@@ -48,6 +48,7 @@ import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 import { resolveFreshWorktreeBaseRef } from "./worktree_base_ref.js";
+import type { JobDiagnostics, JobPhaseSpanDiagnostics } from "./common/types.js";
 
 type CommitRef = {
   branch: string;
@@ -415,6 +416,67 @@ function inferWorkerJobPhaseFromLogLine(line: string): WorkerJobPhase | null {
     return "discovering";
   }
   return null;
+}
+
+function mergeWorkerDiagnostics(
+  base: JobDiagnostics | undefined,
+  extra: JobDiagnostics,
+): JobDiagnostics {
+  return {
+    ...(base ?? {}),
+    ...extra,
+    attempts: [...(base?.attempts ?? []), ...(extra.attempts ?? [])],
+    phaseSpans: [...(base?.phaseSpans ?? []), ...(extra.phaseSpans ?? [])],
+    validationRuns: [...(base?.validationRuns ?? []), ...(extra.validationRuns ?? [])],
+    patchSnapshots: [...(base?.patchSnapshots ?? []), ...(extra.patchSnapshots ?? [])],
+    terminal:
+      base?.terminal || extra.terminal
+        ? {
+            ...(base?.terminal ?? {}),
+            ...(extra.terminal ?? {}),
+            metadata: {
+              ...(base?.terminal?.metadata ?? {}),
+              ...(extra.terminal?.metadata ?? {}),
+            },
+          }
+        : undefined,
+    metadata: {
+      ...(extra.metadata ?? {}),
+      ...(base?.metadata ?? {}),
+    },
+  };
+}
+
+function inferWorkerTerminalFailureClass(result: JobResult): string {
+  if (result.ok) return "success";
+  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  if (/timed out|timeout|signal 15|terminated|exit 143|exit 137/.test(text)) return "timeout";
+  if (/no publishable|non-publishable|node_modules/.test(text)) return "artifact_only_no_publishable_patch";
+  if (/validationgate|validation/.test(text)) return "validation";
+  if (/scopegate|scope/.test(text)) return "scope";
+  if (/criticgate|critic/.test(text)) return "critic";
+  if (/publish/.test(text)) return "publish";
+  return "worker_failure";
+}
+
+function buildPhaseSpanDiagnostics(
+  spans: Array<{ phase: WorkerJobPhase; startedAtMs: number; finishedAtMs?: number }>,
+  attempt: number,
+  fallbackFinishedAtMs: number,
+  outcome: string,
+): JobPhaseSpanDiagnostics[] {
+  return spans.slice(0, 32).map((span) => {
+    const startedAtMs = Math.max(0, span.startedAtMs);
+    const finishedAtMs = Math.max(startedAtMs, span.finishedAtMs ?? fallbackFinishedAtMs);
+    return {
+      attempt,
+      phase: span.phase,
+      startedAt: new Date(startedAtMs).toISOString(),
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      durationMs: finishedAtMs - startedAtMs,
+      outcome,
+    };
+  });
 }
 
 export function shouldEmitDirectSessionJobEvent(options: {
@@ -1417,8 +1479,21 @@ async function workerLoop(
           let stderrSeq = 0;
           let lastCleanLog = "";
           let lastCleanLogAt = 0;
-          let lastForwardedJobLogAt = Date.now();
+          const jobClaimedAtMs = Date.now();
+          let lastForwardedJobLogAt = jobClaimedAtMs;
           let currentJobPhase: WorkerJobPhase | null = null;
+          const phaseSpans: Array<{
+            phase: WorkerJobPhase;
+            startedAtMs: number;
+            finishedAtMs?: number;
+          }> = [];
+          const noteJobPhase = (phase: WorkerJobPhase | null, atMs = Date.now()): void => {
+            if (!phase || phase === currentJobPhase) return;
+            const previous = phaseSpans[phaseSpans.length - 1];
+            if (previous && previous.finishedAtMs == null) previous.finishedAtMs = atMs;
+            currentJobPhase = phase;
+            phaseSpans.push({ phase, startedAtMs: atMs });
+          };
 
           const emitJobLog = job.sessionId
             ? (stream: "stdout" | "stderr", line: string): boolean => {
@@ -1434,7 +1509,7 @@ async function workerLoop(
                 lastCleanLog = cleaned;
                 lastCleanLogAt = now;
                 lastForwardedJobLogAt = now;
-                currentJobPhase = inferWorkerJobPhaseFromLogLine(cleaned) ?? currentJobPhase;
+                noteJobPhase(inferWorkerJobPhaseFromLogLine(cleaned), now);
                 const logTs = new Date(now).toISOString();
 
                 const seq = stream === "stdout" ? ++stdoutSeq : ++stderrSeq;
@@ -1472,7 +1547,6 @@ async function workerLoop(
               }
             : undefined;
 
-          const jobClaimedAtMs = Date.now();
           const jobProgressLogEveryMs = resolveJobProgressLogEveryMs();
           const jobProgressTimer =
             emitJobLog && jobProgressLogEveryMs > 0
@@ -1673,6 +1747,57 @@ async function workerLoop(
               }
             }
 
+            const finalizedAtMs = Date.now();
+            const jobAttemptRaw = Number((job as { attempt?: unknown }).attempt ?? 1);
+            const jobAttempt =
+              Number.isFinite(jobAttemptRaw) && jobAttemptRaw > 0 ? Math.floor(jobAttemptRaw) : 1;
+            const llm = workerLlmConfig(CONFIG);
+            result = {
+              ...result,
+              diagnostics: mergeWorkerDiagnostics(result.diagnostics, {
+                attempts: [
+                  {
+                    attempt: jobAttempt,
+                    workerId: opts.workerId,
+                    backend: resolveExecutor(CONFIG),
+                    model: llm.model,
+                    startedAt: new Date(jobStartedAtMs).toISOString(),
+                    finishedAt: new Date(finalizedAtMs).toISOString(),
+                    durationMs: Math.max(0, finalizedAtMs - jobStartedAtMs),
+                    terminalReason: result.summary,
+                    exitCode: result.exitCode ?? (result.ok ? 0 : 1),
+                    metadata: {
+                      docker: Boolean(dockerExecutor),
+                      jobKind: job.kind,
+                      provider: llm.provider,
+                      cooldownMs: result.cooldownMs ?? 0,
+                    },
+                  },
+                ],
+                phaseSpans: buildPhaseSpanDiagnostics(
+                  phaseSpans,
+                  jobAttempt,
+                  finalizedAtMs,
+                  result.ok ? "completed" : result.publishBlocked ? "publish_blocked" : "failed",
+                ),
+                terminal: {
+                  failureClass: inferWorkerTerminalFailureClass(result),
+                  terminalStage: currentJobPhase ?? (result.ok ? "completed" : "worker"),
+                  executorBackend: resolveExecutor(CONFIG),
+                  summary: result.summary,
+                  watchdogFired: /timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(
+                    `${result.summary}\n${result.stderr ?? ""}`,
+                  ),
+                  metadata: {
+                    workerId: opts.workerId,
+                    docker: Boolean(dockerExecutor),
+                    jobKind: job.kind,
+                    phase: currentJobPhase,
+                  },
+                },
+              }),
+            };
+
             let statusPersistedToServer = false;
             if (result.publishBlocked) {
               await reportToolRunForUnsuccessfulJob({
@@ -1691,6 +1816,7 @@ async function workerLoop(
                   detail: redactSensitiveText(result.stderr ?? ""),
                   publishBlocked: result.publishBlocked,
                   durationMs: jobDurationMs,
+                  diagnostics: result.diagnostics,
                 },
               );
               statusPersistedToServer = response.ok;
@@ -1715,6 +1841,7 @@ async function workerLoop(
                   summary: result.summary,
                   durationMs: jobDurationMs,
                   prUrl: jobPrUrl,
+                  diagnostics: result.diagnostics,
                   artifacts: [
                     ...(result.stdout ? [{ kind: "stdout", text: result.stdout }] : []),
                     ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),
@@ -1741,6 +1868,7 @@ async function workerLoop(
                   message: result.summary,
                   detail: redactSensitiveText(result.stderr ?? ""),
                   durationMs: jobDurationMs,
+                  diagnostics: result.diagnostics,
                 },
               );
               statusPersistedToServer = response.ok;

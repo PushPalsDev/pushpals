@@ -289,6 +289,64 @@ function sanitizeToolRunMetadata(value: unknown, depth = 0): unknown {
   return out;
 }
 
+const MAX_JOB_DIAGNOSTIC_ATTEMPTS = 8;
+const MAX_JOB_DIAGNOSTIC_PHASE_SPANS = 32;
+const MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS = 20;
+const MAX_JOB_DIAGNOSTIC_PATCH_SNAPSHOTS = 20;
+const MAX_JOB_DIAGNOSTIC_PATH_SAMPLE = 50;
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function arrayFromUnknown(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function boundedDbInt(value: unknown, max = Number.MAX_SAFE_INTEGER): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(0, Math.min(Math.floor(parsed), max));
+}
+
+function diagnosticText(value: unknown, maxChars: number): string | null {
+  return compactDbText(redactToolText(value), maxChars);
+}
+
+function diagnosticMetadataJson(value: unknown): string {
+  const sanitized = sanitizeToolRunMetadata(value ?? {});
+  if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) return "{}";
+  return JSON.stringify(sanitized);
+}
+
+function diagnosticStringArrayJson(value: unknown, limit = MAX_JOB_DIAGNOSTIC_PATH_SAMPLE): string {
+  const values = arrayFromUnknown(value)
+    .map((entry) => diagnosticText(entry, 240))
+    .filter((entry): entry is string => Boolean(entry))
+    .slice(0, limit);
+  return JSON.stringify(values);
+}
+
+function diagnosticIso(value: unknown): string | null {
+  return coerceIsoTimestamp(value);
+}
+
+function parseJsonArray(value: string | null): unknown[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function normalizeWorkerStatus(value: unknown): WorkerStatus {
   const text = String(value ?? "")
     .trim()
@@ -642,6 +700,96 @@ export class JobQueue {
       CREATE INDEX IF NOT EXISTS idx_tool_runs_job_id ON tool_runs(jobId, finishedAt);
       CREATE INDEX IF NOT EXISTS idx_tool_runs_tool ON tool_runs(tool, finishedAt);
       CREATE INDEX IF NOT EXISTS idx_tool_runs_failure_class ON tool_runs(failureClass, finishedAt);
+
+      CREATE TABLE IF NOT EXISTS job_attempts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        jobId          TEXT NOT NULL,
+        attempt        INTEGER NOT NULL DEFAULT 1,
+        workerId       TEXT,
+        backend        TEXT,
+        model          TEXT,
+        startedAt      TEXT,
+        finishedAt     TEXT,
+        durationMs     INTEGER,
+        terminalReason TEXT,
+        exitCode       INTEGER,
+        metadataJson   TEXT NOT NULL DEFAULT '{}',
+        createdAt      TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_job_attempts_job_id ON job_attempts(jobId, attempt);
+
+      CREATE TABLE IF NOT EXISTS job_terminal_diagnostics (
+        jobId                 TEXT PRIMARY KEY,
+        status                TEXT NOT NULL,
+        failureClass          TEXT,
+        terminalStage         TEXT,
+        executorBackend       TEXT,
+        summary               TEXT,
+        watchdogFired         INTEGER NOT NULL DEFAULT 0,
+        timeoutMs             INTEGER,
+        publishableFileCount  INTEGER,
+        artifactOnlyPathCount INTEGER,
+        changedPathSampleJson TEXT NOT NULL DEFAULT '[]',
+        metadataJson          TEXT NOT NULL DEFAULT '{}',
+        createdAt             TEXT NOT NULL,
+        updatedAt             TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_job_terminal_failure_class
+        ON job_terminal_diagnostics(failureClass, updatedAt);
+
+      CREATE TABLE IF NOT EXISTS job_phase_spans (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        jobId        TEXT NOT NULL,
+        attempt      INTEGER,
+        phase        TEXT NOT NULL,
+        startedAt    TEXT NOT NULL,
+        finishedAt   TEXT NOT NULL,
+        durationMs   INTEGER NOT NULL DEFAULT 0,
+        outcome      TEXT,
+        metadataJson TEXT NOT NULL DEFAULT '{}',
+        createdAt    TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_job_phase_spans_job_id ON job_phase_spans(jobId, startedAt);
+      CREATE INDEX IF NOT EXISTS idx_job_phase_spans_phase ON job_phase_spans(phase, startedAt);
+
+      CREATE TABLE IF NOT EXISTS job_validation_runs (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        jobId        TEXT NOT NULL,
+        attempt      INTEGER,
+        command      TEXT NOT NULL,
+        exitCode     INTEGER,
+        durationMs   INTEGER,
+        passed       INTEGER NOT NULL DEFAULT 0,
+        failureClass TEXT,
+        stdoutTail   TEXT,
+        stderrTail   TEXT,
+        metadataJson TEXT NOT NULL DEFAULT '{}',
+        createdAt    TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_job_validation_runs_job_id ON job_validation_runs(jobId, id);
+      CREATE INDEX IF NOT EXISTS idx_job_validation_runs_failure_class
+        ON job_validation_runs(failureClass, createdAt);
+
+      CREATE TABLE IF NOT EXISTS job_patch_snapshots (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        jobId                  TEXT NOT NULL,
+        attempt                INTEGER,
+        phase                  TEXT,
+        publishableFileCount   INTEGER,
+        artifactOnlyPathCount  INTEGER,
+        changedPathSampleJson  TEXT NOT NULL DEFAULT '[]',
+        topLevelDirsJson       TEXT NOT NULL DEFAULT '[]',
+        capturedAt             TEXT,
+        metadataJson           TEXT NOT NULL DEFAULT '{}',
+        createdAt              TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_job_patch_snapshots_job_id
+        ON job_patch_snapshots(jobId, capturedAt);
 
       CREATE TABLE IF NOT EXISTS job_artifacts (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1659,6 +1807,162 @@ export class JobQueue {
     });
   }
 
+  private recordJobDiagnostics(
+    jobId: string,
+    body: Record<string, unknown>,
+    status: JobStatus,
+    now: string,
+  ): void {
+    const diagnostics = recordFromUnknown(body.diagnostics);
+    if (!diagnostics) return;
+
+    const attempts = arrayFromUnknown(diagnostics.attempts)
+      .map(recordFromUnknown)
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+      .slice(0, MAX_JOB_DIAGNOSTIC_ATTEMPTS);
+    const phaseSpans = arrayFromUnknown(diagnostics.phaseSpans)
+      .map(recordFromUnknown)
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+      .slice(0, MAX_JOB_DIAGNOSTIC_PHASE_SPANS);
+    const validationRuns = arrayFromUnknown(diagnostics.validationRuns)
+      .map(recordFromUnknown)
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+      .slice(0, MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS);
+    const patchSnapshots = arrayFromUnknown(diagnostics.patchSnapshots)
+      .map(recordFromUnknown)
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+      .slice(0, MAX_JOB_DIAGNOSTIC_PATCH_SNAPSHOTS);
+    const terminal = recordFromUnknown(diagnostics.terminal);
+
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM job_attempts WHERE jobId = ?`).run(jobId);
+      this.db.prepare(`DELETE FROM job_phase_spans WHERE jobId = ?`).run(jobId);
+      this.db.prepare(`DELETE FROM job_validation_runs WHERE jobId = ?`).run(jobId);
+      this.db.prepare(`DELETE FROM job_patch_snapshots WHERE jobId = ?`).run(jobId);
+      this.db.prepare(`DELETE FROM job_terminal_diagnostics WHERE jobId = ?`).run(jobId);
+
+      const insertAttempt = this.db.prepare(
+        `INSERT INTO job_attempts (
+           jobId, attempt, workerId, backend, model, startedAt, finishedAt, durationMs,
+           terminalReason, exitCode, metadataJson, createdAt
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const attempt of attempts) {
+        insertAttempt.run(
+          jobId,
+          boundedDbInt(attempt.attempt, 1000) ?? 1,
+          diagnosticText(attempt.workerId, 160),
+          diagnosticText(attempt.backend, 120),
+          diagnosticText(attempt.model, 180),
+          diagnosticIso(attempt.startedAt),
+          diagnosticIso(attempt.finishedAt),
+          boundedDbInt(attempt.durationMs, 30 * 24 * 60 * 60 * 1000),
+          diagnosticText(attempt.terminalReason, 1000),
+          boundedDbInt(attempt.exitCode, 999),
+          diagnosticMetadataJson(attempt.metadata),
+          now,
+        );
+      }
+
+      if (terminal) {
+        this.db
+          .prepare(
+            `INSERT INTO job_terminal_diagnostics (
+               jobId, status, failureClass, terminalStage, executorBackend, summary,
+               watchdogFired, timeoutMs, publishableFileCount, artifactOnlyPathCount,
+               changedPathSampleJson, metadataJson, createdAt, updatedAt
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            jobId,
+            status,
+            diagnosticText(terminal.failureClass, 160),
+            diagnosticText(terminal.terminalStage, 160),
+            diagnosticText(terminal.executorBackend, 160),
+            diagnosticText(terminal.summary ?? body.summary ?? body.message, 1000),
+            boolFromUnknown(terminal.watchdogFired) ? 1 : 0,
+            boundedDbInt(terminal.timeoutMs, 30 * 24 * 60 * 60 * 1000),
+            boundedDbInt(terminal.publishableFileCount, 100_000),
+            boundedDbInt(terminal.artifactOnlyPathCount, 100_000),
+            diagnosticStringArrayJson(terminal.changedPathSample),
+            diagnosticMetadataJson(terminal.metadata),
+            now,
+            now,
+          );
+      }
+
+      const insertPhaseSpan = this.db.prepare(
+        `INSERT INTO job_phase_spans (
+           jobId, attempt, phase, startedAt, finishedAt, durationMs, outcome, metadataJson, createdAt
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const span of phaseSpans) {
+        const startedAt = diagnosticIso(span.startedAt);
+        const finishedAt = diagnosticIso(span.finishedAt);
+        const phase = diagnosticText(span.phase, 160);
+        if (!startedAt || !finishedAt || !phase) continue;
+        insertPhaseSpan.run(
+          jobId,
+          boundedDbInt(span.attempt, 1000),
+          phase,
+          startedAt,
+          finishedAt,
+          boundedDbInt(span.durationMs, 30 * 24 * 60 * 60 * 1000) ?? 0,
+          diagnosticText(span.outcome, 160),
+          diagnosticMetadataJson(span.metadata),
+          now,
+        );
+      }
+
+      const insertValidationRun = this.db.prepare(
+        `INSERT INTO job_validation_runs (
+           jobId, attempt, command, exitCode, durationMs, passed, failureClass,
+           stdoutTail, stderrTail, metadataJson, createdAt
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const run of validationRuns) {
+        const command = diagnosticText(run.command, 1000);
+        if (!command) continue;
+        insertValidationRun.run(
+          jobId,
+          boundedDbInt(run.attempt, 1000),
+          command,
+          boundedDbInt(run.exitCode, 999),
+          boundedDbInt(run.durationMs, 24 * 60 * 60 * 1000),
+          boolFromUnknown(run.passed) ? 1 : 0,
+          diagnosticText(run.failureClass, 160),
+          diagnosticText(run.stdoutTail, 8_000),
+          diagnosticText(run.stderrTail, 8_000),
+          diagnosticMetadataJson(run.metadata),
+          now,
+        );
+      }
+
+      const insertPatchSnapshot = this.db.prepare(
+        `INSERT INTO job_patch_snapshots (
+           jobId, attempt, phase, publishableFileCount, artifactOnlyPathCount,
+           changedPathSampleJson, topLevelDirsJson, capturedAt, metadataJson, createdAt
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const snapshot of patchSnapshots) {
+        insertPatchSnapshot.run(
+          jobId,
+          boundedDbInt(snapshot.attempt, 1000),
+          diagnosticText(snapshot.phase, 160),
+          boundedDbInt(snapshot.publishableFileCount, 100_000),
+          boundedDbInt(snapshot.artifactOnlyPathCount, 100_000),
+          diagnosticStringArrayJson(snapshot.changedPathSample),
+          diagnosticStringArrayJson(snapshot.topLevelDirs, 20),
+          diagnosticIso(snapshot.capturedAt),
+          diagnosticMetadataJson(snapshot.metadata),
+          now,
+        );
+      }
+    });
+
+    tx();
+  }
+
   complete(
     jobId: string,
     body: Record<string, unknown>,
@@ -1694,6 +1998,12 @@ export class JobQueue {
 
     if (info.changes === 0) {
       return { ok: false, message: "Job not found or not in claimed state" };
+    }
+
+    try {
+      this.recordJobDiagnostics(jobId, body, "completed", now);
+    } catch {
+      // Diagnostics are best-effort and must not change terminal job status.
     }
 
     const completed = this.db
@@ -1749,6 +2059,12 @@ export class JobQueue {
       return { ok: false, message: "Job not found or not in claimed state" };
     }
 
+    try {
+      this.recordJobDiagnostics(jobId, body, "failed", now);
+    } catch {
+      // Diagnostics are best-effort and must not change terminal job status.
+    }
+
     const failed = this.db
       .prepare(`SELECT durationMs, failedAt FROM jobs WHERE id = ?`)
       .get(jobId) as
@@ -1801,6 +2117,12 @@ export class JobQueue {
 
     if (info.changes === 0) {
       return { ok: false, message: "Job not found or not in claimed state" };
+    }
+
+    try {
+      this.recordJobDiagnostics(jobId, body, "publish_blocked", now);
+    } catch {
+      // Diagnostics are best-effort and must not change terminal job status.
     }
 
     const blocked = this.db
@@ -2667,6 +2989,169 @@ export class JobQueue {
       stderrTail: row.stderrTail,
       metadata: parseObjectJson(row.metadataJson),
     }));
+  }
+
+  getJobDiagnostics(jobId: string): Record<string, unknown> {
+    const terminal = this.db
+      .prepare(`SELECT * FROM job_terminal_diagnostics WHERE jobId = ?`)
+      .get(jobId) as
+      | {
+          jobId: string;
+          status: string;
+          failureClass: string | null;
+          terminalStage: string | null;
+          executorBackend: string | null;
+          summary: string | null;
+          watchdogFired: number;
+          timeoutMs: number | null;
+          publishableFileCount: number | null;
+          artifactOnlyPathCount: number | null;
+          changedPathSampleJson: string | null;
+          metadataJson: string | null;
+          createdAt: string;
+          updatedAt: string;
+        }
+      | undefined;
+    const attempts = this.db
+      .prepare(
+        `SELECT *
+         FROM job_attempts
+         WHERE jobId = ?
+         ORDER BY attempt ASC, id ASC`,
+      )
+      .all(jobId) as Array<{
+      attempt: number;
+      workerId: string | null;
+      backend: string | null;
+      model: string | null;
+      startedAt: string | null;
+      finishedAt: string | null;
+      durationMs: number | null;
+      terminalReason: string | null;
+      exitCode: number | null;
+      metadataJson: string | null;
+      createdAt: string;
+    }>;
+    const phaseSpans = this.db
+      .prepare(
+        `SELECT *
+         FROM job_phase_spans
+         WHERE jobId = ?
+         ORDER BY startedAt ASC, id ASC`,
+      )
+      .all(jobId) as Array<{
+      attempt: number | null;
+      phase: string;
+      startedAt: string;
+      finishedAt: string;
+      durationMs: number;
+      outcome: string | null;
+      metadataJson: string | null;
+      createdAt: string;
+    }>;
+    const validationRuns = this.db
+      .prepare(
+        `SELECT *
+         FROM job_validation_runs
+         WHERE jobId = ?
+         ORDER BY id ASC`,
+      )
+      .all(jobId) as Array<{
+      attempt: number | null;
+      command: string;
+      exitCode: number | null;
+      durationMs: number | null;
+      passed: number;
+      failureClass: string | null;
+      stdoutTail: string | null;
+      stderrTail: string | null;
+      metadataJson: string | null;
+      createdAt: string;
+    }>;
+    const patchSnapshots = this.db
+      .prepare(
+        `SELECT *
+         FROM job_patch_snapshots
+         WHERE jobId = ?
+         ORDER BY capturedAt ASC, id ASC`,
+      )
+      .all(jobId) as Array<{
+      attempt: number | null;
+      phase: string | null;
+      publishableFileCount: number | null;
+      artifactOnlyPathCount: number | null;
+      changedPathSampleJson: string | null;
+      topLevelDirsJson: string | null;
+      capturedAt: string | null;
+      metadataJson: string | null;
+      createdAt: string;
+    }>;
+
+    return {
+      terminal: terminal
+        ? {
+            status: terminal.status,
+            failureClass: terminal.failureClass,
+            terminalStage: terminal.terminalStage,
+            executorBackend: terminal.executorBackend,
+            summary: terminal.summary,
+            watchdogFired: terminal.watchdogFired === 1,
+            timeoutMs: terminal.timeoutMs,
+            publishableFileCount: terminal.publishableFileCount,
+            artifactOnlyPathCount: terminal.artifactOnlyPathCount,
+            changedPathSample: parseJsonArray(terminal.changedPathSampleJson),
+            metadata: parseObjectJson(terminal.metadataJson),
+            createdAt: terminal.createdAt,
+            updatedAt: terminal.updatedAt,
+          }
+        : null,
+      attempts: attempts.map((row) => ({
+        attempt: row.attempt,
+        workerId: row.workerId,
+        backend: row.backend,
+        model: row.model,
+        startedAt: row.startedAt,
+        finishedAt: row.finishedAt,
+        durationMs: row.durationMs,
+        terminalReason: row.terminalReason,
+        exitCode: row.exitCode,
+        metadata: parseObjectJson(row.metadataJson),
+        createdAt: row.createdAt,
+      })),
+      phaseSpans: phaseSpans.map((row) => ({
+        attempt: row.attempt,
+        phase: row.phase,
+        startedAt: row.startedAt,
+        finishedAt: row.finishedAt,
+        durationMs: row.durationMs,
+        outcome: row.outcome,
+        metadata: parseObjectJson(row.metadataJson),
+        createdAt: row.createdAt,
+      })),
+      validationRuns: validationRuns.map((row) => ({
+        attempt: row.attempt,
+        command: row.command,
+        exitCode: row.exitCode,
+        durationMs: row.durationMs,
+        passed: row.passed === 1,
+        failureClass: row.failureClass,
+        stdoutTail: row.stdoutTail,
+        stderrTail: row.stderrTail,
+        metadata: parseObjectJson(row.metadataJson),
+        createdAt: row.createdAt,
+      })),
+      patchSnapshots: patchSnapshots.map((row) => ({
+        attempt: row.attempt,
+        phase: row.phase,
+        publishableFileCount: row.publishableFileCount,
+        artifactOnlyPathCount: row.artifactOnlyPathCount,
+        changedPathSample: parseJsonArray(row.changedPathSampleJson),
+        topLevelDirs: parseJsonArray(row.topLevelDirsJson),
+        capturedAt: row.capturedAt,
+        metadata: parseObjectJson(row.metadataJson),
+        createdAt: row.createdAt,
+      })),
+    };
   }
 
   close(): void {

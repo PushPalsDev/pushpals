@@ -18,7 +18,7 @@ import { homedir } from "os";
 import { isAbsolute, relative, resolve } from "path";
 import { loadPushPalsConfig } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
-import type { ExecutorBackend } from "./common/types.js";
+import type { ExecutorBackend, JobDiagnostics } from "./common/types.js";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 import {
   BACKEND_DOCKER_PASSTHROUGH_ENV,
@@ -237,6 +237,7 @@ export interface DockerJobResult {
     branch: string;
     sha: string;
   };
+  diagnostics?: JobDiagnostics;
 }
 
 export interface Job {
@@ -245,6 +246,37 @@ export interface Job {
   kind: string;
   params: Record<string, unknown>;
   sessionId: string;
+}
+
+function compactDockerDiagnosticText(value: unknown, maxChars = 1000): string | null {
+  const text = String(value ?? "").replace(/\s+$/g, "").trim();
+  if (!text) return null;
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+function dockerFallbackDiagnostics(
+  summary: string,
+  context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
+  exitCode: number,
+  failureClass: string,
+  metadata: Record<string, unknown> = {},
+): JobDiagnostics {
+  return {
+    terminal: {
+      failureClass,
+      terminalStage: "docker",
+      summary: compactDockerDiagnosticText(summary),
+      watchdogFired: context.timedOutByDocker,
+      timeoutMs: context.timeoutMs,
+      metadata: {
+        structuredResult: false,
+        elapsedMs: context.elapsedMs,
+        exitCode,
+        timedOutByDocker: context.timedOutByDocker,
+        ...metadata,
+      },
+    },
+  };
 }
 
 function readPositiveNumber(value: unknown): number | null {
@@ -262,6 +294,10 @@ function maybeRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function isReadableByteStream(value: unknown): value is ReadableStream<Uint8Array> {
+  return value instanceof ReadableStream;
 }
 
 function collectValidationCommandHints(params: Record<string, unknown>): string[] {
@@ -1280,10 +1316,15 @@ export class DockerExecutor {
     const stderrLines: string[] = [];
 
     try {
+      const stdout = proc.stdout;
+      const stderr = proc.stderr;
+      if (!isReadableByteStream(stdout) || !isReadableByteStream(stderr)) {
+        throw new Error("docker exec stdout/stderr pipes were not available");
+      }
       await Promise.all([
         this.writeJobSpecToStdin(proc, base64Spec),
-        this.readStream(proc.stdout, "stdout", onLog, stdoutLines),
-        this.readStream(proc.stderr, "stderr", onLog, stderrLines),
+        this.readStream(stdout, "stdout", onLog, stdoutLines),
+        this.readStream(stderr, "stderr", onLog, stderrLines),
       ]);
     } catch (err) {
       try {
@@ -1343,7 +1384,7 @@ export class DockerExecutor {
       throw new Error("docker exec stdin pipe was not available");
     }
     const bytes = new TextEncoder().encode(base64Spec);
-    if ("getWriter" in stdin && typeof stdin.getWriter === "function") {
+    if (stdin instanceof WritableStream) {
       const writer = stdin.getWriter();
       try {
         await writer.write(bytes);
@@ -1359,12 +1400,17 @@ export class DockerExecutor {
       return;
     }
 
-    if (typeof stdin.write === "function" && typeof stdin.end === "function") {
-      await stdin.write(bytes);
-      if (typeof stdin.flush === "function") {
-        await stdin.flush();
+    const nodeStdin = stdin as {
+      write?: (chunk: Uint8Array | string) => unknown;
+      end?: () => unknown;
+      flush?: () => unknown;
+    };
+    if (typeof nodeStdin.write === "function" && typeof nodeStdin.end === "function") {
+      await nodeStdin.write(bytes);
+      if (typeof nodeStdin.flush === "function") {
+        await nodeStdin.flush();
       }
-      await stdin.end();
+      await nodeStdin.end();
       return;
     }
 
@@ -1648,44 +1694,57 @@ export class DockerExecutor {
         `Malformed ___RESULT___ payload: ${sentinelParseError || "unknown parse error"}`,
       ];
       if (stderr) details.push(stderr);
+      const summary = `Worker returned malformed structured result after ${context.elapsedMs}ms`;
       return {
         ok: false,
-        summary: `Worker returned malformed structured result after ${context.elapsedMs}ms`,
+        summary,
         stdout,
         stderr: details.join("\n"),
         exitCode,
+        diagnostics: dockerFallbackDiagnostics(summary, context, exitCode, "malformed_structured_result", {
+          sentinelParseError,
+        }),
       };
     }
 
     // No sentinel found, return generic result.
     if (context.timedOutByDocker) {
+      const summary = `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms; terminated before structured result).`;
       return {
         ok: false,
-        summary: `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms; terminated before structured result).`,
+        summary,
         stdout,
         stderr,
         exitCode,
+        diagnostics: dockerFallbackDiagnostics(summary, context, exitCode, "timeout"),
       };
     }
     if (exitCode === 143 || exitCode === 137) {
+      const summary = `Job process was terminated (exit ${exitCode}) after ${context.elapsedMs}ms before structured result was produced.`;
       return {
         ok: false,
-        summary: `Job process was terminated (exit ${exitCode}) after ${context.elapsedMs}ms before structured result was produced.`,
+        summary,
         stdout,
         stderr,
         exitCode,
+        diagnostics: dockerFallbackDiagnostics(summary, context, exitCode, "terminated"),
       };
     }
 
+    const summary =
+      exitCode === 0
+        ? `Job completed in ${context.elapsedMs}ms`
+        : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
     return {
       ok: exitCode === 0,
-      summary:
-        exitCode === 0
-          ? `Job completed in ${context.elapsedMs}ms`
-          : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`,
+      summary,
       stdout,
       stderr,
       exitCode,
+      diagnostics:
+        exitCode === 0
+          ? undefined
+          : dockerFallbackDiagnostics(summary, context, exitCode, "no_structured_result"),
     };
   }
 

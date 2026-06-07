@@ -32,7 +32,14 @@ import {
   type ToolRequirement,
 } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
-import type { JobPublishBlockedInfo, JobResult } from "./common/types.js";
+import type {
+  JobDiagnostics,
+  JobPatchSnapshotDiagnostics,
+  JobPublishBlockedInfo,
+  JobResult,
+  JobTerminalDiagnostics,
+  JobValidationRunDiagnostics,
+} from "./common/types.js";
 import {
   compactJobOutput,
   truncate,
@@ -191,6 +198,8 @@ export interface QualityGatePolicy {
 
 const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 3;
 const CRITIC_COMPACT_RETRY_MIN_REDUCTION_RATIO = 0.25;
+const MAX_DIAGNOSTIC_PATH_SAMPLES = 50;
+const MAX_DIAGNOSTIC_TEXT_CHARS = 8_000;
 
 export function qualityRevisionLoopUpperBound(policy: {
   maxAutoRevisions: number;
@@ -580,6 +589,162 @@ function isNestedNodeModulesChange(path: string): boolean {
 
 export function publishableChangedPaths(changedPaths: string[]): string[] {
   return changedPaths.filter((path) => !isNonPublishableArtifactPath(path));
+}
+
+function compactDiagnosticText(value: unknown, maxChars = MAX_DIAGNOSTIC_TEXT_CHARS): string | null {
+  const text = String(value ?? "").replace(/\s+$/g, "");
+  if (!text.trim()) return null;
+  return text.length <= maxChars ? text : text.slice(Math.max(0, text.length - maxChars));
+}
+
+function diagnosticPathSample(paths: string[], limit = MAX_DIAGNOSTIC_PATH_SAMPLES): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    const path = String(raw ?? "").replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function diagnosticTopLevelDirs(paths: string[]): string[] {
+  const seen = new Set<string>();
+  for (const path of paths) {
+    const normalized = String(path ?? "").replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+    if (!normalized) continue;
+    const top = normalized.includes("/") ? normalized.split("/", 1)[0] : normalized;
+    if (top) seen.add(top);
+    if (seen.size >= 20) break;
+  }
+  return [...seen];
+}
+
+function buildPatchSnapshotDiagnostics(
+  changedPaths: string[],
+  attempt: number,
+  phase: string,
+): JobPatchSnapshotDiagnostics {
+  const publishable = publishableChangedPaths(changedPaths);
+  const artifactOnly = changedPaths.filter((path) => isNonPublishableArtifactPath(path));
+  return {
+    attempt,
+    phase,
+    publishableFileCount: publishable.length,
+    artifactOnlyPathCount: artifactOnly.length,
+    changedPathSample: diagnosticPathSample(changedPaths),
+    topLevelDirs: diagnosticTopLevelDirs(publishable.length > 0 ? publishable : changedPaths),
+    capturedAt: new Date().toISOString(),
+  };
+}
+
+function classifyValidationRunFailure(run: ValidationExecutionResult): string | null {
+  if (run.ok) return null;
+  const combined = `${run.command}\n${run.stdout}\n${run.stderr}`.toLowerCase();
+  if (run.exitCode === 124 || combined.includes("timed out") || combined.includes("timeout")) {
+    return "timeout";
+  }
+  if (run.exitCode === 127 || combined.includes("missing tool") || combined.includes("not found")) {
+    return "missing_tool";
+  }
+  if (/browser|playwright|cypress|locator|page\.|screenshot|web:e2e/.test(combined)) {
+    return "browser_validation";
+  }
+  if (/cannot find module|import error|does not provide an export|no exported member|mock/.test(combined)) {
+    return "test_harness";
+  }
+  return "nonzero_exit";
+}
+
+function buildValidationRunDiagnostics(
+  runs: ValidationExecutionResult[],
+  attempt: number,
+): JobValidationRunDiagnostics[] {
+  return runs.slice(0, 20).map((run) => ({
+    attempt,
+    command: run.command,
+    exitCode: run.exitCode,
+    durationMs: run.elapsedMs,
+    passed: run.ok,
+    failureClass: classifyValidationRunFailure(run),
+    stdoutTail: compactDiagnosticText(run.stdout),
+    stderrTail: compactDiagnosticText(run.stderr),
+  }));
+}
+
+function inferTerminalFailureClass(result: JobResult, changedPaths: string[]): string {
+  if (result.ok) return "success";
+  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  const publishableCount = publishableChangedPaths(changedPaths).length;
+  if (changedPaths.length > 0 && publishableCount === 0) return "artifact_only_no_publishable_patch";
+  if (result.exitCode === 124 || text.includes("timed out") || text.includes("timeout")) return "timeout";
+  if (text.includes("validationgate") || text.includes("validation")) return "validation";
+  if (text.includes("scopegate") || text.includes("scope")) return "scope";
+  if (text.includes("criticgate") || text.includes("critic")) return "critic";
+  if (text.includes("publish")) return "publish";
+  if (text.includes("shell-wrapper") || text.includes("command-router")) return "command_policy";
+  return "executor_failure";
+}
+
+function inferTerminalStage(result: JobResult, fallback: string): string {
+  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
+  if (text.includes("validationgate") || text.includes("validation")) return "validation";
+  if (text.includes("scopegate") || text.includes("scope")) return "scope";
+  if (text.includes("criticgate") || text.includes("critic")) return "critic";
+  if (text.includes("publish")) return "publish";
+  if (text.includes("quality gate")) return "quality";
+  if (text.includes("codex") || text.includes("executor")) return "executor";
+  return fallback;
+}
+
+function mergeJobDiagnostics(base: JobDiagnostics | undefined, extra: JobDiagnostics): JobDiagnostics {
+  return {
+    ...(base ?? {}),
+    ...extra,
+    attempts: [...(base?.attempts ?? []), ...(extra.attempts ?? [])],
+    phaseSpans: [...(base?.phaseSpans ?? []), ...(extra.phaseSpans ?? [])],
+    validationRuns: [...(base?.validationRuns ?? []), ...(extra.validationRuns ?? [])],
+    patchSnapshots: [...(base?.patchSnapshots ?? []), ...(extra.patchSnapshots ?? [])],
+    terminal: extra.terminal ?? base?.terminal,
+    metadata: {
+      ...(base?.metadata ?? {}),
+      ...(extra.metadata ?? {}),
+    },
+  };
+}
+
+function withJobDiagnostics(result: JobResult, diagnostics: JobDiagnostics): JobResult {
+  return {
+    ...result,
+    diagnostics: mergeJobDiagnostics(result.diagnostics, diagnostics),
+  };
+}
+
+function buildTerminalDiagnostics(args: {
+  result: JobResult;
+  executor: string;
+  changedPaths: string[];
+  terminalStage: string;
+  timeoutMs?: number | null;
+  metadata?: Record<string, unknown>;
+}): JobTerminalDiagnostics {
+  const publishable = publishableChangedPaths(args.changedPaths);
+  const artifactOnly = args.changedPaths.filter((path) => isNonPublishableArtifactPath(path));
+  const text = `${args.result.summary ?? ""}\n${args.result.stderr ?? ""}\n${args.result.stdout ?? ""}`;
+  return {
+    failureClass: inferTerminalFailureClass(args.result, args.changedPaths),
+    terminalStage: inferTerminalStage(args.result, args.terminalStage),
+    executorBackend: args.executor,
+    summary: compactDiagnosticText(args.result.summary, 1_000),
+    watchdogFired: /watchdog|rollout coach/i.test(text),
+    timeoutMs: args.timeoutMs ?? null,
+    publishableFileCount: publishable.length,
+    artifactOnlyPathCount: artifactOnly.length,
+    changedPathSample: diagnosticPathSample(args.changedPaths),
+    metadata: args.metadata,
+  };
 }
 
 function collectPlanningText(planning: TaskExecutePlanning): string {
@@ -7431,6 +7596,8 @@ export async function executeJob(
   const jobStartedAt = Date.now();
   const previousValidationFailureDigests = new Map<string, string>();
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
+  const diagnosticValidationRuns: JobValidationRunDiagnostics[] = [];
+  const diagnosticPatchSnapshots: JobPatchSnapshotDiagnostics[] = [];
   while (revisionAttempt <= qualityRevisionLoopMax) {
     const attemptStartedAt = Date.now();
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
@@ -7593,6 +7760,11 @@ export async function executeJob(
       ? parseChangedPathsFromStatus(preQualityStatus.stdout)
       : [];
     const preQualityPublishablePaths = publishableChangedPaths(preQualityChangedPaths);
+    if (preQualityChangedPaths.length > 0) {
+      diagnosticPatchSnapshots.push(
+        buildPatchSnapshotDiagnostics(preQualityChangedPaths, revisionAttempt, "executor"),
+      );
+    }
     const executorText = `${result.summary ?? ""}\n${result.stdout ?? ""}\n${result.stderr ?? ""}`;
     const shellWrapperReturn =
       /shell-wrapper command rejections|command-router shell-wrapper|command policy rejection/i.test(
@@ -7606,13 +7778,24 @@ export async function executeJob(
         "stderr",
         `[QualityGate] ${detail} Skipping ValidationGate/CriticGate because there is no PR-worthy patch to validate.`,
       );
-      return {
+      const failure: JobResult = {
         ok: false,
         summary: `Executor produced no publishable code changes (${detail})`,
         stdout: result.stdout,
         stderr: [result.stderr ?? "", detail].filter(Boolean).join("\n"),
         exitCode: 4,
       };
+      return withJobDiagnostics(failure, {
+        terminal: buildTerminalDiagnostics({
+          result: failure,
+          executor,
+          changedPaths: preQualityChangedPaths,
+          terminalStage: "executor",
+          timeoutMs: executionBudgetMs,
+          metadata: { revisionAttempt, executorElapsedMs },
+        }),
+        patchSnapshots: [...diagnosticPatchSnapshots],
+      });
     }
     if (
       preQualityPublishablePaths.length === 0 &&
@@ -7626,13 +7809,24 @@ export async function executeJob(
         "stderr",
         `[QualityGate] ${reason} Skipping ValidationGate/CriticGate and failing fast.`,
       );
-      return {
+      const failure: JobResult = {
         ok: false,
         summary: reason,
         stdout: result.stdout,
         stderr: [result.stderr ?? "", reason].filter(Boolean).join("\n"),
         exitCode: 4,
       };
+      return withJobDiagnostics(failure, {
+        terminal: buildTerminalDiagnostics({
+          result: failure,
+          executor,
+          changedPaths: preQualityChangedPaths,
+          terminalStage: "executor",
+          timeoutMs: executionBudgetMs,
+          metadata: { revisionAttempt, executorElapsedMs, shellWrapperReturn },
+        }),
+        patchSnapshots: [...diagnosticPatchSnapshots],
+      });
     }
 
     const qualityStartedAt = Date.now();
@@ -7648,6 +7842,12 @@ export async function executeJob(
       },
     );
     const qualityElapsedMs = Date.now() - qualityStartedAt;
+    diagnosticPatchSnapshots.push(
+      buildPatchSnapshotDiagnostics(quality.changedPaths, revisionAttempt, "quality"),
+    );
+    diagnosticValidationRuns.push(
+      ...buildValidationRunDiagnostics(quality.validationRuns, revisionAttempt),
+    );
     const validationCommandElapsedMs = quality.validationRuns.reduce(
       (total, run) => total + Math.max(0, Number(run.elapsedMs) || 0),
       0,
@@ -7708,6 +7908,30 @@ export async function executeJob(
         : executor === "openai_codex"
           ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog)
           : await runTaskCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog);
+    const annotateTerminalResult = (
+      terminalResult: JobResult,
+      terminalStage: string,
+      changedPaths: string[] = quality.changedPaths,
+    ): JobResult =>
+      withJobDiagnostics(terminalResult, {
+        terminal: buildTerminalDiagnostics({
+          result: terminalResult,
+          executor,
+          changedPaths,
+          terminalStage,
+          timeoutMs: executionBudgetMs,
+          metadata: {
+            revisionAttempt,
+            executorElapsedMs,
+            qualityElapsedMs,
+            validationFailureScope: quality.validationFailureScope,
+            validationRuns: quality.validationRuns.length,
+            criticScore: critic?.score ?? null,
+          },
+        }),
+        validationRuns: [...diagnosticValidationRuns],
+        patchSnapshots: [...diagnosticPatchSnapshots],
+      });
     if (!qualityGatePolicy.criticGateEnabled) {
       onLog?.("stdout", "[CriticGate] Disabled by workerpals.quality_critic_gate_enabled=false.");
     } else if (skipCriticAfterExecutorTimeout) {
@@ -7767,7 +7991,7 @@ export async function executeJob(
         "stderr",
         "[PublishGate] Disabled by workerpals.quality_publish_gate_enabled=false; returning worker result despite gate failures.",
       );
-      return {
+      const advisoryResult: JobResult = {
         ...result,
         summary: `${result.summary} (publish gate disabled; quality gate findings were advisory)`,
         stderr: truncate(
@@ -7782,6 +8006,7 @@ export async function executeJob(
         ),
         exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
       };
+      return annotateTerminalResult(advisoryResult, "quality");
     }
 
     if (!deterministicRequiresRevision && !criticRequiresRevision) {
@@ -7800,13 +8025,14 @@ export async function executeJob(
           outputPolicyForRuntime(runtimeConfig),
         );
         onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
-        return {
+        const failure: JobResult = {
           ok: false,
           summary: requiredSummary,
           stdout: result.stdout,
           stderr: diagnostics,
           exitCode: 4,
         };
+        return annotateTerminalResult(failure, "validation");
       }
       if (critic) {
         onLog?.(
@@ -7814,7 +8040,7 @@ export async function executeJob(
           `[CriticGate] review score ${critic.score.toFixed(1)}/10 (threshold ${qualityCriticMinScore}).`,
         );
       }
-      return result;
+      return annotateTerminalResult(result, "completed");
     }
 
     const blockerIssue = quality.blocker
@@ -7874,13 +8100,14 @@ export async function executeJob(
       } else if (quality.requiredValidationFailures.length > 0) {
         const requiredSummary = `Required vision.md validation blocked publishing: ${quality.requiredValidationFailures.join("; ")}`;
         onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
-        return {
+        const failure: JobResult = {
           ok: false,
           summary: requiredSummary,
           stdout: result.stdout,
           stderr: blockerDiagnostics,
           exitCode: 4,
         };
+        return annotateTerminalResult(failure, "validation");
       } else if (shouldSoftPassValidationBlocker(qualityGatePolicy, quality.blocker)) {
         onLog?.(
           "stderr",
@@ -7889,7 +8116,7 @@ export async function executeJob(
             260,
           )}`,
         );
-        return {
+        const softPass: JobResult = {
           ...result,
           summary:
             `${result.summary} ` +
@@ -7897,15 +8124,17 @@ export async function executeJob(
           stderr: blockerDiagnostics,
           exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
         };
+        return annotateTerminalResult(softPass, "quality");
       } else {
         onLog?.("stderr", `[QualityGate] ${blockerSummary}`);
-        return {
+        const failure: JobResult = {
           ok: false,
           summary: blockerSummary,
           stdout: result.stdout,
           stderr: blockerDiagnostics,
           exitCode: 4,
         };
+        return annotateTerminalResult(failure, "quality");
       }
     }
     if (revisionAttempt >= activeMaxAutoRevisions) {
@@ -7922,13 +8151,14 @@ export async function executeJob(
         );
         const requiredSummary = `Required vision.md validation failed after ${revisionAttempt} auto-revision attempt(s): ${quality.requiredValidationFailures.join("; ")}`;
         onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
-        return {
+        const failure: JobResult = {
           ok: false,
           summary: requiredSummary,
           stdout: result.stdout,
           stderr: diagnostics,
           exitCode: 4,
         };
+        return annotateTerminalResult(failure, "validation");
       }
       if (qualitySoftPassOnExhausted) {
         const diagnostics = truncate(
@@ -7944,14 +8174,15 @@ export async function executeJob(
             260,
           )}`,
         );
-        return {
+        const softPass: JobResult = {
           ...result,
           summary: `${result.summary} (quality gate soft-pass after ${revisionAttempt} auto-revision attempt(s))`,
           stderr: diagnostics,
           exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
         };
+        return annotateTerminalResult(softPass, "quality");
       }
-      return {
+      const failure: JobResult = {
         ok: false,
         summary: `Quality gate failed after ${revisionAttempt} auto-revision attempt(s): ${toSingleLine(
           issueSummary,
@@ -7966,6 +8197,7 @@ export async function executeJob(
         ),
         exitCode: 4,
       };
+      return annotateTerminalResult(failure, "quality");
     }
 
     const revisionBudget = qualityRevisionBudgetDecision({
@@ -7982,7 +8214,7 @@ export async function executeJob(
         220,
       )}`;
       onLog?.("stderr", `[QualityGate] ${budgetSummary}`);
-      return {
+      const failure: JobResult = {
         ok: false,
         summary: budgetSummary,
         stdout: result.stdout,
@@ -7998,6 +8230,7 @@ export async function executeJob(
         ),
         exitCode: 4,
       };
+      return annotateTerminalResult(failure, "quality");
     }
 
     revisionAttempt += 1;

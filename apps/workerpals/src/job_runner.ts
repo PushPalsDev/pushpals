@@ -19,6 +19,7 @@
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
 import { loadPushPalsConfig } from "shared";
 import { writeFileSync } from "fs";
+import type { JobDiagnostics } from "./common/types.js";
 import {
   applyMergeConflictExecutionHints,
   isMergeConflictResolutionParams,
@@ -55,6 +56,7 @@ interface JobResult {
     sha: string;
     stage: "sync" | "push";
   };
+  diagnostics?: JobDiagnostics;
 }
 
 // ─── Logging helpers ────────────────────────────────────────────────────────
@@ -183,6 +185,7 @@ async function main(): Promise<void> {
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: result.exitCode,
+      diagnostics: result.diagnostics,
     };
     // Create commit for file-modifying jobs
     if (result.ok && shouldCommit(spec.kind, CONFIG)) {

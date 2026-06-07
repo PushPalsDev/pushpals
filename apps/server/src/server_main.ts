@@ -1669,6 +1669,16 @@ export function createRequestHandler() {
         return makeJson({ ok: true, jobId, toolRuns });
       }
 
+      // GET /jobs/:id/diagnostics
+      const jobDiagnosticsMatch = pathname.match(/^\/jobs\/([^/]+)\/diagnostics$/);
+      if (jobDiagnosticsMatch && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobDiagnosticsMatch[1];
+        return makeJson({ ok: true, jobId, diagnostics: jobQueue.getJobDiagnostics(jobId) });
+      }
+
       // GET /completions
       if (pathname === "/completions" && method === "GET") {
         const denied = requireAuth();
