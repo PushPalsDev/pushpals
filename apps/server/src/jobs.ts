@@ -374,7 +374,7 @@ function parseBudgetMs(value: unknown, fallback: number): number {
 function parseDedupeCooldownMs(value: unknown, fallback: number): number {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-  return Math.max(0, Math.min(parsed, 10 * 60 * 1000));
+  return Math.max(0, Math.min(parsed, 24 * 60 * 60 * 1000));
 }
 
 function parseIsoMs(value: string | null | undefined): number | null {

@@ -66,6 +66,41 @@ describe("server JobQueue dedupe", () => {
     queue.close();
   });
 
+  test("preserves multi-hour dedupe cooldowns for repeated autonomy work", () => {
+    const queue = new JobQueue(":memory:");
+    const cooldownMs = 6 * 60 * 60 * 1000;
+    const first = queue.enqueue({
+      taskId: "task-autonomy-cooldown-1",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+      dedupeKey: "task.execute:autonomy:dev:app/__tests__/contract.test.ts",
+      dedupeCooldownMs: cooldownMs,
+    });
+    expect(first.ok).toBe(true);
+    const firstJobId = String(first.jobId ?? "");
+    expect(firstJobId.length).toBeGreaterThan(0);
+
+    const claimed = queue.claim("worker-autonomy");
+    expect(claimed.ok).toBe(true);
+    expect(claimed.job?.dedupeCooldownMs).toBe(cooldownMs);
+    expect(queue.complete(firstJobId, { summary: "no publishable patch" }).ok).toBe(true);
+
+    const second = queue.enqueue({
+      taskId: "task-autonomy-cooldown-2",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+      dedupeKey: "task.execute:autonomy:dev:app/__tests__/contract.test.ts",
+      dedupeCooldownMs: cooldownMs,
+    });
+    expect(second.ok).toBe(true);
+    expect(second.deduped).toBe(true);
+    expect(second.jobId).toBe(firstJobId);
+    expect(second.taskId).toBe("task-autonomy-cooldown-1");
+    queue.close();
+  });
+
   test("allows enqueue after dedupe cooldown expires", async () => {
     const queue = new JobQueue(":memory:");
     const first = queue.enqueue({

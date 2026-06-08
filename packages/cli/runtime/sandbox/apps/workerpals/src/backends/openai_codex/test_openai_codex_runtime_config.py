@@ -1396,6 +1396,27 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(watchdog_s, 180)
 
+    def test_narrow_contract_regression_with_required_e2e_uses_fast_no_edit_watchdog(self) -> None:
+        prompt = (
+            "Harden the opportunity graph contract around autonomous delivery-loop failure signals. "
+            "Add focused regression coverage in app/__tests__/opportunity-graph.contract.test.ts. "
+            "Required vision.md testing criteria: bun test | bun x tsc --noEmit | bun run lint | bun run web:e2e."
+        )
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
+            watchdog_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+
+        self.assertEqual(watchdog_s, 180)
+
+    def test_review_fix_contract_level_tests_use_fast_no_edit_watchdog(self) -> None:
+        prompt = (
+            "Restore exact score assertions for contract-level tests where score is part "
+            "of the public output. Keep this as a test-only patch in app/__tests__."
+        )
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
+            watchdog_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+
+        self.assertEqual(watchdog_s, 180)
+
     def test_no_edit_recovery_guidance_warns_against_artifact_only_progress(self) -> None:
         guidance = _build_no_edit_recovery_guidance(
             "item.completed | still inspecting",
