@@ -2,25 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.23`
-- start_commit: `9293f4e721983e72bf61edd3819c680008847a02`
-- end_commit: `11f1182de1c4f58074043ea69ede35ea0cee88a5`
+- version: `v1.1.24`
+- start_commit: `8a4f44050d49c0b1a7185e9815a89d143145f3e5`
+- end_commit: `08d87215b101579bcdf74e1ccf2267c58a7c74a4`
 - commits_in_range: `2`
 
 ## Highlights
 
-- Fix OpenAI Codex WorkerPal dirty-baseline accounting so pre-existing worktree changes are not misclassified as broad worker-created patches.
-- Preserve the safety guard for genuinely broad or noisy small-task edits by counting new paths and same-path edits made after the job starts.
-- Use bounded filesystem fingerprints for baseline paths so the fix does not add expensive per-path Git diff work on Windows.
-- Add regression coverage for dirty baseline timeout handling and same-path baseline mutations.
-- Update the `task.execute` integration harness to allow bounded diagnostics on executor results while still asserting the stable result contract.
-- Ship the updated WorkerPal sandbox mirror in the packaged CLI runtime assets.
+- Add a 6-hour cooldown for repeated autonomy jobs that target the same file, preventing unhealthy retry storms on one narrow objective.
+- Shorten OpenAI Codex no-edit and rollout watchdogs for narrow contract/test tasks so stuck jobs recover or fail faster instead of burning full execution windows.
+- Strengthen no-edit recovery guidance with a patch-first contract that tells workers to make a publishable edit before repeating discovery.
+- Mark no-edit watchdog and rollout-coach terminal diagnostics correctly so job investigations show watchdog-triggered failures instead of hiding them as generic terminal failures.
+- Ship the updated RemoteBuddy and WorkerPal sandbox mirrors in the packaged CLI runtime assets.
 
 ## Validation
 
 - `bun run cli:bundle`
-- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
-- `bun test tests/integration/task.execute.test.ts`
 - `bun run test:root`
 - `git diff --check`
 
@@ -49,7 +46,7 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out.
-- Active runtimes that were started from `v1.1.22` or earlier must be restarted after installing this release before WorkerPal jobs use the dirty-baseline fix.
+- Active runtimes that were started from `v1.1.23` or earlier must be restarted after installing this release before autonomy dedupe cooldowns and faster narrow-task watchdogs take effect.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
