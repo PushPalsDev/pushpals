@@ -18,6 +18,7 @@ import {
   recordBrowserFailureMemory,
   recordValidationRemedyMemory,
   shouldSkipCriticAfterExecutorTimeout,
+  shouldSkipCriticForDeterministicValidationRevision,
   shouldRetryCriticTimeoutWithCompact,
   shouldReviseRequiredValidationBlocker,
   shouldRetryBrowserValidationRunOnce,
@@ -121,6 +122,63 @@ describe("workerpals quality gate critic issue formatting", () => {
         ...base,
         policyMode: "default",
         executorText: "openai_codex completed normally",
+      }),
+    ).toBe(false);
+  });
+
+  test("skips critic when deterministic fast validation already requires revision", () => {
+    expect(
+      shouldSkipCriticForDeterministicValidationRevision({
+        deterministicRequiresRevision: true,
+        validationOutsideTaskScope: false,
+        validationRuns: [
+          {
+            step: "bun x tsc --noEmit",
+            command: "bun x tsc --noEmit",
+            ok: false,
+            exitCode: 2,
+            stdout: "",
+            stderr:
+              "error TS2418: Type of computed property's value is not assignable to type 'number'.",
+            elapsedMs: 13_242,
+          },
+        ],
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldSkipCriticForDeterministicValidationRevision({
+        deterministicRequiresRevision: true,
+        validationOutsideTaskScope: false,
+        validationRuns: [
+          {
+            step: "bun run web:e2e",
+            command: "bun run web:e2e",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr: "Browser validation failed during shell stage: Expected start button",
+            elapsedMs: 140_855,
+          },
+        ],
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSkipCriticForDeterministicValidationRevision({
+        deterministicRequiresRevision: true,
+        validationOutsideTaskScope: true,
+        validationRuns: [
+          {
+            step: "bun run lint",
+            command: "bun run lint",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr: 'error: "eslint" exited with code 1',
+            elapsedMs: 37_046,
+          },
+        ],
       }),
     ).toBe(false);
   });

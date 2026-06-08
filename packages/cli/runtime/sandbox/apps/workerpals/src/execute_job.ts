@@ -325,6 +325,15 @@ export function shouldSkipCriticAfterExecutorTimeout(opts: {
   return /\b(openai_codex|codex(?: exec)?)\b[^\r\n]*\btimed out\b/i.test(opts.executorText);
 }
 
+export function shouldSkipCriticForDeterministicValidationRevision(opts: {
+  deterministicRequiresRevision: boolean;
+  validationOutsideTaskScope: boolean;
+  validationRuns: ValidationExecutionResult[];
+}): boolean {
+  if (!opts.deterministicRequiresRevision || opts.validationOutsideTaskScope) return false;
+  return opts.validationRuns.some(isDeterministicFastValidationFailure);
+}
+
 export function workerAttemptRolloutScore(params: {
   executorElapsedMs: number;
   qualityElapsedMs: number;
@@ -7902,8 +7911,23 @@ export async function executeJob(
       qualityIssues: qualityForCritic.issues,
       changedPaths: quality.changedPaths,
     });
+    const preCriticEffectiveQualityIssues = validationOutsideTaskScope
+      ? quality.issues.filter((issue) => !issue.startsWith("ValidationGate:"))
+      : quality.issues;
+    const preCriticDeterministicRequiresRevision =
+      preCriticEffectiveQualityIssues.length > 0 ||
+      (quality.blocker !== null && !validationOutsideTaskScope);
+    const skipCriticForDeterministicValidationRevision =
+      shouldSkipCriticForDeterministicValidationRevision({
+        deterministicRequiresRevision: preCriticDeterministicRequiresRevision,
+        validationOutsideTaskScope,
+        validationRuns: quality.validationRuns,
+      });
     const critic =
-      quality.skipped || !qualityGatePolicy.criticGateEnabled || skipCriticAfterExecutorTimeout
+      quality.skipped ||
+      !qualityGatePolicy.criticGateEnabled ||
+      skipCriticAfterExecutorTimeout ||
+      skipCriticForDeterministicValidationRevision
         ? null
         : executor === "openai_codex"
           ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog)
@@ -7938,6 +7962,11 @@ export async function executeJob(
       onLog?.(
         "stdout",
         "[CriticGate] Skipping Codex critic after primary Codex executor timeout because deterministic quality and validation are clean.",
+      );
+    } else if (skipCriticForDeterministicValidationRevision) {
+      onLog?.(
+        "stdout",
+        "[CriticGate] Skipping critic because deterministic fast validation already requires a quality revision.",
       );
     }
     const rolloutScore = workerAttemptRolloutScore({
