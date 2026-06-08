@@ -8285,6 +8285,7 @@ function buildWorkerSpawnCommand(options) {
 }
 
 // apps/remotebuddy/src/remotebuddy_main.ts
+var AUTONOMY_TASK_DEDUPE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 var CONFIG = loadPushPalsConfig();
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -8463,6 +8464,11 @@ function buildTaskExecuteDedupeKey(sessionId, params) {
     return null;
   }
   return `task.execute:${normalizedOrigin}:${normalizedSessionId}:${uniqueTargets.join("|")}`.toLowerCase();
+}
+function resolveTaskExecuteDedupeCooldownMs(params, dedupeKey) {
+  if (!dedupeKey)
+    return 0;
+  return params.origin === "autonomy" ? AUTONOMY_TASK_DEDUPE_COOLDOWN_MS : 0;
 }
 function parseAutonomyRequestMetadata(value) {
   let root = asObject2(value);
@@ -9509,6 +9515,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       const dedupeKey = buildTaskExecuteDedupeKey(sessionId, params);
       if (dedupeKey)
         payload.dedupeKey = dedupeKey;
+      const dedupeCooldownMs = resolveTaskExecuteDedupeCooldownMs(params, dedupeKey);
+      if (dedupeCooldownMs > 0)
+        payload.dedupeCooldownMs = dedupeCooldownMs;
       if (targetWorkerId)
         payload.targetWorkerId = targetWorkerId;
       const res = await this.fetchImpl(`${this.server}/jobs/enqueue`, {
@@ -10603,6 +10612,7 @@ if (import.meta.main) {
   });
 }
 export {
+  resolveTaskExecuteDedupeCooldownMs,
   extractRequiredValidationStepsFromVisionMarkdown,
   buildTaskExecuteDedupeKey,
   RemoteBuddyOrchestrator

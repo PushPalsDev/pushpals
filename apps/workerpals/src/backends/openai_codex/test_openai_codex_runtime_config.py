@@ -1386,6 +1386,16 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(watchdog_s, 240)
 
+    def test_narrow_contract_tests_use_fast_no_edit_watchdog(self) -> None:
+        prompt = (
+            "Update app/__tests__/opportunity-graph.contract.test.ts to tighten the "
+            "ranking contract test. Keep this test-only and preserve existing behavior."
+        )
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
+            watchdog_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+
+        self.assertEqual(watchdog_s, 180)
+
     def test_no_edit_recovery_guidance_warns_against_artifact_only_progress(self) -> None:
         guidance = _build_no_edit_recovery_guidance(
             "item.completed | still inspecting",
@@ -1393,6 +1403,8 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
 
         self.assertIn("node_modules", guidance)
+        self.assertIn("patch-first contract", guidance)
+        self.assertIn("Re-reading the target without editing is a failed recovery", guidance)
         self.assertIn("do not invent PushPals/autonomy-specific files", guidance)
         self.assertIn("Previous Codex event trace excerpt", guidance)
 
@@ -1410,6 +1422,15 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(no_edit_s, 240)
         self.assertEqual(rollout_s, 180)
+
+    def test_narrow_contract_rollout_watchdog_is_earlier_than_no_edit_watchdog(self) -> None:
+        prompt = "Tighten the focused contract test for one ranking behavior."
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": ""}, clear=False):
+            no_edit_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+            rollout_s = _resolve_rollout_watchdog_seconds(prompt, 1200, no_edit_s)
+
+        self.assertEqual(no_edit_s, 180)
+        self.assertEqual(rollout_s, 120)
 
     def test_offtrack_rollout_detects_missing_path_and_harness_drift(self) -> None:
         trace = {

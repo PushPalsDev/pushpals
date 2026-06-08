@@ -7,6 +7,7 @@ import { IdempotencyStore } from "../apps/remotebuddy/src/idempotency";
 import { NoopSessionMemory } from "../apps/remotebuddy/src/memory";
 import {
   buildTaskExecuteDedupeKey,
+  resolveTaskExecuteDedupeCooldownMs,
   type TaskExecuteJobParams,
   RemoteBuddyOrchestrator,
 } from "../apps/remotebuddy/src/remotebuddy_main";
@@ -152,6 +153,21 @@ describe("RemoteBuddy task.execute dedupe", () => {
     expect(buildTaskExecuteDedupeKey("dev", autonomy)).toBe(
       "task.execute:autonomy:dev:components/__tests__/animatedselectionring.test.ts",
     );
+  });
+
+  test("resolveTaskExecuteDedupeCooldownMs cools down repeated autonomy same-file work", () => {
+    const user = createUserTaskParams(["components/__tests__/AnimatedSelectionRing.test.ts"]);
+    const autonomy = createAutonomyTaskParams([
+      "components/__tests__/AnimatedSelectionRing.test.ts",
+    ]);
+
+    expect(resolveTaskExecuteDedupeCooldownMs(user, buildTaskExecuteDedupeKey("dev", user))).toBe(
+      0,
+    );
+    expect(
+      resolveTaskExecuteDedupeCooldownMs(autonomy, buildTaskExecuteDedupeKey("dev", autonomy)),
+    ).toBe(6 * 60 * 60 * 1000);
+    expect(resolveTaskExecuteDedupeCooldownMs(autonomy, null)).toBe(0);
   });
 
   test("processRequest reuses the existing task when enqueue dedupes same-file work", async () => {
@@ -318,6 +334,67 @@ describe("RemoteBuddy task.execute dedupe", () => {
     expect(String(taskProgress[1]?.payload.message ?? "")).toContain(
       "Reused active WorkerPal task",
     );
+  }, 15000);
+
+  test("processRequest sends dedupe cooldown for narrow autonomy job enqueue", async () => {
+    const root = makeTempDir();
+    const enqueueBodies: Array<Record<string, unknown>> = [];
+    const targetPath = "tests/remotebuddy.task-dedupe.test.ts";
+
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/jobs/enqueue")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        enqueueBodies.push(body);
+        return new Response(
+          JSON.stringify({ ok: true, jobId: "job-auto-cooldown", taskId: body.taskId }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith("/requests/auto-cooldown/complete")) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch in test: ${url}`);
+    }) as typeof fetch;
+    const orchestrator = createOrchestrator(root, fetchImpl);
+
+    (orchestrator as any).ensureSessionWithRetry = async () => {};
+    (orchestrator as any).ensureSessionEventMonitor = () => {};
+    (orchestrator as any).getRecentJobContext = () => [];
+    (orchestrator as any).selectTargetWorkerForJob = async () => "workerpal-1";
+    (orchestrator as any).sendCommand = async () => {};
+    (orchestrator as any).assistantMessage = async () => {};
+
+    try {
+      await (orchestrator as any).processRequest({
+        id: "auto-cooldown",
+        sessionId: "dev",
+        prompt: `Update ${targetPath} with focused contract coverage`,
+        priority: "background",
+        metadata: {
+          origin: "autonomy",
+          autonomy: {
+            objectiveId: "obj-cooldown",
+            runId: "run-cooldown",
+            snapshotId: "snap-cooldown",
+            patternKey: "pk-cooldown",
+            componentArea: "tests/unit",
+            targetPaths: [targetPath],
+            writeGlobs: [targetPath],
+          },
+        },
+        forceWorker: true,
+        forceLane: "worker",
+      });
+    } finally {
+      await orchestrator.dispose();
+    }
+
+    expect(enqueueBodies).toHaveLength(1);
+    expect(enqueueBodies[0]?.dedupeKey).toBe(
+      "task.execute:autonomy:dev:tests/remotebuddy.task-dedupe.test.ts",
+    );
+    expect(enqueueBodies[0]?.dedupeCooldownMs).toBe(6 * 60 * 60 * 1000);
   }, 15000);
 
   test("processRequest does not create an orphan task when enqueue fails", async () => {

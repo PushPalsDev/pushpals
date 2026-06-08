@@ -109,11 +109,13 @@ _MAX_CREDIBLE_WRAPPER_LOOP_TOP_LEVELS = 4
 _MAX_NO_EDIT_RECOVERY_ATTEMPTS = 1
 _MAX_ROLLOUT_RECOVERY_ATTEMPTS = 1
 _DEFAULT_NO_EDIT_WATCHDOG_S = 480
-_SMALL_TASK_NO_EDIT_WATCHDOG_S = 360
+_SMALL_TASK_NO_EDIT_WATCHDOG_S = 240
+_NARROW_TEST_TASK_NO_EDIT_WATCHDOG_S = 180
 _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
 _DEFAULT_NO_EDIT_RECHECK_S = 120
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
 _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
+_NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
 
 
@@ -591,6 +593,21 @@ def _looks_like_small_task_prompt(prompt: str) -> bool:
         "browser smoke",
         "web delivery",
         "navigation trustworthy",
+        "test-only",
+        "test only",
+        "contract test",
+        "contract coverage",
+        "ranking contract",
+        "focused scenario",
+        "targeted test",
+        "one-file",
+        "one file",
+        "single-file",
+        "single file",
+        "max_files_to_edit: 1",
+        "max_files_to_edit=1",
+        "maxfilestoedit: 1",
+        "maxfilestoedit=1",
     )
     heavy_markers = (
         "merge-conflict",
@@ -605,6 +622,34 @@ def _looks_like_small_task_prompt(prompt: str) -> bool:
     return any(marker in text for marker in small_markers) and not any(
         marker in text for marker in heavy_markers
     )
+
+
+def _looks_like_narrow_test_task_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    if not text:
+        return False
+    narrow_markers = (
+        "contract test",
+        "contract coverage",
+        "ranking contract",
+        "test-only",
+        "test only",
+        "targeted test",
+        "focused scenario",
+    )
+    if not any(marker in text for marker in narrow_markers):
+        return False
+    broad_markers = (
+        "full render harness",
+        "full-surface",
+        "full surface",
+        "e2e",
+        "browser validation",
+        "browser smoke",
+        "migration",
+        "broad refactor",
+    )
+    return not any(marker in text for marker in broad_markers)
 
 
 def _resolve_task_reasoning_effort(
@@ -652,7 +697,9 @@ def _resolve_no_edit_watchdog_seconds(
         return None
 
     prompt_text = str(prompt or "").lower()
-    if "repo-native web review" in prompt_text or "web review path" in prompt_text:
+    if _looks_like_narrow_test_task_prompt(prompt):
+        default_s = _NARROW_TEST_TASK_NO_EDIT_WATCHDOG_S
+    elif "repo-native web review" in prompt_text or "web review path" in prompt_text:
         default_s = _WEB_REVIEW_NO_EDIT_WATCHDOG_S
     else:
         default_s = (
@@ -703,7 +750,9 @@ def _resolve_rollout_watchdog_seconds(
         else:
             return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
 
-    if _looks_like_web_review_prompt(prompt):
+    if _looks_like_narrow_test_task_prompt(prompt):
+        default_s = _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S
+    elif _looks_like_web_review_prompt(prompt):
         default_s = _WEB_REVIEW_ROLLOUT_WATCHDOG_S
     elif _looks_like_small_task_prompt(prompt):
         default_s = _SMALL_TASK_ROLLOUT_WATCHDOG_S
@@ -766,6 +815,8 @@ def _describe_publishable_paths(paths: List[str]) -> str:
 def _build_no_edit_recovery_guidance(trace_excerpt: str, artifact_only_paths: str = "") -> str:
     lines = [
         "No-edit watchdog recovery: the previous Codex attempt spent too much of the execution budget without producing publishable file changes.",
+        "This recovery attempt has a patch-first contract: make one publishable edit before any further broad discovery. If you need one narrow read of the hinted file to place the edit, do that once, then patch immediately.",
+        "Do not repeat the same read/search sequence from the previous attempt. Re-reading the target without editing is a failed recovery.",
         "Start from the already inspected context. Do not re-read broad repo topology, route wrappers, or missing test infrastructure unless that is the blocker.",
         "Runtime/dependency artifacts such as node_modules, outputs, .worktrees, .codex, dist, build, and coverage do not count as progress.",
         "Within the first response/action, edit the smallest behavior-owning file that satisfies the task. If the hinted file is a thin wrapper, patch the owner you already identified.",

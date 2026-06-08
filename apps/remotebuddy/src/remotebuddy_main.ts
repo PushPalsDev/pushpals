@@ -54,6 +54,8 @@ import {
   resolveWorkerStartupTimeoutMs,
 } from "./worker_spawn.js";
 
+const AUTONOMY_TASK_DEDUPE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
@@ -365,6 +367,14 @@ export function buildTaskExecuteDedupeKey(
   }
 
   return `task.execute:${normalizedOrigin}:${normalizedSessionId}:${uniqueTargets.join("|")}`.toLowerCase();
+}
+
+export function resolveTaskExecuteDedupeCooldownMs(
+  params: TaskExecuteJobParams,
+  dedupeKey: string | null,
+): number {
+  if (!dedupeKey) return 0;
+  return params.origin === "autonomy" ? AUTONOMY_TASK_DEDUPE_COOLDOWN_MS : 0;
 }
 
 function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata | null {
@@ -1772,6 +1782,8 @@ export class RemoteBuddyOrchestrator {
       };
       const dedupeKey = buildTaskExecuteDedupeKey(sessionId, params);
       if (dedupeKey) payload.dedupeKey = dedupeKey;
+      const dedupeCooldownMs = resolveTaskExecuteDedupeCooldownMs(params, dedupeKey);
+      if (dedupeCooldownMs > 0) payload.dedupeCooldownMs = dedupeCooldownMs;
       if (targetWorkerId) payload.targetWorkerId = targetWorkerId;
 
       const res = await this.fetchImpl(`${this.server}/jobs/enqueue`, {
