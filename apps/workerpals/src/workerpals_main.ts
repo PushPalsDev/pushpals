@@ -1785,9 +1785,10 @@ async function workerLoop(
                   terminalStage: currentJobPhase ?? (result.ok ? "completed" : "worker"),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
-                  watchdogFired: /timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(
-                    `${result.summary}\n${result.stderr ?? ""}`,
-                  ),
+                  watchdogFired:
+                    /watchdog|rollout coach|timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(
+                      `${result.summary}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`,
+                    ),
                   metadata: {
                     workerId: opts.workerId,
                     docker: Boolean(dockerExecutor),
