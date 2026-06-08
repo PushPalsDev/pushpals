@@ -74,6 +74,7 @@ export interface TaskExecutePlanning {
   validationSteps: string[];
   requiredValidationSteps?: string[];
   repoHintDiagnostics?: string[];
+  repoHintStalePaths?: string[];
   queuePriority: TaskExecutePriority;
   queueWaitBudgetMs: number;
   executionBudgetMs: number;
@@ -6892,6 +6893,7 @@ function sanitizeStalePathHints(
   repo: string,
   values: unknown,
   taskText: string,
+  opts: { dropMissingParentHints?: boolean } = {},
 ): { values: string[]; stale: string[]; diagnostics: string[] } {
   const stale: string[] = [];
   const diagnostics: string[] = [];
@@ -6906,7 +6908,12 @@ function sanitizeStalePathHints(
       continue;
     }
     if (!pathParentExists(repo, raw) && !taskTextAllowsCreatingMissingPaths(taskText)) {
-      diagnostics.push(`Path hint "${raw}" has a missing parent directory; verify the existing repo owner before editing.`);
+      const diagnostic = `Path hint "${raw}" has a missing parent directory; verify the existing repo owner before editing.`;
+      diagnostics.push(diagnostic);
+      if (opts.dropMissingParentHints) {
+        stale.push(raw);
+        continue;
+      }
     }
     out.push(raw);
   }
@@ -6973,7 +6980,9 @@ export function sanitizeTaskExecutePlanningPathHints(
     const normalizedDiscovery: Record<string, unknown> = { ...discovery };
     if (isStringArray(discovery.likelyDirs)) {
       const sanitized = repo
-        ? sanitizeStalePathHints(repo, discovery.likelyDirs, taskText)
+        ? sanitizeStalePathHints(repo, discovery.likelyDirs, taskText, {
+            dropMissingParentHints: true,
+          })
         : { values: toStringArray(discovery.likelyDirs), stale: [], diagnostics: [] };
       normalizedDiscovery.likelyDirs = sanitized.values;
       staleHints.push(...sanitized.stale);
@@ -6995,8 +7004,38 @@ export function sanitizeTaskExecutePlanningPathHints(
   if (repoDiagnostics.length > 0) {
     out.repoHintDiagnostics = Array.from(new Set(repoDiagnostics)).slice(0, 8);
   }
+  if (staleHints.length > 0) {
+    out.repoHintStalePaths = Array.from(new Set(staleHints)).slice(0, 16);
+  }
 
   return out;
+}
+
+export function sanitizePlannerWorkerInstructionPathHints(
+  value: unknown,
+  staleHints: unknown,
+): string | undefined {
+  const text = String(value ?? "").trim();
+  if (!text) return undefined;
+  const normalizedHints = toStringArray(staleHints)
+    .map((hint) => normalizeStagePath(hint))
+    .filter((hint): hint is string => Boolean(hint))
+    .map((hint) => hint.toLowerCase());
+  if (normalizedHints.length === 0) return text;
+
+  const uniqueHints = Array.from(new Set(normalizedHints));
+  const hasStaleHint = (line: string): boolean => {
+    const lower = line.replace(/\\/g, "/").toLowerCase();
+    return uniqueHints.some((hint) => lower.includes(hint));
+  };
+  const lines = text.split(/\r?\n/);
+  const kept = lines.filter((line) => !hasStaleHint(line)).map((line) => line.trim()).filter(Boolean);
+  if (kept.length === lines.length) return text;
+
+  return [
+    "Planner path guidance was sanitized because it referenced paths absent from this checkout; rely on the Task planning contract target path hints and existing repo owners instead.",
+    ...kept,
+  ].join("\n");
 }
 
 function validateTaskExecutePlanning(
@@ -7555,6 +7594,13 @@ export async function executeJob(
     planning: sanitizedPlanning,
     instruction,
   };
+  const sanitizedPlannerWorkerInstruction = sanitizePlannerWorkerInstructionPathHints(
+    params.plannerWorkerInstruction,
+    planning.repoHintStalePaths ?? [],
+  );
+  if (sanitizedPlannerWorkerInstruction !== undefined) {
+    normalizedParams.plannerWorkerInstruction = sanitizedPlannerWorkerInstruction;
+  }
   const executionBudgetMs = Number(planning.executionBudgetMs);
   const finalizationBudgetMs = Number(planning.finalizationBudgetMs);
   const mergeConflictContext = extractMergeConflictReviewContext(normalizedParams);

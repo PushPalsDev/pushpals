@@ -25,6 +25,7 @@ import {
   prepareValidationCommandArgv,
   resolveValidationCommandTimeoutMs,
   runValidationArgv,
+  sanitizePlannerWorkerInstructionPathHints,
   sanitizeTaskExecutePlanningPathHints,
   shouldEnsurePlaywrightBrowserRuntime,
   shouldDeferLongValidationAfterFastFailures,
@@ -587,6 +588,54 @@ describe("workerpals validation command safety", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("drops stale likely directories with missing parents before worker guidance", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-stale-likely-dirs-"));
+    try {
+      mkdirSync(join(root, "app"), { recursive: true });
+      mkdirSync(join(root, "tests"), { recursive: true });
+      writeFileSync(join(root, "app", "_layout.tsx"), "export default function Layout() { return null; }\n");
+      writeFileSync(join(root, "tests", "reactNativeMock.js"), "export const View = 'View';\n");
+
+      const sanitized = sanitizeTaskExecutePlanningPathHints(
+        planningFixture({
+          targetPaths: ["app/_layout.tsx", "tests/reactNativeMock.js"],
+          discovery: {
+            ripgrepQueries: ["reactNativeMock"],
+            likelyDirs: ["apps/client/app", "apps/client/tests", "app", "tests"],
+            keywords: ["app shell"],
+          },
+        }),
+        root,
+        "Fix the existing app shell and React Native mock lint issue.",
+      ) as ReturnType<typeof planningFixture> & {
+        repoHintDiagnostics?: string[];
+        repoHintStalePaths?: string[];
+      };
+
+      expect(sanitized.discovery.likelyDirs).toEqual(["app", "tests"]);
+      expect(sanitized.targetPaths).toEqual(["app/_layout.tsx", "tests/reactNativeMock.js"]);
+      expect(sanitized.repoHintStalePaths).toEqual(["apps/client/app", "apps/client/tests"]);
+      expect(sanitized.repoHintDiagnostics?.join("\n")).toContain("missing parent directory");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("strips stale planner prose before it reaches worker guidance", () => {
+    const guidance = sanitizePlannerWorkerInstructionPathHints(
+      [
+        "Inspect apps/client/app/_layout.tsx and apps/client/tests/reactNativeMock.js first.",
+        "Validate with bun run lint, bunx tsc --noEmit, and bun test.",
+      ].join("\n"),
+      ["apps/client/app", "apps/client/tests"],
+    );
+
+    expect(guidance).toContain("Planner path guidance was sanitized");
+    expect(guidance).not.toContain("apps/client/app");
+    expect(guidance).not.toContain("apps/client/tests");
+    expect(guidance).toContain("Validate with bun run lint");
   });
 
   test("injects the sandbox Expo port into browser script validation commands", () => {
