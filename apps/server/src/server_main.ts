@@ -82,6 +82,10 @@ const SERVER_STARTED_AT_ISO = new Date(SERVER_STARTED_AT_MS).toISOString();
 const AUTONOMY_BUSY_QUEUE_MAX_REQUESTS = 5;
 const AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS = 10;
 const AUTONOMY_WORKER_TTL_MS = 15_000;
+const AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS = 60 * 60 * 1000;
+const AUTONOMY_WORKER_FAILURE_CIRCUIT_THRESHOLD = 3;
+const AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE = 0.5;
+const AUTONOMY_WORKER_FAILURE_DEFER_MS = 30 * 60 * 1000;
 const CLIENT_TRANSPORT_HEARTBEAT_MS = 15_000;
 const SESSION_TOKEN_BUDGET = Math.max(0, STARTUP_CONFIG.server.sessionTokenBudget);
 
@@ -368,13 +372,40 @@ export function createRequestHandler() {
           regressionFlag: false,
         };
       };
-      const isAutonomyRequestPayload = (value: Record<string, unknown>): boolean => {
-        const metadata = value.metadata ?? value.meta;
-        if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
-        const origin = String((metadata as Record<string, unknown>).origin ?? "")
+      const recordHasAutonomyOrigin = (value: unknown): boolean => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        const record = value as Record<string, unknown>;
+        const origin = String(record.origin ?? "")
           .trim()
           .toLowerCase();
         return origin === "autonomy";
+      };
+      const isAutonomyRequestPayload = (value: Record<string, unknown>): boolean =>
+        [value.metadata, value.meta, value.params, value].some(recordHasAutonomyOrigin);
+      const autonomyFailureCircuitSummary = () =>
+        jobQueue.noPublishableFailureCircuitSummary({
+          windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
+          threshold: AUTONOMY_WORKER_FAILURE_CIRCUIT_THRESHOLD,
+          failureRateThreshold: AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE,
+        });
+      const autonomyFailureCircuitMessage = (
+        failureCircuit: ReturnType<typeof autonomyFailureCircuitSummary>,
+      ): string =>
+        `Autonomy enqueue blocked: WorkerPal produced ` +
+        `${failureCircuit.noPublishableFailureCount} no-publishable/no-edit failure(s) ` +
+        `across ${failureCircuit.terminalCount} recent terminal task(s).`;
+      const makeAutonomyFailureCircuitResponse = (): Response | null => {
+        const failureCircuit = autonomyFailureCircuitSummary();
+        if (!failureCircuit.blocked) return null;
+        return makeJson(
+          {
+            ok: false,
+            code: "autonomy_worker_failure_circuit_open",
+            message: autonomyFailureCircuitMessage(failureCircuit),
+            ...failureCircuit,
+          },
+          429,
+        );
       };
       const parseRuntimeMutations = (value: unknown): RuntimeConfigMutation[] => {
         if (!Array.isArray(value)) return [];
@@ -863,6 +894,10 @@ export function createRequestHandler() {
             429,
           );
         }
+        if (isAutonomyRequestPayload(body)) {
+          const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
+          if (failureCircuitResponse) return failureCircuitResponse;
+        }
         const result = jobQueue.enqueue(body);
         return makeJson(result, result.ok ? 201 : 400);
       }
@@ -879,14 +914,38 @@ export function createRequestHandler() {
         let skipped = 0;
         while (result.ok && result.job?.id && skipped < 64) {
           const budgetStatus = getSessionTokenBudgetStatus(result.job.sessionId);
-          if (!budgetStatus?.exceeded) break;
-          emitSessionBudgetPauseNotice(result.job.sessionId, budgetStatus);
-          jobQueue.fail(result.job.id, {
-            message: "Session token budget exceeded",
-            detail: sessionTokenBudgetMessage(budgetStatus),
-          });
-          skipped += 1;
-          result = jobQueue.claim(workerId);
+          if (budgetStatus?.exceeded) {
+            emitSessionBudgetPauseNotice(result.job.sessionId, budgetStatus);
+            jobQueue.fail(result.job.id, {
+              message: "Session token budget exceeded",
+              detail: sessionTokenBudgetMessage(budgetStatus),
+            });
+            skipped += 1;
+            result = jobQueue.claim(workerId);
+            continue;
+          }
+          if (
+            isAutonomyRequestPayload({
+              ...result.job,
+              params: parseJsonRecord(result.job.params),
+            })
+          ) {
+            const failureCircuit = autonomyFailureCircuitSummary();
+            if (failureCircuit.blocked) {
+              jobQueue.defer(result.job.id, {
+                workerId,
+                deferMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
+                detail: JSON.stringify({
+                  code: "autonomy_worker_failure_circuit_open",
+                  ...failureCircuit,
+                }),
+              });
+              skipped += 1;
+              result = jobQueue.claim(workerId);
+              continue;
+            }
+          }
+          break;
         }
         if (result.ok && result.job?.id) {
           const params = parseJsonRecord(result.job.params ?? "");
@@ -932,9 +991,8 @@ export function createRequestHandler() {
         const busyWorkers = onlineWorkers.filter((worker) => worker.activeJobCount > 0).length;
         const taskExecutePending = jobQueue.countByKindAndStatus("task.execute", "pending");
         const taskExecuteClaimed = jobQueue.countByKindAndStatus("task.execute", "claimed");
-        const autoscalableTaskExecutePending = jobQueue.countAutoscalablePendingByKind(
-          "task.execute",
-        );
+        const autoscalableTaskExecutePending =
+          jobQueue.countAutoscalablePendingByKind("task.execute");
         const openUnmergedWorkerPrs = jobQueue.countOpenUnmergedWorkerPrs();
         return makeJson({
           ok: true,
@@ -996,9 +1054,7 @@ export function createRequestHandler() {
           Number(jobSlo.completed ?? 0) + failedJobs + abandonedJobs + publishBlockedJobs,
         );
         const jobFailureRate =
-          jobTerminal > 0
-            ? (failedJobs + abandonedJobs + publishBlockedJobs) / jobTerminal
-            : 0;
+          jobTerminal > 0 ? (failedJobs + abandonedJobs + publishBlockedJobs) / jobTerminal : 0;
         const autonomyOps = autonomyStore.getOpsSummary({
           requestPending: Math.max(0, Number(requestCounts.pending ?? 0)),
           jobFailureRate,
@@ -1935,6 +1991,9 @@ export function createRequestHandler() {
           );
         }
         if (isAutonomyRequestPayload(body)) {
+          const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
+          if (failureCircuitResponse) return failureCircuitResponse;
+
           const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
           const schedulableWorkers = workers.filter(
             (worker) => worker.isOnline && worker.status !== "offline",
@@ -1996,14 +2055,32 @@ export function createRequestHandler() {
         let skipped = 0;
         while (result.ok && result.request?.id && skipped < 64) {
           const budgetStatus = getSessionTokenBudgetStatus(result.request.sessionId);
-          if (!budgetStatus?.exceeded) break;
-          emitSessionBudgetPauseNotice(result.request.sessionId, budgetStatus);
-          requestQueue.fail(result.request.id, {
-            message: "Session token budget exceeded",
-            detail: sessionTokenBudgetMessage(budgetStatus),
-          });
-          skipped += 1;
-          result = requestQueue.claim(agentId);
+          if (budgetStatus?.exceeded) {
+            emitSessionBudgetPauseNotice(result.request.sessionId, budgetStatus);
+            requestQueue.fail(result.request.id, {
+              message: "Session token budget exceeded",
+              detail: sessionTokenBudgetMessage(budgetStatus),
+            });
+            skipped += 1;
+            result = requestQueue.claim(agentId);
+            continue;
+          }
+          if (isAutonomyRequestPayload(result.request as unknown as Record<string, unknown>)) {
+            const failureCircuit = autonomyFailureCircuitSummary();
+            if (failureCircuit.blocked) {
+              requestQueue.fail(result.request.id, {
+                message: autonomyFailureCircuitMessage(failureCircuit),
+                detail: JSON.stringify({
+                  code: "autonomy_worker_failure_circuit_open",
+                  ...failureCircuit,
+                }),
+              });
+              skipped += 1;
+              result = requestQueue.claim(agentId);
+              continue;
+            }
+          }
+          break;
         }
         return makeJson(result, result.ok ? 200 : 404);
       }

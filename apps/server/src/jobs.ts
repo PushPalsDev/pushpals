@@ -82,6 +82,18 @@ export interface JobLogRow {
   message: string;
 }
 
+export interface NoPublishableFailureCircuitSummary {
+  blocked: boolean;
+  windowMs: number;
+  threshold: number;
+  failureRateThreshold: number;
+  terminalCount: number;
+  noPublishableFailureCount: number;
+  noPublishableFailureRate: number;
+  completedCount: number;
+  lastFailureAt: string | null;
+}
+
 interface ToolRunDbRow {
   id: string;
   jobId: string | null;
@@ -266,7 +278,9 @@ function compactDbText(value: unknown, maxChars: number): string | null {
 function boolFromUnknown(value: unknown): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;
-  const text = String(value ?? "").trim().toLowerCase();
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
   return ["1", "true", "yes", "on"].includes(text);
 }
 
@@ -491,7 +505,8 @@ function classifyJobRetrySafety(
     }
     return {
       retrySafety: "manual_retry_required",
-      reason: "task.execute may mutate repository or publish side effects and is not auto-requeue safe",
+      reason:
+        "task.execute may mutate repository or publish side effects and is not auto-requeue safe",
     };
   }
   return {
@@ -1515,7 +1530,7 @@ export class JobQueue {
                updatedAt = ?
            WHERE id = ?
              AND status = 'claimed'
-             AND (? IS NULL OR workerId = ?)` ,
+             AND (? IS NULL OR workerId = ?)`,
         )
         .run(
           abandonmentError,
@@ -1604,7 +1619,7 @@ export class JobQueue {
              updatedAt = ?
          WHERE id = ?
            AND status = 'claimed'
-           AND (? IS NULL OR workerId = ?)` ,
+           AND (? IS NULL OR workerId = ?)`,
       )
       .run(
         failureError,
@@ -1720,9 +1735,7 @@ export class JobQueue {
     if (rows.length === 0) return;
 
     const mismatchedRows =
-      status === "busy" && currentJobId
-        ? rows.filter((row) => row.jobId !== currentJobId)
-        : rows;
+      status === "busy" && currentJobId ? rows.filter((row) => row.jobId !== currentJobId) : rows;
     if (mismatchedRows.length === 0) return;
 
     const nowMs = Date.parse(now);
@@ -2153,7 +2166,9 @@ export class JobQueue {
     }
     const now = new Date().toISOString();
     const deferMsRaw = Number.parseInt(String(body.deferMs ?? ""), 10);
-    const deferMs = Number.isFinite(deferMsRaw) ? Math.max(1_000, Math.min(deferMsRaw, 30 * 60_000)) : 60_000;
+    const deferMs = Number.isFinite(deferMsRaw)
+      ? Math.max(1_000, Math.min(deferMsRaw, 30 * 60_000))
+      : 60_000;
     const availableAt = new Date(Date.now() + deferMs).toISOString();
 
     const info = this.db
@@ -2492,23 +2507,21 @@ export class JobQueue {
     return counts;
   }
 
-  countByKindAndStatus(
-    kind: string,
-    statuses: JobStatus | JobStatus[],
-  ): number {
+  countByKindAndStatus(kind: string, statuses: JobStatus | JobStatus[]): number {
     const normalizedKind = String(kind ?? "").trim();
     if (!normalizedKind) return 0;
     const requestedStatuses = Array.isArray(statuses) ? statuses : [statuses];
-    const normalizedStatuses = [...new Set(requestedStatuses.map((status) => String(status).trim()))]
-      .filter(
-        (status) =>
-          status === "pending" ||
-          status === "claimed" ||
-          status === "completed" ||
-          status === "failed" ||
-          status === "abandoned" ||
-          status === "publish_blocked",
-      );
+    const normalizedStatuses = [
+      ...new Set(requestedStatuses.map((status) => String(status).trim())),
+    ].filter(
+      (status) =>
+        status === "pending" ||
+        status === "claimed" ||
+        status === "completed" ||
+        status === "failed" ||
+        status === "abandoned" ||
+        status === "publish_blocked",
+    );
     if (normalizedStatuses.length === 0) return 0;
     const placeholders = normalizedStatuses.map(() => "?").join(", ");
     const row = this.db
@@ -2764,6 +2777,107 @@ export class JobQueue {
     };
   }
 
+  noPublishableFailureCircuitSummary(options?: {
+    windowMs?: number;
+    threshold?: number;
+    failureRateThreshold?: number;
+  }): NoPublishableFailureCircuitSummary {
+    const windowMs = Math.max(
+      60_000,
+      Math.min(24 * 60 * 60 * 1000, Math.floor(options?.windowMs ?? 60 * 60 * 1000)),
+    );
+    const threshold = Math.max(1, Math.min(100, Math.floor(options?.threshold ?? 3)));
+    const failureRateThreshold = Math.max(
+      0,
+      Math.min(1, Number(options?.failureRateThreshold ?? 0.5)),
+    );
+    const cutoffIso = new Date(Date.now() - windowMs).toISOString();
+    const row = this.db
+      .prepare(
+        `SELECT
+           COUNT(*) AS terminalCount,
+           SUM(CASE WHEN j.status = 'completed' THEN 1 ELSE 0 END) AS completedCount,
+           SUM(
+             CASE
+               WHEN j.status = 'failed'
+                AND (
+                  d.failureClass = 'artifact_only_no_publishable_patch'
+                  OR d.summary LIKE '%no publishable changes%'
+                  OR d.summary LIKE '%no publishable file changes%'
+                  OR d.summary LIKE '%no-edit watchdog%'
+                  OR EXISTS (
+                    SELECT 1
+                    FROM job_attempts a
+                    WHERE a.jobId = j.id
+                      AND (
+                        a.terminalReason LIKE '%no publishable changes%'
+                        OR a.terminalReason LIKE '%no publishable file changes%'
+                        OR a.terminalReason LIKE '%no-edit watchdog%'
+                      )
+                  )
+                )
+               THEN 1
+               ELSE 0
+             END
+           ) AS noPublishableFailureCount,
+           MAX(
+             CASE
+               WHEN j.status = 'failed'
+                AND (
+                  d.failureClass = 'artifact_only_no_publishable_patch'
+                  OR d.summary LIKE '%no publishable changes%'
+                  OR d.summary LIKE '%no publishable file changes%'
+                  OR d.summary LIKE '%no-edit watchdog%'
+                  OR EXISTS (
+                    SELECT 1
+                    FROM job_attempts a
+                    WHERE a.jobId = j.id
+                      AND (
+                        a.terminalReason LIKE '%no publishable changes%'
+                        OR a.terminalReason LIKE '%no publishable file changes%'
+                        OR a.terminalReason LIKE '%no-edit watchdog%'
+                      )
+                  )
+                )
+               THEN COALESCE(j.failedAt, d.updatedAt, j.updatedAt)
+               ELSE NULL
+             END
+           ) AS lastFailureAt
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.kind = 'task.execute'
+           AND j.status IN ('completed', 'failed', 'abandoned', 'publish_blocked')
+           AND j.updatedAt >= ?`,
+      )
+      .get(cutoffIso) as
+      | {
+          terminalCount: number | null;
+          completedCount: number | null;
+          noPublishableFailureCount: number | null;
+          lastFailureAt: string | null;
+        }
+      | undefined;
+
+    const terminalCount = Math.max(0, Number(row?.terminalCount ?? 0));
+    const noPublishableFailureCount = Math.max(0, Number(row?.noPublishableFailureCount ?? 0));
+    const completedCount = Math.max(0, Number(row?.completedCount ?? 0));
+    const noPublishableFailureRate =
+      terminalCount > 0 ? Number((noPublishableFailureCount / terminalCount).toFixed(4)) : 0;
+
+    return {
+      blocked:
+        noPublishableFailureCount >= threshold && noPublishableFailureRate >= failureRateThreshold,
+      windowMs,
+      threshold,
+      failureRateThreshold,
+      terminalCount,
+      noPublishableFailureCount,
+      noPublishableFailureRate,
+      completedCount,
+      lastFailureAt: row?.lastFailureAt ?? null,
+    };
+  }
+
   addLog(jobId: string, message: string, ts?: string): number | null {
     const now = coerceIsoTimestamp(ts) ?? new Date().toISOString();
     let insertedId: number | null = null;
@@ -2828,7 +2942,10 @@ export class JobQueue {
     const envProfile = compactDbText(body.envProfile, 128);
     const cwd = compactDbText(body.cwd, 1000);
     const argv = Array.isArray(body.argv)
-      ? body.argv.map((arg) => String(arg ?? "").trim()).filter(Boolean).slice(0, 80)
+      ? body.argv
+          .map((arg) => String(arg ?? "").trim())
+          .filter(Boolean)
+          .slice(0, 80)
       : [];
     const commandLine = compactDbText(body.commandLine, 2000);
     const allowedEffects = Array.isArray(body.allowedEffects)
@@ -2842,7 +2959,10 @@ export class JobQueue {
     const exitCodeRaw = Number(body.exitCode);
     const exitCode = Number.isFinite(exitCodeRaw) ? Math.trunc(exitCodeRaw) : null;
     const stdoutTail = truncateToolText(redactToolText(body.stdoutTail ?? body.stdout), 8_000);
-    const stderrTail = truncateToolText(redactToolText(body.stderrTail ?? body.stderr ?? body.detail), 8_000);
+    const stderrTail = truncateToolText(
+      redactToolText(body.stderrTail ?? body.stderr ?? body.detail),
+      8_000,
+    );
     const tool = inferToolNameFromFailureText({
       tool: normalizeToolName(body.tool ?? "shell"),
       argv,
@@ -2890,17 +3010,19 @@ export class JobQueue {
           body.retryable !== null &&
           acceptsClientFailureClass
         ? boolFromUnknown(body.retryable)
-        : classification?.retryable ?? false;
+        : (classification?.retryable ?? false);
     const clientRemediation = compactDbText(body.remediation, 1000);
     const remediation =
       ok || (failureClass === clientFailureClass && acceptsClientFailureClass)
-        ? clientRemediation ?? classification?.remediation ?? null
-        : classification?.remediation ?? clientRemediation ?? null;
+        ? (clientRemediation ?? classification?.remediation ?? null)
+        : (classification?.remediation ?? clientRemediation ?? null);
     const finishedAt = coerceIsoTimestamp(body.finishedAt) ?? now;
     const startedAt = coerceIsoTimestamp(body.startedAt) ?? finishedAt;
     const durationRaw = Number(body.durationMs);
     const durationMs =
-      Number.isFinite(durationRaw) && durationRaw >= 0 ? Math.min(Math.trunc(durationRaw), 86_400_000) : 0;
+      Number.isFinite(durationRaw) && durationRaw >= 0
+        ? Math.min(Math.trunc(durationRaw), 86_400_000)
+        : 0;
     const metadata =
       body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
         ? (sanitizeToolRunMetadata(body.metadata) as Record<string, unknown>)
