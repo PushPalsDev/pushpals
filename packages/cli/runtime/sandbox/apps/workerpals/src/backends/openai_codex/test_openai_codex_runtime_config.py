@@ -1407,6 +1407,29 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(watchdog_s, 180)
 
+    def test_no_edit_recovery_attempt_uses_patch_first_watchdog(self) -> None:
+        prompt = "Investigate a broad reliability issue and make the smallest safe fix."
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
+            first_attempt_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+            recovery_attempt_s = _resolve_no_edit_watchdog_seconds(
+                prompt,
+                1200,
+                recovery_attempt=1,
+            )
+
+        self.assertEqual(first_attempt_s, 480)
+        self.assertEqual(recovery_attempt_s, 180)
+
+    def test_explicit_no_edit_watchdog_override_still_controls_recovery_attempts(self) -> None:
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "300"}, clear=False):
+            watchdog_s = _resolve_no_edit_watchdog_seconds(
+                "Investigate a broad reliability issue.",
+                1200,
+                recovery_attempt=1,
+            )
+
+        self.assertEqual(watchdog_s, 300)
+
     def test_review_fix_contract_level_tests_use_fast_no_edit_watchdog(self) -> None:
         prompt = (
             "Restore exact score assertions for contract-level tests where score is part "

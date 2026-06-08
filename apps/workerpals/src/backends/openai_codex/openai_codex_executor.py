@@ -112,6 +112,7 @@ _DEFAULT_NO_EDIT_WATCHDOG_S = 480
 _SMALL_TASK_NO_EDIT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_NO_EDIT_WATCHDOG_S = 180
 _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
+_NO_EDIT_RECOVERY_WATCHDOG_S = 180
 _DEFAULT_NO_EDIT_RECHECK_S = 120
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
 _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
@@ -684,6 +685,7 @@ def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> 
 def _resolve_no_edit_watchdog_seconds(
     prompt: str,
     communicate_timeout_s: Optional[int],
+    recovery_attempt: int = 0,
 ) -> Optional[int]:
     if not communicate_timeout_s:
         return None
@@ -714,6 +716,8 @@ def _resolve_no_edit_watchdog_seconds(
             if _looks_like_small_task_prompt(prompt)
             else _DEFAULT_NO_EDIT_WATCHDOG_S
         )
+    if recovery_attempt > 0:
+        default_s = min(default_s, _NO_EDIT_RECOVERY_WATCHDOG_S)
     return max(120, min(default_s, max(120, communicate_timeout_s - 60)))
 
 
@@ -2259,7 +2263,11 @@ def _run_codex_task(
             rollout_watchdog_retryable = True
             command_policy_rejection_loop = False
             no_edit_watchdog_s = (
-                _resolve_no_edit_watchdog_seconds(prompt, communicate_timeout_s)
+                _resolve_no_edit_watchdog_seconds(
+                    prompt,
+                    communicate_timeout_s,
+                    recovery_attempt=no_edit_recovery_attempt,
+                )
                 if no_edit_recovery_attempt <= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
                 else None
             )
