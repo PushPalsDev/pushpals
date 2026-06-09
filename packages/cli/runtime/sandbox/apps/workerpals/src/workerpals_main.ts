@@ -450,7 +450,7 @@ function mergeWorkerDiagnostics(
 function inferWorkerTerminalFailureClass(result: JobResult): string {
   if (result.ok) return "success";
   const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
-  if (/timed out|timeout|signal 15|terminated|exit 143|exit 137/.test(text)) return "timeout";
+  if (/timed out|timeout|signal 15|terminated|exit 143|exit 137|stalled before first response|startup stall/.test(text)) return "timeout";
   if (/no publishable|non-publishable|node_modules/.test(text)) return "artifact_only_no_publishable_patch";
   if (/validationgate|validation/.test(text)) return "validation";
   if (/scopegate|scope/.test(text)) return "scope";

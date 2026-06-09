@@ -106,6 +106,7 @@ _MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS = 1_200
 _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
 _MAX_CREDIBLE_WRAPPER_LOOP_CHANGED_PATHS = 8
 _MAX_CREDIBLE_WRAPPER_LOOP_TOP_LEVELS = 4
+_MAX_STARTUP_STALL_RECOVERY_ATTEMPTS = 1
 _MAX_NO_EDIT_RECOVERY_ATTEMPTS = 1
 _MAX_ROLLOUT_RECOVERY_ATTEMPTS = 1
 _DEFAULT_NO_EDIT_WATCHDOG_S = 480
@@ -121,6 +122,7 @@ _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
 _BACKGROUND_ROLLOUT_WATCHDOG_S = 90
 _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS = 10 * 60 * 1000
+_CODEX_STARTUP_ONLY_EVENT_TYPES = {"thread.started", "turn.started"}
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -862,11 +864,54 @@ def _build_no_edit_recovery_guidance(trace_excerpt: str, artifact_only_paths: st
     return "\n".join(lines)
 
 
+def _build_startup_stall_recovery_guidance(trace_excerpt: str) -> str:
+    lines = [
+        "Codex startup-stall recovery: the previous Codex subprocess started but emitted no assistant, tool, or reasoning progress before the watchdog.",
+        "Treat this as a fresh execution with a patch-first contract. After at most one narrow read of the hinted owner, make the smallest publishable edit.",
+        "Do not spend this recovery attempt re-reading broad repository topology or validating before an edit exists.",
+        "If the hinted path is absent, choose the nearest existing repo-native owner or test rather than creating unrelated scaffolding.",
+    ]
+    if trace_excerpt:
+        lines.append("Previous Codex event trace excerpt:")
+        lines.append(trace_excerpt)
+    return "\n".join(lines)
+
+
 def _trace_summaries_text(trace: Dict[str, Any]) -> str:
     summaries = trace.get("summaries")
     if not isinstance(summaries, list):
         return ""
     return "\n".join(str(item or "") for item in summaries[-80:]).lower()
+
+
+def _codex_trace_has_work_progress(trace: Dict[str, Any]) -> bool:
+    if to_int(trace.get("reasoning_events"), 0) > 0:
+        return True
+
+    event_counts = trace.get("event_type_counts")
+    if isinstance(event_counts, dict):
+        for key, value in event_counts.items():
+            event_type = str(key or "").strip()
+            if to_int(value, 0) > 0 and event_type not in _CODEX_STARTUP_ONLY_EVENT_TYPES:
+                return True
+
+    summaries = trace.get("summaries")
+    if isinstance(summaries, list):
+        for item in summaries:
+            summary = str(item or "").strip()
+            if not summary:
+                continue
+            event_type = summary.split("|", 1)[0].strip()
+            if event_type not in _CODEX_STARTUP_ONLY_EVENT_TYPES:
+                return True
+
+    return False
+
+
+def _codex_trace_is_startup_stall(trace: Dict[str, Any]) -> bool:
+    if to_int(trace.get("total_tokens"), 0) > 0:
+        return False
+    return not _codex_trace_has_work_progress(trace)
 
 
 def _detect_offtrack_rollout(trace: Dict[str, Any], artifact_only_paths: str = "") -> str:
@@ -1981,6 +2026,7 @@ def _run_codex_task(
     *,
     wrapper_recovery_attempt: int = 0,
     model_compatibility_recovery_attempt: int = 0,
+    startup_stall_recovery_attempt: int = 0,
     no_edit_recovery_attempt: int = 0,
     rollout_recovery_attempt: int = 0,
     model_override: Optional[str] = None,
@@ -2475,6 +2521,7 @@ def _run_codex_task(
                     retry_guidance,
                     wrapper_recovery_attempt=wrapper_recovery_attempt,
                     model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                    startup_stall_recovery_attempt=startup_stall_recovery_attempt,
                     no_edit_recovery_attempt=no_edit_recovery_attempt,
                     rollout_recovery_attempt=rollout_recovery_attempt + 1,
                     model_override=model_override,
@@ -2497,6 +2544,54 @@ def _run_codex_task(
             }
 
         if no_edit_watchdog_fired:
+            startup_stall = _codex_trace_is_startup_stall(stdout_trace)
+            if startup_stall and startup_stall_recovery_attempt < _MAX_STARTUP_STALL_RECOVERY_ATTEMPTS:
+                retry_guidance = [
+                    *supplemental_guidance,
+                    _build_startup_stall_recovery_guidance(trace_excerpt),
+                ]
+                log.warning(
+                    "Codex emitted only startup events before the no-edit watchdog; "
+                    "restarting Codex once before classifying the job terminally."
+                )
+                retry_result = _run_codex_task(
+                    repo,
+                    instruction,
+                    retry_guidance,
+                    wrapper_recovery_attempt=wrapper_recovery_attempt,
+                    model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                    startup_stall_recovery_attempt=startup_stall_recovery_attempt + 1,
+                    no_edit_recovery_attempt=no_edit_recovery_attempt,
+                    rollout_recovery_attempt=rollout_recovery_attempt,
+                    model_override=model_override,
+                    baseline_changes=baseline_snapshot,
+                )
+                retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
+                if retry_result.get("ok"):
+                    recovered_stdout = str(retry_result.get("stdout") or "").strip()
+                    retry_result["stdout"] = _truncate(
+                        (
+                            "Recovered after the first Codex subprocess stalled before emitting "
+                            f"assistant/tool progress.\n\n{recovered_stdout}"
+                        ).strip()
+                    )
+                return retry_result
+            if startup_stall:
+                detail = (
+                    "Codex subprocess started but did not emit assistant, tool, reasoning, "
+                    "or usage progress before the startup watchdog."
+                )
+                if trace_excerpt:
+                    detail = f"{detail}\n{trace_excerpt}"
+                return {
+                    "ok": False,
+                    "summary": "openai_codex stalled before first response",
+                    "stdout": _truncate(stdout),
+                    "stderr": _truncate(f"{detail}\n{stderr}".strip()),
+                    "exitCode": 124,
+                    "usage": usage,
+                    "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
+                }
             if no_edit_recovery_attempt < _MAX_NO_EDIT_RECOVERY_ATTEMPTS:
                 retry_guidance = [
                     *supplemental_guidance,
@@ -2511,6 +2606,7 @@ def _run_codex_task(
                     retry_guidance,
                     wrapper_recovery_attempt=wrapper_recovery_attempt,
                     model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                    startup_stall_recovery_attempt=startup_stall_recovery_attempt,
                     no_edit_recovery_attempt=no_edit_recovery_attempt + 1,
                     rollout_recovery_attempt=rollout_recovery_attempt,
                     model_override=model_override,
@@ -2706,6 +2802,7 @@ def _run_codex_task(
                         ],
                         wrapper_recovery_attempt=wrapper_recovery_attempt + 1,
                         model_compatibility_recovery_attempt=model_compatibility_recovery_attempt,
+                        startup_stall_recovery_attempt=startup_stall_recovery_attempt,
                         no_edit_recovery_attempt=no_edit_recovery_attempt,
                         rollout_recovery_attempt=rollout_recovery_attempt,
                         model_override=model_override,
@@ -2820,6 +2917,7 @@ def _run_codex_task(
                     effective_supplemental_guidance,
                     wrapper_recovery_attempt=wrapper_recovery_attempt,
                     model_compatibility_recovery_attempt=model_compatibility_recovery_attempt + 1,
+                    startup_stall_recovery_attempt=startup_stall_recovery_attempt,
                     no_edit_recovery_attempt=no_edit_recovery_attempt,
                     rollout_recovery_attempt=rollout_recovery_attempt,
                     model_override=LEGACY_CODEX_MODEL_FALLBACK,

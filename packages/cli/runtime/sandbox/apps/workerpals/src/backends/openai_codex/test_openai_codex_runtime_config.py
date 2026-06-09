@@ -1029,6 +1029,159 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertNotIn("broad/noisy", str(result.get("summary") or ""))
         self.assertNotIn("too broad/noisy", str(result.get("stderr") or ""))
 
+    def test_run_codex_task_retries_once_when_codex_stalls_before_first_response(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-startup-stall-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# startup stall repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed startup stall repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_startup_stall.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import json",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'Codex startup-stall recovery' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/startup-stall-recovered.txt').write_text('patched after restart\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched after Codex startup-stall recovery.', encoding='utf-8')",
+                        "    print(json.dumps({'type': 'item.completed', 'message': 'Patched after Codex startup-stall recovery.'}), flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-startup-stall-test-key",
+                "WORKERPALS_OPENAI_CODEX_JSON": "true",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Rename one misleading test fixture constant and update the related assertions.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        stdout = str(result.get("stdout") or "")
+        self.assertIn("Recovered after the first Codex subprocess stalled", stdout)
+        self.assertIn("Patched after Codex startup-stall recovery", stdout)
+        self.assertIn("src/", stdout)
+
+    def test_run_codex_task_reports_startup_stall_when_restart_also_never_responds(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-startup-stall-fail-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# startup stall failure repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed startup stall failure repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_startup_stall_fail.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-startup-stall-fail-test-key",
+                "WORKERPALS_OPENAI_CODEX_JSON": "true",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Rename one misleading test fixture constant and update the related assertions.",
+                    [],
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertEqual(result.get("summary"), "openai_codex stalled before first response")
+        self.assertNotIn("no publishable", str(result.get("summary") or "").lower())
+        self.assertEqual(result.get("cooldownMs"), 600000)
+
     def test_run_codex_task_retries_once_when_no_edit_watchdog_fires(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-") as temp_dir:
             repo = Path(temp_dir) / "repo"
