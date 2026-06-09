@@ -2845,6 +2845,20 @@ export class JobQueue {
            SUM(
              CASE
                WHEN j.status = 'failed'
+                AND NOT (
+                  d.failureClass = 'codex_startup_stall'
+                  OR d.summary LIKE '%stalled before first response%'
+                  OR d.summary LIKE '%startup stall%'
+                  OR EXISTS (
+                    SELECT 1
+                    FROM job_attempts a
+                    WHERE a.jobId = j.id
+                      AND (
+                        a.terminalReason LIKE '%stalled before first response%'
+                        OR a.terminalReason LIKE '%startup stall%'
+                      )
+                  )
+                )
                 AND (
                   d.failureClass = 'artifact_only_no_publishable_patch'
                   OR d.summary LIKE '%no publishable changes%'
@@ -2868,6 +2882,20 @@ export class JobQueue {
            MAX(
              CASE
                WHEN j.status = 'failed'
+                AND NOT (
+                  d.failureClass = 'codex_startup_stall'
+                  OR d.summary LIKE '%stalled before first response%'
+                  OR d.summary LIKE '%startup stall%'
+                  OR EXISTS (
+                    SELECT 1
+                    FROM job_attempts a
+                    WHERE a.jobId = j.id
+                      AND (
+                        a.terminalReason LIKE '%stalled before first response%'
+                        OR a.terminalReason LIKE '%startup stall%'
+                      )
+                  )
+                )
                 AND (
                   d.failureClass = 'artifact_only_no_publishable_patch'
                   OR d.summary LIKE '%no publishable changes%'
@@ -2956,6 +2984,20 @@ export class JobQueue {
          WHERE j.kind = 'task.execute'
            AND j.status = 'failed'
            AND j.updatedAt >= ?
+           AND NOT (
+             d.failureClass = 'codex_startup_stall'
+             OR d.summary LIKE '%stalled before first response%'
+             OR d.summary LIKE '%startup stall%'
+             OR EXISTS (
+               SELECT 1
+               FROM job_attempts a
+               WHERE a.jobId = j.id
+                 AND (
+                   a.terminalReason LIKE '%stalled before first response%'
+                   OR a.terminalReason LIKE '%startup stall%'
+                 )
+             )
+           )
            AND (
              d.failureClass = 'artifact_only_no_publishable_patch'
              OR d.summary LIKE '%no publishable changes%'

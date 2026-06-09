@@ -447,10 +447,16 @@ function mergeWorkerDiagnostics(
   };
 }
 
-function inferWorkerTerminalFailureClass(result: JobResult): string {
+function isCodexStartupStallResult(result: JobResult): boolean {
+  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  return /stalled before first response|startup stall/.test(text);
+}
+
+export function inferWorkerTerminalFailureClass(result: JobResult): string {
   if (result.ok) return "success";
   const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
-  if (/timed out|timeout|signal 15|terminated|exit 143|exit 137|stalled before first response|startup stall/.test(text)) return "timeout";
+  if (isCodexStartupStallResult(result)) return "codex_startup_stall";
+  if (/timed out|timeout|signal 15|terminated|exit 143|exit 137/.test(text)) return "timeout";
   if (/no publishable|non-publishable|node_modules/.test(text)) return "artifact_only_no_publishable_patch";
   if (/validationgate|validation/.test(text)) return "validation";
   if (/scopegate|scope/.test(text)) return "scope";
@@ -497,11 +503,12 @@ export function shouldRecycleWorkerForHeartbeatDegradation(options: {
   return options.transportStale;
 }
 
-function shouldRecycleWorkerForCodexUnavailableFailure(
+export function shouldRecycleWorkerForCodexUnavailableFailure(
   summary: string,
   stderr?: string | null,
 ): boolean {
   const text = `${summary}\n${stderr ?? ""}`.toLowerCase();
+  if (/stalled before first response|startup stall/.test(text)) return true;
   return [
     "openai_codex cli is not installed",
     "openai_codex chatgpt auth is not ready",
@@ -1752,6 +1759,7 @@ async function workerLoop(
             const jobAttempt =
               Number.isFinite(jobAttemptRaw) && jobAttemptRaw > 0 ? Math.floor(jobAttemptRaw) : 1;
             const llm = workerLlmConfig(CONFIG);
+            const terminalFailureClass = inferWorkerTerminalFailureClass(result);
             result = {
               ...result,
               diagnostics: mergeWorkerDiagnostics(result.diagnostics, {
@@ -1781,12 +1789,15 @@ async function workerLoop(
                   result.ok ? "completed" : result.publishBlocked ? "publish_blocked" : "failed",
                 ),
                 terminal: {
-                  failureClass: inferWorkerTerminalFailureClass(result),
-                  terminalStage: currentJobPhase ?? (result.ok ? "completed" : "worker"),
+                  failureClass: terminalFailureClass,
+                  terminalStage:
+                    terminalFailureClass === "codex_startup_stall"
+                      ? "executor_startup"
+                      : currentJobPhase ?? (result.ok ? "completed" : "worker"),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
                   watchdogFired:
-                    /watchdog|rollout coach|timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(
+                    /watchdog|rollout coach|stalled before first response|startup stall|timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(
                       `${result.summary}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`,
                     ),
                   metadata: {

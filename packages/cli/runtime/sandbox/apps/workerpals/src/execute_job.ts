@@ -688,6 +688,9 @@ function inferTerminalFailureClass(result: JobResult, changedPaths: string[]): s
   if (result.ok) return "success";
   const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
   const publishableCount = publishableChangedPaths(changedPaths).length;
+  if (text.includes("stalled before first response") || text.includes("startup stall")) {
+    return "codex_startup_stall";
+  }
   if (changedPaths.length > 0 && publishableCount === 0) return "artifact_only_no_publishable_patch";
   if (result.exitCode === 124 || text.includes("timed out") || text.includes("timeout")) return "timeout";
   if (text.includes("validationgate") || text.includes("validation")) return "validation";
@@ -700,6 +703,9 @@ function inferTerminalFailureClass(result: JobResult, changedPaths: string[]): s
 
 function inferTerminalStage(result: JobResult, fallback: string): string {
   const text = `${result.summary ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
+  if (text.includes("stalled before first response") || text.includes("startup stall")) {
+    return "executor_startup";
+  }
   if (text.includes("validationgate") || text.includes("validation")) return "validation";
   if (text.includes("scopegate") || text.includes("scope")) return "scope";
   if (text.includes("criticgate") || text.includes("critic")) return "critic";
@@ -748,7 +754,7 @@ function buildTerminalDiagnostics(args: {
     terminalStage: inferTerminalStage(args.result, args.terminalStage),
     executorBackend: args.executor,
     summary: compactDiagnosticText(args.result.summary, 1_000),
-    watchdogFired: /watchdog|rollout coach/i.test(text),
+    watchdogFired: /watchdog|rollout coach|stalled before first response|startup stall/i.test(text),
     timeoutMs: args.timeoutMs ?? null,
     publishableFileCount: publishable.length,
     artifactOnlyPathCount: artifactOnly.length,

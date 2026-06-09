@@ -60,6 +60,44 @@ describe("server JobQueue diagnostics", () => {
     expect(failed.ok).toBe(true);
   }
 
+  function failCodexStartupStallJob(
+    queue: JobQueue,
+    taskId: string,
+    params: Record<string, unknown> = {},
+  ): void {
+    const jobId = enqueueClaimedJob(queue, taskId, params);
+    const failed = queue.fail(jobId, {
+      message: "openai_codex stalled before first response",
+      diagnostics: {
+        attempts: [
+          {
+            attempt: 1,
+            workerId: "worker-diagnostics",
+            backend: "openai_codex",
+            model: "gpt-5.5",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString(),
+            durationMs: 120000,
+            terminalReason: "openai_codex stalled before first response",
+            exitCode: 124,
+          },
+        ],
+        terminal: {
+          status: "failed",
+          failureClass: "codex_startup_stall",
+          terminalStage: "executor_startup",
+          executorBackend: "openai_codex",
+          summary: "openai_codex stalled before first response",
+          watchdogFired: true,
+          publishableFileCount: 0,
+          artifactOnlyPathCount: 0,
+          changedPathSample: [],
+        },
+      },
+    });
+    expect(failed.ok).toBe(true);
+  }
+
   function completePublishableJob(queue: JobQueue, taskId: string): void {
     const jobId = enqueueClaimedJob(queue, taskId);
     const completed = queue.complete(jobId, {
@@ -229,6 +267,26 @@ describe("server JobQueue diagnostics", () => {
     }
   });
 
+  test("does not count codex startup stalls as no-publishable failures", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      failCodexStartupStallJob(queue, "task-startup-stall-1");
+      failCodexStartupStallJob(queue, "task-startup-stall-2");
+      failCodexStartupStallJob(queue, "task-startup-stall-3");
+
+      const summary = queue.noPublishableFailureCircuitSummary({
+        windowMs: 60 * 60 * 1000,
+        threshold: 3,
+        failureRateThreshold: 0.5,
+      });
+      expect(summary.blocked).toBe(false);
+      expect(summary.noPublishableFailureCount).toBe(0);
+      expect(summary.terminalCount).toBe(3);
+    } finally {
+      queue.close();
+    }
+  });
+
   test("suppresses similar autonomy no-publishable failures by pattern key", () => {
     const queue = new JobQueue(":memory:");
     try {
@@ -260,6 +318,33 @@ describe("server JobQueue diagnostics", () => {
       expect(summary.recentSimilarFailureCount).toBe(2);
       expect(summary.patternKey).toBe("ui.readability.polish");
       expect(summary.lastFailureAt).toBeTruthy();
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("does not suppress similar autonomy work after codex startup stalls", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      const params = {
+        origin: "autonomy",
+        autonomy: {
+          patternKey: "infra.startup.stall",
+        },
+        planning: {
+          targetPaths: ["src/retryable.ts"],
+        },
+      };
+      failCodexStartupStallJob(queue, "task-startup-stall-similar-1", params);
+      failCodexStartupStallJob(queue, "task-startup-stall-similar-2", params);
+
+      const summary = queue.similarNoPublishableFailureSummary({
+        patternKey: "infra.startup.stall",
+        targetPaths: ["src/retryable.ts"],
+        threshold: 2,
+      });
+      expect(summary.blocked).toBe(false);
+      expect(summary.recentSimilarFailureCount).toBe(0);
     } finally {
       queue.close();
     }
