@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { dirname, join } from "path";
+import { randomUUID } from "crypto";
 import {
   normalizeGenericPythonExecutorParsedResultForTimeout,
+  resolveGenericPythonExecutorScriptPath,
   resolveGenericPythonExecutorChildTimeoutEnv,
   resolveGenericPythonExecutorChildTimeoutMs,
   resolveGenericPythonExecutorTimeoutMs,
@@ -44,6 +48,49 @@ describe("generic python executor timeout resolution", () => {
       "packages/cli/runtime/sandbox/apps/workerpals/src/backends/openai_codex_backend.ts",
     ]) {
       expect(readFileSync(path, "utf8")).not.toContain("capTimeoutToExecutionBudget: false");
+    }
+  });
+
+  test("resolves packaged Python wrapper scripts from the runtime config directory", () => {
+    const root = join(tmpdir(), `pushpals-python-wrapper-${randomUUID()}`);
+    const configDir = join(root, "configs");
+    const packagedScript = join(
+      root,
+      "apps",
+      "workerpals",
+      "src",
+      "backends",
+      "openai_codex",
+      "openai_codex_executor.py",
+    );
+    mkdirSync(dirname(packagedScript), { recursive: true });
+    writeFileSync(packagedScript, "# packaged executor\n", "utf8");
+
+    try {
+      expect(
+        resolveGenericPythonExecutorScriptPath(
+          {
+            backendName: "openai_codex",
+            scriptPath: join(root, "missing", "openai_codex_executor.py"),
+            scriptSegments: [
+              "apps",
+              "workerpals",
+              "src",
+              "backends",
+              "openai_codex",
+              "openai_codex_executor.py",
+            ],
+            pythonConfigKey: "openaiCodexPython",
+            timeoutConfigKey: "openaiCodexTimeoutMs",
+          },
+          {
+            configDir,
+            projectRoot: join(root, "repo"),
+          } as never,
+        ).scriptPath,
+      ).toBe(packagedScript);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

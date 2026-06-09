@@ -61,6 +61,7 @@ export const OPENAI_CODEX_BACKEND: DockerBackendSpec = {
   taskExecute: createGenericPythonExecutor({
     backendName: "openai_codex",
     scriptPath: resolve(import.meta.dir, "openai_codex", "openai_codex_executor.py"),
+    scriptSegments: ["apps", "workerpals", "src", "backends", "openai_codex", "openai_codex_executor.py"],
     pythonConfigKey: "openaiCodexPython",
     timeoutConfigKey: "openaiCodexTimeoutMs",
   }),

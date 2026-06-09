@@ -42,6 +42,7 @@ export const MINISWE_BACKEND: DockerBackendSpec = {
   taskExecute: createGenericPythonExecutor({
     backendName: "miniswe",
     scriptPath: resolve(import.meta.dir, "miniswe", "miniswe_executor.py"),
+    scriptSegments: ["apps", "workerpals", "src", "backends", "miniswe", "miniswe_executor.py"],
     pythonConfigKey: "miniswePython",
     timeoutConfigKey: "minisweTimeoutMs",
   }),

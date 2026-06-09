@@ -8,7 +8,7 @@
  */
 
 import { existsSync } from "fs";
-import { resolve } from "path";
+import { dirname, join, resolve } from "path";
 import type { JobResult, JobTokenUsage } from "./types.js";
 import type { WorkerpalsRuntimeConfig } from "./executor_backend.js";
 import type { BackendTaskExecutor } from "../backends/types.js";
@@ -23,6 +23,7 @@ import { buildWorkerSandboxWritableEnv } from "./sandbox_env.js";
 interface GenericPythonExecutorConfig {
   backendName: string;
   scriptPath: string;
+  scriptSegments?: readonly string[];
   pythonConfigKey: string;
   timeoutConfigKey: string;
   capTimeoutToExecutionBudget?: boolean;
@@ -231,6 +232,28 @@ function formatGenericPythonExecutorTimeoutDetail(
   return `${configPath}=${configuredTimeoutMs}ms within planning executionBudgetMs=${executionBudgetMs}ms`;
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+export function resolveGenericPythonExecutorScriptPath(
+  config: GenericPythonExecutorConfig,
+  runtimeConfig: WorkerpalsRuntimeConfig,
+): { scriptPath: string | null; candidates: string[] } {
+  const candidates = [config.scriptPath];
+  if (config.scriptSegments && config.scriptSegments.length > 0) {
+    const runtimeRoot = dirname(runtimeConfig.configDir);
+    candidates.push(join(runtimeRoot, ...config.scriptSegments));
+    candidates.push(join(runtimeConfig.projectRoot, ...config.scriptSegments));
+  }
+
+  const uniqueCandidates = uniqueStrings(candidates.map((candidate) => resolve(candidate)));
+  return {
+    scriptPath: uniqueCandidates.find((candidate) => existsSync(candidate)) ?? null,
+    candidates: uniqueCandidates,
+  };
+}
+
 export function normalizeGenericPythonExecutorParsedResultForTimeout(params: {
   backendName: string;
   kind: string;
@@ -278,7 +301,7 @@ export function normalizeGenericPythonExecutorParsedResultForTimeout(params: {
 export function createGenericPythonExecutor(
   config: GenericPythonExecutorConfig,
 ): BackendTaskExecutor {
-  const { backendName, scriptPath } = config;
+  const { backendName } = config;
   const backendLabel = backendName[0].toUpperCase() + backendName.slice(1);
 
   return async (
@@ -289,10 +312,13 @@ export function createGenericPythonExecutor(
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
     budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
   ): Promise<JobResult> => {
-    if (!existsSync(scriptPath)) {
+    const resolvedScript = resolveGenericPythonExecutorScriptPath(config, runtimeConfig);
+    const scriptPath = resolvedScript.scriptPath;
+    if (scriptPath == null) {
       return {
         ok: false,
-        summary: `${backendName} wrapper script not found: ${scriptPath}`,
+        summary: `${backendName} wrapper script not found`,
+        stderr: `Checked wrapper script path(s): ${resolvedScript.candidates.join("; ")}`,
         exitCode: 1,
       };
     }
