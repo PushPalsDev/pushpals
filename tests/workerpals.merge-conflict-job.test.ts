@@ -125,7 +125,9 @@ async function createConflictFixture(options?: {
   const publicBranch = "agent/test-branch";
   const baseBranch = "main";
   const conflictFile = options?.conflictFile ?? "apps/client/src/conflict.tsx";
-  const branchCommitContents = options?.branchCommitContents ?? ["export const conflict = 'branch';\n"];
+  const branchCommitContents = options?.branchCommitContents ?? [
+    "export const conflict = 'branch';\n",
+  ];
   const mainContent = options?.mainContent ?? "export const conflict = 'main';\n";
 
   await mustGit(root, ["init", "--bare", remote], "init bare remote");
@@ -165,14 +167,26 @@ async function createConflictFixture(options?: {
   );
   const prHeadSha = await mustGit(maintainer, ["rev-parse", "HEAD"], "resolve branch HEAD");
 
-  await mustGit(maintainer, ["checkout", "-B", baseBranch, `origin/${baseBranch}`], "return to main");
+  await mustGit(
+    maintainer,
+    ["checkout", "-B", baseBranch, `origin/${baseBranch}`],
+    "return to main",
+  );
   writeFileSync(join(maintainer, conflictFile), mainContent, "utf8");
   await mustGit(maintainer, ["add", "-A"], "stage main conflict");
   await mustGit(maintainer, ["commit", "-m", "main conflict"], "commit main conflict");
-  await mustGit(maintainer, ["push", "origin", `HEAD:refs/heads/${baseBranch}`], "push main conflict");
+  await mustGit(
+    maintainer,
+    ["push", "origin", `HEAD:refs/heads/${baseBranch}`],
+    "push main conflict",
+  );
 
   await mustGit(sourceRepo, ["fetch", "origin", baseBranch, publicBranch], "fetch source refs");
-  await mustGit(sourceRepo, ["checkout", "-B", baseBranch, `origin/${baseBranch}`], "source checkout main");
+  await mustGit(
+    sourceRepo,
+    ["checkout", "-B", baseBranch, `origin/${baseBranch}`],
+    "source checkout main",
+  );
 
   return {
     root,
@@ -214,54 +228,70 @@ async function createConflictFixture(options?: {
 }
 
 const skipMergeConflictTests = await shouldSkipForGitSpawnPermission();
-const runMergeConflictTest = skipMergeConflictTests ? test.skip : test;
+const MERGE_CONFLICT_TEST_TIMEOUT_MS = 15_000;
+const mergeConflictTestImpl = skipMergeConflictTests ? test.skip : test;
+
+function runMergeConflictTest(
+  name: string,
+  fn: () => unknown | Promise<unknown>,
+  timeoutMs: number = MERGE_CONFLICT_TEST_TIMEOUT_MS,
+): void {
+  mergeConflictTestImpl(name, fn, timeoutMs);
+}
 
 describe("workerpals merge-conflict sandbox", () => {
-  runMergeConflictTest("prepares merge-conflict repo in isolated sandbox without switching source checkout", async () => {
-    const fixture = await createConflictFixture();
-    try {
-      const sourceBranchBefore = await mustGit(
-        fixture.sourceRepo,
-        ["branch", "--show-current"],
-        "source branch before preparation",
-      );
-      const prepared = await prepareMergeConflictTaskRepo(
-        fixture.sourceRepo,
-        "job-merge-conflict",
-        fixture.params,
-      );
+  runMergeConflictTest(
+    "prepares merge-conflict repo in isolated sandbox without switching source checkout",
+    async () => {
+      const fixture = await createConflictFixture();
+      try {
+        const sourceBranchBefore = await mustGit(
+          fixture.sourceRepo,
+          ["branch", "--show-current"],
+          "source branch before preparation",
+        );
+        const prepared = await prepareMergeConflictTaskRepo(
+          fixture.sourceRepo,
+          "job-merge-conflict",
+          fixture.params,
+        );
         try {
           expect(prepared.repoPath).not.toBe(fixture.sourceRepo);
           expect(prepared.plannerGuidance).toContain("isolated container-local clone");
-          expect(prepared.plannerGuidance).toContain("Use direct commands only while resolving this rebase");
-          expect(prepared.plannerGuidance).toContain("Primary success condition: finish the git rebase");
+          expect(prepared.plannerGuidance).toContain(
+            "Use direct commands only while resolving this rebase",
+          );
+          expect(prepared.plannerGuidance).toContain(
+            "Primary success condition: finish the git rebase",
+          );
           expect(prepared.plannerGuidance).toContain("A clean rebased branch");
           expect(prepared.conflictPaths).toEqual([fixture.conflictFile]);
           const sandboxBranchList = await mustGit(
             prepared.repoPath,
-          ["branch", "--list", fixture.publicBranch],
-          "list sandbox branch",
-        );
-        expect(sandboxBranchList).toContain(fixture.publicBranch);
-        const unresolved = await mustGit(
-          prepared.repoPath,
-          ["diff", "--name-only", "--diff-filter=U"],
-          "list unresolved files",
-        );
-        expect(unresolved).toBe(fixture.conflictFile);
-        const sourceBranchAfter = await mustGit(
-          fixture.sourceRepo,
-          ["branch", "--show-current"],
-          "source branch after preparation",
-        );
-        expect(sourceBranchAfter).toBe(sourceBranchBefore);
+            ["branch", "--list", fixture.publicBranch],
+            "list sandbox branch",
+          );
+          expect(sandboxBranchList).toContain(fixture.publicBranch);
+          const unresolved = await mustGit(
+            prepared.repoPath,
+            ["diff", "--name-only", "--diff-filter=U"],
+            "list unresolved files",
+          );
+          expect(unresolved).toBe(fixture.conflictFile);
+          const sourceBranchAfter = await mustGit(
+            fixture.sourceRepo,
+            ["branch", "--show-current"],
+            "source branch after preparation",
+          );
+          expect(sourceBranchAfter).toBe(sourceBranchBefore);
+        } finally {
+          prepared.cleanup();
+        }
       } finally {
-        prepared.cleanup();
+        rmSync(fixture.root, { recursive: true, force: true });
       }
-    } finally {
-      rmSync(fixture.root, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 
   runMergeConflictTest(
     "createJobCommit force-pushes a completed merge-conflict rebase back to the same PR branch",
@@ -279,7 +309,11 @@ describe("workerpals merge-conflict sandbox", () => {
             "export const conflict = 'resolved';\n",
             "utf8",
           );
-          await mustGit(prepared.repoPath, ["add", fixture.conflictFile], "stage resolved conflict");
+          await mustGit(
+            prepared.repoPath,
+            ["add", fixture.conflictFile],
+            "stage resolved conflict",
+          );
           await mustGit(
             prepared.repoPath,
             ["-c", "core.editor=true", "rebase", "--continue"],
@@ -326,16 +360,18 @@ describe("workerpals merge-conflict sandbox", () => {
     async () => {
       const fixture = await createConflictFixture();
       const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
-      const restoreExecutor = installTestBackendExecutor(async (_kind, _params, _repo, _runtime, onLog) => {
-        onLog?.("stdout", "[stub] merge-conflict executor returned without finishing the rebase");
-        return {
-          ok: true,
-          summary: "stub executor completed",
-          stdout: "__stub_stdout__",
-          stderr: "__stub_stderr__",
-          exitCode: 0,
-        };
-      });
+      const restoreExecutor = installTestBackendExecutor(
+        async (_kind, _params, _repo, _runtime, onLog) => {
+          onLog?.("stdout", "[stub] merge-conflict executor returned without finishing the rebase");
+          return {
+            ok: true,
+            summary: "stub executor completed",
+            stdout: "__stub_stdout__",
+            stderr: "__stub_stderr__",
+            exitCode: 0,
+          };
+        },
+      );
       try {
         const prepared = await prepareMergeConflictTaskRepo(
           fixture.sourceRepo,
@@ -372,9 +408,7 @@ describe("workerpals merge-conflict sandbox", () => {
           expect(
             forwardedLogs.some((entry) => entry.line.includes("merge_conflict policy active")),
           ).toBe(true);
-          expect(
-            forwardedLogs.some((entry) => entry.line.includes("Soft-pass after")),
-          ).toBe(false);
+          expect(forwardedLogs.some((entry) => entry.line.includes("Soft-pass after"))).toBe(false);
           expect(
             forwardedLogs.some((entry) => entry.line.includes("Quality gate validation failed")),
           ).toBe(false);
@@ -496,28 +530,31 @@ describe("workerpals merge-conflict sandbox", () => {
       const fixture = await createConflictFixture();
       const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
       let resolutionPasses = 0;
-      const observedBudgets: Array<{ executionBudgetMs?: number; finalizationBudgetMs?: number }> = [];
-      const restoreExecutor = installTestBackendExecutor(async (_kind, params, repoPath, _runtime, onLog, budgets) => {
-        observedBudgets.push({ ...(budgets ?? {}) });
-        resolutionPasses += 1;
-        if (resolutionPasses === 2) {
-          writeFileSync(
-            join(repoPath, fixture.conflictFile),
-            "export const conflict = 'resolved-after-focused-retry';\n",
-            "utf8",
-          );
-        } else {
-          expect(String(params.qualityRevisionHint ?? "")).toBe("");
-        }
-        onLog?.("stdout", `[stub] merge-conflict resolver pass ${resolutionPasses}`);
-        return {
-          ok: true,
-          summary: `stub merge-conflict pass ${resolutionPasses}`,
-          stdout: `__stub_stdout_pass_${resolutionPasses}__`,
-          stderr: "",
-          exitCode: 0,
-        };
-      });
+      const observedBudgets: Array<{ executionBudgetMs?: number; finalizationBudgetMs?: number }> =
+        [];
+      const restoreExecutor = installTestBackendExecutor(
+        async (_kind, params, repoPath, _runtime, onLog, budgets) => {
+          observedBudgets.push({ ...(budgets ?? {}) });
+          resolutionPasses += 1;
+          if (resolutionPasses === 2) {
+            writeFileSync(
+              join(repoPath, fixture.conflictFile),
+              "export const conflict = 'resolved-after-focused-retry';\n",
+              "utf8",
+            );
+          } else {
+            expect(String(params.qualityRevisionHint ?? "")).toBe("");
+          }
+          onLog?.("stdout", `[stub] merge-conflict resolver pass ${resolutionPasses}`);
+          return {
+            ok: true,
+            summary: `stub merge-conflict pass ${resolutionPasses}`,
+            stdout: `__stub_stdout_pass_${resolutionPasses}__`,
+            stderr: "",
+            exitCode: 0,
+          };
+        },
+      );
       try {
         const prepared = await prepareMergeConflictTaskRepo(
           fixture.sourceRepo,
@@ -559,11 +596,15 @@ describe("workerpals merge-conflict sandbox", () => {
           expect(observedBudgets[1]?.finalizationBudgetMs).toBe(60_000);
           expect(
             forwardedLogs.some((entry) =>
-              entry.line.includes("rerunning resolver pass 2 with focused rebase-completion guidance"),
+              entry.line.includes(
+                "rerunning resolver pass 2 with focused rebase-completion guidance",
+              ),
             ),
           ).toBe(true);
           expect(
-            forwardedLogs.some((entry) => entry.line.includes("capped budget (300000ms execution)")),
+            forwardedLogs.some((entry) =>
+              entry.line.includes("capped budget (300000ms execution)"),
+            ),
           ).toBe(true);
 
           const status = await mustGit(
@@ -596,31 +637,33 @@ describe("workerpals merge-conflict sandbox", () => {
       });
       const restoreSegments = stubBackendScriptSegmentsForTesting(TEST_BACKEND);
       let resolutionPasses = 0;
-      const restoreExecutor = installTestBackendExecutor(async (_kind, _params, repoPath, _runtime, onLog) => {
-        resolutionPasses += 1;
-        const current = readFileSync(join(repoPath, fixture.conflictFile), "utf8");
-        if (current.includes("branch-two")) {
-          writeFileSync(
-            join(repoPath, fixture.conflictFile),
-            "export const conflict = 'resolved-two';\nexport const extra = 'branch';\n",
-            "utf8",
-          );
-        } else {
-          writeFileSync(
-            join(repoPath, fixture.conflictFile),
-            "export const conflict = 'resolved-one';\n",
-            "utf8",
-          );
-        }
-        onLog?.("stdout", `[stub] resolved merge-conflict pass ${resolutionPasses}`);
-        return {
-          ok: true,
-          summary: `stub merge-conflict resolution pass ${resolutionPasses} completed`,
-          stdout: `__stub_stdout_pass_${resolutionPasses}__`,
-          stderr: "",
-          exitCode: 0,
-        };
-      });
+      const restoreExecutor = installTestBackendExecutor(
+        async (_kind, _params, repoPath, _runtime, onLog) => {
+          resolutionPasses += 1;
+          const current = readFileSync(join(repoPath, fixture.conflictFile), "utf8");
+          if (current.includes("branch-two")) {
+            writeFileSync(
+              join(repoPath, fixture.conflictFile),
+              "export const conflict = 'resolved-two';\nexport const extra = 'branch';\n",
+              "utf8",
+            );
+          } else {
+            writeFileSync(
+              join(repoPath, fixture.conflictFile),
+              "export const conflict = 'resolved-one';\n",
+              "utf8",
+            );
+          }
+          onLog?.("stdout", `[stub] resolved merge-conflict pass ${resolutionPasses}`);
+          return {
+            ok: true,
+            summary: `stub merge-conflict resolution pass ${resolutionPasses} completed`,
+            stdout: `__stub_stdout_pass_${resolutionPasses}__`,
+            stderr: "",
+            exitCode: 0,
+          };
+        },
+      );
       try {
         const prepared = await prepareMergeConflictTaskRepo(
           fixture.sourceRepo,
@@ -659,7 +702,9 @@ describe("workerpals merge-conflict sandbox", () => {
           expect(resolutionPasses).toBe(2);
           expect(
             forwardedLogs.some((entry) =>
-              entry.line.includes("Rebase surfaced another conflicted commit after auto-continue; rerunning resolver pass 2"),
+              entry.line.includes(
+                "Rebase surfaced another conflicted commit after auto-continue; rerunning resolver pass 2",
+              ),
             ),
           ).toBe(true);
 
@@ -701,7 +746,11 @@ describe("workerpals merge-conflict sandbox", () => {
       try {
         await mustGit(root, ["init", repo], "init merge-conflict soft-pass repo");
         await mustGit(repo, ["config", "user.name", "PushPals Test"], "set user.name");
-        await mustGit(repo, ["config", "user.email", "pushpals-test@example.com"], "set user.email");
+        await mustGit(
+          repo,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set user.email",
+        );
         writeFileSync(
           join(repo, testPath),
           "test('placeholder', () => { expect(true).toBe(true); expect(null).toBeNull(); });\n",
@@ -770,7 +819,9 @@ describe("workerpals merge-conflict sandbox", () => {
           forwardedLogs.some((entry) => entry.line.includes("Quality gate requested revision 1/3")),
         ).toBe(true);
         expect(
-          forwardedLogs.some((entry) => entry.line.includes("Soft-pass after 3 auto-revision attempt(s)")),
+          forwardedLogs.some((entry) =>
+            entry.line.includes("Soft-pass after 3 auto-revision attempt(s)"),
+          ),
         ).toBe(true);
       } finally {
         restoreExecutor();
@@ -798,7 +849,11 @@ describe("workerpals merge-conflict sandbox", () => {
       try {
         await mustGit(root, ["init", repo], "init merge-conflict quality repo");
         await mustGit(repo, ["config", "user.name", "PushPals Test"], "set user.name");
-        await mustGit(repo, ["config", "user.email", "pushpals-test@example.com"], "set user.email");
+        await mustGit(
+          repo,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set user.email",
+        );
         writeFileSync(
           join(repo, testPath),
           "import missingHelper from '../../tests/reactNativeMock';\nvoid missingHelper;\ntest('placeholder', () => { expect(true).toBe(true); expect(null).toBeNull(); });\n",
@@ -896,7 +951,11 @@ describe("workerpals merge-conflict sandbox", () => {
       try {
         await mustGit(root, ["init", repo], "init merge-conflict quality soft-pass repo");
         await mustGit(repo, ["config", "user.name", "PushPals Test"], "set user.name");
-        await mustGit(repo, ["config", "user.email", "pushpals-test@example.com"], "set user.email");
+        await mustGit(
+          repo,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set user.email",
+        );
         writeFileSync(
           join(repo, testPath),
           "import missingHelper from '../../tests/reactNativeMock';\nvoid missingHelper;\ntest('placeholder', () => { expect(true).toBe(true); expect(null).toBeNull(); });\n",
