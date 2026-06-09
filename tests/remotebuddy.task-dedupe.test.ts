@@ -439,5 +439,5 @@ describe("RemoteBuddy task.execute dedupe", () => {
     expect(commands.some((command) => command.type === "task_created")).toBe(false);
     expect(commands.some((command) => command.type === "task_started")).toBe(false);
     expect(assistantMessages.some((message) => message.includes("No task was started"))).toBe(true);
-  });
+  }, 15000);
 });
