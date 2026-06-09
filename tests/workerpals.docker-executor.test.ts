@@ -127,6 +127,28 @@ describe("workerpals docker executor internals", () => {
     ).toBe(true);
   });
 
+  test("retry matching treats Codex startup stalls as transient infrastructure failures", () => {
+    const executor = createExecutor() as unknown as {
+      matchesRetryablePattern: (text: string) => boolean;
+    };
+
+    expect(
+      executor.matchesRetryablePattern(
+        "openai_codex stalled before first response\nCodex event trace:\n- thread.started\n- turn.started",
+      ),
+    ).toBe(true);
+    expect(executor.matchesRetryablePattern("startup stall after Codex restart")).toBe(true);
+  });
+
+  test("retry exhaustion preserves longer executor-provided cooldowns", () => {
+    const executor = createExecutor() as unknown as {
+      retryExhaustionCooldownMs: (result: { cooldownMs?: number }) => number;
+    };
+
+    expect(executor.retryExhaustionCooldownMs({ cooldownMs: 600_000 })).toBe(600_000);
+    expect(executor.retryExhaustionCooldownMs({ cooldownMs: 1_000 })).toBe(20_000);
+  });
+
   test("worktree names stay short enough for Windows cleanup", () => {
     const executor = createExecutor() as unknown as {
       buildEphemeralWorktreeName: (prefix: "job" | "selfcheck", token: string) => string;
@@ -155,16 +177,21 @@ describe("workerpals docker executor internals", () => {
     };
     const logs: string[] = [];
 
-    expect(executor.hasBudgetForJobRetry(1, 2_690_000, 2_700_000, (stream, line) => {
-      logs.push(`${stream}:${line}`);
-    })).toBe(false);
+    expect(
+      executor.hasBudgetForJobRetry(1, 2_690_000, 2_700_000, (stream, line) => {
+        logs.push(`${stream}:${line}`);
+      }),
+    ).toBe(false);
     expect(logs.join("\n")).toContain("Skipping retry attempt 2");
     expect(executor.hasBudgetForJobRetry(1, 120_000, 2_700_000)).toBe(true);
   });
 
   test("writeJobSpecToStdin supports Web WritableStream stdin", async () => {
     const executor = createExecutor() as unknown as {
-      writeJobSpecToStdin: (proc: { stdin?: WritableStream<Uint8Array> }, spec: string) => Promise<void>;
+      writeJobSpecToStdin: (
+        proc: { stdin?: WritableStream<Uint8Array> },
+        spec: string,
+      ) => Promise<void>;
     };
     const chunks: string[] = [];
     let closed = false;

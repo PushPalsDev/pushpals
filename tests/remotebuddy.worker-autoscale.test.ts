@@ -254,4 +254,28 @@ describe("RemoteBuddy worker autoscaling", () => {
       await orchestrator.dispose();
     }
   });
+
+  test("falls back from Docker WorkerPal after a Codex startup-stall recycle", async () => {
+    const orchestrator = createOrchestrator(makeTempDir());
+    (orchestrator as any).spawnWorkerDocker = true;
+    (orchestrator as any).spawnWorkerRequireDocker = true;
+    (orchestrator as any).workerSpawnCooldownUntil = Date.now() + 60_000;
+
+    try {
+      const activated = (orchestrator as any).maybeFallbackFromDockerAfterWorkerExit(
+        "workerpal-stalled",
+        87,
+      );
+
+      expect(activated).toBe(true);
+      expect((orchestrator as any).spawnWorkerDocker).toBe(false);
+      expect((orchestrator as any).spawnWorkerRequireDocker).toBe(false);
+      expect((orchestrator as any).workerSpawnCooldownUntil).toBe(0);
+      expect(String((orchestrator as any).workerpalsUnavailableReason)).toContain(
+        "falling back to direct isolated-worktree WorkerPal",
+      );
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
 });

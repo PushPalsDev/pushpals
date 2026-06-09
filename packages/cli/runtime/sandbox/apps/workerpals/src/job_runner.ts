@@ -44,6 +44,7 @@ interface JobResult {
   stdout?: string;
   stderr?: string;
   exitCode?: number;
+  cooldownMs?: number;
   commit?: {
     branch: string;
     sha: string;
@@ -115,6 +116,23 @@ echo "password=${token}"
   }
 }
 
+export function buildJobRunnerResult(
+  result: Pick<
+    Awaited<ReturnType<typeof executeJob>>,
+    "ok" | "summary" | "stdout" | "stderr" | "exitCode" | "cooldownMs" | "diagnostics"
+  >,
+): JobResult {
+  return {
+    ok: result.ok,
+    summary: result.summary,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    cooldownMs: result.cooldownMs,
+    diagnostics: result.diagnostics,
+  };
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -127,8 +145,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const base64Spec =
-    rawSpecArg === "--spec-stdin" ? (await Bun.stdin.text()).trim() : rawSpecArg;
+  const base64Spec = rawSpecArg === "--spec-stdin" ? (await Bun.stdin.text()).trim() : rawSpecArg;
   if (!base64Spec) {
     // eslint-disable-next-line no-console
     console.error("Job spec was empty");
@@ -179,14 +196,7 @@ async function main(): Promise<void> {
       CONFIG,
     );
     // Build result object
-    const jobResult: JobResult = {
-      ok: result.ok,
-      summary: result.summary,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      diagnostics: result.diagnostics,
-    };
+    const jobResult = buildJobRunnerResult(result);
     // Create commit for file-modifying jobs
     if (result.ok && shouldCommit(spec.kind, CONFIG)) {
       log("stdout", `[JobRunner] Job modified files, creating commit...`);
@@ -224,7 +234,8 @@ async function main(): Promise<void> {
         if (commitResult.publishBlocked) {
           jobResult.publishBlocked = commitResult.publishBlocked;
         }
-        jobResult.exitCode = jobResult.exitCode && jobResult.exitCode !== 0 ? jobResult.exitCode : 1;
+        jobResult.exitCode =
+          jobResult.exitCode && jobResult.exitCode !== 0 ? jobResult.exitCode : 1;
         log(
           "stderr",
           commitResult.publishBlocked
@@ -246,8 +257,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error(`[JobRunner] Fatal error: ${err}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[JobRunner] Fatal error: ${err}`);
+    process.exit(1);
+  });
+}

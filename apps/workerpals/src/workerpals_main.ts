@@ -67,6 +67,7 @@ type WorkerJobResult = JobResult & {
 
 const DEFAULT_LLM_MODEL = "local-model";
 const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
+const CODEX_STARTUP_STALL_WORKER_EXIT_CODE = 87;
 const CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS = 5_000;
 const CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS = 4_000;
 const DEFAULT_JOB_PROGRESS_LOG_EVERY_MS = 60_000;
@@ -391,7 +392,9 @@ function inferWorkerJobPhaseFromLogLine(line: string): WorkerJobPhase | null {
   ) {
     return "full validation";
   }
-  if (/creating commit|Publish blocked|publish-blocked|completion ref|enqueueCompletion/i.test(text)) {
+  if (
+    /creating commit|Publish blocked|publish-blocked|completion ref|enqueueCompletion/i.test(text)
+  ) {
     return "publishing";
   }
   if (
@@ -448,16 +451,19 @@ function mergeWorkerDiagnostics(
 }
 
 function isCodexStartupStallResult(result: JobResult): boolean {
-  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  const text =
+    `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
   return /stalled before first response|startup stall/.test(text);
 }
 
 export function inferWorkerTerminalFailureClass(result: JobResult): string {
   if (result.ok) return "success";
-  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  const text =
+    `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
   if (isCodexStartupStallResult(result)) return "codex_startup_stall";
   if (/timed out|timeout|signal 15|terminated|exit 143|exit 137/.test(text)) return "timeout";
-  if (/no publishable|non-publishable|node_modules/.test(text)) return "artifact_only_no_publishable_patch";
+  if (/no publishable|non-publishable|node_modules/.test(text))
+    return "artifact_only_no_publishable_patch";
   if (/validationgate|validation/.test(text)) return "validation";
   if (/scopegate|scope/.test(text)) return "scope";
   if (/criticgate|critic/.test(text)) return "critic";
@@ -517,6 +523,12 @@ export function shouldRecycleWorkerForCodexUnavailableFailure(
     "codex cli isn't available",
     "codex cli is mandatory in this backend",
   ].some((needle) => text.includes(needle));
+}
+
+export function workerRecycleExitCodeForResult(result: WorkerJobResult): number {
+  return isCodexStartupStallResult(result)
+    ? CODEX_STARTUP_STALL_WORKER_EXIT_CODE
+    : CODEX_UNAVAILABLE_WORKER_EXIT_CODE;
 }
 
 async function shutdownDockerExecutorBeforeCodexRecycle(
@@ -761,14 +773,9 @@ async function createIsolatedWorktree(
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "")
     .slice(0, 8);
-  const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random()
-    .toString(36)
-    .slice(2, 6)}`;
+  const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random().toString(36).slice(2, 6)}`;
 
-  const worktreePath = resolve(
-    worktreeRoot,
-    `job-${safeJobId || "host"}-${nonce}`,
-  );
+  const worktreePath = resolve(worktreeRoot, `job-${safeJobId || "host"}-${nonce}`);
 
   const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
   if (!addResult.ok) {
@@ -1793,7 +1800,7 @@ async function workerLoop(
                   terminalStage:
                     terminalFailureClass === "codex_startup_stall"
                       ? "executor_startup"
-                      : currentJobPhase ?? (result.ok ? "completed" : "worker"),
+                      : (currentJobPhase ?? (result.ok ? "completed" : "worker")),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
                   watchdogFired:
@@ -1972,12 +1979,15 @@ async function workerLoop(
             clearInterval(busyHeartbeat);
             if (jobProgressTimer) clearInterval(jobProgressTimer);
             if (recycleWorkerAfterJob) {
+              const recycleExitCode = result
+                ? workerRecycleExitCodeForResult(result)
+                : CODEX_UNAVAILABLE_WORKER_EXIT_CODE;
               runtimeState.shutdownRequested = true;
               const forceExitTimer = setTimeout(() => {
                 console.warn(
                   `[WorkerPals] Forcing worker recycle ${CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS}ms after Codex backend failure.`,
                 );
-                process.exit(CODEX_UNAVAILABLE_WORKER_EXIT_CODE);
+                process.exit(recycleExitCode);
               }, CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS);
               try {
                 await maybeHeartbeat("offline", null, true);
@@ -1994,7 +2004,7 @@ async function workerLoop(
                 await shutdownDockerExecutorBeforeCodexRecycle(dockerExecutor);
               } finally {
                 clearTimeout(forceExitTimer);
-                process.exit(CODEX_UNAVAILABLE_WORKER_EXIT_CODE);
+                process.exit(recycleExitCode);
               }
             }
             if (job.sessionId && result?.cooldownMs && result.cooldownMs > 0) {

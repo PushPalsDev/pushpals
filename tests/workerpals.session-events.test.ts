@@ -4,6 +4,7 @@ import {
   shouldEmitDirectSessionJobEvent,
   shouldRecycleWorkerForCodexUnavailableFailure,
   shouldRecycleWorkerForHeartbeatDegradation,
+  workerRecycleExitCodeForResult,
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
@@ -88,5 +89,22 @@ describe("workerpals session event emission", () => {
         "startup stall after restart",
       ),
     ).toBe(true);
+  });
+
+  test("uses a distinct recycle exit code for Codex startup stalls", () => {
+    expect(
+      workerRecycleExitCodeForResult({
+        ok: false,
+        summary: "openai_codex stalled before first response",
+        exitCode: 124,
+      }),
+    ).toBe(87);
+    expect(
+      workerRecycleExitCodeForResult({
+        ok: false,
+        summary: "openai_codex chatgpt auth is not ready",
+        exitCode: 1,
+      }),
+    ).toBe(86);
   });
 });

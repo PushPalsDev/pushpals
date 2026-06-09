@@ -92,6 +92,7 @@ export interface JobResult {
   stdout?: string;
   stderr?: string;
   exitCode?: number;
+  cooldownMs?: number;
   usage?: JobTokenUsage;
   publishBlocked?: JobPublishBlockedInfo;
   diagnostics?: JobDiagnostics;

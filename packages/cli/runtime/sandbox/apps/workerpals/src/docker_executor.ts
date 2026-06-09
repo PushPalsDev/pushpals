@@ -249,7 +249,9 @@ export interface Job {
 }
 
 function compactDockerDiagnosticText(value: unknown, maxChars = 1000): string | null {
-  const text = String(value ?? "").replace(/\s+$/g, "").trim();
+  const text = String(value ?? "")
+    .replace(/\s+$/g, "")
+    .trim();
   if (!text) return null;
   return text.length <= maxChars ? text : text.slice(0, maxChars);
 }
@@ -482,11 +484,11 @@ export class DockerExecutor {
             if (
               retryableFailure &&
               attempt >= this.jobRetryMaxAttempts &&
-              this.failureCooldownMs > 0
+              this.retryExhaustionCooldownMs(result) > 0
             ) {
               return {
                 ...result,
-                cooldownMs: this.failureCooldownMs,
+                cooldownMs: this.retryExhaustionCooldownMs(result),
               };
             }
             return result;
@@ -1279,9 +1281,8 @@ export class DockerExecutor {
       onLog?.("stdout", note);
     }
 
-    const { leadMs: warningLeadMs, delayMs: warningDelayMs } = computeTimeoutWarningWindow(
-      timeoutMs,
-    );
+    const { leadMs: warningLeadMs, delayMs: warningDelayMs } =
+      computeTimeoutWarningWindow(timeoutMs);
     const warningTimer = setTimeout(() => {
       const warning = `[DockerExecutor] Job nearing timeout in warm container (${Math.round(
         warningLeadMs / 1000,
@@ -1424,13 +1425,13 @@ export class DockerExecutor {
     const worktreePrefix = shellSingleQuote(`${containerWorktreePath}/`);
     const command = [
       "set -eu",
-      "linked=\"\"",
+      'linked=""',
       "for name in node_modules; do",
-      "  src=\"/repo/$name\"",
+      '  src="/repo/$name"',
       `  dest=${worktreePrefix}$name`,
-      "  if { [ -e \"$src\" ] || [ -L \"$src\" ]; } && [ ! -e \"$dest\" ] && [ ! -L \"$dest\" ]; then",
-      "    ln -s \"$src\" \"$dest\"",
-      "    linked=\"$linked $name\"",
+      '  if { [ -e "$src" ] || [ -L "$src" ]; } && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then',
+      '    ln -s "$src" "$dest"',
+      '    linked="$linked $name"',
       "  fi",
       "done",
       "printf '%s' \"$linked\"",
@@ -1454,9 +1455,7 @@ export class DockerExecutor {
       .filter(Boolean);
     if (linked.length === 0) return;
 
-    const note = `[DockerExecutor] Linked worktree dependency artifact(s): ${linked.join(
-      ", ",
-    )}`;
+    const note = `[DockerExecutor] Linked worktree dependency artifact(s): ${linked.join(", ")}`;
     console.log(note);
     onLog?.("stdout", note);
   }
@@ -1701,9 +1700,15 @@ export class DockerExecutor {
         stdout,
         stderr: details.join("\n"),
         exitCode,
-        diagnostics: dockerFallbackDiagnostics(summary, context, exitCode, "malformed_structured_result", {
-          sentinelParseError,
-        }),
+        diagnostics: dockerFallbackDiagnostics(
+          summary,
+          context,
+          exitCode,
+          "malformed_structured_result",
+          {
+            sentinelParseError,
+          },
+        ),
       };
     }
 
@@ -1906,8 +1911,15 @@ export class DockerExecutor {
     return this.matchesRetryablePattern(text);
   }
 
+  private retryExhaustionCooldownMs(result: DockerJobResult): number {
+    const resultCooldownMs = readPositiveNumber(result.cooldownMs) ?? 0;
+    return Math.max(this.failureCooldownMs, resultCooldownMs);
+  }
+
   private matchesRetryablePattern(text: string): boolean {
     const transientPatterns: RegExp[] = [
+      /\bstalled before first response\b/i,
+      /\bstartup stall\b/i,
       /warm .*runtime/i,
       /failed to start warm container/i,
       /docker execution error/i,

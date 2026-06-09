@@ -182,6 +182,8 @@ function isCodexUnavailableFailureSignal(message: string, detail: string): boole
   ].some((needle) => text.includes(needle));
 }
 
+const CODEX_STARTUP_STALL_WORKER_EXIT_CODE = 87;
+
 export type TaskExecutionLane = "deterministic" | "worker";
 export type RequestPriority = "interactive" | "normal" | "background";
 export type PlannerIntent = "chat" | "status" | "code_change" | "analysis" | "other";
@@ -546,7 +548,11 @@ function requestAllowsCreatingMissingPath(value: string): boolean {
   );
 }
 
-function shouldTreatMissingTargetAsStale(repoRoot: string, path: string, requestText: string): boolean {
+function shouldTreatMissingTargetAsStale(
+  repoRoot: string,
+  path: string,
+  requestText: string,
+): boolean {
   const normalized = normalizeTargetPath(path);
   if (!normalized || normalized === "." || pathHintHasGlob(normalized)) return false;
   if (!pathHintLooksLikeConcreteFile(normalized)) return false;
@@ -954,8 +960,8 @@ export class RemoteBuddyOrchestrator {
   private readonly minWorkers: number;
   private readonly maxWorkers: number;
   private readonly workerStartupTimeoutMs: number;
-  private readonly spawnWorkerDocker: boolean;
-  private readonly spawnWorkerRequireDocker: boolean;
+  private spawnWorkerDocker: boolean;
+  private spawnWorkerRequireDocker: boolean;
   private readonly spawnWorkerImage: string | null;
   private readonly spawnWorkerPollMs: number | null;
   private readonly spawnWorkerHeartbeatMs: number | null;
@@ -964,6 +970,7 @@ export class RemoteBuddyOrchestrator {
   private readonly workerpalsEnvFile: string | null;
   private readonly workerpalsEntrypoint: string | null;
   private workerpalsUnavailableReason: string | null;
+  private workerDockerFallbackActivated = false;
   private readonly statusHeartbeatMs: number;
   private readonly fetchFailureLogsOnJobFailure: boolean;
   private readonly executionBudgetInteractiveMs: number;
@@ -1356,10 +1363,13 @@ export class RemoteBuddyOrchestrator {
     query.set("feedbackLimit", "3");
     const suffix = query.toString();
     try {
-      const res = await this.fetchImpl(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
-        method: "GET",
-        headers: this.authHeaders(),
-      });
+      const res = await this.fetchImpl(
+        `${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`,
+        {
+          method: "GET",
+          headers: this.authHeaders(),
+        },
+      );
       if (!res.ok) return null;
       const data = (await res.json()) as {
         ok?: boolean;
@@ -2183,10 +2193,13 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchWorkerAutoscaleSnapshot(): Promise<WorkerAutoscaleSnapshot | null> {
     try {
-      const res = await this.fetchImpl(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
-        method: "GET",
-        headers: this.authHeaders(),
-      });
+      const res = await this.fetchImpl(
+        `${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`,
+        {
+          method: "GET",
+          headers: this.authHeaders(),
+        },
+      );
       if (!res.ok) return null;
       const data = (await res.json()) as {
         ok: boolean;
@@ -2346,6 +2359,29 @@ export class RemoteBuddyOrchestrator {
     });
   }
 
+  private maybeFallbackFromDockerAfterWorkerExit(workerId: string, code: number | null): boolean {
+    if (code !== CODEX_STARTUP_STALL_WORKER_EXIT_CODE) return false;
+    if (!this.spawnWorkerDocker) return false;
+    if (this.workerDockerFallbackActivated) return false;
+    if (parseEnabledFlag(process.env.REMOTEBUDDY_DISABLE_WORKERPAL_DIRECT_FALLBACK, false)) {
+      console.warn(
+        `[RemoteBuddy] WorkerPal ${workerId} exited after a Docker Codex startup stall, but direct WorkerPal fallback is disabled.`,
+      );
+      return false;
+    }
+
+    this.workerDockerFallbackActivated = true;
+    this.spawnWorkerDocker = false;
+    this.spawnWorkerRequireDocker = false;
+    this.workerSpawnCooldownUntil = 0;
+    this.workerpalsUnavailableReason =
+      "Docker-backed WorkerPal Codex startup stalled; falling back to direct isolated-worktree WorkerPal.";
+    console.warn(
+      `[RemoteBuddy] WorkerPal ${workerId} exited after a Docker Codex startup stall; falling back to direct isolated-worktree WorkerPal for future spawns.`,
+    );
+    return true;
+  }
+
   private async spawnWorker(): Promise<string | null> {
     if (this.workerSpawnInFlight) {
       return await this.workerSpawnInFlight;
@@ -2378,6 +2414,9 @@ export class RemoteBuddyOrchestrator {
         this.managedWorkers.set(workerId, child);
         child.exited.then((code) => {
           this.managedWorkers.delete(workerId);
+          if (this.maybeFallbackFromDockerAfterWorkerExit(workerId, code)) {
+            void this.ensureAutoscaledWorkerCapacity("docker codex startup fallback");
+          }
           console.warn(`[RemoteBuddy] WorkerPal process ${workerId} exited with code ${code}`);
         });
 
