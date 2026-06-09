@@ -8408,6 +8408,7 @@ ${detail}`.toLowerCase();
     "codex cli is mandatory in this backend"
   ].some((needle) => text.includes(needle));
 }
+var CODEX_STARTUP_STALL_WORKER_EXIT_CODE = 87;
 function asAutonomyComponentArea2(value) {
   return normalizeAutonomyComponentArea(value) ?? undefined;
 }
@@ -8950,6 +8951,7 @@ class RemoteBuddyOrchestrator {
   workerpalsEnvFile;
   workerpalsEntrypoint;
   workerpalsUnavailableReason;
+  workerDockerFallbackActivated = false;
   statusHeartbeatMs;
   fetchFailureLogsOnJobFailure;
   executionBudgetInteractiveMs;
@@ -9956,6 +9958,25 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       entrypoint: this.workerpalsEntrypoint
     });
   }
+  maybeFallbackFromDockerAfterWorkerExit(workerId, code) {
+    if (code !== CODEX_STARTUP_STALL_WORKER_EXIT_CODE)
+      return false;
+    if (!this.spawnWorkerDocker)
+      return false;
+    if (this.workerDockerFallbackActivated)
+      return false;
+    if (parseEnabledFlag(process.env.REMOTEBUDDY_DISABLE_WORKERPAL_DIRECT_FALLBACK, false)) {
+      console.warn(`[RemoteBuddy] WorkerPal ${workerId} exited after a Docker Codex startup stall, but direct WorkerPal fallback is disabled.`);
+      return false;
+    }
+    this.workerDockerFallbackActivated = true;
+    this.spawnWorkerDocker = false;
+    this.spawnWorkerRequireDocker = false;
+    this.workerSpawnCooldownUntil = 0;
+    this.workerpalsUnavailableReason = "Docker-backed WorkerPal Codex startup stalled; falling back to direct isolated-worktree WorkerPal.";
+    console.warn(`[RemoteBuddy] WorkerPal ${workerId} exited after a Docker Codex startup stall; falling back to direct isolated-worktree WorkerPal for future spawns.`);
+    return true;
+  }
   async spawnWorker() {
     if (this.workerSpawnInFlight) {
       return await this.workerSpawnInFlight;
@@ -9983,6 +10004,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         this.managedWorkers.set(workerId, child);
         child.exited.then((code) => {
           this.managedWorkers.delete(workerId);
+          if (this.maybeFallbackFromDockerAfterWorkerExit(workerId, code)) {
+            this.ensureAutoscaledWorkerCapacity("docker codex startup fallback");
+          }
           console.warn(`[RemoteBuddy] WorkerPal process ${workerId} exited with code ${code}`);
         });
         const ready = await this.waitForOnlineWorker(this.workerStartupTimeoutMs, workerId);
