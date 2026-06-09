@@ -86,6 +86,9 @@ const AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS = 60 * 60 * 1000;
 const AUTONOMY_WORKER_FAILURE_CIRCUIT_THRESHOLD = 3;
 const AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE = 0.5;
 const AUTONOMY_WORKER_FAILURE_DEFER_MS = 30 * 60 * 1000;
+const AUTONOMY_SIMILAR_FAILURE_WINDOW_MS = 6 * 60 * 60 * 1000;
+const AUTONOMY_SIMILAR_FAILURE_THRESHOLD = 2;
+const AUTONOMY_SIMILAR_FAILURE_DEFER_MS = 30 * 60 * 1000;
 const CLIENT_TRANSPORT_HEARTBEAT_MS = 15_000;
 const SESSION_TOKEN_BUDGET = Math.max(0, STARTUP_CONFIG.server.sessionTokenBudget);
 
@@ -402,7 +405,86 @@ export function createRequestHandler() {
             ok: false,
             code: "autonomy_worker_failure_circuit_open",
             message: autonomyFailureCircuitMessage(failureCircuit),
+            retryAfterMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
             ...failureCircuit,
+          },
+          429,
+        );
+      };
+      const objectRecord = (value: unknown): Record<string, unknown> | null =>
+        value && typeof value === "object" && !Array.isArray(value)
+          ? (value as Record<string, unknown>)
+          : null;
+      const stringArray = (value: unknown): string[] =>
+        Array.isArray(value)
+          ? value.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+          : [];
+      const autonomyPayloadDetails = (
+        value: Record<string, unknown>,
+      ): {
+        patternKey: string | null;
+        targetPaths: string[];
+        writeGlobs: string[];
+      } => {
+        const params =
+          objectRecord(value.params) ??
+          (typeof value.params === "string" ? parseJsonRecord(value.params) : {});
+        const metadata =
+          objectRecord(value.metadata) ??
+          objectRecord(value.meta) ??
+          (typeof value.metadataJson === "string" ? parseJsonRecord(value.metadataJson) : {});
+        const metadataAutonomy = objectRecord(metadata.autonomy);
+        const paramsAutonomy = objectRecord(params.autonomy);
+        const planning = objectRecord(params.planning);
+        const scope = objectRecord(planning?.scope);
+        const patternKey =
+          compactText(
+            metadataAutonomy?.patternKey ??
+              metadataAutonomy?.pattern_key ??
+              paramsAutonomy?.patternKey ??
+              paramsAutonomy?.pattern_key,
+            240,
+          ) || null;
+        const targetPaths = [
+          ...stringArray(metadataAutonomy?.targetPaths ?? metadataAutonomy?.target_paths),
+          ...stringArray(paramsAutonomy?.targetPaths ?? paramsAutonomy?.target_paths),
+          ...stringArray(params.paths),
+          ...stringArray(planning?.targetPaths ?? planning?.target_paths),
+        ];
+        const writeGlobs = [
+          ...stringArray(metadataAutonomy?.writeGlobs ?? metadataAutonomy?.write_globs),
+          ...stringArray(paramsAutonomy?.writeGlobs ?? paramsAutonomy?.write_globs),
+          ...stringArray(scope?.writeGlobs ?? scope?.write_globs),
+        ];
+        return {
+          patternKey,
+          targetPaths,
+          writeGlobs,
+        };
+      };
+      const autonomySimilarFailureSummary = (value: Record<string, unknown>) => {
+        const details = autonomyPayloadDetails(value);
+        return jobQueue.similarNoPublishableFailureSummary({
+          patternKey: details.patternKey,
+          targetPaths: details.targetPaths,
+          windowMs: AUTONOMY_SIMILAR_FAILURE_WINDOW_MS,
+          threshold: AUTONOMY_SIMILAR_FAILURE_THRESHOLD,
+        });
+      };
+      const makeAutonomySimilarFailureResponse = (
+        value: Record<string, unknown>,
+      ): Response | null => {
+        const similarFailure = autonomySimilarFailureSummary(value);
+        if (!similarFailure.blocked) return null;
+        return makeJson(
+          {
+            ok: false,
+            code: "autonomy_similar_no_publishable_suppressed",
+            message:
+              `Autonomy enqueue blocked: ${similarFailure.recentSimilarFailureCount} ` +
+              `similar no-publishable/no-edit failure(s) were observed recently.`,
+            retryAfterMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
+            ...similarFailure,
           },
           429,
         );
@@ -897,6 +979,8 @@ export function createRequestHandler() {
         if (isAutonomyRequestPayload(body)) {
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse) return failureCircuitResponse;
+          const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
+          if (similarFailureResponse) return similarFailureResponse;
         }
         const result = jobQueue.enqueue(body);
         return makeJson(result, result.ok ? 201 : 400);
@@ -930,6 +1014,10 @@ export function createRequestHandler() {
               params: parseJsonRecord(result.job.params),
             })
           ) {
+            const jobPayload = {
+              ...result.job,
+              params: parseJsonRecord(result.job.params),
+            };
             const failureCircuit = autonomyFailureCircuitSummary();
             if (failureCircuit.blocked) {
               jobQueue.defer(result.job.id, {
@@ -938,6 +1026,20 @@ export function createRequestHandler() {
                 detail: JSON.stringify({
                   code: "autonomy_worker_failure_circuit_open",
                   ...failureCircuit,
+                }),
+              });
+              skipped += 1;
+              result = jobQueue.claim(workerId);
+              continue;
+            }
+            const similarFailure = autonomySimilarFailureSummary(jobPayload);
+            if (similarFailure.blocked) {
+              jobQueue.defer(result.job.id, {
+                workerId,
+                deferMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
+                detail: JSON.stringify({
+                  code: "autonomy_similar_no_publishable_suppressed",
+                  ...similarFailure,
                 }),
               });
               skipped += 1;
@@ -1993,6 +2095,8 @@ export function createRequestHandler() {
         if (isAutonomyRequestPayload(body)) {
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse) return failureCircuitResponse;
+          const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
+          if (similarFailureResponse) return similarFailureResponse;
 
           const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
           const schedulableWorkers = workers.filter(
@@ -2073,6 +2177,23 @@ export function createRequestHandler() {
                 detail: JSON.stringify({
                   code: "autonomy_worker_failure_circuit_open",
                   ...failureCircuit,
+                }),
+              });
+              skipped += 1;
+              result = requestQueue.claim(agentId);
+              continue;
+            }
+            const similarFailure = autonomySimilarFailureSummary(
+              result.request as unknown as Record<string, unknown>,
+            );
+            if (similarFailure.blocked) {
+              requestQueue.fail(result.request.id, {
+                message:
+                  `Autonomy request suppressed after ` +
+                  `${similarFailure.recentSimilarFailureCount} similar no-publishable/no-edit failure(s).`,
+                detail: JSON.stringify({
+                  code: "autonomy_similar_no_publishable_suppressed",
+                  ...similarFailure,
                 }),
               });
               skipped += 1;

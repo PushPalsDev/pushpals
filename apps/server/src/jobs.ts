@@ -94,6 +94,16 @@ export interface NoPublishableFailureCircuitSummary {
   lastFailureAt: string | null;
 }
 
+export interface SimilarNoPublishableFailureSummary {
+  blocked: boolean;
+  windowMs: number;
+  threshold: number;
+  recentSimilarFailureCount: number;
+  patternKey: string | null;
+  targetPathSample: string[];
+  lastFailureAt: string | null;
+}
+
 interface ToolRunDbRow {
   id: string;
   jobId: string | null;
@@ -359,6 +369,41 @@ function parseJsonArray(value: string | null): unknown[] {
   } catch {
     return [];
   }
+}
+
+function stringArrayFromUnknown(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => String(entry ?? "").trim()).filter((entry) => entry.length > 0);
+}
+
+function normalizedJobPath(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+function normalizedJobPathList(value: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of stringArrayFromUnknown(value)) {
+    const normalized = normalizedJobPath(entry);
+    if (!normalized || normalized === "." || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function jobPathOverlaps(left: string[], right: string[]): boolean {
+  for (const a of left) {
+    for (const b of right) {
+      if (a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)) return true;
+    }
+  }
+  return false;
 }
 
 function normalizeWorkerStatus(value: unknown): WorkerStatus {
@@ -2875,6 +2920,104 @@ export class JobQueue {
       noPublishableFailureRate,
       completedCount,
       lastFailureAt: row?.lastFailureAt ?? null,
+    };
+  }
+
+  similarNoPublishableFailureSummary(options?: {
+    patternKey?: string | null;
+    targetPaths?: string[];
+    windowMs?: number;
+    threshold?: number;
+  }): SimilarNoPublishableFailureSummary {
+    const windowMs = Math.max(
+      60_000,
+      Math.min(24 * 60 * 60 * 1000, Math.floor(options?.windowMs ?? 6 * 60 * 60 * 1000)),
+    );
+    const threshold = Math.max(1, Math.min(20, Math.floor(options?.threshold ?? 2)));
+    const patternKey = String(options?.patternKey ?? "").trim() || null;
+    const targetPaths = normalizedJobPathList(options?.targetPaths ?? []);
+    const base: SimilarNoPublishableFailureSummary = {
+      blocked: false,
+      windowMs,
+      threshold,
+      recentSimilarFailureCount: 0,
+      patternKey,
+      targetPathSample: targetPaths.slice(0, 8),
+      lastFailureAt: null,
+    };
+    if (!patternKey && targetPaths.length === 0) return base;
+
+    const cutoffIso = new Date(Date.now() - windowMs).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT j.id, j.params, j.failedAt, j.updatedAt
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.kind = 'task.execute'
+           AND j.status = 'failed'
+           AND j.updatedAt >= ?
+           AND (
+             d.failureClass = 'artifact_only_no_publishable_patch'
+             OR d.summary LIKE '%no publishable changes%'
+             OR d.summary LIKE '%no publishable file changes%'
+             OR d.summary LIKE '%no-edit watchdog%'
+             OR EXISTS (
+               SELECT 1
+               FROM job_attempts a
+               WHERE a.jobId = j.id
+                 AND (
+                   a.terminalReason LIKE '%no publishable changes%'
+                   OR a.terminalReason LIKE '%no publishable file changes%'
+                   OR a.terminalReason LIKE '%no-edit watchdog%'
+                 )
+             )
+           )
+         ORDER BY j.updatedAt DESC
+         LIMIT 250`,
+      )
+      .all(cutoffIso) as Array<{
+      id: string;
+      params: string | null;
+      failedAt: string | null;
+      updatedAt: string | null;
+    }>;
+
+    let count = 0;
+    let lastFailureAt: string | null = null;
+    for (const row of rows) {
+      const params = parseObjectJson(row.params);
+      const autonomy = recordFromUnknown(params.autonomy);
+      const origin = String(params.origin ?? autonomy?.origin ?? "")
+        .trim()
+        .toLowerCase();
+      if (origin !== "autonomy") continue;
+
+      const previousPatternKey = String(autonomy?.patternKey ?? autonomy?.pattern_key ?? "").trim();
+      const planning = recordFromUnknown(params.planning);
+      const previousPaths = [
+        ...normalizedJobPathList(params.paths),
+        ...normalizedJobPathList(planning?.targetPaths ?? planning?.target_paths),
+        ...normalizedJobPathList(autonomy?.targetPaths ?? autonomy?.target_paths),
+      ];
+      const patternMatches = Boolean(patternKey && previousPatternKey === patternKey);
+      const pathMatches =
+        targetPaths.length > 0 &&
+        previousPaths.length > 0 &&
+        jobPathOverlaps(targetPaths, previousPaths);
+      if (!patternMatches && !pathMatches) continue;
+
+      count += 1;
+      const failureAt = row.failedAt ?? row.updatedAt ?? null;
+      if (failureAt && (!lastFailureAt || Date.parse(failureAt) > Date.parse(lastFailureAt))) {
+        lastFailureAt = failureAt;
+      }
+    }
+
+    return {
+      ...base,
+      blocked: count >= threshold,
+      recentSimilarFailureCount: count,
+      lastFailureAt,
     };
   }
 

@@ -1171,6 +1171,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertFalse(result.get("ok"), result)
         self.assertEqual(result.get("exitCode"), 124)
         self.assertIn("no publishable changes", str(result.get("summary") or ""))
+        self.assertEqual(result.get("cooldownMs"), 600000)
 
     def test_run_codex_task_no_edit_watchdog_rechecks_transient_publishable_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-recheck-") as temp_dir:
@@ -1665,6 +1666,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("rollout coach", str(result.get("summary") or ""))
         self.assertIn("broad/noisy", str(result.get("stderr") or ""))
         self.assertIn("area0", str(result.get("stderr") or ""))
+        self.assertEqual(result.get("cooldownMs"), 600000)
 
     def test_run_codex_task_timeout_reports_artifact_only_changes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-timeout-") as temp_dir:

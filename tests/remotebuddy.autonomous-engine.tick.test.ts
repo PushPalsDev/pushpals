@@ -205,6 +205,53 @@ afterEach(() => {
 });
 
 describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
+  test("structured autonomy enqueue throttles set dispatch backoff", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-backoff-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({
+        url: String(url),
+        method: String(init?.method ?? "GET"),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      return jsonResponse(429, {
+        ok: false,
+        code: "autonomy_similar_no_publishable_suppressed",
+        message: "similar no-publishable failures",
+        retryAfterMs: 120_000,
+      });
+    }) as typeof fetch;
+
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_backoff",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+
+    const requestId = await (engine as any).enqueueSyntheticRequest("Background task", {
+      objectiveId: "objective_backoff",
+      runId: "run_backoff",
+      snapshotId: "snapshot_backoff",
+      patternKey: "pattern.backoff",
+      componentArea: "tests",
+      targetPaths: ["src/example.ts"],
+      writeGlobs: ["src/**"],
+    });
+
+    expect(requestId).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect((engine as any).dispatchBackoffUntilMs).toBeGreaterThan(Date.now() + 60_000);
+    expect((engine as any).dispatchBackoffReason).toBe(
+      "autonomy_similar_no_publishable_suppressed",
+    );
+  });
+
   test("tick auto-ingests inspiration and dispatches an objective end-to-end", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();

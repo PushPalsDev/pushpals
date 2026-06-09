@@ -120,6 +120,7 @@ _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
 _BACKGROUND_ROLLOUT_WATCHDOG_S = 90
+_NO_PUBLISHABLE_FAILURE_COOLDOWN_MS = 10 * 60 * 1000
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -2492,6 +2493,7 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
                 "usage": usage,
+                "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
             }
 
         if no_edit_watchdog_fired:
@@ -2524,6 +2526,7 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
                 "usage": usage,
+                "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
             }
 
         if timed_out:
@@ -2583,6 +2586,7 @@ def _run_codex_task(
                     "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                     "exitCode": 124,
                     "usage": usage,
+                    "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
                 }
             artifact_only_paths = _describe_non_publishable_paths(changed_paths, baseline_snapshot)
             if artifact_only_paths:
@@ -2601,6 +2605,7 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
                 "usage": usage,
+                "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
             }
 
         last_message = _read_text_if_exists(last_message_path)

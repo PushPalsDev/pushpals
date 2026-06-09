@@ -586,7 +586,7 @@ function sanitizeRepoNativeTargetHints(params: {
       const lower = step.replace(/\\/g, "/").toLowerCase();
       return !staleLower.some((path) => lower.includes(path));
     });
-    params.plan.scope.write_globs = params.plan.scope.write_globs.filter((glob) => {
+    params.plan.scope.write_globs = (params.plan.scope.write_globs ?? []).filter((glob) => {
       const normalized = normalizeTargetPath(glob);
       if (!normalized) return false;
       return !staleLower.includes(normalized.toLowerCase());
@@ -3027,14 +3027,16 @@ export class RemoteBuddyOrchestrator {
           });
         }
       } else {
-        await this.assistantMessage(
-          requestSessionId,
-          "I could not queue this WorkerPal task. No task was started.",
-          { turnId, correlationId: requestId, from: eventFrom },
-        );
+        if (!autonomyMetadata) {
+          await this.assistantMessage(
+            requestSessionId,
+            "I could not queue this WorkerPal task. No task was started.",
+            { turnId, correlationId: requestId, from: eventFrom },
+          );
+        }
         this.rememberPersistentMemory(
           "job_enqueue_failed",
-          `enqueue_failed lane=${lane} intent=${plan.intent}`,
+          `enqueue_failed lane=${lane} intent=${plan.intent} origin=${autonomyMetadata ? "autonomy" : "user"}`,
           requestId,
           requestSessionId,
         );

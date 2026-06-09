@@ -229,6 +229,21 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             "xhigh",
         )
 
+    def test_background_autonomy_uses_short_no_edit_and_rollout_watchdogs(self) -> None:
+        prompt = (
+            "Task planning contract from PushPals:\n"
+            "- Planning summary: intent=code_change, risk=low, priority=background\n"
+            "Make one narrow repo-native patch and avoid broad discovery.\n"
+        )
+
+        no_edit = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+        self.assertEqual(no_edit, 120)
+        self.assertEqual(
+            _resolve_no_edit_watchdog_seconds(prompt, 1200, recovery_attempt=1),
+            90,
+        )
+        self.assertEqual(_resolve_rollout_watchdog_seconds(prompt, 1200, no_edit), 90)
+
     def test_runtime_config_prefers_explicit_config_dir_override(self) -> None:
         import executor_base
 
@@ -1156,6 +1171,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertFalse(result.get("ok"), result)
         self.assertEqual(result.get("exitCode"), 124)
         self.assertIn("no publishable changes", str(result.get("summary") or ""))
+        self.assertEqual(result.get("cooldownMs"), 600000)
 
     def test_run_codex_task_no_edit_watchdog_rechecks_transient_publishable_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-recheck-") as temp_dir:
@@ -1407,7 +1423,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(watchdog_s, 180)
 
-    def test_no_edit_recovery_attempt_uses_patch_first_watchdog(self) -> None:
+    def test_no_edit_recovery_attempt_uses_short_patch_first_watchdog(self) -> None:
         prompt = "Investigate a broad reliability issue and make the smallest safe fix."
         with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
             first_attempt_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
@@ -1418,7 +1434,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(first_attempt_s, 480)
-        self.assertEqual(recovery_attempt_s, 180)
+        self.assertEqual(recovery_attempt_s, 90)
 
     def test_explicit_no_edit_watchdog_override_still_controls_recovery_attempts(self) -> None:
         with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "300"}, clear=False):
@@ -1650,6 +1666,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("rollout coach", str(result.get("summary") or ""))
         self.assertIn("broad/noisy", str(result.get("stderr") or ""))
         self.assertIn("area0", str(result.get("stderr") or ""))
+        self.assertEqual(result.get("cooldownMs"), 600000)
 
     def test_run_codex_task_timeout_reports_artifact_only_changes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-timeout-") as temp_dir:

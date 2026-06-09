@@ -112,12 +112,15 @@ _DEFAULT_NO_EDIT_WATCHDOG_S = 480
 _SMALL_TASK_NO_EDIT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_NO_EDIT_WATCHDOG_S = 180
 _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
-_NO_EDIT_RECOVERY_WATCHDOG_S = 180
+_BACKGROUND_NO_EDIT_WATCHDOG_S = 120
+_NO_EDIT_RECOVERY_WATCHDOG_S = 90
 _DEFAULT_NO_EDIT_RECHECK_S = 120
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
 _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
+_BACKGROUND_ROLLOUT_WATCHDOG_S = 90
+_NO_PUBLISHABLE_FAILURE_COOLDOWN_MS = 10 * 60 * 1000
 
 
 def _model_supports_xhigh_reasoning(model: str) -> bool:
@@ -682,6 +685,16 @@ def _resolve_progress_log_interval_seconds(config: OpenAICodexRuntimeConfig) -> 
     return max(30, min(120, interval))
 
 
+def _looks_like_background_autonomy_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    return (
+        "priority=background" in text
+        or "queuepriority=background" in text
+        or "origin=autonomy" in text
+        or "autonomy background" in text
+    )
+
+
 def _resolve_no_edit_watchdog_seconds(
     prompt: str,
     communicate_timeout_s: Optional[int],
@@ -706,7 +719,10 @@ def _resolve_no_edit_watchdog_seconds(
         return None
 
     prompt_text = str(prompt or "").lower()
-    if _looks_like_narrow_test_task_prompt(prompt):
+    is_background = _looks_like_background_autonomy_prompt(prompt)
+    if is_background:
+        default_s = _BACKGROUND_NO_EDIT_WATCHDOG_S
+    elif _looks_like_narrow_test_task_prompt(prompt):
         default_s = _NARROW_TEST_TASK_NO_EDIT_WATCHDOG_S
     elif "repo-native web review" in prompt_text or "web review path" in prompt_text:
         default_s = _WEB_REVIEW_NO_EDIT_WATCHDOG_S
@@ -718,7 +734,8 @@ def _resolve_no_edit_watchdog_seconds(
         )
     if recovery_attempt > 0:
         default_s = min(default_s, _NO_EDIT_RECOVERY_WATCHDOG_S)
-    return max(120, min(default_s, max(120, communicate_timeout_s - 60)))
+    floor_s = 90 if is_background or recovery_attempt > 0 else 120
+    return max(floor_s, min(default_s, max(floor_s, communicate_timeout_s - 60)))
 
 
 def _resolve_no_edit_recheck_seconds(communicate_timeout_s: Optional[int]) -> int:
@@ -761,7 +778,9 @@ def _resolve_rollout_watchdog_seconds(
         else:
             return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
 
-    if _looks_like_narrow_test_task_prompt(prompt):
+    if _looks_like_background_autonomy_prompt(prompt):
+        default_s = _BACKGROUND_ROLLOUT_WATCHDOG_S
+    elif _looks_like_narrow_test_task_prompt(prompt):
         default_s = _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S
     elif _looks_like_web_review_prompt(prompt):
         default_s = _WEB_REVIEW_ROLLOUT_WATCHDOG_S
@@ -2474,6 +2493,7 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
                 "usage": usage,
+                "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
             }
 
         if no_edit_watchdog_fired:
@@ -2506,6 +2526,7 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
                 "usage": usage,
+                "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
             }
 
         if timed_out:
@@ -2565,6 +2586,7 @@ def _run_codex_task(
                     "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                     "exitCode": 124,
                     "usage": usage,
+                    "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
                 }
             artifact_only_paths = _describe_non_publishable_paths(changed_paths, baseline_snapshot)
             if artifact_only_paths:
@@ -2583,6 +2605,7 @@ def _run_codex_task(
                 "stderr": _truncate(f"{detail}\n{stderr}".strip()),
                 "exitCode": 124,
                 "usage": usage,
+                "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
             }
 
         last_message = _read_text_if_exists(last_message_path)

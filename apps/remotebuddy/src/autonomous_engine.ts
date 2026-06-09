@@ -3901,6 +3901,8 @@ export class RemoteBuddyAutonomousEngine {
   private lastOutcome: "none" | "success" | "skipped" | "failed" = "none";
   private lastDetail = "not_started";
   private lastCompletedAtMs = 0;
+  private dispatchBackoffUntilMs = 0;
+  private dispatchBackoffReason = "";
   private pendingIdeationTimeoutRecovery: IdeationTimeoutRecovery | null = null;
 
   constructor(opts: {
@@ -4629,9 +4631,43 @@ export class RemoteBuddyAutonomousEngine {
         },
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      let errorPayload: Record<string, unknown> = {};
+      try {
+        const parsed = (await res.json()) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          errorPayload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        errorPayload = {};
+      }
+      const code = String(errorPayload.code ?? "").trim();
+      if (
+        res.status === 429 &&
+        (code === "autonomy_worker_failure_circuit_open" ||
+          code === "autonomy_similar_no_publishable_suppressed" ||
+          code === "autonomy_queue_backpressure" ||
+          code === "autonomy_open_pr_limit")
+      ) {
+        const retryAfterMsRaw = Number(errorPayload.retryAfterMs ?? 0);
+        const retryAfterMs = Number.isFinite(retryAfterMsRaw)
+          ? Math.max(60_000, Math.min(60 * 60 * 1000, Math.floor(retryAfterMsRaw)))
+          : 30 * 60 * 1000;
+        this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
+        this.dispatchBackoffReason =
+          compactStatusDetail(
+            code || String(errorPayload.message ?? "autonomy_enqueue_rejected"),
+          ) || "autonomy_enqueue_rejected";
+      }
+      return null;
+    }
     const data = (await res.json()) as { ok?: boolean; requestId?: string };
-    return data.ok && data.requestId ? data.requestId : null;
+    if (data.ok && data.requestId) {
+      this.dispatchBackoffUntilMs = 0;
+      this.dispatchBackoffReason = "";
+      return data.requestId;
+    }
+    return null;
   }
 
   private isSnapshotExpired(snapshot: Snapshot): boolean {
@@ -4907,6 +4943,14 @@ export class RemoteBuddyAutonomousEngine {
     let outcome: "success" | "skipped" | "failed" = "skipped";
     let outcomeDetail = "not_dispatched";
     try {
+      if (Date.now() < this.dispatchBackoffUntilMs) {
+        this.setPhase("dispatch_backoff");
+        const remainingMs = Math.max(0, this.dispatchBackoffUntilMs - Date.now());
+        outcomeDetail = compactStatusDetail(
+          `dispatch_backoff:${this.dispatchBackoffReason || "autonomy_enqueue_rejected"}:${remainingMs}ms`,
+        );
+        return;
+      }
       this.setPhase("acquire_lock");
       const lockResult = await this.acquireDispatchLock(runId);
       lockAcquired = lockResult.ok;

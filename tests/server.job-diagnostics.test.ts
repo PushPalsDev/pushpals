@@ -2,12 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { JobQueue } from "../apps/server/src/jobs";
 
 describe("server JobQueue diagnostics", () => {
-  function enqueueClaimedJob(queue: JobQueue, taskId: string): string {
+  function enqueueClaimedJob(
+    queue: JobQueue,
+    taskId: string,
+    params: Record<string, unknown> = {},
+  ): string {
     const enqueued = queue.enqueue({
       taskId,
       sessionId: "dev",
       kind: "task.execute",
-      params: {},
+      params,
     });
     expect(enqueued.ok).toBe(true);
     const jobId = String(enqueued.jobId ?? "");
@@ -18,8 +22,12 @@ describe("server JobQueue diagnostics", () => {
     return jobId;
   }
 
-  function failNoPublishableJob(queue: JobQueue, taskId: string): void {
-    const jobId = enqueueClaimedJob(queue, taskId);
+  function failNoPublishableJob(
+    queue: JobQueue,
+    taskId: string,
+    params: Record<string, unknown> = {},
+  ): void {
+    const jobId = enqueueClaimedJob(queue, taskId, params);
     const failed = queue.fail(jobId, {
       message: "executor failed",
       diagnostics: {
@@ -216,6 +224,82 @@ describe("server JobQueue diagnostics", () => {
       expect(summary.completedCount).toBe(4);
       expect(summary.terminalCount).toBe(7);
       expect(summary.noPublishableFailureRate).toBeLessThan(0.5);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("suppresses similar autonomy no-publishable failures by pattern key", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      const params = {
+        origin: "autonomy",
+        autonomy: {
+          patternKey: "ui.readability.polish",
+        },
+        planning: {
+          targetPaths: ["src/shell.ts"],
+        },
+      };
+      failNoPublishableJob(queue, "task-similar-pattern-1", params);
+      expect(
+        queue.similarNoPublishableFailureSummary({
+          patternKey: "ui.readability.polish",
+          targetPaths: ["src/shell.ts"],
+          threshold: 2,
+        }).blocked,
+      ).toBe(false);
+
+      failNoPublishableJob(queue, "task-similar-pattern-2", params);
+      const summary = queue.similarNoPublishableFailureSummary({
+        patternKey: "ui.readability.polish",
+        targetPaths: ["src/other.ts"],
+        threshold: 2,
+      });
+      expect(summary.blocked).toBe(true);
+      expect(summary.recentSimilarFailureCount).toBe(2);
+      expect(summary.patternKey).toBe("ui.readability.polish");
+      expect(summary.lastFailureAt).toBeTruthy();
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("suppresses similar autonomy no-publishable failures by overlapping target paths", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      failNoPublishableJob(queue, "task-similar-path-1", {
+        origin: "autonomy",
+        autonomy: {
+          patternKey: "first.pattern",
+        },
+        paths: ["src/components/Button.tsx"],
+      });
+      failNoPublishableJob(queue, "task-similar-path-2", {
+        origin: "autonomy",
+        autonomy: {
+          patternKey: "second.pattern",
+        },
+        planning: {
+          targetPaths: ["src/components"],
+        },
+      });
+
+      const summary = queue.similarNoPublishableFailureSummary({
+        patternKey: "unrelated.pattern",
+        targetPaths: ["src/components/Button.tsx"],
+        threshold: 2,
+      });
+      expect(summary.blocked).toBe(true);
+      expect(summary.recentSimilarFailureCount).toBe(2);
+      expect(summary.targetPathSample).toEqual(["src/components/button.tsx"]);
+
+      const unrelated = queue.similarNoPublishableFailureSummary({
+        patternKey: "unrelated.pattern",
+        targetPaths: ["docs/release.md"],
+        threshold: 2,
+      });
+      expect(unrelated.blocked).toBe(false);
     } finally {
       queue.close();
     }

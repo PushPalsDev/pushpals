@@ -6583,6 +6583,8 @@ class RemoteBuddyAutonomousEngine {
   lastOutcome = "none";
   lastDetail = "not_started";
   lastCompletedAtMs = 0;
+  dispatchBackoffUntilMs = 0;
+  dispatchBackoffReason = "";
   pendingIdeationTimeoutRecovery = null;
   constructor(opts) {
     this.server = opts.server;
@@ -7133,10 +7135,32 @@ ${JSON.stringify(input.messages ?? [])}`),
         }
       })
     });
-    if (!res.ok)
+    if (!res.ok) {
+      let errorPayload = {};
+      try {
+        const parsed = await res.json();
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          errorPayload = parsed;
+        }
+      } catch {
+        errorPayload = {};
+      }
+      const code = String(errorPayload.code ?? "").trim();
+      if (res.status === 429 && (code === "autonomy_worker_failure_circuit_open" || code === "autonomy_similar_no_publishable_suppressed" || code === "autonomy_queue_backpressure" || code === "autonomy_open_pr_limit")) {
+        const retryAfterMsRaw = Number(errorPayload.retryAfterMs ?? 0);
+        const retryAfterMs = Number.isFinite(retryAfterMsRaw) ? Math.max(60000, Math.min(60 * 60 * 1000, Math.floor(retryAfterMsRaw))) : 30 * 60 * 1000;
+        this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
+        this.dispatchBackoffReason = compactStatusDetail(code || String(errorPayload.message ?? "autonomy_enqueue_rejected")) || "autonomy_enqueue_rejected";
+      }
       return null;
+    }
     const data = await res.json();
-    return data.ok && data.requestId ? data.requestId : null;
+    if (data.ok && data.requestId) {
+      this.dispatchBackoffUntilMs = 0;
+      this.dispatchBackoffReason = "";
+      return data.requestId;
+    }
+    return null;
   }
   isSnapshotExpired(snapshot) {
     const createdAt = Date.parse(snapshot.snapshot_created_at);
@@ -7323,6 +7347,12 @@ ${JSON.stringify(input.messages ?? [])}`),
     let outcome = "skipped";
     let outcomeDetail = "not_dispatched";
     try {
+      if (Date.now() < this.dispatchBackoffUntilMs) {
+        this.setPhase("dispatch_backoff");
+        const remainingMs = Math.max(0, this.dispatchBackoffUntilMs - Date.now());
+        outcomeDetail = compactStatusDetail(`dispatch_backoff:${this.dispatchBackoffReason || "autonomy_enqueue_rejected"}:${remainingMs}ms`);
+        return;
+      }
       this.setPhase("acquire_lock");
       const lockResult = await this.acquireDispatchLock(runId);
       lockAcquired = lockResult.ok;
@@ -8651,7 +8681,7 @@ function sanitizeRepoNativeTargetHints(params) {
       const lower = step.replace(/\\/g, "/").toLowerCase();
       return !staleLower.some((path) => lower.includes(path));
     });
-    params.plan.scope.write_globs = params.plan.scope.write_globs.filter((glob) => {
+    params.plan.scope.write_globs = (params.plan.scope.write_globs ?? []).filter((glob) => {
       const normalized = normalizeTargetPath(glob);
       if (!normalized)
         return false;
@@ -10367,8 +10397,10 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           });
         }
       } else {
-        await this.assistantMessage(requestSessionId, "I could not queue this WorkerPal task. No task was started.", { turnId, correlationId: requestId, from: eventFrom });
-        this.rememberPersistentMemory("job_enqueue_failed", `enqueue_failed lane=${lane} intent=${plan.intent}`, requestId, requestSessionId);
+        if (!autonomyMetadata) {
+          await this.assistantMessage(requestSessionId, "I could not queue this WorkerPal task. No task was started.", { turnId, correlationId: requestId, from: eventFrom });
+        }
+        this.rememberPersistentMemory("job_enqueue_failed", `enqueue_failed lane=${lane} intent=${plan.intent} origin=${autonomyMetadata ? "autonomy" : "user"}`, requestId, requestSessionId);
       }
       await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
         method: "POST",
