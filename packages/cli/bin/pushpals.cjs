@@ -4,7 +4,7 @@
 const { spawn, spawnSync } = require("node:child_process");
 const { existsSync, mkdirSync, readFileSync, rmSync } = require("node:fs");
 const { tmpdir } = require("node:os");
-const { join, resolve } = require("node:path");
+const { dirname, join, resolve } = require("node:path");
 
 const bundledCliPath = resolve(__dirname, "..", "dist", "pushpals-cli.js");
 const packageJsonPath = resolve(__dirname, "..", "package.json");
@@ -16,6 +16,7 @@ const BOOTSTRAP_TIMEOUT_ENV = "PUSHPALS_CLI_BOOTSTRAP_TIMEOUT_MS";
 const BOOTSTRAP_READY_MARKER_ENV = "PUSHPALS_CLI_READY_MARKER";
 let packageVersion = "";
 let readyMarkerPath = "";
+let resolvedBunCommand = "";
 if (existsSync(packageJsonPath)) {
   try {
     const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8"));
@@ -74,6 +75,42 @@ function killChildTree(child) {
   }
 }
 
+function resolveWindowsBunCommand() {
+  try {
+    const where = spawnSync("where.exe", ["bun"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+    });
+    if (where.status !== 0) return "bun";
+    const candidates = String(where.stdout ?? "")
+      .split(/\r?\n/g)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    for (const candidate of candidates) {
+      const lower = candidate.toLowerCase();
+      if (lower.endsWith(".exe") && existsSync(candidate)) return candidate;
+
+      // Bun installed through npm/nvm on Windows commonly exposes shell shims:
+      //   <node-dir>\bun
+      //   <node-dir>\bun.cmd
+      // Those shims delegate to <node-dir>\node_modules\bun\bin\bun.exe.
+      const shimTarget = join(dirname(candidate), "node_modules", "bun", "bin", "bun.exe");
+      if (existsSync(shimTarget)) return shimTarget;
+    }
+  } catch {
+    // Fall back to PATH/shell command resolution below.
+  }
+  return "bun";
+}
+
+function resolveBunCommand() {
+  if (resolvedBunCommand) return resolvedBunCommand;
+  resolvedBunCommand = process.platform === "win32" ? resolveWindowsBunCommand() : "bun";
+  return resolvedBunCommand;
+}
+
 if (!existsSync(bundledCliPath)) {
   fail([
     "[pushpals] CLI bundle is missing in this package install.",
@@ -85,7 +122,7 @@ if (!existsSync(bundledCliPath)) {
 function probeBunRuntime() {
   const timeout = parseBunProbeTimeoutMs();
   const options = { stdio: "ignore", timeout };
-  const result = spawnSync("bun", ["--version"], options);
+  const result = spawnSync(resolveBunCommand(), ["--version"], options);
   return {
     ok: result.status === 0,
     timedOut: Boolean(result.error && result.error.code === "ETIMEDOUT"),
@@ -117,10 +154,11 @@ function spawnBunCli() {
     [BOOTSTRAP_READY_MARKER_ENV]: readyMarkerPath,
   };
 
-  if (process.platform === "win32") {
+  const bunCommand = resolveBunCommand();
+  if (process.platform === "win32" && bunCommand === "bun") {
     const quoteWindows = (value) => `"${String(value).replace(/"/g, '\\"')}"`;
     const commandLine = [
-      "bun",
+      bunCommand,
       quoteWindows(bundledCliPath),
       ...process.argv.slice(2).map(quoteWindows),
     ].join(" ");
@@ -130,7 +168,7 @@ function spawnBunCli() {
       env: childEnv,
     });
   }
-  return spawn("bun", [bundledCliPath, ...process.argv.slice(2)], {
+  return spawn(bunCommand, [bundledCliPath, ...process.argv.slice(2)], {
     stdio: "inherit",
     env: childEnv,
   });

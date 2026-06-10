@@ -1274,6 +1274,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(shim).toContain("PUSHPALS_BUN_PROBE_TIMEOUT_MS");
     expect(shim).toContain("PUSHPALS_CLI_BOOTSTRAP_TIMEOUT_MS");
     expect(shim).toContain("PUSHPALS_CLI_READY_MARKER");
+    expect(shim).toContain("where.exe");
+    expect(shim).toContain('join(dirname(candidate), "node_modules", "bun", "bin", "bun.exe")');
     expect(shim).toContain("terminating Bun process tree");
     expect(shim).toContain("taskkill");
     expect(shim).toContain('process.once("SIGINT"');
