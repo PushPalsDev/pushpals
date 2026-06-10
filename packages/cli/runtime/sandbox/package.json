@@ -9,6 +9,7 @@
     "cli": "bun run scripts/pushpals-cli.ts",
     "cli:integration": "bun run scripts/cli-integration.ts",
     "cli:bundle": "bun run --cwd packages/cli build",
+    "cli:verify-package-payload": "bun run scripts/verify-cli-package-payload.ts",
     "cli:monitor:export": "bun run scripts/sync-cli-monitor-ui.ts",
     "replay:worker-job": "bun run scripts/replay-worker-job.ts",
     "protocol:build": "bun --cwd packages/protocol build",

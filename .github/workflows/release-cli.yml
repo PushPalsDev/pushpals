@@ -138,6 +138,10 @@ jobs:
         if: steps.npm_publish_check.outputs.already_published != 'true'
         run: bun run --cwd packages/cli build
 
+      - name: Verify CLI package payload excludes external toolchains
+        if: steps.npm_publish_check.outputs.already_published != 'true'
+        run: bun run cli:verify-package-payload
+
       - name: Publish to npm
         if: steps.npm_publish_check.outputs.already_published != 'true'
         working-directory: packages/cli
@@ -580,6 +584,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
@@ -591,6 +600,9 @@ jobs:
         run: |
           cd dist
           sha256sum pushpals-* > SHA256SUMS.txt
+
+      - name: Verify GitHub release assets exclude external tool artifacts
+        run: bun run scripts/verify-cli-package-payload.ts --skip-package --release-dir dist
 
       - name: Import Linux release signing key
         if: env.LINUX_RELEASE_GPG_PRIVATE_KEY_BASE64 != ''

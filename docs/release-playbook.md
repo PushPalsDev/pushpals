@@ -27,6 +27,7 @@ Run these before tagging unless there is a clear environment blocker:
 ```powershell
 git status --short --branch
 bun run cli:bundle
+bun run cli:verify-package-payload
 bun run test:root
 git diff --check
 ```
@@ -34,6 +35,16 @@ git diff --check
 If `bun run cli:bundle` changes `packages/cli/runtime` or monitor UI assets,
 commit those generated updates before tagging. The published package uses those
 packaged assets.
+
+The npm package must not vendor external toolchains. Run
+`bun run cli:verify-package-payload` to inspect the actual `npm pack --dry-run`
+file list and fail if the package would include real `node_modules`
+directories, virtualenvs, standalone executables, native libraries, or external
+tool names such as Bun, Node, Git, Docker, Codex, or UV.
+
+The GitHub release still publishes PushPals-built standalone CLI/runtime
+artifacts. Do not add separate third-party tool binaries to the release asset
+set; the release workflow verifies artifact names before upload.
 
 ## Version Numbering
 
@@ -146,6 +157,9 @@ pushpals --clear
 - `release_log.md` was not updated, so the GitHub release body is stale.
 - `packages/cli/runtime` was not regenerated after runtime changes.
 - The npm package published, but a platform binary smoke failed.
+- The CLI package payload check fails because an external tool binary, native
+  library, virtualenv, or `node_modules` directory would be shipped. Remove the
+  vendored artifact and rely on environment discovery/downloads instead.
 - Docker is unavailable in an installed-CLI smoke environment; cleanup should be
   best-effort, not a hard failure.
 - User-local `runtime/configs/local.toml` overrides new defaults during manual
