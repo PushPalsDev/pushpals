@@ -8396,6 +8396,12 @@ function parseEnabledFlag(raw, defaultValue) {
     return defaultValue;
   return !["0", "false", "no", "off"].includes(text);
 }
+function parseNonNegativeMs(raw, defaultValue = 0) {
+  const parsed = Number.parseInt(String(raw ?? "").trim(), 10);
+  if (!Number.isFinite(parsed) || parsed < 0)
+    return Math.max(0, defaultValue);
+  return Math.floor(parsed);
+}
 function isCodexUnavailableFailureSignal(message, detail) {
   const text = `${message}
 ${detail}`.toLowerCase();
@@ -8968,6 +8974,7 @@ class RemoteBuddyOrchestrator {
   workerSpawnCooldownUntil = 0;
   workerSpawnBackoffMs;
   workerAutoscalePollMs;
+  workerPrewarmDelayMs;
   lastWorkerAutoscaleAt = 0;
   comm;
   statusHeartbeatTimer = null;
@@ -9030,6 +9037,7 @@ class RemoteBuddyOrchestrator {
     this.workerpalsUnavailableReason = null;
     this.workerSpawnBackoffMs = Math.max(1000, Number.isFinite(remoteCfg.crashRestartBackoffMs) && remoteCfg.crashRestartBackoffMs > 0 ? remoteCfg.crashRestartBackoffMs : 3000);
     this.workerAutoscalePollMs = Math.max(1000, remoteCfg.pollMs);
+    this.workerPrewarmDelayMs = Math.min(5 * 60000, parseNonNegativeMs(process.env.PUSHPALS_REMOTEBUDDY_WORKERPAL_PREWARM_DELAY_MS, 0));
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS, true);
     this.executionBudgetInteractiveMs = Math.max(60000, remoteCfg.executionBudgetInteractiveMs);
@@ -9081,6 +9089,9 @@ class RemoteBuddyOrchestrator {
     this.autonomousEngine.setRuntimeEnabled(this.autonomyRuntimeEnabled);
     console.log(`[RemoteBuddy] Detected repo root: ${this.repo}`);
     console.log(`[RemoteBuddy] Worker scheduler: min=${this.minWorkers} max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`);
+    if (this.workerPrewarmDelayMs > 0) {
+      console.log(`[RemoteBuddy] WorkerPal startup prewarm delayed by ${this.workerPrewarmDelayMs}ms to reduce first-run binary scan contention.`);
+    }
     console.log(`[RemoteBuddy] Budgets: interactive=${this.executionBudgetInteractiveMs}ms normal=${this.executionBudgetNormalMs}ms background=${this.executionBudgetBackgroundMs}ms finalization=${this.finalizationBudgetMs}ms`);
     console.log(`[RemoteBuddy] Failure log fetch on job failures: ${this.fetchFailureLogsOnJobFailure ? "on" : "off"}`);
     console.log(`[RemoteBuddy] Persistent memory: ${this.memoryEnabled ? "on" : "off"} crossSession=${this.memoryIncludeCrossSession ? "on" : "off"} recallItems=${this.memoryMaxRecallItems} recallChars=${this.memoryMaxRecallChars} retentionDays=${this.memoryRetentionDays}`);
@@ -10039,6 +10050,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
   }
   async ensureWorkerCapacityOnStartup() {
+    if (this.workerPrewarmDelayMs > 0) {
+      console.log(`[RemoteBuddy] Waiting ${this.workerPrewarmDelayMs}ms before WorkerPal startup prewarm.`);
+      await Bun.sleep(this.workerPrewarmDelayMs);
+      if (this.disposed)
+        return;
+    }
     const workers = await this.fetchWorkers();
     if (this.pickIdleWorker(workers)) {
       return;

@@ -159,6 +159,7 @@ type RuntimeBinarySet = {
   remotebuddy: string;
   workerpals: string;
   sourceControlManager: string;
+  freshlyInstalled?: boolean;
 };
 
 type RuntimeBinaryInstallState = {
@@ -279,6 +280,9 @@ const DEFAULT_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS = 5_000;
 const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS_ENV =
   "PUSHPALS_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS";
 const BLOCKING_WORKERPAL_IMAGE_BUILD_ENV = "PUSHPALS_BLOCKING_WORKERPAL_IMAGE_BUILD";
+const WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS_ENV =
+  "PUSHPALS_WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS";
+const DEFAULT_WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS = 30_000;
 const CLI_SESSION_JOB_LOG_MAX_CHARS = 700;
 const CLI_SESSION_SHOW_JOB_EVENTS_ENV = "PUSHPALS_CLI_SHOW_JOB_EVENTS";
 const EMBEDDED_RUNTIME_SAFETY_CAP_DISABLE_ENV = "PUSHPALS_DISABLE_EMBEDDED_SAFETY_CAPS";
@@ -2290,6 +2294,7 @@ export async function ensureRuntimeBinaries(
     console.log(`[pushpals] Embedded runtime binaries downloaded: ${downloadedCount}.`);
   }
   console.log("[pushpals] Embedded runtime binaries are ready.");
+  runtimeBinaries.freshlyInstalled = downloadedCount > 0;
   return runtimeBinaries;
 }
 
@@ -3535,6 +3540,20 @@ function resolveWorkerpalStartupReadinessProbeTimeoutMs(config: PushPalsConfig):
   );
 }
 
+export function resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs(
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): number {
+  if (platform !== "win32") return 0;
+  const raw = String(env[WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS_ENV] ?? "").trim();
+  if (raw === "0") return 0;
+  return clampPositiveInt(
+    parsePositiveInt(raw, DEFAULT_WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS),
+    0,
+    5 * 60_000,
+  );
+}
+
 export function shouldPrepareEmbeddedWorkerpalDockerImageBlocking(opts: {
   platform?: NodeJS.Platform;
   env?: Record<string, string | undefined>;
@@ -4344,6 +4363,20 @@ async function autoStartRuntimeServices(opts: {
     },
   );
   runtimeEnv.PUSHPALS_WORKERPALS_BIN = runtimeBinaries.workerpals;
+  if (
+    runtimeBinaries.freshlyInstalled &&
+    process.platform === "win32" &&
+    runtimePreflight.config.remotebuddy.autoSpawnWorkerpals &&
+    !runtimeEnv.PUSHPALS_REMOTEBUDDY_WORKERPAL_PREWARM_DELAY_MS
+  ) {
+    const delayMs = resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs(runtimeEnv, process.platform);
+    if (delayMs > 0) {
+      runtimeEnv.PUSHPALS_REMOTEBUDDY_WORKERPAL_PREWARM_DELAY_MS = String(delayMs);
+      console.log(
+        `[pushpals] Fresh Windows runtime binaries detected; delaying WorkerPal prewarm by ${delayMs}ms so security software can finish first-run binary checks. Set ${WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS_ENV}=0 to disable.`,
+      );
+    }
+  }
   const preconfiguredRuntimeGitBinary =
     runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE ?? runtimeEnv.PUSHPALS_GIT_BIN;
   if (preconfiguredRuntimeGitBinary) {
@@ -4999,6 +5032,17 @@ function writeCliState(pathValue: string, state: CliState): void {
   };
   mkdirSync(dirname(pathValue), { recursive: true });
   writeFileSync(pathValue, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+function markCliBootstrapReadyFromEnv(env: Record<string, string | undefined> = process.env): void {
+  const markerPath = String(env.PUSHPALS_CLI_READY_MARKER ?? "").trim();
+  if (!markerPath) return;
+  try {
+    mkdirSync(dirname(markerPath), { recursive: true });
+    writeFileSync(markerPath, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+  } catch {
+    // Parent watchdog is best-effort. Startup must not fail because the marker cannot be written.
+  }
 }
 
 export function resolveCliStatePath(repoRoot: string): string | null {
@@ -6215,6 +6259,7 @@ async function main(): Promise<void> {
   console.log(`[pushpals] cliStateFile=${statePath ?? "unavailable"}`);
   reportWorkerExecutionReadinessFromSnapshot(startupWorkerExecutionReadiness);
   reportEmbeddedRuntimeHealth();
+  markCliBootstrapReadyFromEnv();
   if (parsed.runtimeOnly) {
     console.log("[pushpals] runtimeOnly=true");
   } else {

@@ -170,6 +170,12 @@ function parseEnabledFlag(raw: string | undefined | null, defaultValue: boolean)
   return !["0", "false", "no", "off"].includes(text);
 }
 
+function parseNonNegativeMs(raw: string | undefined | null, defaultValue = 0): number {
+  const parsed = Number.parseInt(String(raw ?? "").trim(), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return Math.max(0, defaultValue);
+  return Math.floor(parsed);
+}
+
 function isCodexUnavailableFailureSignal(message: string, detail: string): boolean {
   const text = `${message}\n${detail}`.toLowerCase();
   return [
@@ -987,6 +993,7 @@ export class RemoteBuddyOrchestrator {
   private workerSpawnCooldownUntil = 0;
   private readonly workerSpawnBackoffMs: number;
   private readonly workerAutoscalePollMs: number;
+  private readonly workerPrewarmDelayMs: number;
   private lastWorkerAutoscaleAt = 0;
   private readonly comm: CommunicationManager;
   private statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -1078,6 +1085,10 @@ export class RemoteBuddyOrchestrator {
         : 3_000,
     );
     this.workerAutoscalePollMs = Math.max(1_000, remoteCfg.pollMs);
+    this.workerPrewarmDelayMs = Math.min(
+      5 * 60_000,
+      parseNonNegativeMs(process.env.PUSHPALS_REMOTEBUDDY_WORKERPAL_PREWARM_DELAY_MS, 0),
+    );
     this.statusHeartbeatMs = Math.max(0, remoteCfg.statusHeartbeatMs);
     this.fetchFailureLogsOnJobFailure = parseEnabledFlag(
       process.env.REMOTEBUDDY_FETCH_FAILURE_LOGS,
@@ -1149,6 +1160,11 @@ export class RemoteBuddyOrchestrator {
     console.log(
       `[RemoteBuddy] Worker scheduler: min=${this.minWorkers} max=${this.maxWorkers} autoSpawn=${this.autoSpawnWorkers ? "on" : "off"} wait=${this.waitForWorkerMs}ms`,
     );
+    if (this.workerPrewarmDelayMs > 0) {
+      console.log(
+        `[RemoteBuddy] WorkerPal startup prewarm delayed by ${this.workerPrewarmDelayMs}ms to reduce first-run binary scan contention.`,
+      );
+    }
     console.log(
       `[RemoteBuddy] Budgets: interactive=${this.executionBudgetInteractiveMs}ms normal=${this.executionBudgetNormalMs}ms background=${this.executionBudgetBackgroundMs}ms finalization=${this.finalizationBudgetMs}ms`,
     );
@@ -2460,6 +2476,13 @@ export class RemoteBuddyOrchestrator {
   }
 
   async ensureWorkerCapacityOnStartup(): Promise<void> {
+    if (this.workerPrewarmDelayMs > 0) {
+      console.log(
+        `[RemoteBuddy] Waiting ${this.workerPrewarmDelayMs}ms before WorkerPal startup prewarm.`,
+      );
+      await Bun.sleep(this.workerPrewarmDelayMs);
+      if (this.disposed) return;
+    }
     const workers = await this.fetchWorkers();
     if (this.pickIdleWorker(workers)) {
       return;

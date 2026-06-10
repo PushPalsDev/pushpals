@@ -55,6 +55,7 @@ import {
   resolveCliLocalBuddyAutostart,
   resolveWorkerExecutionReadiness,
   resolveWorkerpalStartupReadinessProbeMaxMs,
+  resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs,
   resolveCliStatePath,
   resolveCommandPath,
   runCommandWithEnv,
@@ -1248,6 +1249,35 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         PUSHPALS_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS: "250",
       }),
     ).toBe(1_000);
+  });
+
+  test("fresh Windows runtime installs delay WorkerPal prewarm while binaries are scanner-hot", () => {
+    expect(resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs({}, "win32")).toBe(30_000);
+    expect(
+      resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs(
+        { PUSHPALS_WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS: "45000" },
+        "win32",
+      ),
+    ).toBe(45_000);
+    expect(
+      resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs(
+        { PUSHPALS_WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS: "0" },
+        "win32",
+      ),
+    ).toBe(0);
+    expect(resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs({}, "linux")).toBe(0);
+  });
+
+  test("npm package shim keeps a bounded Bun bootstrap watchdog", () => {
+    const shim = readFileSync(join(process.cwd(), "packages", "cli", "bin", "pushpals.cjs"), "utf8");
+
+    expect(shim).toContain("PUSHPALS_BUN_PROBE_TIMEOUT_MS");
+    expect(shim).toContain("PUSHPALS_CLI_BOOTSTRAP_TIMEOUT_MS");
+    expect(shim).toContain("PUSHPALS_CLI_READY_MARKER");
+    expect(shim).toContain("terminating Bun process tree");
+    expect(shim).toContain("taskkill");
+    expect(shim).toContain('process.once("SIGINT"');
+    expect(shim).toContain('process.once("SIGTERM"');
   });
 
   test("startup readiness reports blocked immediately when WorkerPal auto-spawn is disabled", () => {
