@@ -17,6 +17,10 @@ import {
   filterResultLines,
 } from "../common/execution_utils.js";
 import { buildWorkerSandboxWritableEnv } from "../common/sandbox_env.js";
+import {
+  createPythonPayloadTransport,
+  type PythonPayloadTransport,
+} from "../common/python_payload_transport.js";
 import { computeTimeoutWarningWindow } from "../timeout_policy.js";
 
 // ---- Script path (resolved relative to this file) ----------------------------
@@ -274,6 +278,7 @@ export async function executeWithOpenHands(
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   let stuckNudgeStartTimer: ReturnType<typeof setTimeout> | null = null;
   let stuckNudgeTimer: ReturnType<typeof setInterval> | null = null;
+  let payloadTransport: PythonPayloadTransport | null = null;
   const outputPolicy = {
     maxOutputChars: runtimeConfig.workerpals.outputMaxChars,
     maxOutputLines: runtimeConfig.workerpals.outputMaxLines,
@@ -282,7 +287,8 @@ export async function executeWithOpenHands(
   };
 
   try {
-    const proc = Bun.spawn([pythonBin, scriptPath, payload], {
+    payloadTransport = createPythonPayloadTransport(payload);
+    const proc = Bun.spawn([pythonBin, scriptPath, ...payloadTransport.args], {
       cwd: repo,
       stdout: "pipe",
       stderr: "pipe",
@@ -623,5 +629,6 @@ export async function executeWithOpenHands(
     if (stuckNudgeTimer) {
       clearInterval(stuckNudgeTimer);
     }
+    payloadTransport?.cleanup();
   }
 }

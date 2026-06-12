@@ -350,6 +350,28 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             self.assertIn("Home shell startup is assertable", guidance)
             self.assertIn("bun run web:e2e", guidance)
 
+    def test_parse_payload_accepts_file_backed_payload_transport(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-payload-file-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "task.execute",
+                "repo": str(repo),
+                "params": {"instruction": "Make one small publishable change"},
+            }
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+            payload_file = Path(temp_dir) / "payload.b64"
+            payload_file.write_text(encoded, encoding="utf-8")
+
+            task = parse_task_execute_payload(
+                ["executor", "--payload-file", str(payload_file)],
+                logger=Logger("[test]"),
+            )
+
+            self.assertEqual(task.kind, "task.execute")
+            self.assertEqual(task.repo, str(repo.resolve()))
+            self.assertEqual(task.instruction, "Make one small publishable change")
+
     def test_parse_payload_prefers_helper_tests_for_visual_derivation_tasks(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-visual-guidance-") as temp_dir:
             repo = Path(temp_dir) / "repo"

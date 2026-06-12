@@ -163,6 +163,20 @@ def decode_payload(raw: str) -> Dict[str, Any]:
     return payload
 
 
+def read_encoded_payload_arg(argv: List[str]) -> str:
+    if len(argv) < 2:
+        raise ValueError("missing base64 job payload")
+    mode = argv[1]
+    if mode == "--payload-file":
+        if len(argv) < 3 or not str(argv[2] or "").strip():
+            raise ValueError("missing payload file path")
+        path = Path(str(argv[2])).expanduser()
+        return path.read_text(encoding="utf-8").strip()
+    if mode == "--payload-stdin":
+        return sys.stdin.read().strip()
+    return mode
+
+
 def resolve_repo_within_assigned_root(repo: str) -> Tuple[Optional[str], Optional[str]]:
     raw_repo = str(repo or "").strip()
     if not raw_repo:
@@ -968,11 +982,8 @@ def parse_task_execute_payload(
     don't need to handle them.
     """
     log = logger or Logger("[Executor]")
-    if len(argv) < 2:
-        raise SystemExit(fail("Missing base64 job payload", exit_code=2))
-
     try:
-        payload = decode_payload(argv[1])
+        payload = decode_payload(read_encoded_payload_arg(argv))
     except Exception as exc:
         raise SystemExit(fail(f"Failed to decode job payload: {exc}", exit_code=2))
 

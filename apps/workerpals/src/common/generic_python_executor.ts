@@ -19,6 +19,10 @@ import {
   streamLines,
 } from "./execution_utils.js";
 import { buildWorkerSandboxWritableEnv } from "./sandbox_env.js";
+import {
+  createPythonPayloadTransport,
+  type PythonPayloadTransport,
+} from "./python_payload_transport.js";
 
 interface GenericPythonExecutorConfig {
   backendName: string;
@@ -357,7 +361,6 @@ export function createGenericPythonExecutor(
       }),
       "utf-8",
     ).toString("base64");
-    const args = [pythonBin, scriptPath, payloadBase64];
     const childTimeoutMs = resolveGenericPythonExecutorChildTimeoutMs({
       backendName,
       hostTimeoutMs: timeoutMs,
@@ -379,12 +382,15 @@ export function createGenericPythonExecutor(
           )}ms`
         : "";
 
-    onLog?.(
-      "stdout",
-      `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms; ${timeoutDetail}${childTimeoutDetail})`,
-    );
-
+    let payloadTransport: PythonPayloadTransport | null = null;
     try {
+      payloadTransport = createPythonPayloadTransport(payloadBase64);
+      const args = [pythonBin, scriptPath, ...payloadTransport.args];
+      onLog?.(
+        "stdout",
+        `[${backendLabel}Executor] Spawning ${backendName} executor (timeout=${timeoutMs}ms; ${timeoutDetail}${childTimeoutDetail})`,
+      );
+
       const outputPolicy = {
         maxOutputChars: runtimeConfig.workerpals.outputMaxChars,
         maxOutputLines: runtimeConfig.workerpals.outputMaxLines,
@@ -539,6 +545,8 @@ export function createGenericPythonExecutor(
           "",
         ),
       };
+    } finally {
+      payloadTransport?.cleanup();
     }
   };
 }

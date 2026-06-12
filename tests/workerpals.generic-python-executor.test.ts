@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { randomUUID } from "crypto";
+import { createPythonPayloadTransport } from "../apps/workerpals/src/common/python_payload_transport";
 import {
   normalizeGenericPythonExecutorParsedResultForTimeout,
   resolveGenericPythonExecutorScriptPath,
@@ -11,6 +12,25 @@ import {
   resolveGenericPythonExecutorTimeoutMs,
   resolveOpenAICodexValidationReserveMs,
 } from "../apps/workerpals/src/common/generic_python_executor";
+
+describe("python payload transport", () => {
+  test("keeps large executor payloads out of process argv", () => {
+    const payloadBase64 = "x".repeat(256 * 1024);
+    const transport = createPythonPayloadTransport(payloadBase64);
+    const filePath = transport.filePath;
+
+    try {
+      expect(transport.args).toEqual(["--payload-file", filePath]);
+      expect(transport.args.join(" ")).not.toContain(payloadBase64.slice(0, 1024));
+      expect(readFileSync(filePath, "utf8")).toBe(payloadBase64);
+    } finally {
+      transport.cleanup();
+      transport.cleanup();
+    }
+
+    expect(existsSync(filePath)).toBe(false);
+  });
+});
 
 describe("generic python executor timeout resolution", () => {
   test("caps normal backends to the job execution budget", () => {
