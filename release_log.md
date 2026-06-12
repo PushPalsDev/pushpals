@@ -2,25 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.35`
-- start_commit: `2ec07ce6e1e80e8e7901f84cb87d6d4e2678ae0d`
-- end_commit: `b78c5a5fc72942cd83dc94e0409d3016ef27c3e0`
-- commits_in_range: `2`
+- version: `v1.1.36`
+- start_commit: `325ad8f8810abb73955a5d759dcec9f93b2dd508`
+- end_commit: `71da2b299d9be510e8be7fc47b014c58460ee80e`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Recover OpenAI Codex WorkerPal startup stalls by detecting runs that emit only startup events, recycling the affected worker, and retrying once with fallback-model guidance before marking the job terminal.
-- Harden Python executor payload decoding so Docker and direct WorkerPal recovery paths accept normal base64, unpadded base64, URL-safe base64, raw JSON recovery payloads, and positional payload-file handoffs.
-- Add focused regression coverage for Codex startup-stall recovery and payload transport variants so direct fallback workers do not fail jobs with `Incorrect padding`.
-- Sync the packaged CLI runtime sandbox so installed `@pushpalsdev/cli` users receive the WorkerPal fixes.
+- Make the OpenAI Codex no-edit watchdog command-aware so legitimate tool reads or shell commands get a bounded post-command patch window before recovery fires.
+- Preserve no-edit protection for prose-only discovery loops and artifact-only diffs; the new grace applies only after observed Codex command/tool activity.
+- Add regression coverage for command-backed discovery that patches after the old no-edit deadline, while retaining existing no-edit and transient-artifact watchdog coverage.
+- Sync the packaged CLI runtime sandbox so installed `@pushpalsdev/cli` users receive the WorkerPal watchdog fix.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
 - `python apps\\workerpals\\src\\backends\\openai_codex\\test_openai_codex_runtime_config.py`
-- `bun test tests\\workerpals.generic-python-executor.test.ts tests\\workerpals.task-execute-schema.test.ts tests\\remotebuddy.worker-spawn-command.test.ts tests\\remotebuddy.worker-autoscale.test.ts`
-- `bun test tests\\release-windows-runtime-smoke.test.ts`
+- `python packages\\cli\\runtime\\sandbox\\apps\\workerpals\\src\\backends\\openai_codex\\test_openai_codex_runtime_config.py`
 - `bun run test:root`
 - `git diff --check`
 
