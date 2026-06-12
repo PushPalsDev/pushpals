@@ -373,6 +373,63 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             self.assertEqual(task.repo, str(repo.resolve()))
             self.assertEqual(task.instruction, "Make one small publishable change")
 
+    def test_parse_payload_accepts_positional_payload_file_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-payload-file-positional-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "task.execute",
+                "repo": str(repo),
+                "params": {"instruction": "Recover from a direct-worker payload handoff"},
+            }
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+            payload_file = Path(temp_dir) / "payload.b64"
+            payload_file.write_text(encoded, encoding="utf-8")
+
+            task = parse_task_execute_payload(
+                ["executor", str(payload_file)],
+                logger=Logger("[test]"),
+            )
+
+            self.assertEqual(task.kind, "task.execute")
+            self.assertEqual(task.repo, str(repo.resolve()))
+            self.assertEqual(task.instruction, "Recover from a direct-worker payload handoff")
+
+    def test_parse_payload_accepts_unpadded_base64_payload(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-payload-unpadded-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "task.execute",
+                "repo": str(repo),
+                "params": {"instruction": "Accept wrapper-normalized payload padding"},
+            }
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+            unpadded = encoded.rstrip("=")
+
+            task = parse_task_execute_payload(["executor", unpadded], logger=Logger("[test]"))
+
+            self.assertEqual(task.kind, "task.execute")
+            self.assertEqual(task.repo, str(repo.resolve()))
+            self.assertEqual(task.instruction, "Accept wrapper-normalized payload padding")
+
+    def test_parse_payload_accepts_raw_json_payload(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-payload-raw-json-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": "task.execute",
+                "repo": str(repo),
+                "params": {"instruction": "Accept raw JSON from a recovery wrapper"},
+            }
+            raw_json = json.dumps(payload)
+
+            task = parse_task_execute_payload(["executor", raw_json], logger=Logger("[test]"))
+
+            self.assertEqual(task.kind, "task.execute")
+            self.assertEqual(task.repo, str(repo.resolve()))
+            self.assertEqual(task.instruction, "Accept raw JSON from a recovery wrapper")
+
     def test_parse_payload_prefers_helper_tests_for_visual_derivation_tasks(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-visual-guidance-") as temp_dir:
             repo = Path(temp_dir) / "repo"

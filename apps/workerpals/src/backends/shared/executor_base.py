@@ -155,12 +155,37 @@ def fail(summary: str, stderr: Optional[str] = None, exit_code: int = 1) -> int:
     return exit_code
 
 
-def decode_payload(raw: str) -> Dict[str, Any]:
-    decoded = base64.b64decode(raw).decode("utf-8")
-    payload = json.loads(decoded)
+def _parse_payload_json(raw: str) -> Dict[str, Any]:
+    payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("payload must be a JSON object")
     return payload
+
+
+def decode_payload(raw: str) -> Dict[str, Any]:
+    stripped = str(raw or "").strip()
+    if not stripped:
+        raise ValueError("empty job payload")
+
+    # Direct workers normally receive a file-backed base64 payload, but this
+    # parser intentionally accepts the safe adjacent encodings too. That keeps
+    # executor startup resilient if an outer wrapper normalizes padding, uses
+    # url-safe base64, or hands through raw JSON during recovery.
+    if stripped.startswith("{"):
+        return _parse_payload_json(stripped)
+
+    compact = "".join(stripped.split())
+    padded = compact + ("=" * ((4 - len(compact) % 4) % 4))
+    decode_errors: List[str] = []
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            decoded = decoder(padded).decode("utf-8")
+            return _parse_payload_json(decoded)
+        except Exception as exc:
+            decode_errors.append(str(exc))
+
+    detail = "; ".join(error for error in decode_errors if error) or "unknown decode error"
+    raise ValueError(f"invalid base64/JSON job payload: {detail}")
 
 
 def read_encoded_payload_arg(argv: List[str]) -> str:
@@ -174,6 +199,13 @@ def read_encoded_payload_arg(argv: List[str]) -> str:
         return path.read_text(encoding="utf-8").strip()
     if mode == "--payload-stdin":
         return sys.stdin.read().strip()
+    if len(mode) < 4096:
+        try:
+            path = Path(mode).expanduser()
+            if path.is_file():
+                return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
     return mode
 
 
