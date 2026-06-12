@@ -2,25 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.33`
-- start_commit: `576b63116eaba0d497ea5b582e3e8a8d80507edb`
-- end_commit: `bae7d97f450d08c98e6a4346ef358ab92a655103`
-- commits_in_range: `2`
+- version: `v1.1.34`
+- start_commit: `62265128bdc7ecb50b441231aff3691db14c8d95`
+- end_commit: `663955b73d9ebdf5faad24ba470b36aa14d40a80`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Fix WorkerPal Python executor startup failures on Windows by moving large base64 job payloads out of process argv and into short-lived payload files, preventing `ENAMETOOLONG: name too long, uv_spawn` before Codex can start.
-- Apply the safe payload transport to the generic Python executor path and the specialized OpenHands path, covering OpenAI Codex, MiniSwe, and OpenHands wrapper launches.
-- Keep shared Python wrapper compatibility with legacy positional payloads while adding `--payload-file` and `--payload-stdin` decoding support for future-safe transports.
-- Tighten release package payload guard coverage so executable-mode external tool files are rejected before npm publish.
-- Regenerate packaged CLI runtime assets so the npm CLI includes the WorkerPal payload transport helper and mirrored wrapper updates.
+- Fix the `v1.1.33` npm publish failure by allowing expected PushPals-generated JavaScript payload artifacts that npm reports with executable file mode on Linux.
+- Preserve the package payload guard against vendored external toolchains, native libraries, virtualenvs, `node_modules`, and executable files outside the known PushPals CLI/runtime JS entrypoints.
+- Add release guard coverage for the allowed generated JS artifacts so future publish checks do not regress into false positives.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests\\workerpals.generic-python-executor.test.ts tests\\release-package-payload.test.ts`
-- `python apps\\workerpals\\src\\backends\\openai_codex\\test_openai_codex_runtime_config.py`
+- `bun test tests\\release-package-payload.test.ts`
 - `bun run test:root`
 - `git diff --check`
 
