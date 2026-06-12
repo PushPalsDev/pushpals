@@ -55,8 +55,9 @@ describe("release package payload verification", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "README.md" },
       { path: "bin/pushpals.cjs", mode: 0o755 },
-      { path: "dist/pushpals-cli.js" },
+      { path: "dist/pushpals-cli.js", mode: 0o755 },
       { path: "runtime/configs/default.toml" },
+      { path: "runtime/sandbox/.pushpals-remotebuddy-fallback.js", mode: 0o755 },
       { path: "runtime/sandbox/bun.lock" },
       { path: "runtime/sandbox/apps/workerpals/uv.lock" },
       { path: "monitor-ui/assets/__node_modules/@expo/vector-icons/build/vendor/react-native-vector-icons/Fonts/Ionicons.ttf" },

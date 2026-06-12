@@ -16,7 +16,11 @@ export type PackagePayloadIssue = {
 };
 
 const REQUIRED_CLI_PACKAGE_PATHS = new Set(["bin/pushpals.cjs", "dist/pushpals-cli.js"]);
-const ALLOWED_EXECUTABLE_PACKAGE_PATHS = new Set(["bin/pushpals.cjs"]);
+const ALLOWED_EXECUTABLE_PACKAGE_PATHS = new Set([
+  "bin/pushpals.cjs",
+  "dist/pushpals-cli.js",
+  "runtime/sandbox/.pushpals-remotebuddy-fallback.js",
+]);
 
 const DISALLOWED_DIRECTORY_SEGMENTS = new Set([
   ".bun",
