@@ -1,14 +1,60 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   findDisallowedCliPackageEntries,
   findDisallowedReleaseArtifactEntries,
 } from "../scripts/verify-cli-package-payload.ts";
 
+const repoRoot = resolve(import.meta.dir, "..");
+const verifierScript = join(repoRoot, "scripts", "verify-cli-package-payload.ts");
+
+function withTempPackage<T>(fn: (packageDir: string) => T): T {
+  const packageDir = mkdtempSync(join(tmpdir(), "pushpals-package-payload-test-"));
+  try {
+    mkdirSync(join(packageDir, "bin"), { recursive: true });
+    mkdirSync(join(packageDir, "dist"), { recursive: true });
+    mkdirSync(join(packageDir, "runtime"), { recursive: true });
+    writeFileSync(
+      join(packageDir, "package.json"),
+      `${JSON.stringify(
+        {
+          name: "pushpals-package-payload-fixture",
+          version: "1.0.0",
+          bin: {
+            pushpals: "bin/pushpals.cjs",
+          },
+          files: ["bin", "dist", "runtime", "README.md"],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    writeFileSync(join(packageDir, "README.md"), "# fixture\n", "utf8");
+    writeFileSync(join(packageDir, "bin", "pushpals.cjs"), "console.log('fixture');\n", "utf8");
+    writeFileSync(join(packageDir, "dist", "pushpals-cli.js"), "export {};\n", "utf8");
+    return fn(packageDir);
+  } finally {
+    rmSync(packageDir, { recursive: true, force: true });
+  }
+}
+
+function runVerifier(args: string[]) {
+  return spawnSync(process.execPath, ["run", verifierScript, ...args], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
 describe("release package payload verification", () => {
   test("allows the expected CLI package payload shape without vendored tool binaries", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "README.md" },
-      { path: "bin/pushpals.cjs" },
+      { path: "bin/pushpals.cjs", mode: 0o755 },
       { path: "dist/pushpals-cli.js" },
       { path: "runtime/configs/default.toml" },
       { path: "runtime/sandbox/bun.lock" },
@@ -30,6 +76,7 @@ describe("release package payload verification", () => {
       { path: "runtime/bin/codex" },
       { path: "runtime/bin/uv" },
       { path: "runtime/lib/native.node" },
+      { path: "runtime/bin/helper", mode: 0o755 },
       { path: "runtime/vendor/libsqlite3.so.0" },
       { path: "runtime/sandbox/node_modules/package/index.js" },
       { path: "runtime/sandbox/apps/workerpals/.venv/bin/python" },
@@ -43,9 +90,24 @@ describe("release package payload verification", () => {
       "runtime/bin/codex",
       "runtime/bin/uv",
       "runtime/lib/native.node",
+      "runtime/bin/helper",
       "runtime/vendor/libsqlite3.so.0",
       "runtime/sandbox/node_modules/package/index.js",
       "runtime/sandbox/apps/workerpals/.venv/bin/python",
+    ]);
+  });
+
+  test("normalizes Windows package paths before matching blocked tools and directories", () => {
+    const issues = findDisallowedCliPackageEntries([
+      { path: "bin\\pushpals.cjs" },
+      { path: "dist\\pushpals-cli.js" },
+      { path: "runtime\\bin\\bun.exe" },
+      { path: "runtime\\sandbox\\node_modules\\package\\index.js" },
+    ]);
+
+    expect(issues.map((issue) => issue.path)).toEqual([
+      "runtime/bin/bun.exe",
+      "runtime/sandbox/node_modules/package/index.js",
     ]);
   });
 
@@ -86,5 +148,54 @@ describe("release package payload verification", () => {
         "pushpals-runtime-workerpals-windows-x64.exe.old",
       ]).map((issue) => issue.path),
     ).toEqual(["bun.exe", "node", "codex", "pushpals-runtime-workerpals-windows-x64.exe.old"]);
+  });
+
+  test("script succeeds against a clean packed package fixture", () => {
+    withTempPackage((packageDir) => {
+      const result = runVerifier(["--package-dir", packageDir]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("verified npm package payload");
+      expect(result.stderr).toBe("");
+    });
+  });
+
+  test("script fails against a package fixture that would ship Bun", () => {
+    withTempPackage((packageDir) => {
+      mkdirSync(join(packageDir, "runtime", "bin"), { recursive: true });
+      writeFileSync(join(packageDir, "runtime", "bin", "bun.exe"), "not really bun\n", "utf8");
+
+      const result = runVerifier(["--package-dir", packageDir]);
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("runtime/bin/bun.exe");
+      expect(result.stderr).toContain("external toolchain");
+    });
+  });
+
+  test("release workflow verifies package payload before npm publish and artifacts before upload", () => {
+    const workflow = readFileSync(join(repoRoot, ".github", "workflows", "release-cli.yml"), "utf8");
+
+    const buildPackageIndex = workflow.indexOf("Build CLI package payload");
+    const verifyPackageIndex = workflow.indexOf(
+      "Verify CLI package payload excludes external toolchains",
+    );
+    const publishIndex = workflow.indexOf("Publish to npm");
+    const checksumIndex = workflow.indexOf("Generate checksums");
+    const verifyReleaseIndex = workflow.indexOf(
+      "Verify GitHub release assets exclude external tool artifacts",
+    );
+    const createReleaseIndex = workflow.indexOf("Create GitHub release (release log)");
+
+    expect(buildPackageIndex).toBeGreaterThanOrEqual(0);
+    expect(verifyPackageIndex).toBeGreaterThan(buildPackageIndex);
+    expect(publishIndex).toBeGreaterThan(verifyPackageIndex);
+    expect(checksumIndex).toBeGreaterThanOrEqual(0);
+    expect(verifyReleaseIndex).toBeGreaterThan(checksumIndex);
+    expect(createReleaseIndex).toBeGreaterThan(verifyReleaseIndex);
+    expect(workflow).toContain("bun run cli:verify-package-payload");
+    expect(workflow).toContain(
+      "bun run scripts/verify-cli-package-payload.ts --skip-package --release-dir dist",
+    );
   });
 });

@@ -6,6 +6,7 @@ import { basename, relative, resolve } from "node:path";
 
 export type PackagePayloadFile = {
   path: string;
+  mode?: number;
   size?: number;
 };
 
@@ -15,6 +16,7 @@ export type PackagePayloadIssue = {
 };
 
 const REQUIRED_CLI_PACKAGE_PATHS = new Set(["bin/pushpals.cjs", "dist/pushpals-cli.js"]);
+const ALLOWED_EXECUTABLE_PACKAGE_PATHS = new Set(["bin/pushpals.cjs"]);
 
 const DISALLOWED_DIRECTORY_SEGMENTS = new Set([
   ".bun",
@@ -53,6 +55,10 @@ function isExternalToolBasename(path: string): boolean {
 
 function isExecutableOrNativeLibrary(path: string): boolean {
   return EXECUTABLE_OR_NATIVE_LIBRARY_PATTERN.test(basename(path));
+}
+
+function hasExecutableMode(file: PackagePayloadFile): boolean {
+  return typeof file.mode === "number" && (file.mode & 0o111) !== 0;
 }
 
 export function findDisallowedCliPackageEntries(
@@ -94,6 +100,14 @@ export function findDisallowedCliPackageEntries(
       issues.push({
         path,
         reason: "package payload includes an executable or native binary artifact",
+      });
+      continue;
+    }
+
+    if (hasExecutableMode(file) && !ALLOWED_EXECUTABLE_PACKAGE_PATHS.has(path)) {
+      issues.push({
+        path,
+        reason: "package payload includes an executable-mode file outside the CLI entrypoint",
       });
     }
   }
