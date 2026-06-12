@@ -1347,6 +1347,90 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Patched immediately after no-edit recovery", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
 
+    def test_run_codex_task_no_edit_watchdog_allows_command_backed_discovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-command-grace-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# command grace repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed command grace repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_no_edit_command_grace.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import json",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "sys.stdin.read()",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "print(json.dumps({'type': 'item.started', 'item': {'id': 'cmd-read-target', 'type': 'command_execution', 'command': 'sed -n 1,120p README.md', 'status': 'in_progress'}}), flush=True)",
+                        "time.sleep(1.4)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'id': 'cmd-read-target', 'type': 'command_execution', 'command': 'sed -n 1,120p README.md', 'status': 'completed', 'exit_code': 0, 'aggregated_output': '# command grace repo'}}), flush=True)",
+                        "time.sleep(1.6)",
+                        "Path('src').mkdir(exist_ok=True)",
+                        "Path('src/command-grace.txt').write_text('patched after command-backed discovery\\n', encoding='utf-8')",
+                        "if last_message_path:",
+                        "    Path(last_message_path).write_text('Patched after command-backed discovery.', encoding='utf-8')",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Patched after command-backed discovery.'}}), flush=True)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-no-edit-command-grace-test-key",
+                "WORKERPALS_OPENAI_CODEX_JSON": "true",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S": "5",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Add one focused contract assertion after inspecting the hinted test.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched after command-backed discovery", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
+
     def test_run_codex_task_recovery_attempt_is_still_guarded_by_no_edit_watchdog(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-fail-") as temp_dir:
             repo = Path(temp_dir) / "repo"

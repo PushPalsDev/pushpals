@@ -116,6 +116,7 @@ _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
 _BACKGROUND_NO_EDIT_WATCHDOG_S = 120
 _NO_EDIT_RECOVERY_WATCHDOG_S = 90
 _DEFAULT_NO_EDIT_RECHECK_S = 120
+_DEFAULT_NO_EDIT_COMMAND_GRACE_S = 240
 _DEFAULT_STARTUP_STALL_WATCHDOG_S = 210
 _RECOVERY_STARTUP_STALL_WATCHDOG_S = 150
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
@@ -757,6 +758,27 @@ def _resolve_no_edit_recheck_seconds(communicate_timeout_s: Optional[int]) -> in
     return max(1, min(_DEFAULT_NO_EDIT_RECHECK_S, upper))
 
 
+def _resolve_no_edit_command_grace_seconds(communicate_timeout_s: Optional[int]) -> Optional[int]:
+    if not communicate_timeout_s:
+        return None
+
+    raw = os.environ.get("WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S", "").strip()
+    if raw:
+        if raw == "0":
+            return None
+        parsed = _to_positive_int(raw)
+        if parsed is None:
+            log.info(
+                "Invalid WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S="
+                f"{raw!r}; using default command-progress grace."
+            )
+        else:
+            return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
+
+    upper = max(1, communicate_timeout_s - 1)
+    return max(1, min(_DEFAULT_NO_EDIT_COMMAND_GRACE_S, upper))
+
+
 def _resolve_startup_stall_watchdog_seconds(
     communicate_timeout_s: Optional[int],
     recovery_attempt: int = 0,
@@ -1339,10 +1361,94 @@ def _empty_codex_trace() -> Dict[str, Any]:
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
+        "active_command_ids": [],
+        "command_event_count": 0,
+        "last_command_activity_at": None,
+        "last_command_summary": "",
     }
 
 
-def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, Any]) -> None:
+def _looks_like_codex_command_item(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    type_text = " ".join(
+        str(value.get(key) or "")
+        for key in ("type", "item_type", "kind", "name", "tool_name")
+    ).lower()
+    if any(marker in type_text for marker in ("command_execution", "exec_command", "shell_command")):
+        return True
+    return any(key in value for key in ("command", "cmd", "exit_code", "aggregated_output"))
+
+
+def _record_codex_command_activity(
+    parsed: Dict[str, Any],
+    event_type: str,
+    trace: Dict[str, Any],
+    now: float,
+) -> None:
+    item = parsed.get("item")
+    command_source: Any = item if _looks_like_codex_command_item(item) else parsed
+    if not _looks_like_codex_command_item(command_source):
+        return
+
+    command_text = ""
+    if isinstance(command_source, dict):
+        for key in ("command", "cmd", "name"):
+            raw = command_source.get(key)
+            if isinstance(raw, str) and raw.strip():
+                command_text = _truncate_inline(raw.strip(), 160)
+                break
+    command_id = ""
+    if isinstance(command_source, dict):
+        command_id = str(
+            command_source.get("id")
+            or command_source.get("call_id")
+            or command_source.get("item_id")
+            or command_text
+            or "command"
+        ).strip()
+    command_id = command_id or "command"
+
+    active = trace.setdefault("active_command_ids", [])
+    if not isinstance(active, list):
+        active = []
+        trace["active_command_ids"] = active
+
+    status_text = ""
+    if isinstance(command_source, dict):
+        status_text = " ".join(
+            str(command_source.get(key) or "")
+            for key in ("status", "state", "outcome")
+        ).lower()
+    event_lower = event_type.lower()
+    completed = (
+        "completed" in event_lower
+        or "failed" in event_lower
+        or "error" in event_lower
+        or any(marker in status_text for marker in ("completed", "failed", "cancelled", "canceled", "exited"))
+    )
+    started = (
+        "started" in event_lower
+        or "updated" in event_lower
+        or any(marker in status_text for marker in ("running", "in_progress", "started"))
+    )
+
+    if completed:
+        trace["active_command_ids"] = [item for item in active if str(item) != command_id]
+    elif started and command_id not in active:
+        active.append(command_id)
+
+    trace["command_event_count"] = to_int(trace.get("command_event_count"), 0) + 1
+    trace["last_command_activity_at"] = float(now)
+    trace["last_command_summary"] = command_text or event_type
+
+
+def _record_live_codex_stdout_line(
+    line: str,
+    use_json: bool,
+    trace: Dict[str, Any],
+    now: Optional[float] = None,
+) -> None:
     stripped = line.strip()
     if not stripped:
         return
@@ -1369,6 +1475,7 @@ def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, A
             return
 
         if isinstance(parsed, dict):
+            observed_at = float(now if now is not None else time.monotonic())
             usage = _extract_usage_counts(parsed)
             if usage is not None:
                 trace["prompt_tokens"] = max(
@@ -1385,6 +1492,7 @@ def _record_live_codex_stdout_line(line: str, use_json: bool, trace: Dict[str, A
                 .strip()
                 or "event"
             )
+            _record_codex_command_activity(parsed, event_type, trace, observed_at)
             event_type_counts[event_type] = to_int(event_type_counts.get(event_type), 0) + 1
             summary = _summarize_json_event(parsed)
             # Reasoning can arrive under generic event types (for example item.updated).
@@ -1449,10 +1557,13 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
     prompt_tokens = to_int(trace.get("prompt_tokens"), 0)
     completion_tokens = to_int(trace.get("completion_tokens"), 0)
     total_tokens = to_int(trace.get("total_tokens"), 0)
+    command_event_count = to_int(trace.get("command_event_count"), 0)
     if reasoning_events > 0:
         log.info(f"[codex] Reasoning-like event(s): {reasoning_events}")
     elif use_json and valid_json > 0:
         log.info("[codex] No reasoning-like events observed in this run.")
+    if command_event_count > 0:
+        log.info(f"[codex] Command execution event(s): {command_event_count}")
     if total_tokens > 0:
         log.info(
             f"[codex] Usage observed: prompt={prompt_tokens} completion={completion_tokens} total={total_tokens}"
@@ -1473,6 +1584,7 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
+        "command_event_count": command_event_count,
     }
 
 
@@ -2299,8 +2411,14 @@ def _run_codex_task(
                         if not line:
                             continue
                         with trace_lock:
-                            last_activity_at["ts"] = time.monotonic()
-                            _record_live_codex_stdout_line(line, use_json, stdout_trace_state)
+                            observed_at = time.monotonic()
+                            last_activity_at["ts"] = observed_at
+                            _record_live_codex_stdout_line(
+                                line,
+                                use_json,
+                                stdout_trace_state,
+                                observed_at,
+                            )
                 except Exception:
                     pass
                 finally:
@@ -2377,6 +2495,7 @@ def _run_codex_task(
                 else None
             )
             no_edit_recheck_s = _resolve_no_edit_recheck_seconds(communicate_timeout_s)
+            no_edit_command_grace_s = _resolve_no_edit_command_grace_seconds(communicate_timeout_s)
             startup_stall_watchdog_s = _resolve_startup_stall_watchdog_seconds(
                 communicate_timeout_s,
                 recovery_attempt=startup_stall_recovery_attempt,
@@ -2398,6 +2517,11 @@ def _run_codex_task(
             no_edit_deadline = (
                 started_at + float(no_edit_watchdog_s)
                 if no_edit_watchdog_s is not None
+                else None
+            )
+            no_edit_command_grace_cap_deadline = (
+                started_at + float(no_edit_watchdog_s + no_edit_command_grace_s)
+                if no_edit_watchdog_s is not None and no_edit_command_grace_s is not None
                 else None
             )
             rollout_deadline = (
@@ -2457,6 +2581,49 @@ def _run_codex_task(
                                 "before startup-stall recovery."
                             )
                             continue
+                        command_event_count = to_int(live_trace.get("command_event_count"), 0)
+                        active_commands_raw = live_trace.get("active_command_ids")
+                        active_command_count = (
+                            len(active_commands_raw)
+                            if isinstance(active_commands_raw, list)
+                            else 0
+                        )
+                        last_command_activity_at = 0.0
+                        try:
+                            last_command_activity_at = float(
+                                live_trace.get("last_command_activity_at") or 0.0
+                            )
+                        except Exception:
+                            last_command_activity_at = 0.0
+                        if command_event_count > 0 and no_edit_command_grace_s is not None:
+                            command_grace_deadline = 0.0
+                            if active_command_count > 0:
+                                # Do not kill while Codex is actively running a tool command; poll
+                                # again soon, but keep the total grace bounded by the hard cap below.
+                                command_grace_deadline = now + min(60.0, float(no_edit_command_grace_s))
+                            elif last_command_activity_at > 0:
+                                command_grace_deadline = last_command_activity_at + float(
+                                    no_edit_command_grace_s
+                                )
+                            if no_edit_command_grace_cap_deadline is not None:
+                                command_grace_deadline = min(
+                                    command_grace_deadline,
+                                    no_edit_command_grace_cap_deadline,
+                                )
+                            if command_grace_deadline > now:
+                                no_edit_deadline = command_grace_deadline
+                                remaining_s = int(max(1.0, command_grace_deadline - now))
+                                command_detail = (
+                                    f"{active_command_count} active command(s)"
+                                    if active_command_count > 0
+                                    else "recent command completion"
+                                )
+                                log.info(
+                                    "No-edit watchdog observed Codex tool progress "
+                                    f"({command_detail}); allowing {remaining_s}s for a "
+                                    "publishable patch before recovery."
+                                )
+                                continue
                         no_edit_artifact_only_paths = _describe_non_publishable_paths(
                             changed_paths,
                             baseline_snapshot,
