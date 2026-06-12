@@ -1918,8 +1918,6 @@ export class DockerExecutor {
 
   private matchesRetryablePattern(text: string): boolean {
     const transientPatterns: RegExp[] = [
-      /\bstalled before first response\b/i,
-      /\bstartup stall\b/i,
       /warm .*runtime/i,
       /failed to start warm container/i,
       /docker execution error/i,

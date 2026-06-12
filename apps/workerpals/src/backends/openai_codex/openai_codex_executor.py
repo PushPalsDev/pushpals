@@ -116,6 +116,8 @@ _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
 _BACKGROUND_NO_EDIT_WATCHDOG_S = 120
 _NO_EDIT_RECOVERY_WATCHDOG_S = 90
 _DEFAULT_NO_EDIT_RECHECK_S = 120
+_DEFAULT_STARTUP_STALL_WATCHDOG_S = 210
+_RECOVERY_STARTUP_STALL_WATCHDOG_S = 150
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
 _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
@@ -753,6 +755,44 @@ def _resolve_no_edit_recheck_seconds(communicate_timeout_s: Optional[int]) -> in
             return max(1, min(parsed, upper))
     upper = max(1, (communicate_timeout_s or _DEFAULT_NO_EDIT_RECHECK_S + 1) - 1)
     return max(1, min(_DEFAULT_NO_EDIT_RECHECK_S, upper))
+
+
+def _resolve_startup_stall_watchdog_seconds(
+    communicate_timeout_s: Optional[int],
+    recovery_attempt: int = 0,
+) -> Optional[int]:
+    if not communicate_timeout_s:
+        return None
+
+    raw = os.environ.get("WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S", "").strip()
+    if raw:
+        if raw == "0":
+            return None
+        parsed = _to_positive_int(raw)
+        if parsed is None:
+            log.info(
+                "Invalid WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S="
+                f"{raw!r}; using default startup-stall watchdog."
+            )
+        else:
+            return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
+
+    default_s = (
+        _RECOVERY_STARTUP_STALL_WATCHDOG_S
+        if recovery_attempt > 0
+        else _DEFAULT_STARTUP_STALL_WATCHDOG_S
+    )
+    floor_s = 60
+    return max(floor_s, min(default_s, max(floor_s, communicate_timeout_s - 1)))
+
+
+def _startup_stall_recovery_model(current_model: str) -> str:
+    normalized = str(current_model or "").strip()
+    if not normalized:
+        return LEGACY_CODEX_MODEL_FALLBACK
+    if normalized.lower() == LEGACY_CODEX_MODEL_FALLBACK.lower():
+        return normalized
+    return LEGACY_CODEX_MODEL_FALLBACK
 
 
 def _looks_like_web_review_prompt(prompt: str) -> bool:
@@ -2337,6 +2377,15 @@ def _run_codex_task(
                 else None
             )
             no_edit_recheck_s = _resolve_no_edit_recheck_seconds(communicate_timeout_s)
+            startup_stall_watchdog_s = _resolve_startup_stall_watchdog_seconds(
+                communicate_timeout_s,
+                recovery_attempt=startup_stall_recovery_attempt,
+            )
+            startup_stall_deadline = (
+                started_at + float(startup_stall_watchdog_s)
+                if startup_stall_watchdog_s is not None
+                else None
+            )
             rollout_watchdog_s = (
                 _resolve_rollout_watchdog_seconds(
                     prompt,
@@ -2364,9 +2413,50 @@ def _run_codex_task(
                     _terminate_active_child()
                     break
 
+                if startup_stall_deadline is not None and now >= startup_stall_deadline:
+                    with trace_lock:
+                        live_trace = dict(stdout_trace_state)
+                        summaries = stdout_trace_state.get("summaries")
+                        if isinstance(summaries, list):
+                            live_trace["summaries"] = list(summaries)
+                    if _codex_trace_is_startup_stall(live_trace):
+                        changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+                        if not effective_paths:
+                            no_edit_artifact_only_paths = _describe_non_publishable_paths(
+                                changed_paths,
+                                baseline_snapshot,
+                            )
+                            no_edit_watchdog_fired = True
+                            elapsed_s = int(max(0.0, now - started_at))
+                            log.info(
+                                f"Startup-stall watchdog fired after {elapsed_s}s with no assistant/tool progress."
+                            )
+                            _terminate_active_child()
+                            break
+                    startup_stall_deadline = None
+
                 if no_edit_deadline is not None and now >= no_edit_deadline:
                     changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
                     if not effective_paths:
+                        with trace_lock:
+                            live_trace = dict(stdout_trace_state)
+                            summaries = stdout_trace_state.get("summaries")
+                            if isinstance(summaries, list):
+                                live_trace["summaries"] = list(summaries)
+                        startup_only = _codex_trace_is_startup_stall(live_trace)
+                        if (
+                            startup_only
+                            and startup_stall_deadline is not None
+                            and now < startup_stall_deadline
+                        ):
+                            no_edit_deadline = startup_stall_deadline
+                            remaining_s = int(max(1.0, startup_stall_deadline - now))
+                            log.info(
+                                "No-edit watchdog observed only Codex startup events; "
+                                f"allowing {remaining_s}s for first assistant/tool progress "
+                                "before startup-stall recovery."
+                            )
+                            continue
                         no_edit_artifact_only_paths = _describe_non_publishable_paths(
                             changed_paths,
                             baseline_snapshot,
@@ -2377,9 +2467,15 @@ def _run_codex_task(
                             if no_edit_artifact_only_paths
                             else ""
                         )
-                        log.info(
-                            f"No-edit watchdog fired after {int(no_edit_watchdog_s or 0)}s with no publishable file changes.{artifact_detail} Retrying with patch-first guidance."
-                        )
+                        if startup_only:
+                            elapsed_s = int(max(0.0, now - started_at))
+                            log.info(
+                                f"Startup-stall watchdog fired after {elapsed_s}s with no assistant/tool progress."
+                            )
+                        else:
+                            log.info(
+                                f"No-edit watchdog fired after {int(no_edit_watchdog_s or 0)}s with no publishable file changes.{artifact_detail} Retrying with patch-first guidance."
+                            )
                         _terminate_active_child()
                         break
                     no_edit_deadline = now + float(no_edit_recheck_s)
@@ -2550,9 +2646,15 @@ def _run_codex_task(
                     *supplemental_guidance,
                     _build_startup_stall_recovery_guidance(trace_excerpt),
                 ]
+                recovery_model = _startup_stall_recovery_model(model)
+                recovery_detail = (
+                    f" using fallback model {recovery_model!r}"
+                    if recovery_model and recovery_model != model
+                    else ""
+                )
                 log.warning(
                     "Codex emitted only startup events before the no-edit watchdog; "
-                    "restarting Codex once before classifying the job terminally."
+                    f"restarting Codex once{recovery_detail} before classifying the job terminally."
                 )
                 retry_result = _run_codex_task(
                     repo,
@@ -2563,7 +2665,7 @@ def _run_codex_task(
                     startup_stall_recovery_attempt=startup_stall_recovery_attempt + 1,
                     no_edit_recovery_attempt=no_edit_recovery_attempt,
                     rollout_recovery_attempt=rollout_recovery_attempt,
-                    model_override=model_override,
+                    model_override=recovery_model or model_override,
                     baseline_changes=baseline_snapshot,
                 )
                 retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))

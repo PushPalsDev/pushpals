@@ -49,6 +49,7 @@ from openai_codex_executor import (
     _resolve_codex_command_prefix,
     _resolve_no_edit_watchdog_seconds,
     _resolve_rollout_watchdog_seconds,
+    _resolve_startup_stall_watchdog_seconds,
     _unwrap_shell_wrapper_command,
     _usage_from_trace_or_estimate,
 )
@@ -1091,13 +1092,16 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "",
                         "argv = sys.argv[1:]",
                         "last_message_path = None",
+                        "model = ''",
                         "for index, arg in enumerate(argv):",
                         "    if arg == '--output-last-message' and index + 1 < len(argv):",
                         "        last_message_path = argv[index + 1]",
+                        "    if arg == '-m' and index + 1 < len(argv):",
+                        "        model = argv[index + 1]",
                         "        break",
                         "",
                         "prompt = sys.stdin.read()",
-                        "if 'Codex startup-stall recovery' in prompt:",
+                        "if 'Codex startup-stall recovery' in prompt and model == 'gpt-5.4':",
                         "    Path('src').mkdir(exist_ok=True)",
                         "    Path('src/startup-stall-recovered.txt').write_text('patched after restart\\n', encoding='utf-8')",
                         "    if last_message_path:",
@@ -1119,7 +1123,8 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "OPENAI_API_KEY": "pushpals-startup-stall-test-key",
                 "WORKERPALS_OPENAI_CODEX_JSON": "true",
                 "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
-                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "0",
+                "WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S": "1",
                 "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
             }
             with mock.patch.dict(os.environ, env_overrides, clear=False):
@@ -1189,6 +1194,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "WORKERPALS_OPENAI_CODEX_JSON": "true",
                 "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
                 "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S": "1",
                 "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
             }
             with mock.patch.dict(os.environ, env_overrides, clear=False):
@@ -1586,6 +1592,31 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             watchdog_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
 
         self.assertEqual(watchdog_s, 180)
+
+    def test_startup_stall_watchdog_allows_slower_first_response_than_no_edit_watchdog(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S": ""},
+            clear=False,
+        ):
+            watchdog_s = _resolve_startup_stall_watchdog_seconds(1200)
+            recovery_watchdog_s = _resolve_startup_stall_watchdog_seconds(
+                1200,
+                recovery_attempt=1,
+            )
+
+        self.assertEqual(watchdog_s, 210)
+        self.assertEqual(recovery_watchdog_s, 150)
+
+    def test_explicit_startup_stall_watchdog_override_is_bounded(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S": "500"},
+            clear=False,
+        ):
+            watchdog_s = _resolve_startup_stall_watchdog_seconds(120)
+
+        self.assertEqual(watchdog_s, 119)
 
     def test_narrow_contract_regression_with_required_e2e_uses_fast_no_edit_watchdog(self) -> None:
         prompt = (

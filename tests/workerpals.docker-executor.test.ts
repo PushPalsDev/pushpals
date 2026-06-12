@@ -127,7 +127,7 @@ describe("workerpals docker executor internals", () => {
     ).toBe(true);
   });
 
-  test("retry matching treats Codex startup stalls as transient infrastructure failures", () => {
+  test("retry matching leaves classified Codex startup stalls to the Codex wrapper", () => {
     const executor = createExecutor() as unknown as {
       matchesRetryablePattern: (text: string) => boolean;
     };
@@ -136,8 +136,9 @@ describe("workerpals docker executor internals", () => {
       executor.matchesRetryablePattern(
         "openai_codex stalled before first response\nCodex event trace:\n- thread.started\n- turn.started",
       ),
-    ).toBe(true);
-    expect(executor.matchesRetryablePattern("startup stall after Codex restart")).toBe(true);
+    ).toBe(false);
+    expect(executor.matchesRetryablePattern("startup stall after Codex restart")).toBe(false);
+    expect(executor.matchesRetryablePattern("warm runtime startup timed out")).toBe(true);
   });
 
   test("retry exhaustion preserves longer executor-provided cooldowns", () => {
