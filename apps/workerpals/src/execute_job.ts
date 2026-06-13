@@ -335,6 +335,22 @@ export function shouldSkipCriticForDeterministicValidationRevision(opts: {
   return opts.validationRuns.some(isDeterministicFastValidationFailure);
 }
 
+export function shouldSkipCriticToPreserveRevisionBudget(opts: {
+  deterministicRequiresRevision: boolean;
+  remainingBudgetMs: number;
+  minimumRevisionBudgetMs: number;
+  criticTimeoutMs: number;
+  criticTimeoutBehavior: "skip" | "retry_once" | "block" | string;
+}): boolean {
+  if (!opts.deterministicRequiresRevision) return false;
+  const remainingBudgetMs = Math.max(0, Math.floor(opts.remainingBudgetMs));
+  const minimumRevisionBudgetMs = Math.max(0, Math.floor(opts.minimumRevisionBudgetMs));
+  const criticTimeoutMs = Math.max(0, Math.floor(opts.criticTimeoutMs));
+  const criticAttempts = opts.criticTimeoutBehavior === "retry_once" ? 2 : 1;
+  const criticWorstCaseMs = criticTimeoutMs * criticAttempts;
+  return remainingBudgetMs < minimumRevisionBudgetMs + criticWorstCaseMs;
+}
+
 export function workerAttemptRolloutScore(params: {
   executorElapsedMs: number;
   qualityElapsedMs: number;
@@ -7975,11 +7991,23 @@ export async function executeJob(
         validationOutsideTaskScope,
         validationRuns: quality.validationRuns,
       });
+    const preCriticRevisionBudget = qualityRevisionBudgetDecision({
+      jobElapsedMs: Date.now() - jobStartedAt,
+      executionBudgetMs,
+    });
+    const skipCriticForRevisionBudget = shouldSkipCriticToPreserveRevisionBudget({
+      deterministicRequiresRevision: preCriticDeterministicRequiresRevision,
+      remainingBudgetMs: preCriticRevisionBudget.remainingBudgetMs,
+      minimumRevisionBudgetMs: preCriticRevisionBudget.minimumRevisionBudgetMs,
+      criticTimeoutMs: resolveQualityCriticTimeoutMs(runtimeConfig),
+      criticTimeoutBehavior: resolveQualityCriticTimeoutBehavior(runtimeConfig),
+    });
     const critic =
       quality.skipped ||
       !qualityGatePolicy.criticGateEnabled ||
       skipCriticAfterExecutorTimeout ||
-      skipCriticForDeterministicValidationRevision
+      skipCriticForDeterministicValidationRevision ||
+      skipCriticForRevisionBudget
         ? null
         : executor === "openai_codex"
           ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog)
@@ -8019,6 +8047,11 @@ export async function executeJob(
       onLog?.(
         "stdout",
         "[CriticGate] Skipping critic because deterministic fast validation already requires a quality revision.",
+      );
+    } else if (skipCriticForRevisionBudget) {
+      onLog?.(
+        "stdout",
+        `[CriticGate] Skipping critic because deterministic quality already requires revision and remaining budget (${preCriticRevisionBudget.remainingBudgetMs}ms) must be reserved for the next worker turn.`,
       );
     }
     const rolloutScore = workerAttemptRolloutScore({

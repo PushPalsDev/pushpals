@@ -19,6 +19,7 @@ import {
   recordValidationRemedyMemory,
   shouldSkipCriticAfterExecutorTimeout,
   shouldSkipCriticForDeterministicValidationRevision,
+  shouldSkipCriticToPreserveRevisionBudget,
   shouldRetryCriticTimeoutWithCompact,
   shouldReviseRequiredValidationBlocker,
   shouldRetryBrowserValidationRunOnce,
@@ -179,6 +180,38 @@ describe("workerpals quality gate critic issue formatting", () => {
             elapsedMs: 37_046,
           },
         ],
+      }),
+    ).toBe(false);
+  });
+
+  test("skips critic when deterministic revision needs the remaining budget", () => {
+    expect(
+      shouldSkipCriticToPreserveRevisionBudget({
+        deterministicRequiresRevision: true,
+        remainingBudgetMs: 500_000,
+        minimumRevisionBudgetMs: 420_000,
+        criticTimeoutMs: 90_000,
+        criticTimeoutBehavior: "retry_once",
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldSkipCriticToPreserveRevisionBudget({
+        deterministicRequiresRevision: true,
+        remainingBudgetMs: 700_000,
+        minimumRevisionBudgetMs: 420_000,
+        criticTimeoutMs: 90_000,
+        criticTimeoutBehavior: "retry_once",
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSkipCriticToPreserveRevisionBudget({
+        deterministicRequiresRevision: false,
+        remainingBudgetMs: 100_000,
+        minimumRevisionBudgetMs: 420_000,
+        criticTimeoutMs: 90_000,
+        criticTimeoutBehavior: "retry_once",
       }),
     ).toBe(false);
   });

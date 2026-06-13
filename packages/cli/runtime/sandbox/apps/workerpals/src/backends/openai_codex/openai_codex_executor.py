@@ -2519,16 +2519,14 @@ def _run_codex_task(
                 if no_edit_watchdog_s is not None
                 else None
             )
-            no_edit_command_grace_cap_deadline = (
-                started_at + float(no_edit_watchdog_s + no_edit_command_grace_s)
-                if no_edit_watchdog_s is not None and no_edit_command_grace_s is not None
-                else None
-            )
             rollout_deadline = (
                 started_at + float(rollout_watchdog_s)
                 if rollout_watchdog_s is not None
                 else None
             )
+            publishable_progress_seen_at: Optional[float] = None
+            publishable_progress_finalized = False
+            publishable_progress_paths: List[str] = []
 
             while proc.poll() is None:
                 now = time.monotonic()
@@ -2605,11 +2603,6 @@ def _run_codex_task(
                                 command_grace_deadline = last_command_activity_at + float(
                                     no_edit_command_grace_s
                                 )
-                            if no_edit_command_grace_cap_deadline is not None:
-                                command_grace_deadline = min(
-                                    command_grace_deadline,
-                                    no_edit_command_grace_cap_deadline,
-                                )
                             if command_grace_deadline > now:
                                 no_edit_deadline = command_grace_deadline
                                 remaining_s = int(max(1.0, command_grace_deadline - now))
@@ -2645,6 +2638,22 @@ def _run_codex_task(
                             )
                         _terminate_active_child()
                         break
+                    if publishable_progress_seen_at is None:
+                        publishable_progress_seen_at = now
+                        publishable_progress_paths = list(effective_paths)
+                    elif _has_credible_shell_wrapper_progress(effective_paths):
+                        publishable_progress_paths = list(effective_paths)
+                        publishable_age_s = now - publishable_progress_seen_at
+                        if publishable_age_s >= float(no_edit_recheck_s):
+                            publishable_progress_finalized = True
+                            log.info(
+                                "No-edit watchdog observed durable publishable file changes "
+                                f"({_describe_publishable_paths(effective_paths)}) for "
+                                f"{int(publishable_age_s)}s; stopping Codex early so "
+                                "QualityGate/ValidationGate can use the remaining budget."
+                            )
+                            _terminate_active_child()
+                            break
                     no_edit_deadline = now + float(no_edit_recheck_s)
                     log.info(
                         "No-edit watchdog observed publishable-looking file changes "
@@ -2804,6 +2813,35 @@ def _run_codex_task(
                 "exitCode": 124,
                 "usage": usage,
                 "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
+            }
+
+        if publishable_progress_finalized:
+            changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            effective_paths = effective_paths or publishable_progress_paths
+            last_message = _read_text_if_exists(last_message_path)
+            log_git_status(repo, log)
+            prefix = (
+                "Codex produced durable publishable file changes. PushPals stopped the "
+                "Codex child early to preserve validation and revision budget; the normal "
+                "QualityGate/ValidationGate will catch any incomplete edit."
+            )
+            return {
+                "ok": True,
+                "summary": (
+                    "openai_codex stopped after durable publishable progress "
+                    f"({len(effective_paths)} file(s))"
+                ),
+                "stdout": _truncate(
+                    _build_success_stdout(
+                        effective_paths=effective_paths,
+                        last_message=last_message,
+                        trace_excerpt=trace_excerpt,
+                        prefix=prefix,
+                    )
+                ),
+                "stderr": _truncate(stderr),
+                "exitCode": 0,
+                "usage": usage,
             }
 
         if no_edit_watchdog_fired:
