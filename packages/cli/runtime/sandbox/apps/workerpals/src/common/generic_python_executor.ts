@@ -34,9 +34,9 @@ interface GenericPythonExecutorConfig {
 }
 
 const BACKEND_TIMEOUT_RESULT_GRACE_MS = 30_000;
-const OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS = 180_000;
-const OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS = 600_000;
-const OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS = 600_000;
+const OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS = 240_000;
+const OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS = 720_000;
+const OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS = 540_000;
 
 function estimateTokensFromText(text: string): number {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
@@ -161,7 +161,7 @@ export function resolveOpenAICodexValidationReserveMs(
       budgetMs,
       Math.max(
         OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS,
-        Math.min(OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS, budgetMs * 0.35),
+        Math.min(OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS, budgetMs * 0.5),
       ),
     ),
   );

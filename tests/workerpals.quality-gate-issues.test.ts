@@ -51,7 +51,7 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toEqual({
       shouldStart: true,
       remainingBudgetMs: 600_000,
-      minimumRevisionBudgetMs: 420_000,
+      minimumRevisionBudgetMs: 300_000,
     });
 
     expect(
@@ -62,7 +62,7 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toEqual({
       shouldStart: false,
       remainingBudgetMs: 200_000,
-      minimumRevisionBudgetMs: 420_000,
+      minimumRevisionBudgetMs: 300_000,
     });
   });
 
@@ -188,8 +188,8 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(
       shouldSkipCriticToPreserveRevisionBudget({
         deterministicRequiresRevision: true,
-        remainingBudgetMs: 500_000,
-        minimumRevisionBudgetMs: 420_000,
+        remainingBudgetMs: 400_000,
+        minimumRevisionBudgetMs: 300_000,
         criticTimeoutMs: 90_000,
         criticTimeoutBehavior: "retry_once",
       }),
@@ -198,8 +198,18 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(
       shouldSkipCriticToPreserveRevisionBudget({
         deterministicRequiresRevision: true,
+        remainingBudgetMs: 500_000,
+        minimumRevisionBudgetMs: 300_000,
+        criticTimeoutMs: 90_000,
+        criticTimeoutBehavior: "retry_once",
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSkipCriticToPreserveRevisionBudget({
+        deterministicRequiresRevision: true,
         remainingBudgetMs: 700_000,
-        minimumRevisionBudgetMs: 420_000,
+        minimumRevisionBudgetMs: 300_000,
         criticTimeoutMs: 90_000,
         criticTimeoutBehavior: "retry_once",
       }),
@@ -209,7 +219,7 @@ describe("workerpals quality gate critic issue formatting", () => {
       shouldSkipCriticToPreserveRevisionBudget({
         deterministicRequiresRevision: false,
         remainingBudgetMs: 100_000,
-        minimumRevisionBudgetMs: 420_000,
+        minimumRevisionBudgetMs: 300_000,
         criticTimeoutMs: 90_000,
         criticTimeoutBehavior: "retry_once",
       }),

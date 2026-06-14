@@ -4,6 +4,7 @@ import re
 import json
 import subprocess
 import sys
+import time
 import unittest
 import tempfile
 from unittest import mock
@@ -47,6 +48,9 @@ from openai_codex_executor import (
     _repo_root_for_prompt_loading,
     _restore_repo_local_codex_files,
     _resolve_codex_command_prefix,
+    _resolve_no_edit_command_grace_seconds,
+    _resolve_no_edit_command_progress_cap_seconds,
+    _resolve_no_edit_recheck_seconds,
     _resolve_no_edit_watchdog_seconds,
     _resolve_rollout_watchdog_seconds,
     _resolve_startup_stall_watchdog_seconds,
@@ -1519,6 +1523,96 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Patched after later command progress", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
 
+    def test_run_codex_task_command_progress_cap_forces_patch_first_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-command-progress-cap-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# command progress cap repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed command progress cap repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_command_progress_cap.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import json",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'No-edit watchdog recovery' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/capped-command-recovery.txt').write_text('patched after capped command progress\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched after capped command progress.', encoding='utf-8')",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Patched after capped command progress.'}}), flush=True)",
+                        "    raise SystemExit(0)",
+                        "",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "for index in range(8):",
+                        "    command_id = f'cmd-{index}'",
+                        "    print(json.dumps({'type': 'item.started', 'item': {'id': command_id, 'type': 'command_execution', 'command': 'cat README.md', 'status': 'in_progress'}}), flush=True)",
+                        "    time.sleep(0.2)",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'id': command_id, 'type': 'command_execution', 'command': 'cat README.md', 'status': 'completed', 'exit_code': 0}}), flush=True)",
+                        "    time.sleep(0.8)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-command-progress-cap-test-key",
+                "WORKERPALS_OPENAI_CODEX_JSON": "true",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "12",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S": "3",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_PROGRESS_CAP_S": "3",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Add one focused patch after bounded command-backed discovery.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched after capped command progress", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
+
     def test_run_codex_task_finalizes_after_durable_publishable_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-durable-progress-") as temp_dir:
             repo = Path(temp_dir) / "repo"
@@ -1962,10 +2056,100 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(watchdog_s, 300)
 
+    def test_no_edit_recovery_attempt_uses_short_durable_recheck_and_command_cap(self) -> None:
+        env = {
+            "WORKERPALS_OPENAI_CODEX_NO_EDIT_RECHECK_S": "",
+            "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S": "",
+            "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_PROGRESS_CAP_S": "",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            first_recheck_s = _resolve_no_edit_recheck_seconds(750)
+            recovery_recheck_s = _resolve_no_edit_recheck_seconds(750, recovery_attempt=1)
+            command_grace_s = _resolve_no_edit_command_grace_seconds(750)
+            first_command_cap_s = _resolve_no_edit_command_progress_cap_seconds(
+                750,
+                command_grace_s,
+            )
+            recovery_command_cap_s = _resolve_no_edit_command_progress_cap_seconds(
+                750,
+                command_grace_s,
+                recovery_attempt=1,
+            )
+
+        self.assertEqual(first_recheck_s, 120)
+        self.assertEqual(recovery_recheck_s, 30)
+        self.assertEqual(first_command_cap_s, 360)
+        self.assertEqual(recovery_command_cap_s, 120)
+
+    def test_codex_recovery_attempt_refuses_exhausted_shared_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-exhausted-recovery-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# exhausted recovery repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed exhausted recovery repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_should_not_run.py"
+            stub_path.write_text(
+                "raise SystemExit('fake codex should not run when recovery budget is exhausted')\n",
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-exhausted-recovery-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "750",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Apply patch-first recovery.",
+                    [],
+                    no_edit_recovery_attempt=1,
+                    execution_deadline_monotonic=time.monotonic() - 1.0,
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertIn("recovery budget exhausted", str(result.get("summary") or ""))
+        self.assertIn("Stopping before a low-odds retry", str(result.get("stderr") or ""))
+
     def test_review_fix_contract_level_tests_use_fast_no_edit_watchdog(self) -> None:
         prompt = (
             "Restore exact score assertions for contract-level tests where score is part "
             "of the public output. Keep this as a test-only patch in app/__tests__."
+        )
+        with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
+            watchdog_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+
+        self.assertEqual(watchdog_s, 180)
+
+    def test_rejected_pr_review_fix_prompt_uses_compact_no_edit_watchdog(self) -> None:
+        prompt = (
+            "Rejected PR revision brief: Previous ReviewAgent score: 7.6 / 10. "
+            "Address reviewer must-fix items in the cleanup harness with focused coverage."
         )
         with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
             watchdog_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
@@ -2112,7 +2296,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Patched after rollout coach guidance", str(result.get("stdout") or ""))
         self.assertIn("scripts/", str(result.get("stdout") or ""))
 
-    def test_run_codex_task_rollout_coach_fails_fast_on_broad_small_task_changes(self) -> None:
+    def test_run_codex_task_rollout_coach_resets_broad_small_task_changes_before_retry(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-noisy-") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
@@ -2149,7 +2333,22 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "import sys",
                         "import time",
                         "",
-                        "sys.stdin.read()",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'Rollout coach recovery' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/narrow-rollout-recovery.txt').write_text('narrow recovery patch\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched narrowly after broad rollout reset.', encoding='utf-8')",
+                        "    print('item.completed | Patched narrowly after broad rollout reset.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
                         "for index in range(5):",
                         "    root = Path(f'area{index}')",
                         "    root.mkdir(exist_ok=True)",
@@ -2165,6 +2364,78 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
                 "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
                 "OPENAI_API_KEY": "pushpals-rollout-noisy-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "700",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "10",
+                "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Make a small low-risk repo-native patch.",
+                    [],
+                )
+            area0_exists_after_retry = (repo / "area0").exists()
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched narrowly after broad rollout reset", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
+        self.assertFalse(area0_exists_after_retry)
+
+    def test_run_codex_task_rollout_coach_fails_after_repeated_broad_small_task_changes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-repeat-noisy-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# repeated rollout noisy repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed repeated rollout noisy repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_rollout_repeat_noisy.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "sys.stdin.read()",
+                        "for index in range(5):",
+                        "    root = Path(f'area{index}')",
+                        "    root.mkdir(exist_ok=True)",
+                        "    (root / 'changed.txt').write_text('broad rollout change\\n', encoding='utf-8')",
+                        "print('item.completed | Repeated broad edits for a small task.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-rollout-repeat-noisy-test-key",
                 "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "700",
                 "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "10",
                 "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "1",

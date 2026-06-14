@@ -3860,6 +3860,42 @@ function sanitizeForGitRef(value: string): string {
   return text || "default";
 }
 
+export function isSafeGitBranchName(value: string): boolean {
+  const text = String(value ?? "").trim();
+  if (!text || text.length > 200) return false;
+  if (text.startsWith("-") || text.startsWith("/") || text.endsWith("/")) return false;
+  if (text.endsWith(".") || text.endsWith(".lock")) return false;
+  if (text.includes("..") || text.includes("//") || text.includes("@{")) return false;
+  return !/[\\\s~^:?*\[\]\x00-\x1F\x7F]/.test(text);
+}
+
+export function normalizeConfiguredGitBranchName(
+  value: string,
+  fallback: string,
+  label = "branch",
+): string {
+  const candidate = String(value ?? "").trim();
+  if (isSafeGitBranchName(candidate)) return candidate;
+  const safeFallback = isSafeGitBranchName(fallback) ? fallback : "main";
+  console.warn(
+    `[RemoteBuddyAutonomousEngine] Ignoring unsafe ${label} ref ${JSON.stringify(
+      candidate,
+    )}; using ${safeFallback}.`,
+  );
+  return safeFallback;
+}
+
+function normalizeConfiguredGitRemoteName(value: string, fallback = "origin"): string {
+  const candidate = String(value ?? "").trim();
+  if (/^[A-Za-z0-9._-]+$/.test(candidate) && !candidate.startsWith("-")) return candidate;
+  console.warn(
+    `[RemoteBuddyAutonomousEngine] Ignoring unsafe git remote ${JSON.stringify(
+      candidate,
+    )}; using ${fallback}.`,
+  );
+  return fallback;
+}
+
 async function repoPreflight(repo: string): Promise<{
   isWorktreeDirty: boolean;
   isMergeInProgress: boolean;
@@ -3921,11 +3957,20 @@ export class RemoteBuddyAutonomousEngine {
     const safeSession = sanitizeForGitRef(this.sessionId).slice(0, 40);
     this.autonomyRepo = resolve(this.repoRoot, ".worktrees", `remotebuddy-autonomy-${safeSession}`);
     this.autonomyBranch = `_remotebuddy/autonomy-${safeSession}`;
-    this.gitRemote = String(opts.config.sourceControlManager.remote || "origin").trim() || "origin";
-    this.integrationBranch =
-      String(opts.config.sourceControlManager.mainBranch || "main_agents").trim() || "main_agents";
-    this.baseBranch =
-      String(opts.config.sourceControlManager.baseBranch || "main").trim() || "main";
+    this.gitRemote = normalizeConfiguredGitRemoteName(
+      String(opts.config.sourceControlManager.remote || "origin"),
+      "origin",
+    );
+    this.integrationBranch = normalizeConfiguredGitBranchName(
+      String(opts.config.sourceControlManager.mainBranch || "main_agents"),
+      "main_agents",
+      "integration branch",
+    );
+    this.baseBranch = normalizeConfiguredGitBranchName(
+      String(opts.config.sourceControlManager.baseBranch || "main"),
+      "main",
+      "base branch",
+    );
     this.llm = opts.llm;
     this.comm = opts.comm;
     this.llmCfg = opts.config.remotebuddy.llm;

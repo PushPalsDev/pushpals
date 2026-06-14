@@ -116,7 +116,10 @@ _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
 _BACKGROUND_NO_EDIT_WATCHDOG_S = 120
 _NO_EDIT_RECOVERY_WATCHDOG_S = 90
 _DEFAULT_NO_EDIT_RECHECK_S = 120
+_NO_EDIT_RECOVERY_RECHECK_S = 30
 _DEFAULT_NO_EDIT_COMMAND_GRACE_S = 240
+_DEFAULT_NO_EDIT_COMMAND_PROGRESS_CAP_S = 360
+_NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S = 120
 _DEFAULT_STARTUP_STALL_WATCHDOG_S = 210
 _RECOVERY_STARTUP_STALL_WATCHDOG_S = 150
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
@@ -124,6 +127,7 @@ _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
 _BACKGROUND_ROLLOUT_WATCHDOG_S = 90
+_MIN_CODEX_RECOVERY_ATTEMPT_S = 120
 _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS = 10 * 60 * 1000
 _CODEX_STARTUP_ONLY_EVENT_TYPES = {"thread.started", "turn.started"}
 
@@ -609,11 +613,19 @@ def _looks_like_small_task_prompt(prompt: str) -> bool:
         "contract-level tests",
         "contract around",
         "contract coverage",
+        "focused contract coverage",
         "ranking contract",
         "regression coverage",
+        "focused coverage",
         "focused regression",
         "focused scenario",
         "targeted test",
+        "small deterministic",
+        "review-fix",
+        "review fix",
+        "rejected pr",
+        "must-fix",
+        "cleanup harness",
         "one-file",
         "one file",
         "single-file",
@@ -648,13 +660,16 @@ def _looks_like_narrow_test_task_prompt(prompt: str) -> bool:
         "contract-level tests",
         "contract around",
         "contract coverage",
+        "focused contract coverage",
         "ranking contract",
         "regression coverage",
+        "focused coverage",
         "focused regression",
         "test-only",
         "test only",
         "targeted test",
         "focused scenario",
+        "cleanup harness",
     )
     if not any(marker in text for marker in narrow_markers):
         return False
@@ -666,6 +681,13 @@ def _looks_like_narrow_test_task_prompt(prompt: str) -> bool:
         "broad refactor",
     )
     return not any(marker in text for marker in broad_markers)
+
+
+def _minimum_recovery_attempt_seconds(requested_timeout_s: Optional[int]) -> int:
+    if not requested_timeout_s or requested_timeout_s <= 0:
+        return _MIN_CODEX_RECOVERY_ATTEMPT_S
+    scaled_s = max(1, int(requested_timeout_s * 0.25))
+    return max(1, min(_MIN_CODEX_RECOVERY_ATTEMPT_S, scaled_s))
 
 
 def _resolve_task_reasoning_effort(
@@ -743,7 +765,10 @@ def _resolve_no_edit_watchdog_seconds(
     return max(floor_s, min(default_s, max(floor_s, communicate_timeout_s - 60)))
 
 
-def _resolve_no_edit_recheck_seconds(communicate_timeout_s: Optional[int]) -> int:
+def _resolve_no_edit_recheck_seconds(
+    communicate_timeout_s: Optional[int],
+    recovery_attempt: int = 0,
+) -> int:
     raw = os.environ.get("WORKERPALS_OPENAI_CODEX_NO_EDIT_RECHECK_S", "").strip()
     if raw:
         parsed = _to_positive_int(raw)
@@ -754,8 +779,13 @@ def _resolve_no_edit_recheck_seconds(communicate_timeout_s: Optional[int]) -> in
         else:
             upper = max(1, (communicate_timeout_s or parsed + 1) - 1)
             return max(1, min(parsed, upper))
-    upper = max(1, (communicate_timeout_s or _DEFAULT_NO_EDIT_RECHECK_S + 1) - 1)
-    return max(1, min(_DEFAULT_NO_EDIT_RECHECK_S, upper))
+    default_s = (
+        _NO_EDIT_RECOVERY_RECHECK_S
+        if recovery_attempt > 0
+        else _DEFAULT_NO_EDIT_RECHECK_S
+    )
+    upper = max(1, (communicate_timeout_s or default_s + 1) - 1)
+    return max(1, min(default_s, upper))
 
 
 def _resolve_no_edit_command_grace_seconds(communicate_timeout_s: Optional[int]) -> Optional[int]:
@@ -777,6 +807,36 @@ def _resolve_no_edit_command_grace_seconds(communicate_timeout_s: Optional[int])
 
     upper = max(1, communicate_timeout_s - 1)
     return max(1, min(_DEFAULT_NO_EDIT_COMMAND_GRACE_S, upper))
+
+
+def _resolve_no_edit_command_progress_cap_seconds(
+    communicate_timeout_s: Optional[int],
+    no_edit_command_grace_s: Optional[int],
+    recovery_attempt: int = 0,
+) -> Optional[int]:
+    if not communicate_timeout_s or no_edit_command_grace_s is None:
+        return None
+
+    raw = os.environ.get("WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_PROGRESS_CAP_S", "").strip()
+    if raw:
+        if raw == "0":
+            return None
+        parsed = _to_positive_int(raw)
+        if parsed is None:
+            log.info(
+                "Invalid WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_PROGRESS_CAP_S="
+                f"{raw!r}; using default command-progress cap."
+            )
+        else:
+            return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
+
+    default_s = (
+        _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S
+        if recovery_attempt > 0
+        else _DEFAULT_NO_EDIT_COMMAND_PROGRESS_CAP_S
+    )
+    upper = max(1, communicate_timeout_s - 1)
+    return max(1, min(default_s, upper))
 
 
 def _resolve_startup_stall_watchdog_seconds(
@@ -2091,6 +2151,118 @@ def _codex_changed_paths(repo: str, baseline_snapshot: Any) -> Tuple[List[str], 
     return changed_paths, delta, effective
 
 
+def _safe_repo_relative_path(repo: str, path: str) -> Optional[Path]:
+    raw = str(path or "").replace("\\", "/").strip()
+    if not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        return None
+    parts = [part for part in raw.split("/") if part]
+    if not parts or any(part in ("..", ".") for part in parts):
+        return None
+    try:
+        repo_path = Path(repo).resolve()
+        candidate = (repo_path / Path(*parts)).resolve()
+        candidate.relative_to(repo_path)
+        return candidate
+    except Exception:
+        return None
+
+
+def _git_status_entries(repo: str) -> List[Tuple[str, str]]:
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    entries: List[Tuple[str, str]] = []
+    for raw_line in proc.stdout.splitlines():
+        line = str(raw_line or "").rstrip("\r\n")
+        if len(line) < 4:
+            continue
+        status = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path:
+            entries.append((status, path))
+    return entries
+
+
+def _restore_retry_baseline(repo: str, baseline_snapshot: Any, reason: str = "") -> bool:
+    _changed_paths, delta_paths, _effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+    if not delta_paths:
+        return True
+    baseline_paths = set(_baseline_snapshot_paths(baseline_snapshot))
+    unsafe_delta = [path for path in delta_paths if _safe_repo_relative_path(repo, path) is None]
+    if unsafe_delta:
+        log.info(
+            "Rollout recovery cannot safely restore worker sandbox baseline; unsafe changed paths: "
+            f"{_describe_publishable_paths(unsafe_delta)}"
+        )
+        return False
+    mutated_baseline_paths = [path for path in delta_paths if path in baseline_paths]
+    if mutated_baseline_paths:
+        log.info(
+            "Rollout recovery will not reset paths that were already dirty at baseline: "
+            f"{_describe_publishable_paths(mutated_baseline_paths)}"
+        )
+        return False
+
+    log.info(
+        "Restoring worker sandbox baseline before rollout recovery retry"
+        f"{f' ({reason})' if reason else ''}: {_describe_publishable_paths(delta_paths)}"
+    )
+    try:
+        subprocess.run(
+            ["git", "restore", "--staged", "--worktree", "--", *delta_paths],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        log.info(f"Failed to run git restore for rollout recovery baseline: {exc}")
+        return False
+
+    delta_set = set(delta_paths)
+    for status, path in _git_status_entries(repo):
+        if status != "??":
+            continue
+        if path not in delta_set and not any(path.startswith(f"{delta.rstrip('/')}/") for delta in delta_set):
+            continue
+        candidate = _safe_repo_relative_path(repo, path)
+        if candidate is None:
+            return False
+        try:
+            if candidate.is_dir():
+                rmtree(candidate)
+            elif candidate.exists():
+                candidate.unlink()
+        except Exception as exc:
+            log.info(f"Failed to remove untracked rollout recovery path {path}: {exc}")
+            return False
+
+    _remaining_changed, remaining_delta, remaining_effective = _codex_changed_paths(
+        repo,
+        baseline_snapshot,
+    )
+    if remaining_delta:
+        log.info(
+            "Rollout recovery baseline restore left changed paths after cleanup: "
+            f"{_describe_publishable_paths(remaining_effective or remaining_delta)}"
+        )
+        return False
+    return True
+
+
 def _changed_path_top_level(path: str) -> str:
     raw = str(path or "").replace("\\", "/").strip()
     is_top_level_directory = raw.endswith("/")
@@ -2183,6 +2355,7 @@ def _run_codex_task(
     rollout_recovery_attempt: int = 0,
     model_override: Optional[str] = None,
     baseline_changes: Optional[List[str]] = None,
+    execution_deadline_monotonic: Optional[float] = None,
 ) -> Dict[str, Any]:
     global _ACTIVE_CHILD, _INTERRUPTED_SIGNAL
     _INTERRUPTED_SIGNAL = None
@@ -2242,7 +2415,39 @@ def _run_codex_task(
     )
     # JSON event output is noisy by default; prefer plain text + output-last-message.
     use_json = runtime_config.json_output
-    communicate_timeout_s = _resolve_communicate_timeout_seconds(runtime_config)
+    requested_communicate_timeout_s = _resolve_communicate_timeout_seconds(runtime_config)
+    recovery_depth = (
+        wrapper_recovery_attempt
+        + model_compatibility_recovery_attempt
+        + startup_stall_recovery_attempt
+        + no_edit_recovery_attempt
+        + rollout_recovery_attempt
+    )
+    communicate_timeout_s = requested_communicate_timeout_s
+    overall_deadline = execution_deadline_monotonic
+    if requested_communicate_timeout_s and requested_communicate_timeout_s > 0:
+        if overall_deadline is None:
+            overall_deadline = time.monotonic() + float(requested_communicate_timeout_s)
+        else:
+            remaining_s = int(max(0.0, overall_deadline - time.monotonic()))
+            min_attempt_s = (
+                _minimum_recovery_attempt_seconds(requested_communicate_timeout_s)
+                if recovery_depth > 0
+                else 1
+            )
+            if remaining_s < min_attempt_s:
+                return {
+                    "ok": False,
+                    "summary": "openai_codex recovery budget exhausted before retry",
+                    "stderr": (
+                        "Codex recovery was requested, but the shared executor budget had only "
+                        f"{remaining_s}s remaining (< {min_attempt_s}s). Stopping before a low-odds "
+                        "retry so ValidationGate/QualityGate can return a structured result."
+                    ),
+                    "exitCode": 124,
+                    "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
+                }
+            communicate_timeout_s = max(1, min(requested_communicate_timeout_s, remaining_s))
     effective_supplemental_guidance = _augment_supplemental_guidance(supplemental_guidance)
     prompt = _build_instruction(instruction, effective_supplemental_guidance)
     reasoning_effort = _resolve_task_reasoning_effort(
@@ -2484,6 +2689,7 @@ def _run_codex_task(
             rollout_watchdog_reason = ""
             rollout_artifact_only_paths = ""
             rollout_watchdog_retryable = True
+            rollout_restore_before_retry = False
             command_policy_rejection_loop = False
             no_edit_watchdog_s = (
                 _resolve_no_edit_watchdog_seconds(
@@ -2494,8 +2700,16 @@ def _run_codex_task(
                 if no_edit_recovery_attempt <= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
                 else None
             )
-            no_edit_recheck_s = _resolve_no_edit_recheck_seconds(communicate_timeout_s)
+            no_edit_recheck_s = _resolve_no_edit_recheck_seconds(
+                communicate_timeout_s,
+                recovery_attempt=recovery_depth,
+            )
             no_edit_command_grace_s = _resolve_no_edit_command_grace_seconds(communicate_timeout_s)
+            no_edit_command_progress_cap_s = _resolve_no_edit_command_progress_cap_seconds(
+                communicate_timeout_s,
+                no_edit_command_grace_s,
+                recovery_attempt=recovery_depth,
+            )
             startup_stall_watchdog_s = _resolve_startup_stall_watchdog_seconds(
                 communicate_timeout_s,
                 recovery_attempt=startup_stall_recovery_attempt,
@@ -2527,6 +2741,7 @@ def _run_codex_task(
             publishable_progress_seen_at: Optional[float] = None
             publishable_progress_finalized = False
             publishable_progress_paths: List[str] = []
+            first_no_edit_command_progress_at: Optional[float] = None
 
             while proc.poll() is None:
                 now = time.monotonic()
@@ -2593,17 +2808,50 @@ def _run_codex_task(
                             )
                         except Exception:
                             last_command_activity_at = 0.0
+                        command_progress_cap_reached = False
+                        command_progress_elapsed_s = 0
                         if command_event_count > 0 and no_edit_command_grace_s is not None:
+                            observed_command_progress_at = (
+                                last_command_activity_at if last_command_activity_at > 0 else now
+                            )
+                            if first_no_edit_command_progress_at is None:
+                                first_no_edit_command_progress_at = observed_command_progress_at
+                            if no_edit_command_progress_cap_s is not None:
+                                command_progress_cap_deadline = (
+                                    first_no_edit_command_progress_at
+                                    + float(no_edit_command_progress_cap_s)
+                                )
+                                command_progress_elapsed_s = int(
+                                    max(0.0, now - first_no_edit_command_progress_at)
+                                )
+                                if now >= command_progress_cap_deadline:
+                                    command_progress_cap_reached = True
                             command_grace_deadline = 0.0
                             if active_command_count > 0:
                                 # Do not kill while Codex is actively running a tool command; poll
-                                # again soon, but keep the total grace bounded by the hard cap below.
+                                # again soon, but keep endless read-only discovery bounded by the
+                                # command-progress cap above.
                                 command_grace_deadline = now + min(60.0, float(no_edit_command_grace_s))
                             elif last_command_activity_at > 0:
                                 command_grace_deadline = last_command_activity_at + float(
                                     no_edit_command_grace_s
                                 )
-                            if command_grace_deadline > now:
+                            if (
+                                no_edit_command_progress_cap_s is not None
+                                and first_no_edit_command_progress_at is not None
+                            ):
+                                command_grace_deadline = min(
+                                    command_grace_deadline,
+                                    first_no_edit_command_progress_at
+                                    + float(no_edit_command_progress_cap_s),
+                                )
+                            if command_progress_cap_reached:
+                                log.info(
+                                    "No-edit watchdog observed Codex tool progress for "
+                                    f"{command_progress_elapsed_s}s without a publishable patch; "
+                                    "forcing patch-first recovery instead of waiting for the child timeout."
+                                )
+                            elif command_grace_deadline > now:
                                 no_edit_deadline = command_grace_deadline
                                 remaining_s = int(max(1.0, command_grace_deadline - now))
                                 command_detail = (
@@ -2680,7 +2928,8 @@ def _run_codex_task(
                                 "publishable-looking changed paths are broad/noisy for a small task: "
                                 f"{_describe_publishable_paths(effective_paths)}"
                             )
-                            rollout_watchdog_retryable = False
+                            rollout_watchdog_retryable = True
+                            rollout_restore_before_retry = True
                         else:
                             rollout_deadline = None
                     else:
@@ -2699,9 +2948,16 @@ def _run_codex_task(
                             if rollout_artifact_only_paths
                             else ""
                         )
+                        can_retry_rollout = (
+                            rollout_watchdog_retryable
+                            and rollout_recovery_attempt < _MAX_ROLLOUT_RECOVERY_ATTEMPTS
+                        )
                         action = (
+                            "Restoring worker sandbox baseline and retrying with stricter guidance."
+                            if rollout_restore_before_retry and can_retry_rollout
+                            else
                             "Retrying with course-correction guidance."
-                            if rollout_watchdog_retryable
+                            if can_retry_rollout
                             else "Failing fast instead of retrying on top of a broad/noisy diff."
                         )
                         log.info(
@@ -2779,6 +3035,27 @@ def _run_codex_task(
 
         if rollout_watchdog_fired:
             if rollout_watchdog_retryable and rollout_recovery_attempt < _MAX_ROLLOUT_RECOVERY_ATTEMPTS:
+                if rollout_restore_before_retry and not _restore_retry_baseline(
+                    repo,
+                    baseline_snapshot,
+                    rollout_watchdog_reason,
+                ):
+                    detail = (
+                        "Codex trajectory drifted into broad/noisy changes and the worker sandbox "
+                        "could not be restored safely for a clean recovery retry: "
+                        f"{rollout_watchdog_reason or 'broad/noisy changes'}."
+                    )
+                    if trace_excerpt:
+                        detail = f"{detail}\n{trace_excerpt}"
+                    return {
+                        "ok": False,
+                        "summary": "openai_codex rollout coach could not safely reset broad changes",
+                        "stdout": _truncate(stdout),
+                        "stderr": _truncate(f"{detail}\n{stderr}".strip()),
+                        "exitCode": 124,
+                        "usage": usage,
+                        "cooldownMs": _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS,
+                    }
                 retry_guidance = [
                     *supplemental_guidance,
                     _build_rollout_recovery_guidance(
@@ -2798,6 +3075,7 @@ def _run_codex_task(
                     rollout_recovery_attempt=rollout_recovery_attempt + 1,
                     model_override=model_override,
                     baseline_changes=baseline_snapshot,
+                    execution_deadline_monotonic=overall_deadline,
                 )
             detail = (
                 "Codex trajectory remained off-track or too broad for safe recovery: "
@@ -2872,6 +3150,7 @@ def _run_codex_task(
                     rollout_recovery_attempt=rollout_recovery_attempt,
                     model_override=recovery_model or model_override,
                     baseline_changes=baseline_snapshot,
+                    execution_deadline_monotonic=overall_deadline,
                 )
                 retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                 if retry_result.get("ok"):
@@ -2918,6 +3197,7 @@ def _run_codex_task(
                     rollout_recovery_attempt=rollout_recovery_attempt,
                     model_override=model_override,
                     baseline_changes=baseline_snapshot,
+                    execution_deadline_monotonic=overall_deadline,
                 )
             detail = "Codex spent too much of the execution budget without producing publishable file changes."
             if trace_excerpt:
@@ -3114,6 +3394,7 @@ def _run_codex_task(
                         rollout_recovery_attempt=rollout_recovery_attempt,
                         model_override=model_override,
                         baseline_changes=baseline_snapshot,
+                        execution_deadline_monotonic=overall_deadline,
                     )
                     retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                     if wrapper_recovery_attempt == 0 and retry_result.get("ok"):
@@ -3229,6 +3510,7 @@ def _run_codex_task(
                     rollout_recovery_attempt=rollout_recovery_attempt,
                     model_override=LEGACY_CODEX_MODEL_FALLBACK,
                     baseline_changes=baseline_snapshot,
+                    execution_deadline_monotonic=overall_deadline,
                 )
                 retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                 if retry_result.get("ok"):

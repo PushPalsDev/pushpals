@@ -201,6 +201,9 @@ const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 3;
 const CRITIC_COMPACT_RETRY_MIN_REDUCTION_RATIO = 0.25;
 const MAX_DIAGNOSTIC_PATH_SAMPLES = 50;
 const MAX_DIAGNOSTIC_TEXT_CHARS = 8_000;
+const QUALITY_MIN_REVISION_BUDGET_MS = 120_000;
+const QUALITY_MAX_REVISION_BUDGET_MS = 420_000;
+const QUALITY_REVISION_BUDGET_RATIO = 0.25;
 
 export function qualityRevisionLoopUpperBound(policy: {
   maxAutoRevisions: number;
@@ -234,7 +237,13 @@ export function qualityRevisionBudgetDecision(opts: {
   const elapsedMs = Math.max(0, Number(opts.jobElapsedMs) || 0);
   const remainingBudgetMs = Math.max(0, Math.floor(executionBudgetMs - elapsedMs));
   const minimumRevisionBudgetMs = Math.floor(
-    Math.min(executionBudgetMs, Math.max(180_000, Math.min(600_000, executionBudgetMs * 0.35))),
+    Math.min(
+      executionBudgetMs,
+      Math.max(
+        QUALITY_MIN_REVISION_BUDGET_MS,
+        Math.min(QUALITY_MAX_REVISION_BUDGET_MS, executionBudgetMs * QUALITY_REVISION_BUDGET_RATIO),
+      ),
+    ),
   );
   return {
     shouldStart: remainingBudgetMs >= minimumRevisionBudgetMs,
