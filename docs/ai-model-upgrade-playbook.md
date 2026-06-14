@@ -184,9 +184,14 @@ the log. Usually the culprit is `runtime\configs\local.toml`, not source default
 
 ## Release Checklist
 
+For the general commit sequence, use `git_commit.md`: `git pull --rebase`,
+`git commit`, then `git push origin main`. For the full CLI release process,
+use `docs/release-playbook.md`.
+
 1. Commit source, tests, config templates, packaged runtime copies, and migrations.
 2. Prepare `release_log.md` for the next version.
-3. Tag and push the release.
+3. Commit the release prep.
+4. Tag and push the release.
 
 ```powershell
 git status --short --branch
@@ -194,14 +199,14 @@ git tag vX.Y.Z
 git -c http.sslBackend=schannel push origin main vX.Y.Z
 ```
 
-4. Watch the release workflow.
+5. Watch the release workflow.
 
 ```powershell
 gh run list --repo PushPalsDev/pushpals --workflow release-cli.yml --limit 5
 gh run view <run_id> --repo PushPalsDev/pushpals --json status,conclusion,jobs
 ```
 
-5. Require these jobs to pass:
+6. Require these jobs to pass:
 
 - Windows runtime smoke
 - GitHub release asset publish

@@ -4,6 +4,12 @@ The `docs` directory is the right place for a project wiki. It does not need to 
 
 This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base for onboarding, architecture, and operations.
 
+## Maintainer References
+
+- `git_commit.md` - Required direct-to-main commit flow: `git pull --rebase`, `git commit`, then `git push origin main`
+- `docs/release-playbook.md` - Tag-driven CLI release checklist
+- `release_log.md` - Current release notes and metadata used by release publication
+
 ## Wiki Index
 
 - `docs/wiki/README.md` - Navigation and learning paths
@@ -24,4 +30,5 @@ This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base
 
 - Keep component ownership docs aligned with code changes.
 - Prefer updating the relevant wiki page in the same PR as behavioral changes.
+- Keep `git_commit.md`, `docs/release-playbook.md`, and `release_log.md` aligned with maintainer workflow changes.
 - Treat these docs as operational references, not marketing copy.
