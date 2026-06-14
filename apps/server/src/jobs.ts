@@ -2215,6 +2215,12 @@ export class JobQueue {
       ? Math.max(1_000, Math.min(deferMsRaw, 30 * 60_000))
       : 60_000;
     const availableAt = new Date(Date.now() + deferMs).toISOString();
+    const targetWorkerId =
+      body.targetWorkerId === null
+        ? null
+        : typeof body.targetWorkerId === "string" && body.targetWorkerId.trim().length > 0
+          ? body.targetWorkerId.trim()
+          : workerId;
 
     const info = this.db
       .prepare(
@@ -2231,7 +2237,7 @@ export class JobQueue {
            AND status = 'claimed'
            AND workerId = ?`,
       )
-      .run(workerId, availableAt, now, jobId, workerId);
+      .run(targetWorkerId, availableAt, now, jobId, workerId);
 
     if (info.changes === 0) {
       return { ok: false, message: "Job not found, not claimed, or not owned by worker" };

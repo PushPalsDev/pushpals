@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   inferWorkerTerminalFailureClass,
+  shouldDeferDockerCodexStartupStallForDirectRetry,
   shouldEmitDirectSessionJobEvent,
   shouldRecycleWorkerForCodexUnavailableFailure,
   shouldRecycleWorkerForHeartbeatDegradation,
@@ -89,6 +90,39 @@ describe("workerpals session event emission", () => {
         "startup stall after restart",
       ),
     ).toBe(true);
+  });
+
+  test("defers Docker Codex startup stalls for a direct WorkerPal retry", () => {
+    const startupStall = {
+      ok: false,
+      summary: "openai_codex stalled before first response",
+      stderr: "Codex subprocess emitted only startup events",
+      exitCode: 124,
+    };
+
+    expect(
+      shouldDeferDockerCodexStartupStallForDirectRetry({
+        dockerEnabled: true,
+        result: startupStall,
+      }),
+    ).toBe(true);
+    expect(
+      shouldDeferDockerCodexStartupStallForDirectRetry({
+        dockerEnabled: false,
+        result: startupStall,
+      }),
+    ).toBe(false);
+    expect(
+      shouldDeferDockerCodexStartupStallForDirectRetry({
+        dockerEnabled: true,
+        result: {
+          ok: false,
+          summary: "openai_codex made no publishable changes before the no-edit watchdog",
+          stderr: "Codex produced tool progress but no patch",
+          exitCode: 124,
+        },
+      }),
+    ).toBe(false);
   });
 
   test("uses a distinct recycle exit code for Codex startup stalls", () => {

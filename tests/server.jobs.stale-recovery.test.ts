@@ -158,6 +158,43 @@ describe("JobQueue stale recovery", () => {
     expect(rightWorkerClaim.job?.id).toBe(jobId);
   });
 
+  test("deferred claimed jobs can clear the target worker for replacement retry", () => {
+    const queue = new JobQueue(":memory:");
+    const enqueue = queue.enqueue({
+      taskId: "task-deferred-clear-target",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(enqueue.ok).toBe(true);
+
+    const claim = queue.claim("worker-docker");
+    expect(claim.ok).toBe(true);
+    const jobId = claim.job!.id;
+
+    const deferred = queue.defer(jobId, {
+      workerId: "worker-docker",
+      deferMs: 1_000,
+      targetWorkerId: null,
+    });
+    expect(deferred.ok).toBe(true);
+
+    const pending = queue.getJob(jobId);
+    expect(pending?.status).toBe("pending");
+    expect(pending?.workerId).toBeNull();
+    expect(pending?.targetWorkerId).toBeNull();
+
+    const db = (queue as unknown as { db: any }).db as any;
+    db.prepare("UPDATE jobs SET availableAt = ? WHERE id = ?").run(
+      new Date(Date.now() - 1_000).toISOString(),
+      jobId,
+    );
+
+    const replacementClaim = queue.claim("worker-direct");
+    expect(replacementClaim.ok).toBe(true);
+    expect(replacementClaim.job?.id).toBe(jobId);
+  });
+
   test("deferred jobs become claimable by another worker once the pinned worker is stale", () => {
     const queue = new JobQueue(":memory:");
     const enqueue = queue.enqueue({

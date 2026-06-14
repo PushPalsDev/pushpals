@@ -70,6 +70,7 @@ const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
 const CODEX_STARTUP_STALL_WORKER_EXIT_CODE = 87;
 const CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS = 5_000;
 const CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS = 4_000;
+const CODEX_STARTUP_STALL_DIRECT_RETRY_DEFER_MS = 5_000;
 const DEFAULT_JOB_PROGRESS_LOG_EVERY_MS = 60_000;
 const CONFIG = loadPushPalsConfig();
 const LOG = new Logger("WorkerPals");
@@ -523,6 +524,14 @@ export function shouldRecycleWorkerForCodexUnavailableFailure(
     "codex cli isn't available",
     "codex cli is mandatory in this backend",
   ].some((needle) => text.includes(needle));
+}
+
+export function shouldDeferDockerCodexStartupStallForDirectRetry(options: {
+  dockerEnabled: boolean;
+  result: JobResult;
+}): boolean {
+  if (!options.dockerEnabled) return false;
+  return isCodexStartupStallResult(options.result);
 }
 
 export function workerRecycleExitCodeForResult(result: WorkerJobResult): number {
@@ -1282,12 +1291,20 @@ async function deferClaimedJobForMaintenance(
   headers: Record<string, string>,
   jobId: string,
   deferMs: number,
+  options: { targetWorkerId?: string | null; reason?: string } = {},
 ): Promise<{ ok: boolean; availableAt?: string; message?: string }> {
   try {
-    const response = await postJsonWithTimeout(`${opts.server}/jobs/${jobId}/defer`, headers, {
+    const body: Record<string, unknown> = {
       workerId: opts.workerId,
       deferMs,
-    });
+    };
+    if (Object.prototype.hasOwnProperty.call(options, "targetWorkerId")) {
+      body.targetWorkerId = options.targetWorkerId;
+    }
+    if (options.reason) {
+      body.reason = options.reason;
+    }
+    const response = await postJsonWithTimeout(`${opts.server}/jobs/${jobId}/defer`, headers, body);
     const payload = (await response.json().catch(() => ({}))) as {
       ok?: boolean;
       availableAt?: string;
@@ -1818,6 +1835,7 @@ async function workerLoop(
             };
 
             let statusPersistedToServer = false;
+            let deferredForDirectRetry = false;
             if (result.publishBlocked) {
               await reportToolRunForUnsuccessfulJob({
                 opts,
@@ -1872,40 +1890,86 @@ async function workerLoop(
                 `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
             } else {
-              await reportToolRunForUnsuccessfulJob({
-                opts,
-                headers,
-                job,
-                result,
-                durationMs: jobDurationMs,
-                phase: job.kind,
-              });
-              const response = await postJsonWithTimeout(
-                `${opts.server}/jobs/${job.id}/fail`,
-                headers,
-                {
-                  message: result.summary,
-                  detail: redactSensitiveText(result.stderr ?? ""),
+              let unsuccessfulToolRunReported = false;
+              const reportUnsuccessfulToolRun = async (phase: string) => {
+                if (unsuccessfulToolRunReported) return;
+                unsuccessfulToolRunReported = true;
+                await reportToolRunForUnsuccessfulJob({
+                  opts,
+                  headers,
+                  job,
+                  result,
                   durationMs: jobDurationMs,
-                  diagnostics: result.diagnostics,
-                },
-              );
-              statusPersistedToServer = response.ok;
-              console.log(
-                `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
-              );
-              recycleWorkerAfterJob = shouldRecycleWorkerForCodexUnavailableFailure(
-                result.summary,
-                result.stderr,
-              );
-              if (recycleWorkerAfterJob) {
-                console.error(
-                  `[WorkerPals] Codex backend unavailable for job ${job.id}; terminating this worker for replacement.`,
+                  phase,
+                });
+              };
+              const failCurrentJob = async () => {
+                await reportUnsuccessfulToolRun(job.kind);
+                const response = await postJsonWithTimeout(
+                  `${opts.server}/jobs/${job.id}/fail`,
+                  headers,
+                  {
+                    message: result.summary,
+                    detail: redactSensitiveText(result.stderr ?? ""),
+                    durationMs: jobDurationMs,
+                    diagnostics: result.diagnostics,
+                  },
                 );
+                statusPersistedToServer = response.ok;
+                console.log(
+                  `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+                );
+                recycleWorkerAfterJob = shouldRecycleWorkerForCodexUnavailableFailure(
+                  result.summary,
+                  result.stderr,
+                );
+                if (recycleWorkerAfterJob) {
+                  console.error(
+                    `[WorkerPals] Codex backend unavailable for job ${job.id}; terminating this worker for replacement.`,
+                  );
+                }
+              };
+
+              if (
+                shouldDeferDockerCodexStartupStallForDirectRetry({
+                  dockerEnabled: Boolean(dockerExecutor),
+                  result,
+                })
+              ) {
+                await reportUnsuccessfulToolRun("worker:docker-codex-startup-stall-defer");
+                const deferred = await deferClaimedJobForMaintenance(
+                  opts,
+                  headers,
+                  job.id,
+                  CODEX_STARTUP_STALL_DIRECT_RETRY_DEFER_MS,
+                  {
+                    targetWorkerId: null,
+                    reason: "codex_startup_stall_direct_retry",
+                  },
+                );
+                if (deferred.ok) {
+                  deferredForDirectRetry = true;
+                  statusPersistedToServer = true;
+                  recycleWorkerAfterJob = true;
+                  console.warn(
+                    `[WorkerPals] Deferred job ${job.id} after Docker Codex startup stall until ${
+                      deferred.availableAt ?? "a direct WorkerPal retry"
+                    }; recycling this worker so RemoteBuddy can spawn a direct isolated-worktree WorkerPal.`,
+                  );
+                } else {
+                  console.warn(
+                    `[WorkerPals] Failed to defer Docker Codex startup-stall job ${job.id}; marking failed: ${
+                      deferred.message || "unknown error"
+                    }`,
+                  );
+                  await failCurrentJob();
+                }
+              } else {
+                await failCurrentJob();
               }
             }
 
-            if (job.sessionId) {
+            if (job.sessionId && !deferredForDirectRetry) {
               const jobOrigin = taskExecuteOrigin(parsedParams);
               const responseMode = String(parsedParams.responseMode ?? "")
                 .trim()
