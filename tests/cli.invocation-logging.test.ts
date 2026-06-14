@@ -388,7 +388,9 @@ enabled = false
       expect(code).toBe(1);
       expect(stderr).toContain(`Server is unavailable at ${unavailableServerUrl}.`);
       expect(stderr).toContain("Auto-start is disabled (--no-auto-start).");
-      expect(stderr).not.toContain('Precheck failed: remote branch "origin/main_agents" was not found.');
+      expect(stderr).not.toContain(
+        'Precheck failed: remote branch "origin/main_agents" was not found.',
+      );
       expect(stderr).not.toContain("Repo affinity check failed");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -950,6 +952,178 @@ enabled = true
       expect(stdout).toContain(`[pushpals] sessionId=${targetSessionId}`);
       expect(createdSessions.has(targetSessionId)).toBe(true);
     } finally {
+      mockServer?.stop(true);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("runtime-only mode keeps running after stdin EOF", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-only-eof-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+    const targetSessionId = "runtime-only-eof";
+    let mockServer: ReturnType<typeof Bun.serve> | null = null;
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      const init = Bun.spawnSync(["git", "init"], {
+        cwd: repoRoot,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      expect(init.exitCode).toBe(0);
+
+      mockServer = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        async fetch(req) {
+          const url = new URL(req.url);
+          if (url.pathname === "/healthz") {
+            return Response.json({ ok: true });
+          }
+          if (url.pathname === "/sessions" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { sessionId?: string };
+            const sessionId = String(body.sessionId ?? "").trim() || targetSessionId;
+            return Response.json({ sessionId }, { status: 201 });
+          }
+          if (url.pathname === "/system/status") {
+            return Response.json({
+              ok: true,
+              repo: {
+                root: repoRoot,
+                remote: "origin",
+                remoteUrl: null,
+                browserUrl: null,
+                provider: "unknown",
+              },
+              clients: {
+                total: 1,
+                connected: 1,
+                byKind: { agent: 1 },
+                items: [
+                  {
+                    clientId: "agent_remotebuddy_orchestrator",
+                    label: "agent:remotebuddy-orchestrator",
+                    kind: "agent",
+                    sessionId: targetSessionId,
+                    status: "connected",
+                  },
+                ],
+              },
+            });
+          }
+          if (url.pathname === "/workers") {
+            return Response.json({
+              ok: true,
+              workers: [
+                {
+                  workerId: "workerpal-1",
+                  sessionId: targetSessionId,
+                  isOnline: true,
+                  status: "online",
+                  activeJobCount: 0,
+                  lastSeenAt: new Date().toISOString(),
+                },
+              ],
+            });
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      mkdirSync(join(runtimeRoot, "prompts"), { recursive: true });
+      mkdirSync(join(runtimeRoot, "protocol", "schemas"), { recursive: true });
+      writeFileSync(join(runtimeRoot, ".env"), "PUSHPALS_PROFILE=dev\n", "utf8");
+      writeFileSync(join(runtimeRoot, ".env.example"), "PUSHPALS_PROFILE=dev\n", "utf8");
+      writeFileSync(join(runtimeRoot, "configs", "local.toml"), "# local overrides\n", "utf8");
+      writeFileSync(
+        join(runtimeRoot, "configs", "default.toml"),
+        `profile = "dev"
+session_id = "dev"
+
+[server]
+url = "http://127.0.0.1:${mockServer.port}"
+
+[localbuddy]
+enabled = false
+port = 3003
+
+[remotebuddy.autonomy]
+enabled = true
+`,
+        "utf8",
+      );
+      writeFileSync(
+        join(repoRoot, "vision.md"),
+        "# Vision\n\n> **One sentence:** Keep runtime-only alive for monitoring.\n",
+        "utf8",
+      );
+      writeFileSync(
+        join(runtimeRoot, "vision.example.md"),
+        "# Vision\n\n> **One sentence:** Ship better automation.\n",
+        "utf8",
+      );
+      writeFileSync(
+        join(runtimeRoot, "protocol", "schemas", "envelope.schema.json"),
+        "{}\n",
+        "utf8",
+      );
+      writeFileSync(join(runtimeRoot, "protocol", "schemas", "events.schema.json"), "{}\n", "utf8");
+
+      proc = Bun.spawn(
+        [
+          bunExecPath,
+          cliScriptPath,
+          "--runtime-only",
+          "--no-auto-start",
+          "--session-id",
+          targetSessionId,
+          "--runtime-root",
+          runtimeRoot,
+          "--runtime-tag",
+          "vtest-local",
+        ],
+        {
+          cwd: repoRoot,
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...process.env,
+            PUSHPALS_CLI_PACKAGE_VERSION: "1.0.12-test",
+            PUSHPALS_SERVER_URL: "",
+            EXPO_PUBLIC_LOCAL_AGENT_URL: "",
+          },
+        },
+      );
+
+      await Bun.sleep(700);
+      proc.stdin.end();
+      const exitedAfterStdinClose = await Promise.race([
+        proc.exited.then(() => true),
+        Bun.sleep(900).then(() => false),
+      ]);
+      expect(exitedAfterStdinClose).toBe(false);
+
+      proc.kill();
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect(stderr.trim()).toBe("");
+      expect(stdout).toContain("[pushpals] runtimeOnly=true");
+      expect(stdout).toContain(
+        "[pushpals] Runtime-only stdin closed; continuing until terminated.",
+      );
+    } finally {
+      if (proc) {
+        try {
+          proc.kill();
+        } catch {}
+      }
       mockServer?.stop(true);
       rmSync(root, { recursive: true, force: true });
     }

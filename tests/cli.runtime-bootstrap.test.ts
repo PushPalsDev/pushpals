@@ -55,6 +55,7 @@ import {
   resolveCliLocalBuddyAutostart,
   resolveWorkerExecutionReadiness,
   resolveWorkerpalStartupReadinessProbeMaxMs,
+  resolveWindowsNodeExtraCaCertsBundlePath,
   resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs,
   resolveCliStatePath,
   resolveCommandPath,
@@ -71,6 +72,7 @@ import {
   shouldPrepareEmbeddedWorkerpalDockerImageBlocking,
   waitForWorkerpalCapacity,
   waitForRemoteBuddySessionConsumer,
+  withWindowsNodeExtraCaCertsEnv,
 } from "../scripts/pushpals-cli.ts";
 import {
   ServiceManager,
@@ -587,6 +589,75 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.WORKERPALS_SKIP_DOCKER_SELF_CHECK).toBe("1");
     expect(env.WORKERPALS_DOCKER_WARM_MEMORY_MB).toBe("1024");
     expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("1");
+  });
+
+  test("buildEmbeddedRuntimeEnv gives child Bun services the Windows root CA bundle", () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-runtime-certs-"));
+    const bundlePath = resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot);
+    mkdirSync(dirname(bundlePath), { recursive: true });
+    writeFileSync(
+      bundlePath,
+      "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+      "utf8",
+    );
+    try {
+      const env = buildEmbeddedRuntimeEnv(
+        {
+          PATH: process.env.PATH,
+        },
+        {
+          repoRoot: "C:/repo/example",
+          runtimeRoot,
+          platform: "win32",
+        },
+      );
+
+      expect(env.NODE_EXTRA_CA_CERTS).toBe(bundlePath);
+    } finally {
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("withWindowsNodeExtraCaCertsEnv preserves explicit CA configuration", () => {
+    const env = withWindowsNodeExtraCaCertsEnv(
+      {
+        PATH: process.env.PATH,
+        NODE_EXTRA_CA_CERTS: "C:/certs/custom.pem",
+      },
+      {
+        runtimeRoot: "C:/runtime/pushpals",
+        platform: "win32",
+      },
+    );
+
+    expect(env.NODE_EXTRA_CA_CERTS).toBe("C:/certs/custom.pem");
+  });
+
+  test("withWindowsNodeExtraCaCertsEnv supports disabling Windows CA bundle export", () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-runtime-certs-disabled-"));
+    const bundlePath = resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot);
+    mkdirSync(dirname(bundlePath), { recursive: true });
+    writeFileSync(
+      bundlePath,
+      "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+      "utf8",
+    );
+    try {
+      const env = withWindowsNodeExtraCaCertsEnv(
+        {
+          PATH: process.env.PATH,
+          PUSHPALS_DISABLE_WINDOWS_NODE_EXTRA_CA_CERTS: "1",
+        },
+        {
+          runtimeRoot,
+          platform: "win32",
+        },
+      );
+
+      expect("NODE_EXTRA_CA_CERTS" in env).toBe(false);
+    } finally {
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
   });
 
   test("buildEmbeddedRuntimeEnv makes child Git commands use the Windows certificate store", () => {
@@ -1269,7 +1340,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   });
 
   test("npm package shim keeps a bounded Bun bootstrap watchdog", () => {
-    const shim = readFileSync(join(process.cwd(), "packages", "cli", "bin", "pushpals.cjs"), "utf8");
+    const shim = readFileSync(
+      join(process.cwd(), "packages", "cli", "bin", "pushpals.cjs"),
+      "utf8",
+    );
 
     expect(shim).toContain("PUSHPALS_BUN_PROBE_TIMEOUT_MS");
     expect(shim).toContain("PUSHPALS_CLI_BOOTSTRAP_TIMEOUT_MS");
@@ -3119,7 +3193,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         "[OpenAICodexExecutor] [codex] No reasoning-like events observed in this run.",
         "[OpenAICodexExecutor] codex exec still running (30s elapsed, json_events=2, idle=27s)",
         "[OpenAICodexExecutor] [stderr] 2026-06-01 ERROR codex_core::tools::router: error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess",
-        "___RESULT___ {\"ok\":true,\"stdout\":\"huge raw result\"}",
+        '___RESULT___ {"ok":true,"stdout":"huge raw result"}',
       ]) {
         expect(
           formatSessionEventLine({

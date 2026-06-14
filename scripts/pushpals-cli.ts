@@ -968,6 +968,114 @@ function withWindowsGitSchannelEnv(
   return appendGitConfigEnv(env, "http.sslBackend", "schannel");
 }
 
+const WINDOWS_NODE_EXTRA_CA_CERTS_DISABLE_ENV = "PUSHPALS_DISABLE_WINDOWS_NODE_EXTRA_CA_CERTS";
+const WINDOWS_NODE_EXTRA_CA_CERTS_BUNDLE_RELATIVE_PATH = ["certs", "windows-root-ca.pem"] as const;
+
+export function resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot: string): string {
+  return join(runtimeRoot, ...WINDOWS_NODE_EXTRA_CA_CERTS_BUNDLE_RELATIVE_PATH);
+}
+
+function hasUsablePemCertificate(pathValue: string): boolean {
+  try {
+    return /-----BEGIN CERTIFICATE-----/.test(readFileSync(pathValue, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+function ensureWindowsNodeExtraCaCertsBundle(
+  outPath: string,
+  env: Record<string, string | undefined>,
+): string {
+  if (hasUsablePemCertificate(outPath)) return outPath;
+
+  const outDir = dirname(outPath);
+  try {
+    mkdirSync(outDir, { recursive: true });
+  } catch {
+    return "";
+  }
+
+  const script = String.raw`
+$ErrorActionPreference = "Stop"
+$outPath = $env:PUSHPALS_WINDOWS_NODE_EXTRA_CA_CERTS_OUT
+if (-not $outPath) { throw "PUSHPALS_WINDOWS_NODE_EXTRA_CA_CERTS_OUT is required" }
+$outDir = Split-Path -Parent $outPath
+if ($outDir) { [System.IO.Directory]::CreateDirectory($outDir) | Out-Null }
+$stores = @("Cert:\CurrentUser\Root", "Cert:\LocalMachine\Root")
+$seen = @{}
+$lines = New-Object System.Collections.Generic.List[string]
+foreach ($store in $stores) {
+  if (-not (Test-Path $store)) { continue }
+  foreach ($cert in Get-ChildItem $store) {
+    if (-not $cert.RawData) { continue }
+    if ($cert.NotAfter -lt (Get-Date)) { continue }
+    $thumbprint = [string]$cert.Thumbprint
+    if ($seen.ContainsKey($thumbprint)) { continue }
+    $seen[$thumbprint] = $true
+    $lines.Add("-----BEGIN CERTIFICATE-----")
+    $encoded = [Convert]::ToBase64String($cert.RawData, [Base64FormattingOptions]::InsertLineBreaks)
+    foreach ($line in [regex]::Split($encoded, '\r?\n')) {
+      if ($line) { $lines.Add($line) }
+    }
+    $lines.Add("-----END CERTIFICATE-----")
+  }
+}
+if ($lines.Count -eq 0) { throw "No Windows root certificates found" }
+[System.IO.File]::WriteAllLines($outPath, $lines, [System.Text.Encoding]::ASCII)
+`;
+  const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+  const childEnv = normalizeChildProcessEnv({
+    ...env,
+    PUSHPALS_WINDOWS_NODE_EXTRA_CA_CERTS_OUT: outPath,
+  });
+  const result = Bun.spawnSync(
+    [
+      "powershell.exe",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encodedScript,
+    ],
+    {
+      cwd: process.cwd(),
+      env: childEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  if (result.exitCode !== 0) return "";
+  return hasUsablePemCertificate(outPath) ? outPath : "";
+}
+
+export function withWindowsNodeExtraCaCertsEnv(
+  env: Record<string, string | undefined>,
+  opts: {
+    platform?: NodeJS.Platform;
+    runtimeRoot: string;
+  },
+): Record<string, string | undefined> {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32") return env;
+  if (parseBooleanFlag(env[WINDOWS_NODE_EXTRA_CA_CERTS_DISABLE_ENV]) === true) return env;
+  if (typeof env.NODE_EXTRA_CA_CERTS === "string" && env.NODE_EXTRA_CA_CERTS.trim()) return env;
+
+  const runtimeRoot = String(opts.runtimeRoot ?? "").trim();
+  if (!runtimeRoot || !existsSync(runtimeRoot)) return env;
+
+  const bundlePath = ensureWindowsNodeExtraCaCertsBundle(
+    resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot),
+    env,
+  );
+  if (!bundlePath) return env;
+  return {
+    ...env,
+    NODE_EXTRA_CA_CERTS: bundlePath,
+  };
+}
+
 async function runGitWithEnv(
   args: string[],
   cwd: string,
@@ -1922,7 +2030,11 @@ export function buildEmbeddedRuntimeEnv(
       ? { PUSHPALS_DOCKER_BIN_ABSOLUTE: env.PUSHPALS_DOCKER_BIN_ABSOLUTE.trim() }
       : {}),
   };
-  return withWindowsGitSchannelEnv(runtimeEnv, platform) as Record<string, string>;
+  const runtimeEnvWithWindowsCa = withWindowsNodeExtraCaCertsEnv(runtimeEnv, {
+    platform,
+    runtimeRoot: opts.runtimeRoot,
+  });
+  return withWindowsGitSchannelEnv(runtimeEnvWithWindowsCa, platform) as Record<string, string>;
 }
 
 function parseBooleanFlag(raw: string | undefined): boolean | null {
@@ -3527,16 +3639,16 @@ export function resolveWorkerpalStartupReadinessProbeMaxMs(
   env: Record<string, string | undefined> = process.env,
 ): number {
   const configured = parseCliIntEnv(WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS_ENV, env);
-  return Math.max(
-    1_000,
-    configured ?? DEFAULT_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS,
-  );
+  return Math.max(1_000, configured ?? DEFAULT_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS);
 }
 
 function resolveWorkerpalStartupReadinessProbeTimeoutMs(config: PushPalsConfig): number {
   return Math.max(
     1_000,
-    Math.min(resolveWorkerpalCapacityTimeoutMs(config), resolveWorkerpalStartupReadinessProbeMaxMs()),
+    Math.min(
+      resolveWorkerpalCapacityTimeoutMs(config),
+      resolveWorkerpalStartupReadinessProbeMaxMs(),
+    ),
   );
 }
 
@@ -3554,10 +3666,12 @@ export function resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs(
   );
 }
 
-export function shouldPrepareEmbeddedWorkerpalDockerImageBlocking(opts: {
-  platform?: NodeJS.Platform;
-  env?: Record<string, string | undefined>;
-} = {}): boolean {
+export function shouldPrepareEmbeddedWorkerpalDockerImageBlocking(
+  opts: {
+    platform?: NodeJS.Platform;
+    env?: Record<string, string | undefined>;
+  } = {},
+): boolean {
   const env = opts.env ?? process.env;
   const explicit = String(env[BLOCKING_WORKERPAL_IMAGE_BUILD_ENV] ?? "").trim();
   if (explicit) return isTruthyCliEnvValue(explicit);
@@ -4884,10 +4998,7 @@ async function autoStartRuntimeServices(opts: {
         : "LocalBuddy skipped";
       const readinessDetail = `${localBuddyDetail}; ${remoteBuddyHealth.detail}`;
       const now = Date.now();
-      if (
-        readinessDetail !== lastReadinessWaitDetail ||
-        now - lastReadinessWaitLogAt >= 5_000
-      ) {
+      if (readinessDetail !== lastReadinessWaitDetail || now - lastReadinessWaitLogAt >= 5_000) {
         console.log(`[pushpals] Waiting for embedded runtime readiness: ${readinessDetail}`);
         appendRuntimeServicesLogLine(
           runtimeServicesLogPath,
@@ -6324,9 +6435,14 @@ async function main(): Promise<void> {
 
     await new Promise<void>((resolveStop) => {
       let resolved = false;
+      let exitRequestedFromInput = false;
+      const keepAlive = setInterval(() => {
+        // Keep headless runtime-only sessions alive after stdin EOF.
+      }, 60_000);
       const finish = () => {
         if (resolved) return;
         resolved = true;
+        clearInterval(keepAlive);
         resolveStop();
       };
 
@@ -6340,13 +6456,17 @@ async function main(): Promise<void> {
       });
       runtimeOnlyInput.on("line", (line) => {
         if (!isCliExitCommand(line)) return;
+        exitRequestedFromInput = true;
         void requestStop();
         runtimeOnlyInput.close();
         finish();
       });
       runtimeOnlyInput.on("close", () => {
-        void requestStop();
-        finish();
+        if (exitRequestedFromInput || resolved) {
+          finish();
+          return;
+        }
+        console.log("[pushpals] Runtime-only stdin closed; continuing until terminated.");
       });
     });
 
