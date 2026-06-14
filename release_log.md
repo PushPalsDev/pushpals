@@ -2,23 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.46`
-- start_commit: `0ab97f613fb2e47d9ef52414c6294218c735ce22`
-- end_commit: `9510350c4fad95d3ba72e3e9d7680a344e5fe9bf`
+- version: `v1.1.47`
+- start_commit: `73ef7e75521762bbc773ea01310db178fc24fa1c`
+- end_commit: `5cf1f7330e81780c7ac7a2c5f817a9ef6f297f47`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Requeue Docker-backed WorkerPal jobs after persistent Codex startup stalls instead of marking the job terminally failed before RemoteBuddy can activate direct isolated-worktree fallback.
-- Allow the server defer endpoint to explicitly clear `targetWorkerId` so replacement WorkerPals can claim infrastructure-retry jobs while preserving pinned maintenance defers by default.
-- Add regression coverage for Docker Codex startup-stall handoff behavior and replacement-worker claiming of cleared-target deferred jobs.
+- Resolve direct WorkerPal Python backend wrappers from the freshly installed runtime sandbox assets before legacy runtime app paths.
+- Prevent direct isolated-worktree fallback from using stale wrappers that decode `--payload-file` as raw base64 and fail jobs with `Incorrect padding`.
+- Add regression coverage for fresh-sandbox resolver priority while preserving the legacy runtime app-path fallback.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.session-events.test.ts`
-- `bun test tests/server.jobs.stale-recovery.test.ts`
+- `bun test tests/workerpals.generic-python-executor.test.ts`
 - `bun run test:root`
 - `git diff --check`
 
