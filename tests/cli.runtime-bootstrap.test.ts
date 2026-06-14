@@ -450,6 +450,71 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     },
   );
 
+  test("shutdownEmbeddedServiceManagerGracefully cancels managed output pipes during bounded stop", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-shutdown-bounded-"));
+    let killCalls = 0;
+    let outputPipeStops = 0;
+    let cleanupCalls = 0;
+    const supervisor = new ServiceManager({
+      pollMs: 10_000,
+      maxRestartAttempts: 1,
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: {
+          pid: undefined,
+          kill: () => {
+            killCalls += 1;
+          },
+        } as any,
+        command: [...spec.command],
+        cwd: spec.cwd,
+        env: { ...(spec.env ?? {}) },
+        logPath: spec.logPath,
+        exited: false,
+        exitCode: null,
+        launchedAtMs: Date.now(),
+        stopOutputPipes: () => {
+          outputPipeStops += 1;
+        },
+      }),
+    });
+    try {
+      supervisor.startService({
+        name: "server",
+        color: "",
+        command: ["fake-server"],
+        cwd: root,
+        env: {},
+      });
+
+      const startedAt = Date.now();
+      await shutdownEmbeddedServiceManagerGracefully({
+        serviceManager: supervisor,
+        serverUrl: "http://127.0.0.1:0",
+        repoRoot: root,
+        reason: "unit test bounded shutdown",
+        requestShutdown: async () => ({ attempted: false, accepted: false }),
+        shutdownAcceptedDelayMs: 0,
+        serviceStopTimeoutMs: 50,
+        onLog: () => {},
+        onWarn: () => {},
+        cleanupTasks: [
+          () => {
+            cleanupCalls += 1;
+          },
+        ],
+      });
+
+      expect(Date.now() - startedAt).toBeLessThan(900);
+      expect(killCalls).toBe(1);
+      expect(outputPipeStops).toBe(1);
+      expect(cleanupCalls).toBe(1);
+    } finally {
+      supervisor.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("resolveEmbeddedBunExecutableFromEnv finds bun on PATH for standalone CLI binaries", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-bun-path-"));
     try {

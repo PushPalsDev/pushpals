@@ -2423,6 +2423,7 @@ export function buildServiceStopCommand(
 function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
   for (const service of services) {
     try {
+      service.stopOutputPipes?.();
       const stopCommand = buildServiceStopCommand(service.proc.pid, process.platform);
       if (stopCommand) {
         Bun.spawnSync(stopCommand, {
@@ -2437,6 +2438,63 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
       }
     } catch {
       // ignore
+    }
+  }
+}
+
+async function runWindowsServiceStopCommand(command: string[], timeoutMs: number): Promise<boolean> {
+  const proc = Bun.spawn(command, {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
+  const exitCode = await Promise.race([
+    proc.exited,
+    new Promise<number>((resolveTimeout) => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // best-effort timeout cleanup only
+        }
+        resolveTimeout(-1);
+      }, Math.max(250, timeoutMs));
+    }),
+  ]);
+  if (timeout) {
+    clearTimeout(timeout);
+    timeout = null;
+  }
+  if (timedOut) {
+    await Promise.race([proc.exited.catch(() => -1), Bun.sleep(250)]);
+    return false;
+  }
+  return exitCode === 0;
+}
+
+async function stopRuntimeServicesOnWindows(
+  services: RuntimeServiceProcess[],
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + Math.max(1_000, timeoutMs);
+  for (const service of services) {
+    service.stopOutputPipes?.();
+    const stopCommand = buildServiceStopCommand(service.proc.pid, "win32");
+    if (stopCommand) {
+      const remainingMs = Math.max(250, deadline - Date.now());
+      const stopped = await runWindowsServiceStopCommand(
+        stopCommand,
+        Math.min(WINDOWS_TASKKILL_TIMEOUT_MS, remainingMs),
+      );
+      if (stopped) continue;
+    }
+    try {
+      service.proc.kill("SIGKILL");
+    } catch {
+      // ignore best-effort shutdown failures
     }
   }
 }
@@ -2474,7 +2532,7 @@ async function stopRuntimeServicesGracefully(
       resolveGracefulShutdownPriority(b.name as RuntimeServiceName),
   );
   if (process.platform === "win32") {
-    stopRuntimeServices(ordered);
+    await stopRuntimeServicesOnWindows(ordered, timeoutMs);
     await waitForRuntimeServicesExit(ordered, Math.min(1_000, timeoutMs));
     return;
   }
@@ -2524,6 +2582,7 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
     reason: string,
   ) => Promise<LocalRuntimeShutdownAttempt>;
   shutdownAcceptedDelayMs?: number;
+  serviceStopTimeoutMs?: number;
   onLog?: (line: string) => void;
   onWarn?: (line: string) => void;
   cleanupTasks?: Array<() => Promise<void> | void>;
@@ -2535,6 +2594,7 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
     reason,
     requestShutdown = requestLocalRuntimeShutdown,
     shutdownAcceptedDelayMs = 1_500,
+    serviceStopTimeoutMs = 10_000,
     onLog = (line) => console.log(line),
     onWarn = (line) => console.warn(line),
     cleanupTasks = [],
@@ -2554,7 +2614,7 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
     onWarn(`[pushpals] ${shutdown.detail}`);
   }
 
-  await stopRuntimeServicesGracefully(services);
+  await stopRuntimeServicesGracefully(services, serviceStopTimeoutMs);
   for (const task of cleanupTasks) {
     await task();
   }

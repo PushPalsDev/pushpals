@@ -33,6 +33,7 @@ export type ManagedServiceProcess = {
   exitCode: number | null;
   launchedAtMs: number;
   logPath?: string;
+  stopOutputPipes?: () => void;
 };
 
 type ServiceManagerState = {
@@ -91,11 +92,14 @@ export function shouldRestartService(
 function pipeProcessStreamToLines(
   stream: ReadableStream<Uint8Array> | number | null | undefined,
   onLine?: (line: string) => void,
-): void {
-  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") return;
+): { cancel: () => void } {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
+    return { cancel: () => {} };
+  }
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let pending = "";
+  let cancelled = false;
   void (async () => {
     try {
       while (true) {
@@ -117,9 +121,24 @@ function pipeProcessStreamToLines(
     } catch {
       // best-effort stream piping only
     } finally {
-      reader.releaseLock();
+      try {
+        reader.releaseLock();
+      } catch {
+        // best-effort stream cleanup only
+      }
     }
   })();
+  return {
+    cancel: () => {
+      if (cancelled) return;
+      cancelled = true;
+      try {
+        void reader.cancel().catch(() => {});
+      } catch {
+        // best-effort stream cleanup only
+      }
+    },
+  };
 }
 
 function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
@@ -130,8 +149,8 @@ function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
     stdout: "pipe",
     stderr: "pipe",
   });
-  pipeProcessStreamToLines(proc.stdout, spec.onStdoutLine);
-  pipeProcessStreamToLines(proc.stderr, spec.onStderrLine);
+  const stdoutPipe = pipeProcessStreamToLines(proc.stdout, spec.onStdoutLine);
+  const stderrPipe = pipeProcessStreamToLines(proc.stderr, spec.onStderrLine);
   const service: ManagedServiceProcess = {
     name: spec.name,
     proc,
@@ -142,6 +161,10 @@ function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
     exitCode: null,
     launchedAtMs: Date.now(),
     logPath: spec.logPath,
+    stopOutputPipes: () => {
+      stdoutPipe.cancel();
+      stderrPipe.cancel();
+    },
   };
   void proc.exited.then((code) => {
     service.exited = true;
@@ -204,6 +227,7 @@ export class ServiceManager {
     const existing = this.services.get(spec.name);
     if (existing && !existing.exited) {
       try {
+        existing.stopOutputPipes?.();
         const pid = existing.proc.pid;
         if (process.platform === "win32" && typeof pid === "number" && pid > 0) {
           Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
@@ -274,6 +298,7 @@ export class ServiceManager {
     this.stopped = true;
     for (const service of this.services.values()) {
       try {
+        service.stopOutputPipes?.();
         const pid = service.proc.pid;
         if (process.platform === "win32" && typeof pid === "number" && pid > 0) {
           Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
