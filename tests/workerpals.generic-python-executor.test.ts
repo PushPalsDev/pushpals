@@ -71,6 +71,46 @@ describe("generic python executor timeout resolution", () => {
     }
   });
 
+  test("prefers fresh runtime sandbox Python wrappers over stale runtime app paths", () => {
+    const root = join(tmpdir(), `pushpals-python-wrapper-${randomUUID()}`);
+    const configDir = join(root, "configs");
+    const scriptSegments = [
+      "apps",
+      "workerpals",
+      "src",
+      "backends",
+      "openai_codex",
+      "openai_codex_executor.py",
+    ];
+    const staleScript = join(root, ...scriptSegments);
+    const sandboxScript = join(root, "sandbox", ...scriptSegments);
+    mkdirSync(dirname(staleScript), { recursive: true });
+    mkdirSync(dirname(sandboxScript), { recursive: true });
+    writeFileSync(staleScript, "# stale executor\n", "utf8");
+    writeFileSync(sandboxScript, "# fresh executor\n", "utf8");
+
+    try {
+      const result = resolveGenericPythonExecutorScriptPath(
+        {
+          backendName: "openai_codex",
+          scriptPath: staleScript,
+          scriptSegments,
+          pythonConfigKey: "openaiCodexPython",
+          timeoutConfigKey: "openaiCodexTimeoutMs",
+        },
+        {
+          configDir,
+          projectRoot: join(root, "repo"),
+        } as never,
+      );
+
+      expect(result.scriptPath).toBe(sandboxScript);
+      expect(result.candidates[0]).toBe(sandboxScript);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("resolves packaged Python wrapper scripts from the runtime config directory", () => {
     const root = join(tmpdir(), `pushpals-python-wrapper-${randomUUID()}`);
     const configDir = join(root, "configs");

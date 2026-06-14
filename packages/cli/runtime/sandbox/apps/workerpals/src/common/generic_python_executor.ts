@@ -248,11 +248,15 @@ export function resolveGenericPythonExecutorScriptPath(
   config: GenericPythonExecutorConfig,
   runtimeConfig: WorkerpalsRuntimeConfig,
 ): { scriptPath: string | null; candidates: string[] } {
-  const candidates = [config.scriptPath];
+  const candidates: string[] = [];
   if (config.scriptSegments && config.scriptSegments.length > 0) {
     const runtimeRoot = dirname(runtimeConfig.configDir);
+    candidates.push(join(runtimeRoot, "sandbox", ...config.scriptSegments));
+    candidates.push(config.scriptPath);
     candidates.push(join(runtimeRoot, ...config.scriptSegments));
     candidates.push(join(runtimeConfig.projectRoot, ...config.scriptSegments));
+  } else {
+    candidates.push(config.scriptPath);
   }
 
   const uniqueCandidates = uniqueStrings(candidates.map((candidate) => resolve(candidate)));
