@@ -2,17 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.1.39`
-- start_commit: `f9d617e9e6f2e6ab809b9c69c79bf7552d9ee957`
-- end_commit: `51d328c825f3b24a7d9e28799a1afbb7ef56b3ba`
-- commits_in_range: `5`
+- version: `v1.1.40`
+- start_commit: `56d552bcd4e6c17e6ca182b994a1ebdc5982ed81`
+- end_commit: `8c7e75f4ca9f57e74863c3a157352b76457d1657`
+- commits_in_range: `1`
 
 ## Highlights
 
-- On Windows, embedded runtime services now inherit a generated `NODE_EXTRA_CA_CERTS` bundle from the Windows root certificate store when no explicit CA bundle is configured. This lets Bun-based service fetches trust local corporate or antivirus TLS inspection roots without disabling TLS verification.
-- Keep `pushpals --runtime-only` alive after stdin closes so headless monitoring runs do not immediately shut down the embedded runtime; explicit `exit`, SIGINT, or SIGTERM still stop it cleanly.
-- Improve WorkerPal OpenAI Codex recovery by keeping watchdogs active across short remaining budgets and preserving time for validation/repair.
-- Keep the repo workflow docs and Codex guardrails aligned around the direct-to-main commit sequence.
+- Fix Windows installed-package shutdown so `pushpals --status-once` exits after printing its status snapshot instead of hanging after local runtime shutdown is accepted.
+- Bound the Windows embedded-service `taskkill` path with an async timeout and direct-kill fallback, avoiding packaged CLI stalls when Windows process-tree termination wedges.
+- Cancel managed service stdout/stderr readers during forced shutdown or service replacement so stopped child processes cannot leave the CLI event loop open.
 
 ## Validation
 
@@ -20,7 +19,7 @@
 - `bun run cli:verify-package-payload`
 - `bun run test:cli:integration`
 - `bun run test:root`
-- Source CLI live check in `SectorCommand`: verified embedded runtime stayed alive after stdin EOF, SourceControlManager started without the prior GitHub certificate error, and `/system/status` reported 1 idle worker with 0 failed jobs/requests.
+- Local packed npm tarball smoke on Windows: `scripts/release-installed-cli-smoke.ts` passed against a freshly packed `@pushpalsdev/cli@0.0.0-dev`, covering the installed `pushpals --status-once` shutdown path that failed in the `v1.1.39` release workflow.
 - `git diff --check`
 
 ## Install
