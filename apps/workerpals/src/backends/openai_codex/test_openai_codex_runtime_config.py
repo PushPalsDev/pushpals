@@ -1307,6 +1307,101 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertNotIn("no publishable", str(result.get("summary") or "").lower())
         self.assertEqual(result.get("cooldownMs"), 600000)
 
+    def test_run_codex_task_no_edit_recovery_retries_same_model_after_startup_stall(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-startup-stall-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# no edit startup stall repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed no-edit startup stall repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_no_edit_startup_stall.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import json",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "model = ''",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "    if arg == '-m' and index + 1 < len(argv):",
+                        "        model = argv[index + 1]",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "has_no_edit_recovery = 'No-edit watchdog recovery' in prompt",
+                        "has_startup_recovery = 'Codex startup-stall recovery' in prompt",
+                        "if has_no_edit_recovery and has_startup_recovery and model != 'gpt-5.4':",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/no-edit-startup-stall-recovered.txt').write_text('patched after same-model restart\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched after same-model startup-stall recovery.', encoding='utf-8')",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Patched after same-model startup-stall recovery.'}}), flush=True)",
+                        "    raise SystemExit(0)",
+                        "",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "if not has_no_edit_recovery:",
+                        "    print(json.dumps({'type': 'item.started', 'item': {'id': 'cmd-read', 'type': 'command_execution', 'command': 'cat README.md', 'status': 'in_progress'}}), flush=True)",
+                        "    time.sleep(0.2)",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'id': 'cmd-read', 'type': 'command_execution', 'command': 'cat README.md', 'status': 'completed', 'exit_code': 0}}), flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-no-edit-startup-stall-test-key",
+                "WORKERPALS_OPENAI_CODEX_JSON": "true",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "30",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_PROGRESS_CAP_S": "1",
+                "WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Add one focused regression assertion after reading the hinted test.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        stdout = str(result.get("stdout") or "")
+        self.assertIn("same-model startup-stall recovery", stdout)
+        self.assertIn("src/", stdout)
+
     def test_run_codex_task_retries_once_when_no_edit_watchdog_fires(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-watchdog-") as temp_dir:
             repo = Path(temp_dir) / "repo"

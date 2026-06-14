@@ -107,6 +107,7 @@ _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
 _MAX_CREDIBLE_WRAPPER_LOOP_CHANGED_PATHS = 8
 _MAX_CREDIBLE_WRAPPER_LOOP_TOP_LEVELS = 4
 _MAX_STARTUP_STALL_RECOVERY_ATTEMPTS = 1
+_MAX_STARTUP_STALL_DURING_NO_EDIT_RECOVERY_ATTEMPTS = 2
 _MAX_NO_EDIT_RECOVERY_ATTEMPTS = 1
 _MAX_ROLLOUT_RECOVERY_ATTEMPTS = 1
 _DEFAULT_NO_EDIT_WATCHDOG_S = 480
@@ -3137,21 +3138,36 @@ def _run_codex_task(
 
         if no_edit_watchdog_fired:
             startup_stall = _codex_trace_is_startup_stall(stdout_trace)
-            if startup_stall and startup_stall_recovery_attempt < _MAX_STARTUP_STALL_RECOVERY_ATTEMPTS:
+            startup_stall_recovery_limit = _MAX_STARTUP_STALL_RECOVERY_ATTEMPTS
+            if no_edit_recovery_attempt > 0:
+                startup_stall_recovery_limit = max(
+                    startup_stall_recovery_limit,
+                    _MAX_STARTUP_STALL_DURING_NO_EDIT_RECOVERY_ATTEMPTS,
+                )
+            if startup_stall and startup_stall_recovery_attempt < startup_stall_recovery_limit:
                 retry_guidance = [
                     *supplemental_guidance,
                     _build_startup_stall_recovery_guidance(trace_excerpt),
                 ]
-                recovery_model = _startup_stall_recovery_model(model)
+                prefer_same_model = (
+                    no_edit_recovery_attempt > 0
+                    and startup_stall_recovery_attempt < _MAX_STARTUP_STALL_RECOVERY_ATTEMPTS
+                )
+                recovery_model = model if prefer_same_model else _startup_stall_recovery_model(model)
                 recovery_detail = (
-                    f" using fallback model {recovery_model!r}"
-                    if recovery_model and recovery_model != model
-                    else ""
+                    f" using same model {recovery_model!r} because an earlier attempt made tool progress"
+                    if prefer_same_model
+                    else (
+                        f" using fallback model {recovery_model!r}"
+                        if recovery_model and recovery_model != model
+                        else ""
+                    )
                 )
                 log.warning(
                     "Codex emitted only startup events before the no-edit watchdog; "
-                    f"restarting Codex once{recovery_detail} before classifying the job terminally."
+                    f"restarting Codex{recovery_detail} before classifying the job terminally."
                 )
+                retry_model_override = model_override if prefer_same_model else recovery_model or model_override
                 retry_result = _run_codex_task(
                     repo,
                     instruction,
@@ -3161,7 +3177,7 @@ def _run_codex_task(
                     startup_stall_recovery_attempt=startup_stall_recovery_attempt + 1,
                     no_edit_recovery_attempt=no_edit_recovery_attempt,
                     rollout_recovery_attempt=rollout_recovery_attempt,
-                    model_override=recovery_model or model_override,
+                    model_override=retry_model_override,
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
                 )
