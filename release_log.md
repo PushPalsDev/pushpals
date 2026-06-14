@@ -2,31 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.38`
-- start_commit: `3f72c214975468a983325aa20f391b93a43cb990`
-- end_commit: `f2a445868586c86fda472faed49226e53f783432`
-- commits_in_range: `1`
+- version: `v1.1.39`
+- start_commit: `f9d617e9e6f2e6ab809b9c69c79bf7552d9ee957`
+- end_commit: `51d328c825f3b24a7d9e28799a1afbb7ef56b3ba`
+- commits_in_range: `5`
 
 ## Highlights
 
-- Improve WorkerPal OpenAI Codex recovery by sharing the execution deadline across retries, refusing low-odds retries when the remaining budget is exhausted, and preserving more time for validation/repair.
-- Bound endless command/tool progress during no-edit windows and make recovery attempts use faster durable-change rechecks.
-- Recover once from broad/noisy small-task rollouts by restoring the isolated worker sandbox to its baseline before retrying with stricter patch-first guidance; repeated broad drift still fails safely.
-- Reserve more of the planning budget for validation and lower the minimum quality-revision threshold so browser/test failures have enough time for focused repair.
-- Guard RemoteBuddy autonomy git config against corrupted branch/ref values before `git fetch`, preventing invalid-refspec startup/autonomy failures.
-- Sync the packaged CLI runtime sandbox and generated RemoteBuddy fallback so installed `@pushpalsdev/cli` users receive the WorkerPal and RemoteBuddy fixes.
+- On Windows, embedded runtime services now inherit a generated `NODE_EXTRA_CA_CERTS` bundle from the Windows root certificate store when no explicit CA bundle is configured. This lets Bun-based service fetches trust local corporate or antivirus TLS inspection roots without disabling TLS verification.
+- Keep `pushpals --runtime-only` alive after stdin closes so headless monitoring runs do not immediately shut down the embedded runtime; explicit `exit`, SIGINT, or SIGTERM still stop it cleanly.
+- Improve WorkerPal OpenAI Codex recovery by keeping watchdogs active across short remaining budgets and preserving time for validation/repair.
+- Keep the repo workflow docs and Codex guardrails aligned around the direct-to-main commit sequence.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `python apps\\workerpals\\src\\backends\\openai_codex\\test_openai_codex_runtime_config.py`
-- `python packages\\cli\\runtime\\sandbox\\apps\\workerpals\\src\\backends\\openai_codex\\test_openai_codex_runtime_config.py`
-- `bun test tests\\workerpals.generic-python-executor.test.ts tests\\workerpals.quality-gate-issues.test.ts apps\\remotebuddy\\src\\autonomous_engine.adjacent_possible.test.ts`
-- `bun run protocol:typecheck`
+- `bun run test:cli:integration`
 - `bun run test:root`
-- `bun run test:prompt-policy`
-- `bun run test:protocol`
+- Source CLI live check in `SectorCommand`: verified embedded runtime stayed alive after stdin EOF, SourceControlManager started without the prior GitHub certificate error, and `/system/status` reported 1 idle worker with 0 failed jobs/requests.
 - `git diff --check`
 
 ## Install
