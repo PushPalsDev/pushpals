@@ -45,7 +45,11 @@ import {
   truncate,
   type OutputCompactionPolicy,
 } from "./common/execution_utils.js";
-import { buildWorkerSandboxWritableEnv } from "./common/sandbox_env.js";
+import {
+  buildWorkerSandboxWritableEnv,
+  resolveBunExecutableFromEnv,
+  withResolvedBunOnPath,
+} from "./common/sandbox_env.js";
 // Re-export shared utilities for backward compatibility with external consumers.
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
@@ -1391,20 +1395,50 @@ export async function runValidationArgv(
     | { type: "failure-signal" }
     | { type: "success-signal" };
   const startedAt = Date.now();
-  const proc = Bun.spawn(argv, {
-    cwd: repo,
-    env,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    detached: process.platform !== "win32",
-  });
+  const spawnEnv = withResolvedBunOnPath(env);
+  const spawnArgv = prepareValidationSpawnArgv(argv, spawnEnv);
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(spawnArgv, {
+      cwd: repo,
+      env: spawnEnv,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: process.platform !== "win32",
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    return {
+      step: command,
+      command,
+      ok: false,
+      exitCode: 127,
+      stdout: "",
+      stderr: compactJobOutput(
+        [
+          `Validation command could not start executable "${spawnArgv[0] ?? ""}".`,
+          detail,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        outputPolicy,
+      ),
+      elapsedMs: Math.max(1, Date.now() - startedAt),
+    };
+  }
   let lastOutputAt = Date.now();
   const noteOutput = () => {
     lastOutputAt = Date.now();
   };
-  const stdoutCapture = captureValidationStream(proc.stdout, noteOutput);
-  const stderrCapture = captureValidationStream(proc.stderr, noteOutput);
+  const stdoutCapture = captureValidationStream(
+    (proc.stdout ?? null) as ReadableStream<Uint8Array> | null,
+    noteOutput,
+  );
+  const stderrCapture = captureValidationStream(
+    (proc.stderr ?? null) as ReadableStream<Uint8Array> | null,
+    noteOutput,
+  );
   let timedOut = false;
   let stoppedAfterFailureSignal = false;
   let stoppedAfterSuccessSignal = false;
@@ -1420,8 +1454,8 @@ export async function runValidationArgv(
   let browserSignalTimer: ReturnType<typeof setInterval> | null = null;
   const browserSignalPromise = isLongRunningBrowserValidationCommand(command)
     ? new Promise<ValidationWaitResult>((resolveBrowserSignal) => {
-        const idleMs = browserValidationFailureIdleMs(env);
-        const successIdleMs = browserValidationSuccessIdleMs(env);
+        const idleMs = browserValidationFailureIdleMs(spawnEnv);
+        const successIdleMs = browserValidationSuccessIdleMs(spawnEnv);
         browserSignalTimer = setInterval(() => {
           const combinedOutput = `${stdoutCapture.text()}\n${stderrCapture.text()}`;
           if (
@@ -1495,7 +1529,7 @@ export async function runValidationArgv(
         stderrCapture.text().trim(),
         timedOut ? timeoutMessage : "",
         stoppedAfterFailureSignal
-          ? `Validation command emitted a browser/e2e failure signal and then produced no output for ${browserValidationFailureIdleMs(env)}ms. PushPals terminated the leaked process tree and preserved the captured failure output for repair.`
+          ? `Validation command emitted a browser/e2e failure signal and then produced no output for ${browserValidationFailureIdleMs(spawnEnv)}ms. PushPals terminated the leaked process tree and preserved the captured failure output for repair.`
           : "",
       ]
         .filter(Boolean)
@@ -1839,9 +1873,37 @@ export function prepareValidationCommandArgv(
 ): string[] | null {
   const argv = tokenizeValidationCommandArgv(command);
   if (!argv) return null;
+  const spawnArgv = prepareValidationSpawnArgv(argv, env);
   const port = String(env.EXPO_DEV_SERVER_PORT ?? "").trim();
-  if (!port || !shouldInjectBrowserValidationPort(command, argv)) return argv;
-  return [...argv, "--", "--port", port];
+  if (!port || !shouldInjectBrowserValidationPort(command, spawnArgv)) return spawnArgv;
+  return [...spawnArgv, "--", "--port", port];
+}
+
+function commandLeaf(value: string): string {
+  return (value.trim().replace(/\\/g, "/").split("/").pop() ?? value).toLowerCase();
+}
+
+function isBunCommandToken(value: string): boolean {
+  const leaf = commandLeaf(value);
+  return leaf === "bun" || leaf === "bun.exe" || leaf === "bun.cmd" || leaf === "bun.bat";
+}
+
+function isBunxCommandToken(value: string): boolean {
+  const leaf = commandLeaf(value);
+  return leaf === "bunx" || leaf === "bunx.exe" || leaf === "bunx.cmd" || leaf === "bunx.bat";
+}
+
+export function prepareValidationSpawnArgv(
+  argv: string[],
+  env: Record<string, string>,
+): string[] {
+  const first = argv[0] ?? "";
+  if (!first) return argv;
+  const bunBin = resolveBunExecutableFromEnv(env);
+  if (!bunBin) return argv;
+  if (isBunCommandToken(first)) return [bunBin, ...argv.slice(1)];
+  if (isBunxCommandToken(first)) return [bunBin, "x", ...argv.slice(1)];
+  return argv;
 }
 
 function isBrowserAssertionDigest(digest: string): boolean {
@@ -1864,26 +1926,32 @@ interface ToolAvailabilityResult {
   detail: string;
 }
 
-function toolProbeArgv(candidate: string): string[] {
+function toolProbeArgv(candidate: string, env: Record<string, string>): string[] {
   const normalized = candidate.toLowerCase();
+  let argv: string[];
   if (normalized === "sh") {
-    return [candidate, "-c", "exit 0"];
+    argv = [candidate, "-c", "exit 0"];
+  } else if (normalized === "cmd") {
+    argv = [candidate, "/c", "exit 0"];
+  } else if (normalized === "bash") {
+    argv = [candidate, "-lc", "exit 0"];
+  } else if (normalized === "powershell" || normalized === "pwsh") {
+    argv = [candidate, "-NoProfile", "-Command", "exit 0"];
+  } else {
+    argv = [candidate, "--version"];
   }
-  if (normalized === "cmd") {
-    return [candidate, "/c", "exit 0"];
-  }
-  if (normalized === "bash") {
-    return [candidate, "-lc", "exit 0"];
-  }
-  if (normalized === "powershell" || normalized === "pwsh") {
-    return [candidate, "-NoProfile", "-Command", "exit 0"];
-  }
-  return [candidate, "--version"];
+  return prepareValidationSpawnArgv(argv, env);
 }
 
-async function checkToolCandidate(candidate: string, timeoutMs = 5_000): Promise<boolean> {
+async function checkToolCandidate(
+  candidate: string,
+  env: Record<string, string>,
+  timeoutMs = 5_000,
+): Promise<boolean> {
+  const spawnEnv = withResolvedBunOnPath(env);
   try {
-    const proc = Bun.spawn(toolProbeArgv(candidate), {
+    const proc = Bun.spawn(toolProbeArgv(candidate, spawnEnv), {
+      env: spawnEnv,
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -1913,13 +1981,14 @@ async function checkToolCandidate(candidate: string, timeoutMs = 5_000): Promise
 
 async function checkToolAvailability(
   requirements: ToolRequirement[],
+  env: Record<string, string> = withResolvedBunOnPath(process.env as Record<string, string>),
 ): Promise<ToolAvailabilityResult[]> {
   const cache = new Map<string, Promise<boolean>>();
   const check = (candidate: string) => {
     const key = candidate.toLowerCase();
     let cached = cache.get(key);
     if (!cached) {
-      cached = checkToolCandidate(candidate);
+      cached = checkToolCandidate(candidate, env);
       cache.set(key, cached);
     }
     return cached;
@@ -3766,7 +3835,10 @@ async function runDeterministicQualityGate(
           .join(", ")}`,
       );
     }
-    const toolAvailability = await checkToolAvailability(toolchainPlan.requirements);
+    const toolAvailability = await checkToolAvailability(
+      toolchainPlan.requirements,
+      buildWorkerSandboxWritableEnv(repo),
+    );
     const missingToolRequirements = toolAvailability
       .filter((entry) => !entry.ok)
       .map((entry) => entry.requirement);

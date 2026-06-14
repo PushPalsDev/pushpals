@@ -23,6 +23,7 @@ import {
   isTestLikeValidationStep,
   playwrightBrowserInstallArgv,
   prepareValidationCommandArgv,
+  prepareValidationSpawnArgv,
   resolveValidationCommandTimeoutMs,
   runValidationArgv,
   sanitizePlannerWorkerInstructionPathHints,
@@ -639,23 +640,70 @@ describe("workerpals validation command safety", () => {
   });
 
   test("injects the sandbox Expo port into browser script validation commands", () => {
+    const bunExec = process.execPath;
+
     expect(
       prepareValidationCommandArgv("bun run web:e2e", {
         EXPO_DEV_SERVER_PORT: "19444",
       }),
-    ).toEqual(["bun", "run", "web:e2e", "--", "--port", "19444"]);
+    ).toEqual([bunExec, "run", "web:e2e", "--", "--port", "19444"]);
 
     expect(
       prepareValidationCommandArgv("bun run web:e2e -- --port 19111", {
         EXPO_DEV_SERVER_PORT: "19444",
       }),
-    ).toEqual(["bun", "run", "web:e2e", "--", "--port", "19111"]);
+    ).toEqual([bunExec, "run", "web:e2e", "--", "--port", "19111"]);
 
     expect(
       prepareValidationCommandArgv("bunx playwright test", {
         EXPO_DEV_SERVER_PORT: "19444",
       }),
-    ).toEqual(["bunx", "playwright", "test"]);
+    ).toEqual([bunExec, "x", "playwright", "test"]);
+  });
+
+  test("resolves validation Bun commands through an embedded Bun executable", () => {
+    const bunBin = process.platform === "win32" ? "C:/runtime/bin/bun.exe" : "/runtime/bin/bun";
+    const env = {
+      EXPO_DEV_SERVER_PORT: "19444",
+      PUSHPALS_BUN_BIN: bunBin,
+    };
+
+    expect(prepareValidationCommandArgv("bun run web:e2e", env)).toEqual([
+      bunBin,
+      "run",
+      "web:e2e",
+      "--",
+      "--port",
+      "19444",
+    ]);
+    expect(prepareValidationSpawnArgv(["bunx", "playwright", "test"], env)).toEqual([
+      bunBin,
+      "x",
+      "playwright",
+      "test",
+    ]);
+  });
+
+  test("returns a validation failure when a command executable cannot start", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-missing-exec-"));
+
+    try {
+      const result = await runValidationArgv(
+        root,
+        "missing-tool --version",
+        [join(root, process.platform === "win32" ? "missing-tool.exe" : "missing-tool")],
+        process.env as Record<string, string>,
+        5_000,
+        {},
+        "validation timed out",
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(127);
+      expect(result.stderr).toContain("Validation command could not start executable");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("returns the real command exit when failed browser launchers leave pipes open", async () => {

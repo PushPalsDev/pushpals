@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join, resolve } from "path";
-import { buildWorkerSandboxWritableEnv } from "../apps/workerpals/src/common/sandbox_env";
+import { dirname, join, resolve } from "path";
+import {
+  buildWorkerSandboxWritableEnv,
+  resolveBunExecutableFromEnv,
+  withResolvedBunOnPath,
+} from "../apps/workerpals/src/common/sandbox_env";
 
 describe("workerpals sandbox writable env", () => {
   test("redirects HOME and Expo caches to writable temp paths", () => {
@@ -16,7 +20,7 @@ describe("workerpals sandbox writable env", () => {
         PATH: "test-path",
       });
 
-      expect(env.PATH).toBe("test-path");
+      expect(env.PATH.endsWith("test-path")).toBe(true);
       expect(env.HOME).not.toBe("/root");
       expect(env.USERPROFILE).toBe(env.HOME);
       expect(env.EXPO_HOME).toContain("pushpals-worker-env");
@@ -39,6 +43,50 @@ describe("workerpals sandbox writable env", () => {
       expect(existsSync(env.npm_config_cache)).toBe(true);
       expect(existsSync(env.PLAYWRIGHT_BROWSERS_PATH)).toBe(true);
       expect(readFileSync(join(env.HOME, ".gitconfig"), "utf8")).toContain("directory = *");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("normalizes Windows Path casing and prepends explicit Bun executable", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-bun-path-"));
+    const bunBin = join(root, "runtime", "bin", "bun.exe");
+
+    try {
+      const env = withResolvedBunOnPath(
+        {
+          Path: "C:\\tools",
+          PUSHPALS_BUN_BIN: bunBin,
+        },
+        "win32",
+        "C:\\runtime\\pushpals-runtime-workerpals-windows-x64.exe",
+      );
+
+      expect(env.PUSHPALS_BUN_BIN).toBe(bunBin);
+      expect(env.PATH.split(";")[0]).toBe(dirname(bunBin));
+      expect(env.Path).toBe(env.PATH);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discovers Bun from Windows Path when no explicit override is present", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-bun-discovery-"));
+    const binDir = join(root, "bin");
+    const bunBin = join(binDir, "bun.exe");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(bunBin, "not a real bun\n", "utf8");
+
+    try {
+      expect(
+        resolveBunExecutableFromEnv(
+          {
+            Path: binDir,
+          },
+          "win32",
+          "C:\\runtime\\pushpals-runtime-workerpals-windows-x64.exe",
+        ),
+      ).toBe(bunBin);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

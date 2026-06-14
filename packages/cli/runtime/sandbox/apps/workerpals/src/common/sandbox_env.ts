@@ -1,14 +1,106 @@
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
-import { basename, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 
-function stringEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+function stringEnv(source: Record<string, string | undefined> = process.env): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(source)) {
     if (typeof value === "string") env[key] = value;
   }
   return env;
+}
+
+function pathListDelimiter(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? ";" : ":";
+}
+
+function commandLeaf(value: string): string {
+  return (value.trim().replace(/\\/g, "/").split("/").pop() ?? value).toLowerCase();
+}
+
+function isBunCommandPath(value: string): boolean {
+  const leaf = commandLeaf(value);
+  return leaf === "bun" || leaf === "bun.exe" || leaf === "bun.cmd" || leaf === "bun.bat";
+}
+
+function normalizePathEnv(
+  env: Record<string, string>,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const out = { ...env };
+  const pathValue =
+    platform === "win32"
+      ? String(out.PATH ?? out.Path ?? "").trim()
+      : String(out.PATH ?? "").trim();
+  if (pathValue) {
+    out.PATH = pathValue;
+    if (platform === "win32") out.Path = pathValue;
+  }
+  return out;
+}
+
+export function resolveBunExecutableFromEnv(
+  sourceEnv: Record<string, string | undefined>,
+  platform: NodeJS.Platform = process.platform,
+  currentExecPathOverride = process.execPath,
+): string {
+  const env = normalizePathEnv(stringEnv(sourceEnv), platform);
+  const explicit = String(env.PUSHPALS_BUN_BIN ?? "").trim();
+  if (explicit && isBunCommandPath(explicit)) return explicit;
+
+  const currentExecPath = String(currentExecPathOverride ?? "").trim();
+  if (currentExecPath && isBunCommandPath(currentExecPath)) return currentExecPath;
+
+  const pathValue =
+    platform === "win32"
+      ? String(env.PATH ?? env.Path ?? "").trim()
+      : String(env.PATH ?? "").trim();
+  if (!pathValue) return "";
+
+  const candidates = platform === "win32" ? ["bun.exe", "bun", "bun.cmd", "bun.bat"] : ["bun"];
+  for (const rawDir of pathValue.split(pathListDelimiter(platform))) {
+    const dir = rawDir.trim();
+    if (!dir) continue;
+    for (const candidate of candidates) {
+      const fullPath = join(dir, candidate);
+      if (existsSync(fullPath)) return fullPath;
+    }
+  }
+  return "";
+}
+
+function commandDirectory(value: string): string {
+  if (!/[\\/]/.test(value)) return "";
+  return dirname(value);
+}
+
+export function withResolvedBunOnPath(
+  sourceEnv: Record<string, string | undefined>,
+  platform: NodeJS.Platform = process.platform,
+  currentExecPathOverride = process.execPath,
+): Record<string, string> {
+  const env = normalizePathEnv(stringEnv(sourceEnv), platform);
+  const bunBin = resolveBunExecutableFromEnv(env, platform, currentExecPathOverride);
+  if (!bunBin) return env;
+
+  const out: Record<string, string> = {
+    ...env,
+    PUSHPALS_BUN_BIN: bunBin,
+  };
+  const bunDir = commandDirectory(bunBin);
+  if (!bunDir) return out;
+
+  const delimiter = pathListDelimiter(platform);
+  const existing = String(out.PATH ?? out.Path ?? "").trim();
+  const existingParts = existing.split(delimiter).map((part) => part.trim()).filter(Boolean);
+  const alreadyPresent = existingParts.some((part) =>
+    platform === "win32" ? part.toLowerCase() === bunDir.toLowerCase() : part === bunDir,
+  );
+  const nextPath = alreadyPresent ? existing : [bunDir, ...existingParts].join(delimiter);
+  out.PATH = nextPath;
+  if (platform === "win32") out.Path = nextPath;
+  return out;
 }
 
 function safeRepoSlug(repo: string): string {
@@ -73,7 +165,7 @@ export function buildWorkerSandboxWritableEnv(
   repo: string,
   sourceEnv: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
-  const env = stringEnv(sourceEnv);
+  const env = withResolvedBunOnPath(sourceEnv);
   const originalHome = resolveOriginalHome(env);
   const codexHome = resolveCodexHome(env, originalHome);
   const baseDir = resolve(tmpdir(), "pushpals-worker-env", safeRepoSlug(repo));
