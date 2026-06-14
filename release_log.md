@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.1.41`
-- start_commit: `f891f6d788199b8986704d731ec3d381b87670ed`
-- end_commit: `c2463d2987571077ca8e78a103c7f0893a1c09db`
+- version: `v1.1.42`
+- start_commit: `902b268bcb77079302845053cc73be286b4075c5`
+- end_commit: `ac36678c154d79e9c4868e9f058ae58129e6d370`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve OpenAI Codex recovery budget for background/autonomy WorkerPal jobs by capping patchless command-backed discovery before it can consume the whole child executor window.
-- Keep the existing broader command-progress grace for normal jobs, while giving background jobs enough remaining budget for rollout and startup-stall recovery attempts.
-- Add regression coverage for the SectorCommand-style 570s Codex child budget so patchless background attempts leave two minimum recovery attempts available.
+- Bound OpenAI Codex no-edit recovery command grace so a post-read patch window cannot outlive the remaining child executor timeout.
+- Treat every Codex recovery depth as a recovery startup-stall window, preventing no-edit recovery attempts from spending a full first-attempt startup budget before fallback.
+- Add regression coverage for recovery command progress that would otherwise be classified as a raw execution timeout instead of a structured no-publishable watchdog result.
 
 ## Validation
 
