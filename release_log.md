@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.1.43`
-- start_commit: `cd1a024b467632ce1a3edef66618e45fba323b53`
-- end_commit: `68188dc277f1a1668dac37ccf03e2603ded3b9ff`
+- version: `v1.1.44`
+- start_commit: `23e99af1c224dbd9522197369448bc652f49e8a0`
+- end_commit: `166d2876b1ecf1835824cf274f4cf2438403ebae`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Keep RemoteBuddy autonomy ticks moving when the LLM scoring phase times out by falling back to deterministic candidate scoring instead of aborting before dispatch.
-- Preserve normal LLM scoring when it completes, while letting missing LLM scores continue through the existing ranker as zero-weight model scores.
-- Add regression coverage for a scoring timeout that still records an objective and enqueues a WorkerPal request.
+- Give WorkerPal Codex no-edit recovery one same-model restart when the patch-first retry stalls before its first response, preserving the model that already made tool progress before falling back.
+- Keep the plain repeated startup-stall path terminal, while making the no-edit recovery ladder less brittle for transient Codex startup stalls in background autonomy jobs.
+- Add source and packaged-runtime regression coverage for the real sequence: tool progress without a patch, patch-first startup stall, then same-model recovery to a publishable edit.
 
 ## Validation
 
