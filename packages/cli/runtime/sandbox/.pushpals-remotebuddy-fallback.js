@@ -7773,20 +7773,29 @@ ${JSON.stringify(input.messages ?? [])}`),
         return;
       }
       this.setPhase("scoring");
-      const scoringPhase = await this.llmPhase("scoring", runId, snapshot.snapshot_id, {
-        system: SCORING_SYSTEM_PROMPT,
-        json: true,
-        maxTokens: 1400,
-        temperature: 0.1,
-        messages: [
-          {
-            role: "user",
-            content: JSON.stringify({ candidates: normalizedCandidates, top_k: this.cfg.topK })
-          }
-        ]
-      });
-      llmCalls.push(scoringPhase.llmCall);
-      const scoringJson = scoringPhase.json;
+      let scoringJson = { scores: [] };
+      try {
+        const scoringPhase = await this.llmPhase("scoring", runId, snapshot.snapshot_id, {
+          system: SCORING_SYSTEM_PROMPT,
+          json: true,
+          maxTokens: 1400,
+          temperature: 0.1,
+          messages: [
+            {
+              role: "user",
+              content: JSON.stringify({ candidates: normalizedCandidates, top_k: this.cfg.topK })
+            }
+          ]
+        });
+        llmCalls.push(scoringPhase.llmCall);
+        scoringJson = scoringPhase.json;
+      } catch (error) {
+        if (error instanceof Error && error.message === "autonomy scoring phase timeout") {
+          console.warn(`[RemoteBuddyAutonomousEngine] tick ${runId}: scoring timed out; continuing with deterministic candidate scoring.`);
+        } else {
+          throw error;
+        }
+      }
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
         this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
