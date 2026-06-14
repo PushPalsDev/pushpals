@@ -184,9 +184,9 @@ the log. Usually the culprit is `runtime\configs\local.toml`, not source default
 
 ## Release Checklist
 
-For the general commit sequence, use `git_commit.md`: `git pull --rebase`,
+For the general commit sequence, use `docs/git_commit.md`: `git pull --rebase`,
 `git commit`, then `git push origin main`. For the full CLI release process,
-use `docs/release-playbook.md`.
+use `docs/release_playbook.md`.
 
 1. Commit source, tests, config templates, packaged runtime copies, and migrations.
 2. Prepare `release_log.md` for the next version.

@@ -6,8 +6,9 @@ This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base
 
 ## Maintainer References
 
-- `git_commit.md` - Required direct-to-main commit flow: `git pull --rebase`, `git commit`, then `git push origin main`
-- `docs/release-playbook.md` - Tag-driven CLI release checklist
+- `docs/git_commit.md` - Required direct-to-main commit flow: `git pull --rebase`, `git commit`, then `git push origin main`
+- `docs/codex-workflow-hooks.md` - Codex hook setup that reinforces commit and release workflows
+- `docs/release_playbook.md` - Tag-driven CLI release checklist
 - `release_log.md` - Current release notes and metadata used by release publication
 
 ## Wiki Index
@@ -30,5 +31,5 @@ This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base
 
 - Keep component ownership docs aligned with code changes.
 - Prefer updating the relevant wiki page in the same PR as behavioral changes.
-- Keep `git_commit.md`, `docs/release-playbook.md`, and `release_log.md` aligned with maintainer workflow changes.
+- Keep `docs/git_commit.md`, `docs/release_playbook.md`, and `release_log.md` aligned with maintainer workflow changes.
 - Treat these docs as operational references, not marketing copy.

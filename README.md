@@ -157,11 +157,11 @@ Notes:
 
 ### CLI release flow (maintainers)
 
-Releases are tag-driven. Follow `docs/release-playbook.md` rather than tagging
+Releases are tag-driven. Follow `docs/release_playbook.md` rather than tagging
 from memory:
 
-1. Commit product/runtime changes using `git_commit.md`.
-2. Run the required pre-release checks from `docs/release-playbook.md`.
+1. Commit product/runtime changes using `docs/git_commit.md`.
+2. Run the required pre-release checks from `docs/release_playbook.md`.
 3. Update `release_log.md`.
 4. Commit release prep.
 5. Push `main` and the new `vX.Y.Z` tag together.

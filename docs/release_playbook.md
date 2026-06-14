@@ -89,11 +89,11 @@ has environment caveats.
 ## Commit Release Prep
 
 Commit `release_log.md` and any new/updated release docs. For ordinary
-direct-to-main commits, follow `git_commit.md`: `git pull --rebase`, then
+direct-to-main commits, follow `docs/git_commit.md`: `git pull --rebase`, then
 `git commit`, then `git push origin main`.
 
 ```powershell
-git add release_log.md docs/release-playbook.md
+git add release_log.md docs/release_playbook.md
 git commit -m "docs(release): prepare vX.Y.Z"
 ```
 
