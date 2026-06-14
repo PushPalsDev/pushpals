@@ -45,6 +45,7 @@ from openai_codex_executor import (
     _has_credible_shell_wrapper_progress,
     _load_prompt_template,
     _mask_repo_local_codex_files,
+    _minimum_recovery_attempt_seconds,
     _repo_root_for_prompt_loading,
     _restore_repo_local_codex_files,
     _resolve_codex_command_prefix,
@@ -248,6 +249,41 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             90,
         )
         self.assertEqual(_resolve_rollout_watchdog_seconds(prompt, 1200, no_edit), 90)
+
+    def test_background_autonomy_caps_patchless_command_progress_before_recovery_reserve(self) -> None:
+        prompt = (
+            "Task planning contract from PushPals:\n"
+            "- Planning summary: intent=code_change, risk=low, priority=background\n"
+            "- Origin=autonomy targetPaths=[app/__tests__/opportunity-graph.contract.test.ts]\n"
+            "Add focused contract coverage without broad discovery.\n"
+        )
+        child_budget_s = 570
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S": "",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_PROGRESS_CAP_S": "",
+                "WORKERPALS_OPENAI_CODEX_STARTUP_STALL_WATCHDOG_S": "",
+            },
+            clear=False,
+        ):
+            command_grace_s = _resolve_no_edit_command_grace_seconds(child_budget_s)
+            command_cap_s = _resolve_no_edit_command_progress_cap_seconds(
+                child_budget_s,
+                command_grace_s,
+                prompt=prompt,
+            )
+            startup_stall_s = _resolve_startup_stall_watchdog_seconds(child_budget_s)
+
+        self.assertEqual(command_grace_s, 240)
+        self.assertEqual(command_cap_s, 120)
+        self.assertEqual(startup_stall_s, 210)
+        first_attempt_patchless_ceiling_s = startup_stall_s + command_cap_s
+        self.assertGreaterEqual(
+            child_budget_s - first_attempt_patchless_ceiling_s,
+            2 * _minimum_recovery_attempt_seconds(child_budget_s),
+        )
 
     def test_runtime_config_prefers_explicit_config_dir_override(self) -> None:
         import executor_base

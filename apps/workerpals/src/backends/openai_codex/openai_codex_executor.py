@@ -119,6 +119,7 @@ _DEFAULT_NO_EDIT_RECHECK_S = 120
 _NO_EDIT_RECOVERY_RECHECK_S = 30
 _DEFAULT_NO_EDIT_COMMAND_GRACE_S = 240
 _DEFAULT_NO_EDIT_COMMAND_PROGRESS_CAP_S = 360
+_BACKGROUND_NO_EDIT_COMMAND_PROGRESS_CAP_S = 120
 _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S = 120
 _DEFAULT_STARTUP_STALL_WATCHDOG_S = 210
 _RECOVERY_STARTUP_STALL_WATCHDOG_S = 150
@@ -817,6 +818,7 @@ def _resolve_no_edit_command_progress_cap_seconds(
     communicate_timeout_s: Optional[int],
     no_edit_command_grace_s: Optional[int],
     recovery_attempt: int = 0,
+    prompt: str = "",
 ) -> Optional[int]:
     if not communicate_timeout_s or no_edit_command_grace_s is None:
         return None
@@ -834,11 +836,12 @@ def _resolve_no_edit_command_progress_cap_seconds(
         else:
             return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
 
-    default_s = (
-        _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S
-        if recovery_attempt > 0
-        else _DEFAULT_NO_EDIT_COMMAND_PROGRESS_CAP_S
-    )
+    if recovery_attempt > 0:
+        default_s = _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S
+    elif _looks_like_background_autonomy_prompt(prompt):
+        default_s = _BACKGROUND_NO_EDIT_COMMAND_PROGRESS_CAP_S
+    else:
+        default_s = _DEFAULT_NO_EDIT_COMMAND_PROGRESS_CAP_S
     upper = max(1, communicate_timeout_s - 1)
     return max(1, min(default_s, upper))
 
@@ -2713,6 +2716,7 @@ def _run_codex_task(
                 communicate_timeout_s,
                 no_edit_command_grace_s,
                 recovery_attempt=recovery_depth,
+                prompt=prompt,
             )
             startup_stall_watchdog_s = _resolve_startup_stall_watchdog_seconds(
                 communicate_timeout_s,
