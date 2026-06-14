@@ -2,16 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.1.42`
-- start_commit: `902b268bcb77079302845053cc73be286b4075c5`
-- end_commit: `ac36678c154d79e9c4868e9f058ae58129e6d370`
+- version: `v1.1.43`
+- start_commit: `cd1a024b467632ce1a3edef66618e45fba323b53`
+- end_commit: `68188dc277f1a1668dac37ccf03e2603ded3b9ff`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Bound OpenAI Codex no-edit recovery command grace so a post-read patch window cannot outlive the remaining child executor timeout.
-- Treat every Codex recovery depth as a recovery startup-stall window, preventing no-edit recovery attempts from spending a full first-attempt startup budget before fallback.
-- Add regression coverage for recovery command progress that would otherwise be classified as a raw execution timeout instead of a structured no-publishable watchdog result.
+- Keep RemoteBuddy autonomy ticks moving when the LLM scoring phase times out by falling back to deterministic candidate scoring instead of aborting before dispatch.
+- Preserve normal LLM scoring when it completes, while letting missing LLM scores continue through the existing ranker as zero-weight model scores.
+- Add regression coverage for a scoring timeout that still records an objective and enqueues a WorkerPal request.
 
 ## Validation
 
