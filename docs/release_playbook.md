@@ -89,8 +89,8 @@ has environment caveats.
 ## Commit Release Prep
 
 Commit `release_log.md` and any new/updated release docs. For ordinary
-direct-to-main commits, follow `docs/git_commit.md`: `git pull --rebase`, then
-`git commit`, then `git push origin main`.
+direct-to-main commits, follow `docs/git_commit.md`: `git commit`, then
+`git pull --rebase`, then `git push`.
 
 ```powershell
 git add release_log.md docs/release_playbook.md

@@ -20,8 +20,9 @@ release workflows consistent.
 - When a user prompt mentions committing or cutting a release, the hook adds
   task-specific context pointing Codex at the required doc.
 - Before shell commands, the hook blocks:
-  - `git commit` until `docs/git_commit.md` was read and `git pull --rebase` was run.
-  - `git push origin main` until `docs/git_commit.md` was read.
+  - `git commit` until `docs/git_commit.md` was read.
+  - `git push` until `docs/git_commit.md` was read and `git pull --rebase`
+    was run after the commit.
   - release tags or release publication commands until
     `docs/release_playbook.md` was read.
 

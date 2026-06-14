@@ -6,7 +6,7 @@ This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base
 
 ## Maintainer References
 
-- `docs/git_commit.md` - Required direct-to-main commit flow: `git pull --rebase`, `git commit`, then `git push origin main`
+- `docs/git_commit.md` - Required direct-to-main commit flow: `git commit`, `git pull --rebase`, then `git push`
 - `docs/codex-workflow-hooks.md` - Codex hook setup that reinforces commit and release workflows
 - `docs/release_playbook.md` - Tag-driven CLI release checklist
 - `release_log.md` - Current release notes and metadata used by release publication

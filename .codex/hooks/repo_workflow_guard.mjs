@@ -55,7 +55,7 @@ function commandFromInput(input) {
 }
 
 function mentionsCommitIntent(text) {
-  return /\b(commit|committing|push(?:ing)?\s+(?:origin\s+)?main)\b/i.test(text);
+  return /\b(commit|committing|git\s+push|push(?:ing)?(?:\s+(?:origin\s+)?main)?)\b/i.test(text);
 }
 
 function mentionsReleaseIntent(text) {
@@ -73,24 +73,53 @@ function readsReleaseDoc(command) {
 }
 
 function runsPullRebase(command) {
-  return /\bgit\s+pull\s+--rebase\b/i.test(normalize(command));
+  const normalized = normalize(command);
+  return runsGitSubcommand(command, "pull") && /(?:^|\s)--rebase\b/i.test(normalized);
 }
 
 function runsCommit(command) {
-  return /\bgit\s+commit\b/i.test(normalize(command));
+  return runsGitSubcommand(command, "commit");
 }
 
-function runsMainPush(command) {
-  return /\bgit\s+push\s+origin\s+main\b/i.test(normalize(command));
+function runsGitPush(command) {
+  return runsGitSubcommand(command, "push");
+}
+
+function runsCommitPush(command) {
+  return runsGitPush(command) && !runsReleaseCommand(command);
 }
 
 function runsReleaseCommand(command) {
   const normalized = normalize(command);
   return (
-    /\bgit\s+tag\s+v?\d+\.\d+\.\d+\b/i.test(normalized) ||
-    /\bgit\s+push\s+origin\s+main\s+v?\d+\.\d+\.\d+\b/i.test(normalized) ||
+    new RegExp(`${gitCommandPrefix()}tag\\s+v?\\d+\\.\\d+\\.\\d+\\b`, "i").test(normalized) ||
+    new RegExp(`${gitCommandPrefix()}push\\s+origin\\s+main\\s+v?\\d+\\.\\d+\\.\\d+\\b`, "i").test(normalized) ||
     /\bgh\s+(?:release|workflow\s+run\b.*release)/i.test(normalized)
   );
+}
+
+function runsGitSubcommand(command, subcommand) {
+  return new RegExp(`${gitCommandPrefix()}${escapeRegex(subcommand)}\\b`, "i").test(normalize(command));
+}
+
+function gitCommandPrefix() {
+  return "\\bgit(?:\\s+-c\\s+\\S+)*\\s+";
+}
+
+function pullRebaseCoversLatestCommit(state) {
+  if (!state.gitPullRebaseAt) {
+    return false;
+  }
+  if (!state.gitCommitAt) {
+    return true;
+  }
+  return !timestampAfter(state.gitCommitAt, state.gitPullRebaseAt);
+}
+
+function timestampAfter(left, right) {
+  const leftTime = Date.parse(left || "");
+  const rightTime = Date.parse(right || "");
+  return Number.isFinite(leftTime) && (!Number.isFinite(rightTime) || leftTime > rightTime);
 }
 
 function normalize(value) {
@@ -129,7 +158,7 @@ function handleSessionStart() {
     "SessionStart",
     [
       "PushPals workflow guard is active.",
-      `Before committing, read ${COMMIT_DOC} and follow: git pull --rebase, git commit, git push origin main.`,
+      `Before committing, read ${COMMIT_DOC} and follow: git commit, git pull --rebase, git push.`,
       `Before cutting a release, read ${RELEASE_DOC} and follow it end-to-end.`,
     ].join(" "),
   );
@@ -159,13 +188,13 @@ function handlePreToolUse(command, state) {
   const commandReadsReleaseDoc = readsReleaseDoc(command);
   const commandPullsRebase = runsPullRebase(command);
 
-  if ((runsCommit(command) || runsMainPush(command)) && !state.gitCommitDocReadAt && !commandReadsCommitDoc) {
-    denyPreToolUse(`Read ${COMMIT_DOC} in this Codex session before running git commit or git push origin main.`);
+  if ((runsCommit(command) || runsCommitPush(command)) && !state.gitCommitDocReadAt && !commandReadsCommitDoc) {
+    denyPreToolUse(`Read ${COMMIT_DOC} in this Codex session before running git commit or git push.`);
     return;
   }
 
-  if (runsCommit(command) && !state.gitPullRebaseAt && !commandPullsRebase) {
-    denyPreToolUse(`Run git pull --rebase before git commit, as required by ${COMMIT_DOC}.`);
+  if (runsCommitPush(command) && !commandPullsRebase && !pullRebaseCoversLatestCommit(state)) {
+    denyPreToolUse(`Run git pull --rebase after git commit and before git push, as required by ${COMMIT_DOC}.`);
     return;
   }
 
@@ -182,6 +211,9 @@ function handlePostToolUse(command, stateFile, state) {
   }
   if (readsReleaseDoc(command)) {
     nextState.releasePlaybookReadAt = new Date().toISOString();
+  }
+  if (runsCommit(command)) {
+    nextState.gitCommitAt = new Date().toISOString();
   }
   if (runsPullRebase(command)) {
     nextState.gitPullRebaseAt = new Date().toISOString();

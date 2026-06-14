@@ -2,7 +2,7 @@
 
 ## Repository Workflows
 
-- Before making a git commit in this repository, read `docs/git_commit.md` and follow it. The required sequence is `git pull --rebase`, then `git commit`, then `git push origin main`.
+- Before making a git commit in this repository, read `docs/git_commit.md` and follow it. The required sequence is `git commit`, then `git pull --rebase`, then `git push`.
 - Before cutting a release, read `docs/release_playbook.md` and follow it end-to-end. Do not tag, push tags, or trigger release publication from memory.
 - Project-local Codex hooks in `.codex/hooks.json` reinforce these workflows. If a commit or release command is blocked, read the referenced workflow doc in the current Codex session, then retry the command.
 
