@@ -134,19 +134,19 @@ describe("generic python executor timeout resolution", () => {
   });
 
   test("reserves validation and repair budget from long OpenAI Codex primary turns", () => {
-    expect(resolveOpenAICodexValidationReserveMs(1_200_000)).toBe(600_000);
-    expect(resolveOpenAICodexValidationReserveMs(1_800_000)).toBe(720_000);
+    expect(resolveOpenAICodexValidationReserveMs(1_200_000)).toBe(300_000);
+    expect(resolveOpenAICodexValidationReserveMs(1_800_000)).toBe(450_000);
     expect(resolveOpenAICodexValidationReserveMs(600_000)).toBe(60_000);
   });
 
-  test("keeps Codex child timeout below execution budget when host has finalization grace", () => {
+  test("keeps Codex child timeout below execution budget without starving recovery", () => {
     expect(
       resolveGenericPythonExecutorChildTimeoutMs({
         backendName: "openai_codex",
         hostTimeoutMs: 1_320_000,
         executionBudgetMs: 1_200_000,
       }),
-    ).toBe(570_000);
+    ).toBe(870_000);
   });
 
   test("does not inject Codex timeout env into unrelated Python backends", () => {

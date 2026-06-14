@@ -37,6 +37,7 @@ const BACKEND_TIMEOUT_RESULT_GRACE_MS = 30_000;
 const OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS = 240_000;
 const OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS = 720_000;
 const OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS = 540_000;
+const OPENAI_CODEX_VALIDATION_RESERVE_RATIO = 0.25;
 
 function estimateTokensFromText(text: string): number {
   return Math.max(0, Math.ceil(String(text ?? "").length / 3));
@@ -161,7 +162,10 @@ export function resolveOpenAICodexValidationReserveMs(
       budgetMs,
       Math.max(
         OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS,
-        Math.min(OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS, budgetMs * 0.5),
+        Math.min(
+          OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS,
+          budgetMs * OPENAI_CODEX_VALIDATION_RESERVE_RATIO,
+        ),
       ),
     ),
   );
