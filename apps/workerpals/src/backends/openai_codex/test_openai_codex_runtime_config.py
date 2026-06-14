@@ -2156,6 +2156,24 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(watchdog_s, 180)
 
+    def test_review_fix_child_budget_below_ten_minutes_still_uses_watchdogs(self) -> None:
+        prompt = (
+            "Rejected PR revision brief: Previous ReviewAgent score: 8.0 / 10. "
+            "Add focused tests for createCleanupHarness.runTask covering successful execution, "
+            "execute failure, cleanup failure, invalid task input, and cleanup execution after "
+            "successful task completion."
+        )
+        env = {
+            "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "",
+            "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            no_edit_s = _resolve_no_edit_watchdog_seconds(prompt, 570)
+            rollout_s = _resolve_rollout_watchdog_seconds(prompt, 570, no_edit_s)
+
+        self.assertEqual(no_edit_s, 180)
+        self.assertEqual(rollout_s, 120)
+
     def test_no_edit_recovery_guidance_warns_against_artifact_only_progress(self) -> None:
         guidance = _build_no_edit_recovery_guidance(
             "item.completed | still inspecting",

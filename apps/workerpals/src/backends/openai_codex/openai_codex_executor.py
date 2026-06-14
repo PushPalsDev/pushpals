@@ -127,6 +127,7 @@ _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
 _BACKGROUND_ROLLOUT_WATCHDOG_S = 90
+_MIN_AUTO_WATCHDOG_TIMEOUT_S = 180
 _MIN_CODEX_RECOVERY_ATTEMPT_S = 120
 _NO_PUBLISHABLE_FAILURE_COOLDOWN_MS = 10 * 60 * 1000
 _CODEX_STARTUP_ONLY_EVENT_TYPES = {"thread.started", "turn.started"}
@@ -664,6 +665,9 @@ def _looks_like_narrow_test_task_prompt(prompt: str) -> bool:
         "ranking contract",
         "regression coverage",
         "focused coverage",
+        "focused test",
+        "focused tests",
+        "focused testing",
         "focused regression",
         "test-only",
         "test only",
@@ -742,7 +746,7 @@ def _resolve_no_edit_watchdog_seconds(
         else:
             return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
 
-    if communicate_timeout_s < 600:
+    if communicate_timeout_s < _MIN_AUTO_WATCHDOG_TIMEOUT_S:
         return None
 
     prompt_text = str(prompt or "").lower()
@@ -887,7 +891,7 @@ def _resolve_rollout_watchdog_seconds(
     communicate_timeout_s: Optional[int],
     no_edit_watchdog_s: Optional[int],
 ) -> Optional[int]:
-    if not communicate_timeout_s or communicate_timeout_s < 600:
+    if not communicate_timeout_s or communicate_timeout_s < _MIN_AUTO_WATCHDOG_TIMEOUT_S:
         return None
 
     raw = os.environ.get("WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S", "").strip()
