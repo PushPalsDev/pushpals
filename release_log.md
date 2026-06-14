@@ -2,24 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.1.44`
-- start_commit: `23e99af1c224dbd9522197369448bc652f49e8a0`
-- end_commit: `166d2876b1ecf1835824cf274f4cf2438403ebae`
+- version: `v1.1.45`
+- start_commit: `1c6663ab1cc6eb9fffe188e3553e86e6cebc37ed`
+- end_commit: `b264301a77307dcb60f2e682d3ea1b0cdd977a7a`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Give WorkerPal Codex no-edit recovery one same-model restart when the patch-first retry stalls before its first response, preserving the model that already made tool progress before falling back.
-- Keep the plain repeated startup-stall path terminal, while making the no-edit recovery ladder less brittle for transient Codex startup stalls in background autonomy jobs.
-- Add source and packaged-runtime regression coverage for the real sequence: tool progress without a patch, patch-first startup stall, then same-model recovery to a publishable edit.
+- Reduce WorkerPal's reserved validation budget for OpenAI Codex jobs so long background tasks leave enough shared executor time for the full no-edit recovery ladder, including fallback-model retry.
+- Preserve a meaningful validation reserve for final ValidationGate and QualityGate results while avoiding premature `openai_codex recovery budget exhausted before retry` failures.
+- Add regression coverage for Codex validation-reserve sizing and child timeout calculation so future budget changes do not starve startup-stall recovery.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
-- `python packages/cli/runtime/sandbox/apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
 - `bun test tests/workerpals.generic-python-executor.test.ts`
+- `bun test tests/source-control-manager.review-agent.test.ts -t "retries same PR SHA when verdict parsing fails"`
 - `bun run test:root`
 - `git diff --check`
 
@@ -51,7 +50,7 @@ bun install -g @pushpalsdev/cli
 - The npm package still requires a working Bun runtime to launch the package entrypoint; PushPals does not vendor Bun or other external toolchains in the npm package.
 - Direct GitHub release binaries are PushPals-built standalone artifacts. Removing embedded Bun runtime from those standalone artifacts would require a separate runtime distribution redesign.
 - Active runtimes that were started from an older release must be restarted after installing this release before new startup or packaged-runtime behavior takes effect.
-- Docker-backed WorkerPal execution can use a stalled Docker Codex startup as the signal to switch future WorkerPal spawns to direct isolated-worktree execution; this release preserves recovery budget for background jobs, but the original Docker stall is still treated as a worker-recycle event.
+- Docker-backed WorkerPal execution can use a stalled Docker Codex startup as the signal to switch future WorkerPal spawns to direct isolated-worktree execution; this release lengthens the shared Codex recovery budget for background jobs, but repeated all-watchdog stalls can still fail terminally and recycle the worker.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
