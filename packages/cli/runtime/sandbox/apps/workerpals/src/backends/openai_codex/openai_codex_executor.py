@@ -2720,7 +2720,7 @@ def _run_codex_task(
             )
             startup_stall_watchdog_s = _resolve_startup_stall_watchdog_seconds(
                 communicate_timeout_s,
-                recovery_attempt=startup_stall_recovery_attempt,
+                recovery_attempt=recovery_depth,
             )
             startup_stall_deadline = (
                 started_at + float(startup_stall_watchdog_s)
@@ -2852,6 +2852,11 @@ def _run_codex_task(
                                     command_grace_deadline,
                                     first_no_edit_command_progress_at
                                     + float(no_edit_command_progress_cap_s),
+                                )
+                            if deadline is not None and command_grace_deadline > 0:
+                                command_grace_deadline = min(
+                                    command_grace_deadline,
+                                    max(now, deadline - 1.0),
                                 )
                             if command_progress_cap_reached:
                                 log.info(

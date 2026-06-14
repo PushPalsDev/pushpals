@@ -1794,6 +1794,86 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("no publishable changes", str(result.get("summary") or ""))
         self.assertEqual(result.get("cooldownMs"), 600000)
 
+    def test_run_codex_task_recovery_command_grace_stops_before_child_timeout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-before-timeout-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# no edit before timeout repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed no-edit before timeout repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_no_edit_before_timeout.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "import sys",
+                        "import time",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "if 'No-edit watchdog recovery' in prompt:",
+                        "    print(json.dumps({'type': 'item.started', 'item': {'id': 'cmd-read', 'type': 'command_execution', 'command': 'cat README.md', 'status': 'in_progress'}}), flush=True)",
+                        "    time.sleep(0.1)",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'id': 'cmd-read', 'type': 'command_execution', 'command': 'cat README.md', 'status': 'completed', 'exit_code': 0, 'aggregated_output': '# no edit before timeout repo'}}), flush=True)",
+                        "    time.sleep(6)",
+                        "    raise SystemExit(0)",
+                        "",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Still inspecting without a patch.'}}), flush=True)",
+                        "time.sleep(6)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-no-edit-before-timeout-test-key",
+                "WORKERPALS_OPENAI_CODEX_JSON": "true",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "6",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_GRACE_S": "5",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Make one focused test edit after the hinted file read.",
+                    [],
+                )
+
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertEqual(
+            result.get("summary"),
+            "openai_codex made no publishable changes before the no-edit watchdog",
+        )
+        self.assertNotIn("execution timed out", str(result.get("summary") or ""))
+        self.assertEqual(result.get("cooldownMs"), 600000)
+
     def test_run_codex_task_no_edit_watchdog_rechecks_transient_publishable_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-recheck-") as temp_dir:
             repo = Path(temp_dir) / "repo"
