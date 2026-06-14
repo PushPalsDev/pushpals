@@ -2,23 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.47`
-- start_commit: `73ef7e75521762bbc773ea01310db178fc24fa1c`
-- end_commit: `5cf1f7330e81780c7ac7a2c5f817a9ef6f297f47`
+- version: `v1.1.48`
+- start_commit: `f86b9325094929c34a71440b8a0db912380a689e`
+- end_commit: `43a1feb38b97a170a87ff8f09d23a7b3326cbe21`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Resolve direct WorkerPal Python backend wrappers from the freshly installed runtime sandbox assets before legacy runtime app paths.
-- Prevent direct isolated-worktree fallback from using stale wrappers that decode `--payload-file` as raw base64 and fail jobs with `Incorrect padding`.
-- Add regression coverage for fresh-sandbox resolver priority while preserving the legacy runtime app-path fallback.
+- Resolve Bun from the CLI/runtime environment before direct WorkerPal validation launches `bun`, `bunx`, or toolchain preflight probes.
+- Normalize Windows `Path`/`PATH` inside the writable validation sandbox and prepend the resolved Bun directory for child scripts.
+- Return a structured validation failure when a validation executable cannot start instead of failing the entire job with an uncaught `uv_spawn 'bun'`.
+- Add regression coverage for embedded Bun resolution, Windows path casing, browser smoke port injection, and missing-executable validation startup.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.generic-python-executor.test.ts`
+- `bun test tests/workerpals.sandbox-env.test.ts tests/workerpals.validation-command-safety.test.ts`
 - `bun run test:root`
+- `bun x tsc -p apps/workerpals/tsconfig.json --noEmit` *(blocked by pre-existing nullability errors in `apps/workerpals/src/workerpals_main.ts`)*
 - `git diff --check`
 
 ## Install
