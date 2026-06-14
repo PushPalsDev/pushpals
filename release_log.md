@@ -2,18 +2,19 @@
 
 ## Release Metadata
 
-- version: `v1.1.37`
-- start_commit: `91553547b51990e6504f16d20a3d6e03c358ac3a`
-- end_commit: `d9e133b596ff59c44db5d8c25441e5a0501aed47`
+- version: `v1.1.38`
+- start_commit: `3f72c214975468a983325aa20f391b93a43cb990`
+- end_commit: `f2a445868586c86fda472faed49226e53f783432`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve WorkerPal repair budget after OpenAI Codex makes real progress: durable publishable file changes now stop the Codex child early so validation and quality-revision turns still have time to run.
-- Remove the process-start cap from no-edit command grace so later Codex command/tool progress receives a fresh bounded patch window instead of being killed by an old deadline.
-- Skip Codex critic review when deterministic gates already require a revision and the remaining execution budget must be reserved for that repair turn.
-- Add regression coverage for late command progress, durable publishable-progress finalization, and critic-budget preservation.
-- Sync the packaged CLI runtime sandbox so installed `@pushpalsdev/cli` users receive the WorkerPal executor and quality-gate fixes.
+- Improve WorkerPal OpenAI Codex recovery by sharing the execution deadline across retries, refusing low-odds retries when the remaining budget is exhausted, and preserving more time for validation/repair.
+- Bound endless command/tool progress during no-edit windows and make recovery attempts use faster durable-change rechecks.
+- Recover once from broad/noisy small-task rollouts by restoring the isolated worker sandbox to its baseline before retrying with stricter patch-first guidance; repeated broad drift still fails safely.
+- Reserve more of the planning budget for validation and lower the minimum quality-revision threshold so browser/test failures have enough time for focused repair.
+- Guard RemoteBuddy autonomy git config against corrupted branch/ref values before `git fetch`, preventing invalid-refspec startup/autonomy failures.
+- Sync the packaged CLI runtime sandbox and generated RemoteBuddy fallback so installed `@pushpalsdev/cli` users receive the WorkerPal and RemoteBuddy fixes.
 
 ## Validation
 
@@ -21,10 +22,11 @@
 - `bun run cli:verify-package-payload`
 - `python apps\\workerpals\\src\\backends\\openai_codex\\test_openai_codex_runtime_config.py`
 - `python packages\\cli\\runtime\\sandbox\\apps\\workerpals\\src\\backends\\openai_codex\\test_openai_codex_runtime_config.py`
-- `bun test tests\\workerpals.quality-gate-issues.test.ts`
-- `bun x tsc -p apps\\workerpals\\tsconfig.json --noEmit`
-- `bun run lint`
+- `bun test tests\\workerpals.generic-python-executor.test.ts tests\\workerpals.quality-gate-issues.test.ts apps\\remotebuddy\\src\\autonomous_engine.adjacent_possible.test.ts`
+- `bun run protocol:typecheck`
 - `bun run test:root`
+- `bun run test:prompt-policy`
+- `bun run test:protocol`
 - `git diff --check`
 
 ## Install
