@@ -2,24 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.1.59`
-- start_commit: `8f6dc9e5862067b7e4d6b97798f509c0c0d155b7`
-- end_commit: `3b78f4313e13fcdc19ecfb023ed90d66fb853b89`
+- version: `v1.1.60`
+- start_commit: `d2ffff8b7546520acbb95cfbe1c0dd9148b8fc1d`
+- end_commit: `2b5012261fc388ca3ca50cc6511ed412ae9f252b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Extend ValidationGate dependency-layout preflight to detect linked `node_modules` artifacts before Expo Router browser smoke validation.
-- Remove linked `node_modules` artifacts only when they are symlinks or junctions, then repair the worktree with `bun install --offline --frozen-lockfile --ignore-scripts` before running browser validation.
-- Keep fast non-browser validation on the existing dependency path so PushPals only localizes dependencies for browser flows that are sensitive to Metro/Expo Router path identity.
-- Add regression coverage for linked dependency artifacts with Expo Router browser validation while preserving the existing Bun dependency-layout safety checks.
+- Soft-pass critic-only quality revisions when the patch is publishable, required validation has passed, `quality_soft_pass_on_exhausted=true`, and the remaining execution budget is too small for another worker turn.
+- Preserve hard failures for deterministic quality blockers, required validation failures, non-publishable changes, and configurations where exhausted soft-pass is disabled.
+- Keep the existing revision-budget guard for unsafe cases while preventing validated browser-passing work from becoming a terminal failed job solely because the critic wanted another refinement.
+- Add regression coverage for the critic-only budget-exhaustion decision path.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.direct-worktree-dependency-artifacts.test.ts`
-- `bun test tests/remotebuddy.task-dedupe.test.ts -t "processRequest reuses the existing task when enqueue dedupes same-file work"`
+- `bun test tests/workerpals.quality-gate-issues.test.ts`
 - `bun --cwd apps/workerpals tsc --noEmit`
 - `bun run test:root`
 - `git diff --check`
@@ -56,6 +55,7 @@ bun install -g @pushpalsdev/cli
 - QualityGate can still reject or request repair for a broad patch after the rollout coach hands publishable progress forward; this release changes the failure point from executor pre-validation failure to structured gate diagnostics.
 - Bun dependency-layout preflight is offline and lockfile-frozen; if the local Bun cache is incomplete or the lockfile cannot be satisfied, ValidationGate will continue and report the dependency/setup blocker rather than modifying project manifests.
 - Expo Router browser validation now removes linked `node_modules` artifacts before dependency repair; if the offline Bun cache is incomplete, the browser validation may still report a local dependency/setup blocker.
+- Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
