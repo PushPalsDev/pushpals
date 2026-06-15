@@ -1342,6 +1342,8 @@ const COMMIT_MSG_GENERATOR_MIN_TIMEOUT_MS = 3_000;
 const COMMIT_MSG_GENERATOR_MAX_TIMEOUT_MS = 30_000;
 
 const SHELL_CONTROL_TOKENS = new Set(["&&", "||", ";", "|"]);
+const BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND =
+  "bun install --offline --frozen-lockfile --ignore-scripts";
 
 export function tokenizeValidationCommandArgv(command: string): string[] | null {
   const trimmed = command.trim();
@@ -2065,6 +2067,231 @@ export function prepareValidationSpawnArgv(argv: string[], env: Record<string, s
   if (isBunCommandToken(first)) return [bunBin, ...argv.slice(1)];
   if (isBunxCommandToken(first)) return [bunBin, "x", ...argv.slice(1)];
   return argv;
+}
+
+interface BunDependencyLayoutPreflightPlan {
+  command: string;
+  reason: string;
+}
+
+function readJsonRecord(path: string): Record<string, unknown> | null {
+  try {
+    return asRecord(JSON.parse(readFileSync(path, "utf8")));
+  } catch {
+    return null;
+  }
+}
+
+function declaredPackageDependencyNames(
+  packageJson: Record<string, unknown>,
+  fields: Array<"dependencies" | "devDependencies" | "optionalDependencies"> = [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+  ],
+): string[] {
+  const out = new Set<string>();
+  for (const field of fields) {
+    const dependencies = asRecord(packageJson[field]);
+    if (!dependencies) continue;
+    for (const name of Object.keys(dependencies)) {
+      if (name.trim()) out.add(name.trim());
+    }
+  }
+  return Array.from(out).sort((a, b) => a.localeCompare(b));
+}
+
+function hasBunLockfile(repo: string): boolean {
+  return existsSync(resolve(repo, "bun.lock")) || existsSync(resolve(repo, "bun.lockb"));
+}
+
+function isBunPackageManagedValidationCommand(command: string): boolean {
+  const tokens = tokenizeValidationCommandArgv(command);
+  if (!tokens || tokens.length === 0) return false;
+  const first = tokens[0] ?? "";
+  if (isBunxCommandToken(first)) return true;
+  if (!isBunCommandToken(first)) return false;
+
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = (tokens[index] ?? "").toLowerCase();
+    if (token === "--cwd" || token === "-c" || token === "-C") {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("--cwd=")) continue;
+    if (token.startsWith("-")) continue;
+    return token === "run" || token === "x" || token === "test";
+  }
+  return false;
+}
+
+function resolvePackageRoot(nodeModulesDir: string, packageName: string): string {
+  return resolve(nodeModulesDir, ...packageName.split("/").filter(Boolean));
+}
+
+function defaultBinNameForPackage(packageName: string): string {
+  return packageName.split("/").filter(Boolean).pop() ?? packageName;
+}
+
+function isSafeBinName(value: string): boolean {
+  return Boolean(value.trim()) && !/[\\/:\0]/.test(value);
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const normalizedParent = resolve(parent).replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedChild = resolve(child).replace(/\\/g, "/");
+  return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
+}
+
+function packageBinaryNames(packageRoot: string, dependencyName: string): string[] {
+  const packageJson = readJsonRecord(resolve(packageRoot, "package.json"));
+  if (!packageJson) return [];
+  const packageName =
+    typeof packageJson.name === "string" && packageJson.name.trim()
+      ? packageJson.name.trim()
+      : dependencyName;
+  const bin = packageJson.bin;
+  const entries: Array<[string, string]> = [];
+  if (typeof bin === "string" && bin.trim()) {
+    entries.push([defaultBinNameForPackage(packageName), bin.trim()]);
+  } else {
+    const binRecord = asRecord(bin);
+    if (binRecord) {
+      for (const [name, target] of Object.entries(binRecord)) {
+        if (typeof target === "string" && target.trim()) entries.push([name, target.trim()]);
+      }
+    }
+  }
+
+  return Array.from(
+    new Set(
+      entries
+        .filter(([name, target]) => {
+          if (!isSafeBinName(name)) return false;
+          const targetPath = resolve(packageRoot, target);
+          return isPathInside(packageRoot, targetPath) && existsSync(targetPath);
+        })
+        .map(([name]) => name),
+    ),
+  ).sort((a, b) => a.localeCompare(b));
+}
+
+function hasLocalBinShim(binDir: string, binName: string): boolean {
+  const candidates = ["", ".bunx", ".exe", ".cmd", ".ps1"].map((extension) =>
+    resolve(binDir, `${binName}${extension}`),
+  );
+  return candidates.some((candidate) => existsSync(candidate));
+}
+
+function collectMissingTopLevelDependencyPackages(
+  repo: string,
+  packageJson: Record<string, unknown>,
+): string[] {
+  const nodeModulesDir = resolve(repo, "node_modules");
+  const missing: string[] = [];
+  for (const dependencyName of declaredPackageDependencyNames(packageJson, [
+    "dependencies",
+    "devDependencies",
+  ])) {
+    if (!existsSync(resolvePackageRoot(nodeModulesDir, dependencyName))) {
+      missing.push(dependencyName);
+      if (missing.length >= 8) return missing;
+    }
+  }
+  return missing;
+}
+
+function collectMissingTopLevelDependencyBinaryShims(repo: string, packageJson: Record<string, unknown>): string[] {
+  const nodeModulesDir = resolve(repo, "node_modules");
+  const binDir = resolve(nodeModulesDir, ".bin");
+  const missing: string[] = [];
+  for (const dependencyName of declaredPackageDependencyNames(packageJson)) {
+    const packageRoot = resolvePackageRoot(nodeModulesDir, dependencyName);
+    if (!existsSync(packageRoot)) continue;
+    for (const binName of packageBinaryNames(packageRoot, dependencyName)) {
+      if (!hasLocalBinShim(binDir, binName)) missing.push(binName);
+      if (missing.length >= 8) return Array.from(new Set(missing));
+    }
+  }
+  return Array.from(new Set(missing));
+}
+
+export function resolveBunDependencyLayoutPreflight(
+  repo: string,
+  validationCommands: string[],
+): BunDependencyLayoutPreflightPlan | null {
+  if (!validationCommands.some((command) => isBunPackageManagedValidationCommand(command))) {
+    return null;
+  }
+  if (!hasBunLockfile(repo)) return null;
+  const packageJson = readJsonRecord(resolve(repo, "package.json"));
+  if (!packageJson) return null;
+
+  const nodeModulesDir = resolve(repo, "node_modules");
+  if (!existsSync(nodeModulesDir)) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason: "node_modules is missing for Bun validation commands",
+    };
+  }
+
+  const binDir = resolve(nodeModulesDir, ".bin");
+  if (!existsSync(binDir)) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason: "node_modules/.bin is missing for Bun validation commands",
+    };
+  }
+
+  const missingPackages = collectMissingTopLevelDependencyPackages(repo, packageJson);
+  if (missingPackages.length > 0) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason: `installed dependency package(s) missing: ${missingPackages.join(", ")}`,
+    };
+  }
+
+  const missingBins = collectMissingTopLevelDependencyBinaryShims(repo, packageJson);
+  if (missingBins.length > 0) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason: `local dependency binary shim(s) missing: ${missingBins.join(", ")}`,
+    };
+  }
+  return null;
+}
+
+async function runBunDependencyLayoutPreflight(
+  repo: string,
+  validationCommands: string[],
+  timeoutMs: number,
+  outputPolicy: Partial<OutputCompactionPolicy>,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<void> {
+  const preflight = resolveBunDependencyLayoutPreflight(repo, validationCommands);
+  if (!preflight) return;
+  onLog?.(
+    "stdout",
+    `[ValidationGate] Dependency layout preflight: ${preflight.reason}; running "${preflight.command}".`,
+  );
+  const run = await runValidationCommand(
+    repo,
+    preflight.command,
+    Math.min(Math.max(30_000, timeoutMs), 120_000),
+    outputPolicy,
+  );
+  if (run.ok) {
+    onLog?.(
+      "stdout",
+      `[ValidationGate] Dependency layout preflight repaired local Bun install layout (${run.elapsedMs}ms).`,
+    );
+    return;
+  }
+  const digest = extractValidationFailureDigest(run);
+  onLog?.(
+    "stderr",
+    `[ValidationGate] Dependency layout preflight failed (${run.elapsedMs}ms, exit ${run.exitCode})${digest ? ` - ${digest}` : ""}. Continuing validation so the real blocker is captured.`,
+  );
 }
 
 function isBrowserAssertionDigest(digest: string): boolean {
@@ -4094,6 +4321,13 @@ async function runDeterministicQualityGate(
           `[ValidationGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
         );
       }
+      await runBunDependencyLayoutPreflight(
+        repo,
+        commandsToRun,
+        qualityValidationStepTimeoutMs,
+        outputPolicy,
+        onLog,
+      );
       const toolchainPlan = buildToolchainPlan({
         repoRoot: repo,
         validationCommands: commandsToRun,

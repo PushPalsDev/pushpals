@@ -24,6 +24,7 @@ import {
   playwrightBrowserInstallArgv,
   prepareValidationCommandArgv,
   prepareValidationSpawnArgv,
+  resolveBunDependencyLayoutPreflight,
   resolveValidationCommandTimeoutMs,
   runValidationArgv,
   sanitizePlannerWorkerInstructionPathHints,
@@ -682,6 +683,76 @@ describe("workerpals validation command safety", () => {
       "playwright",
       "test",
     ]);
+  });
+
+  test("detects a broken Bun dependency binary layout before validation", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-bun-layout-preflight-"));
+
+    try {
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify(
+          {
+            scripts: { lint: "expo lint" },
+            dependencies: { expo: "1.0.0" },
+            devDependencies: { eslint: "1.0.0", typescript: "1.0.0" },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      writeFileSync(join(root, "bun.lock"), "", "utf8");
+      for (const [pkg, binName, binPath] of [
+        ["expo", "expo", "bin/cli.js"],
+        ["eslint", "eslint", "bin/eslint.js"],
+        ["typescript", "tsc", "bin/tsc"],
+      ] as const) {
+        mkdirSync(join(root, "node_modules", pkg, "bin"), { recursive: true });
+        writeFileSync(
+          join(root, "node_modules", pkg, "package.json"),
+          JSON.stringify({ name: pkg, bin: { [binName]: binPath } }, null, 2),
+          "utf8",
+        );
+        writeFileSync(join(root, "node_modules", pkg, binPath), "console.log('ok');\n", "utf8");
+      }
+
+      expect(
+        resolveBunDependencyLayoutPreflight(root, [
+          "bun x tsc --noEmit",
+          "bun run lint",
+        ])?.reason,
+      ).toContain("node_modules/.bin is missing");
+
+      mkdirSync(join(root, "node_modules", ".bin"), { recursive: true });
+      for (const binName of ["expo", "eslint", "tsc"]) {
+        writeFileSync(join(root, "node_modules", ".bin", binName), "", "utf8");
+      }
+      expect(
+        resolveBunDependencyLayoutPreflight(root, [
+          "bun x tsc --noEmit",
+          "bun run lint",
+        ]),
+      ).toBeNull();
+
+      rmSync(join(root, "node_modules", ".bin", "eslint"), { force: true });
+      expect(
+        resolveBunDependencyLayoutPreflight(root, [
+          "bun x tsc --noEmit",
+          "bun run lint",
+        ])?.reason,
+      ).toContain("eslint");
+
+      rmSync(join(root, "node_modules", "typescript"), { recursive: true, force: true });
+      expect(
+        resolveBunDependencyLayoutPreflight(root, [
+          "bun x tsc --noEmit",
+          "bun run lint",
+        ])?.reason,
+      ).toContain("typescript");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("returns a validation failure when a command executable cannot start", async () => {
