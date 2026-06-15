@@ -2241,7 +2241,10 @@ function collectMissingTopLevelDependencyPackages(
   return missing;
 }
 
-function collectMissingTopLevelDependencyBinaryShims(repo: string, packageJson: Record<string, unknown>): string[] {
+function collectMissingTopLevelDependencyBinaryShims(
+  repo: string,
+  packageJson: Record<string, unknown>,
+): string[] {
   const nodeModulesDir = resolve(repo, "node_modules");
   const binDir = resolve(nodeModulesDir, ".bin");
   const missing: string[] = [];
@@ -2281,8 +2284,7 @@ export function resolveBunDependencyLayoutPreflight(
   ) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
-      reason:
-        "node_modules is linked for Expo Router browser validation commands",
+      reason: "node_modules is linked for Expo Router browser validation commands",
       removeLinkedNodeModules: true,
     };
   }
@@ -2313,6 +2315,37 @@ export function resolveBunDependencyLayoutPreflight(
   return null;
 }
 
+export function resolveBunDependencyLayoutPreflightTimeoutMs(timeoutMs: number): number {
+  return Math.min(Math.max(30_000, timeoutMs), 300_000);
+}
+
+export function buildBunDependencyLayoutPreflightFailureRun(args: {
+  validationCommand: string;
+  validationCommands: string[];
+  preflightCommand: string;
+  preflightReason: string;
+  run: ValidationExecutionResult;
+}): ValidationExecutionResult {
+  const validationCommand =
+    args.validationCommand.trim() || args.validationCommands[0] || args.preflightCommand;
+  return {
+    step: validationCommand,
+    command: validationCommand,
+    ok: false,
+    exitCode: args.run.exitCode,
+    stdout: args.run.stdout,
+    stderr: [
+      `Dependency layout preflight failed before validation command "${validationCommand}". WorkerPals could not repair the local Bun dependency layout safely.`,
+      `Preflight reason: ${args.preflightReason}.`,
+      `Repair command: ${args.preflightCommand}.`,
+      args.run.stderr,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    elapsedMs: args.run.elapsedMs,
+  };
+}
+
 function removeLinkedNodeModulesDependencyArtifact(
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
@@ -2338,12 +2371,13 @@ function removeLinkedNodeModulesDependencyArtifact(
 async function runBunDependencyLayoutPreflight(
   repo: string,
   validationCommands: string[],
+  failureValidationCommand: string,
   timeoutMs: number,
   outputPolicy: Partial<OutputCompactionPolicy>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
-): Promise<void> {
+): Promise<ValidationExecutionResult | null> {
   const preflight = resolveBunDependencyLayoutPreflight(repo, validationCommands);
-  if (!preflight) return;
+  if (!preflight) return null;
   onLog?.(
     "stdout",
     `[ValidationGate] Dependency layout preflight: ${preflight.reason}; running "${preflight.command}".`,
@@ -2354,7 +2388,7 @@ async function runBunDependencyLayoutPreflight(
   const run = await runValidationCommand(
     repo,
     preflight.command,
-    Math.min(Math.max(30_000, timeoutMs), 120_000),
+    resolveBunDependencyLayoutPreflightTimeoutMs(timeoutMs),
     outputPolicy,
   );
   if (run.ok) {
@@ -2362,13 +2396,20 @@ async function runBunDependencyLayoutPreflight(
       "stdout",
       `[ValidationGate] Dependency layout preflight repaired local Bun install layout (${run.elapsedMs}ms).`,
     );
-    return;
+    return null;
   }
   const digest = extractValidationFailureDigest(run);
   onLog?.(
     "stderr",
-    `[ValidationGate] Dependency layout preflight failed (${run.elapsedMs}ms, exit ${run.exitCode})${digest ? ` - ${digest}` : ""}. Continuing validation so the real blocker is captured.`,
+    `[ValidationGate] Dependency layout preflight failed (${run.elapsedMs}ms, exit ${run.exitCode})${digest ? ` - ${digest}` : ""}. Blocking validation because the dependency tree may be incomplete after repair failure.`,
   );
+  return buildBunDependencyLayoutPreflightFailureRun({
+    validationCommand: failureValidationCommand,
+    validationCommands,
+    preflightCommand: preflight.command,
+    preflightReason: preflight.reason,
+    run,
+  });
 }
 
 function isBrowserAssertionDigest(digest: string): boolean {
@@ -4398,258 +4439,275 @@ async function runDeterministicQualityGate(
           `[ValidationGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
         );
       }
-      await runBunDependencyLayoutPreflight(
+      const dependencyPreflightFailure = await runBunDependencyLayoutPreflight(
         repo,
         commandsToRun,
+        requiredRunnableSteps[0] ?? commandsToRun[0] ?? "",
         qualityValidationStepTimeoutMs,
         outputPolicy,
         onLog,
       );
-      const toolchainPlan = buildToolchainPlan({
-        repoRoot: repo,
-        validationCommands: commandsToRun,
-      });
-      if (toolchainPlan.requirements.length > 0) {
-        onLog?.(
-          "stdout",
-          `[ValidationGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements
-            .map((requirement) => requirement.tool)
-            .join(", ")}`,
-        );
-      }
-      const toolAvailability = await checkToolAvailability(
-        toolchainPlan.requirements,
-        buildWorkerSandboxWritableEnv(repo),
-      );
-      const missingToolRequirements = toolAvailability
-        .filter((entry) => !entry.ok)
-        .map((entry) => entry.requirement);
-      if (missingToolRequirements.length > 0) {
+      if (dependencyPreflightFailure) {
+        validationRuns.push(dependencyPreflightFailure);
         onLog?.(
           "stderr",
-          `[ValidationGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(
-            missingToolRequirements,
-          )}`,
+          `[ValidationGate] Dependency layout preflight blocked validation before "${dependencyPreflightFailure.command}".`,
         );
-      }
-      const playwrightBrowserRuntimeReadyTargets = new Set<string>();
-      for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
-        const parallelBatch: string[] = [];
-        while (
-          commandIndex + parallelBatch.length < commandsToRun.length &&
-          parallelBatch.length < 3
-        ) {
-          const candidate = commandsToRun[commandIndex + parallelBatch.length];
-          if (!isParallelSafeFastValidationCommand(repo, candidate)) break;
-          parallelBatch.push(candidate);
-        }
-        if (parallelBatch.length > 1) {
+      } else {
+        const toolchainPlan = buildToolchainPlan({
+          repoRoot: repo,
+          validationCommands: commandsToRun,
+        });
+        if (toolchainPlan.requirements.length > 0) {
           onLog?.(
             "stdout",
-            `[ValidationGate] Running fast validation batch in parallel: ${parallelBatch.join(" | ")}`,
+            `[ValidationGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements
+              .map((requirement) => requirement.tool)
+              .join(", ")}`,
           );
-          const batchRuns = await Promise.all(
-            parallelBatch.map(async (command) => {
-              const commandMissingTools = requirementsForValidationCommand(
-                toolchainPlan,
-                command,
-              ).filter((requirement) =>
-                missingToolRequirements.some((missing) => missing.tool === requirement.tool),
-              );
-              if (commandMissingTools.length > 0) {
-                const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
-                  commandMissingTools,
-                )}.`;
-                return {
-                  run: {
-                    step: command,
-                    command,
-                    ok: false,
-                    exitCode: 127,
-                    stdout: "",
-                    stderr,
-                    elapsedMs: 1,
-                  } satisfies ValidationExecutionResult,
-                  stream: "stderr" as const,
-                  summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
-                };
-              }
-              const run = await runValidationCommand(
-                repo,
-                command,
-                resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
-                outputPolicy,
-              );
-              const digest = run.ok ? "" : extractValidationFailureDigest(run);
-              return {
-                run,
-                stream: (run.ok ? "stdout" : "stderr") as "stdout" | "stderr",
-                summary: `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`,
-              };
-            }),
-          );
-          for (const { run, stream, summary } of batchRuns) {
-            validationRuns.push(run);
-            onLog?.(stream, summary);
-          }
-          commandIndex += parallelBatch.length;
-          continue;
         }
-
-        const command = commandsToRun[commandIndex];
-        commandIndex += 1;
-        const commandMissingTools = requirementsForValidationCommand(toolchainPlan, command).filter(
-          (requirement) =>
-            missingToolRequirements.some((missing) => missing.tool === requirement.tool),
+        const toolAvailability = await checkToolAvailability(
+          toolchainPlan.requirements,
+          buildWorkerSandboxWritableEnv(repo),
         );
-        if (commandMissingTools.length > 0) {
-          const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
-            commandMissingTools,
-          )}.`;
-          validationRuns.push({
-            step: command,
-            command,
-            ok: false,
-            exitCode: 127,
-            stdout: "",
-            stderr,
-            elapsedMs: 1,
-          });
-          onLog?.("stderr", `[ValidationGate] Validation skipped (missing toolchain): ${command}`);
-          continue;
-        }
-        const deferredReason = shouldDeferLongValidationAfterFastFailures(command, validationRuns);
-        if (deferredReason) {
-          const stderr =
-            `Skipped long validation command because ${deferredReason}. ` +
-            "Fix the deterministic fast validation blocker first; PushPals will run long browser/e2e validation after the fast layer is clean.";
-          validationRuns.push({
-            step: command,
-            command,
-            ok: false,
-            exitCode: 125,
-            stdout: "",
-            stderr,
-            elapsedMs: 1,
-          });
+        const missingToolRequirements = toolAvailability
+          .filter((entry) => !entry.ok)
+          .map((entry) => entry.requirement);
+        if (missingToolRequirements.length > 0) {
           onLog?.(
             "stderr",
-            `[ValidationGate] Deferred long validation after fast failure: ${command} (${deferredReason})`,
+            `[ValidationGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(
+              missingToolRequirements,
+            )}`,
           );
-          continue;
         }
-        const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(
-          repo,
-          command,
-        );
-        const playwrightBrowserTargets = commandNeedsPlaywrightBrowserRuntime
-          ? inferPlaywrightBrowserInstallTargets(repo, command)
-          : [];
-        const missingPlaywrightBrowserTargets = playwrightBrowserTargets.filter(
-          (target) => !playwrightBrowserRuntimeReadyTargets.has(target),
-        );
-        let commandBrowserRuntimeEnsured =
-          commandNeedsPlaywrightBrowserRuntime && missingPlaywrightBrowserTargets.length === 0;
-        if (missingPlaywrightBrowserTargets.length > 0) {
-          const browserEnv = buildWorkerSandboxWritableEnv(repo);
-          onLog?.(
-            "stdout",
-            `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
-          );
-          const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
-            repo,
+        const playwrightBrowserRuntimeReadyTargets = new Set<string>();
+        for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
+          const parallelBatch: string[] = [];
+          while (
+            commandIndex + parallelBatch.length < commandsToRun.length &&
+            parallelBatch.length < 3
+          ) {
+            const candidate = commandsToRun[commandIndex + parallelBatch.length];
+            if (!isParallelSafeFastValidationCommand(repo, candidate)) break;
+            parallelBatch.push(candidate);
+          }
+          if (parallelBatch.length > 1) {
+            onLog?.(
+              "stdout",
+              `[ValidationGate] Running fast validation batch in parallel: ${parallelBatch.join(" | ")}`,
+            );
+            const batchRuns = await Promise.all(
+              parallelBatch.map(async (command) => {
+                const commandMissingTools = requirementsForValidationCommand(
+                  toolchainPlan,
+                  command,
+                ).filter((requirement) =>
+                  missingToolRequirements.some((missing) => missing.tool === requirement.tool),
+                );
+                if (commandMissingTools.length > 0) {
+                  const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
+                    commandMissingTools,
+                  )}.`;
+                  return {
+                    run: {
+                      step: command,
+                      command,
+                      ok: false,
+                      exitCode: 127,
+                      stdout: "",
+                      stderr,
+                      elapsedMs: 1,
+                    } satisfies ValidationExecutionResult,
+                    stream: "stderr" as const,
+                    summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
+                  };
+                }
+                const run = await runValidationCommand(
+                  repo,
+                  command,
+                  resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+                  outputPolicy,
+                );
+                const digest = run.ok ? "" : extractValidationFailureDigest(run);
+                return {
+                  run,
+                  stream: (run.ok ? "stdout" : "stderr") as "stdout" | "stderr",
+                  summary: `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`,
+                };
+              }),
+            );
+            for (const { run, stream, summary } of batchRuns) {
+              validationRuns.push(run);
+              onLog?.(stream, summary);
+            }
+            commandIndex += parallelBatch.length;
+            continue;
+          }
+
+          const command = commandsToRun[commandIndex];
+          commandIndex += 1;
+          const commandMissingTools = requirementsForValidationCommand(
+            toolchainPlan,
             command,
-            missingPlaywrightBrowserTargets,
-            resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
-            outputPolicy,
+          ).filter((requirement) =>
+            missingToolRequirements.some((missing) => missing.tool === requirement.tool),
           );
-          if (!browserPreflight.ok) {
-            const digest = extractValidationFailureDigest(browserPreflight);
+          if (commandMissingTools.length > 0) {
+            const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
+              commandMissingTools,
+            )}.`;
             validationRuns.push({
-              ...browserPreflight,
-              stderr: [
-                `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
-                browserPreflight.stderr,
-              ]
-                .filter(Boolean)
-                .join("\n"),
+              step: command,
+              command,
+              ok: false,
+              exitCode: 127,
+              stdout: "",
+              stderr,
+              elapsedMs: 1,
             });
             onLog?.(
               "stderr",
-              `[ValidationGate] Browser runtime preflight failed for "${command}"${digest ? ` - ${digest}` : ""}`,
+              `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
             );
             continue;
           }
-          for (const target of missingPlaywrightBrowserTargets) {
-            playwrightBrowserRuntimeReadyTargets.add(target);
-          }
-          onLog?.(
-            "stdout",
-            `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
-          );
-          commandBrowserRuntimeEnsured = true;
-        }
-        const previousDigest = validationRetryState?.previousFailureDigests?.get(
-          validationCommandKey(command),
-        );
-        if (
-          previousDigest &&
-          Number(validationRetryState?.revisionAttempt ?? 0) > 0 &&
-          isLongRunningBrowserValidationCommand(command) &&
-          isBrowserValidationInfrastructureDigest(previousDigest) &&
-          !commandBrowserRuntimeEnsured
-        ) {
-          const stderr =
-            `Skipped repeated browser validation after the same command failed in an earlier revision: ${previousDigest}. ` +
-            "Run it once after the underlying blocker changes.";
-          validationRuns.push({
-            step: command,
+          const deferredReason = shouldDeferLongValidationAfterFastFailures(
             command,
-            ok: false,
-            exitCode: 124,
-            stdout: "",
-            stderr,
-            elapsedMs: 1,
-          });
-          onLog?.(
-            "stderr",
-            `[ValidationGate] Skipped repeated long browser validation: ${command} (${previousDigest})`,
+            validationRuns,
           );
-          continue;
-        }
-        onLog?.("stdout", `[ValidationGate] Running "${command}"`);
-        let run = await runValidationCommand(
-          repo,
-          command,
-          resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
-          outputPolicy,
-        );
-        const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
-        if (shouldRetryBrowserValidationRunOnce(run)) {
-          onLog?.(
-            "stderr",
-            `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+          if (deferredReason) {
+            const stderr =
+              `Skipped long validation command because ${deferredReason}. ` +
+              "Fix the deterministic fast validation blocker first; PushPals will run long browser/e2e validation after the fast layer is clean.";
+            validationRuns.push({
+              step: command,
+              command,
+              ok: false,
+              exitCode: 125,
+              stdout: "",
+              stderr,
+              elapsedMs: 1,
+            });
+            onLog?.(
+              "stderr",
+              `[ValidationGate] Deferred long validation after fast failure: ${command} (${deferredReason})`,
+            );
+            continue;
+          }
+          const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(
+            repo,
+            command,
           );
-          const retryRun = await runValidationCommand(
+          const playwrightBrowserTargets = commandNeedsPlaywrightBrowserRuntime
+            ? inferPlaywrightBrowserInstallTargets(repo, command)
+            : [];
+          const missingPlaywrightBrowserTargets = playwrightBrowserTargets.filter(
+            (target) => !playwrightBrowserRuntimeReadyTargets.has(target),
+          );
+          let commandBrowserRuntimeEnsured =
+            commandNeedsPlaywrightBrowserRuntime && missingPlaywrightBrowserTargets.length === 0;
+          if (missingPlaywrightBrowserTargets.length > 0) {
+            const browserEnv = buildWorkerSandboxWritableEnv(repo);
+            onLog?.(
+              "stdout",
+              `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
+            );
+            const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
+              repo,
+              command,
+              missingPlaywrightBrowserTargets,
+              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+              outputPolicy,
+            );
+            if (!browserPreflight.ok) {
+              const digest = extractValidationFailureDigest(browserPreflight);
+              validationRuns.push({
+                ...browserPreflight,
+                stderr: [
+                  `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
+                  browserPreflight.stderr,
+                ]
+                  .filter(Boolean)
+                  .join("\n"),
+              });
+              onLog?.(
+                "stderr",
+                `[ValidationGate] Browser runtime preflight failed for "${command}"${digest ? ` - ${digest}` : ""}`,
+              );
+              continue;
+            }
+            for (const target of missingPlaywrightBrowserTargets) {
+              playwrightBrowserRuntimeReadyTargets.add(target);
+            }
+            onLog?.(
+              "stdout",
+              `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
+            );
+            commandBrowserRuntimeEnsured = true;
+          }
+          const previousDigest = validationRetryState?.previousFailureDigests?.get(
+            validationCommandKey(command),
+          );
+          if (
+            previousDigest &&
+            Number(validationRetryState?.revisionAttempt ?? 0) > 0 &&
+            isLongRunningBrowserValidationCommand(command) &&
+            isBrowserValidationInfrastructureDigest(previousDigest) &&
+            !commandBrowserRuntimeEnsured
+          ) {
+            const stderr =
+              `Skipped repeated browser validation after the same command failed in an earlier revision: ${previousDigest}. ` +
+              "Run it once after the underlying blocker changes.";
+            validationRuns.push({
+              step: command,
+              command,
+              ok: false,
+              exitCode: 124,
+              stdout: "",
+              stderr,
+              elapsedMs: 1,
+            });
+            onLog?.(
+              "stderr",
+              `[ValidationGate] Skipped repeated long browser validation: ${command} (${previousDigest})`,
+            );
+            continue;
+          }
+          onLog?.("stdout", `[ValidationGate] Running "${command}"`);
+          let run = await runValidationCommand(
             repo,
             command,
             resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
             outputPolicy,
           );
-          if (!retryRun.ok && firstDigest) {
-            retryRun.stderr = [
-              `Previous browser validation attempt failed before retry: ${firstDigest}`,
-              retryRun.stderr,
-            ]
-              .filter(Boolean)
-              .join("\n");
+          const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
+          if (shouldRetryBrowserValidationRunOnce(run)) {
+            onLog?.(
+              "stderr",
+              `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+            );
+            const retryRun = await runValidationCommand(
+              repo,
+              command,
+              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+              outputPolicy,
+            );
+            if (!retryRun.ok && firstDigest) {
+              retryRun.stderr = [
+                `Previous browser validation attempt failed before retry: ${firstDigest}`,
+                retryRun.stderr,
+              ]
+                .filter(Boolean)
+                .join("\n");
+            }
+            run = retryRun;
           }
-          run = retryRun;
+          validationRuns.push(run);
+          const digest = run.ok ? "" : extractValidationFailureDigest(run);
+          const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`;
+          onLog?.(run.ok ? "stdout" : "stderr", runSummary);
         }
-        validationRuns.push(run);
-        const digest = run.ok ? "" : extractValidationFailureDigest(run);
-        const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`;
-        onLog?.(run.ok ? "stdout" : "stderr", runSummary);
       }
       // exit 127 = command not found: separate tool-availability issues from real test failures.
       const notFoundRuns = validationRuns.filter((run) => run.exitCode === 127);
@@ -9045,16 +9103,15 @@ export async function executeJob(
       jobElapsedMs: Date.now() - jobStartedAt,
       executionBudgetMs,
     });
-    const browserValidationContinuation =
-      browserValidationRepairContinuationBudgetDecision({
-        browserRepairPacket:
-          validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode
-            ? null
-            : browserRepairPacket,
-        validationOutsideTaskScope,
-        changedPaths: quality.changedPaths,
-        revisionBudget,
-      });
+    const browserValidationContinuation = browserValidationRepairContinuationBudgetDecision({
+      browserRepairPacket:
+        validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode
+          ? null
+          : browserRepairPacket,
+      validationOutsideTaskScope,
+      changedPaths: quality.changedPaths,
+      revisionBudget,
+    });
     const repoValidationContinuation = repoValidationRepairContinuationBudgetDecision({
       repoValidationRepairMode,
       changedPaths: quality.changedPaths,
@@ -9180,9 +9237,7 @@ export async function executeJob(
       reviewFixContext,
       validationOutsideTaskScopeBlocksOnly ? [] : quality.validationRuns,
       validationOutsideTaskScopeBlocksOnly ? null : quality.blocker,
-      validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode
-        ? null
-        : browserRepairPacket,
+      validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? null : browserRepairPacket,
       quality.changedPaths,
       validationRemedyHints,
       repoValidationRepairMode,

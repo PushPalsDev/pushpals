@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  buildBunDependencyLayoutPreflightFailureRun,
   classifyValidationFailureScope,
   collectPrePublishHygieneIssues,
   collectWriteScopeIssuesFromChangedPaths,
@@ -25,6 +26,7 @@ import {
   prepareValidationCommandArgv,
   prepareValidationSpawnArgv,
   resolveBunDependencyLayoutPreflight,
+  resolveBunDependencyLayoutPreflightTimeoutMs,
   resolveValidationCommandTimeoutMs,
   runValidationArgv,
   sanitizePlannerWorkerInstructionPathHints,
@@ -125,9 +127,7 @@ describe("workerpals validation command safety", () => {
     expect(formatBunTestPathArg("app/__tests__/battlefieldReadability.test.tsx")).toBe(
       "./app/__tests__/battlefieldReadability.test.tsx",
     );
-    expect(formatBunTestPathArg("tests/my smoke.test.ts")).toBe(
-      '"./tests/my smoke.test.ts"',
-    );
+    expect(formatBunTestPathArg("tests/my smoke.test.ts")).toBe('"./tests/my smoke.test.ts"');
     expect(formatBunTestPathArg("./tests/example.test.ts")).toBe("./tests/example.test.ts");
     expect(formatBunTestPathArg("../outside/example.test.ts")).toBe("../outside/example.test.ts");
   });
@@ -597,7 +597,10 @@ describe("workerpals validation command safety", () => {
     try {
       mkdirSync(join(root, "app"), { recursive: true });
       mkdirSync(join(root, "tests"), { recursive: true });
-      writeFileSync(join(root, "app", "_layout.tsx"), "export default function Layout() { return null; }\n");
+      writeFileSync(
+        join(root, "app", "_layout.tsx"),
+        "export default function Layout() { return null; }\n",
+      );
       writeFileSync(join(root, "tests", "reactNativeMock.js"), "export const View = 'View';\n");
 
       const sanitized = sanitizeTaskExecutePlanningPathHints(
@@ -718,10 +721,7 @@ describe("workerpals validation command safety", () => {
       }
 
       expect(
-        resolveBunDependencyLayoutPreflight(root, [
-          "bun x tsc --noEmit",
-          "bun run lint",
-        ])?.reason,
+        resolveBunDependencyLayoutPreflight(root, ["bun x tsc --noEmit", "bun run lint"])?.reason,
       ).toContain("node_modules/.bin is missing");
 
       mkdirSync(join(root, "node_modules", ".bin"), { recursive: true });
@@ -729,26 +729,17 @@ describe("workerpals validation command safety", () => {
         writeFileSync(join(root, "node_modules", ".bin", binName), "", "utf8");
       }
       expect(
-        resolveBunDependencyLayoutPreflight(root, [
-          "bun x tsc --noEmit",
-          "bun run lint",
-        ]),
+        resolveBunDependencyLayoutPreflight(root, ["bun x tsc --noEmit", "bun run lint"]),
       ).toBeNull();
 
       rmSync(join(root, "node_modules", ".bin", "eslint"), { force: true });
       expect(
-        resolveBunDependencyLayoutPreflight(root, [
-          "bun x tsc --noEmit",
-          "bun run lint",
-        ])?.reason,
+        resolveBunDependencyLayoutPreflight(root, ["bun x tsc --noEmit", "bun run lint"])?.reason,
       ).toContain("eslint");
 
       rmSync(join(root, "node_modules", "typescript"), { recursive: true, force: true });
       expect(
-        resolveBunDependencyLayoutPreflight(root, [
-          "bun x tsc --noEmit",
-          "bun run lint",
-        ])?.reason,
+        resolveBunDependencyLayoutPreflight(root, ["bun x tsc --noEmit", "bun run lint"])?.reason,
       ).toContain("typescript");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -800,6 +791,36 @@ describe("workerpals validation command safety", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("blocks validation on dependency preflight repair failure", () => {
+    expect(resolveBunDependencyLayoutPreflightTimeoutMs(10_000)).toBe(30_000);
+    expect(resolveBunDependencyLayoutPreflightTimeoutMs(180_000)).toBe(180_000);
+    expect(resolveBunDependencyLayoutPreflightTimeoutMs(900_000)).toBe(300_000);
+
+    const run = buildBunDependencyLayoutPreflightFailureRun({
+      validationCommand: "bun test",
+      validationCommands: ["bun test", "bun run lint"],
+      preflightCommand: "bun install --offline --frozen-lockfile --ignore-scripts",
+      preflightReason: "node_modules/.bin is missing for Bun validation commands",
+      run: {
+        step: "bun install --offline --frozen-lockfile --ignore-scripts",
+        command: "bun install --offline --frozen-lockfile --ignore-scripts",
+        ok: false,
+        exitCode: 124,
+        stdout: "",
+        stderr: "Validation command timed out after 180000ms.",
+        elapsedMs: 180_000,
+      },
+    });
+
+    expect(run.command).toBe("bun test");
+    expect(run.exitCode).toBe(124);
+    expect(run.stderr).toContain("Dependency layout preflight failed before validation command");
+    expect(run.stderr).toContain("node_modules/.bin is missing");
+    expect(collectRequiredValidationFailures(["bun test", "bun run lint"], [run])[0]).toContain(
+      "Dependency layout preflight failed",
+    );
   });
 
   test("returns a validation failure when a command executable cannot start", async () => {
@@ -954,9 +975,7 @@ describe("workerpals validation command safety", () => {
       expect(shouldEnsurePlaywrightBrowserRuntime(root, "bun run web:e2e")).toBe(true);
       expect(shouldEnsurePlaywrightBrowserRuntime(root, "bun test")).toBe(false);
       expect(playwrightBrowserInstallArgv()).toEqual(["bunx", "playwright", "install", "chromium"]);
-      expect(inferPlaywrightBrowserInstallTargets(root, "bun run web:e2e")).toEqual([
-        "chromium",
-      ]);
+      expect(inferPlaywrightBrowserInstallTargets(root, "bun run web:e2e")).toEqual(["chromium"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
