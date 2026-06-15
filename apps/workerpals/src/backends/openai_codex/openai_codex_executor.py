@@ -2059,8 +2059,54 @@ def _merge_usage_records(first: Any, second: Any) -> Dict[str, Any]:
 
 
 def _is_publishable_changed_path(path: str) -> bool:
-    normalized = str(path or "").replace("\\", "/").lower()
+    normalized = str(path or "").replace("\\", "/").strip().strip("/").lower()
+    if re.search(
+        r"^microsoft/windows/powershell/(moduleanalysiscache|psreadline(/|$))",
+        normalized,
+    ):
+        return False
     return not re.search(r"(^|/)(outputs|node_modules|\.worktrees|\.codex|dist|build|coverage)(/|$)", normalized)
+
+
+def _expand_known_artifact_directory_paths(repo: str, paths: List[str]) -> List[str]:
+    expanded: List[str] = []
+    seen: set[str] = set()
+    repo_root = Path(repo).resolve()
+
+    def add(path: str) -> None:
+        normalized = str(path or "").replace("\\", "/").strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        expanded.append(normalized)
+
+    for raw_path in paths:
+        normalized = str(raw_path or "").replace("\\", "/").strip().strip("/")
+        if normalized.lower() != "microsoft":
+            add(str(raw_path or ""))
+            continue
+
+        power_shell_root = repo_root / "Microsoft" / "Windows" / "PowerShell"
+        known_artifacts: List[Path] = []
+        module_cache = power_shell_root / "ModuleAnalysisCache"
+        if module_cache.exists():
+            known_artifacts.append(module_cache)
+        psreadline_root = power_shell_root / "PSReadLine"
+        if psreadline_root.exists():
+            try:
+                known_artifacts.extend(path for path in psreadline_root.rglob("*") if path.is_file())
+            except Exception:
+                pass
+        if not known_artifacts:
+            add(str(raw_path or ""))
+            continue
+        for artifact in sorted(known_artifacts):
+            try:
+                add(artifact.relative_to(repo_root).as_posix())
+            except Exception:
+                add(str(raw_path or ""))
+
+    return expanded
 
 
 def _filesystem_fingerprint(repo: str, raw_path: str) -> str:
@@ -2133,7 +2179,10 @@ def _changed_path_fingerprint(repo: str, path: str) -> str:
 
 
 def _capture_git_change_snapshot(repo: str) -> Dict[str, str]:
-    return {path: _changed_path_fingerprint(repo, path) for path in summarize_git_changes(repo)}
+    return {
+        path: _changed_path_fingerprint(repo, path)
+        for path in _expand_known_artifact_directory_paths(repo, summarize_git_changes(repo))
+    }
 
 
 def _normalize_baseline_snapshot(repo: str, baseline_changes: Any) -> Dict[str, str]:
@@ -2153,7 +2202,7 @@ def _normalize_baseline_snapshot(repo: str, baseline_changes: Any) -> Dict[str, 
 
 
 def _codex_changed_paths(repo: str, baseline_snapshot: Any) -> Tuple[List[str], List[str], List[str]]:
-    changed_paths = summarize_git_changes(repo)
+    changed_paths = _expand_known_artifact_directory_paths(repo, summarize_git_changes(repo))
     delta = _paths_changed_after_baseline(repo, changed_paths, baseline_snapshot)
     effective = [p for p in delta if _is_publishable_changed_path(p)]
     return changed_paths, delta, effective

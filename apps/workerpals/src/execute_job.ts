@@ -209,12 +209,15 @@ const QUALITY_MIN_REVISION_BUDGET_MS = 120_000;
 const QUALITY_MAX_REVISION_BUDGET_MS = 420_000;
 const QUALITY_REVISION_BUDGET_RATIO = 0.25;
 
-export function qualityRevisionLoopUpperBound(policy: {
-  maxAutoRevisions: number;
-  validationMaxAutoRevisions: number;
-}, opts: {
-  browserValidation?: boolean;
-} = {}): number {
+export function qualityRevisionLoopUpperBound(
+  policy: {
+    maxAutoRevisions: number;
+    validationMaxAutoRevisions: number;
+  },
+  opts: {
+    browserValidation?: boolean;
+  } = {},
+): number {
   return Math.max(
     policy.maxAutoRevisions,
     policy.validationMaxAutoRevisions,
@@ -399,7 +402,11 @@ export function workerAttemptRolloutScore(params: {
     score -= Math.min(20, failedFast * 8);
     reasons.push("fast_validation_failed");
   }
-  if (params.validationRuns.some((run) => run.ok && isLongRunningBrowserValidationCommand(run.command))) {
+  if (
+    params.validationRuns.some(
+      (run) => run.ok && isLongRunningBrowserValidationCommand(run.command),
+    )
+  ) {
     score += 15;
     reasons.push("long_validation_passed");
   }
@@ -595,9 +602,7 @@ function buildDiffBudgetWarning(
   changedPaths: string[],
   focusedBrowserRepair: boolean,
 ): string | null {
-  const meaningfulChangedPaths = changedPaths.filter(
-    (path) => !/(^|\/)(outputs|node_modules|\.worktrees|dist|build|coverage)(\/|$)/i.test(path),
-  );
+  const meaningfulChangedPaths = changedPaths.filter((path) => !isNonPublishableArtifactPath(path));
   if (meaningfulChangedPaths.length === 0) return null;
   const explicitBudget = Number(planning.scope.maxFilesToEdit);
   const hasExplicitBudget = Number.isFinite(explicitBudget) && explicitBudget > 0;
@@ -616,13 +621,25 @@ function buildDiffBudgetWarning(
 }
 
 function isNonPublishableArtifactPath(path: string): boolean {
+  const normalized = path
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+  if (
+    /^Microsoft\/Windows\/PowerShell\/(?:ModuleAnalysisCache|PSReadLine(?:\/|$))/i.test(normalized)
+  ) {
+    return true;
+  }
   return /(^|\/)(outputs|node_modules|\.worktrees|\.codex|dist|build|coverage)(\/|$)/i.test(
-    path.replace(/\\/g, "/"),
+    normalized,
   );
 }
 
 function isNestedNodeModulesChange(path: string): boolean {
-  const normalized = path.replace(/\\/g, "/").replace(/^\.?\//, "").replace(/\/+$/, "");
+  const normalized = path
+    .replace(/\\/g, "/")
+    .replace(/^\.?\//, "")
+    .replace(/\/+$/, "");
   return /(^|\/)node_modules\/.+/i.test(normalized);
 }
 
@@ -630,7 +647,10 @@ export function publishableChangedPaths(changedPaths: string[]): string[] {
   return changedPaths.filter((path) => !isNonPublishableArtifactPath(path));
 }
 
-function compactDiagnosticText(value: unknown, maxChars = MAX_DIAGNOSTIC_TEXT_CHARS): string | null {
+function compactDiagnosticText(
+  value: unknown,
+  maxChars = MAX_DIAGNOSTIC_TEXT_CHARS,
+): string | null {
   const text = String(value ?? "").replace(/\s+$/g, "");
   if (!text.trim()) return null;
   return text.length <= maxChars ? text : text.slice(Math.max(0, text.length - maxChars));
@@ -640,7 +660,10 @@ function diagnosticPathSample(paths: string[], limit = MAX_DIAGNOSTIC_PATH_SAMPL
   const out: string[] = [];
   const seen = new Set<string>();
   for (const raw of paths) {
-    const path = String(raw ?? "").replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+    const path = String(raw ?? "")
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "")
+      .trim();
     if (!path || seen.has(path)) continue;
     seen.add(path);
     out.push(path);
@@ -652,7 +675,10 @@ function diagnosticPathSample(paths: string[], limit = MAX_DIAGNOSTIC_PATH_SAMPL
 function diagnosticTopLevelDirs(paths: string[]): string[] {
   const seen = new Set<string>();
   for (const path of paths) {
-    const normalized = String(path ?? "").replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
+    const normalized = String(path ?? "")
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "")
+      .trim();
     if (!normalized) continue;
     const top = normalized.includes("/") ? normalized.split("/", 1)[0] : normalized;
     if (top) seen.add(top);
@@ -691,7 +717,11 @@ function classifyValidationRunFailure(run: ValidationExecutionResult): string | 
   if (/browser|playwright|cypress|locator|page\.|screenshot|web:e2e/.test(combined)) {
     return "browser_validation";
   }
-  if (/cannot find module|import error|does not provide an export|no exported member|mock/.test(combined)) {
+  if (
+    /cannot find module|import error|does not provide an export|no exported member|mock/.test(
+      combined,
+    )
+  ) {
     return "test_harness";
   }
   return "nonzero_exit";
@@ -715,13 +745,16 @@ function buildValidationRunDiagnostics(
 
 function inferTerminalFailureClass(result: JobResult, changedPaths: string[]): string {
   if (result.ok) return "success";
-  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  const text =
+    `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
   const publishableCount = publishableChangedPaths(changedPaths).length;
   if (text.includes("stalled before first response") || text.includes("startup stall")) {
     return "codex_startup_stall";
   }
-  if (changedPaths.length > 0 && publishableCount === 0) return "artifact_only_no_publishable_patch";
-  if (result.exitCode === 124 || text.includes("timed out") || text.includes("timeout")) return "timeout";
+  if (changedPaths.length > 0 && publishableCount === 0)
+    return "artifact_only_no_publishable_patch";
+  if (result.exitCode === 124 || text.includes("timed out") || text.includes("timeout"))
+    return "timeout";
   if (text.includes("validationgate") || text.includes("validation")) return "validation";
   if (text.includes("scopegate") || text.includes("scope")) return "scope";
   if (text.includes("criticgate") || text.includes("critic")) return "critic";
@@ -744,7 +777,10 @@ function inferTerminalStage(result: JobResult, fallback: string): string {
   return fallback;
 }
 
-function mergeJobDiagnostics(base: JobDiagnostics | undefined, extra: JobDiagnostics): JobDiagnostics {
+function mergeJobDiagnostics(
+  base: JobDiagnostics | undefined,
+  extra: JobDiagnostics,
+): JobDiagnostics {
   return {
     ...(base ?? {}),
     ...extra,
@@ -850,9 +886,7 @@ function buildBroadSharedMockWarning(
   planning: TaskExecutePlanning,
   changedPaths: string[],
 ): string | null {
-  const meaningfulChangedPaths = changedPaths.filter(
-    (path) => !/(^|\/)(outputs|node_modules|\.worktrees|dist|build|coverage)(\/|$)/i.test(path),
-  );
+  const meaningfulChangedPaths = changedPaths.filter((path) => !isNonPublishableArtifactPath(path));
   const broadMockPaths = meaningfulChangedPaths.filter((path) =>
     /(^|\/)(__mocks__|tests\/.*mock|test.*mock|reactNativeMock|setupTests?|jest\.|vitest\.|mock)(\.|\/|$)/i.test(
       path,
@@ -986,8 +1020,10 @@ export function extractReviewFixContext(
   if (!resolutionType && !looksLikeLegacyReviewFix) return null;
   return {
     resolutionType: "review_fix",
-    prHeadRef: typeof reviewAgent.prHeadRef === "string" ? reviewAgent.prHeadRef.trim() || null : null,
-    prBaseRef: typeof reviewAgent.prBaseRef === "string" ? reviewAgent.prBaseRef.trim() || null : null,
+    prHeadRef:
+      typeof reviewAgent.prHeadRef === "string" ? reviewAgent.prHeadRef.trim() || null : null,
+    prBaseRef:
+      typeof reviewAgent.prBaseRef === "string" ? reviewAgent.prBaseRef.trim() || null : null,
     previousReviewScore: toFiniteReviewScore(reviewAgent.previousReviewScore),
     reviewThreshold: toFiniteReviewScore(reviewAgent.reviewThreshold),
     previousReviewSummary: String(reviewAgent.previousReviewSummary ?? "").trim(),
@@ -1055,22 +1091,22 @@ export function deriveQualityGatePolicy(
     const mergeConflict = extractMergeConflictReviewContext(params);
     if (mergeConflict) {
       return {
-      mode: "merge_conflict",
+        mode: "merge_conflict",
+        maxAutoRevisions: baseMaxAutoRevisions,
+        validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
+        ...gateSwitches,
+        softPassOnExhausted: baseSoftPassOnExhausted,
+        criticMinScore: baseCriticMinScore,
+      };
+    }
+    return {
+      mode: "default",
       maxAutoRevisions: baseMaxAutoRevisions,
       validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
       ...gateSwitches,
       softPassOnExhausted: baseSoftPassOnExhausted,
       criticMinScore: baseCriticMinScore,
     };
-  }
-  return {
-    mode: "default",
-    maxAutoRevisions: baseMaxAutoRevisions,
-    validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
-    ...gateSwitches,
-    softPassOnExhausted: baseSoftPassOnExhausted,
-    criticMinScore: baseCriticMinScore,
-  };
   }
   const tightenedCriticMinScore =
     reviewFix.reviewThreshold != null
@@ -1232,9 +1268,7 @@ export function tokenizeValidationCommandArgv(command: string): string[] | null 
   return out;
 }
 
-async function terminateValidationProcessTree(
-  proc: ReturnType<typeof Bun.spawn>,
-): Promise<void> {
+async function terminateValidationProcessTree(proc: ReturnType<typeof Bun.spawn>): Promise<void> {
   const pid = Number(proc.pid);
   if (process.platform === "win32" && Number.isFinite(pid) && pid > 0) {
     try {
@@ -1416,10 +1450,7 @@ export async function runValidationArgv(
       exitCode: 127,
       stdout: "",
       stderr: compactJobOutput(
-        [
-          `Validation command could not start executable "${spawnArgv[0] ?? ""}".`,
-          detail,
-        ]
+        [`Validation command could not start executable "${spawnArgv[0] ?? ""}".`, detail]
           .filter(Boolean)
           .join("\n"),
         outputPolicy,
@@ -1498,7 +1529,7 @@ export async function runValidationArgv(
         ? 1
         : exitOrTimeout.type === "success-signal"
           ? 0
-        : exitOrTimeout.code;
+          : exitOrTimeout.code;
 
   if (!timedOut && !stoppedAfterFailureSignal && !stoppedAfterSuccessSignal) {
     await Promise.race([
@@ -1513,10 +1544,7 @@ export async function runValidationArgv(
     await Promise.all([stdoutCapture.cancel(), stderrCapture.cancel()]);
   }
 
-  await Promise.race([
-    Promise.all([stdoutCapture.promise, stderrCapture.promise]),
-    Bun.sleep(500),
-  ]);
+  await Promise.race([Promise.all([stdoutCapture.promise, stderrCapture.promise]), Bun.sleep(500)]);
 
   return {
     step: command,
@@ -1805,7 +1833,9 @@ export function inferPlaywrightBrowserInstallTargets(repo: string, command: stri
   for (const match of text.matchAll(/\bbrowserName\s*:\s*["'`]([^"'`]+)["'`]/gi)) {
     addPlaywrightInstallTarget(targets, match[1] ?? "");
   }
-  for (const match of text.matchAll(/(?:^|\s)(?:--browser|--browser-name|--channel)[=\s]+["'`]?([A-Za-z0-9_-]+)/gi)) {
+  for (const match of text.matchAll(
+    /(?:^|\s)(?:--browser|--browser-name|--channel)[=\s]+["'`]?([A-Za-z0-9_-]+)/gi,
+  )) {
     addPlaywrightInstallTarget(targets, match[1] ?? "");
   }
   for (const target of PLAYWRIGHT_BROWSER_INSTALL_TARGETS) {
@@ -1823,8 +1853,15 @@ export function inferPlaywrightBrowserInstallTargets(repo: string, command: stri
 }
 
 export function playwrightBrowserInstallArgv(targets: string[] = ["chromium"]): string[] {
-  const installTargets = Array.from(new Set(targets.map((target) => target.trim()).filter(Boolean)));
-  return ["bunx", "playwright", "install", ...(installTargets.length > 0 ? installTargets : ["chromium"])];
+  const installTargets = Array.from(
+    new Set(targets.map((target) => target.trim()).filter(Boolean)),
+  );
+  return [
+    "bunx",
+    "playwright",
+    "install",
+    ...(installTargets.length > 0 ? installTargets : ["chromium"]),
+  ];
 }
 
 async function runPlaywrightBrowserRuntimePreflight(
@@ -1893,10 +1930,7 @@ function isBunxCommandToken(value: string): boolean {
   return leaf === "bunx" || leaf === "bunx.exe" || leaf === "bunx.cmd" || leaf === "bunx.bat";
 }
 
-export function prepareValidationSpawnArgv(
-  argv: string[],
-  env: Record<string, string>,
-): string[] {
+export function prepareValidationSpawnArgv(argv: string[], env: Record<string, string>): string[] {
   const first = argv[0] ?? "";
   if (!first) return argv;
   const bunBin = resolveBunExecutableFromEnv(env);
@@ -1956,14 +1990,17 @@ async function checkToolCandidate(
       stderr: "pipe",
     });
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill();
-      } catch {
-        // ignore
-      }
-    }, Math.max(1_000, timeoutMs));
+    const timer = setTimeout(
+      () => {
+        timedOut = true;
+        try {
+          proc.kill();
+        } catch {
+          // ignore
+        }
+      },
+      Math.max(1_000, timeoutMs),
+    );
     try {
       const [exitCode] = await Promise.all([
         proc.exited,
@@ -2021,14 +2058,20 @@ function formatMissingToolRequirements(requirements: ToolRequirement[]): string 
 
 function extractPreparedMergeConflictPaths(params: Record<string, unknown>): string[] {
   const reviewAgent =
-    params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent)
+    params.reviewAgent &&
+    typeof params.reviewAgent === "object" &&
+    !Array.isArray(params.reviewAgent)
       ? (params.reviewAgent as Record<string, unknown>)
       : null;
   const preparedPaths = Array.isArray(reviewAgent?.preparedConflictPaths)
     ? reviewAgent.preparedConflictPaths
     : [];
   return preparedPaths
-    .map((entry) => String(entry ?? "").trim().replace(/\\/g, "/"))
+    .map((entry) =>
+      String(entry ?? "")
+        .trim()
+        .replace(/\\/g, "/"),
+    )
     .filter(Boolean);
 }
 
@@ -2057,24 +2100,33 @@ function extractPathTokensFromValidationOutput(value: string): string[] {
     out.push(normalized);
   };
   const normalized = stripAnsiControlSequences(value);
-  for (const match of normalized.matchAll(/[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+(?:\.[A-Za-z0-9_.-]+)?/g)) {
+  for (const match of normalized.matchAll(
+    /[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+(?:\.[A-Za-z0-9_.-]+)?/g,
+  )) {
     add(match[0]);
   }
-  for (const match of normalized.matchAll(/(?:from|in|at)\s+['"`]?([^'"`\s]+\/[^'"`\s]+)['"`]?/gi)) {
+  for (const match of normalized.matchAll(
+    /(?:from|in|at)\s+['"`]?([^'"`\s]+\/[^'"`\s]+)['"`]?/gi,
+  )) {
     add(match[1]);
   }
   return out;
 }
 
 function literalScopePrefix(value: string): string | null {
-  const normalized = normalizeValidationPathToken(value.replace(/\*\*?.*$/, "").replace(/\/+$/, ""));
+  const normalized = normalizeValidationPathToken(
+    value.replace(/\*\*?.*$/, "").replace(/\/+$/, ""),
+  );
   if (!normalized || normalized === ".") return null;
   return normalized;
 }
 
 function pathMatchesScopeHint(path: string, hint: string): boolean {
   const normalizedPath = normalizeValidationPathToken(path);
-  const normalizedHint = hint.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
+  const normalizedHint = hint
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "");
   if (!normalizedPath || !normalizedHint) return false;
   if (matchesGlob(normalizedPath, normalizedHint)) return true;
   const prefix = literalScopePrefix(normalizedHint);
@@ -2083,7 +2135,10 @@ function pathMatchesScopeHint(path: string, hint: string): boolean {
 }
 
 function isValidationScopeTestPathHint(path: string): boolean {
-  const normalized = path.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
+  const normalized = path
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "");
   return /(^|\/)(__tests__|tests?)(\/|$)|\.(test|spec)\.[cm]?[jt]sx?$/i.test(normalized);
 }
 
@@ -2103,12 +2158,16 @@ function shouldTreatBrowserAssertionAsTaskScope(
   const allHintsAreTests =
     pathHints.length > 0 && pathHints.every((hint) => isValidationScopeTestPathHint(hint));
   const planningText = collectPlanningText(planning);
-  const explicitlyBrowserValidation =
-    /\b(browser|web:e2e|e2e|playwright|smoke)\b/i.test(planningText);
+  const explicitlyBrowserValidation = /\b(browser|web:e2e|e2e|playwright|smoke)\b/i.test(
+    planningText,
+  );
   if (allHintsAreTests && !explicitlyBrowserValidation) return false;
 
   const productPathChanged = changedPaths.some((path) => {
-    const normalized = path.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
+    const normalized = path
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "");
     return (
       !isValidationScopeTestPathHint(normalized) &&
       /^(app|components|screens|styles|utils)\//i.test(normalized)
@@ -2303,6 +2362,52 @@ function parseChangedPathsFromStatus(statusOutput: string): string[] {
   return out;
 }
 
+export function expandKnownArtifactDirectoryPaths(repo: string, paths: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const addPath = (rawPath: string) => {
+    const path = String(rawPath ?? "")
+      .replace(/\\/g, "/")
+      .trim();
+    if (!path || seen.has(path)) return;
+    seen.add(path);
+    out.push(path);
+  };
+
+  for (const rawPath of paths) {
+    const normalized = String(rawPath ?? "")
+      .replace(/\\/g, "/")
+      .trim()
+      .replace(/\/+$/, "");
+    if (normalized.toLowerCase() !== "microsoft") {
+      addPath(rawPath);
+      continue;
+    }
+
+    const powerShellRoot = resolve(repo, "Microsoft", "Windows", "PowerShell");
+    const knownArtifacts: string[] = [];
+    const moduleCache = resolve(powerShellRoot, "ModuleAnalysisCache");
+    if (existsSync(moduleCache))
+      knownArtifacts.push("Microsoft/Windows/PowerShell/ModuleAnalysisCache");
+    const psReadLineRoot = resolve(powerShellRoot, "PSReadLine");
+    if (existsSync(psReadLineRoot)) {
+      for (const entry of readdirSync(psReadLineRoot, { withFileTypes: true })) {
+        if (entry.isFile()) {
+          knownArtifacts.push(`Microsoft/Windows/PowerShell/PSReadLine/${entry.name}`);
+        }
+      }
+    }
+
+    if (knownArtifacts.length === 0) {
+      addPath(rawPath);
+      continue;
+    }
+    for (const artifact of knownArtifacts.sort()) addPath(artifact);
+  }
+
+  return out;
+}
+
 export function isAssertionCoverageTestPath(path: string): boolean {
   const normalized = path.replace(/\\/g, "/").toLowerCase();
   return (
@@ -2428,7 +2533,9 @@ export function extractValidationFailureDigest(run: {
     .find((line) => /\b(error|failed|cannot|could not|timeout|timed out)\b/i.test(line));
   if (firstMeaningfulLine) return toSingleLine(firstMeaningfulLine, 180);
   if (Number(run.exitCode) === 124) {
-    const elapsed = Number.isFinite(Number(run.elapsedMs)) ? ` after ${Number(run.elapsedMs)}ms` : "";
+    const elapsed = Number.isFinite(Number(run.elapsedMs))
+      ? ` after ${Number(run.elapsedMs)}ms`
+      : "";
     return `timed out${elapsed}`;
   }
   return "";
@@ -2450,7 +2557,11 @@ function classifyBrowserValidationFailureKindFromText(text: string): BrowserVali
   ) {
     return "startup";
   }
-  if (/\b(page\.[a-z0-9_]+:\s+net::ERR_[A-Z0-9_]+|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b/i.test(combined)) {
+  if (
+    /\b(page\.[a-z0-9_]+:\s+net::ERR_[A-Z0-9_]+|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b/i.test(
+      combined,
+    )
+  ) {
     return "network";
   }
   if (isBrowserAssertionDigest(combined)) {
@@ -2523,17 +2634,25 @@ function inferBrowserValidationFailureFocus(params: {
   if (!combined.trim()) return null;
 
   const focusRules: Array<[RegExp, string]> = [
-    [/\b(settings|ui[-\s]?size|scale(?:\s+option)?|settings-ui-|large ui option|medium|compact)\b/i, "settings UI size"],
+    [
+      /\b(settings|ui[-\s]?size|scale(?:\s+option)?|settings-ui-|large ui option|medium|compact)\b/i,
+      "settings UI size",
+    ],
     [/\b(shop|skin|ship-option|projectile-option)\b/i, "shop navigation"],
     [/\b(home|shell|home-screen|home-play|play button|landing)\b/i, "home shell"],
     [/\b(match[-\s]?entry|start match|game-screen|countdown)\b/i, "match entry"],
-    [/\b(in[-\s]?game|game-control|help-menu|planet|deploy|allocation|resource|decoy|attack|defense|tank)\b/i, "in-game UI"],
+    [
+      /\b(in[-\s]?game|game-control|help-menu|planet|deploy|allocation|resource|decoy|attack|defense|tank)\b/i,
+      "in-game UI",
+    ],
   ];
   for (const [pattern, label] of focusRules) {
     if (pattern.test(combined)) return label;
   }
 
-  const stableLocatorMatch = combined.match(/\b(?:getbytestid|data-testid|testid)\(?['"`]?([a-z0-9_-]+)/i);
+  const stableLocatorMatch = combined.match(
+    /\b(?:getbytestid|data-testid|testid)\(?['"`]?([a-z0-9_-]+)/i,
+  );
   if (stableLocatorMatch?.[1]) return `test id ${stableLocatorMatch[1]}`;
 
   const compact = combined
@@ -2546,7 +2665,8 @@ function inferBrowserValidationFailureFocus(params: {
 }
 
 function extractBalancedLocatorCall(text: string): string | null {
-  const callPattern = /\b(?:getBy(?:TestId|Role|Text|Label|Placeholder|Title)|locator\.[a-z0-9_]+|page\.[a-z0-9_]+)\(/gi;
+  const callPattern =
+    /\b(?:getBy(?:TestId|Role|Text|Label|Placeholder|Title)|locator\.[a-z0-9_]+|page\.[a-z0-9_]+)\(/gi;
   let match: RegExpExecArray | null;
   while ((match = callPattern.exec(text)) != null) {
     let depth = 0;
@@ -2742,7 +2862,9 @@ function summarizeBrowserValidationOutput(text: string): string {
 }
 
 function lastBrowserVerifiedStage(text: string): string | null {
-  const verifiedStages = [...stripAnsiControlSequences(text).matchAll(/\bVerified:\s+([^|\r\n]+)/gi)]
+  const verifiedStages = [
+    ...stripAnsiControlSequences(text).matchAll(/\bVerified:\s+([^|\r\n]+)/gi),
+  ]
     .map((match) => match[1]?.trim())
     .filter((entry): entry is string => Boolean(entry));
   const lastVerified = verifiedStages.at(-1);
@@ -2857,16 +2979,21 @@ function browserFailureSuggestedRemedy(packet: BrowserValidationRepairPacket): s
 }
 
 function normalizeFailureMemoryToken(value: string | null | undefined): string {
-  return toSingleLine(value ?? "", 120).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return toSingleLine(value ?? "", 120)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 export function buildTaskFailureJobFamily(params: Record<string, unknown>): string {
-  const planning = params.planning && typeof params.planning === "object"
-    ? (params.planning as Partial<TaskExecutePlanning>)
-    : {};
-  const autonomy = params.autonomy && typeof params.autonomy === "object"
-    ? (params.autonomy as Record<string, unknown>)
-    : {};
+  const planning =
+    params.planning && typeof params.planning === "object"
+      ? (params.planning as Partial<TaskExecutePlanning>)
+      : {};
+  const autonomy =
+    params.autonomy && typeof params.autonomy === "object"
+      ? (params.autonomy as Record<string, unknown>)
+      : {};
   const targetHints = [
     ...(Array.isArray(planning.targetPaths) ? planning.targetPaths : []),
     ...(Array.isArray(planning.scope?.writeGlobs) ? planning.scope.writeGlobs : []),
@@ -2876,7 +3003,9 @@ export function buildTaskFailureJobFamily(params: Record<string, unknown>): stri
     .map((entry) => normalizeFailureMemoryToken(String(entry)))
     .filter(Boolean)
     .slice(0, 8);
-  const area = normalizeFailureMemoryToken(String(autonomy.componentArea ?? autonomy.component_area ?? ""));
+  const area = normalizeFailureMemoryToken(
+    String(autonomy.componentArea ?? autonomy.component_area ?? ""),
+  );
   const intent = normalizeFailureMemoryToken(String(planning.intent ?? ""));
   return [area, intent, ...targetHints].filter(Boolean).join("|") || "general";
 }
@@ -2931,7 +3060,9 @@ function readBrowserFailureMemory(repo: string): BrowserFailureMemoryEntry[] {
     const parsed = JSON.parse(readFileSync(memoryPath, "utf8")) as { entries?: unknown };
     if (!Array.isArray(parsed.entries)) return [];
     return parsed.entries
-      .filter((entry): entry is BrowserFailureMemoryEntry => Boolean(entry && typeof entry === "object"))
+      .filter((entry): entry is BrowserFailureMemoryEntry =>
+        Boolean(entry && typeof entry === "object"),
+      )
       .slice(0, 80);
   } catch {
     return [];
@@ -2946,9 +3077,11 @@ export function knownFailureHintsForPacket(
   const entries = readBrowserFailureMemory(repo)
     .filter((entry) => {
       if (entry.jobFamily !== jobFamily) return false;
-      if (validationCommandKey(entry.command) !== validationCommandKey(packet.command)) return false;
+      if (validationCommandKey(entry.command) !== validationCommandKey(packet.command))
+        return false;
       if (entry.failureKind !== packet.failureKind) return false;
-      if (packet.failureFocus && entry.failureFocus && packet.failureFocus !== entry.failureFocus) return false;
+      if (packet.failureFocus && entry.failureFocus && packet.failureFocus !== entry.failureFocus)
+        return false;
       if (packet.stage && entry.stage && packet.stage !== entry.stage) return false;
       return true;
     })
@@ -3000,9 +3133,7 @@ export function recordBrowserFailureMemory(
       suggestedRemedy: browserFailureSuggestedRemedy(packet),
     });
   }
-  const next = entries
-    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))
-    .slice(0, 80);
+  const next = entries.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)).slice(0, 80);
   try {
     mkdirSync(resolve(memoryPath, ".."), { recursive: true });
     writeFileSync(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}\n`);
@@ -3014,13 +3145,24 @@ export function recordBrowserFailureMemory(
 function classifyValidationFailureForRemedy(run: ValidationExecutionResult): string {
   const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
   if (isLongRunningBrowserValidationCommand(run.command)) return "browser";
-  if (/\bCannot find module\b|\bmodule not found\b|\bfailed to resolve import\b|\bcould not resolve\b/i.test(combined)) {
+  if (
+    /\bCannot find module\b|\bmodule not found\b|\bfailed to resolve import\b|\bcould not resolve\b/i.test(
+      combined,
+    )
+  ) {
     return "module-resolution";
   }
-  if (/\bTS\d{4}\b|\btype error\b|\bno exported member\b|\bdoes not exist on type\b|\bis not assignable to\b/i.test(combined)) {
+  if (
+    /\bTS\d{4}\b|\btype error\b|\bno exported member\b|\bdoes not exist on type\b|\bis not assignable to\b/i.test(
+      combined,
+    )
+  ) {
     return "typecheck";
   }
-  if (/\bESLint\b|\beslint\b|\blint\b/i.test(run.command) || /\berror:\s+"eslint"\s+exited/i.test(combined)) {
+  if (
+    /\bESLint\b|\beslint\b|\blint\b/i.test(run.command) ||
+    /\berror:\s+"eslint"\s+exited/i.test(combined)
+  ) {
     return "lint";
   }
   if (/\bNo such file or directory\b|\bENOENT\b|\bpath does not exist\b/i.test(combined)) {
@@ -3083,7 +3225,9 @@ export function knownValidationRemedyHintsForRuns(
   jobFamily: string,
   runs: ValidationExecutionResult[],
 ): string[] {
-  const failed = runs.filter((run) => !run.ok && !isLongRunningBrowserValidationCommand(run.command));
+  const failed = runs.filter(
+    (run) => !run.ok && !isLongRunningBrowserValidationCommand(run.command),
+  );
   if (failed.length === 0) return [];
   const entries = readValidationRemedyMemory(repo);
   const hints: string[] = [];
@@ -3116,7 +3260,9 @@ export function recordValidationRemedyMemory(
   jobFamily: string,
   runs: ValidationExecutionResult[],
 ): void {
-  const failed = runs.filter((run) => !run.ok && !isLongRunningBrowserValidationCommand(run.command));
+  const failed = runs.filter(
+    (run) => !run.ok && !isLongRunningBrowserValidationCommand(run.command),
+  );
   if (failed.length === 0) return;
   const memoryPath = resolveRemedyMemoryPath(repo);
   const now = new Date().toISOString();
@@ -3143,9 +3289,7 @@ export function recordValidationRemedyMemory(
       });
     }
   }
-  const next = entries
-    .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt))
-    .slice(0, 120);
+  const next = entries.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)).slice(0, 120);
   try {
     mkdirSync(resolve(memoryPath, ".."), { recursive: true });
     writeFileSync(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}\n`);
@@ -3223,8 +3367,12 @@ export function buildBrowserValidationRepairPacket(
       enrichedBrowserContext,
     );
     const previousStage = previousDigest ? extractBrowserValidationStage(previousDigest) : null;
-    const previousSelector = previousDigest ? extractBrowserValidationSelector(previousDigest) : null;
-    const previousExpected = previousDigest ? extractBrowserValidationExpectedUi(previousDigest) : null;
+    const previousSelector = previousDigest
+      ? extractBrowserValidationSelector(previousDigest)
+      : null;
+    const previousExpected = previousDigest
+      ? extractBrowserValidationExpectedUi(previousDigest)
+      : null;
     const failureFocus = inferBrowserValidationFailureFocus({
       stage,
       selector,
@@ -3246,14 +3394,8 @@ export function buildBrowserValidationRepairPacket(
           failureFocus === previousFailureFocus &&
           (!selector || !previousSelector || selector === previousSelector)));
     const progress =
-      previousDigest == null
-        ? "first_failure"
-        : sameFailureSignal
-          ? "same_failure"
-          : "new_failure";
-    const needsDiagnosticProbe =
-      failureKind === "assertion" &&
-      sameFailureSignal;
+      previousDigest == null ? "first_failure" : sameFailureSignal ? "same_failure" : "new_failure";
+    const needsDiagnosticProbe = failureKind === "assertion" && sameFailureSignal;
     const artifacts = mergeBrowserValidationArtifacts(
       extractBrowserValidationArtifacts(combined),
       collectRecentBrowserValidationArtifacts(repo),
@@ -3284,10 +3426,7 @@ export function buildBrowserValidationRepairPacket(
       artifacts,
       artifactSummaries,
       knownFailureHints: knownFailureHints.slice(0, 3),
-      output: [
-        summarizeBrowserValidationOutput(combined) || digest,
-        recentLogSummary,
-      ]
+      output: [summarizeBrowserValidationOutput(combined) || digest, recentLogSummary]
         .filter(Boolean)
         .join(" | "),
     };
@@ -3335,10 +3474,7 @@ function loadRequiredValidationStepsFromVision(repo: string): string[] {
   }
 }
 
-function resolveRequiredValidationSteps(
-  repo: string,
-  planning: TaskExecutePlanning,
-): string[] {
+function resolveRequiredValidationSteps(repo: string, planning: TaskExecutePlanning): string[] {
   return dedupeValidationCommands(
     runnableValidationCommandsFromSteps(planning.requiredValidationSteps),
     loadRequiredValidationStepsFromVision(repo),
@@ -3485,7 +3621,9 @@ export function inferFallbackValidationCommandsForTestTask(
 }
 
 export function formatBunTestPathArg(path: string): string {
-  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
+  const normalized = String(path ?? "")
+    .replace(/\\/g, "/")
+    .trim();
   if (!normalized) return normalized;
   const pathArg =
     normalized.startsWith("./") ||
@@ -3594,7 +3732,10 @@ export function collectPrePublishHygieneIssues(params: {
 
   if (
     changedPathSet.has(".gitignore") &&
-    !changedPathMentionsGuidance(/\b(gitignore|ignore file|node_modules|dependency cache)\b/i, guidance)
+    !changedPathMentionsGuidance(
+      /\b(gitignore|ignore file|node_modules|dependency cache)\b/i,
+      guidance,
+    )
   ) {
     issues.push(
       "modified .gitignore without task or reviewer guidance requesting ignore-policy changes.",
@@ -3610,7 +3751,10 @@ export function collectPrePublishHygieneIssues(params: {
         return false;
       }
     });
-    const explicitlyRequested = changedPathMentionsGuidance(/reactnativemock|react native mock/i, guidance);
+    const explicitlyRequested = changedPathMentionsGuidance(
+      /reactnativemock|react native mock/i,
+      guidance,
+    );
     if (!hasConsumerInChangedTests && !explicitlyRequested) {
       issues.push(
         "changed tests/reactNativeMock.ts without a changed test importing it or explicit reviewer guidance.",
@@ -3619,7 +3763,9 @@ export function collectPrePublishHygieneIssues(params: {
   }
 
   if (changedPaths.some((path) => isNestedNodeModulesChange(path))) {
-    issues.push("attempted to publish node_modules changes; dependency installs must not become PR content.");
+    issues.push(
+      "attempted to publish node_modules changes; dependency installs must not become PR content.",
+    );
   }
 
   return Array.from(new Set(issues));
@@ -3711,7 +3857,9 @@ async function runDeterministicQualityGate(
   }
 
   const statusResult = await git(repo, ["status", "--porcelain"]);
-  const changedPaths = statusResult.ok ? parseChangedPathsFromStatus(statusResult.stdout) : [];
+  const changedPaths = statusResult.ok
+    ? expandKnownArtifactDirectoryPaths(repo, parseChangedPathsFromStatus(statusResult.stdout))
+    : [];
   const preparedMergeConflictPaths = extractPreparedMergeConflictPaths(params);
   const changedTestPaths = Array.from(
     new Set(
@@ -3776,20 +3924,16 @@ async function runDeterministicQualityGate(
     );
   }
 
-  const {
-    commandsToRun,
-    requiredRunnableSteps,
-    plannerRunnableSteps,
-    fallbackValidationSteps,
-  } = collectQualityGateValidationCommands({
-    instruction,
-    targetPath,
-    planning,
-    changedTestPaths,
-    isTestTask,
-    repo,
-    changedPaths,
-  });
+  const { commandsToRun, requiredRunnableSteps, plannerRunnableSteps, fallbackValidationSteps } =
+    collectQualityGateValidationCommands({
+      instruction,
+      targetPath,
+      planning,
+      changedTestPaths,
+      isTestTask,
+      repo,
+      changedPaths,
+    });
   const validationRuns: ValidationExecutionResult[] = [];
   const outputPolicy = outputPolicyForRuntime(runtimeConfig);
   const qualityValidationStepTimeoutMs = (() => {
@@ -3799,313 +3943,309 @@ async function runDeterministicQualityGate(
   })();
   let requiredValidationFailures: string[] = [];
   if (qualityGatePolicy.validationGateEnabled) {
-  if (hasRequiredValidationCriteria && requiredRunnableSteps.length === 0) {
-    addValidationIssue(
-      "found vision.md testing criteria, but none contained a runnable validation command.",
-    );
-  }
-  if (commandsToRun.length === 0) {
-    addValidationIssue(
-      hasRequiredValidationCriteria
-        ? "found no runnable validation command from vision.md testing criteria or planning.validationSteps."
-        : "found no runnable validation command in planning.validationSteps (expected at least one test command).",
-    );
-  } else {
-    if (requiredRunnableSteps.length > 0) {
-      onLog?.(
-        "stdout",
-        `[ValidationGate] Running required vision.md testing criteria: ${requiredRunnableSteps.join(" | ")}`,
+    if (hasRequiredValidationCriteria && requiredRunnableSteps.length === 0) {
+      addValidationIssue(
+        "found vision.md testing criteria, but none contained a runnable validation command.",
       );
     }
-    if (isTestTask && plannerRunnableSteps.length === 0 && fallbackValidationSteps.length > 0) {
-      onLog?.(
-        "stdout",
-        `[ValidationGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
+    if (commandsToRun.length === 0) {
+      addValidationIssue(
+        hasRequiredValidationCriteria
+          ? "found no runnable validation command from vision.md testing criteria or planning.validationSteps."
+          : "found no runnable validation command in planning.validationSteps (expected at least one test command).",
       );
-    }
-    const toolchainPlan = buildToolchainPlan({
-      repoRoot: repo,
-      validationCommands: commandsToRun,
-    });
-    if (toolchainPlan.requirements.length > 0) {
-      onLog?.(
-        "stdout",
-        `[ValidationGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements
-          .map((requirement) => requirement.tool)
-          .join(", ")}`,
-      );
-    }
-    const toolAvailability = await checkToolAvailability(
-      toolchainPlan.requirements,
-      buildWorkerSandboxWritableEnv(repo),
-    );
-    const missingToolRequirements = toolAvailability
-      .filter((entry) => !entry.ok)
-      .map((entry) => entry.requirement);
-    if (missingToolRequirements.length > 0) {
-      onLog?.(
-        "stderr",
-        `[ValidationGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(
-          missingToolRequirements,
-        )}`,
-      );
-    }
-    const playwrightBrowserRuntimeReadyTargets = new Set<string>();
-    for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
-      const parallelBatch: string[] = [];
-      while (
-        commandIndex + parallelBatch.length < commandsToRun.length &&
-        parallelBatch.length < 3
-      ) {
-        const candidate = commandsToRun[commandIndex + parallelBatch.length];
-        if (!isParallelSafeFastValidationCommand(repo, candidate)) break;
-        parallelBatch.push(candidate);
-      }
-      if (parallelBatch.length > 1) {
+    } else {
+      if (requiredRunnableSteps.length > 0) {
         onLog?.(
           "stdout",
-          `[ValidationGate] Running fast validation batch in parallel: ${parallelBatch.join(" | ")}`,
+          `[ValidationGate] Running required vision.md testing criteria: ${requiredRunnableSteps.join(" | ")}`,
         );
-        const batchRuns = await Promise.all(
-          parallelBatch.map(async (command) => {
-            const commandMissingTools = requirementsForValidationCommand(
-              toolchainPlan,
-              command,
-            ).filter((requirement) =>
-              missingToolRequirements.some((missing) => missing.tool === requirement.tool),
-            );
-            if (commandMissingTools.length > 0) {
-              const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
-                commandMissingTools,
-              )}.`;
-              return {
-                run: {
-                  step: command,
-                  command,
-                  ok: false,
-                  exitCode: 127,
-                  stdout: "",
-                  stderr,
-                  elapsedMs: 1,
-                } satisfies ValidationExecutionResult,
-                stream: "stderr" as const,
-                summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
-              };
-            }
-            const run = await runValidationCommand(
-              repo,
-              command,
-              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
-              outputPolicy,
-            );
-            const digest = run.ok ? "" : extractValidationFailureDigest(run);
-            return {
-              run,
-              stream: (run.ok ? "stdout" : "stderr") as "stdout" | "stderr",
-              summary: `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`,
-            };
-          }),
+      }
+      if (isTestTask && plannerRunnableSteps.length === 0 && fallbackValidationSteps.length > 0) {
+        onLog?.(
+          "stdout",
+          `[ValidationGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
         );
-        for (const { run, stream, summary } of batchRuns) {
-          validationRuns.push(run);
-          onLog?.(stream, summary);
+      }
+      const toolchainPlan = buildToolchainPlan({
+        repoRoot: repo,
+        validationCommands: commandsToRun,
+      });
+      if (toolchainPlan.requirements.length > 0) {
+        onLog?.(
+          "stdout",
+          `[ValidationGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements
+            .map((requirement) => requirement.tool)
+            .join(", ")}`,
+        );
+      }
+      const toolAvailability = await checkToolAvailability(
+        toolchainPlan.requirements,
+        buildWorkerSandboxWritableEnv(repo),
+      );
+      const missingToolRequirements = toolAvailability
+        .filter((entry) => !entry.ok)
+        .map((entry) => entry.requirement);
+      if (missingToolRequirements.length > 0) {
+        onLog?.(
+          "stderr",
+          `[ValidationGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(
+            missingToolRequirements,
+          )}`,
+        );
+      }
+      const playwrightBrowserRuntimeReadyTargets = new Set<string>();
+      for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
+        const parallelBatch: string[] = [];
+        while (
+          commandIndex + parallelBatch.length < commandsToRun.length &&
+          parallelBatch.length < 3
+        ) {
+          const candidate = commandsToRun[commandIndex + parallelBatch.length];
+          if (!isParallelSafeFastValidationCommand(repo, candidate)) break;
+          parallelBatch.push(candidate);
         }
-        commandIndex += parallelBatch.length;
-        continue;
-      }
+        if (parallelBatch.length > 1) {
+          onLog?.(
+            "stdout",
+            `[ValidationGate] Running fast validation batch in parallel: ${parallelBatch.join(" | ")}`,
+          );
+          const batchRuns = await Promise.all(
+            parallelBatch.map(async (command) => {
+              const commandMissingTools = requirementsForValidationCommand(
+                toolchainPlan,
+                command,
+              ).filter((requirement) =>
+                missingToolRequirements.some((missing) => missing.tool === requirement.tool),
+              );
+              if (commandMissingTools.length > 0) {
+                const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
+                  commandMissingTools,
+                )}.`;
+                return {
+                  run: {
+                    step: command,
+                    command,
+                    ok: false,
+                    exitCode: 127,
+                    stdout: "",
+                    stderr,
+                    elapsedMs: 1,
+                  } satisfies ValidationExecutionResult,
+                  stream: "stderr" as const,
+                  summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
+                };
+              }
+              const run = await runValidationCommand(
+                repo,
+                command,
+                resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+                outputPolicy,
+              );
+              const digest = run.ok ? "" : extractValidationFailureDigest(run);
+              return {
+                run,
+                stream: (run.ok ? "stdout" : "stderr") as "stdout" | "stderr",
+                summary: `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`,
+              };
+            }),
+          );
+          for (const { run, stream, summary } of batchRuns) {
+            validationRuns.push(run);
+            onLog?.(stream, summary);
+          }
+          commandIndex += parallelBatch.length;
+          continue;
+        }
 
-      const command = commandsToRun[commandIndex];
-      commandIndex += 1;
-      const commandMissingTools = requirementsForValidationCommand(toolchainPlan, command).filter(
-        (requirement) =>
-          missingToolRequirements.some((missing) => missing.tool === requirement.tool),
-      );
-      if (commandMissingTools.length > 0) {
-        const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
-          commandMissingTools,
-        )}.`;
-        validationRuns.push({
-          step: command,
-          command,
-          ok: false,
-          exitCode: 127,
-          stdout: "",
-          stderr,
-          elapsedMs: 1,
-        });
-        onLog?.(
-          "stderr",
-          `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
+        const command = commandsToRun[commandIndex];
+        commandIndex += 1;
+        const commandMissingTools = requirementsForValidationCommand(toolchainPlan, command).filter(
+          (requirement) =>
+            missingToolRequirements.some((missing) => missing.tool === requirement.tool),
         );
-        continue;
-      }
-      const deferredReason = shouldDeferLongValidationAfterFastFailures(command, validationRuns);
-      if (deferredReason) {
-        const stderr =
-          `Skipped long validation command because ${deferredReason}. ` +
-          "Fix the deterministic fast validation blocker first; PushPals will run long browser/e2e validation after the fast layer is clean.";
-        validationRuns.push({
-          step: command,
-          command,
-          ok: false,
-          exitCode: 125,
-          stdout: "",
-          stderr,
-          elapsedMs: 1,
-        });
-        onLog?.(
-          "stderr",
-          `[ValidationGate] Deferred long validation after fast failure: ${command} (${deferredReason})`,
-        );
-        continue;
-      }
-      const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(
-        repo,
-        command,
-      );
-      const playwrightBrowserTargets = commandNeedsPlaywrightBrowserRuntime
-        ? inferPlaywrightBrowserInstallTargets(repo, command)
-        : [];
-      const missingPlaywrightBrowserTargets = playwrightBrowserTargets.filter(
-        (target) => !playwrightBrowserRuntimeReadyTargets.has(target),
-      );
-      let commandBrowserRuntimeEnsured =
-        commandNeedsPlaywrightBrowserRuntime &&
-        missingPlaywrightBrowserTargets.length === 0;
-      if (missingPlaywrightBrowserTargets.length > 0) {
-        const browserEnv = buildWorkerSandboxWritableEnv(repo);
-        onLog?.(
-          "stdout",
-          `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
-        );
-        const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
-          repo,
-          command,
-          missingPlaywrightBrowserTargets,
-          resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
-          outputPolicy,
-        );
-        if (!browserPreflight.ok) {
-          const digest = extractValidationFailureDigest(browserPreflight);
+        if (commandMissingTools.length > 0) {
+          const stderr = `Validation skipped before execution because required tool(s) are missing: ${formatMissingToolRequirements(
+            commandMissingTools,
+          )}.`;
           validationRuns.push({
-            ...browserPreflight,
-            stderr: [
-              `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
-              browserPreflight.stderr,
-            ]
-              .filter(Boolean)
-              .join("\n"),
+            step: command,
+            command,
+            ok: false,
+            exitCode: 127,
+            stdout: "",
+            stderr,
+            elapsedMs: 1,
+          });
+          onLog?.("stderr", `[ValidationGate] Validation skipped (missing toolchain): ${command}`);
+          continue;
+        }
+        const deferredReason = shouldDeferLongValidationAfterFastFailures(command, validationRuns);
+        if (deferredReason) {
+          const stderr =
+            `Skipped long validation command because ${deferredReason}. ` +
+            "Fix the deterministic fast validation blocker first; PushPals will run long browser/e2e validation after the fast layer is clean.";
+          validationRuns.push({
+            step: command,
+            command,
+            ok: false,
+            exitCode: 125,
+            stdout: "",
+            stderr,
+            elapsedMs: 1,
           });
           onLog?.(
             "stderr",
-            `[ValidationGate] Browser runtime preflight failed for "${command}"${digest ? ` - ${digest}` : ""}`,
+            `[ValidationGate] Deferred long validation after fast failure: ${command} (${deferredReason})`,
           );
           continue;
         }
-        for (const target of missingPlaywrightBrowserTargets) {
-          playwrightBrowserRuntimeReadyTargets.add(target);
-        }
-        onLog?.(
-          "stdout",
-          `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
-        );
-        commandBrowserRuntimeEnsured = true;
-      }
-      const previousDigest = validationRetryState?.previousFailureDigests?.get(
-        validationCommandKey(command),
-      );
-      if (
-        previousDigest &&
-        Number(validationRetryState?.revisionAttempt ?? 0) > 0 &&
-        isLongRunningBrowserValidationCommand(command) &&
-        isBrowserValidationInfrastructureDigest(previousDigest) &&
-        !commandBrowserRuntimeEnsured
-      ) {
-        const stderr =
-          `Skipped repeated browser validation after the same command failed in an earlier revision: ${previousDigest}. ` +
-          "Run it once after the underlying blocker changes.";
-        validationRuns.push({
-          step: command,
+        const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(
+          repo,
           command,
-          ok: false,
-          exitCode: 124,
-          stdout: "",
-          stderr,
-          elapsedMs: 1,
-        });
-        onLog?.(
-          "stderr",
-          `[ValidationGate] Skipped repeated long browser validation: ${command} (${previousDigest})`,
         );
-        continue;
-      }
-      onLog?.("stdout", `[ValidationGate] Running "${command}"`);
-      let run = await runValidationCommand(
-        repo,
-        command,
-        resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
-        outputPolicy,
-      );
-      const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
-      if (shouldRetryBrowserValidationRunOnce(run)) {
-        onLog?.(
-          "stderr",
-          `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+        const playwrightBrowserTargets = commandNeedsPlaywrightBrowserRuntime
+          ? inferPlaywrightBrowserInstallTargets(repo, command)
+          : [];
+        const missingPlaywrightBrowserTargets = playwrightBrowserTargets.filter(
+          (target) => !playwrightBrowserRuntimeReadyTargets.has(target),
         );
-        const retryRun = await runValidationCommand(
+        let commandBrowserRuntimeEnsured =
+          commandNeedsPlaywrightBrowserRuntime && missingPlaywrightBrowserTargets.length === 0;
+        if (missingPlaywrightBrowserTargets.length > 0) {
+          const browserEnv = buildWorkerSandboxWritableEnv(repo);
+          onLog?.(
+            "stdout",
+            `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
+          );
+          const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
+            repo,
+            command,
+            missingPlaywrightBrowserTargets,
+            resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+            outputPolicy,
+          );
+          if (!browserPreflight.ok) {
+            const digest = extractValidationFailureDigest(browserPreflight);
+            validationRuns.push({
+              ...browserPreflight,
+              stderr: [
+                `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
+                browserPreflight.stderr,
+              ]
+                .filter(Boolean)
+                .join("\n"),
+            });
+            onLog?.(
+              "stderr",
+              `[ValidationGate] Browser runtime preflight failed for "${command}"${digest ? ` - ${digest}` : ""}`,
+            );
+            continue;
+          }
+          for (const target of missingPlaywrightBrowserTargets) {
+            playwrightBrowserRuntimeReadyTargets.add(target);
+          }
+          onLog?.(
+            "stdout",
+            `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
+          );
+          commandBrowserRuntimeEnsured = true;
+        }
+        const previousDigest = validationRetryState?.previousFailureDigests?.get(
+          validationCommandKey(command),
+        );
+        if (
+          previousDigest &&
+          Number(validationRetryState?.revisionAttempt ?? 0) > 0 &&
+          isLongRunningBrowserValidationCommand(command) &&
+          isBrowserValidationInfrastructureDigest(previousDigest) &&
+          !commandBrowserRuntimeEnsured
+        ) {
+          const stderr =
+            `Skipped repeated browser validation after the same command failed in an earlier revision: ${previousDigest}. ` +
+            "Run it once after the underlying blocker changes.";
+          validationRuns.push({
+            step: command,
+            command,
+            ok: false,
+            exitCode: 124,
+            stdout: "",
+            stderr,
+            elapsedMs: 1,
+          });
+          onLog?.(
+            "stderr",
+            `[ValidationGate] Skipped repeated long browser validation: ${command} (${previousDigest})`,
+          );
+          continue;
+        }
+        onLog?.("stdout", `[ValidationGate] Running "${command}"`);
+        let run = await runValidationCommand(
           repo,
           command,
           resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
           outputPolicy,
         );
-        if (!retryRun.ok && firstDigest) {
-          retryRun.stderr = [
-            `Previous browser validation attempt failed before retry: ${firstDigest}`,
-            retryRun.stderr,
-          ]
-            .filter(Boolean)
-            .join("\n");
+        const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
+        if (shouldRetryBrowserValidationRunOnce(run)) {
+          onLog?.(
+            "stderr",
+            `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+          );
+          const retryRun = await runValidationCommand(
+            repo,
+            command,
+            resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+            outputPolicy,
+          );
+          if (!retryRun.ok && firstDigest) {
+            retryRun.stderr = [
+              `Previous browser validation attempt failed before retry: ${firstDigest}`,
+              retryRun.stderr,
+            ]
+              .filter(Boolean)
+              .join("\n");
+          }
+          run = retryRun;
         }
-        run = retryRun;
+        validationRuns.push(run);
+        const digest = run.ok ? "" : extractValidationFailureDigest(run);
+        const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`;
+        onLog?.(run.ok ? "stdout" : "stderr", runSummary);
       }
-      validationRuns.push(run);
-      const digest = run.ok ? "" : extractValidationFailureDigest(run);
-      const runSummary = `[ValidationGate] ${run.ok ? "Passed" : "Failed"} (${run.elapsedMs}ms, exit ${run.exitCode}): ${command}${digest ? ` - ${digest}` : ""}`;
-      onLog?.(run.ok ? "stdout" : "stderr", runSummary);
+      // exit 127 = command not found: separate tool-availability issues from real test failures.
+      const notFoundRuns = validationRuns.filter((run) => run.exitCode === 127);
+      const executedRuns = validationRuns.filter((run) => run.exitCode !== 127);
+      if (notFoundRuns.length > 0) {
+        const cmds = notFoundRuns.map((run) => run.command).join(", ");
+        onLog?.(
+          "stderr",
+          `[ValidationGate] Some validation commands not found (exit 127 - wrong tool?): ${cmds}. This project uses Bun: prefer "bun test".`,
+        );
+      }
+      if (executedRuns.length > 0 && executedRuns.every((run) => !run.ok)) {
+        addValidationIssue("executed validation commands, but none passed.");
+      } else if (executedRuns.length === 0 && notFoundRuns.length > 0) {
+        addValidationIssue(
+          'could not run any validation command (command not found). Use "bun test" or another available test runner.',
+        );
+      }
+      if (
+        isTestTask &&
+        !validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))
+      ) {
+        addValidationIssue("did not execute a recognizable test command.");
+      }
     }
-    // exit 127 = command not found: separate tool-availability issues from real test failures.
-    const notFoundRuns = validationRuns.filter((run) => run.exitCode === 127);
-    const executedRuns = validationRuns.filter((run) => run.exitCode !== 127);
-    if (notFoundRuns.length > 0) {
-      const cmds = notFoundRuns.map((run) => run.command).join(", ");
-      onLog?.(
-        "stderr",
-        `[ValidationGate] Some validation commands not found (exit 127 - wrong tool?): ${cmds}. This project uses Bun: prefer "bun test".`,
-      );
-    }
-    if (executedRuns.length > 0 && executedRuns.every((run) => !run.ok)) {
-      addValidationIssue("executed validation commands, but none passed.");
-    } else if (executedRuns.length === 0 && notFoundRuns.length > 0) {
-      addValidationIssue(
-        'could not run any validation command (command not found). Use "bun test" or another available test runner.',
-      );
-    }
-    if (
-      isTestTask &&
-      !validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))
-    ) {
-      addValidationIssue("did not execute a recognizable test command.");
-    }
-  }
-  requiredValidationFailures = collectRequiredValidationFailures(
-    requiredRunnableSteps,
-    validationRuns,
-  );
-  if (requiredValidationFailures.length > 0) {
-    addValidationIssue(
-      `Required vision.md validation failed: ${requiredValidationFailures.join("; ")}`,
+    requiredValidationFailures = collectRequiredValidationFailures(
+      requiredRunnableSteps,
+      validationRuns,
     );
-  }
+    if (requiredValidationFailures.length > 0) {
+      addValidationIssue(
+        `Required vision.md validation failed: ${requiredValidationFailures.join("; ")}`,
+      );
+    }
   }
   const blocker = qualityGatePolicy.validationGateEnabled
     ? detectValidationBlocker(validationRuns)
@@ -4154,10 +4294,7 @@ function resolveQualityCriticTimeoutBehavior(
   return "retry_once";
 }
 
-function resolveQualityCriticModel(
-  runtimeConfig: WorkerpalsRuntimeConfig,
-  fallback = "",
-): string {
+function resolveQualityCriticModel(runtimeConfig: WorkerpalsRuntimeConfig, fallback = ""): string {
   return String(runtimeConfig.workerpals.qualityCriticModel ?? "").trim() || fallback.trim();
 }
 
@@ -4189,13 +4326,9 @@ function buildCriticValidationSummary(
     quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
   return quality.validationRuns
     .map((run) => {
-      const output =
-        allPassed
-          ? ""
-          : [run.stdout, run.stderr]
-              .filter(Boolean)
-              .join("\n")
-              .slice(0, maxValidationOutputChars);
+      const output = allPassed
+        ? ""
+        : [run.stdout, run.stderr].filter(Boolean).join("\n").slice(0, maxValidationOutputChars);
       return [
         `Command: ${run.command}`,
         `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
@@ -4557,7 +4690,9 @@ export function buildQualityRevisionHint(
         browserRepairPacket.progress === "same_failure"
           ? "same failure repeated for this command"
           : "new failure for this command after the previous revision";
-      lines.push(`- Breadcrumb: ${breadcrumb}; previous failure was ${browserRepairPacket.previousDigest}`);
+      lines.push(
+        `- Breadcrumb: ${breadcrumb}; previous failure was ${browserRepairPacket.previousDigest}`,
+      );
       if (
         browserRepairPacket.previousStage ||
         browserRepairPacket.previousExpected ||
@@ -4663,7 +4798,9 @@ export function buildQualityRevisionHint(
         lines.push(`- ${finding}`);
       }
     }
-    lines.push("Raise the score above the approval threshold without reopening already accepted behavior.");
+    lines.push(
+      "Raise the score above the approval threshold without reopening already accepted behavior.",
+    );
   }
   if (issues.length > 0) {
     const displayedIssues = focusedBrowserRepair
@@ -4701,7 +4838,9 @@ export function buildQualityRevisionHint(
   if (failedValidationRuns.length > 0) {
     lines.push("Validation failure diagnostics:");
     const runsToShow = browserRepairPacket
-      ? failedValidationRuns.filter((run) => run.command === browserRepairPacket.command).slice(0, 1)
+      ? failedValidationRuns
+          .filter((run) => run.command === browserRepairPacket.command)
+          .slice(0, 1)
       : failedValidationRuns.slice(0, 5);
     for (const run of runsToShow) {
       lines.push(`- ${run.command} failed with exit ${run.exitCode} after ${run.elapsedMs}ms.`);
@@ -5813,7 +5952,9 @@ async function gitDirPath(repo: string): Promise<string | null> {
   return resolve(repo, gitDir);
 }
 
-async function activeGitOperation(repo: string): Promise<"rebase" | "merge" | "cherry-pick" | null> {
+async function activeGitOperation(
+  repo: string,
+): Promise<"rebase" | "merge" | "cherry-pick" | null> {
   const gitDir = await gitDirPath(repo);
   if (!gitDir) return null;
   if (existsSync(resolve(gitDir, "rebase-merge")) || existsSync(resolve(gitDir, "rebase-apply"))) {
@@ -6115,7 +6256,10 @@ async function createMergeConflictJobCommit(
       result = await git(repo, ["add", "-A"]);
     }
     if (!result.ok) {
-      return { ok: false, error: `Failed to stage merge-conflict changes: ${result.stderr || result.stdout}` };
+      return {
+        ok: false,
+        error: `Failed to stage merge-conflict changes: ${result.stderr || result.stdout}`,
+      };
     }
   }
   const unstageArtifacts = await unstageSandboxArtifactPaths(repo);
@@ -6173,7 +6317,10 @@ async function createMergeConflictJobCommit(
     }
     headSha = await currentRefSha(repo, "HEAD");
     if (!headSha) {
-      return { ok: false, error: `Failed to resolve committed HEAD SHA for merge-conflict job ${job.id}.` };
+      return {
+        ok: false,
+        error: `Failed to resolve committed HEAD SHA for merge-conflict job ${job.id}.`,
+      };
     }
   }
 
@@ -6625,9 +6772,7 @@ export function resolveCommitMessageGeneratorTimeoutMs(
     llmConfig.commit_message_timeout_ms ??
     Bun.env.WORKERPALS_COMMIT_MESSAGE_TIMEOUT_MS;
   const configured = Number(configuredRaw);
-  const value = Number.isFinite(configured)
-    ? configured
-    : COMMIT_MSG_GENERATOR_DEFAULT_TIMEOUT_MS;
+  const value = Number.isFinite(configured) ? configured : COMMIT_MSG_GENERATOR_DEFAULT_TIMEOUT_MS;
   return Math.max(
     COMMIT_MSG_GENERATOR_MIN_TIMEOUT_MS,
     Math.min(COMMIT_MSG_GENERATOR_MAX_TIMEOUT_MS, Math.floor(value)),
@@ -6770,7 +6915,10 @@ async function generateCommitMessageFromDiffViaHttp(
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), resolveCommitMessageGeneratorTimeoutMs(runtimeConfig));
+  const timer = setTimeout(
+    () => controller.abort(),
+    resolveCommitMessageGeneratorTimeoutMs(runtimeConfig),
+  );
   try {
     const response = await fetch(endpoint, {
       method: "POST",
@@ -6971,11 +7119,7 @@ function taskTextAllowsCreatingMissingPaths(value: string): boolean {
   );
 }
 
-function shouldTreatMissingPathHintAsStale(
-  repo: string,
-  path: string,
-  taskText: string,
-): boolean {
+function shouldTreatMissingPathHintAsStale(repo: string, path: string, taskText: string): boolean {
   const normalized = normalizeStagePath(path);
   if (!normalized || normalized === "." || pathHintHasGlob(normalized)) return false;
   if (existsSync(resolve(repo, normalized))) return false;
@@ -7007,7 +7151,9 @@ function sanitizeStalePathHints(
     seen.add(raw.toLowerCase());
     if (shouldTreatMissingPathHintAsStale(repo, raw, taskText)) {
       stale.push(raw);
-      diagnostics.push(`Path hint "${raw}" does not exist in this checkout; treat it as stale unless the task explicitly asks to create it.`);
+      diagnostics.push(
+        `Path hint "${raw}" does not exist in this checkout; treat it as stale unless the task explicitly asks to create it.`,
+      );
       continue;
     }
     if (!pathParentExists(repo, raw) && !taskTextAllowsCreatingMissingPaths(taskText)) {
@@ -7132,7 +7278,10 @@ export function sanitizePlannerWorkerInstructionPathHints(
     return uniqueHints.some((hint) => lower.includes(hint));
   };
   const lines = text.split(/\r?\n/);
-  const kept = lines.filter((line) => !hasStaleHint(line)).map((line) => line.trim()).filter(Boolean);
+  const kept = lines
+    .filter((line) => !hasStaleHint(line))
+    .map((line) => line.trim())
+    .filter(Boolean);
   if (kept.length === lines.length) return text;
 
   return [
@@ -7493,10 +7642,7 @@ async function runCodexCriticReview(
     }
     if (exitCode !== 0) {
       const stderrText = await new Response(proc.stderr).text();
-      onLog?.(
-        "stderr",
-        `[CriticGate] Codex exited ${exitCode}: ${toSingleLine(stderrText, 220)}`,
-      );
+      onLog?.("stderr", `[CriticGate] Codex exited ${exitCode}: ${toSingleLine(stderrText, 220)}`);
       return { status: "done", review: null, payload };
     }
 
@@ -7519,10 +7665,7 @@ async function runCodexCriticReview(
 
     const reviewObj = parseJsonObjectLoose(lastMessage);
     if (!reviewObj) {
-      onLog?.(
-        "stderr",
-        `[CriticGate] Codex returned non-JSON: ${toSingleLine(lastMessage, 220)}`,
-      );
+      onLog?.("stderr", `[CriticGate] Codex returned non-JSON: ${toSingleLine(lastMessage, 220)}`);
       return { status: "done", review: null, payload };
     }
 
@@ -7596,7 +7739,10 @@ async function runCodexCriticReview(
         );
         return criticTimeoutReview("Codex", qualityCriticTimeoutMs, qualityCriticTimeoutMs);
       }
-      onLog?.("stderr", `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; skipping.`);
+      onLog?.(
+        "stderr",
+        `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; skipping.`,
+      );
       return null;
     }
     return attempt.review;
@@ -7651,7 +7797,9 @@ export async function executeJob(
       ? (params.autonomy as Record<string, unknown>)
       : null;
   const reviewAgent =
-    params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent)
+    params.reviewAgent &&
+    typeof params.reviewAgent === "object" &&
+    !Array.isArray(params.reviewAgent)
       ? (params.reviewAgent as Record<string, unknown>)
       : null;
   const planningValidation = validateTaskExecutePlanning(params.planning, {
@@ -7667,7 +7815,11 @@ export async function executeJob(
     };
   }
   const instruction = String(params.instruction ?? "").trim();
-  const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(params.planning, repo, instruction);
+  const sanitizedPlanning = sanitizeTaskExecutePlanningPathHints(
+    params.planning,
+    repo,
+    instruction,
+  );
   const planning = sanitizedPlanning as TaskExecutePlanning;
   if (origin === "autonomy" && toStringArray(planning.scope.writeGlobs ?? []).length === 0) {
     onLog?.(
@@ -7817,7 +7969,9 @@ export async function executeJob(
             ok: false,
             summary: detail,
             stdout: currentResult.stdout,
-            stderr: [currentResult.stderr ?? "", resume.detail ?? detail].filter(Boolean).join("\n"),
+            stderr: [currentResult.stderr ?? "", resume.detail ?? detail]
+              .filter(Boolean)
+              .join("\n"),
             exitCode: 4,
           };
         }
@@ -7835,7 +7989,9 @@ export async function executeJob(
             ok: false,
             summary: detail,
             stdout: currentResult.stdout,
-            stderr: [currentResult.stderr ?? "", resume.detail ?? detail].filter(Boolean).join("\n"),
+            stderr: [currentResult.stderr ?? "", resume.detail ?? detail]
+              .filter(Boolean)
+              .join("\n"),
             exitCode: 4,
           };
         }
@@ -7915,7 +8071,10 @@ export async function executeJob(
 
     const preQualityStatus = await git(repo, ["status", "--porcelain"]);
     const preQualityChangedPaths = preQualityStatus.ok
-      ? parseChangedPathsFromStatus(preQualityStatus.stdout)
+      ? expandKnownArtifactDirectoryPaths(
+          repo,
+          parseChangedPathsFromStatus(preQualityStatus.stdout),
+        )
       : [];
     const preQualityPublishablePaths = publishableChangedPaths(preQualityChangedPaths);
     if (preQualityChangedPaths.length > 0) {
@@ -8026,7 +8185,11 @@ export async function executeJob(
       repo,
     );
     if (browserRepairPacket) {
-      const knownFailureHints = knownFailureHintsForPacket(repo, failureJobFamily, browserRepairPacket);
+      const knownFailureHints = knownFailureHintsForPacket(
+        repo,
+        failureJobFamily,
+        browserRepairPacket,
+      );
       browserRepairPacket = {
         ...browserRepairPacket,
         knownFailureHints,
@@ -8038,8 +8201,7 @@ export async function executeJob(
       const digest = extractValidationFailureRetryDigest(run, repo);
       if (digest) previousValidationFailureDigests.set(validationCommandKey(run.command), digest);
     }
-    const validationOutsideTaskScope =
-      quality.validationFailureScope === "outside_task_scope";
+    const validationOutsideTaskScope = quality.validationFailureScope === "outside_task_scope";
     const qualityForCritic: DeterministicQualityResult = validationOutsideTaskScope
       ? {
           ...quality,

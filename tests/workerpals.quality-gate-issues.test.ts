@@ -8,6 +8,7 @@ import {
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
   buildTaskFailureJobFamily,
+  expandKnownArtifactDirectoryPaths,
   extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
   knownFailureHintsForPacket,
@@ -37,9 +38,26 @@ describe("workerpals quality gate critic issue formatting", () => {
         "outputs/data/runtime.log",
         ".worktrees/job-123/tmp.txt",
         ".codex/session.json",
+        "Microsoft/Windows/PowerShell/ModuleAnalysisCache",
         "tests/playerActionControls.test.ts",
       ]),
     ).toEqual(["components/GameControlPanel.tsx", "tests/playerActionControls.test.ts"]);
+  });
+
+  test("expands Windows PowerShell cache directories before publishable filtering", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-powershell-cache-"));
+    try {
+      const cacheDir = join(tempRoot, "Microsoft", "Windows", "PowerShell");
+      mkdirSync(cacheDir, { recursive: true });
+      writeFileSync(join(cacheDir, "ModuleAnalysisCache"), "cache artifact\n");
+
+      const expanded = expandKnownArtifactDirectoryPaths(tempRoot, ["Microsoft/"]);
+
+      expect(expanded).toEqual(["Microsoft/Windows/PowerShell/ModuleAnalysisCache"]);
+      expect(publishableChangedPaths(expanded)).toEqual([]);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   test("stops quality revisions when the remaining execution budget is too small", () => {
@@ -110,7 +128,9 @@ describe("workerpals quality gate critic issue formatting", () => {
 
     expect(shouldSkipCriticAfterExecutorTimeout({ ...base, policyMode: "default" })).toBe(true);
     expect(shouldSkipCriticAfterExecutorTimeout({ ...base, policyMode: "review_fix" })).toBe(false);
-    expect(shouldSkipCriticAfterExecutorTimeout({ ...base, policyMode: "merge_conflict" })).toBe(false);
+    expect(shouldSkipCriticAfterExecutorTimeout({ ...base, policyMode: "merge_conflict" })).toBe(
+      false,
+    );
     expect(
       shouldSkipCriticAfterExecutorTimeout({
         ...base,
@@ -597,8 +617,7 @@ describe("workerpals quality gate critic issue formatting", () => {
             ok: false,
             exitCode: 1,
             stdout: "",
-            stderr:
-              "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+            stderr: "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
             elapsedMs: 111_031,
           },
         ],
@@ -610,7 +629,9 @@ describe("workerpals quality gate critic issue formatting", () => {
       expect(packet?.lastVerifiedStage).toBe("settings screen");
       expect(packet?.artifacts).toContain(screenshotPath);
       expect(packet?.artifacts).toContain(logPath);
-      expect(packet?.artifactSummaries?.join("\n")).toContain("selector=getByTestId('settings-home-button')");
+      expect(packet?.artifactSummaries?.join("\n")).toContain(
+        "selector=getByTestId('settings-home-button')",
+      );
       expect(packet?.output).toContain("Verified: settings screen");
       expect(packet?.output).toContain("settings-home-button");
     } finally {
@@ -639,8 +660,7 @@ describe("workerpals quality gate critic issue formatting", () => {
           command: "bun run web:e2e",
           exitCode: 1,
           stdout: "",
-          stderr:
-            "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+          stderr: "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
           elapsedMs: 145_252,
         },
         repo,
@@ -728,8 +748,7 @@ describe("workerpals quality gate critic issue formatting", () => {
             ok: false,
             exitCode: 1,
             stdout: "",
-            stderr:
-              "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+            stderr: "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
             elapsedMs: 144_591,
           },
         ],
@@ -829,8 +848,7 @@ describe("workerpals quality gate critic issue formatting", () => {
         exitCode: 124,
         elapsedMs: 602_015,
         stdout: "",
-        stderr:
-          'error: script "web:e2e" was terminated by signal SIGTERM (Polite quit request)',
+        stderr: 'error: script "web:e2e" was terminated by signal SIGTERM (Polite quit request)',
       },
     ]);
 
@@ -849,9 +867,7 @@ describe("workerpals quality gate critic issue formatting", () => {
       ),
     ).toBe(false);
 
-    expect(isBrowserValidationInfrastructureDigest("ERR_SOCKET_BAD_PORT at port 65536")).toBe(
-      true,
-    );
+    expect(isBrowserValidationInfrastructureDigest("ERR_SOCKET_BAD_PORT at port 65536")).toBe(true);
   });
 
   test("retries route startup browser smoke failures once", () => {
@@ -948,10 +964,12 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("Do not invent a combined phrase for split text");
     expect(hint).toContain("preserve stages that already passed");
     expect(hint).toContain("Do not change browser startup, port selection");
-    expect(hint).toContain("PushPals ValidationGate will rerun \"bun run web:e2e\"");
+    expect(hint).toContain('PushPals ValidationGate will rerun "bun run web:e2e"');
     expect(hint).toContain("Executor sandbox rule:");
     expect(hint).toContain("treat that as a Codex executor verification limitation");
-    expect(hint).toContain("do not run the full browser command from the Codex executor by default");
+    expect(hint).toContain(
+      "do not run the full browser command from the Codex executor by default",
+    );
     expect(hint).toContain("fast non-browser checks");
     expect(hint).toContain("let ValidationGate perform the authoritative browser run");
     expect(hint).toContain("Suppressed 1 lower-priority ScopeGate/CriticGate note");
@@ -1180,10 +1198,10 @@ describe("workerpals quality gate critic issue formatting", () => {
 
   test("downgrades assertion-balance failures when validation passed and critic score meets threshold", () => {
     const issues = relaxAdvisoryQualityIssues(
-        [
-          "ScopeGate: found changed test files without both positive and negative assertion coverage (expected both).",
-          "Validation steps did not execute a recognizable test command.",
-        ],
+      [
+        "ScopeGate: found changed test files without both positive and negative assertion coverage (expected both).",
+        "Validation steps did not execute a recognizable test command.",
+      ],
       [{ ok: false }, { ok: true }],
       {
         score: 8.8,

@@ -168,6 +168,70 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("createSnapshot marks repo validation red after repeated failures in one terminal job", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-validation-red-single-job-");
+    const jobQueue = new JobQueue(dbPath);
+
+    try {
+      const enqueued = jobQueue.enqueue({
+        taskId: "task-validation-red-single-job",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { instruction: "Repair the local web smoke baseline." },
+      });
+      expect(enqueued.ok).toBe(true);
+      const claimed = jobQueue.claim("worker-validation-red-single-job");
+      expect(claimed.ok).toBe(true);
+      const jobId = String(claimed.job?.id ?? "");
+      expect(jobId.length).toBeGreaterThan(0);
+
+      const failed = jobQueue.fail(jobId, {
+        message: "Required validation failed",
+        diagnostics: {
+          terminal: {
+            failureClass: "validation_failed",
+            terminalStage: "focused_validation",
+            executorBackend: "openai_codex",
+            summary: "bun run web:e2e failed",
+          },
+          validationRuns: [
+            {
+              attempt: 1,
+              command: "bun run web:e2e",
+              exitCode: 1,
+              durationMs: 1200,
+              passed: false,
+              failureClass: "browser_smoke_failed",
+              stderrTail: "tests/web-smoke.test.ts:42 home route startup failed",
+            },
+            {
+              attempt: 2,
+              command: "bun run web:e2e",
+              exitCode: 1,
+              durationMs: 1300,
+              passed: false,
+              failureClass: "browser_smoke_failed",
+              stderrTail: "tests/web-smoke.test.ts:42 home route startup failed",
+            },
+          ],
+        },
+      });
+      expect(failed.ok).toBe(true);
+
+      const snapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_validation_red_single_job",
+      });
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(true);
+      expect(snapshot.validation_incident?.command).toBe("bun run web:e2e");
+      expect(snapshot.validation_incident?.failure_count).toBe(2);
+      expect(snapshot.validation_incident?.failed_job_ids).toHaveLength(1);
+      expect(snapshot.validation_incident?.target_path_hints).toContain("tests/web-smoke.test.ts");
+    } finally {
+      jobQueue.close();
+    }
+  });
+
   test("createSnapshot derives component strength traits from outcomes", () => {
     const store = makeStore();
     const sessionId = "s1";

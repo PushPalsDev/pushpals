@@ -2097,6 +2097,46 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertGreaterEqual(len(delta), 2)
         self.assertEqual(effective, [])
 
+    def test_codex_changed_paths_filters_windows_powershell_cache_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-powershell-cache-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# powershell cache artifact test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed powershell cache artifact test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            cache_dir = repo / "Microsoft" / "Windows" / "PowerShell"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            (cache_dir / "ModuleAnalysisCache").write_text("cache artifact\n", encoding="utf-8")
+
+            changed_paths, delta, effective = _codex_changed_paths(str(repo), [])
+
+        self.assertIn("Microsoft/Windows/PowerShell/ModuleAnalysisCache", changed_paths)
+        self.assertIn("Microsoft/Windows/PowerShell/ModuleAnalysisCache", delta)
+        self.assertNotIn("Microsoft/", changed_paths)
+        self.assertEqual(effective, [])
+
     def test_codex_changed_paths_ignores_publishable_paths_dirty_at_baseline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-dirty-baseline-") as temp_dir:
             repo = Path(temp_dir) / "repo"

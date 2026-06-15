@@ -2784,7 +2784,6 @@ export class AutonomyStore {
 
     const activeGroups = [...groups.values()]
       .filter((group) => group.failureCount >= 2)
-      .filter((group) => group.failedJobIds.size >= 2)
       .filter((group) => group.latestFailAtMs > group.latestPassAtMs)
       .sort((a, b) => {
         if (b.failureCount !== a.failureCount) return b.failureCount - a.failureCount;
