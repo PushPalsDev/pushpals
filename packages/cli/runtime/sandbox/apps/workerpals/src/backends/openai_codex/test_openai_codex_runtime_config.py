@@ -2138,6 +2138,50 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertNotIn("Microsoft/", changed_paths)
         self.assertEqual(effective, [])
 
+    def test_codex_changed_paths_can_clean_generated_powershell_cache_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-clean-powershell-cache-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# clean powershell cache artifact test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed powershell cache cleanup test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            cache_file = repo / "Microsoft" / "Windows" / "PowerShell" / "ModuleAnalysisCache"
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text("cache artifact\n", encoding="utf-8")
+
+            changed_paths, delta, effective = _codex_changed_paths(
+                str(repo),
+                [],
+                clean_known_runtime_artifacts=True,
+            )
+
+            self.assertFalse(cache_file.exists())
+            self.assertNotIn("Microsoft/Windows/PowerShell/ModuleAnalysisCache", changed_paths)
+            self.assertEqual(delta, [])
+            self.assertEqual(effective, [])
+
     def test_codex_changed_paths_ignores_publishable_paths_dirty_at_baseline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-dirty-baseline-") as temp_dir:
             repo = Path(temp_dir) / "repo"
@@ -2848,6 +2892,93 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("continued past artifact-only", str(result.get("stdout") or ""))
         self.assertNotIn("rollout coach", str(result.get("summary") or "").lower())
         self.assertNotIn("rollout coach", str(result.get("stderr") or "").lower())
+
+    def test_run_codex_task_cleans_powershell_artifact_before_rollout_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-artifact-cleanup-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# rollout artifact cleanup repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed rollout artifact cleanup repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_rollout_artifact_cleanup.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "sys.stdin.read()",
+                        "cache = Path('Microsoft/Windows/PowerShell/ModuleAnalysisCache')",
+                        "cache.parent.mkdir(parents=True, exist_ok=True)",
+                        "cache.write_text('runtime artifact before patch\\n', encoding='utf-8')",
+                        "print('item.completed | I found the route shell owner and will patch it next.', flush=True)",
+                        "time.sleep(2)",
+                        "Path('app').mkdir(exist_ok=True)",
+                        "Path('app/_layout.tsx').write_text('export const shell = true;\\n', encoding='utf-8')",
+                        "if last_message_path:",
+                        "    Path(last_message_path).write_text('Patched route shell after artifact cleanup.', encoding='utf-8')",
+                        "print('item.completed | Patched route shell after artifact cleanup.', flush=True)",
+                        "sys.exit(0)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-rollout-artifact-cleanup-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "10",
+                "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Implement a small, low-risk polish pass for the client app shell around match entry.",
+                    [],
+                )
+            cache_file = repo / "Microsoft" / "Windows" / "PowerShell" / "ModuleAnalysisCache"
+
+            self.assertFalse(cache_file.exists())
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched route shell after artifact cleanup", str(result.get("stdout") or ""))
+        self.assertIn("app/", str(result.get("stdout") or ""))
+        self.assertNotIn("rollout coach", str(result.get("summary") or "").lower())
+        self.assertNotIn("artifact-only", str(result.get("stderr") or "").lower())
 
     def test_run_codex_task_timeout_reports_artifact_only_changes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-timeout-") as temp_dir:

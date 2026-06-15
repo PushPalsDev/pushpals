@@ -2084,12 +2084,19 @@ def _merge_usage_records(first: Any, second: Any) -> Dict[str, Any]:
     return merged
 
 
+def _is_known_runtime_artifact_path(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").strip().strip("/").lower()
+    return bool(
+        re.search(
+            r"^microsoft/windows/powershell/(moduleanalysiscache|psreadline(/|$))",
+            normalized,
+        )
+    )
+
+
 def _is_publishable_changed_path(path: str) -> bool:
     normalized = str(path or "").replace("\\", "/").strip().strip("/").lower()
-    if re.search(
-        r"^microsoft/windows/powershell/(moduleanalysiscache|psreadline(/|$))",
-        normalized,
-    ):
+    if _is_known_runtime_artifact_path(normalized):
         return False
     return not re.search(r"(^|/)(outputs|node_modules|\.worktrees|\.codex|dist|build|coverage)(/|$)", normalized)
 
@@ -2227,8 +2234,17 @@ def _normalize_baseline_snapshot(repo: str, baseline_changes: Any) -> Dict[str, 
     return _capture_git_change_snapshot(repo)
 
 
-def _codex_changed_paths(repo: str, baseline_snapshot: Any) -> Tuple[List[str], List[str], List[str]]:
+def _codex_changed_paths(
+    repo: str,
+    baseline_snapshot: Any,
+    *,
+    clean_known_runtime_artifacts: bool = False,
+) -> Tuple[List[str], List[str], List[str]]:
     changed_paths = _expand_known_artifact_directory_paths(repo, summarize_git_changes(repo))
+    if clean_known_runtime_artifacts:
+        cleaned_paths = _cleanup_known_runtime_artifacts(repo, changed_paths, baseline_snapshot)
+        if cleaned_paths:
+            changed_paths = _expand_known_artifact_directory_paths(repo, summarize_git_changes(repo))
     delta = _paths_changed_after_baseline(repo, changed_paths, baseline_snapshot)
     effective = [p for p in delta if _is_publishable_changed_path(p)]
     return changed_paths, delta, effective
@@ -2248,6 +2264,78 @@ def _safe_repo_relative_path(repo: str, path: str) -> Optional[Path]:
         return candidate
     except Exception:
         return None
+
+
+def _git_path_is_tracked(repo: str, path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").strip().strip("/")
+    if not normalized:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", normalized],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _prune_empty_artifact_parent_dirs(repo: str, path: Path) -> None:
+    try:
+        repo_root = Path(repo).resolve()
+        current = path.parent.resolve()
+        while current != repo_root:
+            try:
+                current.relative_to(repo_root)
+            except Exception:
+                break
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent.resolve()
+    except Exception:
+        return
+
+
+def _cleanup_known_runtime_artifacts(
+    repo: str,
+    changed_paths: List[str],
+    baseline_snapshot: Any,
+) -> List[str]:
+    baseline_paths = set(_baseline_snapshot_paths(baseline_snapshot))
+    cleaned: List[str] = []
+    for path in changed_paths:
+        normalized = str(path or "").replace("\\", "/").strip().strip("/")
+        if not normalized or normalized in baseline_paths:
+            continue
+        if not _is_known_runtime_artifact_path(normalized):
+            continue
+        if _git_path_is_tracked(repo, normalized):
+            continue
+        target = _safe_repo_relative_path(repo, normalized)
+        if target is None or not target.exists():
+            continue
+        try:
+            if target.is_dir():
+                rmtree(target)
+            else:
+                target.unlink()
+            cleaned.append(normalized)
+            _prune_empty_artifact_parent_dirs(repo, target)
+        except Exception as exc:
+            log.warning(
+                f"Failed to clean non-publishable runtime artifact path {normalized}: {exc}"
+            )
+    if cleaned:
+        listed = ", ".join(cleaned[:8])
+        if len(cleaned) > 8:
+            listed += ", ..."
+        log.info(f"Cleaned non-publishable runtime artifact path(s): {listed}")
+    return cleaned
 
 
 def _git_status_entries(repo: str) -> List[Tuple[str, str]]:
@@ -2844,7 +2932,11 @@ def _run_codex_task(
                         if isinstance(summaries, list):
                             live_trace["summaries"] = list(summaries)
                     if _codex_trace_is_startup_stall(live_trace):
-                        changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+                        changed_paths, _, effective_paths = _codex_changed_paths(
+                            repo,
+                            baseline_snapshot,
+                            clean_known_runtime_artifacts=True,
+                        )
                         if not effective_paths:
                             no_edit_artifact_only_paths = _describe_non_publishable_paths(
                                 changed_paths,
@@ -2860,7 +2952,11 @@ def _run_codex_task(
                     startup_stall_deadline = None
 
                 if no_edit_deadline is not None and now >= no_edit_deadline:
-                    changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+                    changed_paths, _, effective_paths = _codex_changed_paths(
+                        repo,
+                        baseline_snapshot,
+                        clean_known_runtime_artifacts=True,
+                    )
                     if not effective_paths:
                         with trace_lock:
                             live_trace = dict(stdout_trace_state)
@@ -3002,7 +3098,11 @@ def _run_codex_task(
                     )
 
                 if rollout_deadline is not None and now >= rollout_deadline:
-                    changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+                    changed_paths, _, effective_paths = _codex_changed_paths(
+                        repo,
+                        baseline_snapshot,
+                        clean_known_runtime_artifacts=True,
+                    )
                     with trace_lock:
                         live_trace = dict(stdout_trace_state)
                         summaries = stdout_trace_state.get("summaries")
@@ -3201,7 +3301,11 @@ def _run_codex_task(
             }
 
         if publishable_progress_finalized:
-            changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            changed_paths, _, effective_paths = _codex_changed_paths(
+                repo,
+                baseline_snapshot,
+                clean_known_runtime_artifacts=True,
+            )
             effective_paths = effective_paths or publishable_progress_paths
             last_message = _read_text_if_exists(last_message_path)
             log_git_status(repo, log)
@@ -3342,7 +3446,11 @@ def _run_codex_task(
             )
             if trace_excerpt:
                 detail = f"{detail}\n{trace_excerpt}"
-            changed_paths, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            changed_paths, _, effective_paths = _codex_changed_paths(
+                repo,
+                baseline_snapshot,
+                clean_known_runtime_artifacts=True,
+            )
             credible_partial_patch = _has_credible_shell_wrapper_progress(effective_paths)
             if effective_paths and credible_partial_patch:
                 last_message = _read_text_if_exists(last_message_path)
@@ -3417,7 +3525,11 @@ def _run_codex_task(
         log_git_status(repo, log)
 
         if command_policy_rejection_loop:
-            _, _, effective_paths = _codex_changed_paths(repo, baseline_snapshot)
+            _, _, effective_paths = _codex_changed_paths(
+                repo,
+                baseline_snapshot,
+                clean_known_runtime_artifacts=True,
+            )
             credible_progress = _has_credible_shell_wrapper_progress(effective_paths)
             if effective_paths:
                 policy_signal = _detect_codex_workaround_signal(last_message)
@@ -3682,7 +3794,11 @@ def _run_codex_task(
                 "usage": usage,
             }
 
-        _, _, effective = _codex_changed_paths(repo, baseline_snapshot)
+        _, _, effective = _codex_changed_paths(
+            repo,
+            baseline_snapshot,
+            clean_known_runtime_artifacts=True,
+        )
         if effective:
             return {
                 "ok": True,
