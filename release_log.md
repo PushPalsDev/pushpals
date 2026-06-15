@@ -2,23 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.52`
-- start_commit: `e3bcf568a2d0f59ae5dc094379efcc00895ac452`
-- end_commit: `0d0dcb8a5701f9d3ebd62d6e4c129258555ebd42`
+- version: `v1.1.53`
+- start_commit: `db56819f2dc161f114d42f964dec328b0264b249`
+- end_commit: `d802b9a28a30dab1a5704fe01bfb53961f55ac88`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Continue in-scope browser validation repair when the normal revision budget is exhausted but a publishable browser-smoke repair patch is already present.
-- Give the continuation turn a dedicated execution and finalization budget so WorkerPal can finish the next repair attempt and still leave time for ValidationGate.
-- Keep ordinary quality/critic revisions on the existing budget guard; the continuation path only applies to browser validation repair with publishable code changes.
-- Add regression coverage for both the positive continuation decision and the artifact-only/no-publishable-patch rejection path.
+- Pivot required validation failures outside the original task hints into guarded repo validation repair instead of treating them as terminal blockers.
+- Give repo validation repair a dedicated continuation budget when the original job budget is exhausted but publishable work exists.
+- Tell the next worker when original target paths/write globs are stale advisory hints for the validation blocker while keeping forbidden/generated paths off limits.
+- Add regression coverage for repair-mode entry, dedicated budget continuation, outside-scope repo blockers, and the worker revision prompt.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
 - `bun test tests/workerpals.quality-gate-issues.test.ts`
+- `bun test tests/workerpals.validation-command-safety.test.ts`
 - `bun run test:root`
 - `bun run test:prompt-policy`
 - `bun run test:protocol`
