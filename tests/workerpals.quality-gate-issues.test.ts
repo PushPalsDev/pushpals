@@ -29,6 +29,7 @@ import {
   shouldRetryBrowserValidationRunOnce,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
+  shouldSoftPassCriticOnlyBudgetExhaustion,
   workerAttemptRolloutScore,
 } from "../apps/workerpals/src/execute_job";
 
@@ -85,6 +86,48 @@ describe("workerpals quality gate critic issue formatting", () => {
       remainingBudgetMs: 200_000,
       minimumRevisionBudgetMs: 300_000,
     });
+  });
+
+  test("soft-passes critic-only revision when validation passed but budget is exhausted", () => {
+    expect(
+      shouldSoftPassCriticOnlyBudgetExhaustion({
+        softPassOnExhausted: true,
+        deterministicRequiresRevision: false,
+        criticRequiresRevision: true,
+        requiredValidationFailures: [],
+        changedPaths: ["components/Planet.tsx", "scripts/test-web-e2e.js"],
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldSoftPassCriticOnlyBudgetExhaustion({
+        softPassOnExhausted: true,
+        deterministicRequiresRevision: true,
+        criticRequiresRevision: true,
+        requiredValidationFailures: [],
+        changedPaths: ["components/Planet.tsx"],
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSoftPassCriticOnlyBudgetExhaustion({
+        softPassOnExhausted: true,
+        deterministicRequiresRevision: false,
+        criticRequiresRevision: true,
+        requiredValidationFailures: ["bun run web:e2e"],
+        changedPaths: ["components/Planet.tsx"],
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSoftPassCriticOnlyBudgetExhaustion({
+        softPassOnExhausted: true,
+        deterministicRequiresRevision: false,
+        criticRequiresRevision: true,
+        requiredValidationFailures: [],
+        changedPaths: ["node_modules/react/index.js"],
+      }),
+    ).toBe(false);
   });
 
   test("continues in-scope browser validation repair after the generic revision budget is exhausted", () => {

@@ -379,6 +379,20 @@ export function repoValidationRepairContinuationBudgetDecision(opts: {
   };
 }
 
+export function shouldSoftPassCriticOnlyBudgetExhaustion(opts: {
+  softPassOnExhausted: boolean;
+  deterministicRequiresRevision: boolean;
+  criticRequiresRevision: boolean;
+  requiredValidationFailures: string[];
+  changedPaths: string[];
+}): boolean {
+  if (!opts.softPassOnExhausted) return false;
+  if (opts.deterministicRequiresRevision) return false;
+  if (!opts.criticRequiresRevision) return false;
+  if (opts.requiredValidationFailures.length > 0) return false;
+  return publishableChangedPaths(opts.changedPaths).length > 0;
+}
+
 const MERGE_CONFLICT_RETRY_EXECUTION_BUDGET_MS = 300_000;
 const MERGE_CONFLICT_RETRY_FINALIZATION_BUDGET_MS = 60_000;
 const MERGE_CONFLICT_MIN_RETRY_EXECUTION_BUDGET_MS = 120_000;
@@ -9051,6 +9065,44 @@ export async function executeJob(
       !browserValidationContinuation.shouldContinue &&
       !repoValidationContinuation.shouldContinue
     ) {
+      if (
+        shouldSoftPassCriticOnlyBudgetExhaustion({
+          softPassOnExhausted: qualitySoftPassOnExhausted,
+          deterministicRequiresRevision,
+          criticRequiresRevision,
+          requiredValidationFailures: quality.requiredValidationFailures,
+          changedPaths: quality.changedPaths,
+        })
+      ) {
+        const diagnostics = truncate(
+          [
+            result.stderr ?? "",
+            ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+            critic ? `Critic raw: ${critic.raw}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
+        );
+        onLog?.(
+          "stderr",
+          `[QualityGate] Soft-pass critic-only revision after validation passed but remaining execution budget ${
+            revisionBudget.remainingBudgetMs
+          }ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(
+            issueSummary,
+            260,
+          )}`,
+        );
+        const softPass: JobResult = {
+          ...result,
+          summary:
+            `${result.summary} ` +
+            `(quality gate soft-pass after critic-only budget exhaustion with validation passing)`,
+          stderr: diagnostics,
+          exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
+        };
+        return annotateTerminalResult(softPass, "quality");
+      }
       const budgetSummary = `Quality gate needs revision ${
         revisionAttempt + 1
       }/${activeMaxAutoRevisions}, but remaining execution budget is ${
