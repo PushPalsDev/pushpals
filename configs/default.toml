@@ -21,7 +21,9 @@ port = 3001
 debug_http = false
 stale_claim_ttl_ms = 120000
 stale_claim_sweep_interval_ms = 5000
-session_token_budget = 2000000
+# 0 disables PushPals' local session-token pause; rely on the active LLM/Codex
+# session budget unless an explicit local cap is configured.
+session_token_budget = 0
 
 [localbuddy]
 enabled = false

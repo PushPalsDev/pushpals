@@ -279,4 +279,48 @@ describe("server session message route", () => {
       code: "session_token_budget_exceeded",
     });
   }, 15_000);
+
+  test("does not pause session work when the session token budget is disabled", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const created = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: "dev" }),
+    });
+    expect(created.status).toBe(201);
+
+    const usage = await fetch(`http://127.0.0.1:${port}/telemetry/llm-usage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service: "workerpals",
+        sessionId: "dev",
+        promptTokens: 2_400_000,
+        completionTokens: 100_000,
+      }),
+    });
+    expect(usage.status).toBe(200);
+    expect(await usage.json()).toMatchObject({
+      ok: true,
+      crossedLimit: false,
+      sessionBudget: null,
+    });
+
+    const accepted = await fetch(`http://127.0.0.1:${port}/sessions/dev/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "please keep going" }),
+    });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toMatchObject({
+      ok: true,
+      code: "accepted",
+    });
+  }, 15_000);
 });

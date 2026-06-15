@@ -711,7 +711,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     0,
     asInt(
       parseIntEnv("PUSHPALS_SESSION_TOKEN_BUDGET") ?? serverNode.session_token_budget,
-      1_000_000,
+      0,
     ),
   );
   const sessionTokenBudgetAction: "pause" = "pause";
