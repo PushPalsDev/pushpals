@@ -2,31 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.54`
-- start_commit: `58114e9f61f8fa5b4bc152b4e9ca6c87d6bf5743`
-- end_commit: `c047caa466a99dc0f99f8a489b11e9aafe6043c7`
+- version: `v1.1.55`
+- start_commit: `60eeee85a00f85500f396b6858f219a43de31af6`
+- end_commit: `b31eff53671aee5547f8a7e62dc90695b26a8564`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Hydrate direct isolated WorkerPal worktrees with the repo-root `node_modules` dependency artifact, matching Docker worktree behavior.
-- Fix direct Windows fallback jobs whose lint/web smoke validation needs project-local dependency layout for Expo Router, ESLint import resolution, and browser review hydration.
-- Keep dependency artifacts out of PR content while logging when direct worktree hydration links runtime-only artifacts.
-- Add regression coverage for direct worktree dependency artifact linking and skip behavior.
+- Clean known Windows PowerShell runtime cache artifacts from OpenAI Codex executor progress checks before they can poison WorkerPal rollout decisions.
+- Fix direct Windows fallback jobs that were failing as `artifact_only_no_publishable_patch` when `Microsoft/Windows/PowerShell/ModuleAnalysisCache` was the only dirty path before a real patch landed.
+- Preserve tracked or baseline-dirty files while cleaning only untracked, generated runtime artifacts inside the isolated worktree.
+- Add regression coverage for artifact cleanup before rollout-watchdog failure and for the lower-level PowerShell cache cleanup path.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.direct-worktree-dependency-artifacts.test.ts tests/workerpals.docker-executor.test.ts`
-- `bun test tests/workerpals.validation-command-safety.test.ts`
-- `bun test tests/workerpals.direct-worktree-dependency-artifacts.test.ts tests/workerpals.session-events.test.ts`
+- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
+- `bun test tests/workerpals.quality-gate-issues.test.ts tests/workerpals.session-events.test.ts`
 - `bun run test:root`
-- `bun run test:prompt-policy`
-- `bun run test:protocol`
-- `bun --cwd apps/server build`
 - `bun --cwd apps/workerpals tsc --noEmit`
-- SectorCommand control: temporary linked worktree passed `bun run lint` and `bun run web:e2e`
 - `git diff --check`
 
 ## Install
