@@ -36,6 +36,7 @@ from openai_codex_executor import (
     _build_no_edit_recovery_guidance,
     _build_rollout_recovery_guidance,
     _collect_disallowed_shell_wrapper_rejections,
+    _codex_sandbox_additional_dirs,
     _codex_changed_paths,
     _capture_git_change_snapshot,
     _describe_non_publishable_paths,
@@ -59,6 +60,24 @@ from openai_codex_executor import (
     _unwrap_shell_wrapper_command,
     _usage_from_trace_or_estimate,
 )
+
+
+def _link_test_directory(source: Path, destination: Path) -> None:
+    try:
+        os.symlink(source, destination, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt":
+            raise
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(destination), str(source)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise unittest.SkipTest(
+                f"could not create Windows directory link for test: {result.stderr or result.stdout or exc}"
+            )
 
 
 class OpenAICodexRuntimeConfigTests(unittest.TestCase):
@@ -190,6 +209,105 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 _resolve_codex_command_prefix(cfg),
                 ["/usr/local/bin/bunx", "--yes", "@openai/codex"],
             )
+
+    def test_codex_sandbox_additional_dirs_includes_linked_dependency_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-add-dir-") as root:
+            project = Path(root) / "project"
+            dependency_root = project / "node_modules"
+            worktree = project / ".worktrees" / "job-123"
+            dependency_root.mkdir(parents=True)
+            worktree.mkdir(parents=True)
+            _link_test_directory(dependency_root, worktree / "node_modules")
+
+            self.assertEqual(
+                _codex_sandbox_additional_dirs(str(worktree)),
+                [str(dependency_root.resolve())],
+            )
+
+    def test_codex_sandbox_additional_dirs_skips_local_dependency_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-local-deps-") as root:
+            repo = Path(root) / "repo"
+            (repo / "node_modules").mkdir(parents=True)
+
+            self.assertEqual(_codex_sandbox_additional_dirs(str(repo)), [])
+
+    def test_run_codex_task_adds_linked_dependency_artifact_to_workspace_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-add-dir-cmd-") as root:
+            project = Path(root) / "project"
+            dependency_root = project / "node_modules"
+            worktree = project / ".worktrees" / "job-123"
+            dependency_root.mkdir(parents=True)
+            worktree.mkdir(parents=True)
+            _link_test_directory(dependency_root, worktree / "node_modules")
+            (worktree / "README.md").write_text("# add-dir command test\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "add", "README.md"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed add-dir command repo"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            argv_path = Path(root) / "codex-argv.json"
+            stub_path = Path(root) / "fake_codex_add_dir.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "import sys",
+                        "from pathlib import Path",
+                        "",
+                        "argv = sys.argv[1:]",
+                        f"Path({str(argv_path)!r}).write_text(json.dumps(argv), encoding='utf-8')",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "sys.stdin.read()",
+                        "if last_message_path:",
+                        "    Path(last_message_path).write_text('No changes needed.', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-add-dir-command-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "5",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                _run_codex_task(str(worktree), "Inspect dependency sandbox wiring.", [])
+
+            argv = json.loads(argv_path.read_text(encoding="utf-8"))
+            self.assertIn("exec", argv)
+            self.assertIn("--add-dir", argv)
+            add_dir_index = argv.index("--add-dir")
+            self.assertEqual(argv[add_dir_index + 1], str(dependency_root.resolve()))
 
     def test_reasoning_effort_caps_extra_high_for_legacy_gpt_5_4(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(

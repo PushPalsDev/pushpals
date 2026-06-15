@@ -202,6 +202,7 @@ export interface QualityGatePolicy {
 }
 
 const BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 3;
+const REPO_VALIDATION_REPAIR_MAX_AUTO_REVISIONS = 4;
 const CRITIC_COMPACT_RETRY_MIN_REDUCTION_RATIO = 0.25;
 const MAX_DIAGNOSTIC_PATH_SAMPLES = 50;
 const MAX_DIAGNOSTIC_TEXT_CHARS = 8_000;
@@ -613,6 +614,12 @@ export function revisionLimitForQualityGateFailures(opts: {
   if (!hasValidationGateFailure) return opts.policy.maxAutoRevisions;
   if (opts.browserRepairPacket) {
     return Math.max(opts.policy.validationMaxAutoRevisions, BROWSER_VALIDATION_MAX_AUTO_REVISIONS);
+  }
+  if (opts.requiredValidationFailures.length > 0 && opts.blocker?.category === "repo") {
+    return Math.max(
+      opts.policy.validationMaxAutoRevisions,
+      REPO_VALIDATION_REPAIR_MAX_AUTO_REVISIONS,
+    );
   }
   return opts.policy.validationMaxAutoRevisions;
 }
@@ -7992,9 +7999,16 @@ export async function executeJob(
   const qualityGatePolicy = deriveQualityGatePolicy(normalizedParams, runtimeConfig);
   const qualityMaxAutoRevisions = qualityGatePolicy.maxAutoRevisions;
   const qualityValidationMaxAutoRevisions = qualityGatePolicy.validationMaxAutoRevisions;
-  const qualityRevisionLoopMax = qualityRevisionLoopUpperBound(qualityGatePolicy, {
-    browserValidation: taskRequestsBrowserValidation(normalizedParams),
-  });
+  const qualityRepoValidationRepairMaxAutoRevisions = Math.max(
+    qualityValidationMaxAutoRevisions,
+    REPO_VALIDATION_REPAIR_MAX_AUTO_REVISIONS,
+  );
+  const qualityRevisionLoopMax = Math.max(
+    qualityRevisionLoopUpperBound(qualityGatePolicy, {
+      browserValidation: taskRequestsBrowserValidation(normalizedParams),
+    }),
+    qualityRepoValidationRepairMaxAutoRevisions,
+  );
   const qualitySoftPassOnExhausted = qualityGatePolicy.softPassOnExhausted;
   const qualityCriticMinScore = qualityGatePolicy.criticMinScore;
 
@@ -8344,7 +8358,7 @@ export async function executeJob(
       validationFailureScope: quality.validationFailureScope,
       changedPaths: quality.changedPaths,
       revisionAttempt,
-      maxAutoRevisions: qualityValidationMaxAutoRevisions,
+      maxAutoRevisions: qualityRepoValidationRepairMaxAutoRevisions,
     });
     const validationOutsideTaskScopeBlocksOnly =
       validationOutsideTaskScope && !repoValidationRepairMode;
@@ -8353,7 +8367,7 @@ export async function executeJob(
         "stderr",
         `[ValidationGate] Required validation failed outside original task scope; entering guarded repo validation repair mode for revision ${
           revisionAttempt + 1
-        }/${qualityValidationMaxAutoRevisions}: ${quality.requiredValidationFailures.join("; ")}`,
+        }/${qualityRepoValidationRepairMaxAutoRevisions}: ${quality.requiredValidationFailures.join("; ")}`,
       );
     }
     const qualityForCritic: DeterministicQualityResult = validationOutsideTaskScopeBlocksOnly
@@ -8609,7 +8623,7 @@ export async function executeJob(
           "stderr",
           `[QualityGate] Required vision.md validation hit a repo blocker; requesting revision ${
             revisionAttempt + 1
-          }/${qualityValidationMaxAutoRevisions} instead of failing immediately: ${quality.requiredValidationFailures.join(
+          }/${activeMaxAutoRevisions} instead of failing immediately: ${quality.requiredValidationFailures.join(
             "; ",
           )}`,
         );

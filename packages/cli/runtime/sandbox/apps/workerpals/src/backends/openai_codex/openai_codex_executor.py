@@ -101,6 +101,7 @@ _VALID_SANDBOX_POLICIES = {"read-only", "workspace-write", "danger-full-access"}
 _VALID_COLORS = {"always", "never", "auto"}
 _VALID_AUTH_MODES = {"auto", "api_key", "chatgpt"}
 _VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+_CODEX_SANDBOX_DEPENDENCY_ARTIFACTS = ("node_modules",)
 _MAX_WRAPPER_RECOVERY_ATTEMPTS = 2
 _MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS = 1_200
 _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
@@ -553,6 +554,45 @@ def _resolve_codex_command_prefix(config: OpenAICodexRuntimeConfig) -> List[str]
     if codex:
         return [codex]
     return []
+
+
+def _path_is_inside(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _codex_sandbox_additional_dirs(repo: str) -> List[str]:
+    try:
+        repo_path = Path(repo).resolve()
+    except Exception:
+        return []
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for name in _CODEX_SANDBOX_DEPENDENCY_ARTIFACTS:
+        artifact = Path(repo) / name
+        try:
+            if not artifact.exists():
+                continue
+            resolved = artifact.resolve()
+        except Exception:
+            continue
+        try:
+            if not resolved.is_dir():
+                continue
+        except Exception:
+            continue
+        if _path_is_inside(resolved, repo_path):
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(str(resolved))
+    return out
 
 
 def _resolve_communicate_timeout_seconds(config: OpenAICodexRuntimeConfig) -> Optional[int]:
@@ -2630,6 +2670,9 @@ def _run_codex_task(
 
     with tempfile.TemporaryDirectory(prefix="pushpals-codex-") as tmp_dir:
         last_message_path = Path(tmp_dir) / "codex-last-message.txt"
+        sandbox_additional_dirs = (
+            _codex_sandbox_additional_dirs(repo) if sandbox == "workspace-write" else []
+        )
         cmd: List[str] = [
             *codex_cmd_prefix,
             "-c",
@@ -2644,6 +2687,8 @@ def _run_codex_task(
             "--output-last-message",
             str(last_message_path),
         ]
+        for directory in sandbox_additional_dirs:
+            cmd.extend(["--add-dir", directory])
         if use_json:
             cmd.append("--json")
         if model:
@@ -2749,6 +2794,11 @@ def _run_codex_task(
         log.debug(f"Base URL: {base_for_log}")
         if communicate_timeout_s:
             log.debug(f"communicate timeout: {communicate_timeout_s}s")
+        if sandbox_additional_dirs:
+            log.info(
+                "Codex sandbox add-dir includes linked dependency artifact root(s): "
+                + ", ".join(sandbox_additional_dirs[:4])
+            )
 
         codex_project_mask = _mask_repo_local_codex_files(repo, env)
         try:

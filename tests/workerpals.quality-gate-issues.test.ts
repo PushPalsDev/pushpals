@@ -198,6 +198,16 @@ describe("workerpals quality gate critic issue formatting", () => {
         maxAutoRevisions: 3,
       }),
     ).toBe(false);
+
+    expect(
+      shouldRepairOutsideTaskRequiredValidation({
+        requiredValidationFailures: ["bun run lint exited 1"],
+        validationFailureScope: "outside_task_scope",
+        changedPaths: ["package.json", "tsconfig.json"],
+        revisionAttempt: 3,
+        maxAutoRevisions: 4,
+      }),
+    ).toBe(true);
   });
 
   test("continues repo validation repair after the generic revision budget is exhausted", () => {
@@ -1349,6 +1359,17 @@ describe("workerpals quality gate critic issue formatting", () => {
         blocker: null,
       }),
     ).toBe(3);
+
+    expect(
+      revisionLimitForQualityGateFailures({
+        policy,
+        qualityIssues: [
+          "ValidationGate: Required vision.md validation failed: bun run lint exited 1",
+        ],
+        requiredValidationFailures: ["bun run lint exited 1"],
+        blocker: { category: "repo", detail: "missing repo dependency" },
+      }),
+    ).toBe(4);
 
     expect(
       revisionLimitForQualityGateFailures({
