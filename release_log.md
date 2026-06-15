@@ -2,25 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.50`
-- start_commit: `c58fbfe55123f50f8ac712951032ec2d1afb73fd`
-- end_commit: `ef2f8e51a1e9fe1cfadff3df13bc4e06a1d6394e`
+- version: `v1.1.51`
+- start_commit: `77188a1f83805acde259980a6bd03b52def26b88`
+- end_commit: `8dc356356107587c43ad7402a078dcbddb477630`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Mark required validation red after repeated failed validation runs inside a single terminal job, so PushPals does not need a second failed job before prioritizing repair.
-- Treat Windows PowerShell `ModuleAnalysisCache` and `PSReadLine` cache files as runtime artifacts instead of publishable job output.
-- Expand Git's untracked `Microsoft/` directory status into concrete known PowerShell cache artifact paths before WorkerPal publishability and diff-budget checks.
-- Add regression coverage for single-job validation-red snapshots and Windows PowerShell cache artifact filtering in both direct and packaged WorkerPal runtime paths.
+- Recognize autonomy-origin required-validation repair prompts as diagnostic repair work instead of ordinary background ideation.
+- Give validation repair jobs longer no-edit and command-progress budgets so browser smoke reproduction and root-cause diagnosis are not interrupted prematurely.
+- Keep rollout-coach semantic drift detection for validation repair jobs, while ignoring artifact-only Windows PowerShell cache dirt as a standalone off-track signal.
+- Add regression coverage proving validation repair continues past `Microsoft/Windows/PowerShell/ModuleAnalysisCache` noise in both source and packaged WorkerPal runtime paths.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/server.autonomy-store.test.ts tests/remotebuddy.autonomous-engine.tick.test.ts tests/workerpals.quality-gate-issues.test.ts`
-- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_codex_changed_paths_filters_dependency_artifacts_from_publishable_delta apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_codex_changed_paths_filters_windows_powershell_cache_directory`
-- `bun test tests/remotebuddy.persistent-memory.test.ts -t "recalls repo history across sessions from sqlite"`
+- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_validation_repair_prompt_gets_diagnostic_watchdogs apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_run_codex_task_validation_repair_ignores_artifact_only_rollout_progress`
+- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
+- `bun test tests/workerpals.quality-gate-issues.test.ts`
 - `bun run test:prompt-policy`
 - `bun run test:protocol`
 - `bun run test:root`
