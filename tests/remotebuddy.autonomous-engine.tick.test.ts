@@ -455,6 +455,173 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(String(objective.request_id ?? "")).toBe("req_tick_1");
   });
 
+  test("tick dispatches validation repair before normal ideation when required validation is red", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-validation-red-"));
+    tempDirs.push(root);
+    const scriptPath = join(root, "scripts", "test-web-e2e.js");
+    mkdirSync(join(scriptPath, ".."), { recursive: true });
+    writeFileSync(scriptPath, "// web e2e fixture\n", "utf8");
+
+    const calls: FetchCall[] = [];
+    const objectivePosts: Array<Record<string, unknown>> = [];
+    let llmCall = 0;
+    const snapshot = {
+      ...makeSnapshot(),
+      top_signals: [
+        {
+          signal_id: "sig_validation_incident",
+          type: "test_failure",
+          value: 0.95,
+          evidence: "required validation failing: bun run web:e2e failures=4 jobs=4",
+        },
+      ],
+      state_traits: [
+        {
+          trait_id: "repo_validation_red",
+          category: "risk",
+          focus: "repo_validation",
+          score: 0.95,
+          evidence: "required validation failing: bun run web:e2e",
+        },
+      ],
+      repo_health_flags: {
+        is_worktree_dirty: false,
+        is_merge_in_progress: false,
+        dispatch_lock_held: false,
+        required_validation_red: true,
+      },
+      validation_incident: {
+        active: true,
+        incident_id: "valid_inc_web_e2e",
+        command: "bun run web:e2e",
+        signal_type: "test_failure",
+        failure_class: "browser_smoke_failed",
+        failure_count: 4,
+        total_runs: 5,
+        failed_job_ids: ["job_a", "job_b", "job_c", "job_d"],
+        last_failed_job_id: "job_d",
+        first_failed_at: "2026-06-14T20:00:00.000Z",
+        last_failed_at: "2026-06-14T20:05:00.000Z",
+        digest: "web_e2e_digest",
+        sample_error: "scripts/test-web-e2e.js:12 browser smoke assertion failed",
+        required_commands: ["bun test", "bun run web:e2e"],
+        target_path_hints: ["scripts/test-web-e2e.js"],
+      },
+    };
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/renew"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot")) return jsonResponse(200, { ok: true, snapshot });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
+      if (url.endsWith("/autonomy/eligibility")) {
+        const candidates = Array.isArray((body as Record<string, unknown>).candidates)
+          ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
+          : [];
+        return jsonResponse(200, {
+          ok: true,
+          results: candidates.map((entry) => ({
+            candidate_id: String(entry.id ?? entry.candidate_id ?? ""),
+            ok: true,
+          })),
+        });
+      }
+      if (url.endsWith("/requests/enqueue"))
+        return jsonResponse(201, { ok: true, requestId: "req_validation_repair" });
+      if (url.endsWith("/autonomy/objectives")) {
+        objectivePosts.push(body as Record<string, unknown>);
+        return jsonResponse(200, {
+          ok: true,
+          objectiveId: "obj_validation_repair",
+          patternKey: "pk_validation_repair",
+        });
+      }
+      if (url.includes("/autonomy/inspiration")) {
+        throw new Error("inspiration should not run during validation repair mode");
+      }
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate() {
+        llmCall += 1;
+        throw new Error("LLM should not run during validation repair mode");
+      },
+    };
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_validation_red",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => true;
+    (engine as any).loadVisionContext = () => ({
+      path: "vision.md",
+      markdown: "# Vision\n",
+      one_sentence: "Keep required validation trustworthy.",
+      sections: [
+        {
+          number: "1",
+          title: "Reliability",
+          markdown: "Restore failing validation baselines.",
+          truncated: false,
+        },
+      ],
+      key_items: {
+        target_users: ["maintainers"],
+        priorities: ["reliability"],
+        objectives: ["trustworthy validation"],
+        guardrails: ["small scoped changes"],
+        constraints: ["safe defaults"],
+        non_goals: [],
+        metrics: ["green required validation"],
+        risk_policy: ["low risk repairs"],
+        operating_model: ["repair failing baselines"],
+        governance: ["report environment blockers"],
+      },
+      section_numbers: ["1"],
+      sha256: "visionhash",
+      truncated: false,
+    });
+
+    await engine.tick();
+
+    expect(llmCall).toBe(0);
+    expect(calls.some((entry) => entry.url.includes("/autonomy/inspiration"))).toBe(false);
+    const enqueueCall = calls.find((entry) => entry.url.endsWith("/requests/enqueue"));
+    expect(enqueueCall).toBeDefined();
+    expect(JSON.stringify(enqueueCall?.body ?? {})).toContain("bun run web:e2e");
+    expect(objectivePosts.length).toBe(1);
+    const objective = (objectivePosts[0]?.objective ?? {}) as Record<string, unknown>;
+    expect(String(objective.status ?? "")).toBe("dispatched");
+    expect(String(objective.objective_type ?? "")).toBe("flaky_test");
+    expect(String(objective.trigger_type ?? "")).toBe("test_failure");
+    expect(objective.target_paths).toEqual(["scripts/test-web-e2e.js"]);
+    expect(objective.expected_validation).toEqual(["bun run web:e2e", "bun test"]);
+  });
+
   test("tick records blocked objective with question when candidate requires user input", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();

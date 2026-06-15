@@ -123,6 +123,24 @@ interface OpenObjective {
   updated_at: string;
 }
 
+interface ValidationIncident {
+  active: true;
+  incident_id: string;
+  command: string;
+  signal_type: SignalValue["type"];
+  failure_class: string | null;
+  failure_count: number;
+  total_runs: number;
+  failed_job_ids: string[];
+  last_failed_job_id: string | null;
+  first_failed_at: string | null;
+  last_failed_at: string | null;
+  digest: string;
+  sample_error: string;
+  required_commands: string[];
+  target_path_hints: string[];
+}
+
 interface ObjectivePolicy {
   maxRisk: AutonomyRiskLevel;
   maxGlobBreadth: AutonomyGlobBreadth;
@@ -218,16 +236,10 @@ type EngineSourceCurationStatus = "candidate" | "trusted" | "watchlist" | "archi
 
 function isNegativePrFeedbackVerdict(value: string): boolean {
   const text = value.toLowerCase();
-  return (
-    text.includes("reject") ||
-    text.includes("merge_failed") ||
-    text.includes("failed")
-  );
+  return text.includes("reject") || text.includes("merge_failed") || text.includes("failed");
 }
 
-function deriveOutcomeFromPrFeedbackVerdict(
-  verdict: string,
-): {
+function deriveOutcomeFromPrFeedbackVerdict(verdict: string): {
   success: boolean;
   userAction: string;
   reopenedWithin24h: boolean;
@@ -237,8 +249,7 @@ function deriveOutcomeFromPrFeedbackVerdict(
   const text = verdict.toLowerCase();
   if (
     text.includes("approved_unmergeable") ||
-    (text.includes("approved") &&
-      (text.includes("unmergeable") || text.includes("merge_conflict")))
+    (text.includes("approved") && (text.includes("unmergeable") || text.includes("merge_conflict")))
   ) {
     return null;
   }
@@ -288,7 +299,9 @@ export interface AutonomySnapshot {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
     dispatch_lock_held: boolean;
+    required_validation_red: boolean;
   };
+  validation_incident: ValidationIncident | null;
   dispatch_budget: {
     rolling_window_seconds: number;
     global_count_last_hour: number;
@@ -731,10 +744,54 @@ function normalizeSignalType(value: string): SignalValue["type"] {
   const text = value.toLowerCase();
   if (text === "lint_failure" || /\blint\b/.test(text)) return "lint_failure";
   if (text === "typecheck_failure" || /\btype(check)?\b/.test(text)) return "typecheck_failure";
-  if (text === "test_failure" || /\btest|pytest|vitest|jest\b/.test(text)) return "test_failure";
+  if (
+    text === "test_failure" ||
+    /\b(test|pytest|vitest|jest|e2e|smoke|browser|playwright)\b/.test(text)
+  )
+    return "test_failure";
   if (text === "regret_signal" || /\bregret|reopen|re-open\b/.test(text)) return "regret_signal";
   if (text === "queue_health") return "queue_health";
   return "queue_health";
+}
+
+function normalizeValidationCommand(value: unknown): string {
+  return asString(value).replace(/\s+/g, " ");
+}
+
+function validationSignalType(
+  command: string,
+  failureClass: string | null,
+  sample: string,
+): SignalValue["type"] {
+  return normalizeSignalType(`${command} ${failureClass ?? ""} ${sample}`);
+}
+
+function validationIncidentDigest(
+  command: string,
+  failureClass: string | null,
+  sample: string,
+): string {
+  return sha256Hex(`${command}\n${failureClass ?? ""}\n${sample}`).slice(0, 16);
+}
+
+function collectValidationPathHints(...texts: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const pathRe =
+    /(?:^|[\s("'`])([A-Za-z0-9_.@/-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|css|scss|html|yml|yaml|toml))(?:[:)\s,"'`]|$)/g;
+  for (const text of texts) {
+    for (const match of text.matchAll(pathRe)) {
+      const raw = asString(match[1]).replace(/\\/g, "/");
+      if (!raw || raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) continue;
+      if (raw.includes("node_modules/") || raw.includes("/node_modules/")) continue;
+      const normalized = normalizeAutonomyComponentArea(raw);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      out.push(normalized);
+      if (out.length >= 12) return out;
+    }
+  }
+  return out;
 }
 
 function parseJobPayloadText(raw: string | null): string {
@@ -2606,12 +2663,181 @@ export class AutonomyStore {
     };
   }
 
+  private detectActiveValidationIncident(nowIso: string): ValidationIncident | null {
+    let rows: Array<{
+      jobId: string | null;
+      command: string | null;
+      passed: number | null;
+      failureClass: string | null;
+      stdoutTail: string | null;
+      stderrTail: string | null;
+      createdAt: string | null;
+      jobStatus: string | null;
+    }> = [];
+    try {
+      rows = this.db
+        .prepare(
+          `SELECT v.jobId AS jobId,
+                  v.command AS command,
+                  v.passed AS passed,
+                  v.failureClass AS failureClass,
+                  v.stdoutTail AS stdoutTail,
+                  v.stderrTail AS stderrTail,
+                  v.createdAt AS createdAt,
+                  j.status AS jobStatus
+           FROM job_validation_runs v
+           JOIN jobs j ON j.id = v.jobId
+           WHERE datetime(v.createdAt) >= datetime(?, '-24 hours')
+           ORDER BY v.createdAt DESC, v.id DESC
+           LIMIT 240`,
+        )
+        .all(nowIso) as Array<{
+        jobId: string | null;
+        command: string | null;
+        passed: number | null;
+        failureClass: string | null;
+        stdoutTail: string | null;
+        stderrTail: string | null;
+        createdAt: string | null;
+        jobStatus: string | null;
+      }>;
+    } catch {
+      return null;
+    }
+
+    type ValidationCommandGroup = {
+      command: string;
+      totalRuns: number;
+      failureCount: number;
+      failedJobIds: Set<string>;
+      lastFailure: (typeof rows)[number] | null;
+      latestFailAtMs: number;
+      latestPassAtMs: number;
+      firstFailedAt: string | null;
+      requiredCommands: Set<string>;
+      pathHints: string[];
+    };
+    const groups = new Map<string, ValidationCommandGroup>();
+    const failedJobStatuses = new Set(["failed", "abandoned", "publish_blocked"]);
+    for (const row of rows) {
+      const command = normalizeValidationCommand(row.command);
+      if (!command) continue;
+      const createdAt = asString(row.createdAt);
+      const createdAtMs = Date.parse(createdAt);
+      const group =
+        groups.get(command) ??
+        ({
+          command,
+          totalRuns: 0,
+          failureCount: 0,
+          failedJobIds: new Set<string>(),
+          lastFailure: null,
+          latestFailAtMs: 0,
+          latestPassAtMs: 0,
+          firstFailedAt: null,
+          requiredCommands: new Set<string>(),
+          pathHints: [],
+        } satisfies ValidationCommandGroup);
+      groups.set(command, group);
+      group.totalRuns += 1;
+      if (Number(row.passed) === 1) {
+        if (Number.isFinite(createdAtMs)) {
+          group.latestPassAtMs = Math.max(group.latestPassAtMs, createdAtMs);
+        }
+        continue;
+      }
+      if (!failedJobStatuses.has(asString(row.jobStatus))) continue;
+      const jobId = asString(row.jobId);
+      if (!jobId) continue;
+      group.failureCount += 1;
+      group.failedJobIds.add(jobId);
+      if (Number.isFinite(createdAtMs)) {
+        if (createdAtMs >= group.latestFailAtMs) {
+          group.latestFailAtMs = createdAtMs;
+          group.lastFailure = row;
+        }
+        if (!group.firstFailedAt || createdAtMs < Date.parse(group.firstFailedAt)) {
+          group.firstFailedAt = createdAt;
+        }
+      } else if (!group.lastFailure) {
+        group.lastFailure = row;
+      }
+      group.requiredCommands.add(command);
+      const hints = collectValidationPathHints(
+        asString(row.stderrTail),
+        asString(row.stdoutTail),
+        command,
+      );
+      for (const hint of hints) {
+        if (!group.pathHints.includes(hint)) group.pathHints.push(hint);
+      }
+    }
+
+    for (const row of rows) {
+      const jobId = asString(row.jobId);
+      const command = normalizeValidationCommand(row.command);
+      if (!jobId || !command) continue;
+      for (const group of groups.values()) {
+        if (group.failedJobIds.has(jobId)) group.requiredCommands.add(command);
+      }
+    }
+
+    const activeGroups = [...groups.values()]
+      .filter((group) => group.failureCount >= 2)
+      .filter((group) => group.failedJobIds.size >= 2)
+      .filter((group) => group.latestFailAtMs > group.latestPassAtMs)
+      .sort((a, b) => {
+        if (b.failureCount !== a.failureCount) return b.failureCount - a.failureCount;
+        if (b.failedJobIds.size !== a.failedJobIds.size) {
+          return b.failedJobIds.size - a.failedJobIds.size;
+        }
+        return b.latestFailAtMs - a.latestFailAtMs;
+      });
+    const selected = activeGroups[0];
+    if (!selected?.lastFailure) return null;
+
+    const sample = truncateText(
+      asString(selected.lastFailure.stderrTail) || asString(selected.lastFailure.stdoutTail),
+      900,
+    );
+    const failureClass = asString(selected.lastFailure.failureClass) || null;
+    const digest = validationIncidentDigest(selected.command, failureClass, sample);
+    return {
+      active: true,
+      incident_id: `valid_inc_${digest}`,
+      command: selected.command,
+      signal_type: validationSignalType(selected.command, failureClass, sample),
+      failure_class: failureClass,
+      failure_count: selected.failureCount,
+      total_runs: selected.totalRuns,
+      failed_job_ids: [...selected.failedJobIds].slice(0, 8),
+      last_failed_job_id: asString(selected.lastFailure.jobId) || null,
+      first_failed_at: selected.firstFailedAt,
+      last_failed_at: asString(selected.lastFailure.createdAt) || null,
+      digest,
+      sample_error: sample,
+      required_commands: [...selected.requiredCommands].slice(0, 8),
+      target_path_hints: selected.pathHints.slice(0, 8),
+    };
+  }
+
   private buildTopSignals(
     requestSlo?: QueueSloSummary,
     jobSlo?: QueueSloSummary,
     executionHealth?: ExecutionHealthSummary,
+    validationIncident?: ValidationIncident | null,
   ): SignalValue[] {
     const topSignals: SignalValue[] = [];
+    if (validationIncident?.active) {
+      topSignals.push({
+        signal_id: "sig_validation_incident",
+        type: validationIncident.signal_type,
+        value: clamp01(0.6 + validationIncident.failure_count / 10),
+        evidence:
+          `required validation failing: ${validationIncident.command} ` +
+          `failures=${validationIncident.failure_count} jobs=${validationIncident.failed_job_ids.length}`,
+      });
+    }
     let failedRows: Array<{ kind: string | null; error: string | null; count: number }> = [];
     try {
       failedRows = this.db
@@ -2892,6 +3118,7 @@ export class AutonomyStore {
     dispatchBudget: { globalCount: number; byType: Record<string, number> };
     openObjectives: OpenObjective[];
     repoHealthFlags?: { is_worktree_dirty?: boolean; is_merge_in_progress?: boolean };
+    validationIncident?: ValidationIncident | null;
   }): StateTrait[] {
     const traits: StateTrait[] = [];
     const pushTrait = (trait: StateTrait): void => {
@@ -2918,6 +3145,18 @@ export class AutonomyStore {
         focus: "queue_latency",
         score: norm(120_000 - queueP95, 0, 120_000),
         evidence: `request queue p95=${Math.floor(queueP95)}ms`,
+      });
+    }
+
+    if (params.validationIncident?.active) {
+      pushTrait({
+        trait_id: "repo_validation_red",
+        category: "risk",
+        focus: "repo_validation",
+        score: clamp01(0.65 + params.validationIncident.failure_count / 10),
+        evidence:
+          `required validation failing: ${params.validationIncident.command} ` +
+          `failures=${params.validationIncident.failure_count} jobs=${params.validationIncident.failed_job_ids.length}`,
       });
     }
 
@@ -3626,7 +3865,13 @@ export class AutonomyStore {
     const snapshotId = `snap_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const ttlMs = this.config.remotebuddy.autonomy.tickIntervalMs * 2;
     const executionHealth = this.recentExecutionHealthSummary();
-    const topSignals = this.buildTopSignals(params.requestSlo, params.jobSlo, executionHealth);
+    const validationIncident = this.detectActiveValidationIncident(now);
+    const topSignals = this.buildTopSignals(
+      params.requestSlo,
+      params.jobSlo,
+      executionHealth,
+      validationIncident,
+    );
 
     const feedbackPriors = this.db
       .prepare(
@@ -3685,6 +3930,7 @@ export class AutonomyStore {
       dispatchBudget,
       openObjectives,
       repoHealthFlags: params.repoHealthFlags,
+      validationIncident,
     });
 
     const snapshot: AutonomySnapshot = {
@@ -3703,7 +3949,9 @@ export class AutonomyStore {
         is_worktree_dirty: Boolean(params.repoHealthFlags?.is_worktree_dirty),
         is_merge_in_progress: Boolean(params.repoHealthFlags?.is_merge_in_progress),
         dispatch_lock_held: this.isDispatchLockHeldByAnotherRun(params.runId, now),
+        required_validation_red: Boolean(validationIncident?.active),
       },
+      validation_incident: validationIncident,
       dispatch_budget: {
         rolling_window_seconds: 3600,
         global_count_last_hour: dispatchBudget.globalCount,
@@ -4545,7 +4793,9 @@ export class AutonomyStore {
         reviewAgentRecord.sourceJobId ?? reviewAgentRecord.source_job_id,
       );
       const resolvedFromObjective =
-        (asString(autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id)
+        (asString(
+          autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id,
+        )
           ? readByObjective(
               asString(
                 autonomyRecord.objectiveId ?? paramsRecord.objectiveId ?? paramsRecord.objective_id,
@@ -4579,7 +4829,9 @@ export class AutonomyStore {
           asString(resolvedFromSourceJob?.jobId) ||
           null,
         patternKey:
-          asString(autonomyRecord.patternKey ?? paramsRecord.patternKey ?? paramsRecord.pattern_key) ||
+          asString(
+            autonomyRecord.patternKey ?? paramsRecord.patternKey ?? paramsRecord.pattern_key,
+          ) ||
           asString(resolvedFromObjective?.patternKey) ||
           asString(resolvedFromSourceJob?.patternKey) ||
           null,

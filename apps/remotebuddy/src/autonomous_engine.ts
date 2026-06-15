@@ -124,7 +124,25 @@ type Snapshot = {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
     dispatch_lock_held: boolean;
+    required_validation_red?: boolean;
   };
+  validation_incident?: {
+    active?: boolean;
+    incident_id?: string;
+    command?: string;
+    signal_type?: string;
+    failure_class?: string | null;
+    failure_count?: number;
+    total_runs?: number;
+    failed_job_ids?: string[];
+    last_failed_job_id?: string | null;
+    first_failed_at?: string | null;
+    last_failed_at?: string | null;
+    digest?: string;
+    sample_error?: string;
+    required_commands?: string[];
+    target_path_hints?: string[];
+  } | null;
   dispatch_budget: {
     global_count_last_hour: number;
     by_type_count_last_hour: Record<string, number>;
@@ -1220,15 +1238,17 @@ function containsPushPalsInternalUserRepoText(text: string): boolean {
   );
 }
 
-function candidateLeaksPushPalsInternals(candidate: Pick<
-  AutonomyCandidate,
-  | "title"
-  | "problem_statement"
-  | "vision_alignment_reason"
-  | "feature_hypotheses"
-  | "target_paths"
-  | "component_area"
->): boolean {
+function candidateLeaksPushPalsInternals(
+  candidate: Pick<
+    AutonomyCandidate,
+    | "title"
+    | "problem_statement"
+    | "vision_alignment_reason"
+    | "feature_hypotheses"
+    | "target_paths"
+    | "component_area"
+  >,
+): boolean {
   if (
     [candidate.component_area, ...candidate.target_paths].some((path) =>
       isPushPalsInternalUserRepoPath(path),
@@ -1460,7 +1480,11 @@ function chooseRepoObjectiveTargetProfile(
       if (validationSurface || scriptSurface) score += 5;
       if (productSurface) score += 1;
     }
-    if (/\b(web|browser|smoke|e2e|review path|review|navigation|delivery|trust)\b/i.test(objective.title)) {
+    if (
+      /\b(web|browser|smoke|e2e|review path|review|navigation|delivery|trust)\b/i.test(
+        objective.title,
+      )
+    ) {
       if (/(^|\/)(scripts?|tools?)\/.*(web|browser|smoke|e2e|playwright)/i.test(label)) {
         score += 8;
       }
@@ -1552,6 +1576,292 @@ function findMissingRepoTargetPaths(repoRoot: string, targetPaths: string[]): st
     .map((targetPath) => asString(targetPath))
     .filter(Boolean)
     .filter((targetPath) => !existsSync(resolve(repoRoot, targetPath)));
+}
+
+const VALIDATION_REPAIR_ACTIVE_STATUSES = new Set([
+  "proposed",
+  "gated",
+  "dispatched",
+  "running",
+  "blocked",
+  "needs_clarification",
+]);
+
+function activeValidationIncident(
+  snapshot: Snapshot,
+): NonNullable<Snapshot["validation_incident"]> | null {
+  const incident = snapshot.validation_incident;
+  if (!incident || !incident.active) return null;
+  const command = asString(incident.command);
+  if (!command) return null;
+  return incident;
+}
+
+function validationRepairTriggerType(
+  incident: NonNullable<Snapshot["validation_incident"]>,
+): AutonomyCandidate["trigger_type"] {
+  const signalType = asString(incident.signal_type);
+  if (
+    isTriggerType(signalType) &&
+    signalType !== "queue_health" &&
+    signalType !== "regret_signal"
+  ) {
+    return signalType;
+  }
+  const inferred = inferTriggerTypeFromText(
+    `${asString(incident.command)} ${asString(incident.failure_class)} ${asString(
+      incident.sample_error,
+    )}`,
+  );
+  return inferred === "queue_health" || inferred === "regret_signal" ? "test_failure" : inferred;
+}
+
+function validationRepairObjectiveType(
+  triggerType: AutonomyCandidate["trigger_type"],
+  incident: NonNullable<Snapshot["validation_incident"]>,
+): AutonomyObjectiveType {
+  if (triggerType === "lint_failure") return "lint_fix";
+  if (triggerType === "typecheck_failure") return "type_fix";
+  if (triggerType === "test_failure") return "flaky_test";
+  return inferObjectiveTypeFromText(
+    `${asString(incident.command)} ${asString(incident.failure_class)} ${asString(
+      incident.sample_error,
+    )}`,
+    [],
+  );
+}
+
+function validationRepairCommandTargetCandidates(
+  incident: NonNullable<Snapshot["validation_incident"]>,
+): string[] {
+  const text = `${asString(incident.command)} ${asString(incident.failure_class)} ${asString(
+    incident.sample_error,
+  )}`.toLowerCase();
+  if (/\b(lint|eslint|prettier|format)\b/.test(text)) {
+    return [
+      "eslint.config.js",
+      "eslint.config.mjs",
+      ".eslintrc.cjs",
+      ".eslintrc.js",
+      "package.json",
+    ];
+  }
+  if (/\b(tsc|typecheck|typescript|type error)\b/.test(text)) {
+    return ["tsconfig.json", "package.json"];
+  }
+  if (/\b(web|e2e|browser|smoke|playwright)\b/.test(text)) {
+    return [
+      "scripts/test-web-e2e.js",
+      "scripts/web-e2e.js",
+      "playwright.config.ts",
+      "playwright.config.js",
+      "tests/e2e",
+      "e2e",
+      "package.json",
+    ];
+  }
+  if (/\b(test|vitest|jest|bun test)\b/.test(text)) {
+    return ["tests", "test", "__tests__", "package.json"];
+  }
+  return ["package.json", "src", "app"];
+}
+
+function validationRepairTargetPaths(params: {
+  incident: NonNullable<Snapshot["validation_incident"]>;
+  repoRoot: string;
+  repoTargets: RepoTargetProfile[];
+  triggerType: AutonomyCandidate["trigger_type"];
+}): string[] {
+  const candidates = [
+    ...asStringArray(params.incident.target_path_hints),
+    ...validationRepairCommandTargetCandidates(params.incident),
+  ];
+  const seen = new Set<string>();
+  const existing: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = normalizeAutonomyComponentArea(candidate);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    if (existsSync(resolve(params.repoRoot, normalized))) {
+      existing.push(normalized);
+      if (existing.length >= 3) return existing;
+    }
+  }
+  if (existing.length > 0) return existing;
+  const selected = chooseRepoTargetProfile(
+    params.repoTargets,
+    [
+      asString(params.incident.command),
+      asString(params.incident.failure_class),
+      asString(params.incident.sample_error),
+    ],
+    params.triggerType,
+  );
+  if (selected?.target_paths.length) return selected.target_paths.slice(0, 3);
+  const fallback = normalizeAutonomyComponentArea(candidates[0]) ?? "package.json";
+  return [fallback];
+}
+
+function validationRepairComponentArea(
+  targetPaths: string[],
+  repoTargets: RepoTargetProfile[],
+  triggerType: AutonomyCandidate["trigger_type"],
+): AutonomyComponentArea {
+  const selected = chooseRepoTargetProfile(repoTargets, targetPaths, triggerType);
+  const selectedPath = targetPaths[0] ?? selected?.target_paths[0] ?? "src";
+  return (
+    normalizeAutonomyComponentArea(pathDirname(selectedPath) || selectedPath) ??
+    selected?.component_area ??
+    "src"
+  );
+}
+
+function validationRepairExpectedCommands(
+  incident: NonNullable<Snapshot["validation_incident"]>,
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const command of [
+    asString(incident.command),
+    ...asStringArray(incident.required_commands),
+  ]) {
+    const canonical = canonicalizeValidationCommandForBun(command);
+    if (!canonical || seen.has(canonical)) continue;
+    seen.add(canonical);
+    out.push(canonical);
+    if (out.length >= 6) break;
+  }
+  return out.length > 0
+    ? out
+    : [canonicalizeValidationCommandForBun(asString(incident.command))].filter(Boolean);
+}
+
+function buildValidationIncidentRepairCandidate(params: {
+  snapshot: Snapshot;
+  repoRoot: string;
+  repoTargets: RepoTargetProfile[];
+  visionSectionRefs: string[];
+}): AutonomyCandidate | null {
+  const incident = activeValidationIncident(params.snapshot);
+  if (!incident) return null;
+  const triggerType = validationRepairTriggerType(incident);
+  const objectiveType = validationRepairObjectiveType(triggerType, incident);
+  const targetPaths = validationRepairTargetPaths({
+    incident,
+    repoRoot: params.repoRoot,
+    repoTargets: params.repoTargets,
+    triggerType,
+  });
+  const componentArea = validationRepairComponentArea(targetPaths, params.repoTargets, triggerType);
+  const expectedValidation = validationRepairExpectedCommands(incident);
+  const command = asString(incident.command);
+  const failureCount = Math.max(0, Math.floor(asNumber(incident.failure_count, 0)));
+  const failedJobCount = asStringArray(incident.failed_job_ids).length;
+  const sample = compactStatusDetail(asString(incident.sample_error), 600);
+  const signalIds = params.snapshot.top_signals
+    .filter(
+      (signal) =>
+        signal.signal_id === "sig_validation_incident" ||
+        signal.evidence.toLowerCase().includes(command.toLowerCase()),
+    )
+    .map((signal) => signal.signal_id);
+  return {
+    id: `cand_validation_repair_${sha256(`${command}|${asString(incident.digest)}`).slice(0, 8)}`,
+    title: `Restore required validation: ${command}`,
+    objective_type: objectiveType,
+    problem_statement: [
+      "Required validation is repeatedly failing before publication.",
+      `Primary failing command: ${command}.`,
+      `Recent failures: ${failureCount} across ${failedJobCount} job(s).`,
+      sample ? `Latest failure excerpt: ${sample}` : "",
+      "Fix the repo baseline issue that makes this command fail, then rerun the failing command and related required validation.",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    trigger_type: triggerType,
+    component_area: componentArea,
+    target_paths: targetPaths,
+    scope: {
+      read_anywhere: false,
+      write_globs: targetPaths,
+    },
+    risk_level: "low",
+    expected_validation: expectedValidation,
+    estimated_effort: "small",
+    why_now_signal_ids: signalIds.length > 0 ? signalIds.slice(0, 4) : ["sig_validation_incident"],
+    confidence: 0.92,
+    vision_alignment_reason:
+      "A green required validation baseline keeps repair work trustworthy and prevents unrelated changes from being blocked by stale failures.",
+    vision_section_refs: normalizeVisionSectionRefs(params.visionSectionRefs.slice(0, 3)),
+    feature_hypotheses: [
+      "Restoring the failing required command will allow future scoped changes to publish with trustworthy validation.",
+    ],
+    candidate_created_at: new Date().toISOString(),
+  };
+}
+
+function validationRepairInstruction(
+  candidate: AutonomyCandidate,
+  incident: NonNullable<Snapshot["validation_incident"]>,
+): string {
+  return canonicalizeInstructionTextForBun(
+    [
+      candidate.title,
+      "",
+      candidate.problem_statement,
+      "",
+      "Course of action:",
+      `- Reproduce the failing command first: ${asString(incident.command)}`,
+      "- Identify whether the root cause is code, test, tooling, or local repo configuration.",
+      "- Fix the baseline failure in the smallest repo-owned scope that makes the command pass.",
+      "- If the failure is caused by missing local data, credentials, or environment that cannot be repaired in repo code, report that blocker clearly instead of masking it.",
+      "",
+      "Scope:",
+      `- target_paths: ${candidate.target_paths.join(", ")}`,
+      `- write_globs: ${candidate.scope.write_globs.join(", ")}`,
+      "",
+      "Expected validation:",
+      ...candidate.expected_validation.map((command) => `- ${command}`),
+    ].join("\n"),
+  );
+}
+
+function validationRepairCandidatePayload(params: {
+  candidate: AutonomyCandidate;
+  patternKey: string;
+  selected: boolean;
+  gateDecision: "approved" | "rejected";
+  gateReasons?: string[];
+}): Record<string, unknown> {
+  return {
+    id: params.candidate.id,
+    title: params.candidate.title,
+    objective_type: params.candidate.objective_type,
+    problem_statement: params.candidate.problem_statement,
+    trigger_type: params.candidate.trigger_type,
+    component_area: params.candidate.component_area,
+    target_paths: params.candidate.target_paths,
+    scope: params.candidate.scope,
+    risk_level: params.candidate.risk_level,
+    expected_validation: params.candidate.expected_validation,
+    estimated_effort: params.candidate.estimated_effort,
+    why_now_signal_ids: params.candidate.why_now_signal_ids,
+    confidence: params.candidate.confidence,
+    vision_alignment_reason: params.candidate.vision_alignment_reason,
+    vision_section_refs: params.candidate.vision_section_refs,
+    feature_hypotheses: params.candidate.feature_hypotheses,
+    pattern_key: params.patternKey,
+    llm_score: 1,
+    impact_signal: 1,
+    penalties: [],
+    final_score: 1,
+    gate_decision: params.gateDecision,
+    gate_reasons: params.gateReasons ?? [],
+    selected: params.selected,
+    selection_strategy: "validation_incident_repair",
+    selection_roll: null,
+    candidate_created_at: params.candidate.candidate_created_at,
+  };
 }
 
 function asAutonomyObjectiveType(value: unknown): AutonomyObjectiveType | null {
@@ -2303,7 +2613,8 @@ function inferTriggerTypeFromText(
     return "queue_health";
   if (/\b(lint|format)\b/i.test(text)) return "lint_failure";
   if (/\b(typecheck|type error|typing|typescript)\b/i.test(text)) return "typecheck_failure";
-  if (/\b(test|flake|flaky|failing test)\b/i.test(text)) return "test_failure";
+  if (/\b(test|flake|flaky|failing test|e2e|smoke|browser|playwright)\b/i.test(text))
+    return "test_failure";
   return "regret_signal";
 }
 
@@ -4978,6 +5289,212 @@ export class RemoteBuddyAutonomousEngine {
     });
   }
 
+  private async dispatchValidationIncidentRepair(params: {
+    runId: string;
+    snapshot: Snapshot;
+    repoTargets: RepoTargetProfile[];
+    visionSectionRefs: string[];
+  }): Promise<{ handled: boolean; outcome: "success" | "skipped" | "failed"; detail: string }> {
+    const incident = activeValidationIncident(params.snapshot);
+    if (!incident) {
+      return { handled: false, outcome: "skipped", detail: "no_validation_incident" };
+    }
+    const candidate = buildValidationIncidentRepairCandidate({
+      snapshot: params.snapshot,
+      repoRoot: this.autonomyRepo,
+      repoTargets: params.repoTargets,
+      visionSectionRefs: params.visionSectionRefs,
+    });
+    if (!candidate) {
+      return {
+        handled: true,
+        outcome: "skipped",
+        detail: "validation_repair_candidate_unavailable",
+      };
+    }
+    const patternKey = makePatternKey(
+      candidate.objective_type,
+      candidate.target_paths,
+      candidate.trigger_type,
+      candidate.component_area,
+    );
+    const hasActiveRepair = params.snapshot.open_objectives.some(
+      (objective) =>
+        objective.pattern_key === patternKey &&
+        VALIDATION_REPAIR_ACTIVE_STATUSES.has(asString(objective.status)),
+    );
+    if (hasActiveRepair) {
+      console.log(
+        `[RemoteBuddyAutonomousEngine] tick ${params.runId}: validation repair already active for ${asString(
+          incident.command,
+        )}; skipping normal autonomy while required validation remains red.`,
+      );
+      return { handled: true, outcome: "skipped", detail: "validation_repair_already_active" };
+    }
+
+    this.setPhase("validation_repair_eligibility");
+    const eligibilityById = await this.fetchEligibility(params.runId, params.snapshot.snapshot_id, [
+      {
+        id: candidate.id,
+        objective_type: candidate.objective_type,
+        component_area: candidate.component_area,
+        pattern_key: patternKey,
+        confidence: candidate.confidence,
+      },
+    ]);
+    const eligibility = eligibilityById.get(candidate.id) ?? {
+      ok: false,
+      reason: "eligibility_unavailable",
+    };
+    const objectiveId = `obj_${randomUUID().slice(0, 8)}`;
+    if (!eligibility.ok) {
+      const reason = eligibility.reason ?? "validation repair not eligible";
+      await this.postObjective({
+        runId: params.runId,
+        snapshotId: params.snapshot.snapshot_id,
+        sessionId: this.sessionId,
+        candidates: [
+          validationRepairCandidatePayload({
+            candidate,
+            patternKey,
+            selected: true,
+            gateDecision: "rejected",
+            gateReasons: [reason],
+          }),
+        ],
+        objective: {
+          id: objectiveId,
+          candidate_id: candidate.id,
+          title: candidate.title,
+          instruction: candidate.problem_statement,
+          objective_type: candidate.objective_type,
+          component_area: candidate.component_area,
+          trigger_type: candidate.trigger_type,
+          target_paths: candidate.target_paths,
+          scope: candidate.scope,
+          confidence: candidate.confidence,
+          risk_level: candidate.risk_level,
+          expected_validation: candidate.expected_validation,
+          status: "rejected",
+          block_reason: reason,
+        },
+        llmCalls: [],
+      });
+      return {
+        handled: true,
+        outcome: "skipped",
+        detail: compactStatusDetail(`validation_repair_not_eligible:${reason}`),
+      };
+    }
+
+    this.setPhase("renew_lock_before_validation_repair_enqueue");
+    if (!(await this.renewDispatchLock(params.runId))) {
+      return {
+        handled: true,
+        outcome: "skipped",
+        detail: "lock_renew_failed_before_validation_repair_enqueue",
+      };
+    }
+
+    const instruction = validationRepairInstruction(candidate, incident);
+    this.setPhase("enqueue_validation_repair");
+    const requestId = await this.enqueueSyntheticRequest(instruction, {
+      objectiveId,
+      runId: params.runId,
+      snapshotId: params.snapshot.snapshot_id,
+      patternKey,
+      componentArea: candidate.component_area,
+      targetPaths: candidate.target_paths,
+      writeGlobs: candidate.scope.write_globs,
+    });
+    if (!requestId) {
+      await this.postObjective({
+        runId: params.runId,
+        snapshotId: params.snapshot.snapshot_id,
+        sessionId: this.sessionId,
+        candidates: [
+          validationRepairCandidatePayload({
+            candidate,
+            patternKey,
+            selected: true,
+            gateDecision: "approved",
+          }),
+        ],
+        objective: {
+          id: objectiveId,
+          candidate_id: candidate.id,
+          title: candidate.title,
+          instruction,
+          objective_type: candidate.objective_type,
+          component_area: candidate.component_area,
+          trigger_type: candidate.trigger_type,
+          target_paths: candidate.target_paths,
+          scope: candidate.scope,
+          confidence: candidate.confidence,
+          risk_level: candidate.risk_level,
+          expected_validation: candidate.expected_validation,
+          status: "failed",
+          block_reason: "request_enqueue_failed",
+        },
+        llmCalls: [],
+      });
+      return { handled: true, outcome: "failed", detail: "validation_repair_enqueue_failed" };
+    }
+
+    this.setPhase("record_validation_repair_objective");
+    await this.postObjective({
+      runId: params.runId,
+      snapshotId: params.snapshot.snapshot_id,
+      sessionId: this.sessionId,
+      candidates: [
+        validationRepairCandidatePayload({
+          candidate,
+          patternKey,
+          selected: true,
+          gateDecision: "approved",
+        }),
+      ],
+      objective: {
+        id: objectiveId,
+        candidate_id: candidate.id,
+        title: candidate.title,
+        instruction,
+        objective_type: candidate.objective_type,
+        component_area: candidate.component_area,
+        trigger_type: candidate.trigger_type,
+        target_paths: candidate.target_paths,
+        scope: candidate.scope,
+        confidence: candidate.confidence,
+        risk_level: candidate.risk_level,
+        expected_validation: candidate.expected_validation,
+        status: "dispatched",
+        request_id: requestId,
+        evidence: {
+          validation_incident: incident,
+        },
+        score_breakdown: {
+          llm_score: 1,
+          impact_signal: 1,
+          penalties: [],
+          final_score: 1,
+          selection_strategy: "validation_incident_repair",
+          selection_roll: null,
+        },
+      },
+      llmCalls: [],
+    });
+    console.log(
+      `[RemoteBuddyAutonomousEngine] tick ${params.runId}: dispatched validation repair ${requestId} for ${asString(
+        incident.command,
+      )}.`,
+    );
+    return {
+      handled: true,
+      outcome: "success",
+      detail: `validation_repair_dispatched_${requestId.slice(0, 8)}`,
+    };
+  }
+
   async tick(): Promise<void> {
     if (!this.runtimeEnabled || this.cfg.killSwitchEnabled || this.inFlight) return;
     this.inFlight = true;
@@ -5076,6 +5593,17 @@ export class RemoteBuddyAutonomousEngine {
       const visionContext = this.loadVisionContext(runId);
       if (!visionContext) {
         outcomeDetail = "vision_unavailable";
+        return;
+      }
+      const validationRepair = await this.dispatchValidationIncidentRepair({
+        runId,
+        snapshot,
+        repoTargets,
+        visionSectionRefs: visionContext.section_numbers,
+      });
+      if (validationRepair.handled) {
+        outcome = validationRepair.outcome;
+        outcomeDetail = validationRepair.detail;
         return;
       }
       this.setPhase("collect_engine_inspiration");
@@ -5375,10 +5903,7 @@ export class RemoteBuddyAutonomousEngine {
             candidate.component_area) as AutonomyComponentArea;
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
-          if (
-            !allowPushPalsInternalCandidates &&
-            candidateLeaksPushPalsInternals(candidate)
-          ) {
+          if (!allowPushPalsInternalCandidates && candidateLeaksPushPalsInternals(candidate)) {
             recordDropReason(`${source}_pushpals_internal_leak`);
             console.warn(
               `[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: PushPals-internal concepts do not belong in user-repo autonomy work.`,

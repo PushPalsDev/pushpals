@@ -104,6 +104,70 @@ describe("server AutonomyStore policy gates", () => {
     );
   });
 
+  test("createSnapshot marks repo validation red after repeated required command failures", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-validation-red-");
+    const jobQueue = new JobQueue(dbPath);
+
+    try {
+      for (let i = 0; i < 2; i++) {
+        const enqueued = jobQueue.enqueue({
+          taskId: `task-validation-red-${i + 1}`,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: { instruction: "Repair the local web smoke baseline." },
+        });
+        expect(enqueued.ok).toBe(true);
+        const claimed = jobQueue.claim(`worker-validation-red-${i + 1}`);
+        expect(claimed.ok).toBe(true);
+        const jobId = String(claimed.job?.id ?? "");
+        expect(jobId.length).toBeGreaterThan(0);
+
+        const failed = jobQueue.fail(jobId, {
+          message: "Required validation failed",
+          diagnostics: {
+            terminal: {
+              failureClass: "validation_failed",
+              terminalStage: "focused_validation",
+              executorBackend: "openai_codex",
+              summary: "bun run web:e2e failed",
+            },
+            validationRuns: [
+              {
+                attempt: 1,
+                command: "bun run web:e2e",
+                exitCode: 1,
+                durationMs: 1200,
+                passed: false,
+                failureClass: "browser_smoke_failed",
+                stderrTail:
+                  "scripts/__tests__/cleanup-harness.js:42 browser smoke assertion failed",
+              },
+            ],
+          },
+        });
+        expect(failed.ok).toBe(true);
+      }
+
+      const snapshot = store.createSnapshot({ sessionId: "s1", runId: "run_validation_red" });
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(true);
+      expect(snapshot.validation_incident?.command).toBe("bun run web:e2e");
+      expect(snapshot.validation_incident?.signal_type).toBe("test_failure");
+      expect(snapshot.validation_incident?.failure_count).toBe(2);
+      expect(snapshot.validation_incident?.failed_job_ids).toHaveLength(2);
+      expect(snapshot.validation_incident?.target_path_hints).toContain(
+        "scripts/__tests__/cleanup-harness.js",
+      );
+      expect(
+        snapshot.top_signals.some((signal) => signal.signal_id === "sig_validation_incident"),
+      ).toBe(true);
+      expect(snapshot.state_traits.some((trait) => trait.trait_id === "repo_validation_red")).toBe(
+        true,
+      );
+    } finally {
+      jobQueue.close();
+    }
+  });
+
   test("createSnapshot derives component strength traits from outcomes", () => {
     const store = makeStore();
     const sessionId = "s1";
@@ -2036,8 +2100,10 @@ describe("server AutonomyStore policy gates", () => {
 
   test("evaluator scores iterative PR feedback as one latest objective sample", () => {
     const store = makeStore();
-    const snapshotId = store.createSnapshot({ sessionId: "s1", runId: "run_review_loop" })
-      .snapshot_id;
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_review_loop",
+    }).snapshot_id;
     const decision = store.recordObjectiveDecision({
       runId: "run_review_loop",
       snapshotId,
