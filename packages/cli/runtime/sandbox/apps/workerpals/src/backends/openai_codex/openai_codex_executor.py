@@ -3290,6 +3290,38 @@ def _run_codex_task(
                         continue
                     rejected_shell_wrappers.append(text)
 
+        def _return_publishable_progress_for_quality_gate(
+            *,
+            summary: str,
+            prefix: str,
+            paths_hint: Optional[List[str]] = None,
+        ) -> Dict[str, Any]:
+            changed_paths, _, effective_paths = _codex_changed_paths(
+                repo,
+                baseline_snapshot,
+                clean_known_runtime_artifacts=True,
+            )
+            del changed_paths
+            if not effective_paths and paths_hint:
+                effective_paths = list(paths_hint)
+            last_message = _read_text_if_exists(last_message_path)
+            log_git_status(repo, log)
+            return {
+                "ok": True,
+                "summary": summary,
+                "stdout": _truncate(
+                    _build_success_stdout(
+                        effective_paths=effective_paths,
+                        last_message=last_message,
+                        trace_excerpt=trace_excerpt,
+                        prefix=prefix,
+                    )
+                ),
+                "stderr": _truncate(stderr),
+                "exitCode": 0,
+                "usage": usage,
+            }
+
         if rollout_watchdog_fired:
             if rollout_watchdog_retryable and rollout_recovery_attempt < _MAX_ROLLOUT_RECOVERY_ATTEMPTS:
                 if rollout_restore_before_retry and not _restore_retry_baseline(
@@ -3334,6 +3366,32 @@ def _run_codex_task(
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
                 )
+            _, _, rollout_effective_paths = _codex_changed_paths(
+                repo,
+                baseline_snapshot,
+                clean_known_runtime_artifacts=True,
+            )
+            if rollout_effective_paths:
+                log.info(
+                    "Rollout coach exhausted its recovery attempts, but publishable file "
+                    "changes remain "
+                    f"({_describe_publishable_paths(rollout_effective_paths)}); stopping "
+                    "Codex so QualityGate/ValidationGate can evaluate the patch instead "
+                    "of failing the executor before validation."
+                )
+                return _return_publishable_progress_for_quality_gate(
+                    summary=(
+                        "openai_codex stopped after rollout coach publishable progress "
+                        f"({len(rollout_effective_paths)} file(s))"
+                    ),
+                    prefix=(
+                        "Codex produced publishable file changes before the rollout coach "
+                        "exhausted recovery attempts. PushPals stopped the Codex child so "
+                        "the normal QualityGate/ValidationGate can reject, repair, or "
+                        "accept the patch with full validation context."
+                    ),
+                    paths_hint=rollout_effective_paths,
+                )
             detail = (
                 "Codex trajectory remained off-track or too broad for safe recovery: "
                 f"{rollout_watchdog_reason or 'no publishable progress'}."
@@ -3351,37 +3409,18 @@ def _run_codex_task(
             }
 
         if publishable_progress_finalized:
-            changed_paths, _, effective_paths = _codex_changed_paths(
-                repo,
-                baseline_snapshot,
-                clean_known_runtime_artifacts=True,
-            )
-            effective_paths = effective_paths or publishable_progress_paths
-            last_message = _read_text_if_exists(last_message_path)
-            log_git_status(repo, log)
-            prefix = (
-                "Codex produced durable publishable file changes. PushPals stopped the "
-                "Codex child early to preserve validation and revision budget; the normal "
-                "QualityGate/ValidationGate will catch any incomplete edit."
-            )
-            return {
-                "ok": True,
-                "summary": (
+            return _return_publishable_progress_for_quality_gate(
+                summary=(
                     "openai_codex stopped after durable publishable progress "
-                    f"({len(effective_paths)} file(s))"
+                    f"({len(publishable_progress_paths)} file(s))"
                 ),
-                "stdout": _truncate(
-                    _build_success_stdout(
-                        effective_paths=effective_paths,
-                        last_message=last_message,
-                        trace_excerpt=trace_excerpt,
-                        prefix=prefix,
-                    )
+                prefix=(
+                    "Codex produced durable publishable file changes. PushPals stopped the "
+                    "Codex child early to preserve validation and revision budget; the normal "
+                    "QualityGate/ValidationGate will catch any incomplete edit."
                 ),
-                "stderr": _truncate(stderr),
-                "exitCode": 0,
-                "usage": usage,
-            }
+                paths_hint=publishable_progress_paths,
+            )
 
         if no_edit_watchdog_fired:
             startup_stall = _codex_trace_is_startup_stall(stdout_trace)

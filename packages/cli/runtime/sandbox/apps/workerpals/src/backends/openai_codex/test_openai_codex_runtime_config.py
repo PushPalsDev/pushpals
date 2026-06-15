@@ -2846,7 +2846,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertFalse(area0_exists_after_retry)
 
-    def test_run_codex_task_rollout_coach_fails_after_repeated_broad_small_task_changes(self) -> None:
+    def test_run_codex_task_rollout_coach_hands_publishable_progress_to_quality_gate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-repeat-noisy-") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
@@ -2911,12 +2911,12 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                     [],
                 )
 
-        self.assertFalse(result.get("ok"), result)
-        self.assertEqual(result.get("exitCode"), 124)
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
         self.assertIn("rollout coach", str(result.get("summary") or ""))
-        self.assertIn("broad/noisy", str(result.get("stderr") or ""))
-        self.assertIn("area0", str(result.get("stderr") or ""))
-        self.assertEqual(result.get("cooldownMs"), 600000)
+        self.assertIn("QualityGate/ValidationGate", str(result.get("stdout") or ""))
+        self.assertIn("area0", str(result.get("stdout") or ""))
+        self.assertNotIn("cooldownMs", result)
 
     def test_run_codex_task_validation_repair_ignores_artifact_only_rollout_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-validation-repair-artifact-") as temp_dir:
