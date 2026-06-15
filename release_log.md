@@ -2,28 +2,31 @@
 
 ## Release Metadata
 
-- version: `v1.1.53`
-- start_commit: `db56819f2dc161f114d42f964dec328b0264b249`
-- end_commit: `d802b9a28a30dab1a5704fe01bfb53961f55ac88`
+- version: `v1.1.54`
+- start_commit: `58114e9f61f8fa5b4bc152b4e9ca6c87d6bf5743`
+- end_commit: `c047caa466a99dc0f99f8a489b11e9aafe6043c7`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Pivot required validation failures outside the original task hints into guarded repo validation repair instead of treating them as terminal blockers.
-- Give repo validation repair a dedicated continuation budget when the original job budget is exhausted but publishable work exists.
-- Tell the next worker when original target paths/write globs are stale advisory hints for the validation blocker while keeping forbidden/generated paths off limits.
-- Add regression coverage for repair-mode entry, dedicated budget continuation, outside-scope repo blockers, and the worker revision prompt.
+- Hydrate direct isolated WorkerPal worktrees with the repo-root `node_modules` dependency artifact, matching Docker worktree behavior.
+- Fix direct Windows fallback jobs whose lint/web smoke validation needs project-local dependency layout for Expo Router, ESLint import resolution, and browser review hydration.
+- Keep dependency artifacts out of PR content while logging when direct worktree hydration links runtime-only artifacts.
+- Add regression coverage for direct worktree dependency artifact linking and skip behavior.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.quality-gate-issues.test.ts`
+- `bun test tests/workerpals.direct-worktree-dependency-artifacts.test.ts tests/workerpals.docker-executor.test.ts`
 - `bun test tests/workerpals.validation-command-safety.test.ts`
+- `bun test tests/workerpals.direct-worktree-dependency-artifacts.test.ts tests/workerpals.session-events.test.ts`
 - `bun run test:root`
 - `bun run test:prompt-policy`
 - `bun run test:protocol`
 - `bun --cwd apps/server build`
+- `bun --cwd apps/workerpals tsc --noEmit`
+- SectorCommand control: temporary linked worktree passed `bun run lint` and `bun run web:e2e`
 - `git diff --check`
 
 ## Install
