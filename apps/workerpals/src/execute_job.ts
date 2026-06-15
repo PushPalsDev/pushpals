@@ -210,6 +210,8 @@ const QUALITY_MAX_REVISION_BUDGET_MS = 420_000;
 const QUALITY_REVISION_BUDGET_RATIO = 0.25;
 const BROWSER_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 900_000;
 const BROWSER_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
+const REPO_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 900_000;
+const REPO_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
 
 export function qualityRevisionLoopUpperBound(
   policy: {
@@ -314,6 +316,65 @@ export function browserValidationRepairContinuationBudgetDecision(opts: {
     finalizationBudgetMs: BROWSER_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS,
     reason:
       "browser validation repair made a publishable patch but exhausted the original revision budget",
+  };
+}
+
+export function shouldRepairOutsideTaskRequiredValidation(opts: {
+  requiredValidationFailures: string[];
+  validationFailureScope: "none" | "task_scope" | "outside_task_scope";
+  changedPaths: string[];
+  revisionAttempt: number;
+  maxAutoRevisions: number;
+}): boolean {
+  if (opts.validationFailureScope !== "outside_task_scope") return false;
+  if (opts.requiredValidationFailures.length === 0) return false;
+  if (opts.revisionAttempt >= opts.maxAutoRevisions) return false;
+  return publishableChangedPaths(opts.changedPaths).length > 0;
+}
+
+export function repoValidationRepairContinuationBudgetDecision(opts: {
+  repoValidationRepairMode: boolean;
+  changedPaths: string[];
+  revisionBudget: Pick<
+    ReturnType<typeof qualityRevisionBudgetDecision>,
+    "shouldStart" | "remainingBudgetMs" | "minimumRevisionBudgetMs"
+  >;
+}): {
+  shouldContinue: boolean;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+  reason: string;
+} {
+  if (opts.revisionBudget.shouldStart) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "standard revision budget is available",
+    };
+  }
+  if (!opts.repoValidationRepairMode) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "not in repo validation repair mode",
+    };
+  }
+  if (publishableChangedPaths(opts.changedPaths).length === 0) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no publishable patch is present",
+    };
+  }
+  return {
+    shouldContinue: true,
+    executionBudgetMs: REPO_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS,
+    finalizationBudgetMs: REPO_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS,
+    reason:
+      "repo validation repair has publishable work but exhausted the original revision budget",
   };
 }
 
@@ -529,10 +590,11 @@ export function shouldReviseRequiredValidationBlocker(opts: {
   revisionAttempt: number;
   maxAutoRevisions: number;
   outsideTaskScope?: boolean;
+  allowOutsideTaskScope?: boolean;
 }): boolean {
   if (opts.requiredValidationFailures.length === 0) return false;
   if (!opts.blocker) return false;
-  if (opts.outsideTaskScope) return false;
+  if (opts.outsideTaskScope && !opts.allowOutsideTaskScope) return false;
   if (opts.blocker.category !== "repo") return false;
   return opts.revisionAttempt < opts.maxAutoRevisions;
 }
@@ -4314,7 +4376,7 @@ async function runDeterministicQualityGate(
   if (scopedValidationFailure === "outside_task_scope") {
     onLog?.(
       "stderr",
-      "[ValidationGate] Required validation failures appear outside the task target/relevance hints; treating them as publish blockers, not repair instructions.",
+      "[ValidationGate] Required validation failures appear outside the task target/relevance hints; blocking publish and allowing guarded repo validation repair when auto-revision budget remains.",
     );
   }
 
@@ -4642,10 +4704,19 @@ export function buildQualityRevisionHint(
   browserRepairPacket: BrowserValidationRepairPacket | null = null,
   changedPaths: string[] = [],
   validationRemedyHints: string[] = [],
+  repoValidationRepairMode = false,
 ): string {
   const lines: string[] = [];
   lines.push("Quality revision required before completion.");
-  const focusedBrowserRepair = Boolean(browserRepairPacket);
+  const focusedBrowserRepair = Boolean(browserRepairPacket) && !repoValidationRepairMode;
+  if (repoValidationRepairMode) {
+    lines.push(
+      "Repo validation repair mode: required project validation failed outside the original target/relevance hints. Keep the original patch only if it remains useful, but temporarily broaden discovery and edits to the smallest behavior-owning source, test, mock, package, or config files needed to make the failed validation commands pass.",
+    );
+    lines.push(
+      "Scope rule for this repair: original target paths and write globs are stale/advisory for the validation blocker; forbidden paths and generated/runtime artifacts are still off limits.",
+    );
+  }
   lines.push(
     "Worker phase contract: (1) discovering - inspect only the relevant files/artifacts and name the current hypothesis; (2) editing - make the smallest behavior-owning patch; (3) focused validation - run targeted fast checks; (4) full validation - let PushPals ValidationGate own long required checks unless a single local confirmation is explicitly useful; (5) final diff review - verify changed files are necessary and no unrelated churn remains.",
   );
@@ -4695,7 +4766,7 @@ export function buildQualityRevisionHint(
       "After the cleanup, run fast focused checks if useful and let PushPals ValidationGate rerun the full required validation set.",
     );
   }
-  if (browserRepairPacket) {
+  if (browserRepairPacket && !repoValidationRepairMode) {
     lines.push("Primary ValidationGate repair objective:");
     lines.push(`- Command: ${browserRepairPacket.command}`);
     lines.push(`- Failure type: browser ${browserRepairPacket.failureKind}`);
@@ -8268,7 +8339,24 @@ export async function executeJob(
       if (digest) previousValidationFailureDigests.set(validationCommandKey(run.command), digest);
     }
     const validationOutsideTaskScope = quality.validationFailureScope === "outside_task_scope";
-    const qualityForCritic: DeterministicQualityResult = validationOutsideTaskScope
+    const repoValidationRepairMode = shouldRepairOutsideTaskRequiredValidation({
+      requiredValidationFailures: quality.requiredValidationFailures,
+      validationFailureScope: quality.validationFailureScope,
+      changedPaths: quality.changedPaths,
+      revisionAttempt,
+      maxAutoRevisions: qualityValidationMaxAutoRevisions,
+    });
+    const validationOutsideTaskScopeBlocksOnly =
+      validationOutsideTaskScope && !repoValidationRepairMode;
+    if (repoValidationRepairMode) {
+      onLog?.(
+        "stderr",
+        `[ValidationGate] Required validation failed outside original task scope; entering guarded repo validation repair mode for revision ${
+          revisionAttempt + 1
+        }/${qualityValidationMaxAutoRevisions}: ${quality.requiredValidationFailures.join("; ")}`,
+      );
+    }
+    const qualityForCritic: DeterministicQualityResult = validationOutsideTaskScopeBlocksOnly
       ? {
           ...quality,
           issues: quality.issues.filter((issue) => !issue.startsWith("ValidationGate:")),
@@ -8288,16 +8376,16 @@ export async function executeJob(
       qualityIssues: qualityForCritic.issues,
       changedPaths: quality.changedPaths,
     });
-    const preCriticEffectiveQualityIssues = validationOutsideTaskScope
+    const preCriticEffectiveQualityIssues = validationOutsideTaskScopeBlocksOnly
       ? quality.issues.filter((issue) => !issue.startsWith("ValidationGate:"))
       : quality.issues;
     const preCriticDeterministicRequiresRevision =
       preCriticEffectiveQualityIssues.length > 0 ||
-      (quality.blocker !== null && !validationOutsideTaskScope);
+      (quality.blocker !== null && !validationOutsideTaskScopeBlocksOnly);
     const skipCriticForDeterministicValidationRevision =
       shouldSkipCriticForDeterministicValidationRevision({
         deterministicRequiresRevision: preCriticDeterministicRequiresRevision,
-        validationOutsideTaskScope,
+        validationOutsideTaskScope: validationOutsideTaskScopeBlocksOnly,
         validationRuns: quality.validationRuns,
       });
     const preCriticRevisionBudget = qualityRevisionBudgetDecision({
@@ -8338,6 +8426,7 @@ export async function executeJob(
             executorElapsedMs,
             qualityElapsedMs,
             validationFailureScope: quality.validationFailureScope,
+            repoValidationRepairMode,
             validationRuns: quality.validationRuns.length,
             criticScore: critic?.score ?? null,
           },
@@ -8382,7 +8471,7 @@ export async function executeJob(
       qualityCriticMinScore,
     );
     let effectiveQualityIssues = advisoryRelaxedQualityIssues;
-    if (validationOutsideTaskScope) {
+    if (validationOutsideTaskScopeBlocksOnly) {
       effectiveQualityIssues = effectiveQualityIssues.filter(
         (issue) => !issue.startsWith("ValidationGate:"),
       );
@@ -8404,7 +8493,7 @@ export async function executeJob(
     }
     const deterministicRequiresRevision =
       effectiveQualityIssues.length > 0 ||
-      (quality.blocker !== null && !validationOutsideTaskScope);
+      (quality.blocker !== null && !validationOutsideTaskScopeBlocksOnly);
     const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
     if (
       !qualityGatePolicy.publishGateEnabled &&
@@ -8482,20 +8571,23 @@ export async function executeJob(
     const activeMaxAutoRevisions = revisionLimitForQualityGateFailures({
       policy: qualityGatePolicy,
       qualityIssues: effectiveQualityIssues,
-      requiredValidationFailures: validationOutsideTaskScope
+      requiredValidationFailures: validationOutsideTaskScopeBlocksOnly
         ? []
         : quality.requiredValidationFailures,
-      blocker: validationOutsideTaskScope ? null : quality.blocker,
-      browserRepairPacket: validationOutsideTaskScope ? null : browserRepairPacket,
+      blocker: validationOutsideTaskScopeBlocksOnly ? null : quality.blocker,
+      browserRepairPacket:
+        validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode
+          ? null
+          : browserRepairPacket,
     });
     const issueSummary =
-      browserRepairPacket && !validationOutsideTaskScope
+      browserRepairPacket && !validationOutsideTaskScopeBlocksOnly && !repoValidationRepairMode
         ? `ValidationGate browser ${browserRepairPacket.failureKind} repair for ${browserRepairPacket.command}: ${toSingleLine(
             browserRepairPacket.digest,
             180,
           )}`
         : issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
-    if (quality.blocker && !validationOutsideTaskScope) {
+    if (quality.blocker && !validationOutsideTaskScopeBlocksOnly) {
       const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;
       const blockerDiagnostics = truncate(
         [
@@ -8510,6 +8602,7 @@ export async function executeJob(
         revisionAttempt,
         maxAutoRevisions: activeMaxAutoRevisions,
         outsideTaskScope: validationOutsideTaskScope,
+        allowOutsideTaskScope: repoValidationRepairMode,
       });
       if (requiredValidationCanRevise) {
         onLog?.(
@@ -8629,12 +8722,24 @@ export async function executeJob(
     });
     const browserValidationContinuation =
       browserValidationRepairContinuationBudgetDecision({
-        browserRepairPacket: validationOutsideTaskScope ? null : browserRepairPacket,
+        browserRepairPacket:
+          validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode
+            ? null
+            : browserRepairPacket,
         validationOutsideTaskScope,
         changedPaths: quality.changedPaths,
         revisionBudget,
       });
-    if (!revisionBudget.shouldStart && !browserValidationContinuation.shouldContinue) {
+    const repoValidationContinuation = repoValidationRepairContinuationBudgetDecision({
+      repoValidationRepairMode,
+      changedPaths: quality.changedPaths,
+      revisionBudget,
+    });
+    if (
+      !revisionBudget.shouldStart &&
+      !browserValidationContinuation.shouldContinue &&
+      !repoValidationContinuation.shouldContinue
+    ) {
       const budgetSummary = `Quality gate needs revision ${
         revisionAttempt + 1
       }/${activeMaxAutoRevisions}, but remaining execution budget is ${
@@ -8682,6 +8787,26 @@ export async function executeJob(
           220,
         )}`,
       );
+    } else if (!revisionBudget.shouldStart && repoValidationContinuation.shouldContinue) {
+      nextQualityRevisionExecuteBudgets = {
+        executionBudgetMs: repoValidationContinuation.executionBudgetMs,
+        finalizationBudgetMs: repoValidationContinuation.finalizationBudgetMs,
+      };
+      onLog?.(
+        "stderr",
+        `[QualityGate] Continuing repo validation repair ${
+          revisionAttempt + 1
+        }/${activeMaxAutoRevisions} with dedicated budget ${
+          repoValidationContinuation.executionBudgetMs
+        }ms execution + ${
+          repoValidationContinuation.finalizationBudgetMs
+        }ms finalization after original remaining budget ${
+          revisionBudget.remainingBudgetMs
+        }ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(
+          issueSummary,
+          220,
+        )}`,
+      );
     }
 
     revisionAttempt += 1;
@@ -8690,11 +8815,14 @@ export async function executeJob(
       critic,
       planning,
       reviewFixContext,
-      validationOutsideTaskScope ? [] : quality.validationRuns,
-      validationOutsideTaskScope ? null : quality.blocker,
-      validationOutsideTaskScope ? null : browserRepairPacket,
+      validationOutsideTaskScopeBlocksOnly ? [] : quality.validationRuns,
+      validationOutsideTaskScopeBlocksOnly ? null : quality.blocker,
+      validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode
+        ? null
+        : browserRepairPacket,
       quality.changedPaths,
       validationRemedyHints,
+      repoValidationRepairMode,
     );
     onLog?.(
       "stderr",

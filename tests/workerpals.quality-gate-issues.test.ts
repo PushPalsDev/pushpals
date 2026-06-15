@@ -19,9 +19,11 @@ import {
   qualityRevisionLoopUpperBound,
   recordBrowserFailureMemory,
   recordValidationRemedyMemory,
+  repoValidationRepairContinuationBudgetDecision,
   shouldSkipCriticAfterExecutorTimeout,
   shouldSkipCriticForDeterministicValidationRevision,
   shouldSkipCriticToPreserveRevisionBudget,
+  shouldRepairOutsideTaskRequiredValidation,
   shouldRetryCriticTimeoutWithCompact,
   shouldReviseRequiredValidationBlocker,
   shouldRetryBrowserValidationRunOnce,
@@ -161,6 +163,74 @@ describe("workerpals quality gate critic issue formatting", () => {
       executionBudgetMs: 0,
       finalizationBudgetMs: 0,
       reason: "no publishable browser repair patch is present",
+    });
+  });
+
+  test("enters repo validation repair mode for outside-scope required validation blockers", () => {
+    expect(
+      shouldRepairOutsideTaskRequiredValidation({
+        requiredValidationFailures: [
+          'bun run lint exited 1 (error: "eslint.exe" exited with code 1)',
+        ],
+        validationFailureScope: "outside_task_scope",
+        changedPaths: ["README.md", "package.json"],
+        revisionAttempt: 0,
+        maxAutoRevisions: 3,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldRepairOutsideTaskRequiredValidation({
+        requiredValidationFailures: ["bun run lint exited 1"],
+        validationFailureScope: "outside_task_scope",
+        changedPaths: ["Microsoft/Windows/PowerShell/ModuleAnalysisCache"],
+        revisionAttempt: 0,
+        maxAutoRevisions: 3,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldRepairOutsideTaskRequiredValidation({
+        requiredValidationFailures: ["bun run lint exited 1"],
+        validationFailureScope: "outside_task_scope",
+        changedPaths: ["README.md"],
+        revisionAttempt: 3,
+        maxAutoRevisions: 3,
+      }),
+    ).toBe(false);
+  });
+
+  test("continues repo validation repair after the generic revision budget is exhausted", () => {
+    const revisionBudget = qualityRevisionBudgetDecision({
+      jobElapsedMs: 1_200_000,
+      executionBudgetMs: 1_200_000,
+    });
+
+    expect(
+      repoValidationRepairContinuationBudgetDecision({
+        repoValidationRepairMode: true,
+        changedPaths: ["README.md", "package.json"],
+        revisionBudget,
+      }),
+    ).toEqual({
+      shouldContinue: true,
+      executionBudgetMs: 900_000,
+      finalizationBudgetMs: 120_000,
+      reason:
+        "repo validation repair has publishable work but exhausted the original revision budget",
+    });
+
+    expect(
+      repoValidationRepairContinuationBudgetDecision({
+        repoValidationRepairMode: true,
+        changedPaths: ["outputs/web-e2e/failure.png"],
+        revisionBudget,
+      }),
+    ).toEqual({
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no publishable patch is present",
     });
   });
 
@@ -531,6 +601,66 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("Validation failure diagnostics:");
     expect(hint).toContain("- bun test failed with exit 1 after 123ms.");
     expect(hint).toContain("Cannot find module '../../tests/reactNativeMock'");
+  });
+
+  test("marks outside-scope required validation revisions as repo validation repair mode", () => {
+    const hint = buildQualityRevisionHint(
+      [
+        "ValidationGate: Required vision.md validation failed: bun run lint exited 1; bun run web:e2e exited 1",
+      ],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: {
+          readAnywhere: true,
+          writeAllowed: true,
+          writeGlobs: ["README.md", "package.json"],
+        },
+        acceptanceCriteria: [],
+        validationSteps: [],
+        requiredValidationSteps: ["bun run lint", "bun run web:e2e"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_200_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [
+        {
+          step: "bun run lint",
+          command: "bun run lint",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr: "Unable to resolve path to module 'react-native-svg'",
+          elapsedMs: 234,
+        },
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr:
+            "Web end-to-end smoke test failed: waiting for getByTestId('home-screen') to be visible",
+          elapsedMs: 127_000,
+        },
+      ],
+      { category: "repo", detail: "Required validation fails in repo-owned code." },
+      null,
+      ["README.md", "package.json"],
+      [],
+      true,
+    );
+
+    expect(hint).toContain("Repo validation repair mode");
+    expect(hint).toContain("original target/relevance hints");
+    expect(hint).toContain("forbidden paths and generated/runtime artifacts are still off limits");
+    expect(hint).toContain("- bun run lint failed with exit 1 after 234ms.");
+    expect(hint).toContain("react-native-svg");
+    expect(hint).toContain("- bun run web:e2e failed with exit 1 after 127000ms.");
+    expect(hint).toContain("home-screen");
   });
 
   test("freezes the validated patch when requesting post-validation cleanup", () => {
@@ -1183,6 +1313,17 @@ describe("workerpals quality gate critic issue formatting", () => {
         outsideTaskScope: true,
       }),
     ).toBe(false);
+
+    expect(
+      shouldReviseRequiredValidationBlocker({
+        requiredValidationFailures: ["bun test exited 1"],
+        blocker: { category: "repo", detail: "missing imported file" },
+        revisionAttempt: 0,
+        maxAutoRevisions: 3,
+        outsideTaskScope: true,
+        allowOutsideTaskScope: true,
+      }),
+    ).toBe(true);
 
     expect(
       shouldReviseRequiredValidationBlocker({
