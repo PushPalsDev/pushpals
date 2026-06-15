@@ -121,6 +121,8 @@ _NO_EDIT_RECOVERY_RECHECK_S = 30
 _DEFAULT_NO_EDIT_COMMAND_GRACE_S = 240
 _DEFAULT_NO_EDIT_COMMAND_PROGRESS_CAP_S = 360
 _BACKGROUND_NO_EDIT_COMMAND_PROGRESS_CAP_S = 120
+_VALIDATION_REPAIR_NO_EDIT_WATCHDOG_S = 300
+_VALIDATION_REPAIR_COMMAND_PROGRESS_CAP_S = 360
 _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S = 120
 _DEFAULT_STARTUP_STALL_WATCHDOG_S = 210
 _RECOVERY_STARTUP_STALL_WATCHDOG_S = 150
@@ -128,6 +130,7 @@ _DEFAULT_ROLLOUT_WATCHDOG_S = 300
 _SMALL_TASK_ROLLOUT_WATCHDOG_S = 240
 _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S = 150
 _WEB_REVIEW_ROLLOUT_WATCHDOG_S = 180
+_VALIDATION_REPAIR_ROLLOUT_WATCHDOG_S = 240
 _BACKGROUND_ROLLOUT_WATCHDOG_S = 90
 _MIN_AUTO_WATCHDOG_TIMEOUT_S = 180
 _MIN_CODEX_RECOVERY_ATTEMPT_S = 120
@@ -728,6 +731,22 @@ def _looks_like_background_autonomy_prompt(prompt: str) -> bool:
     )
 
 
+def _looks_like_validation_repair_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    if not text:
+        return False
+    return (
+        "restore required validation:" in text
+        or "required validation is repeatedly failing before publication" in text
+        or "fix the repo baseline issue that makes this command fail" in text
+        or (
+            "primary failing command:" in text
+            and "expected validation:" in text
+            and "course of action:" in text
+        )
+    )
+
+
 def _resolve_no_edit_watchdog_seconds(
     prompt: str,
     communicate_timeout_s: Optional[int],
@@ -753,7 +772,10 @@ def _resolve_no_edit_watchdog_seconds(
 
     prompt_text = str(prompt or "").lower()
     is_background = _looks_like_background_autonomy_prompt(prompt)
-    if is_background:
+    is_validation_repair = _looks_like_validation_repair_prompt(prompt)
+    if is_validation_repair:
+        default_s = _VALIDATION_REPAIR_NO_EDIT_WATCHDOG_S
+    elif is_background:
         default_s = _BACKGROUND_NO_EDIT_WATCHDOG_S
     elif _looks_like_narrow_test_task_prompt(prompt):
         default_s = _NARROW_TEST_TASK_NO_EDIT_WATCHDOG_S
@@ -767,7 +789,7 @@ def _resolve_no_edit_watchdog_seconds(
         )
     if recovery_attempt > 0:
         default_s = min(default_s, _NO_EDIT_RECOVERY_WATCHDOG_S)
-    floor_s = 90 if is_background or recovery_attempt > 0 else 120
+    floor_s = 90 if (is_background and not is_validation_repair) or recovery_attempt > 0 else 120
     return max(floor_s, min(default_s, max(floor_s, communicate_timeout_s - 60)))
 
 
@@ -839,6 +861,8 @@ def _resolve_no_edit_command_progress_cap_seconds(
 
     if recovery_attempt > 0:
         default_s = _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S
+    elif _looks_like_validation_repair_prompt(prompt):
+        default_s = _VALIDATION_REPAIR_COMMAND_PROGRESS_CAP_S
     elif _looks_like_background_autonomy_prompt(prompt):
         default_s = _BACKGROUND_NO_EDIT_COMMAND_PROGRESS_CAP_S
     else:
@@ -910,7 +934,9 @@ def _resolve_rollout_watchdog_seconds(
         else:
             return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
 
-    if _looks_like_background_autonomy_prompt(prompt):
+    if _looks_like_validation_repair_prompt(prompt):
+        default_s = _VALIDATION_REPAIR_ROLLOUT_WATCHDOG_S
+    elif _looks_like_background_autonomy_prompt(prompt):
         default_s = _BACKGROUND_ROLLOUT_WATCHDOG_S
     elif _looks_like_narrow_test_task_prompt(prompt):
         default_s = _NARROW_TEST_TASK_ROLLOUT_WATCHDOG_S
@@ -2800,6 +2826,9 @@ def _run_codex_task(
             publishable_progress_finalized = False
             publishable_progress_paths: List[str] = []
             first_no_edit_command_progress_at: Optional[float] = None
+            validation_repair_prompt = _looks_like_validation_repair_prompt(
+                f"{instruction}\n\n{prompt}"
+            )
 
             while proc.poll() is None:
                 now = time.monotonic()
@@ -3000,10 +3029,25 @@ def _run_codex_task(
                             changed_paths,
                             baseline_snapshot,
                         )
+                        detection_artifact_only_paths = (
+                            "" if validation_repair_prompt else rollout_artifact_only_paths
+                        )
                         rollout_watchdog_reason = _detect_offtrack_rollout(
                             live_trace,
-                            rollout_artifact_only_paths,
+                            detection_artifact_only_paths,
                         )
+                        if (
+                            validation_repair_prompt
+                            and rollout_artifact_only_paths
+                            and not rollout_watchdog_reason
+                        ):
+                            reschedule_s = min(60.0, float(rollout_watchdog_s or 60))
+                            rollout_deadline = now + reschedule_s
+                            log.info(
+                                "Rollout coach observed only non-publishable artifact paths "
+                                "during validation repair; allowing command reproduction and "
+                                f"diagnosis to continue for another {int(reschedule_s)}s."
+                            )
                     if rollout_watchdog_reason:
                         rollout_watchdog_fired = True
                         artifact_detail = (

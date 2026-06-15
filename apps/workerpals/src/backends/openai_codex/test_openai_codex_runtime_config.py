@@ -44,6 +44,7 @@ from openai_codex_executor import (
     _extract_usage_counts,
     _has_credible_shell_wrapper_progress,
     _load_prompt_template,
+    _looks_like_validation_repair_prompt,
     _mask_repo_local_codex_files,
     _minimum_recovery_attempt_seconds,
     _repo_root_for_prompt_loading,
@@ -2284,6 +2285,37 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(watchdog_s, 180)
 
+    def test_validation_repair_prompt_gets_diagnostic_watchdogs(self) -> None:
+        prompt = (
+            "Restore required validation: bun run web:e2e\n\n"
+            "Required validation is repeatedly failing before publication.\n"
+            "Primary failing command: bun run web:e2e.\n"
+            "Fix the repo baseline issue that makes this command fail, then rerun the failing command.\n\n"
+            "Course of action:\n"
+            "- Reproduce the failing command first: bun run web:e2e\n\n"
+            "Expected validation:\n"
+            "- bun run web:e2e\n\n"
+            "priority=background origin=autonomy"
+        )
+        env = {
+            "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "",
+            "WORKERPALS_OPENAI_CODEX_NO_EDIT_COMMAND_PROGRESS_CAP_S": "",
+            "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            no_edit_s = _resolve_no_edit_watchdog_seconds(prompt, 1200)
+            command_cap_s = _resolve_no_edit_command_progress_cap_seconds(
+                1200,
+                _resolve_no_edit_command_grace_seconds(1200),
+                prompt=prompt,
+            )
+            rollout_s = _resolve_rollout_watchdog_seconds(prompt, 1200, no_edit_s)
+
+        self.assertTrue(_looks_like_validation_repair_prompt(prompt))
+        self.assertEqual(no_edit_s, 300)
+        self.assertEqual(command_cap_s, 360)
+        self.assertEqual(rollout_s, 240)
+
     def test_no_edit_recovery_attempt_uses_short_patch_first_watchdog(self) -> None:
         prompt = "Investigate a broad reliability issue and make the smallest safe fix."
         with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": ""}, clear=False):
@@ -2723,6 +2755,99 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("broad/noisy", str(result.get("stderr") or ""))
         self.assertIn("area0", str(result.get("stderr") or ""))
         self.assertEqual(result.get("cooldownMs"), 600000)
+
+    def test_run_codex_task_validation_repair_ignores_artifact_only_rollout_progress(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-validation-repair-artifact-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# validation repair artifact repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed validation repair repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_validation_repair_artifact.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "sys.stdin.read()",
+                        "cache = Path('Microsoft/Windows/PowerShell/ModuleAnalysisCache')",
+                        "cache.parent.mkdir(parents=True, exist_ok=True)",
+                        "cache.write_text('runtime artifact only\\n', encoding='utf-8')",
+                        "print('item.completed | The failure reproduces as a route/startup timeout.', flush=True)",
+                        "time.sleep(2)",
+                        "if last_message_path:",
+                        "    Path(last_message_path).write_text(",
+                        "        'Validation repair diagnosis continued past artifact-only rollout noise.',",
+                        "        encoding='utf-8',",
+                        "    )",
+                        "sys.exit(0)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-validation-repair-artifact-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "10",
+                "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    (
+                        "Restore required validation: bun run web:e2e\n\n"
+                        "Required validation is repeatedly failing before publication.\n"
+                        "Primary failing command: bun run web:e2e.\n"
+                        "Fix the repo baseline issue that makes this command fail.\n\n"
+                        "Course of action:\n"
+                        "- Reproduce the failing command first: bun run web:e2e\n\n"
+                        "Expected validation:\n"
+                        "- bun run web:e2e"
+                    ),
+                    ["priority=background origin=autonomy"],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("no file changes", str(result.get("summary") or ""))
+        self.assertIn("continued past artifact-only", str(result.get("stdout") or ""))
+        self.assertNotIn("rollout coach", str(result.get("summary") or "").lower())
+        self.assertNotIn("rollout coach", str(result.get("stderr") or "").lower())
 
     def test_run_codex_task_timeout_reports_artifact_only_changes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-artifact-timeout-") as temp_dir:
