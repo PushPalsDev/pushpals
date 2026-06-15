@@ -2,25 +2,28 @@
 
 ## Release Metadata
 
-- version: `v1.1.48`
-- start_commit: `f86b9325094929c34a71440b8a0db912380a689e`
-- end_commit: `43a1feb38b97a170a87ff8f09d23a7b3326cbe21`
+- version: `v1.1.49`
+- start_commit: `f8c415542fe9a7c108ce73fa77db1631b87dada4`
+- end_commit: `9e8ed80a903d81fbe3ae50f14eeaabb1a82d762d`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Resolve Bun from the CLI/runtime environment before direct WorkerPal validation launches `bun`, `bunx`, or toolchain preflight probes.
-- Normalize Windows `Path`/`PATH` inside the writable validation sandbox and prepend the resolved Bun directory for child scripts.
-- Return a structured validation failure when a validation executable cannot start instead of failing the entire job with an uncaught `uv_spawn 'bun'`.
-- Add regression coverage for embedded Bun resolution, Windows path casing, browser smoke port injection, and missing-executable validation startup.
+- Detect repeated required validation failures across recent jobs and expose them in the autonomy snapshot as a red validation baseline.
+- Make RemoteBuddy short-circuit normal autonomous ideation while the repo baseline is red, dispatching a deterministic validation-repair objective instead.
+- Build validation repair requests from the failing command, recent failure evidence, target path hints, and required validation commands.
+- Add regression coverage for server-side validation incident snapshots and RemoteBuddy's no-LLM repair dispatch path.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.sandbox-env.test.ts tests/workerpals.validation-command-safety.test.ts`
+- `bun test tests/server.autonomy-store.test.ts tests/remotebuddy.autonomous-engine.tick.test.ts`
+- `bun run test:prompt-policy`
+- `bun run test:protocol`
 - `bun run test:root`
-- `bun x tsc -p apps/workerpals/tsconfig.json --noEmit` *(blocked by pre-existing nullability errors in `apps/workerpals/src/workerpals_main.ts`)*
+- `bun --cwd apps/server build`
+- `bun --cwd apps/remotebuddy typecheck` *(blocked by pre-existing startup checklist/type-test errors outside this release change)*
 - `git diff --check`
 
 ## Install
