@@ -2,23 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.58`
-- start_commit: `c187e693edd1c31516e8754f2a83300b42d23d57`
-- end_commit: `489b461062b687b65c5537f9dce42cefd6ad70d6`
+- version: `v1.1.59`
+- start_commit: `8f6dc9e5862067b7e4d6b97798f509c0c0d155b7`
+- end_commit: `3b78f4313e13fcdc19ecfb023ed90d66fb853b89`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add a ValidationGate dependency-layout preflight for Bun projects so missing `node_modules`, missing `.bin` shims, or missing declared top-level packages are repaired before validation commands run.
-- Run `bun install --offline --frozen-lockfile --ignore-scripts` only when PushPals detects an unhealthy local Bun install layout, keeping dependency repair out of publishable PR content.
-- Continue into normal validation with structured logs if the offline dependency-layout repair cannot complete, so QualityGate records the real blocker instead of spending worker turns on package-manager hygiene.
-- Add regression coverage for missing Bun binary shims and incomplete dependency trees before validation.
+- Extend ValidationGate dependency-layout preflight to detect linked `node_modules` artifacts before Expo Router browser smoke validation.
+- Remove linked `node_modules` artifacts only when they are symlinks or junctions, then repair the worktree with `bun install --offline --frozen-lockfile --ignore-scripts` before running browser validation.
+- Keep fast non-browser validation on the existing dependency path so PushPals only localizes dependencies for browser flows that are sensitive to Metro/Expo Router path identity.
+- Add regression coverage for linked dependency artifacts with Expo Router browser validation while preserving the existing Bun dependency-layout safety checks.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.validation-command-safety.test.ts tests/shared.toolchain.test.ts`
+- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.direct-worktree-dependency-artifacts.test.ts`
+- `bun test tests/remotebuddy.task-dedupe.test.ts -t "processRequest reuses the existing task when enqueue dedupes same-file work"`
 - `bun --cwd apps/workerpals tsc --noEmit`
 - `bun run test:root`
 - `git diff --check`
@@ -54,6 +55,7 @@ bun install -g @pushpalsdev/cli
 - Docker-backed WorkerPal execution can use a stalled Docker Codex startup as the signal to switch future WorkerPal spawns to direct isolated-worktree execution; if the replacement direct WorkerPal also cannot start Codex, that retry can still fail terminally and recycle the worker.
 - QualityGate can still reject or request repair for a broad patch after the rollout coach hands publishable progress forward; this release changes the failure point from executor pre-validation failure to structured gate diagnostics.
 - Bun dependency-layout preflight is offline and lockfile-frozen; if the local Bun cache is incomplete or the lockfile cannot be satisfied, ValidationGate will continue and report the dependency/setup blocker rather than modifying project manifests.
+- Expo Router browser validation now removes linked `node_modules` artifacts before dependency repair; if the offline Bun cache is incomplete, the browser validation may still report a local dependency/setup blocker.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
