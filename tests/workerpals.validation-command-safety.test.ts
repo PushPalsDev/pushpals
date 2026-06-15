@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -750,6 +750,53 @@ describe("workerpals validation command safety", () => {
           "bun run lint",
         ])?.reason,
       ).toContain("typescript");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("repairs linked node_modules before Expo Router browser validation", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-linked-expo-router-"));
+    const dependencyRoot = join(root, "repo-node-modules");
+
+    try {
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify(
+          {
+            scripts: { "web:e2e": "node scripts/test-web-e2e.js", lint: "expo lint" },
+            dependencies: { expo: "1.0.0", "expo-router": "1.0.0" },
+            devDependencies: { playwright: "1.0.0", typescript: "1.0.0" },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      writeFileSync(join(root, "bun.lock"), "", "utf8");
+      mkdirSync(join(dependencyRoot, ".bin"), { recursive: true });
+      for (const dependencyName of ["expo", "expo-router", "playwright", "typescript"]) {
+        mkdirSync(join(dependencyRoot, dependencyName), { recursive: true });
+        writeFileSync(
+          join(dependencyRoot, dependencyName, "package.json"),
+          JSON.stringify({ name: dependencyName }, null, 2),
+          "utf8",
+        );
+      }
+      symlinkSync(
+        dependencyRoot,
+        join(root, "node_modules"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      const browserPlan = resolveBunDependencyLayoutPreflight(root, [
+        "bun test",
+        "bun run web:e2e",
+      ]);
+      expect(browserPlan?.reason).toContain("node_modules is linked");
+      expect(browserPlan?.removeLinkedNodeModules).toBe(true);
+
+      expect(resolveBunDependencyLayoutPreflight(root, ["bun test"])).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

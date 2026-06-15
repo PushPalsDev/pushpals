@@ -2072,6 +2072,7 @@ export function prepareValidationSpawnArgv(argv: string[], env: Record<string, s
 interface BunDependencyLayoutPreflightPlan {
   command: string;
   reason: string;
+  removeLinkedNodeModules?: boolean;
 }
 
 function readJsonRecord(path: string): Record<string, unknown> | null {
@@ -2099,6 +2100,13 @@ function declaredPackageDependencyNames(
     }
   }
   return Array.from(out).sort((a, b) => a.localeCompare(b));
+}
+
+function packageJsonDeclaresDependency(
+  packageJson: Record<string, unknown>,
+  name: string,
+): boolean {
+  return declaredPackageDependencyNames(packageJson).includes(name);
 }
 
 function hasBunLockfile(repo: string): boolean {
@@ -2183,6 +2191,24 @@ function hasLocalBinShim(binDir: string, binName: string): boolean {
   return candidates.some((candidate) => existsSync(candidate));
 }
 
+function isLinkedNodeModulesDependencyArtifact(repo: string): boolean {
+  try {
+    return lstatSync(resolve(repo, "node_modules")).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function validationNeedsExpoRouterBrowserLocalInstall(
+  packageJson: Record<string, unknown>,
+  validationCommands: string[],
+): boolean {
+  return (
+    packageJsonDeclaresDependency(packageJson, "expo-router") &&
+    validationCommands.some((command) => isLongRunningBrowserValidationCommand(command))
+  );
+}
+
 function collectMissingTopLevelDependencyPackages(
   repo: string,
   packageJson: Record<string, unknown>,
@@ -2235,6 +2261,18 @@ export function resolveBunDependencyLayoutPreflight(
     };
   }
 
+  if (
+    isLinkedNodeModulesDependencyArtifact(repo) &&
+    validationNeedsExpoRouterBrowserLocalInstall(packageJson, validationCommands)
+  ) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason:
+        "node_modules is linked for Expo Router browser validation commands",
+      removeLinkedNodeModules: true,
+    };
+  }
+
   const binDir = resolve(nodeModulesDir, ".bin");
   if (!existsSync(binDir)) {
     return {
@@ -2261,6 +2299,28 @@ export function resolveBunDependencyLayoutPreflight(
   return null;
 }
 
+function removeLinkedNodeModulesDependencyArtifact(
+  repo: string,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): void {
+  const nodeModulesDir = resolve(repo, "node_modules");
+  if (!isLinkedNodeModulesDependencyArtifact(repo)) return;
+  try {
+    rmSync(nodeModulesDir, { recursive: true, force: true });
+    onLog?.(
+      "stdout",
+      "[ValidationGate] Dependency layout preflight removed linked node_modules artifact before local Bun install repair.",
+    );
+  } catch (err) {
+    onLog?.(
+      "stderr",
+      `[ValidationGate] Dependency layout preflight could not remove linked node_modules artifact: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
 async function runBunDependencyLayoutPreflight(
   repo: string,
   validationCommands: string[],
@@ -2274,6 +2334,9 @@ async function runBunDependencyLayoutPreflight(
     "stdout",
     `[ValidationGate] Dependency layout preflight: ${preflight.reason}; running "${preflight.command}".`,
   );
+  if (preflight.removeLinkedNodeModules) {
+    removeLinkedNodeModulesDependencyArtifact(repo, onLog);
+  }
   const run = await runValidationCommand(
     repo,
     preflight.command,
