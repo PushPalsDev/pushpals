@@ -2,24 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.60`
-- start_commit: `d2ffff8b7546520acbb95cfbe1c0dd9148b8fc1d`
-- end_commit: `2b5012261fc388ca3ca50cc6511ed412ae9f252b`
+- version: `v1.1.61`
+- start_commit: `22fa3a4a02a1e50d7e9aa6a856b8d06c1e6b47f1`
+- end_commit: `d8cedc1cb468b408f0c07864f9d57b27ebef5dee`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Soft-pass critic-only quality revisions when the patch is publishable, required validation has passed, `quality_soft_pass_on_exhausted=true`, and the remaining execution budget is too small for another worker turn.
-- Preserve hard failures for deterministic quality blockers, required validation failures, non-publishable changes, and configurations where exhausted soft-pass is disabled.
-- Keep the existing revision-budget guard for unsafe cases while preventing validated browser-passing work from becoming a terminal failed job solely because the critic wanted another refinement.
-- Add regression coverage for the critic-only budget-exhaustion decision path.
+- Disable PushPals' local session-token pause by default so a static runtime cap does not stop new work while the active Codex/LLM session still has budget.
+- Keep LLM usage telemetry for observability while returning `sessionBudget: null` when the local session budget is disabled.
+- Preserve explicit local safety caps through `session_token_budget` or `PUSHPALS_SESSION_TOKEN_BUDGET`; configured caps still pause new work after crossing the limit.
+- Ship the new default through the packaged CLI runtime and WorkerPal sandbox runtime assets.
+- Add route coverage proving large telemetry events do not block follow-up session messages when the local session budget is disabled.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.quality-gate-issues.test.ts`
-- `bun --cwd apps/workerpals tsc --noEmit`
+- `bun test tests/server.session-message-route.test.ts tests/server.autonomy-store.test.ts`
 - `bun run test:root`
 - `git diff --check`
 
@@ -51,6 +51,7 @@ bun install -g @pushpalsdev/cli
 - The npm package still requires a working Bun runtime to launch the package entrypoint; PushPals does not vendor Bun or other external toolchains in the npm package.
 - Direct GitHub release binaries are PushPals-built standalone artifacts. Removing embedded Bun runtime from those standalone artifacts would require a separate runtime distribution redesign.
 - Active runtimes that were started from an older release must be restarted after installing this release before new startup or packaged-runtime behavior takes effect.
+- PushPals does not currently read Codex TUI `/status` directly; by default it avoids enforcing an independent local session-token pause and relies on the active Codex/LLM provider budget. Users who need a local safety cap can set `session_token_budget` or `PUSHPALS_SESSION_TOKEN_BUDGET`.
 - Docker-backed WorkerPal execution can use a stalled Docker Codex startup as the signal to switch future WorkerPal spawns to direct isolated-worktree execution; if the replacement direct WorkerPal also cannot start Codex, that retry can still fail terminally and recycle the worker.
 - QualityGate can still reject or request repair for a broad patch after the rollout coach hands publishable progress forward; this release changes the failure point from executor pre-validation failure to structured gate diagnostics.
 - Bun dependency-layout preflight is offline and lockfile-frozen; if the local Bun cache is incomplete or the lockfile cannot be satisfied, ValidationGate will continue and report the dependency/setup blocker rather than modifying project manifests.
