@@ -45,6 +45,7 @@ import {
 } from "./execute_job.js";
 import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
 import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
+import { linkDirectWorktreeDependencyArtifacts } from "./common/worktree_dependency_artifacts.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 import { resolveFreshWorktreeBaseRef } from "./worktree_base_ref.js";
@@ -775,6 +776,7 @@ async function createIsolatedWorktree(
   repo: string,
   jobId: string,
   baseRef: string,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<string> {
   const worktreeRoot = resolve(repo, ".worktrees");
   mkdirSync(worktreeRoot, { recursive: true });
@@ -790,6 +792,8 @@ async function createIsolatedWorktree(
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
   }
+
+  linkDirectWorktreeDependencyArtifacts(repo, worktreePath, onLog);
 
   return worktreePath;
 }
@@ -1607,6 +1611,7 @@ async function workerLoop(
                 opts.repo,
                 job.id,
                 opts.worktreeBaseRef,
+                onLog,
               );
               executionRepo = directWorktreePath;
             }
@@ -1890,6 +1895,7 @@ async function workerLoop(
                 `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
             } else {
+              const failedResult = result;
               let unsuccessfulToolRunReported = false;
               const reportUnsuccessfulToolRun = async (phase: string) => {
                 if (unsuccessfulToolRunReported) return;
@@ -1898,7 +1904,7 @@ async function workerLoop(
                   opts,
                   headers,
                   job,
-                  result,
+                  result: failedResult,
                   durationMs: jobDurationMs,
                   phase,
                 });
@@ -1909,19 +1915,19 @@ async function workerLoop(
                   `${opts.server}/jobs/${job.id}/fail`,
                   headers,
                   {
-                    message: result.summary,
-                    detail: redactSensitiveText(result.stderr ?? ""),
+                    message: failedResult.summary,
+                    detail: redactSensitiveText(failedResult.stderr ?? ""),
                     durationMs: jobDurationMs,
-                    diagnostics: result.diagnostics,
+                    diagnostics: failedResult.diagnostics,
                   },
                 );
                 statusPersistedToServer = response.ok;
                 console.log(
-                  `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+                  `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${failedResult.summary}`,
                 );
                 recycleWorkerAfterJob = shouldRecycleWorkerForCodexUnavailableFailure(
-                  result.summary,
-                  result.stderr,
+                  failedResult.summary,
+                  failedResult.stderr,
                 );
                 if (recycleWorkerAfterJob) {
                   console.error(
@@ -1933,7 +1939,7 @@ async function workerLoop(
               if (
                 shouldDeferDockerCodexStartupStallForDirectRetry({
                   dockerEnabled: Boolean(dockerExecutor),
-                  result,
+                  result: failedResult,
                 })
               ) {
                 await reportUnsuccessfulToolRun("worker:docker-codex-startup-stall-defer");
