@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   buildBrowserValidationRepairPacket,
+  browserValidationRepairContinuationBudgetDecision,
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
@@ -81,6 +82,85 @@ describe("workerpals quality gate critic issue formatting", () => {
       shouldStart: false,
       remainingBudgetMs: 200_000,
       minimumRevisionBudgetMs: 300_000,
+    });
+  });
+
+  test("continues in-scope browser validation repair after the generic revision budget is exhausted", () => {
+    const revisionBudget = qualityRevisionBudgetDecision({
+      jobElapsedMs: 1_200_000,
+      executionBudgetMs: 1_200_000,
+    });
+    const packet = {
+      command: "bun run web:e2e",
+      failureKind: "assertion" as const,
+      stage: "settings return navigation",
+      selector: "[data-testid=\"settings-home-button\"]",
+      expected: "settings home button returns to the home screen",
+      failureFocus: "phase/progression",
+      digest: "Navigation/phase progression smoke failure",
+      previousDigest: "home route startup",
+      previousStage: "home route startup",
+      previousSelector: "[data-testid=\"home-screen\"]",
+      previousExpected: "home screen is visible",
+      previousFailureFocus: "route/startup",
+      progress: "new_failure" as const,
+      needsDiagnosticProbe: false,
+      artifacts: ["artifacts/web-e2e/settings-return.png"],
+      output: "visible settings home button did not return to home",
+    };
+
+    expect(
+      browserValidationRepairContinuationBudgetDecision({
+        browserRepairPacket: packet,
+        validationOutsideTaskScope: false,
+        changedPaths: ["scripts/test-web-e2e.js"],
+        revisionBudget,
+      }),
+    ).toEqual({
+      shouldContinue: true,
+      executionBudgetMs: 900_000,
+      finalizationBudgetMs: 120_000,
+      reason:
+        "browser validation repair made a publishable patch but exhausted the original revision budget",
+    });
+  });
+
+  test("does not continue browser validation repair without a publishable patch", () => {
+    const revisionBudget = qualityRevisionBudgetDecision({
+      jobElapsedMs: 1_200_000,
+      executionBudgetMs: 1_200_000,
+    });
+    const packet = {
+      command: "bun run web:e2e",
+      failureKind: "assertion" as const,
+      stage: "settings return navigation",
+      selector: "[data-testid=\"settings-home-button\"]",
+      expected: "settings home button returns to the home screen",
+      failureFocus: "phase/progression",
+      digest: "Navigation/phase progression smoke failure",
+      previousDigest: "home route startup",
+      previousStage: "home route startup",
+      previousSelector: "[data-testid=\"home-screen\"]",
+      previousExpected: "home screen is visible",
+      previousFailureFocus: "route/startup",
+      progress: "new_failure" as const,
+      needsDiagnosticProbe: false,
+      artifacts: ["artifacts/web-e2e/settings-return.png"],
+      output: "visible settings home button did not return to home",
+    };
+
+    expect(
+      browserValidationRepairContinuationBudgetDecision({
+        browserRepairPacket: packet,
+        validationOutsideTaskScope: false,
+        changedPaths: ["Microsoft/Windows/PowerShell/ModuleAnalysisCache"],
+        revisionBudget,
+      }),
+    ).toEqual({
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no publishable browser repair patch is present",
     });
   });
 

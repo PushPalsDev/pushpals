@@ -208,6 +208,8 @@ const MAX_DIAGNOSTIC_TEXT_CHARS = 8_000;
 const QUALITY_MIN_REVISION_BUDGET_MS = 120_000;
 const QUALITY_MAX_REVISION_BUDGET_MS = 420_000;
 const QUALITY_REVISION_BUDGET_RATIO = 0.25;
+const BROWSER_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 900_000;
+const BROWSER_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
 
 export function qualityRevisionLoopUpperBound(
   policy: {
@@ -256,6 +258,62 @@ export function qualityRevisionBudgetDecision(opts: {
     shouldStart: remainingBudgetMs >= minimumRevisionBudgetMs,
     remainingBudgetMs,
     minimumRevisionBudgetMs,
+  };
+}
+
+export function browserValidationRepairContinuationBudgetDecision(opts: {
+  browserRepairPacket?: BrowserValidationRepairPacket | null;
+  validationOutsideTaskScope?: boolean;
+  changedPaths: string[];
+  revisionBudget: Pick<
+    ReturnType<typeof qualityRevisionBudgetDecision>,
+    "shouldStart" | "remainingBudgetMs" | "minimumRevisionBudgetMs"
+  >;
+}): {
+  shouldContinue: boolean;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+  reason: string;
+} {
+  if (opts.revisionBudget.shouldStart) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "standard revision budget is available",
+    };
+  }
+  if (!opts.browserRepairPacket) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no browser validation repair packet",
+    };
+  }
+  if (opts.validationOutsideTaskScope) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "browser validation failure is outside task scope",
+    };
+  }
+  const publishablePaths = publishableChangedPaths(opts.changedPaths);
+  if (publishablePaths.length === 0) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no publishable browser repair patch is present",
+    };
+  }
+  return {
+    shouldContinue: true,
+    executionBudgetMs: BROWSER_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS,
+    finalizationBudgetMs: BROWSER_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS,
+    reason:
+      "browser validation repair made a publishable patch but exhausted the original revision budget",
   };
 }
 
@@ -7908,6 +7966,10 @@ export async function executeJob(
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   const diagnosticValidationRuns: JobValidationRunDiagnostics[] = [];
   const diagnosticPatchSnapshots: JobPatchSnapshotDiagnostics[] = [];
+  let nextQualityRevisionExecuteBudgets: {
+    executionBudgetMs: number;
+    finalizationBudgetMs: number;
+  } | null = null;
   while (revisionAttempt <= qualityRevisionLoopMax) {
     const attemptStartedAt = Date.now();
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
@@ -7917,7 +7979,11 @@ export async function executeJob(
     }
 
     const executor = resolveExecutor(runtimeConfig);
-    const defaultExecuteBudgets = { executionBudgetMs, finalizationBudgetMs };
+    const defaultExecuteBudgets = nextQualityRevisionExecuteBudgets ?? {
+      executionBudgetMs,
+      finalizationBudgetMs,
+    };
+    nextQualityRevisionExecuteBudgets = null;
     const runExecutor = getBackendTaskExecutor(executor);
     if (!runExecutor) {
       return {
@@ -8561,7 +8627,14 @@ export async function executeJob(
       jobElapsedMs: Date.now() - jobStartedAt,
       executionBudgetMs,
     });
-    if (!revisionBudget.shouldStart) {
+    const browserValidationContinuation =
+      browserValidationRepairContinuationBudgetDecision({
+        browserRepairPacket: validationOutsideTaskScope ? null : browserRepairPacket,
+        validationOutsideTaskScope,
+        changedPaths: quality.changedPaths,
+        revisionBudget,
+      });
+    if (!revisionBudget.shouldStart && !browserValidationContinuation.shouldContinue) {
       const budgetSummary = `Quality gate needs revision ${
         revisionAttempt + 1
       }/${activeMaxAutoRevisions}, but remaining execution budget is ${
@@ -8588,6 +8661,27 @@ export async function executeJob(
         exitCode: 4,
       };
       return annotateTerminalResult(failure, "quality");
+    }
+    if (!revisionBudget.shouldStart && browserValidationContinuation.shouldContinue) {
+      nextQualityRevisionExecuteBudgets = {
+        executionBudgetMs: browserValidationContinuation.executionBudgetMs,
+        finalizationBudgetMs: browserValidationContinuation.finalizationBudgetMs,
+      };
+      onLog?.(
+        "stderr",
+        `[QualityGate] Continuing browser validation repair ${
+          revisionAttempt + 1
+        }/${activeMaxAutoRevisions} with dedicated budget ${
+          browserValidationContinuation.executionBudgetMs
+        }ms execution + ${
+          browserValidationContinuation.finalizationBudgetMs
+        }ms finalization after original remaining budget ${
+          revisionBudget.remainingBudgetMs
+        }ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(
+          issueSummary,
+          220,
+        )}`,
+      );
     }
 
     revisionAttempt += 1;
