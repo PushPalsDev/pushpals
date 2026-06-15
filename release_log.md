@@ -2,24 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.55`
-- start_commit: `60eeee85a00f85500f396b6858f219a43de31af6`
-- end_commit: `b31eff53671aee5547f8a7e62dc90695b26a8564`
+- version: `v1.1.56`
+- start_commit: `7434b5f49b59237faf8af4b7f4ada15000fb4e5d`
+- end_commit: `383e29e671f4d547b45f946ca5525a416e235bcd`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Clean known Windows PowerShell runtime cache artifacts from OpenAI Codex executor progress checks before they can poison WorkerPal rollout decisions.
-- Fix direct Windows fallback jobs that were failing as `artifact_only_no_publishable_patch` when `Microsoft/Windows/PowerShell/ModuleAnalysisCache` was the only dirty path before a real patch landed.
-- Preserve tracked or baseline-dirty files while cleaning only untracked, generated runtime artifacts inside the isolated worktree.
-- Add regression coverage for artifact cleanup before rollout-watchdog failure and for the lower-level PowerShell cache cleanup path.
+- Add OpenAI Codex `--add-dir` sandbox wiring for linked direct-worktree dependency artifacts such as `node_modules`, so local worker checks can traverse repo dependencies without false out-of-worktree permission failures.
+- Give repo validation blockers a guarded fourth repair turn while preserving the normal configured quality budget for non-validation churn.
+- Improve validation-repair convergence when a target repo has broken project validation setup, such as lint/typecheck dependency resolution failures that are outside the original task scope.
+- Add regression coverage for linked dependency sandbox dirs and the extended repo-validation repair budget.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
 - `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
-- `bun test tests/workerpals.quality-gate-issues.test.ts tests/workerpals.session-events.test.ts`
+- `bun test tests/workerpals.quality-gate-issues.test.ts tests/workerpals.direct-worktree-dependency-artifacts.test.ts tests/workerpals.session-events.test.ts`
 - `bun run test:root`
 - `bun --cwd apps/workerpals tsc --noEmit`
 - `git diff --check`
