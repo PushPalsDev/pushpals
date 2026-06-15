@@ -2,28 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.51`
-- start_commit: `77188a1f83805acde259980a6bd03b52def26b88`
-- end_commit: `8dc356356107587c43ad7402a078dcbddb477630`
+- version: `v1.1.52`
+- start_commit: `e3bcf568a2d0f59ae5dc094379efcc00895ac452`
+- end_commit: `0d0dcb8a5701f9d3ebd62d6e4c129258555ebd42`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Recognize autonomy-origin required-validation repair prompts as diagnostic repair work instead of ordinary background ideation.
-- Give validation repair jobs longer no-edit and command-progress budgets so browser smoke reproduction and root-cause diagnosis are not interrupted prematurely.
-- Keep rollout-coach semantic drift detection for validation repair jobs, while ignoring artifact-only Windows PowerShell cache dirt as a standalone off-track signal.
-- Add regression coverage proving validation repair continues past `Microsoft/Windows/PowerShell/ModuleAnalysisCache` noise in both source and packaged WorkerPal runtime paths.
+- Continue in-scope browser validation repair when the normal revision budget is exhausted but a publishable browser-smoke repair patch is already present.
+- Give the continuation turn a dedicated execution and finalization budget so WorkerPal can finish the next repair attempt and still leave time for ValidationGate.
+- Keep ordinary quality/critic revisions on the existing budget guard; the continuation path only applies to browser validation repair with publishable code changes.
+- Add regression coverage for both the positive continuation decision and the artifact-only/no-publishable-patch rejection path.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_validation_repair_prompt_gets_diagnostic_watchdogs apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_run_codex_task_validation_repair_ignores_artifact_only_rollout_progress`
-- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
 - `bun test tests/workerpals.quality-gate-issues.test.ts`
+- `bun run test:root`
 - `bun run test:prompt-policy`
 - `bun run test:protocol`
-- `bun run test:root`
 - `bun --cwd apps/server build`
 - `git diff --check`
 
