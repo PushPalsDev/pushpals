@@ -2,28 +2,29 @@
 
 ## Release Metadata
 
-- version: `v1.1.49`
-- start_commit: `f8c415542fe9a7c108ce73fa77db1631b87dada4`
-- end_commit: `9e8ed80a903d81fbe3ae50f14eeaabb1a82d762d`
+- version: `v1.1.50`
+- start_commit: `c58fbfe55123f50f8ac712951032ec2d1afb73fd`
+- end_commit: `ef2f8e51a1e9fe1cfadff3df13bc4e06a1d6394e`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Detect repeated required validation failures across recent jobs and expose them in the autonomy snapshot as a red validation baseline.
-- Make RemoteBuddy short-circuit normal autonomous ideation while the repo baseline is red, dispatching a deterministic validation-repair objective instead.
-- Build validation repair requests from the failing command, recent failure evidence, target path hints, and required validation commands.
-- Add regression coverage for server-side validation incident snapshots and RemoteBuddy's no-LLM repair dispatch path.
+- Mark required validation red after repeated failed validation runs inside a single terminal job, so PushPals does not need a second failed job before prioritizing repair.
+- Treat Windows PowerShell `ModuleAnalysisCache` and `PSReadLine` cache files as runtime artifacts instead of publishable job output.
+- Expand Git's untracked `Microsoft/` directory status into concrete known PowerShell cache artifact paths before WorkerPal publishability and diff-budget checks.
+- Add regression coverage for single-job validation-red snapshots and Windows PowerShell cache artifact filtering in both direct and packaged WorkerPal runtime paths.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/server.autonomy-store.test.ts tests/remotebuddy.autonomous-engine.tick.test.ts`
+- `bun test tests/server.autonomy-store.test.ts tests/remotebuddy.autonomous-engine.tick.test.ts tests/workerpals.quality-gate-issues.test.ts`
+- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_codex_changed_paths_filters_dependency_artifacts_from_publishable_delta apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_codex_changed_paths_filters_windows_powershell_cache_directory`
+- `bun test tests/remotebuddy.persistent-memory.test.ts -t "recalls repo history across sessions from sqlite"`
 - `bun run test:prompt-policy`
 - `bun run test:protocol`
 - `bun run test:root`
 - `bun --cwd apps/server build`
-- `bun --cwd apps/remotebuddy typecheck` *(blocked by pre-existing startup checklist/type-test errors outside this release change)*
 - `git diff --check`
 
 ## Install
