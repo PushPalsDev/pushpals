@@ -2,28 +2,28 @@
 
 ## Release Metadata
 
-- version: `v1.1.64`
-- start_commit: `648e7d61a5a8bd6eb8204d00c45b289cda6be379`
-- end_commit: `98d4edd2644df00a5400b46633f42652ac9ff7d4`
+- version: `v1.1.65`
+- start_commit: `6243ba2b5f14d37f8f4de204da83fb0136f554bf`
+- end_commit: `684bf6b4519372f2c7776037efc14559dc1295ea`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Make `pushpals --clear` clean WorkerPal Docker warm containers and sandbox image state before deleting repo-local runtime data, so Docker/WorkerPal bind locks are released first.
-- Retry transient locked clear targets such as `outputs/data` across Windows `EBUSY`, `EPERM`, and `ENOTEMPTY` failures instead of failing after a single stale lock.
-- Improve final clear failure detail when a path remains locked after all retry attempts.
-- Add focused coverage for retryable clear failures and retry exhaustion details.
+- Persist the runtime-only CLI host PID in repo-local state when the embedded runtime is auto-started.
+- Make `pushpals --clear` verify and stop that saved runtime host process tree before deleting repo-local runtime data, preventing the supervisor from restarting services and reopening SQLite WAL/SHM files during cleanup.
+- Preserve the saved runtime host identity when short-lived CLI sessions attach to an existing runtime, so `/status` or normal CLI usage does not erase the information needed for a later clear.
+- Add focused coverage for runtime-host candidate selection, command-line verification, and stale-PID refusal.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/cli.runtime-bootstrap.test.ts -t "CliClear"`
 - `bun test tests/cli.runtime-bootstrap.test.ts`
 - `bun test tests/cli.invocation-logging.test.ts -t "pushpals --clear"`
 - `bun run test:cli:integration`
 - `bun run test:root`
 - `git diff --check`
+- Manual SectorCommand smoke: stopped the pre-existing v1.1.64 runtime-only process tree once, then ran the patched `pushpals --clear`; `outputs/data` was removed and no PushPals runtime processes remained.
 
 ## Install
 
@@ -50,6 +50,7 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
+- Active runtime-only supervisors started from v1.1.64 or older did not write the new runtime-host PID state, so they may need to be stopped once manually before this release can prevent future `outputs/data` EBUSY loops.
 - The npm package still requires a working Bun runtime to launch the package entrypoint; PushPals does not vendor Bun or other external toolchains in the npm package.
 - Direct GitHub release binaries are PushPals-built standalone artifacts. Removing embedded Bun runtime from those standalone artifacts would require a separate runtime distribution redesign.
 - Active runtimes that were started from an older release must be restarted after installing this release before new startup or packaged-runtime behavior takes effect.
