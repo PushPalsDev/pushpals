@@ -2,25 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.62`
-- start_commit: `6926af0e76505ff48f614d738d88d44ba559be0e`
-- end_commit: `fdd1bf0432dfa8c0284611abb8a92925af5db611`
+- version: `v1.1.63`
+- start_commit: `9de2663df7257c6ab62430bd835bd2f1eae44812`
+- end_commit: `a53827b692319192fd5a8c08c4cecf5170388ac8`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Block WorkerPal validation when the Bun dependency-layout repair preflight fails, instead of continuing into a partially repaired dependency tree.
-- Report the preflight repair failure as the required validation blocker so job diagnostics point at the dependency/setup issue that must be fixed.
-- Allow dependency-layout repair preflight to use the configured validation timeout window up to a five-minute cap.
-- Ship the WorkerPal runtime fix through the packaged CLI sandbox runtime assets.
-- Add validation-safety coverage for dependency preflight timeout clamping and blocking behavior.
+- Add a final no-edit recovery attempt for OpenAI Codex WorkerPal jobs before classifying no-patch runs as terminal failures.
+- Tighten final recovery guidance so Codex must edit from already inspected context instead of spending another attempt on read-only discovery.
+- Shorten final recovery watchdog, recheck, and command-progress windows so stuck jobs fail with structured diagnostics instead of drifting into generic timeouts.
+- Preserve the shared executor deadline by refusing low-odds final recovery attempts when too little budget remains.
+- Ship the WorkerPal runtime recovery fix through the packaged CLI sandbox runtime assets.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.validation-command-safety.test.ts`
-- `bun --cwd apps/workerpals tsc --noEmit`
+- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
+- `bun test tests/cli.invocation-logging.test.ts -t "runtime-only mode keeps running after stdin EOF"`
 - `bun run test:root`
 - `git diff --check`
 
@@ -57,6 +57,7 @@ bun install -g @pushpalsdev/cli
 - QualityGate can still reject or request repair for a broad patch after the rollout coach hands publishable progress forward; this release changes the failure point from executor pre-validation failure to structured gate diagnostics.
 - Bun dependency-layout preflight is offline and lockfile-frozen; if the local Bun cache is incomplete or the lockfile cannot be satisfied, ValidationGate blocks validation and reports the dependency/setup blocker rather than running later validation against an incomplete dependency tree or modifying project manifests.
 - Expo Router browser validation now removes linked `node_modules` artifacts before dependency repair; if the offline Bun cache is incomplete, the browser validation may still report a local dependency/setup blocker.
+- OpenAI Codex WorkerPal jobs can still fail if Codex produces no publishable edit after the final no-edit recovery attempt or if the shared executor budget is already too low for another recovery.
 - Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
