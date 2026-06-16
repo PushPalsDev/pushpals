@@ -41,6 +41,7 @@ import {
   injectMonitoringHubBootstrap,
   isDockerCleanupTimeoutDetail,
   isDockerUnavailableDetail,
+  isLikelyCliRuntimeHostCommandLine,
   isRetryableCliClearRemoveFailure,
   isCliExitCommand,
   normalizeCliInteractiveMessage,
@@ -54,6 +55,7 @@ import {
   resolveRuntimeDockerExecutableCandidates,
   resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
+  resolveCliRuntimeHostShutdownCandidate,
   resolveWorkerExecutionReadiness,
   resolveWorkerpalStartupReadinessProbeMaxMs,
   resolveWindowsNodeExtraCaCertsBundlePath,
@@ -70,6 +72,7 @@ import {
   resolveWindowsShellExecutableCandidatesForEnv,
   resolveWorkerpalDockerProbe,
   startEmbeddedMonitoringHub,
+  stopCliRuntimeHostFromState,
   shouldDeferRemoteBuddySessionConsumerReadiness,
   shouldPrepareEmbeddedWorkerpalDockerImageBlocking,
   waitForWorkerpalCapacity,
@@ -3558,6 +3561,126 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("resolveCliRuntimeHostShutdownCandidate accepts same-repo runtime-only hosts", () => {
+    const candidate = resolveCliRuntimeHostShutdownCandidate(
+      {
+        repoRoot: "/repo/SectorCommand",
+        runtimeHostPid: 1234,
+        runtimeHostManagesRuntime: true,
+        runtimeHostRuntimeOnly: true,
+      },
+      {
+        repoRoot: "/repo/SectorCommand/",
+        currentPid: 9999,
+      },
+    );
+
+    expect(candidate).toEqual({ ok: true, pid: 1234 });
+    expect(
+      resolveCliRuntimeHostShutdownCandidate(
+        {
+          repoRoot: "/repo/Other",
+          runtimeHostPid: 1234,
+          runtimeHostManagesRuntime: true,
+          runtimeHostRuntimeOnly: true,
+        },
+        {
+          repoRoot: "/repo/SectorCommand",
+          currentPid: 9999,
+        },
+      ),
+    ).toMatchObject({ ok: false });
+    expect(
+      resolveCliRuntimeHostShutdownCandidate(
+        {
+          repoRoot: "/repo/SectorCommand",
+          runtimeHostPid: 9999,
+          runtimeHostManagesRuntime: true,
+          runtimeHostRuntimeOnly: true,
+        },
+        {
+          repoRoot: "/repo/SectorCommand",
+          currentPid: 9999,
+        },
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
+  test("isLikelyCliRuntimeHostCommandLine recognizes PushPals CLI hosts without matching child services", () => {
+    expect(
+      isLikelyCliRuntimeHostCommandLine(
+        '"C:\\Users\\data_pi\\.bun\\bin\\pushpals.exe" --runtime-only',
+      ),
+    ).toBe(true);
+    expect(
+      isLikelyCliRuntimeHostCommandLine(
+        'bun "C:\\Users\\data_pi\\Documents\\programming\\pushpals\\scripts\\pushpals-cli.ts" --runtime-only',
+      ),
+    ).toBe(true);
+    expect(
+      isLikelyCliRuntimeHostCommandLine('"C:\\runtime\\pushpals-runtime-server-windows-x64.exe"'),
+    ).toBe(false);
+    expect(isLikelyCliRuntimeHostCommandLine("C:\\Windows\\System32\\notepad.exe")).toBe(false);
+  });
+
+  test("stopCliRuntimeHostFromState stops a verified saved runtime-only host", async () => {
+    const calls: Array<{ pid: number; platform: NodeJS.Platform }> = [];
+    const sleeps: number[] = [];
+
+    const result = await stopCliRuntimeHostFromState({
+      repoRoot: "/repo/SectorCommand",
+      state: {
+        repoRoot: "/repo/SectorCommand",
+        runtimeHostPid: 4321,
+        runtimeHostManagesRuntime: true,
+        runtimeHostRuntimeOnly: true,
+      },
+      currentPid: 9999,
+      platform: "win32",
+      readCommandLine: () => '"C:\\Users\\data_pi\\.bun\\bin\\pushpals.exe" --runtime-only',
+      stopProcessTree: (pid, platform) => {
+        calls.push({ pid, platform });
+        return true;
+      },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    expect(result).toMatchObject({ attempted: true, stopped: true, pid: 4321 });
+    expect(calls).toEqual([{ pid: 4321, platform: "win32" }]);
+    expect(sleeps).toEqual([500]);
+  });
+
+  test("stopCliRuntimeHostFromState refuses stale non-PushPals PIDs", async () => {
+    let stopCalls = 0;
+    const result = await stopCliRuntimeHostFromState({
+      repoRoot: "/repo/sector-command",
+      state: {
+        repoRoot: "/repo/sector-command",
+        runtimeHostPid: 7654,
+        runtimeHostManagesRuntime: true,
+        runtimeHostRuntimeOnly: true,
+      },
+      currentPid: 9999,
+      platform: "linux",
+      readCommandLine: () => "/usr/bin/notepad",
+      stopProcessTree: () => {
+        stopCalls += 1;
+        return true;
+      },
+      sleep: async () => {},
+    });
+
+    expect(result).toMatchObject({
+      attempted: false,
+      stopped: false,
+      pid: 7654,
+    });
+    expect(result.detail).toContain("no longer looks like a PushPals CLI process");
+    expect(stopCalls).toBe(0);
   });
 
   test("extractRemoteBuddySessionConsumerHealth recognizes the production RemoteBuddy agent identity", () => {

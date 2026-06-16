@@ -71,6 +71,9 @@ type CliState = {
   sessionId?: string;
   repoRoot?: string;
   pushpalsLogPath?: string;
+  runtimeHostPid?: number;
+  runtimeHostManagesRuntime?: boolean;
+  runtimeHostRuntimeOnly?: boolean;
   updatedAt?: string;
 };
 
@@ -90,6 +93,15 @@ type CliClearRemoveOptions = {
   retryDelayMs?: number;
   removePath?: (pathValue: string) => void;
   sleep?: (ms: number) => Promise<void>;
+};
+
+type CliRuntimeHostShutdownCandidate = { ok: true; pid: number } | { ok: false; detail: string };
+
+type CliRuntimeHostStopResult = {
+  attempted: boolean;
+  stopped: boolean;
+  pid?: number;
+  detail?: string;
 };
 
 type SessionStreamPayload = {
@@ -278,6 +290,8 @@ const DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS = 2_000;
 const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
 const CLI_CLEAR_REMOVE_MAX_ATTEMPTS = 8;
 const CLI_CLEAR_REMOVE_RETRY_DELAY_MS = 250;
+const CLI_CLEAR_RUNTIME_HOST_STOP_DELAY_MS = 500;
+const CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS = 2_500;
 const RUNTIME_BINARY_DOWNLOAD_ATTEMPTS = 3;
 const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS = 10_000;
@@ -3994,6 +4008,191 @@ export async function removeCliClearTarget(
   };
 }
 
+function parsePositiveInteger(value: unknown): number | undefined {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
+  return parsed;
+}
+
+function decodeSyncSubprocessOutput(output: unknown): string {
+  if (typeof output === "string") return output;
+  if (output instanceof Uint8Array) return Buffer.from(output).toString("utf8");
+  return String(output ?? "");
+}
+
+export function resolveCliRuntimeHostShutdownCandidate(
+  state: CliState,
+  opts: {
+    repoRoot: string;
+    currentPid?: number;
+    requireRuntimeOnly?: boolean;
+  },
+): CliRuntimeHostShutdownCandidate {
+  if (!state.runtimeHostManagesRuntime) {
+    return { ok: false, detail: "no saved runtime host manages embedded runtime services" };
+  }
+  if ((opts.requireRuntimeOnly ?? true) && !state.runtimeHostRuntimeOnly) {
+    return { ok: false, detail: "saved runtime host is not runtime-only" };
+  }
+  if (
+    !state.repoRoot ||
+    normalizeRepoPathForComparison(state.repoRoot) !== normalizeRepoPathForComparison(opts.repoRoot)
+  ) {
+    return { ok: false, detail: "saved runtime host belongs to a different repo" };
+  }
+  const pid = parsePositiveInteger(state.runtimeHostPid);
+  if (!pid) return { ok: false, detail: "saved runtime host PID is unavailable" };
+  if (pid === (opts.currentPid ?? process.pid)) {
+    return { ok: false, detail: "saved runtime host PID is the current process" };
+  }
+  return { ok: true, pid };
+}
+
+export function isLikelyCliRuntimeHostCommandLine(commandLine: string): boolean {
+  const text = String(commandLine ?? "").trim();
+  if (!text) return false;
+  const normalized = text.replace(/\\/g, "/").toLowerCase();
+  if (!normalized.includes("pushpals")) return false;
+  return (
+    normalized.includes("--runtime-only") ||
+    normalized.includes("pushpals-cli") ||
+    normalized.includes("@pushpalsdev") ||
+    /(^|[\\/"'\s])pushpals(?:\.exe|\.cmd|\.ps1)?(?=$|["'\s])/i.test(text)
+  );
+}
+
+function readCliRuntimeHostProcessCommandLine(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  try {
+    if (platform === "win32") {
+      const script = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
+        "if ($p -and $p.CommandLine) { [Console]::Out.Write([string]$p.CommandLine) }",
+      ].join("\n");
+      const result = Bun.spawnSync(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-EncodedCommand",
+          Buffer.from(script, "utf16le").toString("base64"),
+        ],
+        {
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "ignore",
+          timeout: CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        },
+      );
+      if (result.exitCode !== 0) return null;
+      const text = decodeSyncSubprocessOutput(result.stdout).trim();
+      return text || null;
+    }
+
+    const result = Bun.spawnSync(["ps", "-p", String(pid), "-o", "command="], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (result.exitCode !== 0) return null;
+    const text = decodeSyncSubprocessOutput(result.stdout).trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+function stopCliRuntimeHostProcessTree(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  try {
+    const stopCommand = buildServiceStopCommand(pid, platform);
+    if (stopCommand) {
+      const result = Bun.spawnSync(stopCommand, {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      });
+      return result.exitCode === 0;
+    }
+    process.kill(pid, "SIGTERM");
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+export async function stopCliRuntimeHostFromState(opts: {
+  repoRoot: string;
+  cliStatePath?: string | null;
+  state?: CliState;
+  currentPid?: number;
+  platform?: NodeJS.Platform;
+  readCommandLine?: (pid: number, platform: NodeJS.Platform) => string | null;
+  stopProcessTree?: (pid: number, platform: NodeJS.Platform) => boolean;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<CliRuntimeHostStopResult> {
+  const state =
+    opts.state ??
+    (opts.cliStatePath && existsSync(opts.cliStatePath) ? readCliState(opts.cliStatePath) : {});
+  const candidate = resolveCliRuntimeHostShutdownCandidate(state, {
+    repoRoot: opts.repoRoot,
+    currentPid: opts.currentPid,
+  });
+  if (!candidate.ok) {
+    return { attempted: false, stopped: false, detail: candidate.detail };
+  }
+
+  const platform = opts.platform ?? process.platform;
+  const readCommandLine = opts.readCommandLine ?? readCliRuntimeHostProcessCommandLine;
+  const commandLine = readCommandLine(candidate.pid, platform);
+  if (!commandLine) {
+    return {
+      attempted: false,
+      stopped: false,
+      pid: candidate.pid,
+      detail: "saved runtime host process could not be inspected",
+    };
+  }
+  if (!isLikelyCliRuntimeHostCommandLine(commandLine)) {
+    return {
+      attempted: false,
+      stopped: false,
+      pid: candidate.pid,
+      detail: "saved runtime host PID no longer looks like a PushPals CLI process",
+    };
+  }
+
+  const stopProcessTree = opts.stopProcessTree ?? stopCliRuntimeHostProcessTree;
+  const stopped = stopProcessTree(candidate.pid, platform);
+  if (stopped) {
+    const sleep = opts.sleep ?? ((ms: number) => Bun.sleep(ms));
+    await sleep(CLI_CLEAR_RUNTIME_HOST_STOP_DELAY_MS);
+  }
+  return {
+    attempted: true,
+    stopped,
+    pid: candidate.pid,
+    detail: stopped ? undefined : "runtime host process stop command failed",
+  };
+}
+
 async function requestLocalRuntimeShutdown(
   serverUrl: string,
   repoRoot: string,
@@ -4063,6 +4262,18 @@ async function clearPushpalsState(opts: {
     );
   } else if (shutdown.detail) {
     console.warn(`[pushpals] ${shutdown.detail}`);
+  }
+
+  const hostStop = await stopCliRuntimeHostFromState({
+    repoRoot: opts.repoRoot,
+    cliStatePath: opts.cliStatePath,
+  });
+  if (hostStop.attempted && hostStop.stopped) {
+    console.log(`[pushpals] Stopped runtime host process: pid=${hostStop.pid}`);
+  } else if (hostStop.attempted) {
+    console.warn(
+      `[pushpals] Runtime host process stop did not complete${hostStop.detail ? `: ${hostStop.detail}` : "."}`,
+    );
   }
 
   const targets = buildCliClearTargets({
@@ -5226,6 +5437,15 @@ function readCliState(pathValue: string): CliState {
       repoRoot: typeof parsed.repoRoot === "string" ? parsed.repoRoot : undefined,
       pushpalsLogPath:
         typeof parsed.pushpalsLogPath === "string" ? parsed.pushpalsLogPath : undefined,
+      runtimeHostPid: parsePositiveInteger(parsed.runtimeHostPid),
+      runtimeHostManagesRuntime:
+        typeof parsed.runtimeHostManagesRuntime === "boolean"
+          ? parsed.runtimeHostManagesRuntime
+          : undefined,
+      runtimeHostRuntimeOnly:
+        typeof parsed.runtimeHostRuntimeOnly === "boolean"
+          ? parsed.runtimeHostRuntimeOnly
+          : undefined,
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : undefined,
     };
   } catch {
@@ -6438,6 +6658,25 @@ async function main(): Promise<void> {
     sessionId: activeSessionId,
   });
   const monitoringHubUrl = monitoringHub?.url ?? "";
+  const savedRuntimeHostState =
+    saved.repoRoot &&
+    normalizeRepoPathForComparison(saved.repoRoot) === normalizeRepoPathForComparison(repoRoot) &&
+    saved.runtimeHostManagesRuntime &&
+    saved.runtimeHostRuntimeOnly
+      ? {
+          runtimeHostPid: saved.runtimeHostPid,
+          runtimeHostManagesRuntime: saved.runtimeHostManagesRuntime,
+          runtimeHostRuntimeOnly: saved.runtimeHostRuntimeOnly,
+        }
+      : {};
+  const runtimeHostState =
+    autoStartedServiceManager && parsed.runtimeOnly
+      ? {
+          runtimeHostPid: process.pid,
+          runtimeHostManagesRuntime: true,
+          runtimeHostRuntimeOnly: true,
+        }
+      : savedRuntimeHostState;
 
   if (statePath) {
     writeCliState(statePath, {
@@ -6447,6 +6686,7 @@ async function main(): Promise<void> {
       sessionId: activeSessionId,
       repoRoot,
       pushpalsLogPath,
+      ...runtimeHostState,
     });
   } else {
     console.warn("[pushpals] Could not resolve git metadata dir; skipping CLI state persistence.");
