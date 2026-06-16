@@ -41,6 +41,7 @@ import {
   injectMonitoringHubBootstrap,
   isDockerCleanupTimeoutDetail,
   isDockerUnavailableDetail,
+  isRetryableCliClearRemoveFailure,
   isCliExitCommand,
   normalizeCliInteractiveMessage,
   normalizeChildProcessEnv,
@@ -59,6 +60,7 @@ import {
   resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs,
   resolveCliStatePath,
   resolveCommandPath,
+  removeCliClearTarget,
   runCommandWithEnv,
   repoLooksLikePushPalsSourceCheckout,
   shutdownEmbeddedServiceManagerGracefully,
@@ -3467,6 +3469,92 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           path: join(runtimeRoot, "logs", "bootstrap"),
         },
       ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("isRetryableCliClearRemoveFailure recognizes transient Windows cleanup locks", () => {
+    expect(
+      isRetryableCliClearRemoveFailure(
+        "EBUSY: resource busy or locked, rm 'C:\\repo\\outputs\\data'",
+      ),
+    ).toBe(true);
+    expect(
+      isRetryableCliClearRemoveFailure(
+        "EPERM: operation not permitted, rmdir 'C:\\repo\\outputs\\data'",
+      ),
+    ).toBe(true);
+    expect(isRetryableCliClearRemoveFailure("ENOENT: no such file or directory")).toBe(false);
+  });
+
+  test("removeCliClearTarget retries transient busy removals before reporting failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-retry-"));
+    const dataDir = join(root, "outputs", "data");
+    const delays: number[] = [];
+    let attempts = 0;
+
+    try {
+      mkdirSync(dataDir, { recursive: true });
+      writeFileSync(join(dataDir, "pushpals.db"), "placeholder\n", "utf8");
+
+      const result = await removeCliClearTarget(
+        { label: "runtime data", path: dataDir },
+        {
+          maxAttempts: 4,
+          retryDelayMs: 10,
+          sleep: async (ms) => {
+            delays.push(ms);
+          },
+          removePath: (pathValue) => {
+            attempts += 1;
+            if (attempts < 3) {
+              const err = new Error(`EBUSY: resource busy or locked, rm '${pathValue}'`);
+              (err as NodeJS.ErrnoException).code = "EBUSY";
+              throw err;
+            }
+            rmSync(pathValue, { recursive: true, force: true });
+          },
+        },
+      );
+
+      expect(result).toBe("removed");
+      expect(attempts).toBe(3);
+      expect(delays).toEqual([10, 20]);
+      expect(existsSync(dataDir)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removeCliClearTarget reports retry exhaustion with timing detail", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-clear-retry-failure-"));
+    const dataDir = join(root, "outputs", "data");
+
+    try {
+      mkdirSync(dataDir, { recursive: true });
+
+      const result = await removeCliClearTarget(
+        { label: "runtime data", path: dataDir },
+        {
+          maxAttempts: 3,
+          retryDelayMs: 10,
+          sleep: async () => {},
+          removePath: (pathValue) => {
+            throw new Error(`EBUSY: resource busy or locked, rm '${pathValue}'`);
+          },
+        },
+      );
+
+      expect(result).toMatchObject({
+        label: "runtime data",
+        path: dataDir,
+      });
+      expect(result).not.toBe("removed");
+      expect(result).not.toBe("missing");
+      if (result !== "removed" && result !== "missing") {
+        expect(result.detail).toContain("still locked after 3 attempts over 30ms");
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -83,6 +83,15 @@ type CliClearFailure = CliClearTarget & {
   detail: string;
 };
 
+type CliClearRemoveResult = "removed" | "missing" | CliClearFailure;
+
+type CliClearRemoveOptions = {
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  removePath?: (pathValue: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+};
+
 type SessionStreamPayload = {
   envelope?: {
     id?: string;
@@ -267,6 +276,8 @@ const DEFAULT_COMMAND_OUTPUT_MAX_CHARS = 512_000;
 const DEFAULT_REMOTEBUDDY_SILENT_STARTUP_FALLBACK_MS = 20_000;
 const DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS = 2_000;
 const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
+const CLI_CLEAR_REMOVE_MAX_ATTEMPTS = 8;
+const CLI_CLEAR_REMOVE_RETRY_DELAY_MS = 250;
 const RUNTIME_BINARY_DOWNLOAD_ATTEMPTS = 3;
 const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS = 10_000;
@@ -3925,10 +3936,15 @@ export function buildCliClearTargets(opts: {
   return targets;
 }
 
-function removeCliClearTarget(target: CliClearTarget): "removed" | "missing" | CliClearFailure {
+function removeCliClearTargetOnce(
+  target: CliClearTarget,
+  removePath: (pathValue: string) => void = (pathValue) => {
+    rmSync(pathValue, { recursive: true, force: true });
+  },
+): CliClearRemoveResult {
   if (!existsSync(target.path)) return "missing";
   try {
-    rmSync(target.path, { recursive: true, force: true });
+    removePath(target.path);
     return "removed";
   } catch (err) {
     return {
@@ -3936,6 +3952,46 @@ function removeCliClearTarget(target: CliClearTarget): "removed" | "missing" | C
       detail: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+export function isRetryableCliClearRemoveFailure(detail: string): boolean {
+  return /\b(?:EBUSY|EPERM|ENOTEMPTY)\b/i.test(detail);
+}
+
+export async function removeCliClearTarget(
+  target: CliClearTarget,
+  options: CliClearRemoveOptions = {},
+): Promise<CliClearRemoveResult> {
+  const maxAttempts = Math.max(1, Math.trunc(options.maxAttempts ?? CLI_CLEAR_REMOVE_MAX_ATTEMPTS));
+  const retryDelayMs = Math.max(0, Math.trunc(options.retryDelayMs ?? CLI_CLEAR_REMOVE_RETRY_DELAY_MS));
+  const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+  const removePath = options.removePath;
+  let lastFailure: CliClearFailure | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const result = removeCliClearTargetOnce(target, removePath);
+    if (result === "removed" || result === "missing") return result;
+
+    lastFailure = result;
+    const retryable = isRetryableCliClearRemoveFailure(result.detail);
+    if (attempt >= maxAttempts || !retryable) {
+      if (retryable && attempt > 1) {
+        const totalDelayMs = retryDelayMs * ((attempt * (attempt - 1)) / 2);
+        return {
+          ...result,
+          detail: `${result.detail}; still locked after ${attempt} attempts over ${totalDelayMs}ms`,
+        };
+      }
+      return result;
+    }
+
+    await sleep(retryDelayMs * attempt);
+  }
+
+  return lastFailure ?? {
+    ...target,
+    detail: "clear target removal failed before an attempt could be made",
+  };
 }
 
 async function requestLocalRuntimeShutdown(
@@ -4019,44 +4075,6 @@ async function clearPushpalsState(opts: {
   const missing: CliClearTarget[] = [];
   let failed: CliClearFailure[] = [];
 
-  for (const target of targets) {
-    const result = removeCliClearTarget(target);
-    if (result === "removed") {
-      removed.push(target);
-      continue;
-    }
-    if (result === "missing") {
-      missing.push(target);
-      continue;
-    }
-    failed.push(result);
-  }
-
-  if (failed.length > 0 && shutdown.accepted) {
-    await Bun.sleep(1_000);
-    const retryFailures: CliClearFailure[] = [];
-    for (const failure of failed) {
-      const retry = removeCliClearTarget(failure);
-      if (retry === "removed") {
-        removed.push({ label: failure.label, path: failure.path });
-        continue;
-      }
-      if (retry === "missing") {
-        missing.push({ label: failure.label, path: failure.path });
-        continue;
-      }
-      retryFailures.push(retry);
-    }
-    failed = retryFailures;
-  }
-
-  for (const target of removed) {
-    console.log(`[pushpals] Cleared ${target.label}: ${target.path}`);
-  }
-  for (const target of missing) {
-    console.log(`[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
-  }
-
   if (opts.config.remotebuddy.workerpalDocker || opts.config.remotebuddy.workerpalRequireDocker) {
     const dockerEnv = normalizeChildProcessEnv(process.env as Record<string, string | undefined>);
     const warmCleanup = await cleanupLingeringWorkerpalWarmContainers({
@@ -4095,6 +4113,26 @@ async function clearPushpalsState(opts: {
         detail: imageCleanup.detail,
       });
     }
+  }
+
+  for (const target of targets) {
+    const result = await removeCliClearTarget(target);
+    if (result === "removed") {
+      removed.push(target);
+      continue;
+    }
+    if (result === "missing") {
+      missing.push(target);
+      continue;
+    }
+    failed.push(result);
+  }
+
+  for (const target of removed) {
+    console.log(`[pushpals] Cleared ${target.label}: ${target.path}`);
+  }
+  for (const target of missing) {
+    console.log(`[pushpals] Nothing to clear for ${target.label}: ${target.path}`);
   }
 
   for (const failure of failed) {
