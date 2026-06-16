@@ -2,28 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.65`
-- start_commit: `6243ba2b5f14d37f8f4de204da83fb0136f554bf`
-- end_commit: `684bf6b4519372f2c7776037efc14559dc1295ea`
+- version: `v1.1.66`
+- start_commit: `813f97ecca49553c74c6651753870066702329e5`
+- end_commit: `a7e45924876c4926ca166093d1284f3a56181685`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Persist the runtime-only CLI host PID in repo-local state when the embedded runtime is auto-started.
-- Make `pushpals --clear` verify and stop that saved runtime host process tree before deleting repo-local runtime data, preventing the supervisor from restarting services and reopening SQLite WAL/SHM files during cleanup.
-- Preserve the saved runtime host identity when short-lived CLI sessions attach to an existing runtime, so `/status` or normal CLI usage does not erase the information needed for a later clear.
-- Add focused coverage for runtime-host candidate selection, command-line verification, and stale-PID refusal.
+- Ignore stale clean tracked paths when OpenAI Codex timeout handling checks whether a worker patch is broad or noisy.
+- Keep the broad/noisy timeout guard active for real staged, unstaged, and untracked changes while filtering paths that `git status` reports but `git diff` says are clean.
+- Prevent focused worker patches from being rejected before validation just because stale publishable-looking paths are still visible in the sandbox status summary.
+- Add coverage for stale clean tracked status paths so the executor reports only the true content delta to timeout and quality gates.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/cli.runtime-bootstrap.test.ts`
-- `bun test tests/cli.invocation-logging.test.ts -t "pushpals --clear"`
+- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
 - `bun run test:cli:integration`
 - `bun run test:root`
 - `git diff --check`
-- Manual SectorCommand smoke: stopped the pre-existing v1.1.64 runtime-only process tree once, then ran the patched `pushpals --clear`; `outputs/data` was removed and no PushPals runtime processes remained.
 
 ## Install
 
@@ -60,6 +58,7 @@ bun install -g @pushpalsdev/cli
 - Bun dependency-layout preflight is offline and lockfile-frozen; if the local Bun cache is incomplete or the lockfile cannot be satisfied, ValidationGate blocks validation and reports the dependency/setup blocker rather than running later validation against an incomplete dependency tree or modifying project manifests.
 - Expo Router browser validation now removes linked `node_modules` artifacts before dependency repair; if the offline Bun cache is incomplete, the browser validation may still report a local dependency/setup blocker.
 - OpenAI Codex WorkerPal jobs can still fail if Codex produces no publishable edit after the final no-edit recovery attempt or if the shared executor budget is already too low for another recovery.
+- OpenAI Codex WorkerPal jobs still fail fast on truly broad/noisy publishable diffs after timeout; this release only filters tracked paths with no staged or unstaged Git content delta.
 - Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
