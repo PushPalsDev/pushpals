@@ -109,7 +109,7 @@ _MAX_CREDIBLE_WRAPPER_LOOP_CHANGED_PATHS = 8
 _MAX_CREDIBLE_WRAPPER_LOOP_TOP_LEVELS = 4
 _MAX_STARTUP_STALL_RECOVERY_ATTEMPTS = 1
 _MAX_STARTUP_STALL_DURING_NO_EDIT_RECOVERY_ATTEMPTS = 2
-_MAX_NO_EDIT_RECOVERY_ATTEMPTS = 1
+_MAX_NO_EDIT_RECOVERY_ATTEMPTS = 2
 _MAX_ROLLOUT_RECOVERY_ATTEMPTS = 1
 _DEFAULT_NO_EDIT_WATCHDOG_S = 480
 _SMALL_TASK_NO_EDIT_WATCHDOG_S = 240
@@ -117,14 +117,17 @@ _NARROW_TEST_TASK_NO_EDIT_WATCHDOG_S = 180
 _WEB_REVIEW_NO_EDIT_WATCHDOG_S = 240
 _BACKGROUND_NO_EDIT_WATCHDOG_S = 120
 _NO_EDIT_RECOVERY_WATCHDOG_S = 90
+_FINAL_NO_EDIT_RECOVERY_WATCHDOG_S = 60
 _DEFAULT_NO_EDIT_RECHECK_S = 120
 _NO_EDIT_RECOVERY_RECHECK_S = 30
+_FINAL_NO_EDIT_RECOVERY_RECHECK_S = 15
 _DEFAULT_NO_EDIT_COMMAND_GRACE_S = 240
 _DEFAULT_NO_EDIT_COMMAND_PROGRESS_CAP_S = 360
 _BACKGROUND_NO_EDIT_COMMAND_PROGRESS_CAP_S = 120
 _VALIDATION_REPAIR_NO_EDIT_WATCHDOG_S = 300
 _VALIDATION_REPAIR_COMMAND_PROGRESS_CAP_S = 360
 _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S = 120
+_FINAL_NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S = 60
 _DEFAULT_STARTUP_STALL_WATCHDOG_S = 210
 _RECOVERY_STARTUP_STALL_WATCHDOG_S = 150
 _DEFAULT_ROLLOUT_WATCHDOG_S = 300
@@ -736,7 +739,7 @@ def _minimum_recovery_attempt_seconds(requested_timeout_s: Optional[int]) -> int
     if not requested_timeout_s or requested_timeout_s <= 0:
         return _MIN_CODEX_RECOVERY_ATTEMPT_S
     scaled_s = max(1, int(requested_timeout_s * 0.25))
-    return max(1, min(_MIN_CODEX_RECOVERY_ATTEMPT_S, scaled_s))
+    return max(2, min(_MIN_CODEX_RECOVERY_ATTEMPT_S, scaled_s))
 
 
 def _resolve_task_reasoning_effort(
@@ -827,9 +830,17 @@ def _resolve_no_edit_watchdog_seconds(
             if _looks_like_small_task_prompt(prompt)
             else _DEFAULT_NO_EDIT_WATCHDOG_S
         )
-    if recovery_attempt > 0:
+    if recovery_attempt >= _MAX_NO_EDIT_RECOVERY_ATTEMPTS:
+        default_s = min(default_s, _FINAL_NO_EDIT_RECOVERY_WATCHDOG_S)
+    elif recovery_attempt > 0:
         default_s = min(default_s, _NO_EDIT_RECOVERY_WATCHDOG_S)
-    floor_s = 90 if (is_background and not is_validation_repair) or recovery_attempt > 0 else 120
+    floor_s = (
+        60
+        if recovery_attempt >= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
+        else 90
+        if (is_background and not is_validation_repair) or recovery_attempt > 0
+        else 120
+    )
     return max(floor_s, min(default_s, max(floor_s, communicate_timeout_s - 60)))
 
 
@@ -848,7 +859,9 @@ def _resolve_no_edit_recheck_seconds(
             upper = max(1, (communicate_timeout_s or parsed + 1) - 1)
             return max(1, min(parsed, upper))
     default_s = (
-        _NO_EDIT_RECOVERY_RECHECK_S
+        _FINAL_NO_EDIT_RECOVERY_RECHECK_S
+        if recovery_attempt >= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
+        else _NO_EDIT_RECOVERY_RECHECK_S
         if recovery_attempt > 0
         else _DEFAULT_NO_EDIT_RECHECK_S
     )
@@ -899,7 +912,9 @@ def _resolve_no_edit_command_progress_cap_seconds(
         else:
             return max(1, min(parsed, max(1, communicate_timeout_s - 1)))
 
-    if recovery_attempt > 0:
+    if recovery_attempt >= _MAX_NO_EDIT_RECOVERY_ATTEMPTS:
+        default_s = _FINAL_NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S
+    elif recovery_attempt > 0:
         default_s = _NO_EDIT_RECOVERY_COMMAND_PROGRESS_CAP_S
     elif _looks_like_validation_repair_prompt(prompt):
         default_s = _VALIDATION_REPAIR_COMMAND_PROGRESS_CAP_S
@@ -1040,18 +1055,57 @@ def _describe_publishable_paths(paths: List[str]) -> str:
     return listed
 
 
-def _build_no_edit_recovery_guidance(trace_excerpt: str, artifact_only_paths: str = "") -> str:
+def _build_no_edit_recovery_guidance(
+    trace_excerpt: str,
+    artifact_only_paths: str = "",
+    *,
+    recovery_attempt: int = 1,
+) -> str:
+    final_attempt = recovery_attempt >= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
     lines = [
         "No-edit watchdog recovery: the previous Codex attempt spent too much of the execution budget without producing publishable file changes.",
-        "This recovery attempt has a patch-first contract: make one publishable edit before any further broad discovery. If you need one narrow read of the hinted file to place the edit, do that once, then patch immediately.",
         "Do not repeat the same read/search sequence from the previous attempt. Re-reading the target without editing is a failed recovery.",
-        "Start from the already inspected context. Do not re-read broad repo topology, route wrappers, or missing test infrastructure unless that is the blocker.",
         "Runtime/dependency artifacts such as node_modules, outputs, .worktrees, .codex, dist, build, and coverage do not count as progress.",
-        "Within the first response/action, edit the smallest behavior-owning file that satisfies the task. If the hinted file is a thin wrapper, patch the owner you already identified.",
-        "If a hinted test path is absent, do not invent PushPals/autonomy-specific files in the user repo. Add repo-native coverage beside existing tests, or make a tiny behavior/script patch with no new broad harness.",
-        "Use existing tests or a narrow helper/style assertion; do not create broad React Native mocks or a new full render harness for a compact shell/visual polish task.",
         "Run at most one focused fast validation check before final diff review; let PushPals ValidationGate own long required/browser validation.",
     ]
+    if final_attempt:
+        lines[0] = (
+            "Final no-edit recovery: two Codex attempts have spent too much execution budget "
+            "without producing publishable file changes."
+        )
+        lines.insert(
+            1,
+            "Do not run more exploratory reads, symbol searches, repo topology scans, or validation before editing.",
+        )
+        lines.insert(
+            2,
+            "Use the already inspected context and immediately edit the smallest hinted or behavior-owning file. If uncertain, add the narrowest repo-native assertion or doc/test guard directly beside the existing pattern.",
+        )
+        lines.insert(
+            3,
+            "The first tool action in this final recovery must be a publishable file edit, not another read-only command.",
+        )
+    else:
+        lines.insert(
+            1,
+            "This recovery attempt has a patch-first contract: make one publishable edit before any further broad discovery. If you need one narrow read of the hinted file to place the edit, do that once, then patch immediately.",
+        )
+        lines.insert(
+            3,
+            "Start from the already inspected context. Do not re-read broad repo topology, route wrappers, or missing test infrastructure unless that is the blocker.",
+        )
+        lines.insert(
+            5,
+            "Within the first response/action, edit the smallest behavior-owning file that satisfies the task. If the hinted file is a thin wrapper, patch the owner you already identified.",
+        )
+        lines.insert(
+            6,
+            "If a hinted test path is absent, do not invent PushPals/autonomy-specific files in the user repo. Add repo-native coverage beside existing tests, or make a tiny behavior/script patch with no new broad harness.",
+        )
+        lines.insert(
+            7,
+            "Use existing tests or a narrow helper/style assertion; do not create broad React Native mocks or a new full render harness for a compact shell/visual polish task.",
+        )
     if artifact_only_paths:
         lines.append(f"Only non-publishable artifact paths changed so far: {artifact_only_paths}.")
     if trace_excerpt:
@@ -3119,8 +3173,16 @@ def _run_codex_task(
                                 f"Startup-stall watchdog fired after {elapsed_s}s with no assistant/tool progress."
                             )
                         else:
+                            can_retry_no_edit = (
+                                no_edit_recovery_attempt < _MAX_NO_EDIT_RECOVERY_ATTEMPTS
+                            )
+                            no_edit_action = (
+                                "Retrying with patch-first guidance."
+                                if can_retry_no_edit
+                                else "No no-edit recovery attempts remain; failing this execution."
+                            )
                             log.info(
-                                f"No-edit watchdog fired after {int(no_edit_watchdog_s or 0)}s with no publishable file changes.{artifact_detail} Retrying with patch-first guidance."
+                                f"No-edit watchdog fired after {int(no_edit_watchdog_s or 0)}s with no publishable file changes.{artifact_detail} {no_edit_action}"
                             )
                         _terminate_active_child()
                         break
@@ -3499,6 +3561,7 @@ def _run_codex_task(
                     _build_no_edit_recovery_guidance(
                         trace_excerpt,
                         no_edit_artifact_only_paths,
+                        recovery_attempt=no_edit_recovery_attempt + 1,
                     ),
                 ]
                 return _run_codex_task(

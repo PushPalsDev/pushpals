@@ -1601,6 +1601,86 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Patched immediately after no-edit recovery", str(result.get("stdout") or ""))
         self.assertIn("src/", str(result.get("stdout") or ""))
 
+    def test_run_codex_task_final_no_edit_recovery_can_patch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-final-no-edit-recovery-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# final no edit recovery repo\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed final no-edit recovery repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_final_no_edit_recovery.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "prompt = sys.stdin.read()",
+                        "if 'Final no-edit recovery' in prompt:",
+                        "    Path('src').mkdir(exist_ok=True)",
+                        "    Path('src/final-no-edit-recovery.txt').write_text('patched on final recovery\\n', encoding='utf-8')",
+                        "    if last_message_path:",
+                        "        Path(last_message_path).write_text('Patched immediately during final no-edit recovery.', encoding='utf-8')",
+                        "    print('item.completed | Patched immediately during final no-edit recovery.', flush=True)",
+                        "    sys.exit(0)",
+                        "",
+                        "print('item.completed | Still reading without a publishable edit.', flush=True)",
+                        "time.sleep(10)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-final-no-edit-recovery-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "30",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    "Add one focused contract assertion after inspecting the hinted test.",
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched immediately during final no-edit recovery", str(result.get("stdout") or ""))
+        self.assertIn("src/", str(result.get("stdout") or ""))
+
     def test_run_codex_task_no_edit_watchdog_allows_command_backed_discovery(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-no-edit-command-grace-") as temp_dir:
             repo = Path(temp_dir) / "repo"
@@ -2083,7 +2163,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(result.get("exitCode"), 124)
         self.assertEqual(
             result.get("summary"),
-            "openai_codex made no publishable changes before the no-edit watchdog",
+            "openai_codex recovery budget exhausted before retry",
         )
         self.assertNotIn("execution timed out", str(result.get("summary") or ""))
         self.assertEqual(result.get("cooldownMs"), 600000)
@@ -2487,9 +2567,15 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 1200,
                 recovery_attempt=1,
             )
+            final_recovery_attempt_s = _resolve_no_edit_watchdog_seconds(
+                prompt,
+                1200,
+                recovery_attempt=2,
+            )
 
         self.assertEqual(first_attempt_s, 480)
         self.assertEqual(recovery_attempt_s, 90)
+        self.assertEqual(final_recovery_attempt_s, 60)
 
     def test_explicit_no_edit_watchdog_override_still_controls_recovery_attempts(self) -> None:
         with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "300"}, clear=False):
@@ -2510,6 +2596,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=False):
             first_recheck_s = _resolve_no_edit_recheck_seconds(750)
             recovery_recheck_s = _resolve_no_edit_recheck_seconds(750, recovery_attempt=1)
+            final_recovery_recheck_s = _resolve_no_edit_recheck_seconds(750, recovery_attempt=2)
             command_grace_s = _resolve_no_edit_command_grace_seconds(750)
             first_command_cap_s = _resolve_no_edit_command_progress_cap_seconds(
                 750,
@@ -2520,11 +2607,18 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 command_grace_s,
                 recovery_attempt=1,
             )
+            final_recovery_command_cap_s = _resolve_no_edit_command_progress_cap_seconds(
+                750,
+                command_grace_s,
+                recovery_attempt=2,
+            )
 
         self.assertEqual(first_recheck_s, 120)
         self.assertEqual(recovery_recheck_s, 30)
+        self.assertEqual(final_recovery_recheck_s, 15)
         self.assertEqual(first_command_cap_s, 360)
         self.assertEqual(recovery_command_cap_s, 120)
+        self.assertEqual(final_recovery_command_cap_s, 60)
 
     def test_codex_recovery_attempt_refuses_exhausted_shared_deadline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-exhausted-recovery-") as temp_dir:
@@ -2630,6 +2724,17 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Re-reading the target without editing is a failed recovery", guidance)
         self.assertIn("do not invent PushPals/autonomy-specific files", guidance)
         self.assertIn("Previous Codex event trace excerpt", guidance)
+
+    def test_final_no_edit_recovery_guidance_forbids_more_discovery(self) -> None:
+        guidance = _build_no_edit_recovery_guidance(
+            "item.completed | I found the target block and will open it",
+            recovery_attempt=2,
+        )
+
+        self.assertIn("Final no-edit recovery", guidance)
+        self.assertIn("Do not run more exploratory reads", guidance)
+        self.assertIn("first tool action", guidance)
+        self.assertIn("publishable file edit", guidance)
 
     def test_rollout_watchdog_is_earlier_than_web_review_no_edit_watchdog(self) -> None:
         with mock.patch.dict(os.environ, {"WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": ""}, clear=False):
