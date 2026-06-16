@@ -2,25 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.63`
-- start_commit: `9de2663df7257c6ab62430bd835bd2f1eae44812`
-- end_commit: `a53827b692319192fd5a8c08c4cecf5170388ac8`
+- version: `v1.1.64`
+- start_commit: `648e7d61a5a8bd6eb8204d00c45b289cda6be379`
+- end_commit: `98d4edd2644df00a5400b46633f42652ac9ff7d4`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add a final no-edit recovery attempt for OpenAI Codex WorkerPal jobs before classifying no-patch runs as terminal failures.
-- Tighten final recovery guidance so Codex must edit from already inspected context instead of spending another attempt on read-only discovery.
-- Shorten final recovery watchdog, recheck, and command-progress windows so stuck jobs fail with structured diagnostics instead of drifting into generic timeouts.
-- Preserve the shared executor deadline by refusing low-odds final recovery attempts when too little budget remains.
-- Ship the WorkerPal runtime recovery fix through the packaged CLI sandbox runtime assets.
+- Make `pushpals --clear` clean WorkerPal Docker warm containers and sandbox image state before deleting repo-local runtime data, so Docker/WorkerPal bind locks are released first.
+- Retry transient locked clear targets such as `outputs/data` across Windows `EBUSY`, `EPERM`, and `ENOTEMPTY` failures instead of failing after a single stale lock.
+- Improve final clear failure detail when a path remains locked after all retry attempts.
+- Add focused coverage for retryable clear failures and retry exhaustion details.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
-- `bun test tests/cli.invocation-logging.test.ts -t "runtime-only mode keeps running after stdin EOF"`
+- `bun test tests/cli.runtime-bootstrap.test.ts -t "CliClear"`
+- `bun test tests/cli.runtime-bootstrap.test.ts`
+- `bun test tests/cli.invocation-logging.test.ts -t "pushpals --clear"`
+- `bun run test:cli:integration`
 - `bun run test:root`
 - `git diff --check`
 
@@ -48,7 +49,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out.
+- Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
 - The npm package still requires a working Bun runtime to launch the package entrypoint; PushPals does not vendor Bun or other external toolchains in the npm package.
 - Direct GitHub release binaries are PushPals-built standalone artifacts. Removing embedded Bun runtime from those standalone artifacts would require a separate runtime distribution redesign.
 - Active runtimes that were started from an older release must be restarted after installing this release before new startup or packaged-runtime behavior takes effect.
