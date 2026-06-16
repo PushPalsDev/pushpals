@@ -2460,6 +2460,48 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(delta, ["README.md"])
         self.assertEqual(effective, ["README.md"])
 
+    def test_codex_changed_paths_ignores_stale_status_for_clean_tracked_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-stale-status-clean-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "README.md").write_text("# stale status repo\n", encoding="utf-8")
+            (repo / "src").mkdir()
+            (repo / "src" / "focused.ts").write_text("export const value = 1;\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed stale status repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            (repo / "src" / "focused.ts").write_text("export const value = 2;\n", encoding="utf-8")
+            with mock.patch(
+                "openai_codex_executor.summarize_git_changes",
+                return_value=["README.md", "src/focused.ts"],
+            ):
+                changed_paths, delta, effective = _codex_changed_paths(str(repo), {})
+
+        self.assertEqual(changed_paths, ["README.md", "src/focused.ts"])
+        self.assertEqual(delta, ["src/focused.ts"])
+        self.assertEqual(effective, ["src/focused.ts"])
+
     def test_non_publishable_path_summary_names_artifact_only_dirty_paths(self) -> None:
         changed_paths = [
             "node_modules/react/index.js",

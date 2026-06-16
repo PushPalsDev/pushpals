@@ -1020,12 +1020,15 @@ def _paths_changed_after_baseline(
     baseline_snapshot: Any,
 ) -> List[str]:
     baseline_paths = set(_baseline_snapshot_paths(baseline_snapshot))
-    if not baseline_paths:
-        return list(changed_paths)
-
     delta: List[str] = []
     baseline_fingerprints = baseline_snapshot if isinstance(baseline_snapshot, dict) else {}
     for path in changed_paths:
+        tracked_content_delta = _tracked_path_has_git_content_delta(repo, path)
+        if tracked_content_delta is False:
+            continue
+        if not baseline_paths:
+            delta.append(path)
+            continue
         if path not in baseline_paths:
             delta.append(path)
             continue
@@ -2375,6 +2378,34 @@ def _git_path_is_tracked(repo: str, path: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _tracked_path_has_git_content_delta(repo: str, path: str) -> Optional[bool]:
+    normalized = str(path or "").replace("\\", "/").strip().strip("/")
+    if not normalized or not _git_path_is_tracked(repo, normalized):
+        return None
+
+    has_delta = False
+    for args in (
+        ["git", "diff", "--quiet", "--", normalized],
+        ["git", "diff", "--cached", "--quiet", "--", normalized],
+    ):
+        try:
+            result = subprocess.run(
+                args,
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            return None
+        if result.returncode == 1:
+            has_delta = True
+            continue
+        if result.returncode != 0:
+            return None
+    return has_delta
 
 
 def _prune_empty_artifact_parent_dirs(repo: str, path: Path) -> None:
