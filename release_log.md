@@ -2,24 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.66`
-- start_commit: `813f97ecca49553c74c6651753870066702329e5`
-- end_commit: `a7e45924876c4926ca166093d1284f3a56181685`
+- version: `v1.1.67`
+- start_commit: `ddbe1f62e1b3e6fe0d4e5b36f3c62a60e3e09acc`
+- end_commit: `cebce9bb7400519fdd19c79291abfddecd563dc2`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Ignore stale clean tracked paths when OpenAI Codex timeout handling checks whether a worker patch is broad or noisy.
-- Keep the broad/noisy timeout guard active for real staged, unstaged, and untracked changes while filtering paths that `git status` reports but `git diff` says are clean.
-- Prevent focused worker patches from being rejected before validation just because stale publishable-looking paths are still visible in the sandbox status summary.
-- Add coverage for stale clean tracked status paths so the executor reports only the true content delta to timeout and quality gates.
+- Let OpenAI Codex rollout-coach monitoring continue when the canonical task explicitly asks for React Native mock or test-harness repair.
+- Keep the rollout coach protective for unrelated small/product tasks that drift into broad shared mocks, and keep full render/full-surface harness work blocked even for mock repair tasks.
+- Fix the SectorCommand failure mode where an explicit `tests/reactNativeMock.js` and `.d.ts` stabilization task was failed before validation because the worker merely discussed the requested React Native mock surface.
+- Add executor-level coverage proving an explicit mock repair task can pass the rollout watchdog, then produce a focused mock edit without being rejected as off-track.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
+- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config -k rollout`
 - `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
-- `bun run test:cli:integration`
 - `bun run test:root`
 - `git diff --check`
 
@@ -59,6 +59,7 @@ bun install -g @pushpalsdev/cli
 - Expo Router browser validation now removes linked `node_modules` artifacts before dependency repair; if the offline Bun cache is incomplete, the browser validation may still report a local dependency/setup blocker.
 - OpenAI Codex WorkerPal jobs can still fail if Codex produces no publishable edit after the final no-edit recovery attempt or if the shared executor budget is already too low for another recovery.
 - OpenAI Codex WorkerPal jobs still fail fast on truly broad/noisy publishable diffs after timeout; this release only filters tracked paths with no staged or unstaged Git content delta.
+- OpenAI Codex rollout coaching still blocks missing-path drift, PushPals/autonomy internals in user repos, and full render/full-surface harness expansion; this release only permits mock/harness terminology when the task explicitly requests that repair surface.
 - Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
