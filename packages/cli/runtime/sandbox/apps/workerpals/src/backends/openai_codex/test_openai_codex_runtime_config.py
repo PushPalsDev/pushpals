@@ -2812,6 +2812,38 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertIn("missing hinted files", _detect_offtrack_rollout(trace))
 
+    def test_offtrack_rollout_allows_explicit_react_native_mock_repair(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | The stale surface is the JS React Native mock plus declarations.",
+                "item.completed | I am keeping the test harness repair focused on reactNativeMock.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Stabilize React Native mock test reliability. Start with "
+                "tests/reactNativeMock.js and tests/reactNativeMock.d.ts."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_still_blocks_full_render_harness_when_mock_repair_requested(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am adding a full component render harness around the mock.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text="Stabilize tests/reactNativeMock.js and tests/reactNativeMock.d.ts.",
+        )
+
+        self.assertIn("full render", reason)
+
     def test_rollout_recovery_guidance_points_to_repo_native_patch(self) -> None:
         guidance = _build_rollout_recovery_guidance(
             "the worker is spending time on missing hinted files",
@@ -2905,6 +2937,97 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(result.get("exitCode"), 0)
         self.assertIn("Patched after rollout coach guidance", str(result.get("stdout") or ""))
         self.assertIn("scripts/", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_allows_explicit_mock_repair_past_rollout_signal(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-mock-repair-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            tests_dir = repo / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "reactNativeMock.js").write_text(
+                "export const mockVersion = 1;\n",
+                encoding="utf-8",
+            )
+            (tests_dir / "reactNativeMock.d.ts").write_text(
+                "export declare const mockVersion: number;\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "config", "user.name", "PushPals Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "pushpals-tests@example.com"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "chore: seed mock repair repo"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            stub_path = Path(temp_dir) / "fake_codex_rollout_mock_repair.py"
+            stub_path.write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "import sys",
+                        "import time",
+                        "",
+                        "argv = sys.argv[1:]",
+                        "last_message_path = None",
+                        "for index, arg in enumerate(argv):",
+                        "    if arg == '--output-last-message' and index + 1 < len(argv):",
+                        "        last_message_path = argv[index + 1]",
+                        "        break",
+                        "",
+                        "sys.stdin.read()",
+                        "print('item.completed | The stale surface is the JS React Native mock plus declarations.', flush=True)",
+                        "print('item.completed | I am keeping the test harness repair focused on reactNativeMock.', flush=True)",
+                        "time.sleep(2)",
+                        "Path('tests/reactNativeMock.js').write_text('export const mockVersion = 2;\\n', encoding='utf-8')",
+                        "if last_message_path:",
+                        "    Path(last_message_path).write_text('Patched focused React Native mock repair.', encoding='utf-8')",
+                        "print('item.completed | Patched focused React Native mock repair.', flush=True)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env_overrides = {
+                "PUSHPALS_OPENAI_CODEX_BIN_JSON": json.dumps([sys.executable, str(stub_path)]),
+                "PUSHPALS_OPENAI_CODEX_AUTH_MODE": "api_key",
+                "OPENAI_API_KEY": "pushpals-rollout-mock-repair-test-key",
+                "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "20",
+                "WORKERPALS_OPENAI_CODEX_NO_EDIT_WATCHDOG_S": "10",
+                "WORKERPALS_OPENAI_CODEX_ROLLOUT_WATCHDOG_S": "1",
+                "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+            }
+            with mock.patch.dict(os.environ, env_overrides, clear=False):
+                result = _run_codex_task(
+                    str(repo),
+                    (
+                        "Stabilize React Native mock test reliability. Start with "
+                        "tests/reactNativeMock.js and tests/reactNativeMock.d.ts."
+                    ),
+                    [],
+                )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 0)
+        self.assertIn("Patched focused React Native mock repair", str(result.get("stdout") or ""))
+        self.assertIn("tests/", str(result.get("stdout") or ""))
+        self.assertNotIn("rollout coach", str(result.get("summary") or "").lower())
 
     def test_run_codex_task_rollout_coach_resets_broad_small_task_changes_before_retry(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-rollout-noisy-") as temp_dir:

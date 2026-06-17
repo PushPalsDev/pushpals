@@ -1167,26 +1167,69 @@ def _codex_trace_is_startup_stall(trace: Dict[str, Any]) -> bool:
     return not _codex_trace_has_work_progress(trace)
 
 
-def _detect_offtrack_rollout(trace: Dict[str, Any], artifact_only_paths: str = "") -> str:
+def _task_explicitly_requests_mock_harness_repair(task_text: str) -> bool:
+    text = str(task_text or "").lower()
+    if not text:
+        return False
+    if "reactnativemock" in text or "tests/reactnativemock" in text:
+        return True
+    repair_markers = (
+        "stabilize",
+        "harden",
+        "repair",
+        "fix",
+        "sync",
+        "synchronize",
+        "align",
+        "resettable",
+        "deterministic",
+        "typings",
+        "declarations",
+    )
+    mock_harness_markers = (
+        "react native mock",
+        "rn mock",
+        "mock harness",
+        "test harness",
+        "shared mock",
+        "__mocks__",
+    )
+    return any(marker in text for marker in mock_harness_markers) and any(
+        marker in text for marker in repair_markers
+    )
+
+
+def _detect_offtrack_rollout(
+    trace: Dict[str, Any],
+    artifact_only_paths: str = "",
+    task_text: str = "",
+) -> str:
     text = _trace_summaries_text(trace)
     if artifact_only_paths:
         return f"only non-publishable artifact paths changed: {artifact_only_paths}"
     if not text:
         return ""
-    checks: List[Tuple[str, re.Pattern[str]]] = [
+    checks: List[Tuple[str, re.Pattern[str], bool]] = [
         (
             "the worker is spending time on missing hinted files or absent repo scaffolding",
             re.compile(
                 r"(not present|not found|no existing|no .* directory|missing .* checkout|not listed in the checkout|checkout is much smaller|hinted .* absent)",
                 re.I,
             ),
+            False,
+        ),
+        (
+            "the worker is drifting into full render or full-surface harness work",
+            re.compile(r"(full[- ]?(surface|render)|full component render)", re.I),
+            False,
         ),
         (
             "the worker is drifting into broad test-harness or React Native mock repair",
             re.compile(
-                r"(full[- ]?(surface|render)|test harness repair|react native mock|broad .*mock|shared mock|adding .*mock helper|full component render)",
+                r"(test harness repair|react native mock|broad .*mock|shared mock|adding .*mock helper)",
                 re.I,
             ),
+            True,
         ),
         (
             "the worker is about to add PushPals/autonomy internals to a user repo",
@@ -1194,9 +1237,13 @@ def _detect_offtrack_rollout(trace: Dict[str, Any], artifact_only_paths: str = "
                 r"(_layout\.autonomy|queue_health|workerpal|remotebuddy|reviewagent|pushpals-internal|no autonomy module)",
                 re.I,
             ),
+            False,
         ),
     ]
-    for reason, pattern in checks:
+    task_allows_mock_harness = _task_explicitly_requests_mock_harness_repair(task_text)
+    for reason, pattern, skip_when_mock_harness_requested in checks:
+        if skip_when_mock_harness_requested and task_allows_mock_harness:
+            continue
         if pattern.search(text):
             return reason
     return ""
@@ -3278,6 +3325,7 @@ def _run_codex_task(
                         rollout_watchdog_reason = _detect_offtrack_rollout(
                             live_trace,
                             detection_artifact_only_paths,
+                            instruction,
                         )
                         if (
                             validation_repair_prompt
