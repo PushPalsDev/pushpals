@@ -11,7 +11,9 @@ import {
   collectQualityGateValidationCommands,
   extractRequiredValidationStepsFromVisionMarkdown,
   extractValidationFailureDigest,
+  filterChangedPathsByGitContentDelta,
   formatBunTestPathArg,
+  git,
   inferPlaywrightBrowserInstallTargets,
   inferFallbackValidationCommandsForTestTask,
   inferRepoNativeValidationCommands,
@@ -57,6 +59,14 @@ function planningFixture(overrides: Partial<Record<string, unknown>> = {}) {
     finalizationBudgetMs: 120_000,
     ...(overrides as Record<string, unknown>),
   };
+}
+
+async function runGit(repo: string, args: string[]): Promise<string> {
+  const result = await git(repo, args);
+  if (!result.ok) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
 }
 
 describe("workerpals validation command safety", () => {
@@ -256,6 +266,64 @@ describe("workerpals validation command safety", () => {
       expect(issues).toContain(
         "changed tests/reactNativeMock.ts without a changed test importing it or explicit reviewer guidance.",
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("drops clean tracked paths before hygiene checks while keeping real gitignore edits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-hygiene-delta-"));
+    const unrelatedGitignoreMessage =
+      "modified .gitignore without task or reviewer guidance requesting ignore-policy changes.";
+    const baseParams = {
+      instruction: "Improve home screen readability",
+      targetPath: "app/index.ts",
+      planning: planningFixture({
+        targetPaths: ["app/index.ts"],
+        scope: { readAnywhere: true, writeAllowed: true, writeGlobs: ["app/index.ts"] },
+      }) as any,
+    };
+
+    try {
+      mkdirSync(join(root, "app"), { recursive: true });
+      writeFileSync(join(root, ".gitignore"), "outputs/\n");
+      writeFileSync(join(root, "app", "index.ts"), "export const value = 1;\n");
+
+      await runGit(root, ["init"]);
+      await runGit(root, ["config", "user.email", "pushpals-test@example.com"]);
+      await runGit(root, ["config", "user.name", "PushPals Test"]);
+      await runGit(root, ["config", "core.autocrlf", "false"]);
+      await runGit(root, ["add", ".gitignore", "app/index.ts"]);
+      await runGit(root, ["commit", "-m", "initial"]);
+
+      writeFileSync(join(root, "app", "index.ts"), "export const value = 2;\n");
+      const cleanGitignorePaths = await filterChangedPathsByGitContentDelta(root, [
+        ".gitignore",
+        "app/index.ts",
+      ]);
+      expect(cleanGitignorePaths).toEqual(["app/index.ts"]);
+      expect(
+        collectPrePublishHygieneIssues({
+          repo: root,
+          changedPaths: cleanGitignorePaths,
+          ...baseParams,
+        }),
+      ).not.toContain(unrelatedGitignoreMessage);
+
+      writeFileSync(join(root, ".gitignore"), "outputs/\nnode_modules/\n");
+      await runGit(root, ["add", ".gitignore"]);
+      const realGitignorePaths = await filterChangedPathsByGitContentDelta(root, [
+        ".gitignore",
+        "app/index.ts",
+      ]);
+      expect(realGitignorePaths).toEqual([".gitignore", "app/index.ts"]);
+      expect(
+        collectPrePublishHygieneIssues({
+          repo: root,
+          changedPaths: realGitignorePaths,
+          ...baseParams,
+        }),
+      ).toContain(unrelatedGitignoreMessage);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

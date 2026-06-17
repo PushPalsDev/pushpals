@@ -4329,9 +4329,12 @@ async function runDeterministicQualityGate(
   }
 
   const statusResult = await git(repo, ["status", "--porcelain"]);
-  const changedPaths = statusResult.ok
+  const rawChangedPaths = statusResult.ok
     ? expandKnownArtifactDirectoryPaths(repo, parseChangedPathsFromStatus(statusResult.stdout))
     : [];
+  const changedPaths = statusResult.ok
+    ? await filterChangedPathsByGitContentDelta(repo, rawChangedPaths)
+    : rawChangedPaths;
   const preparedMergeConflictPaths = extractPreparedMergeConflictPaths(params);
   const changedTestPaths = Array.from(
     new Set(
@@ -5619,7 +5622,7 @@ async function buildArchitectureDocument(
 export async function git(
   cwd: string,
   args: string[],
-): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number | null }> {
   try {
     const proc = Bun.spawn(["git", ...args], {
       cwd,
@@ -5634,13 +5637,49 @@ export async function git(
     ]);
 
     // Preserve leading spaces in stdout for porcelain parsers.
-    return { ok: exitCode === 0, stdout: stdout.trimEnd(), stderr: stderr.trim() };
+    return { ok: exitCode === 0, stdout: stdout.trimEnd(), stderr: stderr.trim(), exitCode };
   } catch (err) {
-    return { ok: false, stdout: "", stderr: String(err) };
+    return { ok: false, stdout: "", stderr: String(err), exitCode: null };
   }
 }
 
 // ─── Git commit creation ─────────────────────────────────────────────────────
+
+async function trackedPathHasGitContentDelta(repo: string, path: string): Promise<boolean | null> {
+  const tracked = await git(repo, ["ls-files", "--error-unmatch", "--", path]);
+  if (!tracked.ok) return null;
+
+  const unstaged = await git(repo, ["diff", "--quiet", "--", path]);
+  if (unstaged.exitCode === 1) return true;
+  if (unstaged.exitCode !== 0) return null;
+
+  const staged = await git(repo, ["diff", "--cached", "--quiet", "--", path]);
+  if (staged.exitCode === 1) return true;
+  if (staged.exitCode !== 0) return null;
+
+  return false;
+}
+
+export async function filterChangedPathsByGitContentDelta(
+  repo: string,
+  changedPaths: string[],
+): Promise<string[]> {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const rawPath of changedPaths) {
+    const path = String(rawPath ?? "")
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "")
+      .trim();
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+
+    const trackedDelta = await trackedPathHasGitContentDelta(repo, path);
+    if (trackedDelta === false) continue;
+    out.push(path);
+  }
+  return out;
+}
 
 /** Create commit for job result and return commit info */
 export type WorkerGitCommitIdentity = SourceControlCommitIdentity;
@@ -8590,12 +8629,15 @@ export async function executeJob(
     executorElapsedMs = Date.now() - attemptStartedAt;
 
     const preQualityStatus = await git(repo, ["status", "--porcelain"]);
-    const preQualityChangedPaths = preQualityStatus.ok
+    const rawPreQualityChangedPaths = preQualityStatus.ok
       ? expandKnownArtifactDirectoryPaths(
           repo,
           parseChangedPathsFromStatus(preQualityStatus.stdout),
         )
       : [];
+    const preQualityChangedPaths = preQualityStatus.ok
+      ? await filterChangedPathsByGitContentDelta(repo, rawPreQualityChangedPaths)
+      : rawPreQualityChangedPaths;
     const preQualityPublishablePaths = publishableChangedPaths(preQualityChangedPaths);
     if (preQualityChangedPaths.length > 0) {
       diagnosticPatchSnapshots.push(
