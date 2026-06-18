@@ -2,24 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.69`
-- start_commit: `fbe413089dd7041f7f2fbf3f2425b323657dbb55`
-- end_commit: `a670cc4bba46cb5a574a241c270ea51735c4f482`
+- version: `v1.1.70`
+- start_commit: `d391d634a3dda1ac711dfce3d6bd106159701eaa`
+- end_commit: `dfac5e7828d31ed1b4ea0a4e60a2f50c5efba89a`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add `pushpals --open_config` and `pushpals --open-config` so users can open the active local runtime config and exit before startup.
-- Resolve the config path from the same prepared runtime config directory the CLI would use for the current repo, including installed CLI runtimes under `~/.pushpals/runtime`.
-- Ensure the editable `local.toml` exists before opening it, preserving existing overrides or seeding it from `local.example.toml` on first use.
-- Document the new config opener in the root and npm package CLI notes.
+- Add `[workerpals] execution_platform` with `auto`, `windows`, and `linux_docker` modes.
+- Let repos that need Windows host validation set `execution_platform = "windows"` to force direct WorkerPal execution even when older Docker toggles are still enabled.
+- Let operators set `execution_platform = "linux_docker"` when they explicitly want Docker-backed WorkerPals; the default `auto` preserves existing Docker config behavior.
+- Support `WORKERPALS_EXECUTION_PLATFORM` and `PUSHPALS_WORKERPALS_EXECUTION_PLATFORM` overrides, and ship the new option through default/example configs plus packaged runtime assets.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
+- `bun test tests\shared.config.execution-platform.test.ts tests\shared.config.workerpals-quality-threshold.test.ts`
 - `bun test tests\cli.runtime-bootstrap.test.ts`
-- `bun test tests\cli.invocation-logging.test.ts`
+- `bun test tests\server.runtime-config-mutations.test.ts tests\server.runtime-config-route.test.ts tests\remotebuddy.worker-spawn-command.test.ts`
+- `bun x tsc --noEmit --project packages\shared\tsconfig.json`
+- `bun x tsc --noEmit --project apps\workerpals\tsconfig.json`
 - `bun run test:root`
 - `git diff --check`
 
@@ -47,6 +50,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
+- `execution_platform = "windows"` selects direct host WorkerPal execution so validation inherits the Windows host environment; it does not convert Docker Desktop Linux containers into Windows containers.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
 - Active runtime-only supervisors started from v1.1.64 or older did not write the new runtime-host PID state, so they may need to be stopped once manually before this release can prevent future `outputs/data` EBUSY loops.
 - The npm package still requires a working Bun runtime to launch the package entrypoint; PushPals does not vendor Bun or other external toolchains in the npm package.
