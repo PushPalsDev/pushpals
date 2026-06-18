@@ -66,6 +66,7 @@ describe("pushpals CLI invocation logging", () => {
     expect(stdout).toContain(`[pushpals] cwd=${repoRoot}`);
     expect(stdout).toContain("[pushpals] args=--help");
     expect(stdout).toContain("PushPals CLI");
+    expect(stdout).toContain("--open_config, --open-config");
   });
 
   test("prints invocation context before early non-git failure", async () => {

@@ -54,6 +54,7 @@ type CliOptions = {
   runtimeOnly: boolean;
   statusOnce: boolean;
   clear: boolean;
+  openConfig: boolean;
   createVisionMd: boolean;
 };
 
@@ -608,6 +609,8 @@ function printUsage(): void {
   );
   console.log("  --status-once          Print active endpoints once and exit");
   console.log("  --clear                Remove repo-local PushPals state and exit");
+  console.log("  --open_config, --open-config");
+  console.log("                        Open the active local config file and exit");
   console.log("  --create_vision_md     Create a starter vision.md in the current repo and exit");
   console.log("  -h, --help             Show this help");
   console.log("");
@@ -632,6 +635,7 @@ function parseArgs(argv: string[]): CliOptions | null {
     runtimeOnly: false,
     statusOnce: false,
     clear: false,
+    openConfig: false,
     createVisionMd: false,
   };
 
@@ -659,6 +663,10 @@ function parseArgs(argv: string[]): CliOptions | null {
     }
     if (arg === "--clear") {
       options.clear = true;
+      continue;
+    }
+    if (arg === "--open_config" || arg === "--open-config") {
+      options.openConfig = true;
       continue;
     }
     if (arg === "--create_vision_md" || arg === "--create-vision-md") {
@@ -6179,14 +6187,41 @@ async function runSessionStream(
   }
 }
 
-export function buildOpenMonitoringHubCommand(url: string, platform = process.platform): string[] {
+export function buildOpenPathCommand(target: string, platform = process.platform): string[] {
   if (platform === "win32") {
-    return ["cmd", "/c", "start", "", url];
+    return ["cmd", "/c", "start", "", target];
   }
   if (platform === "darwin") {
-    return ["open", url];
+    return ["open", target];
   }
-  return ["xdg-open", url];
+  return ["xdg-open", target];
+}
+
+export function buildOpenMonitoringHubCommand(url: string, platform = process.platform): string[] {
+  return buildOpenPathCommand(url, platform);
+}
+
+export function buildOpenConfigCommand(configPath: string, platform = process.platform): string[] {
+  return buildOpenPathCommand(configPath, platform);
+}
+
+export function resolveCliLocalConfigPath(configDir: string): string {
+  return resolve(configDir, "local.toml");
+}
+
+export function ensureCliLocalConfigFile(configDir: string): string {
+  const localConfigPath = resolveCliLocalConfigPath(configDir);
+  if (existsSync(localConfigPath)) {
+    return localConfigPath;
+  }
+
+  mkdirSync(configDir, { recursive: true });
+  const exampleConfigPath = resolve(configDir, "local.example.toml");
+  const configBody = existsSync(exampleConfigPath)
+    ? readFileSync(exampleConfigPath, "utf8")
+    : "# Local PushPals runtime overrides\n";
+  writeFileSync(localConfigPath, configBody, "utf8");
+  return localConfigPath;
 }
 
 async function openMonitoringHub(url: string): Promise<boolean> {
@@ -6198,6 +6233,19 @@ async function openMonitoringHub(url: string): Promise<boolean> {
   });
   const code = await proc.exited;
   return code === 0;
+}
+
+async function openConfigFile(configDir: string): Promise<{ ok: boolean; path: string }> {
+  const configPath = ensureCliLocalConfigFile(configDir);
+  console.log(`[pushpals] Opening config file: ${configPath}`);
+  const cmd = buildOpenConfigCommand(configPath, process.platform);
+  const proc = Bun.spawn(cmd, {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  const code = await proc.exited;
+  return { ok: code === 0, path: configPath };
 }
 
 export function isCliExitCommand(text: string): boolean {
@@ -6253,6 +6301,15 @@ async function main(): Promise<void> {
       cliStatePath: statePath,
     });
     process.exit(exitCode);
+  }
+  if (parsed.openConfig) {
+    const result = await openConfigFile(config.configDir);
+    if (result.ok) {
+      console.log(`[pushpals] Opened config file: ${result.path}`);
+      process.exit(0);
+    }
+    console.error(`[pushpals] Failed to open config file. Edit this file manually: ${result.path}`);
+    process.exit(1);
   }
   console.log("[pushpals] Running runtime preflight...");
   console.log(`[pushpals] runtimeRoot=${preparedRuntime.runtimeRoot}`);

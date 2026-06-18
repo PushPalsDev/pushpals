@@ -15,6 +15,7 @@ import {
   buildCliClearTargets,
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
+  buildOpenConfigCommand,
   buildOpenMonitoringHubCommand,
   cleanupLocalWorkerpalSandboxImage,
   createSessionEventReplayFilter,
@@ -47,6 +48,7 @@ import {
   normalizeCliInteractiveMessage,
   normalizeChildProcessEnv,
   normalizeRepoPathForComparison,
+  ensureCliLocalConfigFile,
   prepareEmbeddedWorkerpalDockerImageIfNeeded,
   precheckWorkerpalDockerAvailability,
   precheckSourceControlManagerGitAvailability,
@@ -61,6 +63,7 @@ import {
   resolveWindowsNodeExtraCaCertsBundlePath,
   resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs,
   resolveCliStatePath,
+  resolveCliLocalConfigPath,
   resolveCommandPath,
   removeCliClearTarget,
   runCommandWithEnv,
@@ -2907,6 +2910,61 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "xdg-open",
       "http://localhost:8081",
     ]);
+  });
+
+  test("buildOpenConfigCommand selects the right launcher per platform", () => {
+    const configPath = "C:\\Users\\data_pi\\.pushpals\\runtime\\configs\\local.toml";
+
+    expect(buildOpenConfigCommand(configPath, "win32")).toEqual([
+      "cmd",
+      "/c",
+      "start",
+      "",
+      configPath,
+    ]);
+    expect(
+      buildOpenConfigCommand("/Users/data_pi/.pushpals/runtime/configs/local.toml", "darwin"),
+    ).toEqual(["open", "/Users/data_pi/.pushpals/runtime/configs/local.toml"]);
+    expect(
+      buildOpenConfigCommand("/home/data_pi/.pushpals/runtime/configs/local.toml", "linux"),
+    ).toEqual(["xdg-open", "/home/data_pi/.pushpals/runtime/configs/local.toml"]);
+  });
+
+  test("ensureCliLocalConfigFile creates local config from example without overwriting edits", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-open-config-"));
+    const configDir = join(root, "configs");
+    const exampleBody = ["[startup]", "log_config_on_start = false", ""].join("\n");
+
+    try {
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, "local.example.toml"), exampleBody, "utf8");
+
+      const localPath = ensureCliLocalConfigFile(configDir);
+
+      expect(localPath).toBe(resolveCliLocalConfigPath(configDir));
+      expect(readFileSync(localPath, "utf8")).toBe(exampleBody);
+
+      writeFileSync(localPath, "# user override\n", "utf8");
+
+      expect(ensureCliLocalConfigFile(configDir)).toBe(localPath);
+      expect(readFileSync(localPath, "utf8")).toBe("# user override\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureCliLocalConfigFile creates an editable placeholder when no example exists", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-open-config-empty-"));
+    const configDir = join(root, "configs");
+
+    try {
+      const localPath = ensureCliLocalConfigFile(configDir);
+
+      expect(localPath).toBe(resolveCliLocalConfigPath(configDir));
+      expect(readFileSync(localPath, "utf8")).toBe("# Local PushPals runtime overrides\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("buildServiceStopCommand uses taskkill only on Windows", () => {

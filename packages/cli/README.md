@@ -35,6 +35,7 @@ Behavior:
 - Auto-start does not clone the PushPals repo; it downloads release-tagged runtime binaries
   and prompt/config assets into `~/.pushpals/runtime`.
 - Override runtime tag with `pushpals --runtime-tag vX.Y.Z`.
+- Open the active local runtime config with `pushpals --open_config` or `pushpals --open-config`.
 - Disable auto-start with `pushpals --no-auto-start`.
 
 ## No npm/Bun install
