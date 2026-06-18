@@ -2,26 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.68`
-- start_commit: `497ed2e2f9f794f72841e865235ae167c352d632`
-- end_commit: `d345239ba1ef9bc6175b18d86556419c602ca557`
+- version: `v1.1.69`
+- start_commit: `fbe413089dd7041f7f2fbf3f2425b323657dbb55`
+- end_commit: `a670cc4bba46cb5a574a241c270ea51735c4f482`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Filter WorkerPal quality-gate changed paths through real Git staged/unstaged content deltas before ScopeGate evaluates hygiene policy.
-- Fix the SectorCommand failure mode where stale tracked `.gitignore` status noise caused ScopeGate to reject an otherwise validated patch after `bun test`, typecheck, lint, and web smoke had passed.
-- Preserve the existing `.gitignore` hygiene policy for true staged or unstaged ignore-file edits, including edits that are not requested by the task or reviewer guidance.
-- Ship the same filtered quality-gate behavior in the packaged WorkerPal sandbox runtime used by the published CLI.
+- Add `pushpals --open_config` and `pushpals --open-config` so users can open the active local runtime config and exit before startup.
+- Resolve the config path from the same prepared runtime config directory the CLI would use for the current repo, including installed CLI runtimes under `~/.pushpals/runtime`.
+- Ensure the editable `local.toml` exists before opening it, preserving existing overrides or seeding it from `local.example.toml` on first use.
+- Document the new config opener in the root and npm package CLI notes.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests\workerpals.validation-command-safety.test.ts`
-- `bun x tsc --noEmit --project apps\workerpals\tsconfig.json`
+- `bun test tests\cli.runtime-bootstrap.test.ts`
+- `bun test tests\cli.invocation-logging.test.ts`
 - `bun run test:root`
-- `bun run lint` (2 existing warnings, 0 errors)
 - `git diff --check`
 
 ## Install
@@ -64,5 +63,5 @@ bun install -g @pushpalsdev/cli
 - Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
-- User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --clear` or remove the local override to pick up new packaged defaults.
+- User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --open_config`, `pushpals --clear`, or remove the local override to pick up new packaged defaults.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
