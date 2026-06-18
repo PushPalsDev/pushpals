@@ -36,6 +36,8 @@ Behavior:
   and prompt/config assets into `~/.pushpals/runtime`.
 - Override runtime tag with `pushpals --runtime-tag vX.Y.Z`.
 - Open the active local runtime config with `pushpals --open_config` or `pushpals --open-config`.
+- Set `[workerpals] execution_platform = "windows"` in the active local runtime
+  config when repo validation must run with Windows host semantics.
 - Disable auto-start with `pushpals --no-auto-start`.
 
 ## No npm/Bun install

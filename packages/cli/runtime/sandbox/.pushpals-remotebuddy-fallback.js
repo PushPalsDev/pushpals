@@ -748,6 +748,7 @@ var DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR = "retry_once";
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS = 16000;
 var DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS = 8000;
 var DEFAULT_WORKERPALS_EXECUTOR = "openai_codex";
+var DEFAULT_WORKERPALS_EXECUTION_PLATFORM = "auto";
 var DEFAULT_WORKERPALS_EXECUTOR_RESULT_PREFIX = "__PUSHPALS_OH_RESULT__ ";
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
@@ -831,6 +832,13 @@ function asQualityCriticTimeoutBehavior(value) {
     return normalized;
   }
   return DEFAULT_WORKERPALS_QUALITY_CRITIC_TIMEOUT_BEHAVIOR;
+}
+function normalizeWorkerPalsExecutionPlatform(value, fallback = DEFAULT_WORKERPALS_EXECUTION_PLATFORM) {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/-/g, "_");
+  if (normalized === "auto" || normalized === "windows" || normalized === "linux_docker") {
+    return normalized;
+  }
+  return fallback;
 }
 function asBoolean(value, fallback) {
   if (typeof value === "boolean")
@@ -1104,6 +1112,13 @@ function loadPushPalsConfig(options = {}) {
   }
   const workerNode = getObject(merged, "workerpals");
   const workerOpenHandsNode = getObject(workerNode, "openhands");
+  const workerExecutionPlatform = normalizeWorkerPalsExecutionPlatform(firstNonEmpty(process.env.WORKERPALS_EXECUTION_PLATFORM, process.env.PUSHPALS_WORKERPALS_EXECUTION_PLATFORM, asString(workerNode.execution_platform, DEFAULT_WORKERPALS_EXECUTION_PLATFORM), DEFAULT_WORKERPALS_EXECUTION_PLATFORM));
+  const configuredRemoteWorkerpalDocker = parseBoolEnv("REMOTEBUDDY_WORKERPAL_DOCKER") ?? asBoolean(remoteNode.workerpal_docker, true);
+  const configuredRemoteWorkerpalRequireDocker = parseBoolEnv("REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER") ?? asBoolean(remoteNode.workerpal_require_docker, true);
+  const configuredWorkerRequireDocker = parseBoolEnv("WORKERPALS_REQUIRE_DOCKER") ?? asBoolean(workerNode.require_docker, false);
+  const effectiveRemoteWorkerpalDocker = workerExecutionPlatform === "windows" ? false : workerExecutionPlatform === "linux_docker" ? true : configuredRemoteWorkerpalDocker;
+  const effectiveRemoteWorkerpalRequireDocker = workerExecutionPlatform === "windows" ? false : workerExecutionPlatform === "linux_docker" ? true : configuredRemoteWorkerpalRequireDocker;
+  const effectiveWorkerRequireDocker = workerExecutionPlatform === "windows" ? false : workerExecutionPlatform === "linux_docker" ? true : configuredWorkerRequireDocker;
   const workerPollMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_POLL_MS") ?? workerNode.poll_ms, 2000));
   const workerHeartbeatMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_HEARTBEAT_MS") ?? workerNode.heartbeat_ms, 5000));
   const workerExecutor = firstNonEmpty(process.env.WORKERPALS_EXECUTOR, asString(workerNode.executor, DEFAULT_WORKERPALS_EXECUTOR), DEFAULT_WORKERPALS_EXECUTOR).toLowerCase();
@@ -1298,8 +1313,8 @@ function loadPushPalsConfig(options = {}) {
       minWorkerpals: remoteMinWorkerpals,
       maxWorkerpals: remoteMaxWorkerpals,
       workerpalStartupTimeoutMs: Math.max(1000, asInt(parseIntEnv("REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS") ?? remoteNode.workerpal_startup_timeout_ms, 1e4)),
-      workerpalDocker: parseBoolEnv("REMOTEBUDDY_WORKERPAL_DOCKER") ?? asBoolean(remoteNode.workerpal_docker, true),
-      workerpalRequireDocker: parseBoolEnv("REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER") ?? asBoolean(remoteNode.workerpal_require_docker, true),
+      workerpalDocker: effectiveRemoteWorkerpalDocker,
+      workerpalRequireDocker: effectiveRemoteWorkerpalRequireDocker,
       workerpalImage: firstNonEmpty(process.env.REMOTEBUDDY_WORKERPAL_IMAGE, asString(remoteNode.workerpal_image, "")) || null,
       workerpalPollMs: asIntOrNull(parseIntEnv("REMOTEBUDDY_WORKERPAL_POLL_MS")) ?? asIntOrNull(remoteNode.workerpal_poll_ms),
       workerpalHeartbeatMs: asIntOrNull(parseIntEnv("REMOTEBUDDY_WORKERPAL_HEARTBEAT_MS")) ?? asIntOrNull(remoteNode.workerpal_heartbeat_ms),
@@ -1389,6 +1404,7 @@ function loadPushPalsConfig(options = {}) {
     workerpals: {
       pollMs: workerPollMs,
       heartbeatMs: workerHeartbeatMs,
+      executionPlatform: workerExecutionPlatform,
       executor: workerExecutor,
       openhandsPython: workerOpenHandsPython,
       openhandsTimeoutMs: workerOpenHandsTimeoutMs,
@@ -1407,7 +1423,7 @@ function loadPushPalsConfig(options = {}) {
       openhandsAutoSteerMaxNudges: workerOpenHandsAutoSteerMaxNudges,
       requirePush: workerRequirePush,
       pushAgentBranch: workerPushAgentBranch,
-      requireDocker: parseBoolEnv("WORKERPALS_REQUIRE_DOCKER") ?? asBoolean(workerNode.require_docker, false),
+      requireDocker: effectiveWorkerRequireDocker,
       skipDockerSelfCheck: workerSkipDockerSelfCheck,
       dockerImage: firstNonEmpty(process.env.WORKERPALS_DOCKER_IMAGE, asString(workerNode.docker_image, "pushpals-worker-sandbox:latest"), "pushpals-worker-sandbox:latest"),
       dockerTimeoutMs: Math.max(1e4, asInt(parseIntEnv("WORKERPALS_DOCKER_TIMEOUT_MS") ?? workerNode.docker_timeout_ms, 7260000)),

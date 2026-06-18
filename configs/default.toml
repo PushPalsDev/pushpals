@@ -123,6 +123,7 @@ max_payload_bytes = 262144
 [workerpals]
 poll_ms = 2000
 heartbeat_ms = 5000
+execution_platform = "auto" # auto | windows | linux_docker
 executor = "openai_codex"
 openhands_python = "python"
 openhands_timeout_ms = 1800000

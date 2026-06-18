@@ -511,4 +511,8 @@ High-value env overrides:
 
 - This repository is under active development.
 - For most local development, use Docker worker mode (`workerpals:only:docker`) to keep toolchains reproducible.
+- Repos that need host Windows semantics for validation can set
+  `[workerpals] execution_platform = "windows"` in `configs/local.toml` or
+  the installed CLI runtime config. This forces direct Windows WorkerPal
+  execution even if older Docker toggles are still present.
 - If you only need chat ingress, you can run `localbuddy` without worker services, but delegated coding work requires `server + remotebuddy + workerpals` and usually `source_control_manager` for integration completion.

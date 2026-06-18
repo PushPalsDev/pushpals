@@ -50,6 +50,7 @@ codex_timeout_ms = 120000
 reasoning_effort = "xhigh"
 
 [workerpals]
+execution_platform = "auto" # auto | windows | linux_docker
 executor = "openai_codex"
 docker_image = "pushpals-worker-sandbox:latest"
 openhands_timeout_ms = 1800000
