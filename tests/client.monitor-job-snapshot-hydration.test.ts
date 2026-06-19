@@ -4,6 +4,7 @@ import {
   type Job,
   type LogLine,
   type SessionState,
+  type Task,
 } from "../apps/client/src/lib/eventReducer";
 import { hydrateMonitorTraceState } from "../apps/client/src/lib/monitorTraceHydration";
 import type { JobLogSnapshotRow, JobSnapshotRow } from "../apps/client/src/lib/pushpalsApi";
@@ -61,7 +62,7 @@ describe("monitor trace hydration", () => {
     expect(job?.params?.requestId).toBe("request-1");
   });
 
-  test("preserves live jobs and dedupes persisted logs by timestamp and message", () => {
+  test("promotes stale live jobs from newer terminal snapshots and dedupes logs", () => {
     const liveJob: Job = {
       jobId: "job-1",
       taskId: "task-1",
@@ -88,12 +89,69 @@ describe("monitor trace hydration", () => {
       { "job-1": persistedLogs },
     );
 
-    expect(state.jobs.get("job-1")?.status).toBe("claimed");
-    expect(state.jobs.get("job-1")?.workerId).toBe("workerpal-live");
+    expect(state.jobs.get("job-1")).toMatchObject({
+      status: "completed",
+      workerId: "workerpal-1",
+      summary: "snapshot done",
+    });
     expect(state.logs.get("job-1")?.map((log) => log.line)).toEqual([
       "same line",
       "new durable line",
     ]);
+  });
+
+  test("preserves live jobs when snapshots are not terminal", () => {
+    const liveJob: Job = {
+      jobId: "job-1",
+      taskId: "task-1",
+      kind: "task.execute",
+      status: "claimed",
+      workerId: "workerpal-live",
+      ts: "2026-05-16T09:00:05.000Z",
+    };
+
+    const state = hydrateMonitorTraceState(withLiveJob(liveJob), [
+      jobSnapshot({ status: "claimed", workerId: "workerpal-snapshot" }),
+    ]);
+
+    expect(state.jobs.get("job-1")).toMatchObject({
+      status: "claimed",
+      workerId: "workerpal-live",
+    });
+  });
+
+  test("marks an existing task completed when its stale live job hydrates terminal", () => {
+    const liveJob: Job = {
+      jobId: "job-1",
+      taskId: "task-1",
+      kind: "task.execute",
+      status: "claimed",
+      workerId: "workerpal-live",
+      ts: "2026-05-16T09:00:01.000Z",
+    };
+    const liveTask: Task = {
+      taskId: "task-1",
+      title: "Address ReviewAgent feedback",
+      status: "started",
+      createdBy: "review_agent",
+      jobIds: ["job-1"],
+      ts: "2026-05-16T09:00:00.000Z",
+    };
+    const liveState = withLiveJob(liveJob);
+    liveState.tasks.set(liveTask.taskId, liveTask);
+
+    const state = hydrateMonitorTraceState(liveState, [
+      jobSnapshot({
+        status: "completed",
+        result: JSON.stringify({ summary: "snapshot done" }),
+      }),
+    ]);
+
+    expect(state.tasks.get("task-1")).toMatchObject({
+      status: "completed",
+      summary: "snapshot done",
+      jobIds: ["job-1"],
+    });
   });
 
   test("converts persisted job logs into trace log lines", () => {

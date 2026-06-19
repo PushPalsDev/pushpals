@@ -3,6 +3,13 @@ import type { JobLogSnapshotRow, JobSnapshotRow } from "./pushpalsApi";
 
 export type JobLogsById = Map<string, JobLogSnapshotRow[]> | Record<string, JobLogSnapshotRow[]>;
 
+const TERMINAL_JOB_STATUSES = new Set<JobStatus>([
+  "completed",
+  "failed",
+  "abandoned",
+  "publish_blocked",
+]);
+
 function parseJsonRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "string") return null;
   try {
@@ -82,6 +89,73 @@ function snapshotToTraceJob(row: JobSnapshotRow): Job {
   };
 }
 
+function isTerminalJobStatus(status: JobStatus): boolean {
+  return TERMINAL_JOB_STATUSES.has(status);
+}
+
+function isNewerOrSame(snapshotTs: string, existingTs: string): boolean {
+  const snapshotTime = Date.parse(snapshotTs);
+  const existingTime = Date.parse(existingTs);
+  if (!Number.isFinite(snapshotTime) || !Number.isFinite(existingTime)) {
+    return snapshotTs >= existingTs;
+  }
+  return snapshotTime >= existingTime;
+}
+
+function shouldPromoteSnapshotJob(existing: Job, snapshot: Job): boolean {
+  return isTerminalJobStatus(snapshot.status) && isNewerOrSame(snapshot.ts, existing.ts);
+}
+
+function mergeSnapshotJob(existing: Job, snapshot: Job): Job {
+  return {
+    ...existing,
+    status: snapshot.status,
+    workerId: snapshot.workerId ?? existing.workerId,
+    summary: snapshot.summary ?? existing.summary,
+    message: snapshot.message ?? existing.message,
+    detail: snapshot.detail ?? existing.detail,
+    artifacts: snapshot.artifacts ?? existing.artifacts,
+    ts: snapshot.ts || existing.ts,
+  };
+}
+
+function reconcileTaskStatusFromJob(state: SessionState, job: Job): void {
+  const task = state.tasks.get(job.taskId);
+  if (!task) return;
+
+  const jobIds = task.jobIds.includes(job.jobId) ? task.jobIds : [...task.jobIds, job.jobId];
+  const taskJobs = jobIds.map((jobId) => state.jobs.get(jobId)).filter(Boolean) as Job[];
+  const hasActiveJob = taskJobs.some((item) => !isTerminalJobStatus(item.status));
+  const hasFailedJob = taskJobs.some(
+    (item) =>
+      item.status === "failed" || item.status === "abandoned" || item.status === "publish_blocked",
+  );
+
+  if (job.status === "completed" && task.status !== "failed" && !hasActiveJob && !hasFailedJob) {
+    state.tasks.set(job.taskId, {
+      ...task,
+      status: "completed",
+      summary: task.summary ?? job.summary,
+      jobIds,
+    });
+    return;
+  }
+
+  if (hasFailedJob && task.status !== "completed" && !hasActiveJob) {
+    state.tasks.set(job.taskId, {
+      ...task,
+      status: "failed",
+      message: task.message ?? job.message,
+      jobIds,
+    });
+    return;
+  }
+
+  if (jobIds !== task.jobIds) {
+    state.tasks.set(job.taskId, { ...task, jobIds });
+  }
+}
+
 function logsForJob(logsByJobId: JobLogsById | undefined, jobId: string): JobLogSnapshotRow[] {
   if (!logsByJobId) return [];
   if (logsByJobId instanceof Map) return logsByJobId.get(jobId) ?? [];
@@ -121,12 +195,17 @@ export function hydrateMonitorTraceState(
   logsByJobId?: JobLogsById,
 ): SessionState {
   const jobs = new Map(liveState.jobs);
+  const tasks = new Map(liveState.tasks);
   const logs = new Map(liveState.logs);
   const logSeenKeys = new Map(liveState.logSeenKeys);
 
   for (const snapshot of jobSnapshots) {
-    if (!jobs.has(snapshot.id)) {
-      jobs.set(snapshot.id, snapshotToTraceJob(snapshot));
+    const snapshotJob = snapshotToTraceJob(snapshot);
+    const existingJob = jobs.get(snapshot.id);
+    if (!existingJob) {
+      jobs.set(snapshot.id, snapshotJob);
+    } else if (shouldPromoteSnapshotJob(existingJob, snapshotJob)) {
+      jobs.set(snapshot.id, mergeSnapshotJob(existingJob, snapshotJob));
     }
 
     const mergedLogs = mergePersistedLogs(
@@ -138,11 +217,20 @@ export function hydrateMonitorTraceState(
     }
   }
 
-  return {
+  const nextState = {
     ...liveState,
+    tasks,
     jobs,
     logs,
     logSeenKeys,
     seenIds: new Set(liveState.seenIds),
   };
+
+  for (const job of jobs.values()) {
+    if (isTerminalJobStatus(job.status)) {
+      reconcileTaskStatusFromJob(nextState, job);
+    }
+  }
+
+  return nextState;
 }
