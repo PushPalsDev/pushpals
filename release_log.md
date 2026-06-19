@@ -2,27 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.70`
-- start_commit: `d391d634a3dda1ac711dfce3d6bd106159701eaa`
-- end_commit: `dfac5e7828d31ed1b4ea0a4e60a2f50c5efba89a`
+- version: `v1.1.71`
+- start_commit: `d0bd60bba0605f3be44fa1b3750c147b41c82c06`
+- end_commit: `2f9ecbc43e8dff4e4c33728c659503a832a867cc`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Add `[workerpals] execution_platform` with `auto`, `windows`, and `linux_docker` modes.
-- Let repos that need Windows host validation set `execution_platform = "windows"` to force direct WorkerPal execution even when older Docker toggles are still enabled.
-- Let operators set `execution_platform = "linux_docker"` when they explicitly want Docker-backed WorkerPals; the default `auto` preserves existing Docker config behavior.
-- Support `WORKERPALS_EXECUTION_PLATFORM` and `PUSHPALS_WORKERPALS_EXECUTION_PLATFORM` overrides, and ship the new option through default/example configs plus packaged runtime assets.
+- Reconcile persisted monitor job snapshots with live state so a completed, failed, abandoned, or publish-blocked job cannot remain visually stuck as claimed after a missed terminal event.
+- Update existing task rows from terminal hydrated jobs, closing out started tasks when their database-backed job state is already terminal.
+- Complete derived session task groups from `job_completed` events that only carry `jobId`, using the earlier `job_enqueued` job-to-task mapping.
+- Add focused regression coverage for stale monitor hydration and mapped job-only completion events.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests\shared.config.execution-platform.test.ts tests\shared.config.workerpals-quality-threshold.test.ts`
-- `bun test tests\cli.runtime-bootstrap.test.ts`
-- `bun test tests\server.runtime-config-mutations.test.ts tests\server.runtime-config-route.test.ts tests\remotebuddy.worker-spawn-command.test.ts`
-- `bun x tsc --noEmit --project packages\shared\tsconfig.json`
-- `bun x tsc --noEmit --project apps\workerpals\tsconfig.json`
+- `bun test tests\client.session-task-groups.test.ts tests\client.session-event-visibility.test.ts tests\client.monitor-job-snapshot-hydration.test.ts`
+- `bun run lint`
 - `bun run test:root`
 - `git diff --check`
 
