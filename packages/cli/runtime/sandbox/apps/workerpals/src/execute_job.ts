@@ -2902,8 +2902,15 @@ export function isBrowserSmokeHarnessPath(path: string): boolean {
   );
 }
 
+export function isTestSupportPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  return /(^|\/)(?:tests?|__tests__|__mocks__)\//.test(normalized);
+}
+
 export function isLikelyTestPath(path: string): boolean {
-  return isAssertionCoverageTestPath(path) || isBrowserSmokeHarnessPath(path);
+  return (
+    isAssertionCoverageTestPath(path) || isBrowserSmokeHarnessPath(path) || isTestSupportPath(path)
+  );
 }
 
 function extractRunnableValidationCommand(step: string): string | null {
@@ -3957,7 +3964,8 @@ function runnableValidationCommandsFromSteps(steps: string[] | undefined): strin
   const out: string[] = [];
   const seen = new Set<string>();
   for (const step of steps ?? []) {
-    const command = extractRunnableValidationCommand(String(step ?? ""));
+    const extracted = extractRunnableValidationCommand(String(step ?? ""));
+    const command = extracted ? normalizeRunnableValidationCommand(extracted) : null;
     if (!command) continue;
     const key = command.toLowerCase();
     if (seen.has(key)) continue;
@@ -3965,6 +3973,63 @@ function runnableValidationCommandsFromSteps(steps: string[] | undefined): strin
     out.push(command);
   }
   return out;
+}
+
+function normalizeRunnableValidationCommand(command: string): string | null {
+  const bunTestCommand = normalizeBunTestValidationCommand(command);
+  return bunTestCommand === undefined ? command : bunTestCommand;
+}
+
+function normalizeBunTestValidationCommand(command: string): string | null | undefined {
+  const argv = tokenizeValidationCommandArgv(command);
+  if (!argv || argv.length === 0 || !isBunCommandToken(argv[0] ?? "")) return undefined;
+
+  let testIndex = -1;
+  for (let index = 1; index < argv.length; index += 1) {
+    const token = argv[index] ?? "";
+    const lower = token.toLowerCase();
+    if (lower === "--cwd" || lower === "-c" || lower === "-C" || lower === "--prefix") {
+      index += 1;
+      continue;
+    }
+    if (lower.startsWith("--cwd=") || lower.startsWith("-c=") || lower.startsWith("--prefix=")) {
+      continue;
+    }
+    if (lower.startsWith("-")) continue;
+    if (lower === "test") testIndex = index;
+    break;
+  }
+  if (testIndex < 0) return undefined;
+
+  const prefix = argv.slice(0, testIndex + 1);
+  const args = argv.slice(testIndex + 1);
+  let droppedSupportPath = false;
+  let runnablePathCount = 0;
+  const keptArgs: string[] = [];
+
+  for (const arg of args) {
+    const normalizedPath = normalizeValidationPathToken(arg);
+    if (
+      normalizedPath &&
+      isTestSupportPath(normalizedPath) &&
+      !isAssertionCoverageTestPath(normalizedPath) &&
+      !isBrowserSmokeHarnessPath(normalizedPath)
+    ) {
+      droppedSupportPath = true;
+      continue;
+    }
+    if (
+      normalizedPath &&
+      (isAssertionCoverageTestPath(normalizedPath) || isBrowserSmokeHarnessPath(normalizedPath))
+    ) {
+      runnablePathCount += 1;
+    }
+    keptArgs.push(arg);
+  }
+
+  if (!droppedSupportPath) return command;
+  if (runnablePathCount === 0) return null;
+  return [...prefix, ...keptArgs].map((entry) => quoteValidationCommandArg(entry)).join(" ");
 }
 
 function dedupeValidationCommands(...groups: string[][]): string[] {
@@ -4054,12 +4119,18 @@ export function inferFallbackValidationCommandsForTestTask(
 
   const bunTestPath = (path: string) => formatBunTestPathArg(path);
   const normalizedTarget = (targetPath ?? "").replace(/\\/g, "/").trim();
-  if (normalizedTarget && isLikelyTestPath(normalizedTarget)) {
+  if (
+    normalizedTarget &&
+    (isAssertionCoverageTestPath(normalizedTarget) || isBrowserSmokeHarnessPath(normalizedTarget))
+  ) {
     add(pythonSignal ? `pytest ${normalizedTarget}` : `bun test ${bunTestPath(normalizedTarget)}`);
   }
 
-  if (changedTestPaths.length > 0) {
-    const focused = changedTestPaths.slice(0, 4);
+  const runnableChangedTestPaths = changedTestPaths.filter(
+    (entry) => isAssertionCoverageTestPath(entry) || isBrowserSmokeHarnessPath(entry),
+  );
+  if (runnableChangedTestPaths.length > 0) {
+    const focused = runnableChangedTestPaths.slice(0, 4);
     add(
       pythonSignal
         ? `pytest ${focused.join(" ")}`

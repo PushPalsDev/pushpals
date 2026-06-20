@@ -23,6 +23,7 @@ import {
   isLongRunningBrowserValidationCommand,
   isParallelSafeFastValidationCommand,
   isTestFocusedTask,
+  isTestSupportPath,
   isTestLikeValidationStep,
   playwrightBrowserInstallArgv,
   prepareValidationCommandArgv,
@@ -117,6 +118,10 @@ describe("workerpals validation command safety", () => {
     expect(isLikelyTestPath("scripts/test-web-e2e.js")).toBe(true);
     expect(isAssertionCoverageTestPath("scripts/test-web-e2e.js")).toBe(false);
     expect(isAssertionCoverageTestPath("app/__tests__/route.test.ts")).toBe(true);
+    expect(isTestSupportPath("tests/reactNativeMock.d.ts")).toBe(true);
+    expect(isTestSupportPath("tests")).toBe(false);
+    expect(isLikelyTestPath("tests/reactNativeMock.d.ts")).toBe(true);
+    expect(isAssertionCoverageTestPath("tests/reactNativeMock.d.ts")).toBe(false);
   });
 
   test("prefers scoped fallback commands before full-suite runs", () => {
@@ -213,6 +218,78 @@ describe("workerpals validation command safety", () => {
     expect(commands.fallbackValidationSteps[0]).toContain(
       "./tests/localbuddy.request-status.test.ts",
     );
+  });
+
+  test("does not run test-support files directly as fallback validation", () => {
+    const commands = inferFallbackValidationCommandsForTestTask(
+      "repair the React Native mock type surface for tests",
+      "tests/reactNativeMock.d.ts",
+      planningFixture({
+        validationSteps: [],
+        scope: {
+          readAnywhere: true,
+          writeAllowed: true,
+          writeGlobs: ["tests/reactNativeMock.d.ts"],
+        },
+        discovery: { ripgrepQueries: ["reactNativeMock"], likelyDirs: ["tests"] },
+      }) as any,
+      ["tests/reactNativeMock.d.ts"],
+    );
+
+    expect(commands).toEqual(["bun test"]);
+  });
+
+  test("drops planner validation commands that run only test-support files", () => {
+    const planning = planningFixture({
+      targetPaths: ["tests/reactNativeMock.d.ts"],
+      validationSteps: ["bun test ./tests/reactNativeMock.d.ts"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["tests/reactNativeMock.d.ts"],
+      },
+      discovery: { ripgrepQueries: ["reactNativeMock"], likelyDirs: ["tests"] },
+    }) as any;
+
+    const commands = collectQualityGateValidationCommands({
+      instruction: "repair the React Native mock type surface for tests",
+      targetPath: "tests/reactNativeMock.d.ts",
+      planning,
+      changedTestPaths: ["tests/reactNativeMock.d.ts"],
+      isTestTask: true,
+    });
+
+    expect(commands.plannerRunnableSteps).toEqual([]);
+    expect(commands.fallbackValidationSteps).toEqual(["bun test"]);
+    expect(commands.commandsToRun).toEqual(["bun test"]);
+  });
+
+  test("keeps runnable planner validation while dropping support-only test targets", () => {
+    const planning = planningFixture({
+      targetPaths: ["tests/reactNativeMock.d.ts", "tests/reactNativeMock.test.js"],
+      validationSteps: [
+        "bun test ./tests/reactNativeMock.d.ts",
+        "bun test ./tests/reactNativeMock.test.js",
+      ],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["tests/**"],
+      },
+      discovery: { ripgrepQueries: ["reactNativeMock"], likelyDirs: ["tests"] },
+    }) as any;
+
+    const commands = collectQualityGateValidationCommands({
+      instruction: "add focused tests for the React Native mock contract",
+      targetPath: "tests/reactNativeMock.d.ts",
+      planning,
+      changedTestPaths: ["tests/reactNativeMock.d.ts", "tests/reactNativeMock.test.js"],
+      isTestTask: true,
+    });
+
+    expect(commands.plannerRunnableSteps).toEqual(["bun test ./tests/reactNativeMock.test.js"]);
+    expect(commands.fallbackValidationSteps).toEqual([]);
+    expect(commands.commandsToRun).toEqual(["bun test ./tests/reactNativeMock.test.js"]);
   });
 
   test("adds repo-native typecheck and lint commands for TypeScript changes", () => {
