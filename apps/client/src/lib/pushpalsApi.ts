@@ -25,7 +25,7 @@ export interface SystemClientSummary {
   userAgent?: string;
   sessionId: string;
   status: "connected" | "announced";
-  connectedTransports: Array<"session" | "sse" | "ws">;
+  connectedTransports: ("session" | "sse" | "ws")[];
   announcedAt: string;
   lastSeenAt: string;
 }
@@ -647,6 +647,28 @@ export interface AutonomyTrustedInspirationInsightRow {
   curationReason: string | null;
 }
 
+export interface AutonomyInspirationPatternRow {
+  id: number;
+  fingerprint: string;
+  sourceType: string;
+  sourceLabel: string | null;
+  sourceUrl: string | null;
+  sourceRefs: string[];
+  algorithm: string;
+  whenToUse: string | null;
+  summary: string | null;
+  risks: string[];
+  validationIdeas: string[];
+  tags: string[];
+  qualityScore: number;
+  freshnessScore: number;
+  seenCount: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  updatedAt: string;
+  metadata: Record<string, unknown>;
+}
+
 export interface AutonomyInsightsSummary {
   engineSourceStats: AutonomyEngineSourceInsightRow[];
   trustedInspirationShortlist: AutonomyTrustedInspirationInsightRow[];
@@ -717,6 +739,12 @@ function authHeaders(authToken?: string): Record<string, string> {
   const headers: Record<string, string> = {};
   if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
   return headers;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry) => typeof entry === "string").map(String)
+    : [];
 }
 
 export async function fetchWorkers(
@@ -1021,6 +1049,78 @@ export async function fetchAutonomyInsights(
   } catch (err) {
     console.error("Error fetching autonomy insights:", err);
     return empty;
+  }
+}
+
+export async function fetchAutonomyInspiration(
+  baseUrl: string,
+  authToken?: string,
+  limit = 12,
+): Promise<AutonomyInspirationPatternRow[]> {
+  try {
+    const qs = new URLSearchParams({
+      limit: String(Math.max(1, Math.min(100, Math.floor(limit)))),
+    });
+    const response = await fetch(`${baseUrl}/autonomy/inspiration?${qs.toString()}`, {
+      headers: authHeaders(authToken),
+    });
+    if (!response.ok) return [];
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      patterns?: Record<string, unknown>[];
+    };
+    if (!payload.ok || !Array.isArray(payload.patterns)) return [];
+    return payload.patterns
+      .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+      .map((row) => {
+        const record = row as Record<string, unknown>;
+        const metadata =
+          record.metadata && typeof record.metadata === "object" && !Array.isArray(record.metadata)
+            ? (record.metadata as Record<string, unknown>)
+            : {};
+        return {
+          id: Number.isFinite(Number(record.id)) ? Number(record.id) : 0,
+          fingerprint: String(record.fingerprint ?? ""),
+          sourceType: String(record.sourceType ?? record.source_type ?? "unknown"),
+          sourceLabel:
+            typeof (record.sourceLabel ?? record.source_label) === "string"
+              ? String(record.sourceLabel ?? record.source_label)
+              : null,
+          sourceUrl:
+            typeof (record.sourceUrl ?? record.source_url) === "string"
+              ? String(record.sourceUrl ?? record.source_url)
+              : null,
+          sourceRefs: stringArray(record.sourceRefs ?? record.source_refs),
+          algorithm: String(record.algorithm ?? ""),
+          whenToUse:
+            typeof (record.whenToUse ?? record.when_to_use) === "string"
+              ? String(record.whenToUse ?? record.when_to_use)
+              : null,
+          summary:
+            typeof record.summary === "string" && record.summary.trim()
+              ? String(record.summary)
+              : null,
+          risks: stringArray(record.risks),
+          validationIdeas: stringArray(record.validationIdeas ?? record.validation_ideas),
+          tags: stringArray(record.tags),
+          qualityScore: Number.isFinite(Number(record.qualityScore ?? record.quality_score))
+            ? Number(record.qualityScore ?? record.quality_score)
+            : 0,
+          freshnessScore: Number.isFinite(Number(record.freshnessScore ?? record.freshness_score))
+            ? Number(record.freshnessScore ?? record.freshness_score)
+            : 0,
+          seenCount: Number.isFinite(Number(record.seenCount ?? record.seen_count))
+            ? Number(record.seenCount ?? record.seen_count)
+            : 0,
+          firstSeenAt: String(record.firstSeenAt ?? record.first_seen_at ?? ""),
+          lastSeenAt: String(record.lastSeenAt ?? record.last_seen_at ?? ""),
+          updatedAt: String(record.updatedAt ?? record.updated_at ?? ""),
+          metadata,
+        } satisfies AutonomyInspirationPatternRow;
+      });
+  } catch (err) {
+    console.error("Error fetching autonomy inspiration:", err);
+    return [];
   }
 }
 

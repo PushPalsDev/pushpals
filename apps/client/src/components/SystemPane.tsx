@@ -3,6 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-
 import type {
   ActOnAutonomyQuestionResult,
   AutonomyInsightsSummary,
+  AutonomyInspirationPatternRow,
   AutonomyQuestionRow,
   AnswerAutonomyQuestionResult,
   SystemStatusSummary,
@@ -108,6 +109,7 @@ export function SystemPane({
   workers,
   systemSummary,
   autonomyInsights,
+  autonomyInspiration,
   autonomyQuestions,
   autonomyAnswerResults,
   autonomyAnswerInFlight,
@@ -125,6 +127,7 @@ export function SystemPane({
   workers: WorkerStatusRow[];
   systemSummary: SystemStatusSummary;
   autonomyInsights: AutonomyInsightsSummary;
+  autonomyInspiration: AutonomyInspirationPatternRow[];
   autonomyQuestions: AutonomyQuestionRow[];
   autonomyAnswerResults: Record<string, AnswerAutonomyQuestionResult>;
   autonomyAnswerInFlight: Record<string, boolean>;
@@ -223,11 +226,9 @@ export function SystemPane({
   const evaluator =
     autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
   const recentAlerts = autonomyOps?.recentAlerts ?? [];
+  const freshInspiration = autonomyInspiration.slice(0, 6);
   const trustedSources = autonomyInsights.trustedInspirationShortlist.slice(0, 6);
   const archivedSources = autonomyInsights.archivedInspirationSources.slice(0, 4);
-  const watchlistCount = autonomyInsights.engineSourceStats.filter(
-    (row) => row.curationStatus === "watchlist",
-  ).length;
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
   const actionableQuestionCount = autonomyQuestions.filter(
     (question) => question.status === "open" || question.status === "invalid",
@@ -444,9 +445,9 @@ export function SystemPane({
           theme={theme}
         />
         <MetricTile
-          title="Trusted Sources"
-          value={String(autonomyInsights.trustedInspirationShortlist.length)}
-          detail={`watchlist ${watchlistCount} | archived ${autonomyInsights.archivedInspirationSources.length}`}
+          title="Fresh Inspiration"
+          value={String(autonomyInspiration.length)}
+          detail={`trusted ${autonomyInsights.trustedInspirationShortlist.length} | curated ${autonomyInsights.engineSourceStats.length}`}
           tone="positive"
           theme={theme}
         />
@@ -862,13 +863,73 @@ export function SystemPane({
       >
         <View style={styles.rowBetween}>
           <Text style={[styles.sectionTitle, { color: theme.text, fontFamily: theme.fontSans }]}>
-            Autonomy Source Curation
+            Autonomy Ideas & Curation
           </Text>
           <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
-            {autonomyInsights.engineSourceStats.length} tracked
+            {autonomyInspiration.length} fresh | {autonomyInsights.engineSourceStats.length} curated
           </Text>
         </View>
         <View style={styles.insightColumns}>
+          <View style={styles.insightCol}>
+            <Text
+              style={[
+                styles.insightSectionTitle,
+                { color: theme.accent, fontFamily: theme.fontSans },
+              ]}
+            >
+              Fresh Inspiration
+            </Text>
+            {freshInspiration.length === 0 ? (
+              <Text
+                style={[
+                  styles.emptySubtitle,
+                  { color: theme.textMuted, fontFamily: theme.fontSans },
+                ]}
+              >
+                No fresh inspiration patterns yet.
+              </Text>
+            ) : (
+              freshInspiration.map((row) => (
+                <View
+                  key={`inspiration-${row.fingerprint || row.id}`}
+                  style={[styles.insightRow, { borderColor: theme.border }]}
+                >
+                  <Text
+                    style={[styles.insightLabel, { color: theme.text, fontFamily: theme.fontSans }]}
+                  >
+                    {row.sourceLabel || row.algorithm || "Untitled inspiration"}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.insightMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontMono },
+                    ]}
+                  >
+                    quality {row.qualityScore.toFixed(2)} | fresh {row.freshnessScore.toFixed(2)} |
+                    seen {row.seenCount}
+                  </Text>
+                  {row.summary ? (
+                    <Text
+                      style={[
+                        styles.insightReason,
+                        { color: theme.textMuted, fontFamily: theme.fontSans },
+                      ]}
+                    >
+                      {clip(row.summary, 180)}
+                    </Text>
+                  ) : null}
+                  <Text
+                    style={[
+                      styles.insightMeta,
+                      { color: theme.textMuted, fontFamily: theme.fontSans },
+                    ]}
+                  >
+                    {row.updatedAt ? `updated ${relativeMs(row.updatedAt)}` : "awaiting update"}
+                  </Text>
+                </View>
+              ))
+            )}
+          </View>
           <View style={styles.insightCol}>
             <Text
               style={[

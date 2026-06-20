@@ -35,6 +35,7 @@ import { buildSendFailureMessage, restoreComposerDraft } from "../src/lib/compos
 import { hydrateMonitorTraceState } from "../src/lib/monitorTraceHydration";
 import {
   type AutonomyInsightsSummary,
+  type AutonomyInspirationPatternRow,
   type AutonomyQuestionRow,
   type ActOnAutonomyQuestionResult,
   type AnswerAutonomyQuestionResult,
@@ -49,6 +50,7 @@ import {
   actOnAutonomyQuestion,
   answerAutonomyQuestion,
   fetchAutonomyInsights,
+  fetchAutonomyInspiration,
   fetchAutonomyQuestions,
   fetchCompletionsSnapshot,
   fetchJobLogsSnapshot,
@@ -193,6 +195,9 @@ export default function DashboardScreen() {
     latestEvaluatorScorecard: null,
     opsSummary: null,
   });
+  const [autonomyInspiration, setAutonomyInspiration] = useState<AutonomyInspirationPatternRow[]>(
+    [],
+  );
   const [autonomyQuestions, setAutonomyQuestions] = useState<AutonomyQuestionRow[]>([]);
   const [autonomyAnswerResults, setAutonomyAnswerResults] = useState<
     Record<string, AnswerAutonomyQuestionResult>
@@ -240,6 +245,7 @@ export default function DashboardScreen() {
       completionData,
       systemData,
       autonomyData,
+      autonomyInspirationData,
       autonomyQuestionData,
     ] = await Promise.all([
       fetchWorkers(RUNTIME_CONFIG.serverUrl),
@@ -248,6 +254,7 @@ export default function DashboardScreen() {
       fetchCompletionsSnapshot(RUNTIME_CONFIG.serverUrl),
       fetchSystemStatus(RUNTIME_CONFIG.serverUrl),
       fetchAutonomyInsights(RUNTIME_CONFIG.serverUrl, undefined, 80),
+      fetchAutonomyInspiration(RUNTIME_CONFIG.serverUrl, undefined, 12),
       fetchAutonomyQuestions(RUNTIME_CONFIG.serverUrl, undefined, {
         ...(session.sessionId ? { sessionId: session.sessionId } : {}),
         limit: 120,
@@ -279,6 +286,7 @@ export default function DashboardScreen() {
     setCompletionCounts(completionData.counts);
     setSystemSummary(systemData);
     setAutonomyInsights(autonomyData);
+    setAutonomyInspiration(autonomyInspirationData);
     setAutonomyQuestions(autonomyQuestionData);
     setLastRefresh(new Date().toISOString());
   }, [jobsFilter.jobId, session.sessionId]);
@@ -719,6 +727,7 @@ export default function DashboardScreen() {
                   workers={workers}
                   systemSummary={systemSummary}
                   autonomyInsights={autonomyInsights}
+                  autonomyInspiration={autonomyInspiration}
                   autonomyQuestions={autonomyQuestions}
                   autonomyAnswerResults={autonomyAnswerResults}
                   autonomyAnswerInFlight={autonomyAnswerInFlight}
