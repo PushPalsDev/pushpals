@@ -2,25 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.71`
-- start_commit: `d0bd60bba0605f3be44fa1b3750c147b41c82c06`
-- end_commit: `2f9ecbc43e8dff4e4c33728c659503a832a867cc`
-- commits_in_range: `1`
+- version: `v1.1.72`
+- start_commit: `e26936017de8593ae74028b20fa0a92ee933b9d1`
+- end_commit: `2683c0be8b58afbdbcbc79ea7546e8456cb574dc`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Reconcile persisted monitor job snapshots with live state so a completed, failed, abandoned, or publish-blocked job cannot remain visually stuck as claimed after a missed terminal event.
-- Update existing task rows from terminal hydrated jobs, closing out started tasks when their database-backed job state is already terminal.
-- Complete derived session task groups from `job_completed` events that only carry `jobId`, using the earlier `job_enqueued` job-to-task mapping.
-- Add focused regression coverage for stale monitor hydration and mapped job-only completion events.
+- Surface fresh autonomy inspiration patterns in the system monitor, polling `/autonomy/inspiration` alongside the existing autonomy curation insights so operators can see newly generated idea signals instead of only the trusted/archive lists.
+- Add a typed client parser for autonomy inspiration rows, including safe defaults for optional fields and focused API regression coverage.
+- Harden WorkerPal validation planning so test-support and declaration files, such as `tests/reactNativeMock.d.ts`, still count as task scope but are not executed directly as `bun test` targets.
+- Strip support-only paths out of planner-provided Bun test commands, falling back to runnable validation when the planner only named support files.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests\client.session-task-groups.test.ts tests\client.session-event-visibility.test.ts tests\client.monitor-job-snapshot-hydration.test.ts`
-- `bun run lint`
 - `bun run test:root`
+- `bun run lint`
 - `git diff --check`
 
 ## Install
