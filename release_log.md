@@ -2,17 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.1.73`
-- start_commit: `de97071d906e4d9e86d16becd59b5c5f943d23ae`
-- end_commit: `db050ed07c74c9e57075e092df12843e31743e8e`
+- version: `v1.1.74`
+- start_commit: `0388bb30ff5e55718543600190c0595c070e852c`
+- end_commit: `5cb51795477a4ed1092550973954672c1269411b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Improve autonomous WorkerPal idea selection so repeated test-only work is penalized or deferred when product/behavior work is viable, without blocking legitimate validation repair work.
-- Enrich autonomy snapshots with open objective component, target path, and scope metadata so selection can reason about active work by target area instead of only hashed pattern keys.
-- Treat saturated test/coverage commit-history motifs as saturation evidence instead of inspiration for still more test-only candidates.
-- Use repo-native deterministic commit scopes for WorkerPal fallback commit messages in user repos, avoiding misleading `feat(worker)` subjects for app, script, and test-only changes.
+- Allow validation/tooling repair jobs to publish focused `package.json`, lockfile, `tsconfig`, or lint-config changes without requiring an unrelated test-file edit.
+- Keep ScopeGate/no-publishable-progress worker failures classified as queue-health signals instead of converting worker recovery chatter into fake lint/test repair objectives.
+- Package the WorkerPal sandbox update so installed CLI workers receive the relaxed validation-tooling ScopeGate behavior.
+- Add regression coverage for validation-tooling-only repairs and for autonomy snapshots that should not treat ScopeGate failures as required validation incidents.
 
 ## Validation
 
