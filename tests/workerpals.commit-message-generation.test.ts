@@ -280,6 +280,59 @@ describe("workerpals commit message generation helpers", () => {
     expect(message).not.toContain("can you add 1 more test case for localbuddy");
   });
 
+  test("deterministic fallback commit message uses repo-native scopes outside PushPals apps", () => {
+    const testOnly = buildWorkerCommitMessage(
+      "workerpal-test",
+      {
+        id: "job-sector-tests",
+        taskId: "task-sector-tests",
+        kind: "task.execute",
+        params: {
+          instruction: "Expand opportunity graph tests",
+          targetPath: ".",
+          validationSteps: ["bun test app/__tests__/opportunity-graph.contract.test.ts"],
+        },
+      },
+      ["app/__tests__/opportunity-graph.contract.test.ts"],
+    );
+    expect(testOnly).toContain("feat(tests): expand test coverage");
+
+    const appMixed = buildWorkerCommitMessage(
+      "workerpal-test",
+      {
+        id: "job-sector-app",
+        taskId: "task-sector-app",
+        kind: "task.execute",
+        params: {
+          instruction: "Improve route state behavior",
+          targetPath: ".",
+          validationSteps: ["bun test app/__tests__/_layout.autonomy.test.ts"],
+        },
+      },
+      ["app/_layout.tsx", "app/__tests__/_layout.autonomy.test.ts"],
+    );
+    expect(appMixed).toContain("feat(app): update app implementation and test coverage");
+
+    const scriptHarness = buildWorkerCommitMessage(
+      "workerpal-test",
+      {
+        id: "job-sector-scripts",
+        taskId: "task-sector-scripts",
+        kind: "task.execute",
+        params: {
+          instruction: "Improve web e2e harness",
+          targetPath: ".",
+          validationSteps: ["bun test scripts/__tests__/test-web-e2e.test.js"],
+        },
+      },
+      ["scripts/test-web-e2e.js", "scripts/__tests__/test-web-e2e.test.js"],
+    );
+    expect(scriptHarness).toContain("feat(tests): expand test coverage");
+    expect(testOnly).not.toContain("feat(worker)");
+    expect(appMixed).not.toContain("feat(worker)");
+    expect(scriptHarness).not.toContain("feat(worker)");
+  });
+
   test("redacts credentialed git URL and bearer tokens from error text", () => {
     const redacted = redactSensitiveText(
       "Failed to push branch: fatal: 'https%3A//oauth2%3Agho_abcdefghijklmnopqrstuvwxyz123456@github.com/PushPalsDev/pushpals' Bearer sk-proj-secret-token",

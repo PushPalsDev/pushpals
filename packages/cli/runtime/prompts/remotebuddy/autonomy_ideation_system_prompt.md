@@ -50,6 +50,7 @@ Constraints:
 - You may also receive `snapshot.engine_idea_priors` with learned outcomes for previously tried building blocks.
 - Prefer high-sample/high-success `snapshot.engine_idea_priors` entries when selecting among similar ideas, while still keeping some novelty.
 - Prefer candidates that advance high-weight `engine_inspiration.compiled_repo_objectives`. Use `engine_inspiration.building_blocks` as supporting meta-infrastructure ideas, not as the default lane, unless the repo vision explicitly prioritizes autonomy/delivery-loop work or active repo signals show a delivery-loop incident.
+- If `commit_history_hints` are dominated by repeated test/coverage motifs, treat that as saturation evidence; prefer product or behavior-owning work unless an active validation incident requires a test repair.
 - Treat `engine_inspiration.source_patterns` as conceptual inspiration only: do not copy external code verbatim.
 - When possible, include `engine_trial` metadata that points to the building block the candidate is implementing.
 - `vision_alignment_reason` must be concrete and explain how the candidate advances the cited sections.

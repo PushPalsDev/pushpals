@@ -6159,6 +6159,68 @@ function normalizeCommitArea(raw: string): string {
   return cleaned || "worker";
 }
 
+function normalizeCommitPath(path: string): string {
+  return String(path ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "")
+    .toLowerCase();
+}
+
+function inferRepoNativeCommitArea(targets: string[]): string | null {
+  const normalized = targets.map(normalizeCommitPath).filter((path) => path && path !== ".");
+  if (normalized.length === 0) return null;
+  if (normalized.every(isDocPath)) return "docs";
+  if (
+    normalized.some(isTestPath) &&
+    normalized.every((path) => isTestPath(path) || isDocPath(path))
+  ) {
+    return "tests";
+  }
+
+  const basis =
+    normalized.find((path) => !isTestPath(path) && !isDocPath(path)) ??
+    normalized.find((path) => !isDocPath(path)) ??
+    normalized[0];
+  if (!basis) return null;
+  if (
+    /^(package\.json|bun\.lockb?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i.test(basis)
+  ) {
+    return "package";
+  }
+  if (
+    /^(tsconfig|vite\.config|metro\.config|babel\.config|jest\.config|vitest\.config|playwright\.config|eslint\.config|prettier\.config)/i.test(
+      basis,
+    )
+  ) {
+    return "tooling";
+  }
+  const segments = basis.split("/").filter(Boolean);
+  if ((segments[0] === "apps" || segments[0] === "packages") && segments[1]) {
+    return normalizeCommitArea(segments[1]);
+  }
+  const first = segments[0] ?? "";
+  if (
+    [
+      "app",
+      "components",
+      "screens",
+      "features",
+      "src",
+      "scripts",
+      "utils",
+      "hooks",
+      "styles",
+      "tests",
+    ].includes(first)
+  ) {
+    return normalizeCommitArea(first);
+  }
+  return first ? normalizeCommitArea(first) : null;
+}
+
 function inferCommitArea(
   kind: string,
   params?: Record<string, unknown>,
@@ -6182,7 +6244,7 @@ function inferCommitArea(
   if (pick("apps/client/")) return "client";
   if (pick("apps/server/")) return "server";
   if (pick("README.md") || pick("docs/")) return "docs";
-  return "worker";
+  return inferRepoNativeCommitArea(targets) ?? "repo";
 }
 
 function summarizeScope(
@@ -6200,17 +6262,24 @@ function summarizeScope(
 }
 
 function isDocPath(path: string): boolean {
-  const lower = path.toLowerCase();
+  const lower = normalizeCommitPath(path);
   return (
     lower.startsWith("docs/") ||
     lower.startsWith("wiki/") ||
     lower === "readme.md" ||
-    lower.endsWith(".md")
+    lower.endsWith(".md") ||
+    lower.endsWith(".mdx")
   );
 }
 
 function isTestPath(path: string): boolean {
-  return /(?:^|[/\\])tests?[/\\]|\.test\.[a-z0-9]+$|\.spec\.[a-z0-9]+$/i.test(path);
+  const normalized = normalizeCommitPath(path);
+  if (/(^|\/)(?:__tests__|tests?|e2e|smoke|specs?)(?:\/|$)/i.test(normalized)) {
+    return true;
+  }
+  if (/\.(?:test|spec)\.[a-z0-9]+$/i.test(normalized)) return true;
+  const base = normalized.split("/").pop() ?? normalized;
+  return /(?:^|[-_.])(?:test|spec|e2e|smoke|coverage)(?:[-_.]|$)/i.test(base);
 }
 
 function humanizeCommitArea(area: string): string {
@@ -6221,6 +6290,8 @@ function humanizeCommitArea(area: string): string {
       return "remotebuddy";
     case "source_control_manager":
       return "source control manager";
+    case "tests":
+      return "test";
     default:
       return area.replace(/_/g, " ");
   }
@@ -6242,7 +6313,8 @@ function deriveSummary(
     const codeCount = changedPaths.length - testCount - docCount;
 
     if (testCount > 0 && codeCount === 0 && docCount === 0) {
-      return sanitizeCommitValue(`expand ${label} test coverage`, 72);
+      const coverageLabel = label === "test" ? "test" : `${label} test`;
+      return sanitizeCommitValue(`expand ${coverageLabel} coverage`, 72);
     }
     if (docCount > 0 && codeCount === 0 && testCount === 0) {
       return sanitizeCommitValue(`update ${label} documentation`, 72);

@@ -119,7 +119,14 @@ interface OpenObjective {
   objective_id: string;
   status: string;
   objective_type: string;
+  component_area?: string;
   pattern_key: string;
+  target_paths?: string[];
+  scope?: {
+    read_anywhere: boolean;
+    write_globs: string[];
+    target_paths: string[];
+  };
   updated_at: string;
 }
 
@@ -3909,15 +3916,40 @@ export class AutonomyStore {
         pattern_key: row.pattern_key,
         cooldown_until: row.cooldown_until as string,
       }));
-    const openObjectives = this.db
+    const openObjectiveRows = this.db
       .prepare(
-        `SELECT id AS objective_id, status, objective_type, pattern_key, updated_at
+        `SELECT id AS objective_id, status, objective_type, component_area, pattern_key, scope_json, updated_at
          FROM autonomy_objectives
          WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
          ORDER BY updated_at DESC
          LIMIT 50`,
       )
-      .all() as OpenObjective[];
+      .all() as Array<
+        Omit<OpenObjective, "target_paths" | "scope"> & { scope_json: string | null }
+      >;
+    const openObjectives: OpenObjective[] = openObjectiveRows.map((row) => {
+      const scopeRecord = parseJsonObject(row.scope_json);
+      const targetPaths = asStringArray(scopeRecord.targetPaths ?? scopeRecord.target_paths);
+      const writeGlobs = asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs);
+      const readAnywhere = asBoolean(
+        scopeRecord.readAnywhere ?? scopeRecord.read_anywhere,
+        false,
+      );
+      return {
+        objective_id: row.objective_id,
+        status: row.status,
+        objective_type: row.objective_type,
+        component_area: row.component_area,
+        pattern_key: row.pattern_key,
+        target_paths: targetPaths,
+        scope: {
+          read_anywhere: readAnywhere,
+          write_globs: writeGlobs,
+          target_paths: targetPaths,
+        },
+        updated_at: row.updated_at,
+      };
+    });
     const dispatchBudget = this.getDispatchCountsLastHour(now);
     const resourceBudget = this.resourceBudgetSnapshot(now);
     const stateTraits = this.buildStateTraits({

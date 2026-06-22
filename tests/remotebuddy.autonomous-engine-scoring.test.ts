@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
+  classifyAutonomyCandidateWork,
   computeAdaptiveExploreRate,
   docsWeakEvidencePenaltyForImpact,
   engineIdeaPriorSignalForScoring,
   engineSourcePriorSignalForScoring,
   feedbackPriorSignalForScoring,
+  filterCandidatesForWorkDiversity,
   pickCandidateWithExploreExploit,
+  workDiversityPenaltyForCandidate,
 } from "../apps/remotebuddy/src/autonomous_engine";
 
 describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
@@ -152,6 +155,140 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
     expect(first.strategy).toBe("exploit");
     expect(first.selected?.id).toBe("cand_top");
     expect(second.selected?.id).toBe(first.selected?.id);
+  });
+
+  test("classifies repo-native test harness work separately from product work", () => {
+    const testProfile = classifyAutonomyCandidateWork({
+      id: "cand_tests",
+      objective_type: "feature_small",
+      component_area: "app/__tests__",
+      target_paths: ["app/__tests__/opportunity-graph.contract.test.ts"],
+      scope: { write_globs: ["app/__tests__/*"] },
+    });
+    const productProfile = classifyAutonomyCandidateWork({
+      id: "cand_product",
+      objective_type: "feature_small",
+      component_area: "app",
+      target_paths: ["app/_layout.tsx"],
+      scope: { write_globs: ["app/*"] },
+    });
+
+    expect(testProfile.workKind).toBe("test_only");
+    expect(testProfile.areaKey).toBe("app");
+    expect(productProfile.workKind).toBe("product");
+    expect(productProfile.areaKey).toBe("app");
+  });
+
+  test("work diversity filter defers saturated test-only work when product work is viable", () => {
+    const repeatedTest = {
+      candidate: {
+        id: "cand_repeated_test",
+        objective_type: "feature_small",
+        component_area: "app/__tests__",
+        target_paths: ["app/__tests__/opportunity-graph.contract.test.ts"],
+        scope: { write_globs: ["app/__tests__/*"] },
+      },
+      finalScore: 0.96,
+    };
+    const product = {
+      candidate: {
+        id: "cand_product",
+        objective_type: "feature_small",
+        component_area: "app",
+        target_paths: ["app/_layout.tsx"],
+        scope: { write_globs: ["app/*"] },
+      },
+      finalScore: 0.7,
+    };
+
+    const result = filterCandidatesForWorkDiversity({
+      rows: [repeatedTest, product],
+      openObjectives: [
+        {
+          objective_id: "obj_existing",
+          status: "running",
+          objective_type: "feature_small",
+          component_area: "app/__tests__",
+          pattern_key: "pattern_existing",
+          target_paths: ["app/__tests__/opportunity-graph.contract.test.ts"],
+        },
+      ],
+    });
+
+    expect(result.rows.map((row) => row.candidate.id)).toEqual(["cand_product"]);
+    expect(result.rejected[0]?.reason).toContain("work_diversity_test_target_active");
+  });
+
+  test("work diversity penalty handles saturated test areas without hard rejecting them", () => {
+    const sameAreaDifferentTarget = {
+      candidate: {
+        id: "cand_related_test",
+        objective_type: "feature_small",
+        component_area: "app/__tests__",
+        target_paths: ["app/__tests__/battle-map.contract.test.ts"],
+        scope: { write_globs: ["app/__tests__/*"] },
+      },
+      finalScore: 0.78,
+    };
+    const product = {
+      candidate: {
+        id: "cand_product",
+        objective_type: "feature_small",
+        component_area: "app",
+        target_paths: ["app/_layout.tsx"],
+        scope: { write_globs: ["app/*"] },
+      },
+      finalScore: 0.7,
+    };
+    const openObjectives = [
+      {
+        objective_id: "obj_existing",
+        status: "running",
+        objective_type: "feature_small",
+        component_area: "app/__tests__",
+        pattern_key: "pattern_existing",
+        target_paths: ["app/__tests__/opportunity-graph.contract.test.ts"],
+      },
+    ];
+
+    const filtered = filterCandidatesForWorkDiversity({
+      rows: [sameAreaDifferentTarget, product],
+      openObjectives,
+    });
+    const penalty = workDiversityPenaltyForCandidate({
+      candidate: sameAreaDifferentTarget.candidate,
+      openObjectives,
+    });
+
+    expect(filtered.rows.map((row) => row.candidate.id)).toEqual([
+      "cand_related_test",
+      "cand_product",
+    ]);
+    expect(filtered.rejected).toEqual([]);
+    expect(penalty?.kind).toBe("work_diversity");
+    expect(penalty?.reason).toContain("test-only area already active: app");
+    expect(penalty?.weight).toBeGreaterThan(0);
+  });
+
+  test("work diversity filter keeps test-only work when no other candidate is viable", () => {
+    const onlyTest = {
+      candidate: {
+        id: "cand_only_test",
+        objective_type: "flaky_test",
+        component_area: "tests",
+        target_paths: ["tests/reactNativeMock.test.ts"],
+        scope: { write_globs: ["tests/*"] },
+      },
+      finalScore: 0.8,
+    };
+
+    const result = filterCandidatesForWorkDiversity({
+      rows: [onlyTest],
+      openObjectives: [],
+    });
+
+    expect(result.rows.map((row) => row.candidate.id)).toEqual(["cand_only_test"]);
+    expect(result.rejected).toEqual([]);
   });
 
   test("adaptive explore rate increases under regret pressure and low idea diversity", () => {

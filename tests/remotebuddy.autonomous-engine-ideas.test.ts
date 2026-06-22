@@ -639,4 +639,23 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     expect(queue?.count).toBe(2);
     expect((queue?.sample_subjects ?? []).length).toBeGreaterThan(0);
   });
+
+  test("saturated test-only commit history does not emit another history test block", () => {
+    const hints = summarizeCommitHistoryHints(
+      Array.from({ length: 24 }, (_, index) => `feat(worker): expand app test coverage ${index}`),
+    );
+    const testHint = hints.find((entry) => entry.motif_id === "test_flake_reliability");
+    expect(testHint?.count).toBe(24);
+    expect(testHint?.signal).toBe(1);
+
+    const context = buildEngineInspirationContext({
+      vision,
+      snapshot,
+      commitHistoryHints: hints,
+    });
+
+    expect(
+      context.building_blocks.some((block) => block.id === "history_test_flake_reliability"),
+    ).toBe(false);
+  });
 });

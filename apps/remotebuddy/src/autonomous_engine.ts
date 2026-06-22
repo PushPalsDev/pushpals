@@ -119,7 +119,7 @@ type Snapshot = {
     updated_at: string;
   }>;
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
-  open_objectives: Array<{ objective_id: string; pattern_key: string; status: string }>;
+  open_objectives: SnapshotOpenObjective[];
   repo_health_flags: {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
@@ -168,6 +168,23 @@ type Snapshot = {
     success_rate?: number | null;
     regret_rate?: number | null;
     created_at?: string | null;
+  };
+};
+
+type SnapshotOpenObjective = {
+  objective_id: string;
+  pattern_key: string;
+  status: string;
+  objective_type?: string;
+  component_area?: string;
+  target_paths?: string[];
+  scope?: {
+    read_anywhere?: boolean;
+    readAnywhere?: boolean;
+    write_globs?: string[];
+    writeGlobs?: string[];
+    target_paths?: string[];
+    targetPaths?: string[];
   };
 };
 
@@ -926,6 +943,241 @@ function asStringArray(value: unknown): string[] {
 function asNumber(value: unknown, fallback = 0): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+export type AutonomyCandidateWorkKind = "product" | "test_only" | "docs_only";
+
+export type AutonomyWorkDiversityCandidateInput = {
+  id?: string;
+  objective_type?: string;
+  objectiveType?: string;
+  component_area?: string;
+  componentArea?: string;
+  target_paths?: string[];
+  targetPaths?: string[];
+  scope?: unknown;
+};
+
+export type AutonomyCandidateWorkProfile = {
+  id: string;
+  workKind: AutonomyCandidateWorkKind;
+  areaKey: string;
+  targetKey: string;
+  paths: string[];
+};
+
+export type AutonomyWorkDiversityRejection = {
+  id: string;
+  reason: string;
+  profile: AutonomyCandidateWorkProfile;
+};
+
+export type AutonomyWorkDiversityPenalty = {
+  kind: "work_diversity";
+  weight: number;
+  reason: string;
+};
+
+const WORK_DIVERSITY_ACTIVE_STATUSES = new Set([
+  "proposed",
+  "gated",
+  "dispatched",
+  "running",
+  "blocked",
+  "needs_clarification",
+]);
+
+function normalizeWorkPath(value: unknown): string {
+  return asString(value)
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "")
+    .toLowerCase();
+}
+
+function uniqueWorkPaths(paths: unknown[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const path of paths) {
+    const normalized = normalizeWorkPath(path);
+    if (!normalized || normalized === "." || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function workScopePaths(scope: unknown): string[] {
+  const record = asObject(scope);
+  return [
+    ...asStringArray(record.target_paths ?? record.targetPaths),
+    ...asStringArray(record.write_globs ?? record.writeGlobs),
+  ];
+}
+
+function autonomyDocsPath(path: string): boolean {
+  const normalized = normalizeWorkPath(path);
+  return (
+    normalized === "readme.md" ||
+    normalized.startsWith("docs/") ||
+    normalized.startsWith("wiki/") ||
+    normalized.endsWith(".md") ||
+    normalized.endsWith(".mdx")
+  );
+}
+
+function autonomyTestPath(path: string): boolean {
+  const normalized = normalizeWorkPath(path);
+  if (!normalized) return false;
+  if (/(^|\/)(?:__tests__|tests?|e2e|smoke|specs?)(?:\/|$|\*)/i.test(normalized)) {
+    return true;
+  }
+  if (/\.(?:test|spec)\.[a-z0-9]+$/i.test(normalized)) return true;
+  const base = normalized.split("/").pop() ?? normalized;
+  return /(?:^|[-_.])(?:test|spec|e2e|smoke|coverage)(?:[-_.]|$)/i.test(base);
+}
+
+function workAreaFromPath(path: string): string {
+  const normalized = normalizeWorkPath(path);
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0) return "";
+  const testIndex = segments.findIndex((segment) =>
+    /^(?:__tests__|tests?|e2e|smoke|specs?)$/i.test(segment),
+  );
+  if (testIndex > 0) return segments.slice(0, testIndex).join("/");
+  if ((segments[0] === "apps" || segments[0] === "packages") && segments[1]) {
+    return `${segments[0]}/${segments[1]}`;
+  }
+  return segments[0] ?? "";
+}
+
+export function classifyAutonomyCandidateWork(
+  candidate: AutonomyWorkDiversityCandidateInput,
+): AutonomyCandidateWorkProfile {
+  const scope = asObject(candidate.scope);
+  const directTargetPaths = uniqueWorkPaths(
+    asStringArray(candidate.target_paths ?? candidate.targetPaths),
+  );
+  const paths = uniqueWorkPaths([...directTargetPaths, ...workScopePaths(scope)]);
+  const objectiveType = asString(candidate.objective_type ?? candidate.objectiveType);
+  const componentArea = normalizeWorkPath(candidate.component_area ?? candidate.componentArea);
+  const nonDocPaths = paths.filter((path) => !autonomyDocsPath(path));
+  const nonDocOrTestPaths = paths.filter(
+    (path) => !autonomyDocsPath(path) && !autonomyTestPath(path),
+  );
+  const workKind: AutonomyCandidateWorkKind =
+    paths.length > 0 && nonDocPaths.length === 0
+      ? "docs_only"
+      : paths.length > 0 && nonDocPaths.length > 0 && nonDocOrTestPaths.length === 0
+        ? "test_only"
+        : objectiveType === "flaky_test" && nonDocOrTestPaths.length === 0
+          ? "test_only"
+          : "product";
+  const areaKey =
+    paths.map(workAreaFromPath).find((area) => area && !/^(?:__tests__|tests?)$/.test(area)) ||
+    componentArea ||
+    "repo";
+  const targetKeyPaths = directTargetPaths.length > 0 ? directTargetPaths : paths;
+  const targetKey =
+    targetKeyPaths.length > 0
+      ? targetKeyPaths.slice().sort().slice(0, 4).join("|")
+      : `${workKind}:${areaKey}`;
+  return {
+    id: asString(candidate.id),
+    workKind,
+    areaKey,
+    targetKey,
+    paths,
+  };
+}
+
+function isActiveWorkDiversityStatus(status: unknown): boolean {
+  return WORK_DIVERSITY_ACTIVE_STATUSES.has(asString(status).toLowerCase());
+}
+
+export function filterCandidatesForWorkDiversity<
+  T extends { candidate: AutonomyWorkDiversityCandidateInput },
+>(params: {
+  rows: T[];
+  openObjectives?: SnapshotOpenObjective[];
+}): { rows: T[]; rejected: AutonomyWorkDiversityRejection[] } {
+  const rows = [...params.rows];
+  if (rows.length <= 1) return { rows, rejected: [] };
+
+  const profiles = new Map<T, AutonomyCandidateWorkProfile>();
+  for (const row of rows) profiles.set(row, classifyAutonomyCandidateWork(row.candidate));
+  const hasAlternativeWork = rows.some((row) => profiles.get(row)?.workKind !== "test_only");
+  if (!hasAlternativeWork) return { rows, rejected: [] };
+
+  const activeTestTargetCounts = new Map<string, number>();
+  for (const objective of params.openObjectives ?? []) {
+    if (!isActiveWorkDiversityStatus(objective.status)) continue;
+    const profile = classifyAutonomyCandidateWork(objective);
+    if (profile.workKind !== "test_only") continue;
+    activeTestTargetCounts.set(
+      profile.targetKey,
+      (activeTestTargetCounts.get(profile.targetKey) ?? 0) + 1,
+    );
+  }
+
+  const keptRows: T[] = [];
+  const rejected: AutonomyWorkDiversityRejection[] = [];
+  const activeOrSelectedTestTargets = new Set(activeTestTargetCounts.keys());
+  for (const row of rows) {
+    const profile = profiles.get(row) ?? classifyAutonomyCandidateWork(row.candidate);
+    if (profile.workKind !== "test_only") {
+      keptRows.push(row);
+      continue;
+    }
+    if (activeOrSelectedTestTargets.has(profile.targetKey)) {
+      const reason = `work_diversity_test_target_active:${profile.targetKey}`;
+      rejected.push({ id: profile.id, reason, profile });
+      continue;
+    }
+    keptRows.push(row);
+    activeOrSelectedTestTargets.add(profile.targetKey);
+  }
+
+  return keptRows.length > 0 ? { rows: keptRows, rejected } : { rows, rejected: [] };
+}
+
+export function workDiversityPenaltyForCandidate(params: {
+  candidate: AutonomyWorkDiversityCandidateInput;
+  openObjectives?: SnapshotOpenObjective[];
+  maxActiveTestOnlyPerArea?: number;
+}): AutonomyWorkDiversityPenalty | null {
+  const profile = classifyAutonomyCandidateWork(params.candidate);
+  if (profile.workKind !== "test_only") return null;
+  const maxActivePerArea = Math.max(
+    1,
+    Math.floor(asNumber(params.maxActiveTestOnlyPerArea, 1)),
+  );
+  let activeTargetCount = 0;
+  let activeAreaCount = 0;
+  for (const objective of params.openObjectives ?? []) {
+    if (!isActiveWorkDiversityStatus(objective.status)) continue;
+    const objectiveProfile = classifyAutonomyCandidateWork(objective);
+    if (objectiveProfile.workKind !== "test_only") continue;
+    if (objectiveProfile.targetKey === profile.targetKey) activeTargetCount += 1;
+    if (objectiveProfile.areaKey === profile.areaKey) activeAreaCount += 1;
+  }
+  if (activeTargetCount > 0) {
+    return {
+      kind: "work_diversity",
+      weight: 0.24,
+      reason: `test-only target already active: ${profile.targetKey}`,
+    };
+  }
+  if (activeAreaCount >= maxActivePerArea) {
+    const saturation = activeAreaCount - maxActivePerArea + 1;
+    return {
+      kind: "work_diversity",
+      weight: Math.min(0.22, 0.12 + 0.04 * saturation),
+      reason: `test-only area already active: ${profile.areaKey}`,
+    };
+  }
+  return null;
 }
 
 function compactStatusDetail(value: string, max = 240): string {
@@ -2339,6 +2591,19 @@ const COMMIT_MOTIF_RULES: CommitMotifRule[] = [
   },
 ];
 
+function isSaturatedTestOnlyCommitMotif(input: {
+  motif_id?: unknown;
+  motifId?: unknown;
+  count?: unknown;
+  signal?: unknown;
+}): boolean {
+  const motifId = asString(input.motif_id ?? input.motifId);
+  if (motifId !== "test_flake_reliability") return false;
+  const count = Math.max(0, Math.floor(asNumber(input.count, 0)));
+  const signal = clamp01(asNumber(input.signal, 0));
+  return count >= ADJACENT_POSSIBLE_NOVELTY_DIVISOR && signal >= 0.8;
+}
+
 function bucketLines(items: VisionKeyItems, keys: Array<keyof VisionKeyItems>): string[] {
   return keys.flatMap((key) => (Array.isArray(items[key]) ? items[key] : [])).filter(Boolean);
 }
@@ -3019,6 +3284,7 @@ function buildCommitHistoryBlocks(params: {
     .map((hint) => {
       const rule = COMMIT_MOTIF_RULES.find((entry) => entry.motifId === hint.motif_id);
       if (!rule) return null;
+      if (isSaturatedTestOnlyCommitMotif(hint)) return null;
       const candidateShape = adaptCandidateShapeToRepo({
         shape: rule.shape,
         repoRoot: params.repoRoot,
@@ -3306,6 +3572,16 @@ export function adjacent_possible(params: {
         accepted: false,
         reason: "motif_signal_below_threshold",
         metrics: { signal },
+      });
+      continue;
+    }
+    if (isSaturatedTestOnlyCommitMotif(hint)) {
+      recordTelemetry({
+        step: "motif_screen",
+        motif_id: motifId,
+        accepted: false,
+        reason: "test_only_motif_saturated",
+        metrics: { signal, count: hint.count },
       });
       continue;
     }
@@ -5134,6 +5410,16 @@ export class RemoteBuddyAutonomousEngine {
         evidence_ids: candidate.why_now_signal_ids,
       });
     }
+    const workDiversityPenalty = workDiversityPenaltyForCandidate({
+      candidate,
+      openObjectives: snapshot.open_objectives,
+    });
+    if (workDiversityPenalty) {
+      penalties.push({
+        ...workDiversityPenalty,
+        evidence_ids: candidate.why_now_signal_ids,
+      });
+    }
     if (sourcePriorSignal.curationStatus === "archived") {
       penalties.push({
         kind: "source_archived",
@@ -6106,53 +6392,59 @@ export class RemoteBuddyAutonomousEngine {
           reason: "eligibility_unavailable",
         },
       }));
-      candidatesPayload = rankedWithEligibility.map((row) => ({
-        id: row.candidate.id,
-        title: row.candidate.title,
-        objective_type: row.candidate.objective_type,
-        problem_statement: row.candidate.problem_statement,
-        trigger_type: row.candidate.trigger_type,
-        component_area: row.candidate.component_area,
-        target_paths: row.candidate.target_paths,
-        scope: row.candidate.scope,
-        risk_level: row.candidate.risk_level,
-        expected_validation: row.candidate.expected_validation,
-        estimated_effort: row.candidate.estimated_effort,
-        why_now_signal_ids: row.candidate.why_now_signal_ids,
-        confidence: row.candidate.confidence,
-        vision_alignment_reason: row.candidate.vision_alignment_reason,
-        vision_section_refs: row.candidate.vision_section_refs,
-        feature_hypotheses: row.candidate.feature_hypotheses,
-        ...(row.candidate.engine_trial ? { engine_trial: row.candidate.engine_trial } : {}),
-        llm_score: row.llmScore,
-        impact_signal: row.impactSignal,
-        ema_success: row.emaSuccess,
-        ema_user_accept: row.emaUserAccept,
-        engine_idea_prior_score: row.engineIdeaPriorScore,
-        engine_idea_novelty_score: row.engineIdeaNoveltyScore,
-        engine_idea_novelty_bonus: row.engineIdeaNoveltyBonus,
-        engine_idea_sample_count: row.engineIdeaSampleCount,
-        engine_source_prior_score: row.engineSourcePriorScore,
-        engine_source_novelty_score: row.engineSourceNoveltyScore,
-        engine_source_novelty_bonus: row.engineSourceNoveltyBonus,
-        engine_source_sample_count: row.engineSourceSampleCount,
-        engine_source_trust_score: row.engineSourceTrustScore,
-        engine_source_freshness_score: row.engineSourceFreshnessScore,
-        engine_source_curation_status: row.engineSourceCurationStatus,
-        engine_source_curation_reason: row.engineSourceCurationReason,
-        engine_source_trust_boost: row.engineSourceTrustBoost,
-        explore_rate_configured: adaptiveExplore.baseRate,
-        effective_explore_rate: adaptiveExplore.effectiveRate,
-        explore_rate_adjustment: adaptiveExplore.adjustment,
-        penalties: row.penalties,
-        final_score: row.finalScore,
-        gate_decision: row.eligibility.ok ? "approved" : "rejected",
-        gate_reasons: row.eligibility.ok ? [] : [row.eligibility.reason],
-        selected: false,
-        selection_strategy: "not_selected",
-        selection_roll: null,
-        candidate_created_at: row.candidate.candidate_created_at,
-      }));
+      candidatesPayload = rankedWithEligibility.map((row) => {
+        const workProfile = classifyAutonomyCandidateWork(row.candidate);
+        return {
+          id: row.candidate.id,
+          title: row.candidate.title,
+          objective_type: row.candidate.objective_type,
+          problem_statement: row.candidate.problem_statement,
+          trigger_type: row.candidate.trigger_type,
+          component_area: row.candidate.component_area,
+          target_paths: row.candidate.target_paths,
+          scope: row.candidate.scope,
+          work_kind: workProfile.workKind,
+          work_area_key: workProfile.areaKey,
+          work_target_key: workProfile.targetKey,
+          risk_level: row.candidate.risk_level,
+          expected_validation: row.candidate.expected_validation,
+          estimated_effort: row.candidate.estimated_effort,
+          why_now_signal_ids: row.candidate.why_now_signal_ids,
+          confidence: row.candidate.confidence,
+          vision_alignment_reason: row.candidate.vision_alignment_reason,
+          vision_section_refs: row.candidate.vision_section_refs,
+          feature_hypotheses: row.candidate.feature_hypotheses,
+          ...(row.candidate.engine_trial ? { engine_trial: row.candidate.engine_trial } : {}),
+          llm_score: row.llmScore,
+          impact_signal: row.impactSignal,
+          ema_success: row.emaSuccess,
+          ema_user_accept: row.emaUserAccept,
+          engine_idea_prior_score: row.engineIdeaPriorScore,
+          engine_idea_novelty_score: row.engineIdeaNoveltyScore,
+          engine_idea_novelty_bonus: row.engineIdeaNoveltyBonus,
+          engine_idea_sample_count: row.engineIdeaSampleCount,
+          engine_source_prior_score: row.engineSourcePriorScore,
+          engine_source_novelty_score: row.engineSourceNoveltyScore,
+          engine_source_novelty_bonus: row.engineSourceNoveltyBonus,
+          engine_source_sample_count: row.engineSourceSampleCount,
+          engine_source_trust_score: row.engineSourceTrustScore,
+          engine_source_freshness_score: row.engineSourceFreshnessScore,
+          engine_source_curation_status: row.engineSourceCurationStatus,
+          engine_source_curation_reason: row.engineSourceCurationReason,
+          engine_source_trust_boost: row.engineSourceTrustBoost,
+          explore_rate_configured: adaptiveExplore.baseRate,
+          effective_explore_rate: adaptiveExplore.effectiveRate,
+          explore_rate_adjustment: adaptiveExplore.adjustment,
+          penalties: row.penalties,
+          final_score: row.finalScore,
+          gate_decision: row.eligibility.ok ? "approved" : "rejected",
+          gate_reasons: row.eligibility.ok ? [] : [row.eligibility.reason],
+          selected: false,
+          selection_strategy: "not_selected",
+          selection_roll: null,
+          candidate_created_at: row.candidate.candidate_created_at,
+        };
+      });
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
         this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
@@ -6170,8 +6462,25 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       const eligibleRows = rankedWithEligibility.filter((row) => row.eligibility.ok);
+      const diversitySelection = filterCandidatesForWorkDiversity({
+        rows: eligibleRows,
+        openObjectives: snapshot.open_objectives,
+      });
+      if (diversitySelection.rejected.length > 0) {
+        const payloadById = new Map(candidatesPayload.map((row) => [asString(row.id), row]));
+        for (const rejection of diversitySelection.rejected) {
+          const payload = payloadById.get(rejection.id);
+          if (!payload) continue;
+          payload.gate_decision = "rejected";
+          payload.gate_reasons = [
+            ...(Array.isArray(payload.gate_reasons) ? payload.gate_reasons : []),
+            rejection.reason,
+          ];
+          payload.rejection_reason = rejection.reason;
+        }
+      }
       const selection = pickCandidateWithExploreExploit({
-        rows: eligibleRows.map((row) => ({
+        rows: diversitySelection.rows.map((row) => ({
           id: row.candidate.id,
           finalScore: row.finalScore,
           noveltyScore: row.engineIdeaNoveltyScore,
@@ -6180,7 +6489,7 @@ export class RemoteBuddyAutonomousEngine {
         exploreRate: adaptiveExplore.effectiveRate,
       });
       const selected = selection.selected
-        ? eligibleRows.find((row) => row.candidate.id === selection.selected?.id)
+        ? diversitySelection.rows.find((row) => row.candidate.id === selection.selected?.id)
         : undefined;
       const selectedStrategy = selected ? selection.strategy : "exploit";
       const objectiveId = `obj_${randomUUID().slice(0, 8)}`;
