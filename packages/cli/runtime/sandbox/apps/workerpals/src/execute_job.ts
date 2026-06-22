@@ -2913,6 +2913,48 @@ export function isLikelyTestPath(path: string): boolean {
   );
 }
 
+export function isValidationToolingPath(path: string): boolean {
+  const normalized = String(path ?? "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .toLowerCase();
+  const base = normalized.split("/").pop() ?? normalized;
+  return (
+    /^(package\.json|bun\.lockb?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(base) ||
+    /^(tsconfig|jsconfig)(?:\.[a-z0-9_-]+)?\.json$/.test(base) ||
+    /^(eslint|prettier|babel|metro|jest|vitest|playwright)\.config\.(?:cjs|mjs|js|ts)$/.test(
+      base,
+    ) ||
+    /^\.eslintrc(?:\.(?:cjs|js|json|yaml|yml))?$/.test(base) ||
+    /^\.prettierrc(?:\.(?:cjs|js|json|yaml|yml))?$/.test(base) ||
+    base === "bunfig.toml"
+  );
+}
+
+export function allowsValidationToolingOnlyChangeForTestFocusedTask(params: {
+  instruction: string;
+  planning: TaskExecutePlanning;
+  changedPaths: string[];
+}): boolean {
+  const changedPaths = params.changedPaths
+    .map((path) => String(path ?? "").replace(/\\/g, "/").replace(/^\.\/+/, ""))
+    .filter(Boolean);
+  if (changedPaths.length === 0) return false;
+  if (!changedPaths.every(isValidationToolingPath)) return false;
+  const guidance = [
+    params.instruction,
+    ...(params.planning.targetPaths ?? []),
+    ...(params.planning.scope.writeGlobs ?? []),
+    ...(params.planning.discovery?.likelyDirs ?? []),
+    ...(params.planning.acceptanceCriteria ?? []),
+    ...(params.planning.validationSteps ?? []),
+    ...(params.planning.requiredValidationSteps ?? []),
+  ].join("\n");
+  return /\b(lint|eslint|prettier|format|type\s*check|typecheck|tsc|typescript|validation|tooling|toolchain|package\.json|tsconfig|expo lint|cli)\b/i.test(
+    guidance,
+  );
+}
+
 function extractRunnableValidationCommand(step: string): string | null {
   const trimmed = step.trim();
   if (!trimmed) return null;
@@ -4444,7 +4486,15 @@ async function runDeterministicQualityGate(
     for (const issue of collectWriteScopeIssuesFromChangedPaths(changedPaths, planning)) {
       addScopeIssue(issue);
     }
-    if (isTestTask && changedTestPaths.length === 0) {
+    if (
+      isTestTask &&
+      changedTestPaths.length === 0 &&
+      !allowsValidationToolingOnlyChangeForTestFocusedTask({
+        instruction,
+        planning,
+        changedPaths,
+      })
+    ) {
       addScopeIssue("found no relevant test file modified for this test-focused task.");
     }
     if (

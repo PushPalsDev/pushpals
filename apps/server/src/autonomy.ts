@@ -815,6 +815,48 @@ function parseJobPayloadText(raw: string | null): string {
   return String(raw).trim();
 }
 
+function parseJobPayloadSignalSummary(raw: string | null): string {
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      return `${asString(record.summary)} ${asString(record.message)}`.trim();
+    }
+  } catch {
+    // fall back to the raw stored payload
+  }
+  return String(raw).trim();
+}
+
+function isRequiredValidationFailureSignal(text: string): boolean {
+  return /\b(ValidationGate:\s*Required|required validation)\b/i.test(text);
+}
+
+function isWorkerQualityTrajectoryFailureSignal(text: string): boolean {
+  return (
+    /\bScopeGate\b/i.test(text) ||
+    /\bno relevant test file modified\b/i.test(text) ||
+    /\brollout coach could not recover publishable progress\b/i.test(text) ||
+    /\b(no|without) publishable progress\b/i.test(text) ||
+    /\bartifact_only_no_publishable_patch\b/i.test(text)
+  );
+}
+
+function failedJobSignalType(row: {
+  error: string | null;
+  failureClass?: string | null;
+  diagnosticSummary?: string | null;
+}): SignalValue["type"] {
+  const errorSummary = parseJobPayloadSignalSummary(row.error);
+  const text = `${asString(row.failureClass)} ${asString(row.diagnosticSummary) || errorSummary}`
+    .trim()
+    .replace(/\s+/g, " ");
+  if (isRequiredValidationFailureSignal(text)) return normalizeSignalType(text);
+  if (isWorkerQualityTrajectoryFailureSignal(text)) return "queue_health";
+  return normalizeSignalType(text || errorSummary);
+}
+
 function isStaleClaimFailureText(value: string): boolean {
   return /\b(stale worker claim|heartbeat stale|watchdog|job auto-failed after stale worker claim)\b/i.test(
     value,
@@ -2844,32 +2886,53 @@ export class AutonomyStore {
           `failures=${validationIncident.failure_count} jobs=${validationIncident.failed_job_ids.length}`,
       });
     }
-    let failedRows: Array<{ kind: string | null; error: string | null; count: number }> = [];
+    let failedRows: Array<{
+      kind: string | null;
+      error: string | null;
+      failureClass: string | null;
+      terminalStage: string | null;
+      diagnosticSummary: string | null;
+      count: number;
+    }> = [];
     try {
       failedRows = this.db
         .prepare(
-          `SELECT kind, error, COUNT(*) AS count
-           FROM jobs
-           WHERE status IN ('failed', 'abandoned', 'publish_blocked')
-             AND datetime(COALESCE(failedAt, updatedAt, createdAt)) >= datetime('now', '-24 hours')
-           GROUP BY kind, error
+          `SELECT j.kind AS kind,
+                  j.error AS error,
+                  d.failureClass AS failureClass,
+                  d.terminalStage AS terminalStage,
+                  d.summary AS diagnosticSummary,
+                  COUNT(*) AS count
+           FROM jobs j
+           LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+           WHERE j.status IN ('failed', 'abandoned', 'publish_blocked')
+             AND datetime(COALESCE(j.failedAt, j.updatedAt, j.createdAt)) >= datetime('now', '-24 hours')
+           GROUP BY j.kind, j.error, d.failureClass, d.terminalStage, d.summary
            ORDER BY count DESC
            LIMIT 12`,
         )
-        .all() as Array<{ kind: string | null; error: string | null; count: number }>;
+        .all() as Array<{
+        kind: string | null;
+        error: string | null;
+        failureClass: string | null;
+        terminalStage: string | null;
+        diagnosticSummary: string | null;
+        count: number;
+      }>;
     } catch {
       failedRows = [];
     }
 
     for (let i = 0; i < failedRows.length; i++) {
       const row = failedRows[i];
-      const text = `${asString(row.kind)} ${asString(row.error)}`.trim();
       const count = Math.max(1, Math.floor(asNumber(row.count, 1)));
+      const kind = asString(row.kind) || "job";
+      const failureClass = asString(row.failureClass);
       topSignals.push({
         signal_id: `sig_fail_${i + 1}`,
-        type: normalizeSignalType(text),
+        type: failedJobSignalType(row),
         value: clamp01(count / 8),
-        evidence: `${asString(row.kind) || "job"} failure count=${count}`,
+        evidence: `${kind} failure count=${count}${failureClass ? ` class=${failureClass}` : ""}`,
       });
     }
 

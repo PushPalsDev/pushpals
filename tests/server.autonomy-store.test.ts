@@ -168,6 +168,54 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("createSnapshot keeps scope-gate worker failures as queue health signals", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-scope-gate-signal-");
+    const jobQueue = new JobQueue(dbPath);
+
+    try {
+      const enqueued = jobQueue.enqueue({
+        taskId: "task-scope-gate-signal",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { instruction: "Fix the current lint blocker and validate with bun run lint." },
+      });
+      expect(enqueued.ok).toBe(true);
+      const claimed = jobQueue.claim("worker-scope-gate-signal");
+      expect(claimed.ok).toBe(true);
+      const jobId = String(claimed.job?.id ?? "");
+      expect(jobId.length).toBeGreaterThan(0);
+
+      const failed = jobQueue.fail(jobId, {
+        message:
+          "Quality gate needs revision 1/3: ScopeGate: found no relevant test file modified for this test-focused task.",
+        diagnostics: {
+          terminal: {
+            failureClass: "artifact_only_no_publishable_patch",
+            terminalStage: "test harness repair",
+            executorBackend: "openai_codex",
+            summary:
+              "Quality gate needs revision 1/3: ScopeGate: found no relevant test file modified for this test-focused task.",
+          },
+        },
+      });
+      expect(failed.ok).toBe(true);
+
+      const snapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_scope_gate_signal",
+      });
+      const failureSignal = snapshot.top_signals.find(
+        (signal) => signal.signal_id === "sig_fail_1",
+      );
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(false);
+      expect(snapshot.validation_incident).toBeNull();
+      expect(failureSignal?.type).toBe("queue_health");
+      expect(failureSignal?.evidence).toContain("class=artifact_only_no_publishable_patch");
+    } finally {
+      jobQueue.close();
+    }
+  });
+
   test("createSnapshot marks repo validation red after repeated failures in one terminal job", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-validation-red-single-job-");
     const jobQueue = new JobQueue(dbPath);

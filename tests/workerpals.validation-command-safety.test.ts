@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   buildBunDependencyLayoutPreflightFailureRun,
+  allowsValidationToolingOnlyChangeForTestFocusedTask,
   classifyValidationFailureScope,
   collectPrePublishHygieneIssues,
   collectWriteScopeIssuesFromChangedPaths,
@@ -25,6 +26,7 @@ import {
   isTestFocusedTask,
   isTestSupportPath,
   isTestLikeValidationStep,
+  isValidationToolingPath,
   playwrightBrowserInstallArgv,
   prepareValidationCommandArgv,
   prepareValidationSpawnArgv,
@@ -122,6 +124,37 @@ describe("workerpals validation command safety", () => {
     expect(isTestSupportPath("tests")).toBe(false);
     expect(isLikelyTestPath("tests/reactNativeMock.d.ts")).toBe(true);
     expect(isAssertionCoverageTestPath("tests/reactNativeMock.d.ts")).toBe(false);
+  });
+
+  test("allows validation tooling-only changes for test-focused repair jobs", () => {
+    const planning = planningFixture({
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["tests/reactNativeMock.d.ts", "package.json"],
+      },
+      discovery: { ripgrepQueries: ["reactNativeMock"], likelyDirs: ["tests"] },
+      acceptanceCriteria: ["Repair the lint validation baseline"],
+      validationSteps: ["bun run lint", "bun test"],
+      requiredValidationSteps: ["bun run lint"],
+    }) as any;
+
+    expect(isTestFocusedTask("Repair the lint validation failure for tests", planning)).toBe(true);
+    expect(isValidationToolingPath("package.json")).toBe(true);
+    expect(
+      allowsValidationToolingOnlyChangeForTestFocusedTask({
+        instruction: "Repair the lint validation failure for tests.",
+        planning,
+        changedPaths: ["package.json"],
+      }),
+    ).toBe(true);
+    expect(
+      allowsValidationToolingOnlyChangeForTestFocusedTask({
+        instruction: "Repair the lint validation failure for tests.",
+        planning,
+        changedPaths: ["package.json", "app/_layout.tsx"],
+      }),
+    ).toBe(false);
   });
 
   test("prefers scoped fallback commands before full-suite runs", () => {
