@@ -2,24 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.1.72`
-- start_commit: `e26936017de8593ae74028b20fa0a92ee933b9d1`
-- end_commit: `2683c0be8b58afbdbcbc79ea7546e8456cb574dc`
-- commits_in_range: `2`
+- version: `v1.1.73`
+- start_commit: `de97071d906e4d9e86d16becd59b5c5f943d23ae`
+- end_commit: `db050ed07c74c9e57075e092df12843e31743e8e`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Surface fresh autonomy inspiration patterns in the system monitor, polling `/autonomy/inspiration` alongside the existing autonomy curation insights so operators can see newly generated idea signals instead of only the trusted/archive lists.
-- Add a typed client parser for autonomy inspiration rows, including safe defaults for optional fields and focused API regression coverage.
-- Harden WorkerPal validation planning so test-support and declaration files, such as `tests/reactNativeMock.d.ts`, still count as task scope but are not executed directly as `bun test` targets.
-- Strip support-only paths out of planner-provided Bun test commands, falling back to runnable validation when the planner only named support files.
+- Improve autonomous WorkerPal idea selection so repeated test-only work is penalized or deferred when product/behavior work is viable, without blocking legitimate validation repair work.
+- Enrich autonomy snapshots with open objective component, target path, and scope metadata so selection can reason about active work by target area instead of only hashed pattern keys.
+- Treat saturated test/coverage commit-history motifs as saturation evidence instead of inspiration for still more test-only candidates.
+- Use repo-native deterministic commit scopes for WorkerPal fallback commit messages in user repos, avoiding misleading `feat(worker)` subjects for app, script, and test-only changes.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
 - `bun run test:root`
-- `bun run lint`
 - `git diff --check`
 
 ## Install
