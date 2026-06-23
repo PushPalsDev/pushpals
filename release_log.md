@@ -2,23 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.74`
-- start_commit: `0388bb30ff5e55718543600190c0595c070e852c`
-- end_commit: `5cb51795477a4ed1092550973954672c1269411b`
+- version: `v1.1.75`
+- start_commit: `edb8c48dcab06d0dcbf0d96caea4fe74da445a2d`
+- end_commit: `c1ac6866227a4ebdd89242e2e590da4d4e251165`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Allow validation/tooling repair jobs to publish focused `package.json`, lockfile, `tsconfig`, or lint-config changes without requiring an unrelated test-file edit.
-- Keep ScopeGate/no-publishable-progress worker failures classified as queue-health signals instead of converting worker recovery chatter into fake lint/test repair objectives.
-- Package the WorkerPal sandbox update so installed CLI workers receive the relaxed validation-tooling ScopeGate behavior.
-- Add regression coverage for validation-tooling-only repairs and for autonomy snapshots that should not treat ScopeGate failures as required validation incidents.
+- Keep internal PushPals failure labels out of user-repo autonomy prompts by translating queue-health signal evidence into repo-neutral wording.
+- Classify QualityGate/ValidationGate failures as validation failures even when older no-publishable terminology appears in captured worker context.
+- Cap repeated ReviewAgent auto-fix loops at three attempts and close/delete the unresolved PR branch instead of spending more WorkerPal cycles on low-signal retries.
+- Package the WorkerPal sandbox and RemoteBuddy fallback updates so installed CLI workers receive the retry-loop, classification, and prompt-hygiene behavior.
+- Add regression coverage for internal-label prompt filtering, queue-health signal evidence, review-fix retry caps, and validation-first terminal classification.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
 - `bun run test:root`
+- `bun run test:prompt-policy`
+- `bun run test:protocol`
 - `git diff --check`
 
 ## Install
