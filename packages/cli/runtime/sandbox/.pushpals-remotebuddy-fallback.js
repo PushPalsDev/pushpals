@@ -4994,8 +4994,15 @@ function isPushPalsInternalUserRepoPath(path) {
     return false;
   return /(^|\/)_layout\.autonomy\.test\.[cm]?[jt]sx?$/.test(normalized);
 }
+var PUSHPALS_INTERNAL_USER_REPO_TEXT_PATTERNS = [
+  /\b(queue_health|workerpal|workerpals|remotebuddy|sourcecontrolmanager|source_control_manager|reviewagent|pushpals)\b/i,
+  /\bartifact[_-]?only[_-]?no[_-]?publishable[_-]?patch\b/i,
+  /\bno[-_\s]?reviewable[-_\s]?patch\b/i,
+  /\bno[-_\s]?publishable[-_\s]?(?:patch|changes?|progress)\b/i,
+  /\b(qualitygate|validationgate|scopegate|criticgate|rollout coach|autonomy[-_\s]?internal)\b/i
+];
 function containsPushPalsInternalUserRepoText(text) {
-  return /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|source_control_manager|reviewagent|pushpals)\b/i.test(text);
+  return PUSHPALS_INTERNAL_USER_REPO_TEXT_PATTERNS.some((pattern) => pattern.test(text));
 }
 function candidateLeaksPushPalsInternals(candidate) {
   if ([candidate.component_area, ...candidate.target_paths].some((path) => isPushPalsInternalUserRepoPath(path))) {
@@ -5017,7 +5024,7 @@ function buildRepoNativeFallbackInstruction(candidate) {
     "",
     candidate.problem_statement,
     "",
-    "Keep the change scoped to the repo's own product/runtime behavior. Do not add PushPals, WorkerPal, RemoteBuddy, queue-health, or autonomy-internal concepts to user-facing code or tests.",
+    "Keep the change scoped to the repo's own product/runtime behavior. Do not add external automation telemetry, orchestration internals, or queue diagnostics to user-facing code or tests.",
     "",
     "Scope:",
     `- target_paths: ${candidate.target_paths.join(", ")}`,

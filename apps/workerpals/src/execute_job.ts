@@ -886,11 +886,15 @@ function buildValidationRunDiagnostics(
 
 function inferTerminalFailureClass(result: JobResult, changedPaths: string[]): string {
   if (result.ok) return "success";
+  const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text =
     `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
   const publishableCount = publishableChangedPaths(changedPaths).length;
   if (text.includes("stalled before first response") || text.includes("startup stall")) {
     return "codex_startup_stall";
+  }
+  if (summaryText.includes("validationgate") || summaryText.includes("validation")) {
+    return "validation";
   }
   if (changedPaths.length > 0 && publishableCount === 0)
     return "artifact_only_no_publishable_patch";

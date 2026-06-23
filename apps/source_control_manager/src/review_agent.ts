@@ -46,7 +46,7 @@ interface ReviewAgentDeps {
 }
 
 const MAX_DIFF_BYTES = 150_000;
-const MAX_PR_RE_REVIEW_ENQUEUES = 500;
+const MAX_PR_RE_REVIEW_ENQUEUES = 3;
 const MAX_REVIEW_CONTEXT_COMMENTS = 8;
 const MAX_REVIEW_CONTEXT_COMMENT_CHARS = 320;
 const MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3_000;
@@ -370,12 +370,12 @@ function formatRejectionComment(verdict: ReviewVerdict): string {
   return lines.join("\n");
 }
 
-function formatGiveUpComment(verdict: ReviewVerdict, maxCommentsBeforeGiveUp: number): string {
+function formatGiveUpComment(verdict: ReviewVerdict, reason: string): string {
   const lines = [
     `## ReviewAgent: PR Closed Without Merge (score ${verdict.score.toFixed(1)}/10)`,
     "",
     `**Verdict:** ${verdict.summary}`,
-    `**Reason:** Reached PR feedback comment cap (${Math.max(1, Math.floor(maxCommentsBeforeGiveUp))}).`,
+    `**Reason:** ${reason}`,
     "",
     "_No additional auto-fix attempts will be made for this PR. The PR is being closed and its branch deleted._",
   ];
@@ -1535,9 +1535,17 @@ export class ReviewAgent {
     const priorReReviewEnqueues = this.reReviewEnqueueCounts.get(pr.number) ?? 0;
     if (priorReReviewEnqueues >= MAX_PR_RE_REVIEW_ENQUEUES) {
       this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] PR #${pr.number} reached max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); skipping additional fix-job enqueue.`,
+        `[${ts()}] [ReviewAgent] PR #${pr.number} reached max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); closing instead of enqueueing another fix job.`,
       );
-      return true;
+      return await this.giveUpOnRejectedPr(pr, effectiveVerdict, {
+        jobId,
+        sessionId,
+        recentComments,
+        maxPrCommentsBeforeGiveUp,
+        reason: `Reached automated review-fix retry cap (${MAX_PR_RE_REVIEW_ENQUEUES}).`,
+        feedbackVerdict: "rejected_re_review_cap_closed",
+        feedbackSummarySuffix: `closed after reaching automated review-fix retry cap (${MAX_PR_RE_REVIEW_ENQUEUES}).`,
+      });
     }
 
     const existingFixJobId = await this.findActiveReviewJobIdForPrHead(
@@ -1552,6 +1560,8 @@ export class ReviewAgent {
       return true;
     }
 
+    const nextReReviewEnqueues = priorReReviewEnqueues + 1;
+    this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
     const enqueued = await this.enqueueFixJob(
       pr,
       effectiveVerdict,
@@ -1562,13 +1572,15 @@ export class ReviewAgent {
       recentComments,
     );
     if (enqueued) {
-      const nextReReviewEnqueues = priorReReviewEnqueues + 1;
-      this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
       if (nextReReviewEnqueues === MAX_PR_RE_REVIEW_ENQUEUES) {
         this.deps.logWarn(
           `[${ts()}] [ReviewAgent] PR #${pr.number} hit max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); future rejections will not auto-enqueue fix jobs.`,
         );
       }
+    } else if (priorReReviewEnqueues > 0) {
+      this.reReviewEnqueueCounts.set(pr.number, priorReReviewEnqueues);
+    } else {
+      this.reReviewEnqueueCounts.delete(pr.number);
     }
     return true;
   }
@@ -1581,10 +1593,16 @@ export class ReviewAgent {
       sessionId: string | null;
       recentComments: PullRequestComment[];
       maxPrCommentsBeforeGiveUp: number;
+      reason?: string;
+      feedbackVerdict?: "rejected_comment_cap_closed" | "rejected_re_review_cap_closed";
+      feedbackSummarySuffix?: string;
     },
   ): Promise<boolean> {
+    const reason =
+      context.reason ??
+      `Reached PR feedback comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}).`;
     this.deps.logWarn(
-      `[${ts()}] [ReviewAgent] PR #${pr.number} reached PR comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}); closing without merge.`,
+      `[${ts()}] [ReviewAgent] PR #${pr.number} ${reason} Closing without merge.`,
     );
 
     try {
@@ -1601,12 +1619,12 @@ export class ReviewAgent {
       }
     } catch (err: any) {
       this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Failed to close PR #${pr.number} after comment-cap hit: ${err?.message ?? err}`,
+        `[${ts()}] [ReviewAgent] Failed to close PR #${pr.number} after give-up condition: ${err?.message ?? err}`,
       );
       return false;
     }
 
-    const giveUpComment = formatGiveUpComment(verdict, context.maxPrCommentsBeforeGiveUp);
+    const giveUpComment = formatGiveUpComment(verdict, reason);
     try {
       await this.deps.addPullRequestComment({
         token: this.githubToken,
@@ -1622,8 +1640,11 @@ export class ReviewAgent {
 
     await this.postAutonomyPrFeedback({
       pr,
-      verdict: "rejected_comment_cap_closed",
-      verdictSummary: `${verdict.summary} | closed after reaching PR comment cap (${context.maxPrCommentsBeforeGiveUp}).`,
+      verdict: context.feedbackVerdict ?? "rejected_comment_cap_closed",
+      verdictSummary: `${verdict.summary} | ${
+        context.feedbackSummarySuffix ??
+        `closed after reaching PR comment cap (${context.maxPrCommentsBeforeGiveUp}).`
+      }`,
       reviewScore: verdict.score,
       jobId: context.jobId,
       sessionId: context.sessionId,

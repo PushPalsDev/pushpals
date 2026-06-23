@@ -292,10 +292,13 @@ describe("ReviewAgent", () => {
     expect(reviewCalls).toBe(2);
   });
 
-  test("caps auto-enqueued re-reviews at 500 per PR", async () => {
+  test("closes PR when automated review-fix retries hit the cap", async () => {
     const prNumber = 62;
     let pollCount = 0;
     let jobEnqueueCalls = 0;
+    let closeCalls = 0;
+    let deleteCalls = 0;
+    let closed = false;
 
     const agent = new ReviewAgent(
       { ...baseConfig, passThreshold: 8.5 },
@@ -305,14 +308,20 @@ describe("ReviewAgent", () => {
       "main",
       undefined,
       {
+        ...silentLogs,
         listOpenPullRequests: async () => {
+          if (closed) return [];
           const sha = pollCount.toString(16).padStart(40, "0");
           pollCount += 1;
           return [
             makePr({
               number: prNumber,
               html_url: `https://example.com/pr/${prNumber}`,
-              head: { sha },
+              head: {
+                ref: "agent/test-branch",
+                sha,
+                label: "owner:agent/test-branch",
+              },
             }),
           ];
         },
@@ -326,6 +335,15 @@ describe("ReviewAgent", () => {
           }),
         addPullRequestComment: async () => {},
         listPullRequestComments: async () => [],
+        closePullRequest: async () => {
+          closeCalls += 1;
+          closed = true;
+          return { state: "closed", closed: true };
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
         fetchImpl: async (input) => {
           const url = String(input);
           if (url.endsWith("/jobs/enqueue")) {
@@ -335,15 +353,16 @@ describe("ReviewAgent", () => {
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         },
         now: () => 789,
-        ...silentLogs,
       },
     );
 
-    for (let i = 0; i < 505; i += 1) {
+    for (let i = 0; i < 5; i += 1) {
       await agent.poll();
     }
 
-    expect(jobEnqueueCalls).toBe(500);
+    expect(jobEnqueueCalls).toBe(3);
+    expect(closeCalls).toBe(1);
+    expect(deleteCalls).toBe(1);
   });
 
   test("skips duplicate fix enqueue when active job already exists for same PR head SHA", async () => {

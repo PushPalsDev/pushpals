@@ -83,6 +83,19 @@ describe("workerpals session event emission", () => {
     ).toBe("artifact_only_no_publishable_patch");
   });
 
+  test("classifies quality gate validation failures before incidental no-publishable text", () => {
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary:
+          "Quality gate needs revision 1/3: ValidationGate: Required vision.md validation failed: bun test exited 1",
+        stderr: "previous context mentioned artifact_only_no_publishable_patch",
+        stdout: "no publishable progress terminology appeared in an earlier worker hint",
+        exitCode: 1,
+      }),
+    ).toBe("validation");
+  });
+
   test("recycles a worker after a codex startup stall", () => {
     expect(
       shouldRecycleWorkerForCodexUnavailableFailure(

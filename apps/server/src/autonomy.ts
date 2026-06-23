@@ -857,6 +857,18 @@ function failedJobSignalType(row: {
   return normalizeSignalType(text || errorSummary);
 }
 
+function publicFailureClassLabel(value: string | null): string {
+  const normalized = asString(value).toLowerCase();
+  switch (normalized) {
+    case "artifact_only_no_publishable_patch":
+      return "no_reviewable_repo_change";
+    case "codex_startup_stall":
+      return "executor_startup_stall";
+    default:
+      return asString(value);
+  }
+}
+
 function isStaleClaimFailureText(value: string): boolean {
   return /\b(stale worker claim|heartbeat stale|watchdog|job auto-failed after stale worker claim)\b/i.test(
     value,
@@ -2928,11 +2940,12 @@ export class AutonomyStore {
       const count = Math.max(1, Math.floor(asNumber(row.count, 1)));
       const kind = asString(row.kind) || "job";
       const failureClass = asString(row.failureClass);
+      const publicFailureClass = publicFailureClassLabel(failureClass);
       topSignals.push({
         signal_id: `sig_fail_${i + 1}`,
         type: failedJobSignalType(row),
         value: clamp01(count / 8),
-        evidence: `${kind} failure count=${count}${failureClass ? ` class=${failureClass}` : ""}`,
+        evidence: `${kind} failure count=${count}${publicFailureClass ? ` class=${publicFailureClass}` : ""}`,
       });
     }
 

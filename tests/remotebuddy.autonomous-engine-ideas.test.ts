@@ -6,6 +6,7 @@ import {
   buildEngineFallbackCandidates,
   buildEngineInspirationContext,
   buildRepoVisionFallbackCandidates,
+  containsPushPalsInternalUserRepoText,
   summarizeCommitHistoryHints,
 } from "../apps/remotebuddy/src/autonomous_engine";
 
@@ -88,6 +89,24 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
       },
     },
   };
+
+  test("detects internal PushPals failure labels before user-repo dispatch", () => {
+    expect(
+      containsPushPalsInternalUserRepoText(
+        "Treat artifact_only_no_publishable_patch as explicit delivery evidence.",
+      ),
+    ).toBe(true);
+    expect(
+      containsPushPalsInternalUserRepoText(
+        "Add no-reviewable-patch coverage for QualityGate failures.",
+      ),
+    ).toBe(true);
+    expect(
+      containsPushPalsInternalUserRepoText(
+        "Make the app review path expose selected player actions clearly.",
+      ),
+    ).toBe(false);
+  });
 
   test("buildEngineInspirationContext compiles weighted objectives, gaps, and sorted building blocks", () => {
     const context = buildEngineInspirationContext({ vision, snapshot });

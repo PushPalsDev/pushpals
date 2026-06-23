@@ -460,9 +460,11 @@ function isCodexStartupStallResult(result: JobResult): boolean {
 
 export function inferWorkerTerminalFailureClass(result: JobResult): string {
   if (result.ok) return "success";
+  const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text =
     `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
   if (isCodexStartupStallResult(result)) return "codex_startup_stall";
+  if (/validationgate|validation/.test(summaryText)) return "validation";
   if (/timed out|timeout|signal 15|terminated|exit 143|exit 137/.test(text)) return "timeout";
   if (/no publishable|non-publishable|node_modules/.test(text))
     return "artifact_only_no_publishable_patch";

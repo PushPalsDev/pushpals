@@ -210,7 +210,8 @@ describe("server AutonomyStore policy gates", () => {
       expect(snapshot.repo_health_flags.required_validation_red).toBe(false);
       expect(snapshot.validation_incident).toBeNull();
       expect(failureSignal?.type).toBe("queue_health");
-      expect(failureSignal?.evidence).toContain("class=artifact_only_no_publishable_patch");
+      expect(failureSignal?.evidence).toContain("class=no_reviewable_repo_change");
+      expect(failureSignal?.evidence).not.toContain("artifact_only_no_publishable_patch");
     } finally {
       jobQueue.close();
     }
