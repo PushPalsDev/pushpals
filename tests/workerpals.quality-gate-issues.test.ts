@@ -14,6 +14,7 @@ import {
   isBrowserValidationInfrastructureDigest,
   knownFailureHintsForPacket,
   knownValidationRemedyHintsForRuns,
+  inScopeValidationRepairContinuationBudgetDecision,
   publishableChangedPaths,
   qualityRevisionBudgetDecision,
   qualityRevisionLoopUpperBound,
@@ -284,6 +285,58 @@ describe("workerpals quality gate critic issue formatting", () => {
       executionBudgetMs: 0,
       finalizationBudgetMs: 0,
       reason: "no publishable patch is present",
+    });
+  });
+
+  test("continues in-scope deterministic validation repair after the generic revision budget is exhausted", () => {
+    const revisionBudget = qualityRevisionBudgetDecision({
+      jobElapsedMs: 1_200_000,
+      executionBudgetMs: 1_200_000,
+    });
+
+    expect(
+      inScopeValidationRepairContinuationBudgetDecision({
+        requiredValidationFailures: [
+          "bun test exited 1 (Export named 'getReactNativeMock' not found)",
+        ],
+        validationOutsideTaskScope: false,
+        changedPaths: ["tests/reactNativeMock.ts", "app/__tests__/_layout.autonomy.test.ts"],
+        revisionBudget,
+      }),
+    ).toEqual({
+      shouldContinue: true,
+      executionBudgetMs: 600_000,
+      finalizationBudgetMs: 120_000,
+      reason:
+        "in-scope validation repair has publishable work but exhausted the original revision budget",
+    });
+
+    expect(
+      inScopeValidationRepairContinuationBudgetDecision({
+        requiredValidationFailures: ["bun test exited 1"],
+        validationOutsideTaskScope: false,
+        changedPaths: ["outputs/web-e2e/failure.png"],
+        revisionBudget,
+      }),
+    ).toEqual({
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no publishable validation repair patch is present",
+    });
+
+    expect(
+      inScopeValidationRepairContinuationBudgetDecision({
+        requiredValidationFailures: ["bun test exited 1"],
+        validationOutsideTaskScope: true,
+        changedPaths: ["tests/reactNativeMock.ts"],
+        revisionBudget,
+      }),
+    ).toEqual({
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "validation failure is outside task scope",
     });
   });
 

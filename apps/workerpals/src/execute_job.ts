@@ -213,6 +213,8 @@ const BROWSER_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 900_000;
 const BROWSER_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
 const REPO_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 900_000;
 const REPO_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
+const IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 600_000;
+const IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
 
 export function qualityRevisionLoopUpperBound(
   policy: {
@@ -376,6 +378,61 @@ export function repoValidationRepairContinuationBudgetDecision(opts: {
     finalizationBudgetMs: REPO_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS,
     reason:
       "repo validation repair has publishable work but exhausted the original revision budget",
+  };
+}
+
+export function inScopeValidationRepairContinuationBudgetDecision(opts: {
+  requiredValidationFailures: string[];
+  validationOutsideTaskScope?: boolean;
+  changedPaths: string[];
+  revisionBudget: Pick<
+    ReturnType<typeof qualityRevisionBudgetDecision>,
+    "shouldStart" | "remainingBudgetMs" | "minimumRevisionBudgetMs"
+  >;
+}): {
+  shouldContinue: boolean;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+  reason: string;
+} {
+  if (opts.revisionBudget.shouldStart) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "standard revision budget is available",
+    };
+  }
+  if (opts.requiredValidationFailures.length === 0) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no required validation failure is present",
+    };
+  }
+  if (opts.validationOutsideTaskScope) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "validation failure is outside task scope",
+    };
+  }
+  if (publishableChangedPaths(opts.changedPaths).length === 0) {
+    return {
+      shouldContinue: false,
+      executionBudgetMs: 0,
+      finalizationBudgetMs: 0,
+      reason: "no publishable validation repair patch is present",
+    };
+  }
+  return {
+    shouldContinue: true,
+    executionBudgetMs: IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS,
+    finalizationBudgetMs: IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS,
+    reason:
+      "in-scope validation repair has publishable work but exhausted the original revision budget",
   };
 }
 
@@ -9356,10 +9413,20 @@ export async function executeJob(
       changedPaths: quality.changedPaths,
       revisionBudget,
     });
+    const inScopeValidationContinuation = inScopeValidationRepairContinuationBudgetDecision({
+      requiredValidationFailures:
+        validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode
+          ? []
+          : quality.requiredValidationFailures,
+      validationOutsideTaskScope,
+      changedPaths: quality.changedPaths,
+      revisionBudget,
+    });
     if (
       !revisionBudget.shouldStart &&
       !browserValidationContinuation.shouldContinue &&
-      !repoValidationContinuation.shouldContinue
+      !repoValidationContinuation.shouldContinue &&
+      !inScopeValidationContinuation.shouldContinue
     ) {
       if (
         shouldSoftPassCriticOnlyBudgetExhaustion({
@@ -9459,6 +9526,26 @@ export async function executeJob(
           repoValidationContinuation.executionBudgetMs
         }ms execution + ${
           repoValidationContinuation.finalizationBudgetMs
+        }ms finalization after original remaining budget ${
+          revisionBudget.remainingBudgetMs
+        }ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(
+          issueSummary,
+          220,
+        )}`,
+      );
+    } else if (!revisionBudget.shouldStart && inScopeValidationContinuation.shouldContinue) {
+      nextQualityRevisionExecuteBudgets = {
+        executionBudgetMs: inScopeValidationContinuation.executionBudgetMs,
+        finalizationBudgetMs: inScopeValidationContinuation.finalizationBudgetMs,
+      };
+      onLog?.(
+        "stderr",
+        `[QualityGate] Continuing in-scope validation repair ${
+          revisionAttempt + 1
+        }/${activeMaxAutoRevisions} with dedicated budget ${
+          inScopeValidationContinuation.executionBudgetMs
+        }ms execution + ${
+          inScopeValidationContinuation.finalizationBudgetMs
         }ms finalization after original remaining budget ${
           revisionBudget.remainingBudgetMs
         }ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(
