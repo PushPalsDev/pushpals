@@ -2,25 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.76`
-- start_commit: `6f456af1781cd2f19220127611a696b241735572`
-- end_commit: `74ee9f24c1c38d19354e64eaef888319cd79c213`
+- version: `v1.1.77`
+- start_commit: `c063f3b3f7d498452815c728093d4b0e3d89b616`
+- end_commit: `e3eeedd525309d0dc1060331247aa72cc88b68c8`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Continue in-scope deterministic validation repair with a bounded dedicated budget when a WorkerPal has already produced publishable changes but the main execution budget is exhausted.
-- Require publishable changed files before starting the dedicated in-scope validation repair continuation, preventing artifact-only or empty validation failures from looping.
-- Keep browser validation repair and outside-scope repo validation repair precedence unchanged while giving fast `bun test`, typecheck, and lint failures a smaller focused recovery window.
-- Package the WorkerPal sandbox update so installed CLI workers receive the new in-scope validation continuation behavior.
-- Add regression coverage for the missing-export/typecheck failure class that previously stopped instead of attempting a focused repair pass.
+- Permit repo-native `_layout.autonomy.test.ts` contract-test work without treating the file name as PushPals/autonomy internals leaking into a user repo.
+- Split broad/shared mock expansion from narrow references to existing React Native mock or layout harness infrastructure during shell contract-test jobs.
+- Keep rollout coaching strict for missing-path drift, full render/full-surface harness expansion, and genuinely broad shared mock work.
+- Package the WorkerPal sandbox update so installed CLI workers receive the corrected rollout-coach behavior.
+- Add source and packaged-runtime regression coverage for the SectorCommand shell contract-test failure shape.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
+- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
+- `python -m unittest packages.cli.runtime.sandbox.apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_offtrack_rollout_allows_repo_native_layout_autonomy_contract_test packages.cli.runtime.sandbox.apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_offtrack_rollout_allows_existing_harness_for_shell_contract_guard packages.cli.runtime.sandbox.apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_offtrack_rollout_still_blocks_broad_mock_expansion_for_shell_contract_guard`
 - `bun test tests/workerpals.quality-gate-issues.test.ts`
-- `bun x tsc --noEmit --project apps/workerpals/tsconfig.json`
 - `bun run test:root`
 - `git diff --check`
 
@@ -61,7 +62,7 @@ bun install -g @pushpalsdev/cli
 - Expo Router browser validation now removes linked `node_modules` artifacts before dependency repair; if the offline Bun cache is incomplete, the browser validation may still report a local dependency/setup blocker.
 - OpenAI Codex WorkerPal jobs can still fail if Codex produces no publishable edit after the final no-edit recovery attempt or if the shared executor budget is already too low for another recovery.
 - OpenAI Codex WorkerPal jobs still fail fast on truly broad/noisy publishable diffs after timeout; tracked paths with no staged or unstaged Git content delta are now filtered before ScopeGate and quality diagnostics.
-- OpenAI Codex rollout coaching still blocks missing-path drift, PushPals/autonomy internals in user repos, and full render/full-surface harness expansion; this release only permits mock/harness terminology when the task explicitly requests that repair surface.
+- OpenAI Codex rollout coaching still blocks missing-path drift, PushPals/autonomy internals in user repos, broad shared mock expansion, and full render/full-surface harness expansion; this release permits narrow mock/harness terminology when a repo-native shell contract-test task is reusing existing infrastructure.
 - Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
 - Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
