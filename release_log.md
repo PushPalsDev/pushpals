@@ -2,26 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.1.75`
-- start_commit: `edb8c48dcab06d0dcbf0d96caea4fe74da445a2d`
-- end_commit: `c1ac6866227a4ebdd89242e2e590da4d4e251165`
+- version: `v1.1.76`
+- start_commit: `6f456af1781cd2f19220127611a696b241735572`
+- end_commit: `74ee9f24c1c38d19354e64eaef888319cd79c213`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Keep internal PushPals failure labels out of user-repo autonomy prompts by translating queue-health signal evidence into repo-neutral wording.
-- Classify QualityGate/ValidationGate failures as validation failures even when older no-publishable terminology appears in captured worker context.
-- Cap repeated ReviewAgent auto-fix loops at three attempts and close/delete the unresolved PR branch instead of spending more WorkerPal cycles on low-signal retries.
-- Package the WorkerPal sandbox and RemoteBuddy fallback updates so installed CLI workers receive the retry-loop, classification, and prompt-hygiene behavior.
-- Add regression coverage for internal-label prompt filtering, queue-health signal evidence, review-fix retry caps, and validation-first terminal classification.
+- Continue in-scope deterministic validation repair with a bounded dedicated budget when a WorkerPal has already produced publishable changes but the main execution budget is exhausted.
+- Require publishable changed files before starting the dedicated in-scope validation repair continuation, preventing artifact-only or empty validation failures from looping.
+- Keep browser validation repair and outside-scope repo validation repair precedence unchanged while giving fast `bun test`, typecheck, and lint failures a smaller focused recovery window.
+- Package the WorkerPal sandbox update so installed CLI workers receive the new in-scope validation continuation behavior.
+- Add regression coverage for the missing-export/typecheck failure class that previously stopped instead of attempting a focused repair pass.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
+- `bun test tests/workerpals.quality-gate-issues.test.ts`
+- `bun x tsc --noEmit --project apps/workerpals/tsconfig.json`
 - `bun run test:root`
-- `bun run test:prompt-policy`
-- `bun run test:protocol`
 - `git diff --check`
 
 ## Install
