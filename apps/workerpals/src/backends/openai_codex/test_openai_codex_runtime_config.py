@@ -2830,6 +2830,59 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(reason, "")
 
+    def test_offtrack_rollout_allows_repo_native_layout_autonomy_contract_test(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | The only current dirty file is _layout.autonomy.test.ts.",
+                "item.completed | I am going to inspect it before making the smallest shell assertion.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Remove the production-visible shell readiness marker. Start with "
+                "app/_layout.tsx and app/__tests__/opportunity-graph.contract.test.ts."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_allows_existing_harness_for_shell_contract_guard(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | There is already a comprehensive layout harness in _layout.autonomy.test.ts.",
+                "item.completed | The existing React Native mock already gives us host elements.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Implement a small regression contract guard for the web review shell "
+                "route-stack expectation."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_still_blocks_broad_mock_expansion_for_shell_contract_guard(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am adding a shared mock helper before the shell assertion.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Implement a small regression contract guard for the web review shell "
+                "route-stack expectation."
+            ),
+        )
+
+        self.assertIn("broad test-harness", reason)
+
     def test_offtrack_rollout_still_blocks_full_render_harness_when_mock_repair_requested(self) -> None:
         trace = {
             "summaries": [

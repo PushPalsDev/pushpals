@@ -1199,6 +1199,54 @@ def _task_explicitly_requests_mock_harness_repair(task_text: str) -> bool:
     )
 
 
+def _task_allows_repo_native_test_harness_reference(task_text: str) -> bool:
+    text = str(task_text or "").lower()
+    if not text:
+        return False
+    test_markers = (
+        "test",
+        "tests",
+        "contract",
+        "regression",
+        "coverage",
+        "assert",
+        "guard",
+    )
+    owner_markers = (
+        "app/_layout",
+        "_layout.autonomy",
+        "opportunity-graph.contract",
+        "web shell",
+        "shell review",
+        "route-stack",
+        "route stack",
+        "route shell",
+    )
+    return any(marker in text for marker in test_markers) and any(
+        marker in text for marker in owner_markers
+    )
+
+
+def _trace_mentions_existing_or_focused_harness_reference(text: str) -> bool:
+    if not text:
+        return False
+    markers = (
+        "existing react native mock",
+        "existing nearby",
+        "nearby layout test harness",
+        "stable _layout test harness",
+        "minimal module mock",
+        "already gives us host elements",
+        "already gets a react native mock",
+        "getanimatedmock",
+        "app/__tests__/_layout.autonomy.test",
+        "opportunity-graph.contract",
+        "narrow contract",
+        "focused contract",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _detect_offtrack_rollout(
     trace: Dict[str, Any],
     artifact_only_paths: str = "",
@@ -1209,43 +1257,39 @@ def _detect_offtrack_rollout(
         return f"only non-publishable artifact paths changed: {artifact_only_paths}"
     if not text:
         return ""
-    checks: List[Tuple[str, re.Pattern[str], bool]] = [
-        (
-            "the worker is spending time on missing hinted files or absent repo scaffolding",
-            re.compile(
-                r"(not present|not found|no existing|no .* directory|missing .* checkout|not listed in the checkout|checkout is much smaller|hinted .* absent)",
-                re.I,
-            ),
-            False,
-        ),
-        (
-            "the worker is drifting into full render or full-surface harness work",
-            re.compile(r"(full[- ]?(surface|render)|full component render)", re.I),
-            False,
-        ),
-        (
-            "the worker is drifting into broad test-harness or React Native mock repair",
-            re.compile(
-                r"(test harness repair|react native mock|broad .*mock|shared mock|adding .*mock helper)",
-                re.I,
-            ),
-            True,
-        ),
-        (
-            "the worker is about to add PushPals/autonomy internals to a user repo",
-            re.compile(
-                r"(_layout\.autonomy|queue_health|workerpal|remotebuddy|reviewagent|pushpals-internal|no autonomy module)",
-                re.I,
-            ),
-            False,
-        ),
-    ]
+    missing_or_absent_pattern = re.compile(
+        r"(not present|not found|no existing|no .* directory|missing .* checkout|not listed in the checkout|checkout is much smaller|hinted .* absent)",
+        re.I,
+    )
+    if missing_or_absent_pattern.search(text):
+        return "the worker is spending time on missing hinted files or absent repo scaffolding"
+
+    if re.search(r"(full[- ]?(surface|render)|full component render)", text, re.I):
+        return "the worker is drifting into full render or full-surface harness work"
+
     task_allows_mock_harness = _task_explicitly_requests_mock_harness_repair(task_text)
-    for reason, pattern, skip_when_mock_harness_requested in checks:
-        if skip_when_mock_harness_requested and task_allows_mock_harness:
-            continue
-        if pattern.search(text):
-            return reason
+    broad_mock_pattern = re.compile(r"(broad .*mock|shared mock|adding .*mock helper)", re.I)
+    if not task_allows_mock_harness and broad_mock_pattern.search(text):
+        return "the worker is drifting into broad test-harness or React Native mock repair"
+
+    soft_harness_pattern = re.compile(r"(test harness repair|react native mock)", re.I)
+    allows_existing_harness_reference = (
+        _task_allows_repo_native_test_harness_reference(task_text)
+        and _trace_mentions_existing_or_focused_harness_reference(text)
+    )
+    if (
+        not task_allows_mock_harness
+        and not allows_existing_harness_reference
+        and soft_harness_pattern.search(text)
+    ):
+        return "the worker is drifting into broad test-harness or React Native mock repair"
+
+    internal_leak_pattern = re.compile(
+        r"(queue_health|workerpal|remotebuddy|reviewagent|pushpals-internal|no autonomy module)",
+        re.I,
+    )
+    if internal_leak_pattern.search(text):
+        return "the worker is about to add PushPals/autonomy internals to a user repo"
     return ""
 
 
