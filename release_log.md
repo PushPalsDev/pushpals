@@ -2,27 +2,30 @@
 
 ## Release Metadata
 
-- version: `v1.1.77`
-- start_commit: `c063f3b3f7d498452815c728093d4b0e3d89b616`
-- end_commit: `e3eeedd525309d0dc1060331247aa72cc88b68c8`
+- version: `v1.1.78`
+- start_commit: `6c7ca57ecd2d026993ab482cc1d2fef0f8517f4e`
+- end_commit: `cd10e034ed9181a82350b89cdc58c9cbcbe008f7`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Permit repo-native `_layout.autonomy.test.ts` contract-test work without treating the file name as PushPals/autonomy internals leaking into a user repo.
-- Split broad/shared mock expansion from narrow references to existing React Native mock or layout harness infrastructure during shell contract-test jobs.
-- Keep rollout coaching strict for missing-path drift, full render/full-surface harness expansion, and genuinely broad shared mock work.
-- Package the WorkerPal sandbox update so installed CLI workers receive the corrected rollout-coach behavior.
-- Add source and packaged-runtime regression coverage for the SectorCommand shell contract-test failure shape.
+- Default LocalBuddy, RemoteBuddy, and WorkerPal OpenAI Codex execution to the explicit `gpt-5.6-sol` model at `xhigh` reasoning effort.
+- Migrate exact generated `gpt-5.4` and `gpt-5.5` defaults to `gpt-5.6-sol` while preserving custom model and reasoning-effort overrides.
+- Keep a one-time `gpt-5.5` fallback for RemoteBuddy and WorkerPal when an older Codex CLI reports model incompatibility.
+- Ship synchronized npm-package runtime, sandbox, configuration, and RemoteBuddy fallback assets with the upgraded model defaults.
+- Send an explicit `exit` command during packaged runtime-only E2E teardown so intentional stdin-EOF survival cannot leave orphaned Windows processes or hang the suite.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `python -m unittest apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config`
-- `python -m unittest packages.cli.runtime.sandbox.apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_offtrack_rollout_allows_repo_native_layout_autonomy_contract_test packages.cli.runtime.sandbox.apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_offtrack_rollout_allows_existing_harness_for_shell_contract_guard packages.cli.runtime.sandbox.apps.workerpals.src.backends.openai_codex.test_openai_codex_runtime_config.OpenAICodexRuntimeConfigTests.test_offtrack_rollout_still_blocks_broad_mock_expansion_for_shell_contract_guard`
-- `bun test tests/workerpals.quality-gate-issues.test.ts`
+- `bun test tests/shared.config.workerpals-quality-threshold.test.ts tests/remotebuddy.llm-codex.test.ts tests/remotebuddy.autonomous-engine.tick.test.ts tests/server.job-diagnostics.test.ts tests/server.tool-runs.test.ts tests/shared.tooling.test.ts`
+- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
+- `bun test tests/cli.runtime-bootstrap.test.ts`
+- `bun run test:cli:integration`
+- `bun run test:cli:e2e`
 - `bun run test:root`
+- `codex exec --model gpt-5.6-sol --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"`
 - `git diff --check`
 
 ## Install
@@ -64,7 +67,7 @@ bun install -g @pushpalsdev/cli
 - OpenAI Codex WorkerPal jobs still fail fast on truly broad/noisy publishable diffs after timeout; tracked paths with no staged or unstaged Git content delta are now filtered before ScopeGate and quality diagnostics.
 - OpenAI Codex rollout coaching still blocks missing-path drift, PushPals/autonomy internals in user repos, broad shared mock expansion, and full render/full-surface harness expansion; this release permits narrow mock/harness terminology when a repo-native shell contract-test task is reusing existing infrastructure.
 - Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
-- Codex `gpt-5.5` requires a recent Codex CLI; older Codex CLIs fall back to `gpt-5.4` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
+- Codex `gpt-5.6-sol` requires Codex CLI `0.144.1` or another compatible version; older Codex CLIs fall back once to `gpt-5.5` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
 - User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --open_config`, `pushpals --clear`, or remove the local override to pick up new packaged defaults.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
