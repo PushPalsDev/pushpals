@@ -44,8 +44,8 @@ from executor_base import (
 )
 
 LOG_PREFIX = "[OpenAICodexExecutor]"
-DEFAULT_CODEX_MODEL = "gpt-5.5"
-LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.4"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.5"
 _ACTIVE_CHILD: Optional[subprocess.Popen[str]] = None
 _INTERRUPTED_SIGNAL: Optional[int] = None
 log = Logger(LOG_PREFIX)

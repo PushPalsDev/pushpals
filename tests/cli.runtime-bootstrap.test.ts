@@ -1931,7 +1931,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
-  test("prepareCliRuntime migrates stale embedded Codex defaults to gpt-5.5 xhigh", async () => {
+  test("prepareCliRuntime migrates stale embedded Codex defaults to gpt-5.6 Sol xhigh", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-default-migrate-"));
     const repoRoot = join(root, "repo");
     const runtimeRoot = join(root, "runtime");
@@ -1944,13 +1944,13 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         [
           "[localbuddy.llm]",
           'backend = "openai_codex"',
-          'model = "gpt-5.4"',
-          'reasoning_effort = "high"',
+          'model = "gpt-5.5"',
+          'reasoning_effort = "xhigh"',
           "",
           "[remotebuddy.llm]",
           'backend = "openai_codex"',
-          'model = "gpt-5.4"',
-          'reasoning_effort = "high"',
+          'model = "gpt-5.5"',
+          'reasoning_effort = "xhigh"',
           "",
           "[workerpals.llm]",
           'backend = "openai_codex"',
@@ -1971,15 +1971,16 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
       const migratedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
       expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
-      expect(prepared.runtimePreflight.config?.localbuddy.llm.model).toBe("gpt-5.5");
-      expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe("gpt-5.5");
-      expect(prepared.runtimePreflight.config?.workerpals.llm.model).toBe("gpt-5.5");
+      expect(prepared.runtimePreflight.config?.localbuddy.llm.model).toBe("gpt-5.6-sol");
+      expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe("gpt-5.6-sol");
+      expect(prepared.runtimePreflight.config?.workerpals.llm.model).toBe("gpt-5.6-sol");
       expect(prepared.runtimePreflight.config?.localbuddy.llm.reasoningEffort).toBe("xhigh");
       expect(prepared.runtimePreflight.config?.remotebuddy.llm.reasoningEffort).toBe("xhigh");
       expect(prepared.runtimePreflight.config?.workerpals.llm.reasoningEffort).toBe("xhigh");
-      expect(migratedLocalToml).toContain('model = "gpt-5.5"');
+      expect(migratedLocalToml).toContain('model = "gpt-5.6-sol"');
       expect(migratedLocalToml).toContain('reasoning_effort = "xhigh"');
       expect(migratedLocalToml).not.toContain("gpt-5.4");
+      expect(migratedLocalToml).not.toContain('model = "gpt-5.5"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

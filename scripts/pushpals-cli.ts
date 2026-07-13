@@ -1626,7 +1626,10 @@ function migrateLegacyOpenAICodexDefaults(sectionBody: string, opts: { includeMo
 
   let updated = sectionBody;
   if (opts.includeModel) {
-    updated = updated.replace(/^(\s*model\s*=\s*)"gpt-5\.4"\s*$/m, '$1"gpt-5.5"');
+    updated = updated.replace(
+      /^(\s*model\s*=\s*)"gpt-5\.(?:4|5)"\s*$/m,
+      '$1"gpt-5.6-sol"',
+    );
   }
   updated = updated.replace(/^(\s*reasoning_effort\s*=\s*)"high"\s*$/m, '$1"xhigh"');
   return updated;

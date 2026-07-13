@@ -1,8 +1,7 @@
 # AI Model Upgrade Playbook
 
 Use this when upgrading PushPals to a newer AI model, for example moving Codex from
-`gpt-5.4` to `gpt-5.5` and changing the default reasoning effort from `high` to
-`xhigh`.
+`gpt-5.5` to `gpt-5.6-sol` while retaining the default `xhigh` reasoning effort.
 
 The main lesson from the `gpt-5.4` -> `gpt-5.5` upgrade: changing source defaults is
 not enough. PushPals has source defaults, packaged runtime copies, WorkerPal sandbox
@@ -24,7 +23,7 @@ change, not a string replacement.
 
 ```powershell
 codex --version
-codex exec --model gpt-5.5 --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
+codex exec --model gpt-5.6-sol --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
 ```
 
 2. Check the launcher form used by PushPals.
@@ -36,7 +35,7 @@ bun x --yes @openai/codex --version
 3. Search all active defaults and packaged copies.
 
 ```powershell
-rg -n "gpt-5\.4|gpt-5\.5|reasoning_effort|reasoningEffort|DEFAULT.*CODEX|model_reasoning_effort" configs packages apps tests scripts --glob "!**/node_modules/**" --glob "!packages/cli/monitor-ui/**"
+rg -n "gpt-5\.4|gpt-5\.5|gpt-5\.6-sol|reasoning_effort|reasoningEffort|DEFAULT.*CODEX|model_reasoning_effort" configs packages apps tests scripts --glob "!**/node_modules/**" --glob "!packages/cli/monitor-ui/**"
 ```
 
 If `codex` is new enough but `bun x --yes @openai/codex` resolves an older CLI, fix
@@ -67,8 +66,8 @@ Update these first:
 - `apps/workerpals/src/execute_job.ts`
   - Codex reasoning effort normalization for WorkerPal task execution and critic
 
-Keep fallback behavior explicit. For the 5.5 upgrade, older Codex CLIs could reject
-`gpt-5.5`, so the WorkerPal backend kept a one-time fallback to `gpt-5.4`.
+Keep fallback behavior explicit. For the 5.6 Sol upgrade, older Codex CLIs can reject
+`gpt-5.6-sol`, so the Codex backends keep a one-time fallback to `gpt-5.5`.
 
 ## Config Templates And Packaged Runtime Copies
 
@@ -108,14 +107,14 @@ C:\Users\<user>\.pushpals\runtime\configs\local.toml
 ```
 
 or the equivalent configured runtime root. This file can override new release
-defaults. During the 5.5 upgrade, a stale April `local.toml` still pinned:
+defaults. During the 5.6 Sol upgrade, a stale `local.toml` can still pin:
 
 ```toml
-model = "gpt-5.4"
-reasoning_effort = "high"
+model = "gpt-5.5"
+reasoning_effort = "xhigh"
 ```
 
-even though v1.0.76 source defaults were already `gpt-5.5` and `xhigh`.
+even though source defaults are already `gpt-5.6-sol` and `xhigh`.
 
 For model upgrades, add or update a migration in `scripts/pushpals-cli.ts` near
 `migrateEmbeddedRuntimeLocalToml`.
@@ -170,7 +169,7 @@ bun run test:cli:e2e
 Run the live Codex smoke with the exact model and reasoning config:
 
 ```powershell
-codex exec --model gpt-5.5 --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
+codex exec --model gpt-5.6-sol --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
 ```
 
 When diagnosing a real user runtime, inspect the bootstrap log:
@@ -232,15 +231,15 @@ npm view @pushpalsdev/cli@X.Y.Z version
 - E2E passes on source but installed-package smoke fails because the packaged payload
   differs from the repo root.
 
-## Quick Example: Codex 5.4 To 5.5
+## Quick Example: Codex 5.5 To 5.6 Sol
 
 Minimum expected final state:
 
-- All OpenAI Codex service defaults resolve `model = "gpt-5.5"`.
+- All OpenAI Codex service defaults resolve `model = "gpt-5.6-sol"`.
 - All OpenAI Codex service defaults resolve `reasoning_effort = "xhigh"`.
-- WorkerPal backend can fall back to `gpt-5.4` only when an old Codex CLI rejects
+- Codex backends can fall back to `gpt-5.5` only when an old Codex CLI rejects
   the default model.
-- Existing generated `runtime/configs/local.toml` files migrate exact legacy
-  `gpt-5.4`/`high` defaults to `gpt-5.5`/`xhigh`.
+- Existing generated `runtime/configs/local.toml` files migrate exact legacy model
+  defaults (`gpt-5.4` or `gpt-5.5`) to `gpt-5.6-sol` and exact `high` effort to `xhigh`.
 - Custom user overrides are not overwritten.
 - `bun run test:cli:e2e` and the release installed-package smokes pass.

@@ -40,7 +40,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
     }
   });
 
-  test("defaults openai_codex LLM services to gpt-5.5 with extra-high reasoning", () => {
+  test("defaults openai_codex LLM services to gpt-5.6 Sol with extra-high reasoning", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-"));
     const configDir = join(root, "configs");
     mkdirSync(configDir, { recursive: true });
@@ -65,9 +65,9 @@ describe("shared config workerpals quality critic threshold parsing", () => {
 
     try {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
-      expect(cfg.localbuddy.llm.model).toBe("gpt-5.5");
-      expect(cfg.remotebuddy.llm.model).toBe("gpt-5.5");
-      expect(cfg.workerpals.llm.model).toBe("gpt-5.5");
+      expect(cfg.localbuddy.llm.model).toBe("gpt-5.6-sol");
+      expect(cfg.remotebuddy.llm.model).toBe("gpt-5.6-sol");
+      expect(cfg.workerpals.llm.model).toBe("gpt-5.6-sol");
       expect(cfg.localbuddy.llm.reasoningEffort).toBe("xhigh");
       expect(cfg.remotebuddy.llm.reasoningEffort).toBe("xhigh");
       expect(cfg.workerpals.llm.reasoningEffort).toBe("xhigh");
@@ -92,7 +92,7 @@ describe("shared config workerpals quality critic threshold parsing", () => {
       const cfg = loadPushPalsConfig({ projectRoot: root, reload: true });
       expect(cfg.profile).toBe("dev");
       expect(cfg.workerpals.llm.backend).toBe("openai_codex");
-      expect(cfg.workerpals.llm.model).toBe("gpt-5.5");
+      expect(cfg.workerpals.llm.model).toBe("gpt-5.6-sol");
       expect(cfg.workerpals.llm.reasoningEffort).toBe("xhigh");
     } finally {
       rmSync(root, { recursive: true, force: true });

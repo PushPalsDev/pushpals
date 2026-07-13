@@ -34,8 +34,8 @@ const outputFlag = args.indexOf("--output-last-message");
 const outputPath = outputFlag >= 0 ? args[outputFlag + 1] ?? "" : "";
 await Bun.stdin.text();
 
-if (model === "gpt-5.5") {
-  console.error("ERROR: {\\"detail\\":\\"The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\\"}");
+if (model === "gpt-5.6-sol") {
+  console.error("ERROR: {\\"detail\\":\\"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\\"}");
   process.exit(1);
 }
 
@@ -90,13 +90,13 @@ describe("RemoteBuddy OpenAI Codex CLI client", () => {
     ).toEqual(["C:/tools/bun/bin/bun.exe", "x", "--yes", "@openai/codex"]);
   });
 
-  test("retries default gpt-5.5 requests with the legacy model when Codex is too old", async () => {
+  test("retries default gpt-5.6 Sol requests with the legacy model when Codex is too old", async () => {
     const scriptPath = createFakeCodexScript();
     const usageEvents: Array<{ modelId?: string | null }> = [];
     const client = new OpenAiCodexCliClient({
       service: "remotebuddy",
       sessionId: "test-session",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       codexAuthMode: "chatgpt",
       codexBin: `${quoteArg(process.execPath)} ${quoteArg(scriptPath)}`,
       reasoningEffort: "xhigh",
@@ -113,8 +113,8 @@ describe("RemoteBuddy OpenAI Codex CLI client", () => {
       maxTokens: 64,
     });
 
-    expect(output.text).toBe("fallback:gpt-5.4");
+    expect(output.text).toBe("fallback:gpt-5.5");
     expect(usageEvents).toHaveLength(1);
-    expect(usageEvents[0]?.modelId).toBe("gpt-5.4");
+    expect(usageEvents[0]?.modelId).toBe("gpt-5.5");
   });
 });

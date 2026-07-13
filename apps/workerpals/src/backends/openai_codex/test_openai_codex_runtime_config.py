@@ -175,7 +175,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             finally:
                 _restore_repo_local_codex_files(masked)
 
-    def test_reasoning_effort_defaults_to_extra_high_for_default_gpt_5_5(self) -> None:
+    def test_reasoning_effort_defaults_to_extra_high_for_default_gpt_5_6_sol(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
             SettingsResolver(env={}, config_loader=lambda: {}),
         )
@@ -318,7 +318,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
         self.assertEqual(_resolve_reasoning_effort(cfg, model="gpt-5.4"), "high")
 
-    def test_reasoning_effort_preserves_extra_high_for_default_gpt_5_5(self) -> None:
+    def test_reasoning_effort_preserves_extra_high_for_default_gpt_5_6_sol(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
             SettingsResolver(
                 env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "extra high"},
@@ -343,13 +343,13 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             "- Route-entry/shell task rule: inspect the hinted route wrapper, then patch the owner.\n"
         )
 
-        self.assertEqual(_resolve_task_reasoning_effort("xhigh", prompt, "gpt-5.5"), "high")
-        self.assertEqual(_resolve_task_reasoning_effort("high", prompt, "gpt-5.5"), "high")
+        self.assertEqual(_resolve_task_reasoning_effort("xhigh", prompt, "gpt-5.6-sol"), "high")
+        self.assertEqual(_resolve_task_reasoning_effort("high", prompt, "gpt-5.6-sol"), "high")
         self.assertEqual(
             _resolve_task_reasoning_effort(
                 "xhigh",
                 "Merge-conflict rebase task with risk=low wording in reviewer text.",
-                "gpt-5.5",
+                "gpt-5.6-sol",
             ),
             "xhigh",
         )
@@ -1317,7 +1317,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "        break",
                         "",
                         "prompt = sys.stdin.read()",
-                        "if 'Codex startup-stall recovery' in prompt and model == 'gpt-5.4':",
+                        "if 'Codex startup-stall recovery' in prompt and model == 'gpt-5.5':",
                         "    Path('src').mkdir(exist_ok=True)",
                         "    Path('src/startup-stall-recovered.txt').write_text('patched after restart\\n', encoding='utf-8')",
                         "    if last_message_path:",
@@ -1476,7 +1476,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "prompt = sys.stdin.read()",
                         "has_no_edit_recovery = 'No-edit watchdog recovery' in prompt",
                         "has_startup_recovery = 'Codex startup-stall recovery' in prompt",
-                        "if has_no_edit_recovery and has_startup_recovery and model != 'gpt-5.4':",
+                        "if has_no_edit_recovery and has_startup_recovery and model != 'gpt-5.5':",
                         "    Path('src').mkdir(exist_ok=True)",
                         "    Path('src/no-edit-startup-stall-recovered.txt').write_text('patched after same-model restart\\n', encoding='utf-8')",
                         "    if last_message_path:",
@@ -3623,11 +3623,11 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "    if arg == '--output-last-message' and index + 1 < len(argv):",
                         "        last_message_path = argv[index + 1]",
                         "",
-                        "if model == 'gpt-5.5':",
-                        "    print(\"ERROR: {'detail': \\\"The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\\\"}\", file=sys.stderr)",
+                        "if model == 'gpt-5.6-sol':",
+                        "    print(\"ERROR: {'detail': \\\"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\\\"}\", file=sys.stderr)",
                         "    sys.exit(1)",
                         "",
-                        "if model == 'gpt-5.4':",
+                        "if model == 'gpt-5.5':",
                         "    if last_message_path:",
                         "        Path(last_message_path).write_text('Recovered on legacy model fallback.', encoding='utf-8')",
                         "    print('item.completed | Used legacy model fallback.', flush=True)",
@@ -3656,8 +3656,8 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertTrue(result.get("ok"), result)
         stdout = str(result.get("stdout") or "")
-        self.assertIn("rejected default model gpt-5.5", stdout.lower())
-        self.assertIn("gpt-5.4", stdout)
+        self.assertIn("rejected default model gpt-5.6-sol", stdout.lower())
+        self.assertIn("gpt-5.5", stdout)
         self.assertIn("Recovered on legacy model fallback.", stdout)
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:

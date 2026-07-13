@@ -931,6 +931,7 @@ describe("packaged CLI end-to-end", () => {
         expect(combined).not.toContain("[pushpals] Auto-start failed:");
         expect(combined).not.toContain("[pushpals] Fatal:");
 
+        runtimeProc.stdin.write("exit\n");
         runtimeProc.stdin.end();
         await Promise.all([
           runtimeStdoutCapture.promise,
@@ -1529,6 +1530,7 @@ describe("packaged CLI end-to-end", () => {
         expect(combined).toContain("[pushpals] workerExecution=");
         expect(combined).not.toContain("[pushpals] Fatal:");
 
+        runtimeProc.stdin.write("exit\n");
         runtimeProc.stdin.end();
         await Promise.all([
           runtimeStdoutCapture.promise,

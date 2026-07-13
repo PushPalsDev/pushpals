@@ -59,7 +59,7 @@ describe("shared tool failure classification", () => {
       classifyToolFailure({
         tool: "codex",
         stderr:
-          "The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.",
+          "The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.",
         exitCode: 1,
       }),
     ).toEqual({
