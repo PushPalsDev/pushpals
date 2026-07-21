@@ -2,17 +2,16 @@
 
 ## Release Metadata
 
-- version: `v1.1.85`
-- start_commit: `56ef1b14043d7e75e31888b342f8ea21022c5614`
-- end_commit: `779d5fc7c4283d66387f541270918bfc10a91790`
+- version: `v1.1.86`
+- start_commit: `be693552fd411f242463c73f8618c255c888f177`
+- end_commit: `34b481aa75cc5606f102f820eebef0248353f73b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Detect browser work nested inside aggregate package scripts such as `bun run validate`, including JavaScript validation runners that invoke `web:e2e` later in the chain.
-- Replace linked worktree `node_modules` with a lockfile-frozen local Bun install before nested Expo Router browser validation, preventing Metro from resolving the empty-route onboarding shell instead of the user's app.
-- Apply browser runtime preparation, transient retry, repair diagnostics, and long-validation deferral consistently to both direct and aggregate browser commands.
-- Prefer the terminal web-smoke failure over an earlier failed optional browser-channel probe, so repair agents receive the actionable route or assertion error rather than a misleading missing-Edge message.
+- Size Bun dependency-layout repair timeouts from the longest required validation command instead of applying the ordinary fast-step timeout to every repair.
+- Give dependency repair for direct or aggregate browser validation the same 10-minute ceiling as the browser command, so a slow Windows-mounted offline install is not terminated seconds before completion.
+- Keep non-browser dependency preflights on their configured validation timeout while retaining a bounded repair ceiling for stalled installs.
 
 ## Validation
 
@@ -23,7 +22,7 @@
 - `bun run test`: 931 passed, 1 Windows signal-handling skip, 0 failed, plus prompt-policy and protocol integration.
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `bun x tsc --noEmit -p packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
-- A live v1.1.84 SectorCommand job reproduced the aggregate-only gap: 724 unit tests, 27 Worker tests, both typecheck layers, lint, and the Worker deploy dry-run passed, while Expo Router rendered its empty-route onboarding page from the linked worktree dependency layout. The prior release reported the earlier optional Edge probe instead of that terminal route-startup failure.
+- A live v1.1.85 SectorCommand job exercised the new aggregate preflight and showed its offline install needed 182,023ms on the Windows-mounted worktree; the prior 180,000ms limit correctly blocked the incomplete tree but was too short for this valid repair.
 - `git diff --check`
 
 ## Install
