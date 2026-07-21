@@ -2826,23 +2826,37 @@ export function classifyValidationFailureScope(
   return "outside_task_scope";
 }
 
-function detectValidationBlocker(runs: ValidationExecutionResult[]): ValidationBlocker | null {
-  const combined = runs
+export function detectValidationBlocker(
+  runs: ValidationExecutionResult[],
+): ValidationBlocker | null {
+  const failedRuns = runs.filter((run) => !run.ok);
+  if (failedRuns.length === 0) return null;
+
+  const combined = failedRuns
     .flatMap((run) => [run.stdout, run.stderr])
     .filter(Boolean)
     .join("\n")
     .toLowerCase();
   if (!combined) return null;
 
+  const browserFallbackSucceeded =
+    combined.includes("using google chrome for browser automation") ||
+    combined.includes("using chromium for browser automation") ||
+    combined.includes("using firefox for browser automation") ||
+    combined.includes("using webkit for browser automation");
+  const hasMissingBrowserRuntime =
+    !browserFallbackSucceeded &&
+    (combined.includes("browser runtime preflight failed") ||
+      combined.includes("playwright install") ||
+      combined.includes("executable doesn't exist") ||
+      combined.includes("please run the following command to download new browsers"));
+
   if (
     combined.includes("validation skipped before execution because required tool") ||
     combined.includes("missing required tool") ||
     combined.includes("command not found") ||
     combined.includes("executable not found") ||
-    combined.includes("browser runtime preflight failed") ||
-    combined.includes("playwright install") ||
-    combined.includes("executable doesn't exist") ||
-    combined.includes("please run the following command to download new browsers") ||
+    hasMissingBrowserRuntime ||
     combined.includes("not recognized as an internal or external command")
   ) {
     return {

@@ -9,6 +9,7 @@ import {
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
   buildTaskFailureJobFamily,
+  detectValidationBlocker,
   expandKnownArtifactDirectoryPaths,
   extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
@@ -1184,6 +1185,65 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toBe(false);
 
     expect(isBrowserValidationInfrastructureDigest("ERR_SOCKET_BAD_PORT at port 65536")).toBe(true);
+  });
+
+  test("does not infer blockers from successful validation fallback output", () => {
+    expect(
+      detectValidationBlocker([
+        {
+          step: "bun run validate",
+          command: "bun run validate",
+          ok: true,
+          exitCode: 0,
+          elapsedMs: 264_168,
+          stdout: [
+            "Browser launch failed for Microsoft Edge: Chromium distribution 'msedge' is not found",
+            'Run "npx playwright install msedge"',
+            "Using Google Chrome for browser automation.",
+            "Web end-to-end smoke test completed successfully.",
+            "Publish readiness validation completed successfully.",
+          ].join("\n"),
+          stderr: "",
+        },
+      ]),
+    ).toBeNull();
+  });
+
+  test("does not treat an optional browser fallback as the cause of a later failure", () => {
+    expect(
+      detectValidationBlocker([
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          elapsedMs: 90_000,
+          stdout: [
+            "Browser launch failed for Microsoft Edge: Chromium distribution 'msedge' is not found",
+            'Run "npx playwright install msedge"',
+            "Using Google Chrome for browser automation.",
+          ].join("\n"),
+          stderr: "Expected battlefield readability cue to remain visible.",
+        },
+      ]),
+    ).toBeNull();
+  });
+
+  test("still detects a missing browser when no fallback succeeds", () => {
+    expect(
+      detectValidationBlocker([
+        {
+          step: "bun run web:e2e",
+          command: "bun run web:e2e",
+          ok: false,
+          exitCode: 1,
+          elapsedMs: 2_000,
+          stdout: "",
+          stderr:
+            'Browser launch failed. Run "npx playwright install chromium" to download new browsers.',
+        },
+      ]),
+    ).toMatchObject({ category: "environment" });
   });
 
   test("retries route startup browser smoke failures once", () => {
