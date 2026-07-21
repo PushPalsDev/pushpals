@@ -38,6 +38,7 @@ import {
   sanitizeTaskExecutePlanningPathHints,
   shouldEnsurePlaywrightBrowserRuntime,
   shouldDeferLongValidationAfterFastFailures,
+  shouldRetryBrowserValidationRunOnce,
   tokenizeValidationCommandArgv,
   validationCommandIncludesLongRunningBrowserWork,
   validationCommandIncludesTestWork,
@@ -581,6 +582,22 @@ describe("workerpals validation command safety", () => {
     ).toBe(
       "browserType.launch: Executable doesn't exist at /tmp/cache/ms-playwright/chromium/chrome",
     );
+
+    expect(
+      extractValidationFailureDigest({
+        command: "bun run validate",
+        step: "bun run validate",
+        ok: false,
+        exitCode: 1,
+        stdout: [
+          "Browser launch failed for Microsoft Edge: browserType.launch: Chromium distribution 'msedge' is not found",
+          "Using Google Chrome for browser automation.",
+          "Web end-to-end smoke test failed: Route/startup smoke failure (route/startup)",
+        ].join("\n"),
+        stderr: "",
+        elapsedMs: 200_000,
+      }),
+    ).toBe("Web end-to-end smoke test failed: Route/startup smoke failure (route/startup)");
   });
 
   test("classifies validation failures outside the task target/relevance hints", () => {
@@ -758,6 +775,7 @@ describe("workerpals validation command safety", () => {
             "validate:publish": "node ./scripts/validate-publish-readiness.js",
             lint: "eslint .",
           },
+          devDependencies: { playwright: "1.0.0" },
         }),
       );
       writeFileSync(
@@ -767,8 +785,24 @@ describe("workerpals validation command safety", () => {
 
       expect(validationCommandIncludesLongRunningBrowserWork(repo, "bun run validate")).toBe(true);
       expect(validationCommandIncludesLongRunningBrowserWork(repo, "bun run lint")).toBe(false);
+      expect(shouldEnsurePlaywrightBrowserRuntime(repo, "bun run validate")).toBe(true);
       expect(resolveValidationCommandTimeoutMs("bun run validate", 180_000, repo)).toBe(600_000);
       expect(resolveValidationCommandTimeoutMs("bun run lint", 180_000, repo)).toBe(180_000);
+
+      expect(
+        shouldRetryBrowserValidationRunOnce(
+          {
+            step: "bun run validate",
+            command: "bun run validate",
+            ok: false,
+            exitCode: 1,
+            elapsedMs: 200_000,
+            stdout: "",
+            stderr: "Web end-to-end smoke test failed: Route/startup smoke failure (route/startup)",
+          },
+          repo,
+        ),
+      ).toBe(true);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -1057,6 +1091,32 @@ describe("workerpals validation command safety", () => {
       ]);
       expect(browserPlan?.reason).toContain("node_modules is linked");
       expect(browserPlan?.removeLinkedNodeModules).toBe(true);
+
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify(
+          {
+            scripts: {
+              validate: "node scripts/validate-publish-readiness.js",
+              "web:e2e": "node scripts/test-web-e2e.js",
+            },
+            dependencies: { expo: "1.0.0", "expo-router": "1.0.0" },
+            devDependencies: { playwright: "1.0.0", typescript: "1.0.0" },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      mkdirSync(join(root, "scripts"), { recursive: true });
+      writeFileSync(
+        join(root, "scripts", "validate-publish-readiness.js"),
+        "await Bun.$`bun run web:e2e`;\n",
+        "utf8",
+      );
+      expect(
+        resolveBunDependencyLayoutPreflight(root, ["bun run validate"])?.removeLinkedNodeModules,
+      ).toBe(true);
 
       expect(resolveBunDependencyLayoutPreflight(root, ["bun test"])).toBeNull();
     } finally {

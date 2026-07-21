@@ -1959,8 +1959,14 @@ function isDeterministicFastValidationFailure(run: ValidationExecutionResult): b
 export function shouldDeferLongValidationAfterFastFailures(
   command: string,
   previousRuns: ValidationExecutionResult[],
+  repo?: string,
 ): string | null {
-  if (!isLongRunningBrowserValidationCommand(command)) return null;
+  if (
+    !isLongRunningBrowserValidationCommand(command) &&
+    !(repo && validationCommandIncludesLongRunningBrowserWork(repo, command))
+  ) {
+    return null;
+  }
   const deterministicFailures = previousRuns.filter(isDeterministicFastValidationFailure);
   if (deterministicFailures.length === 0) return null;
   const first = deterministicFailures[0];
@@ -2093,7 +2099,7 @@ function readReferencedValidationScriptText(cwd: string, script: string): string
 }
 
 export function shouldEnsurePlaywrightBrowserRuntime(repo: string, command: string): boolean {
-  if (!isLongRunningBrowserValidationCommand(command)) return false;
+  if (!validationCommandIncludesLongRunningBrowserWork(repo, command)) return false;
   if (/\bplaywright\b/i.test(command)) return true;
 
   const script = resolvePackageScriptForValidationCommand(repo, command);
@@ -2389,12 +2395,15 @@ function isLinkedNodeModulesDependencyArtifact(repo: string): boolean {
 }
 
 function validationNeedsExpoRouterBrowserLocalInstall(
+  repo: string,
   packageJson: Record<string, unknown>,
   validationCommands: string[],
 ): boolean {
   return (
     packageJsonDeclaresDependency(packageJson, "expo-router") &&
-    validationCommands.some((command) => isLongRunningBrowserValidationCommand(command))
+    validationCommands.some((command) =>
+      validationCommandIncludesLongRunningBrowserWork(repo, command),
+    )
   );
 }
 
@@ -2455,7 +2464,7 @@ export function resolveBunDependencyLayoutPreflight(
 
   if (
     isLinkedNodeModulesDependencyArtifact(repo) &&
-    validationNeedsExpoRouterBrowserLocalInstall(packageJson, validationCommands)
+    validationNeedsExpoRouterBrowserLocalInstall(repo, packageJson, validationCommands)
   ) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
@@ -3223,8 +3232,8 @@ export function extractValidationFailureDigest(run: {
     /\bFailed to resolve import\s+['"`][^'"`\r\n]+['"`][^\r\n]*/i,
     /\bCould not resolve\s+['"`]?[^'"`\r\n]+['"`]?[^\r\n]*/i,
     /\bModule not found[^\r\n]*/i,
-    /\bbrowserType\.launch:[^\r\n]*/i,
     /\bWeb end-to-end smoke test failed:[^\r\n]*/i,
+    /\bbrowserType\.launch:[^\r\n]*/i,
     /\blocator\.[a-z0-9_]+:\s+Timeout\s+\d+ms\s+exceeded[^\r\n]*/i,
     /\bpage\.[a-z0-9_]+:\s+Timeout\s+\d+ms\s+exceeded[^\r\n]*/i,
     /\bTimeout\s+\d+ms\s+exceeded[^\r\n]*/i,
@@ -3284,8 +3293,17 @@ function classifyBrowserValidationFailureKindFromText(text: string): BrowserVali
   return "unknown";
 }
 
-export function shouldRetryBrowserValidationRunOnce(run: ValidationExecutionResult): boolean {
-  if (run.ok || !isLongRunningBrowserValidationCommand(run.command)) return false;
+export function shouldRetryBrowserValidationRunOnce(
+  run: ValidationExecutionResult,
+  repo?: string,
+): boolean {
+  if (
+    run.ok ||
+    (!isLongRunningBrowserValidationCommand(run.command) &&
+      !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command)))
+  ) {
+    return false;
+  }
   const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
   const digest = extractValidationFailureDigest(run);
   const failureKind = classifyBrowserValidationFailureKindFromText(`${digest}\n${combined}`);
@@ -4044,7 +4062,12 @@ export function extractValidationFailureRetryDigest(
   repo?: string,
 ): string {
   const baseDigest = extractValidationFailureDigest(run);
-  if (!isLongRunningBrowserValidationCommand(run.command)) return baseDigest;
+  if (
+    !isLongRunningBrowserValidationCommand(run.command) &&
+    !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command))
+  ) {
+    return baseDigest;
+  }
   const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
   const failureKind = classifyBrowserValidationFailureKindFromText(`${baseDigest}\n${combined}`);
   if (failureKind !== "assertion") return baseDigest;
@@ -4079,7 +4102,13 @@ export function buildBrowserValidationRepairPacket(
   knownFailureHints: string[] = [],
 ): BrowserValidationRepairPacket | null {
   for (const run of validationRuns) {
-    if (run.ok || !isLongRunningBrowserValidationCommand(run.command)) continue;
+    if (
+      run.ok ||
+      (!isLongRunningBrowserValidationCommand(run.command) &&
+        !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command)))
+    ) {
+      continue;
+    }
     const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
     const baseDigest = extractValidationFailureDigest(run);
     const failureKind = classifyBrowserValidationFailureKindFromText(`${baseDigest}\n${combined}`);
@@ -4914,6 +4943,7 @@ async function runDeterministicQualityGate(
           const deferredReason = shouldDeferLongValidationAfterFastFailures(
             command,
             validationRuns,
+            repo,
           );
           if (deferredReason) {
             const stderr =
@@ -4991,7 +5021,7 @@ async function runDeterministicQualityGate(
           if (
             previousDigest &&
             Number(validationRetryState?.revisionAttempt ?? 0) > 0 &&
-            isLongRunningBrowserValidationCommand(command) &&
+            validationCommandIncludesLongRunningBrowserWork(repo, command) &&
             isBrowserValidationInfrastructureDigest(previousDigest) &&
             !commandBrowserRuntimeEnsured
           ) {
@@ -5021,7 +5051,7 @@ async function runDeterministicQualityGate(
             outputPolicy,
           );
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
-          const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run);
+          const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run, repo);
           const retryPassingVitestTeardown = shouldRetryPassingVitestTeardownOnce(run);
           if (retryBrowserValidation || retryPassingVitestTeardown) {
             onLog?.(
