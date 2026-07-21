@@ -3331,6 +3331,23 @@ export function shouldRetryBrowserValidationRunOnce(
   );
 }
 
+export function shouldRetryAggregateWorkerValidationRunOnce(
+  run: ValidationExecutionResult,
+  repo?: string,
+): boolean {
+  if (run.ok || !repo || !validationCommandIncludesLongRunningBrowserWork(repo, run.command)) {
+    return false;
+  }
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  if (/\berror:\s*script\s+["'`]test:worker["'`]\s+exited with code\s+1\b/i.test(combined)) {
+    return true;
+  }
+  return (
+    /\bError:\s*Test timed out in \d+ms\b/i.test(combined) &&
+    /\b(?:Worker tests|test:worker|cloudflare\/test)\b/i.test(combined)
+  );
+}
+
 export function shouldRetryPassingVitestTeardownOnce(run: ValidationExecutionResult): boolean {
   if (run.ok) return false;
   const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
@@ -5069,23 +5086,54 @@ async function runDeterministicQualityGate(
           );
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
           const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run, repo);
+          const retryAggregateWorkerValidation = shouldRetryAggregateWorkerValidationRunOnce(
+            run,
+            repo,
+          );
           const retryPassingVitestTeardown = shouldRetryPassingVitestTeardownOnce(run);
-          if (retryBrowserValidation || retryPassingVitestTeardown) {
+          if (
+            retryBrowserValidation ||
+            retryAggregateWorkerValidation ||
+            retryPassingVitestTeardown
+          ) {
             onLog?.(
               "stderr",
               retryPassingVitestTeardown
                 ? `[ValidationGate] Retrying validation once after all Vitest assertions passed but worker teardown failed: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`
-                : `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+                : retryAggregateWorkerValidation
+                  ? `[ValidationGate] Retrying aggregate validation once after its nested Worker test failed during cold sandbox startup: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`
+                  : `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
             );
-            const retryRun = await runValidationCommand(
+            let retryRun = await runValidationCommand(
               repo,
               command,
               resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
               outputPolicy,
             );
+            let secondAggregateWorkerDigest = "";
+            if (
+              retryAggregateWorkerValidation &&
+              !retryRun.ok &&
+              shouldRetryAggregateWorkerValidationRunOnce(retryRun, repo)
+            ) {
+              secondAggregateWorkerDigest = extractValidationFailureDigest(retryRun);
+              onLog?.(
+                "stderr",
+                `[ValidationGate] Retrying aggregate validation a second and final time after its nested Worker test remained transient: ${command}${secondAggregateWorkerDigest ? ` - ${secondAggregateWorkerDigest}` : ""}`,
+              );
+              retryRun = await runValidationCommand(
+                repo,
+                command,
+                resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
+                outputPolicy,
+              );
+            }
             if (!retryRun.ok && firstDigest) {
               retryRun.stderr = [
-                `Previous browser validation attempt failed before retry: ${firstDigest}`,
+                `Previous validation attempt failed before retry: ${firstDigest}`,
+                secondAggregateWorkerDigest
+                  ? `Second aggregate validation attempt failed before final retry: ${secondAggregateWorkerDigest}`
+                  : "",
                 retryRun.stderr,
               ]
                 .filter(Boolean)

@@ -38,6 +38,7 @@ import {
   sanitizePlannerWorkerInstructionPathHints,
   sanitizeTaskExecutePlanningPathHints,
   shouldEnsurePlaywrightBrowserRuntime,
+  shouldRetryAggregateWorkerValidationRunOnce,
   shouldDeferLongValidationAfterFastFailures,
   shouldRetryBrowserValidationRunOnce,
   tokenizeValidationCommandArgv,
@@ -804,6 +805,63 @@ describe("workerpals validation command safety", () => {
           repo,
         ),
       ).toBe(true);
+
+      expect(
+        shouldRetryAggregateWorkerValidationRunOnce(
+          {
+            step: "bun run validate",
+            command: "bun run validate",
+            ok: false,
+            exitCode: 1,
+            elapsedMs: 58_701,
+            stdout: "",
+            stderr: 'error: script "test:worker" exited with code 1',
+          },
+          repo,
+        ),
+      ).toBe(true);
+      expect(
+        shouldRetryAggregateWorkerValidationRunOnce(
+          {
+            step: "bun run validate",
+            command: "bun run validate",
+            ok: false,
+            exitCode: 1,
+            elapsedMs: 61_107,
+            stdout: "[publish readiness 2/7] Worker tests\nError: Test timed out in 5000ms.",
+            stderr: "",
+          },
+          repo,
+        ),
+      ).toBe(true);
+      expect(
+        shouldRetryAggregateWorkerValidationRunOnce(
+          {
+            step: "bun run validate",
+            command: "bun run validate",
+            ok: false,
+            exitCode: 1,
+            elapsedMs: 61_107,
+            stdout: "[publish readiness 7/7] Web e2e smoke\nError: Test timed out in 5000ms.",
+            stderr: "",
+          },
+          repo,
+        ),
+      ).toBe(false);
+      expect(
+        shouldRetryAggregateWorkerValidationRunOnce(
+          {
+            step: "bun run lint",
+            command: "bun run lint",
+            ok: false,
+            exitCode: 1,
+            elapsedMs: 1_000,
+            stdout: "",
+            stderr: 'error: script "test:worker" exited with code 1',
+          },
+          repo,
+        ),
+      ).toBe(false);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
