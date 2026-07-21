@@ -2,7 +2,15 @@
 # This image provides an isolated environment for job execution
 # The entire monorepo is available in the container for job execution
 
-FROM oven/bun:1-debian AS base
+FROM oven/bun:1-debian AS bun-runtime
+
+# Use an official supported Node.js runtime for repository-local tools such as
+# Wrangler. Debian's unpinned nodejs package can lag behind those tools' engine
+# requirements even when the Bun base image itself is current.
+FROM node:24-trixie AS base
+
+COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
+RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx
 
 # Install git and other essential tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,8 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     pkg-config \
-    nodejs \
-    npm \
     openssh-client \
     grep \
     jq \
@@ -44,6 +50,19 @@ RUN mkdir -p /workspace \
         playwright \
     && bun add -g @openai/codex \
     && /workspace/.venv/bin/playwright install --with-deps chromium
+
+# Repo-local Playwright versions expect their own bundled browser revisions.
+# A distro-managed Chrome channel gives those clients a stable executable that
+# does not depend on the Python Playwright revision installed above.
+RUN apt-get update && apt-get install -y --no-install-recommends chromium \
+    && mkdir -p /opt/google/chrome \
+    && ln -sf /usr/bin/chromium /opt/google/chrome/chrome \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node sizes its heap conservatively under the sandbox's cgroup memory limit.
+# Keep enough headroom for other processes while allowing repo-local typecheck
+# and lint commands to use more than the resulting 1 GiB default heap.
+ENV NODE_OPTIONS="--max-old-space-size=1536"
 
 ENV PATH="/workspace/.venv/bin:/root/.bun/bin:${PATH}"
 ENV WORKERPALS_OPENHANDS_PYTHON="/workspace/.venv/bin/python"
