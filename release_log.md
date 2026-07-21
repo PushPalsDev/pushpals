@@ -2,30 +2,29 @@
 
 ## Release Metadata
 
-- version: `v1.1.78`
-- start_commit: `6c7ca57ecd2d026993ab482cc1d2fef0f8517f4e`
-- end_commit: `cd10e034ed9181a82350b89cdc58c9cbcbe008f7`
+- version: `v1.1.79`
+- start_commit: `77c1016b9c6843cf53c9c0d5966c8d8537bad90f`
+- end_commit: `7dcfe4d7413d972b736fac9667f29bd9fef13608`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Default LocalBuddy, RemoteBuddy, and WorkerPal OpenAI Codex execution to the explicit `gpt-5.6-sol` model at `xhigh` reasoning effort.
-- Migrate exact generated `gpt-5.4` and `gpt-5.5` defaults to `gpt-5.6-sol` while preserving custom model and reasoning-effort overrides.
-- Keep a one-time `gpt-5.5` fallback for RemoteBuddy and WorkerPal when an older Codex CLI reports model incompatibility.
-- Ship synchronized npm-package runtime, sandbox, configuration, and RemoteBuddy fallback assets with the upgraded model defaults.
-- Send an explicit `exit` command during packaged runtime-only E2E teardown so intentional stdin-EOF survival cannot leave orphaned Windows processes or hang the suite.
+- Run Docker-backed WorkerPals on the official Node.js 24 Trixie base so modern repo-local tools such as Wrangler can satisfy their Node engine requirements.
+- Layer Bun into the Node base while retaining Python 3.13 for the OpenHands, mini-SWE-agent, and Playwright runtime stack.
+- Provide a distro-managed Chromium stable channel so repo-local Playwright versions can launch browser validation without depending on the image's Python Playwright browser revision.
+- Allow Node validation processes up to a 1536 MiB heap inside the default 2 GiB WorkerPal sandbox, preventing cgroup-derived 1 GiB lint and typecheck failures.
+- Ship the corrected Dockerfile in both source and packaged CLI sandbox assets with regression coverage that enforces runtime support and mirror parity.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/shared.config.workerpals-quality-threshold.test.ts tests/remotebuddy.llm-codex.test.ts tests/remotebuddy.autonomous-engine.tick.test.ts tests/server.job-diagnostics.test.ts tests/server.tool-runs.test.ts tests/shared.tooling.test.ts`
-- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
-- `bun test tests/cli.runtime-bootstrap.test.ts`
-- `bun run test:cli:integration`
+- `bun test tests/workerpals.sandbox-runtime.test.ts tests/cli.runtime-bootstrap.test.ts`
+- `docker build --progress=plain -f apps/workerpals/Dockerfile.sandbox -t pushpals-worker-sandbox:node24-validation .`
+- SectorCommand `bun run validate` inside the built image with the WorkerPal 2 CPU / 2 GiB limits: 722 unit tests, 27 Worker tests, typechecks, lint, and web E2E passed.
+- SectorCommand `bun run worker:deploy:dry-run` inside the built image with Wrangler 4.111.0.
 - `bun run test:cli:e2e`
 - `bun run test:root`
-- `codex exec --model gpt-5.6-sol --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"`
 - `git diff --check`
 
 ## Install
@@ -52,6 +51,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
+- The first Docker-backed WorkerPal startup after upgrading rebuilds the sandbox image and downloads the Node, Python-agent, Playwright, and Chromium layers; subsequent starts reuse Docker's cached layers.
 - `execution_platform = "windows"` selects direct host WorkerPal execution so validation inherits the Windows host environment; it does not convert Docker Desktop Linux containers into Windows containers.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
 - Active runtime-only supervisors started from v1.1.64 or older did not write the new runtime-host PID state, so they may need to be stopped once manually before this release can prevent future `outputs/data` EBUSY loops.
