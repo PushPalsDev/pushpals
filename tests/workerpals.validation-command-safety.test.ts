@@ -40,6 +40,7 @@ import {
   shouldDeferLongValidationAfterFastFailures,
   tokenizeValidationCommandArgv,
   validationCommandIncludesLongRunningBrowserWork,
+  validationCommandIncludesTestWork,
 } from "../apps/workerpals/src/execute_job";
 
 function planningFixture(overrides: Partial<Record<string, unknown>> = {}) {
@@ -730,13 +731,45 @@ describe("workerpals validation command safety", () => {
       );
       writeFileSync(
         join(repo, "scripts", "validate-publish-readiness.js"),
-        'await Bun.$`bun run web:e2e`;\n',
+        "await Bun.$`bun run web:e2e`;\n",
       );
 
       expect(validationCommandIncludesLongRunningBrowserWork(repo, "bun run validate")).toBe(true);
       expect(validationCommandIncludesLongRunningBrowserWork(repo, "bun run lint")).toBe(false);
       expect(resolveValidationCommandTimeoutMs("bun run validate", 180_000, repo)).toBe(600_000);
       expect(resolveValidationCommandTimeoutMs("bun run lint", 180_000, repo)).toBe(180_000);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("recognizes tests nested behind aggregate package scripts and JavaScript runners", () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-aggregate-test-validation-"));
+    try {
+      mkdirSync(join(repo, "scripts"), { recursive: true });
+      writeFileSync(
+        join(repo, "package.json"),
+        JSON.stringify({
+          scripts: {
+            validate: "bun run validate:publish",
+            "validate:publish": "node ./scripts/validate-publish-readiness.js",
+            lint: "eslint .",
+          },
+        }),
+      );
+      writeFileSync(
+        join(repo, "scripts", "validate-publish-readiness.js"),
+        [
+          "const steps = [",
+          "  createStep('Unit tests', 'bun', ['test']),",
+          "  createStep('Worker tests', 'bun', ['run', 'test:worker']),",
+          "];",
+        ].join("\n"),
+      );
+
+      expect(validationCommandIncludesTestWork(repo, "bun run validate")).toBe(true);
+      expect(validationCommandIncludesTestWork(repo, "bun run lint")).toBe(false);
+      expect(validationCommandIncludesTestWork(repo, "bun test")).toBe(true);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

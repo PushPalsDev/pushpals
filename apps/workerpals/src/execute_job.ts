@@ -1844,15 +1844,69 @@ export function validationCommandIncludesLongRunningBrowserWork(
       resolvedScript.cwd,
       resolvedScript.script,
     );
-    if (
-      textIncludesLongRunningBrowserValidation(
-        `${resolvedScript.script}\n${referencedText}`,
-      )
-    ) {
+    if (textIncludesLongRunningBrowserValidation(`${resolvedScript.script}\n${referencedText}`)) {
       return true;
     }
 
     for (const match of resolvedScript.script.matchAll(
+      /\b(bun|npm|pnpm|yarn)(?:\s+run)?\s+([A-Za-z0-9][A-Za-z0-9:._-]*)\b/gi,
+    )) {
+      const packageManager = match[1] ?? "";
+      const scriptName = match[2] ?? "";
+      if (!packageManager || !scriptName) continue;
+      if (visit(resolvedScript.cwd, `${packageManager} run ${scriptName}`, depth + 1)) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  return visit(repo, command, 0);
+}
+
+function textIncludesTestValidation(text: string): boolean {
+  if (
+    /(?:^|[^a-z0-9_-])(?:bun|bunx|npm|npx|pnpm|yarn)\s+(?:run\s+)?test(?::[a-z0-9._-]+)?(?:$|[^a-z0-9_-])/im.test(
+      text,
+    ) ||
+    /(?:^|[^a-z0-9_-])(?:pytest|vitest|jest)(?:$|[^a-z0-9_-])/im.test(text) ||
+    /(?:^|[^a-z0-9_-])(?:python|python3)\s+-m\s+pytest(?:$|[^a-z0-9_-])/im.test(text) ||
+    /(?:^|[^a-z0-9_-])(?:go|cargo|make)\s+test(?:$|[^a-z0-9_-])/im.test(text)
+  ) {
+    return true;
+  }
+
+  // Recognize declarative JavaScript validation runners such as
+  // createStep("Unit tests", "bun", ["test"]) and
+  // createStep("Worker tests", "bun", ["run", "test:worker"]).
+  return /["'`](?:bun|bunx|npm|npx|pnpm|yarn)["'`][\s\S]{0,240}?\[\s*["'`](?:test|run["'`]\s*,\s*["'`]test(?::[a-z0-9._-]+)?)["'`]/i.test(
+    text,
+  );
+}
+
+/** Returns true when a validation command resolves to direct or aggregate test work. */
+export function validationCommandIncludesTestWork(repo: string, command: string): boolean {
+  const visited = new Set<string>();
+
+  const visit = (cwd: string, currentCommand: string, depth: number): boolean => {
+    if (isTestLikeValidationStep(currentCommand)) return true;
+    if (depth >= 8) return false;
+
+    const resolvedScript = resolvePackageScriptForValidationCommand(cwd, currentCommand);
+    if (!resolvedScript) return false;
+    const visitKey = `${resolvedScript.cwd}\0${resolvedScript.script}`;
+    if (visited.has(visitKey)) return false;
+    visited.add(visitKey);
+
+    const referencedText = readReferencedValidationScriptText(
+      resolvedScript.cwd,
+      resolvedScript.script,
+    );
+    const aggregateText = `${resolvedScript.script}\n${referencedText}`;
+    if (textIncludesTestValidation(aggregateText)) return true;
+
+    for (const match of aggregateText.matchAll(
       /\b(bun|npm|pnpm|yarn)(?:\s+run)?\s+([A-Za-z0-9][A-Za-z0-9:._-]*)\b/gi,
     )) {
       const packageManager = match[1] ?? "";
@@ -3072,7 +3126,11 @@ export function allowsValidationToolingOnlyChangeForTestFocusedTask(params: {
   changedPaths: string[];
 }): boolean {
   const changedPaths = params.changedPaths
-    .map((path) => String(path ?? "").replace(/\\/g, "/").replace(/^\.\/+/, ""))
+    .map((path) =>
+      String(path ?? "")
+        .replace(/\\/g, "/")
+        .replace(/^\.\/+/, ""),
+    )
     .filter(Boolean);
   if (changedPaths.length === 0) return false;
   if (!changedPaths.every(isValidationToolingPath)) return false;
@@ -4987,7 +5045,7 @@ async function runDeterministicQualityGate(
       }
       if (
         isTestTask &&
-        !validationRuns.some((run) => /\b(test|pytest|coverage|vitest|jest)\b/i.test(run.command))
+        !validationRuns.some((run) => validationCommandIncludesTestWork(repo, run.command))
       ) {
         addValidationIssue("did not execute a recognizable test command.");
       }
@@ -6370,9 +6428,7 @@ function inferRepoNativeCommitArea(targets: string[]): string | null {
     normalized.find((path) => !isDocPath(path)) ??
     normalized[0];
   if (!basis) return null;
-  if (
-    /^(package\.json|bun\.lockb?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i.test(basis)
-  ) {
+  if (/^(package\.json|bun\.lockb?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i.test(basis)) {
     return "package";
   }
   if (
