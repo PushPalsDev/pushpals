@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.81`
-- start_commit: `2ff194946e8e3bb3a456c20a9b3bb2005ae3baed`
-- end_commit: `be2f2647f439a2ebdebb6fbed63ea93f395a337c`
+- version: `v1.1.82`
+- start_commit: `49e5f7e2a7559254b70f5851e4d12796b064a2c1`
+- end_commit: `65d36f7ca297b96c6a1c1e67d98ee5bb9abf1868`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Detect browser validation hidden behind aggregate package scripts and local JavaScript or TypeScript validation runners.
-- Recursively resolve nested Bun, npm, pnpm, and Yarn package-script aliases with cycle and depth guards.
-- Give aggregate validation that contains browser work the same 10-minute minimum timeout as direct browser E2E commands while preserving the configured timeout for ordinary validation.
-- Ship the timeout resolver in both the source runtime and npm-packaged runtime mirror, with regression coverage for the real SectorCommand validation shape.
+- Detect validation blockers only from failed commands, so successful validation output cannot create a false environment failure.
+- Recognize optional browser-launch fallback: a missing Edge installation is not blocking when Chrome, Chromium, Firefox, or WebKit successfully takes over.
+- Preserve real missing-browser protection when no fallback browser starts.
+- Ship the success-aware classifier in both the source runtime and npm-packaged runtime mirror with regression coverage for successful fallback, later assertion failure, and genuine missing-browser cases.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.validation-command-safety.test.ts`: 47 passed, 0 failed.
-- `bun run test:root`: 925 passed, 1 Windows signal-handling skip, 0 failed.
+- `bun test tests/workerpals.quality-gate-issues.test.ts`: 47 passed, 0 failed.
+- `bun run test:root`: 928 passed, 1 Windows signal-handling skip, 0 failed.
 - `bun run test:cli:e2e`: 10 passed, 0 failed.
-- The real SectorCommand `bun run validate` package-script graph resolves to the 600,000ms browser-validation timeout; `bun run lint` retains the 180,000ms configured timeout.
-- v1.1.80 live-job reproduction: 723 unit tests, 27 Worker tests, both typechecks, binding types, lint, and Wrangler 4.111.0 deploy dry-run passed before PushPals terminated the still-running Expo web E2E at the old 180,000ms aggregate timeout.
+- v1.1.81 live SectorCommand aggregate validation passed in 264,168ms: 723 unit tests, 27 Worker tests, both typechecks, binding types, lint, and the full Chrome browser smoke passed.
+- The same live job passed Wrangler 4.111.0 deploy dry-run, focused typecheck, and focused lint before reproducing the false missing-browser blocker from the successful Edge-to-Chrome fallback output.
 - `git diff --check`
 
 ## Install
