@@ -29,6 +29,7 @@ import {
   shouldRetryCriticTimeoutWithCompact,
   shouldReviseRequiredValidationBlocker,
   shouldRetryBrowserValidationRunOnce,
+  shouldRetryPassingVitestTeardownOnce,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
   shouldSoftPassCriticOnlyBudgetExhaustion,
@@ -141,13 +142,13 @@ describe("workerpals quality gate critic issue formatting", () => {
       command: "bun run web:e2e",
       failureKind: "assertion" as const,
       stage: "settings return navigation",
-      selector: "[data-testid=\"settings-home-button\"]",
+      selector: '[data-testid="settings-home-button"]',
       expected: "settings home button returns to the home screen",
       failureFocus: "phase/progression",
       digest: "Navigation/phase progression smoke failure",
       previousDigest: "home route startup",
       previousStage: "home route startup",
-      previousSelector: "[data-testid=\"home-screen\"]",
+      previousSelector: '[data-testid="home-screen"]',
       previousExpected: "home screen is visible",
       previousFailureFocus: "route/startup",
       progress: "new_failure" as const,
@@ -181,13 +182,13 @@ describe("workerpals quality gate critic issue formatting", () => {
       command: "bun run web:e2e",
       failureKind: "assertion" as const,
       stage: "settings return navigation",
-      selector: "[data-testid=\"settings-home-button\"]",
+      selector: '[data-testid="settings-home-button"]',
       expected: "settings home button returns to the home screen",
       failureFocus: "phase/progression",
       digest: "Navigation/phase progression smoke failure",
       previousDigest: "home route startup",
       previousStage: "home route startup",
-      previousSelector: "[data-testid=\"home-screen\"]",
+      previousSelector: '[data-testid="home-screen"]',
       previousExpected: "home screen is visible",
       previousFailureFocus: "route/startup",
       progress: "new_failure" as const,
@@ -702,12 +703,17 @@ describe("workerpals quality gate critic issue formatting", () => {
         category: "repo",
         detail: "Validation is blocked by missing repo dependencies or imported files.",
       },
+      null,
+      ["components/__tests__/AnimatedSelectionRing.test.tsx"],
     );
 
     expect(hint).toContain("Validation blocker: repo");
     expect(hint).toContain("Validation failure diagnostics:");
     expect(hint).toContain("- bun test failed with exit 1 after 123ms.");
     expect(hint).toContain("Cannot find module '../../tests/reactNativeMock'");
+    expect(hint).toContain("Validation repair continuity rule");
+    expect(hint).toContain("Prepared candidate paths to preserve during this repair:");
+    expect(hint).toContain("Validation ownership rule");
   });
 
   test("marks outside-scope required validation revisions as repo validation repair mode", () => {
@@ -1270,6 +1276,38 @@ describe("workerpals quality gate critic issue formatting", () => {
         stdout: "",
         stderr:
           "Web end-to-end smoke test failed: Error: Browser validation failed during in-game UI stage: Expected help menu primary action to be visible within 30000ms: locator.waitFor: Timeout 30000ms exceeded.",
+      }),
+    ).toBe(false);
+  });
+
+  test("retries a Vitest worker teardown only when every reported test passed", () => {
+    const passingTeardown = {
+      step: "bun run validate",
+      command: "bun run validate",
+      ok: false,
+      exitCode: 1,
+      elapsedMs: 53_848,
+      stdout: [
+        'EnvironmentTeardownError: [vitest-worker]: Closing rpc while "resolve" was pending',
+        " Test Files  1 passed (1)",
+        "      Tests  27 passed (27)",
+        "     Errors  1 error",
+      ].join("\n"),
+      stderr: 'error: script "test:worker" exited with code 1',
+    };
+
+    expect(shouldRetryPassingVitestTeardownOnce(passingTeardown)).toBe(true);
+    expect(
+      shouldRetryPassingVitestTeardownOnce({
+        ...passingTeardown,
+        stdout: [passingTeardown.stdout, " Test Files  1 failed | 1 passed (2)"].join("\n"),
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetryPassingVitestTeardownOnce({
+        ...passingTeardown,
+        stdout:
+          'EnvironmentTeardownError: [vitest-worker]: Closing rpc while "resolve" was pending',
       }),
     ).toBe(false);
   });

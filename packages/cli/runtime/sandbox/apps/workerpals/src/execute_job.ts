@@ -3296,6 +3296,27 @@ export function shouldRetryBrowserValidationRunOnce(run: ValidationExecutionResu
   );
 }
 
+export function shouldRetryPassingVitestTeardownOnce(run: ValidationExecutionResult): boolean {
+  if (run.ok) return false;
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  if (
+    !/EnvironmentTeardownError/i.test(combined) ||
+    !/\[vitest-worker\]:\s*Closing rpc while ["']resolve["'] was pending/i.test(combined)
+  ) {
+    return false;
+  }
+  const summaryLines = combined
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^(?:Test Files|Tests)\b/i.test(line));
+  const testFilesSummary = summaryLines.find((line) => /^Test Files\b/i.test(line)) ?? "";
+  const testsSummary = summaryLines.find((line) => /^Tests\b/i.test(line)) ?? "";
+  if (!/\b\d+\s+passed\b/i.test(testFilesSummary) || !/\b\d+\s+passed\b/i.test(testsSummary)) {
+    return false;
+  }
+  return !summaryLines.some((line) => /\b\d+\s+failed\b/i.test(line));
+}
+
 function extractBrowserValidationStage(text: string): string | null {
   const patterns = [
     /\bBrowser validation failed during\s+([^:.\r\n|]+?)\s+stage\b/i,
@@ -4211,6 +4232,7 @@ function runnableValidationCommandsFromSteps(steps: string[] | undefined): strin
 }
 
 function normalizeRunnableValidationCommand(command: string): string | null {
+  if (/<[A-Za-z][A-Za-z0-9:._ -]*>/.test(command)) return null;
   const bunTestCommand = normalizeBunTestValidationCommand(command);
   return bunTestCommand === undefined ? command : bunTestCommand;
 }
@@ -4999,10 +5021,14 @@ async function runDeterministicQualityGate(
             outputPolicy,
           );
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
-          if (shouldRetryBrowserValidationRunOnce(run)) {
+          const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run);
+          const retryPassingVitestTeardown = shouldRetryPassingVitestTeardownOnce(run);
+          if (retryBrowserValidation || retryPassingVitestTeardown) {
             onLog?.(
               "stderr",
-              `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+              retryPassingVitestTeardown
+                ? `[ValidationGate] Retrying validation once after all Vitest assertions passed but worker teardown failed: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`
+                : `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
             );
             const retryRun = await runValidationCommand(
               repo,
@@ -5658,6 +5684,16 @@ export function buildQualityRevisionHint(
   }
   const failedValidationRuns = validationRuns.filter((run) => !run.ok);
   if (failedValidationRuns.length > 0) {
+    lines.push(
+      "Validation repair continuity rule: existing content changes from earlier repair attempts are prepared candidate fixes. Preserve them unless the latest failing command proves a specific change is wrong; do not revert them merely to restore the original narrow file count, target paths, or write globs.",
+    );
+    if (changedPaths.length > 0) {
+      lines.push("Prepared candidate paths to preserve during this repair:");
+      for (const path of changedPaths.slice(0, 12)) lines.push(`- ${path}`);
+    }
+    lines.push(
+      "Validation ownership rule: diagnose and run the smallest focused command or failing subcommand needed for this repair. Do not rerun a long aggregate required-validation command inside the executor; PushPals ValidationGate will rerun the authoritative aggregate after the repair turn.",
+    );
     lines.push("Validation failure diagnostics:");
     const runsToShow = browserRepairPacket
       ? failedValidationRuns
@@ -5978,6 +6014,23 @@ export async function filterChangedPathsByGitContentDelta(
   repo: string,
   changedPaths: string[],
 ): Promise<string[]> {
+  const [trackedResult, unstagedResult, stagedResult] = await Promise.all([
+    git(repo, ["ls-files"]),
+    git(repo, ["diff", "--name-only", "--no-renames"]),
+    git(repo, ["diff", "--cached", "--name-only", "--no-renames"]),
+  ]);
+  const canFilterInBatch = trackedResult.ok && unstagedResult.ok && stagedResult.ok;
+  const trackedPaths = new Set(
+    canFilterInBatch ? parseChangedPathsFromNameOnlyOutput(trackedResult.stdout) : [],
+  );
+  const trackedContentDeltas = new Set(
+    canFilterInBatch
+      ? [
+          ...parseChangedPathsFromNameOnlyOutput(unstagedResult.stdout),
+          ...parseChangedPathsFromNameOnlyOutput(stagedResult.stdout),
+        ]
+      : [],
+  );
   const out: string[] = [];
   const seen = new Set<string>();
   for (const rawPath of changedPaths) {
@@ -5988,7 +6041,11 @@ export async function filterChangedPathsByGitContentDelta(
     if (!path || seen.has(path)) continue;
     seen.add(path);
 
-    const trackedDelta = await trackedPathHasGitContentDelta(repo, path);
+    const trackedDelta = canFilterInBatch
+      ? trackedPaths.has(path)
+        ? trackedContentDeltas.has(path)
+        : null
+      : await trackedPathHasGitContentDelta(repo, path);
     if (trackedDelta === false) continue;
     out.push(path);
   }

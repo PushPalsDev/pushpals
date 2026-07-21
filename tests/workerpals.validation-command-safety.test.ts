@@ -255,6 +255,37 @@ describe("workerpals validation command safety", () => {
     );
   });
 
+  test("replaces unresolved planner validation placeholders with a focused fallback", () => {
+    const planning = planningFixture({
+      targetPaths: ["components/__tests__/matchRendering.test.ts"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["components/__tests__/matchRendering.test.ts"],
+      },
+      validationSteps: ["bun test <target-test-file>"],
+      requiredValidationSteps: ["bun run validate"],
+      discovery: { ripgrepQueries: [], likelyDirs: ["components"] },
+    }) as any;
+
+    const commands = collectQualityGateValidationCommands({
+      instruction: "add one focused regression test",
+      targetPath: "components/__tests__/matchRendering.test.ts",
+      planning,
+      changedTestPaths: ["components/__tests__/matchRendering.test.ts"],
+      isTestTask: true,
+    });
+
+    expect(commands.plannerRunnableSteps).toEqual([]);
+    expect(commands.fallbackValidationSteps).toEqual([
+      "bun test ./components/__tests__/matchRendering.test.ts",
+    ]);
+    expect(commands.commandsToRun).toEqual([
+      "bun run validate",
+      "bun test ./components/__tests__/matchRendering.test.ts",
+    ]);
+  });
+
   test("does not run test-support files directly as fallback validation", () => {
     const commands = inferFallbackValidationCommandsForTestTask(
       "repair the React Native mock type surface for tests",
