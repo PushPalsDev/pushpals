@@ -2,18 +2,17 @@
 
 ## Release Metadata
 
-- version: `v1.1.84`
-- start_commit: `cd838e78a8370eb20ba7dba5d23685875ed3e97f`
-- end_commit: `8a226705d85d3e22a465a0798fac7570d8a40d31`
+- version: `v1.1.85`
+- start_commit: `56ef1b14043d7e75e31888b342f8ea21022c5614`
+- end_commit: `779d5fc7c4283d66387f541270918bfc10a91790`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve prepared fixes across automatic validation-repair revisions instead of reverting them merely to restore an original narrow file count or planner scope.
-- Reject unresolved planner placeholders such as `bun test <target-test-file>` and replace them with an executable focused test command inferred from the changed test path.
-- Classify CRLF-only Windows worktree noise with three batched Git queries instead of spawning multiple Git processes for every reported path, eliminating multi-minute final-diff stalls in large repositories.
-- Keep long aggregate validation owned by PushPals' authoritative ValidationGate while repair executors diagnose the smallest failing subcommand.
-- Retry once when Vitest reports that every test and test file passed but exits nonzero on the exact worker RPC `EnvironmentTeardownError`; assertion failures and incomplete summaries remain hard failures.
+- Detect browser work nested inside aggregate package scripts such as `bun run validate`, including JavaScript validation runners that invoke `web:e2e` later in the chain.
+- Replace linked worktree `node_modules` with a lockfile-frozen local Bun install before nested Expo Router browser validation, preventing Metro from resolving the empty-route onboarding shell instead of the user's app.
+- Apply browser runtime preparation, transient retry, repair diagnostics, and long-validation deferral consistently to both direct and aggregate browser commands.
+- Prefer the terminal web-smoke failure over an earlier failed optional browser-channel probe, so repair agents receive the actionable route or assertion error rather than a misleading missing-Edge message.
 
 ## Validation
 
@@ -21,8 +20,10 @@
 - `bun run cli:verify-package-payload`
 - `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`: 97 passed, 0 failed.
 - `bun run test:root`: 931 passed, 1 Windows signal-handling skip, 0 failed.
-- `bun run test:cli:e2e`: 10 passed, 0 failed.
-- A live v1.1.83 SectorCommand job reproduced all repaired paths: 188 CRLF-only status entries caused a multi-minute diff review; an unresolved `<target-test-file>` command failed; an earlier timer-type repair was reverted and later recreated; and all 27 Worker tests passed before Vitest emitted the retryable teardown error.
+- `bun run test`: 931 passed, 1 Windows signal-handling skip, 0 failed, plus prompt-policy and protocol integration.
+- `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
+- `bun x tsc --noEmit -p packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
+- A live v1.1.84 SectorCommand job reproduced the aggregate-only gap: 724 unit tests, 27 Worker tests, both typecheck layers, lint, and the Worker deploy dry-run passed, while Expo Router rendered its empty-route onboarding page from the linked worktree dependency layout. The prior release reported the earlier optional Edge probe instead of that terminal route-startup failure.
 - `git diff --check`
 
 ## Install
