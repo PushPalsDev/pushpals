@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.82`
-- start_commit: `49e5f7e2a7559254b70f5851e4d12796b064a2c1`
-- end_commit: `65d36f7ca297b96c6a1c1e67d98ee5bb9abf1868`
+- version: `v1.1.83`
+- start_commit: `b1f474b31b9b461d1c256ef08b8d951c65f2eb6c`
+- end_commit: `77f992cacff33c21919e8e713a70655f6208e73e`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Detect validation blockers only from failed commands, so successful validation output cannot create a false environment failure.
-- Recognize optional browser-launch fallback: a missing Edge installation is not blocking when Chrome, Chromium, Firefox, or WebKit successfully takes over.
-- Preserve real missing-browser protection when no fallback browser starts.
-- Ship the success-aware classifier in both the source runtime and npm-packaged runtime mirror with regression coverage for successful fallback, later assertion failure, and genuine missing-browser cases.
+- Recognize repository-native aggregate validation commands as test execution when their package-script graph resolves to a direct test runner.
+- Follow nested Bun, npm, pnpm, and Yarn script aliases and inspect referenced JavaScript or TypeScript validation runners without requiring projects to rename their top-level `validate` command.
+- Preserve the existing direct-command checks while preventing successful suites such as SectorCommand's `bun run validate` from being rejected after all tests pass.
+- Ship the aggregate-test classifier in both the source runtime and npm-packaged runtime mirror with a regression fixture matching SectorCommand's `validate` to `validate:publish` runner structure.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.quality-gate-issues.test.ts`: 47 passed, 0 failed.
-- `bun run test:root`: 928 passed, 1 Windows signal-handling skip, 0 failed.
+- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`: 95 passed, 0 failed.
+- `bun run test:root`: 929 passed, 1 Windows signal-handling skip, 0 failed.
 - `bun run test:cli:e2e`: 10 passed, 0 failed.
-- v1.1.81 live SectorCommand aggregate validation passed in 264,168ms: 723 unit tests, 27 Worker tests, both typechecks, binding types, lint, and the full Chrome browser smoke passed.
-- The same live job passed Wrangler 4.111.0 deploy dry-run, focused typecheck, and focused lint before reproducing the false missing-browser blocker from the successful Edge-to-Chrome fallback output.
+- The v1.1.83 classifier resolves the live SectorCommand repository's `bun run validate` command as test work while correctly excluding `bun run lint`.
+- Two v1.1.82 live SectorCommand jobs reproduced the false rejection only after the aggregate test, typecheck, lint, browser, and deploy-dry-run validation pipeline had executed.
 - `git diff --check`
 
 ## Install
