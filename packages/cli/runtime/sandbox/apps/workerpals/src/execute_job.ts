@@ -1816,6 +1816,59 @@ export function isLongRunningBrowserValidationCommand(command: string): boolean 
   );
 }
 
+function textIncludesLongRunningBrowserValidation(text: string): boolean {
+  return (
+    /(?:^|[^a-z0-9_-])(?:web:e2e|e2e:web|browser:e2e|smoke:web|web:smoke|browser:smoke|playwright|cypress)(?:$|[^a-z0-9_-])/i.test(
+      text,
+    ) || /\bexpo\b[\s\S]{0,160}\b(?:--web|web|start)\b/i.test(text)
+  );
+}
+
+export function validationCommandIncludesLongRunningBrowserWork(
+  repo: string,
+  command: string,
+): boolean {
+  const visited = new Set<string>();
+
+  const visit = (cwd: string, currentCommand: string, depth: number): boolean => {
+    if (isLongRunningBrowserValidationCommand(currentCommand)) return true;
+    if (depth >= 8) return false;
+
+    const resolvedScript = resolvePackageScriptForValidationCommand(cwd, currentCommand);
+    if (!resolvedScript) return false;
+    const visitKey = `${resolvedScript.cwd}\0${resolvedScript.script}`;
+    if (visited.has(visitKey)) return false;
+    visited.add(visitKey);
+
+    const referencedText = readReferencedValidationScriptText(
+      resolvedScript.cwd,
+      resolvedScript.script,
+    );
+    if (
+      textIncludesLongRunningBrowserValidation(
+        `${resolvedScript.script}\n${referencedText}`,
+      )
+    ) {
+      return true;
+    }
+
+    for (const match of resolvedScript.script.matchAll(
+      /\b(bun|npm|pnpm|yarn)(?:\s+run)?\s+([A-Za-z0-9][A-Za-z0-9:._-]*)\b/gi,
+    )) {
+      const packageManager = match[1] ?? "";
+      const scriptName = match[2] ?? "";
+      if (!packageManager || !scriptName) continue;
+      if (visit(resolvedScript.cwd, `${packageManager} run ${scriptName}`, depth + 1)) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  return visit(repo, command, 0);
+}
+
 export function isParallelSafeFastValidationCommand(repo: string, command: string): boolean {
   if (isLongRunningBrowserValidationCommand(command)) return false;
   if (shouldEnsurePlaywrightBrowserRuntime(repo, command)) return false;
@@ -2088,11 +2141,18 @@ async function runPlaywrightBrowserRuntimePreflight(
   );
 }
 
-export function resolveValidationCommandTimeoutMs(command: string, baseTimeoutMs: number): number {
+export function resolveValidationCommandTimeoutMs(
+  command: string,
+  baseTimeoutMs: number,
+  repo?: string,
+): number {
   const normalizedBase = Number.isFinite(Number(baseTimeoutMs))
     ? Math.max(1_000, Math.min(7_200_000, Math.floor(Number(baseTimeoutMs))))
     : 180_000;
-  if (!isLongRunningBrowserValidationCommand(command)) return normalizedBase;
+  const includesBrowserWork =
+    isLongRunningBrowserValidationCommand(command) ||
+    Boolean(repo && validationCommandIncludesLongRunningBrowserWork(repo, command));
+  if (!includesBrowserWork) return normalizedBase;
   return Math.max(normalizedBase, 600_000);
 }
 
@@ -4711,7 +4771,7 @@ async function runDeterministicQualityGate(
                 const run = await runValidationCommand(
                   repo,
                   command,
-                  resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+                  resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
                   outputPolicy,
                 );
                 const digest = run.ok ? "" : extractValidationFailureDigest(run);
@@ -4802,7 +4862,7 @@ async function runDeterministicQualityGate(
               repo,
               command,
               missingPlaywrightBrowserTargets,
-              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
               outputPolicy,
             );
             if (!browserPreflight.ok) {
@@ -4863,7 +4923,7 @@ async function runDeterministicQualityGate(
           let run = await runValidationCommand(
             repo,
             command,
-            resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+            resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
             outputPolicy,
           );
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
@@ -4875,7 +4935,7 @@ async function runDeterministicQualityGate(
             const retryRun = await runValidationCommand(
               repo,
               command,
-              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs),
+              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
               outputPolicy,
             );
             if (!retryRun.ok && firstDigest) {

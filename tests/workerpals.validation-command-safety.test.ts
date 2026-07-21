@@ -39,6 +39,7 @@ import {
   shouldEnsurePlaywrightBrowserRuntime,
   shouldDeferLongValidationAfterFastFailures,
   tokenizeValidationCommandArgv,
+  validationCommandIncludesLongRunningBrowserWork,
 } from "../apps/workerpals/src/execute_job";
 
 function planningFixture(overrides: Partial<Record<string, unknown>> = {}) {
@@ -711,6 +712,34 @@ describe("workerpals validation command safety", () => {
     expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 180_000)).toBe(600_000);
     expect(resolveValidationCommandTimeoutMs("bun run lint", 180_000)).toBe(180_000);
     expect(resolveValidationCommandTimeoutMs("bun run web:e2e", 900_000)).toBe(900_000);
+  });
+
+  test("uses a longer timeout when an aggregate package script contains browser validation", () => {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-aggregate-browser-validation-"));
+    try {
+      mkdirSync(join(repo, "scripts"), { recursive: true });
+      writeFileSync(
+        join(repo, "package.json"),
+        JSON.stringify({
+          scripts: {
+            validate: "bun run validate:publish",
+            "validate:publish": "node ./scripts/validate-publish-readiness.js",
+            lint: "eslint .",
+          },
+        }),
+      );
+      writeFileSync(
+        join(repo, "scripts", "validate-publish-readiness.js"),
+        'await Bun.$`bun run web:e2e`;\n',
+      );
+
+      expect(validationCommandIncludesLongRunningBrowserWork(repo, "bun run validate")).toBe(true);
+      expect(validationCommandIncludesLongRunningBrowserWork(repo, "bun run lint")).toBe(false);
+      expect(resolveValidationCommandTimeoutMs("bun run validate", 180_000, repo)).toBe(600_000);
+      expect(resolveValidationCommandTimeoutMs("bun run lint", 180_000, repo)).toBe(180_000);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   test("defers long browser validation after deterministic fast failures", () => {
