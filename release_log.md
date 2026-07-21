@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.80`
-- start_commit: `5fb86b7513dae9205d3125216bc8a70c09f4907b`
-- end_commit: `a1dca0aeff6b9688fc13a8b539f910d1f628b08b`
+- version: `v1.1.81`
+- start_commit: `2ff194946e8e3bb3a456c20a9b3bb2005ae3baed`
+- end_commit: `be2f2647f439a2ebdebb6fbed63ea93f395a337c`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Provision installed Windows embedded WorkerPals with 2 CPUs and 2 GiB of memory, replacing the hidden 1 CPU / 1 GiB launcher cap that undercut the modern Node 24 sandbox.
-- Align source defaults, example configuration, npm runtime assets, and packaged sandbox assets on the same proven resource envelope.
-- Keep the Windows launch-time guardrail effective for existing installations while allowing explicit process-environment overrides to retain precedence.
-- Add regression coverage for the installed-package launcher values so future config or bundle changes cannot silently restore the lower cap.
+- Detect browser validation hidden behind aggregate package scripts and local JavaScript or TypeScript validation runners.
+- Recursively resolve nested Bun, npm, pnpm, and Yarn package-script aliases with cycle and depth guards.
+- Give aggregate validation that contains browser work the same 10-minute minimum timeout as direct browser E2E commands while preserving the configured timeout for ordinary validation.
+- Ship the timeout resolver in both the source runtime and npm-packaged runtime mirror, with regression coverage for the real SectorCommand validation shape.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.sandbox-runtime.test.ts tests/cli.runtime-bootstrap.test.ts`
-- `bun run test:root`: 924 passed, 1 Windows signal-handling skip, 0 failed.
+- `bun test tests/workerpals.validation-command-safety.test.ts`: 47 passed, 0 failed.
+- `bun run test:root`: 925 passed, 1 Windows signal-handling skip, 0 failed.
 - `bun run test:cli:e2e`: 10 passed, 0 failed.
-- SectorCommand `bun run validate` inside the Node 24 sandbox at the now-shipped 2 CPU / 2 GiB limits: 722 unit tests, 27 Worker tests, typechecks, lint, and web E2E passed.
-- SectorCommand `bun run worker:deploy:dry-run` inside the same constrained sandbox with Wrangler 4.111.0.
+- The real SectorCommand `bun run validate` package-script graph resolves to the 600,000ms browser-validation timeout; `bun run lint` retains the 180,000ms configured timeout.
+- v1.1.80 live-job reproduction: 723 unit tests, 27 Worker tests, both typechecks, binding types, lint, and Wrangler 4.111.0 deploy dry-run passed before PushPals terminated the still-running Expo web E2E at the old 180,000ms aggregate timeout.
 - `git diff --check`
 
 ## Install
