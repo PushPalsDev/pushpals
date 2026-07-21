@@ -660,8 +660,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS).toBe("120000");
     expect(env.WORKERPALS_DOCKER_AGENT_STARTUP_TIMEOUT_MS).toBe("90000");
     expect(env.WORKERPALS_SKIP_DOCKER_SELF_CHECK).toBe("1");
-    expect(env.WORKERPALS_DOCKER_WARM_MEMORY_MB).toBe("1024");
-    expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("1");
+    expect(env.WORKERPALS_DOCKER_WARM_MEMORY_MB).toBe("2048");
+    expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("2");
   });
 
   test("buildEmbeddedRuntimeEnv gives child Bun services the Windows root CA bundle", () => {
@@ -789,7 +789,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(env.REMOTEBUDDY_MAX_WORKERPALS).toBe("8");
     expect(env.WORKERPALS_SKIP_DOCKER_SELF_CHECK).toBe("0");
     expect(env.WORKERPALS_DOCKER_WARM_MEMORY_MB).toBe("3072");
-    expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("1");
+    expect(env.WORKERPALS_DOCKER_WARM_CPUS).toBe("2");
   });
 
   test("buildEmbeddedRuntimeEnv can disable embedded Windows worker caps", () => {
