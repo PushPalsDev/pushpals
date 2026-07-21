@@ -2,29 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.79`
-- start_commit: `77c1016b9c6843cf53c9c0d5966c8d8537bad90f`
-- end_commit: `7dcfe4d7413d972b736fac9667f29bd9fef13608`
+- version: `v1.1.80`
+- start_commit: `5fb86b7513dae9205d3125216bc8a70c09f4907b`
+- end_commit: `a1dca0aeff6b9688fc13a8b539f910d1f628b08b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Run Docker-backed WorkerPals on the official Node.js 24 Trixie base so modern repo-local tools such as Wrangler can satisfy their Node engine requirements.
-- Layer Bun into the Node base while retaining Python 3.13 for the OpenHands, mini-SWE-agent, and Playwright runtime stack.
-- Provide a distro-managed Chromium stable channel so repo-local Playwright versions can launch browser validation without depending on the image's Python Playwright browser revision.
-- Allow Node validation processes up to a 1536 MiB heap inside the default 2 GiB WorkerPal sandbox, preventing cgroup-derived 1 GiB lint and typecheck failures.
-- Ship the corrected Dockerfile in both source and packaged CLI sandbox assets with regression coverage that enforces runtime support and mirror parity.
+- Provision installed Windows embedded WorkerPals with 2 CPUs and 2 GiB of memory, replacing the hidden 1 CPU / 1 GiB launcher cap that undercut the modern Node 24 sandbox.
+- Align source defaults, example configuration, npm runtime assets, and packaged sandbox assets on the same proven resource envelope.
+- Keep the Windows launch-time guardrail effective for existing installations while allowing explicit process-environment overrides to retain precedence.
+- Add regression coverage for the installed-package launcher values so future config or bundle changes cannot silently restore the lower cap.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
 - `bun test tests/workerpals.sandbox-runtime.test.ts tests/cli.runtime-bootstrap.test.ts`
-- `docker build --progress=plain -f apps/workerpals/Dockerfile.sandbox -t pushpals-worker-sandbox:node24-validation .`
-- SectorCommand `bun run validate` inside the built image with the WorkerPal 2 CPU / 2 GiB limits: 722 unit tests, 27 Worker tests, typechecks, lint, and web E2E passed.
-- SectorCommand `bun run worker:deploy:dry-run` inside the built image with Wrangler 4.111.0.
-- `bun run test:cli:e2e`
-- `bun run test:root`
+- `bun run test:root`: 924 passed, 1 Windows signal-handling skip, 0 failed.
+- `bun run test:cli:e2e`: 10 passed, 0 failed.
+- SectorCommand `bun run validate` inside the Node 24 sandbox at the now-shipped 2 CPU / 2 GiB limits: 722 unit tests, 27 Worker tests, typechecks, lint, and web E2E passed.
+- SectorCommand `bun run worker:deploy:dry-run` inside the same constrained sandbox with Wrangler 4.111.0.
 - `git diff --check`
 
 ## Install
