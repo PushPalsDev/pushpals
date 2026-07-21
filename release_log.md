@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.86`
-- start_commit: `be693552fd411f242463c73f8618c255c888f177`
-- end_commit: `34b481aa75cc5606f102f820eebef0248353f73b`
+- version: `v1.1.87`
+- start_commit: `5c0e3c93123f4593b835b813c3299ade78428326`
+- end_commit: `07feb10d5f5afadf4c2c232477f2859c2a7752b2`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Size Bun dependency-layout repair timeouts from the longest required validation command instead of applying the ordinary fast-step timeout to every repair.
-- Give dependency repair for direct or aggregate browser validation the same 10-minute ceiling as the browser command, so a slow Windows-mounted offline install is not terminated seconds before completion.
-- Keep non-browser dependency preflights on their configured validation timeout while retaining a bounded repair ceiling for stalled installs.
+- Retry aggregate browser validation inside ValidationGate when its nested Worker suite hits a cold-sandbox teardown or test-timeout failure, instead of spending an AI repair revision on an unchanged candidate patch.
+- Allow at most two bounded aggregate reruns, matching the observed warm-up sequence while still blocking deterministic failures after the final attempt.
+- Keep browser and Worker retry classification scoped to aggregate commands that actually resolve to browser work; ordinary lint and unrelated test failures are not retried by this policy.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`: 97 passed, 0 failed.
+- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`: 97 passed, 0 failed, 321 assertions.
 - `bun run test:root`: 931 passed, 1 Windows signal-handling skip, 0 failed.
 - `bun run test`: 931 passed, 1 Windows signal-handling skip, 0 failed, plus prompt-policy and protocol integration.
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `bun x tsc --noEmit -p packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
-- A live v1.1.85 SectorCommand job exercised the new aggregate preflight and showed its offline install needed 182,023ms on the Windows-mounted worktree; the prior 180,000ms limit correctly blocked the incomplete tree but was too short for this valid repair.
+- Live v1.1.86 SectorCommand job `d0aca370-2bd4-47cd-a018-579d3aedf91b` proved the dependency repair completed at 190,654ms, then reproduced the nested Worker sequence: 27/27 assertions passed with a teardown error, the next aggregate run hit a 5-second Worker timeout, and the third aggregate run passed all required validation plus web E2E before publishing PR #497.
 - `git diff --check`
 
 ## Install
