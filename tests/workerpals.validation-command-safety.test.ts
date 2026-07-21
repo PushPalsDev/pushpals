@@ -31,6 +31,7 @@ import {
   prepareValidationCommandArgv,
   prepareValidationSpawnArgv,
   resolveBunDependencyLayoutPreflight,
+  resolveBunDependencyLayoutPreflightTimeoutForValidationCommands,
   resolveBunDependencyLayoutPreflightTimeoutMs,
   resolveValidationCommandTimeoutMs,
   runValidationArgv,
@@ -1117,6 +1118,13 @@ describe("workerpals validation command safety", () => {
       expect(
         resolveBunDependencyLayoutPreflight(root, ["bun run validate"])?.removeLinkedNodeModules,
       ).toBe(true);
+      expect(
+        resolveBunDependencyLayoutPreflightTimeoutForValidationCommands(
+          root,
+          ["bun run validate"],
+          180_000,
+        ),
+      ).toBe(600_000);
 
       expect(resolveBunDependencyLayoutPreflight(root, ["bun test"])).toBeNull();
     } finally {
@@ -1127,7 +1135,7 @@ describe("workerpals validation command safety", () => {
   test("blocks validation on dependency preflight repair failure", () => {
     expect(resolveBunDependencyLayoutPreflightTimeoutMs(10_000)).toBe(30_000);
     expect(resolveBunDependencyLayoutPreflightTimeoutMs(180_000)).toBe(180_000);
-    expect(resolveBunDependencyLayoutPreflightTimeoutMs(900_000)).toBe(300_000);
+    expect(resolveBunDependencyLayoutPreflightTimeoutMs(900_000)).toBe(600_000);
 
     const run = buildBunDependencyLayoutPreflightFailureRun({
       validationCommand: "bun test",

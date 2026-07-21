@@ -2500,7 +2500,20 @@ export function resolveBunDependencyLayoutPreflight(
 }
 
 export function resolveBunDependencyLayoutPreflightTimeoutMs(timeoutMs: number): number {
-  return Math.min(Math.max(30_000, timeoutMs), 300_000);
+  return Math.min(Math.max(30_000, timeoutMs), 600_000);
+}
+
+export function resolveBunDependencyLayoutPreflightTimeoutForValidationCommands(
+  repo: string,
+  validationCommands: string[],
+  baseTimeoutMs: number,
+): number {
+  const longestValidationTimeoutMs = validationCommands.reduce(
+    (longest, command) =>
+      Math.max(longest, resolveValidationCommandTimeoutMs(command, baseTimeoutMs, repo)),
+    baseTimeoutMs,
+  );
+  return resolveBunDependencyLayoutPreflightTimeoutMs(longestValidationTimeoutMs);
 }
 
 export function buildBunDependencyLayoutPreflightFailureRun(args: {
@@ -2572,7 +2585,11 @@ async function runBunDependencyLayoutPreflight(
   const run = await runValidationCommand(
     repo,
     preflight.command,
-    resolveBunDependencyLayoutPreflightTimeoutMs(timeoutMs),
+    resolveBunDependencyLayoutPreflightTimeoutForValidationCommands(
+      repo,
+      validationCommands,
+      timeoutMs,
+    ),
     outputPolicy,
   );
   if (run.ok) {
