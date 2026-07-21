@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.83`
-- start_commit: `b1f474b31b9b461d1c256ef08b8d951c65f2eb6c`
-- end_commit: `77f992cacff33c21919e8e713a70655f6208e73e`
+- version: `v1.1.84`
+- start_commit: `cd838e78a8370eb20ba7dba5d23685875ed3e97f`
+- end_commit: `8a226705d85d3e22a465a0798fac7570d8a40d31`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Recognize repository-native aggregate validation commands as test execution when their package-script graph resolves to a direct test runner.
-- Follow nested Bun, npm, pnpm, and Yarn script aliases and inspect referenced JavaScript or TypeScript validation runners without requiring projects to rename their top-level `validate` command.
-- Preserve the existing direct-command checks while preventing successful suites such as SectorCommand's `bun run validate` from being rejected after all tests pass.
-- Ship the aggregate-test classifier in both the source runtime and npm-packaged runtime mirror with a regression fixture matching SectorCommand's `validate` to `validate:publish` runner structure.
+- Preserve prepared fixes across automatic validation-repair revisions instead of reverting them merely to restore an original narrow file count or planner scope.
+- Reject unresolved planner placeholders such as `bun test <target-test-file>` and replace them with an executable focused test command inferred from the changed test path.
+- Classify CRLF-only Windows worktree noise with three batched Git queries instead of spawning multiple Git processes for every reported path, eliminating multi-minute final-diff stalls in large repositories.
+- Keep long aggregate validation owned by PushPals' authoritative ValidationGate while repair executors diagnose the smallest failing subcommand.
+- Retry once when Vitest reports that every test and test file passed but exits nonzero on the exact worker RPC `EnvironmentTeardownError`; assertion failures and incomplete summaries remain hard failures.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`: 95 passed, 0 failed.
-- `bun run test:root`: 929 passed, 1 Windows signal-handling skip, 0 failed.
+- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`: 97 passed, 0 failed.
+- `bun run test:root`: 931 passed, 1 Windows signal-handling skip, 0 failed.
 - `bun run test:cli:e2e`: 10 passed, 0 failed.
-- The v1.1.83 classifier resolves the live SectorCommand repository's `bun run validate` command as test work while correctly excluding `bun run lint`.
-- Two v1.1.82 live SectorCommand jobs reproduced the false rejection only after the aggregate test, typecheck, lint, browser, and deploy-dry-run validation pipeline had executed.
+- A live v1.1.83 SectorCommand job reproduced all repaired paths: 188 CRLF-only status entries caused a multi-minute diff review; an unresolved `<target-test-file>` command failed; an earlier timer-type repair was reverted and later recreated; and all 27 Worker tests passed before Vitest emitted the retryable teardown error.
 - `git diff --check`
 
 ## Install
