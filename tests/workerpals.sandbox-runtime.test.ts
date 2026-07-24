@@ -14,6 +14,26 @@ const packagedDockerfilePath = join(
   "workerpals",
   "Dockerfile.sandbox",
 );
+const sourceCodexBackendPath = join(
+  repoRoot,
+  "apps",
+  "workerpals",
+  "src",
+  "backends",
+  "openai_codex_backend.ts",
+);
+const packagedCodexBackendPath = join(
+  repoRoot,
+  "packages",
+  "cli",
+  "runtime",
+  "sandbox",
+  "apps",
+  "workerpals",
+  "src",
+  "backends",
+  "openai_codex_backend.ts",
+);
 
 function readDockerfile(path: string): string {
   return readFileSync(path, "utf8").replaceAll("\r\n", "\n");
@@ -39,5 +59,16 @@ describe("WorkerPal sandbox runtime", () => {
 
   test("keeps the published CLI sandbox Dockerfile synchronized", () => {
     expect(readDockerfile(packagedDockerfilePath)).toBe(readDockerfile(sourceDockerfilePath));
+  });
+
+  test("uses the image-installed Codex binary before any registry-backed fallback", () => {
+    for (const path of [sourceCodexBackendPath, packagedCodexBackendPath]) {
+      const backend = readFileSync(path, "utf8");
+      const directCodex = backend.indexOf("if command -v codex");
+      const bunxFallback = backend.indexOf("elif command -v bunx");
+
+      expect(directCodex).toBeGreaterThanOrEqual(0);
+      expect(bunxFallback).toBeGreaterThan(directCodex);
+    }
   });
 });

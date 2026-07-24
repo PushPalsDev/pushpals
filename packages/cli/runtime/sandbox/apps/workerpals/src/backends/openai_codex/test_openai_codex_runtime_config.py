@@ -203,7 +203,23 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
         with mock.patch(
             "openai_codex_executor.shutil_which",
-            side_effect=lambda binary: {"bunx": "/usr/local/bin/bunx" }.get(binary, ""),
+            side_effect=lambda binary: {
+                "codex": "/root/.bun/bin/codex",
+                "bunx": "/usr/local/bin/bunx",
+            }.get(binary, ""),
+        ):
+            self.assertEqual(
+                _resolve_codex_command_prefix(cfg),
+                ["/root/.bun/bin/codex"],
+            )
+
+    def test_resolve_codex_command_prefix_uses_bunx_only_without_installed_codex(self) -> None:
+        cfg = OpenAICodexRuntimeConfig.from_sources(
+            SettingsResolver(env={}, config_loader=lambda: {}),
+        )
+        with mock.patch(
+            "openai_codex_executor.shutil_which",
+            side_effect=lambda binary: {"bunx": "/usr/local/bin/bunx"}.get(binary, ""),
         ):
             self.assertEqual(
                 _resolve_codex_command_prefix(cfg),

@@ -1655,6 +1655,17 @@ function migrateLegacyOpenAICodexDefaults(sectionBody: string, opts: { includeMo
   return updated;
 }
 
+function migrateLegacyWorkerCodexCommandDefault(
+  sectionBody: string,
+  key: "codex_bin" | "bin",
+): string {
+  const pattern = new RegExp(
+    `^(\\s*${key}\\s*=\\s*)"(?:bun\\s+x|bunx)\\s+--yes\\s+@openai/codex"\\s*$`,
+    "m",
+  );
+  return sectionBody.replace(pattern, '$1"codex"');
+}
+
 function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
   if (!existsSync(localTomlPath)) return;
   let original: string;
@@ -1668,13 +1679,25 @@ function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
     "$1enabled = true\n",
   );
   let migrated = updated;
-  for (const sectionName of ["localbuddy.llm", "remotebuddy.llm", "workerpals.llm"]) {
+  for (const sectionName of ["localbuddy.llm", "remotebuddy.llm"]) {
     migrated = migrateEmbeddedRuntimeTomlSection(migrated, sectionName, (sectionBody) =>
       migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: true }),
     );
   }
-  migrated = migrateEmbeddedRuntimeTomlSection(migrated, "workerpals.openai_codex", (sectionBody) =>
-    migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
+  migrated = migrateEmbeddedRuntimeTomlSection(migrated, "workerpals.llm", (sectionBody) =>
+    migrateLegacyWorkerCodexCommandDefault(
+      migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: true }),
+      "codex_bin",
+    ),
+  );
+  migrated = migrateEmbeddedRuntimeTomlSection(
+    migrated,
+    "workerpals.openai_codex",
+    (sectionBody) =>
+      migrateLegacyWorkerCodexCommandDefault(
+        migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
+        "bin",
+      ),
   );
   if (migrated !== original) {
     writeFileSync(localTomlPath, migrated, "utf8");

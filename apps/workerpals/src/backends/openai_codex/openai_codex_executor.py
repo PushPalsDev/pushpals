@@ -549,13 +549,14 @@ def _resolve_codex_command_prefix(config: OpenAICodexRuntimeConfig) -> List[str]
             return []
         return _normalize_command_prefix(parts)
 
-    # Prefer bunx to avoid requiring a separate node runtime in the container.
-    bunx = shutil_which("bunx")
-    if bunx:
-        return [bunx, "--yes", "@openai/codex"]
+    # The worker image installs Codex during image construction. Prefer that
+    # deterministic binary so job startup never needs registry access.
     codex = shutil_which("codex")
     if codex:
         return [codex]
+    bunx = shutil_which("bunx")
+    if bunx:
+        return [bunx, "--yes", "@openai/codex"]
     return []
 
 
@@ -2780,7 +2781,7 @@ def _run_codex_task(
             "summary": "openai_codex CLI is not installed",
             "stderr": (
                 "Could not find a runnable Codex command. "
-                "Expected one of: `bunx --yes @openai/codex` or `codex` in PATH. "
+                "Expected one of: `codex` or `bunx --yes @openai/codex` in PATH. "
                 "You can also set PUSHPALS_OPENAI_CODEX_BIN explicitly."
             ),
             "exitCode": 3,

@@ -27,10 +27,10 @@ function warmupProbeCommand(sharedVenvPython: string): string {
     'AUTH_MODE="$(printf %s "$AUTH_MODE_RAW" | tr "[:upper:]" "[:lower:]")"; ' +
     'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi; ' +
     '[ -n "$PY" ] || { echo "python runtime not found" >&2; exit 1; }; ' +
-    "if command -v bunx >/dev/null 2>&1; then " +
-    '  CODEX_CMD="bunx --yes @openai/codex"; ' +
-    "elif command -v codex >/dev/null 2>&1; then " +
+    "if command -v codex >/dev/null 2>&1; then " +
     '  CODEX_CMD="codex"; ' +
+    "elif command -v bunx >/dev/null 2>&1; then " +
+    '  CODEX_CMD="bunx --yes @openai/codex"; ' +
     "else " +
     '  echo "Neither bunx nor codex was found in PATH" >&2; ' +
     "  exit 1; " +

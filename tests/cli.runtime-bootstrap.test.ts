@@ -2061,9 +2061,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           "[workerpals.llm]",
           'backend = "openai_codex"',
           'model = "gpt-5.4"',
+          'codex_bin = "bun x --yes @openai/codex"',
           'reasoning_effort = "high"',
           "",
           "[workerpals.openai_codex]",
+          'bin = "bunx --yes @openai/codex"',
           'reasoning_effort = "high"',
           "",
         ].join("\n"),
@@ -2087,6 +2089,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(migratedLocalToml).toContain('reasoning_effort = "xhigh"');
       expect(migratedLocalToml).not.toContain("gpt-5.4");
       expect(migratedLocalToml).not.toContain('model = "gpt-5.5"');
+      expect(migratedLocalToml.match(/(?:codex_bin|bin) = "codex"/g)?.length).toBe(2);
+      expect(migratedLocalToml).not.toContain("@openai/codex");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -2108,6 +2112,13 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           'model = "gpt-5.5-mini"',
           'reasoning_effort = "medium"',
           "",
+          "[workerpals.llm]",
+          'backend = "openai_codex"',
+          'codex_bin = "/opt/codex/bin/codex"',
+          "",
+          "[workerpals.openai_codex]",
+          'bin = "custom-codex --profile worker"',
+          "",
         ].join("\n"),
         "utf8",
       );
@@ -2118,8 +2129,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       });
 
       expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+      const migratedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
       expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe("gpt-5.5-mini");
       expect(prepared.runtimePreflight.config?.remotebuddy.llm.reasoningEffort).toBe("medium");
+      expect(migratedLocalToml).toContain('codex_bin = "/opt/codex/bin/codex"');
+      expect(migratedLocalToml).toContain('bin = "custom-codex --profile worker"');
       expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toContain(
         'model = "gpt-5.5-mini"',
       );
