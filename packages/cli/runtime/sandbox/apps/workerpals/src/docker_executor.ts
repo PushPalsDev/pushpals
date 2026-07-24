@@ -1423,6 +1423,11 @@ export class DockerExecutor {
     containerWorktreePath: string,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<void> {
+    const startedAt = Date.now();
+    const startNote =
+      "[DockerExecutor] Projecting top-level dependency entries into the WorkerPal worktree.";
+    console.log(startNote);
+    onLog?.("stdout", startNote);
     const worktreePrefix = shellSingleQuote(`${containerWorktreePath}/`);
     const command = [
       "set -eu",
@@ -1433,11 +1438,21 @@ export class DockerExecutor {
       '  if { [ -e "$src" ] || [ -L "$src" ]; } && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then',
       '    snapshot_key="$(for manifest in /repo/package.json /repo/bun.lock /repo/bun.lockb; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done | sha256sum | cut -d " " -f 1)"',
       '    mkdir -p "$dest"',
-      '    if cp -as "$src"/. "$dest"/; then',
+      '    : > "$dest/.pushpals-dependency-projection-in-progress"',
+      "    projection_ok=1",
+      '    for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
+      '      if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi',
+      '      entry_name="${entry##*/}"',
+      '      case "$entry_name" in',
+      "        .cache|.expo|.vite|.pushpals-dependency-snapshot|.pushpals-dependency-projection-in-progress) continue ;;",
+      "      esac",
+      '      if ! ln -s "$entry" "$dest/$entry_name"; then projection_ok=0; break; fi',
+      "    done",
+      '    if [ "$projection_ok" = "1" ]; then',
       "      for mutable in .cache .expo .vite; do",
-      '        if [ -L "$dest/$mutable" ]; then rm -f "$dest/$mutable"; fi',
       '        mkdir -p "$dest/$mutable"',
       "      done",
+      '      rm -f "$dest/.pushpals-dependency-projection-in-progress"',
       '      rm -f "$dest/.pushpals-dependency-snapshot"',
       '      printf "%s\\n" "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"',
       '      linked="$linked $name"',
@@ -1470,8 +1485,9 @@ export class DockerExecutor {
     if (linked.length === 0) return;
 
     const note =
-      `[DockerExecutor] Materialized content-addressed worktree dependency snapshot(s): ` +
-      linked.join(", ");
+      `[DockerExecutor] Projected top-level worktree dependency snapshot(s) in ${
+        Date.now() - startedAt
+      }ms: ` + linked.join(", ");
     console.log(note);
     onLog?.("stdout", note);
   }

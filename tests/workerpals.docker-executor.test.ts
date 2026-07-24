@@ -462,7 +462,7 @@ describe("workerpals docker executor internals", () => {
     expect(calls).toEqual(["create", "fresh", "warm", "cleanup"]);
   });
 
-  test("links root dependency artifacts into ephemeral worktrees for browser hydration", async () => {
+  test("projects root dependency artifacts at constant depth for browser hydration", async () => {
     const executor = createExecutor() as unknown as {
       ensureWorktreeDependencyArtifacts: (
         containerWorktreePath: string,
@@ -495,13 +495,17 @@ describe("workerpals docker executor internals", () => {
 
     expect(capturedCommand).toContain('src="/repo/$name"');
     expect(capturedCommand).toContain("node_modules");
-    expect(capturedCommand).toContain("cp -as");
+    expect(capturedCommand).not.toContain("cp -as");
+    expect(capturedCommand).toContain('for entry in "$src"/* "$src"/.[!.]* "$src"/..?*');
+    expect(capturedCommand).toContain('ln -s "$entry" "$dest/$entry_name"');
+    expect(capturedCommand).toContain(".pushpals-dependency-projection-in-progress");
     expect(capturedCommand).toContain('rm -f "$dest/.pushpals-dependency-snapshot"');
     expect(capturedCommand).toContain(".pushpals-dependency-snapshot");
     expect(capturedCommand).toContain("/repo/.worktrees/job-browser-smoke/");
     expect(logs.join("\n")).toContain(
-      "Materialized content-addressed worktree dependency snapshot(s): node_modules",
+      "Projecting top-level dependency entries into the WorkerPal worktree.",
     );
+    expect(logs.join("\n")).toContain("Projected top-level worktree dependency snapshot(s) in ");
   });
 
   test("parseGitWorktreeListPorcelain extracts detached and prunable flags", () => {
