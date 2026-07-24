@@ -2,22 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.90`
-- start_commit: `1f7e0679d227b00cf0c3bd9443f64f085eda0e33`
-- end_commit: `f063c9f5212343b688cf52003f8d88558cbbddde`
+- version: `v1.1.91`
+- start_commit: `5da7f339cf47642cc7e1cb76f3646c4dbfcaea68`
+- end_commit: `0821d755f14a7fc68cdc039dc0411fc2e203d039`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Replace Docker's recursive `cp -as` dependency projection with constant-depth top-level links, avoiding multi-minute `node_modules` traversal through Docker Desktop bind mounts.
-- Keep `.cache`, `.expo`, and `.vite` worktree-local, retain the lockfile-addressed snapshot marker, and fall back to the prior whole-tree link if an individual entry cannot be linked.
-- Emit dependency-projection start and elapsed-time logs so long worktree preparation is visible in job diagnostics instead of appearing as an unknown quiet phase.
+- Run Docker-backed WorkerPal jobs with the Codex CLI already installed in the sandbox image instead of resolving `@openai/codex` from the package registry during every runtime warmup.
+- Migrate exact legacy WorkerPal `bun x --yes @openai/codex` and `bunx --yes @openai/codex` defaults to the deterministic in-image `codex` command while preserving explicit custom command overrides.
+- Keep a registry-backed `bunx` fallback only for nonstandard sandbox images that do not contain the bundled Codex command.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 944 passed, 1 Windows signal-handling skip, 0 failed, 3,541 assertions.
+- `bun run test:root`: 945 passed, 1 Windows signal-handling skip, 0 failed, 3,549 assertions.
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
 
