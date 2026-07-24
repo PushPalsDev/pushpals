@@ -2,32 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.1.88`
-- start_commit: `e63e61e765990c3eb4dc855f993fbe1ca7fe82c1`
-- end_commit: `3d8a50617f151fa6be23674551b082a4b9f47f5e`
+- version: `v1.1.89`
+- start_commit: `d71e1282d4bba3d4d2d5f9c4b4276038e28fc0a4`
+- end_commit: `d2ddad09631048674e0cf33c36056cf7462c019f`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Stop repeated merge-conflict repair loops after two failures for the same PR head/base fingerprint, reuse Git rerere state across attempts, and resume only when the PR fingerprint changes.
-- Make SourceControlManager the sole publisher of resolved PR branches: workers upload immutable internal refs, and publication requires exact head/base leases before an atomic force-with-lease update.
-- Replace root `node_modules` worktree links with lockfile-addressed local projections, run focused validation first, remove aggregate-subsumed commands, serialize heavyweight repo validators, and retry only the failed Worker stage before one aggregate confirmation.
-- Recover immediately from rejected shell-wrapper commands by resuming the same Codex thread, preserve exact structured token usage through Docker results, and avoid re-reading the repo on a fresh recovery thread.
-- Persist validation and patch diagnostics before terminal job updates, add recent-target cooldowns to autonomous selection, complete the seven-stage RemoteBuddy startup guard, and overlap CLI stability grace with service readiness probes.
+- Retry transient `EPERM`, `EACCES`, `EBUSY`, and `ETXTBSY` service-launch failures so freshly downloaded Windows runtime binaries recover after antivirus or operating-system scans instead of aborting startup.
+- Persist both interactive and runtime-only CLI supervisor ownership, and make `pushpals --clear` recover legacy supervisors through the repo-affine local server process tree when older state has no host PID.
+- Keep managed-service restart supervision alive when a restart spawn is temporarily blocked, with bounded backoff and explicit diagnostics instead of an unhandled timer failure.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 939 passed, 1 Windows signal-handling skip, 0 failed, 3,522 assertions.
-- `bun run test:protocol`
-- `python tests/openai_codex_executor_streaming.test.py`: 7 passed.
-- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py OpenAICodexRuntimeConfigTests.test_run_codex_task_escalates_wrapper_recovery_and_recovers`: 1 passed with preserved-thread resume exercised.
-- `bun x tsc --noEmit -p apps/server/tsconfig.json`
-- `bun x tsc --noEmit -p apps/source_control_manager/tsconfig.json`
-- `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
-- `bun x tsc --noEmit -p apps/remotebuddy/tsconfig.json`
-- `bun x tsc --noEmit -p packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
+- `bun run test:root`: 944 passed, 1 Windows signal-handling skip, 0 failed, 3,537 assertions.
+- Live cross-version cleanup regression: a healthy v1.1.88 runtime host with its CLI PID state removed was discovered through the repo-affine server listener, stopped, and cleared without locked runtime data.
 - `git diff --check`
 
 ## Install
@@ -57,7 +48,6 @@ bun install -g @pushpalsdev/cli
 - The first Docker-backed WorkerPal startup after upgrading rebuilds the sandbox image and downloads the Node, Python-agent, Playwright, and Chromium layers; subsequent starts reuse Docker's cached layers.
 - `execution_platform = "windows"` selects direct host WorkerPal execution so validation inherits the Windows host environment; it does not convert Docker Desktop Linux containers into Windows containers.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
-- Active runtime-only supervisors started from v1.1.64 or older did not write the new runtime-host PID state, so they may need to be stopped once manually before this release can prevent future `outputs/data` EBUSY loops.
 - The npm package still requires a working Bun runtime to launch the package entrypoint; PushPals does not vendor Bun or other external toolchains in the npm package.
 - Direct GitHub release binaries are PushPals-built standalone artifacts. Removing embedded Bun runtime from those standalone artifacts would require a separate runtime distribution redesign.
 - Active runtimes that were started from an older release must be restarted after installing this release before new startup or packaged-runtime behavior takes effect.
