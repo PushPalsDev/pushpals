@@ -58,6 +58,7 @@ import {
   resolveRuntimeDockerExecutableCandidates,
   resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
+  resolveCliRuntimeHostPidFromProcessTree,
   resolveCliRuntimeHostShutdownCandidate,
   resolveWorkerExecutionReadiness,
   resolveWorkerpalStartupReadinessProbeMaxMs,
@@ -76,6 +77,7 @@ import {
   resolveWindowsShellExecutableCandidatesForEnv,
   resolveWorkerpalDockerProbe,
   startEmbeddedMonitoringHub,
+  stopCliRuntimeHostFromServerListener,
   stopCliRuntimeHostFromState,
   shouldDeferRemoteBuddySessionConsumerReadiness,
   shouldPrepareEmbeddedWorkerpalDockerImageBlocking,
@@ -87,7 +89,9 @@ import {
   ServiceManager,
   computeServiceRestartBackoffMs,
   formatEmbeddedRuntimeHealthLines,
+  isRetryableManagedServiceLaunchError,
   shouldRestartService,
+  startManagedServiceWithRetry,
 } from "../scripts/start_runtime_services.ts";
 
 function withCliJobEventDebug<T>(fn: () => T): T {
@@ -236,6 +240,62 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(shouldRestartService(2.1, 2)).toBe(false);
   });
 
+  test("startManagedServiceWithRetry recovers from transient Windows launch denial", async () => {
+    let spawnCalls = 0;
+    const sleeps: number[] = [];
+    const retries: string[] = [];
+    const transientError = Object.assign(
+      new Error("EPERM: operation not permitted, uv_spawn 'pushpals-runtime-remotebuddy.exe'"),
+      { code: "EPERM" },
+    );
+    const supervisor = new ServiceManager({
+      spawnService: (spec) => {
+        spawnCalls += 1;
+        if (spawnCalls === 1) throw transientError;
+        return {
+          name: spec.name,
+          proc: {} as any,
+          command: [...spec.command],
+          cwd: spec.cwd,
+          env: { ...(spec.env ?? {}) },
+          exited: false,
+          exitCode: null,
+          launchedAtMs: Date.now(),
+        };
+      },
+    });
+
+    try {
+      const service = await startManagedServiceWithRetry(
+        supervisor,
+        {
+          name: "remotebuddy",
+          color: "",
+          command: ["pushpals-runtime-remotebuddy.exe"],
+          cwd: "C:\\repo",
+        },
+        {
+          computeBackoffMs: () => 25,
+          sleep: async (ms) => {
+            sleeps.push(ms);
+          },
+          onRetry: (error, attempt, maxAttempts) => {
+            retries.push(`${attempt}/${maxAttempts}:${String((error as Error).message)}`);
+          },
+        },
+      );
+
+      expect(service.name).toBe("remotebuddy");
+      expect(spawnCalls).toBe(2);
+      expect(sleeps).toEqual([25]);
+      expect(retries).toHaveLength(1);
+      expect(isRetryableManagedServiceLaunchError(transientError)).toBe(true);
+      expect(isRetryableManagedServiceLaunchError(new Error("ENOENT: binary missing"))).toBe(false);
+    } finally {
+      supervisor.stop();
+    }
+  });
+
   test("formatEmbeddedRuntimeHealthLines renders degraded state with action", () => {
     expect(
       formatEmbeddedRuntimeHealthLines({
@@ -357,6 +417,51 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(supervisor.getHealth()).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ServiceManager keeps supervising when a restart spawn is transiently blocked", async () => {
+    let spawnCalls = 0;
+    const events: string[] = [];
+    const supervisor = new ServiceManager({
+      pollMs: 25,
+      maxRestartAttempts: 2,
+      computeRestartBackoffMs: () => 25,
+      spawnService: (spec) => {
+        spawnCalls += 1;
+        if (spawnCalls === 2) {
+          throw Object.assign(new Error("EPERM: operation not permitted, uv_spawn"), {
+            code: "EPERM",
+          });
+        }
+        return {
+          name: spec.name,
+          proc: {} as any,
+          command: [...spec.command],
+          cwd: spec.cwd,
+          env: { ...(spec.env ?? {}) },
+          exited: spawnCalls === 1,
+          exitCode: spawnCalls === 1 ? 23 : null,
+          launchedAtMs: Date.now(),
+        };
+      },
+      onEvent: (_level, line) => events.push(line),
+    });
+    supervisor.startService({
+      name: "remotebuddy",
+      color: "",
+      command: ["fake-remotebuddy"],
+      cwd: "C:\\repo",
+    });
+
+    try {
+      await Bun.sleep(180);
+      expect(spawnCalls).toBe(3);
+      expect(supervisor.getService("remotebuddy")?.exited).toBe(false);
+      expect(events.some((line) => line.includes("could not launch"))).toBe(true);
+      expect(events.some((line) => line.includes("Restarted managed remotebuddy"))).toBe(true);
+    } finally {
+      supervisor.stop();
     }
   });
 
@@ -3685,6 +3790,32 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ).toMatchObject({ ok: false });
   });
 
+  test("resolveCliRuntimeHostShutdownCandidate requires explicit clear authority for interactive hosts", () => {
+    const state = {
+      repoRoot: "/repo/SectorCommand",
+      runtimeHostPid: 1234,
+      runtimeHostManagesRuntime: true,
+      runtimeHostRuntimeOnly: false,
+    };
+
+    expect(
+      resolveCliRuntimeHostShutdownCandidate(state, {
+        repoRoot: "/repo/SectorCommand",
+        currentPid: 9999,
+      }),
+    ).toEqual({
+      ok: false,
+      detail: "saved runtime host is not runtime-only",
+    });
+    expect(
+      resolveCliRuntimeHostShutdownCandidate(state, {
+        repoRoot: "/repo/SectorCommand",
+        currentPid: 9999,
+        requireRuntimeOnly: false,
+      }),
+    ).toEqual({ ok: true, pid: 1234 });
+  });
+
   test("isLikelyCliRuntimeHostCommandLine recognizes PushPals CLI hosts without matching child services", () => {
     expect(
       isLikelyCliRuntimeHostCommandLine(
@@ -3758,6 +3889,85 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     });
     expect(result.detail).toContain("no longer looks like a PushPals CLI process");
     expect(stopCalls).toBe(0);
+  });
+
+  test("resolveCliRuntimeHostPidFromProcessTree selects the nearest verified CLI ancestor", () => {
+    const processes = new Map([
+      [
+        100,
+        {
+          pid: 100,
+          parentPid: 200,
+          commandLine: '"C:\\runtime\\pushpals-runtime-server-windows-x64.exe"',
+        },
+      ],
+      [
+        200,
+        {
+          pid: 200,
+          parentPid: 300,
+          commandLine:
+            'bun "C:\\Users\\test\\.bun\\install\\global\\node_modules\\@pushpalsdev\\cli\\dist\\pushpals-cli.js"',
+        },
+      ],
+      [
+        300,
+        {
+          pid: 300,
+          parentPid: 400,
+          commandLine: 'powershell.exe -Command "pushpals"',
+        },
+      ],
+    ]);
+
+    expect(
+      resolveCliRuntimeHostPidFromProcessTree({
+        listenerPid: 100,
+        currentPid: 999,
+        readProcessInfo: (pid) => processes.get(pid) ?? null,
+      }),
+    ).toBe(200);
+  });
+
+  test("stopCliRuntimeHostFromServerListener stops only a verified listener ancestor", async () => {
+    const stopped: Array<{ pid: number; platform: NodeJS.Platform }> = [];
+    const result = await stopCliRuntimeHostFromServerListener({
+      serverUrl: "http://127.0.0.1:3001",
+      currentPid: 999,
+      platform: "win32",
+      readListenerPid: () => 100,
+      readProcessInfo: (pid) => {
+        if (pid === 100) {
+          return {
+            pid: 100,
+            parentPid: 200,
+            commandLine: '"C:\\runtime\\pushpals-runtime-server-windows-x64.exe"',
+          };
+        }
+        if (pid === 200) {
+          return {
+            pid: 200,
+            parentPid: 300,
+            commandLine:
+              'bun "C:\\Users\\test\\.bun\\install\\global\\node_modules\\@pushpalsdev\\cli\\dist\\pushpals-cli.js"',
+          };
+        }
+        return null;
+      },
+      stopProcessTree: (pid, platform) => {
+        stopped.push({ pid, platform });
+        return true;
+      },
+      sleep: async () => {},
+    });
+
+    expect(result).toEqual({
+      attempted: true,
+      stopped: true,
+      pid: 200,
+      detail: undefined,
+    });
+    expect(stopped).toEqual([{ pid: 200, platform: "win32" }]);
   });
 
   test("extractRemoteBuddySessionConsumerHealth recognizes the production RemoteBuddy agent identity", () => {

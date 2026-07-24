@@ -55,6 +55,14 @@ export type ServiceManagerOptions = {
   onEvent?: (level: "log" | "warn" | "error", line: string) => void;
 };
 
+export type ManagedServiceLaunchRetryOptions = {
+  maxAttempts?: number;
+  computeBackoffMs?: (attempt: number) => number;
+  sleep?: (ms: number) => Promise<void>;
+  shouldRetry?: (error: unknown) => boolean;
+  onRetry?: (error: unknown, attempt: number, maxAttempts: number, backoffMs: number) => void;
+};
+
 const DEFAULT_SERVICE_MANAGER_POLL_MS = 1_000;
 const DEFAULT_SERVICE_MANAGER_MAX_RESTART_ATTEMPTS = 4;
 const DEFAULT_SERVICE_MANAGER_STABLE_WINDOW_MS = 60_000;
@@ -87,6 +95,17 @@ export function shouldRestartService(
   const normalizedAttempts = Math.max(0, Math.floor(attempts));
   const normalizedMax = Math.max(1, Math.floor(maxAttempts));
   return normalizedAttempts < normalizedMax;
+}
+
+export function isRetryableManagedServiceLaunchError(error: unknown): boolean {
+  const code = String((error as NodeJS.ErrnoException | undefined)?.code ?? "")
+    .trim()
+    .toUpperCase();
+  if (["EPERM", "EACCES", "EBUSY", "ETXTBSY"].includes(code)) return true;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /\b(?:EPERM|EACCES|EBUSY|ETXTBSY)\b|operation not permitted|resource busy|text file busy/i.test(
+    message,
+  );
 }
 
 function pipeProcessStreamToLines(
@@ -185,7 +204,11 @@ export class ServiceManager {
   private readonly degradedAction: string;
   private readonly spawnService: (spec: ManagedServiceSpec) => ManagedServiceProcess;
   private readonly onHealthChange?: (health: EmbeddedRuntimeHealth | null) => void;
-  private readonly onServiceDegraded?: (name: string, reason: string, health: EmbeddedRuntimeHealth) => void;
+  private readonly onServiceDegraded?: (
+    name: string,
+    reason: string,
+    health: EmbeddedRuntimeHealth,
+  ) => void;
   private readonly onEvent?: (level: "log" | "warn" | "error", line: string) => void;
   private readonly timer: ReturnType<typeof setInterval>;
   private shutdownBegun = false;
@@ -201,7 +224,8 @@ export class ServiceManager {
       1_000,
       Math.floor(options.stableWindowMs ?? DEFAULT_SERVICE_MANAGER_STABLE_WINDOW_MS),
     );
-    this.computeRestartBackoffMs = options.computeRestartBackoffMs ?? computeServiceRestartBackoffMs;
+    this.computeRestartBackoffMs =
+      options.computeRestartBackoffMs ?? computeServiceRestartBackoffMs;
     this.degradedAction =
       options.degradedAction ??
       "Inspect the affected service logs or restart the runtime after fixing the failure.";
@@ -223,7 +247,10 @@ export class ServiceManager {
     return service;
   }
 
-  replaceService(spec: ManagedServiceSpec, options: { resetAttempts?: boolean } = {}): ManagedServiceProcess {
+  replaceService(
+    spec: ManagedServiceSpec,
+    options: { resetAttempts?: boolean } = {},
+  ): ManagedServiceProcess {
     const existing = this.services.get(spec.name);
     if (existing && !existing.exited) {
       try {
@@ -393,12 +420,45 @@ export class ServiceManager {
         if (!spec) return;
         if (!shouldRestartService(state.attempts, this.maxRestartAttempts)) return;
         state.attempts += 1;
-        const restarted = this.spawnService(spec);
-        this.services.set(name, restarted);
-        this.emitEvent("log", `Restarted managed ${name}.`);
+        try {
+          const restarted = this.spawnService(spec);
+          this.services.set(name, restarted);
+          this.emitEvent("log", `Restarted managed ${name}.`);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          state.lastRestartReason = `launch error: ${detail}`;
+          this.emitEvent(
+            "warn",
+            `Managed ${name} restart attempt ${state.attempts}/${this.maxRestartAttempts} could not launch: ${detail}`,
+          );
+        }
       }, backoffMs);
     }
   }
+}
+
+export async function startManagedServiceWithRetry(
+  serviceManager: ServiceManager,
+  spec: ManagedServiceSpec,
+  options: ManagedServiceLaunchRetryOptions = {},
+): Promise<ManagedServiceProcess> {
+  const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? 3));
+  const computeBackoffMs =
+    options.computeBackoffMs ?? ((attempt: number) => Math.min(10_000, 2_000 * attempt));
+  const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+  const shouldRetry = options.shouldRetry ?? isRetryableManagedServiceLaunchError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return serviceManager.startService(spec);
+    } catch (error) {
+      if (attempt >= maxAttempts || !shouldRetry(error)) throw error;
+      const backoffMs = Math.max(0, Math.floor(computeBackoffMs(attempt)));
+      options.onRetry?.(error, attempt, maxAttempts, backoffMs);
+      await sleep(backoffMs);
+    }
+  }
+  throw new Error(`Managed ${spec.name} launch retry loop ended without a result.`);
 }
 
 export function buildCoreManagedServiceSpecs(
@@ -409,7 +469,12 @@ export function buildCoreManagedServiceSpecs(
   const base = { cwd, env };
   return [
     { name: "server", color: "blue", command: [bunExecPath, "run", "server:only"], ...base },
-    { name: "remotebuddy", color: "red", command: [bunExecPath, "run", "remotebuddy:only"], ...base },
+    {
+      name: "remotebuddy",
+      color: "red",
+      command: [bunExecPath, "run", "remotebuddy:only"],
+      ...base,
+    },
     {
       name: "workerpals",
       color: "yellow",
@@ -422,6 +487,11 @@ export function buildCoreManagedServiceSpecs(
       command: [bunExecPath, "run", "source_control_manager:only:dev"],
       ...base,
     },
-    { name: "client", color: "green", command: [bunExecPath, "run", "client:only:offline"], ...base },
+    {
+      name: "client",
+      color: "green",
+      command: [bunExecPath, "run", "client:only:offline"],
+      ...base,
+    },
   ];
 }

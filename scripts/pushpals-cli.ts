@@ -29,6 +29,7 @@ import {
   computeServiceRestartBackoffMs,
   formatEmbeddedRuntimeHealthLines as formatSharedEmbeddedRuntimeHealthLines,
   shouldRestartService,
+  startManagedServiceWithRetry,
   type EmbeddedRuntimeHealth,
   type ManagedServiceProcess,
 } from "./start_runtime_services.js";
@@ -103,6 +104,12 @@ type CliRuntimeHostStopResult = {
   stopped: boolean;
   pid?: number;
   detail?: string;
+};
+
+type CliRuntimeProcessInfo = {
+  pid: number;
+  parentPid: number;
+  commandLine: string;
 };
 
 type SessionStreamPayload = {
@@ -293,6 +300,9 @@ const CLI_CLEAR_REMOVE_MAX_ATTEMPTS = 8;
 const CLI_CLEAR_REMOVE_RETRY_DELAY_MS = 250;
 const CLI_CLEAR_RUNTIME_HOST_STOP_DELAY_MS = 500;
 const CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS = 2_500;
+const CLI_CLEAR_RUNTIME_HOST_DISCOVERY_ATTEMPTS = 8;
+const CLI_CLEAR_RUNTIME_HOST_DISCOVERY_POLL_MS = 500;
+const CLI_RUNTIME_HOST_MAX_ANCESTORS = 16;
 const RUNTIME_BINARY_DOWNLOAD_ATTEMPTS = 3;
 const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS = 10_000;
@@ -4175,6 +4185,7 @@ export async function stopCliRuntimeHostFromState(opts: {
   cliStatePath?: string | null;
   state?: CliState;
   currentPid?: number;
+  requireRuntimeOnly?: boolean;
   platform?: NodeJS.Platform;
   readCommandLine?: (pid: number, platform: NodeJS.Platform) => string | null;
   stopProcessTree?: (pid: number, platform: NodeJS.Platform) => boolean;
@@ -4186,6 +4197,7 @@ export async function stopCliRuntimeHostFromState(opts: {
   const candidate = resolveCliRuntimeHostShutdownCandidate(state, {
     repoRoot: opts.repoRoot,
     currentPid: opts.currentPid,
+    requireRuntimeOnly: opts.requireRuntimeOnly,
   });
   if (!candidate.ok) {
     return { attempted: false, stopped: false, detail: candidate.detail };
@@ -4222,6 +4234,225 @@ export async function stopCliRuntimeHostFromState(opts: {
     stopped,
     pid: candidate.pid,
     detail: stopped ? undefined : "runtime host process stop command failed",
+  };
+}
+
+function resolveLocalServerPort(serverUrl: string): number | null {
+  try {
+    const url = new URL(serverUrl);
+    const host = url.hostname.toLowerCase();
+    if (!["127.0.0.1", "localhost", "::1"].includes(host)) return null;
+    const parsed = url.port
+      ? Number.parseInt(url.port, 10)
+      : url.protocol === "https:"
+        ? 443
+        : url.protocol === "http:"
+          ? 80
+          : Number.NaN;
+    return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 65_535 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function readRuntimeServerListenerPid(
+  serverUrl: string,
+  platform: NodeJS.Platform = process.platform,
+): number | null {
+  const port = resolveLocalServerPort(serverUrl);
+  if (!port) return null;
+  try {
+    if (platform === "win32") {
+      const script = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        `$listener = Get-NetTCPConnection -State Listen -LocalPort ${port} | Select-Object -First 1`,
+        "if ($listener -and $listener.OwningProcess) { [Console]::Out.Write([string]$listener.OwningProcess) }",
+      ].join("\n");
+      const result = Bun.spawnSync(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-EncodedCommand",
+          Buffer.from(script, "utf16le").toString("base64"),
+        ],
+        {
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "ignore",
+          timeout: CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        },
+      );
+      if (result.exitCode !== 0) return null;
+      return parsePositiveInteger(decodeSyncSubprocessOutput(result.stdout).trim()) ?? null;
+    }
+
+    const lsof = Bun.spawnSync(["lsof", "-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (lsof.exitCode === 0) {
+      const firstPid = decodeSyncSubprocessOutput(lsof.stdout).trim().split(/\s+/)[0];
+      const parsed = parsePositiveInteger(firstPid);
+      if (parsed) return parsed;
+    }
+    if (platform !== "linux") return null;
+
+    const ss = Bun.spawnSync(["ss", "-ltnp", `sport = :${port}`], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (ss.exitCode !== 0) return null;
+    const match = decodeSyncSubprocessOutput(ss.stdout).match(/\bpid=(\d+)\b/);
+    return parsePositiveInteger(match?.[1]) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readCliRuntimeProcessInfo(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+): CliRuntimeProcessInfo | null {
+  try {
+    if (platform === "win32") {
+      const script = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"`,
+        "if ($p) {",
+        '  [Console]::Out.Write(([string]$p.ProcessId) + "`n" + ([string]$p.ParentProcessId) + "`n" + ([string]$p.CommandLine))',
+        "}",
+      ].join("\n");
+      const result = Bun.spawnSync(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-EncodedCommand",
+          Buffer.from(script, "utf16le").toString("base64"),
+        ],
+        {
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "ignore",
+          timeout: CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        },
+      );
+      if (result.exitCode !== 0) return null;
+      const [rawPid, rawParentPid, ...commandLines] = decodeSyncSubprocessOutput(
+        result.stdout,
+      ).split(/\r?\n/);
+      const processId = parsePositiveInteger(rawPid);
+      const parentPid = parsePositiveInteger(rawParentPid);
+      if (!processId || !parentPid) return null;
+      return {
+        pid: processId,
+        parentPid,
+        commandLine: commandLines.join("\n").trim(),
+      };
+    }
+
+    const result = Bun.spawnSync(["ps", "-p", String(pid), "-o", "ppid=", "-o", "command="], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: CLI_RUNTIME_HOST_COMMAND_PROBE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (result.exitCode !== 0) return null;
+    const output = decodeSyncSubprocessOutput(result.stdout).trim();
+    const match = output.match(/^(\d+)\s+([\s\S]+)$/);
+    const parentPid = parsePositiveInteger(match?.[1]);
+    if (!parentPid || !match?.[2]) return null;
+    return { pid, parentPid, commandLine: match[2].trim() };
+  } catch {
+    return null;
+  }
+}
+
+export function resolveCliRuntimeHostPidFromProcessTree(opts: {
+  listenerPid: number;
+  currentPid?: number;
+  readProcessInfo: (pid: number) => CliRuntimeProcessInfo | null;
+  maxAncestors?: number;
+}): number | null {
+  const currentPid = opts.currentPid ?? process.pid;
+  const seen = new Set<number>();
+  let cursor = opts.listenerPid;
+  const maxAncestors = Math.max(1, opts.maxAncestors ?? CLI_RUNTIME_HOST_MAX_ANCESTORS);
+  for (let depth = 0; depth < maxAncestors; depth += 1) {
+    if (!Number.isSafeInteger(cursor) || cursor <= 0 || cursor === currentPid || seen.has(cursor)) {
+      break;
+    }
+    seen.add(cursor);
+    const info = opts.readProcessInfo(cursor);
+    if (!info || info.pid !== cursor) break;
+    if (isLikelyCliRuntimeHostCommandLine(info.commandLine)) {
+      return info.pid;
+    }
+    cursor = info.parentPid;
+  }
+  return null;
+}
+
+export async function stopCliRuntimeHostFromServerListener(opts: {
+  serverUrl: string;
+  currentPid?: number;
+  platform?: NodeJS.Platform;
+  readListenerPid?: (serverUrl: string, platform: NodeJS.Platform) => number | null;
+  readProcessInfo?: (pid: number, platform: NodeJS.Platform) => CliRuntimeProcessInfo | null;
+  stopProcessTree?: (pid: number, platform: NodeJS.Platform) => boolean;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<CliRuntimeHostStopResult> {
+  const platform = opts.platform ?? process.platform;
+  const listenerPid = (opts.readListenerPid ?? readRuntimeServerListenerPid)(
+    opts.serverUrl,
+    platform,
+  );
+  if (!listenerPid) {
+    return {
+      attempted: false,
+      stopped: false,
+      detail: "local runtime server listener process could not be resolved",
+    };
+  }
+  const readProcessInfo = opts.readProcessInfo ?? readCliRuntimeProcessInfo;
+  const hostPid = resolveCliRuntimeHostPidFromProcessTree({
+    listenerPid,
+    currentPid: opts.currentPid,
+    readProcessInfo: (pid) => readProcessInfo(pid, platform),
+  });
+  if (!hostPid) {
+    return {
+      attempted: false,
+      stopped: false,
+      pid: listenerPid,
+      detail: "local runtime server ancestry did not contain a verified PushPals CLI host",
+    };
+  }
+  const stopProcessTree = opts.stopProcessTree ?? stopCliRuntimeHostProcessTree;
+  const stopped = stopProcessTree(hostPid, platform);
+  if (stopped) {
+    const sleep = opts.sleep ?? ((ms: number) => Bun.sleep(ms));
+    await sleep(CLI_CLEAR_RUNTIME_HOST_STOP_DELAY_MS);
+  }
+  return {
+    attempted: true,
+    stopped,
+    pid: hostPid,
+    detail: stopped ? undefined : "discovered runtime host process stop command failed",
   };
 }
 
@@ -4299,12 +4530,37 @@ async function clearPushpalsState(opts: {
   const hostStop = await stopCliRuntimeHostFromState({
     repoRoot: opts.repoRoot,
     cliStatePath: opts.cliStatePath,
+    requireRuntimeOnly: false,
   });
-  if (hostStop.attempted && hostStop.stopped) {
-    console.log(`[pushpals] Stopped runtime host process: pid=${hostStop.pid}`);
-  } else if (hostStop.attempted) {
+  let effectiveHostStop = hostStop;
+  if (shutdown.accepted && !effectiveHostStop.stopped) {
+    for (let attempt = 0; attempt < CLI_CLEAR_RUNTIME_HOST_DISCOVERY_ATTEMPTS; attempt += 1) {
+      if (await probeServer(opts.serverUrl)) {
+        try {
+          await ensureServerRepoAffinity(opts.serverUrl, opts.repoRoot);
+          const discoveredHostStop = await stopCliRuntimeHostFromServerListener({
+            serverUrl: opts.serverUrl,
+          });
+          if (discoveredHostStop.attempted || discoveredHostStop.stopped) {
+            effectiveHostStop = discoveredHostStop;
+          }
+          if (discoveredHostStop.stopped) break;
+        } catch {
+          // The listener changed repo or disappeared between probes. Never stop an unverified host.
+        }
+      }
+      if (attempt + 1 < CLI_CLEAR_RUNTIME_HOST_DISCOVERY_ATTEMPTS) {
+        await Bun.sleep(CLI_CLEAR_RUNTIME_HOST_DISCOVERY_POLL_MS);
+      }
+    }
+  }
+  if (effectiveHostStop.attempted && effectiveHostStop.stopped) {
+    console.log(`[pushpals] Stopped runtime host process: pid=${effectiveHostStop.pid}`);
+  } else if (effectiveHostStop.attempted) {
     console.warn(
-      `[pushpals] Runtime host process stop did not complete${hostStop.detail ? `: ${hostStop.detail}` : "."}`,
+      `[pushpals] Runtime host process stop did not complete${
+        effectiveHostStop.detail ? `: ${effectiveHostStop.detail}` : "."
+      }`,
     );
   }
 
@@ -4953,16 +5209,29 @@ async function autoStartRuntimeServices(opts: {
     };
   };
   let latestServiceLaunchAtMs = 0;
-  const launchService = (
+  const launchService = async (
     name: RuntimeServiceName,
     command: string[],
     launchOpts?: {
       cwd?: string;
       appendLog?: boolean;
     },
-  ): RuntimeServiceProcess => {
+  ): Promise<RuntimeServiceProcess> => {
     const launchStartedAt = Date.now();
-    const service = serviceManager.startService(buildManagedServiceSpec(name, command, launchOpts));
+    const service = await startManagedServiceWithRetry(
+      serviceManager,
+      buildManagedServiceSpec(name, command, launchOpts),
+      {
+        onRetry: (error, attempt, maxAttempts, backoffMs) => {
+          const detail = error instanceof Error ? error.message : String(error);
+          const warning =
+            `[pushpals] Embedded ${name} process launch was blocked (${detail}); ` +
+            `retrying attempt ${attempt + 1}/${maxAttempts} in ${backoffMs}ms.`;
+          console.warn(warning);
+          appendRuntimeServicesLogLine(runtimeServicesLogPath, warning);
+        },
+      },
+    );
     latestServiceLaunchAtMs = Math.max(latestServiceLaunchAtMs, launchStartedAt);
     const launchDurationMs = Date.now() - launchStartedAt;
     if (launchDurationMs >= DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS) {
@@ -5067,7 +5336,7 @@ async function autoStartRuntimeServices(opts: {
   if (!serverHealthy) {
     const serverPhaseStartedAt = Date.now();
     console.log("[pushpals] Starting embedded server...");
-    const serverService = launchService("server", [runtimeBinaries.server]);
+    const serverService = await launchService("server", [runtimeBinaries.server]);
     const serverLogPath = serverService.logPath ?? serviceLogPaths.server;
     console.log(`[pushpals] server log: ${serverLogPath}`);
 
@@ -5122,7 +5391,7 @@ async function autoStartRuntimeServices(opts: {
   if (localBuddyEnabled) {
     const localBuddyPhaseStartedAt = Date.now();
     console.log("[pushpals] Starting embedded LocalBuddy...");
-    const localbuddyService = launchService("localbuddy", [runtimeBinaries.localbuddy]);
+    const localbuddyService = await launchService("localbuddy", [runtimeBinaries.localbuddy]);
     console.log(
       `[pushpals] localbuddy log: ${localbuddyService.logPath ?? serviceLogPaths.localbuddy}`,
     );
@@ -5138,7 +5407,7 @@ async function autoStartRuntimeServices(opts: {
 
   const remoteBuddyPhaseStartedAt = Date.now();
   console.log("[pushpals] Starting embedded RemoteBuddy...");
-  const remotebuddyService = launchService("remotebuddy", [runtimeBinaries.remotebuddy]);
+  const remotebuddyService = await launchService("remotebuddy", [runtimeBinaries.remotebuddy]);
   const remotebuddyLogPath = remotebuddyService.logPath ?? serviceLogPaths.remotebuddy;
   console.log(`[pushpals] remotebuddy log: ${remotebuddyLogPath}`);
   recordStartupPhase("remotebuddy", remoteBuddyPhaseStartedAt, "started");
@@ -5236,7 +5505,7 @@ async function autoStartRuntimeServices(opts: {
       } else if (scmRemoteStatus.status === "ok") {
         console.log(`[pushpals] Embedded SourceControlManager git=${scmGitProbe.detail}`);
         console.log("[pushpals] Starting embedded SourceControlManager...");
-        const sourceControlManagerService = launchService("source_control_manager", [
+        const sourceControlManagerService = await launchService("source_control_manager", [
           runtimeBinaries.sourceControlManager,
           "--skip-clean-check",
         ]);
@@ -6754,22 +7023,20 @@ async function main(): Promise<void> {
   const savedRuntimeHostState =
     saved.repoRoot &&
     normalizeRepoPathForComparison(saved.repoRoot) === normalizeRepoPathForComparison(repoRoot) &&
-    saved.runtimeHostManagesRuntime &&
-    saved.runtimeHostRuntimeOnly
+    saved.runtimeHostManagesRuntime
       ? {
           runtimeHostPid: saved.runtimeHostPid,
           runtimeHostManagesRuntime: saved.runtimeHostManagesRuntime,
           runtimeHostRuntimeOnly: saved.runtimeHostRuntimeOnly,
         }
       : {};
-  const runtimeHostState =
-    autoStartedServiceManager && parsed.runtimeOnly
-      ? {
-          runtimeHostPid: process.pid,
-          runtimeHostManagesRuntime: true,
-          runtimeHostRuntimeOnly: true,
-        }
-      : savedRuntimeHostState;
+  const runtimeHostState = autoStartedServiceManager
+    ? {
+        runtimeHostPid: process.pid,
+        runtimeHostManagesRuntime: true,
+        runtimeHostRuntimeOnly: parsed.runtimeOnly,
+      }
+    : savedRuntimeHostState;
 
   if (statePath) {
     writeCliState(statePath, {
