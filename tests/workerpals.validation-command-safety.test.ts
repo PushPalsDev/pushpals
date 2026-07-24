@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   buildBunDependencyLayoutPreflightFailureRun,
+  buildValidationExecutionDag,
   allowsValidationToolingOnlyChangeForTestFocusedTask,
   classifyValidationFailureScope,
   collectPrePublishHygieneIssues,
@@ -44,6 +45,7 @@ import {
   tokenizeValidationCommandArgv,
   validationCommandIncludesLongRunningBrowserWork,
   validationCommandIncludesTestWork,
+  validationCommandSubsumes,
 } from "../apps/workerpals/src/execute_job";
 
 function planningFixture(overrides: Partial<Record<string, unknown>> = {}) {
@@ -385,6 +387,47 @@ describe("workerpals validation command safety", () => {
         changedPaths: ["app/game.tsx"],
       });
       expect(commands.commandsToRun).toEqual(["bun x tsc --noEmit", "bun run lint"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("builds a focused-first validation DAG and removes aggregate-subsumed commands", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-dag-"));
+    try {
+      mkdirSync(join(root, "scripts"), { recursive: true });
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({
+          scripts: {
+            validate: "node ./scripts/validate.js",
+            validateAlias: "node ./scripts/validate.js",
+            lint: "eslint .",
+            typecheck: "tsc --noEmit",
+          },
+        }),
+      );
+      writeFileSync(
+        join(root, "scripts", "validate.js"),
+        [
+          'createStep("Lint", "bun", ["run", "lint"]);',
+          'createStep("Typecheck", "bun", ["run", "typecheck"]);',
+          'createStep("Tests", "bun", ["test"]);',
+        ].join("\n"),
+      );
+
+      expect(validationCommandSubsumes(root, "bun run validate", "bun run lint")).toBe(true);
+      expect(
+        buildValidationExecutionDag(root, [
+          "bun run lint",
+          "bun run typecheck",
+          "bun test ./tests/focused.test.ts",
+          "bun run validate",
+        ]),
+      ).toEqual(["bun test ./tests/focused.test.ts", "bun run validate"]);
+      expect(
+        buildValidationExecutionDag(root, ["bun run validate", "bun run validateAlias"]),
+      ).toEqual(["bun run validate"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

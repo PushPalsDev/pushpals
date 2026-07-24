@@ -8,7 +8,6 @@ import {
   type RepoStatus,
   type StartupCheckRecord,
   type StartupChecklistContext,
-  type StartupCheckRecord,
   type StartupFailureCode,
   type StartupTelemetryEvent,
   type StartupTelemetryPhaseEvent,

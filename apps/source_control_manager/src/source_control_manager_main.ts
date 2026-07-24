@@ -10,6 +10,7 @@ import { createSourceControlApi, runGitCommandCapture, type SourceControlApi } f
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
+import { buildReviewPublicationPushArgs, parseReviewPublicationLease } from "./review_publication";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
 import {
@@ -535,6 +536,9 @@ async function tick(): Promise<void> {
     }
 
     const completion = data.completion;
+    const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/")
+      ? parseReviewPublicationLease(completion.prBody)
+      : null;
     const comm = createSessionComm(completion.sessionId);
     const completionEventMeta =
       completion.origin === "autonomy"
@@ -577,6 +581,35 @@ async function tick(): Promise<void> {
       // 1. Refresh refs before applying completion commit/ref
       console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();
+      if (reviewPublicationLease) {
+        const fetchCompletionRef = await runGitCapture(
+          [
+            "-C",
+            runtimeConfig.repoPath,
+            "fetch",
+            runtimeConfig.remote,
+            `+${completion.branch}:${completion.branch}`,
+          ],
+          repoRoot,
+        );
+        if (!fetchCompletionRef.ok) {
+          throw new Error(
+            `Failed to fetch merge-conflict completion ref ${completion.branch}: ${fetchCompletionRef.stderr || fetchCompletionRef.stdout}`,
+          );
+        }
+        const fetchedCompletionSha = await runGitCapture(
+          ["-C", runtimeConfig.repoPath, "rev-parse", completion.branch],
+          repoRoot,
+        );
+        if (
+          !fetchedCompletionSha.ok ||
+          fetchedCompletionSha.stdout.trim().toLowerCase() !== completion.commitSha.toLowerCase()
+        ) {
+          throw new Error(
+            `Merge-conflict completion ref ${completion.branch} did not resolve to expected commit ${completion.commitSha}.`,
+          );
+        }
+      }
 
       // 2. Create temp branch and apply worker completion
       tempBranch = `_source_control_manager/${completion.id}`;
@@ -675,9 +708,52 @@ async function tick(): Promise<void> {
         }
 
         const completionPrTitle = (completion.prTitle ?? "").trim();
-        const resolvedHead = deriveReviewPrHeadBranch(completion.branch, completion.id);
+        const resolvedHead = reviewPublicationLease
+          ? { headBranch: reviewPublicationLease.targetBranch, requiresMaterialize: false }
+          : deriveReviewPrHeadBranch(completion.branch, completion.id);
         let prHeadBranch = resolvedHead.headBranch;
-        if (resolvedHead.requiresMaterialize) {
+        if (reviewPublicationLease) {
+          const prBaseBranch =
+            reviewPublicationLease.baseBranch ??
+            (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
+          if (reviewPublicationLease.expectedBaseSha) {
+            const remoteBase = await runGitCapture(
+              [
+                "-C",
+                runtimeConfig.repoPath,
+                "rev-parse",
+                `refs/remotes/${runtimeConfig.remote}/${prBaseBranch}`,
+              ],
+              repoRoot,
+            );
+            const actualBaseSha = remoteBase.ok ? remoteBase.stdout.trim().toLowerCase() : "";
+            if (actualBaseSha !== reviewPublicationLease.expectedBaseSha) {
+              throw new Error(
+                `Review base ${prBaseBranch} moved from expected ${reviewPublicationLease.expectedBaseSha.slice(0, 8)} to ${actualBaseSha.slice(0, 8) || "unknown"}; refusing stale merge-conflict publication.`,
+              );
+            }
+          }
+          console.log(
+            `[${ts()}] Publishing resolved merge-conflict commit ${completion.commitSha.slice(0, 8)} to ${prHeadBranch} with an exact force-with-lease.`,
+          );
+          const pushResult = await runGitCapture(
+            [
+              "-C",
+              runtimeConfig.repoPath,
+              ...buildReviewPublicationPushArgs({
+                remote: runtimeConfig.remote,
+                commitSha: completion.commitSha,
+                lease: reviewPublicationLease,
+              }),
+            ],
+            repoRoot,
+          );
+          if (!pushResult.ok) {
+            throw new Error(
+              `Failed exact-lease publication for review branch ${prHeadBranch}: ${pushResult.stderr || pushResult.stdout}`,
+            );
+          }
+        } else if (resolvedHead.requiresMaterialize) {
           const publishRef = skipLocalApplyDueConflict ? completion.commitSha : "HEAD";
           console.log(
             `[${ts()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch}`,
@@ -872,6 +948,23 @@ async function tick(): Promise<void> {
         );
       }
       if (cleanupHiddenCompletionRef) {
+        if (reviewPublicationLease) {
+          try {
+            const deleteRemoteCompletionRef = await runGitCapture(
+              ["-C", runtimeConfig.repoPath, "push", runtimeConfig.remote, `:${completion.branch}`],
+              repoRoot,
+            );
+            if (!deleteRemoteCompletionRef.ok) {
+              console.warn(
+                `[${ts()}] Failed to clean remote merge-conflict completion ref ${completion.branch}: ${deleteRemoteCompletionRef.stderr || deleteRemoteCompletionRef.stdout}`,
+              );
+            }
+          } catch (err: any) {
+            console.warn(
+              `[${ts()}] Failed to clean remote merge-conflict completion ref ${completion.branch}: ${err?.message ?? err}`,
+            );
+          }
+        }
         try {
           await gitOps.deleteLocalRef(completion.branch);
         } catch (err: any) {

@@ -53,6 +53,7 @@ import {
   precheckWorkerpalDockerAvailability,
   precheckSourceControlManagerGitAvailability,
   prepareCliRuntime,
+  remainingServiceStabilityGraceMs,
   resolveEmbeddedBunExecutableFromEnv,
   resolveRuntimeDockerExecutableCandidates,
   resolveRuntimeGitExecutableCandidates,
@@ -3067,6 +3068,23 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(summary).toBe(
       "[pushpals] startup timing summary: outcome=failed total=20001ms detail=server health timeout server=20000ms(timeout)",
     );
+  });
+
+  test("service stability grace overlaps time already spent in readiness probes", () => {
+    expect(
+      remainingServiceStabilityGraceMs({
+        latestServiceLaunchAtMs: 1_000,
+        nowMs: 3_500,
+        graceMs: 4_000,
+      }),
+    ).toBe(1_500);
+    expect(
+      remainingServiceStabilityGraceMs({
+        latestServiceLaunchAtMs: 1_000,
+        nowMs: 6_000,
+        graceMs: 4_000,
+      }),
+    ).toBe(0);
   });
 
   test("formatEmbeddedServiceLaunchDelayWarning explains slow Windows binary launch", () => {

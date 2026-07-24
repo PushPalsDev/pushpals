@@ -1836,6 +1836,24 @@ export function createRequestHandler() {
         const jobId = jobDiagnosticsMatch[1];
         return makeJson({ ok: true, jobId, diagnostics: jobQueue.getJobDiagnostics(jobId) });
       }
+      if (jobDiagnosticsMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobDiagnosticsMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        try {
+          const result = jobQueue.saveJobDiagnostics(jobId, body);
+          return makeJson(result, result.ok ? 200 : 404);
+        } catch (error) {
+          console.error(
+            `[Server] Failed to persist diagnostics for job ${jobId}: ${
+              error instanceof Error ? error.stack || error.message : String(error)
+            }`,
+          );
+          return makeJson({ ok: false, message: "Failed to persist job diagnostics" }, 500);
+        }
+      }
 
       // GET /completions
       if (pathname === "/completions" && method === "GET") {

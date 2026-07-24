@@ -138,6 +138,54 @@ async function postJsonWithTimeout(
   }
 }
 
+async function persistWorkerDiagnostics(
+  server: string,
+  headers: Record<string, string>,
+  jobId: string,
+  diagnostics: JobDiagnostics | undefined,
+): Promise<boolean> {
+  if (!diagnostics) return true;
+  const expectedValidationRuns = diagnostics.validationRuns?.length ?? 0;
+  const expectedPatchSnapshots = diagnostics.patchSnapshots?.length ?? 0;
+  try {
+    const response = await postJsonWithTimeout(
+      `${server}/jobs/${jobId}/diagnostics`,
+      headers,
+      { diagnostics },
+      5_000,
+    );
+    const payload = (await response.json().catch(() => null)) as {
+      ok?: unknown;
+      counts?: { validationRuns?: unknown; patchSnapshots?: unknown };
+      message?: unknown;
+    } | null;
+    const persistedValidationRuns = Number(payload?.counts?.validationRuns ?? 0);
+    const persistedPatchSnapshots = Number(payload?.counts?.patchSnapshots ?? 0);
+    if (
+      !response.ok ||
+      payload?.ok !== true ||
+      persistedValidationRuns < expectedValidationRuns ||
+      persistedPatchSnapshots < expectedPatchSnapshots
+    ) {
+      console.error(
+        `[WorkerPals] Diagnostics persistence verification failed for job ${jobId}: ` +
+          `expected validation=${expectedValidationRuns}, patches=${expectedPatchSnapshots}; ` +
+          `persisted validation=${persistedValidationRuns}, patches=${persistedPatchSnapshots}; ` +
+          `HTTP ${response.status}${payload?.message ? ` (${String(payload.message)})` : ""}`,
+      );
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error(
+      `[WorkerPals] Diagnostics upload failed for job ${jobId}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return false;
+  }
+}
+
 function inferFailureToolInvocation(result: JobResult): {
   tool?: string;
   argv?: string[];
@@ -1174,6 +1222,26 @@ function taskExecuteOrigin(params: Record<string, unknown> | undefined): "user" 
   return autonomy && typeof autonomy === "object" && !Array.isArray(autonomy) ? "autonomy" : "user";
 }
 
+function normalizeReviewLeaseBranch(value: unknown): string {
+  const branch = String(value ?? "")
+    .trim()
+    .replace(/^refs\/heads\//, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (
+    !branch ||
+    branch.includes("..") ||
+    branch.includes("@{") ||
+    branch.endsWith(".") ||
+    branch.endsWith(".lock") ||
+    /[~^:?*\[\]\s]/.test(branch)
+  ) {
+    return "";
+  }
+  return branch;
+}
+
 async function enqueueCompletion(
   server: string,
   headers: Record<string, string>,
@@ -1205,6 +1273,33 @@ async function enqueueCompletion(
       commit,
       resultSummary,
     });
+    const resolutionType = String(reviewAgent?.resolutionType ?? "")
+      .trim()
+      .toLowerCase();
+    const reviewTargetBranch = normalizeReviewLeaseBranch(reviewAgent?.prHeadRef);
+    const reviewExpectedHeadSha = String(reviewAgent?.prHeadSha ?? "")
+      .trim()
+      .toLowerCase();
+    const reviewExpectedBaseSha = String(reviewAgent?.prBaseSha ?? "")
+      .trim()
+      .toLowerCase();
+    const reviewBaseBranch = normalizeReviewLeaseBranch(reviewAgent?.prBaseRef);
+    const completionPrBody =
+      resolutionType === "merge_conflict" && reviewTargetBranch && reviewExpectedHeadSha
+        ? [
+            pr.body,
+            "",
+            "<!-- DO NOT EDIT: PushPals review publication lease below -->",
+            `<!-- pushpals-reviewTargetBranch: ${reviewTargetBranch} -->`,
+            ...(reviewBaseBranch
+              ? [`<!-- pushpals-reviewBaseBranch: ${reviewBaseBranch} -->`]
+              : []),
+            `<!-- pushpals-reviewExpectedHeadSha: ${reviewExpectedHeadSha} -->`,
+            ...(reviewExpectedBaseSha
+              ? [`<!-- pushpals-reviewExpectedBaseSha: ${reviewExpectedBaseSha} -->`]
+              : []),
+          ].join("\n")
+        : pr.body;
 
     const response = await postJsonWithTimeout(`${server}/completions/enqueue`, headers, {
       jobId: job.id,
@@ -1215,7 +1310,7 @@ async function enqueueCompletion(
       message: `${job.kind}: ${job.taskId} (worker PR metadata attached)`,
       prUrl,
       prTitle: pr.title,
-      prBody: pr.body,
+      prBody: completionPrBody,
     });
 
     if (response.ok) {
@@ -1840,6 +1935,7 @@ async function workerLoop(
                 },
               }),
             };
+            await persistWorkerDiagnostics(opts.server, headers, job.id, result.diagnostics);
 
             let statusPersistedToServer = false;
             let deferredForDirectRetry = false;

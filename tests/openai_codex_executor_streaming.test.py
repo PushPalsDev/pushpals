@@ -87,6 +87,16 @@ class OpenAICodexExecutorStreamingTests(unittest.TestCase):
         self.assertEqual(finalized["valid_json"], 0)
         self.assertEqual(finalized["invalid_json"], 1)
 
+    def test_captures_thread_id_for_context_preserving_recovery(self) -> None:
+        trace = module._empty_codex_trace()
+        module._record_live_codex_stdout_line(
+            '{"type":"thread.started","thread_id":"019f-thread-id"}',
+            True,
+            trace,
+        )
+        finalized = module._finalize_codex_stdout_trace(trace, True)
+        self.assertEqual(finalized["thread_id"], "019f-thread-id")
+
     def test_plain_text_mode_collects_summaries(self) -> None:
         trace = module._empty_codex_trace()
         module._record_live_codex_stdout_line("hello from codex", False, trace)

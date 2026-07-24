@@ -19,7 +19,7 @@
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
 import { loadPushPalsConfig } from "shared";
 import { writeFileSync } from "fs";
-import type { JobDiagnostics } from "./common/types.js";
+import type { JobDiagnostics, JobTokenUsage } from "./common/types.js";
 import {
   applyMergeConflictExecutionHints,
   isMergeConflictResolutionParams,
@@ -45,6 +45,7 @@ interface JobResult {
   stderr?: string;
   exitCode?: number;
   cooldownMs?: number;
+  usage?: JobTokenUsage;
   commit?: {
     branch: string;
     sha: string;
@@ -119,7 +120,7 @@ echo "password=${token}"
 export function buildJobRunnerResult(
   result: Pick<
     Awaited<ReturnType<typeof executeJob>>,
-    "ok" | "summary" | "stdout" | "stderr" | "exitCode" | "cooldownMs" | "diagnostics"
+    "ok" | "summary" | "stdout" | "stderr" | "exitCode" | "cooldownMs" | "usage" | "diagnostics"
   >,
 ): JobResult {
   return {
@@ -129,6 +130,7 @@ export function buildJobRunnerResult(
     stderr: result.stderr,
     exitCode: result.exitCode,
     cooldownMs: result.cooldownMs,
+    usage: result.usage,
     diagnostics: result.diagnostics,
   };
 }

@@ -169,9 +169,7 @@ describe("ReviewAgent", () => {
 
   test("summarizes repeated review findings as hard constraints", () => {
     const summary = summarizeRepeatedReviewFindings({
-      currentFindings: [
-        "The new helper is still unintegrated and only referenced by tests.",
-      ],
+      currentFindings: ["The new helper is still unintegrated and only referenced by tests."],
       previousFeedback: [
         "ReviewAgent: helper is not integrated into runtime behavior.",
         "ReviewAgent: unused helper only referenced by tests.",
@@ -573,52 +571,52 @@ describe("ReviewAgent", () => {
                 : {};
             const planning =
               params.planning && typeof params.planning === "object"
-                 ? (params.planning as Record<string, unknown>)
-                 : {};
-             const scope =
-               planning.scope && typeof planning.scope === "object"
-                 ? (planning.scope as Record<string, unknown>)
-                 : {};
-             const reviewAgent =
-               params.reviewAgent && typeof params.reviewAgent === "object"
-                 ? (params.reviewAgent as Record<string, unknown>)
-                 : {};
-             enqueuedInstruction = String(params.instruction ?? "");
-             enqueuedPlannerWorkerInstruction = String(params.plannerWorkerInstruction ?? "");
-             enqueuedCompletionBranch = String(params.completionBranch ?? "");
-             enqueuedRecentContext = Array.isArray(params.recentContext)
-               ? params.recentContext.map((entry) => String(entry))
-               : [];
-             enqueuedWriteGlobs = Array.isArray(scope.writeGlobs)
-               ? scope.writeGlobs.map((entry) => String(entry))
-               : [];
-             enqueuedTargetPaths = Array.isArray(planning.targetPaths)
-               ? planning.targetPaths.map((entry) => String(entry))
-               : [];
-             enqueuedValidationSteps = Array.isArray(planning.validationSteps)
-               ? planning.validationSteps.map((entry) => String(entry))
-               : [];
-             enqueuedResolutionType = String(reviewAgent.resolutionType ?? "");
-             enqueuedReviewThreshold = Number(reviewAgent.reviewThreshold ?? 0);
-             enqueuedReviewerFindings = Array.isArray(reviewAgent.reviewerFindings)
-               ? reviewAgent.reviewerFindings.map((entry) => String(entry))
-               : [];
-             return new Response(JSON.stringify({ ok: true, jobId: "job-fix-7" }), { status: 200 });
-           }
-           if (url.endsWith("/sessions/dev/command")) {
-             if (String(payload.type ?? "") === "task_created") {
-               const commandPayload =
-                  payload.payload && typeof payload.payload === "object"
-                    ? (payload.payload as Record<string, unknown>)
-                    : {};
-                createdTaskTitle = String(commandPayload.title ?? "");
-                createdTaskTags = Array.isArray(commandPayload.tags)
-                  ? commandPayload.tags.map((entry) => String(entry))
-                  : [];
-              }
-              emittedCommandTypes.push(String(payload.type ?? ""));
-              return new Response(JSON.stringify({ ok: true }), { status: 200 });
+                ? (params.planning as Record<string, unknown>)
+                : {};
+            const scope =
+              planning.scope && typeof planning.scope === "object"
+                ? (planning.scope as Record<string, unknown>)
+                : {};
+            const reviewAgent =
+              params.reviewAgent && typeof params.reviewAgent === "object"
+                ? (params.reviewAgent as Record<string, unknown>)
+                : {};
+            enqueuedInstruction = String(params.instruction ?? "");
+            enqueuedPlannerWorkerInstruction = String(params.plannerWorkerInstruction ?? "");
+            enqueuedCompletionBranch = String(params.completionBranch ?? "");
+            enqueuedRecentContext = Array.isArray(params.recentContext)
+              ? params.recentContext.map((entry) => String(entry))
+              : [];
+            enqueuedWriteGlobs = Array.isArray(scope.writeGlobs)
+              ? scope.writeGlobs.map((entry) => String(entry))
+              : [];
+            enqueuedTargetPaths = Array.isArray(planning.targetPaths)
+              ? planning.targetPaths.map((entry) => String(entry))
+              : [];
+            enqueuedValidationSteps = Array.isArray(planning.validationSteps)
+              ? planning.validationSteps.map((entry) => String(entry))
+              : [];
+            enqueuedResolutionType = String(reviewAgent.resolutionType ?? "");
+            enqueuedReviewThreshold = Number(reviewAgent.reviewThreshold ?? 0);
+            enqueuedReviewerFindings = Array.isArray(reviewAgent.reviewerFindings)
+              ? reviewAgent.reviewerFindings.map((entry) => String(entry))
+              : [];
+            return new Response(JSON.stringify({ ok: true, jobId: "job-fix-7" }), { status: 200 });
+          }
+          if (url.endsWith("/sessions/dev/command")) {
+            if (String(payload.type ?? "") === "task_created") {
+              const commandPayload =
+                payload.payload && typeof payload.payload === "object"
+                  ? (payload.payload as Record<string, unknown>)
+                  : {};
+              createdTaskTitle = String(commandPayload.title ?? "");
+              createdTaskTags = Array.isArray(commandPayload.tags)
+                ? commandPayload.tags.map((entry) => String(entry))
+                : [];
             }
+            emittedCommandTypes.push(String(payload.type ?? ""));
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
           return new Response("ok", { status: 200 });
         },
         now: () => 123,
@@ -1394,7 +1392,7 @@ describe("ReviewAgent", () => {
     expect(mergeCalls).toBe(1);
     expect(enqueueCalls).toBe(1);
     expect(enqueuedTaskId).toBe("review-merge-conflict-pr70-321");
-    expect(enqueuedDedupeKey).toBe("70:abc123def456");
+    expect(enqueuedDedupeKey).toBe("merge-conflict:70:abc123def456:ffff1111");
     expect(enqueuedResolutionType).toBe("merge_conflict");
     expect(enqueuedInstruction).toContain("Resolve merge conflicts for PR #70");
     expect(enqueuedInstruction).toContain("Do not create a new PR");
@@ -1545,6 +1543,65 @@ describe("ReviewAgent", () => {
 
     expect(reviewCalls).toBe(1);
     expect(enqueueCalls).toBe(0);
+  });
+
+  test("opens the merge-conflict circuit after two failures for the same head/base fingerprint", async () => {
+    const pr = makePr({ number: 73, html_url: "https://example.com/pr/73" });
+    let enqueueCalls = 0;
+    const warnings: string[] = [];
+    const failedJobs = ["failed-merge-1", "failed-merge-2"].map((id) => ({
+      id,
+      kind: "task.execute",
+      params: JSON.stringify({
+        reviewAgent: {
+          prNumber: pr.number,
+          prHeadSha: pr.head.sha,
+          prBaseSha: pr.base.sha,
+          resolutionType: "merge_conflict",
+        },
+      }),
+    }));
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/app.ts b/app.ts\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({ score: 9.2, summary: "Approved", issues: [], fix_instruction: "" }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "fix(app): improve behavior",
+        mergePullRequest: async () => {
+          throw new Error('GitHub API 405: {"message":"Pull Request is not mergeable"}');
+        },
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.includes("/jobs?status=failed")) {
+            return new Response(JSON.stringify({ ok: true, jobs: failedJobs }), { status: 200 });
+          }
+          if (url.includes("/jobs?status=")) {
+            return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+          }
+          if (url.endsWith("/jobs/enqueue")) enqueueCalls += 1;
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        logInfo: () => {},
+        logWarn: (message) => warnings.push(message),
+        logError: () => {},
+        closePullRequest: silentLogs.closePullRequest,
+        deleteBranchRef: silentLogs.deleteBranchRef,
+      },
+    );
+
+    await agent.poll();
+
+    expect(enqueueCalls).toBe(0);
+    expect(warnings.join("\n")).toContain("Merge-conflict circuit open");
+    expect(warnings.join("\n")).toContain("merge-conflict:73:abc123def456:ffff1111");
   });
 
   test("rejects when score is below threshold even when reviewer sets approved=true", async () => {

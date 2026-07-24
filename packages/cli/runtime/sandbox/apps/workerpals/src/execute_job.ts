@@ -11,6 +11,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "fs";
@@ -1804,6 +1805,118 @@ async function runValidationCommand(
   );
 }
 
+function isRepoAggregateValidationCommand(repo: string, command: string): boolean {
+  const resolvedScript = resolvePackageScriptForValidationCommand(repo, command);
+  if (!resolvedScript) return false;
+  if (/(?:^|:)(?:validate|validation|readiness|verify)(?:$|:)/i.test(resolvedScript.scriptName)) {
+    return true;
+  }
+  const text = `${resolvedScript.script}\n${readReferencedValidationScriptText(
+    resolvedScript.cwd,
+    resolvedScript.script,
+  )}`.toLowerCase();
+  const layers = [
+    /\b(?:bun|npm|pnpm|yarn|vitest|jest)\b[\s\S]{0,80}\btest\b/.test(text),
+    /\blint\b/.test(text),
+    /\b(?:typecheck|tsc)\b/.test(text),
+    /\b(?:e2e|playwright|browser)\b/.test(text),
+  ].filter(Boolean).length;
+  return layers >= 2;
+}
+
+async function acquireRepoValidationLease(
+  repo: string,
+  command: string,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<(() => void) | null> {
+  if (!isRepoAggregateValidationCommand(repo, command)) return () => {};
+  const commonDirResult = await git(repo, ["rev-parse", "--git-common-dir"]);
+  if (!commonDirResult.ok || !commonDirResult.stdout.trim()) return () => {};
+  const commonDir = resolve(repo, commonDirResult.stdout.trim());
+  const leaseParent = resolve(commonDir, "pushpals");
+  const leaseDir = resolve(leaseParent, "validation-lease");
+  const ownerPath = resolve(leaseDir, "owner.json");
+  const owner = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const waitStartedAt = Date.now();
+  let lastWaitLogAt = 0;
+  mkdirSync(leaseParent, { recursive: true });
+
+  while (Date.now() - waitStartedAt < 15 * 60_000) {
+    try {
+      mkdirSync(leaseDir);
+      try {
+        writeFileSync(
+          ownerPath,
+          JSON.stringify({ owner, command, acquiredAt: new Date().toISOString() }),
+          "utf8",
+        );
+      } catch (error) {
+        rmSync(leaseDir, { recursive: true, force: true });
+        throw error;
+      }
+      const waitedMs = Date.now() - waitStartedAt;
+      onLog?.(
+        "stdout",
+        `[ValidationGate] Acquired repo aggregate-validation lease${waitedMs >= 1_000 ? ` after ${waitedMs}ms` : ""}: ${command}`,
+      );
+      return () => {
+        try {
+          const currentOwner = JSON.parse(readFileSync(ownerPath, "utf8")) as { owner?: unknown };
+          if (currentOwner.owner === owner) rmSync(leaseDir, { recursive: true, force: true });
+        } catch {
+          // A stale-lease recovery or process shutdown may already have removed it.
+        }
+      };
+    } catch {
+      try {
+        if (Date.now() - statSync(leaseDir).mtimeMs > 90 * 60_000) {
+          rmSync(leaseDir, { recursive: true, force: true });
+          onLog?.("stderr", "[ValidationGate] Recovered stale repo validation lease.");
+          continue;
+        }
+      } catch {
+        // The holder may have released the lease between mkdir and stat.
+      }
+      if (Date.now() - lastWaitLogAt >= 30_000) {
+        lastWaitLogAt = Date.now();
+        onLog?.(
+          "stdout",
+          `[ValidationGate] Waiting for another WorkerPal's aggregate validation to finish: ${command}`,
+        );
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 750));
+    }
+  }
+  return null;
+}
+
+async function runValidationCommandWithRepoLease(
+  repo: string,
+  command: string,
+  timeoutMs: number,
+  outputPolicy: Partial<OutputCompactionPolicy>,
+  onLog?: (stream: "stdout" | "stderr", line: string) => void,
+): Promise<ValidationExecutionResult> {
+  const release = await acquireRepoValidationLease(repo, command, onLog);
+  if (!release) {
+    return {
+      step: command,
+      command,
+      ok: false,
+      exitCode: 75,
+      stdout: "",
+      stderr:
+        "Timed out waiting for the repo aggregate-validation lease. Another WorkerPal is still validating this repository; retry after it completes.",
+      elapsedMs: 15 * 60_000,
+    };
+  }
+  try {
+    return await runValidationCommand(repo, command, timeoutMs, outputPolicy);
+  } finally {
+    release();
+  }
+}
+
 export function isLongRunningBrowserValidationCommand(command: string): boolean {
   const normalized = validationCommandKey(command);
   if (!normalized) return false;
@@ -2007,7 +2120,7 @@ function packageJsonDeclaresPlaywright(repo: string): boolean {
 function resolvePackageScriptForValidationCommand(
   repo: string,
   command: string,
-): { script: string; cwd: string } | null {
+): { script: string; scriptName: string; cwd: string } | null {
   const argv = tokenizeValidationCommandArgv(command);
   if (!argv || argv.length === 0) return null;
   const first = argv[0]?.toLowerCase();
@@ -2074,7 +2187,7 @@ function resolvePackageScriptForValidationCommand(
   if (!scriptName) return null;
   const script = readPackageJson(cwd)?.scripts?.[scriptName];
   if (typeof script !== "string" || !script.trim()) return null;
-  return { script, cwd };
+  return { script, scriptName, cwd };
 }
 
 function readReferencedValidationScriptText(cwd: string, script: string): string {
@@ -3348,6 +3461,15 @@ export function shouldRetryAggregateWorkerValidationRunOnce(
   );
 }
 
+export function aggregateWorkerValidationRetryCommand(
+  run: ValidationExecutionResult,
+  repo?: string,
+): string | null {
+  if (!repo || !shouldRetryAggregateWorkerValidationRunOnce(run, repo)) return null;
+  const focusedCommand = "bun run test:worker";
+  return resolvePackageScriptForValidationCommand(repo, focusedCommand) ? focusedCommand : null;
+}
+
 export function shouldRetryPassingVitestTeardownOnce(run: ValidationExecutionResult): boolean {
   if (run.ok) return false;
   const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
@@ -4368,6 +4490,88 @@ function dedupeValidationCommands(...groups: string[][]): string[] {
   return out;
 }
 
+function isFocusedValidationCommand(command: string): boolean {
+  const argv = tokenizeValidationCommandArgv(command);
+  if (!argv) return false;
+  const lower = argv.map((entry) => entry.toLowerCase());
+  const testIndex = lower.findIndex((entry) => entry === "test");
+  if (testIndex < 0) return false;
+  return argv.slice(testIndex + 1).some((entry) => {
+    const normalized = normalizeValidationPathToken(entry);
+    return Boolean(normalized && !entry.startsWith("-"));
+  });
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function validationCommandSubsumes(
+  repo: string,
+  aggregateCommand: string,
+  candidateCommand: string,
+): boolean {
+  if (validationCommandKey(aggregateCommand) === validationCommandKey(candidateCommand)) {
+    return true;
+  }
+  const aggregate = resolvePackageScriptForValidationCommand(repo, aggregateCommand);
+  if (!aggregate) return false;
+  const candidate = resolvePackageScriptForValidationCommand(repo, candidateCommand);
+  const aggregateText = [
+    aggregate.script,
+    readReferencedValidationScriptText(aggregate.cwd, aggregate.script),
+  ].join("\n");
+  const normalizedCandidate = candidateCommand.trim().replace(/\s+/g, " ");
+  if (
+    new RegExp(escapeRegExp(normalizedCandidate).replace(/\\ /g, "\\s+"), "i").test(aggregateText)
+  ) {
+    return true;
+  }
+  if (candidate) {
+    const scriptNamePattern = new RegExp(
+      `(?:bun|npm|pnpm|yarn)(?:["'\`\\s,\\[\\]]+run)?["'\`\\s,\\[\\]]+${escapeRegExp(candidate.scriptName)}(?:["'\`\\s,\\[\\]]|$)`,
+      "i",
+    );
+    if (scriptNamePattern.test(aggregateText)) return true;
+    if (
+      candidate.script.length >= 8 &&
+      aggregateText.toLowerCase().includes(candidate.script.toLowerCase())
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function buildValidationExecutionDag(repo: string, commands: string[]): string[] {
+  const deduped = dedupeValidationCommands(commands);
+  const retained = deduped.filter((candidate, candidateIndex) => {
+    if (isFocusedValidationCommand(candidate)) return true;
+    return !deduped.some(
+      (aggregate, aggregateIndex) =>
+        aggregateIndex !== candidateIndex &&
+        validationCommandSubsumes(repo, aggregate, candidate) &&
+        (!validationCommandSubsumes(repo, candidate, aggregate) || aggregateIndex < candidateIndex),
+    );
+  });
+  return retained.sort((left, right) => {
+    const focusedDelta =
+      Number(isFocusedValidationCommand(right)) - Number(isFocusedValidationCommand(left));
+    if (focusedDelta !== 0) return focusedDelta;
+    const leftAggregate = resolvePackageScriptForValidationCommand(repo, left)
+      ? deduped.some(
+          (candidate) => candidate !== left && validationCommandSubsumes(repo, left, candidate),
+        )
+      : false;
+    const rightAggregate = resolvePackageScriptForValidationCommand(repo, right)
+      ? deduped.some(
+          (candidate) => candidate !== right && validationCommandSubsumes(repo, right, candidate),
+        )
+      : false;
+    return Number(leftAggregate) - Number(rightAggregate);
+  });
+}
+
 export function collectQualityGateValidationCommands(params: {
   instruction: string;
   targetPath?: string;
@@ -4401,11 +4605,14 @@ export function collectQualityGateValidationCommands(params: {
   const inferredRepoNativeValidationSteps = params.repo
     ? inferRepoNativeValidationCommands(params.repo, params.changedPaths ?? [])
     : [];
-  const commandsToRun = dedupeValidationCommands(
+  const discoveredCommands = dedupeValidationCommands(
     requiredRunnableSteps,
     plannerRunnableSteps.length > 0 ? plannerRunnableSteps : fallbackValidationSteps,
     inferredRepoNativeValidationSteps,
   ).slice(0, 16);
+  const commandsToRun = params.repo
+    ? buildValidationExecutionDag(params.repo, discoveredCommands)
+    : discoveredCommands;
   return {
     commandsToRun,
     requiredRunnableSteps,
@@ -5078,11 +5285,12 @@ async function runDeterministicQualityGate(
             continue;
           }
           onLog?.("stdout", `[ValidationGate] Running "${command}"`);
-          let run = await runValidationCommand(
+          let run = await runValidationCommandWithRepoLease(
             repo,
             command,
             resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
             outputPolicy,
+            onLog,
           );
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
           const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run, repo);
@@ -5090,6 +5298,9 @@ async function runDeterministicQualityGate(
             run,
             repo,
           );
+          const focusedAggregateRetryCommand = retryAggregateWorkerValidation
+            ? aggregateWorkerValidationRetryCommand(run, repo)
+            : null;
           const retryPassingVitestTeardown = shouldRetryPassingVitestTeardownOnce(run);
           if (
             retryBrowserValidation ||
@@ -5101,39 +5312,48 @@ async function runDeterministicQualityGate(
               retryPassingVitestTeardown
                 ? `[ValidationGate] Retrying validation once after all Vitest assertions passed but worker teardown failed: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`
                 : retryAggregateWorkerValidation
-                  ? `[ValidationGate] Retrying aggregate validation once after its nested Worker test failed during cold sandbox startup: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`
+                  ? `[ValidationGate] Retrying only the failed Worker validation stage after aggregate cold-start failure: ${focusedAggregateRetryCommand ?? command}${firstDigest ? ` - ${firstDigest}` : ""}`
                   : `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
             );
-            let retryRun = await runValidationCommand(
+            if (retryAggregateWorkerValidation) {
+              await new Promise((resolveWait) => setTimeout(resolveWait, 1_500));
+            }
+            const retryCommand = focusedAggregateRetryCommand ?? command;
+            let retryRun = await runValidationCommandWithRepoLease(
               repo,
-              command,
-              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
+              retryCommand,
+              resolveValidationCommandTimeoutMs(retryCommand, qualityValidationStepTimeoutMs, repo),
               outputPolicy,
+              onLog,
             );
-            let secondAggregateWorkerDigest = "";
-            if (
-              retryAggregateWorkerValidation &&
-              !retryRun.ok &&
-              shouldRetryAggregateWorkerValidationRunOnce(retryRun, repo)
-            ) {
-              secondAggregateWorkerDigest = extractValidationFailureDigest(retryRun);
+            if (focusedAggregateRetryCommand && retryRun.ok) {
               onLog?.(
-                "stderr",
-                `[ValidationGate] Retrying aggregate validation a second and final time after its nested Worker test remained transient: ${command}${secondAggregateWorkerDigest ? ` - ${secondAggregateWorkerDigest}` : ""}`,
+                "stdout",
+                `[ValidationGate] Focused Worker stage passed; rerunning the aggregate command once to verify all remaining stages: ${command}`,
               );
-              retryRun = await runValidationCommand(
+              retryRun = await runValidationCommandWithRepoLease(
                 repo,
                 command,
                 resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
                 outputPolicy,
+                onLog,
               );
+            } else if (focusedAggregateRetryCommand) {
+              retryRun = {
+                ...retryRun,
+                step: command,
+                command,
+                stderr: [
+                  `Aggregate validation retry narrowed to failed stage "${focusedAggregateRetryCommand}" and it remained failing.`,
+                  retryRun.stderr,
+                ]
+                  .filter(Boolean)
+                  .join("\n"),
+              };
             }
             if (!retryRun.ok && firstDigest) {
               retryRun.stderr = [
                 `Previous validation attempt failed before retry: ${firstDigest}`,
-                secondAggregateWorkerDigest
-                  ? `Second aggregate validation attempt failed before final retry: ${secondAggregateWorkerDigest}`
-                  : "",
                 retryRun.stderr,
               ]
                 .filter(Boolean)
@@ -7303,14 +7523,28 @@ async function createMergeConflictJobCommit(
   const remoteHeadSha = await currentRefSha(repo, `refs/remotes/origin/${publicBranchName}`);
   if (
     mergeConflictContext.expectedHeadSha &&
-    remoteHeadSha &&
     remoteHeadSha !== mergeConflictContext.expectedHeadSha
   ) {
     return {
       ok: false,
       error:
         `origin/${publicBranchName} moved from expected ${mergeConflictContext.expectedHeadSha.slice(0, 8)} ` +
-        `to ${remoteHeadSha.slice(0, 8)} while the job was running. Requeue on the newer branch head instead of overwriting it.`,
+        `to ${remoteHeadSha?.slice(0, 8) || "unknown"} while the job was running. Requeue on the newer branch head instead of overwriting it.`,
+    };
+  }
+  const remoteBaseSha = await currentRefSha(
+    repo,
+    `refs/remotes/origin/${mergeConflictContext.baseBranch}`,
+  );
+  if (
+    mergeConflictContext.expectedBaseSha &&
+    remoteBaseSha !== mergeConflictContext.expectedBaseSha
+  ) {
+    return {
+      ok: false,
+      error:
+        `origin/${mergeConflictContext.baseBranch} moved from expected ${mergeConflictContext.expectedBaseSha.slice(0, 8)} ` +
+        `to ${remoteBaseSha?.slice(0, 8) || "unknown"} while the job was running. Requeue against the newer base instead of publishing a stale rebase.`,
     };
   }
 
@@ -7411,31 +7645,29 @@ async function createMergeConflictJobCommit(
       ok: false,
       error:
         `Merge-conflict job ${job.id} did not finish rebased onto origin/${mergeConflictContext.baseBranch}. ` +
-        `Current branch ${currentBranch} must be a descendant of ${baseRemoteRef} before WorkerPals will push it.`,
+        `Current branch ${currentBranch} must be a descendant of ${baseRemoteRef} before WorkerPals can hand it to SourceControlManager.`,
     };
   }
 
-  if (remoteHeadSha && remoteHeadSha === headSha) {
-    return { ok: true, branch: publicBranchName, sha: headSha };
-  }
-
-  const pushArgs = [
-    "push",
-    mergeConflictContext.expectedHeadSha
-      ? `--force-with-lease=refs/heads/${publicBranchName}:${mergeConflictContext.expectedHeadSha}`
-      : "--force-with-lease",
-    "origin",
-    `HEAD:refs/heads/${publicBranchName}`,
-  ];
-  const push = await git(repo, pushArgs);
-  if (!push.ok) {
+  const hiddenCompletionRef = `refs/pushpals/review/${workerId}/${job.id}`;
+  const retain = await git(repo, ["update-ref", hiddenCompletionRef, headSha]);
+  if (!retain.ok) {
     return {
       ok: false,
-      error: `Failed to push rebased merge-conflict branch ${publicBranchName}: ${redactSensitiveText(push.stderr || push.stdout)}`,
+      error: `Failed to retain rebased merge-conflict commit for SourceControlManager: ${combinedGitOutput(retain)}`,
+    };
+  }
+  const upload = await git(repo, ["push", "origin", `${headSha}:${hiddenCompletionRef}`]);
+  if (!upload.ok) {
+    return {
+      ok: false,
+      error:
+        `Failed to upload immutable merge-conflict completion ref for SourceControlManager: ` +
+        redactSensitiveText(combinedGitOutput(upload)),
     };
   }
 
-  return { ok: true, branch: publicBranchName, sha: headSha };
+  return { ok: true, branch: hiddenCompletionRef, sha: headSha };
 }
 
 async function autoResolveRebaseConflicts(

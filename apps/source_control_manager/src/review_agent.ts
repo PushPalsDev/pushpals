@@ -55,7 +55,9 @@ const MAX_AUTONOMY_FEEDBACK_COMMENT_CHARS = 500;
 const MAX_AUTONOMY_FEEDBACK_SUMMARY_CHARS = 500;
 const MAX_ACTIVE_FIX_JOB_SCAN = 500;
 const REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS = 60_000;
-const REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 60_000;
+const REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 30 * 60_000;
+const MAX_MERGE_CONFLICT_ATTEMPTS_PER_FINGERPRINT = 2;
+const MERGE_CONFLICT_COMPLETION_SETTLE_MS = 30 * 60_000;
 const REPEATED_REVIEW_FINDING_MIN_PRIOR_COMMENTS = 3;
 const PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 const JOB_ID_MARKER = "pushpals-jobId";
@@ -581,12 +583,16 @@ const REVIEW_FINDING_THEMES: Array<{
   {
     key: "self-referential-tests",
     label: "self-referential or tautological tests",
-    patterns: [/\b(self[- ]?referential|tautolog|only tests? the helper|duplicates? implementation)\b/i],
+    patterns: [
+      /\b(self[- ]?referential|tautolog|only tests? the helper|duplicates? implementation)\b/i,
+    ],
   },
   {
     key: "unintegrated-helper",
     label: "new helper is not integrated into runtime behavior",
-    patterns: [/\b(unintegrated|not integrated|unused helper|dead helper|only referenced by tests?)\b/i],
+    patterns: [
+      /\b(unintegrated|not integrated|unused helper|dead helper|only referenced by tests?)\b/i,
+    ],
   },
   {
     key: "hardcoded-diagnostics",
@@ -601,12 +607,16 @@ const REVIEW_FINDING_THEMES: Array<{
   {
     key: "duplicate-or-misplaced-tests",
     label: "duplicate or misplaced tests",
-    patterns: [/\b(duplicate|misplaced|wrong file|wrong path)\b.{0,80}\b(test|coverage|assertion)s?\b/i],
+    patterns: [
+      /\b(duplicate|misplaced|wrong file|wrong path)\b.{0,80}\b(test|coverage|assertion)s?\b/i,
+    ],
   },
   {
     key: "pushpals-internal-leak",
     label: "PushPals-internal/autonomy concepts leaked into the user repo",
-    patterns: [/\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i],
+    patterns: [
+      /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i,
+    ],
   },
 ];
 
@@ -739,7 +749,9 @@ export function collectReviewHygieneIssuesFromDiff(diff: string): string[] {
     changedTestPaths.length > 0 &&
     changedRuntimePaths.length > 0 &&
     changedRuntimePaths.every((path) => /^utils\//i.test(path)) &&
-    !changedRuntimePaths.some((path) => /(?:index|route|screen|component|store|service)/i.test(path))
+    !changedRuntimePaths.some((path) =>
+      /(?:index|route|screen|component|store|service)/i.test(path),
+    )
   ) {
     issues.push(
       "PR adds utility/helper code with tests but no clear runtime integration point. Integrate the helper into behavior-owning code or keep it as a test fixture.",
@@ -962,9 +974,8 @@ function deriveReviewTaskLikelyDirs(paths: string[]): string[] {
 
 function deriveReviewTaskValidationSteps(paths: string[]): string[] {
   const targeted = paths
-    .filter(
-      (path) =>
-        /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
+    .filter((path) =>
+      /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
     )
     .slice(0, 4)
     .map((path) => `bun test ${formatBunTestPathArg(path)}`);
@@ -972,7 +983,9 @@ function deriveReviewTaskValidationSteps(paths: string[]): string[] {
 }
 
 function formatBunTestPathArg(path: string): string {
-  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
+  const normalized = String(path ?? "")
+    .replace(/\\/g, "/")
+    .trim();
   if (!normalized) return normalized;
   const pathArg =
     normalized.startsWith("./") ||
@@ -1054,13 +1067,15 @@ function buildMergeConflictPlannerWorkerInstruction(options: {
     lines.push(`- GitHub mergeability error: ${options.mergeErrorSummary}`);
   }
   if (options.changedPaths.length > 0) {
-    lines.push(`- Candidate changed paths from the approved PR: ${options.changedPaths.join(", ")}`);
+    lines.push(
+      `- Candidate changed paths from the approved PR: ${options.changedPaths.join(", ")}`,
+    );
   }
   lines.push(
     "- If the worker preloads an isolated sandbox branch or an in-progress rebase state, treat that current repo state as authoritative instead of re-discovering branch topology.",
   );
   lines.push(
-    `- Finish with ${options.prHeadRef} cleanly rebased onto ${options.prBaseRef}, validated, and ready to push back with force-with-lease if history changed.`,
+    `- Finish with ${options.prHeadRef} cleanly rebased onto ${options.prBaseRef} and validated. Leave publication to SourceControlManager; do not push or force-push from the worker.`,
   );
   return lines.join("\n");
 }
@@ -1073,6 +1088,15 @@ function normalizeReviewFixHeadSha(value: string): string {
 
 function reviewFixDedupeKey(prNumber: number, headSha: string): string {
   return `${prNumber}:${normalizeReviewFixHeadSha(headSha)}`;
+}
+
+export function mergeConflictDedupeKey(prNumber: number, headSha: string, baseSha: string): string {
+  return [
+    "merge-conflict",
+    Math.floor(prNumber),
+    normalizeReviewFixHeadSha(headSha),
+    normalizeReviewFixHeadSha(baseSha),
+  ].join(":");
 }
 
 function extractGitHubApiStatus(error: unknown): number | null {
@@ -1098,12 +1122,22 @@ function isUnmergeablePullRequestError(error: unknown): boolean {
 type ActiveJobLike = {
   id?: string;
   kind?: string;
+  status?: string;
+  createdAt?: string;
+  created_at?: string;
+  completedAt?: string;
+  completed_at?: string;
+  updatedAt?: string;
+  updated_at?: string;
   params?: string | Record<string, unknown> | null;
 };
 
 type ActiveReviewJobContext = {
   dedupeKey: string;
   resolutionType: "review_fix" | "merge_conflict" | string;
+  prNumber: number;
+  headSha: string;
+  baseSha: string;
 };
 
 function extractActiveReviewJobContextFromJob(job: ActiveJobLike): ActiveReviewJobContext | null {
@@ -1133,9 +1167,17 @@ function extractActiveReviewJobContextFromJob(job: ActiveJobLike): ActiveReviewJ
   const rawResolutionType = String(reviewAgentRecord.resolutionType ?? "")
     .trim()
     .toLowerCase();
+  const resolutionType = rawResolutionType || "review_fix";
+  const prBaseSha = normalizeReviewFixHeadSha(String(reviewAgentRecord.prBaseSha ?? ""));
   return {
-    dedupeKey: reviewFixDedupeKey(Math.floor(prNumber), prHeadSha),
-    resolutionType: rawResolutionType || "review_fix",
+    dedupeKey:
+      resolutionType === "merge_conflict"
+        ? mergeConflictDedupeKey(Math.floor(prNumber), prHeadSha, prBaseSha)
+        : reviewFixDedupeKey(Math.floor(prNumber), prHeadSha),
+    resolutionType,
+    prNumber: Math.floor(prNumber),
+    headSha: prHeadSha,
+    baseSha: prBaseSha,
   };
 }
 
@@ -1421,10 +1463,23 @@ export class ReviewAgent {
       pr.number,
       pr.head.sha,
       "merge_conflict",
+      pr.base.sha,
     );
     if (existingReviewJobId) {
       this.deps.logInfo(
-        `[${ts()}] [ReviewAgent] PR #${pr.number} already has active merge-conflict job ${existingReviewJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate merge-conflict enqueue.`,
+        `[${ts()}] [ReviewAgent] PR #${pr.number} already has active merge-conflict job ${existingReviewJobId} for fingerprint ${pr.head.sha.slice(0, 8)}:${pr.base.sha.slice(0, 8)}; skipping duplicate merge-conflict enqueue.`,
+      );
+      return true;
+    }
+
+    const circuit = await this.inspectMergeConflictCircuit(pr);
+    if (circuit.state !== "closed") {
+      const reason =
+        circuit.state === "settling"
+          ? `a completed resolution job is still inside the ${Math.round(MERGE_CONFLICT_COMPLETION_SETTLE_MS / 60_000)} minute SourceControlManager settle window`
+          : `${circuit.failedAttempts} failed attempts reached the per-fingerprint limit of ${MAX_MERGE_CONFLICT_ATTEMPTS_PER_FINGERPRINT}`;
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] Merge-conflict circuit ${circuit.state} for PR #${pr.number} fingerprint ${circuit.fingerprint}: ${reason}. Waiting for the PR head or base SHA to change before another attempt.`,
       );
       return true;
     }
@@ -1601,9 +1656,7 @@ export class ReviewAgent {
     const reason =
       context.reason ??
       `Reached PR feedback comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}).`;
-    this.deps.logWarn(
-      `[${ts()}] [ReviewAgent] PR #${pr.number} ${reason} Closing without merge.`,
-    );
+    this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} ${reason} Closing without merge.`);
 
     try {
       const result = await this.deps.closePullRequest({
@@ -1715,8 +1768,10 @@ export class ReviewAgent {
     prNumber: number,
     headSha: string,
     resolutionType?: "review_fix" | "merge_conflict",
+    baseSha = "",
   ): Promise<string | null> {
-    const dedupeKey = reviewFixDedupeKey(prNumber, headSha);
+    const normalizedHeadSha = normalizeReviewFixHeadSha(headSha);
+    const normalizedBaseSha = normalizeReviewFixHeadSha(baseSha);
     const headers: Record<string, string> = {};
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
     for (const status of ["pending", "claimed"] as const) {
@@ -1736,8 +1791,22 @@ export class ReviewAgent {
           if (!rawJob || typeof rawJob !== "object" || Array.isArray(rawJob)) continue;
           const job = rawJob as ActiveJobLike;
           const context = extractActiveReviewJobContextFromJob(job);
-          if (!context || context.dedupeKey !== dedupeKey) continue;
+          if (
+            !context ||
+            context.prNumber !== Math.floor(prNumber) ||
+            context.headSha !== normalizedHeadSha
+          ) {
+            continue;
+          }
           if (resolutionType && context.resolutionType !== resolutionType) continue;
+          if (
+            resolutionType === "merge_conflict" &&
+            normalizedBaseSha &&
+            context.baseSha &&
+            context.baseSha !== normalizedBaseSha
+          ) {
+            continue;
+          }
           const jobId =
             typeof job.id === "string" && job.id.trim().length > 0 ? job.id.trim() : "(unknown)";
           return jobId;
@@ -1749,6 +1818,79 @@ export class ReviewAgent {
       }
     }
     return null;
+  }
+
+  private async inspectMergeConflictCircuit(pr: GitHubPR): Promise<{
+    state: "closed" | "settling" | "open";
+    fingerprint: string;
+    failedAttempts: number;
+  }> {
+    const fingerprint = mergeConflictDedupeKey(pr.number, pr.head.sha, pr.base.sha);
+    const headers: Record<string, string> = {};
+    if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
+    let failedAttempts = 0;
+    let newestCompletedAt = 0;
+
+    for (const status of ["failed", "publish_blocked", "completed"] as const) {
+      try {
+        const url = `${this.serverUrl}/jobs?status=${status}&limit=${MAX_ACTIVE_FIX_JOB_SCAN}`;
+        const response = await this.deps.fetchImpl(url, { headers });
+        if (!response.ok) {
+          const text = await response.text().catch(() => "");
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Failed merge-conflict circuit scan (${status}) for PR #${pr.number}: HTTP ${response.status}${text ? `: ${text}` : ""}`,
+          );
+          continue;
+        }
+        const payload = (await response.json().catch(() => null)) as { jobs?: unknown } | null;
+        const jobs = payload && Array.isArray(payload.jobs) ? payload.jobs : [];
+        for (const rawJob of jobs) {
+          if (!rawJob || typeof rawJob !== "object" || Array.isArray(rawJob)) continue;
+          const job = rawJob as ActiveJobLike;
+          const context = extractActiveReviewJobContextFromJob(job);
+          if (
+            !context ||
+            context.resolutionType !== "merge_conflict" ||
+            context.dedupeKey !== fingerprint
+          ) {
+            continue;
+          }
+          if (status === "completed") {
+            const completedAt = Date.parse(
+              String(
+                job.completedAt ??
+                  job.completed_at ??
+                  job.updatedAt ??
+                  job.updated_at ??
+                  job.createdAt ??
+                  job.created_at ??
+                  "",
+              ),
+            );
+            if (Number.isFinite(completedAt)) {
+              newestCompletedAt = Math.max(newestCompletedAt, completedAt);
+            }
+          } else {
+            failedAttempts += 1;
+          }
+        }
+      } catch (err: any) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Merge-conflict circuit scan failed for PR #${pr.number} (${status}): ${err?.message ?? err}`,
+        );
+      }
+    }
+
+    if (failedAttempts >= MAX_MERGE_CONFLICT_ATTEMPTS_PER_FINGERPRINT) {
+      return { state: "open", fingerprint, failedAttempts };
+    }
+    if (
+      newestCompletedAt > 0 &&
+      this.deps.now() - newestCompletedAt < MERGE_CONFLICT_COMPLETION_SETTLE_MS
+    ) {
+      return { state: "settling", fingerprint, failedAttempts };
+    }
+    return { state: "closed", fingerprint, failedAttempts };
   }
 
   private async emitFixJobQueuedEvents(args: {
@@ -2137,7 +2279,7 @@ export class ReviewAgent {
       sessionId,
       kind: "task.execute",
       prUrl: pr.html_url,
-      dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha),
+      dedupeKey: mergeConflictDedupeKey(pr.number, pr.head.sha, pr.base.sha),
       dedupeCooldownMs: REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS,
       params: {
         schemaVersion: 2,
@@ -2180,6 +2322,7 @@ export class ReviewAgent {
           prNumber: pr.number,
           prUrl: pr.html_url,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
+          prBaseSha: normalizeReviewFixHeadSha(pr.base.sha),
           prHeadRef: prHeadRef ?? pr.head.ref,
           prBaseRef: pr.base.ref,
           resolutionType: "merge_conflict",

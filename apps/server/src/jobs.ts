@@ -1874,6 +1874,10 @@ export class JobQueue {
     const diagnostics = recordFromUnknown(body.diagnostics);
     if (!diagnostics) return;
 
+    const hasAttempts = Array.isArray(diagnostics.attempts);
+    const hasPhaseSpans = Array.isArray(diagnostics.phaseSpans);
+    const hasValidationRuns = Array.isArray(diagnostics.validationRuns);
+    const hasPatchSnapshots = Array.isArray(diagnostics.patchSnapshots);
     const attempts = arrayFromUnknown(diagnostics.attempts)
       .map(recordFromUnknown)
       .filter((entry): entry is Record<string, unknown> => Boolean(entry))
@@ -1893,11 +1897,17 @@ export class JobQueue {
     const terminal = recordFromUnknown(diagnostics.terminal);
 
     const tx = this.db.transaction(() => {
-      this.db.prepare(`DELETE FROM job_attempts WHERE jobId = ?`).run(jobId);
-      this.db.prepare(`DELETE FROM job_phase_spans WHERE jobId = ?`).run(jobId);
-      this.db.prepare(`DELETE FROM job_validation_runs WHERE jobId = ?`).run(jobId);
-      this.db.prepare(`DELETE FROM job_patch_snapshots WHERE jobId = ?`).run(jobId);
-      this.db.prepare(`DELETE FROM job_terminal_diagnostics WHERE jobId = ?`).run(jobId);
+      if (hasAttempts) this.db.prepare(`DELETE FROM job_attempts WHERE jobId = ?`).run(jobId);
+      if (hasPhaseSpans) this.db.prepare(`DELETE FROM job_phase_spans WHERE jobId = ?`).run(jobId);
+      if (hasValidationRuns) {
+        this.db.prepare(`DELETE FROM job_validation_runs WHERE jobId = ?`).run(jobId);
+      }
+      if (hasPatchSnapshots) {
+        this.db.prepare(`DELETE FROM job_patch_snapshots WHERE jobId = ?`).run(jobId);
+      }
+      if (terminal) {
+        this.db.prepare(`DELETE FROM job_terminal_diagnostics WHERE jobId = ?`).run(jobId);
+      }
 
       const insertAttempt = this.db.prepare(
         `INSERT INTO job_attempts (
@@ -2060,8 +2070,13 @@ export class JobQueue {
 
     try {
       this.recordJobDiagnostics(jobId, body, "completed", now);
-    } catch {
+    } catch (error) {
       // Diagnostics are best-effort and must not change terminal job status.
+      console.error(
+        `[JobQueue] Failed to persist completed diagnostics for ${jobId}: ${
+          error instanceof Error ? error.stack || error.message : String(error)
+        }`,
+      );
     }
 
     const completed = this.db
@@ -2119,8 +2134,13 @@ export class JobQueue {
 
     try {
       this.recordJobDiagnostics(jobId, body, "failed", now);
-    } catch {
+    } catch (error) {
       // Diagnostics are best-effort and must not change terminal job status.
+      console.error(
+        `[JobQueue] Failed to persist failed diagnostics for ${jobId}: ${
+          error instanceof Error ? error.stack || error.message : String(error)
+        }`,
+      );
     }
 
     const failed = this.db
@@ -2179,8 +2199,13 @@ export class JobQueue {
 
     try {
       this.recordJobDiagnostics(jobId, body, "publish_blocked", now);
-    } catch {
+    } catch (error) {
       // Diagnostics are best-effort and must not change terminal job status.
+      console.error(
+        `[JobQueue] Failed to persist publish-blocked diagnostics for ${jobId}: ${
+          error instanceof Error ? error.stack || error.message : String(error)
+        }`,
+      );
     }
 
     const blocked = this.db
@@ -3464,6 +3489,31 @@ export class JobQueue {
         metadata: parseObjectJson(row.metadataJson),
         createdAt: row.createdAt,
       })),
+    };
+  }
+
+  saveJobDiagnostics(
+    jobId: string,
+    body: Record<string, unknown>,
+  ): { ok: boolean; message?: string; counts?: Record<string, number> } {
+    const row = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(jobId) as
+      | { status: JobStatus }
+      | undefined;
+    if (!row) return { ok: false, message: "Job not found" };
+    this.recordJobDiagnostics(jobId, body, row.status, new Date().toISOString());
+    const diagnostics = this.getJobDiagnostics(jobId);
+    return {
+      ok: true,
+      counts: {
+        attempts: Array.isArray(diagnostics.attempts) ? diagnostics.attempts.length : 0,
+        phaseSpans: Array.isArray(diagnostics.phaseSpans) ? diagnostics.phaseSpans.length : 0,
+        validationRuns: Array.isArray(diagnostics.validationRuns)
+          ? diagnostics.validationRuns.length
+          : 0,
+        patchSnapshots: Array.isArray(diagnostics.patchSnapshots)
+          ? diagnostics.patchSnapshots.length
+          : 0,
+      },
     };
   }
 

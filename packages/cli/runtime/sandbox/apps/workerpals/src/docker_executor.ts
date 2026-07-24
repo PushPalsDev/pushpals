@@ -18,7 +18,7 @@ import { homedir } from "os";
 import { isAbsolute, relative, resolve } from "path";
 import { loadPushPalsConfig } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
-import type { ExecutorBackend, JobDiagnostics } from "./common/types.js";
+import type { ExecutorBackend, JobDiagnostics, JobTokenUsage } from "./common/types.js";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 import {
   BACKEND_DOCKER_PASSTHROUGH_ENV,
@@ -225,6 +225,7 @@ export interface DockerJobResult {
   stderr?: string;
   exitCode?: number;
   cooldownMs?: number;
+  usage?: JobTokenUsage;
   publishBlocked?: {
     summary: string;
     detail: string;
@@ -1430,8 +1431,21 @@ export class DockerExecutor {
       '  src="/repo/$name"',
       `  dest=${worktreePrefix}$name`,
       '  if { [ -e "$src" ] || [ -L "$src" ]; } && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then',
-      '    ln -s "$src" "$dest"',
-      '    linked="$linked $name"',
+      '    snapshot_key="$(for manifest in /repo/package.json /repo/bun.lock /repo/bun.lockb; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done | sha256sum | cut -d " " -f 1)"',
+      '    mkdir -p "$dest"',
+      '    if cp -as "$src"/. "$dest"/; then',
+      "      for mutable in .cache .expo .vite; do",
+      '        if [ -L "$dest/$mutable" ]; then rm -f "$dest/$mutable"; fi',
+      '        mkdir -p "$dest/$mutable"',
+      "      done",
+      '      rm -f "$dest/.pushpals-dependency-snapshot"',
+      '      printf "%s\\n" "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"',
+      '      linked="$linked $name"',
+      "    else",
+      '      rm -rf "$dest"',
+      '      ln -s "$src" "$dest"',
+      '      linked="$linked $name-fallback"',
+      "    fi",
       "  fi",
       "done",
       "printf '%s' \"$linked\"",
@@ -1455,7 +1469,9 @@ export class DockerExecutor {
       .filter(Boolean);
     if (linked.length === 0) return;
 
-    const note = `[DockerExecutor] Linked worktree dependency artifact(s): ${linked.join(", ")}`;
+    const note =
+      `[DockerExecutor] Materialized content-addressed worktree dependency snapshot(s): ` +
+      linked.join(", ");
     console.log(note);
     onLog?.("stdout", note);
   }

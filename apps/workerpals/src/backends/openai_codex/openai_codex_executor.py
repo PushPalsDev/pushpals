@@ -1647,6 +1647,7 @@ def _empty_codex_trace() -> Dict[str, Any]:
         "command_event_count": 0,
         "last_command_activity_at": None,
         "last_command_summary": "",
+        "thread_id": "",
     }
 
 
@@ -1774,6 +1775,15 @@ def _record_live_codex_stdout_line(
                 .strip()
                 or "event"
             )
+            if event_type == "thread.started":
+                thread_id = str(
+                    parsed.get("thread_id")
+                    or parsed.get("threadId")
+                    or parsed.get("id")
+                    or ""
+                ).strip()
+                if thread_id:
+                    trace["thread_id"] = thread_id
             _record_codex_command_activity(parsed, event_type, trace, observed_at)
             event_type_counts[event_type] = to_int(event_type_counts.get(event_type), 0) + 1
             summary = _summarize_json_event(parsed)
@@ -1840,6 +1850,7 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
     completion_tokens = to_int(trace.get("completion_tokens"), 0)
     total_tokens = to_int(trace.get("total_tokens"), 0)
     command_event_count = to_int(trace.get("command_event_count"), 0)
+    thread_id = str(trace.get("thread_id") or "").strip()
     if reasoning_events > 0:
         log.info(f"[codex] Reasoning-like event(s): {reasoning_events}")
     elif use_json and valid_json > 0:
@@ -1867,6 +1878,7 @@ def _finalize_codex_stdout_trace(trace: Dict[str, Any], use_json: bool) -> Dict[
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
         "command_event_count": command_event_count,
+        "thread_id": thread_id,
     }
 
 
@@ -2743,6 +2755,7 @@ def _run_codex_task(
     model_override: Optional[str] = None,
     baseline_changes: Optional[List[str]] = None,
     execution_deadline_monotonic: Optional[float] = None,
+    resume_thread_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     global _ACTIVE_CHILD, _INTERRUPTED_SIGNAL
     _INTERRUPTED_SIGNAL = None
@@ -2800,8 +2813,10 @@ def _run_codex_task(
         "never",
         env_name="workerpals.openai_codex.color",
     )
-    # JSON event output is noisy by default; prefer plain text + output-last-message.
-    use_json = runtime_config.json_output
+    # JSON events provide exact token usage and the thread id required for context-preserving
+    # recovery. They are compacted before being returned, so keep them enabled internally even
+    # when verbose JSON logging was not explicitly requested.
+    use_json = True
     requested_communicate_timeout_s = _resolve_communicate_timeout_seconds(runtime_config)
     recovery_depth = (
         wrapper_recovery_attempt
@@ -2836,10 +2851,19 @@ def _run_codex_task(
                 }
             communicate_timeout_s = max(1, min(requested_communicate_timeout_s, remaining_s))
     effective_supplemental_guidance = _augment_supplemental_guidance(supplemental_guidance)
-    prompt = _build_instruction(instruction, effective_supplemental_guidance)
+    prompt = (
+        "\n\n".join(
+            [
+                "Continue the same task from the preserved Codex thread.",
+                *[entry for entry in effective_supplemental_guidance if entry.strip()],
+            ]
+        )
+        if resume_thread_id
+        else _build_instruction(instruction, effective_supplemental_guidance)
+    )
     reasoning_effort = _resolve_task_reasoning_effort(
         _resolve_reasoning_effort(runtime_config, model),
-        prompt,
+        instruction if resume_thread_id else prompt,
         model,
     )
     baseline_snapshot = _normalize_baseline_snapshot(repo, baseline_changes)
@@ -2856,19 +2880,20 @@ def _run_codex_task(
             "-a",
             approval,
             "exec",
-            "-s",
-            sandbox,
-            "--color",
-            color,
-            "--output-last-message",
-            str(last_message_path),
         ]
-        for directory in sandbox_additional_dirs:
-            cmd.extend(["--add-dir", directory])
+        if resume_thread_id:
+            cmd.append("resume")
+        else:
+            cmd.extend(["-s", sandbox, "--color", color])
+            for directory in sandbox_additional_dirs:
+                cmd.extend(["--add-dir", directory])
+        cmd.extend(["--output-last-message", str(last_message_path)])
         if use_json:
             cmd.append("--json")
         if model:
             cmd.extend(["-m", model])
+        if resume_thread_id:
+            cmd.append(resume_thread_id)
         cmd.append("-")
 
         env = os.environ.copy()
@@ -3410,7 +3435,7 @@ def _run_codex_task(
 
                 with trace_lock:
                     wrapper_rejections = to_int(wrapper_rejection_state.get("count"), 0)
-                if wrapper_rejections >= 3:
+                if wrapper_rejections >= 1:
                     command_policy_rejection_loop = True
                     _terminate_active_child()
                     break
@@ -3869,6 +3894,7 @@ def _run_codex_task(
 
             if wrapper_recovery_attempt < _MAX_WRAPPER_RECOVERY_ATTEMPTS:
                 hard_recovery = wrapper_recovery_attempt >= 1
+                recovery_thread_id = str(stdout_trace.get("thread_id") or "").strip()
                 recovery_guidance = _build_wrapper_recovery_guidance(
                     rejected_shell_wrappers,
                     hard=hard_recovery,
@@ -3880,12 +3906,17 @@ def _run_codex_task(
                         else ""
                     )
                     log.warning(
-                        "Codex hit a shell-wrapper rejection loop; retrying once with "
+                        "Codex hit a shell-wrapper rejection; recovering immediately with "
                         + (
                             "strict no-wrapper recovery guidance."
                             + (" Added direct-command context bootstrap." if bootstrap_context else "")
                             if hard_recovery
                             else "direct-command recovery guidance."
+                        )
+                        + (
+                            " Resuming the preserved Codex thread."
+                            if recovery_thread_id
+                            else " Thread id unavailable; starting a compact fresh recovery."
                         )
                     )
                     retry_result = _run_codex_task(
@@ -3904,6 +3935,7 @@ def _run_codex_task(
                         model_override=model_override,
                         baseline_changes=baseline_snapshot,
                         execution_deadline_monotonic=overall_deadline,
+                        resume_thread_id=recovery_thread_id or None,
                     )
                     retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                     if wrapper_recovery_attempt == 0 and retry_result.get("ok"):

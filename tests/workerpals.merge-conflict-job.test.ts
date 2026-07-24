@@ -294,7 +294,7 @@ describe("workerpals merge-conflict sandbox", () => {
   );
 
   runMergeConflictTest(
-    "createJobCommit force-pushes a completed merge-conflict rebase back to the same PR branch",
+    "createJobCommit uploads an immutable completion ref without updating the PR branch",
     async () => {
       const fixture = await createConflictFixture();
       try {
@@ -334,7 +334,9 @@ describe("workerpals merge-conflict sandbox", () => {
             runtimeConfig,
           );
           expect(commitResult.ok).toBe(true);
-          expect(commitResult.branch).toBe(fixture.publicBranch);
+          expect(commitResult.branch).toBe(
+            "refs/pushpals/review/workerpal-test/job-merge-conflict",
+          );
           expect(commitResult.sha).toBeTruthy();
           expect(commitResult.sha).not.toBe(fixture.prHeadSha);
 
@@ -343,7 +345,13 @@ describe("workerpals merge-conflict sandbox", () => {
             ["ls-remote", "--heads", "origin", `refs/heads/${fixture.publicBranch}`],
             "inspect remote branch",
           );
-          expect(lsRemote.startsWith(`${commitResult.sha}\t`)).toBe(true);
+          expect(lsRemote.startsWith(`${fixture.prHeadSha}\t`)).toBe(true);
+          const stagedRef = await mustGit(
+            fixture.sourceRepo,
+            ["ls-remote", "origin", commitResult.branch!],
+            "inspect immutable completion ref",
+          );
+          expect(stagedRef.startsWith(`${commitResult.sha}\t`)).toBe(true);
           const resolvedFile = readFileSync(join(prepared.repoPath, fixture.conflictFile), "utf8");
           expect(resolvedFile).toContain("resolved");
         } finally {

@@ -17,6 +17,7 @@ type Equal<A, B> =
       : false
     : false;
 type Assert<T extends true> = T;
+type AssertFalse<T extends false> = T;
 
 type WorkerTaskExecutePlanningContract = Parameters<InferFallbackValidationCommandsForTestTask>[2];
 

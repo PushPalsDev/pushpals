@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync } from "fs";
+import { createHash } from "crypto";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, join, resolve } from "path";
 
@@ -14,6 +15,7 @@ type MergeConflictReviewContext = {
   publicBranch: string;
   baseBranch: string;
   expectedHeadSha: string;
+  expectedBaseSha: string;
   mergeError: string;
 };
 
@@ -32,7 +34,9 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function normalizeBranchName(value: unknown): string {
-  const trimmed = String(value ?? "").trim().replace(/^refs\/heads\//, "");
+  const trimmed = String(value ?? "")
+    .trim()
+    .replace(/^refs\/heads\//, "");
   const normalized = trimmed
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
@@ -126,7 +130,9 @@ function isTestPath(path: string): boolean {
 }
 
 function formatBunTestPathArg(path: string): string {
-  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
+  const normalized = String(path ?? "")
+    .replace(/\\/g, "/")
+    .trim();
   if (!normalized) return normalized;
   const pathArg =
     normalized.startsWith("./") ||
@@ -172,12 +178,12 @@ function buildPlannerGuidance(
   const lines = [
     "Merge-conflict sandbox state:",
     `- You are on local branch ${context.publicBranch} inside an isolated container-local clone. This branch exists only inside the worker sandbox and does not switch the user's active checkout.`,
-    `- Remote push target: origin/${context.publicBranch}`,
+    `- SourceControlManager publication target: origin/${context.publicBranch}`,
     `- Rebase target: origin/${context.baseBranch}`,
   ];
   if (context.expectedHeadSha) {
     lines.push(
-      `- Expected remote lease SHA for push-back: ${context.expectedHeadSha}. If origin/${context.publicBranch} moved, stop and report the mismatch instead of overwriting newer work.`,
+      `- Expected remote lease SHA for SourceControlManager publication: ${context.expectedHeadSha}. If origin/${context.publicBranch} moved, stop and report the mismatch instead of overwriting newer work.`,
     );
   }
   if (context.mergeError) {
@@ -210,7 +216,9 @@ function buildPlannerGuidance(
       "- After editing, run `git add <files>` and `git -c core.editor=true rebase --continue` until the rebase completes.",
     );
   }
-  lines.push("- Do not create a new PR or alternate branch. Update only the existing PR branch.");
+  lines.push(
+    "- Do not create a new PR, alternate branch, push, or force-push. Leave the resolved commit in the sandbox; SourceControlManager is the sole publisher for the existing PR branch.",
+  );
   return lines.join("\n");
 }
 
@@ -219,7 +227,9 @@ export function extractMergeConflictReviewContext(
 ): MergeConflictReviewContext | null {
   const reviewAgent = asRecord(params?.reviewAgent);
   if (!reviewAgent) return null;
-  const resolutionType = String(reviewAgent.resolutionType ?? "").trim().toLowerCase();
+  const resolutionType = String(reviewAgent.resolutionType ?? "")
+    .trim()
+    .toLowerCase();
   if (resolutionType !== "merge_conflict") return null;
 
   const publicBranch = normalizeBranchName(params?.completionBranch ?? reviewAgent.prHeadRef);
@@ -230,8 +240,32 @@ export function extractMergeConflictReviewContext(
     publicBranch,
     baseBranch,
     expectedHeadSha: String(reviewAgent.prHeadSha ?? "").trim(),
+    expectedBaseSha: String(reviewAgent.prBaseSha ?? "").trim(),
     mergeError: String(reviewAgent.mergeError ?? "").trim(),
   };
+}
+
+async function resolveRerereCacheDir(
+  sourceRepo: string,
+  context: MergeConflictReviewContext,
+): Promise<string> {
+  const gitCommonDir = await mustGit(
+    sourceRepo,
+    ["rev-parse", "--git-common-dir"],
+    "resolve common git dir",
+  );
+  const commonDir = resolve(sourceRepo, gitCommonDir);
+  const fingerprint = createHash("sha256")
+    .update(
+      [
+        context.publicBranch,
+        context.expectedHeadSha,
+        context.baseBranch,
+        context.expectedBaseSha,
+      ].join("\0"),
+    )
+    .digest("hex");
+  return join(commonDir, "pushpals", "merge-conflict-rerere", fingerprint);
 }
 
 export function isMergeConflictResolutionParams(
@@ -313,9 +347,15 @@ export async function prepareMergeConflictTaskRepo(
   const sourceUserEmail = (await git(sourceRepo, ["config", "--get", "user.email"])).stdout.trim();
   const sandboxRoot = mkdtempSync(join(tmpdir(), "pushpals-merge-conflict-"));
   const repoPath = join(sandboxRoot, "repo");
+  const rerereCacheDir = await resolveRerereCacheDir(sourceRepo, context);
   mkdirSync(repoPath, { recursive: true });
 
   const cleanup = () => {
+    const sandboxRerereDir = join(repoPath, ".git", "rr-cache");
+    if (existsSync(sandboxRerereDir)) {
+      mkdirSync(rerereCacheDir, { recursive: true });
+      cpSync(sandboxRerereDir, rerereCacheDir, { recursive: true, force: true });
+    }
     rmSync(sandboxRoot, { recursive: true, force: true });
   };
 
@@ -334,6 +374,16 @@ export async function prepareMergeConflictTaskRepo(
     );
     await mustGit(repoPath, ["config", "rerere.enabled", "true"], "enable rerere");
     await mustGit(repoPath, ["config", "rerere.autoupdate", "true"], "enable rerere autoupdate");
+    if (existsSync(rerereCacheDir)) {
+      cpSync(rerereCacheDir, join(repoPath, ".git", "rr-cache"), {
+        recursive: true,
+        force: true,
+      });
+      onLog?.(
+        "stdout",
+        `[MergeConflict] Restored reusable conflict resolutions for the current PR head/base fingerprint.`,
+      );
+    }
 
     const fetchArgs = [
       "fetch",

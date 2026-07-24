@@ -3522,6 +3522,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "import json",
                         "import sys",
                         "import time",
                         "",
@@ -3533,6 +3534,9 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "        break",
                         "",
                         "prompt = sys.stdin.read()",
+                        "if prompt.startswith('Continue the same task') and 'resume' not in argv:",
+                        "    print('context-preserving recovery did not use codex exec resume', file=sys.stderr)",
+                        "    sys.exit(3)",
                         "hard_marker = 'Your first command invocation on this retry must be one of the direct replacements listed below'",
                         "bootstrap_marker = 'Direct command context bootstrap:'",
                         "pwd_marker = 'Direct command: `pwd`'",
@@ -3546,6 +3550,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "    print('item.completed | Used backend bootstrap context after strict recovery guidance.', flush=True)",
                         "    sys.exit(0)",
                         "",
+                        "print(json.dumps({'type': 'thread.started', 'thread_id': '019f-wrapper-recovery-thread'}), flush=True)",
                         "for line in (",
                         "    'error=exec_command failed for `/bin/bash -lc pwd`: CreateProcess { message: \"Rejected\" }',",
                         "    'error=exec_command failed for `/bin/bash -lc \\'git branch --show-current\\'`: CreateProcess { message: \"Rejected\" }',",

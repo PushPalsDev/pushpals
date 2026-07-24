@@ -495,9 +495,13 @@ describe("workerpals docker executor internals", () => {
 
     expect(capturedCommand).toContain('src="/repo/$name"');
     expect(capturedCommand).toContain("node_modules");
-    expect(capturedCommand).toContain("ln -s");
+    expect(capturedCommand).toContain("cp -as");
+    expect(capturedCommand).toContain('rm -f "$dest/.pushpals-dependency-snapshot"');
+    expect(capturedCommand).toContain(".pushpals-dependency-snapshot");
     expect(capturedCommand).toContain("/repo/.worktrees/job-browser-smoke/");
-    expect(logs.join("\n")).toContain("Linked worktree dependency artifact(s): node_modules");
+    expect(logs.join("\n")).toContain(
+      "Materialized content-addressed worktree dependency snapshot(s): node_modules",
+    );
   });
 
   test("parseGitWorktreeListPorcelain extracts detached and prunable flags", () => {

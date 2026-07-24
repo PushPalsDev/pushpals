@@ -228,6 +228,7 @@ export type TaskExecutePlanning = {
   validationSteps: string[];
   requiredValidationSteps?: string[];
   repoHintDiagnostics?: string[];
+  repoHintStalePaths?: string[];
   queuePriority: RequestPriority;
   queueWaitBudgetMs: number;
   executionBudgetMs: number;

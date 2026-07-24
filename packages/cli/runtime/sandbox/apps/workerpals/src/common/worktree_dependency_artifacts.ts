@@ -1,4 +1,15 @@
-import { lstatSync, symlinkSync } from "fs";
+import { createHash } from "crypto";
+import {
+  copyFileSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { resolve } from "path";
 
 type JobLog = (stream: "stdout" | "stderr", line: string) => void;
@@ -33,6 +44,50 @@ function linkTypeForHost(): "dir" | "junction" {
   return process.platform === "win32" ? "junction" : "dir";
 }
 
+const MUTABLE_DEPENDENCY_DIRS = new Set([".cache", ".expo", ".vite"]);
+
+export function dependencySnapshotKey(repo: string): string {
+  const hash = createHash("sha256");
+  let included = 0;
+  for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
+    const path = resolve(repo, name);
+    try {
+      hash.update(name);
+      hash.update("\0");
+      hash.update(readFileSync(path));
+      hash.update("\0");
+      included += 1;
+    } catch {
+      // A repository may use only one lockfile format.
+    }
+  }
+  return included > 0 ? hash.digest("hex") : "unversioned";
+}
+
+function materializeDependencySnapshot(
+  source: string,
+  destination: string,
+  snapshotKey: string,
+): void {
+  mkdirSync(destination, { recursive: true });
+  for (const entry of readdirSync(source)) {
+    const sourceEntry = resolve(source, entry);
+    const destinationEntry = resolve(destination, entry);
+    const stat = lstatSync(sourceEntry);
+    if (MUTABLE_DEPENDENCY_DIRS.has(entry)) {
+      mkdirSync(destinationEntry, { recursive: true });
+    } else if (
+      stat.isDirectory() ||
+      (stat.isSymbolicLink() && statSync(sourceEntry).isDirectory())
+    ) {
+      symlinkSync(sourceEntry, destinationEntry, linkTypeForHost());
+    } else {
+      copyFileSync(sourceEntry, destinationEntry);
+    }
+  }
+  writeFileSync(resolve(destination, ".pushpals-dependency-snapshot"), `${snapshotKey}\n`, "utf8");
+}
+
 export function linkDirectWorktreeDependencyArtifacts(
   repo: string,
   worktreePath: string,
@@ -56,9 +111,16 @@ export function linkDirectWorktreeDependencyArtifacts(
     }
 
     try {
-      symlinkSync(source, destination, linkTypeForHost());
+      if (name === "node_modules") {
+        materializeDependencySnapshot(source, destination, dependencySnapshotKey(repo));
+      } else {
+        symlinkSync(source, destination, linkTypeForHost());
+      }
       linked.push(name);
     } catch (err) {
+      if (name === "node_modules" && pathExistsOrLink(destination)) {
+        rmSync(destination, { recursive: true, force: true });
+      }
       const warning = `[WorkerPals] Worktree dependency artifact linking skipped for ${name}: ${
         err instanceof Error ? err.message : String(err)
       }`;
@@ -69,7 +131,9 @@ export function linkDirectWorktreeDependencyArtifacts(
   }
 
   if (linked.length > 0) {
-    const note = `[WorkerPals] Linked worktree dependency artifact(s): ${linked.join(", ")}`;
+    const note =
+      `[WorkerPals] Materialized content-addressed worktree dependency snapshot(s): ` +
+      linked.join(", ");
     console.log(note);
     onLog?.("stdout", note);
   }

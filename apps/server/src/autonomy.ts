@@ -302,6 +302,7 @@ export interface AutonomySnapshot {
   engine_source_priors: EngineSourcePrior[];
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: OpenObjective[];
+  recent_objectives: OpenObjective[];
   repo_health_flags: {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
@@ -3716,6 +3717,7 @@ export class AutonomyStore {
         engine_source_priors: snapshot.engine_source_priors.slice(0, 40),
         active_cooldowns: snapshot.active_cooldowns.slice(0, 40),
         open_objectives: snapshot.open_objectives.slice(0, 40),
+        recent_objectives: snapshot.recent_objectives.slice(0, 80),
         repo_health_flags: snapshot.repo_health_flags,
         dispatch_budget: snapshot.dispatch_budget,
         resource_budget: snapshot.resource_budget,
@@ -4001,16 +4003,15 @@ export class AutonomyStore {
          LIMIT 50`,
       )
       .all() as Array<
-        Omit<OpenObjective, "target_paths" | "scope"> & { scope_json: string | null }
-      >;
-    const openObjectives: OpenObjective[] = openObjectiveRows.map((row) => {
+      Omit<OpenObjective, "target_paths" | "scope"> & { scope_json: string | null }
+    >;
+    const hydrateObjective = (
+      row: Omit<OpenObjective, "target_paths" | "scope"> & { scope_json: string | null },
+    ): OpenObjective => {
       const scopeRecord = parseJsonObject(row.scope_json);
       const targetPaths = asStringArray(scopeRecord.targetPaths ?? scopeRecord.target_paths);
       const writeGlobs = asStringArray(scopeRecord.writeGlobs ?? scopeRecord.write_globs);
-      const readAnywhere = asBoolean(
-        scopeRecord.readAnywhere ?? scopeRecord.read_anywhere,
-        false,
-      );
+      const readAnywhere = asBoolean(scopeRecord.readAnywhere ?? scopeRecord.read_anywhere, false);
       return {
         objective_id: row.objective_id,
         status: row.status,
@@ -4025,7 +4026,21 @@ export class AutonomyStore {
         },
         updated_at: row.updated_at,
       };
-    });
+    };
+    const openObjectives: OpenObjective[] = openObjectiveRows.map(hydrateObjective);
+    const recentObjectiveRows = this.db
+      .prepare(
+        `SELECT id AS objective_id, status, objective_type, component_area, pattern_key, scope_json, updated_at
+         FROM autonomy_objectives
+         WHERE status NOT IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
+           AND updated_at >= ?
+         ORDER BY updated_at DESC
+         LIMIT 100`,
+      )
+      .all(new Date(Date.parse(now) - 24 * 60 * 60_000).toISOString()) as Array<
+      Omit<OpenObjective, "target_paths" | "scope"> & { scope_json: string | null }
+    >;
+    const recentObjectives = recentObjectiveRows.map(hydrateObjective);
     const dispatchBudget = this.getDispatchCountsLastHour(now);
     const resourceBudget = this.resourceBudgetSnapshot(now);
     const stateTraits = this.buildStateTraits({
@@ -4052,6 +4067,7 @@ export class AutonomyStore {
       engine_source_priors: engineSourcePriors,
       active_cooldowns: activeCooldowns,
       open_objectives: openObjectives,
+      recent_objectives: recentObjectives,
       repo_health_flags: {
         is_worktree_dirty: Boolean(params.repoHealthFlags?.is_worktree_dirty),
         is_merge_in_progress: Boolean(params.repoHealthFlags?.is_merge_in_progress),

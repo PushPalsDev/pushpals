@@ -60,6 +60,49 @@ describe("server JobQueue diagnostics", () => {
     expect(failed.ok).toBe(true);
   }
 
+  test("explicit diagnostic uploads survive a later partial terminal update", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueClaimedJob(queue, "task-diagnostic-upload");
+    const uploaded = queue.saveJobDiagnostics(jobId, {
+      diagnostics: {
+        validationRuns: [
+          {
+            attempt: 1,
+            command: "bun run validate",
+            exitCode: 0,
+            durationMs: 1234,
+            passed: true,
+          },
+        ],
+        patchSnapshots: [
+          {
+            attempt: 1,
+            phase: "quality",
+            publishableFileCount: 2,
+            artifactOnlyPathCount: 0,
+            changedPathSample: ["app/index.tsx", "tests/index.test.ts"],
+            capturedAt: new Date().toISOString(),
+          },
+        ],
+      },
+    });
+    expect(uploaded.ok).toBe(true);
+    expect(uploaded.counts?.validationRuns).toBe(1);
+    expect(uploaded.counts?.patchSnapshots).toBe(1);
+
+    const completed = queue.complete(jobId, {
+      summary: "done",
+      diagnostics: {
+        attempts: [{ attempt: 1, terminalReason: "done", exitCode: 0 }],
+        terminal: { failureClass: "success", terminalStage: "completed" },
+      },
+    });
+    expect(completed.ok).toBe(true);
+    const persisted = queue.getJobDiagnostics(jobId);
+    expect(persisted.validationRuns).toHaveLength(1);
+    expect(persisted.patchSnapshots).toHaveLength(1);
+  });
+
   function failCodexStartupStallJob(
     queue: JobQueue,
     taskId: string,

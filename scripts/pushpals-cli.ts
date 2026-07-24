@@ -308,6 +308,19 @@ const WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS_ENV =
 const BLOCKING_WORKERPAL_IMAGE_BUILD_ENV = "PUSHPALS_BLOCKING_WORKERPAL_IMAGE_BUILD";
 const WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS_ENV =
   "PUSHPALS_WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS";
+
+export function remainingServiceStabilityGraceMs(opts: {
+  latestServiceLaunchAtMs: number;
+  nowMs?: number;
+  graceMs?: number;
+}): number {
+  const graceMs = Math.max(0, opts.graceMs ?? DEFAULT_SERVICE_STABILITY_GRACE_MS);
+  const nowMs = opts.nowMs ?? Date.now();
+  if (!Number.isFinite(opts.latestServiceLaunchAtMs) || opts.latestServiceLaunchAtMs <= 0) {
+    return graceMs;
+  }
+  return Math.max(0, graceMs - Math.max(0, nowMs - opts.latestServiceLaunchAtMs));
+}
 const DEFAULT_WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS = 30_000;
 const CLI_SESSION_JOB_LOG_MAX_CHARS = 700;
 const CLI_SESSION_SHOW_JOB_EVENTS_ENV = "PUSHPALS_CLI_SHOW_JOB_EVENTS";
@@ -1626,10 +1639,7 @@ function migrateLegacyOpenAICodexDefaults(sectionBody: string, opts: { includeMo
 
   let updated = sectionBody;
   if (opts.includeModel) {
-    updated = updated.replace(
-      /^(\s*model\s*=\s*)"gpt-5\.(?:4|5)"\s*$/m,
-      '$1"gpt-5.6-sol"',
-    );
+    updated = updated.replace(/^(\s*model\s*=\s*)"gpt-5\.(?:4|5)"\s*$/m, '$1"gpt-5.6-sol"');
   }
   updated = updated.replace(/^(\s*reasoning_effort\s*=\s*)"high"\s*$/m, '$1"xhigh"');
   return updated;
@@ -2478,7 +2488,10 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
   }
 }
 
-async function runWindowsServiceStopCommand(command: string[], timeoutMs: number): Promise<boolean> {
+async function runWindowsServiceStopCommand(
+  command: string[],
+  timeoutMs: number,
+): Promise<boolean> {
   const proc = Bun.spawn(command, {
     stdin: "ignore",
     stdout: "ignore",
@@ -2489,15 +2502,18 @@ async function runWindowsServiceStopCommand(command: string[], timeoutMs: number
   const exitCode = await Promise.race([
     proc.exited,
     new Promise<number>((resolveTimeout) => {
-      timeout = setTimeout(() => {
-        timedOut = true;
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // best-effort timeout cleanup only
-        }
-        resolveTimeout(-1);
-      }, Math.max(250, timeoutMs));
+      timeout = setTimeout(
+        () => {
+          timedOut = true;
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            // best-effort timeout cleanup only
+          }
+          resolveTimeout(-1);
+        },
+        Math.max(250, timeoutMs),
+      );
     }),
   ]);
   if (timeout) {
@@ -3988,7 +4004,10 @@ export async function removeCliClearTarget(
   options: CliClearRemoveOptions = {},
 ): Promise<CliClearRemoveResult> {
   const maxAttempts = Math.max(1, Math.trunc(options.maxAttempts ?? CLI_CLEAR_REMOVE_MAX_ATTEMPTS));
-  const retryDelayMs = Math.max(0, Math.trunc(options.retryDelayMs ?? CLI_CLEAR_REMOVE_RETRY_DELAY_MS));
+  const retryDelayMs = Math.max(
+    0,
+    Math.trunc(options.retryDelayMs ?? CLI_CLEAR_REMOVE_RETRY_DELAY_MS),
+  );
   const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
   const removePath = options.removePath;
   let lastFailure: CliClearFailure | null = null;
@@ -4013,10 +4032,12 @@ export async function removeCliClearTarget(
     await sleep(retryDelayMs * attempt);
   }
 
-  return lastFailure ?? {
-    ...target,
-    detail: "clear target removal failed before an attempt could be made",
-  };
+  return (
+    lastFailure ?? {
+      ...target,
+      detail: "clear target removal failed before an attempt could be made",
+    }
+  );
 }
 
 function parsePositiveInteger(value: unknown): number | undefined {
@@ -4931,6 +4952,7 @@ async function autoStartRuntimeServices(opts: {
       },
     };
   };
+  let latestServiceLaunchAtMs = 0;
   const launchService = (
     name: RuntimeServiceName,
     command: string[],
@@ -4941,6 +4963,7 @@ async function autoStartRuntimeServices(opts: {
   ): RuntimeServiceProcess => {
     const launchStartedAt = Date.now();
     const service = serviceManager.startService(buildManagedServiceSpec(name, command, launchOpts));
+    latestServiceLaunchAtMs = Math.max(latestServiceLaunchAtMs, launchStartedAt);
     const launchDurationMs = Date.now() - launchStartedAt;
     if (launchDurationMs >= DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS) {
       const warning = formatEmbeddedServiceLaunchDelayWarning({
@@ -4965,6 +4988,7 @@ async function autoStartRuntimeServices(opts: {
     const service = serviceManager.replaceService(
       buildManagedServiceSpec(name, command, launchOpts),
     );
+    latestServiceLaunchAtMs = Math.max(latestServiceLaunchAtMs, launchStartedAt);
     const launchDurationMs = Date.now() - launchStartedAt;
     if (launchDurationMs >= DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS) {
       const warning = formatEmbeddedServiceLaunchDelayWarning({
@@ -5337,7 +5361,16 @@ async function autoStartRuntimeServices(opts: {
         deferredRemoteBuddyConsumerLogged = true;
       }
       reportRemoteBuddyAutonomousEngineState();
-      const stabilityDeadline = Date.now() + DEFAULT_SERVICE_STABILITY_GRACE_MS;
+      const remainingStabilityGraceMs = remainingServiceStabilityGraceMs({
+        latestServiceLaunchAtMs,
+      });
+      const stabilityDeadline = Date.now() + remainingStabilityGraceMs;
+      if (remainingStabilityGraceMs > 0) {
+        appendRuntimeServicesLogLine(
+          runtimeServicesLogPath,
+          `[pushpals] service stability grace has ${remainingStabilityGraceMs}ms remaining after overlapping with worker/scm readiness.`,
+        );
+      }
       while (Date.now() < stabilityDeadline) {
         reportRemoteBuddyAutonomousEngineState();
         for (const service of serviceManager.getServices()) {

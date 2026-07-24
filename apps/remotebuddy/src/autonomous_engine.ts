@@ -120,6 +120,7 @@ type Snapshot = {
   }>;
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: SnapshotOpenObjective[];
+  recent_objectives?: SnapshotOpenObjective[];
   repo_health_flags: {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
@@ -177,6 +178,7 @@ type SnapshotOpenObjective = {
   status: string;
   objective_type?: string;
   component_area?: string;
+  updated_at?: string;
   target_paths?: string[];
   scope?: {
     read_anywhere?: boolean;
@@ -986,6 +988,19 @@ const WORK_DIVERSITY_ACTIVE_STATUSES = new Set([
   "blocked",
   "needs_clarification",
 ]);
+const WORK_DIVERSITY_RECENT_COOLDOWN_MS = 6 * 60 * 60_000;
+
+function isRecentWorkDiversityObjective(
+  objective: SnapshotOpenObjective,
+  nowMs = Date.now(),
+): boolean {
+  const updatedAt = Date.parse(asString(objective.updated_at));
+  return (
+    Number.isFinite(updatedAt) &&
+    updatedAt <= nowMs &&
+    nowMs - updatedAt <= WORK_DIVERSITY_RECENT_COOLDOWN_MS
+  );
+}
 
 function normalizeWorkPath(value: unknown): string {
   return asString(value)
@@ -1101,14 +1116,13 @@ export function filterCandidatesForWorkDiversity<
 >(params: {
   rows: T[];
   openObjectives?: SnapshotOpenObjective[];
+  recentObjectives?: SnapshotOpenObjective[];
 }): { rows: T[]; rejected: AutonomyWorkDiversityRejection[] } {
   const rows = [...params.rows];
-  if (rows.length <= 1) return { rows, rejected: [] };
 
   const profiles = new Map<T, AutonomyCandidateWorkProfile>();
   for (const row of rows) profiles.set(row, classifyAutonomyCandidateWork(row.candidate));
   const hasAlternativeWork = rows.some((row) => profiles.get(row)?.workKind !== "test_only");
-  if (!hasAlternativeWork) return { rows, rejected: [] };
 
   const activeTestTargetCounts = new Map<string, number>();
   for (const objective of params.openObjectives ?? []) {
@@ -1120,17 +1134,28 @@ export function filterCandidatesForWorkDiversity<
       (activeTestTargetCounts.get(profile.targetKey) ?? 0) + 1,
     );
   }
+  const recentTargetKeys = new Set(
+    (params.recentObjectives ?? [])
+      .filter((objective) => isRecentWorkDiversityObjective(objective))
+      .map((objective) => classifyAutonomyCandidateWork(objective).targetKey)
+      .filter(Boolean),
+  );
 
   const keptRows: T[] = [];
   const rejected: AutonomyWorkDiversityRejection[] = [];
   const activeOrSelectedTestTargets = new Set(activeTestTargetCounts.keys());
   for (const row of rows) {
     const profile = profiles.get(row) ?? classifyAutonomyCandidateWork(row.candidate);
+    if (recentTargetKeys.has(profile.targetKey)) {
+      const reason = `work_diversity_target_recent:${profile.targetKey}`;
+      rejected.push({ id: profile.id, reason, profile });
+      continue;
+    }
     if (profile.workKind !== "test_only") {
       keptRows.push(row);
       continue;
     }
-    if (activeOrSelectedTestTargets.has(profile.targetKey)) {
+    if (hasAlternativeWork && activeOrSelectedTestTargets.has(profile.targetKey)) {
       const reason = `work_diversity_test_target_active:${profile.targetKey}`;
       rejected.push({ id: profile.id, reason, profile });
       continue;
@@ -1139,20 +1164,32 @@ export function filterCandidatesForWorkDiversity<
     activeOrSelectedTestTargets.add(profile.targetKey);
   }
 
-  return keptRows.length > 0 ? { rows: keptRows, rejected } : { rows, rejected: [] };
+  return keptRows.length > 0 || rejected.length > 0
+    ? { rows: keptRows, rejected }
+    : { rows, rejected: [] };
 }
 
 export function workDiversityPenaltyForCandidate(params: {
   candidate: AutonomyWorkDiversityCandidateInput;
   openObjectives?: SnapshotOpenObjective[];
+  recentObjectives?: SnapshotOpenObjective[];
   maxActiveTestOnlyPerArea?: number;
 }): AutonomyWorkDiversityPenalty | null {
   const profile = classifyAutonomyCandidateWork(params.candidate);
-  if (profile.workKind !== "test_only") return null;
-  const maxActivePerArea = Math.max(
-    1,
-    Math.floor(asNumber(params.maxActiveTestOnlyPerArea, 1)),
+  const recentlyTargeted = (params.recentObjectives ?? []).some(
+    (objective) =>
+      isRecentWorkDiversityObjective(objective) &&
+      classifyAutonomyCandidateWork(objective).targetKey === profile.targetKey,
   );
+  if (recentlyTargeted) {
+    return {
+      kind: "work_diversity",
+      weight: 0.28,
+      reason: `target was completed recently: ${profile.targetKey}`,
+    };
+  }
+  if (profile.workKind !== "test_only") return null;
+  const maxActivePerArea = Math.max(1, Math.floor(asNumber(params.maxActiveTestOnlyPerArea, 1)));
   let activeTargetCount = 0;
   let activeAreaCount = 0;
   for (const objective of params.openObjectives ?? []) {
@@ -5419,6 +5456,7 @@ export class RemoteBuddyAutonomousEngine {
     const workDiversityPenalty = workDiversityPenaltyForCandidate({
       candidate,
       openObjectives: snapshot.open_objectives,
+      recentObjectives: snapshot.recent_objectives,
     });
     if (workDiversityPenalty) {
       penalties.push({
@@ -6471,6 +6509,7 @@ export class RemoteBuddyAutonomousEngine {
       const diversitySelection = filterCandidatesForWorkDiversity({
         rows: eligibleRows,
         openObjectives: snapshot.open_objectives,
+        recentObjectives: snapshot.recent_objectives,
       });
       if (diversitySelection.rejected.length > 0) {
         const payloadById = new Map(candidatesPayload.map((row) => [asString(row.id), row]));

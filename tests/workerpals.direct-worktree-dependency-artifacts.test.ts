@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from "fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { linkDirectWorktreeDependencyArtifacts } from "../apps/workerpals/src/common/worktree_dependency_artifacts";
@@ -25,6 +33,7 @@ describe("direct worktree dependency artifacts", () => {
     const repo = join(root, "repo");
     const worktree = join(repo, ".worktrees", "job-browser-smoke");
     mkdirSync(join(repo, "node_modules", "react-native-svg"), { recursive: true });
+    writeFileSync(join(repo, "package.json"), '{"name":"snapshot-fixture"}\n', "utf8");
     mkdirSync(worktree, { recursive: true });
     const logs: string[] = [];
 
@@ -39,7 +48,13 @@ describe("direct worktree dependency artifacts", () => {
     expect(lstatSync(linkedPath).isSymbolicLink() || lstatSync(linkedPath).isDirectory()).toBe(
       true,
     );
-    expect(logs.join("\n")).toContain("Linked worktree dependency artifact(s): node_modules");
+    expect(lstatSync(linkedPath).isSymbolicLink()).toBe(false);
+    expect(
+      readFileSync(join(linkedPath, ".pushpals-dependency-snapshot"), "utf8").trim(),
+    ).toHaveLength(64);
+    expect(logs.join("\n")).toContain(
+      "Materialized content-addressed worktree dependency snapshot(s): node_modules",
+    );
   });
 
   test("skips dependency artifacts when the worktree already has its own", () => {

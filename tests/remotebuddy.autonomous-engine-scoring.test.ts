@@ -291,6 +291,54 @@ describe("RemoteBuddy autonomy scoring: docs weak-evidence penalty", () => {
     expect(result.rejected).toEqual([]);
   });
 
+  test("work diversity cools down recently terminal semantic targets", () => {
+    const repeatedProduct = {
+      candidate: {
+        id: "cand_recent_route_shell",
+        objective_type: "feature_small",
+        component_area: "app",
+        target_paths: ["app/route-shell.tsx"],
+        scope: { write_globs: ["app/route-shell.tsx"] },
+      },
+      finalScore: 0.92,
+    };
+    const alternative = {
+      candidate: {
+        id: "cand_alternative",
+        objective_type: "feature_small",
+        component_area: "worker",
+        target_paths: ["worker/index.ts"],
+        scope: { write_globs: ["worker/index.ts"] },
+      },
+      finalScore: 0.7,
+    };
+    const recentObjectives = [
+      {
+        objective_id: "obj_recent_route_shell",
+        status: "completed",
+        objective_type: "feature_small",
+        component_area: "app",
+        pattern_key: "route-shell",
+        target_paths: ["app/route-shell.tsx"],
+        updated_at: new Date(Date.now() - 30 * 60_000).toISOString(),
+      },
+    ];
+
+    const filtered = filterCandidatesForWorkDiversity({
+      rows: [repeatedProduct, alternative],
+      openObjectives: [],
+      recentObjectives,
+    });
+    const penalty = workDiversityPenaltyForCandidate({
+      candidate: repeatedProduct.candidate,
+      recentObjectives,
+    });
+
+    expect(filtered.rows.map((row) => row.candidate.id)).toEqual(["cand_alternative"]);
+    expect(filtered.rejected[0]?.reason).toContain("work_diversity_target_recent");
+    expect(penalty?.reason).toContain("target was completed recently");
+  });
+
   test("adaptive explore rate increases under regret pressure and low idea diversity", () => {
     const adaptive = computeAdaptiveExploreRate({
       baseRate: 0.3,
