@@ -2,23 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.1.89`
-- start_commit: `d71e1282d4bba3d4d2d5f9c4b4276038e28fc0a4`
-- end_commit: `d2ddad09631048674e0cf33c36056cf7462c019f`
+- version: `v1.1.90`
+- start_commit: `1f7e0679d227b00cf0c3bd9443f64f085eda0e33`
+- end_commit: `f063c9f5212343b688cf52003f8d88558cbbddde`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Retry transient `EPERM`, `EACCES`, `EBUSY`, and `ETXTBSY` service-launch failures so freshly downloaded Windows runtime binaries recover after antivirus or operating-system scans instead of aborting startup.
-- Persist both interactive and runtime-only CLI supervisor ownership, and make `pushpals --clear` recover legacy supervisors through the repo-affine local server process tree when older state has no host PID.
-- Keep managed-service restart supervision alive when a restart spawn is temporarily blocked, with bounded backoff and explicit diagnostics instead of an unhandled timer failure.
+- Replace Docker's recursive `cp -as` dependency projection with constant-depth top-level links, avoiding multi-minute `node_modules` traversal through Docker Desktop bind mounts.
+- Keep `.cache`, `.expo`, and `.vite` worktree-local, retain the lockfile-addressed snapshot marker, and fall back to the prior whole-tree link if an individual entry cannot be linked.
+- Emit dependency-projection start and elapsed-time logs so long worktree preparation is visible in job diagnostics instead of appearing as an unknown quiet phase.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 944 passed, 1 Windows signal-handling skip, 0 failed, 3,537 assertions.
-- Live cross-version cleanup regression: a healthy v1.1.88 runtime host with its CLI PID state removed was discovered through the repo-affine server listener, stopped, and cleared without locked runtime data.
+- `bun run test:root`: 944 passed, 1 Windows signal-handling skip, 0 failed, 3,541 assertions.
+- `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
 
 ## Install
