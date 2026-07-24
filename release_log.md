@@ -2,27 +2,32 @@
 
 ## Release Metadata
 
-- version: `v1.1.87`
-- start_commit: `5c0e3c93123f4593b835b813c3299ade78428326`
-- end_commit: `07feb10d5f5afadf4c2c232477f2859c2a7752b2`
+- version: `v1.1.88`
+- start_commit: `e63e61e765990c3eb4dc855f993fbe1ca7fe82c1`
+- end_commit: `3d8a50617f151fa6be23674551b082a4b9f47f5e`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Retry aggregate browser validation inside ValidationGate when its nested Worker suite hits a cold-sandbox teardown or test-timeout failure, instead of spending an AI repair revision on an unchanged candidate patch.
-- Allow at most two bounded aggregate reruns, matching the observed warm-up sequence while still blocking deterministic failures after the final attempt.
-- Keep browser and Worker retry classification scoped to aggregate commands that actually resolve to browser work; ordinary lint and unrelated test failures are not retried by this policy.
+- Stop repeated merge-conflict repair loops after two failures for the same PR head/base fingerprint, reuse Git rerere state across attempts, and resume only when the PR fingerprint changes.
+- Make SourceControlManager the sole publisher of resolved PR branches: workers upload immutable internal refs, and publication requires exact head/base leases before an atomic force-with-lease update.
+- Replace root `node_modules` worktree links with lockfile-addressed local projections, run focused validation first, remove aggregate-subsumed commands, serialize heavyweight repo validators, and retry only the failed Worker stage before one aggregate confirmation.
+- Recover immediately from rejected shell-wrapper commands by resuming the same Codex thread, preserve exact structured token usage through Docker results, and avoid re-reading the repo on a fresh recovery thread.
+- Persist validation and patch diagnostics before terminal job updates, add recent-target cooldowns to autonomous selection, complete the seven-stage RemoteBuddy startup guard, and overlap CLI stability grace with service readiness probes.
 
 ## Validation
 
 - `bun run cli:bundle`
-- `bun run cli:verify-package-payload`
-- `bun test tests/workerpals.validation-command-safety.test.ts tests/workerpals.quality-gate-issues.test.ts`: 97 passed, 0 failed, 321 assertions.
-- `bun run test:root`: 931 passed, 1 Windows signal-handling skip, 0 failed.
-- `bun run test`: 931 passed, 1 Windows signal-handling skip, 0 failed, plus prompt-policy and protocol integration.
+- `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
+- `bun run test:root`: 939 passed, 1 Windows signal-handling skip, 0 failed, 3,522 assertions.
+- `bun run test:protocol`
+- `python tests/openai_codex_executor_streaming.test.py`: 7 passed.
+- `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py OpenAICodexRuntimeConfigTests.test_run_codex_task_escalates_wrapper_recovery_and_recovers`: 1 passed with preserved-thread resume exercised.
+- `bun x tsc --noEmit -p apps/server/tsconfig.json`
+- `bun x tsc --noEmit -p apps/source_control_manager/tsconfig.json`
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
+- `bun x tsc --noEmit -p apps/remotebuddy/tsconfig.json`
 - `bun x tsc --noEmit -p packages/cli/runtime/sandbox/apps/workerpals/tsconfig.json`
-- Live v1.1.86 SectorCommand job `d0aca370-2bd4-47cd-a018-579d3aedf91b` proved the dependency repair completed at 190,654ms, then reproduced the nested Worker sequence: 27/27 assertions passed with a teardown error, the next aggregate run hit a 5-second Worker timeout, and the third aggregate run passed all required validation plus web E2E before publishing PR #497.
 - `git diff --check`
 
 ## Install
@@ -60,7 +65,7 @@ bun install -g @pushpalsdev/cli
 - Docker-backed WorkerPal execution can use a stalled Docker Codex startup as the signal to switch future WorkerPal spawns to direct isolated-worktree execution; if the replacement direct WorkerPal also cannot start Codex, that retry can still fail terminally and recycle the worker.
 - QualityGate can still reject or request repair for a broad patch after the rollout coach hands publishable progress forward; this release changes the failure point from executor pre-validation failure to structured gate diagnostics.
 - Bun dependency-layout preflight is offline and lockfile-frozen; if the local Bun cache is incomplete or the lockfile cannot be satisfied, ValidationGate blocks validation and reports the dependency/setup blocker rather than running later validation against an incomplete dependency tree or modifying project manifests.
-- Expo Router browser validation now removes linked `node_modules` artifacts before dependency repair; if the offline Bun cache is incomplete, the browser validation may still report a local dependency/setup blocker.
+- Expo Router browser validation now uses a worktree-local dependency projection keyed by the package manifest and lockfile; if the root dependency tree or offline Bun cache is incomplete, validation may still report a local dependency/setup blocker.
 - OpenAI Codex WorkerPal jobs can still fail if Codex produces no publishable edit after the final no-edit recovery attempt or if the shared executor budget is already too low for another recovery.
 - OpenAI Codex WorkerPal jobs still fail fast on truly broad/noisy publishable diffs after timeout; tracked paths with no staged or unstaged Git content delta are now filtered before ScopeGate and quality diagnostics.
 - OpenAI Codex rollout coaching still blocks missing-path drift, PushPals/autonomy internals in user repos, broad shared mock expansion, and full render/full-surface harness expansion; this release permits narrow mock/harness terminology when a repo-native shell contract-test task is reusing existing infrastructure.
