@@ -4,8 +4,10 @@ import {
   DockerExecutor,
   isEphemeralWorkerWorktreePath,
   parseGitWorktreeListPorcelain,
+  prependWorkerpalRuntimeCaStartup,
   resolveDockerJobTimeoutMs,
   resolveWorkerpalDockerBuildCaSecretArgs,
+  resolveWorkerpalDockerRuntimeCaArgs,
 } from "../apps/workerpals/src/docker_executor";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -35,6 +37,50 @@ describe("workerpals docker executor internals", () => {
           NODE_EXTRA_CA_CERTS: join(root, "missing.pem"),
         }),
       ).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("mounts existing host CA trust read-only and merges it with container system roots", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-docker-runtime-ca-"));
+    const caPath = join(root, "extra-ca.pem");
+    writeFileSync(caPath, "test certificate\n", "utf8");
+    try {
+      expect(
+        resolveWorkerpalDockerRuntimeCaArgs(
+          { NODE_EXTRA_CA_CERTS: caPath },
+          (path) => path === caPath,
+          (path) => `docker:${path}`,
+        ),
+      ).toEqual([
+        "--mount",
+        `type=bind,src=docker:${caPath},dst=/run/pushpals/host-extra-ca.pem,readonly`,
+        "-e",
+        "NODE_EXTRA_CA_CERTS=/run/pushpals/host-extra-ca.pem",
+        "-e",
+        "SSL_CERT_FILE=/run/pushpals/ca-bundle.pem",
+        "-e",
+        "REQUESTS_CA_BUNDLE=/run/pushpals/ca-bundle.pem",
+        "-e",
+        "CURL_CA_BUNDLE=/run/pushpals/ca-bundle.pem",
+        "-e",
+        "PIP_CERT=/run/pushpals/ca-bundle.pem",
+      ]);
+      expect(
+        resolveWorkerpalDockerRuntimeCaArgs({
+          PUSHPALS_DOCKER_RUNTIME_EXTRA_CA_CERTS: join(root, "missing.pem"),
+        }),
+      ).toEqual([]);
+
+      const startup = prependWorkerpalRuntimeCaStartup("tail -f /dev/null", true);
+      expect(startup).toContain(
+        "cat /etc/ssl/certs/ca-certificates.crt /run/pushpals/host-extra-ca.pem > /run/pushpals/ca-bundle.pem",
+      );
+      expect(startup.endsWith("tail -f /dev/null")).toBe(true);
+      expect(prependWorkerpalRuntimeCaStartup("tail -f /dev/null", false)).toBe(
+        "tail -f /dev/null",
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

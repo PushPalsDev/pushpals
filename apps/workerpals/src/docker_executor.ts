@@ -42,6 +42,9 @@ const SHARED_CONTAINER_VENV_PYTHON = "/workspace/.venv/bin/python";
 const WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL = "pushpals.runtime_tag";
 const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox";
 const WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID = "pushpals_extra_ca";
+const WORKERPAL_SANDBOX_HOST_EXTRA_CA_PATH = "/run/pushpals/host-extra-ca.pem";
+const WORKERPAL_SANDBOX_MERGED_CA_PATH = "/run/pushpals/ca-bundle.pem";
+const WORKERPAL_SANDBOX_SYSTEM_CA_PATH = "/etc/ssl/certs/ca-certificates.crt";
 const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
 const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
@@ -95,6 +98,50 @@ export function resolveWorkerpalDockerBuildCaSecretArgs(
   const path = resolve(configured);
   if (!fileExists(path)) return [];
   return ["--secret", `id=${WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID},src=${path}`];
+}
+
+export function resolveWorkerpalDockerRuntimeCaArgs(
+  env: NodeJS.ProcessEnv = process.env,
+  fileExists: (path: string) => boolean = existsSync,
+  dockerHostPath: (path: string) => string = (path) => path,
+): string[] {
+  const configured = String(
+    env.PUSHPALS_DOCKER_RUNTIME_EXTRA_CA_CERTS ??
+      env.PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS ??
+      env.NODE_EXTRA_CA_CERTS ??
+      "",
+  ).trim();
+  if (!configured) return [];
+  const path = resolve(configured);
+  if (!fileExists(path)) return [];
+  return [
+    "--mount",
+    `type=bind,src=${dockerHostPath(path)},dst=${WORKERPAL_SANDBOX_HOST_EXTRA_CA_PATH},readonly`,
+    "-e",
+    `NODE_EXTRA_CA_CERTS=${WORKERPAL_SANDBOX_HOST_EXTRA_CA_PATH}`,
+    "-e",
+    `SSL_CERT_FILE=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
+    "-e",
+    `REQUESTS_CA_BUNDLE=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
+    "-e",
+    `CURL_CA_BUNDLE=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
+    "-e",
+    `PIP_CERT=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
+  ];
+}
+
+export function prependWorkerpalRuntimeCaStartup(
+  startupCommand: string,
+  runtimeCaEnabled: boolean,
+): string {
+  if (!runtimeCaEnabled) return startupCommand;
+  return [
+    "set -eu",
+    "mkdir -p /run/pushpals",
+    `cat ${WORKERPAL_SANDBOX_SYSTEM_CA_PATH} ${WORKERPAL_SANDBOX_HOST_EXTRA_CA_PATH} > ${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
+    `chmod 0444 ${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
+    startupCommand,
+  ].join("; ");
 }
 
 function resolveWorkerpalSandboxBuildContext(repoRoot: string): {
@@ -838,6 +885,11 @@ export class DockerExecutor {
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
     const authMountArgs = this.openaiCodexAuthMountArgs(backend);
+    const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(
+      process.env,
+      existsSync,
+      (path) => this.toDockerPath(path),
+    );
     const args: string[] = [
       "run",
       "-d",
@@ -864,6 +916,7 @@ export class DockerExecutor {
       "/workspace",
       ...envArgs,
       ...authMountArgs,
+      ...runtimeCaArgs,
     ];
 
     if (this.options.gitToken) {
@@ -875,7 +928,15 @@ export class DockerExecutor {
       args.push("-e", `${key}=${value}`);
     }
 
-    const startupCmd = backendSpec.warmContainerStartupCommand(warmContext);
+    const startupCmd = prependWorkerpalRuntimeCaStartup(
+      backendSpec.warmContainerStartupCommand(warmContext),
+      runtimeCaArgs.length > 0,
+    );
+    if (runtimeCaArgs.length > 0) {
+      console.log(
+        "[DockerExecutor] Mounting host extra CA trust into the warm container (read-only).",
+      );
+    }
 
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
 
