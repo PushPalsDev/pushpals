@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   buildBrowserValidationRepairPacket,
+  buildCriticDiffText,
   browserValidationRepairContinuationBudgetDecision,
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
@@ -21,6 +22,7 @@ import {
   qualityRevisionLoopUpperBound,
   recordBrowserFailureMemory,
   recordValidationRemedyMemory,
+  repoValidationLeaseRecoveryReason,
   repoValidationRepairContinuationBudgetDecision,
   shouldSkipCriticAfterExecutorTimeout,
   shouldSkipCriticForDeterministicValidationRevision,
@@ -36,7 +38,101 @@ import {
   workerAttemptRolloutScore,
 } from "../apps/workerpals/src/execute_job";
 
+function runGit(cwd: string, args: string[]): void {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(new TextDecoder().decode(result.stderr));
+  }
+}
+
 describe("workerpals quality gate critic issue formatting", () => {
+  test("builds critic diff evidence for tracked and untracked changes", async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-critic-diff-"));
+    try {
+      runGit(tempRoot, ["init"]);
+      runGit(tempRoot, ["config", "user.name", "PushPals Test"]);
+      runGit(tempRoot, ["config", "user.email", "pushpals-test@example.com"]);
+      writeFileSync(join(tempRoot, "tracked.txt"), "before\n");
+      runGit(tempRoot, ["add", "tracked.txt"]);
+      runGit(tempRoot, ["commit", "-m", "initial"]);
+
+      writeFileSync(join(tempRoot, "tracked.txt"), "after\n");
+      mkdirSync(join(tempRoot, "docs"), { recursive: true });
+      writeFileSync(join(tempRoot, "docs", "new-guide.md"), "# New guide\n");
+
+      const diff = await buildCriticDiffText(tempRoot, [
+        "tracked.txt",
+        "docs/new-guide.md",
+      ]);
+
+      expect(diff).toContain("-before");
+      expect(diff).toContain("+after");
+      expect(diff).toContain("new file mode");
+      expect(diff).toContain("+++ b/docs/new-guide.md");
+      expect(diff).toContain("+# New guide");
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers heartbeat leases only for dead owners or stale heartbeats", () => {
+    const owner = {
+      owner: "123-lease",
+      heartbeatVersion: 1,
+      pid: 123,
+      host: "worker-a",
+    };
+
+    expect(
+      repoValidationLeaseRecoveryReason({
+        owner,
+        ownerMtimeMs: 90_000,
+        nowMs: 100_000,
+        currentHost: "worker-a",
+        ownerProcessAlive: false,
+      }),
+    ).toBe("dead owner process");
+    expect(
+      repoValidationLeaseRecoveryReason({
+        owner,
+        ownerMtimeMs: 60_000,
+        nowMs: 100_000,
+        currentHost: "worker-b",
+        ownerProcessAlive: null,
+      }),
+    ).toBe("stale heartbeat");
+    expect(
+      repoValidationLeaseRecoveryReason({
+        owner,
+        ownerMtimeMs: 90_000,
+        nowMs: 100_000,
+        currentHost: "worker-b",
+        ownerProcessAlive: null,
+      }),
+    ).toBeNull();
+  });
+
+  test("keeps the longer safety window for legacy validation leases", () => {
+    expect(
+      repoValidationLeaseRecoveryReason({
+        owner: { owner: "legacy" },
+        ownerMtimeMs: 0,
+        nowMs: 89 * 60_000,
+        currentHost: "worker-a",
+        ownerProcessAlive: null,
+      }),
+    ).toBeNull();
+    expect(
+      repoValidationLeaseRecoveryReason({
+        owner: { owner: "legacy" },
+        ownerMtimeMs: 0,
+        nowMs: 91 * 60_000,
+        currentHost: "worker-a",
+        ownerProcessAlive: null,
+      }),
+    ).toBe("stale legacy lease");
+  });
+
   test("filters dependency and runtime artifacts out of publishable changed paths", () => {
     expect(
       publishableChangedPaths([

@@ -1824,6 +1824,71 @@ function isRepoAggregateValidationCommand(repo: string, command: string): boolea
   return layers >= 2;
 }
 
+const REPO_VALIDATION_LEASE_HEARTBEAT_INTERVAL_MS = 5_000;
+const REPO_VALIDATION_LEASE_HEARTBEAT_STALE_MS = 30_000;
+const LEGACY_REPO_VALIDATION_LEASE_STALE_MS = 90 * 60_000;
+
+export interface RepoValidationLeaseOwner {
+  owner?: unknown;
+  command?: unknown;
+  acquiredAt?: unknown;
+  heartbeatAt?: unknown;
+  heartbeatVersion?: unknown;
+  pid?: unknown;
+  host?: unknown;
+}
+
+function validationLeaseHostId(): string {
+  return String(process.env.HOSTNAME ?? process.env.COMPUTERNAME ?? "").trim();
+}
+
+function readRepoValidationLeaseOwner(ownerPath: string): RepoValidationLeaseOwner | null {
+  try {
+    const parsed = JSON.parse(readFileSync(ownerPath, "utf8"));
+    return parsed && typeof parsed === "object" ? (parsed as RepoValidationLeaseOwner) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+export function repoValidationLeaseRecoveryReason(opts: {
+  owner: RepoValidationLeaseOwner | null;
+  ownerMtimeMs: number;
+  nowMs: number;
+  currentHost: string;
+  ownerProcessAlive: boolean | null;
+}): "dead owner process" | "stale heartbeat" | "stale legacy lease" | null {
+  const ownerHost = typeof opts.owner?.host === "string" ? opts.owner.host.trim() : "";
+  const ownerPid =
+    typeof opts.owner?.pid === "number" && Number.isInteger(opts.owner.pid)
+      ? opts.owner.pid
+      : null;
+  if (
+    ownerHost &&
+    opts.currentHost &&
+    ownerHost === opts.currentHost &&
+    ownerPid !== null &&
+    opts.ownerProcessAlive === false
+  ) {
+    return "dead owner process";
+  }
+
+  const ageMs = Math.max(0, opts.nowMs - opts.ownerMtimeMs);
+  if (opts.owner?.heartbeatVersion === 1) {
+    return ageMs > REPO_VALIDATION_LEASE_HEARTBEAT_STALE_MS ? "stale heartbeat" : null;
+  }
+  return ageMs > LEGACY_REPO_VALIDATION_LEASE_STALE_MS ? "stale legacy lease" : null;
+}
+
 async function acquireRepoValidationLease(
   repo: string,
   command: string,
@@ -1837,6 +1902,7 @@ async function acquireRepoValidationLease(
   const leaseDir = resolve(leaseParent, "validation-lease");
   const ownerPath = resolve(leaseDir, "owner.json");
   const owner = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const ownerHost = validationLeaseHostId();
   const waitStartedAt = Date.now();
   let lastWaitLogAt = 0;
   mkdirSync(leaseParent, { recursive: true });
@@ -1844,34 +1910,75 @@ async function acquireRepoValidationLease(
   while (Date.now() - waitStartedAt < 15 * 60_000) {
     try {
       mkdirSync(leaseDir);
+      const acquiredAt = new Date().toISOString();
+      const ownerRecord: RepoValidationLeaseOwner = {
+        owner,
+        command,
+        acquiredAt,
+        heartbeatAt: acquiredAt,
+        heartbeatVersion: 1,
+        pid: process.pid,
+        host: ownerHost,
+      };
       try {
-        writeFileSync(
-          ownerPath,
-          JSON.stringify({ owner, command, acquiredAt: new Date().toISOString() }),
-          "utf8",
-        );
+        writeFileSync(ownerPath, JSON.stringify(ownerRecord), "utf8");
       } catch (error) {
         rmSync(leaseDir, { recursive: true, force: true });
         throw error;
       }
+      const heartbeat = setInterval(() => {
+        try {
+          const currentOwner = readRepoValidationLeaseOwner(ownerPath);
+          if (currentOwner?.owner !== owner) {
+            clearInterval(heartbeat);
+            return;
+          }
+          ownerRecord.heartbeatAt = new Date().toISOString();
+          writeFileSync(ownerPath, JSON.stringify(ownerRecord), "utf8");
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, REPO_VALIDATION_LEASE_HEARTBEAT_INTERVAL_MS);
+      heartbeat.unref?.();
       const waitedMs = Date.now() - waitStartedAt;
       onLog?.(
         "stdout",
         `[ValidationGate] Acquired repo aggregate-validation lease${waitedMs >= 1_000 ? ` after ${waitedMs}ms` : ""}: ${command}`,
       );
       return () => {
+        clearInterval(heartbeat);
         try {
-          const currentOwner = JSON.parse(readFileSync(ownerPath, "utf8")) as { owner?: unknown };
-          if (currentOwner.owner === owner) rmSync(leaseDir, { recursive: true, force: true });
+          const currentOwner = readRepoValidationLeaseOwner(ownerPath);
+          if (currentOwner?.owner === owner) rmSync(leaseDir, { recursive: true, force: true });
         } catch {
           // A stale-lease recovery or process shutdown may already have removed it.
         }
       };
     } catch {
       try {
-        if (Date.now() - statSync(leaseDir).mtimeMs > 90 * 60_000) {
+        const currentOwner = readRepoValidationLeaseOwner(ownerPath);
+        const ownerMtimeMs = statSync(ownerPath).mtimeMs;
+        const sameHost =
+          Boolean(currentOwner?.host) &&
+          Boolean(ownerHost) &&
+          currentOwner?.host === ownerHost;
+        const ownerProcessAlive =
+          sameHost && typeof currentOwner?.pid === "number"
+            ? isProcessAlive(currentOwner.pid)
+            : null;
+        const recoveryReason = repoValidationLeaseRecoveryReason({
+          owner: currentOwner,
+          ownerMtimeMs,
+          nowMs: Date.now(),
+          currentHost: ownerHost,
+          ownerProcessAlive,
+        });
+        if (recoveryReason) {
           rmSync(leaseDir, { recursive: true, force: true });
-          onLog?.("stderr", "[ValidationGate] Recovered stale repo validation lease.");
+          onLog?.(
+            "stderr",
+            `[ValidationGate] Recovered repo validation lease (${recoveryReason}).`,
+          );
           continue;
         }
       } catch {
@@ -5550,11 +5657,7 @@ async function runTaskCriticReview(
 
   const buildAttemptPayload = async (compact: boolean) => {
     const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
-    let diffText = "";
-    if (changedForDiff.length > 0) {
-      const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
-      diffText = diffResult.ok ? diffResult.stdout : diffResult.stderr;
-    }
+    let diffText = await buildCriticDiffText(repo, changedForDiff);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
       0,
       resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
@@ -6309,6 +6412,51 @@ export async function git(
 }
 
 // ─── Git commit creation ─────────────────────────────────────────────────────
+
+export async function buildCriticDiffText(repo: string, changedPaths: string[]): Promise<string> {
+  const paths = Array.from(
+    new Set(
+      changedPaths
+        .map((path) => normalizeChangedPathForCommit(String(path ?? "")))
+        .filter((path): path is string => Boolean(path)),
+    ),
+  );
+  if (paths.length === 0) return "";
+
+  const chunks: string[] = [];
+  const trackedDiff = await git(repo, ["diff", "HEAD", "--", ...paths]);
+  if (trackedDiff.stdout) {
+    chunks.push(trackedDiff.stdout);
+  } else if (!trackedDiff.ok) {
+    const [unstagedDiff, stagedDiff] = await Promise.all([
+      git(repo, ["diff", "--", ...paths]),
+      git(repo, ["diff", "--cached", "--", ...paths]),
+    ]);
+    if (unstagedDiff.stdout) chunks.push(unstagedDiff.stdout);
+    if (stagedDiff.stdout) chunks.push(stagedDiff.stdout);
+  }
+
+  const untrackedResult = await git(repo, [
+    "ls-files",
+    "-z",
+    "--others",
+    "--exclude-standard",
+    "--",
+    ...paths,
+  ]);
+  if (untrackedResult.ok) {
+    const untrackedPaths = untrackedResult.stdout
+      .split("\u0000")
+      .map((path) => normalizeChangedPathForCommit(path))
+      .filter((path): path is string => Boolean(path));
+    for (const path of untrackedPaths) {
+      const newFileDiff = await git(repo, ["diff", "--no-index", "--", "/dev/null", path]);
+      if (newFileDiff.stdout) chunks.push(newFileDiff.stdout);
+    }
+  }
+
+  return chunks.join("\n");
+}
 
 async function trackedPathHasGitContentDelta(repo: string, path: string): Promise<boolean | null> {
   const tracked = await git(repo, ["ls-files", "--error-unmatch", "--", path]);
@@ -8849,11 +8997,7 @@ async function runCodexCriticReview(
 
   const buildCriticInstruction = async (compact: boolean) => {
     const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
-    let diffText = "";
-    if (changedForDiff.length > 0) {
-      const diffResult = await git(repo, ["diff", "--", ...changedForDiff]);
-      diffText = diffResult.ok ? diffResult.stdout : diffResult.stderr;
-    }
+    let diffText = await buildCriticDiffText(repo, changedForDiff);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
       0,
       resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
