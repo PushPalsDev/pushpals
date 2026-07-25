@@ -2,22 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.91`
-- start_commit: `5da7f339cf47642cc7e1cb76f3646c4dbfcaea68`
-- end_commit: `0821d755f14a7fc68cdc039dc0411fc2e203d039`
+- version: `v1.1.92`
+- start_commit: `221525c30f62bd7fe45b775cb1f6f88afd1cc772`
+- end_commit: `8afec3a2e9625258d723eb18ee940ba4ef4ad71b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Run Docker-backed WorkerPal jobs with the Codex CLI already installed in the sandbox image instead of resolving `@openai/codex` from the package registry during every runtime warmup.
-- Migrate exact legacy WorkerPal `bun x --yes @openai/codex` and `bunx --yes @openai/codex` defaults to the deterministic in-image `codex` command while preserving explicit custom command overrides.
-- Keep a registry-backed `bunx` fallback only for nonstandard sandbox images that do not contain the bundled Codex command.
+- Reuse PushPals' host-exported extra CA trust during sandbox image builds so corporate TLS interception no longer breaks apt, pip, Playwright, Codex, or workspace dependency installation.
+- Supply the host certificate bundle to Docker only as an ephemeral BuildKit secret from both CLI startup and WorkerPal self-healing rebuilds; it is never copied into the resulting image.
+- Install and verify a stable `/usr/local/bin/codex` entrypoint during the image build so WorkerPal login shells use the bundled Codex CLI without a registry lookup.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 945 passed, 1 Windows signal-handling skip, 0 failed, 3,549 assertions.
+- `bun run test:root`: 947 passed, 1 Windows signal-handling skip, 0 failed, 3,558 assertions.
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
 
