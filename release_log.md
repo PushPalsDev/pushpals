@@ -2,22 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.93`
-- start_commit: `53237e519d5767697684c2adebc039c55d86c4f3`
-- end_commit: `e2e1489230bf45f1f8549049b6da2a90ae55fa3f`
+- version: `v1.1.94`
+- start_commit: `4f584ab13cb67f87244787a7e0a499e76e1d1827`
+- end_commit: `6531b783516701add6aef5bb7c148c44f863e236`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Mount PushPals' host-exported extra CA bundle read-only into each warm WorkerPal container so corporate TLS interception no longer breaks Codex execution after a successful image build.
-- Merge the host trust with the sandbox's standard Linux root bundle at container startup, preserving normal public trust while adding user-specific roots.
-- Apply the ephemeral merged bundle consistently to Rust/OpenSSL, Node, Python requests, curl, and pip clients; no host certificate is copied into the image.
+- Keep Vite's `.vite-temp` output job-local and writable instead of projecting the shared root dependency artifact into WorkerPal worktrees.
+- Prevent Vitest config loading from failing with `EROFS` during aggregate validation in Docker-backed jobs.
+- Preserve the constant-depth dependency projection for immutable packages while extending the existing mutable cache isolation policy.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 948 passed, 1 Windows signal-handling skip, 0 failed, 3,563 assertions.
+- `bun run test:root`: 948 passed, 1 Windows signal-handling skip, 0 failed, 3,565 assertions.
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
 
