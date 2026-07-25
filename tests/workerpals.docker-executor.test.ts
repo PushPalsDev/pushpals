@@ -567,6 +567,10 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).not.toContain("cp -as");
     expect(capturedCommand).toContain('for entry in "$src"/* "$src"/.[!.]* "$src"/..?*');
     expect(capturedCommand).toContain('ln -s "$entry" "$dest/$entry_name"');
+    expect(capturedCommand).toContain(
+      ".cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot",
+    );
+    expect(capturedCommand).toContain("for mutable in .cache .expo .vite .vite-temp");
     expect(capturedCommand).toContain(".pushpals-dependency-projection-in-progress");
     expect(capturedCommand).toContain('rm -f "$dest/.pushpals-dependency-snapshot"');
     expect(capturedCommand).toContain(".pushpals-dependency-snapshot");
