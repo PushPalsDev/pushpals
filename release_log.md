@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.97`
-- start_commit: `d91b126f8c665581887dab64810ab9ca5f3cabd1`
-- end_commit: `faa2361e60c4b5fa7feafac3f0abaa80849600d6`
+- version: `v1.1.98`
+- start_commit: `f04084e9a343d3254f65144d74c5c8ba7a42f1ee`
+- end_commit: `9fd92b5ebca8bc1bb9263eac6dc18e23e7e8ba84`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve logical worktree dependency paths for Node processes so Metro, Expo, and similar dev servers emit browser bundle URLs under the project instead of the container-only Linux snapshot cache.
-- Keep the fast Linux-native dependency snapshot while restoring client hydration for Windows-hosted Docker worktrees; the SectorCommand browser smoke now renders its home screen instead of receiving a 404 for the Expo Router entry bundle.
-- Keep successful dependency preparation logs concise by separating Bun install diagnostics from the final linked-artifact sentinel.
+- Route container Git HTTPS through PushPals' merged system and host-extra CA bundle, so review-fix and ordinary WorkerPal commits can sync and push through Windows TLS-inspection certificates.
+- Batch large stale Git-status content checks into three repository-level commands instead of probing every path separately, removing the multi-minute finalization tail observed on Windows-hosted Linux worktrees.
+- Preserve the existing per-path behavior for ordinary small diffs while filtering clean tracked paths caused by cross-platform Git stat-cache churn.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
 - `bun run test:root`: 954 passed, 1 Windows signal-handling skip, 0 failed, 3,591 assertions.
-- `bun test tests/workerpals.sandbox-env.test.ts tests/workerpals.docker-executor.test.ts`: 37 passed, 0 failed, 135 assertions.
+- `bun test tests/workerpals.docker-executor.test.ts`: 27 passed, 0 failed, 95 assertions.
+- Focused Python executor regressions: 3 passed, covering batched stale-status filtering and dirty-baseline preservation.
 - `bun run test:protocol`
-- `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
-- Live Docker/Chromium proof against SectorCommand: the Expo Router bundle resolves under `/node_modules`, returns successfully, and `home-screen` renders.
+- Live Docker Git proof against SectorCommand: `git ls-remote --exit-code origin HEAD` succeeds with `GIT_SSL_CAINFO` pointed at the merged WorkerPal CA bundle.
 
 ## Install
 
