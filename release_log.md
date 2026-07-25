@@ -2,22 +2,22 @@
 
 ## Release Metadata
 
-- version: `v1.1.92`
-- start_commit: `221525c30f62bd7fe45b775cb1f6f88afd1cc772`
-- end_commit: `8afec3a2e9625258d723eb18ee940ba4ef4ad71b`
+- version: `v1.1.93`
+- start_commit: `53237e519d5767697684c2adebc039c55d86c4f3`
+- end_commit: `e2e1489230bf45f1f8549049b6da2a90ae55fa3f`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Reuse PushPals' host-exported extra CA trust during sandbox image builds so corporate TLS interception no longer breaks apt, pip, Playwright, Codex, or workspace dependency installation.
-- Supply the host certificate bundle to Docker only as an ephemeral BuildKit secret from both CLI startup and WorkerPal self-healing rebuilds; it is never copied into the resulting image.
-- Install and verify a stable `/usr/local/bin/codex` entrypoint during the image build so WorkerPal login shells use the bundled Codex CLI without a registry lookup.
+- Mount PushPals' host-exported extra CA bundle read-only into each warm WorkerPal container so corporate TLS interception no longer breaks Codex execution after a successful image build.
+- Merge the host trust with the sandbox's standard Linux root bundle at container startup, preserving normal public trust while adding user-specific roots.
+- Apply the ephemeral merged bundle consistently to Rust/OpenSSL, Node, Python requests, curl, and pip clients; no host certificate is copied into the image.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 947 passed, 1 Windows signal-handling skip, 0 failed, 3,558 assertions.
+- `bun run test:root`: 948 passed, 1 Windows signal-handling skip, 0 failed, 3,563 assertions.
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
 
