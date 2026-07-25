@@ -5,7 +5,11 @@ import {
   isEphemeralWorkerWorktreePath,
   parseGitWorktreeListPorcelain,
   resolveDockerJobTimeoutMs,
+  resolveWorkerpalDockerBuildCaSecretArgs,
 } from "../apps/workerpals/src/docker_executor";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
 function createExecutor() {
   return new DockerExecutor({
@@ -17,6 +21,25 @@ function createExecutor() {
 }
 
 describe("workerpals docker executor internals", () => {
+  test("passes an existing host CA bundle to Docker builds as an ephemeral secret", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-docker-ca-"));
+    const caPath = join(root, "extra-ca.pem");
+    writeFileSync(caPath, "test certificate\n", "utf8");
+    try {
+      expect(resolveWorkerpalDockerBuildCaSecretArgs({ NODE_EXTRA_CA_CERTS: caPath })).toEqual([
+        "--secret",
+        `id=pushpals_extra_ca,src=${caPath}`,
+      ]);
+      expect(
+        resolveWorkerpalDockerBuildCaSecretArgs({
+          NODE_EXTRA_CA_CERTS: join(root, "missing.pem"),
+        }),
+      ).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("readStream reassembles chunk-split lines", async () => {
     const executor = createExecutor() as unknown as {
       readStream: (

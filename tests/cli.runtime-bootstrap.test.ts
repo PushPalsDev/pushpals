@@ -53,6 +53,7 @@ import {
   precheckWorkerpalDockerAvailability,
   precheckSourceControlManagerGitAvailability,
   prepareCliRuntime,
+  resolveWorkerpalDockerBuildCaSecretArgs,
   remainingServiceStabilityGraceMs,
   resolveEmbeddedBunExecutableFromEnv,
   resolveRuntimeDockerExecutableCandidates,
@@ -1758,6 +1759,26 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     );
   });
 
+  test("resolveWorkerpalDockerBuildCaSecretArgs keeps host CA trust out of image layers", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-docker-ca-"));
+    const caPath = join(root, "extra-ca.pem");
+    try {
+      writeFileSync(caPath, "test certificate\n", "utf8");
+      expect(
+        resolveWorkerpalDockerBuildCaSecretArgs({
+          PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS: caPath,
+        }),
+      ).toEqual(["--secret", `id=pushpals_extra_ca,src=${caPath}`]);
+      expect(
+        resolveWorkerpalDockerBuildCaSecretArgs({
+          NODE_EXTRA_CA_CERTS: join(root, "missing.pem"),
+        }),
+      ).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("ensureWorkerpalDockerImageReady builds the local sandbox image when it is missing", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-worker-image-"));
     const sandbox = buildWorkerpalSandboxPaths(root);
@@ -1782,12 +1803,15 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     const calls: Array<{ command: string[]; cwd: string }> = [];
     try {
+      const caPath = join(root, "extra-ca.pem");
+      writeFileSync(caPath, "test certificate\n", "utf8");
       const result = await ensureWorkerpalDockerImageReady({
         runtimeRoot: root,
         runtimeTag: "v1.0.19",
         dockerImage: "pushpals-worker-sandbox:latest",
         env: {
           PUSHPALS_DOCKER_BIN_ABSOLUTE: "/usr/local/bin/docker",
+          NODE_EXTRA_CA_CERTS: caPath,
         },
         ensureRuntimeAssetsFn: async () => {},
         inspectImageRuntimeTagFn: async () => ({ status: "missing", runtimeTag: "" }),
@@ -1813,6 +1837,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         "pushpals.runtime_tag=v1.0.19",
         "--label",
         "pushpals.component=workerpals-sandbox",
+        "--secret",
+        `id=pushpals_extra_ca,src=${caPath}`,
         "-t",
         "pushpals-worker-sandbox:latest",
         ".",

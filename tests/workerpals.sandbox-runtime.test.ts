@@ -51,8 +51,15 @@ describe("WorkerPal sandbox runtime", () => {
     );
     expect(dockerfile).toContain("RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx");
     expect(dockerfile).toContain('ENV NODE_OPTIONS="--max-old-space-size=1536"');
-    expect(dockerfile).toMatch(/^RUN apt-get update && apt-get install .* chromium \\$/m);
+    expect(dockerfile).toContain(
+      "apt-get $APT_CA_OPT update && apt-get $APT_CA_OPT install -y --no-install-recommends chromium",
+    );
     expect(dockerfile).toContain("ln -sf /usr/bin/chromium /opt/google/chrome/chrome");
+    expect(dockerfile.match(/--mount=type=secret,id=pushpals_extra_ca/g)?.length).toBe(4);
+    expect(dockerfile).toContain('bun --cafile="$EXTRA_CA" install');
+    expect(dockerfile).toContain('CODEX_BIN="$(bun pm bin -g)/codex"');
+    expect(dockerfile).toContain('ln -sf "$CODEX_BIN" /usr/local/bin/codex');
+    expect(dockerfile).toContain("&& codex --version");
     expect(dockerfile).not.toMatch(/^\s+nodejs \\$/m);
     expect(dockerfile).not.toMatch(/^\s+npm \\$/m);
   });

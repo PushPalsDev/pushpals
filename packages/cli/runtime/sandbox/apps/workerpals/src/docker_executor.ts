@@ -41,6 +41,7 @@ const DEFAULT_CONFIG = loadPushPalsConfig();
 const SHARED_CONTAINER_VENV_PYTHON = "/workspace/.venv/bin/python";
 const WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL = "pushpals.runtime_tag";
 const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox";
+const WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID = "pushpals_extra_ca";
 const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
 const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
@@ -81,6 +82,19 @@ function resolveDockerExecutable(): string {
   const configured = String(process.env.PUSHPALS_DOCKER_BIN ?? "").trim();
   if (configured) return configured;
   return process.platform === "win32" ? "docker.exe" : "docker";
+}
+
+export function resolveWorkerpalDockerBuildCaSecretArgs(
+  env: NodeJS.ProcessEnv = process.env,
+  fileExists: (path: string) => boolean = existsSync,
+): string[] {
+  const configured = String(
+    env.PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS ?? env.NODE_EXTRA_CA_CERTS ?? "",
+  ).trim();
+  if (!configured) return [];
+  const path = resolve(configured);
+  if (!fileExists(path)) return [];
+  return ["--secret", `id=${WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID},src=${path}`];
 }
 
 function resolveWorkerpalSandboxBuildContext(repoRoot: string): {
@@ -2401,6 +2415,7 @@ export class DockerExecutor {
     }
 
     const dockerfileArg = dockerBuildFileArg(sandboxContext.root, sandboxContext.dockerfilePath);
+    const caSecretArgs = resolveWorkerpalDockerBuildCaSecretArgs();
     console.log(
       runtimeTag
         ? `[DockerExecutor] Building local WorkerPal sandbox image ${this.options.imageName} for runtimeTag=${runtimeTag}`
@@ -2414,10 +2429,16 @@ export class DockerExecutor {
       "--label",
       WORKERPAL_SANDBOX_COMPONENT_LABEL,
       ...(runtimeTag ? ["--label", `${WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL}=${runtimeTag}`] : []),
+      ...caSecretArgs,
       "-t",
       this.options.imageName,
       ".",
     ];
+    if (caSecretArgs.length > 0) {
+      console.log(
+        "[DockerExecutor] Supplying host extra CA trust to the sandbox build as an ephemeral secret.",
+      );
+    }
     const build = await this.runDockerCommandCapture(args, {
       cwd: sandboxContext.root,
       timeoutMs: DOCKER_IMAGE_BUILD_TIMEOUT_MS,

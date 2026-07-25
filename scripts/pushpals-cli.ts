@@ -3008,6 +3008,20 @@ export async function resolveWorkerpalDockerProbe(
 
 const WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL = "pushpals.runtime_tag";
 const WORKERPAL_SANDBOX_COMPONENT_LABEL = "pushpals.component=workerpals-sandbox";
+const WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID = "pushpals_extra_ca";
+
+export function resolveWorkerpalDockerBuildCaSecretArgs(
+  env: Record<string, string | undefined>,
+  fileExists: (path: string) => boolean = existsSync,
+): string[] {
+  const configured = String(
+    env.PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS ?? env.NODE_EXTRA_CA_CERTS ?? "",
+  ).trim();
+  if (!configured) return [];
+  const path = resolve(configured);
+  if (!fileExists(path)) return [];
+  return ["--secret", `id=${WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID},src=${path}`];
+}
 const WORKERPAL_WARM_COMPONENT_LABEL = "pushpals.component=workerpals-warm";
 const SOURCE_CONTROL_MANAGER_TEMP_BRANCH_PREFIX = "_source_control_manager/";
 
@@ -3509,6 +3523,7 @@ export async function ensureWorkerpalDockerImageReady(opts: {
       `${WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL}=${runtimeTag}`,
       "--label",
       WORKERPAL_SANDBOX_COMPONENT_LABEL,
+      ...resolveWorkerpalDockerBuildCaSecretArgs(opts.env),
       "-t",
       opts.dockerImage,
       ".",

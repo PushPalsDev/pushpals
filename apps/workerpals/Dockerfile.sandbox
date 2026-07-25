@@ -12,8 +12,12 @@ FROM node:24-trixie AS base
 COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx
 
-# Install git and other essential tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install git and other essential tools. BuildKit mounts host-provided CA trust
+# only for the networked build step; the certificate bundle is not persisted.
+RUN --mount=type=secret,id=pushpals_extra_ca \
+    EXTRA_CA=/run/secrets/pushpals_extra_ca; \
+    if [ -s "$EXTRA_CA" ]; then APT_CA_OPT="-o Acquire::https::CaInfo=$EXTRA_CA"; else APT_CA_OPT=""; fi; \
+    apt-get $APT_CA_OPT update && apt-get $APT_CA_OPT install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
@@ -38,7 +42,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Worker runtime in one shared venv (uv default layout).
 # Keep the venv at /workspace/.venv so all backends use the same Python runtime.
-RUN mkdir -p /workspace \
+RUN --mount=type=secret,id=pushpals_extra_ca \
+    EXTRA_CA=/run/secrets/pushpals_extra_ca; \
+    if [ -s "$EXTRA_CA" ]; then \
+        export NODE_EXTRA_CA_CERTS="$EXTRA_CA" SSL_CERT_FILE="$EXTRA_CA" REQUESTS_CA_BUNDLE="$EXTRA_CA" PIP_CERT="$EXTRA_CA"; \
+        BUN_CA_ARG="--cafile=$EXTRA_CA"; \
+    else \
+        BUN_CA_ARG=""; \
+    fi; \
+    mkdir -p /workspace \
     && python3 -m venv /workspace/.venv \
     && /workspace/.venv/bin/pip install --no-cache-dir --upgrade pip \
     && /workspace/.venv/bin/pip install --no-cache-dir \
@@ -48,13 +60,20 @@ RUN mkdir -p /workspace \
         openhands-tools \
         mini-swe-agent \
         playwright \
-    && bun add -g @openai/codex \
+    && bun $BUN_CA_ARG add -g @openai/codex \
+    && CODEX_BIN="$(bun pm bin -g)/codex" \
+    && test -x "$CODEX_BIN" \
+    && ln -sf "$CODEX_BIN" /usr/local/bin/codex \
+    && codex --version \
     && /workspace/.venv/bin/playwright install --with-deps chromium
 
 # Repo-local Playwright versions expect their own bundled browser revisions.
 # A distro-managed Chrome channel gives those clients a stable executable that
 # does not depend on the Python Playwright revision installed above.
-RUN apt-get update && apt-get install -y --no-install-recommends chromium \
+RUN --mount=type=secret,id=pushpals_extra_ca \
+    EXTRA_CA=/run/secrets/pushpals_extra_ca; \
+    if [ -s "$EXTRA_CA" ]; then APT_CA_OPT="-o Acquire::https::CaInfo=$EXTRA_CA"; else APT_CA_OPT=""; fi; \
+    apt-get $APT_CA_OPT update && apt-get $APT_CA_OPT install -y --no-install-recommends chromium \
     && mkdir -p /opt/google/chrome \
     && ln -sf /usr/bin/chromium /opt/google/chrome/chrome \
     && rm -rf /var/lib/apt/lists/*
@@ -82,8 +101,14 @@ WORKDIR /workspace
 # Copy entire repository (build context should be repo root)
 COPY . .
 
-# Install workspace dependencies (including devDeps needed for protocol build)
-RUN bun install
+# Install workspace dependencies (including devDeps needed for protocol build).
+RUN --mount=type=secret,id=pushpals_extra_ca \
+    EXTRA_CA=/run/secrets/pushpals_extra_ca; \
+    if [ -s "$EXTRA_CA" ]; then \
+        bun --cafile="$EXTRA_CA" install; \
+    else \
+        bun install; \
+    fi
 
 # Build protocol package (needed by worker)
 RUN cd packages/protocol && bun run build
