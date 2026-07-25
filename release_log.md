@@ -2,23 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.95`
-- start_commit: `043aeb926fe479c06c54c0590337946dbe170879`
-- end_commit: `8a877127dd5e7fca92403a864f005d3d03443aea`
+- version: `v1.1.96`
+- start_commit: `32006b3553e22d0a8f191c8f184edebaac43a911`
+- end_commit: `84c5d99906324069d5fa6f5bdf7d33904da806ff`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Include tracked, staged, and newly created untracked files in CriticGate diff evidence so document-creation and other new-file jobs are reviewed against their real patch instead of receiving an empty-diff revision.
-- Heartbeat aggregate-validation leases every five seconds and recover a dead same-host owner immediately or a stopped heartbeat after 30 seconds.
-- Preserve the longer legacy-lease safety window while making newly created leases resilient to interrupted WorkerPal processes and container replacement.
+- Build a frozen Linux-native Bun dependency snapshot inside the WorkerPal container instead of projecting Windows-host packages into Linux worktrees.
+- Cache dependency downloads and project constant-depth top-level links into each job worktree so validation stays fast without losing platform-specific or transitive packages.
+- Serialize snapshot creation and stop the job before model execution when dependency preparation fails, preventing repeated repair attempts against a broken runtime.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 951 passed, 1 Windows signal-handling skip, 0 failed, 3,575 assertions.
-- `bun test`: 1,018 passed, 1 Windows signal-handling skip, 0 failed, 3,880 assertions.
+- `bun run test:root`: 953 passed, 1 Windows signal-handling skip, 0 failed, 3,589 assertions.
+- `bun test tests/workerpals.docker-executor.test.ts tests/workerpals.direct-worktree-dependency-artifacts.test.ts tests/workerpals.validation-command-safety.test.ts`: 79 passed, 0 failed, 273 assertions.
+- `bun run test:protocol`
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
 
@@ -56,7 +57,7 @@ bun install -g @pushpalsdev/cli
 - Docker-backed WorkerPal execution can use a stalled Docker Codex startup as the signal to switch future WorkerPal spawns to direct isolated-worktree execution; if the replacement direct WorkerPal also cannot start Codex, that retry can still fail terminally and recycle the worker.
 - QualityGate can still reject or request repair for a broad patch after the rollout coach hands publishable progress forward; this release changes the failure point from executor pre-validation failure to structured gate diagnostics.
 - Bun dependency-layout preflight is offline and lockfile-frozen; if the local Bun cache is incomplete or the lockfile cannot be satisfied, ValidationGate blocks validation and reports the dependency/setup blocker rather than running later validation against an incomplete dependency tree or modifying project manifests.
-- Expo Router browser validation now uses a worktree-local dependency projection keyed by the package manifest and lockfile; if the root dependency tree or offline Bun cache is incomplete, validation may still report a local dependency/setup blocker.
+- The first Bun-lockfile job in a fresh WorkerPal container creates a frozen Linux-native dependency snapshot; it can require registry access when the container's Bun download cache is cold, while later jobs reuse the cached downloads and prepared snapshot.
 - OpenAI Codex WorkerPal jobs can still fail if Codex produces no publishable edit after the final no-edit recovery attempt or if the shared executor budget is already too low for another recovery.
 - OpenAI Codex WorkerPal jobs still fail fast on truly broad/noisy publishable diffs after timeout; tracked paths with no staged or unstaged Git content delta are now filtered before ScopeGate and quality diagnostics.
 - OpenAI Codex rollout coaching still blocks missing-path drift, PushPals/autonomy internals in user repos, broad shared mock expansion, and full render/full-surface harness expansion; this release permits narrow mock/harness terminology when a repo-native shell contract-test task is reusing existing infrastructure.
