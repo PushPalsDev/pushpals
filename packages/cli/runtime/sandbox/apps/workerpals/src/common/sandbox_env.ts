@@ -145,10 +145,15 @@ function ensureSandboxGitConfig(homeDir: string): void {
   }
 }
 
-function withNodeDnsIpv4First(value: string | undefined): string {
-  const existing = (value ?? "").trim();
-  if (/(^|\s)--dns-result-order=/.test(existing)) return existing;
-  return [existing, "--dns-result-order=ipv4first"].filter(Boolean).join(" ");
+function withWorkerNodeOptions(value: string | undefined): string {
+  const options = (value ?? "").trim().split(/\s+/).filter(Boolean);
+  if (!options.some((option) => option.startsWith("--dns-result-order="))) {
+    options.push("--dns-result-order=ipv4first");
+  }
+  if (!options.includes("--preserve-symlinks")) {
+    options.push("--preserve-symlinks");
+  }
+  return options.join(" ");
 }
 
 function resolveOriginalHome(env: Record<string, string>): string {
@@ -198,7 +203,11 @@ export function buildWorkerSandboxWritableEnv(
     EXPO_NO_INTERACTIVE: env.EXPO_NO_INTERACTIVE ?? "1",
     CI: env.CI ?? "1",
     BROWSER: env.BROWSER ?? "none",
-    NODE_OPTIONS: withNodeDnsIpv4First(env.NODE_OPTIONS),
+    // Linux-native dependency snapshots are projected into Windows-hosted
+    // worktrees with symlinks. Preserve those logical paths so dev servers
+    // such as Metro emit browser URLs under the worktree instead of the
+    // container-only snapshot root.
+    NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS),
     REACT_NATIVE_PACKAGER_HOSTNAME: env.REACT_NATIVE_PACKAGER_HOSTNAME ?? "127.0.0.1",
     EXPO_DEV_SERVER_PORT: env.EXPO_DEV_SERVER_PORT ?? defaultExpoPort,
     RCT_METRO_PORT: env.RCT_METRO_PORT ?? defaultExpoPort,

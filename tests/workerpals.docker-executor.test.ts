@@ -569,7 +569,7 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).toContain(
       'dependency_cache_root="/workspace/.pushpals-dependencies/linux-$(uname -m)"',
     );
-    expect(capturedCommand).toContain("bun install --frozen-lockfile --ignore-scripts");
+    expect(capturedCommand).toContain("bun install --frozen-lockfile --ignore-scripts >&2");
     expect(capturedCommand).toContain('snapshot_lock="$snapshot_root.lock"');
     expect(capturedCommand).toContain(
       'ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',

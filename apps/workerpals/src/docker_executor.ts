@@ -105,7 +105,7 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '      mkdir -p "$snapshot_root/node_modules"',
     '      rm -rf "$worktree/node_modules"',
     '      ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
-    '      (cd "$worktree" && bun install --frozen-lockfile --ignore-scripts)',
+    '      (cd "$worktree" && bun install --frozen-lockfile --ignore-scripts >&2)',
     '      rm -f "$worktree/node_modules"',
     '      printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"',
     '      rmdir "$snapshot_lock"',

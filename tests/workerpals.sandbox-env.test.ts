@@ -33,6 +33,7 @@ describe("workerpals sandbox writable env", () => {
       expect(env.CI).toBe("1");
       expect(env.BROWSER).toBe("none");
       expect(env.NODE_OPTIONS).toContain("--dns-result-order=ipv4first");
+      expect(env.NODE_OPTIONS).toContain("--preserve-symlinks");
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("127.0.0.1");
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeGreaterThanOrEqual(19006);
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeLessThan(20006);
@@ -149,7 +150,7 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
-  test("preserves explicit Node DNS and Expo hostname overrides", () => {
+  test("preserves explicit Node DNS and Expo hostname overrides while keeping projected paths", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");
     mkdirSync(repo, { recursive: true });
@@ -161,8 +162,27 @@ describe("workerpals sandbox writable env", () => {
         REACT_NATIVE_PACKAGER_HOSTNAME: "localhost",
       });
 
-      expect(env.NODE_OPTIONS).toBe("--max-old-space-size=4096 --dns-result-order=verbatim");
+      expect(env.NODE_OPTIONS).toBe(
+        "--max-old-space-size=4096 --dns-result-order=verbatim --preserve-symlinks",
+      );
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("localhost");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not duplicate the required Node symlink option", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        HOME: join(root, "home"),
+        NODE_OPTIONS: "--preserve-symlinks --dns-result-order=ipv4first",
+      });
+
+      expect(env.NODE_OPTIONS).toBe("--preserve-symlinks --dns-result-order=ipv4first");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
