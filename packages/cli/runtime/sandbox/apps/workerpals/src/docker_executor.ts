@@ -79,6 +79,102 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+export function buildWorktreeDependencyPreparationCommand(containerWorktreePath: string): string {
+  const worktree = shellSingleQuote(containerWorktreePath);
+  const worktreePrefix = shellSingleQuote(`${containerWorktreePath}/`);
+  return [
+    "set -eu",
+    `worktree=${worktree}`,
+    'linked=""',
+    'if [ -f "$worktree/package.json" ] && { [ -f "$worktree/bun.lock" ] || [ -f "$worktree/bun.lockb" ]; }; then',
+    '  dependency_cache_root="/workspace/.pushpals-dependencies/linux-$(uname -m)"',
+    '  mkdir -p "$dependency_cache_root"',
+    '  snapshot_key="$( { printf \'bun=%s\\n\' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done; } | sha256sum | cut -d " " -f 1)"',
+    "  if jq -e '.workspaces != null' \"$worktree/package.json\" >/dev/null 2>&1; then",
+    '    snapshot_key="$snapshot_key-${worktree##*/}"',
+    "  fi",
+    '  snapshot_root="$dependency_cache_root/$snapshot_key"',
+    '  snapshot_ready="$snapshot_root/.pushpals-dependency-ready"',
+    '  snapshot_lock="$snapshot_root.lock"',
+    "  wait_count=0",
+    '  while [ ! -f "$snapshot_ready" ]; do',
+    '    if mkdir "$snapshot_lock" 2>/dev/null; then',
+    '      cleanup_dependency_install() { rm -rf "$worktree/node_modules"; rm -rf "$snapshot_root"; rmdir "$snapshot_lock" 2>/dev/null || true; }',
+    "      trap cleanup_dependency_install EXIT INT TERM",
+    '      rm -rf "$snapshot_root"',
+    '      mkdir -p "$snapshot_root/node_modules"',
+    '      rm -rf "$worktree/node_modules"',
+    '      ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
+    '      (cd "$worktree" && bun install --frozen-lockfile --ignore-scripts)',
+    '      rm -f "$worktree/node_modules"',
+    '      printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"',
+    '      rmdir "$snapshot_lock"',
+    "      trap - EXIT INT TERM",
+    "    else",
+    "      wait_count=$((wait_count + 1))",
+    '      if [ "$wait_count" -ge 600 ]; then',
+    "        printf 'Timed out waiting for Linux-native dependency snapshot lock: %s\\n' \"$snapshot_lock\" >&2",
+    "        exit 1",
+    "      fi",
+    "      sleep 1",
+    "    fi",
+    "  done",
+    '  src="$snapshot_root/node_modules"',
+    `  dest=${worktreePrefix}node_modules`,
+    '  rm -rf "$dest"',
+    '  mkdir -p "$dest"',
+    '  : > "$dest/.pushpals-dependency-projection-in-progress"',
+    '  for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
+    '    if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi',
+    '    entry_name="${entry##*/}"',
+    '    case "$entry_name" in',
+    "      .cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot|.pushpals-dependency-ready|.pushpals-dependency-projection-in-progress) continue ;;",
+    "    esac",
+    '    ln -s "$entry" "$dest/$entry_name"',
+    "  done",
+    "  for mutable in .cache .expo .vite .vite-temp; do",
+    '    mkdir -p "$dest/$mutable"',
+    "  done",
+    '  rm -f "$dest/.pushpals-dependency-projection-in-progress"',
+    '  printf \'%s\\n\' "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"',
+    '  linked="$linked node_modules-linux-native"',
+    "else",
+    "  for name in node_modules; do",
+    '    src="/repo/$name"',
+    `    dest=${worktreePrefix}$name`,
+    '    if { [ -e "$src" ] || [ -L "$src" ]; } && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then',
+    '      snapshot_key="$(for manifest in /repo/package.json /repo/bun.lock /repo/bun.lockb; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done | sha256sum | cut -d " " -f 1)"',
+    '      mkdir -p "$dest"',
+    '      : > "$dest/.pushpals-dependency-projection-in-progress"',
+    "      projection_ok=1",
+    '      for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
+    '        if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi',
+    '        entry_name="${entry##*/}"',
+    '        case "$entry_name" in',
+    "          .cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot|.pushpals-dependency-projection-in-progress) continue ;;",
+    "        esac",
+    '        if ! ln -s "$entry" "$dest/$entry_name"; then projection_ok=0; break; fi',
+    "      done",
+    '      if [ "$projection_ok" = "1" ]; then',
+    "        for mutable in .cache .expo .vite .vite-temp; do",
+    '          mkdir -p "$dest/$mutable"',
+    "        done",
+    '        rm -f "$dest/.pushpals-dependency-projection-in-progress"',
+    '        rm -f "$dest/.pushpals-dependency-snapshot"',
+    '        printf \'%s\\n\' "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"',
+    '        linked="$linked $name-host-fallback"',
+    "      else",
+    '        rm -rf "$dest"',
+    '        ln -s "$src" "$dest"',
+    '        linked="$linked $name-host-fallback-link"',
+    "      fi",
+    "    fi",
+    "  done",
+    "fi",
+    "printf '%s' \"$linked\"",
+  ].join("\n");
+}
+
 function resolveDockerExecutable(): string {
   const absolute = String(process.env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? "").trim();
   if (absolute) return absolute;
@@ -885,10 +981,8 @@ export class DockerExecutor {
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
     const authMountArgs = this.openaiCodexAuthMountArgs(backend);
-    const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(
-      process.env,
-      existsSync,
-      (path) => this.toDockerPath(path),
+    const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(process.env, existsSync, (path) =>
+      this.toDockerPath(path),
     );
     const args: string[] = [
       "run",
@@ -1500,56 +1594,20 @@ export class DockerExecutor {
   ): Promise<void> {
     const startedAt = Date.now();
     const startNote =
-      "[DockerExecutor] Projecting top-level dependency entries into the WorkerPal worktree.";
+      "[DockerExecutor] Preparing Linux-native dependency entries for the WorkerPal worktree.";
     console.log(startNote);
     onLog?.("stdout", startNote);
-    const worktreePrefix = shellSingleQuote(`${containerWorktreePath}/`);
-    const command = [
-      "set -eu",
-      'linked=""',
-      "for name in node_modules; do",
-      '  src="/repo/$name"',
-      `  dest=${worktreePrefix}$name`,
-      '  if { [ -e "$src" ] || [ -L "$src" ]; } && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then',
-      '    snapshot_key="$(for manifest in /repo/package.json /repo/bun.lock /repo/bun.lockb; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done | sha256sum | cut -d " " -f 1)"',
-      '    mkdir -p "$dest"',
-      '    : > "$dest/.pushpals-dependency-projection-in-progress"',
-      "    projection_ok=1",
-      '    for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
-      '      if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi',
-      '      entry_name="${entry##*/}"',
-      '      case "$entry_name" in',
-      "        .cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot|.pushpals-dependency-projection-in-progress) continue ;;",
-      "      esac",
-      '      if ! ln -s "$entry" "$dest/$entry_name"; then projection_ok=0; break; fi',
-      "    done",
-      '    if [ "$projection_ok" = "1" ]; then',
-      "      for mutable in .cache .expo .vite .vite-temp; do",
-      '        mkdir -p "$dest/$mutable"',
-      "      done",
-      '      rm -f "$dest/.pushpals-dependency-projection-in-progress"',
-      '      rm -f "$dest/.pushpals-dependency-snapshot"',
-      '      printf "%s\\n" "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"',
-      '      linked="$linked $name"',
-      "    else",
-      '      rm -rf "$dest"',
-      '      ln -s "$src" "$dest"',
-      '      linked="$linked $name-fallback"',
-      "    fi",
-      "  fi",
-      "done",
-      "printf '%s' \"$linked\"",
-    ].join("\n");
+    const command = buildWorktreeDependencyPreparationCommand(containerWorktreePath);
 
     const result = await this.runWarmShell(command);
     if (!result.ok) {
       const detail = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
-      const warning = `[DockerExecutor] Worktree dependency artifact linking skipped: ${
+      const warning = `[DockerExecutor] Linux-native worktree dependency preparation failed: ${
         detail || `exit ${result.exitCode}`
       }`;
       console.warn(warning);
       onLog?.("stderr", warning);
-      return;
+      throw new Error(warning);
     }
 
     const linked = result.stdout
@@ -1560,9 +1618,8 @@ export class DockerExecutor {
     if (linked.length === 0) return;
 
     const note =
-      `[DockerExecutor] Projected top-level worktree dependency snapshot(s) in ${
-        Date.now() - startedAt
-      }ms: ` + linked.join(", ");
+      `[DockerExecutor] Prepared worktree dependency snapshot(s) in ${Date.now() - startedAt}ms: ` +
+      linked.join(", ");
     console.log(note);
     onLog?.("stdout", note);
   }

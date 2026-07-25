@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildWorktreeDependencyPreparationCommand,
   collectPrunableEphemeralWorktrees,
   DockerExecutor,
   isEphemeralWorkerWorktreePath,
@@ -531,7 +532,7 @@ describe("workerpals docker executor internals", () => {
     expect(calls).toEqual(["create", "fresh", "warm", "cleanup"]);
   });
 
-  test("projects root dependency artifacts at constant depth for browser hydration", async () => {
+  test("prepares Linux-native dependency artifacts at constant depth for browser hydration", async () => {
     const executor = createExecutor() as unknown as {
       ensureWorktreeDependencyArtifacts: (
         containerWorktreePath: string,
@@ -551,7 +552,7 @@ describe("workerpals docker executor internals", () => {
       capturedCommand = command;
       return {
         ok: true,
-        stdout: " node_modules",
+        stdout: " node_modules-linux-native",
         stderr: "",
         exitCode: 0,
       };
@@ -565,6 +566,15 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).toContain('src="/repo/$name"');
     expect(capturedCommand).toContain("node_modules");
     expect(capturedCommand).not.toContain("cp -as");
+    expect(capturedCommand).toContain(
+      'dependency_cache_root="/workspace/.pushpals-dependencies/linux-$(uname -m)"',
+    );
+    expect(capturedCommand).toContain("bun install --frozen-lockfile --ignore-scripts");
+    expect(capturedCommand).toContain('snapshot_lock="$snapshot_root.lock"');
+    expect(capturedCommand).toContain(
+      'ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
+    );
+    expect(capturedCommand).toContain("node_modules-linux-native");
     expect(capturedCommand).toContain('for entry in "$src"/* "$src"/.[!.]* "$src"/..?*');
     expect(capturedCommand).toContain('ln -s "$entry" "$dest/$entry_name"');
     expect(capturedCommand).toContain(
@@ -576,9 +586,56 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).toContain(".pushpals-dependency-snapshot");
     expect(capturedCommand).toContain("/repo/.worktrees/job-browser-smoke/");
     expect(logs.join("\n")).toContain(
-      "Projecting top-level dependency entries into the WorkerPal worktree.",
+      "Preparing Linux-native dependency entries for the WorkerPal worktree.",
     );
-    expect(logs.join("\n")).toContain("Projected top-level worktree dependency snapshot(s) in ");
+    expect(logs.join("\n")).toContain("Prepared worktree dependency snapshot(s) in ");
+  });
+
+  test("keys shared Linux snapshots by lockfiles and isolates workspace dependency links", () => {
+    const command = buildWorktreeDependencyPreparationCommand("/repo/.worktrees/job-native-deps");
+
+    expect(command).toContain("printf 'bun=%s\\n' \"$(bun --version)\"");
+    expect(command).toContain(
+      'for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"',
+    );
+    expect(command).toContain("jq -e '.workspaces != null'");
+    expect(command).toContain('snapshot_key="$snapshot_key-${worktree##*/}"');
+    expect(command).toContain('while [ ! -f "$snapshot_ready" ]; do');
+    expect(command).toContain('if [ "$wait_count" -ge 600 ]; then');
+    expect(command).toContain('printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"');
+  });
+
+  test("stops the job when Linux-native dependency preparation fails", async () => {
+    const executor = createExecutor() as unknown as {
+      ensureWorktreeDependencyArtifacts: (
+        containerWorktreePath: string,
+        onLog?: (stream: "stdout" | "stderr", line: string) => void,
+      ) => Promise<void>;
+      runWarmShell: () => Promise<{
+        ok: boolean;
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+      }>;
+    };
+
+    const logs: string[] = [];
+    executor.runWarmShell = async () => ({
+      ok: false,
+      stdout: "",
+      stderr: "bun install failed",
+      exitCode: 1,
+    });
+
+    await expect(
+      executor.ensureWorktreeDependencyArtifacts(
+        "/repo/.worktrees/job-native-deps-failed",
+        (stream, line) => logs.push(`${stream}:${line}`),
+      ),
+    ).rejects.toThrow("Linux-native worktree dependency preparation failed: bun install failed");
+    expect(logs.join("\n")).toContain(
+      "stderr:[DockerExecutor] Linux-native worktree dependency preparation failed",
+    );
   });
 
   test("parseGitWorktreeListPorcelain extracts detached and prunable flags", () => {
