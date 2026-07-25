@@ -218,6 +218,8 @@ export function resolveWorkerpalDockerRuntimeCaArgs(
     "-e",
     `SSL_CERT_FILE=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
     "-e",
+    `GIT_SSL_CAINFO=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
+    "-e",
     `REQUESTS_CA_BUNDLE=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,
     "-e",
     `CURL_CA_BUNDLE=${WORKERPAL_SANDBOX_MERGED_CA_PATH}`,

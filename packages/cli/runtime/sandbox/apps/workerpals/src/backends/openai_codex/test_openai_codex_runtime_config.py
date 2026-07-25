@@ -2483,6 +2483,9 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             (repo / "README.md").write_text("# stale status repo\n", encoding="utf-8")
             (repo / "src").mkdir()
             (repo / "src" / "focused.ts").write_text("export const value = 1;\n", encoding="utf-8")
+            clean_paths = [f"src/clean-{index}.ts" for index in range(12)]
+            for index, path in enumerate(clean_paths):
+                (repo / path).write_text(f"export const cleanValue{index} = {index};\n", encoding="utf-8")
             subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
             subprocess.run(
                 ["git", "config", "user.name", "PushPals Test"],
@@ -2510,11 +2513,14 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             (repo / "src" / "focused.ts").write_text("export const value = 2;\n", encoding="utf-8")
             with mock.patch(
                 "openai_codex_executor.summarize_git_changes",
-                return_value=["README.md", "src/focused.ts"],
+                return_value=["README.md", *clean_paths, "src/focused.ts"],
+            ), mock.patch(
+                "openai_codex_executor._tracked_path_has_git_content_delta",
+                side_effect=AssertionError("batched filtering should avoid per-path Git probes"),
             ):
                 changed_paths, delta, effective = _codex_changed_paths(str(repo), {})
 
-        self.assertEqual(changed_paths, ["README.md", "src/focused.ts"])
+        self.assertEqual(changed_paths, ["README.md", *clean_paths, "src/focused.ts"])
         self.assertEqual(delta, ["src/focused.ts"])
         self.assertEqual(effective, ["src/focused.ts"])
 

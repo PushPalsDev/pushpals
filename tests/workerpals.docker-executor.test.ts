@@ -62,6 +62,8 @@ describe("workerpals docker executor internals", () => {
         "-e",
         "SSL_CERT_FILE=/run/pushpals/ca-bundle.pem",
         "-e",
+        "GIT_SSL_CAINFO=/run/pushpals/ca-bundle.pem",
+        "-e",
         "REQUESTS_CA_BUNDLE=/run/pushpals/ca-bundle.pem",
         "-e",
         "CURL_CA_BUNDLE=/run/pushpals/ca-bundle.pem",

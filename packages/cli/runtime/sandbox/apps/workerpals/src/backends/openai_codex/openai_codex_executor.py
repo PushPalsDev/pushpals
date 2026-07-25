@@ -107,6 +107,7 @@ _MAX_WRAPPER_BOOTSTRAP_OUTPUT_CHARS = 1_200
 _MAX_WRAPPER_BOOTSTRAP_TOTAL_CHARS = 5_000
 _MAX_CREDIBLE_WRAPPER_LOOP_CHANGED_PATHS = 8
 _MAX_CREDIBLE_WRAPPER_LOOP_TOP_LEVELS = 4
+_BATCH_GIT_CONTENT_DELTA_MIN_PATHS = 8
 _MAX_STARTUP_STALL_RECOVERY_ATTEMPTS = 1
 _MAX_STARTUP_STALL_DURING_NO_EDIT_RECOVERY_ATTEMPTS = 2
 _MAX_NO_EDIT_RECOVERY_ATTEMPTS = 2
@@ -1023,8 +1024,9 @@ def _paths_changed_after_baseline(
     baseline_paths = set(_baseline_snapshot_paths(baseline_snapshot))
     delta: List[str] = []
     baseline_fingerprints = baseline_snapshot if isinstance(baseline_snapshot, dict) else {}
+    tracked_content_deltas = _tracked_paths_git_content_deltas(repo, changed_paths)
     for path in changed_paths:
-        tracked_content_delta = _tracked_path_has_git_content_delta(repo, path)
+        tracked_content_delta = tracked_content_deltas.get(path)
         if tracked_content_delta is False:
             continue
         if not baseline_paths:
@@ -2510,6 +2512,68 @@ def _tracked_path_has_git_content_delta(repo: str, path: str) -> Optional[bool]:
         if result.returncode != 0:
             return None
     return has_delta
+
+
+def _git_null_delimited_paths(output: str) -> List[str]:
+    return [
+        path.replace("\\", "/").strip().strip("/")
+        for path in str(output or "").split("\0")
+        if path.strip()
+    ]
+
+
+def _tracked_paths_git_content_deltas(
+    repo: str,
+    paths: List[str],
+) -> Dict[str, Optional[bool]]:
+    normalized_paths = [
+        str(path or "").replace("\\", "/").strip().strip("/")
+        for path in paths
+        if str(path or "").strip()
+    ]
+    if not normalized_paths:
+        return {}
+    if len(normalized_paths) < _BATCH_GIT_CONTENT_DELTA_MIN_PATHS:
+        return {
+            path: _tracked_path_has_git_content_delta(repo, path)
+            for path in normalized_paths
+        }
+
+    commands = (
+        ["git", "ls-files", "-z"],
+        ["git", "diff", "--name-only", "--no-renames", "-z"],
+        ["git", "diff", "--cached", "--name-only", "--no-renames", "-z"],
+    )
+    results: List[subprocess.CompletedProcess[str]] = []
+    try:
+        for args in commands:
+            results.append(
+                subprocess.run(
+                    args,
+                    cwd=repo,
+                    text=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+            )
+    except Exception:
+        results = []
+
+    if len(results) == len(commands) and all(result.returncode == 0 for result in results):
+        tracked_paths = set(_git_null_delimited_paths(results[0].stdout))
+        content_deltas = {
+            *_git_null_delimited_paths(results[1].stdout),
+            *_git_null_delimited_paths(results[2].stdout),
+        }
+        return {
+            path: (path in content_deltas) if path in tracked_paths else None
+            for path in normalized_paths
+        }
+
+    return {
+        path: _tracked_path_has_git_content_delta(repo, path)
+        for path in normalized_paths
+    }
 
 
 def _prune_empty_artifact_parent_dirs(repo: str, path: Path) -> None:
