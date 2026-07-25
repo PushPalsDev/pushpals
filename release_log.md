@@ -2,22 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.1.94`
-- start_commit: `4f584ab13cb67f87244787a7e0a499e76e1d1827`
-- end_commit: `6531b783516701add6aef5bb7c148c44f863e236`
+- version: `v1.1.95`
+- start_commit: `043aeb926fe479c06c54c0590337946dbe170879`
+- end_commit: `8a877127dd5e7fca92403a864f005d3d03443aea`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Keep Vite's `.vite-temp` output job-local and writable instead of projecting the shared root dependency artifact into WorkerPal worktrees.
-- Prevent Vitest config loading from failing with `EROFS` during aggregate validation in Docker-backed jobs.
-- Preserve the constant-depth dependency projection for immutable packages while extending the existing mutable cache isolation policy.
+- Include tracked, staged, and newly created untracked files in CriticGate diff evidence so document-creation and other new-file jobs are reviewed against their real patch instead of receiving an empty-diff revision.
+- Heartbeat aggregate-validation leases every five seconds and recover a dead same-host owner immediately or a stopped heartbeat after 30 seconds.
+- Preserve the longer legacy-lease safety window while making newly created leases resilient to interrupted WorkerPal processes and container replacement.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 948 passed, 1 Windows signal-handling skip, 0 failed, 3,565 assertions.
+- `bun run test:root`: 951 passed, 1 Windows signal-handling skip, 0 failed, 3,575 assertions.
+- `bun test`: 1,018 passed, 1 Windows signal-handling skip, 0 failed, 3,880 assertions.
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
 
