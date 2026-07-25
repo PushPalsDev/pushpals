@@ -2,26 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.1.96`
-- start_commit: `32006b3553e22d0a8f191c8f184edebaac43a911`
-- end_commit: `84c5d99906324069d5fa6f5bdf7d33904da806ff`
+- version: `v1.1.97`
+- start_commit: `d91b126f8c665581887dab64810ab9ca5f3cabd1`
+- end_commit: `faa2361e60c4b5fa7feafac3f0abaa80849600d6`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Build a frozen Linux-native Bun dependency snapshot inside the WorkerPal container instead of projecting Windows-host packages into Linux worktrees.
-- Cache dependency downloads and project constant-depth top-level links into each job worktree so validation stays fast without losing platform-specific or transitive packages.
-- Serialize snapshot creation and stop the job before model execution when dependency preparation fails, preventing repeated repair attempts against a broken runtime.
+- Preserve logical worktree dependency paths for Node processes so Metro, Expo, and similar dev servers emit browser bundle URLs under the project instead of the container-only Linux snapshot cache.
+- Keep the fast Linux-native dependency snapshot while restoring client hydration for Windows-hosted Docker worktrees; the SectorCommand browser smoke now renders its home screen instead of receiving a 404 for the Expo Router entry bundle.
+- Keep successful dependency preparation logs concise by separating Bun install diagnostics from the final linked-artifact sentinel.
 
 ## Validation
 
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 953 passed, 1 Windows signal-handling skip, 0 failed, 3,589 assertions.
-- `bun test tests/workerpals.docker-executor.test.ts tests/workerpals.direct-worktree-dependency-artifacts.test.ts tests/workerpals.validation-command-safety.test.ts`: 79 passed, 0 failed, 273 assertions.
+- `bun run test:root`: 954 passed, 1 Windows signal-handling skip, 0 failed, 3,591 assertions.
+- `bun test tests/workerpals.sandbox-env.test.ts tests/workerpals.docker-executor.test.ts`: 37 passed, 0 failed, 135 assertions.
 - `bun run test:protocol`
 - `bun x tsc --noEmit -p apps/workerpals/tsconfig.json`
 - `git diff --check`
+- Live Docker/Chromium proof against SectorCommand: the Expo Router bundle resolves under `/node_modules`, returns successfully, and `home-screen` renders.
 
 ## Install
 
