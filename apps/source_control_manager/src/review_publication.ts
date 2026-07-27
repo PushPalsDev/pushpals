@@ -89,3 +89,9 @@ export function shouldUseReviewPublicationFlow(
 ): boolean {
   return reviewAgentEnabled || lease !== null;
 }
+
+export function shouldPublishWithExactReviewLease(
+  lease: ReviewPublicationLease | null,
+): lease is ReviewPublicationLease {
+  return lease !== null;
+}

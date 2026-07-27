@@ -16,6 +16,7 @@ import {
   parseReviewPublicationLease,
   reviewCompletionHandoffMatches,
   shouldCleanupCompletionHandoff,
+  shouldPublishWithExactReviewLease,
   shouldUseReviewPublicationFlow,
 } from "./review_publication";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
@@ -585,7 +586,6 @@ async function tick(): Promise<void> {
     // ── Process completion ─────────────────────────────────────────────
     let tempBranch = "";
     let cleanupCompletionHandoff = false;
-    let cleanupRemoteReviewHandoff = false;
     try {
       let processedPrUrl: string | null =
         typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
@@ -618,7 +618,6 @@ async function tick(): Promise<void> {
               `Review completion ${completion.branch} was not available in the shared host repository and remote compatibility fetch failed: ${fetchCompletionRef.stderr || fetchCompletionRef.stdout}`,
             );
           }
-          cleanupRemoteReviewHandoff = true;
           resolvedCompletionSha = await runGitCapture(
             ["-C", runtimeConfig.repoPath, "rev-parse", "--verify", completion.branch],
             repoRoot,
@@ -752,7 +751,7 @@ async function tick(): Promise<void> {
           ? { headBranch: reviewPublicationLease.targetBranch, requiresMaterialize: false }
           : deriveReviewPrHeadBranch(completion.branch, completion.id);
         let prHeadBranch = resolvedHead.headBranch;
-        if (reviewPublicationLease && cleanupRemoteReviewHandoff) {
+        if (shouldPublishWithExactReviewLease(reviewPublicationLease)) {
           const prBaseBranch =
             reviewPublicationLease.baseBranch ??
             (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
