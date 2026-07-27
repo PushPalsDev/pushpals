@@ -2,24 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.100`
-- start_commit: `146cd808bed288f39b9803f5584ae42e15b7a124`
-- end_commit: `69aa316e60ece93175c6b6f53e31ea7e37f86088`
+- version: `v1.1.101`
+- start_commit: `a032c1e991fe9b6628bb3731ddad71c10e52ef8e`
+- end_commit: `041421a2e659d5271f0bb4a11151ca51cc84a7dd`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Keep an in-flight leased review completion on the exact PR publication path even when ReviewAgent dispatch is disabled before the worker finishes.
-- Treat immutable review-publication lease metadata as authoritative, preventing a completed PR repair from being misrouted into a diverged integration branch.
-- Preserve the existing normal integration-branch flow for completions without a review lease.
+- Preserve an explicit `remotebuddy.autonomy.enabled = false` user override across every embedded-runtime bootstrap and asset refresh.
+- Stop treating a durable local autonomy disable as a stale default that should be silently rewritten to `true`.
+- Keep the remaining embedded model and Codex-command migrations intact.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 977 passed, 2 intentional skips, 0 failed, 3,734 assertions across 116 files.
-- `bun test tests/source-control-manager.review-publication.test.ts`: 6 passed, 0 failed.
-- `bun test tests/workerpals.rebase-sync.test.ts`: 8 passed, 0 failed.
-- `bun test tests/workerpals.merge-conflict-job.test.ts`: 10 passed, 0 failed.
-- SourceControlManager TypeScript check, Prettier verification, and `git diff --check` passed.
+- Full root suite on Bun 1.3.14 before the focused CLI follow-up: 977 passed, 2 intentional skips, 0 failed, 3,734 assertions across 116 files.
+- `bun test tests/cli.runtime-bootstrap.test.ts` on Bun 1.3.14: 145 passed, 1 intentional skip, 0 failed, 483 assertions.
+- `bun run cli:bundle`
+- `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
+- Prettier verification and `git diff --check` passed.
 
 ## Install
 
