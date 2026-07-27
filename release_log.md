@@ -2,24 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.1.101`
-- start_commit: `a032c1e991fe9b6628bb3731ddad71c10e52ef8e`
-- end_commit: `041421a2e659d5271f0bb4a11151ca51cc84a7dd`
+- version: `v1.2.0`
+- start_commit: `dce845d67294116cdd522decd0d39b69027a0364`
+- end_commit: `02690b34ccedd19f2bd30d0d94212cfd6559536a`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve an explicit `remotebuddy.autonomy.enabled = false` user override across every embedded-runtime bootstrap and asset refresh.
-- Stop treating a durable local autonomy disable as a stale default that should be silently rewritten to `true`.
-- Keep the remaining embedded model and Codex-command migrations intact.
+- Always publish immutable review-fix revisions to their leased PR branch, including when the host-prepared handoff ref is already available locally.
+- Protect existing PR heads with an exact `--force-with-lease` expectation before marking review publication processed.
+- Add regression coverage for the local immutable-handoff path that previously skipped publication.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14 before the focused CLI follow-up: 977 passed, 2 intentional skips, 0 failed, 3,734 assertions across 116 files.
-- `bun test tests/cli.runtime-bootstrap.test.ts` on Bun 1.3.14: 145 passed, 1 intentional skip, 0 failed, 483 assertions.
+- Full root suite on Bun 1.3.14: 978 passed, 2 intentional skips, 0 failed, 3,736 assertions across 116 files.
+- `bun test tests/source-control-manager.review-publication.test.ts` on Bun 1.3.14: 7 passed, 0 failed, 16 assertions.
+- SourceControlManager TypeScript check passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- Prettier verification and `git diff --check` passed.
+- `git diff --check` passed.
 
 ## Install
 
