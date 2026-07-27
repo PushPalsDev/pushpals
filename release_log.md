@@ -2,27 +2,30 @@
 
 ## Release Metadata
 
-- version: `v1.1.98`
-- start_commit: `f04084e9a343d3254f65144d74c5c8ba7a42f1ee`
-- end_commit: `9fd92b5ebca8bc1bb9263eac6dc18e23e7e8ba84`
+- version: `v1.1.99`
+- start_commit: `cd1a8d23bef0995e2606f6a2c3cba93c467d4dd0`
+- end_commit: `16b349331e22f3ca056be945d621ca8ee877ac0b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Route container Git HTTPS through PushPals' merged system and host-extra CA bundle, so review-fix and ordinary WorkerPal commits can sync and push through Windows TLS-inspection certificates.
-- Batch large stale Git-status content checks into three repository-level commands instead of probing every path separately, removing the multi-minute finalization tail observed on Windows-hosted Linux worktrees.
-- Preserve the existing per-path behavior for ordinary small diffs while filtering clean tracked paths caused by cross-platform Git stat-cache churn.
+- Create Linux-container worktrees with deterministic LF Git settings and verify the Windows-host/Linux-container boundary with a real Docker integration test.
+- Recover dirty disposable publication worktrees safely, seed review and conflict-repair jobs from exact PR-head leases, and keep branch switching, rebasing, and pushing in host-side source control.
+- Cluster repeated failures by normalized target and failure fingerprint, prioritize focused validation before full gates, and reuse unchanged invariant validation results.
+- Base autonomy health on end-to-end outcomes, timeout rate, repeated failures, active runtime, and token consumption, with stateful open/resolved alerts instead of repeated stateless warnings.
+- Upgrade the embedded Bun runtime to 1.3.14, emit structured native-crash recovery envelopes, and add a scheduled two-hour Windows runtime soak.
+- Preserve the integration branch as the planning baseline and pause dispatch when source control cannot reconcile it with the default branch.
 
 ## Validation
 
-- `bun run cli:bundle`
+- `bun run test:root` on Bun 1.3.14: 976 passed, 2 intentional skips, 0 failed, 3,731 assertions across 116 files.
+- Focused changed-surface suite: 369 passed, 1 intentional skip, 0 failed.
+- `bun run test:protocol`: 44 passed, 0 failed.
+- TypeScript checks for server, RemoteBuddy, WorkerPals, source-control manager, and CLI all passed.
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- `bun run test:root`: 954 passed, 1 Windows signal-handling skip, 0 failed, 3,591 assertions.
-- `bun test tests/workerpals.docker-executor.test.ts`: 27 passed, 0 failed, 95 assertions.
-- Focused Python executor regressions: 3 passed, covering batched stale-status filtering and dirty-baseline preservation.
-- `bun run test:protocol`
-- `git diff --check`
-- Live Docker Git proof against SectorCommand: `git ls-remote --exit-code origin HEAD` succeeds with `GIT_SSL_CAINFO` pointed at the merged WorkerPal CA bundle.
+- Real Windows-host/Linux-container LF integration test passed.
+- Compiled Bun 1.3.14 Windows runtime smoke: 20 successful probes over five minutes across server, RemoteBuddy, and WorkerPal, followed by a clean exit.
+- Frozen install, Prettier verification, and `git diff --check` passed.
 
 ## Install
 
