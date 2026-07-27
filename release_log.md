@@ -2,30 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.1.99`
-- start_commit: `cd1a8d23bef0995e2606f6a2c3cba93c467d4dd0`
-- end_commit: `16b349331e22f3ca056be945d621ca8ee877ac0b`
+- version: `v1.1.100`
+- start_commit: `146cd808bed288f39b9803f5584ae42e15b7a124`
+- end_commit: `69aa316e60ece93175c6b6f53e31ea7e37f86088`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Create Linux-container worktrees with deterministic LF Git settings and verify the Windows-host/Linux-container boundary with a real Docker integration test.
-- Recover dirty disposable publication worktrees safely, seed review and conflict-repair jobs from exact PR-head leases, and keep branch switching, rebasing, and pushing in host-side source control.
-- Cluster repeated failures by normalized target and failure fingerprint, prioritize focused validation before full gates, and reuse unchanged invariant validation results.
-- Base autonomy health on end-to-end outcomes, timeout rate, repeated failures, active runtime, and token consumption, with stateful open/resolved alerts instead of repeated stateless warnings.
-- Upgrade the embedded Bun runtime to 1.3.14, emit structured native-crash recovery envelopes, and add a scheduled two-hour Windows runtime soak.
-- Preserve the integration branch as the planning baseline and pause dispatch when source control cannot reconcile it with the default branch.
+- Keep an in-flight leased review completion on the exact PR publication path even when ReviewAgent dispatch is disabled before the worker finishes.
+- Treat immutable review-publication lease metadata as authoritative, preventing a completed PR repair from being misrouted into a diverged integration branch.
+- Preserve the existing normal integration-branch flow for completions without a review lease.
 
 ## Validation
 
-- `bun run test:root` on Bun 1.3.14: 976 passed, 2 intentional skips, 0 failed, 3,731 assertions across 116 files.
-- Focused changed-surface suite: 369 passed, 1 intentional skip, 0 failed.
-- `bun run test:protocol`: 44 passed, 0 failed.
-- TypeScript checks for server, RemoteBuddy, WorkerPals, source-control manager, and CLI all passed.
-- `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- Real Windows-host/Linux-container LF integration test passed.
-- Compiled Bun 1.3.14 Windows runtime smoke: 20 successful probes over five minutes across server, RemoteBuddy, and WorkerPal, followed by a clean exit.
-- Frozen install, Prettier verification, and `git diff --check` passed.
+- Full root suite on Bun 1.3.14: 977 passed, 2 intentional skips, 0 failed, 3,734 assertions across 116 files.
+- `bun test tests/source-control-manager.review-publication.test.ts`: 6 passed, 0 failed.
+- `bun test tests/workerpals.rebase-sync.test.ts`: 8 passed, 0 failed.
+- `bun test tests/workerpals.merge-conflict-job.test.ts`: 10 passed, 0 failed.
+- SourceControlManager TypeScript check, Prettier verification, and `git diff --check` passed.
 
 ## Install
 
