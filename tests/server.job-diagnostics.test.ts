@@ -141,6 +141,56 @@ describe("server JobQueue diagnostics", () => {
     expect(failed.ok).toBe(true);
   }
 
+  function failValidationFingerprintJob(
+    queue: JobQueue,
+    taskId: string,
+    options: {
+      patternKey: string;
+      targetPath: string;
+      command?: string;
+      failureClass?: string;
+      failedTest?: string;
+      singularTargetPath?: boolean;
+    },
+  ): void {
+    const jobId = enqueueClaimedJob(queue, taskId, {
+      origin: "autonomy",
+      ...(options.singularTargetPath ? { targetPath: options.targetPath } : {}),
+      autonomy: {
+        patternKey: options.patternKey,
+        ...(options.singularTargetPath ? {} : { targetPaths: [options.targetPath] }),
+      },
+    });
+    const command = options.command ?? "bun test tests/appRouteShellImportBoundaryProbe.test.ts";
+    const failureClass = options.failureClass ?? "validation_failed";
+    const failedTest =
+      options.failedTest ?? "route shell import boundary > rejects forbidden feature imports";
+    const failed = queue.fail(jobId, {
+      message: "focused validation failed",
+      diagnostics: {
+        validationRuns: [
+          {
+            attempt: 1,
+            command,
+            exitCode: 1,
+            durationMs: 1000,
+            passed: false,
+            failureClass,
+            stderrTail: `(fail) ${failedTest} [12.00ms]`,
+          },
+        ],
+        terminal: {
+          status: "failed",
+          failureClass,
+          terminalStage: "quality_gate",
+          summary: "focused validation failed",
+          changedPathSample: [options.targetPath],
+        },
+      },
+    });
+    expect(failed.ok).toBe(true);
+  }
+
   function completePublishableJob(queue: JobQueue, taskId: string): void {
     const jobId = enqueueClaimedJob(queue, taskId);
     const completed = queue.complete(jobId, {
@@ -428,6 +478,63 @@ describe("server JobQueue diagnostics", () => {
         threshold: 2,
       });
       expect(unrelated.blocked).toBe(false);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("suppresses unchanged target-and-failure clusters across pattern-key variations", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      failValidationFingerprintJob(queue, "task-fingerprint-1", {
+        patternKey: "route.shell.first-wording",
+        targetPath: "app/(tabs)/_layout.tsx",
+      });
+      expect(
+        queue.similarFailureFingerprintSummary({
+          targetPaths: ["app/(tabs)/_layout.tsx"],
+          threshold: 2,
+        }).blocked,
+      ).toBe(false);
+
+      failValidationFingerprintJob(queue, "task-fingerprint-2", {
+        patternKey: "totally.different.prompt-key",
+        targetPath: "app/(tabs)/_layout.tsx",
+        singularTargetPath: true,
+      });
+      const summary = queue.similarFailureFingerprintSummary({
+        targetPaths: ["app/(tabs)/_layout.tsx"],
+        threshold: 2,
+      });
+      expect(summary.blocked).toBe(true);
+      expect(summary.recentSimilarFailureCount).toBe(2);
+      expect(summary.fingerprint).toHaveLength(24);
+      expect(summary.command).toContain("approuteshellimportboundaryprobe");
+      expect(summary.failedTestSample).toContain(
+        "route shell import boundary > rejects forbidden feature imports",
+      );
+
+      expect(
+        queue.similarFailureFingerprintSummary({
+          targetPaths: ["docs/release.md"],
+          threshold: 2,
+        }).blocked,
+      ).toBe(false);
+
+      failValidationFingerprintJob(queue, "task-fingerprint-distinct-a", {
+        patternKey: "shared-parent-a",
+        targetPath: "app/components/alpha.tsx",
+      });
+      failValidationFingerprintJob(queue, "task-fingerprint-distinct-b", {
+        patternKey: "shared-parent-b",
+        targetPath: "app/components/beta.tsx",
+      });
+      const sharedParent = queue.similarFailureFingerprintSummary({
+        targetPaths: ["app/components"],
+        threshold: 2,
+      });
+      expect(sharedParent.blocked).toBe(false);
+      expect(sharedParent.recentSimilarFailureCount).toBe(1);
     } finally {
       queue.close();
     }

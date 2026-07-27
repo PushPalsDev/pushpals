@@ -48,8 +48,13 @@ import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
 import { linkDirectWorktreeDependencyArtifacts } from "./common/worktree_dependency_artifacts.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
-import { resolveFreshWorktreeBaseRef } from "./worktree_base_ref.js";
+import { resolveFreshWorktreeBaseRef, resolveReviewWorktreeBase } from "./worktree_base_ref.js";
 import type { JobDiagnostics, JobPhaseSpanDiagnostics } from "./common/types.js";
+import {
+  applyMergeConflictExecutionHints,
+  isMergeConflictResolutionParams,
+  prepareMergeConflictWorktreeOnHost,
+} from "./merge_conflict_job.js";
 
 type CommitRef = {
   branch: string;
@@ -822,6 +827,25 @@ async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promi
   });
 }
 
+async function resolveWorktreeBaseRefForJob(
+  repo: string,
+  requestedRef: string,
+  jobId: string,
+  params: Record<string, unknown>,
+): Promise<string> {
+  return resolveReviewWorktreeBase({
+    jobId,
+    params,
+    git: (args) => git(repo, args),
+    fallback: () => resolveWorktreeBaseRef(repo, requestedRef),
+    log: (level, message) => {
+      const line = `[WorkerPals] ${message}`;
+      if (level === "warn") console.warn(line);
+      else console.log(line);
+    },
+  });
+}
+
 async function createIsolatedWorktree(
   repo: string,
   jobId: string,
@@ -1285,7 +1309,9 @@ async function enqueueCompletion(
       .toLowerCase();
     const reviewBaseBranch = normalizeReviewLeaseBranch(reviewAgent?.prBaseRef);
     const completionPrBody =
-      resolutionType === "merge_conflict" && reviewTargetBranch && reviewExpectedHeadSha
+      (resolutionType === "review_fix" || resolutionType === "merge_conflict") &&
+      reviewTargetBranch &&
+      reviewExpectedHeadSha
         ? [
             pr.body,
             "",
@@ -1703,20 +1729,35 @@ async function workerLoop(
           let recycleWorkerAfterJob = false;
 
           try {
-            if (!dockerExecutor) {
-              directWorktreePath = await createIsolatedWorktree(
-                opts.repo,
-                job.id,
-                opts.worktreeBaseRef,
-                onLog,
-              );
-              executionRepo = directWorktreePath;
-            }
-
-            const parsedParams =
+            let parsedParams =
               typeof job.params === "string"
                 ? (JSON.parse(job.params) as Record<string, unknown>)
                 : job.params;
+
+            if (!dockerExecutor) {
+              const jobBaseRef = await resolveWorktreeBaseRefForJob(
+                opts.repo,
+                opts.worktreeBaseRef,
+                job.id,
+                parsedParams,
+              );
+              directWorktreePath = await createIsolatedWorktree(
+                opts.repo,
+                job.id,
+                jobBaseRef,
+                onLog,
+              );
+              executionRepo = directWorktreePath;
+              if (isMergeConflictResolutionParams(parsedParams)) {
+                const prepared = await prepareMergeConflictWorktreeOnHost(
+                  executionRepo,
+                  job.id,
+                  parsedParams,
+                  onLog,
+                );
+                parsedParams = applyMergeConflictExecutionHints(parsedParams, prepared);
+              }
+            }
 
             const jobData = {
               id: job.id,

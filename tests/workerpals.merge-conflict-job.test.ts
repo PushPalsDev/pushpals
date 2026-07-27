@@ -7,7 +7,7 @@ import {
   executeJob,
   resumePreparedMergeConflictRebase,
 } from "../apps/workerpals/src/execute_job";
-import { prepareMergeConflictTaskRepo } from "../apps/workerpals/src/merge_conflict_job";
+import { prepareMergeConflictWorktreeOnHost } from "../apps/workerpals/src/merge_conflict_job";
 import { loadPushPalsConfig } from "shared";
 import type { WorkerpalsRuntimeConfig } from "../apps/workerpals/src/common/executor_backend";
 import type { ExecutorBackend } from "../apps/workerpals/src/common/types";
@@ -109,6 +109,7 @@ type ConflictFixture = {
   publicBranch: string;
   baseBranch: string;
   prHeadSha: string;
+  prBaseSha: string;
   conflictFile: string;
   params: Record<string, unknown>;
 };
@@ -180,6 +181,7 @@ async function createConflictFixture(options?: {
     ["push", "origin", `HEAD:refs/heads/${baseBranch}`],
     "push main conflict",
   );
+  const prBaseSha = await mustGit(maintainer, ["rev-parse", "HEAD"], "resolve base HEAD");
 
   await mustGit(sourceRepo, ["fetch", "origin", baseBranch, publicBranch], "fetch source refs");
   await mustGit(
@@ -195,6 +197,7 @@ async function createConflictFixture(options?: {
     publicBranch,
     baseBranch,
     prHeadSha,
+    prBaseSha,
     conflictFile,
     params: {
       schemaVersion: 2,
@@ -220,11 +223,25 @@ async function createConflictFixture(options?: {
         prHeadRef: publicBranch,
         prBaseRef: baseBranch,
         prHeadSha,
+        prBaseSha,
         resolutionType: "merge_conflict",
         mergeError: "Pull Request is not mergeable",
       },
     },
   };
+}
+
+async function prepareFixtureHostWorktree(
+  fixture: ConflictFixture,
+  jobId: string,
+): ReturnType<typeof prepareMergeConflictWorktreeOnHost> {
+  const worktreePath = join(fixture.root, `${jobId}-worktree`);
+  await mustGit(
+    fixture.sourceRepo,
+    ["worktree", "add", "--detach", worktreePath, fixture.prHeadSha],
+    `create host worktree for ${jobId}`,
+  );
+  return prepareMergeConflictWorktreeOnHost(worktreePath, jobId, fixture.params);
 }
 
 const skipMergeConflictTests = await shouldSkipForGitSpawnPermission();
@@ -241,37 +258,48 @@ function runMergeConflictTest(
 
 describe("workerpals merge-conflict sandbox", () => {
   runMergeConflictTest(
-    "prepares merge-conflict repo in isolated sandbox without switching source checkout",
+    "prepares the exact detached merge-conflict worktree on the host without switching source checkout",
     async () => {
       const fixture = await createConflictFixture();
+      const worktreePath = join(fixture.root, "host-worktree");
       try {
         const sourceBranchBefore = await mustGit(
           fixture.sourceRepo,
           ["branch", "--show-current"],
           "source branch before preparation",
         );
-        const prepared = await prepareMergeConflictTaskRepo(
+        await mustGit(
           fixture.sourceRepo,
+          ["worktree", "add", "--detach", worktreePath, fixture.prHeadSha],
+          "create exact host worktree",
+        );
+        const prepared = await prepareMergeConflictWorktreeOnHost(
+          worktreePath,
           "job-merge-conflict",
           fixture.params,
         );
         try {
-          expect(prepared.repoPath).not.toBe(fixture.sourceRepo);
-          expect(prepared.plannerGuidance).toContain("isolated container-local clone");
+          expect(prepared.repoPath).toBe(worktreePath);
+          expect(prepared.plannerGuidance).toContain("host-prepared worktree");
           expect(prepared.plannerGuidance).toContain(
-            "Use direct commands only while resolving this rebase",
+            "Host-side source-control orchestration owns rebase continuation",
           );
           expect(prepared.plannerGuidance).toContain(
-            "Primary success condition: finish the git rebase",
+            "Do not run checkout, switch, reset, merge, rebase, add, commit, or push commands",
           );
-          expect(prepared.plannerGuidance).toContain("A clean rebased branch");
+          expect(prepared.plannerGuidance).toContain(
+            "Edit the conflicted files, remove conflict markers, preserve both sides' intended behavior",
+          );
+          expect(prepared.plannerGuidance).toContain(
+            "SourceControlManager owns publication and is the sole process allowed",
+          );
           expect(prepared.conflictPaths).toEqual([fixture.conflictFile]);
-          const sandboxBranchList = await mustGit(
+          const preparedBranch = await mustGit(
             prepared.repoPath,
-            ["branch", "--list", fixture.publicBranch],
-            "list sandbox branch",
+            ["branch", "--show-current"],
+            "inspect prepared branch",
           );
-          expect(sandboxBranchList).toContain(fixture.publicBranch);
+          expect(preparedBranch).toBe("");
           const unresolved = await mustGit(
             prepared.repoPath,
             ["diff", "--name-only", "--diff-filter=U"],
@@ -286,6 +314,11 @@ describe("workerpals merge-conflict sandbox", () => {
           expect(sourceBranchAfter).toBe(sourceBranchBefore);
         } finally {
           prepared.cleanup();
+          await mustGit(
+            fixture.sourceRepo,
+            ["worktree", "remove", "--force", worktreePath],
+            "remove exact host worktree",
+          );
         }
       } finally {
         rmSync(fixture.root, { recursive: true, force: true });
@@ -294,12 +327,18 @@ describe("workerpals merge-conflict sandbox", () => {
   );
 
   runMergeConflictTest(
-    "createJobCommit uploads an immutable completion ref without updating the PR branch",
+    "createJobCommit retains a shared local completion ref without any worker-side push",
     async () => {
       const fixture = await createConflictFixture();
+      const worktreePath = join(fixture.root, "host-finalize-worktree");
       try {
-        const prepared = await prepareMergeConflictTaskRepo(
+        await mustGit(
           fixture.sourceRepo,
+          ["worktree", "add", "--detach", worktreePath, fixture.prHeadSha],
+          "create finalization worktree",
+        );
+        const prepared = await prepareMergeConflictWorktreeOnHost(
+          worktreePath,
           "job-merge-conflict",
           fixture.params,
         );
@@ -346,16 +385,27 @@ describe("workerpals merge-conflict sandbox", () => {
             "inspect remote branch",
           );
           expect(lsRemote.startsWith(`${fixture.prHeadSha}\t`)).toBe(true);
-          const stagedRef = await mustGit(
+          const retainedRef = await mustGit(
+            fixture.sourceRepo,
+            ["rev-parse", commitResult.branch!],
+            "inspect shared local completion ref",
+          );
+          expect(retainedRef).toBe(commitResult.sha);
+          const remoteCompletionRef = await mustGit(
             fixture.sourceRepo,
             ["ls-remote", "origin", commitResult.branch!],
-            "inspect immutable completion ref",
+            "inspect remote completion ref",
           );
-          expect(stagedRef.startsWith(`${commitResult.sha}\t`)).toBe(true);
+          expect(remoteCompletionRef).toBe("");
           const resolvedFile = readFileSync(join(prepared.repoPath, fixture.conflictFile), "utf8");
           expect(resolvedFile).toContain("resolved");
         } finally {
           prepared.cleanup();
+          await mustGit(
+            fixture.sourceRepo,
+            ["worktree", "remove", "--force", worktreePath],
+            "remove finalization worktree",
+          );
         }
       } finally {
         rmSync(fixture.root, { recursive: true, force: true });
@@ -381,10 +431,9 @@ describe("workerpals merge-conflict sandbox", () => {
         },
       );
       try {
-        const prepared = await prepareMergeConflictTaskRepo(
-          fixture.sourceRepo,
+        const prepared = await prepareFixtureHostWorktree(
+          fixture,
           "job-merge-conflict-active-rebase",
-          fixture.params,
         );
         try {
           const base = loadPushPalsConfig({ reload: true });
@@ -436,11 +485,7 @@ describe("workerpals merge-conflict sandbox", () => {
     async () => {
       const fixture = await createConflictFixture();
       try {
-        const prepared = await prepareMergeConflictTaskRepo(
-          fixture.sourceRepo,
-          "job-merge-conflict-resume",
-          fixture.params,
-        );
+        const prepared = await prepareFixtureHostWorktree(fixture, "job-merge-conflict-resume");
         try {
           writeFileSync(
             join(prepared.repoPath, fixture.conflictFile),
@@ -488,10 +533,9 @@ describe("workerpals merge-conflict sandbox", () => {
     async () => {
       const fixture = await createConflictFixture();
       try {
-        const prepared = await prepareMergeConflictTaskRepo(
-          fixture.sourceRepo,
+        const prepared = await prepareFixtureHostWorktree(
+          fixture,
           "job-merge-conflict-empty-resolution",
-          fixture.params,
         );
         try {
           writeFileSync(
@@ -564,10 +608,9 @@ describe("workerpals merge-conflict sandbox", () => {
         },
       );
       try {
-        const prepared = await prepareMergeConflictTaskRepo(
-          fixture.sourceRepo,
+        const prepared = await prepareFixtureHostWorktree(
+          fixture,
           "job-merge-conflict-unresolved-retry",
-          fixture.params,
         );
         try {
           const params = {
@@ -673,11 +716,7 @@ describe("workerpals merge-conflict sandbox", () => {
         },
       );
       try {
-        const prepared = await prepareMergeConflictTaskRepo(
-          fixture.sourceRepo,
-          "job-merge-conflict-chained",
-          fixture.params,
-        );
+        const prepared = await prepareFixtureHostWorktree(fixture, "job-merge-conflict-chained");
         try {
           const params = {
             ...fixture.params,

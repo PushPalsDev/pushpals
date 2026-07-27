@@ -17,6 +17,8 @@ on:
       - "apps/source_control_manager/**"
       - "tests/integration/cli.e2e.ts"
       - "tests/integration/workerpals.control-plane.e2e.ts"
+      - "tests/workerpals.worktree-boundary.test.ts"
+      - "tests/fixtures/Dockerfile.worktree-boundary"
   push:
     branches:
       - main
@@ -36,6 +38,8 @@ on:
       - "apps/source_control_manager/**"
       - "tests/integration/cli.e2e.ts"
       - "tests/integration/workerpals.control-plane.e2e.ts"
+      - "tests/workerpals.worktree-boundary.test.ts"
+      - "tests/fixtures/Dockerfile.worktree-boundary"
   workflow_dispatch:
   schedule:
     - cron: "0 10 * * *"
@@ -58,7 +62,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.9"
+          bun-version: "1.3.14"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -82,7 +86,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.9"
+          bun-version: "1.3.14"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -113,13 +117,23 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.9"
+          bun-version: "1.3.14"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
       - name: Verify Docker engine
         run: docker version
+
+      - name: Build worktree boundary image
+        run: docker build -t pushpals-worktree-boundary:test -f tests/fixtures/Dockerfile.worktree-boundary tests/fixtures
+
+      - name: Validate Windows-host Linux-container worktree boundary
+        shell: pwsh
+        env:
+          PUSHPALS_WINDOWS_LINUX_WORKTREE_E2E: "1"
+          PUSHPALS_WORKTREE_BOUNDARY_IMAGE: pushpals-worktree-boundary:test
+        run: bun test tests/workerpals.worktree-boundary.test.ts
 
       - name: Run packaged CLI E2E suite
         run: bun run test:cli:e2e

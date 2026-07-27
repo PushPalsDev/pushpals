@@ -8,6 +8,14 @@ export type GitBaseRefCommand = (args: string[]) => Promise<GitBaseRefCommandRes
 
 export type WorktreeBaseRefLogLevel = "info" | "warn";
 
+type ResolveReviewWorktreeBaseOptions = {
+  jobId: string;
+  params: Record<string, unknown>;
+  git: GitBaseRefCommand;
+  fallback: () => Promise<string>;
+  log?: (level: WorktreeBaseRefLogLevel, message: string) => void;
+};
+
 export type ResolveFreshWorktreeBaseRefOptions = {
   requestedRef: string;
   integrationBranch: string;
@@ -23,6 +31,137 @@ function normalizeBranchName(value: string): string {
     .replace(/^refs\/heads\//, "")
     .replace(/^origin\//, "")
     .replace(/^\/+|\/+$/g, "");
+}
+
+export function normalizeReviewHeadRef(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed
+    .replace(/^refs\/heads\//, "")
+    .replace(/^origin\//, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (
+    !normalized ||
+    normalized.includes("..") ||
+    normalized.includes("@{") ||
+    normalized.endsWith(".") ||
+    normalized.endsWith(".lock") ||
+    /[~^:?*\[\]\s]/.test(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizeExpectedSha(value: unknown): string | null {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return /^[0-9a-f]{40,64}$/.test(normalized) ? normalized : null;
+}
+
+export async function resolveReviewWorktreeBase(
+  options: ResolveReviewWorktreeBaseOptions,
+): Promise<string> {
+  const reviewAgent =
+    options.params.reviewAgent &&
+    typeof options.params.reviewAgent === "object" &&
+    !Array.isArray(options.params.reviewAgent)
+      ? (options.params.reviewAgent as Record<string, unknown>)
+      : null;
+  const resolutionType =
+    typeof reviewAgent?.resolutionType === "string"
+      ? reviewAgent.resolutionType.trim().toLowerCase()
+      : "";
+  if (resolutionType !== "review_fix" && resolutionType !== "merge_conflict") {
+    return options.fallback();
+  }
+
+  const headRef = normalizeReviewHeadRef(reviewAgent?.prHeadRef);
+  const expectedHeadSha = normalizeExpectedSha(reviewAgent?.prHeadSha);
+  if (!headRef || !expectedHeadSha) {
+    throw new Error(
+      `${resolutionType} job ${options.jobId} is missing a valid prHeadRef/prHeadSha publication lease; refusing to start from a generic base.`,
+    );
+  }
+
+  const remoteRef = `origin/${headRef}`;
+  const fetch = await options.git([
+    "fetch",
+    "origin",
+    `+refs/heads/${headRef}:refs/remotes/origin/${headRef}`,
+    "--quiet",
+  ]);
+  if (!fetch.ok) {
+    const detail = [fetch.stderr, fetch.stdout].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `${resolutionType} job ${options.jobId} could not refresh ${remoteRef}${
+        detail ? `: ${detail}` : ""
+      }.`,
+    );
+  }
+
+  const verify = await options.git(["rev-parse", "--verify", `${remoteRef}^{commit}`]);
+  const actualHeadSha = verify.ok
+    ? String(verify.stdout ?? "")
+        .trim()
+        .toLowerCase()
+    : "";
+  if (!actualHeadSha) {
+    throw new Error(`${resolutionType} job ${options.jobId} could not verify ${remoteRef}.`);
+  }
+  if (actualHeadSha !== expectedHeadSha) {
+    throw new Error(
+      `${resolutionType} job ${options.jobId} has a stale PR-head lease: expected ${expectedHeadSha}, but ${remoteRef} is ${actualHeadSha}. Requeue from the current PR head.`,
+    );
+  }
+
+  if (resolutionType === "merge_conflict") {
+    const baseRef = normalizeReviewHeadRef(reviewAgent?.prBaseRef);
+    const expectedBaseSha = normalizeExpectedSha(reviewAgent?.prBaseSha);
+    if (!baseRef || !expectedBaseSha) {
+      throw new Error(
+        `merge_conflict job ${options.jobId} is missing a valid prBaseRef/prBaseSha lease; refusing host-side rebase preparation.`,
+      );
+    }
+    const baseRemoteRef = `origin/${baseRef}`;
+    const fetchBase = await options.git([
+      "fetch",
+      "origin",
+      `+refs/heads/${baseRef}:refs/remotes/origin/${baseRef}`,
+      "--quiet",
+    ]);
+    if (!fetchBase.ok) {
+      const detail = [fetchBase.stderr, fetchBase.stdout].filter(Boolean).join("\n").trim();
+      throw new Error(
+        `merge_conflict job ${options.jobId} could not refresh ${baseRemoteRef}${
+          detail ? `: ${detail}` : ""
+        }.`,
+      );
+    }
+    const verifyBase = await options.git(["rev-parse", "--verify", `${baseRemoteRef}^{commit}`]);
+    const actualBaseSha = verifyBase.ok
+      ? String(verifyBase.stdout ?? "")
+          .trim()
+          .toLowerCase()
+      : "";
+    if (actualBaseSha !== expectedBaseSha) {
+      throw new Error(
+        `merge_conflict job ${options.jobId} has a stale PR-base lease: expected ${expectedBaseSha}, but ${baseRemoteRef} is ${actualBaseSha || "unavailable"}. Requeue against the current base.`,
+      );
+    }
+    options.log?.(
+      "info",
+      `merge_conflict job ${options.jobId}: host verified ${baseRemoteRef} at exact PR base ${actualBaseSha}.`,
+    );
+  }
+
+  options.log?.(
+    "info",
+    `${resolutionType} job ${options.jobId}: host verified ${remoteRef} at exact PR head ${actualHeadSha}.`,
+  );
+  return actualHeadSha;
 }
 
 function normalizeRequestedRef(value: string): string {

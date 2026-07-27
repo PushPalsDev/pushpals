@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
   classifyToolFailure,
   inferToolNameFromFailureText,
@@ -101,6 +101,19 @@ export interface SimilarNoPublishableFailureSummary {
   recentSimilarFailureCount: number;
   patternKey: string | null;
   targetPathSample: string[];
+  lastFailureAt: string | null;
+}
+
+export interface SimilarFailureFingerprintSummary {
+  blocked: boolean;
+  windowMs: number;
+  threshold: number;
+  recentSimilarFailureCount: number;
+  fingerprint: string | null;
+  targetPathSample: string[];
+  failureClass: string | null;
+  command: string | null;
+  failedTestSample: string[];
   lastFailureAt: string | null;
 }
 
@@ -397,6 +410,19 @@ function normalizedJobPathList(value: unknown): string[] {
   return out;
 }
 
+function normalizedJobPathValues(...values: unknown[]): string[] {
+  const out = new Set<string>();
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      for (const path of normalizedJobPathList(value)) out.add(path);
+      continue;
+    }
+    const path = normalizedJobPath(value);
+    if (path && path !== ".") out.add(path);
+  }
+  return [...out];
+}
+
 function jobPathOverlaps(left: string[], right: string[]): boolean {
   for (const a of left) {
     for (const b of right) {
@@ -404,6 +430,79 @@ function jobPathOverlaps(left: string[], right: string[]): boolean {
     }
   }
   return false;
+}
+
+function overlappingFailureTargetPaths(currentPaths: string[], previousPaths: string[]): string[] {
+  const overlapping = new Set<string>();
+  for (const current of currentPaths) {
+    for (const previous of previousPaths) {
+      if (
+        current === previous ||
+        current.startsWith(`${previous}/`) ||
+        previous.startsWith(`${current}/`)
+      ) {
+        overlapping.add(current.length >= previous.length ? current : previous);
+      }
+    }
+  }
+  return [...overlapping].sort();
+}
+
+function normalizeFailureCommand(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .slice(0, 1000);
+}
+
+function extractFailedTestSample(...values: unknown[]): string[] {
+  const text = values.map((value) => String(value ?? "")).join("\n");
+  const samples = new Set<string>();
+  for (const match of text.matchAll(
+    /(?:\(fail\)|\bfail(?:ed)?\b|[×✗])\s*[:>-]?\s*([^\r\n]{3,240})/gi,
+  )) {
+    const normalized = String(match[1] ?? "")
+      .replace(/\s+\[[\d.]+\s*(?:ms|s)\]\s*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    if (normalized) samples.add(normalized);
+    if (samples.size >= 8) break;
+  }
+  if (samples.size < 8) {
+    for (const match of text.matchAll(
+      /(?:^|[\s("'`])([a-z0-9_./-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=$|[\s:)"'`])/gim,
+    )) {
+      samples.add(
+        String(match[1] ?? "")
+          .replace(/\\/g, "/")
+          .toLowerCase(),
+      );
+      if (samples.size >= 8) break;
+    }
+  }
+  return [...samples].sort();
+}
+
+function failureFingerprint(parts: {
+  targetPaths: string[];
+  failureClass: string;
+  command: string;
+  failedTests: string[];
+}): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        targetPaths: [...parts.targetPaths].sort(),
+        failureClass: parts.failureClass,
+        command: parts.command,
+        failedTests: parts.failedTests,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 24);
 }
 
 function normalizeWorkerStatus(value: unknown): WorkerStatus {
@@ -3068,9 +3167,24 @@ export class JobQueue {
       const previousPatternKey = String(autonomy?.patternKey ?? autonomy?.pattern_key ?? "").trim();
       const planning = recordFromUnknown(params.planning);
       const previousPaths = [
-        ...normalizedJobPathList(params.paths),
-        ...normalizedJobPathList(planning?.targetPaths ?? planning?.target_paths),
-        ...normalizedJobPathList(autonomy?.targetPaths ?? autonomy?.target_paths),
+        ...normalizedJobPathValues(
+          params.path,
+          params.targetPath,
+          params.target_path,
+          params.paths,
+        ),
+        ...normalizedJobPathValues(
+          planning?.targetPath,
+          planning?.target_path,
+          planning?.targetPaths,
+          planning?.target_paths,
+        ),
+        ...normalizedJobPathValues(
+          autonomy?.targetPath,
+          autonomy?.target_path,
+          autonomy?.targetPaths,
+          autonomy?.target_paths,
+        ),
       ];
       const patternMatches = Boolean(patternKey && previousPatternKey === patternKey);
       const pathMatches =
@@ -3091,6 +3205,185 @@ export class JobQueue {
       blocked: count >= threshold,
       recentSimilarFailureCount: count,
       lastFailureAt,
+    };
+  }
+
+  similarFailureFingerprintSummary(options?: {
+    targetPaths?: string[];
+    windowMs?: number;
+    threshold?: number;
+  }): SimilarFailureFingerprintSummary {
+    const windowMs = Math.max(
+      60_000,
+      Math.min(24 * 60 * 60 * 1000, Math.floor(options?.windowMs ?? 6 * 60 * 60 * 1000)),
+    );
+    const threshold = Math.max(2, Math.min(20, Math.floor(options?.threshold ?? 2)));
+    const targetPaths = normalizedJobPathList(options?.targetPaths ?? []);
+    const empty: SimilarFailureFingerprintSummary = {
+      blocked: false,
+      windowMs,
+      threshold,
+      recentSimilarFailureCount: 0,
+      fingerprint: null,
+      targetPathSample: targetPaths.slice(0, 8),
+      failureClass: null,
+      command: null,
+      failedTestSample: [],
+      lastFailureAt: null,
+    };
+    if (targetPaths.length === 0) return empty;
+
+    const cutoffIso = new Date(Date.now() - windowMs).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT
+           j.id,
+           j.params,
+           COALESCE(j.failedAt, j.publishBlockedAt, j.abandonedAt, j.updatedAt) AS failureAt,
+           d.failureClass,
+           d.summary,
+           (
+             SELECT v.command
+             FROM job_validation_runs v
+             WHERE v.jobId = j.id AND v.passed = 0
+             ORDER BY v.id DESC
+             LIMIT 1
+           ) AS command,
+           (
+             SELECT v.failureClass
+             FROM job_validation_runs v
+             WHERE v.jobId = j.id AND v.passed = 0
+             ORDER BY v.id DESC
+             LIMIT 1
+           ) AS validationFailureClass,
+           (
+             SELECT v.stdoutTail
+             FROM job_validation_runs v
+             WHERE v.jobId = j.id AND v.passed = 0
+             ORDER BY v.id DESC
+             LIMIT 1
+           ) AS stdoutTail,
+           (
+             SELECT v.stderrTail
+             FROM job_validation_runs v
+             WHERE v.jobId = j.id AND v.passed = 0
+             ORDER BY v.id DESC
+             LIMIT 1
+           ) AS stderrTail
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.kind = 'task.execute'
+           AND j.status IN ('failed', 'abandoned', 'publish_blocked')
+           AND COALESCE(j.failedAt, j.publishBlockedAt, j.abandonedAt, j.updatedAt) >= ?
+         ORDER BY j.updatedAt DESC
+         LIMIT 300`,
+      )
+      .all(cutoffIso) as Array<{
+      id: string;
+      params: string | null;
+      failureAt: string | null;
+      failureClass: string | null;
+      summary: string | null;
+      command: string | null;
+      validationFailureClass: string | null;
+      stdoutTail: string | null;
+      stderrTail: string | null;
+    }>;
+
+    const clusters = new Map<
+      string,
+      {
+        count: number;
+        failureClass: string;
+        command: string;
+        failedTests: string[];
+        targetPaths: string[];
+        lastFailureAt: string | null;
+      }
+    >();
+    for (const row of rows) {
+      const params = parseObjectJson(row.params);
+      const autonomy = recordFromUnknown(params.autonomy);
+      const origin = String(params.origin ?? autonomy?.origin ?? "")
+        .trim()
+        .toLowerCase();
+      if (origin !== "autonomy") continue;
+      const planning = recordFromUnknown(params.planning);
+      const previousPaths = [
+        ...normalizedJobPathValues(
+          params.path,
+          params.targetPath,
+          params.target_path,
+          params.paths,
+        ),
+        ...normalizedJobPathValues(
+          planning?.targetPath,
+          planning?.target_path,
+          planning?.targetPaths,
+          planning?.target_paths,
+        ),
+        ...normalizedJobPathValues(
+          autonomy?.targetPath,
+          autonomy?.target_path,
+          autonomy?.targetPaths,
+          autonomy?.target_paths,
+        ),
+      ];
+      const uniquePreviousPaths = [...new Set(previousPaths)].sort();
+      if (uniquePreviousPaths.length === 0 || !jobPathOverlaps(targetPaths, uniquePreviousPaths)) {
+        continue;
+      }
+      const fingerprintTargetPaths = overlappingFailureTargetPaths(
+        targetPaths,
+        uniquePreviousPaths,
+      );
+      if (fingerprintTargetPaths.length === 0) continue;
+
+      const command = normalizeFailureCommand(row.command);
+      const failureClass = String(
+        row.validationFailureClass ?? row.failureClass ?? "unknown_failure",
+      )
+        .trim()
+        .toLowerCase();
+      const failedTests = extractFailedTestSample(row.stdoutTail, row.stderrTail, row.summary);
+      const fingerprint = failureFingerprint({
+        targetPaths: fingerprintTargetPaths,
+        failureClass,
+        command,
+        failedTests,
+      });
+      const previous = clusters.get(fingerprint);
+      const lastFailureAt =
+        row.failureAt &&
+        (!previous?.lastFailureAt || Date.parse(row.failureAt) > Date.parse(previous.lastFailureAt))
+          ? row.failureAt
+          : (previous?.lastFailureAt ?? null);
+      clusters.set(fingerprint, {
+        count: (previous?.count ?? 0) + 1,
+        failureClass,
+        command,
+        failedTests,
+        targetPaths: fingerprintTargetPaths,
+        lastFailureAt,
+      });
+    }
+
+    const dominant = [...clusters.entries()].sort((left, right) => {
+      if (right[1].count !== left[1].count) return right[1].count - left[1].count;
+      return Date.parse(right[1].lastFailureAt ?? "") - Date.parse(left[1].lastFailureAt ?? "");
+    })[0];
+    if (!dominant) return empty;
+    const [fingerprint, cluster] = dominant;
+    return {
+      ...empty,
+      blocked: cluster.count >= threshold,
+      recentSimilarFailureCount: cluster.count,
+      fingerprint,
+      targetPathSample: cluster.targetPaths.slice(0, 8),
+      failureClass: cluster.failureClass || null,
+      command: cluster.command || null,
+      failedTestSample: cluster.failedTests.slice(0, 8),
+      lastFailureAt: cluster.lastFailureAt,
     };
   }
 

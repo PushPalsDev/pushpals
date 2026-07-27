@@ -10,6 +10,7 @@ type SmokeOptions = {
   runtimeBinDir: string;
   promptsRoot: string;
   durationMs: number;
+  probeIntervalMs: number;
   repoPath: string | null;
   useRepoDataDir: boolean;
 };
@@ -26,6 +27,7 @@ function parseArgs(argv: string[]): SmokeOptions {
   let runtimeBinDir = "";
   let promptsRoot = repoRoot;
   let durationMs = 60_000;
+  let probeIntervalMs = 30_000;
   let repoPath: string | null = null;
   let useRepoDataDir = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -38,7 +40,16 @@ function parseArgs(argv: string[]): SmokeOptions {
         promptsRoot = String(argv[++index] ?? "").trim() || repoRoot;
         break;
       case "--duration-ms":
-        durationMs = Math.max(10_000, Number.parseInt(String(argv[++index] ?? "60000"), 10) || 60_000);
+        durationMs = Math.max(
+          10_000,
+          Number.parseInt(String(argv[++index] ?? "60000"), 10) || 60_000,
+        );
+        break;
+      case "--probe-interval-ms":
+        probeIntervalMs = Math.max(
+          1_000,
+          Number.parseInt(String(argv[++index] ?? "30000"), 10) || 30_000,
+        );
         break;
       case "--repo-path":
         repoPath = String(argv[++index] ?? "").trim() || null;
@@ -57,6 +68,7 @@ function parseArgs(argv: string[]): SmokeOptions {
     runtimeBinDir: resolve(runtimeBinDir),
     promptsRoot: resolve(promptsRoot),
     durationMs,
+    probeIntervalMs: Math.min(durationMs, probeIntervalMs),
     repoPath: repoPath ? resolve(repoPath) : null,
     useRepoDataDir,
   };
@@ -250,14 +262,18 @@ function resolveRepoPath(root: string, repoPath: string | null): string {
   return repoPath;
 }
 
-function startTextCapture(stream: ReadableStream<Uint8Array> | null | undefined): {
+type TextCapture = {
   promise: Promise<string>;
   getSnapshot: () => string;
-} {
+  cancel: () => Promise<void>;
+};
+
+function startTextCapture(stream: ReadableStream<Uint8Array> | null | undefined): TextCapture {
   let buffer = "";
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   const promise = (async () => {
     if (!stream) return buffer;
-    const reader = stream.getReader();
+    reader = stream.getReader();
     const decoder = new TextDecoder();
     try {
       while (true) {
@@ -268,10 +284,21 @@ function startTextCapture(stream: ReadableStream<Uint8Array> | null | undefined)
       buffer += decoder.decode();
       return buffer;
     } finally {
-      reader.releaseLock();
+      reader?.releaseLock();
+      reader = null;
     }
   })();
-  return { promise, getSnapshot: () => buffer };
+  return {
+    promise,
+    getSnapshot: () => buffer,
+    cancel: async () => {
+      try {
+        await reader?.cancel();
+      } catch {
+        // best-effort pipe cancellation
+      }
+    },
+  };
 }
 
 async function waitForHttpOk(
@@ -307,7 +334,12 @@ async function waitForCapturedOutput(
   throw new Error(`Timed out waiting for ${label}\n${summarizeTail(getSnapshot())}`);
 }
 
-function spawnService(binaryPath: string, cwd: string, env: Record<string, string>, args: string[] = []): SpawnedProc {
+function spawnService(
+  binaryPath: string,
+  cwd: string,
+  env: Record<string, string>,
+  args: string[] = [],
+): SpawnedProc {
   return Bun.spawn([binaryPath, ...args], {
     cwd,
     env,
@@ -323,20 +355,66 @@ function summarizeTail(text: string, maxChars = 10_000): string {
   return normalized.slice(-maxChars);
 }
 
-async function ensureProcessStable(
-  proc: SpawnedProc,
-  label: string,
-  timeoutMs: number,
-  getCapturedOutput: () => string,
-): Promise<void> {
-  const exitCode = await Promise.race([
-    proc.exited.then((value) => value),
-    Bun.sleep(timeoutMs).then(() => null),
-  ]);
-  if (exitCode === null) return;
-  throw new Error(
-    `${label} exited early with code ${exitCode}\n${summarizeTail(getCapturedOutput())}`,
-  );
+async function monitorRuntimeSoak(options: {
+  serverProc: SpawnedProc;
+  remoteBuddyProc: SpawnedProc;
+  healthUrl: string;
+  durationMs: number;
+  probeIntervalMs: number;
+  serverOutput: () => string;
+  remoteOutput: () => string;
+}): Promise<void> {
+  const startedAt = Date.now();
+  const deadline = startedAt + options.durationMs;
+  let probeCount = 0;
+  while (Date.now() < deadline) {
+    const waitMs = Math.min(options.probeIntervalMs, Math.max(1, deadline - Date.now()));
+    const processOutcome = await Promise.race([
+      options.serverProc.exited.then((exitCode) => ({
+        service: "server",
+        exitCode,
+      })),
+      options.remoteBuddyProc.exited.then((exitCode) => ({
+        service: "remotebuddy",
+        exitCode,
+      })),
+      Bun.sleep(waitMs).then(() => null),
+    ]);
+    if (processOutcome) {
+      const output =
+        processOutcome.service === "server" ? options.serverOutput() : options.remoteOutput();
+      throw new Error(
+        `${processOutcome.service} exited during soak with code ${processOutcome.exitCode}\n${summarizeTail(
+          output,
+        )}`,
+      );
+    }
+
+    for (const [service, output] of [
+      ["server", options.serverOutput()],
+      ["remotebuddy", options.remoteOutput()],
+    ] as const) {
+      if (/Segmentation fault|oh no: Bun has crashed|panic\(main thread\)/i.test(output)) {
+        throw new Error(`${service} emitted a Bun crash signature.\n${summarizeTail(output)}`);
+      }
+    }
+    try {
+      const response = await fetch(options.healthUrl, {
+        signal: AbortSignal.timeout(Math.min(10_000, options.probeIntervalMs)),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+    } catch (error) {
+      throw new Error(
+        `server health probe failed during soak after ${Date.now() - startedAt}ms: ${String(error)}`,
+      );
+    }
+    probeCount += 1;
+    console.log(
+      `[windows-runtime-smoke] probe=${probeCount} elapsed_ms=${Date.now() - startedAt} duration_ms=${options.durationMs}`,
+    );
+  }
 }
 
 async function removeTreeWithRetries(root: string, attempts = 10, delayMs = 500): Promise<void> {
@@ -365,7 +443,10 @@ async function main(): Promise<void> {
   }
   const options = parseArgs(process.argv.slice(2));
   const serverBin = join(options.runtimeBinDir, "pushpals-runtime-server-windows-x64.exe");
-  const remoteBuddyBin = join(options.runtimeBinDir, "pushpals-runtime-remotebuddy-windows-x64.exe");
+  const remoteBuddyBin = join(
+    options.runtimeBinDir,
+    "pushpals-runtime-remotebuddy-windows-x64.exe",
+  );
   const workerpalBin = join(options.runtimeBinDir, "pushpals-runtime-workerpals-windows-x64.exe");
   ensureBinaryExists(serverBin);
   ensureBinaryExists(remoteBuddyBin);
@@ -373,6 +454,7 @@ async function main(): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "pushpals-release-windows-smoke-"));
   let serverProc: SpawnedProc | null = null;
   let remoteBuddyProc: SpawnedProc | null = null;
+  const captures: TextCapture[] = [];
   try {
     const repoPath = resolveRepoPath(root, options.repoPath);
     const configDir = join(root, "configs");
@@ -397,6 +479,7 @@ async function main(): Promise<void> {
     serverProc = spawnService(serverBin, repoPath, env);
     const serverStdoutCapture = startTextCapture(serverProc.stdout);
     const serverStderrCapture = startTextCapture(serverProc.stderr);
+    captures.push(serverStdoutCapture, serverStderrCapture);
     await waitForHttpOk(`http://127.0.0.1:${portBase}/healthz`, 60_000, () => {
       return `${serverStdoutCapture.getSnapshot()}\n${serverStderrCapture.getSnapshot()}`;
     });
@@ -409,6 +492,7 @@ async function main(): Promise<void> {
     ]);
     const remoteStdoutCapture = startTextCapture(remoteBuddyProc.stdout);
     const remoteStderrCapture = startTextCapture(remoteBuddyProc.stderr);
+    captures.push(remoteStdoutCapture, remoteStderrCapture);
 
     const remoteSnapshot = () =>
       `${remoteStdoutCapture.getSnapshot()}\n${remoteStderrCapture.getSnapshot()}`;
@@ -426,14 +510,23 @@ async function main(): Promise<void> {
         "RemoteBuddy worker warmup outcome log",
       );
     }
-    await ensureProcessStable(serverProc, "server", options.durationMs, () => {
-      return `${serverStdoutCapture.getSnapshot()}\n${serverStderrCapture.getSnapshot()}`;
+    const serverSnapshot = () =>
+      `${serverStdoutCapture.getSnapshot()}\n${serverStderrCapture.getSnapshot()}`;
+    await monitorRuntimeSoak({
+      serverProc,
+      remoteBuddyProc,
+      healthUrl: `http://127.0.0.1:${portBase}/healthz`,
+      durationMs: options.durationMs,
+      probeIntervalMs: options.probeIntervalMs,
+      serverOutput: serverSnapshot,
+      remoteOutput: remoteSnapshot,
     });
-    await ensureProcessStable(remoteBuddyProc, "remotebuddy", options.durationMs, remoteSnapshot);
 
     const finalRemoteOutput = remoteSnapshot();
     if (/Segmentation fault|oh no: Bun has crashed|panic\(main thread\)/i.test(finalRemoteOutput)) {
-      throw new Error(`RemoteBuddy emitted a Bun crash signature.\n${summarizeTail(finalRemoteOutput)}`);
+      throw new Error(
+        `RemoteBuddy emitted a Bun crash signature.\n${summarizeTail(finalRemoteOutput)}`,
+      );
     }
     console.log(
       `[windows-runtime-smoke] Embedded server and RemoteBuddy remained healthy with autonomy enabled${existsSync(workerpalBin) ? " after exercising the WorkerPal warmup path" : ""}.`,
@@ -441,12 +534,30 @@ async function main(): Promise<void> {
   } finally {
     for (const proc of [remoteBuddyProc, serverProc]) {
       if (!proc) continue;
+      let terminated = false;
       try {
-        proc.kill();
+        const result = Bun.spawnSync(["taskkill", "/PID", String(proc.pid), "/T", "/F"], {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        terminated = result.exitCode === 0;
       } catch {
-        // best-effort cleanup
+        // Fall through to the process handle below.
+      }
+      if (!terminated) {
+        try {
+          proc.kill();
+        } catch {
+          // best-effort cleanup
+        }
       }
     }
+    await Promise.all(captures.map((capture) => capture.cancel()));
+    await Promise.all(
+      [remoteBuddyProc, serverProc]
+        .filter((proc): proc is SpawnedProc => proc !== null)
+        .map((proc) => Promise.race([proc.exited, Bun.sleep(5_000)])),
+    );
     await Bun.sleep(500);
     try {
       await removeTreeWithRetries(root);

@@ -12,6 +12,7 @@ import {
   buildTaskFailureJobFamily,
   detectValidationBlocker,
   expandKnownArtifactDirectoryPaths,
+  findUnchangedValidationFailure,
   extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
   knownFailureHintsForPacket,
@@ -32,6 +33,9 @@ import {
   shouldReviseRequiredValidationBlocker,
   shouldRetryBrowserValidationRunOnce,
   shouldRetryPassingVitestTeardownOnce,
+  shouldRetryTransientInfrastructureValidationOnce,
+  shouldDeferHigherTierValidationAfterFailure,
+  validationCommandExecutionTier,
   revisionLimitForQualityGateFailures,
   relaxAdvisoryQualityIssues,
   shouldSoftPassCriticOnlyBudgetExhaustion,
@@ -60,10 +64,7 @@ describe("workerpals quality gate critic issue formatting", () => {
       mkdirSync(join(tempRoot, "docs"), { recursive: true });
       writeFileSync(join(tempRoot, "docs", "new-guide.md"), "# New guide\n");
 
-      const diff = await buildCriticDiffText(tempRoot, [
-        "tracked.txt",
-        "docs/new-guide.md",
-      ]);
+      const diff = await buildCriticDiffText(tempRoot, ["tracked.txt", "docs/new-guide.md"]);
 
       expect(diff).toContain("-before");
       expect(diff).toContain("+after");
@@ -1406,6 +1407,93 @@ describe("workerpals quality gate critic issue formatting", () => {
           'EnvironmentTeardownError: [vitest-worker]: Closing rpc while "resolve" was pending',
       }),
     ).toBe(false);
+  });
+
+  test("orders focused tests before invariant and aggregate validation gates", () => {
+    expect(validationCommandExecutionTier("bun test tests/route-shell.test.ts")).toBeLessThan(
+      validationCommandExecutionTier("bun x tsc --noEmit"),
+    );
+    expect(validationCommandExecutionTier("bun x tsc --noEmit")).toBeLessThan(
+      validationCommandExecutionTier("bun run validate"),
+    );
+    expect(validationCommandExecutionTier("bun run validate")).toBeLessThan(
+      validationCommandExecutionTier("bun run web:e2e"),
+    );
+  });
+
+  test("defers expensive higher-tier gates after a focused failure", () => {
+    const focusedFailure = {
+      step: "bun test tests/route-shell.test.ts",
+      command: "bun test tests/route-shell.test.ts",
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "AssertionError: route shell boundary remains broken",
+      elapsedMs: 100,
+    };
+    expect(
+      shouldDeferHigherTierValidationAfterFailure("bun run validate", [focusedFailure]),
+    ).toContain("lower-tier validation already failed");
+    expect(
+      shouldDeferHigherTierValidationAfterFailure("bun test tests/another.test.ts", [
+        focusedFailure,
+      ]),
+    ).toBeNull();
+    expect(
+      shouldDeferHigherTierValidationAfterFailure("bun run web:e2e", [
+        {
+          ...focusedFailure,
+          command: "bun run validate",
+          step: "bun run validate",
+        },
+      ]),
+    ).toContain('lower-tier validation already failed for "bun run validate"');
+  });
+
+  test("retries transient infrastructure failures once without retrying assertions", () => {
+    const base = {
+      step: "bun test",
+      command: "bun test",
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      elapsedMs: 100,
+    };
+    expect(
+      shouldRetryTransientInfrastructureValidationOnce({
+        ...base,
+        stderr: "fetch failed: ECONNRESET",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetryTransientInfrastructureValidationOnce({
+        ...base,
+        stderr: "AssertionError: expected true to be false",
+      }),
+    ).toBe(false);
+  });
+
+  test("opens the local revision circuit on the second unchanged failure digest", () => {
+    const run = {
+      step: "bun test tests/route-shell.test.ts",
+      command: "bun test tests/route-shell.test.ts",
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "Error: route shell import boundary still fails",
+      elapsedMs: 100,
+    };
+    const digest = extractValidationFailureRetryDigest(run, process.cwd());
+    expect(
+      findUnchangedValidationFailure(
+        [run],
+        new Map([["bun test tests/route-shell.test.ts", digest]]),
+        process.cwd(),
+      ),
+    ).toEqual({
+      command: run.command,
+      digest,
+    });
   });
 
   test("prioritizes browser validation repair guidance over lower-priority gate chatter", () => {

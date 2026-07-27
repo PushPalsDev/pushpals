@@ -1023,6 +1023,10 @@ function uniqueWorkPaths(paths: unknown[]): string[] {
   return out;
 }
 
+function workPathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
 function workScopePaths(scope: unknown): string[] {
   const record = asObject(scope);
   return [
@@ -4538,6 +4542,14 @@ async function repoPreflight(repo: string): Promise<{
   };
 }
 
+export function autonomyIntegrationBaselineDecision(options: {
+  fastForwardSucceeded: boolean;
+  integrationContainsBase: boolean;
+}): "synced" | "use_integration_head" | "pause_for_scm" {
+  if (options.fastForwardSucceeded) return "synced";
+  return options.integrationContainsBase ? "use_integration_head" : "pause_for_scm";
+}
+
 export class RemoteBuddyAutonomousEngine {
   private readonly server: string;
   private readonly sessionId: string;
@@ -4569,6 +4581,7 @@ export class RemoteBuddyAutonomousEngine {
   private lastCompletedAtMs = 0;
   private dispatchBackoffUntilMs = 0;
   private dispatchBackoffReason = "";
+  private readonly suppressedFailureTargets = new Map<string, number>();
   private pendingIdeationTimeoutRecovery: IdeationTimeoutRecovery | null = null;
 
   constructor(opts: {
@@ -4915,17 +4928,26 @@ export class RemoteBuddyAutonomousEngine {
 
     const mergeMain = await this.runGit(this.autonomyRepo, ["merge", "--ff-only", baseRef]);
     if (!mergeMain.ok) {
-      // Keep this non-interactive and deterministic: fall back to the latest base branch when ff-only is impossible.
-      const resetBase = await this.runGit(this.autonomyRepo, ["reset", "--hard", baseRef]);
-      if (!resetBase.ok) {
-        console.error(
-          `[RemoteBuddyAutonomousEngine] tick ${runId}: failed to sync autonomy worktree with ${baseRef}: ${mergeMain.stderr || mergeMain.stdout || `merge exit ${mergeMain.exitCode}`}; reset failed: ${resetBase.stderr || resetBase.stdout || `exit ${resetBase.exitCode}`}`,
+      const integrationContainsBase = await this.runGit(this.autonomyRepo, [
+        "merge-base",
+        "--is-ancestor",
+        baseRef,
+        integrationRef,
+      ]);
+      const baselineDecision = autonomyIntegrationBaselineDecision({
+        fastForwardSucceeded: false,
+        integrationContainsBase: integrationContainsBase.ok,
+      });
+      if (baselineDecision === "use_integration_head") {
+        console.log(
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: ${integrationRef} already contains ${baseRef}; using the integration head as the planning baseline.`,
         );
-        return false;
+        return true;
       }
-      console.log(
-        `[RemoteBuddyAutonomousEngine] tick ${runId}: ff-only merge ${baseRef} into ${integrationRef} was not possible; reset autonomy worktree to ${baseRef}.`,
+      console.error(
+        `[RemoteBuddyAutonomousEngine] tick ${runId}: paused autonomy dispatch because ${integrationRef} and ${baseRef} have diverged and cannot be fast-forwarded. SourceControlManager must reconcile the branches before planning resumes. ${mergeMain.stderr || mergeMain.stdout || `merge exit ${mergeMain.exitCode}`}`,
       );
+      return false;
     }
 
     return true;
@@ -5269,6 +5291,32 @@ export class RemoteBuddyAutonomousEngine {
     };
   }
 
+  private rememberSuppressedFailureTargets(targetPaths: unknown, retryAfterMs: number): void {
+    const untilMs = Date.now() + retryAfterMs;
+    for (const targetPath of uniqueWorkPaths(asStringArray(targetPaths))) {
+      this.suppressedFailureTargets.set(
+        targetPath,
+        Math.max(untilMs, this.suppressedFailureTargets.get(targetPath) ?? 0),
+      );
+    }
+  }
+
+  private suppressedFailureTargetReason(targetPaths: unknown[]): string | null {
+    const nowMs = Date.now();
+    for (const [targetPath, untilMs] of this.suppressedFailureTargets) {
+      if (untilMs <= nowMs) this.suppressedFailureTargets.delete(targetPath);
+    }
+    const normalizedTargets = uniqueWorkPaths(targetPaths);
+    for (const candidateTarget of normalizedTargets) {
+      for (const [suppressedTarget, untilMs] of this.suppressedFailureTargets) {
+        if (untilMs > nowMs && workPathsOverlap(candidateTarget, suppressedTarget)) {
+          return `similar_failure_cluster_cooldown:${suppressedTarget}`;
+        }
+      }
+    }
+    return null;
+  }
+
   private async enqueueSyntheticRequest(
     instruction: string,
     autonomy: {
@@ -5317,6 +5365,22 @@ export class RemoteBuddyAutonomousEngine {
         errorPayload = {};
       }
       const code = String(errorPayload.code ?? "").trim();
+      const retryAfterMsRaw = Number(errorPayload.retryAfterMs ?? 0);
+      const retryAfterMs = Number.isFinite(retryAfterMsRaw)
+        ? Math.max(60_000, Math.min(60 * 60 * 1000, Math.floor(retryAfterMsRaw)))
+        : 30 * 60 * 1000;
+      if (res.status === 429 && code === "autonomy_similar_failure_suppressed") {
+        this.rememberSuppressedFailureTargets(
+          Array.isArray(errorPayload.targetPathSample)
+            ? errorPayload.targetPathSample
+            : autonomy.targetPaths,
+          retryAfterMs,
+        );
+        console.warn(
+          `[RemoteBuddyAutonomousEngine] Suppressing failed target cluster for ${retryAfterMs}ms and continuing future selection on other components.`,
+        );
+        return null;
+      }
       if (
         res.status === 429 &&
         (code === "autonomy_worker_failure_circuit_open" ||
@@ -5324,10 +5388,6 @@ export class RemoteBuddyAutonomousEngine {
           code === "autonomy_queue_backpressure" ||
           code === "autonomy_open_pr_limit")
       ) {
-        const retryAfterMsRaw = Number(errorPayload.retryAfterMs ?? 0);
-        const retryAfterMs = Number.isFinite(retryAfterMsRaw)
-          ? Math.max(60_000, Math.min(60 * 60 * 1000, Math.floor(retryAfterMsRaw)))
-          : 30 * 60 * 1000;
         this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
         this.dispatchBackoffReason =
           compactStatusDetail(
@@ -6233,6 +6293,16 @@ export class RemoteBuddyAutonomousEngine {
             candidate.component_area) as AutonomyComponentArea;
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+          const suppressedFailureReason = this.suppressedFailureTargetReason(
+            candidate.target_paths,
+          );
+          if (suppressedFailureReason) {
+            recordDropReason(`${source}_similar_failure_cluster_cooldown`);
+            console.warn(
+              `[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: ${suppressedFailureReason}; selecting another component instead.`,
+            );
+            continue;
+          }
           if (!allowPushPalsInternalCandidates && candidateLeaksPushPalsInternals(candidate)) {
             recordDropReason(`${source}_pushpals_internal_leak`);
             console.warn(

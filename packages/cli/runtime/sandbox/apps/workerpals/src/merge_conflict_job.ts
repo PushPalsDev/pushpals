@@ -1,7 +1,4 @@
-import { createHash } from "crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { basename, dirname, join, resolve } from "path";
+import { basename, dirname, resolve } from "path";
 
 type LogFn = (stream: "stdout" | "stderr", line: string) => void;
 
@@ -176,10 +173,10 @@ function buildPlannerGuidance(
   rebasedCleanly: boolean,
 ): string {
   const lines = [
-    "Merge-conflict sandbox state:",
-    `- You are on local branch ${context.publicBranch} inside an isolated container-local clone. This branch exists only inside the worker sandbox and does not switch the user's active checkout.`,
-    `- SourceControlManager publication target: origin/${context.publicBranch}`,
-    `- Rebase target: origin/${context.baseBranch}`,
+    "Merge-conflict host-prepared worktree state:",
+    `- The host prepared an isolated detached worktree at the exact leased head for ${context.publicBranch}.`,
+    `- SourceControlManager publication target: origin/${context.publicBranch}.`,
+    `- Host-side source-control orchestration owns rebase continuation onto origin/${context.baseBranch}.`,
   ];
   if (context.expectedHeadSha) {
     lines.push(
@@ -191,33 +188,27 @@ function buildPlannerGuidance(
   }
   if (rebasedCleanly) {
     lines.push(
-      `- The branch already rebased cleanly onto origin/${context.baseBranch} in this sandbox. Validate the rebased result and leave the repo clean for finalization.`,
+      `- The branch is already rebased cleanly onto origin/${context.baseBranch}. Edit only if validation identifies a content defect, then leave publication to SourceControlManager.`,
     );
   } else {
     lines.push(
-      `- The sandbox branch is already paused mid-rebase onto origin/${context.baseBranch}. Resolve the conflicts in the current repo state instead of re-discovering branch topology.`,
+      `- The host-prepared worktree is already paused mid-rebase onto origin/${context.baseBranch}. Resolve the conflicts in the current repo state instead of re-discovering branch topology.`,
     );
     if (conflictPaths.length > 0) {
       lines.push(`- Unresolved conflict files: ${conflictPaths.join(", ")}`);
     }
     lines.push(
-      "- Use direct commands only while resolving this rebase. Prefer `git diff -- <path>`, `git add <path>`, and `git -c core.editor=true rebase --continue` instead of `/bin/bash -lc`, `sh -lc`, `awk`, or chained shell snippets.",
+      "- Edit the conflicted files, remove conflict markers, preserve both sides' intended behavior, and run focused validation. Read-only Git inspection such as `git diff -- <path>` is allowed.",
     );
     lines.push(
-      "- Primary success condition: finish the git rebase and leave no active rebase/merge/cherry-pick state. Do not spend budget polishing, broadening, or refactoring tests beyond what is required to remove conflict markers and keep both sides' intended behavior.",
+      "- Do not run checkout, switch, reset, merge, rebase, add, commit, or push commands. Host-side source-control orchestration will stage resolved files and continue the prepared rebase after you return.",
     );
     lines.push(
-      "- Rebase convergence rule: after resolving each conflicted file, run `git diff --name-only --diff-filter=U`. If no unresolved paths remain, stage the resolved files and continue the rebase immediately before doing broader validation.",
-    );
-    lines.push(
-      "- Budget rule: if conflict resolution is running long, choose the smallest side-preserving resolution, stage it, and continue the rebase. A clean rebased branch with focused follow-up validation is better than a richer partial patch left mid-rebase.",
-    );
-    lines.push(
-      "- After editing, run `git add <files>` and `git -c core.editor=true rebase --continue` until the rebase completes.",
+      "- Budget rule: choose the smallest side-preserving file resolution and focused checks. Do not broaden or refactor beyond what is required to remove conflict markers and retain intended behavior.",
     );
   }
   lines.push(
-    "- Do not create a new PR, alternate branch, push, or force-push. Leave the resolved commit in the sandbox; SourceControlManager is the sole publisher for the existing PR branch.",
+    "- Do not create a new PR or alternate branch. SourceControlManager owns publication and is the sole process allowed to update the existing PR branch.",
   );
   return lines.join("\n");
 }
@@ -245,33 +236,39 @@ export function extractMergeConflictReviewContext(
   };
 }
 
-async function resolveRerereCacheDir(
-  sourceRepo: string,
-  context: MergeConflictReviewContext,
-): Promise<string> {
-  const gitCommonDir = await mustGit(
-    sourceRepo,
-    ["rev-parse", "--git-common-dir"],
-    "resolve common git dir",
-  );
-  const commonDir = resolve(sourceRepo, gitCommonDir);
-  const fingerprint = createHash("sha256")
-    .update(
-      [
-        context.publicBranch,
-        context.expectedHeadSha,
-        context.baseBranch,
-        context.expectedBaseSha,
-      ].join("\0"),
-    )
-    .digest("hex");
-  return join(commonDir, "pushpals", "merge-conflict-rerere", fingerprint);
-}
-
 export function isMergeConflictResolutionParams(
   params: Record<string, unknown> | null | undefined,
 ): boolean {
   return extractMergeConflictReviewContext(params) !== null;
+}
+
+export function isReviewResolutionParams(
+  params: Record<string, unknown> | null | undefined,
+): boolean {
+  const reviewAgent = asRecord(params?.reviewAgent);
+  const resolutionType = String(reviewAgent?.resolutionType ?? "")
+    .trim()
+    .toLowerCase();
+  return resolutionType === "review_fix" || resolutionType === "merge_conflict";
+}
+
+export function isHostScmOwnedReviewParams(
+  params: Record<string, unknown> | null | undefined,
+): boolean {
+  const reviewAgent = asRecord(params?.reviewAgent);
+  return isReviewResolutionParams(params) && reviewAgent?.hostScmGitOwner === true;
+}
+
+export function markHostScmGitOwnership(params: Record<string, unknown>): Record<string, unknown> {
+  const reviewAgent = asRecord(params.reviewAgent);
+  if (!reviewAgent || !isReviewResolutionParams(params)) return params;
+  return {
+    ...params,
+    reviewAgent: {
+      ...reviewAgent,
+      hostScmGitOwner: true,
+    },
+  };
 }
 
 export function applyMergeConflictExecutionHints(
@@ -315,7 +312,7 @@ export function applyMergeConflictExecutionHints(
   if (reviewAgent) {
     next.reviewAgent = {
       ...reviewAgent,
-      preparedWorkspaceMode: "isolated_container_clone",
+      preparedWorkspaceMode: "host_prepared_linked_worktree",
       preparedRebaseState: preparation.rebasedCleanly ? "clean" : "conflicted",
       preparedConflictPaths: preparation.conflictPaths,
       preparedHeadSha: preparation.currentHeadSha,
@@ -324,8 +321,13 @@ export function applyMergeConflictExecutionHints(
   return next;
 }
 
-export async function prepareMergeConflictTaskRepo(
-  sourceRepo: string,
+/**
+ * Prepare the already-isolated linked worktree on the host before a worker
+ * container starts. The worktree remains detached, so this never switches the
+ * user's checkout or creates a disposable public/local branch.
+ */
+export async function prepareMergeConflictWorktreeOnHost(
+  worktreePath: string,
   jobId: string,
   params: Record<string, unknown>,
   onLog?: LogFn,
@@ -333,7 +335,7 @@ export async function prepareMergeConflictTaskRepo(
   const context = extractMergeConflictReviewContext(params);
   if (!context) {
     return {
-      repoPath: sourceRepo,
+      repoPath: worktreePath,
       cleanup: () => {},
       conflictPaths: [],
       plannerGuidance: "",
@@ -342,100 +344,90 @@ export async function prepareMergeConflictTaskRepo(
     };
   }
 
-  const remoteUrl = await mustGit(sourceRepo, ["remote", "get-url", "origin"], "read origin URL");
-  const sourceUserName = (await git(sourceRepo, ["config", "--get", "user.name"])).stdout.trim();
-  const sourceUserEmail = (await git(sourceRepo, ["config", "--get", "user.email"])).stdout.trim();
-  const sandboxRoot = mkdtempSync(join(tmpdir(), "pushpals-merge-conflict-"));
-  const repoPath = join(sandboxRoot, "repo");
-  const rerereCacheDir = await resolveRerereCacheDir(sourceRepo, context);
-  mkdirSync(repoPath, { recursive: true });
-
-  const cleanup = () => {
-    const sandboxRerereDir = join(repoPath, ".git", "rr-cache");
-    if (existsSync(sandboxRerereDir)) {
-      mkdirSync(rerereCacheDir, { recursive: true });
-      cpSync(sandboxRerereDir, rerereCacheDir, { recursive: true, force: true });
-    }
-    rmSync(sandboxRoot, { recursive: true, force: true });
-  };
-
-  try {
-    await mustGit(repoPath, ["init", "--quiet"], "init sandbox repo");
-    await mustGit(repoPath, ["remote", "add", "origin", remoteUrl], "add origin");
-    await mustGit(
-      repoPath,
-      ["config", "user.name", sourceUserName || "PushPals WorkerPal"],
-      "configure user.name",
+  const currentHeadSha = (
+    await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve host worktree HEAD")
+  )
+    .trim()
+    .toLowerCase();
+  if (context.expectedHeadSha && currentHeadSha !== context.expectedHeadSha.trim().toLowerCase()) {
+    throw new Error(
+      `Stale merge-conflict worktree lease for ${jobId}: expected PR head ${context.expectedHeadSha}, but host worktree is ${currentHeadSha}.`,
     );
-    await mustGit(
-      repoPath,
-      ["config", "user.email", sourceUserEmail || "pushpals-worker@local"],
-      "configure user.email",
-    );
-    await mustGit(repoPath, ["config", "rerere.enabled", "true"], "enable rerere");
-    await mustGit(repoPath, ["config", "rerere.autoupdate", "true"], "enable rerere autoupdate");
-    if (existsSync(rerereCacheDir)) {
-      cpSync(rerereCacheDir, join(repoPath, ".git", "rr-cache"), {
-        recursive: true,
-        force: true,
-      });
-      onLog?.(
-        "stdout",
-        `[MergeConflict] Restored reusable conflict resolutions for the current PR head/base fingerprint.`,
-      );
-    }
-
-    const fetchArgs = [
-      "fetch",
-      "--quiet",
-      "origin",
-      `+refs/heads/${context.publicBranch}:refs/remotes/origin/${context.publicBranch}`,
-      `+refs/heads/${context.baseBranch}:refs/remotes/origin/${context.baseBranch}`,
-    ];
-    await mustGit(repoPath, fetchArgs, "fetch merge-conflict refs");
-    await mustGit(
-      repoPath,
-      ["checkout", "-B", context.publicBranch, `refs/remotes/origin/${context.publicBranch}`],
-      "checkout PR branch in sandbox",
-    );
-    await mustGit(
-      repoPath,
-      ["branch", "--set-upstream-to", `origin/${context.publicBranch}`, context.publicBranch],
-      "set sandbox upstream",
-    );
-
-    const baseRemoteRef = `refs/remotes/origin/${context.baseBranch}`;
-    const rebase = await git(repoPath, ["-c", "core.editor=true", "rebase", baseRemoteRef]);
-    let conflictPaths: string[] = [];
-    let rebasedCleanly = false;
-    if (rebase.ok) {
-      rebasedCleanly = true;
-      const note = `[MergeConflictSandbox] ${jobId}: ${context.publicBranch} rebased cleanly onto origin/${context.baseBranch}.`;
-      onLog?.("stdout", note);
-    } else if (isMergeConflictOutput(`${rebase.stderr}\n${rebase.stdout}`)) {
-      const unresolved = await mustGit(
-        repoPath,
-        ["diff", "--name-only", "--diff-filter=U"],
-        "list unresolved conflict paths",
-      );
-      conflictPaths = extractConflictPaths(unresolved);
-      const note = `[MergeConflictSandbox] ${jobId}: prepared isolated sandbox for ${context.publicBranch} with ${conflictPaths.length} unresolved file(s).`;
-      onLog?.("stdout", note);
-    } else {
-      throw new Error(rebase.stderr || rebase.stdout || "unknown rebase failure");
-    }
-
-    const currentHeadSha = await mustGit(repoPath, ["rev-parse", "HEAD"], "resolve sandbox HEAD");
-    return {
-      repoPath: resolve(repoPath),
-      cleanup,
-      conflictPaths,
-      plannerGuidance: buildPlannerGuidance(context, conflictPaths, rebasedCleanly),
-      rebasedCleanly,
-      currentHeadSha,
-    };
-  } catch (error) {
-    cleanup();
-    throw error;
   }
+
+  const baseRef = context.expectedBaseSha || `refs/remotes/origin/${context.baseBranch}`;
+  const resolvedBaseSha = (
+    await mustGit(worktreePath, ["rev-parse", `${baseRef}^{commit}`], "resolve leased PR base")
+  )
+    .trim()
+    .toLowerCase();
+  if (context.expectedBaseSha && resolvedBaseSha !== context.expectedBaseSha.trim().toLowerCase()) {
+    throw new Error(
+      `Stale merge-conflict base lease for ${jobId}: expected ${context.expectedBaseSha}, but host resolved ${resolvedBaseSha}.`,
+    );
+  }
+
+  await mustGit(worktreePath, ["config", "rerere.enabled", "true"], "enable rerere");
+  await mustGit(worktreePath, ["config", "rerere.autoupdate", "true"], "enable rerere autoupdate");
+
+  const rebase = await git(worktreePath, ["-c", "core.editor=true", "rebase", resolvedBaseSha]);
+  let rebasedCleanly = false;
+  let conflictPaths: string[] = [];
+  if (rebase.ok) {
+    rebasedCleanly = true;
+    onLog?.(
+      "stdout",
+      `[MergeConflictHost] ${jobId}: detached PR head rebased cleanly onto ${resolvedBaseSha.slice(0, 12)} before container execution.`,
+    );
+  } else if (isMergeConflictOutput(`${rebase.stderr}\n${rebase.stdout}`)) {
+    const unresolved = await mustGit(
+      worktreePath,
+      ["diff", "--name-only", "--diff-filter=U"],
+      "list host-prepared unresolved conflict paths",
+    );
+    conflictPaths = extractConflictPaths(unresolved);
+    onLog?.(
+      "stdout",
+      `[MergeConflictHost] ${jobId}: host paused the detached worktree rebase with ${conflictPaths.length} unresolved file(s) before container execution.`,
+    );
+  } else {
+    throw new Error(rebase.stderr || rebase.stdout || "unknown host-side rebase failure");
+  }
+
+  const preparedHeadSha = (
+    await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve prepared host worktree HEAD")
+  ).trim();
+  return {
+    repoPath: resolve(worktreePath),
+    cleanup: () => {},
+    conflictPaths,
+    plannerGuidance: buildPlannerGuidance(context, conflictPaths, rebasedCleanly),
+    rebasedCleanly,
+    currentHeadSha: preparedHeadSha,
+  };
+}
+
+export async function refreshMergeConflictWorktreeHints(
+  worktreePath: string,
+  params: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const context = extractMergeConflictReviewContext(params);
+  if (!context) return params;
+  const unresolved = await mustGit(
+    worktreePath,
+    ["diff", "--name-only", "--diff-filter=U"],
+    "refresh host-prepared unresolved conflict paths",
+  );
+  const conflictPaths = extractConflictPaths(unresolved);
+  const currentHeadSha = (
+    await mustGit(worktreePath, ["rev-parse", "HEAD"], "refresh host-prepared worktree HEAD")
+  ).trim();
+  return applyMergeConflictExecutionHints(params, {
+    repoPath: resolve(worktreePath),
+    cleanup: () => {},
+    conflictPaths,
+    plannerGuidance: buildPlannerGuidance(context, conflictPaths, false),
+    rebasedCleanly: false,
+    currentHeadSha,
+  });
 }

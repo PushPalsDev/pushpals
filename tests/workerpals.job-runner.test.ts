@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { buildJobRunnerResult } from "../apps/workerpals/src/job_runner";
+import {
+  buildJobRunnerResult,
+  containerOwnsGitFinalization,
+} from "../apps/workerpals/src/job_runner";
 
 describe("workerpals Docker job runner result", () => {
   test("preserves executor cooldowns in the structured sentinel result", () => {
@@ -29,5 +32,25 @@ describe("workerpals Docker job runner result", () => {
     expect(result.usage?.totalTokens).toBe(1500);
     expect(result.usage?.estimated).toBe(false);
     expect(result.diagnostics?.terminal?.failureClass).toBe("codex_startup_stall");
+  });
+
+  test("keeps host-SCM review jobs edit/validate-only inside the container", () => {
+    expect(
+      containerOwnsGitFinalization({
+        reviewAgent: {
+          resolutionType: "review_fix",
+          hostScmGitOwner: true,
+        },
+      }),
+    ).toBe(false);
+    expect(
+      containerOwnsGitFinalization({
+        reviewAgent: {
+          resolutionType: "merge_conflict",
+          hostScmGitOwner: true,
+        },
+      }),
+    ).toBe(false);
+    expect(containerOwnsGitFinalization({ instruction: "ordinary worker job" })).toBe(true);
   });
 });

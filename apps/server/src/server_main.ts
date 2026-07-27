@@ -29,6 +29,7 @@ import {
 } from "./runtime_config.js";
 import { deriveRuntimeConfigImpact } from "./runtime_config_policy.js";
 import { resolveRequestAuthHeader } from "./request_auth.js";
+import { extractAutonomyPayloadDetails } from "./autonomy_payload.js";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
 const STARTUP_CONFIG = loadPushPalsConfig();
@@ -411,61 +412,9 @@ export function createRequestHandler() {
           429,
         );
       };
-      const objectRecord = (value: unknown): Record<string, unknown> | null =>
-        value && typeof value === "object" && !Array.isArray(value)
-          ? (value as Record<string, unknown>)
-          : null;
-      const stringArray = (value: unknown): string[] =>
-        Array.isArray(value)
-          ? value.map((entry) => String(entry ?? "").trim()).filter(Boolean)
-          : [];
-      const autonomyPayloadDetails = (
-        value: Record<string, unknown>,
-      ): {
-        patternKey: string | null;
-        targetPaths: string[];
-        writeGlobs: string[];
-      } => {
-        const params =
-          objectRecord(value.params) ??
-          (typeof value.params === "string" ? parseJsonRecord(value.params) : {});
-        const metadata =
-          objectRecord(value.metadata) ??
-          objectRecord(value.meta) ??
-          (typeof value.metadataJson === "string" ? parseJsonRecord(value.metadataJson) : {});
-        const metadataAutonomy = objectRecord(metadata.autonomy);
-        const paramsAutonomy = objectRecord(params.autonomy);
-        const planning = objectRecord(params.planning);
-        const scope = objectRecord(planning?.scope);
-        const patternKey =
-          compactText(
-            metadataAutonomy?.patternKey ??
-              metadataAutonomy?.pattern_key ??
-              paramsAutonomy?.patternKey ??
-              paramsAutonomy?.pattern_key,
-            240,
-          ) || null;
-        const targetPaths = [
-          ...stringArray(metadataAutonomy?.targetPaths ?? metadataAutonomy?.target_paths),
-          ...stringArray(paramsAutonomy?.targetPaths ?? paramsAutonomy?.target_paths),
-          ...stringArray(params.paths),
-          ...stringArray(planning?.targetPaths ?? planning?.target_paths),
-        ];
-        const writeGlobs = [
-          ...stringArray(metadataAutonomy?.writeGlobs ?? metadataAutonomy?.write_globs),
-          ...stringArray(paramsAutonomy?.writeGlobs ?? paramsAutonomy?.write_globs),
-          ...stringArray(scope?.writeGlobs ?? scope?.write_globs),
-        ];
-        return {
-          patternKey,
-          targetPaths,
-          writeGlobs,
-        };
-      };
       const autonomySimilarFailureSummary = (value: Record<string, unknown>) => {
-        const details = autonomyPayloadDetails(value);
-        return jobQueue.similarNoPublishableFailureSummary({
-          patternKey: details.patternKey,
+        const details = extractAutonomyPayloadDetails(value);
+        return jobQueue.similarFailureFingerprintSummary({
           targetPaths: details.targetPaths,
           windowMs: AUTONOMY_SIMILAR_FAILURE_WINDOW_MS,
           threshold: AUTONOMY_SIMILAR_FAILURE_THRESHOLD,
@@ -479,10 +428,11 @@ export function createRequestHandler() {
         return makeJson(
           {
             ok: false,
-            code: "autonomy_similar_no_publishable_suppressed",
+            code: "autonomy_similar_failure_suppressed",
             message:
               `Autonomy enqueue blocked: ${similarFailure.recentSimilarFailureCount} ` +
-              `similar no-publishable/no-edit failure(s) were observed recently.`,
+              `unchanged target-and-failure fingerprint occurrence(s) were observed recently. ` +
+              `Dispatch one root-cause repair for this cluster or select another component.`,
             retryAfterMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
             ...similarFailure,
           },
@@ -1038,7 +988,7 @@ export function createRequestHandler() {
                 workerId,
                 deferMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
                 detail: JSON.stringify({
-                  code: "autonomy_similar_no_publishable_suppressed",
+                  code: "autonomy_similar_failure_suppressed",
                   ...similarFailure,
                 }),
               });
@@ -2208,9 +2158,9 @@ export function createRequestHandler() {
               requestQueue.fail(result.request.id, {
                 message:
                   `Autonomy request suppressed after ` +
-                  `${similarFailure.recentSimilarFailureCount} similar no-publishable/no-edit failure(s).`,
+                  `${similarFailure.recentSimilarFailureCount} unchanged target-and-failure fingerprint occurrence(s).`,
                 detail: JSON.stringify({
-                  code: "autonomy_similar_no_publishable_suppressed",
+                  code: "autonomy_similar_failure_suppressed",
                   ...similarFailure,
                 }),
               });

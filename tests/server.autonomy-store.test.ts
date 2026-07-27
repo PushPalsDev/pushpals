@@ -1181,17 +1181,12 @@ describe("server AutonomyStore policy gates", () => {
         runId: "run_token_budget",
       }).snapshot_id;
 
-      const logged = store.recordObjectiveDecision({
-        runId: "run_token_budget",
-        snapshotId,
+      const logged = store.recordLlmUsage({
+        id: "llm_token_budget_1",
+        service: "workerpals",
         sessionId: "s1",
-        llmCalls: [
-          {
-            id: "llm_token_budget_1",
-            phase: "ideation",
-            tokenUsage: { promptTokens: 7, completionTokens: 5 },
-          },
-        ],
+        promptTokens: 7,
+        completionTokens: 5,
       });
       expect(logged.ok).toBe(true);
 
@@ -2298,6 +2293,44 @@ describe("server AutonomyStore policy gates", () => {
     expect(autonomyPatternSampleCount(store, decision.patternKey)).toBe(1);
   });
 
+  test("evaluator selects the chronologically latest outcome after replayed backfills", () => {
+    const store = makeStore();
+    const db = (store as unknown as { db: any }).db;
+    const insert = db.prepare(
+      `INSERT INTO autonomy_outcomes (
+         objective_id, request_id, job_id, pattern_key, success, retries, latency_ms,
+         user_action, reopened_within_24h, regression_flag, created_at
+       ) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, 0, ?, ?)`,
+    );
+    const nowMs = Date.now();
+
+    insert.run(
+      "obj_replayed_backfill",
+      "req_replayed_backfill",
+      "job_replayed_backfill",
+      "pk_replayed_backfill",
+      1,
+      "published",
+      0,
+      new Date(nowMs - 30_000).toISOString(),
+    );
+    insert.run(
+      "obj_replayed_backfill",
+      "req_replayed_backfill",
+      "job_replayed_backfill",
+      "pk_replayed_backfill",
+      0,
+      "failed",
+      1,
+      new Date(nowMs - 60_000).toISOString(),
+    );
+
+    const card = runEvaluatorNow(store);
+    expect(card.sampleCount).toBe(1);
+    expect(card.successRate).toBe(1);
+    expect(card.regretRate).toBe(0);
+  });
+
   test("evaluator still pauses on independent failed objective samples", () => {
     const store = makeStore();
 
@@ -2322,6 +2355,97 @@ describe("server AutonomyStore policy gates", () => {
     expect(card.recommendation).toBe("pause");
     expect(store.getSafetyState().isFrozen).toBe(true);
     expect(store.getSafetyState().freezeReason).toBe("auto_freeze:evaluator_pause");
+  });
+
+  test("evaluator pauses degraded end-to-end job health and preserves null latency", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-job-health-");
+    const queue = new JobQueue(dbPath);
+    try {
+      for (let index = 0; index < 10; index += 1) {
+        const enqueued = queue.enqueue({
+          taskId: `job-health-${index}`,
+          sessionId: "dev",
+          kind: "task.execute",
+          params: {
+            origin: "autonomy",
+            autonomy: { targetPaths: ["app/(tabs)/_layout.tsx"] },
+          },
+        });
+        expect(enqueued.ok).toBe(true);
+        const claimed = queue.claim("worker-health");
+        expect(claimed.ok).toBe(true);
+        const jobId = String(claimed.job?.id ?? "");
+        if (index < 7) {
+          expect(queue.complete(jobId, { summary: "published" }).ok).toBe(true);
+        } else {
+          expect(
+            queue.fail(jobId, {
+              message: "validation timed out",
+              diagnostics: {
+                terminal: {
+                  status: "failed",
+                  failureClass: "validation_timeout",
+                  terminalStage: "quality_gate",
+                  summary: "focused validation timed out",
+                },
+              },
+            }).ok,
+          ).toBe(true);
+        }
+      }
+
+      const card = runEvaluatorNow(store);
+      expect(card.avgLatencyMs).toBeNull();
+      expect(card.jobTerminalCount).toBe(10);
+      expect(card.jobSuccessRate).toBeCloseTo(0.7);
+      expect(card.jobTimeoutRate).toBeCloseTo(0.3);
+      expect(card.recommendation).toBe("pause");
+      expect(store.getSafetyState().isFrozen).toBe(true);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("ops alerts remain open without duplicate events and resolve when healthy", () => {
+    const store = makeStore();
+    const first = store.getOpsSummary({ requestPending: 25 });
+    expect(
+      first.recentAlerts.filter((alert) => alert.alertType === "request_queue_pending_high"),
+    ).toHaveLength(1);
+
+    const repeated = store.getOpsSummary({ requestPending: 30 });
+    const openAlert = repeated.recentAlerts.find(
+      (alert) => alert.alertType === "request_queue_pending_high",
+    );
+    expect(openAlert?.status).toBe("open");
+    expect(openAlert?.occurrenceCount).toBe(2);
+
+    const observationless = store.getOpsSummary();
+    const stillOpen = observationless.recentAlerts.find(
+      (alert) => alert.alertType === "request_queue_pending_high",
+    );
+    expect(stillOpen?.status).toBe("open");
+    expect(stillOpen?.occurrenceCount).toBe(2);
+
+    const db = (store as unknown as { db: any }).db;
+    const historyCount = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM autonomy_ops_alerts WHERE alert_type = 'request_queue_pending_high'`,
+      )
+      .get() as { count: number };
+    expect(historyCount.count).toBe(1);
+
+    const healthy = store.getOpsSummary({ requestPending: 0 });
+    expect(
+      healthy.recentAlerts.some((alert) => alert.alertType === "request_queue_pending_high"),
+    ).toBe(false);
+    const state = db
+      .prepare(
+        `SELECT status, resolved_at FROM autonomy_ops_alert_state WHERE alert_type = 'request_queue_pending_high'`,
+      )
+      .get() as { status: string; resolved_at: string | null };
+    expect(state.status).toBe("resolved");
+    expect(state.resolved_at).toBeTruthy();
   });
 
   test("ingestInspirationPatterns dedupes fingerprints and tracks source attribution", () => {

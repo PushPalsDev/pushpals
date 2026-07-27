@@ -389,6 +389,16 @@ describe("workerpals commit message generation helpers", () => {
       isPullRebaseDirtyWorkingTreeOutput("fatal: cannot rebase: You have unstaged changes."),
     ).toBe(true);
     expect(
+      isPullRebaseDirtyWorkingTreeOutput(
+        "error: Your local changes to the following files would be overwritten by merge:",
+      ),
+    ).toBe(true);
+    expect(
+      isPullRebaseDirtyWorkingTreeOutput(
+        "error: The following untracked working tree files would be overwritten by merge:",
+      ),
+    ).toBe(true);
+    expect(
       isPullRebaseDirtyWorkingTreeOutput("fatal: unable to access 'https://github.com/...': 401"),
     ).toBe(false);
   });
@@ -487,11 +497,7 @@ describe("workerpals commit message generation helpers", () => {
         }),
       );
 
-      const identity = await runGit(repo, [
-        "log",
-        "-1",
-        "--format=%an <%ae>|%cn <%ce>",
-      ]);
+      const identity = await runGit(repo, ["log", "-1", "--format=%an <%ae>|%cn <%ce>"]);
       expect(identity).toBe(
         "PiyushDatta <piyushdattaca@gmail.com>|PiyushDatta <piyushdattaca@gmail.com>",
       );

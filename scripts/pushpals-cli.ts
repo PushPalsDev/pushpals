@@ -1690,14 +1690,11 @@ function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
       "codex_bin",
     ),
   );
-  migrated = migrateEmbeddedRuntimeTomlSection(
-    migrated,
-    "workerpals.openai_codex",
-    (sectionBody) =>
-      migrateLegacyWorkerCodexCommandDefault(
-        migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
-        "bin",
-      ),
+  migrated = migrateEmbeddedRuntimeTomlSection(migrated, "workerpals.openai_codex", (sectionBody) =>
+    migrateLegacyWorkerCodexCommandDefault(
+      migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
+      "bin",
+    ),
   );
   if (migrated !== original) {
     writeFileSync(localTomlPath, migrated, "utf8");
@@ -2265,6 +2262,82 @@ function readLogTail(logPath: string, maxLines = 40): string {
     .filter((line) => line.length > 0);
   if (lines.length === 0) return "";
   return lines.slice(-maxLines).join("\n");
+}
+
+export type EmbeddedRuntimeCrashEnvelope = {
+  event: "embedded_runtime_crash";
+  crashId: string;
+  service: string;
+  runtimeVersion: string | null;
+  platform: string;
+  uptimeMs: number;
+  exitCode: number | null;
+  requestId: string | null;
+  jobId: string | null;
+  memory: {
+    rssBytes: number | null;
+  };
+  crashReport: string | null;
+  crashSignature: string | null;
+  recoveryOutcome: "restart_planned" | "restart_not_planned";
+  observedAt: string;
+};
+
+function memoryValueToBytes(value: string, unit: string): number | null {
+  const amount = Number.parseFloat(value);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  const multiplier =
+    unit.toLowerCase() === "gb" ? 1024 ** 3 : unit.toLowerCase() === "mb" ? 1024 ** 2 : 1024;
+  return Math.floor(amount * multiplier);
+}
+
+export function buildEmbeddedRuntimeCrashEnvelope(options: {
+  service: string;
+  logText: string;
+  uptimeMs: number;
+  exitCode: number | null;
+  rssBytes?: number | null;
+  recoveryPlanned: boolean;
+  observedAt: string;
+}): EmbeddedRuntimeCrashEnvelope {
+  const logText = String(options.logText ?? "");
+  const runtimeMatch = logText.match(/\bBun\s+v?(\d+\.\d+\.\d+(?:[-+][a-z0-9.-]+)?)/i);
+  const rssMatch = logText.match(
+    /\b(?:RSS|resident(?:\s+set)?(?:\s+size)?)\s*[:=]\s*([\d.]+)\s*(KB|MB|GB)\b/i,
+  );
+  const crashReportMatch = logText.match(/https:\/\/bun\.report\/[^\s)"']+/i);
+  const requestMatch = logText.match(
+    /\brequest(?:Id|_id|\s+id)?\s*[:=]\s*["']?([a-z0-9][a-z0-9._:-]{3,})/i,
+  );
+  const jobMatch = logText.match(
+    /\bjob(?:Id|_id|\s+id)?\s*[:=]\s*["']?([a-z0-9][a-z0-9._:-]{3,})/i,
+  );
+  const signatureMatch = logText.match(
+    /\b(?:panic\(main thread\)[^\r\n]*|segmentation fault[^\r\n]*|oh no:\s*bun has crashed[^\r\n]*)/i,
+  );
+  return {
+    event: "embedded_runtime_crash",
+    crashId: `crash_${crypto.randomUUID().slice(0, 12)}`,
+    service: options.service,
+    runtimeVersion: runtimeMatch?.[1] ?? process.versions.bun ?? null,
+    platform: `${process.platform}-${process.arch}`,
+    uptimeMs: Math.max(0, Math.floor(options.uptimeMs)),
+    exitCode: options.exitCode,
+    requestId: requestMatch?.[1] ?? null,
+    jobId: jobMatch?.[1] ?? null,
+    memory: {
+      rssBytes:
+        typeof options.rssBytes === "number" && Number.isFinite(options.rssBytes)
+          ? Math.max(0, Math.floor(options.rssBytes))
+          : rssMatch
+            ? memoryValueToBytes(rssMatch[1], rssMatch[2])
+            : null,
+    },
+    crashReport: crashReportMatch?.[0] ?? null,
+    crashSignature: signatureMatch?.[0] ?? null,
+    recoveryOutcome: options.recoveryPlanned ? "restart_planned" : "restart_not_planned",
+    observedAt: options.observedAt,
+  };
 }
 
 function hasStandaloneBunCrashSignature(text: string): boolean {
@@ -5189,6 +5262,10 @@ async function autoStartRuntimeServices(opts: {
   console.log(
     `[pushpals] service log (source_control_manager)=${serviceLogPaths.source_control_manager}`,
   );
+  const pendingCrashEnvelopes = new Map<
+    string,
+    { envelope: EmbeddedRuntimeCrashEnvelope; observedAtMs: number }
+  >();
   const serviceManager = new ServiceManager({
     degradedAction:
       "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
@@ -5202,6 +5279,51 @@ async function autoStartRuntimeServices(opts: {
         console.log(cliLine);
       }
       appendRuntimeServicesLogLine(runtimeServicesLogPath, cliLine);
+    },
+    onLifecycleEvent: (event) => {
+      if (event.type === "exit") {
+        const logPath =
+          serviceLogPaths[event.service as keyof RuntimeServiceLogPaths] ?? runtimeServicesLogPath;
+        const envelope = buildEmbeddedRuntimeCrashEnvelope({
+          service: event.service,
+          logText: readLogTail(logPath, 200),
+          uptimeMs: event.uptimeMs,
+          exitCode: event.exitCode,
+          rssBytes: event.rssBytes,
+          recoveryPlanned: event.recoveryPlanned,
+          observedAt: event.observedAt,
+        });
+        pendingCrashEnvelopes.set(event.service, {
+          envelope,
+          observedAtMs: Date.parse(event.observedAt),
+        });
+        const line = `[pushpals] embeddedRuntimeCrash=${JSON.stringify(envelope)}`;
+        console.warn(line);
+        appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
+        return;
+      }
+      const pending = pendingCrashEnvelopes.get(event.service);
+      const recoveredAtMs = Date.parse(event.observedAt);
+      const recoveryOutcome =
+        event.type === "recovery_exhausted" ? "recovery_exhausted" : "recovered";
+      const recovery = {
+        event: "embedded_runtime_recovery",
+        crashId: pending?.envelope.crashId ?? null,
+        service: event.service,
+        runtimeVersion: pending?.envelope.runtimeVersion ?? null,
+        recoveryOutcome,
+        recoveryDurationMs:
+          pending && Number.isFinite(recoveredAtMs) && Number.isFinite(pending.observedAtMs)
+            ? Math.max(0, recoveredAtMs - pending.observedAtMs)
+            : null,
+        restartAttempt: event.restartAttempt,
+        recoveredAt: event.observedAt,
+      };
+      pendingCrashEnvelopes.delete(event.service);
+      const line = `[pushpals] embeddedRuntimeRecovery=${JSON.stringify(recovery)}`;
+      if (event.type === "recovery_exhausted") console.error(line);
+      else console.log(line);
+      appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
     },
     onHealthChange: (health) => {
       for (const line of formatEmbeddedRuntimeHealthLines(health)) {

@@ -41,6 +41,7 @@ type ServiceManagerState = {
   nextRestartAtMs: number;
   lastRestartReason: string;
   pendingRestartTimer: ReturnType<typeof setTimeout> | null;
+  lastReportedExitedProcess: ManagedServiceProcess | null;
 };
 
 export type ServiceManagerOptions = {
@@ -53,7 +54,35 @@ export type ServiceManagerOptions = {
   onHealthChange?: (health: EmbeddedRuntimeHealth | null) => void;
   onServiceDegraded?: (name: string, reason: string, health: EmbeddedRuntimeHealth) => void;
   onEvent?: (level: "log" | "warn" | "error", line: string) => void;
+  onLifecycleEvent?: (event: ManagedServiceLifecycleEvent) => void;
 };
+
+export type ManagedServiceLifecycleEvent =
+  | {
+      type: "exit";
+      service: string;
+      exitCode: number | null;
+      uptimeMs: number;
+      rssBytes: number | null;
+      restartAttempt: number;
+      maxRestartAttempts: number;
+      recoveryPlanned: boolean;
+      observedAt: string;
+    }
+  | {
+      type: "restarted";
+      service: string;
+      restartAttempt: number;
+      maxRestartAttempts: number;
+      observedAt: string;
+    }
+  | {
+      type: "recovery_exhausted";
+      service: string;
+      restartAttempt: number;
+      maxRestartAttempts: number;
+      observedAt: string;
+    };
 
 export type ManagedServiceLaunchRetryOptions = {
   maxAttempts?: number;
@@ -95,6 +124,15 @@ export function shouldRestartService(
   const normalizedAttempts = Math.max(0, Math.floor(attempts));
   const normalizedMax = Math.max(1, Math.floor(maxAttempts));
   return normalizedAttempts < normalizedMax;
+}
+
+function managedServiceMaxRssBytes(service: ManagedServiceProcess): number | null {
+  try {
+    const maxRss = Number(service.proc.resourceUsage?.()?.maxRSS);
+    return Number.isFinite(maxRss) && maxRss >= 0 ? Math.floor(maxRss) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function isRetryableManagedServiceLaunchError(error: unknown): boolean {
@@ -210,6 +248,7 @@ export class ServiceManager {
     health: EmbeddedRuntimeHealth,
   ) => void;
   private readonly onEvent?: (level: "log" | "warn" | "error", line: string) => void;
+  private readonly onLifecycleEvent?: (event: ManagedServiceLifecycleEvent) => void;
   private readonly timer: ReturnType<typeof setInterval>;
   private shutdownBegun = false;
   private stopped = false;
@@ -233,6 +272,7 @@ export class ServiceManager {
     this.onHealthChange = options.onHealthChange;
     this.onServiceDegraded = options.onServiceDegraded;
     this.onEvent = options.onEvent;
+    this.onLifecycleEvent = options.onLifecycleEvent;
     this.timer = setInterval(() => this.tick(), this.pollMs);
   }
 
@@ -352,6 +392,7 @@ export class ServiceManager {
       nextRestartAtMs: 0,
       lastRestartReason: "",
       pendingRestartTimer: null,
+      lastReportedExitedProcess: null,
     };
     this.stateByService.set(name, created);
     return created;
@@ -384,7 +425,29 @@ export class ServiceManager {
       if (state.nextRestartAtMs > now) continue;
 
       const reason = `exit code ${service.exitCode ?? "unknown"}`;
+      const exitAlreadyReported = state.lastReportedExitedProcess === service;
       if (!shouldRestartService(state.attempts, this.maxRestartAttempts)) {
+        if (!exitAlreadyReported) {
+          state.lastReportedExitedProcess = service;
+          this.onLifecycleEvent?.({
+            type: "exit",
+            service: name,
+            exitCode: service.exitCode,
+            uptimeMs: Math.max(0, now - service.launchedAtMs),
+            rssBytes: managedServiceMaxRssBytes(service),
+            restartAttempt: state.attempts,
+            maxRestartAttempts: this.maxRestartAttempts,
+            recoveryPlanned: false,
+            observedAt: new Date(now).toISOString(),
+          });
+        }
+        this.onLifecycleEvent?.({
+          type: "recovery_exhausted",
+          service: name,
+          restartAttempt: state.attempts,
+          maxRestartAttempts: this.maxRestartAttempts,
+          observedAt: new Date(now).toISOString(),
+        });
         this.emitEvent(
           "error",
           `Managed ${name} exited (${reason}) and reached restart limit (${state.attempts}/${this.maxRestartAttempts}).`,
@@ -405,6 +468,20 @@ export class ServiceManager {
       const nextAttempt = state.attempts + 1;
       state.lastRestartReason = reason;
       const backoffMs = Math.max(1, Math.floor(this.computeRestartBackoffMs(nextAttempt)));
+      if (!exitAlreadyReported) {
+        state.lastReportedExitedProcess = service;
+        this.onLifecycleEvent?.({
+          type: "exit",
+          service: name,
+          exitCode: service.exitCode,
+          uptimeMs: Math.max(0, now - service.launchedAtMs),
+          rssBytes: managedServiceMaxRssBytes(service),
+          restartAttempt: nextAttempt,
+          maxRestartAttempts: this.maxRestartAttempts,
+          recoveryPlanned: true,
+          observedAt: new Date(now).toISOString(),
+        });
+      }
       this.emitEvent(
         "warn",
         `Managed ${name} exited (${reason}); restarting attempt ${nextAttempt}/${this.maxRestartAttempts} in ${backoffMs}ms.`,
@@ -424,6 +501,13 @@ export class ServiceManager {
           const restarted = this.spawnService(spec);
           this.services.set(name, restarted);
           this.emitEvent("log", `Restarted managed ${name}.`);
+          this.onLifecycleEvent?.({
+            type: "restarted",
+            service: name,
+            restartAttempt: state.attempts,
+            maxRestartAttempts: this.maxRestartAttempts,
+            observedAt: new Date().toISOString(),
+          });
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           state.lastRestartReason = `launch error: ${detail}`;

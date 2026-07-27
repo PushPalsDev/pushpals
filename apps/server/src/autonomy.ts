@@ -412,6 +412,13 @@ export interface AutonomyEvaluatorScorecard {
   regretRate: number | null;
   avgLatencyMs: number | null;
   dispatchCount: number;
+  jobTerminalCount: number;
+  jobSuccessRate: number | null;
+  jobTimeoutRate: number | null;
+  activeRuntimeMs: number;
+  repeatedFailureCount: number;
+  tokenBudgetExhausted: boolean;
+  runtimeBudgetExhausted: boolean;
   recommendation: "healthy" | "constrain" | "pause";
   createdAt: string;
 }
@@ -423,6 +430,11 @@ export interface AutonomyOpsAlert {
   message: string;
   details: Record<string, unknown>;
   createdAt: string;
+  status: "open" | "resolved";
+  firstSeenAt: string;
+  lastSeenAt: string;
+  resolvedAt: string | null;
+  occurrenceCount: number;
 }
 
 export interface AutonomySafetyState {
@@ -557,6 +569,52 @@ function asStringArray(value: unknown): string[] {
   return value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
 }
 
+function normalizedAutonomyFailureTargets(params: Record<string, unknown>): string[] {
+  const planning = asObject(params.planning);
+  const autonomy = asObject(params.autonomy);
+  return [
+    asString(params.path),
+    asString(params.targetPath ?? params.target_path),
+    ...asStringArray(params.paths),
+    asString(planning.targetPath ?? planning.target_path),
+    ...asStringArray(planning.targetPaths ?? planning.target_paths),
+    asString(autonomy.targetPath ?? autonomy.target_path),
+    ...asStringArray(autonomy.targetPaths ?? autonomy.target_paths),
+  ]
+    .map((entry) =>
+      entry
+        .replace(/\\/g, "/")
+        .replace(/^\.\/+/, "")
+        .replace(/\/+$/, "")
+        .toLowerCase(),
+    )
+    .filter(Boolean)
+    .filter((entry, index, entries) => entries.indexOf(entry) === index)
+    .sort();
+}
+
+function failedTestNamesFromOutput(...values: unknown[]): string[] {
+  const text = values.map((value) => String(value ?? "")).join("\n");
+  const tests = new Set<string>();
+  for (const match of text.matchAll(/(?:\(fail\)|\bfail(?:ed)?\b)\s*[:>-]?\s*([^\r\n]{3,240})/gi)) {
+    const normalized = asString(match[1])
+      .replace(/\s+\[[\d.]+\s*(?:ms|s)\]\s*$/i, "")
+      .replace(/\s+/g, " ")
+      .toLowerCase();
+    if (normalized) tests.add(normalized);
+    if (tests.size >= 8) break;
+  }
+  if (tests.size < 8) {
+    for (const match of text.matchAll(
+      /(?:^|[\s("'`])([a-z0-9_./-]+\.(?:test|spec)\.[cm]?[jt]sx?)(?=$|[\s:)"'`])/gim,
+    )) {
+      tests.add(asString(match[1]).replace(/\\/g, "/").toLowerCase());
+      if (tests.size >= 8) break;
+    }
+  }
+  return [...tests].sort();
+}
+
 const PUSHPALS_INTERNAL_CANDIDATE_PATTERNS: RegExp[] = [
   /\bqueue[_-]?health\b/i,
   /\bworkerpals?\b/i,
@@ -667,6 +725,8 @@ function asBoolean(value: unknown, fallback = false): boolean {
 }
 
 function asNumber(value: unknown, fallback = 0): number {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "string" && value.trim().length === 0) return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -675,41 +735,6 @@ function asNonNegativeInt(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
   return Math.max(0, Math.floor(parsed));
-}
-
-function extractTokenUsage(value: unknown): number {
-  const record = asObject(value);
-  const directTotal = asNonNegativeInt(record.totalTokens ?? record.total_tokens ?? record.total);
-  if (directTotal > 0) return directTotal;
-  const prompt = asNonNegativeInt(
-    record.promptTokens ?? record.prompt_tokens ?? record.inputTokens ?? record.input_tokens,
-  );
-  const completion = asNonNegativeInt(
-    record.completionTokens ??
-      record.completion_tokens ??
-      record.outputTokens ??
-      record.output_tokens,
-  );
-  if (prompt > 0 || completion > 0) return prompt + completion;
-  const nestedUsage = asObject(record.usage);
-  const nestedTotal = asNonNegativeInt(
-    nestedUsage.totalTokens ?? nestedUsage.total_tokens ?? nestedUsage.total,
-  );
-  if (nestedTotal > 0) return nestedTotal;
-  const nestedPrompt = asNonNegativeInt(
-    nestedUsage.promptTokens ??
-      nestedUsage.prompt_tokens ??
-      nestedUsage.inputTokens ??
-      nestedUsage.input_tokens,
-  );
-  const nestedCompletion = asNonNegativeInt(
-    nestedUsage.completionTokens ??
-      nestedUsage.completion_tokens ??
-      nestedUsage.outputTokens ??
-      nestedUsage.output_tokens,
-  );
-  if (nestedPrompt > 0 || nestedCompletion > 0) return nestedPrompt + nestedCompletion;
-  return 0;
 }
 
 function parseJsonObject(raw: string | null): Record<string, unknown> {
@@ -1636,6 +1661,19 @@ export class AutonomyStore {
       );
       CREATE INDEX IF NOT EXISTS idx_autonomy_ops_alerts_created
         ON autonomy_ops_alerts(created_at DESC);
+      CREATE TABLE IF NOT EXISTS autonomy_ops_alert_state (
+        alert_type TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'open',
+        severity TEXT NOT NULL,
+        message TEXT NOT NULL,
+        details_json TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        resolved_at TEXT,
+        occurrence_count INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_ops_alert_state_status
+        ON autonomy_ops_alert_state(status, last_seen_at DESC);
       CREATE TABLE IF NOT EXISTS autonomy_dead_letters (
         id TEXT PRIMARY KEY,
         objective_id TEXT NOT NULL,
@@ -1753,21 +1791,26 @@ export class AutonomyStore {
     return { globalCount, byType, byComponent };
   }
 
+  private hasTable(tableName: string): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`)
+      .get(tableName) as { present: number } | undefined;
+    return row?.present === 1;
+  }
+
   private getResourceUsageLastHour(nowIso: string): {
     tokenUsage: number;
     runtimeMs: number;
+    activeRuntimeMs: number;
   } {
-    const tokenRows = this.db
+    const tokenRow = this.db
       .prepare(
-        `SELECT token_usage_json
-         FROM autonomy_llm_calls
+        `SELECT SUM(total_tokens) AS total_tokens
+         FROM llm_usage_events
          WHERE datetime(created_at) >= datetime(?, '-1 hour')`,
       )
-      .all(nowIso) as Array<{ token_usage_json: string | null }>;
-    let tokenUsage = 0;
-    for (const row of tokenRows) {
-      tokenUsage += extractTokenUsage(parseJsonObject(row.token_usage_json));
-    }
+      .get(nowIso) as { total_tokens: number | null } | undefined;
+    const tokenUsage = Math.max(0, Math.floor(asNumber(tokenRow?.total_tokens, 0)));
 
     const runtimeRow = this.db
       .prepare(
@@ -1777,9 +1820,35 @@ export class AutonomyStore {
       )
       .get(nowIso) as { runtime_ms: number | null } | undefined;
     const runtimeMs = Math.max(0, Math.floor(asNumber(runtimeRow?.runtime_ms, 0)));
+    let activeRuntimeMs = 0;
+    if (this.hasTable("jobs")) {
+      const activeRuntimeRow = this.db
+        .prepare(
+          `SELECT SUM(
+             MIN(
+               3600000,
+               MAX(
+                 0,
+                 CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt))) * 86400000 AS INTEGER)
+               )
+             )
+           ) AS active_runtime_ms
+           FROM jobs
+           WHERE status = 'claimed'
+             AND COALESCE(startedAt, claimedAt) IS NOT NULL
+             AND lower(COALESCE(
+               json_extract(params, '$.origin'),
+               json_extract(params, '$.autonomy.origin'),
+               ''
+             )) = 'autonomy'`,
+        )
+        .get(nowIso) as { active_runtime_ms: number | null } | undefined;
+      activeRuntimeMs = Math.max(0, Math.floor(asNumber(activeRuntimeRow?.active_runtime_ms, 0)));
+    }
     return {
       tokenUsage: Math.max(0, Math.floor(tokenUsage)),
-      runtimeMs,
+      runtimeMs: runtimeMs + activeRuntimeMs,
+      activeRuntimeMs,
     };
   }
 
@@ -1791,6 +1860,7 @@ export class AutonomyStore {
     runtime_budget_ms_per_hour: number;
     token_budget_exhausted: boolean;
     runtime_budget_exhausted: boolean;
+    active_runtime_ms: number;
   } {
     const usage = this.getResourceUsageLastHour(nowIso);
     const cfg = this.config.remotebuddy.autonomy;
@@ -1802,8 +1872,9 @@ export class AutonomyStore {
       runtime_ms_last_hour: usage.runtimeMs,
       token_budget_per_hour: tokenBudget,
       runtime_budget_ms_per_hour: runtimeBudgetMs,
-      token_budget_exhausted: usage.tokenUsage >= tokenBudget,
-      runtime_budget_exhausted: usage.runtimeMs >= runtimeBudgetMs,
+      token_budget_exhausted: tokenBudget > 0 && usage.tokenUsage >= tokenBudget,
+      runtime_budget_exhausted: runtimeBudgetMs > 0 && usage.runtimeMs >= runtimeBudgetMs,
+      active_runtime_ms: usage.activeRuntimeMs,
     };
   }
 
@@ -1959,28 +2030,51 @@ export class AutonomyStore {
     const alertType = asString(params.alertType);
     const message = truncateText(asString(params.message), 800);
     if (!alertType || !message) return;
-    const recent = this.db
+    const existing = this.db
       .prepare(
-        `SELECT message, created_at
-         FROM autonomy_ops_alerts
-         WHERE alert_type = ?
-         ORDER BY created_at DESC
-         LIMIT 1`,
+        `SELECT status, occurrence_count
+         FROM autonomy_ops_alert_state
+         WHERE alert_type = ?`,
       )
       .get(alertType) as
       | {
-          message: string | null;
-          created_at: string | null;
+          status: string | null;
+          occurrence_count: number | null;
         }
       | undefined;
-    const recentCreatedAt = asString(recent?.created_at);
-    if (recentCreatedAt) {
-      const ageMs = Date.parse(nowIso) - Date.parse(recentCreatedAt);
-      const sameMessage = asString(recent?.message) === message;
-      if (sameMessage && Number.isFinite(ageMs) && ageMs < 600_000) {
-        return;
-      }
+    const detailsJson = JSON.stringify(asObject(params.details));
+    if (asString(existing?.status).toLowerCase() === "open") {
+      this.db
+        .prepare(
+          `UPDATE autonomy_ops_alert_state
+           SET severity = ?,
+               message = ?,
+               details_json = ?,
+               last_seen_at = ?,
+               occurrence_count = occurrence_count + 1
+           WHERE alert_type = ?`,
+        )
+        .run(params.severity, message, detailsJson, nowIso, alertType);
+      return;
     }
+
+    this.db
+      .prepare(
+        `INSERT INTO autonomy_ops_alert_state (
+           alert_type, status, severity, message, details_json,
+           first_seen_at, last_seen_at, resolved_at, occurrence_count
+         ) VALUES (?, 'open', ?, ?, ?, ?, ?, NULL, 1)
+         ON CONFLICT(alert_type) DO UPDATE SET
+           status = 'open',
+           severity = excluded.severity,
+           message = excluded.message,
+           details_json = excluded.details_json,
+           first_seen_at = excluded.first_seen_at,
+           last_seen_at = excluded.last_seen_at,
+           resolved_at = NULL,
+           occurrence_count = 1`,
+      )
+      .run(alertType, params.severity, message, detailsJson, nowIso, nowIso);
     this.db
       .prepare(
         `INSERT INTO autonomy_ops_alerts (
@@ -1992,47 +2086,203 @@ export class AutonomyStore {
         alertType,
         params.severity,
         message,
-        JSON.stringify(asObject(params.details)),
+        detailsJson,
         nowIso,
       );
+  }
+
+  private resolveOpsAlert(alertTypeRaw: string, nowIso = asIsoNow()): void {
+    const alertType = asString(alertTypeRaw);
+    if (!alertType) return;
+    this.db
+      .prepare(
+        `UPDATE autonomy_ops_alert_state
+         SET status = 'resolved',
+             last_seen_at = ?,
+             resolved_at = ?
+         WHERE alert_type = ?
+           AND status = 'open'`,
+      )
+      .run(nowIso, nowIso, alertType);
   }
 
   private listRecentOpsAlerts(limit = 20): AutonomyOpsAlert[] {
     const rows = this.db
       .prepare(
-        `SELECT id, alert_type, severity, message, details_json, created_at
-         FROM autonomy_ops_alerts
-         ORDER BY created_at DESC
+        `SELECT alert_type, status, severity, message, details_json,
+                first_seen_at, last_seen_at, resolved_at, occurrence_count
+         FROM autonomy_ops_alert_state
+         WHERE status = 'open'
+         ORDER BY last_seen_at DESC
          LIMIT ?`,
       )
       .all(Math.max(1, Math.min(200, Math.floor(limit)))) as Array<{
-      id: string | null;
       alert_type: string | null;
+      status: string | null;
       severity: string | null;
       message: string | null;
       details_json: string | null;
-      created_at: string | null;
+      first_seen_at: string | null;
+      last_seen_at: string | null;
+      resolved_at: string | null;
+      occurrence_count: number | null;
     }>;
     return rows.map((row) => {
       const severityRaw = asString(row.severity).toLowerCase();
       const severity: "info" | "warning" | "critical" =
         severityRaw === "critical" ? "critical" : severityRaw === "warning" ? "warning" : "info";
       return {
-        id: asString(row.id),
+        id: `alert_state_${sha256Hex(asString(row.alert_type)).slice(0, 12)}`,
         alertType: asString(row.alert_type) || "generic",
         severity,
         message: asString(row.message),
         details: parseJsonObject(row.details_json),
-        createdAt: asString(row.created_at),
+        createdAt: asString(row.first_seen_at),
+        status: asString(row.status) === "resolved" ? "resolved" : "open",
+        firstSeenAt: asString(row.first_seen_at),
+        lastSeenAt: asString(row.last_seen_at),
+        resolvedAt: asString(row.resolved_at) || null,
+        occurrenceCount: Math.max(1, Math.floor(asNumber(row.occurrence_count, 1))),
       };
     });
+  }
+
+  private getAutonomyJobHealth(
+    nowIso: string,
+    windowHours: number,
+  ): {
+    terminalCount: number;
+    successRate: number | null;
+    timeoutRate: number | null;
+    activeRuntimeMs: number;
+    repeatedFailureCount: number;
+  } {
+    if (!this.hasTable("jobs")) {
+      return {
+        terminalCount: 0,
+        successRate: null,
+        timeoutRate: null,
+        activeRuntimeMs: 0,
+        repeatedFailureCount: 0,
+      };
+    }
+    const health = this.db
+      .prepare(
+        `SELECT
+           COUNT(*) AS terminal_count,
+           SUM(CASE WHEN j.status = 'completed' THEN 1 ELSE 0 END) AS success_count,
+           SUM(
+             CASE
+               WHEN lower(COALESCE(d.failureClass, '')) LIKE '%timeout%'
+                 OR lower(COALESCE(d.failureClass, '')) LIKE '%watchdog%'
+                 OR lower(COALESCE(d.summary, j.error, '')) LIKE '%timed out%'
+                 OR lower(COALESCE(d.summary, j.error, '')) LIKE '%timeout%'
+               THEN 1
+               ELSE 0
+             END
+           ) AS timeout_count
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.kind = 'task.execute'
+           AND j.status IN ('completed', 'failed', 'abandoned', 'publish_blocked')
+           AND datetime(COALESCE(
+                 j.completedAt,
+                 j.failedAt,
+                 j.publishBlockedAt,
+                 j.abandonedAt,
+                 j.updatedAt
+               )) >= datetime(?, '-${Math.max(1, windowHours)} hours')
+           AND lower(COALESCE(
+             json_extract(j.params, '$.origin'),
+             json_extract(j.params, '$.autonomy.origin'),
+             ''
+           )) = 'autonomy'`,
+      )
+      .get(nowIso) as
+      | {
+          terminal_count: number | null;
+          success_count: number | null;
+          timeout_count: number | null;
+        }
+      | undefined;
+    const terminalCount = Math.max(0, Math.floor(asNumber(health?.terminal_count, 0)));
+    const successCount = Math.max(0, Math.floor(asNumber(health?.success_count, 0)));
+    const timeoutCount = Math.max(0, Math.floor(asNumber(health?.timeout_count, 0)));
+    const resourceUsage = this.getResourceUsageLastHour(nowIso);
+
+    let repeatedFailureCount = 0;
+    if (this.hasTable("job_validation_runs") && this.hasTable("job_terminal_diagnostics")) {
+      const repeatedRows = this.db
+        .prepare(
+          `SELECT
+             j.params,
+             lower(COALESCE(v.failureClass, d.failureClass, 'unknown')) AS failure_class,
+             lower(trim(COALESCE(v.command, ''))) AS failed_command,
+             v.stdoutTail AS stdout_tail,
+             v.stderrTail AS stderr_tail,
+             d.summary
+           FROM jobs j
+           LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+           LEFT JOIN job_validation_runs v
+             ON v.id = (
+               SELECT latest.id
+               FROM job_validation_runs latest
+               WHERE latest.jobId = j.id AND latest.passed = 0
+               ORDER BY latest.id DESC
+               LIMIT 1
+             )
+           WHERE j.kind = 'task.execute'
+             AND j.status IN ('failed', 'abandoned', 'publish_blocked')
+             AND datetime(COALESCE(j.failedAt, j.publishBlockedAt, j.abandonedAt, j.updatedAt))
+                 >= datetime(?, '-${Math.max(1, windowHours)} hours')
+             AND lower(COALESCE(
+               json_extract(j.params, '$.origin'),
+               json_extract(j.params, '$.autonomy.origin'),
+               ''
+             )) = 'autonomy'
+           ORDER BY COALESCE(j.failedAt, j.publishBlockedAt, j.abandonedAt, j.updatedAt) DESC
+           LIMIT 500`,
+        )
+        .all(nowIso) as Array<{
+        params: string | null;
+        failure_class: string | null;
+        failed_command: string | null;
+        stdout_tail: string | null;
+        stderr_tail: string | null;
+        summary: string | null;
+      }>;
+      const fingerprintCounts = new Map<string, number>();
+      for (const row of repeatedRows) {
+        const targets = normalizedAutonomyFailureTargets(parseJsonObject(row.params));
+        if (targets.length === 0) continue;
+        const fingerprint = sha256Hex(
+          JSON.stringify({
+            targets,
+            failureClass: asString(row.failure_class).toLowerCase() || "unknown",
+            command: asString(row.failed_command).replace(/\s+/g, " ").toLowerCase(),
+            failedTests: failedTestNamesFromOutput(row.stdout_tail, row.stderr_tail, row.summary),
+          }),
+        ).slice(0, 24);
+        const count = (fingerprintCounts.get(fingerprint) ?? 0) + 1;
+        fingerprintCounts.set(fingerprint, count);
+        repeatedFailureCount = Math.max(repeatedFailureCount, count);
+      }
+    }
+
+    return {
+      terminalCount,
+      successRate: terminalCount > 0 ? clamp01(successCount / terminalCount) : null,
+      timeoutRate: terminalCount > 0 ? clamp01(timeoutCount / terminalCount) : null,
+      activeRuntimeMs: resourceUsage.activeRuntimeMs,
+      repeatedFailureCount,
+    };
   }
 
   private latestEvaluatorScorecard(): AutonomyEvaluatorScorecard | null {
     const row = this.db
       .prepare(
         `SELECT id, window_hours, sample_count, success_rate, regret_rate, avg_latency_ms, dispatch_count,
-                recommendation, created_at
+                recommendation, payload_json, created_at
          FROM autonomy_evaluator_scorecards
          ORDER BY created_at DESC
          LIMIT 1`,
@@ -2047,6 +2297,7 @@ export class AutonomyStore {
           avg_latency_ms: number | null;
           dispatch_count: number;
           recommendation: string;
+          payload_json: string | null;
           created_at: string;
         }
       | undefined;
@@ -2058,6 +2309,7 @@ export class AutonomyStore {
         : recommendationRaw === "constrain"
           ? "constrain"
           : "healthy";
+    const payload = parseJsonObject(row.payload_json);
     return {
       id: asString(row.id),
       windowHours: Math.max(1, Math.floor(asNumber(row.window_hours, 24))),
@@ -2072,6 +2324,17 @@ export class AutonomyStore {
         ? Math.max(0, Math.floor(asNumber(row.avg_latency_ms, 0)))
         : null,
       dispatchCount: Math.max(0, Math.floor(asNumber(row.dispatch_count, 0))),
+      jobTerminalCount: Math.max(0, Math.floor(asNumber(payload.jobTerminalCount, 0))),
+      jobSuccessRate: Number.isFinite(asNumber(payload.jobSuccessRate, Number.NaN))
+        ? clamp01(asNumber(payload.jobSuccessRate, 0))
+        : null,
+      jobTimeoutRate: Number.isFinite(asNumber(payload.jobTimeoutRate, Number.NaN))
+        ? clamp01(asNumber(payload.jobTimeoutRate, 0))
+        : null,
+      activeRuntimeMs: Math.max(0, Math.floor(asNumber(payload.activeRuntimeMs, 0))),
+      repeatedFailureCount: Math.max(0, Math.floor(asNumber(payload.repeatedFailureCount, 0))),
+      tokenBudgetExhausted: asBoolean(payload.tokenBudgetExhausted, false),
+      runtimeBudgetExhausted: asBoolean(payload.runtimeBudgetExhausted, false),
       recommendation,
       createdAt: asString(row.created_at),
     };
@@ -2083,7 +2346,7 @@ export class AutonomyStore {
     const rows = this.db
       .prepare(
         `WITH windowed AS (
-           SELECT id, success, latency_ms, reopened_within_24h, regression_flag,
+           SELECT id, success, latency_ms, reopened_within_24h, regression_flag, created_at,
                   CASE
                     WHEN NULLIF(objective_id, '') IS NOT NULL THEN 'objective:' || objective_id
                     WHEN NULLIF(job_id, '') IS NOT NULL THEN 'job:' || job_id
@@ -2093,15 +2356,18 @@ export class AutonomyStore {
            FROM autonomy_outcomes
            WHERE datetime(created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')
          ),
-         latest_ids AS (
-           SELECT sample_key, MAX(id) AS latest_id
+         ranked AS (
+           SELECT windowed.*,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY sample_key
+                    ORDER BY datetime(created_at) DESC, id DESC
+                  ) AS recency_rank
            FROM windowed
-           GROUP BY sample_key
          ),
          latest AS (
-           SELECT w.*
-           FROM windowed w
-           INNER JOIN latest_ids l ON l.latest_id = w.id
+           SELECT *
+           FROM ranked
+           WHERE recency_rank = 1
          )
          SELECT (SELECT COUNT(*) FROM windowed) AS raw_sample_count,
                 COUNT(*) AS sample_count,
@@ -2140,18 +2406,38 @@ export class AutonomyStore {
     const minSuccessRate = clamp01(asNumber(cfg.evaluatorMinSuccessRate, 0.45));
     const maxRegretRate = clamp01(asNumber(cfg.evaluatorMaxRegretRate, 0.35));
     const rawSampleCount = Math.max(0, Math.floor(asNumber(rows?.raw_sample_count, sampleCount)));
+    const jobHealth = this.getAutonomyJobHealth(nowIso, windowHours);
+    const resourceBudget = this.resourceBudgetSnapshot(nowIso);
+    const hasOutcomeEvidence = sampleCount >= minSamples;
+    const hasJobEvidence = jobHealth.terminalCount >= minSamples;
 
     let recommendation: "healthy" | "constrain" | "pause" = "healthy";
-    if (sampleCount < minSamples) {
+    if (resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted) {
+      recommendation = "pause";
+    } else if (!hasOutcomeEvidence && !hasJobEvidence) {
       recommendation = "constrain";
     } else if (
-      (typeof successRate === "number" && successRate < minSuccessRate) ||
-      (typeof regretRate === "number" && regretRate > maxRegretRate)
+      (hasOutcomeEvidence &&
+        ((typeof successRate === "number" && successRate < minSuccessRate) ||
+          (typeof regretRate === "number" && regretRate > maxRegretRate))) ||
+      (hasJobEvidence &&
+        ((typeof jobHealth.successRate === "number" && jobHealth.successRate < 0.6) ||
+          (typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.35) ||
+          (typeof jobHealth.successRate === "number" &&
+            typeof jobHealth.timeoutRate === "number" &&
+            jobHealth.successRate < 0.8 &&
+            jobHealth.timeoutRate >= 0.2)))
     ) {
       recommendation = "pause";
     } else if (
-      (typeof successRate === "number" && successRate < Math.min(1, minSuccessRate + 0.08)) ||
-      (typeof regretRate === "number" && regretRate > maxRegretRate * 0.8)
+      (hasOutcomeEvidence &&
+        ((typeof successRate === "number" &&
+          successRate < Math.min(1, Math.max(0.8, minSuccessRate + 0.08))) ||
+          (typeof regretRate === "number" && regretRate > maxRegretRate * 0.8))) ||
+      (hasJobEvidence &&
+        ((typeof jobHealth.successRate === "number" && jobHealth.successRate < 0.8) ||
+          (typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.2))) ||
+      jobHealth.repeatedFailureCount >= 2
     ) {
       recommendation = "constrain";
     }
@@ -2166,6 +2452,13 @@ export class AutonomyStore {
       regretRate,
       avgLatencyMs,
       dispatchCount,
+      jobTerminalCount: jobHealth.terminalCount,
+      jobSuccessRate: jobHealth.successRate,
+      jobTimeoutRate: jobHealth.timeoutRate,
+      activeRuntimeMs: jobHealth.activeRuntimeMs,
+      repeatedFailureCount: jobHealth.repeatedFailureCount,
+      tokenBudgetExhausted: resourceBudget.token_budget_exhausted,
+      runtimeBudgetExhausted: resourceBudget.runtime_budget_exhausted,
     };
     const id = `eval_${randomUUID().slice(0, 8)}`;
     this.db
@@ -2188,13 +2481,20 @@ export class AutonomyStore {
         nowIso,
       );
 
-    if (recommendation === "pause" && sampleCount >= minSamples) {
+    if (
+      recommendation === "pause" &&
+      (hasOutcomeEvidence ||
+        hasJobEvidence ||
+        resourceBudget.token_budget_exhausted ||
+        resourceBudget.runtime_budget_exhausted)
+    ) {
       this.recordOpsAlert({
         alertType: "evaluator_pause",
         severity: "critical",
         message:
           `Evaluator recommends pause: successRate=${successRate?.toFixed(2) ?? "n/a"} ` +
-          `regretRate=${regretRate?.toFixed(2) ?? "n/a"} samples=${sampleCount}`,
+          `regretRate=${regretRate?.toFixed(2) ?? "n/a"} jobSuccessRate=${jobHealth.successRate?.toFixed(2) ?? "n/a"} ` +
+          `jobTimeoutRate=${jobHealth.timeoutRate?.toFixed(2) ?? "n/a"} samples=${sampleCount}/${jobHealth.terminalCount}`,
         details: payload,
         nowIso,
       });
@@ -2205,16 +2505,22 @@ export class AutonomyStore {
           freezeReason: "auto_freeze:evaluator_pause",
         });
       }
-    } else if (recommendation === "constrain" && sampleCount >= minSamples) {
+      this.resolveOpsAlert("evaluator_constrain", nowIso);
+    } else if (recommendation === "constrain" && (hasOutcomeEvidence || hasJobEvidence)) {
       this.recordOpsAlert({
         alertType: "evaluator_constrain",
         severity: "warning",
         message:
           `Evaluator recommends constrain: successRate=${successRate?.toFixed(2) ?? "n/a"} ` +
-          `regretRate=${regretRate?.toFixed(2) ?? "n/a"} samples=${sampleCount}`,
+          `regretRate=${regretRate?.toFixed(2) ?? "n/a"} jobSuccessRate=${jobHealth.successRate?.toFixed(2) ?? "n/a"} ` +
+          `jobTimeoutRate=${jobHealth.timeoutRate?.toFixed(2) ?? "n/a"} samples=${sampleCount}/${jobHealth.terminalCount}`,
         details: payload,
         nowIso,
       });
+      this.resolveOpsAlert("evaluator_pause", nowIso);
+    } else {
+      this.resolveOpsAlert("evaluator_pause", nowIso);
+      this.resolveOpsAlert("evaluator_constrain", nowIso);
     }
     if (recommendation !== "pause") {
       const safety = this.getSafetyState(nowIso);
@@ -2231,6 +2537,13 @@ export class AutonomyStore {
       regretRate,
       avgLatencyMs,
       dispatchCount,
+      jobTerminalCount: jobHealth.terminalCount,
+      jobSuccessRate: jobHealth.successRate,
+      jobTimeoutRate: jobHealth.timeoutRate,
+      activeRuntimeMs: jobHealth.activeRuntimeMs,
+      repeatedFailureCount: jobHealth.repeatedFailureCount,
+      tokenBudgetExhausted: resourceBudget.token_budget_exhausted,
+      runtimeBudgetExhausted: resourceBudget.runtime_budget_exhausted,
       recommendation,
       createdAt: nowIso,
     };
@@ -2376,7 +2689,7 @@ export class AutonomyStore {
       1,
       Math.floor(asNumber(this.config.remotebuddy.autonomy.alertQueuePendingThreshold, 20)),
     );
-    if (requestPending >= queuePendingThreshold) {
+    if (params?.requestPending !== undefined && requestPending >= queuePendingThreshold) {
       this.recordOpsAlert({
         alertType: "request_queue_pending_high",
         severity: requestPending >= queuePendingThreshold * 2 ? "critical" : "warning",
@@ -2384,13 +2697,19 @@ export class AutonomyStore {
         details: { requestPending, queuePendingThreshold },
         nowIso: now,
       });
+    } else if (params?.requestPending !== undefined) {
+      this.resolveOpsAlert("request_queue_pending_high", now);
     }
 
     const jobFailureRate = clamp01(asNumber(params?.jobFailureRate, 0));
     const failureThreshold = clamp01(
       asNumber(this.config.remotebuddy.autonomy.alertJobFailureRateThreshold, 0.3),
     );
-    if (jobFailureRate >= failureThreshold && failureThreshold > 0) {
+    if (
+      params?.jobFailureRate !== undefined &&
+      jobFailureRate >= failureThreshold &&
+      failureThreshold > 0
+    ) {
       this.recordOpsAlert({
         alertType: "job_failure_rate_high",
         severity: jobFailureRate >= failureThreshold * 1.4 ? "critical" : "warning",
@@ -2400,6 +2719,8 @@ export class AutonomyStore {
         details: { jobFailureRate, threshold: failureThreshold },
         nowIso: now,
       });
+    } else if (params?.jobFailureRate !== undefined) {
+      this.resolveOpsAlert("job_failure_rate_high", now);
     }
 
     const resourceBudget = this.resourceBudgetSnapshot(now);
@@ -2413,6 +2734,8 @@ export class AutonomyStore {
         details: resourceBudget,
         nowIso: now,
       });
+    } else {
+      this.resolveOpsAlert("resource_budget_token_exhausted", now);
     }
     if (resourceBudget.runtime_budget_exhausted) {
       this.recordOpsAlert({
@@ -2424,6 +2747,8 @@ export class AutonomyStore {
         details: resourceBudget,
         nowIso: now,
       });
+    } else {
+      this.resolveOpsAlert("resource_budget_runtime_exhausted", now);
     }
 
     const recentAlerts = this.listRecentOpsAlerts(params?.alertLimit ?? 16);

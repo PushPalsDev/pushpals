@@ -64,3 +64,21 @@ export function buildReviewPublicationPushArgs(args: {
     `${args.commitSha}:refs/heads/${args.lease.targetBranch}`,
   ];
 }
+
+export function buildReviewCompletionValidationCheckoutArgs(
+  tempBranch: string,
+  commitSha: string,
+): string[] {
+  return ["checkout", "-B", tempBranch, commitSha];
+}
+
+export function reviewCompletionHandoffMatches(
+  resolvedSha: string | null | undefined,
+  expectedSha: string,
+): boolean {
+  return normalizeSha(String(resolvedSha ?? "")) === normalizeSha(expectedSha);
+}
+
+export function shouldCleanupCompletionHandoff(processedConfirmed: boolean): boolean {
+  return processedConfirmed;
+}

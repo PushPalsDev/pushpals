@@ -13,6 +13,7 @@ import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import {
   buildCliClearTargets,
+  buildEmbeddedRuntimeCrashEnvelope,
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenConfigCommand,
@@ -310,6 +311,32 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
   });
 
+  test("builds a structured Bun crash envelope with runtime and recovery context", () => {
+    const envelope = buildEmbeddedRuntimeCrashEnvelope({
+      service: "remotebuddy",
+      logText: [
+        "Bun v1.3.14 (Windows x64)",
+        "requestId=req-1234 jobId=job-5678",
+        "RSS: 0.26 GB",
+        "oh no: Bun has crashed",
+        "https://bun.report/1.3.14/abc123",
+      ].join("\n"),
+      uptimeMs: 83 * 60_000,
+      exitCode: -1073741819,
+      rssBytes: 310_000_000,
+      recoveryPlanned: true,
+      observedAt: "2026-07-26T12:00:00.000Z",
+    });
+
+    expect(envelope.runtimeVersion).toBe("1.3.14");
+    expect(envelope.uptimeMs).toBe(4_980_000);
+    expect(envelope.requestId).toBe("req-1234");
+    expect(envelope.jobId).toBe("job-5678");
+    expect(envelope.memory.rssBytes).toBe(310_000_000);
+    expect(envelope.crashReport).toBe("https://bun.report/1.3.14/abc123");
+    expect(envelope.recoveryOutcome).toBe("restart_planned");
+  });
+
   test("ServiceManager reports degraded runtime health after restart exhaustion", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-supervisor-degraded-"));
     try {
@@ -319,6 +346,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       writeFileSync(serviceLogPath, "", "utf8");
 
       let spawnCalls = 0;
+      const lifecycleEvents: Array<{ type: string }> = [];
       const supervisor = new ServiceManager({
         pollMs: 50,
         maxRestartAttempts: 1,
@@ -347,6 +375,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
             appendFileSync(runtimeServicesLogPath, `${line}\n`, "utf8");
           }
         },
+        onLifecycleEvent: (event) => lifecycleEvents.push(event),
       });
       supervisor.startService({
         name: "source_control_manager",
@@ -365,6 +394,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         expect(health?.detail).toContain("source_control_manager");
         expect(health?.detail).toContain("reached restart limit");
         expect(health?.action).toContain("Inspect the embedded service log");
+        expect(lifecycleEvents.filter((event) => event.type === "exit")).toHaveLength(2);
+        expect(lifecycleEvents.filter((event) => event.type === "recovery_exhausted")).toHaveLength(
+          1,
+        );
         const logText = readFileSync(runtimeServicesLogPath, "utf8");
         expect(logText).toContain("[pushpals] embeddedRuntime=degraded detail=");
       } finally {
@@ -424,6 +457,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
   test("ServiceManager keeps supervising when a restart spawn is transiently blocked", async () => {
     let spawnCalls = 0;
     const events: string[] = [];
+    const lifecycleEvents: Array<{ type: string }> = [];
     const supervisor = new ServiceManager({
       pollMs: 25,
       maxRestartAttempts: 2,
@@ -447,6 +481,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         };
       },
       onEvent: (_level, line) => events.push(line),
+      onLifecycleEvent: (event) => lifecycleEvents.push(event),
     });
     supervisor.startService({
       name: "remotebuddy",
@@ -461,6 +496,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(supervisor.getService("remotebuddy")?.exited).toBe(false);
       expect(events.some((line) => line.includes("could not launch"))).toBe(true);
       expect(events.some((line) => line.includes("Restarted managed remotebuddy"))).toBe(true);
+      expect(lifecycleEvents.filter((event) => event.type === "exit")).toHaveLength(1);
+      expect(lifecycleEvents.filter((event) => event.type === "restarted")).toHaveLength(1);
     } finally {
       supervisor.stop();
     }

@@ -10,7 +10,13 @@ import { createSourceControlApi, runGitCommandCapture, type SourceControlApi } f
 import { ensureIntegrationPullRequest } from "./github_pr";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
-import { buildReviewPublicationPushArgs, parseReviewPublicationLease } from "./review_publication";
+import {
+  buildReviewCompletionValidationCheckoutArgs,
+  buildReviewPublicationPushArgs,
+  parseReviewPublicationLease,
+  reviewCompletionHandoffMatches,
+  shouldCleanupCompletionHandoff,
+} from "./review_publication";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
 import {
@@ -573,6 +579,8 @@ async function tick(): Promise<void> {
 
     // ── Process completion ─────────────────────────────────────────────
     let tempBranch = "";
+    let cleanupCompletionHandoff = false;
+    let cleanupRemoteReviewHandoff = false;
     try {
       let processedPrUrl: string | null =
         typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
@@ -582,31 +590,45 @@ async function tick(): Promise<void> {
       console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();
       if (reviewPublicationLease) {
-        const fetchCompletionRef = await runGitCapture(
-          [
-            "-C",
-            runtimeConfig.repoPath,
-            "fetch",
-            runtimeConfig.remote,
-            `+${completion.branch}:${completion.branch}`,
-          ],
-          repoRoot,
-        );
-        if (!fetchCompletionRef.ok) {
-          throw new Error(
-            `Failed to fetch merge-conflict completion ref ${completion.branch}: ${fetchCompletionRef.stderr || fetchCompletionRef.stdout}`,
-          );
-        }
-        const fetchedCompletionSha = await runGitCapture(
-          ["-C", runtimeConfig.repoPath, "rev-parse", completion.branch],
+        let resolvedCompletionSha = await runGitCapture(
+          ["-C", runtimeConfig.repoPath, "rev-parse", "--verify", completion.branch],
           repoRoot,
         );
         if (
-          !fetchedCompletionSha.ok ||
-          fetchedCompletionSha.stdout.trim().toLowerCase() !== completion.commitSha.toLowerCase()
+          !resolvedCompletionSha.ok ||
+          !reviewCompletionHandoffMatches(resolvedCompletionSha.stdout, completion.commitSha)
+        ) {
+          const fetchCompletionRef = await runGitCapture(
+            [
+              "-C",
+              runtimeConfig.repoPath,
+              "fetch",
+              runtimeConfig.remote,
+              `+${completion.branch}:${completion.branch}`,
+            ],
+            repoRoot,
+          );
+          if (!fetchCompletionRef.ok) {
+            throw new Error(
+              `Review completion ${completion.branch} was not available in the shared host repository and remote compatibility fetch failed: ${fetchCompletionRef.stderr || fetchCompletionRef.stdout}`,
+            );
+          }
+          cleanupRemoteReviewHandoff = true;
+          resolvedCompletionSha = await runGitCapture(
+            ["-C", runtimeConfig.repoPath, "rev-parse", "--verify", completion.branch],
+            repoRoot,
+          );
+        } else {
+          console.log(
+            `[${ts()}] Using immutable review completion ${completion.branch} from the shared host repository; no worker-side remote handoff was required.`,
+          );
+        }
+        if (
+          !resolvedCompletionSha.ok ||
+          !reviewCompletionHandoffMatches(resolvedCompletionSha.stdout, completion.commitSha)
         ) {
           throw new Error(
-            `Merge-conflict completion ref ${completion.branch} did not resolve to expected commit ${completion.commitSha}.`,
+            `Review completion ref ${completion.branch} did not resolve to expected commit ${completion.commitSha}.`,
           );
         }
       }
@@ -622,8 +644,21 @@ async function tick(): Promise<void> {
       await gitOps.createTempBranch(tempBranch);
       let skipLocalApplyDueConflict = false;
 
-      const applyResult =
-        runtimeConfig.mergeStrategy === "cherry-pick"
+      const applyResult = reviewPublicationLease
+        ? await (async () => {
+            console.log(
+              `[${ts()}] Checking out exact reviewed completion ${completion.commitSha.slice(0, 8)} on ${tempBranch} for validation...`,
+            );
+            return runGitCapture(
+              [
+                "-C",
+                runtimeConfig.repoPath,
+                ...buildReviewCompletionValidationCheckoutArgs(tempBranch, completion.commitSha),
+              ],
+              repoRoot,
+            );
+          })()
+        : runtimeConfig.mergeStrategy === "cherry-pick"
           ? await (async () => {
               console.log(
                 `[${ts()}] Cherry-picking ${completion.commitSha.slice(0, 8)} onto ${tempBranch}...`,
@@ -712,7 +747,7 @@ async function tick(): Promise<void> {
           ? { headBranch: reviewPublicationLease.targetBranch, requiresMaterialize: false }
           : deriveReviewPrHeadBranch(completion.branch, completion.id);
         let prHeadBranch = resolvedHead.headBranch;
-        if (reviewPublicationLease) {
+        if (reviewPublicationLease && cleanupRemoteReviewHandoff) {
           const prBaseBranch =
             reviewPublicationLease.baseBranch ??
             (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
@@ -729,12 +764,12 @@ async function tick(): Promise<void> {
             const actualBaseSha = remoteBase.ok ? remoteBase.stdout.trim().toLowerCase() : "";
             if (actualBaseSha !== reviewPublicationLease.expectedBaseSha) {
               throw new Error(
-                `Review base ${prBaseBranch} moved from expected ${reviewPublicationLease.expectedBaseSha.slice(0, 8)} to ${actualBaseSha.slice(0, 8) || "unknown"}; refusing stale merge-conflict publication.`,
+                `Review base ${prBaseBranch} moved from expected ${reviewPublicationLease.expectedBaseSha.slice(0, 8)} to ${actualBaseSha.slice(0, 8) || "unknown"}; refusing stale review publication.`,
               );
             }
           }
           console.log(
-            `[${ts()}] Publishing resolved merge-conflict commit ${completion.commitSha.slice(0, 8)} to ${prHeadBranch} with an exact force-with-lease.`,
+            `[${ts()}] Publishing reviewed completion ${completion.commitSha.slice(0, 8)} to ${prHeadBranch} with an exact force-with-lease.`,
           );
           const pushResult = await runGitCapture(
             [
@@ -902,6 +937,7 @@ async function tick(): Promise<void> {
         console.error(`[${ts()}] Failed to mark completion processed: ${markResponse.status}`);
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
+        cleanupCompletionHandoff = true;
         const pushMessage = runtimeConfig.reviewAgent.enabled
           ? skipLocalApplyDueConflict
             ? `Local apply/checks were bypassed for ${completion.commitSha.slice(0, 8)} due cherry-pick conflict; individual PR flow continued for ReviewAgent.`
@@ -947,7 +983,7 @@ async function tick(): Promise<void> {
           `[${ts()}] Failed to delete temp branch ${tempBranch} during final cleanup: ${err?.message ?? err}`,
         );
       }
-      if (cleanupHiddenCompletionRef) {
+      if (cleanupHiddenCompletionRef && shouldCleanupCompletionHandoff(cleanupCompletionHandoff)) {
         if (reviewPublicationLease) {
           try {
             const deleteRemoteCompletionRef = await runGitCapture(
@@ -956,12 +992,12 @@ async function tick(): Promise<void> {
             );
             if (!deleteRemoteCompletionRef.ok) {
               console.warn(
-                `[${ts()}] Failed to clean remote merge-conflict completion ref ${completion.branch}: ${deleteRemoteCompletionRef.stderr || deleteRemoteCompletionRef.stdout}`,
+                `[${ts()}] Failed to clean remote review completion ref ${completion.branch}: ${deleteRemoteCompletionRef.stderr || deleteRemoteCompletionRef.stdout}`,
               );
             }
           } catch (err: any) {
             console.warn(
-              `[${ts()}] Failed to clean remote merge-conflict completion ref ${completion.branch}: ${err?.message ?? err}`,
+              `[${ts()}] Failed to clean remote review completion ref ${completion.branch}: ${err?.message ?? err}`,
             );
           }
         }
@@ -972,6 +1008,10 @@ async function tick(): Promise<void> {
             `[${ts()}] Failed to clean local completion ref ${completion.branch}: ${err?.message ?? err}`,
           );
         }
+      } else if (cleanupHiddenCompletionRef) {
+        console.warn(
+          `[${ts()}] Retaining completion handoff ${completion.branch} because publication did not reach a confirmed processed state.`,
+        );
       }
     }
   } catch (err: any) {

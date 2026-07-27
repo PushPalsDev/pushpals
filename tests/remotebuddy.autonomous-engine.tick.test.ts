@@ -2,7 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { RemoteBuddyAutonomousEngine } from "../apps/remotebuddy/src/autonomous_engine";
+import {
+  autonomyIntegrationBaselineDecision,
+  RemoteBuddyAutonomousEngine,
+} from "../apps/remotebuddy/src/autonomous_engine";
 
 type FetchCall = {
   url: string;
@@ -13,6 +16,23 @@ type FetchCall = {
 const tempDirs: string[] = [];
 let originalFetch: typeof globalThis.fetch;
 let originalSpawn: typeof Bun.spawn;
+
+describe("autonomy integration baseline", () => {
+  test("keeps integration context when it contains main and pauses on true divergence", () => {
+    expect(
+      autonomyIntegrationBaselineDecision({
+        fastForwardSucceeded: false,
+        integrationContainsBase: true,
+      }),
+    ).toBe("use_integration_head");
+    expect(
+      autonomyIntegrationBaselineDecision({
+        fastForwardSucceeded: false,
+        integrationContainsBase: false,
+      }),
+    ).toBe("pause_for_scm");
+  });
+});
 
 function jsonResponse(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -205,7 +225,7 @@ afterEach(() => {
 });
 
 describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
-  test("structured autonomy enqueue throttles set dispatch backoff", async () => {
+  test("similar-failure enqueue suppression cools only the failed target cluster", async () => {
     originalFetch = globalThis.fetch;
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-backoff-"));
     tempDirs.push(root);
@@ -218,9 +238,10 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       });
       return jsonResponse(429, {
         ok: false,
-        code: "autonomy_similar_no_publishable_suppressed",
-        message: "similar no-publishable failures",
+        code: "autonomy_similar_failure_suppressed",
+        message: "unchanged target-and-failure fingerprint",
         retryAfterMs: 120_000,
+        targetPathSample: ["src/example.ts"],
       });
     }) as typeof fetch;
 
@@ -246,10 +267,12 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
 
     expect(requestId).toBeNull();
     expect(calls).toHaveLength(1);
-    expect((engine as any).dispatchBackoffUntilMs).toBeGreaterThan(Date.now() + 60_000);
-    expect((engine as any).dispatchBackoffReason).toBe(
-      "autonomy_similar_no_publishable_suppressed",
+    expect((engine as any).dispatchBackoffUntilMs).toBe(0);
+    expect((engine as any).dispatchBackoffReason).toBe("");
+    expect((engine as any).suppressedFailureTargetReason(["src/example.ts"])).toContain(
+      "similar_failure_cluster_cooldown",
     );
+    expect((engine as any).suppressedFailureTargetReason(["src/other.ts"])).toBeNull();
   });
 
   test("tick auto-ingests inspiration and dispatches an objective end-to-end", async () => {

@@ -4616,6 +4616,9 @@ function uniqueWorkPaths(paths) {
   }
   return out;
 }
+function workPathsOverlap(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
 function workScopePaths(scope) {
   const record = asObject(scope);
   return [
@@ -7003,6 +7006,11 @@ async function repoPreflight(repo) {
     isMergeInProgress: Boolean(mergeHead)
   };
 }
+function autonomyIntegrationBaselineDecision(options) {
+  if (options.fastForwardSucceeded)
+    return "synced";
+  return options.integrationContainsBase ? "use_integration_head" : "pause_for_scm";
+}
 
 class RemoteBuddyAutonomousEngine {
   server;
@@ -7035,6 +7043,7 @@ class RemoteBuddyAutonomousEngine {
   lastCompletedAtMs = 0;
   dispatchBackoffUntilMs = 0;
   dispatchBackoffReason = "";
+  suppressedFailureTargets = new Map;
   pendingIdeationTimeoutRecovery = null;
   constructor(opts) {
     this.server = opts.server;
@@ -7285,12 +7294,22 @@ class RemoteBuddyAutonomousEngine {
     }
     const mergeMain = await this.runGit(this.autonomyRepo, ["merge", "--ff-only", baseRef]);
     if (!mergeMain.ok) {
-      const resetBase = await this.runGit(this.autonomyRepo, ["reset", "--hard", baseRef]);
-      if (!resetBase.ok) {
-        console.error(`[RemoteBuddyAutonomousEngine] tick ${runId}: failed to sync autonomy worktree with ${baseRef}: ${mergeMain.stderr || mergeMain.stdout || `merge exit ${mergeMain.exitCode}`}; reset failed: ${resetBase.stderr || resetBase.stdout || `exit ${resetBase.exitCode}`}`);
-        return false;
+      const integrationContainsBase = await this.runGit(this.autonomyRepo, [
+        "merge-base",
+        "--is-ancestor",
+        baseRef,
+        integrationRef
+      ]);
+      const baselineDecision = autonomyIntegrationBaselineDecision({
+        fastForwardSucceeded: false,
+        integrationContainsBase: integrationContainsBase.ok
+      });
+      if (baselineDecision === "use_integration_head") {
+        console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: ${integrationRef} already contains ${baseRef}; using the integration head as the planning baseline.`);
+        return true;
       }
-      console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: ff-only merge ${baseRef} into ${integrationRef} was not possible; reset autonomy worktree to ${baseRef}.`);
+      console.error(`[RemoteBuddyAutonomousEngine] tick ${runId}: paused autonomy dispatch because ${integrationRef} and ${baseRef} have diverged and cannot be fast-forwarded. SourceControlManager must reconcile the branches before planning resumes. ${mergeMain.stderr || mergeMain.stdout || `merge exit ${mergeMain.exitCode}`}`);
+      return false;
     }
     return true;
   }
@@ -7558,6 +7577,28 @@ ${JSON.stringify(input.messages ?? [])}`),
       }
     };
   }
+  rememberSuppressedFailureTargets(targetPaths, retryAfterMs) {
+    const untilMs = Date.now() + retryAfterMs;
+    for (const targetPath of uniqueWorkPaths(asStringArray2(targetPaths))) {
+      this.suppressedFailureTargets.set(targetPath, Math.max(untilMs, this.suppressedFailureTargets.get(targetPath) ?? 0));
+    }
+  }
+  suppressedFailureTargetReason(targetPaths) {
+    const nowMs = Date.now();
+    for (const [targetPath, untilMs] of this.suppressedFailureTargets) {
+      if (untilMs <= nowMs)
+        this.suppressedFailureTargets.delete(targetPath);
+    }
+    const normalizedTargets = uniqueWorkPaths(targetPaths);
+    for (const candidateTarget of normalizedTargets) {
+      for (const [suppressedTarget, untilMs] of this.suppressedFailureTargets) {
+        if (untilMs > nowMs && workPathsOverlap(candidateTarget, suppressedTarget)) {
+          return `similar_failure_cluster_cooldown:${suppressedTarget}`;
+        }
+      }
+    }
+    return null;
+  }
   async enqueueSyntheticRequest(instruction, autonomy) {
     if (!this.runtimeEnabled)
       return null;
@@ -7596,9 +7637,14 @@ ${JSON.stringify(input.messages ?? [])}`),
         errorPayload = {};
       }
       const code = String(errorPayload.code ?? "").trim();
+      const retryAfterMsRaw = Number(errorPayload.retryAfterMs ?? 0);
+      const retryAfterMs = Number.isFinite(retryAfterMsRaw) ? Math.max(60000, Math.min(60 * 60 * 1000, Math.floor(retryAfterMsRaw))) : 30 * 60 * 1000;
+      if (res.status === 429 && code === "autonomy_similar_failure_suppressed") {
+        this.rememberSuppressedFailureTargets(Array.isArray(errorPayload.targetPathSample) ? errorPayload.targetPathSample : autonomy.targetPaths, retryAfterMs);
+        console.warn(`[RemoteBuddyAutonomousEngine] Suppressing failed target cluster for ${retryAfterMs}ms and continuing future selection on other components.`);
+        return null;
+      }
       if (res.status === 429 && (code === "autonomy_worker_failure_circuit_open" || code === "autonomy_similar_no_publishable_suppressed" || code === "autonomy_queue_backpressure" || code === "autonomy_open_pr_limit")) {
-        const retryAfterMsRaw = Number(errorPayload.retryAfterMs ?? 0);
-        const retryAfterMs = Number.isFinite(retryAfterMsRaw) ? Math.max(60000, Math.min(60 * 60 * 1000, Math.floor(retryAfterMsRaw))) : 30 * 60 * 1000;
         this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
         this.dispatchBackoffReason = compactStatusDetail(code || String(errorPayload.message ?? "autonomy_enqueue_rejected")) || "autonomy_enqueue_rejected";
       }
@@ -8303,6 +8349,12 @@ ${JSON.stringify(input.messages ?? [])}`),
           candidate.component_area = scopeValidation.componentArea ?? candidate.component_area;
           candidate.target_paths = scopeValidation.normalizedTargetPaths;
           candidate.scope.write_globs = scopeValidation.normalizedWriteGlobs;
+          const suppressedFailureReason = this.suppressedFailureTargetReason(candidate.target_paths);
+          if (suppressedFailureReason) {
+            recordDropReason(`${source}_similar_failure_cluster_cooldown`);
+            console.warn(`[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: ${suppressedFailureReason}; selecting another component instead.`);
+            continue;
+          }
           if (!allowPushPalsInternalCandidates && candidateLeaksPushPalsInternals(candidate)) {
             recordDropReason(`${source}_pushpals_internal_leak`);
             console.warn(`[RemoteBuddyAutonomousEngine] dropping candidate ${candidate.id}: PushPals-internal concepts do not belong in user-repo autonomy work.`);

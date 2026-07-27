@@ -1,10 +1,29 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildReviewCompletionValidationCheckoutArgs,
   buildReviewPublicationPushArgs,
   parseReviewPublicationLease,
+  reviewCompletionHandoffMatches,
+  shouldCleanupCompletionHandoff,
 } from "../apps/source_control_manager/src/review_publication";
 
 describe("SourceControlManager review publication lease", () => {
+  test("validates the immutable completion SHA instead of reconstructing it on main", () => {
+    expect(
+      buildReviewCompletionValidationCheckoutArgs(
+        "_source_control_manager/completion-1",
+        "a".repeat(40),
+      ),
+    ).toEqual(["checkout", "-B", "_source_control_manager/completion-1", "a".repeat(40)]);
+    expect(reviewCompletionHandoffMatches("A".repeat(40), "a".repeat(40))).toBe(true);
+    expect(reviewCompletionHandoffMatches("b".repeat(40), "a".repeat(40))).toBe(false);
+  });
+
+  test("retains immutable handoffs until processed state is confirmed", () => {
+    expect(shouldCleanupCompletionHandoff(false)).toBe(false);
+    expect(shouldCleanupCompletionHandoff(true)).toBe(true);
+  });
+
   test("parses exact head/base leases and builds the sole public-branch push", () => {
     const lease = parseReviewPublicationLease(
       [

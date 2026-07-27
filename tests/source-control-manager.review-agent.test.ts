@@ -644,6 +644,12 @@ describe("ReviewAgent", () => {
     expect(enqueuedReviewThreshold).toBe(9.5);
     expect(enqueuedReviewerFindings).toEqual(["Missing negative-path assertions"]);
     expect(enqueuedPlannerWorkerInstruction).toContain("Do not return an unchanged branch");
+    expect(enqueuedPlannerWorkerInstruction).toContain(
+      "do not checkout, switch, reset, merge, rebase, stage, commit, or push",
+    );
+    expect(enqueuedPlannerWorkerInstruction).toContain(
+      "SourceControlManager publication target after host finalization",
+    );
     expect(enqueuedRecentContext).toContain(
       "Review-fix jobs must produce at least one concrete committed change. If a reviewer finding is invalid, make a small code/test/docs update that documents the reason; unchanged branch re-review is refused.",
     );
@@ -1397,7 +1403,12 @@ describe("ReviewAgent", () => {
     expect(enqueuedInstruction).toContain("Resolve merge conflicts for PR #70");
     expect(enqueuedInstruction).toContain("Do not create a new PR");
     expect(enqueuedPlannerWorkerInstruction).toContain("Existing PR branch: agent/test-branch");
-    expect(enqueuedPlannerWorkerInstruction).toContain("Rebase target: main");
+    expect(enqueuedPlannerWorkerInstruction).toContain(
+      "Deterministic orchestration rebase target: main",
+    );
+    expect(enqueuedPlannerWorkerInstruction).toContain(
+      "must not checkout, switch, reset, merge, rebase, stage, commit, or push",
+    );
     expect(enqueuedPlannerWorkerInstruction).toContain("Expected remote lease SHA: abc123def456");
     expect(enqueuedTargetPaths).toEqual(["apps/remotebuddy/README.md"]);
     expect(enqueuedValidationSteps).toEqual(["bun test"]);

@@ -1023,7 +1023,8 @@ function buildReviewFixPlannerWorkerInstruction(options: {
     `- Minimum score improvement needed: +${Math.max(0, options.reviewThreshold - options.reviewScore).toFixed(1)}`,
     "- Make at least one concrete repo change that addresses reviewer feedback, or explicitly document why a finding is invalid in a committed code/test/docs update.",
     "- Do not return an unchanged branch: PushPals refuses unchanged review-fix re-reviews.",
-    `- Push target after fixes: ${options.prHeadRef} (update the existing PR branch only).`,
+    `- The prepared checkout is the exact leased head of ${options.prHeadRef}. Edit and validate only; do not checkout, switch, reset, merge, rebase, stage, commit, or push.`,
+    `- SourceControlManager publication target after host finalization: ${options.prHeadRef} (update the existing PR branch only).`,
   ];
   if (options.reviewerFindings.length > 0) {
     lines.push("- Current reviewer must-fix items:");
@@ -1059,8 +1060,8 @@ function buildMergeConflictPlannerWorkerInstruction(options: {
     "Merge-conflict resolution brief:",
     `- PR: #${options.prNumber} (${options.prUrl})`,
     `- Existing PR branch: ${options.prHeadRef}`,
-    `- Rebase target: ${options.prBaseRef}`,
-    `- Push target after resolution: ${options.prHeadRef} (update the existing PR branch only).`,
+    `- Deterministic orchestration rebase target: ${options.prBaseRef}`,
+    `- SourceControlManager publication target: ${options.prHeadRef} (update the existing PR branch only).`,
     `- Expected remote lease SHA: ${options.prHeadSha}`,
   ];
   if (options.mergeErrorSummary) {
@@ -1072,10 +1073,10 @@ function buildMergeConflictPlannerWorkerInstruction(options: {
     );
   }
   lines.push(
-    "- If the worker preloads an isolated sandbox branch or an in-progress rebase state, treat that current repo state as authoritative instead of re-discovering branch topology.",
+    "- Treat the prepared checkout and any in-progress rebase state as authoritative. The worker edits and validates file content only; it must not checkout, switch, reset, merge, rebase, stage, commit, or push.",
   );
   lines.push(
-    `- Finish with ${options.prHeadRef} cleanly rebased onto ${options.prBaseRef} and validated. Leave publication to SourceControlManager; do not push or force-push from the worker.`,
+    `- Resolve conflict markers and run focused validation. Deterministic orchestration continues the rebase onto ${options.prBaseRef}, and SourceControlManager alone publishes ${options.prHeadRef}.`,
   );
   return lines.join("\n");
 }
@@ -2126,7 +2127,7 @@ export class ReviewAgent {
             pr_url: pr.html_url,
             pr_head_ref: String(pr.head?.ref ?? ""),
           }),
-          "The branch already exists on the remote. Checkout the branch, make required fixes, and push.",
+          "The host prepared the exact leased PR-head checkout. Edit and validate only; deterministic finalization creates the completion commit and SourceControlManager owns publication.",
           "Review-fix jobs must produce at least one concrete committed change. If a reviewer finding is invalid, make a small code/test/docs update that documents the reason; unchanged branch re-review is refused.",
           `Raise this PR from ${verdict.score.toFixed(1)}/10 to at least ${this.config.passThreshold.toFixed(1)}/10 without reopening already accepted behavior.`,
           `Reviewer score was ${verdict.score.toFixed(1)}/10. Issues: ${issuesSummary}`,

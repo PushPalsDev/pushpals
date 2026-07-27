@@ -9,7 +9,8 @@
  *
  * Architecture:
  *   HOST: Worker daemon → git worktree add → docker exec (warm container) → git worktree remove
- *   CONTAINER: job_runner.ts → executeJob → git commit/push → ___RESULT___
+ *   CONTAINER: job_runner.ts → executeJob (review jobs edit/validate only) → ___RESULT___
+ *   HOST SCM: prepare/rebase/finalize review worktree → retain immutable local completion ref
  */
 
 import { randomUUID } from "crypto";
@@ -34,7 +35,17 @@ import type {
   DockerWarmShellResult,
   DockerWarmStartupContext,
 } from "./backends/types.js";
-import { resolveFreshWorktreeBaseRef } from "./worktree_base_ref.js";
+import { resolveFreshWorktreeBaseRef, resolveReviewWorktreeBase } from "./worktree_base_ref.js";
+import { createJobCommit, resumePreparedMergeConflictRebase, shouldCommit } from "./execute_job.js";
+import {
+  applyMergeConflictExecutionHints,
+  isHostScmOwnedReviewParams,
+  isMergeConflictResolutionParams,
+  isReviewResolutionParams,
+  markHostScmGitOwnership,
+  prepareMergeConflictWorktreeOnHost,
+  refreshMergeConflictWorktreeHints,
+} from "./merge_conflict_job.js";
 
 const DEFAULT_OPENHANDS_MODEL = "local-model";
 const DEFAULT_CONFIG = loadPushPalsConfig();
@@ -321,27 +332,23 @@ export function collectPrunableEphemeralWorktrees(output: string): string[] {
     .map((entry) => entry.path);
 }
 
-function normalizeMergeConflictHeadRef(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  const withoutRefs = trimmed.replace(/^refs\/heads\//, "");
-  const withoutOrigin = withoutRefs.replace(/^origin\//, "");
-  const normalized = withoutOrigin
-    .replace(/\\/g, "/")
-    .replace(/\/+/g, "/")
-    .replace(/^\/+|\/+$/g, "");
-  if (!normalized) return null;
-  if (
-    normalized.includes("..") ||
-    normalized.includes("@{") ||
-    normalized.endsWith(".") ||
-    normalized.endsWith(".lock")
-  ) {
-    return null;
-  }
-  if (/[~^:?*\[\]\s]/.test(normalized)) return null;
-  return normalized;
+export function buildLinuxWorktreeAddArgs(
+  worktreePath: string,
+  baseRef: string,
+  force = false,
+): string[] {
+  return [
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.eol=lf",
+    "worktree",
+    "add",
+    ...(force ? ["--force"] : []),
+    "--detach",
+    worktreePath,
+    baseRef,
+  ];
 }
 
 export class DockerExecutionExhaustedError extends Error {
@@ -615,22 +622,39 @@ export class DockerExecutor {
       // Step 1: Create isolated git worktree
       await this.createWorktree(worktreePath, worktreeBaseRef);
 
-      // Step 2: Prepare job spec as base64
-      const jobSpec = {
-        jobId: job.id,
-        taskId: job.taskId,
-        kind: job.kind,
-        params: job.params,
-        workerId: this.options.workerId,
-      };
-      const base64Spec = Buffer.from(JSON.stringify(jobSpec)).toString("base64");
+      // Step 2: Prepare review Git state on the host before the container sees
+      // the worktree. Review containers receive no branch/rebase/push duties.
+      let effectiveJob: Job = job;
+      if (isReviewResolutionParams(job.params)) {
+        let effectiveParams = job.params;
+        if (isMergeConflictResolutionParams(job.params)) {
+          const prepared = await prepareMergeConflictWorktreeOnHost(
+            worktreePath,
+            job.id,
+            job.params,
+            onLog,
+          );
+          effectiveParams = applyMergeConflictExecutionHints(effectiveParams, prepared);
+        }
+        effectiveJob = {
+          ...job,
+          params: markHostScmGitOwnership(effectiveParams),
+        };
+      }
 
       // Step 3: Run Docker container with the worktree mounted
       for (let attempt = 1; attempt <= this.jobRetryMaxAttempts; attempt++) {
         const attemptStartedAtMs = Date.now();
         try {
           this.logExecutionConfig();
-          const result = await this.runInWarmContainer(worktreePath, base64Spec, job, onLog);
+          const result = isHostScmOwnedReviewParams(effectiveJob.params)
+            ? await this.runHostScmOwnedReviewJob(worktreePath, effectiveJob, onLog)
+            : await this.runInWarmContainer(
+                worktreePath,
+                this.encodeJobSpec(effectiveJob),
+                effectiveJob,
+                onLog,
+              );
           if (result.ok) return result;
 
           const retryableFailure = this.isRetryableJobFailure(result);
@@ -736,13 +760,44 @@ export class DockerExecutor {
   }
 
   /**
+   * Dedicated Windows-host/Linux-container boundary check used by CI. Unlike
+   * the broader startup self-check, this requires only a minimal Linux image
+   * with Git and verifies file bytes from inside that container.
+   */
+  async validateLinuxContainerWorktreeBoundary(assertLfPath: string): Promise<void> {
+    const normalizedPath = String(assertLfPath ?? "")
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "");
+    if (
+      !normalizedPath ||
+      normalizedPath.startsWith("/") ||
+      /^[A-Za-z]:\//.test(normalizedPath) ||
+      normalizedPath.split("/").includes("..") ||
+      /[\r\n\0]/.test(normalizedPath)
+    ) {
+      throw new Error(`Invalid LF boundary assertion path: ${assertLfPath}`);
+    }
+    const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "windows-linux-lf");
+    const worktreePath = resolve(this.worktreeDir, worktreeName);
+    try {
+      await this.createWorktree(worktreePath, this.options.baseRef);
+      await this.runGitSelfCheckContainer(worktreePath, normalizedPath);
+    } finally {
+      await this.removeWorktree(worktreePath).catch(() => {
+        // Preserve the original boundary assertion error.
+      });
+    }
+  }
+
+  /**
    * Create a git worktree for isolated job execution
    */
   private async createWorktree(worktreePath: string, baseRef: string): Promise<void> {
     await this.ensureFreshWorktreePath(worktreePath);
 
     // Create worktree from configured base ref (detached)
-    let proc = Bun.spawn(["git", "worktree", "add", "--detach", worktreePath, baseRef], {
+    let proc = Bun.spawn(["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef)], {
       cwd: this.options.repo,
       stdout: "pipe",
       stderr: "pipe",
@@ -760,7 +815,7 @@ export class DockerExecutor {
       });
       await prune.exited;
 
-      proc = Bun.spawn(["git", "worktree", "add", "--force", "--detach", worktreePath, baseRef], {
+      proc = Bun.spawn(["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef, true)], {
         cwd: this.options.repo,
         stdout: "pipe",
         stderr: "pipe",
@@ -773,6 +828,39 @@ export class DockerExecutor {
 
     if (exitCode !== 0) {
       throw new Error(`Failed to create worktree from ${baseRef}: ${detail}`);
+    }
+
+    const enableWorktreeConfig = await this.runGitBaseRefCommand([
+      "config",
+      "extensions.worktreeConfig",
+      "true",
+    ]);
+    if (!enableWorktreeConfig.ok) {
+      throw new Error(
+        `Failed to enable worktree-local Git configuration: ${
+          enableWorktreeConfig.stderr || enableWorktreeConfig.stdout
+        }`,
+      );
+    }
+    for (const [key, value] of [
+      ["core.autocrlf", "false"],
+      ["core.eol", "lf"],
+    ] as const) {
+      const configured = await this.runGitBaseRefCommand([
+        "-C",
+        worktreePath,
+        "config",
+        "--worktree",
+        key,
+        value,
+      ]);
+      if (!configured.ok) {
+        throw new Error(
+          `Failed to configure ${key}=${value} for Linux worktree: ${
+            configured.stderr || configured.stdout
+          }`,
+        );
+      }
     }
 
     this.rewriteWorktreeGitdirToRelative(worktreePath);
@@ -1410,6 +1498,180 @@ export class DockerExecutor {
     await this.stopWarmContainer("worker shutdown", true);
   }
 
+  private encodeJobSpec(job: Job): string {
+    return Buffer.from(
+      JSON.stringify({
+        jobId: job.id,
+        taskId: job.taskId,
+        kind: job.kind,
+        params: job.params,
+        workerId: this.options.workerId,
+      }),
+    ).toString("base64");
+  }
+
+  private mergeReviewPassUsage(
+    accumulated: JobTokenUsage | undefined,
+    current: JobTokenUsage | undefined,
+  ): JobTokenUsage | undefined {
+    if (!accumulated) return current;
+    if (!current) return accumulated;
+    const promptTokens = accumulated.promptTokens + current.promptTokens;
+    const completionTokens = accumulated.completionTokens + current.completionTokens;
+    return {
+      promptTokens,
+      completionTokens,
+      totalTokens:
+        (accumulated.totalTokens ?? accumulated.promptTokens + accumulated.completionTokens) +
+        (current.totalTokens ?? current.promptTokens + current.completionTokens),
+      estimated: Boolean(accumulated.estimated || current.estimated),
+      backend: current.backend || accumulated.backend,
+      modelId: current.modelId || accumulated.modelId,
+    };
+  }
+
+  private async runHostScmOwnedReviewJob(
+    worktreePath: string,
+    initialJob: Job,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<DockerJobResult> {
+    const maxMergeConflictPasses = 8;
+    let effectiveJob = initialJob;
+    let accumulatedUsage: JobTokenUsage | undefined;
+
+    for (let pass = 1; pass <= maxMergeConflictPasses; pass++) {
+      const result = await this.runInWarmContainer(
+        worktreePath,
+        this.encodeJobSpec(effectiveJob),
+        effectiveJob,
+        onLog,
+      );
+      accumulatedUsage = this.mergeReviewPassUsage(accumulatedUsage, result.usage);
+      if (!result.ok) return { ...result, usage: accumulatedUsage };
+
+      if (isMergeConflictResolutionParams(effectiveJob.params)) {
+        const resume = await resumePreparedMergeConflictRebase(
+          worktreePath,
+          effectiveJob.kind,
+          effectiveJob.params,
+          onLog,
+        );
+        if (!resume.ok) {
+          return {
+            ...result,
+            ok: false,
+            summary: "Host-side merge-conflict rebase continuation failed",
+            stderr: [result.stderr, resume.error].filter(Boolean).join("\n"),
+            exitCode: 4,
+            usage: accumulatedUsage,
+          };
+        }
+        if (resume.sequencer) {
+          if (resume.sequencer !== "rebase" || pass >= maxMergeConflictPasses) {
+            const detail =
+              resume.sequencer !== "rebase"
+                ? `Host-side review worktree left unexpected git ${resume.sequencer} in progress.`
+                : `Host-side merge-conflict repair exceeded ${maxMergeConflictPasses} focused resolver passes.`;
+            return {
+              ...result,
+              ok: false,
+              summary: detail,
+              stderr: [result.stderr, resume.detail, detail].filter(Boolean).join("\n"),
+              exitCode: 4,
+              usage: accumulatedUsage,
+            };
+          }
+
+          const refreshedParams = await refreshMergeConflictWorktreeHints(
+            worktreePath,
+            effectiveJob.params,
+          );
+          const planning =
+            refreshedParams.planning &&
+            typeof refreshedParams.planning === "object" &&
+            !Array.isArray(refreshedParams.planning)
+              ? { ...(refreshedParams.planning as Record<string, unknown>) }
+              : {};
+          planning.executionBudgetMs = Math.min(
+            300_000,
+            Math.max(60_000, Number(planning.executionBudgetMs) || 300_000),
+          );
+          planning.finalizationBudgetMs = Math.min(
+            60_000,
+            Math.max(30_000, Number(planning.finalizationBudgetMs) || 60_000),
+          );
+          effectiveJob = {
+            ...effectiveJob,
+            params: markHostScmGitOwnership({
+              ...refreshedParams,
+              planning,
+              qualityRevisionAttempt: pass,
+              qualityRevisionHint: [
+                String(refreshedParams.qualityRevisionHint ?? "").trim(),
+                resume.detail ??
+                  "Host-side rebase continuation advanced to another unresolved conflict.",
+                "Resolve only the currently conflicted file contents. Host-side SCM will stage and continue after this pass.",
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+            }),
+          };
+          onLog?.(
+            "stdout",
+            `[MergeConflictHost] Rebase still requires conflict editing; starting focused container pass ${pass + 1}/${maxMergeConflictPasses}.`,
+          );
+          continue;
+        }
+      }
+
+      if (!shouldCommit(effectiveJob.kind, this.config)) {
+        return { ...result, usage: accumulatedUsage };
+      }
+      const commitResult = await createJobCommit(
+        worktreePath,
+        this.options.workerId,
+        {
+          id: effectiveJob.id,
+          taskId: effectiveJob.taskId,
+          kind: effectiveJob.kind,
+          params: effectiveJob.params,
+          sessionId: effectiveJob.sessionId,
+          context: "host",
+        },
+        this.config,
+      );
+      if (!commitResult.ok || !commitResult.sha || !commitResult.branch) {
+        const detail =
+          commitResult.error ??
+          `Host-side completion metadata missing for review job ${effectiveJob.id}.`;
+        return {
+          ...result,
+          ok: false,
+          summary: commitResult.publishBlocked?.summary ?? "Host-side review finalization failed",
+          stderr: [result.stderr, detail].filter(Boolean).join("\n"),
+          exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 1,
+          publishBlocked: commitResult.publishBlocked,
+          usage: accumulatedUsage,
+        };
+      }
+      return {
+        ...result,
+        commit: {
+          branch: commitResult.branch,
+          sha: commitResult.sha,
+        },
+        usage: accumulatedUsage,
+      };
+    }
+
+    return {
+      ok: false,
+      summary: "Host-side review execution exhausted resolver passes",
+      exitCode: 4,
+      usage: accumulatedUsage,
+    };
+  }
+
   private async runInWarmContainer(
     worktreePath: string,
     base64Spec: string,
@@ -1727,36 +1989,52 @@ export class DockerExecutor {
     }
   }
 
-  private async runGitSelfCheckContainer(worktreePath: string): Promise<void> {
+  private async runGitSelfCheckContainer(
+    worktreePath: string,
+    assertLfPath?: string,
+  ): Promise<void> {
     const containerName = `pushpals-${this.options.workerId}-selfcheck-${Date.now()}`;
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
 
-    const proc = Bun.spawn(
+    const args = [
+      resolveDockerExecutable(),
+      "run",
+      "--rm",
+      "--name",
+      containerName,
+      "--network",
+      "none",
+      "-v",
+      `${dockerRepoPath}:/repo`,
+      "-w",
+      containerWorktreePath,
+      ...(assertLfPath ? ["-e", `PUSHPALS_LF_ASSERT_PATH=${assertLfPath}`] : []),
+      "--entrypoint",
+      "/bin/sh",
+      this.options.imageName,
+      "-lc",
       [
-        resolveDockerExecutable(),
-        "run",
-        "--rm",
-        "--name",
-        containerName,
-        "--network",
-        "none",
-        "-v",
-        `${dockerRepoPath}:/repo`,
-        "-w",
-        containerWorktreePath,
-        "--entrypoint",
-        "/bin/sh",
-        this.options.imageName,
-        "-lc",
-        "git rev-parse --is-inside-work-tree && git rev-parse --git-dir && git status --porcelain",
-      ],
-      {
-        stdout: "pipe",
-        stderr: "pipe",
-      },
-    );
+        "set -eu",
+        'test "$(git config --worktree --get core.autocrlf)" = "false"',
+        'test "$(git config --worktree --get core.eol)" = "lf"',
+        "git rev-parse --is-inside-work-tree",
+        "git rev-parse --git-dir",
+        "git status --porcelain",
+        'if [ -n "${PUSHPALS_LF_ASSERT_PATH:-}" ]; then',
+        '  test -f "$PUSHPALS_LF_ASSERT_PATH"',
+        '  if od -An -t x1 "$PUSHPALS_LF_ASSERT_PATH" | tr -d " \\n" | grep -qi "0d0a"; then',
+        '    echo "CRLF bytes found in $PUSHPALS_LF_ASSERT_PATH" >&2',
+        "    exit 23",
+        "  fi",
+        "fi",
+      ].join("\n"),
+    ];
+    const proc = Bun.spawn(args, {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
@@ -2334,76 +2612,41 @@ export class DockerExecutor {
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<string> {
-    const reviewAgent =
-      job.params?.reviewAgent && typeof job.params.reviewAgent === "object"
-        ? (job.params.reviewAgent as Record<string, unknown>)
-        : null;
-    const resolutionType =
-      reviewAgent && typeof reviewAgent.resolutionType === "string"
-        ? reviewAgent.resolutionType.trim().toLowerCase()
-        : "";
-    if (resolutionType !== "merge_conflict") {
-      return resolveFreshWorktreeBaseRef({
-        requestedRef: this.options.baseRef,
-        integrationBranch:
-          this.config.sourceControlManager.mainBranch ||
-          this.config.workerpals.baseRef ||
-          this.options.baseRef,
-        sourceBaseBranch: this.config.sourceControlManager.baseBranch,
-        git: (args) => this.runGitBaseRefCommand(args),
-        log: (level, message) => {
-          const line = `[DockerExecutor] ${message}`;
-          if (level === "warn") {
-            console.warn(line);
-            onLog?.("stderr", line);
-          } else {
-            console.log(line);
-            onLog?.("stdout", line);
-          }
-        },
-      });
-    }
-
-    const normalizedHeadRef = normalizeMergeConflictHeadRef(reviewAgent?.prHeadRef);
-    if (!normalizedHeadRef) {
-      const note = `[DockerExecutor] Merge-conflict job ${job.id} has no usable prHeadRef; falling back to ${this.options.baseRef}.`;
-      console.warn(note);
-      onLog?.("stderr", note);
-      return this.options.baseRef;
-    }
-
-    const remoteRef = `origin/${normalizedHeadRef}`;
-    const fetch = Bun.spawn(["git", "fetch", "origin", normalizedHeadRef, "--quiet"], {
-      cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
+    return resolveReviewWorktreeBase({
+      jobId: job.id,
+      params: job.params,
+      git: (args) => this.runGitBaseRefCommand(args),
+      fallback: () =>
+        resolveFreshWorktreeBaseRef({
+          requestedRef: this.options.baseRef,
+          integrationBranch:
+            this.config.sourceControlManager.mainBranch ||
+            this.config.workerpals.baseRef ||
+            this.options.baseRef,
+          sourceBaseBranch: this.config.sourceControlManager.baseBranch,
+          git: (args) => this.runGitBaseRefCommand(args),
+          log: (level, message) => {
+            const line = `[DockerExecutor] ${message}`;
+            if (level === "warn") {
+              console.warn(line);
+              onLog?.("stderr", line);
+            } else {
+              console.log(line);
+              onLog?.("stdout", line);
+            }
+          },
+        }),
+      log: (level, message) => {
+        const line = `[DockerExecutor] ${message}`;
+        if (level === "warn") {
+          console.warn(line);
+          onLog?.("stderr", line);
+        } else {
+          console.log(line);
+          onLog?.("stdout", line);
+        }
+      },
     });
-    const fetchExit = await fetch.exited;
-    if (fetchExit !== 0) {
-      const fetchErr = (await new Response(fetch.stderr).text()).trim();
-      const note = `[DockerExecutor] Merge-conflict job ${job.id} could not refresh ${remoteRef}; falling back to ${this.options.baseRef}${fetchErr ? ` (${fetchErr})` : ""}.`;
-      console.warn(note);
-      onLog?.("stderr", note);
-      return this.options.baseRef;
-    }
-
-    const verify = Bun.spawn(["git", "rev-parse", "--verify", "--quiet", remoteRef], {
-      cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const verifyExit = await verify.exited;
-    if (verifyExit !== 0) {
-      const note = `[DockerExecutor] Merge-conflict job ${job.id} could not verify ${remoteRef}; falling back to ${this.options.baseRef}.`;
-      console.warn(note);
-      onLog?.("stderr", note);
-      return this.options.baseRef;
-    }
-
-    const info = `[DockerExecutor] Merge-conflict job ${job.id}: using fresh worktree base ${remoteRef}.`;
-    console.log(info);
-    onLog?.("stdout", info);
-    return remoteRef;
   }
 
   private async runGitBaseRefCommand(

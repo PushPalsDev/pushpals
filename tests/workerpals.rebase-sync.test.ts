@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { loadPushPalsConfig } from "shared";
-import { createJobCommit, syncHiddenRefWithRemoteBranchByRebase } from "../apps/workerpals/src/execute_job";
+import {
+  createJobCommit,
+  syncHiddenRefWithRemoteBranchByRebase,
+} from "../apps/workerpals/src/execute_job";
 
 function isGitSpawnPermissionDenied(error: unknown): boolean {
   const code = String((error as { code?: unknown } | null)?.code ?? "")
@@ -240,11 +243,20 @@ describe("workerpals rebase sync", () => {
           "push remote add",
         );
 
-        const sync = await syncHiddenRefWithRemoteBranchByRebase(worker, hiddenRef, branch, "job-addadd");
+        const sync = await syncHiddenRefWithRemoteBranchByRebase(
+          worker,
+          hiddenRef,
+          branch,
+          "job-addadd",
+        );
         expect(sync.ok).toBe(true);
         if (!sync.ok) throw new Error(sync.error);
 
-        const resolvedFile = await mustGit(worker, ["show", `${sync.sha}:${file}`], "show resolved file");
+        const resolvedFile = await mustGit(
+          worker,
+          ["show", `${sync.sha}:${file}`],
+          "show resolved file",
+        );
         expect(resolvedFile).toContain("worker");
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -322,7 +334,11 @@ describe("workerpals rebase sync", () => {
         expect(sync.ok).toBe(true);
         if (!sync.ok) throw new Error(sync.error);
 
-        const resolvedFile = await mustGit(worker, ["show", `${sync.sha}:${file}`], "show resolved file");
+        const resolvedFile = await mustGit(
+          worker,
+          ["show", `${sync.sha}:${file}`],
+          "show resolved file",
+        );
         expect(resolvedFile).toContain("worker");
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -349,7 +365,11 @@ describe("workerpals rebase sync", () => {
         writeFileSync(join(repo, "README.md"), "base\n", "utf8");
         await mustGit(repo, ["add", "README.md"], "stage base");
         await mustGit(repo, ["commit", "-m", "base"], "commit base");
-        await mustGit(repo, ["remote", "add", "origin", join(root, "missing-remote.git")], "add broken origin");
+        await mustGit(
+          repo,
+          ["remote", "add", "origin", join(root, "missing-remote.git")],
+          "add broken origin",
+        );
 
         writeFileSync(join(repo, "README.md"), "updated\n", "utf8");
         const runtimeConfig = loadPushPalsConfig();
@@ -373,8 +393,12 @@ describe("workerpals rebase sync", () => {
 
         expect(commitResult.ok).toBe(false);
         expect(commitResult.publishBlocked?.stage).toBe("sync");
-        expect(commitResult.publishBlocked?.summary).toBe("Failed to sync and push task.execute commit");
-        expect(commitResult.branch).toContain("refs/pushpals/agent/workerpal-test/job-publish-blocked");
+        expect(commitResult.publishBlocked?.summary).toBe(
+          "Failed to sync and push task.execute commit",
+        );
+        expect(commitResult.branch).toContain(
+          "refs/pushpals/agent/workerpal-test/job-publish-blocked",
+        );
         expect(commitResult.sha).toBeTruthy();
 
         const hiddenSha = await mustGit(
@@ -383,6 +407,86 @@ describe("workerpals rebase sync", () => {
           "resolve hidden ref",
         );
         expect(hiddenSha).toBe(commitResult.sha);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  runRebaseSyncTest(
+    "retains review-fix commits locally for SourceControlManager without worker-side pushes",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-review-fix-handoff-"));
+      const remote = join(root, "remote.git");
+      const repo = join(root, "repo");
+      const publicBranch = "agent/review/existing-pr";
+      try {
+        await mustGit(root, ["init", "--bare", remote], "init bare remote");
+        await mustGit(root, ["clone", remote, repo], "clone worker repo");
+        await mustGit(repo, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          repo,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+        writeFileSync(join(repo, "README.md"), "base\n", "utf8");
+        await mustGit(repo, ["add", "README.md"], "stage base");
+        await mustGit(repo, ["commit", "-m", "base"], "commit base");
+        await mustGit(
+          repo,
+          ["push", "origin", `HEAD:refs/heads/${publicBranch}`],
+          "publish PR head",
+        );
+        const originalHead = await mustGit(repo, ["rev-parse", "HEAD"], "resolve original head");
+
+        writeFileSync(join(repo, "README.md"), "review fix\n", "utf8");
+        const runtimeConfig = loadPushPalsConfig();
+        runtimeConfig.workerpals.llm.model = "";
+        const commitResult = await createJobCommit(
+          repo,
+          "workerpal-test",
+          {
+            id: "job-review-fix",
+            taskId: "task-review-fix",
+            kind: "task.execute",
+            params: {
+              instruction: "Address reviewer feedback in README",
+              completionBranch: publicBranch,
+              reviewAgent: {
+                resolutionType: "review_fix",
+                prHeadRef: publicBranch,
+                prHeadSha: originalHead,
+                prBaseRef: "main",
+              },
+            },
+            context: "docker",
+          },
+          runtimeConfig,
+        );
+
+        expect(commitResult.ok).toBe(true);
+        expect(commitResult.branch).toBe("refs/pushpals/review/workerpal-test/job-review-fix");
+        expect(commitResult.sha).toBeTruthy();
+        expect(commitResult.sha).not.toBe(originalHead);
+        const publicHead = await mustGit(
+          repo,
+          ["ls-remote", "--heads", "origin", `refs/heads/${publicBranch}`],
+          "inspect public PR branch",
+        );
+        expect(publicHead.startsWith(`${originalHead}\t`)).toBe(true);
+        const completionHead = await mustGit(
+          repo,
+          ["rev-parse", commitResult.branch!],
+          "inspect immutable local review completion",
+        );
+        expect(completionHead).toBe(commitResult.sha);
+        const remoteCompletionHead = await mustGit(
+          repo,
+          ["ls-remote", "origin", commitResult.branch!],
+          "confirm worker did not upload the review completion",
+        );
+        expect(remoteCompletionHead).toBe("");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -463,7 +567,11 @@ describe("workerpals rebase sync", () => {
         expect(git(worker, ["status", "--porcelain", "--", ".codex"])).resolves.toMatchObject({
           stdout: "",
         });
-        const syncedCodex = await mustGit(worker, ["show", `${sync.sha}:.codex`], "show synced .codex");
+        const syncedCodex = await mustGit(
+          worker,
+          ["show", `${sync.sha}:.codex`],
+          "show synced .codex",
+        );
         expect(syncedCodex).toContain("tracked remote codex file");
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -543,14 +651,111 @@ describe("workerpals rebase sync", () => {
         expect(sync.ok).toBe(true);
         if (!sync.ok) throw new Error(sync.error);
 
-        await expect(git(worker, ["status", "--porcelain", "--", ".codex"])).resolves.toMatchObject({
-          stdout: "",
-        });
-        const syncedCodex = await mustGit(worker, ["show", `${sync.sha}:.codex`], "show synced .codex");
+        await expect(git(worker, ["status", "--porcelain", "--", ".codex"])).resolves.toMatchObject(
+          {
+            stdout: "",
+          },
+        );
+        const syncedCodex = await mustGit(
+          worker,
+          ["show", `${sync.sha}:.codex`],
+          "show synced .codex",
+        );
         expect(syncedCodex).toContain("tracked remote codex file");
-        const syncedReadme = await mustGit(worker, ["show", `${sync.sha}:${file}`], "show synced readme");
+        const syncedReadme = await mustGit(
+          worker,
+          ["show", `${sync.sha}:${file}`],
+          "show synced readme",
+        );
         expect(syncedReadme).toContain("worker change");
       } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  runRebaseSyncTest(
+    "resets tracked and colliding untracked residue only inside a disposable publication worktree",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-rebase-dirty-linked-"));
+      const remote = join(root, "remote.git");
+      const maintainer = join(root, "maintainer");
+      const host = join(root, "host");
+      const worker = join(root, "worker-worktree");
+      const branch = "agent/workerpal-test/dirty-linked";
+      const hiddenRef = "refs/pushpals/agent/workerpal-test/job-dirty-linked";
+      try {
+        await mustGit(root, ["init", "--bare", remote], "init bare remote");
+        await mustGit(root, ["clone", remote, maintainer], "clone maintainer");
+        await mustGit(maintainer, ["config", "user.name", "PushPals Test"], "set maintainer name");
+        await mustGit(
+          maintainer,
+          ["config", "user.email", "pushpals-test@example.com"],
+          "set maintainer email",
+        );
+        writeFileSync(join(maintainer, "tracked.txt"), "base\n", "utf8");
+        await mustGit(maintainer, ["add", "tracked.txt"], "stage base");
+        await mustGit(maintainer, ["commit", "-m", "base"], "commit base");
+        await mustGit(maintainer, ["push", "origin", `HEAD:refs/heads/${branch}`], "push base");
+
+        await mustGit(root, ["clone", remote, host], "clone host");
+        await mustGit(host, ["fetch", "origin", branch], "fetch branch");
+        await mustGit(
+          host,
+          ["worktree", "add", "--detach", worker, `origin/${branch}`],
+          "create linked worker worktree",
+        );
+        await mustGit(worker, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          worker,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+        writeFileSync(join(worker, "worker.txt"), "worker committed\n", "utf8");
+        await mustGit(worker, ["add", "worker.txt"], "stage worker file");
+        await mustGit(worker, ["commit", "-m", "worker change"], "commit worker file");
+        const workerSha = await mustGit(worker, ["rev-parse", "HEAD"], "resolve worker sha");
+        await mustGit(worker, ["update-ref", hiddenRef, workerSha], "retain worker commit");
+
+        await mustGit(
+          maintainer,
+          ["checkout", "-B", branch, `origin/${branch}`],
+          "checkout remote branch",
+        );
+        writeFileSync(join(maintainer, "remote.txt"), "remote advanced\n", "utf8");
+        writeFileSync(join(maintainer, "collision.txt"), "remote collision\n", "utf8");
+        await mustGit(maintainer, ["add", "remote.txt", "collision.txt"], "stage remote change");
+        await mustGit(maintainer, ["commit", "-m", "remote change"], "commit remote change");
+        await mustGit(
+          maintainer,
+          ["push", "origin", `HEAD:refs/heads/${branch}`],
+          "push remote change",
+        );
+
+        writeFileSync(join(worker, "worker.txt"), "dirty residue\n", "utf8");
+        writeFileSync(join(worker, "collision.txt"), "untracked residue\n", "utf8");
+        const sync = await syncHiddenRefWithRemoteBranchByRebase(
+          worker,
+          hiddenRef,
+          branch,
+          "job-dirty-linked",
+        );
+        expect(sync.ok).toBe(true);
+        if (!sync.ok) throw new Error(sync.error);
+        expect(readFileSync(join(worker, "worker.txt"), "utf8").replace(/\r\n/g, "\n")).toBe(
+          "worker committed\n",
+        );
+        expect(readFileSync(join(worker, "collision.txt"), "utf8").replace(/\r\n/g, "\n")).toBe(
+          "remote collision\n",
+        );
+        expect((await git(worker, ["status", "--porcelain"])).stdout).toBe("");
+      } finally {
+        try {
+          await git(host, ["worktree", "remove", "--force", worker]);
+        } catch {
+          // Best-effort cleanup for failed setup.
+        }
         rmSync(root, { recursive: true, force: true });
       }
     },

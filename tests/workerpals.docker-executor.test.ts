@@ -727,7 +727,7 @@ describe("workerpals docker executor internals", () => {
     expect(executor.activeJobs).toBe(0);
   });
 
-  test("prepares Docker image only for merge-conflict jobs and not inside execute", async () => {
+  test("keeps merge-conflict image preparation explicit and never rebuilds inside execute", async () => {
     const executor = createExecutor() as unknown as {
       execute: (job: {
         id: string;
@@ -797,7 +797,9 @@ describe("workerpals docker executor internals", () => {
     expect(rebuildCalls).toBe(1);
 
     const mergeConflictExecuteResult = await executor.execute(mergeConflictJob);
-    expect(mergeConflictExecuteResult.ok).toBe(true);
+    // The intentionally incomplete review lease cannot pass the new host-side
+    // PR preparation boundary, but execute must not trigger an image rebuild.
+    expect(mergeConflictExecuteResult.ok).toBe(false);
     expect(rebuildCalls).toBe(1);
     expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(true);
   });

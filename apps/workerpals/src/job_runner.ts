@@ -20,11 +20,7 @@ import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
 import { loadPushPalsConfig } from "shared";
 import { writeFileSync } from "fs";
 import type { JobDiagnostics, JobTokenUsage } from "./common/types.js";
-import {
-  applyMergeConflictExecutionHints,
-  isMergeConflictResolutionParams,
-  prepareMergeConflictTaskRepo,
-} from "./merge_conflict_job.js";
+import { isHostScmOwnedReviewParams } from "./merge_conflict_job.js";
 
 const CONFIG = loadPushPalsConfig();
 
@@ -135,6 +131,10 @@ export function buildJobRunnerResult(
   };
 }
 
+export function containerOwnsGitFinalization(params: Record<string, unknown>): boolean {
+  return !isHostScmOwnedReviewParams(params);
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -165,27 +165,18 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   log("stdout", `[JobRunner] Starting job ${spec.jobId} (${spec.kind})`);
-  // Setup git credentials for pushing
-  setupGitCredentials();
+  const hostScmOwnsGit = !containerOwnsGitFinalization(spec.params);
+  // Review/repair containers never receive push credentials. Their host-side
+  // source-control orchestrator owns rebase continuation and finalization.
+  if (!hostScmOwnsGit) setupGitCredentials();
   // Execute inside the mounted job worktree (docker -w), not the baked image copy.
-  const mountedJobRepo = process.cwd();
-  let jobRepo = mountedJobRepo;
-  let cleanupJobRepo: (() => void) | null = null;
-  let effectiveParams = spec.params;
+  const jobRepo = process.cwd();
+  const effectiveParams = spec.params;
   try {
-    if (isMergeConflictResolutionParams(spec.params)) {
-      const prepared = await prepareMergeConflictTaskRepo(
-        mountedJobRepo,
-        spec.jobId,
-        spec.params,
-        log,
-      );
-      jobRepo = prepared.repoPath;
-      cleanupJobRepo = prepared.cleanup;
-      effectiveParams = applyMergeConflictExecutionHints(spec.params, prepared);
+    if (hostScmOwnsGit) {
       log(
         "stdout",
-        `[JobRunner] Merge-conflict job ${spec.jobId} is running in isolated sandbox repo ${jobRepo}`,
+        `[JobRunner] Host-side SCM owns Git finalization for review job ${spec.jobId}; container is edit/validate-only.`,
       );
     }
     const result = await executeJob(
@@ -200,7 +191,7 @@ async function main(): Promise<void> {
     // Build result object
     const jobResult = buildJobRunnerResult(result);
     // Create commit for file-modifying jobs
-    if (result.ok && shouldCommit(spec.kind, CONFIG)) {
+    if (result.ok && shouldCommit(spec.kind, CONFIG) && !hostScmOwnsGit) {
       log("stdout", `[JobRunner] Job modified files, creating commit...`);
       const commitResult = await createJobCommit(
         jobRepo,
@@ -255,7 +246,7 @@ async function main(): Promise<void> {
     // Exit with appropriate code
     process.exit(jobResult.exitCode ?? (jobResult.ok ? 0 : 1));
   } finally {
-    cleanupJobRepo?.();
+    // Host-owned review worktrees are finalized and removed by DockerExecutor.
   }
 }
 

@@ -3,6 +3,7 @@
  * Used by both the host Worker (direct mode) and the Docker job runner.
  */
 
+import { createHash } from "crypto";
 import {
   existsSync,
   lstatSync,
@@ -55,7 +56,10 @@ import {
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
 import { getBackendTaskExecutor } from "./backends/task_execute_registry.js";
-import { extractMergeConflictReviewContext } from "./merge_conflict_job.js";
+import {
+  extractMergeConflictReviewContext,
+  isHostScmOwnedReviewParams,
+} from "./merge_conflict_job.js";
 
 const DEFAULT_CONFIG = loadPushPalsConfig();
 
@@ -1869,9 +1873,7 @@ export function repoValidationLeaseRecoveryReason(opts: {
 }): "dead owner process" | "stale heartbeat" | "stale legacy lease" | null {
   const ownerHost = typeof opts.owner?.host === "string" ? opts.owner.host.trim() : "";
   const ownerPid =
-    typeof opts.owner?.pid === "number" && Number.isInteger(opts.owner.pid)
-      ? opts.owner.pid
-      : null;
+    typeof opts.owner?.pid === "number" && Number.isInteger(opts.owner.pid) ? opts.owner.pid : null;
   if (
     ownerHost &&
     opts.currentHost &&
@@ -1959,9 +1961,7 @@ async function acquireRepoValidationLease(
         const currentOwner = readRepoValidationLeaseOwner(ownerPath);
         const ownerMtimeMs = statSync(ownerPath).mtimeMs;
         const sameHost =
-          Boolean(currentOwner?.host) &&
-          Boolean(ownerHost) &&
-          currentOwner?.host === ownerHost;
+          Boolean(currentOwner?.host) && Boolean(ownerHost) && currentOwner?.host === ownerHost;
         const ownerProcessAlive =
           sameHost && typeof currentOwner?.pid === "number"
             ? isProcessAlive(currentOwner.pid)
@@ -3457,6 +3457,105 @@ function validationCommandKey(command: string): string {
     .toLowerCase();
 }
 
+export function validationCommandExecutionTier(command: string): number {
+  const normalized = validationCommandKey(command);
+  if (
+    /\.(?:test|spec)\.[cm]?[jt]sx?\b/i.test(normalized) ||
+    /\btests?\/[^\s]+\b/i.test(normalized) ||
+    /\b(?:pytest|vitest|jest)\s+[^\s]+\b/i.test(normalized)
+  ) {
+    return 0;
+  }
+  if (
+    /\b(?:tsc|typecheck|lint|eslint|ruff|mypy)\b/i.test(normalized) &&
+    !/\b(?:validate|test:all|test:root)\b/i.test(normalized)
+  ) {
+    return 1;
+  }
+  if (isLongRunningBrowserValidationCommand(command)) return 3;
+  if (
+    /\b(?:validate|test:all|test:root|test:integration|test:e2e|test:worker)\b/i.test(normalized) ||
+    /^(?:bun|npm|pnpm|yarn)(?:\s+run)?\s+test$/i.test(normalized)
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+export function shouldDeferHigherTierValidationAfterFailure(
+  command: string,
+  previousRuns: ValidationExecutionResult[],
+): string | null {
+  const candidateTier = validationCommandExecutionTier(command);
+  const blocker = previousRuns.find(
+    (run) =>
+      !run.ok &&
+      run.exitCode !== 125 &&
+      validationCommandExecutionTier(run.command) < candidateTier,
+  );
+  if (!blocker) return null;
+  const digest = extractValidationFailureDigest(blocker);
+  return `lower-tier validation already failed for "${blocker.command}"${
+    digest ? ` (${digest})` : ""
+  }`;
+}
+
+function validationFileFingerprint(repo: string, changedPaths: string[]): string {
+  const hash = createHash("sha256");
+  hash.update(`${process.platform}\0${process.arch}\0`);
+  const fingerprintPaths = ["bun.lock", "bun.lockb", "package.json", ...changedPaths]
+    .map((entry) => entry.replace(/\\/g, "/"))
+    .filter((entry, index, values) => values.indexOf(entry) === index)
+    .sort();
+  for (const relativePath of fingerprintPaths) {
+    const absolutePath = resolve(repo, relativePath);
+    hash.update(relativePath);
+    hash.update("\0");
+    if (!existsSync(absolutePath)) {
+      hash.update("missing\0");
+      continue;
+    }
+    try {
+      const stats = statSync(absolutePath);
+      if (!stats.isFile()) {
+        hash.update(`non-file:${stats.size}\0`);
+        continue;
+      }
+      hash.update(readFileSync(absolutePath));
+      hash.update("\0");
+    } catch (error) {
+      hash.update(`unreadable:${String(error)}\0`);
+    }
+  }
+  return hash.digest("hex");
+}
+
+async function validationCacheContext(repo: string, changedPaths: string[]): Promise<string> {
+  const head = await git(repo, ["rev-parse", "HEAD"]);
+  return `${head.ok ? head.stdout.trim() : "unknown-head"}:${validationFileFingerprint(
+    repo,
+    changedPaths,
+  )}`;
+}
+
+export function findUnchangedValidationFailure(
+  runs: ValidationExecutionResult[],
+  previousFailureDigests: Map<string, string>,
+  repo?: string,
+): { command: string; digest: string } | null {
+  for (const run of runs) {
+    if (run.ok || run.exitCode === 127 || run.exitCode === 125) continue;
+    const digest = repo
+      ? extractValidationFailureRetryDigest(run, repo)
+      : extractValidationFailureDigest(run);
+    if (!digest) continue;
+    if (previousFailureDigests.get(validationCommandKey(run.command)) === digest) {
+      return { command: run.command, digest };
+    }
+  }
+  return null;
+}
+
 export function extractValidationFailureDigest(run: {
   exitCode?: number;
   stdout?: string;
@@ -3596,6 +3695,23 @@ export function shouldRetryPassingVitestTeardownOnce(run: ValidationExecutionRes
     return false;
   }
   return !summaryLines.some((line) => /\b\d+\s+failed\b/i.test(line));
+}
+
+export function shouldRetryTransientInfrastructureValidationOnce(
+  run: ValidationExecutionResult,
+): boolean {
+  if (run.ok || run.exitCode === 127) return false;
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  if (
+    /\b(?:assert|expected|received|test failed|tests? failed|syntaxerror|typeerror|TS\d{4})\b/i.test(
+      combined,
+    )
+  ) {
+    return false;
+  }
+  return /\b(?:EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|socket hang up|temporary failure in name resolution|service unavailable|bad gateway|gateway timeout|Docker daemon is not running|cannot connect to the Docker daemon|spawn EBUSY|spawn EPERM)\b/i.test(
+    combined,
+  );
 }
 
 function extractBrowserValidationStage(text: string): string | null {
@@ -5000,6 +5116,7 @@ async function runDeterministicQualityGate(
   validationRetryState?: {
     previousFailureDigests?: Map<string, string>;
     revisionAttempt?: number;
+    passingValidationCache?: Map<string, ValidationExecutionResult>;
   },
 ): Promise<DeterministicQualityResult> {
   const instruction = String(params.instruction ?? "");
@@ -5112,17 +5229,52 @@ async function runDeterministicQualityGate(
     );
   }
 
-  const { commandsToRun, requiredRunnableSteps, plannerRunnableSteps, fallbackValidationSteps } =
-    collectQualityGateValidationCommands({
-      instruction,
-      targetPath,
-      planning,
-      changedTestPaths,
-      isTestTask,
-      repo,
-      changedPaths,
-    });
+  const {
+    commandsToRun: collectedCommandsToRun,
+    requiredRunnableSteps,
+    plannerRunnableSteps,
+    fallbackValidationSteps,
+  } = collectQualityGateValidationCommands({
+    instruction,
+    targetPath,
+    planning,
+    changedTestPaths,
+    isTestTask,
+    repo,
+    changedPaths,
+  });
+  const commandsToRun = collectedCommandsToRun
+    .map((command, index) => ({ command, index }))
+    .sort((left, right) => {
+      const tierDelta =
+        validationCommandExecutionTier(left.command) -
+        validationCommandExecutionTier(right.command);
+      return tierDelta !== 0 ? tierDelta : left.index - right.index;
+    })
+    .map((entry) => entry.command);
   const validationRuns: ValidationExecutionResult[] = [];
+  const cacheContext = await validationCacheContext(repo, changedPaths);
+  const runValidationWithCache = async (
+    command: string,
+    runner: () => Promise<ValidationExecutionResult>,
+  ): Promise<ValidationExecutionResult> => {
+    const cacheKey = `${cacheContext}\0${validationCommandKey(command)}`;
+    const cached = validationRetryState?.passingValidationCache?.get(cacheKey);
+    if (cached?.ok) {
+      onLog?.("stdout", `[ValidationGate] Cache hit for unchanged passing gate: ${command}`);
+      return {
+        ...cached,
+        step: command,
+        command,
+        elapsedMs: 0,
+      };
+    }
+    const run = await runner();
+    if (run.ok) {
+      validationRetryState?.passingValidationCache?.set(cacheKey, { ...run });
+    }
+    return run;
+  };
   const outputPolicy = outputPolicyForRuntime(runtimeConfig);
   const qualityValidationStepTimeoutMs = (() => {
     const value = Number(runtimeConfig.workerpals.qualityValidationStepTimeoutMs);
@@ -5199,13 +5351,45 @@ async function runDeterministicQualityGate(
         }
         const playwrightBrowserRuntimeReadyTargets = new Set<string>();
         for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
+          const nextCommand = commandsToRun[commandIndex];
+          const higherTierDeferredReason = shouldDeferHigherTierValidationAfterFailure(
+            nextCommand,
+            validationRuns,
+          );
+          if (higherTierDeferredReason) {
+            commandIndex += 1;
+            const stderr =
+              `Skipped higher-tier validation command because ${higherTierDeferredReason}. ` +
+              "Fix the focused blocker first; PushPals will run this gate after lower-tier validation is clean.";
+            validationRuns.push({
+              step: nextCommand,
+              command: nextCommand,
+              ok: false,
+              exitCode: 125,
+              stdout: "",
+              stderr,
+              elapsedMs: 1,
+            });
+            onLog?.(
+              "stderr",
+              `[ValidationGate] Deferred higher-tier validation after lower-tier failure: ${nextCommand} (${higherTierDeferredReason})`,
+            );
+            continue;
+          }
+
           const parallelBatch: string[] = [];
+          const parallelTier = validationCommandExecutionTier(nextCommand);
           while (
             commandIndex + parallelBatch.length < commandsToRun.length &&
             parallelBatch.length < 3
           ) {
             const candidate = commandsToRun[commandIndex + parallelBatch.length];
-            if (!isParallelSafeFastValidationCommand(repo, candidate)) break;
+            if (
+              validationCommandExecutionTier(candidate) !== parallelTier ||
+              !isParallelSafeFastValidationCommand(repo, candidate)
+            ) {
+              break;
+            }
             parallelBatch.push(candidate);
           }
           if (parallelBatch.length > 1) {
@@ -5239,12 +5423,47 @@ async function runDeterministicQualityGate(
                     summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
                   };
                 }
-                const run = await runValidationCommand(
-                  repo,
-                  command,
-                  resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
-                  outputPolicy,
+                let run = await runValidationWithCache(command, () =>
+                  runValidationCommand(
+                    repo,
+                    command,
+                    resolveValidationCommandTimeoutMs(
+                      command,
+                      qualityValidationStepTimeoutMs,
+                      repo,
+                    ),
+                    outputPolicy,
+                  ),
                 );
+                if (
+                  !run.ok &&
+                  (shouldRetryPassingVitestTeardownOnce(run) ||
+                    shouldRetryTransientInfrastructureValidationOnce(run))
+                ) {
+                  const firstDigest = extractValidationFailureDigest(run);
+                  onLog?.(
+                    "stderr",
+                    `[ValidationGate] Retrying fast validation once after transient infrastructure/teardown failure: ${command}${
+                      firstDigest ? ` - ${firstDigest}` : ""
+                    }`,
+                  );
+                  run = await runValidationCommand(
+                    repo,
+                    command,
+                    resolveValidationCommandTimeoutMs(
+                      command,
+                      qualityValidationStepTimeoutMs,
+                      repo,
+                    ),
+                    outputPolicy,
+                  );
+                  if (run.ok) {
+                    validationRetryState?.passingValidationCache?.set(
+                      `${cacheContext}\0${validationCommandKey(command)}`,
+                      { ...run, step: command, command },
+                    );
+                  }
+                }
                 const digest = run.ok ? "" : extractValidationFailureDigest(run);
                 return {
                   run,
@@ -5392,12 +5611,14 @@ async function runDeterministicQualityGate(
             continue;
           }
           onLog?.("stdout", `[ValidationGate] Running "${command}"`);
-          let run = await runValidationCommandWithRepoLease(
-            repo,
-            command,
-            resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
-            outputPolicy,
-            onLog,
+          let run = await runValidationWithCache(command, () =>
+            runValidationCommandWithRepoLease(
+              repo,
+              command,
+              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
+              outputPolicy,
+              onLog,
+            ),
           );
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
           const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run, repo);
@@ -5409,10 +5630,13 @@ async function runDeterministicQualityGate(
             ? aggregateWorkerValidationRetryCommand(run, repo)
             : null;
           const retryPassingVitestTeardown = shouldRetryPassingVitestTeardownOnce(run);
+          const retryTransientInfrastructure =
+            shouldRetryTransientInfrastructureValidationOnce(run);
           if (
             retryBrowserValidation ||
             retryAggregateWorkerValidation ||
-            retryPassingVitestTeardown
+            retryPassingVitestTeardown ||
+            retryTransientInfrastructure
           ) {
             onLog?.(
               "stderr",
@@ -5420,7 +5644,9 @@ async function runDeterministicQualityGate(
                 ? `[ValidationGate] Retrying validation once after all Vitest assertions passed but worker teardown failed: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`
                 : retryAggregateWorkerValidation
                   ? `[ValidationGate] Retrying only the failed Worker validation stage after aggregate cold-start failure: ${focusedAggregateRetryCommand ?? command}${firstDigest ? ` - ${firstDigest}` : ""}`
-                  : `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
+                  : retryBrowserValidation
+                    ? `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`
+                    : `[ValidationGate] Retrying validation once after transient infrastructure failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
             );
             if (retryAggregateWorkerValidation) {
               await new Promise((resolveWait) => setTimeout(resolveWait, 1_500));
@@ -5467,6 +5693,12 @@ async function runDeterministicQualityGate(
                 .join("\n");
             }
             run = retryRun;
+          }
+          if (run.ok && validationCommandKey(run.command) === validationCommandKey(command)) {
+            validationRetryState?.passingValidationCache?.set(
+              `${cacheContext}\0${validationCommandKey(command)}`,
+              { ...run, step: command, command },
+            );
           }
           validationRuns.push(run);
           const digest = run.ok ? "" : extractValidationFailureDigest(run);
@@ -6612,6 +6844,7 @@ export async function createJobCommit(
     defaultPublicBranchName,
   );
   const publicBranchName = resolvedPublicBranch.branch;
+  const reviewFixContext = extractReviewFixContext(job.params ?? null);
   if (extractMergeConflictReviewContext(job.params ?? null)) {
     return createMergeConflictJobCommit(repo, workerId, job, publicBranchName, runtimeConfig);
   }
@@ -6619,7 +6852,9 @@ export async function createJobCommit(
   const pushAgentBranch =
     requirePush || runtimeConfig.workerpals.pushAgentBranch || resolvedPublicBranch.overridden;
   // Keep worker refs out of refs/heads so user-visible branch lists stay clean.
-  const hiddenCommitRef = `refs/pushpals/agent/${workerId}/${job.id}`;
+  const hiddenCommitRef = reviewFixContext
+    ? `refs/pushpals/review/${workerId}/${job.id}`
+    : `refs/pushpals/agent/${workerId}/${job.id}`;
   let completionRef = hiddenCommitRef;
   let hiddenRefCreated = false;
 
@@ -6726,6 +6961,13 @@ export async function createJobCommit(
       return { ok: false, error: `Failed to store worker commit ref: ${result.stderr}` };
     }
     hiddenRefCreated = true;
+
+    if (reviewFixContext) {
+      console.log(
+        `[WorkerPals] Retained immutable review-fix completion ${hiddenCommitRef} in the shared host repository; SourceControlManager owns publication to ${publicBranchName}.`,
+      );
+      return { ok: true, branch: hiddenCommitRef, sha };
+    }
 
     // Push branch to origin (optional; disabled by default for shared-.git workflows)
     if (pushAgentBranch) {
@@ -7376,18 +7618,17 @@ export function isPullRebaseDirtyWorkingTreeOutput(text: string): boolean {
   return (
     normalized.includes("cannot pull with rebase: you have unstaged changes") ||
     normalized.includes("cannot rebase: you have unstaged changes") ||
-    normalized.includes("please commit or stash them")
+    normalized.includes("please commit or stash them") ||
+    normalized.includes(
+      "your local changes to the following files would be overwritten by merge",
+    ) ||
+    normalized.includes("please commit your changes or stash them before you merge") ||
+    normalized.includes("untracked working tree files would be overwritten by merge")
   );
 }
 
 async function currentRefSha(repo: string, ref: string): Promise<string | null> {
   const result = await git(repo, ["rev-parse", ref]);
-  if (!result.ok) return null;
-  return result.stdout.trim() || null;
-}
-
-async function currentBranchName(repo: string): Promise<string | null> {
-  const result = await git(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
   if (!result.ok) return null;
   return result.stdout.trim() || null;
 }
@@ -7660,14 +7901,6 @@ async function createMergeConflictJobCommit(
   );
   if (!refreshed.ok) return refreshed;
 
-  const currentBranch = await currentBranchName(repo);
-  if (!currentBranch) {
-    return {
-      ok: false,
-      error: `Merge-conflict job ${job.id} must finish on a local branch inside the isolated sandbox, but HEAD is detached.`,
-    };
-  }
-
   const remoteHeadSha = await currentRefSha(repo, `refs/remotes/origin/${publicBranchName}`);
   if (
     mergeConflictContext.expectedHeadSha &&
@@ -7793,7 +8026,7 @@ async function createMergeConflictJobCommit(
       ok: false,
       error:
         `Merge-conflict job ${job.id} did not finish rebased onto origin/${mergeConflictContext.baseBranch}. ` +
-        `Current branch ${currentBranch} must be a descendant of ${baseRemoteRef} before WorkerPals can hand it to SourceControlManager.`,
+        `Detached host worktree HEAD must be a descendant of ${baseRemoteRef} before WorkerPals can hand it to SourceControlManager.`,
     };
   }
 
@@ -7805,16 +8038,6 @@ async function createMergeConflictJobCommit(
       error: `Failed to retain rebased merge-conflict commit for SourceControlManager: ${combinedGitOutput(retain)}`,
     };
   }
-  const upload = await git(repo, ["push", "origin", `${headSha}:${hiddenCompletionRef}`]);
-  if (!upload.ok) {
-    return {
-      ok: false,
-      error:
-        `Failed to upload immutable merge-conflict completion ref for SourceControlManager: ` +
-        redactSensitiveText(combinedGitOutput(upload)),
-    };
-  }
-
   return { ok: true, branch: hiddenCompletionRef, sha: headSha };
 }
 
@@ -7903,6 +8126,88 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
   publicBranchName: string,
   jobId: string,
 ): Promise<{ ok: true; sha: string } | { ok: false; error: string }> {
+  const resetPublicationResidueInDisposableWorktree = async (
+    reason: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const gitDir = await git(repo, ["rev-parse", "--git-dir"]);
+    const commonDir = await git(repo, ["rev-parse", "--git-common-dir"]);
+    if (!gitDir.ok || !commonDir.ok) {
+      return {
+        ok: false,
+        error:
+          `Refusing to reset publication checkout because its Git directory layout could not be verified: ` +
+          `${combinedGitOutput(!gitDir.ok ? gitDir : commonDir)}`,
+      };
+    }
+    const resolvedGitDir = resolve(repo, gitDir.stdout.trim());
+    const resolvedCommonDir = resolve(repo, commonDir.stdout.trim());
+    const normalizePath = (value: string) =>
+      process.platform === "win32" ? value.toLowerCase() : value;
+    if (normalizePath(resolvedGitDir) === normalizePath(resolvedCommonDir)) {
+      return {
+        ok: false,
+        error:
+          "Refusing to reset a dirty publication checkout that is not a disposable linked worktree.",
+      };
+    }
+
+    console.warn(
+      `[WorkerPals] Resetting tracked and untracked residue in disposable publication worktree before ${reason}.`,
+    );
+    const reset = await git(repo, ["reset", "--hard", "HEAD"]);
+    if (!reset.ok) {
+      return {
+        ok: false,
+        error: `Failed to reset disposable publication worktree: ${combinedGitOutput(reset)}`,
+      };
+    }
+    const clean = await git(repo, ["clean", "-fd"]);
+    if (!clean.ok) {
+      return {
+        ok: false,
+        error: `Failed to clean disposable publication worktree: ${combinedGitOutput(clean)}`,
+      };
+    }
+    const status = await git(repo, ["status", "--porcelain"]);
+    if (!status.ok) {
+      return {
+        ok: false,
+        error: `Failed to verify publication worktree after reset: ${combinedGitOutput(status)}`,
+      };
+    }
+    const residue = status.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+    if (residue.length > 0) {
+      return {
+        ok: false,
+        error:
+          "Changes remain in disposable publication worktree after reset and clean: " +
+          residue.slice(0, 10).join(", "),
+      };
+    }
+    return { ok: true };
+  };
+
+  const verifyCleanTrackedStateBeforeRebase = async (): Promise<
+    { ok: true } | { ok: false; error: string }
+  > => {
+    const status = await git(repo, ["status", "--porcelain"]);
+    if (!status.ok) {
+      return {
+        ok: false,
+        error: `Failed to inspect publication worktree before rebase: ${combinedGitOutput(status)}`,
+      };
+    }
+    const trackedResidue = status.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter((line) => line && !line.startsWith("?? "));
+    if (trackedResidue.length === 0) return { ok: true };
+    return resetPublicationResidueInDisposableWorktree("git pull --rebase");
+  };
+
   const scrubKnownPreSyncArtifacts = async (): Promise<
     { ok: true } | { ok: false; error: string }
   > => {
@@ -8020,16 +8325,16 @@ export async function syncHiddenRefWithRemoteBranchByRebase(
       if (!preSyncGuard.ok) {
         return { ok: false, error: preSyncGuard.error };
       }
+      const cleanBeforeRebase = await verifyCleanTrackedStateBeforeRebase();
+      if (!cleanBeforeRebase.ok) {
+        return { ok: false, error: cleanBeforeRebase.error };
+      }
       let pullRebase = await pullRebaseNonInteractive();
       if (!pullRebase.ok && isPullRebaseDirtyWorkingTreeOutput(combinedGitOutput(pullRebase))) {
-        // Recover from dirty index/worktree left by previous attempts and retry non-interactively.
-        const reset = await git(repo, ["reset", "--hard", "HEAD"]);
-        if (!reset.ok) {
-          return {
-            ok: false,
-            error: `Failed to clean working tree before retrying pull --rebase: ${combinedGitOutput(reset)}`,
-          };
-        }
+        const reset = await resetPublicationResidueInDisposableWorktree(
+          "retrying git pull --rebase after a dirty-tree rejection",
+        );
+        if (!reset.ok) return { ok: false, error: reset.error };
         pullRebase = await pullRebaseNonInteractive();
       }
 
@@ -9368,6 +9673,7 @@ export async function executeJob(
   let revisionHint = "";
   const jobStartedAt = Date.now();
   const previousValidationFailureDigests = new Map<string, string>();
+  const passingValidationCache = new Map<string, ValidationExecutionResult>();
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   const diagnosticValidationRuns: JobValidationRunDiagnostics[] = [];
   const diagnosticPatchSnapshots: JobPatchSnapshotDiagnostics[] = [];
@@ -9415,6 +9721,13 @@ export async function executeJob(
       if (!currentResult.ok) return currentResult;
       result = currentResult;
       if (!mergeConflictContext) break;
+      if (isHostScmOwnedReviewParams(attemptParams)) {
+        onLog?.(
+          "stdout",
+          "[MergeConflict] Container editing pass complete; host-side SCM will stage and continue the prepared rebase.",
+        );
+        break;
+      }
 
       const resume = await resumePreparedMergeConflictRebase(repo, kind, attemptParams, onLog);
       if (!resume.ok) {
@@ -9494,8 +9807,8 @@ export async function executeJob(
             previousHint,
             [
               `Merge-conflict resolver pass ${mergeConflictPass} left the rebase unfinished: ${retryDetail}.`,
-              "Focus only on completing the active rebase. Inspect unresolved files with `git diff --name-only --diff-filter=U`, remove remaining conflict markers, stage resolved files, and run `git -c core.editor=true rebase --continue` until no rebase remains.",
-              "Do not broaden the patch or run full validation before the rebase is complete.",
+              "Focus only on the unresolved file content. Inspect unresolved files read-only, remove remaining conflict markers, and run focused validation.",
+              "Do not checkout, switch, stage, commit, rebase, or push. The deterministic job orchestrator owns staging and rebase continuation after the editing pass.",
             ].join("\n"),
           ]
             .filter(Boolean)
@@ -9630,6 +9943,7 @@ export async function executeJob(
       {
         previousFailureDigests: previousValidationFailureDigests,
         revisionAttempt,
+        passingValidationCache,
       },
     );
     const qualityElapsedMs = Date.now() - qualityStartedAt;
@@ -9670,6 +9984,14 @@ export async function executeJob(
       };
       recordBrowserFailureMemory(repo, failureJobFamily, browserRepairPacket);
     }
+    const unchangedValidationFailure =
+      revisionAttempt > 0
+        ? findUnchangedValidationFailure(
+            quality.validationRuns,
+            previousValidationFailureDigests,
+            repo,
+          )
+        : null;
     for (const run of quality.validationRuns) {
       if (run.ok) continue;
       const digest = extractValidationFailureRetryDigest(run, repo);
@@ -9739,6 +10061,7 @@ export async function executeJob(
     const critic =
       quality.skipped ||
       !qualityGatePolicy.criticGateEnabled ||
+      unchangedValidationFailure !== null ||
       skipCriticAfterExecutorTimeout ||
       skipCriticForDeterministicValidationRevision ||
       skipCriticForRevisionBudget
@@ -9771,6 +10094,31 @@ export async function executeJob(
         validationRuns: [...diagnosticValidationRuns],
         patchSnapshots: [...diagnosticPatchSnapshots],
       });
+    if (unchangedValidationFailure) {
+      const detail =
+        `Validation failed unchanged after two attempts for "${unchangedValidationFailure.command}": ` +
+        `${unchangedValidationFailure.digest}. Stopping revisions for this failure cluster; ` +
+        "dispatch a root-cause repair or move to another component.";
+      onLog?.("stderr", `[ValidationGate] ${detail}`);
+      const failure: JobResult = {
+        ok: false,
+        summary: "Repeated unchanged validation failure circuit opened",
+        stdout: result.stdout,
+        stderr: truncate(
+          [
+            result.stderr ?? "",
+            detail,
+            ...quality.validationRuns
+              .filter((run) => !run.ok)
+              .flatMap((run) => [run.stdout, run.stderr])
+              .filter(Boolean),
+          ].join("\n"),
+          outputPolicyForRuntime(runtimeConfig),
+        ),
+        exitCode: 4,
+      };
+      return annotateTerminalResult(failure, "validation_circuit_breaker");
+    }
     if (!qualityGatePolicy.criticGateEnabled) {
       onLog?.("stdout", "[CriticGate] Disabled by workerpals.quality_critic_gate_enabled=false.");
     } else if (skipCriticAfterExecutorTimeout) {
