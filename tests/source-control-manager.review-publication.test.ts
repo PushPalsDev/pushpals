@@ -5,6 +5,7 @@ import {
   parseReviewPublicationLease,
   reviewCompletionHandoffMatches,
   shouldCleanupCompletionHandoff,
+  shouldUseReviewPublicationFlow,
 } from "../apps/source_control_manager/src/review_publication";
 
 describe("SourceControlManager review publication lease", () => {
@@ -22,6 +23,19 @@ describe("SourceControlManager review publication lease", () => {
   test("retains immutable handoffs until processed state is confirmed", () => {
     expect(shouldCleanupCompletionHandoff(false)).toBe(false);
     expect(shouldCleanupCompletionHandoff(true)).toBe(true);
+  });
+
+  test("keeps an in-flight leased review completion on the review publication path", () => {
+    const lease = {
+      targetBranch: "agent/feature",
+      baseBranch: "main",
+      expectedHeadSha: "a".repeat(40),
+      expectedBaseSha: "b".repeat(40),
+    };
+
+    expect(shouldUseReviewPublicationFlow(true, null)).toBe(true);
+    expect(shouldUseReviewPublicationFlow(false, lease)).toBe(true);
+    expect(shouldUseReviewPublicationFlow(false, null)).toBe(false);
   });
 
   test("parses exact head/base leases and builds the sole public-branch push", () => {

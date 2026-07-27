@@ -16,6 +16,7 @@ import {
   parseReviewPublicationLease,
   reviewCompletionHandoffMatches,
   shouldCleanupCompletionHandoff,
+  shouldUseReviewPublicationFlow,
 } from "./review_publication";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
@@ -545,6 +546,10 @@ async function tick(): Promise<void> {
     const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/")
       ? parseReviewPublicationLease(completion.prBody)
       : null;
+    const useReviewPublicationFlow = shouldUseReviewPublicationFlow(
+      runtimeConfig.reviewAgent.enabled,
+      reviewPublicationLease,
+    );
     const comm = createSessionComm(completion.sessionId);
     const completionEventMeta =
       completion.origin === "autonomy"
@@ -675,7 +680,7 @@ async function tick(): Promise<void> {
       if (!applyResult.ok) {
         if (
           shouldBypassApplyFailureInReviewMode({
-            reviewAgentEnabled: runtimeConfig.reviewAgent.enabled,
+            reviewAgentEnabled: useReviewPublicationFlow,
             mergeStrategy: runtimeConfig.mergeStrategy,
             applyStdout: applyResult.stdout,
             applyStderr: applyResult.stderr,
@@ -718,7 +723,7 @@ async function tick(): Promise<void> {
       }
 
       // 5. Merge to main OR create individual PR (ReviewAgent mode)
-      if (runtimeConfig.reviewAgent.enabled) {
+      if (useReviewPublicationFlow) {
         // ReviewAgent mode: create individual PR from agent branch to prBaseBranch.
         // The agent branch already exists on remote (pushed by the worker).
         // Checks have passed; we skip merging into main_agents entirely.
@@ -938,7 +943,7 @@ async function tick(): Promise<void> {
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
         cleanupCompletionHandoff = true;
-        const pushMessage = runtimeConfig.reviewAgent.enabled
+        const pushMessage = useReviewPublicationFlow
           ? skipLocalApplyDueConflict
             ? `Local apply/checks were bypassed for ${completion.commitSha.slice(0, 8)} due cherry-pick conflict; individual PR flow continued for ReviewAgent.`
             : `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`

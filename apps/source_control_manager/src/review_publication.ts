@@ -82,3 +82,10 @@ export function reviewCompletionHandoffMatches(
 export function shouldCleanupCompletionHandoff(processedConfirmed: boolean): boolean {
   return processedConfirmed;
 }
+
+export function shouldUseReviewPublicationFlow(
+  reviewAgentEnabled: boolean,
+  lease: ReviewPublicationLease | null,
+): boolean {
+  return reviewAgentEnabled || lease !== null;
+}
