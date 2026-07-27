@@ -2071,7 +2071,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     });
   });
 
-  test("prepareCliRuntime migrates stale embedded local autonomy overrides back to the default-on state", async () => {
+  test("prepareCliRuntime preserves an explicit embedded local autonomy disable", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-autonomy-migrate-"));
     const repoRoot = join(root, "repo");
     const runtimeRoot = join(root, "runtime");
@@ -2091,9 +2091,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       });
 
       expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
-      expect(prepared.runtimePreflight.config?.remotebuddy.autonomy.enabled).toBe(true);
+      expect(prepared.runtimePreflight.config?.remotebuddy.autonomy.enabled).toBe(false);
       expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toContain(
-        "enabled = true",
+        "enabled = false",
       );
     } finally {
       rmSync(root, { recursive: true, force: true });

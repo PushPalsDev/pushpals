@@ -1674,11 +1674,7 @@ function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
   } catch {
     return;
   }
-  const updated = original.replace(
-    /^(\[remotebuddy\.autonomy\]\r?\n)(enabled\s*=\s*false\s*\r?\n)/m,
-    "$1enabled = true\n",
-  );
-  let migrated = updated;
+  let migrated = original;
   for (const sectionName of ["localbuddy.llm", "remotebuddy.llm"]) {
     migrated = migrateEmbeddedRuntimeTomlSection(migrated, sectionName, (sectionBody) =>
       migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: true }),
