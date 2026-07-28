@@ -66,6 +66,7 @@ export interface SourceControlApi {
   discoverAgentBranches(): Promise<DiscoveredBranch[]>;
   getMainHeadSha(): Promise<string>;
   checkoutMain(): Promise<void>;
+  alignMainToRemote(): Promise<string | null>;
   pullMainFF(): Promise<void>;
   syncMainWithBaseBranch(): Promise<IntegrationBaseSyncResult>;
   createTempBranch(name: string): Promise<void>;
@@ -674,6 +675,34 @@ export class GitSourceControlApi implements SourceControlApi {
           "--quiet",
         ]);
     assertOk(result, "checkout main");
+  }
+
+  /**
+   * Align the disposable local integration ref to the fetched remote exactly.
+   *
+   * Periodic maintenance must treat the remote integration branch as the
+   * durable source of truth. Keeping an unpublished local-ahead merge here can
+   * otherwise hide a remote rewind/replacement forever.
+   */
+  async alignMainToRemote(): Promise<string | null> {
+    const remoteMain = this.remoteMainRef();
+    const remoteHeadSha = await this.revParse(remoteMain);
+    if (!remoteHeadSha) return null;
+
+    const checkoutResult = await git(this.repoPath, [
+      "checkout",
+      "--detach",
+      remoteMain,
+      "--quiet",
+    ]);
+    assertOk(checkoutResult, `checkout --detach ${remoteMain}`);
+    const pinResult = await git(this.repoPath, [
+      "update-ref",
+      this.localMainRef,
+      remoteHeadSha,
+    ]);
+    assertOk(pinResult, `align ${this.localMainRef} to ${remoteMain}`);
+    return remoteHeadSha;
   }
 
   /**

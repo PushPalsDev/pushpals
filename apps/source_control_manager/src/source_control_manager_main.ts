@@ -525,8 +525,11 @@ async function maintainIntegrationBranch(
 
   try {
     await gitOps.fetchPrune();
-    await gitOps.checkoutMain();
-    await gitOps.pullMainFF();
+    const alignedRemoteHead = await gitOps.alignMainToRemote();
+    if (!alignedRemoteHead) {
+      await gitOps.checkoutMain();
+      await gitOps.pullMainFF();
+    }
     const sync = await gitOps.syncMainWithBaseBranch();
     if (sync.status === "up_to_date") {
       logIntegrationMaintenanceState(

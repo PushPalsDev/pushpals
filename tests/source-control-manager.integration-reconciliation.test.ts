@@ -112,6 +112,38 @@ describe("source_control_manager integration reconciliation", () => {
     expect(await gitOps.isAncestor(fixture.integrationHeadSha, "origin/main_agents")).toBe(true);
   }, 20_000);
 
+  test("realigns a locally-ahead maintenance ref after the remote integration branch is replaced", async () => {
+    const fixture = await createFixture({ conflicting: false });
+    const gitOps = createGitOps(fixture.scm);
+
+    await gitOps.fetchPrune();
+    await gitOps.alignMainToRemote();
+    const firstSync = await gitOps.syncMainWithBaseBranch();
+    expect(firstSync.status).toBe("updated");
+    if (firstSync.status !== "updated") {
+      throw new Error(`unexpected sync status ${firstSync.status}`);
+    }
+    expect((await gitOps.pushMain()).ok).toBe(true);
+
+    await mustGit(fixture.scm, [
+      "push",
+      "--force",
+      "origin",
+      `${fixture.integrationHeadSha}:refs/heads/main_agents`,
+    ]);
+    await gitOps.fetchPrune();
+    expect(await gitOps.getMainHeadSha()).toBe(firstSync.mergedHeadSha);
+
+    expect(await gitOps.alignMainToRemote()).toBe(fixture.integrationHeadSha);
+    expect(await gitOps.getMainHeadSha()).toBe(fixture.integrationHeadSha);
+    const repairedSync = await gitOps.syncMainWithBaseBranch();
+    expect(repairedSync.status).toBe("updated");
+    expect((await gitOps.pushMain()).ok).toBe(true);
+    await gitOps.fetchPrune();
+    expect(await gitOps.isAncestor("origin/main", "origin/main_agents")).toBe(true);
+    expect(await gitOps.isAncestor(fixture.integrationHeadSha, "origin/main_agents")).toBe(true);
+  }, 30_000);
+
   test("returns exact conflict state, aborts the host merge, and builds a leased repair job", async () => {
     const fixture = await createFixture({ conflicting: true });
     const gitOps = createGitOps(fixture.scm);
