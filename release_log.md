@@ -2,22 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.2.0`
-- start_commit: `dce845d67294116cdd522decd0d39b69027a0364`
-- end_commit: `02690b34ccedd19f2bd30d0d94212cfd6559536a`
+- version: `v1.2.1`
+- start_commit: `a05be8e2e20c90d19bad9b4058603cae09e35c0a`
+- end_commit: `836557707831b681f4bf9e6ad423f2619be04f45`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Always publish immutable review-fix revisions to their leased PR branch, including when the host-prepared handoff ref is already available locally.
-- Protect existing PR heads with an exact `--force-with-lease` expectation before marking review publication processed.
-- Add regression coverage for the local immutable-handoff path that previously skipped publication.
+- Reconcile the integration branch with its source branch continuously, even when the completion queue is empty, so clean divergence cannot leave autonomy permanently paused.
+- Dispatch exact-lease integration-repair jobs for genuine conflicts while RemoteBuddy continues planning from the integration head instead of discarding context or freezing.
+- Refresh stale review base leases before worker startup, preserve integrated worktree context during divergence, and keep host-side SCM responsible for rebasing and publication.
+- Add real-Git integration coverage for clean divergence, conflicted reconciliation, abort cleanup, and repair-job lease construction.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 978 passed, 2 intentional skips, 0 failed, 3,736 assertions across 116 files.
-- `bun test tests/source-control-manager.review-publication.test.ts` on Bun 1.3.14: 7 passed, 0 failed, 16 assertions.
-- SourceControlManager TypeScript check passed.
+- Full root suite on Bun 1.3.14: 983 passed, 2 intentional skips, 0 failed, 3,762 assertions across 117 files.
+- Full repository suite on Bun 1.3.14: 1,050 passed, 2 intentional skips, 0 failed, 4,067 assertions across 125 files.
+- Focused reconciliation and worker lease suite: 41 passed, 1 intentional Linux-container skip, 0 failed, 187 assertions.
+- SourceControlManager, RemoteBuddy, and WorkerPals TypeScript checks passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
 - `git diff --check` passed.
