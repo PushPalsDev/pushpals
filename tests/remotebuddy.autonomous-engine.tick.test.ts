@@ -18,7 +18,7 @@ let originalFetch: typeof globalThis.fetch;
 let originalSpawn: typeof Bun.spawn;
 
 describe("autonomy integration baseline", () => {
-  test("keeps integration context when it contains main and pauses on true divergence", () => {
+  test("keeps integration context both when it contains main and while SCM reconciles divergence", () => {
     expect(
       autonomyIntegrationBaselineDecision({
         fastForwardSucceeded: false,
@@ -30,7 +30,7 @@ describe("autonomy integration baseline", () => {
         fastForwardSucceeded: false,
         integrationContainsBase: false,
       }),
-    ).toBe("pause_for_scm");
+    ).toBe("use_integration_head");
   });
 });
 

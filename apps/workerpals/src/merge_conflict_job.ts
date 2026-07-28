@@ -9,6 +9,7 @@ type GitResult = {
 };
 
 type MergeConflictReviewContext = {
+  resolutionType: "merge_conflict" | "integration_reconcile";
   publicBranch: string;
   baseBranch: string;
   expectedHeadSha: string;
@@ -30,7 +31,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function normalizeBranchName(value: unknown): string {
+function normalizeBranchName(
+  value: unknown,
+  resolutionType: "merge_conflict" | "integration_reconcile",
+): string {
   const trimmed = String(value ?? "")
     .trim()
     .replace(/^refs\/heads\//, "");
@@ -38,7 +42,7 @@ function normalizeBranchName(value: unknown): string {
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/^\/+|\/+$/g, "");
-  if (!normalized.startsWith("agent/")) return "";
+  if (resolutionType === "merge_conflict" && !normalized.startsWith("agent/")) return "";
   if (
     normalized.includes("..") ||
     normalized.includes("@{") ||
@@ -221,13 +225,19 @@ export function extractMergeConflictReviewContext(
   const resolutionType = String(reviewAgent.resolutionType ?? "")
     .trim()
     .toLowerCase();
-  if (resolutionType !== "merge_conflict") return null;
+  if (resolutionType !== "merge_conflict" && resolutionType !== "integration_reconcile") {
+    return null;
+  }
 
-  const publicBranch = normalizeBranchName(params?.completionBranch ?? reviewAgent.prHeadRef);
+  const publicBranch = normalizeBranchName(
+    params?.completionBranch ?? reviewAgent.prHeadRef,
+    resolutionType,
+  );
   const baseBranch = normalizeBaseBranch(reviewAgent.prBaseRef);
-  if (!publicBranch || !baseBranch) return null;
+  if (!publicBranch || !baseBranch || publicBranch === baseBranch) return null;
 
   return {
+    resolutionType,
     publicBranch,
     baseBranch,
     expectedHeadSha: String(reviewAgent.prHeadSha ?? "").trim(),
@@ -249,7 +259,11 @@ export function isReviewResolutionParams(
   const resolutionType = String(reviewAgent?.resolutionType ?? "")
     .trim()
     .toLowerCase();
-  return resolutionType === "review_fix" || resolutionType === "merge_conflict";
+  return (
+    resolutionType === "review_fix" ||
+    resolutionType === "merge_conflict" ||
+    resolutionType === "integration_reconcile"
+  );
 }
 
 export function isHostScmOwnedReviewParams(

@@ -34,6 +34,28 @@ export interface TempBranchCleanupSummary {
   warnings: string[];
 }
 
+export type IntegrationBaseSyncResult =
+  | {
+      status: "up_to_date";
+      integrationHeadSha: string;
+      baseHeadSha: string;
+      conflictPaths: [];
+    }
+  | {
+      status: "updated";
+      integrationHeadSha: string;
+      baseHeadSha: string;
+      mergedHeadSha: string;
+      conflictPaths: [];
+    }
+  | {
+      status: "conflicted";
+      integrationHeadSha: string;
+      baseHeadSha: string;
+      conflictPaths: string[];
+      detail: string;
+    };
+
 export interface SourceControlApi {
   readonly provider: SourceControlProvider;
   readonly repoPath: string;
@@ -45,7 +67,7 @@ export interface SourceControlApi {
   getMainHeadSha(): Promise<string>;
   checkoutMain(): Promise<void>;
   pullMainFF(): Promise<void>;
-  syncMainWithBaseBranch(): Promise<void>;
+  syncMainWithBaseBranch(): Promise<IntegrationBaseSyncResult>;
   createTempBranch(name: string): Promise<void>;
   mergeNoFF(agentBranch: string, message: string): Promise<GitResult>;
   mergeFFOnly(agentBranch: string): Promise<GitResult>;
@@ -676,31 +698,76 @@ export class GitSourceControlApi implements SourceControlApi {
    * Merge the configured integration base (e.g. origin/main) into the local
    * integration branch so integration stays aligned with source-of-truth.
    */
-  async syncMainWithBaseBranch(): Promise<void> {
+  async syncMainWithBaseBranch(): Promise<IntegrationBaseSyncResult> {
     const baseRef = this.integrationBaseRef();
-    if (!(await this.revParse(baseRef))) {
+    const baseHeadSha = await this.revParse(baseRef);
+    if (!baseHeadSha) {
       console.warn(`[source_control_manager] Skipping base sync: ${baseRef} does not exist.`);
-      return;
+      throw new Error(`Cannot sync ${this.mainBranch}: base ref ${baseRef} does not exist.`);
     }
 
-    if (!(await this.revParse(this.localMainRef))) {
+    const integrationHeadSha = await this.revParse(this.localMainRef);
+    if (!integrationHeadSha) {
       console.warn(
         `[source_control_manager] Skipping base sync: local integration ref ${this.localMainRef} is missing.`,
       );
-      return;
+      throw new Error(
+        `Cannot sync ${this.mainBranch}: local integration ref ${this.localMainRef} is missing.`,
+      );
     }
 
     const alreadySynced = await this.isAncestor(baseRef, this.localMainRef);
-    if (alreadySynced) return;
+    if (alreadySynced) {
+      return {
+        status: "up_to_date",
+        integrationHeadSha,
+        baseHeadSha,
+        conflictPaths: [],
+      };
+    }
 
     const mergeResult = await git(this.repoPath, ["merge", baseRef, "--no-edit"]);
     if (!mergeResult.ok) {
-      throw new Error(
-        `Failed to sync ${this.mainBranch} with ${baseRef}: ${mergeResult.stderr || mergeResult.stdout}`,
-      );
+      const conflicts = await git(this.repoPath, ["diff", "--name-only", "--diff-filter=U"]);
+      const conflictPaths = conflicts.ok
+        ? conflicts.stdout
+            .split(/\r?\n/)
+            .map((value) => value.trim().replace(/\\/g, "/"))
+            .filter(Boolean)
+        : [];
+      const detail = mergeResult.stderr || mergeResult.stdout || "merge failed";
+      await git(this.repoPath, ["merge", "--abort"]);
+      const restore = await git(this.repoPath, [
+        "checkout",
+        "--detach",
+        this.localMainRef,
+        "--quiet",
+      ]);
+      assertOk(restore, `restore ${this.localMainRef} after base-sync conflict`);
+      if (conflictPaths.length === 0) {
+        throw new Error(`Failed to sync ${this.mainBranch} with ${baseRef}: ${detail}`);
+      }
+      return {
+        status: "conflicted",
+        integrationHeadSha,
+        baseHeadSha,
+        conflictPaths,
+        detail,
+      };
     }
     const pinResult = await git(this.repoPath, ["update-ref", this.localMainRef, "HEAD"]);
     assertOk(pinResult, `update-ref ${this.localMainRef} HEAD`);
+    const mergedHeadSha = await this.revParse("HEAD");
+    if (!mergedHeadSha) {
+      throw new Error(`Failed to resolve merged ${this.mainBranch} head after syncing ${baseRef}.`);
+    }
+    return {
+      status: "updated",
+      integrationHeadSha,
+      baseHeadSha,
+      mergedHeadSha,
+      conflictPaths: [],
+    };
   }
 
   // ── Branch operations for merging ─────────────────────────────────────

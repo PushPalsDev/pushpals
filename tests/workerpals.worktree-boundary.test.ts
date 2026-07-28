@@ -206,4 +206,44 @@ describe("review worktree base leases", () => {
       ["rev-parse", "--verify", "origin/main^{commit}"],
     ]);
   });
+
+  test("refreshes a stale merge-conflict base lease before any worker execution", async () => {
+    const currentBaseSha = "c".repeat(40);
+    const params: Record<string, unknown> = {
+      plannerWorkerInstruction: "Resolve the prepared conflicts.",
+      reviewAgent: {
+        resolutionType: "merge_conflict",
+        prHeadRef: "agent/feature/conflict",
+        prHeadSha: expectedSha,
+        prBaseRef: "main",
+        prBaseSha: expectedBaseSha,
+      },
+    };
+    const messages: string[] = [];
+
+    const resolved = await resolveReviewWorktreeBase({
+      jobId: "job-stale-base",
+      params,
+      git: async (args) => {
+        if (args[0] === "fetch") return { ok: true, stdout: "", stderr: "" };
+        return {
+          ok: true,
+          stdout: args[2]?.startsWith("origin/main") ? currentBaseSha : expectedSha,
+          stderr: "",
+        };
+      },
+      fallback: async () => "main_agents",
+      log: (_level, message) => messages.push(message),
+    });
+
+    expect(resolved).toBe(expectedSha);
+    expect((params.reviewAgent as Record<string, unknown>).prBaseSha).toBe(currentBaseSha);
+    expect((params.reviewAgent as Record<string, unknown>).prBaseLeaseRefreshedFrom).toBe(
+      expectedBaseSha,
+    );
+    expect(String(params.plannerWorkerInstruction)).toContain(
+      `advanced from ${expectedBaseSha} to ${currentBaseSha}`,
+    );
+    expect(messages.join("\n")).toContain("refreshed stale base lease");
+  });
 });

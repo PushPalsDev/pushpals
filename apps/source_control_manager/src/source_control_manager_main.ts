@@ -8,6 +8,7 @@ import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { createSourceControlApi, runGitCommandCapture, type SourceControlApi } from "./git";
 import { ensureIntegrationPullRequest } from "./github_pr";
+import { buildIntegrationReconciliationJob } from "./integration_reconciliation";
 import { ReviewAgent } from "./review_agent";
 import { deriveReviewPrHeadBranch } from "./review_pr_branch";
 import {
@@ -227,6 +228,13 @@ let shutdownPromise: Promise<void> | null = null;
 const startupStatusTracker = createStartupStatusTracker();
 let reviewAgentRuntimeStateKey = "startup";
 let reviewAgentRuntimeFingerprint = "";
+let nextIntegrationMaintenanceAtMs = 0;
+let integrationMaintenanceStateKey = "startup";
+
+const integrationMaintenanceIntervalMs = Math.max(
+  10_000,
+  Math.min(60_000, config.pollIntervalSeconds * 3_000),
+);
 
 const reviewAgentConfigPollMs = 3_000;
 const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(async () => {
@@ -493,6 +501,115 @@ async function emitPusherMessage(
   }
 }
 
+function logIntegrationMaintenanceState(
+  key: string,
+  message: string,
+  level: "log" | "warn" = "log",
+): void {
+  if (integrationMaintenanceStateKey === key) return;
+  integrationMaintenanceStateKey = key;
+  if (level === "warn") {
+    console.warn(message);
+    return;
+  }
+  console.log(message);
+}
+
+async function maintainIntegrationBranch(
+  runtimeConfig: SourceControlManagerConfig,
+  headers: Record<string, string>,
+): Promise<void> {
+  const now = Date.now();
+  if (now < nextIntegrationMaintenanceAtMs) return;
+  nextIntegrationMaintenanceAtMs = now + integrationMaintenanceIntervalMs;
+
+  try {
+    await gitOps.fetchPrune();
+    await gitOps.checkoutMain();
+    await gitOps.pullMainFF();
+    const sync = await gitOps.syncMainWithBaseBranch();
+    if (sync.status === "up_to_date") {
+      logIntegrationMaintenanceState(
+        `healthy:${sync.integrationHeadSha}:${sync.baseHeadSha}`,
+        `[${ts()}] Integration branch ${runtimeConfig.remote}/${runtimeConfig.mainBranch} contains ${runtimeConfig.remote}/${runtimeConfig.integrationBaseBranch}; continuous dispatch is ready.`,
+      );
+      return;
+    }
+
+    if (sync.status === "updated") {
+      if (!runtimeConfig.pushMainAfterMerge) {
+        logIntegrationMaintenanceState(
+          `updated-local:${sync.mergedHeadSha}`,
+          `[${ts()}] Integration branch ${runtimeConfig.mainBranch} was reconciled locally with ${runtimeConfig.integrationBaseBranch}, but push_main_after_merge=false prevents remote publication.`,
+          "warn",
+        );
+        return;
+      }
+      const push = await gitOps.pushMain();
+      if (!push.ok) {
+        throw new Error(
+          `Failed to push reconciled ${runtimeConfig.mainBranch}: ${push.stderr || push.stdout}`,
+        );
+      }
+      await gitOps.fetchPrune();
+      logIntegrationMaintenanceState(
+        `reconciled:${sync.mergedHeadSha}`,
+        `[${ts()}] Reconciled ${runtimeConfig.remote}/${runtimeConfig.mainBranch} with ${runtimeConfig.remote}/${runtimeConfig.integrationBaseBranch} (${sync.integrationHeadSha.slice(0, 8)} -> ${sync.mergedHeadSha.slice(0, 8)}) and pushed the result.`,
+      );
+      return;
+    }
+
+    const payload = buildIntegrationReconciliationJob({
+      sessionId: statusSessionId,
+      integrationBranch: runtimeConfig.mainBranch,
+      baseBranch: runtimeConfig.integrationBaseBranch,
+      sync,
+      now,
+    });
+    const response = await fetch(`${runtimeConfig.serverUrl}/jobs/enqueue`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+    const responseBody = (await response.json().catch(() => null)) as {
+      jobId?: unknown;
+      deduped?: unknown;
+      message?: unknown;
+    } | null;
+    if (!response.ok) {
+      throw new Error(
+        `Failed to enqueue integration reconciliation job: HTTP ${response.status}${
+          typeof responseBody?.message === "string" ? ` ${responseBody.message}` : ""
+        }`,
+      );
+    }
+    const jobId =
+      typeof responseBody?.jobId === "string" && responseBody.jobId.trim()
+        ? responseBody.jobId.trim()
+        : "unknown";
+    const deduped = responseBody?.deduped === true;
+    logIntegrationMaintenanceState(
+      `repair:${payload.dedupeKey}:${jobId}`,
+      `[${ts()}] ${runtimeConfig.mainBranch} conflicts with ${runtimeConfig.integrationBaseBranch}; ${
+        deduped ? "reusing" : "dispatched"
+      } exact-lease integration reconciliation job ${jobId} for ${sync.conflictPaths.join(", ")}.`,
+      "warn",
+    );
+  } catch (err: any) {
+    try {
+      await gitOps.resetToClean();
+    } catch {
+      // The next maintenance tick retries from freshly fetched remote refs.
+    }
+    const detail = err?.message ?? String(err);
+    logIntegrationMaintenanceState(
+      `error:${detail}`,
+      `[${ts()}] Integration maintenance failed; SourceControlManager will retry without freezing autonomy: ${detail}`,
+      "warn",
+    );
+  }
+}
+
 async function tick(): Promise<void> {
   try {
     const runtimeConfig = cloneSourceControlManagerConfigSnapshot(config);
@@ -502,6 +619,8 @@ async function tick(): Promise<void> {
     if (runtimeConfig.authToken) {
       headers["Authorization"] = `Bearer ${runtimeConfig.authToken}`;
     }
+
+    await maintainIntegrationBranch(runtimeConfig, headers);
 
     const pusherId = `source_control_manager-${Math.random().toString(36).substring(2, 10)}`;
 
@@ -547,6 +666,11 @@ async function tick(): Promise<void> {
     const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/")
       ? parseReviewPublicationLease(completion.prBody)
       : null;
+    const isIntegrationReconciliationCompletion = Boolean(
+      reviewPublicationLease &&
+      reviewPublicationLease.targetBranch === runtimeConfig.mainBranch &&
+      reviewPublicationLease.baseBranch === runtimeConfig.integrationBaseBranch,
+    );
     const useReviewPublicationFlow = shouldUseReviewPublicationFlow(
       runtimeConfig.reviewAgent.enabled,
       reviewPublicationLease,
@@ -644,7 +768,14 @@ async function tick(): Promise<void> {
       await gitOps.resetToClean();
       await gitOps.checkoutMain();
       await gitOps.pullMainFF();
-      await gitOps.syncMainWithBaseBranch();
+      if (!isIntegrationReconciliationCompletion) {
+        const baseSync = await gitOps.syncMainWithBaseBranch();
+        if (baseSync.status === "conflicted") {
+          throw new Error(
+            `Integration reconciliation is active for ${runtimeConfig.mainBranch} and ${runtimeConfig.integrationBaseBranch}; conflicted paths: ${baseSync.conflictPaths.join(", ")}.`,
+          );
+        }
+      }
       await gitOps.createTempBranch(tempBranch);
       let skipLocalApplyDueConflict = false;
 

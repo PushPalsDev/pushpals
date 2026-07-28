@@ -1309,7 +1309,9 @@ async function enqueueCompletion(
       .toLowerCase();
     const reviewBaseBranch = normalizeReviewLeaseBranch(reviewAgent?.prBaseRef);
     const completionPrBody =
-      (resolutionType === "review_fix" || resolutionType === "merge_conflict") &&
+      (resolutionType === "review_fix" ||
+        resolutionType === "merge_conflict" ||
+        resolutionType === "integration_reconcile") &&
       reviewTargetBranch &&
       reviewExpectedHeadSha
         ? [

@@ -55,6 +55,7 @@ describe("workerpals worktree base ref resolution", () => {
     const messages: string[] = [];
     const { git } = createGitMock({
       refs: new Set(["origin/main_agents", "origin/main"]),
+      ancestors: new Set(["origin/main_agents..origin/main"]),
     });
 
     const resolved = await resolveFreshWorktreeBaseRef({
@@ -66,7 +67,25 @@ describe("workerpals worktree base ref resolution", () => {
     });
 
     expect(resolved).toBe("origin/main");
-    expect(messages.join("\n")).toContain("does not contain origin/main");
+    expect(messages.join("\n")).toContain("is behind origin/main");
+  });
+
+  test("preserves integration context while source control reconciles true divergence", async () => {
+    const messages: string[] = [];
+    const { git } = createGitMock({
+      refs: new Set(["origin/main_agents", "origin/main"]),
+    });
+
+    const resolved = await resolveFreshWorktreeBaseRef({
+      requestedRef: "origin/main_agents",
+      integrationBranch: "main_agents",
+      sourceBaseBranch: "main",
+      git,
+      log: (_level, message) => messages.push(message),
+    });
+
+    expect(resolved).toBe("origin/main_agents");
+    expect(messages.join("\n")).toContain("has diverged from origin/main");
   });
 
   test("uses cached source base when refresh fails but local ref exists", async () => {
@@ -74,6 +93,7 @@ describe("workerpals worktree base ref resolution", () => {
     const { git } = createGitMock({
       refs: new Set(["origin/main_agents", "origin/main"]),
       fetchFailures: new Set(["main"]),
+      ancestors: new Set(["origin/main_agents..origin/main"]),
     });
 
     const resolved = await resolveFreshWorktreeBaseRef({

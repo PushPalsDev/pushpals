@@ -99,7 +99,12 @@ export class JobRunner {
       await this.gitOps.fetchPrune();
       await this.gitOps.checkoutMain();
       await this.gitOps.pullMainFF();
-      await this.gitOps.syncMainWithBaseBranch();
+      const baseSync = await this.gitOps.syncMainWithBaseBranch();
+      if (baseSync.status === "conflicted") {
+        throw new Error(
+          `Integration reconciliation required before merge: ${baseSync.conflictPaths.join(", ")}`,
+        );
+      }
 
       // Log SHAs for debugging
       const originMainSha = await this.gitOps.revParse(

@@ -7009,7 +7009,7 @@ async function repoPreflight(repo) {
 function autonomyIntegrationBaselineDecision(options) {
   if (options.fastForwardSucceeded)
     return "synced";
-  return options.integrationContainsBase ? "use_integration_head" : "pause_for_scm";
+  return "use_integration_head";
 }
 
 class RemoteBuddyAutonomousEngine {
@@ -7305,11 +7305,13 @@ class RemoteBuddyAutonomousEngine {
         integrationContainsBase: integrationContainsBase.ok
       });
       if (baselineDecision === "use_integration_head") {
-        console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: ${integrationRef} already contains ${baseRef}; using the integration head as the planning baseline.`);
+        if (integrationContainsBase.ok) {
+          console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: ${integrationRef} already contains ${baseRef}; using the integration head as the planning baseline.`);
+        } else {
+          console.warn(`[RemoteBuddyAutonomousEngine] tick ${runId}: ${integrationRef} and ${baseRef} have diverged. Continuing from the integration head while SourceControlManager actively reconciles the branches; integration context will not be discarded.`);
+        }
         return true;
       }
-      console.error(`[RemoteBuddyAutonomousEngine] tick ${runId}: paused autonomy dispatch because ${integrationRef} and ${baseRef} have diverged and cannot be fast-forwarded. SourceControlManager must reconcile the branches before planning resumes. ${mergeMain.stderr || mergeMain.stdout || `merge exit ${mergeMain.exitCode}`}`);
-      return false;
     }
     return true;
   }

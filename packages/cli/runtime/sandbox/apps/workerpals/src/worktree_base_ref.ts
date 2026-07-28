@@ -61,6 +61,10 @@ function normalizeExpectedSha(value: unknown): string | null {
   return /^[0-9a-f]{40,64}$/.test(normalized) ? normalized : null;
 }
 
+function isReviewResolutionType(value: string): boolean {
+  return value === "review_fix" || value === "merge_conflict" || value === "integration_reconcile";
+}
+
 export async function resolveReviewWorktreeBase(
   options: ResolveReviewWorktreeBaseOptions,
 ): Promise<string> {
@@ -74,7 +78,7 @@ export async function resolveReviewWorktreeBase(
     typeof reviewAgent?.resolutionType === "string"
       ? reviewAgent.resolutionType.trim().toLowerCase()
       : "";
-  if (resolutionType !== "review_fix" && resolutionType !== "merge_conflict") {
+  if (!reviewAgent || !isReviewResolutionType(resolutionType)) {
     return options.fallback();
   }
 
@@ -117,7 +121,7 @@ export async function resolveReviewWorktreeBase(
     );
   }
 
-  if (resolutionType === "merge_conflict") {
+  if (resolutionType === "merge_conflict" || resolutionType === "integration_reconcile") {
     const baseRef = normalizeReviewHeadRef(reviewAgent?.prBaseRef);
     const expectedBaseSha = normalizeExpectedSha(reviewAgent?.prBaseSha);
     if (!baseRef || !expectedBaseSha) {
@@ -147,13 +151,32 @@ export async function resolveReviewWorktreeBase(
           .toLowerCase()
       : "";
     if (actualBaseSha !== expectedBaseSha) {
-      throw new Error(
-        `merge_conflict job ${options.jobId} has a stale PR-base lease: expected ${expectedBaseSha}, but ${baseRemoteRef} is ${actualBaseSha || "unavailable"}. Requeue against the current base.`,
+      if (!normalizeExpectedSha(actualBaseSha)) {
+        throw new Error(
+          `${resolutionType} job ${options.jobId} could not refresh its stale base lease: expected ${expectedBaseSha}, but ${baseRemoteRef} is unavailable.`,
+        );
+      }
+      reviewAgent.prBaseSha = actualBaseSha;
+      reviewAgent.prBaseLeaseRefreshedFrom = expectedBaseSha;
+      reviewAgent.prBaseLeaseRefreshedAt = new Date().toISOString();
+      const existingGuidance =
+        typeof options.params.plannerWorkerInstruction === "string"
+          ? options.params.plannerWorkerInstruction.trim()
+          : "";
+      options.params.plannerWorkerInstruction = [
+        existingGuidance,
+        `Host lease refresh: ${baseRemoteRef} advanced from ${expectedBaseSha} to ${actualBaseSha} before execution. The host updated this job to the current exact base before preparing any worker checkout.`,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      options.log?.(
+        "warn",
+        `${resolutionType} job ${options.jobId}: refreshed stale base lease for ${baseRemoteRef} from ${expectedBaseSha} to ${actualBaseSha} before execution.`,
       );
     }
     options.log?.(
       "info",
-      `merge_conflict job ${options.jobId}: host verified ${baseRemoteRef} at exact PR base ${actualBaseSha}.`,
+      `${resolutionType} job ${options.jobId}: host verified ${baseRemoteRef} at exact base ${actualBaseSha}.`,
     );
   }
 
@@ -270,11 +293,19 @@ export async function resolveFreshWorktreeBaseRef(
   if (resolvedRef !== "HEAD" && (await refExists(options.git, resolvedRef))) {
     const sourceAlreadyIncluded = await isAncestor(options.git, sourceBaseRef, resolvedRef);
     if (sourceAlreadyIncluded) return resolvedRef;
+    const integrationIsOnlyBehind = await isAncestor(options.git, resolvedRef, sourceBaseRef);
+    if (!integrationIsOnlyBehind) {
+      options.log?.(
+        "warn",
+        `Worktree base ${resolvedRef} has diverged from ${sourceBaseRef}; preserving the integration head while SourceControlManager reconciles it so new jobs retain integrated context.`,
+      );
+      return resolvedRef;
+    }
   }
 
   options.log?.(
     "warn",
-    `Worktree base ${resolvedRef} does not contain ${sourceBaseRef}; using ${sourceBaseRef} for new WorkerPal jobs to avoid stale integration-branch checkouts.`,
+    `Worktree base ${resolvedRef} is behind ${sourceBaseRef}; using ${sourceBaseRef} for new WorkerPal jobs until SourceControlManager fast-forwards the integration branch.`,
   );
   return sourceBaseRef;
 }

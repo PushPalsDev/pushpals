@@ -2517,7 +2517,7 @@ export class DockerExecutor {
       reviewAgent && typeof reviewAgent.resolutionType === "string"
         ? reviewAgent.resolutionType.trim().toLowerCase()
         : "";
-    return resolutionType === "merge_conflict";
+    return resolutionType === "merge_conflict" || resolutionType === "integration_reconcile";
   }
 
   shouldPrepareMergeConflictJobBeforeExecution(job: Job): boolean {

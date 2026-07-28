@@ -7,7 +7,10 @@ import {
   executeJob,
   resumePreparedMergeConflictRebase,
 } from "../apps/workerpals/src/execute_job";
-import { prepareMergeConflictWorktreeOnHost } from "../apps/workerpals/src/merge_conflict_job";
+import {
+  extractMergeConflictReviewContext,
+  prepareMergeConflictWorktreeOnHost,
+} from "../apps/workerpals/src/merge_conflict_job";
 import { loadPushPalsConfig } from "shared";
 import type { WorkerpalsRuntimeConfig } from "../apps/workerpals/src/common/executor_backend";
 import type { ExecutorBackend } from "../apps/workerpals/src/common/types";
@@ -20,6 +23,35 @@ import {
 } from "../apps/workerpals/src/backends/task_execute_registry";
 
 const TEST_BACKEND = "__test_merge_conflict_backend__" as ExecutorBackend;
+
+test("integration reconciliation permits the configured integration branch but never the base", () => {
+  expect(
+    extractMergeConflictReviewContext({
+      completionBranch: "main_agents",
+      reviewAgent: {
+        resolutionType: "integration_reconcile",
+        prHeadRef: "main_agents",
+        prBaseRef: "main",
+        prHeadSha: "a".repeat(40),
+        prBaseSha: "b".repeat(40),
+      },
+    }),
+  ).toMatchObject({
+    resolutionType: "integration_reconcile",
+    publicBranch: "main_agents",
+    baseBranch: "main",
+  });
+  expect(
+    extractMergeConflictReviewContext({
+      completionBranch: "main",
+      reviewAgent: {
+        resolutionType: "integration_reconcile",
+        prHeadRef: "main",
+        prBaseRef: "main",
+      },
+    }),
+  ).toBeNull();
+});
 
 function stubBackendScriptSegmentsForTesting(
   backend: ExecutorBackend,
