@@ -1,14 +1,105 @@
 import { describe, expect, test } from "bun:test";
 import {
+  holdCommitForTrustedValidation,
   inferWorkerTerminalFailureClass,
   shouldDeferDockerCodexStartupStallForDirectRetry,
   shouldEmitDirectSessionJobEvent,
   shouldRecycleWorkerForCodexUnavailableFailure,
   shouldRecycleWorkerForHeartbeatDegradation,
+  workerJobResultFromDocker,
   workerRecycleExitCodeForResult,
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
+  test("preserves Docker structured diagnostics and usage through the host boundary", () => {
+    const result = workerJobResultFromDocker({
+      ok: false,
+      summary: "Required validation could not access the Docker daemon",
+      exitCode: 1,
+      cooldownMs: 60_000,
+      usage: {
+        promptTokens: 100,
+        completionTokens: 25,
+        totalTokens: 125,
+      },
+      diagnostics: {
+        validationRuns: [
+          {
+            command: "bun run validate",
+            exitCode: 1,
+            passed: false,
+            failureClass: "environment",
+          },
+        ],
+        patchSnapshots: [
+          {
+            phase: "quality_gate",
+            publishableFileCount: 2,
+            changedPathSample: ["scripts/test-supabase.js"],
+          },
+        ],
+      },
+    });
+
+    expect(result.cooldownMs).toBe(60_000);
+    expect(result.usage?.totalTokens).toBe(125);
+    expect(result.diagnostics?.validationRuns).toHaveLength(1);
+    expect(result.diagnostics?.patchSnapshots).toHaveLength(1);
+  });
+
+  test("holds an environment-blocked candidate ref instead of enqueueing completion", () => {
+    const held = holdCommitForTrustedValidation(
+      {
+        ok: true,
+        summary: "candidate ready",
+        validationBlocked: {
+          category: "environment",
+          summary: "Candidate patch requires trusted-environment validation before publication",
+          detail: "Docker socket access is not permitted in the sandbox.",
+          commands: ["bun run validate"],
+        },
+      },
+      {
+        branch: "refs/pushpals/agent/worker/job",
+        publicBranch: "agent/worker/job",
+        sha: "abc123",
+      },
+    );
+
+    expect(held.completionCommit).toBeNull();
+    expect(held.result.ok).toBe(false);
+    expect(held.result.publishBlocked).toEqual({
+      summary: "Candidate patch requires trusted-environment validation before publication",
+      detail: "Docker socket access is not permitted in the sandbox.",
+      publicBranch: "agent/worker/job",
+      localRef: "refs/pushpals/agent/worker/job",
+      sha: "abc123",
+      stage: "validation",
+    });
+    expect(inferWorkerTerminalFailureClass(held.result)).toBe("environment");
+  });
+
+  test("fails an environment-blocked job that produced no candidate commit", () => {
+    const held = holdCommitForTrustedValidation(
+      {
+        ok: true,
+        summary: "candidate ready",
+        validationBlocked: {
+          category: "environment",
+          summary: "Trusted validation required",
+          detail: "Docker is unavailable.",
+          commands: ["bun run validate"],
+        },
+      },
+      null,
+    );
+
+    expect(held.completionCommit).toBeNull();
+    expect(held.result.ok).toBe(false);
+    expect(held.result.publishBlocked).toBeUndefined();
+    expect(held.result.summary).toContain("no publishable candidate commit");
+  });
+
   test("keeps direct completion events even when server status persistence succeeds", () => {
     expect(
       shouldEmitDirectSessionJobEvent({

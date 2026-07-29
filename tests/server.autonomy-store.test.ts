@@ -2357,6 +2357,62 @@ describe("server AutonomyStore policy gates", () => {
     expect(store.getSafetyState().freezeReason).toBe("auto_freeze:evaluator_pause");
   });
 
+  test("does not re-arm an expired evaluator freeze without new terminal evidence", () => {
+    const store = makeStore();
+    const internal = store as unknown as {
+      config: {
+        remotebuddy: {
+          autonomy: {
+            autoFreezeDurationMs: number;
+          };
+        };
+      };
+      runEvaluator: (nowIso?: string) => AutonomyEvaluatorScorecard;
+    };
+    internal.config.remotebuddy.autonomy.autoFreezeDurationMs = 60_000;
+    for (let index = 0; index < 6; index += 1) {
+      expect(
+        store.recordOutcome({
+          objectiveId: `obj_freeze_evidence_${index}`,
+          requestId: `req_freeze_evidence_${index}`,
+          jobId: `job_freeze_evidence_${index}`,
+          patternKey: `pk_freeze_evidence_${index}`,
+          success: false,
+          userAction: "failed",
+          regressionFlag: true,
+        }).ok,
+      ).toBe(true);
+    }
+
+    const firstAtMs = Date.now() + 1_000;
+    const first = internal.runEvaluator(new Date(firstAtMs).toISOString());
+    expect(first.recommendation).toBe("pause");
+    expect(store.getSafetyState(new Date(firstAtMs).toISOString()).isFrozen).toBe(true);
+
+    const afterExpiry = new Date(firstAtMs + 61_000).toISOString();
+    const unchanged = internal.runEvaluator(afterExpiry);
+    expect(unchanged.recommendation).toBe("constrain");
+    expect(store.getSafetyState(afterExpiry).isFrozen).toBe(false);
+    expect(store.getSafetyState(afterExpiry).freezeReason).toBeNull();
+
+    expect(
+      store.recordOutcome({
+        objectiveId: "obj_freeze_evidence_new",
+        requestId: "req_freeze_evidence_new",
+        jobId: "job_freeze_evidence_new",
+        patternKey: "pk_freeze_evidence_new",
+        success: false,
+        userAction: "failed",
+        regressionFlag: true,
+      }).ok,
+    ).toBe(true);
+    const withNewEvidence = internal.runEvaluator(
+      new Date(firstAtMs + 62_000).toISOString(),
+    );
+    expect(withNewEvidence.recommendation).toBe("pause");
+    expect(store.getSafetyState().isFrozen).toBe(true);
+  });
+
   test("evaluator pauses degraded end-to-end job health and preserves null latency", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-job-health-");
     const queue = new JobQueue(dbPath);
@@ -2419,6 +2475,12 @@ describe("server AutonomyStore policy gates", () => {
     );
     expect(openAlert?.status).toBe("open");
     expect(openAlert?.occurrenceCount).toBe(2);
+
+    const identical = store.getOpsSummary({ requestPending: 30 });
+    const unchangedAlert = identical.recentAlerts.find(
+      (alert) => alert.alertType === "request_queue_pending_high",
+    );
+    expect(unchangedAlert?.occurrenceCount).toBe(2);
 
     const observationless = store.getOpsSummary();
     const stillOpen = observationless.recentAlerts.find(
@@ -2620,6 +2682,34 @@ describe("server AutonomyStore policy gates", () => {
       .get("obj_running_state") as { status: string; job_id: string | null };
     expect(row.status).toBe("running");
     expect(row.job_id).toBe("job_running_state");
+  });
+
+  test("resolves autonomous outcome context from job metadata when objective persistence is absent", () => {
+    const store = makeStore();
+    const context = store.resolveJobOutcomeContext("job_metadata_fallback", {
+      origin: "autonomy",
+      requestId: "req_metadata_fallback",
+      autonomy: {
+        objectiveId: "obj_metadata_fallback",
+        patternKey: "pattern.metadata.fallback",
+      },
+    });
+
+    expect(context).toEqual({
+      objectiveId: "obj_metadata_fallback",
+      requestId: "req_metadata_fallback",
+      patternKey: "pattern.metadata.fallback",
+    });
+    expect(
+      store.recordOutcome({
+        ...context,
+        jobId: "job_metadata_fallback",
+        success: false,
+        userAction: "failed",
+        regressionFlag: true,
+      }).ok,
+    ).toBe(true);
+    expect(runEvaluatorNow(store).sampleCount).toBe(1);
   });
 
   test("safety state kill switch blocks eligibility", () => {

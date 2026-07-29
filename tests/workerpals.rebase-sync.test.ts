@@ -415,6 +415,66 @@ describe("workerpals rebase sync", () => {
   );
 
   runRebaseSyncTest(
+    "retains trusted-validation candidates locally even when normal publication is required",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-validation-hold-"));
+      const repo = join(root, "repo");
+      try {
+        mkdirSync(repo, { recursive: true });
+        await mustGit(root, ["init", repo], "init repo");
+        await mustGit(repo, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          repo,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+        writeFileSync(join(repo, "README.md"), "base\n", "utf8");
+        await mustGit(repo, ["add", "README.md"], "stage base");
+        await mustGit(repo, ["commit", "-m", "base"], "commit base");
+        await mustGit(
+          repo,
+          ["remote", "add", "origin", join(root, "missing-remote.git")],
+          "add broken origin",
+        );
+        writeFileSync(join(repo, "README.md"), "candidate\n", "utf8");
+
+        const runtimeConfig = loadPushPalsConfig();
+        runtimeConfig.workerpals.requirePush = true;
+        runtimeConfig.workerpals.llm.model = "";
+        const commitResult = await createJobCommit(
+          repo,
+          "workerpal-test",
+          {
+            id: "job-validation-hold",
+            taskId: "task-validation-hold",
+            kind: "task.execute",
+            params: {
+              instruction: "Update README",
+              completionBranch: "agent/workerpal-test/validation-hold",
+            },
+            context: "host",
+            deferPublication: true,
+          },
+          runtimeConfig,
+        );
+
+        expect(commitResult.ok).toBe(true);
+        expect(commitResult.branch).toBe(
+          "refs/pushpals/agent/workerpal-test/job-validation-hold",
+        );
+        expect(commitResult.publicBranch).toBe(
+          "agent/workerpal-test/validation-hold",
+        );
+        expect(commitResult.sha).toBeTruthy();
+        expect(commitResult.publishBlocked).toBeUndefined();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  runRebaseSyncTest(
     "retains review-fix commits locally for SourceControlManager without worker-side pushes",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "pushpals-review-fix-handoff-"));

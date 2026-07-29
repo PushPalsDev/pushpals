@@ -65,6 +65,12 @@ When the system is "stuck", diagnose in this order:
 4. Completion queue movement and SCM processing.
 5. Client transport/reconnect state.
 
+Autonomy safety freezes are evidence-scoped. A degraded-health evidence set
+may trigger one timed evaluator freeze; once that freeze expires, unchanged
+evidence constrains dispatch instead of extending the freeze forever. New
+terminal evidence can trigger a new freeze. Hourly token and runtime budget
+pauses remain hard limits until their rolling window recovers.
+
 ## Testing Layers
 
 - Unit/integration tests (TypeScript + Python harnesses).

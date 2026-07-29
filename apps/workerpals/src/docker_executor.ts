@@ -398,11 +398,18 @@ export interface DockerJobResult {
     publicBranch: string;
     localRef: string;
     sha: string;
-    stage: "sync" | "push";
+    stage: "sync" | "push" | "validation";
+  };
+  validationBlocked?: {
+    category: "environment";
+    summary: string;
+    detail: string;
+    commands: string[];
   };
   commit?: {
     branch: string;
     sha: string;
+    publicBranch?: string;
   };
   diagnostics?: JobDiagnostics;
 }
@@ -1637,6 +1644,7 @@ export class DockerExecutor {
           params: effectiveJob.params,
           sessionId: effectiveJob.sessionId,
           context: "host",
+          deferPublication: Boolean(result.validationBlocked),
         },
         this.config,
       );
@@ -1659,6 +1667,7 @@ export class DockerExecutor {
         commit: {
           branch: commitResult.branch,
           sha: commitResult.sha,
+          publicBranch: commitResult.publicBranch,
         },
         usage: accumulatedUsage,
       };

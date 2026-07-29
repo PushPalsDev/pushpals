@@ -45,6 +45,7 @@ interface JobResult {
   commit?: {
     branch: string;
     sha: string;
+    publicBranch?: string;
   };
   publishBlocked?: {
     summary: string;
@@ -52,7 +53,13 @@ interface JobResult {
     publicBranch: string;
     localRef: string;
     sha: string;
-    stage: "sync" | "push";
+    stage: "sync" | "push" | "validation";
+  };
+  validationBlocked?: {
+    category: "environment";
+    summary: string;
+    detail: string;
+    commands: string[];
   };
   diagnostics?: JobDiagnostics;
 }
@@ -116,7 +123,15 @@ echo "password=${token}"
 export function buildJobRunnerResult(
   result: Pick<
     Awaited<ReturnType<typeof executeJob>>,
-    "ok" | "summary" | "stdout" | "stderr" | "exitCode" | "cooldownMs" | "usage" | "diagnostics"
+    | "ok"
+    | "summary"
+    | "stdout"
+    | "stderr"
+    | "exitCode"
+    | "cooldownMs"
+    | "usage"
+    | "diagnostics"
+    | "validationBlocked"
   >,
 ): JobResult {
   return {
@@ -128,6 +143,7 @@ export function buildJobRunnerResult(
     cooldownMs: result.cooldownMs,
     usage: result.usage,
     diagnostics: result.diagnostics,
+    validationBlocked: result.validationBlocked,
   };
 }
 
@@ -202,6 +218,7 @@ async function main(): Promise<void> {
           kind: spec.kind,
           params: effectiveParams,
           context: "docker",
+          deferPublication: Boolean(result.validationBlocked),
         },
         CONFIG,
       );
@@ -210,6 +227,7 @@ async function main(): Promise<void> {
         jobResult.commit = {
           branch: commitResult.branch!,
           sha: commitResult.sha,
+          publicBranch: commitResult.publicBranch,
         };
         if (commitResult.sha === "no-changes") {
           log("stdout", `[JobRunner] No changes to commit for ${spec.jobId}`);

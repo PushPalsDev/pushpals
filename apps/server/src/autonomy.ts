@@ -1651,6 +1651,11 @@ export class AutonomyStore {
       );
       CREATE INDEX IF NOT EXISTS idx_autonomy_evaluator_scorecards_created
         ON autonomy_evaluator_scorecards(created_at DESC);
+      CREATE TABLE IF NOT EXISTS autonomy_evaluator_freeze_evidence (
+        state_id TEXT PRIMARY KEY,
+        evidence_key TEXT NOT NULL,
+        frozen_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS autonomy_ops_alerts (
         id TEXT PRIMARY KEY,
         alert_type TEXT NOT NULL,
@@ -2032,18 +2037,25 @@ export class AutonomyStore {
     if (!alertType || !message) return;
     const existing = this.db
       .prepare(
-        `SELECT status, occurrence_count
+        `SELECT status, severity, message, details_json, occurrence_count
          FROM autonomy_ops_alert_state
          WHERE alert_type = ?`,
       )
       .get(alertType) as
       | {
           status: string | null;
+          severity: string | null;
+          message: string | null;
+          details_json: string | null;
           occurrence_count: number | null;
         }
       | undefined;
     const detailsJson = JSON.stringify(asObject(params.details));
     if (asString(existing?.status).toLowerCase() === "open") {
+      const materiallyChanged =
+        asString(existing?.severity) !== params.severity ||
+        asString(existing?.message) !== message ||
+        asString(existing?.details_json) !== detailsJson;
       this.db
         .prepare(
           `UPDATE autonomy_ops_alert_state
@@ -2051,10 +2063,10 @@ export class AutonomyStore {
                message = ?,
                details_json = ?,
                last_seen_at = ?,
-               occurrence_count = occurrence_count + 1
+               occurrence_count = occurrence_count + ?
            WHERE alert_type = ?`,
         )
-        .run(params.severity, message, detailsJson, nowIso, alertType);
+        .run(params.severity, message, detailsJson, nowIso, materiallyChanged ? 1 : 0, alertType);
       return;
     }
 
@@ -2156,6 +2168,7 @@ export class AutonomyStore {
     timeoutRate: number | null;
     activeRuntimeMs: number;
     repeatedFailureCount: number;
+    latestTerminalAt: string | null;
   } {
     if (!this.hasTable("jobs")) {
       return {
@@ -2164,12 +2177,20 @@ export class AutonomyStore {
         timeoutRate: null,
         activeRuntimeMs: 0,
         repeatedFailureCount: 0,
+        latestTerminalAt: null,
       };
     }
     const health = this.db
       .prepare(
         `SELECT
            COUNT(*) AS terminal_count,
+           MAX(COALESCE(
+             j.completedAt,
+             j.failedAt,
+             j.publishBlockedAt,
+             j.abandonedAt,
+             j.updatedAt
+           )) AS latest_terminal_at,
            SUM(CASE WHEN j.status = 'completed' THEN 1 ELSE 0 END) AS success_count,
            SUM(
              CASE
@@ -2203,6 +2224,7 @@ export class AutonomyStore {
           terminal_count: number | null;
           success_count: number | null;
           timeout_count: number | null;
+          latest_terminal_at: string | null;
         }
       | undefined;
     const terminalCount = Math.max(0, Math.floor(asNumber(health?.terminal_count, 0)));
@@ -2275,6 +2297,7 @@ export class AutonomyStore {
       timeoutRate: terminalCount > 0 ? clamp01(timeoutCount / terminalCount) : null,
       activeRuntimeMs: resourceUsage.activeRuntimeMs,
       repeatedFailureCount,
+      latestTerminalAt: asString(health?.latest_terminal_at) || null,
     };
   }
 
@@ -2373,7 +2396,8 @@ export class AutonomyStore {
                 COUNT(*) AS sample_count,
                 SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count,
                 SUM(CASE WHEN reopened_within_24h = 1 OR regression_flag = 1 THEN 1 ELSE 0 END) AS regret_count,
-                AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS avg_latency_ms
+                AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS avg_latency_ms,
+                MAX(created_at) AS latest_outcome_at
          FROM latest`,
       )
       .get(nowIso) as
@@ -2383,6 +2407,7 @@ export class AutonomyStore {
           success_count: number | null;
           regret_count: number | null;
           avg_latency_ms: number | null;
+          latest_outcome_at: string | null;
         }
       | undefined;
     const dispatchRow = this.db
@@ -2442,6 +2467,39 @@ export class AutonomyStore {
       recommendation = "constrain";
     }
 
+    const evaluatorEvidenceKey = sha256Hex(
+      JSON.stringify({
+        rawSampleCount,
+        sampleCount,
+        successCount,
+        regretCount,
+        latestOutcomeAt: asString(rows?.latest_outcome_at) || null,
+        jobTerminalCount: jobHealth.terminalCount,
+        jobSuccessRate: jobHealth.successRate,
+        jobTimeoutRate: jobHealth.timeoutRate,
+        repeatedFailureCount: jobHealth.repeatedFailureCount,
+        latestJobTerminalAt: jobHealth.latestTerminalAt,
+      }),
+    ).slice(0, 24);
+    const resourcePause =
+      resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted;
+    if (recommendation === "pause" && !resourcePause) {
+      const consumedEvidence = this.db
+        .prepare(
+          `SELECT evidence_key
+           FROM autonomy_evaluator_freeze_evidence
+           WHERE state_id = 'global'`,
+        )
+        .get() as { evidence_key: string | null } | undefined;
+      const safety = this.getSafetyState(nowIso);
+      if (
+        !safety.isFrozen &&
+        asString(consumedEvidence?.evidence_key) === evaluatorEvidenceKey
+      ) {
+        recommendation = "constrain";
+      }
+    }
+
     const payload = {
       minSamples,
       minSuccessRate,
@@ -2459,6 +2517,7 @@ export class AutonomyStore {
       repeatedFailureCount: jobHealth.repeatedFailureCount,
       tokenBudgetExhausted: resourceBudget.token_budget_exhausted,
       runtimeBudgetExhausted: resourceBudget.runtime_budget_exhausted,
+      evaluatorEvidenceKey,
     };
     const id = `eval_${randomUUID().slice(0, 8)}`;
     this.db
@@ -2504,6 +2563,18 @@ export class AutonomyStore {
           freezeForMs: Math.max(60_000, Math.floor(asNumber(cfg.autoFreezeDurationMs, 1_800_000))),
           freezeReason: "auto_freeze:evaluator_pause",
         });
+        if (!resourcePause) {
+          this.db
+            .prepare(
+              `INSERT INTO autonomy_evaluator_freeze_evidence (
+                 state_id, evidence_key, frozen_at
+               ) VALUES ('global', ?, ?)
+               ON CONFLICT(state_id) DO UPDATE SET
+                 evidence_key = excluded.evidence_key,
+                 frozen_at = excluded.frozen_at`,
+            )
+            .run(evaluatorEvidenceKey, nowIso);
+        }
       }
       this.resolveOpsAlert("evaluator_constrain", nowIso);
     } else if (recommendation === "constrain" && (hasOutcomeEvidence || hasJobEvidence)) {
@@ -2524,7 +2595,7 @@ export class AutonomyStore {
     }
     if (recommendation !== "pause") {
       const safety = this.getSafetyState(nowIso);
-      if (safety.isFrozen && safety.freezeReason === "auto_freeze:evaluator_pause") {
+      if (safety.freezeReason === "auto_freeze:evaluator_pause") {
         this.updateSafetyState({ clearFreeze: true });
       }
     }
@@ -6917,6 +6988,34 @@ export class AutonomyStore {
         }
       | undefined;
     return row ?? null;
+  }
+
+  resolveJobOutcomeContext(
+    jobId: string,
+    params: Record<string, unknown>,
+  ): {
+    objectiveId: string | null;
+    requestId: string | null;
+    patternKey: string;
+  } | null {
+    const matched = this.findObjectiveByJobId(jobId);
+    if (matched) {
+      return {
+        objectiveId: matched.objectiveId,
+        requestId: asString(params.requestId) || null,
+        patternKey: matched.patternKey,
+      };
+    }
+
+    const autonomy = asObject(params.autonomy);
+    const origin = asString(params.origin ?? autonomy.origin).toLowerCase();
+    const patternKey = asString(autonomy.patternKey ?? autonomy.pattern_key);
+    if (origin !== "autonomy" || !patternKey) return null;
+    return {
+      objectiveId: asString(autonomy.objectiveId ?? autonomy.objective_id) || null,
+      requestId: asString(params.requestId ?? params.request_id) || null,
+      patternKey,
+    };
   }
 
   linkJobToObjectiveByRequest(requestId: string, jobId: string): void {

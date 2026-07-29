@@ -15,7 +15,14 @@ export interface JobPublishBlockedInfo {
   publicBranch: string;
   localRef: string;
   sha: string;
-  stage: "sync" | "push";
+  stage: "sync" | "push" | "validation";
+}
+
+export interface JobValidationBlockedInfo {
+  category: "environment";
+  summary: string;
+  detail: string;
+  commands: string[];
 }
 
 export interface JobDiagnosticAttempt {
@@ -95,5 +102,6 @@ export interface JobResult {
   cooldownMs?: number;
   usage?: JobTokenUsage;
   publishBlocked?: JobPublishBlockedInfo;
+  validationBlocked?: JobValidationBlockedInfo;
   diagnostics?: JobDiagnostics;
 }

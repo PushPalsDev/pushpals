@@ -6790,6 +6790,7 @@ export function buildGitCommitArgs(
 export interface CreateJobCommitResult {
   ok: boolean;
   branch?: string;
+  publicBranch?: string;
   sha?: string;
   error?: string;
   publishBlocked?: JobPublishBlockedInfo;
@@ -6829,6 +6830,7 @@ export async function createJobCommit(
     params?: Record<string, unknown>;
     sessionId?: string;
     context?: "host" | "docker";
+    deferPublication?: boolean;
   },
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
 ): Promise<CreateJobCommitResult> {
@@ -6848,9 +6850,12 @@ export async function createJobCommit(
   if (extractMergeConflictReviewContext(job.params ?? null)) {
     return createMergeConflictJobCommit(repo, workerId, job, publicBranchName, runtimeConfig);
   }
-  const requirePush = runtimeConfig.workerpals.requirePush || resolvedPublicBranch.overridden;
+  const requirePush =
+    !job.deferPublication &&
+    (runtimeConfig.workerpals.requirePush || resolvedPublicBranch.overridden);
   const pushAgentBranch =
-    requirePush || runtimeConfig.workerpals.pushAgentBranch || resolvedPublicBranch.overridden;
+    !job.deferPublication &&
+    (requirePush || runtimeConfig.workerpals.pushAgentBranch || resolvedPublicBranch.overridden);
   // Keep worker refs out of refs/heads so user-visible branch lists stay clean.
   const hiddenCommitRef = reviewFixContext
     ? `refs/pushpals/review/${workerId}/${job.id}`
@@ -6902,7 +6907,12 @@ export async function createJobCommit(
     if (result.ok) {
       // No changes to commit (diff exited 0)
       console.log(`[WorkerPals] No changes to commit for job ${job.id}`);
-      return { ok: true, branch: hiddenCommitRef, sha: "no-changes" };
+      return {
+        ok: true,
+        branch: hiddenCommitRef,
+        publicBranch: publicBranchName,
+        sha: "no-changes",
+      };
     }
 
     // Generate commit message from actual staged diff; fall back to deterministic.
@@ -6966,7 +6976,7 @@ export async function createJobCommit(
       console.log(
         `[WorkerPals] Retained immutable review-fix completion ${hiddenCommitRef} in the shared host repository; SourceControlManager owns publication to ${publicBranchName}.`,
       );
-      return { ok: true, branch: hiddenCommitRef, sha };
+      return { ok: true, branch: hiddenCommitRef, publicBranch: publicBranchName, sha };
     }
 
     // Push branch to origin (optional; disabled by default for shared-.git workflows)
@@ -7029,7 +7039,7 @@ export async function createJobCommit(
         console.warn(
           `[WorkerPals] ${pushError}. Continuing with local commit ref only (set WORKERPALS_REQUIRE_PUSH=1 to enforce push).`,
         );
-        return { ok: true, branch: completionRef, sha };
+        return { ok: true, branch: completionRef, publicBranch: publicBranchName, sha };
       }
     } else {
       console.log(
@@ -7038,7 +7048,7 @@ export async function createJobCommit(
     }
 
     console.log(`[WorkerPals] Created commit ${sha} on ref ${completionRef}`);
-    return { ok: true, branch: completionRef, sha };
+    return { ok: true, branch: completionRef, publicBranch: publicBranchName, sha };
   } catch (err) {
     if (hiddenRefCreated) {
       await git(repo, ["update-ref", "-d", hiddenCommitRef]);
@@ -7880,7 +7890,13 @@ async function createMergeConflictJobCommit(
   },
   publicBranchName: string,
   runtimeConfig: WorkerpalsRuntimeConfig,
-): Promise<{ ok: boolean; branch?: string; sha?: string; error?: string }> {
+): Promise<{
+  ok: boolean;
+  branch?: string;
+  publicBranch?: string;
+  sha?: string;
+  error?: string;
+}> {
   const mergeConflictContext = extractMergeConflictReviewContext(job.params ?? null);
   if (!mergeConflictContext) {
     return { ok: false, error: "Merge-conflict context is missing required branch metadata." };
@@ -8038,7 +8054,12 @@ async function createMergeConflictJobCommit(
       error: `Failed to retain rebased merge-conflict commit for SourceControlManager: ${combinedGitOutput(retain)}`,
     };
   }
-  return { ok: true, branch: hiddenCompletionRef, sha: headSha };
+  return {
+    ok: true,
+    branch: hiddenCompletionRef,
+    publicBranch: publicBranchName,
+    sha: headSha,
+  };
 }
 
 async function autoResolveRebaseConflicts(
@@ -10204,6 +10225,42 @@ export async function executeJob(
         exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
       };
       return annotateTerminalResult(advisoryResult, "quality");
+    }
+
+    if (quality.blocker?.category === "environment") {
+      const blockedCommands = quality.validationRuns
+        .filter((run) => !run.ok)
+        .map((run) => run.command);
+      const blockerDiagnostics = truncate(
+        [
+          result.stderr ?? "",
+          ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
+        ].join("\n"),
+        outputPolicyForRuntime(runtimeConfig),
+      );
+      const summary =
+        "Candidate patch requires trusted-environment validation before publication";
+      onLog?.(
+        "stderr",
+        `[QualityGate] ${summary}: ${toSingleLine(quality.blocker.detail, 260)}`,
+      );
+      const heldCandidate: JobResult = {
+        ...result,
+        ok: true,
+        summary,
+        stderr: blockerDiagnostics,
+        exitCode: 0,
+        validationBlocked: {
+          category: "environment",
+          summary,
+          detail: quality.blocker.detail,
+          commands: blockedCommands,
+        },
+      };
+      return annotateTerminalResult(
+        heldCandidate,
+        "trusted_environment_validation_required",
+      );
     }
 
     if (!deterministicRequiresRevision && !criticRequiresRevision) {

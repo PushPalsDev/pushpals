@@ -457,6 +457,60 @@ function normalizeFailureCommand(value: unknown): string {
     .slice(0, 1000);
 }
 
+function jobFailureText(value: unknown): string {
+  const raw = String(value ?? "");
+  if (!raw.trim()) return "";
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return [parsed.message, parsed.detail, parsed.error]
+      .map((part) => String(part ?? ""))
+      .filter(Boolean)
+      .join("\n");
+  } catch {
+    return raw;
+  }
+}
+
+function nestedFailureCommand(value: unknown): string {
+  const text = jobFailureText(value);
+  const scriptMatches = [...text.matchAll(/error:\s*script\s+"([^"]+)"\s+(?:exited|was terminated)/gi)];
+  const nestedScript = scriptMatches.at(-1)?.[1]?.trim();
+  if (nestedScript) return normalizeFailureCommand(`bun run ${nestedScript}`);
+  const unchanged = text.match(
+    /validation failed unchanged after two attempts for "([^"]+)"/i,
+  )?.[1];
+  if (unchanged) return normalizeFailureCommand(unchanged);
+  const required = text.match(
+    /required vision\.md validation (?:failed|blocked publishing)[^:\r\n]*:\s*([^\r\n;]+?)(?:\s+exited\b|;|$)/i,
+  )?.[1];
+  return normalizeFailureCommand(required);
+}
+
+function failureClassFromEvidence(value: unknown): string | null {
+  const text = jobFailureText(value).toLowerCase();
+  if (!text) return null;
+  if (
+    /\/var\/run\/docker\.sock|docker daemon|operation not permitted|permission denied|read-only file system|\beacces\b|\beperm\b/.test(
+      text,
+    )
+  ) {
+    return "environment";
+  }
+  return null;
+}
+
+function nestedFailedTestSample(value: unknown): string[] {
+  const text = jobFailureText(value);
+  const samples = new Set<string>();
+  for (const match of text.matchAll(/error:\s*script\s+"([^"]+)"\s+(?:exited|was terminated)/gi)) {
+    const script = String(match[1] ?? "")
+      .trim()
+      .toLowerCase();
+    if (script) samples.add(`script:${script}`);
+  }
+  return [...samples].sort();
+}
+
 function extractFailedTestSample(...values: unknown[]): string[] {
   const text = values.map((value) => String(value ?? "")).join("\n");
   const samples = new Set<string>();
@@ -3236,9 +3290,10 @@ export class JobQueue {
     const cutoffIso = new Date(Date.now() - windowMs).toISOString();
     const rows = this.db
       .prepare(
-        `SELECT
+         `SELECT
            j.id,
            j.params,
+           j.error,
            COALESCE(j.failedAt, j.publishBlockedAt, j.abandonedAt, j.updatedAt) AS failureAt,
            d.failureClass,
            d.summary,
@@ -3281,6 +3336,7 @@ export class JobQueue {
       .all(cutoffIso) as Array<{
       id: string;
       params: string | null;
+      error: string | null;
       failureAt: string | null;
       failureClass: string | null;
       summary: string | null;
@@ -3339,13 +3395,26 @@ export class JobQueue {
       );
       if (fingerprintTargetPaths.length === 0) continue;
 
-      const command = normalizeFailureCommand(row.command);
+      const command =
+        normalizeFailureCommand(row.command) || nestedFailureCommand(row.error);
       const failureClass = String(
-        row.validationFailureClass ?? row.failureClass ?? "unknown_failure",
+        failureClassFromEvidence(row.error) ??
+          row.validationFailureClass ??
+          row.failureClass ??
+          "unknown_failure",
       )
         .trim()
         .toLowerCase();
-      const failedTests = extractFailedTestSample(row.stdoutTail, row.stderrTail, row.summary);
+      const nestedFailedTests = nestedFailedTestSample(row.error);
+      const failedTests =
+        nestedFailedTests.length > 0
+          ? nestedFailedTests
+          : extractFailedTestSample(
+              row.stdoutTail,
+              row.stderrTail,
+              row.summary,
+              jobFailureText(row.error),
+            );
       const fingerprint = failureFingerprint({
         targetPaths: fingerprintTargetPaths,
         failureClass,

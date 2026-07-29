@@ -1349,6 +1349,27 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toMatchObject({ category: "environment" });
   });
 
+  test("classifies an inaccessible nested Docker daemon as an environment blocker", () => {
+    expect(
+      detectValidationBlocker([
+        {
+          step: "bun run validate",
+          command: "bun run validate",
+          ok: false,
+          exitCode: 1,
+          elapsedMs: 210_000,
+          stdout: "",
+          stderr:
+            "[supabase tests] Failed to start the local stack.\n" +
+            "[supabase tests] Supabase CLI stderr:\n" +
+            "failed to inspect service: connect /var/run/docker.sock: operation not permitted",
+        },
+      ]),
+    ).toMatchObject({
+      category: "environment",
+    });
+  });
+
   test("retries route startup browser smoke failures once", () => {
     expect(
       shouldRetryBrowserValidationRunOnce({

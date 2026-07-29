@@ -1846,14 +1846,14 @@ export function createRequestHandler() {
           const requestId = compactText(params.requestId, 128);
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           autonomyStore.markObjectiveRunningByJobId(jobId);
-          const matched = autonomyStore.findObjectiveByJobId(jobId);
-          if (matched) {
+          const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
+          if (outcomeContext) {
             const outcome = classifyAutonomyJobCompletion(body);
             autonomyStore.recordOutcome({
-              objectiveId: matched.objectiveId,
-              requestId,
+              objectiveId: outcomeContext.objectiveId,
+              requestId: outcomeContext.requestId ?? requestId,
               jobId,
-              patternKey: matched.patternKey,
+              patternKey: outcomeContext.patternKey,
               success: outcome.success,
               latencyMs: result.durationMs ?? null,
               userAction: outcome.userAction,
@@ -1884,13 +1884,13 @@ export function createRequestHandler() {
           const origin = deriveJobOrigin(params);
           const requestId = compactText(params.requestId, 128);
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
-          const matched = autonomyStore.findObjectiveByJobId(jobId);
-          if (matched) {
+          const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
+          if (outcomeContext) {
             autonomyStore.recordOutcome({
-              objectiveId: matched.objectiveId,
-              requestId,
+              objectiveId: outcomeContext.objectiveId,
+              requestId: outcomeContext.requestId ?? requestId,
               jobId,
-              patternKey: matched.patternKey,
+              patternKey: outcomeContext.patternKey,
               success: false,
               latencyMs: result.durationMs ?? null,
               userAction: "failed",
@@ -1944,13 +1944,13 @@ export function createRequestHandler() {
           const origin = deriveJobOrigin(params);
           const requestId = compactText(params.requestId, 128);
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
-          const matched = autonomyStore.findObjectiveByJobId(jobId);
-          if (matched) {
+          const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
+          if (outcomeContext) {
             autonomyStore.recordOutcome({
-              objectiveId: matched.objectiveId,
-              requestId,
+              objectiveId: outcomeContext.objectiveId,
+              requestId: outcomeContext.requestId ?? requestId,
               jobId,
-              patternKey: matched.patternKey,
+              patternKey: outcomeContext.patternKey,
               success: false,
               latencyMs: result.durationMs ?? null,
               userAction: "failed",

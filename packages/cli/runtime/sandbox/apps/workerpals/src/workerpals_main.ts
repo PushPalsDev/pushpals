@@ -43,7 +43,11 @@ import {
   shouldEnqueueNoChangeReviewCompletion,
   type JobResult,
 } from "./execute_job.js";
-import { DockerExecutionExhaustedError, DockerExecutor } from "./docker_executor.js";
+import {
+  DockerExecutionExhaustedError,
+  DockerExecutor,
+  type DockerJobResult,
+} from "./docker_executor.js";
 import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
 import { linkDirectWorktreeDependencyArtifacts } from "./common/worktree_dependency_artifacts.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
@@ -59,6 +63,7 @@ import {
 type CommitRef = {
   branch: string;
   sha: string;
+  publicBranch?: string;
 };
 
 type CompletionPrMetadata = {
@@ -513,6 +518,7 @@ function isCodexStartupStallResult(result: JobResult): boolean {
 
 export function inferWorkerTerminalFailureClass(result: JobResult): string {
   if (result.ok) return "success";
+  if (result.publishBlocked?.stage === "validation") return "environment";
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text =
     `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
@@ -800,17 +806,64 @@ async function runJob(
 ): Promise<WorkerJobResult> {
   if (dockerExecutor) {
     const result = await dockerExecutor.execute(job, onLog);
-    return {
-      ok: result.ok,
-      summary: result.summary,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      publishBlocked: result.publishBlocked,
-      commit: result.commit,
-    };
+    return workerJobResultFromDocker(result);
   }
   return executeJob(job.kind, job.params, repo, onLog, runtimeConfig);
+}
+
+export function workerJobResultFromDocker(result: DockerJobResult): WorkerJobResult {
+  return {
+    ok: result.ok,
+    summary: result.summary,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    cooldownMs: result.cooldownMs,
+    usage: result.usage,
+    publishBlocked: result.publishBlocked,
+    validationBlocked: result.validationBlocked,
+    commit: result.commit,
+    diagnostics: result.diagnostics,
+  };
+}
+
+export function holdCommitForTrustedValidation(
+  result: WorkerJobResult,
+  commit: CommitRef | null,
+): { result: WorkerJobResult; completionCommit: CommitRef | null } {
+  if (!result.validationBlocked) {
+    return { result, completionCommit: commit };
+  }
+  if (!commit || commit.sha === "no-changes") {
+    return {
+      result: {
+        ...result,
+        ok: false,
+        summary: `${result.validationBlocked.summary}; no publishable candidate commit was produced`,
+        exitCode: 4,
+      },
+      completionCommit: null,
+    };
+  }
+
+  return {
+    result: {
+      ...result,
+      ok: false,
+      summary: result.validationBlocked.summary,
+      stderr: [result.stderr, result.validationBlocked.detail].filter(Boolean).join("\n"),
+      exitCode: 4,
+      publishBlocked: {
+        summary: result.validationBlocked.summary,
+        detail: result.validationBlocked.detail,
+        publicBranch: commit.publicBranch ?? commit.branch,
+        localRef: commit.branch,
+        sha: commit.sha,
+        stage: "validation",
+      },
+    },
+    completionCommit: null,
+  };
 }
 
 async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promise<string> {
@@ -1860,6 +1913,7 @@ async function workerLoop(
                     params: parsedParams,
                     sessionId: job.sessionId,
                     context: "host",
+                    deferPublication: Boolean(result.validationBlocked),
                   },
                   CONFIG,
                 );
@@ -1869,6 +1923,7 @@ async function workerLoop(
                     completionCommit = {
                       branch: commitResult.branch,
                       sha: commitResult.sha,
+                      publicBranch: commitResult.publicBranch,
                     };
                   } else if (!shouldEnqueueNoChangeReviewCompletion(parsedParams)) {
                     console.warn(
@@ -1890,6 +1945,11 @@ async function workerLoop(
                 }
               }
             }
+
+            ({ result, completionCommit } = holdCommitForTrustedValidation(
+              result,
+              completionCommit,
+            ));
 
             if (completionCommit) {
               const enqueued = await enqueueCompletion(

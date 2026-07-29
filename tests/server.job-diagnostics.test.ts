@@ -539,4 +539,59 @@ describe("server JobQueue diagnostics", () => {
       queue.close();
     }
   });
+
+  test("clusters nested environment gate failures when structured validation rows are absent", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      const params = (patternKey: string) => ({
+        origin: "autonomy",
+        autonomy: {
+          patternKey,
+          targetPaths: ["scripts/test-supabase.js"],
+        },
+      });
+      const detail =
+        "[supabase tests] Failed to start the local stack.\n" +
+        "failed to inspect service: connect /var/run/docker.sock: operation not permitted\n" +
+        'error: script "test:supabase" exited with code 1';
+
+      const firstId = enqueueClaimedJob(
+        queue,
+        "nested-environment-first",
+        params("supabase.first-wording"),
+      );
+      expect(
+        queue.fail(firstId, {
+          message:
+            "Required vision.md validation failed after 3 auto-revision attempts: bun run validate exited 1",
+          detail,
+        }).ok,
+      ).toBe(true);
+
+      const secondId = enqueueClaimedJob(
+        queue,
+        "nested-environment-second",
+        params("supabase.completely-different-wording"),
+      );
+      expect(
+        queue.fail(secondId, {
+          message: "Repeated unchanged validation failure circuit opened",
+          detail:
+            'Validation failed unchanged after two attempts for "bun run validate".\n' + detail,
+        }).ok,
+      ).toBe(true);
+
+      const summary = queue.similarFailureFingerprintSummary({
+        targetPaths: ["scripts/test-supabase.js"],
+        threshold: 2,
+      });
+      expect(summary.blocked).toBe(true);
+      expect(summary.recentSimilarFailureCount).toBe(2);
+      expect(summary.failureClass).toBe("environment");
+      expect(summary.command).toBe("bun run test:supabase");
+      expect(summary.failedTestSample).toEqual(["script:test:supabase"]);
+    } finally {
+      queue.close();
+    }
+  });
 });

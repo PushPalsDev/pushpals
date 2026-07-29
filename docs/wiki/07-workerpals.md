@@ -37,9 +37,11 @@ At a high level:
 2. Isolated worktree is created.
 3. Backend executor runs task.
 4. Logs stream to server as job logs.
-5. Job result is reported complete/fail.
-6. Commit metadata is enqueued as completion when applicable.
-7. Worktree is cleaned up.
+5. Job result, token usage, cooldowns, validation runs, and patch snapshots cross
+   the Docker boundary as one structured result.
+6. Job result is reported complete/fail/publish-blocked.
+7. Commit metadata is enqueued as completion when applicable.
+8. Worktree is cleaned up.
 
 ## Why Worktree Isolation Matters
 
@@ -59,6 +61,12 @@ This provides:
 - validation-step execution support,
 - optional critic/revision loops (backend-specific),
 - output compaction and structured result handling.
+
+An environment-blocked required validation gate is not treated as a code
+revision request. WorkerPals retains a publishable candidate commit under its
+internal ref, reports the job as `publish_blocked` at the `validation` stage,
+and waits for the same gate to run in a trusted environment. It neither drops
+the patch nor publishes an unvalidated branch.
 
 ## Operational Failure Patterns
 
