@@ -32,6 +32,61 @@ describe("autonomy integration baseline", () => {
       }),
     ).toBe("use_integration_head");
   });
+
+  test("prepares the integration-head worktree and continues when integration truly diverges", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-divergence-"));
+    tempDirs.push(root);
+    const commands: string[][] = [];
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => warnings.push(String(message ?? ""));
+
+    try {
+      const engine = new RemoteBuddyAutonomousEngine({
+        server: "http://localhost:3001",
+        sessionId: "s_diverged",
+        authToken: "tok",
+        repo: root,
+        llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+        comm: { async emit() {} } as any,
+        config: makeConfig(),
+      });
+      (engine as any).runGit = async (_cwd: string, args: string[]) => {
+        commands.push([...args]);
+        if (args[0] === "merge" && args[1] === "--ff-only") {
+          return { ok: false, exitCode: 1, stdout: "", stderr: "not possible to fast-forward" };
+        }
+        if (args[0] === "merge-base" && args[1] === "--is-ancestor") {
+          return { ok: false, exitCode: 1, stdout: "", stderr: "" };
+        }
+        return { ok: true, exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const ready = await (engine as any).ensureAutonomyRepoReady("run_diverged");
+
+      expect(ready).toBe(true);
+      expect(
+        commands.some(
+          (args) =>
+            args[0] === "worktree" && args[1] === "add" && args.at(-1) === "origin/main_agents",
+        ),
+      ).toBe(true);
+      expect(
+        commands.some(
+          (args) =>
+            args[0] === "merge-base" &&
+            args.includes("origin/main") &&
+            args.includes("origin/main_agents"),
+        ),
+      ).toBe(true);
+      expect(commands.some((args) => args[0] === "reset")).toBe(false);
+      expect(
+        warnings.some((message) => message.includes("Continuing from the integration head")),
+      ).toBe(true);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
 });
 
 function jsonResponse(status: number, payload: unknown): Response {
