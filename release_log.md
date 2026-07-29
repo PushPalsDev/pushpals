@@ -2,24 +2,29 @@
 
 ## Release Metadata
 
-- version: `v1.2.2`
-- start_commit: `7d897fa5938001c80d5a6c03f9c389a414dcadb5`
-- end_commit: `d9546e2b2584fc24cb952aa77918fd8116bc917a`
-- commits_in_range: `1`
+- version: `v1.2.3`
+- start_commit: `9f1a0e57f05d6ba275be70af1db5a1ce81587143`
+- end_commit: `0179d9c7f92ea9c0a2fd6a2f813240298159d592`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Align SourceControlManager's disposable local integration ref to the fetched remote on every maintenance cycle before reconciling the base branch.
-- Recover automatically when a remote integration branch is rewound or replaced instead of allowing a locally-ahead hidden ref to mask the divergence forever.
-- Add a real-Git regression that replaces the remote integration head, verifies exact local realignment, and proves the next reconciliation is pushed successfully.
+- Keep SourceControlManager reconciliation live across remote integration rewinds, transient maintenance failures, cleanup failures, and changing conflict-dedupe leases.
+- Preserve Docker WorkerPal validation runs, patch snapshots, token usage, and cooldowns across the container-to-host result boundary.
+- Retain environment-blocked candidate patches under internal refs and report them as validation-stage `publish_blocked` jobs instead of discarding them, revising code for a sandbox limitation, or publishing without required validation.
+- Fingerprint equivalent nested validation failures across prompt and pattern-key variations so repeated infrastructure failures open one durable target-and-failure circuit.
+- Scope evaluator freezes to terminal evidence, fall back to constrained dispatch after unchanged evidence expires, and stop inflating alert occurrence counts on unchanged polling.
+- Recover autonomous job outcomes from durable job metadata when objective-row linkage is missing.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 984 passed, 2 intentional skips, 0 failed, 3,771 assertions across 117 files.
-- Focused reconciliation, worker lease, and autonomy suite: 42 passed, 1 intentional Linux-container skip, 0 failed, 196 assertions.
-- SourceControlManager TypeScript check passed.
+- Full root suite on Bun 1.3.14: 1,006 passed, 2 intentional skips, 0 failed, 3,878 assertions across 118 files.
+- Focused validation-hold, rebase-sync, Docker diagnostics, and failure-fingerprint suite: 32 passed, 0 failed, 252 assertions.
+- Server and WorkerPals TypeScript checks passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
+- SectorCommand trusted-host publish gate passed all eight stages, including 137 pgTAP checks, 3 live Supabase account integrations, 126 Worker tests, typechecks, binding drift checks, lint, and browser smoke.
+- Both SectorCommand Worker deploy dry-runs passed.
 - `git diff --check` passed.
 
 ## Install
@@ -46,6 +51,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
+- WorkerPal sandboxes intentionally do not receive the host Docker socket. Repositories whose required validation starts nested containers are retained as validation-stage `publish_blocked` candidates until the same gate can run in a trusted environment.
 - The first Docker-backed WorkerPal startup after upgrading rebuilds the sandbox image and downloads the Node, Python-agent, Playwright, and Chromium layers; subsequent starts reuse Docker's cached layers.
 - `execution_platform = "windows"` selects direct host WorkerPal execution so validation inherits the Windows host environment; it does not convert Docker Desktop Linux containers into Windows containers.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
