@@ -4,6 +4,11 @@ import { homedir, tmpdir } from "os";
 import { basename, dirname, join, resolve } from "path";
 import { directWorktreePoolRoot } from "./direct_worktree.js";
 
+export const WINDOWS_WORKER_SANDBOX_ROOT_NAME = ".ppe";
+const TEMP_WORKER_SANDBOX_ROOT_NAME = "pushpals-worker-env";
+const WINDOWS_PLAYWRIGHT_CACHE_NAME = "pw";
+const TEMP_PLAYWRIGHT_CACHE_NAME = "playwright-browsers";
+
 function stringEnv(
   source: Record<string, string | undefined> = process.env,
 ): Record<string, string> {
@@ -109,18 +114,35 @@ export function withResolvedBunOnPath(
   return out;
 }
 
-function safeRepoSlug(repo: string): string {
+function safeRepoSlug(repo: string, platform: NodeJS.Platform = process.platform): string {
   const leaf = basename(resolve(repo)).replace(/[^A-Za-z0-9_.-]+/g, "-") || "repo";
-  const hash = createHash("sha256").update(resolve(repo)).digest("hex").slice(0, 12);
+  const resolvedRepo = resolve(repo);
+  const hashInput =
+    platform === "win32" ? resolvedRepo.replace(/\\/g, "/").toLowerCase() : resolvedRepo;
+  const hash = createHash("sha256").update(hashInput).digest("hex").slice(0, 12);
+  if (platform === "win32") return hash;
   return `${leaf}-${hash}`;
 }
 
-function browserCacheRepoKey(repo: string): string {
+function browserCacheRepoKey(repo: string, platform: NodeJS.Platform = process.platform): string {
   const normalized = resolve(repo).replace(/\\/g, "/");
   const marker = "/.worktrees/";
   const markerIndex = normalized.lastIndexOf(marker);
   if (markerIndex >= 0) return normalized.slice(0, markerIndex);
-  return directWorktreePoolRoot(repo) ?? resolve(repo);
+  return directWorktreePoolRoot(repo, platform) ?? resolve(repo);
+}
+
+export function resolveWorkerSandboxRoot(
+  repo: string,
+  platform: NodeJS.Platform = process.platform,
+  homeRoot: string = homedir(),
+  tempRoot: string = tmpdir(),
+): string {
+  const parent =
+    platform === "win32"
+      ? resolve(homeRoot, WINDOWS_WORKER_SANDBOX_ROOT_NAME)
+      : resolve(tempRoot, TEMP_WORKER_SANDBOX_ROOT_NAME);
+  return resolve(parent, safeRepoSlug(repo, platform));
 }
 
 function defaultExpoPortForRepo(repo: string): string {
@@ -218,8 +240,9 @@ export function buildWorkerSandboxWritableEnv(
 ): Record<string, string> {
   const env = withResolvedBunOnPath(sourceEnv);
   const originalHome = resolveOriginalHome(env);
+  const sandboxHomeRoot = platform === "win32" ? env.USERPROFILE || originalHome : originalHome;
   const codexHome = resolveCodexHome(env, originalHome);
-  const baseDir = resolve(tmpdir(), "pushpals-worker-env", safeRepoSlug(repo));
+  const baseDir = resolveWorkerSandboxRoot(repo, platform, sandboxHomeRoot);
   const homeDir = resolve(baseDir, "home");
   const cacheDir = resolve(baseDir, "cache");
   const expoDir = resolve(baseDir, "expo");
@@ -238,10 +261,8 @@ export function buildWorkerSandboxWritableEnv(
     env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0"
       ? env.PLAYWRIGHT_BROWSERS_PATH
       : resolve(
-          tmpdir(),
-          "pushpals-worker-env",
-          safeRepoSlug(browserCacheRepoKey(repo)),
-          "playwright-browsers",
+          resolveWorkerSandboxRoot(browserCacheRepoKey(repo, platform), platform, sandboxHomeRoot),
+          platform === "win32" ? WINDOWS_PLAYWRIGHT_CACHE_NAME : TEMP_PLAYWRIGHT_CACHE_NAME,
         );
   const defaultExpoPort = defaultExpoPortForRepo(repo);
   const expoRouterAppRoot = resolveExpoRouterAppRoot(repo);

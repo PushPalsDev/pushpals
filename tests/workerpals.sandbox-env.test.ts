@@ -10,10 +10,12 @@ import {
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, relative, resolve, sep } from "path";
 import {
   buildWorkerSandboxWritableEnv,
   resolveBunExecutableFromEnv,
+  resolveWorkerSandboxRoot,
+  WINDOWS_WORKER_SANDBOX_ROOT_NAME,
   withResolvedBunOnPath,
 } from "../apps/workerpals/src/common/sandbox_env";
 
@@ -21,21 +23,28 @@ describe("workerpals sandbox writable env", () => {
   test("redirects HOME and Expo caches to writable temp paths", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");
+    const originalHome = join(root, "original-home");
     mkdirSync(repo, { recursive: true });
 
     try {
       const env = buildWorkerSandboxWritableEnv(repo, {
-        HOME: "/root",
+        HOME: originalHome,
         PATH: "test-path",
       });
 
       expect(env.PATH.endsWith("test-path")).toBe(true);
-      expect(env.HOME).not.toBe("/root");
+      expect(env.HOME).not.toBe(originalHome);
       expect(env.USERPROFILE).toBe(env.HOME);
-      expect(env.EXPO_HOME).toContain("pushpals-worker-env");
-      expect(env.XDG_CACHE_HOME).toContain("pushpals-worker-env");
+      expect(env.EXPO_HOME).toContain(
+        process.platform === "win32" ? WINDOWS_WORKER_SANDBOX_ROOT_NAME : "pushpals-worker-env",
+      );
+      expect(env.XDG_CACHE_HOME).toContain(
+        process.platform === "win32" ? WINDOWS_WORKER_SANDBOX_ROOT_NAME : "pushpals-worker-env",
+      );
       expect(env.npm_config_cache).toContain("npm");
-      expect(env.PLAYWRIGHT_BROWSERS_PATH).toContain("playwright-browsers");
+      expect(env.PLAYWRIGHT_BROWSERS_PATH).toContain(
+        process.platform === "win32" ? `${sep}pw` : "playwright-browsers",
+      );
       expect(env.PLAYWRIGHT_BROWSERS_PATH).not.toBe(env.XDG_CACHE_HOME);
       expect(env.EXPO_NO_TELEMETRY).toBe("1");
       expect(env.EXPO_NO_INTERACTIVE).toBe("1");
@@ -83,6 +92,12 @@ describe("workerpals sandbox writable env", () => {
       expect(env.APPDATA).toBe(join(sandboxRoot, "roaming"));
       expect(env.LOCALAPPDATA).toBe(join(sandboxRoot, "local"));
       expect(env.XDG_CONFIG_HOME).toBe(join(sandboxRoot, "config"));
+      expect(sandboxRoot).toBe(
+        resolveWorkerSandboxRoot(repo, "win32", join(root, "original-home")),
+      );
+      expect(sandboxRoot).toContain(WINDOWS_WORKER_SANDBOX_ROOT_NAME);
+      expect(basename(sandboxRoot)).toMatch(/^[a-f0-9]{12}$/);
+      expect(sandboxRoot.length - join(root, "original-home").length).toBeLessThan(20);
       expect(env.PSModuleAnalysisCachePath).toBe(
         join(sandboxRoot, "local", "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache"),
       );
@@ -93,6 +108,60 @@ describe("workerpals sandbox writable env", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
       if (sandboxRoot) rmSync(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps Windows Expo and Workerd writable paths under a bounded profile root", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-windows-short-"));
+    const profile = join(root, "profile");
+    const repo = join(
+      root,
+      "an-intentionally-long-repository-parent",
+      "another-long-parent",
+      "job-12345678-longnonce-run",
+    );
+    mkdirSync(join(repo, "app"), { recursive: true });
+    writeFileSync(
+      join(repo, "package.json"),
+      JSON.stringify({
+        main: "expo-router/entry",
+        dependencies: { "expo-router": "6.0.0" },
+      }),
+      "utf8",
+    );
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(
+        repo,
+        {
+          HOME: join(root, "an-intentionally-long-home-override"),
+          USERPROFILE: profile,
+          TEMP: join(root, "a-much-longer-host-temp-path"),
+        },
+        "win32",
+      );
+      const boundedPaths = [
+        env.HOME,
+        env.TEMP,
+        env.TMP,
+        env.TMPDIR,
+        env.XDG_CACHE_HOME,
+        env.XDG_CONFIG_HOME,
+        env.APPDATA,
+        env.LOCALAPPDATA,
+        env.EXPO_HOME,
+        env.PLAYWRIGHT_BROWSERS_PATH,
+      ];
+
+      for (const path of boundedPaths) {
+        expect(relative(profile, path).split(sep)[0]).toBe(WINDOWS_WORKER_SANDBOX_ROOT_NAME);
+        expect(path.length - profile.length).toBeLessThan(30);
+      }
+      expect(env.TEMP).not.toContain("pushpals-worker-env");
+      expect(env.TEMP).not.toContain(basename(repo));
+      expect(existsSync(env.TEMP)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -222,7 +291,9 @@ describe("workerpals sandbox writable env", () => {
       });
 
       expect(env.EXPO_ROUTER_APP_ROOT).toBe(appRoot);
-      expect(env.TEMP).toContain("pushpals-worker-env");
+      expect(env.TEMP).toContain(
+        process.platform === "win32" ? WINDOWS_WORKER_SANDBOX_ROOT_NAME : "pushpals-worker-env",
+      );
       expect(env.TMP).toBe(env.TEMP);
       expect(env.TMPDIR).toBe(env.TEMP);
       expect(existsSync(env.TEMP)).toBe(true);
@@ -373,15 +444,25 @@ describe("workerpals sandbox writable env", () => {
     mkdirSync(secondWorktree, { recursive: true });
 
     try {
-      const firstEnv = buildWorkerSandboxWritableEnv(firstWorktree, {
-        HOME: join(root, "home"),
-      });
-      const secondEnv = buildWorkerSandboxWritableEnv(secondWorktree, {
-        HOME: join(root, "home"),
-      });
+      const firstEnv = buildWorkerSandboxWritableEnv(
+        firstWorktree,
+        {
+          HOME: join(root, "home"),
+        },
+        "win32",
+      );
+      const secondEnv = buildWorkerSandboxWritableEnv(
+        secondWorktree,
+        {
+          HOME: join(root, "home"),
+        },
+        "win32",
+      );
 
       expect(firstEnv.HOME).not.toBe(secondEnv.HOME);
       expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toBe(secondEnv.PLAYWRIGHT_BROWSERS_PATH);
+      expect(firstEnv.HOME).toContain(WINDOWS_WORKER_SANDBOX_ROOT_NAME);
+      expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toEndWith(`${sep}pw`);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
