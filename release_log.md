@@ -2,29 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.2.3`
-- start_commit: `9f1a0e57f05d6ba275be70af1db5a1ce81587143`
-- end_commit: `0179d9c7f92ea9c0a2fd6a2f813240298159d592`
-- commits_in_range: `2`
+- version: `v1.2.4`
+- start_commit: `e89b775abc272394e8fba06a20eb7ed9212a8db9`
+- end_commit: `afbbaa0d714b2f3ffe2b20a01cf7168ea5802f13`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Keep SourceControlManager reconciliation live across remote integration rewinds, transient maintenance failures, cleanup failures, and changing conflict-dedupe leases.
-- Preserve Docker WorkerPal validation runs, patch snapshots, token usage, and cooldowns across the container-to-host result boundary.
-- Retain environment-blocked candidate patches under internal refs and report them as validation-stage `publish_blocked` jobs instead of discarding them, revising code for a sandbox limitation, or publishing without required validation.
-- Fingerprint equivalent nested validation failures across prompt and pattern-key variations so repeated infrastructure failures open one durable target-and-failure circuit.
-- Scope evaluator freezes to terminal evidence, fall back to constrained dispatch after unchanged evidence expires, and stop inflating alert occurrence counts on unchanged polling.
-- Recover autonomous job outcomes from durable job metadata when objective-row linkage is missing.
+- Classify an inaccessible nested Docker daemon as a trusted-environment validation blocker on the first failed gate, preserving the candidate instead of spending quality revisions on sandbox infrastructure.
+- Never reinterpret a structured job terminal, validation hold, publication hold, or opened failure circuit as a transient failure of the outer Docker transport.
+- Preserve exact `validation_circuit_breaker` and `trusted_environment_validation_required` terminal stages in job diagnostics.
+- Stop incidental test names such as `timeout_policy` or `browser budgets` from polluting timeout and browser-failure telemetry.
+- Add regressions using the exact SectorCommand Supabase failure observed in the published `v1.2.3` soak: `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 1,006 passed, 2 intentional skips, 0 failed, 3,878 assertions across 118 files.
-- Focused validation-hold, rebase-sync, Docker diagnostics, and failure-fingerprint suite: 32 passed, 0 failed, 252 assertions.
-- Server and WorkerPals TypeScript checks passed.
+- Full root suite on Bun 1.3.14: 1,008 passed, 2 intentional skips, 0 failed, 3,886 assertions across 118 files.
+- Focused Docker retry, validation-blocker, and telemetry suite: 85 passed, 0 failed, 279 assertions.
+- WorkerPals TypeScript check passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- SectorCommand trusted-host publish gate passed all eight stages, including 137 pgTAP checks, 3 live Supabase account integrations, 126 Worker tests, typechecks, binding drift checks, lint, and browser smoke.
-- Both SectorCommand Worker deploy dry-runs passed.
+- Published `v1.2.3` SectorCommand soak reproduced the nested Docker validation blocker and proved the old outer retry restarted the entire job; the exact result and diagnostics now have regression coverage.
 - `git diff --check` passed.
 
 ## Install
