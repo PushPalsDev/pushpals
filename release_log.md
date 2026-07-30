@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.2.5`
-- start_commit: `a9a5e437933bef6f0056ba80be93864dbcc3cbf0`
-- end_commit: `875f5d1f2fdc2087bb8e4808a46f68280726d983`
+- version: `v1.2.6`
+- start_commit: `a460bce82ded39f13ee94cdde9f90f2fc97d7a90`
+- end_commit: `dd7bb6b8fec63a9e78de5b27e8985bff7578d2a2`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Pin Expo Router route discovery to each WorkerPal's isolated worktree instead of allowing Windows dependency junctions to resolve routes from the shared checkout.
-- Remove Node's incompatible `--preserve-symlinks` option only for detected Expo Router repositories while retaining it for other projected dependency layouts.
-- Override stale inherited `EXPO_ROUTER_APP_ROOT` values and prefer the repository's `src/app` route root before `app`.
-- Add regression coverage for isolated `app` and `src/app` layouts, stale host route roots, explicit Node options, and unrelated repositories.
+- Revalidate explicit test-file targets against the current job checkout before every deterministic quality gate.
+- Drop planner commands whose only explicit test targets were deleted during an intentional PR-scope cleanup, instead of treating Bun's “no matches” result as a product failure.
+- Preserve existing targets in mixed existing/deleted test commands, along with flags and aggregate validation requirements.
+- Prevent stale test paths from deferring authoritative aggregate validation and consuming repeated dedicated repair revisions.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 1,010 passed, 2 intentional skips, 0 failed, 3,890 assertions across 118 files.
-- Focused sandbox-environment suite: 12 passed, 0 failed, 44 assertions.
+- Full root suite on Bun 1.3.14: 1,012 passed, 2 intentional skips, 0 failed, 3,898 assertions across 118 files.
+- Focused validation-command suite: 52 passed, 0 failed, 176 assertions.
 - WorkerPals TypeScript check passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- The exact previously failing detached SectorCommand worktree completed its full Expo browser suite through the patched WorkerPals environment.
-- A controlled comparison confirmed that the same worktree renders Expo's stock tutorial with `EXPO_ROUTER_APP_ROOT` plus `--preserve-symlinks`, and loads all SectorCommand routes when the incompatible option is removed.
+- The exact interrupted SectorCommand PR-repair worktree was replayed: deleted web-startup and home-action test targets were removed while the real Projectile, Wrangler, validate, deploy dry-run, typecheck, and lint gates remained.
+- Mixed-command coverage confirms a deleted test target is pruned without broadening the command or dropping a still-existing test target.
 - `git diff --check` passed.
 
 ## Install
