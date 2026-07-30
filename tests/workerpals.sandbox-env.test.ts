@@ -150,6 +150,68 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
+  test("pins Expo Router route discovery to the isolated worktree", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-expo-router-"));
+    const repo = join(root, "repo", ".worktrees", "job-one");
+    const appRoot = join(repo, "app");
+    mkdirSync(appRoot, { recursive: true });
+    writeFileSync(
+      join(repo, "package.json"),
+      JSON.stringify({
+        main: "expo-router/entry",
+        dependencies: { "expo-router": "6.0.0" },
+      }),
+      "utf8",
+    );
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        HOME: join(root, "home"),
+        EXPO_ROUTER_APP_ROOT: join(root, "repo", "app"),
+        NODE_OPTIONS:
+          "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim",
+      });
+
+      expect(env.EXPO_ROUTER_APP_ROOT).toBe(appRoot);
+      expect(env.NODE_OPTIONS).toBe(
+        "--max-old-space-size=4096 --dns-result-order=verbatim",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prefers src/app and leaves unrelated app directories alone", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-expo-router-"));
+    const expoRepo = join(root, "expo-repo");
+    const srcAppRoot = join(expoRepo, "src", "app");
+    const otherRepo = join(root, "other-repo");
+    mkdirSync(srcAppRoot, { recursive: true });
+    mkdirSync(join(expoRepo, "app"), { recursive: true });
+    mkdirSync(join(otherRepo, "app"), { recursive: true });
+    writeFileSync(
+      join(expoRepo, "package.json"),
+      JSON.stringify({ devDependencies: { "expo-router": "6.0.0" } }),
+      "utf8",
+    );
+    writeFileSync(join(otherRepo, "package.json"), JSON.stringify({ name: "other" }), "utf8");
+
+    try {
+      expect(
+        buildWorkerSandboxWritableEnv(expoRepo, {
+          HOME: join(root, "home"),
+        }).EXPO_ROUTER_APP_ROOT,
+      ).toBe(srcAppRoot);
+      expect(
+        buildWorkerSandboxWritableEnv(otherRepo, {
+          HOME: join(root, "home"),
+        }).EXPO_ROUTER_APP_ROOT,
+      ).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("preserves explicit Node DNS and Expo hostname overrides while keeping projected paths", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");

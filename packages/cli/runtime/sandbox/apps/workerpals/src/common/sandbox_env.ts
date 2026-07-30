@@ -123,6 +123,28 @@ function defaultExpoPortForRepo(repo: string): string {
   return String(19_006 + offset);
 }
 
+function resolveExpoRouterAppRoot(repo: string): string | undefined {
+  try {
+    const packageJson = JSON.parse(readFileSync(resolve(repo, "package.json"), "utf8")) as {
+      main?: unknown;
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+    };
+    const usesExpoRouter =
+      (typeof packageJson.main === "string" && packageJson.main.includes("expo-router")) ||
+      packageJson.dependencies?.["expo-router"] !== undefined ||
+      packageJson.devDependencies?.["expo-router"] !== undefined;
+    if (!usesExpoRouter) return undefined;
+
+    for (const candidate of [resolve(repo, "src", "app"), resolve(repo, "app")]) {
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {
+    // Not every repository has a readable Node package manifest.
+  }
+  return undefined;
+}
+
 function ensureDirs(paths: string[]): void {
   for (const path of paths) {
     try {
@@ -145,12 +167,18 @@ function ensureSandboxGitConfig(homeDir: string): void {
   }
 }
 
-function withWorkerNodeOptions(value: string | undefined): string {
-  const options = (value ?? "").trim().split(/\s+/).filter(Boolean);
+function withWorkerNodeOptions(
+  value: string | undefined,
+  preserveSymlinks: boolean,
+): string {
+  const options = (value ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter((option) => option && (preserveSymlinks || option !== "--preserve-symlinks"));
   if (!options.some((option) => option.startsWith("--dns-result-order="))) {
     options.push("--dns-result-order=ipv4first");
   }
-  if (!options.includes("--preserve-symlinks")) {
+  if (preserveSymlinks && !options.includes("--preserve-symlinks")) {
     options.push("--preserve-symlinks");
   }
   return options.join(" ");
@@ -187,6 +215,7 @@ export function buildWorkerSandboxWritableEnv(
           "playwright-browsers",
         );
   const defaultExpoPort = defaultExpoPortForRepo(repo);
+  const expoRouterAppRoot = resolveExpoRouterAppRoot(repo);
   ensureDirs([homeDir, cacheDir, expoDir, resolve(cacheDir, "npm"), playwrightBrowsersDir]);
   ensureSandboxGitConfig(homeDir);
 
@@ -203,11 +232,17 @@ export function buildWorkerSandboxWritableEnv(
     EXPO_NO_INTERACTIVE: env.EXPO_NO_INTERACTIVE ?? "1",
     CI: env.CI ?? "1",
     BROWSER: env.BROWSER ?? "none",
+    // Windows dependency snapshots use directory junctions to the host
+    // checkout. Expo Router otherwise resolves its package through the
+    // junction target and can render the stock tutorial even when the
+    // isolated worktree has valid routes.
+    ...(expoRouterAppRoot ? { EXPO_ROUTER_APP_ROOT: expoRouterAppRoot } : {}),
     // Linux-native dependency snapshots are projected into Windows-hosted
     // worktrees with symlinks. Preserve those logical paths so dev servers
-    // such as Metro emit browser URLs under the worktree instead of the
-    // container-only snapshot root.
-    NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS),
+    // emit browser URLs under the worktree instead of the container-only
+    // snapshot root. Expo Router is the exception: preserving its package
+    // junction overrides EXPO_ROUTER_APP_ROOT and renders the stock tutorial.
+    NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS, !expoRouterAppRoot),
     REACT_NATIVE_PACKAGER_HOSTNAME: env.REACT_NATIVE_PACKAGER_HOSTNAME ?? "127.0.0.1",
     EXPO_DEV_SERVER_PORT: env.EXPO_DEV_SERVER_PORT ?? defaultExpoPort,
     RCT_METRO_PORT: env.RCT_METRO_PORT ?? defaultExpoPort,
