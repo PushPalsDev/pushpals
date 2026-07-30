@@ -2,24 +2,23 @@
 
 ## Release Metadata
 
-- version: `v1.2.9`
-- start_commit: `a24a73c627de044691d90c4de02b9df3203d7c8b`
-- end_commit: `f6cef506fbf10a6223a96fd2dbbdcb90d288219b`
+- version: `v1.2.10`
+- start_commit: `56c562872c2f9e313cd21716d6b32268274739ff`
+- end_commit: `4256e8adfbbaa07bb8a428f5b9f97a95df2172ae`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve logical Node module paths through WorkerPal dependency-snapshot junctions so parent packages resolve job-local platform and CLI dependencies.
-- Restore `--preserve-symlinks` for Expo Router worktrees now that v1.2.8 isolates Metro transform caches per checkout.
-- Prevent junctioned `expo` and `workerd` packages from bypassing job-local `@expo/cli` and `@cloudflare/workerd-*` packages on Windows.
-- Add an executable junction-resolution regression test that fails when Node realpaths into the parent checkout.
+- Preserve junctioned Node CLI entrypoints as well as imported modules in direct Windows WorkerPal worktrees.
+- Add `--preserve-symlinks-main` alongside `--preserve-symlinks` so commands such as Expo lint and Wrangler resolve platform-specific dependencies from the job-local dependency tree.
+- Extend the executable junction-resolution regression to cover both imported packages and a junctioned package launched directly as Node's main module.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 1,015 passed, 2 intentional skips, 0 failed, 3,916 assertions across 118 files.
-- Focused WorkerPal sandbox-environment suite: 14 passed, 0 failed, 60 assertions.
+- Full root suite on Bun 1.3.14: 1,082 passed, 2 intentional skips, 0 failed, 4,225 assertions across 126 files.
+- Focused WorkerPal sandbox-environment and validation-command suites: 66 passed, 0 failed, 240 assertions.
 - WorkerPals TypeScript check passed.
-- A published v1.2.8 SectorCommand job proved both missing packages were present inside the job-local dependency tree but skipped through parent-checkout junction realpaths; the new executable regression recreates that topology.
+- The exact failed SectorCommand worktree passed `bun run lint` and `bun run worker:deploy:dry-run` after applying the complete Node symlink options.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
 - `git diff --check` passed.
