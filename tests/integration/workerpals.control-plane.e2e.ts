@@ -115,6 +115,74 @@ function initializeMinimalRepo(root: string): string {
   return repoPath;
 }
 
+function runGit(repoPath: string, args: string[]): string {
+  const result = Bun.spawnSync(["git", ...args], {
+    cwd: repoPath,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `git ${args.join(" ")} failed: ${decodeOutput(result.stderr) || decodeOutput(result.stdout)}`,
+    );
+  }
+  return decodeOutput(result.stdout).trim();
+}
+
+function initializeReviewLeaseRemote(
+  root: string,
+  repoPath: string,
+): {
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  baseSha: string;
+} {
+  const originPath = join(root, "origin.git");
+  const init = Bun.spawnSync(["git", "init", "--bare", originPath], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (init.exitCode !== 0) {
+    throw new Error(`git init --bare failed: ${decodeOutput(init.stderr)}`);
+  }
+
+  const headRef = "agent/merge-conflict-control-plane-e2e";
+  runGit(repoPath, ["branch", headRef]);
+  runGit(repoPath, ["remote", "add", "origin", originPath]);
+  runGit(repoPath, ["push", "origin", "main:main", `${headRef}:${headRef}`]);
+  const headSha = runGit(repoPath, ["rev-parse", "HEAD"]).toLowerCase();
+  return {
+    headRef,
+    headSha,
+    baseRef: "main",
+    baseSha: headSha,
+  };
+}
+
+test("review lease fixture publishes exact immutable head and base refs", () => {
+  const root = mkdtempSync(join(tmpdir(), "pushpals-worker-review-lease-"));
+  try {
+    const repoPath = initializeMinimalRepo(root);
+    const reviewLease = initializeReviewLeaseRemote(root, repoPath);
+    const remoteRefs = runGit(repoPath, [
+      "ls-remote",
+      "--heads",
+      "origin",
+      reviewLease.baseRef,
+      reviewLease.headRef,
+    ]);
+
+    expect(reviewLease.headSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(reviewLease.baseSha).toBe(reviewLease.headSha);
+    expect(remoteRefs).toContain(`${reviewLease.headSha}\trefs/heads/${reviewLease.baseRef}`);
+    expect(remoteRefs).toContain(`${reviewLease.headSha}\trefs/heads/${reviewLease.headRef}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function createTaskExecuteParams(instruction: string): Record<string, unknown> {
   return {
     schemaVersion: 2,
@@ -539,6 +607,7 @@ test(
     const dockerImage = `pushpals-worker-sandbox:merge-conflict-e2e-${Date.now()}`;
     try {
       const repoPath = initializeMinimalRepo(root);
+      const reviewLease = initializeReviewLeaseRemote(root, repoPath);
       const jobId = "job-merge-conflict-docker";
       const requestTrace: string[] = [];
       const sessionCommands: string[] = [];
@@ -574,6 +643,10 @@ test(
                     params: {
                       reviewAgent: {
                         resolutionType: "merge_conflict",
+                        prHeadRef: reviewLease.headRef,
+                        prHeadSha: reviewLease.headSha,
+                        prBaseRef: reviewLease.baseRef,
+                        prBaseSha: reviewLease.baseSha,
                       },
                     },
                     sessionId: "session-merge-conflict",
