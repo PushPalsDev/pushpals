@@ -2,25 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.2.12`
-- start_commit: `c6da5ed8e288c83ddd41ec2481e760740f313961`
-- end_commit: `67a53e17b852dfbd75c168b60c0fefa3f77c5cd9`
+- version: `v1.2.13`
+- start_commit: `4a5071ce0dabc22b341701040f6666ec6db2b53c`
+- end_commit: `22a2a0e92e83166aaaa54ed018affb1c200c45e8`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Keep Node and Bun on canonical dependency realpaths so caches and singleton modules such as Vitest retain one module identity in direct Windows WorkerPal worktrees.
-- Prepend the job-local `node_modules` directory to `NODE_PATH`, preserving user entries, so realpathed dependency parents can still resolve packages from the isolated job snapshot.
-- Stop injecting global symlink-preservation flags while retaining explicitly configured user flags, and cover both junctioned CLI resolution and cross-path singleton identity in Node and Bun.
+- Detect PushPals-managed dependency snapshots before Bun validation and replace their per-package junctions with a fully local, offline, frozen install.
+- Keep fast linked snapshots available during worker editing while ensuring Node ESM, Bun, Wrangler, ESLint, and other tool-specific resolvers validate entirely inside the isolated worktree.
+- Add an executable Windows worktree regression that reproduces canonical-parent ESM resolution failure, verifies managed-snapshot removal, and proves both Node and Bun succeed from the localized dependency tree.
 
 ## Validation
 
-- Full repository suite on Bun 1.3.14: 1,085 passed, 2 intentional skips, 0 failed, 4,243 assertions across 126 files.
-- Release-playbook root suite on Bun 1.3.14: 1,018 passed, 2 intentional skips, 0 failed, 3,938 assertions across 118 files.
-- Focused WorkerPal sandbox-environment and validation-command suites: 69 passed, 0 failed, 258 assertions.
-- Focused sandbox-environment suite on Bun 1.3.9: 17 passed, 0 failed, 82 assertions.
+- Release-playbook root suite on Bun 1.3.14: 1,019 passed, 2 intentional skips, 0 failed, 3,950 assertions across 118 files.
+- Focused dependency-layout and validation-command suite on Bun 1.3.14: 53 passed, 0 failed, 188 assertions.
+- Focused dependency-layout and validation-command suite on Bun 1.3.9: 53 passed, 0 failed, 188 assertions.
 - WorkerPals TypeScript check passed.
-- A published v1.2.11 SectorCommand job passed its aggregate unit stage, then reproduced duplicate Vitest suite identity twice in the Worker Vitest stage; the new singleton regression covers that unchanged failure cluster.
+- A published v1.2.12 SectorCommand job reproduced the same junction-target failure first in Wrangler (`@cloudflare/unenv-preset`) and then in ESLint (`@humanfs/node`); the run was stopped instead of accepting repository manifest/runner workarounds.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
 - `git diff --check` passed.
