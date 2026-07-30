@@ -42,10 +42,11 @@ describe("workerpals sandbox writable env", () => {
       expect(env.CI).toBe("1");
       expect(env.BROWSER).toBe("none");
       expect(env.NODE_OPTIONS).toContain("--dns-result-order=ipv4first");
-      expect(env.NODE_OPTIONS).toContain("--preserve-symlinks");
-      expect(env.NODE_OPTIONS).toContain("--preserve-symlinks-main");
-      expect(env.BUN_OPTIONS).toContain("--preserve-symlinks");
-      expect(env.BUN_OPTIONS).toContain("--preserve-symlinks-main");
+      expect(env.NODE_OPTIONS).not.toContain("--preserve-symlinks");
+      expect(env.BUN_OPTIONS).toBeUndefined();
+      expect(env.NODE_PATH.split(process.platform === "win32" ? ";" : ":")[0]).toBe(
+        resolve(repo, "node_modules"),
+      );
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("127.0.0.1");
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeGreaterThanOrEqual(19006);
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeLessThan(20006);
@@ -192,7 +193,7 @@ describe("workerpals sandbox writable env", () => {
       expect(env.TMPDIR).toBe(env.TEMP);
       expect(existsSync(env.TEMP)).toBe(true);
       expect(env.NODE_OPTIONS).toBe(
-        "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim --preserve-symlinks-main",
+        "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim",
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -243,7 +244,7 @@ describe("workerpals sandbox writable env", () => {
       });
 
       expect(env.NODE_OPTIONS).toBe(
-        "--max-old-space-size=4096 --dns-result-order=verbatim --preserve-symlinks --preserve-symlinks-main",
+        "--max-old-space-size=4096 --dns-result-order=verbatim",
       );
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("localhost");
     } finally {
@@ -251,7 +252,7 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
-  test("does not duplicate the required Node symlink option", () => {
+  test("preserves explicitly configured Node symlink options without injecting them", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");
     mkdirSync(repo, { recursive: true });
@@ -271,7 +272,7 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
-  test("preserves existing Bun options without duplicating required symlink options", () => {
+  test("preserves existing Bun options without injecting global resolver flags", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");
     mkdirSync(repo, { recursive: true });
@@ -279,12 +280,35 @@ describe("workerpals sandbox writable env", () => {
     try {
       const env = buildWorkerSandboxWritableEnv(repo, {
         HOME: join(root, "home"),
-        BUN_OPTIONS: "--smol --preserve-symlinks-main --preserve-symlinks",
+        BUN_OPTIONS: "--smol",
       });
 
-      expect(env.BUN_OPTIONS).toBe(
-        "--smol --preserve-symlinks-main --preserve-symlinks",
-      );
+      expect(env.BUN_OPTIONS).toBe("--smol");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepends job-local node_modules once while preserving existing NODE_PATH entries", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-node-path-"));
+    const repo = join(root, "repo");
+    const jobNodeModules = join(repo, "node_modules");
+    const sharedNodeModules = join(root, "shared-node-modules");
+    const otherNodeModules = join(root, "other-node-modules");
+    const delimiter = process.platform === "win32" ? ";" : ":";
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        HOME: join(root, "home"),
+        NODE_PATH: [sharedNodeModules, jobNodeModules, otherNodeModules].join(delimiter),
+      });
+
+      expect(env.NODE_PATH.split(delimiter)).toEqual([
+        jobNodeModules,
+        sharedNodeModules,
+        otherNodeModules,
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -378,7 +402,7 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
-  test("resolves job-local dependencies through junctioned imports and CLI entrypoints", () => {
+  test("resolves job-local dependencies without duplicating junctioned Node or Bun modules", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-junction-resolution-"));
     const repo = join(root, "repo");
     const worktree = join(repo, ".worktrees", "job-one");
@@ -432,6 +456,20 @@ describe("workerpals sandbox writable env", () => {
           encoding: "utf8",
         },
       );
+      const bunCliResult = spawnSync(
+        process.execPath,
+        [join(logicalPackage, "bin", "resolve-job-local.cjs")],
+        {
+          env,
+          encoding: "utf8",
+        },
+      );
+
+      expect(env.NODE_OPTIONS).not.toContain("--preserve-symlinks");
+      expect(env.BUN_OPTIONS).toBeUndefined();
+      expect(env.NODE_PATH.split(process.platform === "win32" ? ";" : ":")[0]).toBe(
+        join(worktree, "node_modules"),
+      );
       expect(result.status).toBe(0);
       expect(result.stdout).toBe("job-local");
       expect(result.stderr).toBe("");
@@ -440,6 +478,61 @@ describe("workerpals sandbox writable env", () => {
       expect(cliResult.stderr).toBe("");
       expect(bunResult.status).toBe(0);
       expect(bunResult.stdout).toBe("job-local");
+      expect(bunResult.stderr).toBe("");
+      expect(bunCliResult.status).toBe(0);
+      expect(bunCliResult.stdout).toBe("job-local");
+      expect(bunCliResult.stderr).toBe("");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps one module instance across worktree junction and canonical host imports", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-singleton-"));
+    const repo = join(root, "repo");
+    const worktree = join(repo, ".worktrees", "job-one");
+    const hostPackage = join(repo, "node_modules", "vitest");
+    const logicalPackage = join(worktree, "node_modules", "vitest");
+    mkdirSync(hostPackage, { recursive: true });
+    mkdirSync(join(worktree, "node_modules"), { recursive: true });
+    writeFileSync(join(hostPackage, "index.js"), "module.exports = {};\n", "utf8");
+    writeFileSync(
+      join(worktree, "compare-module-identity.cjs"),
+      [
+        'const logical = require("./node_modules/vitest");',
+        `const canonical = require(${JSON.stringify(join(hostPackage, "index.js"))});`,
+        'process.stdout.write(logical === canonical ? "same" : "different");',
+        "if (logical !== canonical) process.exitCode = 1;",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    symlinkSync(hostPackage, logicalPackage, process.platform === "win32" ? "junction" : "dir");
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(worktree, process.env);
+      const nodeResult = spawnSync(
+        "node",
+        [join(worktree, "compare-module-identity.cjs")],
+        {
+          env,
+          encoding: "utf8",
+        },
+      );
+      const bunResult = spawnSync(
+        process.execPath,
+        [join(worktree, "compare-module-identity.cjs")],
+        {
+          env,
+          encoding: "utf8",
+        },
+      );
+
+      expect(nodeResult.status).toBe(0);
+      expect(nodeResult.stdout).toBe("same");
+      expect(nodeResult.stderr).toBe("");
+      expect(bunResult.status).toBe(0);
+      expect(bunResult.stdout).toBe("same");
       expect(bunResult.stderr).toBe("");
     } finally {
       rmSync(root, { recursive: true, force: true });

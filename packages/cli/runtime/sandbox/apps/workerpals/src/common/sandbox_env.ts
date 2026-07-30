@@ -177,24 +177,29 @@ function withWorkerNodeOptions(value: string | undefined): string {
   if (!options.some((option) => option.startsWith("--dns-result-order="))) {
     options.push("--dns-result-order=ipv4first");
   }
-  if (!options.includes("--preserve-symlinks")) {
-    options.push("--preserve-symlinks");
-  }
-  if (!options.includes("--preserve-symlinks-main")) {
-    options.push("--preserve-symlinks-main");
-  }
   return options.join(" ");
 }
 
-function withWorkerBunOptions(value: string | undefined): string {
-  const options = (value ?? "").trim().split(/\s+/).filter(Boolean);
-  if (!options.includes("--preserve-symlinks")) {
-    options.push("--preserve-symlinks");
-  }
-  if (!options.includes("--preserve-symlinks-main")) {
-    options.push("--preserve-symlinks-main");
-  }
-  return options.join(" ");
+function withWorkerNodePath(
+  repo: string,
+  value: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const delimiter = pathListDelimiter(platform);
+  const jobNodeModules = resolve(repo, "node_modules");
+  const existing = (value ?? "")
+    .split(delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const remaining = existing.filter(
+    (entry) =>
+      !(
+        platform === "win32"
+          ? resolve(entry).toLowerCase() === jobNodeModules.toLowerCase()
+          : resolve(entry) === jobNodeModules
+      ),
+  );
+  return [jobNodeModules, ...remaining].join(delimiter);
 }
 
 function resolveOriginalHome(env: Record<string, string>): string {
@@ -269,18 +274,11 @@ export function buildWorkerSandboxWritableEnv(
           TMPDIR: tempDir,
         }
       : {}),
-    // Dependency snapshots are projected into worktrees with symlinks or
-    // junctions. Preserve logical paths so junctioned parent packages resolve
-    // platform-specific dependencies from the job-local node_modules tree.
-    // Preserve the main module separately because Node otherwise resolves
-    // junctioned CLI entrypoints back into the host checkout before loading.
-    // Expo's transform cache is isolated above, so preserving its package
-    // junction no longer risks reusing another worktree's route context.
+    // Keep canonical realpaths for caches and singletons such as Vitest, while
+    // still allowing junctioned packages to resolve platform-specific
+    // dependencies that exist only in the job-local dependency snapshot.
     NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS),
-    // BUN_OPTIONS is inherited by nested Bun package scripts. NODE_OPTIONS
-    // alone does not affect Bun's resolver, so aggregate test scripts could
-    // still realpath junctioned packages and miss job-local dependencies.
-    BUN_OPTIONS: withWorkerBunOptions(env.BUN_OPTIONS),
+    NODE_PATH: withWorkerNodePath(repo, env.NODE_PATH),
     REACT_NATIVE_PACKAGER_HOSTNAME: env.REACT_NATIVE_PACKAGER_HOSTNAME ?? "127.0.0.1",
     EXPO_DEV_SERVER_PORT: env.EXPO_DEV_SERVER_PORT ?? defaultExpoPort,
     RCT_METRO_PORT: env.RCT_METRO_PORT ?? defaultExpoPort,
