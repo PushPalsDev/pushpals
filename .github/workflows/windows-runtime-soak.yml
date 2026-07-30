@@ -30,6 +30,14 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify compact Windows worker path contracts
+        run: >-
+          bun test
+          tests/workerpals.direct-worktree.test.ts
+          tests/workerpals.sandbox-env.test.ts
+          tests/workerpals.runtime-sandbox-mirror.test.ts
+          tests/workerpals.windows-sandbox-env.integration.test.ts
+
       - name: Build protocol workspace artifacts
         run: bun run protocol:build
 

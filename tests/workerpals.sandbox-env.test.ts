@@ -435,6 +435,189 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
+  test("preserves the Playwright sentinel that disables managed browser downloads", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-playwright-disabled-"));
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(
+        repo,
+        {
+          HOME: join(root, "home"),
+          USERPROFILE: join(root, "profile"),
+          PLAYWRIGHT_BROWSERS_PATH: "0",
+        },
+        "win32",
+      );
+
+      expect(env.PLAYWRIGHT_BROWSERS_PATH).toBe("0");
+      expect(existsSync(join(repo, "0"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prefers the bounded Windows profile even when HOME and TEMP are deeply nested", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-profile-priority-"));
+    const profile = join(root, "profile");
+    const repo = join(root, "repo");
+    const longHome = join(root, "legacy-home", "nested".repeat(20));
+    const longTemp = join(root, "legacy-temp", "nested".repeat(20));
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(
+        repo,
+        {
+          HOME: longHome,
+          USERPROFILE: profile,
+          TEMP: longTemp,
+          TMP: longTemp,
+          TMPDIR: longTemp,
+        },
+        "win32",
+      );
+      const sandboxRoot = dirname(env.HOME);
+
+      expect(relative(profile, sandboxRoot).split(sep)[0]).toBe(WINDOWS_WORKER_SANDBOX_ROOT_NAME);
+      expect(sandboxRoot).not.toContain("legacy-home");
+      expect(env.PLAYWRIGHT_BROWSERS_PATH).not.toContain("legacy-temp");
+      expect(sandboxRoot.length - profile.length).toBeLessThan(20);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back to HOME for Windows when USERPROFILE is unavailable", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-home-fallback-"));
+    const home = join(root, "home");
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(
+        repo,
+        {
+          HOME: home,
+        },
+        "win32",
+      );
+
+      expect(relative(home, env.HOME).split(sep)[0]).toBe(WINDOWS_WORKER_SANDBOX_ROOT_NAME);
+      expect(env.USERPROFILE).toBe(env.HOME);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps Windows roots stable across equivalent path casing and separators", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-casefold-"));
+    const profile = join(root, "Profile");
+    const repo = join(root, "SectorCommand");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const canonical = resolveWorkerSandboxRoot(repo, "win32", profile);
+      const equivalent = resolveWorkerSandboxRoot(
+        repo.replace(/\\/g, "/").toUpperCase(),
+        "win32",
+        profile,
+      );
+
+      expect(canonical.toLowerCase()).toBe(equivalent.toLowerCase());
+      expect(basename(canonical)).toMatch(/^[a-f0-9]{12}$/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("isolates default Playwright caches between repositories", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-browser-repos-"));
+    const profile = join(root, "profile");
+    const firstRepo = join(root, "first-repo");
+    const secondRepo = join(root, "second-repo");
+    mkdirSync(firstRepo, { recursive: true });
+    mkdirSync(secondRepo, { recursive: true });
+
+    try {
+      const firstEnv = buildWorkerSandboxWritableEnv(
+        firstRepo,
+        { HOME: profile, USERPROFILE: profile },
+        "win32",
+      );
+      const secondEnv = buildWorkerSandboxWritableEnv(
+        secondRepo,
+        { HOME: profile, USERPROFILE: profile },
+        "win32",
+      );
+
+      expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).not.toBe(secondEnv.PLAYWRIGHT_BROWSERS_PATH);
+      expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toEndWith(`${sep}pw`);
+      expect(secondEnv.PLAYWRIGHT_BROWSERS_PATH).toEndWith(`${sep}pw`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves inherited execution flags while replacing writable locations", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-flags-"));
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        HOME: join(root, "home"),
+        EXPO_NO_TELEMETRY: "0",
+        EXPO_NO_INTERACTIVE: "0",
+        CI: "false",
+        BROWSER: "custom-browser",
+      });
+
+      expect(env.EXPO_NO_TELEMETRY).toBe("0");
+      expect(env.EXPO_NO_INTERACTIVE).toBe("0");
+      expect(env.CI).toBe("false");
+      expect(env.BROWSER).toBe("custom-browser");
+      expect(env.HOME).not.toBe(join(root, "home"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("adds the sandbox Git safe-directory rule once without erasing existing config", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-gitconfig-"));
+    const repo = join(root, "repo");
+    const profile = join(root, "profile");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const firstEnv = buildWorkerSandboxWritableEnv(
+        repo,
+        { HOME: profile, USERPROFILE: profile },
+        "win32",
+      );
+      const gitConfigPath = join(firstEnv.HOME, ".gitconfig");
+      writeFileSync(
+        gitConfigPath,
+        `${readFileSync(gitConfigPath, "utf8")}\n[user]\n\tname = Worker Test\n`,
+        "utf8",
+      );
+
+      const secondEnv = buildWorkerSandboxWritableEnv(
+        repo,
+        { HOME: profile, USERPROFILE: profile },
+        "win32",
+      );
+      const gitConfig = readFileSync(join(secondEnv.HOME, ".gitconfig"), "utf8");
+
+      expect(secondEnv.HOME).toBe(firstEnv.HOME);
+      expect(gitConfig.match(/directory\s*=\s*\*/g)?.length).toBe(1);
+      expect(gitConfig).toContain("name = Worker Test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("keeps Playwright browser cache stable across ephemeral worktrees", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");
