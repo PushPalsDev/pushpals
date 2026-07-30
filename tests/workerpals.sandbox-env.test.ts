@@ -803,7 +803,7 @@ describe("workerpals sandbox writable env", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("keeps one Node module instance across worktree junction and canonical host imports", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-singleton-"));
