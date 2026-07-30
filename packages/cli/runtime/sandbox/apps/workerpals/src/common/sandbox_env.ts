@@ -172,15 +172,12 @@ function ensureSandboxGitConfig(homeDir: string): void {
   }
 }
 
-function withWorkerNodeOptions(value: string | undefined, preserveSymlinks: boolean): string {
-  const options = (value ?? "")
-    .trim()
-    .split(/\s+/)
-    .filter((option) => option && (preserveSymlinks || option !== "--preserve-symlinks"));
+function withWorkerNodeOptions(value: string | undefined): string {
+  const options = (value ?? "").trim().split(/\s+/).filter(Boolean);
   if (!options.some((option) => option.startsWith("--dns-result-order="))) {
     options.push("--dns-result-order=ipv4first");
   }
-  if (preserveSymlinks && !options.includes("--preserve-symlinks")) {
+  if (!options.includes("--preserve-symlinks")) {
     options.push("--preserve-symlinks");
   }
   return options.join(" ");
@@ -258,12 +255,12 @@ export function buildWorkerSandboxWritableEnv(
           TMPDIR: tempDir,
         }
       : {}),
-    // Linux-native dependency snapshots are projected into Windows-hosted
-    // worktrees with symlinks. Preserve those logical paths so dev servers
-    // emit browser URLs under the worktree instead of the container-only
-    // snapshot root. Expo Router is the exception: preserving its package
-    // junction overrides EXPO_ROUTER_APP_ROOT and renders the stock tutorial.
-    NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS, !expoRouterAppRoot),
+    // Dependency snapshots are projected into worktrees with symlinks or
+    // junctions. Preserve logical paths so junctioned parent packages resolve
+    // platform-specific dependencies from the job-local node_modules tree.
+    // Expo's transform cache is isolated above, so preserving its package
+    // junction no longer risks reusing another worktree's route context.
+    NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS),
     REACT_NATIVE_PACKAGER_HOSTNAME: env.REACT_NATIVE_PACKAGER_HOSTNAME ?? "127.0.0.1",
     EXPO_DEV_SERVER_PORT: env.EXPO_DEV_SERVER_PORT ?? defaultExpoPort,
     RCT_METRO_PORT: env.RCT_METRO_PORT ?? defaultExpoPort,

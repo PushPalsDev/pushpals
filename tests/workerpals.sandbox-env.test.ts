@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { spawnSync } from "child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import {
@@ -179,7 +188,9 @@ describe("workerpals sandbox writable env", () => {
       expect(env.TMP).toBe(env.TEMP);
       expect(env.TMPDIR).toBe(env.TEMP);
       expect(existsSync(env.TEMP)).toBe(true);
-      expect(env.NODE_OPTIONS).toBe("--max-old-space-size=4096 --dns-result-order=verbatim");
+      expect(env.NODE_OPTIONS).toBe(
+        "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim",
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -337,6 +348,52 @@ describe("workerpals sandbox writable env", () => {
       expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toBe(secondEnv.PLAYWRIGHT_BROWSERS_PATH);
       expect(existsSync(firstEnv.TEMP)).toBe(true);
       expect(existsSync(secondEnv.TEMP)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolves job-local dependencies through junctioned parent packages", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-junction-resolution-"));
+    const repo = join(root, "repo");
+    const worktree = join(repo, ".worktrees", "job-one");
+    const parentPackage = join(repo, "node_modules", "expo");
+    const logicalPackage = join(worktree, "node_modules", "expo");
+    const jobLocalDependency = join(worktree, "node_modules", "@expo", "cli");
+    mkdirSync(join(worktree, "app"), { recursive: true });
+    mkdirSync(join(parentPackage, "bin"), { recursive: true });
+    mkdirSync(jobLocalDependency, { recursive: true });
+    writeFileSync(
+      join(worktree, "package.json"),
+      JSON.stringify({
+        main: "expo-router/entry",
+        dependencies: { "expo-router": "6.0.0" },
+      }),
+      "utf8",
+    );
+    writeFileSync(
+      join(parentPackage, "bin", "resolve-job-local.cjs"),
+      'process.stdout.write(require("@expo/cli"));\n',
+      "utf8",
+    );
+    writeFileSync(
+      join(worktree, "run-junctioned-package.cjs"),
+      'require("./node_modules/expo/bin/resolve-job-local.cjs");\n',
+      "utf8",
+    );
+    writeFileSync(join(jobLocalDependency, "index.js"), 'module.exports = "job-local";\n', "utf8");
+    symlinkSync(parentPackage, logicalPackage, process.platform === "win32" ? "junction" : "dir");
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(worktree, process.env);
+      const result = spawnSync("node", [join(worktree, "run-junctioned-package.cjs")], {
+        env,
+        encoding: "utf8",
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("job-local");
+      expect(result.stderr).toBe("");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
