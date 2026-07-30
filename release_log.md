@@ -2,24 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.2.11`
-- start_commit: `d960501c3b35b430eedd60af27354e67f45e0cbf`
-- end_commit: `e29fc95d7c13d3f154f975906963b82f0578a6e1`
+- version: `v1.2.12`
+- start_commit: `c6da5ed8e288c83ddd41ec2481e760740f313961`
+- end_commit: `67a53e17b852dfbd75c168b60c0fefa3f77c5cd9`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve junctioned dependency paths in Bun itself as well as in Node for direct Windows WorkerPal worktrees.
-- Set inherited `BUN_OPTIONS` symlink flags so nested Bun test and package scripts resolve dependencies from the job-local dependency tree.
-- Extend the executable junction-resolution regression to run through Bun 1.3.9 and Bun 1.3.14, matching the live SectorCommand failure topology.
+- Keep Node and Bun on canonical dependency realpaths so caches and singleton modules such as Vitest retain one module identity in direct Windows WorkerPal worktrees.
+- Prepend the job-local `node_modules` directory to `NODE_PATH`, preserving user entries, so realpathed dependency parents can still resolve packages from the isolated job snapshot.
+- Stop injecting global symlink-preservation flags while retaining explicitly configured user flags, and cover both junctioned CLI resolution and cross-path singleton identity in Node and Bun.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 1,083 passed, 2 intentional skips, 0 failed, 4,231 assertions across 126 files.
-- Focused WorkerPal sandbox-environment and validation-command suites: 67 passed, 0 failed, 246 assertions.
-- Focused sandbox-environment suite on Bun 1.3.9: 15 passed, 0 failed, 70 assertions.
+- Full repository suite on Bun 1.3.14: 1,085 passed, 2 intentional skips, 0 failed, 4,243 assertions across 126 files.
+- Release-playbook root suite on Bun 1.3.14: 1,018 passed, 2 intentional skips, 0 failed, 3,938 assertions across 118 files.
+- Focused WorkerPal sandbox-environment and validation-command suites: 69 passed, 0 failed, 258 assertions.
+- Focused sandbox-environment suite on Bun 1.3.9: 17 passed, 0 failed, 82 assertions.
 - WorkerPals TypeScript check passed.
-- A published v1.2.10 SectorCommand job passed lint and Wrangler dry-runs but reproduced the remaining aggregate Bun resolver failure twice; the new regression covers that unchanged failure cluster.
+- A published v1.2.11 SectorCommand job passed its aggregate unit stage, then reproduced duplicate Vitest suite identity twice in the Worker Vitest stage; the new singleton regression covers that unchanged failure cluster.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
 - `git diff --check` passed.
