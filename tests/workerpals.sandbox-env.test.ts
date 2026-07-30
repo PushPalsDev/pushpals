@@ -754,10 +754,12 @@ describe("workerpals sandbox writable env", () => {
     try {
       const env = buildWorkerSandboxWritableEnv(worktree, process.env);
       const result = spawnSync("node", [join(worktree, "run-junctioned-package.cjs")], {
+        cwd: worktree,
         env,
         encoding: "utf8",
       });
       const cliResult = spawnSync("node", [join(logicalPackage, "bin", "resolve-job-local.cjs")], {
+        cwd: worktree,
         env,
         encoding: "utf8",
       });
@@ -766,6 +768,7 @@ describe("workerpals sandbox writable env", () => {
         process.execPath,
         [join(worktree, "run-junctioned-package.cjs")],
         {
+          cwd: worktree,
           env,
           encoding: "utf8",
         },
@@ -774,6 +777,7 @@ describe("workerpals sandbox writable env", () => {
         process.execPath,
         [join(logicalPackage, "bin", "resolve-job-local.cjs")],
         {
+          cwd: worktree,
           env,
           encoding: "utf8",
         },
@@ -826,6 +830,7 @@ describe("workerpals sandbox writable env", () => {
     try {
       const env = buildWorkerSandboxWritableEnv(worktree, process.env);
       const nodeResult = spawnSync("node", [join(worktree, "compare-module-identity.cjs")], {
+        cwd: worktree,
         env,
         encoding: "utf8",
       });
@@ -833,6 +838,7 @@ describe("workerpals sandbox writable env", () => {
         process.execPath,
         [join(worktree, "compare-module-identity.cjs")],
         {
+          cwd: worktree,
           env,
           encoding: "utf8",
         },
