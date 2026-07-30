@@ -168,14 +168,18 @@ describe("workerpals sandbox writable env", () => {
       const env = buildWorkerSandboxWritableEnv(repo, {
         HOME: join(root, "home"),
         EXPO_ROUTER_APP_ROOT: join(root, "repo", "app"),
-        NODE_OPTIONS:
-          "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim",
+        TEMP: join(root, "shared-temp"),
+        TMP: join(root, "shared-temp"),
+        TMPDIR: join(root, "shared-temp"),
+        NODE_OPTIONS: "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim",
       });
 
       expect(env.EXPO_ROUTER_APP_ROOT).toBe(appRoot);
-      expect(env.NODE_OPTIONS).toBe(
-        "--max-old-space-size=4096 --dns-result-order=verbatim",
-      );
+      expect(env.TEMP).toContain("pushpals-worker-env");
+      expect(env.TMP).toBe(env.TEMP);
+      expect(env.TMPDIR).toBe(env.TEMP);
+      expect(existsSync(env.TEMP)).toBe(true);
+      expect(env.NODE_OPTIONS).toBe("--max-old-space-size=4096 --dns-result-order=verbatim");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -287,6 +291,52 @@ describe("workerpals sandbox writable env", () => {
 
       expect(firstEnv.HOME).not.toBe(secondEnv.HOME);
       expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toBe(secondEnv.PLAYWRIGHT_BROWSERS_PATH);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("isolates Metro temp caches across Expo Router worktrees", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-expo-cache-"));
+    const repo = join(root, "repo");
+    const firstWorktree = join(repo, ".worktrees", "job-one");
+    const secondWorktree = join(repo, ".worktrees", "job-two");
+    const sharedTemp = join(root, "shared-temp");
+    for (const worktree of [firstWorktree, secondWorktree]) {
+      mkdirSync(join(worktree, "app"), { recursive: true });
+      writeFileSync(
+        join(worktree, "package.json"),
+        JSON.stringify({
+          main: "expo-router/entry",
+          dependencies: { "expo-router": "6.0.0" },
+        }),
+        "utf8",
+      );
+    }
+
+    try {
+      const firstEnv = buildWorkerSandboxWritableEnv(firstWorktree, {
+        HOME: join(root, "home"),
+        TEMP: sharedTemp,
+        TMP: sharedTemp,
+        TMPDIR: sharedTemp,
+      });
+      const secondEnv = buildWorkerSandboxWritableEnv(secondWorktree, {
+        HOME: join(root, "home"),
+        TEMP: sharedTemp,
+        TMP: sharedTemp,
+        TMPDIR: sharedTemp,
+      });
+
+      expect(firstEnv.TEMP).not.toBe(sharedTemp);
+      expect(firstEnv.TEMP).not.toBe(secondEnv.TEMP);
+      expect(firstEnv.TMP).toBe(firstEnv.TEMP);
+      expect(firstEnv.TMPDIR).toBe(firstEnv.TEMP);
+      expect(secondEnv.TMP).toBe(secondEnv.TEMP);
+      expect(secondEnv.TMPDIR).toBe(secondEnv.TEMP);
+      expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toBe(secondEnv.PLAYWRIGHT_BROWSERS_PATH);
+      expect(existsSync(firstEnv.TEMP)).toBe(true);
+      expect(existsSync(secondEnv.TEMP)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, dirname, join, resolve } from "path";
 
-function stringEnv(source: Record<string, string | undefined> = process.env): Record<string, string> {
+function stringEnv(
+  source: Record<string, string | undefined> = process.env,
+): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(source)) {
     if (typeof value === "string") env[key] = value;
@@ -93,7 +95,10 @@ export function withResolvedBunOnPath(
 
   const delimiter = pathListDelimiter(platform);
   const existing = String(out.PATH ?? out.Path ?? "").trim();
-  const existingParts = existing.split(delimiter).map((part) => part.trim()).filter(Boolean);
+  const existingParts = existing
+    .split(delimiter)
+    .map((part) => part.trim())
+    .filter(Boolean);
   const alreadyPresent = existingParts.some((part) =>
     platform === "win32" ? part.toLowerCase() === bunDir.toLowerCase() : part === bunDir,
   );
@@ -167,10 +172,7 @@ function ensureSandboxGitConfig(homeDir: string): void {
   }
 }
 
-function withWorkerNodeOptions(
-  value: string | undefined,
-  preserveSymlinks: boolean,
-): string {
+function withWorkerNodeOptions(value: string | undefined, preserveSymlinks: boolean): string {
   const options = (value ?? "")
     .trim()
     .split(/\s+/)
@@ -205,6 +207,7 @@ export function buildWorkerSandboxWritableEnv(
   const homeDir = resolve(baseDir, "home");
   const cacheDir = resolve(baseDir, "cache");
   const expoDir = resolve(baseDir, "expo");
+  const tempDir = resolve(baseDir, "tmp");
   const playwrightBrowsersDir =
     env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0"
       ? env.PLAYWRIGHT_BROWSERS_PATH
@@ -216,7 +219,14 @@ export function buildWorkerSandboxWritableEnv(
         );
   const defaultExpoPort = defaultExpoPortForRepo(repo);
   const expoRouterAppRoot = resolveExpoRouterAppRoot(repo);
-  ensureDirs([homeDir, cacheDir, expoDir, resolve(cacheDir, "npm"), playwrightBrowsersDir]);
+  ensureDirs([
+    homeDir,
+    cacheDir,
+    expoDir,
+    tempDir,
+    resolve(cacheDir, "npm"),
+    playwrightBrowsersDir,
+  ]);
   ensureSandboxGitConfig(homeDir);
 
   return {
@@ -236,7 +246,18 @@ export function buildWorkerSandboxWritableEnv(
     // checkout. Expo Router otherwise resolves its package through the
     // junction target and can render the stock tutorial even when the
     // isolated worktree has valid routes.
-    ...(expoRouterAppRoot ? { EXPO_ROUTER_APP_ROOT: expoRouterAppRoot } : {}),
+    ...(expoRouterAppRoot
+      ? {
+          EXPO_ROUTER_APP_ROOT: expoRouterAppRoot,
+          // Expo's Metro transform cache is rooted under os.tmpdir() and its
+          // junctioned expo-router cache key does not include the worktree
+          // project root. Keep that cache worktree-local so one checkout
+          // cannot reuse another checkout's empty/stale route context.
+          TEMP: tempDir,
+          TMP: tempDir,
+          TMPDIR: tempDir,
+        }
+      : {}),
     // Linux-native dependency snapshots are projected into Windows-hosted
     // worktrees with symlinks. Preserve those logical paths so dev servers
     // emit browser URLs under the worktree instead of the container-only
