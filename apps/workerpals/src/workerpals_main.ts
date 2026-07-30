@@ -50,6 +50,7 @@ import {
 } from "./docker_executor.js";
 import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
 import { linkDirectWorktreeDependencyArtifacts } from "./common/worktree_dependency_artifacts.js";
+import { resolveDirectWorktreePath } from "./common/direct_worktree.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 import { resolveFreshWorktreeBaseRef, resolveReviewWorktreeBase } from "./worktree_base_ref.js";
@@ -905,15 +906,9 @@ async function createIsolatedWorktree(
   baseRef: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): Promise<string> {
-  const worktreeRoot = resolve(repo, ".worktrees");
-  mkdirSync(worktreeRoot, { recursive: true });
-  const safeJobId = jobId
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "")
-    .slice(0, 8);
   const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random().toString(36).slice(2, 6)}`;
-
-  const worktreePath = resolve(worktreeRoot, `job-${safeJobId || "host"}-${nonce}`);
+  const worktreePath = resolveDirectWorktreePath(repo, jobId, nonce);
+  mkdirSync(resolve(worktreePath, ".."), { recursive: true });
 
   const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
   if (!addResult.ok) {

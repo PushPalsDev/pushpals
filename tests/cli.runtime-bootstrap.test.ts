@@ -11,6 +11,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
+import { resolveDirectWorktreePath } from "../apps/workerpals/src/common/direct_worktree";
 import {
   buildCliClearTargets,
   buildEmbeddedRuntimeCrashEnvelope,
@@ -2782,6 +2783,59 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         cwd: "/repo/example",
       },
     ]);
+  });
+
+  test("cleanupLingeringPushPalsGitWorktrees removes short Windows workerpal worktrees", async () => {
+    const calls: Array<{ command: string[]; cwd: string }> = [];
+    const repoRoot = "C:\\repo\\example";
+    const tempRoot = "C:\\Users\\example\\AppData\\Local\\Temp";
+    const worktreePath = resolveDirectWorktreePath(repoRoot, "job-123", "nonce", "win32", tempRoot);
+    const result = await cleanupLingeringPushPalsGitWorktrees({
+      repoRoot,
+      env: {},
+      platform: "win32",
+      tempRoot,
+      runCommandWithEnvFn: async (command, cwd) => {
+        calls.push({ command, cwd });
+        if (command[2] === "list") {
+          return {
+            ok: true,
+            stdout: [
+              `worktree ${repoRoot.replace(/\\/g, "/")}`,
+              "HEAD abcdef1234567890",
+              "branch refs/heads/main",
+              "",
+              `worktree ${worktreePath.replace(/\\/g, "/")}`,
+              "HEAD feedface12345678",
+              "detached",
+            ].join("\n"),
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (command[2] === "remove" || command[2] === "prune") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        if (command[1] === "for-each-ref") {
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        }
+        throw new Error(`unexpected command: ${command.join(" ")}`);
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      detail: "removed 1 lingering PushPals git artifact(s)",
+      removed: 1,
+    });
+    expect(
+      calls.some(
+        ({ command }) =>
+          command[2] === "remove" &&
+          command.at(-1)?.replace(/\\/g, "/").toLowerCase() ===
+            worktreePath.replace(/\\/g, "/").toLowerCase(),
+      ),
+    ).toBe(true);
   });
 
   test("cleanupLingeringPushPalsGitWorktrees falls back to forced delete when git remove hits long paths", async () => {

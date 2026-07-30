@@ -62,6 +62,36 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
+  test("redirects Windows roaming and local application data to writable paths", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-windows-"));
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+    let sandboxRoot = "";
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(
+        repo,
+        {
+          HOME: join(root, "original-home"),
+          APPDATA: join(root, "read-only-roaming"),
+          LOCALAPPDATA: join(root, "read-only-local"),
+        },
+        "win32",
+      );
+      sandboxRoot = dirname(env.HOME);
+
+      expect(env.APPDATA).toBe(join(sandboxRoot, "roaming"));
+      expect(env.LOCALAPPDATA).toBe(join(sandboxRoot, "local"));
+      expect(env.XDG_CONFIG_HOME).toBe(join(sandboxRoot, "config"));
+      expect(existsSync(env.APPDATA)).toBe(true);
+      expect(existsSync(env.LOCALAPPDATA)).toBe(true);
+      expect(existsSync(env.XDG_CONFIG_HOME)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (sandboxRoot) rmSync(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
   test("normalizes Windows Path casing and prepends explicit Bun executable", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-bun-path-"));
     const bunBin = join(root, "runtime", "bin", "bun.exe");
@@ -243,9 +273,7 @@ describe("workerpals sandbox writable env", () => {
         REACT_NATIVE_PACKAGER_HOSTNAME: "localhost",
       });
 
-      expect(env.NODE_OPTIONS).toBe(
-        "--max-old-space-size=4096 --dns-result-order=verbatim",
-      );
+      expect(env.NODE_OPTIONS).toBe("--max-old-space-size=4096 --dns-result-order=verbatim");
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("localhost");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -260,8 +288,7 @@ describe("workerpals sandbox writable env", () => {
     try {
       const env = buildWorkerSandboxWritableEnv(repo, {
         HOME: join(root, "home"),
-        NODE_OPTIONS:
-          "--preserve-symlinks --preserve-symlinks-main --dns-result-order=ipv4first",
+        NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main --dns-result-order=ipv4first",
       });
 
       expect(env.NODE_OPTIONS).toBe(
@@ -338,6 +365,29 @@ describe("workerpals sandbox writable env", () => {
     const repo = join(root, "repo");
     const firstWorktree = join(repo, ".worktrees", "job-one");
     const secondWorktree = join(repo, ".worktrees", "job-two");
+    mkdirSync(firstWorktree, { recursive: true });
+    mkdirSync(secondWorktree, { recursive: true });
+
+    try {
+      const firstEnv = buildWorkerSandboxWritableEnv(firstWorktree, {
+        HOME: join(root, "home"),
+      });
+      const secondEnv = buildWorkerSandboxWritableEnv(secondWorktree, {
+        HOME: join(root, "home"),
+      });
+
+      expect(firstEnv.HOME).not.toBe(secondEnv.HOME);
+      expect(firstEnv.PLAYWRIGHT_BROWSERS_PATH).toBe(secondEnv.PLAYWRIGHT_BROWSERS_PATH);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps Playwright browser cache stable across short Windows worktree pools", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-short-worktree-"));
+    const pool = join(root, "ppw", "abcdef123456");
+    const firstWorktree = join(pool, "job-one");
+    const secondWorktree = join(pool, "job-two");
     mkdirSync(firstWorktree, { recursive: true });
     mkdirSync(secondWorktree, { recursive: true });
 
@@ -439,14 +489,10 @@ describe("workerpals sandbox writable env", () => {
         env,
         encoding: "utf8",
       });
-      const cliResult = spawnSync(
-        "node",
-        [join(logicalPackage, "bin", "resolve-job-local.cjs")],
-        {
-          env,
-          encoding: "utf8",
-        },
-      );
+      const cliResult = spawnSync("node", [join(logicalPackage, "bin", "resolve-job-local.cjs")], {
+        env,
+        encoding: "utf8",
+      });
 
       const bunResult = spawnSync(
         process.execPath,
@@ -511,14 +557,10 @@ describe("workerpals sandbox writable env", () => {
 
     try {
       const env = buildWorkerSandboxWritableEnv(worktree, process.env);
-      const nodeResult = spawnSync(
-        "node",
-        [join(worktree, "compare-module-identity.cjs")],
-        {
-          env,
-          encoding: "utf8",
-        },
-      );
+      const nodeResult = spawnSync("node", [join(worktree, "compare-module-identity.cjs")], {
+        env,
+        encoding: "utf8",
+      });
       const bunResult = spawnSync(
         process.execPath,
         [join(worktree, "compare-module-identity.cjs")],

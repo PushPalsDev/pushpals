@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, dirname, join, resolve } from "path";
+import { directWorktreePoolRoot } from "./direct_worktree.js";
 
 function stringEnv(
   source: Record<string, string | undefined> = process.env,
@@ -118,8 +119,8 @@ function browserCacheRepoKey(repo: string): string {
   const normalized = resolve(repo).replace(/\\/g, "/");
   const marker = "/.worktrees/";
   const markerIndex = normalized.lastIndexOf(marker);
-  if (markerIndex < 0) return resolve(repo);
-  return normalized.slice(0, markerIndex);
+  if (markerIndex >= 0) return normalized.slice(0, markerIndex);
+  return directWorktreePoolRoot(repo) ?? resolve(repo);
 }
 
 function defaultExpoPortForRepo(repo: string): string {
@@ -193,11 +194,9 @@ function withWorkerNodePath(
     .filter(Boolean);
   const remaining = existing.filter(
     (entry) =>
-      !(
-        platform === "win32"
-          ? resolve(entry).toLowerCase() === jobNodeModules.toLowerCase()
-          : resolve(entry) === jobNodeModules
-      ),
+      !(platform === "win32"
+        ? resolve(entry).toLowerCase() === jobNodeModules.toLowerCase()
+        : resolve(entry) === jobNodeModules),
   );
   return [jobNodeModules, ...remaining].join(delimiter);
 }
@@ -215,6 +214,7 @@ function resolveCodexHome(env: Record<string, string>, originalHome: string): st
 export function buildWorkerSandboxWritableEnv(
   repo: string,
   sourceEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): Record<string, string> {
   const env = withResolvedBunOnPath(sourceEnv);
   const originalHome = resolveOriginalHome(env);
@@ -224,6 +224,9 @@ export function buildWorkerSandboxWritableEnv(
   const cacheDir = resolve(baseDir, "cache");
   const expoDir = resolve(baseDir, "expo");
   const tempDir = resolve(baseDir, "tmp");
+  const configDir = resolve(baseDir, "config");
+  const roamingDir = resolve(baseDir, "roaming");
+  const localAppDataDir = resolve(baseDir, "local");
   const playwrightBrowsersDir =
     env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0"
       ? env.PLAYWRIGHT_BROWSERS_PATH
@@ -240,6 +243,8 @@ export function buildWorkerSandboxWritableEnv(
     cacheDir,
     expoDir,
     tempDir,
+    configDir,
+    ...(platform === "win32" ? [roamingDir, localAppDataDir] : []),
     resolve(cacheDir, "npm"),
     playwrightBrowsersDir,
   ]);
@@ -251,6 +256,13 @@ export function buildWorkerSandboxWritableEnv(
     HOME: homeDir,
     USERPROFILE: homeDir,
     XDG_CACHE_HOME: cacheDir,
+    XDG_CONFIG_HOME: configDir,
+    ...(platform === "win32"
+      ? {
+          APPDATA: roamingDir,
+          LOCALAPPDATA: localAppDataDir,
+        }
+      : {}),
     npm_config_cache: resolve(cacheDir, "npm"),
     PLAYWRIGHT_BROWSERS_PATH: env.PLAYWRIGHT_BROWSERS_PATH ?? playwrightBrowsersDir,
     EXPO_HOME: expoDir,

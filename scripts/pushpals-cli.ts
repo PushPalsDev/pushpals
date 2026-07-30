@@ -34,6 +34,7 @@ import {
   type ManagedServiceProcess,
 } from "./start_runtime_services.js";
 import { forceDeleteWorktreePath } from "../apps/workerpals/src/common/worktree_cleanup.js";
+import { isDirectWorkerWorktreePath } from "../apps/workerpals/src/common/direct_worktree.js";
 import {
   evaluateClientRuntimePreflight,
   formatClientRuntimePreflightLines,
@@ -3136,12 +3137,13 @@ function parseGitWorktreeListPorcelain(stdout: string): GitWorktreeEntry[] {
   return entries;
 }
 
-function isWorkerpalEphemeralWorktreePath(repoRoot: string, worktreePath: string): boolean {
-  const expectedPrefix = `${normalizeFsPathForComparison(join(repoRoot, ".worktrees"))}/`;
-  const normalizedPath = normalizeFsPathForComparison(worktreePath);
-  if (!normalizedPath.startsWith(expectedPrefix)) return false;
-  const leaf = basename(normalizedPath);
-  return /^(job|selfcheck)-[a-z0-9][a-z0-9._-]*$/i.test(leaf);
+function isWorkerpalEphemeralWorktreePath(
+  repoRoot: string,
+  worktreePath: string,
+  platform: NodeJS.Platform = process.platform,
+  tempRoot?: string,
+): boolean {
+  return isDirectWorkerWorktreePath(repoRoot, worktreePath, platform, tempRoot);
 }
 
 function resolveConfiguredDockerExecutable(
@@ -3337,6 +3339,8 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
   runCommandWithEnvFn?: typeof runCommandWithEnv;
   forceDeleteWorktreePathFn?: typeof forceDeleteWorktreePath;
   commandTimeoutMs?: number;
+  platform?: NodeJS.Platform;
+  tempRoot?: string;
 }): Promise<{ ok: boolean; detail: string; removed: number }> {
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
   const forceDeleteWorktreePathFn = opts.forceDeleteWorktreePathFn ?? forceDeleteWorktreePath;
@@ -3366,7 +3370,12 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
     if (entry.branch?.startsWith(`refs/heads/${SOURCE_CONTROL_MANAGER_TEMP_BRANCH_PREFIX}`)) {
       return true;
     }
-    return isWorkerpalEphemeralWorktreePath(opts.repoRoot, entry.path);
+    return isWorkerpalEphemeralWorktreePath(
+      opts.repoRoot,
+      entry.path,
+      opts.platform ?? process.platform,
+      opts.tempRoot,
+    );
   });
 
   let removed = 0;
