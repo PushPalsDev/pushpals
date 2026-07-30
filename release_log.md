@@ -2,27 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.2.6`
-- start_commit: `a460bce82ded39f13ee94cdde9f90f2fc97d7a90`
-- end_commit: `dd7bb6b8fec63a9e78de5b27e8985bff7578d2a2`
+- version: `v1.2.7`
+- start_commit: `c6df2e8342e11168d985b8b8009b0a97fa926ba8`
+- end_commit: `165e623e6efb72c537e70f3ff236231b1cdd9b82`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Revalidate explicit test-file targets against the current job checkout before every deterministic quality gate.
-- Drop planner commands whose only explicit test targets were deleted during an intentional PR-scope cleanup, instead of treating Bun's “no matches” result as a product failure.
-- Preserve existing targets in mixed existing/deleted test commands, along with flags and aggregate validation requirements.
-- Prevent stale test paths from deferring authoritative aggregate validation and consuming repeated dedicated repair revisions.
+- Pin the packaged WorkerPal launcher to OpenAI Codex CLI 0.146.0 so fresh Windows worktrees can overwrite existing tracked files under the native workspace-write sandbox.
+- Migrate the shipped legacy `codex`, unpinned `bun x`, and unpinned `bunx` WorkerPal defaults to the known-good versioned launcher at runtime startup.
+- Preserve explicit user-supplied Codex version pins instead of replacing intentional custom launcher choices.
+- Add bootstrap regression coverage and require an existing-tracked-file Windows sandbox smoke test in the model-upgrade playbook.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 1,012 passed, 2 intentional skips, 0 failed, 3,898 assertions across 118 files.
-- Focused validation-command suite: 52 passed, 0 failed, 176 assertions.
-- WorkerPals TypeScript check passed.
+- Full root suite on Bun 1.3.14: 1,013 passed, 2 intentional skips, 0 failed, 3,900 assertions across 118 files.
+- Focused CLI runtime-bootstrap suite: 146 passed, 1 intentional skip, 0 failed, 485 assertions.
+- A fresh Windows SectorCommand Git worktree verified that Codex CLI 0.146.0 can modify an existing tracked file under `workspace-write`.
+- The versioned launcher resolved successfully through the embedded Windows root-CA bundle.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- The exact interrupted SectorCommand PR-repair worktree was replayed: deleted web-startup and home-action test targets were removed while the real Projectile, Wrangler, validate, deploy dry-run, typecheck, and lint gates remained.
-- Mixed-command coverage confirms a deleted test target is pruned without broadening the command or dropping a still-existing test target.
 - `git diff --check` passed.
 
 ## Install
@@ -65,7 +64,7 @@ bun install -g @pushpalsdev/cli
 - OpenAI Codex WorkerPal jobs still fail fast on truly broad/noisy publishable diffs after timeout; tracked paths with no staged or unstaged Git content delta are now filtered before ScopeGate and quality diagnostics.
 - OpenAI Codex rollout coaching still blocks missing-path drift, PushPals/autonomy internals in user repos, broad shared mock expansion, and full render/full-surface harness expansion; this release permits narrow mock/harness terminology when a repo-native shell contract-test task is reusing existing infrastructure.
 - Critic-only soft-pass applies only after required validation passes; a low critic score can still block when there is enough budget for another revision, when deterministic gates find issues, or when exhausted soft-pass is disabled.
-- Codex `gpt-5.6-sol` requires Codex CLI `0.144.1` or another compatible version; older Codex CLIs fall back once to `gpt-5.5` for WorkerPal and RemoteBuddy Codex execution when they report model incompatibility.
+- Codex `gpt-5.6-sol` requires a compatible Codex CLI; packaged WorkerPal defaults now pin `0.146.0`, while older explicitly configured CLIs still fall back once to `gpt-5.5` when they report model incompatibility.
 - GitHub contribution credit for WorkerPal commits requires the configured commit email to be associated with the target GitHub account.
-- User-local `runtime/configs/local.toml` overrides can preserve older runtime defaults during manual smoke testing; use `pushpals --open_config`, `pushpals --clear`, or remove the local override to pick up new packaged defaults.
+- User-local `runtime/configs/local.toml` values that use the shipped legacy unversioned WorkerPal launcher are migrated to `0.146.0`; explicit custom commands and explicit version pins are preserved.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
