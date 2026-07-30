@@ -2,23 +2,24 @@
 
 ## Release Metadata
 
-- version: `v1.2.10`
-- start_commit: `56c562872c2f9e313cd21716d6b32268274739ff`
-- end_commit: `4256e8adfbbaa07bb8a428f5b9f97a95df2172ae`
+- version: `v1.2.11`
+- start_commit: `d960501c3b35b430eedd60af27354e67f45e0cbf`
+- end_commit: `e29fc95d7c13d3f154f975906963b82f0578a6e1`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve junctioned Node CLI entrypoints as well as imported modules in direct Windows WorkerPal worktrees.
-- Add `--preserve-symlinks-main` alongside `--preserve-symlinks` so commands such as Expo lint and Wrangler resolve platform-specific dependencies from the job-local dependency tree.
-- Extend the executable junction-resolution regression to cover both imported packages and a junctioned package launched directly as Node's main module.
+- Preserve junctioned dependency paths in Bun itself as well as in Node for direct Windows WorkerPal worktrees.
+- Set inherited `BUN_OPTIONS` symlink flags so nested Bun test and package scripts resolve dependencies from the job-local dependency tree.
+- Extend the executable junction-resolution regression to run through Bun 1.3.9 and Bun 1.3.14, matching the live SectorCommand failure topology.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 1,082 passed, 2 intentional skips, 0 failed, 4,225 assertions across 126 files.
-- Focused WorkerPal sandbox-environment and validation-command suites: 66 passed, 0 failed, 240 assertions.
+- Full root suite on Bun 1.3.14: 1,083 passed, 2 intentional skips, 0 failed, 4,231 assertions across 126 files.
+- Focused WorkerPal sandbox-environment and validation-command suites: 67 passed, 0 failed, 246 assertions.
+- Focused sandbox-environment suite on Bun 1.3.9: 15 passed, 0 failed, 70 assertions.
 - WorkerPals TypeScript check passed.
-- The exact failed SectorCommand worktree passed `bun run lint` and `bun run worker:deploy:dry-run` after applying the complete Node symlink options.
+- A published v1.2.10 SectorCommand job passed lint and Wrangler dry-runs but reproduced the remaining aggregate Bun resolver failure twice; the new regression covers that unchanged failure cluster.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
 - `git diff --check` passed.
