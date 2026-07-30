@@ -45,7 +45,7 @@ retention_days = 30
 backend = "openai_codex"
 model = "gpt-5.6-sol"
 codex_auth_mode = "chatgpt"
-codex_bin = "codex"
+codex_bin = "bun x --yes @openai/codex@0.146.0"
 codex_timeout_ms = 120000
 reasoning_effort = "xhigh"
 
@@ -99,7 +99,7 @@ auto_steer_max_nudges = 30
 
 [workerpals.openai_codex]
 auth_mode = "chatgpt"
-bin = "codex"
+bin = "bun x --yes @openai/codex@0.146.0"
 timeout_ms = 7200000
 progress_log_interval_s = 30
 # timeout_s = 120  # optional; if set, overrides timeout_ms

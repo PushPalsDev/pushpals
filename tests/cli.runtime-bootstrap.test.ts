@@ -2124,7 +2124,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           "[workerpals.llm]",
           'backend = "openai_codex"',
           'model = "gpt-5.4"',
-          'codex_bin = "bun x --yes @openai/codex"',
+          'codex_bin = "codex"',
           'reasoning_effort = "high"',
           "",
           "[workerpals.openai_codex]",
@@ -2152,8 +2152,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(migratedLocalToml).toContain('reasoning_effort = "xhigh"');
       expect(migratedLocalToml).not.toContain("gpt-5.4");
       expect(migratedLocalToml).not.toContain('model = "gpt-5.5"');
-      expect(migratedLocalToml.match(/(?:codex_bin|bin) = "codex"/g)?.length).toBe(2);
-      expect(migratedLocalToml).not.toContain("@openai/codex");
+      expect(
+        migratedLocalToml.match(/(?:codex_bin|bin) = "bun x --yes @openai\/codex@0\.146\.0"/g)
+          ?.length,
+      ).toBe(2);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -2200,6 +2202,40 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toContain(
         'model = "gpt-5.5-mini"',
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime preserves explicit WorkerPal Codex version pins", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-pin-preserve-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+    mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+    writeFileSync(
+      join(runtimeRoot, "configs", "local.toml"),
+      [
+        "[workerpals.llm]",
+        'backend = "openai_codex"',
+        'codex_bin = "bun x --yes @openai/codex@0.147.0"',
+        "",
+        "[workerpals.openai_codex]",
+        'bin = "bunx --yes @openai/codex@0.147.0"',
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    try {
+      await prepareCliRuntime({
+        repoRoot,
+        runtimeRoot,
+      });
+
+      const migratedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
+      expect(migratedLocalToml).toContain('codex_bin = "bun x --yes @openai/codex@0.147.0"');
+      expect(migratedLocalToml).toContain('bin = "bunx --yes @openai/codex@0.147.0"');
+      expect(migratedLocalToml).not.toContain("@openai/codex@0.146.0");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

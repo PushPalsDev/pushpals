@@ -1655,15 +1655,17 @@ function migrateLegacyOpenAICodexDefaults(sectionBody: string, opts: { includeMo
   return updated;
 }
 
+const PINNED_WORKER_CODEX_COMMAND = "bun x --yes @openai/codex@0.146.0";
+
 function migrateLegacyWorkerCodexCommandDefault(
   sectionBody: string,
   key: "codex_bin" | "bin",
 ): string {
   const pattern = new RegExp(
-    `^(\\s*${key}\\s*=\\s*)"(?:bun\\s+x|bunx)\\s+--yes\\s+@openai/codex"\\s*$`,
+    `^(\\s*${key}\\s*=\\s*)"(?:codex|(?:bun\\s+x|bunx)\\s+--yes\\s+@openai/codex)"\\s*$`,
     "m",
   );
-  return sectionBody.replace(pattern, '$1"codex"');
+  return sectionBody.replace(pattern, `$1"${PINNED_WORKER_CODEX_COMMAND}"`);
 }
 
 function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {

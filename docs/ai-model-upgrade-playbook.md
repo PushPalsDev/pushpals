@@ -29,7 +29,7 @@ codex exec --model gpt-5.6-sol --sandbox read-only --ephemeral -c 'model_reasoni
 2. Check the launcher form used by PushPals.
 
 ```powershell
-bun x --yes @openai/codex --version
+bun x --yes @openai/codex@0.146.0 --version
 ```
 
 3. Search all active defaults and packaged copies.
@@ -38,9 +38,12 @@ bun x --yes @openai/codex --version
 rg -n "gpt-5\.4|gpt-5\.5|gpt-5\.6-sol|reasoning_effort|reasoningEffort|DEFAULT.*CODEX|model_reasoning_effort" configs packages apps tests scripts --glob "!**/node_modules/**" --glob "!packages/cli/monitor-ui/**"
 ```
 
-If `codex` is new enough but `bun x --yes @openai/codex` resolves an older CLI, fix
-or document that separately. PushPals services often launch Codex through the
-configured `codex_bin`, not necessarily the global `codex` executable.
+WorkerPals pins `bun x --yes @openai/codex@0.146.0` because earlier native
+Windows Codex sandboxes could create files in a Git worktree while denying
+overwrites of files that existed before sandbox startup. If a newer explicit
+pin is being evaluated, preserve it during the test. PushPals services launch
+Codex through the configured `codex_bin`, not necessarily the global `codex`
+executable.
 
 On Windows, also test the service launcher path rather than only PowerShell command
 resolution. PowerShell may resolve `codex` through a `.ps1` or `.cmd` shim, while a
@@ -225,6 +228,9 @@ npm view @pushpalsdev/cli@X.Y.Z version
 - Published package passes basic tests but preserves an old user `local.toml`.
 - Live `codex` binary supports the new model but `bun x --yes @openai/codex` resolves
   an older CLI.
+- A Windows smoke test creates a new Git worktree but only proves that Codex can
+  create a new file. The probe must also overwrite an existing tracked file
+  under `workspace-write`.
 - Reasoning effort is changed in config but the executor still normalizes it down.
 - The release is tagged before the migration fix lands, requiring a follow-up patch
   release.
