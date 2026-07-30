@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { spawnSync } from "child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -31,6 +39,7 @@ import {
   playwrightBrowserInstallArgv,
   prepareValidationCommandArgv,
   prepareValidationSpawnArgv,
+  removeLinkedNodeModulesDependencyArtifact,
   resolveBunDependencyLayoutPreflight,
   resolveBunDependencyLayoutPreflightTimeoutForValidationCommands,
   resolveBunDependencyLayoutPreflightTimeoutMs,
@@ -1293,6 +1302,159 @@ describe("workerpals validation command safety", () => {
       expect(resolveBunDependencyLayoutPreflight(root, ["bun test"])).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("replaces managed linked-package snapshots before Bun validation", () => {
+    const tempRoot = mkdtempSync(
+      join(tmpdir(), "pushpals-validation-linked-package-snapshot-"),
+    );
+    const canonicalRepo = join(tempRoot, "repo");
+    const root = join(canonicalRepo, ".worktrees", "job-fixture");
+    const canonicalWrangler = join(canonicalRepo, "node_modules", "wrangler");
+
+    try {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify(
+          {
+            scripts: { "worker:deploy:dry-run": "wrangler deploy --dry-run" },
+            devDependencies: { wrangler: "1.0.0" },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      writeFileSync(join(root, "bun.lock"), "", "utf8");
+      mkdirSync(join(root, "node_modules", ".bin"), { recursive: true });
+      mkdirSync(join(root, "node_modules", "@cloudflare", "unenv-preset"), {
+        recursive: true,
+      });
+      mkdirSync(canonicalWrangler, { recursive: true });
+      writeFileSync(
+        join(canonicalWrangler, "package.json"),
+        JSON.stringify({
+          name: "wrangler",
+          type: "module",
+          bin: { wrangler: "cli.js" },
+        }),
+        "utf8",
+      );
+      writeFileSync(
+        join(canonicalWrangler, "cli.js"),
+        'import preset from "@cloudflare/unenv-preset"; process.stdout.write(preset);\n',
+        "utf8",
+      );
+      writeFileSync(
+        join(root, "node_modules", "@cloudflare", "unenv-preset", "package.json"),
+        JSON.stringify({
+          name: "@cloudflare/unenv-preset",
+          type: "module",
+          exports: "./index.js",
+        }),
+        "utf8",
+      );
+      writeFileSync(
+        join(root, "node_modules", "@cloudflare", "unenv-preset", "index.js"),
+        'export default "job-local";\n',
+        "utf8",
+      );
+      writeFileSync(join(root, "node_modules", ".bin", "wrangler"), "", "utf8");
+      writeFileSync(
+        join(root, "node_modules", ".pushpals-dependency-snapshot"),
+        "fixture\n",
+        "utf8",
+      );
+      symlinkSync(
+        canonicalWrangler,
+        join(root, "node_modules", "wrangler"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      const plan = resolveBunDependencyLayoutPreflight(root, [
+        "bun run worker:deploy:dry-run",
+      ]);
+      expect(plan?.reason).toContain("linked package directories");
+      expect(plan?.removeLinkedNodeModules).toBe(true);
+
+      const linkedRun = spawnSync(
+        "node",
+        [join(root, "node_modules", "wrangler", "cli.js")],
+        {
+          env: {
+            ...process.env,
+            NODE_PATH: join(root, "node_modules"),
+            BUN_OPTIONS: "",
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(linkedRun.status).not.toBe(0);
+      expect(linkedRun.stderr).toContain("Cannot find package '@cloudflare/unenv-preset'");
+
+      const logs: string[] = [];
+      removeLinkedNodeModulesDependencyArtifact(root, (_stream, line) => logs.push(line));
+      expect(existsSync(join(root, "node_modules"))).toBe(false);
+      expect(logs.join("\n")).toContain(
+        "removed linked-package node_modules artifact before local Bun install repair",
+      );
+
+      const localWrangler = join(root, "node_modules", "wrangler");
+      const localPreset = join(root, "node_modules", "@cloudflare", "unenv-preset");
+      mkdirSync(localWrangler, { recursive: true });
+      mkdirSync(localPreset, { recursive: true });
+      writeFileSync(
+        join(localWrangler, "package.json"),
+        JSON.stringify({ name: "wrangler", type: "module" }),
+        "utf8",
+      );
+      writeFileSync(
+        join(localWrangler, "cli.js"),
+        'import preset from "@cloudflare/unenv-preset"; process.stdout.write(preset);\n',
+        "utf8",
+      );
+      writeFileSync(
+        join(localPreset, "package.json"),
+        JSON.stringify({
+          name: "@cloudflare/unenv-preset",
+          type: "module",
+          exports: "./index.js",
+        }),
+        "utf8",
+      );
+      writeFileSync(join(localPreset, "index.js"), 'export default "job-local";\n', "utf8");
+
+      const localizedRun = spawnSync(
+        "node",
+        [join(localWrangler, "cli.js")],
+        {
+          env: {
+            ...process.env,
+            NODE_PATH: join(root, "node_modules"),
+            BUN_OPTIONS: "",
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(localizedRun.status).toBe(0);
+      expect(localizedRun.stdout).toBe("job-local");
+      expect(localizedRun.stderr).toBe("");
+
+      const localizedBunRun = spawnSync(process.execPath, [join(localWrangler, "cli.js")], {
+        env: {
+          ...process.env,
+          NODE_PATH: join(root, "node_modules"),
+          BUN_OPTIONS: "",
+        },
+        encoding: "utf8",
+      });
+      expect(localizedBunRun.status).toBe(0);
+      expect(localizedBunRun.stdout).toBe("job-local");
+      expect(localizedBunRun.stderr).toBe("");
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
     }
   });
 

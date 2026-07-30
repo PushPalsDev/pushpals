@@ -274,9 +274,10 @@ export function buildWorkerSandboxWritableEnv(
           TMPDIR: tempDir,
         }
       : {}),
-    // Keep canonical realpaths for caches and singletons such as Vitest, while
-    // still allowing junctioned packages to resolve platform-specific
-    // dependencies that exist only in the job-local dependency snapshot.
+    // Keep canonical realpaths for caches and singletons such as Vitest.
+    // NODE_PATH keeps Node/CommonJS discovery usable while a worker edits
+    // against the fast linked-package snapshot; ValidationGate replaces that
+    // managed snapshot with a fully local frozen install before Bun commands.
     NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS),
     NODE_PATH: withWorkerNodePath(repo, env.NODE_PATH),
     REACT_NATIVE_PACKAGER_HOSTNAME: env.REACT_NATIVE_PACKAGER_HOSTNAME ?? "127.0.0.1",

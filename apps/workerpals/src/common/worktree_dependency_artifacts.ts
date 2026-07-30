@@ -15,6 +15,8 @@ import { resolve } from "path";
 type JobLog = (stream: "stdout" | "stderr", line: string) => void;
 
 export const DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS = ["node_modules"] as const;
+export const DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER =
+  ".pushpals-dependency-snapshot";
 
 export type DirectWorktreeDependencyArtifactResult = {
   linked: string[];
@@ -85,7 +87,11 @@ function materializeDependencySnapshot(
       copyFileSync(sourceEntry, destinationEntry);
     }
   }
-  writeFileSync(resolve(destination, ".pushpals-dependency-snapshot"), `${snapshotKey}\n`, "utf8");
+  writeFileSync(
+    resolve(destination, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER),
+    `${snapshotKey}\n`,
+    "utf8",
+  );
 }
 
 export function linkDirectWorktreeDependencyArtifacts(

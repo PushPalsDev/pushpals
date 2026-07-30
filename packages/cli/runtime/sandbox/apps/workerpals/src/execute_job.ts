@@ -52,6 +52,7 @@ import {
   resolveBunExecutableFromEnv,
   withResolvedBunOnPath,
 } from "./common/sandbox_env.js";
+import { DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER } from "./common/worktree_dependency_artifacts.js";
 // Re-export shared utilities for backward compatibility with external consumers.
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
@@ -2657,6 +2658,12 @@ function isLinkedNodeModulesDependencyArtifact(repo: string): boolean {
   }
 }
 
+function isManagedLinkedPackageDependencySnapshot(repo: string): boolean {
+  return existsSync(
+    resolve(repo, "node_modules", DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER),
+  );
+}
+
 function validationNeedsExpoRouterBrowserLocalInstall(
   repo: string,
   packageJson: Record<string, unknown>,
@@ -2722,6 +2729,15 @@ export function resolveBunDependencyLayoutPreflight(
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules is missing for Bun validation commands",
+    };
+  }
+
+  if (isManagedLinkedPackageDependencySnapshot(repo)) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason:
+        "node_modules contains linked package directories from a PushPals dependency snapshot",
+      removeLinkedNodeModules: true,
     };
   }
 
@@ -2806,17 +2822,22 @@ export function buildBunDependencyLayoutPreflightFailureRun(args: {
   };
 }
 
-function removeLinkedNodeModulesDependencyArtifact(
+export function removeLinkedNodeModulesDependencyArtifact(
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
 ): void {
   const nodeModulesDir = resolve(repo, "node_modules");
-  if (!isLinkedNodeModulesDependencyArtifact(repo)) return;
+  if (
+    !isLinkedNodeModulesDependencyArtifact(repo) &&
+    !isManagedLinkedPackageDependencySnapshot(repo)
+  ) {
+    return;
+  }
   try {
     rmSync(nodeModulesDir, { recursive: true, force: true });
     onLog?.(
       "stdout",
-      "[ValidationGate] Dependency layout preflight removed linked node_modules artifact before local Bun install repair.",
+      "[ValidationGate] Dependency layout preflight removed linked-package node_modules artifact before local Bun install repair.",
     );
   } catch (err) {
     onLog?.(
