@@ -908,16 +908,53 @@ function buildPatchSnapshotDiagnostics(
   };
 }
 
-function classifyValidationRunFailure(run: ValidationExecutionResult): string | null {
+function isDockerDaemonValidationBlocker(value: string): boolean {
+  const socketUnavailable =
+    /\/var\/run\/docker\.sock/i.test(value) &&
+    /\b(?:cannot connect|failed to connect|permission denied|operation not permitted|eacces|eperm)\b/i.test(
+      value,
+    );
+  return (
+    socketUnavailable ||
+    /cannot connect to (?:the )?docker daemon/i.test(value) ||
+    /is the docker daemon running/i.test(value) ||
+    /docker daemon is not running/i.test(value) ||
+    /failed to connect to the docker api/i.test(value)
+  );
+}
+
+export function classifyValidationRunFailure(run: ValidationExecutionResult): string | null {
   if (run.ok) return null;
   const combined = `${run.command}\n${run.stdout}\n${run.stderr}`.toLowerCase();
-  if (run.exitCode === 124 || combined.includes("timed out") || combined.includes("timeout")) {
+  const command = run.command.toLowerCase();
+  const output = `${run.stdout}\n${run.stderr}`.toLowerCase();
+  if (isDockerDaemonValidationBlocker(combined)) {
+    return "environment";
+  }
+  if (
+    run.exitCode === 124 ||
+    /\b(?:command|process|request|connection|validation|test|browser|playwright|executor)\s+timed out\b/i.test(
+      combined,
+    ) ||
+    /\btimeout(?:error)?\b[^a-z0-9]*(?:after|exceeded|expired)/i.test(combined)
+  ) {
     return "timeout";
   }
-  if (run.exitCode === 127 || combined.includes("missing tool") || combined.includes("not found")) {
+  if (
+    run.exitCode === 127 ||
+    combined.includes("missing required tool") ||
+    combined.includes("command not found") ||
+    combined.includes("executable not found") ||
+    combined.includes("not recognized as an internal or external command")
+  ) {
     return "missing_tool";
   }
-  if (/browser|playwright|cypress|locator|page\.|screenshot|web:e2e/.test(combined)) {
+  if (
+    /(?:browser|playwright|cypress|web:e2e)/.test(command) ||
+    /\b(?:playwright|cypress|locator|screenshot)\b|page\.(?:goto|waitfor|locator|click|fill)/.test(
+      output,
+    )
+  ) {
     return "browser_validation";
   }
   if (
@@ -971,6 +1008,12 @@ function inferTerminalFailureClass(result: JobResult, changedPaths: string[]): s
 }
 
 function inferTerminalStage(result: JobResult, fallback: string): string {
+  if (
+    fallback === "validation_circuit_breaker" ||
+    fallback === "trusted_environment_validation_required"
+  ) {
+    return fallback;
+  }
   const text = `${result.summary ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
   if (text.includes("stalled before first response") || text.includes("startup stall")) {
     return "executor_startup";
@@ -3150,6 +3193,14 @@ export function detectValidationBlocker(
       combined.includes("playwright install") ||
       combined.includes("executable doesn't exist") ||
       combined.includes("please run the following command to download new browsers"));
+
+  if (isDockerDaemonValidationBlocker(combined)) {
+    return {
+      category: "environment",
+      detail:
+        "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the candidate and rerun the blocked command in a trusted host environment.",
+    };
+  }
 
   if (
     combined.includes("validation skipped before execution because required tool") ||

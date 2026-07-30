@@ -2360,7 +2360,20 @@ export class DockerExecutor {
   }
 
   private isRetryableJobFailure(result: DockerJobResult): boolean {
+    // A structured terminal result came from the job runner after it already
+    // applied its own revision, validation, and circuit-breaker policies. Do
+    // not reinterpret nested validation output (for example, a missing Docker
+    // socket inside the sandbox) as a failure of the outer Docker transport.
+    if (result.diagnostics?.terminal || result.publishBlocked || result.validationBlocked) {
+      return false;
+    }
     const text = `${result.summary ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
+    if (
+      text.includes("repeated unchanged validation failure circuit opened") ||
+      text.includes("stopping revisions for this failure cluster")
+    ) {
+      return false;
+    }
     return this.matchesRetryablePattern(text);
   }
 

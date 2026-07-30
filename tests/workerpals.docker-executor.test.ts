@@ -213,6 +213,49 @@ describe("workerpals docker executor internals", () => {
     expect(executor.matchesRetryablePattern("warm runtime startup timed out")).toBe(true);
   });
 
+  test("does not retry structured job terminals from nested validation failures", () => {
+    const executor = createExecutor() as unknown as {
+      isRetryableJobFailure: (result: {
+        ok: boolean;
+        summary: string;
+        stderr?: string;
+        diagnostics?: { terminal?: { terminalStage?: string } };
+      }) => boolean;
+    };
+    const nestedDockerFailure =
+      "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. " +
+      "Is the docker daemon running?";
+
+    expect(
+      executor.isRetryableJobFailure({
+        ok: false,
+        summary: "Repeated unchanged validation failure circuit opened",
+        stderr: nestedDockerFailure,
+        diagnostics: {
+          terminal: {
+            terminalStage: "validation_circuit_breaker",
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      executor.isRetryableJobFailure({
+        ok: false,
+        summary: "Repeated unchanged validation failure circuit opened",
+        stderr:
+          `${nestedDockerFailure}\n` +
+          "Stopping revisions for this failure cluster; dispatch a root-cause repair.",
+      }),
+    ).toBe(false);
+    expect(
+      executor.isRetryableJobFailure({
+        ok: false,
+        summary: "Docker execution error",
+        stderr: "connection reset while contacting the warm runtime",
+      }),
+    ).toBe(true);
+  });
+
   test("retry exhaustion preserves longer executor-provided cooldowns", () => {
     const executor = createExecutor() as unknown as {
       retryExhaustionCooldownMs: (result: { cooldownMs?: number }) => number;

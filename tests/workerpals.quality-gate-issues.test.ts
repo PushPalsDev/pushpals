@@ -10,6 +10,7 @@ import {
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
   buildTaskFailureJobFamily,
+  classifyValidationRunFailure,
   detectValidationBlocker,
   expandKnownArtifactDirectoryPaths,
   findUnchangedValidationFailure,
@@ -1368,6 +1369,81 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toMatchObject({
       category: "environment",
     });
+
+    expect(
+      detectValidationBlocker([
+        {
+          step: "bun run validate",
+          command: "bun run validate",
+          ok: false,
+          exitCode: 1,
+          elapsedMs: 23_255,
+          stdout: "[publish readiness 2/8] Supabase database tests",
+          stderr:
+            "[supabase tests] Failed to start the local stack.\n" +
+            "[supabase tests] Supabase CLI stderr:\n" +
+            "failed to inspect service: Cannot connect to the Docker daemon at " +
+            "unix:///var/run/docker.sock. Is the docker daemon running?",
+        },
+      ]),
+    ).toEqual({
+      category: "environment",
+      detail:
+        "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the candidate and rerun the blocked command in a trusted host environment.",
+    });
+    expect(
+      detectValidationBlocker([
+        {
+          step: "bun test",
+          command: "bun test",
+          ok: false,
+          exitCode: 1,
+          elapsedMs: 1_000,
+          stdout: "",
+          stderr: "Expected documentation to mention /var/run/docker.sock",
+        },
+      ]),
+    ).toBeNull();
+  });
+
+  test("does not label fast validation failures as timeouts from incidental test output", () => {
+    expect(
+      classifyValidationRunFailure({
+        step: "bun run validate",
+        command: "bun run validate",
+        ok: false,
+        exitCode: 1,
+        elapsedMs: 23_255,
+        stdout:
+          "(pass) timeout policy keeps browser budgets bounded\n" +
+          "[publish readiness 2/8] Supabase database tests",
+        stderr:
+          "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. " +
+          "Is the docker daemon running?",
+      }),
+    ).toBe("environment");
+    expect(
+      classifyValidationRunFailure({
+        step: "bun test",
+        command: "bun test",
+        ok: false,
+        exitCode: 1,
+        elapsedMs: 1_200,
+        stdout: "(pass) timeout policy keeps browser budgets bounded",
+        stderr: "Expected route shell to render",
+      }),
+    ).toBe("nonzero_exit");
+    expect(
+      classifyValidationRunFailure({
+        step: "bun run web:e2e",
+        command: "bun run web:e2e",
+        ok: false,
+        exitCode: 124,
+        elapsedMs: 300_000,
+        stdout: "",
+        stderr: "browser validation timed out after 300000ms",
+      }),
+    ).toBe("timeout");
   });
 
   test("retries route startup browser smoke failures once", () => {
