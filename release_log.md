@@ -2,26 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.2.13`
-- start_commit: `4a5071ce0dabc22b341701040f6666ec6db2b53c`
-- end_commit: `22a2a0e92e83166aaaa54ed018affb1c200c45e8`
+- version: `v1.2.14`
+- start_commit: `e6f86eb7e978e94d507cc2b2ab23644288503b0f`
+- end_commit: `e0bd880c2cc8e75976ce552f8c8c97a0de22dead`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Detect PushPals-managed dependency snapshots before Bun validation and replace their per-package junctions with a fully local, offline, frozen install.
-- Keep fast linked snapshots available during worker editing while ensuring Node ESM, Bun, Wrangler, ESLint, and other tool-specific resolvers validate entirely inside the isolated worktree.
-- Add an executable Windows worktree regression that reproduces canonical-parent ESM resolution failure, verifies managed-snapshot removal, and proves both Node and Bun succeed from the localized dependency tree.
+- Create direct Windows WorkerPal worktrees beneath a bounded `%TEMP%\ppw\<repo-key>` pool, preventing deep checkout paths from breaking SQLite-backed Durable Objects in Workerd.
+- Make the short worktree pool repository-specific and case-insensitive, and teach CLI crash/startup cleanup to remove only the matching repository's disposable worktrees.
+- Redirect Windows application-data and cross-platform config paths into each writable sandbox environment while retaining stable per-repository Playwright browser caches.
+- Keep the source and packaged runtime implementations synchronized and add regression coverage for bounded paths, repository isolation, cleanup, and writable sandbox configuration.
 
 ## Validation
 
-- Release-playbook root suite on Bun 1.3.14: 1,019 passed, 2 intentional skips, 0 failed, 3,950 assertions across 118 files.
-- Focused dependency-layout and validation-command suite on Bun 1.3.14: 53 passed, 0 failed, 188 assertions.
-- Focused dependency-layout and validation-command suite on Bun 1.3.9: 53 passed, 0 failed, 188 assertions.
+- Release-playbook root suite on Bun 1.3.14: 1,027 passed, 2 intentional skips, 0 failed, 3,972 assertions across 119 files.
+- Focused worktree, sandbox-environment, cleanup, runtime-bootstrap, and validation-command suite on Bun 1.3.14: 227 passed, 1 intentional skip, 0 failed, 782 assertions.
 - WorkerPals TypeScript check passed.
-- A published v1.2.12 SectorCommand job reproduced the same junction-target failure first in Wrangler (`@cloudflare/unenv-preset`) and then in ESLint (`@humanfs/node`); the run was stopped instead of accepting repository manifest/runner workarounds.
+- A published v1.2.13 SectorCommand job reproduced 34 of 39 matchmaker tests failing while Workerd constructed SQLite-backed Durable Objects from the deeply nested repository-local worktree.
+- The same SectorCommand commit and matchmaker suite passed 39 of 39 tests from the proposed bounded `%TEMP%\ppw` worktree path.
 - `bun run cli:bundle`
-- `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
+- `bun run cli:verify-package-payload`: 221 package files, no external toolchain files.
 - `git diff --check` passed.
 
 ## Install
