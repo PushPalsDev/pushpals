@@ -2,25 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.2.15`
-- start_commit: `4f3118d5a6b11a9d036b16f6f8a8f54910aca80c`
-- end_commit: `fb196c9be4d5a0eb74a327981c3ed011c194de39`
+- version: `v1.2.16`
+- start_commit: `c1458d1166e886a48410935a3156145bfc1ecfd2`
+- end_commit: `75e97f07fe42436ba400fcb901daf5d9e7a0bbff`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Move direct Windows WorkerPal worktrees from `%TEMP%\ppw` to the shorter `%USERPROFILE%\.ppw\<repo-key>` pool, eliminating the remaining host-path depth that could make Workerd fail while constructing SQLite-backed Durable Objects.
-- Preserve repository-specific, case-insensitive cleanup for the new pool while recognizing v1.2.14 `%TEMP%\ppw` worktrees so upgrades do not strand disposable checkouts.
-- Redirect PowerShell's module-analysis cache into each writable WorkerPal sandbox, preventing host-profile cache artifacts from leaking into direct Windows jobs.
-- Keep source and packaged runtime implementations synchronized and expand regression coverage for current and legacy worktree cleanup, bounded profile-root paths, repository isolation, and PowerShell cache configuration.
+- Move direct Windows WorkerPal writable environments from the long `%TEMP%\pushpals-worker-env` tree to `%USERPROFILE%\.ppe\<repo-key>`, keeping Workerd, Expo, package-manager, application-data, and PowerShell cache paths within a bounded profile-root path.
+- Use compact, case-insensitive per-job keys for isolated writable state and a stable per-repository `pw` browser cache so jobs remain isolated without repeatedly downloading Playwright browsers.
+- Prefer the actual Windows `USERPROFILE` over a potentially longer `HOME` override when selecting the bounded environment root.
+- Keep source and packaged runtime implementations synchronized and add explicit regression coverage for Windows path budgets, writable directory creation, per-job isolation, and stable browser caches.
 
 ## Validation
 
-- Release-playbook root suite on Bun 1.3.14: 1,028 passed, 2 intentional skips, 0 failed, 3,977 assertions across 119 files.
-- Focused worktree, sandbox-environment, cleanup, runtime-bootstrap, and validation-command suite on Bun 1.3.14: 228 passed, 1 intentional skip, 0 failed, 787 assertions.
+- Release-playbook root suite on Bun 1.3.14: 1,029 passed, 2 intentional skips, 0 failed, 4,006 assertions across 119 files.
+- Focused worktree, sandbox-environment, cleanup, runtime-bootstrap, and validation-command suite on Bun 1.3.14: 229 passed, 1 intentional skip, 0 failed, 816 assertions.
 - WorkerPals TypeScript check passed.
-- A published v1.2.14 SectorCommand job reproduced Workerd's internal error from the `%TEMP%\ppw` worktree even though the full dependency layout was local and Worker deployment validation passed.
-- The same SectorCommand commit passed 126 of 126 Worker tests from the proposed `%USERPROFILE%\.ppw` worktree path.
+- A published v1.2.15 SectorCommand job passed its focused route-shell test, Worker deploy dry-run, typecheck, and lint before Workerd failed during the aggregate Worker validation stage.
+- The exact fully-localized job worktree passed 126 of 126 Worker tests with the normal host environment, reproduced 34 of 39 matchmaker failures with the v1.2.15 `%TEMP%\pushpals-worker-env` redirects, and passed 126 of 126 through the proposed source-generated `%USERPROFILE%\.ppe` environment.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 221 package files, no external toolchain files.
 - `git diff --check` passed.
