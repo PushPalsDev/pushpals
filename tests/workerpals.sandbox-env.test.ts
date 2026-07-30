@@ -817,7 +817,7 @@ describe("workerpals sandbox writable env", () => {
     writeFileSync(
       join(worktree, "compare-module-identity.cjs"),
       [
-        'const logical = require("./node_modules/vitest");',
+        'const logical = require("./node_modules/vitest/index.js");',
         `const canonical = require(${JSON.stringify(join(hostPackage, "index.js"))});`,
         'process.stdout.write(logical === canonical ? "same" : "different");',
         "if (logical !== canonical) process.exitCode = 1;",
@@ -847,7 +847,10 @@ describe("workerpals sandbox writable env", () => {
       expect(nodeResult.status).toBe(0);
       expect(nodeResult.stdout).toBe("same");
       expect(nodeResult.stderr).toBe("");
-      expect(bunResult.status).toBe(0);
+      expect(
+        bunResult.status,
+        `stdout=${JSON.stringify(bunResult.stdout)} stderr=${JSON.stringify(bunResult.stderr)}`,
+      ).toBe(0);
       expect(bunResult.stdout).toBe("same");
       expect(bunResult.stderr).toBe("");
     } finally {
