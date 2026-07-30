@@ -2,25 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.2.14`
-- start_commit: `e6f86eb7e978e94d507cc2b2ab23644288503b0f`
-- end_commit: `e0bd880c2cc8e75976ce552f8c8c97a0de22dead`
+- version: `v1.2.15`
+- start_commit: `4f3118d5a6b11a9d036b16f6f8a8f54910aca80c`
+- end_commit: `fb196c9be4d5a0eb74a327981c3ed011c194de39`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Create direct Windows WorkerPal worktrees beneath a bounded `%TEMP%\ppw\<repo-key>` pool, preventing deep checkout paths from breaking SQLite-backed Durable Objects in Workerd.
-- Make the short worktree pool repository-specific and case-insensitive, and teach CLI crash/startup cleanup to remove only the matching repository's disposable worktrees.
-- Redirect Windows application-data and cross-platform config paths into each writable sandbox environment while retaining stable per-repository Playwright browser caches.
-- Keep the source and packaged runtime implementations synchronized and add regression coverage for bounded paths, repository isolation, cleanup, and writable sandbox configuration.
+- Move direct Windows WorkerPal worktrees from `%TEMP%\ppw` to the shorter `%USERPROFILE%\.ppw\<repo-key>` pool, eliminating the remaining host-path depth that could make Workerd fail while constructing SQLite-backed Durable Objects.
+- Preserve repository-specific, case-insensitive cleanup for the new pool while recognizing v1.2.14 `%TEMP%\ppw` worktrees so upgrades do not strand disposable checkouts.
+- Redirect PowerShell's module-analysis cache into each writable WorkerPal sandbox, preventing host-profile cache artifacts from leaking into direct Windows jobs.
+- Keep source and packaged runtime implementations synchronized and expand regression coverage for current and legacy worktree cleanup, bounded profile-root paths, repository isolation, and PowerShell cache configuration.
 
 ## Validation
 
-- Release-playbook root suite on Bun 1.3.14: 1,027 passed, 2 intentional skips, 0 failed, 3,972 assertions across 119 files.
-- Focused worktree, sandbox-environment, cleanup, runtime-bootstrap, and validation-command suite on Bun 1.3.14: 227 passed, 1 intentional skip, 0 failed, 782 assertions.
+- Release-playbook root suite on Bun 1.3.14: 1,028 passed, 2 intentional skips, 0 failed, 3,977 assertions across 119 files.
+- Focused worktree, sandbox-environment, cleanup, runtime-bootstrap, and validation-command suite on Bun 1.3.14: 228 passed, 1 intentional skip, 0 failed, 787 assertions.
 - WorkerPals TypeScript check passed.
-- A published v1.2.13 SectorCommand job reproduced 34 of 39 matchmaker tests failing while Workerd constructed SQLite-backed Durable Objects from the deeply nested repository-local worktree.
-- The same SectorCommand commit and matchmaker suite passed 39 of 39 tests from the proposed bounded `%TEMP%\ppw` worktree path.
+- A published v1.2.14 SectorCommand job reproduced Workerd's internal error from the `%TEMP%\ppw` worktree even though the full dependency layout was local and Worker deployment validation passed.
+- The same SectorCommand commit passed 126 of 126 Worker tests from the proposed `%USERPROFILE%\.ppw` worktree path.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 221 package files, no external toolchain files.
 - `git diff --check` passed.
