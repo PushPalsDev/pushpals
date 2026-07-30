@@ -36,6 +36,7 @@ import {
   resolveBunDependencyLayoutPreflightTimeoutMs,
   resolveValidationCommandTimeoutMs,
   runValidationArgv,
+  sanitizeMissingExplicitTestTargets,
   sanitizePlannerWorkerInstructionPathHints,
   sanitizeTaskExecutePlanningPathHints,
   shouldEnsurePlaywrightBrowserRuntime,
@@ -361,6 +362,68 @@ describe("workerpals validation command safety", () => {
     expect(commands.plannerRunnableSteps).toEqual(["bun test ./tests/reactNativeMock.test.js"]);
     expect(commands.fallbackValidationSteps).toEqual([]);
     expect(commands.commandsToRun).toEqual(["bun test ./tests/reactNativeMock.test.js"]);
+  });
+
+  test("drops deleted explicit test targets before each validation gate run", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-deleted-targets-"));
+    try {
+      mkdirSync(join(root, "components", "__tests__"), { recursive: true });
+      writeFileSync(
+        join(root, "components", "__tests__", "Projectile.test.tsx"),
+        "test('projectile', () => {});\n",
+      );
+      const planning = planningFixture({
+        validationSteps: [
+          "bun test ./components/__tests__/Projectile.test.tsx",
+          "bun test ./scripts/__tests__/web-startup-readiness.test.js",
+          "bun test ./utils/__tests__/homeActions.test.ts",
+        ],
+        requiredValidationSteps: ["bun run validate"],
+      }) as any;
+
+      const commands = collectQualityGateValidationCommands({
+        instruction: "Narrow the PR and keep the projectile behavior covered.",
+        targetPath: "components/__tests__/Projectile.test.tsx",
+        planning,
+        changedTestPaths: ["components/__tests__/Projectile.test.tsx"],
+        isTestTask: false,
+        repo: root,
+        changedPaths: ["components/__tests__/Projectile.test.tsx"],
+      });
+
+      expect(commands.plannerRunnableSteps).toEqual([
+        "bun test ./components/__tests__/Projectile.test.tsx",
+      ]);
+      expect(commands.commandsToRun).toContain(
+        "bun test ./components/__tests__/Projectile.test.tsx",
+      );
+      expect(commands.commandsToRun).toContain("bun run validate");
+      expect(commands.commandsToRun.join("\n")).not.toContain("web-startup-readiness");
+      expect(commands.commandsToRun.join("\n")).not.toContain("homeActions");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps existing targets when pruning a mixed Bun test command", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-mixed-targets-"));
+    try {
+      mkdirSync(join(root, "tests"), { recursive: true });
+      writeFileSync(join(root, "tests", "kept.test.ts"), "test('kept', () => {});\n");
+
+      expect(
+        sanitizeMissingExplicitTestTargets(
+          root,
+          "bun test ./tests/deleted.test.ts ./tests/kept.test.ts --timeout 5000",
+        ),
+      ).toBe("bun test ./tests/kept.test.ts --timeout 5000");
+      expect(
+        sanitizeMissingExplicitTestTargets(root, "bun test ./tests/deleted.test.ts"),
+      ).toBeNull();
+      expect(sanitizeMissingExplicitTestTargets(root, "bun test")).toBe("bun test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("adds repo-native typecheck and lint commands for TypeScript changes", () => {

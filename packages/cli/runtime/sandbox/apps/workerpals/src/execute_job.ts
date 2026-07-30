@@ -4748,6 +4748,55 @@ function normalizeBunTestValidationCommand(command: string): string | null | und
   return [...prefix, ...keptArgs].map((entry) => quoteValidationCommandArg(entry)).join(" ");
 }
 
+export function sanitizeMissingExplicitTestTargets(
+  repo: string,
+  command: string,
+): string | null {
+  const argv = tokenizeValidationCommandArgv(command);
+  if (!argv || argv.length === 0 || !isBunCommandToken(argv[0] ?? "")) return command;
+
+  const lower = argv.map((entry) => entry.toLowerCase());
+  const testIndex = lower.findIndex((entry) => entry === "test");
+  if (testIndex < 0) return command;
+
+  let droppedMissingTarget = false;
+  let keptConcreteTarget = false;
+  const keptArgs: string[] = [];
+  for (const arg of argv.slice(testIndex + 1)) {
+    const normalizedPath = normalizeValidationPathToken(arg);
+    const isConcreteTestTarget =
+      Boolean(normalizedPath) &&
+      (isAssertionCoverageTestPath(normalizedPath ?? "") ||
+        isBrowserSmokeHarnessPath(normalizedPath ?? ""));
+    if (
+      isConcreteTestTarget &&
+      normalizedPath &&
+      !existsSync(resolve(repo, normalizedPath))
+    ) {
+      droppedMissingTarget = true;
+      continue;
+    }
+    if (isConcreteTestTarget) keptConcreteTarget = true;
+    keptArgs.push(arg);
+  }
+
+  if (!droppedMissingTarget) return command;
+  if (!keptConcreteTarget) return null;
+  return [...argv.slice(0, testIndex + 1), ...keptArgs]
+    .map((entry) => quoteValidationCommandArg(entry))
+    .join(" ");
+}
+
+function sanitizeValidationCommandsForCurrentCheckout(
+  repo: string | undefined,
+  commands: string[],
+): string[] {
+  if (!repo) return commands;
+  return commands
+    .map((command) => sanitizeMissingExplicitTestTargets(repo, command))
+    .filter((command): command is string => Boolean(command));
+}
+
 function dedupeValidationCommands(...groups: string[][]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -4861,13 +4910,16 @@ export function collectQualityGateValidationCommands(params: {
   fallbackValidationSteps: string[];
   inferredRepoNativeValidationSteps: string[];
 } {
-  const requiredRunnableSteps = runnableValidationCommandsFromSteps(
-    params.planning.requiredValidationSteps,
-  ).slice(0, 12);
-  const plannerRunnableSteps = runnableValidationCommandsFromSteps(
-    params.planning.validationSteps,
-  ).slice(0, 4);
-  const fallbackValidationSteps =
+  const requiredRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(
+    params.repo,
+    runnableValidationCommandsFromSteps(params.planning.requiredValidationSteps).slice(0, 12),
+  );
+  const plannerRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(
+    params.repo,
+    runnableValidationCommandsFromSteps(params.planning.validationSteps).slice(0, 4),
+  );
+  const fallbackValidationSteps = sanitizeValidationCommandsForCurrentCheckout(
+    params.repo,
     params.isTestTask && plannerRunnableSteps.length === 0
       ? inferFallbackValidationCommandsForTestTask(
           params.instruction,
@@ -4875,7 +4927,8 @@ export function collectQualityGateValidationCommands(params: {
           params.planning,
           params.changedTestPaths,
         )
-      : [];
+      : [],
+  );
   const inferredRepoNativeValidationSteps = params.repo
     ? inferRepoNativeValidationCommands(params.repo, params.changedPaths ?? [])
     : [];
