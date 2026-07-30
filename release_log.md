@@ -2,10 +2,10 @@
 
 ## Release Metadata
 
-- version: `v1.2.18`
-- start_commit: `ca08821de54e4cdbe7a33c91c19c44a82c1f8164`
-- end_commit: `9aa472bf5efa126821eb6c5c5b6e6b0ebb340b0e`
-- commits_in_range: `1`
+- version: `v1.2.19`
+- start_commit: `7c5f958b68a6b826dbebb734417284f18dc73ebd`
+- end_commit: `ab4266a211ab39eab5e1763b6344cce9382a5319`
+- commits_in_range: `4`
 
 ## Highlights
 
@@ -13,14 +13,15 @@
 - Exercise every redirected writable directory in a real Bun child process and prove that three concurrent-style WorkerPal jobs keep isolated home/temp state while sharing only the stable per-repository browser cache.
 - Stress 24 worst-case long-path jobs and assert strict path budgets for `.ppw` worktrees, `.ppe` sandbox roots, Workerd/Expo caches, and Playwright hot caches.
 - Enforce byte-identical source and packaged WorkerPal path behavior, and gate pull requests, pushes, every release, and the long Windows runtime soak on the complete Windows path contract.
-- Run module-resolution child probes from the synthetic WorkerPal worktree, matching production execution and keeping the tests deterministic when a GitHub runner checkout and `%TEMP%` use different Windows volumes.
+- Keep module-resolution coverage aligned with production: child probes run from the WorkerPal worktree, Node singleton behavior remains strict across junctions, Bun dependency resolution remains asserted without relying on runner-dependent object identity, and the four-process Windows probe has an explicit slow-runner budget.
 
 ## Validation
 
-- Release-playbook root suite on Bun 1.3.14: 1,042 passed, 2 intentional skips, 0 failed, 5,693 assertions across 121 files.
-- Focused direct-worktree, sandbox-environment, packaged-runtime parity, and real-Windows integration suite on Bun 1.3.14: 39 passed, 0 failed, 1,822 assertions across 4 files.
-- Focused sandbox-environment suite on the local Bun 1.3.9 runtime: 27 passed, 0 failed, 142 assertions.
-- The v1.2.17 release gate ran all 39 Windows path-contract tests, exposed the cross-volume child working-directory mismatch, and prevented npm and GitHub publication; npm has no published `1.2.17` version.
+- Release-playbook root suite on Bun 1.3.14: 1,042 passed, 2 intentional skips, 0 failed, 5,690 assertions across 121 files.
+- Focused direct-worktree, sandbox-environment, packaged-runtime parity, and real-Windows integration suite on Bun 1.3.14: 39 passed, 0 failed, 1,819 assertions across 4 files.
+- Focused sandbox-environment suite on the local Bun 1.3.9 runtime: 27 passed, 0 failed, 139 assertions.
+- GitHub-hosted `windows-2022` path-contract job passed all 39 tests on Bun 1.3.14.
+- The v1.2.17 and v1.2.18 release gates exposed the runner-specific test assumptions and correctly skipped npm and GitHub publication.
 - WorkerPals TypeScript check passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 221 package files, no external toolchain files.
