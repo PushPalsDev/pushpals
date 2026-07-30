@@ -2,9 +2,9 @@
 
 ## Release Metadata
 
-- version: `v1.2.17`
-- start_commit: `bf5049d5a08dca2cdf6f4bea4a7a17186eb5a371`
-- end_commit: `e9574492ab73d0c50d1977019bc277dd7036cfe5`
+- version: `v1.2.18`
+- start_commit: `ca08821de54e4cdbe7a33c91c19c44a82c1f8164`
+- end_commit: `9aa472bf5efa126821eb6c5c5b6e6b0ebb340b0e`
 - commits_in_range: `1`
 
 ## Highlights
@@ -13,13 +13,14 @@
 - Exercise every redirected writable directory in a real Bun child process and prove that three concurrent-style WorkerPal jobs keep isolated home/temp state while sharing only the stable per-repository browser cache.
 - Stress 24 worst-case long-path jobs and assert strict path budgets for `.ppw` worktrees, `.ppe` sandbox roots, Workerd/Expo caches, and Playwright hot caches.
 - Enforce byte-identical source and packaged WorkerPal path behavior, and gate pull requests, pushes, every release, and the long Windows runtime soak on the complete Windows path contract.
+- Run module-resolution child probes from the synthetic WorkerPal worktree, matching production execution and keeping the tests deterministic when a GitHub runner checkout and `%TEMP%` use different Windows volumes.
 
 ## Validation
 
 - Release-playbook root suite on Bun 1.3.14: 1,042 passed, 2 intentional skips, 0 failed, 5,693 assertions across 121 files.
-- WorkerPals suite on Bun 1.3.14: 320 passed, 1 intentional Docker-only skip, 0 failed, 2,711 assertions across 27 files.
 - Focused direct-worktree, sandbox-environment, packaged-runtime parity, and real-Windows integration suite on Bun 1.3.14: 39 passed, 0 failed, 1,822 assertions across 4 files.
-- The local Bun 1.3.9 release-playbook run hit one intermittent Windows Git-subprocess failure; its isolated 11-test suite immediately passed, and both the full 1.3.9 rerun and authoritative Bun 1.3.14 run passed.
+- Focused sandbox-environment suite on the local Bun 1.3.9 runtime: 27 passed, 0 failed, 142 assertions.
+- The v1.2.17 release gate ran all 39 Windows path-contract tests, exposed the cross-volume child working-directory mismatch, and prevented npm and GitHub publication; npm has no published `1.2.17` version.
 - WorkerPals TypeScript check passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 221 package files, no external toolchain files.
