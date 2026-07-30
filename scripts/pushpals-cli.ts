@@ -3141,9 +3141,10 @@ function isWorkerpalEphemeralWorktreePath(
   repoRoot: string,
   worktreePath: string,
   platform: NodeJS.Platform = process.platform,
+  homeRoot?: string,
   tempRoot?: string,
 ): boolean {
-  return isDirectWorkerWorktreePath(repoRoot, worktreePath, platform, tempRoot);
+  return isDirectWorkerWorktreePath(repoRoot, worktreePath, platform, homeRoot, tempRoot);
 }
 
 function resolveConfiguredDockerExecutable(
@@ -3340,6 +3341,7 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
   forceDeleteWorktreePathFn?: typeof forceDeleteWorktreePath;
   commandTimeoutMs?: number;
   platform?: NodeJS.Platform;
+  homeRoot?: string;
   tempRoot?: string;
 }): Promise<{ ok: boolean; detail: string; removed: number }> {
   const runCommandWithEnvFn = opts.runCommandWithEnvFn ?? runCommandWithEnv;
@@ -3374,6 +3376,7 @@ export async function cleanupLingeringPushPalsGitWorktrees(opts: {
       opts.repoRoot,
       entry.path,
       opts.platform ?? process.platform,
+      opts.homeRoot,
       opts.tempRoot,
     );
   });

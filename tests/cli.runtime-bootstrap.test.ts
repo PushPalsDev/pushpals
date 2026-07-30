@@ -10,8 +10,11 @@ import {
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
-import { dirname, join, resolve } from "path";
-import { resolveDirectWorktreePath } from "../apps/workerpals/src/common/direct_worktree";
+import { dirname, join, resolve, win32 } from "path";
+import {
+  resolveDirectWorktreePath,
+  resolveLegacyDirectWorktreeRoot,
+} from "../apps/workerpals/src/common/direct_worktree";
 import {
   buildCliClearTargets,
   buildEmbeddedRuntimeCrashEnvelope,
@@ -2785,15 +2788,21 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ]);
   });
 
-  test("cleanupLingeringPushPalsGitWorktrees removes short Windows workerpal worktrees", async () => {
+  test("cleanupLingeringPushPalsGitWorktrees removes current and legacy short Windows worktrees", async () => {
     const calls: Array<{ command: string[]; cwd: string }> = [];
     const repoRoot = "C:\\repo\\example";
+    const homeRoot = "C:\\Users\\example";
     const tempRoot = "C:\\Users\\example\\AppData\\Local\\Temp";
-    const worktreePath = resolveDirectWorktreePath(repoRoot, "job-123", "nonce", "win32", tempRoot);
+    const worktreePath = resolveDirectWorktreePath(repoRoot, "job-123", "nonce", "win32", homeRoot);
+    const legacyWorktreePath = win32.resolve(
+      resolveLegacyDirectWorktreeRoot(repoRoot, "win32", tempRoot),
+      "job-legacy-oldrun",
+    );
     const result = await cleanupLingeringPushPalsGitWorktrees({
       repoRoot,
       env: {},
       platform: "win32",
+      homeRoot,
       tempRoot,
       runCommandWithEnvFn: async (command, cwd) => {
         calls.push({ command, cwd });
@@ -2807,6 +2816,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
               "",
               `worktree ${worktreePath.replace(/\\/g, "/")}`,
               "HEAD feedface12345678",
+              "detached",
+              "",
+              `worktree ${legacyWorktreePath.replace(/\\/g, "/")}`,
+              "HEAD deadbeef12345678",
               "detached",
             ].join("\n"),
             stderr: "",
@@ -2825,8 +2838,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(result).toEqual({
       ok: true,
-      detail: "removed 1 lingering PushPals git artifact(s)",
-      removed: 1,
+      detail: "removed 2 lingering PushPals git artifact(s)",
+      removed: 2,
     });
     expect(
       calls.some(
@@ -2834,6 +2847,14 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
           command[2] === "remove" &&
           command.at(-1)?.replace(/\\/g, "/").toLowerCase() ===
             worktreePath.replace(/\\/g, "/").toLowerCase(),
+      ),
+    ).toBe(true);
+    expect(
+      calls.some(
+        ({ command }) =>
+          command[2] === "remove" &&
+          command.at(-1)?.replace(/\\/g, "/").toLowerCase() ===
+            legacyWorktreePath.replace(/\\/g, "/").toLowerCase(),
       ),
     ).toBe(true);
   });

@@ -1,8 +1,9 @@
 import { createHash } from "crypto";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { posix, win32, type PlatformPath } from "path";
 
-export const WINDOWS_DIRECT_WORKTREE_ROOT_NAME = "ppw";
+export const WINDOWS_DIRECT_WORKTREE_ROOT_NAME = ".ppw";
+export const LEGACY_WINDOWS_DIRECT_WORKTREE_ROOT_NAME = "ppw";
 
 function pathApi(platform: NodeJS.Platform): PlatformPath {
   return platform === "win32" ? win32 : posix;
@@ -23,11 +24,23 @@ function repoKey(repo: string, platform: NodeJS.Platform): string {
 export function resolveDirectWorktreeRoot(
   repo: string,
   platform: NodeJS.Platform = process.platform,
-  tempRoot: string = tmpdir(),
+  homeRoot: string = homedir(),
 ): string {
   const path = pathApi(platform);
   if (platform !== "win32") return path.resolve(repo, ".worktrees");
-  return path.resolve(tempRoot, WINDOWS_DIRECT_WORKTREE_ROOT_NAME, repoKey(repo, platform));
+  return path.resolve(homeRoot, WINDOWS_DIRECT_WORKTREE_ROOT_NAME, repoKey(repo, platform));
+}
+
+export function resolveLegacyDirectWorktreeRoot(
+  repo: string,
+  platform: NodeJS.Platform = process.platform,
+  tempRoot: string = tmpdir(),
+): string {
+  return pathApi(platform).resolve(
+    tempRoot,
+    LEGACY_WINDOWS_DIRECT_WORKTREE_ROOT_NAME,
+    repoKey(repo, platform),
+  );
 }
 
 export function resolveDirectWorktreePath(
@@ -35,7 +48,7 @@ export function resolveDirectWorktreePath(
   jobId: string,
   nonce: string,
   platform: NodeJS.Platform = process.platform,
-  tempRoot: string = tmpdir(),
+  homeRoot: string = homedir(),
 ): string {
   const safeJobId =
     jobId
@@ -48,7 +61,7 @@ export function resolveDirectWorktreePath(
       .replace(/[^a-z0-9-]+/g, "")
       .slice(0, 16) || "run";
   return pathApi(platform).resolve(
-    resolveDirectWorktreeRoot(repo, platform, tempRoot),
+    resolveDirectWorktreeRoot(repo, platform, homeRoot),
     `job-${safeJobId}-${safeNonce}`,
   );
 }
@@ -62,7 +75,11 @@ export function directWorktreePoolRoot(
   const poolRoot = path.dirname(worktreePath);
   if (!/^job-[a-z0-9][a-z0-9-]*$/i.test(leaf)) return undefined;
   if (!/^[a-f0-9]{12}$/i.test(path.basename(poolRoot))) return undefined;
-  if (path.basename(path.dirname(poolRoot)).toLowerCase() !== WINDOWS_DIRECT_WORKTREE_ROOT_NAME) {
+  const rootName = path.basename(path.dirname(poolRoot)).toLowerCase();
+  if (
+    rootName !== WINDOWS_DIRECT_WORKTREE_ROOT_NAME &&
+    rootName !== LEGACY_WINDOWS_DIRECT_WORKTREE_ROOT_NAME
+  ) {
     return undefined;
   }
   return normalizeForComparison(poolRoot, platform);
@@ -72,7 +89,8 @@ export function isDirectWorkerWorktreePath(
   repo: string,
   worktreePath: string,
   platform: NodeJS.Platform = process.platform,
-  tempRoot: string = tmpdir(),
+  homeRoot: string = homedir(),
+  legacyTempRoot: string = tmpdir(),
 ): boolean {
   const path = pathApi(platform);
   const leaf = path.basename(worktreePath);
@@ -83,9 +101,9 @@ export function isDirectWorkerWorktreePath(
   if (normalizedParent === repoLocalRoot) return true;
 
   if (platform !== "win32") return false;
-  const windowsRoot = normalizeForComparison(
-    resolveDirectWorktreeRoot(repo, platform, tempRoot),
-    platform,
-  );
-  return normalizedParent === windowsRoot;
+  const windowsRoots = [
+    resolveDirectWorktreeRoot(repo, platform, homeRoot),
+    resolveLegacyDirectWorktreeRoot(repo, platform, legacyTempRoot),
+  ].map((root) => normalizeForComparison(root, platform));
+  return windowsRoots.includes(normalizedParent);
 }

@@ -83,9 +83,13 @@ describe("workerpals sandbox writable env", () => {
       expect(env.APPDATA).toBe(join(sandboxRoot, "roaming"));
       expect(env.LOCALAPPDATA).toBe(join(sandboxRoot, "local"));
       expect(env.XDG_CONFIG_HOME).toBe(join(sandboxRoot, "config"));
+      expect(env.PSModuleAnalysisCachePath).toBe(
+        join(sandboxRoot, "local", "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache"),
+      );
       expect(existsSync(env.APPDATA)).toBe(true);
       expect(existsSync(env.LOCALAPPDATA)).toBe(true);
       expect(existsSync(env.XDG_CONFIG_HOME)).toBe(true);
+      expect(existsSync(dirname(env.PSModuleAnalysisCachePath))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
       if (sandboxRoot) rmSync(sandboxRoot, { recursive: true, force: true });

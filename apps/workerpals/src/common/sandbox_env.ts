@@ -227,6 +227,13 @@ export function buildWorkerSandboxWritableEnv(
   const configDir = resolve(baseDir, "config");
   const roamingDir = resolve(baseDir, "roaming");
   const localAppDataDir = resolve(baseDir, "local");
+  const powershellAnalysisCachePath = resolve(
+    localAppDataDir,
+    "Microsoft",
+    "Windows",
+    "PowerShell",
+    "ModuleAnalysisCache",
+  );
   const playwrightBrowsersDir =
     env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0"
       ? env.PLAYWRIGHT_BROWSERS_PATH
@@ -245,6 +252,7 @@ export function buildWorkerSandboxWritableEnv(
     tempDir,
     configDir,
     ...(platform === "win32" ? [roamingDir, localAppDataDir] : []),
+    ...(platform === "win32" ? [dirname(powershellAnalysisCachePath)] : []),
     resolve(cacheDir, "npm"),
     playwrightBrowsersDir,
   ]);
@@ -261,6 +269,7 @@ export function buildWorkerSandboxWritableEnv(
       ? {
           APPDATA: roamingDir,
           LOCALAPPDATA: localAppDataDir,
+          PSModuleAnalysisCachePath: powershellAnalysisCachePath,
         }
       : {}),
     npm_config_cache: resolve(cacheDir, "npm"),
