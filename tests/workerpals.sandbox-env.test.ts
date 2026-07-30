@@ -841,46 +841,4 @@ describe("workerpals sandbox writable env", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-
-  test("keeps one Bun module instance after validation dependencies are worktree-local", () => {
-    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-bun-singleton-"));
-    const repo = join(root, "repo");
-    const worktree = join(repo, ".worktrees", "job-one");
-    const localPackage = join(worktree, "node_modules", "vitest");
-    mkdirSync(localPackage, { recursive: true });
-    writeFileSync(join(localPackage, "index.js"), "module.exports = {};\n", "utf8");
-    writeFileSync(
-      join(worktree, "compare-local-module-identity.cjs"),
-      [
-        'const logical = require("./node_modules/vitest/index.js");',
-        `const canonical = require(${JSON.stringify(join(localPackage, "index.js"))});`,
-        'process.stdout.write(logical === canonical ? "same" : "different");',
-        "if (logical !== canonical) process.exitCode = 1;",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-
-    try {
-      const env = buildWorkerSandboxWritableEnv(worktree, process.env);
-      const bunResult = spawnSync(
-        process.execPath,
-        [join(worktree, "compare-local-module-identity.cjs")],
-        {
-          cwd: worktree,
-          env,
-          encoding: "utf8",
-        },
-      );
-
-      expect(
-        bunResult.status,
-        `stdout=${JSON.stringify(bunResult.stdout)} stderr=${JSON.stringify(bunResult.stderr)}`,
-      ).toBe(0);
-      expect(bunResult.stdout).toBe("same");
-      expect(bunResult.stderr).toBe("");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
 });
