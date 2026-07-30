@@ -44,6 +44,8 @@ describe("workerpals sandbox writable env", () => {
       expect(env.NODE_OPTIONS).toContain("--dns-result-order=ipv4first");
       expect(env.NODE_OPTIONS).toContain("--preserve-symlinks");
       expect(env.NODE_OPTIONS).toContain("--preserve-symlinks-main");
+      expect(env.BUN_OPTIONS).toContain("--preserve-symlinks");
+      expect(env.BUN_OPTIONS).toContain("--preserve-symlinks-main");
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("127.0.0.1");
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeGreaterThanOrEqual(19006);
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeLessThan(20006);
@@ -269,6 +271,25 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
+  test("preserves existing Bun options without duplicating required symlink options", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        HOME: join(root, "home"),
+        BUN_OPTIONS: "--smol --preserve-symlinks-main --preserve-symlinks",
+      });
+
+      expect(env.BUN_OPTIONS).toBe(
+        "--smol --preserve-symlinks-main --preserve-symlinks",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("preserves an explicit Playwright browser cache path", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");
@@ -403,12 +424,23 @@ describe("workerpals sandbox writable env", () => {
         },
       );
 
+      const bunResult = spawnSync(
+        process.execPath,
+        [join(worktree, "run-junctioned-package.cjs")],
+        {
+          env,
+          encoding: "utf8",
+        },
+      );
       expect(result.status).toBe(0);
       expect(result.stdout).toBe("job-local");
       expect(result.stderr).toBe("");
       expect(cliResult.status).toBe(0);
       expect(cliResult.stdout).toBe("job-local");
       expect(cliResult.stderr).toBe("");
+      expect(bunResult.status).toBe(0);
+      expect(bunResult.stdout).toBe("job-local");
+      expect(bunResult.stderr).toBe("");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

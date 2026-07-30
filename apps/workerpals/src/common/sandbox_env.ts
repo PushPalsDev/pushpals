@@ -186,6 +186,17 @@ function withWorkerNodeOptions(value: string | undefined): string {
   return options.join(" ");
 }
 
+function withWorkerBunOptions(value: string | undefined): string {
+  const options = (value ?? "").trim().split(/\s+/).filter(Boolean);
+  if (!options.includes("--preserve-symlinks")) {
+    options.push("--preserve-symlinks");
+  }
+  if (!options.includes("--preserve-symlinks-main")) {
+    options.push("--preserve-symlinks-main");
+  }
+  return options.join(" ");
+}
+
 function resolveOriginalHome(env: Record<string, string>): string {
   return env.HOME || env.USERPROFILE || homedir();
 }
@@ -266,6 +277,10 @@ export function buildWorkerSandboxWritableEnv(
     // Expo's transform cache is isolated above, so preserving its package
     // junction no longer risks reusing another worktree's route context.
     NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS),
+    // BUN_OPTIONS is inherited by nested Bun package scripts. NODE_OPTIONS
+    // alone does not affect Bun's resolver, so aggregate test scripts could
+    // still realpath junctioned packages and miss job-local dependencies.
+    BUN_OPTIONS: withWorkerBunOptions(env.BUN_OPTIONS),
     REACT_NATIVE_PACKAGER_HOSTNAME: env.REACT_NATIVE_PACKAGER_HOSTNAME ?? "127.0.0.1",
     EXPO_DEV_SERVER_PORT: env.EXPO_DEV_SERVER_PORT ?? defaultExpoPort,
     RCT_METRO_PORT: env.RCT_METRO_PORT ?? defaultExpoPort,
