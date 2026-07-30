@@ -43,6 +43,7 @@ describe("workerpals sandbox writable env", () => {
       expect(env.BROWSER).toBe("none");
       expect(env.NODE_OPTIONS).toContain("--dns-result-order=ipv4first");
       expect(env.NODE_OPTIONS).toContain("--preserve-symlinks");
+      expect(env.NODE_OPTIONS).toContain("--preserve-symlinks-main");
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("127.0.0.1");
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeGreaterThanOrEqual(19006);
       expect(Number(env.EXPO_DEV_SERVER_PORT)).toBeLessThan(20006);
@@ -189,7 +190,7 @@ describe("workerpals sandbox writable env", () => {
       expect(env.TMPDIR).toBe(env.TEMP);
       expect(existsSync(env.TEMP)).toBe(true);
       expect(env.NODE_OPTIONS).toBe(
-        "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim",
+        "--max-old-space-size=4096 --preserve-symlinks --dns-result-order=verbatim --preserve-symlinks-main",
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -240,7 +241,7 @@ describe("workerpals sandbox writable env", () => {
       });
 
       expect(env.NODE_OPTIONS).toBe(
-        "--max-old-space-size=4096 --dns-result-order=verbatim --preserve-symlinks",
+        "--max-old-space-size=4096 --dns-result-order=verbatim --preserve-symlinks --preserve-symlinks-main",
       );
       expect(env.REACT_NATIVE_PACKAGER_HOSTNAME).toBe("localhost");
     } finally {
@@ -256,10 +257,13 @@ describe("workerpals sandbox writable env", () => {
     try {
       const env = buildWorkerSandboxWritableEnv(repo, {
         HOME: join(root, "home"),
-        NODE_OPTIONS: "--preserve-symlinks --dns-result-order=ipv4first",
+        NODE_OPTIONS:
+          "--preserve-symlinks --preserve-symlinks-main --dns-result-order=ipv4first",
       });
 
-      expect(env.NODE_OPTIONS).toBe("--preserve-symlinks --dns-result-order=ipv4first");
+      expect(env.NODE_OPTIONS).toBe(
+        "--preserve-symlinks --preserve-symlinks-main --dns-result-order=ipv4first",
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -353,7 +357,7 @@ describe("workerpals sandbox writable env", () => {
     }
   });
 
-  test("resolves job-local dependencies through junctioned parent packages", () => {
+  test("resolves job-local dependencies through junctioned imports and CLI entrypoints", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-junction-resolution-"));
     const repo = join(root, "repo");
     const worktree = join(repo, ".worktrees", "job-one");
@@ -390,10 +394,21 @@ describe("workerpals sandbox writable env", () => {
         env,
         encoding: "utf8",
       });
+      const cliResult = spawnSync(
+        "node",
+        [join(logicalPackage, "bin", "resolve-job-local.cjs")],
+        {
+          env,
+          encoding: "utf8",
+        },
+      );
 
       expect(result.status).toBe(0);
       expect(result.stdout).toBe("job-local");
       expect(result.stderr).toBe("");
+      expect(cliResult.status).toBe(0);
+      expect(cliResult.stdout).toBe("job-local");
+      expect(cliResult.stderr).toBe("");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -180,6 +180,9 @@ function withWorkerNodeOptions(value: string | undefined): string {
   if (!options.includes("--preserve-symlinks")) {
     options.push("--preserve-symlinks");
   }
+  if (!options.includes("--preserve-symlinks-main")) {
+    options.push("--preserve-symlinks-main");
+  }
   return options.join(" ");
 }
 
@@ -258,6 +261,8 @@ export function buildWorkerSandboxWritableEnv(
     // Dependency snapshots are projected into worktrees with symlinks or
     // junctions. Preserve logical paths so junctioned parent packages resolve
     // platform-specific dependencies from the job-local node_modules tree.
+    // Preserve the main module separately because Node otherwise resolves
+    // junctioned CLI entrypoints back into the host checkout before loading.
     // Expo's transform cache is isolated above, so preserving its package
     // junction no longer risks reusing another worktree's route context.
     NODE_OPTIONS: withWorkerNodeOptions(env.NODE_OPTIONS),
