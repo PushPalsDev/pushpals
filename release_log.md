@@ -2,27 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.2.4`
-- start_commit: `e89b775abc272394e8fba06a20eb7ed9212a8db9`
-- end_commit: `afbbaa0d714b2f3ffe2b20a01cf7168ea5802f13`
+- version: `v1.2.5`
+- start_commit: `a9a5e437933bef6f0056ba80be93864dbcc3cbf0`
+- end_commit: `875f5d1f2fdc2087bb8e4808a46f68280726d983`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Classify an inaccessible nested Docker daemon as a trusted-environment validation blocker on the first failed gate, preserving the candidate instead of spending quality revisions on sandbox infrastructure.
-- Never reinterpret a structured job terminal, validation hold, publication hold, or opened failure circuit as a transient failure of the outer Docker transport.
-- Preserve exact `validation_circuit_breaker` and `trusted_environment_validation_required` terminal stages in job diagnostics.
-- Stop incidental test names such as `timeout_policy` or `browser budgets` from polluting timeout and browser-failure telemetry.
-- Add regressions using the exact SectorCommand Supabase failure observed in the published `v1.2.3` soak: `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`.
+- Pin Expo Router route discovery to each WorkerPal's isolated worktree instead of allowing Windows dependency junctions to resolve routes from the shared checkout.
+- Remove Node's incompatible `--preserve-symlinks` option only for detected Expo Router repositories while retaining it for other projected dependency layouts.
+- Override stale inherited `EXPO_ROUTER_APP_ROOT` values and prefer the repository's `src/app` route root before `app`.
+- Add regression coverage for isolated `app` and `src/app` layouts, stale host route roots, explicit Node options, and unrelated repositories.
 
 ## Validation
 
-- Full root suite on Bun 1.3.14: 1,008 passed, 2 intentional skips, 0 failed, 3,886 assertions across 118 files.
-- Focused Docker retry, validation-blocker, and telemetry suite: 85 passed, 0 failed, 279 assertions.
+- Full root suite on Bun 1.3.14: 1,010 passed, 2 intentional skips, 0 failed, 3,890 assertions across 118 files.
+- Focused sandbox-environment suite: 12 passed, 0 failed, 44 assertions.
 - WorkerPals TypeScript check passed.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 220 package files, no external toolchain files.
-- Published `v1.2.3` SectorCommand soak reproduced the nested Docker validation blocker and proved the old outer retry restarted the entire job; the exact result and diagnostics now have regression coverage.
+- The exact previously failing detached SectorCommand worktree completed its full Expo browser suite through the patched WorkerPals environment.
+- A controlled comparison confirmed that the same worktree renders Expo's stock tutorial with `EXPO_ROUTER_APP_ROOT` plus `--preserve-symlinks`, and loads all SectorCommand routes when the incompatible option is removed.
 - `git diff --check` passed.
 
 ## Install
