@@ -37,6 +37,7 @@ jobs:
           tests/workerpals.sandbox-env.test.ts
           tests/workerpals.runtime-sandbox-mirror.test.ts
           tests/workerpals.windows-sandbox-env.integration.test.ts
+          tests/workerpals.worktree-boundary.test.ts
 
       - name: Build protocol workspace artifacts
         run: bun run protocol:build

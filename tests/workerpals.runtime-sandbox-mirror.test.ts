@@ -10,11 +10,15 @@ const MIRRORED_WORKERPALS_FILES = [
   "common/sandbox_env.ts",
   "common/generic_python_executor.ts",
   "backends/openhands_task_execute.ts",
+  "docker_executor.ts",
   "execute_job.ts",
+  "merge_conflict_job.ts",
+  "workerpals_main.ts",
+  "worktree_base_ref.ts",
 ] as const;
 
 describe("packaged WorkerPal sandbox runtime parity", () => {
-  test("keeps every writable-environment producer and consumer byte-identical", () => {
+  test("keeps path and review-lease runtime files byte-identical", () => {
     for (const relativePath of MIRRORED_WORKERPALS_FILES) {
       const sourcePath = resolve("apps", "workerpals", "src", relativePath);
       const packagedPath = resolve(

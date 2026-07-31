@@ -256,4 +256,89 @@ describe("Windows WorkerPal sandbox environment integration", () => {
     },
     30_000,
   );
+
+  windowsTest(
+    "recreates the same complete sandbox after job cleanup without retaining stale files",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-windows-env-recreate-"));
+      const profile = join(root, "profile");
+      const repo = join(root, "SectorCommand");
+      const probePath = writeEnvironmentProbe(root);
+      createExpoRepo(repo);
+
+      try {
+        const sourceEnv = {
+          ...process.env,
+          HOME: join(root, "legacy-home"),
+          USERPROFILE: profile,
+          TEMP: join(root, "legacy-temp"),
+        };
+        const first = buildWorkerSandboxWritableEnv(repo, sourceEnv, "win32");
+        runEnvironmentProbe(probePath, "first", first);
+        const sandboxRoot = dirname(first.HOME);
+        const staleMarker = join(first.TEMP, "first-TEMP.txt");
+        expect(existsSync(staleMarker)).toBe(true);
+
+        rmSync(sandboxRoot, { recursive: true, force: true });
+        expect(existsSync(staleMarker)).toBe(false);
+
+        const second = buildWorkerSandboxWritableEnv(repo, sourceEnv, "win32");
+        const observed = runEnvironmentProbe(probePath, "second", second);
+        expectCompactWindowsEnvironment(second, profile, repo);
+        expect(
+          Object.fromEntries(WRITABLE_DIRECTORY_KEYS.map((key) => [key, second[key]])),
+        ).toEqual(Object.fromEntries(WRITABLE_DIRECTORY_KEYS.map((key) => [key, first[key]])));
+        expect(observed).toEqual(
+          Object.fromEntries(WRITABLE_DIRECTORY_KEYS.map((key) => [key, second[key]])),
+        );
+        expect(existsSync(staleMarker)).toBe(false);
+        expect(
+          readFileSync(join(second.HOME, ".gitconfig"), "utf8").match(/directory\s*=\s*\*/g),
+        ).toHaveLength(1);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  windowsTest(
+    "keeps many repositories collision-free even with long and unusual names",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-windows-env-repos-"));
+      const profile = join(root, "profile");
+      const sandboxHomes = new Set<string>();
+      const browserCaches = new Set<string>();
+
+      try {
+        for (let index = 0; index < 48; index += 1) {
+          const repo = join(
+            root,
+            `${index.toString().padStart(2, "0")}-Sector Command-${"long parent ".repeat(4)}-测试`,
+          );
+          createExpoRepo(repo);
+          const env = buildWorkerSandboxWritableEnv(
+            repo,
+            {
+              ...process.env,
+              HOME: join(root, "legacy-home"),
+              USERPROFILE: profile,
+              TEMP: join(root, "legacy-temp", String(index)),
+            },
+            "win32",
+          );
+
+          expectCompactWindowsEnvironment(env, profile, repo);
+          sandboxHomes.add(env.HOME.toLowerCase());
+          browserCaches.add(env.PLAYWRIGHT_BROWSERS_PATH.toLowerCase());
+        }
+
+        expect(sandboxHomes.size).toBe(48);
+        expect(browserCaches.size).toBe(48);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 });

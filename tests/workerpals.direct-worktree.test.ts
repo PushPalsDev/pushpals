@@ -104,4 +104,86 @@ describe("direct WorkerPal worktree paths", () => {
       ),
     ).toBe(false);
   });
+
+  test("keeps a large set of long Windows repository pools unique and bounded", () => {
+    const homeRoot = "C:\\Users\\example";
+    const tempRoot = "C:\\Users\\example\\AppData\\Local\\Temp";
+    const roots = new Set<string>();
+    const worktrees = new Set<string>();
+
+    for (let index = 0; index < 128; index += 1) {
+      const repo = win32.join(
+        "C:\\Users\\example\\Documents",
+        `organization-${index.toString().padStart(3, "0")}-${"deep-parent-".repeat(6)}`,
+        "SectorCommand",
+      );
+      const root = resolveDirectWorktreeRoot(repo, "win32", homeRoot);
+      const worktree = resolveDirectWorktreePath(
+        repo,
+        `job-${index.toString(16).padStart(8, "0")}-7986-46b1-891f-e66983cac5b7`,
+        `nonce-${index}-abcdefghijklmnopqrstuvwxyz`,
+        "win32",
+        homeRoot,
+      );
+
+      expect(root.length).toBeLessThan(45);
+      expect(worktree.length).toBeLessThan(80);
+      expect(isDirectWorkerWorktreePath(repo, worktree, "win32", homeRoot, tempRoot)).toBe(true);
+      roots.add(root.toLowerCase());
+      worktrees.add(worktree.toLowerCase());
+    }
+
+    expect(roots.size).toBe(128);
+    expect(worktrees.size).toBe(128);
+  });
+
+  test("uses safe bounded fallbacks for hostile or empty job path components", () => {
+    const repo = "C:\\projects\\example";
+    const homeRoot = "C:\\Users\\example";
+
+    expect(resolveDirectWorktreePath(repo, "../..", "@@@", "win32", homeRoot)).toBe(
+      win32.resolve(resolveDirectWorktreeRoot(repo, "win32", homeRoot), "job-host-run"),
+    );
+    expect(
+      resolveDirectWorktreePath(
+        repo,
+        "ABCDEF0123456789-path-traversal",
+        "NONCE_WITH_INVALID_CHARACTERS_AND_EXCESS_LENGTH",
+        "win32",
+        homeRoot,
+      ),
+    ).toBe(
+      win32.resolve(
+        resolveDirectWorktreeRoot(repo, "win32", homeRoot),
+        "job-abcdef01-noncewithinvalid",
+      ),
+    );
+  });
+
+  test("rejects traversal and lookalike pool paths outside the exact repository root", () => {
+    const repo = "C:\\projects\\example";
+    const homeRoot = "C:\\Users\\example";
+    const tempRoot = "C:\\Temp";
+    const root = resolveDirectWorktreeRoot(repo, "win32", homeRoot);
+    const lookalikeRoot = `${root}-lookalike`;
+
+    expect(
+      isDirectWorkerWorktreePath(
+        repo,
+        win32.resolve(lookalikeRoot, "job-abc-run"),
+        "win32",
+        homeRoot,
+        tempRoot,
+      ),
+    ).toBe(false);
+    expect(
+      isDirectWorkerWorktreePath(
+        repo,
+        win32.resolve(root, "job-abc-run", "..", "..", "job-escaped-run"),
+        "win32",
+        homeRoot,
+        tempRoot,
+      ),
+    ).toBe(false);
+  });
 });
