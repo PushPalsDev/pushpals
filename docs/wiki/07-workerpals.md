@@ -64,9 +64,12 @@ This provides:
 
 An environment-blocked required validation gate is not treated as a code
 revision request. WorkerPals retains a publishable candidate commit under its
-internal ref, reports the job as `publish_blocked` at the `validation` stage,
-and waits for the same gate to run in a trusted environment. It neither drops
-the patch nor publishes an unvalidated branch.
+internal ref and hands the exact blocked commands to SourceControlManager.
+SourceControlManager applies the candidate to its temporary publication branch,
+runs those commands on the trusted host without a shell, and only continues to
+merge or PR publication after they pass. A failed trusted check retains the
+internal ref for diagnosis; a failed queue handoff is reported as
+`publish_blocked` instead of silently deleting the candidate.
 
 ## Operational Failure Patterns
 

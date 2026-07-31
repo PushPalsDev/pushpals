@@ -850,20 +850,52 @@ export function holdCommitForTrustedValidation(
   return {
     result: {
       ...result,
-      ok: false,
-      summary: result.validationBlocked.summary,
-      stderr: [result.stderr, result.validationBlocked.detail].filter(Boolean).join("\n"),
-      exitCode: 4,
-      publishBlocked: {
-        summary: result.validationBlocked.summary,
-        detail: result.validationBlocked.detail,
-        publicBranch: commit.publicBranch ?? commit.branch,
-        localRef: commit.branch,
-        sha: commit.sha,
-        stage: "validation",
-      },
+      ok: true,
+      summary: `${result.validationBlocked.summary}; queued for host-side validation`,
+      exitCode: 0,
+      publishBlocked: undefined,
     },
-    completionCommit: null,
+    completionCommit: commit,
+  };
+}
+
+export function failCompletionEnqueue(result: WorkerJobResult, commit: CommitRef): WorkerJobResult {
+  const validationDetail = result.validationBlocked?.detail;
+  const detail = [
+    validationDetail,
+    `The candidate remains available at ${commit.branch} (${commit.sha}); completion handoff failed.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return {
+    ...result,
+    ok: false,
+    summary: result.validationBlocked
+      ? "Trusted validation could not be queued"
+      : "Candidate publication could not be queued",
+    stderr: [result.stderr, detail].filter(Boolean).join("\n"),
+    exitCode: 4,
+    publishBlocked: {
+      summary: result.validationBlocked
+        ? "Trusted validation could not be queued"
+        : "Candidate publication could not be queued",
+      detail,
+      publicBranch: commit.publicBranch ?? commit.branch,
+      localRef: commit.branch,
+      sha: commit.sha,
+      stage: result.validationBlocked ? "validation" : "push",
+    },
+  };
+}
+
+export function buildTrustedValidationCompletionPayload(
+  validationBlocked: WorkerJobResult["validationBlocked"],
+): Record<string, unknown> {
+  if (!validationBlocked) return {};
+  return {
+    trustedValidationCommands: [...validationBlocked.commands],
+    trustedValidationSummary: validationBlocked.summary,
+    trustedValidationDetail: validationBlocked.detail,
   };
 }
 
@@ -1328,6 +1360,7 @@ async function enqueueCompletion(
   },
   commit: CommitRef,
   resultSummary: string,
+  validationBlocked?: WorkerJobResult["validationBlocked"],
 ): Promise<boolean> {
   try {
     const reviewAgent =
@@ -1387,6 +1420,7 @@ async function enqueueCompletion(
       prUrl,
       prTitle: pr.title,
       prBody: completionPrBody,
+      ...buildTrustedValidationCompletionPayload(validationBlocked),
     });
 
     if (response.ok) {
@@ -1961,20 +1995,10 @@ async function workerLoop(
                 },
                 completionCommit,
                 result.summary,
+                result.validationBlocked,
               );
-              if (!enqueued && completionCommit.branch.startsWith("refs/pushpals/")) {
-                const cleanupRef = await git(executionRepo, [
-                  "update-ref",
-                  "-d",
-                  completionCommit.branch,
-                ]);
-                if (!cleanupRef.ok) {
-                  console.warn(
-                    `[WorkerPals] Failed to clean local completion ref ${completionCommit.branch}: ${
-                      cleanupRef.stderr || cleanupRef.stdout
-                    }`,
-                  );
-                }
+              if (!enqueued) {
+                result = failCompletionEnqueue(result, completionCommit);
               }
             }
 

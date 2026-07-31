@@ -1,7 +1,85 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { CompletionQueue } from "../apps/server/src/completions";
 
 describe("server CompletionQueue PR URL persistence", () => {
+  test("persists trusted-validation handoff metadata for SourceControlManager", () => {
+    const queue = new CompletionQueue(":memory:");
+    const enqueued = queue.enqueue({
+      jobId: "job-trusted",
+      sessionId: "dev",
+      commitSha: "fed123",
+      branch: "refs/pushpals/agent/worker/job-trusted",
+      message: "candidate retained",
+      trustedValidationCommands: ["bun run validate:publish", "bun run validate:publish"],
+      trustedValidationSummary: "Host validation required",
+      trustedValidationDetail: "Docker is unavailable in the worker sandbox.",
+    });
+
+    expect(enqueued.ok).toBe(true);
+    const claimed = queue.claim("scm-trusted");
+    expect(claimed.completion?.trustedValidationCommandsJson).toBe(
+      JSON.stringify(["bun run validate:publish"]),
+    );
+    expect(claimed.completion?.trustedValidationSummary).toBe("Host validation required");
+    expect(claimed.completion?.trustedValidationDetail).toContain("Docker is unavailable");
+    queue.close();
+  });
+
+  test("rejects unsafe trusted-validation handoffs", () => {
+    const queue = new CompletionQueue(":memory:");
+    const enqueued = queue.enqueue({
+      jobId: "job-unsafe",
+      sessionId: "dev",
+      commitSha: "bad123",
+      branch: "refs/pushpals/agent/worker/job-unsafe",
+      message: "candidate retained",
+      trustedValidationCommands: ["bun test && powershell -Command Remove-Item"],
+    });
+
+    expect(enqueued.ok).toBe(false);
+    expect(enqueued.message).toContain("unsafe or unsupported");
+    expect(queue.getPendingCompletions()).toHaveLength(0);
+    queue.close();
+  });
+
+  test("migrates an existing completion database before accepting trusted validation", () => {
+    const legacy = new Database(":memory:");
+    legacy.exec(`
+      CREATE TABLE completions (
+        id TEXT PRIMARY KEY,
+        jobId TEXT NOT NULL,
+        sessionId TEXT NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'user',
+        commitSha TEXT,
+        branch TEXT,
+        message TEXT NOT NULL,
+        prUrl TEXT,
+        prTitle TEXT,
+        prBody TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        pusherId TEXT,
+        error TEXT,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+    `);
+
+    const queue = new CompletionQueue(legacy);
+    expect(
+      queue.enqueue({
+        jobId: "job-migrated",
+        sessionId: "dev",
+        message: "candidate retained",
+        trustedValidationCommands: ["bun run validate:publish"],
+      }).ok,
+    ).toBe(true);
+    expect(queue.claim("scm-migrated").completion?.trustedValidationCommandsJson).toBe(
+      JSON.stringify(["bun run validate:publish"]),
+    );
+    queue.close();
+  });
+
   test("stores prUrl on enqueue and returns it when claimed", () => {
     const queue = new CompletionQueue(":memory:");
     const enqueued = queue.enqueue({

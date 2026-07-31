@@ -12,6 +12,7 @@
 
 import { Database } from "bun:sqlite";
 import { randomUUID } from "crypto";
+import { normalizeTrustedValidationCommands } from "../../../packages/shared/src/trusted_validation.js";
 
 export type CompletionStatus = "pending" | "claimed" | "processed" | "failed";
 
@@ -26,6 +27,9 @@ export interface CompletionRow {
   prUrl: string | null;
   prTitle: string | null;
   prBody: string | null;
+  trustedValidationCommandsJson: string | null;
+  trustedValidationSummary: string | null;
+  trustedValidationDetail: string | null;
   status: CompletionStatus;
   pusherId: string | null;
   error: string | null;
@@ -36,8 +40,8 @@ export interface CompletionRow {
 export class CompletionQueue {
   private db: Database;
 
-  constructor(dbPath: string = ":memory:") {
-    this.db = new Database(dbPath);
+  constructor(dbPath: string | Database = ":memory:") {
+    this.db = typeof dbPath === "string" ? new Database(dbPath) : dbPath;
     this.db.exec("PRAGMA journal_mode = WAL;");
     this._migrate();
   }
@@ -55,6 +59,9 @@ export class CompletionQueue {
         prUrl      TEXT,
         prTitle    TEXT,
         prBody     TEXT,
+        trustedValidationCommandsJson TEXT,
+        trustedValidationSummary TEXT,
+        trustedValidationDetail TEXT,
         status     TEXT NOT NULL DEFAULT 'pending',
         pusherId   TEXT,
         error      TEXT,
@@ -81,6 +88,15 @@ export class CompletionQueue {
     if (!columns.some((col) => col.name === "origin")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN origin TEXT NOT NULL DEFAULT 'user';`);
     }
+    if (!columns.some((col) => col.name === "trustedValidationCommandsJson")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationCommandsJson TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "trustedValidationSummary")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationSummary TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "trustedValidationDetail")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationDetail TEXT;`);
+    }
   }
 
   /**
@@ -101,6 +117,24 @@ export class CompletionQueue {
         : null;
     const prBody =
       typeof body.prBody === "string" && body.prBody.trim().length > 0 ? body.prBody.trim() : null;
+    let trustedValidationCommandsJson: string | null = null;
+    let trustedValidationSummary: string | null = null;
+    let trustedValidationDetail: string | null = null;
+    if (body.trustedValidationCommands !== undefined) {
+      const trustedCommands = normalizeTrustedValidationCommands(body.trustedValidationCommands);
+      if (!trustedCommands.ok) {
+        return { ok: false, message: trustedCommands.message };
+      }
+      trustedValidationCommandsJson = JSON.stringify(trustedCommands.commands);
+      trustedValidationSummary =
+        typeof body.trustedValidationSummary === "string"
+          ? body.trustedValidationSummary.trim().slice(0, 500) || null
+          : null;
+      trustedValidationDetail =
+        typeof body.trustedValidationDetail === "string"
+          ? body.trustedValidationDetail.trim().slice(0, 4_000) || null
+          : null;
+    }
 
     if (!jobId || !sessionId || !message) {
       return { ok: false, message: "jobId, sessionId, and message are required" };
@@ -111,8 +145,11 @@ export class CompletionQueue {
 
     this.db
       .prepare(
-        `INSERT INTO completions (id, jobId, sessionId, origin, commitSha, branch, message, prUrl, prTitle, prBody, status, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        `INSERT INTO completions (
+           id, jobId, sessionId, origin, commitSha, branch, message, prUrl, prTitle, prBody,
+           trustedValidationCommandsJson, trustedValidationSummary, trustedValidationDetail,
+           status, createdAt, updatedAt
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       )
       .run(
         completionId,
@@ -125,6 +162,9 @@ export class CompletionQueue {
         prUrl,
         prTitle,
         prBody,
+        trustedValidationCommandsJson,
+        trustedValidationSummary,
+        trustedValidationDetail,
         now,
         now,
       );

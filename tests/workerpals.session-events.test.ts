@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildTrustedValidationCompletionPayload,
+  failCompletionEnqueue,
   holdCommitForTrustedValidation,
   inferWorkerTerminalFailureClass,
   shouldDeferDockerCodexStartupStallForDirectRetry,
@@ -47,7 +49,7 @@ describe("workerpals session event emission", () => {
     expect(result.diagnostics?.patchSnapshots).toHaveLength(1);
   });
 
-  test("holds an environment-blocked candidate ref instead of enqueueing completion", () => {
+  test("hands an environment-blocked candidate ref to the trusted validation queue", () => {
     const held = holdCommitForTrustedValidation(
       {
         ok: true,
@@ -66,17 +68,56 @@ describe("workerpals session event emission", () => {
       },
     );
 
-    expect(held.completionCommit).toBeNull();
-    expect(held.result.ok).toBe(false);
-    expect(held.result.publishBlocked).toEqual({
-      summary: "Candidate patch requires trusted-environment validation before publication",
-      detail: "Docker socket access is not permitted in the sandbox.",
+    expect(held.completionCommit).toEqual({
+      branch: "refs/pushpals/agent/worker/job",
       publicBranch: "agent/worker/job",
-      localRef: "refs/pushpals/agent/worker/job",
       sha: "abc123",
-      stage: "validation",
     });
-    expect(inferWorkerTerminalFailureClass(held.result)).toBe("environment");
+    expect(held.result.ok).toBe(true);
+    expect(held.result.publishBlocked).toBeUndefined();
+    expect(held.result.summary).toContain("queued for host-side validation");
+  });
+
+  test("retains the candidate and reports publish-blocked when trusted handoff fails", () => {
+    const failed = failCompletionEnqueue(
+      {
+        ok: true,
+        summary: "queued",
+        validationBlocked: {
+          category: "environment",
+          summary: "Trusted validation required",
+          detail: "Docker is unavailable in the worker sandbox.",
+          commands: ["bun run validate"],
+        },
+      },
+      {
+        branch: "refs/pushpals/agent/worker/job",
+        publicBranch: "agent/worker/job",
+        sha: "abc123",
+      },
+    );
+
+    expect(failed.ok).toBe(false);
+    expect(failed.publishBlocked?.stage).toBe("validation");
+    expect(failed.publishBlocked?.localRef).toBe("refs/pushpals/agent/worker/job");
+    expect(failed.stderr).toContain("candidate remains available");
+    expect(inferWorkerTerminalFailureClass(failed)).toBe("environment");
+  });
+
+  test("carries exact blocked commands into the completion handoff", () => {
+    expect(
+      buildTrustedValidationCompletionPayload({
+        category: "environment",
+        summary: "Trusted validation required",
+        detail: "Docker is unavailable.",
+        commands: ["bun run validate:publish"],
+      }),
+    ).toEqual({
+      trustedValidationCommands: ["bun run validate:publish"],
+      trustedValidationSummary: "Trusted validation required",
+      trustedValidationDetail: "Docker is unavailable.",
+    });
+    expect(buildTrustedValidationCompletionPayload(undefined)).toEqual({});
   });
 
   test("fails an environment-blocked job that produced no candidate commit", () => {

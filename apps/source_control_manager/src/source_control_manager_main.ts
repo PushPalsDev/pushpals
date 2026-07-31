@@ -33,6 +33,7 @@ import {
 } from "./runtime_helpers";
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
+import { runTrustedValidationCommands } from "./trusted_validation";
 import {
   loadConfig,
   applyCliOverrides,
@@ -549,6 +550,9 @@ async function tick(): Promise<void> {
         prUrl: string | null;
         prTitle: string | null;
         prBody: string | null;
+        trustedValidationCommandsJson: string | null;
+        trustedValidationSummary: string | null;
+        trustedValidationDetail: string | null;
         status: string;
         pusherId: string;
         createdAt: string;
@@ -734,10 +738,32 @@ async function tick(): Promise<void> {
 
       // 4. Run checks
       if (skipLocalApplyDueConflict) {
+        if (completion.trustedValidationCommandsJson) {
+          throw new Error(
+            "Trusted validation cannot run because the candidate was not applied to the SourceControlManager validation branch.",
+          );
+        }
         console.warn(
           `[${ts()}] Skipping local checks for ${completion.commitSha.slice(0, 8)} because ReviewAgent fallback bypassed temp-branch apply.`,
         );
       } else {
+        if (completion.trustedValidationCommandsJson) {
+          console.log(
+            `[${ts()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`,
+          );
+          const trustedResults = await runTrustedValidationCommands({
+            repoPath: runtimeConfig.repoPath,
+            commandsJson: completion.trustedValidationCommandsJson,
+          });
+          for (const trustedResult of trustedResults) {
+            if (!trustedResult.ok) {
+              throw new Error(
+                `Trusted validation "${trustedResult.command}" failed (exit ${trustedResult.exitCode}): ${trustedResult.output}`,
+              );
+            }
+            console.log(`[${ts()}]   - Trusted validation passed: ${trustedResult.command}`);
+          }
+        }
         console.log(`[${ts()}] Running checks...`);
         for (const check of runtimeConfig.checks) {
           console.log(`[${ts()}]   - Running check: ${check.name}`);

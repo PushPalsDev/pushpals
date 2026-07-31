@@ -1815,6 +1815,33 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
   "-C",
   "-F"
 ]);
+// packages/shared/src/trusted_validation.ts
+var TRUSTED_VALIDATION_EXECUTABLES = new Set([
+  "bun",
+  "bunx",
+  "cargo",
+  "coverage",
+  "deno",
+  "docker",
+  "docker-compose",
+  "eslint",
+  "go",
+  "jest",
+  "make",
+  "mypy",
+  "node",
+  "npm",
+  "npx",
+  "pnpm",
+  "pytest",
+  "python",
+  "python3",
+  "ruff",
+  "tsc",
+  "uv",
+  "vitest",
+  "yarn"
+]);
 // packages/shared/src/session_event_visibility.ts
 var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts

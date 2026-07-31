@@ -85,6 +85,13 @@ export {
   type ToolchainPlan,
 } from "./toolchain.js";
 export {
+  MAX_TRUSTED_VALIDATION_COMMANDS,
+  MAX_TRUSTED_VALIDATION_COMMAND_LENGTH,
+  normalizeTrustedValidationCommands,
+  tokenizeTrustedValidationCommand,
+  type TrustedValidationCommandsResult,
+} from "./trusted_validation.js";
+export {
   DEFAULT_WORKERPALS_EXECUTOR,
   invalidatePushPalsConfigCache,
   loadPushPalsConfig,
