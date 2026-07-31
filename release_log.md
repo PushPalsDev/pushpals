@@ -2,29 +2,28 @@
 
 ## Release Metadata
 
-- version: `v1.2.19`
-- start_commit: `7c5f958b68a6b826dbebb734417284f18dc73ebd`
-- end_commit: `ab4266a211ab39eab5e1763b6344cce9382a5319`
-- commits_in_range: `4`
+- version: `v1.2.20`
+- start_commit: `b49dc371bedb0cad706abe8ab3526fef57c448d9`
+- end_commit: `245bcf1ef01df539469ae518f7ea5a7411727b67`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Add 13 focused regression cases for compact Windows worktrees and writable sandbox environments, including inherited-environment edge cases, Git configuration idempotence, repository isolation, and Playwright cache behavior.
-- Exercise every redirected writable directory in a real Bun child process and prove that three concurrent-style WorkerPal jobs keep isolated home/temp state while sharing only the stable per-repository browser cache.
-- Stress 24 worst-case long-path jobs and assert strict path budgets for `.ppw` worktrees, `.ppe` sandbox roots, Workerd/Expo caches, and Playwright hot caches.
-- Enforce byte-identical source and packaged WorkerPal path behavior, and gate pull requests, pushes, every release, and the long Windows runtime soak on the complete Windows path contract.
-- Keep module-resolution coverage aligned with production: child probes run from the WorkerPal worktree, Node singleton behavior remains strict across junctions, Bun dependency resolution remains asserted without relying on runner-dependent object identity, and the four-process Windows probe has an explicit slow-runner budget.
+- Resume Docker-dependent validation automatically after a sandboxed WorkerPal retains a candidate: SourceControlManager now applies the exact handoff commit, runs the blocked commands on its trusted host worktree, and only continues publication after they pass.
+- Persist trusted-validation commands, summary, and blocker detail through a backward-compatible completion-queue migration instead of terminating the job at `publish_blocked` with no recovery owner.
+- Execute trusted validation as bounded direct argv commands, reject shell controls, inline-code escape forms, absolute executables, unsupported tools, and oversized payloads, and stop at the first failed gate.
+- Preserve immutable candidate refs when completion handoff or trusted validation fails so useful work is never silently discarded or published without its required gate.
+- Extend exact review-head lease E2E coverage plus Windows LF, compact-path, sandbox isolation, cleanup, and packaged-runtime parity regressions across pull requests, releases, and the long runtime soak.
 
 ## Validation
 
-- Release-playbook root suite on Bun 1.3.14: 1,042 passed, 2 intentional skips, 0 failed, 5,690 assertions across 121 files.
-- Focused direct-worktree, sandbox-environment, packaged-runtime parity, and real-Windows integration suite on Bun 1.3.14: 39 passed, 0 failed, 1,819 assertions across 4 files.
-- Focused sandbox-environment suite on the local Bun 1.3.9 runtime: 27 passed, 0 failed, 139 assertions.
-- GitHub-hosted `windows-2022` path-contract job passed all 39 tests on Bun 1.3.14.
-- The v1.2.17 and v1.2.18 release gates exposed the runner-specific test assumptions and correctly skipped npm and GitHub publication.
-- WorkerPals TypeScript check passed.
+- Release-playbook root suite on Bun 1.3.14: 1,066 passed, 2 intentional skips, 0 failed, 8,911 assertions across 122 files.
+- Focused trusted-validation, completion migration, WorkerPal handoff, and packaged-runtime parity suite: 31 passed, 0 failed.
+- SourceControlManager and related WorkerPal publication/reconciliation suite: 172 passed, 0 failed, 573 assertions across 16 files.
+- Shared, Server, WorkerPals, and SourceControlManager TypeScript checks passed.
+- SourceControlManager production bundle compiled successfully with the trusted-validation runner.
 - `bun run cli:bundle`
-- `bun run cli:verify-package-payload`: 221 package files, no external toolchain files.
+- `bun run cli:verify-package-payload`: 222 package files, no external toolchain files.
 - `git diff --check` passed.
 
 ## Install
@@ -51,7 +50,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- WorkerPal sandboxes intentionally do not receive the host Docker socket. Repositories whose required validation starts nested containers are retained as validation-stage `publish_blocked` candidates until the same gate can run in a trusted environment.
+- WorkerPal sandboxes intentionally do not receive the host Docker socket. Docker-dependent gates now resume through SourceControlManager's trusted host worktree, but that host still needs Docker installed and running; otherwise the candidate remains retained and unpublished with the host validation failure attached.
 - The first Docker-backed WorkerPal startup after upgrading rebuilds the sandbox image and downloads the Node, Python-agent, Playwright, and Chromium layers; subsequent starts reuse Docker's cached layers.
 - `execution_platform = "windows"` selects direct host WorkerPal execution so validation inherits the Windows host environment; it does not convert Docker Desktop Linux containers into Windows containers.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
