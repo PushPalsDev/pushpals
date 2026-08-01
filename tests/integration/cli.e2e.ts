@@ -1370,7 +1370,7 @@ describe("packaged CLI end-to-end", () => {
         expect(combined).toContain(
           "[pushpals] Windows safety mode: unused standalone runtime binary downloads are skipped.",
         );
-        expect(combined).toContain("[pushpals] Embedded WorkerPal capacity is ready");
+        expect(combined).toContain("[pushpals] workerExecution=ready detail=1 idle / 1 online");
         expect(combined).toContain("[pushpals] startup timing summary: outcome=ready");
         expect(combined).toContain("[pushpals] Embedded runtime is ready.");
         expect(combined).toContain("[pushpals] Embedded RemoteBuddy autonomous engine is enabled.");
