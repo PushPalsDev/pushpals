@@ -5139,6 +5139,23 @@ export function resolveCliLocalBuddyAutostart(
   return runtimeOnly ? runtimeConfigEnabled : false;
 }
 
+export function resolveEmbeddedLocalAgentUrl(input: {
+  requestedUrl?: string;
+  configuredClientUrl: string;
+  localBuddyPort: number;
+  startLocalBuddy: boolean;
+}): string {
+  const requestedUrl = String(input.requestedUrl ?? "").trim();
+  if (requestedUrl || !input.startLocalBuddy) {
+    return normalizeLoopbackUrl(requestedUrl || undefined, input.configuredClientUrl);
+  }
+  const localBuddyPort = Math.max(
+    1,
+    Math.min(65_535, Math.floor(Number(input.localBuddyPort) || 3_003)),
+  );
+  return `http://127.0.0.1:${localBuddyPort}`;
+}
+
 async function ensureServerSession(
   serverUrl: string,
   requestedSessionId: string,
@@ -6791,10 +6808,8 @@ async function main(): Promise<void> {
     parsed.serverUrl ?? process.env.PUSHPALS_SERVER_URL,
     config.server.url,
   );
-  const localAgentUrl = normalizeLoopbackUrl(
-    parsed.localAgentUrl ?? process.env.EXPO_PUBLIC_LOCAL_AGENT_URL,
-    config.client.localAgentUrl,
-  );
+  const requestedLocalAgentUrl = parsed.localAgentUrl ?? process.env.EXPO_PUBLIC_LOCAL_AGENT_URL;
+  let localAgentUrl = normalizeLoopbackUrl(requestedLocalAgentUrl, config.client.localAgentUrl);
   const sessionId = String(
     parsed.sessionId ?? process.env.PUSHPALS_SESSION_ID ?? config.sessionId,
   ).trim();
@@ -7010,6 +7025,16 @@ async function main(): Promise<void> {
     }
     if (!parsed.noAutoStart) {
       try {
+        const startLocalBuddy = resolveCliLocalBuddyAutostart(
+          parsed.runtimeOnly,
+          Boolean(config.localbuddy.enabled),
+        );
+        localAgentUrl = resolveEmbeddedLocalAgentUrl({
+          requestedUrl: requestedLocalAgentUrl,
+          configuredClientUrl: config.client.localAgentUrl,
+          localBuddyPort: config.localbuddy.port,
+          startLocalBuddy,
+        });
         const startedRuntime = await autoStartRuntimeServices({
           repoRoot,
           serverUrl,
@@ -7019,10 +7044,7 @@ async function main(): Promise<void> {
           sourceControlManagerRemote: config.sourceControlManager.remote,
           preparedRuntime,
           requestedRuntimeTag: resolvedRuntimeTagForAutoStart || parsed.runtimeTag,
-          startLocalBuddy: resolveCliLocalBuddyAutostart(
-            parsed.runtimeOnly,
-            Boolean(config.localbuddy.enabled),
-          ),
+          startLocalBuddy,
           baseEnv: workerpalDockerPrecheck.env,
         });
         autoStartedServiceManager = startedRuntime.serviceManager;

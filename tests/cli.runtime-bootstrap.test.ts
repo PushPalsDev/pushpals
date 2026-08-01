@@ -65,6 +65,7 @@ import {
   resolveRuntimeDockerExecutableCandidates,
   resolveRuntimeGitExecutableCandidates,
   resolveCliLocalBuddyAutostart,
+  resolveEmbeddedLocalAgentUrl,
   resolveCliRuntimeHostPidFromProcessTree,
   resolveCliRuntimeHostShutdownCandidate,
   resolveWorkerExecutionReadiness,
@@ -3932,6 +3933,31 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(resolveCliLocalBuddyAutostart(false, true)).toBe(false);
     expect(resolveCliLocalBuddyAutostart(true, false)).toBe(false);
     expect(resolveCliLocalBuddyAutostart(true, true)).toBe(true);
+  });
+
+  test("embedded LocalBuddy readiness follows its configured port unless the user overrides it", () => {
+    expect(
+      resolveEmbeddedLocalAgentUrl({
+        configuredClientUrl: "http://127.0.0.1:3003",
+        localBuddyPort: 23021,
+        startLocalBuddy: true,
+      }),
+    ).toBe("http://127.0.0.1:23021");
+    expect(
+      resolveEmbeddedLocalAgentUrl({
+        requestedUrl: "http://localhost:4100",
+        configuredClientUrl: "http://127.0.0.1:3003",
+        localBuddyPort: 23021,
+        startLocalBuddy: true,
+      }),
+    ).toBe("http://127.0.0.1:4100");
+    expect(
+      resolveEmbeddedLocalAgentUrl({
+        configuredClientUrl: "http://127.0.0.1:3003",
+        localBuddyPort: 23021,
+        startLocalBuddy: false,
+      }),
+    ).toBe("http://127.0.0.1:3003");
   });
 
   test("normalizeRepoPathForComparison compares repo roots safely across path casings and separators", () => {
