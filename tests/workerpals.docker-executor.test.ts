@@ -458,7 +458,7 @@ describe("workerpals docker executor internals", () => {
     executor.inspectWarmContainerState = async () => "running=true";
 
     const result = await executor.ensureWorktreeAccessibleInWarmContainer(
-      `${process.cwd()}\\.worktrees\\job-123`,
+      join(process.cwd(), ".worktrees", "job-123"),
     );
 
     expect(result).toContain("/repo/.worktrees/job-123");

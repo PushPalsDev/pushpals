@@ -134,6 +134,38 @@ describe("remotebuddy worker spawn command", () => {
     expect(command).not.toContain("--env-file");
   });
 
+  test("wraps the Windows WorkerPal source bundle in the isolated launch trampoline", () => {
+    const command = buildWorkerSpawnCommand({
+      server: "http://localhost:3001",
+      workerId: "workerpal-safe",
+      repoRoot: "C:/target-repo",
+      pollMs: 2000,
+      heartbeatMs: 5000,
+      labels: ["autospawn"],
+      docker: true,
+      requireDocker: true,
+      dockerImage: "pushpals-worker-sandbox:latest",
+      sourceBundlePath: "C:/runtime/sandbox/.pushpals-workerpals-runtime.js",
+      bunExecutable: "C:/bun/bun.exe",
+      launchTrampolinePath: "C:/runtime/sandbox/.pushpals-runtime-launch-trampoline.js",
+      envFile: null,
+    });
+
+    expect(command.slice(0, 6)).toEqual([
+      "C:/bun/bun.exe",
+      "C:/runtime/sandbox/.pushpals-runtime-launch-trampoline.js",
+      "--",
+      "C:/bun/bun.exe",
+      "C:/runtime/sandbox/.pushpals-workerpals-runtime.js",
+      "--server",
+    ]);
+    expect(command).toContain("--repo");
+    expect(command).toContain("C:/target-repo");
+    expect(command).toContain("--require-docker");
+    expect(command).not.toContain("--env-file");
+    expect(command).not.toContain("pushpals-runtime-workerpals-windows-x64.exe");
+  });
+
   test("uses a higher startup timeout floor for Docker-backed workers", () => {
     expect(
       resolveWorkerStartupTimeoutMs({

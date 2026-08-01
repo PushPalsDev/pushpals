@@ -70,31 +70,59 @@ if (existsSync(join(repoRoot, "bun.lock"))) {
   copyTrackedRepoPath(repoRoot, "bun.lock", join(outDir, "sandbox", "bun.lock"), true);
 }
 
-const remoteBuddyFallbackBundlePath = join(outDir, "sandbox", ".pushpals-remotebuddy-fallback.js");
-const remoteBuddyFallbackBuild = Bun.spawnSync(
-  [
-    process.execPath,
-    "build",
-    "apps/remotebuddy/src/remotebuddy_main.ts",
-    "--target=bun",
-    `--outfile=${remoteBuddyFallbackBundlePath}`,
-  ],
+const bundledWindowsRuntimeEntrypoints = [
   {
-    cwd: repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
+    label: "server",
+    sourcePath: "apps/server/src/server_main.ts",
+    outputPath: join(outDir, "sandbox", ".pushpals-server-runtime.js"),
   },
-);
-if (remoteBuddyFallbackBuild.exitCode !== 0 || !existsSync(remoteBuddyFallbackBundlePath)) {
-  const stdout = Buffer.from(remoteBuddyFallbackBuild.stdout ?? [])
+  {
+    label: "LocalBuddy",
+    sourcePath: "apps/localbuddy/src/localbuddy_main.ts",
+    outputPath: join(outDir, "sandbox", ".pushpals-localbuddy-runtime.js"),
+  },
+  {
+    label: "RemoteBuddy",
+    sourcePath: "apps/remotebuddy/src/remotebuddy_main.ts",
+    outputPath: join(outDir, "sandbox", ".pushpals-remotebuddy-fallback.js"),
+  },
+  {
+    label: "WorkerPal",
+    sourcePath: "apps/workerpals/src/workerpals_main.ts",
+    outputPath: join(outDir, "sandbox", ".pushpals-workerpals-runtime.js"),
+  },
+  {
+    label: "SourceControlManager",
+    sourcePath: "apps/source_control_manager/src/source_control_manager_main.ts",
+    outputPath: join(outDir, "sandbox", ".pushpals-source-control-manager-runtime.js"),
+  },
+  {
+    label: "runtime launch trampoline",
+    sourcePath: "scripts/runtime-launch-trampoline.ts",
+    outputPath: join(outDir, "sandbox", ".pushpals-runtime-launch-trampoline.js"),
+  },
+] as const;
+
+for (const asset of bundledWindowsRuntimeEntrypoints) {
+  const build = Bun.spawnSync(
+    [process.execPath, "build", asset.sourcePath, "--target=bun", `--outfile=${asset.outputPath}`],
+    {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  if (build.exitCode === 0 && existsSync(asset.outputPath)) continue;
+
+  const stdout = Buffer.from(build.stdout ?? [])
     .toString("utf8")
     .trim();
-  const stderr = Buffer.from(remoteBuddyFallbackBuild.stderr ?? [])
+  const stderr = Buffer.from(build.stderr ?? [])
     .toString("utf8")
     .trim();
   const detail = [stdout, stderr].filter(Boolean).join("\n");
   console.error(
-    "[cli-runtime-assets] Failed to build bundled RemoteBuddy fallback asset." +
+    `[cli-runtime-assets] Failed to build bundled ${asset.label} asset.` +
       (detail ? `\n${detail}` : ""),
   );
   process.exit(1);

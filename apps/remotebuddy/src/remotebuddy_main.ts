@@ -974,6 +974,9 @@ export class RemoteBuddyOrchestrator {
   private readonly spawnWorkerHeartbeatMs: number | null;
   private readonly spawnWorkerLabels: string[];
   private readonly workerpalsBinaryPath: string | null;
+  private readonly workerpalsSourceBundlePath: string | null;
+  private readonly workerpalsBunExecutable: string | null;
+  private readonly workerpalsLaunchTrampolinePath: string | null;
   private readonly workerpalsEnvFile: string | null;
   private readonly workerpalsEntrypoint: string | null;
   private workerpalsUnavailableReason: string | null;
@@ -1076,6 +1079,9 @@ export class RemoteBuddyOrchestrator {
         : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
     this.workerpalsBinaryPath = null;
+    this.workerpalsSourceBundlePath = null;
+    this.workerpalsBunExecutable = null;
+    this.workerpalsLaunchTrampolinePath = null;
     this.workerpalsEnvFile = null;
     this.workerpalsEntrypoint = null;
     this.workerpalsUnavailableReason = null;
@@ -1114,6 +1120,14 @@ export class RemoteBuddyOrchestrator {
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
     const embeddedWorkerpalsBinary = String(process.env.PUSHPALS_WORKERPALS_BIN ?? "").trim();
+    const embeddedWorkerpalsSourceBundle = String(
+      process.env.PUSHPALS_WORKERPALS_SOURCE_BUNDLE ?? "",
+    ).trim();
+    const embeddedRuntimeLaunchTrampoline = String(
+      process.env.PUSHPALS_RUNTIME_LAUNCH_TRAMPOLINE ?? "",
+    ).trim();
+    const embeddedBunExecutable =
+      String(process.env.PUSHPALS_BUN_BIN ?? "").trim() || process.execPath;
     const workerpalsEntrypoint = resolve(
       this.repo,
       "apps",
@@ -1121,7 +1135,24 @@ export class RemoteBuddyOrchestrator {
       "src",
       "workerpals_main.ts",
     );
-    if (embeddedWorkerpalsBinary && existsSync(embeddedWorkerpalsBinary)) {
+    if (
+      process.platform === "win32" &&
+      embeddedWorkerpalsSourceBundle &&
+      existsSync(embeddedWorkerpalsSourceBundle) &&
+      embeddedRuntimeLaunchTrampoline &&
+      existsSync(embeddedRuntimeLaunchTrampoline) &&
+      embeddedBunExecutable &&
+      existsSync(embeddedBunExecutable)
+    ) {
+      this.workerpalsSourceBundlePath = embeddedWorkerpalsSourceBundle;
+      this.workerpalsBunExecutable = embeddedBunExecutable;
+      this.workerpalsLaunchTrampolinePath = embeddedRuntimeLaunchTrampoline;
+    } else if (process.platform === "win32" && this.autoSpawnWorkers) {
+      this.autoSpawnWorkers = false;
+      this.workerpalsUnavailableReason =
+        "WorkerPal isolated Windows source launcher is incomplete; direct standalone-binary launch is disabled";
+      console.warn(`[RemoteBuddy] Auto-spawn disabled: ${this.workerpalsUnavailableReason}.`);
+    } else if (embeddedWorkerpalsBinary && existsSync(embeddedWorkerpalsBinary)) {
       this.workerpalsBinaryPath = embeddedWorkerpalsBinary;
     } else if (existsSync(workerpalsEntrypoint)) {
       this.workerpalsEntrypoint = workerpalsEntrypoint;
@@ -2057,22 +2088,10 @@ export class RemoteBuddyOrchestrator {
     exited = await waitForExit(timeoutMs);
 
     if (!exited) {
-      if (process.platform === "win32" && Number.isFinite(proc.pid ?? Number.NaN)) {
-        try {
-          Bun.spawnSync(["taskkill", "/PID", String(proc.pid), "/T", "/F"], {
-            stdin: "ignore",
-            stdout: "ignore",
-            stderr: "ignore",
-          });
-        } catch {
-          // Ignore taskkill errors and keep fallback below.
-        }
-      } else {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // Ignore and continue with final wait.
-        }
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Ignore and continue with final wait.
       }
       exited = await waitForExit(2_000);
     }
@@ -2371,6 +2390,9 @@ export class RemoteBuddyOrchestrator {
       requireDocker: this.spawnWorkerRequireDocker,
       dockerImage: this.spawnWorkerImage,
       binaryPath: this.workerpalsBinaryPath,
+      sourceBundlePath: this.workerpalsSourceBundlePath,
+      bunExecutable: this.workerpalsBunExecutable,
+      launchTrampolinePath: this.workerpalsLaunchTrampolinePath,
       envFile: this.workerpalsEnvFile,
       entrypoint: this.workerpalsEntrypoint,
     });

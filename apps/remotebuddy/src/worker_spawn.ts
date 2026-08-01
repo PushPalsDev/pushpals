@@ -11,6 +11,9 @@ export type WorkerSpawnCommandOptions = {
   requireDocker: boolean;
   dockerImage: string | null;
   binaryPath?: string | null;
+  sourceBundlePath?: string | null;
+  bunExecutable?: string | null;
+  launchTrampolinePath?: string | null;
   envFile?: string | null;
   entrypoint?: string | null;
 };
@@ -49,7 +52,10 @@ export function resolveWorkerStartupTimeoutMs(options: WorkerStartupTimeoutOptio
 
 export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): string[] {
   const binaryPath = String(options.binaryPath ?? "").trim();
-  const envFile = String(options.envFile ?? "").trim() || ".env";
+  const sourceBundlePath = String(options.sourceBundlePath ?? "").trim();
+  const bunExecutable = String(options.bunExecutable ?? "").trim() || "bun";
+  const launchTrampolinePath = String(options.launchTrampolinePath ?? "").trim();
+  const envFile = options.envFile === null ? "" : String(options.envFile ?? "").trim() || ".env";
   const entrypoint =
     String(options.entrypoint ?? "").trim() || "apps/workerpals/src/workerpals_main.ts";
   const args = binaryPath
@@ -62,19 +68,29 @@ export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): str
         "--repo",
         options.repoRoot,
       ]
-    : [
-        "bun",
-        "run",
-        "--env-file",
-        envFile,
-        entrypoint,
-        "--server",
-        options.server,
-        "--workerId",
-        options.workerId,
-        "--repo",
-        options.repoRoot,
-      ];
+    : sourceBundlePath
+      ? [
+          bunExecutable,
+          sourceBundlePath,
+          "--server",
+          options.server,
+          "--workerId",
+          options.workerId,
+          "--repo",
+          options.repoRoot,
+        ]
+      : [
+          bunExecutable,
+          "run",
+          ...(envFile ? ["--env-file", envFile] : []),
+          entrypoint,
+          "--server",
+          options.server,
+          "--workerId",
+          options.workerId,
+          "--repo",
+          options.repoRoot,
+        ];
   if (options.pollMs) {
     args.push("--poll", String(options.pollMs));
   }
@@ -91,5 +107,5 @@ export function buildWorkerSpawnCommand(options: WorkerSpawnCommandOptions): str
       args.push("--docker-image", options.dockerImage);
     }
   }
-  return args;
+  return launchTrampolinePath ? [bunExecutable, launchTrampolinePath, "--", ...args] : args;
 }

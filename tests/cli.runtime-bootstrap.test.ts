@@ -17,6 +17,7 @@ import {
 } from "../apps/workerpals/src/common/direct_worktree";
 import {
   buildCliClearTargets,
+  buildEmbeddedRuntimeServiceLaunchPlan,
   buildEmbeddedRuntimeCrashEnvelope,
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
@@ -80,6 +81,7 @@ import {
   shouldUseRemoteBuddySilentStartupFallback,
   shouldRunEmbeddedRuntimeStartupPrechecks,
   resolvePreferredRuntimeReleaseTag,
+  resolveRuntimeBinaryPaths,
   resolveWindowsShellExecutableCandidatesForEnv,
   resolveWorkerpalDockerProbe,
   startEmbeddedMonitoringHub,
@@ -170,14 +172,12 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
     expect(env.PUSHPALS_PROJECT_ROOT_OVERRIDE).toBe("C:/repo/example");
     expect(env.PUSHPALS_REPO_ROOT_OVERRIDE).toBe("C:/repo/example");
-    expect(env.PUSHPALS_CONFIG_DIR_OVERRIDE).toBe(resolve("C:/runtime/pushpals", "configs"));
+    expect(env.PUSHPALS_CONFIG_DIR_OVERRIDE).toBe(join("C:/runtime/pushpals", "configs"));
     expect(env.PUSHPALS_PROMPTS_ROOT_OVERRIDE).toBe("C:/runtime/pushpals");
     expect(env.PUSHPALS_PROTOCOL_SCHEMAS_DIR).toBe(
-      join(resolve("C:/runtime/pushpals"), "protocol", "schemas"),
+      join("C:/runtime/pushpals", "protocol", "schemas"),
     );
-    expect(env.PUSHPALS_WORKERPALS_SANDBOX_ROOT).toBe(
-      join(resolve("C:/runtime/pushpals"), "sandbox"),
-    );
+    expect(env.PUSHPALS_WORKERPALS_SANDBOX_ROOT).toBe(join("C:/runtime/pushpals", "sandbox"));
     expect("REMOTEBUDDY_AUTONOMY_ENABLED" in env).toBe(false);
     expect("LOCALBUDDY_ENABLED" in env).toBe(false);
   });
@@ -299,6 +299,68 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(isRetryableManagedServiceLaunchError(new Error("ENOENT: binary missing"))).toBe(false);
     } finally {
       supervisor.stop();
+    }
+  });
+
+  test("a missing launch marker times out and retries without blocking a healthy service", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-managed-launch-timeout-"));
+    const readyScript = join(root, "ready.ts");
+    const stuckScript = join(root, "stuck.ts");
+    writeFileSync(
+      readyScript,
+      'console.error("fixture-ready"); setInterval(() => {}, 1000);\n',
+      "utf8",
+    );
+    writeFileSync(stuckScript, "setInterval(() => {}, 1000);\n", "utf8");
+    const supervisor = new ServiceManager({ pollMs: 25 });
+    let timeoutCount = 0;
+
+    try {
+      const healthy = await startManagedServiceWithRetry(
+        supervisor,
+        {
+          name: "healthy",
+          color: "",
+          command: [process.execPath, readyScript],
+          cwd: root,
+          launchReadyLine: "fixture-ready",
+          launchTimeoutMs: 1_000,
+        },
+        { maxAttempts: 1 },
+      );
+
+      const startedAt = Date.now();
+      await expect(
+        startManagedServiceWithRetry(
+          supervisor,
+          {
+            name: "stuck",
+            color: "",
+            command: [process.execPath, stuckScript],
+            cwd: root,
+            launchReadyLine: "fixture-ready",
+            launchTimeoutMs: 100,
+            onLaunchTimeout: () => {
+              timeoutCount += 1;
+            },
+          },
+          {
+            maxAttempts: 2,
+            computeBackoffMs: () => 1,
+            sleep: async () => {},
+          },
+        ),
+      ).rejects.toThrow("launch did not become ready");
+
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      expect(timeoutCount).toBe(2);
+      expect(healthy.exited).toBe(false);
+      expect(supervisor.getService("healthy")).toBe(healthy);
+      expect(supervisor.getService("stuck")).toBeNull();
+      expect(isRetryableManagedServiceLaunchError({ code: "ETIMEDOUT" })).toBe(true);
+    } finally {
+      supervisor.stop();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -662,7 +724,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       });
 
       expect(Date.now() - startedAt).toBeLessThan(900);
-      expect(killCalls).toBe(1);
+      expect(killCalls).toBe(2);
       expect(outputPipeStops).toBe(1);
       expect(cleanupCalls).toBe(1);
     } finally {
@@ -2589,6 +2651,8 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         "failed to connect to the docker API at npipe:////./pipe/docker_engine",
       ),
     ).toBe(true);
+    expect(isDockerUnavailableDetail('Executable not found in $PATH: "docker"')).toBe(true);
+    expect(isDockerUnavailableDetail("spawn docker ENOENT")).toBe(true);
     expect(isDockerUnavailableDetail("Error response from daemon: No such image")).toBe(false);
   });
 
@@ -3137,6 +3201,31 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("resolveRuntimeBinaryPaths computes source-only Windows placeholders without filesystem writes", () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-source-only-runtime-paths-"));
+    try {
+      const paths = resolveRuntimeBinaryPaths(runtimeRoot, "windows-x64");
+
+      expect(paths.server).toBe(
+        join(runtimeRoot, "bin", "windows-x64", "pushpals-runtime-server-windows-x64.exe"),
+      );
+      expect(paths.workerpals).toBe(
+        join(runtimeRoot, "bin", "windows-x64", "pushpals-runtime-workerpals-windows-x64.exe"),
+      );
+      expect(paths.sourceControlManager).toBe(
+        join(
+          runtimeRoot,
+          "bin",
+          "windows-x64",
+          "pushpals-runtime-source-control-manager-windows-x64.exe",
+        ),
+      );
+      expect(existsSync(join(runtimeRoot, "bin"))).toBe(false);
+    } finally {
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
   test("ensureRuntimeBinaries retries transient runtime binary download failures", async () => {
     const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-bin-retry-"));
     const originalFetch = globalThis.fetch;
@@ -3390,6 +3479,72 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     ).toBe(
       "[pushpals] Embedded source_control_manager process launch took 26670ms; startup is continuing. On Windows, first-run standalone binaries can be delayed while security software scans them.",
     );
+  });
+
+  test("every Windows embedded service uses an isolated source launcher with a deadline", () => {
+    const services = [
+      ["server", "server.js", []],
+      ["localbuddy", "localbuddy.js", []],
+      ["remotebuddy", "remotebuddy.js", ["--server", "http://127.0.0.1:3001"]],
+      ["source_control_manager", "scm.js", ["--skip-clean-check"]],
+    ] as const;
+
+    for (const [serviceName, sourceBundlePath, args] of services) {
+      const standalone = [`C:/runtime/${serviceName}.exe`, ...args];
+      const plan = buildEmbeddedRuntimeServiceLaunchPlan({
+        serviceName,
+        standaloneCommand: standalone,
+        sourceBundlePath: `C:/runtime/sandbox/${sourceBundlePath}`,
+        launchTrampolinePath: "C:/runtime/sandbox/trampoline.js",
+        bunExecutable: "C:/bun/bun.exe",
+        cwd: "C:/target-repo",
+        platform: "win32",
+        launchTimeoutMs: 12_345,
+        fileExists: () => true,
+      });
+
+      expect(plan.command).toEqual([
+        "C:/bun/bun.exe",
+        "C:/runtime/sandbox/trampoline.js",
+        "--",
+        "C:/bun/bun.exe",
+        `C:/runtime/sandbox/${sourceBundlePath}`,
+        ...args,
+      ]);
+      expect(plan.cwd).toBe("C:/target-repo");
+      expect(plan.launchReadyLine).toBe("[pushpals-launch-trampoline] child-started");
+      expect(plan.launchTimeoutMs).toBe(12_345);
+      expect(plan.command).not.toContain(standalone[0]);
+    }
+  });
+
+  test("Windows embedded startup fails safely when isolated-launch assets are incomplete", () => {
+    expect(() =>
+      buildEmbeddedRuntimeServiceLaunchPlan({
+        serviceName: "server",
+        standaloneCommand: ["C:/runtime/server.exe"],
+        sourceBundlePath: "C:/runtime/server.js",
+        launchTrampolinePath: "C:/runtime/trampoline.js",
+        bunExecutable: "C:/bun/bun.exe",
+        cwd: "C:/target-repo",
+        platform: "win32",
+        fileExists: (path) => !path.endsWith("trampoline.js"),
+      }),
+    ).toThrow("Direct standalone-runtime launch is disabled");
+  });
+
+  test("non-Windows embedded startup preserves standalone runtime commands", () => {
+    const plan = buildEmbeddedRuntimeServiceLaunchPlan({
+      serviceName: "server",
+      standaloneCommand: ["/runtime/server", "--flag"],
+      sourceBundlePath: "/missing/server.js",
+      launchTrampolinePath: "/missing/trampoline.js",
+      bunExecutable: "/missing/bun",
+      cwd: "/target-repo",
+      platform: "linux",
+      fileExists: () => false,
+    });
+    expect(plan).toEqual({ command: ["/runtime/server", "--flag"], cwd: "/target-repo" });
   });
 
   test("formatSessionEventLine suppresses status events from interactive output by default", () => {

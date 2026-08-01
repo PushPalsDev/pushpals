@@ -1,6 +1,6 @@
-import { resolve } from "path";
 import type { DockerBackendSpec } from "./types.js";
 import { createGenericPythonExecutor } from "../common/generic_python_executor.js";
+import { resolveWorkerpalsSourcePath } from "../common/runtime_paths.js";
 
 function normalizeContainerPython(configuredPython: string, sharedVenvPython: string): string {
   const configured = configuredPython.trim();
@@ -41,7 +41,7 @@ export const MINISWE_BACKEND: DockerBackendSpec = {
   warmupProbeCommand,
   taskExecute: createGenericPythonExecutor({
     backendName: "miniswe",
-    scriptPath: resolve(import.meta.dir, "miniswe", "miniswe_executor.py"),
+    scriptPath: resolveWorkerpalsSourcePath("backends", "miniswe", "miniswe_executor.py"),
     scriptSegments: ["apps", "workerpals", "src", "backends", "miniswe", "miniswe_executor.py"],
     pythonConfigKey: "miniswePython",
     timeoutConfigKey: "minisweTimeoutMs",

@@ -7,7 +7,6 @@
  */
 
 import { existsSync } from "fs";
-import { resolve } from "path";
 import type { JobResult, JobTokenUsage } from "../common/types.js";
 import type { WorkerpalsRuntimeConfig } from "../common/executor_backend.js";
 import {
@@ -22,10 +21,15 @@ import {
   type PythonPayloadTransport,
 } from "../common/python_payload_transport.js";
 import { computeTimeoutWarningWindow } from "../timeout_policy.js";
+import { resolveWorkerpalsSourcePath } from "../common/runtime_paths.js";
 
 // ---- Script path (resolved relative to this file) ----------------------------
 
-const OPENHANDS_SCRIPT_PATH = resolve(import.meta.dir, "openhands", "openhands_executor.py");
+const OPENHANDS_SCRIPT_PATH = resolveWorkerpalsSourcePath(
+  "backends",
+  "openhands",
+  "openhands_executor.py",
+);
 
 // ---- OpenHands-specific helpers ----------------------------------------------
 

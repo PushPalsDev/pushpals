@@ -148,7 +148,8 @@ Notes:
 
 - `pushpals` hard-fails if current directory is not a git repo.
 - If LocalBuddy is down, `pushpals` auto-starts embedded `server + localbuddy + remotebuddy + source_control_manager`.
-- Auto-start does not clone this repository; it downloads release-tagged runtime binaries and runtime assets into `~/.pushpals/runtime`.
+- Auto-start does not clone this repository; it installs packaged runtime assets into `~/.pushpals/runtime` and downloads release-tagged standalone service binaries only on non-Windows platforms.
+- On Windows, the npm CLI skips the unused standalone binary downloads and starts each embedded service and auto-spawned WorkerPal from a packaged source bundle through an isolated launcher with a bounded startup deadline. A blocked child launch is terminated and retried without freezing the CLI or the other services.
 - Override runtime tag when needed via `pushpals --runtime-tag vX.Y.Z`.
 - Open the active local runtime config with `pushpals --open_config` or `pushpals --open-config`.
 - `pushpals` validates LocalBuddy is attached to the same repo root.

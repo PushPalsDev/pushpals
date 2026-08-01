@@ -212,7 +212,12 @@ type WorkerpalSandboxPaths = {
   dockerfilePath: string;
   packageJsonPath: string;
   workerpalsDir: string;
+  serverBundlePath: string;
+  localbuddyBundlePath: string;
   remotebuddyFallbackBundlePath: string;
+  workerpalsBundlePath: string;
+  sourceControlManagerBundlePath: string;
+  runtimeLaunchTrampolinePath: string;
   sharedDir: string;
   protocolDir: string;
   configsDir: string;
@@ -308,6 +313,10 @@ const RUNTIME_BINARY_DOWNLOAD_ATTEMPTS = 3;
 const DEFAULT_STARTUP_GIT_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_STARTUP_GIT_REMOTE_TIMEOUT_MS = 10_000;
 const DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS = 5_000;
+const DEFAULT_WINDOWS_RUNTIME_SERVICE_LAUNCH_TIMEOUT_MS = 15_000;
+const WINDOWS_RUNTIME_SERVICE_LAUNCH_TIMEOUT_MS_ENV =
+  "PUSHPALS_WINDOWS_RUNTIME_SERVICE_LAUNCH_TIMEOUT_MS";
+export const RUNTIME_LAUNCH_TRAMPOLINE_READY_LINE = "[pushpals-launch-trampoline] child-started";
 const DEFAULT_EMBEDDED_SERVICE_SUPERVISOR_POLL_MS = 1_000;
 const EMBEDDED_SERVICE_RESTART_MAX_ATTEMPTS = 4;
 const EMBEDDED_SERVICE_RESTART_STABLE_WINDOW_MS = 60_000;
@@ -420,6 +429,62 @@ export function formatEmbeddedServiceLaunchDelayWarning(input: {
     `[pushpals] Embedded ${serviceName} process launch took ${durationMs}ms; startup is continuing.` +
     windowsHint
   );
+}
+
+export type EmbeddedRuntimeServiceLaunchPlan = {
+  command: string[];
+  cwd: string;
+  launchReadyLine?: string;
+  launchTimeoutMs?: number;
+};
+
+export function buildEmbeddedRuntimeServiceLaunchPlan(input: {
+  serviceName: RuntimeServiceName;
+  standaloneCommand: string[];
+  sourceBundlePath: string;
+  launchTrampolinePath: string;
+  bunExecutable: string;
+  cwd: string;
+  platform?: NodeJS.Platform | string;
+  launchTimeoutMs?: number;
+  fileExists?: (path: string) => boolean;
+}): EmbeddedRuntimeServiceLaunchPlan {
+  const platform = String(input.platform ?? process.platform);
+  if (platform !== "win32") {
+    return {
+      command: [...input.standaloneCommand],
+      cwd: input.cwd,
+    };
+  }
+
+  const bunExecutable = String(input.bunExecutable ?? "").trim();
+  const sourceBundlePath = String(input.sourceBundlePath ?? "").trim();
+  const launchTrampolinePath = String(input.launchTrampolinePath ?? "").trim();
+  const fileExists = input.fileExists ?? existsSync;
+  const missing: string[] = [];
+  if (!bunExecutable || !fileExists(bunExecutable)) missing.push("Bun executable");
+  if (!sourceBundlePath || !fileExists(sourceBundlePath)) missing.push("source bundle");
+  if (!launchTrampolinePath || !fileExists(launchTrampolinePath)) {
+    missing.push("launch trampoline");
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Cannot safely start embedded ${input.serviceName} on Windows: missing ${missing.join(
+        ", ",
+      )}. Direct standalone-runtime launch is disabled because it can block the CLI process.`,
+    );
+  }
+
+  const childCommand = [bunExecutable, sourceBundlePath, ...input.standaloneCommand.slice(1)];
+  return {
+    command: [bunExecutable, launchTrampolinePath, "--", ...childCommand],
+    cwd: input.cwd,
+    launchReadyLine: RUNTIME_LAUNCH_TRAMPOLINE_READY_LINE,
+    launchTimeoutMs: Math.max(
+      1_000,
+      Math.floor(input.launchTimeoutMs ?? DEFAULT_WINDOWS_RUNTIME_SERVICE_LAUNCH_TIMEOUT_MS),
+    ),
+  };
 }
 
 export function describeWorkerExecutionReadiness(opts: {
@@ -1186,7 +1251,12 @@ export function buildWorkerpalSandboxPaths(runtimeRoot: string): WorkerpalSandbo
     dockerfilePath: join(root, "apps", "workerpals", "Dockerfile.sandbox"),
     packageJsonPath: join(root, "package.json"),
     workerpalsDir: join(root, "apps", "workerpals"),
+    serverBundlePath: join(root, ".pushpals-server-runtime.js"),
+    localbuddyBundlePath: join(root, ".pushpals-localbuddy-runtime.js"),
     remotebuddyFallbackBundlePath: join(root, ".pushpals-remotebuddy-fallback.js"),
+    workerpalsBundlePath: join(root, ".pushpals-workerpals-runtime.js"),
+    sourceControlManagerBundlePath: join(root, ".pushpals-source-control-manager-runtime.js"),
+    runtimeLaunchTrampolinePath: join(root, ".pushpals-runtime-launch-trampoline.js"),
     sharedDir: join(root, "packages", "shared"),
     protocolDir: join(root, "packages", "protocol"),
     configsDir: join(root, "configs"),
@@ -2493,6 +2563,23 @@ async function runWithConcurrency<T>(
   );
 }
 
+export function resolveRuntimeBinaryPaths(
+  runtimeRoot: string,
+  platformKey = resolveRuntimePlatformKey(),
+): RuntimeBinarySet {
+  const binDir = join(runtimeRoot, "bin", platformKey);
+  return {
+    server: join(binDir, runtimeBinaryFilename("server", platformKey)),
+    localbuddy: join(binDir, runtimeBinaryFilename("localbuddy", platformKey)),
+    remotebuddy: join(binDir, runtimeBinaryFilename("remotebuddy", platformKey)),
+    workerpals: join(binDir, runtimeBinaryFilename("workerpals", platformKey)),
+    sourceControlManager: join(
+      binDir,
+      runtimeBinaryFilename("source_control_manager", platformKey),
+    ),
+  };
+}
+
 export async function ensureRuntimeBinaries(
   runtimeRoot: string,
   runtimeTag: string,
@@ -2505,17 +2592,7 @@ export async function ensureRuntimeBinaries(
   const { binDir, tagMarkerPath, installedTag } = installState;
   mkdirSync(binDir, { recursive: true });
 
-  const runtimeBinaries: RuntimeBinarySet = {
-    server: join(binDir, runtimeBinaryFilename("server", platformKey)),
-    localbuddy: join(binDir, runtimeBinaryFilename("localbuddy", platformKey)),
-    remotebuddy: join(binDir, runtimeBinaryFilename("remotebuddy", platformKey)),
-    workerpals: join(binDir, runtimeBinaryFilename("workerpals", platformKey)),
-    sourceControlManager: join(
-      binDir,
-      runtimeBinaryFilename("source_control_manager", platformKey),
-    ),
-  };
-
+  const runtimeBinaries = resolveRuntimeBinaryPaths(runtimeRoot, platformKey);
   const requiredAssets = [
     runtimeBinaries.server,
     runtimeBinaries.localbuddy,
@@ -2575,79 +2652,28 @@ function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
   for (const service of services) {
     try {
       service.stopOutputPipes?.();
-      const stopCommand = buildServiceStopCommand(service.proc.pid, process.platform);
-      if (stopCommand) {
-        Bun.spawnSync(stopCommand, {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
-          killSignal: "SIGKILL",
-        });
-      } else {
-        service.proc.kill("SIGKILL");
-      }
+      service.proc.kill("SIGTERM");
     } catch {
       // ignore
     }
   }
 }
 
-async function runWindowsServiceStopCommand(
-  command: string[],
-  timeoutMs: number,
-): Promise<boolean> {
-  const proc = Bun.spawn(command, {
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  let timeout: ReturnType<typeof setTimeout> | null = null;
-  let timedOut = false;
-  const exitCode = await Promise.race([
-    proc.exited,
-    new Promise<number>((resolveTimeout) => {
-      timeout = setTimeout(
-        () => {
-          timedOut = true;
-          try {
-            proc.kill("SIGKILL");
-          } catch {
-            // best-effort timeout cleanup only
-          }
-          resolveTimeout(-1);
-        },
-        Math.max(250, timeoutMs),
-      );
-    }),
-  ]);
-  if (timeout) {
-    clearTimeout(timeout);
-    timeout = null;
-  }
-  if (timedOut) {
-    await Promise.race([proc.exited.catch(() => -1), Bun.sleep(250)]);
-    return false;
-  }
-  return exitCode === 0;
-}
-
 async function stopRuntimeServicesOnWindows(
   services: RuntimeServiceProcess[],
   timeoutMs: number,
 ): Promise<void> {
-  const deadline = Date.now() + Math.max(1_000, timeoutMs);
   for (const service of services) {
     service.stopOutputPipes?.();
-    const stopCommand = buildServiceStopCommand(service.proc.pid, "win32");
-    if (stopCommand) {
-      const remainingMs = Math.max(250, deadline - Date.now());
-      const stopped = await runWindowsServiceStopCommand(
-        stopCommand,
-        Math.min(WINDOWS_TASKKILL_TIMEOUT_MS, remainingMs),
-      );
-      if (stopped) continue;
+    try {
+      service.proc.kill("SIGTERM");
+    } catch {
+      // ignore best-effort shutdown failures
     }
+  }
+  await waitForRuntimeServicesExit(services, Math.max(500, timeoutMs - 1_000));
+  for (const service of services) {
+    if (service.exited) continue;
     try {
       service.proc.kill("SIGKILL");
     } catch {
@@ -2788,11 +2814,12 @@ function prependExecutableDirToPath(
     return env;
   }
 
-  const executableDir = dirname(resolvedPath);
+  const pathApi = platform === "win32" ? pathWin32 : { dirname, basename, delimiter };
+  const executableDir = pathApi.dirname(resolvedPath);
   const existingPath =
     platform === "win32" ? String(env.Path ?? env.PATH ?? "") : String(env.PATH ?? "");
   const pathEntries = existingPath
-    .split(delimiter)
+    .split(pathApi.delimiter)
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
   const hasDir = pathEntries.some((entry) =>
@@ -2800,7 +2827,7 @@ function prependExecutableDirToPath(
       ? entry.toLowerCase() === executableDir.toLowerCase()
       : entry === executableDir,
   );
-  const nextPath = hasDir ? existingPath : [executableDir, ...pathEntries].join(delimiter);
+  const nextPath = hasDir ? existingPath : [executableDir, ...pathEntries].join(pathApi.delimiter);
 
   if (platform === "win32") {
     env.Path = nextPath;
@@ -2819,7 +2846,8 @@ export function applyResolvedGitBinaryToRuntimeEnv(
   const resolvedPath = String(resolvedGitBinary ?? "").trim();
   if (!resolvedPath) return env;
   prependExecutableDirToPath(env, resolvedPath, platform);
-  env.PUSHPALS_GIT_BIN = basename(resolvedPath);
+  env.PUSHPALS_GIT_BIN =
+    platform === "win32" ? pathWin32.basename(resolvedPath) : basename(resolvedPath);
   if (resolvedPath.includes("/") || resolvedPath.includes("\\")) {
     env.PUSHPALS_GIT_BIN_ABSOLUTE = resolvedPath;
   } else {
@@ -2836,7 +2864,8 @@ export function applyResolvedDockerBinaryToRuntimeEnv(
   const resolvedPath = String(resolvedDockerBinary ?? "").trim();
   if (!resolvedPath) return env;
   prependExecutableDirToPath(env, resolvedPath, platform);
-  env.PUSHPALS_DOCKER_BIN = basename(resolvedPath);
+  env.PUSHPALS_DOCKER_BIN =
+    platform === "win32" ? pathWin32.basename(resolvedPath) : basename(resolvedPath);
   if (resolvedPath.includes("/") || resolvedPath.includes("\\")) {
     env.PUSHPALS_DOCKER_BIN_ABSOLUTE = resolvedPath;
   } else {
@@ -3491,6 +3520,7 @@ export function isDockerUnavailableDetail(detail: string): boolean {
     /failed to connect to the docker api/i.test(text) ||
     /docker_engine/i.test(text) ||
     /is the docker daemon running/i.test(text) ||
+    /executable not found[^\r\n]*["']?docker(?:\.exe)?/i.test(text) ||
     /docker(?:\.exe)?: command not found/i.test(text) ||
     /spawn\s+docker(?:\.exe)?\s+ENOENT/i.test(text) ||
     /docker(?:\.exe)?'?\s+is not recognized as an internal or external command/i.test(text)
@@ -5179,7 +5209,11 @@ async function autoStartRuntimeServices(opts: {
   }
 
   await ensureRuntimeAssets(runtimeRoot, runtimeTag);
-  const runtimeBinaries = await ensureRuntimeBinaries(runtimeRoot, runtimeTag);
+  const runtimeBinaries =
+    process.platform === "win32"
+      ? resolveRuntimeBinaryPaths(runtimeRoot)
+      : await ensureRuntimeBinaries(runtimeRoot, runtimeTag);
+  const sandboxPaths = buildWorkerpalSandboxPaths(runtimeRoot);
 
   const runtimeEnv = buildEmbeddedRuntimeEnv(
     (opts.baseEnv ?? (process.env as Record<string, string | undefined>)) as Record<
@@ -5194,20 +5228,34 @@ async function autoStartRuntimeServices(opts: {
       runtimeTag,
     },
   );
-  runtimeEnv.PUSHPALS_WORKERPALS_BIN = runtimeBinaries.workerpals;
-  if (
-    runtimeBinaries.freshlyInstalled &&
-    process.platform === "win32" &&
-    runtimePreflight.config.remotebuddy.autoSpawnWorkerpals &&
-    !runtimeEnv.PUSHPALS_REMOTEBUDDY_WORKERPAL_PREWARM_DELAY_MS
-  ) {
-    const delayMs = resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs(runtimeEnv, process.platform);
-    if (delayMs > 0) {
-      runtimeEnv.PUSHPALS_REMOTEBUDDY_WORKERPAL_PREWARM_DELAY_MS = String(delayMs);
-      console.log(
-        `[pushpals] Fresh Windows runtime binaries detected; delaying WorkerPal prewarm by ${delayMs}ms so security software can finish first-run binary checks. Set ${WINDOWS_FRESH_RUNTIME_WORKERPAL_PREWARM_DELAY_MS_ENV}=0 to disable.`,
-      );
-    }
+  const embeddedBunExecutable = resolveEmbeddedBunExecutableFromEnv(
+    runtimeEnv,
+    process.platform,
+    process.execPath,
+  );
+  const windowsRuntimeLaunchTimeoutMs = clampPositiveInt(
+    parsePositiveInt(
+      runtimeEnv[WINDOWS_RUNTIME_SERVICE_LAUNCH_TIMEOUT_MS_ENV],
+      DEFAULT_WINDOWS_RUNTIME_SERVICE_LAUNCH_TIMEOUT_MS,
+    ),
+    1_000,
+    60_000,
+  );
+  if (process.platform === "win32") {
+    delete runtimeEnv.PUSHPALS_WORKERPALS_BIN;
+    runtimeEnv.PUSHPALS_WORKERPALS_SOURCE_BUNDLE = sandboxPaths.workerpalsBundlePath;
+    runtimeEnv.PUSHPALS_WORKERPALS_SOURCE_ROOT = join(sandboxPaths.workerpalsDir, "src");
+    runtimeEnv.PUSHPALS_RUNTIME_LAUNCH_TRAMPOLINE = sandboxPaths.runtimeLaunchTrampolinePath;
+    runtimeEnv.PUSHPALS_RUNTIME_LAUNCH_TIMEOUT_MS = String(windowsRuntimeLaunchTimeoutMs);
+    if (embeddedBunExecutable) runtimeEnv.PUSHPALS_BUN_BIN = embeddedBunExecutable;
+    console.log(
+      "[pushpals] Windows safety mode: embedded services and WorkerPals will use isolated source-bundle launchers with bounded startup deadlines.",
+    );
+    console.log(
+      "[pushpals] Windows safety mode: unused standalone runtime binary downloads are skipped.",
+    );
+  } else {
+    runtimeEnv.PUSHPALS_WORKERPALS_BIN = runtimeBinaries.workerpals;
   }
   const preconfiguredRuntimeGitBinary =
     runtimeEnv.PUSHPALS_GIT_BIN_ABSOLUTE ?? runtimeEnv.PUSHPALS_GIT_BIN;
@@ -5350,9 +5398,25 @@ async function autoStartRuntimeServices(opts: {
       appendLog?: boolean;
     } = {},
   ): ManagedServiceSpec => {
-    const cwd = launchOpts.cwd ?? opts.repoRoot;
+    const sourceBundleByService: Record<RuntimeServiceName, string> = {
+      server: sandboxPaths.serverBundlePath,
+      localbuddy: sandboxPaths.localbuddyBundlePath,
+      remotebuddy: sandboxPaths.remotebuddyFallbackBundlePath,
+      source_control_manager: sandboxPaths.sourceControlManagerBundlePath,
+    };
+    const launchPlan = buildEmbeddedRuntimeServiceLaunchPlan({
+      serviceName: name,
+      standaloneCommand: command,
+      sourceBundlePath: sourceBundleByService[name],
+      launchTrampolinePath: sandboxPaths.runtimeLaunchTrampolinePath,
+      bunExecutable: embeddedBunExecutable,
+      cwd: launchOpts.cwd ?? opts.repoRoot,
+      platform: process.platform,
+      launchTimeoutMs: windowsRuntimeLaunchTimeoutMs,
+    });
+    const cwd = launchPlan.cwd;
     const logPath = serviceLogPaths[name];
-    const header = `[pushpals] service=${name} command=${command.join(" ")} cwd=${cwd}`;
+    const header = `[pushpals] service=${name} command=${launchPlan.command.join(" ")} cwd=${cwd}`;
     if (launchOpts.appendLog && existsSync(logPath)) {
       appendFileSync(logPath, `${header}\n`, "utf8");
     } else {
@@ -5362,10 +5426,19 @@ async function autoStartRuntimeServices(opts: {
     return {
       name,
       color: "",
-      command,
+      command: launchPlan.command,
       cwd,
       env: runtimeEnv,
       logPath,
+      launchReadyLine: launchPlan.launchReadyLine,
+      launchTimeoutMs: launchPlan.launchTimeoutMs,
+      onLaunchTimeout: (timeoutMs) => {
+        const warning =
+          `[pushpals] Embedded ${name} isolated launcher did not confirm child startup within ${timeoutMs}ms; ` +
+          "terminating only that launcher and retrying without blocking the other services.";
+        console.warn(warning);
+        appendRuntimeServicesLogLine(runtimeServicesLogPath, warning);
+      },
       onStdoutLine: (line) => {
         const serviceLine = `[stdout] ${line}`;
         appendFileSync(logPath, `${serviceLine}\n`, "utf8");
@@ -5415,93 +5488,6 @@ async function autoStartRuntimeServices(opts: {
     }
     return service;
   };
-  const replaceService = (
-    name: RuntimeServiceName,
-    command: string[],
-    launchOpts?: {
-      cwd?: string;
-      appendLog?: boolean;
-    },
-  ): RuntimeServiceProcess => {
-    const launchStartedAt = Date.now();
-    const service = serviceManager.replaceService(
-      buildManagedServiceSpec(name, command, launchOpts),
-    );
-    latestServiceLaunchAtMs = Math.max(latestServiceLaunchAtMs, launchStartedAt);
-    const launchDurationMs = Date.now() - launchStartedAt;
-    if (launchDurationMs >= DEFAULT_EMBEDDED_SERVICE_LAUNCH_WARN_MS) {
-      const warning = formatEmbeddedServiceLaunchDelayWarning({
-        serviceName: name,
-        durationMs: launchDurationMs,
-        platform: process.platform,
-      });
-      console.warn(warning);
-      appendRuntimeServicesLogLine(runtimeServicesLogPath, warning);
-    }
-    return service;
-  };
-  const sandboxPaths = buildWorkerpalSandboxPaths(runtimeRoot);
-  const remoteBuddyFallbackBun =
-    process.platform === "win32"
-      ? resolveEmbeddedBunExecutableFromEnv(runtimeEnv, process.platform, process.execPath)
-      : "";
-  const remoteBuddySourceFallback =
-    process.platform === "win32" &&
-    remoteBuddyFallbackBun &&
-    existsSync(sandboxPaths.remotebuddyFallbackBundlePath)
-      ? {
-          cwd: sandboxPaths.root,
-          bunBin: remoteBuddyFallbackBun,
-          bundlePath: sandboxPaths.remotebuddyFallbackBundlePath,
-        }
-      : null;
-  let remoteBuddyFallbackActivated = false;
-  const maybeActivateRemoteBuddyWindowsFallback = (
-    reason: "crash" | "silent_startup" = "crash",
-  ): boolean => {
-    if (remoteBuddyFallbackActivated || !remoteBuddySourceFallback) return false;
-    const tail = readLogTail(serviceLogPaths.remotebuddy, 120);
-    if (reason === "crash" && !hasStandaloneBunCrashSignature(tail)) return false;
-    if (
-      reason === "silent_startup" &&
-      !shouldUseRemoteBuddySilentStartupFallback({
-        logText: tail,
-        elapsedMs: Date.now() - remoteBuddyPhaseStartedAt,
-        platform: process.platform,
-        fallbackAvailable: Boolean(remoteBuddySourceFallback),
-      })
-    ) {
-      return false;
-    }
-    remoteBuddyFallbackActivated = true;
-    lastReportedRemoteBuddyAutonomyState = "unknown";
-    const fallbackReason =
-      reason === "silent_startup" ? "produced no startup output on Windows" : "crashed on Windows";
-    console.warn(
-      `[pushpals] Embedded RemoteBuddy standalone binary ${fallbackReason}; retrying with source fallback under bun.`,
-    );
-    appendRuntimeServicesLogLine(
-      runtimeServicesLogPath,
-      `[pushpals] embedded remotebuddy standalone binary ${fallbackReason}; retrying with source fallback under bun.`,
-    );
-    replaceService(
-      "remotebuddy",
-      [
-        remoteBuddySourceFallback.bunBin,
-        remoteBuddySourceFallback.bundlePath,
-        "--server",
-        opts.serverUrl,
-        "--sessionId",
-        opts.sessionId,
-      ],
-      {
-        cwd: remoteBuddySourceFallback.cwd,
-        appendLog: true,
-      },
-    );
-    return true;
-  };
-
   const serverHealthy = await probeServer(opts.serverUrl);
   if (!serverHealthy) {
     const serverPhaseStartedAt = Date.now();
@@ -5577,7 +5563,13 @@ async function autoStartRuntimeServices(opts: {
 
   const remoteBuddyPhaseStartedAt = Date.now();
   console.log("[pushpals] Starting embedded RemoteBuddy...");
-  const remotebuddyService = await launchService("remotebuddy", [runtimeBinaries.remotebuddy]);
+  const remotebuddyService = await launchService("remotebuddy", [
+    runtimeBinaries.remotebuddy,
+    "--server",
+    opts.serverUrl,
+    "--sessionId",
+    opts.sessionId,
+  ]);
   const remotebuddyLogPath = remotebuddyService.logPath ?? serviceLogPaths.remotebuddy;
   console.log(`[pushpals] remotebuddy log: ${remotebuddyLogPath}`);
   recordStartupPhase("remotebuddy", remoteBuddyPhaseStartedAt, "started");
@@ -5711,16 +5703,8 @@ async function autoStartRuntimeServices(opts: {
   let deferredRemoteBuddyConsumerLogged = false;
   while (Date.now() < deadline) {
     reportRemoteBuddyAutonomousEngineState();
-    if (maybeActivateRemoteBuddyWindowsFallback("silent_startup")) {
-      await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
-      continue;
-    }
     for (const service of serviceManager.getServices()) {
       if (service.exited) {
-        if (service.name === "remotebuddy" && maybeActivateRemoteBuddyWindowsFallback()) {
-          await Bun.sleep(DEFAULT_RUNTIME_BOOT_POLL_MS);
-          continue;
-        }
         if (isOptionalEmbeddedService(service.name)) {
           const runtimeServiceName = service.name as RuntimeServiceName;
           const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];
@@ -5814,10 +5798,6 @@ async function autoStartRuntimeServices(opts: {
         reportRemoteBuddyAutonomousEngineState();
         for (const service of serviceManager.getServices()) {
           if (!service.exited) continue;
-          if (service.name === "remotebuddy" && maybeActivateRemoteBuddyWindowsFallback()) {
-            await Bun.sleep(250);
-            continue;
-          }
           if (isOptionalEmbeddedService(service.name)) {
             const runtimeServiceName = service.name as RuntimeServiceName;
             const serviceLogPath = service.logPath ?? serviceLogPaths[runtimeServiceName];

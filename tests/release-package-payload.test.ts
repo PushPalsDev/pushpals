@@ -10,13 +10,24 @@ import {
 
 const repoRoot = resolve(import.meta.dir, "..");
 const verifierScript = join(repoRoot, "scripts", "verify-cli-package-payload.ts");
+const windowsSourceRuntimeAssets = [
+  ".pushpals-server-runtime.js",
+  ".pushpals-localbuddy-runtime.js",
+  ".pushpals-remotebuddy-fallback.js",
+  ".pushpals-workerpals-runtime.js",
+  ".pushpals-source-control-manager-runtime.js",
+  ".pushpals-runtime-launch-trampoline.js",
+];
+const requiredRuntimePayloadEntries = windowsSourceRuntimeAssets.map((asset) => ({
+  path: `runtime/sandbox/${asset}`,
+}));
 
 function withTempPackage<T>(fn: (packageDir: string) => T): T {
   const packageDir = mkdtempSync(join(tmpdir(), "pushpals-package-payload-test-"));
   try {
     mkdirSync(join(packageDir, "bin"), { recursive: true });
     mkdirSync(join(packageDir, "dist"), { recursive: true });
-    mkdirSync(join(packageDir, "runtime"), { recursive: true });
+    mkdirSync(join(packageDir, "runtime", "sandbox"), { recursive: true });
     writeFileSync(
       join(packageDir, "package.json"),
       `${JSON.stringify(
@@ -36,6 +47,9 @@ function withTempPackage<T>(fn: (packageDir: string) => T): T {
     writeFileSync(join(packageDir, "README.md"), "# fixture\n", "utf8");
     writeFileSync(join(packageDir, "bin", "pushpals.cjs"), "console.log('fixture');\n", "utf8");
     writeFileSync(join(packageDir, "dist", "pushpals-cli.js"), "export {};\n", "utf8");
+    for (const asset of windowsSourceRuntimeAssets) {
+      writeFileSync(join(packageDir, "runtime", "sandbox", asset), "export {};\n", "utf8");
+    }
     return fn(packageDir);
   } finally {
     rmSync(packageDir, { recursive: true, force: true });
@@ -57,10 +71,15 @@ describe("release package payload verification", () => {
       { path: "bin/pushpals.cjs", mode: 0o755 },
       { path: "dist/pushpals-cli.js", mode: 0o755 },
       { path: "runtime/configs/default.toml" },
-      { path: "runtime/sandbox/.pushpals-remotebuddy-fallback.js", mode: 0o755 },
+      ...windowsSourceRuntimeAssets.map((asset) => ({
+        path: `runtime/sandbox/${asset}`,
+        mode: 0o755,
+      })),
       { path: "runtime/sandbox/bun.lock" },
       { path: "runtime/sandbox/apps/workerpals/uv.lock" },
-      { path: "monitor-ui/assets/__node_modules/@expo/vector-icons/build/vendor/react-native-vector-icons/Fonts/Ionicons.ttf" },
+      {
+        path: "monitor-ui/assets/__node_modules/@expo/vector-icons/build/vendor/react-native-vector-icons/Fonts/Ionicons.ttf",
+      },
     ]);
 
     expect(issues).toEqual([]);
@@ -70,6 +89,7 @@ describe("release package payload verification", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "bin/pushpals.cjs" },
       { path: "dist/pushpals-cli.js" },
+      ...requiredRuntimePayloadEntries,
       { path: "runtime/bin/bun.exe" },
       { path: "runtime/bin/node" },
       { path: "runtime/bin/git.cmd" },
@@ -102,6 +122,9 @@ describe("release package payload verification", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "bin\\pushpals.cjs" },
       { path: "dist\\pushpals-cli.js" },
+      ...windowsSourceRuntimeAssets.map((asset) => ({
+        path: `runtime\\sandbox\\${asset}`,
+      })),
       { path: "runtime\\bin\\bun.exe" },
       { path: "runtime\\sandbox\\node_modules\\package\\index.js" },
     ]);
@@ -115,16 +138,14 @@ describe("release package payload verification", () => {
   test("rejects package payloads missing required CLI entry files", () => {
     const issues = findDisallowedCliPackageEntries([{ path: "README.md" }]);
 
-    expect(issues).toEqual([
-      {
-        path: "bin/pushpals.cjs",
-        reason: "required CLI package entry is missing",
-      },
-      {
-        path: "dist/pushpals-cli.js",
-        reason: "required CLI package entry is missing",
-      },
+    expect(issues.map((issue) => issue.path)).toEqual([
+      "bin/pushpals.cjs",
+      "dist/pushpals-cli.js",
+      ...windowsSourceRuntimeAssets.map((asset) => `runtime/sandbox/${asset}`),
     ]);
+    expect(issues.every((issue) => issue.reason === "required CLI package entry is missing")).toBe(
+      true,
+    );
   });
 
   test("release artifact guard allows only PushPals release assets", () => {
@@ -175,7 +196,10 @@ describe("release package payload verification", () => {
   });
 
   test("release workflow verifies package payload before npm publish and artifacts before upload", () => {
-    const workflow = readFileSync(join(repoRoot, ".github", "workflows", "release-cli.yml"), "utf8");
+    const workflow = readFileSync(
+      join(repoRoot, ".github", "workflows", "release-cli.yml"),
+      "utf8",
+    );
 
     const buildPackageIndex = workflow.indexOf("Build CLI package payload");
     const verifyPackageIndex = workflow.indexOf(

@@ -1,6 +1,6 @@
-import { resolve } from "path";
 import type { DockerBackendSpec } from "./types.js";
 import { createGenericPythonExecutor } from "../common/generic_python_executor.js";
+import { resolveWorkerpalsSourcePath } from "../common/runtime_paths.js";
 
 function normalizeContainerPython(configuredPython: string, sharedVenvPython: string): string {
   const configured = configuredPython.trim();
@@ -60,8 +60,15 @@ export const OPENAI_CODEX_BACKEND: DockerBackendSpec = {
   warmupProbeCommand,
   taskExecute: createGenericPythonExecutor({
     backendName: "openai_codex",
-    scriptPath: resolve(import.meta.dir, "openai_codex", "openai_codex_executor.py"),
-    scriptSegments: ["apps", "workerpals", "src", "backends", "openai_codex", "openai_codex_executor.py"],
+    scriptPath: resolveWorkerpalsSourcePath("backends", "openai_codex", "openai_codex_executor.py"),
+    scriptSegments: [
+      "apps",
+      "workerpals",
+      "src",
+      "backends",
+      "openai_codex",
+      "openai_codex_executor.py",
+    ],
     pythonConfigKey: "openaiCodexPython",
     timeoutConfigKey: "openaiCodexTimeoutMs",
   }),

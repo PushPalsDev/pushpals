@@ -15,25 +15,31 @@ export type PackagePayloadIssue = {
   reason: string;
 };
 
-const REQUIRED_CLI_PACKAGE_PATHS = new Set(["bin/pushpals.cjs", "dist/pushpals-cli.js"]);
+const WINDOWS_SOURCE_RUNTIME_ASSET_PATHS = [
+  "runtime/sandbox/.pushpals-server-runtime.js",
+  "runtime/sandbox/.pushpals-localbuddy-runtime.js",
+  "runtime/sandbox/.pushpals-remotebuddy-fallback.js",
+  "runtime/sandbox/.pushpals-workerpals-runtime.js",
+  "runtime/sandbox/.pushpals-source-control-manager-runtime.js",
+  "runtime/sandbox/.pushpals-runtime-launch-trampoline.js",
+] as const;
+const REQUIRED_CLI_PACKAGE_PATHS = new Set([
+  "bin/pushpals.cjs",
+  "dist/pushpals-cli.js",
+  ...WINDOWS_SOURCE_RUNTIME_ASSET_PATHS,
+]);
 const ALLOWED_EXECUTABLE_PACKAGE_PATHS = new Set([
   "bin/pushpals.cjs",
   "dist/pushpals-cli.js",
-  "runtime/sandbox/.pushpals-remotebuddy-fallback.js",
+  ...WINDOWS_SOURCE_RUNTIME_ASSET_PATHS,
 ]);
 
-const DISALLOWED_DIRECTORY_SEGMENTS = new Set([
-  ".bun",
-  ".venv",
-  "node_modules",
-  "venv",
-]);
+const DISALLOWED_DIRECTORY_SEGMENTS = new Set([".bun", ".venv", "node_modules", "venv"]);
 
 const EXTERNAL_TOOL_NAME_PATTERN =
   /^(bun|bunx|node|npm|npx|pnpm|yarn|git|docker|codex|uv|python|python3|pip|pip3)(\.(exe|cmd|bat|ps1|sh))?$/i;
 
-const EXECUTABLE_OR_NATIVE_LIBRARY_PATTERN =
-  /\.(exe|dll|dylib|node|pyd|jar)$|\.so(\.\d+)*$/i;
+const EXECUTABLE_OR_NATIVE_LIBRARY_PATTERN = /\.(exe|dll|dylib|node|pyd|jar)$|\.so(\.\d+)*$/i;
 
 const RELEASE_ARTIFACT_ALLOW_PATTERN =
   /^(pushpals-(linux-x64|windows-x64\.exe|macos-x64|macos-arm64)|pushpals-runtime-(server|localbuddy|remotebuddy|workerpals|source-control-manager)-(linux-x64|windows-x64\.exe|macos-x64|macos-arm64)|SHA256SUMS\.txt)(\.asc)?$/;

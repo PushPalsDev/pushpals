@@ -30,7 +30,7 @@ type BuildArtifacts = {
   dockerImage: string;
 };
 
-let buildArtifactsPromise: Promise<BuildArtifacts> | null = null;
+const buildArtifactsPromises = new Map<string, Promise<BuildArtifacts>>();
 let cliPackageTarballPromise: Promise<string> | null = null;
 const sharedDockerImageTag = `pushpals-worker-sandbox:cli-e2e-shared-${Date.now()}`;
 let sharedDockerImageBuilt = false;
@@ -105,10 +105,14 @@ function runtimeBinaryFilename(
   return `pushpals-runtime-${token}-${platformKey}${extension}`;
 }
 
-async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
-  if (buildArtifactsPromise) return await buildArtifactsPromise;
-  buildArtifactsPromise = (async () => {
-    runChecked(["docker", "version", "--format", "{{.Server.Version}}"], repoRoot);
+async function ensureBuildArtifacts(
+  options: { buildDockerImage?: boolean } = {},
+): Promise<BuildArtifacts> {
+  const buildDockerImage = options.buildDockerImage ?? true;
+  const cacheKey = buildDockerImage ? "docker" : "host-only";
+  const existing = buildArtifactsPromises.get(cacheKey);
+  if (existing) return await existing;
+  const buildPromise = (async () => {
     runChecked(
       [process.execPath, "run", "cli:bundle"],
       repoRoot,
@@ -119,15 +123,26 @@ async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
       repoRoot,
       process.env as Record<string, string>,
     );
-    runChecked(
-      ["docker", "build", "-f", "apps/workerpals/Dockerfile.sandbox", "-t", sharedDockerImageTag, "."],
-      repoRoot,
-      process.env as Record<string, string>,
-    );
-    sharedDockerImageBuilt = true;
+    if (buildDockerImage) {
+      runChecked(["docker", "version", "--format", "{{.Server.Version}}"], repoRoot);
+      runChecked(
+        [
+          "docker",
+          "build",
+          "-f",
+          "apps/workerpals/Dockerfile.sandbox",
+          "-t",
+          sharedDockerImageTag,
+          ".",
+        ],
+        repoRoot,
+        process.env as Record<string, string>,
+      );
+      sharedDockerImageBuilt = true;
+    }
 
     const target = resolveRuntimeTarget();
-    const cacheDir = join(buildCacheRoot, target.platformKey);
+    const cacheDir = join(buildCacheRoot, `${target.platformKey}-${cacheKey}`);
     mkdirSync(cacheDir, { recursive: true });
 
     const serviceBuilds: Array<{
@@ -168,10 +183,11 @@ async function ensureBuildArtifacts(): Promise<BuildArtifacts> {
       cliPath: packagedCliPath,
       runtimeBinaryDir: cacheDir,
       platformKey: target.platformKey,
-      dockerImage: sharedDockerImageTag,
+      dockerImage: buildDockerImage ? sharedDockerImageTag : "pushpals-worker-sandbox:unused",
     };
   })();
-  return await buildArtifactsPromise;
+  buildArtifactsPromises.set(cacheKey, buildPromise);
+  return await buildPromise;
 }
 
 async function ensureCliPackageTarball(): Promise<string> {
@@ -238,9 +254,15 @@ function prepareRuntimeRoot(
   portBase: number,
   options: {
     autonomyEnabled?: boolean;
+    autoSpawnWorkerpals?: boolean;
+    localBuddyEnabled?: boolean;
+    workerpalDocker?: boolean;
   } = {},
 ): void {
   const autonomyEnabled = options.autonomyEnabled ?? false;
+  const autoSpawnWorkerpals = options.autoSpawnWorkerpals ?? true;
+  const localBuddyEnabled = options.localBuddyEnabled ?? false;
+  const workerpalDocker = options.workerpalDocker ?? true;
   cpSync(packagedRuntimeAssetRoot, runtimeRoot, { recursive: true, force: true });
   const runtimeBinDir = join(runtimeRoot, "bin", artifacts.platformKey);
   mkdirSync(runtimeBinDir, { recursive: true });
@@ -270,10 +292,12 @@ url = "http://127.0.0.1:${portBase}"
 port = ${portBase}
 
 [localbuddy]
-enabled = false
+enabled = ${localBuddyEnabled ? "true" : "false"}
 port = ${portBase + 2}
 
 [remotebuddy]
+auto_spawn_workerpals = ${autoSpawnWorkerpals ? "true" : "false"}
+workerpal_docker = ${workerpalDocker ? "true" : "false"}
 max_workerpals = 1
 wait_for_workerpal_ms = 30000
 workerpal_startup_timeout_ms = 30000
@@ -356,9 +380,7 @@ function buildCliE2EEnv(extra: Record<string, string> = {}): Record<string, stri
 
 function resolveInstalledPushpalsPath(globalBinDir: string): string {
   const candidates =
-    process.platform === "win32"
-      ? ["pushpals.exe", "pushpals.cmd", "pushpals"]
-      : ["pushpals"];
+    process.platform === "win32" ? ["pushpals.exe", "pushpals.cmd", "pushpals"] : ["pushpals"];
   for (const candidate of candidates) {
     const candidatePath = join(globalBinDir, candidate);
     if (existsSync(candidatePath)) return candidatePath;
@@ -379,7 +401,11 @@ async function installCliTarballGlobally(root: string): Promise<{
     BUN_INSTALL: bunInstallRoot,
   } as Record<string, string>;
   runChecked([process.execPath, "install", "-g", tarballPath], root, installEnv);
-  const globalBinDir = runChecked([process.execPath, "pm", "bin", "-g"], root, installEnv).stdout.trim();
+  const globalBinDir = runChecked(
+    [process.execPath, "pm", "bin", "-g"],
+    root,
+    installEnv,
+  ).stdout.trim();
   if (!globalBinDir) {
     throw new Error("bun pm bin -g returned an empty global bin directory.");
   }
@@ -420,13 +446,20 @@ async function createFailingDockerExecutable(root: string): Promise<string> {
   return outputPath;
 }
 
-async function createCrashingRemoteBuddyExecutable(root: string): Promise<string> {
-  const sourcePath = join(root, "remotebuddy-crash.ts");
+async function createStandaloneRuntimeSentinel(
+  root: string,
+): Promise<{ executablePath: string; markerDir: string }> {
+  const sourcePath = join(root, "standalone-runtime-sentinel.ts");
   const extension = process.platform === "win32" ? ".exe" : "";
-  const outputPath = join(root, `pushpals-runtime-remotebuddy-crash${extension}`);
+  const executablePath = join(root, `pushpals-runtime-sentinel${extension}`);
+  const markerDir = join(root, "standalone-runtime-markers");
+  mkdirSync(markerDir, { recursive: true });
   writeFileSync(
     sourcePath,
     [
+      'import { basename, join } from "node:path";',
+      'const markerDir = String(process.env.PUSHPALS_STANDALONE_SENTINEL_DIR ?? "").trim();',
+      'if (markerDir) await Bun.write(join(markerDir, `${basename(process.execPath)}.launched`), "launched\\n");',
       "console.error('panic(main thread): Segmentation fault at address 0xFFFFFFFFFFFFFFFF');",
       "console.error('oh no: Bun has crashed. This indicates a bug in Bun, not your code.');",
       "process.exit(3);",
@@ -434,12 +467,18 @@ async function createCrashingRemoteBuddyExecutable(root: string): Promise<string
     ].join("\n"),
     "utf8",
   );
-  const buildArgs = [process.execPath, "build", sourcePath, "--compile", `--outfile=${outputPath}`];
+  const buildArgs = [
+    process.execPath,
+    "build",
+    sourcePath,
+    "--compile",
+    `--outfile=${executablePath}`,
+  ];
   if (process.platform === "win32") {
     buildArgs.splice(3, 0, "--target=bun-windows-x64");
   }
   runChecked(buildArgs, root, process.env as Record<string, string>);
-  return outputPath;
+  return { executablePath, markerDir };
 }
 
 function shSingleQuote(value: string): string {
@@ -463,7 +502,10 @@ function resolveDockerExecutablePath(): string {
   );
 }
 
-async function createTimedOutInspectDockerExecutable(root: string, targetImage: string): Promise<{
+async function createTimedOutInspectDockerExecutable(
+  root: string,
+  targetImage: string,
+): Promise<{
   executablePath: string;
   statePath: string;
   commandLogPath: string;
@@ -545,9 +587,10 @@ async function waitForExitWithTimeout(
   }
 }
 
-function startTextCapture(
-  stream: ReadableStream<Uint8Array> | null | undefined,
-): { promise: Promise<string>; getSnapshot: () => string } {
+function startTextCapture(stream: ReadableStream<Uint8Array> | null | undefined): {
+  promise: Promise<string>;
+  getSnapshot: () => string;
+} {
   let buffer = "";
   const promise = (async () => {
     if (!stream) return buffer;
@@ -617,7 +660,10 @@ function findLatestRuntimeServicesLogPath(runtimeRoot: string): string | null {
   return candidates[0] ?? null;
 }
 
-async function waitForRuntimeServicesLogPath(runtimeRoot: string, timeoutMs: number): Promise<string> {
+async function waitForRuntimeServicesLogPath(
+  runtimeRoot: string,
+  timeoutMs: number,
+): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const logPath = findLatestRuntimeServicesLogPath(runtimeRoot);
@@ -695,7 +741,10 @@ function findProcessIdsByCommandNeedle(commandNeedle: string): number[] {
   return pids;
 }
 
-async function terminateProcessByCommandNeedle(commandNeedle: string, timeoutMs: number): Promise<void> {
+async function terminateProcessByCommandNeedle(
+  commandNeedle: string,
+  timeoutMs: number,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const pids = findProcessIdsByCommandNeedle(commandNeedle);
@@ -725,7 +774,7 @@ describe("packaged CLI end-to-end", () => {
   test(
     "boots from a bun-installed package entrypoint with an isolated runtime root",
     async () => {
-      const artifacts = await ensureBuildArtifacts();
+      const artifacts = await ensureBuildArtifacts({ buildDockerImage: false });
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-installed-"));
       let clearProc: ReturnType<typeof Bun.spawn> | null = null;
       let statusProc: ReturnType<typeof Bun.spawn> | null = null;
@@ -747,16 +796,13 @@ describe("packaged CLI end-to-end", () => {
           REMOTEBUDDY_AUTONOMY_ENABLED: process.platform === "win32" ? "true" : "false",
         });
 
-        clearProc = Bun.spawn(
-          [installed.pushpalsPath, "--clear", "--runtime-root", runtimeRoot],
-          {
-            cwd: repoPath,
-            stdin: "ignore",
-            stdout: "pipe",
-            stderr: "pipe",
-            env,
-          },
-        );
+        clearProc = Bun.spawn([installed.pushpalsPath, "--clear", "--runtime-root", runtimeRoot], {
+          cwd: repoPath,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+          env,
+        });
         const clearStdoutCapture = startTextCapture(clearProc.stdout);
         const clearStderrCapture = startTextCapture(clearProc.stderr);
         const [clearStdout, clearStderr, clearExitCode] = await Promise.all([
@@ -769,7 +815,9 @@ describe("packaged CLI end-to-end", () => {
           ),
         ]);
         if (clearExitCode !== 0) {
-          throw new Error(`Installed-package clear exited ${clearExitCode}\n${clearStdout}\n${clearStderr}`);
+          throw new Error(
+            `Installed-package clear exited ${clearExitCode}\n${clearStdout}\n${clearStderr}`,
+          );
         }
 
         statusProc = Bun.spawn(
@@ -793,7 +841,11 @@ describe("packaged CLI end-to-end", () => {
         const stdoutCapture = startTextCapture(statusProc.stdout);
         const stderrCapture = startTextCapture(statusProc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
-        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "[pushpals] embedded runtime is ready.",
+          180_000,
+        );
 
         const [stdout, stderr, exitCode] = await Promise.all([
           stdoutCapture.promise,
@@ -885,7 +937,11 @@ describe("packaged CLI end-to-end", () => {
         const runtimeStdoutCapture = startTextCapture(runtimeProc.stdout);
         const runtimeStderrCapture = startTextCapture(runtimeProc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
-        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "[pushpals] embedded runtime is ready.",
+          180_000,
+        );
 
         statusProc = Bun.spawn(
           [
@@ -920,7 +976,9 @@ describe("packaged CLI end-to-end", () => {
         const combined = `${stdout}\n${stderr}`;
 
         if (exitCode !== 0) {
-          throw new Error(`Installed-package no-auto-start CLI E2E exited ${exitCode}\n${combined}`);
+          throw new Error(
+            `Installed-package no-auto-start CLI E2E exited ${exitCode}\n${combined}`,
+          );
         }
         expect(combined).toContain("[pushpals] Connected.");
         expect(combined).toContain(`[pushpals] serverUrl=http://127.0.0.1:${portBase}`);
@@ -999,7 +1057,11 @@ describe("packaged CLI end-to-end", () => {
         const stdoutCapture = startTextCapture(proc.stdout);
         const stderrCapture = startTextCapture(proc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
-        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "[pushpals] embedded runtime is ready.",
+          180_000,
+        );
 
         const [stdout, stderr, exitCode] = await Promise.all([
           stdoutCapture.promise,
@@ -1089,12 +1151,16 @@ describe("packaged CLI end-to-end", () => {
         const combined = `${stdout}\n${stderr}`;
 
         expect(exitCode).toBe(1);
-        expect(combined).toContain(`[pushpals] Server is unavailable at http://127.0.0.1:${portBase}.`);
+        expect(combined).toContain(
+          `[pushpals] Server is unavailable at http://127.0.0.1:${portBase}.`,
+        );
         expect(combined).toContain("[pushpals] Auto-start is disabled (--no-auto-start).");
         expect(combined).not.toContain("[pushpals] Starting embedded server...");
         expect(combined).not.toContain("[pushpals] Runtime unavailable. Auto-starting runtime");
         expect(combined).not.toContain("[pushpals] Connected.");
-        expect(combined).not.toContain('Precheck failed: remote branch "origin/main_agents" was not found.');
+        expect(combined).not.toContain(
+          'Precheck failed: remote branch "origin/main_agents" was not found.',
+        );
       } finally {
         if (proc) {
           try {
@@ -1117,7 +1183,7 @@ describe("packaged CLI end-to-end", () => {
     "boots packaged Windows runtime with autonomy enabled",
     async () => {
       if (process.platform !== "win32") return;
-      const artifacts = await ensureBuildArtifacts();
+      const artifacts = await ensureBuildArtifacts({ buildDockerImage: false });
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-autonomy-win-"));
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
@@ -1126,6 +1192,7 @@ describe("packaged CLI end-to-end", () => {
         const portBase = await findAvailablePortBlock();
         prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase, {
           autonomyEnabled: true,
+          autoSpawnWorkerpals: false,
         });
 
         proc = Bun.spawn(
@@ -1191,11 +1258,11 @@ describe("packaged CLI end-to-end", () => {
   );
 
   test(
-    "falls back to bundled RemoteBuddy source when the packaged Windows binary crashes with a Bun panic",
+    "boots every Windows service from isolated source bundles without launching standalone binaries",
     async () => {
       if (process.platform !== "win32") return;
-      const artifacts = await ensureBuildArtifacts();
-      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-remotebuddy-fallback-"));
+      const artifacts = await ensureBuildArtifacts({ buildDockerImage: false });
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-safe-windows-launch-"));
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
         const { repoPath } = initializeTempRepo(root);
@@ -1203,20 +1270,34 @@ describe("packaged CLI end-to-end", () => {
         const portBase = await findAvailablePortBlock();
         prepareRuntimeRoot(runtimeRoot, artifacts, artifacts.dockerImage, portBase, {
           autonomyEnabled: true,
+          autoSpawnWorkerpals: true,
+          localBuddyEnabled: true,
+          workerpalDocker: false,
         });
 
-        const crashingRemoteBuddyPath = await createCrashingRemoteBuddyExecutable(root);
-        cpSync(
-          crashingRemoteBuddyPath,
-          join(runtimeRoot, "bin", artifacts.platformKey, runtimeBinaryFilename("remotebuddy", artifacts.platformKey, ".exe")),
-          { force: true },
-        );
+        const sentinel = await createStandaloneRuntimeSentinel(root);
+        const runtimeBinDir = join(runtimeRoot, "bin", artifacts.platformKey);
+        const staleStandaloneTag = "stale-standalone-runtime";
+        for (const service of [
+          "server",
+          "localbuddy",
+          "remotebuddy",
+          "workerpals",
+          "source_control_manager",
+        ] as const) {
+          cpSync(
+            sentinel.executablePath,
+            join(runtimeBinDir, runtimeBinaryFilename(service, artifacts.platformKey, ".exe")),
+            { force: true },
+          );
+        }
+        writeFileSync(join(runtimeBinDir, ".runtime-tag"), `${staleStandaloneTag}\n`, "utf8");
 
         proc = Bun.spawn(
           [
             process.execPath,
             artifacts.cliPath,
-            "--status-once",
+            "--runtime-only",
             "--runtime-root",
             runtimeRoot,
             "--runtime-tag",
@@ -1224,10 +1305,12 @@ describe("packaged CLI end-to-end", () => {
           ],
           {
             cwd: repoPath,
-            stdin: "ignore",
+            stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
-            env: buildCliE2EEnv(),
+            env: buildCliE2EEnv({
+              PUSHPALS_STANDALONE_SENTINEL_DIR: sentinel.markerDir,
+            }),
           },
         );
 
@@ -1236,10 +1319,11 @@ describe("packaged CLI end-to-end", () => {
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
         await waitForLogLine(
           runtimeServicesLogPath,
-          "source fallback under bun.",
+          "[pushpals] embedded runtime is ready.",
           180_000,
         );
-
+        proc.stdin.write("exit\n");
+        proc.stdin.end();
         const [stdout, stderr, exitCode] = await Promise.all([
           stdoutCapture.promise,
           stderrCapture.promise,
@@ -1254,15 +1338,34 @@ describe("packaged CLI end-to-end", () => {
         if (exitCode !== 0) {
           throw new Error(`CLI E2E exited ${exitCode}\n${combined}`);
         }
-        expect(combined).toContain(
-          "[pushpals] Embedded RemoteBuddy standalone binary crashed on Windows; retrying with source fallback under bun.",
+        expect(readdirSync(sentinel.markerDir)).toEqual([]);
+        expect(readFileSync(join(runtimeBinDir, ".runtime-tag"), "utf8")).toBe(
+          `${staleStandaloneTag}\n`,
         );
+        expect(combined).toContain(
+          "[pushpals] Windows safety mode: embedded services and WorkerPals will use isolated source-bundle launchers with bounded startup deadlines.",
+        );
+        expect(combined).toContain(
+          "[pushpals] Windows safety mode: unused standalone runtime binary downloads are skipped.",
+        );
+        expect(combined).toContain("[pushpals] Embedded WorkerPal capacity is ready");
         expect(combined).toContain("[pushpals] startup timing summary: outcome=ready");
         expect(combined).toContain("[pushpals] Embedded runtime is ready.");
         expect(combined).toContain("[pushpals] Embedded RemoteBuddy autonomous engine is enabled.");
         expect(combined).toContain("[pushpals] Connected.");
         expect(combined).not.toContain("[pushpals] Auto-start failed:");
         expect(combined).not.toContain("[pushpals] Fatal:");
+        expect(combined).not.toContain("panic(main thread):");
+        const runtimeLog = readFileSync(runtimeServicesLogPath, "utf8");
+        for (const sourceAsset of [
+          ".pushpals-server-runtime.js",
+          ".pushpals-localbuddy-runtime.js",
+          ".pushpals-remotebuddy-fallback.js",
+          ".pushpals-source-control-manager-runtime.js",
+        ]) {
+          expect(runtimeLog).toContain(sourceAsset);
+        }
+        expect(runtimeLog).toContain(".pushpals-runtime-launch-trampoline.js");
       } finally {
         if (proc) {
           try {
@@ -1357,7 +1460,10 @@ describe("packaged CLI end-to-end", () => {
       if (process.platform === "win32") return;
       const artifacts = await ensureBuildArtifacts();
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-docker-timeout-"));
-      const timedOutDocker = await createTimedOutInspectDockerExecutable(root, artifacts.dockerImage);
+      const timedOutDocker = await createTimedOutInspectDockerExecutable(
+        root,
+        artifacts.dockerImage,
+      );
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
         const { repoPath } = initializeTempRepo(root);
@@ -1467,7 +1573,11 @@ describe("packaged CLI end-to-end", () => {
         const runtimeStdoutCapture = startTextCapture(runtimeProc.stdout);
         const runtimeStderrCapture = startTextCapture(runtimeProc.stderr);
         const runtimeServicesLogPath = await waitForRuntimeServicesLogPath(runtimeRoot, 120_000);
-        await waitForLogLine(runtimeServicesLogPath, "[pushpals] embedded runtime is ready.", 180_000);
+        await waitForLogLine(
+          runtimeServicesLogPath,
+          "[pushpals] embedded runtime is ready.",
+          180_000,
+        );
 
         const extension = artifacts.platformKey.startsWith("windows-") ? ".exe" : "";
         const scmBinaryPath = join(

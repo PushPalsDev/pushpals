@@ -19,6 +19,9 @@ export type ManagedServiceSpec = {
   cwd: string;
   env?: Record<string, string>;
   logPath?: string;
+  launchTimeoutMs?: number;
+  launchReadyLine?: string;
+  onLaunchTimeout?: (timeoutMs: number) => void;
   onStdoutLine?: (line: string) => void;
   onStderrLine?: (line: string) => void;
 };
@@ -32,6 +35,8 @@ export type ManagedServiceProcess = {
   exited: boolean;
   exitCode: number | null;
   launchedAtMs: number;
+  launchReady?: Promise<boolean>;
+  launchTimedOut?: boolean;
   logPath?: string;
   stopOutputPipes?: () => void;
 };
@@ -97,7 +102,6 @@ const DEFAULT_SERVICE_MANAGER_MAX_RESTART_ATTEMPTS = 4;
 const DEFAULT_SERVICE_MANAGER_STABLE_WINDOW_MS = 60_000;
 const DEFAULT_SERVICE_MANAGER_BASE_BACKOFF_MS = 2_000;
 const DEFAULT_SERVICE_MANAGER_MAX_BACKOFF_MS = 30_000;
-const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
 
 export function formatEmbeddedRuntimeHealthLines(health: EmbeddedRuntimeHealth | null): string[] {
   if (!health) return [];
@@ -139,9 +143,9 @@ export function isRetryableManagedServiceLaunchError(error: unknown): boolean {
   const code = String((error as NodeJS.ErrnoException | undefined)?.code ?? "")
     .trim()
     .toUpperCase();
-  if (["EPERM", "EACCES", "EBUSY", "ETXTBSY"].includes(code)) return true;
+  if (["EPERM", "EACCES", "EBUSY", "ETXTBSY", "ETIMEDOUT"].includes(code)) return true;
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return /\b(?:EPERM|EACCES|EBUSY|ETXTBSY)\b|operation not permitted|resource busy|text file busy/i.test(
+  return /\b(?:EPERM|EACCES|EBUSY|ETXTBSY|ETIMEDOUT)\b|operation not permitted|resource busy|text file busy|launch did not become ready/i.test(
     message,
   );
 }
@@ -200,14 +204,33 @@ function pipeProcessStreamToLines(
 
 function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
   const env = { ...(spec.env ?? {}) };
+  const launchReadyLine = String(spec.launchReadyLine ?? "").trim();
+  let launchSettled = !launchReadyLine;
+  let settleLaunchReady: (ready: boolean) => void = () => {};
+  const launchReady = launchReadyLine
+    ? new Promise<boolean>((resolve) => {
+        settleLaunchReady = resolve;
+      })
+    : Promise.resolve(true);
+  const observeLaunchLine = (line: string): void => {
+    if (launchSettled || !launchReadyLine || !line.includes(launchReadyLine)) return;
+    launchSettled = true;
+    settleLaunchReady(true);
+  };
   const proc = Bun.spawn(spec.command, {
     cwd: spec.cwd,
     env,
     stdout: "pipe",
     stderr: "pipe",
   });
-  const stdoutPipe = pipeProcessStreamToLines(proc.stdout, spec.onStdoutLine);
-  const stderrPipe = pipeProcessStreamToLines(proc.stderr, spec.onStderrLine);
+  const stdoutPipe = pipeProcessStreamToLines(proc.stdout, (line) => {
+    observeLaunchLine(line);
+    spec.onStdoutLine?.(line);
+  });
+  const stderrPipe = pipeProcessStreamToLines(proc.stderr, (line) => {
+    observeLaunchLine(line);
+    spec.onStderrLine?.(line);
+  });
   const service: ManagedServiceProcess = {
     name: spec.name,
     proc,
@@ -217,13 +240,38 @@ function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
     exited: false,
     exitCode: null,
     launchedAtMs: Date.now(),
+    launchReady,
+    launchTimedOut: false,
     logPath: spec.logPath,
     stopOutputPipes: () => {
       stdoutPipe.cancel();
       stderrPipe.cancel();
     },
   };
+  const configuredLaunchTimeoutMs = Math.floor(spec.launchTimeoutMs ?? 0);
+  const launchTimeoutMs =
+    configuredLaunchTimeoutMs > 0 ? Math.max(100, configuredLaunchTimeoutMs) : 0;
+  const launchTimer =
+    launchReadyLine && launchTimeoutMs > 0
+      ? setTimeout(() => {
+          if (launchSettled) return;
+          launchSettled = true;
+          service.launchTimedOut = true;
+          spec.onLaunchTimeout?.(launchTimeoutMs);
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            // The isolated launcher may already have exited.
+          }
+          settleLaunchReady(false);
+        }, launchTimeoutMs)
+      : null;
   void proc.exited.then((code) => {
+    if (launchTimer) clearTimeout(launchTimer);
+    if (!launchSettled) {
+      launchSettled = true;
+      settleLaunchReady(false);
+    }
     service.exited = true;
     service.exitCode = code;
   });
@@ -295,18 +343,7 @@ export class ServiceManager {
     if (existing && !existing.exited) {
       try {
         existing.stopOutputPipes?.();
-        const pid = existing.proc.pid;
-        if (process.platform === "win32" && typeof pid === "number" && pid > 0) {
-          Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
-            stdin: "ignore",
-            stdout: "ignore",
-            stderr: "ignore",
-            timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
-            killSignal: "SIGKILL",
-          });
-        } else {
-          existing.proc.kill("SIGKILL");
-        }
+        existing.proc.kill("SIGTERM");
       } catch {
         // ignore best-effort replacement shutdown failures
       }
@@ -334,6 +371,23 @@ export class ServiceManager {
 
   getService(name: string): ManagedServiceProcess | null {
     return this.services.get(name) ?? null;
+  }
+
+  abandonService(service: ManagedServiceProcess): void {
+    if (this.services.get(service.name) !== service) return;
+    service.stopOutputPipes?.();
+    try {
+      service.proc.kill("SIGKILL");
+    } catch {
+      // Best-effort isolated-launcher termination only.
+    }
+    this.services.delete(service.name);
+    this.launchSpecs.delete(service.name);
+    const state = this.stateByService.get(service.name);
+    if (state?.pendingRestartTimer) clearTimeout(state.pendingRestartTimer);
+    this.stateByService.delete(service.name);
+    this.degradedServiceReasons.delete(service.name);
+    this.emitHealthChange();
   }
 
   getHealth(): EmbeddedRuntimeHealth | null {
@@ -366,18 +420,7 @@ export class ServiceManager {
     for (const service of this.services.values()) {
       try {
         service.stopOutputPipes?.();
-        const pid = service.proc.pid;
-        if (process.platform === "win32" && typeof pid === "number" && pid > 0) {
-          Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
-            stdin: "ignore",
-            stdout: "ignore",
-            stderr: "ignore",
-            timeout: WINDOWS_TASKKILL_TIMEOUT_MS,
-            killSignal: "SIGKILL",
-          });
-        } else {
-          service.proc.kill("SIGKILL");
-        }
+        service.proc.kill("SIGTERM");
       } catch {
         // ignore best-effort shutdown failures
       }
@@ -534,7 +577,18 @@ export async function startManagedServiceWithRetry(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return serviceManager.startService(spec);
+      const service = serviceManager.startService(spec);
+      const launchReady = service.launchReady ? await service.launchReady : true;
+      if (!launchReady) {
+        serviceManager.abandonService(service);
+        throw Object.assign(
+          new Error(
+            `Managed ${spec.name} launch did not become ready within ${Math.max(0, Math.floor(spec.launchTimeoutMs ?? 0))}ms.`,
+          ),
+          { code: "ETIMEDOUT" },
+        );
+      }
+      return service;
     } catch (error) {
       if (attempt >= maxAttempts || !shouldRetry(error)) throw error;
       const backoffMs = Math.max(0, Math.floor(computeBackoffMs(attempt)));

@@ -9037,7 +9037,10 @@ function resolveWorkerStartupTimeoutMs(options) {
 }
 function buildWorkerSpawnCommand(options) {
   const binaryPath = String(options.binaryPath ?? "").trim();
-  const envFile = String(options.envFile ?? "").trim() || ".env";
+  const sourceBundlePath = String(options.sourceBundlePath ?? "").trim();
+  const bunExecutable = String(options.bunExecutable ?? "").trim() || "bun";
+  const launchTrampolinePath = String(options.launchTrampolinePath ?? "").trim();
+  const envFile = options.envFile === null ? "" : String(options.envFile ?? "").trim() || ".env";
   const entrypoint = String(options.entrypoint ?? "").trim() || "apps/workerpals/src/workerpals_main.ts";
   const args = binaryPath ? [
     binaryPath,
@@ -9047,11 +9050,19 @@ function buildWorkerSpawnCommand(options) {
     options.workerId,
     "--repo",
     options.repoRoot
+  ] : sourceBundlePath ? [
+    bunExecutable,
+    sourceBundlePath,
+    "--server",
+    options.server,
+    "--workerId",
+    options.workerId,
+    "--repo",
+    options.repoRoot
   ] : [
-    "bun",
+    bunExecutable,
     "run",
-    "--env-file",
-    envFile,
+    ...envFile ? ["--env-file", envFile] : [],
     entrypoint,
     "--server",
     options.server,
@@ -9077,7 +9088,7 @@ function buildWorkerSpawnCommand(options) {
       args.push("--docker-image", options.dockerImage);
     }
   }
-  return args;
+  return launchTrampolinePath ? [bunExecutable, launchTrampolinePath, "--", ...args] : args;
 }
 
 // apps/remotebuddy/src/remotebuddy_main.ts
@@ -9720,6 +9731,9 @@ class RemoteBuddyOrchestrator {
   spawnWorkerHeartbeatMs;
   spawnWorkerLabels;
   workerpalsBinaryPath;
+  workerpalsSourceBundlePath;
+  workerpalsBunExecutable;
+  workerpalsLaunchTrampolinePath;
   workerpalsEnvFile;
   workerpalsEntrypoint;
   workerpalsUnavailableReason;
@@ -9798,6 +9812,9 @@ class RemoteBuddyOrchestrator {
     this.spawnWorkerHeartbeatMs = typeof remoteCfg.workerpalHeartbeatMs === "number" && remoteCfg.workerpalHeartbeatMs > 0 ? remoteCfg.workerpalHeartbeatMs : null;
     this.spawnWorkerLabels = remoteCfg.workerpalLabels;
     this.workerpalsBinaryPath = null;
+    this.workerpalsSourceBundlePath = null;
+    this.workerpalsBunExecutable = null;
+    this.workerpalsLaunchTrampolinePath = null;
     this.workerpalsEnvFile = null;
     this.workerpalsEntrypoint = null;
     this.workerpalsUnavailableReason = null;
@@ -9820,8 +9837,19 @@ class RemoteBuddyOrchestrator {
     this.memoryRetentionDays = Math.max(1, remoteCfg.memory.retentionDays);
     this.repo = detectRepoRoot(process.cwd());
     const embeddedWorkerpalsBinary = String(process.env.PUSHPALS_WORKERPALS_BIN ?? "").trim();
+    const embeddedWorkerpalsSourceBundle = String(process.env.PUSHPALS_WORKERPALS_SOURCE_BUNDLE ?? "").trim();
+    const embeddedRuntimeLaunchTrampoline = String(process.env.PUSHPALS_RUNTIME_LAUNCH_TRAMPOLINE ?? "").trim();
+    const embeddedBunExecutable = String(process.env.PUSHPALS_BUN_BIN ?? "").trim() || process.execPath;
     const workerpalsEntrypoint = resolve5(this.repo, "apps", "workerpals", "src", "workerpals_main.ts");
-    if (embeddedWorkerpalsBinary && existsSync5(embeddedWorkerpalsBinary)) {
+    if (process.platform === "win32" && embeddedWorkerpalsSourceBundle && existsSync5(embeddedWorkerpalsSourceBundle) && embeddedRuntimeLaunchTrampoline && existsSync5(embeddedRuntimeLaunchTrampoline) && embeddedBunExecutable && existsSync5(embeddedBunExecutable)) {
+      this.workerpalsSourceBundlePath = embeddedWorkerpalsSourceBundle;
+      this.workerpalsBunExecutable = embeddedBunExecutable;
+      this.workerpalsLaunchTrampolinePath = embeddedRuntimeLaunchTrampoline;
+    } else if (process.platform === "win32" && this.autoSpawnWorkers) {
+      this.autoSpawnWorkers = false;
+      this.workerpalsUnavailableReason = "WorkerPal isolated Windows source launcher is incomplete; direct standalone-binary launch is disabled";
+      console.warn(`[RemoteBuddy] Auto-spawn disabled: ${this.workerpalsUnavailableReason}.`);
+    } else if (embeddedWorkerpalsBinary && existsSync5(embeddedWorkerpalsBinary)) {
       this.workerpalsBinaryPath = embeddedWorkerpalsBinary;
     } else if (existsSync5(workerpalsEntrypoint)) {
       this.workerpalsEntrypoint = workerpalsEntrypoint;
@@ -10506,19 +10534,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     } catch {}
     exited = await waitForExit(timeoutMs);
     if (!exited) {
-      if (process.platform === "win32" && Number.isFinite(proc.pid ?? Number.NaN)) {
-        try {
-          Bun.spawnSync(["taskkill", "/PID", String(proc.pid), "/T", "/F"], {
-            stdin: "ignore",
-            stdout: "ignore",
-            stderr: "ignore"
-          });
-        } catch {}
-      } else {
-        try {
-          proc.kill("SIGKILL");
-        } catch {}
-      }
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
       exited = await waitForExit(2000);
     }
     if (!exited) {
@@ -10731,6 +10749,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       requireDocker: this.spawnWorkerRequireDocker,
       dockerImage: this.spawnWorkerImage,
       binaryPath: this.workerpalsBinaryPath,
+      sourceBundlePath: this.workerpalsSourceBundlePath,
+      bunExecutable: this.workerpalsBunExecutable,
+      launchTrampolinePath: this.workerpalsLaunchTrampolinePath,
       envFile: this.workerpalsEnvFile,
       entrypoint: this.workerpalsEntrypoint
     });

@@ -207,7 +207,7 @@ describe("start runtime service helpers", () => {
     }
   });
 
-  test("ServiceManager stop force-kills managed services on Unix", () => {
+  test("ServiceManager stop signals managed launchers without spawning a blocking cleanup process", () => {
     if (process.platform === "win32") return;
     let killSignal: string | undefined;
     const manager = new ServiceManager({
@@ -237,6 +237,6 @@ describe("start runtime service helpers", () => {
     });
     manager.stop();
 
-    expect(killSignal).toBe("SIGKILL");
+    expect(killSignal).toBe("SIGTERM");
   });
 });

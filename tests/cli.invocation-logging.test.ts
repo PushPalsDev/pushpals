@@ -224,7 +224,11 @@ enabled = true
       ]);
 
       const visionPath = join(repoRoot, "vision.md");
-      expect(code).toBe(0);
+      if (code !== 0) {
+        throw new Error(
+          `pushpals --create_vision_md exited ${code}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
+        );
+      }
       expect(stderr.trim()).toBe("");
       expect(existsSync(visionPath)).toBe(true);
       expect(readFileSync(visionPath, "utf8")).toContain("# Vision");
@@ -448,7 +452,11 @@ enabled = false
         proc.exited,
       ]);
 
-      expect(code).toBe(0);
+      if (code !== 0) {
+        throw new Error(
+          `pushpals --clear exited ${code}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
+        );
+      }
       expect(stderr.trim()).toBe("");
       expect(stdout).toContain("[pushpals] Clear requested. Removing repo-local PushPals state.");
       expect(stdout).toContain("[pushpals] Clear completed.");
