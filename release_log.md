@@ -2,28 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.2.20`
-- start_commit: `b49dc371bedb0cad706abe8ab3526fef57c448d9`
-- end_commit: `245bcf1ef01df539469ae518f7ea5a7411727b67`
-- commits_in_range: `3`
+- version: `v1.2.21`
+- start_commit: `2a1515319005bf684bcdec9f89e53a7bb08eb908`
+- end_commit: `375fe7fd4599d81330dc614efda155c844d58eee`
+- commits_in_range: `7`
 
 ## Highlights
 
-- Resume Docker-dependent validation automatically after a sandboxed WorkerPal retains a candidate: SourceControlManager now applies the exact handoff commit, runs the blocked commands on its trusted host worktree, and only continues publication after they pass.
-- Persist trusted-validation commands, summary, and blocker detail through a backward-compatible completion-queue migration instead of terminating the job at `publish_blocked` with no recovery owner.
-- Execute trusted validation as bounded direct argv commands, reject shell controls, inline-code escape forms, absolute executables, unsupported tools, and oversized payloads, and stop at the first failed gate.
-- Preserve immutable candidate refs when completion handoff or trusted validation fails so useful work is never silently discarded or published without its required gate.
-- Extend exact review-head lease E2E coverage plus Windows LF, compact-path, sandbox isolation, cleanup, and packaged-runtime parity regressions across pull requests, releases, and the long runtime soak.
+- Isolate Windows npm CLI service startup behind a small Bun launcher process so a blocked or crashed service cannot hold the main CLI event loop or prevent the remaining services from starting.
+- Start Server, LocalBuddy, RemoteBuddy, WorkerPal, and SourceControlManager from packaged source bundles on Windows instead of directly launching large downloaded standalone executables, and skip downloading those unused Windows binaries.
+- Bound every launcher readiness handshake with a 15-second deadline, terminate only the failed launcher, retain per-service diagnostics, and keep shutdown off synchronous process-tree cleanup paths.
+- Follow the configured embedded LocalBuddy port when the CLI owns LocalBuddy startup while preserving explicit remote LocalBuddy URLs.
+- Make clean CLI E2E builds deterministic by building the protocol workspace before packaging, and verify every required source runtime asset in the npm payload.
+- Exercise complete source-only Windows startup on GitHub-hosted Windows runners, preserve failure logs as artifacts, and keep the resource-intensive self-hosted Windows Docker job manual-only.
 
 ## Validation
 
-- Release-playbook root suite on Bun 1.3.14: 1,066 passed, 2 intentional skips, 0 failed, 8,911 assertions across 122 files.
-- Focused trusted-validation, completion migration, WorkerPal handoff, and packaged-runtime parity suite: 31 passed, 0 failed.
-- SourceControlManager and related WorkerPal publication/reconciliation suite: 172 passed, 0 failed, 573 assertions across 16 files.
-- Shared, Server, WorkerPals, and SourceControlManager TypeScript checks passed.
-- SourceControlManager production bundle compiled successfully with the trusted-validation runner.
+- Release-playbook root suite in Docker on Bun 1.3.14: 1,075 passed, 7 intentional Windows-only skips, 0 failed, 4,555 assertions across 124 files.
+- Focused CLI runtime-bootstrap suite: 154 passed, 0 failed.
+- GitHub CLI E2E run 30690575582 passed the WorkerPals control-plane Linux E2E, packaged CLI Linux E2E, and GitHub-hosted Windows source-only startup jobs; the self-hosted Windows job was skipped by its manual-only guard.
 - `bun run cli:bundle`
-- `bun run cli:verify-package-payload`: 222 package files, no external toolchain files.
+- Normalized `bun run cli:verify-package-payload`: 228 package files, no external toolchain files.
 - `git diff --check` passed.
 
 ## Install
