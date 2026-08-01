@@ -102,6 +102,12 @@ jobs:
           tests/workerpals.windows-sandbox-env.integration.test.ts
           tests/workerpals.worktree-boundary.test.ts
 
+      - name: Verify isolated Windows source-only runtime startup
+        run: >-
+          bun test
+          --test-name-pattern "boots (packaged Windows runtime|every Windows service)"
+          ./tests/integration/cli.e2e.ts
+
   packaged_cli_e2e_linux:
     name: Packaged CLI E2E (Linux)
     runs-on: ubuntu-latest

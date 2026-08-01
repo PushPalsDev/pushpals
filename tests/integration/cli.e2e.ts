@@ -106,10 +106,13 @@ function runtimeBinaryFilename(
 }
 
 async function ensureBuildArtifacts(
-  options: { buildDockerImage?: boolean } = {},
+  options: { buildDockerImage?: boolean; buildRuntimeBinaries?: boolean } = {},
 ): Promise<BuildArtifacts> {
   const buildDockerImage = options.buildDockerImage ?? true;
-  const cacheKey = buildDockerImage ? "docker" : "host-only";
+  const buildRuntimeBinaries = options.buildRuntimeBinaries ?? true;
+  const cacheKey = `${buildDockerImage ? "docker" : "host-only"}-${
+    buildRuntimeBinaries ? "compiled-runtime" : "source-only-runtime"
+  }`;
   const existing = buildArtifactsPromises.get(cacheKey);
   if (existing) return await existing;
   const buildPromise = (async () => {
@@ -165,18 +168,26 @@ async function ensureBuildArtifacts(
         runtimeBinaryFilename(build.service, target.platformKey, target.extension),
       );
       if (existsSync(outfile)) continue;
-      runChecked(
-        [
-          process.execPath,
-          "build",
-          build.source,
-          "--compile",
-          `--target=${target.target}`,
-          `--outfile=${outfile}`,
-        ],
-        repoRoot,
-        process.env as Record<string, string>,
-      );
+      if (buildRuntimeBinaries) {
+        runChecked(
+          [
+            process.execPath,
+            "build",
+            build.source,
+            "--compile",
+            `--target=${target.target}`,
+            `--outfile=${outfile}`,
+          ],
+          repoRoot,
+          process.env as Record<string, string>,
+        );
+      } else {
+        writeFileSync(
+          outfile,
+          "PushPals source-only startup test: standalone runtime deliberately unavailable.\n",
+          "utf8",
+        );
+      }
     }
 
     return {
@@ -1183,7 +1194,10 @@ describe("packaged CLI end-to-end", () => {
     "boots packaged Windows runtime with autonomy enabled",
     async () => {
       if (process.platform !== "win32") return;
-      const artifacts = await ensureBuildArtifacts({ buildDockerImage: false });
+      const artifacts = await ensureBuildArtifacts({
+        buildDockerImage: false,
+        buildRuntimeBinaries: false,
+      });
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-autonomy-win-"));
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {
@@ -1261,7 +1275,10 @@ describe("packaged CLI end-to-end", () => {
     "boots every Windows service from isolated source bundles without launching standalone binaries",
     async () => {
       if (process.platform !== "win32") return;
-      const artifacts = await ensureBuildArtifacts({ buildDockerImage: false });
+      const artifacts = await ensureBuildArtifacts({
+        buildDockerImage: false,
+        buildRuntimeBinaries: false,
+      });
       const root = mkdtempSync(join(tmpdir(), "pushpals-cli-e2e-safe-windows-launch-"));
       let proc: ReturnType<typeof Bun.spawn> | null = null;
       try {

@@ -87,6 +87,20 @@ describe("release package payload verification", () => {
     expect(e2eScript.indexOf("cli:bundle")).toBeLessThan(e2eScript.indexOf("bun test"));
   });
 
+  test("hosted Windows CI exercises source-only startup without compiling standalone runtimes", () => {
+    const workflow = readFileSync(join(repoRoot, ".github", "workflows", "cli-e2e.yml"), "utf8");
+    const e2eSource = readFileSync(join(repoRoot, "tests", "integration", "cli.e2e.ts"), "utf8");
+
+    expect(workflow).toContain("Verify isolated Windows source-only runtime startup");
+    expect(workflow).toContain(
+      '--test-name-pattern "boots (packaged Windows runtime|every Windows service)"',
+    );
+    expect(e2eSource).toContain("buildRuntimeBinaries: false");
+    expect(e2eSource).toContain(
+      "PushPals source-only startup test: standalone runtime deliberately unavailable.",
+    );
+  });
+
   test("allows the expected CLI package payload shape without vendored tool binaries", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "README.md" },
