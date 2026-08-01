@@ -686,14 +686,19 @@ async function waitForRuntimeServicesLogPath(
 
 async function waitForLogLine(logPath: string, needle: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  let latestContent = "";
   while (Date.now() < deadline) {
     if (existsSync(logPath)) {
-      const content = readFileSync(logPath, "utf8");
-      if (content.includes(needle)) return;
+      latestContent = readFileSync(logPath, "utf8");
+      if (latestContent.includes(needle)) return;
     }
     await Bun.sleep(300);
   }
-  throw new Error(`Timed out waiting for log line "${needle}" in ${logPath}`);
+  const logTail = latestContent.slice(-24_000);
+  throw new Error(
+    `Timed out waiting for log line "${needle}" in ${logPath}` +
+      (logTail ? `\n--- runtime-services.log tail ---\n${logTail}` : "\nLog remained empty."),
+  );
 }
 
 function parsePidList(text: string): number[] {

@@ -103,10 +103,21 @@ jobs:
           tests/workerpals.worktree-boundary.test.ts
 
       - name: Verify isolated Windows source-only runtime startup
+        env:
+          PUSHPALS_KEEP_E2E_TMP: "1"
         run: >-
           bun test
           --test-name-pattern "boots (packaged Windows runtime|every Windows service)"
           ./tests/integration/cli.e2e.ts
+
+      - name: Upload Windows source-only startup logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-source-only-startup-logs
+          path: ${{ runner.temp }}/pushpals-cli-e2e-*/runtime/logs/**
+          if-no-files-found: warn
+          retention-days: 7
 
   packaged_cli_e2e_linux:
     name: Packaged CLI E2E (Linux)
