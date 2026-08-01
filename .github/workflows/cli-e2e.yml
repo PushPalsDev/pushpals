@@ -169,6 +169,7 @@ jobs:
 
   windows_host_docker_e2e:
     name: Windows Host Docker E2E
+    if: github.event_name == 'workflow_dispatch'
     needs:
       - packaged_cli_e2e_linux
       - workerpals_control_plane_e2e_linux

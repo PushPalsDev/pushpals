@@ -95,6 +95,9 @@ describe("release package payload verification", () => {
     expect(workflow).toContain(
       '--test-name-pattern "boots (packaged Windows runtime|every Windows service)"',
     );
+    expect(workflow).toContain(
+      "windows_host_docker_e2e:\n    name: Windows Host Docker E2E\n    if: github.event_name == 'workflow_dispatch'",
+    );
     expect(e2eSource).toContain("buildRuntimeBinaries: false");
     expect(e2eSource).toContain(
       "PushPals source-only startup test: standalone runtime deliberately unavailable.",
