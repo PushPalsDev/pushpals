@@ -65,6 +65,28 @@ function runVerifier(args: string[]) {
 }
 
 describe("release package payload verification", () => {
+  test("fresh CLI package builds compile the protocol workspace before runtime source bundles", () => {
+    const cliPackage = JSON.parse(
+      readFileSync(join(repoRoot, "packages", "cli", "package.json"), "utf8"),
+    ) as { scripts?: { build?: string } };
+    const buildScript = String(cliPackage.scripts?.build ?? "");
+
+    expect(buildScript.startsWith("bun --cwd ../protocol build && ")).toBe(true);
+    expect(buildScript.indexOf("../protocol build")).toBeLessThan(
+      buildScript.indexOf("sync-cli-runtime-assets.ts"),
+    );
+  });
+
+  test("CLI E2E prebuilds the package before concurrent test files consume it", () => {
+    const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as {
+      scripts?: { "test:cli:e2e"?: string };
+    };
+    const e2eScript = String(rootPackage.scripts?.["test:cli:e2e"] ?? "");
+
+    expect(e2eScript.startsWith("bun run cli:bundle && bun test ")).toBe(true);
+    expect(e2eScript.indexOf("cli:bundle")).toBeLessThan(e2eScript.indexOf("bun test"));
+  });
+
   test("allows the expected CLI package payload shape without vendored tool binaries", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "README.md" },

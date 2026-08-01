@@ -22,7 +22,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun run ../../scripts/sync-cli-runtime-assets.ts && bun run ../../scripts/sync-cli-monitor-ui.ts && bun build ../../scripts/pushpals-cli.ts --target=bun --outfile ./dist/pushpals-cli.js",
+    "build": "bun --cwd ../protocol build && bun run ../../scripts/sync-cli-runtime-assets.ts && bun run ../../scripts/sync-cli-monitor-ui.ts && bun build ../../scripts/pushpals-cli.ts --target=bun --outfile ./dist/pushpals-cli.js",
     "prepack": "bun run build"
   },
   "engines": {
