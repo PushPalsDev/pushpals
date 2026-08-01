@@ -2,27 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.2.21`
-- start_commit: `2a1515319005bf684bcdec9f89e53a7bb08eb908`
-- end_commit: `375fe7fd4599d81330dc614efda155c844d58eee`
-- commits_in_range: `7`
+- version: `v1.2.22`
+- start_commit: `c3356efea7368e09f599faef65fdc62c5886c334`
+- end_commit: `c3356efea7368e09f599faef65fdc62c5886c334`
+- commits_in_range: `0`
 
 ## Highlights
 
-- Isolate Windows npm CLI service startup behind a small Bun launcher process so a blocked or crashed service cannot hold the main CLI event loop or prevent the remaining services from starting.
-- Start Server, LocalBuddy, RemoteBuddy, WorkerPal, and SourceControlManager from packaged source bundles on Windows instead of directly launching large downloaded standalone executables, and skip downloading those unused Windows binaries.
-- Bound every launcher readiness handshake with a 15-second deadline, terminate only the failed launcher, retain per-service diagnostics, and keep shutdown off synchronous process-tree cleanup paths.
-- Follow the configured embedded LocalBuddy port when the CLI owns LocalBuddy startup while preserving explicit remote LocalBuddy URLs.
-- Make clean CLI E2E builds deterministic by building the protocol workspace before packaging, and verify every required source runtime asset in the npm payload.
-- Exercise complete source-only Windows startup on GitHub-hosted Windows runners, preserve failure logs as artifacts, and keep the resource-intensive self-hosted Windows Docker job manual-only.
+- Republish the `v1.2.21` Windows startup-isolation fix as `v1.2.22` without additional product-code changes.
+- Preserve source-bundle startup for Server, LocalBuddy, RemoteBuddy, WorkerPal, and SourceControlManager on Windows, with isolated launcher handshakes, per-service deadlines, configured LocalBuddy port discovery, and service-local failure handling.
+- Keep automatic validation on GitHub-hosted Windows and Linux runners while the resource-intensive self-hosted Windows Docker job remains manual-only.
 
 ## Validation
 
 - Release-playbook root suite in Docker on Bun 1.3.14: 1,075 passed, 7 intentional Windows-only skips, 0 failed, 4,555 assertions across 124 files.
-- Focused CLI runtime-bootstrap suite: 154 passed, 0 failed.
-- GitHub CLI E2E run 30690575582 passed the WorkerPals control-plane Linux E2E, packaged CLI Linux E2E, and GitHub-hosted Windows source-only startup jobs; the self-hosted Windows job was skipped by its manual-only guard.
+- Focused LLM preflight and merge-conflict publication suites: 14 passed, 0 failed after the disposable container received its required Python command compatibility link.
+- GitHub release run 30690968640 passed the Windows autonomy runtime smoke plus published-package smoke on Linux and Windows for the identical `v1.2.21` product commit.
 - `bun run cli:bundle`
 - Normalized `bun run cli:verify-package-payload`: 228 package files, no external toolchain files.
+- Rebuilt packaged runtime and monitor assets produced no tracked-file drift.
 - `git diff --check` passed.
 
 ## Install
