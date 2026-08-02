@@ -451,7 +451,9 @@ export default function DashboardScreen() {
   const claimedRequestsCount =
     systemSummary.queues?.requests?.claimed ?? queueValue(requestCounts, "claimed");
   const pendingJobsCount = systemSummary.queues?.jobs?.pending ?? queueValue(jobCounts, "pending");
-  const runningJobsCount = systemSummary.queues?.jobs?.claimed ?? queueValue(jobCounts, "claimed");
+  const runningJobsCount =
+    (systemSummary.queues?.jobs?.claimed ?? queueValue(jobCounts, "claimed")) +
+    (systemSummary.queues?.jobs?.finalizing ?? queueValue(jobCounts, "finalizing"));
   const failedJobsCount = systemSummary.queues?.jobs?.failed ?? queueValue(jobCounts, "failed");
   const processedCompletionsCount =
     systemSummary.queues?.completions?.processed ?? queueValue(completionCounts, "processed");

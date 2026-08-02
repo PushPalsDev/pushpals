@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { AutonomyStore, type AutonomyEvaluatorScorecard } from "../apps/server/src/autonomy";
+import { CompletionQueue } from "../apps/server/src/completions";
 import { JobQueue } from "../apps/server/src/jobs";
 
 const stores: AutonomyStore[] = [];
@@ -78,6 +79,64 @@ afterEach(() => {
 });
 
 describe("server AutonomyStore policy gates", () => {
+  test("repairs premature success telemetry after legacy publication failure reconciliation", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-lifecycle-");
+    const jobs = new JobQueue(dbPath);
+    let completions = new CompletionQueue(dbPath);
+    const enqueued = jobs.enqueue({
+      taskId: "task-lifecycle",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    const jobId = String(enqueued.jobId ?? "");
+    expect(jobs.claim("worker-lifecycle").job?.id).toBe(jobId);
+    const handoff = completions.enqueue({
+      jobId,
+      sessionId: "dev",
+      message: "legacy candidate",
+    });
+    expect(jobs.complete(jobId, { summary: "premature success" }).ok).toBe(true);
+    expect(
+      store.recordOutcome({
+        patternKey: "lifecycle:publication",
+        jobId,
+        success: true,
+        userAction: "applied",
+      }).ok,
+    ).toBe(true);
+    expect(completions.claim("scm-lifecycle").completion?.id).toBe(handoff.completionId);
+    expect(completions.markFailed(handoff.completionId ?? "", "merge failed").ok).toBe(true);
+
+    completions.close();
+    completions = new CompletionQueue(dbPath);
+    const reconciliation = store.reconcileJobLinkedOutcomeLifecycle();
+    expect(reconciliation).toMatchObject({
+      correctedFailures: 1,
+      removedPrematureSuccesses: 0,
+    });
+    const db = (store as unknown as { db: any }).db;
+    expect(
+      db
+        .prepare(
+          `SELECT success, user_action AS userAction, regression_flag AS regressionFlag
+           FROM autonomy_outcomes WHERE job_id = ?`,
+        )
+        .get(jobId),
+    ).toMatchObject({ success: 0, userAction: "failed", regressionFlag: 1 });
+    expect(
+      db
+        .prepare(
+          `SELECT ema_success AS emaSuccess, fail_streak AS failStreak, sample_count AS sampleCount
+           FROM autonomy_pattern_stats WHERE pattern_key = 'lifecycle:publication'`,
+        )
+        .get(),
+    ).toMatchObject({ emaSuccess: 0, failStreak: 1, sampleCount: 1 });
+
+    completions.close();
+    jobs.close();
+  });
+
   test("createSnapshot builds multi-source state traits", () => {
     const store = makeStore();
     const snapshot = store.createSnapshot({
@@ -2406,9 +2465,7 @@ describe("server AutonomyStore policy gates", () => {
         regressionFlag: true,
       }).ok,
     ).toBe(true);
-    const withNewEvidence = internal.runEvaluator(
-      new Date(firstAtMs + 62_000).toISOString(),
-    );
+    const withNewEvidence = internal.runEvaluator(new Date(firstAtMs + 62_000).toISOString());
     expect(withNewEvidence.recommendation).toBe("pause");
     expect(store.getSafetyState().isFrozen).toBe(true);
   });

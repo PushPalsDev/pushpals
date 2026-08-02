@@ -189,4 +189,38 @@ describe("source_control_manager integration reconciliation", () => {
       prBaseSha: fixture.baseHeadSha,
     });
   }, 20_000);
+
+  test("continues a merge when rerere auto-stages every recorded resolution", async () => {
+    const fixture = await createFixture({ conflicting: true });
+    const gitOps = createGitOps(fixture.scm);
+
+    await gitOps.fetchPrune();
+    await gitOps.alignMainToRemote();
+    await mustGit(fixture.scm, ["config", "rerere.enabled", "true"]);
+    await mustGit(fixture.scm, ["config", "rerere.autoupdate", "true"]);
+
+    const trainingMerge = await runGitCommandCapture(fixture.scm, [
+      "merge",
+      "origin/main",
+      "--no-edit",
+    ]);
+    expect(trainingMerge.ok).toBe(false);
+    writeFileSync(join(fixture.scm, "shared.txt"), "resolved by host\n", "utf8");
+    await mustGit(fixture.scm, ["add", "shared.txt"]);
+    await mustGit(fixture.scm, ["commit", "--no-edit"]);
+
+    await mustGit(fixture.scm, ["checkout", "--detach", fixture.integrationHeadSha]);
+    await mustGit(fixture.scm, [
+      "update-ref",
+      "refs/heads/main_agents",
+      fixture.integrationHeadSha,
+    ]);
+
+    const sync = await gitOps.syncMainWithBaseBranch();
+    expect(sync.status).toBe("updated");
+    if (sync.status !== "updated") throw new Error(`unexpected sync status ${sync.status}`);
+    expect(await gitOps.isAncestor("origin/main", sync.mergedHeadSha)).toBe(true);
+    expect(await Bun.file(join(fixture.scm, "shared.txt")).text()).toBe("resolved by host\n");
+    expect(await gitOps.isRepoClean()).toBe(true);
+  }, 20_000);
 });

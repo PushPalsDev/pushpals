@@ -1,8 +1,216 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CompletionQueue } from "../apps/server/src/completions";
+import { JobQueue } from "../apps/server/src/jobs";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function createSharedQueues(): {
+  jobs: JobQueue;
+  completions: CompletionQueue;
+  jobId: string;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "pushpals-completion-lifecycle-"));
+  tempDirs.push(dir);
+  const dbPath = join(dir, "pushpals.db");
+  const jobs = new JobQueue(dbPath);
+  const completions = new CompletionQueue(dbPath);
+  const enqueued = jobs.enqueue({
+    taskId: "task-publication",
+    sessionId: "dev",
+    kind: "task.execute",
+    params: {},
+    dedupeKey: "publication:test",
+  });
+  const jobId = String(enqueued.jobId ?? "");
+  expect(jobId).not.toBe("");
+  expect(jobs.claim("worker-publication").job?.id).toBe(jobId);
+  return { jobs, completions, jobId };
+}
 
 describe("server CompletionQueue PR URL persistence", () => {
+  test("keeps a handed-off candidate nonterminal until publication succeeds", () => {
+    const { jobs, completions, jobId } = createSharedQueues();
+    const handoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        commitSha: "abc123",
+        branch: "refs/pushpals/agent/worker/job-publication",
+        message: "candidate retained",
+        jobResultSummary: "implemented the requested change",
+      },
+      { beginJobFinalization: true },
+    );
+
+    expect(handoff).toMatchObject({ ok: true, jobStatus: "finalizing" });
+    expect(
+      completions.enqueue(
+        {
+          jobId,
+          sessionId: "dev",
+          commitSha: "abc123",
+          branch: "refs/pushpals/agent/worker/job-publication",
+          message: "candidate retained",
+        },
+        { beginJobFinalization: true },
+      ),
+    ).toMatchObject({
+      ok: true,
+      completionId: handoff.completionId,
+      deduped: true,
+      jobStatus: "finalizing",
+    });
+    expect(jobs.getJob(jobId)?.status).toBe("finalizing");
+    expect(jobs.countByStatus()).toMatchObject({ finalizing: 1, completed: 0 });
+    expect(jobs.countByPriority()).toMatchObject({ normal: 1 });
+    expect(
+      jobs.enqueue({
+        taskId: "task-publication-duplicate",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: {},
+        dedupeKey: "publication:test",
+      }),
+    ).toMatchObject({ ok: true, deduped: true, jobId });
+    expect(jobs.claim("worker-next").ok).toBe(false);
+
+    const claimed = completions.claim("scm-publication");
+    const completed = completions.markProcessedAndFinalizeJob(
+      claimed.completion?.id ?? "",
+      "https://github.com/org/repo/pull/42",
+    );
+    expect(completed).toMatchObject({ ok: true, jobId, jobTransitioned: true });
+    expect(jobs.getJob(jobId)).toMatchObject({
+      status: "completed",
+      prUrl: "https://github.com/org/repo/pull/42",
+      error: null,
+    });
+    expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+      status: "completed",
+      failureClass: "success",
+      terminalStage: "publication",
+    });
+    expect(
+      completions.markProcessedAndFinalizeJob(
+        claimed.completion?.id ?? "",
+        "https://github.com/org/repo/pull/42",
+      ),
+    ).toMatchObject({ ok: true, jobTransitioned: false });
+
+    completions.close();
+    jobs.close();
+  });
+
+  test("turns trusted-environment validation failure into publish_blocked, never completed", () => {
+    const { jobs, completions, jobId } = createSharedQueues();
+    const handoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        commitSha: "def456",
+        branch: "refs/pushpals/agent/worker/job-validation",
+        message: "candidate retained",
+        trustedValidationCommands: ["bun run validate:publish"],
+        jobResultSummary: "host validation required",
+      },
+      { beginJobFinalization: true },
+    );
+    const completionId = handoff.completionId ?? "";
+    expect(jobs.getJob(jobId)?.status).toBe("finalizing");
+    expect(completions.claim("scm-validation").completion?.id).toBe(completionId);
+
+    const failed = completions.markFailedAndBlockJob(
+      completionId,
+      "bun run validate:publish exited with code 1",
+    );
+    expect(failed).toMatchObject({ ok: true, jobId, jobTransitioned: true });
+    expect(jobs.getJob(jobId)).toMatchObject({
+      status: "publish_blocked",
+      completedAt: null,
+    });
+    expect(jobs.countByStatus()).toMatchObject({ completed: 0, publish_blocked: 1 });
+    expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+      status: "publish_blocked",
+      failureClass: "trusted_validation_failed",
+      terminalStage: "trusted_environment_validation",
+    });
+    expect(completions.markFailedAndBlockJob(completionId, "duplicate callback")).toMatchObject({
+      ok: true,
+      jobTransitioned: false,
+    });
+
+    completions.close();
+    jobs.close();
+  });
+
+  test("rejects an invalid handoff without moving the claimed job", () => {
+    const { jobs, completions, jobId } = createSharedQueues();
+    const handoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        message: "candidate retained",
+        trustedValidationCommands: ["bun test && powershell -Command Remove-Item"],
+      },
+      { beginJobFinalization: true },
+    );
+
+    expect(handoff.ok).toBe(false);
+    expect(jobs.getJob(jobId)?.status).toBe("claimed");
+    expect(completions.getPendingCompletions()).toHaveLength(0);
+    completions.close();
+    jobs.close();
+  });
+
+  test("repairs legacy completed jobs whose persisted completion already failed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pushpals-completion-legacy-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "pushpals.db");
+    const jobs = new JobQueue(dbPath);
+    let completions = new CompletionQueue(dbPath);
+    const enqueued = jobs.enqueue({
+      taskId: "task-legacy",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {},
+    });
+    const jobId = String(enqueued.jobId ?? "");
+    expect(jobs.claim("worker-legacy").job?.id).toBe(jobId);
+    const handoff = completions.enqueue({
+      jobId,
+      sessionId: "dev",
+      message: "legacy candidate",
+    });
+    expect(jobs.complete(jobId, { summary: "premature success" }).ok).toBe(true);
+    expect(completions.claim("scm-legacy").completion?.id).toBe(handoff.completionId);
+    expect(completions.markFailed(handoff.completionId ?? "", "merge failed").ok).toBe(true);
+    expect(jobs.getJob(jobId)?.status).toBe("completed");
+
+    completions.close();
+    completions = new CompletionQueue(dbPath);
+    expect(jobs.getJob(jobId)).toMatchObject({
+      status: "publish_blocked",
+      completedAt: null,
+    });
+    expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+      status: "publish_blocked",
+      failureClass: "publication_failed",
+    });
+    completions.close();
+    jobs.close();
+  });
+
   test("persists trusted-validation handoff metadata for SourceControlManager", () => {
     const queue = new CompletionQueue(":memory:");
     const enqueued = queue.enqueue({

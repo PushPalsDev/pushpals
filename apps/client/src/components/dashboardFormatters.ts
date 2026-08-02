@@ -43,7 +43,7 @@ export function statusColor(theme: DashboardTheme, status: string): string {
   ) {
     return theme.danger;
   }
-  if (normalized.includes("initializing")) return theme.warning;
+  if (normalized.includes("initializing") || normalized.includes("finaliz")) return theme.warning;
   if (normalized.includes("busy") || normalized.includes("claim")) return theme.warning;
   if (normalized.includes("progress") || normalized.includes("start")) return theme.warning;
   return theme.accent;

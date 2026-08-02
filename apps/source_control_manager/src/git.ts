@@ -696,11 +696,7 @@ export class GitSourceControlApi implements SourceControlApi {
       "--quiet",
     ]);
     assertOk(checkoutResult, `checkout --detach ${remoteMain}`);
-    const pinResult = await git(this.repoPath, [
-      "update-ref",
-      this.localMainRef,
-      remoteHeadSha,
-    ]);
+    const pinResult = await git(this.repoPath, ["update-ref", this.localMainRef, remoteHeadSha]);
     assertOk(pinResult, `align ${this.localMainRef} to ${remoteMain}`);
     return remoteHeadSha;
   }
@@ -755,7 +751,7 @@ export class GitSourceControlApi implements SourceControlApi {
       };
     }
 
-    const mergeResult = await git(this.repoPath, ["merge", baseRef, "--no-edit"]);
+    let mergeResult = await git(this.repoPath, ["merge", baseRef, "--no-edit"]);
     if (!mergeResult.ok) {
       const conflicts = await git(this.repoPath, ["diff", "--name-only", "--diff-filter=U"]);
       const conflictPaths = conflicts.ok
@@ -764,25 +760,46 @@ export class GitSourceControlApi implements SourceControlApi {
             .map((value) => value.trim().replace(/\\/g, "/"))
             .filter(Boolean)
         : [];
-      const detail = mergeResult.stderr || mergeResult.stdout || "merge failed";
-      await git(this.repoPath, ["merge", "--abort"]);
-      const restore = await git(this.repoPath, [
-        "checkout",
-        "--detach",
-        this.localMainRef,
-        "--quiet",
-      ]);
-      assertOk(restore, `restore ${this.localMainRef} after base-sync conflict`);
+      let detail = mergeResult.stderr || mergeResult.stdout || "merge failed";
+
+      // With rerere.autoupdate enabled, Git can reuse and stage every recorded
+      // conflict resolution while still returning the original merge exit code
+      // of 1. That is a valid, continuable merge state, not an unknown failure.
+      // Only continue when MERGE_HEAD exists, no unmerged paths remain, and the
+      // index contains staged changes. Every other failure still aborts below.
       if (conflictPaths.length === 0) {
-        throw new Error(`Failed to sync ${this.mainBranch} with ${baseRef}: ${detail}`);
+        const mergeHead = await git(this.repoPath, ["rev-parse", "--verify", "MERGE_HEAD"]);
+        const stagedDiff = await git(this.repoPath, ["diff", "--cached", "--quiet"]);
+        if (mergeHead.ok && stagedDiff.exitCode === 1) {
+          const continued = await git(this.repoPath, ["commit", "--no-edit"]);
+          if (continued.ok) {
+            mergeResult = continued;
+          } else {
+            detail = [detail, continued.stderr, continued.stdout].filter(Boolean).join("\n");
+          }
+        }
       }
-      return {
-        status: "conflicted",
-        integrationHeadSha,
-        baseHeadSha,
-        conflictPaths,
-        detail,
-      };
+
+      if (!mergeResult.ok) {
+        await git(this.repoPath, ["merge", "--abort"]);
+        const restore = await git(this.repoPath, [
+          "checkout",
+          "--detach",
+          this.localMainRef,
+          "--quiet",
+        ]);
+        assertOk(restore, `restore ${this.localMainRef} after base-sync conflict`);
+        if (conflictPaths.length === 0) {
+          throw new Error(`Failed to sync ${this.mainBranch} with ${baseRef}: ${detail}`);
+        }
+        return {
+          status: "conflicted",
+          integrationHeadSha,
+          baseHeadSha,
+          conflictPaths,
+          detail,
+        };
+      }
     }
     const pinResult = await git(this.repoPath, ["update-ref", this.localMainRef, "HEAD"]);
     assertOk(pinResult, `update-ref ${this.localMainRef} HEAD`);

@@ -432,7 +432,14 @@ export interface JobSnapshotRow {
   queueWaitBudgetMs?: number | null;
   executionBudgetMs?: number | null;
   finalizationBudgetMs?: number | null;
-  status: "pending" | "claimed" | "completed" | "failed" | "abandoned" | "publish_blocked";
+  status:
+    | "pending"
+    | "claimed"
+    | "finalizing"
+    | "completed"
+    | "failed"
+    | "abandoned"
+    | "publish_blocked";
   workerId: string | null;
   targetWorkerId: string | null;
   result: string | null;
@@ -742,9 +749,7 @@ function authHeaders(authToken?: string): Record<string, string> {
 }
 
 function stringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((entry) => typeof entry === "string").map(String)
-    : [];
+  return Array.isArray(value) ? value.filter((entry) => typeof entry === "string").map(String) : [];
 }
 
 export async function fetchWorkers(

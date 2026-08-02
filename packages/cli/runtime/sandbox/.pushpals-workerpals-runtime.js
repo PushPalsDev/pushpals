@@ -14215,10 +14215,12 @@ ${result.stdout ?? ""}`.toLowerCase();
   return /stalled before first response|startup stall/.test(text);
 }
 function inferWorkerTerminalFailureClass(result) {
-  if (result.ok)
-    return "success";
   if (result.publishBlocked?.stage === "validation")
     return "environment";
+  if (result.validationBlocked)
+    return "trusted_validation_required";
+  if (result.ok)
+    return "success";
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text = `${result.summary ?? ""}
 ${result.stderr ?? ""}
@@ -14256,6 +14258,8 @@ function buildPhaseSpanDiagnostics(spans, attempt, fallbackFinishedAtMs, outcome
   });
 }
 function shouldEmitDirectSessionJobEvent(options) {
+  if (options.finalizing)
+    return false;
   if (options.ok)
     return true;
   return !options.statusPersistedToServer;
@@ -14865,7 +14869,7 @@ function normalizeReviewLeaseBranch(value) {
   }
   return branch;
 }
-async function enqueueCompletion(server, headers, workerId, integrationBranch, job, commit, resultSummary, validationBlocked) {
+async function enqueueCompletion(server, headers, workerId, integrationBranch, job, commit, result) {
   try {
     const reviewAgent = job.params?.reviewAgent && typeof job.params.reviewAgent === "object" ? job.params.reviewAgent : null;
     const prUrl = reviewAgent && typeof reviewAgent.prUrl === "string" && reviewAgent.prUrl.trim().length > 0 ? reviewAgent.prUrl.trim() : null;
@@ -14874,7 +14878,7 @@ async function enqueueCompletion(server, headers, workerId, integrationBranch, j
       integrationBranch,
       job,
       commit,
-      resultSummary
+      resultSummary: result.summary
     });
     const resolutionType = String(reviewAgent?.resolutionType ?? "").trim().toLowerCase();
     const reviewTargetBranch = normalizeReviewLeaseBranch(reviewAgent?.prHeadRef);
@@ -14901,7 +14905,12 @@ async function enqueueCompletion(server, headers, workerId, integrationBranch, j
       prUrl,
       prTitle: pr.title,
       prBody: completionPrBody,
-      ...buildTrustedValidationCompletionPayload(validationBlocked)
+      jobResultSummary: result.summary,
+      jobArtifacts: [
+        ...result.stdout ? [{ kind: "stdout", text: result.stdout }] : [],
+        ...result.stderr ? [{ kind: "stderr", text: result.stderr }] : []
+      ],
+      ...buildTrustedValidationCompletionPayload(result.validationBlocked)
     });
     if (response.ok) {
       console.log(`[WorkerPals] Enqueued completion for job ${job.id} (commit ${commit.sha})`);
@@ -15280,6 +15289,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
               }
             }
             ({ result, completionCommit } = holdCommitForTrustedValidation(result, completionCommit));
+            let completionEnqueued = false;
             if (completionCommit) {
               const enqueued = await enqueueCompletion(opts.server, headers, opts.workerId, integrationBranchName(), {
                 id: job.id,
@@ -15287,16 +15297,18 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
                 kind: job.kind,
                 sessionId: job.sessionId,
                 params: parsedParams
-              }, completionCommit, result.summary, result.validationBlocked);
+              }, completionCommit, result);
               if (!enqueued) {
                 result = failCompletionEnqueue(result, completionCommit);
+              } else {
+                completionEnqueued = true;
               }
             }
             const finalizedAtMs = Date.now();
             const jobAttemptRaw = Number(job.attempt ?? 1);
             const jobAttempt = Number.isFinite(jobAttemptRaw) && jobAttemptRaw > 0 ? Math.floor(jobAttemptRaw) : 1;
             const llm = workerLlmConfig(CONFIG);
-            const terminalFailureClass = inferWorkerTerminalFailureClass(result);
+            const terminalFailureClass = completionEnqueued ? result.validationBlocked ? "trusted_validation_required" : "publication_pending" : inferWorkerTerminalFailureClass(result);
             result = {
               ...result,
               diagnostics: mergeWorkerDiagnostics(result.diagnostics, {
@@ -15319,10 +15331,10 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
                     }
                   }
                 ],
-                phaseSpans: buildPhaseSpanDiagnostics(phaseSpans, jobAttempt, finalizedAtMs, result.ok ? "completed" : result.publishBlocked ? "publish_blocked" : "failed"),
+                phaseSpans: buildPhaseSpanDiagnostics(phaseSpans, jobAttempt, finalizedAtMs, completionEnqueued ? "finalizing" : result.ok ? "completed" : result.publishBlocked ? "publish_blocked" : "failed"),
                 terminal: {
                   failureClass: terminalFailureClass,
-                  terminalStage: terminalFailureClass === "codex_startup_stall" ? "executor_startup" : currentJobPhase ?? (result.ok ? "completed" : "worker"),
+                  terminalStage: terminalFailureClass === "codex_startup_stall" ? "executor_startup" : completionEnqueued ? result.validationBlocked ? "trusted_environment_validation" : "publication" : currentJobPhase ?? (result.ok ? "completed" : "worker"),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
                   watchdogFired: /watchdog|rollout coach|stalled before first response|startup stall|timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(`${result.summary}
@@ -15358,6 +15370,9 @@ ${result.stdout ?? ""}`),
               });
               statusPersistedToServer = response.ok;
               console.log(`[WorkerPals] Job ${job.id} publish-blocked in ${formatDurationMs(jobDurationMs)}: ${result.summary}`);
+            } else if (result.ok && completionEnqueued) {
+              statusPersistedToServer = true;
+              console.log(`[WorkerPals] Job ${job.id} is finalizing after ${formatDurationMs(jobDurationMs)}: ${result.summary}`);
             } else if (result.ok) {
               const reviewAgent = parsedParams.reviewAgent && typeof parsedParams.reviewAgent === "object" ? parsedParams.reviewAgent : null;
               const jobPrUrl = reviewAgent && typeof reviewAgent.prUrl === "string" && reviewAgent.prUrl.trim().length > 0 ? reviewAgent.prUrl.trim() : null;
@@ -15429,7 +15444,7 @@ ${result.stdout ?? ""}`),
             if (job.sessionId && !deferredForDirectRetry) {
               const jobOrigin = taskExecuteOrigin2(parsedParams);
               const responseMode = String(parsedParams.responseMode ?? "").trim().toLowerCase();
-              if (responseMode === "assistant_message") {
+              if (responseMode === "assistant_message" && !completionEnqueued) {
                 const maxResponseCharsRaw = Number(parsedParams.maxResponseChars ?? 8000);
                 const maxResponseChars = Number.isFinite(maxResponseCharsRaw) && maxResponseCharsRaw >= 256 ? Math.min(maxResponseCharsRaw, 20000) : 8000;
                 const rawText = result.ok ? String(result.stdout ?? result.summary ?? "").trim() : `Worker failed to complete request: ${String(result.summary ?? "unknown error").trim()}`;
@@ -15442,7 +15457,11 @@ ${result.stdout ?? ""}`),
                   }, { priority: "high" });
                 }
               }
-              if (shouldEmitDirectSessionJobEvent({ ok: result.ok, statusPersistedToServer })) {
+              if (shouldEmitDirectSessionJobEvent({
+                ok: result.ok,
+                statusPersistedToServer,
+                finalizing: completionEnqueued
+              })) {
                 const eventCmd = result.ok ? {
                   type: "job_completed",
                   payload: {

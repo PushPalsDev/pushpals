@@ -52,6 +52,7 @@ function toTraceJobStatus(status: JobSnapshotRow["status"]): JobStatus {
   switch (status) {
     case "pending":
     case "claimed":
+    case "finalizing":
     case "completed":
     case "failed":
     case "abandoned":
@@ -103,7 +104,9 @@ function isNewerOrSame(snapshotTs: string, existingTs: string): boolean {
 }
 
 function shouldPromoteSnapshotJob(existing: Job, snapshot: Job): boolean {
-  return isTerminalJobStatus(snapshot.status) && isNewerOrSame(snapshot.ts, existing.ts);
+  if (!isNewerOrSame(snapshot.ts, existing.ts)) return false;
+  if (isTerminalJobStatus(snapshot.status)) return true;
+  return snapshot.status === "finalizing" && existing.status !== "finalizing";
 }
 
 function mergeSnapshotJob(existing: Job, snapshot: Job): Job {

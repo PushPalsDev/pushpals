@@ -518,8 +518,9 @@ function isCodexStartupStallResult(result: JobResult): boolean {
 }
 
 export function inferWorkerTerminalFailureClass(result: JobResult): string {
-  if (result.ok) return "success";
   if (result.publishBlocked?.stage === "validation") return "environment";
+  if (result.validationBlocked) return "trusted_validation_required";
+  if (result.ok) return "success";
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text =
     `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
@@ -558,7 +559,9 @@ function buildPhaseSpanDiagnostics(
 export function shouldEmitDirectSessionJobEvent(options: {
   ok: boolean;
   statusPersistedToServer: boolean;
+  finalizing?: boolean;
 }): boolean {
+  if (options.finalizing) return false;
   if (options.ok) return true;
   return !options.statusPersistedToServer;
 }
@@ -1359,8 +1362,7 @@ async function enqueueCompletion(
     params?: Record<string, unknown>;
   },
   commit: CommitRef,
-  resultSummary: string,
-  validationBlocked?: WorkerJobResult["validationBlocked"],
+  result: WorkerJobResult,
 ): Promise<boolean> {
   try {
     const reviewAgent =
@@ -1376,7 +1378,7 @@ async function enqueueCompletion(
       integrationBranch,
       job,
       commit,
-      resultSummary,
+      resultSummary: result.summary,
     });
     const resolutionType = String(reviewAgent?.resolutionType ?? "")
       .trim()
@@ -1420,7 +1422,12 @@ async function enqueueCompletion(
       prUrl,
       prTitle: pr.title,
       prBody: completionPrBody,
-      ...buildTrustedValidationCompletionPayload(validationBlocked),
+      jobResultSummary: result.summary,
+      jobArtifacts: [
+        ...(result.stdout ? [{ kind: "stdout", text: result.stdout }] : []),
+        ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),
+      ],
+      ...buildTrustedValidationCompletionPayload(result.validationBlocked),
     });
 
     if (response.ok) {
@@ -1980,6 +1987,7 @@ async function workerLoop(
               completionCommit,
             ));
 
+            let completionEnqueued = false;
             if (completionCommit) {
               const enqueued = await enqueueCompletion(
                 opts.server,
@@ -1994,11 +2002,12 @@ async function workerLoop(
                   params: parsedParams,
                 },
                 completionCommit,
-                result.summary,
-                result.validationBlocked,
+                result,
               );
               if (!enqueued) {
                 result = failCompletionEnqueue(result, completionCommit);
+              } else {
+                completionEnqueued = true;
               }
             }
 
@@ -2007,7 +2016,11 @@ async function workerLoop(
             const jobAttempt =
               Number.isFinite(jobAttemptRaw) && jobAttemptRaw > 0 ? Math.floor(jobAttemptRaw) : 1;
             const llm = workerLlmConfig(CONFIG);
-            const terminalFailureClass = inferWorkerTerminalFailureClass(result);
+            const terminalFailureClass = completionEnqueued
+              ? result.validationBlocked
+                ? "trusted_validation_required"
+                : "publication_pending"
+              : inferWorkerTerminalFailureClass(result);
             result = {
               ...result,
               diagnostics: mergeWorkerDiagnostics(result.diagnostics, {
@@ -2034,14 +2047,24 @@ async function workerLoop(
                   phaseSpans,
                   jobAttempt,
                   finalizedAtMs,
-                  result.ok ? "completed" : result.publishBlocked ? "publish_blocked" : "failed",
+                  completionEnqueued
+                    ? "finalizing"
+                    : result.ok
+                      ? "completed"
+                      : result.publishBlocked
+                        ? "publish_blocked"
+                        : "failed",
                 ),
                 terminal: {
                   failureClass: terminalFailureClass,
                   terminalStage:
                     terminalFailureClass === "codex_startup_stall"
                       ? "executor_startup"
-                      : (currentJobPhase ?? (result.ok ? "completed" : "worker")),
+                      : completionEnqueued
+                        ? result.validationBlocked
+                          ? "trusted_environment_validation"
+                          : "publication"
+                        : (currentJobPhase ?? (result.ok ? "completed" : "worker")),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
                   watchdogFired:
@@ -2084,6 +2107,11 @@ async function workerLoop(
               statusPersistedToServer = response.ok;
               console.log(
                 `[WorkerPals] Job ${job.id} publish-blocked in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+              );
+            } else if (result.ok && completionEnqueued) {
+              statusPersistedToServer = true;
+              console.log(
+                `[WorkerPals] Job ${job.id} is finalizing after ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
               );
             } else if (result.ok) {
               const reviewAgent =
@@ -2200,7 +2228,7 @@ async function workerLoop(
               const responseMode = String(parsedParams.responseMode ?? "")
                 .trim()
                 .toLowerCase();
-              if (responseMode === "assistant_message") {
+              if (responseMode === "assistant_message" && !completionEnqueued) {
                 const maxResponseCharsRaw = Number(parsedParams.maxResponseChars ?? 8000);
                 const maxResponseChars =
                   Number.isFinite(maxResponseCharsRaw) && maxResponseCharsRaw >= 256
@@ -2229,7 +2257,13 @@ async function workerLoop(
                 }
               }
 
-              if (shouldEmitDirectSessionJobEvent({ ok: result.ok, statusPersistedToServer })) {
+              if (
+                shouldEmitDirectSessionJobEvent({
+                  ok: result.ok,
+                  statusPersistedToServer,
+                  finalizing: completionEnqueued,
+                })
+              ) {
                 const eventCmd = result.ok
                   ? {
                       type: "job_completed" as const,

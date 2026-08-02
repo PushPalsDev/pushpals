@@ -76,6 +76,7 @@ describe("workerpals session event emission", () => {
     expect(held.result.ok).toBe(true);
     expect(held.result.publishBlocked).toBeUndefined();
     expect(held.result.summary).toContain("queued for host-side validation");
+    expect(inferWorkerTerminalFailureClass(held.result)).toBe("trusted_validation_required");
   });
 
   test("retains the candidate and reports publish-blocked when trusted handoff fails", () => {
@@ -148,6 +149,16 @@ describe("workerpals session event emission", () => {
         statusPersistedToServer: true,
       }),
     ).toBe(true);
+  });
+
+  test("does not emit job_completed while a candidate is still finalizing", () => {
+    expect(
+      shouldEmitDirectSessionJobEvent({
+        ok: true,
+        statusPersistedToServer: true,
+        finalizing: true,
+      }),
+    ).toBe(false);
   });
 
   test("suppresses duplicate direct failure events when server fail hook accepted the status", () => {

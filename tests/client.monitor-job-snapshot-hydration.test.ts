@@ -120,6 +120,31 @@ describe("monitor trace hydration", () => {
     });
   });
 
+  test("promotes a claimed live job to the durable finalizing phase", () => {
+    const liveJob: Job = {
+      jobId: "job-1",
+      taskId: "task-1",
+      kind: "task.execute",
+      status: "claimed",
+      workerId: "workerpal-live",
+      ts: "2026-05-16T09:00:04.000Z",
+    };
+
+    const state = hydrateMonitorTraceState(withLiveJob(liveJob), [
+      jobSnapshot({
+        status: "finalizing",
+        workerId: "workerpal-live",
+        result: JSON.stringify({ summary: "awaiting trusted validation" }),
+        updatedAt: "2026-05-16T09:00:05.000Z",
+      }),
+    ]);
+
+    expect(state.jobs.get("job-1")).toMatchObject({
+      status: "finalizing",
+      summary: "awaiting trusted validation",
+    });
+  });
+
   test("marks an existing task completed when its stale live job hydrates terminal", () => {
     const liveJob: Job = {
       jobId: "job-1",

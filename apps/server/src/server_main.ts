@@ -42,6 +42,16 @@ const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
+const lifecycleReconciliation = autonomyStore.reconcileJobLinkedOutcomeLifecycle();
+if (
+  lifecycleReconciliation.correctedFailures > 0 ||
+  lifecycleReconciliation.removedPrematureSuccesses > 0 ||
+  lifecycleReconciliation.correctedObjectives > 0
+) {
+  console.warn(
+    `[Server] Reconciled legacy completion lifecycle state: ${JSON.stringify(lifecycleReconciliation)}`,
+  );
+}
 const clientPresence = new ClientPresenceRegistry();
 const clientPresencePruneTimer = setInterval(() => {
   const removed = clientPresence.pruneExpired();
@@ -1709,6 +1719,7 @@ export function createRequestHandler() {
             "all",
             "pending",
             "claimed",
+            "finalizing",
             "completed",
             "failed",
             "abandoned",
@@ -1723,6 +1734,7 @@ export function createRequestHandler() {
             | "all"
             | "pending"
             | "claimed"
+            | "finalizing"
             | "completed"
             | "failed"
             | "abandoned"
@@ -2239,7 +2251,16 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = completionQueue.enqueue(body);
+        const result = completionQueue.enqueue(body, { beginJobFinalization: true });
+        if (result.ok) {
+          const jobId = compactText(body.jobId, 128);
+          if (jobId) {
+            autonomyStore.markObjectiveRunningByJobId(jobId);
+            console.log(
+              `[Server] Job ${jobId} is finalizing via completion ${result.completionId ?? "unknown"}`,
+            );
+          }
+        }
         return makeJson(result, result.ok ? 201 : 400);
       }
 
@@ -2263,17 +2284,47 @@ export function createRequestHandler() {
         const completionId = compProcMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const prUrl = typeof body.prUrl === "string" ? body.prUrl : null;
-        const result = completionQueue.markProcessed(completionId, prUrl);
-        if (result.ok && prUrl) {
-          const completion = completionQueue.getCompletion(completionId);
-          if (completion?.jobId) {
-            const syncResult = jobQueue.setPrUrl(completion.jobId, prUrl);
-            if (!syncResult.ok) {
-              console.warn(
-                `[Server] Completion ${completionId} marked processed, but failed to sync job PR URL for ${completion.jobId}: ${syncResult.message ?? "unknown error"}`,
-              );
-            }
+        const result = completionQueue.markProcessedAndFinalizeJob(completionId, prUrl);
+        if (result.ok && result.jobTransitioned && result.jobId) {
+          const job = jobQueue.getJob(result.jobId);
+          const params = parseJsonRecord(job?.params ?? "");
+          const origin = deriveJobOrigin(params);
+          const requestId = compactText(params.requestId, 128);
+          const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
+          if (outcomeContext) {
+            autonomyStore.recordOutcome({
+              objectiveId: outcomeContext.objectiveId,
+              requestId: outcomeContext.requestId ?? requestId,
+              jobId: result.jobId,
+              patternKey: outcomeContext.patternKey,
+              success: true,
+              latencyMs: result.durationMs ?? null,
+              userAction: "applied",
+              reopenedWithin24h: false,
+              regressionFlag: false,
+            });
           }
+          if (job?.sessionId) {
+            const session = sessionManager.getSession(job.sessionId);
+            const savedResult = parseJsonRecord(job.result ?? "");
+            session?.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: new Date().toISOString(),
+              sessionId: job.sessionId,
+              type: "job_completed",
+              from: "server:completion-processed",
+              payload: {
+                jobId: result.jobId,
+                summary:
+                  compactText(savedResult.summary, 1200) || "Candidate published successfully",
+                origin,
+              },
+            });
+          }
+          console.log(
+            `[Server] Job ${result.jobId} completed after publication confirmation (${result.durationMs ?? "unknown"}ms)`,
+          );
         }
         return makeJson(result, result.ok ? 200 : 400);
       }
@@ -2287,7 +2338,45 @@ export function createRequestHandler() {
         const completionId = compFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const error = (body.error as string) ?? "Unknown error";
-        const result = completionQueue.markFailed(completionId, error);
+        const result = completionQueue.markFailedAndBlockJob(completionId, error);
+        if (result.ok && result.jobTransitioned && result.jobId) {
+          const job = jobQueue.getJob(result.jobId);
+          const params = parseJsonRecord(job?.params ?? "");
+          const origin = deriveJobOrigin(params);
+          const requestId = compactText(params.requestId, 128);
+          const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
+          if (outcomeContext) {
+            autonomyStore.recordOutcome({
+              objectiveId: outcomeContext.objectiveId,
+              requestId: outcomeContext.requestId ?? requestId,
+              jobId: result.jobId,
+              patternKey: outcomeContext.patternKey,
+              success: false,
+              latencyMs: result.durationMs ?? null,
+              userAction: "failed",
+              reopenedWithin24h: false,
+              regressionFlag: true,
+            });
+          }
+          if (job?.sessionId) {
+            const session = sessionManager.getSession(job.sessionId);
+            session?.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: new Date().toISOString(),
+              sessionId: job.sessionId,
+              type: "job_failed",
+              from: "server:completion-fail-hook",
+              payload: {
+                jobId: result.jobId,
+                message: "Candidate publication failed",
+                origin,
+                detail: compactText(error, 600),
+              },
+            });
+          }
+          console.warn(`[Server] Job ${result.jobId} publish-blocked: ${error}`);
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 

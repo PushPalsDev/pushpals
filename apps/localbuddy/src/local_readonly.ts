@@ -1,6 +1,7 @@
 type QueueCounts = {
   pending: number;
   claimed: number;
+  finalizing?: number;
   completed: number;
   failed: number;
 };
@@ -163,7 +164,7 @@ async function buildSystemStatusReply(ctx: LocalReadonlyContext): Promise<string
     `System status: workers online ${workers.online}/${workers.total} ` +
     `(busy ${workers.busy}, idle ${workers.idle}). ` +
     `Requests p/c/d/f: ${requests.pending}/${requests.claimed}/${requests.completed}/${requests.failed}. ` +
-    `Jobs p/c/d/f: ${jobs.pending}/${jobs.claimed}/${jobs.completed}/${jobs.failed}. ` +
+    `Jobs pending/claimed/finalizing/completed/failed: ${jobs.pending}/${jobs.claimed}/${jobs.finalizing ?? 0}/${jobs.completed}/${jobs.failed}. ` +
     `Completions p/c/pr/f: ${completions.pending}/${completions.claimed}/${completions.processed}/${completions.failed}.`
   );
 }

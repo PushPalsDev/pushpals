@@ -120,8 +120,8 @@ export function JobsPane({
           theme={theme}
         />
         <MetricTile
-          title="Running Jobs"
-          value={String(queueValue(jobCounts, "claimed"))}
+          title="Running / Finalizing"
+          value={String(queueValue(jobCounts, "claimed") + queueValue(jobCounts, "finalizing"))}
           tone="accent"
           theme={theme}
         />
@@ -216,13 +216,15 @@ export function JobsPane({
                     ? `queue #${queueMeta.position} (eta ${formatEtaMs(queueMeta.etaMs)})`
                     : item.status === "claimed"
                       ? "running"
-                      : item.status === "abandoned"
-                        ? "abandoned"
-                      : item.status === "publish_blocked"
-                        ? "publish blocked"
-                      : elapsedMs != null
-                        ? `elapsed ${formatDuration(elapsedMs)}`
-                        : "terminal";
+                      : item.status === "finalizing"
+                        ? "validating / publishing"
+                        : item.status === "abandoned"
+                          ? "abandoned"
+                          : item.status === "publish_blocked"
+                            ? "publish blocked"
+                            : elapsedMs != null
+                              ? `elapsed ${formatDuration(elapsedMs)}`
+                              : "terminal";
 
                 return (
                   <View style={[styles.jobRow, { borderColor: theme.border }]}>

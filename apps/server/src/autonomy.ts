@@ -2492,10 +2492,7 @@ export class AutonomyStore {
         )
         .get() as { evidence_key: string | null } | undefined;
       const safety = this.getSafetyState(nowIso);
-      if (
-        !safety.isFrozen &&
-        asString(consumedEvidence?.evidence_key) === evaluatorEvidenceKey
-      ) {
+      if (!safety.isFrozen && asString(consumedEvidence?.evidence_key) === evaluatorEvidenceKey) {
         recommendation = "constrain";
       }
     }
@@ -7057,6 +7054,175 @@ export class AutonomyStore {
            AND status IN ('dispatched','gated','blocked','needs_clarification')`,
       )
       .run(asIsoNow(), jobId);
+  }
+
+  /**
+   * Repair outcome rows written by releases that completed jobs before their
+   * completion handoff reached a terminal publication result.
+   */
+  reconcileJobLinkedOutcomeLifecycle(): {
+    correctedFailures: number;
+    removedPrematureSuccesses: number;
+    correctedObjectives: number;
+  } {
+    const affectedPatterns = this.db
+      .prepare(
+        `SELECT DISTINCT ao.pattern_key AS patternKey
+         FROM autonomy_outcomes ao
+         JOIN jobs j ON j.id = ao.job_id
+         WHERE ao.success = 1
+           AND j.status IN ('finalizing', 'failed', 'abandoned', 'publish_blocked')`,
+      )
+      .all() as Array<{ patternKey: string }>;
+    if (affectedPatterns.length === 0) {
+      return {
+        correctedFailures: 0,
+        removedPrematureSuccesses: 0,
+        correctedObjectives: 0,
+      };
+    }
+
+    const now = asIsoNow();
+    let correctedFailures = 0;
+    let removedPrematureSuccesses = 0;
+    let correctedObjectives = 0;
+    const tx = this.db.transaction(() => {
+      const removed = this.db
+        .prepare(
+          `DELETE FROM autonomy_outcomes
+           WHERE success = 1
+             AND job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')`,
+        )
+        .run();
+      removedPrematureSuccesses = Number(removed.changes ?? 0);
+
+      const corrected = this.db
+        .prepare(
+          `UPDATE autonomy_outcomes
+           SET success = 0,
+               user_action = 'failed',
+               reopened_within_24h = 0,
+               regression_flag = 1
+           WHERE success = 1
+             AND job_id IN (
+               SELECT id FROM jobs
+               WHERE status IN ('failed', 'abandoned', 'publish_blocked')
+             )`,
+        )
+        .run();
+      correctedFailures = Number(corrected.changes ?? 0);
+
+      const runningObjectives = this.db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET status = 'running', updated_at = ?
+           WHERE job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')
+             AND status IN ('completed', 'failed')`,
+        )
+        .run(now);
+      const failedObjectives = this.db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET status = 'failed', updated_at = ?
+           WHERE job_id IN (
+             SELECT id FROM jobs
+             WHERE status IN ('failed', 'abandoned', 'publish_blocked')
+           )
+             AND status <> 'failed'`,
+        )
+        .run(now);
+      correctedObjectives =
+        Number(runningObjectives.changes ?? 0) + Number(failedObjectives.changes ?? 0);
+
+      for (const affected of affectedPatterns) {
+        const patternKey = asString(affected.patternKey);
+        if (!patternKey) continue;
+        const rows = this.db
+          .prepare(
+            `SELECT success, latency_ms AS latencyMs, user_action AS userAction,
+                    reopened_within_24h AS reopenedWithin24h
+             FROM autonomy_outcomes
+             WHERE pattern_key = ?
+             ORDER BY id ASC`,
+          )
+          .all(patternKey) as Array<{
+          success: number;
+          latencyMs: number | null;
+          userAction: string | null;
+          reopenedWithin24h: number;
+        }>;
+        if (rows.length === 0) {
+          this.db
+            .prepare(`DELETE FROM autonomy_pattern_stats WHERE pattern_key = ?`)
+            .run(patternKey);
+          continue;
+        }
+
+        let emaSuccess = 0;
+        let emaUserAccept = 0;
+        let emaLatency = 0;
+        let emaRegret = 0;
+        let failStreak = 0;
+        const ema = (previous: number, current: number) =>
+          this.alpha * current + (1 - this.alpha) * previous;
+        for (const row of rows) {
+          const success = Number(row.success) === 1;
+          const userAction = asString(row.userAction).toLowerCase();
+          emaSuccess = ema(emaSuccess, success ? 1 : 0);
+          emaUserAccept = ema(
+            emaUserAccept,
+            ["accepted", "manual_fix", "override_dispatch", "applied"].includes(userAction) ? 1 : 0,
+          );
+          if (typeof row.latencyMs === "number" && Number.isFinite(row.latencyMs)) {
+            emaLatency = ema(emaLatency, clamp01(1 - row.latencyMs / 600_000));
+          }
+          emaRegret = ema(
+            emaRegret,
+            Number(row.reopenedWithin24h) === 1 || ["rejected", "cancelled"].includes(userAction)
+              ? 1
+              : 0,
+          );
+          failStreak = success ? 0 : failStreak + 1;
+        }
+        const cooldownThreshold = Math.max(
+          1,
+          Math.floor(this.config.remotebuddy.autonomy.cooldownFailStreakThreshold),
+        );
+        const cooldownUntil =
+          failStreak >= cooldownThreshold
+            ? new Date(Date.parse(now) + this.config.remotebuddy.autonomy.cooldownMs).toISOString()
+            : null;
+        this.db
+          .prepare(
+            `INSERT INTO autonomy_pattern_stats (
+               pattern_key, ema_success, ema_user_accept, ema_latency, ema_regret,
+               fail_streak, cooldown_until, sample_count, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(pattern_key) DO UPDATE SET
+               ema_success = excluded.ema_success,
+               ema_user_accept = excluded.ema_user_accept,
+               ema_latency = excluded.ema_latency,
+               ema_regret = excluded.ema_regret,
+               fail_streak = excluded.fail_streak,
+               cooldown_until = excluded.cooldown_until,
+               sample_count = excluded.sample_count,
+               updated_at = excluded.updated_at`,
+          )
+          .run(
+            patternKey,
+            emaSuccess,
+            emaUserAccept,
+            emaLatency,
+            emaRegret,
+            failStreak,
+            cooldownUntil,
+            rows.length,
+            now,
+          );
+      }
+    });
+    tx();
+    return { correctedFailures, removedPrematureSuccesses, correctedObjectives };
   }
 
   close(): void {

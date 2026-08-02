@@ -16,6 +16,7 @@ import {
 export type JobStatus =
   | "pending"
   | "claimed"
+  | "finalizing"
   | "completed"
   | "failed"
   | "abandoned"
@@ -473,7 +474,9 @@ function jobFailureText(value: unknown): string {
 
 function nestedFailureCommand(value: unknown): string {
   const text = jobFailureText(value);
-  const scriptMatches = [...text.matchAll(/error:\s*script\s+"([^"]+)"\s+(?:exited|was terminated)/gi)];
+  const scriptMatches = [
+    ...text.matchAll(/error:\s*script\s+"([^"]+)"\s+(?:exited|was terminated)/gi),
+  ];
   const nestedScript = scriptMatches.at(-1)?.[1]?.trim();
   if (nestedScript) return normalizeFailureCommand(`bun run ${nestedScript}`);
   const unchanged = text.match(
@@ -1111,12 +1114,15 @@ export class JobQueue {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_created ON jobs(dedupeKey, createdAt);`,
     );
+    // Keep publication-in-flight jobs active for dedupe. Recreate the partial
+    // index so databases made by older releases pick up the finalizing state.
+    this.db.exec(`DROP INDEX IF EXISTS idx_jobs_dedupe_active;`);
     this.db.exec(
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active
+      `CREATE UNIQUE INDEX idx_jobs_dedupe_active
          ON jobs(dedupeKey)
        WHERE dedupeKey IS NOT NULL
          AND dedupeKey <> ''
-         AND status IN ('pending','claimed');`,
+         AND status IN ('pending','claimed','finalizing');`,
     );
 
     this.db.exec(`
@@ -1368,7 +1374,7 @@ export class JobQueue {
           `SELECT id, taskId
            FROM jobs
            WHERE dedupeKey = ?
-             AND status IN ('pending', 'claimed')
+             AND status IN ('pending', 'claimed', 'finalizing')
            ORDER BY createdAt DESC
            LIMIT 1`,
         )
@@ -1454,7 +1460,7 @@ export class JobQueue {
             `SELECT id, taskId
              FROM jobs
              WHERE dedupeKey = ?
-               AND status IN ('pending', 'claimed')
+               AND status IN ('pending', 'claimed', 'finalizing')
              ORDER BY createdAt DESC
              LIMIT 1`,
           )
@@ -2703,6 +2709,7 @@ export class JobQueue {
     const counts: Record<JobStatus, number> = {
       pending: 0,
       claimed: 0,
+      finalizing: 0,
       completed: 0,
       failed: 0,
       abandoned: 0,
@@ -2719,7 +2726,7 @@ export class JobQueue {
       .prepare(
         `SELECT priority, COUNT(*) AS count
          FROM jobs
-         WHERE status IN ('pending', 'claimed')
+         WHERE status IN ('pending', 'claimed', 'finalizing')
          GROUP BY priority`,
       )
       .all() as Array<{ priority: string; count: number }>;
@@ -2746,6 +2753,7 @@ export class JobQueue {
       (status) =>
         status === "pending" ||
         status === "claimed" ||
+        status === "finalizing" ||
         status === "completed" ||
         status === "failed" ||
         status === "abandoned" ||
@@ -3290,7 +3298,7 @@ export class JobQueue {
     const cutoffIso = new Date(Date.now() - windowMs).toISOString();
     const rows = this.db
       .prepare(
-         `SELECT
+        `SELECT
            j.id,
            j.params,
            j.error,
@@ -3395,8 +3403,7 @@ export class JobQueue {
       );
       if (fingerprintTargetPaths.length === 0) continue;
 
-      const command =
-        normalizeFailureCommand(row.command) || nestedFailureCommand(row.error);
+      const command = normalizeFailureCommand(row.command) || nestedFailureCommand(row.error);
       const failureClass = String(
         failureClassFromEvidence(row.error) ??
           row.validationFailureClass ??

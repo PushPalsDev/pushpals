@@ -9108,7 +9108,9 @@ function jobFailureText(value) {
 }
 function nestedFailureCommand(value) {
   const text = jobFailureText(value);
-  const scriptMatches = [...text.matchAll(/error:\s*script\s+"([^"]+)"\s+(?:exited|was terminated)/gi)];
+  const scriptMatches = [
+    ...text.matchAll(/error:\s*script\s+"([^"]+)"\s+(?:exited|was terminated)/gi)
+  ];
   const nestedScript = scriptMatches.at(-1)?.[1]?.trim();
   if (nestedScript)
     return normalizeFailureCommand(`bun run ${nestedScript}`);
@@ -9663,11 +9665,12 @@ class JobQueue {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_available_at ON jobs(status, availableAt);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_created ON jobs(dedupeKey, createdAt);`);
-    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active
+    this.db.exec(`DROP INDEX IF EXISTS idx_jobs_dedupe_active;`);
+    this.db.exec(`CREATE UNIQUE INDEX idx_jobs_dedupe_active
          ON jobs(dedupeKey)
        WHERE dedupeKey IS NOT NULL
          AND dedupeKey <> ''
-         AND status IN ('pending','claimed');`);
+         AND status IN ('pending','claimed','finalizing');`);
     this.db.exec(`
       UPDATE jobs
       SET
@@ -9852,7 +9855,7 @@ class JobQueue {
       const active = this.db.prepare(`SELECT id, taskId
            FROM jobs
            WHERE dedupeKey = ?
-             AND status IN ('pending', 'claimed')
+             AND status IN ('pending', 'claimed', 'finalizing')
            ORDER BY createdAt DESC
            LIMIT 1`).get(dedupeKey);
       if (active?.id) {
@@ -9907,7 +9910,7 @@ class JobQueue {
         const active = this.db.prepare(`SELECT id, taskId
              FROM jobs
              WHERE dedupeKey = ?
-               AND status IN ('pending', 'claimed')
+               AND status IN ('pending', 'claimed', 'finalizing')
              ORDER BY createdAt DESC
              LIMIT 1`).get(dedupeKey);
         if (active?.id) {
@@ -10695,6 +10698,7 @@ class JobQueue {
     const counts = {
       pending: 0,
       claimed: 0,
+      finalizing: 0,
       completed: 0,
       failed: 0,
       abandoned: 0,
@@ -10709,7 +10713,7 @@ class JobQueue {
   countByPriority() {
     const rows = this.db.prepare(`SELECT priority, COUNT(*) AS count
          FROM jobs
-         WHERE status IN ('pending', 'claimed')
+         WHERE status IN ('pending', 'claimed', 'finalizing')
          GROUP BY priority`).all();
     const counts = {
       interactive: 0,
@@ -10729,7 +10733,7 @@ class JobQueue {
     const requestedStatuses = Array.isArray(statuses) ? statuses : [statuses];
     const normalizedStatuses = [
       ...new Set(requestedStatuses.map((status) => String(status).trim()))
-    ].filter((status) => status === "pending" || status === "claimed" || status === "completed" || status === "failed" || status === "abandoned" || status === "publish_blocked");
+    ].filter((status) => status === "pending" || status === "claimed" || status === "finalizing" || status === "completed" || status === "failed" || status === "abandoned" || status === "publish_blocked");
     if (normalizedStatuses.length === 0)
       return 0;
     const placeholders = normalizedStatuses.map(() => "?").join(", ");
@@ -12030,8 +12034,76 @@ class CompletionQueue {
     if (!columns.some((col) => col.name === "trustedValidationDetail")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationDetail TEXT;`);
     }
+    this.reconcileLegacyParentJobStates();
   }
-  enqueue(body) {
+  reconcileLegacyParentJobStates() {
+    const jobsTable = this.db.prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`).get();
+    if (!jobsTable)
+      return;
+    const now = new Date().toISOString();
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`UPDATE jobs
+           SET status = 'finalizing', completedAt = NULL, updatedAt = ?
+           WHERE status = 'completed'
+             AND EXISTS (
+               SELECT 1 FROM completions c
+               WHERE c.jobId = jobs.id AND c.status IN ('pending', 'claimed')
+             )`).run(now);
+      this.db.prepare(`UPDATE jobs
+           SET status = 'publish_blocked',
+               error = COALESCE(
+                 (SELECT c.error FROM completions c
+                  WHERE c.jobId = jobs.id AND c.status = 'failed'
+                  ORDER BY c.updatedAt DESC LIMIT 1),
+                 error
+               ),
+               completedAt = NULL,
+               publishBlockedAt = COALESCE(publishBlockedAt, ?),
+               updatedAt = ?
+           WHERE status IN ('completed', 'finalizing')
+             AND EXISTS (
+               SELECT 1 FROM completions c
+               WHERE c.jobId = jobs.id AND c.status = 'failed'
+             )`).run(now, now);
+      this.db.prepare(`UPDATE jobs
+           SET status = 'completed',
+               completedAt = COALESCE(completedAt, ?),
+               error = NULL,
+               publishBlockedAt = NULL,
+               updatedAt = ?
+           WHERE status = 'finalizing'
+             AND EXISTS (
+               SELECT 1 FROM completions c
+               WHERE c.jobId = jobs.id AND c.status = 'processed'
+             )`).run(now, now);
+      const diagnosticsTable = this.db.prepare(`SELECT 1 AS present FROM sqlite_master
+           WHERE type = 'table' AND name = 'job_terminal_diagnostics'`).get();
+      if (diagnosticsTable) {
+        const failedParents = this.db.prepare(`SELECT j.id AS jobId,
+                    c.error AS error,
+                    c.trustedValidationCommandsJson AS trustedValidationCommandsJson
+             FROM jobs j
+             JOIN completions c ON c.id = (
+               SELECT latest.id FROM completions latest
+               WHERE latest.jobId = j.id AND latest.status = 'failed'
+               ORDER BY latest.updatedAt DESC LIMIT 1
+             )
+             WHERE j.status = 'publish_blocked'`).all();
+        for (const row of failedParents) {
+          this.upsertPublicationTerminalDiagnostics({
+            jobId: row.jobId,
+            status: "publish_blocked",
+            failureClass: row.trustedValidationCommandsJson ? "trusted_validation_failed" : "publication_failed",
+            terminalStage: row.trustedValidationCommandsJson ? "trusted_environment_validation" : "publication",
+            summary: row.error || "Candidate publication failed",
+            now
+          });
+        }
+      }
+    });
+    tx();
+  }
+  enqueue(body, options = {}) {
     const jobId = body.jobId;
     const sessionId = body.sessionId;
     const commitSha = body.commitSha;
@@ -12058,12 +12130,83 @@ class CompletionQueue {
     }
     const completionId = randomUUID4();
     const now = new Date().toISOString();
-    this.db.prepare(`INSERT INTO completions (
-           id, jobId, sessionId, origin, commitSha, branch, message, prUrl, prTitle, prBody,
-           trustedValidationCommandsJson, trustedValidationSummary, trustedValidationDetail,
-           status, createdAt, updatedAt
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(completionId, jobId, sessionId, origin, commitSha ?? null, branch ?? null, message, prUrl, prTitle, prBody, trustedValidationCommandsJson, trustedValidationSummary, trustedValidationDetail, now, now);
-    return { ok: true, completionId };
+    const tx = this.db.transaction(() => {
+      if (options.beginJobFinalization) {
+        const job = this.db.prepare(`SELECT status, workerId FROM jobs WHERE id = ?`).get(jobId);
+        if (!job)
+          return { ok: false, message: "Job not found" };
+        const existing = this.db.prepare(`SELECT id FROM completions
+             WHERE jobId = ? AND status IN ('pending', 'claimed')
+             ORDER BY createdAt DESC
+             LIMIT 1`).get(jobId);
+        if (existing && job.status === "finalizing") {
+          return {
+            ok: true,
+            completionId: existing.id,
+            deduped: true,
+            jobStatus: "finalizing"
+          };
+        }
+        if (job.status !== "claimed") {
+          return {
+            ok: false,
+            message: `Job is ${job.status}; expected claimed before completion handoff`
+          };
+        }
+        if (existing) {
+          return {
+            ok: false,
+            message: `Job already has active completion ${existing.id}`
+          };
+        }
+      }
+      this.db.prepare(`INSERT INTO completions (
+             id, jobId, sessionId, origin, commitSha, branch, message, prUrl, prTitle, prBody,
+             trustedValidationCommandsJson, trustedValidationSummary, trustedValidationDetail,
+             status, createdAt, updatedAt
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`).run(completionId, jobId, sessionId, origin, commitSha ?? null, branch ?? null, message, prUrl, prTitle, prBody, trustedValidationCommandsJson, trustedValidationSummary, trustedValidationDetail, now, now);
+      if (options.beginJobFinalization) {
+        const summary = typeof body.jobResultSummary === "string" ? body.jobResultSummary.trim() : "";
+        const artifacts = Array.isArray(body.jobArtifacts) ? body.jobArtifacts : [];
+        const transitioned = this.db.prepare(`UPDATE jobs
+             SET status = 'finalizing',
+                 result = ?,
+                 prUrl = COALESCE(?, prUrl),
+                 error = NULL,
+                 completedAt = NULL,
+                 failedAt = NULL,
+                 abandonedAt = NULL,
+                 publishBlockedAt = NULL,
+                 updatedAt = ?
+             WHERE id = ? AND status = 'claimed'`).run(JSON.stringify({ summary: summary || message, artifacts }), prUrl, now, jobId);
+        if (transitioned.changes === 0) {
+          throw new Error(`Job ${jobId} left claimed state during completion handoff`);
+        }
+        this.db.prepare(`UPDATE workers
+             SET status = 'idle',
+                 currentJobId = CASE WHEN currentJobId = ? THEN NULL ELSE currentJobId END,
+                 lastHeartbeat = ?,
+                 updatedAt = ?
+             WHERE workerId = (SELECT workerId FROM jobs WHERE id = ?)
+               AND NOT EXISTS (
+                 SELECT 1 FROM jobs active
+                 WHERE active.workerId = workers.workerId AND active.status = 'claimed'
+               )`).run(jobId, now, now, jobId);
+      }
+      return {
+        ok: true,
+        completionId,
+        ...options.beginJobFinalization ? { jobStatus: "finalizing" } : {}
+      };
+    });
+    try {
+      return tx();
+    } catch (error) {
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error)
+      };
+    }
   }
   claim(pusherId) {
     const now = new Date().toISOString();
@@ -12099,6 +12242,141 @@ class CompletionQueue {
       return { ok: false, message: "Completion not found or not in claimed state" };
     }
     return { ok: true };
+  }
+  markProcessedAndFinalizeJob(completionId, prUrl) {
+    const now = new Date().toISOString();
+    const normalizedPrUrl = typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
+    const tx = this.db.transaction(() => {
+      const completion = this.getCompletion(completionId);
+      if (!completion)
+        return { ok: false, message: "Completion not found" };
+      if (completion.status === "processed") {
+        return { ok: true, jobId: completion.jobId, jobTransitioned: false };
+      }
+      if (completion.status !== "claimed") {
+        return { ok: false, message: "Completion not in claimed state" };
+      }
+      const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId);
+      if (!job)
+        return { ok: false, message: "Parent job not found" };
+      if (job.status !== "finalizing" && job.status !== "completed") {
+        return {
+          ok: false,
+          message: `Parent job is ${job.status}; expected finalizing`
+        };
+      }
+      this.db.prepare(`UPDATE completions
+           SET status = 'processed', prUrl = COALESCE(?, prUrl), error = NULL, updatedAt = ?
+           WHERE id = ? AND status = 'claimed'`).run(normalizedPrUrl, now, completionId);
+      const transitioned = this.db.prepare(`UPDATE jobs
+           SET status = 'completed',
+               prUrl = COALESCE(?, prUrl),
+               error = NULL,
+               completedAt = ?,
+               failedAt = NULL,
+               abandonedAt = NULL,
+               publishBlockedAt = NULL,
+               durationMs = MAX(
+                 0,
+                 CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+               ),
+               updatedAt = ?
+           WHERE id = ? AND status = 'finalizing'`).run(normalizedPrUrl, now, now, now, completion.jobId);
+      if (transitioned.changes > 0) {
+        this.upsertPublicationTerminalDiagnostics({
+          jobId: completion.jobId,
+          status: "completed",
+          failureClass: "success",
+          terminalStage: "publication",
+          summary: normalizedPrUrl ? `Candidate published successfully: ${normalizedPrUrl}` : "Candidate published successfully",
+          now
+        });
+      }
+      const saved = this.db.prepare(`SELECT durationMs, completedAt FROM jobs WHERE id = ?`).get(completion.jobId);
+      return {
+        ok: true,
+        jobId: completion.jobId,
+        jobTransitioned: transitioned.changes > 0,
+        durationMs: saved?.durationMs ?? undefined,
+        completedAt: saved?.completedAt ?? undefined
+      };
+    });
+    return tx();
+  }
+  markFailedAndBlockJob(completionId, error) {
+    const now = new Date().toISOString();
+    const failure = String(error || "Unknown publication error");
+    const tx = this.db.transaction(() => {
+      const completion = this.getCompletion(completionId);
+      if (!completion)
+        return { ok: false, message: "Completion not found" };
+      if (completion.status === "failed") {
+        return { ok: true, jobId: completion.jobId, jobTransitioned: false };
+      }
+      if (completion.status !== "claimed") {
+        return { ok: false, message: "Completion not in claimed state" };
+      }
+      const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId);
+      if (!job)
+        return { ok: false, message: "Parent job not found" };
+      if (job.status !== "finalizing" && job.status !== "completed") {
+        return {
+          ok: false,
+          message: `Parent job is ${job.status}; expected finalizing`
+        };
+      }
+      this.db.prepare(`UPDATE completions
+           SET status = 'failed', error = ?, updatedAt = ?
+           WHERE id = ? AND status = 'claimed'`).run(failure, now, completionId);
+      const transitioned = this.db.prepare(`UPDATE jobs
+           SET status = 'publish_blocked',
+               error = ?,
+               publishBlockedAt = ?,
+               completedAt = NULL,
+               failedAt = NULL,
+               abandonedAt = NULL,
+               durationMs = MAX(
+                 0,
+                 CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+               ),
+               updatedAt = ?
+           WHERE id = ? AND status IN ('finalizing', 'completed')`).run(JSON.stringify({
+        message: "Candidate publication failed",
+        detail: failure,
+        completionId
+      }), now, now, now, completion.jobId);
+      if (transitioned.changes > 0) {
+        this.upsertPublicationTerminalDiagnostics({
+          jobId: completion.jobId,
+          status: "publish_blocked",
+          failureClass: completion.trustedValidationCommandsJson ? "trusted_validation_failed" : "publication_failed",
+          terminalStage: completion.trustedValidationCommandsJson ? "trusted_environment_validation" : "publication",
+          summary: failure,
+          now
+        });
+      }
+      const saved = this.db.prepare(`SELECT durationMs, publishBlockedAt FROM jobs WHERE id = ?`).get(completion.jobId);
+      return {
+        ok: true,
+        jobId: completion.jobId,
+        jobTransitioned: transitioned.changes > 0,
+        durationMs: saved?.durationMs ?? undefined,
+        publishBlockedAt: saved?.publishBlockedAt ?? undefined
+      };
+    });
+    return tx();
+  }
+  upsertPublicationTerminalDiagnostics(options) {
+    this.db.prepare(`INSERT INTO job_terminal_diagnostics (
+           jobId, status, failureClass, terminalStage, summary,
+           watchdogFired, changedPathSampleJson, metadataJson, createdAt, updatedAt
+         ) VALUES (?, ?, ?, ?, ?, 0, '[]', ?, ?, ?)
+         ON CONFLICT(jobId) DO UPDATE SET
+           status = excluded.status,
+           failureClass = excluded.failureClass,
+           terminalStage = excluded.terminalStage,
+           summary = excluded.summary,
+           updatedAt = excluded.updatedAt`).run(options.jobId, options.status, options.failureClass, options.terminalStage, options.summary.slice(0, 1000), JSON.stringify({ completionFinalized: true }), options.now, options.now);
   }
   getCompletion(completionId) {
     return this.db.prepare(`SELECT * FROM completions WHERE id = ?`).get(completionId) ?? null;
@@ -16618,6 +16896,101 @@ Apply this clarification while keeping changes scoped to the existing objective 
          WHERE job_id = ?
            AND status IN ('dispatched','gated','blocked','needs_clarification')`).run(asIsoNow(), jobId);
   }
+  reconcileJobLinkedOutcomeLifecycle() {
+    const affectedPatterns = this.db.prepare(`SELECT DISTINCT ao.pattern_key AS patternKey
+         FROM autonomy_outcomes ao
+         JOIN jobs j ON j.id = ao.job_id
+         WHERE ao.success = 1
+           AND j.status IN ('finalizing', 'failed', 'abandoned', 'publish_blocked')`).all();
+    if (affectedPatterns.length === 0) {
+      return {
+        correctedFailures: 0,
+        removedPrematureSuccesses: 0,
+        correctedObjectives: 0
+      };
+    }
+    const now = asIsoNow();
+    let correctedFailures = 0;
+    let removedPrematureSuccesses = 0;
+    let correctedObjectives = 0;
+    const tx = this.db.transaction(() => {
+      const removed = this.db.prepare(`DELETE FROM autonomy_outcomes
+           WHERE success = 1
+             AND job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')`).run();
+      removedPrematureSuccesses = Number(removed.changes ?? 0);
+      const corrected = this.db.prepare(`UPDATE autonomy_outcomes
+           SET success = 0,
+               user_action = 'failed',
+               reopened_within_24h = 0,
+               regression_flag = 1
+           WHERE success = 1
+             AND job_id IN (
+               SELECT id FROM jobs
+               WHERE status IN ('failed', 'abandoned', 'publish_blocked')
+             )`).run();
+      correctedFailures = Number(corrected.changes ?? 0);
+      const runningObjectives = this.db.prepare(`UPDATE autonomy_objectives
+           SET status = 'running', updated_at = ?
+           WHERE job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')
+             AND status IN ('completed', 'failed')`).run(now);
+      const failedObjectives = this.db.prepare(`UPDATE autonomy_objectives
+           SET status = 'failed', updated_at = ?
+           WHERE job_id IN (
+             SELECT id FROM jobs
+             WHERE status IN ('failed', 'abandoned', 'publish_blocked')
+           )
+             AND status <> 'failed'`).run(now);
+      correctedObjectives = Number(runningObjectives.changes ?? 0) + Number(failedObjectives.changes ?? 0);
+      for (const affected of affectedPatterns) {
+        const patternKey = asString3(affected.patternKey);
+        if (!patternKey)
+          continue;
+        const rows = this.db.prepare(`SELECT success, latency_ms AS latencyMs, user_action AS userAction,
+                    reopened_within_24h AS reopenedWithin24h
+             FROM autonomy_outcomes
+             WHERE pattern_key = ?
+             ORDER BY id ASC`).all(patternKey);
+        if (rows.length === 0) {
+          this.db.prepare(`DELETE FROM autonomy_pattern_stats WHERE pattern_key = ?`).run(patternKey);
+          continue;
+        }
+        let emaSuccess = 0;
+        let emaUserAccept = 0;
+        let emaLatency = 0;
+        let emaRegret = 0;
+        let failStreak = 0;
+        const ema = (previous, current) => this.alpha * current + (1 - this.alpha) * previous;
+        for (const row of rows) {
+          const success = Number(row.success) === 1;
+          const userAction = asString3(row.userAction).toLowerCase();
+          emaSuccess = ema(emaSuccess, success ? 1 : 0);
+          emaUserAccept = ema(emaUserAccept, ["accepted", "manual_fix", "override_dispatch", "applied"].includes(userAction) ? 1 : 0);
+          if (typeof row.latencyMs === "number" && Number.isFinite(row.latencyMs)) {
+            emaLatency = ema(emaLatency, clamp012(1 - row.latencyMs / 600000));
+          }
+          emaRegret = ema(emaRegret, Number(row.reopenedWithin24h) === 1 || ["rejected", "cancelled"].includes(userAction) ? 1 : 0);
+          failStreak = success ? 0 : failStreak + 1;
+        }
+        const cooldownThreshold = Math.max(1, Math.floor(this.config.remotebuddy.autonomy.cooldownFailStreakThreshold));
+        const cooldownUntil = failStreak >= cooldownThreshold ? new Date(Date.parse(now) + this.config.remotebuddy.autonomy.cooldownMs).toISOString() : null;
+        this.db.prepare(`INSERT INTO autonomy_pattern_stats (
+               pattern_key, ema_success, ema_user_accept, ema_latency, ema_regret,
+               fail_streak, cooldown_until, sample_count, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(pattern_key) DO UPDATE SET
+               ema_success = excluded.ema_success,
+               ema_user_accept = excluded.ema_user_accept,
+               ema_latency = excluded.ema_latency,
+               ema_regret = excluded.ema_regret,
+               fail_streak = excluded.fail_streak,
+               cooldown_until = excluded.cooldown_until,
+               sample_count = excluded.sample_count,
+               updated_at = excluded.updated_at`).run(patternKey, emaSuccess, emaUserAccept, emaLatency, emaRegret, failStreak, cooldownUntil, rows.length, now);
+      }
+    });
+    tx();
+    return { correctedFailures, removedPrematureSuccesses, correctedObjectives };
+  }
   close() {
     this.db.close();
   }
@@ -17213,6 +17586,10 @@ var jobQueue = new JobQueue(sharedDbPath);
 var requestQueue = new RequestQueue(sharedDbPath);
 var completionQueue = new CompletionQueue(sharedDbPath);
 var autonomyStore = new AutonomyStore(sharedDbPath);
+var lifecycleReconciliation = autonomyStore.reconcileJobLinkedOutcomeLifecycle();
+if (lifecycleReconciliation.correctedFailures > 0 || lifecycleReconciliation.removedPrematureSuccesses > 0 || lifecycleReconciliation.correctedObjectives > 0) {
+  console.warn(`[Server] Reconciled legacy completion lifecycle state: ${JSON.stringify(lifecycleReconciliation)}`);
+}
 var clientPresence = new ClientPresenceRegistry;
 var clientPresencePruneTimer = setInterval(() => {
   const removed = clientPresence.pruneExpired();
@@ -18614,6 +18991,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           "all",
           "pending",
           "claimed",
+          "finalizing",
           "completed",
           "failed",
           "abandoned",
@@ -19055,7 +19433,14 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const result = completionQueue.enqueue(body);
+        const result = completionQueue.enqueue(body, { beginJobFinalization: true });
+        if (result.ok) {
+          const jobId = compactText3(body.jobId, 128);
+          if (jobId) {
+            autonomyStore.markObjectiveRunningByJobId(jobId);
+            console.log(`[Server] Job ${jobId} is finalizing via completion ${result.completionId ?? "unknown"}`);
+          }
+        }
         return makeJson(result, result.ok ? 201 : 400);
       }
       if (pathname === "/completions/claim" && method === "POST") {
@@ -19075,15 +19460,44 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const completionId = compProcMatch[1];
         const body = await req.json().catch(() => ({}));
         const prUrl = typeof body.prUrl === "string" ? body.prUrl : null;
-        const result = completionQueue.markProcessed(completionId, prUrl);
-        if (result.ok && prUrl) {
-          const completion = completionQueue.getCompletion(completionId);
-          if (completion?.jobId) {
-            const syncResult = jobQueue.setPrUrl(completion.jobId, prUrl);
-            if (!syncResult.ok) {
-              console.warn(`[Server] Completion ${completionId} marked processed, but failed to sync job PR URL for ${completion.jobId}: ${syncResult.message ?? "unknown error"}`);
-            }
+        const result = completionQueue.markProcessedAndFinalizeJob(completionId, prUrl);
+        if (result.ok && result.jobTransitioned && result.jobId) {
+          const job = jobQueue.getJob(result.jobId);
+          const params = parseJsonRecord2(job?.params ?? "");
+          const origin = deriveJobOrigin(params);
+          const requestId = compactText3(params.requestId, 128);
+          const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
+          if (outcomeContext) {
+            autonomyStore.recordOutcome({
+              objectiveId: outcomeContext.objectiveId,
+              requestId: outcomeContext.requestId ?? requestId,
+              jobId: result.jobId,
+              patternKey: outcomeContext.patternKey,
+              success: true,
+              latencyMs: result.durationMs ?? null,
+              userAction: "applied",
+              reopenedWithin24h: false,
+              regressionFlag: false
+            });
           }
+          if (job?.sessionId) {
+            const session = sessionManager.getSession(job.sessionId);
+            const savedResult = parseJsonRecord2(job.result ?? "");
+            session?.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID6(),
+              ts: new Date().toISOString(),
+              sessionId: job.sessionId,
+              type: "job_completed",
+              from: "server:completion-processed",
+              payload: {
+                jobId: result.jobId,
+                summary: compactText3(savedResult.summary, 1200) || "Candidate published successfully",
+                origin
+              }
+            });
+          }
+          console.log(`[Server] Job ${result.jobId} completed after publication confirmation (${result.durationMs ?? "unknown"}ms)`);
         }
         return makeJson(result, result.ok ? 200 : 400);
       }
@@ -19095,7 +19509,45 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const completionId = compFailMatch[1];
         const body = await req.json().catch(() => ({}));
         const error = body.error ?? "Unknown error";
-        const result = completionQueue.markFailed(completionId, error);
+        const result = completionQueue.markFailedAndBlockJob(completionId, error);
+        if (result.ok && result.jobTransitioned && result.jobId) {
+          const job = jobQueue.getJob(result.jobId);
+          const params = parseJsonRecord2(job?.params ?? "");
+          const origin = deriveJobOrigin(params);
+          const requestId = compactText3(params.requestId, 128);
+          const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
+          if (outcomeContext) {
+            autonomyStore.recordOutcome({
+              objectiveId: outcomeContext.objectiveId,
+              requestId: outcomeContext.requestId ?? requestId,
+              jobId: result.jobId,
+              patternKey: outcomeContext.patternKey,
+              success: false,
+              latencyMs: result.durationMs ?? null,
+              userAction: "failed",
+              reopenedWithin24h: false,
+              regressionFlag: true
+            });
+          }
+          if (job?.sessionId) {
+            const session = sessionManager.getSession(job.sessionId);
+            session?.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID6(),
+              ts: new Date().toISOString(),
+              sessionId: job.sessionId,
+              type: "job_failed",
+              from: "server:completion-fail-hook",
+              payload: {
+                jobId: result.jobId,
+                message: "Candidate publication failed",
+                origin,
+                detail: compactText3(error, 600)
+              }
+            });
+          }
+          console.warn(`[Server] Job ${result.jobId} publish-blocked: ${error}`);
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
       return makeJson({ ok: false, message: "Not found" }, 404);

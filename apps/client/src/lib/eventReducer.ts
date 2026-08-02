@@ -40,6 +40,7 @@ export type JobStatus =
   | "pending"
   | "enqueued"
   | "claimed"
+  | "finalizing"
   | "completed"
   | "failed"
   | "abandoned"

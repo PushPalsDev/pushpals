@@ -100,7 +100,9 @@ export function CoordinationPane({
         <MetricTile
           title="Active Handoffs"
           value={String(activeCount)}
-          detail={`${queueValue(jobCounts, "claimed")} running jobs`}
+          detail={`${
+            queueValue(jobCounts, "claimed") + queueValue(jobCounts, "finalizing")
+          } running/finalizing jobs`}
           tone={activeCount > 0 ? "warning" : "accent"}
           theme={theme}
         />
