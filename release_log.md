@@ -2,25 +2,25 @@
 
 ## Release Metadata
 
-- version: `v1.2.22`
-- start_commit: `c3356efea7368e09f599faef65fdc62c5886c334`
-- end_commit: `c3356efea7368e09f599faef65fdc62c5886c334`
-- commits_in_range: `0`
+- version: `v1.2.23`
+- start_commit: `da6be15893a3b482acfb8b21cca13aad4be74516`
+- end_commit: `a1e18d716438bb467a916cc8365f220a6721dd51`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Republish the `v1.2.21` Windows startup-isolation fix as `v1.2.22` without additional product-code changes.
-- Preserve source-bundle startup for Server, LocalBuddy, RemoteBuddy, WorkerPal, and SourceControlManager on Windows, with isolated launcher handshakes, per-service deadlines, configured LocalBuddy port discovery, and service-local failure handling.
-- Keep automatic validation on GitHub-hosted Windows and Linux runners while the resource-intensive self-hosted Windows Docker job remains manual-only.
+- Keep WorkerPal candidates nonterminal in a new `finalizing` state until SourceControlManager confirms trusted validation and publication; only that confirmation can mark the parent job completed.
+- Propagate publication and trusted-environment validation failures atomically back to the parent job as `publish_blocked`, while repairing legacy false-positive job and autonomy outcome records during startup.
+- Suppress premature completion events and expose the finalizing phase consistently in monitoring, queue deduplication, LocalBuddy status, and packaged runtime assets.
+- Continue Git merges when rerere has safely auto-staged every recorded conflict resolution, while preserving abort-and-report behavior for unresolved or otherwise invalid merge states.
 
 ## Validation
 
-- Release-playbook root suite in Docker on Bun 1.3.14: 1,075 passed, 7 intentional Windows-only skips, 0 failed, 4,555 assertions across 124 files.
-- Focused LLM preflight and merge-conflict publication suites: 14 passed, 0 failed after the disposable container received its required Python command compatibility link.
-- GitHub release run 30690968640 passed the Windows autonomy runtime smoke plus published-package smoke on Linux and Windows for the identical `v1.2.21` product commit.
+- Release-playbook root suite in an init-enabled Docker container on Bun 1.3.14: 1,083 passed, 7 intentional platform skips, 0 failed, 4,605 assertions across 124 files.
+- Focused completion lifecycle, autonomy recovery, monitor hydration, WorkerPal event, and real Git rerere reconciliation suites: 91 passed, 0 failed.
 - `bun run cli:bundle`
 - Normalized `bun run cli:verify-package-payload`: 228 package files, no external toolchain files.
-- Rebuilt packaged runtime and monitor assets produced no tracked-file drift.
+- Rebuilt packaged runtime and monitor assets include the finalizing lifecycle changes.
 - `git diff --check` passed.
 
 ## Install
