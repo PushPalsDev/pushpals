@@ -2,25 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.2.23`
-- start_commit: `da6be15893a3b482acfb8b21cca13aad4be74516`
-- end_commit: `a1e18d716438bb467a916cc8365f220a6721dd51`
+- version: `v1.2.24`
+- start_commit: `8f0f41618e019dcc348f86ae87f809d0bdf4ceba`
+- end_commit: `a85dafff80da30fd47662c8e57195706486cc576`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Keep WorkerPal candidates nonterminal in a new `finalizing` state until SourceControlManager confirms trusted validation and publication; only that confirmation can mark the parent job completed.
-- Propagate publication and trusted-environment validation failures atomically back to the parent job as `publish_blocked`, while repairing legacy false-positive job and autonomy outcome records during startup.
-- Suppress premature completion events and expose the finalizing phase consistently in monitoring, queue deduplication, LocalBuddy status, and packaged runtime assets.
-- Continue Git merges when rerere has safely auto-staged every recorded conflict resolution, while preserving abort-and-report behavior for unresolved or otherwise invalid merge states.
+- Require Bun 1.3.14 or newer at the npm launcher, CLI runtime, and RemoteBuddy startup boundary so known-incompatible runtimes are rejected before embedded services can enter a native crash loop.
+- Circuit-break repeated identical native-runtime failures after two occurrences while leaving healthy embedded services available, and report corrected byte-based RSS plus structured crash and recovery telemetry.
+- Prepare frozen Bun dependencies in disposable SourceControlManager validation worktrees and reject shell-control validation payloads before execution.
+- Require the integration harness to observe both SourceControlManager processing and the parent job's terminal `completed` state, preventing false-positive acceptance when publication fails.
+- Extend installed-CLI release smoke coverage with a Windows soak interval long enough to cross the previously observed native-crash window.
 
 ## Validation
 
-- Release-playbook root suite in an init-enabled Docker container on Bun 1.3.14: 1,083 passed, 7 intentional platform skips, 0 failed, 4,605 assertions across 124 files.
-- Focused completion lifecycle, autonomy recovery, monitor hydration, WorkerPal event, and real Git rerere reconciliation suites: 91 passed, 0 failed.
+- Release-playbook root suite in a resource-capped Docker container on Bun 1.3.14: 1,097 passed, 7 intentional platform skips, 0 failed, 4,652 assertions across 127 files.
+- Three consecutive isolated SectorCommand jobs completed end-to-end through WorkerPal validation, Playwright, deploy dry-run, critic review, SourceControlManager publication, and terminal parent-job completion.
 - `bun run cli:bundle`
-- Normalized `bun run cli:verify-package-payload`: 228 package files, no external toolchain files.
-- Rebuilt packaged runtime and monitor assets include the finalizing lifecycle changes.
+- Normalized `bun run cli:verify-package-payload`: 229 package files, no external toolchain files.
+- Rebuilt packaged runtime and monitor assets include the Bun compatibility guard, crash circuit breaker, validation hardening, and release-soak changes.
 - `git diff --check` passed.
 
 ## Install
@@ -51,7 +52,7 @@ bun install -g @pushpalsdev/cli
 - The first Docker-backed WorkerPal startup after upgrading rebuilds the sandbox image and downloads the Node, Python-agent, Playwright, and Chromium layers; subsequent starts reuse Docker's cached layers.
 - `execution_platform = "windows"` selects direct host WorkerPal execution so validation inherits the Windows host environment; it does not convert Docker Desktop Linux containers into Windows containers.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when WorkerPal auto-spawn is enabled; `pushpals --clear` cleanup is best-effort when Docker is unavailable or times out, and still reports a clear failure if Windows keeps a runtime-data path locked after the retry window.
-- The npm package still requires a working Bun runtime to launch the package entrypoint; PushPals does not vendor Bun or other external toolchains in the npm package.
+- The npm package requires Bun 1.3.14 or newer to launch the package entrypoint; PushPals refuses older runtimes and does not vendor Bun or other external toolchains in the npm package.
 - Direct GitHub release binaries are PushPals-built standalone artifacts. Removing embedded Bun runtime from those standalone artifacts would require a separate runtime distribution redesign.
 - Active runtimes that were started from an older release must be restarted after installing this release before new startup or packaged-runtime behavior takes effect.
 - PushPals does not currently read Codex TUI `/status` directly; by default it avoids enforcing an independent local session-token pause and relies on the active Codex/LLM provider budget. Users who need a local safety cap can set `session_token_budget` or `PUSHPALS_SESSION_TOKEN_BUDGET`.
