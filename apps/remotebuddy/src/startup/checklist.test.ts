@@ -29,7 +29,7 @@ const buildContext = (
   syntheticTester: {
     runSyntheticJob: async () => ({ ok: true, latencyMs: 150 }),
   },
-  readBunVersion: async () => "1.3.0",
+  readBunVersion: async () => "1.3.14",
   readDockerVersion: async () => "25.0.0",
   ...overrides,
 });
@@ -77,7 +77,7 @@ describe("StartupChecklist", () => {
   test("fails when Bun runtime is below the required version", async () => {
     const telemetry: StartupTelemetryEvent[] = [];
     const ctx = buildContext({
-      readBunVersion: async () => "1.0.9",
+      readBunVersion: async () => "1.3.9",
       telemetry: (event) => telemetry.push(event),
     });
     const result = await runStartupPreflight(ctx);
@@ -85,8 +85,8 @@ describe("StartupChecklist", () => {
     expect(result.failure?.code).toBe(STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED);
     expect(result.failure?.step).toBe(1);
     expect(result.failure?.category).toBe("runtime");
-    expect(result.failure?.detail).toContain("1.0.9");
-    expect(result.failure?.action).toContain("Bun 1.1");
+    expect(result.failure?.detail).toContain("1.3.9");
+    expect(result.failure?.action).toContain("Bun 1.3.14");
     expect(result.history).toHaveLength(1);
     const bunPhase = telemetry.find(
       (event): event is StartupTelemetryPhaseEvent =>
@@ -97,7 +97,7 @@ describe("StartupChecklist", () => {
     if (bunPhase) {
       expect(bunPhase.status).toBe("fail");
       expect(bunPhase.startedAtMs).toBeLessThanOrEqual(bunPhase.endedAtMs);
-      expect(bunPhase.detail).toContain("1.0.9");
+      expect(bunPhase.detail).toContain("1.3.9");
     }
   });
 

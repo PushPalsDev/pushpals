@@ -9514,6 +9514,58 @@ function hasRelevantTargetPath(step, targetPaths) {
   }
   return false;
 }
+var VALIDATION_SHELL_CONTROL_TOKENS = new Set(["&&", "||", ";", "|"]);
+function isPlainValidationCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed)
+    return false;
+  const tokens = [];
+  let current = "";
+  let quote = null;
+  let escaped = false;
+  const pushCurrent = () => {
+    if (!current)
+      return;
+    tokens.push(current);
+    current = "";
+  };
+  for (const ch of trimmed) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (quote) {
+      if (quote === '"' && ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === quote)
+        quote = null;
+      else
+        current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "|" || ch === ";" || ch === "&" || ch === ">" || ch === "<" || ch === "`" || ch === "$") {
+      return false;
+    }
+    if (/\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped)
+    current += "\\";
+  if (quote)
+    return false;
+  pushCurrent();
+  return tokens.length > 0 && !tokens.some((token) => VALIDATION_SHELL_CONTROL_TOKENS.has(token));
+}
 function normalizeValidationSteps(steps, targetPaths) {
   const out = [];
   const seen = new Set;
@@ -9522,6 +9574,8 @@ function normalizeValidationSteps(steps, targetPaths) {
     if (!value)
       continue;
     if (!isCommandLikeValidationStep(value))
+      continue;
+    if (!isPlainValidationCommand(value))
       continue;
     if (!hasRelevantTargetPath(value, targetPaths))
       continue;
@@ -11473,6 +11527,7 @@ if (import.meta.main) {
 }
 export {
   resolveTaskExecuteDedupeCooldownMs,
+  normalizeValidationSteps,
   extractRequiredValidationStepsFromVisionMarkdown,
   buildTaskExecuteDedupeKey,
   RemoteBuddyOrchestrator

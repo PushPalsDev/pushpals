@@ -64,6 +64,7 @@ Quality gates:
 - `acceptance_criteria` must be explicit and verifiable when `requires_worker=true`; keep empty only for no-worker requests.
 - `validation_steps` should be minimal and relevant (empty array only for no-worker requests):
   - each item must be an executable command, not prose
+  - each item must be one plain command; never use pipes, `&&`, `||`, semicolons, redirection, or other shell chaining
   - prefer targeted checks tied to requested file paths
   - **this project uses Bun**: use `bun test` (not `pnpm test`, `npm test`, or `yarn test`) for running tests; use `bun run <script>` for scripts; use `bunx <tool>` (not `npx`) for ad-hoc CLIs; use `bun --cwd <app> test` to test a specific app
   - for Python/pytest targets, use `pytest` or `python -m pytest`

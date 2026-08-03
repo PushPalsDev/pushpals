@@ -4991,6 +4991,9 @@ function tokenizeValidationCommandArgv(command) {
       quote = ch;
       continue;
     }
+    if (ch === "|" || ch === ";" || ch === "&" || ch === ">" || ch === "<" || ch === "`" || ch === "$") {
+      return null;
+    }
     if (/\s/.test(ch)) {
       pushCurrent();
       continue;
@@ -7344,6 +7347,8 @@ function runnableValidationCommandsFromSteps(steps) {
 }
 function normalizeRunnableValidationCommand(command) {
   if (/<[A-Za-z][A-Za-z0-9:._ -]*>/.test(command))
+    return null;
+  if (!tokenizeValidationCommandArgv(command))
     return null;
   const bunTestCommand = normalizeBunTestValidationCommand(command);
   return bunTestCommand === undefined ? command : bunTestCommand;

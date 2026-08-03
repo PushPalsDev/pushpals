@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -19,6 +20,7 @@ import {
   buildCliClearTargets,
   buildEmbeddedRuntimeServiceLaunchPlan,
   buildEmbeddedRuntimeCrashEnvelope,
+  buildEmbeddedRuntimeCrashFingerprint,
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenConfigCommand,
@@ -99,6 +101,7 @@ import {
   computeServiceRestartBackoffMs,
   formatEmbeddedRuntimeHealthLines,
   isRetryableManagedServiceLaunchError,
+  maxRssKiBToBytes,
   shouldRestartService,
   startManagedServiceWithRetry,
 } from "../scripts/start_runtime_services.ts";
@@ -399,9 +402,27 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(envelope.uptimeMs).toBe(4_980_000);
     expect(envelope.requestId).toBe("req-1234");
     expect(envelope.jobId).toBe("job-5678");
-    expect(envelope.memory.rssBytes).toBe(310_000_000);
+    expect(envelope.memory.rssBytes).toBe(Math.floor(0.26 * 1024 ** 3));
     expect(envelope.crashReport).toBe("https://bun.report/1.3.14/abc123");
     expect(envelope.recoveryOutcome).toBe("restart_planned");
+  });
+
+  test("normalizes identical native Bun crashes into a stable circuit-breaker fingerprint", () => {
+    const first = buildEmbeddedRuntimeCrashFingerprint(
+      "Bun v1.3.9\npanic(main thread): Segmentation fault at address 0xFFFFFFFFFFFFFFFF",
+    );
+    const second = buildEmbeddedRuntimeCrashFingerprint(
+      "Bun v1.3.9\nPANIC(main thread):   Segmentation fault at address 0xFFFFFFFFFFFFFFFF",
+    );
+    expect(first).toBe(second);
+    expect(first).toContain("bun@1.3.9:panic(main thread)");
+    expect(buildEmbeddedRuntimeCrashFingerprint("process exited with code 1")).toBeNull();
+  });
+
+  test("converts Bun resourceUsage maxRSS KiB telemetry to bytes", () => {
+    expect(maxRssKiBToBytes(131_092)).toBe(134_238_208);
+    expect(maxRssKiBToBytes(-1)).toBeNull();
+    expect(maxRssKiBToBytes("unknown")).toBeNull();
   });
 
   test("ServiceManager reports degraded runtime health after restart exhaustion", async () => {
@@ -472,6 +493,84 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ServiceManager opens the repeated-fingerprint circuit after stability resets attempts without stopping healthy services", async () => {
+    let remoteBuddySpawnCalls = 0;
+    const lifecycleEvents: Array<{ type: string; recoveryPlanned?: boolean }> = [];
+    const supervisor = new ServiceManager({
+      pollMs: 20,
+      maxRestartAttempts: 4,
+      stableWindowMs: 1_000,
+      repeatedExitFingerprintLimit: 2,
+      repeatedExitFingerprintWindowMs: 10_000,
+      computeRestartBackoffMs: () => 20,
+      resolveExitFingerprint: () =>
+        "bun@1.3.9:panic(main thread): segmentation fault at address 0xffffffffffffffff",
+      spawnService: (spec) => {
+        if (spec.name === "server") {
+          return {
+            name: spec.name,
+            proc: {} as any,
+            command: [...spec.command],
+            cwd: spec.cwd,
+            env: { ...(spec.env ?? {}) },
+            exited: false,
+            exitCode: null,
+            launchedAtMs: Date.now(),
+          };
+        }
+        remoteBuddySpawnCalls += 1;
+        return {
+          name: spec.name,
+          proc: {} as any,
+          command: [...spec.command],
+          cwd: spec.cwd,
+          env: { ...(spec.env ?? {}) },
+          exited: remoteBuddySpawnCalls === 1,
+          exitCode: remoteBuddySpawnCalls === 1 ? 3 : null,
+          launchedAtMs: remoteBuddySpawnCalls === 1 ? Date.now() : Date.now() - 2_000,
+        };
+      },
+      onLifecycleEvent: (event) => lifecycleEvents.push(event),
+    });
+    supervisor.startService({
+      name: "server",
+      color: "",
+      command: ["fake-server"],
+      cwd: "C:/repo",
+    });
+    supervisor.startService({
+      name: "remotebuddy",
+      color: "",
+      command: ["fake-remotebuddy"],
+      cwd: "C:/repo",
+    });
+
+    try {
+      await Bun.sleep(100);
+      const restarted = supervisor.getService("remotebuddy");
+      expect(remoteBuddySpawnCalls).toBe(2);
+      expect(restarted?.exited).toBe(false);
+      if (restarted) {
+        restarted.exitCode = 3;
+        restarted.exited = true;
+      }
+      await Bun.sleep(100);
+
+      expect(remoteBuddySpawnCalls).toBe(2);
+      expect(supervisor.getHealth()?.detail).toContain("repeated identical native failure");
+      expect(supervisor.getService("server")?.exited).toBe(false);
+      expect(lifecycleEvents.filter((event) => event.type === "exit")).toHaveLength(2);
+      expect(
+        lifecycleEvents.filter((event) => event.type === "exit" && event.recoveryPlanned === false),
+      ).toHaveLength(1);
+      expect(lifecycleEvents.filter((event) => event.type === "recovery_exhausted")).toHaveLength(
+        1,
+      );
+    } finally {
+      supervisor.stop();
     }
   });
 
@@ -1632,12 +1731,74 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(shim).toContain("PUSHPALS_BUN_PROBE_TIMEOUT_MS");
     expect(shim).toContain("PUSHPALS_CLI_BOOTSTRAP_TIMEOUT_MS");
     expect(shim).toContain("PUSHPALS_CLI_READY_MARKER");
+    expect(shim).toContain("minimumBunVersion");
+    expect(shim).toContain("Unsupported Bun runtime");
+    expect(shim).toContain("npm install -g bun@");
     expect(shim).toContain("where.exe");
     expect(shim).toContain('join(dirname(candidate), "node_modules", "bun", "bin", "bun.exe")');
     expect(shim).toContain("terminating Bun process tree");
     expect(shim).toContain("taskkill");
     expect(shim).toContain('process.once("SIGINT"');
     expect(shim).toContain('process.once("SIGTERM"');
+  });
+
+  testOnUnix("npm package shim refuses an outdated Bun before loading the CLI bundle", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-old-bun-shim-"));
+    try {
+      const packageRoot = join(root, "package");
+      const binDir = join(packageRoot, "bin");
+      const distDir = join(packageRoot, "dist");
+      const fakeBinDir = join(root, "fake-bin");
+      const launchedMarker = join(root, "launched.txt");
+      mkdirSync(binDir, { recursive: true });
+      mkdirSync(distDir, { recursive: true });
+      mkdirSync(fakeBinDir, { recursive: true });
+      writeFileSync(
+        join(binDir, "pushpals.cjs"),
+        readFileSync(join(process.cwd(), "packages", "cli", "bin", "pushpals.cjs"), "utf8"),
+        "utf8",
+      );
+      writeFileSync(
+        join(packageRoot, "package.json"),
+        JSON.stringify({ version: "test", engines: { bun: ">=1.3.14" } }),
+        "utf8",
+      );
+      writeFileSync(
+        join(distDir, "pushpals-cli.js"),
+        `await Bun.write(${JSON.stringify(launchedMarker)}, "launched");\n`,
+        "utf8",
+      );
+      const fakeBun = join(fakeBinDir, "bun");
+      writeFileSync(
+        fakeBun,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "--version" ]; then',
+          "  echo 1.3.9",
+          "  exit 0",
+          "fi",
+          `touch ${launchedMarker}`,
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      chmodSync(fakeBun, 0o755);
+
+      const result = Bun.spawnSync([process.execPath, join(binDir, "pushpals.cjs")], {
+        cwd: packageRoot,
+        env: { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH ?? ""}` },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stderr = Buffer.from(result.stderr ?? []).toString("utf8");
+      expect(result.exitCode).toBe(1);
+      expect(stderr).toContain("Unsupported Bun runtime 1.3.9");
+      expect(stderr).toContain("npm install -g bun@1.3.14");
+      expect(existsSync(launchedMarker)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("startup readiness reports blocked immediately when WorkerPal auto-spawn is disabled", () => {

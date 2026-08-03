@@ -165,6 +165,11 @@ COMPLETION_AFTER_JOB_GRACE_SEC = max(
     1.0,
     _env_float("WORKERPALS_E2E_COMPLETION_AFTER_JOB_GRACE_SEC", 20.0),
 )
+REQUIRE_TERMINAL_COMPLETION = _env_flag("WORKERPALS_E2E_REQUIRE_TERMINAL_COMPLETION", "0")
+TERMINAL_COMPLETION_TIMEOUT_SEC = max(
+    1.0,
+    _env_float("WORKERPALS_E2E_TERMINAL_COMPLETION_TIMEOUT_SEC", 20 * 60.0),
+)
 _requested_backends_env = (os.environ.get("WORKERPALS_E2E_BACKENDS") or "").strip()
 REQUESTED_BACKENDS = [
     item.strip().lower()
@@ -1113,6 +1118,48 @@ def get_completion(completion_id: str) -> dict | None:
     except Exception:
         pass
     return None
+
+
+def wait_for_terminal_completion(
+    completion_id: str,
+    job_id: str,
+    timeout_sec: float = TERMINAL_COMPLETION_TIMEOUT_SEC,
+) -> tuple[dict, dict]:
+    deadline = _mono_now() + max(1.0, timeout_sec)
+    last_completion_status = ""
+    last_job_status = ""
+    while _mono_now() < deadline:
+        completion = get_completion(completion_id)
+        job = get_job(job_id)
+        completion_status = str((completion or {}).get("status") or "").strip().lower()
+        job_status = str((job or {}).get("status") or "").strip().lower()
+        if completion_status != last_completion_status or job_status != last_job_status:
+            print(
+                "  terminal publication status: "
+                f"completion={completion_status or 'unknown'} job={job_status or 'unknown'}"
+            )
+            last_completion_status = completion_status
+            last_job_status = job_status
+        if completion_status == "failed":
+            raise RuntimeError(
+                "Completion failed during terminal publication validation.\n"
+                f"completion_id={completion_id} job_id={job_id}\n"
+                f"error={_one_line((completion or {}).get('error'), 600)}"
+            )
+        if job_status in {"failed", "abandoned", "publish_blocked"}:
+            raise RuntimeError(
+                "Worker job failed before terminal publication completed.\n"
+                f"completion_id={completion_id} job_id={job_id} status={job_status}\n"
+                f"error={_one_line((job or {}).get('error'), 600)}"
+            )
+        if completion_status == "processed" and job_status == "completed":
+            return completion or {}, job or {}
+        time.sleep(POLL_INTERVAL_SEC)
+    raise RuntimeError(
+        "Timed out waiting for terminal completion publication.\n"
+        f"completion_id={completion_id} completion_status={last_completion_status or 'unknown'}\n"
+        f"job_id={job_id} job_status={last_job_status or 'unknown'} timeout_sec={timeout_sec}"
+    )
 
 
 def _normalize_epoch_seconds(value: float) -> float:
@@ -3078,6 +3125,25 @@ def main():
 
                 print("\n===== INTERCEPTED COMPLETION PAYLOAD =====")
                 print(json.dumps(intercepted_completion, indent=2, ensure_ascii=False))
+                if REQUIRE_TERMINAL_COMPLETION:
+                    completion_id = str(intercepted_completion.get("id") or "")
+                    completion_job_id = str(intercepted_completion.get("jobId") or "")
+                    if not completion_id or not completion_job_id:
+                        raise RuntimeError(
+                            "Terminal completion mode requires completion and job identifiers."
+                        )
+                    print(
+                        "[NOTICE] Waiting for SourceControlManager trusted validation and terminal publication..."
+                    )
+                    intercepted_completion, terminal_job = wait_for_terminal_completion(
+                        completion_id,
+                        completion_job_id,
+                    )
+                    print(
+                        "[OK] Terminal publication completed: "
+                        f"completion={completion_id} job={completion_job_id} "
+                        f"commit={intercepted_completion.get('commitSha')}"
+                    )
                 print(f"[OK] Backend {backend} produced a completion enqueue payload.")
                 _print_duration(f"{backend} phase B completion intercept", phase_b_started_at)
                 backend_eval["phase_b_sec"] = round(_now() - phase_b_started_at, 3)

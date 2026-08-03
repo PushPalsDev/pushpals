@@ -950,7 +950,9 @@ enabled = true
         writer,
       ]);
 
-      expect(code).toBe(0);
+      if (code !== 0) {
+        throw new Error(`CLI exited ${code}.\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      }
       expect(
         stderr.trim() === "" ||
           stderr.includes(
@@ -1114,6 +1116,16 @@ enabled = true
         proc.exited.then(() => true),
         Bun.sleep(900).then(() => false),
       ]);
+      if (exitedAfterStdinClose) {
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        throw new Error(
+          `Runtime-only CLI exited ${code} after stdin EOF.\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+        );
+      }
       expect(exitedAfterStdinClose).toBe(false);
 
       proc.kill();

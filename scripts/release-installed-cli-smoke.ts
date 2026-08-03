@@ -7,6 +7,7 @@ import { basename, delimiter, join, resolve } from "path";
 type SmokeOptions = {
   packageSpec: string;
   durationMs: number;
+  soakMs: number;
   repoPath: string | null;
   useRepoDataDir: boolean;
   keepTemp: boolean;
@@ -33,6 +34,7 @@ const TEMP_CLEANUP_TIMEOUT_MS = 15_000;
 function parseArgs(argv: string[]): SmokeOptions {
   let packageSpec = "";
   let durationMs = 7 * 60_000;
+  let soakMs = 0;
   let repoPath: string | null = null;
   let useRepoDataDir = false;
   let keepTemp = false;
@@ -49,6 +51,9 @@ function parseArgs(argv: string[]): SmokeOptions {
           30_000,
           Number.parseInt(String(argv[++index] ?? "420000"), 10) || 7 * 60_000,
         );
+        break;
+      case "--soak-ms":
+        soakMs = Math.max(0, Number.parseInt(String(argv[++index] ?? "0"), 10) || 0);
         break;
       case "--repo-path":
         repoPath = String(argv[++index] ?? "").trim() || null;
@@ -74,6 +79,7 @@ function parseArgs(argv: string[]): SmokeOptions {
   return {
     packageSpec,
     durationMs,
+    soakMs,
     repoPath: repoPath ? resolve(repoPath) : null,
     useRepoDataDir,
     keepTemp,
@@ -88,7 +94,9 @@ function appendBoundedOutput(existing: string, next: string): string {
   return combined.slice(combined.length - OUTPUT_MAX_CHARS);
 }
 
-function collectOutput(stream: ReadableStream<Uint8Array> | null | undefined): ProcessOutputCollector {
+function collectOutput(
+  stream: ReadableStream<Uint8Array> | null | undefined,
+): ProcessOutputCollector {
   if (!stream) {
     return {
       done: Promise.resolve(""),
@@ -177,7 +185,12 @@ async function runChecked(
   env?: Record<string, string | undefined>,
   timeoutMs = 2 * 60_000,
 ): Promise<{ stdout: string; stderr: string }> {
-  const result = await runWithTimeout(cmd, cwd, env ?? (process.env as Record<string, string>), timeoutMs);
+  const result = await runWithTimeout(
+    cmd,
+    cwd,
+    env ?? (process.env as Record<string, string>),
+    timeoutMs,
+  );
   if (result.exitCode !== 0) {
     throw new Error(
       `Command failed (${result.exitCode}): ${cmd.join(" ")}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
@@ -243,7 +256,10 @@ async function initializeTempRepo(root: string): Promise<string> {
   await runChecked(["git", "init"], repoPath);
   await runChecked(["git", "branch", "-M", "main"], repoPath);
   await runChecked(["git", "config", "user.name", "PushPals Installed Smoke"], repoPath);
-  await runChecked(["git", "config", "user.email", "pushpals-installed-smoke@example.com"], repoPath);
+  await runChecked(
+    ["git", "config", "user.email", "pushpals-installed-smoke@example.com"],
+    repoPath,
+  );
   writeFileSync(join(repoPath, "README.md"), "# Installed CLI Smoke\n", "utf8");
   writeFileSync(
     join(repoPath, "vision.md"),
@@ -273,9 +289,7 @@ async function resolveRepoPath(root: string, repoPath: string | null): Promise<s
 
 function resolvePushpalsCommand(globalBinDir: string): string {
   const candidates =
-    process.platform === "win32"
-      ? ["pushpals.exe", "pushpals.cmd", "pushpals"]
-      : ["pushpals"];
+    process.platform === "win32" ? ["pushpals.exe", "pushpals.cmd", "pushpals"] : ["pushpals"];
   for (const candidate of candidates) {
     const pathValue = join(globalBinDir, candidate);
     if (existsSync(pathValue)) return pathValue;
@@ -310,11 +324,91 @@ function assertNoStartupFailure(text: string): void {
     "Segmentation fault",
     "oh no: Bun has crashed",
     "Embedded remotebuddy exited during startup",
+    "embeddedRuntimeCrash=",
+    "embeddedRuntime=degraded",
   ];
   for (const blocker of blockers) {
     if (text.includes(blocker)) {
-      throw new Error(`Installed CLI smoke observed failure marker "${blocker}"\n${summarizeTail(text)}`);
+      throw new Error(
+        `Installed CLI smoke observed failure marker "${blocker}"\n${summarizeTail(text)}`,
+      );
     }
+  }
+}
+
+async function runInstalledRuntimeSoak(options: {
+  pushpalsPath: string;
+  repoPath: string;
+  runtimeRoot: string;
+  env: Record<string, string | undefined>;
+  soakMs: number;
+  startupTimeoutMs: number;
+}): Promise<void> {
+  if (options.soakMs <= 0) return;
+  const proc = Bun.spawn(
+    [options.pushpalsPath, "--runtime-only", "--runtime-root", options.runtimeRoot],
+    {
+      cwd: options.repoPath,
+      env: options.env,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  const stdoutCollector = collectOutput(proc.stdout);
+  const stderrCollector = collectOutput(proc.stderr);
+  let exitCode: number | null = null;
+  void proc.exited.then((code) => {
+    exitCode = code;
+  });
+  const combinedSnapshot = () => `${stdoutCollector.snapshot()}\n${stderrCollector.snapshot()}`;
+
+  try {
+    const startupDeadline = Date.now() + options.startupTimeoutMs;
+    while (Date.now() < startupDeadline) {
+      const snapshot = combinedSnapshot();
+      assertNoStartupFailure(snapshot);
+      if (snapshot.includes("[pushpals] Embedded runtime is ready.")) break;
+      if (exitCode !== null) {
+        throw new Error(
+          `Installed runtime-only soak exited ${exitCode} before readiness.\n${summarizeTail(snapshot)}`,
+        );
+      }
+      await Bun.sleep(500);
+    }
+    if (!combinedSnapshot().includes("[pushpals] Embedded runtime is ready.")) {
+      throw new Error(
+        `Installed runtime-only soak did not become ready within ${options.startupTimeoutMs}ms.\n${summarizeTail(combinedSnapshot())}`,
+      );
+    }
+
+    const soakDeadline = Date.now() + options.soakMs;
+    while (Date.now() < soakDeadline) {
+      const snapshot = combinedSnapshot();
+      assertNoStartupFailure(snapshot);
+      if (exitCode !== null) {
+        throw new Error(
+          `Installed runtime-only soak exited ${exitCode} before the ${options.soakMs}ms soak completed.\n${summarizeTail(snapshot)}`,
+        );
+      }
+      await Bun.sleep(Math.min(1_000, Math.max(1, soakDeadline - Date.now())));
+    }
+    assertNoStartupFailure(combinedSnapshot());
+    console.log(
+      `[installed-cli-smoke] Runtime remained healthy for ${options.soakMs}ms after readiness.`,
+    );
+  } finally {
+    if (exitCode === null) {
+      try {
+        proc.stdin.write("exit\n");
+        proc.stdin.end();
+      } catch {
+        killProcessTree(proc);
+      }
+      await Promise.race([proc.exited.catch(() => -1), Bun.sleep(60_000)]);
+    }
+    if (exitCode === null) killProcessTree(proc);
+    await Promise.all([finishOutput(stdoutCollector), finishOutput(stderrCollector)]);
   }
 }
 
@@ -388,13 +482,11 @@ async function main(): Promise<void> {
   mkdirSync(bunInstallRoot, { recursive: true });
   mkdirSync(runtimeRoot, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
-  let finalClear:
-    | {
-        pushpalsPath: string;
-        repoPath: string;
-        commandEnv: Record<string, string>;
-      }
-    | null = null;
+  let finalClear: {
+    pushpalsPath: string;
+    repoPath: string;
+    commandEnv: Record<string, string>;
+  } | null = null;
 
   try {
     const repoPath = await resolveRepoPath(root, options.repoPath);
@@ -404,7 +496,12 @@ async function main(): Promise<void> {
     } as Record<string, string>;
 
     console.log(`[installed-cli-smoke] Installing ${options.packageSpec}`);
-    await runChecked([process.execPath, "install", "-g", options.packageSpec], root, installEnv, 5 * 60_000);
+    await runChecked(
+      [process.execPath, "install", "-g", options.packageSpec],
+      root,
+      installEnv,
+      5 * 60_000,
+    );
     const globalBinDir = (
       await runChecked([process.execPath, "pm", "bin", "-g"], root, installEnv, 30_000)
     ).stdout.trim();
@@ -450,6 +547,14 @@ async function main(): Promise<void> {
     if (!combined.includes("[pushpals] Connected.")) {
       throw new Error(`Missing connected log line.\n${summarizeTail(combined)}`);
     }
+    await runInstalledRuntimeSoak({
+      pushpalsPath,
+      repoPath,
+      runtimeRoot,
+      env: commandEnv,
+      soakMs: options.soakMs,
+      startupTimeoutMs: options.durationMs,
+    });
     console.log(
       `[installed-cli-smoke] Installed package ${options.packageSpec} cold-started successfully on ${process.platform}/${process.arch}.`,
     );

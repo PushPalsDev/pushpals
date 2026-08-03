@@ -15,12 +15,15 @@ const BUN_PROBE_TIMEOUT_ENV = "PUSHPALS_BUN_PROBE_TIMEOUT_MS";
 const BOOTSTRAP_TIMEOUT_ENV = "PUSHPALS_CLI_BOOTSTRAP_TIMEOUT_MS";
 const BOOTSTRAP_READY_MARKER_ENV = "PUSHPALS_CLI_READY_MARKER";
 let packageVersion = "";
+let minimumBunVersion = "1.3.14";
 let readyMarkerPath = "";
 let resolvedBunCommand = "";
 if (existsSync(packageJsonPath)) {
   try {
     const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8"));
     packageVersion = String(parsed?.version ?? "").trim();
+    const engineFloor = String(parsed?.engines?.bun ?? "").match(/(\d+)\.(\d+)\.(\d+)/);
+    if (engineFloor) minimumBunVersion = engineFloor[0];
   } catch {
     packageVersion = "";
   }
@@ -46,11 +49,7 @@ function parseBunProbeTimeoutMs() {
 }
 
 function parseBootstrapTimeoutMs() {
-  return parseBoundedTimeoutMs(
-    BOOTSTRAP_TIMEOUT_ENV,
-    DEFAULT_BOOTSTRAP_TIMEOUT_MS,
-    30 * 60 * 1000,
-  );
+  return parseBoundedTimeoutMs(BOOTSTRAP_TIMEOUT_ENV, DEFAULT_BOOTSTRAP_TIMEOUT_MS, 30 * 60 * 1000);
 }
 
 function createReadyMarkerPath() {
@@ -121,12 +120,31 @@ if (!existsSync(bundledCliPath)) {
 
 function probeBunRuntime() {
   const timeout = parseBunProbeTimeoutMs();
-  const options = { stdio: "ignore", timeout };
+  const options = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout };
   const result = spawnSync(resolveBunCommand(), ["--version"], options);
+  const version = String(result.stdout ?? "").trim();
   return {
     ok: result.status === 0,
     timedOut: Boolean(result.error && result.error.code === "ETIMEDOUT"),
+    version,
   };
+}
+
+function parseVersion(value) {
+  const match = String(value ?? "")
+    .trim()
+    .match(/v?(\d+)\.(\d+)\.(\d+)/i);
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+function versionAtLeast(actualValue, minimumValue) {
+  const actual = parseVersion(actualValue);
+  const minimum = parseVersion(minimumValue);
+  if (!actual || !minimum) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (actual[index] !== minimum[index]) return actual[index] > minimum[index];
+  }
+  return true;
 }
 
 const bunRuntime = probeBunRuntime();
@@ -143,6 +161,13 @@ if (!bunRuntime.ok) {
     "[pushpals] Bun runtime is required for the npm package entrypoint.",
     "[pushpals] Install Bun from https://bun.sh, or use a direct binary release:",
     `[pushpals] ${releaseUrl}`,
+  ]);
+}
+if (!versionAtLeast(bunRuntime.version, minimumBunVersion)) {
+  fail([
+    `[pushpals] Unsupported Bun runtime ${bunRuntime.version || "unknown"}; this PushPals package requires Bun ${minimumBunVersion} or newer.`,
+    `[pushpals] For npm-managed Bun, run: npm install -g bun@${minimumBunVersion}`,
+    "[pushpals] PushPals refused to launch an incompatible runtime so it cannot crash-loop or freeze the shell.",
   ]);
 }
 

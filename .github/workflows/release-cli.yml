@@ -199,7 +199,8 @@ jobs:
         shell: pwsh
         run: |
           bun run scripts/release-installed-cli-smoke.ts `
-            --package-spec @pushpalsdev/cli@${{ needs.meta.outputs.version }}
+            --package-spec @pushpalsdev/cli@${{ needs.meta.outputs.version }} `
+            --soak-ms 150000
 
   build_binaries:
     name: Build standalone CLI binaries

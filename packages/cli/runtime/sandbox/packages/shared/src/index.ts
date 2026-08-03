@@ -92,6 +92,13 @@ export {
   type TrustedValidationCommandsResult,
 } from "./trusted_validation.js";
 export {
+  MINIMUM_SUPPORTED_BUN_VERSION,
+  isSupportedBunVersion,
+  parseRuntimeVersion,
+  runtimeVersionAtLeast,
+  type RuntimeVersionTuple,
+} from "./runtime_version.js";
+export {
   DEFAULT_WORKERPALS_EXECUTOR,
   invalidatePushPalsConfigCache,
   loadPushPalsConfig,

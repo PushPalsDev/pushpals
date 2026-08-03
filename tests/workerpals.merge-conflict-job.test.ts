@@ -864,7 +864,7 @@ describe("workerpals merge-conflict sandbox", () => {
               likelyDirs: ["components/__tests__"],
             },
             acceptanceCriteria: ["Resolve the merge conflict and keep the test healthy."],
-            validationSteps: ['python -c "raise SystemExit(1)"'],
+            validationSteps: ["bun test definitely_missing_validation_target.test.ts"],
             queuePriority: "normal",
             queueWaitBudgetMs: 90_000,
             executionBudgetMs: 1_800_000,

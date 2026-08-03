@@ -3,6 +3,11 @@
  * The helper executes each check sequentially, surfaces actionable failure codes,
  * and optionally blocks job dispatch until a synthetic probe completes.
  */
+import {
+  MINIMUM_SUPPORTED_BUN_VERSION,
+  isSupportedBunVersion,
+} from "../../../../packages/shared/src/runtime_version.js";
+
 export const STARTUP_FAILURE_CODES = {
   BUN_VERSION_UNSUPPORTED: "startup.bun_version_unsupported",
   DOCKER_VERSION_UNSUPPORTED: "startup.docker_version_unsupported",
@@ -155,7 +160,6 @@ export interface StartupCheckStructure {
 
 const DEFAULT_SYNTHETIC_LATENCY_MS = 850;
 const DEFAULT_SYNTHETIC_PROBE = "probe.remote_startup";
-const MINIMUM_BUN_VERSION = [1, 1, 0] as const;
 const MINIMUM_DOCKER_VERSION = [24, 0, 0] as const;
 const DISPATCH_CHECK_LABEL = "Job dispatch must succeed.";
 const DISPATCH_CHECK_ACTION =
@@ -182,15 +186,14 @@ const defaultChecks = Object.freeze([
   {
     code: STARTUP_FAILURE_CODES.BUN_VERSION_UNSUPPORTED,
     label: "Bun runtime must meet the supported version floor.",
-    action: "Install Bun 1.1 or newer, then rerun the startup preflight.",
+    action: `Install Bun ${MINIMUM_SUPPORTED_BUN_VERSION} or newer, then rerun the startup preflight.`,
     category: "runtime",
     run: async (ctx) => {
       const value = await ctx.readBunVersion();
-      const parsed = parseVersion(value);
-      if (!parsed || !versionAtLeast(parsed, MINIMUM_BUN_VERSION)) {
+      if (!isSupportedBunVersion(value)) {
         return {
           ok: false,
-          detail: `Bun ${value || "(unknown)"} is below the supported 1.1.0 floor.`,
+          detail: `Bun ${value || "(unknown)"} is below the supported ${MINIMUM_SUPPORTED_BUN_VERSION} floor.`,
         };
       }
       return { ok: true, detail: `Bun ${value} meets the supported version floor.` };

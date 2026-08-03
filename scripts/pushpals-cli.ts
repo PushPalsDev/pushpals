@@ -42,6 +42,10 @@ import {
 } from "../packages/shared/src/client_preflight.js";
 import { normalizePresenceLookupToken } from "../packages/shared/src/communication.js";
 import { resolveGitStateFilePath } from "../packages/shared/src/repo.js";
+import {
+  MINIMUM_SUPPORTED_BUN_VERSION,
+  isSupportedBunVersion,
+} from "../packages/shared/src/runtime_version.js";
 import { shouldDisplayInteractiveSessionEvent } from "../packages/shared/src/session_event_visibility.js";
 
 type CliOptions = {
@@ -676,6 +680,21 @@ function logCliInvocation(argv: string[]): void {
   console.log(`[pushpals] platform=${process.platform}/${process.arch}`);
   console.log(`[pushpals] cwd=${process.cwd()}`);
   console.log(`[pushpals] args=${argsText}`);
+}
+
+export function formatUnsupportedBunRuntimeLines(version: string): string[] {
+  const detected = String(version ?? "").trim() || "unknown";
+  return [
+    `[pushpals] Unsupported Bun runtime ${detected}; PushPals requires Bun ${MINIMUM_SUPPORTED_BUN_VERSION} or newer.`,
+    `[pushpals] Upgrade Bun before starting services. For npm-managed Bun: npm install -g bun@${MINIMUM_SUPPORTED_BUN_VERSION}`,
+    "[pushpals] PushPals refused to start the runtime so an incompatible Bun process cannot crash-loop or freeze the shell.",
+  ];
+}
+
+export function enforceSupportedBunRuntime(version = Bun.version): boolean {
+  if (isSupportedBunVersion(version)) return true;
+  for (const line of formatUnsupportedBunRuntimeLines(version)) console.error(line);
+  return false;
 }
 
 function printUsage(): void {
@@ -2384,6 +2403,7 @@ export function buildEmbeddedRuntimeCrashEnvelope(options: {
   const signatureMatch = logText.match(
     /\b(?:panic\(main thread\)[^\r\n]*|segmentation fault[^\r\n]*|oh no:\s*bun has crashed[^\r\n]*)/i,
   );
+  const logRssBytes = rssMatch ? memoryValueToBytes(rssMatch[1], rssMatch[2]) : null;
   return {
     event: "embedded_runtime_crash",
     crashId: `crash_${crypto.randomUUID().slice(0, 12)}`,
@@ -2396,17 +2416,27 @@ export function buildEmbeddedRuntimeCrashEnvelope(options: {
     jobId: jobMatch?.[1] ?? null,
     memory: {
       rssBytes:
-        typeof options.rssBytes === "number" && Number.isFinite(options.rssBytes)
+        logRssBytes ??
+        (typeof options.rssBytes === "number" && Number.isFinite(options.rssBytes)
           ? Math.max(0, Math.floor(options.rssBytes))
-          : rssMatch
-            ? memoryValueToBytes(rssMatch[1], rssMatch[2])
-            : null,
+          : null),
     },
     crashReport: crashReportMatch?.[0] ?? null,
     crashSignature: signatureMatch?.[0] ?? null,
     recoveryOutcome: options.recoveryPlanned ? "restart_planned" : "restart_not_planned",
     observedAt: options.observedAt,
   };
+}
+
+export function buildEmbeddedRuntimeCrashFingerprint(logText: string): string | null {
+  const text = String(logText ?? "");
+  const signature = text.match(
+    /\b(?:panic\(main thread\)[^\r\n]*|segmentation fault[^\r\n]*|oh no:\s*bun has crashed[^\r\n]*)/i,
+  )?.[0];
+  if (!signature) return null;
+  const runtime = text.match(/\bBun\s+v?(\d+\.\d+\.\d+(?:[-+][a-z0-9.-]+)?)/i)?.[1];
+  const normalizedSignature = signature.trim().replace(/\s+/g, " ").toLowerCase();
+  return `bun@${runtime ?? "unknown"}:${normalizedSignature}`;
 }
 
 function hasStandaloneBunCrashSignature(text: string): boolean {
@@ -5342,8 +5372,11 @@ async function autoStartRuntimeServices(opts: {
     { envelope: EmbeddedRuntimeCrashEnvelope; observedAtMs: number }
   >();
   const serviceManager = new ServiceManager({
-    degradedAction:
-      "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
+    degradedAction: `Inspect the embedded service log, upgrade to Bun ${MINIMUM_SUPPORTED_BUN_VERSION} or newer when a native crash is reported, then restart PushPals. Other healthy services remain available.`,
+    repeatedExitFingerprintLimit: 2,
+    repeatedExitFingerprintWindowMs: 15 * 60_000,
+    resolveExitFingerprint: ({ logPath }) =>
+      logPath ? buildEmbeddedRuntimeCrashFingerprint(readLogTail(logPath, 200)) : null,
     onEvent: (level, line) => {
       const cliLine = `[pushpals] ${line.replace(/^Managed /, "Embedded ").replace(/^Restarted managed /, "Restarted embedded ")}`;
       if (level === "error") {
@@ -6781,6 +6814,9 @@ async function main(): Promise<void> {
       process.exit(0);
     }
     console.error(`[pushpals] Failed to open config file. Edit this file manually: ${result.path}`);
+    process.exit(1);
+  }
+  if (!enforceSupportedBunRuntime()) {
     process.exit(1);
   }
   console.log("[pushpals] Running runtime preflight...");

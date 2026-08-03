@@ -5102,7 +5102,50 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
 }
 
 // apps/source_control_manager/src/trusted_validation.ts
+import { existsSync as existsSync5 } from "fs";
+import { basename as basename2 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 15 * 60000;
+var BUN_DEPENDENCY_COMMANDS = new Set([
+  "bun",
+  "bunx",
+  "eslint",
+  "jest",
+  "node",
+  "npm",
+  "npx",
+  "tsc",
+  "vitest"
+]);
+function currentBunExecutable(explicit) {
+  const configured = String(explicit ?? process.env.PUSHPALS_BUN_BIN ?? "").trim();
+  if (configured)
+    return configured;
+  const execPath = String(process.execPath ?? "").trim();
+  return /^(?:bun|bun\.exe)$/i.test(basename2(execPath)) ? execPath : "";
+}
+function resolveTrustedValidationArgv(argv, bunExecutable) {
+  if (argv.length === 0)
+    return [];
+  const bun = currentBunExecutable(bunExecutable);
+  if (!bun)
+    return [...argv];
+  const executable = String(argv[0] ?? "").trim().toLowerCase();
+  if (executable === "bun" || executable === "bun.exe") {
+    return [bun, ...argv.slice(1)];
+  }
+  if (executable === "bunx" || executable === "bunx.exe") {
+    return [bun, "x", ...argv.slice(1)];
+  }
+  return [...argv];
+}
+function resolveTrustedValidationPreparationArgv(options) {
+  const hasBunProject = existsSync5(`${options.repoPath}/package.json`) && (existsSync5(`${options.repoPath}/bun.lock`) || existsSync5(`${options.repoPath}/bun.lockb`));
+  const needsDependencies = options.commandArgv.some((argv) => BUN_DEPENDENCY_COMMANDS.has(String(argv[0] ?? "").trim().toLowerCase()));
+  if (!hasBunProject || !needsDependencies)
+    return null;
+  const bun = currentBunExecutable(options.bunExecutable);
+  return [bun || "bun", "install", "--frozen-lockfile"];
+}
 async function runArgv(argv, options) {
   const proc = Bun.spawn(argv, {
     cwd: options.cwd,
@@ -5132,12 +5175,26 @@ async function runTrustedValidationCommands(options) {
   const runner = options.runner ?? runArgv;
   const timeoutMs = Math.max(1000, options.timeoutMs ?? DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS);
   const results = [];
-  for (const command of normalized.commands) {
+  const commandsWithArgv = normalized.commands.map((command) => {
     const argv = tokenizeTrustedValidationCommand(command);
-    if (!argv) {
+    if (!argv)
       throw new Error(`Invalid trusted-validation command after normalization: ${command}`);
-    }
-    const result = await runner(argv, { cwd: options.repoPath, timeoutMs });
+    return { command, argv };
+  });
+  const preparationArgv = resolveTrustedValidationPreparationArgv({
+    repoPath: options.repoPath,
+    commandArgv: commandsWithArgv.map(({ argv }) => argv),
+    bunExecutable: options.bunExecutable
+  });
+  if (preparationArgv) {
+    const preparation = await runner(preparationArgv, { cwd: options.repoPath, timeoutMs });
+    results.push({ command: "bun install --frozen-lockfile", ...preparation });
+    if (!preparation.ok)
+      return results;
+  }
+  for (const { command, argv } of commandsWithArgv) {
+    const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
+    const result = await runner(resolvedArgv, { cwd: options.repoPath, timeoutMs });
     results.push({ command, ...result });
     if (!result.ok)
       break;

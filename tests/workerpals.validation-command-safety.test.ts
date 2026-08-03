@@ -1,13 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -116,6 +109,14 @@ describe("workerpals validation command safety", () => {
   test("rejects shell control chaining tokens", () => {
     expect(tokenizeValidationCommandArgv("bun test && echo hi")).toBeNull();
     expect(tokenizeValidationCommandArgv("bun test | cat")).toBeNull();
+    expect(tokenizeValidationCommandArgv("bun test|cat")).toBeNull();
+    expect(tokenizeValidationCommandArgv("bun test > output.log")).toBeNull();
+    expect(tokenizeValidationCommandArgv('bun test -t "route|shell"')).toEqual([
+      "bun",
+      "test",
+      "-t",
+      "route|shell",
+    ]);
   });
 
   test("detects test-like validation steps with argv flags and inline backticks", () => {
@@ -231,6 +232,26 @@ describe("workerpals validation command safety", () => {
       "git diff -- app/game.tsx",
     ]);
     expect(commands.fallbackValidationSteps).toEqual([]);
+  });
+
+  test("drops planner validation commands that require a shell pipeline", () => {
+    const planning = planningFixture({
+      validationSteps: [
+        "git diff --check -- README.md",
+        "git diff --name-only | grep -qx 'README.md'",
+      ],
+      requiredValidationSteps: ["bun run validate"],
+    }) as any;
+
+    const commands = collectQualityGateValidationCommands({
+      instruction: "Append one line to README.md",
+      targetPath: "README.md",
+      planning,
+      changedTestPaths: [],
+      isTestTask: false,
+    });
+
+    expect(commands.commandsToRun).toEqual(["bun run validate", "git diff --check -- README.md"]);
   });
 
   test("dedupes equivalent bun x and bunx validation commands", () => {
@@ -1306,9 +1327,7 @@ describe("workerpals validation command safety", () => {
   });
 
   test("replaces managed linked-package snapshots before Bun validation", () => {
-    const tempRoot = mkdtempSync(
-      join(tmpdir(), "pushpals-validation-linked-package-snapshot-"),
-    );
+    const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-validation-linked-package-snapshot-"));
     const canonicalRepo = join(tempRoot, "repo");
     const root = join(canonicalRepo, ".worktrees", "job-fixture");
     const canonicalWrangler = join(canonicalRepo, "node_modules", "wrangler");
@@ -1373,24 +1392,18 @@ describe("workerpals validation command safety", () => {
         process.platform === "win32" ? "junction" : "dir",
       );
 
-      const plan = resolveBunDependencyLayoutPreflight(root, [
-        "bun run worker:deploy:dry-run",
-      ]);
+      const plan = resolveBunDependencyLayoutPreflight(root, ["bun run worker:deploy:dry-run"]);
       expect(plan?.reason).toContain("linked package directories");
       expect(plan?.removeLinkedNodeModules).toBe(true);
 
-      const linkedRun = spawnSync(
-        "node",
-        [join(root, "node_modules", "wrangler", "cli.js")],
-        {
-          env: {
-            ...process.env,
-            NODE_PATH: join(root, "node_modules"),
-            BUN_OPTIONS: "",
-          },
-          encoding: "utf8",
+      const linkedRun = spawnSync("node", [join(root, "node_modules", "wrangler", "cli.js")], {
+        env: {
+          ...process.env,
+          NODE_PATH: join(root, "node_modules"),
+          BUN_OPTIONS: "",
         },
-      );
+        encoding: "utf8",
+      });
       expect(linkedRun.status).not.toBe(0);
       expect(linkedRun.stderr).toContain("Cannot find package '@cloudflare/unenv-preset'");
 
@@ -1426,18 +1439,14 @@ describe("workerpals validation command safety", () => {
       );
       writeFileSync(join(localPreset, "index.js"), 'export default "job-local";\n', "utf8");
 
-      const localizedRun = spawnSync(
-        "node",
-        [join(localWrangler, "cli.js")],
-        {
-          env: {
-            ...process.env,
-            NODE_PATH: join(root, "node_modules"),
-            BUN_OPTIONS: "",
-          },
-          encoding: "utf8",
+      const localizedRun = spawnSync("node", [join(localWrangler, "cli.js")], {
+        env: {
+          ...process.env,
+          NODE_PATH: join(root, "node_modules"),
+          BUN_OPTIONS: "",
         },
-      );
+        encoding: "utf8",
+      });
       expect(localizedRun.status).toBe(0);
       expect(localizedRun.stdout).toBe("job-local");
       expect(localizedRun.stderr).toBe("");

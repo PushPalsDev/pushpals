@@ -649,13 +649,72 @@ function hasRelevantTargetPath(step: string, targetPaths: string[]): boolean {
   return false;
 }
 
-function normalizeValidationSteps(steps: string[], targetPaths: string[]): string[] {
+const VALIDATION_SHELL_CONTROL_TOKENS = new Set(["&&", "||", ";", "|"]);
+
+function isPlainValidationCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  const pushCurrent = () => {
+    if (!current) return;
+    tokens.push(current);
+    current = "";
+  };
+
+  for (const ch of trimmed) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (quote) {
+      if (quote === '"' && ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (
+      ch === "|" ||
+      ch === ";" ||
+      ch === "&" ||
+      ch === ">" ||
+      ch === "<" ||
+      ch === "`" ||
+      ch === "$"
+    ) {
+      return false;
+    }
+    if (/\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  if (quote) return false;
+  pushCurrent();
+  return tokens.length > 0 && !tokens.some((token) => VALIDATION_SHELL_CONTROL_TOKENS.has(token));
+}
+
+export function normalizeValidationSteps(steps: string[], targetPaths: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const raw of steps) {
     const value = canonicalizeValidationCommandForBun(String(raw ?? "").trim());
     if (!value) continue;
     if (!isCommandLikeValidationStep(value)) continue;
+    if (!isPlainValidationCommand(value)) continue;
     if (!hasRelevantTargetPath(value, targetPaths)) continue;
     const key = value.toLowerCase();
     if (seen.has(key)) continue;

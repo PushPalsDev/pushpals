@@ -47,12 +47,26 @@ type ServiceManagerState = {
   lastRestartReason: string;
   pendingRestartTimer: ReturnType<typeof setTimeout> | null;
   lastReportedExitedProcess: ManagedServiceProcess | null;
+  lastExitFingerprint: string;
+  matchingExitFingerprintCount: number;
+  lastExitFingerprintAtMs: number;
+};
+
+export type ManagedServiceExitFingerprintContext = {
+  service: string;
+  exitCode: number | null;
+  uptimeMs: number;
+  logPath?: string;
+  command: string[];
 };
 
 export type ServiceManagerOptions = {
   pollMs?: number;
   maxRestartAttempts?: number;
   stableWindowMs?: number;
+  repeatedExitFingerprintLimit?: number;
+  repeatedExitFingerprintWindowMs?: number;
+  resolveExitFingerprint?: (context: ManagedServiceExitFingerprintContext) => string | null;
   computeRestartBackoffMs?: (attempt: number) => number;
   degradedAction?: string;
   spawnService?: (spec: ManagedServiceSpec) => ManagedServiceProcess;
@@ -100,6 +114,8 @@ export type ManagedServiceLaunchRetryOptions = {
 const DEFAULT_SERVICE_MANAGER_POLL_MS = 1_000;
 const DEFAULT_SERVICE_MANAGER_MAX_RESTART_ATTEMPTS = 4;
 const DEFAULT_SERVICE_MANAGER_STABLE_WINDOW_MS = 60_000;
+const DEFAULT_REPEATED_EXIT_FINGERPRINT_LIMIT = 2;
+const DEFAULT_REPEATED_EXIT_FINGERPRINT_WINDOW_MS = 15 * 60_000;
 const DEFAULT_SERVICE_MANAGER_BASE_BACKOFF_MS = 2_000;
 const DEFAULT_SERVICE_MANAGER_MAX_BACKOFF_MS = 30_000;
 
@@ -130,10 +146,15 @@ export function shouldRestartService(
   return normalizedAttempts < normalizedMax;
 }
 
+export function maxRssKiBToBytes(value: unknown): number | null {
+  const maxRssKiB = Number(value);
+  if (!Number.isFinite(maxRssKiB) || maxRssKiB < 0) return null;
+  return Math.floor(maxRssKiB * 1024);
+}
+
 function managedServiceMaxRssBytes(service: ManagedServiceProcess): number | null {
   try {
-    const maxRss = Number(service.proc.resourceUsage?.()?.maxRSS);
-    return Number.isFinite(maxRss) && maxRss >= 0 ? Math.floor(maxRss) : null;
+    return maxRssKiBToBytes(service.proc.resourceUsage?.()?.maxRSS);
   } catch {
     return null;
   }
@@ -286,6 +307,9 @@ export class ServiceManager {
   private readonly pollMs: number;
   private readonly maxRestartAttempts: number;
   private readonly stableWindowMs: number;
+  private readonly repeatedExitFingerprintLimit: number;
+  private readonly repeatedExitFingerprintWindowMs: number;
+  private readonly resolveExitFingerprint?: ServiceManagerOptions["resolveExitFingerprint"];
   private readonly computeRestartBackoffMs: (attempt: number) => number;
   private readonly degradedAction: string;
   private readonly spawnService: (spec: ManagedServiceSpec) => ManagedServiceProcess;
@@ -311,6 +335,17 @@ export class ServiceManager {
       1_000,
       Math.floor(options.stableWindowMs ?? DEFAULT_SERVICE_MANAGER_STABLE_WINDOW_MS),
     );
+    this.repeatedExitFingerprintLimit = Math.max(
+      2,
+      Math.floor(options.repeatedExitFingerprintLimit ?? DEFAULT_REPEATED_EXIT_FINGERPRINT_LIMIT),
+    );
+    this.repeatedExitFingerprintWindowMs = Math.max(
+      1_000,
+      Math.floor(
+        options.repeatedExitFingerprintWindowMs ?? DEFAULT_REPEATED_EXIT_FINGERPRINT_WINDOW_MS,
+      ),
+    );
+    this.resolveExitFingerprint = options.resolveExitFingerprint;
     this.computeRestartBackoffMs =
       options.computeRestartBackoffMs ?? computeServiceRestartBackoffMs;
     this.degradedAction =
@@ -358,6 +393,9 @@ export class ServiceManager {
     state.lastRestartReason = "";
     if (options.resetAttempts !== false) {
       state.attempts = 0;
+      state.lastExitFingerprint = "";
+      state.matchingExitFingerprintCount = 0;
+      state.lastExitFingerprintAtMs = 0;
     }
     this.degradedServiceReasons.delete(spec.name);
     this.emitHealthChange();
@@ -436,6 +474,9 @@ export class ServiceManager {
       lastRestartReason: "",
       pendingRestartTimer: null,
       lastReportedExitedProcess: null,
+      lastExitFingerprint: "",
+      matchingExitFingerprintCount: 0,
+      lastExitFingerprintAtMs: 0,
     };
     this.stateByService.set(name, created);
     return created;
@@ -447,6 +488,49 @@ export class ServiceManager {
 
   private emitEvent(level: "log" | "warn" | "error", line: string): void {
     this.onEvent?.(level, line);
+  }
+
+  private recordExitFingerprint(
+    state: ServiceManagerState,
+    name: string,
+    service: ManagedServiceProcess,
+    now: number,
+  ): { fingerprint: string; count: number; limitReached: boolean } | null {
+    if (!this.resolveExitFingerprint) return null;
+    let resolved = "";
+    try {
+      resolved = String(
+        this.resolveExitFingerprint({
+          service: name,
+          exitCode: service.exitCode,
+          uptimeMs: Math.max(0, now - service.launchedAtMs),
+          logPath: service.logPath,
+          command: [...service.command],
+        }) ?? "",
+      )
+        .trim()
+        .replace(/\s+/g, " ")
+        .slice(0, 240);
+    } catch (error) {
+      this.emitEvent(
+        "warn",
+        `Managed ${name} exit fingerprint resolver failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    }
+    if (!resolved) return null;
+
+    const withinWindow =
+      state.lastExitFingerprint === resolved &&
+      now - state.lastExitFingerprintAtMs <= this.repeatedExitFingerprintWindowMs;
+    state.matchingExitFingerprintCount = withinWindow ? state.matchingExitFingerprintCount + 1 : 1;
+    state.lastExitFingerprint = resolved;
+    state.lastExitFingerprintAtMs = now;
+    return {
+      fingerprint: resolved,
+      count: state.matchingExitFingerprintCount,
+      limitReached: state.matchingExitFingerprintCount >= this.repeatedExitFingerprintLimit,
+    };
   }
 
   private tick(): void {
@@ -469,14 +553,22 @@ export class ServiceManager {
 
       const reason = `exit code ${service.exitCode ?? "unknown"}`;
       const exitAlreadyReported = state.lastReportedExitedProcess === service;
-      if (!shouldRestartService(state.attempts, this.maxRestartAttempts)) {
+      const uptimeMs = Math.max(0, now - service.launchedAtMs);
+      const exitFingerprint = exitAlreadyReported
+        ? null
+        : this.recordExitFingerprint(state, name, service, now);
+      const fingerprintCircuitOpen = Boolean(exitFingerprint?.limitReached);
+      if (
+        fingerprintCircuitOpen ||
+        !shouldRestartService(state.attempts, this.maxRestartAttempts)
+      ) {
         if (!exitAlreadyReported) {
           state.lastReportedExitedProcess = service;
           this.onLifecycleEvent?.({
             type: "exit",
             service: name,
             exitCode: service.exitCode,
-            uptimeMs: Math.max(0, now - service.launchedAtMs),
+            uptimeMs,
             rssBytes: managedServiceMaxRssBytes(service),
             restartAttempt: state.attempts,
             maxRestartAttempts: this.maxRestartAttempts,
@@ -491,13 +583,15 @@ export class ServiceManager {
           maxRestartAttempts: this.maxRestartAttempts,
           observedAt: new Date(now).toISOString(),
         });
-        this.emitEvent(
-          "error",
-          `Managed ${name} exited (${reason}) and reached restart limit (${state.attempts}/${this.maxRestartAttempts}).`,
-        );
+        const repeatedFailureDetail = fingerprintCircuitOpen
+          ? `repeated identical native failure (${exitFingerprint?.count}/${this.repeatedExitFingerprintLimit}, fingerprint=${exitFingerprint?.fingerprint})`
+          : `reached restart limit (${state.attempts}/${this.maxRestartAttempts})`;
+        this.emitEvent("error", `Managed ${name} exited (${reason}) and ${repeatedFailureDetail}.`);
         this.launchSpecs.delete(name);
         if (!this.degradedServiceReasons.has(name)) {
-          const degradationReason = `reached restart limit after ${reason} (${state.attempts}/${this.maxRestartAttempts})`;
+          const degradationReason = fingerprintCircuitOpen
+            ? `${repeatedFailureDetail} after ${reason}; automatic restarts paused for this service`
+            : `reached restart limit after ${reason} (${state.attempts}/${this.maxRestartAttempts})`;
           this.degradedServiceReasons.set(name, degradationReason);
           const health = this.getHealth();
           if (health) {
@@ -517,7 +611,7 @@ export class ServiceManager {
           type: "exit",
           service: name,
           exitCode: service.exitCode,
-          uptimeMs: Math.max(0, now - service.launchedAtMs),
+          uptimeMs,
           rssBytes: managedServiceMaxRssBytes(service),
           restartAttempt: nextAttempt,
           maxRestartAttempts: this.maxRestartAttempts,

@@ -1507,6 +1507,17 @@ export function tokenizeValidationCommandArgv(command: string): string[] | null 
       quote = ch;
       continue;
     }
+    if (
+      ch === "|" ||
+      ch === ";" ||
+      ch === "&" ||
+      ch === ">" ||
+      ch === "<" ||
+      ch === "`" ||
+      ch === "$"
+    ) {
+      return null;
+    }
     if (/\s/.test(ch)) {
       pushCurrent();
       continue;
@@ -2659,9 +2670,7 @@ function isLinkedNodeModulesDependencyArtifact(repo: string): boolean {
 }
 
 function isManagedLinkedPackageDependencySnapshot(repo: string): boolean {
-  return existsSync(
-    resolve(repo, "node_modules", DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER),
-  );
+  return existsSync(resolve(repo, "node_modules", DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER));
 }
 
 function validationNeedsExpoRouterBrowserLocalInstall(
@@ -4713,6 +4722,7 @@ function runnableValidationCommandsFromSteps(steps: string[] | undefined): strin
 
 function normalizeRunnableValidationCommand(command: string): string | null {
   if (/<[A-Za-z][A-Za-z0-9:._ -]*>/.test(command)) return null;
+  if (!tokenizeValidationCommandArgv(command)) return null;
   const bunTestCommand = normalizeBunTestValidationCommand(command);
   return bunTestCommand === undefined ? command : bunTestCommand;
 }
@@ -4769,10 +4779,7 @@ function normalizeBunTestValidationCommand(command: string): string | null | und
   return [...prefix, ...keptArgs].map((entry) => quoteValidationCommandArg(entry)).join(" ");
 }
 
-export function sanitizeMissingExplicitTestTargets(
-  repo: string,
-  command: string,
-): string | null {
+export function sanitizeMissingExplicitTestTargets(repo: string, command: string): string | null {
   const argv = tokenizeValidationCommandArgv(command);
   if (!argv || argv.length === 0 || !isBunCommandToken(argv[0] ?? "")) return command;
 
@@ -4789,11 +4796,7 @@ export function sanitizeMissingExplicitTestTargets(
       Boolean(normalizedPath) &&
       (isAssertionCoverageTestPath(normalizedPath ?? "") ||
         isBrowserSmokeHarnessPath(normalizedPath ?? ""));
-    if (
-      isConcreteTestTarget &&
-      normalizedPath &&
-      !existsSync(resolve(repo, normalizedPath))
-    ) {
+    if (isConcreteTestTarget && normalizedPath && !existsSync(resolve(repo, normalizedPath))) {
       droppedMissingTarget = true;
       continue;
     }
@@ -10363,12 +10366,8 @@ export async function executeJob(
         ].join("\n"),
         outputPolicyForRuntime(runtimeConfig),
       );
-      const summary =
-        "Candidate patch requires trusted-environment validation before publication";
-      onLog?.(
-        "stderr",
-        `[QualityGate] ${summary}: ${toSingleLine(quality.blocker.detail, 260)}`,
-      );
+      const summary = "Candidate patch requires trusted-environment validation before publication";
+      onLog?.("stderr", `[QualityGate] ${summary}: ${toSingleLine(quality.blocker.detail, 260)}`);
       const heldCandidate: JobResult = {
         ...result,
         ok: true,
@@ -10382,10 +10381,7 @@ export async function executeJob(
           commands: blockedCommands,
         },
       };
-      return annotateTerminalResult(
-        heldCandidate,
-        "trusted_environment_validation_required",
-      );
+      return annotateTerminalResult(heldCandidate, "trusted_environment_validation_required");
     }
 
     if (!deterministicRequiresRevision && !criticRequiresRevision) {

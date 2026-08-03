@@ -2,6 +2,8 @@ import {
   normalizeTrustedValidationCommands,
   tokenizeTrustedValidationCommand,
 } from "../../../packages/shared/src/trusted_validation.js";
+import { existsSync } from "fs";
+import { basename } from "path";
 
 export type TrustedValidationCommandResult = {
   ok: boolean;
@@ -16,6 +18,61 @@ type CommandRunner = (
 ) => Promise<{ ok: boolean; output: string; exitCode: number }>;
 
 const DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 15 * 60_000;
+const BUN_DEPENDENCY_COMMANDS = new Set([
+  "bun",
+  "bunx",
+  "eslint",
+  "jest",
+  "node",
+  "npm",
+  "npx",
+  "tsc",
+  "vitest",
+]);
+
+function currentBunExecutable(explicit?: string): string {
+  const configured = String(explicit ?? process.env.PUSHPALS_BUN_BIN ?? "").trim();
+  if (configured) return configured;
+  const execPath = String(process.execPath ?? "").trim();
+  return /^(?:bun|bun\.exe)$/i.test(basename(execPath)) ? execPath : "";
+}
+
+export function resolveTrustedValidationArgv(argv: string[], bunExecutable?: string): string[] {
+  if (argv.length === 0) return [];
+  const bun = currentBunExecutable(bunExecutable);
+  if (!bun) return [...argv];
+  const executable = String(argv[0] ?? "")
+    .trim()
+    .toLowerCase();
+  if (executable === "bun" || executable === "bun.exe") {
+    return [bun, ...argv.slice(1)];
+  }
+  if (executable === "bunx" || executable === "bunx.exe") {
+    return [bun, "x", ...argv.slice(1)];
+  }
+  return [...argv];
+}
+
+export function resolveTrustedValidationPreparationArgv(options: {
+  repoPath: string;
+  commandArgv: string[][];
+  bunExecutable?: string;
+}): string[] | null {
+  const hasBunProject =
+    existsSync(`${options.repoPath}/package.json`) &&
+    (existsSync(`${options.repoPath}/bun.lock`) || existsSync(`${options.repoPath}/bun.lockb`));
+  const needsDependencies = options.commandArgv.some((argv) =>
+    BUN_DEPENDENCY_COMMANDS.has(
+      String(argv[0] ?? "")
+        .trim()
+        .toLowerCase(),
+    ),
+  );
+  if (!hasBunProject || !needsDependencies) return null;
+
+  const bun = currentBunExecutable(options.bunExecutable);
+  return [bun || "bun", "install", "--frozen-lockfile"];
+}
 
 async function runArgv(
   argv: string[],
@@ -45,6 +102,7 @@ export async function runTrustedValidationCommands(options: {
   repoPath: string;
   commandsJson: string;
   timeoutMs?: number;
+  bunExecutable?: string;
   runner?: CommandRunner;
 }): Promise<TrustedValidationCommandResult[]> {
   const normalized = normalizeTrustedValidationCommands(options.commandsJson);
@@ -55,12 +113,26 @@ export async function runTrustedValidationCommands(options: {
   const runner = options.runner ?? runArgv;
   const timeoutMs = Math.max(1_000, options.timeoutMs ?? DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS);
   const results: TrustedValidationCommandResult[] = [];
-  for (const command of normalized.commands) {
+  const commandsWithArgv = normalized.commands.map((command) => {
     const argv = tokenizeTrustedValidationCommand(command);
-    if (!argv) {
+    if (!argv)
       throw new Error(`Invalid trusted-validation command after normalization: ${command}`);
-    }
-    const result = await runner(argv, { cwd: options.repoPath, timeoutMs });
+    return { command, argv };
+  });
+  const preparationArgv = resolveTrustedValidationPreparationArgv({
+    repoPath: options.repoPath,
+    commandArgv: commandsWithArgv.map(({ argv }) => argv),
+    bunExecutable: options.bunExecutable,
+  });
+  if (preparationArgv) {
+    const preparation = await runner(preparationArgv, { cwd: options.repoPath, timeoutMs });
+    results.push({ command: "bun install --frozen-lockfile", ...preparation });
+    if (!preparation.ok) return results;
+  }
+
+  for (const { command, argv } of commandsWithArgv) {
+    const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
+    const result = await runner(resolvedArgv, { cwd: options.repoPath, timeoutMs });
     results.push({ command, ...result });
     if (!result.ok) break;
   }
