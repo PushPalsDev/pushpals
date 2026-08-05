@@ -3714,7 +3714,7 @@ import {
   unlinkSync,
   writeFileSync as writeFileSync4
 } from "fs";
-import { resolve as resolve10 } from "path";
+import { basename as basename4, resolve as resolve10 } from "path";
 
 // apps/workerpals/src/common/worktree_dependency_artifacts.ts
 import { createHash as createHash3 } from "crypto";
@@ -3732,6 +3732,7 @@ import {
 import { resolve as resolve8 } from "path";
 var DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS = ["node_modules"];
 var DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-dependency-snapshot";
+var DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-validation-safe-dependency-snapshot";
 function pathExistsOrLink(path) {
   try {
     lstatSync(path);
@@ -5637,6 +5638,54 @@ function readReferencedValidationScriptText(cwd, script) {
   return texts.join(`
 `);
 }
+function validationTextRequiresDockerDaemon(text) {
+  if (!text)
+    return false;
+  if (/(?:^|[^A-Za-z0-9_-])docker(?:\.exe)?(?:$|[^A-Za-z0-9_-])|docker daemon|docker\.sock|DOCKER_HOST/i.test(text)) {
+    return true;
+  }
+  return /\bsupabase\b/i.test(text) && /\blocal stack\b|run\s*\(\s*\[\s*["'](?:status|start|stop)["']/i.test(text);
+}
+function validationCommandRequiresDockerDaemon(repo, command) {
+  const visited = new Set;
+  const visit = (currentCommand, depth) => {
+    if (depth > 8)
+      return false;
+    const normalized = validationCommandKey(currentCommand);
+    if (!normalized || visited.has(normalized))
+      return false;
+    visited.add(normalized);
+    if (validationTextRequiresDockerDaemon(currentCommand))
+      return true;
+    const resolvedScript = resolvePackageScriptForValidationCommand(repo, currentCommand);
+    if (!resolvedScript)
+      return false;
+    const referencedText = readReferencedValidationScriptText(resolvedScript.cwd, resolvedScript.script);
+    const combined = `${resolvedScript.script}
+${referencedText}`;
+    if (validationTextRequiresDockerDaemon(combined))
+      return true;
+    const nestedScriptNames = new Set;
+    for (const match of combined.matchAll(/\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?([A-Za-z0-9:_-]+)/gi)) {
+      if (match[1])
+        nestedScriptNames.add(match[1]);
+    }
+    for (const match of combined.matchAll(/["']run["']\s*,\s*["']([A-Za-z0-9:_-]+)["']/gi)) {
+      if (match[1])
+        nestedScriptNames.add(match[1]);
+    }
+    return Array.from(nestedScriptNames).some((scriptName) => visit(`bun run ${scriptName}`, depth + 1));
+  };
+  return visit(command, 0);
+}
+function trustedEnvironmentValidationDeferralReason(repo, command, env = process.env) {
+  if (String(env.PUSHPALS_WORKER_DOCKER_CAPABILITY ?? "").trim() !== "unavailable") {
+    return null;
+  }
+  if (!validationCommandRequiresDockerDaemon(repo, command))
+    return null;
+  return "Trusted-environment validation deferred before execution because the command requires " + "a Docker daemon and the worker sandbox intentionally has no Docker socket. Cannot connect " + "to the Docker daemon at unix:///var/run/docker.sock. Run this command on the trusted host.";
+}
 function shouldEnsurePlaywrightBrowserRuntime(repo, command) {
   if (!validationCommandIncludesLongRunningBrowserWork(repo, command))
     return false;
@@ -5712,6 +5761,13 @@ function playwrightBrowserInstallArgv(targets = ["chromium"]) {
     "install",
     ...installTargets.length > 0 ? installTargets : ["chromium"]
   ];
+}
+function playwrightBrowserRuntimeCacheMarkerPath(repo, targets, env = buildWorkerSandboxWritableEnv(repo)) {
+  const browsersPath = String(env.PLAYWRIGHT_BROWSERS_PATH ?? "").trim();
+  if (!browsersPath || browsersPath === "0")
+    return null;
+  const cacheKey = createHash4("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
+  return resolve10(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
 }
 async function runPlaywrightBrowserRuntimePreflight(repo, command, targets, timeoutMs, outputPolicy) {
   const env = buildWorkerSandboxWritableEnv(repo);
@@ -5873,7 +5929,40 @@ function isLinkedNodeModulesDependencyArtifact(repo) {
   }
 }
 function isManagedLinkedPackageDependencySnapshot(repo) {
-  return existsSync8(resolve10(repo, "node_modules", DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER));
+  const nodeModulesDir = resolve10(repo, "node_modules");
+  return existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER)) && !existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
+}
+function bunDependencySnapshotKey(repo, bunVersion = String(process.versions.bun ?? "unknown")) {
+  const packagePath = resolve10(repo, "package.json");
+  if (!existsSync8(packagePath))
+    return null;
+  const hashInput = [`projection=hardlink-v1`, `bun=${bunVersion}`];
+  for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
+    const path = resolve10(repo, name);
+    if (!existsSync8(path))
+      continue;
+    hashInput.push(createHash4("sha256").update(readFileSync8(path)).digest("hex"));
+  }
+  let key = createHash4("sha256").update(`${hashInput.join(`
+`)}
+`).digest("hex");
+  const packageJson = readJsonRecord(packagePath);
+  if (packageJson?.workspaces != null)
+    key = `${key}-${basename4(resolve10(repo))}`;
+  return key;
+}
+function validationSafeDependencySnapshotIsCurrent(repo) {
+  const markerPath = resolve10(repo, "node_modules", DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER);
+  if (!existsSync8(markerPath))
+    return false;
+  const expected = bunDependencySnapshotKey(repo);
+  if (!expected)
+    return false;
+  try {
+    return readFileSync8(markerPath, "utf8").trim() === expected;
+  } catch {
+    return false;
+  }
 }
 function validationNeedsExpoRouterBrowserLocalInstall(repo, packageJson, validationCommands) {
   return packageJsonDeclaresDependency(packageJson, "expo-router") && validationCommands.some((command) => validationCommandIncludesLongRunningBrowserWork(repo, command));
@@ -5924,6 +6013,13 @@ function resolveBunDependencyLayoutPreflight(repo, validationCommands) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules is missing for Bun validation commands"
+    };
+  }
+  if (existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER)) && !validationSafeDependencySnapshotIsCurrent(repo)) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason: "validation-safe dependency snapshot fingerprint is stale",
+      removeLinkedNodeModules: true
     };
   }
   if (isManagedLinkedPackageDependencySnapshot(repo)) {
@@ -7950,32 +8046,62 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
             onLog?.("stderr", `[ValidationGate] Deferred long validation after fast failure: ${command} (${deferredReason})`);
             continue;
           }
+          const trustedEnvironmentDeferral = trustedEnvironmentValidationDeferralReason(repo, command);
+          if (trustedEnvironmentDeferral) {
+            validationRuns.push({
+              step: command,
+              command,
+              ok: false,
+              exitCode: 1,
+              stdout: "",
+              stderr: trustedEnvironmentDeferral,
+              elapsedMs: 0
+            });
+            onLog?.("stderr", `[ValidationGate] Deferred Docker-dependent validation to the trusted host without executing it: ${command}`);
+            continue;
+          }
           const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(repo, command);
           const playwrightBrowserTargets = commandNeedsPlaywrightBrowserRuntime ? inferPlaywrightBrowserInstallTargets(repo, command) : [];
           const missingPlaywrightBrowserTargets = playwrightBrowserTargets.filter((target) => !playwrightBrowserRuntimeReadyTargets.has(target));
           let commandBrowserRuntimeEnsured = commandNeedsPlaywrightBrowserRuntime && missingPlaywrightBrowserTargets.length === 0;
           if (missingPlaywrightBrowserTargets.length > 0) {
             const browserEnv = buildWorkerSandboxWritableEnv(repo);
-            onLog?.("stdout", `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`);
-            const browserPreflight = await runPlaywrightBrowserRuntimePreflight(repo, command, missingPlaywrightBrowserTargets, resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo), outputPolicy);
-            if (!browserPreflight.ok) {
-              const digest2 = extractValidationFailureDigest(browserPreflight);
-              validationRuns.push({
-                ...browserPreflight,
-                stderr: [
-                  `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
-                  browserPreflight.stderr
-                ].filter(Boolean).join(`
+            const browserReadyMarker = playwrightBrowserRuntimeCacheMarkerPath(repo, missingPlaywrightBrowserTargets, browserEnv);
+            if (browserReadyMarker && existsSync8(browserReadyMarker)) {
+              for (const target of missingPlaywrightBrowserTargets) {
+                playwrightBrowserRuntimeReadyTargets.add(target);
+              }
+              commandBrowserRuntimeEnsured = true;
+              onLog?.("stdout", `[ValidationGate] Browser runtime cache hit for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`);
+            }
+            if (!commandBrowserRuntimeEnsured) {
+              onLog?.("stdout", `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`);
+              const browserPreflight = await runPlaywrightBrowserRuntimePreflight(repo, command, missingPlaywrightBrowserTargets, resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo), outputPolicy);
+              if (!browserPreflight.ok) {
+                const digest2 = extractValidationFailureDigest(browserPreflight);
+                validationRuns.push({
+                  ...browserPreflight,
+                  stderr: [
+                    `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
+                    browserPreflight.stderr
+                  ].filter(Boolean).join(`
 `)
-              });
-              onLog?.("stderr", `[ValidationGate] Browser runtime preflight failed for "${command}"${digest2 ? ` - ${digest2}` : ""}`);
-              continue;
+                });
+                onLog?.("stderr", `[ValidationGate] Browser runtime preflight failed for "${command}"${digest2 ? ` - ${digest2}` : ""}`);
+                continue;
+              }
+              for (const target of missingPlaywrightBrowserTargets) {
+                playwrightBrowserRuntimeReadyTargets.add(target);
+              }
+              if (browserReadyMarker) {
+                try {
+                  writeFileSync4(browserReadyMarker, `${new Date().toISOString()}
+`, "utf8");
+                } catch {}
+              }
+              onLog?.("stdout", `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`);
+              commandBrowserRuntimeEnsured = true;
             }
-            for (const target of missingPlaywrightBrowserTargets) {
-              playwrightBrowserRuntimeReadyTargets.add(target);
-            }
-            onLog?.("stdout", `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`);
-            commandBrowserRuntimeEnsured = true;
           }
           const previousDigest = validationRetryState?.previousFailureDigests?.get(validationCommandKey(command));
           if (previousDigest && Number(validationRetryState?.revisionAttempt ?? 0) > 0 && validationCommandIncludesLongRunningBrowserWork(repo, command) && isBrowserValidationInfrastructureDigest(previousDigest) && !commandBrowserRuntimeEnsured) {
@@ -11689,15 +11815,20 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     `worktree=${worktree}`,
     'linked=""',
     'if [ -f "$worktree/package.json" ] && { [ -f "$worktree/bun.lock" ] || [ -f "$worktree/bun.lockb" ]; }; then',
-    '  dependency_cache_root="/workspace/.pushpals-dependencies/linux-$(uname -m)"',
+    '  git_common_dir="$(cd "$worktree" && common="$(git rev-parse --git-common-dir)" && cd "$common" && pwd -P)"',
+    '  dependency_cache_root="$git_common_dir/pushpals/dependencies/linux-$(uname -m)"',
     '  mkdir -p "$dependency_cache_root"',
-    `  snapshot_key="$( { printf 'bun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done; } | sha256sum | cut -d " " -f 1)"`,
+    `  snapshot_key="$( { printf 'projection=hardlink-v1\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
     `  if jq -e '.workspaces != null' "$worktree/package.json" >/dev/null 2>&1; then`,
     '    snapshot_key="$snapshot_key-${worktree##*/}"',
     "  fi",
     '  snapshot_root="$dependency_cache_root/$snapshot_key"',
     '  snapshot_ready="$snapshot_root/.pushpals-dependency-ready"',
     '  snapshot_lock="$snapshot_root.lock"',
+    '  if [ -f "$snapshot_ready" ] && find "$snapshot_root/node_modules" -type f -newer "$snapshot_ready" -print -quit | grep -q .; then',
+    `    printf 'Discarding modified Linux-native dependency snapshot: %s\\n' "$snapshot_root" >&2`,
+    '    rm -f "$snapshot_ready"',
+    "  fi",
     "  wait_count=0",
     '  while [ ! -f "$snapshot_ready" ]; do',
     '    if mkdir "$snapshot_lock" 2>/dev/null; then',
@@ -11709,6 +11840,7 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     '      ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
     '      (cd "$worktree" && bun install --frozen-lockfile --ignore-scripts >&2)',
     '      rm -f "$worktree/node_modules"',
+    '      find "$snapshot_root/node_modules" -type f -exec chmod a-w {} +',
     `      printf '%s\\n' "$snapshot_key" > "$snapshot_ready"`,
     '      rmdir "$snapshot_lock"',
     "      trap - EXIT INT TERM",
@@ -11732,14 +11864,15 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     '    case "$entry_name" in',
     "      .cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot|.pushpals-dependency-ready|.pushpals-dependency-projection-in-progress) continue ;;",
     "    esac",
-    '    ln -s "$entry" "$dest/$entry_name"',
+    '    cp -al "$entry" "$dest/$entry_name"',
     "  done",
     "  for mutable in .cache .expo .vite .vite-temp; do",
     '    mkdir -p "$dest/$mutable"',
     "  done",
     '  rm -f "$dest/.pushpals-dependency-projection-in-progress"',
     `  printf '%s\\n' "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"`,
-    '  linked="$linked node_modules-linux-native"',
+    `  printf '%s\\n' "$snapshot_key" > "$dest/.pushpals-validation-safe-dependency-snapshot"`,
+    '  linked="$linked node_modules-linux-native-hardlink"',
     "else",
     "  for name in node_modules; do",
     '    src="/repo/$name"',
@@ -12292,7 +12425,8 @@ class DockerExecutor {
       PUSHPALS_REPO_ROOT_OVERRIDE: "/repo",
       PUSHPALS_CONFIG_DIR_OVERRIDE: "/workspace/configs",
       PUSHPALS_PROMPTS_ROOT_OVERRIDE: "/workspace",
-      PUSHPALS_PROTOCOL_SCHEMAS_DIR: "/workspace/protocol/schemas"
+      PUSHPALS_PROTOCOL_SCHEMAS_DIR: "/workspace/protocol/schemas",
+      PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable"
     };
     for (const backend of DOCKER_BACKENDS) {
       const name = backend.name.toUpperCase();
@@ -12830,7 +12964,7 @@ ${text}` : `
     await this.ensureWarmRuntimeReady(job, onLog);
     const startedAtMs = Date.now();
     const containerWorktreePath = await this.ensureWorktreeAccessibleInWarmContainer(worktreePath, onLog);
-    await this.ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog);
+    const dependencyPreparation = await this.ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog);
     const args = this.buildWarmContainerExecArgs(containerWorktreePath);
     console.log(`[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary()})`);
     const dockerArgv = [resolveDockerExecutable(), ...args];
@@ -12898,7 +13032,29 @@ ${text}` : `
       elapsedMs,
       timeoutMs
     });
-    return result;
+    const diagnostics = result.diagnostics ?? {};
+    return {
+      ...result,
+      diagnostics: {
+        ...diagnostics,
+        phaseSpans: [
+          {
+            phase: "dependency preparation",
+            startedAt: new Date(dependencyPreparation.startedAtMs).toISOString(),
+            finishedAt: new Date(dependencyPreparation.finishedAtMs).toISOString(),
+            durationMs: dependencyPreparation.durationMs,
+            outcome: "completed",
+            metadata: { artifacts: dependencyPreparation.artifacts }
+          },
+          ...diagnostics.phaseSpans ?? []
+        ],
+        metadata: {
+          ...diagnostics.metadata ?? {},
+          dependencyPreparationMs: dependencyPreparation.durationMs,
+          dependencyArtifacts: dependencyPreparation.artifacts
+        }
+      }
+    };
   }
   buildWarmContainerExecArgs(containerWorktreePath) {
     return [
@@ -12959,11 +13115,24 @@ ${text}` : `
       throw new Error(warning);
     }
     const linked = result.stdout.trim().split(/\s+/g).map((entry) => entry.trim()).filter(Boolean);
-    if (linked.length === 0)
-      return;
-    const note = `[DockerExecutor] Prepared worktree dependency snapshot(s) in ${Date.now() - startedAt}ms: ` + linked.join(", ");
+    const finishedAtMs = Date.now();
+    if (linked.length === 0) {
+      return {
+        startedAtMs: startedAt,
+        finishedAtMs,
+        durationMs: Math.max(0, finishedAtMs - startedAt),
+        artifacts: []
+      };
+    }
+    const note = `[DockerExecutor] Prepared worktree dependency snapshot(s) in ${finishedAtMs - startedAt}ms: ` + linked.join(", ");
     console.log(note);
     onLog?.("stdout", note);
+    return {
+      startedAtMs: startedAt,
+      finishedAtMs,
+      durationMs: Math.max(0, finishedAtMs - startedAt),
+      artifacts: linked
+    };
   }
   async waitForWorktreePathInWarmContainer(containerWorktreePath, timeoutMs = 5000) {
     const deadline = Date.now() + timeoutMs;
@@ -13078,6 +13247,10 @@ ${text}` : `
         '    echo "CRLF bytes found in $PUSHPALS_LF_ASSERT_PATH" >&2',
         "    exit 23",
         "  fi",
+        '  hardlink_probe=".pushpals-hardlink-boundary-$$"',
+        '  ln "$PUSHPALS_LF_ASSERT_PATH" "$hardlink_probe"',
+        '  test "$PUSHPALS_LF_ASSERT_PATH" -ef "$hardlink_probe"',
+        '  rm -f "$hardlink_probe"',
         "fi"
       ].join(`
 `)

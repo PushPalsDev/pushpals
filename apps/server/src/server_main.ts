@@ -2284,7 +2284,21 @@ export function createRequestHandler() {
         const completionId = compProcMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const prUrl = typeof body.prUrl === "string" ? body.prUrl : null;
-        const result = completionQueue.markProcessedAndFinalizeJob(completionId, prUrl);
+        const trustedInstallDurationMs =
+          typeof body.trustedInstallDurationMs === "number" ? body.trustedInstallDurationMs : null;
+        const trustedValidationDurationMs =
+          typeof body.trustedValidationDurationMs === "number"
+            ? body.trustedValidationDurationMs
+            : null;
+        const trustedValidationCacheHit =
+          typeof body.trustedValidationCacheHit === "boolean"
+            ? body.trustedValidationCacheHit
+            : null;
+        const result = completionQueue.markProcessedAndFinalizeJob(completionId, prUrl, {
+          installDurationMs: trustedInstallDurationMs,
+          validationDurationMs: trustedValidationDurationMs,
+          installCacheHit: trustedValidationCacheHit,
+        });
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord(job?.params ?? "");
@@ -2338,7 +2352,20 @@ export function createRequestHandler() {
         const completionId = compFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const error = (body.error as string) ?? "Unknown error";
-        const result = completionQueue.markFailedAndBlockJob(completionId, error);
+        const result = completionQueue.markFailedAndBlockJob(completionId, error, {
+          installDurationMs:
+            typeof body.trustedInstallDurationMs === "number"
+              ? body.trustedInstallDurationMs
+              : null,
+          validationDurationMs:
+            typeof body.trustedValidationDurationMs === "number"
+              ? body.trustedValidationDurationMs
+              : null,
+          installCacheHit:
+            typeof body.trustedValidationCacheHit === "boolean"
+              ? body.trustedValidationCacheHit
+              : null,
+        });
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord(job?.params ?? "");

@@ -22,6 +22,14 @@ const requiredRuntimePayloadEntries = windowsSourceRuntimeAssets.map((asset) => 
   path: `runtime/sandbox/${asset}`,
 }));
 
+function requiredCliPackageFiles() {
+  return [
+    { path: "bin/pushpals.cjs", mode: 0o755 },
+    { path: "dist/pushpals-cli.js", mode: 0o755 },
+    ...requiredRuntimePayloadEntries,
+  ];
+}
+
 function withTempPackage<T>(fn: (packageDir: string) => T): T {
   const packageDir = mkdtempSync(join(tmpdir(), "pushpals-package-payload-test-"));
   try {
@@ -65,6 +73,25 @@ function runVerifier(args: string[]) {
 }
 
 describe("release package payload verification", () => {
+  test("rejects developer-local runtime configuration from npm packages", () => {
+    const issues = findDisallowedCliPackageEntries([
+      ...requiredCliPackageFiles(),
+      { path: "runtime/configs/local.toml", mode: 0o644 },
+      { path: "runtime/sandbox/configs/local.toml", mode: 0o644 },
+    ]);
+
+    expect(issues).toEqual([
+      {
+        path: "runtime/configs/local.toml",
+        reason: "package payload includes a developer-local runtime override",
+      },
+      {
+        path: "runtime/sandbox/configs/local.toml",
+        reason: "package payload includes a developer-local runtime override",
+      },
+    ]);
+  });
+
   test("fresh CLI package builds compile the protocol workspace before runtime source bundles", () => {
     const cliPackage = JSON.parse(
       readFileSync(join(repoRoot, "packages", "cli", "package.json"), "utf8"),

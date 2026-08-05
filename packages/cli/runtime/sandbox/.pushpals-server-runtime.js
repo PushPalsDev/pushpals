@@ -11979,6 +11979,15 @@ class RequestQueue {
 // apps/server/src/completions.ts
 import { Database as Database4 } from "bun:sqlite";
 import { randomUUID as randomUUID4 } from "crypto";
+function normalizeTrustedValidationTiming(timing) {
+  const normalizedDuration = (value) => typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : null;
+  return {
+    installDurationMs: normalizedDuration(timing?.installDurationMs),
+    validationDurationMs: normalizedDuration(timing?.validationDurationMs),
+    installCacheHit: typeof timing?.installCacheHit === "boolean" ? timing.installCacheHit ? 1 : 0 : null
+  };
+}
+
 class CompletionQueue {
   db;
   constructor(dbPath = ":memory:") {
@@ -12002,6 +12011,9 @@ class CompletionQueue {
         trustedValidationCommandsJson TEXT,
         trustedValidationSummary TEXT,
         trustedValidationDetail TEXT,
+        trustedInstallDurationMs INTEGER,
+        trustedValidationDurationMs INTEGER,
+        trustedValidationCacheHit INTEGER,
         status     TEXT NOT NULL DEFAULT 'pending',
         pusherId   TEXT,
         error      TEXT,
@@ -12033,6 +12045,15 @@ class CompletionQueue {
     }
     if (!columns.some((col) => col.name === "trustedValidationDetail")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationDetail TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "trustedInstallDurationMs")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedInstallDurationMs INTEGER;`);
+    }
+    if (!columns.some((col) => col.name === "trustedValidationDurationMs")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationDurationMs INTEGER;`);
+    }
+    if (!columns.some((col) => col.name === "trustedValidationCacheHit")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationCacheHit INTEGER;`);
     }
     this.reconcileLegacyParentJobStates();
   }
@@ -12243,9 +12264,10 @@ class CompletionQueue {
     }
     return { ok: true };
   }
-  markProcessedAndFinalizeJob(completionId, prUrl) {
+  markProcessedAndFinalizeJob(completionId, prUrl, trustedTiming) {
     const now = new Date().toISOString();
     const normalizedPrUrl = typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
+    const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
     const tx = this.db.transaction(() => {
       const completion = this.getCompletion(completionId);
       if (!completion)
@@ -12266,8 +12288,14 @@ class CompletionQueue {
         };
       }
       this.db.prepare(`UPDATE completions
-           SET status = 'processed', prUrl = COALESCE(?, prUrl), error = NULL, updatedAt = ?
-           WHERE id = ? AND status = 'claimed'`).run(normalizedPrUrl, now, completionId);
+           SET status = 'processed',
+               prUrl = COALESCE(?, prUrl),
+               trustedInstallDurationMs = COALESCE(?, trustedInstallDurationMs),
+               trustedValidationDurationMs = COALESCE(?, trustedValidationDurationMs),
+               trustedValidationCacheHit = COALESCE(?, trustedValidationCacheHit),
+               error = NULL,
+               updatedAt = ?
+           WHERE id = ? AND status = 'claimed'`).run(normalizedPrUrl, normalizedTiming.installDurationMs, normalizedTiming.validationDurationMs, normalizedTiming.installCacheHit, now, completionId);
       const transitioned = this.db.prepare(`UPDATE jobs
            SET status = 'completed',
                prUrl = COALESCE(?, prUrl),
@@ -12303,9 +12331,10 @@ class CompletionQueue {
     });
     return tx();
   }
-  markFailedAndBlockJob(completionId, error) {
+  markFailedAndBlockJob(completionId, error, trustedTiming) {
     const now = new Date().toISOString();
     const failure = String(error || "Unknown publication error");
+    const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
     const tx = this.db.transaction(() => {
       const completion = this.getCompletion(completionId);
       if (!completion)
@@ -12326,8 +12355,13 @@ class CompletionQueue {
         };
       }
       this.db.prepare(`UPDATE completions
-           SET status = 'failed', error = ?, updatedAt = ?
-           WHERE id = ? AND status = 'claimed'`).run(failure, now, completionId);
+           SET status = 'failed',
+               trustedInstallDurationMs = COALESCE(?, trustedInstallDurationMs),
+               trustedValidationDurationMs = COALESCE(?, trustedValidationDurationMs),
+               trustedValidationCacheHit = COALESCE(?, trustedValidationCacheHit),
+               error = ?,
+               updatedAt = ?
+           WHERE id = ? AND status = 'claimed'`).run(normalizedTiming.installDurationMs, normalizedTiming.validationDurationMs, normalizedTiming.installCacheHit, failure, now, completionId);
       const transitioned = this.db.prepare(`UPDATE jobs
            SET status = 'publish_blocked',
                error = ?,
@@ -19473,7 +19507,14 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const completionId = compProcMatch[1];
         const body = await req.json().catch(() => ({}));
         const prUrl = typeof body.prUrl === "string" ? body.prUrl : null;
-        const result = completionQueue.markProcessedAndFinalizeJob(completionId, prUrl);
+        const trustedInstallDurationMs = typeof body.trustedInstallDurationMs === "number" ? body.trustedInstallDurationMs : null;
+        const trustedValidationDurationMs = typeof body.trustedValidationDurationMs === "number" ? body.trustedValidationDurationMs : null;
+        const trustedValidationCacheHit = typeof body.trustedValidationCacheHit === "boolean" ? body.trustedValidationCacheHit : null;
+        const result = completionQueue.markProcessedAndFinalizeJob(completionId, prUrl, {
+          installDurationMs: trustedInstallDurationMs,
+          validationDurationMs: trustedValidationDurationMs,
+          installCacheHit: trustedValidationCacheHit
+        });
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");
@@ -19522,7 +19563,11 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const completionId = compFailMatch[1];
         const body = await req.json().catch(() => ({}));
         const error = body.error ?? "Unknown error";
-        const result = completionQueue.markFailedAndBlockJob(completionId, error);
+        const result = completionQueue.markFailedAndBlockJob(completionId, error, {
+          installDurationMs: typeof body.trustedInstallDurationMs === "number" ? body.trustedInstallDurationMs : null,
+          validationDurationMs: typeof body.trustedValidationDurationMs === "number" ? body.trustedValidationDurationMs : null,
+          installCacheHit: typeof body.trustedValidationCacheHit === "boolean" ? body.trustedValidationCacheHit : null
+        });
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");

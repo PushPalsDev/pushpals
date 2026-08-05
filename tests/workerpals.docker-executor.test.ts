@@ -597,7 +597,7 @@ describe("workerpals docker executor internals", () => {
       capturedCommand = command;
       return {
         ok: true,
-        stdout: " node_modules-linux-native",
+        stdout: " node_modules-linux-native-hardlink",
         stderr: "",
         exitCode: 0,
       };
@@ -612,16 +612,25 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).toContain("node_modules");
     expect(capturedCommand).not.toContain("cp -as");
     expect(capturedCommand).toContain(
-      'dependency_cache_root="/workspace/.pushpals-dependencies/linux-$(uname -m)"',
+      'dependency_cache_root="$git_common_dir/pushpals/dependencies/linux-$(uname -m)"',
     );
+    expect(capturedCommand).toContain("git rev-parse --git-common-dir");
     expect(capturedCommand).toContain("bun install --frozen-lockfile --ignore-scripts >&2");
     expect(capturedCommand).toContain('snapshot_lock="$snapshot_root.lock"');
     expect(capturedCommand).toContain(
+      'find "$snapshot_root/node_modules" -type f -newer "$snapshot_ready" -print -quit',
+    );
+    expect(capturedCommand).toContain('rm -f "$snapshot_ready"');
+    expect(capturedCommand).toContain(
       'ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
     );
-    expect(capturedCommand).toContain("node_modules-linux-native");
+    expect(capturedCommand).toContain("projection=hardlink-v1");
+    expect(capturedCommand).toContain("node_modules-linux-native-hardlink");
     expect(capturedCommand).toContain('for entry in "$src"/* "$src"/.[!.]* "$src"/..?*');
-    expect(capturedCommand).toContain('ln -s "$entry" "$dest/$entry_name"');
+    expect(capturedCommand).toContain('cp -al "$entry" "$dest/$entry_name"');
+    expect(capturedCommand).toContain(
+      'find "$snapshot_root/node_modules" -type f -exec chmod a-w {} +',
+    );
     expect(capturedCommand).toContain(
       ".cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot",
     );
@@ -629,6 +638,7 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).toContain(".pushpals-dependency-projection-in-progress");
     expect(capturedCommand).toContain('rm -f "$dest/.pushpals-dependency-snapshot"');
     expect(capturedCommand).toContain(".pushpals-dependency-snapshot");
+    expect(capturedCommand).toContain(".pushpals-validation-safe-dependency-snapshot");
     expect(capturedCommand).toContain("/repo/.worktrees/job-browser-smoke/");
     expect(logs.join("\n")).toContain(
       "Preparing Linux-native dependency entries for the WorkerPal worktree.",
@@ -639,10 +649,11 @@ describe("workerpals docker executor internals", () => {
   test("keys shared Linux snapshots by lockfiles and isolates workspace dependency links", () => {
     const command = buildWorktreeDependencyPreparationCommand("/repo/.worktrees/job-native-deps");
 
-    expect(command).toContain("printf 'bun=%s\\n' \"$(bun --version)\"");
+    expect(command).toContain("printf 'projection=hardlink-v1\\nbun=%s\\n' \"$(bun --version)\"");
     expect(command).toContain(
       'for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"',
     );
+    expect(command).toContain('sha256sum "$manifest" | cut -d " " -f 1');
     expect(command).toContain("jq -e '.workspaces != null'");
     expect(command).toContain('snapshot_key="$snapshot_key-${worktree##*/}"');
     expect(command).toContain('while [ ! -f "$snapshot_ready" ]; do');

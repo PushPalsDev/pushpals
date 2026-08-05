@@ -89,6 +89,11 @@ describe("server CompletionQueue PR URL persistence", () => {
     const completed = completions.markProcessedAndFinalizeJob(
       claimed.completion?.id ?? "",
       "https://github.com/org/repo/pull/42",
+      {
+        installDurationMs: 12_345,
+        validationDurationMs: 54_321,
+        installCacheHit: true,
+      },
     );
     expect(completed).toMatchObject({ ok: true, jobId, jobTransitioned: true });
     expect(jobs.getJob(jobId)).toMatchObject({
@@ -100,6 +105,11 @@ describe("server CompletionQueue PR URL persistence", () => {
       status: "completed",
       failureClass: "success",
       terminalStage: "publication",
+    });
+    expect(completions.getCompletion(claimed.completion?.id ?? "")).toMatchObject({
+      trustedInstallDurationMs: 12_345,
+      trustedValidationDurationMs: 54_321,
+      trustedValidationCacheHit: 1,
     });
     expect(
       completions.markProcessedAndFinalizeJob(
@@ -133,6 +143,11 @@ describe("server CompletionQueue PR URL persistence", () => {
     const failed = completions.markFailedAndBlockJob(
       completionId,
       "bun run validate:publish exited with code 1",
+      {
+        installDurationMs: 7_654,
+        validationDurationMs: 32_100,
+        installCacheHit: false,
+      },
     );
     expect(failed).toMatchObject({ ok: true, jobId, jobTransitioned: true });
     expect(jobs.getJob(jobId)).toMatchObject({
@@ -148,6 +163,11 @@ describe("server CompletionQueue PR URL persistence", () => {
     expect(completions.markFailedAndBlockJob(completionId, "duplicate callback")).toMatchObject({
       ok: true,
       jobTransitioned: false,
+    });
+    expect(completions.getCompletion(completionId)).toMatchObject({
+      trustedInstallDurationMs: 7_654,
+      trustedValidationDurationMs: 32_100,
+      trustedValidationCacheHit: 0,
     });
 
     completions.close();
@@ -282,9 +302,12 @@ describe("server CompletionQueue PR URL persistence", () => {
         trustedValidationCommands: ["bun run validate:publish"],
       }).ok,
     ).toBe(true);
-    expect(queue.claim("scm-migrated").completion?.trustedValidationCommandsJson).toBe(
-      JSON.stringify(["bun run validate:publish"]),
-    );
+    expect(queue.claim("scm-migrated").completion).toMatchObject({
+      trustedValidationCommandsJson: JSON.stringify(["bun run validate:publish"]),
+      trustedInstallDurationMs: null,
+      trustedValidationDurationMs: null,
+      trustedValidationCacheHit: null,
+    });
     queue.close();
   });
 

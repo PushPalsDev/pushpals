@@ -15,8 +15,9 @@ import { resolve } from "path";
 type JobLog = (stream: "stdout" | "stderr", line: string) => void;
 
 export const DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS = ["node_modules"] as const;
-export const DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER =
-  ".pushpals-dependency-snapshot";
+export const DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-dependency-snapshot";
+export const DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER =
+  ".pushpals-validation-safe-dependency-snapshot";
 
 export type DirectWorktreeDependencyArtifactResult = {
   linked: string[];

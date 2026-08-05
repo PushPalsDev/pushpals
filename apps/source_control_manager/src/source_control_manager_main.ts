@@ -613,6 +613,9 @@ async function tick(): Promise<void> {
     // ── Process completion ─────────────────────────────────────────────
     let tempBranch = "";
     let cleanupCompletionHandoff = false;
+    let trustedInstallDurationMs: number | null = null;
+    let trustedValidationDurationMs: number | null = null;
+    let trustedValidationCacheHit: boolean | null = null;
     try {
       let processedPrUrl: string | null =
         typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
@@ -756,12 +759,33 @@ async function tick(): Promise<void> {
             commandsJson: completion.trustedValidationCommandsJson,
           });
           for (const trustedResult of trustedResults) {
+            if (trustedResult.phase === "dependency_install") {
+              trustedInstallDurationMs = (trustedInstallDurationMs ?? 0) + trustedResult.durationMs;
+              trustedValidationCacheHit = Boolean(trustedResult.cached);
+            } else {
+              trustedValidationDurationMs =
+                (trustedValidationDurationMs ?? 0) + trustedResult.durationMs;
+            }
+            const timing = `${trustedResult.durationMs}ms${trustedResult.cached ? ", cache hit" : ""}`;
             if (!trustedResult.ok) {
               throw new Error(
-                `Trusted validation "${trustedResult.command}" failed (exit ${trustedResult.exitCode}): ${trustedResult.output}`,
+                `Trusted validation "${trustedResult.command}" failed after ${timing} (exit ${trustedResult.exitCode}): ${trustedResult.output}`,
               );
             }
-            console.log(`[${ts()}]   - Trusted validation passed: ${trustedResult.command}`);
+            console.log(
+              `[${ts()}]   - Trusted validation passed (${timing}): ${trustedResult.command}`,
+            );
+            console.log(
+              `[${ts()}] trustedValidationTiming=${JSON.stringify({
+                event: "trusted_validation_timing",
+                jobId: completion.jobId,
+                commitSha: completion.commitSha,
+                command: trustedResult.command,
+                phase: trustedResult.phase,
+                durationMs: trustedResult.durationMs,
+                cached: Boolean(trustedResult.cached),
+              })}`,
+            );
           }
         }
         console.log(`[${ts()}] Running checks...`);
@@ -989,7 +1013,12 @@ async function tick(): Promise<void> {
         {
           method: "POST",
           headers,
-          body: JSON.stringify({ prUrl: processedPrUrl }),
+          body: JSON.stringify({
+            prUrl: processedPrUrl,
+            trustedInstallDurationMs,
+            trustedValidationDurationMs,
+            trustedValidationCacheHit,
+          }),
         },
       );
 
@@ -1014,7 +1043,12 @@ async function tick(): Promise<void> {
       const failResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/fail`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ error: err.message }),
+        body: JSON.stringify({
+          error: err.message,
+          trustedInstallDurationMs,
+          trustedValidationDurationMs,
+          trustedValidationCacheHit,
+        }),
       });
 
       if (!failResponse.ok) {

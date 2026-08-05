@@ -48,6 +48,7 @@ from openai_codex_executor import (
     _looks_like_validation_repair_prompt,
     _mask_repo_local_codex_files,
     _minimum_recovery_attempt_seconds,
+    _publishable_progress_fingerprint,
     _repo_root_for_prompt_loading,
     _restore_repo_local_codex_files,
     _resolve_codex_command_prefix,
@@ -1571,6 +1572,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "import json",
                         "import sys",
                         "import time",
                         "",
@@ -1587,10 +1589,12 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "    Path('src/no-edit-retry.txt').write_text('patched on retry\\n', encoding='utf-8')",
                         "    if last_message_path:",
                         "        Path(last_message_path).write_text('Patched immediately after no-edit recovery.', encoding='utf-8')",
-                        "    print('item.completed | Patched immediately after no-edit recovery.', flush=True)",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Patched immediately after no-edit recovery.'}}), flush=True)",
                         "    sys.exit(0)",
                         "",
-                        "print('item.completed | Still inspecting route wrappers.', flush=True)",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Still inspecting route wrappers.'}}), flush=True)",
                         "time.sleep(10)",
                     ]
                 ),
@@ -1651,6 +1655,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "import json",
                         "import sys",
                         "import time",
                         "",
@@ -1667,10 +1672,12 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "    Path('src/final-no-edit-recovery.txt').write_text('patched on final recovery\\n', encoding='utf-8')",
                         "    if last_message_path:",
                         "        Path(last_message_path).write_text('Patched immediately during final no-edit recovery.', encoding='utf-8')",
-                        "    print('item.completed | Patched immediately during final no-edit recovery.', flush=True)",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Patched immediately during final no-edit recovery.'}}), flush=True)",
                         "    sys.exit(0)",
                         "",
-                        "print('item.completed | Still reading without a publishable edit.', flush=True)",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Still reading without a publishable edit.'}}), flush=True)",
                         "time.sleep(10)",
                     ]
                 ),
@@ -2073,11 +2080,14 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             stub_path.write_text(
                 "\n".join(
                     [
+                        "import json",
                         "import sys",
                         "import time",
                         "",
                         "sys.stdin.read()",
-                        "print('item.completed | Still inspecting, no patch yet.', flush=True)",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Still inspecting, no patch yet.'}}), flush=True)",
                         "time.sleep(10)",
                     ]
                 ),
@@ -2218,6 +2228,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "import json",
                         "import sys",
                         "import time",
                         "",
@@ -2234,18 +2245,18 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "    Path('src/no-edit-recheck-retry.txt').write_text('patched after recheck\\n', encoding='utf-8')",
                         "    if last_message_path:",
                         "        Path(last_message_path).write_text('Patched after transient no-edit recheck.', encoding='utf-8')",
-                        "    print('item.completed | Patched after transient no-edit recheck.', flush=True)",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Patched after transient no-edit recheck.'}}), flush=True)",
                         "    sys.exit(0)",
                         "",
                         "Path('src').mkdir(exist_ok=True)",
                         "transient = Path('src/transient-progress.txt')",
                         "transient.write_text('temporary progress\\n', encoding='utf-8')",
-                        "print('item.completed | Created transient publishable progress.', flush=True)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Created transient publishable progress.'}}), flush=True)",
                         "time.sleep(1.4)",
                         "transient.unlink()",
                         "Path('node_modules').mkdir(exist_ok=True)",
                         "Path('node_modules/linked.txt').write_text('artifact only\\n', encoding='utf-8')",
-                        "print('item.completed | Lost patch while still thinking.', flush=True)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Lost patch while still thinking.'}}), flush=True)",
                         "time.sleep(10)",
                     ]
                 ),
@@ -2659,6 +2670,10 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env, clear=False):
             first_recheck_s = _resolve_no_edit_recheck_seconds(750)
+            review_fix_recheck_s = _resolve_no_edit_recheck_seconds(
+                750,
+                prompt="Rejected PR review-fix on the existing PR branch.",
+            )
             recovery_recheck_s = _resolve_no_edit_recheck_seconds(750, recovery_attempt=1)
             final_recovery_recheck_s = _resolve_no_edit_recheck_seconds(750, recovery_attempt=2)
             command_grace_s = _resolve_no_edit_command_grace_seconds(750)
@@ -2678,11 +2693,24 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(first_recheck_s, 120)
+        self.assertEqual(review_fix_recheck_s, 30)
         self.assertEqual(recovery_recheck_s, 30)
         self.assertEqual(final_recovery_recheck_s, 15)
         self.assertEqual(first_command_cap_s, 360)
         self.assertEqual(recovery_command_cap_s, 120)
         self.assertEqual(final_recovery_command_cap_s, 60)
+
+    def test_publishable_progress_fingerprint_changes_with_file_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            target = repo / "src" / "contract.ts"
+            target.parent.mkdir(parents=True)
+            target.write_text("export const value = 1;\n", encoding="utf-8")
+            first = _publishable_progress_fingerprint(str(repo), ["src/contract.ts"])
+            target.write_text("export const value = 2;\n", encoding="utf-8")
+            second = _publishable_progress_fingerprint(str(repo), ["src/contract.ts"])
+
+        self.assertNotEqual(first, second)
 
     def test_codex_recovery_attempt_refuses_exhausted_shared_deadline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-exhausted-recovery-") as temp_dir:
@@ -2965,6 +2993,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "import json",
                         "import sys",
                         "import time",
                         "",
@@ -2981,11 +3010,13 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "    Path('scripts/web-review-path.txt').write_text('repo-native patch\\n', encoding='utf-8')",
                         "    if last_message_path:",
                         "        Path(last_message_path).write_text('Patched after rollout coach guidance.', encoding='utf-8')",
-                        "    print('item.completed | Patched after rollout coach guidance.', flush=True)",
+                        "    print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'Patched after rollout coach guidance.'}}), flush=True)",
                         "    sys.exit(0)",
                         "",
-                        "print('item.completed | The requested test path is not present in this checkout.', flush=True)",
-                        "print('item.completed | I am checking the React Native test surface before choosing assertion style.', flush=True)",
+                        "print(json.dumps({'type': 'thread.started'}), flush=True)",
+                        "print(json.dumps({'type': 'turn.started'}), flush=True)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'The requested test path is not present in this checkout.'}}), flush=True)",
+                        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'message', 'text': 'I am checking the React Native test surface before choosing assertion style.'}}), flush=True)",
                         "time.sleep(10)",
                     ]
                 ),

@@ -30,6 +30,9 @@ export interface CompletionRow {
   trustedValidationCommandsJson: string | null;
   trustedValidationSummary: string | null;
   trustedValidationDetail: string | null;
+  trustedInstallDurationMs: number | null;
+  trustedValidationDurationMs: number | null;
+  trustedValidationCacheHit: number | null;
   status: CompletionStatus;
   pusherId: string | null;
   error: string | null;
@@ -45,6 +48,27 @@ export interface CompletionFinalizationResult {
   durationMs?: number;
   completedAt?: string;
   publishBlockedAt?: string;
+}
+
+export interface TrustedValidationTiming {
+  installDurationMs?: number | null;
+  validationDurationMs?: number | null;
+  installCacheHit?: boolean | null;
+}
+
+function normalizeTrustedValidationTiming(timing?: TrustedValidationTiming): {
+  installDurationMs: number | null;
+  validationDurationMs: number | null;
+  installCacheHit: number | null;
+} {
+  const normalizedDuration = (value: number | null | undefined): number | null =>
+    typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : null;
+  return {
+    installDurationMs: normalizedDuration(timing?.installDurationMs),
+    validationDurationMs: normalizedDuration(timing?.validationDurationMs),
+    installCacheHit:
+      typeof timing?.installCacheHit === "boolean" ? (timing.installCacheHit ? 1 : 0) : null,
+  };
 }
 
 export class CompletionQueue {
@@ -72,6 +96,9 @@ export class CompletionQueue {
         trustedValidationCommandsJson TEXT,
         trustedValidationSummary TEXT,
         trustedValidationDetail TEXT,
+        trustedInstallDurationMs INTEGER,
+        trustedValidationDurationMs INTEGER,
+        trustedValidationCacheHit INTEGER,
         status     TEXT NOT NULL DEFAULT 'pending',
         pusherId   TEXT,
         error      TEXT,
@@ -106,6 +133,15 @@ export class CompletionQueue {
     }
     if (!columns.some((col) => col.name === "trustedValidationDetail")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationDetail TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "trustedInstallDurationMs")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedInstallDurationMs INTEGER;`);
+    }
+    if (!columns.some((col) => col.name === "trustedValidationDurationMs")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationDurationMs INTEGER;`);
+    }
+    if (!columns.some((col) => col.name === "trustedValidationCacheHit")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationCacheHit INTEGER;`);
     }
 
     this.reconcileLegacyParentJobStates();
@@ -466,10 +502,12 @@ export class CompletionQueue {
   markProcessedAndFinalizeJob(
     completionId: string,
     prUrl?: string | null,
+    trustedTiming?: TrustedValidationTiming,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
     const normalizedPrUrl =
       typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
+    const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
     const tx = this.db.transaction((): CompletionFinalizationResult => {
       const completion = this.getCompletion(completionId);
       if (!completion) return { ok: false, message: "Completion not found" };
@@ -493,10 +531,23 @@ export class CompletionQueue {
       this.db
         .prepare(
           `UPDATE completions
-           SET status = 'processed', prUrl = COALESCE(?, prUrl), error = NULL, updatedAt = ?
+           SET status = 'processed',
+               prUrl = COALESCE(?, prUrl),
+               trustedInstallDurationMs = COALESCE(?, trustedInstallDurationMs),
+               trustedValidationDurationMs = COALESCE(?, trustedValidationDurationMs),
+               trustedValidationCacheHit = COALESCE(?, trustedValidationCacheHit),
+               error = NULL,
+               updatedAt = ?
            WHERE id = ? AND status = 'claimed'`,
         )
-        .run(normalizedPrUrl, now, completionId);
+        .run(
+          normalizedPrUrl,
+          normalizedTiming.installDurationMs,
+          normalizedTiming.validationDurationMs,
+          normalizedTiming.installCacheHit,
+          now,
+          completionId,
+        );
       const transitioned = this.db
         .prepare(
           `UPDATE jobs
@@ -548,9 +599,14 @@ export class CompletionQueue {
    * Fail publication and move the parent job to publish_blocked atomically.
    * Completed is accepted only to repair state written by older workers.
    */
-  markFailedAndBlockJob(completionId: string, error: string): CompletionFinalizationResult {
+  markFailedAndBlockJob(
+    completionId: string,
+    error: string,
+    trustedTiming?: TrustedValidationTiming,
+  ): CompletionFinalizationResult {
     const now = new Date().toISOString();
     const failure = String(error || "Unknown publication error");
+    const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
     const tx = this.db.transaction((): CompletionFinalizationResult => {
       const completion = this.getCompletion(completionId);
       if (!completion) return { ok: false, message: "Completion not found" };
@@ -574,10 +630,22 @@ export class CompletionQueue {
       this.db
         .prepare(
           `UPDATE completions
-           SET status = 'failed', error = ?, updatedAt = ?
+           SET status = 'failed',
+               trustedInstallDurationMs = COALESCE(?, trustedInstallDurationMs),
+               trustedValidationDurationMs = COALESCE(?, trustedValidationDurationMs),
+               trustedValidationCacheHit = COALESCE(?, trustedValidationCacheHit),
+               error = ?,
+               updatedAt = ?
            WHERE id = ? AND status = 'claimed'`,
         )
-        .run(failure, now, completionId);
+        .run(
+          normalizedTiming.installDurationMs,
+          normalizedTiming.validationDurationMs,
+          normalizedTiming.installCacheHit,
+          failure,
+          now,
+          completionId,
+        );
       const transitioned = this.db
         .prepare(
           `UPDATE jobs

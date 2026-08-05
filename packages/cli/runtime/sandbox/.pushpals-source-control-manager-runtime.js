@@ -3,7 +3,7 @@ var __require = import.meta.require;
 
 // apps/source_control_manager/src/source_control_manager_main.ts
 import { parseArgs } from "util";
-import { isAbsolute as isAbsolute3, join as join5, relative, resolve as resolve8 } from "path";
+import { isAbsolute as isAbsolute3, join as join5, relative, resolve as resolve9 } from "path";
 import { mkdirSync as mkdirSync2 } from "fs";
 
 // packages/shared/src/communication.ts
@@ -5102,9 +5102,12 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
 }
 
 // apps/source_control_manager/src/trusted_validation.ts
-import { existsSync as existsSync5 } from "fs";
-import { basename as basename2 } from "path";
+import { createHash } from "crypto";
+import { existsSync as existsSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync2 } from "fs";
+import { basename as basename2, resolve as resolve7 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 15 * 60000;
+var TRUSTED_INSTALL_MARKER = ".pushpals-trusted-install.json";
+var trustedInstallFlights = new Map;
 var BUN_DEPENDENCY_COMMANDS = new Set([
   "bun",
   "bunx",
@@ -5145,6 +5148,100 @@ function resolveTrustedValidationPreparationArgv(options) {
     return null;
   const bun = currentBunExecutable(options.bunExecutable);
   return [bun || "bun", "install", "--frozen-lockfile"];
+}
+function trustedValidationInstallFingerprint(options) {
+  const packagePath = resolve7(options.repoPath, "package.json");
+  const lockPath = [
+    resolve7(options.repoPath, "bun.lock"),
+    resolve7(options.repoPath, "bun.lockb")
+  ].find((path) => existsSync5(path));
+  if (!existsSync5(packagePath) || !lockPath)
+    return null;
+  const hash = createHash("sha256");
+  hash.update(`platform=${process.platform}-${process.arch}
+`);
+  hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}
+`);
+  hash.update(`version=${typeof Bun !== "undefined" ? Bun.version : "unknown"}
+`);
+  hash.update(readFileSync6(packagePath));
+  hash.update("\x00");
+  hash.update(readFileSync6(lockPath));
+  return hash.digest("hex");
+}
+function trustedInstallMarkerPath(repoPath) {
+  return resolve7(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
+}
+function hasFreshTrustedValidationInstall(options) {
+  const fingerprint = trustedValidationInstallFingerprint(options);
+  if (!fingerprint)
+    return false;
+  try {
+    const marker = JSON.parse(readFileSync6(trustedInstallMarkerPath(options.repoPath), "utf8"));
+    return marker.fingerprint === fingerprint;
+  } catch {
+    return false;
+  }
+}
+async function runTimed(runner, argv, options) {
+  const startedAt = Date.now();
+  const result = await runner(argv, options);
+  return { ...result, durationMs: Math.max(0, Date.now() - startedAt) };
+}
+async function ensureTrustedValidationInstall(options) {
+  if (hasFreshTrustedValidationInstall(options)) {
+    return {
+      command: "bun install --frozen-lockfile",
+      ok: true,
+      output: "Trusted dependency install cache hit for unchanged package and lockfile inputs.",
+      exitCode: 0,
+      durationMs: 0,
+      cached: true,
+      phase: "dependency_install"
+    };
+  }
+  const flightKey = resolve7(options.repoPath);
+  const activeFlight = trustedInstallFlights.get(flightKey);
+  if (activeFlight)
+    return await activeFlight;
+  const flight = (async () => {
+    if (hasFreshTrustedValidationInstall(options)) {
+      return {
+        command: "bun install --frozen-lockfile",
+        ok: true,
+        output: "Trusted dependency install cache hit after waiting for another validation.",
+        exitCode: 0,
+        durationMs: 0,
+        cached: true,
+        phase: "dependency_install"
+      };
+    }
+    const preparation = await runTimed(options.runner, options.preparationArgv, {
+      cwd: options.repoPath,
+      timeoutMs: options.timeoutMs
+    });
+    const result = {
+      command: "bun install --frozen-lockfile",
+      ...preparation,
+      phase: "dependency_install"
+    };
+    if (preparation.ok) {
+      const fingerprint = trustedValidationInstallFingerprint(options);
+      if (fingerprint) {
+        try {
+          writeFileSync2(trustedInstallMarkerPath(options.repoPath), JSON.stringify({ fingerprint, updatedAt: new Date().toISOString() }), "utf8");
+        } catch {}
+      }
+    }
+    return result;
+  })();
+  trustedInstallFlights.set(flightKey, flight);
+  try {
+    return await flight;
+  } finally {
+    if (trustedInstallFlights.get(flightKey) === flight)
+      trustedInstallFlights.delete(flightKey);
+  }
 }
 async function runArgv(argv, options) {
   const proc = Bun.spawn(argv, {
@@ -5187,15 +5284,21 @@ async function runTrustedValidationCommands(options) {
     bunExecutable: options.bunExecutable
   });
   if (preparationArgv) {
-    const preparation = await runner(preparationArgv, { cwd: options.repoPath, timeoutMs });
-    results.push({ command: "bun install --frozen-lockfile", ...preparation });
+    const preparation = await ensureTrustedValidationInstall({
+      repoPath: options.repoPath,
+      preparationArgv,
+      timeoutMs,
+      bunExecutable: options.bunExecutable,
+      runner
+    });
+    results.push(preparation);
     if (!preparation.ok)
       return results;
   }
   for (const { command, argv } of commandsWithArgv) {
     const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
-    const result = await runner(resolvedArgv, { cwd: options.repoPath, timeoutMs });
-    results.push({ command, ...result });
+    const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
+    results.push({ command, ...result, phase: "validation" });
     if (!result.ok)
       break;
   }
@@ -5203,7 +5306,7 @@ async function runTrustedValidationCommands(options) {
 }
 
 // apps/source_control_manager/src/config.ts
-import { resolve as resolve7 } from "path";
+import { resolve as resolve8 } from "path";
 function buildDefaults(options = {}) {
   const pushConfig = loadPushPalsConfig({ reload: options.reload });
   const defaultLocalServer = resolveLocalServerConnection({
@@ -5212,7 +5315,7 @@ function buildDefaults(options = {}) {
     fallbackPort: pushConfig.server.port
   });
   return {
-    repoPath: resolve7(pushConfig.sourceControlManager.repoPath),
+    repoPath: resolve8(pushConfig.sourceControlManager.repoPath),
     serverUrl: defaultLocalServer.serverUrl,
     remote: pushConfig.sourceControlManager.remote,
     mainBranch: pushConfig.sourceControlManager.mainBranch,
@@ -5220,7 +5323,7 @@ function buildDefaults(options = {}) {
     branchPrefix: pushConfig.sourceControlManager.branchPrefix,
     pollIntervalSeconds: pushConfig.sourceControlManager.pollIntervalSeconds,
     checks: pushConfig.sourceControlManager.checks.map((check) => ({ ...check })),
-    stateDir: resolve7(pushConfig.sourceControlManager.stateDir),
+    stateDir: resolve8(pushConfig.sourceControlManager.stateDir),
     port: pushConfig.sourceControlManager.port,
     deleteAfterMerge: pushConfig.sourceControlManager.deleteAfterMerge,
     maxAttempts: pushConfig.sourceControlManager.maxAttempts,
@@ -5311,7 +5414,7 @@ function validateConfig(config) {
 // apps/source_control_manager/src/source_control_manager_main.ts
 var PUSH_CONFIG = loadPushPalsConfig();
 var repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
-var defaultSourceControlManagerRepoPath = resolve8(PUSH_CONFIG.sourceControlManager.repoPath);
+var defaultSourceControlManagerRepoPath = resolve9(PUSH_CONFIG.sourceControlManager.repoPath);
 var { values: args } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
@@ -5360,7 +5463,7 @@ if (typeof args.config === "string" && args.config.trim()) {
 var config = loadConfig();
 var cliOverrides = {};
 if (typeof args.repo === "string")
-  cliOverrides.repoPath = resolve8(args.repo);
+  cliOverrides.repoPath = resolve9(args.repo);
 if (typeof args.server === "string")
   cliOverrides.serverUrl = args.server;
 if (typeof args.port === "string") {
@@ -5388,14 +5491,14 @@ if (typeof args.interval === "string") {
   }
 }
 if (typeof args["state-dir"] === "string")
-  cliOverrides.stateDir = resolve8(args["state-dir"]);
+  cliOverrides.stateDir = resolve9(args["state-dir"]);
 if (args["delete-after-merge"])
   cliOverrides.deleteAfterMerge = true;
 config = applyCliOverrides(config, cliOverrides);
-config.repoPath = resolve8(config.repoPath);
+config.repoPath = resolve9(config.repoPath);
 var integrationBaseBranch = config.integrationBaseBranch;
 var integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
-var usingDefaultRepoPath = resolve8(config.repoPath) === resolve8(defaultSourceControlManagerRepoPath);
+var usingDefaultRepoPath = resolve9(config.repoPath) === resolve9(defaultSourceControlManagerRepoPath);
 try {
   validateConfig(config);
 } catch (err) {
@@ -5703,6 +5806,9 @@ async function tick() {
     }
     let tempBranch = "";
     let cleanupCompletionHandoff = false;
+    let trustedInstallDurationMs = null;
+    let trustedValidationDurationMs = null;
+    let trustedValidationCacheHit = null;
     try {
       let processedPrUrl = typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0 ? completion.prUrl.trim() : null;
       console.log(`[${ts2()}] Refreshing refs before applying ${completion.branch}...`);
@@ -5784,10 +5890,26 @@ async function tick() {
             commandsJson: completion.trustedValidationCommandsJson
           });
           for (const trustedResult of trustedResults) {
-            if (!trustedResult.ok) {
-              throw new Error(`Trusted validation "${trustedResult.command}" failed (exit ${trustedResult.exitCode}): ${trustedResult.output}`);
+            if (trustedResult.phase === "dependency_install") {
+              trustedInstallDurationMs = (trustedInstallDurationMs ?? 0) + trustedResult.durationMs;
+              trustedValidationCacheHit = Boolean(trustedResult.cached);
+            } else {
+              trustedValidationDurationMs = (trustedValidationDurationMs ?? 0) + trustedResult.durationMs;
             }
-            console.log(`[${ts2()}]   - Trusted validation passed: ${trustedResult.command}`);
+            const timing = `${trustedResult.durationMs}ms${trustedResult.cached ? ", cache hit" : ""}`;
+            if (!trustedResult.ok) {
+              throw new Error(`Trusted validation "${trustedResult.command}" failed after ${timing} (exit ${trustedResult.exitCode}): ${trustedResult.output}`);
+            }
+            console.log(`[${ts2()}]   - Trusted validation passed (${timing}): ${trustedResult.command}`);
+            console.log(`[${ts2()}] trustedValidationTiming=${JSON.stringify({
+              event: "trusted_validation_timing",
+              jobId: completion.jobId,
+              commitSha: completion.commitSha,
+              command: trustedResult.command,
+              phase: trustedResult.phase,
+              durationMs: trustedResult.durationMs,
+              cached: Boolean(trustedResult.cached)
+            })}`);
           }
         }
         console.log(`[${ts2()}] Running checks...`);
@@ -5948,7 +6070,12 @@ ${pushResult.stdout}`.toLowerCase();
       const markResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/processed`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ prUrl: processedPrUrl })
+        body: JSON.stringify({
+          prUrl: processedPrUrl,
+          trustedInstallDurationMs,
+          trustedValidationDurationMs,
+          trustedValidationCacheHit
+        })
       });
       if (!markResponse.ok) {
         console.error(`[${ts2()}] Failed to mark completion processed: ${markResponse.status}`);
@@ -5963,7 +6090,12 @@ ${pushResult.stdout}`.toLowerCase();
       const failResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/fail`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ error: err.message })
+        body: JSON.stringify({
+          error: err.message,
+          trustedInstallDurationMs,
+          trustedValidationDurationMs,
+          trustedValidationCacheHit
+        })
       });
       if (!failResponse.ok) {
         console.error(`[${ts2()}] Failed to mark completion failed: ${failResponse.status}`);
@@ -6101,7 +6233,7 @@ async function ensureDefaultSourceControlManagerWorktree() {
   const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
   if (probe.ok)
     return;
-  mkdirSync2(resolve8(config.repoPath, ".."), { recursive: true });
+  mkdirSync2(resolve9(config.repoPath, ".."), { recursive: true });
   await runGitCapture(["worktree", "prune"]);
   const seedCandidates = [
     `${config.remote}/${config.mainBranch}`,

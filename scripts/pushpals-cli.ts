@@ -4179,6 +4179,15 @@ export function buildCliClearTargets(opts: {
   );
   appendCliClearTarget(
     targets,
+    "WorkerPal dependency cache",
+    join(
+      dirname(resolveGitStateFilePath(opts.repoRoot, "pushpals-cli-state.json")),
+      "pushpals",
+      "dependencies",
+    ),
+  );
+  appendCliClearTarget(
+    targets,
     "runtime bootstrap logs",
     join(opts.runtimeRoot, "logs", "bootstrap"),
   );

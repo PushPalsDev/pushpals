@@ -695,11 +695,18 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
             "  stderr: 'inherit',",
             "});",
             "console.log(`CHILD_PID=${child.pid ?? ''}`);",
+            "let shuttingDown = false;",
             "process.on('SIGTERM', () => {",
+            "  if (shuttingDown) return;",
+            "  shuttingDown = true;",
             "  try {",
             "    child.kill('SIGTERM');",
             "  } catch {}",
-            "  setTimeout(() => process.exit(0), 0);",
+            "  const fallback = setTimeout(() => process.exit(1), 2000);",
+            "  void child.exited.then(",
+            "    () => { clearTimeout(fallback); process.exit(0); },",
+            "    () => { clearTimeout(fallback); process.exit(1); },",
+            "  );",
             "});",
             "setInterval(() => {}, 1000);",
           ].join("\n"),
@@ -766,6 +773,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         rmSync(root, { recursive: true, force: true });
       }
     },
+    15_000,
   );
 
   test("shutdownEmbeddedServiceManagerGracefully cancels managed output pipes during bounded stop", async () => {
@@ -4246,6 +4254,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         {
           label: "client monitor state file",
           path: join(gitDir, "pushpals-client-state.json"),
+        },
+        {
+          label: "WorkerPal dependency cache",
+          path: join(gitDir, "pushpals", "dependencies"),
         },
         {
           label: "runtime bootstrap logs",

@@ -16,7 +16,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { resolve } from "path";
+import { basename, resolve } from "path";
 import {
   buildGitCommitArgs as buildSourceControlGitCommitArgs,
   explicitSourceControlCommitIdentityFromEnv,
@@ -52,7 +52,10 @@ import {
   resolveBunExecutableFromEnv,
   withResolvedBunOnPath,
 } from "./common/sandbox_env.js";
-import { DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER } from "./common/worktree_dependency_artifacts.js";
+import {
+  DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER,
+  DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER,
+} from "./common/worktree_dependency_artifacts.js";
 // Re-export shared utilities for backward compatibility with external consumers.
 export { compactJobOutput, truncate, streamLines } from "./common/execution_utils.js";
 export { extractClarificationQuestionFromOutput } from "./backends/openhands_task_execute.js";
@@ -2373,6 +2376,71 @@ function readReferencedValidationScriptText(cwd: string, script: string): string
   return texts.join("\n");
 }
 
+function validationTextRequiresDockerDaemon(text: string): boolean {
+  if (!text) return false;
+  if (
+    /(?:^|[^A-Za-z0-9_-])docker(?:\.exe)?(?:$|[^A-Za-z0-9_-])|docker daemon|docker\.sock|DOCKER_HOST/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  return (
+    /\bsupabase\b/i.test(text) &&
+    /\blocal stack\b|run\s*\(\s*\[\s*["'](?:status|start|stop)["']/i.test(text)
+  );
+}
+
+export function validationCommandRequiresDockerDaemon(repo: string, command: string): boolean {
+  const visited = new Set<string>();
+  const visit = (currentCommand: string, depth: number): boolean => {
+    if (depth > 8) return false;
+    const normalized = validationCommandKey(currentCommand);
+    if (!normalized || visited.has(normalized)) return false;
+    visited.add(normalized);
+    if (validationTextRequiresDockerDaemon(currentCommand)) return true;
+
+    const resolvedScript = resolvePackageScriptForValidationCommand(repo, currentCommand);
+    if (!resolvedScript) return false;
+    const referencedText = readReferencedValidationScriptText(
+      resolvedScript.cwd,
+      resolvedScript.script,
+    );
+    const combined = `${resolvedScript.script}\n${referencedText}`;
+    if (validationTextRequiresDockerDaemon(combined)) return true;
+
+    const nestedScriptNames = new Set<string>();
+    for (const match of combined.matchAll(
+      /\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?([A-Za-z0-9:_-]+)/gi,
+    )) {
+      if (match[1]) nestedScriptNames.add(match[1]);
+    }
+    for (const match of combined.matchAll(/["']run["']\s*,\s*["']([A-Za-z0-9:_-]+)["']/gi)) {
+      if (match[1]) nestedScriptNames.add(match[1]);
+    }
+    return Array.from(nestedScriptNames).some((scriptName) =>
+      visit(`bun run ${scriptName}`, depth + 1),
+    );
+  };
+  return visit(command, 0);
+}
+
+export function trustedEnvironmentValidationDeferralReason(
+  repo: string,
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (String(env.PUSHPALS_WORKER_DOCKER_CAPABILITY ?? "").trim() !== "unavailable") {
+    return null;
+  }
+  if (!validationCommandRequiresDockerDaemon(repo, command)) return null;
+  return (
+    "Trusted-environment validation deferred before execution because the command requires " +
+    "a Docker daemon and the worker sandbox intentionally has no Docker socket. Cannot connect " +
+    "to the Docker daemon at unix:///var/run/docker.sock. Run this command on the trusted host."
+  );
+}
+
 export function shouldEnsurePlaywrightBrowserRuntime(repo: string, command: string): boolean {
   if (!validationCommandIncludesLongRunningBrowserWork(repo, command)) return false;
   if (/\bplaywright\b/i.test(command)) return true;
@@ -2454,6 +2522,22 @@ export function playwrightBrowserInstallArgv(targets: string[] = ["chromium"]): 
     "install",
     ...(installTargets.length > 0 ? installTargets : ["chromium"]),
   ];
+}
+
+export function playwrightBrowserRuntimeCacheMarkerPath(
+  repo: string,
+  targets: string[],
+  env: Record<string, string> = buildWorkerSandboxWritableEnv(repo),
+): string | null {
+  const browsersPath = String(env.PLAYWRIGHT_BROWSERS_PATH ?? "").trim();
+  if (!browsersPath || browsersPath === "0") return null;
+  const cacheKey = createHash("sha256")
+    .update(validationFileFingerprint(repo, []))
+    .update("\0")
+    .update(Array.from(new Set(targets)).sort().join(","))
+    .digest("hex")
+    .slice(0, 24);
+  return resolve(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
 }
 
 async function runPlaywrightBrowserRuntimePreflight(
@@ -2670,7 +2754,47 @@ function isLinkedNodeModulesDependencyArtifact(repo: string): boolean {
 }
 
 function isManagedLinkedPackageDependencySnapshot(repo: string): boolean {
-  return existsSync(resolve(repo, "node_modules", DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER));
+  const nodeModulesDir = resolve(repo, "node_modules");
+  return (
+    existsSync(resolve(nodeModulesDir, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER)) &&
+    !existsSync(resolve(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER))
+  );
+}
+
+export function bunDependencySnapshotKey(
+  repo: string,
+  bunVersion: string = String(process.versions.bun ?? "unknown"),
+): string | null {
+  const packagePath = resolve(repo, "package.json");
+  if (!existsSync(packagePath)) return null;
+  const hashInput: string[] = [`projection=hardlink-v1`, `bun=${bunVersion}`];
+  for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
+    const path = resolve(repo, name);
+    if (!existsSync(path)) continue;
+    hashInput.push(createHash("sha256").update(readFileSync(path)).digest("hex"));
+  }
+  let key = createHash("sha256")
+    .update(`${hashInput.join("\n")}\n`)
+    .digest("hex");
+  const packageJson = readJsonRecord(packagePath);
+  if (packageJson?.workspaces != null) key = `${key}-${basename(resolve(repo))}`;
+  return key;
+}
+
+function validationSafeDependencySnapshotIsCurrent(repo: string): boolean {
+  const markerPath = resolve(
+    repo,
+    "node_modules",
+    DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER,
+  );
+  if (!existsSync(markerPath)) return false;
+  const expected = bunDependencySnapshotKey(repo);
+  if (!expected) return false;
+  try {
+    return readFileSync(markerPath, "utf8").trim() === expected;
+  } catch {
+    return false;
+  }
 }
 
 function validationNeedsExpoRouterBrowserLocalInstall(
@@ -2738,6 +2862,19 @@ export function resolveBunDependencyLayoutPreflight(
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules is missing for Bun validation commands",
+    };
+  }
+
+  if (
+    existsSync(
+      resolve(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER),
+    ) &&
+    !validationSafeDependencySnapshotIsCurrent(repo)
+  ) {
+    return {
+      command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
+      reason: "validation-safe dependency snapshot fingerprint is stale",
+      removeLinkedNodeModules: true,
     };
   }
 
@@ -5659,6 +5796,26 @@ async function runDeterministicQualityGate(
             );
             continue;
           }
+          const trustedEnvironmentDeferral = trustedEnvironmentValidationDeferralReason(
+            repo,
+            command,
+          );
+          if (trustedEnvironmentDeferral) {
+            validationRuns.push({
+              step: command,
+              command,
+              ok: false,
+              exitCode: 1,
+              stdout: "",
+              stderr: trustedEnvironmentDeferral,
+              elapsedMs: 0,
+            });
+            onLog?.(
+              "stderr",
+              `[ValidationGate] Deferred Docker-dependent validation to the trusted host without executing it: ${command}`,
+            );
+            continue;
+          }
           const commandNeedsPlaywrightBrowserRuntime = shouldEnsurePlaywrightBrowserRuntime(
             repo,
             command,
@@ -5673,42 +5830,66 @@ async function runDeterministicQualityGate(
             commandNeedsPlaywrightBrowserRuntime && missingPlaywrightBrowserTargets.length === 0;
           if (missingPlaywrightBrowserTargets.length > 0) {
             const browserEnv = buildWorkerSandboxWritableEnv(repo);
-            onLog?.(
-              "stdout",
-              `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
-            );
-            const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
+            const browserReadyMarker = playwrightBrowserRuntimeCacheMarkerPath(
               repo,
-              command,
               missingPlaywrightBrowserTargets,
-              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
-              outputPolicy,
+              browserEnv,
             );
-            if (!browserPreflight.ok) {
-              const digest = extractValidationFailureDigest(browserPreflight);
-              validationRuns.push({
-                ...browserPreflight,
-                stderr: [
-                  `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
-                  browserPreflight.stderr,
-                ]
-                  .filter(Boolean)
-                  .join("\n"),
-              });
+            if (browserReadyMarker && existsSync(browserReadyMarker)) {
+              for (const target of missingPlaywrightBrowserTargets) {
+                playwrightBrowserRuntimeReadyTargets.add(target);
+              }
+              commandBrowserRuntimeEnsured = true;
               onLog?.(
-                "stderr",
-                `[ValidationGate] Browser runtime preflight failed for "${command}"${digest ? ` - ${digest}` : ""}`,
+                "stdout",
+                `[ValidationGate] Browser runtime cache hit for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
               );
-              continue;
             }
-            for (const target of missingPlaywrightBrowserTargets) {
-              playwrightBrowserRuntimeReadyTargets.add(target);
+            if (!commandBrowserRuntimeEnsured) {
+              onLog?.(
+                "stdout",
+                `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
+              );
+              const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
+                repo,
+                command,
+                missingPlaywrightBrowserTargets,
+                resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
+                outputPolicy,
+              );
+              if (!browserPreflight.ok) {
+                const digest = extractValidationFailureDigest(browserPreflight);
+                validationRuns.push({
+                  ...browserPreflight,
+                  stderr: [
+                    `Browser runtime preflight failed before validation command "${command}". WorkerPals could not ensure Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} in PLAYWRIGHT_BROWSERS_PATH=${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default)"}.`,
+                    browserPreflight.stderr,
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                });
+                onLog?.(
+                  "stderr",
+                  `[ValidationGate] Browser runtime preflight failed for "${command}"${digest ? ` - ${digest}` : ""}`,
+                );
+                continue;
+              }
+              for (const target of missingPlaywrightBrowserTargets) {
+                playwrightBrowserRuntimeReadyTargets.add(target);
+              }
+              if (browserReadyMarker) {
+                try {
+                  writeFileSync(browserReadyMarker, `${new Date().toISOString()}\n`, "utf8");
+                } catch {
+                  // Best effort. A later job can safely rerun the idempotent preflight.
+                }
+              }
+              onLog?.(
+                "stdout",
+                `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
+              );
+              commandBrowserRuntimeEnsured = true;
             }
-            onLog?.(
-              "stdout",
-              `[ValidationGate] Browser runtime preflight passed for "${command}" (${missingPlaywrightBrowserTargets.join(", ")})`,
-            );
-            commandBrowserRuntimeEnsured = true;
           }
           const previousDigest = validationRetryState?.previousFailureDigests?.get(
             validationCommandKey(command),

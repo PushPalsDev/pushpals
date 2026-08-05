@@ -40,6 +40,7 @@ const EXTERNAL_TOOL_NAME_PATTERN =
   /^(bun|bunx|node|npm|npx|pnpm|yarn|git|docker|codex|uv|python|python3|pip|pip3)(\.(exe|cmd|bat|ps1|sh))?$/i;
 
 const EXECUTABLE_OR_NATIVE_LIBRARY_PATTERN = /\.(exe|dll|dylib|node|pyd|jar)$|\.so(\.\d+)*$/i;
+const LOCAL_RUNTIME_OVERRIDE_PATTERN = /(?:^|\/)local\.toml$/i;
 
 const RELEASE_ARTIFACT_ALLOW_PATTERN =
   /^(pushpals-(linux-x64|windows-x64\.exe|macos-x64|macos-arm64)|pushpals-runtime-(server|localbuddy|remotebuddy|workerpals|source-control-manager)-(linux-x64|windows-x64\.exe|macos-x64|macos-arm64)|SHA256SUMS\.txt)(\.asc)?$/;
@@ -89,6 +90,13 @@ export function findDisallowedCliPackageEntries(
   for (const file of files) {
     const path = normalizePackagePath(file.path);
     const segments = splitPackagePath(path);
+    if (LOCAL_RUNTIME_OVERRIDE_PATTERN.test(path)) {
+      issues.push({
+        path,
+        reason: "package payload includes a developer-local runtime override",
+      });
+      continue;
+    }
     const disallowedSegment = segments.find(isDisallowedDirectorySegment);
     if (disallowedSegment) {
       issues.push({

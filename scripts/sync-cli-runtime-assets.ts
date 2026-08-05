@@ -33,10 +33,8 @@ mkdirSync(outDir, { recursive: true });
 const copyPairs: Array<[string, string]> = [
   [source.envExamplePath, join(outDir, ".env.example")],
   [source.visionExamplePath, join(outDir, "vision.example.md")],
-  [source.configsDir, join(outDir, "configs")],
   [source.promptsDir, join(outDir, "prompts")],
   [source.protocolSchemasDir, join(outDir, "protocol", "schemas")],
-  [source.configsDir, join(outDir, "sandbox", "configs")],
   [join(source.promptsDir, "workerpals"), join(outDir, "sandbox", "prompts", "workerpals")],
   [source.protocolSchemasDir, join(outDir, "sandbox", "protocol", "schemas")],
 ];
@@ -60,6 +58,13 @@ for (const [fromPath, toPath] of copyPairs) {
     recursive: true,
     force: true,
   });
+}
+
+// Runtime packages must never inherit ignored developer overrides such as
+// configs/local.toml. npm includes untracked files under a package's `files`
+// directories, so copy the committed config surface explicitly.
+for (const destination of [join(outDir, "configs"), join(outDir, "sandbox", "configs")]) {
+  copyTrackedRepoPath(repoRoot, "configs", destination, true);
 }
 
 for (const [fromPath, toPath] of trackedSandboxCopyPairs) {

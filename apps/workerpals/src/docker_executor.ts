@@ -98,15 +98,25 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     `worktree=${worktree}`,
     'linked=""',
     'if [ -f "$worktree/package.json" ] && { [ -f "$worktree/bun.lock" ] || [ -f "$worktree/bun.lockb" ]; }; then',
-    '  dependency_cache_root="/workspace/.pushpals-dependencies/linux-$(uname -m)"',
+    // Keep the snapshot on the repository bind mount so GNU cp can hardlink
+    // immutable package files into each worktree without crossing filesystems.
+    '  git_common_dir="$(cd "$worktree" && common="$(git rev-parse --git-common-dir)" && cd "$common" && pwd -P)"',
+    '  dependency_cache_root="$git_common_dir/pushpals/dependencies/linux-$(uname -m)"',
     '  mkdir -p "$dependency_cache_root"',
-    '  snapshot_key="$( { printf \'bun=%s\\n\' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done; } | sha256sum | cut -d " " -f 1)"',
+    '  snapshot_key="$( { printf \'projection=hardlink-v1\\nbun=%s\\n\' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"',
     "  if jq -e '.workspaces != null' \"$worktree/package.json\" >/dev/null 2>&1; then",
     '    snapshot_key="$snapshot_key-${worktree##*/}"',
     "  fi",
     '  snapshot_root="$dependency_cache_root/$snapshot_key"',
     '  snapshot_ready="$snapshot_root/.pushpals-dependency-ready"',
     '  snapshot_lock="$snapshot_root.lock"',
+    // The shared files are read-only, but the worker runs as root and can
+    // technically override that permission. Detect any content write by its
+    // mtime and invalidate the snapshot before another job projects it.
+    '  if [ -f "$snapshot_ready" ] && find "$snapshot_root/node_modules" -type f -newer "$snapshot_ready" -print -quit | grep -q .; then',
+    "    printf 'Discarding modified Linux-native dependency snapshot: %s\\n' \"$snapshot_root\" >&2",
+    '    rm -f "$snapshot_ready"',
+    "  fi",
     "  wait_count=0",
     '  while [ ! -f "$snapshot_ready" ]; do',
     '    if mkdir "$snapshot_lock" 2>/dev/null; then',
@@ -118,6 +128,7 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '      ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
     '      (cd "$worktree" && bun install --frozen-lockfile --ignore-scripts >&2)',
     '      rm -f "$worktree/node_modules"',
+    '      find "$snapshot_root/node_modules" -type f -exec chmod a-w {} +',
     '      printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"',
     '      rmdir "$snapshot_lock"',
     "      trap - EXIT INT TERM",
@@ -141,14 +152,19 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '    case "$entry_name" in',
     "      .cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot|.pushpals-dependency-ready|.pushpals-dependency-projection-in-progress) continue ;;",
     "    esac",
-    '    ln -s "$entry" "$dest/$entry_name"',
+    // A top-level symlink projection is fast for editing but changes package
+    // realpaths, which breaks Expo/Vitest singleton resolution and forces a
+    // second full install. A hardlink clone keeps job-local canonical paths
+    // while sharing immutable file content with the lockfile-keyed snapshot.
+    '    cp -al "$entry" "$dest/$entry_name"',
     "  done",
     "  for mutable in .cache .expo .vite .vite-temp; do",
     '    mkdir -p "$dest/$mutable"',
     "  done",
     '  rm -f "$dest/.pushpals-dependency-projection-in-progress"',
     '  printf \'%s\\n\' "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"',
-    '  linked="$linked node_modules-linux-native"',
+    '  printf \'%s\\n\' "$snapshot_key" > "$dest/.pushpals-validation-safe-dependency-snapshot"',
+    '  linked="$linked node_modules-linux-native-hardlink"',
     "else",
     "  for name in node_modules; do",
     '    src="/repo/$name"',
@@ -769,7 +785,9 @@ export class DockerExecutor {
   /**
    * Dedicated Windows-host/Linux-container boundary check used by CI. Unlike
    * the broader startup self-check, this requires only a minimal Linux image
-   * with Git and verifies file bytes from inside that container.
+   * with Git and verifies LF bytes plus hardlink support from inside that
+   * container. The hardlink probe protects the dependency projection used by
+   * production Windows-host workers.
    */
   async validateLinuxContainerWorktreeBoundary(assertLfPath: string): Promise<void> {
     const normalizedPath = String(assertLfPath ?? "")
@@ -1012,6 +1030,10 @@ export class DockerExecutor {
       PUSHPALS_CONFIG_DIR_OVERRIDE: "/workspace/configs",
       PUSHPALS_PROMPTS_ROOT_OVERRIDE: "/workspace",
       PUSHPALS_PROTOCOL_SCHEMAS_DIR: "/workspace/protocol/schemas",
+      // The warm worker container intentionally has no host Docker socket.
+      // ValidationGate uses this capability signal to hand aggregate commands
+      // that require Docker to SourceControlManager without a futile run.
+      PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable",
     };
     for (const backend of DOCKER_BACKENDS) {
       const name = backend.name.toUpperCase();
@@ -1693,7 +1715,10 @@ export class DockerExecutor {
       worktreePath,
       onLog,
     );
-    await this.ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog);
+    const dependencyPreparation = await this.ensureWorktreeDependencyArtifacts(
+      containerWorktreePath,
+      onLog,
+    );
 
     const args = this.buildWarmContainerExecArgs(containerWorktreePath);
 
@@ -1795,7 +1820,29 @@ export class DockerExecutor {
       timeoutMs,
     });
 
-    return result;
+    const diagnostics = result.diagnostics ?? {};
+    return {
+      ...result,
+      diagnostics: {
+        ...diagnostics,
+        phaseSpans: [
+          {
+            phase: "dependency preparation",
+            startedAt: new Date(dependencyPreparation.startedAtMs).toISOString(),
+            finishedAt: new Date(dependencyPreparation.finishedAtMs).toISOString(),
+            durationMs: dependencyPreparation.durationMs,
+            outcome: "completed",
+            metadata: { artifacts: dependencyPreparation.artifacts },
+          },
+          ...(diagnostics.phaseSpans ?? []),
+        ],
+        metadata: {
+          ...(diagnostics.metadata ?? {}),
+          dependencyPreparationMs: dependencyPreparation.durationMs,
+          dependencyArtifacts: dependencyPreparation.artifacts,
+        },
+      },
+    };
   }
 
   private buildWarmContainerExecArgs(containerWorktreePath: string): string[] {
@@ -1864,7 +1911,12 @@ export class DockerExecutor {
   private async ensureWorktreeDependencyArtifacts(
     containerWorktreePath: string,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
-  ): Promise<void> {
+  ): Promise<{
+    startedAtMs: number;
+    finishedAtMs: number;
+    durationMs: number;
+    artifacts: string[];
+  }> {
     const startedAt = Date.now();
     const startNote =
       "[DockerExecutor] Preparing Linux-native dependency entries for the WorkerPal worktree.";
@@ -1888,13 +1940,27 @@ export class DockerExecutor {
       .split(/\s+/g)
       .map((entry) => entry.trim())
       .filter(Boolean);
-    if (linked.length === 0) return;
+    const finishedAtMs = Date.now();
+    if (linked.length === 0) {
+      return {
+        startedAtMs: startedAt,
+        finishedAtMs,
+        durationMs: Math.max(0, finishedAtMs - startedAt),
+        artifacts: [],
+      };
+    }
 
     const note =
-      `[DockerExecutor] Prepared worktree dependency snapshot(s) in ${Date.now() - startedAt}ms: ` +
+      `[DockerExecutor] Prepared worktree dependency snapshot(s) in ${finishedAtMs - startedAt}ms: ` +
       linked.join(", ");
     console.log(note);
     onLog?.("stdout", note);
+    return {
+      startedAtMs: startedAt,
+      finishedAtMs,
+      durationMs: Math.max(0, finishedAtMs - startedAt),
+      artifacts: linked,
+    };
   }
 
   private async waitForWorktreePathInWarmContainer(
@@ -2037,6 +2103,10 @@ export class DockerExecutor {
         '    echo "CRLF bytes found in $PUSHPALS_LF_ASSERT_PATH" >&2',
         "    exit 23",
         "  fi",
+        '  hardlink_probe=".pushpals-hardlink-boundary-$$"',
+        '  ln "$PUSHPALS_LF_ASSERT_PATH" "$hardlink_probe"',
+        '  test "$PUSHPALS_LF_ASSERT_PATH" -ef "$hardlink_probe"',
+        '  rm -f "$hardlink_probe"',
         "fi",
       ].join("\n"),
     ];

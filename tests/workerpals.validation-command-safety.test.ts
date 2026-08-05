@@ -6,12 +6,14 @@ import { join } from "path";
 import {
   buildBunDependencyLayoutPreflightFailureRun,
   buildValidationExecutionDag,
+  bunDependencySnapshotKey,
   allowsValidationToolingOnlyChangeForTestFocusedTask,
   classifyValidationFailureScope,
   collectPrePublishHygieneIssues,
   collectWriteScopeIssuesFromChangedPaths,
   collectRequiredValidationFailures,
   collectQualityGateValidationCommands,
+  detectValidationBlocker,
   extractRequiredValidationStepsFromVisionMarkdown,
   extractValidationFailureDigest,
   filterChangedPathsByGitContentDelta,
@@ -30,6 +32,7 @@ import {
   isTestLikeValidationStep,
   isValidationToolingPath,
   playwrightBrowserInstallArgv,
+  playwrightBrowserRuntimeCacheMarkerPath,
   prepareValidationCommandArgv,
   prepareValidationSpawnArgv,
   removeLinkedNodeModulesDependencyArtifact,
@@ -46,8 +49,10 @@ import {
   shouldDeferLongValidationAfterFastFailures,
   shouldRetryBrowserValidationRunOnce,
   tokenizeValidationCommandArgv,
+  trustedEnvironmentValidationDeferralReason,
   validationCommandIncludesLongRunningBrowserWork,
   validationCommandIncludesTestWork,
+  validationCommandRequiresDockerDaemon,
   validationCommandSubsumes,
 } from "../apps/workerpals/src/execute_job";
 
@@ -1188,6 +1193,90 @@ describe("workerpals validation command safety", () => {
     ]);
   });
 
+  test("defers nested Docker-dependent aggregate validation only in socketless workers", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-docker-validation-deferral-"));
+
+    try {
+      mkdirSync(join(root, "scripts"), { recursive: true });
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({
+          scripts: {
+            validate: "node ./scripts/validate.js",
+            "test:supabase": "node ./scripts/test-supabase.js",
+            "worker:deploy:dry-run": "wrangler deploy --dry-run",
+          },
+        }),
+        "utf8",
+      );
+      writeFileSync(
+        join(root, "scripts", "validate.js"),
+        "const steps = [['run', 'test:supabase']];\n",
+        "utf8",
+      );
+      writeFileSync(
+        join(root, "scripts", "test-supabase.js"),
+        "console.log('Starting isolated local stack'); run(['start']);\n",
+        "utf8",
+      );
+
+      expect(validationCommandRequiresDockerDaemon(root, "bun run validate")).toBe(true);
+      expect(validationCommandRequiresDockerDaemon(root, "bun run worker:deploy:dry-run")).toBe(
+        false,
+      );
+      expect(
+        trustedEnvironmentValidationDeferralReason(root, "bun run validate", {
+          PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable",
+        }),
+      ).toContain("trusted host");
+      const deferredDetail = trustedEnvironmentValidationDeferralReason(root, "bun run validate", {
+        PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable",
+      });
+      expect(
+        detectValidationBlocker([
+          {
+            step: "bun run validate",
+            command: "bun run validate",
+            ok: false,
+            exitCode: 1,
+            stdout: "",
+            stderr: deferredDetail ?? "",
+            elapsedMs: 0,
+          },
+        ]),
+      ).toMatchObject({ category: "environment" });
+      expect(
+        trustedEnvironmentValidationDeferralReason(root, "bun run validate", {
+          PUSHPALS_WORKER_DOCKER_CAPABILITY: "available",
+        }),
+      ).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keys browser-runtime readiness by dependency inputs and browser targets", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-browser-runtime-cache-"));
+
+    try {
+      writeFileSync(join(root, "package.json"), '{"devDependencies":{"playwright":"1.0.0"}}');
+      writeFileSync(join(root, "bun.lock"), "lock-a", "utf8");
+      const env = { PLAYWRIGHT_BROWSERS_PATH: join(root, "browser-cache") };
+      const first = playwrightBrowserRuntimeCacheMarkerPath(root, ["chromium"], env);
+      const reordered = playwrightBrowserRuntimeCacheMarkerPath(root, ["chromium"], env);
+      const otherTarget = playwrightBrowserRuntimeCacheMarkerPath(root, ["firefox"], env);
+      writeFileSync(join(root, "bun.lock"), "lock-b", "utf8");
+      const changedLock = playwrightBrowserRuntimeCacheMarkerPath(root, ["chromium"], env);
+
+      expect(first).toBe(reordered);
+      expect(otherTarget).not.toBe(first);
+      expect(changedLock).not.toBe(first);
+      expect(first).toContain(".pushpals-browser-ready-");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("detects a broken Bun dependency binary layout before validation", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-bun-layout-preflight-"));
 
@@ -1464,6 +1553,47 @@ describe("workerpals validation command safety", () => {
       expect(localizedBunRun.stderr).toBe("");
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps validation-safe hardlink dependency snapshots for Bun validation", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-hardlink-snapshot-"));
+
+    try {
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({
+          scripts: { "worker:deploy:dry-run": "wrangler deploy --dry-run" },
+          devDependencies: { wrangler: "1.0.0" },
+        }),
+        "utf8",
+      );
+      writeFileSync(join(root, "bun.lock"), "", "utf8");
+      mkdirSync(join(root, "node_modules", ".bin"), { recursive: true });
+      mkdirSync(join(root, "node_modules", "wrangler"), { recursive: true });
+      writeFileSync(join(root, "node_modules", ".bin", "wrangler"), "", "utf8");
+      writeFileSync(
+        join(root, "node_modules", "wrangler", "package.json"),
+        JSON.stringify({ name: "wrangler", bin: { wrangler: "cli.js" } }),
+        "utf8",
+      );
+      writeFileSync(join(root, "node_modules", "wrangler", "cli.js"), "", "utf8");
+      writeFileSync(join(root, "node_modules", ".pushpals-dependency-snapshot"), "key\n");
+      writeFileSync(
+        join(root, "node_modules", ".pushpals-validation-safe-dependency-snapshot"),
+        `${bunDependencySnapshotKey(root)}\n`,
+      );
+
+      expect(
+        resolveBunDependencyLayoutPreflight(root, ["bun run worker:deploy:dry-run"]),
+      ).toBeNull();
+
+      writeFileSync(join(root, "bun.lock"), "changed", "utf8");
+      const stale = resolveBunDependencyLayoutPreflight(root, ["bun run worker:deploy:dry-run"]);
+      expect(stale?.reason).toContain("fingerprint is stale");
+      expect(stale?.removeLinkedNodeModules).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

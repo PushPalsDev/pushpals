@@ -120,6 +120,7 @@ _BACKGROUND_NO_EDIT_WATCHDOG_S = 120
 _NO_EDIT_RECOVERY_WATCHDOG_S = 90
 _FINAL_NO_EDIT_RECOVERY_WATCHDOG_S = 60
 _DEFAULT_NO_EDIT_RECHECK_S = 120
+_REVIEW_FIX_NO_EDIT_RECHECK_S = 30
 _NO_EDIT_RECOVERY_RECHECK_S = 30
 _FINAL_NO_EDIT_RECOVERY_RECHECK_S = 15
 _DEFAULT_NO_EDIT_COMMAND_GRACE_S = 240
@@ -701,6 +702,20 @@ def _looks_like_small_task_prompt(prompt: str) -> bool:
     )
 
 
+def _looks_like_review_fix_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "review-fix",
+            "review fix",
+            "rejected pr",
+            "existing pr branch",
+            "previous reviewagent score",
+        )
+    )
+
+
 def _looks_like_narrow_test_task_prompt(prompt: str) -> bool:
     text = str(prompt or "").lower()
     if not text:
@@ -849,6 +864,7 @@ def _resolve_no_edit_watchdog_seconds(
 def _resolve_no_edit_recheck_seconds(
     communicate_timeout_s: Optional[int],
     recovery_attempt: int = 0,
+    prompt: str = "",
 ) -> int:
     raw = os.environ.get("WORKERPALS_OPENAI_CODEX_NO_EDIT_RECHECK_S", "").strip()
     if raw:
@@ -860,13 +876,14 @@ def _resolve_no_edit_recheck_seconds(
         else:
             upper = max(1, (communicate_timeout_s or parsed + 1) - 1)
             return max(1, min(parsed, upper))
-    default_s = (
-        _FINAL_NO_EDIT_RECOVERY_RECHECK_S
-        if recovery_attempt >= _MAX_NO_EDIT_RECOVERY_ATTEMPTS
-        else _NO_EDIT_RECOVERY_RECHECK_S
-        if recovery_attempt > 0
-        else _DEFAULT_NO_EDIT_RECHECK_S
-    )
+    if recovery_attempt >= _MAX_NO_EDIT_RECOVERY_ATTEMPTS:
+        default_s = _FINAL_NO_EDIT_RECOVERY_RECHECK_S
+    elif recovery_attempt > 0:
+        default_s = _NO_EDIT_RECOVERY_RECHECK_S
+    elif _looks_like_review_fix_prompt(prompt):
+        default_s = _REVIEW_FIX_NO_EDIT_RECHECK_S
+    else:
+        default_s = _DEFAULT_NO_EDIT_RECHECK_S
     upper = max(1, (communicate_timeout_s or default_s + 1) - 1)
     return max(1, min(default_s, upper))
 
@@ -2414,6 +2431,18 @@ def _changed_path_fingerprint(repo: str, path: str) -> str:
     return digest.hexdigest()
 
 
+def _publishable_progress_fingerprint(repo: str, paths: List[str]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted({str(path or "").replace("\\", "/").strip() for path in paths}):
+        if not path:
+            continue
+        digest.update(path.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(_changed_path_fingerprint(repo, path).encode("ascii", errors="replace"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _capture_git_change_snapshot(repo: str) -> Dict[str, str]:
     return {
         path: _changed_path_fingerprint(repo, path)
@@ -3190,6 +3219,7 @@ def _run_codex_task(
             no_edit_recheck_s = _resolve_no_edit_recheck_seconds(
                 communicate_timeout_s,
                 recovery_attempt=recovery_depth,
+                prompt=prompt,
             )
             no_edit_command_grace_s = _resolve_no_edit_command_grace_seconds(communicate_timeout_s)
             no_edit_command_progress_cap_s = _resolve_no_edit_command_progress_cap_seconds(
@@ -3229,6 +3259,7 @@ def _run_codex_task(
             publishable_progress_seen_at: Optional[float] = None
             publishable_progress_finalized = False
             publishable_progress_paths: List[str] = []
+            publishable_progress_fingerprint = ""
             first_no_edit_command_progress_at: Optional[float] = None
             validation_repair_prompt = _looks_like_validation_repair_prompt(
                 f"{instruction}\n\n{prompt}"
@@ -3398,9 +3429,33 @@ def _run_codex_task(
                             )
                         _terminate_active_child()
                         break
-                    if publishable_progress_seen_at is None:
+                    current_progress_fingerprint = _publishable_progress_fingerprint(
+                        repo, effective_paths
+                    )
+                    with trace_lock:
+                        active_commands_raw = stdout_trace_state.get("active_command_ids")
+                        active_command_count = (
+                            len(active_commands_raw)
+                            if isinstance(active_commands_raw, list)
+                            else 0
+                        )
+                    if active_command_count > 0:
                         publishable_progress_seen_at = now
                         publishable_progress_paths = list(effective_paths)
+                        publishable_progress_fingerprint = current_progress_fingerprint
+                        no_edit_deadline = now + float(no_edit_recheck_s)
+                        log.info(
+                            "No-edit watchdog observed publishable changes while "
+                            f"{active_command_count} tool command(s) remain active; waiting for a stable diff."
+                        )
+                        continue
+                    if (
+                        publishable_progress_seen_at is None
+                        or current_progress_fingerprint != publishable_progress_fingerprint
+                    ):
+                        publishable_progress_seen_at = now
+                        publishable_progress_paths = list(effective_paths)
+                        publishable_progress_fingerprint = current_progress_fingerprint
                     elif _has_credible_shell_wrapper_progress(effective_paths):
                         publishable_progress_paths = list(effective_paths)
                         publishable_age_s = now - publishable_progress_seen_at

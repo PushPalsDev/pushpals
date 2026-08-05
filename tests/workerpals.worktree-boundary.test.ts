@@ -85,7 +85,7 @@ describe("workerpals host/container worktree boundary", () => {
       ? test
       : test.skip;
   windowsLinuxContainerTest(
-    "reads LF bytes and worktree-local Git configuration inside a Linux container",
+    "reads LF bytes and creates hardlinks inside a Windows-host Linux container worktree",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "pushpals-lf-container-boundary-"));
       const repo = join(root, "repo");

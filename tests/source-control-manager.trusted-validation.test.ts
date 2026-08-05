@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  hasFreshTrustedValidationInstall,
   resolveTrustedValidationArgv,
   runTrustedValidationCommands,
+  trustedValidationInstallFingerprint,
 } from "../apps/source_control_manager/src/trusted_validation";
 
 describe("SourceControlManager trusted validation", () => {
@@ -96,6 +98,8 @@ describe("SourceControlManager trusted validation", () => {
           command: "bun install --frozen-lockfile",
           output: "lockfile mismatch",
           exitCode: 1,
+          durationMs: expect.any(Number),
+          phase: "dependency_install",
         },
       ]);
     } finally {
@@ -124,8 +128,69 @@ describe("SourceControlManager trusted validation", () => {
         command: "bun test tests/first.test.ts",
         output: "assertion failed",
         exitCode: 1,
+        durationMs: expect.any(Number),
+        phase: "validation",
       },
     ]);
+  });
+
+  test("reuses a successful trusted install until dependency inputs change", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-validation-cache-"));
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      const calls: string[][] = [];
+      const runner = async (argv: string[]) => {
+        calls.push(argv);
+        if (argv.includes("install"))
+          mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+
+      const firstFingerprint = trustedValidationInstallFingerprint({
+        repoPath,
+        bunExecutable: "/runtime/bun",
+      });
+      const first = await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        runner,
+      });
+      const second = await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        runner,
+      });
+
+      expect(first[0]?.cached).not.toBe(true);
+      expect(second[0]).toMatchObject({
+        command: "bun install --frozen-lockfile",
+        ok: true,
+        cached: true,
+        durationMs: 0,
+        phase: "dependency_install",
+      });
+      expect(hasFreshTrustedValidationInstall({ repoPath, bunExecutable: "/runtime/bun" })).toBe(
+        true,
+      );
+      expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(1);
+
+      writeFileSync(join(repoPath, "bun.lock"), "lock-b");
+      expect(
+        trustedValidationInstallFingerprint({ repoPath, bunExecutable: "/runtime/bun" }),
+      ).not.toBe(firstFingerprint);
+      await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        runner,
+      });
+      expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(2);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
   });
 
   test("rejects shell-control payloads before invoking a runner", async () => {
