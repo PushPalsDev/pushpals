@@ -2328,6 +2328,74 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("prepareCliRuntime migrates legacy hourly autonomy resource defaults to unlimited", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-autonomy-budget-migrate-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.toml"),
+        [
+          "[remotebuddy.autonomy]",
+          "max_token_usage_per_hour = 120000",
+          "max_runtime_ms_per_hour = 5400000",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
+      const migratedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
+
+      expect(prepared.runtimePreflight.config?.remotebuddy.autonomy.maxTokenUsagePerHour).toBe(0);
+      expect(prepared.runtimePreflight.config?.remotebuddy.autonomy.maxRuntimeMsPerHour).toBe(0);
+      expect(migratedLocalToml).toContain("max_token_usage_per_hour = 0");
+      expect(migratedLocalToml).toContain("max_runtime_ms_per_hour = 0");
+      expect(migratedLocalToml).not.toContain("max_token_usage_per_hour = 120000");
+      expect(migratedLocalToml).not.toContain("max_runtime_ms_per_hour = 5400000");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime preserves explicit custom hourly autonomy resource limits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-autonomy-budget-preserve-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "configs", "local.toml"),
+        [
+          "[remotebuddy.autonomy]",
+          "max_token_usage_per_hour = 250000",
+          "max_runtime_ms_per_hour = 7200000",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
+      const preservedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
+
+      expect(prepared.runtimePreflight.config?.remotebuddy.autonomy.maxTokenUsagePerHour).toBe(
+        250_000,
+      );
+      expect(prepared.runtimePreflight.config?.remotebuddy.autonomy.maxRuntimeMsPerHour).toBe(
+        7_200_000,
+      );
+      expect(preservedLocalToml).toContain("max_token_usage_per_hour = 250000");
+      expect(preservedLocalToml).toContain("max_runtime_ms_per_hour = 7200000");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("prepareCliRuntime migrates stale embedded Codex defaults to gpt-5.6 Sol xhigh", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-default-migrate-"));
     const repoRoot = join(root, "repo");

@@ -8254,8 +8254,8 @@ function loadPushPalsConfig(options = {}) {
         maxDispatchPerHour: Math.max(1, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_DISPATCH_PER_HOUR") ?? remoteAutonomyNode.max_dispatch_per_hour, 6)),
         maxDispatchPerHourByType: remoteAutonomyDispatchByType,
         maxDispatchPerHourByComponent: remoteAutonomyDispatchByComponent,
-        maxTokenUsagePerHour: Math.max(0, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_TOKEN_USAGE_PER_HOUR") ?? remoteAutonomyNode.max_token_usage_per_hour, 120000)),
-        maxRuntimeMsPerHour: Math.max(0, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_RUNTIME_MS_PER_HOUR") ?? remoteAutonomyNode.max_runtime_ms_per_hour, 5400000)),
+        maxTokenUsagePerHour: Math.max(0, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_TOKEN_USAGE_PER_HOUR") ?? remoteAutonomyNode.max_token_usage_per_hour, 0)),
+        maxRuntimeMsPerHour: Math.max(0, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_RUNTIME_MS_PER_HOUR") ?? remoteAutonomyNode.max_runtime_ms_per_hour, 0)),
         cooldownFailStreakThreshold: Math.max(1, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_COOLDOWN_FAIL_STREAK_THRESHOLD") ?? remoteAutonomyNode.cooldown_fail_streak_threshold, 2)),
         cooldownMs: Math.max(1000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_COOLDOWN_MS") ?? remoteAutonomyNode.cooldown_ms, 1800000)),
         staleObjectiveTtlMs: Math.max(60000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_STALE_OBJECTIVE_TTL_MS") ?? remoteAutonomyNode.stale_objective_ttl_ms, 2700000)),
@@ -13699,8 +13699,8 @@ class AutonomyStore {
       updatedAt: asString3(row.updated_at) || null
     };
   }
-  updateSafetyState(body) {
-    const now = asIsoNow();
+  updateSafetyState(body, nowIso = asIsoNow()) {
+    const now = nowIso;
     const current = this.readSafetyStateRow();
     let killSwitchEnabled = asBoolean2(current.kill_switch_enabled, false);
     let freezeUntil = asString3(current.freeze_until) || null;
@@ -13740,6 +13740,18 @@ class AutonomyStore {
           freeze_reason = excluded.freeze_reason,
           updated_at = excluded.updated_at`).run(killSwitchEnabled ? 1 : 0, freezeUntil, freezeReason, now);
     return { ok: true, state: this.getSafetyState(now) };
+  }
+  applyAutomaticFreeze(params) {
+    const nowIso = params.nowIso || asIsoNow();
+    const current = this.getSafetyState(nowIso);
+    if (current.killSwitchEnabled || current.isFrozen) {
+      return { applied: false, state: current };
+    }
+    const result = this.updateSafetyState({
+      freezeForMs: params.freezeForMs,
+      freezeReason: params.freezeReason
+    }, nowIso);
+    return { applied: result.ok && result.state.isFrozen, state: result.state };
   }
   safetyBlockReason(nowIso = asIsoNow()) {
     const state = this.getSafetyState(nowIso);
@@ -14077,21 +14089,19 @@ class AutonomyStore {
         details: payload,
         nowIso
       });
-      const safety = this.getSafetyState(nowIso);
-      if (!safety.killSwitchEnabled && !safety.isFrozen) {
-        this.updateSafetyState({
-          freezeForMs: Math.max(60000, Math.floor(asNumber(cfg.autoFreezeDurationMs, 1800000))),
-          freezeReason: "auto_freeze:evaluator_pause"
-        });
-        if (!resourcePause) {
-          this.db.prepare(`INSERT INTO autonomy_evaluator_freeze_evidence (
-                 state_id, evidence_key, frozen_at
-               ) VALUES ('global', ?, ?)
-               ON CONFLICT(state_id) DO UPDATE SET
-                 evidence_key = excluded.evidence_key,
-                 frozen_at = excluded.frozen_at`).run(evaluatorEvidenceKey, nowIso);
-        }
+      if (!resourcePause) {
+        this.db.prepare(`INSERT INTO autonomy_evaluator_freeze_evidence (
+               state_id, evidence_key, frozen_at
+             ) VALUES ('global', ?, ?)
+             ON CONFLICT(state_id) DO UPDATE SET
+               evidence_key = excluded.evidence_key,
+               frozen_at = excluded.frozen_at`).run(evaluatorEvidenceKey, nowIso);
       }
+      this.applyAutomaticFreeze({
+        freezeForMs: Math.max(60000, Math.floor(asNumber(cfg.autoFreezeDurationMs, 1800000))),
+        freezeReason: "auto_freeze:evaluator_pause",
+        nowIso
+      });
       this.resolveOpsAlert("evaluator_constrain", nowIso);
     } else if (recommendation === "constrain" && (hasOutcomeEvidence || hasJobEvidence)) {
       this.recordOpsAlert({
@@ -14108,8 +14118,10 @@ class AutonomyStore {
     }
     if (recommendation !== "pause") {
       const safety = this.getSafetyState(nowIso);
-      if (safety.freezeReason === "auto_freeze:evaluator_pause") {
-        this.updateSafetyState({ clearFreeze: true });
+      const evaluatorFreeze = safety.freezeReason === "auto_freeze:evaluator_pause";
+      const expiredAutomaticFreeze = !safety.isFrozen && Boolean(safety.freezeReason?.startsWith("auto_freeze:"));
+      if (evaluatorFreeze || expiredAutomaticFreeze) {
+        this.updateSafetyState({ clearFreeze: true }, nowIso);
       }
     }
     return {
@@ -16288,11 +16300,12 @@ ${errorText}`.trim();
     const autoFreezeThreshold = Math.max(1, Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeFailStreakThreshold, 3)));
     if (!success && nextFailStreak >= autoFreezeThreshold) {
       const freezeForMs = Math.max(60000, Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeDurationMs, 1800000)));
-      const freezeResult = this.updateSafetyState({
+      const freezeResult = this.applyAutomaticFreeze({
         freezeForMs,
-        freezeReason: `auto_freeze:fail_streak:${patternKey}`
+        freezeReason: `auto_freeze:fail_streak:${patternKey}`,
+        nowIso: now
       });
-      if (freezeResult.ok) {
+      if (freezeResult.applied) {
         this.recordOpsAlert({
           alertType: "auto_freeze_fail_streak",
           severity: "critical",

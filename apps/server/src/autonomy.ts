@@ -1957,12 +1957,15 @@ export class AutonomyStore {
     };
   }
 
-  updateSafetyState(body: Record<string, unknown>): {
+  updateSafetyState(
+    body: Record<string, unknown>,
+    nowIso = asIsoNow(),
+  ): {
     ok: boolean;
     reason?: string;
     state: AutonomySafetyState;
   } {
-    const now = asIsoNow();
+    const now = nowIso;
     const current = this.readSafetyStateRow();
     let killSwitchEnabled = asBoolean(current.kill_switch_enabled, false);
     let freezeUntil = asString(current.freeze_until) || null;
@@ -2013,6 +2016,29 @@ export class AutonomyStore {
       )
       .run(killSwitchEnabled ? 1 : 0, freezeUntil, freezeReason, now);
     return { ok: true, state: this.getSafetyState(now) };
+  }
+
+  private applyAutomaticFreeze(params: {
+    freezeForMs: number;
+    freezeReason: string;
+    nowIso?: string;
+  }): {
+    applied: boolean;
+    state: AutonomySafetyState;
+  } {
+    const nowIso = params.nowIso || asIsoNow();
+    const current = this.getSafetyState(nowIso);
+    if (current.killSwitchEnabled || current.isFrozen) {
+      return { applied: false, state: current };
+    }
+    const result = this.updateSafetyState(
+      {
+        freezeForMs: params.freezeForMs,
+        freezeReason: params.freezeReason,
+      },
+      nowIso,
+    );
+    return { applied: result.ok && result.state.isFrozen, state: result.state };
   }
 
   private safetyBlockReason(nowIso = asIsoNow()): string | null {
@@ -2554,25 +2580,23 @@ export class AutonomyStore {
         details: payload,
         nowIso,
       });
-      const safety = this.getSafetyState(nowIso);
-      if (!safety.killSwitchEnabled && !safety.isFrozen) {
-        this.updateSafetyState({
-          freezeForMs: Math.max(60_000, Math.floor(asNumber(cfg.autoFreezeDurationMs, 1_800_000))),
-          freezeReason: "auto_freeze:evaluator_pause",
-        });
-        if (!resourcePause) {
-          this.db
-            .prepare(
-              `INSERT INTO autonomy_evaluator_freeze_evidence (
-                 state_id, evidence_key, frozen_at
-               ) VALUES ('global', ?, ?)
-               ON CONFLICT(state_id) DO UPDATE SET
-                 evidence_key = excluded.evidence_key,
-                 frozen_at = excluded.frozen_at`,
-            )
-            .run(evaluatorEvidenceKey, nowIso);
-        }
+      if (!resourcePause) {
+        this.db
+          .prepare(
+            `INSERT INTO autonomy_evaluator_freeze_evidence (
+               state_id, evidence_key, frozen_at
+             ) VALUES ('global', ?, ?)
+             ON CONFLICT(state_id) DO UPDATE SET
+               evidence_key = excluded.evidence_key,
+               frozen_at = excluded.frozen_at`,
+          )
+          .run(evaluatorEvidenceKey, nowIso);
       }
+      this.applyAutomaticFreeze({
+        freezeForMs: Math.max(60_000, Math.floor(asNumber(cfg.autoFreezeDurationMs, 1_800_000))),
+        freezeReason: "auto_freeze:evaluator_pause",
+        nowIso,
+      });
       this.resolveOpsAlert("evaluator_constrain", nowIso);
     } else if (recommendation === "constrain" && (hasOutcomeEvidence || hasJobEvidence)) {
       this.recordOpsAlert({
@@ -2592,8 +2616,11 @@ export class AutonomyStore {
     }
     if (recommendation !== "pause") {
       const safety = this.getSafetyState(nowIso);
-      if (safety.freezeReason === "auto_freeze:evaluator_pause") {
-        this.updateSafetyState({ clearFreeze: true });
+      const evaluatorFreeze = safety.freezeReason === "auto_freeze:evaluator_pause";
+      const expiredAutomaticFreeze =
+        !safety.isFrozen && Boolean(safety.freezeReason?.startsWith("auto_freeze:"));
+      if (evaluatorFreeze || expiredAutomaticFreeze) {
+        this.updateSafetyState({ clearFreeze: true }, nowIso);
       }
     }
 
@@ -5972,11 +5999,12 @@ export class AutonomyStore {
         60_000,
         Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeDurationMs, 1_800_000)),
       );
-      const freezeResult = this.updateSafetyState({
+      const freezeResult = this.applyAutomaticFreeze({
         freezeForMs,
         freezeReason: `auto_freeze:fail_streak:${patternKey}`,
+        nowIso: now,
       });
-      if (freezeResult.ok) {
+      if (freezeResult.applied) {
         this.recordOpsAlert({
           alertType: "auto_freeze_fail_streak",
           severity: "critical",

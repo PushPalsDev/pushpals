@@ -1758,6 +1758,18 @@ function migrateLegacyWorkerCodexCommandDefault(
   return sectionBody.replace(pattern, `$1"${PINNED_WORKER_CODEX_COMMAND}"`);
 }
 
+function migrateLegacyAutonomyResourceBudgetDefaults(sectionBody: string): string {
+  return sectionBody
+    .replace(
+      /^(\s*max_token_usage_per_hour\s*=\s*)120000\s*$/m,
+      (_match, prefix: string) => `${prefix}0`,
+    )
+    .replace(
+      /^(\s*max_runtime_ms_per_hour\s*=\s*)5400000\s*$/m,
+      (_match, prefix: string) => `${prefix}0`,
+    );
+}
+
 function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
   if (!existsSync(localTomlPath)) return;
   let original: string;
@@ -1783,6 +1795,11 @@ function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
       migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),
       "bin",
     ),
+  );
+  migrated = migrateEmbeddedRuntimeTomlSection(
+    migrated,
+    "remotebuddy.autonomy",
+    migrateLegacyAutonomyResourceBudgetDefaults,
   );
   if (migrated !== original) {
     writeFileSync(localTomlPath, migrated, "utf8");

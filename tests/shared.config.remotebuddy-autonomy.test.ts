@@ -48,8 +48,9 @@ describe("shared config remotebuddy autonomy parsing", () => {
       expect(cfg.remotebuddy.autonomy.exploreRate).toBe(0.3);
       expect(cfg.remotebuddy.autonomy.staleObjectiveTtlMs).toBe(2_700_000);
       expect(cfg.remotebuddy.autonomy.autoFreezeFailStreakThreshold).toBe(3);
-      expect(cfg.remotebuddy.autonomy.maxTokenUsagePerHour).toBe(120_000);
-      expect(cfg.remotebuddy.autonomy.maxRuntimeMsPerHour).toBe(5_400_000);
+      expect(cfg.remotebuddy.autonomy.autoFreezeDurationMs).toBe(1_800_000);
+      expect(cfg.remotebuddy.autonomy.maxTokenUsagePerHour).toBe(0);
+      expect(cfg.remotebuddy.autonomy.maxRuntimeMsPerHour).toBe(0);
       expect(cfg.remotebuddy.autonomy.evaluatorWindowHours).toBe(24);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentRows).toBe(16);
       expect(cfg.remotebuddy.autonomy.prFeedbackCommentChars).toBe(600);

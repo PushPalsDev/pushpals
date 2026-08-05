@@ -1271,6 +1271,58 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("default hourly autonomy resource budgets remain unlimited under heavy usage", () => {
+    const store = makeStore();
+    const internal = store as unknown as {
+      config: {
+        remotebuddy: {
+          autonomy: {
+            maxTokenUsagePerHour: number;
+            maxRuntimeMsPerHour: number;
+          };
+        };
+      };
+      resourceBudgetSnapshot: () => {
+        token_usage_last_hour: number;
+        runtime_ms_last_hour: number;
+        token_budget_per_hour: number;
+        runtime_budget_ms_per_hour: number;
+        token_budget_exhausted: boolean;
+        runtime_budget_exhausted: boolean;
+      };
+    };
+
+    expect(internal.config.remotebuddy.autonomy.maxTokenUsagePerHour).toBe(0);
+    expect(internal.config.remotebuddy.autonomy.maxRuntimeMsPerHour).toBe(0);
+    expect(
+      store.recordLlmUsage({
+        id: "llm_unlimited_hourly_budget",
+        service: "workerpals",
+        promptTokens: 900_000,
+        completionTokens: 100_000,
+      }).ok,
+    ).toBe(true);
+    expect(
+      store.recordOutcome({
+        objectiveId: "obj_unlimited_hourly_budget",
+        requestId: "req_unlimited_hourly_budget",
+        jobId: "job_unlimited_hourly_budget",
+        patternKey: "pk_unlimited_hourly_budget",
+        success: true,
+        userAction: "applied",
+        latencyMs: 7_200_000,
+      }).ok,
+    ).toBe(true);
+
+    const budget = internal.resourceBudgetSnapshot();
+    expect(budget.token_usage_last_hour).toBe(1_000_000);
+    expect(budget.runtime_ms_last_hour).toBe(7_200_000);
+    expect(budget.token_budget_per_hour).toBe(0);
+    expect(budget.runtime_budget_ms_per_hour).toBe(0);
+    expect(budget.token_budget_exhausted).toBe(false);
+    expect(budget.runtime_budget_exhausted).toBe(false);
+  });
+
   test("evaluateEligibility blocks dispatch when hourly runtime budget is exhausted", () => {
     const store = makeStore();
     const autonomyCfg = (
@@ -2414,6 +2466,94 @@ describe("server AutonomyStore policy gates", () => {
     expect(card.recommendation).toBe("pause");
     expect(store.getSafetyState().isFrozen).toBe(true);
     expect(store.getSafetyState().freezeReason).toBe("auto_freeze:evaluator_pause");
+  });
+
+  test("the default automatic freeze is capped at 30 minutes and is not extended", async () => {
+    const store = makeStore();
+    const startedAtMs = Date.now();
+
+    for (let index = 0; index < 3; index += 1) {
+      expect(
+        store.recordOutcome({
+          objectiveId: `obj_non_extending_freeze_${index}`,
+          requestId: `req_non_extending_freeze_${index}`,
+          jobId: `job_non_extending_freeze_${index}`,
+          patternKey: "pk_non_extending_freeze",
+          success: false,
+          userAction: "failed",
+          regressionFlag: true,
+        }).ok,
+      ).toBe(true);
+    }
+    const firstFreeze = store.getSafetyState();
+    expect(firstFreeze.isFrozen).toBe(true);
+    expect(firstFreeze.freezeReason).toBe("auto_freeze:fail_streak:pk_non_extending_freeze");
+    expect(firstFreeze.freezeUntil).not.toBeNull();
+    const firstFreezeDurationMs = Date.parse(String(firstFreeze.freezeUntil)) - startedAtMs;
+    expect(firstFreezeDurationMs).toBeGreaterThan(1_799_000);
+    expect(firstFreezeDurationMs).toBeLessThanOrEqual(1_800_500);
+
+    await Bun.sleep(10);
+    expect(
+      store.recordOutcome({
+        objectiveId: "obj_non_extending_freeze_late",
+        requestId: "req_non_extending_freeze_late",
+        jobId: "job_non_extending_freeze_late",
+        patternKey: "pk_non_extending_freeze",
+        success: false,
+        userAction: "failed",
+        regressionFlag: true,
+      }).ok,
+    ).toBe(true);
+
+    const unchangedFreeze = store.getSafetyState();
+    expect(unchangedFreeze.isFrozen).toBe(true);
+    expect(unchangedFreeze.freezeUntil).toBe(firstFreeze.freezeUntil);
+    expect(unchangedFreeze.freezeReason).toBe(firstFreeze.freezeReason);
+  });
+
+  test("evaluator consumes pause evidence while a fail-streak freeze is active", () => {
+    const store = makeStore();
+    const internal = store as unknown as {
+      config: {
+        remotebuddy: {
+          autonomy: {
+            autoFreezeDurationMs: number;
+          };
+        };
+      };
+      runEvaluator: (nowIso?: string) => AutonomyEvaluatorScorecard;
+    };
+    internal.config.remotebuddy.autonomy.autoFreezeDurationMs = 60_000;
+
+    for (let index = 0; index < 6; index += 1) {
+      expect(
+        store.recordOutcome({
+          objectiveId: `obj_overlapping_freeze_${index}`,
+          requestId: `req_overlapping_freeze_${index}`,
+          jobId: `job_overlapping_freeze_${index}`,
+          patternKey: index < 3 ? "pk_overlapping_freeze" : `pk_overlapping_freeze_${index}`,
+          success: false,
+          userAction: "failed",
+          regressionFlag: true,
+        }).ok,
+      ).toBe(true);
+    }
+
+    const freeze = store.getSafetyState();
+    expect(freeze.isFrozen).toBe(true);
+    expect(freeze.freezeReason).toBe("auto_freeze:fail_streak:pk_overlapping_freeze");
+    const freezeUntilMs = Date.parse(String(freeze.freezeUntil));
+
+    const duringFreeze = internal.runEvaluator(new Date(freezeUntilMs - 1_000).toISOString());
+    expect(duringFreeze.recommendation).toBe("pause");
+    expect(store.getSafetyState().freezeUntil).toBe(freeze.freezeUntil);
+
+    const afterExpiry = new Date(freezeUntilMs + 1_000).toISOString();
+    const unchangedEvidence = internal.runEvaluator(afterExpiry);
+    expect(unchangedEvidence.recommendation).toBe("constrain");
+    expect(store.getSafetyState(afterExpiry).isFrozen).toBe(false);
+    expect(store.getSafetyState(afterExpiry).freezeReason).toBeNull();
   });
 
   test("does not re-arm an expired evaluator freeze without new terminal evidence", () => {

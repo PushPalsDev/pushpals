@@ -91,8 +91,9 @@ max_concurrent_objectives = 2
 max_dispatch_per_hour = 6
 max_dispatch_per_hour_by_type = { flaky_test = 4, lint_fix = 3, type_fix = 3, small_refactor = 2, feature_small = 2, feature_medium = 1, feature_large = 0, docs = 1, dep_bump = 0 }
 max_dispatch_per_hour_by_component = { "apps/server" = 3, "apps/remotebuddy" = 2, "apps/workerpals" = 2, "apps/client" = 2, "packages/protocol" = 1, "packages/shared" = 2, "tests/integration" = 2, "tests/unit" = 2 }
-max_token_usage_per_hour = 120000
-max_runtime_ms_per_hour = 5400000
+# Zero disables the rolling hourly resource cap so autonomy keeps progressing by default.
+max_token_usage_per_hour = 0
+max_runtime_ms_per_hour = 0
 cooldown_fail_streak_threshold = 2
 cooldown_ms = 1800000
 stale_objective_ttl_ms = 2700000
