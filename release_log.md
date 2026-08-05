@@ -2,27 +2,31 @@
 
 ## Release Metadata
 
-- version: `v1.2.25`
-- start_commit: `6ea9574457bebaa34c00c797c7ede938fcc7e1fa`
-- end_commit: `d1040716938a01b38ea5173043b739ab0a69bb5b`
+- version: `v1.2.26`
+- start_commit: `d63bce459f4e3a00d991331d6a36db016e4708d9`
+- end_commit: `c3651697f4e234f4e6300ac308e45895d8d64163`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Keep autonomy continuously available by disabling the rolling hourly token and cumulative-runtime caps by default; explicit positive limits remain supported and enforced.
-- Keep the default automatic safety freeze at 30 minutes without extending an active freeze when additional in-flight failures arrive.
-- Consume evaluator pause evidence while another automatic freeze is active, preventing unchanged failures from chaining one 30-minute freeze directly into another.
-- Migrate the exact previously shipped embedded hourly resource defaults to unlimited while preserving custom user-configured limits.
-- Regenerate the packaged CLI runtime so source, sandbox, and embedded service defaults remain aligned.
+- Reuse frozen Linux-native dependency snapshots across Docker WorkerPal worktrees with same-filesystem hardlink projection and deterministic invalidation. A disposable SectorCommand benchmark reduced warm dependency preparation from 14.2 seconds to 2.44 seconds.
+- Defer Docker-dependent aggregate validation from socketless workers to SourceControlManager's trusted host worktree instead of spending worker time on a command that cannot succeed there.
+- Cache unchanged trusted-host dependency installs and Playwright browser preparation while preserving the actual trusted validation commands on every candidate.
+- Record worker dependency preparation, trusted install, trusted validation, and cache-hit telemetry so production job time can be attributed by phase.
+- Shorten review-fix stable-patch rechecks from 120 seconds to 30 seconds, reset stability when file content changes, and never finalize while a command remains active.
+- Exclude untracked local configuration from packaged runtime synchronization and reject any `local.toml` that reaches the npm payload.
+- Make the managed-descendant shutdown regression deterministic by having its parent fixture reap the signaled child before exiting.
 
 ## Validation
 
-- Clean release-playbook root suite in a resource-capped Docker container on Bun 1.3.14: 1,102 passed, 7 intentional platform skips, 0 failed, 4,698 assertions across 127 files.
+- Clean release-playbook root suite in a resource-capped Docker container on Bun 1.3.14: 1,107 passed, 7 intentional platform skips, 0 failed, 4,726 assertions across 127 files.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 227 package files, no external toolchain files.
-- Server and shared-package TypeScript checks passed.
-- Focused autonomy, embedded-config migration, and freeze-liveness regression suites passed.
-- Rebuilt packaged runtime and monitor assets include the unlimited resource defaults, migration, and non-chaining freeze behavior.
+- Server, SourceControlManager, and WorkerPal TypeScript checks passed.
+- All 105 OpenAI Codex executor runtime tests passed.
+- Focused dependency projection, trusted validation, validation handoff, package payload, telemetry, worktree-boundary, and CLI cleanup suites passed.
+- Rebuilt packaged runtime source mirrors are byte-identical to their source files.
+- Disposable SectorCommand dependency preparation benchmark: 14.192 seconds cold, 2.442 seconds warm, 5.8x faster.
 - `git diff --check` passed.
 
 ## Install
@@ -49,6 +53,10 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
+- End-to-end job duration still depends on task scope, model latency, repository validation, and publication work; the next live SectorCommand soak should confirm whether the steady-state average reaches the ten-minute target.
+- The first dependency preparation for a new Bun version, lockfile, platform, or affected workspace can still require registry access; later jobs reuse the validated snapshot.
+- Docker Desktop exposes Windows bind-mounted files as executable inside Linux containers. The package mode guard must run against a Linux-native checkout or the release workflow rather than directly against the Windows bind mount.
+- Trusted-host install caching skips only an unchanged frozen install; trusted validation commands still run for every publication candidate.
 - Explicit positive `max_token_usage_per_hour` and `max_runtime_ms_per_hour` values remain enforced as opt-in safety caps; set either value to `0` for unlimited usage.
 - WorkerPal sandboxes intentionally do not receive the host Docker socket. Docker-dependent gates now resume through SourceControlManager's trusted host worktree, but that host still needs Docker installed and running; otherwise the candidate remains retained and unpublished with the host validation failure attached.
 - The first Docker-backed WorkerPal startup after upgrading rebuilds the sandbox image and downloads the Node, Python-agent, Playwright, and Chromium layers; subsequent starts reuse Docker's cached layers.
