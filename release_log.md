@@ -2,26 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.2.24`
-- start_commit: `8f0f41618e019dcc348f86ae87f809d0bdf4ceba`
-- end_commit: `a85dafff80da30fd47662c8e57195706486cc576`
+- version: `v1.2.25`
+- start_commit: `6ea9574457bebaa34c00c797c7ede938fcc7e1fa`
+- end_commit: `d1040716938a01b38ea5173043b739ab0a69bb5b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Require Bun 1.3.14 or newer at the npm launcher, CLI runtime, and RemoteBuddy startup boundary so known-incompatible runtimes are rejected before embedded services can enter a native crash loop.
-- Circuit-break repeated identical native-runtime failures after two occurrences while leaving healthy embedded services available, and report corrected byte-based RSS plus structured crash and recovery telemetry.
-- Prepare frozen Bun dependencies in disposable SourceControlManager validation worktrees and reject shell-control validation payloads before execution.
-- Require the integration harness to observe both SourceControlManager processing and the parent job's terminal `completed` state, preventing false-positive acceptance when publication fails.
-- Extend installed-CLI release smoke coverage with a Windows soak interval long enough to cross the previously observed native-crash window.
+- Keep autonomy continuously available by disabling the rolling hourly token and cumulative-runtime caps by default; explicit positive limits remain supported and enforced.
+- Keep the default automatic safety freeze at 30 minutes without extending an active freeze when additional in-flight failures arrive.
+- Consume evaluator pause evidence while another automatic freeze is active, preventing unchanged failures from chaining one 30-minute freeze directly into another.
+- Migrate the exact previously shipped embedded hourly resource defaults to unlimited while preserving custom user-configured limits.
+- Regenerate the packaged CLI runtime so source, sandbox, and embedded service defaults remain aligned.
 
 ## Validation
 
-- Release-playbook root suite in a resource-capped Docker container on Bun 1.3.14: 1,097 passed, 7 intentional platform skips, 0 failed, 4,652 assertions across 127 files.
-- Three consecutive isolated SectorCommand jobs completed end-to-end through WorkerPal validation, Playwright, deploy dry-run, critic review, SourceControlManager publication, and terminal parent-job completion.
+- Clean release-playbook root suite in a resource-capped Docker container on Bun 1.3.14: 1,102 passed, 7 intentional platform skips, 0 failed, 4,698 assertions across 127 files.
 - `bun run cli:bundle`
-- Normalized `bun run cli:verify-package-payload`: 229 package files, no external toolchain files.
-- Rebuilt packaged runtime and monitor assets include the Bun compatibility guard, crash circuit breaker, validation hardening, and release-soak changes.
+- `bun run cli:verify-package-payload`: 227 package files, no external toolchain files.
+- Server and shared-package TypeScript checks passed.
+- Focused autonomy, embedded-config migration, and freeze-liveness regression suites passed.
+- Rebuilt packaged runtime and monitor assets include the unlimited resource defaults, migration, and non-chaining freeze behavior.
 - `git diff --check` passed.
 
 ## Install
@@ -48,6 +49,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
+- Explicit positive `max_token_usage_per_hour` and `max_runtime_ms_per_hour` values remain enforced as opt-in safety caps; set either value to `0` for unlimited usage.
 - WorkerPal sandboxes intentionally do not receive the host Docker socket. Docker-dependent gates now resume through SourceControlManager's trusted host worktree, but that host still needs Docker installed and running; otherwise the candidate remains retained and unpublished with the host validation failure attached.
 - The first Docker-backed WorkerPal startup after upgrading rebuilds the sandbox image and downloads the Node, Python-agent, Playwright, and Chromium layers; subsequent starts reuse Docker's cached layers.
 - `execution_platform = "windows"` selects direct host WorkerPal execution so validation inherits the Windows host environment; it does not convert Docker Desktop Linux containers into Windows containers.
