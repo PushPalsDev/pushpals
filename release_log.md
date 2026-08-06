@@ -4,8 +4,8 @@
 
 - version: `v1.2.27`
 - start_commit: `212e4483c38cbcd30c813187b76175a3763a1966`
-- end_commit: `a6e18d117890845b94c3c974c635da1ed831fc29`
-- commits_in_range: `1`
+- end_commit: `33fc879c7c33dc08e345a11c7d6204856786a4ea`
+- commits_in_range: `2`
 
 ## Highlights
 
@@ -15,6 +15,7 @@
 - Prevent environment-only validation deferrals from marking the repository baseline red or dispatching repeated `Restore required validation` autonomy jobs. RemoteBuddy also rejects stale environment incidents from older server snapshots.
 - Make `workerpals_main.ts` import-safe so tests and tooling can load its helpers without starting a WorkerPal daemon or polling a control plane.
 - Ship synchronized server, RemoteBuddy, and WorkerPal runtime bundles so installed CLI users receive every part of the recovery contract together.
+- Allow an authenticated manual dispatch of the release workflow when GitHub accepts a release tag but drops its automatic tag-push event.
 
 ## Validation
 
