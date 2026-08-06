@@ -2,31 +2,30 @@
 
 ## Release Metadata
 
-- version: `v1.2.26`
-- start_commit: `d63bce459f4e3a00d991331d6a36db016e4708d9`
-- end_commit: `c3651697f4e234f4e6300ac308e45895d8d64163`
+- version: `v1.2.27`
+- start_commit: `212e4483c38cbcd30c813187b76175a3763a1966`
+- end_commit: `a6e18d117890845b94c3c974c635da1ed831fc29`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Reuse frozen Linux-native dependency snapshots across Docker WorkerPal worktrees with same-filesystem hardlink projection and deterministic invalidation. A disposable SectorCommand benchmark reduced warm dependency preparation from 14.2 seconds to 2.44 seconds.
-- Defer Docker-dependent aggregate validation from socketless workers to SourceControlManager's trusted host worktree instead of spending worker time on a command that cannot succeed there.
-- Cache unchanged trusted-host dependency installs and Playwright browser preparation while preserving the actual trusted validation commands on every candidate.
-- Record worker dependency preparation, trusted install, trusted validation, and cache-hit telemetry so production job time can be attributed by phase.
-- Shorten review-fix stable-patch rechecks from 120 seconds to 30 seconds, reset stability when file content changes, and never finalize while a command remains active.
-- Exclude untracked local configuration from packaged runtime synchronization and reject any `local.toml` that reaches the npm payload.
-- Make the managed-descendant shutdown regression deterministic by having its parent fixture reap the signaled child before exiting.
+- Continue host-owned merge-conflict rebases when Git rerere auto-stages every path in a later conflicted commit. The valid active-rebase/zero-unmerged-path state is no longer treated as a terminal failure.
+- Preserve the original host-side SCM or commit-finalization error instead of masking it with a later trusted-validation handoff message.
+- Complete socketless-worker validation deferrals as successful no-change outcomes when there is no candidate to publish, while still sending real candidate commits to trusted-host validation.
+- Prevent environment-only validation deferrals from marking the repository baseline red or dispatching repeated `Restore required validation` autonomy jobs. RemoteBuddy also rejects stale environment incidents from older server snapshots.
+- Make `workerpals_main.ts` import-safe so tests and tooling can load its helpers without starting a WorkerPal daemon or polling a control plane.
+- Ship synchronized server, RemoteBuddy, and WorkerPal runtime bundles so installed CLI users receive every part of the recovery contract together.
 
 ## Validation
 
-- Clean release-playbook root suite in a resource-capped Docker container on Bun 1.3.14: 1,107 passed, 7 intentional platform skips, 0 failed, 4,726 assertions across 127 files.
+- Clean release-playbook root suite in a resource-capped Docker container on Bun 1.3.14 with a bind-mount allowance: 1,112 passed, 7 intentional platform skips, 0 failed, 4,758 assertions across 127 files.
 - `bun run cli:bundle`
 - `bun run cli:verify-package-payload`: 227 package files, no external toolchain files.
-- Server, SourceControlManager, and WorkerPal TypeScript checks passed.
-- All 105 OpenAI Codex executor runtime tests passed.
-- Focused dependency projection, trusted validation, validation handoff, package payload, telemetry, worktree-boundary, and CLI cleanup suites passed.
+- Server, RemoteBuddy, and WorkerPal TypeScript checks passed.
+- All 106 focused merge-conflict, validation-handoff, autonomy-incident, runtime-parity, and import-safety tests passed.
+- The new rerere integration fixture trains two recorded conflict resolutions, replays the same rebase with auto-staging, and verifies clean completion.
 - Rebuilt packaged runtime source mirrors are byte-identical to their source files.
-- Disposable SectorCommand dependency preparation benchmark: 14.192 seconds cold, 2.442 seconds warm, 5.8x faster.
+- The Docker bind-mounted task.execute harness passed both cases with a 30-second test allowance; each completed in about 7 seconds.
 - `git diff --check` passed.
 
 ## Install
