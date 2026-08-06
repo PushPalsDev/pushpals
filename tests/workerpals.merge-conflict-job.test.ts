@@ -609,6 +609,87 @@ describe("workerpals merge-conflict sandbox", () => {
   );
 
   runMergeConflictTest(
+    "resumePreparedMergeConflictRebase continues when rerere auto-stages a later conflict",
+    async () => {
+      const fixture = await createConflictFixture({
+        branchCommitContents: [
+          "export const conflict = 'branch-one';\n",
+          "export const conflict = 'branch-two';\n",
+        ],
+      });
+      try {
+        const training = await prepareFixtureHostWorktree(
+          fixture,
+          "job-merge-conflict-rerere-training",
+        );
+        writeFileSync(
+          join(training.repoPath, fixture.conflictFile),
+          "export const conflict = 'recorded-one';\n",
+          "utf8",
+        );
+        const first = await resumePreparedMergeConflictRebase(
+          training.repoPath,
+          "task.execute",
+          fixture.params,
+        );
+        expect(first.ok).toBe(true);
+        if (!first.ok) return;
+        expect(first.sequencer).toBe("rebase");
+
+        writeFileSync(
+          join(training.repoPath, fixture.conflictFile),
+          "export const conflict = 'recorded-two';\n",
+          "utf8",
+        );
+        const trained = await resumePreparedMergeConflictRebase(
+          training.repoPath,
+          "task.execute",
+          fixture.params,
+        );
+        expect(trained.ok).toBe(true);
+        if (!trained.ok) return;
+        expect(trained.sequencer).toBe(null);
+        await mustGit(
+          fixture.sourceRepo,
+          ["worktree", "remove", "--force", training.repoPath],
+          "remove rerere training worktree",
+        );
+
+        const replay = await prepareFixtureHostWorktree(
+          fixture,
+          "job-merge-conflict-rerere-replay",
+        );
+        const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
+        const resumed = await resumePreparedMergeConflictRebase(
+          replay.repoPath,
+          "task.execute",
+          fixture.params,
+          (stream, line) => forwardedLogs.push({ stream, line }),
+        );
+
+        expect(resumed.ok).toBe(true);
+        if (!resumed.ok) return;
+        expect(resumed.sequencer).toBe(null);
+        expect(
+          forwardedLogs.some((entry) =>
+            entry.line.includes("no unmerged paths after rerere auto-staging"),
+          ),
+        ).toBe(true);
+        expect(
+          await mustGit(
+            replay.repoPath,
+            ["status", "--porcelain"],
+            "inspect rerere replay worktree",
+          ),
+        ).toBe("");
+      } finally {
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  runMergeConflictTest(
     "executeJob reruns the resolver when conflict markers remain after the first pass",
     async () => {
       const fixture = await createConflictFixture();

@@ -12869,6 +12869,15 @@ function parseJobPayloadSignalSummary(raw) {
 function isRequiredValidationFailureSignal(text) {
   return /\b(ValidationGate:\s*Required|required validation)\b/i.test(text);
 }
+function isNonRepairableValidationEnvironmentFailure(failureClass, stdoutTail, stderrTail) {
+  const normalizedClass = asString3(failureClass).trim().toLowerCase();
+  if (normalizedClass === "environment" || normalizedClass === "trusted_validation_required") {
+    return true;
+  }
+  const text = `${asString3(stdoutTail)}
+${asString3(stderrTail)}`.toLowerCase();
+  return text.includes("trusted-environment validation deferred before execution") || text.includes("worker sandbox intentionally has no docker socket") && text.includes("run this command on the trusted host");
+}
 function isWorkerQualityTrajectoryFailureSignal(text) {
   return /\bScopeGate\b/i.test(text) || /\bno relevant test file modified\b/i.test(text) || /\brollout coach could not recover publishable progress\b/i.test(text) || /\b(no|without) publishable progress\b/i.test(text) || /\bartifact_only_no_publishable_patch\b/i.test(text);
 }
@@ -14544,6 +14553,9 @@ ${errorText}`.trim();
       }
       if (!failedJobStatuses.has(asString3(row.jobStatus)))
         continue;
+      if (isNonRepairableValidationEnvironmentFailure(row.failureClass, row.stdoutTail, row.stderrTail)) {
+        continue;
+      }
       const jobId = asString3(row.jobId);
       if (!jobId)
         continue;

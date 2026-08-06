@@ -859,6 +859,23 @@ function isRequiredValidationFailureSignal(text: string): boolean {
   return /\b(ValidationGate:\s*Required|required validation)\b/i.test(text);
 }
 
+function isNonRepairableValidationEnvironmentFailure(
+  failureClass: string | null,
+  stdoutTail: string | null,
+  stderrTail: string | null,
+): boolean {
+  const normalizedClass = asString(failureClass).trim().toLowerCase();
+  if (normalizedClass === "environment" || normalizedClass === "trusted_validation_required") {
+    return true;
+  }
+  const text = `${asString(stdoutTail)}\n${asString(stderrTail)}`.toLowerCase();
+  return (
+    text.includes("trusted-environment validation deferred before execution") ||
+    (text.includes("worker sandbox intentionally has no docker socket") &&
+      text.includes("run this command on the trusted host"))
+  );
+}
+
 function isWorkerQualityTrajectoryFailureSignal(text: string): boolean {
   return (
     /\bScopeGate\b/i.test(text) ||
@@ -3229,6 +3246,18 @@ export class AutonomyStore {
         continue;
       }
       if (!failedJobStatuses.has(asString(row.jobStatus))) continue;
+      // Environment deferrals are publication handoffs, not evidence that the
+      // repository baseline is red. Scheduling code-repair jobs for a
+      // deliberately socketless worker creates an endless no-change loop.
+      if (
+        isNonRepairableValidationEnvironmentFailure(
+          row.failureClass,
+          row.stdoutTail,
+          row.stderrTail,
+        )
+      ) {
+        continue;
+      }
       const jobId = asString(row.jobId);
       if (!jobId) continue;
       group.failureCount += 1;

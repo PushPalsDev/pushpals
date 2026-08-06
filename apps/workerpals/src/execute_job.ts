@@ -8111,6 +8111,17 @@ export async function resumePreparedMergeConflictRebase(
                 advancedToNextConflict: true,
               };
             }
+
+            // Git rerere with rerere.autoupdate=true can resolve and stage every
+            // path in the next conflicted commit while `git rebase --continue`
+            // still exits non-zero to report that it stopped. In that state the
+            // rebase is healthy and ready for another non-interactive continue;
+            // treating it as fatal strands an otherwise publishable repair.
+            onLog?.(
+              "stdout",
+              `[MergeConflict] Rebase continuation stopped with no unmerged paths after rerere auto-staging; continuing on the host (pass ${pass}/${maxContinuationPasses}).`,
+            );
+            continue;
           }
         }
         return {

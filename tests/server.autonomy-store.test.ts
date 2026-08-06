@@ -227,6 +227,68 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("createSnapshot never turns trusted-environment deferrals into validation repair incidents", () => {
+    const { store, dbPath } = makePersistentStore(
+      "pushpals-autonomy-validation-environment-deferral-",
+    );
+    const jobQueue = new JobQueue(dbPath);
+
+    try {
+      for (let i = 0; i < 3; i++) {
+        const enqueued = jobQueue.enqueue({
+          taskId: `task-validation-environment-${i + 1}`,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: { instruction: "Run required validation." },
+        });
+        expect(enqueued.ok).toBe(true);
+        const claimed = jobQueue.claim(`worker-validation-environment-${i + 1}`);
+        const jobId = String(claimed.job?.id ?? "");
+        expect(jobId.length).toBeGreaterThan(0);
+        expect(
+          jobQueue.fail(jobId, {
+            message: "Trusted validation was deferred",
+            diagnostics: {
+              terminal: {
+                failureClass: "trusted_validation_required",
+                terminalStage: "trusted_environment_validation",
+                executorBackend: "openai_codex",
+                summary: "Candidate requires trusted-environment validation",
+              },
+              validationRuns: [
+                {
+                  attempt: 1,
+                  command: "bun run validate",
+                  exitCode: 1,
+                  durationMs: 0,
+                  passed: false,
+                  failureClass: "environment",
+                  stderrTail:
+                    "Trusted-environment validation deferred before execution because the worker sandbox intentionally has no Docker socket. Run this command on the trusted host.",
+                },
+              ],
+            },
+          }).ok,
+        ).toBe(true);
+      }
+
+      const snapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_validation_environment_deferral",
+      });
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(false);
+      expect(snapshot.validation_incident).toBeNull();
+      expect(
+        snapshot.top_signals.some((signal) => signal.signal_id === "sig_validation_incident"),
+      ).toBe(false);
+      expect(snapshot.state_traits.some((trait) => trait.trait_id === "repo_validation_red")).toBe(
+        false,
+      );
+    } finally {
+      jobQueue.close();
+    }
+  });
+
   test("createSnapshot keeps scope-gate worker failures as queue health signals", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-scope-gate-signal-");
     const jobQueue = new JobQueue(dbPath);

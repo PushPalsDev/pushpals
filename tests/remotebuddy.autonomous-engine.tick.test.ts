@@ -700,6 +700,62 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(objective.expected_validation).toEqual(["bun run web:e2e", "bun test"]);
   });
 
+  test("validation repair ignores trusted-environment incidents from older server snapshots", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-validation-environment-"));
+    tempDirs.push(root);
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_validation_environment",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        async generate() {
+          throw new Error("LLM should not run");
+        },
+      } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const snapshot = {
+      ...makeSnapshot(),
+      repo_health_flags: {
+        ...makeSnapshot().repo_health_flags,
+        required_validation_red: true,
+      },
+      validation_incident: {
+        active: true,
+        incident_id: "valid_inc_environment",
+        command: "bun run validate",
+        signal_type: "test_failure",
+        failure_class: "environment",
+        failure_count: 4,
+        total_runs: 4,
+        failed_job_ids: ["job_a", "job_b", "job_c", "job_d"],
+        last_failed_job_id: "job_d",
+        first_failed_at: "2026-08-06T01:00:00.000Z",
+        last_failed_at: "2026-08-06T02:00:00.000Z",
+        digest: "environment_digest",
+        sample_error:
+          "Trusted-environment validation deferred before execution because the worker sandbox intentionally has no Docker socket. Run this command on the trusted host.",
+        required_commands: ["bun run validate"],
+        target_path_hints: ["package.json"],
+      },
+    };
+
+    const outcome = await (engine as any).dispatchValidationIncidentRepair({
+      runId: "run_validation_environment",
+      snapshot,
+      repoTargets: [],
+      visionSectionRefs: ["1"],
+    });
+
+    expect(outcome).toEqual({
+      handled: false,
+      outcome: "skipped",
+      detail: "no_validation_incident",
+    });
+  });
+
   test("tick records blocked objective with question when candidate requires user input", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();

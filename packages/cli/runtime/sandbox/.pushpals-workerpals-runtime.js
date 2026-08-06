@@ -9576,6 +9576,8 @@ async function resumePreparedMergeConflictRebase(repo, kind, params, onLog) {
                 advancedToNextConflict: true
               };
             }
+            onLog?.("stdout", `[MergeConflict] Rebase continuation stopped with no unmerged paths after rerere auto-staging; continuing on the host (pass ${pass}/${maxContinuationPasses}).`);
+            continue;
           }
         }
         return {
@@ -14642,13 +14644,24 @@ function holdCommitForTrustedValidation(result, commit) {
   if (!result.validationBlocked) {
     return { result, completionCommit: commit };
   }
+  if (!result.ok) {
+    return { result, completionCommit: null };
+  }
   if (!commit || commit.sha === "no-changes") {
+    const detail = [
+      result.stderr,
+      result.validationBlocked.detail,
+      "Trusted-environment validation was intentionally deferred, but the worktree contains no candidate changes to publish."
+    ].filter(Boolean).join(`
+`);
     return {
       result: {
         ...result,
-        ok: false,
-        summary: `${result.validationBlocked.summary}; no publishable candidate commit was produced`,
-        exitCode: 4
+        ok: true,
+        summary: "Trusted-environment validation deferred; no candidate changes require publication",
+        stderr: detail,
+        exitCode: 0,
+        validationBlocked: undefined
       },
       completionCommit: null
     };
@@ -15872,7 +15885,9 @@ async function main() {
     process.exit(1);
   });
 }
-main();
+if (import.meta.main) {
+  main();
+}
 export {
   workerRecycleExitCodeForResult,
   workerJobResultFromDocker,

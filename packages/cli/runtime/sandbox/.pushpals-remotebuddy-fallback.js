@@ -5333,6 +5333,11 @@ function activeValidationIncident(snapshot) {
   const command = asString2(incident.command);
   if (!command)
     return null;
+  const failureClass = asString2(incident.failure_class).trim().toLowerCase();
+  const sampleError = asString2(incident.sample_error).toLowerCase();
+  if (failureClass === "environment" || failureClass === "trusted_validation_required" || sampleError.includes("trusted-environment validation deferred before execution") || sampleError.includes("worker sandbox intentionally has no docker socket") && sampleError.includes("run this command on the trusted host")) {
+    return null;
+  }
   return incident;
 }
 function validationRepairTriggerType(incident) {

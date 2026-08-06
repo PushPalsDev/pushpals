@@ -838,13 +838,31 @@ export function holdCommitForTrustedValidation(
   if (!result.validationBlocked) {
     return { result, completionCommit: commit };
   }
+
+  // Do not let the trusted-validation wrapper hide an earlier host-side SCM
+  // or commit-finalization failure. The validation metadata belongs to the
+  // candidate execution, but a failed result has no candidate to hand off.
+  if (!result.ok) {
+    return { result, completionCommit: null };
+  }
+
   if (!commit || commit.sha === "no-changes") {
+    const detail = [
+      result.stderr,
+      result.validationBlocked.detail,
+      "Trusted-environment validation was intentionally deferred, but the worktree contains no candidate changes to publish.",
+    ]
+      .filter(Boolean)
+      .join("\n");
     return {
       result: {
         ...result,
-        ok: false,
-        summary: `${result.validationBlocked.summary}; no publishable candidate commit was produced`,
-        exitCode: 4,
+        ok: true,
+        summary:
+          "Trusted-environment validation deferred; no candidate changes require publication",
+        stderr: detail,
+        exitCode: 0,
+        validationBlocked: undefined,
       },
       completionCommit: null,
     };
@@ -2541,4 +2559,6 @@ async function main(): Promise<void> {
   });
 }
 
-main();
+if (import.meta.main) {
+  main();
+}

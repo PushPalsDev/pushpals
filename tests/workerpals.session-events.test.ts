@@ -13,6 +13,37 @@ import {
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
+  test("importing workerpals_main has no daemon startup side effects", async () => {
+    const proc = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        "await import('./apps/workerpals/src/workerpals_main.ts'); console.log('workerpals-import-ok');",
+      ],
+      {
+        cwd: process.cwd(),
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill();
+    }, 3_000);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    clearTimeout(timer);
+
+    expect(timedOut).toBe(false);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("workerpals-import-ok");
+    expect(`${stdout}\n${stderr}`).not.toContain("PushPals WorkerPals Daemon");
+  });
+
   test("preserves Docker structured diagnostics and usage through the host boundary", () => {
     const result = workerJobResultFromDocker({
       ok: false,
@@ -121,7 +152,7 @@ describe("workerpals session event emission", () => {
     expect(buildTrustedValidationCompletionPayload(undefined)).toEqual({});
   });
 
-  test("fails an environment-blocked job that produced no candidate commit", () => {
+  test("completes an environment-deferred no-change job without publication", () => {
     const held = holdCommitForTrustedValidation(
       {
         ok: true,
@@ -137,9 +168,34 @@ describe("workerpals session event emission", () => {
     );
 
     expect(held.completionCommit).toBeNull();
-    expect(held.result.ok).toBe(false);
+    expect(held.result.ok).toBe(true);
     expect(held.result.publishBlocked).toBeUndefined();
-    expect(held.result.summary).toContain("no publishable candidate commit");
+    expect(held.result.validationBlocked).toBeUndefined();
+    expect(held.result.summary).toContain("no candidate changes require publication");
+    expect(inferWorkerTerminalFailureClass(held.result)).toBe("success");
+  });
+
+  test("does not mask an earlier host-side finalization failure with trusted validation", () => {
+    const held = holdCommitForTrustedValidation(
+      {
+        ok: false,
+        summary: "Host-side merge-conflict rebase continuation failed",
+        stderr: "Failed to continue prepared merge-conflict rebase",
+        exitCode: 4,
+        validationBlocked: {
+          category: "environment",
+          summary: "Trusted validation required",
+          detail: "Docker is unavailable.",
+          commands: ["bun run validate"],
+        },
+      },
+      null,
+    );
+
+    expect(held.completionCommit).toBeNull();
+    expect(held.result.ok).toBe(false);
+    expect(held.result.summary).toBe("Host-side merge-conflict rebase continuation failed");
+    expect(held.result.stderr).toContain("Failed to continue prepared merge-conflict rebase");
   });
 
   test("keeps direct completion events even when server status persistence succeeds", () => {
