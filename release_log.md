@@ -2,31 +2,29 @@
 
 ## Release Metadata
 
-- version: `v1.2.27`
-- start_commit: `212e4483c38cbcd30c813187b76175a3763a1966`
-- end_commit: `33fc879c7c33dc08e345a11c7d6204856786a4ea`
-- commits_in_range: `2`
+- version: `v1.2.28`
+- start_commit: `98d587b17f955ea6af5cd8f0539d2b746c61d2e8`
+- end_commit: `8d1b9882513932fe37c58190e949349aed3e5bb4`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Continue host-owned merge-conflict rebases when Git rerere auto-stages every path in a later conflicted commit. The valid active-rebase/zero-unmerged-path state is no longer treated as a terminal failure.
-- Preserve the original host-side SCM or commit-finalization error instead of masking it with a later trusted-validation handoff message.
-- Complete socketless-worker validation deferrals as successful no-change outcomes when there is no candidate to publish, while still sending real candidate commits to trusted-host validation.
-- Prevent environment-only validation deferrals from marking the repository baseline red or dispatching repeated `Restore required validation` autonomy jobs. RemoteBuddy also rejects stale environment incidents from older server snapshots.
-- Make `workerpals_main.ts` import-safe so tests and tooling can load its helpers without starting a WorkerPal daemon or polling a control plane.
-- Ship synchronized server, RemoteBuddy, and WorkerPal runtime bundles so installed CLI users receive every part of the recovery contract together.
-- Allow an authenticated manual dispatch of the release workflow when GitHub accepts a release tag but drops its automatic tag-push event.
+- Persist trusted-host validation evidence with canonical candidate and baseline SHAs, stable failure fingerprints, failed test names, affected paths, and bounded command output.
+- Circuit-break repeated trusted-host publication failures after two distinct jobs reproduce the same root cause, then dispatch one exact repair instead of continuing unrelated autonomy work.
+- Resolve a trusted-host incident only after a later trusted-host pass for the same failure; sandbox-only success can no longer hide a host publication blocker.
+- Reject unrequested trusted-validation callback commands and derive the candidate SHA from server-owned completion state before host execution.
+- Preserve every existing autonomy safety boundary: required repairs can bypass stale cooldown and recent-success suppression, but not freezes, budgets, concurrency, repository safety, or the kill switch.
+- Ship synchronized server, RemoteBuddy, SourceControlManager, and shared runtime mirrors so installed CLI users receive the complete recovery contract.
 
 ## Validation
 
-- Clean release-playbook root suite in a resource-capped Docker container on Bun 1.3.14 with a bind-mount allowance: 1,112 passed, 7 intentional platform skips, 0 failed, 4,758 assertions across 127 files.
+- All 99 focused trusted-validation, autonomy-store, completion-queue, and RemoteBuddy repair tests passed with 728 assertions in a resource-capped Docker container on Bun 1.3.14.
+- The broader root suite completed 1,113 tests successfully with 7 intentional platform skips; four environment/toolchain checks were inapplicable in the offline Linux container (Codex CLI preflight, npm fixture semantics in the base image, and a Windows linked-package assertion). Every changed subsystem suite passed.
 - `bun run cli:bundle`
-- `bun run cli:verify-package-payload`: 227 package files, no external toolchain files.
-- Server, RemoteBuddy, and WorkerPal TypeScript checks passed.
-- All 106 focused merge-conflict, validation-handoff, autonomy-incident, runtime-parity, and import-safety tests passed.
-- The new rerere integration fixture trains two recorded conflict resolutions, replays the same rebase with auto-staging, and verifies clean completion.
-- Rebuilt packaged runtime source mirrors are byte-identical to their source files.
-- The Docker bind-mounted task.execute harness passed both cases with a 30-second test allowance; each completed in about 7 seconds.
+- `bun run cli:verify-package-payload`: 201 package files, no external toolchain files, verified from a Linux-native checkout.
+- Server, RemoteBuddy, SourceControlManager, and shared-package TypeScript project builds passed.
+- Regression coverage includes cross-job deduplication, stable fingerprints, equal-timestamp ordering, distinct failure separation, stale incident rejection, exact repair dispatch, safety guardrails, untrusted command rejection, and trusted-pass-only resolution.
+- Rebuilt packaged runtime source mirrors include the complete server, RemoteBuddy, SourceControlManager, and shared validation changes.
 - `git diff --check` passed.
 
 ## Install
