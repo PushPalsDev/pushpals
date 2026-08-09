@@ -2,29 +2,30 @@
 
 ## Release Metadata
 
-- version: `v1.2.28`
-- start_commit: `98d587b17f955ea6af5cd8f0539d2b746c61d2e8`
-- end_commit: `8d1b9882513932fe37c58190e949349aed3e5bb4`
-- commits_in_range: `1`
+- version: `v1.2.29`
+- start_commit: `c9470137605406208a46092aae93b5621b8d14b9`
+- end_commit: `c321a3c38051a91d4c5765993d22ae13591f52e9`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Persist trusted-host validation evidence with canonical candidate and baseline SHAs, stable failure fingerprints, failed test names, affected paths, and bounded command output.
-- Circuit-break repeated trusted-host publication failures after two distinct jobs reproduce the same root cause, then dispatch one exact repair instead of continuing unrelated autonomy work.
-- Resolve a trusted-host incident only after a later trusted-host pass for the same failure; sandbox-only success can no longer hide a host publication blocker.
-- Reject unrequested trusted-validation callback commands and derive the candidate SHA from server-owned completion state before host execution.
-- Preserve every existing autonomy safety boundary: required repairs can bypass stale cooldown and recent-success suppression, but not freezes, budgets, concurrency, repository safety, or the kill switch.
-- Ship synchronized server, RemoteBuddy, SourceControlManager, and shared runtime mirrors so installed CLI users receive the complete recovery contract.
+- Requeue retained publication candidates after the exact trusted-host validation command later passes, allowing already-useful work to resume instead of remaining permanently `publish_blocked`.
+- Reconcile persisted trusted-host passes during server startup so upgrading and restarting recovers blockers that were recorded by an older PushPals release.
+- Bound recovery to three attempts per candidate and require the original requested command, candidate SHA, and baseline SHA to match before any completion is requeued.
+- Restore recovered parent jobs to `finalizing` and clear stale terminal diagnostics while preserving the retained candidate ref for SourceControlManager publication.
+- Validate missing OpenAI API-key configuration before probing the Codex executable, producing the actionable credential error consistently even in offline environments.
+- Ship synchronized server and RemoteBuddy runtime assets so installed CLI users receive both the publication recovery and preflight fixes.
 
 ## Validation
 
-- All 99 focused trusted-validation, autonomy-store, completion-queue, and RemoteBuddy repair tests passed with 728 assertions in a resource-capped Docker container on Bun 1.3.14.
-- The broader root suite completed 1,113 tests successfully with 7 intentional platform skips; four environment/toolchain checks were inapplicable in the offline Linux container (Codex CLI preflight, npm fixture semantics in the base image, and a Windows linked-package assertion). Every changed subsystem suite passed.
+- All 96 focused completion lifecycle, autonomy, diagnostics, and SourceControlManager trusted-validation tests passed with 871 assertions in a resource-capped Docker container on Bun 1.3.14.
+- The broader root suite completed 1,121 tests successfully with 7 intentional Windows-only platform skips and 0 failures.
+- The focused LLM preflight suite passed all 3 tests, and the RemoteBuddy TypeScript project build completed successfully.
 - `bun run cli:bundle`
-- `bun run cli:verify-package-payload`: 201 package files, no external toolchain files, verified from a Linux-native checkout.
-- Server, RemoteBuddy, SourceControlManager, and shared-package TypeScript project builds passed.
-- Regression coverage includes cross-job deduplication, stable fingerprints, equal-timestamp ordering, distinct failure separation, stale incident rejection, exact repair dispatch, safety guardrails, untrusted command rejection, and trusted-pass-only resolution.
-- Rebuilt packaged runtime source mirrors include the complete server, RemoteBuddy, SourceControlManager, and shared validation changes.
+- `bun run cli:verify-package-payload`: 227 package files, no external toolchain files, verified from a Linux-native checkout.
+- A disposable copy of the live SectorCommand database reconciled all 3 matching blockers from `publish_blocked` to `finalizing`, requeued all 3 failed completions, and recorded recovery attempt 1 without modifying the live database.
+- Regression coverage includes exact-command recovery, startup reconciliation, bounded retries, unrelated and unrequested pass rejection, parent-job restoration, and stale-diagnostic cleanup.
+- Rebuilt packaged runtime source mirrors include the complete server and RemoteBuddy changes.
 - `git diff --check` passed.
 
 ## Install
@@ -51,6 +52,7 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
+- A recovered candidate can still fail publication when its retained patch has a candidate-specific conflict or validation failure; PushPals retries matching trusted-validation recovery at most three times rather than looping indefinitely.
 - End-to-end job duration still depends on task scope, model latency, repository validation, and publication work; the next live SectorCommand soak should confirm whether the steady-state average reaches the ten-minute target.
 - The first dependency preparation for a new Bun version, lockfile, platform, or affected workspace can still require registry access; later jobs reuse the validated snapshot.
 - Docker Desktop exposes Windows bind-mounted files as executable inside Linux containers. The package mode guard must run against a Linux-native checkout or the release workflow rather than directly against the Windows bind mount.
