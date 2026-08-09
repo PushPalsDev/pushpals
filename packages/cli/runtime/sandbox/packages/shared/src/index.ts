@@ -87,8 +87,14 @@ export {
 export {
   MAX_TRUSTED_VALIDATION_COMMANDS,
   MAX_TRUSTED_VALIDATION_COMMAND_LENGTH,
+  extractTrustedValidationFailureEvidence,
   normalizeTrustedValidationCommands,
   tokenizeTrustedValidationCommand,
+  truncateTrustedValidationOutput,
+  type TrustedValidationExecutionResult,
+  type TrustedValidationFailureEvidence,
+  type TrustedValidationPhase,
+  type TrustedValidationReport,
   type TrustedValidationCommandsResult,
 } from "./trusted_validation.js";
 export {

@@ -1,20 +1,15 @@
 import {
+  extractTrustedValidationFailureEvidence,
   normalizeTrustedValidationCommands,
   tokenizeTrustedValidationCommand,
+  truncateTrustedValidationOutput,
+  type TrustedValidationExecutionResult,
 } from "../../../packages/shared/src/trusted_validation.js";
 import { createHash } from "crypto";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { basename, resolve } from "path";
 
-export type TrustedValidationCommandResult = {
-  ok: boolean;
-  command: string;
-  output: string;
-  exitCode: number;
-  durationMs: number;
-  cached?: boolean;
-  phase: "dependency_install" | "validation";
-};
+export type TrustedValidationCommandResult = TrustedValidationExecutionResult;
 
 type CommandRunner = (
   argv: string[],
@@ -171,8 +166,10 @@ async function ensureTrustedValidationInstall(options: {
     const result: TrustedValidationCommandResult = {
       command: "bun install --frozen-lockfile",
       ...preparation,
+      output: truncateTrustedValidationOutput(preparation.output),
       phase: "dependency_install",
     };
+    if (!result.ok) Object.assign(result, extractTrustedValidationFailureEvidence(result));
     if (preparation.ok) {
       const fingerprint = trustedValidationInstallFingerprint(options);
       if (fingerprint) {
@@ -263,7 +260,16 @@ export async function runTrustedValidationCommands(options: {
   for (const { command, argv } of commandsWithArgv) {
     const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
     const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
-    results.push({ command, ...result, phase: "validation" });
+    const validationResult: TrustedValidationCommandResult = {
+      command,
+      ...result,
+      output: truncateTrustedValidationOutput(result.output),
+      phase: "validation",
+    };
+    if (!validationResult.ok) {
+      Object.assign(validationResult, extractTrustedValidationFailureEvidence(validationResult));
+    }
+    results.push(validationResult);
     if (!result.ok) break;
   }
   return results;

@@ -92,7 +92,7 @@ describe("SourceControlManager trusted validation", () => {
       });
 
       expect(calls).toBe(1);
-      expect(results).toEqual([
+      expect(results).toMatchObject([
         {
           ok: false,
           command: "bun install --frozen-lockfile",
@@ -100,6 +100,7 @@ describe("SourceControlManager trusted validation", () => {
           exitCode: 1,
           durationMs: expect.any(Number),
           phase: "dependency_install",
+          failureClass: "dependency_setup_failed",
         },
       ]);
     } finally {
@@ -122,7 +123,7 @@ describe("SourceControlManager trusted validation", () => {
     });
 
     expect(calls).toBe(1);
-    expect(results).toEqual([
+    expect(results).toMatchObject([
       {
         ok: false,
         command: "bun test tests/first.test.ts",
@@ -130,8 +131,31 @@ describe("SourceControlManager trusted validation", () => {
         exitCode: 1,
         durationMs: expect.any(Number),
         phase: "validation",
+        failureClass: "test_failure",
       },
     ]);
+  });
+
+  test("extracts stable Bun failed-test evidence for cross-job correlation", async () => {
+    const output = [
+      "account\\__tests__\\AccountContext.test.tsx:",
+      "(fail) mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured [7ms]",
+      "error: expect(received).toBe(expected)",
+    ].join("\n");
+    const [result] = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async () => ({ ok: false, output, exitCode: 1 }),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      failureClass: "test_failure",
+      failedTests: [
+        "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured",
+      ],
+      targetPathHints: ["account/__tests__/AccountContext.test.tsx"],
+    });
   });
 
   test("reuses a successful trusted install until dependency inputs change", async () => {

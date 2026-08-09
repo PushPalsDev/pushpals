@@ -402,6 +402,195 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("trusted-host failures open a cross-job circuit and a later host pass resolves it", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-trusted-host-circuit-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const failedTest =
+      "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured";
+    const output = `account/__tests__/AccountContext.test.tsx:\n(fail) ${failedTest} [7ms]`;
+    const finalize = (suffix: string, ok: boolean): string => {
+      const enqueued = jobs.enqueue({
+        taskId: `task-trusted-host-${suffix}`,
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { instruction: `Candidate ${suffix}` },
+        dedupeKey: `trusted-host:${suffix}`,
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim(`worker-${suffix}`).job?.id).toBe(jobId);
+      const handoff = completions.enqueue(
+        {
+          jobId,
+          sessionId: "s1",
+          commitSha: `candidate-${suffix}`,
+          branch: `refs/pushpals/agent/worker/${suffix}`,
+          message: "candidate",
+          trustedValidationCommands: ["bun run validate"],
+        },
+        { beginJobFinalization: true },
+      );
+      const completionId = handoff.completionId ?? "";
+      expect(completions.claim(`scm-${suffix}`).completion?.id).toBe(completionId);
+      const report = {
+        version: 1,
+        baselineSha: "shared-baseline",
+        candidateSha: `candidate-${suffix}`,
+        results: [
+          {
+            ok,
+            command: "bun run validate",
+            output: ok ? "20 pass, 0 fail" : output,
+            exitCode: ok ? 0 : 1,
+            durationMs: 2_000,
+            phase: "validation",
+            ...(ok
+              ? {}
+              : {
+                  failureClass: "test_failure",
+                  failedTests: [failedTest],
+                  targetPathHints: ["account/__tests__/AccountContext.test.tsx"],
+                }),
+          },
+        ],
+      };
+      const result = ok
+        ? completions.markProcessedAndFinalizeJob(completionId, null, undefined, report)
+        : completions.markFailedAndBlockJob(
+            completionId,
+            `Trusted validation failed: ${failedTest}`,
+            undefined,
+            report,
+          );
+      expect(result.ok).toBe(true);
+      return jobId;
+    };
+
+    try {
+      const firstFailedJobId = finalize("failure-a", false);
+      finalize("failure-b", false);
+      const red = store.createSnapshot({ sessionId: "s1", runId: "run_trusted_red" });
+      expect(red.repo_health_flags.required_validation_red).toBe(true);
+      expect(red.validation_incident).toMatchObject({
+        source: "trusted_host",
+        cross_job_circuit_open: true,
+        command: "bun run validate",
+        failure_count: 2,
+        failed_tests: [failedTest],
+        target_path_hints: ["account/__tests__/AccountContext.test.tsx"],
+        failure_fingerprint: expect.any(String),
+      });
+      expect(red.validation_incident?.failed_job_ids).toHaveLength(2);
+
+      const db = (store as unknown as { db: any }).db;
+      db.prepare(
+        `INSERT INTO job_validation_runs (
+           jobId, command, exitCode, durationMs, passed, failureClass,
+           stdoutTail, stderrTail, metadataJson, createdAt
+         ) VALUES (?, 'bun run validate', 0, 100, 1, NULL, 'worker sandbox passed', NULL, '{}', ?)`,
+      ).run(firstFailedJobId, new Date(Date.now() + 100).toISOString());
+      const workerGreenOnly = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_trusted_worker_green_only",
+      });
+      expect(workerGreenOnly.repo_health_flags.required_validation_red).toBe(true);
+      expect(workerGreenOnly.validation_incident?.source).toBe("trusted_host");
+
+      finalize("success", true);
+      const green = store.createSnapshot({ sessionId: "s1", runId: "run_trusted_green" });
+      expect(green.repo_health_flags.required_validation_red).toBe(false);
+      expect(green.validation_incident).toBeNull();
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
+  test("trusted-host circuit does not combine distinct failures under one command", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-trusted-host-distinct-");
+    const jobs = new JobQueue(dbPath);
+    const db = (store as unknown as { db: any }).db;
+    try {
+      for (let i = 0; i < 2; i++) {
+        const enqueued = jobs.enqueue({
+          taskId: `task-distinct-${i}`,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: {},
+          dedupeKey: `distinct:${i}`,
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        expect(jobs.claim(`worker-distinct-${i}`).job?.id).toBe(jobId);
+        expect(jobs.publishBlocked(jobId, { message: "trusted validation failed" }).ok).toBe(true);
+        db.prepare(
+          `INSERT INTO job_validation_runs (
+             jobId, command, exitCode, durationMs, passed, failureClass,
+             stdoutTail, stderrTail, metadataJson, createdAt
+           ) VALUES (?, 'bun run validate', 1, 100, 0, 'test_failure', ?, NULL, ?, ?)`,
+        ).run(
+          jobId,
+          `(fail) distinct failed test ${i}`,
+          JSON.stringify({
+            source: "trusted_host",
+            failureFingerprint: `fingerprint-${i}`,
+            failedTests: [`distinct failed test ${i}`],
+            targetPathHints: [`tests/distinct-${i}.test.ts`],
+          }),
+          new Date(Date.now() + i).toISOString(),
+        );
+      }
+
+      const snapshot = store.createSnapshot({ sessionId: "s1", runId: "run_distinct" });
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(false);
+      expect(snapshot.validation_incident).toBeNull();
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("a later pass wins when validation rows share the same timestamp", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-validation-order-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const enqueued = jobs.enqueue({
+        taskId: "task-validation-order",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: {},
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim("worker-validation-order").job?.id).toBe(jobId);
+      expect(
+        jobs.fail(jobId, {
+          message: "validation recovered on retry",
+          diagnostics: {
+            validationRuns: [
+              {
+                command: "bun test",
+                passed: false,
+                exitCode: 1,
+                failureClass: "test_failure",
+                stderrTail: "tests/order.test.ts failed",
+              },
+              {
+                command: "bun test",
+                passed: true,
+                exitCode: 0,
+                stdoutTail: "all tests passed",
+              },
+            ],
+          },
+        }).ok,
+      ).toBe(true);
+
+      const snapshot = store.createSnapshot({ sessionId: "s1", runId: "run_order" });
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(false);
+      expect(snapshot.validation_incident).toBeNull();
+    } finally {
+      jobs.close();
+    }
+  });
+
   test("createSnapshot derives component strength traits from outcomes", () => {
     const store = makeStore();
     const sessionId = "s1";
@@ -1119,6 +1308,151 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(result.results?.[0]?.reason ?? "")).toContain(
       "recent_success_same_pattern_within_24h",
     );
+
+    const spoofedRepair = store.evaluateEligibility({
+      runId: "run_recent_exact",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_spoofed_repair",
+          objective_type: "lint_fix",
+          component_area: "apps/server",
+          pattern_key: seeded.patternKey,
+          confidence: 0.95,
+          required_validation_repair: true,
+        },
+      ],
+    });
+    expect(spoofedRepair.results?.[0]?.ok).toBe(false);
+    expect(String(spoofedRepair.results?.[0]?.reason ?? "")).toContain(
+      "recent_success_same_pattern_within_24h",
+    );
+  });
+
+  test("required validation repair bypasses only pattern suppression while an incident is active", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-required-repair-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const enqueued = jobs.enqueue({
+        taskId: "task-required-repair",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: {},
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim("worker-required-repair").job?.id).toBe(jobId);
+      expect(
+        jobs.fail(jobId, {
+          message: "required validation failed twice",
+          diagnostics: {
+            validationRuns: [1, 2].map((attempt) => ({
+              attempt,
+              command: "bun test",
+              passed: false,
+              exitCode: 1,
+              failureClass: "test_failure",
+              stderrTail: "tests/baseline.test.ts failed",
+            })),
+          },
+        }).ok,
+      ).toBe(true);
+      const snapshotId = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_required_repair",
+      }).snapshot_id;
+      const seeded = store.recordObjectiveDecision({
+        runId: "run_required_repair",
+        snapshotId,
+        sessionId: "s1",
+        objective: {
+          id: "obj_required_repair_seed",
+          title: "Seed prior success",
+          instruction: "Repair baseline test",
+          objective_type: "flaky_test",
+          component_area: "tests",
+          trigger_type: "test_failure",
+          target_paths: ["tests/baseline.test.ts"],
+          scope: { read_anywhere: false, write_globs: ["tests/baseline.test.ts"] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          status: "rejected",
+        },
+      });
+      expect(seeded.ok).toBe(true);
+      expect(
+        store.recordOutcome({
+          objectiveId: "obj_required_repair_seed",
+          patternKey: seeded.patternKey,
+          success: true,
+          userAction: "applied",
+        }).ok,
+      ).toBe(true);
+
+      const allowed = store.evaluateEligibility({
+        runId: "run_required_repair",
+        snapshotId,
+        candidates: [
+          {
+            candidate_id: "cand_required_repair",
+            objective_type: "flaky_test",
+            component_area: "tests",
+            pattern_key: seeded.patternKey,
+            confidence: 0.95,
+            required_validation_repair: true,
+          },
+        ],
+      });
+      expect(allowed.results?.[0]).toMatchObject({
+        candidate_id: "cand_required_repair",
+        ok: true,
+      });
+
+      const dispatched = store.recordObjectiveDecision({
+        runId: "run_required_repair",
+        snapshotId,
+        sessionId: "s1",
+        objective: {
+          id: "obj_required_repair",
+          title: "Repair required validation",
+          instruction: "Fix and rerun bun test",
+          objective_type: "flaky_test",
+          component_area: "tests",
+          trigger_type: "test_failure",
+          target_paths: ["tests/baseline.test.ts"],
+          scope: { read_anywhere: false, write_globs: ["tests/baseline.test.ts"] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          status: "dispatched",
+          required_validation_repair: true,
+        },
+      });
+      expect(dispatched.ok).toBe(true);
+
+      store.updateSafetyState({
+        freezeForMs: 60_000,
+        freezeReason: "test_required_repair_safety",
+      });
+      const frozen = store.evaluateEligibility({
+        runId: "run_required_repair",
+        snapshotId,
+        candidates: [
+          {
+            candidate_id: "cand_required_repair_frozen",
+            objective_type: "flaky_test",
+            component_area: "tests",
+            pattern_key: seeded.patternKey,
+            confidence: 0.95,
+            required_validation_repair: true,
+          },
+        ],
+      });
+      expect(frozen.results?.[0]?.ok).toBe(false);
+      expect(String(frozen.results?.[0]?.reason ?? "")).toContain("autonomy frozen");
+    } finally {
+      jobs.close();
+    }
   });
 
   test("evaluateEligibility suppresses near-same docs candidate in same component after recent success", () => {

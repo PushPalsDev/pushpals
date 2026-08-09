@@ -34,6 +34,10 @@ import {
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
 import { runTrustedValidationCommands } from "./trusted_validation";
+import type {
+  TrustedValidationExecutionResult,
+  TrustedValidationReport,
+} from "../../../packages/shared/src/trusted_validation.js";
 import {
   loadConfig,
   applyCliOverrides,
@@ -616,6 +620,17 @@ async function tick(): Promise<void> {
     let trustedInstallDurationMs: number | null = null;
     let trustedValidationDurationMs: number | null = null;
     let trustedValidationCacheHit: boolean | null = null;
+    let trustedValidationBaselineSha: string | null = null;
+    let trustedValidationResults: TrustedValidationExecutionResult[] = [];
+    const trustedValidationReport = (): TrustedValidationReport | null =>
+      completion.trustedValidationCommandsJson
+        ? {
+            version: 1,
+            baselineSha: trustedValidationBaselineSha,
+            candidateSha: completion.commitSha,
+            results: trustedValidationResults,
+          }
+        : null;
     try {
       let processedPrUrl: string | null =
         typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
@@ -683,6 +698,7 @@ async function tick(): Promise<void> {
         }
       }
       await gitOps.createTempBranch(tempBranch);
+      trustedValidationBaselineSha = await gitOps.revParse("HEAD");
       let skipLocalApplyDueConflict = false;
 
       const applyResult = reviewPublicationLease
@@ -754,11 +770,11 @@ async function tick(): Promise<void> {
           console.log(
             `[${ts()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`,
           );
-          const trustedResults = await runTrustedValidationCommands({
+          trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: completion.trustedValidationCommandsJson,
           });
-          for (const trustedResult of trustedResults) {
+          for (const trustedResult of trustedValidationResults) {
             if (trustedResult.phase === "dependency_install") {
               trustedInstallDurationMs = (trustedInstallDurationMs ?? 0) + trustedResult.durationMs;
               trustedValidationCacheHit = Boolean(trustedResult.cached);
@@ -1018,6 +1034,7 @@ async function tick(): Promise<void> {
             trustedInstallDurationMs,
             trustedValidationDurationMs,
             trustedValidationCacheHit,
+            trustedValidationReport: trustedValidationReport(),
           }),
         },
       );
@@ -1048,6 +1065,7 @@ async function tick(): Promise<void> {
           trustedInstallDurationMs,
           trustedValidationDurationMs,
           trustedValidationCacheHit,
+          trustedValidationReport: trustedValidationReport(),
         }),
       });
 

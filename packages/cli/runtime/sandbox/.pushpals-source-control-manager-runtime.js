@@ -1648,6 +1648,79 @@ var TRUSTED_VALIDATION_EXECUTABLES = new Set([
   "vitest",
   "yarn"
 ]);
+var ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+var TEST_DURATION_SUFFIX_RE = /\s+\[(?:\d+(?:\.\d+)?)(?:ms|s)\]\s*$/i;
+function uniqueSorted(values) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+function normalizeEvidencePath(value) {
+  let normalized = value.trim().replace(/^['"`]|['"`]$/g, "").replace(/\\/g, "/");
+  normalized = normalized.replace(/:\d+(?::\d+)?$/, "").replace(/:\s*$/, "");
+  normalized = normalized.replace(/^\.\//, "").replace(/\/{2,}/g, "/");
+  if (!normalized || normalized.includes("node_modules/"))
+    return null;
+  if (!/\.[a-z0-9]+$/i.test(normalized))
+    return null;
+  return normalized;
+}
+function extractTrustedValidationFailureEvidence(options) {
+  const command = String(options.command ?? "").trim().toLowerCase();
+  const output = String(options.output ?? "").replace(ANSI_ESCAPE_RE, "");
+  const failedTests = [];
+  const targetPathHints = [];
+  let currentTestPath = null;
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line)
+      continue;
+    const bunPath = line.match(/^(.+\.(?:test|spec)\.[cm]?[jt]sx?):\s*$/i)?.[1];
+    const suitePath = line.match(/^(?:FAIL|failed)\s+(.+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s|$)/i)?.[1];
+    const diagnosticPath = line.match(/^([^:(]+\.[cm]?[jt]sx?)\(\d+,\d+\):\s+error\b/i)?.[1];
+    const path = normalizeEvidencePath(bunPath ?? suitePath ?? diagnosticPath ?? "");
+    if (path) {
+      currentTestPath = path;
+      targetPathHints.push(path);
+    }
+    const bunFailure = line.match(/^\(fail\)\s+(.+)$/i)?.[1];
+    const jestFailure = line.match(/^[\u2715\u2717]\s+(.+)$/)?.[1];
+    const namedFailure = (bunFailure ?? jestFailure ?? "").replace(TEST_DURATION_SUFFIX_RE, "").trim();
+    if (namedFailure) {
+      failedTests.push(namedFailure);
+      if (currentTestPath)
+        targetPathHints.push(currentTestPath);
+    }
+  }
+  let failureClass;
+  if (options.phase === "dependency_install") {
+    failureClass = "dependency_setup_failed";
+  } else if (/timed?\s*out|timeout/i.test(output) || options.exitCode === 124) {
+    failureClass = "timeout";
+  } else if (failedTests.length > 0 || /(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
+    failureClass = "test_failure";
+  } else if (/\b(?:tsc|typecheck|type-check)\b/i.test(command)) {
+    failureClass = "typecheck_failure";
+  } else if (/\b(?:eslint|lint)\b/i.test(command)) {
+    failureClass = "lint_failure";
+  } else {
+    failureClass = "trusted_validation_failed";
+  }
+  return {
+    failureClass,
+    failedTests: uniqueSorted(failedTests),
+    targetPathHints: uniqueSorted(targetPathHints)
+  };
+}
+function truncateTrustedValidationOutput(output, maxChars = 16000) {
+  const text = String(output ?? "");
+  const boundedMax = Math.max(1000, Math.floor(maxChars));
+  if (text.length <= boundedMax)
+    return text;
+  const headChars = Math.min(4000, Math.floor(boundedMax / 3));
+  const tailChars = boundedMax - headChars;
+  return `${text.slice(0, headChars)}
+... trusted validation output truncated ...
+${text.slice(-tailChars)}`;
+}
 function tokenizeTrustedValidationCommand(command) {
   const trimmed = String(command ?? "").trim();
   if (!trimmed || trimmed.length > MAX_TRUSTED_VALIDATION_COMMAND_LENGTH)
@@ -5223,8 +5296,11 @@ async function ensureTrustedValidationInstall(options) {
     const result = {
       command: "bun install --frozen-lockfile",
       ...preparation,
+      output: truncateTrustedValidationOutput(preparation.output),
       phase: "dependency_install"
     };
+    if (!result.ok)
+      Object.assign(result, extractTrustedValidationFailureEvidence(result));
     if (preparation.ok) {
       const fingerprint = trustedValidationInstallFingerprint(options);
       if (fingerprint) {
@@ -5298,7 +5374,16 @@ async function runTrustedValidationCommands(options) {
   for (const { command, argv } of commandsWithArgv) {
     const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
     const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
-    results.push({ command, ...result, phase: "validation" });
+    const validationResult = {
+      command,
+      ...result,
+      output: truncateTrustedValidationOutput(result.output),
+      phase: "validation"
+    };
+    if (!validationResult.ok) {
+      Object.assign(validationResult, extractTrustedValidationFailureEvidence(validationResult));
+    }
+    results.push(validationResult);
     if (!result.ok)
       break;
   }
@@ -5809,6 +5894,14 @@ async function tick() {
     let trustedInstallDurationMs = null;
     let trustedValidationDurationMs = null;
     let trustedValidationCacheHit = null;
+    let trustedValidationBaselineSha = null;
+    let trustedValidationResults = [];
+    const trustedValidationReport = () => completion.trustedValidationCommandsJson ? {
+      version: 1,
+      baselineSha: trustedValidationBaselineSha,
+      candidateSha: completion.commitSha,
+      results: trustedValidationResults
+    } : null;
     try {
       let processedPrUrl = typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0 ? completion.prUrl.trim() : null;
       console.log(`[${ts2()}] Refreshing refs before applying ${completion.branch}...`);
@@ -5846,6 +5939,7 @@ async function tick() {
         }
       }
       await gitOps.createTempBranch(tempBranch);
+      trustedValidationBaselineSha = await gitOps.revParse("HEAD");
       let skipLocalApplyDueConflict = false;
       const applyResult = reviewPublicationLease ? await (async () => {
         console.log(`[${ts2()}] Checking out exact reviewed completion ${completion.commitSha.slice(0, 8)} on ${tempBranch} for validation...`);
@@ -5885,11 +5979,11 @@ async function tick() {
       } else {
         if (completion.trustedValidationCommandsJson) {
           console.log(`[${ts2()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`);
-          const trustedResults = await runTrustedValidationCommands({
+          trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: completion.trustedValidationCommandsJson
           });
-          for (const trustedResult of trustedResults) {
+          for (const trustedResult of trustedValidationResults) {
             if (trustedResult.phase === "dependency_install") {
               trustedInstallDurationMs = (trustedInstallDurationMs ?? 0) + trustedResult.durationMs;
               trustedValidationCacheHit = Boolean(trustedResult.cached);
@@ -6074,7 +6168,8 @@ ${pushResult.stdout}`.toLowerCase();
           prUrl: processedPrUrl,
           trustedInstallDurationMs,
           trustedValidationDurationMs,
-          trustedValidationCacheHit
+          trustedValidationCacheHit,
+          trustedValidationReport: trustedValidationReport()
         })
       });
       if (!markResponse.ok) {
@@ -6094,7 +6189,8 @@ ${pushResult.stdout}`.toLowerCase();
           error: err.message,
           trustedInstallDurationMs,
           trustedValidationDurationMs,
-          trustedValidationCacheHit
+          trustedValidationCacheHit,
+          trustedValidationReport: trustedValidationReport()
         })
       });
       if (!failResponse.ok) {

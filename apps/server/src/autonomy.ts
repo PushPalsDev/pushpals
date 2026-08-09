@@ -146,6 +146,10 @@ interface ValidationIncident {
   sample_error: string;
   required_commands: string[];
   target_path_hints: string[];
+  failed_tests: string[];
+  failure_fingerprint: string | null;
+  source: "trusted_host" | "worker";
+  cross_job_circuit_open: boolean;
 }
 
 interface ObjectivePolicy {
@@ -3164,6 +3168,7 @@ export class AutonomyStore {
 
   private detectActiveValidationIncident(nowIso: string): ValidationIncident | null {
     let rows: Array<{
+      id: number;
       jobId: string | null;
       command: string | null;
       passed: number | null;
@@ -3172,18 +3177,21 @@ export class AutonomyStore {
       stderrTail: string | null;
       createdAt: string | null;
       jobStatus: string | null;
+      metadataJson: string | null;
     }> = [];
     try {
       rows = this.db
         .prepare(
-          `SELECT v.jobId AS jobId,
+          `SELECT v.id AS id,
+                  v.jobId AS jobId,
                   v.command AS command,
                   v.passed AS passed,
                   v.failureClass AS failureClass,
                   v.stdoutTail AS stdoutTail,
                   v.stderrTail AS stderrTail,
                   v.createdAt AS createdAt,
-                  j.status AS jobStatus
+                  j.status AS jobStatus,
+                  v.metadataJson AS metadataJson
            FROM job_validation_runs v
            JOIN jobs j ON j.id = v.jobId
            WHERE datetime(v.createdAt) >= datetime(?, '-24 hours')
@@ -3191,6 +3199,7 @@ export class AutonomyStore {
            LIMIT 240`,
         )
         .all(nowIso) as Array<{
+        id: number;
         jobId: string | null;
         command: string | null;
         passed: number | null;
@@ -3199,52 +3208,84 @@ export class AutonomyStore {
         stderrTail: string | null;
         createdAt: string | null;
         jobStatus: string | null;
+        metadataJson: string | null;
       }>;
     } catch {
       return null;
     }
 
     type ValidationCommandGroup = {
+      key: string;
       command: string;
+      source: "trusted_host" | "worker";
+      failureFingerprint: string | null;
       totalRuns: number;
       failureCount: number;
       failedJobIds: Set<string>;
       lastFailure: (typeof rows)[number] | null;
-      latestFailAtMs: number;
-      latestPassAtMs: number;
+      latestFailOrder: { createdAtMs: number; id: number } | null;
       firstFailedAt: string | null;
       requiredCommands: Set<string>;
       pathHints: string[];
+      failedTests: Set<string>;
     };
     const groups = new Map<string, ValidationCommandGroup>();
+    const latestPassByCommandAndSource = new Map<string, { createdAtMs: number; id: number }>();
+    const laterThan = (
+      left: { createdAtMs: number; id: number } | null,
+      right: { createdAtMs: number; id: number } | null,
+    ): boolean => {
+      if (!left) return false;
+      if (!right) return true;
+      return (
+        left.createdAtMs > right.createdAtMs ||
+        (left.createdAtMs === right.createdAtMs && left.id > right.id)
+      );
+    };
     const failedJobStatuses = new Set(["failed", "abandoned", "publish_blocked"]);
     for (const row of rows) {
       const command = normalizeValidationCommand(row.command);
       if (!command) continue;
       const createdAt = asString(row.createdAt);
       const createdAtMs = Date.parse(createdAt);
+      const order = {
+        createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : 0,
+        id: Math.max(0, Math.floor(asNumber(row.id, 0))),
+      };
+      const metadata = parseJsonObject(row.metadataJson);
+      const source = asString(metadata.source) === "trusted_host" ? "trusted_host" : "worker";
+      const commandSourceKey = `${command}\n${source}`;
+      if (Number(row.passed) === 1) {
+        const latestPass = latestPassByCommandAndSource.get(commandSourceKey) ?? null;
+        if (laterThan(order, latestPass)) {
+          latestPassByCommandAndSource.set(commandSourceKey, order);
+        }
+        continue;
+      }
+      const failureFingerprint = asString(metadata.failureFingerprint) || null;
+      const groupKey =
+        source === "trusted_host" && failureFingerprint
+          ? `${command}\ntrusted_host\n${failureFingerprint}`
+          : `${command}\nworker`;
       const group =
-        groups.get(command) ??
+        groups.get(groupKey) ??
         ({
+          key: groupKey,
           command,
+          source,
+          failureFingerprint,
           totalRuns: 0,
           failureCount: 0,
           failedJobIds: new Set<string>(),
           lastFailure: null,
-          latestFailAtMs: 0,
-          latestPassAtMs: 0,
+          latestFailOrder: null,
           firstFailedAt: null,
           requiredCommands: new Set<string>(),
           pathHints: [],
+          failedTests: new Set<string>(),
         } satisfies ValidationCommandGroup);
-      groups.set(command, group);
+      groups.set(groupKey, group);
       group.totalRuns += 1;
-      if (Number(row.passed) === 1) {
-        if (Number.isFinite(createdAtMs)) {
-          group.latestPassAtMs = Math.max(group.latestPassAtMs, createdAtMs);
-        }
-        continue;
-      }
       if (!failedJobStatuses.has(asString(row.jobStatus))) continue;
       // Environment deferrals are publication handoffs, not evidence that the
       // repository baseline is red. Scheduling code-repair jobs for a
@@ -3263,8 +3304,8 @@ export class AutonomyStore {
       group.failureCount += 1;
       group.failedJobIds.add(jobId);
       if (Number.isFinite(createdAtMs)) {
-        if (createdAtMs >= group.latestFailAtMs) {
-          group.latestFailAtMs = createdAtMs;
+        if (laterThan(order, group.latestFailOrder)) {
+          group.latestFailOrder = order;
           group.lastFailure = row;
         }
         if (!group.firstFailedAt || createdAtMs < Date.parse(group.firstFailedAt)) {
@@ -3274,7 +3315,12 @@ export class AutonomyStore {
         group.lastFailure = row;
       }
       group.requiredCommands.add(command);
+      for (const failedTest of asStringArray(metadata.failedTests)) {
+        group.failedTests.add(failedTest);
+      }
+      const metadataHints = asStringArray(metadata.targetPathHints);
       const hints = collectValidationPathHints(
+        ...metadataHints,
         asString(row.stderrTail),
         asString(row.stdoutTail),
         command,
@@ -3295,13 +3341,19 @@ export class AutonomyStore {
 
     const activeGroups = [...groups.values()]
       .filter((group) => group.failureCount >= 2)
-      .filter((group) => group.latestFailAtMs > group.latestPassAtMs)
+      .filter((group) => group.source !== "trusted_host" || group.failedJobIds.size >= 2)
+      .filter((group) =>
+        laterThan(
+          group.latestFailOrder,
+          latestPassByCommandAndSource.get(`${group.command}\n${group.source}`) ?? null,
+        ),
+      )
       .sort((a, b) => {
         if (b.failureCount !== a.failureCount) return b.failureCount - a.failureCount;
         if (b.failedJobIds.size !== a.failedJobIds.size) {
           return b.failedJobIds.size - a.failedJobIds.size;
         }
-        return b.latestFailAtMs - a.latestFailAtMs;
+        return (b.latestFailOrder?.createdAtMs ?? 0) - (a.latestFailOrder?.createdAtMs ?? 0);
       });
     const selected = activeGroups[0];
     if (!selected?.lastFailure) return null;
@@ -3311,7 +3363,9 @@ export class AutonomyStore {
       900,
     );
     const failureClass = asString(selected.lastFailure.failureClass) || null;
-    const digest = validationIncidentDigest(selected.command, failureClass, sample);
+    const digest = selected.failureFingerprint
+      ? sha256Hex(`${selected.command}\n${selected.failureFingerprint}`).slice(0, 16)
+      : validationIncidentDigest(selected.command, failureClass, sample);
     return {
       active: true,
       incident_id: `valid_inc_${digest}`,
@@ -3328,6 +3382,10 @@ export class AutonomyStore {
       sample_error: sample,
       required_commands: [...selected.requiredCommands].slice(0, 8),
       target_path_hints: selected.pathHints.slice(0, 8),
+      failed_tests: [...selected.failedTests].slice(0, 12),
+      failure_fingerprint: selected.failureFingerprint,
+      source: selected.source,
+      cross_job_circuit_open: selected.source === "trusted_host" && selected.failedJobIds.size >= 2,
     };
   }
 
@@ -4168,6 +4226,7 @@ export class AutonomyStore {
         open_objectives: snapshot.open_objectives.slice(0, 40),
         recent_objectives: snapshot.recent_objectives.slice(0, 80),
         repo_health_flags: snapshot.repo_health_flags,
+        validation_incident: snapshot.validation_incident,
         dispatch_budget: snapshot.dispatch_budget,
         resource_budget: snapshot.resource_budget,
         payload_hash: payloadHash,
@@ -4182,6 +4241,7 @@ export class AutonomyStore {
       engine_idea_priors: snapshot.engine_idea_priors.slice(0, 20),
       engine_source_priors: snapshot.engine_source_priors.slice(0, 20),
       repo_health_flags: snapshot.repo_health_flags,
+      validation_incident: snapshot.validation_incident,
       dispatch_budget: snapshot.dispatch_budget,
       resource_budget: snapshot.resource_budget,
       payload_hash: payloadHash,
@@ -4666,6 +4726,24 @@ export class AutonomyStore {
     return null;
   }
 
+  private snapshotAuthorizesRequiredValidationRepair(snapshotId: string): boolean {
+    const row = this.db
+      .prepare(`SELECT payload_json FROM autonomy_snapshots WHERE snapshot_id = ?`)
+      .get(snapshotId) as { payload_json: string } | null;
+    if (!row?.payload_json) return false;
+    const payload = parseJsonObject(row.payload_json);
+    const incident = asObject(payload.validation_incident);
+    const flags = asObject(payload.repo_health_flags);
+    if (!asBoolean(flags.required_validation_red, false) || !asBoolean(incident.active, false)) {
+      return false;
+    }
+    const snapshotIncidentId = asString(incident.incident_id);
+    const liveIncident = this.detectActiveValidationIncident(asIsoNow());
+    return Boolean(
+      snapshotIncidentId && liveIncident?.active && liveIncident.incident_id === snapshotIncidentId,
+    );
+  }
+
   evaluateEligibility(body: Record<string, unknown>): {
     ok: boolean;
     results?: Array<{ candidate_id: string; ok: boolean; reason?: string }>;
@@ -4692,6 +4770,8 @@ export class AutonomyStore {
     const preflightErr = this.preflightReason(snapshotId, runId);
     const safetyErr = this.safetyBlockReason(now);
     const resourceBudgetErr = this.resourceBudgetBlockReason(now);
+    const requiredValidationRepairAuthorized =
+      this.snapshotAuthorizesRequiredValidationRepair(snapshotId);
     const activePatternRows = this.db
       .prepare(
         `SELECT DISTINCT pattern_key AS patternKey
@@ -4718,6 +4798,9 @@ export class AutonomyStore {
       const patternKey = asString(record.patternKey ?? record.pattern_key);
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp01(asNumber(record.confidence, 0));
+      const requiredValidationRepair =
+        requiredValidationRepairAuthorized &&
+        asBoolean(record.requiredValidationRepair ?? record.required_validation_repair, false);
       const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
       if (pushpalsInternalErr) {
         return {
@@ -4765,18 +4848,20 @@ export class AutonomyStore {
           reason: "max concurrent objectives reached",
         };
       }
-      const cooldownErr = this.cooldownReason(patternKey, now);
-      if (cooldownErr) {
-        return { candidate_id: candidateId, ok: false, reason: cooldownErr };
-      }
-      const recentSuccessErr = this.recentSuccessSuppressionReason({
-        patternKey,
-        objectiveType,
-        componentArea,
-        nowIso: now,
-      });
-      if (recentSuccessErr) {
-        return { candidate_id: candidateId, ok: false, reason: recentSuccessErr };
+      if (!requiredValidationRepair) {
+        const cooldownErr = this.cooldownReason(patternKey, now);
+        if (cooldownErr) {
+          return { candidate_id: candidateId, ok: false, reason: cooldownErr };
+        }
+        const recentSuccessErr = this.recentSuccessSuppressionReason({
+          patternKey,
+          objectiveType,
+          componentArea,
+          nowIso: now,
+        });
+        if (recentSuccessErr) {
+          return { candidate_id: candidateId, ok: false, reason: recentSuccessErr };
+        }
       }
       if (preflightErr) {
         return { candidate_id: candidateId, ok: false, reason: preflightErr };
@@ -5061,6 +5146,15 @@ export class AutonomyStore {
       ? scopedCandidateStorageId(runId, objectiveCandidateRaw)
       : null;
     if (objectiveStatus === "dispatched") {
+      const requiredValidationRepair = asBoolean(
+        objective.requiredValidationRepair ??
+          objective.required_validation_repair ??
+          asObject(body.candidate).requiredValidationRepair ??
+          asObject(body.candidate).required_validation_repair ??
+          body.requiredValidationRepair ??
+          body.required_validation_repair,
+        false,
+      );
       const overrideCooldown = asBoolean(
         objective.overrideCooldown ??
           objective.override_cooldown ??
@@ -5077,6 +5171,7 @@ export class AutonomyStore {
             objective_type: objectiveType,
             pattern_key: patternKey,
             confidence: clamp01(asNumber(objective.confidence, 0)),
+            required_validation_repair: requiredValidationRepair,
           },
         ],
       });

@@ -586,6 +586,10 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         sample_error: "scripts/test-web-e2e.js:12 browser smoke assertion failed",
         required_commands: ["bun test", "bun run web:e2e"],
         target_path_hints: ["scripts/test-web-e2e.js"],
+        failed_tests: ["route shell > renders account navigation without startup failure"],
+        failure_fingerprint: "fp_web_e2e",
+        source: "trusted_host" as const,
+        cross_job_circuit_open: true,
       },
     };
 
@@ -691,13 +695,26 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     const enqueueCall = calls.find((entry) => entry.url.endsWith("/requests/enqueue"));
     expect(enqueueCall).toBeDefined();
     expect(JSON.stringify(enqueueCall?.body ?? {})).toContain("bun run web:e2e");
+    expect(JSON.stringify(enqueueCall?.body ?? {})).toContain(
+      "route shell > renders account navigation without startup failure",
+    );
+    expect(JSON.stringify(enqueueCall?.body ?? {})).toContain("cross-job publication circuit");
+    const eligibilityCall = calls.find((entry) => entry.url.endsWith("/autonomy/eligibility"));
+    const eligibilityCandidates = ((eligibilityCall?.body as Record<string, unknown> | undefined)
+      ?.candidates ?? []) as Array<Record<string, unknown>>;
+    expect(eligibilityCandidates[0]?.required_validation_repair).toBe(true);
     expect(objectivePosts.length).toBe(1);
+    const postedCandidates = (objectivePosts[0]?.candidates ?? []) as Array<
+      Record<string, unknown>
+    >;
+    expect(postedCandidates[0]?.required_validation_repair).toBe(true);
     const objective = (objectivePosts[0]?.objective ?? {}) as Record<string, unknown>;
     expect(String(objective.status ?? "")).toBe("dispatched");
     expect(String(objective.objective_type ?? "")).toBe("flaky_test");
     expect(String(objective.trigger_type ?? "")).toBe("test_failure");
     expect(objective.target_paths).toEqual(["scripts/test-web-e2e.js"]);
     expect(objective.expected_validation).toEqual(["bun run web:e2e", "bun test"]);
+    expect(objective.required_validation_repair).toBe(true);
   });
 
   test("validation repair ignores trusted-environment incidents from older server snapshots", async () => {

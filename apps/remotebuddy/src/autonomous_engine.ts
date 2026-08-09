@@ -143,6 +143,10 @@ type Snapshot = {
     sample_error?: string;
     required_commands?: string[];
     target_path_hints?: string[];
+    failed_tests?: string[];
+    failure_fingerprint?: string | null;
+    source?: "trusted_host" | "worker";
+    cross_job_circuit_open?: boolean;
   } | null;
   dispatch_budget: {
     global_count_last_hour: number;
@@ -2068,6 +2072,7 @@ function buildValidationIncidentRepairCandidate(params: {
   const failureCount = Math.max(0, Math.floor(asNumber(incident.failure_count, 0)));
   const failedJobCount = asStringArray(incident.failed_job_ids).length;
   const sample = compactStatusDetail(asString(incident.sample_error), 600);
+  const failedTests = asStringArray(incident.failed_tests);
   const signalIds = params.snapshot.top_signals
     .filter(
       (signal) =>
@@ -2083,6 +2088,10 @@ function buildValidationIncidentRepairCandidate(params: {
       "Required validation is repeatedly failing before publication.",
       `Primary failing command: ${command}.`,
       `Recent failures: ${failureCount} across ${failedJobCount} job(s).`,
+      incident.cross_job_circuit_open
+        ? "The cross-job publication circuit is open; normal autonomy is paused for this failing baseline."
+        : "",
+      failedTests.length > 0 ? `Failed tests: ${failedTests.join("; ")}.` : "",
       sample ? `Latest failure excerpt: ${sample}` : "",
       "Fix the repo baseline issue that makes this command fail, then rerun the failing command and related required validation.",
     ]
@@ -2122,6 +2131,9 @@ function validationRepairInstruction(
       "",
       "Course of action:",
       `- Reproduce the failing command first: ${asString(incident.command)}`,
+      ...asStringArray(incident.failed_tests).map(
+        (testName) => `- Reproduce failed test: ${testName}`,
+      ),
       "- Identify whether the root cause is code, test, tooling, or local repo configuration.",
       "- Fix the baseline failure in the smallest repo-owned scope that makes the command pass.",
       "- If the failure is caused by missing local data, credentials, or environment that cannot be repaired in repo code, report that blocker clearly instead of masking it.",
@@ -2169,6 +2181,7 @@ function validationRepairCandidatePayload(params: {
     gate_reasons: params.gateReasons ?? [],
     selected: params.selected,
     selection_strategy: "validation_incident_repair",
+    required_validation_repair: true,
     selection_roll: null,
     candidate_created_at: params.candidate.candidate_created_at,
   };
@@ -5601,6 +5614,7 @@ export class RemoteBuddyAutonomousEngine {
       component_area: AutonomyComponentArea;
       pattern_key: string;
       confidence: number;
+      required_validation_repair?: boolean;
     }>,
   ): Promise<Map<string, { ok: boolean; reason?: string }>> {
     const out = new Map<string, { ok: boolean; reason?: string }>();
@@ -5743,6 +5757,7 @@ export class RemoteBuddyAutonomousEngine {
         component_area: candidate.component_area,
         pattern_key: patternKey,
         confidence: candidate.confidence,
+        required_validation_repair: true,
       },
     ]);
     const eligibility = eligibilityById.get(candidate.id) ?? {
@@ -5780,6 +5795,7 @@ export class RemoteBuddyAutonomousEngine {
           expected_validation: candidate.expected_validation,
           status: "rejected",
           block_reason: reason,
+          required_validation_repair: true,
         },
         llmCalls: [],
       });
@@ -5838,6 +5854,7 @@ export class RemoteBuddyAutonomousEngine {
           expected_validation: candidate.expected_validation,
           status: "failed",
           block_reason: "request_enqueue_failed",
+          required_validation_repair: true,
         },
         llmCalls: [],
       });
@@ -5872,6 +5889,7 @@ export class RemoteBuddyAutonomousEngine {
         expected_validation: candidate.expected_validation,
         status: "dispatched",
         request_id: requestId,
+        required_validation_repair: true,
         evidence: {
           validation_incident: incident,
         },

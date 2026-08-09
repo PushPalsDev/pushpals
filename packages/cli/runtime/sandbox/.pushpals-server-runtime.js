@@ -8783,6 +8783,68 @@ var TRUSTED_VALIDATION_EXECUTABLES = new Set([
   "vitest",
   "yarn"
 ]);
+var ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+var TEST_DURATION_SUFFIX_RE = /\s+\[(?:\d+(?:\.\d+)?)(?:ms|s)\]\s*$/i;
+function uniqueSorted(values) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+function normalizeEvidencePath(value) {
+  let normalized = value.trim().replace(/^['"`]|['"`]$/g, "").replace(/\\/g, "/");
+  normalized = normalized.replace(/:\d+(?::\d+)?$/, "").replace(/:\s*$/, "");
+  normalized = normalized.replace(/^\.\//, "").replace(/\/{2,}/g, "/");
+  if (!normalized || normalized.includes("node_modules/"))
+    return null;
+  if (!/\.[a-z0-9]+$/i.test(normalized))
+    return null;
+  return normalized;
+}
+function extractTrustedValidationFailureEvidence(options) {
+  const command = String(options.command ?? "").trim().toLowerCase();
+  const output = String(options.output ?? "").replace(ANSI_ESCAPE_RE, "");
+  const failedTests = [];
+  const targetPathHints = [];
+  let currentTestPath = null;
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line)
+      continue;
+    const bunPath = line.match(/^(.+\.(?:test|spec)\.[cm]?[jt]sx?):\s*$/i)?.[1];
+    const suitePath = line.match(/^(?:FAIL|failed)\s+(.+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s|$)/i)?.[1];
+    const diagnosticPath = line.match(/^([^:(]+\.[cm]?[jt]sx?)\(\d+,\d+\):\s+error\b/i)?.[1];
+    const path = normalizeEvidencePath(bunPath ?? suitePath ?? diagnosticPath ?? "");
+    if (path) {
+      currentTestPath = path;
+      targetPathHints.push(path);
+    }
+    const bunFailure = line.match(/^\(fail\)\s+(.+)$/i)?.[1];
+    const jestFailure = line.match(/^[\u2715\u2717]\s+(.+)$/)?.[1];
+    const namedFailure = (bunFailure ?? jestFailure ?? "").replace(TEST_DURATION_SUFFIX_RE, "").trim();
+    if (namedFailure) {
+      failedTests.push(namedFailure);
+      if (currentTestPath)
+        targetPathHints.push(currentTestPath);
+    }
+  }
+  let failureClass;
+  if (options.phase === "dependency_install") {
+    failureClass = "dependency_setup_failed";
+  } else if (/timed?\s*out|timeout/i.test(output) || options.exitCode === 124) {
+    failureClass = "timeout";
+  } else if (failedTests.length > 0 || /(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
+    failureClass = "test_failure";
+  } else if (/\b(?:tsc|typecheck|type-check)\b/i.test(command)) {
+    failureClass = "typecheck_failure";
+  } else if (/\b(?:eslint|lint)\b/i.test(command)) {
+    failureClass = "lint_failure";
+  } else {
+    failureClass = "trusted_validation_failed";
+  }
+  return {
+    failureClass,
+    failedTests: uniqueSorted(failedTests),
+    targetPathHints: uniqueSorted(targetPathHints)
+  };
+}
 function tokenizeTrustedValidationCommand(command) {
   const trimmed = String(command ?? "").trim();
   if (!trimmed || trimmed.length > MAX_TRUSTED_VALIDATION_COMMAND_LENGTH)
@@ -11978,7 +12040,7 @@ class RequestQueue {
 
 // apps/server/src/completions.ts
 import { Database as Database4 } from "bun:sqlite";
-import { randomUUID as randomUUID4 } from "crypto";
+import { createHash as createHash3, randomUUID as randomUUID4 } from "crypto";
 function normalizeTrustedValidationTiming(timing) {
   const normalizedDuration = (value) => typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : null;
   return {
@@ -11986,6 +12048,67 @@ function normalizeTrustedValidationTiming(timing) {
     validationDurationMs: normalizedDuration(timing?.validationDurationMs),
     installCacheHit: typeof timing?.installCacheHit === "boolean" ? timing.installCacheHit ? 1 : 0 : null
   };
+}
+function trustedValidationText(value, maxLength) {
+  return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+function trustedValidationStringArray(value, maxItems = 20) {
+  if (!Array.isArray(value))
+    return [];
+  return [
+    ...new Set(value.map((entry) => trustedValidationText(entry, 1000)).filter(Boolean).slice(0, maxItems))
+  ].sort((a, b) => a.localeCompare(b));
+}
+function normalizeTrustedValidationReport(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return null;
+  const input = value;
+  if (input.version !== 1 || !Array.isArray(input.results))
+    return null;
+  const results = [];
+  for (const raw of input.results.slice(0, 16)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      continue;
+    const result = raw;
+    const command = trustedValidationText(result.command, 1000);
+    const phase = result.phase === "dependency_install" ? "dependency_install" : "validation";
+    if (!command)
+      continue;
+    const ok = result.ok === true;
+    const output = trustedValidationText(result.output, 16000);
+    const exitCode = typeof result.exitCode === "number" && Number.isFinite(result.exitCode) ? Math.max(-1, Math.min(999, Math.floor(result.exitCode))) : ok ? 0 : 1;
+    const evidence = extractTrustedValidationFailureEvidence({ command, phase, output, exitCode });
+    results.push({
+      ok,
+      command,
+      output,
+      exitCode,
+      durationMs: typeof result.durationMs === "number" && Number.isFinite(result.durationMs) ? Math.max(0, Math.min(24 * 60 * 60 * 1000, Math.floor(result.durationMs))) : 0,
+      cached: result.cached === true,
+      phase,
+      ...ok ? {} : {
+        failureClass: evidence.failureClass,
+        failedTests: trustedValidationStringArray(result.failedTests).length > 0 ? trustedValidationStringArray(result.failedTests) : evidence.failedTests,
+        targetPathHints: trustedValidationStringArray(result.targetPathHints).length > 0 ? trustedValidationStringArray(result.targetPathHints) : evidence.targetPathHints
+      }
+    });
+  }
+  return {
+    version: 1,
+    baselineSha: trustedValidationText(input.baselineSha, 128) || null,
+    candidateSha: trustedValidationText(input.candidateSha, 128) || null,
+    results
+  };
+}
+function trustedValidationFailureFingerprint(result) {
+  const fallback = result.output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").split(/\r?\n/).map((line) => line.trim().replace(/\b\d+(?:\.\d+)?(?:ms|s)\b/gi, "<duration>")).filter((line) => /\b(?:error|fail|failed|failure|timeout)\b/i.test(line)).slice(0, 4);
+  return createHash3("sha256").update(JSON.stringify({
+    command: result.command.trim().replace(/\s+/g, " ").toLowerCase(),
+    failureClass: result.failureClass ?? "trusted_validation_failed",
+    failedTests: trustedValidationStringArray(result.failedTests),
+    targetPathHints: trustedValidationStringArray(result.targetPathHints),
+    fallback: (result.failedTests?.length ?? 0) > 0 || (result.targetPathHints?.length ?? 0) > 0 ? [] : fallback
+  })).digest("hex").slice(0, 24);
 }
 
 class CompletionQueue {
@@ -12264,10 +12387,11 @@ class CompletionQueue {
     }
     return { ok: true };
   }
-  markProcessedAndFinalizeJob(completionId, prUrl, trustedTiming) {
+  markProcessedAndFinalizeJob(completionId, prUrl, trustedTiming, trustedReportInput) {
     const now = new Date().toISOString();
     const normalizedPrUrl = typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
     const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
+    const trustedReport = normalizeTrustedValidationReport(trustedReportInput);
     const tx = this.db.transaction(() => {
       const completion = this.getCompletion(completionId);
       if (!completion)
@@ -12296,6 +12420,7 @@ class CompletionQueue {
                error = NULL,
                updatedAt = ?
            WHERE id = ? AND status = 'claimed'`).run(normalizedPrUrl, normalizedTiming.installDurationMs, normalizedTiming.validationDurationMs, normalizedTiming.installCacheHit, now, completionId);
+      this.replaceTrustedValidationRuns(completion, trustedReport, now);
       const transitioned = this.db.prepare(`UPDATE jobs
            SET status = 'completed',
                prUrl = COALESCE(?, prUrl),
@@ -12331,10 +12456,11 @@ class CompletionQueue {
     });
     return tx();
   }
-  markFailedAndBlockJob(completionId, error, trustedTiming) {
+  markFailedAndBlockJob(completionId, error, trustedTiming, trustedReportInput) {
     const now = new Date().toISOString();
     const failure = String(error || "Unknown publication error");
     const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
+    const trustedReport = normalizeTrustedValidationReport(trustedReportInput);
     const tx = this.db.transaction(() => {
       const completion = this.getCompletion(completionId);
       if (!completion)
@@ -12362,6 +12488,7 @@ class CompletionQueue {
                error = ?,
                updatedAt = ?
            WHERE id = ? AND status = 'claimed'`).run(normalizedTiming.installDurationMs, normalizedTiming.validationDurationMs, normalizedTiming.installCacheHit, failure, now, completionId);
+      this.replaceTrustedValidationRuns(completion, trustedReport, now);
       const transitioned = this.db.prepare(`UPDATE jobs
            SET status = 'publish_blocked',
                error = ?,
@@ -12399,6 +12526,42 @@ class CompletionQueue {
       };
     });
     return tx();
+  }
+  replaceTrustedValidationRuns(completion, report, now) {
+    if (!completion.trustedValidationCommandsJson || !report || report.results.length === 0)
+      return;
+    const requested = normalizeTrustedValidationCommands(completion.trustedValidationCommandsJson);
+    if (!requested.ok)
+      return;
+    const allowedCommands = new Set(requested.commands.map((command) => command.trim().replace(/\s+/g, " ").toLowerCase()));
+    this.db.prepare(`DELETE FROM job_validation_runs
+         WHERE jobId = ?
+           AND json_extract(metadataJson, '$.source') = 'trusted_host'
+           AND json_extract(metadataJson, '$.completionId') = ?`).run(completion.jobId, completion.id);
+    const insert = this.db.prepare(`INSERT INTO job_validation_runs (
+         jobId, attempt, command, exitCode, durationMs, passed, failureClass,
+         stdoutTail, stderrTail, metadataJson, createdAt
+       ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`);
+    for (const result of report.results) {
+      const normalizedCommand = result.command.trim().replace(/\s+/g, " ").toLowerCase();
+      if (result.phase !== "dependency_install" && !allowedCommands.has(normalizedCommand)) {
+        continue;
+      }
+      const failedTests = trustedValidationStringArray(result.failedTests);
+      const targetPathHints = trustedValidationStringArray(result.targetPathHints);
+      const failureFingerprint2 = result.ok ? null : trustedValidationFailureFingerprint(result);
+      insert.run(completion.jobId, result.command, result.exitCode, result.durationMs, result.ok ? 1 : 0, result.ok ? null : result.failureClass ?? "trusted_validation_failed", result.output.slice(-8000), JSON.stringify({
+        source: "trusted_host",
+        completionId: completion.id,
+        phase: result.phase,
+        cached: Boolean(result.cached),
+        baselineSha: report.baselineSha,
+        candidateSha: completion.commitSha ?? report.candidateSha,
+        failureFingerprint: failureFingerprint2,
+        failedTests,
+        targetPathHints
+      }), now);
+    }
   }
   upsertPublicationTerminalDiagnostics(options) {
     this.db.prepare(`INSERT INTO job_terminal_diagnostics (
@@ -12447,7 +12610,7 @@ class CompletionQueue {
 
 // apps/server/src/autonomy.ts
 import { Database as Database5 } from "bun:sqlite";
-import { createHash as createHash3, randomUUID as randomUUID5 } from "crypto";
+import { createHash as createHash4, randomUUID as randomUUID5 } from "crypto";
 var OBJECTIVE_POLICY = {
   flaky_test: {
     maxRisk: "low",
@@ -12569,7 +12732,7 @@ function asIsoNow() {
   return new Date().toISOString();
 }
 function sha256Hex(value) {
-  return createHash3("sha256").update(value).digest("hex");
+  return createHash4("sha256").update(value).digest("hex");
 }
 function jsonByteLength(value) {
   return Buffer.byteLength(value, "utf8");
@@ -12958,7 +13121,7 @@ function deriveInspirationSourceKey(params) {
   const sourceUrl = asString3(params.sourceUrl).toLowerCase();
   if (!sourceType && !sourceLabel && !sourceUrl)
     return "";
-  return `source:${createHash3("sha256").update([sourceType, sourceLabel, sourceUrl].join("|")).digest("hex")}`;
+  return `source:${createHash4("sha256").update([sourceType, sourceLabel, sourceUrl].join("|")).digest("hex")}`;
 }
 function normalizeEngineSourceCurationStatus(value) {
   const text = asString3(value).toLowerCase();
@@ -14507,14 +14670,16 @@ ${errorText}`.trim();
   detectActiveValidationIncident(nowIso) {
     let rows = [];
     try {
-      rows = this.db.prepare(`SELECT v.jobId AS jobId,
+      rows = this.db.prepare(`SELECT v.id AS id,
+                  v.jobId AS jobId,
                   v.command AS command,
                   v.passed AS passed,
                   v.failureClass AS failureClass,
                   v.stdoutTail AS stdoutTail,
                   v.stderrTail AS stderrTail,
                   v.createdAt AS createdAt,
-                  j.status AS jobStatus
+                  j.status AS jobStatus,
+                  v.metadataJson AS metadataJson
            FROM job_validation_runs v
            JOIN jobs j ON j.id = v.jobId
            WHERE datetime(v.createdAt) >= datetime(?, '-24 hours')
@@ -14524,6 +14689,14 @@ ${errorText}`.trim();
       return null;
     }
     const groups = new Map;
+    const latestPassByCommandAndSource = new Map;
+    const laterThan = (left, right) => {
+      if (!left)
+        return false;
+      if (!right)
+        return true;
+      return left.createdAtMs > right.createdAtMs || left.createdAtMs === right.createdAtMs && left.id > right.id;
+    };
     const failedJobStatuses = new Set(["failed", "abandoned", "publish_blocked"]);
     for (const row of rows) {
       const command = normalizeValidationCommand(row.command);
@@ -14531,26 +14704,43 @@ ${errorText}`.trim();
         continue;
       const createdAt = asString3(row.createdAt);
       const createdAtMs = Date.parse(createdAt);
-      const group = groups.get(command) ?? {
+      const order = {
+        createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : 0,
+        id: Math.max(0, Math.floor(asNumber(row.id, 0)))
+      };
+      const metadata = parseJsonObject(row.metadataJson);
+      const source = asString3(metadata.source) === "trusted_host" ? "trusted_host" : "worker";
+      const commandSourceKey = `${command}
+${source}`;
+      if (Number(row.passed) === 1) {
+        const latestPass = latestPassByCommandAndSource.get(commandSourceKey) ?? null;
+        if (laterThan(order, latestPass)) {
+          latestPassByCommandAndSource.set(commandSourceKey, order);
+        }
+        continue;
+      }
+      const failureFingerprint2 = asString3(metadata.failureFingerprint) || null;
+      const groupKey = source === "trusted_host" && failureFingerprint2 ? `${command}
+trusted_host
+${failureFingerprint2}` : `${command}
+worker`;
+      const group = groups.get(groupKey) ?? {
+        key: groupKey,
         command,
+        source,
+        failureFingerprint: failureFingerprint2,
         totalRuns: 0,
         failureCount: 0,
         failedJobIds: new Set,
         lastFailure: null,
-        latestFailAtMs: 0,
-        latestPassAtMs: 0,
+        latestFailOrder: null,
         firstFailedAt: null,
         requiredCommands: new Set,
-        pathHints: []
+        pathHints: [],
+        failedTests: new Set
       };
-      groups.set(command, group);
+      groups.set(groupKey, group);
       group.totalRuns += 1;
-      if (Number(row.passed) === 1) {
-        if (Number.isFinite(createdAtMs)) {
-          group.latestPassAtMs = Math.max(group.latestPassAtMs, createdAtMs);
-        }
-        continue;
-      }
       if (!failedJobStatuses.has(asString3(row.jobStatus)))
         continue;
       if (isNonRepairableValidationEnvironmentFailure(row.failureClass, row.stdoutTail, row.stderrTail)) {
@@ -14562,8 +14752,8 @@ ${errorText}`.trim();
       group.failureCount += 1;
       group.failedJobIds.add(jobId);
       if (Number.isFinite(createdAtMs)) {
-        if (createdAtMs >= group.latestFailAtMs) {
-          group.latestFailAtMs = createdAtMs;
+        if (laterThan(order, group.latestFailOrder)) {
+          group.latestFailOrder = order;
           group.lastFailure = row;
         }
         if (!group.firstFailedAt || createdAtMs < Date.parse(group.firstFailedAt)) {
@@ -14573,7 +14763,11 @@ ${errorText}`.trim();
         group.lastFailure = row;
       }
       group.requiredCommands.add(command);
-      const hints = collectValidationPathHints(asString3(row.stderrTail), asString3(row.stdoutTail), command);
+      for (const failedTest of asStringArray3(metadata.failedTests)) {
+        group.failedTests.add(failedTest);
+      }
+      const metadataHints = asStringArray3(metadata.targetPathHints);
+      const hints = collectValidationPathHints(...metadataHints, asString3(row.stderrTail), asString3(row.stdoutTail), command);
       for (const hint of hints) {
         if (!group.pathHints.includes(hint))
           group.pathHints.push(hint);
@@ -14589,20 +14783,22 @@ ${errorText}`.trim();
           group.requiredCommands.add(command);
       }
     }
-    const activeGroups = [...groups.values()].filter((group) => group.failureCount >= 2).filter((group) => group.latestFailAtMs > group.latestPassAtMs).sort((a, b) => {
+    const activeGroups = [...groups.values()].filter((group) => group.failureCount >= 2).filter((group) => group.source !== "trusted_host" || group.failedJobIds.size >= 2).filter((group) => laterThan(group.latestFailOrder, latestPassByCommandAndSource.get(`${group.command}
+${group.source}`) ?? null)).sort((a, b) => {
       if (b.failureCount !== a.failureCount)
         return b.failureCount - a.failureCount;
       if (b.failedJobIds.size !== a.failedJobIds.size) {
         return b.failedJobIds.size - a.failedJobIds.size;
       }
-      return b.latestFailAtMs - a.latestFailAtMs;
+      return (b.latestFailOrder?.createdAtMs ?? 0) - (a.latestFailOrder?.createdAtMs ?? 0);
     });
     const selected = activeGroups[0];
     if (!selected?.lastFailure)
       return null;
     const sample = truncateText(asString3(selected.lastFailure.stderrTail) || asString3(selected.lastFailure.stdoutTail), 900);
     const failureClass = asString3(selected.lastFailure.failureClass) || null;
-    const digest = validationIncidentDigest(selected.command, failureClass, sample);
+    const digest = selected.failureFingerprint ? sha256Hex(`${selected.command}
+${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selected.command, failureClass, sample);
     return {
       active: true,
       incident_id: `valid_inc_${digest}`,
@@ -14618,7 +14814,11 @@ ${errorText}`.trim();
       digest,
       sample_error: sample,
       required_commands: [...selected.requiredCommands].slice(0, 8),
-      target_path_hints: selected.pathHints.slice(0, 8)
+      target_path_hints: selected.pathHints.slice(0, 8),
+      failed_tests: [...selected.failedTests].slice(0, 12),
+      failure_fingerprint: selected.failureFingerprint,
+      source: selected.source,
+      cross_job_circuit_open: selected.source === "trusted_host" && selected.failedJobIds.size >= 2
     };
   }
   buildTopSignals(requestSlo, jobSlo, executionHealth, validationIncident) {
@@ -15232,6 +15432,7 @@ ${errorText}`.trim();
         open_objectives: snapshot.open_objectives.slice(0, 40),
         recent_objectives: snapshot.recent_objectives.slice(0, 80),
         repo_health_flags: snapshot.repo_health_flags,
+        validation_incident: snapshot.validation_incident,
         dispatch_budget: snapshot.dispatch_budget,
         resource_budget: snapshot.resource_budget,
         payload_hash: payloadHash
@@ -15247,6 +15448,7 @@ ${errorText}`.trim();
       engine_idea_priors: snapshot.engine_idea_priors.slice(0, 20),
       engine_source_priors: snapshot.engine_source_priors.slice(0, 20),
       repo_health_flags: snapshot.repo_health_flags,
+      validation_incident: snapshot.validation_incident,
       dispatch_budget: snapshot.dispatch_budget,
       resource_budget: snapshot.resource_budget,
       payload_hash: payloadHash,
@@ -15592,6 +15794,20 @@ ${errorText}`.trim();
     }
     return null;
   }
+  snapshotAuthorizesRequiredValidationRepair(snapshotId) {
+    const row = this.db.prepare(`SELECT payload_json FROM autonomy_snapshots WHERE snapshot_id = ?`).get(snapshotId);
+    if (!row?.payload_json)
+      return false;
+    const payload = parseJsonObject(row.payload_json);
+    const incident = asObject2(payload.validation_incident);
+    const flags = asObject2(payload.repo_health_flags);
+    if (!asBoolean2(flags.required_validation_red, false) || !asBoolean2(incident.active, false)) {
+      return false;
+    }
+    const snapshotIncidentId = asString3(incident.incident_id);
+    const liveIncident = this.detectActiveValidationIncident(asIsoNow());
+    return Boolean(snapshotIncidentId && liveIncident?.active && liveIncident.incident_id === snapshotIncidentId);
+  }
   evaluateEligibility(body) {
     const runId = asString3(body.runId);
     const snapshotId = asString3(body.snapshotId);
@@ -15611,6 +15827,7 @@ ${errorText}`.trim();
     const preflightErr = this.preflightReason(snapshotId, runId);
     const safetyErr = this.safetyBlockReason(now);
     const resourceBudgetErr = this.resourceBudgetBlockReason(now);
+    const requiredValidationRepairAuthorized = this.snapshotAuthorizesRequiredValidationRepair(snapshotId);
     const activePatternRows = this.db.prepare(`SELECT DISTINCT pattern_key AS patternKey
          FROM autonomy_objectives
          WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`).all();
@@ -15630,6 +15847,7 @@ ${errorText}`.trim();
       const patternKey = asString3(record.patternKey ?? record.pattern_key);
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp012(asNumber(record.confidence, 0));
+      const requiredValidationRepair = requiredValidationRepairAuthorized && asBoolean2(record.requiredValidationRepair ?? record.required_validation_repair, false);
       const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
       if (pushpalsInternalErr) {
         return {
@@ -15668,18 +15886,20 @@ ${errorText}`.trim();
           reason: "max concurrent objectives reached"
         };
       }
-      const cooldownErr = this.cooldownReason(patternKey, now);
-      if (cooldownErr) {
-        return { candidate_id: candidateId, ok: false, reason: cooldownErr };
-      }
-      const recentSuccessErr = this.recentSuccessSuppressionReason({
-        patternKey,
-        objectiveType,
-        componentArea,
-        nowIso: now
-      });
-      if (recentSuccessErr) {
-        return { candidate_id: candidateId, ok: false, reason: recentSuccessErr };
+      if (!requiredValidationRepair) {
+        const cooldownErr = this.cooldownReason(patternKey, now);
+        if (cooldownErr) {
+          return { candidate_id: candidateId, ok: false, reason: cooldownErr };
+        }
+        const recentSuccessErr = this.recentSuccessSuppressionReason({
+          patternKey,
+          objectiveType,
+          componentArea,
+          nowIso: now
+        });
+        if (recentSuccessErr) {
+          return { candidate_id: candidateId, ok: false, reason: recentSuccessErr };
+        }
       }
       if (preflightErr) {
         return { candidate_id: candidateId, ok: false, reason: preflightErr };
@@ -15857,6 +16077,7 @@ ${errorText}`.trim();
     const objectiveCandidateRaw = asString3(objective.candidateId ?? objective.candidate_id);
     const objectiveCandidateId = objectiveCandidateRaw ? scopedCandidateStorageId(runId, objectiveCandidateRaw) : null;
     if (objectiveStatus === "dispatched") {
+      const requiredValidationRepair = asBoolean2(objective.requiredValidationRepair ?? objective.required_validation_repair ?? asObject2(body.candidate).requiredValidationRepair ?? asObject2(body.candidate).required_validation_repair ?? body.requiredValidationRepair ?? body.required_validation_repair, false);
       const overrideCooldown = asBoolean2(objective.overrideCooldown ?? objective.override_cooldown ?? body.overrideCooldown ?? body.override_cooldown, false);
       const eligibility = this.evaluateEligibility({
         runId,
@@ -15866,7 +16087,8 @@ ${errorText}`.trim();
             candidate_id: objectiveId,
             objective_type: objectiveType,
             pattern_key: patternKey,
-            confidence: clamp012(asNumber(objective.confidence, 0))
+            confidence: clamp012(asNumber(objective.confidence, 0)),
+            required_validation_repair: requiredValidationRepair
           }
         ]
       });
@@ -19526,7 +19748,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           installDurationMs: trustedInstallDurationMs,
           validationDurationMs: trustedValidationDurationMs,
           installCacheHit: trustedValidationCacheHit
-        });
+        }, body.trustedValidationReport);
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");
@@ -19579,7 +19801,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           installDurationMs: typeof body.trustedInstallDurationMs === "number" ? body.trustedInstallDurationMs : null,
           validationDurationMs: typeof body.trustedValidationDurationMs === "number" ? body.trustedValidationDurationMs : null,
           installCacheHit: typeof body.trustedValidationCacheHit === "boolean" ? body.trustedValidationCacheHit : null
-        });
+        }, body.trustedValidationReport);
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");

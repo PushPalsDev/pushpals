@@ -11,8 +11,13 @@
  */
 
 import { Database } from "bun:sqlite";
-import { randomUUID } from "crypto";
-import { normalizeTrustedValidationCommands } from "../../../packages/shared/src/trusted_validation.js";
+import { createHash, randomUUID } from "crypto";
+import {
+  extractTrustedValidationFailureEvidence,
+  normalizeTrustedValidationCommands,
+  type TrustedValidationExecutionResult,
+  type TrustedValidationReport,
+} from "../../../packages/shared/src/trusted_validation.js";
 
 export type CompletionStatus = "pending" | "claimed" | "processed" | "failed";
 
@@ -69,6 +74,100 @@ function normalizeTrustedValidationTiming(timing?: TrustedValidationTiming): {
     installCacheHit:
       typeof timing?.installCacheHit === "boolean" ? (timing.installCacheHit ? 1 : 0) : null,
   };
+}
+
+function trustedValidationText(value: unknown, maxLength: number): string {
+  return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+function trustedValidationStringArray(value: unknown, maxItems = 20): string[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value
+        .map((entry) => trustedValidationText(entry, 1_000))
+        .filter(Boolean)
+        .slice(0, maxItems),
+    ),
+  ].sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeTrustedValidationReport(value: unknown): TrustedValidationReport | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  if (input.version !== 1 || !Array.isArray(input.results)) return null;
+  const results: TrustedValidationExecutionResult[] = [];
+  for (const raw of input.results.slice(0, 16)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const result = raw as Record<string, unknown>;
+    const command = trustedValidationText(result.command, 1_000);
+    const phase = result.phase === "dependency_install" ? "dependency_install" : "validation";
+    if (!command) continue;
+    const ok = result.ok === true;
+    const output = trustedValidationText(result.output, 16_000);
+    const exitCode =
+      typeof result.exitCode === "number" && Number.isFinite(result.exitCode)
+        ? Math.max(-1, Math.min(999, Math.floor(result.exitCode)))
+        : ok
+          ? 0
+          : 1;
+    const evidence = extractTrustedValidationFailureEvidence({ command, phase, output, exitCode });
+    results.push({
+      ok,
+      command,
+      output,
+      exitCode,
+      durationMs:
+        typeof result.durationMs === "number" && Number.isFinite(result.durationMs)
+          ? Math.max(0, Math.min(24 * 60 * 60 * 1_000, Math.floor(result.durationMs)))
+          : 0,
+      cached: result.cached === true,
+      phase,
+      ...(ok
+        ? {}
+        : {
+            failureClass: evidence.failureClass,
+            failedTests:
+              trustedValidationStringArray(result.failedTests).length > 0
+                ? trustedValidationStringArray(result.failedTests)
+                : evidence.failedTests,
+            targetPathHints:
+              trustedValidationStringArray(result.targetPathHints).length > 0
+                ? trustedValidationStringArray(result.targetPathHints)
+                : evidence.targetPathHints,
+          }),
+    });
+  }
+  return {
+    version: 1,
+    baselineSha: trustedValidationText(input.baselineSha, 128) || null,
+    candidateSha: trustedValidationText(input.candidateSha, 128) || null,
+    results,
+  };
+}
+
+function trustedValidationFailureFingerprint(result: TrustedValidationExecutionResult): string {
+  const fallback = result.output
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/\b\d+(?:\.\d+)?(?:ms|s)\b/gi, "<duration>"))
+    .filter((line) => /\b(?:error|fail|failed|failure|timeout)\b/i.test(line))
+    .slice(0, 4);
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        command: result.command.trim().replace(/\s+/g, " ").toLowerCase(),
+        failureClass: result.failureClass ?? "trusted_validation_failed",
+        failedTests: trustedValidationStringArray(result.failedTests),
+        targetPathHints: trustedValidationStringArray(result.targetPathHints),
+        fallback:
+          (result.failedTests?.length ?? 0) > 0 || (result.targetPathHints?.length ?? 0) > 0
+            ? []
+            : fallback,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 24);
 }
 
 export class CompletionQueue {
@@ -503,11 +602,13 @@ export class CompletionQueue {
     completionId: string,
     prUrl?: string | null,
     trustedTiming?: TrustedValidationTiming,
+    trustedReportInput?: unknown,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
     const normalizedPrUrl =
       typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
     const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
+    const trustedReport = normalizeTrustedValidationReport(trustedReportInput);
     const tx = this.db.transaction((): CompletionFinalizationResult => {
       const completion = this.getCompletion(completionId);
       if (!completion) return { ok: false, message: "Completion not found" };
@@ -548,6 +649,7 @@ export class CompletionQueue {
           now,
           completionId,
         );
+      this.replaceTrustedValidationRuns(completion, trustedReport, now);
       const transitioned = this.db
         .prepare(
           `UPDATE jobs
@@ -603,10 +705,12 @@ export class CompletionQueue {
     completionId: string,
     error: string,
     trustedTiming?: TrustedValidationTiming,
+    trustedReportInput?: unknown,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
     const failure = String(error || "Unknown publication error");
     const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
+    const trustedReport = normalizeTrustedValidationReport(trustedReportInput);
     const tx = this.db.transaction((): CompletionFinalizationResult => {
       const completion = this.getCompletion(completionId);
       if (!completion) return { ok: false, message: "Completion not found" };
@@ -646,6 +750,7 @@ export class CompletionQueue {
           now,
           completionId,
         );
+      this.replaceTrustedValidationRuns(completion, trustedReport, now);
       const transitioned = this.db
         .prepare(
           `UPDATE jobs
@@ -701,6 +806,63 @@ export class CompletionQueue {
       };
     });
     return tx();
+  }
+
+  private replaceTrustedValidationRuns(
+    completion: CompletionRow,
+    report: TrustedValidationReport | null,
+    now: string,
+  ): void {
+    if (!completion.trustedValidationCommandsJson || !report || report.results.length === 0) return;
+    const requested = normalizeTrustedValidationCommands(completion.trustedValidationCommandsJson);
+    if (!requested.ok) return;
+    const allowedCommands = new Set(
+      requested.commands.map((command) => command.trim().replace(/\s+/g, " ").toLowerCase()),
+    );
+    this.db
+      .prepare(
+        `DELETE FROM job_validation_runs
+         WHERE jobId = ?
+           AND json_extract(metadataJson, '$.source') = 'trusted_host'
+           AND json_extract(metadataJson, '$.completionId') = ?`,
+      )
+      .run(completion.jobId, completion.id);
+    const insert = this.db.prepare(
+      `INSERT INTO job_validation_runs (
+         jobId, attempt, command, exitCode, durationMs, passed, failureClass,
+         stdoutTail, stderrTail, metadataJson, createdAt
+       ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+    );
+    for (const result of report.results) {
+      const normalizedCommand = result.command.trim().replace(/\s+/g, " ").toLowerCase();
+      if (result.phase !== "dependency_install" && !allowedCommands.has(normalizedCommand)) {
+        continue;
+      }
+      const failedTests = trustedValidationStringArray(result.failedTests);
+      const targetPathHints = trustedValidationStringArray(result.targetPathHints);
+      const failureFingerprint = result.ok ? null : trustedValidationFailureFingerprint(result);
+      insert.run(
+        completion.jobId,
+        result.command,
+        result.exitCode,
+        result.durationMs,
+        result.ok ? 1 : 0,
+        result.ok ? null : (result.failureClass ?? "trusted_validation_failed"),
+        result.output.slice(-8_000),
+        JSON.stringify({
+          source: "trusted_host",
+          completionId: completion.id,
+          phase: result.phase,
+          cached: Boolean(result.cached),
+          baselineSha: report.baselineSha,
+          candidateSha: completion.commitSha ?? report.candidateSha,
+          failureFingerprint,
+          failedTests,
+          targetPathHints,
+        }),
+        now,
+      );
+    }
   }
 
   private upsertPublicationTerminalDiagnostics(options: {

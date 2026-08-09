@@ -148,6 +148,35 @@ describe("server CompletionQueue PR URL persistence", () => {
         validationDurationMs: 32_100,
         installCacheHit: false,
       },
+      {
+        version: 1,
+        baselineSha: "base123",
+        candidateSha: "spoofed-candidate",
+        results: [
+          {
+            ok: false,
+            command: "bun run validate:publish",
+            output:
+              "account/__tests__/AccountContext.test.tsx:\n(fail) mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured [7ms]",
+            exitCode: 1,
+            durationMs: 32_100,
+            phase: "validation",
+            failureClass: "test_failure",
+            failedTests: [
+              "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured",
+            ],
+            targetPathHints: ["account/__tests__/AccountContext.test.tsx"],
+          },
+          {
+            ok: false,
+            command: "bun run unrelated",
+            output: "(fail) unrelated callback command",
+            exitCode: 1,
+            durationMs: 100,
+            phase: "validation",
+          },
+        ],
+      },
     );
     expect(failed).toMatchObject({ ok: true, jobId, jobTransitioned: true });
     expect(jobs.getJob(jobId)).toMatchObject({
@@ -163,6 +192,26 @@ describe("server CompletionQueue PR URL persistence", () => {
     expect(completions.markFailedAndBlockJob(completionId, "duplicate callback")).toMatchObject({
       ok: true,
       jobTransitioned: false,
+    });
+    const validationRuns = jobs.getJobDiagnostics(jobId).validationRuns as Array<
+      Record<string, unknown>
+    >;
+    expect(validationRuns).toHaveLength(1);
+    expect(validationRuns[0]).toMatchObject({
+      command: "bun run validate:publish",
+      passed: false,
+      failureClass: "test_failure",
+      metadata: {
+        source: "trusted_host",
+        completionId,
+        baselineSha: "base123",
+        candidateSha: "def456",
+        failureFingerprint: expect.any(String),
+        failedTests: [
+          "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured",
+        ],
+        targetPathHints: ["account/__tests__/AccountContext.test.tsx"],
+      },
     });
     expect(completions.getCompletion(completionId)).toMatchObject({
       trustedInstallDurationMs: 7_654,
