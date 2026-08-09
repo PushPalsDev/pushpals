@@ -38,6 +38,7 @@ export interface CompletionRow {
   trustedInstallDurationMs: number | null;
   trustedValidationDurationMs: number | null;
   trustedValidationCacheHit: number | null;
+  trustedValidationRecoveryAttempts: number;
   status: CompletionStatus;
   pusherId: string | null;
   error: string | null;
@@ -53,7 +54,16 @@ export interface CompletionFinalizationResult {
   durationMs?: number;
   completedAt?: string;
   publishBlockedAt?: string;
+  requeuedCompletionIds?: string[];
+  requeuedJobIds?: string[];
 }
+
+const TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 3;
+
+type TrustedValidationRecoveryCandidate = {
+  completionId: string;
+  jobId: string;
+};
 
 export interface TrustedValidationTiming {
   installDurationMs?: number | null;
@@ -170,6 +180,10 @@ function trustedValidationFailureFingerprint(result: TrustedValidationExecutionR
     .slice(0, 24);
 }
 
+function trustedValidationCommandKey(value: unknown): string {
+  return typeof value === "string" ? value.trim().replace(/\s+/g, " ").toLowerCase() : "";
+}
+
 export class CompletionQueue {
   private db: Database;
 
@@ -198,6 +212,7 @@ export class CompletionQueue {
         trustedInstallDurationMs INTEGER,
         trustedValidationDurationMs INTEGER,
         trustedValidationCacheHit INTEGER,
+        trustedValidationRecoveryAttempts INTEGER NOT NULL DEFAULT 0,
         status     TEXT NOT NULL DEFAULT 'pending',
         pusherId   TEXT,
         error      TEXT,
@@ -242,8 +257,14 @@ export class CompletionQueue {
     if (!columns.some((col) => col.name === "trustedValidationCacheHit")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN trustedValidationCacheHit INTEGER;`);
     }
+    if (!columns.some((col) => col.name === "trustedValidationRecoveryAttempts")) {
+      this.db.exec(
+        `ALTER TABLE completions ADD COLUMN trustedValidationRecoveryAttempts INTEGER NOT NULL DEFAULT 0;`,
+      );
+    }
 
     this.reconcileLegacyParentJobStates();
+    this.reconcileRecoverableTrustedValidationFailures();
   }
 
   private reconcileLegacyParentJobStates(): void {
@@ -348,6 +369,77 @@ export class CompletionQueue {
       }
     });
     tx();
+  }
+
+  private reconcileRecoverableTrustedValidationFailures(): void {
+    const requiredTables = ["jobs", "job_validation_runs", "job_terminal_diagnostics"];
+    const present = this.db
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name IN ('jobs', 'job_validation_runs', 'job_terminal_diagnostics')`,
+      )
+      .all() as Array<{ name: string }>;
+    const presentNames = new Set(present.map((row) => row.name));
+    if (!requiredTables.every((name) => presentNames.has(name))) return;
+
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT c.id AS completionId,
+                         c.jobId AS jobId,
+                         failed.command AS failedCommand,
+                         passed.command AS passedCommand
+         FROM completions c
+         JOIN jobs blockedJob ON blockedJob.id = c.jobId
+         JOIN job_validation_runs failed ON failed.jobId = c.jobId
+         JOIN job_validation_runs passed
+           ON passed.passed = 1
+          AND json_extract(passed.metadataJson, '$.source') = 'trusted_host'
+          AND (
+            datetime(passed.createdAt) > datetime(failed.createdAt)
+            OR (datetime(passed.createdAt) = datetime(failed.createdAt) AND passed.id > failed.id)
+          )
+         JOIN jobs passedJob ON passedJob.id = passed.jobId AND passedJob.status = 'completed'
+         WHERE c.status = 'failed'
+           AND blockedJob.status = 'publish_blocked'
+           AND c.trustedValidationCommandsJson IS NOT NULL
+           AND c.trustedValidationRecoveryAttempts < ?
+           AND failed.passed = 0
+           AND json_extract(failed.metadataJson, '$.source') = 'trusted_host'
+           AND json_extract(failed.metadataJson, '$.completionId') = c.id
+         ORDER BY c.createdAt ASC, c.id ASC
+         LIMIT 256`,
+      )
+      .all(TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS) as Array<{
+      completionId: string;
+      jobId: string;
+      failedCommand: string;
+      passedCommand: string;
+    }>;
+    const eligible = new Map<string, TrustedValidationRecoveryCandidate>();
+    for (const row of rows) {
+      if (
+        !trustedValidationCommandKey(row.failedCommand) ||
+        trustedValidationCommandKey(row.failedCommand) !==
+          trustedValidationCommandKey(row.passedCommand)
+      ) {
+        continue;
+      }
+      eligible.set(row.completionId, {
+        completionId: row.completionId,
+        jobId: row.jobId,
+      });
+    }
+    if (eligible.size === 0) return;
+    const now = new Date().toISOString();
+    const tx = this.db.transaction(() =>
+      this.restoreTrustedValidationBlockedCompletions([...eligible.values()], now),
+    );
+    const recovered = tx();
+    if (recovered.jobIds.length > 0) {
+      console.log(
+        `[Server] Startup recovery requeued ${recovered.jobIds.length} retained trusted-validation candidate(s): ${recovered.jobIds.join(", ")}`,
+      );
+    }
   }
 
   /**
@@ -681,6 +773,11 @@ export class CompletionQueue {
           now,
         });
       }
+      const recovered = this.requeueTrustedValidationBlockedCompletionsAfterPass(
+        completion,
+        trustedReport,
+        now,
+      );
       const saved = this.db
         .prepare(`SELECT durationMs, completedAt FROM jobs WHERE id = ?`)
         .get(completion.jobId) as
@@ -692,6 +789,12 @@ export class CompletionQueue {
         jobTransitioned: transitioned.changes > 0,
         durationMs: saved?.durationMs ?? undefined,
         completedAt: saved?.completedAt ?? undefined,
+        ...(recovered.completionIds.length > 0
+          ? {
+              requeuedCompletionIds: recovered.completionIds,
+              requeuedJobIds: recovered.jobIds,
+            }
+          : {}),
       };
     });
     return tx();
@@ -863,6 +966,122 @@ export class CompletionQueue {
         now,
       );
     }
+  }
+
+  /**
+   * A trusted-host pass on a newer candidate proves that a previously red
+   * validation command can execute successfully again. Requeue retained
+   * candidates that were blocked by that same command so SourceControlManager
+   * can apply them to the repaired baseline and validate them again.
+   *
+   * Recovery is deliberately bounded per completion. A candidate-specific
+   * failure can therefore make progress after later baseline repairs without
+   * bouncing forever whenever an unrelated candidate passes validation.
+   */
+  private requeueTrustedValidationBlockedCompletionsAfterPass(
+    passingCompletion: CompletionRow,
+    report: TrustedValidationReport | null,
+    now: string,
+  ): { completionIds: string[]; jobIds: string[] } {
+    if (!passingCompletion.trustedValidationCommandsJson || !report) {
+      return { completionIds: [], jobIds: [] };
+    }
+    const requested = normalizeTrustedValidationCommands(
+      passingCompletion.trustedValidationCommandsJson,
+    );
+    if (!requested.ok) return { completionIds: [], jobIds: [] };
+    const allowed = new Set(requested.commands.map(trustedValidationCommandKey));
+    const passedCommands = new Set(
+      report.results
+        .filter((result) => result.ok && result.phase === "validation")
+        .map((result) => trustedValidationCommandKey(result.command))
+        .filter((command) => command && allowed.has(command)),
+    );
+    if (passedCommands.size === 0) return { completionIds: [], jobIds: [] };
+
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT c.id AS completionId,
+                         c.jobId AS jobId,
+                         c.trustedValidationRecoveryAttempts AS recoveryAttempts,
+                         r.command AS command
+         FROM completions c
+         JOIN jobs j ON j.id = c.jobId
+         JOIN job_validation_runs r ON r.jobId = c.jobId
+         WHERE c.status = 'failed'
+           AND j.status = 'publish_blocked'
+           AND c.id != ?
+           AND c.trustedValidationCommandsJson IS NOT NULL
+           AND c.trustedValidationRecoveryAttempts < ?
+           AND r.passed = 0
+           AND json_extract(r.metadataJson, '$.source') = 'trusted_host'
+           AND json_extract(r.metadataJson, '$.completionId') = c.id
+           AND datetime(r.createdAt) <= datetime(?)
+         ORDER BY c.createdAt ASC, c.id ASC`,
+      )
+      .all(passingCompletion.id, TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS, now) as Array<{
+      completionId: string;
+      jobId: string;
+      recoveryAttempts: number;
+      command: string;
+    }>;
+    const eligible = new Map<string, TrustedValidationRecoveryCandidate>();
+    for (const row of rows) {
+      if (!passedCommands.has(trustedValidationCommandKey(row.command))) continue;
+      eligible.set(row.completionId, {
+        completionId: row.completionId,
+        jobId: row.jobId,
+      });
+    }
+
+    return this.restoreTrustedValidationBlockedCompletions([...eligible.values()], now);
+  }
+
+  private restoreTrustedValidationBlockedCompletions(
+    candidates: TrustedValidationRecoveryCandidate[],
+    now: string,
+  ): { completionIds: string[]; jobIds: string[] } {
+    const completionIds: string[] = [];
+    const jobIds: string[] = [];
+    for (const row of candidates) {
+      const completionUpdate = this.db
+        .prepare(
+          `UPDATE completions
+           SET status = 'pending',
+               pusherId = NULL,
+               error = NULL,
+               trustedValidationRecoveryAttempts = trustedValidationRecoveryAttempts + 1,
+               updatedAt = ?
+           WHERE id = ?
+             AND status = 'failed'
+             AND trustedValidationRecoveryAttempts < ?`,
+        )
+        .run(now, row.completionId, TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS);
+      if (completionUpdate.changes === 0) continue;
+      const jobUpdate = this.db
+        .prepare(
+          `UPDATE jobs
+           SET status = 'finalizing',
+               error = NULL,
+               completedAt = NULL,
+               failedAt = NULL,
+               abandonedAt = NULL,
+               publishBlockedAt = NULL,
+               durationMs = NULL,
+               updatedAt = ?
+           WHERE id = ? AND status = 'publish_blocked'`,
+        )
+        .run(now, row.jobId);
+      if (jobUpdate.changes === 0) {
+        throw new Error(
+          `Failed to restore parent job ${row.jobId} while requeueing completion ${row.completionId}`,
+        );
+      }
+      this.db.prepare(`DELETE FROM job_terminal_diagnostics WHERE jobId = ?`).run(row.jobId);
+      completionIds.push(row.completionId);
+      jobIds.push(row.jobId);
+    }
+    return { completionIds, jobIds };
   }
 
   private upsertPublicationTerminalDiagnostics(options: {

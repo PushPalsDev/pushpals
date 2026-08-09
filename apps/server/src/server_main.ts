@@ -2304,6 +2304,11 @@ export function createRequestHandler() {
           },
           body.trustedValidationReport,
         );
+        if (result.ok && (result.requeuedJobIds?.length ?? 0) > 0) {
+          console.log(
+            `[Server] Trusted validation recovered; requeued ${result.requeuedJobIds?.length ?? 0} retained publication candidate(s): ${result.requeuedJobIds?.join(", ")}`,
+          );
+        }
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord(job?.params ?? "");
