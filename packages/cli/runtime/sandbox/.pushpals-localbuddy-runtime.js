@@ -2428,20 +2428,21 @@ class OpenAiCodexCliClient {
     throw new Error(`Codex CLI is not logged in for ChatGPT auth mode. Run \`bunx --yes @openai/codex login\` (or \`codex login\`) and retry.${detail ? ` Details: ${detail}` : ""}`);
   }
   async preflight() {
+    const authMode = this.effectiveAuthMode();
+    if (authMode === "api_key") {
+      const finalApiKey = this.apiKey || (process.env.OPENAI_API_KEY ?? "").trim();
+      if (!finalApiKey) {
+        throw new Error("openai_codex API-key auth requires OPENAI_API_KEY (or service llm.api_key), but none is configured.");
+      }
+    }
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
     const env = { ...process.env };
     env.PYTHONIOENCODING = "utf-8";
-    const authMode = this.effectiveAuthMode();
     if (authMode === "chatgpt") {
       delete env.OPENAI_API_KEY;
       delete env.OPENAI_BASE_URL;
       delete env.OPENAI_API_BASE;
       await this.ensureChatGptLoginReady(commandPrefix, env);
-      return;
-    }
-    const finalApiKey = this.apiKey || (process.env.OPENAI_API_KEY ?? "").trim();
-    if (!finalApiKey) {
-      throw new Error("openai_codex API-key auth requires OPENAI_API_KEY (or service llm.api_key), but none is configured.");
     }
   }
   async runCodexExec(prompt) {
