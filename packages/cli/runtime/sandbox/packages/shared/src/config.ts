@@ -211,6 +211,7 @@ export interface PushPalsConfig {
     dockerNetworkMode: string;
     dockerWarmMemoryMb: number;
     dockerWarmCpus: number;
+    dependencyPreparationTimeoutMs: number;
     fileModifyingJobs: string[];
     outputMaxChars: number;
     outputMaxLines: number;
@@ -727,10 +728,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
   );
   const sessionTokenBudget = Math.max(
     0,
-    asInt(
-      parseIntEnv("PUSHPALS_SESSION_TOKEN_BUDGET") ?? serverNode.session_token_budget,
-      0,
-    ),
+    asInt(parseIntEnv("PUSHPALS_SESSION_TOKEN_BUDGET") ?? serverNode.session_token_budget, 0),
   );
   const sessionTokenBudgetAction: "pause" = "pause";
 
@@ -1291,6 +1289,18 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     Math.min(
       16,
       asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_CPUS") ?? workerNode.docker_warm_cpus, 2),
+    ),
+  );
+  const workerDependencyPreparationTimeoutMs = Math.max(
+    30_000,
+    Math.min(
+      20 * 60_000,
+      asInt(
+        parseIntEnv("WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ??
+          parseIntEnv("PUSHPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ??
+          workerNode.dependency_preparation_timeout_ms,
+        5 * 60_000,
+      ),
     ),
   );
   const workerLlm = resolveLlmConfig(
@@ -2134,6 +2144,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
       dockerJobRetryBackoffMs: workerDockerJobRetryBackoffMs,
       dockerWarmMemoryMb: workerDockerWarmMemoryMb,
       dockerWarmCpus: workerDockerWarmCpus,
+      dependencyPreparationTimeoutMs: workerDependencyPreparationTimeoutMs,
       fileModifyingJobs: workerFileModifyingJobs,
       outputMaxChars: workerOutputMaxChars,
       outputMaxLines: workerOutputMaxLines,

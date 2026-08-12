@@ -1056,6 +1056,8 @@ export function createRequestHandler() {
         const autoscalableTaskExecutePending =
           jobQueue.countAutoscalablePendingByKind("task.execute");
         const openUnmergedWorkerPrs = jobQueue.countOpenUnmergedWorkerPrs();
+        completionQueue.recoverExpiredClaims();
+        const publication = completionQueue.publicationBacklogSummary();
         return makeJson({
           ok: true,
           workers: {
@@ -1068,7 +1070,13 @@ export function createRequestHandler() {
             pending: taskExecutePending,
             claimed: taskExecuteClaimed,
             autoscalablePending: autoscalableTaskExecutePending,
+            finalizing: publication.finalizing,
           },
+          completions: {
+            pending: publication.pending,
+            claimed: publication.claimed,
+          },
+          publication,
           prs: {
             openUnmerged: openUnmergedWorkerPrs,
           },
@@ -1107,7 +1115,9 @@ export function createRequestHandler() {
         const jobPriorityCounts = jobQueue.countByPriority();
         const jobPendingSnapshot = jobQueue.nextPendingSnapshot(10);
         const jobSlo = jobQueue.sloSummary(24);
+        completionQueue.recoverExpiredClaims();
         const completionCounts = completionQueue.countByStatus();
+        const publication = completionQueue.publicationBacklogSummary();
         const abandonedJobs = Math.max(0, Number(jobSlo.abandoned ?? 0));
         const failedJobs = Math.max(0, Number(jobSlo.failed ?? 0));
         const publishBlockedJobs = Math.max(0, Number(jobSlo.publishBlocked ?? 0));
@@ -1158,6 +1168,7 @@ export function createRequestHandler() {
               })),
             },
             completions: completionCounts,
+            publication,
           },
           slo: {
             requests: requestSlo,
@@ -2271,8 +2282,26 @@ export function createRequestHandler() {
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const pusherId = (body.pusherId as string) || "unknown";
-        const result = completionQueue.claim(pusherId);
+        const result = completionQueue.claim(pusherId, {
+          leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
+          reconcilePusher: body.reconcilePusher === true,
+        });
         return makeJson(result, result.ok ? 200 : 404);
+      }
+
+      // POST /completions/:id/lease/renew
+      const compLeaseMatch = pathname.match(/^\/completions\/([^/]+)\/lease\/renew$/);
+      if (compLeaseMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const pusherId = typeof body.pusherId === "string" ? body.pusherId.trim() : "";
+        if (!pusherId) return makeJson({ ok: false, message: "pusherId is required" }, 400);
+        const result = completionQueue.renewLease(compLeaseMatch[1], pusherId, {
+          leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
+        });
+        return makeJson(result, result.ok ? 200 : 409);
       }
 
       // POST /completions/:id/processed
@@ -2303,6 +2332,7 @@ export function createRequestHandler() {
             installCacheHit: trustedValidationCacheHit,
           },
           body.trustedValidationReport,
+          typeof body.pusherId === "string" ? body.pusherId : null,
         );
         if (result.ok && (result.requeuedJobIds?.length ?? 0) > 0) {
           console.log(
@@ -2380,6 +2410,7 @@ export function createRequestHandler() {
                 : null,
           },
           body.trustedValidationReport,
+          typeof body.pusherId === "string" ? body.pusherId : null,
         );
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);

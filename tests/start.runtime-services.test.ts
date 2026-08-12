@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   ServiceManager,
+  buildWindowsManagedServiceTreeTerminationArgv,
   buildCoreManagedServiceSpecs,
   computeLocalBuddyRestartBackoffMs,
   resolveLocalBuddyRuntimeAction,
@@ -8,6 +9,16 @@ import {
 } from "../scripts/start_runtime_services";
 
 describe("start runtime service helpers", () => {
+  test("builds forced Windows process-tree termination for unhealthy services", () => {
+    expect(buildWindowsManagedServiceTreeTerminationArgv(7654)).toEqual([
+      "taskkill",
+      "/PID",
+      "7654",
+      "/T",
+      "/F",
+    ]);
+  });
+
   test("buildCoreManagedServiceSpecs excludes LocalBuddy so it can be supervised dynamically", () => {
     const specs = buildCoreManagedServiceSpecs();
     expect(specs.map((spec) => spec.name)).toEqual([
@@ -238,5 +249,62 @@ describe("start runtime service helpers", () => {
     manager.stop();
 
     expect(killSignal).toBe("SIGTERM");
+  });
+
+  test("ServiceManager restarts a service after consecutive unhealthy probes", async () => {
+    let spawnCalls = 0;
+    let terminateCalls = 0;
+    let probeCalls = 0;
+    let current: ReturnType<ServiceManager["startService"]> | null = null;
+    const manager = new ServiceManager({
+      pollMs: 20,
+      computeRestartBackoffMs: () => 20,
+      probeServiceHealth: async () => {
+        probeCalls += 1;
+        return probeCalls <= 2
+          ? { ok: false, detail: "tick stalled" }
+          : { ok: true, detail: "healthy" };
+      },
+      terminateService: async (service) => {
+        terminateCalls += 1;
+        service.exited = true;
+        service.exitCode = 1;
+      },
+      spawnService: (spec) => {
+        spawnCalls += 1;
+        current = {
+          name: spec.name,
+          proc: { pid: 9000 + spawnCalls, kill: () => {} } as any,
+          command: [...spec.command],
+          cwd: spec.cwd,
+          env: { ...(spec.env ?? {}) },
+          exited: false,
+          exitCode: null,
+          launchedAtMs: Date.now(),
+          logPath: spec.logPath,
+        };
+        return current;
+      },
+    });
+    try {
+      manager.startService({
+        name: "source_control_manager",
+        color: "green",
+        command: ["fake-scm"],
+        cwd: process.cwd(),
+        healthCheck: {
+          url: "http://127.0.0.1:1/health",
+          intervalMs: 50,
+          unhealthyThreshold: 2,
+        },
+      });
+
+      await Bun.sleep(300);
+      expect(terminateCalls).toBe(1);
+      expect(spawnCalls).toBeGreaterThanOrEqual(2);
+      expect(current?.exited).toBe(false);
+    } finally {
+      manager.stop();
+    }
   });
 });

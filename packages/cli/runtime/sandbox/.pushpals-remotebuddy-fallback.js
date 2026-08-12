@@ -1189,6 +1189,7 @@ function loadPushPalsConfig(options = {}) {
   const workerDockerJobRetryBackoffMs = Math.max(250, Math.min(60000, asInt(parseIntEnv("WORKERPALS_DOCKER_JOB_RETRY_BACKOFF_MS") ?? workerNode.docker_job_retry_backoff_ms, 3000)));
   const workerDockerWarmMemoryMb = Math.max(512, Math.min(32768, asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_MEMORY_MB") ?? workerNode.docker_warm_memory_mb, 2048)));
   const workerDockerWarmCpus = Math.max(1, Math.min(16, asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_CPUS") ?? workerNode.docker_warm_cpus, 2)));
+  const workerDependencyPreparationTimeoutMs = Math.max(30000, Math.min(20 * 60000, asInt(parseIntEnv("WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ?? parseIntEnv("PUSHPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ?? workerNode.dependency_preparation_timeout_ms, 5 * 60000)));
   const workerLlm = resolveLlmConfig(workerNode, "WORKERPALS", {
     backend: "lmstudio",
     endpoint: "http://127.0.0.1:1234",
@@ -1435,6 +1436,7 @@ function loadPushPalsConfig(options = {}) {
       dockerJobRetryBackoffMs: workerDockerJobRetryBackoffMs,
       dockerWarmMemoryMb: workerDockerWarmMemoryMb,
       dockerWarmCpus: workerDockerWarmCpus,
+      dependencyPreparationTimeoutMs: workerDependencyPreparationTimeoutMs,
       fileModifyingJobs: workerFileModifyingJobs,
       outputMaxChars: workerOutputMaxChars,
       outputMaxLines: workerOutputMaxLines,
@@ -7383,6 +7385,17 @@ class RemoteBuddyAutonomousEngine {
       return {
         workers: data.workers,
         jobs: data.jobs,
+        completions: {
+          pending: Math.max(0, Math.floor(asNumber(asObject(data.completions).pending, 0))),
+          claimed: Math.max(0, Math.floor(asNumber(asObject(data.completions).claimed, 0)))
+        },
+        publication: {
+          backlog: Math.max(0, Math.floor(asNumber(asObject(data.publication).backlog, 0))),
+          oldestPendingAgeMs: Math.max(0, Math.floor(asNumber(asObject(data.publication).oldestPendingAgeMs, 0))),
+          oldestFinalizingAgeMs: Math.max(0, Math.floor(asNumber(asObject(data.publication).oldestFinalizingAgeMs, 0))),
+          expiredClaims: Math.max(0, Math.floor(asNumber(asObject(data.publication).expiredClaims, 0))),
+          unhealthy: asBoolean2(asObject(data.publication).unhealthy, false)
+        },
         prs: {
           openUnmerged: Math.max(0, Math.floor(asNumber(asObject(data.prs).openUnmerged, 0)))
         }
@@ -7393,12 +7406,21 @@ class RemoteBuddyAutonomousEngine {
   }
   deferReasonForWorkerLoad(snapshot) {
     const busyWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.busy, 0)));
+    const onlineWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.online, 0)));
+    const idleWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.idle, 0)));
     const pendingJobs = Math.max(0, Math.floor(asNumber(snapshot.jobs.pending, 0)));
     const autoscalablePending = Math.max(0, Math.floor(asNumber(snapshot.jobs.autoscalablePending, 0)));
-    if (busyWorkers <= 0 && pendingJobs <= 0 && autoscalablePending <= 0) {
-      return null;
+    const publicationBacklog = Math.max(0, Math.floor(asNumber(snapshot.publication?.backlog, 0)));
+    const publicationUnhealthy = asBoolean2(snapshot.publication?.unhealthy, false);
+    const publicationOldestMs = Math.max(0, Math.floor(asNumber(snapshot.publication?.oldestPendingAgeMs, 0)), Math.floor(asNumber(snapshot.publication?.oldestFinalizingAgeMs, 0)));
+    const publicationBackpressureThreshold = Math.max(2, onlineWorkers);
+    if (publicationUnhealthy || publicationBacklog >= publicationBackpressureThreshold || publicationBacklog > 0 && publicationOldestMs >= 10 * 60000) {
+      return `publication_backpressure_backlog_${publicationBacklog}_oldest_${publicationOldestMs}`;
     }
-    return `worker_load_busy_${busyWorkers}_pending_${pendingJobs}_autoscalable_${autoscalablePending}`;
+    if (pendingJobs > 0 || autoscalablePending > 0 || busyWorkers > 0 && idleWorkers <= 0) {
+      return `worker_load_busy_${busyWorkers}_pending_${pendingJobs}_autoscalable_${autoscalablePending}`;
+    }
+    return null;
   }
   async fetchInspirationPatterns(limit = 60) {
     const qs = new URLSearchParams({
@@ -8141,7 +8163,7 @@ ${JSON.stringify(input.messages ?? [])}`),
       const workerLoad = await this.fetchWorkerLoadSnapshot();
       const workerLoadDeferReason = workerLoad ? this.deferReasonForWorkerLoad(workerLoad) : null;
       if (workerLoad && workerLoadDeferReason) {
-        console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: deferring ideation due to active worker load (busy=${workerLoad.workers.busy} pending=${workerLoad.jobs.pending} autoscalablePending=${workerLoad.jobs.autoscalablePending}).`);
+        console.log(`[RemoteBuddyAutonomousEngine] tick ${runId}: deferring ideation due to capacity/publication backpressure (busy=${workerLoad.workers.busy} idle=${workerLoad.workers.idle} pending=${workerLoad.jobs.pending} autoscalablePending=${workerLoad.jobs.autoscalablePending} publicationBacklog=${workerLoad.publication.backlog}).`);
         outcomeDetail = workerLoadDeferReason;
         return;
       }

@@ -1,6 +1,7 @@
 import { parseArgs } from "util";
 import { isAbsolute, join, relative, resolve } from "path";
 import { mkdirSync } from "fs";
+import { createHash } from "crypto";
 import { CommunicationManager } from "../../../packages/shared/src/communication.js";
 import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
@@ -28,12 +29,14 @@ import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
 import {
   cloneSourceControlManagerConfigSnapshot,
   createStartupStatusTracker,
+  createSourceControlManagerHealthTracker,
   createSingleFlightExecutor,
   probeReviewAgentRuntimeReadiness,
+  type SourceControlManagerPublicationHealth,
 } from "./runtime_helpers";
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
-import { runTrustedValidationCommands } from "./trusted_validation";
+import { runProcessWithTreeTimeout, runTrustedValidationCommands } from "./trusted_validation";
 import type {
   TrustedValidationExecutionResult,
   TrustedValidationReport,
@@ -56,6 +59,13 @@ type GitCmdResult = {
 const PUSH_CONFIG = loadPushPalsConfig();
 const repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
 const defaultSourceControlManagerRepoPath = resolve(PUSH_CONFIG.sourceControlManager.repoPath);
+const COMPLETION_LEASE_MS = 3 * 60_000;
+const COMPLETION_LEASE_HEARTBEAT_MS = 30_000;
+const PUBLICATION_HEALTH_POLL_MS = 10_000;
+const SCM_TICK_STALL_MS = Math.max(
+  60_000,
+  Number(process.env.PUSHPALS_SCM_TICK_STALL_MS) || 17 * 60_000,
+);
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -198,6 +208,16 @@ const dbPath = join(config.stateDir, "merge_queue.db");
 const db = new MergeQueueDB(dbPath);
 console.log(`[${ts()}] Database opened: ${dbPath}`);
 
+const sourceControlManagerPusherId = `source_control_manager-${createHash("sha256")
+  .update(`${config.repoPath}\n${config.mainBranch}\n${config.remote}`)
+  .digest("hex")
+  .slice(0, 12)}`;
+let reconcilePusherOnNextClaim = true;
+const healthTracker = createSourceControlManagerHealthTracker({
+  tickStallMs: SCM_TICK_STALL_MS,
+  idleBacklogGraceMs: Math.max(30_000, config.pollIntervalSeconds * 3_000),
+});
+
 // Recover any jobs stuck in 'running' from a previous crash
 const recovered = db.recoverStuckJobs();
 if (recovered > 0) {
@@ -212,7 +232,7 @@ const gitOps: SourceControlApi = createSourceControlApi(config);
 
 let server: ReturnType<typeof createStatusServer> | undefined;
 try {
-  server = createStatusServer(db, config.port);
+  server = createStatusServer(db, config.port, healthTracker.snapshot);
   console.log(`[${ts()}] Status server listening on http://127.0.0.1:${config.port}`);
 } catch (err: unknown) {
   const code = err instanceof Error && "code" in err ? (err as { code: string }).code : undefined;
@@ -228,6 +248,8 @@ try {
 
 let running = true;
 let statusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let publicationHealthTimer: ReturnType<typeof setInterval> | null = null;
+let publicationHealthProbeInFlight = false;
 let reviewAgentPollTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentConfigPollTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentInstance: ReviewAgent | null = null;
@@ -236,6 +258,40 @@ let shutdownPromise: Promise<void> | null = null;
 const startupStatusTracker = createStartupStatusTracker();
 let reviewAgentRuntimeStateKey = "startup";
 let reviewAgentRuntimeFingerprint = "";
+
+async function refreshPublicationHealth(): Promise<void> {
+  if (publicationHealthProbeInFlight) return;
+  publicationHealthProbeInFlight = true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3_000);
+  try {
+    const headers: Record<string, string> = {};
+    if (config.authToken) headers.Authorization = `Bearer ${config.authToken}`;
+    const response = await fetch(`${config.serverUrl}/workers/autoscale?ttlMs=15000`, {
+      headers,
+      signal: controller.signal,
+    });
+    if (!response.ok) return;
+    const payload = (await response.json().catch(() => ({}))) as {
+      publication?: SourceControlManagerPublicationHealth;
+    };
+    if (payload.publication) healthTracker.updatePublication(payload.publication);
+  } catch {
+    // A transient status-probe failure must not restart a healthy publisher.
+  } finally {
+    clearTimeout(timer);
+    publicationHealthProbeInFlight = false;
+  }
+}
+
+function startPublicationHealthPolling(): void {
+  if (publicationHealthTimer) return;
+  void refreshPublicationHealth();
+  publicationHealthTimer = setInterval(
+    () => void refreshPublicationHealth(),
+    PUBLICATION_HEALTH_POLL_MS,
+  );
+}
 
 const integrationMaintenanceIntervalMs = Math.max(
   10_000,
@@ -513,6 +569,7 @@ async function emitPusherMessage(
 }
 
 async function tick(): Promise<void> {
+  healthTracker.beginTick("integration_maintenance");
   try {
     const runtimeConfig = cloneSourceControlManagerConfigSnapshot(config);
     const reviewAgentForTick = reviewAgentInstance;
@@ -522,7 +579,7 @@ async function tick(): Promise<void> {
       headers["Authorization"] = `Bearer ${runtimeConfig.authToken}`;
     }
 
-    const pusherId = `source_control_manager-${Math.random().toString(36).substring(2, 10)}`;
+    const pusherId = sourceControlManagerPusherId;
 
     const response = await maintainIntegrationBeforeCompletionClaim({
       maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
@@ -530,9 +587,14 @@ async function tick(): Promise<void> {
         fetch(`${runtimeConfig.serverUrl}/completions/claim`, {
           method: "POST",
           headers,
-          body: JSON.stringify({ pusherId }),
+          body: JSON.stringify({
+            pusherId,
+            leaseMs: COMPLETION_LEASE_MS,
+            reconcilePusher: reconcilePusherOnNextClaim,
+          }),
         }),
     });
+    reconcilePusherOnNextClaim = false;
 
     if (!response.ok) {
       if (response.status !== 404) {
@@ -570,6 +632,7 @@ async function tick(): Promise<void> {
     }
 
     const completion = data.completion;
+    healthTracker.progress("completion_claimed", completion.id);
     const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/")
       ? parseReviewPublicationLease(completion.prBody)
       : null;
@@ -615,6 +678,63 @@ async function tick(): Promise<void> {
     }
 
     // ── Process completion ─────────────────────────────────────────────
+    let completionLeaseHeartbeatInFlight = false;
+    let completionLeaseLost = false;
+    const renewCompletionLease = async (required = false): Promise<boolean> => {
+      if (completionLeaseHeartbeatInFlight) {
+        if (!required) return !completionLeaseLost;
+        const deadline = Date.now() + 6_000;
+        while (completionLeaseHeartbeatInFlight && Date.now() < deadline) {
+          await Bun.sleep(50);
+        }
+        if (completionLeaseHeartbeatInFlight || completionLeaseLost) {
+          throw new Error("Completion publication lease heartbeat did not settle safely.");
+        }
+        return true;
+      }
+      completionLeaseHeartbeatInFlight = true;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5_000);
+      try {
+        const leaseResponse = await fetch(
+          `${runtimeConfig.serverUrl}/completions/${completion.id}/lease/renew`,
+          {
+            method: "POST",
+            headers,
+            signal: controller.signal,
+            body: JSON.stringify({ pusherId, leaseMs: COMPLETION_LEASE_MS }),
+          },
+        );
+        if (!leaseResponse.ok) {
+          if (leaseResponse.status === 400 || leaseResponse.status === 409) {
+            completionLeaseLost = true;
+          }
+          if (required) {
+            throw new Error(
+              `Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`,
+            );
+          }
+          return false;
+        }
+        completionLeaseLost = false;
+        return true;
+      } catch (error) {
+        if (required) throw error;
+        console.warn(
+          `[${ts()}] Completion lease heartbeat failed for ${completion.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return false;
+      } finally {
+        clearTimeout(timer);
+        completionLeaseHeartbeatInFlight = false;
+      }
+    };
+    const completionLeaseHeartbeatTimer = setInterval(
+      () => void renewCompletionLease(false),
+      COMPLETION_LEASE_HEARTBEAT_MS,
+    );
     let tempBranch = "";
     let cleanupCompletionHandoff = false;
     let trustedInstallDurationMs: number | null = null;
@@ -637,6 +757,7 @@ async function tick(): Promise<void> {
           ? completion.prUrl.trim()
           : null;
       // 1. Refresh refs before applying completion commit/ref
+      healthTracker.progress("refreshing_refs", completion.id);
       console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();
       if (reviewPublicationLease) {
@@ -683,6 +804,7 @@ async function tick(): Promise<void> {
       }
 
       // 2. Create temp branch and apply worker completion
+      healthTracker.progress("applying_candidate", completion.id);
       tempBranch = `_source_control_manager/${completion.id}`;
       console.log(`[${ts()}] Creating temp branch ${tempBranch}...`);
 
@@ -767,6 +889,7 @@ async function tick(): Promise<void> {
         );
       } else {
         if (completion.trustedValidationCommandsJson) {
+          healthTracker.progress("trusted_validation", completion.id);
           console.log(
             `[${ts()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`,
           );
@@ -818,6 +941,8 @@ async function tick(): Promise<void> {
       }
 
       // 5. Merge to main OR create individual PR (ReviewAgent mode)
+      healthTracker.progress("publication", completion.id);
+      await renewCompletionLease(true);
       if (useReviewPublicationFlow) {
         // ReviewAgent mode: create individual PR from agent branch to prBaseBranch.
         // The agent branch already exists on remote (pushed by the worker).
@@ -1024,12 +1149,15 @@ async function tick(): Promise<void> {
       await gitOps.deleteTempBranch(tempBranch);
 
       // 7. Mark completion as processed
+      healthTracker.progress("completion_callback", completion.id);
+      await renewCompletionLease(true);
       const markResponse = await fetch(
         `${config.serverUrl}/completions/${completion.id}/processed`,
         {
           method: "POST",
           headers,
           body: JSON.stringify({
+            pusherId,
             prUrl: processedPrUrl,
             trustedInstallDurationMs,
             trustedValidationDurationMs,
@@ -1061,6 +1189,7 @@ async function tick(): Promise<void> {
         method: "POST",
         headers,
         body: JSON.stringify({
+          pusherId,
           error: err.message,
           trustedInstallDurationMs,
           trustedValidationDurationMs,
@@ -1079,6 +1208,7 @@ async function tick(): Promise<void> {
         completionEventMeta,
       );
     } finally {
+      clearInterval(completionLeaseHeartbeatTimer);
       try {
         await gitOps.resetToClean();
       } catch (err: any) {
@@ -1128,6 +1258,8 @@ async function tick(): Promise<void> {
     }
   } catch (err: any) {
     console.error(`[${ts()}] Poll error: ${err.message}`);
+  } finally {
+    healthTracker.completeTick();
   }
 }
 
@@ -1140,25 +1272,11 @@ async function runCheck(
   const isWindows = process.platform === "win32";
   const shell = isWindows ? ["cmd", "/c"] : ["sh", "-c"];
 
-  const proc = Bun.spawn([...shell, check.command], {
+  const result = await runProcessWithTreeTimeout([...shell, check.command], {
     cwd: repoPath,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env },
+    timeoutMs,
   });
-
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-
-  const exitCode = await proc.exited;
-  clearTimeout(timer);
-
-  const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-  return { ok: exitCode === 0, output };
+  return { ok: result.ok, output: result.output };
 }
 
 async function promptYesNo(question: string): Promise<boolean> {
@@ -1405,6 +1523,7 @@ async function main(): Promise<void> {
   await ensureIntegrationBranchExists();
   await emitStartupStatus();
   startStatusHeartbeat();
+  startPublicationHealthPolling();
 
   await syncReviewAgentRuntimeConfig();
   startReviewAgentRuntimeConfigPolling();
@@ -1446,6 +1565,10 @@ async function shutdown(): Promise<void> {
     if (statusHeartbeatTimer) {
       clearInterval(statusHeartbeatTimer);
       statusHeartbeatTimer = null;
+    }
+    if (publicationHealthTimer) {
+      clearInterval(publicationHealthTimer);
+      publicationHealthTimer = null;
     }
     if (reviewAgentConfigPollTimer) {
       clearInterval(reviewAgentConfigPollTimer);

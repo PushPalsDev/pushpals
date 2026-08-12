@@ -1,10 +1,27 @@
 import type { MergeQueueDB, MergeJobStatus } from "./db";
+import type { SourceControlManagerHealthSnapshot } from "./runtime_helpers";
 
 /**
  * Small HTTP status server for SourceControlManager.
  * Provides read-only access to job status for monitoring and dashboards.
  */
-export function createStatusServer(db: MergeQueueDB, port: number): ReturnType<typeof Bun.serve> {
+export function createStatusServer(
+  db: MergeQueueDB,
+  port: number,
+  healthProvider: () => SourceControlManagerHealthSnapshot = () => ({
+    healthy: true,
+    status: "ok",
+    reason: null,
+    startedAt: new Date().toISOString(),
+    lastTickStartedAt: null,
+    lastTickCompletedAt: null,
+    lastProgressAt: new Date().toISOString(),
+    activeTick: false,
+    activeCompletionId: null,
+    phase: "unknown",
+    publication: null,
+  }),
+): ReturnType<typeof Bun.serve> {
   return Bun.serve({
     port,
     hostname: "127.0.0.1",
@@ -21,7 +38,11 @@ export function createStatusServer(db: MergeQueueDB, port: number): ReturnType<t
 
       // ── GET /health ───────────────────────────────────────────────────
       if (req.method === "GET" && pathname === "/health") {
-        return Response.json({ status: "ok", pid: process.pid }, { headers });
+        const health = healthProvider();
+        return Response.json(
+          { ...health, pid: process.pid },
+          { status: health.healthy ? 200 : 503, headers },
+        );
       }
 
       // ── GET /jobs ─────────────────────────────────────────────────────

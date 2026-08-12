@@ -3,13 +3,67 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  buildWindowsProcessTreeTerminationArgv,
   hasFreshTrustedValidationInstall,
   resolveTrustedValidationArgv,
+  runProcessWithTreeTimeout,
   runTrustedValidationCommands,
   trustedValidationInstallFingerprint,
 } from "../apps/source_control_manager/src/trusted_validation";
 
 describe("SourceControlManager trusted validation", () => {
+  test("builds a forced Windows process-tree termination command", () => {
+    expect(buildWindowsProcessTreeTerminationArgv(4321)).toEqual([
+      "taskkill",
+      "/PID",
+      "4321",
+      "/T",
+      "/F",
+    ]);
+  });
+
+  test("returns after a bounded timeout even when the command keeps its streams open", async () => {
+    const startedAt = Date.now();
+    const result = await runProcessWithTreeTimeout(
+      [process.execPath, "-e", "console.log('started'); setInterval(() => {}, 1000)"],
+      { cwd: process.cwd(), timeoutMs: 250 },
+    );
+
+    expect(result).toMatchObject({ ok: false, exitCode: 124, timedOut: true });
+    expect(result.output).toContain("terminated process tree");
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
+  });
+
+  (process.platform === "win32" ? test : test.skip)(
+    "kills inherited-pipe descendants when trusted validation times out on Windows",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-process-tree-"));
+      const pidPath = join(root, "descendant.pid");
+      try {
+        const parentScript = [
+          "const child = Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], { stdout: 'inherit', stderr: 'inherit' });",
+          "await Bun.write(Bun.argv[1], String(child.pid));",
+          "setInterval(() => {}, 1000);",
+        ].join(" ");
+        const result = await runProcessWithTreeTimeout(
+          [process.execPath, "-e", parentScript, pidPath],
+          { cwd: root, timeoutMs: 750 },
+        );
+        expect(result.timedOut).toBe(true);
+        const descendantPid = (await Bun.file(pidPath).text()).trim();
+        const tasklist = Bun.spawn(
+          ["tasklist", "/FI", `PID eq ${descendantPid}`, "/FO", "CSV", "/NH"],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        const output = await new Response(tasklist.stdout).text();
+        await tasklist.exited;
+        expect(output).not.toContain(`,\"${descendantPid}\",`);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("runs normalized commands directly in order", async () => {
     const calls: string[][] = [];
     const results = await runTrustedValidationCommands({

@@ -74,7 +74,9 @@ When moving a setting between env and TOML:
 - RemoteBuddy autonomy:
   - tick interval, candidate limits, confidence gates, dispatch quotas, cooldown windows.
 - WorkerPals:
-  - backend selection, runtime timeouts, Docker warm/jitter policy.
+  - backend selection, runtime timeouts, Docker warm/jitter policy,
+    `workerpals.dependency_preparation_timeout_ms` (or
+    `WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS`).
 - SourceControlManager:
   - integration branch/base branch, merge strategy, PR behavior.
 - SourceControlManager ReviewAgent:

@@ -692,6 +692,49 @@ describe("server CompletionQueue PR URL persistence", () => {
     queue.close();
   });
 
+  test("startup migration requeues legacy claimed completions that had no lease", () => {
+    const legacy = new Database(":memory:");
+    legacy.exec(`
+      CREATE TABLE completions (
+        id TEXT PRIMARY KEY,
+        jobId TEXT NOT NULL,
+        sessionId TEXT NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'user',
+        commitSha TEXT,
+        branch TEXT,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        pusherId TEXT,
+        error TEXT,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+      INSERT INTO completions (
+        id, jobId, sessionId, message, status, pusherId, createdAt, updatedAt
+      ) VALUES (
+        'legacy-claimed', 'job-legacy-claimed', 'dev', 'candidate', 'claimed', 'dead-scm',
+        '2026-08-10T00:00:00.000Z', '2026-08-10T00:00:00.000Z'
+      );
+    `);
+
+    const queue = new CompletionQueue(legacy);
+    expect(queue.getCompletion("legacy-claimed")).toMatchObject({
+      status: "pending",
+      pusherId: null,
+      claimedAt: null,
+      leaseExpiresAt: null,
+      lastHeartbeatAt: null,
+      claimAttempts: 0,
+    });
+    expect(queue.claim("replacement-scm").completion).toMatchObject({
+      id: "legacy-claimed",
+      status: "claimed",
+      pusherId: "replacement-scm",
+      claimAttempts: 1,
+    });
+    queue.close();
+  });
+
   test("stores prUrl on enqueue and returns it when claimed", () => {
     const queue = new CompletionQueue(":memory:");
     const enqueued = queue.enqueue({
@@ -754,6 +797,160 @@ describe("server CompletionQueue PR URL persistence", () => {
     expect(claimed.ok).toBe(true);
     expect(claimed.completion?.origin).toBe("autonomy");
 
+    queue.close();
+  });
+
+  test("leases claimed completions and renews only for the owning pusher", () => {
+    const db = new Database(":memory:");
+    const queue = new CompletionQueue(db);
+    const enqueued = queue.enqueue({
+      jobId: "job-lease",
+      sessionId: "dev",
+      message: "candidate retained",
+    });
+
+    const claimed = queue.claim("scm-owner", { leaseMs: 60_000 });
+    expect(claimed.completion).toMatchObject({
+      id: enqueued.completionId,
+      pusherId: "scm-owner",
+      claimAttempts: 1,
+    });
+    expect(claimed.completion?.claimedAt).toBeTruthy();
+    expect(claimed.completion?.lastHeartbeatAt).toBeTruthy();
+    expect(claimed.completion?.leaseExpiresAt).toBeTruthy();
+    expect(queue.renewLease(enqueued.completionId ?? "", "scm-other").ok).toBe(false);
+    expect(queue.renewLease(enqueued.completionId ?? "", "scm-owner").ok).toBe(true);
+    queue.close();
+  });
+
+  test("recovers expired claims and prevents a stale owner from finalizing", () => {
+    const db = new Database(":memory:");
+    const queue = new CompletionQueue(db);
+    const enqueued = queue.enqueue({
+      jobId: "job-expired",
+      sessionId: "dev",
+      message: "candidate retained",
+    });
+    expect(queue.claim("scm-old").ok).toBe(true);
+    db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
+      "2000-01-01T00:00:00.000Z",
+      enqueued.completionId,
+    );
+
+    const recovered = queue.recoverExpiredClaims();
+    expect(recovered).toMatchObject({ recovered: 1 });
+    const reclaimed = queue.claim("scm-new");
+    expect(reclaimed.completion).toMatchObject({
+      id: enqueued.completionId,
+      pusherId: "scm-new",
+      claimAttempts: 2,
+    });
+    expect(queue.markProcessed(enqueued.completionId ?? "", null, "scm-old").ok).toBe(false);
+    expect(queue.markProcessed(enqueued.completionId ?? "", null, "scm-new").ok).toBe(true);
+    queue.close();
+  });
+
+  test("rejects an expired owner's callbacks before a recovery sweep runs", () => {
+    const db = new Database(":memory:");
+    const queue = new CompletionQueue(db);
+    const processedCandidate = queue.enqueue({
+      jobId: "job-expired-processed-callback",
+      sessionId: "dev",
+      message: "candidate retained",
+    });
+    expect(queue.claim("scm-expired").ok).toBe(true);
+    db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
+      "2000-01-01T00:00:00.000Z",
+      processedCandidate.completionId,
+    );
+    expect(queue.markProcessed(processedCandidate.completionId ?? "", null, "scm-expired").ok).toBe(
+      false,
+    );
+
+    const failedCandidate = queue.enqueue({
+      jobId: "job-expired-failed-callback",
+      sessionId: "dev",
+      message: "candidate retained",
+    });
+    expect(queue.claim("scm-expired").ok).toBe(true);
+    db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
+      "2000-01-01T00:00:00.000Z",
+      failedCandidate.completionId,
+    );
+    expect(
+      queue.markFailed(failedCandidate.completionId ?? "", "stale callback", "scm-expired").ok,
+    ).toBe(false);
+    queue.close();
+  });
+
+  test("rejects atomic publication finalization after the owner lease expires", () => {
+    const { jobs, completions, jobId, dbPath } = createSharedQueues();
+    const handoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        commitSha: "expired-finalization-sha",
+        branch: "refs/pushpals/agent/worker/expired-finalization",
+        message: "candidate retained",
+      },
+      { beginJobFinalization: true },
+    );
+    const completionId = handoff.completionId ?? "";
+    expect(completions.claim("scm-expired-finalizer").ok).toBe(true);
+    const row = completions.getCompletion(completionId);
+    expect(row?.leaseExpiresAt).toBeTruthy();
+    const db = new Database(dbPath);
+    db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
+      "2000-01-01T00:00:00.000Z",
+      completionId,
+    );
+    db.close();
+
+    expect(
+      completions.markProcessedAndFinalizeJob(
+        completionId,
+        "https://github.com/org/repo/pull/expired",
+        undefined,
+        undefined,
+        "scm-expired-finalizer",
+      ),
+    ).toMatchObject({ ok: false });
+    expect(jobs.getJob(jobId)?.status).toBe("finalizing");
+    completions.close();
+    jobs.close();
+  });
+
+  test("startup reconciliation requeues claims from the stable pusher identity", () => {
+    const queue = new CompletionQueue(":memory:");
+    const first = queue.enqueue({ jobId: "job-reconcile-1", sessionId: "dev", message: "one" });
+    const second = queue.enqueue({ jobId: "job-reconcile-2", sessionId: "dev", message: "two" });
+    expect(queue.claim("scm-stable").completion?.id).toBe(first.completionId);
+
+    const reconciled = queue.claim("scm-stable", { reconcilePusher: true });
+    expect(reconciled.completion?.id).toBe(first.completionId);
+    expect(reconciled.completion?.claimAttempts).toBe(2);
+    expect(queue.getPendingCompletions().map((row) => row.id)).toEqual([second.completionId]);
+    queue.close();
+  });
+
+  test("reports publication backlog age for autonomy and watchdog backpressure", () => {
+    const db = new Database(":memory:");
+    const queue = new CompletionQueue(db);
+    queue.enqueue({ jobId: "job-backlog", sessionId: "dev", message: "candidate" });
+    db.exec(`UPDATE completions SET createdAt = '2000-01-01T00:00:00.000Z';`);
+
+    expect(
+      queue.publicationBacklogSummary({
+        now: new Date("2000-01-01T00:20:00.000Z"),
+        unhealthyAfterMs: 10 * 60_000,
+      }),
+    ).toMatchObject({
+      pending: 1,
+      claimed: 0,
+      backlog: 1,
+      unhealthy: true,
+      oldestPendingAgeMs: 20 * 60_000,
+    });
     queue.close();
   });
 });

@@ -685,6 +685,7 @@ function loadPushPalsConfig(options = {}) {
   const workerDockerJobRetryBackoffMs = Math.max(250, Math.min(60000, asInt(parseIntEnv("WORKERPALS_DOCKER_JOB_RETRY_BACKOFF_MS") ?? workerNode.docker_job_retry_backoff_ms, 3000)));
   const workerDockerWarmMemoryMb = Math.max(512, Math.min(32768, asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_MEMORY_MB") ?? workerNode.docker_warm_memory_mb, 2048)));
   const workerDockerWarmCpus = Math.max(1, Math.min(16, asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_CPUS") ?? workerNode.docker_warm_cpus, 2)));
+  const workerDependencyPreparationTimeoutMs = Math.max(30000, Math.min(20 * 60000, asInt(parseIntEnv("WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ?? parseIntEnv("PUSHPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ?? workerNode.dependency_preparation_timeout_ms, 5 * 60000)));
   const workerLlm = resolveLlmConfig(workerNode, "WORKERPALS", {
     backend: "lmstudio",
     endpoint: "http://127.0.0.1:1234",
@@ -931,6 +932,7 @@ function loadPushPalsConfig(options = {}) {
       dockerJobRetryBackoffMs: workerDockerJobRetryBackoffMs,
       dockerWarmMemoryMb: workerDockerWarmMemoryMb,
       dockerWarmCpus: workerDockerWarmCpus,
+      dependencyPreparationTimeoutMs: workerDependencyPreparationTimeoutMs,
       fileModifyingJobs: workerFileModifyingJobs,
       outputMaxChars: workerOutputMaxChars,
       outputMaxLines: workerOutputMaxLines,
@@ -11546,10 +11548,10 @@ ${result.stderr ?? ""}`;
 }
 
 // apps/workerpals/src/docker_executor.ts
-import { randomUUID } from "crypto";
+import { createHash as createHash5, randomUUID } from "crypto";
 import { existsSync as existsSync10, mkdirSync as mkdirSync4, readFileSync as readFileSync9, writeFileSync as writeFileSync5 } from "fs";
 import { homedir as homedir3 } from "os";
-import { isAbsolute as isAbsolute3, relative, resolve as resolve11 } from "path";
+import { basename as basename5, isAbsolute as isAbsolute3, relative, resolve as resolve11 } from "path";
 
 // apps/workerpals/src/common/worktree_cleanup.ts
 import { existsSync as existsSync9, rmSync as rmSync4 } from "fs";
@@ -11794,6 +11796,45 @@ var BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS = 3;
 var BROWSER_VALIDATION_JOB_OVERHEAD_MS = 5 * 60000;
 var BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS = 20 * 60000;
 var BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS = 45 * 60000;
+var DOCKER_EXEC_TREE_TERMINATION_TIMEOUT_MS = 5000;
+var DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS = 2000;
+async function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise(null), Math.max(1, timeoutMs));
+      })
+    ]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+function buildWindowsDockerExecTreeTerminationArgv(pid) {
+  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+async function terminateDockerExecProcessTree(proc, platform = process.platform) {
+  const pid = Number(proc.pid);
+  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const taskkill = Bun.spawn(buildWindowsDockerExecTreeTerminationArgv(pid), {
+        stdout: "ignore",
+        stderr: "ignore"
+      });
+      const result = await settleWithin(taskkill.exited, DOCKER_EXEC_TREE_TERMINATION_TIMEOUT_MS);
+      if (result === null) {
+        taskkill.kill("SIGKILL");
+      } else if (result === 0 && await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS) !== null) {
+        return;
+      }
+    } catch {}
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {}
+}
 function parseClampedInt(value, defaultValue, min, max) {
   const parsed = typeof value === "number" ? Math.floor(value) : typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
   if (!Number.isFinite(parsed) || parsed <= 0)
@@ -11811,18 +11852,23 @@ function shellSingleQuote(value) {
 }
 function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
   const worktree = shellSingleQuote(containerWorktreePath);
-  const worktreePrefix = shellSingleQuote(`${containerWorktreePath}/`);
   return [
     "set -eu",
     `worktree=${worktree}`,
+    'store_root="/workspace/.pushpals/dependency-store"',
+    `worktree_id="$(printf '%s' "\${worktree##*/}" | tr -cd 'A-Za-z0-9_.-')"`,
+    'projection_root="$store_root/projections/$worktree_id"',
+    'projection_node_modules="$projection_root/node_modules"',
+    `progress() { printf '[DependencyPreparation] phase=%s progress=%s\\n' "$1" "$2" >&2; }`,
+    'mkdir -p "$store_root/snapshots" "$store_root/projections"',
+    "progress inspect 5",
     'linked=""',
     'if [ -f "$worktree/package.json" ] && { [ -f "$worktree/bun.lock" ] || [ -f "$worktree/bun.lockb" ]; }; then',
-    '  git_common_dir="$(cd "$worktree" && common="$(git rev-parse --git-common-dir)" && cd "$common" && pwd -P)"',
-    '  dependency_cache_root="$git_common_dir/pushpals/dependencies/linux-$(uname -m)"',
+    '  dependency_cache_root="$store_root/snapshots/linux-$(uname -m)"',
     '  mkdir -p "$dependency_cache_root"',
-    `  snapshot_key="$( { printf 'projection=hardlink-v1\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
+    `  snapshot_key="$( { printf 'projection=container-volume-v1\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
     `  if jq -e '.workspaces != null' "$worktree/package.json" >/dev/null 2>&1; then`,
-    '    snapshot_key="$snapshot_key-${worktree##*/}"',
+    '    snapshot_key="$snapshot_key-$worktree_id"',
     "  fi",
     '  snapshot_root="$dependency_cache_root/$snapshot_key"',
     '  snapshot_ready="$snapshot_root/.pushpals-dependency-ready"',
@@ -11831,6 +11877,7 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     `    printf 'Discarding modified Linux-native dependency snapshot: %s\\n' "$snapshot_root" >&2`,
     '    rm -f "$snapshot_ready"',
     "  fi",
+    '  if [ -f "$snapshot_ready" ]; then progress snapshot_cache_hit 25; else progress snapshot_cache_miss 10; fi',
     "  wait_count=0",
     '  while [ ! -f "$snapshot_ready" ]; do',
     '    if mkdir "$snapshot_lock" 2>/dev/null; then',
@@ -11840,7 +11887,9 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     '      mkdir -p "$snapshot_root/node_modules"',
     '      rm -rf "$worktree/node_modules"',
     '      ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
+    "      progress install 20",
     '      (cd "$worktree" && bun install --frozen-lockfile --ignore-scripts >&2)',
+    "      progress install_complete 70",
     '      rm -f "$worktree/node_modules"',
     '      find "$snapshot_root/node_modules" -type f -exec chmod a-w {} +',
     `      printf '%s\\n' "$snapshot_key" > "$snapshot_ready"`,
@@ -11848,7 +11897,7 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     "      trap - EXIT INT TERM",
     "    else",
     "      wait_count=$((wait_count + 1))",
-    '      if [ "$wait_count" -ge 600 ]; then',
+    '      if [ "$wait_count" -ge 300 ]; then',
     `        printf 'Timed out waiting for Linux-native dependency snapshot lock: %s\\n' "$snapshot_lock" >&2`,
     "        exit 1",
     "      fi",
@@ -11856,58 +11905,49 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     "    fi",
     "  done",
     '  src="$snapshot_root/node_modules"',
-    `  dest=${worktreePrefix}node_modules`,
-    '  rm -rf "$dest"',
-    '  mkdir -p "$dest"',
-    '  : > "$dest/.pushpals-dependency-projection-in-progress"',
-    '  for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
-    '    if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi',
-    '    entry_name="${entry##*/}"',
-    '    case "$entry_name" in',
-    "      .cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot|.pushpals-dependency-ready|.pushpals-dependency-projection-in-progress) continue ;;",
-    "    esac",
-    '    cp -al "$entry" "$dest/$entry_name"',
-    "  done",
+    "  progress projection 80",
+    '  rm -rf "$projection_root"',
+    '  mkdir -p "$projection_node_modules"',
+    '  : > "$projection_node_modules/.pushpals-dependency-projection-in-progress"',
+    '  cp -al "$src/." "$projection_node_modules/"',
+    '  rm -rf "$projection_node_modules/.cache" "$projection_node_modules/.expo" "$projection_node_modules/.vite" "$projection_node_modules/.vite-temp"',
     "  for mutable in .cache .expo .vite .vite-temp; do",
-    '    mkdir -p "$dest/$mutable"',
+    '    mkdir -p "$projection_node_modules/$mutable"',
     "  done",
-    '  rm -f "$dest/.pushpals-dependency-projection-in-progress"',
-    `  printf '%s\\n' "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"`,
-    `  printf '%s\\n' "$snapshot_key" > "$dest/.pushpals-validation-safe-dependency-snapshot"`,
-    '  linked="$linked node_modules-linux-native-hardlink"',
+    '  rm -f "$projection_node_modules/.pushpals-dependency-projection-in-progress"',
+    `  printf '%s\\n' "$snapshot_key" > "$projection_node_modules/.pushpals-dependency-snapshot"`,
+    `  printf '%s\\n' "$snapshot_key" > "$projection_node_modules/.pushpals-validation-safe-dependency-snapshot"`,
+    '  rm -rf "$worktree/node_modules"',
+    '  ln -s "$projection_node_modules" "$worktree/node_modules"',
+    '  linked="$linked node_modules-container-native"',
     "else",
+    "  progress host_fallback 20",
     "  for name in node_modules; do",
     '    src="/repo/$name"',
-    `    dest=${worktreePrefix}$name`,
-    '    if { [ -e "$src" ] || [ -L "$src" ]; } && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then',
+    '    dest="$worktree/$name"',
+    '    if { [ -e "$src" ] || [ -L "$src" ]; }; then',
     '      snapshot_key="$(for manifest in /repo/package.json /repo/bun.lock /repo/bun.lockb; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done | sha256sum | cut -d " " -f 1)"',
-    '      mkdir -p "$dest"',
-    '      : > "$dest/.pushpals-dependency-projection-in-progress"',
-    "      projection_ok=1",
+    '      rm -rf "$projection_root"',
+    '      mkdir -p "$projection_node_modules"',
     '      for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
     '        if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi',
     '        entry_name="${entry##*/}"',
     '        case "$entry_name" in',
     "          .cache|.expo|.vite|.vite-temp|.pushpals-dependency-snapshot|.pushpals-dependency-projection-in-progress) continue ;;",
     "        esac",
-    '        if ! ln -s "$entry" "$dest/$entry_name"; then projection_ok=0; break; fi',
+    '        ln -s "$entry" "$projection_node_modules/$entry_name"',
     "      done",
-    '      if [ "$projection_ok" = "1" ]; then',
-    "        for mutable in .cache .expo .vite .vite-temp; do",
-    '          mkdir -p "$dest/$mutable"',
-    "        done",
-    '        rm -f "$dest/.pushpals-dependency-projection-in-progress"',
-    '        rm -f "$dest/.pushpals-dependency-snapshot"',
-    `        printf '%s\\n' "$snapshot_key" > "$dest/.pushpals-dependency-snapshot"`,
-    '        linked="$linked $name-host-fallback"',
-    "      else",
-    '        rm -rf "$dest"',
-    '        ln -s "$src" "$dest"',
-    '        linked="$linked $name-host-fallback-link"',
-    "      fi",
+    "      for mutable in .cache .expo .vite .vite-temp; do",
+    '        mkdir -p "$projection_node_modules/$mutable"',
+    "      done",
+    `      printf '%s\\n' "$snapshot_key" > "$projection_node_modules/.pushpals-dependency-snapshot"`,
+    '      rm -rf "$dest"',
+    '      ln -s "$projection_node_modules" "$dest"',
+    '      linked="$linked $name-container-native-fallback"',
     "    fi",
     "  done",
     "fi",
+    "progress complete 100",
     `printf '%s' "$linked"`
   ].join(`
 `);
@@ -12121,6 +12161,7 @@ class DockerExecutor {
   options;
   worktreeDir;
   warmContainerName;
+  dependencyVolumeName;
   warmAgentPort = 39231;
   idleTimer = null;
   activeJobs = 0;
@@ -12132,6 +12173,7 @@ class DockerExecutor {
   jobRetryBackoffMs;
   failureCooldownMs;
   worktreeVisibilityTimeoutMs;
+  dependencyPreparationTimeoutMs;
   lastLoggedExecutionConfig = "";
   lastLoggedEndpointRewrite = "";
   warmedBackends = new Set;
@@ -12152,6 +12194,8 @@ class DockerExecutor {
     };
     this.worktreeDir = resolve11(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
+    const dependencyRepoPath = resolve11(this.options.repo);
+    this.dependencyVolumeName = `pushpals-deps-${createHash5("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
     this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
     this.warmSetupBackoffMs = parseClampedInt(this.config.workerpals.dockerWarmRetryBackoffMs, 2000, 250, 60000);
@@ -12159,6 +12203,7 @@ class DockerExecutor {
     this.jobRetryBackoffMs = parseClampedInt(this.config.workerpals.dockerJobRetryBackoffMs, 3000, 250, 60000);
     this.failureCooldownMs = parseClampedIntAllowZero(this.config.workerpals.failureCooldownMs, 20000, 300000);
     this.worktreeVisibilityTimeoutMs = process.platform === "win32" ? 15000 : 5000;
+    this.dependencyPreparationTimeoutMs = parseClampedInt(this.config.workerpals.dependencyPreparationTimeoutMs, 5 * 60000, 30000, 20 * 60000);
     try {
       mkdirSync4(this.worktreeDir, { recursive: true });
     } catch {}
@@ -12236,6 +12281,7 @@ class DockerExecutor {
     } finally {
       this.preparedMergeConflictJobs.delete(job.id);
       this.activeJobs = Math.max(0, this.activeJobs - 1);
+      await this.cleanupContainerDependencyProjection(worktreePath);
       await this.removeWorktree(worktreePath).catch((err) => {
         console.error(`[DockerExecutor] Failed to remove worktree: ${err}`);
       });
@@ -12379,6 +12425,14 @@ class DockerExecutor {
     }
     console.log(`[DockerExecutor] Removed worktree: ${worktreePath}`);
   }
+  async cleanupContainerDependencyProjection(worktreePath) {
+    const worktreeId = basename5(worktreePath).replace(/[^A-Za-z0-9_.-]/g, "");
+    if (!worktreeId)
+      return;
+    try {
+      await this.runWarmShell(`rm -rf ${shellSingleQuote(`/workspace/.pushpals/dependency-store/projections/${worktreeId}`)}`, { timeoutMs: 30000 });
+    } catch {}
+  }
   containerBackendPython(backend, runtimeConfig = this.backendRuntimeConfig()) {
     const spec = getDockerBackendSpec(backend);
     const configured = spec.configuredPython(runtimeConfig);
@@ -12483,6 +12537,24 @@ class DockerExecutor {
   }
   async startWarmContainer() {
     await this.stopWarmContainer("pre-start cleanup", true);
+    const volume = Bun.spawn([
+      resolveDockerExecutable(),
+      "volume",
+      "create",
+      "--label",
+      "pushpals.component=workerpals-dependencies",
+      "--label",
+      `pushpals.repo=${this.options.repo}`,
+      this.dependencyVolumeName
+    ], { stdout: "pipe", stderr: "pipe" });
+    const [volumeExitCode, volumeStdout, volumeStderr] = await Promise.all([
+      volume.exited,
+      new Response(volume.stdout).text(),
+      new Response(volume.stderr).text()
+    ]);
+    if (volumeExitCode !== 0) {
+      throw new Error(`Failed to prepare container-native dependency volume (exit ${volumeExitCode}): ${volumeStderr.trim() || volumeStdout.trim() || "no docker output"}`);
+    }
     const backend = this.currentBackend();
     const backendSpec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
@@ -12511,6 +12583,8 @@ class DockerExecutor {
       "host.docker.internal:host-gateway",
       "-v",
       `${dockerRepoPath}:/repo`,
+      "--mount",
+      `type=volume,source=${this.dependencyVolumeName},target=/workspace/.pushpals/dependency-store`,
       "-w",
       "/workspace",
       ...envArgs,
@@ -12602,21 +12676,80 @@ class DockerExecutor {
     }
     await this.startWarmContainer();
   }
-  async runWarmShell(command) {
-    const proc = Bun.spawn([resolveDockerExecutable(), "exec", this.warmContainerName, "/bin/sh", "-lc", command], {
+  async runWarmShell(command, options = {}) {
+    const timeoutMs = typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) ? Math.max(1000, Math.floor(options.timeoutMs)) : 0;
+    const effectiveCommand = timeoutMs ? `timeout --signal=TERM --kill-after=5s ${Math.max(1, Math.ceil(timeoutMs / 1000))}s /bin/sh -lc ${shellSingleQuote(command)}` : command;
+    const proc = Bun.spawn([
+      resolveDockerExecutable(),
+      "exec",
+      this.warmContainerName,
+      "/bin/sh",
+      "-lc",
+      effectiveCommand
+    ], {
       stdout: "pipe",
       stderr: "pipe"
     });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited
+    const stdoutLines = [];
+    const stderrLines = [];
+    const stdout = proc.stdout;
+    const stderr = proc.stderr;
+    if (!isReadableByteStream(stdout) || !isReadableByteStream(stderr)) {
+      throw new Error("warm shell stdout/stderr pipes were not available");
+    }
+    const streamAbort = new AbortController;
+    const streams = Promise.all([
+      this.readStream(stdout, "stdout", options.onLog, stdoutLines, streamAbort.signal),
+      this.readStream(stderr, "stderr", options.onLog, stderrLines, streamAbort.signal)
     ]);
+    let hostTimer = null;
+    let hostTimedOut = false;
+    try {
+      if (timeoutMs) {
+        const outcome = await Promise.race([
+          streams.then(() => "streams"),
+          new Promise((resolvePromise) => {
+            hostTimer = setTimeout(() => resolvePromise("timeout"), timeoutMs + 1e4);
+          })
+        ]);
+        if (outcome === "timeout") {
+          hostTimedOut = true;
+          await terminateDockerExecProcessTree(proc);
+          const drained = await settleWithin(streams.catch(() => {
+            return;
+          }), DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS);
+          if (drained === null) {
+            streamAbort.abort();
+            await settleWithin(streams.catch(() => {
+              return;
+            }), 250);
+          }
+        }
+      } else {
+        await streams;
+      }
+    } catch (error) {
+      streamAbort.abort();
+      await terminateDockerExecProcessTree(proc);
+      throw error;
+    } finally {
+      if (hostTimer)
+        clearTimeout(hostTimer);
+    }
+    const exitCode = hostTimedOut ? await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS) ?? 124 : await proc.exited;
+    const timedOut = hostTimedOut || exitCode === 124;
     return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode
+      ok: !timedOut && exitCode === 0,
+      stdout: stdoutLines.join(`
+`).trim(),
+      stderr: [
+        stderrLines.join(`
+`).trim(),
+        timedOut ? `Warm-container command timed out after ${timeoutMs}ms.` : ""
+      ].filter(Boolean).join(`
+`),
+      exitCode: timedOut ? 124 : exitCode,
+      ...timedOut ? { timedOut: true } : {}
     };
   }
   async runWarmWorktreeProbe(containerWorktreePath) {
@@ -12995,39 +13128,62 @@ ${text}` : `
       onLog?.("stderr", "[DockerExecutor] Worker should finish quickly and return a concise failure/update if task cannot complete in time.");
     }, warningDelayMs);
     let timedOutByDocker = false;
-    const timer = setTimeout(() => {
-      timedOutByDocker = true;
-      const elapsedMs2 = Math.max(1, Date.now() - startedAtMs);
-      const timeoutMsg = `[DockerExecutor] Job timeout in warm container after ${elapsedMs2}ms (limit ${timeoutMs}ms): ${this.warmContainerName}`;
-      console.log(timeoutMsg);
-      onLog?.("stderr", timeoutMsg);
-      try {
-        proc.kill();
-        Bun.spawn([resolveDockerExecutable(), "restart", "-t", "1", this.warmContainerName]);
-      } catch {}
-    }, timeoutMs);
+    let timeoutTimer = null;
     const stdoutLines = [];
     const stderrLines = [];
+    const streamAbort = new AbortController;
     try {
       const stdout = proc.stdout;
       const stderr = proc.stderr;
       if (!isReadableByteStream(stdout) || !isReadableByteStream(stderr)) {
         throw new Error("docker exec stdout/stderr pipes were not available");
       }
-      await Promise.all([
+      const streams = Promise.all([
         this.writeJobSpecToStdin(proc, base64Spec),
-        this.readStream(stdout, "stdout", onLog, stdoutLines),
-        this.readStream(stderr, "stderr", onLog, stderrLines)
+        this.readStream(stdout, "stdout", onLog, stdoutLines, streamAbort.signal),
+        this.readStream(stderr, "stderr", onLog, stderrLines, streamAbort.signal)
       ]);
+      const outcome = await Promise.race([
+        streams.then(() => "streams"),
+        new Promise((resolvePromise) => {
+          timeoutTimer = setTimeout(() => resolvePromise("timeout"), timeoutMs);
+        })
+      ]);
+      if (outcome === "timeout") {
+        timedOutByDocker = true;
+        const elapsedMs2 = Math.max(1, Date.now() - startedAtMs);
+        const timeoutMsg = `[DockerExecutor] Job timeout in warm container after ${elapsedMs2}ms (limit ${timeoutMs}ms): ${this.warmContainerName}`;
+        console.log(timeoutMsg);
+        onLog?.("stderr", timeoutMsg);
+        await terminateDockerExecProcessTree(proc);
+        try {
+          Bun.spawn([resolveDockerExecutable(), "restart", "-t", "1", this.warmContainerName], {
+            stdout: "ignore",
+            stderr: "ignore"
+          });
+        } catch {}
+        const drained = await settleWithin(streams.catch(() => {
+          return;
+        }), DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS);
+        if (drained === null) {
+          streamAbort.abort();
+          await settleWithin(streams.catch(() => {
+            return;
+          }), 250);
+        }
+      }
     } catch (err) {
-      try {
-        proc.kill();
-      } catch {}
+      clearTimeout(warningTimer);
+      if (timeoutTimer)
+        clearTimeout(timeoutTimer);
+      streamAbort.abort();
+      await terminateDockerExecProcessTree(proc);
       throw new Error(`failed while streaming warm-container job execution (${this.warmContainerName}, spec_chars=${base64Spec.length}): ${this.compactError(err)}`);
     }
     clearTimeout(warningTimer);
-    clearTimeout(timer);
-    const exitCode = await proc.exited;
+    if (timeoutTimer)
+      clearTimeout(timeoutTimer);
+    const exitCode = timedOutByDocker ? await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS) ?? 124 : await proc.exited;
     const elapsedMs = Math.max(1, Date.now() - startedAtMs);
     const result = this.parseResult(stdoutLines, stderrLines, exitCode, {
       timedOutByDocker,
@@ -13103,11 +13259,28 @@ ${text}` : `
   }
   async ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog) {
     const startedAt = Date.now();
-    const startNote = "[DockerExecutor] Preparing Linux-native dependency entries for the WorkerPal worktree.";
+    let currentPhase = "starting";
+    let currentProgress = 0;
+    const startNote = `[DependencyPreparation] phase=${currentPhase} progress=${currentProgress} timeout_ms=${this.dependencyPreparationTimeoutMs}`;
     console.log(startNote);
     onLog?.("stdout", startNote);
     const command = buildWorktreeDependencyPreparationCommand(containerWorktreePath);
-    const result = await this.runWarmShell(command);
+    const progressTimer = setInterval(() => {
+      const note2 = `[DependencyPreparation] phase=${currentPhase} progress=${currentProgress} elapsed_ms=${Math.max(0, Date.now() - startedAt)}`;
+      console.log(note2);
+      onLog?.("stdout", note2);
+    }, 15000);
+    const result = await this.runWarmShell(command, {
+      timeoutMs: this.dependencyPreparationTimeoutMs,
+      onLog: (stream, line) => {
+        const progress = line.match(/^\[DependencyPreparation\]\s+phase=([^\s]+)\s+progress=(\d+)$/);
+        if (progress) {
+          currentPhase = progress[1];
+          currentProgress = Math.max(0, Math.min(100, Number(progress[2]) || 0));
+        }
+        onLog?.(stream, line);
+      }
+    }).finally(() => clearInterval(progressTimer));
     if (!result.ok) {
       const detail = [result.stderr, result.stdout].filter(Boolean).join(`
 `).trim();
@@ -13118,6 +13291,9 @@ ${text}` : `
     }
     const linked = result.stdout.trim().split(/\s+/g).map((entry) => entry.trim()).filter(Boolean);
     const finishedAtMs = Date.now();
+    const note = `[DependencyPreparation] phase=complete progress=100 duration_ms=${finishedAtMs - startedAt} artifacts=` + (linked.length > 0 ? linked.join(",") : "none");
+    console.log(note);
+    onLog?.("stdout", note);
     if (linked.length === 0) {
       return {
         startedAtMs: startedAt,
@@ -13126,9 +13302,6 @@ ${text}` : `
         artifacts: []
       };
     }
-    const note = `[DockerExecutor] Prepared worktree dependency snapshot(s) in ${finishedAtMs - startedAt}ms: ` + linked.join(", ");
-    console.log(note);
-    onLog?.("stdout", note);
     return {
       startedAtMs: startedAt,
       finishedAtMs,
@@ -13272,10 +13445,16 @@ ${text}` : `
       throw new Error(`Docker git/worktree startup self-check failed: ${detail}`);
     }
   }
-  async readStream(readable, streamName, onLog, lines) {
+  async readStream(readable, streamName, onLog, lines, signal) {
     const decoder = new TextDecoder;
     const reader = readable.getReader();
     let pending = "";
+    const abortReader = () => {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {}
+    };
+    signal?.addEventListener("abort", abortReader, { once: true });
     const forwardLine = (line) => {
       const cleanLine = line.endsWith("\r") ? line.slice(0, -1) : line;
       if (!cleanLine)
@@ -13292,24 +13471,34 @@ ${text}` : `
       }
       onLog?.(streamName, cleanLine);
     };
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done)
-        break;
-      pending += decoder.decode(value, { stream: true });
-      let newlineIndex = pending.indexOf(`
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        pending += decoder.decode(value, { stream: true });
+        let newlineIndex = pending.indexOf(`
 `);
-      while (newlineIndex >= 0) {
-        const line = pending.slice(0, newlineIndex);
-        pending = pending.slice(newlineIndex + 1);
-        forwardLine(line);
-        newlineIndex = pending.indexOf(`
+        while (newlineIndex >= 0) {
+          const line = pending.slice(0, newlineIndex);
+          pending = pending.slice(newlineIndex + 1);
+          forwardLine(line);
+          newlineIndex = pending.indexOf(`
 `);
+        }
       }
-    }
-    pending += decoder.decode();
-    if (pending) {
-      forwardLine(pending);
+      pending += decoder.decode();
+      if (pending) {
+        forwardLine(pending);
+      }
+    } catch (error) {
+      if (!signal?.aborted)
+        throw error;
+    } finally {
+      signal?.removeEventListener("abort", abortReader);
+      try {
+        reader.releaseLock();
+      } catch {}
     }
   }
   parseResult(stdoutLines, stderrLines, exitCode, context) {
@@ -14340,6 +14529,9 @@ function inferWorkerJobPhaseFromLogLine(line) {
   const text = String(line ?? "").trim();
   if (!text)
     return null;
+  if (/\[DependencyPreparation\]|dependency preparation/i.test(text)) {
+    return "dependency preparation";
+  }
   if (/Quality gate requested revision|Quality revision required|revision guidance/i.test(text)) {
     return "quality revision";
   }

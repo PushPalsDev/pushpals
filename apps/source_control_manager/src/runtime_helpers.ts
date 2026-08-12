@@ -6,6 +6,112 @@ export type ReviewAgentRuntimeReadiness = {
   detail: string;
 };
 
+export type SourceControlManagerPublicationHealth = {
+  backlog: number;
+  pending: number;
+  claimed: number;
+  finalizing: number;
+  oldestPendingAgeMs: number;
+  oldestFinalizingAgeMs: number;
+  unhealthy: boolean;
+  observedAt?: string;
+};
+
+export type SourceControlManagerHealthSnapshot = {
+  healthy: boolean;
+  status: "ok" | "unhealthy";
+  reason: string | null;
+  startedAt: string;
+  lastTickStartedAt: string | null;
+  lastTickCompletedAt: string | null;
+  lastProgressAt: string;
+  activeTick: boolean;
+  activeCompletionId: string | null;
+  phase: string;
+  publication: SourceControlManagerPublicationHealth | null;
+};
+
+export function createSourceControlManagerHealthTracker(options: {
+  tickStallMs: number;
+  idleBacklogGraceMs: number;
+  now?: () => number;
+}): {
+  beginTick: (phase?: string) => void;
+  progress: (phase: string, completionId?: string | null) => void;
+  completeTick: () => void;
+  updatePublication: (publication: SourceControlManagerPublicationHealth | null) => void;
+  snapshot: () => SourceControlManagerHealthSnapshot;
+} {
+  const now = options.now ?? Date.now;
+  const startedAtMs = now();
+  let lastTickStartedAtMs: number | null = null;
+  let lastTickCompletedAtMs: number | null = null;
+  let lastProgressAtMs = startedAtMs;
+  let activeTick = false;
+  let activeCompletionId: string | null = null;
+  let phase = "startup";
+  let publication: SourceControlManagerPublicationHealth | null = null;
+  const toIso = (value: number | null): string | null =>
+    value === null ? null : new Date(value).toISOString();
+
+  return {
+    beginTick(nextPhase = "polling") {
+      const at = now();
+      activeTick = true;
+      activeCompletionId = null;
+      phase = nextPhase;
+      lastTickStartedAtMs = at;
+      lastProgressAtMs = at;
+    },
+    progress(nextPhase, completionId) {
+      phase = String(nextPhase || phase);
+      if (completionId !== undefined) activeCompletionId = completionId;
+      lastProgressAtMs = now();
+    },
+    completeTick() {
+      const at = now();
+      activeTick = false;
+      activeCompletionId = null;
+      phase = "idle";
+      lastTickCompletedAtMs = at;
+      lastProgressAtMs = at;
+    },
+    updatePublication(nextPublication) {
+      publication = nextPublication ? { ...nextPublication } : null;
+    },
+    snapshot() {
+      const at = now();
+      const progressAgeMs = Math.max(0, at - lastProgressAtMs);
+      let reason: string | null = null;
+      if (activeTick && progressAgeMs >= Math.max(1_000, options.tickStallMs)) {
+        reason = `tick_stalled_${progressAgeMs}ms_phase_${phase}`;
+      } else if (publication?.unhealthy && !activeTick) {
+        const idleSince = lastTickCompletedAtMs ?? startedAtMs;
+        const idleAgeMs = Math.max(0, at - idleSince);
+        if (idleAgeMs >= Math.max(1_000, options.idleBacklogGraceMs)) {
+          reason = `publication_backlog_stalled_${publication.backlog}_oldest_${Math.max(
+            publication.oldestPendingAgeMs,
+            publication.oldestFinalizingAgeMs,
+          )}ms`;
+        }
+      }
+      return {
+        healthy: reason === null,
+        status: reason === null ? "ok" : "unhealthy",
+        reason,
+        startedAt: new Date(startedAtMs).toISOString(),
+        lastTickStartedAt: toIso(lastTickStartedAtMs),
+        lastTickCompletedAt: toIso(lastTickCompletedAtMs),
+        lastProgressAt: new Date(lastProgressAtMs).toISOString(),
+        activeTick,
+        activeCompletionId,
+        phase,
+        publication: publication ? { ...publication } : null,
+      };
+    },
+  };
+}
+
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
 type SystemStatusClientRow = {

@@ -205,6 +205,18 @@ type WorkerLoadSnapshot = {
     pending: number;
     claimed: number;
     autoscalablePending: number;
+    finalizing?: number;
+  };
+  completions: {
+    pending: number;
+    claimed: number;
+  };
+  publication: {
+    backlog: number;
+    oldestPendingAgeMs: number;
+    oldestFinalizingAgeMs: number;
+    expiredClaims: number;
+    unhealthy: boolean;
   };
   prs: {
     openUnmerged: number;
@@ -5012,12 +5024,34 @@ export class RemoteBuddyAutonomousEngine {
         ok?: boolean;
         workers?: WorkerLoadSnapshot["workers"];
         jobs?: WorkerLoadSnapshot["jobs"];
+        completions?: Partial<WorkerLoadSnapshot["completions"]>;
+        publication?: Partial<WorkerLoadSnapshot["publication"]>;
         prs?: Partial<WorkerLoadSnapshot["prs"]>;
       };
       if (!data.ok || !data.workers || !data.jobs) return null;
       return {
         workers: data.workers,
         jobs: data.jobs,
+        completions: {
+          pending: Math.max(0, Math.floor(asNumber(asObject(data.completions).pending, 0))),
+          claimed: Math.max(0, Math.floor(asNumber(asObject(data.completions).claimed, 0))),
+        },
+        publication: {
+          backlog: Math.max(0, Math.floor(asNumber(asObject(data.publication).backlog, 0))),
+          oldestPendingAgeMs: Math.max(
+            0,
+            Math.floor(asNumber(asObject(data.publication).oldestPendingAgeMs, 0)),
+          ),
+          oldestFinalizingAgeMs: Math.max(
+            0,
+            Math.floor(asNumber(asObject(data.publication).oldestFinalizingAgeMs, 0)),
+          ),
+          expiredClaims: Math.max(
+            0,
+            Math.floor(asNumber(asObject(data.publication).expiredClaims, 0)),
+          ),
+          unhealthy: asBoolean(asObject(data.publication).unhealthy, false),
+        },
         prs: {
           openUnmerged: Math.max(0, Math.floor(asNumber(asObject(data.prs).openUnmerged, 0))),
         },
@@ -5029,15 +5063,32 @@ export class RemoteBuddyAutonomousEngine {
 
   private deferReasonForWorkerLoad(snapshot: WorkerLoadSnapshot): string | null {
     const busyWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.busy, 0)));
+    const onlineWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.online, 0)));
+    const idleWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.idle, 0)));
     const pendingJobs = Math.max(0, Math.floor(asNumber(snapshot.jobs.pending, 0)));
     const autoscalablePending = Math.max(
       0,
       Math.floor(asNumber(snapshot.jobs.autoscalablePending, 0)),
     );
-    if (busyWorkers <= 0 && pendingJobs <= 0 && autoscalablePending <= 0) {
-      return null;
+    const publicationBacklog = Math.max(0, Math.floor(asNumber(snapshot.publication?.backlog, 0)));
+    const publicationUnhealthy = asBoolean(snapshot.publication?.unhealthy, false);
+    const publicationOldestMs = Math.max(
+      0,
+      Math.floor(asNumber(snapshot.publication?.oldestPendingAgeMs, 0)),
+      Math.floor(asNumber(snapshot.publication?.oldestFinalizingAgeMs, 0)),
+    );
+    const publicationBackpressureThreshold = Math.max(2, onlineWorkers);
+    if (
+      publicationUnhealthy ||
+      publicationBacklog >= publicationBackpressureThreshold ||
+      (publicationBacklog > 0 && publicationOldestMs >= 10 * 60_000)
+    ) {
+      return `publication_backpressure_backlog_${publicationBacklog}_oldest_${publicationOldestMs}`;
     }
-    return `worker_load_busy_${busyWorkers}_pending_${pendingJobs}_autoscalable_${autoscalablePending}`;
+    if (pendingJobs > 0 || autoscalablePending > 0 || (busyWorkers > 0 && idleWorkers <= 0)) {
+      return `worker_load_busy_${busyWorkers}_pending_${pendingJobs}_autoscalable_${autoscalablePending}`;
+    }
+    return null;
   }
 
   private async fetchInspirationPatterns(limit = 60): Promise<unknown[]> {
@@ -6004,7 +6055,7 @@ export class RemoteBuddyAutonomousEngine {
       const workerLoadDeferReason = workerLoad ? this.deferReasonForWorkerLoad(workerLoad) : null;
       if (workerLoad && workerLoadDeferReason) {
         console.log(
-          `[RemoteBuddyAutonomousEngine] tick ${runId}: deferring ideation due to active worker load (busy=${workerLoad.workers.busy} pending=${workerLoad.jobs.pending} autoscalablePending=${workerLoad.jobs.autoscalablePending}).`,
+          `[RemoteBuddyAutonomousEngine] tick ${runId}: deferring ideation due to capacity/publication backpressure (busy=${workerLoad.workers.busy} idle=${workerLoad.workers.idle} pending=${workerLoad.jobs.pending} autoscalablePending=${workerLoad.jobs.autoscalablePending} publicationBacklog=${workerLoad.publication.backlog}).`,
         );
         outcomeDetail = workerLoadDeferReason;
         return;

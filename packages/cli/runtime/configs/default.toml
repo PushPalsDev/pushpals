@@ -151,6 +151,8 @@ docker_job_max_attempts = 2
 docker_job_retry_backoff_ms = 3000
 docker_warm_memory_mb = 2048
 docker_warm_cpus = 2
+# Hard limit for Linux-native dependency snapshot/projection setup per job.
+dependency_preparation_timeout_ms = 300000
 file_modifying_jobs = ["task.execute"]
 output_max_chars = 196608
 output_max_lines = 600

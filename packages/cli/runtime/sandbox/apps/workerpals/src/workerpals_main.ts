@@ -417,6 +417,7 @@ function isNoisyProgressLine(line: string): boolean {
 }
 
 type WorkerJobPhase =
+  | "dependency preparation"
   | "discovering"
   | "editing"
   | "test harness repair"
@@ -429,6 +430,9 @@ type WorkerJobPhase =
 function inferWorkerJobPhaseFromLogLine(line: string): WorkerJobPhase | null {
   const text = String(line ?? "").trim();
   if (!text) return null;
+  if (/\[DependencyPreparation\]|dependency preparation/i.test(text)) {
+    return "dependency preparation";
+  }
   if (/Quality gate requested revision|Quality revision required|revision guidance/i.test(text)) {
     return "quality revision";
   }

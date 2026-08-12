@@ -41,6 +41,10 @@ export interface CompletionRow {
   trustedValidationRecoveryAttempts: number;
   status: CompletionStatus;
   pusherId: string | null;
+  claimedAt: string | null;
+  leaseExpiresAt: string | null;
+  lastHeartbeatAt: string | null;
+  claimAttempts: number;
   error: string | null;
   createdAt: string;
   updatedAt: string;
@@ -59,6 +63,32 @@ export interface CompletionFinalizationResult {
 }
 
 const TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 3;
+export const DEFAULT_COMPLETION_LEASE_MS = 3 * 60_000;
+const MIN_COMPLETION_LEASE_MS = 30_000;
+const MAX_COMPLETION_LEASE_MS = 15 * 60_000;
+
+export type CompletionLeaseRecoveryResult = {
+  recovered: number;
+  completionIds: string[];
+};
+
+export type PublicationBacklogSummary = {
+  pending: number;
+  claimed: number;
+  finalizing: number;
+  backlog: number;
+  oldestPendingAgeMs: number;
+  oldestFinalizingAgeMs: number;
+  expiredClaims: number;
+  unhealthy: boolean;
+  observedAt: string;
+};
+
+function normalizeCompletionLeaseMs(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_COMPLETION_LEASE_MS;
+  return Math.max(MIN_COMPLETION_LEASE_MS, Math.min(MAX_COMPLETION_LEASE_MS, Math.floor(parsed)));
+}
 
 type TrustedValidationRecoveryCandidate = {
   completionId: string;
@@ -215,6 +245,10 @@ export class CompletionQueue {
         trustedValidationRecoveryAttempts INTEGER NOT NULL DEFAULT 0,
         status     TEXT NOT NULL DEFAULT 'pending',
         pusherId   TEXT,
+        claimedAt  TEXT,
+        leaseExpiresAt TEXT,
+        lastHeartbeatAt TEXT,
+        claimAttempts INTEGER NOT NULL DEFAULT 0,
         error      TEXT,
         createdAt  TEXT NOT NULL,
         updatedAt  TEXT NOT NULL
@@ -262,7 +296,24 @@ export class CompletionQueue {
         `ALTER TABLE completions ADD COLUMN trustedValidationRecoveryAttempts INTEGER NOT NULL DEFAULT 0;`,
       );
     }
+    if (!columns.some((col) => col.name === "claimedAt")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN claimedAt TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "leaseExpiresAt")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN leaseExpiresAt TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "lastHeartbeatAt")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN lastHeartbeatAt TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "claimAttempts")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN claimAttempts INTEGER NOT NULL DEFAULT 0;`);
+    }
 
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_completions_lease_expiry ON completions(status, leaseExpiresAt);`,
+    );
+
+    this.recoverExpiredClaims();
     this.reconcileLegacyParentJobStates();
     this.reconcileRecoverableTrustedValidationFailures();
   }
@@ -616,10 +667,30 @@ export class CompletionQueue {
   /**
    * Atomically claim the next pending completion (FIFO by createdAt)
    */
-  claim(pusherId: string): { ok: boolean; completion?: CompletionRow; message?: string } {
+  claim(
+    pusherId: string,
+    options: { leaseMs?: number; reconcilePusher?: boolean } = {},
+  ): { ok: boolean; completion?: CompletionRow; message?: string } {
     const now = new Date().toISOString();
+    const leaseMs = normalizeCompletionLeaseMs(options.leaseMs);
+    const leaseExpiresAt = new Date(Date.parse(now) + leaseMs).toISOString();
 
     const tx = this.db.transaction(() => {
+      this.recoverExpiredClaims(now);
+      if (options.reconcilePusher) {
+        this.db
+          .prepare(
+            `UPDATE completions
+             SET status = 'pending',
+                 pusherId = NULL,
+                 claimedAt = NULL,
+                 leaseExpiresAt = NULL,
+                 lastHeartbeatAt = NULL,
+                 updatedAt = ?
+             WHERE status = 'claimed' AND pusherId = ?`,
+          )
+          .run(now, pusherId);
+      }
       const row = this.db
         .prepare(
           `SELECT * FROM completions WHERE status = 'pending' ORDER BY createdAt ASC LIMIT 1`,
@@ -630,11 +701,19 @@ export class CompletionQueue {
 
       this.db
         .prepare(
-          `UPDATE completions SET status = 'claimed', pusherId = ?, updatedAt = ? WHERE id = ?`,
+          `UPDATE completions
+           SET status = 'claimed',
+               pusherId = ?,
+               claimedAt = ?,
+               leaseExpiresAt = ?,
+               lastHeartbeatAt = ?,
+               claimAttempts = COALESCE(claimAttempts, 0) + 1,
+               updatedAt = ?
+           WHERE id = ? AND status = 'pending'`,
         )
-        .run(pusherId, now, row.id);
+        .run(pusherId, now, leaseExpiresAt, now, now, row.id);
 
-      return { ...row, status: "claimed" as CompletionStatus, pusherId, updatedAt: now };
+      return this.getCompletion(row.id);
     });
 
     const completion = tx();
@@ -642,10 +721,73 @@ export class CompletionQueue {
     return { ok: true, completion };
   }
 
+  renewLease(
+    completionId: string,
+    pusherId: string,
+    options: { leaseMs?: number } = {},
+  ): { ok: boolean; leaseExpiresAt?: string; message?: string } {
+    const now = new Date().toISOString();
+    const leaseExpiresAt = new Date(
+      Date.parse(now) + normalizeCompletionLeaseMs(options.leaseMs),
+    ).toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE completions
+         SET lastHeartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ?
+         WHERE id = ?
+           AND status = 'claimed'
+           AND pusherId = ?
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?`,
+      )
+      .run(now, leaseExpiresAt, now, completionId, pusherId, now);
+    if (result.changes === 0) {
+      return {
+        ok: false,
+        message: "Completion lease is missing, expired, or owned by another pusher",
+      };
+    }
+    return { ok: true, leaseExpiresAt };
+  }
+
+  recoverExpiredClaims(nowInput: string | Date = new Date()): CompletionLeaseRecoveryResult {
+    const now =
+      nowInput instanceof Date ? nowInput.toISOString() : new Date(nowInput).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM completions
+         WHERE status = 'claimed'
+           AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+         ORDER BY createdAt ASC`,
+      )
+      .all(now) as Array<{ id: string }>;
+    if (rows.length === 0) return { recovered: 0, completionIds: [] };
+    const ids = rows.map((row) => row.id);
+    const result = this.db
+      .prepare(
+        `UPDATE completions
+       SET status = 'pending',
+           pusherId = NULL,
+           claimedAt = NULL,
+           leaseExpiresAt = NULL,
+           lastHeartbeatAt = NULL,
+           updatedAt = ?
+       WHERE status = 'claimed'
+         AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`,
+      )
+      .run(now, now);
+    const recovered = result.changes;
+    return { recovered, completionIds: ids.slice(0, recovered) };
+  }
+
   /**
    * Mark a completion as processed (checks passed, merged to integration branch)
    */
-  markProcessed(completionId: string, prUrl?: string | null): { ok: boolean; message?: string } {
+  markProcessed(
+    completionId: string,
+    prUrl?: string | null,
+    pusherId?: string | null,
+  ): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
     const normalizedPrUrl =
       typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
@@ -656,9 +798,16 @@ export class CompletionQueue {
          SET status = 'processed',
              prUrl = COALESCE(?, prUrl),
              updatedAt = ?
-         WHERE id = ? AND status = 'claimed'`,
+         WHERE id = ? AND status = 'claimed'
+           AND (
+             ? IS NULL OR (
+               pusherId = ?
+               AND leaseExpiresAt IS NOT NULL
+               AND leaseExpiresAt > ?
+             )
+           )`,
       )
-      .run(normalizedPrUrl, now, completionId);
+      .run(normalizedPrUrl, now, completionId, pusherId ?? null, pusherId ?? null, now);
 
     if (info.changes === 0) {
       return { ok: false, message: "Completion not found or not in claimed state" };
@@ -670,14 +819,26 @@ export class CompletionQueue {
   /**
    * Mark a completion as failed (checks failed or merge conflict)
    */
-  markFailed(completionId: string, error: string): { ok: boolean; message?: string } {
+  markFailed(
+    completionId: string,
+    error: string,
+    pusherId?: string | null,
+  ): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
 
     const info = this.db
       .prepare(
-        `UPDATE completions SET status = 'failed', error = ?, updatedAt = ? WHERE id = ? AND status = 'claimed'`,
+        `UPDATE completions SET status = 'failed', error = ?, updatedAt = ?
+         WHERE id = ? AND status = 'claimed'
+           AND (
+             ? IS NULL OR (
+               pusherId = ?
+               AND leaseExpiresAt IS NOT NULL
+               AND leaseExpiresAt > ?
+             )
+           )`,
       )
-      .run(error, now, completionId);
+      .run(error, now, completionId, pusherId ?? null, pusherId ?? null, now);
 
     if (info.changes === 0) {
       return { ok: false, message: "Completion not found or not in claimed state" };
@@ -695,6 +856,7 @@ export class CompletionQueue {
     prUrl?: string | null,
     trustedTiming?: TrustedValidationTiming,
     trustedReportInput?: unknown,
+    pusherId?: string | null,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
     const normalizedPrUrl =
@@ -710,6 +872,14 @@ export class CompletionQueue {
       if (completion.status !== "claimed") {
         return { ok: false, message: "Completion not in claimed state" };
       }
+      if (
+        pusherId &&
+        (completion.pusherId !== pusherId ||
+          !completion.leaseExpiresAt ||
+          completion.leaseExpiresAt <= now)
+      ) {
+        return { ok: false, message: "Completion lease is expired or owned by another pusher" };
+      }
       const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId) as
         | { status: string }
         | undefined;
@@ -721,7 +891,7 @@ export class CompletionQueue {
         };
       }
 
-      this.db
+      const completionUpdated = this.db
         .prepare(
           `UPDATE completions
            SET status = 'processed',
@@ -731,7 +901,14 @@ export class CompletionQueue {
                trustedValidationCacheHit = COALESCE(?, trustedValidationCacheHit),
                error = NULL,
                updatedAt = ?
-           WHERE id = ? AND status = 'claimed'`,
+           WHERE id = ? AND status = 'claimed'
+             AND (
+               ? IS NULL OR (
+                 pusherId = ?
+                 AND leaseExpiresAt IS NOT NULL
+                 AND leaseExpiresAt > ?
+               )
+             )`,
         )
         .run(
           normalizedPrUrl,
@@ -740,7 +917,13 @@ export class CompletionQueue {
           normalizedTiming.installCacheHit,
           now,
           completionId,
+          pusherId ?? null,
+          pusherId ?? null,
+          now,
         );
+      if (completionUpdated.changes === 0) {
+        return { ok: false, message: "Completion lease was lost before finalization" };
+      }
       this.replaceTrustedValidationRuns(completion, trustedReport, now);
       const transitioned = this.db
         .prepare(
@@ -809,6 +992,7 @@ export class CompletionQueue {
     error: string,
     trustedTiming?: TrustedValidationTiming,
     trustedReportInput?: unknown,
+    pusherId?: string | null,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
     const failure = String(error || "Unknown publication error");
@@ -823,6 +1007,14 @@ export class CompletionQueue {
       if (completion.status !== "claimed") {
         return { ok: false, message: "Completion not in claimed state" };
       }
+      if (
+        pusherId &&
+        (completion.pusherId !== pusherId ||
+          !completion.leaseExpiresAt ||
+          completion.leaseExpiresAt <= now)
+      ) {
+        return { ok: false, message: "Completion lease is expired or owned by another pusher" };
+      }
       const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId) as
         | { status: string }
         | undefined;
@@ -834,7 +1026,7 @@ export class CompletionQueue {
         };
       }
 
-      this.db
+      const completionUpdated = this.db
         .prepare(
           `UPDATE completions
            SET status = 'failed',
@@ -843,7 +1035,14 @@ export class CompletionQueue {
                trustedValidationCacheHit = COALESCE(?, trustedValidationCacheHit),
                error = ?,
                updatedAt = ?
-           WHERE id = ? AND status = 'claimed'`,
+           WHERE id = ? AND status = 'claimed'
+             AND (
+               ? IS NULL OR (
+                 pusherId = ?
+                 AND leaseExpiresAt IS NOT NULL
+                 AND leaseExpiresAt > ?
+               )
+             )`,
         )
         .run(
           normalizedTiming.installDurationMs,
@@ -852,7 +1051,13 @@ export class CompletionQueue {
           failure,
           now,
           completionId,
+          pusherId ?? null,
+          pusherId ?? null,
+          now,
         );
+      if (completionUpdated.changes === 0) {
+        return { ok: false, message: "Completion lease was lost before failure finalization" };
+      }
       this.replaceTrustedValidationRuns(completion, trustedReport, now);
       const transitioned = this.db
         .prepare(
@@ -1173,6 +1378,62 @@ export class CompletionQueue {
       if (row.status in counts) counts[row.status] = Number(row.count || 0);
     }
     return counts;
+  }
+
+  publicationBacklogSummary(
+    options: { now?: Date; unhealthyAfterMs?: number } = {},
+  ): PublicationBacklogSummary {
+    const nowDate = options.now ?? new Date();
+    const now = nowDate.toISOString();
+    const unhealthyAfterMs = Math.max(60_000, options.unhealthyAfterMs ?? 15 * 60_000);
+    const counts = this.countByStatus();
+    const oldestPending = this.db
+      .prepare(
+        `SELECT MIN(createdAt) AS value FROM completions WHERE status IN ('pending', 'claimed')`,
+      )
+      .get() as { value: string | null } | undefined;
+    const expiredClaimsRow = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM completions
+         WHERE status = 'claimed' AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`,
+      )
+      .get(now) as { count: number } | undefined;
+    const jobsTable = this.db
+      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`)
+      .get() as { present: number } | undefined;
+    const finalizingRow = jobsTable
+      ? (this.db
+          .prepare(
+            `SELECT COUNT(*) AS count, MIN(updatedAt) AS oldest
+             FROM jobs WHERE status = 'finalizing'`,
+          )
+          .get() as { count: number; oldest: string | null })
+      : { count: counts.pending + counts.claimed, oldest: oldestPending?.value ?? null };
+    const ageMs = (value: string | null | undefined): number => {
+      if (!value) return 0;
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? Math.max(0, nowDate.getTime() - parsed) : 0;
+    };
+    const pending = Math.max(0, counts.pending);
+    const claimed = Math.max(0, counts.claimed);
+    const finalizing = Math.max(0, Number(finalizingRow.count || 0));
+    const oldestPendingAgeMs = ageMs(oldestPending?.value);
+    const oldestFinalizingAgeMs = ageMs(finalizingRow.oldest);
+    const expiredClaims = Math.max(0, Number(expiredClaimsRow?.count || 0));
+    return {
+      pending,
+      claimed,
+      finalizing,
+      backlog: Math.max(pending + claimed, finalizing),
+      oldestPendingAgeMs,
+      oldestFinalizingAgeMs,
+      expiredClaims,
+      unhealthy:
+        expiredClaims > 0 ||
+        (pending + claimed > 0 && oldestPendingAgeMs >= unhealthyAfterMs) ||
+        (finalizing > 0 && oldestFinalizingAgeMs >= unhealthyAfterMs),
+      observedAt: now,
+    };
   }
 
   close(): void {

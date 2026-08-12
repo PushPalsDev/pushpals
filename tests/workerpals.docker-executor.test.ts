@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildWindowsDockerExecTreeTerminationArgv,
   buildWorktreeDependencyPreparationCommand,
   collectPrunableEphemeralWorktrees,
   DockerExecutor,
@@ -10,7 +11,7 @@ import {
   resolveWorkerpalDockerBuildCaSecretArgs,
   resolveWorkerpalDockerRuntimeCaArgs,
 } from "../apps/workerpals/src/docker_executor";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -24,6 +25,16 @@ function createExecutor() {
 }
 
 describe("workerpals docker executor internals", () => {
+  test("builds forced Windows process-tree termination for Docker exec clients", () => {
+    expect(buildWindowsDockerExecTreeTerminationArgv(9876)).toEqual([
+      "taskkill",
+      "/PID",
+      "9876",
+      "/T",
+      "/F",
+    ]);
+  });
+
   test("passes an existing host CA bundle to Docker builds as an ephemeral secret", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-docker-ca-"));
     const caPath = join(root, "extra-ca.pem");
@@ -583,7 +594,13 @@ describe("workerpals docker executor internals", () => {
         containerWorktreePath: string,
         onLog?: (stream: "stdout" | "stderr", line: string) => void,
       ) => Promise<void>;
-      runWarmShell: (command: string) => Promise<{
+      runWarmShell: (
+        command: string,
+        options?: {
+          timeoutMs?: number;
+          onLog?: (stream: "stdout" | "stderr", line: string) => void;
+        },
+      ) => Promise<{
         ok: boolean;
         stdout: string;
         stderr: string;
@@ -592,12 +609,15 @@ describe("workerpals docker executor internals", () => {
     };
 
     let capturedCommand = "";
+    let capturedTimeoutMs = 0;
     const logs: string[] = [];
-    executor.runWarmShell = async (command: string) => {
+    executor.runWarmShell = async (command, options) => {
       capturedCommand = command;
+      capturedTimeoutMs = options?.timeoutMs ?? 0;
+      options?.onLog?.("stderr", "[DependencyPreparation] phase=projection progress=80");
       return {
         ok: true,
-        stdout: " node_modules-linux-native-hardlink",
+        stdout: " node_modules-container-native",
         stderr: "",
         exitCode: 0,
       };
@@ -608,13 +628,15 @@ describe("workerpals docker executor internals", () => {
       (stream, line) => logs.push(`${stream}:${line}`),
     );
 
+    expect(capturedTimeoutMs).toBeGreaterThan(0);
     expect(capturedCommand).toContain('src="/repo/$name"');
     expect(capturedCommand).toContain("node_modules");
     expect(capturedCommand).not.toContain("cp -as");
     expect(capturedCommand).toContain(
-      'dependency_cache_root="$git_common_dir/pushpals/dependencies/linux-$(uname -m)"',
+      'dependency_cache_root="$store_root/snapshots/linux-$(uname -m)"',
     );
-    expect(capturedCommand).toContain("git rev-parse --git-common-dir");
+    expect(capturedCommand).toContain("/workspace/.pushpals/dependency-store");
+    expect(capturedCommand).not.toContain("git rev-parse --git-common-dir");
     expect(capturedCommand).toContain("bun install --frozen-lockfile --ignore-scripts >&2");
     expect(capturedCommand).toContain('snapshot_lock="$snapshot_root.lock"');
     expect(capturedCommand).toContain(
@@ -624,10 +646,11 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).toContain(
       'ln -s "$snapshot_root/node_modules" "$worktree/node_modules"',
     );
-    expect(capturedCommand).toContain("projection=hardlink-v1");
-    expect(capturedCommand).toContain("node_modules-linux-native-hardlink");
+    expect(capturedCommand).toContain("projection=container-volume-v1");
+    expect(capturedCommand).toContain("node_modules-container-native");
     expect(capturedCommand).toContain('for entry in "$src"/* "$src"/.[!.]* "$src"/..?*');
-    expect(capturedCommand).toContain('cp -al "$entry" "$dest/$entry_name"');
+    expect(capturedCommand).toContain('cp -al "$src/." "$projection_node_modules/"');
+    expect(capturedCommand).not.toContain('cp -al "$entry" "$dest/$entry_name"');
     expect(capturedCommand).toContain(
       'find "$snapshot_root/node_modules" -type f -exec chmod a-w {} +',
     );
@@ -636,30 +659,87 @@ describe("workerpals docker executor internals", () => {
     );
     expect(capturedCommand).toContain("for mutable in .cache .expo .vite .vite-temp");
     expect(capturedCommand).toContain(".pushpals-dependency-projection-in-progress");
-    expect(capturedCommand).toContain('rm -f "$dest/.pushpals-dependency-snapshot"');
+    expect(capturedCommand).toContain('ln -s "$projection_node_modules" "$worktree/node_modules"');
     expect(capturedCommand).toContain(".pushpals-dependency-snapshot");
     expect(capturedCommand).toContain(".pushpals-validation-safe-dependency-snapshot");
-    expect(capturedCommand).toContain("/repo/.worktrees/job-browser-smoke/");
-    expect(logs.join("\n")).toContain(
-      "Preparing Linux-native dependency entries for the WorkerPal worktree.",
-    );
-    expect(logs.join("\n")).toContain("Prepared worktree dependency snapshot(s) in ");
+    expect(capturedCommand).toContain("/repo/.worktrees/job-browser-smoke");
+    expect(logs.join("\n")).toContain("[DependencyPreparation] phase=starting progress=0");
+    expect(logs.join("\n")).toContain("[DependencyPreparation] phase=complete progress=100");
   });
 
   test("keys shared Linux snapshots by lockfiles and isolates workspace dependency links", () => {
     const command = buildWorktreeDependencyPreparationCommand("/repo/.worktrees/job-native-deps");
 
-    expect(command).toContain("printf 'projection=hardlink-v1\\nbun=%s\\n' \"$(bun --version)\"");
+    expect(command).toContain(
+      "printf 'projection=container-volume-v1\\nbun=%s\\n' \"$(bun --version)\"",
+    );
     expect(command).toContain(
       'for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"',
     );
     expect(command).toContain('sha256sum "$manifest" | cut -d " " -f 1');
     expect(command).toContain("jq -e '.workspaces != null'");
-    expect(command).toContain('snapshot_key="$snapshot_key-${worktree##*/}"');
+    expect(command).toContain('snapshot_key="$snapshot_key-$worktree_id"');
     expect(command).toContain('while [ ! -f "$snapshot_ready" ]; do');
-    expect(command).toContain('if [ "$wait_count" -ge 600 ]; then');
+    expect(command).toContain('if [ "$wait_count" -ge 300 ]; then');
     expect(command).toContain('printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"');
   });
+
+  (process.platform === "linux" &&
+    process.env.PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION === "1"
+    ? test
+    : test.skip)(
+    "projects dependencies through a container-native store without copying into the bind path",
+    async () => {
+      const worktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-"));
+      try {
+        mkdirSync(join(worktree, "fixture-dep"));
+        writeFileSync(
+          join(worktree, "fixture-dep", "package.json"),
+          '{"name":"fixture-dep","version":"1.0.0"}\n',
+        );
+        writeFileSync(
+          join(worktree, "package.json"),
+          '{"name":"projection-fixture","dependencies":{"fixture-dep":"file:./fixture-dep"}}\n',
+        );
+        const install = Bun.spawn([process.execPath, "install", "--ignore-scripts"], {
+          cwd: worktree,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        expect(await install.exited).toBe(0);
+        rmSync(join(worktree, "node_modules"), { recursive: true, force: true });
+
+        const command = buildWorktreeDependencyPreparationCommand(worktree);
+        const first = Bun.spawn(["sh", "-lc", command], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [firstExit, firstStdout] = await Promise.all([
+          first.exited,
+          new Response(first.stdout).text(),
+        ]);
+        expect(firstExit).toBe(0);
+        expect(firstStdout).toContain("node_modules-container-native");
+        expect(lstatSync(join(worktree, "node_modules")).isSymbolicLink()).toBe(true);
+        expect(
+          await Bun.file(join(worktree, "node_modules", ".pushpals-dependency-snapshot")).exists(),
+        ).toBe(true);
+
+        const second = Bun.spawn(["sh", "-lc", command], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [secondExit, secondStderr] = await Promise.all([
+          second.exited,
+          new Response(second.stderr).text(),
+        ]);
+        expect(secondExit).toBe(0);
+        expect(secondStderr).toContain("phase=snapshot_cache_hit");
+      } finally {
+        rmSync(worktree, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("stops the job when Linux-native dependency preparation fails", async () => {
     const executor = createExecutor() as unknown as {

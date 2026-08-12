@@ -1262,6 +1262,39 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect((engine as any).lastDetail).toBe("worker_load_busy_1_pending_2_autoscalable_1");
   });
 
+  test("worker-load backpressure drains publication first, then uses safe idle capacity", () => {
+    const engine = Object.create(RemoteBuddyAutonomousEngine.prototype) as {
+      deferReasonForWorkerLoad: (snapshot: unknown) => string | null;
+    };
+    const healthyCapacity = {
+      workers: { total: 3, online: 3, busy: 1, idle: 2 },
+      jobs: { pending: 0, claimed: 1, autoscalablePending: 0, finalizing: 1 },
+      completions: { pending: 0, claimed: 1 },
+      publication: {
+        backlog: 1,
+        oldestPendingAgeMs: 20_000,
+        oldestFinalizingAgeMs: 20_000,
+        expiredClaims: 0,
+        unhealthy: false,
+      },
+      prs: { openUnmerged: 1 },
+    };
+    expect(engine.deferReasonForWorkerLoad(healthyCapacity)).toBeNull();
+
+    expect(
+      engine.deferReasonForWorkerLoad({
+        ...healthyCapacity,
+        completions: { pending: 5, claimed: 1 },
+        publication: {
+          ...healthyCapacity.publication,
+          backlog: 6,
+          oldestPendingAgeMs: 20 * 60_000,
+          unhealthy: true,
+        },
+      }),
+    ).toBe("publication_backpressure_backlog_6_oldest_1200000");
+  });
+
   test("tick stops at repo preflight when worktree is dirty and allowDirtyWorktree is false", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnWithDirtyWorktree();

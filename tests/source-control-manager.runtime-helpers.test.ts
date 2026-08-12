@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { loadConfig } from "../apps/source_control_manager/src/config";
 import {
   cloneSourceControlManagerConfigSnapshot,
+  createSourceControlManagerHealthTracker,
   createStartupStatusTracker,
   createSingleFlightExecutor,
   probeReviewAgentRuntimeReadiness,
@@ -9,6 +10,50 @@ import {
 } from "../apps/source_control_manager/src/runtime_helpers";
 
 describe("source_control_manager runtime helpers", () => {
+  test("health tracker marks a tick unhealthy only after progress stalls", () => {
+    let now = Date.parse("2026-08-11T00:00:00.000Z");
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 60_000,
+      idleBacklogGraceMs: 30_000,
+      now: () => now,
+    });
+    tracker.beginTick("trusted_validation");
+    tracker.progress("trusted_validation", "completion-1");
+    now += 59_999;
+    expect(tracker.snapshot()).toMatchObject({ healthy: true, activeCompletionId: "completion-1" });
+    now += 1;
+    expect(tracker.snapshot()).toMatchObject({
+      healthy: false,
+      status: "unhealthy",
+      reason: expect.stringContaining("tick_stalled"),
+    });
+  });
+
+  test("health tracker reports an old finalization queue when the poller is idle", () => {
+    let now = Date.parse("2026-08-11T00:00:00.000Z");
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 60_000,
+      idleBacklogGraceMs: 30_000,
+      now: () => now,
+    });
+    tracker.beginTick();
+    tracker.completeTick();
+    tracker.updatePublication({
+      backlog: 12,
+      pending: 11,
+      claimed: 1,
+      finalizing: 12,
+      oldestPendingAgeMs: 20 * 60_000,
+      oldestFinalizingAgeMs: 20 * 60_000,
+      unhealthy: true,
+    });
+    now += 30_000;
+    expect(tracker.snapshot()).toMatchObject({
+      healthy: false,
+      reason: expect.stringContaining("publication_backlog_stalled_12"),
+    });
+  });
+
   test("cloneSourceControlManagerConfigSnapshot isolates mutable review and check config", () => {
     const config = loadConfig();
     const snapshot = cloneSourceControlManagerConfigSnapshot(config);

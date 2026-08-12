@@ -47,6 +47,13 @@ At a high level:
 
 Each job runs in an isolated git worktree to avoid cross-job contamination.
 
+For Linux-container jobs, dependency snapshots and per-job hardlink projections
+live in a repo-keyed Docker volume. The Windows bind-mounted worktree receives
+only a symlink to that container-native projection, so dependency preparation
+does not recursively copy `node_modules` through the host filesystem. Progress
+is streamed as `DependencyPreparation` phase telemetry and is bounded by
+`workerpals.dependency_preparation_timeout_ms` (five minutes by default).
+
 This provides:
 
 - safer parallelism,
@@ -77,6 +84,9 @@ internal ref for diagnosis; a failed queue handoff is reported as
   - usually schema/format mismatch in executor output.
 - Docker warm container issues:
   - usually image/tooling/network precondition failures.
+- Dependency preparation timeout:
+  - inspect the last `DependencyPreparation` phase/progress event; cold snapshot
+    installs, cache hits, and projection are reported separately.
 - Repeated timeouts:
   - usually budget mismatch or backend model/tool slowness.
 

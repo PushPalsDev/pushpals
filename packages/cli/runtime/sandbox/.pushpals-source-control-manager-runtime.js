@@ -5,6 +5,7 @@ var __require = import.meta.require;
 import { parseArgs } from "util";
 import { isAbsolute as isAbsolute3, join as join5, relative, resolve as resolve9 } from "path";
 import { mkdirSync as mkdirSync2 } from "fs";
+import { createHash as createHash2 } from "crypto";
 
 // packages/shared/src/communication.ts
 function stripPresenceSourcePrefix(value) {
@@ -741,6 +742,7 @@ function loadPushPalsConfig(options = {}) {
   const workerDockerJobRetryBackoffMs = Math.max(250, Math.min(60000, asInt(parseIntEnv("WORKERPALS_DOCKER_JOB_RETRY_BACKOFF_MS") ?? workerNode.docker_job_retry_backoff_ms, 3000)));
   const workerDockerWarmMemoryMb = Math.max(512, Math.min(32768, asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_MEMORY_MB") ?? workerNode.docker_warm_memory_mb, 2048)));
   const workerDockerWarmCpus = Math.max(1, Math.min(16, asInt(parseIntEnv("WORKERPALS_DOCKER_WARM_CPUS") ?? workerNode.docker_warm_cpus, 2)));
+  const workerDependencyPreparationTimeoutMs = Math.max(30000, Math.min(20 * 60000, asInt(parseIntEnv("WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ?? parseIntEnv("PUSHPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS") ?? workerNode.dependency_preparation_timeout_ms, 5 * 60000)));
   const workerLlm = resolveLlmConfig(workerNode, "WORKERPALS", {
     backend: "lmstudio",
     endpoint: "http://127.0.0.1:1234",
@@ -987,6 +989,7 @@ function loadPushPalsConfig(options = {}) {
       dockerJobRetryBackoffMs: workerDockerJobRetryBackoffMs,
       dockerWarmMemoryMb: workerDockerWarmMemoryMb,
       dockerWarmCpus: workerDockerWarmCpus,
+      dependencyPreparationTimeoutMs: workerDependencyPreparationTimeoutMs,
       fileModifyingJobs: workerFileModifyingJobs,
       outputMaxChars: workerOutputMaxChars,
       outputMaxLines: workerOutputMaxLines,
@@ -4950,6 +4953,72 @@ function shouldBypassApplyFailureInReviewMode(input) {
 }
 
 // apps/source_control_manager/src/runtime_helpers.ts
+function createSourceControlManagerHealthTracker(options) {
+  const now = options.now ?? Date.now;
+  const startedAtMs = now();
+  let lastTickStartedAtMs = null;
+  let lastTickCompletedAtMs = null;
+  let lastProgressAtMs = startedAtMs;
+  let activeTick = false;
+  let activeCompletionId = null;
+  let phase = "startup";
+  let publication = null;
+  const toIso = (value) => value === null ? null : new Date(value).toISOString();
+  return {
+    beginTick(nextPhase = "polling") {
+      const at = now();
+      activeTick = true;
+      activeCompletionId = null;
+      phase = nextPhase;
+      lastTickStartedAtMs = at;
+      lastProgressAtMs = at;
+    },
+    progress(nextPhase, completionId) {
+      phase = String(nextPhase || phase);
+      if (completionId !== undefined)
+        activeCompletionId = completionId;
+      lastProgressAtMs = now();
+    },
+    completeTick() {
+      const at = now();
+      activeTick = false;
+      activeCompletionId = null;
+      phase = "idle";
+      lastTickCompletedAtMs = at;
+      lastProgressAtMs = at;
+    },
+    updatePublication(nextPublication) {
+      publication = nextPublication ? { ...nextPublication } : null;
+    },
+    snapshot() {
+      const at = now();
+      const progressAgeMs = Math.max(0, at - lastProgressAtMs);
+      let reason = null;
+      if (activeTick && progressAgeMs >= Math.max(1000, options.tickStallMs)) {
+        reason = `tick_stalled_${progressAgeMs}ms_phase_${phase}`;
+      } else if (publication?.unhealthy && !activeTick) {
+        const idleSince = lastTickCompletedAtMs ?? startedAtMs;
+        const idleAgeMs = Math.max(0, at - idleSince);
+        if (idleAgeMs >= Math.max(1000, options.idleBacklogGraceMs)) {
+          reason = `publication_backlog_stalled_${publication.backlog}_oldest_${Math.max(publication.oldestPendingAgeMs, publication.oldestFinalizingAgeMs)}ms`;
+        }
+      }
+      return {
+        healthy: reason === null,
+        status: reason === null ? "ok" : "unhealthy",
+        reason,
+        startedAt: new Date(startedAtMs).toISOString(),
+        lastTickStartedAt: toIso(lastTickStartedAtMs),
+        lastTickCompletedAt: toIso(lastTickCompletedAtMs),
+        lastProgressAt: new Date(lastProgressAtMs).toISOString(),
+        activeTick,
+        activeCompletionId,
+        phase,
+        publication: publication ? { ...publication } : null
+      };
+    }
+  };
+}
 function cloneSourceControlManagerConfigSnapshot(config) {
   return {
     ...config,
@@ -5105,7 +5174,19 @@ async function probeReviewAgentRuntimeReadiness(options) {
 }
 
 // apps/source_control_manager/src/http.ts
-function createStatusServer(db, port) {
+function createStatusServer(db, port, healthProvider = () => ({
+  healthy: true,
+  status: "ok",
+  reason: null,
+  startedAt: new Date().toISOString(),
+  lastTickStartedAt: null,
+  lastTickCompletedAt: null,
+  lastProgressAt: new Date().toISOString(),
+  activeTick: false,
+  activeCompletionId: null,
+  phase: "unknown",
+  publication: null
+})) {
   return Bun.serve({
     port,
     hostname: "127.0.0.1",
@@ -5118,7 +5199,8 @@ function createStatusServer(db, port) {
         "X-Content-Type-Options": "nosniff"
       };
       if (req.method === "GET" && pathname === "/health") {
-        return Response.json({ status: "ok", pid: process.pid }, { headers });
+        const health = healthProvider();
+        return Response.json({ ...health, pid: process.pid }, { status: health.healthy ? 200 : 503, headers });
       }
       if (req.method === "GET" && pathname === "/jobs") {
         const statusFilter = url.searchParams.get("status");
@@ -5179,6 +5261,9 @@ import { createHash } from "crypto";
 import { existsSync as existsSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync2 } from "fs";
 import { basename as basename2, resolve as resolve7 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 15 * 60000;
+var PROCESS_TREE_TERMINATION_GRACE_MS = 5000;
+var PROCESS_STREAM_DRAIN_GRACE_MS = 2000;
+var PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 var TRUSTED_INSTALL_MARKER = ".pushpals-trusted-install.json";
 var trustedInstallFlights = new Map;
 var BUN_DEPENDENCY_COMMANDS = new Set([
@@ -5319,25 +5404,132 @@ async function ensureTrustedValidationInstall(options) {
       trustedInstallFlights.delete(flightKey);
   }
 }
-async function runArgv(argv, options) {
+function buildWindowsProcessTreeTerminationArgv(pid) {
+  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+async function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise(null), Math.max(1, timeoutMs));
+      })
+    ]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+function captureBoundedProcessStream(stream, maxBytes = PROCESS_OUTPUT_LIMIT_BYTES) {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
+    return { done: Promise.resolve(""), cancel: () => {} };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  let output = "";
+  let bytes = 0;
+  let truncated = false;
+  let cancelled = false;
+  const done = (async () => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done)
+          break;
+        if (bytes < maxBytes) {
+          const remaining = Math.max(0, maxBytes - bytes);
+          const value = chunk.value.byteLength > remaining ? chunk.value.slice(0, remaining) : chunk.value;
+          output += decoder.decode(value, { stream: true });
+          bytes += value.byteLength;
+          if (value.byteLength < chunk.value.byteLength)
+            truncated = true;
+        } else {
+          truncated = true;
+        }
+      }
+      output += decoder.decode();
+    } catch {} finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+    return `${output}${truncated ? `
+[pushpals: process output truncated]` : ""}`;
+  })();
+  return {
+    done,
+    cancel: () => {
+      if (cancelled)
+        return;
+      cancelled = true;
+      try {
+        reader.cancel().catch(() => {});
+      } catch {}
+    }
+  };
+}
+async function terminateProcessTree(proc, platform = process.platform) {
+  const pid = Number(proc.pid);
+  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const killer = Bun.spawn(buildWindowsProcessTreeTerminationArgv(pid), {
+        stdout: "ignore",
+        stderr: "ignore"
+      });
+      const settled = await settleWithin(killer.exited, PROCESS_TREE_TERMINATION_GRACE_MS);
+      if (settled === null) {
+        killer.kill("SIGKILL");
+      } else if (settled === 0 && await settleWithin(proc.exited, PROCESS_STREAM_DRAIN_GRACE_MS) !== null) {
+        return;
+      }
+    } catch {}
+  }
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  if (await settleWithin(proc.exited, PROCESS_TREE_TERMINATION_GRACE_MS) !== null)
+    return;
+  try {
+    proc.kill("SIGKILL");
+  } catch {}
+}
+async function runProcessWithTreeTimeout(argv, options) {
   const proc = Bun.spawn(argv, {
     cwd: options.cwd,
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env }
   });
-  const timer = setTimeout(() => proc.kill(), options.timeoutMs);
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited
+  const stdoutCapture = captureBoundedProcessStream(proc.stdout);
+  const stderrCapture = captureBoundedProcessStream(proc.stderr);
+  let timer = null;
+  const outcome = await Promise.race([
+    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    new Promise((resolvePromise) => {
+      timer = setTimeout(() => resolvePromise({ timedOut: true, exitCode: 124 }), Math.max(1, options.timeoutMs));
+    })
   ]);
-  clearTimeout(timer);
+  if (timer)
+    clearTimeout(timer);
+  if (outcome.timedOut)
+    await terminateProcessTree(proc);
+  const drained = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), PROCESS_STREAM_DRAIN_GRACE_MS);
+  if (!drained) {
+    stdoutCapture.cancel();
+    stderrCapture.cancel();
+  }
+  const streams = drained ?? await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250) ?? ["", ""];
+  const [stdout, stderr] = streams;
+  const timeoutDetail = outcome.timedOut ? `Command timed out after ${Math.max(1, options.timeoutMs)}ms; terminated process tree.` : "";
   return {
-    ok: exitCode === 0,
-    output: [stdout.trim(), stderr.trim()].filter(Boolean).join(`
+    ok: !outcome.timedOut && outcome.exitCode === 0,
+    output: [stdout.trim(), stderr.trim(), timeoutDetail].filter(Boolean).join(`
 `),
-    exitCode
+    exitCode: outcome.exitCode,
+    ...outcome.timedOut ? { timedOut: true } : {}
   };
 }
 async function runTrustedValidationCommands(options) {
@@ -5345,7 +5537,7 @@ async function runTrustedValidationCommands(options) {
   if (!normalized.ok) {
     throw new Error(`Invalid trusted-validation handoff: ${normalized.message}`);
   }
-  const runner = options.runner ?? runArgv;
+  const runner = options.runner ?? runProcessWithTreeTimeout;
   const timeoutMs = Math.max(1000, options.timeoutMs ?? DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS);
   const results = [];
   const commandsWithArgv = normalized.commands.map((command) => {
@@ -5500,6 +5692,10 @@ function validateConfig(config) {
 var PUSH_CONFIG = loadPushPalsConfig();
 var repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
 var defaultSourceControlManagerRepoPath = resolve9(PUSH_CONFIG.sourceControlManager.repoPath);
+var COMPLETION_LEASE_MS = 3 * 60000;
+var COMPLETION_LEASE_HEARTBEAT_MS = 30000;
+var PUBLICATION_HEALTH_POLL_MS = 1e4;
+var SCM_TICK_STALL_MS = Math.max(60000, Number(process.env.PUSHPALS_SCM_TICK_STALL_MS) || 17 * 60000);
 var { values: args } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
@@ -5622,6 +5818,14 @@ console.log(`[${ts2()}] Lock acquired`);
 var dbPath = join5(config.stateDir, "merge_queue.db");
 var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
+var sourceControlManagerPusherId = `source_control_manager-${createHash2("sha256").update(`${config.repoPath}
+${config.mainBranch}
+${config.remote}`).digest("hex").slice(0, 12)}`;
+var reconcilePusherOnNextClaim = true;
+var healthTracker = createSourceControlManagerHealthTracker({
+  tickStallMs: SCM_TICK_STALL_MS,
+  idleBacklogGraceMs: Math.max(30000, config.pollIntervalSeconds * 3000)
+});
 var recovered = db.recoverStuckJobs();
 if (recovered > 0) {
   console.log(`[${ts2()}] Recovered ${recovered} stuck running job(s) -> queued`);
@@ -5629,7 +5833,7 @@ if (recovered > 0) {
 var gitOps = createSourceControlApi(config);
 var server;
 try {
-  server = createStatusServer(db, config.port);
+  server = createStatusServer(db, config.port, healthTracker.snapshot);
   console.log(`[${ts2()}] Status server listening on http://127.0.0.1:${config.port}`);
 } catch (err) {
   const code = err instanceof Error && "code" in err ? err.code : undefined;
@@ -5642,6 +5846,8 @@ try {
 }
 var running = true;
 var statusHeartbeatTimer = null;
+var publicationHealthTimer = null;
+var publicationHealthProbeInFlight = false;
 var reviewAgentPollTimer = null;
 var reviewAgentConfigPollTimer = null;
 var reviewAgentInstance = null;
@@ -5650,6 +5856,36 @@ var shutdownPromise = null;
 var startupStatusTracker = createStartupStatusTracker();
 var reviewAgentRuntimeStateKey = "startup";
 var reviewAgentRuntimeFingerprint = "";
+async function refreshPublicationHealth() {
+  if (publicationHealthProbeInFlight)
+    return;
+  publicationHealthProbeInFlight = true;
+  const controller = new AbortController;
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const headers = {};
+    if (config.authToken)
+      headers.Authorization = `Bearer ${config.authToken}`;
+    const response = await fetch(`${config.serverUrl}/workers/autoscale?ttlMs=15000`, {
+      headers,
+      signal: controller.signal
+    });
+    if (!response.ok)
+      return;
+    const payload = await response.json().catch(() => ({}));
+    if (payload.publication)
+      healthTracker.updatePublication(payload.publication);
+  } catch {} finally {
+    clearTimeout(timer);
+    publicationHealthProbeInFlight = false;
+  }
+}
+function startPublicationHealthPolling() {
+  if (publicationHealthTimer)
+    return;
+  refreshPublicationHealth();
+  publicationHealthTimer = setInterval(() => void refreshPublicationHealth(), PUBLICATION_HEALTH_POLL_MS);
+}
 var integrationMaintenanceIntervalMs = Math.max(1e4, Math.min(60000, config.pollIntervalSeconds * 3000));
 var integrationMaintenanceRunner = new IntegrationMaintenanceRunner({
   gitOps,
@@ -5846,6 +6082,7 @@ async function emitPusherMessage(comm, text, correlationId, meta = {}) {
   }
 }
 async function tick() {
+  healthTracker.beginTick("integration_maintenance");
   try {
     const runtimeConfig = cloneSourceControlManagerConfigSnapshot(config);
     const reviewAgentForTick = reviewAgentInstance;
@@ -5853,15 +6090,20 @@ async function tick() {
     if (runtimeConfig.authToken) {
       headers["Authorization"] = `Bearer ${runtimeConfig.authToken}`;
     }
-    const pusherId = `source_control_manager-${Math.random().toString(36).substring(2, 10)}`;
+    const pusherId = sourceControlManagerPusherId;
     const response = await maintainIntegrationBeforeCompletionClaim({
       maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
       claimCompletion: () => fetch(`${runtimeConfig.serverUrl}/completions/claim`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ pusherId })
+        body: JSON.stringify({
+          pusherId,
+          leaseMs: COMPLETION_LEASE_MS,
+          reconcilePusher: reconcilePusherOnNextClaim
+        })
       })
     });
+    reconcilePusherOnNextClaim = false;
     if (!response.ok) {
       if (response.status !== 404) {
         console.error(`[${ts2()}] Failed to claim completion: ${response.status}`);
@@ -5873,6 +6115,7 @@ async function tick() {
       return;
     }
     const completion = data.completion;
+    healthTracker.progress("completion_claimed", completion.id);
     const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/") ? parseReviewPublicationLease(completion.prBody) : null;
     const isIntegrationReconciliationCompletion = Boolean(reviewPublicationLease && reviewPublicationLease.targetBranch === runtimeConfig.mainBranch && reviewPublicationLease.baseBranch === runtimeConfig.integrationBaseBranch);
     const useReviewPublicationFlow = shouldUseReviewPublicationFlow(runtimeConfig.reviewAgent.enabled, reviewPublicationLease);
@@ -5889,6 +6132,53 @@ async function tick() {
       await emitPusherMessage(comm, `SourceControlManager is in dry-run mode, so completion ${completion.id.slice(0, 8)} was not applied.`, completion.id, completionEventMeta);
       return;
     }
+    let completionLeaseHeartbeatInFlight = false;
+    let completionLeaseLost = false;
+    const renewCompletionLease = async (required = false) => {
+      if (completionLeaseHeartbeatInFlight) {
+        if (!required)
+          return !completionLeaseLost;
+        const deadline = Date.now() + 6000;
+        while (completionLeaseHeartbeatInFlight && Date.now() < deadline) {
+          await Bun.sleep(50);
+        }
+        if (completionLeaseHeartbeatInFlight || completionLeaseLost) {
+          throw new Error("Completion publication lease heartbeat did not settle safely.");
+        }
+        return true;
+      }
+      completionLeaseHeartbeatInFlight = true;
+      const controller = new AbortController;
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const leaseResponse = await fetch(`${runtimeConfig.serverUrl}/completions/${completion.id}/lease/renew`, {
+          method: "POST",
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({ pusherId, leaseMs: COMPLETION_LEASE_MS })
+        });
+        if (!leaseResponse.ok) {
+          if (leaseResponse.status === 400 || leaseResponse.status === 409) {
+            completionLeaseLost = true;
+          }
+          if (required) {
+            throw new Error(`Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`);
+          }
+          return false;
+        }
+        completionLeaseLost = false;
+        return true;
+      } catch (error) {
+        if (required)
+          throw error;
+        console.warn(`[${ts2()}] Completion lease heartbeat failed for ${completion.id}: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      } finally {
+        clearTimeout(timer);
+        completionLeaseHeartbeatInFlight = false;
+      }
+    };
+    const completionLeaseHeartbeatTimer = setInterval(() => void renewCompletionLease(false), COMPLETION_LEASE_HEARTBEAT_MS);
     let tempBranch = "";
     let cleanupCompletionHandoff = false;
     let trustedInstallDurationMs = null;
@@ -5904,6 +6194,7 @@ async function tick() {
     } : null;
     try {
       let processedPrUrl = typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0 ? completion.prUrl.trim() : null;
+      healthTracker.progress("refreshing_refs", completion.id);
       console.log(`[${ts2()}] Refreshing refs before applying ${completion.branch}...`);
       await gitOps.fetchPrune();
       if (reviewPublicationLease) {
@@ -5927,6 +6218,7 @@ async function tick() {
           throw new Error(`Review completion ref ${completion.branch} did not resolve to expected commit ${completion.commitSha}.`);
         }
       }
+      healthTracker.progress("applying_candidate", completion.id);
       tempBranch = `_source_control_manager/${completion.id}`;
       console.log(`[${ts2()}] Creating temp branch ${tempBranch}...`);
       await gitOps.resetToClean();
@@ -5978,6 +6270,7 @@ async function tick() {
         console.warn(`[${ts2()}] Skipping local checks for ${completion.commitSha.slice(0, 8)} because ReviewAgent fallback bypassed temp-branch apply.`);
       } else {
         if (completion.trustedValidationCommandsJson) {
+          healthTracker.progress("trusted_validation", completion.id);
           console.log(`[${ts2()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`);
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
@@ -6016,6 +6309,8 @@ async function tick() {
           console.log(`[${ts2()}]   - Check passed: ${check.name}`);
         }
       }
+      healthTracker.progress("publication", completion.id);
+      await renewCompletionLease(true);
       if (useReviewPublicationFlow) {
         console.log(`[${ts2()}] ReviewAgent mode - creating individual PR for ${completion.branch}`);
         const remoteUrlResult = await runGitCapture(["-C", runtimeConfig.repoPath, "remote", "get-url", runtimeConfig.remote], repoRoot);
@@ -6161,10 +6456,13 @@ ${pushResult.stdout}`.toLowerCase();
         }
       }
       await gitOps.deleteTempBranch(tempBranch);
+      healthTracker.progress("completion_callback", completion.id);
+      await renewCompletionLease(true);
       const markResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/processed`, {
         method: "POST",
         headers,
         body: JSON.stringify({
+          pusherId,
           prUrl: processedPrUrl,
           trustedInstallDurationMs,
           trustedValidationDurationMs,
@@ -6186,6 +6484,7 @@ ${pushResult.stdout}`.toLowerCase();
         method: "POST",
         headers,
         body: JSON.stringify({
+          pusherId,
           error: err.message,
           trustedInstallDurationMs,
           trustedValidationDurationMs,
@@ -6198,6 +6497,7 @@ ${pushResult.stdout}`.toLowerCase();
       }
       await emitPusherMessage(comm, `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`, completion.id, completionEventMeta);
     } finally {
+      clearInterval(completionLeaseHeartbeatTimer);
       try {
         await gitOps.resetToClean();
       } catch (err) {
@@ -6232,28 +6532,19 @@ ${pushResult.stdout}`.toLowerCase();
     }
   } catch (err) {
     console.error(`[${ts2()}] Poll error: ${err.message}`);
+  } finally {
+    healthTracker.completeTick();
   }
 }
 async function runCheck(repoPath, check) {
   const timeoutMs = check.timeoutMs ?? 300000;
   const isWindows = process.platform === "win32";
   const shell = isWindows ? ["cmd", "/c"] : ["sh", "-c"];
-  const proc = Bun.spawn([...shell, check.command], {
+  const result = await runProcessWithTreeTimeout([...shell, check.command], {
     cwd: repoPath,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env }
+    timeoutMs
   });
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text()
-  ]);
-  const exitCode = await proc.exited;
-  clearTimeout(timer);
-  const output = [stdout.trim(), stderr.trim()].filter(Boolean).join(`
-`);
-  return { ok: exitCode === 0, output };
+  return { ok: result.ok, output: result.output };
 }
 async function promptYesNo(question) {
   if (!process.stdin.isTTY || !process.stdout.isTTY)
@@ -6424,6 +6715,7 @@ async function main() {
   await ensureIntegrationBranchExists();
   await emitStartupStatus();
   startStatusHeartbeat();
+  startPublicationHealthPolling();
   await syncReviewAgentRuntimeConfig();
   startReviewAgentRuntimeConfigPolling();
   for (let attempt = 1;; attempt++) {
@@ -6456,6 +6748,10 @@ async function shutdown() {
     if (statusHeartbeatTimer) {
       clearInterval(statusHeartbeatTimer);
       statusHeartbeatTimer = null;
+    }
+    if (publicationHealthTimer) {
+      clearInterval(publicationHealthTimer);
+      publicationHealthTimer = null;
     }
     if (reviewAgentConfigPollTimer) {
       clearInterval(reviewAgentConfigPollTimer);

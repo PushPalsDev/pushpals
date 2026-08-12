@@ -5,6 +5,24 @@ import { tmpdir } from "os";
 import { loadPushPalsConfig } from "../packages/shared/src/config";
 
 describe("shared config env path overrides", () => {
+  test("bounds the dependency preparation timeout override", () => {
+    const previous = process.env.WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS;
+    try {
+      process.env.WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS = "45000";
+      expect(loadPushPalsConfig({ reload: true }).workerpals.dependencyPreparationTimeoutMs).toBe(
+        45_000,
+      );
+      process.env.WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS = "99999999";
+      expect(loadPushPalsConfig({ reload: true }).workerpals.dependencyPreparationTimeoutMs).toBe(
+        20 * 60_000,
+      );
+    } finally {
+      if (previous == null) delete process.env.WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS;
+      else process.env.WORKERPALS_DEPENDENCY_PREPARATION_TIMEOUT_MS = previous;
+      loadPushPalsConfig({ reload: true });
+    }
+  });
+
   test("respects PUSHPALS_PROJECT_ROOT_OVERRIDE and PUSHPALS_CONFIG_DIR_OVERRIDE", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-config-env-"));
     const projectRoot = join(root, "project-repo");

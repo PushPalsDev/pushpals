@@ -24,6 +24,12 @@ export type ManagedServiceSpec = {
   onLaunchTimeout?: (timeoutMs: number) => void;
   onStdoutLine?: (line: string) => void;
   onStderrLine?: (line: string) => void;
+  healthCheck?: {
+    url: string;
+    intervalMs?: number;
+    timeoutMs?: number;
+    unhealthyThreshold?: number;
+  };
 };
 
 export type ManagedServiceProcess = {
@@ -50,6 +56,11 @@ type ServiceManagerState = {
   lastExitFingerprint: string;
   matchingExitFingerprintCount: number;
   lastExitFingerprintAtMs: number;
+  nextHealthProbeAtMs: number;
+  healthProbeInFlight: boolean;
+  consecutiveUnhealthyProbes: number;
+  healthTerminationRequested: boolean;
+  healthFailureDetail: string;
 };
 
 export type ManagedServiceExitFingerprintContext = {
@@ -74,6 +85,11 @@ export type ServiceManagerOptions = {
   onServiceDegraded?: (name: string, reason: string, health: EmbeddedRuntimeHealth) => void;
   onEvent?: (level: "log" | "warn" | "error", line: string) => void;
   onLifecycleEvent?: (event: ManagedServiceLifecycleEvent) => void;
+  probeServiceHealth?: (spec: NonNullable<ManagedServiceSpec["healthCheck"]>) => Promise<{
+    ok: boolean;
+    detail: string;
+  }>;
+  terminateService?: (service: ManagedServiceProcess) => Promise<void>;
 };
 
 export type ManagedServiceLifecycleEvent =
@@ -118,6 +134,82 @@ const DEFAULT_REPEATED_EXIT_FINGERPRINT_LIMIT = 2;
 const DEFAULT_REPEATED_EXIT_FINGERPRINT_WINDOW_MS = 15 * 60_000;
 const DEFAULT_SERVICE_MANAGER_BASE_BACKOFF_MS = 2_000;
 const DEFAULT_SERVICE_MANAGER_MAX_BACKOFF_MS = 30_000;
+const DEFAULT_SERVICE_HEALTH_INTERVAL_MS = 5_000;
+const DEFAULT_SERVICE_HEALTH_TIMEOUT_MS = 2_500;
+const DEFAULT_SERVICE_UNHEALTHY_THRESHOLD = 3;
+
+async function settleManagedProcessWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise(null), Math.max(1, timeoutMs));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export function buildWindowsManagedServiceTreeTerminationArgv(pid: number): string[] {
+  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+
+async function defaultProbeServiceHealth(
+  spec: NonNullable<ManagedServiceSpec["healthCheck"]>,
+): Promise<{ ok: boolean; detail: string }> {
+  const controller = new AbortController();
+  const timeoutMs = Math.max(250, spec.timeoutMs ?? DEFAULT_SERVICE_HEALTH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(spec.url, { signal: controller.signal });
+    const detail = await response.text().catch(() => "");
+    return {
+      ok: response.ok,
+      detail: detail.trim().slice(0, 500) || `HTTP ${response.status}`,
+    };
+  } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function terminateManagedServiceTree(
+  service: ManagedServiceProcess,
+  platform = process.platform,
+): Promise<void> {
+  service.stopOutputPipes?.();
+  const pid = Number(service.proc.pid);
+  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const taskkill = Bun.spawn(buildWindowsManagedServiceTreeTerminationArgv(pid), {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const result = await settleManagedProcessWithin(taskkill.exited, 5_000);
+      if (result === null) {
+        taskkill.kill("SIGKILL");
+      } else if (
+        result === 0 &&
+        (await settleManagedProcessWithin(service.proc.exited, 2_000)) !== null
+      ) {
+        return;
+      }
+    } catch {
+      // Fall back to terminating the managed parent directly.
+    }
+  }
+  try {
+    service.proc.kill("SIGKILL");
+  } catch {
+    // Process already exited.
+  }
+}
 
 export function formatEmbeddedRuntimeHealthLines(health: EmbeddedRuntimeHealth | null): string[] {
   if (!health) return [];
@@ -321,6 +413,8 @@ export class ServiceManager {
   ) => void;
   private readonly onEvent?: (level: "log" | "warn" | "error", line: string) => void;
   private readonly onLifecycleEvent?: (event: ManagedServiceLifecycleEvent) => void;
+  private readonly probeServiceHealth: NonNullable<ServiceManagerOptions["probeServiceHealth"]>;
+  private readonly terminateService: NonNullable<ServiceManagerOptions["terminateService"]>;
   private readonly timer: ReturnType<typeof setInterval>;
   private shutdownBegun = false;
   private stopped = false;
@@ -356,6 +450,8 @@ export class ServiceManager {
     this.onServiceDegraded = options.onServiceDegraded;
     this.onEvent = options.onEvent;
     this.onLifecycleEvent = options.onLifecycleEvent;
+    this.probeServiceHealth = options.probeServiceHealth ?? defaultProbeServiceHealth;
+    this.terminateService = options.terminateService ?? terminateManagedServiceTree;
     this.timer = setInterval(() => this.tick(), this.pollMs);
   }
 
@@ -391,6 +487,11 @@ export class ServiceManager {
     }
     state.nextRestartAtMs = 0;
     state.lastRestartReason = "";
+    state.nextHealthProbeAtMs = 0;
+    state.healthProbeInFlight = false;
+    state.consecutiveUnhealthyProbes = 0;
+    state.healthTerminationRequested = false;
+    state.healthFailureDetail = "";
     if (options.resetAttempts !== false) {
       state.attempts = 0;
       state.lastExitFingerprint = "";
@@ -477,6 +578,11 @@ export class ServiceManager {
       lastExitFingerprint: "",
       matchingExitFingerprintCount: 0,
       lastExitFingerprintAtMs: 0,
+      nextHealthProbeAtMs: 0,
+      healthProbeInFlight: false,
+      consecutiveUnhealthyProbes: 0,
+      healthTerminationRequested: false,
+      healthFailureDetail: "",
     };
     this.stateByService.set(name, created);
     return created;
@@ -533,6 +639,63 @@ export class ServiceManager {
     };
   }
 
+  private scheduleHealthProbe(
+    name: string,
+    service: ManagedServiceProcess,
+    spec: ManagedServiceSpec,
+    state: ServiceManagerState,
+    now: number,
+  ): void {
+    const healthCheck = spec.healthCheck;
+    if (
+      !healthCheck ||
+      state.healthProbeInFlight ||
+      state.healthTerminationRequested ||
+      state.nextHealthProbeAtMs > now
+    ) {
+      return;
+    }
+    state.healthProbeInFlight = true;
+    state.nextHealthProbeAtMs =
+      now + Math.max(50, healthCheck.intervalMs ?? DEFAULT_SERVICE_HEALTH_INTERVAL_MS);
+    void this.probeServiceHealth(healthCheck)
+      .then(async (health) => {
+        if (this.shutdownBegun || this.stopped) return;
+        if (this.services.get(name) !== service || service.exited) return;
+        if (health.ok) {
+          state.consecutiveUnhealthyProbes = 0;
+          state.healthFailureDetail = "";
+          return;
+        }
+        state.consecutiveUnhealthyProbes += 1;
+        state.healthFailureDetail = health.detail;
+        const threshold = Math.max(
+          1,
+          Math.floor(healthCheck.unhealthyThreshold ?? DEFAULT_SERVICE_UNHEALTHY_THRESHOLD),
+        );
+        this.emitEvent(
+          state.consecutiveUnhealthyProbes >= threshold ? "warn" : "log",
+          `Managed ${name} health probe failed (${state.consecutiveUnhealthyProbes}/${threshold}): ${health.detail}`,
+        );
+        if (state.consecutiveUnhealthyProbes < threshold) return;
+        state.healthTerminationRequested = true;
+        this.emitEvent(
+          "warn",
+          `Managed ${name} is unhealthy; terminating its process tree so the supervisor can restart it.`,
+        );
+        await this.terminateService(service);
+      })
+      .catch((error) => {
+        this.emitEvent(
+          "warn",
+          `Managed ${name} health supervision failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        state.healthProbeInFlight = false;
+      });
+  }
+
   private tick(): void {
     if (this.shutdownBegun || this.stopped) return;
     const now = Date.now();
@@ -546,12 +709,15 @@ export class ServiceManager {
           state.nextRestartAtMs = 0;
           state.lastRestartReason = "";
         }
+        this.scheduleHealthProbe(name, service, launchSpec, state, now);
         continue;
       }
       if (state.pendingRestartTimer) continue;
       if (state.nextRestartAtMs > now) continue;
 
-      const reason = `exit code ${service.exitCode ?? "unknown"}`;
+      const reason = state.healthTerminationRequested
+        ? `unhealthy health probe${state.healthFailureDetail ? `: ${state.healthFailureDetail}` : ""}`
+        : `exit code ${service.exitCode ?? "unknown"}`;
       const exitAlreadyReported = state.lastReportedExitedProcess === service;
       const uptimeMs = Math.max(0, now - service.launchedAtMs);
       const exitFingerprint = exitAlreadyReported
@@ -637,6 +803,12 @@ export class ServiceManager {
         try {
           const restarted = this.spawnService(spec);
           this.services.set(name, restarted);
+          state.nextHealthProbeAtMs =
+            Date.now() +
+            Math.max(50, spec.healthCheck?.intervalMs ?? DEFAULT_SERVICE_HEALTH_INTERVAL_MS);
+          state.consecutiveUnhealthyProbes = 0;
+          state.healthTerminationRequested = false;
+          state.healthFailureDetail = "";
           this.emitEvent("log", `Restarted managed ${name}.`);
           this.onLifecycleEvent?.({
             type: "restarted",

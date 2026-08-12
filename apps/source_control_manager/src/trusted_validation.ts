@@ -14,9 +14,12 @@ export type TrustedValidationCommandResult = TrustedValidationExecutionResult;
 type CommandRunner = (
   argv: string[],
   options: { cwd: string; timeoutMs: number },
-) => Promise<{ ok: boolean; output: string; exitCode: number }>;
+) => Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }>;
 
 const DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 15 * 60_000;
+const PROCESS_TREE_TERMINATION_GRACE_MS = 5_000;
+const PROCESS_STREAM_DRAIN_GRACE_MS = 2_000;
+const PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 const TRUSTED_INSTALL_MARKER = ".pushpals-trusted-install.json";
 const trustedInstallFlights = new Map<string, Promise<TrustedValidationCommandResult>>();
 const BUN_DEPENDENCY_COMMANDS = new Set([
@@ -195,27 +198,159 @@ async function ensureTrustedValidationInstall(options: {
   }
 }
 
-async function runArgv(
+export function buildWindowsProcessTreeTerminationArgv(pid: number): string[] {
+  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise(null), Math.max(1, timeoutMs));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function captureBoundedProcessStream(
+  stream: ReadableStream<Uint8Array> | number | null | undefined,
+  maxBytes = PROCESS_OUTPUT_LIMIT_BYTES,
+): { done: Promise<string>; cancel: () => void } {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
+    return { done: Promise.resolve(""), cancel: () => {} };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  let bytes = 0;
+  let truncated = false;
+  let cancelled = false;
+  const done = (async () => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        if (bytes < maxBytes) {
+          const remaining = Math.max(0, maxBytes - bytes);
+          const value =
+            chunk.value.byteLength > remaining ? chunk.value.slice(0, remaining) : chunk.value;
+          output += decoder.decode(value, { stream: true });
+          bytes += value.byteLength;
+          if (value.byteLength < chunk.value.byteLength) truncated = true;
+        } else {
+          truncated = true;
+        }
+      }
+      output += decoder.decode();
+    } catch {
+      // Stream cancellation is expected after the bounded drain deadline.
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // best-effort stream cleanup
+      }
+    }
+    return `${output}${truncated ? "\n[pushpals: process output truncated]" : ""}`;
+  })();
+  return {
+    done,
+    cancel: () => {
+      if (cancelled) return;
+      cancelled = true;
+      try {
+        void reader.cancel().catch(() => {});
+      } catch {
+        // best-effort stream cleanup
+      }
+    },
+  };
+}
+
+export async function terminateProcessTree(
+  proc: ReturnType<typeof Bun.spawn>,
+  platform = process.platform,
+): Promise<void> {
+  const pid = Number(proc.pid);
+  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const killer = Bun.spawn(buildWindowsProcessTreeTerminationArgv(pid), {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const settled = await settleWithin(killer.exited, PROCESS_TREE_TERMINATION_GRACE_MS);
+      if (settled === null) {
+        killer.kill("SIGKILL");
+      } else if (
+        settled === 0 &&
+        (await settleWithin(proc.exited, PROCESS_STREAM_DRAIN_GRACE_MS)) !== null
+      ) {
+        return;
+      }
+    } catch {
+      // Fall through to Bun's direct-process kill as a last resort.
+    }
+  }
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  if ((await settleWithin(proc.exited, PROCESS_TREE_TERMINATION_GRACE_MS)) !== null) return;
+  try {
+    proc.kill("SIGKILL");
+  } catch {
+    // Process already exited.
+  }
+}
+
+export async function runProcessWithTreeTimeout(
   argv: string[],
   options: { cwd: string; timeoutMs: number },
-): Promise<{ ok: boolean; output: string; exitCode: number }> {
+): Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }> {
   const proc = Bun.spawn(argv, {
     cwd: options.cwd,
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env },
   });
-  const timer = setTimeout(() => proc.kill(), options.timeoutMs);
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
+  const stdoutCapture = captureBoundedProcessStream(proc.stdout);
+  const stderrCapture = captureBoundedProcessStream(proc.stderr);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const outcome = await Promise.race([
+    proc.exited.then((exitCode) => ({ timedOut: false as const, exitCode })),
+    new Promise<{ timedOut: true; exitCode: number }>((resolvePromise) => {
+      timer = setTimeout(
+        () => resolvePromise({ timedOut: true, exitCode: 124 }),
+        Math.max(1, options.timeoutMs),
+      );
+    }),
   ]);
-  clearTimeout(timer);
+  if (timer) clearTimeout(timer);
+  if (outcome.timedOut) await terminateProcessTree(proc);
+  const drained = await settleWithin(
+    Promise.all([stdoutCapture.done, stderrCapture.done]),
+    PROCESS_STREAM_DRAIN_GRACE_MS,
+  );
+  if (!drained) {
+    stdoutCapture.cancel();
+    stderrCapture.cancel();
+  }
+  const streams = drained ??
+    (await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250)) ?? ["", ""];
+  const [stdout, stderr] = streams;
+  const timeoutDetail = outcome.timedOut
+    ? `Command timed out after ${Math.max(1, options.timeoutMs)}ms; terminated process tree.`
+    : "";
   return {
-    ok: exitCode === 0,
-    output: [stdout.trim(), stderr.trim()].filter(Boolean).join("\n"),
-    exitCode,
+    ok: !outcome.timedOut && outcome.exitCode === 0,
+    output: [stdout.trim(), stderr.trim(), timeoutDetail].filter(Boolean).join("\n"),
+    exitCode: outcome.exitCode,
+    ...(outcome.timedOut ? { timedOut: true } : {}),
   };
 }
 
@@ -231,7 +366,7 @@ export async function runTrustedValidationCommands(options: {
     throw new Error(`Invalid trusted-validation handoff: ${normalized.message}`);
   }
 
-  const runner = options.runner ?? runArgv;
+  const runner = options.runner ?? runProcessWithTreeTimeout;
   const timeoutMs = Math.max(1_000, options.timeoutMs ?? DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS);
   const results: TrustedValidationCommandResult[] = [];
   const commandsWithArgv = normalized.commands.map((command) => {

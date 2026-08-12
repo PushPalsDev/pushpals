@@ -102,6 +102,11 @@ For each claimed request:
 6. Enqueue `task.execute` or return direct response.
 7. Persist request/plan/outcome memory entries.
 
+Autonomous dispatch also reads the worker/publication snapshot. It pauses when
+pending jobs already need workers or the completion/finalization backlog is old
+or above publisher capacity. Once publication is healthy, a busy worker no
+longer blocks ideation by itself when another online worker is safely idle.
+
 ## Config Knobs
 
 Primary knobs live in `configs/*.toml` under `[remotebuddy.memory]`:

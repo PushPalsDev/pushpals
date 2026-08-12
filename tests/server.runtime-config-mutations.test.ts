@@ -174,6 +174,7 @@ function makeConfig(projectRoot: string): PushPalsConfig {
       dockerNetworkMode: "bridge",
       dockerWarmMemoryMb: 2048,
       dockerWarmCpus: 2,
+      dependencyPreparationTimeoutMs: 300000,
       fileModifyingJobs: ["task.execute"],
       outputMaxChars: 196608,
       outputMaxLines: 600,

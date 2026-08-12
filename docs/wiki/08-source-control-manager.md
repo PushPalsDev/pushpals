@@ -75,6 +75,15 @@ This keeps provider-specific auth behavior in one place and reduces duplicated a
 ## Recovery and Safety Features
 
 - process lock prevents dual SCM daemons on one state directory,
+- completion claims use renewable leases and stable pusher ownership; expired,
+  legacy, and same-pusher restart claims are reconciled back to FIFO pending work,
+- processed/failed callbacks verify lease ownership so a stale publisher cannot
+  finalize a completion reclaimed by another SCM instance,
+- `/health` becomes unhealthy when an active tick stops making progress or an
+  old publication backlog remains idle; the embedded supervisor then terminates
+  the full Windows process tree with `taskkill /T /F` and restarts SCM,
+- trusted validation and configured checks terminate their Windows descendant
+  trees on timeout and stop draining inherited output pipes after a bounded grace,
 - clean-repo guard (optional skip in dev),
 - retry/backoff on transient failures,
 - bounded review diff size,

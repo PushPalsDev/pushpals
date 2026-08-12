@@ -30,6 +30,7 @@ import {
   formatEmbeddedRuntimeHealthLines as formatSharedEmbeddedRuntimeHealthLines,
   shouldRestartService,
   startManagedServiceWithRetry,
+  terminateManagedServiceTree,
   type EmbeddedRuntimeHealth,
   type ManagedServiceProcess,
 } from "./start_runtime_services.js";
@@ -2710,23 +2711,10 @@ async function stopRuntimeServicesOnWindows(
   services: RuntimeServiceProcess[],
   timeoutMs: number,
 ): Promise<void> {
-  for (const service of services) {
-    service.stopOutputPipes?.();
-    try {
-      service.proc.kill("SIGTERM");
-    } catch {
-      // ignore best-effort shutdown failures
-    }
-  }
-  await waitForRuntimeServicesExit(services, Math.max(500, timeoutMs - 1_000));
-  for (const service of services) {
-    if (service.exited) continue;
-    try {
-      service.proc.kill("SIGKILL");
-    } catch {
-      // ignore best-effort shutdown failures
-    }
-  }
+  await Promise.allSettled(
+    services.map((service) => terminateManagedServiceTree(service, "win32")),
+  );
+  await waitForRuntimeServicesExit(services, Math.max(500, timeoutMs));
 }
 
 function resolveGracefulShutdownPriority(name: RuntimeServiceName): number {
@@ -5525,6 +5513,16 @@ async function autoStartRuntimeServices(opts: {
         appendFileSync(logPath, `${serviceLine}\n`, "utf8");
         appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
       },
+      ...(name === "source_control_manager"
+        ? {
+            healthCheck: {
+              url: `http://127.0.0.1:${opts.sourceControlManagerPort}/health`,
+              intervalMs: 5_000,
+              timeoutMs: 2_500,
+              unhealthyThreshold: 3,
+            },
+          }
+        : {}),
     };
   };
   let latestServiceLaunchAtMs = 0;
