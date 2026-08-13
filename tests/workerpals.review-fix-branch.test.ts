@@ -4,6 +4,7 @@ import {
   extractReviewFixContext,
   resolveReviewFixCompletionBranch,
   resolveReviewNoChangeCompletionBranch,
+  resolveWorkerCriticReviewContext,
   shouldEnqueueNoChangeReviewCompletion,
 } from "../apps/workerpals/src/execute_job";
 import { loadPushPalsConfig } from "../packages/shared/src/config";
@@ -110,7 +111,56 @@ describe("workerpals review fix completion branch resolution", () => {
     expect(policy.criticGateEnabled).toBe(false);
     expect(policy.publishGateEnabled).toBe(true);
     expect(policy.softPassOnExhausted).toBe(true);
-    expect(policy.criticMinScore).toBeCloseTo(8.3, 5);
+    expect(policy.criticMinScore).toBeCloseTo(8.5, 5);
+  });
+
+  test("aligns the default worker critic threshold with enabled final review", () => {
+    const base = loadPushPalsConfig({ reload: true });
+    const runtimeConfig = {
+      ...base,
+      workerpals: { ...base.workerpals, qualityCriticMinScore: 8 },
+      sourceControlManager: {
+        ...base.sourceControlManager,
+        reviewAgent: {
+          ...base.sourceControlManager.reviewAgent,
+          enabled: true,
+          passThreshold: 9.1,
+        },
+      },
+    };
+    expect(deriveQualityGatePolicy({}, runtimeConfig).criticMinScore).toBe(9.1);
+  });
+
+  test("feeds the final reviewer rubric and prior findings into worker review context", () => {
+    const base = loadPushPalsConfig({ reload: true });
+    const runtimeConfig = {
+      ...base,
+      sourceControlManager: {
+        ...base.sourceControlManager,
+        reviewAgent: {
+          ...base.sourceControlManager.reviewAgent,
+          passThreshold: 8.7,
+          reviewerMdPath: "missing-reviewer.md",
+        },
+      },
+    };
+    const context = resolveWorkerCriticReviewContext(
+      process.cwd(),
+      {
+        reviewAgent: {
+          resolutionType: "review_fix",
+          previousReviewScore: 7.8,
+          previousReviewSummary: "Rendered ownership cue can be obscured",
+          reviewerFindings: ["Cover all ship variants", "Assert rendered geometry"],
+        },
+      },
+      runtimeConfig,
+    );
+    expect(context.finalReviewThreshold).toBe(8.7);
+    expect(context.finalReviewerRubric).toContain("Distinguished Engineer");
+    expect(context.priorReviewContext).toContain("Previous final-review score: 7.8");
+    expect(context.priorReviewContext).toContain("Cover all ship variants");
+    expect(context.priorReviewContext).toContain("not an exhaustive checklist");
   });
 
   test("preserves exhausted soft-pass for merge-conflict jobs", () => {
@@ -141,7 +191,7 @@ describe("workerpals review fix completion branch resolution", () => {
     expect(policy.maxAutoRevisions).toBe(1);
     expect(policy.validationMaxAutoRevisions).toBe(3);
     expect(policy.softPassOnExhausted).toBe(true);
-    expect(policy.criticMinScore).toBe(8);
+    expect(policy.criticMinScore).toBe(base.sourceControlManager.reviewAgent.passThreshold);
   });
 
   test("suppresses unchanged branch re-review for rejected review-fix jobs", () => {
@@ -161,8 +211,8 @@ describe("workerpals review fix completion branch resolution", () => {
         },
       }),
     ).toBe(false);
-    expect(shouldEnqueueNoChangeReviewCompletion({ completionBranch: "agent/workerpal-1/job-xyz" })).toBe(
-      true,
-    );
+    expect(
+      shouldEnqueueNoChangeReviewCompletion({ completionBranch: "agent/workerpal-1/job-xyz" }),
+    ).toBe(true);
   });
 });

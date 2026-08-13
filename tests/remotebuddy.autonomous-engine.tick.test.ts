@@ -525,12 +525,17 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       unknown
     >;
     expect(String(enqueueMetadata.origin ?? "")).toBe("autonomy");
+    const enqueueAutonomy = enqueueMetadata.autonomy as Record<string, unknown>;
+    expect(enqueueAutonomy.reservationRequired).toBe(true);
+    expect(String((enqueueCall?.body as Record<string, unknown>).idempotencyKey)).toStartWith(
+      "autonomy:",
+    );
 
-    expect(objectivePosts.length).toBeGreaterThan(0);
+    expect(objectivePosts.length).toBe(1);
     const lastObjective = objectivePosts[objectivePosts.length - 1] ?? {};
     const objective = (lastObjective.objective ?? {}) as Record<string, unknown>;
-    expect(String(objective.status ?? "")).toBe("dispatched");
-    expect(String(objective.request_id ?? "")).toBe("req_tick_1");
+    expect(String(objective.status ?? "")).toBe("gated");
+    expect(objective.expected_validation).toEqual(["bun run test:root"]);
   });
 
   test("tick dispatches validation repair before normal ideation when required validation is red", async () => {
@@ -709,7 +714,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     >;
     expect(postedCandidates[0]?.required_validation_repair).toBe(true);
     const objective = (objectivePosts[0]?.objective ?? {}) as Record<string, unknown>;
-    expect(String(objective.status ?? "")).toBe("dispatched");
+    expect(String(objective.status ?? "")).toBe("gated");
     expect(String(objective.objective_type ?? "")).toBe("flaky_test");
     expect(String(objective.trigger_type ?? "")).toBe("test_failure");
     expect(objective.target_paths).toEqual(["scripts/test-web-e2e.js"]);
@@ -1600,6 +1605,7 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     });
 
     expect((engine as any).phaseTimeoutMs("ideation")).toBe(90_000);
+    expect((engine as any).ideationRetryTimeoutMs()).toBe(30_000);
     expect((engine as any).phaseTimeoutMs("scoring")).toBe(60_000);
     expect((engine as any).phaseTimeoutMs("planning")).toBe(60_000);
   });
@@ -1780,6 +1786,180 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(llmCall).toBe(3);
     expect(objectivePosts.length).toBeGreaterThan(0);
     expect(requestPosts.length).toBe(1);
+  });
+
+  test("filters recently completed targets before scoring and records every rejection as unselected", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-prescore-diversity-"));
+    tempDirs.push(root);
+    const objectivePosts: Array<Record<string, unknown>> = [];
+    const calls: FetchCall[] = [];
+    const now = new Date().toISOString();
+    const snapshot = {
+      ...makeSnapshot(),
+      recent_objectives: [
+        {
+          id: "obj_recent_src",
+          status: "completed",
+          objective_type: "small_refactor",
+          component_area: "src",
+          target_paths: ["src"],
+          scope: { write_globs: ["src/**"] },
+          updated_at: now,
+        },
+        {
+          id: "obj_recent_vision",
+          status: "completed",
+          objective_type: "docs",
+          component_area: "docs",
+          target_paths: ["vision.md"],
+          scope: { write_globs: ["vision.md"] },
+          updated_at: now,
+        },
+      ],
+    };
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: now });
+      if (url.includes("/autonomy/lock/renew"))
+        return jsonResponse(200, { ok: true, lockUntil: now });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot")) return jsonResponse(200, { ok: true, snapshot });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
+      if (url.includes("/autonomy/inspiration/ingest"))
+        return jsonResponse(200, { ok: true, inserted: 0, updated: 0, skipped: 0 });
+      if (url.includes("/autonomy/inspiration?"))
+        return jsonResponse(200, { ok: true, patterns: [] });
+      if (url.includes("/autonomy/insights?"))
+        return jsonResponse(200, { ok: true, engineSourceStats: [] });
+      if (url.endsWith("/autonomy/objectives")) {
+        objectivePosts.push(body as Record<string, unknown>);
+        return jsonResponse(200, { ok: true });
+      }
+      throw new Error(`Unexpected post-diversity request: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llmInputs: Array<Record<string, unknown>> = [];
+    const llm = {
+      async generate(input: Record<string, unknown>) {
+        llmInputs.push(input);
+        if (llmInputs.length > 1) {
+          throw new Error("recent targets must be rejected before the scoring LLM call");
+        }
+        return {
+          text: JSON.stringify({
+            candidates: [
+              {
+                id: "cand_recent_target",
+                title: "Repeat the recent autonomy target",
+                objective_type: "small_refactor",
+                problem_statement: "Repeat work that has already completed on this target.",
+                trigger_type: "queue_health",
+                component_area: "src",
+                target_paths: ["src/autonomy.ts"],
+                scope: { read_anywhere: false, write_globs: ["src/autonomy.ts"] },
+                risk_level: "low",
+                expected_validation: ["bun test"],
+                estimated_effort: "small",
+                why_now_signal_ids: ["sig_queue"],
+                confidence: 0.95,
+                vision_alignment_reason: "Claims to improve reliability.",
+                vision_section_refs: ["1"],
+                feature_hypotheses: ["Repeating the same target would not add diversity."],
+                requires_user_input: false,
+              },
+            ],
+          }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_prescore_diversity",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => {
+      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+      const targetPath = join(autonomyRepo, "src", "autonomy.ts");
+      mkdirSync(join(targetPath, ".."), { recursive: true });
+      writeFileSync(targetPath, "// recent target fixture\n", "utf8");
+      writeFileSync(join(autonomyRepo, "vision.md"), "# Vision\n", "utf8");
+      return true;
+    };
+    (engine as any).loadVisionContext = () => ({
+      path: "vision.md",
+      markdown: "# Vision\n",
+      one_sentence: "Improve reliability without repeating completed targets.",
+      sections: [
+        {
+          number: "1",
+          title: "Reliability",
+          markdown: "Diversify work across product surfaces.",
+          truncated: false,
+        },
+      ],
+      key_items: {
+        target_users: ["maintainers"],
+        priorities: ["reliability"],
+        objectives: ["avoid repeated work"],
+        guardrails: ["do not repeat recent targets"],
+        constraints: [],
+        non_goals: [],
+        metrics: ["first-pass completion"],
+        risk_policy: ["low risk autonomous"],
+        operating_model: ["autonomous maintenance"],
+        governance: ["review changes"],
+      },
+      section_numbers: ["1"],
+      sha256: "visionhash-prescore",
+      truncated: false,
+    });
+    (engine as any).loadCommitHistoryHints = async () => [];
+
+    await engine.tick();
+
+    expect(llmInputs.length).toBe(1);
+    const ideationContent = String(
+      ((llmInputs[0]?.messages as Array<Record<string, unknown>>)?.[0]?.content ?? "") as string,
+    );
+    const ideationPayload = JSON.parse(ideationContent) as Record<string, unknown>;
+    const ideationSnapshot = ideationPayload.snapshot as Record<string, unknown>;
+    expect(ideationSnapshot.excluded_target_paths).toEqual(
+      expect.arrayContaining(["src", "vision.md"]),
+    );
+    expect(Array.isArray(ideationSnapshot.recent_objectives)).toBe(true);
+    expect(calls.some((entry) => entry.url.endsWith("/autonomy/eligibility"))).toBe(false);
+    expect(calls.some((entry) => entry.url.endsWith("/requests/enqueue"))).toBe(false);
+    expect(objectivePosts).toHaveLength(1);
+    const candidates = objectivePosts[0]?.candidates as Array<Record<string, unknown>>;
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates.every((candidate) => candidate.selected === false)).toBe(true);
+    expect(
+      candidates.every((candidate) =>
+        String(candidate.rejection_reason ?? "").startsWith("work_diversity_target_recent:"),
+      ),
+    ).toBe(true);
+    expect((engine as any).lastDetail).toBe("no_eligible_candidates");
   });
 
   test("tick can dispatch generic repo autonomy work when vision.md is present", async () => {

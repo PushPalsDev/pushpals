@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildWindowsDockerExecTreeTerminationArgv,
+  buildOpenAiCodexHomeStartupCommand,
   buildWorktreeDependencyPreparationCommand,
   collectPrunableEphemeralWorktrees,
   DockerExecutor,
   isEphemeralWorkerWorktreePath,
   parseGitWorktreeListPorcelain,
   prependWorkerpalRuntimeCaStartup,
+  resolveOpenAiCodexContainerHome,
   resolveDockerJobTimeoutMs,
   resolveWorkerpalDockerBuildCaSecretArgs,
   resolveWorkerpalDockerRuntimeCaArgs,
@@ -537,25 +539,88 @@ describe("workerpals docker executor internals", () => {
     expect(logs.join("\n")).toContain("retrying warm container startup");
   });
 
-  test("openaiCodexAuthMountArgs ignores relative CODEX_HOME overrides that point into the repo", () => {
+  test("isolates Linux Codex state and binds only the host auth file read-only", () => {
     const original = process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME;
-    process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME = ".codex";
+    const root = mkdtempSync(join(tmpdir(), "pushpals-codex-auth-"));
+    writeFileSync(join(root, "auth.json"), '{"tokens":{}}\n', "utf8");
+    process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME = root;
     try {
       const executor = createExecutor() as unknown as {
-        openaiCodexAuthMountArgs: (backend: string) => string[];
+        openaiCodexAuthMount: (backend: string) => {
+          args: string[];
+          containerHome: string;
+          hostAuthMounted: boolean;
+        };
+        codexVolumeName: string;
       };
-      const args = executor.openaiCodexAuthMountArgs("openai_codex");
+      const mount = executor.openaiCodexAuthMount("openai_codex");
+      const args = mount.args;
       expect(args).toContain("-e");
-      expect(args).toContain("CODEX_HOME=/root/.codex");
-      const mountArg = args[1] ?? "";
-      expect(mountArg.includes(`${process.cwd()}\\.codex`)).toBe(false);
+      expect(args).toContain("CODEX_HOME=/workspace/.pushpals/codex-home");
+      expect(args).toContain(
+        `type=volume,source=${executor.codexVolumeName},target=/workspace/.pushpals/codex-home`,
+      );
+      expect(
+        args.some((arg) => arg.includes("dst=/run/pushpals/host-codex-auth.json,readonly")),
+      ).toBe(true);
+      expect(args.join("\n")).not.toContain(`target=/root/.codex`);
+      expect(args.join("\n")).not.toContain(`src=${root},`);
+      expect(mount.hostAuthMounted).toBe(true);
     } finally {
       if (original === undefined) {
         delete process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME;
       } else {
         process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME = original;
       }
+      rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("uses separate Linux Codex volumes for different workers", () => {
+    const first = createExecutor() as unknown as { codexVolumeName: string };
+    const second = new DockerExecutor({
+      repo: process.cwd(),
+      workerId: "workerpal-other",
+      imageName: "pushpals-worker-sandbox:latest",
+    }) as unknown as { codexVolumeName: string };
+    expect(first.codexVolumeName).not.toBe(second.codexVolumeName);
+  });
+
+  test("does not mount Codex state for non-Codex backends", () => {
+    const executor = createExecutor() as unknown as {
+      openaiCodexAuthMount: (backend: string) => { args: string[]; hostAuthMounted: boolean };
+    };
+    expect(executor.openaiCodexAuthMount("miniswe")).toEqual({
+      args: [],
+      containerHome: "/workspace/.pushpals/codex-home",
+      hostAuthMounted: false,
+    });
+  });
+
+  test("rejects unsafe container Codex home paths", () => {
+    expect(resolveOpenAiCodexContainerHome("relative/.codex")).toBe(
+      "/workspace/.pushpals/codex-home",
+    );
+    expect(resolveOpenAiCodexContainerHome("/repo/.codex")).toBe("/workspace/.pushpals/codex-home");
+    expect(resolveOpenAiCodexContainerHome("/etc")).toBe("/workspace/.pushpals/codex-home");
+    expect(resolveOpenAiCodexContainerHome("/home/bun/.codex")).toBe("/home/bun/.codex");
+    expect(resolveOpenAiCodexContainerHome("/root/.codex/")).toBe("/root/.codex");
+  });
+
+  test("preserves refreshed auth but clears runtime-specific Codex state on version changes", () => {
+    const startup = buildOpenAiCodexHomeStartupCommand({
+      containerHome: "/workspace/.pushpals/codex-home",
+      runtimeTag: "v1.2.31",
+      hostAuthMounted: true,
+    });
+    expect(startup).toContain(".pushpals-runtime-tag");
+    expect(startup).toContain("previous_runtime_tag");
+    expect(startup).toContain("! -name auth.json");
+    expect(startup).toContain("! -name .pushpals-host-auth.sha256");
+    expect(startup).toContain('host_auth_hash="$(sha256sum');
+    expect(startup).toContain('[ ! -s "$codex_home/auth.json" ] ||');
+    expect(startup).toContain('"$host_auth_hash" != "$previous_host_auth_hash"');
+    expect(startup).not.toContain("/root/.codex/tmp");
   });
 
   test("validateWorktreeGitInterop validates warm-container accessibility too", async () => {
@@ -701,10 +766,18 @@ describe("workerpals docker executor internals", () => {
           join(worktree, "package.json"),
           '{"name":"projection-fixture","dependencies":{"fixture-dep":"file:./fixture-dep"}}\n',
         );
+        const installTemp = join(worktree, ".tmp");
+        mkdirSync(installTemp);
         const install = Bun.spawn([process.execPath, "install", "--ignore-scripts"], {
           cwd: worktree,
           stdout: "pipe",
           stderr: "pipe",
+          env: {
+            ...process.env,
+            TEMP: installTemp,
+            TMP: installTemp,
+            TMPDIR: installTemp,
+          },
         });
         expect(await install.exited).toBe(0);
         rmSync(join(worktree, "node_modules"), { recursive: true, force: true });
@@ -739,6 +812,124 @@ describe("workerpals docker executor internals", () => {
         rmSync(worktree, { recursive: true, force: true });
       }
     },
+  );
+
+  (process.env.PUSHPALS_RUN_WINDOWS_LINUX_CONTAINER_INTEGRATION === "1" ? test : test.skip)(
+    "reuses dependency and isolated Codex volumes through a Windows-host Linux container",
+    async () => {
+      const worktree = mkdtempSync(join(tmpdir(), "pushpals-docker-desktop-deps-"));
+      const authRoot = mkdtempSync(join(tmpdir(), "pushpals-docker-desktop-auth-"));
+      const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const dependencyVolume = `pushpals-test-deps-${suffix}`;
+      const codexVolume = `pushpals-test-codex-${suffix}`;
+      const image = process.env.PUSHPALS_WORKERPAL_IMAGE || "pushpals-worker-sandbox:latest";
+      const docker = async (args: string[]) => {
+        const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+        const [exitCode, stdout, stderr] = await Promise.all([
+          proc.exited,
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ]);
+        return { exitCode, stdout, stderr };
+      };
+      const dockerHostPath = (path: string) => path.replace(/\\/g, "/");
+
+      try {
+        mkdirSync(join(worktree, "fixture-dep"));
+        writeFileSync(
+          join(worktree, "fixture-dep", "package.json"),
+          '{"name":"fixture-dep","version":"1.0.0"}\n',
+        );
+        writeFileSync(
+          join(worktree, "package.json"),
+          '{"name":"projection-fixture","dependencies":{"fixture-dep":"file:./fixture-dep"}}\n',
+        );
+        expect((await docker(["volume", "create", dependencyVolume])).exitCode).toBe(0);
+        expect((await docker(["volume", "create", codexVolume])).exitCode).toBe(0);
+        const bindMount = `type=bind,src=${dockerHostPath(worktree)},dst=/repo/worktree`;
+        const createLockfile = await docker([
+          "run",
+          "--rm",
+          "--entrypoint",
+          "sh",
+          "--mount",
+          bindMount,
+          image,
+          "-lc",
+          "cd /repo/worktree && bun install --ignore-scripts && rm -rf node_modules",
+        ]);
+        expect(`${createLockfile.stdout}\n${createLockfile.stderr}`).not.toContain("error:");
+        expect(createLockfile.exitCode).toBe(0);
+        const dependencyCommand = buildWorktreeDependencyPreparationCommand("/repo/worktree");
+        const dependencyRunArgs = [
+          "run",
+          "--rm",
+          "--entrypoint",
+          "sh",
+          "--mount",
+          bindMount,
+          "--mount",
+          `type=volume,source=${dependencyVolume},target=/workspace/.pushpals/dependency-store`,
+          image,
+          "-lc",
+          dependencyCommand,
+        ];
+        const firstProjection = await docker(dependencyRunArgs);
+        expect(`${firstProjection.stdout}\n${firstProjection.stderr}`).toContain(
+          "node_modules-container-native",
+        );
+        expect(firstProjection.exitCode).toBe(0);
+
+        const secondProjection = await docker(dependencyRunArgs);
+        expect(secondProjection.exitCode).toBe(0);
+        expect(secondProjection.stderr).toContain("phase=snapshot_cache_hit");
+        expect(secondProjection.stderr).not.toContain("phase=install progress=20");
+
+        const hostAuthPath = join(authRoot, "auth.json");
+        writeFileSync(hostAuthPath, '{"source":"host"}\n', "utf8");
+        const codexHome = "/workspace/.pushpals/codex-home";
+        const codexMountArgs = [
+          "run",
+          "--rm",
+          "--entrypoint",
+          "sh",
+          "--mount",
+          `type=volume,source=${codexVolume},target=${codexHome}`,
+          "--mount",
+          `type=bind,src=${dockerHostPath(hostAuthPath)},dst=/run/pushpals/host-codex-auth.json,readonly`,
+          image,
+          "-lc",
+        ];
+        const firstCodexStartup = buildOpenAiCodexHomeStartupCommand({
+          containerHome: codexHome,
+          runtimeTag: "integration-v1",
+          hostAuthMounted: true,
+        });
+        const firstCodex = await docker([
+          ...codexMountArgs,
+          `${firstCodexStartup}; printf '%s\\n' '{"source":"container-refresh"}' > "$codex_home/auth.json"; touch "$codex_home/history.json"`,
+        ]);
+        expect(firstCodex.exitCode).toBe(0);
+
+        const upgradedCodexStartup = buildOpenAiCodexHomeStartupCommand({
+          containerHome: codexHome,
+          runtimeTag: "integration-v2",
+          hostAuthMounted: true,
+        });
+        const upgradedCodex = await docker([
+          ...codexMountArgs,
+          `${upgradedCodexStartup}; test ! -e "$codex_home/history.json"; grep -q container-refresh "$codex_home/auth.json"`,
+        ]);
+        expect(`${upgradedCodex.stdout}\n${upgradedCodex.stderr}`).toBe("\n");
+        expect(upgradedCodex.exitCode).toBe(0);
+      } finally {
+        await docker(["volume", "rm", "-f", dependencyVolume]);
+        await docker(["volume", "rm", "-f", codexVolume]);
+        rmSync(worktree, { recursive: true, force: true });
+        rmSync(authRoot, { recursive: true, force: true });
+      }
+    },
+    180_000,
   );
 
   test("stops the job when Linux-native dependency preparation fails", async () => {

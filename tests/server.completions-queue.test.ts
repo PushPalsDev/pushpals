@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CompletionQueue } from "../apps/server/src/completions";
@@ -8,10 +8,25 @@ import { JobQueue } from "../apps/server/src/jobs";
 
 const tempDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  Bun.gc(true);
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
-    if (dir) rmSync(dir, { recursive: true, force: true });
+    if (!dir) continue;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        await Bun.sleep(25 * attempt);
+      }
+    }
+    if (lastError && existsSync(dir)) {
+      console.warn(`[test cleanup] deferred locked completion fixture cleanup: ${dir}`);
+    }
   }
 });
 

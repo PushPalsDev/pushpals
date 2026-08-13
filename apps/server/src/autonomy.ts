@@ -91,6 +91,19 @@ interface ObjectiveStatusSignalRow {
   oldest_minutes: number | null;
 }
 
+function normalizeObjectiveTargetPath(value: unknown): string {
+  return asString(value)
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "")
+    .toLowerCase();
+}
+
+function objectiveTargetPathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
 interface ObjectiveFailureSignalRow {
   trigger_type: string | null;
   failure_count: number | null;
@@ -4782,6 +4795,19 @@ export class AutonomyStore {
     const activePatternKeys = new Set(
       activePatternRows.map((row) => asString(row.patternKey)).filter(Boolean),
     );
+    const activeTargetRows = this.db
+      .prepare(
+        `SELECT scope_json AS scopeJson
+         FROM autonomy_objectives
+         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`,
+      )
+      .all() as Array<{ scopeJson: string }>;
+    const activeTargetPaths = activeTargetRows.flatMap((row) => {
+      const scope = parseJsonObject(row.scopeJson);
+      return asStringArray(scope.targetPaths ?? scope.target_paths)
+        .map(normalizeObjectiveTargetPath)
+        .filter(Boolean);
+    });
     const results = candidates.map((raw) => {
       const record = asObject(raw);
       const candidateId =
@@ -4798,6 +4824,9 @@ export class AutonomyStore {
       const patternKey = asString(record.patternKey ?? record.pattern_key);
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp01(asNumber(record.confidence, 0));
+      const targetPaths = asStringArray(record.targetPaths ?? record.target_paths)
+        .map(normalizeObjectiveTargetPath)
+        .filter(Boolean);
       const requiredValidationRepair =
         requiredValidationRepairAuthorized &&
         asBoolean(record.requiredValidationRepair ?? record.required_validation_repair, false);
@@ -4879,6 +4908,20 @@ export class AutonomyStore {
           reason: "pattern already has active objective",
         };
       }
+      if (
+        !requiredValidationRepair &&
+        targetPaths.some((candidateTarget) =>
+          activeTargetPaths.some((activeTarget) =>
+            objectiveTargetPathsOverlap(candidateTarget, activeTarget),
+          ),
+        )
+      ) {
+        return {
+          candidate_id: candidateId,
+          ok: false,
+          reason: "target path already has active objective",
+        };
+      }
       if (confidence < limits.minConfidence) {
         return {
           candidate_id: candidateId,
@@ -4893,6 +4936,7 @@ export class AutonomyStore {
         globalCount += 1;
         activeCount += 1;
         if (patternKey) activePatternKeys.add(patternKey);
+        activeTargetPaths.push(...targetPaths);
       }
       return { candidate_id: candidateId, ok: true };
     });
@@ -5145,7 +5189,7 @@ export class AutonomyStore {
     const objectiveCandidateId = objectiveCandidateRaw
       ? scopedCandidateStorageId(runId, objectiveCandidateRaw)
       : null;
-    if (objectiveStatus === "dispatched") {
+    if (objectiveStatus === "gated" || objectiveStatus === "dispatched") {
       const requiredValidationRepair = asBoolean(
         objective.requiredValidationRepair ??
           objective.required_validation_repair ??
@@ -5170,6 +5214,7 @@ export class AutonomyStore {
             candidate_id: objectiveId,
             objective_type: objectiveType,
             pattern_key: patternKey,
+            target_paths: scopeValidation.normalizedTargetPaths,
             confidence: clamp01(asNumber(objective.confidence, 0)),
             required_validation_repair: requiredValidationRepair,
           },
@@ -7192,6 +7237,92 @@ export class AutonomyStore {
          WHERE id = ?`,
       )
       .run(requestId, now, now, objectiveId);
+  }
+
+  validateObjectiveReservation(input: {
+    objectiveId: string;
+    sessionId: string;
+    runId: string;
+    snapshotId: string;
+  }): { ok: boolean; reason?: string } {
+    const row = this.db
+      .prepare(
+        `SELECT session_id AS sessionId, run_id AS runId, snapshot_id AS snapshotId, status
+         FROM autonomy_objectives
+         WHERE id = ?`,
+      )
+      .get(input.objectiveId) as {
+      sessionId: string;
+      runId: string;
+      snapshotId: string;
+      status: string;
+    } | null;
+    if (!row) return { ok: false, reason: "autonomy objective reservation not found" };
+    if (
+      row.sessionId !== input.sessionId ||
+      row.runId !== input.runId ||
+      row.snapshotId !== input.snapshotId
+    ) {
+      return { ok: false, reason: "autonomy objective reservation identity mismatch" };
+    }
+    if (row.status !== "gated" && row.status !== "dispatched") {
+      return {
+        ok: false,
+        reason: `autonomy objective reservation has invalid status ${row.status || "unknown"}`,
+      };
+    }
+    return { ok: true };
+  }
+
+  reconcileGatedObjectiveReservations(
+    nowIso = asIsoNow(),
+    staleAfterMs = 10 * 60_000,
+  ): { linked: number; failed: number } {
+    const rows = this.db
+      .prepare(
+        `SELECT id, created_at AS createdAt
+         FROM autonomy_objectives
+         WHERE status = 'gated'`,
+      )
+      .all() as Array<{ id: string; createdAt: string }>;
+    let linked = 0;
+    let failed = 0;
+    const nowMs = Date.parse(nowIso);
+    const tx = this.db.transaction(() => {
+      for (const row of rows) {
+        const request = this.db
+          .prepare(
+            `SELECT id
+             FROM requests
+             WHERE idempotencyKey = ?
+             ORDER BY createdAt DESC
+             LIMIT 1`,
+          )
+          .get(`autonomy:${row.id}`) as { id: string } | null;
+        if (request?.id) {
+          this.markObjectiveDispatched(row.id, request.id);
+          linked += 1;
+          continue;
+        }
+        const createdMs = Date.parse(row.createdAt);
+        if (
+          Number.isFinite(nowMs) &&
+          Number.isFinite(createdMs) &&
+          nowMs - createdMs >= Math.max(60_000, staleAfterMs)
+        ) {
+          this.db
+            .prepare(
+              `UPDATE autonomy_objectives
+               SET status = 'failed', block_reason = 'stale_objective_reservation', updated_at = ?
+               WHERE id = ? AND status = 'gated'`,
+            )
+            .run(nowIso, row.id);
+          failed += 1;
+        }
+      }
+    });
+    tx();
+    return { linked, failed };
   }
 
   markObjectiveRunningByJobId(jobId: string): void {

@@ -113,6 +113,8 @@ function sanitizeRequestMetadata(input: unknown): {
         componentArea: scope.componentArea ?? componentAreaRaw,
         targetPaths: scope.normalizedTargetPaths,
         writeGlobs: scope.normalizedWriteGlobs,
+        reservationRequired:
+          autonomy.reservationRequired === true || autonomy.reservation_required === true,
       },
     },
   };

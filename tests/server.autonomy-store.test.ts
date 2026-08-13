@@ -5,6 +5,7 @@ import { join } from "path";
 import { AutonomyStore, type AutonomyEvaluatorScorecard } from "../apps/server/src/autonomy";
 import { CompletionQueue } from "../apps/server/src/completions";
 import { JobQueue } from "../apps/server/src/jobs";
+import { RequestQueue } from "../apps/server/src/requests";
 
 const stores: AutonomyStore[] = [];
 const tempDirs: string[] = [];
@@ -1173,6 +1174,58 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(result.results?.[0]?.reason ?? "")).toContain("confidence");
   });
 
+  test("evaluateEligibility reserves normalized target paths across pattern variations", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_target_reservation",
+      repoHealthFlags: {
+        is_worktree_dirty: false,
+        is_merge_in_progress: false,
+      },
+    }).snapshot_id;
+    const reserved = store.recordObjectiveDecision({
+      runId: "run_target_reservation",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_target_reservation",
+        title: "Reserve autonomy target",
+        instruction: "Keep this target reserved until its worker completes.",
+        objective_type: "lint_fix",
+        component_area: "apps/server",
+        trigger_type: "lint_failure",
+        target_paths: ["apps\\server\\src\\autonomy.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun test tests/server.autonomy-store.test.ts"],
+        status: "gated",
+      },
+    });
+    expect(reserved.ok).toBe(true);
+
+    const result = store.evaluateEligibility({
+      runId: "run_target_reservation",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_same_target_new_prompt",
+          objective_type: "type_fix",
+          component_area: "apps/server",
+          pattern_key: "different-prompt-and-pattern",
+          confidence: 0.95,
+          target_paths: ["./apps/server/src"],
+        },
+      ],
+    });
+
+    expect(result.results?.[0]?.ok).toBe(false);
+    expect(String(result.results?.[0]?.reason ?? "")).toBe(
+      "target path already has active objective",
+    );
+  });
+
   test("blocks PushPals-internal autonomy ideas from user-repo targets", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({
@@ -1389,6 +1442,27 @@ describe("server AutonomyStore policy gates", () => {
         }).ok,
       ).toBe(true);
 
+      const activeDifferentPattern = store.recordObjectiveDecision({
+        runId: "run_required_repair",
+        snapshotId,
+        sessionId: "s1",
+        objective: {
+          id: "obj_required_repair_active_target",
+          title: "Active work on required validation target",
+          instruction: "Keep unrelated active work visible to the target reservation gate.",
+          objective_type: "small_refactor",
+          component_area: "tests",
+          trigger_type: "queue_health",
+          target_paths: ["tests/baseline.test.ts"],
+          scope: { read_anywhere: false, write_globs: ["tests/baseline.test.ts"] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          status: "proposed",
+        },
+      });
+      expect(activeDifferentPattern.ok).toBe(true);
+
       const allowed = store.evaluateEligibility({
         runId: "run_required_repair",
         snapshotId,
@@ -1407,6 +1481,14 @@ describe("server AutonomyStore policy gates", () => {
         candidate_id: "cand_required_repair",
         ok: true,
       });
+      expect(
+        store.recordOutcome({
+          objectiveId: "obj_required_repair_active_target",
+          patternKey: activeDifferentPattern.patternKey,
+          success: true,
+          userAction: "applied",
+        }).ok,
+      ).toBe(true);
 
       const dispatched = store.recordObjectiveDecision({
         runId: "run_required_repair",
@@ -1452,6 +1534,100 @@ describe("server AutonomyStore policy gates", () => {
       expect(String(frozen.results?.[0]?.reason ?? "")).toContain("autonomy frozen");
     } finally {
       jobs.close();
+    }
+  });
+
+  test("validates and reconciles durable gated objective reservations", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-reservation-");
+    const queue = new RequestQueue(dbPath);
+    try {
+      const snapshotId = store.createSnapshot({
+        sessionId: "s_reservation",
+        runId: "run_reservation",
+        repoHealthFlags: {
+          is_worktree_dirty: false,
+          is_merge_in_progress: false,
+        },
+      }).snapshot_id;
+      const gated = store.recordObjectiveDecision({
+        runId: "run_reservation",
+        snapshotId,
+        sessionId: "s_reservation",
+        objective: {
+          id: "obj_reservation",
+          title: "Durably reserve an objective",
+          instruction: "Persist the objective before enqueueing its request.",
+          objective_type: "small_refactor",
+          component_area: "apps/server",
+          trigger_type: "queue_health",
+          target_paths: ["apps/server/src/requests.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun test tests/server.requests-queue.test.ts"],
+          status: "gated",
+        },
+      });
+      expect(gated.ok).toBe(true);
+      expect(
+        store.validateObjectiveReservation({
+          objectiveId: "obj_reservation",
+          sessionId: "s_reservation",
+          runId: "run_reservation",
+          snapshotId,
+        }),
+      ).toEqual({ ok: true });
+      expect(
+        store.validateObjectiveReservation({
+          objectiveId: "obj_reservation",
+          sessionId: "wrong-session",
+          runId: "run_reservation",
+          snapshotId,
+        }),
+      ).toMatchObject({ ok: false, reason: "autonomy objective reservation identity mismatch" });
+
+      const request = queue.enqueue({
+        sessionId: "s_reservation",
+        prompt: "Run the reserved objective",
+        idempotencyKey: "autonomy:obj_reservation",
+      });
+      expect(request.ok).toBe(true);
+      const linked = store.reconcileGatedObjectiveReservations();
+      expect(linked).toEqual({ linked: 1, failed: 0 });
+      expect(autonomyObjectiveStatus(store, "obj_reservation")).toBe("dispatched");
+
+      const orphan = store.recordObjectiveDecision({
+        runId: "run_reservation",
+        snapshotId,
+        sessionId: "s_reservation",
+        objective: {
+          id: "obj_orphan_reservation",
+          title: "Orphaned reservation",
+          instruction: "Exercise startup reconciliation of a stale reservation.",
+          objective_type: "docs",
+          component_area: "docs",
+          trigger_type: "regret_signal",
+          target_paths: ["docs/autonomy.md"],
+          scope: { read_anywhere: false, write_globs: ["docs/*.md"] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun run lint"],
+          status: "gated",
+        },
+      });
+      expect(orphan.ok).toBe(true);
+      const db = (store as unknown as { db: any }).db;
+      db.prepare(
+        `UPDATE autonomy_objectives SET created_at = ? WHERE id = 'obj_orphan_reservation'`,
+      ).run("2026-08-12T00:00:00.000Z");
+      const reconciled = store.reconcileGatedObjectiveReservations(
+        "2026-08-12T00:02:00.000Z",
+        60_000,
+      );
+      expect(reconciled).toEqual({ linked: 0, failed: 1 });
+      expect(autonomyObjectiveStatus(store, "obj_orphan_reservation")).toBe("failed");
+    } finally {
+      queue.close();
     }
   });
 

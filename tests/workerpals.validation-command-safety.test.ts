@@ -1556,7 +1556,7 @@ describe("workerpals validation command safety", () => {
     }
   });
 
-  test("keeps validation-safe hardlink dependency snapshots for Bun validation", () => {
+  test("keeps current validation-safe container dependency projections for Bun validation", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-validation-hardlink-snapshot-"));
 
     try {

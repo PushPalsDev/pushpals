@@ -1125,17 +1125,22 @@ function hasUsablePemCertificate(pathValue: string): boolean {
   }
 }
 
-function ensureWindowsNodeExtraCaCertsBundle(
+type WindowsRootCaBundleExporter = (
   outPath: string,
   env: Record<string, string | undefined>,
-): string {
-  if (hasUsablePemCertificate(outPath)) return outPath;
+) => boolean;
 
+const windowsNodeExtraCaRefreshAttempts = new Set<string>();
+
+function exportWindowsRootCaCertsBundle(
+  outPath: string,
+  env: Record<string, string | undefined>,
+): boolean {
   const outDir = dirname(outPath);
   try {
     mkdirSync(outDir, { recursive: true });
   } catch {
-    return "";
+    return false;
   }
 
   const script = String.raw`
@@ -1144,6 +1149,7 @@ $outPath = $env:PUSHPALS_WINDOWS_NODE_EXTRA_CA_CERTS_OUT
 if (-not $outPath) { throw "PUSHPALS_WINDOWS_NODE_EXTRA_CA_CERTS_OUT is required" }
 $outDir = Split-Path -Parent $outPath
 if ($outDir) { [System.IO.Directory]::CreateDirectory($outDir) | Out-Null }
+$tempPath = Join-Path $outDir ((Split-Path -Leaf $outPath) + ".tmp-" + $PID + "-" + [Guid]::NewGuid().ToString("N"))
 $stores = @("Cert:\CurrentUser\Root", "Cert:\LocalMachine\Root")
 $seen = @{}
 $lines = New-Object System.Collections.Generic.List[string]
@@ -1164,7 +1170,12 @@ foreach ($store in $stores) {
   }
 }
 if ($lines.Count -eq 0) { throw "No Windows root certificates found" }
-[System.IO.File]::WriteAllLines($outPath, $lines, [System.Text.Encoding]::ASCII)
+try {
+  [System.IO.File]::WriteAllLines($tempPath, $lines, [System.Text.Encoding]::ASCII)
+  Move-Item -LiteralPath $tempPath -Destination $outPath -Force
+} finally {
+  if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
+}
 `;
   const encodedScript = Buffer.from(script, "utf16le").toString("base64");
   const childEnv = normalizeChildProcessEnv({
@@ -1188,8 +1199,20 @@ if ($lines.Count -eq 0) { throw "No Windows root certificates found" }
       stderr: "pipe",
     },
   );
-  if (result.exitCode !== 0) return "";
-  return hasUsablePemCertificate(outPath) ? outPath : "";
+  return result.exitCode === 0 && hasUsablePemCertificate(outPath);
+}
+
+export function refreshWindowsNodeExtraCaCertsBundle(
+  outPath: string,
+  env: Record<string, string | undefined>,
+  exporter: WindowsRootCaBundleExporter = exportWindowsRootCaCertsBundle,
+): string {
+  const existingUsable = hasUsablePemCertificate(outPath);
+  if (!windowsNodeExtraCaRefreshAttempts.has(outPath)) {
+    windowsNodeExtraCaRefreshAttempts.add(outPath);
+    if (exporter(outPath, env) && hasUsablePemCertificate(outPath)) return outPath;
+  }
+  return existingUsable && hasUsablePemCertificate(outPath) ? outPath : "";
 }
 
 export function withWindowsNodeExtraCaCertsEnv(
@@ -1207,7 +1230,7 @@ export function withWindowsNodeExtraCaCertsEnv(
   const runtimeRoot = String(opts.runtimeRoot ?? "").trim();
   if (!runtimeRoot || !existsSync(runtimeRoot)) return env;
 
-  const bundlePath = ensureWindowsNodeExtraCaCertsBundle(
+  const bundlePath = refreshWindowsNodeExtraCaCertsBundle(
     resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot),
     env,
   );
@@ -2833,6 +2856,7 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
   }
 
   await stopRuntimeServicesGracefully(services, serviceStopTimeoutMs);
+  serviceManager.stop();
   for (const task of cleanupTasks) {
     await task();
   }
@@ -3554,6 +3578,7 @@ export function isDockerUnavailableDetail(detail: string): boolean {
     /docker daemon is not running/i.test(text) ||
     /failed to connect to the docker api/i.test(text) ||
     /docker_engine/i.test(text) ||
+    /dockerdesktoplinuxengine/i.test(text) ||
     /is the docker daemon running/i.test(text) ||
     /executable not found[^\r\n]*["']?docker(?:\.exe)?/i.test(text) ||
     /docker(?:\.exe)?: command not found/i.test(text) ||

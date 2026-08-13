@@ -217,6 +217,123 @@ describe("server session message route", () => {
     });
   }, 15_000);
 
+  test("requires a matching durable autonomy reservation before request enqueue", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const postJson = (path: string, body: Record<string, unknown>) =>
+      fetch(`http://127.0.0.1:${port}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    const snapshotResponse = await fetch(
+      `http://127.0.0.1:${port}/autonomy/snapshot?sessionId=s_reservation&runId=run_reservation`,
+    );
+    expect(snapshotResponse.status).toBe(200);
+    const snapshotPayload = (await snapshotResponse.json()) as Record<string, unknown>;
+    const snapshot = snapshotPayload.snapshot as Record<string, unknown>;
+    const snapshotId = String(snapshot.snapshot_id ?? "");
+    expect(snapshotId).not.toBe("");
+
+    const objectiveResponse = await postJson("/autonomy/objectives", {
+      runId: "run_reservation",
+      snapshotId,
+      sessionId: "s_reservation",
+      objective: {
+        id: "obj_route_reservation",
+        title: "Reserve route dispatch",
+        instruction: "Persist this objective before enqueueing its worker request.",
+        objective_type: "small_refactor",
+        component_area: "apps/server",
+        trigger_type: "queue_health",
+        target_paths: ["apps/server/src/requests.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun test tests/server.requests-queue.test.ts"],
+        status: "gated",
+      },
+    });
+    expect(objectiveResponse.status).toBe(200);
+
+    const requestBody = {
+      sessionId: "s_reservation",
+      prompt: "Execute the durably reserved autonomy objective.",
+      priority: "background",
+      forceWorker: true,
+      forceLane: "worker",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          objectiveId: "obj_route_reservation",
+          runId: "run_reservation",
+          snapshotId,
+          patternKey: "route-reservation-pattern",
+          componentArea: "apps/server",
+          targetPaths: ["apps/server/src/requests.ts"],
+          writeGlobs: ["apps/server/src/*.ts"],
+          reservationRequired: true,
+        },
+      },
+    };
+
+    const wrongKey = await postJson("/requests/enqueue", {
+      ...requestBody,
+      idempotencyKey: "autonomy:wrong-objective",
+    });
+    expect(wrongKey.status).toBe(409);
+    expect(await wrongKey.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_reservation_required",
+    });
+
+    const wrongIdentity = await postJson("/requests/enqueue", {
+      ...requestBody,
+      idempotencyKey: "autonomy:obj_route_reservation",
+      metadata: {
+        ...requestBody.metadata,
+        autonomy: {
+          ...requestBody.metadata.autonomy,
+          snapshotId: "wrong-snapshot",
+        },
+      },
+    });
+    expect(wrongIdentity.status).toBe(409);
+    expect(await wrongIdentity.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_reservation_invalid",
+    });
+
+    const accepted = await postJson("/requests/enqueue", {
+      ...requestBody,
+      idempotencyKey: "autonomy:obj_route_reservation",
+    });
+    expect(accepted.status).toBe(201);
+    expect(await accepted.json()).toMatchObject({ ok: true, requestId: expect.any(String) });
+
+    const claimed = await postJson("/requests/claim", {
+      agentId: "remotebuddy-orchestrator",
+    });
+    expect(claimed.status).toBe(200);
+    expect(await claimed.json()).toMatchObject({
+      ok: true,
+      request: {
+        metadata: {
+          origin: "autonomy",
+          autonomy: {
+            objectiveId: "obj_route_reservation",
+            reservationRequired: true,
+          },
+        },
+      },
+    });
+  }, 15_000);
+
   test("blocks new session work after the token budget is exceeded", async () => {
     const root = makeTempDir();
     const port = await getFreePort();

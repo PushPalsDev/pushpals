@@ -11607,7 +11607,8 @@ function sanitizeRequestMetadata(input) {
         patternKey: asString2(autonomy.patternKey ?? autonomy.pattern_key),
         componentArea: scope.componentArea ?? componentAreaRaw,
         targetPaths: scope.normalizedTargetPaths,
-        writeGlobs: scope.normalizedWriteGlobs
+        writeGlobs: scope.normalizedWriteGlobs,
+        reservationRequired: autonomy.reservationRequired === true || autonomy.reservation_required === true
       }
     }
   };
@@ -12913,6 +12914,12 @@ class CompletionQueue {
 // apps/server/src/autonomy.ts
 import { Database as Database5 } from "bun:sqlite";
 import { createHash as createHash4, randomUUID as randomUUID5 } from "crypto";
+function normalizeObjectiveTargetPath(value) {
+  return asString3(value).replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/").replace(/\/$/, "").toLowerCase();
+}
+function objectiveTargetPathsOverlap(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
 var OBJECTIVE_POLICY = {
   flaky_test: {
     maxRisk: "low",
@@ -16134,6 +16141,13 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
          FROM autonomy_objectives
          WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`).all();
     const activePatternKeys = new Set(activePatternRows.map((row) => asString3(row.patternKey)).filter(Boolean));
+    const activeTargetRows = this.db.prepare(`SELECT scope_json AS scopeJson
+         FROM autonomy_objectives
+         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`).all();
+    const activeTargetPaths = activeTargetRows.flatMap((row) => {
+      const scope = parseJsonObject(row.scopeJson);
+      return asStringArray3(scope.targetPaths ?? scope.target_paths).map(normalizeObjectiveTargetPath).filter(Boolean);
+    });
     const results = candidates.map((raw) => {
       const record = asObject2(raw);
       const candidateId = asString3(record.id ?? record.candidateId ?? record.candidate_id) || randomUUID5();
@@ -16149,6 +16163,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       const patternKey = asString3(record.patternKey ?? record.pattern_key);
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp012(asNumber(record.confidence, 0));
+      const targetPaths = asStringArray3(record.targetPaths ?? record.target_paths).map(normalizeObjectiveTargetPath).filter(Boolean);
       const requiredValidationRepair = requiredValidationRepairAuthorized && asBoolean2(record.requiredValidationRepair ?? record.required_validation_repair, false);
       const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
       if (pushpalsInternalErr) {
@@ -16219,6 +16234,13 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           reason: "pattern already has active objective"
         };
       }
+      if (!requiredValidationRepair && targetPaths.some((candidateTarget) => activeTargetPaths.some((activeTarget) => objectiveTargetPathsOverlap(candidateTarget, activeTarget)))) {
+        return {
+          candidate_id: candidateId,
+          ok: false,
+          reason: "target path already has active objective"
+        };
+      }
       if (confidence < limits.minConfidence) {
         return {
           candidate_id: candidateId,
@@ -16234,6 +16256,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         activeCount += 1;
         if (patternKey)
           activePatternKeys.add(patternKey);
+        activeTargetPaths.push(...targetPaths);
       }
       return { candidate_id: candidateId, ok: true };
     });
@@ -16378,7 +16401,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const patternKey = makePatternKey(objectiveType, scopeValidation.normalizedTargetPaths, triggerType, normalizedComponentArea);
     const objectiveCandidateRaw = asString3(objective.candidateId ?? objective.candidate_id);
     const objectiveCandidateId = objectiveCandidateRaw ? scopedCandidateStorageId(runId, objectiveCandidateRaw) : null;
-    if (objectiveStatus === "dispatched") {
+    if (objectiveStatus === "gated" || objectiveStatus === "dispatched") {
       const requiredValidationRepair = asBoolean2(objective.requiredValidationRepair ?? objective.required_validation_repair ?? asObject2(body.candidate).requiredValidationRepair ?? asObject2(body.candidate).required_validation_repair ?? body.requiredValidationRepair ?? body.required_validation_repair, false);
       const overrideCooldown = asBoolean2(objective.overrideCooldown ?? objective.override_cooldown ?? body.overrideCooldown ?? body.override_cooldown, false);
       const eligibility = this.evaluateEligibility({
@@ -16389,6 +16412,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
             candidate_id: objectiveId,
             objective_type: objectiveType,
             pattern_key: patternKey,
+            target_paths: scopeValidation.normalizedTargetPaths,
             confidence: clamp012(asNumber(objective.confidence, 0)),
             required_validation_repair: requiredValidationRepair
           }
@@ -17469,6 +17493,54 @@ Apply this clarification while keeping changes scoped to the existing objective 
              updated_at = ?
          WHERE id = ?`).run(requestId, now, now, objectiveId);
   }
+  validateObjectiveReservation(input) {
+    const row = this.db.prepare(`SELECT session_id AS sessionId, run_id AS runId, snapshot_id AS snapshotId, status
+         FROM autonomy_objectives
+         WHERE id = ?`).get(input.objectiveId);
+    if (!row)
+      return { ok: false, reason: "autonomy objective reservation not found" };
+    if (row.sessionId !== input.sessionId || row.runId !== input.runId || row.snapshotId !== input.snapshotId) {
+      return { ok: false, reason: "autonomy objective reservation identity mismatch" };
+    }
+    if (row.status !== "gated" && row.status !== "dispatched") {
+      return {
+        ok: false,
+        reason: `autonomy objective reservation has invalid status ${row.status || "unknown"}`
+      };
+    }
+    return { ok: true };
+  }
+  reconcileGatedObjectiveReservations(nowIso = asIsoNow(), staleAfterMs = 10 * 60000) {
+    const rows = this.db.prepare(`SELECT id, created_at AS createdAt
+         FROM autonomy_objectives
+         WHERE status = 'gated'`).all();
+    let linked = 0;
+    let failed = 0;
+    const nowMs = Date.parse(nowIso);
+    const tx = this.db.transaction(() => {
+      for (const row of rows) {
+        const request = this.db.prepare(`SELECT id
+             FROM requests
+             WHERE idempotencyKey = ?
+             ORDER BY createdAt DESC
+             LIMIT 1`).get(`autonomy:${row.id}`);
+        if (request?.id) {
+          this.markObjectiveDispatched(row.id, request.id);
+          linked += 1;
+          continue;
+        }
+        const createdMs = Date.parse(row.createdAt);
+        if (Number.isFinite(nowMs) && Number.isFinite(createdMs) && nowMs - createdMs >= Math.max(60000, staleAfterMs)) {
+          this.db.prepare(`UPDATE autonomy_objectives
+               SET status = 'failed', block_reason = 'stale_objective_reservation', updated_at = ?
+               WHERE id = ? AND status = 'gated'`).run(nowIso, row.id);
+          failed += 1;
+        }
+      }
+    });
+    tx();
+    return { linked, failed };
+  }
   markObjectiveRunningByJobId(jobId) {
     if (!jobId)
       return;
@@ -18170,8 +18242,12 @@ var requestQueue = new RequestQueue(sharedDbPath);
 var completionQueue = new CompletionQueue(sharedDbPath);
 var autonomyStore = new AutonomyStore(sharedDbPath);
 var lifecycleReconciliation = autonomyStore.reconcileJobLinkedOutcomeLifecycle();
+var reservationReconciliation = autonomyStore.reconcileGatedObjectiveReservations();
 if (lifecycleReconciliation.correctedFailures > 0 || lifecycleReconciliation.removedPrematureSuccesses > 0 || lifecycleReconciliation.correctedObjectives > 0) {
   console.warn(`[Server] Reconciled legacy completion lifecycle state: ${JSON.stringify(lifecycleReconciliation)}`);
+}
+if (reservationReconciliation.linked > 0 || reservationReconciliation.failed > 0) {
+  console.warn(`[Server] Reconciled autonomy objective reservations: ${JSON.stringify(reservationReconciliation)}`);
 }
 var clientPresence = new ClientPresenceRegistry;
 var clientPresencePruneTimer = setInterval(() => {
@@ -18453,6 +18529,49 @@ function createRequestHandler() {
         return origin === "autonomy";
       };
       const isAutonomyRequestPayload = (value) => [value.metadata, value.meta, value.params, value].some(recordHasAutonomyOrigin);
+      const autonomyMetadataFromPayload = (value) => {
+        for (const candidate of [value.metadata, value.meta, value.params, value]) {
+          if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
+            continue;
+          const record = candidate;
+          if (!recordHasAutonomyOrigin(record))
+            continue;
+          const autonomy = record.autonomy;
+          if (autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)) {
+            return autonomy;
+          }
+        }
+        return {};
+      };
+      const makeAutonomyReservationResponse = (value) => {
+        const autonomyMetadata = autonomyMetadataFromPayload(value);
+        const reservationRequired = autonomyMetadata.reservationRequired === true || autonomyMetadata.reservation_required === true;
+        if (!reservationRequired)
+          return null;
+        const reservationIdentity = {
+          objectiveId: compactText3(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128),
+          sessionId: compactText3(value.sessionId, 128),
+          runId: compactText3(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+          snapshotId: compactText3(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128)
+        };
+        const expectedIdempotencyKey = `autonomy:${reservationIdentity.objectiveId}`;
+        const actualIdempotencyKey = compactText3(value.idempotencyKey ?? value.idempotency_key, 256);
+        if (!reservationIdentity.objectiveId || !reservationIdentity.sessionId || !reservationIdentity.runId || !reservationIdentity.snapshotId || actualIdempotencyKey !== expectedIdempotencyKey) {
+          return makeJson({
+            ok: false,
+            code: "autonomy_reservation_required",
+            message: "A matching autonomy objective reservation and idempotency key are required."
+          }, 409);
+        }
+        const reservation = autonomyStore.validateObjectiveReservation(reservationIdentity);
+        if (reservation.ok)
+          return null;
+        return makeJson({
+          ok: false,
+          code: "autonomy_reservation_invalid",
+          message: reservation.reason ?? "Autonomy objective reservation is invalid."
+        }, 409);
+      };
       const autonomyFailureCircuitSummary = () => jobQueue.noPublishableFailureCircuitSummary({
         windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
         threshold: AUTONOMY_WORKER_FAILURE_CIRCUIT_THRESHOLD,
@@ -18520,6 +18639,10 @@ function createRequestHandler() {
           return;
         lastStaleRecoverySweepAt = nowMs;
         autonomyStore.maybeSweepStaleObjectives();
+        const reservationRecovery = autonomyStore.reconcileGatedObjectiveReservations();
+        if (reservationRecovery.linked > 0 || reservationRecovery.failed > 0) {
+          console.warn(`[Server] Reconciled autonomy objective reservations during stale-claim sweep: ${JSON.stringify(reservationRecovery)}`);
+        }
         const recovered = jobQueue.recoverStaleClaimedJobs(staleClaimTtlMs);
         if (recovered.length === 0)
           return;
@@ -18889,6 +19012,9 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           }, 429);
         }
         if (isAutonomyRequestPayload(body)) {
+          const reservationResponse = makeAutonomyReservationResponse(body);
+          if (reservationResponse)
+            return reservationResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse)
             return failureCircuitResponse;
@@ -19882,6 +20008,9 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           }, 429);
         }
         if (isAutonomyRequestPayload(body)) {
+          const reservationResponse = makeAutonomyReservationResponse(body);
+          if (reservationResponse)
+            return reservationResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse)
             return failureCircuitResponse;
@@ -19918,6 +20047,33 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           }
         }
         const result = requestQueue.enqueue(body);
+        const autonomyMetadata = autonomyMetadataFromPayload(body);
+        if (result.ok && result.requestId && (autonomyMetadata.reservationRequired === true || autonomyMetadata.reservation_required === true)) {
+          const objectiveId = compactText3(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128);
+          if (objectiveId) {
+            autonomyStore.markObjectiveDispatched(objectiveId, result.requestId);
+            const sessionId = compactText3(body.sessionId, 128);
+            const session = sessionManager.getSession(sessionId);
+            if (session) {
+              session.emit({
+                protocolVersion: PROTOCOL_VERSION,
+                id: randomUUID6(),
+                ts: new Date().toISOString(),
+                sessionId,
+                type: "autonomy_objective_dispatched",
+                from: "server:autonomy",
+                payload: {
+                  runId: compactText3(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+                  snapshotId: compactText3(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128),
+                  objectiveId,
+                  requestId: result.requestId,
+                  patternKey: compactText3(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) || "unknown",
+                  origin: "autonomy"
+                }
+              });
+            }
+          }
+        }
         return makeJson(result, result.ok ? 201 : 400);
       }
       if (pathname === "/requests/claim" && method === "POST") {

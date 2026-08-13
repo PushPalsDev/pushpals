@@ -43,6 +43,7 @@ const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
 const lifecycleReconciliation = autonomyStore.reconcileJobLinkedOutcomeLifecycle();
+const reservationReconciliation = autonomyStore.reconcileGatedObjectiveReservations();
 if (
   lifecycleReconciliation.correctedFailures > 0 ||
   lifecycleReconciliation.removedPrematureSuccesses > 0 ||
@@ -50,6 +51,11 @@ if (
 ) {
   console.warn(
     `[Server] Reconciled legacy completion lifecycle state: ${JSON.stringify(lifecycleReconciliation)}`,
+  );
+}
+if (reservationReconciliation.linked > 0 || reservationReconciliation.failed > 0) {
+  console.warn(
+    `[Server] Reconciled autonomy objective reservations: ${JSON.stringify(reservationReconciliation)}`,
   );
 }
 const clientPresence = new ClientPresenceRegistry();
@@ -396,6 +402,69 @@ export function createRequestHandler() {
       };
       const isAutonomyRequestPayload = (value: Record<string, unknown>): boolean =>
         [value.metadata, value.meta, value.params, value].some(recordHasAutonomyOrigin);
+      const autonomyMetadataFromPayload = (
+        value: Record<string, unknown>,
+      ): Record<string, unknown> => {
+        for (const candidate of [value.metadata, value.meta, value.params, value]) {
+          if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+          const record = candidate as Record<string, unknown>;
+          if (!recordHasAutonomyOrigin(record)) continue;
+          const autonomy = record.autonomy;
+          if (autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)) {
+            return autonomy as Record<string, unknown>;
+          }
+        }
+        return {};
+      };
+      const makeAutonomyReservationResponse = (value: Record<string, unknown>): Response | null => {
+        const autonomyMetadata = autonomyMetadataFromPayload(value);
+        const reservationRequired =
+          autonomyMetadata.reservationRequired === true ||
+          autonomyMetadata.reservation_required === true;
+        if (!reservationRequired) return null;
+
+        const reservationIdentity = {
+          objectiveId: compactText(
+            autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id,
+            128,
+          ),
+          sessionId: compactText(value.sessionId, 128),
+          runId: compactText(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+          snapshotId: compactText(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128),
+        };
+        const expectedIdempotencyKey = `autonomy:${reservationIdentity.objectiveId}`;
+        const actualIdempotencyKey = compactText(
+          value.idempotencyKey ?? value.idempotency_key,
+          256,
+        );
+        if (
+          !reservationIdentity.objectiveId ||
+          !reservationIdentity.sessionId ||
+          !reservationIdentity.runId ||
+          !reservationIdentity.snapshotId ||
+          actualIdempotencyKey !== expectedIdempotencyKey
+        ) {
+          return makeJson(
+            {
+              ok: false,
+              code: "autonomy_reservation_required",
+              message:
+                "A matching autonomy objective reservation and idempotency key are required.",
+            },
+            409,
+          );
+        }
+        const reservation = autonomyStore.validateObjectiveReservation(reservationIdentity);
+        if (reservation.ok) return null;
+        return makeJson(
+          {
+            ok: false,
+            code: "autonomy_reservation_invalid",
+            message: reservation.reason ?? "Autonomy objective reservation is invalid.",
+          },
+          409,
+        );
+      };
       const autonomyFailureCircuitSummary = () =>
         jobQueue.noPublishableFailureCircuitSummary({
           windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
@@ -476,6 +545,12 @@ export function createRequestHandler() {
         if (nowMs - lastStaleRecoverySweepAt < staleClaimSweepIntervalMs) return;
         lastStaleRecoverySweepAt = nowMs;
         autonomyStore.maybeSweepStaleObjectives();
+        const reservationRecovery = autonomyStore.reconcileGatedObjectiveReservations();
+        if (reservationRecovery.linked > 0 || reservationRecovery.failed > 0) {
+          console.warn(
+            `[Server] Reconciled autonomy objective reservations during stale-claim sweep: ${JSON.stringify(reservationRecovery)}`,
+          );
+        }
 
         const recovered = jobQueue.recoverStaleClaimedJobs(staleClaimTtlMs);
         if (recovered.length === 0) return;
@@ -937,6 +1012,8 @@ export function createRequestHandler() {
           );
         }
         if (isAutonomyRequestPayload(body)) {
+          const reservationResponse = makeAutonomyReservationResponse(body);
+          if (reservationResponse) return reservationResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse) return failureCircuitResponse;
           const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
@@ -2084,6 +2161,8 @@ export function createRequestHandler() {
           );
         }
         if (isAutonomyRequestPayload(body)) {
+          const reservationResponse = makeAutonomyReservationResponse(body);
+          if (reservationResponse) return reservationResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse) return failureCircuitResponse;
           const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
@@ -2136,6 +2215,46 @@ export function createRequestHandler() {
           }
         }
         const result = requestQueue.enqueue(body);
+        const autonomyMetadata = autonomyMetadataFromPayload(body);
+        if (
+          result.ok &&
+          result.requestId &&
+          (autonomyMetadata.reservationRequired === true ||
+            autonomyMetadata.reservation_required === true)
+        ) {
+          const objectiveId = compactText(
+            autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id,
+            128,
+          );
+          if (objectiveId) {
+            autonomyStore.markObjectiveDispatched(objectiveId, result.requestId);
+            const sessionId = compactText(body.sessionId, 128);
+            const session = sessionManager.getSession(sessionId);
+            if (session) {
+              session.emit({
+                protocolVersion: PROTOCOL_VERSION,
+                id: randomUUID(),
+                ts: new Date().toISOString(),
+                sessionId,
+                type: "autonomy_objective_dispatched",
+                from: "server:autonomy",
+                payload: {
+                  runId: compactText(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+                  snapshotId: compactText(
+                    autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id,
+                    128,
+                  ),
+                  objectiveId,
+                  requestId: result.requestId,
+                  patternKey:
+                    compactText(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) ||
+                    "unknown",
+                  origin: "autonomy",
+                },
+              });
+            }
+          }
+        }
         return makeJson(result, result.ok ? 201 : 400);
       }
 

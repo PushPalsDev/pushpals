@@ -3716,7 +3716,7 @@ import {
   unlinkSync,
   writeFileSync as writeFileSync4
 } from "fs";
-import { basename as basename4, resolve as resolve10 } from "path";
+import { basename as basename4, isAbsolute as isAbsolute3, resolve as resolve10 } from "path";
 
 // apps/workerpals/src/common/worktree_dependency_artifacts.ts
 import { createHash as createHash3 } from "crypto";
@@ -3735,6 +3735,7 @@ import { resolve as resolve8 } from "path";
 var DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS = ["node_modules"];
 var DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-dependency-snapshot";
 var DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-validation-safe-dependency-snapshot";
+var VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION = "container-volume-v1";
 function pathExistsOrLink(path) {
   try {
     lstatSync(path);
@@ -4836,6 +4837,15 @@ function deriveQualityGatePolicy(params, runtimeConfig = DEFAULT_CONFIG3) {
       return 8;
     return Math.max(0, Math.min(10, value));
   })();
+  const configuredFinalReviewThreshold = (() => {
+    if (!runtimeConfig.sourceControlManager.reviewAgent.enabled)
+      return null;
+    const value = Number(runtimeConfig.sourceControlManager.reviewAgent.passThreshold);
+    if (!Number.isFinite(value))
+      return null;
+    return Math.max(0, Math.min(10, value));
+  })();
+  const defaultCriticMinScore = Math.max(baseCriticMinScore, configuredFinalReviewThreshold ?? 0);
   const reviewFix = extractReviewFixContext(params);
   if (!reviewFix) {
     const mergeConflict = extractMergeConflictReviewContext(params);
@@ -4846,7 +4856,7 @@ function deriveQualityGatePolicy(params, runtimeConfig = DEFAULT_CONFIG3) {
         validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
         ...gateSwitches,
         softPassOnExhausted: baseSoftPassOnExhausted,
-        criticMinScore: baseCriticMinScore
+        criticMinScore: defaultCriticMinScore
       };
     }
     return {
@@ -4855,10 +4865,10 @@ function deriveQualityGatePolicy(params, runtimeConfig = DEFAULT_CONFIG3) {
       validationMaxAutoRevisions: baseValidationMaxAutoRevisions,
       ...gateSwitches,
       softPassOnExhausted: baseSoftPassOnExhausted,
-      criticMinScore: baseCriticMinScore
+      criticMinScore: defaultCriticMinScore
     };
   }
-  const tightenedCriticMinScore = reviewFix.reviewThreshold != null ? Math.max(baseCriticMinScore, Math.max(0, Math.min(10, reviewFix.reviewThreshold - 0.2))) : baseCriticMinScore;
+  const tightenedCriticMinScore = reviewFix.reviewThreshold != null ? Math.max(defaultCriticMinScore, Math.max(0, Math.min(10, reviewFix.reviewThreshold))) : defaultCriticMinScore;
   return {
     mode: "review_fix",
     maxAutoRevisions: Math.max(baseMaxAutoRevisions, 2),
@@ -5938,7 +5948,10 @@ function bunDependencySnapshotKey(repo, bunVersion = String(process.versions.bun
   const packagePath = resolve10(repo, "package.json");
   if (!existsSync8(packagePath))
     return null;
-  const hashInput = [`projection=hardlink-v1`, `bun=${bunVersion}`];
+  const hashInput = [
+    `projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}`,
+    `bun=${bunVersion}`
+  ];
   for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
     const path = resolve10(repo, name);
     if (!existsSync8(path))
@@ -6354,6 +6367,36 @@ function detectValidationBlocker(runs) {
     };
   }
   return null;
+}
+function isolatePureEnvironmentValidationDeferral(quality) {
+  const failedRuns = quality.validationRuns.filter((run) => !run.ok);
+  const pureEnvironmentDeferral = failedRuns.length > 0 && failedRuns.every((run) => detectValidationBlocker([run])?.category === "environment");
+  if (!pureEnvironmentDeferral) {
+    return { pureEnvironmentDeferral: false, qualityForCritic: quality, blockedCommands: [] };
+  }
+  const successfulRuns = quality.validationRuns.filter((run) => run.ok);
+  const nonValidationIssues = quality.issues.filter((issue) => !issue.startsWith("ValidationGate:"));
+  return {
+    pureEnvironmentDeferral: true,
+    blockedCommands: failedRuns.map((run) => run.command),
+    qualityForCritic: {
+      ...quality,
+      ok: nonValidationIssues.length === 0,
+      issues: nonValidationIssues,
+      validationIssues: [],
+      validationRuns: successfulRuns,
+      requiredValidationFailures: [],
+      blocker: null,
+      validationFailureScope: "none"
+    }
+  };
+}
+function canReturnTrustedEnvironmentValidationHandoff(input) {
+  if (!input.pureEnvironmentDeferral || input.deterministicRequiresRevision)
+    return false;
+  if (!input.criticGateEnabled)
+    return true;
+  return input.criticScore != null && input.criticScore >= input.criticMinScore;
 }
 function stripAnsiControlSequences(value) {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
@@ -8252,6 +8295,39 @@ ${output}` : ""
 
 `);
 }
+function resolveWorkerCriticReviewContext(repo, params, runtimeConfig = DEFAULT_CONFIG3) {
+  const reviewAgent = runtimeConfig.sourceControlManager.reviewAgent;
+  const thresholdRaw = Number(reviewAgent.passThreshold);
+  const finalReviewThreshold = Number.isFinite(thresholdRaw) ? Math.max(0, Math.min(10, thresholdRaw)) : 9.5;
+  const configuredPath = String(reviewAgent.reviewerMdPath ?? "").trim();
+  const reviewerPath = configuredPath ? isAbsolute3(configuredPath) ? configuredPath : resolve10(repo, configuredPath) : "";
+  let finalReviewerRubric = "";
+  if (reviewerPath && existsSync8(reviewerPath)) {
+    try {
+      finalReviewerRubric = readFileSync8(reviewerPath, "utf8").trim();
+    } catch {
+      finalReviewerRubric = "";
+    }
+  }
+  if (!finalReviewerRubric) {
+    finalReviewerRubric = loadPromptTemplate("review_agent/reviewer.md").trim();
+  }
+  finalReviewerRubric = finalReviewerRubric.slice(0, 16000);
+  const reviewFix = extractReviewFixContext(params);
+  const priorReviewLines = reviewFix ? [
+    reviewFix.previousReviewScore != null ? `Previous final-review score: ${reviewFix.previousReviewScore.toFixed(1)} / 10` : "",
+    reviewFix.previousReviewSummary ? `Previous final-review summary: ${reviewFix.previousReviewSummary}` : "",
+    reviewFix.reviewerFindings.length > 0 ? `Previous final-review findings (mandatory minimum coverage, not an exhaustive checklist):
+${reviewFix.reviewerFindings.map((finding) => `- ${finding}`).join(`
+`)}` : ""
+  ].filter(Boolean) : [];
+  return {
+    finalReviewThreshold,
+    finalReviewerRubric,
+    priorReviewContext: priorReviewLines.join(`
+`) || "No prior final-review findings are available for this job."
+  };
+}
 function criticTimeoutReview(source, timeoutMs, elapsedMs) {
   const summary = `${source} critic timed out after ${elapsedMs}ms (timeout=${timeoutMs}ms).`;
   return {
@@ -8283,6 +8359,7 @@ async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog) 
   const changedPathsText = quality.changedPaths.map((entry) => `- ${entry}`).join(`
 `) || "- (none)";
   const criticSystem = loadPromptTemplate("workerpals/task_quality_critic_system_prompt.md").trim();
+  const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
   const apiKey = runtimeConfig.workerpals.llm.apiKey.trim() || "local";
   const headers = {
     "Content-Type": "application/json"
@@ -8300,7 +8377,10 @@ async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog) 
       validation_steps: validationStepsText,
       changed_paths: changedPathsText,
       diff_excerpt: diffText || "(empty diff excerpt)",
-      validation_evidence: validationSummary || "(no validation output)"
+      validation_evidence: validationSummary || "(no validation output)",
+      final_review_threshold: reviewContext.finalReviewThreshold.toFixed(1),
+      final_reviewer_rubric: reviewContext.finalReviewerRubric,
+      prior_review_context: reviewContext.priorReviewContext
     });
     const promptChars = criticSystem.length + criticUser.length;
     const promptBytes = new TextEncoder().encode(`${criticSystem}
@@ -10704,6 +10784,7 @@ async function runCodexCriticReview(repo, params, quality, runtimeConfig, onLog)
   const qualityCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
   const criticModel = resolveQualityCriticModel(runtimeConfig);
+  const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
   const buildCriticInstruction = async (compact) => {
     const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
     let diffText = await buildCriticDiffText(repo, changedForDiff);
@@ -10717,7 +10798,10 @@ async function runCodexCriticReview(repo, params, quality, runtimeConfig, onLog)
       diff_section: diffText ? `Diff:
 ${diffText}` : "Diff: (empty - no changes detected)",
       validation_section: validationSummary ? `Validation:
-${validationSummary}` : "Validation: (none)"
+${validationSummary}` : "Validation: (none)",
+      final_review_threshold: reviewContext.finalReviewThreshold.toFixed(1),
+      final_reviewer_rubric: reviewContext.finalReviewerRubric,
+      prior_review_context: reviewContext.priorReviewContext
     });
     return {
       criticInstruction,
@@ -11168,8 +11252,9 @@ ${result.stderr ?? ""}`;
       };
       recordBrowserFailureMemory(repo, failureJobFamily, browserRepairPacket);
     }
-    const unchangedValidationFailure = revisionAttempt > 0 ? findUnchangedValidationFailure(quality.validationRuns, previousValidationFailureDigests, repo) : null;
-    for (const run of quality.validationRuns) {
+    const environmentDeferral = isolatePureEnvironmentValidationDeferral(quality);
+    const unchangedValidationFailure = !environmentDeferral.pureEnvironmentDeferral && revisionAttempt > 0 ? findUnchangedValidationFailure(quality.validationRuns, previousValidationFailureDigests, repo) : null;
+    for (const run of environmentDeferral.pureEnvironmentDeferral ? [] : quality.validationRuns) {
       if (run.ok)
         continue;
       const digest = extractValidationFailureRetryDigest(run, repo);
@@ -11177,18 +11262,18 @@ ${result.stderr ?? ""}`;
         previousValidationFailureDigests.set(validationCommandKey(run.command), digest);
     }
     const validationOutsideTaskScope = quality.validationFailureScope === "outside_task_scope";
-    const repoValidationRepairMode = shouldRepairOutsideTaskRequiredValidation({
+    const repoValidationRepairMode = !environmentDeferral.pureEnvironmentDeferral && shouldRepairOutsideTaskRequiredValidation({
       requiredValidationFailures: quality.requiredValidationFailures,
       validationFailureScope: quality.validationFailureScope,
       changedPaths: quality.changedPaths,
       revisionAttempt,
       maxAutoRevisions: qualityRepoValidationRepairMaxAutoRevisions
     });
-    const validationOutsideTaskScopeBlocksOnly = validationOutsideTaskScope && !repoValidationRepairMode;
+    const validationOutsideTaskScopeBlocksOnly = !environmentDeferral.pureEnvironmentDeferral && validationOutsideTaskScope && !repoValidationRepairMode;
     if (repoValidationRepairMode) {
       onLog?.("stderr", `[ValidationGate] Required validation failed outside original task scope; entering guarded repo validation repair mode for revision ${revisionAttempt + 1}/${qualityRepoValidationRepairMaxAutoRevisions}: ${quality.requiredValidationFailures.join("; ")}`);
     }
-    const qualityForCritic = validationOutsideTaskScopeBlocksOnly ? {
+    const qualityForCritic = environmentDeferral.pureEnvironmentDeferral ? environmentDeferral.qualityForCritic : validationOutsideTaskScopeBlocksOnly ? {
       ...quality,
       issues: quality.issues.filter((issue) => !issue.startsWith("ValidationGate:")),
       validationIssues: [],
@@ -11205,12 +11290,12 @@ ${result.stderr ?? ""}`;
       qualityIssues: qualityForCritic.issues,
       changedPaths: quality.changedPaths
     });
-    const preCriticEffectiveQualityIssues = validationOutsideTaskScopeBlocksOnly ? quality.issues.filter((issue) => !issue.startsWith("ValidationGate:")) : quality.issues;
-    const preCriticDeterministicRequiresRevision = preCriticEffectiveQualityIssues.length > 0 || quality.blocker !== null && !validationOutsideTaskScopeBlocksOnly;
+    const preCriticEffectiveQualityIssues = qualityForCritic.issues;
+    const preCriticDeterministicRequiresRevision = preCriticEffectiveQualityIssues.length > 0 || qualityForCritic.blocker !== null;
     const skipCriticForDeterministicValidationRevision = shouldSkipCriticForDeterministicValidationRevision({
       deterministicRequiresRevision: preCriticDeterministicRequiresRevision,
       validationOutsideTaskScope: validationOutsideTaskScopeBlocksOnly,
-      validationRuns: quality.validationRuns
+      validationRuns: qualityForCritic.validationRuns
     });
     const preCriticRevisionBudget = qualityRevisionBudgetDecision({
       jobElapsedMs: Date.now() - jobStartedAt,
@@ -11279,7 +11364,7 @@ ${result.stderr ?? ""}`;
       criticScore: critic?.score
     });
     onLog?.("stdout", `[JobRunner] Rollout score: score=${rolloutScore.score} reasons=${rolloutScore.reasons.join(",") || "none"}`);
-    const advisoryRelaxedQualityIssues = relaxAdvisoryQualityIssues(quality.issues, quality.validationRuns, critic, qualityCriticMinScore);
+    const advisoryRelaxedQualityIssues = relaxAdvisoryQualityIssues(qualityForCritic.issues, qualityForCritic.validationRuns, critic, qualityCriticMinScore);
     let effectiveQualityIssues = advisoryRelaxedQualityIssues;
     if (validationOutsideTaskScopeBlocksOnly) {
       effectiveQualityIssues = effectiveQualityIssues.filter((issue) => !issue.startsWith("ValidationGate:"));
@@ -11290,8 +11375,15 @@ ${result.stderr ?? ""}`;
     if (!validationOutsideTaskScope && advisoryRelaxedQualityIssues.length !== quality.issues.length) {
       onLog?.("stdout", "[QualityGate] Assertion-balance heuristic downgraded to advisory because validation passed and critic score met threshold.");
     }
-    const deterministicRequiresRevision = effectiveQualityIssues.length > 0 || quality.blocker !== null && !validationOutsideTaskScopeBlocksOnly;
+    const deterministicRequiresRevision = effectiveQualityIssues.length > 0 || qualityForCritic.blocker !== null;
     const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
+    const trustedEnvironmentHandoffReady = canReturnTrustedEnvironmentValidationHandoff({
+      pureEnvironmentDeferral: environmentDeferral.pureEnvironmentDeferral,
+      deterministicRequiresRevision,
+      criticGateEnabled: qualityGatePolicy.criticGateEnabled,
+      criticScore: critic?.score ?? null,
+      criticMinScore: qualityCriticMinScore
+    });
     if (!qualityGatePolicy.publishGateEnabled && (deterministicRequiresRevision || criticRequiresRevision)) {
       onLog?.("stderr", "[PublishGate] Disabled by workerpals.quality_publish_gate_enabled=false; returning worker result despite gate failures.");
       const advisoryResult = {
@@ -11307,15 +11399,31 @@ ${result.stderr ?? ""}`;
       };
       return annotateTerminalResult(advisoryResult, "quality");
     }
-    if (quality.blocker?.category === "environment") {
-      const blockedCommands = quality.validationRuns.filter((run) => !run.ok).map((run) => run.command);
+    if (environmentDeferral.pureEnvironmentDeferral && qualityGatePolicy.criticGateEnabled && !deterministicRequiresRevision && critic == null) {
+      const summary = "Critic review unavailable before trusted-environment validation handoff";
+      onLog?.("stderr", `[CriticGate] ${summary}; retaining the candidate without reporting a publishable success.`);
+      return annotateTerminalResult({
+        ok: false,
+        summary,
+        stdout: result.stdout,
+        stderr: truncate([
+          result.stderr ?? "",
+          "The deterministic validation blocker is environment-only, but the enabled critic did not produce a verdict.",
+          ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean)
+        ].join(`
+`), outputPolicyForRuntime(runtimeConfig)),
+        exitCode: 4
+      }, "critic_unavailable_before_trusted_environment_handoff");
+    }
+    if (trustedEnvironmentHandoffReady) {
       const blockerDiagnostics = truncate([
         result.stderr ?? "",
         ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean)
       ].join(`
 `), outputPolicyForRuntime(runtimeConfig));
       const summary = "Candidate patch requires trusted-environment validation before publication";
-      onLog?.("stderr", `[QualityGate] ${summary}: ${toSingleLine(quality.blocker.detail, 260)}`);
+      const environmentDetail = quality.blocker?.detail ?? "Validation could not run in the worker environment and must be completed on the trusted host.";
+      onLog?.("stderr", `[QualityGate] ${summary}: ${toSingleLine(environmentDetail, 260)}`);
       const heldCandidate = {
         ...result,
         ok: true,
@@ -11325,15 +11433,15 @@ ${result.stderr ?? ""}`;
         validationBlocked: {
           category: "environment",
           summary,
-          detail: quality.blocker.detail,
-          commands: blockedCommands
+          detail: environmentDetail,
+          commands: environmentDeferral.blockedCommands
         }
       };
       return annotateTerminalResult(heldCandidate, "trusted_environment_validation_required");
     }
     if (!deterministicRequiresRevision && !criticRequiresRevision) {
-      if (quality.requiredValidationFailures.length > 0) {
-        const requiredSummary = `Required vision.md validation blocked publishing: ${quality.requiredValidationFailures.join("; ")}`;
+      if (qualityForCritic.requiredValidationFailures.length > 0) {
+        const requiredSummary = `Required vision.md validation blocked publishing: ${qualityForCritic.requiredValidationFailures.join("; ")}`;
         const diagnostics = truncate([
           result.stderr ?? "",
           validationOutsideTaskScope ? "Validation failures appear outside the task target/relevance hints and are treated as pre-existing repo blockers." : "",
@@ -11355,37 +11463,37 @@ ${result.stderr ?? ""}`;
       }
       return annotateTerminalResult(result, "completed");
     }
-    const blockerIssue = quality.blocker ? [
-      `Validation blocker (${quality.blocker.category}): ${toSingleLine(quality.blocker.detail, 240)}`
+    const blockerIssue = qualityForCritic.blocker ? [
+      `Validation blocker (${qualityForCritic.blocker.category}): ${toSingleLine(qualityForCritic.blocker.detail, 240)}`
     ] : [];
     const issues = buildQualityGateRevisionIssues([...effectiveQualityIssues, ...blockerIssue], critic, qualityCriticMinScore);
     const activeMaxAutoRevisions = revisionLimitForQualityGateFailures({
       policy: qualityGatePolicy,
       qualityIssues: effectiveQualityIssues,
-      requiredValidationFailures: validationOutsideTaskScopeBlocksOnly ? [] : quality.requiredValidationFailures,
-      blocker: validationOutsideTaskScopeBlocksOnly ? null : quality.blocker,
+      requiredValidationFailures: validationOutsideTaskScopeBlocksOnly ? [] : qualityForCritic.requiredValidationFailures,
+      blocker: qualityForCritic.blocker,
       browserRepairPacket: validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? null : browserRepairPacket
     });
     const issueSummary = browserRepairPacket && !validationOutsideTaskScopeBlocksOnly && !repoValidationRepairMode ? `ValidationGate browser ${browserRepairPacket.failureKind} repair for ${browserRepairPacket.command}: ${toSingleLine(browserRepairPacket.digest, 180)}` : issues.map((entry) => toSingleLine(entry, 180)).join(" | ");
-    if (quality.blocker && !validationOutsideTaskScopeBlocksOnly) {
-      const blockerSummary = `Quality gate blocked by ${quality.blocker.category} issue: ${quality.blocker.detail}`;
+    if (qualityForCritic.blocker) {
+      const blockerSummary = `Quality gate blocked by ${qualityForCritic.blocker.category} issue: ${qualityForCritic.blocker.detail}`;
       const blockerDiagnostics = truncate([
         result.stderr ?? "",
         ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean)
       ].join(`
 `), outputPolicyForRuntime(runtimeConfig));
       const requiredValidationCanRevise = shouldReviseRequiredValidationBlocker({
-        requiredValidationFailures: quality.requiredValidationFailures,
-        blocker: quality.blocker,
+        requiredValidationFailures: qualityForCritic.requiredValidationFailures,
+        blocker: qualityForCritic.blocker,
         revisionAttempt,
         maxAutoRevisions: activeMaxAutoRevisions,
         outsideTaskScope: validationOutsideTaskScope,
         allowOutsideTaskScope: repoValidationRepairMode
       });
       if (requiredValidationCanRevise) {
-        onLog?.("stderr", `[QualityGate] Required vision.md validation hit a repo blocker; requesting revision ${revisionAttempt + 1}/${activeMaxAutoRevisions} instead of failing immediately: ${quality.requiredValidationFailures.join("; ")}`);
-      } else if (quality.requiredValidationFailures.length > 0) {
-        const requiredSummary = `Required vision.md validation blocked publishing: ${quality.requiredValidationFailures.join("; ")}`;
+        onLog?.("stderr", `[QualityGate] Required vision.md validation hit a repo blocker; requesting revision ${revisionAttempt + 1}/${activeMaxAutoRevisions} instead of failing immediately: ${qualityForCritic.requiredValidationFailures.join("; ")}`);
+      } else if (qualityForCritic.requiredValidationFailures.length > 0) {
+        const requiredSummary = `Required vision.md validation blocked publishing: ${qualityForCritic.requiredValidationFailures.join("; ")}`;
         onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
         const failure = {
           ok: false,
@@ -11395,11 +11503,11 @@ ${result.stderr ?? ""}`;
           exitCode: 4
         };
         return annotateTerminalResult(failure, "validation");
-      } else if (shouldSoftPassValidationBlocker(qualityGatePolicy, quality.blocker)) {
-        onLog?.("stderr", `[QualityGate] Soft-pass on ${quality.blocker.category} blocker for publishable ${qualityGatePolicy.mode} job: ${toSingleLine(quality.blocker.detail, 260)}`);
+      } else if (shouldSoftPassValidationBlocker(qualityGatePolicy, qualityForCritic.blocker)) {
+        onLog?.("stderr", `[QualityGate] Soft-pass on ${qualityForCritic.blocker.category} blocker for publishable ${qualityGatePolicy.mode} job: ${toSingleLine(qualityForCritic.blocker.detail, 260)}`);
         const softPass = {
           ...result,
-          summary: `${result.summary} (quality gate soft-pass on ${quality.blocker.category} blocker after publishable ${qualityGatePolicy.mode} update)`,
+          summary: `${result.summary} (quality gate soft-pass on ${qualityForCritic.blocker.category} blocker after publishable ${qualityGatePolicy.mode} update)`,
           stderr: blockerDiagnostics,
           exitCode: typeof result.exitCode === "number" ? result.exitCode : 0
         };
@@ -11417,14 +11525,14 @@ ${result.stderr ?? ""}`;
       }
     }
     if (revisionAttempt >= activeMaxAutoRevisions) {
-      if (quality.requiredValidationFailures.length > 0) {
+      if (qualityForCritic.requiredValidationFailures.length > 0) {
         const diagnostics = truncate([
           result.stderr ?? "",
           ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
           critic ? `Critic raw: ${critic.raw}` : ""
         ].filter(Boolean).join(`
 `), outputPolicyForRuntime(runtimeConfig));
-        const requiredSummary = `Required vision.md validation failed after ${revisionAttempt} auto-revision attempt(s): ${quality.requiredValidationFailures.join("; ")}`;
+        const requiredSummary = `Required vision.md validation failed after ${revisionAttempt} auto-revision attempt(s): ${qualityForCritic.requiredValidationFailures.join("; ")}`;
         onLog?.("stderr", `[QualityGate] ${requiredSummary}`);
         const failure2 = {
           ok: false,
@@ -11473,7 +11581,7 @@ ${result.stderr ?? ""}`;
       revisionBudget
     });
     const inScopeValidationContinuation = inScopeValidationRepairContinuationBudgetDecision({
-      requiredValidationFailures: validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? [] : quality.requiredValidationFailures,
+      requiredValidationFailures: validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? [] : qualityForCritic.requiredValidationFailures,
       validationOutsideTaskScope,
       changedPaths: quality.changedPaths,
       revisionBudget
@@ -11483,7 +11591,7 @@ ${result.stderr ?? ""}`;
         softPassOnExhausted: qualitySoftPassOnExhausted,
         deterministicRequiresRevision,
         criticRequiresRevision,
-        requiredValidationFailures: quality.requiredValidationFailures,
+        requiredValidationFailures: qualityForCritic.requiredValidationFailures,
         changedPaths: quality.changedPaths
       })) {
         const diagnostics = truncate([
@@ -11537,7 +11645,7 @@ ${result.stderr ?? ""}`;
       onLog?.("stderr", `[QualityGate] Continuing in-scope validation repair ${revisionAttempt + 1}/${activeMaxAutoRevisions} with dedicated budget ${inScopeValidationContinuation.executionBudgetMs}ms execution + ${inScopeValidationContinuation.finalizationBudgetMs}ms finalization after original remaining budget ${revisionBudget.remainingBudgetMs}ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(issueSummary, 220)}`);
     }
     revisionAttempt += 1;
-    revisionHint = buildQualityRevisionHint(issues, critic, planning, reviewFixContext, validationOutsideTaskScopeBlocksOnly ? [] : quality.validationRuns, validationOutsideTaskScopeBlocksOnly ? null : quality.blocker, validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? null : browserRepairPacket, quality.changedPaths, validationRemedyHints, repoValidationRepairMode);
+    revisionHint = buildQualityRevisionHint(issues, critic, planning, reviewFixContext, qualityForCritic.validationRuns, qualityForCritic.blocker, validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? null : browserRepairPacket, quality.changedPaths, validationRemedyHints, repoValidationRepairMode);
     onLog?.("stderr", `[QualityGate] Quality gate requested revision ${revisionAttempt}/${activeMaxAutoRevisions}: ${toSingleLine(issueSummary, 260)}`);
   }
   return {
@@ -11551,7 +11659,7 @@ ${result.stderr ?? ""}`;
 import { createHash as createHash5, randomUUID } from "crypto";
 import { existsSync as existsSync10, mkdirSync as mkdirSync4, readFileSync as readFileSync9, writeFileSync as writeFileSync5 } from "fs";
 import { homedir as homedir3 } from "os";
-import { basename as basename5, isAbsolute as isAbsolute3, relative, resolve as resolve11 } from "path";
+import { basename as basename5, isAbsolute as isAbsolute4, relative, resolve as resolve11 } from "path";
 
 // apps/workerpals/src/common/worktree_cleanup.ts
 import { existsSync as existsSync9, rmSync as rmSync4 } from "fs";
@@ -11789,6 +11897,8 @@ var WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID = "pushpals_extra_ca";
 var WORKERPAL_SANDBOX_HOST_EXTRA_CA_PATH = "/run/pushpals/host-extra-ca.pem";
 var WORKERPAL_SANDBOX_MERGED_CA_PATH = "/run/pushpals/ca-bundle.pem";
 var WORKERPAL_SANDBOX_SYSTEM_CA_PATH = "/etc/ssl/certs/ca-certificates.crt";
+var DEFAULT_OPENAI_CODEX_CONTAINER_HOME = "/workspace/.pushpals/codex-home";
+var WORKERPAL_HOST_CODEX_AUTH_PATH = "/run/pushpals/host-codex-auth.json";
 var DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15000;
 var DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60000;
 var DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60000;
@@ -11814,6 +11924,41 @@ async function settleWithin(promise, timeoutMs) {
 }
 function buildWindowsDockerExecTreeTerminationArgv(pid) {
   return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+function resolveOpenAiCodexContainerHome(configured) {
+  const raw = String(configured ?? "").trim();
+  if (!raw)
+    return DEFAULT_OPENAI_CODEX_CONTAINER_HOME;
+  if (!raw.startsWith("/") || raw.includes("\\") || raw.split("/").includes("..")) {
+    return DEFAULT_OPENAI_CODEX_CONTAINER_HOME;
+  }
+  const normalized = raw.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+  const isDedicatedCodexHome = normalized.startsWith("/workspace/.pushpals/") || /^\/(?:root|home\/[^/]+)\/\.codex(?:\/.*)?$/.test(normalized);
+  if (!normalized || !isDedicatedCodexHome) {
+    return DEFAULT_OPENAI_CODEX_CONTAINER_HOME;
+  }
+  return normalized;
+}
+function buildOpenAiCodexHomeStartupCommand(options) {
+  const home = shellSingleQuote(resolveOpenAiCodexContainerHome(options.containerHome));
+  const runtimeTag = shellSingleQuote(String(options.runtimeTag ?? "").trim() || "unversioned");
+  const commands = [
+    `codex_home=${home}`,
+    `codex_runtime_tag=${runtimeTag}`,
+    'mkdir -p "$codex_home"',
+    'runtime_marker="$codex_home/.pushpals-runtime-tag"',
+    'previous_runtime_tag="$(cat "$runtime_marker" 2>/dev/null || true)"',
+    `if [ "$previous_runtime_tag" != "$codex_runtime_tag" ]; then find "$codex_home" -mindepth 1 -maxdepth 1 ! -name auth.json ! -name .pushpals-host-auth.sha256 ! -name .pushpals-runtime-tag -exec rm -rf -- {} +; printf '%s\\n' "$codex_runtime_tag" > "$runtime_marker"; fi`
+  ];
+  if (options.hostAuthMounted) {
+    commands.push(`host_auth=${shellSingleQuote(WORKERPAL_HOST_CODEX_AUTH_PATH)}`, 'host_auth_hash="$(sha256sum "$host_auth" | cut -d " " -f 1)"', 'host_auth_marker="$codex_home/.pushpals-host-auth.sha256"', 'previous_host_auth_hash="$(cat "$host_auth_marker" 2>/dev/null || true)"', `if [ ! -s "$codex_home/auth.json" ] || [ "$host_auth_hash" != "$previous_host_auth_hash" ]; then cp "$host_auth" "$codex_home/.auth.json.pushpals-tmp"; chmod 0600 "$codex_home/.auth.json.pushpals-tmp"; mv -f "$codex_home/.auth.json.pushpals-tmp" "$codex_home/auth.json"; printf '%s\\n' "$host_auth_hash" > "$host_auth_marker"; fi`);
+  }
+  return commands.join("; ");
+}
+function prependOpenAiCodexHomeStartup(startupCommand, options) {
+  if (!options)
+    return startupCommand;
+  return `${buildOpenAiCodexHomeStartupCommand(options)}; ${startupCommand}`;
 }
 async function terminateDockerExecProcessTree(proc, platform = process.platform) {
   const pid = Number(proc.pid);
@@ -11866,7 +12011,7 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     'if [ -f "$worktree/package.json" ] && { [ -f "$worktree/bun.lock" ] || [ -f "$worktree/bun.lockb" ]; }; then',
     '  dependency_cache_root="$store_root/snapshots/linux-$(uname -m)"',
     '  mkdir -p "$dependency_cache_root"',
-    `  snapshot_key="$( { printf 'projection=container-volume-v1\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
+    `  snapshot_key="$( { printf 'projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
     `  if jq -e '.workspaces != null' "$worktree/package.json" >/dev/null 2>&1; then`,
     '    snapshot_key="$snapshot_key-$worktree_id"',
     "  fi",
@@ -11926,7 +12071,10 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath) {
     '    src="/repo/$name"',
     '    dest="$worktree/$name"',
     '    if { [ -e "$src" ] || [ -L "$src" ]; }; then',
-    '      snapshot_key="$(for manifest in /repo/package.json /repo/bun.lock /repo/bun.lockb; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done | sha256sum | cut -d " " -f 1)"',
+    `      snapshot_key="$( { printf 'projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
+    `      if jq -e '.workspaces != null' "$worktree/package.json" >/dev/null 2>&1; then`,
+    '        snapshot_key="$snapshot_key-$worktree_id"',
+    "      fi",
     '      rm -rf "$projection_root"',
     '      mkdir -p "$projection_node_modules"',
     '      for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
@@ -12162,6 +12310,7 @@ class DockerExecutor {
   worktreeDir;
   warmContainerName;
   dependencyVolumeName;
+  codexVolumeName;
   warmAgentPort = 39231;
   idleTimer = null;
   activeJobs = 0;
@@ -12196,6 +12345,7 @@ class DockerExecutor {
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     const dependencyRepoPath = resolve11(this.options.repo);
     this.dependencyVolumeName = `pushpals-deps-${createHash5("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
+    this.codexVolumeName = `pushpals-codex-${createHash5("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
     this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
     this.warmSetupBackoffMs = parseClampedInt(this.config.workerpals.dockerWarmRetryBackoffMs, 2000, 250, 60000);
@@ -12383,7 +12533,7 @@ class DockerExecutor {
         return;
       const gitdirRaw = match[1].trim();
       const hasWindowsDrive = /^[a-zA-Z]:[\\/]/.test(gitdirRaw);
-      if (!hasWindowsDrive && !isAbsolute3(gitdirRaw)) {
+      if (!hasWindowsDrive && !isAbsolute4(gitdirRaw)) {
         return;
       }
       const rel = relative(worktreePath, gitdirRaw).replace(/\\/g, "/");
@@ -12537,30 +12687,16 @@ class DockerExecutor {
   }
   async startWarmContainer() {
     await this.stopWarmContainer("pre-start cleanup", true);
-    const volume = Bun.spawn([
-      resolveDockerExecutable(),
-      "volume",
-      "create",
-      "--label",
-      "pushpals.component=workerpals-dependencies",
-      "--label",
-      `pushpals.repo=${this.options.repo}`,
-      this.dependencyVolumeName
-    ], { stdout: "pipe", stderr: "pipe" });
-    const [volumeExitCode, volumeStdout, volumeStderr] = await Promise.all([
-      volume.exited,
-      new Response(volume.stdout).text(),
-      new Response(volume.stderr).text()
-    ]);
-    if (volumeExitCode !== 0) {
-      throw new Error(`Failed to prepare container-native dependency volume (exit ${volumeExitCode}): ${volumeStderr.trim() || volumeStdout.trim() || "no docker output"}`);
-    }
+    await this.ensureNamedVolume(this.dependencyVolumeName, "workerpals-dependencies");
     const backend = this.currentBackend();
+    if (backend === "openai_codex") {
+      await this.ensureNamedVolume(this.codexVolumeName, "workerpals-codex-home");
+    }
     const backendSpec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
-    const authMountArgs = this.openaiCodexAuthMountArgs(backend);
+    const authMount = this.openaiCodexAuthMount(backend);
     const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(process.env, existsSync10, (path) => this.toDockerPath(path));
     const args = [
       "run",
@@ -12588,7 +12724,7 @@ class DockerExecutor {
       "-w",
       "/workspace",
       ...envArgs,
-      ...authMountArgs,
+      ...authMount.args,
       ...runtimeCaArgs
     ];
     if (this.options.gitToken) {
@@ -12600,7 +12736,12 @@ class DockerExecutor {
         continue;
       args.push("-e", `${key}=${value}`);
     }
-    const startupCmd = prependWorkerpalRuntimeCaStartup(backendSpec.warmContainerStartupCommand(warmContext), runtimeCaArgs.length > 0);
+    const backendStartup = prependOpenAiCodexHomeStartup(backendSpec.warmContainerStartupCommand(warmContext), backend === "openai_codex" ? {
+      containerHome: authMount.containerHome,
+      runtimeTag: resolveWorkerpalRuntimeTag(),
+      hostAuthMounted: authMount.hostAuthMounted
+    } : null);
+    const startupCmd = prependWorkerpalRuntimeCaStartup(backendStartup, runtimeCaArgs.length > 0);
     if (runtimeCaArgs.length > 0) {
       console.log("[DockerExecutor] Mounting host extra CA trust into the warm container (read-only).");
     }
@@ -12619,37 +12760,59 @@ class DockerExecutor {
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
   }
-  openaiCodexAuthMountArgs(backend) {
-    if (backend !== "openai_codex")
-      return [];
+  async ensureNamedVolume(name, component) {
+    const volume = Bun.spawn([
+      resolveDockerExecutable(),
+      "volume",
+      "create",
+      "--label",
+      `pushpals.component=${component}`,
+      "--label",
+      `pushpals.repo=${this.options.repo}`,
+      name
+    ], { stdout: "pipe", stderr: "pipe" });
+    const [volumeExitCode, volumeStdout, volumeStderr] = await Promise.all([
+      volume.exited,
+      new Response(volume.stdout).text(),
+      new Response(volume.stderr).text()
+    ]);
+    if (volumeExitCode !== 0) {
+      throw new Error(`Failed to prepare ${component} volume (exit ${volumeExitCode}): ${volumeStderr.trim() || volumeStdout.trim() || "no docker output"}`);
+    }
+  }
+  openaiCodexAuthMount(backend) {
+    if (backend !== "openai_codex") {
+      return {
+        args: [],
+        containerHome: DEFAULT_OPENAI_CODEX_CONTAINER_HOME,
+        hostAuthMounted: false
+      };
+    }
     const hostCodexHomeRaw = (process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
-    if (hostCodexHomeRaw && !isAbsolute3(hostCodexHomeRaw)) {
+    if (hostCodexHomeRaw && !isAbsolute4(hostCodexHomeRaw)) {
       console.warn(`[DockerExecutor] Ignoring relative PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME=${hostCodexHomeRaw}; using ${resolve11(homedir3(), ".codex")} so Codex state stays outside the repo worktree.`);
     }
-    const hostCodexHome = (hostCodexHomeRaw && isAbsolute3(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve11(homedir3(), ".codex")).trim();
-    if (!hostCodexHome)
-      return [];
-    if (!existsSync10(hostCodexHome)) {
-      try {
-        mkdirSync4(hostCodexHome, { recursive: true });
-      } catch (err) {
-        console.warn(`[DockerExecutor] Failed to create Codex auth directory (${hostCodexHome}); skipping mount: ${this.compactError(err)}`);
-        return [];
-      }
+    const hostCodexHome = (hostCodexHomeRaw && isAbsolute4(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve11(homedir3(), ".codex")).trim();
+    const configuredContainerHome = process.env.PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME;
+    const containerCodexHome = resolveOpenAiCodexContainerHome(configuredContainerHome);
+    if (configuredContainerHome?.trim() && containerCodexHome !== configuredContainerHome.trim().replace(/\/$/, "")) {
+      console.warn(`[DockerExecutor] Invalid or unsafe PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME=${configuredContainerHome}; using ${containerCodexHome}.`);
     }
-    let containerCodexHome = (process.env.PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME || "/root/.codex").trim();
-    if (!containerCodexHome.startsWith("/")) {
-      console.warn(`[DockerExecutor] Invalid PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME=${containerCodexHome}; expected absolute path. Using /root/.codex.`);
-      containerCodexHome = "/root/.codex";
-    }
-    const dockerHostPath = this.toDockerPath(hostCodexHome);
-    console.log(`[DockerExecutor] Mounting Codex auth directory for openai_codex: ${hostCodexHome} -> ${containerCodexHome}`);
-    return [
-      "-v",
-      `${dockerHostPath}:${containerCodexHome}`,
+    const args = [
+      "--mount",
+      `type=volume,source=${this.codexVolumeName},target=${containerCodexHome}`,
       "-e",
       `CODEX_HOME=${containerCodexHome}`
     ];
+    const hostAuthPath = resolve11(hostCodexHome, "auth.json");
+    if (!existsSync10(hostAuthPath)) {
+      console.warn(`[DockerExecutor] Host Codex auth file not found at ${hostAuthPath}; preserving any auth already stored in ${this.codexVolumeName}.`);
+      return { args, containerHome: containerCodexHome, hostAuthMounted: false };
+    }
+    const dockerHostPath = this.toDockerPath(hostAuthPath);
+    console.log(`[DockerExecutor] Mounting host Codex auth file read-only and isolating Linux state in volume ${this.codexVolumeName}.`);
+    args.push("--mount", `type=bind,src=${dockerHostPath},dst=${WORKERPAL_HOST_CODEX_AUTH_PATH},readonly`);
+    return { args, containerHome: containerCodexHome, hostAuthMounted: true };
   }
   async ensureWarmContainer() {
     const inspect = Bun.spawn([

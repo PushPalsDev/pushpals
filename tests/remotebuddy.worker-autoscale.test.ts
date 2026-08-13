@@ -76,7 +76,7 @@ function createOrchestrator(root: string, fetchImpl?: typeof fetch): RemoteBuddy
     join(root, "outputs", "data", "remotebuddy-autoscale.db"),
   );
   openStores.push(idempotency);
-  return new RemoteBuddyOrchestrator({
+  const orchestrator = new RemoteBuddyOrchestrator({
     server: "http://127.0.0.1:3001",
     sessionId: "dev",
     authToken: null,
@@ -89,6 +89,11 @@ function createOrchestrator(root: string, fetchImpl?: typeof fetch): RemoteBuddy
     jobsDbPath: join(root, "outputs", "data", "pushpals.db"),
     fetchImpl,
   });
+  // These tests replace spawnWorker with deterministic fixtures. Keep the
+  // scheduler under test independent of host-specific standalone launch assets.
+  (orchestrator as any).autoSpawnWorkers = true;
+  (orchestrator as any).workerpalsUnavailableReason = null;
+  return orchestrator;
 }
 
 describe("RemoteBuddy worker autoscaling", () => {

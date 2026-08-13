@@ -53,6 +53,15 @@ only a symlink to that container-native projection, so dependency preparation
 does not recursively copy `node_modules` through the host filesystem. Progress
 is streamed as `DependencyPreparation` phase telemetry and is bounded by
 `workerpals.dependency_preparation_timeout_ms` (five minutes by default).
+The preparation and validation paths share one fingerprint version keyed by
+Bun, dependency manifests, platform, and workspace identity, preventing a valid
+Linux projection from being discarded and reinstalled during quality checks.
+
+OpenAI Codex workers also keep Linux-specific state in a per-worker named
+volume. Only the host `auth.json` is mounted read-only and copied when its hash
+changes; Windows caches, sessions, and executable state are never projected
+into the Linux container. Runtime upgrades clear version-specific state while
+preserving refreshed credentials.
 
 This provides:
 
@@ -70,8 +79,10 @@ This provides:
 - output compaction and structured result handling.
 
 An environment-blocked required validation gate is not treated as a code
-revision request. WorkerPals retains a publishable candidate commit under its
-internal ref and hands the exact blocked commands to SourceControlManager.
+revision request by itself. Scope checks and the critic still run first, using
+the same rubric and pass threshold as the final ReviewAgent. Only a candidate
+that clears those gates is retained under its internal ref and handed to
+SourceControlManager with the exact blocked commands.
 SourceControlManager applies the candidate to its temporary publication branch,
 runs those commands on the trusted host without a shell, and only continues to
 merge or PR publication after they pass. A failed trusted check retains the

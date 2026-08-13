@@ -65,3 +65,4 @@ Constraints:
 - If all signals are low/noisy, it is valid to return zero candidates.
 - Treat a low `sig_queue_health` value as maintenance-window evidence for safe proactive work, not only incident response.
 - `expected_validation` commands should use repo-native commands from `vision.key_items.testing_criteria` or local package scripts. Do not rewrite explicit testing criteria to another package manager.
+- Treat `snapshot.open_objectives`, `snapshot.recent_objectives`, and `snapshot.excluded_target_paths` as hard target exclusions. Do not propose the same file, directory, or equivalent work under different wording. Choose another component or return zero candidates when no genuinely distinct work remains.

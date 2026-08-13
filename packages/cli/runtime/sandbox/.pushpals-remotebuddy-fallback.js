@@ -4702,6 +4702,7 @@ function classifyAutonomyCandidateWork(candidate) {
     workKind,
     areaKey,
     targetKey,
+    targetPaths: targetKeyPaths,
     paths
   };
 }
@@ -4723,13 +4724,15 @@ function filterCandidatesForWorkDiversity(params) {
       continue;
     activeTestTargetCounts.set(profile.targetKey, (activeTestTargetCounts.get(profile.targetKey) ?? 0) + 1);
   }
-  const recentTargetKeys = new Set((params.recentObjectives ?? []).filter((objective) => isRecentWorkDiversityObjective(objective)).map((objective) => classifyAutonomyCandidateWork(objective).targetKey).filter(Boolean));
+  const recentProfiles = (params.recentObjectives ?? []).filter((objective) => isRecentWorkDiversityObjective(objective)).map((objective) => classifyAutonomyCandidateWork(objective));
+  const recentTargetKeys = new Set(recentProfiles.map((profile) => profile.targetKey).filter(Boolean));
   const keptRows = [];
   const rejected = [];
   const activeOrSelectedTestTargets = new Set(activeTestTargetCounts.keys());
   for (const row of rows) {
     const profile = profiles.get(row) ?? classifyAutonomyCandidateWork(row.candidate);
-    if (recentTargetKeys.has(profile.targetKey)) {
+    const overlappingRecentTarget = recentProfiles.find((recentProfile) => profile.targetPaths.some((candidateTarget) => recentProfile.targetPaths.some((recentTarget) => workPathsOverlap(candidateTarget, recentTarget))));
+    if (recentTargetKeys.has(profile.targetKey) || overlappingRecentTarget) {
       const reason = `work_diversity_target_recent:${profile.targetKey}`;
       rejected.push({ id: profile.id, reason, profile });
       continue;
@@ -7220,6 +7223,9 @@ class RemoteBuddyAutonomousEngine {
     const codexTimeoutMs2 = Math.max(configuredTimeoutMs, this.llmCfg.codexTimeoutMs || 0);
     return Math.min(codexTimeoutMs2, Math.max(configuredTimeoutMs, 90000));
   }
+  ideationRetryTimeoutMs() {
+    return Math.max(1000, Math.min(this.phaseTimeoutMs("ideation"), 30000));
+  }
   consumeIdeationTimeoutRecovery() {
     const recovery = this.pendingIdeationTimeoutRecovery;
     this.pendingIdeationTimeoutRecovery = null;
@@ -7578,8 +7584,9 @@ class RemoteBuddyAutonomousEngine {
       })
     }).catch(() => {});
   }
-  async llmPhase(phase, runId, snapshotId, input, objectiveId) {
-    const timeoutMs = this.phaseTimeoutMs(phase);
+  async llmPhase(phase, runId, snapshotId, input, objectiveId, timeoutOverrideMs) {
+    const phaseTimeoutMs = this.phaseTimeoutMs(phase);
+    const timeoutMs = Number.isFinite(timeoutOverrideMs) ? Math.max(1000, Math.min(phaseTimeoutMs, Math.floor(timeoutOverrideMs))) : phaseTimeoutMs;
     const requestPayload = {
       phase,
       system: input.system,
@@ -7665,6 +7672,7 @@ ${JSON.stringify(input.messages ?? [])}`),
     if (!this.runtimeEnabled)
       return null;
     const canonicalInstruction = canonicalizeInstructionTextForBun(instruction);
+    const reservationRequired = autonomy.reservationRequired !== false;
     const res = await fetch(`${this.server}/requests/enqueue`, {
       method: "POST",
       headers: this.headers(),
@@ -7674,6 +7682,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         priority: "background",
         forceWorker: true,
         forceLane: "worker",
+        ...reservationRequired ? { idempotencyKey: `autonomy:${autonomy.objectiveId}` } : {},
         metadata: {
           origin: "autonomy",
           autonomy: {
@@ -7683,7 +7692,8 @@ ${JSON.stringify(input.messages ?? [])}`),
             patternKey: autonomy.patternKey,
             componentArea: autonomy.componentArea,
             targetPaths: autonomy.targetPaths,
-            writeGlobs: autonomy.writeGlobs
+            writeGlobs: autonomy.writeGlobs,
+            reservationRequired
           }
         }
       })
@@ -7898,6 +7908,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           scope: topCandidate.scope,
           confidence: topCandidate.confidence,
           risk_level: topCandidate.risk_level,
+          expected_validation: topCandidate.expected_validation,
           status: "stale",
           block_reason: "snapshot_expired"
         }
@@ -7937,6 +7948,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         component_area: candidate.component_area,
         pattern_key: patternKey,
         confidence: candidate.confidence,
+        target_paths: candidate.target_paths,
         required_validation_repair: true
       }
     ]);
@@ -7994,6 +8006,53 @@ ${JSON.stringify(input.messages ?? [])}`),
       };
     }
     const instruction = validationRepairInstruction(candidate, incident);
+    this.setPhase("reserve_validation_repair_objective");
+    const reservationRecorded = await this.postObjective({
+      runId: params.runId,
+      snapshotId: params.snapshot.snapshot_id,
+      sessionId: this.sessionId,
+      candidates: [
+        validationRepairCandidatePayload({
+          candidate,
+          patternKey,
+          selected: true,
+          gateDecision: "approved"
+        })
+      ],
+      objective: {
+        id: objectiveId,
+        candidate_id: candidate.id,
+        title: candidate.title,
+        instruction,
+        objective_type: candidate.objective_type,
+        component_area: candidate.component_area,
+        trigger_type: candidate.trigger_type,
+        target_paths: candidate.target_paths,
+        scope: candidate.scope,
+        confidence: candidate.confidence,
+        risk_level: candidate.risk_level,
+        expected_validation: candidate.expected_validation,
+        status: "gated",
+        required_validation_repair: true,
+        evidence: { validation_incident: incident },
+        score_breakdown: {
+          llm_score: 1,
+          impact_signal: 1,
+          penalties: [],
+          final_score: 1,
+          selection_strategy: "validation_incident_repair",
+          selection_roll: null
+        }
+      },
+      llmCalls: []
+    });
+    if (!reservationRecorded) {
+      return {
+        handled: true,
+        outcome: "failed",
+        detail: "validation_repair_reservation_failed"
+      };
+    }
     this.setPhase("enqueue_validation_repair");
     const requestId = await this.enqueueSyntheticRequest(instruction, {
       objectiveId,
@@ -8038,49 +8097,6 @@ ${JSON.stringify(input.messages ?? [])}`),
       });
       return { handled: true, outcome: "failed", detail: "validation_repair_enqueue_failed" };
     }
-    this.setPhase("record_validation_repair_objective");
-    await this.postObjective({
-      runId: params.runId,
-      snapshotId: params.snapshot.snapshot_id,
-      sessionId: this.sessionId,
-      candidates: [
-        validationRepairCandidatePayload({
-          candidate,
-          patternKey,
-          selected: true,
-          gateDecision: "approved"
-        })
-      ],
-      objective: {
-        id: objectiveId,
-        candidate_id: candidate.id,
-        title: candidate.title,
-        instruction,
-        objective_type: candidate.objective_type,
-        component_area: candidate.component_area,
-        trigger_type: candidate.trigger_type,
-        target_paths: candidate.target_paths,
-        scope: candidate.scope,
-        confidence: candidate.confidence,
-        risk_level: candidate.risk_level,
-        expected_validation: candidate.expected_validation,
-        status: "dispatched",
-        request_id: requestId,
-        required_validation_repair: true,
-        evidence: {
-          validation_incident: incident
-        },
-        score_breakdown: {
-          llm_score: 1,
-          impact_signal: 1,
-          penalties: [],
-          final_score: 1,
-          selection_strategy: "validation_incident_repair",
-          selection_roll: null
-        }
-      },
-      llmCalls: []
-    });
     console.log(`[RemoteBuddyAutonomousEngine] tick ${params.runId}: dispatched validation repair ${requestId} for ${asString2(incident.command)}.`);
     return {
       handled: true,
@@ -8240,8 +8256,14 @@ ${JSON.stringify(input.messages ?? [])}`),
         const ideationFeedbackPriors = snapshot.feedback_priors.slice(0, reduced ? 4 : 8);
         const ideationEngineIdeaPriors = (snapshot.engine_idea_priors ?? []).slice(0, reduced ? 4 : 8);
         const ideationOpenObjectives = snapshot.open_objectives.slice(0, reduced ? 4 : 8);
+        const ideationRecentObjectives = (snapshot.recent_objectives ?? []).slice(0, reduced ? 6 : 12);
         const ideationActiveCooldowns = snapshot.active_cooldowns.slice(0, reduced ? 4 : 8);
-        const ideationRepoTargets = repoTargets.slice(0, reduced ? 4 : 8);
+        const excludedTargetPaths = uniqueWorkPaths([...ideationOpenObjectives, ...ideationRecentObjectives].flatMap((objective) => classifyAutonomyCandidateWork(objective).targetPaths));
+        const alternativeRepoTargets = repoTargets.filter((target) => {
+          const targetPaths = uniqueWorkPaths([...target.target_paths, ...target.write_globs]);
+          return !targetPaths.some((targetPath) => excludedTargetPaths.some((excludedPath) => workPathsOverlap(targetPath, excludedPath)));
+        });
+        const ideationRepoTargets = (alternativeRepoTargets.length > 0 ? alternativeRepoTargets : repoTargets).slice(0, reduced ? 4 : 8);
         return {
           system: IDEATION_SYSTEM_PROMPT,
           json: true,
@@ -8251,7 +8273,7 @@ ${JSON.stringify(input.messages ?? [])}`),
             ...ideationRecovery2 ? [
               {
                 role: "user",
-                content: `${IDEATION_TIMEOUT_RECOVERY_INSTRUCTION} Previous timed-out run: ${ideationRecovery2.previousRunId}. Timeout budget for this round: ${this.phaseTimeoutMs("ideation")}ms.`
+                content: `${IDEATION_TIMEOUT_RECOVERY_INSTRUCTION} Previous timed-out run: ${ideationRecovery2.previousRunId}. Timeout budget for this round: ${this.ideationRetryTimeoutMs()}ms.`
               }
             ] : [],
             {
@@ -8264,7 +8286,9 @@ ${JSON.stringify(input.messages ?? [])}`),
                   feedback_priors: ideationFeedbackPriors,
                   engine_idea_priors: ideationEngineIdeaPriors,
                   open_objectives: ideationOpenObjectives,
-                  active_cooldowns: ideationActiveCooldowns
+                  recent_objectives: ideationRecentObjectives,
+                  active_cooldowns: ideationActiveCooldowns,
+                  excluded_target_paths: excludedTargetPaths.slice(0, reduced ? 12 : 24)
                 },
                 vision: compactVisionContextForIdeationRetry(visionContext),
                 repo_targets: ideationRepoTargets.map((target) => ({
@@ -8290,7 +8314,7 @@ ${JSON.stringify(input.messages ?? [])}`),
       }
       let ideationPhase;
       try {
-        ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, buildIdeationInput(ideationRecovery, Boolean(ideationRecovery)));
+        ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, buildIdeationInput(ideationRecovery, Boolean(ideationRecovery)), undefined, ideationRecovery ? this.ideationRetryTimeoutMs() : undefined);
       } catch (error) {
         if (error instanceof Error && error.message === "autonomy ideation phase timeout" && !ideationRecovery) {
           ideationRecovery = {
@@ -8300,7 +8324,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           };
           this.pendingIdeationTimeoutRecovery = null;
           console.warn(`[RemoteBuddyAutonomousEngine] tick ${runId}: ideation timed out; retrying once immediately with reduced context and budget-focused guidance.`);
-          ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, buildIdeationInput(ideationRecovery, true));
+          ideationPhase = await this.llmPhase("ideation", runId, snapshot.snapshot_id, buildIdeationInput(ideationRecovery, true), undefined, this.ideationRetryTimeoutMs());
           this.pendingIdeationTimeoutRecovery = null;
         } else {
           throw error;
@@ -8316,7 +8340,9 @@ ${JSON.stringify(input.messages ?? [])}`),
       }
       let rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
       let rawCandidatesSource = "llm";
+      let deterministicFallbackAttempted = false;
       if (rawCandidates.length === 0) {
+        deterministicFallbackAttempted = true;
         const repoSynthesized = buildRepoVisionFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
@@ -8445,7 +8471,8 @@ ${JSON.stringify(input.messages ?? [])}`),
         }
       };
       ingestRawCandidates(rawCandidates, rawCandidatesSource);
-      if (normalizedCandidates.length === 0) {
+      if (normalizedCandidates.length === 0 && !deterministicFallbackAttempted) {
+        deterministicFallbackAttempted = true;
         const repoSynthesizedFallback = buildRepoVisionFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: snapshot.top_signals,
@@ -8465,6 +8492,44 @@ ${JSON.stringify(input.messages ?? [])}`),
           ingestRawCandidates(synthesizedFallback, repoSynthesizedFallback.length > 0 ? "repo_vision_fallback" : "engine_fallback");
         }
       }
+      let preScoringDiversity = filterCandidatesForWorkDiversity({
+        rows: normalizedCandidates.map((candidate) => ({ candidate })),
+        openObjectives: snapshot.open_objectives,
+        recentObjectives: snapshot.recent_objectives
+      });
+      if (preScoringDiversity.rows.length === 0 && !deterministicFallbackAttempted) {
+        deterministicFallbackAttempted = true;
+        const beforeFallbackCount = normalizedCandidates.length;
+        const repoFallback = buildRepoVisionFallbackCandidates({
+          engineInspiration,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: visionContext.section_numbers,
+          maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+          repoTargets
+        });
+        const deterministicFallback = repoFallback.length > 0 ? repoFallback : buildEngineFallbackCandidates({
+          engineInspiration,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: visionContext.section_numbers,
+          maxCandidates: Math.max(1, Math.min(3, this.cfg.topK)),
+          repoRoot: this.autonomyRepo,
+          repoTargets
+        });
+        if (deterministicFallback.length > 0) {
+          ingestRawCandidates(deterministicFallback, repoFallback.length > 0 ? "repo_vision_fallback" : "engine_fallback");
+          const fallbackDiversity = filterCandidatesForWorkDiversity({
+            rows: normalizedCandidates.slice(beforeFallbackCount).map((candidate) => ({ candidate })),
+            openObjectives: snapshot.open_objectives,
+            recentObjectives: snapshot.recent_objectives
+          });
+          preScoringDiversity = {
+            rows: fallbackDiversity.rows,
+            rejected: [...preScoringDiversity.rejected, ...fallbackDiversity.rejected]
+          };
+        }
+      }
+      const scoringCandidates = preScoringDiversity.rows.map((row) => row.candidate);
+      const preScoringRejectionById = new Map(preScoringDiversity.rejected.map((rejection) => [rejection.id, rejection.reason]));
       candidatesPayload = normalizedCandidates.map((candidate) => ({
         id: candidate.id,
         title: candidate.title,
@@ -8483,15 +8548,17 @@ ${JSON.stringify(input.messages ?? [])}`),
         vision_section_refs: candidate.vision_section_refs,
         feature_hypotheses: candidate.feature_hypotheses,
         ...candidate.engine_trial ? { engine_trial: candidate.engine_trial } : {},
-        gate_decision: "proposed",
-        gate_reasons: [],
+        gate_decision: preScoringRejectionById.has(candidate.id) ? "rejected" : "proposed",
+        gate_reasons: preScoringRejectionById.has(candidate.id) ? [preScoringRejectionById.get(candidate.id)] : [],
+        rejection_reason: preScoringRejectionById.get(candidate.id) ?? null,
+        selected: false,
         candidate_created_at: candidate.candidate_created_at
       }));
-      if (normalizedCandidates.length === 0) {
+      if (scoringCandidates.length === 0) {
         const dropReasons = Object.fromEntries([...dropReasonCounts.entries()].sort(([a], [b]) => a.localeCompare(b)));
         const topSignals = snapshot.top_signals.slice(0, 3).map((signal) => `${signal.signal_id}:${Number(signal.value ?? 0).toFixed(2)}`).join(", ");
         const parseHint = rawCandidates.length === 0 && Object.keys(ideationJson).length === 0 ? " (ideation returned empty or non-parseable JSON)" : "";
-        console.log(`[RemoteBuddyAutonomousEngine] tick produced no eligible candidates: raw=${rawCandidates.length} normalized=0 drop_reasons=${JSON.stringify(dropReasons)} top_signals=${topSignals || "none"}${parseHint}`);
+        console.log(`[RemoteBuddyAutonomousEngine] tick produced no eligible candidates: raw=${rawCandidates.length} normalized=${normalizedCandidates.length} distinct=0 drop_reasons=${JSON.stringify(dropReasons)} top_signals=${topSignals || "none"}${parseHint}`);
         this.setPhase("record_no_candidate_objective");
         await this.postObjective({
           runId,
@@ -8525,7 +8592,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           messages: [
             {
               role: "user",
-              content: JSON.stringify({ candidates: normalizedCandidates, top_k: this.cfg.topK })
+              content: JSON.stringify({ candidates: scoringCandidates, top_k: this.cfg.topK })
             }
           ]
         });
@@ -8552,7 +8619,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           continue;
         scoreById.set(id, clamp012(asNumber(s.llm_score, 0)));
       }
-      const scored = normalizedCandidates.map((candidate) => {
+      const scored = scoringCandidates.map((candidate) => {
         const llmScore = scoreById.get(candidate.id) ?? 0;
         const scoredCandidate = this.scoreCandidate(snapshot, candidate, llmScore);
         return { candidate, llmScore, ...scoredCandidate };
@@ -8578,7 +8645,8 @@ ${JSON.stringify(input.messages ?? [])}`),
         objective_type: row.candidate.objective_type,
         component_area: row.candidate.component_area,
         pattern_key: row.patternKey,
-        confidence: row.candidate.confidence
+        confidence: row.candidate.confidence,
+        target_paths: row.candidate.target_paths
       })));
       const rankedWithEligibility = scored.map((row) => ({
         ...row,
@@ -8587,59 +8655,63 @@ ${JSON.stringify(input.messages ?? [])}`),
           reason: "eligibility_unavailable"
         }
       }));
-      candidatesPayload = rankedWithEligibility.map((row) => {
-        const workProfile = classifyAutonomyCandidateWork(row.candidate);
-        return {
-          id: row.candidate.id,
-          title: row.candidate.title,
-          objective_type: row.candidate.objective_type,
-          problem_statement: row.candidate.problem_statement,
-          trigger_type: row.candidate.trigger_type,
-          component_area: row.candidate.component_area,
-          target_paths: row.candidate.target_paths,
-          scope: row.candidate.scope,
-          work_kind: workProfile.workKind,
-          work_area_key: workProfile.areaKey,
-          work_target_key: workProfile.targetKey,
-          risk_level: row.candidate.risk_level,
-          expected_validation: row.candidate.expected_validation,
-          estimated_effort: row.candidate.estimated_effort,
-          why_now_signal_ids: row.candidate.why_now_signal_ids,
-          confidence: row.candidate.confidence,
-          vision_alignment_reason: row.candidate.vision_alignment_reason,
-          vision_section_refs: row.candidate.vision_section_refs,
-          feature_hypotheses: row.candidate.feature_hypotheses,
-          ...row.candidate.engine_trial ? { engine_trial: row.candidate.engine_trial } : {},
-          llm_score: row.llmScore,
-          impact_signal: row.impactSignal,
-          ema_success: row.emaSuccess,
-          ema_user_accept: row.emaUserAccept,
-          engine_idea_prior_score: row.engineIdeaPriorScore,
-          engine_idea_novelty_score: row.engineIdeaNoveltyScore,
-          engine_idea_novelty_bonus: row.engineIdeaNoveltyBonus,
-          engine_idea_sample_count: row.engineIdeaSampleCount,
-          engine_source_prior_score: row.engineSourcePriorScore,
-          engine_source_novelty_score: row.engineSourceNoveltyScore,
-          engine_source_novelty_bonus: row.engineSourceNoveltyBonus,
-          engine_source_sample_count: row.engineSourceSampleCount,
-          engine_source_trust_score: row.engineSourceTrustScore,
-          engine_source_freshness_score: row.engineSourceFreshnessScore,
-          engine_source_curation_status: row.engineSourceCurationStatus,
-          engine_source_curation_reason: row.engineSourceCurationReason,
-          engine_source_trust_boost: row.engineSourceTrustBoost,
-          explore_rate_configured: adaptiveExplore.baseRate,
-          effective_explore_rate: adaptiveExplore.effectiveRate,
-          explore_rate_adjustment: adaptiveExplore.adjustment,
-          penalties: row.penalties,
-          final_score: row.finalScore,
-          gate_decision: row.eligibility.ok ? "approved" : "rejected",
-          gate_reasons: row.eligibility.ok ? [] : [row.eligibility.reason],
-          selected: false,
-          selection_strategy: "not_selected",
-          selection_roll: null,
-          candidate_created_at: row.candidate.candidate_created_at
-        };
-      });
+      const preScoringRejectedPayloads = candidatesPayload.filter((row) => asString2(row.gate_decision) === "rejected");
+      candidatesPayload = [
+        ...preScoringRejectedPayloads,
+        ...rankedWithEligibility.map((row) => {
+          const workProfile = classifyAutonomyCandidateWork(row.candidate);
+          return {
+            id: row.candidate.id,
+            title: row.candidate.title,
+            objective_type: row.candidate.objective_type,
+            problem_statement: row.candidate.problem_statement,
+            trigger_type: row.candidate.trigger_type,
+            component_area: row.candidate.component_area,
+            target_paths: row.candidate.target_paths,
+            scope: row.candidate.scope,
+            work_kind: workProfile.workKind,
+            work_area_key: workProfile.areaKey,
+            work_target_key: workProfile.targetKey,
+            risk_level: row.candidate.risk_level,
+            expected_validation: row.candidate.expected_validation,
+            estimated_effort: row.candidate.estimated_effort,
+            why_now_signal_ids: row.candidate.why_now_signal_ids,
+            confidence: row.candidate.confidence,
+            vision_alignment_reason: row.candidate.vision_alignment_reason,
+            vision_section_refs: row.candidate.vision_section_refs,
+            feature_hypotheses: row.candidate.feature_hypotheses,
+            ...row.candidate.engine_trial ? { engine_trial: row.candidate.engine_trial } : {},
+            llm_score: row.llmScore,
+            impact_signal: row.impactSignal,
+            ema_success: row.emaSuccess,
+            ema_user_accept: row.emaUserAccept,
+            engine_idea_prior_score: row.engineIdeaPriorScore,
+            engine_idea_novelty_score: row.engineIdeaNoveltyScore,
+            engine_idea_novelty_bonus: row.engineIdeaNoveltyBonus,
+            engine_idea_sample_count: row.engineIdeaSampleCount,
+            engine_source_prior_score: row.engineSourcePriorScore,
+            engine_source_novelty_score: row.engineSourceNoveltyScore,
+            engine_source_novelty_bonus: row.engineSourceNoveltyBonus,
+            engine_source_sample_count: row.engineSourceSampleCount,
+            engine_source_trust_score: row.engineSourceTrustScore,
+            engine_source_freshness_score: row.engineSourceFreshnessScore,
+            engine_source_curation_status: row.engineSourceCurationStatus,
+            engine_source_curation_reason: row.engineSourceCurationReason,
+            engine_source_trust_boost: row.engineSourceTrustBoost,
+            explore_rate_configured: adaptiveExplore.baseRate,
+            effective_explore_rate: adaptiveExplore.effectiveRate,
+            explore_rate_adjustment: adaptiveExplore.adjustment,
+            penalties: row.penalties,
+            final_score: row.finalScore,
+            gate_decision: row.eligibility.ok ? "approved" : "rejected",
+            gate_reasons: row.eligibility.ok ? [] : [row.eligibility.reason],
+            selected: false,
+            selection_strategy: "not_selected",
+            selection_roll: null,
+            candidate_created_at: row.candidate.candidate_created_at
+          };
+        })
+      ];
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
         this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(runId, snapshot.snapshot_id, llmCalls, candidatesPayload);
@@ -8726,12 +8798,14 @@ ${JSON.stringify(input.messages ?? [])}`),
         effective_explore_rate: adaptiveExplore.effectiveRate
       };
       for (const row of candidatesPayload) {
-        const isSelected = Boolean(row.id === selectedCandidatePayload.id);
+        const isSelected = Boolean(selected && row.id === selectedCandidatePayload.id);
         row.selected = isSelected;
         row.selection_strategy = isSelected && selected ? selectedStrategy : "not_selected";
         row.selection_roll = isSelected ? selection.roll : null;
       }
       if (!selected) {
+        const topCandidatePayload = candidatesPayload.find((row) => asString2(row.id) === top.candidate.id);
+        const rejectionReason = asString2(topCandidatePayload?.rejection_reason) || asStringArray2(topCandidatePayload?.gate_reasons)[0] || top.eligibility.reason || "no eligible candidate";
         this.setPhase("record_rejected_objective");
         await this.postObjective({
           runId,
@@ -8750,8 +8824,9 @@ ${JSON.stringify(input.messages ?? [])}`),
             scope: top.candidate.scope,
             confidence: top.candidate.confidence,
             risk_level: top.candidate.risk_level,
+            expected_validation: top.candidate.expected_validation,
             status: "rejected",
-            block_reason: top.eligibility.reason ?? "no eligible candidate",
+            block_reason: rejectionReason,
             score_breakdown: {
               llm_score: top.llmScore,
               impact_signal: top.impactSignal,
@@ -8803,6 +8878,7 @@ ${JSON.stringify(input.messages ?? [])}`),
             scope: selected.candidate.scope,
             confidence: selected.candidate.confidence,
             risk_level: selected.candidate.risk_level,
+            expected_validation: selected.candidate.expected_validation,
             status: "blocked",
             block_reason: "requires_user_input",
             score_breakdown: {
@@ -8884,6 +8960,60 @@ Scope:
         console.warn(`[RemoteBuddyAutonomousEngine] replacing autonomy instruction for ${selected.candidate.id}: planner output contained PushPals-internal wording.`);
         instruction = canonicalizeInstructionTextForBun(buildRepoNativeFallbackInstruction(selected.candidate));
       }
+      const selectedScoreBreakdown = {
+        llm_score: selected.llmScore,
+        impact_signal: selected.impactSignal,
+        penalties: selected.penalties,
+        ema_success: selected.emaSuccess,
+        ema_user_accept: selected.emaUserAccept,
+        engine_idea_prior_score: selected.engineIdeaPriorScore,
+        engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
+        engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
+        engine_idea_sample_count: selected.engineIdeaSampleCount,
+        engine_source_prior_score: selected.engineSourcePriorScore,
+        engine_source_novelty_score: selected.engineSourceNoveltyScore,
+        engine_source_novelty_bonus: selected.engineSourceNoveltyBonus,
+        engine_source_sample_count: selected.engineSourceSampleCount,
+        engine_source_trust_score: selected.engineSourceTrustScore,
+        engine_source_freshness_score: selected.engineSourceFreshnessScore,
+        engine_source_curation_status: selected.engineSourceCurationStatus,
+        engine_source_curation_reason: selected.engineSourceCurationReason,
+        engine_source_trust_boost: selected.engineSourceTrustBoost,
+        explore_rate_configured: adaptiveExplore.baseRate,
+        effective_explore_rate: adaptiveExplore.effectiveRate,
+        explore_rate_adjustment: adaptiveExplore.adjustment,
+        final_score: selected.finalScore,
+        selection_strategy: selectedStrategy,
+        selection_roll: selection.roll
+      };
+      this.setPhase("reserve_objective");
+      const reservationRecorded = await this.postObjective({
+        runId,
+        snapshotId: snapshot.snapshot_id,
+        sessionId: this.sessionId,
+        candidates: candidatesPayload,
+        objective: {
+          id: objectiveId,
+          candidate_id: selected.candidate.id,
+          title: selected.candidate.title,
+          instruction,
+          objective_type: selected.candidate.objective_type,
+          component_area: selected.candidate.component_area,
+          trigger_type: selected.candidate.trigger_type,
+          target_paths: selected.candidate.target_paths,
+          scope: selected.candidate.scope,
+          confidence: selected.candidate.confidence,
+          risk_level: selected.candidate.risk_level,
+          expected_validation: selected.candidate.expected_validation,
+          status: "gated",
+          score_breakdown: selectedScoreBreakdown
+        },
+        llmCalls
+      });
+      if (!reservationRecorded) {
+        outcomeDetail = "objective_reservation_failed";
+        return;
+      }
       this.setPhase("enqueue_request");
       const requestId = await this.enqueueSyntheticRequest(instruction, {
         objectiveId,
@@ -8913,6 +9043,7 @@ Scope:
             scope: selected.candidate.scope,
             confidence: selected.candidate.confidence,
             risk_level: selected.candidate.risk_level,
+            expected_validation: selected.candidate.expected_validation,
             status: "failed",
             block_reason: "request_enqueue_failed"
           },
@@ -8921,55 +9052,6 @@ Scope:
         outcomeDetail = "request_enqueue_failed";
         return;
       }
-      this.setPhase("record_dispatched_objective");
-      await this.postObjective({
-        runId,
-        snapshotId: snapshot.snapshot_id,
-        sessionId: this.sessionId,
-        candidates: candidatesPayload,
-        objective: {
-          id: objectiveId,
-          candidate_id: selected.candidate.id,
-          title: selected.candidate.title,
-          instruction,
-          objective_type: selected.candidate.objective_type,
-          component_area: selected.candidate.component_area,
-          trigger_type: selected.candidate.trigger_type,
-          target_paths: selected.candidate.target_paths,
-          scope: selected.candidate.scope,
-          confidence: selected.candidate.confidence,
-          risk_level: selected.candidate.risk_level,
-          status: "dispatched",
-          request_id: requestId,
-          score_breakdown: {
-            llm_score: selected.llmScore,
-            impact_signal: selected.impactSignal,
-            penalties: selected.penalties,
-            ema_success: selected.emaSuccess,
-            ema_user_accept: selected.emaUserAccept,
-            engine_idea_prior_score: selected.engineIdeaPriorScore,
-            engine_idea_novelty_score: selected.engineIdeaNoveltyScore,
-            engine_idea_novelty_bonus: selected.engineIdeaNoveltyBonus,
-            engine_idea_sample_count: selected.engineIdeaSampleCount,
-            engine_source_prior_score: selected.engineSourcePriorScore,
-            engine_source_novelty_score: selected.engineSourceNoveltyScore,
-            engine_source_novelty_bonus: selected.engineSourceNoveltyBonus,
-            engine_source_sample_count: selected.engineSourceSampleCount,
-            engine_source_trust_score: selected.engineSourceTrustScore,
-            engine_source_freshness_score: selected.engineSourceFreshnessScore,
-            engine_source_curation_status: selected.engineSourceCurationStatus,
-            engine_source_curation_reason: selected.engineSourceCurationReason,
-            engine_source_trust_boost: selected.engineSourceTrustBoost,
-            explore_rate_configured: adaptiveExplore.baseRate,
-            effective_explore_rate: adaptiveExplore.effectiveRate,
-            explore_rate_adjustment: adaptiveExplore.adjustment,
-            final_score: selected.finalScore,
-            selection_strategy: selectedStrategy,
-            selection_roll: selection.roll
-          }
-        },
-        llmCalls
-      });
       outcome = "success";
       outcomeDetail = `dispatched_request_${requestId.slice(0, 8)}`;
     } catch (error) {
@@ -9001,7 +9083,8 @@ Scope:
       patternKey,
       componentArea: autonomyCtx.componentArea ?? "shared",
       targetPaths: autonomyCtx.targetPaths,
-      writeGlobs: autonomyCtx.writeGlobs
+      writeGlobs: autonomyCtx.writeGlobs,
+      reservationRequired: false
     });
   }
   start() {

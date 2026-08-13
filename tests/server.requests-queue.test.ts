@@ -122,6 +122,7 @@ describe("server RequestQueue", () => {
           objectiveId: "obj_123",
           runId: "run_123",
           snapshotId: "snap_123",
+          reservationRequired: true,
           componentArea: "tests/integration",
           targetPaths: ["tests/integration/test_workerpals_e2e.py"],
           writeGlobs: ["tests/integration/*.py"],
@@ -136,6 +137,7 @@ describe("server RequestQueue", () => {
     expect(metadata.origin).toBe("autonomy");
     expect(Array.isArray(autonomy.writeGlobs)).toBe(true);
     expect((autonomy.writeGlobs as string[])[0]).toBe("tests/integration/*.py");
+    expect(autonomy.reservationRequired).toBe(true);
     queue.close();
   });
 

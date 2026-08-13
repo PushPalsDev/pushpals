@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  canReturnTrustedEnvironmentValidationHandoff,
   buildBrowserValidationRepairPacket,
   buildCriticDiffText,
   browserValidationRepairContinuationBudgetDecision,
@@ -19,6 +20,7 @@ import {
   knownFailureHintsForPacket,
   knownValidationRemedyHintsForRuns,
   inScopeValidationRepairContinuationBudgetDecision,
+  isolatePureEnvironmentValidationDeferral,
   publishableChangedPaths,
   qualityRevisionBudgetDecision,
   qualityRevisionLoopUpperBound,
@@ -51,6 +53,160 @@ function runGit(cwd: string, args: string[]): void {
 }
 
 describe("workerpals quality gate critic issue formatting", () => {
+  test("isolates pure environment failures from critic and revision inputs", () => {
+    const result = isolatePureEnvironmentValidationDeferral({
+      ok: false,
+      skipped: false,
+      issues: [
+        "ScopeGate: acceptance criterion is not covered.",
+        "ValidationGate: Required vision.md validation failed: bun run validate exited 1",
+      ],
+      scopeIssues: ["acceptance criterion is not covered."],
+      validationIssues: ["Required vision.md validation failed: bun run validate exited 1"],
+      changedPaths: ["src/example.ts"],
+      changedTestPaths: [],
+      validationRuns: [
+        {
+          step: "bun test focused.test.ts",
+          command: "bun test focused.test.ts",
+          ok: true,
+          exitCode: 0,
+          stdout: "1 pass",
+          stderr: "",
+          elapsedMs: 10,
+        },
+        {
+          step: "bun run validate",
+          command: "bun run validate",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+          elapsedMs: 20,
+        },
+      ],
+      requiredValidationFailures: ["bun run validate exited 1"],
+      blocker: { category: "environment", detail: "Docker is unavailable" },
+      validationFailureScope: "outside_task_scope",
+    });
+
+    expect(result.pureEnvironmentDeferral).toBe(true);
+    expect(result.blockedCommands).toEqual(["bun run validate"]);
+    expect(result.qualityForCritic.issues).toEqual([
+      "ScopeGate: acceptance criterion is not covered.",
+    ]);
+    expect(result.qualityForCritic.validationRuns.map((run) => run.command)).toEqual([
+      "bun test focused.test.ts",
+    ]);
+    expect(result.qualityForCritic.requiredValidationFailures).toEqual([]);
+    expect(result.qualityForCritic.blocker).toBeNull();
+    expect(result.qualityForCritic.validationFailureScope).toBe("none");
+  });
+
+  test("does not defer a mixed environment and assertion failure cluster", () => {
+    const environmentRun = {
+      step: "bun run validate",
+      command: "bun run validate",
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+      elapsedMs: 20,
+    };
+    const assertionRun = {
+      step: "bun test focused.test.ts",
+      command: "bun test focused.test.ts",
+      ok: false,
+      exitCode: 1,
+      stdout: "Expected 1 to be 2",
+      stderr: "1 test failed",
+      elapsedMs: 10,
+    };
+    const quality = {
+      ok: false,
+      skipped: false,
+      issues: ["ValidationGate: executed validation commands, but none passed."],
+      scopeIssues: [],
+      validationIssues: ["executed validation commands, but none passed."],
+      changedPaths: ["src/example.ts"],
+      changedTestPaths: ["focused.test.ts"],
+      validationRuns: [environmentRun, assertionRun],
+      requiredValidationFailures: ["bun run validate exited 1"],
+      blocker: { category: "environment" as const, detail: "Docker is unavailable" },
+      validationFailureScope: "task_scope" as const,
+    };
+
+    const result = isolatePureEnvironmentValidationDeferral(quality);
+    expect(result.pureEnvironmentDeferral).toBe(false);
+    expect(result.qualityForCritic).toBe(quality);
+  });
+
+  test("does not defer repository dependency failures", () => {
+    const quality = {
+      ok: false,
+      skipped: false,
+      issues: ["ValidationGate: executed validation commands, but none passed."],
+      scopeIssues: [],
+      validationIssues: ["executed validation commands, but none passed."],
+      changedPaths: ["src/example.ts"],
+      changedTestPaths: [],
+      validationRuns: [
+        {
+          step: "bun test",
+          command: "bun test",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr: "Cannot find module './missing.ts'",
+          elapsedMs: 10,
+        },
+      ],
+      requiredValidationFailures: ["bun test exited 1"],
+      blocker: { category: "repo" as const, detail: "missing imported file" },
+      validationFailureScope: "task_scope" as const,
+    };
+    expect(isolatePureEnvironmentValidationDeferral(quality).pureEnvironmentDeferral).toBe(false);
+  });
+
+  test("requires an enabled critic to meet the final threshold before environment handoff", () => {
+    expect(
+      canReturnTrustedEnvironmentValidationHandoff({
+        pureEnvironmentDeferral: true,
+        deterministicRequiresRevision: false,
+        criticGateEnabled: true,
+        criticScore: 8.4,
+        criticMinScore: 8.5,
+      }),
+    ).toBe(false);
+    expect(
+      canReturnTrustedEnvironmentValidationHandoff({
+        pureEnvironmentDeferral: true,
+        deterministicRequiresRevision: false,
+        criticGateEnabled: true,
+        criticScore: null,
+        criticMinScore: 8.5,
+      }),
+    ).toBe(false);
+    expect(
+      canReturnTrustedEnvironmentValidationHandoff({
+        pureEnvironmentDeferral: true,
+        deterministicRequiresRevision: false,
+        criticGateEnabled: true,
+        criticScore: 8.5,
+        criticMinScore: 8.5,
+      }),
+    ).toBe(true);
+    expect(
+      canReturnTrustedEnvironmentValidationHandoff({
+        pureEnvironmentDeferral: true,
+        deterministicRequiresRevision: true,
+        criticGateEnabled: false,
+        criticScore: null,
+        criticMinScore: 8.5,
+      }),
+    ).toBe(false);
+  });
+
   test("builds critic diff evidence for tracked and untracked changes", async () => {
     const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-critic-diff-"));
     try {

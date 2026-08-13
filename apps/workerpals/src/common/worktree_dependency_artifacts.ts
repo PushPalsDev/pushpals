@@ -18,6 +18,7 @@ export const DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS = ["node_modules"] as const;
 export const DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-dependency-snapshot";
 export const DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER =
   ".pushpals-validation-safe-dependency-snapshot";
+export const VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION = "container-volume-v1";
 
 export type DirectWorktreeDependencyArtifactResult = {
   linked: string[];

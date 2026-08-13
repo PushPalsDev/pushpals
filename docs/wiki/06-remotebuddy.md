@@ -107,6 +107,19 @@ pending jobs already need workers or the completion/finalization backlog is old
 or above publisher capacity. Once publication is healthy, a busy worker no
 longer blocks ideation by itself when another online worker is safely idle.
 
+Before scoring, autonomy removes candidates whose normalized targets overlap
+open or recently completed objectives. The same exclusions are included in the
+ideation prompt, so prompt variations cannot repeatedly spend scoring tokens on
+one file or directory. A timed-out ideation request receives one compact retry
+with a 30-second ceiling.
+
+Dispatch uses a durable two-step handoff: RemoteBuddy first persists a `gated`
+objective, then enqueues the request with the objective-derived idempotency key.
+The Server validates the reservation identity and owns the transition to
+`dispatched`. Startup and periodic stale-claim reconciliation link an already
+enqueued request or fail an orphaned reservation, preventing queue/objective
+split-brain after a process interruption.
+
 ## Config Knobs
 
 Primary knobs live in `configs/*.toml` under `[remotebuddy.memory]`:

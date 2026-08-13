@@ -73,6 +73,7 @@ import {
   resolveWorkerExecutionReadiness,
   resolveWorkerpalStartupReadinessProbeMaxMs,
   resolveWindowsNodeExtraCaCertsBundlePath,
+  refreshWindowsNodeExtraCaCertsBundle,
   resolveWindowsFreshRuntimeWorkerpalPrewarmDelayMs,
   resolveCliStatePath,
   resolveCliLocalConfigPath,
@@ -363,7 +364,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(supervisor.getService("stuck")).toBeNull();
       expect(isRetryableManagedServiceLaunchError({ code: "ETIMEDOUT" })).toBe(true);
     } finally {
-      supervisor.stop();
+      await supervisor.stopAndWait();
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1004,6 +1005,49 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       );
 
       expect(env.NODE_EXTRA_CA_CERTS).toBe(bundlePath);
+    } finally {
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("refreshes an existing Windows root bundle instead of trusting stale PEM content", () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-runtime-certs-refresh-"));
+    const bundlePath = resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot);
+    mkdirSync(dirname(bundlePath), { recursive: true });
+    writeFileSync(
+      bundlePath,
+      "-----BEGIN CERTIFICATE-----\nSTALE\n-----END CERTIFICATE-----\n",
+      "utf8",
+    );
+    try {
+      let calls = 0;
+      const result = refreshWindowsNodeExtraCaCertsBundle(bundlePath, {}, (outPath) => {
+        calls += 1;
+        writeFileSync(
+          outPath,
+          "-----BEGIN CERTIFICATE-----\nCURRENT\n-----END CERTIFICATE-----\n",
+          "utf8",
+        );
+        return true;
+      });
+      expect(result).toBe(bundlePath);
+      expect(calls).toBe(1);
+      expect(readFileSync(bundlePath, "utf8")).toContain("CURRENT");
+    } finally {
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves the last valid Windows root bundle when refresh fails", () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "pushpals-runtime-certs-fallback-"));
+    const bundlePath = resolveWindowsNodeExtraCaCertsBundlePath(runtimeRoot);
+    mkdirSync(dirname(bundlePath), { recursive: true });
+    const existing = "-----BEGIN CERTIFICATE-----\nFALLBACK\n-----END CERTIFICATE-----\n";
+    writeFileSync(bundlePath, existing, "utf8");
+    try {
+      const result = refreshWindowsNodeExtraCaCertsBundle(bundlePath, {}, () => false);
+      expect(result).toBe(bundlePath);
+      expect(readFileSync(bundlePath, "utf8")).toBe(existing);
     } finally {
       rmSync(runtimeRoot, { recursive: true, force: true });
     }
@@ -2887,6 +2931,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(
       isDockerUnavailableDetail(
         "failed to connect to the docker API at npipe:////./pipe/docker_engine",
+      ),
+    ).toBe(true);
+    expect(
+      isDockerUnavailableDetail(
+        "open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.",
       ),
     ).toBe(true);
     expect(isDockerUnavailableDetail('Executable not found in $PATH: "docker"')).toBe(true);

@@ -29,6 +29,7 @@ import {
   getDockerBackendSpec,
 } from "./backends/backend_config.js";
 import { forceDeleteWorktreePath } from "./common/worktree_cleanup.js";
+import { VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION } from "./common/worktree_dependency_artifacts.js";
 import type {
   DockerBackendRuntimeConfig,
   DockerBackendSpec,
@@ -56,6 +57,8 @@ const WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID = "pushpals_extra_ca";
 const WORKERPAL_SANDBOX_HOST_EXTRA_CA_PATH = "/run/pushpals/host-extra-ca.pem";
 const WORKERPAL_SANDBOX_MERGED_CA_PATH = "/run/pushpals/ca-bundle.pem";
 const WORKERPAL_SANDBOX_SYSTEM_CA_PATH = "/etc/ssl/certs/ca-certificates.crt";
+const DEFAULT_OPENAI_CODEX_CONTAINER_HOME = "/workspace/.pushpals/codex-home";
+const WORKERPAL_HOST_CODEX_AUTH_PATH = "/run/pushpals/host-codex-auth.json";
 const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
 const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
@@ -82,6 +85,57 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<
 
 export function buildWindowsDockerExecTreeTerminationArgv(pid: number): string[] {
   return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+
+export function resolveOpenAiCodexContainerHome(configured: string | undefined): string {
+  const raw = String(configured ?? "").trim();
+  if (!raw) return DEFAULT_OPENAI_CODEX_CONTAINER_HOME;
+  if (!raw.startsWith("/") || raw.includes("\\") || raw.split("/").includes("..")) {
+    return DEFAULT_OPENAI_CODEX_CONTAINER_HOME;
+  }
+  const normalized = raw.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+  const isDedicatedCodexHome =
+    normalized.startsWith("/workspace/.pushpals/") ||
+    /^\/(?:root|home\/[^/]+)\/\.codex(?:\/.*)?$/.test(normalized);
+  if (!normalized || !isDedicatedCodexHome) {
+    return DEFAULT_OPENAI_CODEX_CONTAINER_HOME;
+  }
+  return normalized;
+}
+
+export function buildOpenAiCodexHomeStartupCommand(options: {
+  containerHome: string;
+  runtimeTag?: string;
+  hostAuthMounted: boolean;
+}): string {
+  const home = shellSingleQuote(resolveOpenAiCodexContainerHome(options.containerHome));
+  const runtimeTag = shellSingleQuote(String(options.runtimeTag ?? "").trim() || "unversioned");
+  const commands = [
+    `codex_home=${home}`,
+    `codex_runtime_tag=${runtimeTag}`,
+    'mkdir -p "$codex_home"',
+    'runtime_marker="$codex_home/.pushpals-runtime-tag"',
+    'previous_runtime_tag="$(cat "$runtime_marker" 2>/dev/null || true)"',
+    'if [ "$previous_runtime_tag" != "$codex_runtime_tag" ]; then find "$codex_home" -mindepth 1 -maxdepth 1 ! -name auth.json ! -name .pushpals-host-auth.sha256 ! -name .pushpals-runtime-tag -exec rm -rf -- {} +; printf \'%s\\n\' "$codex_runtime_tag" > "$runtime_marker"; fi',
+  ];
+  if (options.hostAuthMounted) {
+    commands.push(
+      `host_auth=${shellSingleQuote(WORKERPAL_HOST_CODEX_AUTH_PATH)}`,
+      'host_auth_hash="$(sha256sum "$host_auth" | cut -d " " -f 1)"',
+      'host_auth_marker="$codex_home/.pushpals-host-auth.sha256"',
+      'previous_host_auth_hash="$(cat "$host_auth_marker" 2>/dev/null || true)"',
+      'if [ ! -s "$codex_home/auth.json" ] || [ "$host_auth_hash" != "$previous_host_auth_hash" ]; then cp "$host_auth" "$codex_home/.auth.json.pushpals-tmp"; chmod 0600 "$codex_home/.auth.json.pushpals-tmp"; mv -f "$codex_home/.auth.json.pushpals-tmp" "$codex_home/auth.json"; printf \'%s\\n\' "$host_auth_hash" > "$host_auth_marker"; fi',
+    );
+  }
+  return commands.join("; ");
+}
+
+export function prependOpenAiCodexHomeStartup(
+  startupCommand: string,
+  options: { containerHome: string; runtimeTag?: string; hostAuthMounted: boolean } | null,
+): string {
+  if (!options) return startupCommand;
+  return `${buildOpenAiCodexHomeStartupCommand(options)}; ${startupCommand}`;
 }
 
 async function terminateDockerExecProcessTree(
@@ -159,7 +213,7 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     // Linux volume. Only one symlink is created through the Windows bind mount.
     '  dependency_cache_root="$store_root/snapshots/linux-$(uname -m)"',
     '  mkdir -p "$dependency_cache_root"',
-    '  snapshot_key="$( { printf \'projection=container-volume-v1\\nbun=%s\\n\' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"',
+    `  snapshot_key="$( { printf 'projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
     "  if jq -e '.workspaces != null' \"$worktree/package.json\" >/dev/null 2>&1; then",
     '    snapshot_key="$snapshot_key-$worktree_id"',
     "  fi",
@@ -224,7 +278,10 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '    src="/repo/$name"',
     '    dest="$worktree/$name"',
     '    if { [ -e "$src" ] || [ -L "$src" ]; }; then',
-    '      snapshot_key="$(for manifest in /repo/package.json /repo/bun.lock /repo/bun.lockb; do [ ! -f "$manifest" ] || sha256sum "$manifest"; done | sha256sum | cut -d " " -f 1)"',
+    `      snapshot_key="$( { printf 'projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
+    "      if jq -e '.workspaces != null' \"$worktree/package.json\" >/dev/null 2>&1; then",
+    '        snapshot_key="$snapshot_key-$worktree_id"',
+    "      fi",
     '      rm -rf "$projection_root"',
     '      mkdir -p "$projection_node_modules"',
     '      for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
@@ -597,6 +654,7 @@ export class DockerExecutor {
   private worktreeDir: string;
   private warmContainerName: string;
   private dependencyVolumeName: string;
+  private codexVolumeName: string;
   private warmAgentPort = 39231;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private activeJobs = 0;
@@ -643,6 +701,14 @@ export class DockerExecutor {
       .update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath)
       .digest("hex")
       .slice(0, 16)}`;
+    this.codexVolumeName = `pushpals-codex-${createHash("sha256")
+      .update(
+        `${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\0${
+          this.options.workerId
+        }`,
+      )
+      .digest("hex")
+      .slice(0, 20)}`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
     this.warmSetupMaxAttempts = parseClampedInt(
       this.config.workerpals.dockerWarmMaxAttempts,
@@ -1170,37 +1236,16 @@ export class DockerExecutor {
 
   private async startWarmContainer(): Promise<void> {
     await this.stopWarmContainer("pre-start cleanup", true);
-    const volume = Bun.spawn(
-      [
-        resolveDockerExecutable(),
-        "volume",
-        "create",
-        "--label",
-        "pushpals.component=workerpals-dependencies",
-        "--label",
-        `pushpals.repo=${this.options.repo}`,
-        this.dependencyVolumeName,
-      ],
-      { stdout: "pipe", stderr: "pipe" },
-    );
-    const [volumeExitCode, volumeStdout, volumeStderr] = await Promise.all([
-      volume.exited,
-      new Response(volume.stdout).text(),
-      new Response(volume.stderr).text(),
-    ]);
-    if (volumeExitCode !== 0) {
-      throw new Error(
-        `Failed to prepare container-native dependency volume (exit ${volumeExitCode}): ${
-          volumeStderr.trim() || volumeStdout.trim() || "no docker output"
-        }`,
-      );
-    }
+    await this.ensureNamedVolume(this.dependencyVolumeName, "workerpals-dependencies");
     const backend = this.currentBackend();
+    if (backend === "openai_codex") {
+      await this.ensureNamedVolume(this.codexVolumeName, "workerpals-codex-home");
+    }
     const backendSpec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
-    const authMountArgs = this.openaiCodexAuthMountArgs(backend);
+    const authMount = this.openaiCodexAuthMount(backend);
     const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(process.env, existsSync, (path) =>
       this.toDockerPath(path),
     );
@@ -1231,7 +1276,7 @@ export class DockerExecutor {
       // Keep agent-server runtime artifacts off the host-mounted repo path.
       "/workspace",
       ...envArgs,
-      ...authMountArgs,
+      ...authMount.args,
       ...runtimeCaArgs,
     ];
 
@@ -1244,10 +1289,17 @@ export class DockerExecutor {
       args.push("-e", `${key}=${value}`);
     }
 
-    const startupCmd = prependWorkerpalRuntimeCaStartup(
+    const backendStartup = prependOpenAiCodexHomeStartup(
       backendSpec.warmContainerStartupCommand(warmContext),
-      runtimeCaArgs.length > 0,
+      backend === "openai_codex"
+        ? {
+            containerHome: authMount.containerHome,
+            runtimeTag: resolveWorkerpalRuntimeTag(),
+            hostAuthMounted: authMount.hostAuthMounted,
+          }
+        : null,
     );
+    const startupCmd = prependWorkerpalRuntimeCaStartup(backendStartup, runtimeCaArgs.length > 0);
     if (runtimeCaArgs.length > 0) {
       console.log(
         "[DockerExecutor] Mounting host extra CA trust into the warm container (read-only).",
@@ -1275,8 +1327,46 @@ export class DockerExecutor {
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
   }
 
-  private openaiCodexAuthMountArgs(backend: ExecutorBackend): string[] {
-    if (backend !== "openai_codex") return [];
+  private async ensureNamedVolume(name: string, component: string): Promise<void> {
+    const volume = Bun.spawn(
+      [
+        resolveDockerExecutable(),
+        "volume",
+        "create",
+        "--label",
+        `pushpals.component=${component}`,
+        "--label",
+        `pushpals.repo=${this.options.repo}`,
+        name,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [volumeExitCode, volumeStdout, volumeStderr] = await Promise.all([
+      volume.exited,
+      new Response(volume.stdout).text(),
+      new Response(volume.stderr).text(),
+    ]);
+    if (volumeExitCode !== 0) {
+      throw new Error(
+        `Failed to prepare ${component} volume (exit ${volumeExitCode}): ${
+          volumeStderr.trim() || volumeStdout.trim() || "no docker output"
+        }`,
+      );
+    }
+  }
+
+  private openaiCodexAuthMount(backend: ExecutorBackend): {
+    args: string[];
+    containerHome: string;
+    hostAuthMounted: boolean;
+  } {
+    if (backend !== "openai_codex") {
+      return {
+        args: [],
+        containerHome: DEFAULT_OPENAI_CODEX_CONTAINER_HOME,
+        hostAuthMounted: false,
+      };
+    }
 
     const hostCodexHomeRaw = (process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
     if (hostCodexHomeRaw && !isAbsolute(hostCodexHomeRaw)) {
@@ -1292,41 +1382,38 @@ export class DockerExecutor {
         ? hostCodexHomeRaw
         : resolve(homedir(), ".codex")
     ).trim();
-    if (!hostCodexHome) return [];
-
-    if (!existsSync(hostCodexHome)) {
-      try {
-        mkdirSync(hostCodexHome, { recursive: true });
-      } catch (err) {
-        console.warn(
-          `[DockerExecutor] Failed to create Codex auth directory (${hostCodexHome}); skipping mount: ${this.compactError(
-            err,
-          )}`,
-        );
-        return [];
-      }
-    }
-
-    let containerCodexHome = (
-      process.env.PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME || "/root/.codex"
-    ).trim();
-    if (!containerCodexHome.startsWith("/")) {
+    const configuredContainerHome = process.env.PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME;
+    const containerCodexHome = resolveOpenAiCodexContainerHome(configuredContainerHome);
+    if (
+      configuredContainerHome?.trim() &&
+      containerCodexHome !== configuredContainerHome.trim().replace(/\/$/, "")
+    ) {
       console.warn(
-        `[DockerExecutor] Invalid PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME=${containerCodexHome}; expected absolute path. Using /root/.codex.`,
+        `[DockerExecutor] Invalid or unsafe PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME=${configuredContainerHome}; using ${containerCodexHome}.`,
       );
-      containerCodexHome = "/root/.codex";
     }
-
-    const dockerHostPath = this.toDockerPath(hostCodexHome);
-    console.log(
-      `[DockerExecutor] Mounting Codex auth directory for openai_codex: ${hostCodexHome} -> ${containerCodexHome}`,
-    );
-    return [
-      "-v",
-      `${dockerHostPath}:${containerCodexHome}`,
+    const args = [
+      "--mount",
+      `type=volume,source=${this.codexVolumeName},target=${containerCodexHome}`,
       "-e",
       `CODEX_HOME=${containerCodexHome}`,
     ];
+    const hostAuthPath = resolve(hostCodexHome, "auth.json");
+    if (!existsSync(hostAuthPath)) {
+      console.warn(
+        `[DockerExecutor] Host Codex auth file not found at ${hostAuthPath}; preserving any auth already stored in ${this.codexVolumeName}.`,
+      );
+      return { args, containerHome: containerCodexHome, hostAuthMounted: false };
+    }
+    const dockerHostPath = this.toDockerPath(hostAuthPath);
+    console.log(
+      `[DockerExecutor] Mounting host Codex auth file read-only and isolating Linux state in volume ${this.codexVolumeName}.`,
+    );
+    args.push(
+      "--mount",
+      `type=bind,src=${dockerHostPath},dst=${WORKERPAL_HOST_CODEX_AUTH_PATH},readonly`,
+    );
+    return { args, containerHome: containerCodexHome, hostAuthMounted: true };
   }
 
   private async ensureWarmContainer(): Promise<void> {

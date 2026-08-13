@@ -44,7 +44,8 @@ export type ManagedServiceProcess = {
   launchReady?: Promise<boolean>;
   launchTimedOut?: boolean;
   logPath?: string;
-  stopOutputPipes?: () => void;
+  stopOutputPipes?: () => Promise<void> | void;
+  outputPipesStopped?: boolean;
 };
 
 type ServiceManagerState = {
@@ -155,6 +156,12 @@ async function settleManagedProcessWithin<T>(
   }
 }
 
+async function stopManagedServiceOutputPipes(service: ManagedServiceProcess): Promise<void> {
+  if (service.outputPipesStopped) return;
+  service.outputPipesStopped = true;
+  await service.stopOutputPipes?.();
+}
+
 export function buildWindowsManagedServiceTreeTerminationArgv(pid: number): string[] {
   return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
 }
@@ -183,7 +190,7 @@ export async function terminateManagedServiceTree(
   service: ManagedServiceProcess,
   platform = process.platform,
 ): Promise<void> {
-  service.stopOutputPipes?.();
+  await stopManagedServiceOutputPipes(service);
   const pid = Number(service.proc.pid);
   if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
     try {
@@ -266,15 +273,15 @@ export function isRetryableManagedServiceLaunchError(error: unknown): boolean {
 function pipeProcessStreamToLines(
   stream: ReadableStream<Uint8Array> | number | null | undefined,
   onLine?: (line: string) => void,
-): { cancel: () => void } {
+): { cancel: () => Promise<void> } {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
-    return { cancel: () => {} };
+    return { cancel: async () => {} };
   }
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let pending = "";
   let cancelled = false;
-  void (async () => {
+  const drained = (async () => {
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -303,14 +310,16 @@ function pipeProcessStreamToLines(
     }
   })();
   return {
-    cancel: () => {
-      if (cancelled) return;
-      cancelled = true;
-      try {
-        void reader.cancel().catch(() => {});
-      } catch {
-        // best-effort stream cleanup only
+    cancel: async () => {
+      if (!cancelled) {
+        cancelled = true;
+        try {
+          await reader.cancel();
+        } catch {
+          // best-effort stream cleanup only
+        }
       }
+      await settleManagedProcessWithin(drained, 500);
     },
   };
 }
@@ -356,10 +365,10 @@ function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
     launchReady,
     launchTimedOut: false,
     logPath: spec.logPath,
-    stopOutputPipes: () => {
-      stdoutPipe.cancel();
-      stderrPipe.cancel();
+    stopOutputPipes: async () => {
+      await Promise.allSettled([stdoutPipe.cancel(), stderrPipe.cancel()]);
     },
+    outputPipesStopped: false,
   };
   const configuredLaunchTimeoutMs = Math.floor(spec.launchTimeoutMs ?? 0);
   const launchTimeoutMs =
@@ -473,7 +482,7 @@ export class ServiceManager {
     const existing = this.services.get(spec.name);
     if (existing && !existing.exited) {
       try {
-        existing.stopOutputPipes?.();
+        void stopManagedServiceOutputPipes(existing);
         existing.proc.kill("SIGTERM");
       } catch {
         // ignore best-effort replacement shutdown failures
@@ -512,14 +521,18 @@ export class ServiceManager {
     return this.services.get(name) ?? null;
   }
 
-  abandonService(service: ManagedServiceProcess): void {
+  async abandonService(service: ManagedServiceProcess): Promise<void> {
     if (this.services.get(service.name) !== service) return;
-    service.stopOutputPipes?.();
+    const outputDrain = stopManagedServiceOutputPipes(service);
     try {
       service.proc.kill("SIGKILL");
     } catch {
       // Best-effort isolated-launcher termination only.
     }
+    await Promise.allSettled([
+      settleManagedProcessWithin(service.proc.exited, 1_000),
+      settleManagedProcessWithin(outputDrain, 1_000),
+    ]);
     this.services.delete(service.name);
     this.launchSpecs.delete(service.name);
     const state = this.stateByService.get(service.name);
@@ -558,12 +571,23 @@ export class ServiceManager {
     this.stopped = true;
     for (const service of this.services.values()) {
       try {
-        service.stopOutputPipes?.();
+        void stopManagedServiceOutputPipes(service);
         service.proc.kill("SIGTERM");
       } catch {
         // ignore best-effort shutdown failures
       }
     }
+  }
+
+  async stopAndWait(timeoutMs = 1_000): Promise<void> {
+    const services = this.getServices();
+    this.stop();
+    await Promise.allSettled(
+      services.flatMap((service) => [
+        settleManagedProcessWithin(service.proc.exited, timeoutMs),
+        settleManagedProcessWithin(stopManagedServiceOutputPipes(service), timeoutMs),
+      ]),
+    );
   }
 
   private ensureState(name: string): ServiceManagerState {
@@ -846,7 +870,7 @@ export async function startManagedServiceWithRetry(
       const service = serviceManager.startService(spec);
       const launchReady = service.launchReady ? await service.launchReady : true;
       if (!launchReady) {
-        serviceManager.abandonService(service);
+        await serviceManager.abandonService(service);
         throw Object.assign(
           new Error(
             `Managed ${spec.name} launch did not become ready within ${Math.max(0, Math.floor(spec.launchTimeoutMs ?? 0))}ms.`,
