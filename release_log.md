@@ -2,32 +2,34 @@
 
 ## Release Metadata
 
-- version: `v1.2.30`
-- start_commit: `8f5cd16ce49b2a8d583248cc80f703466d699e4f`
-- end_commit: `c9f478923c97c4e6297720cb6efea6f301fc58c7`
+- version: `v1.2.31`
+- start_commit: `1ffa2a1a1d8ba7d22a6bec86dff6ecb52044c0bd`
+- end_commit: `c48e432b5dd5a26865496ca5fc932628f2d5d087`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Terminate timed-out Windows process trees with `taskkill /T /F`, bounded output capture, and bounded stream draining across trusted validation, managed runtime services, and Docker job execution.
-- Protect completion publication with durable leases, periodic heartbeats, owner-checked callbacks, expired-claim recovery, and stable-pusher startup reconciliation.
-- Mark SourceControlManager unhealthy when an active tick stops progressing or an old finalization backlog remains idle, allowing the embedded supervisor to terminate and restart the stalled service.
-- Move dependency snapshots and recursive hardlink projection into a Linux-native Docker volume instead of copying dependency trees through a Windows bind mount.
-- Report dependency-preparation phases, percentage progress, elapsed time, artifacts, and a configurable five-minute default timeout.
-- Apply autonomy backpressure while publication is unhealthy or backed up, then resume dispatch safely when idle WorkerPal capacity is available.
-- Ship synchronized server, SourceControlManager, RemoteBuddy, WorkerPal, shared-config, and CLI runtime assets with expanded regression coverage.
+- Use one validation-safe dependency fingerprint across Docker preparation and WorkerPal validation so a fast Linux-native projection is not discarded and reinstalled before validation.
+- Keep dependency snapshots and per-job projections in repository-scoped Docker volumes, with accurate preparation phases, cache-hit telemetry, and bounded timeouts.
+- Isolate each OpenAI Codex worker in a repository-and-worker-scoped Linux volume while mounting only the host `auth.json` read-only; preserve container-refreshed credentials until the host credential actually changes.
+- Require the enabled worker critic to meet the final ReviewAgent threshold before handing a candidate to trusted-host validation, and provide the final-review rubric and prior findings to the worker critic.
+- Persist autonomy objectives in a durable `gated` reservation before enqueueing work, validate reservation identity and idempotency server-side, and reconcile interrupted reservations on startup and stale-claim sweeps.
+- Suppress overlapping active or recently attempted target paths before LLM scoring, record rejected candidates as unselected, and cap compact ideation timeout retries at 30 seconds.
+- Refresh the Windows CA bundle once per CLI process without destroying the last valid bundle when export fails, and treat a stopped Docker Desktop pipe as unavailable during best-effort cleanup.
+- Bound failed-launch process exit and output-stream draining, then finalize service-manager shutdown without allowing one service to hold another open.
+- Ship synchronized server, RemoteBuddy, WorkerPal, prompts, documentation, and packaged CLI runtime assets with expanded regression coverage.
 
 ## Validation
 
-- The complete root suite passed `1,138` tests with `9` intentional platform or opt-in skips and `0` failures in the production WorkerPal image on Bun 1.3.14 with a 3 GB memory and 2 CPU limit.
-- All `108` focused completion, supervision, SourceControlManager, dependency-projection, autonomy, and configuration regression tests passed with `2` expected skips and `0` failures.
-- Server, SourceControlManager, WorkerPals, and RemoteBuddy TypeScript checks passed.
-- The opt-in real Linux dependency-projection integration passed using a Docker-native dependency volume and confirmed cache reuse without copying dependencies into the host bind path.
-- Packaged WorkerPal runtime parity passed all `3` tests.
-- `bun run cli:bundle` completed and synchronized the packaged runtime and monitor assets.
-- `bun run cli:verify-package-payload` verified `227` package files with no external toolchain files from a Linux-native checkout.
-- Maintained source, tests, and documentation passed Prettier checks; `git diff --check` passed.
-- Regression coverage includes expired lease recovery, stale-owner callback rejection, stable-pusher reconciliation, stalled-tick health, old-finalization health, supervisor restart, forced Windows tree-kill command construction, bounded timeout draining, publication backpressure, safe idle-worker use, dependency telemetry, and dependency timeout propagation.
+- The complete root suite passed `1,159` tests with `5` intentional platform or opt-in skips and `0` failures on Windows with Bun 1.3.14.
+- The focused autonomy, reservation, Docker executor, quality-gate, review-fix, and validation-safety suite passed `259` tests with `2` Docker integration skips and `0` failures.
+- The combined CLI lifecycle, invocation, autoscaling, and completion-persistence suite passed `200` tests with `2` intentional skips and `0` failures.
+- Server, RemoteBuddy, WorkerPals, and shared-package TypeScript checks passed.
+- Protocol integration passed all `44` checks, and prompt-policy enforcement passed both checks.
+- `bun run cli:bundle` completed and synchronized packaged runtime source, generated service bundles, prompts, and monitor assets.
+- `bun run cli:verify-package-payload` verified `227` package files with no external toolchain files.
+- Maintained source, tests, prompts, and documentation passed Prettier checks; `git diff --check` passed.
+- Runtime mirror hashes match their source WorkerPal, prompt, and environment-template files.
 
 ## Install
 
@@ -53,11 +55,10 @@ bun install -g @pushpalsdev/cli
 
 ## Known Issues
 
-- The real descendant-process termination integration is Windows-only and was not executed inside the local Linux validation container; the cross-platform command and bounded-drain behavior are covered by unit tests.
-- The first dependency preparation for a new Bun version, lockfile, platform, or workspace can still require registry access; later jobs reuse the container-native snapshot.
-- Repository-scoped Docker dependency volumes intentionally persist across warm-container restarts for cache reuse. Old lockfile-keyed snapshots are not yet automatically garbage-collected.
-- Docker-backed WorkerPal execution still requires Docker to be installed and running when auto-spawn is enabled.
-- A SourceControlManager restart can interrupt an in-flight publication, but its completion lease expires or is reconciled on startup and the disposable publication worktree is reset before retry.
-- Active runtimes started from an older release must be restarted after installing this release before the new supervision, lease, and dependency-projection behavior takes effect.
-- Docker Desktop exposes Windows bind-mounted files as executable inside Linux containers, so the package mode guard must run against a Linux-native checkout or in the release workflow.
+- Docker Desktop was intentionally stopped before implementation validation, so the new opt-in Windows-host/Linux-container cache-and-Codex-volume integration was added but not executed locally. Command construction, cache fingerprinting, mount isolation, state migration, and timeout behavior are covered by the normal suite.
+- The first dependency preparation for a new Bun version, lockfile, platform, or workspace still requires installation; later jobs reuse the container-native snapshot.
+- Repository-scoped dependency volumes and repository-and-worker-scoped Codex volumes intentionally persist across warm-container restarts. Obsolete lockfile snapshots and retired worker volumes are not yet automatically garbage-collected.
+- Docker-backed WorkerPal execution still requires Docker to be installed and running when auto-spawn is enabled. `pushpals --clear` treats a stopped Docker daemon as a best-effort cleanup skip.
+- The observed pre-release session averaged 14.37 minutes per terminal job and 50% first-pass PR approval. This release removes measured bottlenecks and quality-gate gaps, but a new downstream soak is still required to quantify the resulting runtime and approval-rate changes.
+- Active runtimes started from an older release must be restarted after installing this release before the new dependency, critic, reservation, and service-lifecycle behavior takes effect.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
