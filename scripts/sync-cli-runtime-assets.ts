@@ -35,7 +35,9 @@ const copyPairs: Array<[string, string]> = [
   [source.visionExamplePath, join(outDir, "vision.example.md")],
   [source.promptsDir, join(outDir, "prompts")],
   [source.protocolSchemasDir, join(outDir, "protocol", "schemas")],
-  [join(source.promptsDir, "workerpals"), join(outDir, "sandbox", "prompts", "workerpals")],
+  // The containerized quality gate also consumes shared review-agent prompts.
+  // Copy the complete prompt contract rather than maintaining a fragile list.
+  [source.promptsDir, join(outDir, "sandbox", "prompts")],
   [source.protocolSchemasDir, join(outDir, "sandbox", "protocol", "schemas")],
 ];
 const trackedSandboxCopyPairs: Array<[string, string]> = [

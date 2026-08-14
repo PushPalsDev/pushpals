@@ -576,6 +576,18 @@ function dockerFallbackDiagnostics(
   };
 }
 
+function unstructuredDockerFailureClass(stdout: string, stderr: string): string {
+  const terminalText = `${stderr}\n${stdout}`;
+  if (
+    /(?:\[JobRunner\] Fatal error|ENOENT|no such file or directory)/i.test(terminalText) &&
+    /(?:\/workspace\/prompts|[\\/]prompts[\\/]|\[prompts\])/i.test(terminalText)
+  ) {
+    return "missing_runtime_asset";
+  }
+  if (/\[JobRunner\] Fatal error/i.test(terminalText)) return "worker_runtime_failure";
+  return "no_structured_result";
+}
+
 function readPositiveNumber(value: unknown): number | null {
   const parsed =
     typeof value === "number"
@@ -2583,10 +2595,13 @@ export class DockerExecutor {
       };
     }
 
+    const failureClass = unstructuredDockerFailureClass(stdout, stderr);
     const summary =
       exitCode === 0
         ? `Job completed in ${context.elapsedMs}ms`
-        : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
+        : failureClass === "missing_runtime_asset"
+          ? `Job failed because a required WorkerPal runtime asset was missing (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`
+          : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
     return {
       ok: exitCode === 0,
       summary,
@@ -2596,7 +2611,7 @@ export class DockerExecutor {
       diagnostics:
         exitCode === 0
           ? undefined
-          : dockerFallbackDiagnostics(summary, context, exitCode, "no_structured_result"),
+          : dockerFallbackDiagnostics(summary, context, exitCode, failureClass),
     };
   }
 

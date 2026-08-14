@@ -64,6 +64,29 @@ interface JobResult {
   diagnostics?: JobDiagnostics;
 }
 
+export function buildFatalJobResult(error: unknown): JobResult {
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  const missingRuntimeAsset =
+    /(?:ENOENT|no such file or directory)/i.test(detail) &&
+    /(?:\/workspace\/prompts|[\\/]prompts[\\/]|\[prompts\])/i.test(detail);
+  return {
+    ok: false,
+    summary: missingRuntimeAsset
+      ? "WorkerPal could not load a required runtime prompt asset"
+      : "WorkerPal encountered an unexpected runtime failure",
+    stderr: detail,
+    exitCode: 1,
+    diagnostics: {
+      terminal: {
+        failureClass: missingRuntimeAsset ? "missing_runtime_asset" : "worker_runtime_failure",
+        terminalStage: "worker_runtime",
+        summary: detail,
+        watchdogFired: false,
+      },
+    },
+  };
+}
+
 // ─── Logging helpers ────────────────────────────────────────────────────────
 
 function log(stream: "stdout" | "stderr", line: string): void {
@@ -270,8 +293,13 @@ async function main(): Promise<void> {
 
 if (import.meta.main) {
   main().catch((err) => {
+    const result = buildFatalJobResult(err);
     // eslint-disable-next-line no-console
     console.error(`[JobRunner] Fatal error: ${err}`);
+    // Preserve a structured terminal result even for unexpected runtime faults
+    // so the host does not have to infer timeout state from arbitrary job logs.
+    // eslint-disable-next-line no-console
+    console.log(`___RESULT___ ${JSON.stringify(result)}`);
     process.exit(1);
   });
 }

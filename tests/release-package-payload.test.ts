@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   findDisallowedCliPackageEntries,
   findDisallowedReleaseArtifactEntries,
@@ -21,12 +21,18 @@ const windowsSourceRuntimeAssets = [
 const requiredRuntimePayloadEntries = windowsSourceRuntimeAssets.map((asset) => ({
   path: `runtime/sandbox/${asset}`,
 }));
+const requiredSandboxPromptEntries = [
+  "runtime/sandbox/prompts/review_agent/reviewer.md",
+  "runtime/sandbox/prompts/workerpals/task_quality_critic_system_prompt.md",
+  "runtime/sandbox/prompts/workerpals/task_quality_critic_user_prompt.md",
+].map((path) => ({ path }));
 
 function requiredCliPackageFiles() {
   return [
     { path: "bin/pushpals.cjs", mode: 0o755 },
     { path: "dist/pushpals-cli.js", mode: 0o755 },
     ...requiredRuntimePayloadEntries,
+    ...requiredSandboxPromptEntries,
   ];
 }
 
@@ -57,6 +63,11 @@ function withTempPackage<T>(fn: (packageDir: string) => T): T {
     writeFileSync(join(packageDir, "dist", "pushpals-cli.js"), "export {};\n", "utf8");
     for (const asset of windowsSourceRuntimeAssets) {
       writeFileSync(join(packageDir, "runtime", "sandbox", asset), "export {};\n", "utf8");
+    }
+    for (const prompt of requiredSandboxPromptEntries) {
+      const promptPath = join(packageDir, prompt.path);
+      mkdirSync(dirname(promptPath), { recursive: true });
+      writeFileSync(promptPath, "# fixture prompt\n", "utf8");
     }
     return fn(packageDir);
   } finally {
@@ -141,6 +152,7 @@ describe("release package payload verification", () => {
         path: `runtime/sandbox/${asset}`,
         mode: 0o755,
       })),
+      ...requiredSandboxPromptEntries,
       { path: "runtime/sandbox/bun.lock" },
       { path: "runtime/sandbox/apps/workerpals/uv.lock" },
       {
@@ -156,6 +168,7 @@ describe("release package payload verification", () => {
       { path: "bin/pushpals.cjs" },
       { path: "dist/pushpals-cli.js" },
       ...requiredRuntimePayloadEntries,
+      ...requiredSandboxPromptEntries,
       { path: "runtime/bin/bun.exe" },
       { path: "runtime/bin/node" },
       { path: "runtime/bin/git.cmd" },
@@ -191,6 +204,9 @@ describe("release package payload verification", () => {
       ...windowsSourceRuntimeAssets.map((asset) => ({
         path: `runtime\\sandbox\\${asset}`,
       })),
+      ...requiredSandboxPromptEntries.map((entry) => ({
+        path: entry.path.replaceAll("/", "\\"),
+      })),
       { path: "runtime\\bin\\bun.exe" },
       { path: "runtime\\sandbox\\node_modules\\package\\index.js" },
     ]);
@@ -208,6 +224,7 @@ describe("release package payload verification", () => {
       "bin/pushpals.cjs",
       "dist/pushpals-cli.js",
       ...windowsSourceRuntimeAssets.map((asset) => `runtime/sandbox/${asset}`),
+      ...requiredSandboxPromptEntries.map((entry) => entry.path),
     ]);
     expect(issues.every((issue) => issue.reason === "required CLI package entry is missing")).toBe(
       true,

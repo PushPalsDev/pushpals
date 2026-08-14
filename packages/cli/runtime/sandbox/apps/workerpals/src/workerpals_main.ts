@@ -528,16 +528,34 @@ export function inferWorkerTerminalFailureClass(result: JobResult): string {
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text =
     `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  const terminalText = `${result.summary ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
   if (isCodexStartupStallResult(result)) return "codex_startup_stall";
+  if (
+    /(?:fatal error|enoent|no such file or directory)/.test(terminalText) &&
+    /(?:\/workspace\/prompts|[\\/]prompts[\\/]|\[prompts\])/.test(terminalText)
+  ) {
+    return "missing_runtime_asset";
+  }
   if (/validationgate|validation/.test(summaryText)) return "validation";
-  if (/timed out|timeout|signal 15|terminated|exit 143|exit 137/.test(text)) return "timeout";
   if (/no publishable|non-publishable|node_modules/.test(text))
     return "artifact_only_no_publishable_patch";
+  if (
+    result.exitCode === 124 ||
+    /timed out|job timeout|signal 15|terminated \(exit|exit 143|exit 137/.test(terminalText)
+  )
+    return "timeout";
   if (/validationgate|validation/.test(text)) return "validation";
   if (/scopegate|scope/.test(text)) return "scope";
   if (/criticgate|critic/.test(text)) return "critic";
   if (/publish/.test(text)) return "publish";
   return "worker_failure";
+}
+
+export function didWorkerWatchdogFire(result: JobResult): boolean {
+  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`;
+  return /watchdog|rollout coach|stalled before first response|startup stall|\[DockerExecutor\] Job timeout|Job timed out in Docker executor|signal 15|terminated \(exit (?:143|137)\)|exit (?:143|137)/i.test(
+    text,
+  );
 }
 
 function buildPhaseSpanDiagnostics(
@@ -2089,10 +2107,7 @@ async function workerLoop(
                         : (currentJobPhase ?? (result.ok ? "completed" : "worker")),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
-                  watchdogFired:
-                    /watchdog|rollout coach|stalled before first response|startup stall|timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(
-                      `${result.summary}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`,
-                    ),
+                  watchdogFired: didWorkerWatchdogFire(result),
                   metadata: {
                     workerId: opts.workerId,
                     docker: Boolean(dockerExecutor),

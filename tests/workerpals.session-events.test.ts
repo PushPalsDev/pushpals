@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildTrustedValidationCompletionPayload,
+  didWorkerWatchdogFire,
   failCompletionEnqueue,
   holdCommitForTrustedValidation,
   inferWorkerTerminalFailureClass,
@@ -293,6 +294,39 @@ describe("workerpals session event emission", () => {
         exitCode: 1,
       }),
     ).toBe("validation");
+  });
+
+  test("classifies missing runtime prompts before incidental timeout task text", () => {
+    const result = {
+      ok: false,
+      summary: "Job failed (exit 1, elapsed 600000ms)",
+      stderr:
+        "[JobRunner] Fatal error: Error: ENOENT: no such file or directory, open '/workspace/prompts/review_agent/reviewer.md'",
+      stdout: "Task: harden timeout handling and add timeout tests",
+      exitCode: 1,
+    };
+
+    expect(inferWorkerTerminalFailureClass(result)).toBe("missing_runtime_asset");
+    expect(didWorkerWatchdogFire(result)).toBe(false);
+  });
+
+  test("does not mark ordinary timeout-related task wording as a fired watchdog", () => {
+    expect(
+      didWorkerWatchdogFire({
+        ok: false,
+        summary: "Validation failed",
+        stdout: "Implement timeout handling and test timeout cleanup",
+        stderr: "assertion failed",
+        exitCode: 1,
+      }),
+    ).toBe(false);
+    expect(
+      didWorkerWatchdogFire({
+        ok: false,
+        summary: "Job timed out in Docker executor after 900000ms",
+        exitCode: 124,
+      }),
+    ).toBe(true);
   });
 
   test("recycles a worker after a codex startup stall", () => {

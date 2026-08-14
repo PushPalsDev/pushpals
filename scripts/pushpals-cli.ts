@@ -226,7 +226,9 @@ type WorkerpalSandboxPaths = {
   sharedDir: string;
   protocolDir: string;
   configsDir: string;
+  promptsDir: string;
   workerpalsPromptsDir: string;
+  reviewerPromptPath: string;
   protocolSchemasDir: string;
 };
 
@@ -1303,7 +1305,9 @@ export function buildWorkerpalSandboxPaths(runtimeRoot: string): WorkerpalSandbo
     sharedDir: join(root, "packages", "shared"),
     protocolDir: join(root, "packages", "protocol"),
     configsDir: join(root, "configs"),
+    promptsDir: join(root, "prompts"),
     workerpalsPromptsDir: join(root, "prompts", "workerpals"),
+    reviewerPromptPath: join(root, "prompts", "review_agent", "reviewer.md"),
     protocolSchemasDir: join(root, "protocol", "schemas"),
   };
 }
@@ -1398,7 +1402,9 @@ function isCompleteWorkerpalSandboxRoot(root: string): boolean {
     existsSync(join(root, "packages", "shared", "package.json")) &&
     existsSync(join(root, "packages", "protocol", "package.json")) &&
     existsSync(join(root, "configs", "default.toml")) &&
-    existsSync(join(root, "prompts", "workerpals")) &&
+    existsSync(join(root, "prompts", "workerpals", "task_quality_critic_system_prompt.md")) &&
+    existsSync(join(root, "prompts", "workerpals", "task_quality_critic_user_prompt.md")) &&
+    existsSync(join(root, "prompts", "review_agent", "reviewer.md")) &&
     existsSync(join(root, "protocol", "schemas", "envelope.schema.json")) &&
     existsSync(join(root, "protocol", "schemas", "events.schema.json"))
   );
@@ -1411,7 +1417,10 @@ function populateWorkerpalSandboxRuntimeAssets(runtimeRoot: string, force: boole
     force,
     errorOnExist: false,
   });
-  cpSync(join(runtimeRoot, "prompts", "workerpals"), sandbox.workerpalsPromptsDir, {
+  // WorkerPal quality/finalization code consumes prompts outside the workerpals
+  // directory too (for example review_agent/reviewer.md). Project the complete
+  // prompt bundle so newly shared quality prompts cannot be omitted silently.
+  cpSync(join(runtimeRoot, "prompts"), sandbox.promptsDir, {
     recursive: true,
     force,
     errorOnExist: false,

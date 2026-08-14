@@ -6204,6 +6204,13 @@ export interface WorkerCriticReviewContext {
   priorReviewContext: string;
 }
 
+const BUILT_IN_FINAL_REVIEWER_RUBRIC = [
+  "Review the candidate as a strict senior maintainer.",
+  "Prioritize functional correctness, acceptance-criteria coverage, regression risk, security, maintainability, and concrete validation evidence.",
+  "Reject speculative changes, unrelated churn, missing tests for changed behavior, and claims that are not supported by the diff or validation output.",
+  "Score from 0 to 10 and identify every must-fix issue that blocks a safe first-pass merge.",
+].join(" ");
+
 export function resolveWorkerCriticReviewContext(
   repo: string,
   params: Record<string, unknown> | null | undefined,
@@ -6229,7 +6236,18 @@ export function resolveWorkerCriticReviewContext(
     }
   }
   if (!finalReviewerRubric) {
-    finalReviewerRubric = loadPromptTemplate("review_agent/reviewer.md").trim();
+    try {
+      finalReviewerRubric = loadPromptTemplate("review_agent/reviewer.md").trim();
+    } catch (error) {
+      // A damaged or incomplete runtime bundle must not turn every otherwise
+      // valid worker patch into an unstructured fatal error. Package checks
+      // enforce the asset, while this fallback keeps an already-running system
+      // available and makes the degraded state explicit in its logs.
+      console.warn(
+        `[CriticGate] Final-review rubric asset is unavailable; using the built-in rubric: ${String(error)}`,
+      );
+      finalReviewerRubric = BUILT_IN_FINAL_REVIEWER_RUBRIC;
+    }
   }
   finalReviewerRubric = finalReviewerRubric.slice(0, 16_000);
 

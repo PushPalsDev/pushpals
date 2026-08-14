@@ -2068,8 +2068,12 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       join("/runtime/pushpals", "sandbox", ".pushpals-remotebuddy-fallback.js"),
     );
     expect(paths.configsDir).toBe(join("/runtime/pushpals", "sandbox", "configs"));
+    expect(paths.promptsDir).toBe(join("/runtime/pushpals", "sandbox", "prompts"));
     expect(paths.workerpalsPromptsDir).toBe(
       join("/runtime/pushpals", "sandbox", "prompts", "workerpals"),
+    );
+    expect(paths.reviewerPromptPath).toBe(
+      join("/runtime/pushpals", "sandbox", "prompts", "review_agent", "reviewer.md"),
     );
     expect(paths.protocolSchemasDir).toBe(
       join("/runtime/pushpals", "sandbox", "protocol", "schemas"),
@@ -2115,6 +2119,18 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "# workerpals\n",
       "utf8",
     );
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "task_quality_critic_system_prompt.md"),
+      "# critic system\n",
+      "utf8",
+    );
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "task_quality_critic_user_prompt.md"),
+      "# critic user\n",
+      "utf8",
+    );
+    mkdirSync(dirname(sandbox.reviewerPromptPath), { recursive: true });
+    writeFileSync(sandbox.reviewerPromptPath, "# reviewer\n", "utf8");
     writeFileSync(join(sandbox.protocolSchemasDir, "envelope.schema.json"), "{}\n", "utf8");
     writeFileSync(join(sandbox.protocolSchemasDir, "events.schema.json"), "{}\n", "utf8");
 
@@ -2184,6 +2200,18 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "# workerpals\n",
       "utf8",
     );
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "task_quality_critic_system_prompt.md"),
+      "# critic system\n",
+      "utf8",
+    );
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "task_quality_critic_user_prompt.md"),
+      "# critic user\n",
+      "utf8",
+    );
+    mkdirSync(dirname(sandbox.reviewerPromptPath), { recursive: true });
+    writeFileSync(sandbox.reviewerPromptPath, "# reviewer\n", "utf8");
     writeFileSync(join(sandbox.protocolSchemasDir, "envelope.schema.json"), "{}\n", "utf8");
     writeFileSync(join(sandbox.protocolSchemasDir, "events.schema.json"), "{}\n", "utf8");
 
@@ -2231,6 +2259,18 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "# workerpals\n",
       "utf8",
     );
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "task_quality_critic_system_prompt.md"),
+      "# critic system\n",
+      "utf8",
+    );
+    writeFileSync(
+      join(sandbox.workerpalsPromptsDir, "task_quality_critic_user_prompt.md"),
+      "# critic user\n",
+      "utf8",
+    );
+    mkdirSync(dirname(sandbox.reviewerPromptPath), { recursive: true });
+    writeFileSync(sandbox.reviewerPromptPath, "# reviewer\n", "utf8");
     writeFileSync(join(sandbox.protocolSchemasDir, "envelope.schema.json"), "{}\n", "utf8");
     writeFileSync(join(sandbox.protocolSchemasDir, "events.schema.json"), "{}\n", "utf8");
 

@@ -8295,6 +8295,12 @@ ${output}` : ""
 
 `);
 }
+var BUILT_IN_FINAL_REVIEWER_RUBRIC = [
+  "Review the candidate as a strict senior maintainer.",
+  "Prioritize functional correctness, acceptance-criteria coverage, regression risk, security, maintainability, and concrete validation evidence.",
+  "Reject speculative changes, unrelated churn, missing tests for changed behavior, and claims that are not supported by the diff or validation output.",
+  "Score from 0 to 10 and identify every must-fix issue that blocks a safe first-pass merge."
+].join(" ");
 function resolveWorkerCriticReviewContext(repo, params, runtimeConfig = DEFAULT_CONFIG3) {
   const reviewAgent = runtimeConfig.sourceControlManager.reviewAgent;
   const thresholdRaw = Number(reviewAgent.passThreshold);
@@ -8310,7 +8316,12 @@ function resolveWorkerCriticReviewContext(repo, params, runtimeConfig = DEFAULT_
     }
   }
   if (!finalReviewerRubric) {
-    finalReviewerRubric = loadPromptTemplate("review_agent/reviewer.md").trim();
+    try {
+      finalReviewerRubric = loadPromptTemplate("review_agent/reviewer.md").trim();
+    } catch (error) {
+      console.warn(`[CriticGate] Final-review rubric asset is unavailable; using the built-in rubric: ${String(error)}`);
+      finalReviewerRubric = BUILT_IN_FINAL_REVIEWER_RUBRIC;
+    }
   }
   finalReviewerRubric = finalReviewerRubric.slice(0, 16000);
   const reviewFix = extractReviewFixContext(params);
@@ -12253,6 +12264,16 @@ function dockerFallbackDiagnostics(summary, context, exitCode, failureClass, met
     }
   };
 }
+function unstructuredDockerFailureClass(stdout, stderr) {
+  const terminalText = `${stderr}
+${stdout}`;
+  if (/(?:\[JobRunner\] Fatal error|ENOENT|no such file or directory)/i.test(terminalText) && /(?:\/workspace\/prompts|[\\/]prompts[\\/]|\[prompts\])/i.test(terminalText)) {
+    return "missing_runtime_asset";
+  }
+  if (/\[JobRunner\] Fatal error/i.test(terminalText))
+    return "worker_runtime_failure";
+  return "no_structured_result";
+}
 function readPositiveNumber(value) {
   const parsed = typeof value === "number" ? value : typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
   if (!Number.isFinite(parsed) || parsed <= 0)
@@ -13726,14 +13747,15 @@ ${text}` : `
         diagnostics: dockerFallbackDiagnostics(summary2, context, exitCode, "terminated")
       };
     }
-    const summary = exitCode === 0 ? `Job completed in ${context.elapsedMs}ms` : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
+    const failureClass = unstructuredDockerFailureClass(stdout, stderr);
+    const summary = exitCode === 0 ? `Job completed in ${context.elapsedMs}ms` : failureClass === "missing_runtime_asset" ? `Job failed because a required WorkerPal runtime asset was missing (exit ${exitCode}, elapsed ${context.elapsedMs}ms)` : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
     return {
       ok: exitCode === 0,
       summary,
       stdout,
       stderr,
       exitCode,
-      diagnostics: exitCode === 0 ? undefined : dockerFallbackDiagnostics(summary, context, exitCode, "no_structured_result")
+      diagnostics: exitCode === 0 ? undefined : dockerFallbackDiagnostics(summary, context, exitCode, failureClass)
     };
   }
   async ensureWarmRuntimeReady(job, onLog) {
@@ -14760,14 +14782,19 @@ function inferWorkerTerminalFailureClass(result) {
   const text = `${result.summary ?? ""}
 ${result.stderr ?? ""}
 ${result.stdout ?? ""}`.toLowerCase();
+  const terminalText = `${result.summary ?? ""}
+${result.stderr ?? ""}`.toLowerCase();
   if (isCodexStartupStallResult(result))
     return "codex_startup_stall";
+  if (/(?:fatal error|enoent|no such file or directory)/.test(terminalText) && /(?:\/workspace\/prompts|[\\/]prompts[\\/]|\[prompts\])/.test(terminalText)) {
+    return "missing_runtime_asset";
+  }
   if (/validationgate|validation/.test(summaryText))
     return "validation";
-  if (/timed out|timeout|signal 15|terminated|exit 143|exit 137/.test(text))
-    return "timeout";
   if (/no publishable|non-publishable|node_modules/.test(text))
     return "artifact_only_no_publishable_patch";
+  if (result.exitCode === 124 || /timed out|job timeout|signal 15|terminated \(exit|exit 143|exit 137/.test(terminalText))
+    return "timeout";
   if (/validationgate|validation/.test(text))
     return "validation";
   if (/scopegate|scope/.test(text))
@@ -14777,6 +14804,12 @@ ${result.stdout ?? ""}`.toLowerCase();
   if (/publish/.test(text))
     return "publish";
   return "worker_failure";
+}
+function didWorkerWatchdogFire(result) {
+  const text = `${result.summary ?? ""}
+${result.stderr ?? ""}
+${result.stdout ?? ""}`;
+  return /watchdog|rollout coach|stalled before first response|startup stall|\[DockerExecutor\] Job timeout|Job timed out in Docker executor|signal 15|terminated \(exit (?:143|137)\)|exit (?:143|137)/i.test(text);
 }
 function buildPhaseSpanDiagnostics(spans, attempt, fallbackFinishedAtMs, outcome) {
   return spans.slice(0, 32).map((span) => {
@@ -15883,9 +15916,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
                   terminalStage: terminalFailureClass === "codex_startup_stall" ? "executor_startup" : completionEnqueued ? result.validationBlocked ? "trusted_environment_validation" : "publication" : currentJobPhase ?? (result.ok ? "completed" : "worker"),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
-                  watchdogFired: /watchdog|rollout coach|stalled before first response|startup stall|timed out|timeout|signal 15|terminated|exit 143|exit 137/i.test(`${result.summary}
-${result.stderr ?? ""}
-${result.stdout ?? ""}`),
+                  watchdogFired: didWorkerWatchdogFire(result),
                   metadata: {
                     workerId: opts.workerId,
                     docker: Boolean(dockerExecutor),
@@ -16253,5 +16284,6 @@ export {
   inferWorkerTerminalFailureClass,
   holdCommitForTrustedValidation,
   failCompletionEnqueue,
+  didWorkerWatchdogFire,
   buildTrustedValidationCompletionPayload
 };

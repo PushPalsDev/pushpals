@@ -27,6 +27,9 @@ const REQUIRED_CLI_PACKAGE_PATHS = new Set([
   "bin/pushpals.cjs",
   "dist/pushpals-cli.js",
   ...WINDOWS_SOURCE_RUNTIME_ASSET_PATHS,
+  "runtime/sandbox/prompts/review_agent/reviewer.md",
+  "runtime/sandbox/prompts/workerpals/task_quality_critic_system_prompt.md",
+  "runtime/sandbox/prompts/workerpals/task_quality_critic_user_prompt.md",
 ]);
 const ALLOWED_EXECUTABLE_PACKAGE_PATHS = new Set([
   "bin/pushpals.cjs",

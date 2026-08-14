@@ -1,10 +1,24 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildFatalJobResult,
   buildJobRunnerResult,
   containerOwnsGitFinalization,
 } from "../apps/workerpals/src/job_runner";
 
 describe("workerpals Docker job runner result", () => {
+  test("returns structured missing-runtime diagnostics for a missing prompt", () => {
+    const result = buildFatalJobResult(
+      new Error(
+        "ENOENT: no such file or directory, open '/workspace/prompts/review_agent/reviewer.md'",
+      ),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("required runtime prompt asset");
+    expect(result.diagnostics?.terminal?.failureClass).toBe("missing_runtime_asset");
+    expect(result.diagnostics?.terminal?.watchdogFired).toBe(false);
+  });
+
   test("preserves executor cooldowns in the structured sentinel result", () => {
     const result = buildJobRunnerResult({
       ok: false,

@@ -157,6 +157,32 @@ describe("workerpals docker executor internals", () => {
     expect(timedOut.summary).toContain("14400000ms");
   });
 
+  test("parseResult reports missing prompt assets without misclassifying them as timeouts", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
+      ) => {
+        summary: string;
+        diagnostics?: { terminal?: { failureClass?: string; watchdogFired?: boolean } };
+      };
+    };
+    const result = executor.parseResult(
+      ["Task requested bounded timeout handling"],
+      [
+        "[JobRunner] Fatal error: Error: ENOENT: no such file or directory, open '/workspace/prompts/review_agent/reviewer.md'",
+      ],
+      1,
+      { timedOutByDocker: false, elapsedMs: 600_000, timeoutMs: 7_260_000 },
+    );
+
+    expect(result.summary).toContain("required WorkerPal runtime asset was missing");
+    expect(result.diagnostics?.terminal?.failureClass).toBe("missing_runtime_asset");
+    expect(result.diagnostics?.terminal?.watchdogFired).toBe(false);
+  });
+
   test("caps Docker timeout for browser-validation repair jobs", () => {
     const regularTimeout = resolveDockerJobTimeoutMs(1_860_000, {
       kind: "task.execute",

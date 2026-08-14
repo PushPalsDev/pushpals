@@ -26,6 +26,7 @@ import {
   qualityRevisionLoopUpperBound,
   recordBrowserFailureMemory,
   recordValidationRemedyMemory,
+  resolveWorkerCriticReviewContext,
   repoValidationLeaseRecoveryReason,
   repoValidationRepairContinuationBudgetDecision,
   shouldSkipCriticAfterExecutorTimeout,
@@ -53,6 +54,21 @@ function runGit(cwd: string, args: string[]): void {
 }
 
 describe("workerpals quality gate critic issue formatting", () => {
+  test("uses a built-in final-review rubric when the packaged prompt is unavailable", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-missing-reviewer-prompt-"));
+    const previousPromptRoot = process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE;
+    process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE = join(root, "missing-runtime");
+    try {
+      const context = resolveWorkerCriticReviewContext(root, {}, undefined);
+      expect(context.finalReviewerRubric).toContain("strict senior maintainer");
+      expect(context.finalReviewerRubric).toContain("functional correctness");
+    } finally {
+      if (previousPromptRoot === undefined) delete process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE;
+      else process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE = previousPromptRoot;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("isolates pure environment failures from critic and revision inputs", () => {
     const result = isolatePureEnvironmentValidationDeferral({
       ok: false,

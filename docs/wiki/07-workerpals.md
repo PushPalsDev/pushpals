@@ -78,6 +78,13 @@ This provides:
 - optional critic/revision loops (backend-specific),
 - output compaction and structured result handling.
 
+Packaged WorkerPal sandbox images receive the complete runtime prompt bundle,
+including the shared ReviewAgent rubric used by CriticGate. Package-payload and
+runtime-completeness checks require the critical critic/reviewer files. If an
+already-running image is damaged or incomplete, CriticGate uses a conservative
+built-in rubric and reports the degraded asset instead of terminating every
+job without a structured result.
+
 An environment-blocked required validation gate is not treated as a code
 revision request by itself. Scope checks and the critic still run first, using
 the same rubric and pass threshold as the final ReviewAgent. Only a candidate
@@ -93,6 +100,9 @@ internal ref for diagnosis; a failed queue handoff is reported as
 
 - Backend output parse errors:
   - usually schema/format mismatch in executor output.
+- `missing_runtime_asset`:
+  - the packaged sandbox is incomplete or stale; rebuild it from a runtime
+    bundle that passed the package-payload checks.
 - Docker warm container issues:
   - usually image/tooling/network precondition failures.
 - Dependency preparation timeout:
