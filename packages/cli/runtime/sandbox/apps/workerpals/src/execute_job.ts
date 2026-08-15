@@ -179,6 +179,7 @@ export interface DeterministicQualityResult {
   requiredValidationFailures: string[];
   blocker: ValidationBlocker | null;
   validationFailureScope: "none" | "task_scope" | "outside_task_scope";
+  trustedValidationPendingCommands?: string[];
 }
 
 interface CriticReview {
@@ -451,12 +452,14 @@ export function shouldSoftPassCriticOnlyBudgetExhaustion(opts: {
   deterministicRequiresRevision: boolean;
   criticRequiresRevision: boolean;
   requiredValidationFailures: string[];
+  trustedValidationPendingCommands?: string[];
   changedPaths: string[];
 }): boolean {
   if (!opts.softPassOnExhausted) return false;
   if (opts.deterministicRequiresRevision) return false;
   if (!opts.criticRequiresRevision) return false;
   if (opts.requiredValidationFailures.length > 0) return false;
+  if ((opts.trustedValidationPendingCommands?.length ?? 0) > 0) return false;
   return publishableChangedPaths(opts.changedPaths).length > 0;
 }
 
@@ -2876,12 +2879,12 @@ export function resolveBunDependencyLayoutPreflight(
     };
   }
 
-  if (
-    existsSync(
-      resolve(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER),
-    ) &&
-    !validationSafeDependencySnapshotIsCurrent(repo)
-  ) {
+  const validationSafeSnapshotMarkerExists = existsSync(
+    resolve(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER),
+  );
+  const validationSafeSnapshotIsCurrent =
+    validationSafeSnapshotMarkerExists && validationSafeDependencySnapshotIsCurrent(repo);
+  if (validationSafeSnapshotMarkerExists && !validationSafeSnapshotIsCurrent) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "validation-safe dependency snapshot fingerprint is stale",
@@ -2900,6 +2903,7 @@ export function resolveBunDependencyLayoutPreflight(
 
   if (
     isLinkedNodeModulesDependencyArtifact(repo) &&
+    !validationSafeSnapshotIsCurrent &&
     validationNeedsExpoRouterBrowserLocalInstall(repo, packageJson, validationCommands)
   ) {
     return {
@@ -3461,6 +3465,7 @@ export function isolatePureEnvironmentValidationDeferral(quality: DeterministicQ
       requiredValidationFailures: [],
       blocker: null,
       validationFailureScope: "none",
+      trustedValidationPendingCommands: failedRuns.map((run) => run.command),
     },
   };
 }
@@ -6176,13 +6181,13 @@ function resolveQualityCriticMaxValidationOutputChars(
   return compact ? Math.min(bounded, 2_000) : bounded;
 }
 
-function buildCriticValidationSummary(
+export function buildCriticValidationSummary(
   quality: DeterministicQualityResult,
   maxValidationOutputChars: number,
 ): string {
   const allPassed =
     quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
-  return quality.validationRuns
+  const executedSummary = quality.validationRuns
     .map((run) => {
       const output = allPassed
         ? ""
@@ -6196,6 +6201,17 @@ function buildCriticValidationSummary(
         .join("\n");
     })
     .join("\n\n---\n\n");
+  const pendingTrustedCommands = Array.from(
+    new Set(quality.trustedValidationPendingCommands ?? []),
+  );
+  const trustedSummary = pendingTrustedCommands.length
+    ? [
+        "Trusted-host validation handoff:",
+        ...pendingTrustedCommands.map((command) => `Command: ${command}`),
+        "Result: pending trusted-host execution because the worker has no Docker daemon. This is not a candidate failure; SourceControlManager must run it before publication. Do not request a worker revision solely to rerun it.",
+      ].join("\n")
+    : "";
+  return [executedSummary, trustedSummary].filter(Boolean).join("\n\n---\n\n");
 }
 
 export interface WorkerCriticReviewContext {
@@ -10991,6 +11007,7 @@ export async function executeJob(
           deterministicRequiresRevision,
           criticRequiresRevision,
           requiredValidationFailures: qualityForCritic.requiredValidationFailures,
+          trustedValidationPendingCommands: qualityForCritic.trustedValidationPendingCommands,
           changedPaths: quality.changedPaths,
         })
       ) {

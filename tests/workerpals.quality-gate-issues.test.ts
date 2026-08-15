@@ -5,6 +5,7 @@ import { join } from "path";
 import {
   canReturnTrustedEnvironmentValidationHandoff,
   buildBrowserValidationRepairPacket,
+  buildCriticValidationSummary,
   buildCriticDiffText,
   browserValidationRepairContinuationBudgetDecision,
   buildQualityRevisionHint,
@@ -117,6 +118,12 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(result.qualityForCritic.requiredValidationFailures).toEqual([]);
     expect(result.qualityForCritic.blocker).toBeNull();
     expect(result.qualityForCritic.validationFailureScope).toBe("none");
+    expect(result.qualityForCritic.trustedValidationPendingCommands).toEqual(["bun run validate"]);
+    const criticSummary = buildCriticValidationSummary(result.qualityForCritic, 2_000);
+    expect(criticSummary).toContain("Trusted-host validation handoff");
+    expect(criticSummary).toContain("Command: bun run validate");
+    expect(criticSummary).toContain("not a candidate failure");
+    expect(criticSummary).toContain("Do not request a worker revision solely to rerun it");
   });
 
   test("does not defer a mixed environment and assertion failure cluster", () => {
@@ -378,6 +385,17 @@ describe("workerpals quality gate critic issue formatting", () => {
         deterministicRequiresRevision: true,
         criticRequiresRevision: true,
         requiredValidationFailures: [],
+        changedPaths: ["components/Planet.tsx"],
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSoftPassCriticOnlyBudgetExhaustion({
+        softPassOnExhausted: true,
+        deterministicRequiresRevision: false,
+        criticRequiresRevision: true,
+        requiredValidationFailures: [],
+        trustedValidationPendingCommands: ["bun run validate"],
         changedPaths: ["components/Planet.tsx"],
       }),
     ).toBe(false);

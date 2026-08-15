@@ -1369,6 +1369,19 @@ describe("workerpals validation command safety", () => {
         process.platform === "win32" ? "junction" : "dir",
       );
 
+      writeFileSync(join(dependencyRoot, ".pushpals-dependency-snapshot"), "key\n", "utf8");
+      writeFileSync(
+        join(dependencyRoot, ".pushpals-validation-safe-dependency-snapshot"),
+        `${bunDependencySnapshotKey(root)}\n`,
+        "utf8",
+      );
+      expect(resolveBunDependencyLayoutPreflight(root, ["bun test", "bun run web:e2e"])).toBeNull();
+
+      rmSync(join(dependencyRoot, ".pushpals-dependency-snapshot"), { force: true });
+      rmSync(join(dependencyRoot, ".pushpals-validation-safe-dependency-snapshot"), {
+        force: true,
+      });
+
       const browserPlan = resolveBunDependencyLayoutPreflight(root, [
         "bun test",
         "bun run web:e2e",

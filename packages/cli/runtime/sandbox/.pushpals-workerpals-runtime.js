@@ -4259,6 +4259,8 @@ function shouldSoftPassCriticOnlyBudgetExhaustion(opts) {
     return false;
   if (opts.requiredValidationFailures.length > 0)
     return false;
+  if ((opts.trustedValidationPendingCommands?.length ?? 0) > 0)
+    return false;
   return publishableChangedPaths(opts.changedPaths).length > 0;
 }
 var MERGE_CONFLICT_RETRY_EXECUTION_BUDGET_MS = 300000;
@@ -6030,7 +6032,9 @@ function resolveBunDependencyLayoutPreflight(repo, validationCommands) {
       reason: "node_modules is missing for Bun validation commands"
     };
   }
-  if (existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER)) && !validationSafeDependencySnapshotIsCurrent(repo)) {
+  const validationSafeSnapshotMarkerExists = existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
+  const validationSafeSnapshotIsCurrent = validationSafeSnapshotMarkerExists && validationSafeDependencySnapshotIsCurrent(repo);
+  if (validationSafeSnapshotMarkerExists && !validationSafeSnapshotIsCurrent) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "validation-safe dependency snapshot fingerprint is stale",
@@ -6044,7 +6048,7 @@ function resolveBunDependencyLayoutPreflight(repo, validationCommands) {
       removeLinkedNodeModules: true
     };
   }
-  if (isLinkedNodeModulesDependencyArtifact(repo) && validationNeedsExpoRouterBrowserLocalInstall(repo, packageJson, validationCommands)) {
+  if (isLinkedNodeModulesDependencyArtifact(repo) && !validationSafeSnapshotIsCurrent && validationNeedsExpoRouterBrowserLocalInstall(repo, packageJson, validationCommands)) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules is linked for Expo Router browser validation commands",
@@ -6387,7 +6391,8 @@ function isolatePureEnvironmentValidationDeferral(quality) {
       validationRuns: successfulRuns,
       requiredValidationFailures: [],
       blocker: null,
-      validationFailureScope: "none"
+      validationFailureScope: "none",
+      trustedValidationPendingCommands: failedRuns.map((run) => run.command)
     }
   };
 }
@@ -8279,7 +8284,7 @@ function resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact = f
 }
 function buildCriticValidationSummary(quality, maxValidationOutputChars) {
   const allPassed = quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
-  return quality.validationRuns.map((run) => {
+  const executedSummary = quality.validationRuns.map((run) => {
     const output = allPassed ? "" : [run.stdout, run.stderr].filter(Boolean).join(`
 `).slice(0, maxValidationOutputChars);
     return [
@@ -8290,6 +8295,18 @@ ${output}` : ""
     ].filter(Boolean).join(`
 `);
   }).join(`
+
+---
+
+`);
+  const pendingTrustedCommands = Array.from(new Set(quality.trustedValidationPendingCommands ?? []));
+  const trustedSummary = pendingTrustedCommands.length ? [
+    "Trusted-host validation handoff:",
+    ...pendingTrustedCommands.map((command) => `Command: ${command}`),
+    "Result: pending trusted-host execution because the worker has no Docker daemon. This is not a candidate failure; SourceControlManager must run it before publication. Do not request a worker revision solely to rerun it."
+  ].join(`
+`) : "";
+  return [executedSummary, trustedSummary].filter(Boolean).join(`
 
 ---
 
@@ -11603,6 +11620,7 @@ ${result.stderr ?? ""}`;
         deterministicRequiresRevision,
         criticRequiresRevision,
         requiredValidationFailures: qualityForCritic.requiredValidationFailures,
+        trustedValidationPendingCommands: qualityForCritic.trustedValidationPendingCommands,
         changedPaths: quality.changedPaths
       })) {
         const diagnostics = truncate([
