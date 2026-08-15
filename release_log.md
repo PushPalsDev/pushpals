@@ -2,29 +2,27 @@
 
 ## Release Metadata
 
-- version: `v1.2.32`
-- start_commit: `6f193b3055665b394f813a394c70cbcabffddde2`
-- end_commit: `c1672195a31f1db14600e4bbd21c336b5b26c74d`
+- version: `v1.2.33`
+- start_commit: `dbdf9f6a9dbbe63f1104f40c31d89132966b55c1`
+- end_commit: `eeef91d4bb0e045a6d0c145a9ce175b463b872d6`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Package the complete prompt tree in the WorkerPal sandbox, including the final ReviewAgent rubric that was missing from `v1.2.31` and caused otherwise-successful jobs to terminate during CriticGate review.
-- Verify the critical WorkerPal and ReviewAgent prompt assets in the actual npm payload before publication.
-- Fall back to a conservative built-in final-review rubric if a packaged reviewer prompt is unexpectedly unavailable instead of failing the whole job.
-- Emit a structured `missing_runtime_asset` terminal result for fatal prompt-loading failures and keep incidental timeout wording in worker output from being misclassified as a watchdog timeout.
-- Ship synchronized WorkerPal source, generated runtime bundles, sandbox prompts, documentation, and regression coverage.
+- Preserve current validation-safe container-native dependency projections during Expo Router browser validation instead of discarding them and rebuilding `node_modules` inside every worktree.
+- Tell CriticGate exactly which validation commands are pending trusted-host execution so it does not send workers through impossible Docker-dependent revision loops.
+- Prevent critic-only budget exhaustion from soft-passing candidates while trusted-host validation is still pending; those jobs must retain a real validation handoff or fail closed.
+- Ship synchronized WorkerPal source, generated runtime bundles, and focused regression coverage for projection reuse, critic handoff context, and budget-exhaustion safety.
 
 ## Validation
 
-- The complete root suite passed `1,164` tests with `5` intentional platform or opt-in skips and `0` failures on Windows with Bun 1.3.14.
-- The focused CLI packaging, Docker executor, job-runner, quality-gate, and session-event suite passed `291` tests with `4` intentional skips and `0` failures.
-- WorkerPals, shared-package, and packaged-runtime TypeScript checks passed.
-- `bun run cli:bundle` completed and synchronized packaged runtime source, generated service bundles, prompts, and monitor assets.
+- `bun run test` passed `1,164` tests with `5` intentional platform or opt-in skips and `0` failures on Windows with Bun 1.3.14.
+- The focused validation-command and quality-gate suites passed `119` tests with `0` failures.
+- WorkerPals TypeScript checks and packaged-runtime source parity passed.
+- `bun run cli:bundle` completed and synchronized packaged runtime source and generated service bundles.
 - `bun run cli:verify-package-payload` verified `257` package files with no external toolchain files.
-- Maintained source, tests, prompts, and documentation passed Prettier checks; `git diff --check` passed.
-- The exact packaged Linux sandbox loaded the ReviewAgent rubric, exercised the built-in missing-prompt fallback, and resolved CriticGate context through a real SectorCommand Windows bind mount.
 - The opt-in Windows-host/Linux-container integration suite passed `35` tests with `1` intentional skip and `0` failures.
+- `git diff --check` passed.
 
 ## Install
 
@@ -51,5 +49,5 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when auto-spawn is enabled. `pushpals --clear` treats a stopped Docker daemon as a best-effort cleanup skip.
-- Active runtimes started from an older release must be restarted after installing this release before the corrected sandbox payload and terminal classification take effect.
+- Active runtimes started from an older release must be restarted after installing this release before dependency-projection reuse and trusted-validation handoff safeguards take effect.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
