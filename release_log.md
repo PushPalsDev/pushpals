@@ -2,26 +2,26 @@
 
 ## Release Metadata
 
-- version: `v1.2.33`
-- start_commit: `dbdf9f6a9dbbe63f1104f40c31d89132966b55c1`
-- end_commit: `eeef91d4bb0e045a6d0c145a9ce175b463b872d6`
+- version: `v1.2.34`
+- start_commit: `afc99b94b068b34600720fc98c806a3905149366`
+- end_commit: `2cbe75536f8c3cdcff5853f5027a8f564b97724b`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Preserve current validation-safe container-native dependency projections during Expo Router browser validation instead of discarding them and rebuilding `node_modules` inside every worktree.
-- Tell CriticGate exactly which validation commands are pending trusted-host execution so it does not send workers through impossible Docker-dependent revision loops.
-- Prevent critic-only budget exhaustion from soft-passing candidates while trusted-host validation is still pending; those jobs must retain a real validation handoff or fail closed.
-- Ship synchronized WorkerPal source, generated runtime bundles, and focused regression coverage for projection reuse, critic handoff context, and budget-exhaustion safety.
+- Remove PushPals-managed `node_modules` projections before host-side Git finalization so valid Docker worker patches are not lost to Windows `git add -A` failures.
+- Recognize Docker Desktop's opaque Linux symlinks when Windows exposes them as `EACCES` or `EINVAL` directory entries, and unlink only the worktree artifact without deleting the container-volume dependency snapshot.
+- Fail finalization with a direct cleanup diagnostic if the managed artifact cannot be removed instead of continuing into an ambiguous Git staging error.
+- Ship synchronized WorkerPal source, generated runtime bundles, native Windows-junction coverage, and an opt-in Windows-host/Linux-container regression test for the exact production boundary.
 
 ## Validation
 
-- `bun run test` passed `1,164` tests with `5` intentional platform or opt-in skips and `0` failures on Windows with Bun 1.3.14.
-- The focused validation-command and quality-gate suites passed `119` tests with `0` failures.
-- WorkerPals TypeScript checks and packaged-runtime source parity passed.
+- `bun run test:root` passed `1,165` tests with `5` intentional platform or opt-in skips and `0` failures on Windows with Bun 1.3.14.
+- The focused Docker executor, review-finalization, and validation-command suites passed `102` tests with `1` intentional Linux-only skip and `0` failures.
+- The opt-in Windows-host/Linux-container regression passed against a real Docker Desktop dependency projection and preserved the backing dependency snapshot after host cleanup.
+- WorkerPals and shared-package TypeScript checks and packaged-runtime source parity passed.
 - `bun run cli:bundle` completed and synchronized packaged runtime source and generated service bundles.
 - `bun run cli:verify-package-payload` verified `257` package files with no external toolchain files.
-- The opt-in Windows-host/Linux-container integration suite passed `35` tests with `1` intentional skip and `0` failures.
 - `git diff --check` passed.
 
 ## Install
@@ -49,5 +49,5 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when auto-spawn is enabled. `pushpals --clear` treats a stopped Docker daemon as a best-effort cleanup skip.
-- Active runtimes started from an older release must be restarted after installing this release before dependency-projection reuse and trusted-validation handoff safeguards take effect.
+- Active runtimes started from an older release must be restarted after installing this release before host-side dependency-projection cleanup takes effect.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
