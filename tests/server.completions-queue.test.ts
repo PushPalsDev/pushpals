@@ -72,12 +72,23 @@ function trustedValidationReport(options: {
   ok: boolean;
   command?: string;
   candidateSha: string;
+  baselineSha?: string;
   output?: string;
+  exitCode?: number;
+  failureClass?:
+    | "dependency_setup_failed"
+    | "test_failure"
+    | "timeout"
+    | "trusted_validation_failed";
+  failedTests?: string[];
+  targetPathHints?: string[];
 }): Record<string, unknown> {
   const command = options.command ?? "bun run validate:publish";
+  const failedTests = options.failedTests ?? ["mandatory account state machine"];
+  const targetPathHints = options.targetPathHints ?? ["tests/account.test.ts"];
   return {
     version: 1,
-    baselineSha: "baseline-sha",
+    baselineSha: options.baselineSha ?? "baseline-sha",
     candidateSha: options.candidateSha,
     results: [
       {
@@ -88,15 +99,15 @@ function trustedValidationReport(options: {
           (options.ok
             ? "1141 pass, 0 fail"
             : "tests/account.test.ts:\n(fail) mandatory account state machine"),
-        exitCode: options.ok ? 0 : 1,
+        exitCode: options.ok ? 0 : (options.exitCode ?? 1),
         durationMs: 1_000,
         phase: "validation",
         ...(options.ok
           ? {}
           : {
-              failureClass: "test_failure",
-              failedTests: ["mandatory account state machine"],
-              targetPathHints: ["tests/account.test.ts"],
+              failureClass: options.failureClass ?? "test_failure",
+              failedTests,
+              targetPathHints,
             }),
       },
     ],
@@ -288,7 +299,7 @@ describe("server CompletionQueue PR URL persistence", () => {
     jobs.close();
   });
 
-  test("requeues retained publish-blocked candidates after a later trusted-host pass", () => {
+  test("requeues a retained transient same-baseline failure after a later trusted-host pass", () => {
     const { jobs, completions, jobId } = createSharedQueues();
     const blockedHandoff = completions.enqueue(
       {
@@ -309,7 +320,15 @@ describe("server CompletionQueue PR URL persistence", () => {
         blockedCompletionId,
         "bun run validate:publish exited with code 1",
         undefined,
-        trustedValidationReport({ ok: false, candidateSha: "blocked-candidate" }),
+        trustedValidationReport({
+          ok: false,
+          candidateSha: "blocked-candidate",
+          output: "Command timed out after 480000ms; terminated process tree.",
+          exitCode: 124,
+          failureClass: "timeout",
+          failedTests: [],
+          targetPathHints: [],
+        }),
       ),
     ).toMatchObject({ ok: true, jobId, jobTransitioned: true });
     expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
@@ -388,7 +407,15 @@ describe("server CompletionQueue PR URL persistence", () => {
         blockedCompletionId,
         "validate failed",
         undefined,
-        trustedValidationReport({ ok: false, candidateSha: "blocked-before-restart" }),
+        trustedValidationReport({
+          ok: false,
+          candidateSha: "blocked-before-restart",
+          output: "Command timed out after 480000ms; terminated process tree.",
+          exitCode: 124,
+          failureClass: "timeout",
+          failedTests: [],
+          targetPathHints: [],
+        }),
       ).ok,
     ).toBe(true);
 
@@ -408,7 +435,12 @@ describe("server CompletionQueue PR URL persistence", () => {
       passedJobId,
       "bun run validate:publish",
       "1141 pass, 0 fail",
-      JSON.stringify({ source: "trusted_host", completionId: "persisted-pass" }),
+      JSON.stringify({
+        source: "trusted_host",
+        completionId: "persisted-pass",
+        baselineSha: "baseline-sha",
+        failedTests: [],
+      }),
       passedAt,
     );
     db.close();
@@ -508,6 +540,131 @@ describe("server CompletionQueue PR URL persistence", () => {
     jobs.close();
   });
 
+  test("does not recover a candidate-specific test failure after the same command passes elsewhere", () => {
+    const { jobs, completions, jobId } = createSharedQueues();
+    const blockedHandoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        commitSha: "candidate-test-failure",
+        branch: "refs/pushpals/agent/worker/candidate-test-failure",
+        message: "candidate retained",
+        trustedValidationCommands: ["bun run validate:publish"],
+      },
+      { beginJobFinalization: true },
+    );
+    const blockedCompletionId = blockedHandoff.completionId ?? "";
+    expect(completions.claim("scm-blocked").completion?.id).toBe(blockedCompletionId);
+    expect(
+      completions.markFailedAndBlockJob(
+        blockedCompletionId,
+        "named test failed",
+        undefined,
+        trustedValidationReport({ ok: false, candidateSha: "candidate-test-failure" }),
+      ).ok,
+    ).toBe(true);
+
+    const passingJobId = enqueueClaimedJob(jobs, "unrelated-same-command-pass");
+    const passingHandoff = completions.enqueue(
+      {
+        jobId: passingJobId,
+        sessionId: "dev",
+        commitSha: "unrelated-passing-candidate",
+        branch: "refs/pushpals/agent/worker/unrelated-passing-candidate",
+        message: "unrelated candidate passed",
+        trustedValidationCommands: ["bun run validate:publish"],
+      },
+      { beginJobFinalization: true },
+    );
+    const passingCompletionId = passingHandoff.completionId ?? "";
+    expect(completions.claim("scm-passing").completion?.id).toBe(passingCompletionId);
+    const processed = completions.markProcessedAndFinalizeJob(
+      passingCompletionId,
+      null,
+      undefined,
+      trustedValidationReport({ ok: true, candidateSha: "unrelated-passing-candidate" }),
+    );
+
+    expect(processed.requeuedCompletionIds).toBeUndefined();
+    expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
+    expect(completions.getCompletion(blockedCompletionId)).toMatchObject({
+      status: "failed",
+      trustedValidationRecoveryAttempts: 0,
+    });
+
+    completions.close();
+    jobs.close();
+  });
+
+  test("does not recover a transient failure when the passing baseline differs", () => {
+    const { jobs, completions, jobId } = createSharedQueues();
+    const blockedHandoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        commitSha: "old-baseline-timeout",
+        branch: "refs/pushpals/agent/worker/old-baseline-timeout",
+        message: "candidate retained",
+        trustedValidationCommands: ["bun run validate:publish"],
+      },
+      { beginJobFinalization: true },
+    );
+    const blockedCompletionId = blockedHandoff.completionId ?? "";
+    expect(completions.claim("scm-blocked").completion?.id).toBe(blockedCompletionId);
+    expect(
+      completions.markFailedAndBlockJob(
+        blockedCompletionId,
+        "validation timed out",
+        undefined,
+        trustedValidationReport({
+          ok: false,
+          candidateSha: "old-baseline-timeout",
+          baselineSha: "old-baseline",
+          output: "Command timed out after 480000ms; terminated process tree.",
+          exitCode: 124,
+          failureClass: "timeout",
+          failedTests: [],
+          targetPathHints: [],
+        }),
+      ).ok,
+    ).toBe(true);
+
+    const passingJobId = enqueueClaimedJob(jobs, "new-baseline-pass");
+    const passingHandoff = completions.enqueue(
+      {
+        jobId: passingJobId,
+        sessionId: "dev",
+        commitSha: "new-baseline-candidate",
+        branch: "refs/pushpals/agent/worker/new-baseline-candidate",
+        message: "new baseline passed",
+        trustedValidationCommands: ["bun run validate:publish"],
+      },
+      { beginJobFinalization: true },
+    );
+    const passingCompletionId = passingHandoff.completionId ?? "";
+    expect(completions.claim("scm-passing").completion?.id).toBe(passingCompletionId);
+    const processed = completions.markProcessedAndFinalizeJob(
+      passingCompletionId,
+      null,
+      undefined,
+      trustedValidationReport({
+        ok: true,
+        candidateSha: "new-baseline-candidate",
+        baselineSha: "new-baseline",
+      }),
+    );
+
+    expect(processed.requeuedCompletionIds).toBeUndefined();
+    expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
+    expect(completions.getCompletion(blockedCompletionId)).toMatchObject({
+      status: "failed",
+      trustedValidationRecoveryAttempts: 0,
+    });
+
+    completions.close();
+    jobs.close();
+  });
+
   test("caps automatic trusted-validation recovery attempts", () => {
     const { jobs, completions, jobId, dbPath } = createSharedQueues();
     const blockedHandoff = completions.enqueue(
@@ -528,11 +685,19 @@ describe("server CompletionQueue PR URL persistence", () => {
         blockedCompletionId,
         "validate failed",
         undefined,
-        trustedValidationReport({ ok: false, candidateSha: "retry-exhausted" }),
+        trustedValidationReport({
+          ok: false,
+          candidateSha: "retry-exhausted",
+          output: "Command timed out after 480000ms; terminated process tree.",
+          exitCode: 124,
+          failureClass: "timeout",
+          failedTests: [],
+          targetPathHints: [],
+        }),
       ).ok,
     ).toBe(true);
     const db = new Database(dbPath);
-    db.prepare(`UPDATE completions SET trustedValidationRecoveryAttempts = 3 WHERE id = ?`).run(
+    db.prepare(`UPDATE completions SET trustedValidationRecoveryAttempts = 1 WHERE id = ?`).run(
       blockedCompletionId,
     );
     db.close();
@@ -562,7 +727,7 @@ describe("server CompletionQueue PR URL persistence", () => {
     expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
     expect(completions.getCompletion(blockedCompletionId)).toMatchObject({
       status: "failed",
-      trustedValidationRecoveryAttempts: 3,
+      trustedValidationRecoveryAttempts: 1,
     });
 
     completions.close();

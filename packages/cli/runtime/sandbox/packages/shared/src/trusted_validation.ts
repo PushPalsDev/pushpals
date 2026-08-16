@@ -135,9 +135,13 @@ export function extractTrustedValidationFailureEvidence(options: {
   let failureClass: TrustedValidationFailureEvidence["failureClass"];
   if (options.phase === "dependency_install") {
     failureClass = "dependency_setup_failed";
-  } else if (/timed?\s*out|timeout/i.test(output) || options.exitCode === 124) {
+  } else if (options.exitCode === 124) {
     failureClass = "timeout";
-  } else if (failedTests.length > 0 || /(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
+  } else if (failedTests.length > 0) {
+    failureClass = "test_failure";
+  } else if (/timed?\s*out|timeout/i.test(output)) {
+    failureClass = "timeout";
+  } else if (/(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
     failureClass = "test_failure";
   } else if (/\b(?:tsc|typecheck|type-check)\b/i.test(command)) {
     failureClass = "typecheck_failure";

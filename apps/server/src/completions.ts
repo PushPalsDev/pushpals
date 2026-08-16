@@ -62,7 +62,10 @@ export interface CompletionFinalizationResult {
   requeuedJobIds?: string[];
 }
 
-const TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 3;
+// The original failure plus one recovery run is enough to distinguish a
+// transient host outage from an unchanged candidate failure. Further retries
+// must come from a new repair candidate instead of cycling publication.
+const TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 1;
 export const DEFAULT_COMPLETION_LEASE_MS = 3 * 60_000;
 const MIN_COMPLETION_LEASE_MS = 30_000;
 const MAX_COMPLETION_LEASE_MS = 15 * 60_000;
@@ -436,9 +439,11 @@ export class CompletionQueue {
     const rows = this.db
       .prepare(
         `SELECT DISTINCT c.id AS completionId,
-                         c.jobId AS jobId,
-                         failed.command AS failedCommand,
-                         passed.command AS passedCommand
+                          c.jobId AS jobId,
+                          failed.command AS failedCommand,
+                          passed.command AS passedCommand,
+                          json_extract(failed.metadataJson, '$.baselineSha') AS failedBaselineSha,
+                          json_extract(passed.metadataJson, '$.baselineSha') AS passedBaselineSha
          FROM completions c
          JOIN jobs blockedJob ON blockedJob.id = c.jobId
          JOIN job_validation_runs failed ON failed.jobId = c.jobId
@@ -455,8 +460,13 @@ export class CompletionQueue {
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
            AND failed.passed = 0
+           AND failed.failureClass IN ('timeout', 'dependency_setup_failed', 'trusted_validation_failed')
            AND json_extract(failed.metadataJson, '$.source') = 'trusted_host'
            AND json_extract(failed.metadataJson, '$.completionId') = c.id
+           AND COALESCE(json_array_length(json_extract(failed.metadataJson, '$.failedTests')), 0) = 0
+           AND COALESCE(json_extract(failed.metadataJson, '$.baselineSha'), '') != ''
+           AND json_extract(failed.metadataJson, '$.baselineSha') =
+               json_extract(passed.metadataJson, '$.baselineSha')
          ORDER BY c.createdAt ASC, c.id ASC
          LIMIT 256`,
       )
@@ -465,6 +475,8 @@ export class CompletionQueue {
       jobId: string;
       failedCommand: string;
       passedCommand: string;
+      failedBaselineSha: string | null;
+      passedBaselineSha: string | null;
     }>;
     const eligible = new Map<string, TrustedValidationRecoveryCandidate>();
     for (const row of rows) {
@@ -1174,14 +1186,11 @@ export class CompletionQueue {
   }
 
   /**
-   * A trusted-host pass on a newer candidate proves that a previously red
-   * validation command can execute successfully again. Requeue retained
-   * candidates that were blocked by that same command so SourceControlManager
-   * can apply them to the repaired baseline and validate them again.
-   *
-   * Recovery is deliberately bounded per completion. A candidate-specific
-   * failure can therefore make progress after later baseline repairs without
-   * bouncing forever whenever an unrelated candidate passes validation.
+   * A same-baseline trusted-host pass can prove that a transient validation
+   * failure without named test evidence was environmental. Candidate-specific
+   * test, lint, and typecheck failures remain blocked until a repair produces a
+   * new candidate SHA. Recovery is limited to one retry to prevent publication
+   * churn from an unchanged failure.
    */
   private requeueTrustedValidationBlockedCompletionsAfterPass(
     passingCompletion: CompletionRow,
@@ -1198,18 +1207,28 @@ export class CompletionQueue {
     const allowed = new Set(requested.commands.map(trustedValidationCommandKey));
     const passedCommands = new Set(
       report.results
-        .filter((result) => result.ok && result.phase === "validation")
+        .filter(
+          (result) =>
+            result.ok &&
+            (result.phase === "dependency_install" ||
+              allowed.has(trustedValidationCommandKey(result.command))),
+        )
         .map((result) => trustedValidationCommandKey(result.command))
-        .filter((command) => command && allowed.has(command)),
+        .filter(Boolean),
     );
-    if (passedCommands.size === 0) return { completionIds: [], jobIds: [] };
+    const passingBaselineSha = trustedValidationText(report.baselineSha, 128);
+    if (passedCommands.size === 0 || !passingBaselineSha) {
+      return { completionIds: [], jobIds: [] };
+    }
 
     const rows = this.db
       .prepare(
         `SELECT DISTINCT c.id AS completionId,
                          c.jobId AS jobId,
-                         c.trustedValidationRecoveryAttempts AS recoveryAttempts,
-                         r.command AS command
+                          c.trustedValidationRecoveryAttempts AS recoveryAttempts,
+                          r.command AS command,
+                          r.failureClass AS failureClass,
+                          json_extract(r.metadataJson, '$.baselineSha') AS baselineSha
          FROM completions c
          JOIN jobs j ON j.id = c.jobId
          JOIN job_validation_runs r ON r.jobId = c.jobId
@@ -1218,17 +1237,27 @@ export class CompletionQueue {
            AND c.id != ?
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
-           AND r.passed = 0
-           AND json_extract(r.metadataJson, '$.source') = 'trusted_host'
-           AND json_extract(r.metadataJson, '$.completionId') = c.id
-           AND datetime(r.createdAt) <= datetime(?)
+            AND r.passed = 0
+            AND r.failureClass IN ('timeout', 'dependency_setup_failed', 'trusted_validation_failed')
+            AND json_extract(r.metadataJson, '$.source') = 'trusted_host'
+            AND json_extract(r.metadataJson, '$.completionId') = c.id
+            AND COALESCE(json_array_length(json_extract(r.metadataJson, '$.failedTests')), 0) = 0
+            AND json_extract(r.metadataJson, '$.baselineSha') = ?
+            AND datetime(r.createdAt) <= datetime(?)
          ORDER BY c.createdAt ASC, c.id ASC`,
       )
-      .all(passingCompletion.id, TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS, now) as Array<{
+      .all(
+        passingCompletion.id,
+        TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS,
+        passingBaselineSha,
+        now,
+      ) as Array<{
       completionId: string;
       jobId: string;
       recoveryAttempts: number;
       command: string;
+      failureClass: string | null;
+      baselineSha: string | null;
     }>;
     const eligible = new Map<string, TrustedValidationRecoveryCandidate>();
     for (const row of rows) {

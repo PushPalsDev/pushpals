@@ -8830,9 +8830,13 @@ function extractTrustedValidationFailureEvidence(options) {
   let failureClass;
   if (options.phase === "dependency_install") {
     failureClass = "dependency_setup_failed";
-  } else if (/timed?\s*out|timeout/i.test(output) || options.exitCode === 124) {
+  } else if (options.exitCode === 124) {
     failureClass = "timeout";
-  } else if (failedTests.length > 0 || /(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
+  } else if (failedTests.length > 0) {
+    failureClass = "test_failure";
+  } else if (/timed?\s*out|timeout/i.test(output)) {
+    failureClass = "timeout";
+  } else if (/(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
     failureClass = "test_failure";
   } else if (/\b(?:tsc|typecheck|type-check)\b/i.test(command)) {
     failureClass = "typecheck_failure";
@@ -12044,7 +12048,7 @@ class RequestQueue {
 // apps/server/src/completions.ts
 import { Database as Database4 } from "bun:sqlite";
 import { createHash as createHash3, randomUUID as randomUUID4 } from "crypto";
-var TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 3;
+var TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 1;
 var DEFAULT_COMPLETION_LEASE_MS = 3 * 60000;
 var MIN_COMPLETION_LEASE_MS = 30000;
 var MAX_COMPLETION_LEASE_MS = 15 * 60000;
@@ -12294,9 +12298,11 @@ class CompletionQueue {
     if (!requiredTables.every((name) => presentNames.has(name)))
       return;
     const rows = this.db.prepare(`SELECT DISTINCT c.id AS completionId,
-                         c.jobId AS jobId,
-                         failed.command AS failedCommand,
-                         passed.command AS passedCommand
+                          c.jobId AS jobId,
+                          failed.command AS failedCommand,
+                          passed.command AS passedCommand,
+                          json_extract(failed.metadataJson, '$.baselineSha') AS failedBaselineSha,
+                          json_extract(passed.metadataJson, '$.baselineSha') AS passedBaselineSha
          FROM completions c
          JOIN jobs blockedJob ON blockedJob.id = c.jobId
          JOIN job_validation_runs failed ON failed.jobId = c.jobId
@@ -12313,8 +12319,13 @@ class CompletionQueue {
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
            AND failed.passed = 0
+           AND failed.failureClass IN ('timeout', 'dependency_setup_failed', 'trusted_validation_failed')
            AND json_extract(failed.metadataJson, '$.source') = 'trusted_host'
            AND json_extract(failed.metadataJson, '$.completionId') = c.id
+           AND COALESCE(json_array_length(json_extract(failed.metadataJson, '$.failedTests')), 0) = 0
+           AND COALESCE(json_extract(failed.metadataJson, '$.baselineSha'), '') != ''
+           AND json_extract(failed.metadataJson, '$.baselineSha') =
+               json_extract(passed.metadataJson, '$.baselineSha')
          ORDER BY c.createdAt ASC, c.id ASC
          LIMIT 256`).all(TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS);
     const eligible = new Map;
@@ -12766,13 +12777,17 @@ class CompletionQueue {
     if (!requested.ok)
       return { completionIds: [], jobIds: [] };
     const allowed = new Set(requested.commands.map(trustedValidationCommandKey));
-    const passedCommands = new Set(report.results.filter((result) => result.ok && result.phase === "validation").map((result) => trustedValidationCommandKey(result.command)).filter((command) => command && allowed.has(command)));
-    if (passedCommands.size === 0)
+    const passedCommands = new Set(report.results.filter((result) => result.ok && (result.phase === "dependency_install" || allowed.has(trustedValidationCommandKey(result.command)))).map((result) => trustedValidationCommandKey(result.command)).filter(Boolean));
+    const passingBaselineSha = trustedValidationText(report.baselineSha, 128);
+    if (passedCommands.size === 0 || !passingBaselineSha) {
       return { completionIds: [], jobIds: [] };
+    }
     const rows = this.db.prepare(`SELECT DISTINCT c.id AS completionId,
                          c.jobId AS jobId,
-                         c.trustedValidationRecoveryAttempts AS recoveryAttempts,
-                         r.command AS command
+                          c.trustedValidationRecoveryAttempts AS recoveryAttempts,
+                          r.command AS command,
+                          r.failureClass AS failureClass,
+                          json_extract(r.metadataJson, '$.baselineSha') AS baselineSha
          FROM completions c
          JOIN jobs j ON j.id = c.jobId
          JOIN job_validation_runs r ON r.jobId = c.jobId
@@ -12781,11 +12796,14 @@ class CompletionQueue {
            AND c.id != ?
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
-           AND r.passed = 0
-           AND json_extract(r.metadataJson, '$.source') = 'trusted_host'
-           AND json_extract(r.metadataJson, '$.completionId') = c.id
-           AND datetime(r.createdAt) <= datetime(?)
-         ORDER BY c.createdAt ASC, c.id ASC`).all(passingCompletion.id, TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS, now);
+            AND r.passed = 0
+            AND r.failureClass IN ('timeout', 'dependency_setup_failed', 'trusted_validation_failed')
+            AND json_extract(r.metadataJson, '$.source') = 'trusted_host'
+            AND json_extract(r.metadataJson, '$.completionId') = c.id
+            AND COALESCE(json_array_length(json_extract(r.metadataJson, '$.failedTests')), 0) = 0
+            AND json_extract(r.metadataJson, '$.baselineSha') = ?
+            AND datetime(r.createdAt) <= datetime(?)
+         ORDER BY c.createdAt ASC, c.id ASC`).all(passingCompletion.id, TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS, passingBaselineSha, now);
     const eligible = new Map;
     for (const row of rows) {
       if (!passedCommands.has(trustedValidationCommandKey(row.command)))

@@ -16,7 +16,7 @@ type CommandRunner = (
   options: { cwd: string; timeoutMs: number },
 ) => Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }>;
 
-const DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 15 * 60_000;
+const DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60_000;
 const PROCESS_TREE_TERMINATION_GRACE_MS = 5_000;
 const PROCESS_STREAM_DRAIN_GRACE_MS = 2_000;
 const PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;

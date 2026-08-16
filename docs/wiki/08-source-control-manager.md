@@ -83,7 +83,12 @@ This keeps provider-specific auth behavior in one place and reduces duplicated a
   old publication backlog remains idle; the embedded supervisor then terminates
   the full Windows process tree with `taskkill /T /F` and restarts SCM,
 - trusted validation and configured checks terminate their Windows descendant
-  trees on timeout and stop draining inherited output pipes after a bounded grace,
+  trees on timeout and stop draining inherited output pipes after a bounded grace;
+  trusted-host commands default to an eight-minute ceiling,
+- retained candidates are automatically retried only once, and only after a
+  same-command pass on the same baseline proves recovery from a transient host
+  failure without named test evidence; test, lint, and typecheck failures stay
+  blocked until a new repair candidate is produced,
 - clean-repo guard (optional skip in dev),
 - retry/backoff on transient failures,
 - bounded review diff size,

@@ -1696,9 +1696,13 @@ function extractTrustedValidationFailureEvidence(options) {
   let failureClass;
   if (options.phase === "dependency_install") {
     failureClass = "dependency_setup_failed";
-  } else if (/timed?\s*out|timeout/i.test(output) || options.exitCode === 124) {
+  } else if (options.exitCode === 124) {
     failureClass = "timeout";
-  } else if (failedTests.length > 0 || /(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
+  } else if (failedTests.length > 0) {
+    failureClass = "test_failure";
+  } else if (/timed?\s*out|timeout/i.test(output)) {
+    failureClass = "timeout";
+  } else if (/(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
     failureClass = "test_failure";
   } else if (/\b(?:tsc|typecheck|type-check)\b/i.test(command)) {
     failureClass = "typecheck_failure";
@@ -5260,7 +5264,7 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
 import { createHash } from "crypto";
 import { existsSync as existsSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync2 } from "fs";
 import { basename as basename2, resolve as resolve7 } from "path";
-var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 15 * 60000;
+var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60000;
 var PROCESS_TREE_TERMINATION_GRACE_MS = 5000;
 var PROCESS_STREAM_DRAIN_GRACE_MS = 2000;
 var PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;

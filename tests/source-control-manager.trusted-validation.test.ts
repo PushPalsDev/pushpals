@@ -73,6 +73,7 @@ describe("SourceControlManager trusted validation", () => {
       runner: async (argv, options) => {
         calls.push(argv);
         expect(options.cwd).toBe("C:/repo");
+        expect(options.timeoutMs).toBe(8 * 60_000);
         return { ok: true, output: "passed", exitCode: 0 };
       },
     });
@@ -209,6 +210,26 @@ describe("SourceControlManager trusted validation", () => {
         "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured",
       ],
       targetPathHints: ["account/__tests__/AccountContext.test.tsx"],
+    });
+  });
+
+  test("keeps named test failures classified as tests when diagnostics mention timeouts", async () => {
+    const output = [
+      "tests/runWebE2e.test.ts:",
+      "(fail) runWebE2e lifecycle > reports a timeout while draining the process tree [21ms]",
+      "ProcessTerminationError: teardown timeout after the assertion failed",
+    ].join("\n");
+    const [result] = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async () => ({ ok: false, output, exitCode: 1 }),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      exitCode: 1,
+      failureClass: "test_failure",
+      failedTests: ["runWebE2e lifecycle > reports a timeout while draining the process tree"],
     });
   });
 
