@@ -13,7 +13,8 @@ import {
   resolveWorkerpalDockerBuildCaSecretArgs,
   resolveWorkerpalDockerRuntimeCaArgs,
 } from "../apps/workerpals/src/docker_executor";
-import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { removeLinkedNodeModulesDependencyArtifact } from "../apps/workerpals/src/execute_job";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -885,7 +886,11 @@ describe("workerpals docker executor internals", () => {
           "cd /repo/worktree && bun install --ignore-scripts && rm -rf node_modules",
         ]);
         expect(`${createLockfile.stdout}\n${createLockfile.stderr}`).not.toContain("error:");
-        expect(createLockfile.exitCode).toBe(0);
+        if (createLockfile.exitCode !== 0) {
+          throw new Error(
+            `Docker lockfile preparation failed with exit ${createLockfile.exitCode}:\n${createLockfile.stdout}\n${createLockfile.stderr}`,
+          );
+        }
         const dependencyCommand = buildWorktreeDependencyPreparationCommand("/repo/worktree");
         const dependencyRunArgs = [
           "run",
@@ -910,6 +915,22 @@ describe("workerpals docker executor internals", () => {
         expect(secondProjection.exitCode).toBe(0);
         expect(secondProjection.stderr).toContain("phase=snapshot_cache_hit");
         expect(secondProjection.stderr).not.toContain("phase=install progress=20");
+
+        const hostFinalizationCleanup = removeLinkedNodeModulesDependencyArtifact(worktree);
+        expect(hostFinalizationCleanup).toEqual({ ok: true, removed: true });
+        expect(existsSync(join(worktree, "node_modules"))).toBe(false);
+        const retainedDependencySnapshot = await docker([
+          "run",
+          "--rm",
+          "--entrypoint",
+          "sh",
+          "--mount",
+          `type=volume,source=${dependencyVolume},target=/workspace/.pushpals/dependency-store`,
+          image,
+          "-lc",
+          "find /workspace/.pushpals/dependency-store -name .pushpals-dependency-ready -print -quit | grep -q .",
+        ]);
+        expect(retainedDependencySnapshot.exitCode).toBe(0);
 
         const hostAuthPath = join(authRoot, "auth.json");
         writeFileSync(hostAuthPath, '{"source":"host"}\n', "utf8");

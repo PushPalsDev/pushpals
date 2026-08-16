@@ -2759,8 +2759,18 @@ function hasLocalBinShim(binDir: string, binName: string): boolean {
 function isLinkedNodeModulesDependencyArtifact(repo: string): boolean {
   try {
     return lstatSync(resolve(repo, "node_modules")).isSymbolicLink();
-  } catch {
-    return false;
+  } catch (err) {
+    // Docker Desktop can create a Linux symlink through an NTFS bind mount
+    // that Windows exposes as a directory entry but rejects with EACCES or
+    // EINVAL when host processes inspect or open it. That opaque entry is the
+    // same managed projection and must be removed before host Git stages it.
+    const code = String((err as { code?: unknown } | null)?.code ?? "").toUpperCase();
+    if (process.platform !== "win32" || !["EACCES", "EINVAL"].includes(code)) return false;
+    try {
+      return readdirSync(repo).some((entry) => entry.toLowerCase() === "node_modules");
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -2986,27 +2996,32 @@ export function buildBunDependencyLayoutPreflightFailureRun(args: {
 export function removeLinkedNodeModulesDependencyArtifact(
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
-): void {
+): { ok: boolean; removed: boolean; error?: string } {
   const nodeModulesDir = resolve(repo, "node_modules");
-  if (
-    !isLinkedNodeModulesDependencyArtifact(repo) &&
-    !isManagedLinkedPackageDependencySnapshot(repo)
-  ) {
-    return;
+  const linkedArtifact = isLinkedNodeModulesDependencyArtifact(repo);
+  if (!linkedArtifact && !isManagedLinkedPackageDependencySnapshot(repo)) {
+    return { ok: true, removed: false };
   }
   try {
-    rmSync(nodeModulesDir, { recursive: true, force: true });
+    // A Linux symlink created through a Windows bind mount can be unreadable to
+    // host Git. Unlink the root directly so Windows never traverses its target.
+    if (linkedArtifact) {
+      unlinkSync(nodeModulesDir);
+    } else {
+      rmSync(nodeModulesDir, { recursive: true, force: true });
+    }
     onLog?.(
       "stdout",
       "[ValidationGate] Dependency layout preflight removed linked-package node_modules artifact before local Bun install repair.",
     );
+    return { ok: true, removed: true };
   } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
     onLog?.(
       "stderr",
-      `[ValidationGate] Dependency layout preflight could not remove linked node_modules artifact: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `[ValidationGate] Dependency layout preflight could not remove linked node_modules artifact: ${error}`,
     );
+    return { ok: false, removed: false, error };
   }
 }
 
@@ -7309,6 +7324,17 @@ export async function createJobCommit(
   );
   const publicBranchName = resolvedPublicBranch.branch;
   const reviewFixContext = extractReviewFixContext(job.params ?? null);
+  if (job.kind === "task.execute") {
+    const cleanup = removeLinkedNodeModulesDependencyArtifact(repo);
+    if (!cleanup.ok) {
+      return {
+        ok: false,
+        error:
+          "Failed to remove the managed node_modules dependency artifact before host-side Git finalization: " +
+          cleanup.error,
+      };
+    }
+  }
   if (extractMergeConflictReviewContext(job.params ?? null)) {
     return createMergeConflictJobCommit(repo, workerId, job, publicBranchName, runtimeConfig);
   }

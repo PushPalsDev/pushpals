@@ -5938,8 +5938,15 @@ function hasLocalBinShim(binDir, binName) {
 function isLinkedNodeModulesDependencyArtifact(repo) {
   try {
     return lstatSync2(resolve10(repo, "node_modules")).isSymbolicLink();
-  } catch {
-    return false;
+  } catch (err) {
+    const code = String(err?.code ?? "").toUpperCase();
+    if (process.platform !== "win32" || !["EACCES", "EINVAL"].includes(code))
+      return false;
+    try {
+      return readdirSync3(repo).some((entry) => entry.toLowerCase() === "node_modules");
+    } catch {
+      return false;
+    }
   }
 }
 function isManagedLinkedPackageDependencySnapshot(repo) {
@@ -6105,14 +6112,22 @@ function buildBunDependencyLayoutPreflightFailureRun(args) {
 }
 function removeLinkedNodeModulesDependencyArtifact(repo, onLog) {
   const nodeModulesDir = resolve10(repo, "node_modules");
-  if (!isLinkedNodeModulesDependencyArtifact(repo) && !isManagedLinkedPackageDependencySnapshot(repo)) {
-    return;
+  const linkedArtifact = isLinkedNodeModulesDependencyArtifact(repo);
+  if (!linkedArtifact && !isManagedLinkedPackageDependencySnapshot(repo)) {
+    return { ok: true, removed: false };
   }
   try {
-    rmSync3(nodeModulesDir, { recursive: true, force: true });
+    if (linkedArtifact) {
+      unlinkSync(nodeModulesDir);
+    } else {
+      rmSync3(nodeModulesDir, { recursive: true, force: true });
+    }
     onLog?.("stdout", "[ValidationGate] Dependency layout preflight removed linked-package node_modules artifact before local Bun install repair.");
+    return { ok: true, removed: true };
   } catch (err) {
-    onLog?.("stderr", `[ValidationGate] Dependency layout preflight could not remove linked node_modules artifact: ${err instanceof Error ? err.message : String(err)}`);
+    const error = err instanceof Error ? err.message : String(err);
+    onLog?.("stderr", `[ValidationGate] Dependency layout preflight could not remove linked node_modules artifact: ${error}`);
+    return { ok: false, removed: false, error };
   }
 }
 async function runBunDependencyLayoutPreflight(repo, validationCommands, failureValidationCommand, timeoutMs, outputPolicy, onLog) {
@@ -8986,6 +9001,15 @@ async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONF
   const resolvedPublicBranch = resolveReviewFixCompletionBranch(job.params?.completionBranch ?? reviewAgentHeadRef, defaultPublicBranchName);
   const publicBranchName = resolvedPublicBranch.branch;
   const reviewFixContext = extractReviewFixContext(job.params ?? null);
+  if (job.kind === "task.execute") {
+    const cleanup = removeLinkedNodeModulesDependencyArtifact(repo);
+    if (!cleanup.ok) {
+      return {
+        ok: false,
+        error: "Failed to remove the managed node_modules dependency artifact before host-side Git finalization: " + cleanup.error
+      };
+    }
+  }
   if (extractMergeConflictReviewContext(job.params ?? null)) {
     return createMergeConflictJobCommit(repo, workerId, job, publicBranchName, runtimeConfig);
   }

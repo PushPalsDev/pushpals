@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { loadPushPalsConfig } from "shared";
@@ -547,6 +555,84 @@ describe("workerpals rebase sync", () => {
           "confirm worker did not upload the review completion",
         );
         expect(remoteCompletionHead).toBe("");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  runRebaseSyncTest(
+    "removes a managed node_modules link before host-side review finalization",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-review-fix-dependency-artifact-"));
+      const remote = join(root, "remote.git");
+      const repo = join(root, "repo");
+      const dependencyProjection = join(root, "linux-dependency-projection");
+      const publicBranch = "agent/review/dependency-artifact";
+      try {
+        await mustGit(root, ["init", "--bare", remote], "init bare remote");
+        await mustGit(root, ["clone", remote, repo], "clone worker repo");
+        await mustGit(repo, ["config", "user.name", "PushPals Worker"], "set worker name");
+        await mustGit(
+          repo,
+          ["config", "user.email", "pushpals-worker@example.com"],
+          "set worker email",
+        );
+        writeFileSync(join(repo, "README.md"), "base\n", "utf8");
+        await mustGit(repo, ["add", "README.md"], "stage base");
+        await mustGit(repo, ["commit", "-m", "base"], "commit base");
+        await mustGit(
+          repo,
+          ["push", "origin", `HEAD:refs/heads/${publicBranch}`],
+          "publish PR head",
+        );
+        const originalHead = await mustGit(repo, ["rev-parse", "HEAD"], "resolve original head");
+
+        mkdirSync(dependencyProjection, { recursive: true });
+        writeFileSync(join(dependencyProjection, "container-only-package"), "fixture\n", "utf8");
+        symlinkSync(
+          dependencyProjection,
+          join(repo, "node_modules"),
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        writeFileSync(join(repo, "README.md"), "review fix\n", "utf8");
+
+        const runtimeConfig = loadPushPalsConfig();
+        runtimeConfig.workerpals.llm.model = "";
+        const commitResult = await createJobCommit(
+          repo,
+          "workerpal-test",
+          {
+            id: "job-review-fix-dependency-artifact",
+            taskId: "task-review-fix-dependency-artifact",
+            kind: "task.execute",
+            params: {
+              instruction: "Address reviewer feedback in README",
+              completionBranch: publicBranch,
+              reviewAgent: {
+                resolutionType: "review_fix",
+                prHeadRef: publicBranch,
+                prHeadSha: originalHead,
+                prBaseRef: "main",
+              },
+            },
+            context: "docker",
+          },
+          runtimeConfig,
+        );
+
+        expect(commitResult.ok).toBe(true);
+        expect(existsSync(join(repo, "node_modules"))).toBe(false);
+        const committedPaths = await mustGit(
+          repo,
+          ["show", "--pretty=format:", "--name-only", commitResult.sha!],
+          "inspect finalized paths",
+        );
+        expect(committedPaths.split(/\r?\n/).filter(Boolean)).toEqual(["README.md"]);
+        expect(readFileSync(join(dependencyProjection, "container-only-package"), "utf8")).toBe(
+          "fixture\n",
+        );
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
