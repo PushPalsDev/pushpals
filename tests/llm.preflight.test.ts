@@ -15,6 +15,36 @@ afterEach(() => {
 });
 
 describe("LLM preflight", () => {
+  test("bounds a model-list response body that never finishes", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start() {
+              // Headers arrive, but the provider never completes the body.
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    });
+    servers.push(server);
+    const startedAt = Date.now();
+
+    await expect(
+      preflightServiceLlm({
+        service: "localbuddy",
+        backend: "openai",
+        endpoint: `http://127.0.0.1:${server.port}/v1/chat/completions`,
+        apiKey: "test-key",
+        model: "gpt-4.1-mini",
+        httpTimeoutMs: 20,
+      }),
+    ).rejects.toThrow("model-list probe timed out after 20ms");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   test("passes when an OpenAI-compatible endpoint exposes the configured model", async () => {
     const server = Bun.serve({
       port: 0,

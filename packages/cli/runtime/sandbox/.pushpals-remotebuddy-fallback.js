@@ -14,6 +14,354 @@ import { join as join3 } from "path";
 // packages/shared/src/repo.ts
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
+
+// packages/shared/src/bounded_process.ts
+var DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
+var DEFAULT_DRAIN_TIMEOUT_MS = 2000;
+var DEFAULT_TERMINATION_TIMEOUT_MS = 5000;
+var DEFAULT_EXIT_GRACE_MS = 250;
+var MAX_STREAMING_LINE_CHARS = 64 * 1024;
+function defaultSpawner(argv, options) {
+  return Bun.spawn(argv, options);
+}
+function buildWindowsProcessTreeTerminationArgv(pid) {
+  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+function buildWindowsDescendantSweepArgv(pid) {
+  const rootPid = Math.max(0, Math.floor(pid));
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$rootPid = ${rootPid}`,
+    "$processes = @(Get-CimInstance Win32_Process)",
+    "$children = @{}",
+    "foreach ($process in $processes) {",
+    "  $parent = [int]$process.ParentProcessId",
+    "  if (-not $children.ContainsKey($parent)) { $children[$parent] = [System.Collections.Generic.List[int]]::new() }",
+    "  $children[$parent].Add([int]$process.ProcessId)",
+    "}",
+    "$stack = [System.Collections.Generic.Stack[int]]::new()",
+    "$targets = [System.Collections.Generic.List[int]]::new()",
+    "$stack.Push($rootPid)",
+    "while ($stack.Count -gt 0) {",
+    "  $parent = $stack.Pop()",
+    "  if (-not $children.ContainsKey($parent)) { continue }",
+    "  foreach ($child in $children[$parent]) { $targets.Add($child); $stack.Push($child) }",
+    "}",
+    "for ($index = $targets.Count - 1; $index -ge 0; $index--) { Stop-Process -Id $targets[$index] -Force -ErrorAction SilentlyContinue }"
+  ].join(`
+`);
+  return [
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+    Buffer.from(script, "utf16le").toString("base64")
+  ];
+}
+async function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ settled: true, value })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ settled: false }), Math.max(1, timeoutMs));
+      })
+    ]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+function captureBoundedStream(stream, maxBytes, options = {}) {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
+    return { done: Promise.resolve(""), cancel: () => {
+      return;
+    } };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  const headLimit = options.retainTail ? Math.max(1, Math.floor(maxBytes / 2)) : maxBytes;
+  const tailLimit = options.retainTail ? Math.max(0, maxBytes - headLimit) : 0;
+  let head = "";
+  let tail = "";
+  let observedChars = 0;
+  let lineBuffer = "";
+  let truncated = false;
+  let cancelled = false;
+  const emitLine = (line) => {
+    try {
+      options.onLine?.(line);
+    } catch {}
+  };
+  const retainAndEmit = (text) => {
+    if (!text)
+      return;
+    observedChars += text.length;
+    const headRemaining = Math.max(0, headLimit - head.length);
+    const headPart = headRemaining > 0 ? text.slice(0, headRemaining) : "";
+    head += headPart;
+    const remainder = text.slice(headPart.length);
+    if (remainder && tailLimit > 0)
+      tail = `${tail}${remainder}`.slice(-tailLimit);
+    truncated = observedChars > maxBytes;
+    if (!options.onLine)
+      return;
+    lineBuffer += text;
+    const lines = lineBuffer.split(`
+`);
+    lineBuffer = lines.pop() ?? "";
+    for (const line of lines)
+      emitLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+    if (lineBuffer.length > MAX_STREAMING_LINE_CHARS) {
+      emitLine(`${lineBuffer.slice(0, MAX_STREAMING_LINE_CHARS)}
+[pushpals: streaming line truncated]`);
+      lineBuffer = "";
+    }
+  };
+  const done = (async () => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done)
+          break;
+        retainAndEmit(decoder.decode(chunk.value, { stream: true }));
+      }
+      retainAndEmit(decoder.decode());
+      if (options.onLine && lineBuffer.length > 0) {
+        emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
+        lineBuffer = "";
+      }
+    } catch {} finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+    if (!truncated)
+      return head + tail;
+    const marker = `
+[pushpals: process output truncated]`;
+    return options.retainTail ? `${head}${marker}
+${tail}` : `${head}${marker}`;
+  })();
+  return {
+    done,
+    cancel: () => {
+      if (cancelled)
+        return;
+      cancelled = true;
+      try {
+        reader.cancel().catch(() => {
+          return;
+        });
+      } catch {}
+    }
+  };
+}
+async function terminateProcessTree(proc, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const spawn = options.spawn ?? defaultSpawner;
+  const terminationTimeoutMs = Math.max(1, options.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS);
+  const exitGraceMs = Math.max(1, options.exitGraceMs ?? DEFAULT_EXIT_GRACE_MS);
+  const gracefulSignalAlreadySent = options.gracefulSignalAlreadySent === true;
+  const pid = Number(proc.pid);
+  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const killer = spawn(buildWindowsProcessTreeTerminationArgv(pid), {
+        stdout: "ignore",
+        stderr: "ignore"
+      });
+      const taskkillExit = await settleWithin(killer.exited, terminationTimeoutMs);
+      if (!taskkillExit.settled) {
+        try {
+          killer.kill("SIGKILL");
+        } catch {}
+      }
+      if (!taskkillExit.settled || taskkillExit.value !== 0) {
+        try {
+          const sweeper = spawn(buildWindowsDescendantSweepArgv(pid), {
+            stdout: "ignore",
+            stderr: "ignore"
+          });
+          if (!(await settleWithin(sweeper.exited, terminationTimeoutMs)).settled) {
+            try {
+              sweeper.kill("SIGKILL");
+            } catch {}
+          }
+        } catch {}
+      }
+      if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+        return;
+    } catch {}
+  }
+  if (platform !== "win32" && Number.isFinite(pid) && pid > 0) {
+    if (gracefulSignalAlreadySent) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          return;
+        }
+      }
+      await settleWithin(proc.exited, exitGraceMs);
+      return;
+    }
+    let signalledProcessGroup = false;
+    try {
+      process.kill(-pid, "SIGTERM");
+      signalledProcessGroup = true;
+    } catch {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        return;
+      }
+    }
+    if (!signalledProcessGroup) {
+      if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+        return;
+    } else {
+      const groupDeadline = Date.now() + exitGraceMs;
+      while (Date.now() < groupDeadline) {
+        try {
+          process.kill(-pid, 0);
+        } catch (error) {
+          if (error?.code === "ESRCH")
+            return;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, groupDeadline - Date.now()))));
+      }
+    }
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+    await settleWithin(proc.exited, exitGraceMs);
+    return;
+  }
+  if (!gracefulSignalAlreadySent) {
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      return;
+    }
+    if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+      return;
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {}
+  await settleWithin(proc.exited, exitGraceMs);
+}
+async function runBoundedProcess(argv, options) {
+  const spawn = options.spawn ?? defaultSpawner;
+  const platform = options.platform ?? process.platform;
+  const proc = spawn(argv, {
+    ...options.cwd ? { cwd: options.cwd } : {},
+    ...options.env ? { env: options.env } : {},
+    ...options.stdin ? { stdin: options.stdin } : {},
+    stdout: options.stdout ?? "pipe",
+    stderr: options.stderr ?? "pipe",
+    detached: platform !== "win32"
+  });
+  const maxBytes = Math.max(1, options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const stdoutCapture = captureBoundedStream(proc.stdout, maxBytes, {
+    retainTail: options.retainOutputTail,
+    onLine: options.onStdoutLine
+  });
+  const stderrCapture = captureBoundedStream(proc.stderr, maxBytes, {
+    retainTail: options.retainOutputTail,
+    onLine: options.onStderrLine
+  });
+  const timeoutMs = Math.max(1, Math.floor(options.timeoutMs));
+  const maxTotalTimeoutMs = Math.max(timeoutMs, Math.floor(options.maxTotalTimeoutMs ?? timeoutMs));
+  const startedAtMs = Date.now();
+  let effectiveTimeoutMs = timeoutMs;
+  let deadlineAtMs = startedAtMs + timeoutMs;
+  let timer = null;
+  const outcome = await Promise.race([
+    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    new Promise((resolve) => {
+      const scheduleDeadline = () => {
+        timer = setTimeout(() => {
+          const nowMs = Date.now();
+          let requestedExtensionValue = 0;
+          try {
+            requestedExtensionValue = options.extendTimeoutMs?.({
+              startedAtMs,
+              deadlineAtMs,
+              elapsedMs: Math.max(0, nowMs - startedAtMs)
+            }) ?? 0;
+          } catch {
+            requestedExtensionValue = 0;
+          }
+          const extensionMs = Math.min(Math.max(0, Math.floor(requestedExtensionValue)), Math.max(0, maxTotalTimeoutMs - effectiveTimeoutMs));
+          if (extensionMs > 0) {
+            effectiveTimeoutMs += extensionMs;
+            deadlineAtMs = nowMs + extensionMs;
+            try {
+              options.onTimeoutExtended?.(extensionMs, deadlineAtMs);
+            } catch {}
+            scheduleDeadline();
+            return;
+          }
+          try {
+            options.onTimeout?.(Math.max(1, nowMs - startedAtMs));
+          } catch {}
+          resolve({ timedOut: true, exitCode: 124 });
+        }, Math.max(1, deadlineAtMs - Date.now()));
+      };
+      scheduleDeadline();
+    })
+  ]);
+  if (timer)
+    clearTimeout(timer);
+  const terminate = options.terminate ?? ((target) => terminateProcessTree(target, { platform, spawn }));
+  if (outcome.timedOut)
+    await terminate(proc);
+  const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
+  let streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), drainTimeoutMs);
+  const drainTimedOut = !streams.settled;
+  if (!streams.settled) {
+    if (!outcome.timedOut) {
+      if (options.terminate) {
+        await options.terminate(proc);
+      } else {
+        await terminateProcessTree(proc, {
+          platform,
+          spawn,
+          exitGraceMs: Math.min(250, Math.max(25, drainTimeoutMs))
+        });
+      }
+    }
+    stdoutCapture.cancel();
+    stderrCapture.cancel();
+    streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250);
+  }
+  const [stdout, rawStderr] = streams.settled ? streams.value : ["", ""];
+  const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
+  const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
+  const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
+  return {
+    stdout: trimOutput(stdout),
+    stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
+`),
+    exitCode: outcome.exitCode,
+    timedOut: outcome.timedOut,
+    drainTimedOut
+  };
+}
+
+// packages/shared/src/repo.ts
 function resolveDotGitEntry(repoRoot) {
   return resolve(repoRoot, ".git");
 }
@@ -70,6 +418,118 @@ function detectRepoRoot(startDir) {
   console.warn(`[repo] No .git directory found, using: ${startDir}`);
   return startDir;
 }
+// packages/shared/src/bounded_fetch.ts
+var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
+async function fetchWithHardDeadline(options) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.floor(options.timeoutMs)) : 1;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const controller = new AbortController;
+  const upstreamSignal = options.init?.signal;
+  let rejectUpstreamAbort = null;
+  const upstreamAbort = new Promise((_resolve, reject) => {
+    rejectUpstreamAbort = reject;
+  });
+  const abortFromUpstream = () => {
+    controller.abort(upstreamSignal?.reason);
+    rejectUpstreamAbort?.(upstreamSignal?.reason instanceof Error ? upstreamSignal.reason : new DOMException("The HTTP request was aborted", "AbortError"));
+  };
+  if (upstreamSignal?.aborted) {
+    abortFromUpstream();
+  } else {
+    upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+  }
+  let timer = null;
+  const operation = Promise.resolve().then(async () => {
+    const response = await fetchImpl(options.input, {
+      ...options.init,
+      signal: controller.signal
+    });
+    return await options.consume(response, controller.signal);
+  });
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(options.timeoutMessage ?? `HTTP request timed out after ${timeoutMs}ms`));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race(upstreamSignal ? [operation, deadline, upstreamAbort] : [operation, deadline]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+  }
+}
+async function fetchBufferedWithHardDeadline(options) {
+  const { maxResponseBytes: configuredMaxResponseBytes, ...requestOptions } = options;
+  const maxResponseBytes = typeof configuredMaxResponseBytes === "number" && Number.isFinite(configuredMaxResponseBytes) && configuredMaxResponseBytes >= 0 ? Math.floor(configuredMaxResponseBytes) : DEFAULT_MAX_BUFFERED_RESPONSE_BYTES;
+  return fetchWithHardDeadline({
+    ...requestOptions,
+    consume: async (response, signal) => {
+      const responseInit = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      };
+      if (!response.body)
+        return new Response(null, responseInit);
+      const reader = response.body.getReader();
+      const sizeError = () => new Error(`HTTP response exceeded ${maxResponseBytes} byte buffer limit`);
+      const cancelReader = () => {
+        try {
+          reader.cancel(signal.reason).catch(() => {
+            return;
+          });
+        } catch {}
+      };
+      signal.addEventListener("abort", cancelReader, { once: true });
+      if (signal.aborted)
+        cancelReader();
+      try {
+        const contentLengthHeader = response.headers.get("content-length");
+        const contentLength = contentLengthHeader == null ? null : Number(contentLengthHeader);
+        if (contentLength != null && Number.isFinite(contentLength) && contentLength > maxResponseBytes) {
+          const error = sizeError();
+          await reader.cancel(error).catch(() => {
+            return;
+          });
+          throw error;
+        }
+        const chunks = [];
+        let totalBytes = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done)
+            break;
+          totalBytes += value.byteLength;
+          if (totalBytes > maxResponseBytes) {
+            const error = sizeError();
+            await reader.cancel(error).catch(() => {
+              return;
+            });
+            throw error;
+          }
+          chunks.push(value);
+        }
+        if (totalBytes === 0)
+          return new Response(null, responseInit);
+        const body = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          body.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return new Response(body, responseInit);
+      } finally {
+        signal.removeEventListener("abort", cancelReader);
+        try {
+          reader.releaseLock();
+        } catch {}
+      }
+    }
+  });
+}
+
 // packages/shared/src/communication.ts
 function stripPresenceSourcePrefix(value) {
   return value.replace(/^(agent|client)(?:[\s:./_-]+)+/i, "");
@@ -87,12 +547,14 @@ class CommunicationManager {
   from;
   authToken;
   fetchImpl;
+  requestTimeoutMs;
   constructor(opts) {
     this.serverUrl = opts.serverUrl;
     this.sessionId = opts.sessionId;
     this.from = opts.from;
     this.authToken = opts.authToken ?? null;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.requestTimeoutMs = Math.max(1, Math.min(120000, Math.floor(opts.requestTimeoutMs ?? 1e4)));
   }
   headers() {
     const headers = { "Content-Type": "application/json" };
@@ -134,10 +596,16 @@ class CommunicationManager {
         body.turnId = meta.turnId;
       if (meta.parentId)
         body.parentId = meta.parentId;
-      const response = await this.fetchImpl(this.commandUrl(sessionId), {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body)
+      const response = await fetchBufferedWithHardDeadline({
+        input: this.commandUrl(sessionId),
+        init: {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body)
+        },
+        timeoutMs: this.requestTimeoutMs,
+        fetchImpl: this.fetchImpl,
+        timeoutMessage: `session command timed out after ${this.requestTimeoutMs}ms`
       });
       return response.ok;
     } catch {
@@ -1858,10 +2326,26 @@ var DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 var LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.5";
 var DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 var DEFAULT_CODEX_TIMEOUT_MS = 120000;
+var DEFAULT_LLM_HTTP_TIMEOUT_MS = 120000;
+var DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS = 1e4;
+var DEFAULT_LLM_TELEMETRY_TIMEOUT_MS = 5000;
 var DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 var DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 var DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
 var DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES = 3;
+function resolveLlmHttpTimeoutMs(explicit, fallback) {
+  const environmentValue = Number(process.env.PUSHPALS_LLM_HTTP_TIMEOUT_MS);
+  const configured = typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0 ? explicit : Number.isFinite(environmentValue) && environmentValue > 0 ? environmentValue : fallback;
+  return Math.max(1, Math.floor(configured));
+}
+function fetchLlmHttpResponse(input, init, timeoutMs, operation) {
+  return fetchBufferedWithHardDeadline({
+    input,
+    init,
+    timeoutMs,
+    timeoutMessage: `${operation} timed out after ${timeoutMs}ms`
+  });
+}
 var CONTEXT_PACKER_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/context_packer_system_prompt.md").trim();
 var CONTEXT_PACKER_CONDENSED_HISTORY_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/context_packer_condensed_history_system_prompt.md").trim();
 var KNOWN_PROVIDER_PREFIXES = new Set([
@@ -2064,54 +2548,22 @@ async function runProcess(command, opts) {
   return runProcessWithNode(command, opts);
 }
 async function runProcessWithBun(command, opts) {
-  const bunRuntime = globalThis.Bun;
-  const timeoutMs = opts.timeoutMs ?? 0;
-  let timedOut = false;
-  let timeout = null;
-  let killTimeout = null;
-  const proc = bunRuntime.spawn(command, {
+  const timeoutMs = typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? Math.floor(opts.timeoutMs) : DEFAULT_CODEX_TIMEOUT_MS;
+  const result = await runBoundedProcess(command, {
     cwd: opts.cwd,
     env: opts.env,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe"
+    stdin: typeof opts.stdin === "string" ? new Blob([opts.stdin]) : "ignore",
+    timeoutMs,
+    outputLimitBytes: 4 * 1024 * 1024,
+    streamDrainTimeoutMs: 2000
   });
-  const stdoutPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
-  if (timeoutMs > 0) {
-    timeout = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill("SIGTERM");
-      } catch {}
-      killTimeout = setTimeout(() => {
-        try {
-          proc.kill("SIGKILL");
-        } catch {}
-      }, 1000);
-      killTimeout.unref?.();
-    }, timeoutMs);
-  }
-  try {
-    if (typeof opts.stdin === "string") {
-      proc.stdin?.write(opts.stdin);
-    }
-    proc.stdin?.end();
-    const code = await proc.exited;
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-    return {
-      code,
-      signal: null,
-      stdout,
-      stderr,
-      timedOut
-    };
-  } finally {
-    if (timeout)
-      clearTimeout(timeout);
-    if (killTimeout)
-      clearTimeout(killTimeout);
-  }
+  return {
+    code: result.exitCode,
+    signal: result.timedOut ? "SIGKILL" : null,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    timedOut: result.timedOut
+  };
 }
 async function runProcessWithNode(command, opts) {
   const timeoutMs = opts.timeoutMs ?? 0;
@@ -2397,17 +2849,18 @@ function createHttpUsageReporter(opts) {
   const serverUrl = (opts.serverUrl ?? "").trim().replace(/\/+$/, "");
   if (!serverUrl)
     return null;
+  const timeoutMs = Math.min(resolveLlmHttpTimeoutMs(opts.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS), DEFAULT_LLM_TELEMETRY_TIMEOUT_MS);
   return {
     async reportUsage(event) {
       const headers = { "Content-Type": "application/json" };
       const authToken = (opts.authToken ?? "").trim();
       if (authToken)
         headers.Authorization = `Bearer ${authToken}`;
-      const response = await fetch(`${serverUrl}/telemetry/llm-usage`, {
+      const response = await fetchLlmHttpResponse(`${serverUrl}/telemetry/llm-usage`, {
         method: "POST",
         headers,
         body: JSON.stringify(event)
-      });
+      }, timeoutMs, "LLM usage telemetry request");
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         throw new Error(`usage telemetry rejected (${response.status})${detail ? `: ${detail.trim()}` : ""}`);
@@ -2572,6 +3025,7 @@ class LmStudioClient {
   batchTailMessages;
   batchChunkTokens;
   batchMemoryChars;
+  httpTimeoutMs;
   resolvedModel = null;
   resolveModelPromise = null;
   lmStudioSupportsExtendedSessionFields = null;
@@ -2594,6 +3048,7 @@ class LmStudioClient {
     this.batchTailMessages = Math.max(1, lmStudio?.batchTailMessages ?? DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES);
     this.batchChunkTokens = Math.max(0, lmStudio?.batchChunkTokens ?? 0);
     this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
+    this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
   async maybeReportUsage(modelId, usage) {
     if (!this.usageReporter)
@@ -2654,9 +3109,10 @@ class LmStudioClient {
       headers.Authorization = `Bearer ${this.apiKey.trim()}`;
     }
     let lastDetail = "model-list probe failed";
+    const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
     for (const url of probes) {
       try {
-        const res = await fetch(url, { method: "GET", headers });
+        const res = await fetchLlmHttpResponse(url, { method: "GET", headers }, timeoutMs, `${this.providerLabel} model-list probe`);
         if (!res.ok) {
           const body = await res.text();
           const hint = body.trim().slice(0, 120);
@@ -2785,11 +3241,11 @@ class LmStudioClient {
         headers["X-Session-Id"] = this.sessionTag;
         headers["X-Conversation-Id"] = this.sessionTag;
       }
-      const res = await fetch(this.endpoint, {
+      const res = await fetchLlmHttpResponse(this.endpoint, {
         method: "POST",
         headers,
         body: JSON.stringify(body)
-      });
+      }, this.httpTimeoutMs, `${this.providerLabel} completion request`);
       if (!res.ok) {
         lastStatus = res.status;
         lastError = await res.text();
@@ -3152,6 +3608,7 @@ class OllamaClient {
   service;
   sessionTag;
   usageReporter;
+  httpTimeoutMs;
   constructor(opts) {
     const rawEndpoint = opts?.endpoint ?? DEFAULT_OLLAMA_ENDPOINT;
     this.endpoint = normalizeOllamaEndpoint(rawEndpoint);
@@ -3159,6 +3616,7 @@ class OllamaClient {
     this.service = opts?.service ?? "remotebuddy";
     this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
     this.usageReporter = opts?.usageReporter ?? null;
+    this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
   async maybeReportUsage(usage) {
     if (!this.usageReporter)
@@ -3182,9 +3640,10 @@ class OllamaClient {
     const base = this.endpoint.replace(/\/api\/chat$/, "");
     const probes = uniqueNonEmptyStrings([`${base}/api/tags`, this.endpoint]);
     let lastDetail = "model-list probe failed";
+    const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
     for (const url of probes) {
       try {
-        const res = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
+        const res = await fetchLlmHttpResponse(url, { method: "GET", headers: { Accept: "application/json" } }, timeoutMs, "Ollama model-list probe");
         if (!res.ok) {
           const body = await res.text();
           const hint = body.trim().slice(0, 120);
@@ -3235,11 +3694,11 @@ class OllamaClient {
     if (input.json) {
       body.format = "json";
     }
-    const res = await fetch(this.endpoint, {
+    const res = await fetchLlmHttpResponse(this.endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
-    });
+    }, this.httpTimeoutMs, "Ollama completion request");
     if (!res.ok) {
       const err = await res.text();
       throw new Error(`Ollama API error ${res.status}: ${err}`);
@@ -3283,7 +3742,8 @@ function createLLMClient(opts = {}) {
       model: resolved.model,
       service,
       sessionId: resolved.sessionId,
-      usageReporter
+      usageReporter,
+      httpTimeoutMs: opts.httpTimeoutMs
     });
   }
   if (resolved.backend === "openai") {
@@ -3296,7 +3756,8 @@ function createLLMClient(opts = {}) {
       service,
       sessionId: resolved.sessionId,
       lmStudio: resolved.lmStudio,
-      usageReporter
+      usageReporter,
+      httpTimeoutMs: opts.httpTimeoutMs
     });
   }
   console.log(`[LLM] Using LM Studio backend (model: ${resolved.model}, endpoint: ${resolved.endpoint})`);
@@ -3308,7 +3769,8 @@ function createLLMClient(opts = {}) {
     service,
     sessionId: resolved.sessionId,
     lmStudio: resolved.lmStudio,
-    usageReporter
+    usageReporter,
+    httpTimeoutMs: opts.httpTimeoutMs
   });
 }
 
@@ -5341,7 +5803,7 @@ function activeValidationIncident(snapshot) {
     return null;
   const failureClass = asString2(incident.failure_class).trim().toLowerCase();
   const sampleError = asString2(incident.sample_error).toLowerCase();
-  if (failureClass === "environment" || failureClass === "trusted_validation_required" || sampleError.includes("trusted-environment validation deferred before execution") || sampleError.includes("worker sandbox intentionally has no docker socket") && sampleError.includes("run this command on the trusted host")) {
+  if (failureClass === "environment" || failureClass === "trusted_validation_required" || failureClass === "dependency_setup_failed" || sampleError.includes("trusted-environment validation deferred before execution") || sampleError.includes("worker sandbox intentionally has no docker socket") && sampleError.includes("run this command on the trusted host") || /\b(?:econnreset|econnrefused|etimedout|network is unreachable|could not resolve host|temporary failure|tls handshake|certificate verify|unable to verify|docker daemon|cannot connect to (?:the )?docker|missing runtime|credential|permission denied)\b/i.test(sampleError)) {
     return null;
   }
   return incident;
@@ -5394,10 +5856,13 @@ function validationRepairCommandTargetCandidates(incident) {
   return ["package.json", "src", "app"];
 }
 function validationRepairTargetPaths(params) {
-  const candidates = [
-    ...asStringArray2(params.incident.target_path_hints),
-    ...validationRepairCommandTargetCandidates(params.incident)
-  ];
+  const incidentHints = asStringArray2(params.incident.target_path_hints);
+  const normalizedHints = incidentHints.map((candidate) => normalizeAutonomyComponentArea(candidate)).filter((candidate) => Boolean(candidate)).filter((candidate, index, values) => values.indexOf(candidate) === index);
+  const candidateSpecific = asString2(params.incident.validation_scope) === "candidate_specific";
+  const exactEvidenceHints = candidateSpecific ? normalizedHints : normalizedHints.filter((candidate) => existsSync4(resolve4(params.repoRoot, candidate)));
+  if (exactEvidenceHints.length > 0)
+    return exactEvidenceHints.slice(0, 6);
+  const candidates = [...validationRepairCommandTargetCandidates(params.incident)];
   const seen = new Set;
   const existing = [];
   for (const candidate of candidates) {
@@ -5464,6 +5929,8 @@ function buildValidationIncidentRepairCandidate(params) {
   const failedJobCount = asStringArray2(incident.failed_job_ids).length;
   const sample = compactStatusDetail(asString2(incident.sample_error), 600);
   const failedTests = asStringArray2(incident.failed_tests);
+  const validationScope = asString2(incident.validation_scope) === "baseline_suspected" && asBoolean2(incident.baseline_failure_proven, false) ? "baseline_suspected" : asString2(incident.validation_scope) === "worker_local" ? "worker_local" : asString2(incident.validation_scope) === "candidate_unavailable" ? "candidate_unavailable" : "candidate_specific";
+  const candidateSha = asString2(incident.candidate_sha);
   const signalIds = params.snapshot.top_signals.filter((signal) => signal.signal_id === "sig_validation_incident" || signal.evidence.toLowerCase().includes(command.toLowerCase())).map((signal) => signal.signal_id);
   return {
     id: `cand_validation_repair_${sha256(`${command}|${asString2(incident.digest)}`).slice(0, 8)}`,
@@ -5473,10 +5940,12 @@ function buildValidationIncidentRepairCandidate(params) {
       "Required validation is repeatedly failing before publication.",
       `Primary failing command: ${command}.`,
       `Recent failures: ${failureCount} across ${failedJobCount} job(s).`,
-      incident.cross_job_circuit_open ? "The cross-job publication circuit is open; normal autonomy is paused for this failing baseline." : "",
+      incident.cross_job_circuit_open ? "The same deterministic publication failure has been confirmed across jobs." : "",
       failedTests.length > 0 ? `Failed tests: ${failedTests.join("; ")}.` : "",
       sample ? `Latest failure excerpt: ${sample}` : "",
-      "Fix the repo baseline issue that makes this command fail, then rerun the failing command and related required validation."
+      candidateSha ? `Exact failing candidate SHA: ${candidateSha}.` : "",
+      validationScope === "baseline_suspected" ? "Trusted validation reproduced the same failure directly on the baseline; repair the smallest baseline-owned root cause." : validationScope === "candidate_unavailable" ? "The exact tested candidate was not retained. Investigate from the current integration baseline without claiming candidate-specific provenance." : "Treat this as candidate-specific until trusted evidence proves the baseline independently fails.",
+      "Fix the evidence-backed failure, then rerun the failing command and related required validation."
     ].filter(Boolean).join(`
 `),
     trigger_type: triggerType,
@@ -5506,10 +5975,12 @@ function validationRepairInstruction(candidate, incident) {
     candidate.problem_statement,
     "",
     "Course of action:",
+    asString2(incident.candidate_sha) ? `- Start from the host-prepared exact candidate SHA ${asString2(incident.candidate_sha)}.` : "",
     `- Reproduce the failing command first: ${asString2(incident.command)}`,
     ...asStringArray2(incident.failed_tests).map((testName) => `- Reproduce failed test: ${testName}`),
     "- Identify whether the root cause is code, test, tooling, or local repo configuration.",
-    "- Fix the baseline failure in the smallest repo-owned scope that makes the command pass.",
+    asString2(incident.validation_scope) === "baseline_suspected" && asBoolean2(incident.baseline_failure_proven, false) ? "- Confirm and fix the shared baseline root cause in the smallest repo-owned scope." : asString2(incident.validation_scope) === "candidate_unavailable" ? "- Investigate from the current integration baseline; no exact failing candidate is available, so do not claim candidate-specific provenance." : "- Fix the candidate-specific failure in the smallest evidence-backed repo-owned scope.",
+    "- Do not switch branches, rebase, merge, or push. Host-side SCM owns Git state and publication.",
     "- If the failure is caused by missing local data, credentials, or environment that cannot be repaired in repo code, report that blocker clearly instead of masking it.",
     "",
     "Scope:",
@@ -7000,15 +7471,38 @@ async function withTimeout(promise, timeoutMs, reason) {
   }
 }
 async function gitOutput(repo, args) {
-  const proc = Bun.spawn(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
-  const [stdout, _stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited
-  ]);
-  if (exitCode !== 0)
+  const result = await runAutonomyGitCommand(repo, args);
+  if (!result.ok)
     return "";
-  return stdout.trim();
+  return result.stdout;
+}
+var AUTONOMY_LOCAL_GIT_TIMEOUT_MS = 30000;
+var AUTONOMY_NETWORK_GIT_TIMEOUT_MS = 120000;
+function resolveAutonomyGitCommandTimeoutMs(args) {
+  return args.some((arg) => ["fetch", "pull", "push", "ls-remote"].includes(arg)) ? AUTONOMY_NETWORK_GIT_TIMEOUT_MS : AUTONOMY_LOCAL_GIT_TIMEOUT_MS;
+}
+async function runAutonomyGitCommand(cwd, args, timeoutMs = resolveAutonomyGitCommandTimeoutMs(args)) {
+  try {
+    const result = await runBoundedProcess(["git", ...args], {
+      cwd,
+      timeoutMs,
+      outputLimitBytes: 2 * 1024 * 1024,
+      streamDrainTimeoutMs: 2000
+    });
+    return {
+      ok: result.exitCode === 0,
+      exitCode: result.exitCode,
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim()
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      exitCode: 127,
+      stdout: "",
+      stderr: `Unable to start bounded Git command: ${String(error)}`
+    };
+  }
 }
 function sanitizeForGitRef(value) {
   const text = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
@@ -7054,6 +7548,7 @@ function autonomyIntegrationBaselineDecision(options) {
     return "synced";
   return "use_integration_head";
 }
+var AUTONOMY_CONTROL_HTTP_TIMEOUT_MS = 1e4;
 
 class RemoteBuddyAutonomousEngine {
   server;
@@ -7157,6 +7652,14 @@ class RemoteBuddyAutonomousEngine {
     if (this.authToken)
       headers.Authorization = `Bearer ${this.authToken}`;
     return headers;
+  }
+  fetchControl(input, init, timeoutMs = AUTONOMY_CONTROL_HTTP_TIMEOUT_MS) {
+    return fetchBufferedWithHardDeadline({
+      input,
+      init,
+      timeoutMs,
+      timeoutMessage: `RemoteBuddy autonomy control request timed out after ${timeoutMs}ms`
+    });
   }
   lockTtlMs() {
     const maxPhaseTimeoutMs = Math.max(this.phaseTimeoutMs("ideation"), this.phaseTimeoutMs("scoring"), this.phaseTimeoutMs("planning"));
@@ -7285,19 +7788,8 @@ class RemoteBuddyAutonomousEngine {
       truncated
     };
   }
-  async runGit(cwd, args) {
-    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited
-    ]);
-    return {
-      ok: exitCode === 0,
-      exitCode,
-      stdout: stdout.trim(),
-      stderr: stderr.trim()
-    };
+  runGit(cwd, args, timeoutMs) {
+    return runAutonomyGitCommand(cwd, args, timeoutMs);
   }
   async ensureAutonomyRepoReady(runId) {
     const integrationRef = `${this.gitRemote}/${this.integrationBranch}`;
@@ -7368,7 +7860,7 @@ class RemoteBuddyAutonomousEngine {
       isWorktreeDirty: preflight.isWorktreeDirty ? "true" : "false",
       isMergeInProgress: preflight.isMergeInProgress ? "true" : "false"
     });
-    const res = await fetch(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
       method: "GET",
       headers: this.headers()
     });
@@ -7379,7 +7871,7 @@ class RemoteBuddyAutonomousEngine {
   }
   async fetchWorkerLoadSnapshot() {
     try {
-      const res = await fetch(`${this.server}/workers/autoscale?ttlMs=15000`, {
+      const res = await this.fetchControl(`${this.server}/workers/autoscale?ttlMs=15000`, {
         method: "GET",
         headers: this.headers()
       });
@@ -7432,7 +7924,7 @@ class RemoteBuddyAutonomousEngine {
     const qs = new URLSearchParams({
       limit: String(Math.max(1, Math.min(400, Math.floor(limit))))
     });
-    const res = await fetch(`${this.server}/autonomy/inspiration?${qs.toString()}`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/inspiration?${qs.toString()}`, {
       method: "GET",
       headers: this.headers()
     });
@@ -7446,7 +7938,7 @@ class RemoteBuddyAutonomousEngine {
       limit: String(Math.max(1, Math.min(400, Math.floor(limit)))),
       feedbackLimit: "1"
     });
-    const res = await fetch(`${this.server}/autonomy/insights?${qs.toString()}`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/insights?${qs.toString()}`, {
       method: "GET",
       headers: this.headers()
     });
@@ -7507,7 +7999,7 @@ class RemoteBuddyAutonomousEngine {
     if (entries.length === 0)
       return;
     try {
-      const res = await fetch(`${this.server}/autonomy/inspiration/ingest`, {
+      const res = await this.fetchControl(`${this.server}/autonomy/inspiration/ingest`, {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify({ entries })
@@ -7537,7 +8029,7 @@ class RemoteBuddyAutonomousEngine {
     return summarizeCommitHistoryHints(subjects).slice(0, 8);
   }
   async postObjective(payload) {
-    const res = await fetch(`${this.server}/autonomy/objectives`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/objectives`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(payload)
@@ -7546,7 +8038,7 @@ class RemoteBuddyAutonomousEngine {
   }
   async acquireDispatchLock(runId) {
     const ttlMs = this.lockTtlMs();
-    const res = await fetch(`${this.server}/autonomy/lock/acquire`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/lock/acquire`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -7563,7 +8055,7 @@ class RemoteBuddyAutonomousEngine {
     return { ok: false, reason };
   }
   async renewDispatchLock(runId) {
-    const res = await fetch(`${this.server}/autonomy/lock/renew`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/lock/renew`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -7575,7 +8067,7 @@ class RemoteBuddyAutonomousEngine {
     return res.ok;
   }
   async releaseDispatchLock(runId) {
-    await fetch(`${this.server}/autonomy/lock/release`, {
+    await this.fetchControl(`${this.server}/autonomy/lock/release`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -7673,7 +8165,7 @@ ${JSON.stringify(input.messages ?? [])}`),
       return null;
     const canonicalInstruction = canonicalizeInstructionTextForBun(instruction);
     const reservationRequired = autonomy.reservationRequired !== false;
-    const res = await fetch(`${this.server}/requests/enqueue`, {
+    const res = await this.fetchControl(`${this.server}/requests/enqueue`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -7693,6 +8185,7 @@ ${JSON.stringify(input.messages ?? [])}`),
             componentArea: autonomy.componentArea,
             targetPaths: autonomy.targetPaths,
             writeGlobs: autonomy.writeGlobs,
+            ...autonomy.validationIncident ? { validationIncident: autonomy.validationIncident } : {},
             reservationRequired
           }
         }
@@ -7716,7 +8209,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         console.warn(`[RemoteBuddyAutonomousEngine] Suppressing failed target cluster for ${retryAfterMs}ms and continuing future selection on other components.`);
         return null;
       }
-      if (res.status === 429 && (code === "autonomy_worker_failure_circuit_open" || code === "autonomy_similar_no_publishable_suppressed" || code === "autonomy_queue_backpressure" || code === "autonomy_open_pr_limit")) {
+      if (res.status === 429 && (code === "autonomy_worker_failure_circuit_open" || code === "autonomy_similar_no_publishable_suppressed" || code === "autonomy_queue_backpressure" || code === "autonomy_publication_backpressure" || code === "autonomy_open_pr_limit")) {
         this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
         this.dispatchBackoffReason = compactStatusDetail(code || String(errorPayload.message ?? "autonomy_enqueue_rejected")) || "autonomy_enqueue_rejected";
       }
@@ -7844,7 +8337,7 @@ ${JSON.stringify(input.messages ?? [])}`),
   }
   async fetchEligibility(runId, snapshotId, candidates) {
     const out = new Map;
-    const res = await fetch(`${this.server}/autonomy/eligibility`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/eligibility`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -7929,16 +8422,30 @@ ${JSON.stringify(input.messages ?? [])}`),
     });
     if (!candidate) {
       return {
-        handled: true,
+        handled: false,
         outcome: "skipped",
-        detail: "validation_repair_candidate_unavailable"
+        detail: "validation_repair_candidate_unavailable_continue_ideation"
       };
     }
     const patternKey = makePatternKey(candidate.objective_type, candidate.target_paths, candidate.trigger_type, candidate.component_area);
-    const hasActiveRepair = params.snapshot.open_objectives.some((objective) => objective.pattern_key === patternKey && VALIDATION_REPAIR_ACTIVE_STATUSES.has(asString2(objective.status)));
+    const incidentKey = asString2(incident.incident_id) || `valid_inc_${asString2(incident.digest)}`;
+    const hasActiveRepair = params.snapshot.open_objectives.some((objective) => (objective.incident_key === incidentKey || objective.pattern_key === patternKey) && VALIDATION_REPAIR_ACTIVE_STATUSES.has(asString2(objective.status)));
     if (hasActiveRepair) {
-      console.log(`[RemoteBuddyAutonomousEngine] tick ${params.runId}: validation repair already active for ${asString2(incident.command)}; skipping normal autonomy while required validation remains red.`);
-      return { handled: true, outcome: "skipped", detail: "validation_repair_already_active" };
+      console.log(`[RemoteBuddyAutonomousEngine] tick ${params.runId}: validation repair already active for ${asString2(incident.command)}; continuing normal ideation for another component.`);
+      return {
+        handled: false,
+        outcome: "skipped",
+        detail: "validation_repair_already_active_continue_ideation"
+      };
+    }
+    const unchangedFailedRepairs = (params.snapshot.recent_objectives ?? []).filter((objective) => objective.incident_key === incidentKey && Boolean(asString2(objective.job_id)) && objective.deterministic_repair_failure === true && asString2(objective.attempt_failure_fingerprint) === asString2(incident.failure_fingerprint) && ["failed", "dead_letter"].includes(asString2(objective.status))).length;
+    if (asString2(incident.failure_fingerprint) && unchangedFailedRepairs >= 2) {
+      console.warn(`[RemoteBuddyAutonomousEngine] tick ${params.runId}: validation incident ${incidentKey} has ${unchangedFailedRepairs} executed deterministic repairs with the same fingerprint; moving normal ideation to another component until evidence changes.`);
+      return {
+        handled: false,
+        outcome: "skipped",
+        detail: "validation_repair_circuit_open_continue_ideation"
+      };
     }
     this.setPhase("validation_repair_eligibility");
     const eligibilityById = await this.fetchEligibility(params.runId, params.snapshot.snapshot_id, [
@@ -7987,7 +8494,8 @@ ${JSON.stringify(input.messages ?? [])}`),
           expected_validation: candidate.expected_validation,
           status: "rejected",
           block_reason: reason,
-          required_validation_repair: true
+          required_validation_repair: true,
+          incident_key: incidentKey
         },
         llmCalls: []
       });
@@ -8034,6 +8542,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         expected_validation: candidate.expected_validation,
         status: "gated",
         required_validation_repair: true,
+        incident_key: incidentKey,
         evidence: { validation_incident: incident },
         score_breakdown: {
           llm_score: 1,
@@ -8061,7 +8570,15 @@ ${JSON.stringify(input.messages ?? [])}`),
       patternKey,
       componentArea: candidate.component_area,
       targetPaths: candidate.target_paths,
-      writeGlobs: candidate.scope.write_globs
+      writeGlobs: candidate.scope.write_globs,
+      validationIncident: {
+        incidentId: incidentKey,
+        candidateSha: asString2(incident.candidate_sha) || undefined,
+        candidateRef: asString2(incident.candidate_ref) || undefined,
+        baselineSha: asString2(incident.baseline_sha) || undefined,
+        validationScope: asString2(incident.validation_scope) || undefined,
+        failureFingerprint: asString2(incident.failure_fingerprint) || undefined
+      }
     });
     if (!requestId) {
       await this.postObjective({
@@ -8091,7 +8608,8 @@ ${JSON.stringify(input.messages ?? [])}`),
           expected_validation: candidate.expected_validation,
           status: "failed",
           block_reason: "request_enqueue_failed",
-          required_validation_repair: true
+          required_validation_repair: true,
+          incident_key: incidentKey
         },
         llmCalls: []
       });
@@ -9212,7 +9730,16 @@ function buildWorkerSpawnCommand(options) {
 }
 
 // apps/remotebuddy/src/remotebuddy_main.ts
-var AUTONOMY_TASK_DEDUPE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+var TASK_EXECUTE_REQUEST_IDEMPOTENCY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+var REQUEST_LEASE_MS = 3 * 60000;
+var REQUEST_LEASE_HEARTBEAT_MS = 30000;
+var REQUEST_LEASE_RENEW_TIMEOUT_MS = 1e4;
+var REQUEST_TRANSITION_MAX_ATTEMPTS = 3;
+var REQUEST_TRANSITION_TIMEOUT_MS = 1e4;
+var JOB_ENQUEUE_MAX_ATTEMPTS = 3;
+var JOB_ENQUEUE_TIMEOUT_MS = 1e4;
+var SERVICE_CONTROL_HTTP_TIMEOUT_MS = 1e4;
+var STARTUP_SESSION_HTTP_TIMEOUT_MS = 5000;
 var CONFIG = loadPushPalsConfig();
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -9327,6 +9854,22 @@ function toSingleLine(value, max = 220) {
     return "";
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
+async function withHardDeadline(operation, timeoutMs, timeoutMessage) {
+  const controller = new AbortController;
+  let timer = null;
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(timeoutMessage));
+    }, Math.max(1, Math.floor(timeoutMs)));
+  });
+  try {
+    return await Promise.race([operation(controller.signal), deadline]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
 function asObject2(value) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
@@ -9386,6 +9929,9 @@ function buildTaskExecuteDedupeKey(sessionId, params) {
   if (!normalizedSessionId)
     return null;
   const normalizedOrigin = params.origin === "autonomy" ? "autonomy" : "user";
+  const normalizedRequestId = String(params.requestId ?? "").trim().toLowerCase();
+  if (!normalizedRequestId)
+    return null;
   const rawTargetPaths = Array.isArray(params.planning.targetPaths) ? params.planning.targetPaths : [];
   const normalizedTargets = rawTargetPaths.map((entry) => normalizeTargetPath(entry)).filter((entry) => Boolean(entry)).filter((entry) => entry !== ".").slice(0, 8);
   if (normalizedTargets.length === 0)
@@ -9397,12 +9943,20 @@ function buildTaskExecuteDedupeKey(sessionId, params) {
   if (typeof maxFilesToEdit === "number" && Number.isFinite(maxFilesToEdit) && maxFilesToEdit > 4) {
     return null;
   }
-  return `task.execute:${normalizedOrigin}:${normalizedSessionId}:${uniqueTargets.join("|")}`.toLowerCase();
+  return `task.execute:${normalizedOrigin}:${normalizedSessionId}:request:${normalizedRequestId}:${uniqueTargets.join("|")}`.toLowerCase();
 }
-function resolveTaskExecuteDedupeCooldownMs(params, dedupeKey) {
+function buildTaskExecuteRequestDedupeKey(sessionId, params) {
+  const normalizedSessionId = String(sessionId ?? "").trim().toLowerCase();
+  const normalizedRequestId = String(params.requestId ?? "").trim().toLowerCase();
+  if (!normalizedSessionId || !normalizedRequestId)
+    return null;
+  const normalizedOrigin = params.origin === "autonomy" ? "autonomy" : "user";
+  return `task.execute:${normalizedOrigin}:${normalizedSessionId}:request:${normalizedRequestId}:idempotent`;
+}
+function resolveTaskExecuteDedupeCooldownMs(_params, dedupeKey) {
   if (!dedupeKey)
     return 0;
-  return params.origin === "autonomy" ? AUTONOMY_TASK_DEDUPE_COOLDOWN_MS : 0;
+  return TASK_EXECUTE_REQUEST_IDEMPOTENCY_COOLDOWN_MS;
 }
 function parseAutonomyRequestMetadata(value) {
   let root = asObject2(value);
@@ -9424,6 +9978,8 @@ function parseAutonomyRequestMetadata(value) {
   if (rootOrigin !== "autonomy" && autonomyOrigin !== "autonomy")
     return null;
   const payload = autonomy ?? root;
+  const validationIncidentRaw = asObject2(payload.validationIncident ?? payload.validation_incident);
+  const validationIncidentId = String(validationIncidentRaw?.incidentId ?? validationIncidentRaw?.incident_id ?? "").trim();
   return {
     origin: "autonomy",
     objectiveId: String(payload.objectiveId ?? payload.objective_id ?? "").trim() || undefined,
@@ -9431,6 +9987,16 @@ function parseAutonomyRequestMetadata(value) {
     snapshotId: String(payload.snapshotId ?? payload.snapshot_id ?? "").trim() || undefined,
     patternKey: String(payload.patternKey ?? payload.pattern_key ?? "").trim() || undefined,
     componentArea: asAutonomyComponentArea2(payload.componentArea ?? payload.component_area),
+    ...validationIncidentId ? {
+      validationIncident: {
+        incidentId: validationIncidentId,
+        candidateSha: String(validationIncidentRaw?.candidateSha ?? validationIncidentRaw?.candidate_sha ?? "").trim() || undefined,
+        candidateRef: String(validationIncidentRaw?.candidateRef ?? validationIncidentRaw?.candidate_ref ?? "").trim() || undefined,
+        baselineSha: String(validationIncidentRaw?.baselineSha ?? validationIncidentRaw?.baseline_sha ?? "").trim() || undefined,
+        validationScope: String(validationIncidentRaw?.validationScope ?? validationIncidentRaw?.validation_scope ?? "").trim() || undefined,
+        failureFingerprint: String(validationIncidentRaw?.failureFingerprint ?? validationIncidentRaw?.failure_fingerprint ?? "").trim() || undefined
+      }
+    } : {},
     targetPaths: normalizeMetadataTargetPaths(payload.targetPaths ?? payload.target_paths),
     writeGlobs: normalizeMetadataWriteGlobs(payload.writeGlobs ?? payload.write_globs)
   };
@@ -9890,6 +10456,7 @@ class RemoteBuddyOrchestrator {
   sessionId;
   authToken;
   fetchImpl;
+  terminateProcessTreeImpl;
   repo;
   jobsDbPath;
   workerOnlineTtlMs;
@@ -9944,6 +10511,7 @@ class RemoteBuddyOrchestrator {
   jobsDb = null;
   disposed = false;
   sessionMonitorWsErrorCounts = new Map;
+  requestLeaseHeartbeats = new Map;
   chain = Promise.resolve();
   brain;
   idempotency;
@@ -9964,6 +10532,7 @@ class RemoteBuddyOrchestrator {
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.terminateProcessTreeImpl = opts.terminateProcessTreeImpl ?? terminateProcessTree;
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
     this.persistentMemory = opts.persistentMemory;
@@ -10108,11 +10677,11 @@ class RemoteBuddyOrchestrator {
   async ensureSessionWithRetry(sessionId = this.sessionId, maxRetries = 20, baseDelayMs = 500, maxDelayMs = 5000) {
     for (let attempt = 1;attempt <= maxRetries && !this.disposed; attempt++) {
       try {
-        const res = await this.fetchImpl(`${this.server}/sessions`, {
+        const res = await this.fetchServiceControl(`${this.server}/sessions`, {
           method: "POST",
           headers: this.authHeaders(),
           body: JSON.stringify({ sessionId })
-        });
+        }, STARTUP_SESSION_HTTP_TIMEOUT_MS);
         if (res.ok)
           return true;
       } catch {}
@@ -10126,6 +10695,152 @@ class RemoteBuddyOrchestrator {
     if (this.authToken)
       h["Authorization"] = `Bearer ${this.authToken}`;
     return h;
+  }
+  fetchServiceControl(input, init, timeoutMs = SERVICE_CONTROL_HTTP_TIMEOUT_MS) {
+    return fetchBufferedWithHardDeadline({
+      input,
+      init,
+      timeoutMs,
+      fetchImpl: this.fetchImpl,
+      timeoutMessage: `RemoteBuddy service-control request timed out after ${timeoutMs}ms`
+    });
+  }
+  async fetchDurableRequestState(requestIdRaw, timeoutMs = REQUEST_TRANSITION_TIMEOUT_MS) {
+    const requestId = String(requestIdRaw ?? "").trim();
+    if (!requestId)
+      return null;
+    try {
+      const payload = await withHardDeadline(async (signal) => {
+        const response = await this.fetchServiceControl(`${this.server}/requests/${encodeURIComponent(requestId)}`, {
+          method: "GET",
+          headers: this.authHeaders(),
+          signal
+        });
+        if (!response.ok)
+          return null;
+        return await response.json();
+      }, timeoutMs, `request state lookup timed out after ${timeoutMs}ms`);
+      if (!payload?.request || typeof payload.request !== "object")
+        return null;
+      return {
+        status: String(payload.request.status ?? "").trim(),
+        agentId: typeof payload.request.agentId === "string" ? payload.request.agentId.trim() : null,
+        claimToken: typeof payload.request.claimToken === "string" ? payload.request.claimToken.trim() : null,
+        workerRequired: Number(payload.request.workerRequired) === 1 ? 1 : 0,
+        handoffJobId: typeof payload.request.handoffJobId === "string" ? payload.request.handoffJobId.trim() : null
+      };
+    } catch {
+      return null;
+    }
+  }
+  async postRequestLifecycleTransition(params) {
+    const transitionUrl = `${this.server}/requests/${encodeURIComponent(params.requestId)}/${params.transition}`;
+    let detail = "request lifecycle callback did not complete";
+    const maxAttempts = Math.max(1, Math.min(5, params.attempts ?? REQUEST_TRANSITION_MAX_ATTEMPTS));
+    const timeoutMs = Math.max(1, params.timeoutMs ?? REQUEST_TRANSITION_TIMEOUT_MS);
+    const retryDelayMs = Math.max(0, params.retryDelayMs ?? 150);
+    for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await withHardDeadline(async (signal) => {
+          const rawResponse = await this.fetchServiceControl(transitionUrl, {
+            method: "POST",
+            headers: this.authHeaders(),
+            body: JSON.stringify(params.body),
+            signal
+          });
+          const responseDetail = rawResponse.ok ? "" : toSingleLine(await rawResponse.text().catch(() => ""), 500);
+          return {
+            ok: rawResponse.ok,
+            status: rawResponse.status,
+            responseDetail
+          };
+        }, timeoutMs, `request lifecycle callback timed out after ${timeoutMs}ms`);
+        if (response.ok)
+          return { ok: true };
+        detail = `HTTP ${response.status}${response.responseDetail ? `: ${response.responseDetail}` : ""}`;
+        if ([400, 401, 403, 404].includes(response.status))
+          break;
+      } catch (error) {
+        detail = toSingleLine(error, 500) || "request lifecycle callback transport failed";
+      }
+      if (attempt < maxAttempts && retryDelayMs > 0) {
+        await Bun.sleep(retryDelayMs * attempt);
+      }
+    }
+    const state = await this.fetchDurableRequestState(params.requestId, timeoutMs);
+    const sameTerminalOwner = state?.agentId === this.agentId && state?.claimToken === params.claimToken;
+    if (params.transition === "complete" && state?.status === "completed" && (sameTerminalOwner || Boolean(params.jobId) && state.workerRequired === 1 && state.handoffJobId === params.jobId)) {
+      return { ok: true, recoveredFromState: true };
+    }
+    if (params.transition === "worker-handoff" && Boolean(params.jobId) && state?.workerRequired === 1 && state.handoffJobId === params.jobId && (state.status === "claimed" || state.status === "completed")) {
+      return { ok: true, recoveredFromState: true };
+    }
+    return { ok: false, detail };
+  }
+  startRequestLeaseHeartbeat(requestIdRaw, claimTokenRaw, options = {}) {
+    const requestId = String(requestIdRaw ?? "").trim();
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!requestId || !claimToken)
+      return () => {};
+    const heartbeatMs = Math.max(1, options.heartbeatMs ?? REQUEST_LEASE_HEARTBEAT_MS);
+    const leaseMs = Math.max(1, options.leaseMs ?? REQUEST_LEASE_MS);
+    const timeoutMs = Math.max(1, options.timeoutMs ?? REQUEST_LEASE_RENEW_TIMEOUT_MS);
+    const existing = this.requestLeaseHeartbeats.get(requestId);
+    if (existing) {
+      if (existing.claimToken === claimToken) {
+        return () => this.stopRequestLeaseHeartbeat(requestId, claimToken);
+      }
+      this.stopRequestLeaseHeartbeat(requestId, existing.claimToken);
+    }
+    const state = {
+      timer: null,
+      inFlight: false,
+      consecutiveFailures: 0,
+      claimToken
+    };
+    const renew = async () => {
+      if (this.disposed || state.inFlight || this.requestLeaseHeartbeats.get(requestId) !== state)
+        return;
+      state.inFlight = true;
+      try {
+        const response = await this.fetchServiceControl(`${this.server}/requests/${encodeURIComponent(requestId)}/lease/renew`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({
+            agentId: this.agentId,
+            claimToken,
+            leaseMs
+          }),
+          signal: AbortSignal.timeout(timeoutMs)
+        });
+        if (!response.ok) {
+          state.consecutiveFailures += 1;
+          console.warn(`[RemoteBuddy] Request lease renewal failed for ${requestId.slice(0, 8)}: HTTP ${response.status}`);
+          return;
+        }
+        state.consecutiveFailures = 0;
+      } catch (error) {
+        state.consecutiveFailures += 1;
+        console.warn(`[RemoteBuddy] Request lease renewal error for ${requestId.slice(0, 8)} ` + `(attempt ${state.consecutiveFailures}): ${toSingleLine(error, 180)}`);
+      } finally {
+        state.inFlight = false;
+      }
+    };
+    state.timer = setInterval(() => void renew(), heartbeatMs);
+    state.timer.unref?.();
+    this.requestLeaseHeartbeats.set(requestId, state);
+    return () => this.stopRequestLeaseHeartbeat(requestId, claimToken);
+  }
+  stopRequestLeaseHeartbeat(requestIdRaw, claimTokenRaw) {
+    const requestId = String(requestIdRaw ?? "").trim();
+    const state = this.requestLeaseHeartbeats.get(requestId);
+    if (!state)
+      return;
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (claimToken && state.claimToken !== claimToken)
+      return;
+    clearInterval(state.timer);
+    this.requestLeaseHeartbeats.delete(requestId);
   }
   async assistantMessage(sessionId, text, meta = {}) {
     try {
@@ -10155,7 +10870,7 @@ class RemoteBuddyOrchestrator {
   }
   async fetchJobLogs(jobId, limit = 80) {
     try {
-      const res = await this.fetchImpl(`${this.server}/jobs/${jobId}/logs?limit=${Math.max(1, Math.min(500, limit))}`, {
+      const res = await this.fetchServiceControl(`${this.server}/jobs/${jobId}/logs?limit=${Math.max(1, Math.min(500, limit))}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -10171,7 +10886,7 @@ class RemoteBuddyOrchestrator {
   }
   async fetchJobToolRuns(jobId, limit = 20) {
     try {
-      const res = await this.fetchImpl(`${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`, {
+      const res = await this.fetchServiceControl(`${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -10227,7 +10942,7 @@ class RemoteBuddyOrchestrator {
     query.set("feedbackLimit", "3");
     const suffix = query.toString();
     try {
-      const res = await this.fetchImpl(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
+      const res = await this.fetchServiceControl(`${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -10515,47 +11230,80 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
   startSessionEventMonitor() {
     this.ensureSessionEventMonitor(this.sessionId, { fatalOnWsBudgetExhaustion: true });
   }
-  async enqueueJob(taskId, kind, sessionId, params, targetWorkerId = null) {
-    try {
-      const payload = {
-        taskId,
-        sessionId,
-        kind,
-        params
-      };
-      const dedupeKey = buildTaskExecuteDedupeKey(sessionId, params);
-      if (dedupeKey)
-        payload.dedupeKey = dedupeKey;
-      const dedupeCooldownMs = resolveTaskExecuteDedupeCooldownMs(params, dedupeKey);
-      if (dedupeCooldownMs > 0)
-        payload.dedupeCooldownMs = dedupeCooldownMs;
-      if (targetWorkerId)
-        payload.targetWorkerId = targetWorkerId;
-      const res = await this.fetchImpl(`${this.server}/jobs/enqueue`, {
-        method: "POST",
-        headers: this.authHeaders(),
-        body: JSON.stringify(payload)
-      });
-      if (!res.ok) {
-        const err = await res.text();
-        console.error(`[RemoteBuddy] Enqueue failed: ${res.status} ${err}`);
-        return null;
+  async enqueueJob(taskId, kind, sessionId, params, targetWorkerId = null, requestClaimToken = null, retryOptions = {}) {
+    const payload = {
+      taskId,
+      sessionId,
+      kind,
+      params,
+      requestAgentId: this.agentId,
+      ...requestClaimToken ? { requestClaimToken } : {}
+    };
+    const targetedDedupeKey = buildTaskExecuteDedupeKey(sessionId, params);
+    const dedupeKey = targetedDedupeKey ?? buildTaskExecuteRequestDedupeKey(sessionId, params);
+    if (dedupeKey)
+      payload.dedupeKey = dedupeKey;
+    const dedupeCooldownMs = resolveTaskExecuteDedupeCooldownMs(params, dedupeKey);
+    if (dedupeCooldownMs > 0)
+      payload.dedupeCooldownMs = dedupeCooldownMs;
+    if (targetWorkerId)
+      payload.targetWorkerId = targetWorkerId;
+    const serializedPayload = JSON.stringify(payload);
+    let ambiguousDetail = "job enqueue acknowledgement was not received";
+    const maxAttempts = Math.max(1, Math.min(5, retryOptions.attempts ?? JOB_ENQUEUE_MAX_ATTEMPTS));
+    const timeoutMs = Math.max(1, retryOptions.timeoutMs ?? JOB_ENQUEUE_TIMEOUT_MS);
+    const retryDelayMs = Math.max(0, retryOptions.retryDelayMs ?? 150);
+    for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await withHardDeadline(async (signal) => {
+          const res = await this.fetchServiceControl(`${this.server}/jobs/enqueue`, {
+            method: "POST",
+            headers: this.authHeaders(),
+            body: serializedPayload,
+            signal
+          });
+          if (!res.ok) {
+            return {
+              ok: false,
+              status: res.status,
+              detail: toSingleLine(await res.text().catch(() => ""), 500)
+            };
+          }
+          return {
+            ok: true,
+            status: res.status,
+            data: await res.json()
+          };
+        }, timeoutMs, `job enqueue timed out after ${timeoutMs}ms`);
+        if (!response.ok) {
+          const detail = `HTTP ${response.status}${response.detail ? `: ${response.detail}` : ""}`;
+          const retryableOrAmbiguous = response.status === 408 || response.status === 429 || response.status >= 500;
+          if (!retryableOrAmbiguous) {
+            console.error(`[RemoteBuddy] Enqueue rejected: ${detail}`);
+            return null;
+          }
+          ambiguousDetail = detail;
+        } else {
+          const data = response.data;
+          const resolvedTaskId = String(data.taskId ?? taskId).trim();
+          if (data.ok && data.jobId && resolvedTaskId) {
+            return {
+              jobId: data.jobId,
+              taskId: resolvedTaskId,
+              deduped: data.deduped === true
+            };
+          }
+          ambiguousDetail = "successful enqueue response did not include a durable job ID";
+        }
+      } catch (err) {
+        ambiguousDetail = toSingleLine(err, 500) || "job enqueue transport failed";
       }
-      const data = await res.json();
-      const resolvedTaskId = String(data.taskId ?? taskId).trim();
-      if (!data.ok || !data.jobId || !resolvedTaskId) {
-        console.error(`[RemoteBuddy] Enqueue response missing jobId:`, data);
-        return null;
+      if (attempt < maxAttempts && retryDelayMs > 0) {
+        await Bun.sleep(retryDelayMs * attempt);
       }
-      return {
-        jobId: data.jobId,
-        taskId: resolvedTaskId,
-        deduped: data.deduped === true
-      };
-    } catch (err) {
-      console.error(`[RemoteBuddy] Enqueue error:`, err);
-      return null;
     }
+    console.warn(`[RemoteBuddy] Job enqueue outcome is ambiguous after ${maxAttempts} attempt(s): ${ambiguousDetail}`);
+    return { ambiguous: true, detail: ambiguousDetail };
   }
   sessionContext(sessionId) {
     const normalizedSessionId = String(sessionId ?? "").trim() || this.sessionId;
@@ -10702,17 +11450,11 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       ]);
       return settled;
     };
-    let exited = false;
-    try {
-      proc.kill("SIGTERM");
-    } catch {}
-    exited = await waitForExit(timeoutMs);
-    if (!exited) {
-      try {
-        proc.kill("SIGKILL");
-      } catch {}
-      exited = await waitForExit(2000);
-    }
+    await this.terminateProcessTreeImpl(proc, {
+      terminationTimeoutMs: timeoutMs,
+      exitGraceMs: 2000
+    });
+    const exited = await waitForExit(250);
     if (!exited) {
       console.warn(`[RemoteBuddy] WorkerPal ${workerId} did not terminate cleanly (${reason}); process may still be running.`);
     }
@@ -10791,7 +11533,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
   }
   async fetchWorkers() {
     try {
-      const res = await this.fetchImpl(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
+      const res = await this.fetchServiceControl(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
         method: "GET",
         headers: this.authHeaders()
       });
@@ -10803,12 +11545,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       return [];
     }
   }
-  async fetchWorkerAutoscaleSnapshot() {
+  async fetchWorkerAutoscaleSnapshot(timeoutMs = SERVICE_CONTROL_HTTP_TIMEOUT_MS) {
     try {
-      const res = await this.fetchImpl(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
+      const res = await this.fetchServiceControl(`${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`, {
         method: "GET",
         headers: this.authHeaders()
-      });
+      }, timeoutMs);
       if (!res.ok)
         return null;
       const data = await res.json();
@@ -10971,7 +11713,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           cwd: this.repo,
           stdin: "ignore",
           stdout: "inherit",
-          stderr: "inherit"
+          stderr: "inherit",
+          detached: process.platform !== "win32"
         });
         this.managedWorkers.set(workerId, child);
         child.exited.then((code) => {
@@ -11087,21 +11830,25 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     const requestId = String(request.id ?? "").trim();
     if (!requestId)
       return;
+    const claimToken = String(request.claimToken ?? "").trim();
+    if (!claimToken) {
+      console.error(`[RemoteBuddy] Claimed request ${requestId} did not include a fencing token.`);
+      return;
+    }
     const requestSessionId = String(request.sessionId ?? "").trim() || this.sessionId;
     await this.ensureSessionWithRetry(requestSessionId, 3, 250, 2000);
     this.ensureSessionEventMonitor(requestSessionId);
-    if (this.idempotency.hasHandled(requestSessionId, requestId)) {
-      console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
-      return;
-    }
-    this.idempotency.markHandled(requestSessionId, requestId);
     const prompt = String(request.prompt ?? "").trim();
     if (!prompt) {
       console.warn(`[RemoteBuddy] Request ${requestId} missing prompt; marking failed`);
-      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
-        body: JSON.stringify({ message: "Request missing prompt" })
+        body: JSON.stringify({
+          agentId: this.agentId,
+          claimToken,
+          message: "Request missing prompt"
+        })
       }).catch(() => {});
       return;
     }
@@ -11119,6 +11866,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     const turnId = randomUUID3();
     const eventFrom = autonomyMetadata ? `agent:${this.agentId}/autonomy` : undefined;
     const planningContext = this.buildPlanningContext(priority, requestSessionId);
+    let durableWorkerJob = null;
     this.rememberPersistentMemory("request", `priority=${priority} prompt=${toSingleLine(prompt, 520)}`, requestId, requestSessionId);
     try {
       console.log(`[RemoteBuddy] Planning request ${requestId.slice(0, 8)} session=${requestSessionId} priority=${priority} queueWait=${Math.max(0, Math.floor(queueWaitMs))}ms${forceWorker ? ` forceWorker=true forceLane=${forceLane ?? "worker"}` : ""}`);
@@ -11127,11 +11875,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         forceLane
       });
       if (autonomyMetadata) {
-        if (plan.intent !== "analysis") {
-          plan.requires_worker = true;
-          plan.job_kind = "task.execute";
-          plan.lane = "worker";
-        }
+        plan.requires_worker = true;
+        plan.job_kind = "task.execute";
+        plan.lane = "worker";
         plan.scope.read_anywhere = true;
         plan.scope.write_allowed = true;
         plan.scope.write_globs = [...autonomyMetadata.writeGlobs];
@@ -11151,8 +11897,7 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       }
       this.rememberPersistentMemory("plan", `intent=${plan.intent} worker=${plan.requires_worker ? "yes" : "no"} lane=${plan.lane} risk=${plan.risk_level} targets=${targetPaths.slice(0, 6).join(",") || "(none)"}`, requestId, requestSessionId);
       const targetPath = targetPaths[0];
-      const isAnalysisFromEngine = plan.intent === "analysis" && Boolean(autonomyMetadata);
-      const requiresWorker = forceWorker && !isAnalysisFromEngine ? true : this.shouldForceDirectReply(prompt, plan.intent) ? false : plan.requires_worker;
+      const requiresWorker = forceWorker ? true : this.shouldForceDirectReply(prompt, plan.intent) ? false : plan.requires_worker;
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
       let requiredValidationSteps = [];
       if (requiresWorker) {
@@ -11235,10 +11980,13 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
             await this.assistantMessage(requestSessionId, "Should I have a WorkerPal implement this? Reply to confirm and I'll enqueue the work, or clarify what you'd like focused on.", { turnId, correlationId: requestId, from: eventFrom });
           }
         }
-        await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
-          method: "POST",
-          headers: this.authHeaders(),
-          body: JSON.stringify({
+        const completionResult2 = await this.postRequestLifecycleTransition({
+          requestId,
+          transition: "complete",
+          claimToken,
+          body: {
+            agentId: this.agentId,
+            claimToken,
             result: {
               requiresWorker: false,
               intent: plan.intent,
@@ -11248,8 +11996,11 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
               forceWorker,
               forceLane: forceLane ?? null
             }
-          })
-        }).catch(() => {});
+          }
+        });
+        if (!completionResult2.ok) {
+          throw new Error(`request completion was not durably acknowledged${completionResult2.detail ? `: ${completionResult2.detail}` : ""}`);
+        }
         this.rememberPersistentMemory("decision", `completed_without_worker intent=${plan.intent} lane=deterministic`, requestId, requestSessionId);
         return;
       }
@@ -11266,10 +12017,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
             correlationId: requestId,
             from: eventFrom
           });
-          await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
+          await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
             method: "POST",
             headers: this.authHeaders(),
             body: JSON.stringify({
+              agentId: this.agentId,
+              claimToken,
               message: "WorkerPal backend unavailable",
               detail
             })
@@ -11333,14 +12086,18 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           ...autonomyMetadata.runId ? { runId: autonomyMetadata.runId } : {},
           ...autonomyMetadata.snapshotId ? { snapshotId: autonomyMetadata.snapshotId } : {},
           ...autonomyMetadata.patternKey ? { patternKey: autonomyMetadata.patternKey } : {},
-          ...autonomyMetadata.componentArea ? { componentArea: autonomyMetadata.componentArea } : {}
+          ...autonomyMetadata.componentArea ? { componentArea: autonomyMetadata.componentArea } : {},
+          ...autonomyMetadata.validationIncident ? { validationIncident: autonomyMetadata.validationIncident } : {}
         }
       } : {
         ...baseParams,
         origin: "user"
       };
-      const enqueueResult = await this.enqueueJob(taskId, "task.execute", requestSessionId, params, targetWorkerId);
+      const enqueueOutcome = await this.enqueueJob(taskId, "task.execute", requestSessionId, params, targetWorkerId, claimToken);
+      const enqueueAmbiguous = Boolean(enqueueOutcome && "ambiguous" in enqueueOutcome);
+      const enqueueResult = enqueueOutcome && !("ambiguous" in enqueueOutcome) ? enqueueOutcome : null;
       if (enqueueResult) {
+        durableWorkerJob = enqueueResult;
         const effectiveTaskId = enqueueResult.taskId;
         if (!enqueueResult.deduped) {
           await this.sendCommand(requestSessionId, {
@@ -11399,17 +12156,59 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           });
         }
       } else {
+        if (enqueueAmbiguous) {
+          const detail = enqueueOutcome.detail;
+          console.warn(`[RemoteBuddy] Request ${requestId.slice(0, 8)} has an ambiguous job enqueue; leaving its lease lifecycle recoverable: ${detail}`);
+          this.rememberPersistentMemory("handoff_reconciliation_pending", `enqueue_acknowledgement_ambiguous detail=${detail}`, requestId, requestSessionId);
+          if (!autonomyMetadata) {
+            await this.assistantMessage(requestSessionId, "The WorkerPal enqueue acknowledgement was interrupted. I am preserving the request for automatic reconciliation instead of reporting a false failure.", { turnId, correlationId: requestId, from: eventFrom });
+          }
+          return;
+        }
         if (!autonomyMetadata) {
           await this.assistantMessage(requestSessionId, "I could not queue this WorkerPal task. No task was started.", { turnId, correlationId: requestId, from: eventFrom });
         }
         this.rememberPersistentMemory("job_enqueue_failed", `enqueue_failed lane=${lane} intent=${plan.intent} origin=${autonomyMetadata ? "autonomy" : "user"}`, requestId, requestSessionId);
+        await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({
+            agentId: this.agentId,
+            claimToken,
+            message: "WorkerPal handoff failed",
+            detail: "Planner required a worker, but no task.execute job was created. The request remains failed instead of being recorded as a completed dispatch."
+          })
+        }).catch(() => {});
+        return;
       }
-      await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
-        method: "POST",
-        headers: this.authHeaders(),
-        body: JSON.stringify({
+      const handoffResult = await this.postRequestLifecycleTransition({
+        requestId,
+        transition: "worker-handoff",
+        claimToken,
+        jobId: enqueueResult.jobId,
+        body: {
+          agentId: this.agentId,
+          claimToken,
+          jobId: enqueueResult.jobId,
+          taskId: enqueueResult.taskId
+        }
+      });
+      if (!handoffResult.ok) {
+        throw new Error(`durable WorkerPal handoff was not acknowledged${handoffResult.detail ? `: ${handoffResult.detail}` : ""}`);
+      }
+      const completionResult = await this.postRequestLifecycleTransition({
+        requestId,
+        transition: "complete",
+        claimToken,
+        jobId: enqueueResult.jobId,
+        body: {
+          agentId: this.agentId,
+          claimToken,
           result: {
             requiresWorker: true,
+            jobId: enqueueResult.jobId,
+            taskId: enqueueResult.taskId,
+            deduped: enqueueResult.deduped,
             intent: plan.intent,
             lane,
             priority,
@@ -11424,9 +12223,18 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
             forceWorker,
             forceLane: forceLane ?? null
           }
-        })
-      }).catch(() => {});
+        }
+      });
+      if (!completionResult.ok) {
+        throw new Error(`request completion was not durably acknowledged${completionResult.detail ? `: ${completionResult.detail}` : ""}`);
+      }
     } catch (err) {
+      if (durableWorkerJob) {
+        const detail = toSingleLine(err, 400) || "request lifecycle callback was interrupted";
+        console.warn(`[RemoteBuddy] Durable WorkerPal job ${durableWorkerJob.jobId.slice(0, 8)} exists for request ${requestId.slice(0, 8)}; server reconciliation will close the planning handoff after callback uncertainty: ${detail}`);
+        this.rememberPersistentMemory("handoff_reconciliation_pending", `job=${durableWorkerJob.jobId} detail=${detail}`, requestId, requestSessionId);
+        return;
+      }
       const message = `RemoteBuddy planning failed: ${toSingleLine(err, 220) || "unknown error"}`;
       console.error(`[RemoteBuddy] ${message}`);
       this.rememberPersistentMemory("planning_failed", message, requestId, requestSessionId);
@@ -11435,10 +12243,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         correlationId: requestId,
         from: eventFrom
       });
-      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({
+          agentId: this.agentId,
+          claimToken,
           message: "RemoteBuddy planning failed",
           detail: String(err)
         })
@@ -11450,17 +12260,22 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     while (!this.disposed) {
       try {
         await this.maybeAutoscaleWorkers();
-        const res = await this.fetchImpl(`${this.server}/requests/claim`, {
+        if (this.requestLeaseHeartbeats.size > 0) {
+          await Bun.sleep(pollMs);
+          continue;
+        }
+        const res = await this.fetchServiceControl(`${this.server}/requests/claim`, {
           method: "POST",
           headers: this.authHeaders(),
-          body: JSON.stringify({ agentId: this.agentId })
+          body: JSON.stringify({ agentId: this.agentId, leaseMs: REQUEST_LEASE_MS })
         });
         if (res.ok) {
           const data = await res.json();
           console.log("[RemoteBuddy] claim payload:", JSON.stringify(data, null, 2));
           if (data.ok && data.request) {
             console.log(`[RemoteBuddy] Claimed request ${data.request.id}${data.request.forceWorker ? ` (forceWorker=true)` : ""}`);
-            this.chain = this.chain.then(() => this.processRequest(data.request, Number(data.queueWaitMs ?? 0))).catch((err) => console.error("[RemoteBuddy] Process error:", err));
+            const stopRequestLeaseHeartbeat = this.startRequestLeaseHeartbeat(data.request.id, data.request.claimToken);
+            this.chain = this.chain.then(() => this.processRequest(data.request, Number(data.queueWaitMs ?? 0))).catch((err) => console.error("[RemoteBuddy] Process error:", err)).finally(stopRequestLeaseHeartbeat);
           }
         }
       } catch (err) {
@@ -11517,6 +12332,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       clearInterval(this.statusHeartbeatTimer);
       this.statusHeartbeatTimer = null;
     }
+    for (const requestId of Array.from(this.requestLeaseHeartbeats.keys())) {
+      this.stopRequestLeaseHeartbeat(requestId);
+    }
     this.comm.status(this.agentId, "shutting_down", "RemoteBuddy shutting down");
     for (const [sessionId, stop] of this.sessionEventStops.entries()) {
       try {
@@ -11548,10 +12366,15 @@ async function connectWithRetry(server, sessionId, maxRetries = Infinity, baseDe
   while (true) {
     attempt++;
     try {
-      const res = await fetch(`${server}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sessionId ? { sessionId } : {})
+      const res = await fetchBufferedWithHardDeadline({
+        input: `${server}/sessions`,
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(sessionId ? { sessionId } : {})
+        },
+        timeoutMs: STARTUP_SESSION_HTTP_TIMEOUT_MS,
+        timeoutMessage: `RemoteBuddy session bootstrap timed out after ${STARTUP_SESSION_HTTP_TIMEOUT_MS}ms`
       });
       if (!res.ok)
         throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -11649,6 +12472,7 @@ export {
   resolveTaskExecuteDedupeCooldownMs,
   normalizeValidationSteps,
   extractRequiredValidationStepsFromVisionMarkdown,
+  buildTaskExecuteRequestDedupeKey,
   buildTaskExecuteDedupeKey,
   RemoteBuddyOrchestrator
 };

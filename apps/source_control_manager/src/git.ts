@@ -8,6 +8,7 @@ import {
   type SourceControlProvider,
 } from "shared";
 import type { SourceControlManagerConfig } from "./config";
+import { runBoundedScmProcess } from "./bounded_process";
 
 /**
  * Result from a spawned git command.
@@ -93,11 +94,35 @@ type GitWorktreeEntry = {
   detached: boolean;
 };
 
-type ResponseBody = ConstructorParameters<typeof Response>[0];
+const DEFAULT_GIT_COMMAND_TIMEOUT_MS = 2 * 60_000;
+const DEFAULT_GIT_NETWORK_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_GIT_DISCOVERY_TIMEOUT_MS = 10_000;
 
-function readSubprocessOutput(output: ResponseBody | number | undefined): Promise<string> {
-  if (!output || typeof output === "number") return Promise.resolve("");
-  return new Response(output).text();
+function positiveTimeoutFromEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.max(1_000, Math.floor(parsed)) : fallback;
+}
+
+export function resolveGitCommandTimeoutMs(
+  args: string[],
+  requestedTimeout?: number,
+  env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+): number {
+  if (Number.isFinite(requestedTimeout) && Number(requestedTimeout) > 0) {
+    return Math.max(1, Math.floor(Number(requestedTimeout)));
+  }
+  const networkCommand = args.some((arg) =>
+    /^(?:clone|fetch|ls-remote|pull|push|submodule)$/i.test(String(arg).trim()),
+  );
+  return networkCommand
+    ? positiveTimeoutFromEnv(
+        env.PUSHPALS_SCM_GIT_NETWORK_TIMEOUT_MS,
+        DEFAULT_GIT_NETWORK_TIMEOUT_MS,
+      )
+    : positiveTimeoutFromEnv(
+        env.PUSHPALS_SCM_GIT_COMMAND_TIMEOUT_MS,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+      );
 }
 
 function normalizeFsPathForComparison(value: string): string {
@@ -246,7 +271,7 @@ function isWindowsCommandNotFound(output: string, exitCode: number): boolean {
 async function runViaWindowsCmd(
   repoPath: string,
   commandArgs: string[],
-  timeout?: number,
+  timeout: number,
 ): Promise<GitResult> {
   const commandLine = commandArgs.map((arg) => quoteWindowsCmdArg(arg)).join(" ");
   const env = process.env as Record<string, string | undefined>;
@@ -254,38 +279,25 @@ async function runViaWindowsCmd(
   const spawnFailures: string[] = [];
 
   for (const shellExecutable of shellCandidates) {
-    let proc: Bun.Subprocess;
     try {
-      proc = Bun.spawn([shellExecutable, "/d", "/s", "/c", commandLine], {
+      const result = await runBoundedScmProcess([shellExecutable, "/d", "/s", "/c", commandLine], {
+        timeoutMs: timeout,
+        platform: "win32",
         cwd: repoPath,
         env,
         stdout: "pipe",
         stderr: "pipe",
       });
+      return {
+        ok: result.exitCode === 0 && !result.timedOut,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+      };
     } catch (err) {
       spawnFailures.push(formatGitSpawnFailure(shellExecutable, err));
       continue;
     }
-
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    if (timeout) {
-      timer = setTimeout(() => proc.kill(), timeout);
-    }
-
-    const [stdout, stderr] = await Promise.all([
-      readSubprocessOutput(proc.stdout),
-      readSubprocessOutput(proc.stderr),
-    ]);
-
-    const exitCode = await proc.exited;
-    if (timer) clearTimeout(timer);
-
-    return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode,
-    };
   }
 
   throw new Error(
@@ -320,18 +332,18 @@ async function expandWindowsGitExecutableCandidates(
       );
       for (const whereExecutable of whereCandidates) {
         try {
-          const proc = Bun.spawn([whereExecutable, candidate], {
+          const lookup = await runBoundedScmProcess([whereExecutable, candidate], {
+            timeoutMs: positiveTimeoutFromEnv(
+              process.env.PUSHPALS_SCM_GIT_DISCOVERY_TIMEOUT_MS,
+              DEFAULT_GIT_DISCOVERY_TIMEOUT_MS,
+            ),
             cwd: repoPath,
             env: process.env as Record<string, string | undefined>,
             stdout: "pipe",
             stderr: "ignore",
           });
-          const [stdout, exitCode] = await Promise.all([
-            readSubprocessOutput(proc.stdout),
-            proc.exited,
-          ]);
-          if (exitCode === 0) {
-            for (const resolved of stdout
+          if (lookup.exitCode === 0 && !lookup.timedOut) {
+            for (const resolved of lookup.stdout
               .split(/\r?\n/)
               .map((line) => line.trim())
               .filter((line) => line.length > 0)) {
@@ -355,6 +367,7 @@ export async function runGitCommandCapture(
   args: string[],
   opts?: { timeout?: number; githubToken?: string },
 ): Promise<GitResult> {
+  const timeoutMs = resolveGitCommandTimeoutMs(args, opts?.timeout);
   const gitExecutables = await expandWindowsGitExecutableCandidates(
     repoPath,
     resolveGitExecutableCandidatesFromEnv(),
@@ -375,18 +388,25 @@ export async function runGitCommandCapture(
           ]
         : [gitExecutable, ...args];
 
-    let proc: Bun.Subprocess;
     try {
-      proc = Bun.spawn(gitArgs, {
+      const result = await runBoundedScmProcess(gitArgs, {
         cwd: repoPath,
+        env: process.env as Record<string, string | undefined>,
         stdout: "pipe",
         stderr: "pipe",
+        timeoutMs,
       });
+      return {
+        ok: result.exitCode === 0 && !result.timedOut,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+      };
     } catch (err) {
       spawnFailures.push(formatGitSpawnFailure(gitExecutable, err));
       if (process.platform === "win32") {
         try {
-          const shellResult = await runViaWindowsCmd(repoPath, gitArgs, opts?.timeout);
+          const shellResult = await runViaWindowsCmd(repoPath, gitArgs, timeoutMs);
           const output = [shellResult.stdout, shellResult.stderr].filter(Boolean).join("\n");
           if (!isWindowsCommandNotFound(output, shellResult.exitCode)) {
             return shellResult;
@@ -400,26 +420,6 @@ export async function runGitCommandCapture(
       }
       continue;
     }
-
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    if (opts?.timeout) {
-      timer = setTimeout(() => proc.kill(), opts.timeout);
-    }
-
-    const [stdout, stderr] = await Promise.all([
-      readSubprocessOutput(proc.stdout),
-      readSubprocessOutput(proc.stderr),
-    ]);
-
-    const exitCode = await proc.exited;
-    if (timer) clearTimeout(timer);
-
-    return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode,
-    };
   }
 
   return {

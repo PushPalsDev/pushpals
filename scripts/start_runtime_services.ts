@@ -1,3 +1,9 @@
+import {
+  fetchBufferedWithHardDeadline,
+  type FetchLike,
+} from "../packages/shared/src/bounded_fetch.js";
+import { terminateProcessTree } from "../packages/shared/src/bounded_process.js";
+
 export {
   computeLocalBuddyRestartBackoffMs,
   resolveLocalBuddyRuntimeAction,
@@ -138,6 +144,8 @@ const DEFAULT_SERVICE_MANAGER_MAX_BACKOFF_MS = 30_000;
 const DEFAULT_SERVICE_HEALTH_INTERVAL_MS = 5_000;
 const DEFAULT_SERVICE_HEALTH_TIMEOUT_MS = 2_500;
 const DEFAULT_SERVICE_UNHEALTHY_THRESHOLD = 3;
+const DEFAULT_SERVICE_TERMINATION_TIMEOUT_MS = 15_000;
+const MAX_MANAGED_SERVICE_OUTPUT_LINE_CHARS = 64 * 1024;
 
 async function settleManagedProcessWithin<T>(
   promise: Promise<T>,
@@ -166,56 +174,43 @@ export function buildWindowsManagedServiceTreeTerminationArgv(pid: number): stri
   return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
 }
 
-async function defaultProbeServiceHealth(
+export function shouldDetachManagedServiceProcess(platform: NodeJS.Platform): boolean {
+  return platform !== "win32";
+}
+
+export async function defaultProbeServiceHealth(
   spec: NonNullable<ManagedServiceSpec["healthCheck"]>,
+  fetchImpl: FetchLike = fetch,
 ): Promise<{ ok: boolean; detail: string }> {
-  const controller = new AbortController();
   const timeoutMs = Math.max(250, spec.timeoutMs ?? DEFAULT_SERVICE_HEALTH_TIMEOUT_MS);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(spec.url, { signal: controller.signal });
-    const detail = await response.text().catch(() => "");
+    const response = await fetchBufferedWithHardDeadline({
+      input: spec.url,
+      timeoutMs,
+      maxResponseBytes: 1024 * 1024,
+      fetchImpl,
+      timeoutMessage: `Managed service health probe timed out after ${timeoutMs}ms`,
+    });
+    const detail = await response.text();
     return {
       ok: response.ok,
       detail: detail.trim().slice(0, 500) || `HTTP ${response.status}`,
     };
   } catch (error) {
     return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
 export async function terminateManagedServiceTree(
   service: ManagedServiceProcess,
   platform = process.platform,
+  options: { gracefulSignalAlreadySent?: boolean } = {},
 ): Promise<void> {
   await stopManagedServiceOutputPipes(service);
-  const pid = Number(service.proc.pid);
-  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
-    try {
-      const taskkill = Bun.spawn(buildWindowsManagedServiceTreeTerminationArgv(pid), {
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      const result = await settleManagedProcessWithin(taskkill.exited, 5_000);
-      if (result === null) {
-        taskkill.kill("SIGKILL");
-      } else if (
-        result === 0 &&
-        (await settleManagedProcessWithin(service.proc.exited, 2_000)) !== null
-      ) {
-        return;
-      }
-    } catch {
-      // Fall back to terminating the managed parent directly.
-    }
-  }
-  try {
-    service.proc.kill("SIGKILL");
-  } catch {
-    // Process already exited.
-  }
+  await terminateProcessTree(service.proc, {
+    platform,
+    gracefulSignalAlreadySent: options.gracefulSignalAlreadySent,
+  });
 }
 
 export function formatEmbeddedRuntimeHealthLines(health: EmbeddedRuntimeHealth | null): string[] {
@@ -270,12 +265,12 @@ export function isRetryableManagedServiceLaunchError(error: unknown): boolean {
   );
 }
 
-function pipeProcessStreamToLines(
+export function pipeProcessStreamToLines(
   stream: ReadableStream<Uint8Array> | number | null | undefined,
   onLine?: (line: string) => void,
-): { cancel: () => Promise<void> } {
+): { cancel: () => Promise<void>; done: Promise<void> } {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
-    return { cancel: async () => {} };
+    return { cancel: async () => {}, done: Promise.resolve() };
   }
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -294,6 +289,12 @@ function pipeProcessStreamToLines(
           if (!trimmed) continue;
           onLine?.(trimmed);
         }
+        if (pending.length > MAX_MANAGED_SERVICE_OUTPUT_LINE_CHARS) {
+          const truncated = pending.slice(0, MAX_MANAGED_SERVICE_OUTPUT_LINE_CHARS).trimEnd();
+          if (truncated) onLine?.(truncated);
+          onLine?.("[pushpals: managed service output line truncated]");
+          pending = "";
+        }
       }
       const rest = decoder.decode();
       if (rest) pending += rest;
@@ -310,6 +311,7 @@ function pipeProcessStreamToLines(
     }
   })();
   return {
+    done: drained,
     cancel: async () => {
       if (!cancelled) {
         cancelled = true;
@@ -344,6 +346,7 @@ function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
     env,
     stdout: "pipe",
     stderr: "pipe",
+    detached: shouldDetachManagedServiceProcess(process.platform),
   });
   const stdoutPipe = pipeProcessStreamToLines(proc.stdout, (line) => {
     observeLaunchLine(line);
@@ -380,12 +383,7 @@ function spawnManagedService(spec: ManagedServiceSpec): ManagedServiceProcess {
           launchSettled = true;
           service.launchTimedOut = true;
           spec.onLaunchTimeout?.(launchTimeoutMs);
-          try {
-            proc.kill("SIGKILL");
-          } catch {
-            // The isolated launcher may already have exited.
-          }
-          settleLaunchReady(false);
+          void terminateManagedServiceTree(service).finally(() => settleLaunchReady(false));
         }, launchTimeoutMs)
       : null;
   void proc.exited.then((code) => {
@@ -475,17 +473,20 @@ export class ServiceManager {
     return service;
   }
 
-  replaceService(
+  async replaceService(
     spec: ManagedServiceSpec,
     options: { resetAttempts?: boolean } = {},
-  ): ManagedServiceProcess {
+  ): Promise<ManagedServiceProcess> {
     const existing = this.services.get(spec.name);
     if (existing && !existing.exited) {
-      try {
-        void stopManagedServiceOutputPipes(existing);
-        existing.proc.kill("SIGTERM");
-      } catch {
-        // ignore best-effort replacement shutdown failures
+      const terminated = await settleManagedProcessWithin(
+        this.terminateService(existing),
+        DEFAULT_SERVICE_TERMINATION_TIMEOUT_MS,
+      );
+      if (terminated === null) {
+        throw new Error(
+          `Timed out terminating managed ${spec.name} process tree before replacement.`,
+        );
       }
     }
 
@@ -524,12 +525,19 @@ export class ServiceManager {
   async abandonService(service: ManagedServiceProcess): Promise<void> {
     if (this.services.get(service.name) !== service) return;
     const outputDrain = stopManagedServiceOutputPipes(service);
-    try {
-      service.proc.kill("SIGKILL");
-    } catch {
-      // Best-effort isolated-launcher termination only.
-    }
+    // A launch timeout resolves `launchReady` only after its process-tree
+    // termination finishes. Avoid invoking taskkill/group termination a
+    // second time here: on Windows that redundant sweep can add seconds to
+    // every retry even though no process remains.
+    const termination =
+      service.launchTimedOut || service.exited
+        ? Promise.resolve(null)
+        : settleManagedProcessWithin(
+            this.terminateService(service),
+            DEFAULT_SERVICE_TERMINATION_TIMEOUT_MS,
+          );
     await Promise.allSettled([
+      termination,
       settleManagedProcessWithin(service.proc.exited, 1_000),
       settleManagedProcessWithin(outputDrain, 1_000),
     ]);
@@ -579,13 +587,33 @@ export class ServiceManager {
     }
   }
 
-  async stopAndWait(timeoutMs = 1_000): Promise<void> {
+  /**
+   * Mark supervision stopped after another shutdown path has already awaited
+   * termination for every managed process tree. This keeps restart timers
+   * disabled without signalling the same processes again.
+   */
+  finishShutdownAfterTermination(): void {
+    if (this.stopped) return;
+    this.beginShutdown();
+    this.stopped = true;
+  }
+
+  async stopAndWait(timeoutMs = DEFAULT_SERVICE_TERMINATION_TIMEOUT_MS): Promise<void> {
     const services = this.getServices();
-    this.stop();
+    this.beginShutdown();
+    this.stopped = true;
+    const boundedTimeoutMs = Math.max(1, Math.floor(timeoutMs));
+    const startedAtMs = Date.now();
+    const terminations = Promise.allSettled(
+      services.map((service) => this.terminateService(service)),
+    );
+    await settleManagedProcessWithin(terminations, boundedTimeoutMs);
+
+    const remainingMs = Math.max(1, boundedTimeoutMs - (Date.now() - startedAtMs));
     await Promise.allSettled(
       services.flatMap((service) => [
-        settleManagedProcessWithin(service.proc.exited, timeoutMs),
-        settleManagedProcessWithin(stopManagedServiceOutputPipes(service), timeoutMs),
+        settleManagedProcessWithin(service.proc.exited, remainingMs),
+        settleManagedProcessWithin(stopManagedServiceOutputPipes(service), remainingMs),
       ]),
     );
   }

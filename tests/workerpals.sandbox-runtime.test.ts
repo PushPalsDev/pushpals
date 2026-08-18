@@ -45,10 +45,9 @@ describe("WorkerPal sandbox runtime", () => {
     const nodeMajor = Number(dockerfile.match(/^FROM node:(\d+)-trixie AS base$/m)?.[1]);
 
     expect(nodeMajor).toBeGreaterThanOrEqual(24);
-    expect(dockerfile).toContain("FROM oven/bun:1-debian AS bun-runtime");
-    expect(dockerfile).toContain(
-      "COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun",
-    );
+    expect(dockerfile).toContain("FROM oven/bun:1.3.14-debian AS bun-runtime");
+    expect(dockerfile).not.toContain("FROM oven/bun:1-debian AS bun-runtime");
+    expect(dockerfile).toContain("COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun");
     expect(dockerfile).toContain("RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx");
     expect(dockerfile).toContain('ENV NODE_OPTIONS="--max-old-space-size=1536"');
     expect(dockerfile).toContain(

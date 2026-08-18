@@ -4,6 +4,354 @@
 // packages/shared/src/repo.ts
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
+
+// packages/shared/src/bounded_process.ts
+var DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
+var DEFAULT_DRAIN_TIMEOUT_MS = 2000;
+var DEFAULT_TERMINATION_TIMEOUT_MS = 5000;
+var DEFAULT_EXIT_GRACE_MS = 250;
+var MAX_STREAMING_LINE_CHARS = 64 * 1024;
+function defaultSpawner(argv, options) {
+  return Bun.spawn(argv, options);
+}
+function buildWindowsProcessTreeTerminationArgv(pid) {
+  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+function buildWindowsDescendantSweepArgv(pid) {
+  const rootPid = Math.max(0, Math.floor(pid));
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$rootPid = ${rootPid}`,
+    "$processes = @(Get-CimInstance Win32_Process)",
+    "$children = @{}",
+    "foreach ($process in $processes) {",
+    "  $parent = [int]$process.ParentProcessId",
+    "  if (-not $children.ContainsKey($parent)) { $children[$parent] = [System.Collections.Generic.List[int]]::new() }",
+    "  $children[$parent].Add([int]$process.ProcessId)",
+    "}",
+    "$stack = [System.Collections.Generic.Stack[int]]::new()",
+    "$targets = [System.Collections.Generic.List[int]]::new()",
+    "$stack.Push($rootPid)",
+    "while ($stack.Count -gt 0) {",
+    "  $parent = $stack.Pop()",
+    "  if (-not $children.ContainsKey($parent)) { continue }",
+    "  foreach ($child in $children[$parent]) { $targets.Add($child); $stack.Push($child) }",
+    "}",
+    "for ($index = $targets.Count - 1; $index -ge 0; $index--) { Stop-Process -Id $targets[$index] -Force -ErrorAction SilentlyContinue }"
+  ].join(`
+`);
+  return [
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+    Buffer.from(script, "utf16le").toString("base64")
+  ];
+}
+async function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ settled: true, value })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ settled: false }), Math.max(1, timeoutMs));
+      })
+    ]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+function captureBoundedStream(stream, maxBytes, options = {}) {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
+    return { done: Promise.resolve(""), cancel: () => {
+      return;
+    } };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  const headLimit = options.retainTail ? Math.max(1, Math.floor(maxBytes / 2)) : maxBytes;
+  const tailLimit = options.retainTail ? Math.max(0, maxBytes - headLimit) : 0;
+  let head = "";
+  let tail = "";
+  let observedChars = 0;
+  let lineBuffer = "";
+  let truncated = false;
+  let cancelled = false;
+  const emitLine = (line) => {
+    try {
+      options.onLine?.(line);
+    } catch {}
+  };
+  const retainAndEmit = (text) => {
+    if (!text)
+      return;
+    observedChars += text.length;
+    const headRemaining = Math.max(0, headLimit - head.length);
+    const headPart = headRemaining > 0 ? text.slice(0, headRemaining) : "";
+    head += headPart;
+    const remainder = text.slice(headPart.length);
+    if (remainder && tailLimit > 0)
+      tail = `${tail}${remainder}`.slice(-tailLimit);
+    truncated = observedChars > maxBytes;
+    if (!options.onLine)
+      return;
+    lineBuffer += text;
+    const lines = lineBuffer.split(`
+`);
+    lineBuffer = lines.pop() ?? "";
+    for (const line of lines)
+      emitLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+    if (lineBuffer.length > MAX_STREAMING_LINE_CHARS) {
+      emitLine(`${lineBuffer.slice(0, MAX_STREAMING_LINE_CHARS)}
+[pushpals: streaming line truncated]`);
+      lineBuffer = "";
+    }
+  };
+  const done = (async () => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done)
+          break;
+        retainAndEmit(decoder.decode(chunk.value, { stream: true }));
+      }
+      retainAndEmit(decoder.decode());
+      if (options.onLine && lineBuffer.length > 0) {
+        emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
+        lineBuffer = "";
+      }
+    } catch {} finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+    if (!truncated)
+      return head + tail;
+    const marker = `
+[pushpals: process output truncated]`;
+    return options.retainTail ? `${head}${marker}
+${tail}` : `${head}${marker}`;
+  })();
+  return {
+    done,
+    cancel: () => {
+      if (cancelled)
+        return;
+      cancelled = true;
+      try {
+        reader.cancel().catch(() => {
+          return;
+        });
+      } catch {}
+    }
+  };
+}
+async function terminateProcessTree(proc, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const spawn = options.spawn ?? defaultSpawner;
+  const terminationTimeoutMs = Math.max(1, options.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS);
+  const exitGraceMs = Math.max(1, options.exitGraceMs ?? DEFAULT_EXIT_GRACE_MS);
+  const gracefulSignalAlreadySent = options.gracefulSignalAlreadySent === true;
+  const pid = Number(proc.pid);
+  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const killer = spawn(buildWindowsProcessTreeTerminationArgv(pid), {
+        stdout: "ignore",
+        stderr: "ignore"
+      });
+      const taskkillExit = await settleWithin(killer.exited, terminationTimeoutMs);
+      if (!taskkillExit.settled) {
+        try {
+          killer.kill("SIGKILL");
+        } catch {}
+      }
+      if (!taskkillExit.settled || taskkillExit.value !== 0) {
+        try {
+          const sweeper = spawn(buildWindowsDescendantSweepArgv(pid), {
+            stdout: "ignore",
+            stderr: "ignore"
+          });
+          if (!(await settleWithin(sweeper.exited, terminationTimeoutMs)).settled) {
+            try {
+              sweeper.kill("SIGKILL");
+            } catch {}
+          }
+        } catch {}
+      }
+      if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+        return;
+    } catch {}
+  }
+  if (platform !== "win32" && Number.isFinite(pid) && pid > 0) {
+    if (gracefulSignalAlreadySent) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          return;
+        }
+      }
+      await settleWithin(proc.exited, exitGraceMs);
+      return;
+    }
+    let signalledProcessGroup = false;
+    try {
+      process.kill(-pid, "SIGTERM");
+      signalledProcessGroup = true;
+    } catch {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        return;
+      }
+    }
+    if (!signalledProcessGroup) {
+      if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+        return;
+    } else {
+      const groupDeadline = Date.now() + exitGraceMs;
+      while (Date.now() < groupDeadline) {
+        try {
+          process.kill(-pid, 0);
+        } catch (error) {
+          if (error?.code === "ESRCH")
+            return;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, groupDeadline - Date.now()))));
+      }
+    }
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+    await settleWithin(proc.exited, exitGraceMs);
+    return;
+  }
+  if (!gracefulSignalAlreadySent) {
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      return;
+    }
+    if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+      return;
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {}
+  await settleWithin(proc.exited, exitGraceMs);
+}
+async function runBoundedProcess(argv, options) {
+  const spawn = options.spawn ?? defaultSpawner;
+  const platform = options.platform ?? process.platform;
+  const proc = spawn(argv, {
+    ...options.cwd ? { cwd: options.cwd } : {},
+    ...options.env ? { env: options.env } : {},
+    ...options.stdin ? { stdin: options.stdin } : {},
+    stdout: options.stdout ?? "pipe",
+    stderr: options.stderr ?? "pipe",
+    detached: platform !== "win32"
+  });
+  const maxBytes = Math.max(1, options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const stdoutCapture = captureBoundedStream(proc.stdout, maxBytes, {
+    retainTail: options.retainOutputTail,
+    onLine: options.onStdoutLine
+  });
+  const stderrCapture = captureBoundedStream(proc.stderr, maxBytes, {
+    retainTail: options.retainOutputTail,
+    onLine: options.onStderrLine
+  });
+  const timeoutMs = Math.max(1, Math.floor(options.timeoutMs));
+  const maxTotalTimeoutMs = Math.max(timeoutMs, Math.floor(options.maxTotalTimeoutMs ?? timeoutMs));
+  const startedAtMs = Date.now();
+  let effectiveTimeoutMs = timeoutMs;
+  let deadlineAtMs = startedAtMs + timeoutMs;
+  let timer = null;
+  const outcome = await Promise.race([
+    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    new Promise((resolve) => {
+      const scheduleDeadline = () => {
+        timer = setTimeout(() => {
+          const nowMs = Date.now();
+          let requestedExtensionValue = 0;
+          try {
+            requestedExtensionValue = options.extendTimeoutMs?.({
+              startedAtMs,
+              deadlineAtMs,
+              elapsedMs: Math.max(0, nowMs - startedAtMs)
+            }) ?? 0;
+          } catch {
+            requestedExtensionValue = 0;
+          }
+          const extensionMs = Math.min(Math.max(0, Math.floor(requestedExtensionValue)), Math.max(0, maxTotalTimeoutMs - effectiveTimeoutMs));
+          if (extensionMs > 0) {
+            effectiveTimeoutMs += extensionMs;
+            deadlineAtMs = nowMs + extensionMs;
+            try {
+              options.onTimeoutExtended?.(extensionMs, deadlineAtMs);
+            } catch {}
+            scheduleDeadline();
+            return;
+          }
+          try {
+            options.onTimeout?.(Math.max(1, nowMs - startedAtMs));
+          } catch {}
+          resolve({ timedOut: true, exitCode: 124 });
+        }, Math.max(1, deadlineAtMs - Date.now()));
+      };
+      scheduleDeadline();
+    })
+  ]);
+  if (timer)
+    clearTimeout(timer);
+  const terminate = options.terminate ?? ((target) => terminateProcessTree(target, { platform, spawn }));
+  if (outcome.timedOut)
+    await terminate(proc);
+  const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
+  let streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), drainTimeoutMs);
+  const drainTimedOut = !streams.settled;
+  if (!streams.settled) {
+    if (!outcome.timedOut) {
+      if (options.terminate) {
+        await options.terminate(proc);
+      } else {
+        await terminateProcessTree(proc, {
+          platform,
+          spawn,
+          exitGraceMs: Math.min(250, Math.max(25, drainTimeoutMs))
+        });
+      }
+    }
+    stdoutCapture.cancel();
+    stderrCapture.cancel();
+    streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250);
+  }
+  const [stdout, rawStderr] = streams.settled ? streams.value : ["", ""];
+  const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
+  const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
+  const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
+  return {
+    stdout: trimOutput(stdout),
+    stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
+`),
+    exitCode: outcome.exitCode,
+    timedOut: outcome.timedOut,
+    drainTimedOut
+  };
+}
+
+// packages/shared/src/repo.ts
 function resolveDotGitEntry(repoRoot) {
   return resolve(repoRoot, ".git");
 }
@@ -60,6 +408,118 @@ function detectRepoRoot(startDir) {
   console.warn(`[repo] No .git directory found, using: ${startDir}`);
   return startDir;
 }
+// packages/shared/src/bounded_fetch.ts
+var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
+async function fetchWithHardDeadline(options) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.floor(options.timeoutMs)) : 1;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const controller = new AbortController;
+  const upstreamSignal = options.init?.signal;
+  let rejectUpstreamAbort = null;
+  const upstreamAbort = new Promise((_resolve, reject) => {
+    rejectUpstreamAbort = reject;
+  });
+  const abortFromUpstream = () => {
+    controller.abort(upstreamSignal?.reason);
+    rejectUpstreamAbort?.(upstreamSignal?.reason instanceof Error ? upstreamSignal.reason : new DOMException("The HTTP request was aborted", "AbortError"));
+  };
+  if (upstreamSignal?.aborted) {
+    abortFromUpstream();
+  } else {
+    upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+  }
+  let timer = null;
+  const operation = Promise.resolve().then(async () => {
+    const response = await fetchImpl(options.input, {
+      ...options.init,
+      signal: controller.signal
+    });
+    return await options.consume(response, controller.signal);
+  });
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(options.timeoutMessage ?? `HTTP request timed out after ${timeoutMs}ms`));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race(upstreamSignal ? [operation, deadline, upstreamAbort] : [operation, deadline]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+  }
+}
+async function fetchBufferedWithHardDeadline(options) {
+  const { maxResponseBytes: configuredMaxResponseBytes, ...requestOptions } = options;
+  const maxResponseBytes = typeof configuredMaxResponseBytes === "number" && Number.isFinite(configuredMaxResponseBytes) && configuredMaxResponseBytes >= 0 ? Math.floor(configuredMaxResponseBytes) : DEFAULT_MAX_BUFFERED_RESPONSE_BYTES;
+  return fetchWithHardDeadline({
+    ...requestOptions,
+    consume: async (response, signal) => {
+      const responseInit = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      };
+      if (!response.body)
+        return new Response(null, responseInit);
+      const reader = response.body.getReader();
+      const sizeError = () => new Error(`HTTP response exceeded ${maxResponseBytes} byte buffer limit`);
+      const cancelReader = () => {
+        try {
+          reader.cancel(signal.reason).catch(() => {
+            return;
+          });
+        } catch {}
+      };
+      signal.addEventListener("abort", cancelReader, { once: true });
+      if (signal.aborted)
+        cancelReader();
+      try {
+        const contentLengthHeader = response.headers.get("content-length");
+        const contentLength = contentLengthHeader == null ? null : Number(contentLengthHeader);
+        if (contentLength != null && Number.isFinite(contentLength) && contentLength > maxResponseBytes) {
+          const error = sizeError();
+          await reader.cancel(error).catch(() => {
+            return;
+          });
+          throw error;
+        }
+        const chunks = [];
+        let totalBytes = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done)
+            break;
+          totalBytes += value.byteLength;
+          if (totalBytes > maxResponseBytes) {
+            const error = sizeError();
+            await reader.cancel(error).catch(() => {
+              return;
+            });
+            throw error;
+          }
+          chunks.push(value);
+        }
+        if (totalBytes === 0)
+          return new Response(null, responseInit);
+        const body = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          body.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return new Response(body, responseInit);
+      } finally {
+        signal.removeEventListener("abort", cancelReader);
+        try {
+          reader.releaseLock();
+        } catch {}
+      }
+    }
+  });
+}
+
 // packages/shared/src/communication.ts
 function stripPresenceSourcePrefix(value) {
   return value.replace(/^(agent|client)(?:[\s:./_-]+)+/i, "");
@@ -77,12 +537,14 @@ class CommunicationManager {
   from;
   authToken;
   fetchImpl;
+  requestTimeoutMs;
   constructor(opts) {
     this.serverUrl = opts.serverUrl;
     this.sessionId = opts.sessionId;
     this.from = opts.from;
     this.authToken = opts.authToken ?? null;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.requestTimeoutMs = Math.max(1, Math.min(120000, Math.floor(opts.requestTimeoutMs ?? 1e4)));
   }
   headers() {
     const headers = { "Content-Type": "application/json" };
@@ -124,10 +586,16 @@ class CommunicationManager {
         body.turnId = meta.turnId;
       if (meta.parentId)
         body.parentId = meta.parentId;
-      const response = await this.fetchImpl(this.commandUrl(sessionId), {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body)
+      const response = await fetchBufferedWithHardDeadline({
+        input: this.commandUrl(sessionId),
+        init: {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body)
+        },
+        timeoutMs: this.requestTimeoutMs,
+        fetchImpl: this.fetchImpl,
+        timeoutMessage: `session command timed out after ${this.requestTimeoutMs}ms`
       });
       return response.ok;
     } catch {
@@ -1271,10 +1739,26 @@ var DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 var LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.5";
 var DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 var DEFAULT_CODEX_TIMEOUT_MS = 120000;
+var DEFAULT_LLM_HTTP_TIMEOUT_MS = 120000;
+var DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS = 1e4;
+var DEFAULT_LLM_TELEMETRY_TIMEOUT_MS = 5000;
 var DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 var DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 var DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
 var DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES = 3;
+function resolveLlmHttpTimeoutMs(explicit, fallback) {
+  const environmentValue = Number(process.env.PUSHPALS_LLM_HTTP_TIMEOUT_MS);
+  const configured = typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0 ? explicit : Number.isFinite(environmentValue) && environmentValue > 0 ? environmentValue : fallback;
+  return Math.max(1, Math.floor(configured));
+}
+function fetchLlmHttpResponse(input, init, timeoutMs, operation) {
+  return fetchBufferedWithHardDeadline({
+    input,
+    init,
+    timeoutMs,
+    timeoutMessage: `${operation} timed out after ${timeoutMs}ms`
+  });
+}
 var CONTEXT_PACKER_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/context_packer_system_prompt.md").trim();
 var CONTEXT_PACKER_CONDENSED_HISTORY_SYSTEM_PROMPT = loadPromptTemplate("remotebuddy/context_packer_condensed_history_system_prompt.md").trim();
 var KNOWN_PROVIDER_PREFIXES = new Set([
@@ -1477,54 +1961,22 @@ async function runProcess(command, opts) {
   return runProcessWithNode(command, opts);
 }
 async function runProcessWithBun(command, opts) {
-  const bunRuntime = globalThis.Bun;
-  const timeoutMs = opts.timeoutMs ?? 0;
-  let timedOut = false;
-  let timeout = null;
-  let killTimeout = null;
-  const proc = bunRuntime.spawn(command, {
+  const timeoutMs = typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? Math.floor(opts.timeoutMs) : DEFAULT_CODEX_TIMEOUT_MS;
+  const result = await runBoundedProcess(command, {
     cwd: opts.cwd,
     env: opts.env,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe"
+    stdin: typeof opts.stdin === "string" ? new Blob([opts.stdin]) : "ignore",
+    timeoutMs,
+    outputLimitBytes: 4 * 1024 * 1024,
+    streamDrainTimeoutMs: 2000
   });
-  const stdoutPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
-  if (timeoutMs > 0) {
-    timeout = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill("SIGTERM");
-      } catch {}
-      killTimeout = setTimeout(() => {
-        try {
-          proc.kill("SIGKILL");
-        } catch {}
-      }, 1000);
-      killTimeout.unref?.();
-    }, timeoutMs);
-  }
-  try {
-    if (typeof opts.stdin === "string") {
-      proc.stdin?.write(opts.stdin);
-    }
-    proc.stdin?.end();
-    const code = await proc.exited;
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-    return {
-      code,
-      signal: null,
-      stdout,
-      stderr,
-      timedOut
-    };
-  } finally {
-    if (timeout)
-      clearTimeout(timeout);
-    if (killTimeout)
-      clearTimeout(killTimeout);
-  }
+  return {
+    code: result.exitCode,
+    signal: result.timedOut ? "SIGKILL" : null,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    timedOut: result.timedOut
+  };
 }
 async function runProcessWithNode(command, opts) {
   const timeoutMs = opts.timeoutMs ?? 0;
@@ -1810,17 +2262,18 @@ function createHttpUsageReporter(opts) {
   const serverUrl = (opts.serverUrl ?? "").trim().replace(/\/+$/, "");
   if (!serverUrl)
     return null;
+  const timeoutMs = Math.min(resolveLlmHttpTimeoutMs(opts.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS), DEFAULT_LLM_TELEMETRY_TIMEOUT_MS);
   return {
     async reportUsage(event) {
       const headers = { "Content-Type": "application/json" };
       const authToken = (opts.authToken ?? "").trim();
       if (authToken)
         headers.Authorization = `Bearer ${authToken}`;
-      const response = await fetch(`${serverUrl}/telemetry/llm-usage`, {
+      const response = await fetchLlmHttpResponse(`${serverUrl}/telemetry/llm-usage`, {
         method: "POST",
         headers,
         body: JSON.stringify(event)
-      });
+      }, timeoutMs, "LLM usage telemetry request");
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         throw new Error(`usage telemetry rejected (${response.status})${detail ? `: ${detail.trim()}` : ""}`);
@@ -1985,6 +2438,7 @@ class LmStudioClient {
   batchTailMessages;
   batchChunkTokens;
   batchMemoryChars;
+  httpTimeoutMs;
   resolvedModel = null;
   resolveModelPromise = null;
   lmStudioSupportsExtendedSessionFields = null;
@@ -2007,6 +2461,7 @@ class LmStudioClient {
     this.batchTailMessages = Math.max(1, lmStudio?.batchTailMessages ?? DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES);
     this.batchChunkTokens = Math.max(0, lmStudio?.batchChunkTokens ?? 0);
     this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
+    this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
   async maybeReportUsage(modelId, usage) {
     if (!this.usageReporter)
@@ -2067,9 +2522,10 @@ class LmStudioClient {
       headers.Authorization = `Bearer ${this.apiKey.trim()}`;
     }
     let lastDetail = "model-list probe failed";
+    const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
     for (const url of probes) {
       try {
-        const res = await fetch(url, { method: "GET", headers });
+        const res = await fetchLlmHttpResponse(url, { method: "GET", headers }, timeoutMs, `${this.providerLabel} model-list probe`);
         if (!res.ok) {
           const body = await res.text();
           const hint = body.trim().slice(0, 120);
@@ -2198,11 +2654,11 @@ class LmStudioClient {
         headers["X-Session-Id"] = this.sessionTag;
         headers["X-Conversation-Id"] = this.sessionTag;
       }
-      const res = await fetch(this.endpoint, {
+      const res = await fetchLlmHttpResponse(this.endpoint, {
         method: "POST",
         headers,
         body: JSON.stringify(body)
-      });
+      }, this.httpTimeoutMs, `${this.providerLabel} completion request`);
       if (!res.ok) {
         lastStatus = res.status;
         lastError = await res.text();
@@ -2565,6 +3021,7 @@ class OllamaClient {
   service;
   sessionTag;
   usageReporter;
+  httpTimeoutMs;
   constructor(opts) {
     const rawEndpoint = opts?.endpoint ?? DEFAULT_OLLAMA_ENDPOINT;
     this.endpoint = normalizeOllamaEndpoint(rawEndpoint);
@@ -2572,6 +3029,7 @@ class OllamaClient {
     this.service = opts?.service ?? "remotebuddy";
     this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
     this.usageReporter = opts?.usageReporter ?? null;
+    this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
   async maybeReportUsage(usage) {
     if (!this.usageReporter)
@@ -2595,9 +3053,10 @@ class OllamaClient {
     const base = this.endpoint.replace(/\/api\/chat$/, "");
     const probes = uniqueNonEmptyStrings([`${base}/api/tags`, this.endpoint]);
     let lastDetail = "model-list probe failed";
+    const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
     for (const url of probes) {
       try {
-        const res = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
+        const res = await fetchLlmHttpResponse(url, { method: "GET", headers: { Accept: "application/json" } }, timeoutMs, "Ollama model-list probe");
         if (!res.ok) {
           const body = await res.text();
           const hint = body.trim().slice(0, 120);
@@ -2648,11 +3107,11 @@ class OllamaClient {
     if (input.json) {
       body.format = "json";
     }
-    const res = await fetch(this.endpoint, {
+    const res = await fetchLlmHttpResponse(this.endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
-    });
+    }, this.httpTimeoutMs, "Ollama completion request");
     if (!res.ok) {
       const err = await res.text();
       throw new Error(`Ollama API error ${res.status}: ${err}`);
@@ -2696,7 +3155,8 @@ function createLLMClient(opts = {}) {
       model: resolved.model,
       service,
       sessionId: resolved.sessionId,
-      usageReporter
+      usageReporter,
+      httpTimeoutMs: opts.httpTimeoutMs
     });
   }
   if (resolved.backend === "openai") {
@@ -2709,7 +3169,8 @@ function createLLMClient(opts = {}) {
       service,
       sessionId: resolved.sessionId,
       lmStudio: resolved.lmStudio,
-      usageReporter
+      usageReporter,
+      httpTimeoutMs: opts.httpTimeoutMs
     });
   }
   console.log(`[LLM] Using LM Studio backend (model: ${resolved.model}, endpoint: ${resolved.endpoint})`);
@@ -2721,7 +3182,8 @@ function createLLMClient(opts = {}) {
     service,
     sessionId: resolved.sessionId,
     lmStudio: resolved.lmStudio,
-    usageReporter
+    usageReporter,
+    httpTimeoutMs: opts.httpTimeoutMs
   });
 }
 async function preflightServiceLlm(opts = {}) {
@@ -2749,7 +3211,8 @@ async function preflightServiceLlm(opts = {}) {
       model: resolved.model,
       service,
       sessionId: resolved.sessionId,
-      usageReporter: null
+      usageReporter: null,
+      httpTimeoutMs: opts.httpTimeoutMs
     });
     await client2.preflightConfiguredModel();
     return;
@@ -2762,7 +3225,8 @@ async function preflightServiceLlm(opts = {}) {
     service,
     sessionId: resolved.sessionId,
     lmStudio: resolved.lmStudio,
-    usageReporter: null
+    usageReporter: null,
+    httpTimeoutMs: opts.httpTimeoutMs
   });
   await client.preflightConfiguredModel();
 }
@@ -3104,6 +3568,7 @@ function buildRequestStatusReply(args) {
 
 // apps/localbuddy/src/local_readonly.ts
 var READONLY_COMMAND_TIMEOUT_MS = 8000;
+var READONLY_HTTP_TIMEOUT_MS = 1e4;
 var MAX_STATUS_LINES = 60;
 function truncateLines(lines, maxLines) {
   const trimmed = lines.map((line) => line.trimEnd()).filter((line) => line.length > 0);
@@ -3116,26 +3581,15 @@ function truncateLines(lines, maxLines) {
   };
 }
 async function runReadOnlyCommand(command, cwd) {
-  const proc = Bun.spawn(command, {
+  const result = await runBoundedProcess(command, {
     cwd,
-    stdout: "pipe",
-    stderr: "pipe"
+    timeoutMs: READONLY_COMMAND_TIMEOUT_MS,
+    outputLimitBytes: 256 * 1024
   });
-  const timer = setTimeout(() => {
-    try {
-      proc.kill();
-    } catch {}
-  }, READONLY_COMMAND_TIMEOUT_MS);
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited
-  ]);
-  clearTimeout(timer);
   return {
-    ok: exitCode === 0,
-    stdout: String(stdout ?? ""),
-    stderr: String(stderr ?? "")
+    ok: result.exitCode === 0,
+    stdout: result.stdout,
+    stderr: result.stderr
   };
 }
 function isGitStatusPrompt(input) {
@@ -3188,8 +3642,12 @@ ${compact.text}${overflow}
 async function buildSystemStatusReply(ctx) {
   let response;
   try {
-    response = await fetch(`${ctx.serverUrl}/system/status`, {
-      headers: ctx.authHeaders
+    response = await fetchBufferedWithHardDeadline({
+      input: `${ctx.serverUrl}/system/status`,
+      init: { headers: ctx.authHeaders },
+      timeoutMs: Math.max(1, Math.floor(ctx.httpTimeoutMs ?? READONLY_HTTP_TIMEOUT_MS)),
+      maxResponseBytes: 2 * 1024 * 1024,
+      timeoutMessage: "LocalBuddy system-status request timed out"
     });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
@@ -3220,6 +3678,7 @@ async function answerLocalReadonlyQuery(userPrompt, ctx) {
 
 // apps/localbuddy/src/localbuddy_main.ts
 var CONFIG = loadPushPalsConfig();
+var LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS = 1e4;
 function parseArgs() {
   const args = process.argv.slice(2);
   let server = CONFIG.server.url;
@@ -3571,7 +4030,13 @@ ${LOCAL_QUICK_REPLY_JSON_SYSTEM_SUFFIX}`,
   }
   async fetchJobLogTail(jobId, limit = 8) {
     try {
-      const res = await fetch(`${this.server}/jobs/${encodeURIComponent(jobId)}/logs?limit=${Math.max(1, Math.min(20, limit))}`, { headers: this.authHeaders() });
+      const res = await fetchBufferedWithHardDeadline({
+        input: `${this.server}/jobs/${encodeURIComponent(jobId)}/logs?limit=${Math.max(1, Math.min(20, limit))}`,
+        init: { headers: this.authHeaders() },
+        timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+        maxResponseBytes: 8 * 1024 * 1024,
+        timeoutMessage: "LocalBuddy job-log request timed out"
+      });
       if (!res.ok)
         return [];
       const payload = await res.json();
@@ -3612,11 +4077,19 @@ ${tail.join(`
       return null;
     try {
       const [requestData, jobData] = await Promise.all([
-        fetch(`${this.server}/requests?status=all&limit=200`, {
-          headers: this.authHeaders()
+        fetchBufferedWithHardDeadline({
+          input: `${this.server}/requests?status=all&limit=200`,
+          init: { headers: this.authHeaders() },
+          timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+          maxResponseBytes: 8 * 1024 * 1024,
+          timeoutMessage: "LocalBuddy request-status query timed out"
         }),
-        fetch(`${this.server}/jobs?status=all&limit=400`, {
-          headers: this.authHeaders()
+        fetchBufferedWithHardDeadline({
+          input: `${this.server}/jobs?status=all&limit=400`,
+          init: { headers: this.authHeaders() },
+          timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+          maxResponseBytes: 8 * 1024 * 1024,
+          timeoutMessage: "LocalBuddy job-status query timed out"
         })
       ]);
       if (!requestData.ok) {
@@ -3639,8 +4112,12 @@ ${tail.join(`
           selectedJob = matchedJob;
         }
         if (selectedJob) {
-          const logsRes = await fetch(`${this.server}/jobs/${selectedJob.id}/logs?limit=10`, {
-            headers: this.authHeaders()
+          const logsRes = await fetchBufferedWithHardDeadline({
+            input: `${this.server}/jobs/${selectedJob.id}/logs?limit=10`,
+            init: { headers: this.authHeaders() },
+            timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+            maxResponseBytes: 8 * 1024 * 1024,
+            timeoutMessage: "LocalBuddy selected-job log query timed out"
           });
           if (logsRes.ok) {
             const logsPayload = await logsRes.json();
@@ -3690,10 +4167,16 @@ ${tail.join(`
         headers["Authorization"] = `Bearer ${authToken}`;
       for (let attempt = 1;attempt <= maxRetries && !stopping; attempt++) {
         try {
-          const res = await fetch(`${serverUrl}/sessions`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ sessionId })
+          const res = await fetchBufferedWithHardDeadline({
+            input: `${serverUrl}/sessions`,
+            init: {
+              method: "POST",
+              headers,
+              body: JSON.stringify({ sessionId })
+            },
+            timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+            maxResponseBytes: 8 * 1024 * 1024,
+            timeoutMessage: "LocalBuddy session registration timed out"
           });
           if (res.ok)
             return true;
@@ -3904,15 +4387,21 @@ ${tail.join(`
                       send({ type: "status", message: "Enqueuing to Request Queue..." });
                       const priority = classifyRemoteRequestPriority(routedPrompt);
                       const queueWaitBudgetMs = queueWaitBudgetForPriority(priority);
-                      const res = await fetch(`${serverUrl}/requests/enqueue`, {
-                        method: "POST",
-                        headers: cmdHeaders,
-                        body: JSON.stringify({
-                          sessionId,
-                          prompt: routedPrompt,
-                          priority,
-                          queueWaitBudgetMs
-                        })
+                      const res = await fetchBufferedWithHardDeadline({
+                        input: `${serverUrl}/requests/enqueue`,
+                        init: {
+                          method: "POST",
+                          headers: cmdHeaders,
+                          body: JSON.stringify({
+                            sessionId,
+                            prompt: routedPrompt,
+                            priority,
+                            queueWaitBudgetMs
+                          })
+                        },
+                        timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+                        maxResponseBytes: 8 * 1024 * 1024,
+                        timeoutMessage: "LocalBuddy request enqueue timed out"
                       });
                       if (!res.ok) {
                         const err = await res.text();
@@ -3998,10 +4487,16 @@ async function connectWithRetry(server, sessionId, maxRetries = 10, baseDelay = 
   while (true) {
     attempt++;
     try {
-      const res = await fetch(`${server}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId })
+      const res = await fetchBufferedWithHardDeadline({
+        input: `${server}/sessions`,
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId })
+        },
+        timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+        maxResponseBytes: 8 * 1024 * 1024,
+        timeoutMessage: "LocalBuddy startup session connection timed out"
       });
       if (!res.ok)
         throw new Error(`HTTP ${res.status} ${res.statusText}`);

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { loadPushPalsConfig } from "shared";
+import { loadPushPalsConfig, terminateProcessTree } from "shared";
 
 const CONFIG = loadPushPalsConfig();
 const restartEnabled = CONFIG.remotebuddy.crashRestartEnabled;
@@ -15,16 +15,15 @@ let shuttingDown = false;
 function requestShutdown(exitCode: number): void {
   if (shuttingDown) return;
   shuttingDown = true;
-  if (activeChild) {
-    try {
-      activeChild.kill();
-    } catch {
-      // best-effort shutdown
+  const child = activeChild;
+  void (async () => {
+    if (child) {
+      await terminateProcessTree(child, {
+        terminationTimeoutMs: 5_000,
+        exitGraceMs: 2_000,
+      });
     }
-  }
-  setTimeout(() => {
-    process.exit(exitCode);
-  }, 50).unref();
+  })().finally(() => process.exit(exitCode));
 }
 
 process.on("SIGINT", () => requestShutdown(130));
@@ -55,12 +54,16 @@ async function run(): Promise<never> {
       stdout: "inherit",
       stderr: "inherit",
       env: { ...process.env },
+      detached: process.platform !== "win32",
     });
 
     const exitCode = await activeChild.exited;
     activeChild = null;
 
     if (!shouldAttemptRestart(exitCode)) {
+      if (shuttingDown) {
+        await new Promise<never>(() => undefined);
+      }
       process.exit(exitCode);
     }
 

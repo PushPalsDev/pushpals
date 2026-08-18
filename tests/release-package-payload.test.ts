@@ -285,6 +285,8 @@ describe("release package payload verification", () => {
     );
 
     const buildPackageIndex = workflow.indexOf("Build CLI package payload");
+    const reliabilityJobIndex = workflow.indexOf("reliability_contract:");
+    const publishJobIndex = workflow.indexOf("publish_npm:");
     const verifyPackageIndex = workflow.indexOf(
       "Verify CLI package payload excludes external toolchains",
     );
@@ -296,6 +298,13 @@ describe("release package payload verification", () => {
     const createReleaseIndex = workflow.indexOf("Create GitHub release (release log)");
 
     expect(buildPackageIndex).toBeGreaterThanOrEqual(0);
+    expect(reliabilityJobIndex).toBeGreaterThanOrEqual(0);
+    expect(publishJobIndex).toBeGreaterThan(reliabilityJobIndex);
+    expect(workflow).toContain("- reliability_contract");
+    expect(workflow).toContain("bun run harness:reliability");
+    expect(workflow).toContain('PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION: "1"');
+    expect(workflow).toContain('PUSHPALS_RUN_CONTAINER_VOLUME_INTEGRATION: "1"');
+    expect(workflow).not.toContain('PUSHPALS_RUN_WINDOWS_LINUX_CONTAINER_INTEGRATION: "1"');
     expect(verifyPackageIndex).toBeGreaterThan(buildPackageIndex);
     expect(publishIndex).toBeGreaterThan(verifyPackageIndex);
     expect(checksumIndex).toBeGreaterThanOrEqual(0);

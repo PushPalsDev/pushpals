@@ -1,5 +1,6 @@
 import type { SourceControlManagerConfig } from "./config";
 import type { SourceControlApi } from "./git";
+import { fetchBufferedWithHardDeadline } from "../../../packages/shared/src/bounded_fetch.js";
 import {
   buildIntegrationReconciliationJob,
   type IntegrationReconciliationJobPayload,
@@ -40,6 +41,7 @@ export interface IntegrationMaintenanceRunnerOptions {
   intervalMs: number;
   now?: () => number;
   fetchImpl?: typeof fetch;
+  httpTimeoutMs?: number;
   logger?: {
     log(message: string): void;
     warn(message: string): void;
@@ -58,6 +60,7 @@ export class IntegrationMaintenanceRunner {
   private readonly intervalMs: number;
   private readonly now: () => number;
   private readonly fetchImpl: typeof fetch;
+  private readonly httpTimeoutMs: number;
   private readonly logger: NonNullable<IntegrationMaintenanceRunnerOptions["logger"]>;
   private nextRunAtMs = 0;
   private lastObservedNowMs: number | null = null;
@@ -70,6 +73,7 @@ export class IntegrationMaintenanceRunner {
     this.intervalMs = Math.max(1, Math.floor(options.intervalMs));
     this.now = options.now ?? Date.now;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    this.httpTimeoutMs = Math.max(1, Math.floor(options.httpTimeoutMs ?? 10_000));
     this.logger = options.logger ?? {
       log: (message) => console.log(message),
       warn: (message) => console.warn(message),
@@ -162,10 +166,16 @@ export class IntegrationMaintenanceRunner {
         sync,
         now,
       });
-      const response = await this.fetchImpl(`${runtimeConfig.serverUrl}/jobs/enqueue`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${runtimeConfig.serverUrl}/jobs/enqueue`,
+        init: {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+        },
+        timeoutMs: this.httpTimeoutMs,
+        fetchImpl: this.fetchImpl,
+        timeoutMessage: `Integration reconciliation enqueue timed out after ${this.httpTimeoutMs}ms`,
       });
       const responseBody = (await response.json().catch(() => null)) as EnqueueResponseBody | null;
       if (!response.ok) {

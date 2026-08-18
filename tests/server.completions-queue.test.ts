@@ -68,10 +68,23 @@ function enqueueClaimedJob(jobs: JobQueue, suffix: string): string {
   return jobId;
 }
 
+function currentCompletionClaim(
+  completions: CompletionQueue,
+  completionId: string,
+): [pusherId: string, claimToken: string] {
+  const row = completions.getCompletion(completionId);
+  const pusherId = String(row?.pusherId ?? "");
+  const claimToken = String(row?.claimToken ?? "");
+  expect(pusherId).not.toBe("");
+  expect(claimToken).not.toBe("");
+  return [pusherId, claimToken];
+}
+
 function trustedValidationReport(options: {
   ok: boolean;
   command?: string;
   candidateSha: string;
+  candidateRef?: string;
   baselineSha?: string;
   output?: string;
   exitCode?: number;
@@ -90,6 +103,7 @@ function trustedValidationReport(options: {
     version: 1,
     baselineSha: options.baselineSha ?? "baseline-sha",
     candidateSha: options.candidateSha,
+    candidateRef: options.candidateRef ?? `refs/pushpals/validation/${"a".repeat(32)}/1/candidate`,
     results: [
       {
         ok: options.ok,
@@ -170,6 +184,9 @@ describe("server CompletionQueue PR URL persistence", () => {
         validationDurationMs: 54_321,
         installCacheHit: true,
       },
+      undefined,
+      "scm-publication",
+      claimed.completion?.claimToken,
     );
     expect(completed).toMatchObject({ ok: true, jobId, jobTransitioned: true });
     expect(jobs.getJob(jobId)).toMatchObject({
@@ -187,12 +204,52 @@ describe("server CompletionQueue PR URL persistence", () => {
       trustedValidationDurationMs: 54_321,
       trustedValidationCacheHit: 1,
     });
+    expect(completions.getCompletionProcessingAuthority(claimed.completion?.id ?? "")).toEqual({
+      id: claimed.completion?.id,
+      status: "processed",
+      commitSha: "abc123",
+      branch: "refs/pushpals/agent/worker/job-publication",
+      claimGeneration: 1,
+    });
+    expect(completions.getCompletionProcessingAuthority("missing-completion")).toBeNull();
     expect(
       completions.markProcessedAndFinalizeJob(
         claimed.completion?.id ?? "",
         "https://github.com/org/repo/pull/42",
+        undefined,
+        undefined,
+        "scm-publication",
+        claimed.completion?.claimToken,
       ),
     ).toMatchObject({ ok: true, jobTransitioned: false });
+    expect(
+      completions.enqueue(
+        {
+          jobId,
+          sessionId: "dev",
+          commitSha: "abc123",
+          branch: "refs/pushpals/agent/worker/job-publication",
+          message: "candidate retained",
+        },
+        { beginJobFinalization: true },
+      ),
+    ).toMatchObject({
+      ok: true,
+      completionId: handoff.completionId,
+      deduped: true,
+    });
+    expect(
+      completions.enqueue(
+        {
+          jobId,
+          sessionId: "dev",
+          commitSha: "different-candidate",
+          branch: "refs/pushpals/agent/worker/job-publication",
+          message: "candidate retained",
+        },
+        { beginJobFinalization: true },
+      ),
+    ).toMatchObject({ ok: false });
 
     completions.close();
     jobs.close();
@@ -214,7 +271,8 @@ describe("server CompletionQueue PR URL persistence", () => {
     );
     const completionId = handoff.completionId ?? "";
     expect(jobs.getJob(jobId)?.status).toBe("finalizing");
-    expect(completions.claim("scm-validation").completion?.id).toBe(completionId);
+    const claimed = completions.claim("scm-validation");
+    expect(claimed.completion?.id).toBe(completionId);
 
     const failed = completions.markFailedAndBlockJob(
       completionId,
@@ -228,6 +286,7 @@ describe("server CompletionQueue PR URL persistence", () => {
         version: 1,
         baselineSha: "base123",
         candidateSha: "spoofed-candidate",
+        candidateRef: `refs/pushpals/validation/${"b".repeat(32)}/3/candidate`,
         results: [
           {
             ok: false,
@@ -253,6 +312,8 @@ describe("server CompletionQueue PR URL persistence", () => {
           },
         ],
       },
+      "scm-validation",
+      claimed.completion?.claimToken,
     );
     expect(failed).toMatchObject({ ok: true, jobId, jobTransitioned: true });
     expect(jobs.getJob(jobId)).toMatchObject({
@@ -265,10 +326,16 @@ describe("server CompletionQueue PR URL persistence", () => {
       failureClass: "trusted_validation_failed",
       terminalStage: "trusted_environment_validation",
     });
-    expect(completions.markFailedAndBlockJob(completionId, "duplicate callback")).toMatchObject({
-      ok: true,
-      jobTransitioned: false,
-    });
+    expect(
+      completions.markFailedAndBlockJob(
+        completionId,
+        "duplicate callback",
+        undefined,
+        undefined,
+        "scm-validation",
+        claimed.completion?.claimToken,
+      ),
+    ).toMatchObject({ ok: true, jobTransitioned: false });
     const validationRuns = jobs.getJobDiagnostics(jobId).validationRuns as Array<
       Record<string, unknown>
     >;
@@ -281,7 +348,8 @@ describe("server CompletionQueue PR URL persistence", () => {
         source: "trusted_host",
         completionId,
         baselineSha: "base123",
-        candidateSha: "def456",
+        candidateSha: "spoofed-candidate",
+        candidateRef: `refs/pushpals/validation/${"b".repeat(32)}/3/candidate`,
         failureFingerprint: expect.any(String),
         failedTests: [
           "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured",
@@ -295,6 +363,244 @@ describe("server CompletionQueue PR URL persistence", () => {
       trustedValidationCacheHit: 0,
     });
 
+    completions.close();
+    jobs.close();
+  });
+
+  test("does not invent exact tested provenance from the worker handoff", () => {
+    const { jobs, completions, jobId } = createSharedQueues();
+    const handoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        commitSha: "original-worker-sha",
+        branch: "refs/pushpals/agent/worker/original-worker-sha",
+        message: "candidate retained",
+        trustedValidationCommands: ["bun test"],
+      },
+      { beginJobFinalization: true },
+    );
+    const completionId = handoff.completionId ?? "";
+    const claimed = completions.claim("scm-no-provenance");
+    expect(claimed.completion?.id).toBe(completionId);
+    expect(
+      completions.markFailedAndBlockJob(
+        completionId,
+        "trusted validation failed",
+        undefined,
+        {
+          version: 1,
+          baselineSha: "known-baseline",
+          candidateSha: null,
+          candidateRef: null,
+          results: [
+            {
+              ok: false,
+              command: "bun test",
+              output: "tests/example.test.ts:\n(fail) exact provenance is unavailable",
+              exitCode: 1,
+              durationMs: 100,
+              phase: "validation",
+            },
+          ],
+        },
+        "scm-no-provenance",
+        claimed.completion?.claimToken,
+      ).ok,
+    ).toBe(true);
+
+    const run = jobs.getJobDiagnostics(jobId).validationRuns[0] as Record<string, any>;
+    expect(run.metadata).toMatchObject({
+      source: "trusted_host",
+      completionId,
+      baselineSha: "known-baseline",
+      candidateSha: null,
+      candidateRef: null,
+    });
+    expect(run.metadata.candidateSha).not.toBe("original-worker-sha");
+    expect(run.metadata.candidateRef).not.toBe("refs/pushpals/agent/worker/original-worker-sha");
+
+    completions.close();
+    jobs.close();
+  });
+
+  test("does not collide fingerprints for different assertions in the same test target", () => {
+    const { jobs, completions, jobId: firstJobId } = createSharedQueues();
+    const secondJobId = enqueueClaimedJob(jobs, "fingerprint-second");
+    const persistFailure = (jobId: string, candidateSha: string, assertion: string): string => {
+      const handoff = completions.enqueue(
+        {
+          jobId,
+          sessionId: "dev",
+          commitSha: candidateSha,
+          branch: `refs/pushpals/agent/worker/${candidateSha}`,
+          message: "candidate retained",
+          trustedValidationCommands: ["bun test"],
+        },
+        { beginJobFinalization: true },
+      );
+      const completionId = handoff.completionId ?? "";
+      const pusherId = `scm-${candidateSha}`;
+      const claimed = completions.claim(pusherId);
+      expect(claimed.completion?.id).toBe(completionId);
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "bun test failed",
+          undefined,
+          {
+            version: 1,
+            baselineSha: "same-baseline",
+            candidateSha,
+            results: [
+              {
+                ok: false,
+                command: "bun test",
+                output: [
+                  "tests/account.test.ts:",
+                  "(fail) account boundary > rejects invalid state",
+                  assertion,
+                ].join("\n"),
+                exitCode: 1,
+                durationMs: 100,
+                phase: "validation",
+              },
+            ],
+          },
+          pusherId,
+          claimed.completion?.claimToken,
+        ).ok,
+      ).toBe(true);
+      const run = jobs.getJobDiagnostics(jobId).validationRuns[0] as Record<string, any>;
+      return String(run.metadata.failureFingerprint ?? "");
+    };
+
+    const first = persistFailure(firstJobId, "a".repeat(40), "Expected: 401\nReceived: 503");
+    const second = persistFailure(secondJobId, "b".repeat(40), "Error: teardown process timed out");
+
+    expect(first).toHaveLength(24);
+    expect(second).toHaveLength(24);
+    expect(first).not.toBe(second);
+    completions.close();
+    jobs.close();
+  });
+
+  test("normalizes volatile runtime identity out of trusted-validation fingerprints", () => {
+    const { jobs, completions, jobId: firstJobId } = createSharedQueues();
+    const secondJobId = enqueueClaimedJob(jobs, "fingerprint-volatile-second");
+    const persist = (jobId: string, candidateSha: string, output: string): string => {
+      const handoff = completions.enqueue(
+        {
+          jobId,
+          sessionId: "dev",
+          commitSha: candidateSha,
+          branch: `refs/pushpals/agent/worker/${candidateSha}`,
+          message: "candidate retained",
+          trustedValidationCommands: ["bun test tests/account.test.ts"],
+        },
+        { beginJobFinalization: true },
+      );
+      const completionId = handoff.completionId ?? "";
+      const pusherId = `scm-${candidateSha}`;
+      const claimed = completions.claim(pusherId);
+      expect(claimed.completion?.id).toBe(completionId);
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "bun test failed",
+          undefined,
+          {
+            version: 1,
+            baselineSha: "same-baseline",
+            candidateSha,
+            results: [
+              {
+                ok: false,
+                command: "bun test tests/account.test.ts",
+                output,
+                exitCode: 1,
+                durationMs: 100,
+                phase: "validation",
+              },
+            ],
+          },
+          pusherId,
+          claimed.completion?.claimToken,
+        ).ok,
+      ).toBe(true);
+      return String(
+        (jobs.getJobDiagnostics(jobId).validationRuns[0] as Record<string, any>).metadata
+          .failureFingerprint ?? "",
+      );
+    };
+
+    const first = persist(
+      firstJobId,
+      "a".repeat(40),
+      "tests/account.test.ts:\n(fail) account boundary > rejects invalid state\nError: worker job_abcdef12 pid 4012 could not reach 127.0.0.1:53111 at C:\\Users\\one\\AppData\\Local\\Temp\\pushpals-a\\runner.ts:12:4",
+    );
+    const second = persist(
+      secondJobId,
+      "b".repeat(40),
+      "tests/account.test.ts:\n(fail) account boundary > rejects invalid state\nError: worker job_fedcba98 pid 9931 could not reach 127.0.0.1:64222 at C:\\Users\\two\\AppData\\Local\\Temp\\pushpals-b\\runner.ts:98:7",
+    );
+    expect(first).toHaveLength(24);
+    expect(second).toBe(first);
+    completions.close();
+    jobs.close();
+  });
+
+  test("merges full supplied evidence with evidence re-extracted from bounded output", () => {
+    const { jobs, completions, jobId } = createSharedQueues();
+    const handoff = completions.enqueue(
+      {
+        jobId,
+        sessionId: "dev",
+        commitSha: "evidence-candidate",
+        branch: "refs/pushpals/agent/worker/evidence-candidate",
+        message: "candidate retained",
+        trustedValidationCommands: ["bun test"],
+      },
+      { beginJobFinalization: true },
+    );
+    const completionId = handoff.completionId ?? "";
+    const claimed = completions.claim("scm-evidence-merge");
+    expect(claimed.completion?.id).toBe(completionId);
+    expect(
+      completions.markFailedAndBlockJob(
+        completionId,
+        "bun test failed",
+        undefined,
+        {
+          version: 1,
+          baselineSha: "evidence-baseline",
+          candidateSha: "evidence-candidate",
+          results: [
+            {
+              ok: false,
+              command: "bun test",
+              output: "tests/visible.test.ts:\n(fail) visible suite > visible assertion",
+              exitCode: 1,
+              durationMs: 100,
+              phase: "validation",
+              failedTests: ["visible suite > visible assertion", "hidden suite > hidden assertion"],
+              targetPathHints: ["tests/visible.test.ts", "tests/hidden.test.ts"],
+              failureLines: ["(fail) hidden suite > hidden assertion"],
+            },
+          ],
+        },
+        "scm-evidence-merge",
+        claimed.completion?.claimToken,
+      ).ok,
+    ).toBe(true);
+    const metadata = (jobs.getJobDiagnostics(jobId).validationRuns[0] as Record<string, any>)
+      .metadata;
+    expect(metadata.failedTests).toEqual([
+      "hidden suite > hidden assertion",
+      "visible suite > visible assertion",
+    ]);
+    expect(metadata.targetPathHints).toEqual(["tests/hidden.test.ts", "tests/visible.test.ts"]);
+    expect(metadata.failureLines).toContain("(fail) hidden suite > hidden assertion");
     completions.close();
     jobs.close();
   });
@@ -329,6 +635,7 @@ describe("server CompletionQueue PR URL persistence", () => {
           failedTests: [],
           targetPathHints: [],
         }),
+        ...currentCompletionClaim(completions, blockedCompletionId),
       ),
     ).toMatchObject({ ok: true, jobId, jobTransitioned: true });
     expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
@@ -352,6 +659,7 @@ describe("server CompletionQueue PR URL persistence", () => {
       "https://github.com/org/repo/pull/repair",
       undefined,
       trustedValidationReport({ ok: true, candidateSha: "repair-candidate" }),
+      ...currentCompletionClaim(completions, repairCompletionId),
     );
 
     expect(repaired).toMatchObject({
@@ -372,6 +680,7 @@ describe("server CompletionQueue PR URL persistence", () => {
     expect(completions.getCompletion(blockedCompletionId)).toMatchObject({
       status: "pending",
       pusherId: null,
+      claimToken: null,
       error: null,
       trustedValidationRecoveryAttempts: 1,
     });
@@ -416,6 +725,7 @@ describe("server CompletionQueue PR URL persistence", () => {
           failedTests: [],
           targetPathHints: [],
         }),
+        ...currentCompletionClaim(completions, blockedCompletionId),
       ).ok,
     ).toBe(true);
 
@@ -483,6 +793,7 @@ describe("server CompletionQueue PR URL persistence", () => {
         "validate failed",
         undefined,
         trustedValidationReport({ ok: false, candidateSha: "blocked-validate" }),
+        ...currentCompletionClaim(completions, blockedCompletionId),
       ).ok,
     ).toBe(true);
 
@@ -527,6 +838,7 @@ describe("server CompletionQueue PR URL persistence", () => {
           },
         ],
       },
+      ...currentCompletionClaim(completions, unrelatedCompletionId),
     );
 
     expect(processed.requeuedCompletionIds).toBeUndefined();
@@ -561,6 +873,7 @@ describe("server CompletionQueue PR URL persistence", () => {
         "named test failed",
         undefined,
         trustedValidationReport({ ok: false, candidateSha: "candidate-test-failure" }),
+        ...currentCompletionClaim(completions, blockedCompletionId),
       ).ok,
     ).toBe(true);
 
@@ -583,6 +896,7 @@ describe("server CompletionQueue PR URL persistence", () => {
       null,
       undefined,
       trustedValidationReport({ ok: true, candidateSha: "unrelated-passing-candidate" }),
+      ...currentCompletionClaim(completions, passingCompletionId),
     );
 
     expect(processed.requeuedCompletionIds).toBeUndefined();
@@ -626,6 +940,7 @@ describe("server CompletionQueue PR URL persistence", () => {
           failedTests: [],
           targetPathHints: [],
         }),
+        ...currentCompletionClaim(completions, blockedCompletionId),
       ).ok,
     ).toBe(true);
 
@@ -652,6 +967,7 @@ describe("server CompletionQueue PR URL persistence", () => {
         candidateSha: "new-baseline-candidate",
         baselineSha: "new-baseline",
       }),
+      ...currentCompletionClaim(completions, passingCompletionId),
     );
 
     expect(processed.requeuedCompletionIds).toBeUndefined();
@@ -694,6 +1010,7 @@ describe("server CompletionQueue PR URL persistence", () => {
           failedTests: [],
           targetPathHints: [],
         }),
+        ...currentCompletionClaim(completions, blockedCompletionId),
       ).ok,
     ).toBe(true);
     const db = new Database(dbPath);
@@ -721,6 +1038,7 @@ describe("server CompletionQueue PR URL persistence", () => {
       null,
       undefined,
       trustedValidationReport({ ok: true, candidateSha: "repair-after-cap" }),
+      ...currentCompletionClaim(completions, repairCompletionId),
     );
 
     expect(repaired.requeuedCompletionIds).toBeUndefined();
@@ -774,7 +1092,13 @@ describe("server CompletionQueue PR URL persistence", () => {
     });
     expect(jobs.complete(jobId, { summary: "premature success" }).ok).toBe(true);
     expect(completions.claim("scm-legacy").completion?.id).toBe(handoff.completionId);
-    expect(completions.markFailed(handoff.completionId ?? "", "merge failed").ok).toBe(true);
+    expect(
+      completions.markFailed(
+        handoff.completionId ?? "",
+        "merge failed",
+        ...currentCompletionClaim(completions, handoff.completionId ?? ""),
+      ).ok,
+    ).toBe(true);
     expect(jobs.getJob(jobId)?.status).toBe("completed");
 
     completions.close();
@@ -910,6 +1234,8 @@ describe("server CompletionQueue PR URL persistence", () => {
       id: "legacy-claimed",
       status: "claimed",
       pusherId: "replacement-scm",
+      claimToken: expect.any(String),
+      claimGeneration: 1,
       claimAttempts: 1,
     });
     queue.close();
@@ -951,7 +1277,11 @@ describe("server CompletionQueue PR URL persistence", () => {
     const completionId = claimed.completion?.id ?? "";
     expect(completionId.length).toBeGreaterThan(0);
 
-    const processed = queue.markProcessed(completionId, "https://github.com/org/repo/pull/34");
+    const processed = queue.markProcessed(
+      completionId,
+      "https://github.com/org/repo/pull/34",
+      ...currentCompletionClaim(queue, completionId),
+    );
     expect(processed.ok).toBe(true);
 
     const saved = queue.getCompletion(completionId);
@@ -998,8 +1328,26 @@ describe("server CompletionQueue PR URL persistence", () => {
     expect(claimed.completion?.claimedAt).toBeTruthy();
     expect(claimed.completion?.lastHeartbeatAt).toBeTruthy();
     expect(claimed.completion?.leaseExpiresAt).toBeTruthy();
-    expect(queue.renewLease(enqueued.completionId ?? "", "scm-other").ok).toBe(false);
-    expect(queue.renewLease(enqueued.completionId ?? "", "scm-owner").ok).toBe(true);
+    const claimToken = String(claimed.completion?.claimToken ?? "");
+    expect(queue.renewLease(enqueued.completionId ?? "", "scm-other", claimToken).ok).toBe(false);
+    expect(queue.renewLease(enqueued.completionId ?? "", "scm-owner", claimToken).ok).toBe(true);
+    queue.close();
+  });
+
+  test("rejects ownerless completion lease and terminal callbacks", () => {
+    const queue = new CompletionQueue(":memory:");
+    const enqueued = queue.enqueue({
+      jobId: "job-ownerless-callback",
+      sessionId: "dev",
+      message: "candidate retained",
+    });
+    const completionId = String(enqueued.completionId ?? "");
+    expect(queue.claim("scm-owner").ok).toBe(true);
+
+    expect(queue.renewLease(completionId, "", "").ok).toBe(false);
+    expect(queue.markProcessed(completionId).ok).toBe(false);
+    expect(queue.markFailed(completionId, "ownerless failure").ok).toBe(false);
+    expect(queue.getCompletion(completionId)?.status).toBe("claimed");
     queue.close();
   });
 
@@ -1011,7 +1359,9 @@ describe("server CompletionQueue PR URL persistence", () => {
       sessionId: "dev",
       message: "candidate retained",
     });
-    expect(queue.claim("scm-old").ok).toBe(true);
+    const firstClaim = queue.claim("scm-old");
+    expect(firstClaim.ok).toBe(true);
+    const staleToken = String(firstClaim.completion?.claimToken ?? "");
     db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
       "2000-01-01T00:00:00.000Z",
       enqueued.completionId,
@@ -1025,8 +1375,17 @@ describe("server CompletionQueue PR URL persistence", () => {
       pusherId: "scm-new",
       claimAttempts: 2,
     });
-    expect(queue.markProcessed(enqueued.completionId ?? "", null, "scm-old").ok).toBe(false);
-    expect(queue.markProcessed(enqueued.completionId ?? "", null, "scm-new").ok).toBe(true);
+    expect(queue.markProcessed(enqueued.completionId ?? "", null, "scm-old", staleToken).ok).toBe(
+      false,
+    );
+    expect(
+      queue.markProcessed(
+        enqueued.completionId ?? "",
+        null,
+        "scm-new",
+        reclaimed.completion?.claimToken,
+      ).ok,
+    ).toBe(true);
     queue.close();
   });
 
@@ -1038,27 +1397,39 @@ describe("server CompletionQueue PR URL persistence", () => {
       sessionId: "dev",
       message: "candidate retained",
     });
-    expect(queue.claim("scm-expired").ok).toBe(true);
+    const processedClaim = queue.claim("scm-expired");
+    expect(processedClaim.ok).toBe(true);
     db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
       "2000-01-01T00:00:00.000Z",
       processedCandidate.completionId,
     );
-    expect(queue.markProcessed(processedCandidate.completionId ?? "", null, "scm-expired").ok).toBe(
-      false,
-    );
+    expect(
+      queue.markProcessed(
+        processedCandidate.completionId ?? "",
+        null,
+        "scm-expired",
+        processedClaim.completion?.claimToken,
+      ).ok,
+    ).toBe(false);
 
     const failedCandidate = queue.enqueue({
       jobId: "job-expired-failed-callback",
       sessionId: "dev",
       message: "candidate retained",
     });
-    expect(queue.claim("scm-expired").ok).toBe(true);
+    const failedClaim = queue.claim("scm-expired");
+    expect(failedClaim.ok).toBe(true);
     db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
       "2000-01-01T00:00:00.000Z",
       failedCandidate.completionId,
     );
     expect(
-      queue.markFailed(failedCandidate.completionId ?? "", "stale callback", "scm-expired").ok,
+      queue.markFailed(
+        failedCandidate.completionId ?? "",
+        "stale callback",
+        "scm-expired",
+        failedClaim.completion?.claimToken,
+      ).ok,
     ).toBe(false);
     queue.close();
   });
@@ -1093,6 +1464,7 @@ describe("server CompletionQueue PR URL persistence", () => {
         undefined,
         undefined,
         "scm-expired-finalizer",
+        row?.claimToken,
       ),
     ).toMatchObject({ ok: false });
     expect(jobs.getJob(jobId)?.status).toBe("finalizing");
@@ -1100,16 +1472,50 @@ describe("server CompletionQueue PR URL persistence", () => {
     jobs.close();
   });
 
-  test("startup reconciliation requeues claims from the stable pusher identity", () => {
+  test("does not revoke an unexpired claim when the same pusher polls again", () => {
     const queue = new CompletionQueue(":memory:");
     const first = queue.enqueue({ jobId: "job-reconcile-1", sessionId: "dev", message: "one" });
     const second = queue.enqueue({ jobId: "job-reconcile-2", sessionId: "dev", message: "two" });
-    expect(queue.claim("scm-stable").completion?.id).toBe(first.completionId);
+    const claimed = queue.claim("scm-stable");
+    expect(claimed.completion?.id).toBe(first.completionId);
+    const originalToken = claimed.completion?.claimToken;
 
-    const reconciled = queue.claim("scm-stable", { reconcilePusher: true });
-    expect(reconciled.completion?.id).toBe(first.completionId);
-    expect(reconciled.completion?.claimAttempts).toBe(2);
+    const secondPoll = queue.claim("scm-stable");
+    expect(secondPoll.ok).toBe(false);
+    expect(queue.getCompletion(first.completionId ?? "")).toMatchObject({
+      status: "claimed",
+      claimToken: originalToken,
+      claimAttempts: 1,
+    });
     expect(queue.getPendingCompletions().map((row) => row.id)).toEqual([second.completionId]);
+    queue.close();
+  });
+
+  test("fences stale callbacks when the same pusher reclaims after expiry", () => {
+    const db = new Database(":memory:");
+    const queue = new CompletionQueue(db);
+    const enqueued = queue.enqueue({
+      jobId: "job-same-pusher-aba",
+      sessionId: "dev",
+      message: "one",
+    });
+    const completionId = String(enqueued.completionId ?? "");
+    const first = queue.claim("scm-stable");
+    const staleToken = String(first.completion?.claimToken ?? "");
+    db.prepare(`UPDATE completions SET leaseExpiresAt = ? WHERE id = ?`).run(
+      "2000-01-01T00:00:00.000Z",
+      completionId,
+    );
+    const second = queue.claim("scm-stable");
+    const activeToken = String(second.completion?.claimToken ?? "");
+    expect(activeToken).not.toBe(staleToken);
+    expect(second.completion?.claimGeneration).toBe(2);
+
+    expect(queue.renewLease(completionId, "scm-stable", staleToken).ok).toBe(false);
+    expect(queue.markProcessed(completionId, null, "scm-stable", staleToken).ok).toBe(false);
+    expect(queue.markFailed(completionId, "stale", "scm-stable", staleToken).ok).toBe(false);
+    expect(queue.renewLease(completionId, "scm-stable", activeToken).ok).toBe(true);
+    expect(queue.markProcessed(completionId, null, "scm-stable", activeToken).ok).toBe(true);
     queue.close();
   });
 

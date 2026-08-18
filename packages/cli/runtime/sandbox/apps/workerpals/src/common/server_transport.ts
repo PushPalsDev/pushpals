@@ -1,4 +1,5 @@
 import type { CommandRequest } from "protocol";
+import { fetchBufferedWithHardDeadline } from "shared";
 
 export type WorkerHeartbeatStatus = "idle" | "busy" | "error" | "offline";
 
@@ -23,6 +24,10 @@ export type WorkerServerTransportOptions = {
   logInfo?: (message: string) => void;
   logWarn?: (message: string) => void;
   nowFn?: () => number;
+  /** Test/deployment override for the complete heartbeat exchange deadline. */
+  heartbeatTimeoutMs?: number;
+  /** Test/deployment override for the complete queued-request exchange deadline. */
+  requestTimeoutMs?: number;
 };
 
 export type WorkerTransportHealthSnapshot = {
@@ -89,8 +94,14 @@ export class WorkerServerTransport {
     this.logInfo = options.logInfo ?? ((message) => console.log(message));
     this.logWarn = options.logWarn ?? ((message) => console.warn(message));
     this.nowFn = options.nowFn ?? (() => Date.now());
-    this.heartbeatTimeoutMs = computeHeartbeatTimeoutMs(options.heartbeatMs);
-    this.requestTimeoutMs = computeRequestTimeoutMs(options.heartbeatMs);
+    this.heartbeatTimeoutMs = Math.max(
+      1,
+      Math.floor(options.heartbeatTimeoutMs ?? computeHeartbeatTimeoutMs(options.heartbeatMs)),
+    );
+    this.requestTimeoutMs = Math.max(
+      1,
+      Math.floor(options.requestTimeoutMs ?? computeRequestTimeoutMs(options.heartbeatMs)),
+    );
   }
 
   getHealthSnapshot(): WorkerTransportHealthSnapshot {
@@ -111,9 +122,7 @@ export class WorkerServerTransport {
 
   shouldRecycleBusyWorker(nowMs = this.nowFn()): boolean {
     const failureAgeMs =
-      this.firstHeartbeatFailureAt >= 0
-        ? Math.max(0, nowMs - this.firstHeartbeatFailureAt)
-        : null;
+      this.firstHeartbeatFailureAt >= 0 ? Math.max(0, nowMs - this.firstHeartbeatFailureAt) : null;
     if (failureAgeMs == null) return false;
     const threshold = Math.min(
       this.staleClaimTtlMs,
@@ -135,19 +144,21 @@ export class WorkerServerTransport {
     this.heartbeatInFlight = true;
     this.lastHeartbeatAttemptAt = this.nowFn();
     try {
-      const response = await this.postJson("/workers/heartbeat", {
-        workerId: this.workerId,
-        status: payload.status,
-        currentJobId: payload.currentJobId,
-        pollMs: this.pollMs,
-        capabilities: payload.capabilities ?? {},
-        details: payload.details ?? {},
-      }, this.heartbeatTimeoutMs);
+      const response = await this.postJson(
+        "/workers/heartbeat",
+        {
+          workerId: this.workerId,
+          status: payload.status,
+          currentJobId: payload.currentJobId,
+          pollMs: this.pollMs,
+          capabilities: payload.capabilities ?? {},
+          details: payload.details ?? {},
+        },
+        this.heartbeatTimeoutMs,
+      );
       if (!response.ok) {
         const detail = await readResponseDetail(response);
-        throw new Error(
-          `heartbeat rejected (${response.status})${detail ? `: ${detail}` : ""}`,
-        );
+        throw new Error(`heartbeat rejected (${response.status})${detail ? `: ${detail}` : ""}`);
       }
       const previousFailures = this.consecutiveHeartbeatFailures;
       this.lastHeartbeatSuccessAt = this.nowFn();
@@ -257,7 +268,9 @@ export class WorkerServerTransport {
     return new Promise((resolve) => {
       const queued: TransportTask = { ...task, resolve };
       if (queued.priority === "high") {
-        const firstNormalIndex = this.queuedRequests.findIndex((entry) => entry.priority !== "high");
+        const firstNormalIndex = this.queuedRequests.findIndex(
+          (entry) => entry.priority !== "high",
+        );
         if (firstNormalIndex === -1) {
           this.queuedRequests.push(queued);
         } else {
@@ -302,22 +315,16 @@ export class WorkerServerTransport {
   }
 
   private async postJson(path: string, payload: unknown, timeoutMs: number): Promise<Response> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
-    try {
-      return await this.fetchFn(`${this.server}${path}`, {
+    return fetchBufferedWithHardDeadline({
+      input: `${this.server}${path}`,
+      init: {
         method: "POST",
         headers: this.headers,
         body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new Error(`request timed out after ${timeoutMs}ms (${path})`);
-      }
-      throw error;
-    } finally {
-      clearTimeout(timer);
-    }
+      },
+      timeoutMs,
+      fetchImpl: this.fetchFn,
+      timeoutMessage: `request timed out after ${timeoutMs}ms (${path})`,
+    });
   }
 }

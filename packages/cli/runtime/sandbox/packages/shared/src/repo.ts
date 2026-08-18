@@ -4,6 +4,7 @@
 
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
+import { runBoundedProcess } from "./bounded_process.js";
 
 function resolveDotGitEntry(repoRoot: string): string {
   return resolve(repoRoot, ".git");
@@ -99,20 +100,15 @@ export async function getRepoContext(repoRoot: string): Promise<{
   recentCommits: string;
 }> {
   const git = async (args: string[]): Promise<string> => {
-    const proc = Bun.spawn(["git", ...args], {
+    const result = await runBoundedProcess(["git", ...args], {
       cwd: repoRoot,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: 10_000,
+      outputLimitBytes: 512 * 1024,
     });
-    const stdout = await new Response(proc.stdout).text();
-    const exitCode = await proc.exited;
-
-    if (exitCode !== 0) {
-      const stderr = await new Response(proc.stderr).text();
-      throw new Error(`git ${args[0]} failed (exit ${exitCode}): ${stderr}`);
+    if (result.exitCode !== 0) {
+      throw new Error(`git ${args[0]} failed (exit ${result.exitCode}): ${result.stderr}`);
     }
-
-    return stdout.trim();
+    return result.stdout;
   };
 
   try {

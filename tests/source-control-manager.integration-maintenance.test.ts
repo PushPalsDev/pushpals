@@ -521,6 +521,53 @@ describe("SourceControlManager continuous integration maintenance", () => {
     expect(resets).toBe(1);
   });
 
+  test("bounds a conflict-dispatch response body that never finishes", async () => {
+    let resets = 0;
+    const runner = new IntegrationMaintenanceRunner({
+      intervalMs: 1_000,
+      sessionId: "dev",
+      now: () => 95_000,
+      logger: noOpLogger(),
+      httpTimeoutMs: 20,
+      fetchImpl: (async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start() {
+              // Headers arrive, but the server never closes the JSON body.
+            },
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        )) as typeof fetch,
+      gitOps: {
+        async fetchPrune() {},
+        async alignMainToRemote() {
+          return INTEGRATION_SHA;
+        },
+        async checkoutMain() {},
+        async pullMainFF() {},
+        async syncMainWithBaseBranch() {
+          return conflictedSync();
+        },
+        async pushMain() {
+          return successfulPush();
+        },
+        async resetToClean() {
+          resets += 1;
+        },
+      },
+    });
+
+    const startedAt = Date.now();
+    const outcome = await runner.run(makeConfig(), {});
+
+    expect(outcome).toMatchObject({
+      status: "retry_scheduled",
+      error: "Integration reconciliation enqueue timed out after 20ms",
+    });
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(resets).toBe(1);
+  });
+
   test("keeps retrying even when cleanup of the failed maintenance attempt also fails", async () => {
     let now = 100_000;
     let fetchAttempts = 0;

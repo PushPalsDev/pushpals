@@ -17,6 +17,15 @@ const MIRRORED_WORKERPALS_FILES = [
   "worktree_base_ref.ts",
 ] as const;
 
+const MIRRORED_SHARED_FILES = [
+  "bounded_fetch.ts",
+  "bounded_process.ts",
+  "communication.ts",
+  "index.ts",
+  "trusted_validation.ts",
+  "validation_repair_lease.ts",
+] as const;
+
 describe("packaged WorkerPal sandbox runtime parity", () => {
   test("keeps path and review-lease runtime files byte-identical", () => {
     for (const relativePath of MIRRORED_WORKERPALS_FILES) {
@@ -28,6 +37,22 @@ describe("packaged WorkerPal sandbox runtime parity", () => {
         "sandbox",
         "apps",
         "workerpals",
+        "src",
+        relativePath,
+      );
+
+      expect(readFileSync(packagedPath)).toEqual(readFileSync(sourcePath));
+    }
+
+    for (const relativePath of MIRRORED_SHARED_FILES) {
+      const sourcePath = resolve("packages", "shared", "src", relativePath);
+      const packagedPath = resolve(
+        "packages",
+        "cli",
+        "runtime",
+        "sandbox",
+        "packages",
+        "shared",
         "src",
         relativePath,
       );

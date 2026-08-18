@@ -58,6 +58,23 @@ afterEach(() => {
 });
 
 describe("RemoteBuddy OpenAI Codex CLI client", () => {
+  test("hard-stops a Codex subprocess that never exits", async () => {
+    const startedAt = Date.now();
+
+    const result = await __TEST_ONLY__.runProcessWithBun(
+      [process.execPath, "-e", "setInterval(() => {}, 1000)"],
+      {
+        cwd: process.cwd(),
+        env: process.env,
+        timeoutMs: 50,
+      },
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.code).toBe(124);
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+  });
+
   test("chooses the newest Codex CLI probe for default launcher candidates", () => {
     const oldProbe = {
       command: ["old-codex"],

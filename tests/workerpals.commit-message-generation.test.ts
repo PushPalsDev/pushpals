@@ -9,6 +9,7 @@ import {
   buildWorkerCommitMessage,
   buildCommitMessageGeneratorUserMessage,
   explicitWorkerCommitIdentityFromEnv,
+  generateCommitMessageFromDiffViaHttp,
   isNonFastForwardPushOutput,
   isPullRebaseDirtyWorkingTreeOutput,
   isRebaseConflictOutput,
@@ -120,6 +121,41 @@ describe("workerpals commit message generation helpers", () => {
         },
       } as never),
     ).toBe(15_000);
+  });
+
+  test("bounds commit-message generation through response-body consumption", async () => {
+    const startedAt = Date.now();
+    const result = await generateCommitMessageFromDiffViaHttp(
+      {
+        systemPrompt: "Write a commit message.",
+        userMessage: "Summarize the staged diff.",
+      },
+      { type: "fix", area: "workerpals" },
+      {
+        workerpals: {
+          llm: {
+            endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+            model: "test-model",
+            apiKey: "",
+          },
+        },
+      } as never,
+      {
+        timeoutMs: 20,
+        fetchFn: (async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start() {
+                // Return headers but deliberately leave the response body open.
+              },
+            }),
+            { status: 200 },
+          )) as typeof fetch,
+      },
+    );
+
+    expect(result).toBeNull();
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
   test("skips LLM commit messages for broad staged diffs", () => {

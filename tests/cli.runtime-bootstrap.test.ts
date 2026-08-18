@@ -476,7 +476,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       });
 
       try {
-        await Bun.sleep(220);
+        await waitForCondition(
+          () => spawnCalls === 2 && supervisor.getHealth()?.state === "degraded",
+          2_000,
+          "Expected the managed service to restart once and then report degraded health.",
+        );
         const health = supervisor.getHealth();
         expect(spawnCalls).toBe(2);
         expect(health?.state).toBe("degraded");
@@ -779,7 +783,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
   test("shutdownEmbeddedServiceManagerGracefully cancels managed output pipes during bounded stop", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-shutdown-bounded-"));
-    let killCalls = 0;
+    const killSignals: Array<NodeJS.Signals | number | undefined> = [];
     let outputPipeStops = 0;
     let cleanupCalls = 0;
     const supervisor = new ServiceManager({
@@ -789,8 +793,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         name: spec.name,
         proc: {
           pid: undefined,
-          kill: () => {
-            killCalls += 1;
+          exited: new Promise<number>(() => {}),
+          kill: (signal?: NodeJS.Signals | number) => {
+            killSignals.push(signal);
           },
         } as any,
         command: [...spec.command],
@@ -833,7 +838,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       });
 
       expect(Date.now() - startedAt).toBeLessThan(900);
-      expect(killCalls).toBe(2);
+      expect(killSignals).toEqual(["SIGTERM", "SIGKILL"]);
       expect(outputPipeStops).toBe(1);
       expect(cleanupCalls).toBe(1);
     } finally {

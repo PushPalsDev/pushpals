@@ -1691,13 +1691,53 @@ describe("workerpals validation command safety", () => {
     }
   });
 
-  test("terminates idle browser validations after a captured assertion failure", async () => {
+  test("waits for authoritative exit before applying a browser failure-marker veto", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-validation-idle-browser-failure-"));
     const script = [
       "console.error('Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.');",
       "console.error('Call log:');",
       "console.error(\" - waiting for getByTestId('home-screen').last() to be visible\");",
-      "setInterval(() => {}, 1000);",
+      "setTimeout(() => process.exit(0), 750);",
+    ].join("\n");
+    const startedAt = Date.now();
+
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run web:e2e",
+        [process.execPath, "-e", script],
+        {
+          ...(process.env as Record<string, string>),
+          PUSHPALS_VALIDATION_FAILURE_IDLE_MS: "250",
+        },
+        10_000,
+        {},
+        "validation timed out",
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(0);
+      expect(result.browserSignal).toBe("failure");
+      expect(result.stderr).toContain(
+        "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
+      );
+      expect(result.stderr).toContain("waiting for getByTestId('home-screen')");
+      expect(result.stderr).not.toContain("validation timed out");
+      expect(result.elapsedMs).toBeGreaterThanOrEqual(500);
+      expect(result.elapsedMs).toBeLessThan(3_500);
+      expect(Date.now() - startedAt).toBeLessThan(3_500);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds noisy validation output without losing an evicted browser failure signal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-noisy-browser-failure-"));
+    const script = [
+      "process.stdout.write('validation-head\\n' + 'a'.repeat(1200000));",
+      "process.stdout.write('\\nWeb end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.\\n');",
+      "process.stdout.write('b'.repeat(1200000) + '\\nvalidation-tail\\n');",
+      "setTimeout(() => process.exit(1), 750);",
     ].join("\n");
     const startedAt = Date.now();
 
@@ -1711,25 +1751,29 @@ describe("workerpals validation command safety", () => {
           PUSHPALS_VALIDATION_FAILURE_IDLE_MS: "500",
         },
         10_000,
-        {},
+        {
+          maxOutputChars: 4_194_304,
+          maxOutputLines: 20_000,
+          maxOutputHeadLines: 10_000,
+        },
         "validation timed out",
       );
 
       expect(result.exitCode).toBe(1);
-      expect(result.stderr).toContain(
-        "Web end-to-end smoke test failed: locator.waitFor: Timeout 30000ms exceeded.",
-      );
-      expect(result.stderr).toContain("waiting for getByTestId('home-screen')");
-      expect(result.stderr).toContain("browser/e2e failure signal");
+      expect(result.stdout).toStartWith("validation-head");
+      expect(result.stdout).toContain("earlier validation output truncated");
+      expect(result.stdout).toEndWith("validation-tail");
+      expect(result.stdout.length).toBeLessThanOrEqual(2 * 1024 * 1024);
+      expect(result.browserSignal).toBe("failure");
       expect(result.stderr).not.toContain("validation timed out");
-      expect(result.elapsedMs).toBeLessThan(3_500);
+      expect(result.elapsedMs).toBeGreaterThanOrEqual(500);
       expect(Date.now() - startedAt).toBeLessThan(3_500);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("terminates idle browser validations after a captured success signal", async () => {
+  test("treats a browser success marker followed by a hang as a timeout", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-validation-idle-browser-success-"));
     const script = [
       "console.log('Verified: home screen');",
@@ -1746,19 +1790,83 @@ describe("workerpals validation command safety", () => {
         [process.execPath, "-e", script],
         {
           ...(process.env as Record<string, string>),
-          PUSHPALS_VALIDATION_SUCCESS_IDLE_MS: "500",
+          PUSHPALS_VALIDATION_SUCCESS_IDLE_MS: "250",
         },
-        10_000,
+        1_000,
         {},
         "validation timed out",
       );
 
-      expect(result.ok).toBe(true);
-      expect(result.exitCode).toBe(0);
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(124);
+      expect(result.browserSignal).toBe("success");
       expect(result.stdout).toContain("Web end-to-end smoke test completed successfully.");
+      expect(result.stderr).toContain("validation timed out");
+      expect(result.elapsedMs).toBeGreaterThanOrEqual(900);
+      expect(result.elapsedMs).toBeLessThan(6_000);
+      expect(Date.now() - startedAt).toBeLessThan(6_000);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not synthesize success before a later nonzero browser exit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-browser-false-green-"));
+    const script = [
+      "console.log('Web end-to-end smoke test completed successfully.');",
+      "setTimeout(() => { console.error('post-test cleanup failed'); process.exit(7); }, 750);",
+    ].join("\n");
+
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run web:e2e",
+        [process.execPath, "-e", script],
+        {
+          ...(process.env as Record<string, string>),
+          PUSHPALS_VALIDATION_SUCCESS_IDLE_MS: "250",
+        },
+        5_000,
+        {},
+        "validation timed out",
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(7);
+      expect(result.browserSignal).toBe("success");
+      expect(result.stdout).toContain("Web end-to-end smoke test completed successfully.");
+      expect(result.stderr).toContain("post-test cleanup failed");
       expect(result.stderr).not.toContain("validation timed out");
-      expect(result.elapsedMs).toBeLessThan(3_500);
-      expect(Date.now() - startedAt).toBeLessThan(3_500);
+      expect(result.elapsedMs).toBeGreaterThanOrEqual(500);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails after authoritative exit when browser output contains conflicting markers", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-browser-conflicting-markers-"));
+    const script = [
+      "console.error('Web end-to-end smoke test failed: AssertionError');",
+      "console.log('Web end-to-end smoke test completed successfully.');",
+      "setTimeout(() => process.exit(0), 500);",
+    ].join("\n");
+
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run web:e2e",
+        [process.execPath, "-e", script],
+        process.env as Record<string, string>,
+        5_000,
+        {},
+        "validation timed out",
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(0);
+      expect(result.browserSignal).toBe("failure_and_success");
+      expect(result.terminalStatusSource).toBe("process_exit");
+      expect(result.elapsedMs).toBeGreaterThanOrEqual(350);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as vscode from "vscode";
 import { resolveBrowserClientUrl } from "./browser_client_url";
+import { fetchVscodeResponseWithDeadline } from "./httpDeadline";
 import { normalizeVscodeServerUrl } from "./local_server_url";
 import WebSocket from "ws";
 import { reconnectDelayMs } from "./reconnectPolicy";
@@ -8,6 +9,9 @@ import { renderClientPanelHtml } from "./clientPanelHtml";
 import { StackServiceManager } from "./serviceManager";
 import { WORKSPACE_TRUST_ERROR } from "./workspaceTrust";
 import { shouldDisplayInteractiveSessionEvent } from "./sessionEventVisibility";
+
+const CLIENT_HTTP_TIMEOUT_MS = 10_000;
+const WEBSOCKET_CONNECT_TIMEOUT_MS = 10_000;
 
 type SessionEvent = {
   id?: string;
@@ -234,14 +238,18 @@ export class PushPalsClientPanel implements vscode.Disposable {
   private async ensureSession(): Promise<void> {
     const url = `${this.serverUrl()}/sessions`;
     this.output.appendLine(`[client] ensuring session ${this.sessionId} at ${url}`);
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId: this.sessionId,
-        client: this.clientRegistration(),
-      }),
-    });
+    const response = await fetchVscodeResponseWithDeadline(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: this.sessionId,
+          client: this.clientRegistration(),
+        }),
+      },
+      { timeoutMs: CLIENT_HTTP_TIMEOUT_MS },
+    );
     if (!response.ok) {
       const body = await response.text();
       throw new Error(`Failed to create session: ${response.status} ${body}`);
@@ -250,11 +258,15 @@ export class PushPalsClientPanel implements vscode.Disposable {
 
   private async sendMessage(text: string): Promise<void> {
     const url = `${this.serverUrl()}/sessions/${encodeURIComponent(this.sessionId)}/message`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
+    const response = await fetchVscodeResponseWithDeadline(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      },
+      { timeoutMs: CLIENT_HTTP_TIMEOUT_MS },
+    );
     if (!response.ok) {
       const body = await response.text();
       throw new Error(`Failed to send message: ${response.status} ${body}`);
@@ -285,9 +297,15 @@ export class PushPalsClientPanel implements vscode.Disposable {
 
     await new Promise<void>((resolvePromise, rejectPromise) => {
       let settled = false;
+      const connectTimer = setTimeout(
+        () =>
+          done(new Error(`WebSocket connection timed out after ${WEBSOCKET_CONNECT_TIMEOUT_MS}ms`)),
+        WEBSOCKET_CONNECT_TIMEOUT_MS,
+      );
       const done = (err?: Error) => {
         if (settled) return;
         settled = true;
+        clearTimeout(connectTimer);
         if (err) {
           try {
             ws.removeAllListeners();

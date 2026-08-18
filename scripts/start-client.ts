@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { Socket, createServer } from "node:net";
 import { dirname } from "node:path";
 import { findGitRepoRoot, resolveGitStateFilePath } from "../packages/shared/src/repo.js";
+import { terminateProcessTree } from "../packages/shared/src/bounded_process.js";
 
 const DEFAULT_CLIENT_PORT = 8081;
 const DEFAULT_MAX_PORT_SCAN = 200;
@@ -163,8 +164,20 @@ const child = Bun.spawn(
     stdout: "inherit",
     stderr: "inherit",
     env: { ...process.env, EXPO_NO_INTERACTIVE: process.env.EXPO_NO_INTERACTIVE ?? "1" },
+    detached: process.platform !== "win32",
   },
 );
+
+let stopping = false;
+async function stopClient(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+  if (stopping) return;
+  stopping = true;
+  await terminateProcessTree(child);
+  process.exit(signal === "SIGINT" ? 130 : 143);
+}
+
+process.once("SIGINT", () => void stopClient("SIGINT"));
+process.once("SIGTERM", () => void stopClient("SIGTERM"));
 
 const code = await child.exited;
 process.exit(code);

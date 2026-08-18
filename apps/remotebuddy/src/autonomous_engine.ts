@@ -4,6 +4,7 @@ import { resolve } from "path";
 import type { CommunicationManager } from "shared";
 import {
   extractVisionKeyItems,
+  fetchBufferedWithHardDeadline,
   loadRepoDocText,
   loadPromptTemplate,
   makePatternKey,
@@ -13,6 +14,7 @@ import {
   penaltyTotal,
   parseVisionDoc,
   validateScopeInvariants,
+  runBoundedProcess,
   type AutonomyComponentArea,
   type AutonomyObjectiveType,
 } from "shared";
@@ -145,6 +147,14 @@ type Snapshot = {
     target_path_hints?: string[];
     failed_tests?: string[];
     failure_fingerprint?: string | null;
+    baseline_sha?: string | null;
+    candidate_sha?: string | null;
+    candidate_ref?: string | null;
+    candidate_shas?: string[];
+    validation_scope?: "baseline_suspected" | "candidate_specific" | "worker_local";
+    baseline_failure_proven?: boolean;
+    evidence_quality?: "high" | "medium" | "low";
+    failure_lines?: string[];
     source?: "trusted_host" | "worker";
     cross_job_circuit_open?: boolean;
   } | null;
@@ -179,6 +189,11 @@ type Snapshot = {
 type SnapshotOpenObjective = {
   objective_id: string;
   pattern_key: string;
+  incident_key?: string | null;
+  job_id?: string | null;
+  attempt_outcome?: string | null;
+  deterministic_repair_failure?: boolean;
+  attempt_failure_fingerprint?: string | null;
   status: string;
   objective_type?: string;
   component_area?: string;
@@ -1923,9 +1938,13 @@ function activeValidationIncident(
   if (
     failureClass === "environment" ||
     failureClass === "trusted_validation_required" ||
+    failureClass === "dependency_setup_failed" ||
     sampleError.includes("trusted-environment validation deferred before execution") ||
     (sampleError.includes("worker sandbox intentionally has no docker socket") &&
-      sampleError.includes("run this command on the trusted host"))
+      sampleError.includes("run this command on the trusted host")) ||
+    /\b(?:econnreset|econnrefused|etimedout|network is unreachable|could not resolve host|temporary failure|tls handshake|certificate verify|unable to verify|docker daemon|cannot connect to (?:the )?docker|missing runtime|credential|permission denied)\b/i.test(
+      sampleError,
+    )
   ) {
     return null;
   }
@@ -2007,10 +2026,21 @@ function validationRepairTargetPaths(params: {
   repoTargets: RepoTargetProfile[];
   triggerType: AutonomyCandidate["trigger_type"];
 }): string[] {
-  const candidates = [
-    ...asStringArray(params.incident.target_path_hints),
-    ...validationRepairCommandTargetCandidates(params.incident),
-  ];
+  const incidentHints = asStringArray(params.incident.target_path_hints);
+  const normalizedHints = incidentHints
+    .map((candidate) => normalizeAutonomyComponentArea(candidate))
+    .filter((candidate): candidate is string => Boolean(candidate))
+    .filter((candidate, index, values) => values.indexOf(candidate) === index);
+  const candidateSpecific = asString(params.incident.validation_scope) === "candidate_specific";
+  const exactEvidenceHints = candidateSpecific
+    ? normalizedHints
+    : normalizedHints.filter((candidate) => existsSync(resolve(params.repoRoot, candidate)));
+  // Parsed failure paths are authoritative. Do not pad them with generic test
+  // directories or package manifests, which previously sent repair workers to
+  // unrelated passing suites. Candidate-specific evidence may name a file that
+  // exists only at the leased candidate SHA, not in this planning worktree.
+  if (exactEvidenceHints.length > 0) return exactEvidenceHints.slice(0, 6);
+  const candidates = [...validationRepairCommandTargetCandidates(params.incident)];
   const seen = new Set<string>();
   const existing: string[] = [];
   for (const candidate of candidates) {
@@ -2094,6 +2124,16 @@ function buildValidationIncidentRepairCandidate(params: {
   const failedJobCount = asStringArray(incident.failed_job_ids).length;
   const sample = compactStatusDetail(asString(incident.sample_error), 600);
   const failedTests = asStringArray(incident.failed_tests);
+  const validationScope =
+    asString(incident.validation_scope) === "baseline_suspected" &&
+    asBoolean(incident.baseline_failure_proven, false)
+      ? "baseline_suspected"
+      : asString(incident.validation_scope) === "worker_local"
+        ? "worker_local"
+        : asString(incident.validation_scope) === "candidate_unavailable"
+          ? "candidate_unavailable"
+          : "candidate_specific";
+  const candidateSha = asString(incident.candidate_sha);
   const signalIds = params.snapshot.top_signals
     .filter(
       (signal) =>
@@ -2110,11 +2150,17 @@ function buildValidationIncidentRepairCandidate(params: {
       `Primary failing command: ${command}.`,
       `Recent failures: ${failureCount} across ${failedJobCount} job(s).`,
       incident.cross_job_circuit_open
-        ? "The cross-job publication circuit is open; normal autonomy is paused for this failing baseline."
+        ? "The same deterministic publication failure has been confirmed across jobs."
         : "",
       failedTests.length > 0 ? `Failed tests: ${failedTests.join("; ")}.` : "",
       sample ? `Latest failure excerpt: ${sample}` : "",
-      "Fix the repo baseline issue that makes this command fail, then rerun the failing command and related required validation.",
+      candidateSha ? `Exact failing candidate SHA: ${candidateSha}.` : "",
+      validationScope === "baseline_suspected"
+        ? "Trusted validation reproduced the same failure directly on the baseline; repair the smallest baseline-owned root cause."
+        : validationScope === "candidate_unavailable"
+          ? "The exact tested candidate was not retained. Investigate from the current integration baseline without claiming candidate-specific provenance."
+          : "Treat this as candidate-specific until trusted evidence proves the baseline independently fails.",
+      "Fix the evidence-backed failure, then rerun the failing command and related required validation.",
     ]
       .filter(Boolean)
       .join("\n"),
@@ -2151,12 +2197,21 @@ function validationRepairInstruction(
       candidate.problem_statement,
       "",
       "Course of action:",
+      asString(incident.candidate_sha)
+        ? `- Start from the host-prepared exact candidate SHA ${asString(incident.candidate_sha)}.`
+        : "",
       `- Reproduce the failing command first: ${asString(incident.command)}`,
       ...asStringArray(incident.failed_tests).map(
         (testName) => `- Reproduce failed test: ${testName}`,
       ),
       "- Identify whether the root cause is code, test, tooling, or local repo configuration.",
-      "- Fix the baseline failure in the smallest repo-owned scope that makes the command pass.",
+      asString(incident.validation_scope) === "baseline_suspected" &&
+      asBoolean(incident.baseline_failure_proven, false)
+        ? "- Confirm and fix the shared baseline root cause in the smallest repo-owned scope."
+        : asString(incident.validation_scope) === "candidate_unavailable"
+          ? "- Investigate from the current integration baseline; no exact failing candidate is available, so do not claim candidate-specific provenance."
+          : "- Fix the candidate-specific failure in the smallest evidence-backed repo-owned scope.",
+      "- Do not switch branches, rebase, merge, or push. Host-side SCM owns Git state and publication.",
       "- If the failure is caused by missing local data, credentials, or environment that cannot be repaired in repo code, report that blocker clearly instead of masking it.",
       "",
       "Scope:",
@@ -4517,14 +4572,9 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: st
 }
 
 async function gitOutput(repo: string, args: string[]): Promise<string> {
-  const proc = Bun.spawn(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
-  const [stdout, _stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (exitCode !== 0) return "";
-  return stdout.trim();
+  const result = await runAutonomyGitCommand(repo, args);
+  if (!result.ok) return "";
+  return result.stdout;
 }
 
 type GitRunResult = {
@@ -4533,6 +4583,43 @@ type GitRunResult = {
   stdout: string;
   stderr: string;
 };
+
+const AUTONOMY_LOCAL_GIT_TIMEOUT_MS = 30_000;
+const AUTONOMY_NETWORK_GIT_TIMEOUT_MS = 120_000;
+
+export function resolveAutonomyGitCommandTimeoutMs(args: string[]): number {
+  return args.some((arg) => ["fetch", "pull", "push", "ls-remote"].includes(arg))
+    ? AUTONOMY_NETWORK_GIT_TIMEOUT_MS
+    : AUTONOMY_LOCAL_GIT_TIMEOUT_MS;
+}
+
+async function runAutonomyGitCommand(
+  cwd: string,
+  args: string[],
+  timeoutMs = resolveAutonomyGitCommandTimeoutMs(args),
+): Promise<GitRunResult> {
+  try {
+    const result = await runBoundedProcess(["git", ...args], {
+      cwd,
+      timeoutMs,
+      outputLimitBytes: 2 * 1024 * 1024,
+      streamDrainTimeoutMs: 2_000,
+    });
+    return {
+      ok: result.exitCode === 0,
+      exitCode: result.exitCode,
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      exitCode: 127,
+      stdout: "",
+      stderr: `Unable to start bounded Git command: ${String(error)}`,
+    };
+  }
+}
 
 function sanitizeForGitRef(value: string): string {
   const text = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
@@ -4594,6 +4681,8 @@ export function autonomyIntegrationBaselineDecision(options: {
   if (options.fastForwardSucceeded) return "synced";
   return "use_integration_head";
 }
+
+const AUTONOMY_CONTROL_HTTP_TIMEOUT_MS = 10_000;
 
 export class RemoteBuddyAutonomousEngine {
   private readonly server: string;
@@ -4729,6 +4818,19 @@ export class RemoteBuddyAutonomousEngine {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
     return headers;
+  }
+
+  private fetchControl(
+    input: string | URL | Request,
+    init?: RequestInit,
+    timeoutMs = AUTONOMY_CONTROL_HTTP_TIMEOUT_MS,
+  ): Promise<Response> {
+    return fetchBufferedWithHardDeadline({
+      input,
+      init,
+      timeoutMs,
+      timeoutMessage: `RemoteBuddy autonomy control request timed out after ${timeoutMs}ms`,
+    });
   }
 
   private lockTtlMs(): number {
@@ -4912,19 +5014,8 @@ export class RemoteBuddyAutonomousEngine {
     };
   }
 
-  private async runGit(cwd: string, args: string[]): Promise<GitRunResult> {
-    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return {
-      ok: exitCode === 0,
-      exitCode,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-    };
+  private runGit(cwd: string, args: string[], timeoutMs?: number): Promise<GitRunResult> {
+    return runAutonomyGitCommand(cwd, args, timeoutMs);
   }
 
   private async ensureAutonomyRepoReady(runId: string): Promise<boolean> {
@@ -5017,7 +5108,7 @@ export class RemoteBuddyAutonomousEngine {
       isWorktreeDirty: preflight.isWorktreeDirty ? "true" : "false",
       isMergeInProgress: preflight.isMergeInProgress ? "true" : "false",
     });
-    const res = await fetch(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/snapshot?${qs.toString()}`, {
       method: "GET",
       headers: this.headers(),
     });
@@ -5028,7 +5119,7 @@ export class RemoteBuddyAutonomousEngine {
 
   private async fetchWorkerLoadSnapshot(): Promise<WorkerLoadSnapshot | null> {
     try {
-      const res = await fetch(`${this.server}/workers/autoscale?ttlMs=15000`, {
+      const res = await this.fetchControl(`${this.server}/workers/autoscale?ttlMs=15000`, {
         method: "GET",
         headers: this.headers(),
       });
@@ -5108,7 +5199,7 @@ export class RemoteBuddyAutonomousEngine {
     const qs = new URLSearchParams({
       limit: String(Math.max(1, Math.min(400, Math.floor(limit)))),
     });
-    const res = await fetch(`${this.server}/autonomy/inspiration?${qs.toString()}`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/inspiration?${qs.toString()}`, {
       method: "GET",
       headers: this.headers(),
     });
@@ -5122,7 +5213,7 @@ export class RemoteBuddyAutonomousEngine {
       limit: String(Math.max(1, Math.min(400, Math.floor(limit)))),
       feedbackLimit: "1",
     });
-    const res = await fetch(`${this.server}/autonomy/insights?${qs.toString()}`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/insights?${qs.toString()}`, {
       method: "GET",
       headers: this.headers(),
     });
@@ -5197,7 +5288,7 @@ export class RemoteBuddyAutonomousEngine {
     const entries = this.buildAutoInspirationEntries(commitHistoryHints);
     if (entries.length === 0) return;
     try {
-      const res = await fetch(`${this.server}/autonomy/inspiration/ingest`, {
+      const res = await this.fetchControl(`${this.server}/autonomy/inspiration/ingest`, {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify({ entries }),
@@ -5244,7 +5335,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private async postObjective(payload: Record<string, unknown>): Promise<boolean> {
-    const res = await fetch(`${this.server}/autonomy/objectives`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/objectives`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(payload),
@@ -5254,7 +5345,7 @@ export class RemoteBuddyAutonomousEngine {
 
   private async acquireDispatchLock(runId: string): Promise<{ ok: boolean; reason?: string }> {
     const ttlMs = this.lockTtlMs();
-    const res = await fetch(`${this.server}/autonomy/lock/acquire`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/lock/acquire`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -5271,7 +5362,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private async renewDispatchLock(runId: string): Promise<boolean> {
-    const res = await fetch(`${this.server}/autonomy/lock/renew`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/lock/renew`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -5284,7 +5375,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private async releaseDispatchLock(runId: string): Promise<void> {
-    await fetch(`${this.server}/autonomy/lock/release`, {
+    await this.fetchControl(`${this.server}/autonomy/lock/release`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -5422,12 +5513,20 @@ export class RemoteBuddyAutonomousEngine {
       targetPaths: string[];
       writeGlobs: string[];
       reservationRequired?: boolean;
+      validationIncident?: {
+        incidentId: string;
+        candidateSha?: string;
+        candidateRef?: string;
+        baselineSha?: string;
+        validationScope?: string;
+        failureFingerprint?: string;
+      };
     },
   ): Promise<string | null> {
     if (!this.runtimeEnabled) return null;
     const canonicalInstruction = canonicalizeInstructionTextForBun(instruction);
     const reservationRequired = autonomy.reservationRequired !== false;
-    const res = await fetch(`${this.server}/requests/enqueue`, {
+    const res = await this.fetchControl(`${this.server}/requests/enqueue`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -5447,6 +5546,9 @@ export class RemoteBuddyAutonomousEngine {
             componentArea: autonomy.componentArea,
             targetPaths: autonomy.targetPaths,
             writeGlobs: autonomy.writeGlobs,
+            ...(autonomy.validationIncident
+              ? { validationIncident: autonomy.validationIncident }
+              : {}),
             reservationRequired,
           },
         },
@@ -5484,6 +5586,7 @@ export class RemoteBuddyAutonomousEngine {
         (code === "autonomy_worker_failure_circuit_open" ||
           code === "autonomy_similar_no_publishable_suppressed" ||
           code === "autonomy_queue_backpressure" ||
+          code === "autonomy_publication_backpressure" ||
           code === "autonomy_open_pr_limit")
       ) {
         this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
@@ -5691,7 +5794,7 @@ export class RemoteBuddyAutonomousEngine {
     }>,
   ): Promise<Map<string, { ok: boolean; reason?: string }>> {
     const out = new Map<string, { ok: boolean; reason?: string }>();
-    const res = await fetch(`${this.server}/autonomy/eligibility`, {
+    const res = await this.fetchControl(`${this.server}/autonomy/eligibility`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
@@ -5798,9 +5901,9 @@ export class RemoteBuddyAutonomousEngine {
     });
     if (!candidate) {
       return {
-        handled: true,
+        handled: false,
         outcome: "skipped",
-        detail: "validation_repair_candidate_unavailable",
+        detail: "validation_repair_candidate_unavailable_continue_ideation",
       };
     }
     const patternKey = makePatternKey(
@@ -5809,18 +5912,42 @@ export class RemoteBuddyAutonomousEngine {
       candidate.trigger_type,
       candidate.component_area,
     );
+    const incidentKey = asString(incident.incident_id) || `valid_inc_${asString(incident.digest)}`;
     const hasActiveRepair = params.snapshot.open_objectives.some(
       (objective) =>
-        objective.pattern_key === patternKey &&
+        (objective.incident_key === incidentKey || objective.pattern_key === patternKey) &&
         VALIDATION_REPAIR_ACTIVE_STATUSES.has(asString(objective.status)),
     );
     if (hasActiveRepair) {
       console.log(
         `[RemoteBuddyAutonomousEngine] tick ${params.runId}: validation repair already active for ${asString(
           incident.command,
-        )}; skipping normal autonomy while required validation remains red.`,
+        )}; continuing normal ideation for another component.`,
       );
-      return { handled: true, outcome: "skipped", detail: "validation_repair_already_active" };
+      return {
+        handled: false,
+        outcome: "skipped",
+        detail: "validation_repair_already_active_continue_ideation",
+      };
+    }
+    const unchangedFailedRepairs = (params.snapshot.recent_objectives ?? []).filter(
+      (objective) =>
+        objective.incident_key === incidentKey &&
+        Boolean(asString(objective.job_id)) &&
+        objective.deterministic_repair_failure === true &&
+        asString(objective.attempt_failure_fingerprint) ===
+          asString(incident.failure_fingerprint) &&
+        ["failed", "dead_letter"].includes(asString(objective.status)),
+    ).length;
+    if (asString(incident.failure_fingerprint) && unchangedFailedRepairs >= 2) {
+      console.warn(
+        `[RemoteBuddyAutonomousEngine] tick ${params.runId}: validation incident ${incidentKey} has ${unchangedFailedRepairs} executed deterministic repairs with the same fingerprint; moving normal ideation to another component until evidence changes.`,
+      );
+      return {
+        handled: false,
+        outcome: "skipped",
+        detail: "validation_repair_circuit_open_continue_ideation",
+      };
     }
 
     this.setPhase("validation_repair_eligibility");
@@ -5871,6 +5998,7 @@ export class RemoteBuddyAutonomousEngine {
           status: "rejected",
           block_reason: reason,
           required_validation_repair: true,
+          incident_key: incidentKey,
         },
         llmCalls: [],
       });
@@ -5919,6 +6047,7 @@ export class RemoteBuddyAutonomousEngine {
         expected_validation: candidate.expected_validation,
         status: "gated",
         required_validation_repair: true,
+        incident_key: incidentKey,
         evidence: { validation_incident: incident },
         score_breakdown: {
           llm_score: 1,
@@ -5947,6 +6076,14 @@ export class RemoteBuddyAutonomousEngine {
       componentArea: candidate.component_area,
       targetPaths: candidate.target_paths,
       writeGlobs: candidate.scope.write_globs,
+      validationIncident: {
+        incidentId: incidentKey,
+        candidateSha: asString(incident.candidate_sha) || undefined,
+        candidateRef: asString(incident.candidate_ref) || undefined,
+        baselineSha: asString(incident.baseline_sha) || undefined,
+        validationScope: asString(incident.validation_scope) || undefined,
+        failureFingerprint: asString(incident.failure_fingerprint) || undefined,
+      },
     });
     if (!requestId) {
       await this.postObjective({
@@ -5977,6 +6114,7 @@ export class RemoteBuddyAutonomousEngine {
           status: "failed",
           block_reason: "request_enqueue_failed",
           required_validation_repair: true,
+          incident_key: incidentKey,
         },
         llmCalls: [],
       });

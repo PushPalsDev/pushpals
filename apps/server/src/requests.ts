@@ -19,6 +19,10 @@ import {
 export type RequestStatus = "pending" | "claimed" | "completed" | "failed";
 export type QueuePriority = "interactive" | "normal" | "background";
 
+export const DEFAULT_REQUEST_LEASE_MS = 3 * 60_000;
+const MIN_REQUEST_LEASE_MS = 30_000;
+const MAX_REQUEST_LEASE_MS = 15 * 60_000;
+
 const PRIORITY_ORDER: QueuePriority[] = ["interactive", "normal", "background"];
 const PRIORITY_SLA_MS: Record<QueuePriority, number> = {
   interactive: 20_000,
@@ -43,6 +47,12 @@ function parseBudgetMs(value: unknown, fallback: number): number {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.max(1_000, parsed);
+}
+
+function normalizeRequestLeaseMs(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REQUEST_LEASE_MS;
+  return Math.max(MIN_REQUEST_LEASE_MS, Math.min(MAX_REQUEST_LEASE_MS, Math.floor(parsed)));
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -160,8 +170,15 @@ export interface RequestRow {
   // Overrides / routing hints for RemoteBuddy
   forceWorker: number; // 0/1 (SQLite INTEGER)
   forceLane: string | null; // "worker" | "deterministic" | null
+  workerRequired: number; // Durable server-owned planning/handoff invariant (0/1)
+  handoffJobId: string | null;
   status: RequestStatus;
   agentId: string | null;
+  claimToken: string | null;
+  claimGeneration: number;
+  leaseExpiresAt: string | null;
+  lastHeartbeatAt: string | null;
+  claimAttempts: number;
   result: string | null;
   error: string | null;
   enqueuedAt: string;
@@ -190,6 +207,19 @@ export interface RequestSloSummary {
   queueWaitMs: SloMetricSummary;
 }
 
+export interface RequestHandoffReconciliationResult {
+  completed: number;
+  requestIds: string[];
+  jobIds: string[];
+}
+
+export interface RequestTerminalTransitionResult {
+  ok: boolean;
+  message?: string;
+  transitioned?: boolean;
+  idempotent?: boolean;
+}
+
 export class RequestQueue {
   private db: Database;
   private static readonly SELECT_COLUMNS = `
@@ -202,8 +232,15 @@ export class RequestQueue {
     idempotencyKey,
     forceWorker,
     forceLane,
+    workerRequired,
+    handoffJobId,
     status,
     agentId,
+    claimToken,
+    claimGeneration,
+    leaseExpiresAt,
+    lastHeartbeatAt,
+    claimAttempts,
     result,
     error,
     enqueuedAt,
@@ -233,8 +270,15 @@ export class RequestQueue {
         idempotencyKey   TEXT,
         forceWorker      INTEGER NOT NULL DEFAULT 0,
         forceLane        TEXT,
+        workerRequired   INTEGER NOT NULL DEFAULT 0,
+        handoffJobId     TEXT,
         status           TEXT NOT NULL DEFAULT 'pending',
         agentId          TEXT,
+        claimToken       TEXT,
+        claimGeneration  INTEGER NOT NULL DEFAULT 0,
+        leaseExpiresAt   TEXT,
+        lastHeartbeatAt  TEXT,
+        claimAttempts    INTEGER NOT NULL DEFAULT 0,
         result           TEXT,
         error            TEXT,
         enqueuedAt       TEXT,
@@ -272,6 +316,22 @@ export class RequestQueue {
       `ALTER TABLE requests ADD COLUMN forceWorker INTEGER NOT NULL DEFAULT 0;`,
     );
     ensureColumn("forceLane", `ALTER TABLE requests ADD COLUMN forceLane TEXT;`);
+    ensureColumn(
+      "workerRequired",
+      `ALTER TABLE requests ADD COLUMN workerRequired INTEGER NOT NULL DEFAULT 0;`,
+    );
+    ensureColumn("handoffJobId", `ALTER TABLE requests ADD COLUMN handoffJobId TEXT;`);
+    ensureColumn("claimToken", `ALTER TABLE requests ADD COLUMN claimToken TEXT;`);
+    ensureColumn(
+      "claimGeneration",
+      `ALTER TABLE requests ADD COLUMN claimGeneration INTEGER NOT NULL DEFAULT 0;`,
+    );
+    ensureColumn("leaseExpiresAt", `ALTER TABLE requests ADD COLUMN leaseExpiresAt TEXT;`);
+    ensureColumn("lastHeartbeatAt", `ALTER TABLE requests ADD COLUMN lastHeartbeatAt TEXT;`);
+    ensureColumn(
+      "claimAttempts",
+      `ALTER TABLE requests ADD COLUMN claimAttempts INTEGER NOT NULL DEFAULT 0;`,
+    );
 
     ensureColumn("enqueuedAt", `ALTER TABLE requests ADD COLUMN enqueuedAt TEXT;`);
     ensureColumn("claimedAt", `ALTER TABLE requests ADD COLUMN claimedAt TEXT;`);
@@ -287,6 +347,10 @@ export class RequestQueue {
       `CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_idempotency
          ON requests(idempotencyKey)
          WHERE idempotencyKey IS NOT NULL AND idempotencyKey <> '';`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_requests_lease_expiry
+         ON requests(status, leaseExpiresAt);`,
     );
 
     this.db.exec(`
@@ -305,9 +369,35 @@ export class RequestQueue {
           WHEN forceWorker IS NULL THEN 0
           ELSE forceWorker
         END,
+        workerRequired = CASE
+          WHEN workerRequired IS NULL THEN COALESCE(forceWorker, 0)
+          WHEN forceWorker = 1 THEN 1
+          ELSE workerRequired
+        END,
+        claimAttempts = COALESCE(claimAttempts, 0),
+        claimGeneration = COALESCE(claimGeneration, 0),
         enqueuedAt = COALESCE(enqueuedAt, createdAt)
       WHERE 1 = 1;
     `);
+
+    // A claim without a fencing token cannot be safely distinguished from a
+    // stale callback after a same-agent reclaim. Requeue legacy claims so the
+    // next owner receives a fresh token and generation.
+    const migrationNow = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE requests
+         SET status = 'pending',
+             agentId = NULL,
+             claimToken = NULL,
+             claimedAt = NULL,
+             leaseExpiresAt = NULL,
+             lastHeartbeatAt = NULL,
+             updatedAt = ?
+         WHERE status = 'claimed'
+           AND (claimToken IS NULL OR claimToken = '')`,
+      )
+      .run(migrationNow);
   }
 
   private pendingOrderedIds(): string[] {
@@ -353,6 +443,7 @@ export class RequestQueue {
     queuePosition?: number;
     etaMs?: number;
     deduplicated?: boolean;
+    requeued?: boolean;
     message?: string;
   } {
     const sessionId = String(body.sessionId ?? "").trim();
@@ -392,6 +483,60 @@ export class RequestQueue {
         status: RequestStatus;
       } | null;
       if (existing?.id) {
+        if (existing.status === "failed") {
+          const now = new Date().toISOString();
+          const reopened = this.db
+            .prepare(
+              `UPDATE requests
+               SET sessionId = ?,
+                   prompt = ?,
+                   priority = ?,
+                   queueWaitBudgetMs = ?,
+                   metadataJson = ?,
+                   forceWorker = ?,
+                   forceLane = ?,
+                   workerRequired = ?,
+                   handoffJobId = NULL,
+                   status = 'pending',
+                   agentId = NULL,
+                   claimToken = NULL,
+                   result = NULL,
+                   error = NULL,
+                   enqueuedAt = ?,
+                   claimedAt = NULL,
+                   leaseExpiresAt = NULL,
+                   lastHeartbeatAt = NULL,
+                   completedAt = NULL,
+                   failedAt = NULL,
+                   durationMs = NULL,
+                   updatedAt = ?
+               WHERE id = ? AND status = 'failed'`,
+            )
+            .run(
+              sessionId,
+              prompt,
+              priority,
+              queueWaitBudgetMs,
+              metadataJson,
+              forceWorker,
+              forceLane,
+              forceWorker,
+              now,
+              now,
+              existing.id,
+            );
+          if (reopened.changes > 0) {
+            const queuePosition = this.queuePosition(existing.id);
+            const etaMs = this.estimateEtaMs(priority, queuePosition);
+            return {
+              ok: true,
+              requestId: existing.id,
+              queuePosition: queuePosition ?? undefined,
+              etaMs: etaMs ?? undefined,
+              requeued: true,
+            };
+          }
+        }
         const queuePosition =
           existing.status === "pending" ? this.queuePosition(existing.id) : null;
         const etaMs = this.estimateEtaMs(normalizePriority(existing.priority), queuePosition);
@@ -412,10 +557,10 @@ export class RequestQueue {
       .prepare(
         `INSERT INTO requests (
           id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
-          status, agentId, result, error,
+          workerRequired, handoffJobId, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
           enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
       )
       .run(
         requestId,
@@ -427,6 +572,7 @@ export class RequestQueue {
         idempotencyKey,
         forceWorker,
         forceLane,
+        forceWorker,
         now,
         now,
         now,
@@ -447,16 +593,30 @@ export class RequestQueue {
    * Atomically claim the next pending request.
    * Ordering: priority asc (interactive first), then FIFO by createdAt.
    */
-  claim(agentIdRaw: string): {
+  claim(
+    agentIdRaw: string,
+    options: { leaseMs?: number } = {},
+  ): {
     ok: boolean;
     request?: RequestRow;
     queueWaitMs?: number;
     message?: string;
   } {
     const now = new Date().toISOString();
-    const agentId = String(agentIdRaw ?? "").trim() || "unknown";
+    const agentId = String(agentIdRaw ?? "").trim();
+    if (!agentId) return { ok: false, message: "agentId is required" };
+    const claimToken = randomUUID();
+    const leaseExpiresAt = new Date(
+      Date.parse(now) + normalizeRequestLeaseMs(options.leaseMs),
+    ).toISOString();
+
+    // A task.execute job is the durable planning handoff. Close any expired
+    // crash window before requeueing/claiming the request so a replacement
+    // planner cannot dispatch the same user request a second time.
+    this.reconcileWorkerHandoffsFromJobs(now);
 
     const tx = this.db.transaction(() => {
+      this.recoverExpiredClaims(now);
       const row = this.db
         .prepare(
           `SELECT ${RequestQueue.SELECT_COLUMNS}
@@ -481,14 +641,19 @@ export class RequestQueue {
           `UPDATE requests
            SET status = 'claimed',
                agentId = ?,
+               claimToken = ?,
+               claimGeneration = COALESCE(claimGeneration, 0) + 1,
                claimedAt = ?,
+               leaseExpiresAt = ?,
+               lastHeartbeatAt = ?,
+               claimAttempts = COALESCE(claimAttempts, 0) + 1,
                completedAt = NULL,
                failedAt = NULL,
                durationMs = NULL,
                updatedAt = ?
            WHERE id = ?`,
         )
-        .run(agentId, now, now, row.id);
+        .run(agentId, claimToken, now, leaseExpiresAt, now, now, row.id);
 
       const queueWaitMs = Math.max(
         0,
@@ -501,7 +666,12 @@ export class RequestQueue {
           metadata: parseMetadataJson(row.metadataJson),
           status: "claimed" as RequestStatus,
           agentId,
+          claimToken,
+          claimGeneration: Number(row.claimGeneration ?? 0) + 1,
           claimedAt: now,
+          leaseExpiresAt,
+          lastHeartbeatAt: now,
+          claimAttempts: Number(row.claimAttempts ?? 0) + 1,
           completedAt: null,
           failedAt: null,
           durationMs: null,
@@ -516,59 +686,344 @@ export class RequestQueue {
     return { ok: true, request: claimed.request, queueWaitMs: claimed.queueWaitMs };
   }
 
+  renewLease(
+    requestId: string,
+    agentIdRaw: string,
+    claimTokenRaw: string,
+    options: { leaseMs?: number } = {},
+  ): { ok: boolean; leaseExpiresAt?: string; message?: string } {
+    const agentId = String(agentIdRaw ?? "").trim();
+    if (!agentId) return { ok: false, message: "agentId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
+    const now = new Date().toISOString();
+    const leaseExpiresAt = new Date(
+      Date.parse(now) + normalizeRequestLeaseMs(options.leaseMs),
+    ).toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE requests
+         SET lastHeartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ?
+         WHERE id = ?
+           AND status = 'claimed'
+           AND agentId = ?
+           AND claimToken = ?
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?`,
+      )
+      .run(now, leaseExpiresAt, now, requestId, agentId, claimToken, now);
+    if (result.changes === 0) {
+      return {
+        ok: false,
+        message: "Request lease is missing, expired, or owned by another agent",
+      };
+    }
+    return { ok: true, leaseExpiresAt };
+  }
+
+  validateActiveLease(
+    requestId: string,
+    agentIdRaw: string,
+    claimTokenRaw: string,
+    nowInput: string | Date = new Date(),
+  ): { ok: boolean; message?: string } {
+    const agentId = String(agentIdRaw ?? "").trim();
+    if (!agentId) return { ok: false, message: "agentId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const nowMs = parsed.getTime();
+    const request = this.getRequest(requestId);
+    if (!request || request.status !== "claimed") {
+      return { ok: false, message: "Request is not claimed" };
+    }
+    if (request.agentId !== agentId) {
+      return { ok: false, message: "Request lease is owned by another agent" };
+    }
+    if (request.claimToken !== claimToken) {
+      return { ok: false, message: "Request claim token is stale" };
+    }
+    const leaseExpiresAtMs = Date.parse(String(request.leaseExpiresAt ?? ""));
+    if (
+      !Number.isFinite(nowMs) ||
+      !Number.isFinite(leaseExpiresAtMs) ||
+      leaseExpiresAtMs <= nowMs
+    ) {
+      return { ok: false, message: "Request lease is missing or expired" };
+    }
+    return { ok: true };
+  }
+
+  recoverExpiredClaims(nowInput: string | Date = new Date()): {
+    recovered: number;
+    requestIds: string[];
+  } {
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM requests
+         WHERE status = 'claimed'
+           AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+         ORDER BY createdAt ASC`,
+      )
+      .all(now) as Array<{ id: string }>;
+    if (rows.length === 0) return { recovered: 0, requestIds: [] };
+    const result = this.db
+      .prepare(
+        `UPDATE requests
+         SET status = 'pending',
+             agentId = NULL,
+             claimToken = NULL,
+             claimedAt = NULL,
+             leaseExpiresAt = NULL,
+             lastHeartbeatAt = NULL,
+             updatedAt = ?
+         WHERE status = 'claimed'
+           AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`,
+      )
+      .run(now, now);
+    return {
+      recovered: result.changes,
+      requestIds: rows.slice(0, result.changes).map((row) => row.id),
+    };
+  }
+
+  /**
+   * Recover requests whose planner created a durable task.execute job but
+   * crashed before recording the handoff/completion callbacks. This is kept in
+   * RequestQueue (rather than autonomy-only reconciliation) so ordinary user
+   * requests receive the same recovery guarantees.
+   */
+  reconcileWorkerHandoffsFromJobs(
+    nowInput: string | Date = new Date(),
+  ): RequestHandoffReconciliationResult {
+    const jobsTable = this.db
+      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`)
+      .get() as { present: number } | undefined;
+    if (!jobsTable) return { completed: 0, requestIds: [], jobIds: [] };
+
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT r.id AS requestId,
+                r.sessionId AS requestSessionId,
+                j.id AS jobId
+         FROM requests r
+         JOIN jobs j ON j.id = (
+           SELECT candidate.id
+           FROM jobs candidate
+           WHERE candidate.kind = 'task.execute'
+             AND candidate.sessionId = r.sessionId
+             AND json_valid(candidate.params)
+             AND json_extract(candidate.params, '$.requestId') = r.id
+             AND datetime(candidate.createdAt) >= datetime(COALESCE(r.enqueuedAt, r.createdAt))
+           ORDER BY candidate.createdAt DESC, candidate.id DESC
+           LIMIT 1
+         )
+         WHERE r.status = 'pending'
+            OR (
+              r.status = 'claimed'
+              AND (r.leaseExpiresAt IS NULL OR r.leaseExpiresAt <= ?)
+            )
+         ORDER BY r.createdAt ASC
+         LIMIT 400`,
+      )
+      .all(now) as Array<{ requestId: string; requestSessionId: string; jobId: string }>;
+    if (rows.length === 0) return { completed: 0, requestIds: [], jobIds: [] };
+
+    const requestIds: string[] = [];
+    const jobIds: string[] = [];
+    const tx = this.db.transaction(() => {
+      for (const row of rows) {
+        const updated = this.db
+          .prepare(
+            `UPDATE requests
+             SET workerRequired = 1,
+                 handoffJobId = ?,
+                 status = 'completed',
+                 result = CASE
+                   WHEN result IS NULL OR result = '' THEN ?
+                   ELSE result
+                 END,
+                 completedAt = COALESCE(completedAt, ?),
+                 failedAt = NULL,
+                 leaseExpiresAt = NULL,
+                 lastHeartbeatAt = NULL,
+                 durationMs = MAX(
+                   0,
+                   CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+                 ),
+                 updatedAt = ?
+             WHERE id = ?
+               AND sessionId = ?
+               AND (
+                 status = 'pending'
+                 OR (
+                   status = 'claimed'
+                   AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+                 )
+               )`,
+          )
+          .run(
+            row.jobId,
+            JSON.stringify({
+              requiresWorker: true,
+              jobId: row.jobId,
+              reconciledAfterCrash: true,
+            }),
+            now,
+            now,
+            now,
+            row.requestId,
+            row.requestSessionId,
+            now,
+          );
+        if (updated.changes === 0) continue;
+        requestIds.push(row.requestId);
+        jobIds.push(row.jobId);
+      }
+    });
+    tx();
+    return { completed: requestIds.length, requestIds, jobIds };
+  }
+
+  recordWorkerHandoff(
+    requestId: string,
+    jobIdRaw: string,
+    agentIdRaw: string,
+    claimTokenRaw: string,
+  ): { ok: boolean; message?: string } {
+    const jobId = String(jobIdRaw ?? "").trim();
+    const agentId = String(agentIdRaw ?? "").trim();
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!jobId) return { ok: false, message: "jobId is required" };
+    if (!agentId) return { ok: false, message: "agentId is required" };
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE requests
+         SET workerRequired = 1,
+             handoffJobId = ?,
+             updatedAt = ?
+         WHERE id = ?
+           AND status = 'claimed'
+           AND agentId = ?
+           AND claimToken = ?
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?`,
+      )
+      .run(jobId, now, requestId, agentId, claimToken, now);
+    if (result.changes === 0) {
+      return {
+        ok: false,
+        message: "Request is not claimed with an active lease owned by this agent",
+      };
+    }
+    return { ok: true };
+  }
+
   /**
    * Mark a request as completed.
    */
-  complete(requestId: string, body: Record<string, unknown>): { ok: boolean; message?: string } {
+  complete(requestId: string, body: Record<string, unknown>): RequestTerminalTransitionResult {
     const now = new Date().toISOString();
     const result = body.result ? JSON.stringify(body.result) : null;
+    const agentId = asString(body.agentId);
+    if (!agentId) return { ok: false, message: "agentId is required" };
+    const claimToken = asString(body.claimToken);
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
+
+    const current = this.getRequest(requestId);
+    if (!current) return { ok: false, message: "Request not found" };
+    if (current.status === "completed") {
+      if (current.agentId === agentId && current.claimToken === claimToken) {
+        return { ok: true, transitioned: false, idempotent: true };
+      }
+      return { ok: false, message: "Request completion token is stale or owned by another agent" };
+    }
 
     const info = this.db
       .prepare(
         `UPDATE requests
          SET status = 'completed',
-             result = ?,
-             completedAt = ?,
-             failedAt = NULL,
+              result = ?,
+              completedAt = ?,
+              failedAt = NULL,
+              leaseExpiresAt = NULL,
+              lastHeartbeatAt = NULL,
              durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
              updatedAt = ?
-         WHERE id = ? AND status = 'claimed'`,
+         WHERE id = ?
+           AND status = 'claimed'
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?
+           AND agentId = ?
+           AND claimToken = ?`,
       )
-      .run(result, now, now, now, requestId);
+      .run(result, now, now, now, requestId, now, agentId, claimToken);
 
     if (info.changes === 0) {
-      return { ok: false, message: "Request not found or not in claimed state" };
+      return {
+        ok: false,
+        message: "Request is not claimed with an active lease owned by this agent",
+      };
     }
 
-    return { ok: true };
+    return { ok: true, transitioned: true };
   }
 
   /**
    * Mark a request as failed.
    */
-  fail(requestId: string, body: Record<string, unknown>): { ok: boolean; message?: string } {
+  fail(requestId: string, body: Record<string, unknown>): RequestTerminalTransitionResult {
     const now = new Date().toISOString();
     const message = String(body.message ?? "Unknown error");
     const detail = body.detail == null ? null : String(body.detail);
+    const agentId = asString(body.agentId);
+    if (!agentId) return { ok: false, message: "agentId is required" };
+    const claimToken = asString(body.claimToken);
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
+
+    const current = this.getRequest(requestId);
+    if (!current) return { ok: false, message: "Request not found" };
+    if (current.status === "failed") {
+      if (current.agentId === agentId && current.claimToken === claimToken) {
+        return { ok: true, transitioned: false, idempotent: true };
+      }
+      return { ok: false, message: "Request failure token is stale or owned by another agent" };
+    }
 
     const info = this.db
       .prepare(
         `UPDATE requests
          SET status = 'failed',
-             error = ?,
-             failedAt = ?,
-             completedAt = NULL,
+              error = ?,
+              failedAt = ?,
+              completedAt = NULL,
+              leaseExpiresAt = NULL,
+             lastHeartbeatAt = NULL,
              durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
              updatedAt = ?
-         WHERE id = ? AND status = 'claimed'`,
+         WHERE id = ?
+           AND status = 'claimed'
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?
+           AND agentId = ?
+           AND claimToken = ?`,
       )
-      .run(JSON.stringify({ message, detail }), now, now, now, requestId);
+      .run(JSON.stringify({ message, detail }), now, now, now, requestId, now, agentId, claimToken);
 
     if (info.changes === 0) {
-      return { ok: false, message: "Request not found or not in claimed state" };
+      return {
+        ok: false,
+        message: "Request is not claimed with an active lease owned by this agent",
+      };
     }
 
-    return { ok: true };
+    return { ok: true, transitioned: true };
   }
 
   getRequest(requestId: string): RequestRow | null {

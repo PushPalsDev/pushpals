@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
 import * as vscode from "vscode";
+import { runBoundedNodeCommand, terminateNodeProcessTree } from "./boundedProcess";
+import { fetchVscodeResponseWithDeadline } from "./httpDeadline";
 import { normalizeVscodeServerUrl } from "./local_server_url";
 import { looksLikePushPalsSourceCheckout } from "./repo";
 import { formatCommandForLog, validateDockerImageName } from "./safety";
@@ -47,6 +49,8 @@ type CliManagedRuntime = {
 const DEFAULT_WORKER_IMAGE = "pushpals-worker-sandbox:latest";
 const DEFAULT_SERVER_URL = "http://127.0.0.1:3001";
 const DEFAULT_CLI_BOOT_TIMEOUT_MS = 90_000;
+const DEFAULT_ONE_SHOT_TIMEOUT_MS = 2 * 60_000;
+const DOCKER_BUILD_TIMEOUT_MS = 30 * 60_000;
 const LOCALBUDDY_RUNTIME_CONFIG_POLL_MS = 2_000;
 const LOCALBUDDY_STABLE_UPTIME_MS = 10_000;
 const LOCALBUDDY_MAX_CONSECUTIVE_FAILURES = 5;
@@ -248,18 +252,15 @@ export class StackServiceManager implements vscode.Disposable {
   }
 
   private async probeServerHealth(timeoutMs = 1_000): Promise<boolean> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(`${this.serverUrl()}/healthz`, {
-        method: "GET",
-        signal: controller.signal,
-      });
+      const response = await fetchVscodeResponseWithDeadline(
+        `${this.serverUrl()}/healthz`,
+        { method: "GET" },
+        { timeoutMs, maxResponseBytes: 64 * 1024 },
+      );
       return response.ok;
     } catch {
       return false;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -280,6 +281,7 @@ export class StackServiceManager implements vscode.Disposable {
       cwd: workspaceRoot,
       shell: false,
       stdio: "pipe",
+      detached: process.platform !== "win32",
       windowsHide: true,
       env: process.env,
     }) as ChildProcessWithoutNullStreams;
@@ -295,81 +297,85 @@ export class StackServiceManager implements vscode.Disposable {
     child.stdout.on("data", (chunk: Buffer) => this.appendStream("pushpals-cli", "stdout", chunk));
     child.stderr.on("data", (chunk: Buffer) => this.appendStream("pushpals-cli", "stderr", chunk));
 
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      let settled = false;
-      const settle = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        if (error) {
-          runtime.stopRequested = true;
-          try {
-            runtime.process.kill();
-          } catch {
-            // best effort
-          }
-          if (this.cliRuntime?.process === child) {
-            this.cliRuntime = null;
-          }
-          rejectPromise(error);
-          return;
-        }
-        resolvePromise();
-      };
-
-      child.once("error", (error) => {
-        const detail = error.message || String(error);
-        settle(
-          new Error(
-            `Failed to launch ${command}: ${detail}. Install the PushPals CLI and ensure \`${command}\` is available on PATH.`,
-          ),
-        );
-      });
-
-      child.once("exit", (code, signal) => {
-        const activeRuntime = this.cliRuntime;
-        if (activeRuntime?.process === child) {
-          this.cliRuntime = null;
-        }
-        const reason = signal ? `signal=${signal}` : `code=${code ?? 0}`;
-        this.output.appendLine(`[stack] Installed PushPals CLI runtime exited (${reason}).`);
-        const expectedExit = this.stopping || runtime.stopRequested;
-        if (!expectedExit) {
-          void vscode.window.showWarningMessage(
-            `PushPals CLI runtime stopped unexpectedly (${reason}). See extension output for details.`,
-          );
-        }
-        if (!this.isRunning()) {
-          this.stopLocalBuddyRuntimeConfigPolling();
-          this.stackWorkspaceRoot = null;
-          this.launchMode = null;
-          this.localBuddyStopRequested = false;
-          this.onDidChangeRunningEmitter.fire(false);
-        }
-        settle(
-          new Error(`Installed PushPals CLI runtime exited before startup completed (${reason}).`),
-        );
-      });
-
-      const deadline = Date.now() + DEFAULT_CLI_BOOT_TIMEOUT_MS;
-      const poll = async () => {
-        while (!settled && Date.now() < deadline) {
-          if (await this.probeServerHealth()) {
-            this.output.appendLine("[stack] Installed PushPals CLI runtime is healthy.");
-            settle();
+    try {
+      await new Promise<void>((resolvePromise, rejectPromise) => {
+        let settled = false;
+        const settle = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (error) {
+            runtime.stopRequested = true;
+            if (this.cliRuntime?.process === child) {
+              this.cliRuntime = null;
+            }
+            rejectPromise(error);
             return;
           }
-          await new Promise((resolveLater) => setTimeout(resolveLater, 250));
-        }
-        if (!settled) {
+          resolvePromise();
+        };
+
+        child.once("error", (error) => {
+          const detail = error.message || String(error);
           settle(
             new Error(
-              `Installed PushPals CLI runtime did not become healthy within ${DEFAULT_CLI_BOOT_TIMEOUT_MS}ms.`,
+              `Failed to launch ${command}: ${detail}. Install the PushPals CLI and ensure \`${command}\` is available on PATH.`,
             ),
           );
-        }
-      };
-      void poll();
-    });
+        });
+
+        child.once("exit", (code, signal) => {
+          const activeRuntime = this.cliRuntime;
+          if (activeRuntime?.process === child) {
+            this.cliRuntime = null;
+          }
+          const reason = signal ? `signal=${signal}` : `code=${code ?? 0}`;
+          this.output.appendLine(`[stack] Installed PushPals CLI runtime exited (${reason}).`);
+          const expectedExit = this.stopping || runtime.stopRequested;
+          if (!expectedExit) {
+            void vscode.window.showWarningMessage(
+              `PushPals CLI runtime stopped unexpectedly (${reason}). See extension output for details.`,
+            );
+          }
+          if (!this.isRunning()) {
+            this.stopLocalBuddyRuntimeConfigPolling();
+            this.stackWorkspaceRoot = null;
+            this.launchMode = null;
+            this.localBuddyStopRequested = false;
+            this.onDidChangeRunningEmitter.fire(false);
+          }
+          settle(
+            new Error(
+              `Installed PushPals CLI runtime exited before startup completed (${reason}).`,
+            ),
+          );
+        });
+
+        const deadline = Date.now() + DEFAULT_CLI_BOOT_TIMEOUT_MS;
+        const poll = async () => {
+          while (!settled && Date.now() < deadline) {
+            if (await this.probeServerHealth()) {
+              this.output.appendLine("[stack] Installed PushPals CLI runtime is healthy.");
+              settle();
+              return;
+            }
+            await new Promise((resolveLater) => setTimeout(resolveLater, 250));
+          }
+          if (!settled) {
+            settle(
+              new Error(
+                `Installed PushPals CLI runtime did not become healthy within ${DEFAULT_CLI_BOOT_TIMEOUT_MS}ms.`,
+              ),
+            );
+          }
+        };
+        void poll();
+      });
+    } catch (error) {
+      runtime.stopRequested = true;
+      await terminateNodeProcessTree(child);
+      if (this.cliRuntime?.process === child) this.cliRuntime = null;
+      throw error;
+    }
 
     this.onDidChangeRunningEmitter.fire(true);
   }
@@ -393,34 +399,8 @@ export class StackServiceManager implements vscode.Disposable {
 
     await this.waitForExit(runtime.process, 8_000);
     if (runtime.process.exitCode == null && runtime.process.signalCode == null) {
-      try {
-        if (process.platform === "win32" && runtime.process.pid) {
-          await this.runOneShot(
-            "taskkill",
-            ["/PID", String(runtime.process.pid), "/T", "/F"],
-            workspaceRoot,
-            "Stopping installed PushPals CLI runtime",
-            true,
-          );
-        } else {
-          runtime.process.kill("SIGTERM");
-        }
-      } catch {
-        // fall through to final verification
-      }
-      await this.waitForExit(runtime.process, 2_000);
-      if (
-        process.platform !== "win32" &&
-        runtime.process.exitCode == null &&
-        runtime.process.signalCode == null
-      ) {
-        try {
-          runtime.process.kill("SIGKILL");
-        } catch {
-          // best effort
-        }
-        await this.waitForExit(runtime.process, 1_000);
-      }
+      await terminateNodeProcessTree(runtime.process);
+      await this.waitForExit(runtime.process, 1_000);
     }
 
     this.stopping = false;
@@ -654,6 +634,8 @@ export class StackServiceManager implements vscode.Disposable {
         ["--cwd", "apps/workerpals", "run", "docker:build"],
         workspaceRoot,
         `Building ${DEFAULT_WORKER_IMAGE}`,
+        false,
+        DOCKER_BUILD_TIMEOUT_MS,
       );
       return;
     }
@@ -663,6 +645,8 @@ export class StackServiceManager implements vscode.Disposable {
       ["build", "-f", "apps/workerpals/Dockerfile.sandbox", "-t", image, "."],
       workspaceRoot,
       `Building custom worker image ${image}`,
+      false,
+      DOCKER_BUILD_TIMEOUT_MS,
     );
   }
 
@@ -741,62 +725,10 @@ export class StackServiceManager implements vscode.Disposable {
       this.localBuddyStopRequested = true;
       this.clearLocalBuddyStabilityTimer();
     }
-    if (!pid) {
-      service.process.kill();
-      return;
-    }
-
-    if (process.platform === "win32") {
-      const result = await this.runOneShot(
-        "taskkill",
-        ["/PID", String(pid), "/T", "/F"],
-        workspaceRoot,
-        `Stopping ${service.def.label}`,
-        true,
-      );
-      if (result.code !== 0) {
-        this.output.appendLine(
-          `[stack] taskkill returned ${result.code} for ${service.def.label}. Verifying process exit...`,
-        );
-      }
-      await this.waitForExit(service.process, 4_000);
-      if (service.process.exitCode == null && service.process.signalCode == null) {
-        try {
-          service.process.kill("SIGKILL");
-        } catch {
-          // best effort
-        }
-        await this.waitForExit(service.process, 1_500);
-      }
-      if (service.process.exitCode == null && service.process.signalCode == null) {
-        throw new Error(`Unable to terminate pid ${pid}.`);
-      }
-      return;
-    }
-
-    try {
-      process.kill(-pid, "SIGTERM");
-    } catch {
-      try {
-        service.process.kill("SIGTERM");
-      } catch {
-        // best effort
-      }
-    }
-    await this.waitForExit(service.process, 5_000);
+    await terminateNodeProcessTree(service.process);
+    await this.waitForExit(service.process, 1_000);
     if (service.process.exitCode == null && service.process.signalCode == null) {
-      try {
-        process.kill(-pid, "SIGKILL");
-      } catch {
-        try {
-          service.process.kill("SIGKILL");
-        } catch {
-          // best effort
-        }
-      }
-    }
-    if (service.process.exitCode == null && service.process.signalCode == null) {
-      throw new Error(`Unable to terminate pid ${pid}.`);
+      throw new Error(`Unable to terminate pid ${pid ?? "unknown"}.`);
     }
   }
 
@@ -828,38 +760,29 @@ export class StackServiceManager implements vscode.Disposable {
     cwd: string,
     label: string,
     tolerateFailure = false,
+    timeoutMs = DEFAULT_ONE_SHOT_TIMEOUT_MS,
   ): Promise<CommandResult> {
     this.output.appendLine(`[preflight] ${label}: ${formatCommandForLog(command, args)}`);
-    return new Promise((resolvePromise, rejectPromise) => {
-      const child = spawn(command, args, {
-        cwd,
-        shell: false,
-        env: process.env,
-        windowsHide: true,
-      });
-
-      let stdout = "";
-      let stderr = "";
-      child.stdout?.on("data", (chunk: Buffer) => {
-        const text = chunk.toString("utf8");
-        stdout += text;
-        this.appendPrefixedLines("preflight", "stdout", text);
-      });
-      child.stderr?.on("data", (chunk: Buffer) => {
-        const text = chunk.toString("utf8");
-        stderr += text;
-        this.appendPrefixedLines("preflight", "stderr", text);
-      });
-      child.on("error", (error) => rejectPromise(error));
-      child.on("close", (code) => {
-        const result: CommandResult = { code: code ?? 1, stdout, stderr };
-        if (result.code !== 0 && !tolerateFailure) {
-          const detail = (stderr || stdout).trim() || `${label} failed with code ${result.code}`;
-          rejectPromise(new Error(detail));
-          return;
-        }
-        resolvePromise(result);
-      });
+    return runBoundedNodeCommand({
+      command,
+      args,
+      cwd,
+      env: process.env,
+      timeoutMs,
+      onStdoutChunk: (chunk) => this.appendStream("preflight", "stdout", chunk),
+      onStderrChunk: (chunk) => this.appendStream("preflight", "stderr", chunk),
+    }).then((bounded) => {
+      const result: CommandResult = {
+        code: bounded.code,
+        stdout: bounded.stdout,
+        stderr: bounded.stderr,
+      };
+      if (result.code !== 0 && !tolerateFailure) {
+        const detail =
+          (result.stderr || result.stdout).trim() || `${label} failed with code ${result.code}`;
+        throw new Error(detail);
+      }
+      return result;
     });
   }
 

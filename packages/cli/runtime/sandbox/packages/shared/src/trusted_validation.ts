@@ -44,6 +44,8 @@ export interface TrustedValidationFailureEvidence {
     | "typecheck_failure";
   failedTests: string[];
   targetPathHints: string[];
+  /** Stable, failure-adjacent lines used for incident identity and repair prompts. */
+  failureLines: string[];
 }
 
 export interface TrustedValidationExecutionResult {
@@ -57,17 +59,28 @@ export interface TrustedValidationExecutionResult {
   failureClass?: TrustedValidationFailureEvidence["failureClass"];
   failedTests?: string[];
   targetPathHints?: string[];
+  failureLines?: string[];
+  attempt?: number;
+  retryReason?: "transient_infrastructure";
+  /** Tree that was executed; baseline proof must never be inferred from candidate count. */
+  validationTarget?: "candidate" | "baseline";
+  baselineFailureProven?: boolean;
 }
 
 export interface TrustedValidationReport {
   version: 1;
   baselineSha: string | null;
   candidateSha: string | null;
+  /** Durable hidden ref retaining the exact tree that trusted validation executed. */
+  candidateRef: string | null;
   results: TrustedValidationExecutionResult[];
 }
 
 const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 const TEST_DURATION_SUFFIX_RE = /\s+\[(?:\d+(?:\.\d+)?)(?:ms|s)\]\s*$/i;
+const FAILURE_LINE_RE =
+  /(?:^|\s)(?:error|fail(?:ed|ure)?|fatal|panic|panicked|timed?\s*out|timeout|expected|received|assert(?:ion|ionerror)?)(?:\b|:)/i;
+const PASS_LINE_RE = /^(?:\(pass\)|PASS\b|\u2713\s|\u2714\s|Tests?\s+\d+\s+passed\b)/i;
 
 function uniqueSorted(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort((a, b) =>
@@ -88,6 +101,74 @@ function normalizeEvidencePath(value: string): string | null {
 }
 
 /**
+ * Remove per-run identity from validation evidence without erasing assertion
+ * values. Incident fingerprints use this to remain stable across worktrees,
+ * ports, process ids, and retries of the same underlying failure.
+ */
+export function normalizeTrustedValidationFingerprintLine(value: string): string {
+  return value
+    .replace(ANSI_ESCAPE_RE, "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
+      "<uuid>",
+    )
+    .replace(
+      /\b(?:job|req|request|completion|crash|task|run)_[a-z0-9][a-z0-9_-]{5,}\b/gi,
+      (match) => `${match.slice(0, match.indexOf("_") + 1)}<id>`,
+    )
+    .replace(
+      /\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?\b/gi,
+      "<timestamp>",
+    )
+    .replace(TEST_DURATION_SUFFIX_RE, "")
+    .replace(/\b[0-9a-f]{40,64}\b/gi, "<sha>")
+    .replace(/\b\d+(?:\.\d+)?(?:ms|s)\b/gi, "<duration>")
+    .replace(/\b(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):\d{2,5}\b/gi, "$1:<port>")
+    .replace(/\bport\s*[:=#]?\s*\d{2,5}\b/gi, "port <port>")
+    .replace(/\b(pid|process(?:\s+id)?)\s*[:=#]?\s*\d+\b/gi, "$1 <pid>")
+    .replace(/(\.[a-z][a-z0-9]{0,7}):\d+:\d+\b/gi, "$1:<line>:<column>")
+    .replace(/(\.[a-z][a-z0-9]{0,7}):\d+\b/gi, "$1:<line>")
+    .replace(/\(\d+,\d+\)/g, "(<line>,<column>)")
+    .replace(
+      /(?:[a-z]:)?\/(?:users\/[^/\s]+\/appdata\/local\/temp|tmp|var\/tmp)\/[^\s'"`]+/gi,
+      "<temp-path>",
+    )
+    .replace(
+      /(?:[a-z]:)?\/[^\s'"`]*?\.pushpals\/(?:runtime\/)?worktrees?\/[^/\s'"`]+/gi,
+      "<worktree>",
+    )
+    .replace(/(?:[a-z]:)?\/[^\s'"`]*?\/\.worktrees\/[^/\s'"`]+/gi, "<worktree>")
+    .replace(/\s+/g, " ")
+    .slice(0, 1_000);
+}
+
+function normalizeFailureLine(value: string): string {
+  return normalizeTrustedValidationFingerprintLine(value);
+}
+
+function failureNeighborhoodLines(output: string, radius = 2): string[] {
+  const lines = output.replace(ANSI_ESCAPE_RE, "").split(/\r?\n/);
+  const selected = new Set<number>();
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]?.trim() ?? "";
+    if (!line || PASS_LINE_RE.test(line) || !FAILURE_LINE_RE.test(line)) continue;
+    for (
+      let candidate = Math.max(0, index - radius);
+      candidate <= Math.min(lines.length - 1, index + radius);
+      candidate += 1
+    ) {
+      if (lines[candidate]?.trim()) selected.add(candidate);
+    }
+  }
+  return [...selected]
+    .sort((a, b) => a - b)
+    .map((index) => lines[index]?.trim() ?? "")
+    .filter(Boolean);
+}
+
+/**
  * Extract stable test names and paths before transport truncates noisy command
  * output. The evidence deliberately excludes durations and candidate SHAs so
  * the same baseline failure can be correlated across unrelated jobs.
@@ -104,31 +185,73 @@ export function extractTrustedValidationFailureEvidence(options: {
   const output = String(options.output ?? "").replace(ANSI_ESCAPE_RE, "");
   const failedTests: string[] = [];
   const targetPathHints: string[] = [];
+  const failureLines: string[] = [];
   let currentTestPath: string | null = null;
 
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
 
-    const bunPath = line.match(/^(.+\.(?:test|spec)\.[cm]?[jt]sx?):\s*$/i)?.[1];
+    // A bare Bun test-file heading is not failure evidence. Keep it as context
+    // and associate it with a path only after a named failure is observed.
+    const bunPath = line.match(/^(.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?):\s*$/i)?.[1];
     const suitePath = line.match(
-      /^(?:FAIL|failed)\s+(.+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s|$)/i,
+      /^(?:FAIL|failed)\s+(.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?)(?:\s|$)/i,
     )?.[1];
     const diagnosticPath = line.match(/^([^:(]+\.[cm]?[jt]sx?)\(\d+,\d+\):\s+error\b/i)?.[1];
-    const path = normalizeEvidencePath(bunPath ?? suitePath ?? diagnosticPath ?? "");
-    if (path) {
-      currentTestPath = path;
-      targetPathHints.push(path);
+    const pytestFailure = line.match(/^FAILED\s+(.+?\.py)::([^\s]+)(?:\s+-\s+|$)/i);
+    const portableDiagnosticPath = line.match(/^(.+?\.(?:py|go|rs)):\d+(?::\d+)?:/i)?.[1];
+    const cargoPanic = line.match(
+      /^thread\s+['"]([^'"]+)['"]\s+panicked\s+at\s+(.+?\.rs):\d+(?::\d+)?:/i,
+    );
+    const bunContextPath = normalizeEvidencePath(bunPath ?? "");
+    if (bunContextPath) currentTestPath = bunContextPath;
+    const failingPath = normalizeEvidencePath(
+      suitePath ??
+        pytestFailure?.[1] ??
+        cargoPanic?.[2] ??
+        diagnosticPath ??
+        portableDiagnosticPath ??
+        "",
+    );
+    if (failingPath) {
+      currentTestPath = failingPath;
+      targetPathHints.push(failingPath);
     }
 
     const bunFailure = line.match(/^\(fail\)\s+(.+)$/i)?.[1];
     const jestFailure = line.match(/^[\u2715\u2717]\s+(.+)$/)?.[1];
-    const namedFailure = (bunFailure ?? jestFailure ?? "")
+    const vitestFailure = line.match(
+      /^FAIL\s+.+?\.(?:test|spec|vitest)\.[cm]?[jt]sx?\s*>\s*(.+)$/i,
+    )?.[1];
+    const jestSuiteFailure = line.match(/^\u25cf\s+(.+)$/)?.[1];
+    const goFailure = line.match(/^---\s+FAIL:\s+([^\s(]+)(?:\s+\(|$)/i)?.[1];
+    const cargoStdoutFailure = line.match(/^----\s+(.+?)\s+stdout\s+----$/i)?.[1];
+    const cargoTestFailure = line.match(/^test\s+(.+?)\s+\.\.\.\s+FAILED$/i)?.[1];
+    const namedFailure = (
+      bunFailure ??
+      jestFailure ??
+      vitestFailure ??
+      jestSuiteFailure ??
+      pytestFailure?.[2] ??
+      goFailure ??
+      cargoStdoutFailure ??
+      cargoTestFailure ??
+      cargoPanic?.[1] ??
+      ""
+    )
       .replace(TEST_DURATION_SUFFIX_RE, "")
       .trim();
     if (namedFailure) {
       failedTests.push(namedFailure);
       if (currentTestPath) targetPathHints.push(currentTestPath);
+    }
+
+    if (
+      !PASS_LINE_RE.test(line) &&
+      (Boolean(namedFailure) || Boolean(failingPath) || FAILURE_LINE_RE.test(line))
+    ) {
+      failureLines.push(normalizeFailureLine(line));
     }
   }
 
@@ -141,11 +264,11 @@ export function extractTrustedValidationFailureEvidence(options: {
     failureClass = "test_failure";
   } else if (/timed?\s*out|timeout/i.test(output)) {
     failureClass = "timeout";
-  } else if (/(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
+  } else if (/(?:^|\s)(?:test|pytest|jest|vitest)(?:\s|$)/i.test(command)) {
     failureClass = "test_failure";
   } else if (/\b(?:tsc|typecheck|type-check)\b/i.test(command)) {
     failureClass = "typecheck_failure";
-  } else if (/\b(?:eslint|lint)\b/i.test(command)) {
+  } else if (/\b(?:eslint|lint|ruff)\b/i.test(command)) {
     failureClass = "lint_failure";
   } else {
     failureClass = "trusted_validation_failed";
@@ -155,6 +278,7 @@ export function extractTrustedValidationFailureEvidence(options: {
     failureClass,
     failedTests: uniqueSorted(failedTests),
     targetPathHints: uniqueSorted(targetPathHints),
+    failureLines: uniqueSorted(failureLines).slice(0, 20),
   };
 }
 
@@ -162,9 +286,20 @@ export function truncateTrustedValidationOutput(output: string, maxChars = 16_00
   const text = String(output ?? "");
   const boundedMax = Math.max(1_000, Math.floor(maxChars));
   if (text.length <= boundedMax) return text;
-  const headChars = Math.min(4_000, Math.floor(boundedMax / 3));
-  const tailChars = boundedMax - headChars;
-  return `${text.slice(0, headChars)}\n... trusted validation output truncated ...\n${text.slice(-tailChars)}`;
+  const headChars = Math.min(3_000, Math.floor(boundedMax / 4));
+  const failureContext = failureNeighborhoodLines(text)
+    .join("\n")
+    .slice(0, Math.max(2_000, Math.floor(boundedMax / 2)));
+  const remaining = Math.max(1_000, boundedMax - headChars - failureContext.length - 100);
+  return [
+    text.slice(0, headChars),
+    "... trusted validation output truncated ...",
+    failureContext ? `Failure context:\n${failureContext}` : "",
+    text.slice(-remaining),
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, boundedMax);
 }
 
 /**

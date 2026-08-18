@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   resolveExistingWorktreeBaseRef,
   resolveFreshWorktreeBaseRef,
+  resolveReviewWorktreeBase,
   type GitBaseRefCommand,
 } from "../apps/workerpals/src/worktree_base_ref";
 
@@ -35,6 +36,81 @@ function createGitMock(options: {
 }
 
 describe("workerpals worktree base ref resolution", () => {
+  test("seeds candidate-specific validation repair from the exact host commit", async () => {
+    const candidateSha = "a".repeat(40);
+    const candidateRef = `refs/pushpals/validation/${"1".repeat(32)}/1/candidate`;
+    let fallbackCalls = 0;
+    const params: Record<string, unknown> = {
+      autonomy: {
+        validationIncident: {
+          incidentId: "valid_inc_account",
+          candidateSha,
+          candidateRef,
+          validationScope: "candidate_specific",
+        },
+      },
+    };
+    const resolved = await resolveReviewWorktreeBase({
+      jobId: "job-validation-repair",
+      params,
+      git: async (args) => ({
+        ok: args[0] === "rev-parse" && args.at(-1) === `${candidateRef}^{commit}`,
+        stdout: candidateSha,
+        stderr: "",
+      }),
+      fallback: async () => {
+        fallbackCalls += 1;
+        return "origin/main_agents";
+      },
+    });
+
+    expect(resolved).toBe(candidateSha);
+    expect(fallbackCalls).toBe(0);
+    expect(String(params.plannerWorkerInstruction)).toContain("Host SCM prepared");
+    expect(String(params.plannerWorkerInstruction)).toContain("do not switch branches");
+  });
+
+  test("refuses a generic base when an exact validation candidate is unavailable", async () => {
+    const candidateSha = "b".repeat(40);
+    const candidateRef = `refs/pushpals/validation/${"2".repeat(32)}/1/candidate`;
+    expect(
+      resolveReviewWorktreeBase({
+        jobId: "job-missing-validation-candidate",
+        params: {
+          autonomy: {
+            validationIncident: {
+              incidentId: "valid_inc_missing",
+              candidateSha,
+              candidateRef,
+              validationScope: "candidate_specific",
+            },
+          },
+        },
+        git: async () => ({ ok: false, stdout: "", stderr: "missing" }),
+        fallback: async () => "origin/main_agents",
+      }),
+    ).rejects.toThrow("refusing a generic base");
+  });
+
+  test("refuses candidate-specific repair metadata without an immutable candidate ref", async () => {
+    expect(
+      resolveReviewWorktreeBase({
+        jobId: "job-unretained-validation-candidate",
+        params: {
+          autonomy: {
+            validationIncident: {
+              incidentId: "valid_inc_unretained",
+              candidateSha: "c".repeat(40),
+              validationScope: "candidate_specific",
+            },
+          },
+        },
+        git: async () => ({ ok: true, stdout: "c".repeat(40), stderr: "" }),
+        fallback: async () => "origin/main_agents",
+      }),
+    ).rejects.toThrow("missing its exact retained candidate ref");
+  });
+
   test("keeps integration branch when it already contains source base", async () => {
     const { git } = createGitMock({
       refs: new Set(["origin/main_agents", "origin/main"]),

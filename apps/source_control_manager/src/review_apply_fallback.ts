@@ -21,9 +21,10 @@ export function isCherryPickConflictOutput(text: string): boolean {
   );
 }
 
-export function shouldBypassApplyFailureInReviewMode(input: ReviewApplyFallbackInput): boolean {
-  if (!input.reviewAgentEnabled) return false;
-  if (normalize(input.mergeStrategy) !== "cherry-pick") return false;
+export function reviewApplyFailureBlocksPublication(input: ReviewApplyFallbackInput): true {
   const combined = [input.applyStderr ?? "", input.applyStdout ?? ""].filter(Boolean).join("\n");
-  return isCherryPickConflictOutput(combined);
+  // A conflict is useful classification for repair dispatch, never permission
+  // to bypass SourceControlManager validation and publish the worker branch.
+  void isCherryPickConflictOutput(combined);
+  return true;
 }

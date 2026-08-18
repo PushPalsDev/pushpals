@@ -39,6 +39,20 @@ const copyPairs: Array<[string, string]> = [
   // Copy the complete prompt contract rather than maintaining a fragile list.
   [source.promptsDir, join(outDir, "sandbox", "prompts")],
   [source.protocolSchemasDir, join(outDir, "sandbox", "protocol", "schemas")],
+  // Keep newly introduced runtime primitives available during pre-commit
+  // package validation; the tracked-tree copy below cannot see new files yet.
+  [
+    join(repoRoot, "packages", "shared", "src", "bounded_fetch.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "bounded_fetch.ts"),
+  ],
+  [
+    join(repoRoot, "packages", "shared", "src", "bounded_process.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "bounded_process.ts"),
+  ],
+  [
+    join(repoRoot, "packages", "shared", "src", "validation_repair_lease.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "validation_repair_lease.ts"),
+  ],
 ];
 const trackedSandboxCopyPairs: Array<[string, string]> = [
   ["package.json", join(outDir, "sandbox", "package.json")],

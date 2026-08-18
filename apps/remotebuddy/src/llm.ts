@@ -10,7 +10,13 @@ import { spawn } from "child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { loadPromptTemplate, loadPushPalsConfig, type PushPalsLmStudioConfig } from "shared";
+import {
+  fetchBufferedWithHardDeadline,
+  loadPromptTemplate,
+  loadPushPalsConfig,
+  runBoundedProcess,
+  type PushPalsLmStudioConfig,
+} from "shared";
 
 export interface LLMMessage {
   role: "system" | "user" | "assistant";
@@ -73,6 +79,7 @@ export interface LLMClientOptions {
   serverUrl?: string;
   authToken?: string | null;
   usageReporter?: LLMUsageReporter;
+  httpTimeoutMs?: number;
 }
 
 interface ResolvedServiceLlmConfig {
@@ -96,10 +103,39 @@ const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 const LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.5";
 const DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_TIMEOUT_MS = 120_000;
+const DEFAULT_LLM_HTTP_TIMEOUT_MS = 120_000;
+const DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS = 10_000;
+const DEFAULT_LLM_TELEMETRY_TIMEOUT_MS = 5_000;
 const DEFAULT_LMSTUDIO_CONTEXT_WINDOW = 4096;
 const DEFAULT_LMSTUDIO_MIN_OUTPUT_TOKENS = 256;
 const DEFAULT_LMSTUDIO_TOKEN_SAFETY_MARGIN = 64;
 const DEFAULT_LMSTUDIO_BATCH_TAIL_MESSAGES = 3;
+
+function resolveLlmHttpTimeoutMs(explicit: number | undefined, fallback: number): number {
+  const environmentValue = Number(process.env.PUSHPALS_LLM_HTTP_TIMEOUT_MS);
+  const configured =
+    typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0
+      ? explicit
+      : Number.isFinite(environmentValue) && environmentValue > 0
+        ? environmentValue
+        : fallback;
+  return Math.max(1, Math.floor(configured));
+}
+
+function fetchLlmHttpResponse(
+  input: string | URL | Request,
+  init: RequestInit,
+  timeoutMs: number,
+  operation: string,
+): Promise<Response> {
+  return fetchBufferedWithHardDeadline({
+    input,
+    init,
+    timeoutMs,
+    timeoutMessage: `${operation} timed out after ${timeoutMs}ms`,
+  });
+}
+
 const CONTEXT_PACKER_SYSTEM_PROMPT = loadPromptTemplate(
   "remotebuddy/context_packer_system_prompt.md",
 ).trim();
@@ -365,58 +401,25 @@ async function runProcessWithBun(
   command: string[],
   opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
 ): Promise<ProcessRunResult> {
-  const bunRuntime = (globalThis as any).Bun;
-  const timeoutMs = opts.timeoutMs ?? 0;
-  let timedOut = false;
-  let timeout: NodeJS.Timeout | null = null;
-  let killTimeout: NodeJS.Timeout | null = null;
-  const proc = bunRuntime.spawn(command, {
+  const timeoutMs =
+    typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+      ? Math.floor(opts.timeoutMs)
+      : DEFAULT_CODEX_TIMEOUT_MS;
+  const result = await runBoundedProcess(command, {
     cwd: opts.cwd,
     env: opts.env,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
+    stdin: typeof opts.stdin === "string" ? new Blob([opts.stdin]) : "ignore",
+    timeoutMs,
+    outputLimitBytes: 4 * 1024 * 1024,
+    streamDrainTimeoutMs: 2_000,
   });
-  const stdoutPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
-
-  if (timeoutMs > 0) {
-    timeout = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill("SIGTERM");
-      } catch {
-        // best effort
-      }
-      killTimeout = setTimeout(() => {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // best effort
-        }
-      }, 1_000);
-      killTimeout.unref?.();
-    }, timeoutMs);
-  }
-
-  try {
-    if (typeof opts.stdin === "string") {
-      proc.stdin?.write(opts.stdin);
-    }
-    proc.stdin?.end();
-    const code = await proc.exited;
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-    return {
-      code,
-      signal: null,
-      stdout,
-      stderr,
-      timedOut,
-    };
-  } finally {
-    if (timeout) clearTimeout(timeout);
-    if (killTimeout) clearTimeout(killTimeout);
-  }
+  return {
+    code: result.exitCode,
+    signal: result.timedOut ? "SIGKILL" : null,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    timedOut: result.timedOut,
+  };
 }
 
 async function runProcessWithNode(
@@ -772,19 +775,29 @@ function normalizeTokenUsage(
 function createHttpUsageReporter(opts: {
   serverUrl?: string;
   authToken?: string | null;
+  httpTimeoutMs?: number;
 }): LLMUsageReporter | null {
   const serverUrl = (opts.serverUrl ?? "").trim().replace(/\/+$/, "");
   if (!serverUrl) return null;
+  const timeoutMs = Math.min(
+    resolveLlmHttpTimeoutMs(opts.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS),
+    DEFAULT_LLM_TELEMETRY_TIMEOUT_MS,
+  );
   return {
     async reportUsage(event: LLMUsageEvent): Promise<void> {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       const authToken = (opts.authToken ?? "").trim();
       if (authToken) headers.Authorization = `Bearer ${authToken}`;
-      const response = await fetch(`${serverUrl}/telemetry/llm-usage`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(event),
-      });
+      const response = await fetchLlmHttpResponse(
+        `${serverUrl}/telemetry/llm-usage`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(event),
+        },
+        timeoutMs,
+        "LLM usage telemetry request",
+      );
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         throw new Error(
@@ -985,6 +998,7 @@ export class LmStudioClient implements LLMClient {
   private batchTailMessages: number;
   private batchChunkTokens: number;
   private batchMemoryChars: number;
+  private httpTimeoutMs: number;
   private resolvedModel: string | null = null;
   private resolveModelPromise: Promise<string> | null = null;
   private lmStudioSupportsExtendedSessionFields: boolean | null = null;
@@ -999,6 +1013,7 @@ export class LmStudioClient implements LLMClient {
     sessionId?: string;
     lmStudio?: PushPalsLmStudioConfig;
     usageReporter?: LLMUsageReporter | null;
+    httpTimeoutMs?: number;
   }) {
     this.providerKind = opts?.backend ?? "lmstudio";
     this.providerLabel = this.providerKind === "openai" ? "OpenAI" : "LM Studio";
@@ -1027,6 +1042,7 @@ export class LmStudioClient implements LLMClient {
     );
     this.batchChunkTokens = Math.max(0, lmStudio?.batchChunkTokens ?? 0);
     this.batchMemoryChars = Math.max(0, lmStudio?.batchMemoryChars ?? 0);
+    this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
 
   private async maybeReportUsage(
@@ -1093,9 +1109,15 @@ export class LmStudioClient implements LLMClient {
     }
 
     let lastDetail = "model-list probe failed";
+    const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
     for (const url of probes) {
       try {
-        const res = await fetch(url, { method: "GET", headers });
+        const res = await fetchLlmHttpResponse(
+          url,
+          { method: "GET", headers },
+          timeoutMs,
+          `${this.providerLabel} model-list probe`,
+        );
         if (!res.ok) {
           const body = await res.text();
           const hint = body.trim().slice(0, 120);
@@ -1267,11 +1289,16 @@ export class LmStudioClient implements LLMClient {
         headers["X-Session-Id"] = this.sessionTag;
         headers["X-Conversation-Id"] = this.sessionTag;
       }
-      const res = await fetch(this.endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
+      const res = await fetchLlmHttpResponse(
+        this.endpoint,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        },
+        this.httpTimeoutMs,
+        `${this.providerLabel} completion request`,
+      );
 
       if (!res.ok) {
         lastStatus = res.status;
@@ -1758,6 +1785,7 @@ export class OllamaClient implements LLMClient {
   private service: LlmService;
   private sessionTag: string;
   private usageReporter: LLMUsageReporter | null;
+  private httpTimeoutMs: number;
 
   constructor(opts?: {
     endpoint?: string;
@@ -1765,6 +1793,7 @@ export class OllamaClient implements LLMClient {
     service?: LlmService;
     sessionId?: string;
     usageReporter?: LLMUsageReporter | null;
+    httpTimeoutMs?: number;
   }) {
     const rawEndpoint = opts?.endpoint ?? DEFAULT_OLLAMA_ENDPOINT;
     this.endpoint = normalizeOllamaEndpoint(rawEndpoint);
@@ -1772,6 +1801,7 @@ export class OllamaClient implements LLMClient {
     this.service = opts?.service ?? "remotebuddy";
     this.sessionTag = stableConversationTag(this.service, opts?.sessionId);
     this.usageReporter = opts?.usageReporter ?? null;
+    this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
 
   private async maybeReportUsage(usage: {
@@ -1800,10 +1830,16 @@ export class OllamaClient implements LLMClient {
     const base = this.endpoint.replace(/\/api\/chat$/, "");
     const probes = uniqueNonEmptyStrings([`${base}/api/tags`, this.endpoint]);
     let lastDetail = "model-list probe failed";
+    const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
 
     for (const url of probes) {
       try {
-        const res = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
+        const res = await fetchLlmHttpResponse(
+          url,
+          { method: "GET", headers: { Accept: "application/json" } },
+          timeoutMs,
+          "Ollama model-list probe",
+        );
         if (!res.ok) {
           const body = await res.text();
           const hint = body.trim().slice(0, 120);
@@ -1871,11 +1907,16 @@ export class OllamaClient implements LLMClient {
       body.format = "json";
     }
 
-    const res = await fetch(this.endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const res = await fetchLlmHttpResponse(
+      this.endpoint,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      this.httpTimeoutMs,
+      "Ollama completion request",
+    );
 
     if (!res.ok) {
       const err = await res.text();
@@ -1932,6 +1973,7 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
       service,
       sessionId: resolved.sessionId,
       usageReporter,
+      httpTimeoutMs: opts.httpTimeoutMs,
     });
   }
 
@@ -1948,6 +1990,7 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
       sessionId: resolved.sessionId,
       lmStudio: resolved.lmStudio,
       usageReporter,
+      httpTimeoutMs: opts.httpTimeoutMs,
     });
   }
 
@@ -1963,6 +2006,7 @@ export function createLLMClient(opts: LLMClientOptions = {}): LLMClient {
     sessionId: resolved.sessionId,
     lmStudio: resolved.lmStudio,
     usageReporter,
+    httpTimeoutMs: opts.httpTimeoutMs,
   });
 }
 
@@ -1994,6 +2038,7 @@ export async function preflightServiceLlm(opts: LLMClientOptions = {}): Promise<
       service,
       sessionId: resolved.sessionId,
       usageReporter: null,
+      httpTimeoutMs: opts.httpTimeoutMs,
     });
     await client.preflightConfiguredModel();
     return;
@@ -2008,6 +2053,7 @@ export async function preflightServiceLlm(opts: LLMClientOptions = {}): Promise<
     sessionId: resolved.sessionId,
     lmStudio: resolved.lmStudio,
     usageReporter: null,
+    httpTimeoutMs: opts.httpTimeoutMs,
   });
   await client.preflightConfiguredModel();
 }
@@ -2018,4 +2064,5 @@ export const __TEST_ONLY__ = {
   compareCodexVersions,
   parseCodexCliVersion,
   requiresNewerCodexForModel,
+  runProcessWithBun,
 };

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   isCherryPickConflictOutput,
-  shouldBypassApplyFailureInReviewMode,
+  reviewApplyFailureBlocksPublication,
 } from "../apps/source_control_manager/src/review_apply_fallback";
 
 describe("source-control-manager review apply fallback", () => {
@@ -16,14 +16,14 @@ describe("source-control-manager review apply fallback", () => {
     ).toBe(false);
   });
 
-  test("bypasses apply failure only in ReviewAgent cherry-pick mode", () => {
+  test("never bypasses a failed apply before review publication", async () => {
     const base = {
       applyStdout: "",
       applyStderr: "error: could not apply abc123... feature",
     };
 
     expect(
-      shouldBypassApplyFailureInReviewMode({
+      reviewApplyFailureBlocksPublication({
         ...base,
         reviewAgentEnabled: true,
         mergeStrategy: "cherry-pick",
@@ -31,28 +31,44 @@ describe("source-control-manager review apply fallback", () => {
     ).toBe(true);
 
     expect(
-      shouldBypassApplyFailureInReviewMode({
+      reviewApplyFailureBlocksPublication({
         ...base,
         reviewAgentEnabled: false,
         mergeStrategy: "cherry-pick",
       }),
-    ).toBe(false);
+    ).toBe(true);
 
     expect(
-      shouldBypassApplyFailureInReviewMode({
+      reviewApplyFailureBlocksPublication({
         ...base,
         reviewAgentEnabled: true,
         mergeStrategy: "ff-only",
       }),
-    ).toBe(false);
+    ).toBe(true);
 
     expect(
-      shouldBypassApplyFailureInReviewMode({
+      reviewApplyFailureBlocksPublication({
         applyStdout: "",
         applyStderr: "fatal: could not read Username for 'https://github.com'",
         reviewAgentEnabled: true,
         mergeStrategy: "cherry-pick",
       }),
-    ).toBe(false);
+    ).toBe(true);
+
+    let pushed = false;
+    const orchestrateReviewPublication = async () => {
+      if (
+        reviewApplyFailureBlocksPublication({
+          ...base,
+          reviewAgentEnabled: true,
+          mergeStrategy: "cherry-pick",
+        })
+      ) {
+        throw new Error("candidate apply failed; publication blocked");
+      }
+      pushed = true;
+    };
+    await expect(orchestrateReviewPublication()).rejects.toThrow("publication blocked");
+    expect(pushed).toBe(false);
   });
 });

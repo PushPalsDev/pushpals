@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 
+import { terminateProcessTree } from "../packages/shared/src/bounded_process.js";
+
 const READY_PREFIX = "[pushpals-launch-trampoline] child-started";
 const separatorIndex = process.argv.indexOf("--", 2);
 // Bun consumes the conventional `--` separator before populating process.argv,
@@ -19,17 +21,7 @@ async function stopChild(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   if (stopping) return;
   stopping = true;
   if (child) {
-    try {
-      child.kill(signal);
-    } catch {
-      // The child may already have exited.
-    }
-    await Promise.race([child.exited.catch(() => 0), Bun.sleep(2_000)]);
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Best-effort final termination only.
-    }
+    await terminateProcessTree(child);
   }
   process.exit(signal === "SIGINT" ? 130 : 143);
 }

@@ -17,6 +17,7 @@ import {
   inferGitBackendFromRemote,
   isLoopbackOrigin,
   loadPushPalsConfig,
+  runBoundedProcess,
   sanitizePushPalsConfigForLogging,
   sanitizeGitRemoteUrl,
   toGitHubRepoWebUrl,
@@ -30,6 +31,7 @@ import {
 import { deriveRuntimeConfigImpact } from "./runtime_config_policy.js";
 import { resolveRequestAuthHeader } from "./request_auth.js";
 import { extractAutonomyPayloadDetails } from "./autonomy_payload.js";
+import { LifecycleReconciliationTracker } from "./lifecycle_reconciliation.js";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
 const STARTUP_CONFIG = loadPushPalsConfig();
@@ -42,8 +44,44 @@ const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
-const lifecycleReconciliation = autonomyStore.reconcileJobLinkedOutcomeLifecycle();
-const reservationReconciliation = autonomyStore.reconcileGatedObjectiveReservations();
+const reconciliationTracker = new LifecycleReconciliationTracker();
+function guardedReconciliation<T>(label: string, fallback: T, reconcile: () => T): T {
+  return reconciliationTracker.run(label, fallback, reconcile, (detail) => {
+    console.error(
+      `[Server] ${label} reconciliation failed and will be retried by the lifecycle watchdog: ${detail}`,
+    );
+  });
+}
+const requestHandoffReconciliation = guardedReconciliation(
+  "request handoff",
+  { completed: 0, requestIds: [] as string[], jobIds: [] as string[] },
+  () => requestQueue.reconcileWorkerHandoffsFromJobs(),
+);
+const requestLeaseReconciliation = guardedReconciliation(
+  "request lease",
+  { recovered: 0, requestIds: [] as string[] },
+  () => requestQueue.recoverExpiredClaims(),
+);
+const completionLeaseReconciliation = guardedReconciliation(
+  "completion lease",
+  { recovered: 0, completionIds: [] as string[] },
+  () => completionQueue.recoverExpiredClaims(),
+);
+const lifecycleReconciliation = guardedReconciliation(
+  "completion lifecycle",
+  { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 },
+  () => autonomyStore.reconcileJobLinkedOutcomeLifecycle(),
+);
+const reservationReconciliation = guardedReconciliation(
+  "autonomy reservation",
+  { linked: 0, failed: 0 },
+  () => autonomyStore.reconcileGatedObjectiveReservations(),
+);
+const handoffReconciliation = guardedReconciliation(
+  "worker handoff",
+  { linked: 0, failed: 0, pending: 0, scanned: 0 },
+  () => autonomyStore.reconcileObjectiveWorkerHandoffs(),
+);
 if (
   lifecycleReconciliation.correctedFailures > 0 ||
   lifecycleReconciliation.removedPrematureSuccesses > 0 ||
@@ -58,6 +96,93 @@ if (reservationReconciliation.linked > 0 || reservationReconciliation.failed > 0
     `[Server] Reconciled autonomy objective reservations: ${JSON.stringify(reservationReconciliation)}`,
   );
 }
+if (handoffReconciliation.linked > 0 || handoffReconciliation.failed > 0) {
+  console.warn(
+    `[Server] Reconciled autonomy worker handoffs: ${JSON.stringify(handoffReconciliation)}`,
+  );
+}
+if (requestLeaseReconciliation.recovered > 0) {
+  console.warn(
+    `[Server] Requeued ${requestLeaseReconciliation.recovered} request(s) with expired planning leases.`,
+  );
+}
+if (requestHandoffReconciliation.completed > 0) {
+  console.warn(
+    `[Server] Reconciled ${requestHandoffReconciliation.completed} durable request/job handoff(s) after a planner crash.`,
+  );
+}
+if (completionLeaseReconciliation.recovered > 0) {
+  console.warn(
+    `[Server] Requeued ${completionLeaseReconciliation.recovered} completion(s) with expired publication leases.`,
+  );
+}
+const lifecycleWatchdogTimer = setInterval(() => {
+  const requestHandoffRecovery = guardedReconciliation(
+    "request handoff",
+    { completed: 0, requestIds: [] as string[], jobIds: [] as string[] },
+    () => requestQueue.reconcileWorkerHandoffsFromJobs(),
+  );
+  if (requestHandoffRecovery.completed > 0) {
+    console.warn(
+      `[Server] Periodic watchdog reconciled ${requestHandoffRecovery.completed} durable request/job handoff(s).`,
+    );
+  }
+  const leaseRecovery = guardedReconciliation(
+    "request lease",
+    { recovered: 0, requestIds: [] as string[] },
+    () => requestQueue.recoverExpiredClaims(),
+  );
+  if (leaseRecovery.recovered > 0) {
+    console.warn(
+      `[Server] Periodic watchdog requeued ${leaseRecovery.recovered} request(s) with expired planning leases.`,
+    );
+  }
+  const completionLeaseRecovery = guardedReconciliation(
+    "completion lease",
+    { recovered: 0, completionIds: [] as string[] },
+    () => completionQueue.recoverExpiredClaims(),
+  );
+  if (completionLeaseRecovery.recovered > 0) {
+    console.warn(
+      `[Server] Periodic watchdog requeued ${completionLeaseRecovery.recovered} completion(s) with expired publication leases.`,
+    );
+  }
+  const completionLifecycleRecovery = guardedReconciliation(
+    "completion lifecycle",
+    { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 },
+    () => autonomyStore.reconcileJobLinkedOutcomeLifecycle(),
+  );
+  if (
+    completionLifecycleRecovery.correctedFailures > 0 ||
+    completionLifecycleRecovery.removedPrematureSuccesses > 0 ||
+    completionLifecycleRecovery.correctedObjectives > 0
+  ) {
+    console.warn(
+      `[Server] Periodic completion-lifecycle reconciliation: ${JSON.stringify(completionLifecycleRecovery)}`,
+    );
+  }
+  const reservationRecovery = guardedReconciliation(
+    "autonomy reservation",
+    { linked: 0, failed: 0 },
+    () => autonomyStore.reconcileGatedObjectiveReservations(),
+  );
+  if (reservationRecovery.linked > 0 || reservationRecovery.failed > 0) {
+    console.warn(
+      `[Server] Periodic autonomy-reservation reconciliation: ${JSON.stringify(reservationRecovery)}`,
+    );
+  }
+  const handoffRecovery = guardedReconciliation(
+    "worker handoff",
+    { linked: 0, failed: 0, pending: 0, scanned: 0 },
+    () => autonomyStore.reconcileObjectiveWorkerHandoffs(),
+  );
+  if (handoffRecovery.linked > 0 || handoffRecovery.failed > 0) {
+    console.warn(
+      `[Server] Periodic worker-handoff reconciliation: ${JSON.stringify(handoffRecovery)}`,
+    );
+  }
+}, 30_000);
+lifecycleWatchdogTimer.unref?.();
 const clientPresence = new ClientPresenceRegistry();
 const clientPresencePruneTimer = setInterval(() => {
   const removed = clientPresence.pruneExpired();
@@ -99,6 +224,8 @@ const SERVER_STARTED_AT_ISO = new Date(SERVER_STARTED_AT_MS).toISOString();
 const AUTONOMY_BUSY_QUEUE_MAX_REQUESTS = 5;
 const AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS = 10;
 const AUTONOMY_WORKER_TTL_MS = 15_000;
+const AUTONOMY_PUBLICATION_MAX_AGE_MS = 10 * 60 * 1000;
+const AUTONOMY_PUBLICATION_BACKPRESSURE_DEFER_MS = 5 * 60 * 1000;
 const AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS = 60 * 60 * 1000;
 const AUTONOMY_WORKER_FAILURE_CIRCUIT_THRESHOLD = 3;
 const AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE = 0.5;
@@ -183,21 +310,16 @@ let repoStatusCache: {
 } | null = null;
 
 async function resolveRemoteUrl(repoPath: string, remote: string): Promise<string> {
-  const proc = Bun.spawn(["git", "-C", repoPath, "remote", "get-url", remote], {
-    stdout: "pipe",
-    stderr: "pipe",
+  const result = await runBoundedProcess(["git", "-C", repoPath, "remote", "get-url", remote], {
+    timeoutMs: 5_000,
+    outputLimitBytes: 256 * 1024,
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (exitCode !== 0) {
-    const detail = stderr.trim() || stdout.trim() || `exit ${exitCode}`;
+  if (result.exitCode !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
     console.warn(`[Server] Failed to resolve git remote URL (${remote}): ${detail}`);
     return "";
   }
-  return stdout.trim();
+  return result.stdout.trim();
 }
 
 async function getRepoStatusSummary(repoPath: string, remote: string): Promise<RepoStatusSummary> {
@@ -518,6 +640,52 @@ export function createRequestHandler() {
           429,
         );
       };
+      const autonomyPublicationBackpressureSummary = () => {
+        // Stale publication claims are recoverable work, not permanent queue
+        // occupancy. Requeue them before making an admission decision.
+        completionQueue.recoverExpiredClaims();
+        const publication = completionQueue.publicationBacklogSummary({
+          unhealthyAfterMs: AUTONOMY_PUBLICATION_MAX_AGE_MS,
+        });
+        const onlineWorkers = jobQueue
+          .listWorkers(AUTONOMY_WORKER_TTL_MS)
+          .filter((worker) => worker.isOnline && worker.status !== "offline").length;
+        const threshold = Math.max(2, onlineWorkers);
+        const oldestAgeMs = Math.max(
+          publication.oldestPendingAgeMs,
+          publication.oldestFinalizingAgeMs,
+        );
+        return {
+          blocked:
+            publication.unhealthy ||
+            publication.backlog >= threshold ||
+            (publication.backlog > 0 && oldestAgeMs >= AUTONOMY_PUBLICATION_MAX_AGE_MS),
+          publication,
+          onlineWorkers,
+          threshold,
+          oldestAgeMs,
+        };
+      };
+      const makeAutonomyPublicationBackpressureResponse = (): Response | null => {
+        const state = autonomyPublicationBackpressureSummary();
+        if (!state.blocked) return null;
+        return makeJson(
+          {
+            ok: false,
+            code: "autonomy_publication_backpressure",
+            message:
+              `Autonomy enqueue blocked: publication backlog is ${state.publication.backlog} ` +
+              `(threshold ${state.threshold}, oldest ${state.oldestAgeMs}ms, ` +
+              `unhealthy=${state.publication.unhealthy}).`,
+            retryAfterMs: AUTONOMY_PUBLICATION_BACKPRESSURE_DEFER_MS,
+            publication: state.publication,
+            onlineWorkers: state.onlineWorkers,
+            threshold: state.threshold,
+            oldestAgeMs: state.oldestAgeMs,
+          },
+          429,
+        );
+      };
       const parseRuntimeMutations = (value: unknown): RuntimeConfigMutation[] => {
         if (!Array.isArray(value)) return [];
         const out: RuntimeConfigMutation[] = [];
@@ -549,6 +717,12 @@ export function createRequestHandler() {
         if (reservationRecovery.linked > 0 || reservationRecovery.failed > 0) {
           console.warn(
             `[Server] Reconciled autonomy objective reservations during stale-claim sweep: ${JSON.stringify(reservationRecovery)}`,
+          );
+        }
+        const handoffRecovery = autonomyStore.reconcileObjectiveWorkerHandoffs();
+        if (handoffRecovery.linked > 0 || handoffRecovery.failed > 0) {
+          console.warn(
+            `[Server] Reconciled autonomy worker handoffs during stale-claim sweep: ${JSON.stringify(handoffRecovery)}`,
           );
         }
 
@@ -1011,13 +1185,58 @@ export function createRequestHandler() {
             429,
           );
         }
-        if (isAutonomyRequestPayload(body)) {
+        const enqueueParams =
+          body.params && typeof body.params === "object" && !Array.isArray(body.params)
+            ? (body.params as Record<string, unknown>)
+            : {};
+        const lifecycleRequestId = compactText(enqueueParams.requestId, 128);
+        const lifecycleRequest = lifecycleRequestId
+          ? requestQueue.getRequest(lifecycleRequestId)
+          : null;
+        if (lifecycleRequestId && !lifecycleRequest) {
+          return makeJson(
+            {
+              ok: false,
+              code: "request_not_found",
+              message: "task.execute enqueue references an unknown durable request.",
+            },
+            409,
+          );
+        }
+        let validLifecycleHandoff = false;
+        if (lifecycleRequest) {
+          const lease = requestQueue.validateActiveLease(
+            lifecycleRequestId,
+            compactText(body.requestAgentId, 128),
+            compactText(body.requestClaimToken, 256),
+          );
+          if (!lease.ok) {
+            return makeJson(
+              {
+                ok: false,
+                code: "request_lease_invalid",
+                message:
+                  lease.message ??
+                  "task.execute enqueue requires the request's active planning lease.",
+              },
+              409,
+            );
+          }
+          validLifecycleHandoff = true;
+        }
+        if (isAutonomyRequestPayload(body) && !validLifecycleHandoff) {
+          // A direct autonomy job is a new admission and must honor every
+          // server-side circuit. A valid handoff for an already-admitted,
+          // actively leased request must keep moving even if pressure rises
+          // while RemoteBuddy is planning it.
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse) return reservationResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse) return failureCircuitResponse;
           const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
           if (similarFailureResponse) return similarFailureResponse;
+          const publicationResponse = makeAutonomyPublicationBackpressureResponse();
+          if (publicationResponse) return publicationResponse;
         }
         const result = jobQueue.enqueue(body);
         return makeJson(result, result.ok ? 201 : 400);
@@ -1217,6 +1436,7 @@ export function createRequestHandler() {
           runtime: {
             startedAt: SERVER_STARTED_AT_ISO,
             uptimeMs: Math.max(0, Date.now() - SERVER_STARTED_AT_MS),
+            reconciliation: reconciliationTracker.snapshot(),
           },
           workers: {
             total: workers.length,
@@ -1274,6 +1494,17 @@ export function createRequestHandler() {
       }
 
       // GET /requests
+      const requestDetailMatch = pathname.match(/^\/requests\/([^/]+)$/);
+      if (requestDetailMatch && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const request = requestQueue.getRequest(requestDetailMatch[1]);
+        return request
+          ? makeJson({ ok: true, request }, 200)
+          : makeJson({ ok: false, message: "Request not found" }, 404);
+      }
+
       if (pathname === "/requests" && method === "GET") {
         const denied = requireAuth();
         if (denied) return denied;
@@ -1928,6 +2159,27 @@ export function createRequestHandler() {
         });
       }
 
+      // GET /completions/:id/status
+      // This narrow authority endpoint lets SourceControlManager reconcile a
+      // response lost after the processed transaction committed. Never make
+      // cleanup decisions from the bounded /completions list.
+      const completionStatusMatch = pathname.match(/^\/completions\/([^/]+)\/status$/);
+      if (completionStatusMatch && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        let completionId = completionStatusMatch[1];
+        try {
+          completionId = decodeURIComponent(completionId);
+        } catch {
+          return makeJson({ ok: false, message: "Invalid completion ID" }, 400);
+        }
+        const completion = completionQueue.getCompletionProcessingAuthority(completionId);
+        return completion
+          ? makeJson({ ok: true, completion })
+          : makeJson({ ok: false, message: "Completion not found" }, 404);
+      }
+
       // POST /jobs/:id/complete
       const jobCompleteMatch = pathname.match(/^\/jobs\/([^/]+)\/complete$/);
       if (jobCompleteMatch && method === "POST") {
@@ -2167,6 +2419,8 @@ export function createRequestHandler() {
           if (failureCircuitResponse) return failureCircuitResponse;
           const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
           if (similarFailureResponse) return similarFailureResponse;
+          const publicationResponse = makeAutonomyPublicationBackpressureResponse();
+          if (publicationResponse) return publicationResponse;
 
           const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
           const schedulableWorkers = workers.filter(
@@ -2264,25 +2518,31 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const agentId = (body.agentId as string) || "unknown";
-        let result = requestQueue.claim(agentId);
+        const agentId = compactText(body.agentId, 128);
+        if (!agentId) return makeJson({ ok: false, message: "agentId is required" }, 400);
+        const leaseMs = typeof body.leaseMs === "number" ? body.leaseMs : undefined;
+        let result = requestQueue.claim(agentId, { leaseMs });
         let skipped = 0;
         while (result.ok && result.request?.id && skipped < 64) {
           const budgetStatus = getSessionTokenBudgetStatus(result.request.sessionId);
           if (budgetStatus?.exceeded) {
             emitSessionBudgetPauseNotice(result.request.sessionId, budgetStatus);
             requestQueue.fail(result.request.id, {
+              agentId,
+              claimToken: result.request.claimToken,
               message: "Session token budget exceeded",
               detail: sessionTokenBudgetMessage(budgetStatus),
             });
             skipped += 1;
-            result = requestQueue.claim(agentId);
+            result = requestQueue.claim(agentId, { leaseMs });
             continue;
           }
           if (isAutonomyRequestPayload(result.request as unknown as Record<string, unknown>)) {
             const failureCircuit = autonomyFailureCircuitSummary();
             if (failureCircuit.blocked) {
               requestQueue.fail(result.request.id, {
+                agentId,
+                claimToken: result.request.claimToken,
                 message: autonomyFailureCircuitMessage(failureCircuit),
                 detail: JSON.stringify({
                   code: "autonomy_worker_failure_circuit_open",
@@ -2290,7 +2550,7 @@ export function createRequestHandler() {
                 }),
               });
               skipped += 1;
-              result = requestQueue.claim(agentId);
+              result = requestQueue.claim(agentId, { leaseMs });
               continue;
             }
             const similarFailure = autonomySimilarFailureSummary(
@@ -2298,6 +2558,8 @@ export function createRequestHandler() {
             );
             if (similarFailure.blocked) {
               requestQueue.fail(result.request.id, {
+                agentId,
+                claimToken: result.request.claimToken,
                 message:
                   `Autonomy request suppressed after ` +
                   `${similarFailure.recentSimilarFailureCount} unchanged target-and-failure fingerprint occurrence(s).`,
@@ -2307,13 +2569,77 @@ export function createRequestHandler() {
                 }),
               });
               skipped += 1;
-              result = requestQueue.claim(agentId);
+              result = requestQueue.claim(agentId, { leaseMs });
               continue;
             }
           }
           break;
         }
         return makeJson(result, result.ok ? 200 : 404);
+      }
+
+      // POST /requests/:id/lease/renew
+      const reqLeaseRenewMatch = pathname.match(/^\/requests\/([^/]+)\/lease\/renew$/);
+      if (reqLeaseRenewMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const requestId = reqLeaseRenewMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = requestQueue.renewLease(
+          requestId,
+          compactText(body.agentId, 128),
+          compactText(body.claimToken, 256),
+          {
+            leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
+          },
+        );
+        return makeJson(result, result.ok ? 200 : 409);
+      }
+
+      // POST /requests/:id/worker-handoff
+      // This transition makes the worker requirement durable before the request
+      // can be completed. The completion callback is not trusted to define it.
+      const reqWorkerHandoffMatch = pathname.match(/^\/requests\/([^/]+)\/worker-handoff$/);
+      if (reqWorkerHandoffMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const requestId = reqWorkerHandoffMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const request = requestQueue.getRequest(requestId);
+        const handoffJobId = compactText(body.jobId, 128);
+        const handoffJob = handoffJobId ? jobQueue.getJob(handoffJobId) : null;
+        const handoffParams = parseJsonRecord(handoffJob?.params ?? "");
+        const linkedRequestId = compactText(handoffParams.requestId, 128);
+        if (
+          !request ||
+          request.status !== "claimed" ||
+          !handoffJob ||
+          handoffJob.kind !== "task.execute" ||
+          handoffJob.sessionId !== request.sessionId ||
+          linkedRequestId !== requestId
+        ) {
+          return makeJson(
+            {
+              ok: false,
+              code: "worker_handoff_invalid",
+              message:
+                "Worker handoff must reference this claimed request's durable task.execute job.",
+            },
+            409,
+          );
+        }
+        const result = requestQueue.recordWorkerHandoff(
+          requestId,
+          handoffJobId,
+          compactText(body.agentId, 128),
+          compactText(body.claimToken, 256),
+        );
+        if (result.ok) {
+          autonomyStore.linkJobToObjectiveByRequest(requestId, handoffJobId);
+        }
+        return makeJson(result, result.ok ? 200 : 409);
       }
 
       // POST /requests/:id/complete
@@ -2324,13 +2650,94 @@ export function createRequestHandler() {
 
         const requestId = reqCompleteMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const requestAgentId = compactText(body.agentId, 128);
+        const requestClaimToken = compactText(body.claimToken, 256);
+        const storedRequest = requestQueue.getRequest(requestId);
+        if (storedRequest?.status === "completed") {
+          const replay = requestQueue.complete(requestId, body);
+          return makeJson(replay, replay.ok ? 200 : 409);
+        }
+        const lease = requestQueue.validateActiveLease(
+          requestId,
+          requestAgentId,
+          requestClaimToken,
+        );
+        if (!lease.ok) {
+          return makeJson(
+            {
+              ok: false,
+              code: "request_lease_invalid",
+              message: lease.message ?? "Request completion requires the active owner lease.",
+            },
+            409,
+          );
+        }
+        const resultPayload =
+          body.result && typeof body.result === "object" && !Array.isArray(body.result)
+            ? (body.result as Record<string, unknown>)
+            : null;
+        const payloadClaimsWorker = resultPayload?.requiresWorker === true;
+        const wasDelegatedToWorker = Boolean(
+          storedRequest && (storedRequest.forceWorker === 1 || storedRequest.workerRequired === 1),
+        );
+        if (payloadClaimsWorker && !wasDelegatedToWorker) {
+          requestQueue.fail(requestId, {
+            agentId: requestAgentId,
+            claimToken: requestClaimToken,
+            message: "WorkerPal handoff was not recorded",
+            detail:
+              "RemoteBuddy claimed worker delegation in its completion payload without first recording the durable worker handoff.",
+          });
+          autonomyStore.markObjectiveHandoffFailed(
+            requestId,
+            "worker_handoff_not_recorded_before_request_completion",
+          );
+          return makeJson(
+            {
+              ok: false,
+              code: "worker_handoff_not_recorded",
+              message: "Worker delegation must be recorded before request completion.",
+            },
+            409,
+          );
+        }
+        if (wasDelegatedToWorker) {
+          const handoffJobId = compactText(storedRequest?.handoffJobId, 128);
+          const handoffJob = handoffJobId ? jobQueue.getJob(handoffJobId) : null;
+          const handoffParams = parseJsonRecord(handoffJob?.params ?? "");
+          const linkedRequestId = compactText(handoffParams.requestId, 128);
+          const payloadJobId = compactText(resultPayload?.jobId, 128);
+          if (
+            !handoffJobId ||
+            !handoffJob ||
+            linkedRequestId !== requestId ||
+            (payloadJobId && payloadJobId !== handoffJobId)
+          ) {
+            requestQueue.fail(requestId, {
+              agentId: requestAgentId,
+              claimToken: requestClaimToken,
+              message: "WorkerPal handoff missing",
+              detail:
+                "A request cannot complete with requiresWorker=true until its task.execute job is durably created and linked.",
+            });
+            autonomyStore.markObjectiveHandoffFailed(
+              requestId,
+              "worker_handoff_missing_before_request_completion",
+            );
+            return makeJson(
+              {
+                ok: false,
+                code: "worker_handoff_missing",
+                message:
+                  "Worker-required request was failed because no matching durable job handoff exists.",
+              },
+              409,
+            );
+          }
+          autonomyStore.linkJobToObjectiveByRequest(requestId, handoffJobId);
+        }
         const result = requestQueue.complete(requestId, body);
         if (result.ok) {
-          const resultPayload =
-            body.result && typeof body.result === "object" && !Array.isArray(body.result)
-              ? (body.result as Record<string, unknown>)
-              : null;
-          const wasDelegatedToWorker = Boolean(resultPayload?.requiresWorker);
           const matched = autonomyStore.findObjectiveByRequestId(requestId);
           if (matched && !wasDelegatedToWorker) {
             autonomyStore.recordOutcome({
@@ -2355,6 +2762,27 @@ export function createRequestHandler() {
 
         const requestId = reqFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const requestAgentId = compactText(body.agentId, 128);
+        const storedRequest = requestQueue.getRequest(requestId);
+        if (storedRequest?.status === "failed") {
+          const replay = requestQueue.fail(requestId, body);
+          return makeJson(replay, replay.ok ? 200 : 409);
+        }
+        const lease = requestQueue.validateActiveLease(
+          requestId,
+          requestAgentId,
+          compactText(body.claimToken, 256),
+        );
+        if (!lease.ok) {
+          return makeJson(
+            {
+              ok: false,
+              code: "request_lease_invalid",
+              message: lease.message ?? "Request failure requires the active owner lease.",
+            },
+            409,
+          );
+        }
         const result = requestQueue.fail(requestId, body);
         if (result.ok) {
           const matched = autonomyStore.findObjectiveByRequestId(requestId);
@@ -2400,10 +2828,10 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const pusherId = (body.pusherId as string) || "unknown";
+        const pusherId = compactText(body.pusherId, 128);
+        if (!pusherId) return makeJson({ ok: false, message: "pusherId is required" }, 400);
         const result = completionQueue.claim(pusherId, {
           leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
-          reconcilePusher: body.reconcilePusher === true,
         });
         return makeJson(result, result.ok ? 200 : 404);
       }
@@ -2417,7 +2845,9 @@ export function createRequestHandler() {
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const pusherId = typeof body.pusherId === "string" ? body.pusherId.trim() : "";
         if (!pusherId) return makeJson({ ok: false, message: "pusherId is required" }, 400);
-        const result = completionQueue.renewLease(compLeaseMatch[1], pusherId, {
+        const claimToken = compactText(body.claimToken, 256);
+        if (!claimToken) return makeJson({ ok: false, message: "claimToken is required" }, 400);
+        const result = completionQueue.renewLease(compLeaseMatch[1], pusherId, claimToken, {
           leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
         });
         return makeJson(result, result.ok ? 200 : 409);
@@ -2431,6 +2861,10 @@ export function createRequestHandler() {
 
         const completionId = compProcMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const pusherId = compactText(body.pusherId, 128);
+        const claimToken = compactText(body.claimToken, 256);
+        if (!pusherId) return makeJson({ ok: false, message: "pusherId is required" }, 400);
+        if (!claimToken) return makeJson({ ok: false, message: "claimToken is required" }, 400);
         const prUrl = typeof body.prUrl === "string" ? body.prUrl : null;
         const trustedInstallDurationMs =
           typeof body.trustedInstallDurationMs === "number" ? body.trustedInstallDurationMs : null;
@@ -2451,7 +2885,8 @@ export function createRequestHandler() {
             installCacheHit: trustedValidationCacheHit,
           },
           body.trustedValidationReport,
-          typeof body.pusherId === "string" ? body.pusherId : null,
+          pusherId,
+          claimToken,
         );
         if (result.ok && (result.requeuedJobIds?.length ?? 0) > 0) {
           console.log(
@@ -2510,6 +2945,10 @@ export function createRequestHandler() {
 
         const completionId = compFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const pusherId = compactText(body.pusherId, 128);
+        const claimToken = compactText(body.claimToken, 256);
+        if (!pusherId) return makeJson({ ok: false, message: "pusherId is required" }, 400);
+        if (!claimToken) return makeJson({ ok: false, message: "claimToken is required" }, 400);
         const error = (body.error as string) ?? "Unknown error";
         const result = completionQueue.markFailedAndBlockJob(
           completionId,
@@ -2529,7 +2968,8 @@ export function createRequestHandler() {
                 : null,
           },
           body.trustedValidationReport,
-          typeof body.pusherId === "string" ? body.pusherId : null,
+          pusherId,
+          claimToken,
         );
         if (result.ok && result.jobTransitioned && result.jobId) {
           const job = jobQueue.getJob(result.jobId);

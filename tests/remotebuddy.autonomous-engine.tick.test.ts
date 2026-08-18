@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
   autonomyIntegrationBaselineDecision,
   RemoteBuddyAutonomousEngine,
+  resolveAutonomyGitCommandTimeoutMs,
 } from "../apps/remotebuddy/src/autonomous_engine";
 
 type FetchCall = {
@@ -18,6 +19,76 @@ let originalFetch: typeof globalThis.fetch;
 let originalSpawn: typeof Bun.spawn;
 
 describe("autonomy integration baseline", () => {
+  test("gives network Git a longer deadline than local worktree inspection", () => {
+    expect(resolveAutonomyGitCommandTimeoutMs(["status", "--porcelain"])).toBe(30_000);
+    expect(resolveAutonomyGitCommandTimeoutMs(["fetch", "origin", "main"])).toBe(120_000);
+  });
+
+  test("terminates and returns from a stalled autonomy Git command", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-git-deadline-"));
+    tempDirs.push(root);
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_git_deadline",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    let resolveExit: (code: number) => void = () => undefined;
+    let stdoutController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let stderrController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let finished = false;
+    const finishTarget = () => {
+      if (finished) return;
+      finished = true;
+      stdoutController?.close();
+      stderrController?.close();
+      resolveExit(137);
+    };
+    const target = {
+      pid: 2_147_480_000,
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) {
+          stdoutController = controller;
+        },
+      }),
+      stderr: new ReadableStream<Uint8Array>({
+        start(controller) {
+          stderrController = controller;
+        },
+      }),
+      exited: new Promise<number>((resolve) => {
+        resolveExit = resolve;
+      }),
+      kill: finishTarget,
+    };
+    originalSpawn = Bun.spawn;
+    (Bun as any).spawn = (cmd: string[]) => {
+      if (cmd[0] === "git") return target;
+      if (cmd[0] === "taskkill") {
+        finishTarget();
+        return {
+          pid: 2_147_480_001,
+          stdout: null,
+          stderr: null,
+          exited: Promise.resolve(0),
+          kill() {},
+        };
+      }
+      return originalSpawn(cmd as any);
+    };
+    const startedAt = Date.now();
+
+    const result = await (engine as any).runGit(root, ["status", "--porcelain"], 20);
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(124);
+    expect(result.stderr).toContain("timed out after 20ms");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   test("keeps integration context both when it contains main and while SCM reconciles divergence", () => {
     expect(
       autonomyIntegrationBaselineDecision({
@@ -280,6 +351,36 @@ afterEach(() => {
 });
 
 describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
+  test("bounds a control-plane response body that never finishes", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-http-deadline-"));
+    tempDirs.push(root);
+    globalThis.fetch = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            // The endpoint sent headers but never completed its response body.
+          },
+        }),
+        { status: 200 },
+      )) as typeof globalThis.fetch;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_http_deadline",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+
+    const startedAt = Date.now();
+    await expect(
+      (engine as any).fetchControl("http://localhost:3001/autonomy/snapshot", {}, 20),
+    ).rejects.toThrow("RemoteBuddy autonomy control request timed out after 20ms");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   test("similar-failure enqueue suppression cools only the failed target cluster", async () => {
     originalFetch = globalThis.fetch;
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-backoff-"));
@@ -593,6 +694,13 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         target_path_hints: ["scripts/test-web-e2e.js"],
         failed_tests: ["route shell > renders account navigation without startup failure"],
         failure_fingerprint: "fp_web_e2e",
+        baseline_sha: "b".repeat(40),
+        candidate_sha: "c".repeat(40),
+        candidate_ref: "refs/pushpals/review/pr-626",
+        candidate_shas: ["c".repeat(40)],
+        validation_scope: "candidate_specific" as const,
+        evidence_quality: "high" as const,
+        failure_lines: ["FAIL scripts/test-web-e2e.js > route shell teardown"],
         source: "trusted_host" as const,
         cross_job_circuit_open: true,
       },
@@ -703,7 +811,14 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(JSON.stringify(enqueueCall?.body ?? {})).toContain(
       "route shell > renders account navigation without startup failure",
     );
-    expect(JSON.stringify(enqueueCall?.body ?? {})).toContain("cross-job publication circuit");
+    expect(JSON.stringify(enqueueCall?.body ?? {})).toContain(
+      "same deterministic publication failure",
+    );
+    expect(JSON.stringify(enqueueCall?.body ?? {})).toContain("c".repeat(40));
+    expect(
+      ((enqueueCall?.body as Record<string, any>)?.metadata?.autonomy?.validationIncident ?? {})
+        .candidateSha,
+    ).toBe("c".repeat(40));
     const eligibilityCall = calls.find((entry) => entry.url.endsWith("/autonomy/eligibility"));
     const eligibilityCandidates = ((eligibilityCall?.body as Record<string, unknown> | undefined)
       ?.candidates ?? []) as Array<Record<string, unknown>>;
@@ -720,6 +835,365 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(objective.target_paths).toEqual(["scripts/test-web-e2e.js"]);
     expect(objective.expected_validation).toEqual(["bun run web:e2e", "bun test"]);
     expect(objective.required_validation_repair).toBe(true);
+    expect(objective.incident_key).toBe("valid_inc_web_e2e");
+  });
+
+  test("repair circuit counts only executed same-fingerprint failures and continues ideation", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-validation-circuit-"));
+    tempDirs.push(root);
+    const targetPath = join(root, "tests", "account.test.ts");
+    mkdirSync(join(targetPath, ".."), { recursive: true });
+    writeFileSync(targetPath, "// validation target\n", "utf8");
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_validation_circuit",
+      authToken: "tok",
+      repo: root,
+      llm: { async generate() {} } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const incident = {
+      active: true,
+      incident_id: "valid_inc_account_stable",
+      command: "bun test tests/account.test.ts",
+      signal_type: "test_failure",
+      failure_class: "test_failure",
+      failure_count: 4,
+      total_runs: 4,
+      failed_job_ids: ["job_a", "job_b"],
+      last_failed_job_id: "job_b",
+      first_failed_at: "2026-08-17T01:00:00.000Z",
+      last_failed_at: "2026-08-17T01:05:00.000Z",
+      digest: "account_stable",
+      sample_error: "(fail) account state remains stale",
+      required_commands: ["bun test tests/account.test.ts"],
+      target_path_hints: ["tests/account.test.ts"],
+      failed_tests: ["account state remains stale"],
+      failure_fingerprint: "fp_account_stable",
+      candidate_sha: "c".repeat(40),
+      candidate_shas: ["c".repeat(40)],
+      validation_scope: "candidate_specific" as const,
+      baseline_failure_proven: false,
+      evidence_quality: "high" as const,
+      failure_lines: ["(fail) account state remains stale"],
+      source: "trusted_host" as const,
+      cross_job_circuit_open: true,
+    };
+    const snapshot = {
+      ...makeSnapshot(),
+      validation_incident: incident,
+      recent_objectives: [
+        {
+          objective_id: "obj_never_executed",
+          pattern_key: "pk_validation",
+          incident_key: incident.incident_id,
+          status: "failed",
+        },
+        {
+          objective_id: "obj_rejected",
+          pattern_key: "pk_validation",
+          incident_key: incident.incident_id,
+          job_id: "job_rejected",
+          status: "rejected",
+        },
+        {
+          objective_id: "obj_executed_a",
+          pattern_key: "pk_validation",
+          incident_key: incident.incident_id,
+          job_id: "job_repair_a",
+          attempt_outcome: "validation_blocked",
+          deterministic_repair_failure: true,
+          attempt_failure_fingerprint: "fp_account_stable",
+          status: "failed",
+        },
+        {
+          objective_id: "obj_executed_b",
+          pattern_key: "pk_validation",
+          incident_key: incident.incident_id,
+          job_id: "job_repair_b",
+          attempt_outcome: "quality_rejected",
+          deterministic_repair_failure: true,
+          attempt_failure_fingerprint: "fp_account_stable",
+          status: "dead_letter",
+        },
+      ],
+    };
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error("circuit-open repair must not call eligibility or enqueue");
+    }) as typeof globalThis.fetch;
+
+    const outcome = await (engine as any).dispatchValidationIncidentRepair({
+      runId: "run_validation_circuit",
+      snapshot,
+      repoTargets: [],
+      visionSectionRefs: ["1"],
+    });
+
+    expect(outcome).toEqual({
+      handled: false,
+      outcome: "skipped",
+      detail: "validation_repair_circuit_open_continue_ideation",
+    });
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("two different deterministic repair failures do not open the incident circuit", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-validation-changed-failure-"));
+    tempDirs.push(root);
+    mkdirSync(join(root, "tests"), { recursive: true });
+    writeFileSync(join(root, "tests", "account.test.ts"), "// target\n", "utf8");
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_validation_changed_failure",
+      authToken: "tok",
+      repo: root,
+      llm: { async generate() {} } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const incident = {
+      active: true,
+      incident_id: "valid_inc_account_changed_failure",
+      command: "bun test tests/account.test.ts",
+      signal_type: "test_failure",
+      failure_class: "test_failure",
+      failure_count: 2,
+      total_runs: 2,
+      failed_job_ids: ["job_a", "job_b"],
+      last_failed_job_id: "job_b",
+      first_failed_at: "2026-08-17T01:00:00.000Z",
+      last_failed_at: "2026-08-17T01:05:00.000Z",
+      digest: "account_changed_failure",
+      sample_error: "(fail) account state remains stale",
+      required_commands: ["bun test tests/account.test.ts"],
+      target_path_hints: ["tests/account.test.ts"],
+      failed_tests: ["account state remains stale"],
+      failure_fingerprint: "fp_account_current",
+      candidate_sha: "c".repeat(40),
+      candidate_shas: ["c".repeat(40)],
+      validation_scope: "candidate_specific" as const,
+      baseline_failure_proven: false,
+      evidence_quality: "high" as const,
+      failure_lines: ["(fail) account state remains stale"],
+      source: "trusted_host" as const,
+      cross_job_circuit_open: true,
+    };
+    const snapshot = {
+      ...makeSnapshot(),
+      validation_incident: incident,
+      recent_objectives: [
+        {
+          objective_id: "obj_different_a",
+          pattern_key: "pk_validation",
+          incident_key: incident.incident_id,
+          job_id: "job_different_a",
+          attempt_outcome: "validation_blocked",
+          deterministic_repair_failure: true,
+          attempt_failure_fingerprint: "fp_different_a",
+          status: "failed",
+        },
+        {
+          objective_id: "obj_different_b",
+          pattern_key: "pk_validation",
+          incident_key: incident.incident_id,
+          job_id: "job_different_b",
+          attempt_outcome: "quality_rejected",
+          deterministic_repair_failure: true,
+          attempt_failure_fingerprint: "fp_different_b",
+          status: "dead_letter",
+        },
+      ],
+    };
+    let eligibilityCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+      if (url.endsWith("/autonomy/eligibility")) {
+        eligibilityCalls += 1;
+        const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+        return jsonResponse(200, {
+          ok: true,
+          results: candidates.map((candidate: Record<string, unknown>) => ({
+            candidate_id: candidate.id,
+            ok: false,
+            reason: "changed_failure_test_gate",
+          })),
+        });
+      }
+      if (url.endsWith("/autonomy/objectives")) return jsonResponse(201, { ok: true });
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const outcome = await (engine as any).dispatchValidationIncidentRepair({
+      runId: "run_validation_changed_failure",
+      snapshot,
+      repoTargets: [],
+      visionSectionRefs: ["1"],
+    });
+
+    expect(eligibilityCalls).toBe(1);
+    expect(outcome.handled).toBe(true);
+    expect(outcome.detail).toContain("validation_repair_not_eligible");
+    expect(outcome.detail).not.toContain("circuit_open");
+  });
+
+  test("candidate-specific repairs preserve a failing file added only by the candidate", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-candidate-only-path-"));
+    tempDirs.push(root);
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_candidate_only_path",
+      authToken: "tok",
+      repo: root,
+      llm: { async generate() {} } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const candidateOnlyPath = "src/new-candidate-only.test.ts";
+    const snapshot = {
+      ...makeSnapshot(),
+      validation_incident: {
+        active: true,
+        incident_id: "valid_inc_candidate_only_path",
+        command: `bun test ${candidateOnlyPath}`,
+        signal_type: "test_failure",
+        failure_class: "test_failure",
+        failure_count: 2,
+        total_runs: 2,
+        failed_job_ids: ["job_a", "job_b"],
+        last_failed_job_id: "job_b",
+        first_failed_at: "2026-08-17T01:00:00.000Z",
+        last_failed_at: "2026-08-17T01:05:00.000Z",
+        digest: "candidate_only_path",
+        sample_error: `(fail) ${candidateOnlyPath} remains broken`,
+        required_commands: [`bun test ${candidateOnlyPath}`],
+        target_path_hints: [candidateOnlyPath],
+        failed_tests: ["candidate-only file remains broken"],
+        failure_fingerprint: "fp_candidate_only_path",
+        candidate_sha: "c".repeat(40),
+        candidate_shas: ["c".repeat(40)],
+        validation_scope: "candidate_specific" as const,
+        baseline_failure_proven: false,
+        evidence_quality: "high" as const,
+        failure_lines: [`(fail) ${candidateOnlyPath} remains broken`],
+        source: "trusted_host" as const,
+        cross_job_circuit_open: true,
+      },
+    };
+    let eligibilityCandidates: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+      if (url.endsWith("/autonomy/eligibility")) {
+        eligibilityCandidates = Array.isArray(body.candidates) ? body.candidates : [];
+        return jsonResponse(200, {
+          ok: true,
+          results: eligibilityCandidates.map((candidate) => ({
+            candidate_id: candidate.id,
+            ok: false,
+            reason: "candidate_path_test_gate",
+          })),
+        });
+      }
+      if (url.endsWith("/autonomy/objectives")) return jsonResponse(201, { ok: true });
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    await (engine as any).dispatchValidationIncidentRepair({
+      runId: "run_candidate_only_path",
+      snapshot,
+      repoTargets: [],
+      visionSectionRefs: ["1"],
+    });
+
+    expect(existsSync(join(root, candidateOnlyPath))).toBe(false);
+    expect(eligibilityCandidates[0]?.target_paths).toEqual([candidateOnlyPath]);
+  });
+
+  test("an active exact-incident repair leaves the tick free to ideate elsewhere", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-validation-active-"));
+    tempDirs.push(root);
+    mkdirSync(join(root, "tests"), { recursive: true });
+    writeFileSync(join(root, "tests", "account.test.ts"), "// target\n", "utf8");
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_validation_active",
+      authToken: "tok",
+      repo: root,
+      llm: { async generate() {} } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const incident = {
+      active: true,
+      incident_id: "valid_inc_account_active",
+      command: "bun test tests/account.test.ts",
+      signal_type: "test_failure",
+      failure_class: "test_failure",
+      failure_count: 2,
+      total_runs: 2,
+      failed_job_ids: ["job_a", "job_b"],
+      last_failed_job_id: "job_b",
+      first_failed_at: "2026-08-17T01:00:00.000Z",
+      last_failed_at: "2026-08-17T01:05:00.000Z",
+      digest: "account_active",
+      sample_error: "(fail) account state remains stale",
+      required_commands: ["bun test tests/account.test.ts"],
+      target_path_hints: ["tests/account.test.ts"],
+      failed_tests: ["account state remains stale"],
+      failure_fingerprint: "fp_account_active",
+      candidate_sha: "c".repeat(40),
+      candidate_shas: ["c".repeat(40)],
+      validation_scope: "candidate_specific" as const,
+      baseline_failure_proven: false,
+      evidence_quality: "high" as const,
+      failure_lines: ["(fail) account state remains stale"],
+      source: "trusted_host" as const,
+      cross_job_circuit_open: true,
+    };
+    const snapshot = {
+      ...makeSnapshot(),
+      validation_incident: incident,
+      open_objectives: [
+        {
+          objective_id: "obj_active_repair",
+          status: "running",
+          objective_type: "flaky_test",
+          pattern_key: "pk_validation_active",
+          incident_key: incident.incident_id,
+          job_id: "job_active_repair",
+          updated_at: "2026-08-17T01:06:00.000Z",
+        },
+      ],
+    };
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error("active repair path must not enqueue a duplicate");
+    }) as typeof globalThis.fetch;
+
+    expect(
+      await (engine as any).dispatchValidationIncidentRepair({
+        runId: "run_validation_active",
+        snapshot,
+        repoTargets: [],
+        visionSectionRefs: ["1"],
+      }),
+    ).toEqual({
+      handled: false,
+      outcome: "skipped",
+      detail: "validation_repair_already_active_continue_ideation",
+    });
+    expect(fetchCalls).toBe(0);
   });
 
   test("validation repair ignores trusted-environment incidents from older server snapshots", async () => {

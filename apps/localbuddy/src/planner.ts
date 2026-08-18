@@ -8,7 +8,7 @@
 
 // Interfaces
 
-import { loadPromptTemplate, loadPushPalsConfig } from "shared";
+import { fetchBufferedWithHardDeadline, loadPromptTemplate, loadPushPalsConfig } from "shared";
 
 export interface PlannerInput {
   userText: string;
@@ -336,12 +336,14 @@ export class RemotePlanner implements PlannerModel {
   private endpoint: string;
   private apiKey: string | null;
   private model: string;
+  private timeoutMs: number;
 
   constructor(
     opts: {
       endpoint?: string;
       apiKey?: string;
       model?: string;
+      timeoutMs?: number;
     } = {},
   ) {
     const llmCfg = CONFIG.localbuddy.llm;
@@ -355,6 +357,7 @@ export class RemotePlanner implements PlannerModel {
         : configuredEndpoint;
     this.apiKey = opts.apiKey ?? llmCfg.apiKey ?? null;
     this.model = opts.model ?? llmCfg.model ?? "local-model";
+    this.timeoutMs = Math.max(1, Math.floor(opts.timeoutMs ?? llmCfg.codexTimeoutMs));
   }
 
   async plan(input: PlannerInput): Promise<PlannerOutput> {
@@ -390,10 +393,16 @@ export class RemotePlanner implements PlannerModel {
         body.format = "json";
       }
 
-      const response = await fetch(this.endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
+      const response = await fetchBufferedWithHardDeadline({
+        input: this.endpoint,
+        init: {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        },
+        timeoutMs: this.timeoutMs,
+        maxResponseBytes: 16 * 1024 * 1024,
+        timeoutMessage: `RemotePlanner request timed out after ${this.timeoutMs}ms`,
       });
 
       if (!response.ok) {

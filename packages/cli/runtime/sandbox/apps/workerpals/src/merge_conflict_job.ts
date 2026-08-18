@@ -1,4 +1,5 @@
 import { basename, dirname, resolve } from "path";
+import { runBoundedProcess as runBoundedWorkerProcess } from "shared";
 
 type LogFn = (stream: "stdout" | "stderr", line: string) => void;
 
@@ -75,20 +76,20 @@ function isMergeConflictOutput(text: string): boolean {
 }
 
 async function git(cwd: string, args: string[]): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], {
+  const configuredTimeoutMs = Number(Bun.env.PUSHPALS_WORKERPAL_GIT_COMMAND_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+      ? Math.max(1_000, Math.min(30 * 60_000, Math.floor(configuredTimeoutMs)))
+      : 120_000;
+  const result = await runBoundedWorkerProcess(["git", ...args], {
     cwd,
-    stdout: "pipe",
-    stderr: "pipe",
+    timeoutMs,
+    outputLimitBytes: 4 * 1024 * 1024,
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
   return {
-    ok: exitCode === 0,
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
+    ok: !result.timedOut && !result.drainTimedOut && result.exitCode === 0,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
   };
 }
 

@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, delimiter, isAbsolute, join, resolve } from "path";
+import {
+  fetchBufferedWithHardDeadline,
+  type FetchLike,
+} from "../../../packages/shared/src/bounded_fetch.js";
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import {
   addPullRequestComment,
@@ -17,6 +21,7 @@ import {
   type PullRequestComment,
 } from "./github_pr";
 import type { ReviewAgentConfig as SourceControlManagerReviewAgentConfig } from "./config";
+import { runBoundedScmProcess } from "./bounded_process";
 
 export type ReviewAgentConfig = SourceControlManagerReviewAgentConfig;
 
@@ -38,7 +43,9 @@ interface ReviewAgentDeps {
   deleteBranchRef: typeof deleteBranchRef;
   addPullRequestComment: typeof addPullRequestComment;
   invokeCodexReview: (prompt: string, config: ReviewAgentConfig) => Promise<string>;
-  fetchImpl: typeof fetch;
+  fetchImpl: FetchLike;
+  httpTimeoutMs: number;
+  httpMaxResponseBytes: number;
   now: () => number;
   logInfo: (line: string) => void;
   logWarn: (line: string) => void;
@@ -63,6 +70,8 @@ const PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_
 const JOB_ID_MARKER = "pushpals-jobId";
 const SESSION_ID_MARKER = "pushpals-sessionId";
 const DEFAULT_WORKSPACE_ROOT = resolve(import.meta.dir, "..", "..", "..");
+const DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS = 5_000;
+const DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 const ts = () => new Date().toISOString();
 
@@ -78,11 +87,36 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   addPullRequestComment,
   invokeCodexReview,
   fetchImpl: fetch,
+  httpTimeoutMs: DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS,
+  httpMaxResponseBytes: DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES,
   now: () => Date.now(),
   logInfo: (line) => console.log(line),
   logWarn: (line) => console.warn(line),
   logError: (line) => console.error(line),
 };
+
+export function createBoundedReviewAgentFetch(
+  fetchImpl: FetchLike,
+  options: { timeoutMs?: number; maxResponseBytes?: number } = {},
+): FetchLike {
+  const timeoutMs =
+    typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)
+      ? Math.max(1, Math.floor(options.timeoutMs))
+      : DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS;
+  const maxResponseBytes =
+    typeof options.maxResponseBytes === "number" && Number.isFinite(options.maxResponseBytes)
+      ? Math.max(0, Math.floor(options.maxResponseBytes))
+      : DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES;
+  return (input, init) =>
+    fetchBufferedWithHardDeadline({
+      input,
+      init,
+      timeoutMs,
+      maxResponseBytes,
+      fetchImpl,
+      timeoutMessage: `ReviewAgent HTTP request timed out after ${timeoutMs}ms`,
+    });
+}
 
 function splitArgs(raw: string): string[] {
   const out: string[] = [];
@@ -240,33 +274,24 @@ async function invokeCodexReview(prompt: string, config: ReviewAgentConfig): Pro
   const codexCmd = resolveCodexCmd(config.codexBin);
   const args = buildCodexExecArgs(codexCmd, tmpFile);
 
-  const proc = Bun.spawn(args, {
-    stdin: new Blob([prompt]),
-    stdout: "ignore",
-    stderr: "pipe",
-    env: buildCodexEnv(config),
-  });
-
-  let timedOut = false;
-  const killTimer = setTimeout(() => {
-    timedOut = true;
-    proc.kill();
-  }, config.codexTimeoutMs);
-
   try {
-    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-
-    if (timedOut) {
+    const result = await runBoundedScmProcess(args, {
+      stdin: new Blob([prompt]),
+      stdout: "ignore",
+      stderr: "pipe",
+      env: buildCodexEnv(config),
+      timeoutMs: config.codexTimeoutMs,
+    });
+    if (result.timedOut) {
       throw new Error(`Codex review timed out after ${config.codexTimeoutMs}ms`);
     }
-    if (exitCode !== 0) {
-      const detail = stderr.trim().slice(0, 800);
-      throw new Error(`Codex review failed (exit ${exitCode}): ${detail || "no stderr"}`);
+    if (result.exitCode !== 0) {
+      const detail = result.stderr.trim().slice(0, 800);
+      throw new Error(`Codex review failed (exit ${result.exitCode}): ${detail || "no stderr"}`);
     }
 
     return (await Bun.file(tmpFile).text()).trim();
   } finally {
-    clearTimeout(killTimer);
     await Bun.file(tmpFile)
       .delete()
       .catch(() => {});
@@ -1199,7 +1224,14 @@ export class ReviewAgent {
     private authToken?: string,
     deps?: Partial<ReviewAgentDeps>,
   ) {
-    this.deps = { ...DEFAULT_DEPS, ...(deps ?? {}) };
+    const resolvedDeps = { ...DEFAULT_DEPS, ...(deps ?? {}) };
+    this.deps = {
+      ...resolvedDeps,
+      fetchImpl: createBoundedReviewAgentFetch(resolvedDeps.fetchImpl, {
+        timeoutMs: resolvedDeps.httpTimeoutMs,
+        maxResponseBytes: resolvedDeps.httpMaxResponseBytes,
+      }),
+    };
   }
 
   requestReReview(prNumber: number, sha: string): void {

@@ -9,15 +9,11 @@
 
 import { existsSync } from "fs";
 import { dirname, join, resolve } from "path";
+import { runBoundedProcess as runBoundedWorkerProcess } from "shared";
 import type { JobResult, JobTokenUsage } from "./types.js";
 import type { WorkerpalsRuntimeConfig } from "./executor_backend.js";
 import type { BackendTaskExecutor } from "../backends/types.js";
-import {
-  truncate,
-  parseStructuredResult,
-  filterResultLines,
-  streamLines,
-} from "./execution_utils.js";
+import { truncate, parseStructuredResult, filterResultLines } from "./execution_utils.js";
 import { buildWorkerSandboxWritableEnv } from "./sandbox_env.js";
 import {
   createPythonPayloadTransport,
@@ -292,7 +288,10 @@ export function normalizeGenericPythonExecutorParsedResultForTimeout(params: {
 
   const timeoutDetail = String(params.timeoutDetail ?? "").trim();
   const cleanedStderr = String(params.stderr ?? "")
-    .replace(/\bopenai_codex interrupted by signal 15\b/gi, "OpenAI Codex exceeded the execution budget")
+    .replace(
+      /\bopenai_codex interrupted by signal 15\b/gi,
+      "OpenAI Codex exceeded the execution budget",
+    )
     .trim();
   const stderr = [
     `OpenAI Codex exceeded the PushPals execution budget before returning a completed result.`,
@@ -345,7 +344,8 @@ export function createGenericPythonExecutor(
         ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
         : null;
     const finalizationBudgetMs =
-      typeof budgets?.finalizationBudgetMs === "number" && Number.isFinite(budgets.finalizationBudgetMs)
+      typeof budgets?.finalizationBudgetMs === "number" &&
+      Number.isFinite(budgets.finalizationBudgetMs)
         ? Math.max(0, Math.floor(budgets.finalizationBudgetMs))
         : null;
     const timeoutMs = resolveGenericPythonExecutorTimeoutMs({
@@ -405,37 +405,6 @@ export function createGenericPythonExecutor(
         maxOutputHeadLines: runtimeConfig.workerpals.outputMaxHeadLines,
         executorResultPrefix: runtimeConfig.workerpals.executorResultPrefix,
       };
-      const proc = Bun.spawn(args, {
-        cwd: repo,
-        stdout: "pipe",
-        stderr: "pipe",
-        env: {
-          ...buildWorkerSandboxWritableEnv(repo),
-          ...childTimeoutEnv,
-          PUSHPALS_REPO_PATH: repo,
-          PUSHPALS_ASSIGNED_REPO_ROOT: repo,
-          PYTHONIOENCODING: "utf-8",
-        },
-      });
-
-      let timedOut = false;
-      let hardKillTimer: ReturnType<typeof setTimeout> | null = null;
-      const timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        onLog?.(
-          "stdout",
-          `[${backendLabel}Executor] Timeout reached after ${timeoutMs}ms; terminating process.`,
-        );
-        proc.kill();
-        hardKillTimer = setTimeout(() => {
-          onLog?.(
-            "stdout",
-            `[${backendLabel}Executor] Process did not exit after graceful timeout termination; forcing kill.`,
-          );
-          proc.kill("SIGKILL");
-        }, 5_000);
-      }, timeoutMs);
-
       const progressIntervalMs = 15_000;
       const startedAt = Date.now();
       let sawProcessOutput = false;
@@ -458,19 +427,40 @@ export function createGenericPythonExecutor(
         }
         onLog?.(stream, line);
       };
+      let processResult: Awaited<ReturnType<typeof runBoundedWorkerProcess>>;
+      try {
+        processResult = await runBoundedWorkerProcess(args, {
+          cwd: repo,
+          env: {
+            ...buildWorkerSandboxWritableEnv(repo),
+            ...childTimeoutEnv,
+            PUSHPALS_REPO_PATH: repo,
+            PUSHPALS_ASSIGNED_REPO_ROOT: repo,
+            PYTHONIOENCODING: "utf-8",
+          },
+          timeoutMs,
+          outputLimitBytes: Math.max(
+            64 * 1024,
+            Math.min(4 * 1024 * 1024, runtimeConfig.workerpals.outputMaxChars),
+          ),
+          retainOutputTail: true,
+          onStdoutLine: (line) => onProcessLine("stdout", line),
+          onStderrLine: (line) => onProcessLine("stderr", line),
+          onTimeout: () => {
+            onLog?.(
+              "stdout",
+              `[${backendLabel}Executor] Timeout reached after ${timeoutMs}ms; terminating process tree.`,
+            );
+          },
+        });
+      } finally {
+        clearInterval(progressTimer);
+      }
 
-      const [rawStdout, rawStderr, exitCode] = await Promise.all([
-        proc.stdout ? streamLines(proc.stdout, "stdout", onProcessLine) : Promise.resolve(""),
-        proc.stderr ? streamLines(proc.stderr, "stderr", onProcessLine) : Promise.resolve(""),
-        proc.exited,
-      ]);
-
-      clearTimeout(timeoutTimer);
-      if (hardKillTimer) clearTimeout(hardKillTimer);
-      clearInterval(progressTimer);
-
-      const stdout = rawStdout ?? "";
-      const stderr = rawStderr ?? "";
+      const timedOut = processResult.timedOut;
+      const stdout = processResult.stdout;
+      const stderr = processResult.stderr;
+      const exitCode = processResult.exitCode;
 
       const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
       const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);

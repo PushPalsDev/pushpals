@@ -7,14 +7,10 @@
  */
 
 import { existsSync } from "fs";
+import { runBoundedProcess as runBoundedWorkerProcess } from "shared";
 import type { JobResult, JobTokenUsage } from "../common/types.js";
 import type { WorkerpalsRuntimeConfig } from "../common/executor_backend.js";
-import {
-  truncate,
-  streamLines,
-  parseStructuredResult,
-  filterResultLines,
-} from "../common/execution_utils.js";
+import { truncate, parseStructuredResult, filterResultLines } from "../common/execution_utils.js";
 import { buildWorkerSandboxWritableEnv } from "../common/sandbox_env.js";
 import {
   createPythonPayloadTransport,
@@ -279,7 +275,6 @@ export async function executeWithOpenHands(
   ).toString("base64");
 
   let warningTimer: ReturnType<typeof setTimeout> | null = null;
-  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   let stuckNudgeStartTimer: ReturnType<typeof setTimeout> | null = null;
   let stuckNudgeTimer: ReturnType<typeof setInterval> | null = null;
   let payloadTransport: PythonPayloadTransport | null = null;
@@ -292,17 +287,13 @@ export async function executeWithOpenHands(
 
   try {
     payloadTransport = createPythonPayloadTransport(payload);
-    const proc = Bun.spawn([pythonBin, scriptPath, ...payloadTransport.args], {
-      cwd: repo,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...buildWorkerSandboxWritableEnv(repo),
-        PUSHPALS_REPO_PATH: repo,
-        PUSHPALS_ASSIGNED_REPO_ROOT: repo,
-        PYTHONIOENCODING: "utf-8",
-      },
-    });
+    const processArgv = [pythonBin, scriptPath, ...payloadTransport.args];
+    const processEnv = {
+      ...buildWorkerSandboxWritableEnv(repo),
+      PUSHPALS_REPO_PATH: repo,
+      PUSHPALS_ASSIGNED_REPO_ROOT: repo,
+      PYTHONIOENCODING: "utf-8",
+    };
 
     let timedOut = false;
     const startedAtMs = Date.now();
@@ -473,65 +464,61 @@ export async function executeWithOpenHands(
       }, msUntilWarn);
     };
 
-    const resetTimeoutTimer = () => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-        timeoutTimer = null;
-      }
-      const msUntilTimeout = Math.max(1, timeoutDeadlineMs - Date.now());
-      timeoutTimer = setTimeout(() => {
+    resetWarningTimer();
+    const processResult = await runBoundedWorkerProcess(processArgv, {
+      cwd: repo,
+      env: processEnv,
+      timeoutMs,
+      maxTotalTimeoutMs: timeoutMs + activityExtensionMs,
+      outputLimitBytes: Math.max(
+        64 * 1024,
+        Math.min(4 * 1024 * 1024, runtimeConfig.workerpals.outputMaxChars),
+      ),
+      retainOutputTail: true,
+      onStdoutLine: (line) => onProcessLine("stdout", line),
+      onStderrLine: (line) => onProcessLine("stderr", line),
+      extendTimeoutMs: () => {
         const nowMs = Date.now();
         const quietForMs = nowMs - lastActivityAtMs;
         if (
-          extendedByActivityMs === 0 &&
-          activityExtensionMs > 0 &&
-          quietForMs <= activityWindowMs
+          extendedByActivityMs !== 0 ||
+          activityExtensionMs <= 0 ||
+          quietForMs > activityWindowMs
         ) {
-          extendedByActivityMs = activityExtensionMs;
-          timeoutDeadlineMs = nowMs + activityExtensionMs;
-          onLog?.(
-            "stdout",
-            `[OpenHandsExecutor] Extending timeout by ${activityExtensionMs}ms because the agent is still active (last output ${Math.round(
-              quietForMs / 1000,
-            )}s ago).`,
-          );
-          resetWarningTimer();
-          resetTimeoutTimer();
-          return;
+          return 0;
         }
-
+        extendedByActivityMs = activityExtensionMs;
+        timeoutDeadlineMs = nowMs + activityExtensionMs;
+        onLog?.(
+          "stdout",
+          `[OpenHandsExecutor] Extending timeout by ${activityExtensionMs}ms because the agent is still active (last output ${Math.round(
+            quietForMs / 1000,
+          )}s ago).`,
+        );
+        resetWarningTimer();
+        return activityExtensionMs;
+      },
+      onTimeout: (elapsedMs) => {
         timedOut = true;
-        timedOutAfterMs = Math.max(1, nowMs - startedAtMs);
+        timedOutAfterMs = Math.max(1, elapsedMs);
         onLog?.(
           "stdout",
           `[OpenHandsExecutor] Timeout reached for ${kind} after ${timedOutAfterMs}ms (effective limit: ${timeoutLimitSource}${
             extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
-          }); terminating wrapper process.`,
+          }); terminating wrapper process tree.`,
         );
         stopStuckNudges();
-        try {
-          proc.kill();
-        } catch (_e) {}
-      }, msUntilTimeout);
-    };
-
-    resetWarningTimer();
-    resetTimeoutTimer();
-
-    const [stdout, stderr] = await Promise.all([
-      streamLines(proc.stdout, "stdout", onProcessLine),
-      streamLines(proc.stderr, "stderr", onProcessLine),
-    ]);
+      },
+    });
+    timedOut = processResult.timedOut;
+    const stdout = processResult.stdout;
+    const stderr = processResult.stderr;
+    const exitCode = processResult.exitCode;
     if (warningTimer) {
       clearTimeout(warningTimer);
       warningTimer = null;
     }
-    if (timeoutTimer) {
-      clearTimeout(timeoutTimer);
-      timeoutTimer = null;
-    }
     stopStuckNudges();
-    const exitCode = await proc.exited;
 
     const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
     const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
@@ -623,9 +610,6 @@ export async function executeWithOpenHands(
   } finally {
     if (warningTimer) {
       clearTimeout(warningTimer);
-    }
-    if (timeoutTimer) {
-      clearTimeout(timeoutTimer);
     }
     if (stuckNudgeStartTimer) {
       clearTimeout(stuckNudgeStartTimer);

@@ -1,3 +1,5 @@
+import { fetchBufferedWithHardDeadline } from "../../../packages/shared/src/bounded_fetch.js";
+
 export interface PullRequestUpsertResult {
   created: boolean;
   number: number;
@@ -25,6 +27,25 @@ export interface EnsurePullRequestOptions {
 }
 
 type GitHubRepoRef = { owner: string; repo: string };
+
+const DEFAULT_GITHUB_API_TIMEOUT_MS = 30_000;
+
+function githubApiTimeoutMs(): number {
+  const configured = Number(process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.max(1_000, Math.floor(configured))
+    : DEFAULT_GITHUB_API_TIMEOUT_MS;
+}
+
+function githubFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const timeoutMs = githubApiTimeoutMs();
+  return fetchBufferedWithHardDeadline({
+    input,
+    init,
+    timeoutMs,
+    timeoutMessage: `GitHub API request timed out after ${timeoutMs}ms`,
+  });
+}
 
 function parseGitHubRepo(remoteUrl: string): GitHubRepoRef | null {
   const raw = (remoteUrl ?? "").trim();
@@ -71,7 +92,7 @@ export async function ensureIntegrationPullRequest(
   const headSpec = `${repo.owner}:${opts.headBranch}`;
 
   const listUrl = `${apiBase}/pulls?state=open&head=${encodeURIComponent(headSpec)}&base=${encodeURIComponent(opts.baseBranch)}`;
-  const listResponse = await fetch(listUrl, {
+  const listResponse = await githubFetch(listUrl, {
     method: "GET",
     headers: githubHeaders(opts.token),
   });
@@ -86,7 +107,7 @@ export async function ensureIntegrationPullRequest(
     return { created: false, number: existing.number, htmlUrl: existing.html_url };
   }
 
-  const createResponse = await fetch(`${apiBase}/pulls`, {
+  const createResponse = await githubFetch(`${apiBase}/pulls`, {
     method: "POST",
     headers: githubHeaders(opts.token),
     body: JSON.stringify({
@@ -105,7 +126,7 @@ export async function ensureIntegrationPullRequest(
 
   // Handle races where another process created the PR between list and create.
   if (createResponse.status === 422) {
-    const retryListResponse = await fetch(listUrl, {
+    const retryListResponse = await githubFetch(listUrl, {
       method: "GET",
       headers: githubHeaders(opts.token),
     });
@@ -139,7 +160,7 @@ export async function listOpenPullRequests(opts: {
   const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
   const url = `${apiBase}/pulls?state=open&base=${encodeURIComponent(opts.base)}&per_page=100`;
 
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "GET",
     headers: githubHeaders(opts.token),
   });
@@ -167,7 +188,7 @@ export async function getPullRequestDiff(opts: {
   }
 
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "GET",
     headers: {
       ...githubHeaders(opts.token),
@@ -194,7 +215,7 @@ export async function getCommitMessage(opts: {
   }
 
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/commits/${encodeURIComponent(opts.sha)}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "GET",
     headers: githubHeaders(opts.token),
   });
@@ -239,7 +260,7 @@ export async function getPullRequestCommitMessage(opts: {
 
   while (url && pages < 50) {
     pages += 1;
-    const response = await fetch(url, {
+    const response = await githubFetch(url, {
       method: "GET",
       headers: githubHeaders(opts.token),
     });
@@ -301,7 +322,7 @@ export async function mergePullRequest(opts: {
   if (opts.commitTitle) body.commit_title = opts.commitTitle;
   if (opts.commitMessage) body.commit_message = opts.commitMessage;
 
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "PUT",
     headers: githubHeaders(opts.token),
     body: JSON.stringify(body),
@@ -332,7 +353,7 @@ export async function closePullRequest(opts: {
   }
 
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "PATCH",
     headers: githubHeaders(opts.token),
     body: JSON.stringify({ state: "closed" }),
@@ -374,7 +395,7 @@ export async function deleteBranchRef(opts: {
   }
 
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/git/refs/heads/${encodeURIComponent(normalizedRef)}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "DELETE",
     headers: githubHeaders(opts.token),
   });
@@ -411,7 +432,7 @@ export async function listPullRequestComments(opts: {
   const requested = Number.isFinite(opts.maxComments) ? Math.trunc(opts.maxComments ?? 0) : 0;
   const perPage = Math.max(1, Math.min(100, requested > 0 ? requested : 20));
   const issueUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/issues/${opts.prNumber}/comments?sort=created&direction=desc&per_page=${perPage}`;
-  const issueResponse = await fetch(issueUrl, {
+  const issueResponse = await githubFetch(issueUrl, {
     method: "GET",
     headers: githubHeaders(opts.token),
   });
@@ -438,7 +459,7 @@ export async function listPullRequestComments(opts: {
     html_url?: unknown;
     user?: { login?: unknown } | null;
   }> = [];
-  const reviewResponse = await fetch(reviewUrl, {
+  const reviewResponse = await githubFetch(reviewUrl, {
     method: "GET",
     headers: githubHeaders(opts.token),
   });
@@ -487,7 +508,7 @@ export async function addPullRequestComment(opts: {
   }
 
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/issues/${opts.prNumber}/comments`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "POST",
     headers: githubHeaders(opts.token),
     body: JSON.stringify({ body: opts.body }),

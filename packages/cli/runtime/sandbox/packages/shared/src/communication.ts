@@ -1,4 +1,5 @@
 import type { EventEnvelope, EventType, EventTypePayloadMap } from "protocol";
+import { fetchBufferedWithHardDeadline } from "./bounded_fetch.js";
 
 type EventMeta = {
   from?: string;
@@ -54,6 +55,8 @@ export interface CommunicationManagerOptions {
   from: string;
   authToken?: string | null;
   fetchImpl?: typeof fetch;
+  /** Hard deadline for one server transport request. */
+  requestTimeoutMs?: number;
 }
 
 export class CommunicationManager {
@@ -62,6 +65,7 @@ export class CommunicationManager {
   private readonly from: string;
   private readonly authToken: string | null;
   private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number;
 
   constructor(opts: CommunicationManagerOptions) {
     this.serverUrl = opts.serverUrl;
@@ -69,6 +73,10 @@ export class CommunicationManager {
     this.from = opts.from;
     this.authToken = opts.authToken ?? null;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.requestTimeoutMs = Math.max(
+      1,
+      Math.min(120_000, Math.floor(opts.requestTimeoutMs ?? 10_000)),
+    );
   }
 
   private headers(): Record<string, string> {
@@ -124,10 +132,16 @@ export class CommunicationManager {
       if (meta.turnId) body.turnId = meta.turnId;
       if (meta.parentId) body.parentId = meta.parentId;
 
-      const response = await this.fetchImpl(this.commandUrl(sessionId), {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body),
+      const response = await fetchBufferedWithHardDeadline({
+        input: this.commandUrl(sessionId),
+        init: {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body),
+        },
+        timeoutMs: this.requestTimeoutMs,
+        fetchImpl: this.fetchImpl,
+        timeoutMessage: `session command timed out after ${this.requestTimeoutMs}ms`,
       });
       return response.ok;
     } catch {

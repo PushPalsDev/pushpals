@@ -5,11 +5,29 @@ import { join } from "path";
 import {
   buildWindowsProcessTreeTerminationArgv,
   hasFreshTrustedValidationInstall,
+  resolveTrustedValidationOutcome,
   resolveTrustedValidationArgv,
   runProcessWithTreeTimeout,
   runTrustedValidationCommands,
+  trustedValidationHealthPhase,
   trustedValidationInstallFingerprint,
+  type TrustedValidationProgressEvent,
 } from "../apps/source_control_manager/src/trusted_validation";
+import { createSourceControlManagerHealthTracker } from "../apps/source_control_manager/src/runtime_helpers";
+import { assertExactCleanValidationWorktree } from "../apps/source_control_manager/src/validation_worktree";
+
+function gitResult(repoPath: string, args: string[]) {
+  const result = Bun.spawnSync(["git", "-C", repoPath, ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return {
+    ok: result.exitCode === 0,
+    stdout: Buffer.from(result.stdout).toString("utf8").trim(),
+    stderr: Buffer.from(result.stderr).toString("utf8").trim(),
+    exitCode: result.exitCode,
+  };
+}
 
 describe("SourceControlManager trusted validation", () => {
   test("builds a forced Windows process-tree termination command", () => {
@@ -84,6 +102,101 @@ describe("SourceControlManager trusted validation", () => {
     ]);
     expect(results).toHaveLength(2);
     expect(results.every((result) => result.ok)).toBe(true);
+  });
+
+  test("keeps a healthy multi-command retry batch fresh with typed progress boundaries", async () => {
+    let now = Date.parse("2026-08-18T00:00:00.000Z");
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 17 * 60_000,
+      idleBacklogGraceMs: 30_000,
+      now: () => now,
+    });
+    const events: TrustedValidationProgressEvent[] = [];
+    const healthDuringAttempts: boolean[] = [];
+    let calls = 0;
+    tracker.beginTick("trusted_validation");
+
+    await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify([
+        "bun test tests/first.test.ts",
+        "bun test tests/second.test.ts",
+        "bun test tests/third.test.ts",
+      ]),
+      runner: async () => {
+        calls += 1;
+        now += 8 * 60_000;
+        healthDuringAttempts.push(tracker.snapshot().healthy);
+        return calls === 1
+          ? { ok: false, output: "TLS handshake timeout", exitCode: 124 }
+          : { ok: true, output: "passed", exitCode: 0 };
+      },
+      onProgress: (event) => {
+        events.push(event);
+        tracker.progress(trustedValidationHealthPhase(event), "completion-progress");
+      },
+    });
+
+    expect(calls).toBe(4);
+    expect(now).toBe(Date.parse("2026-08-18T00:00:00.000Z") + 32 * 60_000);
+    expect(healthDuringAttempts).toEqual([true, true, true, true]);
+    expect(events.map(({ boundary, phase, attempt }) => [boundary, phase, attempt])).toEqual([
+      ["start", "validation", 1],
+      ["complete", "validation", 1],
+      ["retry", "validation", 2],
+      ["start", "validation", 2],
+      ["complete", "validation", 2],
+      ["start", "validation", 1],
+      ["complete", "validation", 1],
+      ["start", "validation", 1],
+      ["complete", "validation", 1],
+    ]);
+    expect(tracker.snapshot()).toMatchObject({
+      healthy: true,
+      activeCompletionId: "completion-progress",
+      phase: "trusted_validation_validation_complete_attempt_1",
+    });
+  });
+
+  test("marks a validation command unhealthy when its runner stops making progress", async () => {
+    let now = Date.parse("2026-08-18T00:00:00.000Z");
+    let releaseRunner!: () => void;
+    const runnerGate = new Promise<void>((resolveGate) => {
+      releaseRunner = resolveGate;
+    });
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 17 * 60_000,
+      idleBacklogGraceMs: 30_000,
+      now: () => now,
+    });
+    tracker.beginTick("trusted_validation");
+
+    const validation = runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun test tests/stuck.test.ts"]),
+      runner: async () => {
+        await runnerGate;
+        return { ok: true, output: "passed", exitCode: 0 };
+      },
+      onProgress: (event) =>
+        tracker.progress(trustedValidationHealthPhase(event), "completion-stuck"),
+    });
+    await Promise.resolve();
+
+    now += 17 * 60_000;
+    expect(tracker.snapshot()).toMatchObject({
+      healthy: false,
+      activeCompletionId: "completion-stuck",
+      phase: "trusted_validation_validation_start_attempt_1",
+      reason: expect.stringContaining("tick_stalled"),
+    });
+
+    releaseRunner();
+    await validation;
+    expect(tracker.snapshot()).toMatchObject({
+      healthy: true,
+      phase: "trusted_validation_validation_complete_attempt_1",
+    });
   });
 
   test("resolves bun and bunx through the absolute embedded runtime without changing other tools", () => {
@@ -189,6 +302,128 @@ describe("SourceControlManager trusted validation", () => {
         failureClass: "test_failure",
       },
     ]);
+  });
+
+  test("retries a known transient validation failure exactly once and records the reason", async () => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun test tests/transient.test.ts"]),
+      runner: async () => {
+        calls += 1;
+        return calls === 1
+          ? { ok: false, output: "TLS handshake timeout", exitCode: 124 }
+          : { ok: true, output: "1 pass", exitCode: 0 };
+      },
+    });
+
+    expect(calls).toBe(2);
+    expect(results).toMatchObject([
+      {
+        ok: false,
+        attempt: 1,
+        failureClass: "timeout",
+        retryReason: "transient_infrastructure",
+      },
+      {
+        ok: true,
+        attempt: 2,
+        retryReason: "transient_infrastructure",
+      },
+    ]);
+    const outcome = resolveTrustedValidationOutcome(results);
+    expect(outcome.terminalResults).toEqual([results[1]]);
+    expect(outcome.terminalFailure).toBeNull();
+  });
+
+  test("keeps failed retry telemetry but blocks on the terminal attempt when retry also fails", () => {
+    const firstAttempt = {
+      ok: false,
+      command: "bun test tests/transient.test.ts",
+      output: "TLS handshake timeout",
+      exitCode: 124,
+      durationMs: 120,
+      phase: "validation" as const,
+      attempt: 1,
+      retryReason: "transient_infrastructure" as const,
+    };
+    const terminalAttempt = {
+      ...firstAttempt,
+      output: "connection reset",
+      durationMs: 80,
+      attempt: 2,
+    };
+
+    const outcome = resolveTrustedValidationOutcome([firstAttempt, terminalAttempt]);
+
+    expect(outcome.terminalResults).toEqual([terminalAttempt]);
+    expect(outcome.terminalFailure).toBe(terminalAttempt);
+  });
+
+  test("allows publication when dependency preparation recovers on its terminal retry", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-validation-retry-"));
+    try {
+      writeFileSync(join(repoPath, "package.json"), "{}");
+      writeFileSync(join(repoPath, "bun.lock"), "");
+      let calls = 0;
+      const progress: TrustedValidationProgressEvent[] = [];
+      const results = await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun test"]),
+        runner: async (argv) => {
+          calls += 1;
+          if (argv.includes("install") && calls === 1) {
+            return { ok: false, output: "connection reset", exitCode: 1 };
+          }
+          return { ok: true, output: "passed", exitCode: 0 };
+        },
+        onProgress: (event) => progress.push(event),
+      });
+
+      expect(results).toMatchObject([
+        {
+          command: "bun install --frozen-lockfile",
+          ok: false,
+          attempt: 1,
+          retryReason: "transient_infrastructure",
+        },
+        {
+          command: "bun install --frozen-lockfile",
+          ok: true,
+          attempt: 2,
+          retryReason: "transient_infrastructure",
+        },
+        { command: "bun test", ok: true },
+      ]);
+      expect(resolveTrustedValidationOutcome(results).terminalFailure).toBeNull();
+      expect(progress.map(({ boundary, phase, attempt }) => [boundary, phase, attempt])).toEqual([
+        ["start", "dependency_install", 1],
+        ["complete", "dependency_install", 1],
+        ["retry", "dependency_install", 2],
+        ["start", "dependency_install", 2],
+        ["complete", "dependency_install", 2],
+        ["start", "validation", 1],
+        ["complete", "validation", 1],
+      ]);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("does not retry deterministic validation failures", async () => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun test tests/deterministic.test.ts"]),
+      runner: async () => {
+        calls += 1;
+        return { ok: false, output: "expect(received).toBe(expected)", exitCode: 1 };
+      },
+    });
+
+    expect(calls).toBe(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ attempt: 1, failureClass: "test_failure" });
   });
 
   test("extracts stable Bun failed-test evidence for cross-job correlation", async () => {
@@ -305,6 +540,38 @@ describe("SourceControlManager trusted validation", () => {
       }),
     ).rejects.toThrow("Invalid trusted-validation handoff");
     expect(called).toBe(false);
+  });
+
+  test("refuses publication when a passing validation command mutates the candidate", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-validation-mutator-"));
+    try {
+      expect(gitResult(repoPath, ["init"]).ok).toBe(true);
+      expect(gitResult(repoPath, ["config", "user.email", "tests@pushpals.local"]).ok).toBe(true);
+      expect(gitResult(repoPath, ["config", "user.name", "PushPals Tests"]).ok).toBe(true);
+      writeFileSync(join(repoPath, "candidate.txt"), "immutable\n");
+      expect(gitResult(repoPath, ["add", "candidate.txt"]).ok).toBe(true);
+      expect(gitResult(repoPath, ["commit", "-m", "candidate"]).ok).toBe(true);
+      const candidateSha = gitResult(repoPath, ["rev-parse", "HEAD"]).stdout;
+
+      const results = await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun test"]),
+        runner: async () => {
+          writeFileSync(join(repoPath, "candidate.txt"), "mutated but command passed\n");
+          return { ok: true, output: "1 pass", exitCode: 0 };
+        },
+      });
+      expect(results.at(-1)?.ok).toBe(true);
+      await expect(
+        assertExactCleanValidationWorktree({
+          expectedSha: candidateSha,
+          phase: "after trusted validation",
+          git: async (args) => gitResult(repoPath, args),
+        }),
+      ).rejects.toThrow("mutated the candidate worktree");
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
   });
 
   test.each([

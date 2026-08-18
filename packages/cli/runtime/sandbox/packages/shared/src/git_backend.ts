@@ -1,3 +1,5 @@
+import { runBoundedProcess } from "./bounded_process.js";
+
 export type GitBackendId = "github" | "gitlab" | "unknown";
 export type GitTokenSource = "configured" | "env" | "cli" | "none";
 
@@ -109,21 +111,16 @@ export function toGitHubRepoWebUrl(remoteUrl: string): string | null {
 
 async function defaultRunCommand(command: string[], cwd?: string): Promise<CommandCaptureResult> {
   try {
-    const proc = Bun.spawn(command, {
+    const result = await runBoundedProcess(command, {
       cwd,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: 10_000,
+      outputLimitBytes: 256 * 1024,
     });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
     return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode,
+      ok: result.exitCode === 0,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
     };
   } catch (err) {
     return {

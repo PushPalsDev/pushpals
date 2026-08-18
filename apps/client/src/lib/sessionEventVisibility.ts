@@ -1,18 +1,18 @@
-import type { EventEnvelope } from "protocol/browser";
-
 const HEARTBEAT_STATUS_RE = /\bheartbeat\b/i;
 const ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 
-type SessionEventLike = Pick<EventEnvelope, "type" | "payload" | "from"> | null | undefined;
+type SessionEventLike = { type?: unknown; payload?: unknown; from?: unknown } | null | undefined;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
 function isAutonomyMarker(value: unknown): boolean {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase() === "autonomy";
+  return (
+    String(value ?? "")
+      .trim()
+      .toLowerCase() === "autonomy"
+  );
 }
 
 function hasAutonomyPayloadMarker(value: unknown): boolean {
@@ -31,7 +31,7 @@ export function isHeartbeatStatusSessionEvent(event: SessionEventLike): boolean 
     .toLowerCase();
   if (type !== "status") return false;
 
-  const payload = event?.payload ?? {};
+  const payload = isRecord(event?.payload) ? event.payload : {};
   const detail = typeof payload.detail === "string" ? payload.detail.trim() : "";
   const message = typeof payload.message === "string" ? payload.message.trim() : "";
 

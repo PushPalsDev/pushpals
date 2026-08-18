@@ -8,8 +8,47 @@ import {
 import { createHash } from "crypto";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { basename, resolve } from "path";
+import {
+  buildWindowsProcessTreeTerminationArgv as buildSharedWindowsProcessTreeTerminationArgv,
+  runBoundedProcess,
+  terminateProcessTree as terminateSharedProcessTree,
+  type BoundedSubprocess,
+} from "../../../packages/shared/src/bounded_process.js";
 
 export type TrustedValidationCommandResult = TrustedValidationExecutionResult;
+
+export type TrustedValidationOutcome = {
+  terminalResults: TrustedValidationCommandResult[];
+  terminalFailure: TrustedValidationCommandResult | null;
+};
+
+export type TrustedValidationProgressEvent =
+  | {
+      boundary: "start";
+      phase: TrustedValidationCommandResult["phase"];
+      command: string;
+      attempt: number;
+    }
+  | {
+      boundary: "complete";
+      phase: TrustedValidationCommandResult["phase"];
+      command: string;
+      attempt: number;
+      ok: boolean;
+      durationMs: number;
+      cached: boolean;
+    }
+  | {
+      boundary: "retry";
+      phase: TrustedValidationCommandResult["phase"];
+      command: string;
+      attempt: number;
+      retryReason: "transient_infrastructure";
+    };
+
+export type TrustedValidationProgressCallback = (
+  event: Readonly<TrustedValidationProgressEvent>,
+) => void;
 
 type CommandRunner = (
   argv: string[],
@@ -33,6 +72,40 @@ const BUN_DEPENDENCY_COMMANDS = new Set([
   "tsc",
   "vitest",
 ]);
+
+function emitTrustedValidationProgress(
+  callback: TrustedValidationProgressCallback | undefined,
+  event: TrustedValidationProgressEvent,
+): void {
+  try {
+    callback?.(event);
+  } catch {
+    // Health/telemetry observers must never change validation or publication.
+  }
+}
+
+export function trustedValidationHealthPhase(event: TrustedValidationProgressEvent): string {
+  return `trusted_validation_${event.phase}_${event.boundary}_attempt_${event.attempt}`;
+}
+
+/**
+ * Validation retries are retained in reports for latency/failure telemetry,
+ * while publication is decided by the terminal attempt for each phase and
+ * command. A recovered first attempt must not veto a successful retry.
+ */
+export function resolveTrustedValidationOutcome(
+  results: TrustedValidationCommandResult[],
+): TrustedValidationOutcome {
+  const terminalByCommand = new Map<string, TrustedValidationCommandResult>();
+  for (const result of results) {
+    terminalByCommand.set(`${result.phase}\0${result.command}`, result);
+  }
+  const terminalResults = [...terminalByCommand.values()];
+  return {
+    terminalResults,
+    terminalFailure: terminalResults.find((result) => !result.ok) ?? null,
+  };
+}
 
 function currentBunExecutable(explicit?: string): string {
   const configured = String(explicit ?? process.env.PUSHPALS_BUN_BIN ?? "").trim();
@@ -166,13 +239,21 @@ async function ensureTrustedValidationInstall(options: {
       cwd: options.repoPath,
       timeoutMs: options.timeoutMs,
     });
+    const evidence = preparation.ok
+      ? null
+      : extractTrustedValidationFailureEvidence({
+          command: "bun install --frozen-lockfile",
+          phase: "dependency_install",
+          output: preparation.output,
+          exitCode: preparation.exitCode,
+        });
     const result: TrustedValidationCommandResult = {
       command: "bun install --frozen-lockfile",
       ...preparation,
       output: truncateTrustedValidationOutput(preparation.output),
       phase: "dependency_install",
+      ...(evidence ?? {}),
     };
-    if (!result.ok) Object.assign(result, extractTrustedValidationFailureEvidence(result));
     if (preparation.ok) {
       const fingerprint = trustedValidationInstallFingerprint(options);
       if (fingerprint) {
@@ -199,7 +280,7 @@ async function ensureTrustedValidationInstall(options: {
 }
 
 export function buildWindowsProcessTreeTerminationArgv(pid: number): string[] {
-  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+  return buildSharedWindowsProcessTreeTerminationArgv(pid);
 }
 
 async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
@@ -275,82 +356,25 @@ export async function terminateProcessTree(
   proc: ReturnType<typeof Bun.spawn>,
   platform = process.platform,
 ): Promise<void> {
-  const pid = Number(proc.pid);
-  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
-    try {
-      const killer = Bun.spawn(buildWindowsProcessTreeTerminationArgv(pid), {
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      const settled = await settleWithin(killer.exited, PROCESS_TREE_TERMINATION_GRACE_MS);
-      if (settled === null) {
-        killer.kill("SIGKILL");
-      } else if (
-        settled === 0 &&
-        (await settleWithin(proc.exited, PROCESS_STREAM_DRAIN_GRACE_MS)) !== null
-      ) {
-        return;
-      }
-    } catch {
-      // Fall through to Bun's direct-process kill as a last resort.
-    }
-  }
-  try {
-    proc.kill("SIGTERM");
-  } catch {
-    return;
-  }
-  if ((await settleWithin(proc.exited, PROCESS_TREE_TERMINATION_GRACE_MS)) !== null) return;
-  try {
-    proc.kill("SIGKILL");
-  } catch {
-    // Process already exited.
-  }
+  await terminateSharedProcessTree(proc as unknown as BoundedSubprocess, { platform });
 }
 
 export async function runProcessWithTreeTimeout(
   argv: string[],
   options: { cwd: string; timeoutMs: number },
 ): Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }> {
-  const proc = Bun.spawn(argv, {
+  const result = await runBoundedProcess(argv, {
     cwd: options.cwd,
-    stdout: "pipe",
-    stderr: "pipe",
     env: { ...process.env },
+    timeoutMs: Math.max(1, options.timeoutMs),
+    outputLimitBytes: PROCESS_OUTPUT_LIMIT_BYTES,
+    streamDrainTimeoutMs: PROCESS_STREAM_DRAIN_GRACE_MS,
   });
-  const stdoutCapture = captureBoundedProcessStream(proc.stdout);
-  const stderrCapture = captureBoundedProcessStream(proc.stderr);
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const outcome = await Promise.race([
-    proc.exited.then((exitCode) => ({ timedOut: false as const, exitCode })),
-    new Promise<{ timedOut: true; exitCode: number }>((resolvePromise) => {
-      timer = setTimeout(
-        () => resolvePromise({ timedOut: true, exitCode: 124 }),
-        Math.max(1, options.timeoutMs),
-      );
-    }),
-  ]);
-  if (timer) clearTimeout(timer);
-  if (outcome.timedOut) await terminateProcessTree(proc);
-  const drained = await settleWithin(
-    Promise.all([stdoutCapture.done, stderrCapture.done]),
-    PROCESS_STREAM_DRAIN_GRACE_MS,
-  );
-  if (!drained) {
-    stdoutCapture.cancel();
-    stderrCapture.cancel();
-  }
-  const streams = drained ??
-    (await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250)) ?? ["", ""];
-  const [stdout, stderr] = streams;
-  const timeoutDetail = outcome.timedOut
-    ? `Command timed out after ${Math.max(1, options.timeoutMs)}ms; terminated process tree.`
-    : "";
   return {
-    ok: !outcome.timedOut && outcome.exitCode === 0,
-    output: [stdout.trim(), stderr.trim(), timeoutDetail].filter(Boolean).join("\n"),
-    exitCode: outcome.exitCode,
-    ...(outcome.timedOut ? { timedOut: true } : {}),
+    ok: !result.timedOut && result.exitCode === 0,
+    output: [result.stdout, result.stderr].filter(Boolean).join("\n"),
+    exitCode: result.exitCode,
+    ...(result.timedOut ? { timedOut: true } : {}),
   };
 }
 
@@ -360,6 +384,8 @@ export async function runTrustedValidationCommands(options: {
   timeoutMs?: number;
   bunExecutable?: string;
   runner?: CommandRunner;
+  retryTransientFailures?: boolean;
+  onProgress?: TrustedValidationProgressCallback;
 }): Promise<TrustedValidationCommandResult[]> {
   const normalized = normalizeTrustedValidationCommands(options.commandsJson);
   if (!normalized.ok) {
@@ -381,31 +407,147 @@ export async function runTrustedValidationCommands(options: {
     bunExecutable: options.bunExecutable,
   });
   if (preparationArgv) {
-    const preparation = await ensureTrustedValidationInstall({
+    const preparationCommand = "bun install --frozen-lockfile";
+    emitTrustedValidationProgress(options.onProgress, {
+      boundary: "start",
+      phase: "dependency_install",
+      command: preparationCommand,
+      attempt: 1,
+    });
+    let preparation = await ensureTrustedValidationInstall({
       repoPath: options.repoPath,
       preparationArgv,
       timeoutMs,
       bunExecutable: options.bunExecutable,
       runner,
     });
+    emitTrustedValidationProgress(options.onProgress, {
+      boundary: "complete",
+      phase: "dependency_install",
+      command: preparationCommand,
+      attempt: 1,
+      ok: preparation.ok,
+      durationMs: preparation.durationMs,
+      cached: Boolean(preparation.cached),
+    });
+    if (
+      !preparation.ok &&
+      options.retryTransientFailures !== false &&
+      isTransientTrustedValidationFailure(preparation)
+    ) {
+      results.push({
+        ...preparation,
+        attempt: 1,
+        retryReason: "transient_infrastructure",
+      });
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "retry",
+        phase: "dependency_install",
+        command: preparationCommand,
+        attempt: 2,
+        retryReason: "transient_infrastructure",
+      });
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "start",
+        phase: "dependency_install",
+        command: preparationCommand,
+        attempt: 2,
+      });
+      preparation = {
+        ...(await ensureTrustedValidationInstall({
+          repoPath: options.repoPath,
+          preparationArgv,
+          timeoutMs,
+          bunExecutable: options.bunExecutable,
+          runner,
+        })),
+        attempt: 2,
+        retryReason: "transient_infrastructure",
+      };
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "complete",
+        phase: "dependency_install",
+        command: preparationCommand,
+        attempt: 2,
+        ok: preparation.ok,
+        durationMs: preparation.durationMs,
+        cached: Boolean(preparation.cached),
+      });
+    }
     results.push(preparation);
     if (!preparation.ok) return results;
   }
 
   for (const { command, argv } of commandsWithArgv) {
     const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
-    const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
-    const validationResult: TrustedValidationCommandResult = {
-      command,
-      ...result,
-      output: truncateTrustedValidationOutput(result.output),
-      phase: "validation",
+    const execute = async (attempt: number): Promise<TrustedValidationCommandResult> => {
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "start",
+        phase: "validation",
+        command,
+        attempt,
+      });
+      const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
+      const evidence = result.ok
+        ? null
+        : extractTrustedValidationFailureEvidence({
+            command,
+            phase: "validation",
+            output: result.output,
+            exitCode: result.exitCode,
+          });
+      const validationResult: TrustedValidationCommandResult = {
+        command,
+        ...result,
+        output: truncateTrustedValidationOutput(result.output),
+        phase: "validation",
+        attempt,
+        ...(evidence ?? {}),
+      };
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "complete",
+        phase: "validation",
+        command,
+        attempt,
+        ok: validationResult.ok,
+        durationMs: validationResult.durationMs,
+        cached: Boolean(validationResult.cached),
+      });
+      return validationResult;
     };
-    if (!validationResult.ok) {
-      Object.assign(validationResult, extractTrustedValidationFailureEvidence(validationResult));
+    let validationResult = await execute(1);
+    if (
+      !validationResult.ok &&
+      options.retryTransientFailures !== false &&
+      isTransientTrustedValidationFailure(validationResult)
+    ) {
+      results.push({
+        ...validationResult,
+        retryReason: "transient_infrastructure",
+      });
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "retry",
+        phase: "validation",
+        command,
+        attempt: 2,
+        retryReason: "transient_infrastructure",
+      });
+      validationResult = {
+        ...(await execute(2)),
+        retryReason: "transient_infrastructure",
+      };
     }
     results.push(validationResult);
-    if (!result.ok) break;
+    if (!validationResult.ok) break;
   }
   return results;
+}
+
+export function isTransientTrustedValidationFailure(
+  result: Pick<TrustedValidationCommandResult, "failureClass" | "output" | "exitCode">,
+): boolean {
+  if (result.failureClass === "timeout" || result.exitCode === 124) return true;
+  return /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(
+    String(result.output ?? ""),
+  );
 }

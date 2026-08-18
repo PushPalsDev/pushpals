@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { fetchVscodeResponseWithDeadline, type VscodeFetchLike } from "./httpDeadline";
 import { resolveWorkspaceGitStateFilePath } from "./repo";
 
 const DEFAULT_CLIENT_PORT = 8081;
@@ -48,7 +49,7 @@ export function looksLikePushPalsWebClient(body: string): boolean {
 export async function resolveBrowserClientUrl(
   env: NodeJS.ProcessEnv = process.env,
   workspaceRoot?: string,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: VscodeFetchLike = fetch,
 ): Promise<string> {
   const candidates = buildBrowserClientPortCandidates(env);
   const fallback = buildBrowserClientUrl(resolveBrowserClientPortBase(env));
@@ -112,14 +113,13 @@ function normalizeLoopbackUrl(value: unknown): string | null {
   }
 }
 
-async function probePushPalsClientUrl(url: string, fetchImpl: typeof fetch): Promise<boolean> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+async function probePushPalsClientUrl(url: string, fetchImpl: VscodeFetchLike): Promise<boolean> {
   try {
-    const response = await fetchImpl(url, {
-      method: "GET",
-      signal: controller.signal,
-    });
+    const response = await fetchVscodeResponseWithDeadline(
+      url,
+      { method: "GET" },
+      { timeoutMs: PROBE_TIMEOUT_MS, maxResponseBytes: 2 * 1024 * 1024, fetchImpl },
+    );
     if (!response.ok) return false;
     const contentType = String(response.headers.get("content-type") ?? "").toLowerCase();
     if (!contentType.includes("text/html")) return false;
@@ -127,7 +127,5 @@ async function probePushPalsClientUrl(url: string, fetchImpl: typeof fetch): Pro
     return looksLikePushPalsWebClient(body);
   } catch {
     return false;
-  } finally {
-    clearTimeout(timeout);
   }
 }

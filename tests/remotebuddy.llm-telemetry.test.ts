@@ -8,6 +8,71 @@ afterEach(() => {
 });
 
 describe("remotebuddy llm telemetry", () => {
+  test("bounds an Ollama completion body that never finishes", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            // Headers arrive, but the model server never completes the body.
+          },
+        }),
+        { status: 200 },
+      )) as typeof fetch;
+    const client = createLLMClient({
+      service: "remotebuddy",
+      backend: "ollama",
+      endpoint: "http://ollama.test/api/chat",
+      model: "tiny-model",
+      httpTimeoutMs: 20,
+    });
+    const startedAt = Date.now();
+
+    await expect(
+      client.generate({
+        system: "Answer briefly.",
+        messages: [{ role: "user", content: "Status?" }],
+      }),
+    ).rejects.toThrow("Ollama completion request timed out after 20ms");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  test("does not let a stalled telemetry body hold a completed model response", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "http://ollama.test/api/chat") {
+        return Response.json({ message: { content: "Ready." } });
+      }
+      if (url === "http://server.test/telemetry/llm-usage") {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start() {
+              // Headers arrive, but the telemetry server never completes the body.
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+    const client = createLLMClient({
+      service: "remotebuddy",
+      backend: "ollama",
+      endpoint: "http://ollama.test/api/chat",
+      model: "tiny-model",
+      serverUrl: "http://server.test",
+      httpTimeoutMs: 20,
+    });
+    const startedAt = Date.now();
+
+    const output = await client.generate({
+      system: "Answer briefly.",
+      messages: [{ role: "user", content: "Status?" }],
+    });
+
+    expect(output.text).toBe("Ready.");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   test("reports estimated ollama usage to the server telemetry endpoint", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {

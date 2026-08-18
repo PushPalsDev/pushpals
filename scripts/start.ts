@@ -48,6 +48,8 @@ import {
   readTomlLeafKeys,
 } from "../packages/shared/src/config_template_parity.js";
 import { validateVisionDocStructure } from "../packages/shared/src/vision.js";
+import { fetchBufferedWithHardDeadline } from "../packages/shared/src/bounded_fetch.js";
+import { runBoundedProcess, terminateProcessTree } from "../packages/shared/src/bounded_process.js";
 import {
   buildCoreManagedServiceSpecs,
   computeLocalBuddyRestartBackoffMs,
@@ -56,6 +58,7 @@ import {
   resolveLocalBuddyStartGate,
   ServiceManager,
 } from "./start_runtime_services.js";
+import { appendBoundedLineChunk, finishBoundedLineBuffer } from "./bounded_line_buffer.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -79,6 +82,9 @@ const START_SYNC_GIT_USER_EMAIL = "pushpals-start@local";
 const DEFAULT_PUSHPALS_PORT = CONFIG.server.port;
 const DEFAULT_STARTUP_WARMUP_TIMEOUT_MS = 120_000;
 const DEFAULT_STARTUP_WARMUP_POLL_MS = 1_000;
+const STARTUP_HTTP_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const STARTUP_HELPER_TIMEOUT_MS = 2 * 60_000;
+const STARTUP_HELPER_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 const SYSTEM_LOG_PATH = resolve(repoRoot, "system.log");
 const SYSTEM_LOG_TAIL_POLL_MS = 250;
 const SYSTEM_LOG_TAIL_READ_CHUNK_BYTES = 64 * 1024;
@@ -333,18 +339,17 @@ async function pipeProcStreamToTaggedConsole(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      pending += decoder.decode(value, { stream: true });
-      const parts = pending.split(/\r?\n/);
-      pending = parts.pop() ?? "";
-      for (const line of parts) {
+      const chunk = appendBoundedLineChunk(pending, decoder.decode(value, { stream: true }));
+      pending = chunk.pending;
+      for (const line of chunk.lines) {
         const trimmed = line.trimEnd();
         if (!trimmed) continue;
         console.log(`${formatManagedServiceLogPrefix(serviceName)} ${trimmed}`);
       }
     }
-    const tail = pending.trim();
-    if (tail) {
-      console.log(`${formatManagedServiceLogPrefix(serviceName)} ${tail}`);
+    for (const line of finishBoundedLineBuffer(pending, decoder.decode())) {
+      const trimmed = line.trimEnd();
+      if (trimmed) console.log(`${formatManagedServiceLogPrefix(serviceName)} ${trimmed}`);
     }
   } catch {
     // best-effort stream piping
@@ -619,6 +624,8 @@ function isGitIgnoredPath(pathValue: string): boolean {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
+      timeout: 5_000,
+      killSignal: "SIGKILL",
     });
     return result.exitCode === 0;
   } catch {
@@ -1484,16 +1491,19 @@ async function resolveHostCodexCommandPrefix(commandPrefix: string[]): Promise<s
   pushCandidate(["codex"]);
 
   const attempted: string[] = [];
-  const successful: Array<{ command: string[]; version: CodexCliVersion | null; versionText: string }> = [];
+  const successful: Array<{
+    command: string[];
+    version: CodexCliVersion | null;
+    versionText: string;
+  }> = [];
   const preferNewestCompatible = isDefaultCodexCommandPrefix(commandPrefix);
   for (const candidate of candidates) {
     const renderedCandidate = candidate.join(" ");
     attempted.push(`${renderedCandidate} --version`);
     const versionProbe = await runQuietOutput([...candidate, "--version"]);
     if (versionProbe.code === 0) {
-      const versionText = (versionProbe.stdout || versionProbe.stderr || "")
-        .trim()
-        .split(/\r?\n/, 1)[0] ?? "";
+      const versionText =
+        (versionProbe.stdout || versionProbe.stderr || "").trim().split(/\r?\n/, 1)[0] ?? "";
       successful.push({
         command: candidate,
         version: parseCodexCliVersion(versionText),
@@ -1668,20 +1678,21 @@ function streamProcessOutput(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        pending += decoder.decode(value, { stream: true });
-        const parts = pending.split(/\r?\n/);
-        pending = parts.pop() ?? "";
-        for (const line of parts) {
+        const chunk = appendBoundedLineChunk(pending, decoder.decode(value, { stream: true }));
+        pending = chunk.pending;
+        for (const line of chunk.lines) {
           const trimmed = line.trimEnd();
           if (!trimmed) continue;
           appendLmStudioLogTail(trimmed);
           console.log(`${prefix}${trimmed}`);
         }
       }
-      const tail = pending.trim();
-      if (tail) {
-        appendLmStudioLogTail(tail);
-        console.log(`${prefix}${tail}`);
+      for (const line of finishBoundedLineBuffer(pending, decoder.decode())) {
+        const trimmed = line.trim();
+        if (trimmed) {
+          appendLmStudioLogTail(trimmed);
+          console.log(`${prefix}${trimmed}`);
+        }
       }
     } catch {
       // best effort log streaming only
@@ -1695,13 +1706,16 @@ async function probeHttpReachable(
   url: string,
   timeoutMs = 2500,
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort("timeout"), timeoutMs);
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: { Accept: "application/json, text/plain, */*" },
+    const response = await fetchBufferedWithHardDeadline({
+      input: url,
+      init: {
+        method: "GET",
+        headers: { Accept: "application/json, text/plain, */*" },
+      },
+      timeoutMs,
+      maxResponseBytes: 1024 * 1024,
+      timeoutMessage: `Startup HTTP probe timed out after ${timeoutMs}ms`,
     });
     if (response.status >= 200 && response.status < 500) {
       return { ok: true, status: response.status };
@@ -1709,8 +1723,6 @@ async function probeHttpReachable(
     return { ok: false, status: response.status, error: `HTTP ${response.status}` };
   } catch (err) {
     return { ok: false, error: String(err) };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -1902,13 +1914,13 @@ async function discoverModelsForTarget(
 
   let lastDetail = "model list probe failed";
   for (const probe of probes) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort("timeout"), 4_000);
     try {
-      const response = await fetch(probe, {
-        method: "GET",
-        signal: controller.signal,
-        headers,
+      const response = await fetchBufferedWithHardDeadline({
+        input: probe,
+        init: { method: "GET", headers },
+        timeoutMs: 4_000,
+        maxResponseBytes: STARTUP_HTTP_MAX_RESPONSE_BYTES,
+        timeoutMessage: "Startup model discovery timed out after 4000ms",
       });
       const text = await response.text();
       if (!response.ok) {
@@ -1931,7 +1943,7 @@ async function discoverModelsForTarget(
     } catch (err) {
       lastDetail = `${probe}: ${String(err)}`;
     } finally {
-      clearTimeout(timeout);
+      // The bounded fetch owns its deadline and body cleanup.
     }
   }
 
@@ -2266,6 +2278,7 @@ async function startManagedLmStudio(primaryEndpoint: string): Promise<void> {
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
+        detached: process.platform !== "win32",
       });
     } catch (err) {
       attempts.push(`${cmd.join(" ")} -> ${String(err)}`);
@@ -2348,16 +2361,7 @@ async function stopManagedLmStudio(): Promise<void> {
   managedLmStudioStopPort = null;
 
   if (proc) {
-    try {
-      proc.kill();
-    } catch {}
-
-    try {
-      await Promise.race([
-        proc.exited,
-        new Promise((resolveWait) => setTimeout(resolveWait, 2500)),
-      ]);
-    } catch {}
+    await terminateProcessTree(proc);
   }
 
   if (startedByUs && daemonized && stopCli) {
@@ -2597,27 +2601,26 @@ async function ensureLlmPreflight(): Promise<void> {
 
 async function runQuiet(cmd: string[]): Promise<number> {
   try {
-    const proc = Bun.spawn(cmd, {
-      stdout: "pipe",
-      stderr: "pipe",
+    const result = await runBoundedProcess(cmd, {
+      timeoutMs: STARTUP_HELPER_TIMEOUT_MS,
+      stdout: "ignore",
+      stderr: "ignore",
     });
-    return proc.exited;
+    return result.exitCode;
   } catch {
     return 127;
   }
 }
 
-async function runQuietOutput(cmd: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+async function runQuietOutput(
+  cmd: string[],
+): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const proc = Bun.spawn(cmd, {
-      stdout: "pipe",
-      stderr: "pipe",
+    const result = await runBoundedProcess(cmd, {
+      timeoutMs: STARTUP_HELPER_TIMEOUT_MS,
+      outputLimitBytes: STARTUP_HELPER_OUTPUT_LIMIT_BYTES,
     });
-    const stdoutPromise = new Response(proc.stdout).text();
-    const stderrPromise = new Response(proc.stderr).text();
-    const code = await proc.exited;
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-    return { code, stdout, stderr };
+    return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
   } catch {
     return { code: 127, stdout: "", stderr: "" };
   }
@@ -2736,48 +2739,9 @@ async function ensureLocalBuddyManagedStartReady(bunExecPath: string): Promise<v
 }
 
 async function terminateManagedChildTree(child: SpawnedChild, label: string): Promise<void> {
-  const pid = child.pid;
-  if (!pid) {
-    try {
-      child.kill();
-    } catch {}
-    return;
-  }
-
-  if (process.platform === "win32") {
-    const result = await runCapture(["taskkill", "/PID", String(pid), "/T", "/F"], repoRoot);
-    if (!result.ok) {
-      console.warn(
-        `[start] taskkill returned ${result.exitCode} for ${label}. Verifying process exit...`,
-      );
-    }
-    await waitForChildExit(child, 4_000);
-    if (child.exitCode == null && child.signalCode == null) {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-      await waitForChildExit(child, 1_500);
-    }
-    return;
-  }
-
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    try {
-      child.kill("SIGTERM");
-    } catch {}
-  }
-  await waitForChildExit(child, 5_000);
+  await terminateProcessTree(child);
   if (child.exitCode == null && child.signalCode == null) {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-    }
-    await waitForChildExit(child, 1_500);
+    console.warn(`[start] ${label} process tree did not confirm exit after forced termination.`);
   }
 }
 
@@ -2821,7 +2785,18 @@ async function startLocalBuddyManagedProcess(reason: string, bunExecPath: string
       localBuddyStdoutPump = null;
       localBuddyStderrPump = null;
     }
-    await Promise.allSettled([stdoutPump ?? Promise.resolve(), stderrPump ?? Promise.resolve()]);
+    const pumps = Promise.allSettled([
+      stdoutPump ?? Promise.resolve(),
+      stderrPump ?? Promise.resolve(),
+    ]);
+    const drained = await Promise.race([
+      pumps.then(() => true),
+      Bun.sleep(2_000).then(() => false),
+    ]);
+    if (!drained) {
+      await terminateProcessTree(child);
+      await Promise.race([pumps, Bun.sleep(500)]);
+    }
     const expectedExit = shuttingDown || localBuddyStopRequested || !localBuddyRuntimeEnabled;
     if (expectedExit) {
       console.log(`[start] LocalBuddy exited with code ${code}.`);
@@ -2845,9 +2820,7 @@ async function stopLocalBuddyManagedProcess(reason: string): Promise<void> {
   const exited = await waitForChildExit(child, 1_000);
   if (exited === "timeout") {
     console.warn("[start] LocalBuddy did not exit promptly; forcing shutdown.");
-    try {
-      child.kill("SIGKILL");
-    } catch {}
+    await terminateProcessTree(child);
     await waitForChildExit(child, 2_000);
   }
 }
@@ -2936,23 +2909,22 @@ type CmdResult = {
   stderr: string;
 };
 
-async function runCapture(cmd: string[], cwd = repoRoot): Promise<CmdResult> {
+async function runCapture(
+  cmd: string[],
+  cwd = repoRoot,
+  timeoutMs = STARTUP_HELPER_TIMEOUT_MS,
+): Promise<CmdResult> {
   try {
-    const proc = Bun.spawn(cmd, {
+    const result = await runBoundedProcess(cmd, {
       cwd,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs,
+      outputLimitBytes: STARTUP_HELPER_OUTPUT_LIMIT_BYTES,
     });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
     return {
-      ok: exitCode === 0,
-      exitCode,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
+      ok: result.exitCode === 0,
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
     };
   } catch (err) {
     return {
@@ -3585,10 +3557,14 @@ async function startupFetchJson(
   init: RequestInit,
   timeoutMs: number,
 ): Promise<{ ok: boolean; status: number; json: any | null; text: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort("timeout"), timeoutMs);
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetchBufferedWithHardDeadline({
+      input: url,
+      init,
+      timeoutMs,
+      maxResponseBytes: STARTUP_HTTP_MAX_RESPONSE_BYTES,
+      timeoutMessage: `Startup control-plane request timed out after ${timeoutMs}ms`,
+    });
     const text = await response.text();
     let json: any = null;
     try {
@@ -3599,8 +3575,6 @@ async function startupFetchJson(
     return { ok: response.ok, status: response.status, json, text };
   } catch (err) {
     return { ok: false, status: 0, json: null, text: String(err) };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -4198,11 +4172,7 @@ async function attemptGhAuthRefresh(
       }
       deviceFlowDetected = true;
       if (!allowInteractive) {
-        try {
-          proc.kill();
-        } catch {
-          // ignore
-        }
+        void terminateProcessTree(proc);
       }
     };
     const streamToTerminal = async (
@@ -4238,18 +4208,17 @@ async function attemptGhAuthRefresh(
       maybeHandleDeviceFlowUrl,
     );
     const timeoutMs = allowInteractive ? 180_000 : 12_000;
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill();
-      } catch {
-        // ignore
-      }
-    }, timeoutMs);
-    const exitCode = await proc.exited;
-    await Promise.allSettled([stdoutPump, stderrPump]);
-    clearTimeout(timeout);
+    const outcome = await Promise.race([
+      proc.exited.then((exitCode) => ({ exitCode, timedOut: false as const })),
+      Bun.sleep(timeoutMs).then(() => ({ exitCode: 124, timedOut: true as const })),
+    ]);
+    if (outcome.timedOut) await terminateProcessTree(proc);
+    const pumpsDrained = await Promise.race([
+      Promise.allSettled([stdoutPump, stderrPump]).then(() => true),
+      Bun.sleep(2_000).then(() => false),
+    ]);
+    if (!pumpsDrained) await terminateProcessTree(proc);
+    const { exitCode, timedOut } = outcome;
     if (deviceFlowDetected) {
       ghLastRefreshEnteredDeviceFlow = true;
       if (!allowInteractive) {
@@ -4904,7 +4873,7 @@ const shutdown = async (code: number) => {
   if (shuttingDown) return;
   shuttingDown = true;
   try {
-    serviceManager?.stop();
+    await serviceManager?.stopAndWait(15_000);
   } catch {}
   stopLocalBuddyRuntimeConfigPolling();
   await stopLocalBuddyManagedProcess("shutdown");
@@ -4973,7 +4942,8 @@ console.log(
 );
 startSystemLogTail();
 serviceManager = new ServiceManager({
-  degradedAction: "Inspect the affected service logs or restart the managed runtime after fixing the failure.",
+  degradedAction:
+    "Inspect the affected service logs or restart the managed runtime after fixing the failure.",
   onEvent: (level, line) => {
     const formatted = `[start] ${line}`;
     if (level === "error") {

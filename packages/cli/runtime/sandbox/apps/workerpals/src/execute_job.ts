@@ -24,12 +24,15 @@ import {
   loadPushPalsConfig,
   buildToolchainPlan,
   extractVisionKeyItems,
+  fetchBufferedWithHardDeadline,
   formatToolRequirement,
   matchesGlob,
   normalizeTargetPath,
   requirementsForValidationCommand,
   resolveGitStateFilePath,
+  runBoundedProcess as runBoundedWorkerProcess,
   sanitizeSourceControlIdentityField,
+  terminateProcessTree,
   type SourceControlCommitIdentity,
   type ToolRequirement,
 } from "shared";
@@ -103,6 +106,9 @@ export interface ValidationExecutionResult {
   stdout: string;
   stderr: string;
   elapsedMs: number;
+  /** Informational browser/e2e marker observed in output; never a terminal-status source. */
+  browserSignal?: "failure" | "success" | "failure_and_success";
+  terminalStatusSource?: "process_exit" | "deadline";
 }
 
 export interface ValidationBlocker {
@@ -988,6 +994,14 @@ function buildValidationRunDiagnostics(
     failureClass: classifyValidationRunFailure(run),
     stdoutTail: compactDiagnosticText(run.stdout),
     stderrTail: compactDiagnosticText(run.stderr),
+    ...(run.browserSignal
+      ? {
+          metadata: {
+            browserSignal: run.browserSignal,
+            terminalStatusSource: run.terminalStatusSource ?? "process_exit",
+          },
+        }
+      : {}),
   }));
 }
 
@@ -1295,6 +1309,20 @@ export function shouldEnqueueNoChangeReviewCompletion(
   return extractReviewFixContext(params) == null;
 }
 
+export function shouldFailTaskWithoutPublishableChanges(options: {
+  mode: QualityGatePolicy["mode"];
+  planningIntent: TaskExecuteIntent;
+  writeAllowed: boolean;
+  publishablePathCount: number;
+  shellWrapperReturn: boolean;
+}): boolean {
+  if (options.publishablePathCount > 0) return false;
+  if (options.mode === "review_fix" || options.shellWrapperReturn) return true;
+  return (
+    options.mode === "default" && options.planningIntent === "code_change" && options.writeAllowed
+  );
+}
+
 export function deriveQualityGatePolicy(
   params: Record<string, unknown> | null | undefined,
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
@@ -1547,66 +1575,80 @@ export function tokenizeValidationCommandArgv(command: string): string[] | null 
 }
 
 async function terminateValidationProcessTree(proc: ReturnType<typeof Bun.spawn>): Promise<void> {
-  const pid = Number(proc.pid);
-  if (process.platform === "win32" && Number.isFinite(pid) && pid > 0) {
-    try {
-      Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      return;
-    } catch {
-      // Fall through to Bun's process handle.
-    }
-  }
-
-  if (process.platform !== "win32" && Number.isFinite(pid) && pid > 0) {
-    try {
-      process.kill(-pid, "SIGTERM");
-    } catch {
-      try {
-        proc.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-    }
-    await Bun.sleep(2_000);
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // ignore
-      }
-    }
-    return;
-  }
-
-  try {
-    proc.kill();
-  } catch {
-    // ignore
-  }
+  await terminateProcessTree(proc, {
+    terminationTimeoutMs: 5_000,
+    exitGraceMs: 2_000,
+  });
 }
+
+const VALIDATION_STREAM_CAPTURE_MAX_CHARS = 2 * 1024 * 1024;
+const VALIDATION_SIGNAL_WINDOW_MAX_CHARS = 64 * 1024;
+const VALIDATION_STREAM_TRUNCATION_MARKER =
+  "\n[pushpals: earlier validation output truncated while the process continued draining]\n";
 
 function captureValidationStream(
   stream: ReadableStream<Uint8Array> | null,
   onChunk?: (chunk: string) => void,
 ) {
-  let text = "";
+  const headLimit = Math.floor(VALIDATION_STREAM_CAPTURE_MAX_CHARS / 2);
+  const tailLimit = VALIDATION_STREAM_CAPTURE_MAX_CHARS - headLimit;
+  let head = "";
+  let tail = "";
+  let observedChars = 0;
+  let signalWindow = "";
+  let browserFailureSignalDetected = false;
+  let browserSuccessSignalDetected = false;
   let done = false;
   const reader = stream?.getReader();
+  const decoder = new TextDecoder();
+  const append = (chunk: string) => {
+    if (!chunk) return;
+    observedChars += chunk.length;
+
+    const headRemaining = Math.max(0, headLimit - head.length);
+    const headPart = headRemaining > 0 ? chunk.slice(0, headRemaining) : "";
+    head += headPart;
+    const remainder = chunk.slice(headPart.length);
+    if (remainder) {
+      tail =
+        remainder.length >= tailLimit
+          ? remainder.slice(-tailLimit)
+          : `${tail}${remainder}`.slice(-tailLimit);
+    }
+
+    // Detection is incremental and independent of retained output. A marker
+    // emitted in the middle of a noisy command therefore remains available as
+    // telemetry even when bounded head/tail capture evicts that text. Markers
+    // are deliberately not treated as process completion or exit status.
+    const signalCandidate = `${signalWindow}${chunk}`;
+    if (!browserFailureSignalDetected) {
+      browserFailureSignalDetected = hasBrowserValidationFailureSignal(signalCandidate);
+    }
+    if (!browserSuccessSignalDetected) {
+      browserSuccessSignalDetected = hasBrowserValidationSuccessSignal(signalCandidate);
+    }
+    signalWindow = signalCandidate.slice(-VALIDATION_SIGNAL_WINDOW_MAX_CHARS);
+    onChunk?.(chunk);
+  };
+  const retainedText = () => {
+    if (observedChars <= VALIDATION_STREAM_CAPTURE_MAX_CHARS) return head + tail;
+    const tailBudget = Math.max(
+      0,
+      VALIDATION_STREAM_CAPTURE_MAX_CHARS -
+        head.length -
+        VALIDATION_STREAM_TRUNCATION_MARKER.length,
+    );
+    return `${head}${VALIDATION_STREAM_TRUNCATION_MARKER}${tail.slice(-tailBudget)}`;
+  };
   const promise = reader
     ? (async () => {
         try {
           while (true) {
             const result = await reader.read();
             if (result.done) break;
-            const chunk = Buffer.from(result.value).toString("utf8");
-            text += chunk;
-            onChunk?.(chunk);
+            append(decoder.decode(result.value, { stream: true }));
           }
+          append(decoder.decode());
         } catch {
           // Stream cancellation after process exit is expected when descendants
           // inherit pipes from failed browser/dev-server launchers.
@@ -1626,34 +1668,17 @@ function captureValidationStream(
   return {
     cancel: async () => {
       try {
-        await reader?.cancel();
+        await Promise.race([reader?.cancel() ?? Promise.resolve(), Bun.sleep(250)]);
       } catch {
         // ignore
       }
     },
     isDone: () => done,
     promise,
-    text: () => text,
+    text: retainedText,
+    hasBrowserFailureSignal: () => browserFailureSignalDetected,
+    hasBrowserSuccessSignal: () => browserSuccessSignalDetected,
   };
-}
-
-const DEFAULT_BROWSER_VALIDATION_FAILURE_IDLE_MS = 15_000;
-const DEFAULT_BROWSER_VALIDATION_SUCCESS_IDLE_MS = 1_000;
-
-function browserValidationFailureIdleMs(env: Record<string, string>): number {
-  const configured = Number(env.PUSHPALS_VALIDATION_FAILURE_IDLE_MS ?? "");
-  if (Number.isFinite(configured) && configured >= 250) {
-    return Math.min(120_000, Math.trunc(configured));
-  }
-  return DEFAULT_BROWSER_VALIDATION_FAILURE_IDLE_MS;
-}
-
-function browserValidationSuccessIdleMs(env: Record<string, string>): number {
-  const configured = Number(env.PUSHPALS_VALIDATION_SUCCESS_IDLE_MS ?? "");
-  if (Number.isFinite(configured) && configured >= 250) {
-    return Math.min(120_000, Math.trunc(configured));
-  }
-  return DEFAULT_BROWSER_VALIDATION_SUCCESS_IDLE_MS;
 }
 
 function hasBrowserValidationFailureSignal(output: string): boolean {
@@ -1701,11 +1726,7 @@ export async function runValidationArgv(
   outputPolicy: Partial<OutputCompactionPolicy>,
   timeoutMessage: string,
 ): Promise<ValidationExecutionResult> {
-  type ValidationWaitResult =
-    | { type: "exit"; code: number }
-    | { type: "timeout" }
-    | { type: "failure-signal" }
-    | { type: "success-signal" };
+  type ValidationWaitResult = { type: "exit"; code: number } | { type: "timeout" };
   const startedAt = Date.now();
   const spawnEnv = withResolvedBunOnPath(env);
   const spawnArgv = prepareValidationSpawnArgv(argv, spawnEnv);
@@ -1736,80 +1757,34 @@ export async function runValidationArgv(
       elapsedMs: Math.max(1, Date.now() - startedAt),
     };
   }
-  let lastOutputAt = Date.now();
-  const noteOutput = () => {
-    lastOutputAt = Date.now();
-  };
   const stdoutCapture = captureValidationStream(
     (proc.stdout ?? null) as ReadableStream<Uint8Array> | null,
-    noteOutput,
   );
   const stderrCapture = captureValidationStream(
     (proc.stderr ?? null) as ReadableStream<Uint8Array> | null,
-    noteOutput,
   );
-  let timedOut = false;
-  let stoppedAfterFailureSignal = false;
-  let stoppedAfterSuccessSignal = false;
   const timeout = Math.max(1_000, timeoutMs);
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<ValidationWaitResult>((resolveTimeout) => {
     timeoutTimer = setTimeout(() => {
-      timedOut = true;
       resolveTimeout({ type: "timeout" });
     }, timeout);
   });
 
-  let browserSignalTimer: ReturnType<typeof setInterval> | null = null;
-  const browserSignalPromise = isLongRunningBrowserValidationCommand(command)
-    ? new Promise<ValidationWaitResult>((resolveBrowserSignal) => {
-        const idleMs = browserValidationFailureIdleMs(spawnEnv);
-        const successIdleMs = browserValidationSuccessIdleMs(spawnEnv);
-        browserSignalTimer = setInterval(() => {
-          const combinedOutput = `${stdoutCapture.text()}\n${stderrCapture.text()}`;
-          if (
-            hasBrowserValidationFailureSignal(combinedOutput) &&
-            Date.now() - lastOutputAt >= idleMs
-          ) {
-            stoppedAfterFailureSignal = true;
-            resolveBrowserSignal({ type: "failure-signal" });
-            return;
-          }
-          if (
-            hasBrowserValidationSuccessSignal(combinedOutput) &&
-            Date.now() - lastOutputAt >= successIdleMs
-          ) {
-            stoppedAfterSuccessSignal = true;
-            resolveBrowserSignal({ type: "success-signal" });
-          }
-        }, 250);
-      })
-    : new Promise<ValidationWaitResult>(() => {
-        // Non-browser validations should only end on process exit or timeout.
-      });
-
   const exitOrTimeout = await Promise.race<ValidationWaitResult>([
     proc.exited.then((code) => ({ type: "exit" as const, code })),
     timeoutPromise,
-    browserSignalPromise,
   ]);
   if (timeoutTimer) clearTimeout(timeoutTimer);
-  if (browserSignalTimer) clearInterval(browserSignalTimer);
+  const timedOut = exitOrTimeout.type === "timeout";
 
-  if (timedOut || stoppedAfterFailureSignal || stoppedAfterSuccessSignal) {
+  if (timedOut) {
     await terminateValidationProcessTree(proc);
   }
 
-  const exitCode =
-    exitOrTimeout.type === "timeout"
-      ? 124
-      : exitOrTimeout.type === "failure-signal"
-        ? 1
-        : exitOrTimeout.type === "success-signal"
-          ? 0
-          : exitOrTimeout.code;
+  const exitCode = exitOrTimeout.type === "timeout" ? 124 : exitOrTimeout.code;
 
-  if (!timedOut && !stoppedAfterFailureSignal && !stoppedAfterSuccessSignal) {
+  if (!timedOut) {
     await Promise.race([
       Promise.all([stdoutCapture.promise, stderrCapture.promise]),
       Bun.sleep(1_000),
@@ -1823,26 +1798,35 @@ export async function runValidationArgv(
   }
 
   await Promise.race([Promise.all([stdoutCapture.promise, stderrCapture.promise]), Bun.sleep(500)]);
+  const browserFailureSignalDetected =
+    stdoutCapture.hasBrowserFailureSignal() || stderrCapture.hasBrowserFailureSignal();
+  const browserSuccessSignalDetected =
+    stdoutCapture.hasBrowserSuccessSignal() || stderrCapture.hasBrowserSuccessSignal();
+  const browserSignal = browserFailureSignalDetected
+    ? browserSuccessSignalDetected
+      ? "failure_and_success"
+      : "failure"
+    : browserSuccessSignalDetected
+      ? "success"
+      : undefined;
 
   return {
     step: command,
     command,
-    ok: !timedOut && exitCode === 0,
+    // Exit status remains authoritative for when the process is finished. A
+    // definite failure marker is evaluated only after that exit and can veto a
+    // nominal zero code (for wrappers that swallow a failing browser child).
+    // A success marker can never override a nonzero exit or deadline.
+    ok: !timedOut && exitCode === 0 && !browserFailureSignalDetected,
     exitCode,
     stdout: compactJobOutput(stdoutCapture.text().trim(), outputPolicy),
     stderr: compactJobOutput(
-      [
-        stderrCapture.text().trim(),
-        timedOut ? timeoutMessage : "",
-        stoppedAfterFailureSignal
-          ? `Validation command emitted a browser/e2e failure signal and then produced no output for ${browserValidationFailureIdleMs(spawnEnv)}ms. PushPals terminated the leaked process tree and preserved the captured failure output for repair.`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
+      [stderrCapture.text().trim(), timedOut ? timeoutMessage : ""].filter(Boolean).join("\n"),
       outputPolicy,
     ),
     elapsedMs: Math.max(1, Date.now() - startedAt),
+    ...(browserSignal ? { browserSignal } : {}),
+    terminalStatusSource: timedOut ? "deadline" : "process_exit",
   };
 }
 
@@ -3117,33 +3101,12 @@ async function checkToolCandidate(
 ): Promise<boolean> {
   const spawnEnv = withResolvedBunOnPath(env);
   try {
-    const proc = Bun.spawn(toolProbeArgv(candidate, spawnEnv), {
+    const result = await runBoundedWorkerProcess(toolProbeArgv(candidate, spawnEnv), {
       env: spawnEnv,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: Math.max(1_000, timeoutMs),
+      outputLimitBytes: 64 * 1024,
     });
-    let timedOut = false;
-    const timer = setTimeout(
-      () => {
-        timedOut = true;
-        try {
-          proc.kill();
-        } catch {
-          // ignore
-        }
-      },
-      Math.max(1_000, timeoutMs),
-    );
-    try {
-      const [exitCode] = await Promise.all([
-        proc.exited,
-        new Response(proc.stdout).text().catch(() => ""),
-        new Response(proc.stderr).text().catch(() => ""),
-      ]);
-      return !timedOut && exitCode === 0;
-    } finally {
-      clearTimeout(timer);
-    }
+    return !result.timedOut && !result.drainTimedOut && result.exitCode === 0;
   } catch {
     return false;
   }
@@ -6324,6 +6287,33 @@ function criticTimeoutReview(
   };
 }
 
+export async function fetchWorkerCriticResponseWithHardDeadline(options: {
+  endpoint: string;
+  init: RequestInit;
+  timeoutMs: number;
+  fetchFn?: typeof fetch;
+}): Promise<
+  { timedOut: false; response: Response; text: string } | { timedOut: true; err: Error }
+> {
+  const timeoutMs = Math.max(1, Math.floor(options.timeoutMs));
+  const timeoutMessage = `quality-critic HTTP request timed out after ${timeoutMs}ms`;
+  try {
+    const response = await fetchBufferedWithHardDeadline({
+      input: options.endpoint,
+      init: options.init,
+      timeoutMs,
+      fetchImpl: options.fetchFn,
+      timeoutMessage,
+    });
+    return { timedOut: false, response, text: await response.text() };
+  } catch (err) {
+    if (err instanceof Error && err.message === timeoutMessage) {
+      return { timedOut: true, err };
+    }
+    throw err;
+  }
+}
+
 async function runTaskCriticReview(
   repo: string,
   params: Record<string, unknown>,
@@ -6406,31 +6396,17 @@ async function runTaskCriticReview(
     bodyBase: Record<string, unknown>,
     responseFormat: Record<string, unknown> | null,
   ) => {
-    const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, qualityCriticTimeoutMs);
-    try {
-      const response = await fetch(endpoint, {
+    return fetchWorkerCriticResponseWithHardDeadline({
+      endpoint,
+      init: {
         method: "POST",
         headers,
         body: JSON.stringify(
           responseFormat ? { ...bodyBase, response_format: responseFormat } : bodyBase,
         ),
-        signal: controller.signal,
-      });
-      const text = await response.text();
-      return { timedOut: false as const, response, text };
-    } catch (err) {
-      if (!timedOut && String((err as { name?: unknown })?.name ?? "") !== "AbortError") {
-        throw err;
-      }
-      return { timedOut: true as const, err };
-    } finally {
-      clearTimeout(timer);
-    }
+      },
+      timeoutMs: qualityCriticTimeoutMs,
+    });
   };
 
   const runAttempt = async (
@@ -7095,26 +7071,49 @@ async function buildArchitectureDocument(
   return lines.join("\n").trim() + "\n";
 }
 
-/** Execute a git command and return stdout */
+const DEFAULT_WORKERPAL_GIT_COMMAND_TIMEOUT_MS = 120_000;
+const DEFAULT_WORKERPAL_GIT_NETWORK_TIMEOUT_MS = 300_000;
+
+export function resolveWorkerGitCommandTimeoutMs(
+  args: string[],
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const operation = String(args[0] ?? "")
+    .trim()
+    .toLowerCase();
+  const networkOperation = new Set(["clone", "fetch", "pull", "push", "ls-remote"]).has(operation);
+  const configured = Number(
+    networkOperation
+      ? env.PUSHPALS_WORKERPAL_GIT_NETWORK_TIMEOUT_MS
+      : env.PUSHPALS_WORKERPAL_GIT_COMMAND_TIMEOUT_MS,
+  );
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.max(1_000, Math.min(30 * 60_000, Math.floor(configured)));
+  }
+  return networkOperation
+    ? DEFAULT_WORKERPAL_GIT_NETWORK_TIMEOUT_MS
+    : DEFAULT_WORKERPAL_GIT_COMMAND_TIMEOUT_MS;
+}
+
+/** Execute a bounded git command and return stdout. */
 export async function git(
   cwd: string,
   args: string[],
 ): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number | null }> {
   try {
-    const proc = Bun.spawn(["git", ...args], {
+    const result = await runBoundedWorkerProcess(["git", ...args], {
       cwd,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: resolveWorkerGitCommandTimeoutMs(args),
+      outputLimitBytes: 4 * 1024 * 1024,
+      preserveOutputWhitespace: true,
     });
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-
     // Preserve leading spaces in stdout for porcelain parsers.
-    return { ok: exitCode === 0, stdout: stdout.trimEnd(), stderr: stderr.trim(), exitCode };
+    return {
+      ok: !result.timedOut && !result.drainTimedOut && result.exitCode === 0,
+      stdout: result.stdout.trimEnd(),
+      stderr: result.stderr.trim(),
+      exitCode: result.exitCode,
+    };
   } catch (err) {
     return { ok: false, stdout: "", stderr: String(err), exitCode: null };
   }
@@ -9072,7 +9071,7 @@ export function shouldUseLlmCommitMessageForStagedDiff(params: {
   return params.changedPaths.length <= COMMIT_MSG_LLM_MAX_CHANGED_PATHS;
 }
 
-type CommitMessagePrompt = {
+export type CommitMessagePrompt = {
   systemPrompt: string;
   userMessage: string;
 };
@@ -9140,27 +9139,17 @@ async function generateCommitMessageFromDiffViaCodex(
   const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
   try {
     const stdinText = `${prompt.systemPrompt}\n\n${prompt.userMessage}`;
-    const proc = Bun.spawn(cmd, {
+    const processResult = await runBoundedWorkerProcess(cmd, {
       cwd: repo,
       env,
-      stdout: "pipe",
-      stderr: "pipe",
       stdin: new Blob([stdinText]),
+      timeoutMs,
+      outputLimitBytes: 512 * 1024,
+      retainOutputTail: true,
     });
-
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill();
-      } catch {
-        // ignore
-      }
-    }, timeoutMs);
-
-    const exitCode = await proc.exited;
-    clearTimeout(timer);
-    if (timedOut || exitCode !== 0) return null;
+    if (processResult.timedOut || processResult.drainTimedOut || processResult.exitCode !== 0) {
+      return null;
+    }
 
     let content = "";
     try {
@@ -9169,7 +9158,7 @@ async function generateCommitMessageFromDiffViaCodex(
       content = "";
     }
     if (!content) {
-      content = (await new Response(proc.stdout).text()).trim();
+      content = processResult.stdout.trim();
     }
     if (!content) return null;
     const clean = sanitizeGeneratedCommitMessage(content, opts.type, opts.area);
@@ -9186,10 +9175,11 @@ async function generateCommitMessageFromDiffViaCodex(
   }
 }
 
-async function generateCommitMessageFromDiffViaHttp(
+export async function generateCommitMessageFromDiffViaHttp(
   prompt: CommitMessagePrompt,
   opts: { type: string; area: string },
   runtimeConfig: WorkerpalsRuntimeConfig,
+  requestOptions: { fetchFn?: typeof fetch; timeoutMs?: number } = {},
 ): Promise<string | null> {
   const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
   const model = runtimeConfig.workerpals.llm.model.trim();
@@ -9199,27 +9189,30 @@ async function generateCommitMessageFromDiffViaHttp(
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    resolveCommitMessageGeneratorTimeoutMs(runtimeConfig),
+  const timeoutMs = Math.max(
+    1,
+    Math.floor(requestOptions.timeoutMs ?? resolveCommitMessageGeneratorTimeoutMs(runtimeConfig)),
   );
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: prompt.systemPrompt },
-          { role: "user", content: prompt.userMessage },
-        ],
-        temperature: 0,
-        max_tokens: 500,
-      }),
-      signal: controller.signal,
+    const response = await fetchBufferedWithHardDeadline({
+      input: endpoint,
+      init: {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: prompt.systemPrompt },
+            { role: "user", content: prompt.userMessage },
+          ],
+          temperature: 0,
+          max_tokens: 500,
+        }),
+      },
+      timeoutMs,
+      fetchImpl: requestOptions.fetchFn,
+      timeoutMessage: `commit-message HTTP request timed out after ${timeoutMs}ms`,
     });
-    clearTimeout(timer);
     if (!response.ok) return null;
     const payload = parseJsonObjectLoose(await response.text());
     if (!payload) return null;
@@ -9234,7 +9227,6 @@ async function generateCommitMessageFromDiffViaHttp(
     if (!clean) return null;
     return clean;
   } catch {
-    clearTimeout(timer);
     return null;
   }
 }
@@ -9752,23 +9744,12 @@ async function canExecuteCodexCommandCandidate(
 ): Promise<boolean> {
   if (candidate.length === 0) return false;
   try {
-    const proc = Bun.spawn([...candidate, "--version"], {
+    const result = await runBoundedWorkerProcess([...candidate, "--version"], {
       cwd: repo,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: 15_000,
+      outputLimitBytes: 64 * 1024,
     });
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill();
-      } catch {
-        // ignore
-      }
-    }, 15_000);
-    const exitCode = await proc.exited;
-    clearTimeout(timer);
-    return !timedOut && exitCode === 0;
+    return !result.timedOut && !result.drainTimedOut && result.exitCode === 0;
   } catch {
     return false;
   }
@@ -9901,33 +9882,23 @@ async function runCodexCriticReview(
       "stdout",
       `[CriticGate] Codex review attempt ${attempt}${compact ? " (compact)" : ""}: model=${criticModel || "(codex default)"} timeout_ms=${qualityCriticTimeoutMs} behavior=${timeoutBehavior} prompt_chars=${payload.promptChars} prompt_bytes=${payload.promptBytes} diff_chars=${payload.diffChars} validation_chars=${payload.validationChars}`,
     );
-    const proc = Bun.spawn(buildCmd(), {
+    const processResult = await runBoundedWorkerProcess(buildCmd(), {
       cwd: repo,
       env,
-      stdout: "pipe",
-      stderr: "pipe",
       stdin: new Blob([payload.criticInstruction]),
+      timeoutMs: qualityCriticTimeoutMs,
+      outputLimitBytes: 512 * 1024,
+      retainOutputTail: true,
     });
 
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill();
-      } catch {
-        /* ignore */
-      }
-    }, qualityCriticTimeoutMs);
-
-    const exitCode = await proc.exited;
-    clearTimeout(timer);
-
-    if (timedOut) {
+    if (processResult.timedOut) {
       return { status: "timeout", payload };
     }
-    if (exitCode !== 0) {
-      const stderrText = await new Response(proc.stderr).text();
-      onLog?.("stderr", `[CriticGate] Codex exited ${exitCode}: ${toSingleLine(stderrText, 220)}`);
+    if (processResult.drainTimedOut || processResult.exitCode !== 0) {
+      onLog?.(
+        "stderr",
+        `[CriticGate] Codex exited ${processResult.exitCode}: ${toSingleLine(processResult.stderr, 220)}`,
+      );
       return { status: "done", review: null, payload };
     }
 
@@ -10426,13 +10397,20 @@ export async function executeJob(
       });
     }
     if (
-      preQualityPublishablePaths.length === 0 &&
-      (qualityGatePolicy.mode === "review_fix" || shellWrapperReturn)
+      shouldFailTaskWithoutPublishableChanges({
+        mode: qualityGatePolicy.mode,
+        planningIntent: planning.intent,
+        writeAllowed: planning.scope.writeAllowed,
+        publishablePathCount: preQualityPublishablePaths.length,
+        shellWrapperReturn,
+      })
     ) {
       const reason =
         qualityGatePolicy.mode === "review_fix"
           ? "Review-fix executor returned without publishable code changes."
-          : "Codex hit shell-wrapper command rejections without leaving a publishable patch.";
+          : shellWrapperReturn
+            ? "Codex hit shell-wrapper command rejections without leaving a publishable patch."
+            : "Code-change executor returned without publishable code changes.";
       onLog?.(
         "stderr",
         `[QualityGate] ${reason} Skipping ValidationGate/CriticGate and failing fast.`,

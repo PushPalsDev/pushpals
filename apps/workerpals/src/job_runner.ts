@@ -23,6 +23,7 @@ import type { JobDiagnostics, JobTokenUsage } from "./common/types.js";
 import { isHostScmOwnedReviewParams } from "./merge_conflict_job.js";
 
 const CONFIG = loadPushPalsConfig();
+const GIT_CONFIG_TIMEOUT_MS = 10_000;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -116,6 +117,8 @@ echo "password=${token}"
       {
         stdout: "pipe",
         stderr: "pipe",
+        timeout: GIT_CONFIG_TIMEOUT_MS,
+        killSignal: "SIGKILL",
       },
     );
     if (urlRules.exitCode === 0) {
@@ -133,11 +136,18 @@ echo "password=${token}"
         Bun.spawnSync(["git", "config", "--global", "--unset-all", key], {
           stdout: "pipe",
           stderr: "pipe",
+          timeout: GIT_CONFIG_TIMEOUT_MS,
+          killSignal: "SIGKILL",
         });
       }
     }
 
-    Bun.spawnSync(["git", "config", "--global", "credential.helper", helperPath]);
+    Bun.spawnSync(["git", "config", "--global", "credential.helper", helperPath], {
+      stdout: "ignore",
+      stderr: "ignore",
+      timeout: GIT_CONFIG_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
   } catch (err) {
     log("stderr", `Failed to setup git credentials: ${err}`);
   }

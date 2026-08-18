@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   fetchAutonomyInspiration,
+  fetchAutonomyInsights,
   fetchJobLogsSnapshot,
   buildSessionEventsUrl,
   buildSessionMessageUrl,
@@ -173,6 +174,91 @@ describe("pushpals client session transport URLs", () => {
     try {
       await expect(fetchAutonomyInspiration("http://localhost:3001")).resolves.toEqual([]);
       await expect(fetchAutonomyInspiration("http://localhost:3001")).resolves.toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("fetchAutonomyInsights preserves nullable reliability metrics and outcome counts", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      Response.json({
+        ok: true,
+        latestEvaluatorScorecard: {
+          id: "eval-null-metrics",
+          windowHours: null,
+          sampleCount: null,
+          successRate: null,
+          regretRate: null,
+          avgLatencyMs: null,
+          dispatchCount: "not-a-number",
+          recommendation: "constrain",
+          createdAt: "2026-08-17T00:00:00.000Z",
+        },
+        opsSummary: {
+          reliability: {
+            windowHours: 24,
+            attemptsTotal: 6,
+            outcomeCounts: {
+              succeeded: 2,
+              validation_blocked: 3,
+              environment_blocked: 1,
+            },
+            attemptSuccessRate: 1 / 3,
+            objectiveTerminalCount: 5,
+            objectiveSuccessRate: null,
+            nonTerminalRevisionCount: 4,
+            nonTerminalRevisionObjectiveCount: 3,
+            revisedTerminalObjectiveCount: 2,
+            objectiveRevisionRate: 0.4,
+            objectiveFirstPassRate: 0.6,
+            durationMs: { average: 600_000, p50: 480_000, p95: null },
+            validationFailureRuns: 4,
+            validationEvidenceCoverageRate: 0.75,
+            validationFingerprintCollisionCount: 0,
+            transientValidationRetries: 2,
+            activeIncidentCount: 1,
+            workerHandoffFailureCount: 2,
+            stalledWorkerHandoffCount: 0,
+          },
+        },
+      })) as typeof fetch;
+
+    try {
+      const insights = await fetchAutonomyInsights("http://localhost:3001");
+      expect(insights.latestEvaluatorScorecard).toMatchObject({
+        id: "eval-null-metrics",
+        windowHours: 24,
+        sampleCount: 0,
+        successRate: null,
+        regretRate: null,
+        avgLatencyMs: null,
+        dispatchCount: 0,
+        recommendation: "constrain",
+      });
+      expect(insights.opsSummary?.latestEvaluatorScorecard).toEqual(
+        insights.latestEvaluatorScorecard,
+      );
+      expect(insights.opsSummary?.reliability).toMatchObject({
+        attemptsTotal: 6,
+        outcomeCounts: {
+          succeeded: 2,
+          validation_blocked: 3,
+          environment_blocked: 1,
+        },
+        attemptSuccessRate: 1 / 3,
+        objectiveSuccessRate: null,
+        nonTerminalRevisionCount: 4,
+        nonTerminalRevisionObjectiveCount: 3,
+        revisedTerminalObjectiveCount: 2,
+        objectiveRevisionRate: 0.4,
+        objectiveFirstPassRate: 0.6,
+        durationMs: { average: 600_000, p50: 480_000, p95: null },
+        validationEvidenceCoverageRate: 0.75,
+        transientValidationRetries: 2,
+        activeIncidentCount: 1,
+        workerHandoffFailureCount: 2,
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }

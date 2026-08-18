@@ -70,7 +70,11 @@ function createWorkerPlan(): PlannerOutput {
   };
 }
 
-function createOrchestrator(root: string, fetchImpl?: typeof fetch): RemoteBuddyOrchestrator {
+function createOrchestrator(
+  root: string,
+  fetchImpl?: typeof fetch,
+  terminateProcessTreeImpl?: (proc: any, options?: any) => Promise<void>,
+): RemoteBuddyOrchestrator {
   mkdirSync(join(root, "outputs", "data"), { recursive: true });
   const idempotency = new IdempotencyStore(
     join(root, "outputs", "data", "remotebuddy-autoscale.db"),
@@ -88,6 +92,7 @@ function createOrchestrator(root: string, fetchImpl?: typeof fetch): RemoteBuddy
     persistentMemory: new NoopSessionMemory(),
     jobsDbPath: join(root, "outputs", "data", "pushpals.db"),
     fetchImpl,
+    terminateProcessTreeImpl,
   });
   // These tests replace spawnWorker with deterministic fixtures. Keep the
   // scheduler under test independent of host-specific standalone launch assets.
@@ -97,6 +102,59 @@ function createOrchestrator(root: string, fetchImpl?: typeof fetch): RemoteBuddy
 }
 
 describe("RemoteBuddy worker autoscaling", () => {
+  test("routes managed WorkerPal shutdown through process-tree termination", async () => {
+    const terminations: Array<{ pid: number; options: Record<string, unknown> }> = [];
+    const orchestrator = createOrchestrator(makeTempDir(), undefined, async (proc, options) => {
+      terminations.push({ pid: proc.pid, options });
+    });
+    const proc = {
+      pid: 4242,
+      exited: Promise.resolve(0),
+      kill() {},
+    } as ReturnType<typeof Bun.spawn>;
+    (orchestrator as any).managedWorkers.set("workerpal-tree", proc);
+
+    try {
+      await (orchestrator as any).terminateManagedWorkerProcess(
+        "workerpal-tree",
+        proc,
+        "test shutdown",
+        1234,
+      );
+
+      expect(terminations).toEqual([
+        {
+          pid: 4242,
+          options: { terminationTimeoutMs: 1234, exitGraceMs: 2_000 },
+        },
+      ]);
+      expect((orchestrator as any).managedWorkers.has("workerpal-tree")).toBe(false);
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
+  test("bounds autoscale polling when response headers arrive but the body stalls", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            // Deliberately leave the body stream open without producing data.
+          },
+        }),
+        { status: 200 },
+      )) as typeof fetch;
+    const orchestrator = createOrchestrator(makeTempDir(), fetchImpl);
+    const startedAt = Date.now();
+
+    try {
+      expect(await (orchestrator as any).fetchWorkerAutoscaleSnapshot(20)).toBeNull();
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
   test("maintains the configured warm pool floor", async () => {
     const spawnCalls: string[] = [];
     const fetchImpl = (async (input: RequestInfo | URL) => {

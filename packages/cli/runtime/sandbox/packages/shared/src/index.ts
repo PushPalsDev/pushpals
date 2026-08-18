@@ -10,6 +10,23 @@ export {
   resolveGitStateFilePath,
 } from "./repo.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
+export {
+  DEFAULT_MAX_BUFFERED_RESPONSE_BYTES,
+  fetchBufferedWithHardDeadline,
+  fetchWithHardDeadline,
+  type FetchBufferedWithHardDeadlineOptions,
+  type FetchLike,
+  type FetchWithHardDeadlineOptions,
+} from "./bounded_fetch.js";
+export {
+  buildWindowsDescendantSweepArgv,
+  buildWindowsProcessTreeTerminationArgv,
+  runBoundedProcess,
+  terminateProcessTree,
+  type BoundedProcessResult,
+  type BoundedProcessSpawner,
+  type BoundedSubprocess,
+} from "./bounded_process.js";
 export { loadPromptTemplate, loadRepoDocText } from "./prompts.js";
 export {
   evaluateClientRuntimePreflight,
@@ -88,6 +105,7 @@ export {
   MAX_TRUSTED_VALIDATION_COMMANDS,
   MAX_TRUSTED_VALIDATION_COMMAND_LENGTH,
   extractTrustedValidationFailureEvidence,
+  normalizeTrustedValidationFingerprintLine,
   normalizeTrustedValidationCommands,
   tokenizeTrustedValidationCommand,
   truncateTrustedValidationOutput,
@@ -97,6 +115,13 @@ export {
   type TrustedValidationReport,
   type TrustedValidationCommandsResult,
 } from "./trusted_validation.js";
+export {
+  appendValidationRepairPublicationLease,
+  parseValidationRepairPublicationLease,
+  validateValidationRepairPublicationLease,
+  validationRepairPublicationLeaseFromJobParams,
+  type ValidationRepairPublicationLease,
+} from "./validation_repair_lease.js";
 export {
   MINIMUM_SUPPORTED_BUN_VERSION,
   isSupportedBunVersion,

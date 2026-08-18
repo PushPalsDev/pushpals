@@ -3,9 +3,121 @@ var __require = import.meta.require;
 
 // apps/source_control_manager/src/source_control_manager_main.ts
 import { parseArgs } from "util";
-import { isAbsolute as isAbsolute3, join as join5, relative, resolve as resolve9 } from "path";
-import { mkdirSync as mkdirSync2 } from "fs";
-import { createHash as createHash2 } from "crypto";
+import { isAbsolute as isAbsolute3, join as join6, relative, resolve as resolve9 } from "path";
+import { mkdirSync as mkdirSync3 } from "fs";
+import { createHash as createHash4, randomUUID as randomUUID2 } from "crypto";
+
+// packages/shared/src/bounded_fetch.ts
+var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
+async function fetchWithHardDeadline(options) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.floor(options.timeoutMs)) : 1;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const controller = new AbortController;
+  const upstreamSignal = options.init?.signal;
+  let rejectUpstreamAbort = null;
+  const upstreamAbort = new Promise((_resolve, reject) => {
+    rejectUpstreamAbort = reject;
+  });
+  const abortFromUpstream = () => {
+    controller.abort(upstreamSignal?.reason);
+    rejectUpstreamAbort?.(upstreamSignal?.reason instanceof Error ? upstreamSignal.reason : new DOMException("The HTTP request was aborted", "AbortError"));
+  };
+  if (upstreamSignal?.aborted) {
+    abortFromUpstream();
+  } else {
+    upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+  }
+  let timer = null;
+  const operation = Promise.resolve().then(async () => {
+    const response = await fetchImpl(options.input, {
+      ...options.init,
+      signal: controller.signal
+    });
+    return await options.consume(response, controller.signal);
+  });
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(options.timeoutMessage ?? `HTTP request timed out after ${timeoutMs}ms`));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race(upstreamSignal ? [operation, deadline, upstreamAbort] : [operation, deadline]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+  }
+}
+async function fetchBufferedWithHardDeadline(options) {
+  const { maxResponseBytes: configuredMaxResponseBytes, ...requestOptions } = options;
+  const maxResponseBytes = typeof configuredMaxResponseBytes === "number" && Number.isFinite(configuredMaxResponseBytes) && configuredMaxResponseBytes >= 0 ? Math.floor(configuredMaxResponseBytes) : DEFAULT_MAX_BUFFERED_RESPONSE_BYTES;
+  return fetchWithHardDeadline({
+    ...requestOptions,
+    consume: async (response, signal) => {
+      const responseInit = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      };
+      if (!response.body)
+        return new Response(null, responseInit);
+      const reader = response.body.getReader();
+      const sizeError = () => new Error(`HTTP response exceeded ${maxResponseBytes} byte buffer limit`);
+      const cancelReader = () => {
+        try {
+          reader.cancel(signal.reason).catch(() => {
+            return;
+          });
+        } catch {}
+      };
+      signal.addEventListener("abort", cancelReader, { once: true });
+      if (signal.aborted)
+        cancelReader();
+      try {
+        const contentLengthHeader = response.headers.get("content-length");
+        const contentLength = contentLengthHeader == null ? null : Number(contentLengthHeader);
+        if (contentLength != null && Number.isFinite(contentLength) && contentLength > maxResponseBytes) {
+          const error = sizeError();
+          await reader.cancel(error).catch(() => {
+            return;
+          });
+          throw error;
+        }
+        const chunks = [];
+        let totalBytes = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done)
+            break;
+          totalBytes += value.byteLength;
+          if (totalBytes > maxResponseBytes) {
+            const error = sizeError();
+            await reader.cancel(error).catch(() => {
+              return;
+            });
+            throw error;
+          }
+          chunks.push(value);
+        }
+        if (totalBytes === 0)
+          return new Response(null, responseInit);
+        const body = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          body.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return new Response(body, responseInit);
+      } finally {
+        signal.removeEventListener("abort", cancelReader);
+        try {
+          reader.releaseLock();
+        } catch {}
+      }
+    }
+  });
+}
 
 // packages/shared/src/communication.ts
 function stripPresenceSourcePrefix(value) {
@@ -24,12 +136,14 @@ class CommunicationManager {
   from;
   authToken;
   fetchImpl;
+  requestTimeoutMs;
   constructor(opts) {
     this.serverUrl = opts.serverUrl;
     this.sessionId = opts.sessionId;
     this.from = opts.from;
     this.authToken = opts.authToken ?? null;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.requestTimeoutMs = Math.max(1, Math.min(120000, Math.floor(opts.requestTimeoutMs ?? 1e4)));
   }
   headers() {
     const headers = { "Content-Type": "application/json" };
@@ -71,10 +185,16 @@ class CommunicationManager {
         body.turnId = meta.turnId;
       if (meta.parentId)
         body.parentId = meta.parentId;
-      const response = await this.fetchImpl(this.commandUrl(sessionId), {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body)
+      const response = await fetchBufferedWithHardDeadline({
+        input: this.commandUrl(sessionId),
+        init: {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body)
+        },
+        timeoutMs: this.requestTimeoutMs,
+        fetchImpl: this.fetchImpl,
+        timeoutMessage: `session command timed out after ${this.requestTimeoutMs}ms`
       });
       return response.ok;
     } catch {
@@ -1077,6 +1197,352 @@ function loadPushPalsConfig(options = {}) {
   return config;
 }
 
+// packages/shared/src/bounded_process.ts
+var DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
+var DEFAULT_DRAIN_TIMEOUT_MS = 2000;
+var DEFAULT_TERMINATION_TIMEOUT_MS = 5000;
+var DEFAULT_EXIT_GRACE_MS = 250;
+var MAX_STREAMING_LINE_CHARS = 64 * 1024;
+function defaultSpawner(argv, options) {
+  return Bun.spawn(argv, options);
+}
+function buildWindowsProcessTreeTerminationArgv(pid) {
+  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+function buildWindowsDescendantSweepArgv(pid) {
+  const rootPid = Math.max(0, Math.floor(pid));
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$rootPid = ${rootPid}`,
+    "$processes = @(Get-CimInstance Win32_Process)",
+    "$children = @{}",
+    "foreach ($process in $processes) {",
+    "  $parent = [int]$process.ParentProcessId",
+    "  if (-not $children.ContainsKey($parent)) { $children[$parent] = [System.Collections.Generic.List[int]]::new() }",
+    "  $children[$parent].Add([int]$process.ProcessId)",
+    "}",
+    "$stack = [System.Collections.Generic.Stack[int]]::new()",
+    "$targets = [System.Collections.Generic.List[int]]::new()",
+    "$stack.Push($rootPid)",
+    "while ($stack.Count -gt 0) {",
+    "  $parent = $stack.Pop()",
+    "  if (-not $children.ContainsKey($parent)) { continue }",
+    "  foreach ($child in $children[$parent]) { $targets.Add($child); $stack.Push($child) }",
+    "}",
+    "for ($index = $targets.Count - 1; $index -ge 0; $index--) { Stop-Process -Id $targets[$index] -Force -ErrorAction SilentlyContinue }"
+  ].join(`
+`);
+  return [
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+    Buffer.from(script, "utf16le").toString("base64")
+  ];
+}
+async function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ settled: true, value })),
+      new Promise((resolve2) => {
+        timer = setTimeout(() => resolve2({ settled: false }), Math.max(1, timeoutMs));
+      })
+    ]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+function captureBoundedStream(stream, maxBytes, options = {}) {
+  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
+    return { done: Promise.resolve(""), cancel: () => {
+      return;
+    } };
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  const headLimit = options.retainTail ? Math.max(1, Math.floor(maxBytes / 2)) : maxBytes;
+  const tailLimit = options.retainTail ? Math.max(0, maxBytes - headLimit) : 0;
+  let head = "";
+  let tail = "";
+  let observedChars = 0;
+  let lineBuffer = "";
+  let truncated = false;
+  let cancelled = false;
+  const emitLine = (line) => {
+    try {
+      options.onLine?.(line);
+    } catch {}
+  };
+  const retainAndEmit = (text) => {
+    if (!text)
+      return;
+    observedChars += text.length;
+    const headRemaining = Math.max(0, headLimit - head.length);
+    const headPart = headRemaining > 0 ? text.slice(0, headRemaining) : "";
+    head += headPart;
+    const remainder = text.slice(headPart.length);
+    if (remainder && tailLimit > 0)
+      tail = `${tail}${remainder}`.slice(-tailLimit);
+    truncated = observedChars > maxBytes;
+    if (!options.onLine)
+      return;
+    lineBuffer += text;
+    const lines = lineBuffer.split(`
+`);
+    lineBuffer = lines.pop() ?? "";
+    for (const line of lines)
+      emitLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+    if (lineBuffer.length > MAX_STREAMING_LINE_CHARS) {
+      emitLine(`${lineBuffer.slice(0, MAX_STREAMING_LINE_CHARS)}
+[pushpals: streaming line truncated]`);
+      lineBuffer = "";
+    }
+  };
+  const done = (async () => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done)
+          break;
+        retainAndEmit(decoder.decode(chunk.value, { stream: true }));
+      }
+      retainAndEmit(decoder.decode());
+      if (options.onLine && lineBuffer.length > 0) {
+        emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
+        lineBuffer = "";
+      }
+    } catch {} finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+    if (!truncated)
+      return head + tail;
+    const marker = `
+[pushpals: process output truncated]`;
+    return options.retainTail ? `${head}${marker}
+${tail}` : `${head}${marker}`;
+  })();
+  return {
+    done,
+    cancel: () => {
+      if (cancelled)
+        return;
+      cancelled = true;
+      try {
+        reader.cancel().catch(() => {
+          return;
+        });
+      } catch {}
+    }
+  };
+}
+async function terminateProcessTree(proc, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const spawn = options.spawn ?? defaultSpawner;
+  const terminationTimeoutMs = Math.max(1, options.terminationTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS);
+  const exitGraceMs = Math.max(1, options.exitGraceMs ?? DEFAULT_EXIT_GRACE_MS);
+  const gracefulSignalAlreadySent = options.gracefulSignalAlreadySent === true;
+  const pid = Number(proc.pid);
+  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const killer = spawn(buildWindowsProcessTreeTerminationArgv(pid), {
+        stdout: "ignore",
+        stderr: "ignore"
+      });
+      const taskkillExit = await settleWithin(killer.exited, terminationTimeoutMs);
+      if (!taskkillExit.settled) {
+        try {
+          killer.kill("SIGKILL");
+        } catch {}
+      }
+      if (!taskkillExit.settled || taskkillExit.value !== 0) {
+        try {
+          const sweeper = spawn(buildWindowsDescendantSweepArgv(pid), {
+            stdout: "ignore",
+            stderr: "ignore"
+          });
+          if (!(await settleWithin(sweeper.exited, terminationTimeoutMs)).settled) {
+            try {
+              sweeper.kill("SIGKILL");
+            } catch {}
+          }
+        } catch {}
+      }
+      if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+        return;
+    } catch {}
+  }
+  if (platform !== "win32" && Number.isFinite(pid) && pid > 0) {
+    if (gracefulSignalAlreadySent) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          return;
+        }
+      }
+      await settleWithin(proc.exited, exitGraceMs);
+      return;
+    }
+    let signalledProcessGroup = false;
+    try {
+      process.kill(-pid, "SIGTERM");
+      signalledProcessGroup = true;
+    } catch {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        return;
+      }
+    }
+    if (!signalledProcessGroup) {
+      if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+        return;
+    } else {
+      const groupDeadline = Date.now() + exitGraceMs;
+      while (Date.now() < groupDeadline) {
+        try {
+          process.kill(-pid, 0);
+        } catch (error) {
+          if (error?.code === "ESRCH")
+            return;
+          break;
+        }
+        await new Promise((resolve2) => setTimeout(resolve2, Math.min(25, Math.max(1, groupDeadline - Date.now()))));
+      }
+    }
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+    await settleWithin(proc.exited, exitGraceMs);
+    return;
+  }
+  if (!gracefulSignalAlreadySent) {
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      return;
+    }
+    if ((await settleWithin(proc.exited, exitGraceMs)).settled)
+      return;
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {}
+  await settleWithin(proc.exited, exitGraceMs);
+}
+async function runBoundedProcess(argv, options) {
+  const spawn = options.spawn ?? defaultSpawner;
+  const platform = options.platform ?? process.platform;
+  const proc = spawn(argv, {
+    ...options.cwd ? { cwd: options.cwd } : {},
+    ...options.env ? { env: options.env } : {},
+    ...options.stdin ? { stdin: options.stdin } : {},
+    stdout: options.stdout ?? "pipe",
+    stderr: options.stderr ?? "pipe",
+    detached: platform !== "win32"
+  });
+  const maxBytes = Math.max(1, options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const stdoutCapture = captureBoundedStream(proc.stdout, maxBytes, {
+    retainTail: options.retainOutputTail,
+    onLine: options.onStdoutLine
+  });
+  const stderrCapture = captureBoundedStream(proc.stderr, maxBytes, {
+    retainTail: options.retainOutputTail,
+    onLine: options.onStderrLine
+  });
+  const timeoutMs = Math.max(1, Math.floor(options.timeoutMs));
+  const maxTotalTimeoutMs = Math.max(timeoutMs, Math.floor(options.maxTotalTimeoutMs ?? timeoutMs));
+  const startedAtMs = Date.now();
+  let effectiveTimeoutMs = timeoutMs;
+  let deadlineAtMs = startedAtMs + timeoutMs;
+  let timer = null;
+  const outcome = await Promise.race([
+    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    new Promise((resolve2) => {
+      const scheduleDeadline = () => {
+        timer = setTimeout(() => {
+          const nowMs = Date.now();
+          let requestedExtensionValue = 0;
+          try {
+            requestedExtensionValue = options.extendTimeoutMs?.({
+              startedAtMs,
+              deadlineAtMs,
+              elapsedMs: Math.max(0, nowMs - startedAtMs)
+            }) ?? 0;
+          } catch {
+            requestedExtensionValue = 0;
+          }
+          const extensionMs = Math.min(Math.max(0, Math.floor(requestedExtensionValue)), Math.max(0, maxTotalTimeoutMs - effectiveTimeoutMs));
+          if (extensionMs > 0) {
+            effectiveTimeoutMs += extensionMs;
+            deadlineAtMs = nowMs + extensionMs;
+            try {
+              options.onTimeoutExtended?.(extensionMs, deadlineAtMs);
+            } catch {}
+            scheduleDeadline();
+            return;
+          }
+          try {
+            options.onTimeout?.(Math.max(1, nowMs - startedAtMs));
+          } catch {}
+          resolve2({ timedOut: true, exitCode: 124 });
+        }, Math.max(1, deadlineAtMs - Date.now()));
+      };
+      scheduleDeadline();
+    })
+  ]);
+  if (timer)
+    clearTimeout(timer);
+  const terminate = options.terminate ?? ((target) => terminateProcessTree(target, { platform, spawn }));
+  if (outcome.timedOut)
+    await terminate(proc);
+  const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
+  let streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), drainTimeoutMs);
+  const drainTimedOut = !streams.settled;
+  if (!streams.settled) {
+    if (!outcome.timedOut) {
+      if (options.terminate) {
+        await options.terminate(proc);
+      } else {
+        await terminateProcessTree(proc, {
+          platform,
+          spawn,
+          exitGraceMs: Math.min(250, Math.max(25, drainTimeoutMs))
+        });
+      }
+    }
+    stdoutCapture.cancel();
+    stderrCapture.cancel();
+    streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250);
+  }
+  const [stdout, rawStderr] = streams.settled ? streams.value : ["", ""];
+  const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
+  const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
+  const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
+  return {
+    stdout: trimOutput(stdout),
+    stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
+`),
+    exitCode: outcome.exitCode,
+    timedOut: outcome.timedOut,
+    drainTimedOut
+  };
+}
+
 // packages/shared/src/git_backend.ts
 function trimToken(value) {
   return String(value ?? "").trim();
@@ -1120,21 +1586,16 @@ function inferGitBackendFromRemote(remoteUrl) {
 }
 async function defaultRunCommand(command, cwd) {
   try {
-    const proc = Bun.spawn(command, {
+    const result = await runBoundedProcess(command, {
       cwd,
-      stdout: "pipe",
-      stderr: "pipe"
+      timeoutMs: 1e4,
+      outputLimitBytes: 256 * 1024
     });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited
-    ]);
     return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode
+      ok: result.exitCode === 0,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode
     };
   } catch (err) {
     return {
@@ -1653,6 +2114,8 @@ var TRUSTED_VALIDATION_EXECUTABLES = new Set([
 ]);
 var ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 var TEST_DURATION_SUFFIX_RE = /\s+\[(?:\d+(?:\.\d+)?)(?:ms|s)\]\s*$/i;
+var FAILURE_LINE_RE = /(?:^|\s)(?:error|fail(?:ed|ure)?|fatal|panic|panicked|timed?\s*out|timeout|expected|received|assert(?:ion|ionerror)?)(?:\b|:)/i;
+var PASS_LINE_RE = /^(?:\(pass\)|PASS\b|\u2713\s|\u2714\s|Tests?\s+\d+\s+passed\b)/i;
 function uniqueSorted(values) {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
@@ -1666,31 +2129,66 @@ function normalizeEvidencePath(value) {
     return null;
   return normalized;
 }
+function normalizeTrustedValidationFingerprintLine(value) {
+  return value.replace(ANSI_ESCAPE_RE, "").trim().replace(/\\/g, "/").replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "<uuid>").replace(/\b(?:job|req|request|completion|crash|task|run)_[a-z0-9][a-z0-9_-]{5,}\b/gi, (match) => `${match.slice(0, match.indexOf("_") + 1)}<id>`).replace(/\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?\b/gi, "<timestamp>").replace(TEST_DURATION_SUFFIX_RE, "").replace(/\b[0-9a-f]{40,64}\b/gi, "<sha>").replace(/\b\d+(?:\.\d+)?(?:ms|s)\b/gi, "<duration>").replace(/\b(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):\d{2,5}\b/gi, "$1:<port>").replace(/\bport\s*[:=#]?\s*\d{2,5}\b/gi, "port <port>").replace(/\b(pid|process(?:\s+id)?)\s*[:=#]?\s*\d+\b/gi, "$1 <pid>").replace(/(\.[a-z][a-z0-9]{0,7}):\d+:\d+\b/gi, "$1:<line>:<column>").replace(/(\.[a-z][a-z0-9]{0,7}):\d+\b/gi, "$1:<line>").replace(/\(\d+,\d+\)/g, "(<line>,<column>)").replace(/(?:[a-z]:)?\/(?:users\/[^/\s]+\/appdata\/local\/temp|tmp|var\/tmp)\/[^\s'"`]+/gi, "<temp-path>").replace(/(?:[a-z]:)?\/[^\s'"`]*?\.pushpals\/(?:runtime\/)?worktrees?\/[^/\s'"`]+/gi, "<worktree>").replace(/(?:[a-z]:)?\/[^\s'"`]*?\/\.worktrees\/[^/\s'"`]+/gi, "<worktree>").replace(/\s+/g, " ").slice(0, 1000);
+}
+function normalizeFailureLine(value) {
+  return normalizeTrustedValidationFingerprintLine(value);
+}
+function failureNeighborhoodLines(output, radius = 2) {
+  const lines = output.replace(ANSI_ESCAPE_RE, "").split(/\r?\n/);
+  const selected = new Set;
+  for (let index = 0;index < lines.length; index += 1) {
+    const line = lines[index]?.trim() ?? "";
+    if (!line || PASS_LINE_RE.test(line) || !FAILURE_LINE_RE.test(line))
+      continue;
+    for (let candidate = Math.max(0, index - radius);candidate <= Math.min(lines.length - 1, index + radius); candidate += 1) {
+      if (lines[candidate]?.trim())
+        selected.add(candidate);
+    }
+  }
+  return [...selected].sort((a, b) => a - b).map((index) => lines[index]?.trim() ?? "").filter(Boolean);
+}
 function extractTrustedValidationFailureEvidence(options) {
   const command = String(options.command ?? "").trim().toLowerCase();
   const output = String(options.output ?? "").replace(ANSI_ESCAPE_RE, "");
   const failedTests = [];
   const targetPathHints = [];
+  const failureLines = [];
   let currentTestPath = null;
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line)
       continue;
-    const bunPath = line.match(/^(.+\.(?:test|spec)\.[cm]?[jt]sx?):\s*$/i)?.[1];
-    const suitePath = line.match(/^(?:FAIL|failed)\s+(.+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s|$)/i)?.[1];
+    const bunPath = line.match(/^(.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?):\s*$/i)?.[1];
+    const suitePath = line.match(/^(?:FAIL|failed)\s+(.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?)(?:\s|$)/i)?.[1];
     const diagnosticPath = line.match(/^([^:(]+\.[cm]?[jt]sx?)\(\d+,\d+\):\s+error\b/i)?.[1];
-    const path = normalizeEvidencePath(bunPath ?? suitePath ?? diagnosticPath ?? "");
-    if (path) {
-      currentTestPath = path;
-      targetPathHints.push(path);
+    const pytestFailure = line.match(/^FAILED\s+(.+?\.py)::([^\s]+)(?:\s+-\s+|$)/i);
+    const portableDiagnosticPath = line.match(/^(.+?\.(?:py|go|rs)):\d+(?::\d+)?:/i)?.[1];
+    const cargoPanic = line.match(/^thread\s+['"]([^'"]+)['"]\s+panicked\s+at\s+(.+?\.rs):\d+(?::\d+)?:/i);
+    const bunContextPath = normalizeEvidencePath(bunPath ?? "");
+    if (bunContextPath)
+      currentTestPath = bunContextPath;
+    const failingPath = normalizeEvidencePath(suitePath ?? pytestFailure?.[1] ?? cargoPanic?.[2] ?? diagnosticPath ?? portableDiagnosticPath ?? "");
+    if (failingPath) {
+      currentTestPath = failingPath;
+      targetPathHints.push(failingPath);
     }
     const bunFailure = line.match(/^\(fail\)\s+(.+)$/i)?.[1];
     const jestFailure = line.match(/^[\u2715\u2717]\s+(.+)$/)?.[1];
-    const namedFailure = (bunFailure ?? jestFailure ?? "").replace(TEST_DURATION_SUFFIX_RE, "").trim();
+    const vitestFailure = line.match(/^FAIL\s+.+?\.(?:test|spec|vitest)\.[cm]?[jt]sx?\s*>\s*(.+)$/i)?.[1];
+    const jestSuiteFailure = line.match(/^\u25cf\s+(.+)$/)?.[1];
+    const goFailure = line.match(/^---\s+FAIL:\s+([^\s(]+)(?:\s+\(|$)/i)?.[1];
+    const cargoStdoutFailure = line.match(/^----\s+(.+?)\s+stdout\s+----$/i)?.[1];
+    const cargoTestFailure = line.match(/^test\s+(.+?)\s+\.\.\.\s+FAILED$/i)?.[1];
+    const namedFailure = (bunFailure ?? jestFailure ?? vitestFailure ?? jestSuiteFailure ?? pytestFailure?.[2] ?? goFailure ?? cargoStdoutFailure ?? cargoTestFailure ?? cargoPanic?.[1] ?? "").replace(TEST_DURATION_SUFFIX_RE, "").trim();
     if (namedFailure) {
       failedTests.push(namedFailure);
       if (currentTestPath)
         targetPathHints.push(currentTestPath);
+    }
+    if (!PASS_LINE_RE.test(line) && (Boolean(namedFailure) || Boolean(failingPath) || FAILURE_LINE_RE.test(line))) {
+      failureLines.push(normalizeFailureLine(line));
     }
   }
   let failureClass;
@@ -1702,11 +2200,11 @@ function extractTrustedValidationFailureEvidence(options) {
     failureClass = "test_failure";
   } else if (/timed?\s*out|timeout/i.test(output)) {
     failureClass = "timeout";
-  } else if (/(?:^|\s)(?:test|jest|vitest)(?:\s|$)/i.test(command)) {
+  } else if (/(?:^|\s)(?:test|pytest|jest|vitest)(?:\s|$)/i.test(command)) {
     failureClass = "test_failure";
   } else if (/\b(?:tsc|typecheck|type-check)\b/i.test(command)) {
     failureClass = "typecheck_failure";
-  } else if (/\b(?:eslint|lint)\b/i.test(command)) {
+  } else if (/\b(?:eslint|lint|ruff)\b/i.test(command)) {
     failureClass = "lint_failure";
   } else {
     failureClass = "trusted_validation_failed";
@@ -1714,7 +2212,8 @@ function extractTrustedValidationFailureEvidence(options) {
   return {
     failureClass,
     failedTests: uniqueSorted(failedTests),
-    targetPathHints: uniqueSorted(targetPathHints)
+    targetPathHints: uniqueSorted(targetPathHints),
+    failureLines: uniqueSorted(failureLines).slice(0, 20)
   };
 }
 function truncateTrustedValidationOutput(output, maxChars = 16000) {
@@ -1722,11 +2221,18 @@ function truncateTrustedValidationOutput(output, maxChars = 16000) {
   const boundedMax = Math.max(1000, Math.floor(maxChars));
   if (text.length <= boundedMax)
     return text;
-  const headChars = Math.min(4000, Math.floor(boundedMax / 3));
-  const tailChars = boundedMax - headChars;
-  return `${text.slice(0, headChars)}
-... trusted validation output truncated ...
-${text.slice(-tailChars)}`;
+  const headChars = Math.min(3000, Math.floor(boundedMax / 4));
+  const failureContext = failureNeighborhoodLines(text).join(`
+`).slice(0, Math.max(2000, Math.floor(boundedMax / 2)));
+  const remaining = Math.max(1000, boundedMax - headChars - failureContext.length - 100);
+  return [
+    text.slice(0, headChars),
+    "... trusted validation output truncated ...",
+    failureContext ? `Failure context:
+${failureContext}` : "",
+    text.slice(-remaining)
+  ].filter(Boolean).join(`
+`).slice(0, boundedMax);
 }
 function tokenizeTrustedValidationCommand(command) {
   const trimmed = String(command ?? "").trim();
@@ -1826,16 +2332,108 @@ function normalizeTrustedValidationCommands(value) {
   }
   return commands.length > 0 ? { ok: true, commands } : { ok: false, message: "trusted validation commands must be a non-empty array" };
 }
+// packages/shared/src/validation_repair_lease.ts
+var LEASE_KEYS = {
+  version: "pushpals-validationRepairLeaseVersion",
+  scope: "pushpals-validationRepairScope",
+  incidentId: "pushpals-validationRepairIncidentId",
+  baselineSha: "pushpals-validationRepairBaselineSha",
+  candidateSha: "pushpals-validationRepairCandidateSha",
+  candidateRef: "pushpals-validationRepairCandidateRef",
+  expectedCompletionSha: "pushpals-validationRepairCompletionSha"
+};
+var LEASE_MARKER_RE = /<!--\s*pushpals-validationRepair/i;
+var SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+var INCIDENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+var VALIDATION_CANDIDATE_REF_RE = /^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/candidate$/;
+function normalizeSha(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return SHA_RE.test(normalized) ? normalized : "";
+}
+function normalizeIncidentId(value) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return INCIDENT_ID_RE.test(normalized) ? normalized : "";
+}
+function normalizeCandidateRef(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return VALIDATION_CANDIDATE_REF_RE.test(normalized) ? normalized : "";
+}
+function metadataValues(body, key) {
+  return [...body.matchAll(new RegExp(`<!--\\s*${key}\\s*:\\s*([^>]*?)\\s*-->`, "gi"))].map((match) => String(match[1] ?? "").trim());
+}
+function singleMetadataValue(body, key) {
+  const values = metadataValues(body, key);
+  if (values.length !== 1) {
+    throw new Error(`Malformed validation-repair publication lease: expected exactly one ${key} marker, found ${values.length}.`);
+  }
+  return values[0] ?? "";
+}
+function validateValidationRepairPublicationLease(input) {
+  if (String(input.version ?? "").trim() !== "1") {
+    throw new Error("Malformed validation-repair publication lease: unsupported lease version.");
+  }
+  if (String(input.scope ?? "").trim().toLowerCase() !== "candidate_specific") {
+    throw new Error("Malformed validation-repair publication lease: scope must be candidate_specific.");
+  }
+  const incidentId = normalizeIncidentId(input.incidentId);
+  const baselineSha = normalizeSha(input.baselineSha);
+  const candidateSha = normalizeSha(input.candidateSha);
+  const candidateRef = normalizeCandidateRef(input.candidateRef);
+  const expectedCompletionSha = normalizeSha(input.expectedCompletionSha);
+  if (!incidentId || !baselineSha || !candidateSha || !candidateRef || !expectedCompletionSha) {
+    throw new Error("Malformed validation-repair publication lease: incident ID, retained candidate ref, and exact baseline/candidate/completion SHAs are required.");
+  }
+  if (baselineSha === candidateSha || candidateSha === expectedCompletionSha) {
+    throw new Error("Malformed validation-repair publication lease: baseline, candidate, and completion must identify distinct revisions.");
+  }
+  return {
+    version: 1,
+    scope: "candidate_specific",
+    incidentId,
+    baselineSha,
+    candidateSha,
+    candidateRef,
+    expectedCompletionSha
+  };
+}
+function parseValidationRepairPublicationLease(prBody) {
+  const body = String(prBody ?? "");
+  if (!LEASE_MARKER_RE.test(body))
+    return null;
+  return validateValidationRepairPublicationLease({
+    version: singleMetadataValue(body, LEASE_KEYS.version),
+    scope: singleMetadataValue(body, LEASE_KEYS.scope),
+    incidentId: singleMetadataValue(body, LEASE_KEYS.incidentId),
+    baselineSha: singleMetadataValue(body, LEASE_KEYS.baselineSha),
+    candidateSha: singleMetadataValue(body, LEASE_KEYS.candidateSha),
+    candidateRef: singleMetadataValue(body, LEASE_KEYS.candidateRef),
+    expectedCompletionSha: singleMetadataValue(body, LEASE_KEYS.expectedCompletionSha)
+  });
+}
 // packages/shared/src/session_event_visibility.ts
 var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts
 var TRUTHY2 = new Set(["1", "true", "yes", "on"]);
 var FALSY2 = new Set(["0", "false", "no", "off"]);
+// apps/source_control_manager/src/bounded_process.ts
+async function runBoundedScmProcess(argv, options) {
+  return runBoundedProcess(argv, options);
+}
+
 // apps/source_control_manager/src/git.ts
-function readSubprocessOutput(output) {
-  if (!output || typeof output === "number")
-    return Promise.resolve("");
-  return new Response(output).text();
+var DEFAULT_GIT_COMMAND_TIMEOUT_MS = 2 * 60000;
+var DEFAULT_GIT_NETWORK_TIMEOUT_MS = 5 * 60000;
+var DEFAULT_GIT_DISCOVERY_TIMEOUT_MS = 1e4;
+function positiveTimeoutFromEnv(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.max(1000, Math.floor(parsed)) : fallback;
+}
+function resolveGitCommandTimeoutMs(args, requestedTimeout, env = process.env) {
+  if (Number.isFinite(requestedTimeout) && Number(requestedTimeout) > 0) {
+    return Math.max(1, Math.floor(Number(requestedTimeout)));
+  }
+  const networkCommand = args.some((arg) => /^(?:clone|fetch|ls-remote|pull|push|submodule)$/i.test(String(arg).trim()));
+  return networkCommand ? positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_NETWORK_TIMEOUT_MS, DEFAULT_GIT_NETWORK_TIMEOUT_MS) : positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_COMMAND_TIMEOUT_MS, DEFAULT_GIT_COMMAND_TIMEOUT_MS);
 }
 function normalizeFsPathForComparison(value) {
   const resolved = resolve4(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
@@ -1938,35 +2536,25 @@ async function runViaWindowsCmd(repoPath, commandArgs, timeout) {
   const shellCandidates = resolveWindowsShellExecutableCandidates(env);
   const spawnFailures = [];
   for (const shellExecutable of shellCandidates) {
-    let proc;
     try {
-      proc = Bun.spawn([shellExecutable, "/d", "/s", "/c", commandLine], {
+      const result = await runBoundedScmProcess([shellExecutable, "/d", "/s", "/c", commandLine], {
+        timeoutMs: timeout,
+        platform: "win32",
         cwd: repoPath,
         env,
         stdout: "pipe",
         stderr: "pipe"
       });
+      return {
+        ok: result.exitCode === 0 && !result.timedOut,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode
+      };
     } catch (err) {
       spawnFailures.push(formatGitSpawnFailure(shellExecutable, err));
       continue;
     }
-    let timer;
-    if (timeout) {
-      timer = setTimeout(() => proc.kill(), timeout);
-    }
-    const [stdout, stderr] = await Promise.all([
-      readSubprocessOutput(proc.stdout),
-      readSubprocessOutput(proc.stderr)
-    ]);
-    const exitCode = await proc.exited;
-    if (timer)
-      clearTimeout(timer);
-    return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode
-    };
   }
   throw new Error(spawnFailures.length > 0 ? spawnFailures.join(" | ") : "spawn cmd.exe failed: no Windows shell candidates were available");
 }
@@ -1991,18 +2579,15 @@ async function expandWindowsGitExecutableCandidates(repoPath, candidates) {
       const whereCandidates = resolveWindowsWhereExecutableCandidates(process.env);
       for (const whereExecutable of whereCandidates) {
         try {
-          const proc = Bun.spawn([whereExecutable, candidate], {
+          const lookup = await runBoundedScmProcess([whereExecutable, candidate], {
+            timeoutMs: positiveTimeoutFromEnv(process.env.PUSHPALS_SCM_GIT_DISCOVERY_TIMEOUT_MS, DEFAULT_GIT_DISCOVERY_TIMEOUT_MS),
             cwd: repoPath,
             env: process.env,
             stdout: "pipe",
             stderr: "ignore"
           });
-          const [stdout, exitCode] = await Promise.all([
-            readSubprocessOutput(proc.stdout),
-            proc.exited
-          ]);
-          if (exitCode === 0) {
-            for (const resolved of stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0)) {
+          if (lookup.exitCode === 0 && !lookup.timedOut) {
+            for (const resolved of lookup.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0)) {
               pushCandidate(resolved);
             }
           }
@@ -2015,6 +2600,7 @@ async function expandWindowsGitExecutableCandidates(repoPath, candidates) {
   return expanded.length > 0 ? expanded : candidates;
 }
 async function runGitCommandCapture(repoPath, args, opts) {
+  const timeoutMs = resolveGitCommandTimeoutMs(args, opts?.timeout);
   const gitExecutables = await expandWindowsGitExecutableCandidates(repoPath, resolveGitExecutableCandidatesFromEnv());
   const spawnFailures = [];
   for (const gitExecutable of gitExecutables) {
@@ -2024,18 +2610,25 @@ async function runGitCommandCapture(repoPath, args, opts) {
       `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${opts.githubToken}`, "utf-8").toString("base64")}`,
       ...args
     ] : [gitExecutable, ...args];
-    let proc;
     try {
-      proc = Bun.spawn(gitArgs, {
+      const result = await runBoundedScmProcess(gitArgs, {
         cwd: repoPath,
+        env: process.env,
         stdout: "pipe",
-        stderr: "pipe"
+        stderr: "pipe",
+        timeoutMs
       });
+      return {
+        ok: result.exitCode === 0 && !result.timedOut,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode
+      };
     } catch (err) {
       spawnFailures.push(formatGitSpawnFailure(gitExecutable, err));
       if (process.platform === "win32") {
         try {
-          const shellResult = await runViaWindowsCmd(repoPath, gitArgs, opts?.timeout);
+          const shellResult = await runViaWindowsCmd(repoPath, gitArgs, timeoutMs);
           const output = [shellResult.stdout, shellResult.stderr].filter(Boolean).join(`
 `);
           if (!isWindowsCommandNotFound(output, shellResult.exitCode)) {
@@ -2048,23 +2641,6 @@ async function runGitCommandCapture(repoPath, args, opts) {
       }
       continue;
     }
-    let timer;
-    if (opts?.timeout) {
-      timer = setTimeout(() => proc.kill(), opts.timeout);
-    }
-    const [stdout, stderr] = await Promise.all([
-      readSubprocessOutput(proc.stdout),
-      readSubprocessOutput(proc.stderr)
-    ]);
-    const exitCode = await proc.exited;
-    if (timer)
-      clearTimeout(timer);
-    return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode
-    };
   }
   return {
     ok: false,
@@ -2452,6 +3028,20 @@ class GitSourceControlApi {
 }
 
 // apps/source_control_manager/src/github_pr.ts
+var DEFAULT_GITHUB_API_TIMEOUT_MS = 30000;
+function githubApiTimeoutMs() {
+  const configured = Number(process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? Math.max(1000, Math.floor(configured)) : DEFAULT_GITHUB_API_TIMEOUT_MS;
+}
+function githubFetch(input, init) {
+  const timeoutMs = githubApiTimeoutMs();
+  return fetchBufferedWithHardDeadline({
+    input,
+    init,
+    timeoutMs,
+    timeoutMessage: `GitHub API request timed out after ${timeoutMs}ms`
+  });
+}
 function parseGitHubRepo2(remoteUrl) {
   const raw = (remoteUrl ?? "").trim();
   if (!raw)
@@ -2489,7 +3079,7 @@ async function ensureIntegrationPullRequest(opts) {
   const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
   const headSpec = `${repo.owner}:${opts.headBranch}`;
   const listUrl = `${apiBase}/pulls?state=open&head=${encodeURIComponent(headSpec)}&base=${encodeURIComponent(opts.baseBranch)}`;
-  const listResponse = await fetch(listUrl, {
+  const listResponse = await githubFetch(listUrl, {
     method: "GET",
     headers: githubHeaders(opts.token)
   });
@@ -2502,7 +3092,7 @@ async function ensureIntegrationPullRequest(opts) {
     const existing = openPrs[0];
     return { created: false, number: existing.number, htmlUrl: existing.html_url };
   }
-  const createResponse = await fetch(`${apiBase}/pulls`, {
+  const createResponse = await githubFetch(`${apiBase}/pulls`, {
     method: "POST",
     headers: githubHeaders(opts.token),
     body: JSON.stringify({
@@ -2518,7 +3108,7 @@ async function ensureIntegrationPullRequest(opts) {
     return { created: true, number: created.number, htmlUrl: created.html_url };
   }
   if (createResponse.status === 422) {
-    const retryListResponse = await fetch(listUrl, {
+    const retryListResponse = await githubFetch(listUrl, {
       method: "GET",
       headers: githubHeaders(opts.token)
     });
@@ -2540,7 +3130,7 @@ async function listOpenPullRequests(opts) {
   }
   const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
   const url = `${apiBase}/pulls?state=open&base=${encodeURIComponent(opts.base)}&per_page=100`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "GET",
     headers: githubHeaders(opts.token)
   });
@@ -2561,7 +3151,7 @@ async function getPullRequestDiff(opts) {
     throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
   }
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "GET",
     headers: {
       ...githubHeaders(opts.token),
@@ -2580,7 +3170,7 @@ async function getCommitMessage(opts) {
     throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
   }
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/commits/${encodeURIComponent(opts.sha)}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "GET",
     headers: githubHeaders(opts.token)
   });
@@ -2615,7 +3205,7 @@ async function getPullRequestCommitMessage(opts) {
   let latestMessage = "";
   while (url && pages < 50) {
     pages += 1;
-    const response = await fetch(url, {
+    const response = await githubFetch(url, {
       method: "GET",
       headers: githubHeaders(opts.token)
     });
@@ -2660,7 +3250,7 @@ async function mergePullRequest(opts) {
     body.commit_title = opts.commitTitle;
   if (opts.commitMessage)
     body.commit_message = opts.commitMessage;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "PUT",
     headers: githubHeaders(opts.token),
     body: JSON.stringify(body)
@@ -2678,7 +3268,7 @@ async function closePullRequest(opts) {
     throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
   }
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "PATCH",
     headers: githubHeaders(opts.token),
     body: JSON.stringify({ state: "closed" })
@@ -2701,7 +3291,7 @@ async function deleteBranchRef(opts) {
     throw new Error("branchRef is required to delete a branch");
   }
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/git/refs/heads/${encodeURIComponent(normalizedRef)}`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "DELETE",
     headers: githubHeaders(opts.token)
   });
@@ -2722,7 +3312,7 @@ async function listPullRequestComments(opts) {
   const requested = Number.isFinite(opts.maxComments) ? Math.trunc(opts.maxComments ?? 0) : 0;
   const perPage = Math.max(1, Math.min(100, requested > 0 ? requested : 20));
   const issueUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/issues/${opts.prNumber}/comments?sort=created&direction=desc&per_page=${perPage}`;
-  const issueResponse = await fetch(issueUrl, {
+  const issueResponse = await githubFetch(issueUrl, {
     method: "GET",
     headers: githubHeaders(opts.token)
   });
@@ -2734,7 +3324,7 @@ async function listPullRequestComments(opts) {
   const normalizedIssueComments = Array.isArray(issueComments) ? issueComments : [];
   const reviewUrl = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}/comments?sort=created&direction=desc&per_page=${perPage}`;
   let normalizedReviewComments = [];
-  const reviewResponse = await fetch(reviewUrl, {
+  const reviewResponse = await githubFetch(reviewUrl, {
     method: "GET",
     headers: githubHeaders(opts.token)
   });
@@ -2765,7 +3355,7 @@ async function addPullRequestComment(opts) {
     throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
   }
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/issues/${opts.prNumber}/comments`;
-  const response = await fetch(url, {
+  const response = await githubFetch(url, {
     method: "POST",
     headers: githubHeaders(opts.token),
     body: JSON.stringify({ body: opts.body })
@@ -2915,6 +3505,7 @@ class IntegrationMaintenanceRunner {
   intervalMs;
   now;
   fetchImpl;
+  httpTimeoutMs;
   logger;
   nextRunAtMs = 0;
   lastObservedNowMs = null;
@@ -2926,6 +3517,7 @@ class IntegrationMaintenanceRunner {
     this.intervalMs = Math.max(1, Math.floor(options.intervalMs));
     this.now = options.now ?? Date.now;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    this.httpTimeoutMs = Math.max(1, Math.floor(options.httpTimeoutMs ?? 1e4));
     this.logger = options.logger ?? {
       log: (message) => console.log(message),
       warn: (message) => console.warn(message)
@@ -2994,10 +3586,16 @@ class IntegrationMaintenanceRunner {
         sync,
         now
       });
-      const response = await this.fetchImpl(`${runtimeConfig.serverUrl}/jobs/enqueue`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload)
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${runtimeConfig.serverUrl}/jobs/enqueue`,
+        init: {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload)
+        },
+        timeoutMs: this.httpTimeoutMs,
+        fetchImpl: this.fetchImpl,
+        timeoutMessage: `Integration reconciliation enqueue timed out after ${this.httpTimeoutMs}ms`
       });
       const responseBody = await response.json().catch(() => null);
       if (!response.ok) {
@@ -3053,6 +3651,8 @@ var PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_ag
 var JOB_ID_MARKER = "pushpals-jobId";
 var SESSION_ID_MARKER = "pushpals-sessionId";
 var DEFAULT_WORKSPACE_ROOT = resolve5(import.meta.dir, "..", "..", "..");
+var DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS = 5000;
+var DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 var ts = () => new Date().toISOString();
 var DEFAULT_DEPS = {
   listOpenPullRequests,
@@ -3066,11 +3666,25 @@ var DEFAULT_DEPS = {
   addPullRequestComment,
   invokeCodexReview,
   fetchImpl: fetch,
+  httpTimeoutMs: DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS,
+  httpMaxResponseBytes: DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES,
   now: () => Date.now(),
   logInfo: (line) => console.log(line),
   logWarn: (line) => console.warn(line),
   logError: (line) => console.error(line)
 };
+function createBoundedReviewAgentFetch(fetchImpl, options = {}) {
+  const timeoutMs = typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) ? Math.max(1, Math.floor(options.timeoutMs)) : DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS;
+  const maxResponseBytes = typeof options.maxResponseBytes === "number" && Number.isFinite(options.maxResponseBytes) ? Math.max(0, Math.floor(options.maxResponseBytes)) : DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES;
+  return (input, init) => fetchBufferedWithHardDeadline({
+    input,
+    init,
+    timeoutMs,
+    maxResponseBytes,
+    fetchImpl,
+    timeoutMessage: `ReviewAgent HTTP request timed out after ${timeoutMs}ms`
+  });
+}
 function splitArgs(raw) {
   const out = [];
   let current = "";
@@ -3212,29 +3826,23 @@ async function invokeCodexReview(prompt, config) {
   const tmpFile = join4(tmpdir(), `review-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   const codexCmd = resolveCodexCmd(config.codexBin);
   const args = buildCodexExecArgs(codexCmd, tmpFile);
-  const proc = Bun.spawn(args, {
-    stdin: new Blob([prompt]),
-    stdout: "ignore",
-    stderr: "pipe",
-    env: buildCodexEnv(config)
-  });
-  let timedOut = false;
-  const killTimer = setTimeout(() => {
-    timedOut = true;
-    proc.kill();
-  }, config.codexTimeoutMs);
   try {
-    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-    if (timedOut) {
+    const result = await runBoundedScmProcess(args, {
+      stdin: new Blob([prompt]),
+      stdout: "ignore",
+      stderr: "pipe",
+      env: buildCodexEnv(config),
+      timeoutMs: config.codexTimeoutMs
+    });
+    if (result.timedOut) {
       throw new Error(`Codex review timed out after ${config.codexTimeoutMs}ms`);
     }
-    if (exitCode !== 0) {
-      const detail = stderr.trim().slice(0, 800);
-      throw new Error(`Codex review failed (exit ${exitCode}): ${detail || "no stderr"}`);
+    if (result.exitCode !== 0) {
+      const detail = result.stderr.trim().slice(0, 800);
+      throw new Error(`Codex review failed (exit ${result.exitCode}): ${detail || "no stderr"}`);
     }
     return (await Bun.file(tmpFile).text()).trim();
   } finally {
-    clearTimeout(killTimer);
     await Bun.file(tmpFile).delete().catch(() => {});
   }
 }
@@ -3954,7 +4562,14 @@ class ReviewAgent {
     this.remoteUrl = remoteUrl;
     this.prBaseBranch = prBaseBranch;
     this.authToken = authToken;
-    this.deps = { ...DEFAULT_DEPS, ...deps ?? {} };
+    const resolvedDeps = { ...DEFAULT_DEPS, ...deps ?? {} };
+    this.deps = {
+      ...resolvedDeps,
+      fetchImpl: createBoundedReviewAgentFetch(resolvedDeps.fetchImpl, {
+        timeoutMs: resolvedDeps.httpTimeoutMs,
+        maxResponseBytes: resolvedDeps.httpMaxResponseBytes
+      })
+    };
   }
   requestReReview(prNumber, sha) {
     const normalizedSha = String(sha ?? "").trim();
@@ -4866,7 +5481,7 @@ function normalizeBranch2(value) {
   }
   return branch;
 }
-function normalizeSha(value) {
+function normalizeSha2(value) {
   const sha = value.trim().toLowerCase();
   return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha) ? sha : "";
 }
@@ -4874,8 +5489,8 @@ function parseReviewPublicationLease(prBody) {
   const body = String(prBody ?? "");
   const targetBranch = normalizeBranch2(metadataValue(body, "pushpals-reviewTargetBranch"));
   const baseBranch = normalizeBranch2(metadataValue(body, "pushpals-reviewBaseBranch"));
-  const expectedHeadSha = normalizeSha(metadataValue(body, "pushpals-reviewExpectedHeadSha"));
-  const expectedBaseSha = normalizeSha(metadataValue(body, "pushpals-reviewExpectedBaseSha"));
+  const expectedHeadSha = normalizeSha2(metadataValue(body, "pushpals-reviewExpectedHeadSha"));
+  const expectedBaseSha = normalizeSha2(metadataValue(body, "pushpals-reviewExpectedBaseSha"));
   if (!targetBranch || !expectedHeadSha)
     return null;
   return {
@@ -4897,10 +5512,7 @@ function buildReviewCompletionValidationCheckoutArgs(tempBranch, commitSha) {
   return ["checkout", "-B", tempBranch, commitSha];
 }
 function reviewCompletionHandoffMatches(resolvedSha, expectedSha) {
-  return normalizeSha(String(resolvedSha ?? "")) === normalizeSha(expectedSha);
-}
-function shouldCleanupCompletionHandoff(processedConfirmed) {
-  return processedConfirmed;
+  return normalizeSha2(String(resolvedSha ?? "")) === normalizeSha2(expectedSha);
 }
 function shouldUseReviewPublicationFlow(reviewAgentEnabled, lease) {
   return reviewAgentEnabled || lease !== null;
@@ -4946,14 +5558,11 @@ function isCherryPickConflictOutput(text) {
     return false;
   return normalized.includes("could not apply") || normalized.includes("after resolving the conflicts") || normalized.includes("cherry-pick --continue") || normalized.includes("merge conflict") || normalized.includes("conflict (content)");
 }
-function shouldBypassApplyFailureInReviewMode(input) {
-  if (!input.reviewAgentEnabled)
-    return false;
-  if (normalize(input.mergeStrategy) !== "cherry-pick")
-    return false;
+function reviewApplyFailureBlocksPublication(input) {
   const combined = [input.applyStderr ?? "", input.applyStdout ?? ""].filter(Boolean).join(`
 `);
-  return isCherryPickConflictOutput(combined);
+  isCherryPickConflictOutput(combined);
+  return true;
 }
 
 // apps/source_control_manager/src/runtime_helpers.ts
@@ -5149,15 +5758,17 @@ function summarizeReviewAgentRuntimeReadiness(statusPayload, sessionId) {
 async function probeReviewAgentRuntimeReadiness(options) {
   const timeoutMs = Math.max(1, options.timeoutMs ?? 2500);
   const fetchImpl = options.fetchImpl ?? fetch;
-  const controller = new AbortController;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const headers = {};
     if (options.authToken)
       headers.Authorization = `Bearer ${options.authToken}`;
-    const response = await fetchImpl(`${options.serverUrl.replace(/\/+$/, "")}/system/status`, {
-      headers,
-      signal: controller.signal
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${options.serverUrl.replace(/\/+$/, "")}/system/status`,
+      init: { headers },
+      timeoutMs,
+      fetchImpl,
+      maxResponseBytes: 2 * 1024 * 1024,
+      timeoutMessage: `system status probe timed out after ${timeoutMs}ms`
     });
     if (!response.ok) {
       return {
@@ -5172,8 +5783,6 @@ async function probeReviewAgentRuntimeReadiness(options) {
       ready: false,
       detail: `system status probe failed: ${String(err)}`
     };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -5260,12 +5869,517 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
   return resolve6(fallbackCwd);
 }
 
+// apps/source_control_manager/src/completion_callback.ts
+async function withHardDeadline(operation, timeoutMs, timeoutMessage = "operation timed out") {
+  const controller = new AbortController;
+  let timer = null;
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(timeoutMessage));
+    }, Math.max(1, Math.floor(timeoutMs)));
+  });
+  try {
+    return await Promise.race([operation(controller.signal), deadline]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+async function postCompletionCallbackWithRetry(options) {
+  const attempts = Math.max(1, Math.min(5, Math.floor(options.attempts ?? 3)));
+  const timeoutMs = Math.max(100, Math.floor(options.timeoutMs ?? 5000));
+  const retryDelayMs = Math.max(0, Math.floor(options.retryDelayMs ?? 200));
+  const wait = options.wait ?? ((delayMs) => Bun.sleep(delayMs));
+  let lastStatus = null;
+  let lastError = null;
+  let attempted = 0;
+  for (let attempt = 1;attempt <= attempts; attempt += 1) {
+    attempted = attempt;
+    try {
+      const response = await withHardDeadline(options.request, timeoutMs, `completion callback timed out after ${timeoutMs}ms`);
+      lastStatus = response.status;
+      lastError = null;
+      if (response.ok) {
+        return { confirmed: true, attempts: attempt, lastStatus, lastError };
+      }
+      if (response.status >= 400 && response.status < 500 && response.status !== 408)
+        break;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    if (attempt < attempts && retryDelayMs > 0) {
+      await wait(retryDelayMs * attempt);
+    }
+  }
+  return { confirmed: false, attempts: attempted, lastStatus, lastError };
+}
+var postCompletionProcessedWithRetry = postCompletionCallbackWithRetry;
+
+// apps/source_control_manager/src/completion_gc.ts
+import { createHash, randomUUID } from "crypto";
+import {
+  closeSync,
+  existsSync as existsSync5,
+  fsyncSync,
+  mkdirSync as mkdirSync2,
+  openSync,
+  readFileSync as readFileSync6,
+  readdirSync,
+  renameSync,
+  unlinkSync as unlinkSync2,
+  writeFileSync as writeFileSync2
+} from "fs";
+import { join as join5 } from "path";
+var COMPLETION_GC_VERSION = 1;
+var SHA_RE2 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+var SAFE_COMPLETION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/;
+var SAFE_REMOTE_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+var SAFE_PUSHPALS_REF_RE = /^refs\/pushpals\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+var SAFE_VALIDATION_REF_RE = /^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/(?:baseline|candidate|validated)$/i;
+var MAX_ADDITIONAL_VALIDATION_REFS = 24;
+function validationNamespace(completionId) {
+  const key = createHash("sha256").update(completionId).digest("hex").slice(0, 32);
+  return `refs/pushpals/validation/${key}`;
+}
+function isSafePushpalsRef(value) {
+  return SAFE_PUSHPALS_REF_RE.test(value) && !value.includes("..") && !value.includes("//") && !value.includes("@{") && !value.endsWith("/") && !value.endsWith(".") && !value.split("/").some((part) => part.endsWith(".lock"));
+}
+function normalizeRecord(input) {
+  if (input?.version !== COMPLETION_GC_VERSION) {
+    throw new Error("Completion GC record has an unsupported version.");
+  }
+  const completionId = String(input?.completionId ?? "").trim();
+  if (!SAFE_COMPLETION_ID_RE.test(completionId)) {
+    throw new Error("Completion GC record has an invalid completion ID.");
+  }
+  const completionBranch = String(input?.completionBranch ?? "").trim();
+  if (!completionBranch || completionBranch.length > 512 || /[\u0000-\u001f\u007f]/.test(completionBranch)) {
+    throw new Error(`Completion GC record ${completionId} has an invalid completion branch.`);
+  }
+  if (completionBranch.startsWith("refs/pushpals/") && !isSafePushpalsRef(completionBranch)) {
+    throw new Error(`Completion GC record ${completionId} has an unsafe PushPals ref.`);
+  }
+  const commitSha = String(input?.commitSha ?? "").trim().toLowerCase();
+  if (!SHA_RE2.test(commitSha)) {
+    throw new Error(`Completion GC record ${completionId} has an invalid commit SHA.`);
+  }
+  const claimGeneration = Number(input?.claimGeneration);
+  if (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1) {
+    throw new Error(`Completion GC record ${completionId} has an invalid claim generation.`);
+  }
+  const remote = input?.remote === null ? null : String(input?.remote ?? "").trim();
+  if (remote !== null && (!SAFE_REMOTE_RE.test(remote) || remote.includes("..") || remote.includes("//"))) {
+    throw new Error(`Completion GC record ${completionId} has an invalid remote.`);
+  }
+  if (remote !== null && !isSafePushpalsRef(completionBranch)) {
+    throw new Error(`Completion GC record ${completionId} cannot delete a non-PushPals remote ref.`);
+  }
+  const additionalValidationRefs = [
+    ...new Set((Array.isArray(input?.additionalValidationRefs) ? input.additionalValidationRefs : []).map((value) => String(value ?? "").trim()))
+  ].sort((a, b) => a.localeCompare(b));
+  if (additionalValidationRefs.length > MAX_ADDITIONAL_VALIDATION_REFS) {
+    throw new Error(`Completion GC record ${completionId} has too many retained validation refs.`);
+  }
+  for (const ref of additionalValidationRefs) {
+    if (!isSafePushpalsRef(ref) || !SAFE_VALIDATION_REF_RE.test(ref)) {
+      throw new Error(`Completion GC record ${completionId} contains an invalid validation checkpoint ref.`);
+    }
+  }
+  const createdAt = String(input?.createdAt ?? "").trim();
+  if (!createdAt || !Number.isFinite(Date.parse(createdAt))) {
+    throw new Error(`Completion GC record ${completionId} has an invalid creation time.`);
+  }
+  return {
+    version: COMPLETION_GC_VERSION,
+    completionId,
+    completionBranch,
+    commitSha,
+    claimGeneration,
+    remote,
+    additionalValidationRefs,
+    createdAt
+  };
+}
+function sameRecord(left, right) {
+  return left.completionId === right.completionId && left.completionBranch === right.completionBranch && left.commitSha === right.commitSha && left.claimGeneration === right.claimGeneration && left.remote === right.remote && left.additionalValidationRefs.join(`
+`) === right.additionalValidationRefs.join(`
+`);
+}
+function createCompletionGcRecord(input) {
+  return normalizeRecord({
+    version: COMPLETION_GC_VERSION,
+    completionId: input.completionId,
+    completionBranch: input.completionBranch,
+    commitSha: input.commitSha,
+    claimGeneration: input.claimGeneration,
+    remote: input.remote ?? null,
+    additionalValidationRefs: input.additionalValidationRefs ?? [],
+    createdAt: input.createdAt ?? new Date().toISOString()
+  });
+}
+function completionGcValidationNamespace(record) {
+  return validationNamespace(record.completionId);
+}
+function completionGcAuthorityConfirmsProcessed(record, authority) {
+  if (!authority || authority.status !== "processed")
+    return false;
+  const authoritySha = String(authority.commitSha ?? "").trim().toLowerCase();
+  const authorityGeneration = Number(authority.claimGeneration);
+  return authority.id === record.completionId && authority.branch === record.completionBranch && authoritySha === record.commitSha && Number.isSafeInteger(authorityGeneration) && authorityGeneration >= record.claimGeneration;
+}
+function buildCompletionGcLocalDeleteArgs(record, resolvedSha) {
+  if (!record.completionBranch.startsWith("refs/pushpals/"))
+    return null;
+  const normalizedResolvedSha = String(resolvedSha ?? "").trim().toLowerCase();
+  if (normalizedResolvedSha !== record.commitSha)
+    return null;
+  return ["update-ref", "-d", record.completionBranch, record.commitSha];
+}
+function buildCompletionGcRemoteDeleteArgs(record, resolvedSha) {
+  if (!record.remote)
+    return null;
+  const normalizedResolvedSha = String(resolvedSha ?? "").trim().toLowerCase();
+  if (normalizedResolvedSha !== record.commitSha)
+    return null;
+  return [
+    "push",
+    `--force-with-lease=${record.completionBranch}:${record.commitSha}`,
+    record.remote,
+    `:${record.completionBranch}`
+  ];
+}
+
+class CompletionGcJournal {
+  directory;
+  cursor = 0;
+  constructor(stateDir) {
+    this.directory = join5(stateDir, "completion-ref-gc");
+    mkdirSync2(this.directory, { recursive: true });
+  }
+  pathFor(record) {
+    const key = createHash("sha256").update(record.completionId).digest("hex").slice(0, 32);
+    return join5(this.directory, `${key}-${record.claimGeneration}.json`);
+  }
+  enqueue(input) {
+    const record = normalizeRecord(input);
+    const destination = this.pathFor(record);
+    if (existsSync5(destination)) {
+      const existing = normalizeRecord(JSON.parse(readFileSync6(destination, "utf8")));
+      if (!sameRecord(existing, record)) {
+        throw new Error(`Completion GC record ${record.completionId}/${record.claimGeneration} conflicts with an existing durable record.`);
+      }
+      return existing;
+    }
+    const temporary = `${destination}.tmp-${process.pid}-${randomUUID()}`;
+    let fd = null;
+    try {
+      fd = openSync(temporary, "wx", 384);
+      writeFileSync2(fd, `${JSON.stringify(record)}
+`, "utf8");
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = null;
+      renameSync(temporary, destination);
+      return record;
+    } catch (error) {
+      if (fd !== null)
+        closeSync(fd);
+      try {
+        unlinkSync2(temporary);
+      } catch {}
+      if (existsSync5(destination)) {
+        const existing = normalizeRecord(JSON.parse(readFileSync6(destination, "utf8")));
+        if (sameRecord(existing, record))
+          return existing;
+      }
+      throw error;
+    }
+  }
+  list(limit = 4, onWarning = () => {
+    return;
+  }) {
+    const names = readdirSync(this.directory).filter((name) => /^[0-9a-f]{32}-[1-9][0-9]*\.json$/i.test(name)).sort((a, b) => a.localeCompare(b));
+    if (names.length === 0) {
+      this.cursor = 0;
+      return [];
+    }
+    const boundedLimit = Math.max(1, Math.min(32, Math.floor(limit)));
+    const selectedCount = Math.min(boundedLimit, names.length);
+    const start = this.cursor % names.length;
+    const selected = Array.from({ length: selectedCount }, (_unused, index) => names[(start + index) % names.length]);
+    this.cursor = (start + selectedCount) % names.length;
+    const records = [];
+    for (const name of selected) {
+      const path = join5(this.directory, name);
+      try {
+        const record = normalizeRecord(JSON.parse(readFileSync6(path, "utf8")));
+        if (this.pathFor(record) !== path) {
+          throw new Error("record identity does not match its journal filename");
+        }
+        records.push(record);
+      } catch (error) {
+        onWarning(`Ignoring invalid completion GC journal ${name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return records;
+  }
+  remove(record) {
+    try {
+      unlinkSync2(this.pathFor(normalizeRecord(record)));
+    } catch (error) {
+      if (error?.code !== "ENOENT")
+        throw error;
+    }
+  }
+}
+async function reconcileCompletionGcJournal(options) {
+  const onWarning = options.onWarning ?? (() => {
+    return;
+  });
+  const records = options.journal.list(options.limit ?? 4, onWarning);
+  const result = {
+    examined: records.length,
+    cleaned: 0,
+    retained: 0,
+    uncertain: 0
+  };
+  const authorityResults = await Promise.all(records.map(async (record) => {
+    try {
+      return { record, authority: await options.resolveAuthority(record), error: null };
+    } catch (error) {
+      return { record, authority: null, error };
+    }
+  }));
+  for (const authorityResult of authorityResults) {
+    const { record, authority, error } = authorityResult;
+    if (error) {
+      result.uncertain += 1;
+      result.retained += 1;
+      onWarning(`Completion ${record.completionId} cleanup authority is unreachable; retaining refs: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    if (!completionGcAuthorityConfirmsProcessed(record, authority)) {
+      result.retained += 1;
+      continue;
+    }
+    try {
+      const cleaned = await options.cleanup(record);
+      if (!cleaned) {
+        result.retained += 1;
+        continue;
+      }
+      options.journal.remove(record);
+      result.cleaned += 1;
+    } catch (cleanupError) {
+      result.retained += 1;
+      onWarning(`Completion ${record.completionId} ref cleanup failed and will be retried: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+  }
+  return result;
+}
+async function claimBeforeCompletionGc(options) {
+  const result = await options.claim();
+  if (options.isIdle(result))
+    await options.reconcile();
+  return result;
+}
+
+// apps/source_control_manager/src/completion_lease.ts
+class CompletionLeaseRenewalCoordinator {
+  attempt;
+  inFlight = null;
+  lastFailureDetail = null;
+  leaseLost = false;
+  constructor(attempt) {
+    this.attempt = attempt;
+  }
+  async renew(required = false) {
+    if (this.leaseLost) {
+      const detail = this.lastFailureDetail ?? "Completion publication lease was permanently lost.";
+      if (required)
+        throw new Error(detail);
+      return false;
+    }
+    try {
+      const result = await this.sharedAttempt();
+      if (result.ok) {
+        this.lastFailureDetail = null;
+        return true;
+      }
+      this.lastFailureDetail = String(result.detail ?? "").trim() || "Completion publication lease was not renewed.";
+      if (result.leaseLost)
+        this.leaseLost = true;
+      if (required)
+        throw new Error(this.lastFailureDetail);
+      return false;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.lastFailureDetail = detail || "Completion publication lease renewal failed.";
+      if (required)
+        throw error;
+      return false;
+    }
+  }
+  failureDetail() {
+    return this.lastFailureDetail;
+  }
+  hasLostLease() {
+    return this.leaseLost;
+  }
+  sharedAttempt() {
+    if (this.inFlight)
+      return this.inFlight;
+    const attempt = Promise.resolve().then(() => this.attempt());
+    this.inFlight = attempt;
+    attempt.then(() => {
+      if (this.inFlight === attempt)
+        this.inFlight = null;
+    }, () => {
+      if (this.inFlight === attempt)
+        this.inFlight = null;
+    });
+    return attempt;
+  }
+}
+
+// apps/source_control_manager/src/publication_recovery.ts
+class PublicationAuthorityUnreachableError extends Error {
+  mutationError;
+  probeError;
+  constructor(options) {
+    const probeDetail = options.probeError instanceof Error ? options.probeError.message : String(options.probeError ?? "unknown authority error");
+    super(`${options.failurePrefix}; authoritative publication state is unreachable: ${probeDetail}`);
+    this.name = "PublicationAuthorityUnreachableError";
+    this.mutationError = options.mutationError;
+    this.probeError = options.probeError;
+  }
+}
+
+class PublicationProofLostError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PublicationProofLostError";
+  }
+}
+function authoritativeGitFailureDetail(result) {
+  return [result.stderr, result.stdout].filter(Boolean).join(`
+`).trim() || "no output";
+}
+function authoritativeRefShaFromGitResult(result, label) {
+  if (!result.ok) {
+    if (result.exitCode === 1)
+      return null;
+    throw new Error(`Authoritative ref probe failed for ${label} (exit ${result.exitCode}): ${authoritativeGitFailureDetail(result)}`);
+  }
+  const sha = String(result.stdout ?? "").trim().toLowerCase();
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) {
+    throw new Error(`Authoritative ref probe for ${label} returned a non-commit SHA.`);
+  }
+  return sha;
+}
+function authoritativeAncestryFromGitResult(result, label) {
+  if (result.ok)
+    return true;
+  if (result.exitCode === 1)
+    return false;
+  throw new Error(`Authoritative ancestry probe failed for ${label} (exit ${result.exitCode}): ${authoritativeGitFailureDetail(result)}`);
+}
+function publicationFailureDisposition(options) {
+  if (options.publicationReadyForFinalization || options.authoritativeReprobe === "published") {
+    return "finalize";
+  }
+  if (options.validatedCheckpointRecoveryPending)
+    return "reconcile";
+  if (options.publicationAttemptUncertain && options.authoritativeReprobe === "unreachable") {
+    return "reconcile";
+  }
+  return "fail";
+}
+async function assertFinalAuthoritativePublicationProof(options) {
+  let published;
+  try {
+    published = await options.provePublished();
+  } catch (probeError) {
+    throw new PublicationAuthorityUnreachableError({
+      failurePrefix: options.failurePrefix,
+      probeError
+    });
+  }
+  if (!published) {
+    throw new PublicationProofLostError(options.failurePrefix);
+  }
+}
+function durablePublicationRecoveryState(durablePublicationProven) {
+  return {
+    skipPublicationMutation: durablePublicationProven,
+    protectFromTerminalFailure: durablePublicationProven
+  };
+}
+function shouldSkipValidationForDurableRecovery(options) {
+  return options.validationProven && options.publicationProven;
+}
+async function publishWithAuthoritativeProof(options) {
+  let result;
+  try {
+    result = await options.mutate();
+  } catch (error) {
+    let published2;
+    try {
+      published2 = await options.provePublished();
+    } catch (probeError) {
+      throw new PublicationAuthorityUnreachableError({
+        failurePrefix: options.failurePrefix,
+        mutationError: error,
+        probeError
+      });
+    }
+    if (published2) {
+      return {
+        result: {
+          ok: false,
+          stderr: error instanceof Error ? error.message : String(error)
+        },
+        recoveredFromAmbiguousFailure: true
+      };
+    }
+    throw error;
+  }
+  let published;
+  try {
+    published = await options.provePublished();
+  } catch (probeError) {
+    throw new PublicationAuthorityUnreachableError({
+      failurePrefix: options.failurePrefix,
+      probeError
+    });
+  }
+  if (!published) {
+    const detail = [result.stderr, result.stdout].filter(Boolean).join(`
+`).trim();
+    throw new Error(`${options.failurePrefix}${detail ? `: ${detail}` : ""}`);
+  }
+  return { result, recoveredFromAmbiguousFailure: !result.ok };
+}
+async function isValidationCheckpointPublished(options) {
+  const candidateSha = String(options.candidateSha ?? "").trim();
+  if (!candidateSha)
+    return false;
+  const publicationHead = options.useReviewPublicationFlow ? options.reviewRemoteHeadSha : options.pushMainAfterMerge ? options.remoteIntegrationHeadSha : options.localIntegrationHeadSha;
+  const normalizedHead = String(publicationHead ?? "").trim();
+  if (!normalizedHead)
+    return false;
+  if (options.useReviewPublicationFlow) {
+    return normalizedHead.toLowerCase() === candidateSha.toLowerCase();
+  }
+  return options.isAncestor(candidateSha, normalizedHead);
+}
+
 // apps/source_control_manager/src/trusted_validation.ts
-import { createHash } from "crypto";
-import { existsSync as existsSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync2 } from "fs";
+import { createHash as createHash2 } from "crypto";
+import { existsSync as existsSync6, readFileSync as readFileSync7, writeFileSync as writeFileSync3 } from "fs";
 import { basename as basename2, resolve as resolve7 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60000;
-var PROCESS_TREE_TERMINATION_GRACE_MS = 5000;
 var PROCESS_STREAM_DRAIN_GRACE_MS = 2000;
 var PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 var TRUSTED_INSTALL_MARKER = ".pushpals-trusted-install.json";
@@ -5281,6 +6395,25 @@ var BUN_DEPENDENCY_COMMANDS = new Set([
   "tsc",
   "vitest"
 ]);
+function emitTrustedValidationProgress(callback, event) {
+  try {
+    callback?.(event);
+  } catch {}
+}
+function trustedValidationHealthPhase(event) {
+  return `trusted_validation_${event.phase}_${event.boundary}_attempt_${event.attempt}`;
+}
+function resolveTrustedValidationOutcome(results) {
+  const terminalByCommand = new Map;
+  for (const result of results) {
+    terminalByCommand.set(`${result.phase}\x00${result.command}`, result);
+  }
+  const terminalResults = [...terminalByCommand.values()];
+  return {
+    terminalResults,
+    terminalFailure: terminalResults.find((result) => !result.ok) ?? null
+  };
+}
 function currentBunExecutable(explicit) {
   const configured = String(explicit ?? process.env.PUSHPALS_BUN_BIN ?? "").trim();
   if (configured)
@@ -5304,7 +6437,7 @@ function resolveTrustedValidationArgv(argv, bunExecutable) {
   return [...argv];
 }
 function resolveTrustedValidationPreparationArgv(options) {
-  const hasBunProject = existsSync5(`${options.repoPath}/package.json`) && (existsSync5(`${options.repoPath}/bun.lock`) || existsSync5(`${options.repoPath}/bun.lockb`));
+  const hasBunProject = existsSync6(`${options.repoPath}/package.json`) && (existsSync6(`${options.repoPath}/bun.lock`) || existsSync6(`${options.repoPath}/bun.lockb`));
   const needsDependencies = options.commandArgv.some((argv) => BUN_DEPENDENCY_COMMANDS.has(String(argv[0] ?? "").trim().toLowerCase()));
   if (!hasBunProject || !needsDependencies)
     return null;
@@ -5316,19 +6449,19 @@ function trustedValidationInstallFingerprint(options) {
   const lockPath = [
     resolve7(options.repoPath, "bun.lock"),
     resolve7(options.repoPath, "bun.lockb")
-  ].find((path) => existsSync5(path));
-  if (!existsSync5(packagePath) || !lockPath)
+  ].find((path) => existsSync6(path));
+  if (!existsSync6(packagePath) || !lockPath)
     return null;
-  const hash = createHash("sha256");
+  const hash = createHash2("sha256");
   hash.update(`platform=${process.platform}-${process.arch}
 `);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}
 `);
   hash.update(`version=${typeof Bun !== "undefined" ? Bun.version : "unknown"}
 `);
-  hash.update(readFileSync6(packagePath));
+  hash.update(readFileSync7(packagePath));
   hash.update("\x00");
-  hash.update(readFileSync6(lockPath));
+  hash.update(readFileSync7(lockPath));
   return hash.digest("hex");
 }
 function trustedInstallMarkerPath(repoPath) {
@@ -5339,7 +6472,7 @@ function hasFreshTrustedValidationInstall(options) {
   if (!fingerprint)
     return false;
   try {
-    const marker = JSON.parse(readFileSync6(trustedInstallMarkerPath(options.repoPath), "utf8"));
+    const marker = JSON.parse(readFileSync7(trustedInstallMarkerPath(options.repoPath), "utf8"));
     return marker.fingerprint === fingerprint;
   } catch {
     return false;
@@ -5382,19 +6515,24 @@ async function ensureTrustedValidationInstall(options) {
       cwd: options.repoPath,
       timeoutMs: options.timeoutMs
     });
+    const evidence = preparation.ok ? null : extractTrustedValidationFailureEvidence({
+      command: "bun install --frozen-lockfile",
+      phase: "dependency_install",
+      output: preparation.output,
+      exitCode: preparation.exitCode
+    });
     const result = {
       command: "bun install --frozen-lockfile",
       ...preparation,
       output: truncateTrustedValidationOutput(preparation.output),
-      phase: "dependency_install"
+      phase: "dependency_install",
+      ...evidence ?? {}
     };
-    if (!result.ok)
-      Object.assign(result, extractTrustedValidationFailureEvidence(result));
     if (preparation.ok) {
       const fingerprint = trustedValidationInstallFingerprint(options);
       if (fingerprint) {
         try {
-          writeFileSync2(trustedInstallMarkerPath(options.repoPath), JSON.stringify({ fingerprint, updatedAt: new Date().toISOString() }), "utf8");
+          writeFileSync3(trustedInstallMarkerPath(options.repoPath), JSON.stringify({ fingerprint, updatedAt: new Date().toISOString() }), "utf8");
         } catch {}
       }
     }
@@ -5408,132 +6546,20 @@ async function ensureTrustedValidationInstall(options) {
       trustedInstallFlights.delete(flightKey);
   }
 }
-function buildWindowsProcessTreeTerminationArgv(pid) {
-  return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
-}
-async function settleWithin(promise, timeoutMs) {
-  let timer = null;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((resolvePromise) => {
-        timer = setTimeout(() => resolvePromise(null), Math.max(1, timeoutMs));
-      })
-    ]);
-  } finally {
-    if (timer)
-      clearTimeout(timer);
-  }
-}
-function captureBoundedProcessStream(stream, maxBytes = PROCESS_OUTPUT_LIMIT_BYTES) {
-  if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
-    return { done: Promise.resolve(""), cancel: () => {} };
-  }
-  const reader = stream.getReader();
-  const decoder = new TextDecoder;
-  let output = "";
-  let bytes = 0;
-  let truncated = false;
-  let cancelled = false;
-  const done = (async () => {
-    try {
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done)
-          break;
-        if (bytes < maxBytes) {
-          const remaining = Math.max(0, maxBytes - bytes);
-          const value = chunk.value.byteLength > remaining ? chunk.value.slice(0, remaining) : chunk.value;
-          output += decoder.decode(value, { stream: true });
-          bytes += value.byteLength;
-          if (value.byteLength < chunk.value.byteLength)
-            truncated = true;
-        } else {
-          truncated = true;
-        }
-      }
-      output += decoder.decode();
-    } catch {} finally {
-      try {
-        reader.releaseLock();
-      } catch {}
-    }
-    return `${output}${truncated ? `
-[pushpals: process output truncated]` : ""}`;
-  })();
-  return {
-    done,
-    cancel: () => {
-      if (cancelled)
-        return;
-      cancelled = true;
-      try {
-        reader.cancel().catch(() => {});
-      } catch {}
-    }
-  };
-}
-async function terminateProcessTree(proc, platform = process.platform) {
-  const pid = Number(proc.pid);
-  if (platform === "win32" && Number.isFinite(pid) && pid > 0) {
-    try {
-      const killer = Bun.spawn(buildWindowsProcessTreeTerminationArgv(pid), {
-        stdout: "ignore",
-        stderr: "ignore"
-      });
-      const settled = await settleWithin(killer.exited, PROCESS_TREE_TERMINATION_GRACE_MS);
-      if (settled === null) {
-        killer.kill("SIGKILL");
-      } else if (settled === 0 && await settleWithin(proc.exited, PROCESS_STREAM_DRAIN_GRACE_MS) !== null) {
-        return;
-      }
-    } catch {}
-  }
-  try {
-    proc.kill("SIGTERM");
-  } catch {
-    return;
-  }
-  if (await settleWithin(proc.exited, PROCESS_TREE_TERMINATION_GRACE_MS) !== null)
-    return;
-  try {
-    proc.kill("SIGKILL");
-  } catch {}
-}
 async function runProcessWithTreeTimeout(argv, options) {
-  const proc = Bun.spawn(argv, {
+  const result = await runBoundedProcess(argv, {
     cwd: options.cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env }
+    env: { ...process.env },
+    timeoutMs: Math.max(1, options.timeoutMs),
+    outputLimitBytes: PROCESS_OUTPUT_LIMIT_BYTES,
+    streamDrainTimeoutMs: PROCESS_STREAM_DRAIN_GRACE_MS
   });
-  const stdoutCapture = captureBoundedProcessStream(proc.stdout);
-  const stderrCapture = captureBoundedProcessStream(proc.stderr);
-  let timer = null;
-  const outcome = await Promise.race([
-    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
-    new Promise((resolvePromise) => {
-      timer = setTimeout(() => resolvePromise({ timedOut: true, exitCode: 124 }), Math.max(1, options.timeoutMs));
-    })
-  ]);
-  if (timer)
-    clearTimeout(timer);
-  if (outcome.timedOut)
-    await terminateProcessTree(proc);
-  const drained = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), PROCESS_STREAM_DRAIN_GRACE_MS);
-  if (!drained) {
-    stdoutCapture.cancel();
-    stderrCapture.cancel();
-  }
-  const streams = drained ?? await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250) ?? ["", ""];
-  const [stdout, stderr] = streams;
-  const timeoutDetail = outcome.timedOut ? `Command timed out after ${Math.max(1, options.timeoutMs)}ms; terminated process tree.` : "";
   return {
-    ok: !outcome.timedOut && outcome.exitCode === 0,
-    output: [stdout.trim(), stderr.trim(), timeoutDetail].filter(Boolean).join(`
+    ok: !result.timedOut && result.exitCode === 0,
+    output: [result.stdout, result.stderr].filter(Boolean).join(`
 `),
-    exitCode: outcome.exitCode,
-    ...outcome.timedOut ? { timedOut: true } : {}
+    exitCode: result.exitCode,
+    ...result.timedOut ? { timedOut: true } : {}
   };
 }
 async function runTrustedValidationCommands(options) {
@@ -5556,34 +6582,520 @@ async function runTrustedValidationCommands(options) {
     bunExecutable: options.bunExecutable
   });
   if (preparationArgv) {
-    const preparation = await ensureTrustedValidationInstall({
+    const preparationCommand = "bun install --frozen-lockfile";
+    emitTrustedValidationProgress(options.onProgress, {
+      boundary: "start",
+      phase: "dependency_install",
+      command: preparationCommand,
+      attempt: 1
+    });
+    let preparation = await ensureTrustedValidationInstall({
       repoPath: options.repoPath,
       preparationArgv,
       timeoutMs,
       bunExecutable: options.bunExecutable,
       runner
     });
+    emitTrustedValidationProgress(options.onProgress, {
+      boundary: "complete",
+      phase: "dependency_install",
+      command: preparationCommand,
+      attempt: 1,
+      ok: preparation.ok,
+      durationMs: preparation.durationMs,
+      cached: Boolean(preparation.cached)
+    });
+    if (!preparation.ok && options.retryTransientFailures !== false && isTransientTrustedValidationFailure(preparation)) {
+      results.push({
+        ...preparation,
+        attempt: 1,
+        retryReason: "transient_infrastructure"
+      });
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "retry",
+        phase: "dependency_install",
+        command: preparationCommand,
+        attempt: 2,
+        retryReason: "transient_infrastructure"
+      });
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "start",
+        phase: "dependency_install",
+        command: preparationCommand,
+        attempt: 2
+      });
+      preparation = {
+        ...await ensureTrustedValidationInstall({
+          repoPath: options.repoPath,
+          preparationArgv,
+          timeoutMs,
+          bunExecutable: options.bunExecutable,
+          runner
+        }),
+        attempt: 2,
+        retryReason: "transient_infrastructure"
+      };
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "complete",
+        phase: "dependency_install",
+        command: preparationCommand,
+        attempt: 2,
+        ok: preparation.ok,
+        durationMs: preparation.durationMs,
+        cached: Boolean(preparation.cached)
+      });
+    }
     results.push(preparation);
     if (!preparation.ok)
       return results;
   }
   for (const { command, argv } of commandsWithArgv) {
     const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
-    const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
-    const validationResult = {
-      command,
-      ...result,
-      output: truncateTrustedValidationOutput(result.output),
-      phase: "validation"
+    const execute = async (attempt) => {
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "start",
+        phase: "validation",
+        command,
+        attempt
+      });
+      const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
+      const evidence = result.ok ? null : extractTrustedValidationFailureEvidence({
+        command,
+        phase: "validation",
+        output: result.output,
+        exitCode: result.exitCode
+      });
+      const validationResult2 = {
+        command,
+        ...result,
+        output: truncateTrustedValidationOutput(result.output),
+        phase: "validation",
+        attempt,
+        ...evidence ?? {}
+      };
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "complete",
+        phase: "validation",
+        command,
+        attempt,
+        ok: validationResult2.ok,
+        durationMs: validationResult2.durationMs,
+        cached: Boolean(validationResult2.cached)
+      });
+      return validationResult2;
     };
-    if (!validationResult.ok) {
-      Object.assign(validationResult, extractTrustedValidationFailureEvidence(validationResult));
+    let validationResult = await execute(1);
+    if (!validationResult.ok && options.retryTransientFailures !== false && isTransientTrustedValidationFailure(validationResult)) {
+      results.push({
+        ...validationResult,
+        retryReason: "transient_infrastructure"
+      });
+      emitTrustedValidationProgress(options.onProgress, {
+        boundary: "retry",
+        phase: "validation",
+        command,
+        attempt: 2,
+        retryReason: "transient_infrastructure"
+      });
+      validationResult = {
+        ...await execute(2),
+        retryReason: "transient_infrastructure"
+      };
     }
     results.push(validationResult);
-    if (!result.ok)
+    if (!validationResult.ok)
       break;
   }
   return results;
+}
+function isTransientTrustedValidationFailure(result) {
+  if (result.failureClass === "timeout" || result.exitCode === 124)
+    return true;
+  return /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(String(result.output ?? ""));
+}
+
+// apps/source_control_manager/src/validation_repair_publication.ts
+import { createHash as createHash3 } from "crypto";
+var SHA_RE3 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+var MAX_REPAIR_CHAIN_COMMITS = 32;
+function normalizeSha3(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return SHA_RE3.test(normalized) ? normalized : "";
+}
+function validationCheckpointNamespace(completionId) {
+  const key = createHash3("sha256").update(String(completionId)).digest("hex").slice(0, 32);
+  return `refs/pushpals/validation/${key}`;
+}
+function validationCheckpointRefs(completionId, claimGeneration) {
+  const generation = Math.max(1, Math.floor(claimGeneration));
+  const namespace = validationCheckpointNamespace(completionId);
+  return {
+    baselineRef: `${namespace}/${generation}/baseline`,
+    candidateRef: `${namespace}/${generation}/candidate`,
+    validatedRef: `${namespace}/${generation}/validated`
+  };
+}
+async function immutableRefSha(git2, ref) {
+  const result = await git2(["rev-parse", "--verify", `${ref}^{commit}`]);
+  if (!result.ok)
+    return null;
+  const sha = normalizeSha3(result.stdout);
+  if (!sha)
+    throw new Error(`Validation checkpoint ${ref} did not resolve to an exact commit.`);
+  return sha;
+}
+async function loadValidationCheckpoint(options) {
+  const refs = validationCheckpointRefs(options.completionId, options.claimGeneration);
+  const [baselineSha, candidateSha, validatedSha] = await Promise.all([
+    immutableRefSha(options.git, refs.baselineRef),
+    immutableRefSha(options.git, refs.candidateRef),
+    immutableRefSha(options.git, refs.validatedRef)
+  ]);
+  if (!baselineSha && !candidateSha && !validatedSha)
+    return null;
+  if (!baselineSha || !candidateSha) {
+    throw new Error(`Validation checkpoint for completion ${options.completionId} is incomplete; refusing generic-base recovery.`);
+  }
+  if (validatedSha && validatedSha !== candidateSha) {
+    throw new Error(`Immutable validation-success proof ${refs.validatedRef} points to ${validatedSha}, not candidate ${candidateSha}.`);
+  }
+  return {
+    ...refs,
+    baselineSha,
+    candidateSha,
+    validationProven: validatedSha === candidateSha
+  };
+}
+async function loadLatestValidationCheckpoint(options) {
+  const namespace = validationCheckpointNamespace(options.completionId);
+  const listed = await options.git(["for-each-ref", "--format=%(refname)", `${namespace}/`]);
+  if (!listed.ok) {
+    throw new Error(`Failed to enumerate retained validation checkpoints for ${options.completionId}: ${listed.stderr || listed.stdout}.`);
+  }
+  const generations = [
+    ...new Set(listed.stdout.split(/\r?\n/).map((ref) => Number(ref.trim().match(new RegExp(`^${namespace}/([1-9][0-9]*)/candidate$`))?.[1])).filter((generation) => Number.isSafeInteger(generation) && generation > 0 && generation < options.beforeClaimGeneration))
+  ].sort((a, b) => b - a);
+  for (const claimGeneration of generations) {
+    const checkpoint = await loadValidationCheckpoint({
+      completionId: options.completionId,
+      claimGeneration,
+      git: options.git
+    });
+    if (checkpoint)
+      return { claimGeneration, ...checkpoint };
+  }
+  return null;
+}
+async function persistValidationSuccessProof(options) {
+  const candidateSha = normalizeSha3(options.candidateSha);
+  if (!candidateSha)
+    throw new Error("Validation-success proof requires an exact candidate SHA.");
+  const checkpoint = await loadValidationCheckpoint({
+    completionId: options.completionId,
+    claimGeneration: options.claimGeneration,
+    git: options.git
+  });
+  if (!checkpoint || checkpoint.candidateSha !== candidateSha) {
+    throw new Error(`Validation-success proof requires the matching immutable candidate checkpoint ${candidateSha}.`);
+  }
+  const existing = await immutableRefSha(options.git, checkpoint.validatedRef);
+  if (existing && existing !== candidateSha) {
+    throw new Error(`Immutable validation-success proof ${checkpoint.validatedRef} already points to ${existing}, not ${candidateSha}.`);
+  }
+  if (!existing) {
+    const zeroOid = "0".repeat(candidateSha.length);
+    const update = await options.git([
+      "update-ref",
+      checkpoint.validatedRef,
+      candidateSha,
+      zeroOid
+    ]);
+    if (!update.ok) {
+      const concurrent = await immutableRefSha(options.git, checkpoint.validatedRef);
+      if (concurrent !== candidateSha) {
+        throw new Error(`Failed atomic creation of validation-success proof ${checkpoint.validatedRef}: ${update.stderr || update.stdout}.`);
+      }
+    }
+  }
+  const verified = await immutableRefSha(options.git, checkpoint.validatedRef);
+  if (verified !== candidateSha) {
+    throw new Error(`Validation-success proof ${checkpoint.validatedRef} failed exact-SHA verification after update.`);
+  }
+  return { validatedRef: checkpoint.validatedRef, candidateSha };
+}
+async function persistValidationCheckpoint(options) {
+  const baselineSha = normalizeSha3(options.baselineSha);
+  const candidateSha = normalizeSha3(options.candidateSha);
+  if (!baselineSha || !candidateSha || baselineSha === candidateSha) {
+    throw new Error("Validation checkpoint requires distinct exact baseline and candidate SHAs.");
+  }
+  await resolveExactCommit(options.git, baselineSha, "validation baseline");
+  await resolveExactCommit(options.git, candidateSha, "tested candidate");
+  await requireAncestor(options.git, baselineSha, candidateSha, `tested candidate ${candidateSha} is not descended from validation baseline ${baselineSha}`);
+  const refs = validationCheckpointRefs(options.completionId, options.claimGeneration);
+  for (const [ref, sha] of [
+    [refs.baselineRef, baselineSha],
+    [refs.candidateRef, candidateSha]
+  ]) {
+    const existing = await immutableRefSha(options.git, ref);
+    if (existing && existing !== sha) {
+      throw new Error(`Immutable validation checkpoint ${ref} already points to ${existing}, not ${sha}.`);
+    }
+    if (!existing) {
+      const zeroOid = "0".repeat(sha.length);
+      const update = await options.git(["update-ref", ref, sha, zeroOid]);
+      if (!update.ok) {
+        const concurrent = await immutableRefSha(options.git, ref);
+        if (concurrent !== sha) {
+          throw new Error(`Failed atomic creation of trusted-validation checkpoint ${ref}: ${update.stderr || update.stdout}.`);
+        }
+      }
+    }
+    const verified = await immutableRefSha(options.git, ref);
+    if (verified !== sha) {
+      throw new Error(`Validation checkpoint ${ref} failed exact-SHA verification after update.`);
+    }
+  }
+  const validatedSha = await immutableRefSha(options.git, refs.validatedRef);
+  if (validatedSha && validatedSha !== candidateSha) {
+    throw new Error(`Immutable validation-success proof ${refs.validatedRef} points to ${validatedSha}, not candidate ${candidateSha}.`);
+  }
+  return {
+    ...refs,
+    baselineSha,
+    candidateSha,
+    validationProven: validatedSha === candidateSha
+  };
+}
+async function resolveExactCommit(git2, sha, label) {
+  const result = await git2(["rev-parse", "--verify", `${sha}^{commit}`]);
+  const resolved = result.ok ? normalizeSha3(result.stdout) : "";
+  if (!resolved || resolved !== sha) {
+    throw new Error(`Validation-repair publication lease could not verify exact ${label} ${sha}: ${result.stderr || result.stdout || "revision unavailable"}.`);
+  }
+  return resolved;
+}
+async function requireAncestor(git2, ancestor, descendant, detail) {
+  const result = await git2(["merge-base", "--is-ancestor", ancestor, descendant]);
+  if (!result.ok) {
+    throw new Error(`Validation-repair publication lease mismatch: ${detail}.`);
+  }
+}
+async function resolveValidationCheckpointBaseline(options) {
+  const preApplyBaselineSha = normalizeSha3(options.preApplyBaselineSha);
+  const candidateSha = normalizeSha3(options.candidateSha);
+  if (!preApplyBaselineSha || !candidateSha) {
+    throw new Error("Validation checkpoint baseline resolution requires exact SHAs.");
+  }
+  await resolveExactCommit(options.git, preApplyBaselineSha, "pre-apply baseline");
+  await resolveExactCommit(options.git, candidateSha, "tested candidate");
+  const directAncestry = await options.git([
+    "merge-base",
+    "--is-ancestor",
+    preApplyBaselineSha,
+    candidateSha
+  ]);
+  if (directAncestry.ok)
+    return preApplyBaselineSha;
+  const mergeBase = await options.git(["merge-base", preApplyBaselineSha, candidateSha]);
+  const exactMergeBase = mergeBase.ok ? normalizeSha3(mergeBase.stdout) : "";
+  if (!exactMergeBase) {
+    throw new Error(`Unable to derive an exact trusted-validation baseline for candidate ${candidateSha}: ${mergeBase.stderr || mergeBase.stdout || "no merge base"}.`);
+  }
+  await requireAncestor(options.git, exactMergeBase, candidateSha, `derived baseline ${exactMergeBase} is not an ancestor of candidate ${candidateSha}`);
+  return exactMergeBase;
+}
+async function applyRetainedValidationCheckpoint(options) {
+  const baselineSha = normalizeSha3(options.baselineSha);
+  const candidateSha = normalizeSha3(options.candidateSha);
+  const currentIntegrationSha = normalizeSha3(options.currentIntegrationSha);
+  if (!baselineSha || !candidateSha || !currentIntegrationSha) {
+    throw new Error("Retained validation replay requires exact baseline, candidate, and integration SHAs.");
+  }
+  await resolveExactCommit(options.git, baselineSha, "retained baseline");
+  await resolveExactCommit(options.git, candidateSha, "retained candidate");
+  await resolveExactCommit(options.git, currentIntegrationSha, "current integration head");
+  await requireAncestor(options.git, baselineSha, candidateSha, `retained candidate ${candidateSha} is not descended from baseline ${baselineSha}`);
+  await requireAncestor(options.git, baselineSha, currentIntegrationSha, `current integration head ${currentIntegrationSha} is not descended from retained baseline ${baselineSha}`);
+  const chainResult = await options.git([
+    "rev-list",
+    "--reverse",
+    "--ancestry-path",
+    `${baselineSha}..${candidateSha}`
+  ]);
+  const chain = chainResult.ok ? chainResult.stdout.split(/\r?\n/).map((value) => normalizeSha3(value)).filter(Boolean) : [];
+  if (!chainResult.ok || chain.length < 1 || chain.length > MAX_REPAIR_CHAIN_COMMITS || chain.at(-1) !== candidateSha) {
+    throw new Error(`Retained validation replay refused an invalid or oversized commit chain (${chain.length} commits): ${chainResult.stderr || chainResult.stdout}.`);
+  }
+  const cherryResult = await options.git([
+    "cherry",
+    currentIntegrationSha,
+    candidateSha,
+    baselineSha
+  ]);
+  if (!cherryResult.ok) {
+    throw new Error(`Retained validation replay could not compare patch equivalence: ${cherryResult.stderr || cherryResult.stdout}.`);
+  }
+  const equivalent = new Set(cherryResult.stdout.split(/\r?\n/).map((line) => line.trim().match(/^-\s+([0-9a-f]{40,64})(?:\s|$)/i)?.[1]?.toLowerCase()).filter((sha) => Boolean(sha)));
+  const applied = [];
+  for (const commitSha of chain) {
+    const ancestor = await options.git([
+      "merge-base",
+      "--is-ancestor",
+      commitSha,
+      currentIntegrationSha
+    ]);
+    if (ancestor.ok || equivalent.has(commitSha))
+      continue;
+    const result = await options.git(["cherry-pick", commitSha]);
+    if (!result.ok) {
+      return {
+        ...result,
+        stderr: [
+          result.stderr,
+          `Failed while replaying retained trusted-validation commit ${commitSha}.`
+        ].filter(Boolean).join(`
+`)
+      };
+    }
+    applied.push(commitSha);
+  }
+  return applied.length > 0 ? {
+    ok: true,
+    stdout: `Replayed ${applied.length} retained trusted-validation commit(s).`,
+    stderr: "",
+    exitCode: 0
+  } : {
+    ok: true,
+    stdout: `Retained trusted-validation candidate ${candidateSha} is already integrated.`,
+    stderr: "",
+    exitCode: 0,
+    idempotent: true
+  };
+}
+async function applyValidationRepairPublication(options) {
+  const lease = validateValidationRepairPublicationLease(options.lease);
+  const completionSha = normalizeSha3(options.completionSha);
+  const currentIntegrationSha = normalizeSha3(options.currentIntegrationSha);
+  if (!completionSha || completionSha !== lease.expectedCompletionSha) {
+    throw new Error(`Validation-repair publication lease expected completion ${lease.expectedCompletionSha}, received ${options.completionSha}.`);
+  }
+  if (!currentIntegrationSha) {
+    throw new Error("Validation-repair publication requires an exact current integration SHA.");
+  }
+  await resolveExactCommit(options.git, lease.baselineSha, "baseline");
+  await resolveExactCommit(options.git, lease.candidateSha, "candidate");
+  await resolveExactCommit(options.git, completionSha, "completion");
+  await resolveExactCommit(options.git, currentIntegrationSha, "current integration head");
+  const retainedCandidate = await options.git([
+    "rev-parse",
+    "--verify",
+    `${lease.candidateRef}^{commit}`
+  ]);
+  if (!retainedCandidate.ok || normalizeSha3(retainedCandidate.stdout) !== lease.candidateSha) {
+    throw new Error(`Validation-repair publication lease mismatch: retained candidate ref ${lease.candidateRef} does not resolve to ${lease.candidateSha}.`);
+  }
+  await requireAncestor(options.git, lease.baselineSha, lease.candidateSha, `candidate ${lease.candidateSha} is not descended from baseline ${lease.baselineSha}`);
+  await requireAncestor(options.git, lease.candidateSha, completionSha, `completion ${completionSha} is not descended from candidate ${lease.candidateSha}`);
+  await requireAncestor(options.git, lease.baselineSha, currentIntegrationSha, `current integration head ${currentIntegrationSha} is not descended from leased baseline ${lease.baselineSha}`);
+  const chainResult = await options.git([
+    "rev-list",
+    "--reverse",
+    "--ancestry-path",
+    `${lease.baselineSha}..${completionSha}`
+  ]);
+  if (!chainResult.ok) {
+    throw new Error(`Validation-repair publication could not enumerate the leased commit chain: ${chainResult.stderr || chainResult.stdout}.`);
+  }
+  const chain = chainResult.stdout.split(/\r?\n/).map((value) => normalizeSha3(value)).filter(Boolean);
+  const candidateIndex = chain.indexOf(lease.candidateSha);
+  if (chain.length < 2 || chain.length > MAX_REPAIR_CHAIN_COMMITS || candidateIndex < 0 || chain.at(-1) !== completionSha) {
+    throw new Error(`Validation-repair publication refused an invalid or oversized leased chain (${chain.length} commits; candidate index ${candidateIndex}).`);
+  }
+  const cherryResult = await options.git([
+    "cherry",
+    currentIntegrationSha,
+    completionSha,
+    lease.baselineSha
+  ]);
+  if (!cherryResult.ok) {
+    throw new Error(`Validation-repair publication could not compare patch equivalence for idempotent recovery: ${cherryResult.stderr || cherryResult.stdout}.`);
+  }
+  const equivalentCommits = new Set(cherryResult.stdout.split(/\r?\n/).map((line) => line.trim().match(/^-\s+([0-9a-f]{40,64})(?:\s|$)/i)?.[1]?.toLowerCase()).filter((sha) => Boolean(sha)));
+  const applied = [];
+  for (const commitSha of chain) {
+    const alreadyIntegrated = await options.git([
+      "merge-base",
+      "--is-ancestor",
+      commitSha,
+      currentIntegrationSha
+    ]);
+    if (alreadyIntegrated.ok || equivalentCommits.has(commitSha))
+      continue;
+    const appliedResult = await options.git(["cherry-pick", commitSha]);
+    if (!appliedResult.ok) {
+      return {
+        ...appliedResult,
+        stderr: [
+          appliedResult.stderr,
+          `Failed while applying leased validation-repair commit ${commitSha} (${applied.length + 1}/${chain.length}).`
+        ].filter(Boolean).join(`
+`)
+      };
+    }
+    applied.push(commitSha);
+  }
+  if (applied.length === 0) {
+    return {
+      ok: true,
+      stdout: `Validation-repair completion ${completionSha} is already integrated; no duplicate mutation was applied.`,
+      stderr: "",
+      exitCode: 0,
+      idempotent: true
+    };
+  }
+  return {
+    ok: true,
+    stdout: `Applied ${applied.length} leased validation-repair commit(s): ${applied.join(", ")}`,
+    stderr: "",
+    exitCode: 0
+  };
+}
+
+// apps/source_control_manager/src/validation_worktree.ts
+var SHA_RE4 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+function exactSha(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return SHA_RE4.test(normalized) ? normalized : "";
+}
+
+class ValidationWorktreeInvariantError extends Error {
+  status;
+  constructor(message, status = "") {
+    super(message);
+    this.name = "ValidationWorktreeInvariantError";
+    this.status = status;
+  }
+}
+async function assertExactCleanValidationWorktree(options) {
+  const expectedSha = exactSha(options.expectedSha);
+  if (!expectedSha) {
+    throw new ValidationWorktreeInvariantError(`Trusted-validation ${options.phase} requires an exact candidate SHA.`);
+  }
+  const head = await options.git(["rev-parse", "--verify", "HEAD^{commit}"]);
+  const actualSha = head.ok ? exactSha(head.stdout) : "";
+  if (actualSha !== expectedSha) {
+    throw new ValidationWorktreeInvariantError(`Trusted-validation ${options.phase} moved HEAD from ${expectedSha} to ${actualSha || "unavailable"}; refusing publication.`);
+  }
+  const status = await options.git(["status", "--porcelain=v1", "--untracked-files=all"]);
+  if (!status.ok) {
+    throw new ValidationWorktreeInvariantError(`Trusted-validation ${options.phase} could not verify worktree cleanliness: ${status.stderr || status.stdout || "git status failed"}.`);
+  }
+  const dirty = status.stdout.trim();
+  if (dirty) {
+    throw new ValidationWorktreeInvariantError(`Trusted-validation ${options.phase} mutated the candidate worktree; refusing to publish a different tree than ${expectedSha}.
+${dirty}`, dirty);
+  }
 }
 
 // apps/source_control_manager/src/config.ts
@@ -5699,6 +7211,11 @@ var defaultSourceControlManagerRepoPath = resolve9(PUSH_CONFIG.sourceControlMana
 var COMPLETION_LEASE_MS = 3 * 60000;
 var COMPLETION_LEASE_HEARTBEAT_MS = 30000;
 var PUBLICATION_HEALTH_POLL_MS = 1e4;
+var SERVER_CONTROL_HTTP_TIMEOUT_MS = 5000;
+var COMPLETION_GC_RECORDS_PER_TICK = 1;
+var COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS = 3000;
+var COMPLETION_GC_REMOTE_GIT_TIMEOUT_MS = 1e4;
+var COMPLETION_GC_REFS_PER_RECORD_PER_TICK = 4;
 var SCM_TICK_STALL_MS = Math.max(60000, Number(process.env.PUSHPALS_SCM_TICK_STALL_MS) || 17 * 60000);
 var { values: args } = parseArgs({
   args: Bun.argv.slice(2),
@@ -5812,20 +7329,19 @@ if (skipCleanCheck) {
   const source = skipCleanCheckFlag ? "--skip-clean-check flag" : "source_control_manager.skip_clean_check";
   console.log(`[${ts2()}]   mode:     SKIP CLEAN CHECK (${source})`);
 }
-mkdirSync2(config.stateDir, { recursive: true });
+mkdirSync3(config.stateDir, { recursive: true });
 var lock = new FileLock(config.stateDir);
 if (!lock.acquire()) {
   console.error(`[${ts2()}] Another source_control_manager instance is already running. Exiting.`);
   process.exit(1);
 }
 console.log(`[${ts2()}] Lock acquired`);
-var dbPath = join5(config.stateDir, "merge_queue.db");
+var dbPath = join6(config.stateDir, "merge_queue.db");
 var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
-var sourceControlManagerPusherId = `source_control_manager-${createHash2("sha256").update(`${config.repoPath}
+var sourceControlManagerPusherId = `source_control_manager-${createHash4("sha256").update(`${config.repoPath}
 ${config.mainBranch}
-${config.remote}`).digest("hex").slice(0, 12)}`;
-var reconcilePusherOnNextClaim = true;
+${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID2().slice(0, 8)}`;
 var healthTracker = createSourceControlManagerHealthTracker({
   tickStallMs: SCM_TICK_STALL_MS,
   idleBacklogGraceMs: Math.max(30000, config.pollIntervalSeconds * 3000)
@@ -5835,6 +7351,7 @@ if (recovered > 0) {
   console.log(`[${ts2()}] Recovered ${recovered} stuck running job(s) -> queued`);
 }
 var gitOps = createSourceControlApi(config);
+var completionGcJournal = new CompletionGcJournal(config.stateDir);
 var server;
 try {
   server = createStatusServer(db, config.port, healthTracker.snapshot);
@@ -5864,15 +7381,15 @@ async function refreshPublicationHealth() {
   if (publicationHealthProbeInFlight)
     return;
   publicationHealthProbeInFlight = true;
-  const controller = new AbortController;
-  const timer = setTimeout(() => controller.abort(), 3000);
   try {
     const headers = {};
     if (config.authToken)
       headers.Authorization = `Bearer ${config.authToken}`;
-    const response = await fetch(`${config.serverUrl}/workers/autoscale?ttlMs=15000`, {
-      headers,
-      signal: controller.signal
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${config.serverUrl}/workers/autoscale?ttlMs=15000`,
+      init: { headers },
+      timeoutMs: 3000,
+      timeoutMessage: "SourceControlManager publication-health probe timed out after 3000ms"
     });
     if (!response.ok)
       return;
@@ -5880,7 +7397,6 @@ async function refreshPublicationHealth() {
     if (payload.publication)
       healthTracker.updatePublication(payload.publication);
   } catch {} finally {
-    clearTimeout(timer);
     publicationHealthProbeInFlight = false;
   }
 }
@@ -5973,10 +7489,15 @@ async function ensureSessionWithRetry(sessionId, maxRetries = 10, baseDelayMs = 
   while (running) {
     attempt += 1;
     try {
-      const response = await fetch(`${config.serverUrl}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId })
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${config.serverUrl}/sessions`,
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId })
+        },
+        timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+        timeoutMessage: `SourceControlManager session registration timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms`
       });
       if (response.ok)
         return true;
@@ -6085,6 +7606,117 @@ async function emitPusherMessage(comm, text, correlationId, meta = {}) {
     console.error(`[${ts2()}] Failed to emit source_control_manager message: ${text}`);
   }
 }
+async function resolveCompletionProcessingAuthority(runtimeConfig, headers, record) {
+  const response = await fetchBufferedWithHardDeadline({
+    input: `${runtimeConfig.serverUrl}/completions/${encodeURIComponent(record.completionId)}/status`,
+    init: { headers },
+    timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+    timeoutMessage: `Completion ${record.completionId} status probe timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
+  });
+  if (response.status === 404)
+    return null;
+  if (!response.ok) {
+    throw new Error(`completion status authority returned HTTP ${response.status}`);
+  }
+  const payload = await response.json();
+  if (!payload.ok || !payload.completion) {
+    throw new Error("completion status authority returned a malformed response");
+  }
+  return payload.completion;
+}
+async function cleanupProcessedCompletionRefs(runtimeConfig, record) {
+  const validationNamespace2 = completionGcValidationNamespace(record);
+  const listed = await runGitCommandCapture(repoRoot, [
+    "-C",
+    runtimeConfig.repoPath,
+    "for-each-ref",
+    "--format=%(refname)",
+    `${validationNamespace2}/`,
+    ...record.additionalValidationRefs
+  ], { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS });
+  if (!listed.ok) {
+    throw new Error(`failed to list retained validation refs: ${listed.stderr || listed.stdout || `exit ${listed.exitCode}`}`);
+  }
+  const additionalValidationRefSet = new Set(record.additionalValidationRefs);
+  const validationRefs = [
+    ...new Set(listed.stdout.split(/\r?\n/).map((value) => value.trim()).filter((ref) => ref.startsWith(`${validationNamespace2}/`) || additionalValidationRefSet.has(ref)))
+  ].sort((a, b) => a.localeCompare(b));
+  const refsForThisTick = validationRefs.slice(0, COMPLETION_GC_REFS_PER_RECORD_PER_TICK);
+  for (const ref of refsForThisTick) {
+    const deleted = await runGitCommandCapture(repoRoot, ["-C", runtimeConfig.repoPath, "update-ref", "-d", ref], { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS });
+    if (!deleted.ok) {
+      throw new Error(`failed to delete retained validation ref ${ref}: ${deleted.stderr || deleted.stdout || `exit ${deleted.exitCode}`}`);
+    }
+  }
+  if (validationRefs.length > refsForThisTick.length) {
+    return false;
+  }
+  if (record.completionBranch.startsWith("refs/pushpals/")) {
+    const resolvedLocal = authoritativeRefShaFromGitResult(await runGitCommandCapture(repoRoot, [
+      "-C",
+      runtimeConfig.repoPath,
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `${record.completionBranch}^{commit}`
+    ], { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS }), record.completionBranch);
+    const localDeleteArgs = buildCompletionGcLocalDeleteArgs(record, resolvedLocal);
+    if (resolvedLocal && !localDeleteArgs) {
+      console.warn(`[${ts2()}] Retained completion ref ${record.completionBranch} moved to ${resolvedLocal}; preserving its new owner instead of deleting it for processed completion ${record.completionId}.`);
+    }
+    if (localDeleteArgs) {
+      const deletedLocal = await runGitCommandCapture(repoRoot, ["-C", runtimeConfig.repoPath, ...localDeleteArgs], { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS });
+      if (!deletedLocal.ok) {
+        throw new Error(`failed leased deletion of local completion ref ${record.completionBranch}: ${deletedLocal.stderr || deletedLocal.stdout || `exit ${deletedLocal.exitCode}`}`);
+      }
+    }
+  }
+  if (record.remote) {
+    const remoteOptions = {
+      timeout: COMPLETION_GC_REMOTE_GIT_TIMEOUT_MS,
+      ...runtimeConfig.gitToken ? { githubToken: runtimeConfig.gitToken } : {}
+    };
+    const remoteRefResult = await runGitCommandCapture(repoRoot, ["-C", runtimeConfig.repoPath, "ls-remote", "--refs", record.remote, record.completionBranch], remoteOptions);
+    if (!remoteRefResult.ok) {
+      throw new Error(`failed to resolve remote completion ref ${record.completionBranch}: ${remoteRefResult.stderr || remoteRefResult.stdout || `exit ${remoteRefResult.exitCode}`}`);
+    }
+    const remoteMatches = remoteRefResult.stdout.split(/\r?\n/).map((line) => line.trim().split(/\s+/, 2)).filter((parts) => parts.length === 2 && parts[1] === record.completionBranch);
+    if (remoteMatches.length > 1) {
+      throw new Error(`remote returned multiple values for completion ref ${record.completionBranch}`);
+    }
+    const resolvedRemote = remoteMatches[0]?.[0] ?? null;
+    if (resolvedRemote && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(resolvedRemote)) {
+      throw new Error(`remote returned an invalid SHA for ${record.completionBranch}`);
+    }
+    const remoteDeleteArgs = buildCompletionGcRemoteDeleteArgs(record, resolvedRemote);
+    if (resolvedRemote && !remoteDeleteArgs) {
+      console.warn(`[${ts2()}] Remote completion ref ${record.completionBranch} moved to ${resolvedRemote}; preserving its new owner instead of deleting it for processed completion ${record.completionId}.`);
+    }
+    if (remoteDeleteArgs) {
+      const deletedRemote = await runGitCommandCapture(repoRoot, ["-C", runtimeConfig.repoPath, ...remoteDeleteArgs], remoteOptions);
+      if (!deletedRemote.ok) {
+        throw new Error(`failed leased deletion of remote completion ref ${record.completionBranch}: ${deletedRemote.stderr || deletedRemote.stdout || `exit ${deletedRemote.exitCode}`}`);
+      }
+    }
+  }
+  return true;
+}
+async function reconcileRetainedCompletionRefs(runtimeConfig, headers) {
+  try {
+    const result = await reconcileCompletionGcJournal({
+      journal: completionGcJournal,
+      limit: COMPLETION_GC_RECORDS_PER_TICK,
+      resolveAuthority: (record) => resolveCompletionProcessingAuthority(runtimeConfig, headers, record),
+      cleanup: (record) => cleanupProcessedCompletionRefs(runtimeConfig, record),
+      onWarning: (message) => console.warn(`[${ts2()}] ${message}`)
+    });
+    if (result.cleaned > 0) {
+      console.log(`[${ts2()}] Reconciled ${result.cleaned} processed completion ref handoff(s); examined=${result.examined} retained=${result.retained} uncertain=${result.uncertain}.`);
+    }
+  } catch (error) {
+    console.warn(`[${ts2()}] Completion ref GC pass failed safely; publication polling will continue: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 async function tick() {
   healthTracker.beginTick("integration_maintenance");
   try {
@@ -6095,32 +7727,52 @@ async function tick() {
       headers["Authorization"] = `Bearer ${runtimeConfig.authToken}`;
     }
     const pusherId = sourceControlManagerPusherId;
-    const response = await maintainIntegrationBeforeCompletionClaim({
-      maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
-      claimCompletion: () => fetch(`${runtimeConfig.serverUrl}/completions/claim`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          pusherId,
-          leaseMs: COMPLETION_LEASE_MS,
-          reconcilePusher: reconcilePusherOnNextClaim
-        })
-      })
+    const response = await claimBeforeCompletionGc({
+      claim: () => maintainIntegrationBeforeCompletionClaim({
+        maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
+        claimCompletion: async () => {
+          const rawResponse = await fetchBufferedWithHardDeadline({
+            input: `${runtimeConfig.serverUrl}/completions/claim`,
+            init: {
+              method: "POST",
+              headers,
+              body: JSON.stringify({
+                pusherId,
+                leaseMs: COMPLETION_LEASE_MS
+              })
+            },
+            timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+            timeoutMessage: `Completion claim timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
+          });
+          return {
+            ok: rawResponse.ok,
+            status: rawResponse.status,
+            data: rawResponse.ok ? await rawResponse.json() : null
+          };
+        }
+      }),
+      isIdle: (claimResult) => claimResult.status === 404 || claimResult.ok && !claimResult.data?.completion,
+      reconcile: () => reconcileRetainedCompletionRefs(runtimeConfig, headers)
     });
-    reconcilePusherOnNextClaim = false;
     if (!response.ok) {
       if (response.status !== 404) {
         console.error(`[${ts2()}] Failed to claim completion: ${response.status}`);
       }
       return;
     }
-    const data = await response.json();
+    const data = response.data;
     if (!data.ok || !data.completion) {
       return;
     }
     const completion = data.completion;
+    const completionClaimToken = String(completion.claimToken ?? "").trim();
+    const completionClaimGeneration = Number(completion.claimGeneration);
+    if (!completionClaimToken || !Number.isSafeInteger(completionClaimGeneration) || completionClaimGeneration < 1) {
+      throw new Error(`Claimed completion ${completion.id} did not include a valid fencing token/generation; refusing publication.`);
+    }
     healthTracker.progress("completion_claimed", completion.id);
     const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/") ? parseReviewPublicationLease(completion.prBody) : null;
+    let validationRepairPublicationLease = null;
     const isIntegrationReconciliationCompletion = Boolean(reviewPublicationLease && reviewPublicationLease.targetBranch === runtimeConfig.mainBranch && reviewPublicationLease.baseBranch === runtimeConfig.integrationBaseBranch);
     const useReviewPublicationFlow = shouldUseReviewPublicationFlow(runtimeConfig.reviewAgent.enabled, reviewPublicationLease);
     const comm = createSessionComm(completion.sessionId);
@@ -6136,71 +7788,159 @@ async function tick() {
       await emitPusherMessage(comm, `SourceControlManager is in dry-run mode, so completion ${completion.id.slice(0, 8)} was not applied.`, completion.id, completionEventMeta);
       return;
     }
-    let completionLeaseHeartbeatInFlight = false;
-    let completionLeaseLost = false;
-    const renewCompletionLease = async (required = false) => {
-      if (completionLeaseHeartbeatInFlight) {
-        if (!required)
-          return !completionLeaseLost;
-        const deadline = Date.now() + 6000;
-        while (completionLeaseHeartbeatInFlight && Date.now() < deadline) {
-          await Bun.sleep(50);
-        }
-        if (completionLeaseHeartbeatInFlight || completionLeaseLost) {
-          throw new Error("Completion publication lease heartbeat did not settle safely.");
-        }
-        return true;
-      }
-      completionLeaseHeartbeatInFlight = true;
-      const controller = new AbortController;
-      const timer = setTimeout(() => controller.abort(), 5000);
-      try {
-        const leaseResponse = await fetch(`${runtimeConfig.serverUrl}/completions/${completion.id}/lease/renew`, {
+    const completionLeaseRenewal = new CompletionLeaseRenewalCoordinator(async () => {
+      const leaseResponse = await fetchBufferedWithHardDeadline({
+        input: `${runtimeConfig.serverUrl}/completions/${completion.id}/lease/renew`,
+        init: {
           method: "POST",
           headers,
-          signal: controller.signal,
-          body: JSON.stringify({ pusherId, leaseMs: COMPLETION_LEASE_MS })
-        });
-        if (!leaseResponse.ok) {
-          if (leaseResponse.status === 400 || leaseResponse.status === 409) {
-            completionLeaseLost = true;
-          }
-          if (required) {
-            throw new Error(`Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`);
-          }
-          return false;
-        }
-        completionLeaseLost = false;
-        return true;
-      } catch (error) {
-        if (required)
-          throw error;
-        console.warn(`[${ts2()}] Completion lease heartbeat failed for ${completion.id}: ${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      } finally {
-        clearTimeout(timer);
-        completionLeaseHeartbeatInFlight = false;
+          body: JSON.stringify({
+            pusherId,
+            claimToken: completionClaimToken,
+            leaseMs: COMPLETION_LEASE_MS
+          })
+        },
+        timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+        timeoutMessage: `Completion publication lease renewal timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
+      });
+      if (!leaseResponse.ok) {
+        return {
+          ok: false,
+          leaseLost: leaseResponse.status === 400 || leaseResponse.status === 409,
+          detail: `Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`
+        };
+      }
+      return { ok: true };
+    });
+    const renewCompletionLease = async (required = false) => {
+      const renewed = await completionLeaseRenewal.renew(required);
+      if (!renewed && !required) {
+        console.warn(`[${ts2()}] Completion lease heartbeat failed for ${completion.id}: ${completionLeaseRenewal.failureDetail() ?? "renewal was not confirmed"}`);
+      }
+      return renewed;
+    };
+    const requireCompletionLease = async (operation) => {
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(`Completion publication lease was lost before ${operation}; refusing stale-owner mutation.`);
+      }
+      await renewCompletionLease(true);
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(`Completion publication lease was lost before ${operation}; refusing stale-owner mutation.`);
       }
     };
     const completionLeaseHeartbeatTimer = setInterval(() => void renewCompletionLease(false), COMPLETION_LEASE_HEARTBEAT_MS);
     let tempBranch = "";
     let cleanupCompletionHandoff = false;
+    let completionGcRecord = null;
     let trustedInstallDurationMs = null;
     let trustedValidationDurationMs = null;
     let trustedValidationCacheHit = null;
     let trustedValidationBaselineSha = null;
+    let trustedValidationCandidateSha = null;
+    let trustedValidationCandidateRef = null;
     let trustedValidationResults = [];
+    let publicationAlreadyIntegrated = false;
+    let publicationReadyForFinalization = false;
+    let validationCheckpointPersisted = false;
+    let validationSuccessProven = false;
+    let skipValidationForDurableRecovery = false;
+    let validationCheckpointGeneration = completionClaimGeneration;
+    let validationWorktreeInvariantFailed = false;
+    let validatedCheckpointRecoveryPending = false;
+    let previousValidationCheckpoint = null;
+    const completionValidationRefs = validationCheckpointRefs(completion.id, completionClaimGeneration);
     const trustedValidationReport = () => completion.trustedValidationCommandsJson ? {
       version: 1,
       baselineSha: trustedValidationBaselineSha,
-      candidateSha: completion.commitSha,
+      candidateSha: trustedValidationCandidateSha,
+      candidateRef: trustedValidationCandidateRef,
       results: trustedValidationResults
     } : null;
+    const persistExactValidationCheckpoint = async () => {
+      if (validationCheckpointPersisted || !trustedValidationBaselineSha || !trustedValidationCandidateSha) {
+        return;
+      }
+      const checkpoint = await persistValidationCheckpoint({
+        completionId: completion.id,
+        claimGeneration: completionClaimGeneration,
+        baselineSha: trustedValidationBaselineSha,
+        candidateSha: trustedValidationCandidateSha,
+        git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot)
+      });
+      trustedValidationCandidateRef = checkpoint.candidateRef;
+      validationCheckpointPersisted = true;
+      validationCheckpointGeneration = completionClaimGeneration;
+    };
+    const validationGit = (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot);
+    const probeAuthoritativeRefSha = async (ref) => authoritativeRefShaFromGitResult(await validationGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]), ref);
+    const probeAuthoritativeAncestry = async (ancestor, descendant) => authoritativeAncestryFromGitResult(await validationGit(["merge-base", "--is-ancestor", ancestor, descendant]), `${ancestor} -> ${descendant}`);
+    const assertValidationWorktree = async (phase) => {
+      try {
+        await assertExactCleanValidationWorktree({
+          expectedSha: trustedValidationCandidateSha ?? "",
+          phase,
+          git: validationGit
+        });
+      } catch (error) {
+        if (error instanceof ValidationWorktreeInvariantError) {
+          validationWorktreeInvariantFailed = true;
+        }
+        throw error;
+      }
+    };
+    const proveValidatedCandidatePublished = async () => {
+      if (!validationSuccessProven || !trustedValidationCandidateSha)
+        return false;
+      if (useReviewPublicationFlow || runtimeConfig.pushMainAfterMerge) {
+        await gitOps.fetchPrune();
+      }
+      const reviewHeadBranch = useReviewPublicationFlow ? reviewPublicationLease?.targetBranch ?? deriveReviewPrHeadBranch(completion.branch, completion.id).headBranch : null;
+      const reviewRemoteHeadSha = reviewHeadBranch ? await probeAuthoritativeRefSha(`refs/remotes/${runtimeConfig.remote}/${reviewHeadBranch}`) : null;
+      const remoteIntegrationHeadSha = !useReviewPublicationFlow && runtimeConfig.pushMainAfterMerge ? await probeAuthoritativeRefSha(`refs/remotes/${runtimeConfig.remote}/${runtimeConfig.mainBranch}`) : null;
+      const localIntegrationHeadSha = !useReviewPublicationFlow && !runtimeConfig.pushMainAfterMerge ? await probeAuthoritativeRefSha(`refs/heads/${runtimeConfig.mainBranch}`) : null;
+      return isValidationCheckpointPublished({
+        candidateSha: trustedValidationCandidateSha,
+        localIntegrationHeadSha,
+        remoteIntegrationHeadSha,
+        reviewRemoteHeadSha,
+        pushMainAfterMerge: runtimeConfig.pushMainAfterMerge,
+        useReviewPublicationFlow,
+        isAncestor: probeAuthoritativeAncestry
+      });
+    };
+    const markPublicationDurable = () => {
+      const recoveryState = durablePublicationRecoveryState(true);
+      publicationAlreadyIntegrated = recoveryState.skipPublicationMutation;
+      publicationReadyForFinalization = recoveryState.protectFromTerminalFailure;
+    };
+    const confirmLeaseAfterPublication = async (operation) => {
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(`Completion publication became durable during ${operation}, but this owner lost its lease; leaving finalization to the current owner.`);
+      }
+      await renewCompletionLease(true);
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(`Completion publication became durable during ${operation}, but this owner lost its lease; leaving finalization to the current owner.`);
+      }
+    };
     try {
+      validationRepairPublicationLease = parseValidationRepairPublicationLease(completion.prBody);
+      if (validationRepairPublicationLease && reviewPublicationLease) {
+        throw new Error("Completion contains conflicting review and validation-repair publication leases.");
+      }
+      previousValidationCheckpoint = await loadLatestValidationCheckpoint({
+        completionId: completion.id,
+        beforeClaimGeneration: completionClaimGeneration,
+        git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot)
+      });
+      validatedCheckpointRecoveryPending = previousValidationCheckpoint?.validationProven === true;
       let processedPrUrl = typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0 ? completion.prUrl.trim() : null;
       healthTracker.progress("refreshing_refs", completion.id);
       console.log(`[${ts2()}] Refreshing refs before applying ${completion.branch}...`);
-      await gitOps.fetchPrune();
+      try {
+        await gitOps.fetchPrune();
+      } catch (error) {
+        throw error;
+      }
       if (reviewPublicationLease) {
         let resolvedCompletionSha = await runGitCapture(["-C", runtimeConfig.repoPath, "rev-parse", "--verify", completion.branch], repoRoot);
         if (!resolvedCompletionSha.ok || !reviewCompletionHandoffMatches(resolvedCompletionSha.stdout, completion.commitSha)) {
@@ -6235,15 +7975,93 @@ async function tick() {
         }
       }
       await gitOps.createTempBranch(tempBranch);
-      trustedValidationBaselineSha = await gitOps.revParse("HEAD");
-      let skipLocalApplyDueConflict = false;
-      const applyResult = reviewPublicationLease ? await (async () => {
+      trustedValidationBaselineSha = await probeAuthoritativeRefSha("HEAD");
+      if (!trustedValidationBaselineSha) {
+        throw new Error("SourceControlManager worktree has no authoritative HEAD commit.");
+      }
+      let retainedCheckpointApplyResult = null;
+      if (previousValidationCheckpoint?.validationProven) {
+        validationSuccessProven = true;
+        trustedValidationCandidateSha = previousValidationCheckpoint.candidateSha;
+        const checkpointHead = useReviewPublicationFlow ? reviewPublicationLease?.targetBranch ?? deriveReviewPrHeadBranch(completion.branch, completion.id).headBranch : null;
+        const reviewRemoteHeadSha = checkpointHead ? await probeAuthoritativeRefSha(`refs/remotes/${runtimeConfig.remote}/${checkpointHead}`) : null;
+        const remoteIntegrationHeadSha = !useReviewPublicationFlow && runtimeConfig.pushMainAfterMerge ? await probeAuthoritativeRefSha(`refs/remotes/${runtimeConfig.remote}/${runtimeConfig.mainBranch}`) : null;
+        const checkpointPublished = await isValidationCheckpointPublished({
+          candidateSha: previousValidationCheckpoint.candidateSha,
+          localIntegrationHeadSha: trustedValidationBaselineSha,
+          remoteIntegrationHeadSha,
+          reviewRemoteHeadSha,
+          pushMainAfterMerge: runtimeConfig.pushMainAfterMerge,
+          useReviewPublicationFlow,
+          isAncestor: probeAuthoritativeAncestry
+        });
+        validatedCheckpointRecoveryPending = false;
+        if (shouldSkipValidationForDurableRecovery({
+          validationProven: previousValidationCheckpoint.validationProven,
+          publicationProven: checkpointPublished
+        })) {
+          const recoveryState = durablePublicationRecoveryState(true);
+          const restoreCheckpoint = await runGitCapture([
+            "-C",
+            runtimeConfig.repoPath,
+            "checkout",
+            "-B",
+            tempBranch,
+            previousValidationCheckpoint.candidateSha
+          ], repoRoot);
+          if (!restoreCheckpoint.ok) {
+            throw new Error(`Failed to restore exact trusted-validation checkpoint ${previousValidationCheckpoint.candidateRef}: ${restoreCheckpoint.stderr || restoreCheckpoint.stdout}`);
+          }
+          trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
+          trustedValidationCandidateSha = previousValidationCheckpoint.candidateSha;
+          trustedValidationCandidateRef = previousValidationCheckpoint.candidateRef;
+          validationCheckpointPersisted = true;
+          validationCheckpointGeneration = previousValidationCheckpoint.claimGeneration;
+          skipValidationForDurableRecovery = true;
+          publicationAlreadyIntegrated = recoveryState.skipPublicationMutation;
+          publicationReadyForFinalization = recoveryState.protectFromTerminalFailure;
+          retainedCheckpointApplyResult = {
+            ok: true,
+            stdout: "Reused already-published immutable validation checkpoint.",
+            stderr: "",
+            exitCode: 0
+          };
+          console.log(`[${ts2()}] Reusing already-published trusted-validation checkpoint ${previousValidationCheckpoint.candidateSha.slice(0, 8)} without duplicate mutation.`);
+        } else {
+          validationSuccessProven = false;
+          trustedValidationCandidateSha = null;
+          retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
+            baselineSha: previousValidationCheckpoint.baselineSha,
+            candidateSha: previousValidationCheckpoint.candidateSha,
+            currentIntegrationSha: trustedValidationBaselineSha ?? "",
+            git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot)
+          });
+          console.log(`[${ts2()}] Replayed exact retained checkpoint ${previousValidationCheckpoint.candidateRef} onto the current integration head.`);
+        }
+      } else if (previousValidationCheckpoint) {
+        retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
+          baselineSha: previousValidationCheckpoint.baselineSha,
+          candidateSha: previousValidationCheckpoint.candidateSha,
+          currentIntegrationSha: trustedValidationBaselineSha ?? "",
+          git: validationGit
+        });
+        console.log(`[${ts2()}] Replayed unvalidated retained checkpoint ${previousValidationCheckpoint.candidateRef}; validation-success proof is required before publication.`);
+      }
+      const applyResult = retainedCheckpointApplyResult ? retainedCheckpointApplyResult : reviewPublicationLease ? await (async () => {
         console.log(`[${ts2()}] Checking out exact reviewed completion ${completion.commitSha.slice(0, 8)} on ${tempBranch} for validation...`);
         return runGitCapture([
           "-C",
           runtimeConfig.repoPath,
           ...buildReviewCompletionValidationCheckoutArgs(tempBranch, completion.commitSha)
         ], repoRoot);
+      })() : validationRepairPublicationLease ? await (async () => {
+        console.log(`[${ts2()}] Applying exact validation-repair chain ${validationRepairPublicationLease.baselineSha.slice(0, 8)} -> ${validationRepairPublicationLease.candidateSha.slice(0, 8)} -> ${completion.commitSha.slice(0, 8)} for incident ${validationRepairPublicationLease.incidentId}...`);
+        return applyValidationRepairPublication({
+          lease: validationRepairPublicationLease,
+          completionSha: completion.commitSha,
+          currentIntegrationSha: trustedValidationBaselineSha ?? "",
+          git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot)
+        });
       })() : runtimeConfig.mergeStrategy === "cherry-pick" ? await (async () => {
         console.log(`[${ts2()}] Cherry-picking ${completion.commitSha.slice(0, 8)} onto ${tempBranch}...`);
         return gitOps.cherryPickRef(completion.commitSha);
@@ -6252,34 +8070,52 @@ async function tick() {
         return runtimeConfig.mergeStrategy === "no-ff" ? gitOps.mergeNoFF(completion.branch, `Merge ${completion.branch}`) : gitOps.mergeFFOnly(completion.branch);
       })();
       if (!applyResult.ok) {
-        if (shouldBypassApplyFailureInReviewMode({
+        if (!validationRepairPublicationLease && useReviewPublicationFlow && reviewApplyFailureBlocksPublication({
           reviewAgentEnabled: useReviewPublicationFlow,
           mergeStrategy: runtimeConfig.mergeStrategy,
           applyStdout: applyResult.stdout,
           applyStderr: applyResult.stderr
         })) {
-          skipLocalApplyDueConflict = true;
-          const applyDetail = applyResult.stderr || applyResult.stdout;
-          console.warn(`[${ts2()}] ReviewAgent mode - cherry-pick conflict while applying ${completion.commitSha.slice(0, 8)}; continuing with PR flow from worker branch commit.`);
-          await emitPusherMessage(comm, `ReviewAgent mode: local apply conflicted (${completion.commitSha.slice(0, 8)}), so SourceControlManager continued with branch-based PR flow. Detail: ${applyDetail}`, completion.id, completionEventMeta);
-          await gitOps.resetToClean();
-        } else {
-          throw new Error(`Apply failed: ${applyResult.stderr || applyResult.stdout}`);
+          throw new Error(`Review candidate apply failed; publication is blocked until the exact candidate can be prepared and checked: ${applyResult.stderr || applyResult.stdout}`);
+        }
+        throw new Error(`Apply failed: ${applyResult.stderr || applyResult.stdout}`);
+      }
+      if (!trustedValidationCandidateSha) {
+        trustedValidationCandidateSha = await gitOps.revParse("HEAD");
+        if (!trustedValidationCandidateSha) {
+          throw new Error("Unable to capture the exact applied candidate SHA before validation.");
         }
       }
-      if (skipLocalApplyDueConflict) {
-        if (completion.trustedValidationCommandsJson) {
-          throw new Error("Trusted validation cannot run because the candidate was not applied to the SourceControlManager validation branch.");
+      if ("idempotent" in applyResult && applyResult.idempotent) {
+        if (previousValidationCheckpoint) {
+          trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
+        } else if (validationRepairPublicationLease) {
+          trustedValidationBaselineSha = validationRepairPublicationLease.baselineSha;
         }
-        console.warn(`[${ts2()}] Skipping local checks for ${completion.commitSha.slice(0, 8)} because ReviewAgent fallback bypassed temp-branch apply.`);
+      }
+      if (trustedValidationBaselineSha && trustedValidationCandidateSha && !await gitOps.isAncestor(trustedValidationBaselineSha, trustedValidationCandidateSha)) {
+        trustedValidationBaselineSha = await resolveValidationCheckpointBaseline({
+          preApplyBaselineSha: trustedValidationBaselineSha,
+          candidateSha: trustedValidationCandidateSha,
+          git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot)
+        });
+      }
+      await persistExactValidationCheckpoint();
+      if (skipValidationForDurableRecovery) {
+        await assertValidationWorktree("published recovery");
+        console.log(`[${ts2()}] Exact candidate ${trustedValidationCandidateSha?.slice(0, 8)} already has immutable validation-success and publication proof; skipping duplicate validation.`);
       } else {
+        await assertValidationWorktree("before trusted validation");
         if (completion.trustedValidationCommandsJson) {
           healthTracker.progress("trusted_validation", completion.id);
           console.log(`[${ts2()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`);
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
-            commandsJson: completion.trustedValidationCommandsJson
+            commandsJson: completion.trustedValidationCommandsJson,
+            onProgress: (event) => healthTracker.progress(trustedValidationHealthPhase(event), completion.id)
           });
+          const validationOutcome = resolveTrustedValidationOutcome(trustedValidationResults);
+          const terminalResults = new Set(validationOutcome.terminalResults);
           for (const trustedResult of trustedValidationResults) {
             if (trustedResult.phase === "dependency_install") {
               trustedInstallDurationMs = (trustedInstallDurationMs ?? 0) + trustedResult.durationMs;
@@ -6288,10 +8124,6 @@ async function tick() {
               trustedValidationDurationMs = (trustedValidationDurationMs ?? 0) + trustedResult.durationMs;
             }
             const timing = `${trustedResult.durationMs}ms${trustedResult.cached ? ", cache hit" : ""}`;
-            if (!trustedResult.ok) {
-              throw new Error(`Trusted validation "${trustedResult.command}" failed after ${timing} (exit ${trustedResult.exitCode}): ${trustedResult.output}`);
-            }
-            console.log(`[${ts2()}]   - Trusted validation passed (${timing}): ${trustedResult.command}`);
             console.log(`[${ts2()}] trustedValidationTiming=${JSON.stringify({
               event: "trusted_validation_timing",
               jobId: completion.jobId,
@@ -6299,9 +8131,23 @@ async function tick() {
               command: trustedResult.command,
               phase: trustedResult.phase,
               durationMs: trustedResult.durationMs,
-              cached: Boolean(trustedResult.cached)
+              cached: Boolean(trustedResult.cached),
+              ok: trustedResult.ok,
+              attempt: trustedResult.attempt ?? 1,
+              retryReason: trustedResult.retryReason ?? null
             })}`);
+            if (trustedResult.ok) {
+              console.log(`[${ts2()}]   - Trusted validation passed (${timing}, attempt ${trustedResult.attempt ?? 1}): ${trustedResult.command}`);
+            } else if (!terminalResults.has(trustedResult)) {
+              console.warn(`[${ts2()}]   - Trusted validation attempt ${trustedResult.attempt ?? 1} failed after ${timing} and was retried: ${trustedResult.command}`);
+            }
           }
+          if (validationOutcome.terminalFailure) {
+            const trustedResult = validationOutcome.terminalFailure;
+            const timing = `${trustedResult.durationMs}ms${trustedResult.cached ? ", cache hit" : ""}`;
+            throw new Error(`Trusted validation "${trustedResult.command}" failed after ${timing} (exit ${trustedResult.exitCode}): ${trustedResult.output}`);
+          }
+          await assertValidationWorktree("after trusted validation");
         }
         console.log(`[${ts2()}] Running checks...`);
         for (const check of runtimeConfig.checks) {
@@ -6311,10 +8157,26 @@ async function tick() {
             throw new Error(`Check "${check.name}" failed: ${checkResult.output}`);
           }
           console.log(`[${ts2()}]   - Check passed: ${check.name}`);
+          await assertValidationWorktree(`after check ${check.name}`);
+        }
+        await assertValidationWorktree("after all checks");
+        await persistValidationSuccessProof({
+          completionId: completion.id,
+          claimGeneration: validationCheckpointGeneration,
+          candidateSha: trustedValidationCandidateSha ?? "",
+          git: validationGit
+        });
+        validationSuccessProven = true;
+        if (await proveValidatedCandidatePublished()) {
+          const recoveryState = durablePublicationRecoveryState(true);
+          publicationAlreadyIntegrated = recoveryState.skipPublicationMutation;
+          publicationReadyForFinalization = recoveryState.protectFromTerminalFailure;
+          console.log(`[${ts2()}] Exact validated candidate ${trustedValidationCandidateSha?.slice(0, 8)} is already durable on its authoritative publication ref.`);
         }
       }
+      await persistExactValidationCheckpoint();
       healthTracker.progress("publication", completion.id);
-      await renewCompletionLease(true);
+      await requireCompletionLease("publication");
       if (useReviewPublicationFlow) {
         console.log(`[${ts2()}] ReviewAgent mode - creating individual PR for ${completion.branch}`);
         const remoteUrlResult = await runGitCapture(["-C", runtimeConfig.repoPath, "remote", "get-url", runtimeConfig.remote], repoRoot);
@@ -6328,7 +8190,9 @@ async function tick() {
         const completionPrTitle = (completion.prTitle ?? "").trim();
         const resolvedHead = reviewPublicationLease ? { headBranch: reviewPublicationLease.targetBranch, requiresMaterialize: false } : deriveReviewPrHeadBranch(completion.branch, completion.id);
         let prHeadBranch = resolvedHead.headBranch;
-        if (shouldPublishWithExactReviewLease(reviewPublicationLease)) {
+        if (publicationAlreadyIntegrated) {
+          console.log(`[${ts2()}] Review completion ${completion.id} is already present on ${prHeadBranch}; skipping duplicate branch mutation.`);
+        } else if (shouldPublishWithExactReviewLease(reviewPublicationLease)) {
           const prBaseBranch2 = reviewPublicationLease.baseBranch ?? (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
           if (reviewPublicationLease.expectedBaseSha) {
             const remoteBase = await runGitCapture([
@@ -6343,47 +8207,48 @@ async function tick() {
             }
           }
           console.log(`[${ts2()}] Publishing reviewed completion ${completion.commitSha.slice(0, 8)} to ${prHeadBranch} with an exact force-with-lease.`);
-          const pushResult = await runGitCapture([
-            "-C",
-            runtimeConfig.repoPath,
-            ...buildReviewPublicationPushArgs({
-              remote: runtimeConfig.remote,
-              commitSha: completion.commitSha,
-              lease: reviewPublicationLease
-            })
-          ], repoRoot);
-          if (!pushResult.ok) {
-            throw new Error(`Failed exact-lease publication for review branch ${prHeadBranch}: ${pushResult.stderr || pushResult.stdout}`);
+          await requireCompletionLease(`review branch push ${prHeadBranch}`);
+          const publication = await publishWithAuthoritativeProof({
+            mutate: () => runGitCapture([
+              "-C",
+              runtimeConfig.repoPath,
+              ...buildReviewPublicationPushArgs({
+                remote: runtimeConfig.remote,
+                commitSha: completion.commitSha,
+                lease: reviewPublicationLease
+              })
+            ], repoRoot),
+            provePublished: proveValidatedCandidatePublished,
+            failurePrefix: `Failed exact-lease publication for review branch ${prHeadBranch}`
+          });
+          markPublicationDurable();
+          if (publication.recoveredFromAmbiguousFailure) {
+            console.warn(`[${ts2()}] Review push reported failure after ${prHeadBranch} became authoritative; continuing with durable recovery.`);
           }
+          await confirmLeaseAfterPublication(`review branch push ${prHeadBranch}`);
         } else if (resolvedHead.requiresMaterialize) {
-          const publishRef = skipLocalApplyDueConflict ? completion.commitSha : "HEAD";
-          console.log(`[${ts2()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch}`);
-          let pushResult = await runGitCapture([
-            "-C",
-            runtimeConfig.repoPath,
-            "push",
-            runtimeConfig.remote,
-            `${publishRef}:refs/heads/${prHeadBranch}`
-          ], repoRoot);
-          if (!pushResult.ok) {
-            const detail = `${pushResult.stderr}
-${pushResult.stdout}`.toLowerCase();
-            const likelyNonFf = detail.includes("non-fast-forward") || detail.includes("fetch first") || detail.includes("rejected");
-            if (likelyNonFf) {
-              console.warn(`[${ts2()}] Non-fast-forward while publishing ${prHeadBranch}; retrying with --force-with-lease`);
-              pushResult = await runGitCapture([
-                "-C",
-                runtimeConfig.repoPath,
-                "push",
-                "--force-with-lease",
-                runtimeConfig.remote,
-                `${publishRef}:refs/heads/${prHeadBranch}`
-              ], repoRoot);
-            }
+          const publishRef = "HEAD";
+          const remoteHeadBeforePublication = await gitOps.revParse(`refs/remotes/${runtimeConfig.remote}/${prHeadBranch}`);
+          const explicitLease = `--force-with-lease=refs/heads/${prHeadBranch}:${remoteHeadBeforePublication ?? ""}`;
+          console.log(`[${ts2()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch} with an exact remote lease.`);
+          await requireCompletionLease(`review branch materialization ${prHeadBranch}`);
+          const publication = await publishWithAuthoritativeProof({
+            mutate: () => runGitCapture([
+              "-C",
+              runtimeConfig.repoPath,
+              "push",
+              explicitLease,
+              runtimeConfig.remote,
+              `${publishRef}:refs/heads/${prHeadBranch}`
+            ], repoRoot),
+            provePublished: proveValidatedCandidatePublished,
+            failurePrefix: `Failed to publish review branch ${prHeadBranch}`
+          });
+          markPublicationDurable();
+          if (publication.recoveredFromAmbiguousFailure) {
+            console.warn(`[${ts2()}] Review materialization reported failure after ${prHeadBranch} became authoritative; continuing with durable recovery.`);
           }
-          if (!pushResult.ok) {
-            throw new Error(`Failed to publish review branch ${prHeadBranch}: ${pushResult.stderr || pushResult.stdout}`);
-          }
+          await confirmLeaseAfterPublication(`review branch materialization ${prHeadBranch}`);
         }
         const commitSubject = await resolveCommitSubject(completion.commitSha);
         if (!commitSubject) {
@@ -6411,6 +8276,7 @@ ${pushResult.stdout}`.toLowerCase();
 `);
         const remoteUrl = remoteUrlResult.stdout.trim();
         const prBaseBranch = (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
+        await requireCompletionLease(`pull request creation for ${prHeadBranch}`);
         const pr = await ensureIntegrationPullRequest({
           token,
           remoteUrl,
@@ -6420,7 +8286,7 @@ ${pushResult.stdout}`.toLowerCase();
           body: prBody,
           draft: false
         });
-        if (!pr.created) {
+        if (!pr.created && !publicationAlreadyIntegrated) {
           reviewAgentForTick?.requestReReview(pr.number, completion.commitSha);
         }
         const prMessage = pr.created ? `Opened individual PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}` : `Reused existing PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`;
@@ -6428,84 +8294,216 @@ ${pushResult.stdout}`.toLowerCase();
         console.log(`[${ts2()}] ${prMessage}`);
         await emitPusherMessage(comm, prMessage, completion.id, completionEventMeta);
       } else {
-        console.log(`[${ts2()}] Merging ${tempBranch} to ${runtimeConfig.mainBranch}...`);
-        await gitOps.checkoutMain();
-        const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
-        if (!ffResult.ok) {
-          throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
-        }
-        console.log(`[${ts2()}] \u2713 Successfully merged ${completion.branch} to ${config.mainBranch}`);
-        if (config.pushMainAfterMerge) {
-          console.log(`[${ts2()}] Pushing ${config.mainBranch} to ${config.remote}...`);
-          const pushResult = await gitOps.pushMain();
-          if (!pushResult.ok) {
-            throw new Error(`Push failed: ${pushResult.stderr || pushResult.stdout}`);
+        if (!publicationAlreadyIntegrated) {
+          await requireCompletionLease(`merge to ${runtimeConfig.mainBranch}`);
+          console.log(`[${ts2()}] Merging ${tempBranch} to ${runtimeConfig.mainBranch}...`);
+          await gitOps.checkoutMain();
+          const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
+          if (!ffResult.ok) {
+            throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
           }
-          console.log(`[${ts2()}] Push succeeded for ${config.mainBranch}`);
-          if (config.openPrAfterPush) {
+          console.log(`[${ts2()}] \u2713 Successfully merged ${completion.branch} to ${config.mainBranch}`);
+        } else {
+          console.log(`[${ts2()}] Completion ${completion.id} is already present on ${runtimeConfig.mainBranch}; skipping duplicate merge and push.`);
+        }
+        if (runtimeConfig.pushMainAfterMerge && !publicationAlreadyIntegrated) {
+          await requireCompletionLease(`push to ${runtimeConfig.remote}/${runtimeConfig.mainBranch}`);
+          console.log(`[${ts2()}] Pushing ${runtimeConfig.mainBranch} to ${runtimeConfig.remote}...`);
+          const publication = await publishWithAuthoritativeProof({
+            mutate: () => gitOps.pushMain(),
+            provePublished: proveValidatedCandidatePublished,
+            failurePrefix: `Push failed for ${runtimeConfig.remote}/${runtimeConfig.mainBranch}`
+          });
+          markPublicationDurable();
+          if (publication.recoveredFromAmbiguousFailure) {
+            console.warn(`[${ts2()}] Push reported failure after ${runtimeConfig.remote}/${runtimeConfig.mainBranch} contained the exact validated candidate; continuing with durable recovery.`);
+          } else {
+            console.log(`[${ts2()}] Push succeeded for ${runtimeConfig.mainBranch}`);
+          }
+          await confirmLeaseAfterPublication(`push to ${runtimeConfig.remote}/${runtimeConfig.mainBranch}`);
+          if (runtimeConfig.openPrAfterPush) {
             try {
+              await requireCompletionLease("aggregated pull request creation");
               const pr = await ensureMainPullRequest(completion, runtimeConfig);
               const prMessage = pr.created ? `Opened PR #${pr.number}: ${pr.htmlUrl}` : `Reused existing PR #${pr.number}: ${pr.htmlUrl}`;
               processedPrUrl = pr.htmlUrl;
               console.log(`[${ts2()}] ${prMessage}`);
               await emitPusherMessage(comm, prMessage, completion.id, completionEventMeta);
             } catch (prErr) {
+              if (completionLeaseRenewal.hasLostLease())
+                throw prErr;
               const warning = `Push succeeded, but PR auto-open failed: ${prErr?.message ?? prErr}`;
               console.error(`[${ts2()}] ${warning}`);
               await emitPusherMessage(comm, warning, completion.id, completionEventMeta);
             }
           }
-        } else {
+        } else if (!publicationAlreadyIntegrated) {
           console.log(`[${ts2()}] pushMainAfterMerge=false - skipping push`);
+          if (!await proveValidatedCandidatePublished()) {
+            throw new Error(`Local publication proof for ${runtimeConfig.mainBranch} did not contain exact validated candidate ${trustedValidationCandidateSha}.`);
+          }
+          markPublicationDurable();
+          await confirmLeaseAfterPublication(`local merge to ${runtimeConfig.mainBranch}`);
         }
+      }
+      await requireCompletionLease("final authoritative publication proof");
+      publicationAlreadyIntegrated = false;
+      publicationReadyForFinalization = false;
+      await assertFinalAuthoritativePublicationProof({
+        provePublished: proveValidatedCandidatePublished,
+        failurePrefix: `Final authoritative publication proof no longer contains exact validated candidate ${trustedValidationCandidateSha}`
+      });
+      markPublicationDurable();
+      if (!publicationReadyForFinalization) {
+        throw new Error("Publication finished without authoritative validation and durability proof; refusing completion finalization.");
       }
       await gitOps.deleteTempBranch(tempBranch);
       healthTracker.progress("completion_callback", completion.id);
-      await renewCompletionLease(true);
-      const markResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/processed`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          pusherId,
-          prUrl: processedPrUrl,
-          trustedInstallDurationMs,
-          trustedValidationDurationMs,
-          trustedValidationCacheHit,
-          trustedValidationReport: trustedValidationReport()
-        })
+      await requireCompletionLease("processed callback");
+      const additionalValidationRefs = validationRepairPublicationLease?.candidateRef ? [
+        validationRepairPublicationLease.candidateRef,
+        validationRepairPublicationLease.candidateRef.replace(/\/candidate$/, "/baseline"),
+        validationRepairPublicationLease.candidateRef.replace(/\/candidate$/, "/validated")
+      ] : [];
+      completionGcRecord = completionGcJournal.enqueue(createCompletionGcRecord({
+        completionId: completion.id,
+        completionBranch: completion.branch,
+        commitSha: completion.commitSha,
+        claimGeneration: completionClaimGeneration,
+        remote: reviewPublicationLease && completion.branch.startsWith("refs/pushpals/") ? runtimeConfig.remote : null,
+        additionalValidationRefs
+      }));
+      const markResult = await postCompletionProcessedWithRetry({
+        request: async (signal) => {
+          const response2 = await fetchBufferedWithHardDeadline({
+            input: `${config.serverUrl}/completions/${completion.id}/processed`,
+            init: {
+              method: "POST",
+              headers,
+              signal,
+              body: JSON.stringify({
+                pusherId,
+                claimToken: completionClaimToken,
+                prUrl: processedPrUrl,
+                trustedInstallDurationMs,
+                trustedValidationDurationMs,
+                trustedValidationCacheHit,
+                trustedValidationReport: trustedValidationReport()
+              })
+            },
+            timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+            timeoutMessage: `Completion processed callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
+          });
+          const payload = await response2.json().catch(() => null);
+          return { ok: response2.ok && payload?.ok === true, status: response2.status };
+        }
       });
-      if (!markResponse.ok) {
-        console.error(`[${ts2()}] Failed to mark completion processed: ${markResponse.status}`);
+      if (!markResult.confirmed) {
+        const callbackDetail = markResult.lastStatus ? `HTTP ${markResult.lastStatus}` : markResult.lastError || "no response";
+        console.warn(`[${ts2()}] Publication completed for ${completion.id}, but its processed callback is unconfirmed after ${markResult.attempts} attempt(s): ${callbackDetail}. Retaining the immutable checkpoint for stale-claim reconciliation.`);
+        await emitPusherMessage(comm, `Publication completed for ${completion.id.slice(0, 8)}, but finalization acknowledgement is pending. SourceControlManager retained the exact checkpoint and will reconcile it without publishing again.`, completion.id, completionEventMeta);
       } else {
         console.log(`[${ts2()}] Marked completion ${completion.id} as processed`);
         cleanupCompletionHandoff = true;
-        const pushMessage = useReviewPublicationFlow ? skipLocalApplyDueConflict ? `Local apply/checks were bypassed for ${completion.commitSha.slice(0, 8)} due cherry-pick conflict; individual PR flow continued for ReviewAgent.` : `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.` : config.pushMainAfterMerge ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.` : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
+        const pushMessage = useReviewPublicationFlow ? `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.` : config.pushMainAfterMerge ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.` : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err) {
-      console.error(`[${ts2()}] Failed to process completion ${completion.id}: ${err.message}`);
-      const failResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/fail`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          pusherId,
-          error: err.message,
-          trustedInstallDurationMs,
-          trustedValidationDurationMs,
-          trustedValidationCacheHit,
-          trustedValidationReport: trustedValidationReport()
-        })
-      });
-      if (!failResponse.ok) {
-        console.error(`[${ts2()}] Failed to mark completion failed: ${failResponse.status}`);
+      const publicationAttemptUncertain = err instanceof PublicationAuthorityUnreachableError;
+      let authoritativeReprobe = "absent";
+      if (validatedCheckpointRecoveryPending && previousValidationCheckpoint?.validationProven) {
+        validationSuccessProven = true;
+        trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
+        trustedValidationCandidateSha = previousValidationCheckpoint.candidateSha;
+        trustedValidationCandidateRef = previousValidationCheckpoint.candidateRef;
+        validationCheckpointPersisted = true;
+        validationCheckpointGeneration = previousValidationCheckpoint.claimGeneration;
       }
-      await emitPusherMessage(comm, `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`, completion.id, completionEventMeta);
+      try {
+        await persistExactValidationCheckpoint();
+      } catch (checkpointError) {
+        err = new Error(`${err?.message ?? err}; additionally failed to retain exact trusted-validation candidate: ${checkpointError instanceof Error ? checkpointError.message : String(checkpointError)}`);
+      }
+      if (!publicationReadyForFinalization && validationSuccessProven) {
+        try {
+          if (await proveValidatedCandidatePublished()) {
+            markPublicationDurable();
+            authoritativeReprobe = "published";
+            console.warn(`[${ts2()}] Recovered authoritative publication proof for ${completion.id} after an ambiguous publication error.`);
+          } else {
+            authoritativeReprobe = "absent";
+          }
+        } catch (publicationProbeError) {
+          authoritativeReprobe = "unreachable";
+          console.warn(`[${ts2()}] Could not confirm authoritative publication state for ${completion.id}: ${publicationProbeError instanceof Error ? publicationProbeError.message : String(publicationProbeError)}`);
+        }
+      }
+      const failureDisposition = publicationFailureDisposition({
+        publicationReadyForFinalization,
+        publicationAttemptUncertain,
+        authoritativeReprobe,
+        validatedCheckpointRecoveryPending
+      });
+      if (failureDisposition === "finalize") {
+        console.warn(`[${ts2()}] Publication completed for ${completion.id}, but finalization is pending after: ${err.message}. Retaining the completion for idempotent stale-claim recovery.`);
+        try {
+          await emitPusherMessage(comm, `Publication completed for ${completion.id.slice(0, 8)}, but finalization acknowledgement is pending. SourceControlManager retained the exact checkpoint and will reconcile it without publishing again. Detail: ${err.message}`, completion.id, completionEventMeta);
+        } catch (messageError) {
+          console.warn(`[${ts2()}] Could not emit pending-finalization status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
+        }
+      } else if (failureDisposition === "reconcile") {
+        console.warn(`[${ts2()}] Publication outcome is uncertain for ${completion.id} because the authoritative ref remained unreachable. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`);
+        try {
+          await emitPusherMessage(comm, `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it when the authoritative ref is reachable; the job was not marked failed.`, completion.id, completionEventMeta);
+        } catch (messageError) {
+          console.warn(`[${ts2()}] Could not emit uncertain-publication status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
+        }
+      } else {
+        console.error(`[${ts2()}] Failed to process completion ${completion.id}: ${err.message}`);
+        const failResult = await postCompletionCallbackWithRetry({
+          attempts: 2,
+          request: (signal) => fetchBufferedWithHardDeadline({
+            input: `${config.serverUrl}/completions/${completion.id}/fail`,
+            init: {
+              method: "POST",
+              headers,
+              signal,
+              body: JSON.stringify({
+                pusherId,
+                claimToken: completionClaimToken,
+                error: err.message,
+                trustedInstallDurationMs,
+                trustedValidationDurationMs,
+                trustedValidationCacheHit,
+                trustedValidationReport: trustedValidationReport()
+              })
+            },
+            timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+            timeoutMessage: `Completion failure callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
+          })
+        });
+        if (!failResult.confirmed) {
+          const callbackDetail = failResult.lastStatus ? `HTTP ${failResult.lastStatus}` : failResult.lastError || "no response";
+          console.warn(`[${ts2()}] Completion ${completion.id} failed, but its failure callback is unconfirmed after ${failResult.attempts} attempt(s): ${callbackDetail}. Lease recovery will reconcile it.`);
+        }
+        await emitPusherMessage(comm, `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`, completion.id, completionEventMeta);
+      }
     } finally {
       clearInterval(completionLeaseHeartbeatTimer);
       try {
         await gitOps.resetToClean();
       } catch (err) {
         console.warn(`[${ts2()}] Failed to reset SourceControlManager worktree after completion ${completion.id}: ${err?.message ?? err}`);
+      }
+      if (validationWorktreeInvariantFailed) {
+        try {
+          const cleanResult = await validationGit(["clean", "-ffd"]);
+          if (!cleanResult.ok) {
+            console.warn(`[${ts2()}] Failed to remove files created by a mutating validation command: ${cleanResult.stderr || cleanResult.stdout}`);
+          }
+        } catch (err) {
+          console.warn(`[${ts2()}] Failed to clean validation-created files from the disposable SourceControlManager worktree: ${err?.message ?? err}`);
+        }
       }
       try {
         if (tempBranch && await gitOps.revParse(tempBranch)) {
@@ -6514,21 +8512,16 @@ ${pushResult.stdout}`.toLowerCase();
       } catch (err) {
         console.warn(`[${ts2()}] Failed to delete temp branch ${tempBranch} during final cleanup: ${err?.message ?? err}`);
       }
-      if (cleanupHiddenCompletionRef && shouldCleanupCompletionHandoff(cleanupCompletionHandoff)) {
-        if (reviewPublicationLease) {
-          try {
-            const deleteRemoteCompletionRef = await runGitCapture(["-C", runtimeConfig.repoPath, "push", runtimeConfig.remote, `:${completion.branch}`], repoRoot);
-            if (!deleteRemoteCompletionRef.ok) {
-              console.warn(`[${ts2()}] Failed to clean remote review completion ref ${completion.branch}: ${deleteRemoteCompletionRef.stderr || deleteRemoteCompletionRef.stdout}`);
-            }
-          } catch (err) {
-            console.warn(`[${ts2()}] Failed to clean remote review completion ref ${completion.branch}: ${err?.message ?? err}`);
-          }
-        }
+      if (cleanupCompletionHandoff && completionGcRecord) {
         try {
-          await gitOps.deleteLocalRef(completion.branch);
+          const cleaned = await cleanupProcessedCompletionRefs(runtimeConfig, completionGcRecord);
+          if (cleaned) {
+            completionGcJournal.remove(completionGcRecord);
+          } else {
+            console.warn(`[${ts2()}] Processed completion ${completion.id} has more retained refs than one bounded cleanup batch; the journal will resume cleanup next tick.`);
+          }
         } catch (err) {
-          console.warn(`[${ts2()}] Failed to clean local completion ref ${completion.branch}: ${err?.message ?? err}`);
+          console.warn(`[${ts2()}] Failed to clean processed completion refs for ${completion.id}; the durable GC journal will retry: ${err?.message ?? err}`);
         }
       } else if (cleanupHiddenCompletionRef) {
         console.warn(`[${ts2()}] Retaining completion handoff ${completion.branch} because publication did not reach a confirmed processed state.`);
@@ -6624,7 +8617,7 @@ async function ensureDefaultSourceControlManagerWorktree() {
   const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
   if (probe.ok)
     return;
-  mkdirSync2(resolve9(config.repoPath, ".."), { recursive: true });
+  mkdirSync3(resolve9(config.repoPath, ".."), { recursive: true });
   await runGitCapture(["worktree", "prune"]);
   const seedCandidates = [
     `${config.remote}/${config.mainBranch}`,

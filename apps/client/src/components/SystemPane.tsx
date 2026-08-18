@@ -226,6 +226,7 @@ export function SystemPane({
   const evaluator =
     autonomyOps?.latestEvaluatorScorecard ?? autonomyInsights.latestEvaluatorScorecard;
   const recentAlerts = autonomyOps?.recentAlerts ?? [];
+  const reliability = autonomyOps?.reliability;
   const freshInspiration = autonomyInspiration.slice(0, 6);
   const trustedSources = autonomyInsights.trustedInspirationShortlist.slice(0, 6);
   const archivedSources = autonomyInsights.archivedInspirationSources.slice(0, 4);
@@ -476,6 +477,45 @@ export function SystemPane({
           detail={`timeout ${formatPercent(jobSlo?.timeoutRate)} | p95 run ${formatDuration(jobSlo?.durationMs?.p95)}`}
           theme={theme}
         />
+        <MetricTile
+          title={`Autonomy Yield (${reliability?.windowHours ?? 24}h)`}
+          value={formatPercent(reliability?.attemptSuccessRate)}
+          detail={`objectives ${formatPercent(reliability?.objectiveSuccessRate)} | first pass ${formatPercent(reliability?.objectiveFirstPassRate)} | attempts ${reliability?.attemptsTotal ?? 0}`}
+          tone={
+            reliability?.attemptSuccessRate == null
+              ? "accent"
+              : reliability.attemptSuccessRate >= 0.7
+                ? "positive"
+                : "warning"
+          }
+          theme={theme}
+        />
+        <MetricTile
+          title="Autonomy Runtime"
+          value={formatDuration(reliability?.durationMs.p50)}
+          detail={`p95 ${formatDuration(reliability?.durationMs.p95)} | avg ${formatDuration(reliability?.durationMs.average)}`}
+          tone={
+            reliability?.durationMs.average == null
+              ? "accent"
+              : reliability.durationMs.average <= 10 * 60_000
+                ? "positive"
+                : "warning"
+          }
+          theme={theme}
+        />
+        <MetricTile
+          title="Validation Evidence"
+          value={formatPercent(reliability?.validationEvidenceCoverageRate)}
+          detail={`collisions ${reliability?.validationFingerprintCollisionCount ?? 0} | retries ${reliability?.transientValidationRetries ?? 0}`}
+          tone={
+            reliability?.validationEvidenceCoverageRate == null
+              ? "accent"
+              : reliability.validationFingerprintCollisionCount === 0
+                ? "positive"
+                : "danger"
+          }
+          theme={theme}
+        />
       </View>
 
       <View
@@ -611,6 +651,21 @@ export function SystemPane({
             : "--"}{" "}
           | samples {evaluator?.sampleCount ?? 0}
         </Text>
+        {reliability ? (
+          <Text style={[styles.systemMeta, { color: theme.textMuted, fontFamily: theme.fontSans }]}>
+            outcomes success {reliability.outcomeCounts.succeeded ?? 0} | quality rejected{" "}
+            {reliability.outcomeCounts.quality_rejected ?? 0} | validation blocked{" "}
+            {reliability.outcomeCounts.validation_blocked ?? 0} | environment blocked{" "}
+            {reliability.outcomeCounts.environment_blocked ?? 0} | no change{" "}
+            {reliability.outcomeCounts.no_change ?? 0} | infrastructure{" "}
+            {reliability.outcomeCounts.infrastructure_failed ?? 0} | active incidents{" "}
+            {reliability.activeIncidentCount} | handoff failures{" "}
+            {reliability.workerHandoffFailureCount} | stalled handoffs{" "}
+            {reliability.stalledWorkerHandoffCount} | revision events{" "}
+            {reliability.nonTerminalRevisionCount} across{" "}
+            {reliability.nonTerminalRevisionObjectiveCount} objectives
+          </Text>
+        ) : null}
         <View style={styles.safetyActionsRow}>
           <Pressable
             style={[

@@ -106,8 +106,16 @@ describe("server AutonomyStore policy gates", () => {
         userAction: "applied",
       }).ok,
     ).toBe(true);
-    expect(completions.claim("scm-lifecycle").completion?.id).toBe(handoff.completionId);
-    expect(completions.markFailed(handoff.completionId ?? "", "merge failed").ok).toBe(true);
+    const claimed = completions.claim("scm-lifecycle");
+    expect(claimed.completion?.id).toBe(handoff.completionId);
+    expect(
+      completions.markFailed(
+        handoff.completionId ?? "",
+        "merge failed",
+        "scm-lifecycle",
+        claimed.completion?.claimToken,
+      ).ok,
+    ).toBe(true);
 
     completions.close();
     completions = new CompletionQueue(dbPath);
@@ -339,7 +347,7 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
-  test("createSnapshot marks repo validation red after repeated failures in one terminal job", () => {
+  test("createSnapshot does not open a cross-job incident from retries in one terminal job", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-validation-red-single-job-");
     const jobQueue = new JobQueue(dbPath);
 
@@ -393,24 +401,25 @@ describe("server AutonomyStore policy gates", () => {
         sessionId: "s1",
         runId: "run_validation_red_single_job",
       });
-      expect(snapshot.repo_health_flags.required_validation_red).toBe(true);
-      expect(snapshot.validation_incident?.command).toBe("bun run web:e2e");
-      expect(snapshot.validation_incident?.failure_count).toBe(2);
-      expect(snapshot.validation_incident?.failed_job_ids).toHaveLength(1);
-      expect(snapshot.validation_incident?.target_path_hints).toContain("tests/web-smoke.test.ts");
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(false);
+      expect(snapshot.validation_incident).toBeNull();
     } finally {
       jobQueue.close();
     }
   });
 
-  test("trusted-host failures open a cross-job circuit and a later host pass resolves it", () => {
+  test("trusted-host failures stay candidate-specific until the failing candidate passes", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-trusted-host-circuit-");
     const jobs = new JobQueue(dbPath);
     const completions = new CompletionQueue(dbPath);
     const failedTest =
       "mandatory AccountProvider state machine > fails account deletion locally when the account API is not configured";
     const output = `account/__tests__/AccountContext.test.tsx:\n(fail) ${failedTest} [7ms]`;
-    const finalize = (suffix: string, ok: boolean): string => {
+    const finalize = (
+      suffix: string,
+      ok: boolean,
+      candidateSha = `candidate-${suffix}`,
+    ): string => {
       const enqueued = jobs.enqueue({
         taskId: `task-trusted-host-${suffix}`,
         sessionId: "s1",
@@ -424,7 +433,7 @@ describe("server AutonomyStore policy gates", () => {
         {
           jobId,
           sessionId: "s1",
-          commitSha: `candidate-${suffix}`,
+          commitSha: candidateSha,
           branch: `refs/pushpals/agent/worker/${suffix}`,
           message: "candidate",
           trustedValidationCommands: ["bun run validate"],
@@ -432,11 +441,14 @@ describe("server AutonomyStore policy gates", () => {
         { beginJobFinalization: true },
       );
       const completionId = handoff.completionId ?? "";
-      expect(completions.claim(`scm-${suffix}`).completion?.id).toBe(completionId);
+      const pusherId = `scm-${suffix}`;
+      const claimed = completions.claim(pusherId);
+      expect(claimed.completion?.id).toBe(completionId);
       const report = {
         version: 1,
         baselineSha: "shared-baseline",
-        candidateSha: `candidate-${suffix}`,
+        candidateSha,
+        candidateRef: `refs/pushpals/validation/${"a".repeat(32)}/1/candidate`,
         results: [
           {
             ok,
@@ -451,17 +463,29 @@ describe("server AutonomyStore policy gates", () => {
                   failureClass: "test_failure",
                   failedTests: [failedTest],
                   targetPathHints: ["account/__tests__/AccountContext.test.tsx"],
+                  failureLines: [
+                    `candidate ${candidateSha} failed in disposable worktree ${suffix}`,
+                  ],
                 }),
           },
         ],
       };
       const result = ok
-        ? completions.markProcessedAndFinalizeJob(completionId, null, undefined, report)
+        ? completions.markProcessedAndFinalizeJob(
+            completionId,
+            null,
+            undefined,
+            report,
+            pusherId,
+            claimed.completion?.claimToken,
+          )
         : completions.markFailedAndBlockJob(
             completionId,
             `Trusted validation failed: ${failedTest}`,
             undefined,
             report,
+            pusherId,
+            claimed.completion?.claimToken,
           );
       expect(result.ok).toBe(true);
       return jobId;
@@ -480,8 +504,11 @@ describe("server AutonomyStore policy gates", () => {
         failed_tests: [failedTest],
         target_path_hints: ["account/__tests__/AccountContext.test.tsx"],
         failure_fingerprint: expect.any(String),
+        validation_scope: "candidate_specific",
+        baseline_failure_proven: false,
       });
       expect(red.validation_incident?.failed_job_ids).toHaveLength(2);
+      expect(store.getReliabilityMetrics().validationFingerprintCollisionCount).toBe(0);
 
       const db = (store as unknown as { db: any }).db;
       db.prepare(
@@ -497,12 +524,319 @@ describe("server AutonomyStore policy gates", () => {
       expect(workerGreenOnly.repo_health_flags.required_validation_red).toBe(true);
       expect(workerGreenOnly.validation_incident?.source).toBe("trusted_host");
 
-      finalize("success", true);
+      finalize("unrelated-success", true);
+      const stillRed = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_trusted_unrelated_green",
+      });
+      expect(stillRed.repo_health_flags.required_validation_red).toBe(true);
+      expect(stillRed.validation_incident?.candidate_sha).toBe("candidate-failure-b");
+
+      finalize("exact-success", true, "candidate-failure-b");
       const green = store.createSnapshot({ sessionId: "s1", runId: "run_trusted_green" });
       expect(green.repo_health_flags.required_validation_red).toBe(false);
       expect(green.validation_incident).toBeNull();
     } finally {
       completions.close();
+      jobs.close();
+    }
+  });
+
+  test("a deterministic terminal retry remains incident evidence after a transient first attempt", () => {
+    const { store, dbPath } = makePersistentStore(
+      "pushpals-autonomy-transient-then-deterministic-",
+    );
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const failedTest = "retry boundary > preserves the deterministic assertion";
+    const command = "bun test tests/retry-boundary.test.ts";
+    const failCandidate = (suffix: string): void => {
+      const enqueued = jobs.enqueue({
+        taskId: `task-transient-terminal-${suffix}`,
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { origin: "autonomy" },
+        dedupeKey: `transient-terminal:${suffix}`,
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim(`worker-transient-terminal-${suffix}`).job?.id).toBe(jobId);
+      const handoff = completions.enqueue(
+        {
+          jobId,
+          sessionId: "s1",
+          commitSha: `candidate-${suffix}`,
+          branch: `refs/pushpals/agent/worker/${suffix}`,
+          message: "candidate",
+          trustedValidationCommands: [command],
+        },
+        { beginJobFinalization: true },
+      );
+      const pusherId = `scm-transient-terminal-${suffix}`;
+      const claimed = completions.claim(pusherId).completion;
+      expect(claimed?.id).toBe(handoff.completionId);
+      expect(
+        completions.markFailedAndBlockJob(
+          handoff.completionId ?? "",
+          `Trusted validation failed: ${failedTest}`,
+          undefined,
+          {
+            version: 1,
+            baselineSha: "shared-retry-baseline",
+            candidateSha: `candidate-${suffix}`,
+            candidateRef: `refs/pushpals/validation/${suffix}/candidate`,
+            results: [
+              {
+                ok: false,
+                command,
+                output: "ECONNRESET while contacting a transient dependency",
+                exitCode: 1,
+                durationMs: 100,
+                phase: "validation",
+                attempt: 1,
+                retryReason: "transient_infrastructure",
+              },
+              {
+                ok: false,
+                command,
+                output: `tests/retry-boundary.test.ts:\n(fail) ${failedTest}`,
+                exitCode: 1,
+                durationMs: 100,
+                phase: "validation",
+                attempt: 2,
+                retryReason: "transient_infrastructure",
+              },
+            ],
+          },
+          pusherId,
+          claimed?.claimToken,
+        ).ok,
+      ).toBe(true);
+    };
+
+    try {
+      failCandidate("a");
+      failCandidate("b");
+      const snapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_transient_then_deterministic",
+      });
+      expect(snapshot.validation_incident).toMatchObject({
+        active: true,
+        command,
+        failure_count: 2,
+        failed_tests: [failedTest],
+        cross_job_circuit_open: true,
+      });
+      expect(store.getReliabilityMetrics().transientValidationRetries).toBe(2);
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
+  test("keeps trusted failures observable without inventing a repair candidate", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-no-candidate-ref-");
+    const jobs = new JobQueue(dbPath);
+    const db = (store as unknown as { db: any }).db;
+    try {
+      for (const [index, suffix] of ["a", "b"].entries()) {
+        const enqueued = jobs.enqueue({
+          taskId: `task-no-provenance-${suffix}`,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+          dedupeKey: `no-provenance:${suffix}`,
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        expect(jobs.claim(`worker-no-provenance-${suffix}`).job?.id).toBe(jobId);
+        expect(jobs.publishBlocked(jobId, { message: "trusted host failed" }).ok).toBe(true);
+        db.prepare(
+          `INSERT INTO job_validation_runs (
+             jobId, command, exitCode, durationMs, passed, failureClass,
+             stdoutTail, stderrTail, metadataJson, createdAt
+           ) VALUES (?, 'bun test', 1, 100, 0, 'test_failure', ?, NULL, ?, ?)`,
+        ).run(
+          jobId,
+          "tests/example.test.ts:\n(fail) same retained failure",
+          JSON.stringify({
+            source: "trusted_host",
+            baselineSha: "baseline-shared",
+            candidateSha: `unverified-worker-${suffix}`,
+            candidateRef: null,
+            failureFingerprint: "same-no-provenance-failure",
+            failedTests: ["same retained failure"],
+            targetPathHints: ["tests/example.test.ts"],
+          }),
+          new Date(Date.now() + index * 100).toISOString(),
+        );
+      }
+
+      const snapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_no_candidate_provenance",
+      });
+      expect(snapshot.repo_health_flags.required_validation_red).toBe(true);
+      expect(snapshot.validation_incident).toMatchObject({
+        source: "trusted_host",
+        validation_scope: "candidate_unavailable",
+        candidate_sha: null,
+        candidate_ref: null,
+        candidate_shas: [],
+      });
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("candidate-specific validation incidents ignore passes from unrelated candidates", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-candidate-specific-pass-");
+    const jobs = new JobQueue(dbPath);
+    const db = (store as unknown as { db: any }).db;
+    const baselineSha = "baseline-shared";
+    const failingCandidateSha = "candidate-failing";
+    const failureFingerprint = "same-candidate-failure";
+    let sequence = 0;
+
+    const recordRun = (suffix: string, candidateSha: string, passed: boolean): void => {
+      const enqueued = jobs.enqueue({
+        taskId: `task-candidate-pass-${suffix}`,
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+        dedupeKey: `candidate-pass:${suffix}`,
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim(`worker-candidate-pass-${suffix}`).job?.id).toBe(jobId);
+      if (passed) {
+        expect(jobs.complete(jobId, { summary: "trusted host passed" }).ok).toBe(true);
+      } else {
+        expect(jobs.publishBlocked(jobId, { message: "trusted host failed" }).ok).toBe(true);
+      }
+      sequence += 1;
+      db.prepare(
+        `INSERT INTO job_validation_runs (
+           jobId, command, exitCode, durationMs, passed, failureClass,
+           stdoutTail, stderrTail, metadataJson, createdAt
+         ) VALUES (?, 'bun test tests/account.test.ts', ?, 100, ?, ?, ?, NULL, ?, ?)`,
+      ).run(
+        jobId,
+        passed ? 0 : 1,
+        passed ? 1 : 0,
+        passed ? null : "test_failure",
+        passed ? "1 pass" : "(fail) account state remains stale",
+        JSON.stringify({
+          source: "trusted_host",
+          baselineSha,
+          candidateSha,
+          candidateRef: `refs/pushpals/candidate/${candidateSha}`,
+          failureFingerprint,
+          failedTests: passed ? [] : ["account state remains stale"],
+          targetPathHints: passed ? [] : ["tests/account.test.ts"],
+          failureLines: passed ? [] : ["(fail) account state remains stale"],
+        }),
+        new Date(Date.now() + sequence * 100).toISOString(),
+      );
+    };
+
+    try {
+      recordRun("failure-a", failingCandidateSha, false);
+      recordRun("failure-b", failingCandidateSha, false);
+      const red = store.createSnapshot({ sessionId: "s1", runId: "run_candidate_red" });
+      expect(red.validation_incident).toMatchObject({
+        validation_scope: "candidate_specific",
+        candidate_sha: failingCandidateSha,
+        baseline_sha: baselineSha,
+      });
+
+      recordRun("unrelated-pass", "candidate-unrelated", true);
+      const stillRed = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_candidate_unrelated_pass",
+      });
+      expect(stillRed.validation_incident?.candidate_sha).toBe(failingCandidateSha);
+
+      recordRun("exact-pass", failingCandidateSha, true);
+      const green = store.createSnapshot({ sessionId: "s1", runId: "run_candidate_exact_pass" });
+      expect(green.validation_incident).toBeNull();
+      expect(green.repo_health_flags.required_validation_red).toBe(false);
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("only explicit baseline execution proof creates and clears a baseline incident", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-explicit-baseline-");
+    const jobs = new JobQueue(dbPath);
+    const db = (store as unknown as { db: any }).db;
+    const baselineSha = "baseline-explicit";
+    let sequence = 0;
+    const recordRun = (
+      suffix: string,
+      validationTarget: "candidate" | "baseline",
+      passed: boolean,
+    ) => {
+      const enqueued = jobs.enqueue({
+        taskId: `task-baseline-proof-${suffix}`,
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+        dedupeKey: `baseline-proof:${suffix}`,
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim(`worker-baseline-proof-${suffix}`).job?.id).toBe(jobId);
+      if (passed) {
+        expect(jobs.complete(jobId, { summary: "trusted host passed" }).ok).toBe(true);
+      } else {
+        expect(jobs.publishBlocked(jobId, { message: "trusted host failed" }).ok).toBe(true);
+      }
+      sequence += 1;
+      db.prepare(
+        `INSERT INTO job_validation_runs (
+           jobId, command, exitCode, durationMs, passed, failureClass,
+           stdoutTail, stderrTail, metadataJson, createdAt
+         ) VALUES (?, 'bun test tests/baseline.test.ts', ?, 100, ?, ?, ?, NULL, ?, ?)`,
+      ).run(
+        jobId,
+        passed ? 0 : 1,
+        passed ? 1 : 0,
+        passed ? null : "test_failure",
+        passed ? "1 pass" : "(fail) shared baseline remains broken",
+        JSON.stringify({
+          source: "trusted_host",
+          baselineSha,
+          candidateSha: `candidate-${suffix}`,
+          validationTarget,
+          baselineFailureProven: validationTarget === "baseline",
+          failedTests: passed ? [] : ["shared baseline remains broken"],
+          targetPathHints: passed ? [] : ["tests/baseline.test.ts"],
+          failureLines: passed ? [] : ["(fail) shared baseline remains broken"],
+        }),
+        new Date(Date.now() + sequence * 100).toISOString(),
+      );
+    };
+
+    try {
+      recordRun("failure-a", "baseline", false);
+      recordRun("failure-b", "baseline", false);
+      const red = store.createSnapshot({ sessionId: "s1", runId: "run_baseline_red" });
+      expect(red.validation_incident).toMatchObject({
+        validation_scope: "baseline_suspected",
+        baseline_failure_proven: true,
+        baseline_sha: baselineSha,
+        candidate_sha: null,
+      });
+
+      recordRun("candidate-pass", "candidate", true);
+      expect(
+        store.createSnapshot({ sessionId: "s1", runId: "run_baseline_candidate_pass" })
+          .validation_incident?.baseline_failure_proven,
+      ).toBe(true);
+
+      recordRun("baseline-pass", "baseline", true);
+      expect(
+        store.createSnapshot({ sessionId: "s1", runId: "run_baseline_green" }).validation_incident,
+      ).toBeNull();
+    } finally {
       jobs.close();
     }
   });
@@ -1386,29 +1720,34 @@ describe("server AutonomyStore policy gates", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-required-repair-");
     const jobs = new JobQueue(dbPath);
     try {
-      const enqueued = jobs.enqueue({
-        taskId: "task-required-repair",
-        sessionId: "s1",
-        kind: "task.execute",
-        params: {},
-      });
-      const jobId = String(enqueued.jobId ?? "");
-      expect(jobs.claim("worker-required-repair").job?.id).toBe(jobId);
-      expect(
-        jobs.fail(jobId, {
-          message: "required validation failed twice",
-          diagnostics: {
-            validationRuns: [1, 2].map((attempt) => ({
-              attempt,
-              command: "bun test",
-              passed: false,
-              exitCode: 1,
-              failureClass: "test_failure",
-              stderrTail: "tests/baseline.test.ts failed",
-            })),
-          },
-        }).ok,
-      ).toBe(true);
+      for (let index = 1; index <= 2; index += 1) {
+        const enqueued = jobs.enqueue({
+          taskId: `task-required-repair-${index}`,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: {},
+          dedupeKey: `required-repair:${index}`,
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        expect(jobs.claim(`worker-required-repair-${index}`).job?.id).toBe(jobId);
+        expect(
+          jobs.fail(jobId, {
+            message: "required validation failed in distinct jobs",
+            diagnostics: {
+              validationRuns: [
+                {
+                  attempt: 1,
+                  command: "bun test",
+                  passed: false,
+                  exitCode: 1,
+                  failureClass: "test_failure",
+                  stderrTail: "tests/baseline.test.ts failed",
+                },
+              ],
+            },
+          }).ok,
+        ).toBe(true);
+      }
       const snapshotId = store.createSnapshot({
         sessionId: "s1",
         runId: "run_required_repair",
@@ -2889,7 +3228,7 @@ describe("server AutonomyStore policy gates", () => {
     expect(autonomyOutcomeCount(store, "obj_merge_conflict_feedback")).toBe(0);
   });
 
-  test("evaluator scores iterative PR feedback as one latest objective sample", () => {
+  test("evaluator excludes iterative PR revisions until a terminal objective outcome", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({
       sessionId: "s1",
@@ -2933,12 +3272,21 @@ describe("server AutonomyStore policy gates", () => {
     }
 
     const rejectedCard = runEvaluatorNow(store);
-    expect(rejectedCard.sampleCount).toBe(1);
-    expect(rejectedCard.successRate).toBe(0);
-    expect(rejectedCard.regretRate).toBe(1);
+    expect(rejectedCard.sampleCount).toBe(0);
+    expect(rejectedCard.successRate).toBeNull();
+    expect(rejectedCard.regretRate).toBeNull();
     expect(rejectedCard.recommendation).toBe("constrain");
     expect(autonomyObjectiveStatus(store, "obj_review_loop")).toBe("dispatched");
     expect(autonomyPatternSampleCount(store, decision.patternKey)).toBe(0);
+    expect(store.getReliabilityMetrics()).toMatchObject({
+      objectiveTerminalCount: 0,
+      objectiveSuccessRate: null,
+      nonTerminalRevisionCount: 7,
+      nonTerminalRevisionObjectiveCount: 1,
+      revisedTerminalObjectiveCount: 0,
+      objectiveRevisionRate: null,
+      objectiveFirstPassRate: null,
+    });
 
     const frozen = store.updateSafetyState({
       freezeForMs: 600_000,
@@ -2948,7 +3296,7 @@ describe("server AutonomyStore policy gates", () => {
     expect(frozen.state.isFrozen).toBe(true);
 
     const recheckedCard = runEvaluatorNow(store);
-    expect(recheckedCard.sampleCount).toBe(1);
+    expect(recheckedCard.sampleCount).toBe(0);
     expect(recheckedCard.recommendation).toBe("constrain");
     expect(store.getSafetyState().isFrozen).toBe(false);
 
@@ -2974,6 +3322,15 @@ describe("server AutonomyStore policy gates", () => {
     expect(mergedCard.recommendation).toBe("constrain");
     expect(autonomyObjectiveStatus(store, "obj_review_loop")).toBe("completed");
     expect(autonomyPatternSampleCount(store, decision.patternKey)).toBe(1);
+    expect(store.getReliabilityMetrics()).toMatchObject({
+      objectiveTerminalCount: 1,
+      objectiveSuccessRate: 1,
+      nonTerminalRevisionCount: 7,
+      nonTerminalRevisionObjectiveCount: 1,
+      revisedTerminalObjectiveCount: 1,
+      objectiveRevisionRate: 1,
+      objectiveFirstPassRate: 0,
+    });
   });
 
   test("evaluator selects the chronologically latest outcome after replayed backfills", () => {
@@ -3665,5 +4022,562 @@ describe("server AutonomyStore policy gates", () => {
       .get("q_restart_recovery") as { status: string; closed_reason: string | null };
     expect(questionRow.status).toBe("closed");
     expect(questionRow.closed_reason).toBe("stale_objective_timeout");
+  });
+
+  test("keeps one active objective per validation incident across runs", () => {
+    const store = makeStore();
+    const firstSnapshot = store.createSnapshot({ sessionId: "s1", runId: "run_incident_a" });
+    const objective = (id: string, runId: string, snapshotId: string) => ({
+      runId,
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id,
+        title: "Repair exact validation incident",
+        instruction: "Fix the evidence-backed failing test.",
+        objective_type: "flaky_test",
+        component_area: "tests",
+        trigger_type: "test_failure",
+        target_paths: ["tests/account.test.ts"],
+        scope: { read_anywhere: false, write_globs: ["tests/account.test.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun test tests/account.test.ts"],
+        status: "gated",
+        required_validation_repair: true,
+        incident_key: "valid_inc_exact_failure",
+        evidence: {
+          validation_incident: { incident_id: "valid_inc_exact_failure" },
+        },
+      },
+    });
+    expect(
+      store.recordObjectiveDecision(
+        objective("obj_incident_a", "run_incident_a", firstSnapshot.snapshot_id),
+      ).ok,
+    ).toBe(true);
+
+    const secondSnapshot = store.createSnapshot({ sessionId: "s1", runId: "run_incident_b" });
+    const duplicate = store.recordObjectiveDecision(
+      objective("obj_incident_b", "run_incident_b", secondSnapshot.snapshot_id),
+    );
+    expect(duplicate.ok).toBe(false);
+    expect(duplicate.objectiveId).toBe("obj_incident_a");
+    expect(duplicate.reason).toContain("already has active objective");
+  });
+
+  test("reconciles worker-required requests to jobs or fails the orphan quickly", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-handoff-");
+    const requests = new RequestQueue(dbPath);
+    const jobs = new JobQueue(dbPath);
+    try {
+      const snapshot = store.createSnapshot({ sessionId: "s1", runId: "run_handoff" });
+      const seedObjective = (
+        id: string,
+        targetPath = "apps/server/src/requests.ts",
+        runId = "run_handoff",
+        snapshotId = snapshot.snapshot_id,
+        status: "gated" | "proposed" = "gated",
+      ) =>
+        store.recordObjectiveDecision({
+          runId,
+          snapshotId,
+          sessionId: "s1",
+          objective: {
+            id,
+            title: `Handoff ${id}`,
+            instruction: "Create a durable worker handoff.",
+            objective_type: "small_refactor",
+            component_area: "apps/server",
+            trigger_type: "queue_health",
+            target_paths: [targetPath],
+            scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+            confidence: 0.95,
+            risk_level: "low",
+            expected_validation: ["bun test tests/server.requests-queue.test.ts"],
+            status,
+          },
+        });
+
+      expect(seedObjective("obj_handoff_linked").ok).toBe(true);
+      const linkedRequest = requests.enqueue({
+        sessionId: "s1",
+        prompt: "linked handoff",
+        idempotencyKey: "autonomy:obj_handoff_linked",
+      });
+      store.markObjectiveDispatched("obj_handoff_linked", linkedRequest.requestId ?? "");
+      const linkedJob = jobs.enqueue({
+        taskId: "task_handoff_linked",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: {
+          requestId: linkedRequest.requestId,
+          origin: "autonomy",
+          autonomy: { origin: "autonomy" },
+        },
+      });
+      expect(store.reconcileObjectiveWorkerHandoffs()).toMatchObject({ linked: 1, failed: 0 });
+      const db = (store as unknown as { db: any }).db;
+      expect(
+        db.prepare(`SELECT job_id FROM autonomy_objectives WHERE id = ?`).get("obj_handoff_linked")
+          .job_id,
+      ).toBe(linkedJob.jobId);
+      expect(requests.getRequest(linkedRequest.requestId ?? "")).toMatchObject({
+        status: "completed",
+        workerRequired: 1,
+        handoffJobId: linkedJob.jobId,
+        agentId: null,
+        claimToken: null,
+      });
+      db.prepare(`UPDATE autonomy_objectives SET status = 'completed' WHERE id = ?`).run(
+        "obj_handoff_linked",
+      );
+
+      expect(seedObjective("obj_handoff_orphan").ok).toBe(true);
+      const orphanRequest = requests.enqueue({
+        sessionId: "s1",
+        prompt: "orphan handoff",
+        idempotencyKey: "autonomy:obj_handoff_orphan",
+      });
+      store.markObjectiveDispatched("obj_handoff_orphan", orphanRequest.requestId ?? "");
+      const orphanClaim = requests.claim("remote-handoff").request;
+      expect(orphanClaim?.id).toBe(orphanRequest.requestId);
+      expect(
+        requests.complete(orphanRequest.requestId ?? "", {
+          agentId: "remote-handoff",
+          claimToken: orphanClaim?.claimToken,
+          result: { requiresWorker: true },
+        }).ok,
+      ).toBe(true);
+      db.prepare(`UPDATE autonomy_objectives SET updated_at = ? WHERE id = ?`).run(
+        "2026-08-17T00:00:00.000Z",
+        "obj_handoff_orphan",
+      );
+      const reconciled = store.reconcileObjectiveWorkerHandoffs("2026-08-17T00:01:00.000Z", 5_000);
+      expect(reconciled.failed).toBe(1);
+      expect(
+        db
+          .prepare(`SELECT status, block_reason FROM autonomy_objectives WHERE id = ?`)
+          .get("obj_handoff_orphan"),
+      ).toMatchObject({
+        status: "failed",
+        block_reason: "worker_handoff_missing_after_request_completion",
+      });
+
+      const slowSnapshot = store.createSnapshot({ sessionId: "s1", runId: "run_handoff_slow" });
+      expect(
+        seedObjective(
+          "obj_handoff_in_flight",
+          "apps/server/src/jobs.ts",
+          "run_handoff_slow",
+          slowSnapshot.snapshot_id,
+          "proposed",
+        ).ok,
+      ).toBe(true);
+      const inFlightRequest = requests.enqueue({
+        sessionId: "s1",
+        prompt: "slow but healthy planner handoff",
+        idempotencyKey: "autonomy:obj_handoff_in_flight",
+      });
+      store.markObjectiveDispatched("obj_handoff_in_flight", inFlightRequest.requestId ?? "");
+      expect(requests.claim("remote-slow-planner").request?.id).toBe(inFlightRequest.requestId);
+      db.prepare(`UPDATE autonomy_objectives SET updated_at = ? WHERE id = ?`).run(
+        "2026-08-17T00:00:00.000Z",
+        "obj_handoff_in_flight",
+      );
+      expect(store.reconcileObjectiveWorkerHandoffs("2026-08-17T00:01:00.000Z")).toMatchObject({
+        failed: 0,
+        pending: 1,
+      });
+      expect(
+        db
+          .prepare(`SELECT status FROM autonomy_objectives WHERE id = ?`)
+          .get("obj_handoff_in_flight").status,
+      ).toBe("dispatched");
+
+      const expiredSnapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_handoff_expired_lease",
+      });
+      expect(
+        seedObjective(
+          "obj_handoff_expired_lease",
+          "apps/server/src/autonomy.ts",
+          "run_handoff_expired_lease",
+          expiredSnapshot.snapshot_id,
+          "proposed",
+        ).ok,
+      ).toBe(true);
+      const expiredRequest = requests.enqueue({
+        sessionId: "s1",
+        prompt: "planner whose completion lease expires",
+        idempotencyKey: "autonomy:obj_handoff_expired_lease",
+      });
+      store.markObjectiveDispatched("obj_handoff_expired_lease", expiredRequest.requestId ?? "");
+      expect(requests.claim("remote-expired-planner").request?.id).toBe(expiredRequest.requestId);
+      db.prepare(`UPDATE autonomy_objectives SET updated_at = ? WHERE id = ?`).run(
+        "2026-08-17T00:00:00.000Z",
+        "obj_handoff_expired_lease",
+      );
+      db.prepare(
+        `UPDATE requests
+         SET leaseExpiresAt = ?, lastHeartbeatAt = ?, updatedAt = ?
+         WHERE id = ?`,
+      ).run(
+        "2026-08-17T00:00:30.000Z",
+        "2026-08-17T00:00:59.500Z",
+        "2026-08-17T00:00:59.500Z",
+        expiredRequest.requestId,
+      );
+      expect(
+        store.reconcileObjectiveWorkerHandoffs("2026-08-17T00:01:00.000Z", 5_000),
+      ).toMatchObject({ failed: 0 });
+      expect(
+        db
+          .prepare(`SELECT status, block_reason FROM autonomy_objectives WHERE id = ?`)
+          .get("obj_handoff_expired_lease"),
+      ).toMatchObject({
+        status: "dispatched",
+        block_reason: null,
+      });
+      expect(requests.getRequest(expiredRequest.requestId ?? "")).toMatchObject({
+        status: "pending",
+        agentId: null,
+        claimToken: null,
+      });
+
+      const pendingSnapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_handoff_pending_restart",
+      });
+      expect(
+        seedObjective(
+          "obj_handoff_pending_restart",
+          "apps/server/src/server_main.ts",
+          "run_handoff_pending_restart",
+          pendingSnapshot.snapshot_id,
+          "proposed",
+        ).ok,
+      ).toBe(true);
+      const pendingRequest = requests.enqueue({
+        sessionId: "s1",
+        prompt: "old pending work remains retryable",
+        idempotencyKey: "autonomy:obj_handoff_pending_restart",
+      });
+      store.markObjectiveDispatched("obj_handoff_pending_restart", pendingRequest.requestId ?? "");
+      db.prepare(`UPDATE autonomy_objectives SET updated_at = ? WHERE id = ?`).run(
+        "2026-08-16T00:00:00.000Z",
+        "obj_handoff_pending_restart",
+      );
+      const wrongSessionJob = jobs.enqueue({
+        taskId: "task_handoff_wrong_session",
+        sessionId: "other-session",
+        kind: "task.execute",
+        params: { requestId: pendingRequest.requestId },
+      });
+      const malformedJob = jobs.enqueue({
+        taskId: "task_handoff_malformed_params",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { requestId: pendingRequest.requestId },
+      });
+      db.prepare(`UPDATE jobs SET params = ? WHERE id = ?`).run("{malformed", malformedJob.jobId);
+      expect(
+        store.reconcileObjectiveWorkerHandoffs("2026-08-17T00:01:00.000Z", 5_000),
+      ).toMatchObject({ failed: 0, linked: 0 });
+      expect(requests.getRequest(pendingRequest.requestId ?? "")?.status).toBe("pending");
+      expect(
+        db
+          .prepare(`SELECT status, job_id FROM autonomy_objectives WHERE id = ?`)
+          .get("obj_handoff_pending_restart"),
+      ).toMatchObject({ status: "dispatched", job_id: null });
+      expect(wrongSessionJob.ok).toBe(true);
+    } finally {
+      requests.close();
+      jobs.close();
+    }
+  });
+
+  test("does not reconcile a reopened request to a stale job from its prior attempt", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-handoff-retry-");
+    const requests = new RequestQueue(dbPath);
+    const jobs = new JobQueue(dbPath);
+    try {
+      const snapshot = store.createSnapshot({ sessionId: "s1", runId: "run_handoff_retry" });
+      expect(
+        store.recordObjectiveDecision({
+          runId: "run_handoff_retry",
+          snapshotId: snapshot.snapshot_id,
+          sessionId: "s1",
+          objective: {
+            id: "obj_handoff_retry",
+            title: "Retry a failed planning handoff",
+            instruction: "Create a fresh durable worker handoff.",
+            objective_type: "small_refactor",
+            component_area: "apps/server",
+            trigger_type: "queue_health",
+            target_paths: ["apps/server/src/requests.ts"],
+            scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+            confidence: 0.95,
+            risk_level: "low",
+            expected_validation: ["bun test tests/server.requests-queue.test.ts"],
+            status: "gated",
+          },
+        }).ok,
+      ).toBe(true);
+
+      const first = requests.enqueue({
+        sessionId: "s1",
+        prompt: "first planning attempt",
+        idempotencyKey: "autonomy:obj_handoff_retry",
+      });
+      const firstClaim = requests.claim("remote-retry").request;
+      expect(firstClaim?.id).toBe(first.requestId);
+      expect(
+        requests.fail(first.requestId ?? "", {
+          agentId: "remote-retry",
+          claimToken: firstClaim?.claimToken,
+          message: "planner crashed before retry",
+        }).ok,
+      ).toBe(true);
+
+      const staleJob = jobs.enqueue({
+        taskId: "task_handoff_stale_prior_attempt",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { requestId: first.requestId, origin: "autonomy" },
+      });
+      const retried = requests.enqueue({
+        sessionId: "s1",
+        prompt: "second planning attempt",
+        idempotencyKey: "autonomy:obj_handoff_retry",
+      });
+      expect(retried).toMatchObject({ ok: true, requestId: first.requestId, requeued: true });
+      store.markObjectiveDispatched("obj_handoff_retry", retried.requestId ?? "");
+
+      const db = (store as unknown as { db: any }).db;
+      db.prepare(`UPDATE jobs SET createdAt = ? WHERE id = ?`).run(
+        "2026-08-17T00:00:00.000Z",
+        staleJob.jobId,
+      );
+      db.prepare(`UPDATE requests SET enqueuedAt = ?, updatedAt = ? WHERE id = ?`).run(
+        "2026-08-17T00:01:00.000Z",
+        "2026-08-17T00:01:00.000Z",
+        retried.requestId,
+      );
+
+      expect(store.reconcileObjectiveWorkerHandoffs("2026-08-17T00:02:00.000Z")).toMatchObject({
+        linked: 0,
+        failed: 0,
+        pending: 1,
+      });
+      expect(requests.getRequest(retried.requestId ?? "")).toMatchObject({
+        status: "pending",
+        handoffJobId: null,
+      });
+      expect(
+        db
+          .prepare(`SELECT status, job_id FROM autonomy_objectives WHERE id = ?`)
+          .get("obj_handoff_retry"),
+      ).toMatchObject({ status: "dispatched", job_id: null });
+    } finally {
+      requests.close();
+      jobs.close();
+    }
+  });
+
+  test("reports attempt outcome taxonomy instead of one undifferentiated failure rate", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-reliability-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const finish = (
+        suffix: string,
+        outcome: "completed" | "failed" | "publish_blocked",
+        failureClass?: string,
+        terminalStage?: string,
+      ) => {
+        const enqueued = jobs.enqueue({
+          taskId: `task_${suffix}`,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+        });
+        const jobId = enqueued.jobId ?? "";
+        expect(jobs.claim(`worker_${suffix}`).job?.id).toBe(jobId);
+        if (outcome === "completed") {
+          expect(jobs.complete(jobId, { summary: failureClass ?? "published" }).ok).toBe(true);
+        } else if (outcome === "publish_blocked") {
+          expect(
+            jobs.publishBlocked(jobId, {
+              message: failureClass,
+              diagnostics: {
+                terminal: {
+                  failureClass,
+                  terminalStage: terminalStage ?? "publication",
+                  summary: failureClass,
+                },
+              },
+            }).ok,
+          ).toBe(true);
+        } else {
+          expect(
+            jobs.fail(jobId, {
+              message: failureClass,
+              diagnostics: {
+                terminal: {
+                  failureClass,
+                  terminalStage:
+                    terminalStage ?? (failureClass?.includes("artifact") ? "quality" : "docker"),
+                  summary: failureClass,
+                },
+              },
+            }).ok,
+          ).toBe(true);
+        }
+      };
+      finish("success", "completed");
+      finish("no_change", "failed", "artifact_only_no_publishable_patch");
+      finish("environment", "failed", "missing_runtime_asset");
+      finish("completed_no_change", "completed", "completed_no_change");
+      finish("publish_environment", "publish_blocked", "missing_runtime_asset");
+      finish(
+        "trusted_validation",
+        "publish_blocked",
+        "trusted_validation_failed",
+        "trusted_environment_validation",
+      );
+
+      const metrics = store.getReliabilityMetrics();
+      expect(metrics.attemptsTotal).toBe(6);
+      expect(metrics.outcomeCounts).toMatchObject({
+        succeeded: 1,
+        no_change: 2,
+        environment_blocked: 2,
+        validation_blocked: 1,
+      });
+      expect(metrics.attemptSuccessRate).toBeCloseTo(1 / 6, 5);
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("snapshot circuit evidence excludes environment, infrastructure, and unexecuted handoffs", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-circuit-evidence-");
+    const jobs = new JobQueue(dbPath);
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_circuit_evidence_seed",
+    }).snapshot_id;
+    const db = (store as unknown as { db: any }).db;
+    const seedObjective = (id: string, targetPath: string) => {
+      const decision = store.recordObjectiveDecision({
+        runId: "run_circuit_evidence_seed",
+        snapshotId,
+        sessionId: "s1",
+        objective: {
+          id,
+          title: `Circuit evidence ${id}`,
+          instruction: "Exercise one repair attempt outcome.",
+          objective_type: "flaky_test",
+          component_area: "tests",
+          trigger_type: "test_failure",
+          target_paths: [targetPath],
+          scope: { read_anywhere: false, write_globs: [targetPath] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          status: "rejected",
+          incident_key: "valid_inc_circuit_evidence",
+        },
+      });
+      expect(decision.ok).toBe(true);
+    };
+    const failLinkedJob = (objectiveId: string, suffix: string, failureClass: string): void => {
+      const enqueued = jobs.enqueue({
+        taskId: `task-circuit-evidence-${suffix}`,
+        sessionId: "s1",
+        kind: "task.execute",
+        params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+        dedupeKey: `circuit-evidence:${suffix}`,
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim(`worker-circuit-evidence-${suffix}`).job?.id).toBe(jobId);
+      expect(
+        jobs.fail(jobId, {
+          message: failureClass,
+          diagnostics: {
+            terminal: {
+              failureClass,
+              terminalStage:
+                failureClass === "test_failure" ? "trusted_environment_validation" : "executor",
+              summary: failureClass,
+            },
+            ...(failureClass === "test_failure"
+              ? {
+                  validationRuns: [
+                    {
+                      attempt: 1,
+                      command: "bun test tests/circuit-validation.test.ts",
+                      passed: false,
+                      exitCode: 1,
+                      failureClass: "test_failure",
+                      stderrTail: "(fail) circuit validation remains broken",
+                      metadata: {
+                        failedTests: ["circuit validation remains broken"],
+                        targetPathHints: ["tests/circuit-validation.test.ts"],
+                        failureLines: ["(fail) circuit validation remains broken"],
+                      },
+                    },
+                  ],
+                }
+              : {}),
+          },
+        }).ok,
+      ).toBe(true);
+      db.prepare(
+        `UPDATE autonomy_objectives
+         SET status = 'failed', job_id = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(jobId, new Date().toISOString(), objectiveId);
+    };
+
+    try {
+      seedObjective("obj_circuit_validation", "tests/circuit-validation.test.ts");
+      failLinkedJob("obj_circuit_validation", "validation", "test_failure");
+      seedObjective("obj_circuit_environment", "tests/circuit-environment.test.ts");
+      failLinkedJob("obj_circuit_environment", "environment", "missing_runtime_asset");
+      seedObjective("obj_circuit_infrastructure", "tests/circuit-infrastructure.test.ts");
+      failLinkedJob("obj_circuit_infrastructure", "infrastructure", "worker_process_exit");
+      seedObjective("obj_circuit_handoff", "tests/circuit-handoff.test.ts");
+      db.prepare(
+        `UPDATE autonomy_objectives SET status = 'failed', updated_at = ? WHERE id = ?`,
+      ).run(new Date().toISOString(), "obj_circuit_handoff");
+
+      const recent = store.createSnapshot({
+        sessionId: "s1",
+        runId: "run_circuit_evidence_assert",
+      }).recent_objectives;
+      const byId = new Map(recent.map((objective) => [objective.objective_id, objective]));
+      expect(byId.get("obj_circuit_validation")).toMatchObject({
+        attempt_outcome: "validation_blocked",
+        deterministic_repair_failure: true,
+        attempt_failure_fingerprint: expect.any(String),
+      });
+      expect(byId.get("obj_circuit_environment")).toMatchObject({
+        attempt_outcome: "environment_blocked",
+        deterministic_repair_failure: false,
+      });
+      expect(byId.get("obj_circuit_infrastructure")).toMatchObject({
+        attempt_outcome: "infrastructure_failed",
+        deterministic_repair_failure: false,
+      });
+      expect(byId.get("obj_circuit_handoff")).toMatchObject({
+        job_id: null,
+        attempt_outcome: null,
+        deterministic_repair_failure: false,
+      });
+    } finally {
+      jobs.close();
+    }
   });
 });

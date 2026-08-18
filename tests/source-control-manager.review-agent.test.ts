@@ -59,6 +59,79 @@ const silentLogs = {
 };
 
 describe("ReviewAgent", () => {
+  test("bounds an injected server fetch when response headers never arrive", async () => {
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        httpTimeoutMs: 20,
+        fetchImpl: async () => new Promise<Response>(() => {}),
+      },
+    );
+
+    await expect((agent as any).sendSessionCommand("dev", {}, { type: "review" })).rejects.toThrow(
+      "ReviewAgent HTTP request timed out after 20ms",
+    );
+  });
+
+  test("cancels an injected server response body that never completes", async () => {
+    let bodyCancelled = false;
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        httpTimeoutMs: 20,
+        fetchImpl: async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start() {
+                // Deliberately leave the response body open.
+              },
+              cancel() {
+                bodyCancelled = true;
+              },
+            }),
+            { status: 200 },
+          ),
+      },
+    );
+
+    await expect((agent as any).sendSessionCommand("dev", {}, { type: "review" })).rejects.toThrow(
+      "ReviewAgent HTTP request timed out after 20ms",
+    );
+    expect(bodyCancelled).toBe(true);
+  });
+
+  test("rejects an oversized injected server response before parsing", async () => {
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        httpMaxResponseBytes: 4,
+        fetchImpl: async () => new Response("12345", { status: 200 }),
+      },
+    );
+
+    await expect((agent as any).sendSessionCommand("dev", {}, { type: "review" })).rejects.toThrow(
+      "HTTP response exceeded 4 byte buffer limit",
+    );
+  });
+
   test("resolves reviewer markdown path from workspace root", () => {
     const workspaceRoot = resolve(import.meta.dir, "..");
     const reviewerPath = resolveReviewerMdPath("prompts/review_agent/reviewer.md", {

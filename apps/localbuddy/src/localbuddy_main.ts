@@ -16,6 +16,7 @@ import {
   buildLocalCorsHeaders,
   CommunicationManager,
   detectRepoRoot,
+  fetchBufferedWithHardDeadline,
   isLoopbackOrigin,
   loadPromptTemplate,
   loadPushPalsConfig,
@@ -36,6 +37,7 @@ import { answerLocalReadonlyQuery, isLocalReadonlyQueryPrompt } from "./local_re
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
 const CONFIG = loadPushPalsConfig();
+const LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS = 10_000;
 
 function parseArgs(): {
   server: string;
@@ -499,10 +501,13 @@ class LocalBuddyServer {
 
   private async fetchJobLogTail(jobId: string, limit = 8): Promise<string[]> {
     try {
-      const res = await fetch(
-        `${this.server}/jobs/${encodeURIComponent(jobId)}/logs?limit=${Math.max(1, Math.min(20, limit))}`,
-        { headers: this.authHeaders() },
-      );
+      const res = await fetchBufferedWithHardDeadline({
+        input: `${this.server}/jobs/${encodeURIComponent(jobId)}/logs?limit=${Math.max(1, Math.min(20, limit))}`,
+        init: { headers: this.authHeaders() },
+        timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+        maxResponseBytes: 8 * 1024 * 1024,
+        timeoutMessage: "LocalBuddy job-log request timed out",
+      });
       if (!res.ok) return [];
       const payload = (await res.json()) as JobLogListResponse;
       if (!payload.ok || !Array.isArray(payload.logs)) return [];
@@ -549,11 +554,19 @@ class LocalBuddyServer {
 
     try {
       const [requestData, jobData] = await Promise.all([
-        fetch(`${this.server}/requests?status=all&limit=200`, {
-          headers: this.authHeaders(),
+        fetchBufferedWithHardDeadline({
+          input: `${this.server}/requests?status=all&limit=200`,
+          init: { headers: this.authHeaders() },
+          timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+          maxResponseBytes: 8 * 1024 * 1024,
+          timeoutMessage: "LocalBuddy request-status query timed out",
         }),
-        fetch(`${this.server}/jobs?status=all&limit=400`, {
-          headers: this.authHeaders(),
+        fetchBufferedWithHardDeadline({
+          input: `${this.server}/jobs?status=all&limit=400`,
+          init: { headers: this.authHeaders() },
+          timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+          maxResponseBytes: 8 * 1024 * 1024,
+          timeoutMessage: "LocalBuddy job-status query timed out",
         }),
       ]);
 
@@ -588,8 +601,12 @@ class LocalBuddyServer {
           selectedJob = matchedJob;
         }
         if (selectedJob) {
-          const logsRes = await fetch(`${this.server}/jobs/${selectedJob.id}/logs?limit=10`, {
-            headers: this.authHeaders(),
+          const logsRes = await fetchBufferedWithHardDeadline({
+            input: `${this.server}/jobs/${selectedJob.id}/logs?limit=10`,
+            init: { headers: this.authHeaders() },
+            timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+            maxResponseBytes: 8 * 1024 * 1024,
+            timeoutMessage: "LocalBuddy selected-job log query timed out",
           });
           if (logsRes.ok) {
             const logsPayload = (await logsRes.json()) as JobLogListResponse;
@@ -648,10 +665,16 @@ class LocalBuddyServer {
       if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
       for (let attempt = 1; attempt <= maxRetries && !stopping; attempt++) {
         try {
-          const res = await fetch(`${serverUrl}/sessions`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ sessionId }),
+          const res = await fetchBufferedWithHardDeadline({
+            input: `${serverUrl}/sessions`,
+            init: {
+              method: "POST",
+              headers,
+              body: JSON.stringify({ sessionId }),
+            },
+            timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+            maxResponseBytes: 8 * 1024 * 1024,
+            timeoutMessage: "LocalBuddy session registration timed out",
           });
           if (res.ok) return true;
         } catch {
@@ -923,15 +946,21 @@ class LocalBuddyServer {
                       const priority = classifyRemoteRequestPriority(routedPrompt);
                       const queueWaitBudgetMs = queueWaitBudgetForPriority(priority);
 
-                      const res = await fetch(`${serverUrl}/requests/enqueue`, {
-                        method: "POST",
-                        headers: cmdHeaders,
-                        body: JSON.stringify({
-                          sessionId,
-                          prompt: routedPrompt,
-                          priority,
-                          queueWaitBudgetMs,
-                        }),
+                      const res = await fetchBufferedWithHardDeadline({
+                        input: `${serverUrl}/requests/enqueue`,
+                        init: {
+                          method: "POST",
+                          headers: cmdHeaders,
+                          body: JSON.stringify({
+                            sessionId,
+                            prompt: routedPrompt,
+                            priority,
+                            queueWaitBudgetMs,
+                          }),
+                        },
+                        timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+                        maxResponseBytes: 8 * 1024 * 1024,
+                        timeoutMessage: "LocalBuddy request enqueue timed out",
                       });
 
                       if (!res.ok) {
@@ -1058,10 +1087,16 @@ async function connectWithRetry(
   while (true) {
     attempt++;
     try {
-      const res = await fetch(`${server}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId }),
+      const res = await fetchBufferedWithHardDeadline({
+        input: `${server}/sessions`,
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId }),
+        },
+        timeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+        maxResponseBytes: 8 * 1024 * 1024,
+        timeoutMessage: "LocalBuddy startup session connection timed out",
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
       const data = (await res.json()) as { sessionId: string };

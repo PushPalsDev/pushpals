@@ -30,6 +30,7 @@ import {
   resolveLocalServerConnection,
   resolveGitTokenForRemote,
   createToolRunRecordFromFailure,
+  fetchBufferedWithHardDeadline,
 } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
 import { Logger } from "./common/logger.js";
@@ -60,6 +61,10 @@ import {
   isMergeConflictResolutionParams,
   prepareMergeConflictWorktreeOnHost,
 } from "./merge_conflict_job.js";
+import {
+  appendValidationRepairPublicationLease,
+  validationRepairPublicationLeaseFromJobParams,
+} from "shared";
 
 type CommitRef = {
   branch: string;
@@ -124,29 +129,24 @@ function compactWorkerError(error: unknown, maxLength = 220): string {
   return `${normalized.slice(0, maxLength - 3)}...`;
 }
 
-async function postJsonWithTimeout(
+export async function postJsonWithTimeout(
   url: string,
   headers: Record<string, string>,
   body: unknown,
   timeoutMs = 10_000,
+  fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
-  try {
-    return await fetch(url, {
+  return fetchBufferedWithHardDeadline({
+    input: url,
+    init: {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (controller.signal.aborted) {
-      throw new Error(`request timed out after ${timeoutMs}ms: ${url}`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+    },
+    timeoutMs,
+    fetchImpl: fetchFn,
+    timeoutMessage: `request timed out after ${timeoutMs}ms: ${url}`,
+  });
 }
 
 async function persistWorkerDiagnostics(
@@ -879,12 +879,11 @@ export function holdCommitForTrustedValidation(
     return {
       result: {
         ...result,
-        ok: true,
+        ok: false,
         summary:
-          "Trusted-environment validation deferred; no candidate changes require publication",
+          "Trusted-environment validation required but no candidate was available to validate",
         stderr: detail,
-        exitCode: 0,
-        validationBlocked: undefined,
+        exitCode: 4,
       },
       completionCommit: null,
     };
@@ -1358,7 +1357,57 @@ function failNoChangeReviewFixJob(jobId: string, result: WorkerJobResult): Worke
     ]
       .filter(Boolean)
       .join("\n"),
-    exitCode: typeof result.exitCode === "number" ? result.exitCode : 4,
+    exitCode: typeof result.exitCode === "number" && result.exitCode !== 0 ? result.exitCode : 4,
+  };
+}
+
+export function requiresPublishableCodeChange(
+  params: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!params || isMergeConflictResolutionParams(params)) return false;
+  const reviewAgent =
+    params.reviewAgent &&
+    typeof params.reviewAgent === "object" &&
+    !Array.isArray(params.reviewAgent)
+      ? (params.reviewAgent as Record<string, unknown>)
+      : null;
+  const resolutionType = String(reviewAgent?.resolutionType ?? "")
+    .trim()
+    .toLowerCase();
+  if (resolutionType === "merge_conflict" || resolutionType === "integration_reconcile") {
+    return false;
+  }
+  const planning =
+    params.planning && typeof params.planning === "object" && !Array.isArray(params.planning)
+      ? (params.planning as Record<string, unknown>)
+      : null;
+  const scope =
+    planning?.scope && typeof planning.scope === "object" && !Array.isArray(planning.scope)
+      ? (planning.scope as Record<string, unknown>)
+      : null;
+  return (
+    String(planning?.intent ?? "")
+      .trim()
+      .toLowerCase() === "code_change" && scope?.writeAllowed === true
+  );
+}
+
+export function failNoPublishableCodeChange(
+  jobId: string,
+  result: WorkerJobResult,
+): WorkerJobResult {
+  return {
+    ...result,
+    ok: false,
+    summary: `Coding job ${jobId} produced no publishable changes`,
+    stderr: [
+      result.stderr,
+      "The planner required a code change with write access, but the worker produced no staged source, test, or documentation change.",
+      "Refusing to report an unchanged coding attempt as successfully completed.",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    exitCode: typeof result.exitCode === "number" && result.exitCode !== 0 ? result.exitCode : 4,
   };
 }
 
@@ -1389,7 +1438,7 @@ function normalizeReviewLeaseBranch(value: unknown): string {
   return branch;
 }
 
-async function enqueueCompletion(
+export async function enqueueCompletion(
   server: string,
   headers: Record<string, string>,
   workerId: string,
@@ -1431,7 +1480,7 @@ async function enqueueCompletion(
       .trim()
       .toLowerCase();
     const reviewBaseBranch = normalizeReviewLeaseBranch(reviewAgent?.prBaseRef);
-    const completionPrBody =
+    const reviewCompletionPrBody =
       (resolutionType === "review_fix" ||
         resolutionType === "merge_conflict" ||
         resolutionType === "integration_reconcile") &&
@@ -1451,8 +1500,12 @@ async function enqueueCompletion(
               : []),
           ].join("\n")
         : pr.body;
+    const completionPrBody = appendValidationRepairPublicationLease(
+      reviewCompletionPrBody,
+      validationRepairPublicationLeaseFromJobParams(job.params, commit.sha),
+    );
 
-    const response = await postJsonWithTimeout(`${server}/completions/enqueue`, headers, {
+    const payload = {
       jobId: job.id,
       sessionId: job.sessionId,
       origin: taskExecuteOrigin(job.params),
@@ -1468,17 +1521,35 @@ async function enqueueCompletion(
         ...(result.stderr ? [{ kind: "stderr", text: result.stderr }] : []),
       ],
       ...buildTrustedValidationCompletionPayload(result.validationBlocked),
-    });
+    };
 
-    if (response.ok) {
-      console.log(`[WorkerPals] Enqueued completion for job ${job.id} (commit ${commit.sha})`);
-      return true;
-    } else {
-      console.error(
-        `[WorkerPals] Failed to enqueue completion: ${response.status} ${await response.text()}`,
-      );
-      return false;
+    let lastDetail = "no response";
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const response = await postJsonWithTimeout(
+          `${server}/completions/enqueue`,
+          headers,
+          payload,
+        );
+        if (response.ok) {
+          console.log(
+            `[WorkerPals] Enqueued completion for job ${job.id} (commit ${commit.sha})${
+              attempt > 1 ? ` after ${attempt} attempts` : ""
+            }`,
+          );
+          return true;
+        }
+        lastDetail = `${response.status} ${await response.text()}`.trim();
+        const retryable =
+          response.status === 408 || response.status === 429 || response.status >= 500;
+        if (!retryable) break;
+      } catch (error) {
+        lastDetail = error instanceof Error ? error.message : String(error);
+      }
+      if (attempt < 3) await Bun.sleep(150 * attempt);
     }
+    console.error(`[WorkerPals] Failed to enqueue completion: ${lastDetail}`);
+    return false;
   } catch (err) {
     console.error(`[WorkerPals] Failed to enqueue completion:`, err);
     return false;
@@ -1952,6 +2023,11 @@ async function workerLoop(
                     `[WorkerPals] Job ${job.id} produced no code changes for a rejected review-fix request; marking the job failed instead of enqueueing unchanged branch re-review.`,
                   );
                   result = failNoChangeReviewFixJob(job.id, result);
+                } else if (requiresPublishableCodeChange(parsedParams)) {
+                  console.warn(
+                    `[WorkerPals] Coding job ${job.id} produced no publishable changes; marking it failed instead of reporting a false success.`,
+                  );
+                  result = failNoPublishableCodeChange(job.id, result);
                 } else {
                   const reReviewCommit = await resolveReReviewNoChangeCommit(
                     executionRepo,
@@ -2006,6 +2082,11 @@ async function workerLoop(
                       `[WorkerPals] Job ${job.id} produced no staged review-fix changes; marking the job failed instead of enqueueing unchanged branch re-review.`,
                     );
                     result = failNoChangeReviewFixJob(job.id, result);
+                  } else if (requiresPublishableCodeChange(parsedParams)) {
+                    console.warn(
+                      `[WorkerPals] Coding job ${job.id} produced no staged publishable changes; marking it failed instead of reporting a false success.`,
+                    );
+                    result = failNoPublishableCodeChange(job.id, result);
                   }
                 } else if (commitResult.publishBlocked) {
                   result = {

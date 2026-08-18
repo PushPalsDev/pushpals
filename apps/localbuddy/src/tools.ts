@@ -11,6 +11,12 @@ import {
   statSync,
   appendFileSync,
 } from "fs";
+import { fetchBufferedWithHardDeadline, runBoundedProcess } from "shared";
+
+function configuredHttpTimeoutMs(envName: string, fallbackMs: number): number {
+  const parsed = Number.parseInt(String(process.env[envName] ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs;
+}
 
 // ─── Tool definition ────────────────────────────────────────────────────────
 
@@ -61,30 +67,15 @@ async function safeExec(
   cwd: string,
   timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const proc = Bun.spawn(cmd, {
+  const result = await runBoundedProcess(cmd, {
     cwd,
-    stdout: "pipe",
-    stderr: "pipe",
+    timeoutMs,
+    outputLimitBytes: MAX_OUTPUT_BYTES,
   });
-
-  const timer = setTimeout(() => {
-    try {
-      proc.kill();
-    } catch (_e) {}
-  }, timeoutMs);
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-
-  clearTimeout(timer);
-  const exitCode = await proc.exited;
-
   return {
-    stdout: truncate(stdout) ?? "",
-    stderr: truncate(stderr) ?? "",
-    exitCode,
+    stdout: truncate(result.stdout) ?? "",
+    stderr: truncate(result.stderr) ?? "",
+    exitCode: result.exitCode,
   };
 }
 
@@ -615,13 +606,14 @@ const webFetch: ToolDefinition = {
     if (!url) return { ok: false, stderr: "Missing 'url' argument", exitCode: 1 };
 
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 25_000);
-      const res = await fetch(url, {
-        headers: { "User-Agent": "PushPals/1.0" },
-        signal: controller.signal,
+      const timeoutMs = configuredHttpTimeoutMs("PUSHPALS_LOCALBUDDY_WEB_FETCH_TIMEOUT_MS", 25_000);
+      const res = await fetchBufferedWithHardDeadline({
+        input: url,
+        init: { headers: { "User-Agent": "PushPals/1.0" } },
+        timeoutMs,
+        maxResponseBytes: 4 * 1024 * 1024,
+        timeoutMessage: `web.fetch timed out after ${timeoutMs}ms`,
       });
-      clearTimeout(timer);
 
       const contentType = res.headers.get("content-type") ?? "";
       const body = await res.text();
@@ -661,14 +653,18 @@ const webSearch: ToolDefinition = {
     if (!query) return { ok: false, stderr: "Missing 'query' argument", exitCode: 1 };
 
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15_000);
+      const timeoutMs = configuredHttpTimeoutMs(
+        "PUSHPALS_LOCALBUDDY_WEB_SEARCH_TIMEOUT_MS",
+        15_000,
+      );
       const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "PushPals/1.0" },
-        signal: controller.signal,
+      const res = await fetchBufferedWithHardDeadline({
+        input: url,
+        init: { headers: { "User-Agent": "PushPals/1.0" } },
+        timeoutMs,
+        maxResponseBytes: 4 * 1024 * 1024,
+        timeoutMessage: `web.search timed out after ${timeoutMs}ms`,
       });
-      clearTimeout(timer);
 
       const html = await res.text();
 

@@ -1,10 +1,11 @@
 import { parseArgs } from "util";
 import { isAbsolute, join, relative, resolve } from "path";
 import { mkdirSync } from "fs";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { CommunicationManager } from "../../../packages/shared/src/communication.js";
 import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
 import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
+import { fetchBufferedWithHardDeadline } from "../../../packages/shared/src/bounded_fetch.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { createSourceControlApi, runGitCommandCapture, type SourceControlApi } from "./git";
@@ -20,12 +21,11 @@ import {
   buildReviewPublicationPushArgs,
   parseReviewPublicationLease,
   reviewCompletionHandoffMatches,
-  shouldCleanupCompletionHandoff,
   shouldPublishWithExactReviewLease,
   shouldUseReviewPublicationFlow,
 } from "./review_publication";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
-import { shouldBypassApplyFailureInReviewMode } from "./review_apply_fallback";
+import { reviewApplyFailureBlocksPublication } from "./review_apply_fallback";
 import {
   cloneSourceControlManagerConfigSnapshot,
   createStartupStatusTracker,
@@ -36,7 +36,55 @@ import {
 } from "./runtime_helpers";
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
-import { runProcessWithTreeTimeout, runTrustedValidationCommands } from "./trusted_validation";
+import {
+  postCompletionCallbackWithRetry,
+  postCompletionProcessedWithRetry,
+} from "./completion_callback";
+import {
+  CompletionGcJournal,
+  buildCompletionGcLocalDeleteArgs,
+  buildCompletionGcRemoteDeleteArgs,
+  claimBeforeCompletionGc,
+  completionGcValidationNamespace,
+  createCompletionGcRecord,
+  reconcileCompletionGcJournal,
+  type CompletionGcRecord,
+  type CompletionProcessingAuthority,
+} from "./completion_gc";
+import { CompletionLeaseRenewalCoordinator } from "./completion_lease";
+import {
+  assertFinalAuthoritativePublicationProof,
+  authoritativeAncestryFromGitResult,
+  authoritativeRefShaFromGitResult,
+  durablePublicationRecoveryState,
+  isValidationCheckpointPublished,
+  PublicationAuthorityUnreachableError,
+  publicationFailureDisposition,
+  publishWithAuthoritativeProof,
+  shouldSkipValidationForDurableRecovery,
+  type AuthoritativePublicationReprobe,
+} from "./publication_recovery";
+import {
+  resolveTrustedValidationOutcome,
+  runProcessWithTreeTimeout,
+  runTrustedValidationCommands,
+  trustedValidationHealthPhase,
+} from "./trusted_validation";
+import {
+  applyRetainedValidationCheckpoint,
+  applyValidationRepairPublication,
+  loadLatestValidationCheckpoint,
+  parseValidationRepairPublicationLease,
+  persistValidationCheckpoint,
+  persistValidationSuccessProof,
+  resolveValidationCheckpointBaseline,
+  validationCheckpointRefs,
+  type ValidationRepairPublicationLease,
+} from "./validation_repair_publication";
+import {
+  assertExactCleanValidationWorktree,
+  ValidationWorktreeInvariantError,
+} from "./validation_worktree";
 import type {
   TrustedValidationExecutionResult,
   TrustedValidationReport,
@@ -54,6 +102,7 @@ type GitCmdResult = {
   stdout: string;
   stderr: string;
   exitCode: number;
+  idempotent?: boolean;
 };
 
 const PUSH_CONFIG = loadPushPalsConfig();
@@ -62,6 +111,11 @@ const defaultSourceControlManagerRepoPath = resolve(PUSH_CONFIG.sourceControlMan
 const COMPLETION_LEASE_MS = 3 * 60_000;
 const COMPLETION_LEASE_HEARTBEAT_MS = 30_000;
 const PUBLICATION_HEALTH_POLL_MS = 10_000;
+const SERVER_CONTROL_HTTP_TIMEOUT_MS = 5_000;
+const COMPLETION_GC_RECORDS_PER_TICK = 1;
+const COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS = 3_000;
+const COMPLETION_GC_REMOTE_GIT_TIMEOUT_MS = 10_000;
+const COMPLETION_GC_REFS_PER_RECORD_PER_TICK = 4;
 const SCM_TICK_STALL_MS = Math.max(
   60_000,
   Number(process.env.PUSHPALS_SCM_TICK_STALL_MS) || 17 * 60_000,
@@ -211,8 +265,7 @@ console.log(`[${ts()}] Database opened: ${dbPath}`);
 const sourceControlManagerPusherId = `source_control_manager-${createHash("sha256")
   .update(`${config.repoPath}\n${config.mainBranch}\n${config.remote}`)
   .digest("hex")
-  .slice(0, 12)}`;
-let reconcilePusherOnNextClaim = true;
+  .slice(0, 12)}-${process.pid}-${randomUUID().slice(0, 8)}`;
 const healthTracker = createSourceControlManagerHealthTracker({
   tickStallMs: SCM_TICK_STALL_MS,
   idleBacklogGraceMs: Math.max(30_000, config.pollIntervalSeconds * 3_000),
@@ -227,6 +280,7 @@ if (recovered > 0) {
 // ── Git Operations ─────────────────────────────────────────────────────────
 
 const gitOps: SourceControlApi = createSourceControlApi(config);
+const completionGcJournal = new CompletionGcJournal(config.stateDir);
 
 // ── HTTP server ─────────────────────────────────────────────────────────────
 
@@ -262,14 +316,14 @@ let reviewAgentRuntimeFingerprint = "";
 async function refreshPublicationHealth(): Promise<void> {
   if (publicationHealthProbeInFlight) return;
   publicationHealthProbeInFlight = true;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3_000);
   try {
     const headers: Record<string, string> = {};
     if (config.authToken) headers.Authorization = `Bearer ${config.authToken}`;
-    const response = await fetch(`${config.serverUrl}/workers/autoscale?ttlMs=15000`, {
-      headers,
-      signal: controller.signal,
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${config.serverUrl}/workers/autoscale?ttlMs=15000`,
+      init: { headers },
+      timeoutMs: 3_000,
+      timeoutMessage: "SourceControlManager publication-health probe timed out after 3000ms",
     });
     if (!response.ok) return;
     const payload = (await response.json().catch(() => ({}))) as {
@@ -279,7 +333,6 @@ async function refreshPublicationHealth(): Promise<void> {
   } catch {
     // A transient status-probe failure must not restart a healthy publisher.
   } finally {
-    clearTimeout(timer);
     publicationHealthProbeInFlight = false;
   }
 }
@@ -429,10 +482,15 @@ async function ensureSessionWithRetry(
   while (running) {
     attempt += 1;
     try {
-      const response = await fetch(`${config.serverUrl}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId }),
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${config.serverUrl}/sessions`,
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId }),
+        },
+        timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+        timeoutMessage: `SourceControlManager session registration timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms`,
       });
       if (response.ok) return true;
       throw new Error(`HTTP ${response.status}`);
@@ -568,6 +626,193 @@ async function emitPusherMessage(
   }
 }
 
+async function resolveCompletionProcessingAuthority(
+  runtimeConfig: SourceControlManagerConfig,
+  headers: Record<string, string>,
+  record: CompletionGcRecord,
+): Promise<CompletionProcessingAuthority | null> {
+  const response = await fetchBufferedWithHardDeadline({
+    input: `${runtimeConfig.serverUrl}/completions/${encodeURIComponent(record.completionId)}/status`,
+    init: { headers },
+    timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+    timeoutMessage: `Completion ${record.completionId} status probe timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`completion status authority returned HTTP ${response.status}`);
+  }
+  const payload = (await response.json()) as {
+    ok?: boolean;
+    completion?: CompletionProcessingAuthority;
+  };
+  if (!payload.ok || !payload.completion) {
+    throw new Error("completion status authority returned a malformed response");
+  }
+  return payload.completion;
+}
+
+async function cleanupProcessedCompletionRefs(
+  runtimeConfig: SourceControlManagerConfig,
+  record: CompletionGcRecord,
+): Promise<boolean> {
+  const validationNamespace = completionGcValidationNamespace(record);
+  const listed = await runGitCommandCapture(
+    repoRoot,
+    [
+      "-C",
+      runtimeConfig.repoPath,
+      "for-each-ref",
+      "--format=%(refname)",
+      `${validationNamespace}/`,
+      ...record.additionalValidationRefs,
+    ],
+    { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS },
+  );
+  if (!listed.ok) {
+    throw new Error(
+      `failed to list retained validation refs: ${listed.stderr || listed.stdout || `exit ${listed.exitCode}`}`,
+    );
+  }
+
+  const additionalValidationRefSet = new Set(record.additionalValidationRefs);
+  const validationRefs = [
+    ...new Set(
+      listed.stdout
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(
+          (ref) => ref.startsWith(`${validationNamespace}/`) || additionalValidationRefSet.has(ref),
+        ),
+    ),
+  ].sort((a, b) => a.localeCompare(b));
+  const refsForThisTick = validationRefs.slice(0, COMPLETION_GC_REFS_PER_RECORD_PER_TICK);
+  for (const ref of refsForThisTick) {
+    const deleted = await runGitCommandCapture(
+      repoRoot,
+      ["-C", runtimeConfig.repoPath, "update-ref", "-d", ref],
+      { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS },
+    );
+    if (!deleted.ok) {
+      throw new Error(
+        `failed to delete retained validation ref ${ref}: ${deleted.stderr || deleted.stdout || `exit ${deleted.exitCode}`}`,
+      );
+    }
+  }
+  if (validationRefs.length > refsForThisTick.length) {
+    return false;
+  }
+
+  if (record.completionBranch.startsWith("refs/pushpals/")) {
+    const resolvedLocal = authoritativeRefShaFromGitResult(
+      await runGitCommandCapture(
+        repoRoot,
+        [
+          "-C",
+          runtimeConfig.repoPath,
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          `${record.completionBranch}^{commit}`,
+        ],
+        { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS },
+      ),
+      record.completionBranch,
+    );
+    const localDeleteArgs = buildCompletionGcLocalDeleteArgs(record, resolvedLocal);
+    if (resolvedLocal && !localDeleteArgs) {
+      console.warn(
+        `[${ts()}] Retained completion ref ${record.completionBranch} moved to ${resolvedLocal}; preserving its new owner instead of deleting it for processed completion ${record.completionId}.`,
+      );
+    }
+    if (localDeleteArgs) {
+      const deletedLocal = await runGitCommandCapture(
+        repoRoot,
+        ["-C", runtimeConfig.repoPath, ...localDeleteArgs],
+        { timeout: COMPLETION_GC_LOCAL_GIT_TIMEOUT_MS },
+      );
+      if (!deletedLocal.ok) {
+        throw new Error(
+          `failed leased deletion of local completion ref ${record.completionBranch}: ${deletedLocal.stderr || deletedLocal.stdout || `exit ${deletedLocal.exitCode}`}`,
+        );
+      }
+    }
+  }
+
+  if (record.remote) {
+    const remoteOptions = {
+      timeout: COMPLETION_GC_REMOTE_GIT_TIMEOUT_MS,
+      ...(runtimeConfig.gitToken ? { githubToken: runtimeConfig.gitToken } : {}),
+    };
+    const remoteRefResult = await runGitCommandCapture(
+      repoRoot,
+      ["-C", runtimeConfig.repoPath, "ls-remote", "--refs", record.remote, record.completionBranch],
+      remoteOptions,
+    );
+    if (!remoteRefResult.ok) {
+      throw new Error(
+        `failed to resolve remote completion ref ${record.completionBranch}: ${remoteRefResult.stderr || remoteRefResult.stdout || `exit ${remoteRefResult.exitCode}`}`,
+      );
+    }
+    const remoteMatches = remoteRefResult.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim().split(/\s+/, 2))
+      .filter((parts) => parts.length === 2 && parts[1] === record.completionBranch);
+    if (remoteMatches.length > 1) {
+      throw new Error(
+        `remote returned multiple values for completion ref ${record.completionBranch}`,
+      );
+    }
+    const resolvedRemote = remoteMatches[0]?.[0] ?? null;
+    if (resolvedRemote && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(resolvedRemote)) {
+      throw new Error(`remote returned an invalid SHA for ${record.completionBranch}`);
+    }
+    const remoteDeleteArgs = buildCompletionGcRemoteDeleteArgs(record, resolvedRemote);
+    if (resolvedRemote && !remoteDeleteArgs) {
+      console.warn(
+        `[${ts()}] Remote completion ref ${record.completionBranch} moved to ${resolvedRemote}; preserving its new owner instead of deleting it for processed completion ${record.completionId}.`,
+      );
+    }
+    if (remoteDeleteArgs) {
+      const deletedRemote = await runGitCommandCapture(
+        repoRoot,
+        ["-C", runtimeConfig.repoPath, ...remoteDeleteArgs],
+        remoteOptions,
+      );
+      if (!deletedRemote.ok) {
+        throw new Error(
+          `failed leased deletion of remote completion ref ${record.completionBranch}: ${deletedRemote.stderr || deletedRemote.stdout || `exit ${deletedRemote.exitCode}`}`,
+        );
+      }
+    }
+  }
+  return true;
+}
+
+async function reconcileRetainedCompletionRefs(
+  runtimeConfig: SourceControlManagerConfig,
+  headers: Record<string, string>,
+): Promise<void> {
+  try {
+    const result = await reconcileCompletionGcJournal({
+      journal: completionGcJournal,
+      limit: COMPLETION_GC_RECORDS_PER_TICK,
+      resolveAuthority: (record) =>
+        resolveCompletionProcessingAuthority(runtimeConfig, headers, record),
+      cleanup: (record) => cleanupProcessedCompletionRefs(runtimeConfig, record),
+      onWarning: (message) => console.warn(`[${ts()}] ${message}`),
+    });
+    if (result.cleaned > 0) {
+      console.log(
+        `[${ts()}] Reconciled ${result.cleaned} processed completion ref handoff(s); examined=${result.examined} retained=${result.retained} uncertain=${result.uncertain}.`,
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `[${ts()}] Completion ref GC pass failed safely; publication polling will continue: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 async function tick(): Promise<void> {
   healthTracker.beginTick("integration_maintenance");
   try {
@@ -578,23 +823,44 @@ async function tick(): Promise<void> {
     if (runtimeConfig.authToken) {
       headers["Authorization"] = `Bearer ${runtimeConfig.authToken}`;
     }
-
     const pusherId = sourceControlManagerPusherId;
 
-    const response = await maintainIntegrationBeforeCompletionClaim({
-      maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
-      claimCompletion: () =>
-        fetch(`${runtimeConfig.serverUrl}/completions/claim`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            pusherId,
-            leaseMs: COMPLETION_LEASE_MS,
-            reconcilePusher: reconcilePusherOnNextClaim,
-          }),
+    const response = await claimBeforeCompletionGc({
+      claim: () =>
+        maintainIntegrationBeforeCompletionClaim({
+          maintain: () => integrationMaintenanceRunner.run(runtimeConfig, headers),
+          claimCompletion: async () => {
+            const rawResponse = await fetchBufferedWithHardDeadline({
+              input: `${runtimeConfig.serverUrl}/completions/claim`,
+              init: {
+                method: "POST",
+                headers,
+                body: JSON.stringify({
+                  pusherId,
+                  leaseMs: COMPLETION_LEASE_MS,
+                }),
+              },
+              timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+              timeoutMessage: `Completion claim timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
+            });
+            return {
+              ok: rawResponse.ok,
+              status: rawResponse.status,
+              data: rawResponse.ok ? await rawResponse.json() : null,
+            };
+          },
         }),
+      isIdle: (claimResult) =>
+        claimResult.status === 404 ||
+        (claimResult.ok &&
+          !(
+            claimResult.data as
+              | { ok?: boolean; completion?: Record<string, unknown> }
+              | null
+              | undefined
+          )?.completion),
+      reconcile: () => reconcileRetainedCompletionRefs(runtimeConfig, headers),
     });
-    reconcilePusherOnNextClaim = false;
 
     if (!response.ok) {
       if (response.status !== 404) {
@@ -603,7 +869,7 @@ async function tick(): Promise<void> {
       return;
     }
 
-    const data = (await response.json()) as {
+    const data = response.data as {
       ok: boolean;
       completion?: {
         id: string;
@@ -621,6 +887,8 @@ async function tick(): Promise<void> {
         trustedValidationDetail: string | null;
         status: string;
         pusherId: string;
+        claimToken: string;
+        claimGeneration: number;
         createdAt: string;
         updatedAt: string;
       };
@@ -632,10 +900,22 @@ async function tick(): Promise<void> {
     }
 
     const completion = data.completion;
+    const completionClaimToken = String(completion.claimToken ?? "").trim();
+    const completionClaimGeneration = Number(completion.claimGeneration);
+    if (
+      !completionClaimToken ||
+      !Number.isSafeInteger(completionClaimGeneration) ||
+      completionClaimGeneration < 1
+    ) {
+      throw new Error(
+        `Claimed completion ${completion.id} did not include a valid fencing token/generation; refusing publication.`,
+      );
+    }
     healthTracker.progress("completion_claimed", completion.id);
     const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/")
       ? parseReviewPublicationLease(completion.prBody)
       : null;
+    let validationRepairPublicationLease: ValidationRepairPublicationLease | null = null;
     const isIntegrationReconciliationCompletion = Boolean(
       reviewPublicationLease &&
       reviewPublicationLease.targetBranch === runtimeConfig.mainBranch &&
@@ -678,57 +958,52 @@ async function tick(): Promise<void> {
     }
 
     // ── Process completion ─────────────────────────────────────────────
-    let completionLeaseHeartbeatInFlight = false;
-    let completionLeaseLost = false;
-    const renewCompletionLease = async (required = false): Promise<boolean> => {
-      if (completionLeaseHeartbeatInFlight) {
-        if (!required) return !completionLeaseLost;
-        const deadline = Date.now() + 6_000;
-        while (completionLeaseHeartbeatInFlight && Date.now() < deadline) {
-          await Bun.sleep(50);
-        }
-        if (completionLeaseHeartbeatInFlight || completionLeaseLost) {
-          throw new Error("Completion publication lease heartbeat did not settle safely.");
-        }
-        return true;
+    const completionLeaseRenewal = new CompletionLeaseRenewalCoordinator(async () => {
+      const leaseResponse = await fetchBufferedWithHardDeadline({
+        input: `${runtimeConfig.serverUrl}/completions/${completion.id}/lease/renew`,
+        init: {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            pusherId,
+            claimToken: completionClaimToken,
+            leaseMs: COMPLETION_LEASE_MS,
+          }),
+        },
+        timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+        timeoutMessage: `Completion publication lease renewal timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
+      });
+      if (!leaseResponse.ok) {
+        return {
+          ok: false,
+          leaseLost: leaseResponse.status === 400 || leaseResponse.status === 409,
+          detail: `Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`,
+        };
       }
-      completionLeaseHeartbeatInFlight = true;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5_000);
-      try {
-        const leaseResponse = await fetch(
-          `${runtimeConfig.serverUrl}/completions/${completion.id}/lease/renew`,
-          {
-            method: "POST",
-            headers,
-            signal: controller.signal,
-            body: JSON.stringify({ pusherId, leaseMs: COMPLETION_LEASE_MS }),
-          },
-        );
-        if (!leaseResponse.ok) {
-          if (leaseResponse.status === 400 || leaseResponse.status === 409) {
-            completionLeaseLost = true;
-          }
-          if (required) {
-            throw new Error(
-              `Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`,
-            );
-          }
-          return false;
-        }
-        completionLeaseLost = false;
-        return true;
-      } catch (error) {
-        if (required) throw error;
+      return { ok: true };
+    });
+    const renewCompletionLease = async (required = false): Promise<boolean> => {
+      const renewed = await completionLeaseRenewal.renew(required);
+      if (!renewed && !required) {
         console.warn(
           `[${ts()}] Completion lease heartbeat failed for ${completion.id}: ${
-            error instanceof Error ? error.message : String(error)
+            completionLeaseRenewal.failureDetail() ?? "renewal was not confirmed"
           }`,
         );
-        return false;
-      } finally {
-        clearTimeout(timer);
-        completionLeaseHeartbeatInFlight = false;
+      }
+      return renewed;
+    };
+    const requireCompletionLease = async (operation: string): Promise<void> => {
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(
+          `Completion publication lease was lost before ${operation}; refusing stale-owner mutation.`,
+        );
+      }
+      await renewCompletionLease(true);
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(
+          `Completion publication lease was lost before ${operation}; refusing stale-owner mutation.`,
+        );
       }
     };
     const completionLeaseHeartbeatTimer = setInterval(
@@ -737,21 +1012,149 @@ async function tick(): Promise<void> {
     );
     let tempBranch = "";
     let cleanupCompletionHandoff = false;
+    let completionGcRecord: CompletionGcRecord | null = null;
     let trustedInstallDurationMs: number | null = null;
     let trustedValidationDurationMs: number | null = null;
     let trustedValidationCacheHit: boolean | null = null;
     let trustedValidationBaselineSha: string | null = null;
+    let trustedValidationCandidateSha: string | null = null;
+    let trustedValidationCandidateRef: string | null = null;
     let trustedValidationResults: TrustedValidationExecutionResult[] = [];
+    let publicationAlreadyIntegrated = false;
+    let publicationReadyForFinalization = false;
+    let validationCheckpointPersisted = false;
+    let validationSuccessProven = false;
+    let skipValidationForDurableRecovery = false;
+    let validationCheckpointGeneration = completionClaimGeneration;
+    let validationWorktreeInvariantFailed = false;
+    let validatedCheckpointRecoveryPending = false;
+    let previousValidationCheckpoint: Awaited<ReturnType<typeof loadLatestValidationCheckpoint>> =
+      null;
+    const completionValidationRefs = validationCheckpointRefs(
+      completion.id,
+      completionClaimGeneration,
+    );
     const trustedValidationReport = (): TrustedValidationReport | null =>
       completion.trustedValidationCommandsJson
         ? {
             version: 1,
             baselineSha: trustedValidationBaselineSha,
-            candidateSha: completion.commitSha,
+            candidateSha: trustedValidationCandidateSha,
+            candidateRef: trustedValidationCandidateRef,
             results: trustedValidationResults,
           }
         : null;
+    const persistExactValidationCheckpoint = async (): Promise<void> => {
+      if (
+        validationCheckpointPersisted ||
+        !trustedValidationBaselineSha ||
+        !trustedValidationCandidateSha
+      ) {
+        return;
+      }
+      const checkpoint = await persistValidationCheckpoint({
+        completionId: completion.id,
+        claimGeneration: completionClaimGeneration,
+        baselineSha: trustedValidationBaselineSha,
+        candidateSha: trustedValidationCandidateSha,
+        git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
+      });
+      trustedValidationCandidateRef = checkpoint.candidateRef;
+      validationCheckpointPersisted = true;
+      validationCheckpointGeneration = completionClaimGeneration;
+    };
+    const validationGit = (gitArgs: string[]) =>
+      runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot);
+    const probeAuthoritativeRefSha = async (ref: string): Promise<string | null> =>
+      authoritativeRefShaFromGitResult(
+        await validationGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]),
+        ref,
+      );
+    const probeAuthoritativeAncestry = async (
+      ancestor: string,
+      descendant: string,
+    ): Promise<boolean> =>
+      authoritativeAncestryFromGitResult(
+        await validationGit(["merge-base", "--is-ancestor", ancestor, descendant]),
+        `${ancestor} -> ${descendant}`,
+      );
+    const assertValidationWorktree = async (phase: string): Promise<void> => {
+      try {
+        await assertExactCleanValidationWorktree({
+          expectedSha: trustedValidationCandidateSha ?? "",
+          phase,
+          git: validationGit,
+        });
+      } catch (error) {
+        if (error instanceof ValidationWorktreeInvariantError) {
+          validationWorktreeInvariantFailed = true;
+        }
+        throw error;
+      }
+    };
+    const proveValidatedCandidatePublished = async (): Promise<boolean> => {
+      if (!validationSuccessProven || !trustedValidationCandidateSha) return false;
+      if (useReviewPublicationFlow || runtimeConfig.pushMainAfterMerge) {
+        await gitOps.fetchPrune();
+      }
+      const reviewHeadBranch = useReviewPublicationFlow
+        ? (reviewPublicationLease?.targetBranch ??
+          deriveReviewPrHeadBranch(completion.branch, completion.id).headBranch)
+        : null;
+      const reviewRemoteHeadSha = reviewHeadBranch
+        ? await probeAuthoritativeRefSha(`refs/remotes/${runtimeConfig.remote}/${reviewHeadBranch}`)
+        : null;
+      const remoteIntegrationHeadSha =
+        !useReviewPublicationFlow && runtimeConfig.pushMainAfterMerge
+          ? await probeAuthoritativeRefSha(
+              `refs/remotes/${runtimeConfig.remote}/${runtimeConfig.mainBranch}`,
+            )
+          : null;
+      const localIntegrationHeadSha =
+        !useReviewPublicationFlow && !runtimeConfig.pushMainAfterMerge
+          ? await probeAuthoritativeRefSha(`refs/heads/${runtimeConfig.mainBranch}`)
+          : null;
+      return isValidationCheckpointPublished({
+        candidateSha: trustedValidationCandidateSha,
+        localIntegrationHeadSha,
+        remoteIntegrationHeadSha,
+        reviewRemoteHeadSha,
+        pushMainAfterMerge: runtimeConfig.pushMainAfterMerge,
+        useReviewPublicationFlow,
+        isAncestor: probeAuthoritativeAncestry,
+      });
+    };
+    const markPublicationDurable = (): void => {
+      const recoveryState = durablePublicationRecoveryState(true);
+      publicationAlreadyIntegrated = recoveryState.skipPublicationMutation;
+      publicationReadyForFinalization = recoveryState.protectFromTerminalFailure;
+    };
+    const confirmLeaseAfterPublication = async (operation: string): Promise<void> => {
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(
+          `Completion publication became durable during ${operation}, but this owner lost its lease; leaving finalization to the current owner.`,
+        );
+      }
+      await renewCompletionLease(true);
+      if (completionLeaseRenewal.hasLostLease()) {
+        throw new Error(
+          `Completion publication became durable during ${operation}, but this owner lost its lease; leaving finalization to the current owner.`,
+        );
+      }
+    };
     try {
+      validationRepairPublicationLease = parseValidationRepairPublicationLease(completion.prBody);
+      if (validationRepairPublicationLease && reviewPublicationLease) {
+        throw new Error(
+          "Completion contains conflicting review and validation-repair publication leases.",
+        );
+      }
+      previousValidationCheckpoint = await loadLatestValidationCheckpoint({
+        completionId: completion.id,
+        beforeClaimGeneration: completionClaimGeneration,
+        git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
+      });
+      validatedCheckpointRecoveryPending = previousValidationCheckpoint?.validationProven === true;
       let processedPrUrl: string | null =
         typeof completion.prUrl === "string" && completion.prUrl.trim().length > 0
           ? completion.prUrl.trim()
@@ -759,7 +1162,14 @@ async function tick(): Promise<void> {
       // 1. Refresh refs before applying completion commit/ref
       healthTracker.progress("refreshing_refs", completion.id);
       console.log(`[${ts()}] Refreshing refs before applying ${completion.branch}...`);
-      await gitOps.fetchPrune();
+      try {
+        await gitOps.fetchPrune();
+      } catch (error) {
+        // A prior validated checkpoint may represent an accepted push whose
+        // response was lost. Do not terminally fail it merely because the
+        // authority is still unreachable on the next lease generation.
+        throw error;
+      }
       if (reviewPublicationLease) {
         let resolvedCompletionSha = await runGitCapture(
           ["-C", runtimeConfig.repoPath, "rev-parse", "--verify", completion.branch],
@@ -820,74 +1230,204 @@ async function tick(): Promise<void> {
         }
       }
       await gitOps.createTempBranch(tempBranch);
-      trustedValidationBaselineSha = await gitOps.revParse("HEAD");
-      let skipLocalApplyDueConflict = false;
+      trustedValidationBaselineSha = await probeAuthoritativeRefSha("HEAD");
+      if (!trustedValidationBaselineSha) {
+        throw new Error("SourceControlManager worktree has no authoritative HEAD commit.");
+      }
+      let retainedCheckpointApplyResult: GitCmdResult | null = null;
+      if (previousValidationCheckpoint?.validationProven) {
+        validationSuccessProven = true;
+        trustedValidationCandidateSha = previousValidationCheckpoint.candidateSha;
+        const checkpointHead = useReviewPublicationFlow
+          ? (reviewPublicationLease?.targetBranch ??
+            deriveReviewPrHeadBranch(completion.branch, completion.id).headBranch)
+          : null;
+        const reviewRemoteHeadSha = checkpointHead
+          ? await probeAuthoritativeRefSha(`refs/remotes/${runtimeConfig.remote}/${checkpointHead}`)
+          : null;
+        const remoteIntegrationHeadSha =
+          !useReviewPublicationFlow && runtimeConfig.pushMainAfterMerge
+            ? await probeAuthoritativeRefSha(
+                `refs/remotes/${runtimeConfig.remote}/${runtimeConfig.mainBranch}`,
+              )
+            : null;
+        const checkpointPublished = await isValidationCheckpointPublished({
+          candidateSha: previousValidationCheckpoint.candidateSha,
+          localIntegrationHeadSha: trustedValidationBaselineSha,
+          remoteIntegrationHeadSha,
+          reviewRemoteHeadSha,
+          pushMainAfterMerge: runtimeConfig.pushMainAfterMerge,
+          useReviewPublicationFlow,
+          isAncestor: probeAuthoritativeAncestry,
+        });
+        // Authority was reachable and gave a definitive answer. From here,
+        // replay/apply failures are real repair failures, not uncertainty from
+        // the earlier publication attempt.
+        validatedCheckpointRecoveryPending = false;
+        if (
+          shouldSkipValidationForDurableRecovery({
+            validationProven: previousValidationCheckpoint.validationProven,
+            publicationProven: checkpointPublished,
+          })
+        ) {
+          const recoveryState = durablePublicationRecoveryState(true);
+          const restoreCheckpoint = await runGitCapture(
+            [
+              "-C",
+              runtimeConfig.repoPath,
+              "checkout",
+              "-B",
+              tempBranch,
+              previousValidationCheckpoint.candidateSha,
+            ],
+            repoRoot,
+          );
+          if (!restoreCheckpoint.ok) {
+            throw new Error(
+              `Failed to restore exact trusted-validation checkpoint ${previousValidationCheckpoint.candidateRef}: ${restoreCheckpoint.stderr || restoreCheckpoint.stdout}`,
+            );
+          }
+          trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
+          trustedValidationCandidateSha = previousValidationCheckpoint.candidateSha;
+          trustedValidationCandidateRef = previousValidationCheckpoint.candidateRef;
+          validationCheckpointPersisted = true;
+          validationCheckpointGeneration = previousValidationCheckpoint.claimGeneration;
+          skipValidationForDurableRecovery = true;
+          publicationAlreadyIntegrated = recoveryState.skipPublicationMutation;
+          publicationReadyForFinalization = recoveryState.protectFromTerminalFailure;
+          retainedCheckpointApplyResult = {
+            ok: true,
+            stdout: "Reused already-published immutable validation checkpoint.",
+            stderr: "",
+            exitCode: 0,
+          };
+          console.log(
+            `[${ts()}] Reusing already-published trusted-validation checkpoint ${previousValidationCheckpoint.candidateSha.slice(0, 8)} without duplicate mutation.`,
+          );
+        } else {
+          validationSuccessProven = false;
+          trustedValidationCandidateSha = null;
+          retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
+            baselineSha: previousValidationCheckpoint.baselineSha,
+            candidateSha: previousValidationCheckpoint.candidateSha,
+            currentIntegrationSha: trustedValidationBaselineSha ?? "",
+            git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
+          });
+          console.log(
+            `[${ts()}] Replayed exact retained checkpoint ${previousValidationCheckpoint.candidateRef} onto the current integration head.`,
+          );
+        }
+      } else if (previousValidationCheckpoint) {
+        retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
+          baselineSha: previousValidationCheckpoint.baselineSha,
+          candidateSha: previousValidationCheckpoint.candidateSha,
+          currentIntegrationSha: trustedValidationBaselineSha ?? "",
+          git: validationGit,
+        });
+        console.log(
+          `[${ts()}] Replayed unvalidated retained checkpoint ${previousValidationCheckpoint.candidateRef}; validation-success proof is required before publication.`,
+        );
+      }
 
-      const applyResult = reviewPublicationLease
-        ? await (async () => {
-            console.log(
-              `[${ts()}] Checking out exact reviewed completion ${completion.commitSha.slice(0, 8)} on ${tempBranch} for validation...`,
-            );
-            return runGitCapture(
-              [
-                "-C",
-                runtimeConfig.repoPath,
-                ...buildReviewCompletionValidationCheckoutArgs(tempBranch, completion.commitSha),
-              ],
-              repoRoot,
-            );
-          })()
-        : runtimeConfig.mergeStrategy === "cherry-pick"
+      const applyResult = retainedCheckpointApplyResult
+        ? retainedCheckpointApplyResult
+        : reviewPublicationLease
           ? await (async () => {
               console.log(
-                `[${ts()}] Cherry-picking ${completion.commitSha.slice(0, 8)} onto ${tempBranch}...`,
+                `[${ts()}] Checking out exact reviewed completion ${completion.commitSha.slice(0, 8)} on ${tempBranch} for validation...`,
               );
-              return gitOps.cherryPickRef(completion.commitSha);
+              return runGitCapture(
+                [
+                  "-C",
+                  runtimeConfig.repoPath,
+                  ...buildReviewCompletionValidationCheckoutArgs(tempBranch, completion.commitSha),
+                ],
+                repoRoot,
+              );
             })()
-          : await (async () => {
-              console.log(`[${ts()}] Merging ${completion.branch} into ${tempBranch}...`);
-              return runtimeConfig.mergeStrategy === "no-ff"
-                ? gitOps.mergeNoFF(completion.branch, `Merge ${completion.branch}`)
-                : gitOps.mergeFFOnly(completion.branch);
-            })();
+          : validationRepairPublicationLease
+            ? await (async () => {
+                console.log(
+                  `[${ts()}] Applying exact validation-repair chain ${validationRepairPublicationLease.baselineSha.slice(0, 8)} -> ${validationRepairPublicationLease.candidateSha.slice(0, 8)} -> ${completion.commitSha.slice(0, 8)} for incident ${validationRepairPublicationLease.incidentId}...`,
+                );
+                return applyValidationRepairPublication({
+                  lease: validationRepairPublicationLease,
+                  completionSha: completion.commitSha,
+                  currentIntegrationSha: trustedValidationBaselineSha ?? "",
+                  git: (gitArgs) =>
+                    runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
+                });
+              })()
+            : runtimeConfig.mergeStrategy === "cherry-pick"
+              ? await (async () => {
+                  console.log(
+                    `[${ts()}] Cherry-picking ${completion.commitSha.slice(0, 8)} onto ${tempBranch}...`,
+                  );
+                  return gitOps.cherryPickRef(completion.commitSha);
+                })()
+              : await (async () => {
+                  console.log(`[${ts()}] Merging ${completion.branch} into ${tempBranch}...`);
+                  return runtimeConfig.mergeStrategy === "no-ff"
+                    ? gitOps.mergeNoFF(completion.branch, `Merge ${completion.branch}`)
+                    : gitOps.mergeFFOnly(completion.branch);
+                })();
 
       if (!applyResult.ok) {
         if (
-          shouldBypassApplyFailureInReviewMode({
+          !validationRepairPublicationLease &&
+          useReviewPublicationFlow &&
+          reviewApplyFailureBlocksPublication({
             reviewAgentEnabled: useReviewPublicationFlow,
             mergeStrategy: runtimeConfig.mergeStrategy,
             applyStdout: applyResult.stdout,
             applyStderr: applyResult.stderr,
           })
         ) {
-          skipLocalApplyDueConflict = true;
-          const applyDetail = applyResult.stderr || applyResult.stdout;
-          console.warn(
-            `[${ts()}] ReviewAgent mode - cherry-pick conflict while applying ${completion.commitSha.slice(0, 8)}; continuing with PR flow from worker branch commit.`,
+          throw new Error(
+            `Review candidate apply failed; publication is blocked until the exact candidate can be prepared and checked: ${applyResult.stderr || applyResult.stdout}`,
           );
-          await emitPusherMessage(
-            comm,
-            `ReviewAgent mode: local apply conflicted (${completion.commitSha.slice(0, 8)}), so SourceControlManager continued with branch-based PR flow. Detail: ${applyDetail}`,
-            completion.id,
-            completionEventMeta,
-          );
-          await gitOps.resetToClean();
-        } else {
-          throw new Error(`Apply failed: ${applyResult.stderr || applyResult.stdout}`);
+        }
+        throw new Error(`Apply failed: ${applyResult.stderr || applyResult.stdout}`);
+      }
+      if (!trustedValidationCandidateSha) {
+        trustedValidationCandidateSha = await gitOps.revParse("HEAD");
+        if (!trustedValidationCandidateSha) {
+          throw new Error("Unable to capture the exact applied candidate SHA before validation.");
         }
       }
-
-      // 4. Run checks
-      if (skipLocalApplyDueConflict) {
-        if (completion.trustedValidationCommandsJson) {
-          throw new Error(
-            "Trusted validation cannot run because the candidate was not applied to the SourceControlManager validation branch.",
-          );
+      if ("idempotent" in applyResult && applyResult.idempotent) {
+        // Patch equivalence proves only that the candidate is present in this
+        // local checkout. It does not prove a prior remote push/PR publication;
+        // only the remote-authoritative checks above may suppress publication.
+        if (previousValidationCheckpoint) {
+          trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
+        } else if (validationRepairPublicationLease) {
+          trustedValidationBaselineSha = validationRepairPublicationLease.baselineSha;
         }
-        console.warn(
-          `[${ts()}] Skipping local checks for ${completion.commitSha.slice(0, 8)} because ReviewAgent fallback bypassed temp-branch apply.`,
+      }
+      if (
+        trustedValidationBaselineSha &&
+        trustedValidationCandidateSha &&
+        !(await gitOps.isAncestor(trustedValidationBaselineSha, trustedValidationCandidateSha))
+      ) {
+        trustedValidationBaselineSha = await resolveValidationCheckpointBaseline({
+          preApplyBaselineSha: trustedValidationBaselineSha,
+          candidateSha: trustedValidationCandidateSha,
+          git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
+        });
+      }
+      await persistExactValidationCheckpoint();
+
+      // 4. Run checks against the exact immutable candidate. A durable success
+      // proof plus authoritative publication proof is the only recovery path
+      // allowed to skip re-running mutable validation.
+      if (skipValidationForDurableRecovery) {
+        await assertValidationWorktree("published recovery");
+        console.log(
+          `[${ts()}] Exact candidate ${trustedValidationCandidateSha?.slice(0, 8)} already has immutable validation-success and publication proof; skipping duplicate validation.`,
         );
       } else {
+        await assertValidationWorktree("before trusted validation");
         if (completion.trustedValidationCommandsJson) {
           healthTracker.progress("trusted_validation", completion.id);
           console.log(
@@ -896,7 +1436,11 @@ async function tick(): Promise<void> {
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: completion.trustedValidationCommandsJson,
+            onProgress: (event) =>
+              healthTracker.progress(trustedValidationHealthPhase(event), completion.id),
           });
+          const validationOutcome = resolveTrustedValidationOutcome(trustedValidationResults);
+          const terminalResults = new Set(validationOutcome.terminalResults);
           for (const trustedResult of trustedValidationResults) {
             if (trustedResult.phase === "dependency_install") {
               trustedInstallDurationMs = (trustedInstallDurationMs ?? 0) + trustedResult.durationMs;
@@ -906,14 +1450,6 @@ async function tick(): Promise<void> {
                 (trustedValidationDurationMs ?? 0) + trustedResult.durationMs;
             }
             const timing = `${trustedResult.durationMs}ms${trustedResult.cached ? ", cache hit" : ""}`;
-            if (!trustedResult.ok) {
-              throw new Error(
-                `Trusted validation "${trustedResult.command}" failed after ${timing} (exit ${trustedResult.exitCode}): ${trustedResult.output}`,
-              );
-            }
-            console.log(
-              `[${ts()}]   - Trusted validation passed (${timing}): ${trustedResult.command}`,
-            );
             console.log(
               `[${ts()}] trustedValidationTiming=${JSON.stringify({
                 event: "trusted_validation_timing",
@@ -923,9 +1459,29 @@ async function tick(): Promise<void> {
                 phase: trustedResult.phase,
                 durationMs: trustedResult.durationMs,
                 cached: Boolean(trustedResult.cached),
+                ok: trustedResult.ok,
+                attempt: trustedResult.attempt ?? 1,
+                retryReason: trustedResult.retryReason ?? null,
               })}`,
             );
+            if (trustedResult.ok) {
+              console.log(
+                `[${ts()}]   - Trusted validation passed (${timing}, attempt ${trustedResult.attempt ?? 1}): ${trustedResult.command}`,
+              );
+            } else if (!terminalResults.has(trustedResult)) {
+              console.warn(
+                `[${ts()}]   - Trusted validation attempt ${trustedResult.attempt ?? 1} failed after ${timing} and was retried: ${trustedResult.command}`,
+              );
+            }
           }
+          if (validationOutcome.terminalFailure) {
+            const trustedResult = validationOutcome.terminalFailure;
+            const timing = `${trustedResult.durationMs}ms${trustedResult.cached ? ", cache hit" : ""}`;
+            throw new Error(
+              `Trusted validation "${trustedResult.command}" failed after ${timing} (exit ${trustedResult.exitCode}): ${trustedResult.output}`,
+            );
+          }
+          await assertValidationWorktree("after trusted validation");
         }
         console.log(`[${ts()}] Running checks...`);
         for (const check of runtimeConfig.checks) {
@@ -937,12 +1493,35 @@ async function tick(): Promise<void> {
           }
 
           console.log(`[${ts()}]   - Check passed: ${check.name}`);
+          await assertValidationWorktree(`after check ${check.name}`);
+        }
+        await assertValidationWorktree("after all checks");
+        await persistValidationSuccessProof({
+          completionId: completion.id,
+          claimGeneration: validationCheckpointGeneration,
+          candidateSha: trustedValidationCandidateSha ?? "",
+          git: validationGit,
+        });
+        validationSuccessProven = true;
+
+        // A worker may have pre-created a remote review branch. It is not
+        // publication proof until the exact tree has crossed validation. Once
+        // both proofs exist, publication can be recovered without mutation.
+        if (await proveValidatedCandidatePublished()) {
+          const recoveryState = durablePublicationRecoveryState(true);
+          publicationAlreadyIntegrated = recoveryState.skipPublicationMutation;
+          publicationReadyForFinalization = recoveryState.protectFromTerminalFailure;
+          console.log(
+            `[${ts()}] Exact validated candidate ${trustedValidationCandidateSha?.slice(0, 8)} is already durable on its authoritative publication ref.`,
+          );
         }
       }
 
+      await persistExactValidationCheckpoint();
+
       // 5. Merge to main OR create individual PR (ReviewAgent mode)
       healthTracker.progress("publication", completion.id);
-      await renewCompletionLease(true);
+      await requireCompletionLease("publication");
       if (useReviewPublicationFlow) {
         // ReviewAgent mode: create individual PR from agent branch to prBaseBranch.
         // The agent branch already exists on remote (pushed by the worker).
@@ -972,7 +1551,11 @@ async function tick(): Promise<void> {
           ? { headBranch: reviewPublicationLease.targetBranch, requiresMaterialize: false }
           : deriveReviewPrHeadBranch(completion.branch, completion.id);
         let prHeadBranch = resolvedHead.headBranch;
-        if (shouldPublishWithExactReviewLease(reviewPublicationLease)) {
+        if (publicationAlreadyIntegrated) {
+          console.log(
+            `[${ts()}] Review completion ${completion.id} is already present on ${prHeadBranch}; skipping duplicate branch mutation.`,
+          );
+        } else if (shouldPublishWithExactReviewLease(reviewPublicationLease)) {
           const prBaseBranch =
             reviewPublicationLease.baseBranch ??
             (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
@@ -996,66 +1579,64 @@ async function tick(): Promise<void> {
           console.log(
             `[${ts()}] Publishing reviewed completion ${completion.commitSha.slice(0, 8)} to ${prHeadBranch} with an exact force-with-lease.`,
           );
-          const pushResult = await runGitCapture(
-            [
-              "-C",
-              runtimeConfig.repoPath,
-              ...buildReviewPublicationPushArgs({
-                remote: runtimeConfig.remote,
-                commitSha: completion.commitSha,
-                lease: reviewPublicationLease,
-              }),
-            ],
-            repoRoot,
-          );
-          if (!pushResult.ok) {
-            throw new Error(
-              `Failed exact-lease publication for review branch ${prHeadBranch}: ${pushResult.stderr || pushResult.stdout}`,
+          await requireCompletionLease(`review branch push ${prHeadBranch}`);
+          const publication = await publishWithAuthoritativeProof({
+            mutate: () =>
+              runGitCapture(
+                [
+                  "-C",
+                  runtimeConfig.repoPath,
+                  ...buildReviewPublicationPushArgs({
+                    remote: runtimeConfig.remote,
+                    commitSha: completion.commitSha,
+                    lease: reviewPublicationLease,
+                  }),
+                ],
+                repoRoot,
+              ),
+            provePublished: proveValidatedCandidatePublished,
+            failurePrefix: `Failed exact-lease publication for review branch ${prHeadBranch}`,
+          });
+          markPublicationDurable();
+          if (publication.recoveredFromAmbiguousFailure) {
+            console.warn(
+              `[${ts()}] Review push reported failure after ${prHeadBranch} became authoritative; continuing with durable recovery.`,
             );
           }
+          await confirmLeaseAfterPublication(`review branch push ${prHeadBranch}`);
         } else if (resolvedHead.requiresMaterialize) {
-          const publishRef = skipLocalApplyDueConflict ? completion.commitSha : "HEAD";
+          const publishRef = "HEAD";
+          const remoteHeadBeforePublication = await gitOps.revParse(
+            `refs/remotes/${runtimeConfig.remote}/${prHeadBranch}`,
+          );
+          const explicitLease = `--force-with-lease=refs/heads/${prHeadBranch}:${remoteHeadBeforePublication ?? ""}`;
           console.log(
-            `[${ts()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch}`,
+            `[${ts()}] ReviewAgent mode - materializing hidden completion ref ${completion.branch} -> refs/heads/${prHeadBranch} with an exact remote lease.`,
           );
-          let pushResult = await runGitCapture(
-            [
-              "-C",
-              runtimeConfig.repoPath,
-              "push",
-              runtimeConfig.remote,
-              `${publishRef}:refs/heads/${prHeadBranch}`,
-            ],
-            repoRoot,
-          );
-          if (!pushResult.ok) {
-            const detail = `${pushResult.stderr}\n${pushResult.stdout}`.toLowerCase();
-            const likelyNonFf =
-              detail.includes("non-fast-forward") ||
-              detail.includes("fetch first") ||
-              detail.includes("rejected");
-            if (likelyNonFf) {
-              console.warn(
-                `[${ts()}] Non-fast-forward while publishing ${prHeadBranch}; retrying with --force-with-lease`,
-              );
-              pushResult = await runGitCapture(
+          await requireCompletionLease(`review branch materialization ${prHeadBranch}`);
+          const publication = await publishWithAuthoritativeProof({
+            mutate: () =>
+              runGitCapture(
                 [
                   "-C",
                   runtimeConfig.repoPath,
                   "push",
-                  "--force-with-lease",
+                  explicitLease,
                   runtimeConfig.remote,
                   `${publishRef}:refs/heads/${prHeadBranch}`,
                 ],
                 repoRoot,
-              );
-            }
-          }
-          if (!pushResult.ok) {
-            throw new Error(
-              `Failed to publish review branch ${prHeadBranch}: ${pushResult.stderr || pushResult.stdout}`,
+              ),
+            provePublished: proveValidatedCandidatePublished,
+            failurePrefix: `Failed to publish review branch ${prHeadBranch}`,
+          });
+          markPublicationDurable();
+          if (publication.recoveredFromAmbiguousFailure) {
+            console.warn(
+              `[${ts()}] Review materialization reported failure after ${prHeadBranch} became authoritative; continuing with durable recovery.`,
             );
           }
+          await confirmLeaseAfterPublication(`review branch materialization ${prHeadBranch}`);
         }
         const commitSubject = await resolveCommitSubject(completion.commitSha);
         if (!commitSubject) {
@@ -1089,6 +1670,7 @@ async function tick(): Promise<void> {
         const remoteUrl = remoteUrlResult.stdout.trim();
         const prBaseBranch = (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
 
+        await requireCompletionLease(`pull request creation for ${prHeadBranch}`);
         const pr = await ensureIntegrationPullRequest({
           token,
           remoteUrl,
@@ -1098,7 +1680,7 @@ async function tick(): Promise<void> {
           body: prBody,
           draft: false,
         });
-        if (!pr.created) {
+        if (!pr.created && !publicationAlreadyIntegrated) {
           reviewAgentForTick?.requestReReview(pr.number, completion.commitSha);
         }
         const prMessage = pr.created
@@ -1109,24 +1691,50 @@ async function tick(): Promise<void> {
         await emitPusherMessage(comm, prMessage, completion.id, completionEventMeta);
       } else {
         // Normal mode: merge temp branch into main_agents, push, open aggregated PR.
-        console.log(`[${ts()}] Merging ${tempBranch} to ${runtimeConfig.mainBranch}...`);
-        await gitOps.checkoutMain();
-        const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
+        if (!publicationAlreadyIntegrated) {
+          await requireCompletionLease(`merge to ${runtimeConfig.mainBranch}`);
+          console.log(`[${ts()}] Merging ${tempBranch} to ${runtimeConfig.mainBranch}...`);
+          await gitOps.checkoutMain();
+          const ffResult = await gitOps.mergeFFOnlyRef(tempBranch);
 
-        if (!ffResult.ok) {
-          throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
-        }
-
-        console.log(`[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`);
-        if (config.pushMainAfterMerge) {
-          console.log(`[${ts()}] Pushing ${config.mainBranch} to ${config.remote}...`);
-          const pushResult = await gitOps.pushMain();
-          if (!pushResult.ok) {
-            throw new Error(`Push failed: ${pushResult.stderr || pushResult.stdout}`);
+          if (!ffResult.ok) {
+            throw new Error(`FF merge to main failed: ${ffResult.stderr || ffResult.stdout}`);
           }
-          console.log(`[${ts()}] Push succeeded for ${config.mainBranch}`);
-          if (config.openPrAfterPush) {
+
+          console.log(
+            `[${ts()}] ✓ Successfully merged ${completion.branch} to ${config.mainBranch}`,
+          );
+        } else {
+          console.log(
+            `[${ts()}] Completion ${completion.id} is already present on ${runtimeConfig.mainBranch}; skipping duplicate merge and push.`,
+          );
+        }
+        if (runtimeConfig.pushMainAfterMerge && !publicationAlreadyIntegrated) {
+          await requireCompletionLease(
+            `push to ${runtimeConfig.remote}/${runtimeConfig.mainBranch}`,
+          );
+          console.log(
+            `[${ts()}] Pushing ${runtimeConfig.mainBranch} to ${runtimeConfig.remote}...`,
+          );
+          const publication = await publishWithAuthoritativeProof({
+            mutate: () => gitOps.pushMain(),
+            provePublished: proveValidatedCandidatePublished,
+            failurePrefix: `Push failed for ${runtimeConfig.remote}/${runtimeConfig.mainBranch}`,
+          });
+          markPublicationDurable();
+          if (publication.recoveredFromAmbiguousFailure) {
+            console.warn(
+              `[${ts()}] Push reported failure after ${runtimeConfig.remote}/${runtimeConfig.mainBranch} contained the exact validated candidate; continuing with durable recovery.`,
+            );
+          } else {
+            console.log(`[${ts()}] Push succeeded for ${runtimeConfig.mainBranch}`);
+          }
+          await confirmLeaseAfterPublication(
+            `push to ${runtimeConfig.remote}/${runtimeConfig.mainBranch}`,
+          );
+          if (runtimeConfig.openPrAfterPush) {
             try {
+              await requireCompletionLease("aggregated pull request creation");
               const pr = await ensureMainPullRequest(completion, runtimeConfig);
               const prMessage = pr.created
                 ? `Opened PR #${pr.number}: ${pr.htmlUrl}`
@@ -1135,78 +1743,240 @@ async function tick(): Promise<void> {
               console.log(`[${ts()}] ${prMessage}`);
               await emitPusherMessage(comm, prMessage, completion.id, completionEventMeta);
             } catch (prErr: any) {
+              if (completionLeaseRenewal.hasLostLease()) throw prErr;
               const warning = `Push succeeded, but PR auto-open failed: ${prErr?.message ?? prErr}`;
               console.error(`[${ts()}] ${warning}`);
               await emitPusherMessage(comm, warning, completion.id, completionEventMeta);
             }
           }
-        } else {
+        } else if (!publicationAlreadyIntegrated) {
           console.log(`[${ts()}] pushMainAfterMerge=false - skipping push`);
+          if (!(await proveValidatedCandidatePublished())) {
+            throw new Error(
+              `Local publication proof for ${runtimeConfig.mainBranch} did not contain exact validated candidate ${trustedValidationCandidateSha}.`,
+            );
+          }
+          markPublicationDurable();
+          await confirmLeaseAfterPublication(`local merge to ${runtimeConfig.mainBranch}`);
         }
       }
 
+      await requireCompletionLease("final authoritative publication proof");
+      // An earlier proof can become stale while a PR provider request is in
+      // flight. Clear it before the final probe so an unreachable or moved ref
+      // can never inherit permission to finalize from a cached boolean.
+      publicationAlreadyIntegrated = false;
+      publicationReadyForFinalization = false;
+      await assertFinalAuthoritativePublicationProof({
+        provePublished: proveValidatedCandidatePublished,
+        failurePrefix: `Final authoritative publication proof no longer contains exact validated candidate ${trustedValidationCandidateSha}`,
+      });
+      markPublicationDurable();
+
+      if (!publicationReadyForFinalization) {
+        throw new Error(
+          "Publication finished without authoritative validation and durability proof; refusing completion finalization.",
+        );
+      }
       // 6. Clean up temp branch
       await gitOps.deleteTempBranch(tempBranch);
 
       // 7. Mark completion as processed
       healthTracker.progress("completion_callback", completion.id);
-      await renewCompletionLease(true);
-      const markResponse = await fetch(
-        `${config.serverUrl}/completions/${completion.id}/processed`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            pusherId,
-            prUrl: processedPrUrl,
-            trustedInstallDurationMs,
-            trustedValidationDurationMs,
-            trustedValidationCacheHit,
-            trustedValidationReport: trustedValidationReport(),
-          }),
-        },
+      await requireCompletionLease("processed callback");
+      const additionalValidationRefs = validationRepairPublicationLease?.candidateRef
+        ? [
+            validationRepairPublicationLease.candidateRef,
+            validationRepairPublicationLease.candidateRef.replace(/\/candidate$/, "/baseline"),
+            validationRepairPublicationLease.candidateRef.replace(/\/candidate$/, "/validated"),
+          ]
+        : [];
+      completionGcRecord = completionGcJournal.enqueue(
+        createCompletionGcRecord({
+          completionId: completion.id,
+          completionBranch: completion.branch,
+          commitSha: completion.commitSha,
+          claimGeneration: completionClaimGeneration,
+          remote:
+            reviewPublicationLease && completion.branch.startsWith("refs/pushpals/")
+              ? runtimeConfig.remote
+              : null,
+          additionalValidationRefs,
+        }),
       );
+      const markResult = await postCompletionProcessedWithRetry({
+        request: async (signal) => {
+          const response = await fetchBufferedWithHardDeadline({
+            input: `${config.serverUrl}/completions/${completion.id}/processed`,
+            init: {
+              method: "POST",
+              headers,
+              signal,
+              body: JSON.stringify({
+                pusherId,
+                claimToken: completionClaimToken,
+                prUrl: processedPrUrl,
+                trustedInstallDurationMs,
+                trustedValidationDurationMs,
+                trustedValidationCacheHit,
+                trustedValidationReport: trustedValidationReport(),
+              }),
+            },
+            timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+            timeoutMessage: `Completion processed callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
+          });
+          const payload = (await response.json().catch(() => null)) as { ok?: boolean } | null;
+          return { ok: response.ok && payload?.ok === true, status: response.status };
+        },
+      });
 
-      if (!markResponse.ok) {
-        console.error(`[${ts()}] Failed to mark completion processed: ${markResponse.status}`);
+      if (!markResult.confirmed) {
+        const callbackDetail = markResult.lastStatus
+          ? `HTTP ${markResult.lastStatus}`
+          : markResult.lastError || "no response";
+        console.warn(
+          `[${ts()}] Publication completed for ${completion.id}, but its processed callback is unconfirmed after ${markResult.attempts} attempt(s): ${callbackDetail}. Retaining the immutable checkpoint for stale-claim reconciliation.`,
+        );
+        await emitPusherMessage(
+          comm,
+          `Publication completed for ${completion.id.slice(0, 8)}, but finalization acknowledgement is pending. SourceControlManager retained the exact checkpoint and will reconcile it without publishing again.`,
+          completion.id,
+          completionEventMeta,
+        );
       } else {
         console.log(`[${ts()}] Marked completion ${completion.id} as processed`);
         cleanupCompletionHandoff = true;
         const pushMessage = useReviewPublicationFlow
-          ? skipLocalApplyDueConflict
-            ? `Local apply/checks were bypassed for ${completion.commitSha.slice(0, 8)} due cherry-pick conflict; individual PR flow continued for ReviewAgent.`
-            : `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`
+          ? `Checks passed for ${completion.commitSha.slice(0, 8)} from ${completion.branch}. Individual PR is ready for ReviewAgent review.`
           : config.pushMainAfterMerge
             ? `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} and pushed to ${config.remote}/${config.mainBranch}.`
             : `Merged ${completion.commitSha.slice(0, 8)} from ${completion.branch} into ${config.mainBranch} (push disabled).`;
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err: any) {
-      console.error(`[${ts()}] Failed to process completion ${completion.id}: ${err.message}`);
-
-      // Mark completion as failed
-      const failResponse = await fetch(`${config.serverUrl}/completions/${completion.id}/fail`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          pusherId,
-          error: err.message,
-          trustedInstallDurationMs,
-          trustedValidationDurationMs,
-          trustedValidationCacheHit,
-          trustedValidationReport: trustedValidationReport(),
-        }),
-      });
-
-      if (!failResponse.ok) {
-        console.error(`[${ts()}] Failed to mark completion failed: ${failResponse.status}`);
+      const publicationAttemptUncertain = err instanceof PublicationAuthorityUnreachableError;
+      let authoritativeReprobe: AuthoritativePublicationReprobe = "absent";
+      if (validatedCheckpointRecoveryPending && previousValidationCheckpoint?.validationProven) {
+        validationSuccessProven = true;
+        trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
+        trustedValidationCandidateSha = previousValidationCheckpoint.candidateSha;
+        trustedValidationCandidateRef = previousValidationCheckpoint.candidateRef;
+        validationCheckpointPersisted = true;
+        validationCheckpointGeneration = previousValidationCheckpoint.claimGeneration;
       }
-      await emitPusherMessage(
-        comm,
-        `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`,
-        completion.id,
-        completionEventMeta,
-      );
+      try {
+        await persistExactValidationCheckpoint();
+      } catch (checkpointError) {
+        err = new Error(
+          `${err?.message ?? err}; additionally failed to retain exact trusted-validation candidate: ${
+            checkpointError instanceof Error ? checkpointError.message : String(checkpointError)
+          }`,
+        );
+      }
+      if (!publicationReadyForFinalization && validationSuccessProven) {
+        try {
+          if (await proveValidatedCandidatePublished()) {
+            markPublicationDurable();
+            authoritativeReprobe = "published";
+            console.warn(
+              `[${ts()}] Recovered authoritative publication proof for ${completion.id} after an ambiguous publication error.`,
+            );
+          } else {
+            authoritativeReprobe = "absent";
+          }
+        } catch (publicationProbeError) {
+          authoritativeReprobe = "unreachable";
+          console.warn(
+            `[${ts()}] Could not confirm authoritative publication state for ${completion.id}: ${
+              publicationProbeError instanceof Error
+                ? publicationProbeError.message
+                : String(publicationProbeError)
+            }`,
+          );
+        }
+      }
+      const failureDisposition = publicationFailureDisposition({
+        publicationReadyForFinalization,
+        publicationAttemptUncertain,
+        authoritativeReprobe,
+        validatedCheckpointRecoveryPending,
+      });
+      if (failureDisposition === "finalize") {
+        console.warn(
+          `[${ts()}] Publication completed for ${completion.id}, but finalization is pending after: ${err.message}. Retaining the completion for idempotent stale-claim recovery.`,
+        );
+        try {
+          await emitPusherMessage(
+            comm,
+            `Publication completed for ${completion.id.slice(0, 8)}, but finalization acknowledgement is pending. SourceControlManager retained the exact checkpoint and will reconcile it without publishing again. Detail: ${err.message}`,
+            completion.id,
+            completionEventMeta,
+          );
+        } catch (messageError) {
+          console.warn(
+            `[${ts()}] Could not emit pending-finalization status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`,
+          );
+        }
+      } else if (failureDisposition === "reconcile") {
+        console.warn(
+          `[${ts()}] Publication outcome is uncertain for ${completion.id} because the authoritative ref remained unreachable. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`,
+        );
+        try {
+          await emitPusherMessage(
+            comm,
+            `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it when the authoritative ref is reachable; the job was not marked failed.`,
+            completion.id,
+            completionEventMeta,
+          );
+        } catch (messageError) {
+          console.warn(
+            `[${ts()}] Could not emit uncertain-publication status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`,
+          );
+        }
+      } else {
+        console.error(`[${ts()}] Failed to process completion ${completion.id}: ${err.message}`);
+
+        // Mark completion as failed only before publication has completed. Once
+        // a side effect is durable, stale-claim reconciliation owns recovery.
+        const failResult = await postCompletionCallbackWithRetry({
+          attempts: 2,
+          request: (signal) =>
+            fetchBufferedWithHardDeadline({
+              input: `${config.serverUrl}/completions/${completion.id}/fail`,
+              init: {
+                method: "POST",
+                headers,
+                signal,
+                body: JSON.stringify({
+                  pusherId,
+                  claimToken: completionClaimToken,
+                  error: err.message,
+                  trustedInstallDurationMs,
+                  trustedValidationDurationMs,
+                  trustedValidationCacheHit,
+                  trustedValidationReport: trustedValidationReport(),
+                }),
+              },
+              timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+              timeoutMessage: `Completion failure callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
+            }),
+        });
+
+        if (!failResult.confirmed) {
+          const callbackDetail = failResult.lastStatus
+            ? `HTTP ${failResult.lastStatus}`
+            : failResult.lastError || "no response";
+          console.warn(
+            `[${ts()}] Completion ${completion.id} failed, but its failure callback is unconfirmed after ${failResult.attempts} attempt(s): ${callbackDetail}. Lease recovery will reconcile it.`,
+          );
+        }
+        await emitPusherMessage(
+          comm,
+          `Failed to apply completion ${completion.id.slice(0, 8)} from ${completion.branch}: ${err.message}`,
+          completion.id,
+          completionEventMeta,
+        );
+      }
     } finally {
       clearInterval(completionLeaseHeartbeatTimer);
       try {
@@ -1215,6 +1985,20 @@ async function tick(): Promise<void> {
         console.warn(
           `[${ts()}] Failed to reset SourceControlManager worktree after completion ${completion.id}: ${err?.message ?? err}`,
         );
+      }
+      if (validationWorktreeInvariantFailed) {
+        try {
+          const cleanResult = await validationGit(["clean", "-ffd"]);
+          if (!cleanResult.ok) {
+            console.warn(
+              `[${ts()}] Failed to remove files created by a mutating validation command: ${cleanResult.stderr || cleanResult.stdout}`,
+            );
+          }
+        } catch (err: any) {
+          console.warn(
+            `[${ts()}] Failed to clean validation-created files from the disposable SourceControlManager worktree: ${err?.message ?? err}`,
+          );
+        }
       }
       try {
         if (tempBranch && (await gitOps.revParse(tempBranch))) {
@@ -1225,29 +2009,19 @@ async function tick(): Promise<void> {
           `[${ts()}] Failed to delete temp branch ${tempBranch} during final cleanup: ${err?.message ?? err}`,
         );
       }
-      if (cleanupHiddenCompletionRef && shouldCleanupCompletionHandoff(cleanupCompletionHandoff)) {
-        if (reviewPublicationLease) {
-          try {
-            const deleteRemoteCompletionRef = await runGitCapture(
-              ["-C", runtimeConfig.repoPath, "push", runtimeConfig.remote, `:${completion.branch}`],
-              repoRoot,
-            );
-            if (!deleteRemoteCompletionRef.ok) {
-              console.warn(
-                `[${ts()}] Failed to clean remote review completion ref ${completion.branch}: ${deleteRemoteCompletionRef.stderr || deleteRemoteCompletionRef.stdout}`,
-              );
-            }
-          } catch (err: any) {
+      if (cleanupCompletionHandoff && completionGcRecord) {
+        try {
+          const cleaned = await cleanupProcessedCompletionRefs(runtimeConfig, completionGcRecord);
+          if (cleaned) {
+            completionGcJournal.remove(completionGcRecord);
+          } else {
             console.warn(
-              `[${ts()}] Failed to clean remote review completion ref ${completion.branch}: ${err?.message ?? err}`,
+              `[${ts()}] Processed completion ${completion.id} has more retained refs than one bounded cleanup batch; the journal will resume cleanup next tick.`,
             );
           }
-        }
-        try {
-          await gitOps.deleteLocalRef(completion.branch);
         } catch (err: any) {
           console.warn(
-            `[${ts()}] Failed to clean local completion ref ${completion.branch}: ${err?.message ?? err}`,
+            `[${ts()}] Failed to clean processed completion refs for ${completion.id}; the durable GC journal will retry: ${err?.message ?? err}`,
           );
         }
       } else if (cleanupHiddenCompletionRef) {

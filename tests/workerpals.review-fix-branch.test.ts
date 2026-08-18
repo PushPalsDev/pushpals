@@ -6,6 +6,7 @@ import {
   resolveReviewNoChangeCompletionBranch,
   resolveWorkerCriticReviewContext,
   shouldEnqueueNoChangeReviewCompletion,
+  shouldFailTaskWithoutPublishableChanges,
 } from "../apps/workerpals/src/execute_job";
 import { loadPushPalsConfig } from "../packages/shared/src/config";
 
@@ -213,6 +214,45 @@ describe("workerpals review fix completion branch resolution", () => {
     ).toBe(false);
     expect(
       shouldEnqueueNoChangeReviewCompletion({ completionBranch: "agent/workerpal-1/job-xyz" }),
+    ).toBe(true);
+  });
+
+  test("fails file-modifying jobs that return without a publishable patch", () => {
+    const base = {
+      planningIntent: "code_change" as const,
+      writeAllowed: true,
+      publishablePathCount: 0,
+      shellWrapperReturn: false,
+    };
+
+    expect(shouldFailTaskWithoutPublishableChanges({ ...base, mode: "default" })).toBe(true);
+    expect(shouldFailTaskWithoutPublishableChanges({ ...base, mode: "review_fix" })).toBe(true);
+    expect(shouldFailTaskWithoutPublishableChanges({ ...base, mode: "merge_conflict" })).toBe(
+      false,
+    );
+    expect(
+      shouldFailTaskWithoutPublishableChanges({
+        ...base,
+        mode: "default",
+        planningIntent: "analysis",
+      }),
+    ).toBe(false);
+    expect(
+      shouldFailTaskWithoutPublishableChanges({ ...base, mode: "default", writeAllowed: false }),
+    ).toBe(false);
+    expect(
+      shouldFailTaskWithoutPublishableChanges({
+        ...base,
+        mode: "default",
+        publishablePathCount: 1,
+      }),
+    ).toBe(false);
+    expect(
+      shouldFailTaskWithoutPublishableChanges({
+        ...base,
+        mode: "merge_conflict",
+        shellWrapperReturn: true,
+      }),
     ).toBe(true);
   });
 });

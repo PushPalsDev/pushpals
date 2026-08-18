@@ -27,10 +27,12 @@ import {
   CommunicationManager,
   detectRepoRoot,
   extractVisionKeyItems,
+  fetchBufferedWithHardDeadline,
   loadPushPalsConfig,
   normalizeAutonomyComponentArea,
   resolveLocalServerConnection,
   sanitizePushPalsConfigForLogging,
+  terminateProcessTree,
   matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
@@ -54,7 +56,16 @@ import {
   resolveWorkerStartupTimeoutMs,
 } from "./worker_spawn.js";
 
-const AUTONOMY_TASK_DEDUPE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const TASK_EXECUTE_REQUEST_IDEMPOTENCY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const REQUEST_LEASE_MS = 3 * 60_000;
+const REQUEST_LEASE_HEARTBEAT_MS = 30_000;
+const REQUEST_LEASE_RENEW_TIMEOUT_MS = 10_000;
+const REQUEST_TRANSITION_MAX_ATTEMPTS = 3;
+const REQUEST_TRANSITION_TIMEOUT_MS = 10_000;
+const JOB_ENQUEUE_MAX_ATTEMPTS = 3;
+const JOB_ENQUEUE_TIMEOUT_MS = 10_000;
+const SERVICE_CONTROL_HTTP_TIMEOUT_MS = 10_000;
+const STARTUP_SESSION_HTTP_TIMEOUT_MS = 5_000;
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
@@ -202,6 +213,14 @@ export type AutonomyJobMetadata = {
   snapshotId?: string;
   patternKey?: string;
   componentArea?: AutonomyComponentArea;
+  validationIncident?: {
+    incidentId: string;
+    candidateSha?: string;
+    candidateRef?: string;
+    baselineSha?: string;
+    validationScope?: string;
+    failureFingerprint?: string;
+  };
 };
 
 export type TaskExecutePlanningScope = {
@@ -281,6 +300,11 @@ type EnqueueJobResult = {
   deduped: boolean;
 };
 
+type AmbiguousEnqueueJobResult = {
+  ambiguous: true;
+  detail: string;
+};
+
 function asAutonomyComponentArea(value: unknown): AutonomyComponentArea | undefined {
   return normalizeAutonomyComponentArea(value) ?? undefined;
 }
@@ -299,6 +323,29 @@ function toSingleLine(value: unknown, max = 220): string {
     .trim();
   if (!text) return "";
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+async function withHardDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => {
+        controller.abort();
+        reject(new Error(timeoutMessage));
+      },
+      Math.max(1, Math.floor(timeoutMs)),
+    );
+  });
+  try {
+    return await Promise.race([operation(controller.signal), deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -356,6 +403,12 @@ export function buildTaskExecuteDedupeKey(
     .toLowerCase();
   if (!normalizedSessionId) return null;
   const normalizedOrigin = params.origin === "autonomy" ? "autonomy" : "user";
+  const normalizedRequestId = String(params.requestId ?? "")
+    .trim()
+    .toLowerCase();
+  // A task.execute job belongs to one durable request lifecycle. Reusing a job
+  // across request IDs loses the second request/objective's terminal outcome.
+  if (!normalizedRequestId) return null;
 
   const rawTargetPaths = Array.isArray(params.planning.targetPaths)
     ? params.planning.targetPaths
@@ -375,15 +428,34 @@ export function buildTaskExecuteDedupeKey(
     return null;
   }
 
-  return `task.execute:${normalizedOrigin}:${normalizedSessionId}:${uniqueTargets.join("|")}`.toLowerCase();
+  return `task.execute:${normalizedOrigin}:${normalizedSessionId}:request:${normalizedRequestId}:${uniqueTargets.join("|")}`.toLowerCase();
+}
+
+export function buildTaskExecuteRequestDedupeKey(
+  sessionId: string,
+  params: TaskExecuteJobParams,
+): string | null {
+  const normalizedSessionId = String(sessionId ?? "")
+    .trim()
+    .toLowerCase();
+  const normalizedRequestId = String(params.requestId ?? "")
+    .trim()
+    .toLowerCase();
+  if (!normalizedSessionId || !normalizedRequestId) return null;
+  const normalizedOrigin = params.origin === "autonomy" ? "autonomy" : "user";
+  return `task.execute:${normalizedOrigin}:${normalizedSessionId}:request:${normalizedRequestId}:idempotent`;
 }
 
 export function resolveTaskExecuteDedupeCooldownMs(
-  params: TaskExecuteJobParams,
+  _params: TaskExecuteJobParams,
   dedupeKey: string | null,
 ): number {
   if (!dedupeKey) return 0;
-  return params.origin === "autonomy" ? AUTONOMY_TASK_DEDUPE_COOLDOWN_MS : 0;
+  // Every generated task.execute key is scoped to one durable request ID, so
+  // this is an idempotency window rather than cross-request work suppression.
+  // It keeps a lost enqueue response safe even if the committed job reaches a
+  // terminal state before RemoteBuddy retries.
+  return TASK_EXECUTE_REQUEST_IDEMPOTENCY_COOLDOWN_MS;
 }
 
 function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata | null {
@@ -409,6 +481,10 @@ function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata |
   if (rootOrigin !== "autonomy" && autonomyOrigin !== "autonomy") return null;
 
   const payload = autonomy ?? root;
+  const validationIncidentRaw = asObject(payload.validationIncident ?? payload.validation_incident);
+  const validationIncidentId = String(
+    validationIncidentRaw?.incidentId ?? validationIncidentRaw?.incident_id ?? "",
+  ).trim();
   return {
     origin: "autonomy",
     objectiveId: String(payload.objectiveId ?? payload.objective_id ?? "").trim() || undefined,
@@ -416,6 +492,37 @@ function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata |
     snapshotId: String(payload.snapshotId ?? payload.snapshot_id ?? "").trim() || undefined,
     patternKey: String(payload.patternKey ?? payload.pattern_key ?? "").trim() || undefined,
     componentArea: asAutonomyComponentArea(payload.componentArea ?? payload.component_area),
+    ...(validationIncidentId
+      ? {
+          validationIncident: {
+            incidentId: validationIncidentId,
+            candidateSha:
+              String(
+                validationIncidentRaw?.candidateSha ?? validationIncidentRaw?.candidate_sha ?? "",
+              ).trim() || undefined,
+            candidateRef:
+              String(
+                validationIncidentRaw?.candidateRef ?? validationIncidentRaw?.candidate_ref ?? "",
+              ).trim() || undefined,
+            baselineSha:
+              String(
+                validationIncidentRaw?.baselineSha ?? validationIncidentRaw?.baseline_sha ?? "",
+              ).trim() || undefined,
+            validationScope:
+              String(
+                validationIncidentRaw?.validationScope ??
+                  validationIncidentRaw?.validation_scope ??
+                  "",
+              ).trim() || undefined,
+            failureFingerprint:
+              String(
+                validationIncidentRaw?.failureFingerprint ??
+                  validationIncidentRaw?.failure_fingerprint ??
+                  "",
+              ).trim() || undefined,
+          },
+        }
+      : {}),
     targetPaths: normalizeMetadataTargetPaths(payload.targetPaths ?? payload.target_paths),
     writeGlobs: normalizeMetadataWriteGlobs(payload.writeGlobs ?? payload.write_globs),
   };
@@ -1018,6 +1125,7 @@ export class RemoteBuddyOrchestrator {
   private readonly sessionId: string;
   private readonly authToken: string | null;
   private readonly fetchImpl: typeof fetch;
+  private readonly terminateProcessTreeImpl: typeof terminateProcessTree;
   private readonly repo: string;
   private readonly jobsDbPath: string;
   private readonly workerOnlineTtlMs: number;
@@ -1072,6 +1180,15 @@ export class RemoteBuddyOrchestrator {
   private jobsDb: Database | null = null;
   private disposed = false;
   private readonly sessionMonitorWsErrorCounts = new Map<string, number>();
+  private readonly requestLeaseHeartbeats = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setInterval>;
+      inFlight: boolean;
+      consecutiveFailures: number;
+      claimToken: string;
+    }
+  >();
 
   /** Serialises async request handling to preserve ordering */
   private chain: Promise<void> = Promise.resolve();
@@ -1105,11 +1222,13 @@ export class RemoteBuddyOrchestrator {
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
     fetchImpl?: typeof fetch;
+    terminateProcessTreeImpl?: typeof terminateProcessTree;
   }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.terminateProcessTreeImpl = opts.terminateProcessTreeImpl ?? terminateProcessTree;
     this.brain = opts.brain;
     this.idempotency = opts.idempotency;
     this.persistentMemory = opts.persistentMemory;
@@ -1322,11 +1441,15 @@ export class RemoteBuddyOrchestrator {
   ): Promise<boolean> {
     for (let attempt = 1; attempt <= maxRetries && !this.disposed; attempt++) {
       try {
-        const res = await this.fetchImpl(`${this.server}/sessions`, {
-          method: "POST",
-          headers: this.authHeaders(),
-          body: JSON.stringify({ sessionId }),
-        });
+        const res = await this.fetchServiceControl(
+          `${this.server}/sessions`,
+          {
+            method: "POST",
+            headers: this.authHeaders(),
+            body: JSON.stringify({ sessionId }),
+          },
+          STARTUP_SESSION_HTTP_TIMEOUT_MS,
+        );
         if (res.ok) return true;
       } catch {
         // retry
@@ -1343,6 +1466,231 @@ export class RemoteBuddyOrchestrator {
     const h: Record<string, string> = { "Content-Type": "application/json" };
     if (this.authToken) h["Authorization"] = `Bearer ${this.authToken}`;
     return h;
+  }
+
+  private fetchServiceControl(
+    input: string | URL | Request,
+    init?: RequestInit,
+    timeoutMs = SERVICE_CONTROL_HTTP_TIMEOUT_MS,
+  ): Promise<Response> {
+    return fetchBufferedWithHardDeadline({
+      input,
+      init,
+      timeoutMs,
+      fetchImpl: this.fetchImpl,
+      timeoutMessage: `RemoteBuddy service-control request timed out after ${timeoutMs}ms`,
+    });
+  }
+
+  private async fetchDurableRequestState(
+    requestIdRaw: string,
+    timeoutMs = REQUEST_TRANSITION_TIMEOUT_MS,
+  ): Promise<{
+    status: string;
+    agentId: string | null;
+    claimToken: string | null;
+    workerRequired: number;
+    handoffJobId: string | null;
+  } | null> {
+    const requestId = String(requestIdRaw ?? "").trim();
+    if (!requestId) return null;
+    try {
+      const payload = await withHardDeadline(
+        async (signal) => {
+          const response = await this.fetchServiceControl(
+            `${this.server}/requests/${encodeURIComponent(requestId)}`,
+            {
+              method: "GET",
+              headers: this.authHeaders(),
+              signal,
+            },
+          );
+          if (!response.ok) return null;
+          return (await response.json()) as {
+            request?: {
+              status?: unknown;
+              agentId?: unknown;
+              claimToken?: unknown;
+              workerRequired?: unknown;
+              handoffJobId?: unknown;
+            };
+          };
+        },
+        timeoutMs,
+        `request state lookup timed out after ${timeoutMs}ms`,
+      );
+      if (!payload?.request || typeof payload.request !== "object") return null;
+      return {
+        status: String(payload.request.status ?? "").trim(),
+        agentId:
+          typeof payload.request.agentId === "string" ? payload.request.agentId.trim() : null,
+        claimToken:
+          typeof payload.request.claimToken === "string" ? payload.request.claimToken.trim() : null,
+        workerRequired: Number(payload.request.workerRequired) === 1 ? 1 : 0,
+        handoffJobId:
+          typeof payload.request.handoffJobId === "string"
+            ? payload.request.handoffJobId.trim()
+            : null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async postRequestLifecycleTransition(params: {
+    requestId: string;
+    transition: "worker-handoff" | "complete";
+    body: Record<string, unknown>;
+    claimToken: string;
+    jobId?: string;
+    attempts?: number;
+    timeoutMs?: number;
+    retryDelayMs?: number;
+  }): Promise<{ ok: boolean; recoveredFromState?: boolean; detail?: string }> {
+    const transitionUrl = `${this.server}/requests/${encodeURIComponent(params.requestId)}/${params.transition}`;
+    let detail = "request lifecycle callback did not complete";
+    const maxAttempts = Math.max(
+      1,
+      Math.min(5, params.attempts ?? REQUEST_TRANSITION_MAX_ATTEMPTS),
+    );
+    const timeoutMs = Math.max(1, params.timeoutMs ?? REQUEST_TRANSITION_TIMEOUT_MS);
+    const retryDelayMs = Math.max(0, params.retryDelayMs ?? 150);
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await withHardDeadline(
+          async (signal) => {
+            const rawResponse = await this.fetchServiceControl(transitionUrl, {
+              method: "POST",
+              headers: this.authHeaders(),
+              body: JSON.stringify(params.body),
+              signal,
+            });
+            const responseDetail = rawResponse.ok
+              ? ""
+              : toSingleLine(await rawResponse.text().catch(() => ""), 500);
+            return {
+              ok: rawResponse.ok,
+              status: rawResponse.status,
+              responseDetail,
+            };
+          },
+          timeoutMs,
+          `request lifecycle callback timed out after ${timeoutMs}ms`,
+        );
+        if (response.ok) return { ok: true };
+        detail = `HTTP ${response.status}${response.responseDetail ? `: ${response.responseDetail}` : ""}`;
+        if ([400, 401, 403, 404].includes(response.status)) break;
+      } catch (error) {
+        detail = toSingleLine(error, 500) || "request lifecycle callback transport failed";
+      }
+      if (attempt < maxAttempts && retryDelayMs > 0) {
+        await Bun.sleep(retryDelayMs * attempt);
+      }
+    }
+
+    // The server may have committed a terminal transition before the response
+    // was lost. Confirm durable state before treating that ambiguity as a
+    // planning failure or trying an opposite terminal transition.
+    const state = await this.fetchDurableRequestState(params.requestId, timeoutMs);
+    const sameTerminalOwner =
+      state?.agentId === this.agentId && state?.claimToken === params.claimToken;
+    if (
+      params.transition === "complete" &&
+      state?.status === "completed" &&
+      (sameTerminalOwner ||
+        (Boolean(params.jobId) &&
+          state.workerRequired === 1 &&
+          state.handoffJobId === params.jobId))
+    ) {
+      return { ok: true, recoveredFromState: true };
+    }
+    if (
+      params.transition === "worker-handoff" &&
+      Boolean(params.jobId) &&
+      state?.workerRequired === 1 &&
+      state.handoffJobId === params.jobId &&
+      (state.status === "claimed" || state.status === "completed")
+    ) {
+      return { ok: true, recoveredFromState: true };
+    }
+    return { ok: false, detail };
+  }
+
+  private startRequestLeaseHeartbeat(
+    requestIdRaw: string,
+    claimTokenRaw: string,
+    options: { heartbeatMs?: number; leaseMs?: number; timeoutMs?: number } = {},
+  ): () => void {
+    const requestId = String(requestIdRaw ?? "").trim();
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!requestId || !claimToken) return () => {};
+    const heartbeatMs = Math.max(1, options.heartbeatMs ?? REQUEST_LEASE_HEARTBEAT_MS);
+    const leaseMs = Math.max(1, options.leaseMs ?? REQUEST_LEASE_MS);
+    const timeoutMs = Math.max(1, options.timeoutMs ?? REQUEST_LEASE_RENEW_TIMEOUT_MS);
+    const existing = this.requestLeaseHeartbeats.get(requestId);
+    if (existing) {
+      if (existing.claimToken === claimToken) {
+        return () => this.stopRequestLeaseHeartbeat(requestId, claimToken);
+      }
+      this.stopRequestLeaseHeartbeat(requestId, existing.claimToken);
+    }
+
+    const state = {
+      timer: null as unknown as ReturnType<typeof setInterval>,
+      inFlight: false,
+      consecutiveFailures: 0,
+      claimToken,
+    };
+    const renew = async () => {
+      if (this.disposed || state.inFlight || this.requestLeaseHeartbeats.get(requestId) !== state)
+        return;
+      state.inFlight = true;
+      try {
+        const response = await this.fetchServiceControl(
+          `${this.server}/requests/${encodeURIComponent(requestId)}/lease/renew`,
+          {
+            method: "POST",
+            headers: this.authHeaders(),
+            body: JSON.stringify({
+              agentId: this.agentId,
+              claimToken,
+              leaseMs,
+            }),
+            signal: AbortSignal.timeout(timeoutMs),
+          },
+        );
+        if (!response.ok) {
+          state.consecutiveFailures += 1;
+          console.warn(
+            `[RemoteBuddy] Request lease renewal failed for ${requestId.slice(0, 8)}: HTTP ${response.status}`,
+          );
+          return;
+        }
+        state.consecutiveFailures = 0;
+      } catch (error) {
+        state.consecutiveFailures += 1;
+        console.warn(
+          `[RemoteBuddy] Request lease renewal error for ${requestId.slice(0, 8)} ` +
+            `(attempt ${state.consecutiveFailures}): ${toSingleLine(error, 180)}`,
+        );
+      } finally {
+        state.inFlight = false;
+      }
+    };
+    state.timer = setInterval(() => void renew(), heartbeatMs);
+    state.timer.unref?.();
+    this.requestLeaseHeartbeats.set(requestId, state);
+    return () => this.stopRequestLeaseHeartbeat(requestId, claimToken);
+  }
+
+  private stopRequestLeaseHeartbeat(requestIdRaw: string, claimTokenRaw?: string): void {
+    const requestId = String(requestIdRaw ?? "").trim();
+    const state = this.requestLeaseHeartbeats.get(requestId);
+    if (!state) return;
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (claimToken && state.claimToken !== claimToken) return;
+    clearInterval(state.timer);
+    this.requestLeaseHeartbeats.delete(requestId);
   }
 
   private async assistantMessage(
@@ -1395,7 +1743,7 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchJobLogs(jobId: string, limit = 80): Promise<JobLogEntry[]> {
     try {
-      const res = await this.fetchImpl(
+      const res = await this.fetchServiceControl(
         `${this.server}/jobs/${jobId}/logs?limit=${Math.max(1, Math.min(500, limit))}`,
         {
           method: "GET",
@@ -1413,7 +1761,7 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchJobToolRuns(jobId: string, limit = 20): Promise<JobToolRunEntry[]> {
     try {
-      const res = await this.fetchImpl(
+      const res = await this.fetchServiceControl(
         `${this.server}/jobs/${jobId}/tool-runs?limit=${Math.max(1, Math.min(100, limit))}`,
         {
           method: "GET",
@@ -1470,7 +1818,7 @@ export class RemoteBuddyOrchestrator {
     query.set("feedbackLimit", "3");
     const suffix = query.toString();
     try {
-      const res = await this.fetchImpl(
+      const res = await this.fetchServiceControl(
         `${this.server}/autonomy/insights${suffix ? `?${suffix}` : ""}`,
         {
           method: "GET",
@@ -1889,50 +2237,95 @@ export class RemoteBuddyOrchestrator {
     sessionId: string,
     params: TaskExecuteJobParams,
     targetWorkerId: string | null = null,
-  ): Promise<EnqueueJobResult | null> {
-    try {
-      const payload: Record<string, unknown> = {
-        taskId,
-        sessionId,
-        kind,
-        params,
-      };
-      const dedupeKey = buildTaskExecuteDedupeKey(sessionId, params);
-      if (dedupeKey) payload.dedupeKey = dedupeKey;
-      const dedupeCooldownMs = resolveTaskExecuteDedupeCooldownMs(params, dedupeKey);
-      if (dedupeCooldownMs > 0) payload.dedupeCooldownMs = dedupeCooldownMs;
-      if (targetWorkerId) payload.targetWorkerId = targetWorkerId;
+    requestClaimToken: string | null = null,
+    retryOptions: { attempts?: number; timeoutMs?: number; retryDelayMs?: number } = {},
+  ): Promise<EnqueueJobResult | AmbiguousEnqueueJobResult | null> {
+    const payload: Record<string, unknown> = {
+      taskId,
+      sessionId,
+      kind,
+      params,
+      requestAgentId: this.agentId,
+      ...(requestClaimToken ? { requestClaimToken } : {}),
+    };
+    const targetedDedupeKey = buildTaskExecuteDedupeKey(sessionId, params);
+    const dedupeKey = targetedDedupeKey ?? buildTaskExecuteRequestDedupeKey(sessionId, params);
+    if (dedupeKey) payload.dedupeKey = dedupeKey;
+    const dedupeCooldownMs = resolveTaskExecuteDedupeCooldownMs(params, dedupeKey);
+    if (dedupeCooldownMs > 0) payload.dedupeCooldownMs = dedupeCooldownMs;
+    if (targetWorkerId) payload.targetWorkerId = targetWorkerId;
 
-      const res = await this.fetchImpl(`${this.server}/jobs/enqueue`, {
-        method: "POST",
-        headers: this.authHeaders(),
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const err = await res.text();
-        console.error(`[RemoteBuddy] Enqueue failed: ${res.status} ${err}`);
-        return null;
+    // Reuse byte-for-byte payload identity on retry. JobQueue's active dedupe
+    // key then returns the committed job if only the first response was lost.
+    const serializedPayload = JSON.stringify(payload);
+    let ambiguousDetail = "job enqueue acknowledgement was not received";
+    const maxAttempts = Math.max(1, Math.min(5, retryOptions.attempts ?? JOB_ENQUEUE_MAX_ATTEMPTS));
+    const timeoutMs = Math.max(1, retryOptions.timeoutMs ?? JOB_ENQUEUE_TIMEOUT_MS);
+    const retryDelayMs = Math.max(0, retryOptions.retryDelayMs ?? 150);
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const response = await withHardDeadline(
+          async (signal) => {
+            const res = await this.fetchServiceControl(`${this.server}/jobs/enqueue`, {
+              method: "POST",
+              headers: this.authHeaders(),
+              body: serializedPayload,
+              signal,
+            });
+            if (!res.ok) {
+              return {
+                ok: false as const,
+                status: res.status,
+                detail: toSingleLine(await res.text().catch(() => ""), 500),
+              };
+            }
+            return {
+              ok: true as const,
+              status: res.status,
+              data: (await res.json()) as {
+                ok: boolean;
+                jobId?: string;
+                taskId?: string;
+                deduped?: boolean;
+              },
+            };
+          },
+          timeoutMs,
+          `job enqueue timed out after ${timeoutMs}ms`,
+        );
+        if (!response.ok) {
+          const detail = `HTTP ${response.status}${response.detail ? `: ${response.detail}` : ""}`;
+          const retryableOrAmbiguous =
+            response.status === 408 || response.status === 429 || response.status >= 500;
+          if (!retryableOrAmbiguous) {
+            console.error(`[RemoteBuddy] Enqueue rejected: ${detail}`);
+            return null;
+          }
+          ambiguousDetail = detail;
+        } else {
+          const data = response.data;
+          const resolvedTaskId = String(data.taskId ?? taskId).trim();
+          if (data.ok && data.jobId && resolvedTaskId) {
+            return {
+              jobId: data.jobId,
+              taskId: resolvedTaskId,
+              deduped: data.deduped === true,
+            };
+          }
+          ambiguousDetail = "successful enqueue response did not include a durable job ID";
+        }
+      } catch (err) {
+        ambiguousDetail = toSingleLine(err, 500) || "job enqueue transport failed";
       }
-      const data = (await res.json()) as {
-        ok: boolean;
-        jobId?: string;
-        taskId?: string;
-        deduped?: boolean;
-      };
-      const resolvedTaskId = String(data.taskId ?? taskId).trim();
-      if (!data.ok || !data.jobId || !resolvedTaskId) {
-        console.error(`[RemoteBuddy] Enqueue response missing jobId:`, data);
-        return null;
+      if (attempt < maxAttempts && retryDelayMs > 0) {
+        await Bun.sleep(retryDelayMs * attempt);
       }
-      return {
-        jobId: data.jobId,
-        taskId: resolvedTaskId,
-        deduped: data.deduped === true,
-      };
-    } catch (err) {
-      console.error(`[RemoteBuddy] Enqueue error:`, err);
-      return null;
     }
+
+    console.warn(
+      `[RemoteBuddy] Job enqueue outcome is ambiguous after ${maxAttempts} attempt(s): ${ambiguousDetail}`,
+    );
+    return { ambiguous: true, detail: ambiguousDetail };
   }
 
   // ── Context tracking ───────────────────────────────────────────────────
@@ -2138,22 +2531,11 @@ export class RemoteBuddyOrchestrator {
       return settled;
     };
 
-    let exited = false;
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Best-effort signal; fallback handles stubborn child processes.
-    }
-    exited = await waitForExit(timeoutMs);
-
-    if (!exited) {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // Ignore and continue with final wait.
-      }
-      exited = await waitForExit(2_000);
-    }
+    await this.terminateProcessTreeImpl(proc, {
+      terminationTimeoutMs: timeoutMs,
+      exitGraceMs: 2_000,
+    });
+    const exited = await waitForExit(250);
 
     if (!exited) {
       console.warn(
@@ -2274,10 +2656,13 @@ export class RemoteBuddyOrchestrator {
 
   private async fetchWorkers(): Promise<WorkerSnapshot[]> {
     try {
-      const res = await this.fetchImpl(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
-        method: "GET",
-        headers: this.authHeaders(),
-      });
+      const res = await this.fetchServiceControl(
+        `${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`,
+        {
+          method: "GET",
+          headers: this.authHeaders(),
+        },
+      );
       if (!res.ok) return [];
       const data = (await res.json()) as { ok: boolean; workers?: WorkerSnapshot[] };
       return data.ok ? (data.workers ?? []) : [];
@@ -2286,14 +2671,17 @@ export class RemoteBuddyOrchestrator {
     }
   }
 
-  private async fetchWorkerAutoscaleSnapshot(): Promise<WorkerAutoscaleSnapshot | null> {
+  private async fetchWorkerAutoscaleSnapshot(
+    timeoutMs = SERVICE_CONTROL_HTTP_TIMEOUT_MS,
+  ): Promise<WorkerAutoscaleSnapshot | null> {
     try {
-      const res = await this.fetchImpl(
+      const res = await this.fetchServiceControl(
         `${this.server}/workers/autoscale?ttlMs=${this.workerOnlineTtlMs}`,
         {
           method: "GET",
           headers: this.authHeaders(),
         },
+        timeoutMs,
       );
       if (!res.ok) return null;
       const data = (await res.json()) as {
@@ -2508,6 +2896,7 @@ export class RemoteBuddyOrchestrator {
           stdin: "ignore",
           stdout: "inherit",
           stderr: "inherit",
+          detached: process.platform !== "win32",
         });
         this.managedWorkers.set(workerId, child);
         child.exited.then((code) => {
@@ -2668,29 +3057,37 @@ export class RemoteBuddyOrchestrator {
       forceLane?: TaskExecutionLane;
       metadata?: Record<string, unknown>;
       metadataJson?: string | null;
+      claimToken: string;
     },
     queueWaitMs = 0,
   ): Promise<void> {
     const requestId = String(request.id ?? "").trim();
     if (!requestId) return;
+    const claimToken = String(request.claimToken ?? "").trim();
+    if (!claimToken) {
+      console.error(`[RemoteBuddy] Claimed request ${requestId} did not include a fencing token.`);
+      return;
+    }
     const requestSessionId = String(request.sessionId ?? "").trim() || this.sessionId;
 
     await this.ensureSessionWithRetry(requestSessionId, 3, 250, 2_000);
     this.ensureSessionEventMonitor(requestSessionId);
 
-    if (this.idempotency.hasHandled(requestSessionId, requestId)) {
-      console.log(`[RemoteBuddy] Skipping already-handled request ${requestId}`);
-      return;
-    }
-    this.idempotency.markHandled(requestSessionId, requestId);
+    // RequestQueue's claim lease and terminal state are authoritative here.
+    // Marking the ID handled before a durable handoff made crash recovery skip
+    // the requeued request forever.
 
     const prompt = String(request.prompt ?? "").trim();
     if (!prompt) {
       console.warn(`[RemoteBuddy] Request ${requestId} missing prompt; marking failed`);
-      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
-        body: JSON.stringify({ message: "Request missing prompt" }),
+        body: JSON.stringify({
+          agentId: this.agentId,
+          claimToken,
+          message: "Request missing prompt",
+        }),
       }).catch(() => {});
       return;
     }
@@ -2724,6 +3121,7 @@ export class RemoteBuddyOrchestrator {
     const turnId = randomUUID();
     const eventFrom = autonomyMetadata ? `agent:${this.agentId}/autonomy` : undefined;
     const planningContext = this.buildPlanningContext(priority, requestSessionId);
+    let durableWorkerJob: EnqueueJobResult | null = null;
     this.rememberPersistentMemory(
       "request",
       `priority=${priority} prompt=${toSingleLine(prompt, 520)}`,
@@ -2744,13 +3142,11 @@ export class RemoteBuddyOrchestrator {
         forceLane,
       });
       if (autonomyMetadata) {
-        // For analysis intent from the engine, don't force to worker — let it fall through
-        // to the !requiresWorker branch where the autonomous engine will handle next steps.
-        if (plan.intent !== "analysis") {
-          plan.requires_worker = true;
-          plan.job_kind = "task.execute";
-          plan.lane = "worker";
-        }
+        // Autonomy requests are durably stored as worker-required. Do not let a
+        // planner classification silently downgrade that server-side invariant.
+        plan.requires_worker = true;
+        plan.job_kind = "task.execute";
+        plan.lane = "worker";
         plan.scope.read_anywhere = true;
         plan.scope.write_allowed = true;
         plan.scope.write_globs = [...autonomyMetadata.writeGlobs];
@@ -2782,16 +3178,11 @@ export class RemoteBuddyOrchestrator {
         requestSessionId,
       );
       const targetPath = targetPaths[0];
-      // forceWorker overrides "direct reply" short-circuit + planner requires_worker,
-      // except for analysis intent from the engine — those fall through so the autonomous
-      // engine can handle next-step dispatch rather than blindly queueing a worker job.
-      const isAnalysisFromEngine = plan.intent === "analysis" && Boolean(autonomyMetadata);
-      const requiresWorker =
-        forceWorker && !isAnalysisFromEngine
-          ? true
-          : this.shouldForceDirectReply(prompt, plan.intent)
-            ? false
-            : plan.requires_worker;
+      const requiresWorker = forceWorker
+        ? true
+        : this.shouldForceDirectReply(prompt, plan.intent)
+          ? false
+          : plan.requires_worker;
       console.log("[RemoteBuddy] Planner output:", { plan, targetPath, requiresWorker });
       let requiredValidationSteps: string[] = [];
       // when forcing worker, don't fail on "planner contract incomplete" — fill safe defaults.
@@ -2936,10 +3327,13 @@ export class RemoteBuddyOrchestrator {
           }
         }
 
-        await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
-          method: "POST",
-          headers: this.authHeaders(),
-          body: JSON.stringify({
+        const completionResult = await this.postRequestLifecycleTransition({
+          requestId,
+          transition: "complete",
+          claimToken,
+          body: {
+            agentId: this.agentId,
+            claimToken,
             result: {
               requiresWorker: false,
               intent: plan.intent,
@@ -2949,8 +3343,13 @@ export class RemoteBuddyOrchestrator {
               forceWorker,
               forceLane: forceLane ?? null,
             },
-          }),
-        }).catch(() => {});
+          },
+        });
+        if (!completionResult.ok) {
+          throw new Error(
+            `request completion was not durably acknowledged${completionResult.detail ? `: ${completionResult.detail}` : ""}`,
+          );
+        }
         this.rememberPersistentMemory(
           "decision",
           `completed_without_worker intent=${plan.intent} lane=deterministic`,
@@ -2974,10 +3373,12 @@ export class RemoteBuddyOrchestrator {
             correlationId: requestId,
             from: eventFrom,
           });
-          await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
+          await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
             method: "POST",
             headers: this.authHeaders(),
             body: JSON.stringify({
+              agentId: this.agentId,
+              claimToken,
               message: "WorkerPal backend unavailable",
               detail,
             }),
@@ -3068,6 +3469,9 @@ export class RemoteBuddyOrchestrator {
               ...(autonomyMetadata.componentArea
                 ? { componentArea: autonomyMetadata.componentArea }
                 : {}),
+              ...(autonomyMetadata.validationIncident
+                ? { validationIncident: autonomyMetadata.validationIncident }
+                : {}),
             },
           }
         : {
@@ -3075,14 +3479,19 @@ export class RemoteBuddyOrchestrator {
             origin: "user",
           };
 
-      const enqueueResult = await this.enqueueJob(
+      const enqueueOutcome = await this.enqueueJob(
         taskId,
         "task.execute",
         requestSessionId,
         params,
         targetWorkerId,
+        claimToken,
       );
+      const enqueueAmbiguous = Boolean(enqueueOutcome && "ambiguous" in enqueueOutcome);
+      const enqueueResult =
+        enqueueOutcome && !("ambiguous" in enqueueOutcome) ? enqueueOutcome : null;
       if (enqueueResult) {
+        durableWorkerJob = enqueueResult;
         const effectiveTaskId = enqueueResult.taskId;
         if (!enqueueResult.deduped) {
           await this.sendCommand(requestSessionId, {
@@ -3171,6 +3580,26 @@ export class RemoteBuddyOrchestrator {
           });
         }
       } else {
+        if (enqueueAmbiguous) {
+          const detail = (enqueueOutcome as AmbiguousEnqueueJobResult).detail;
+          console.warn(
+            `[RemoteBuddy] Request ${requestId.slice(0, 8)} has an ambiguous job enqueue; leaving its lease lifecycle recoverable: ${detail}`,
+          );
+          this.rememberPersistentMemory(
+            "handoff_reconciliation_pending",
+            `enqueue_acknowledgement_ambiguous detail=${detail}`,
+            requestId,
+            requestSessionId,
+          );
+          if (!autonomyMetadata) {
+            await this.assistantMessage(
+              requestSessionId,
+              "The WorkerPal enqueue acknowledgement was interrupted. I am preserving the request for automatic reconciliation instead of reporting a false failure.",
+              { turnId, correlationId: requestId, from: eventFrom },
+            );
+          }
+          return;
+        }
         if (!autonomyMetadata) {
           await this.assistantMessage(
             requestSessionId,
@@ -3184,14 +3613,51 @@ export class RemoteBuddyOrchestrator {
           requestId,
           requestSessionId,
         );
+        await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
+          method: "POST",
+          headers: this.authHeaders(),
+          body: JSON.stringify({
+            agentId: this.agentId,
+            claimToken,
+            message: "WorkerPal handoff failed",
+            detail:
+              "Planner required a worker, but no task.execute job was created. The request remains failed instead of being recorded as a completed dispatch.",
+          }),
+        }).catch(() => {});
+        return;
       }
 
-      await this.fetchImpl(`${this.server}/requests/${requestId}/complete`, {
-        method: "POST",
-        headers: this.authHeaders(),
-        body: JSON.stringify({
+      const handoffResult = await this.postRequestLifecycleTransition({
+        requestId,
+        transition: "worker-handoff",
+        claimToken,
+        jobId: enqueueResult.jobId,
+        body: {
+          agentId: this.agentId,
+          claimToken,
+          jobId: enqueueResult.jobId,
+          taskId: enqueueResult.taskId,
+        },
+      });
+      if (!handoffResult.ok) {
+        throw new Error(
+          `durable WorkerPal handoff was not acknowledged${handoffResult.detail ? `: ${handoffResult.detail}` : ""}`,
+        );
+      }
+
+      const completionResult = await this.postRequestLifecycleTransition({
+        requestId,
+        transition: "complete",
+        claimToken,
+        jobId: enqueueResult.jobId,
+        body: {
+          agentId: this.agentId,
+          claimToken,
           result: {
             requiresWorker: true,
+            jobId: enqueueResult.jobId,
+            taskId: enqueueResult.taskId,
+            deduped: enqueueResult.deduped,
             intent: plan.intent,
             lane,
             priority,
@@ -3206,9 +3672,27 @@ export class RemoteBuddyOrchestrator {
             forceWorker,
             forceLane: forceLane ?? null,
           },
-        }),
-      }).catch(() => {});
+        },
+      });
+      if (!completionResult.ok) {
+        throw new Error(
+          `request completion was not durably acknowledged${completionResult.detail ? `: ${completionResult.detail}` : ""}`,
+        );
+      }
     } catch (err) {
+      if (durableWorkerJob) {
+        const detail = toSingleLine(err, 400) || "request lifecycle callback was interrupted";
+        console.warn(
+          `[RemoteBuddy] Durable WorkerPal job ${durableWorkerJob.jobId.slice(0, 8)} exists for request ${requestId.slice(0, 8)}; server reconciliation will close the planning handoff after callback uncertainty: ${detail}`,
+        );
+        this.rememberPersistentMemory(
+          "handoff_reconciliation_pending",
+          `job=${durableWorkerJob.jobId} detail=${detail}`,
+          requestId,
+          requestSessionId,
+        );
+        return;
+      }
       const message = `RemoteBuddy planning failed: ${toSingleLine(err, 220) || "unknown error"}`;
       console.error(`[RemoteBuddy] ${message}`);
       this.rememberPersistentMemory("planning_failed", message, requestId, requestSessionId);
@@ -3217,10 +3701,12 @@ export class RemoteBuddyOrchestrator {
         correlationId: requestId,
         from: eventFrom,
       });
-      await this.fetchImpl(`${this.server}/requests/${requestId}/fail`, {
+      await this.fetchServiceControl(`${this.server}/requests/${requestId}/fail`, {
         method: "POST",
         headers: this.authHeaders(),
         body: JSON.stringify({
+          agentId: this.agentId,
+          claimToken,
           message: "RemoteBuddy planning failed",
           detail: String(err),
         }),
@@ -3235,10 +3721,14 @@ export class RemoteBuddyOrchestrator {
     while (!this.disposed) {
       try {
         await this.maybeAutoscaleWorkers();
-        const res = await this.fetchImpl(`${this.server}/requests/claim`, {
+        if (this.requestLeaseHeartbeats.size > 0) {
+          await Bun.sleep(pollMs);
+          continue;
+        }
+        const res = await this.fetchServiceControl(`${this.server}/requests/claim`, {
           method: "POST",
           headers: this.authHeaders(),
-          body: JSON.stringify({ agentId: this.agentId }),
+          body: JSON.stringify({ agentId: this.agentId, leaseMs: REQUEST_LEASE_MS }),
         });
 
         if (res.ok) {
@@ -3254,6 +3744,7 @@ export class RemoteBuddyOrchestrator {
               forceLane?: TaskExecutionLane;
               metadata?: Record<string, unknown>;
               metadataJson?: string | null;
+              claimToken: string;
             };
             queueWaitMs?: number;
           };
@@ -3264,10 +3755,16 @@ export class RemoteBuddyOrchestrator {
                 data.request.forceWorker ? ` (forceWorker=true)` : ""
               }`,
             );
-            // Serialize processing
+            const stopRequestLeaseHeartbeat = this.startRequestLeaseHeartbeat(
+              data.request.id,
+              data.request.claimToken,
+            );
+            // Serialize processing. The lease starts before the work enters the
+            // chain so queueing behind another planner cannot make it stale.
             this.chain = this.chain
               .then(() => this.processRequest(data.request!, Number(data.queueWaitMs ?? 0)))
-              .catch((err) => console.error("[RemoteBuddy] Process error:", err));
+              .catch((err) => console.error("[RemoteBuddy] Process error:", err))
+              .finally(stopRequestLeaseHeartbeat);
           }
         }
       } catch (err) {
@@ -3334,6 +3831,9 @@ export class RemoteBuddyOrchestrator {
       clearInterval(this.statusHeartbeatTimer);
       this.statusHeartbeatTimer = null;
     }
+    for (const requestId of Array.from(this.requestLeaseHeartbeats.keys())) {
+      this.stopRequestLeaseHeartbeat(requestId);
+    }
     void this.comm.status(this.agentId, "shutting_down", "RemoteBuddy shutting down");
     for (const [sessionId, stop] of this.sessionEventStops.entries()) {
       try {
@@ -3382,10 +3882,15 @@ async function connectWithRetry(
   while (true) {
     attempt++;
     try {
-      const res = await fetch(`${server}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sessionId ? { sessionId } : {}),
+      const res = await fetchBufferedWithHardDeadline({
+        input: `${server}/sessions`,
+        init: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(sessionId ? { sessionId } : {}),
+        },
+        timeoutMs: STARTUP_SESSION_HTTP_TIMEOUT_MS,
+        timeoutMessage: `RemoteBuddy session bootstrap timed out after ${STARTUP_SESSION_HTTP_TIMEOUT_MS}ms`,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
       const data = (await res.json()) as { sessionId: string };

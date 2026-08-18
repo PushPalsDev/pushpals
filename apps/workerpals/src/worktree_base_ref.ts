@@ -65,6 +65,39 @@ function isReviewResolutionType(value: string): boolean {
   return value === "review_fix" || value === "merge_conflict" || value === "integration_reconcile";
 }
 
+function validationIncidentLease(params: Record<string, unknown>): {
+  incidentId: string;
+  candidateSha: string;
+  candidateRef: string;
+} | null {
+  const autonomy =
+    params.autonomy && typeof params.autonomy === "object" && !Array.isArray(params.autonomy)
+      ? (params.autonomy as Record<string, unknown>)
+      : null;
+  const incident =
+    autonomy?.validationIncident &&
+    typeof autonomy.validationIncident === "object" &&
+    !Array.isArray(autonomy.validationIncident)
+      ? (autonomy.validationIncident as Record<string, unknown>)
+      : null;
+  if (!incident) return null;
+  const validationScope = String(incident.validationScope ?? incident.validation_scope ?? "")
+    .trim()
+    .toLowerCase();
+  if (validationScope !== "candidate_specific") return null;
+  const candidateSha = normalizeExpectedSha(incident.candidateSha ?? incident.candidate_sha);
+  const candidateRef = String(incident.candidateRef ?? incident.candidate_ref ?? "")
+    .trim()
+    .toLowerCase();
+  const incidentId = String(incident.incidentId ?? incident.incident_id ?? "").trim();
+  if (!/^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/candidate$/.test(candidateRef)) {
+    throw new Error(
+      `validation repair incident ${incidentId || "unknown"} is missing its exact retained candidate ref; refusing a generic base.`,
+    );
+  }
+  return candidateSha && incidentId ? { incidentId, candidateSha, candidateRef } : null;
+}
+
 export async function resolveReviewWorktreeBase(
   options: ResolveReviewWorktreeBaseOptions,
 ): Promise<string> {
@@ -79,7 +112,38 @@ export async function resolveReviewWorktreeBase(
       ? reviewAgent.resolutionType.trim().toLowerCase()
       : "";
   if (!reviewAgent || !isReviewResolutionType(resolutionType)) {
-    return options.fallback();
+    const incidentLease = validationIncidentLease(options.params);
+    if (!incidentLease) return options.fallback();
+    const verify = await options.git([
+      "rev-parse",
+      "--verify",
+      `${incidentLease.candidateRef}^{commit}`,
+    ]);
+    const actualSha = verify.ok
+      ? String(verify.stdout ?? "")
+          .trim()
+          .toLowerCase()
+      : "";
+    if (actualSha !== incidentLease.candidateSha) {
+      throw new Error(
+        `validation repair job ${options.jobId} could not verify exact candidate ${incidentLease.candidateSha} for incident ${incidentLease.incidentId}; refusing a generic base.`,
+      );
+    }
+    const existingGuidance =
+      typeof options.params.plannerWorkerInstruction === "string"
+        ? options.params.plannerWorkerInstruction.trim()
+        : "";
+    options.params.plannerWorkerInstruction = [
+      existingGuidance,
+      `Host SCM prepared validation incident ${incidentLease.incidentId} at exact candidate ${actualSha}. Edit and validate only; do not switch branches, rebase, merge, or push.`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    options.log?.(
+      "info",
+      `validation repair job ${options.jobId}: host verified exact candidate ${actualSha} for ${incidentLease.incidentId}.`,
+    );
+    return actualSha;
   }
 
   const headRef = normalizeReviewHeadRef(reviewAgent?.prHeadRef);

@@ -13,6 +13,17 @@ function heartbeatPayload(currentJobId: string | null = "job-1"): WorkerHeartbea
   };
 }
 
+function neverEndingBodyResponse(status = 200): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start() {
+        // Intentionally send headers without ever closing the response body.
+      },
+    }),
+    { status },
+  );
+}
+
 describe("workerpals server transport", () => {
   test("keeps heartbeat delivery independent from blocked job-log transport", async () => {
     let resolveLogRequest: (() => void) | null = null;
@@ -135,6 +146,70 @@ describe("workerpals server transport", () => {
 
     resolveHeartbeat?.();
     expect(await firstHeartbeat).toBe(true);
+  });
+
+  test("bounds heartbeat delivery when headers arrive but the body never finishes", async () => {
+    const warnings: string[] = [];
+    const transport = new WorkerServerTransport({
+      server: "http://127.0.0.1:3001",
+      headers: { "Content-Type": "application/json" },
+      workerId: "workerpal-test",
+      pollMs: 2_000,
+      heartbeatMs: 5_000,
+      heartbeatTimeoutMs: 20,
+      staleClaimTtlMs: 120_000,
+      logWarn: (message) => warnings.push(message),
+      fetchFn: (async () => neverEndingBodyResponse()) as typeof fetch,
+    });
+
+    const startedAt = Date.now();
+    expect(await transport.sendHeartbeat(heartbeatPayload())).toBe(false);
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(transport.getHealthSnapshot().heartbeatInFlight).toBe(false);
+    expect(warnings.join("\n")).toContain("request timed out after 20ms (/workers/heartbeat)");
+  });
+
+  test("a stalled queued response body cannot block heartbeats or later requests indefinitely", async () => {
+    const seenUrls: string[] = [];
+    const transport = new WorkerServerTransport({
+      server: "http://127.0.0.1:3001",
+      headers: { "Content-Type": "application/json" },
+      workerId: "workerpal-test",
+      pollMs: 2_000,
+      heartbeatMs: 5_000,
+      heartbeatTimeoutMs: 50,
+      requestTimeoutMs: 20,
+      staleClaimTtlMs: 120_000,
+      logWarn: () => undefined,
+      fetchFn: (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        seenUrls.push(url);
+        if (url.endsWith("/jobs/job-1/log")) return neverEndingBodyResponse();
+        return new Response("{}", { status: 200 });
+      }) as typeof fetch,
+    });
+
+    const stalledLog = transport.queueJobLog("job-1", {
+      stream: "stdout",
+      seq: 1,
+      message: "line 1",
+      ts: new Date().toISOString(),
+    });
+    await Promise.resolve();
+
+    expect(await transport.sendHeartbeat(heartbeatPayload())).toBe(true);
+    const laterCommand = transport.queueSessionCommand("session-1", {
+      type: "job_progress",
+      payload: { jobId: "job-1", message: "still working" },
+      from: "worker:workerpal-test",
+    });
+
+    await Promise.all([stalledLog, laterCommand, transport.flush(1_000)]);
+
+    expect(seenUrls).toContain("http://127.0.0.1:3001/workers/heartbeat");
+    expect(seenUrls).toContain("http://127.0.0.1:3001/sessions/session-1/command");
+    expect(transport.getHealthSnapshot().queuedRequests).toBe(0);
   });
 
   test("recycles after sustained heartbeat failures even before the first successful heartbeat", async () => {

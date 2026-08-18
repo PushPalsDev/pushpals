@@ -14,6 +14,8 @@ import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "crypto";
 import {
   extractTrustedValidationFailureEvidence,
+  MAX_TRUSTED_VALIDATION_COMMANDS,
+  normalizeTrustedValidationFingerprintLine,
   normalizeTrustedValidationCommands,
   type TrustedValidationExecutionResult,
   type TrustedValidationReport,
@@ -41,6 +43,8 @@ export interface CompletionRow {
   trustedValidationRecoveryAttempts: number;
   status: CompletionStatus;
   pusherId: string | null;
+  claimToken: string | null;
+  claimGeneration: number;
   claimedAt: string | null;
   leaseExpiresAt: string | null;
   lastHeartbeatAt: string | null;
@@ -61,6 +65,11 @@ export interface CompletionFinalizationResult {
   requeuedCompletionIds?: string[];
   requeuedJobIds?: string[];
 }
+
+export type CompletionProcessingAuthority = Pick<
+  CompletionRow,
+  "id" | "status" | "commitSha" | "branch" | "claimGeneration"
+>;
 
 // The original failure plus one recovery run is enough to distinguish a
 // transient host outage from an unchanged candidate failure. Further retries
@@ -140,7 +149,10 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
   const input = value as Record<string, unknown>;
   if (input.version !== 1 || !Array.isArray(input.results)) return null;
   const results: TrustedValidationExecutionResult[] = [];
-  for (const raw of input.results.slice(0, 16)) {
+  // One dependency-preparation phase plus two attempts for every allowed
+  // command is the largest valid report. Keeping that full envelope avoids
+  // dropping the successful terminal retry of the last command.
+  for (const raw of input.results.slice(0, MAX_TRUSTED_VALIDATION_COMMANDS * 2 + 2)) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     const result = raw as Record<string, unknown>;
     const command = trustedValidationText(result.command, 1_000);
@@ -155,6 +167,21 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
           ? 0
           : 1;
     const evidence = extractTrustedValidationFailureEvidence({ command, phase, output, exitCode });
+    const providedFailedTests = trustedValidationStringArray(result.failedTests);
+    const providedPathHints = trustedValidationStringArray(result.targetPathHints);
+    const providedFailureLines = trustedValidationStringArray(result.failureLines);
+    const failedTests = trustedValidationStringArray([
+      ...providedFailedTests,
+      ...evidence.failedTests,
+    ]);
+    const targetPathHints = trustedValidationStringArray([
+      ...providedPathHints,
+      ...evidence.targetPathHints,
+    ]);
+    const failureLines = trustedValidationStringArray([
+      ...providedFailureLines,
+      ...evidence.failureLines,
+    ]);
     results.push({
       ok,
       command,
@@ -170,30 +197,44 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
         ? {}
         : {
             failureClass: evidence.failureClass,
-            failedTests:
-              trustedValidationStringArray(result.failedTests).length > 0
-                ? trustedValidationStringArray(result.failedTests)
-                : evidence.failedTests,
-            targetPathHints:
-              trustedValidationStringArray(result.targetPathHints).length > 0
-                ? trustedValidationStringArray(result.targetPathHints)
-                : evidence.targetPathHints,
+            failedTests,
+            targetPathHints,
+            failureLines,
           }),
+      attempt:
+        typeof result.attempt === "number" && Number.isFinite(result.attempt)
+          ? Math.max(1, Math.min(10, Math.floor(result.attempt)))
+          : undefined,
+      retryReason:
+        result.retryReason === "transient_infrastructure" ? "transient_infrastructure" : undefined,
+      validationTarget:
+        result.validationTarget === "baseline" || result.validation_target === "baseline"
+          ? "baseline"
+          : "candidate",
+      baselineFailureProven:
+        result.baselineFailureProven === true || result.baseline_failure_proven === true,
     });
   }
+  const candidateSha = trustedValidationText(input.candidateSha, 128) || null;
+  const candidateRef = trustedValidationText(input.candidateRef, 512) || null;
+  const hasExactCandidateProvenance = Boolean(candidateSha && candidateRef);
   return {
     version: 1,
     baselineSha: trustedValidationText(input.baselineSha, 128) || null,
-    candidateSha: trustedValidationText(input.candidateSha, 128) || null,
+    candidateSha: hasExactCandidateProvenance ? candidateSha : null,
+    candidateRef: hasExactCandidateProvenance ? candidateRef : null,
     results,
   };
 }
 
 function trustedValidationFailureFingerprint(result: TrustedValidationExecutionResult): string {
+  const failureLines = trustedValidationStringArray(result.failureLines).map(
+    normalizeTrustedValidationFingerprintLine,
+  );
   const fallback = result.output
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .split(/\r?\n/)
-    .map((line) => line.trim().replace(/\b\d+(?:\.\d+)?(?:ms|s)\b/gi, "<duration>"))
+    .map(normalizeTrustedValidationFingerprintLine)
     .filter((line) => /\b(?:error|fail|failed|failure|timeout)\b/i.test(line))
     .slice(0, 4);
   return createHash("sha256")
@@ -201,12 +242,17 @@ function trustedValidationFailureFingerprint(result: TrustedValidationExecutionR
       JSON.stringify({
         command: result.command.trim().replace(/\s+/g, " ").toLowerCase(),
         failureClass: result.failureClass ?? "trusted_validation_failed",
-        failedTests: trustedValidationStringArray(result.failedTests),
-        targetPathHints: trustedValidationStringArray(result.targetPathHints),
-        fallback:
-          (result.failedTests?.length ?? 0) > 0 || (result.targetPathHints?.length ?? 0) > 0
-            ? []
-            : fallback,
+        failedTests: trustedValidationStringArray(result.failedTests).map(
+          normalizeTrustedValidationFingerprintLine,
+        ),
+        targetPathHints: trustedValidationStringArray(result.targetPathHints).map(
+          normalizeTrustedValidationFingerprintLine,
+        ),
+        // Failure lines stay in the identity even when a path/test was parsed.
+        // That prevents two different assertions in the same broad suite from
+        // collapsing into one cross-job repair incident.
+        failureLines,
+        fallback: failureLines.length > 0 ? [] : fallback,
       }),
     )
     .digest("hex")
@@ -215,6 +261,35 @@ function trustedValidationFailureFingerprint(result: TrustedValidationExecutionR
 
 function trustedValidationCommandKey(value: unknown): string {
   return typeof value === "string" ? value.trim().replace(/\s+/g, " ").toLowerCase() : "";
+}
+
+function completionHandoffMatches(
+  existing: CompletionRow,
+  expected: {
+    jobId: string;
+    sessionId: string;
+    origin: "user" | "autonomy";
+    commitSha: string | undefined;
+    branch: string | undefined;
+    message: string;
+    prUrl: string | null;
+    prTitle: string | null;
+    prBody: string | null;
+    trustedValidationCommandsJson: string | null;
+  },
+): boolean {
+  return (
+    existing.jobId === expected.jobId &&
+    existing.sessionId === expected.sessionId &&
+    existing.origin === expected.origin &&
+    (existing.commitSha ?? null) === (expected.commitSha ?? null) &&
+    (existing.branch ?? null) === (expected.branch ?? null) &&
+    existing.message === expected.message &&
+    (expected.prUrl === null || (existing.prUrl ?? null) === expected.prUrl) &&
+    (existing.prTitle ?? null) === expected.prTitle &&
+    (existing.prBody ?? null) === expected.prBody &&
+    (existing.trustedValidationCommandsJson ?? null) === expected.trustedValidationCommandsJson
+  );
 }
 
 export class CompletionQueue {
@@ -248,6 +323,8 @@ export class CompletionQueue {
         trustedValidationRecoveryAttempts INTEGER NOT NULL DEFAULT 0,
         status     TEXT NOT NULL DEFAULT 'pending',
         pusherId   TEXT,
+        claimToken TEXT,
+        claimGeneration INTEGER NOT NULL DEFAULT 0,
         claimedAt  TEXT,
         leaseExpiresAt TEXT,
         lastHeartbeatAt TEXT,
@@ -302,6 +379,14 @@ export class CompletionQueue {
     if (!columns.some((col) => col.name === "claimedAt")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN claimedAt TEXT;`);
     }
+    if (!columns.some((col) => col.name === "claimToken")) {
+      this.db.exec(`ALTER TABLE completions ADD COLUMN claimToken TEXT;`);
+    }
+    if (!columns.some((col) => col.name === "claimGeneration")) {
+      this.db.exec(
+        `ALTER TABLE completions ADD COLUMN claimGeneration INTEGER NOT NULL DEFAULT 0;`,
+      );
+    }
     if (!columns.some((col) => col.name === "leaseExpiresAt")) {
       this.db.exec(`ALTER TABLE completions ADD COLUMN leaseExpiresAt TEXT;`);
     }
@@ -315,6 +400,29 @@ export class CompletionQueue {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_completions_lease_expiry ON completions(status, leaseExpiresAt);`,
     );
+
+    const migrationNow = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE completions
+         SET claimGeneration = COALESCE(claimGeneration, 0)
+         WHERE claimGeneration IS NULL`,
+      )
+      .run();
+    this.db
+      .prepare(
+        `UPDATE completions
+         SET status = 'pending',
+             pusherId = NULL,
+             claimToken = NULL,
+             claimedAt = NULL,
+             leaseExpiresAt = NULL,
+             lastHeartbeatAt = NULL,
+             updatedAt = ?
+         WHERE status = 'claimed'
+           AND (claimToken IS NULL OR claimToken = '')`,
+      )
+      .run(migrationNow);
 
     this.recoverExpiredClaims();
     this.reconcileLegacyParentJobStates();
@@ -567,30 +675,42 @@ export class CompletionQueue {
 
         const existing = this.db
           .prepare(
-            `SELECT id FROM completions
-             WHERE jobId = ? AND status IN ('pending', 'claimed')
+            `SELECT * FROM completions
+             WHERE jobId = ?
              ORDER BY createdAt DESC
              LIMIT 1`,
           )
-          .get(jobId) as { id: string } | undefined;
-        if (existing && job.status === "finalizing") {
+          .get(jobId) as CompletionRow | undefined;
+        if (existing) {
+          const exactRetry = completionHandoffMatches(existing, {
+            jobId,
+            sessionId,
+            origin,
+            commitSha,
+            branch,
+            message,
+            prUrl,
+            prTitle,
+            prBody,
+            trustedValidationCommandsJson,
+          });
+          if (!exactRetry) {
+            return {
+              ok: false as const,
+              message: `Job already has completion ${existing.id} with different immutable handoff metadata`,
+            };
+          }
           return {
             ok: true as const,
             completionId: existing.id,
             deduped: true,
-            jobStatus: "finalizing" as const,
+            ...(job.status === "finalizing" ? { jobStatus: "finalizing" as const } : {}),
           };
         }
         if (job.status !== "claimed") {
           return {
             ok: false as const,
             message: `Job is ${job.status}; expected claimed before completion handoff`,
-          };
-        }
-        if (existing) {
-          return {
-            ok: false as const,
-            message: `Job already has active completion ${existing.id}`,
           };
         }
       }
@@ -680,29 +800,31 @@ export class CompletionQueue {
    * Atomically claim the next pending completion (FIFO by createdAt)
    */
   claim(
-    pusherId: string,
-    options: { leaseMs?: number; reconcilePusher?: boolean } = {},
+    pusherIdRaw: string,
+    options: { leaseMs?: number } = {},
   ): { ok: boolean; completion?: CompletionRow; message?: string } {
     const now = new Date().toISOString();
+    const pusherId = String(pusherIdRaw ?? "").trim();
+    if (!pusherId) return { ok: false, message: "pusherId is required" };
+    const claimToken = randomUUID();
     const leaseMs = normalizeCompletionLeaseMs(options.leaseMs);
     const leaseExpiresAt = new Date(Date.parse(now) + leaseMs).toISOString();
 
     const tx = this.db.transaction(() => {
       this.recoverExpiredClaims(now);
-      if (options.reconcilePusher) {
-        this.db
-          .prepare(
-            `UPDATE completions
-             SET status = 'pending',
-                 pusherId = NULL,
-                 claimedAt = NULL,
-                 leaseExpiresAt = NULL,
-                 lastHeartbeatAt = NULL,
-                 updatedAt = ?
-             WHERE status = 'claimed' AND pusherId = ?`,
-          )
-          .run(now, pusherId);
-      }
+      const activeClaim = this.db
+        .prepare(
+          `SELECT id FROM completions
+           WHERE status = 'claimed'
+             AND pusherId = ?
+             AND claimToken IS NOT NULL
+             AND claimToken != ''
+             AND leaseExpiresAt IS NOT NULL
+             AND leaseExpiresAt > ?
+           LIMIT 1`,
+        )
+        .get(pusherId, now) as { id: string } | null;
+      if (activeClaim?.id) return null;
       const row = this.db
         .prepare(
           `SELECT * FROM completions WHERE status = 'pending' ORDER BY createdAt ASC LIMIT 1`,
@@ -716,6 +838,8 @@ export class CompletionQueue {
           `UPDATE completions
            SET status = 'claimed',
                pusherId = ?,
+               claimToken = ?,
+               claimGeneration = COALESCE(claimGeneration, 0) + 1,
                claimedAt = ?,
                leaseExpiresAt = ?,
                lastHeartbeatAt = ?,
@@ -723,7 +847,7 @@ export class CompletionQueue {
                updatedAt = ?
            WHERE id = ? AND status = 'pending'`,
         )
-        .run(pusherId, now, leaseExpiresAt, now, now, row.id);
+        .run(pusherId, claimToken, now, leaseExpiresAt, now, now, row.id);
 
       return this.getCompletion(row.id);
     });
@@ -735,10 +859,15 @@ export class CompletionQueue {
 
   renewLease(
     completionId: string,
-    pusherId: string,
+    pusherIdRaw: string,
+    claimTokenRaw: string,
     options: { leaseMs?: number } = {},
   ): { ok: boolean; leaseExpiresAt?: string; message?: string } {
     const now = new Date().toISOString();
+    const pusherId = String(pusherIdRaw ?? "").trim();
+    if (!pusherId) return { ok: false, message: "pusherId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
     const leaseExpiresAt = new Date(
       Date.parse(now) + normalizeCompletionLeaseMs(options.leaseMs),
     ).toISOString();
@@ -749,10 +878,11 @@ export class CompletionQueue {
          WHERE id = ?
            AND status = 'claimed'
            AND pusherId = ?
+           AND claimToken = ?
            AND leaseExpiresAt IS NOT NULL
            AND leaseExpiresAt > ?`,
       )
-      .run(now, leaseExpiresAt, now, completionId, pusherId, now);
+      .run(now, leaseExpiresAt, now, completionId, pusherId, claimToken, now);
     if (result.changes === 0) {
       return {
         ok: false,
@@ -780,6 +910,7 @@ export class CompletionQueue {
         `UPDATE completions
        SET status = 'pending',
            pusherId = NULL,
+           claimToken = NULL,
            claimedAt = NULL,
            leaseExpiresAt = NULL,
            lastHeartbeatAt = NULL,
@@ -798,9 +929,14 @@ export class CompletionQueue {
   markProcessed(
     completionId: string,
     prUrl?: string | null,
-    pusherId?: string | null,
+    pusherIdRaw?: string | null,
+    claimTokenRaw?: string | null,
   ): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
+    const pusherId = String(pusherIdRaw ?? "").trim();
+    if (!pusherId) return { ok: false, message: "pusherId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
     const normalizedPrUrl =
       typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
 
@@ -811,15 +947,12 @@ export class CompletionQueue {
              prUrl = COALESCE(?, prUrl),
              updatedAt = ?
          WHERE id = ? AND status = 'claimed'
-           AND (
-             ? IS NULL OR (
-               pusherId = ?
-               AND leaseExpiresAt IS NOT NULL
-               AND leaseExpiresAt > ?
-             )
-           )`,
+           AND pusherId = ?
+           AND claimToken = ?
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?`,
       )
-      .run(normalizedPrUrl, now, completionId, pusherId ?? null, pusherId ?? null, now);
+      .run(normalizedPrUrl, now, completionId, pusherId, claimToken, now);
 
     if (info.changes === 0) {
       return { ok: false, message: "Completion not found or not in claimed state" };
@@ -834,23 +967,25 @@ export class CompletionQueue {
   markFailed(
     completionId: string,
     error: string,
-    pusherId?: string | null,
+    pusherIdRaw?: string | null,
+    claimTokenRaw?: string | null,
   ): { ok: boolean; message?: string } {
     const now = new Date().toISOString();
+    const pusherId = String(pusherIdRaw ?? "").trim();
+    if (!pusherId) return { ok: false, message: "pusherId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
 
     const info = this.db
       .prepare(
         `UPDATE completions SET status = 'failed', error = ?, updatedAt = ?
          WHERE id = ? AND status = 'claimed'
-           AND (
-             ? IS NULL OR (
-               pusherId = ?
-               AND leaseExpiresAt IS NOT NULL
-               AND leaseExpiresAt > ?
-             )
-           )`,
+           AND pusherId = ?
+           AND claimToken = ?
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?`,
       )
-      .run(error, now, completionId, pusherId ?? null, pusherId ?? null, now);
+      .run(error, now, completionId, pusherId, claimToken, now);
 
     if (info.changes === 0) {
       return { ok: false, message: "Completion not found or not in claimed state" };
@@ -868,9 +1003,14 @@ export class CompletionQueue {
     prUrl?: string | null,
     trustedTiming?: TrustedValidationTiming,
     trustedReportInput?: unknown,
-    pusherId?: string | null,
+    pusherIdRaw?: string | null,
+    claimTokenRaw?: string | null,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
+    const pusherId = String(pusherIdRaw ?? "").trim();
+    if (!pusherId) return { ok: false, message: "pusherId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
     const normalizedPrUrl =
       typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
     const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
@@ -878,18 +1018,16 @@ export class CompletionQueue {
     const tx = this.db.transaction((): CompletionFinalizationResult => {
       const completion = this.getCompletion(completionId);
       if (!completion) return { ok: false, message: "Completion not found" };
+      if (completion.pusherId !== pusherId || completion.claimToken !== claimToken) {
+        return { ok: false, message: "Completion claim token is stale or owned by another pusher" };
+      }
       if (completion.status === "processed") {
         return { ok: true, jobId: completion.jobId, jobTransitioned: false };
       }
       if (completion.status !== "claimed") {
         return { ok: false, message: "Completion not in claimed state" };
       }
-      if (
-        pusherId &&
-        (completion.pusherId !== pusherId ||
-          !completion.leaseExpiresAt ||
-          completion.leaseExpiresAt <= now)
-      ) {
+      if (!completion.leaseExpiresAt || completion.leaseExpiresAt <= now) {
         return { ok: false, message: "Completion lease is expired or owned by another pusher" };
       }
       const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId) as
@@ -914,13 +1052,10 @@ export class CompletionQueue {
                error = NULL,
                updatedAt = ?
            WHERE id = ? AND status = 'claimed'
-             AND (
-               ? IS NULL OR (
-                 pusherId = ?
-                 AND leaseExpiresAt IS NOT NULL
-                 AND leaseExpiresAt > ?
-               )
-             )`,
+             AND pusherId = ?
+             AND claimToken = ?
+             AND leaseExpiresAt IS NOT NULL
+             AND leaseExpiresAt > ?`,
         )
         .run(
           normalizedPrUrl,
@@ -929,8 +1064,8 @@ export class CompletionQueue {
           normalizedTiming.installCacheHit,
           now,
           completionId,
-          pusherId ?? null,
-          pusherId ?? null,
+          pusherId,
+          claimToken,
           now,
         );
       if (completionUpdated.changes === 0) {
@@ -1004,27 +1139,30 @@ export class CompletionQueue {
     error: string,
     trustedTiming?: TrustedValidationTiming,
     trustedReportInput?: unknown,
-    pusherId?: string | null,
+    pusherIdRaw?: string | null,
+    claimTokenRaw?: string | null,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
+    const pusherId = String(pusherIdRaw ?? "").trim();
+    if (!pusherId) return { ok: false, message: "pusherId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
     const failure = String(error || "Unknown publication error");
     const normalizedTiming = normalizeTrustedValidationTiming(trustedTiming);
     const trustedReport = normalizeTrustedValidationReport(trustedReportInput);
     const tx = this.db.transaction((): CompletionFinalizationResult => {
       const completion = this.getCompletion(completionId);
       if (!completion) return { ok: false, message: "Completion not found" };
+      if (completion.pusherId !== pusherId || completion.claimToken !== claimToken) {
+        return { ok: false, message: "Completion claim token is stale or owned by another pusher" };
+      }
       if (completion.status === "failed") {
         return { ok: true, jobId: completion.jobId, jobTransitioned: false };
       }
       if (completion.status !== "claimed") {
         return { ok: false, message: "Completion not in claimed state" };
       }
-      if (
-        pusherId &&
-        (completion.pusherId !== pusherId ||
-          !completion.leaseExpiresAt ||
-          completion.leaseExpiresAt <= now)
-      ) {
+      if (!completion.leaseExpiresAt || completion.leaseExpiresAt <= now) {
         return { ok: false, message: "Completion lease is expired or owned by another pusher" };
       }
       const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId) as
@@ -1048,13 +1186,10 @@ export class CompletionQueue {
                error = ?,
                updatedAt = ?
            WHERE id = ? AND status = 'claimed'
-             AND (
-               ? IS NULL OR (
-                 pusherId = ?
-                 AND leaseExpiresAt IS NOT NULL
-                 AND leaseExpiresAt > ?
-               )
-             )`,
+             AND pusherId = ?
+             AND claimToken = ?
+             AND leaseExpiresAt IS NOT NULL
+             AND leaseExpiresAt > ?`,
         )
         .run(
           normalizedTiming.installDurationMs,
@@ -1063,8 +1198,8 @@ export class CompletionQueue {
           failure,
           now,
           completionId,
-          pusherId ?? null,
-          pusherId ?? null,
+          pusherId,
+          claimToken,
           now,
         );
       if (completionUpdated.changes === 0) {
@@ -1160,6 +1295,7 @@ export class CompletionQueue {
       }
       const failedTests = trustedValidationStringArray(result.failedTests);
       const targetPathHints = trustedValidationStringArray(result.targetPathHints);
+      const failureLines = trustedValidationStringArray(result.failureLines);
       const failureFingerprint = result.ok ? null : trustedValidationFailureFingerprint(result);
       insert.run(
         completion.jobId,
@@ -1175,10 +1311,17 @@ export class CompletionQueue {
           phase: result.phase,
           cached: Boolean(result.cached),
           baselineSha: report.baselineSha,
-          candidateSha: completion.commitSha ?? report.candidateSha,
+          candidateSha: report.candidateSha,
+          candidateRef: report.candidateRef,
           failureFingerprint,
+          failureFingerprintVersion: 3,
           failedTests,
           targetPathHints,
+          failureLines,
+          attempt: result.attempt ?? null,
+          retryReason: result.retryReason ?? null,
+          validationTarget: result.validationTarget ?? "candidate",
+          baselineFailureProven: Boolean(result.baselineFailureProven),
         }),
         now,
       );
@@ -1283,6 +1426,10 @@ export class CompletionQueue {
           `UPDATE completions
            SET status = 'pending',
                pusherId = NULL,
+               claimToken = NULL,
+               claimedAt = NULL,
+               leaseExpiresAt = NULL,
+               lastHeartbeatAt = NULL,
                error = NULL,
                trustedValidationRecoveryAttempts = trustedValidationRecoveryAttempts + 1,
                updatedAt = ?
@@ -1359,6 +1506,22 @@ export class CompletionQueue {
       (this.db
         .prepare(`SELECT * FROM completions WHERE id = ?`)
         .get(completionId) as CompletionRow) ?? null
+    );
+  }
+
+  /**
+   * Return only the immutable identity and terminal state needed by
+   * SourceControlManager's retained-ref garbage collector. The collector must
+   * not infer success from a missing row or a list scan that may be truncated.
+   */
+  getCompletionProcessingAuthority(completionId: string): CompletionProcessingAuthority | null {
+    return (
+      (this.db
+        .prepare(
+          `SELECT id, status, commitSha, branch, claimGeneration
+           FROM completions WHERE id = ?`,
+        )
+        .get(completionId) as CompletionProcessingAuthority) ?? null
     );
   }
 

@@ -16,8 +16,8 @@
 import { createHash, randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
-import { basename, isAbsolute, relative, resolve } from "path";
-import { loadPushPalsConfig } from "shared";
+import { isAbsolute, relative, resolve } from "path";
+import { fetchWithHardDeadline, loadPushPalsConfig } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { ExecutorBackend, JobDiagnostics, JobTokenUsage } from "./common/types.js";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
@@ -62,12 +62,46 @@ const WORKERPAL_HOST_CODEX_AUTH_PATH = "/run/pushpals/host-codex-auth.json";
 const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
 const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
+const DOCKER_CONTROL_TIMEOUT_MS = 30_000;
+const DOCKER_PROBE_TIMEOUT_MS = 15_000;
+const DOCKER_SELF_CHECK_TIMEOUT_MS = 60_000;
+const HOST_GIT_CONTROL_TIMEOUT_MS = 60_000;
 const BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS = 3;
 const BROWSER_VALIDATION_JOB_OVERHEAD_MS = 5 * 60_000;
 const BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS = 20 * 60_000;
 const BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS = 45 * 60_000;
 const DOCKER_EXEC_TREE_TERMINATION_TIMEOUT_MS = 5_000;
 const DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS = 2_000;
+const DOCKER_TIMEOUT_RECYCLE_TIMEOUT_MS = 15_000;
+const DOCKER_CAPTURE_MAX_CHARS = 2_000_000;
+const DOCKER_STREAM_TRUNCATION_MARKER = "[PushPals] Earlier process output truncated";
+const DOCKER_PENDING_LINE_MAX_CHARS = 64 * 1024;
+const DOCKER_PENDING_LINE_TRUNCATION_MARKER =
+  "[PushPals] Oversized unterminated process-output line truncated; continuing to drain";
+const DEPENDENCY_SNAPSHOT_MAX_ENTRIES = 8;
+const DEPENDENCY_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
+
+export async function probeWorkerLlmHttpEndpointStatus(
+  probe: string,
+  timeoutMs = 2_500,
+  fetchFn: typeof fetch = fetch,
+): Promise<number> {
+  const boundedTimeoutMs = Math.max(1, Math.floor(timeoutMs));
+  return fetchWithHardDeadline({
+    input: probe,
+    init: {
+      method: "GET",
+      headers: { Accept: "application/json, text/plain, */*" },
+    },
+    timeoutMs: boundedTimeoutMs,
+    fetchImpl: fetchFn,
+    timeoutMessage: `WorkerPal LLM endpoint probe timed out after ${boundedTimeoutMs}ms`,
+    consume: async (response) => {
+      if (response.body) await response.body.cancel();
+      return response.status;
+    },
+  });
+}
 
 async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -83,8 +117,81 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<
   }
 }
 
+async function readCapturedProcessStream(
+  readable: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  maxChars = DOCKER_CAPTURE_MAX_CHARS,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  const reader = readable.getReader();
+  let captured = "";
+  const abortReader = () => {
+    try {
+      void reader.cancel().catch(() => {});
+    } catch {
+      // Reader already closed.
+    }
+  };
+  signal.addEventListener("abort", abortReader, { once: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      captured += decoder.decode(value, { stream: true });
+      if (captured.length > maxChars) {
+        captured = `[output truncated to final ${maxChars} characters]\n${captured.slice(-maxChars)}`;
+      }
+    }
+    captured += decoder.decode();
+    return captured;
+  } catch (error) {
+    if (!signal.aborted) throw error;
+    return captured;
+  } finally {
+    signal.removeEventListener("abort", abortReader);
+    try {
+      reader.releaseLock();
+    } catch {
+      // Reader already released or cancelled.
+    }
+  }
+}
+
 export function buildWindowsDockerExecTreeTerminationArgv(pid: number): string[] {
   return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+
+export function buildDockerRuntimeCapabilityCanaryCommand(backend: ExecutorBackend): string {
+  const requiredTools = ["git", "bun", "node", "flock", "sha256sum", "readlink"];
+  const backendRuntimeCheck =
+    backend === "openai_codex"
+      ? [
+          "if command -v codex >/dev/null 2>&1; then codex_runtime=codex;",
+          "elif command -v bunx >/dev/null 2>&1; then codex_runtime=bunx;",
+          'else echo "Neither codex nor bunx is available" >&2; exit 1; fi',
+        ].join(" ")
+      : "codex_runtime=not-required";
+  return [
+    "set -eu",
+    ...requiredTools.map((tool) => `command -v ${tool} >/dev/null`),
+    'PY="/workspace/.venv/bin/python"',
+    'if [ ! -x "$PY" ]; then PY="$(command -v python3 || command -v python || true)"; fi',
+    '[ -n "$PY" ] && [ -x "$PY" ]',
+    backendRuntimeCheck,
+    'dependency_store="/workspace/.pushpals/dependency-store"',
+    'test -d "$dependency_store" && test -w "$dependency_store"',
+    'dependency_probe="$dependency_store/.pushpals-capability-$$"',
+    'rm -rf -- "$dependency_probe"',
+    'mkdir "$dependency_probe"',
+    'printf pushpals > "$dependency_probe/source"',
+    'ln "$dependency_probe/source" "$dependency_probe/link"',
+    'test "$(cat "$dependency_probe/link")" = pushpals',
+    'rm -rf -- "$dependency_probe"',
+    "printf 'runtime_tools=%s codex_runtime=%s docker_socket=%s dependency_store=write-delete-ok\\n' " +
+      `${shellSingleQuote(`${requiredTools.join(",")},python`)} ` +
+      '"$codex_runtime" ' +
+      '"$(if [ -S /var/run/docker.sock ]; then printf available; else printf trusted-host-only; fi)"',
+  ].join("\n");
 }
 
 export function resolveOpenAiCodexContainerHome(configured: string | undefined): string {
@@ -195,12 +302,75 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
-export function buildWorktreeDependencyPreparationCommand(containerWorktreePath: string): string {
+function buildDependencySnapshotGcFunctionCommand(): string {
+  return [
+    "gc_dependency_snapshots() {",
+    '  gc_cache_root="$1"',
+    '  gc_current_key="${2:-}"',
+    '  gc_now="$(date +%s)"',
+    "  find \"$gc_cache_root\" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\\n' | sort -nr | (",
+    "    gc_snapshot_count=0",
+    "    while IFS=' ' read -r gc_mtime gc_snapshot_root; do",
+    '      [ -n "$gc_snapshot_root" ] || continue',
+    '      gc_snapshot_name="${gc_snapshot_root##*/}"',
+    "      if ! printf '%s' \"$gc_snapshot_name\" | grep -Eq '^[0-9a-f]{64}$'; then continue; fi",
+    "      gc_snapshot_count=$((gc_snapshot_count + 1))",
+    '      [ "$gc_snapshot_name" != "$gc_current_key" ] || continue',
+    '      if find "$store_root/projections" -type f -name .pushpals-dependency-snapshot -exec grep -Fqx "$gc_snapshot_name" {} \\; -print -quit | grep -q .; then continue; fi',
+    '      gc_mtime_seconds="${gc_mtime%%.*}"',
+    "      gc_age_seconds=$((gc_now - gc_mtime_seconds))",
+    '      if [ "$gc_snapshot_count" -le "$dependency_snapshot_max_entries" ] && [ "$gc_age_seconds" -le "$dependency_snapshot_max_age_seconds" ]; then continue; fi',
+    '      exec 8>"$gc_snapshot_root.lock"',
+    "      if ! flock -n 8; then exec 8>&-; continue; fi",
+    '      if find "$store_root/projections" -type f -name .pushpals-dependency-snapshot -exec grep -Fqx "$gc_snapshot_name" {} \\; -print -quit | grep -q .; then flock -u 8; exec 8>&-; continue; fi',
+    '      rm -rf -- "$gc_snapshot_root"',
+    "      flock -u 8",
+    "      exec 8>&-",
+    "    done",
+    "  )",
+    "}",
+  ].join("\n");
+}
+
+export function buildDependencyStoreReconciliationCommand(
+  dependencyStoreRoot = "/workspace/.pushpals/dependency-store",
+  hostWorktreeRoot = "/repo/.worktrees",
+): string {
+  const storeRoot = shellSingleQuote(dependencyStoreRoot);
+  const worktreeRoot = shellSingleQuote(hostWorktreeRoot);
+  return [
+    "set -eu",
+    `store_root=${storeRoot}`,
+    `worktree_root=${worktreeRoot}`,
+    `dependency_snapshot_max_entries=${DEPENDENCY_SNAPSHOT_MAX_ENTRIES}`,
+    `dependency_snapshot_max_age_seconds=${DEPENDENCY_SNAPSHOT_MAX_AGE_SECONDS}`,
+    buildDependencySnapshotGcFunctionCommand(),
+    'mkdir -p "$store_root/snapshots" "$store_root/projections"',
+    'find "$store_root/projections" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r projection_root; do',
+    '  projection_id="${projection_root##*/}"',
+    '  case "$projection_id" in job-*|selfcheck-*) ;; *) continue ;; esac',
+    '  if [ ! -d "$worktree_root/$projection_id" ]; then rm -rf -- "$projection_root"; fi',
+    "done",
+    'for dependency_cache_root in "$store_root"/snapshots/linux-*; do',
+    '  [ -d "$dependency_cache_root" ] || continue',
+    '  gc_dependency_snapshots "$dependency_cache_root" ""',
+    "done",
+  ].join("\n");
+}
+
+export function buildWorktreeDependencyPreparationCommand(
+  containerWorktreePath: string,
+  dependencyStoreRoot = "/workspace/.pushpals/dependency-store",
+): string {
   const worktree = shellSingleQuote(containerWorktreePath);
+  const storeRoot = shellSingleQuote(dependencyStoreRoot);
   return [
     "set -eu",
     `worktree=${worktree}`,
-    'store_root="/workspace/.pushpals/dependency-store"',
+    `store_root=${storeRoot}`,
+    `dependency_snapshot_max_entries=${DEPENDENCY_SNAPSHOT_MAX_ENTRIES}`,
+    `dependency_snapshot_max_age_seconds=${DEPENDENCY_SNAPSHOT_MAX_AGE_SECONDS}`,
+    buildDependencySnapshotGcFunctionCommand(),
     "worktree_id=\"$(printf '%s' \"${worktree##*/}\" | tr -cd 'A-Za-z0-9_.-')\"",
     'projection_root="$store_root/projections/$worktree_id"',
     'projection_node_modules="$projection_root/node_modules"',
@@ -214,12 +384,16 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '  dependency_cache_root="$store_root/snapshots/linux-$(uname -m)"',
     '  mkdir -p "$dependency_cache_root"',
     `  snapshot_key="$( { printf 'projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
-    "  if jq -e '.workspaces != null' \"$worktree/package.json\" >/dev/null 2>&1; then",
-    '    snapshot_key="$snapshot_key-$worktree_id"',
-    "  fi",
     '  snapshot_root="$dependency_cache_root/$snapshot_key"',
     '  snapshot_ready="$snapshot_root/.pushpals-dependency-ready"',
     '  snapshot_lock="$snapshot_root.lock"',
+    '  workspace_placeholder="/__pushpals_worktree__"',
+    '  exec 9>"$snapshot_lock"',
+    "  progress snapshot_lock 10",
+    "  if ! flock -w 300 9; then",
+    "    printf 'Timed out waiting for Linux-native dependency snapshot lock: %s\\n' \"$snapshot_lock\" >&2",
+    "    exit 1",
+    "  fi",
     // The shared files are read-only, but the worker runs as root and can
     // technically override that permission. Detect any content write by its
     // mtime and invalidate the snapshot before another job projects it.
@@ -228,10 +402,8 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '    rm -f "$snapshot_ready"',
     "  fi",
     '  if [ -f "$snapshot_ready" ]; then progress snapshot_cache_hit 25; else progress snapshot_cache_miss 10; fi',
-    "  wait_count=0",
-    '  while [ ! -f "$snapshot_ready" ]; do',
-    '    if mkdir "$snapshot_lock" 2>/dev/null; then',
-    '      cleanup_dependency_install() { rm -rf "$worktree/node_modules"; rm -rf "$snapshot_root"; rmdir "$snapshot_lock" 2>/dev/null || true; }',
+    '  if [ ! -f "$snapshot_ready" ]; then',
+    '      cleanup_dependency_install() { rm -rf "$worktree/node_modules"; rm -rf "$snapshot_root"; }',
     "      trap cleanup_dependency_install EXIT INT TERM",
     '      rm -rf "$snapshot_root"',
     '      mkdir -p "$snapshot_root/node_modules"',
@@ -241,19 +413,23 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '      (cd "$worktree" && bun install --frozen-lockfile --ignore-scripts >&2)',
     "      progress install_complete 70",
     '      rm -f "$worktree/node_modules"',
+    // Replace workspace links with a stable placeholder before caching. Bun
+    // emits absolute links into the ephemeral worktree; projections restore
+    // those links for their own exact worktree without changing cache keys.
+    '      find "$snapshot_root/node_modules" -type l -print | while IFS= read -r workspace_link; do',
+    '        resolved_link="$(readlink -f "$workspace_link" 2>/dev/null || true)"',
+    '        case "$resolved_link" in',
+    '          "$worktree") workspace_relative="" ;;',
+    '          "$worktree"/*) workspace_relative="${resolved_link#"$worktree"/}" ;;',
+    "          *) continue ;;",
+    "        esac",
+    '        rm -f "$workspace_link"',
+    '        ln -s "$workspace_placeholder${workspace_relative:+/$workspace_relative}" "$workspace_link"',
+    "      done",
     '      find "$snapshot_root/node_modules" -type f -exec chmod a-w {} +',
     '      printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"',
-    '      rmdir "$snapshot_lock"',
     "      trap - EXIT INT TERM",
-    "    else",
-    "      wait_count=$((wait_count + 1))",
-    '      if [ "$wait_count" -ge 300 ]; then',
-    "        printf 'Timed out waiting for Linux-native dependency snapshot lock: %s\\n' \"$snapshot_lock\" >&2",
-    "        exit 1",
-    "      fi",
-    "      sleep 1",
-    "    fi",
-    "  done",
+    "  fi",
     '  src="$snapshot_root/node_modules"',
     "  progress projection 80",
     '  rm -rf "$projection_root"',
@@ -262,6 +438,17 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     // The recursive hardlink clone is now entirely Linux-native and never
     // traverses the Windows bind mount.
     '  cp -al "$src/." "$projection_node_modules/"',
+    '  find "$projection_node_modules" -type l -print | while IFS= read -r workspace_link; do',
+    '    workspace_target="$(readlink "$workspace_link" 2>/dev/null || true)"',
+    '    case "$workspace_target" in',
+    '      "$workspace_placeholder"|"$workspace_placeholder"/*)',
+    '        workspace_relative="${workspace_target#"$workspace_placeholder"}"',
+    '        workspace_relative="${workspace_relative#/}"',
+    '        rm -f "$workspace_link"',
+    '        ln -s "$worktree${workspace_relative:+/$workspace_relative}" "$workspace_link"',
+    "        ;;",
+    "    esac",
+    "  done",
     '  rm -rf "$projection_node_modules/.cache" "$projection_node_modules/.expo" "$projection_node_modules/.vite" "$projection_node_modules/.vite-temp"',
     "  for mutable in .cache .expo .vite .vite-temp; do",
     '    mkdir -p "$projection_node_modules/$mutable"',
@@ -271,6 +458,8 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '  printf \'%s\\n\' "$snapshot_key" > "$projection_node_modules/.pushpals-validation-safe-dependency-snapshot"',
     '  rm -rf "$worktree/node_modules"',
     '  ln -s "$projection_node_modules" "$worktree/node_modules"',
+    '  gc_dependency_snapshots "$dependency_cache_root" "$snapshot_key"',
+    "  flock -u 9",
     '  linked="$linked node_modules-container-native"',
     "else",
     "  progress host_fallback 20",
@@ -279,9 +468,6 @@ export function buildWorktreeDependencyPreparationCommand(containerWorktreePath:
     '    dest="$worktree/$name"',
     '    if { [ -e "$src" ] || [ -L "$src" ]; }; then',
     `      snapshot_key="$( { printf 'projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}\\nbun=%s\\n' "$(bun --version)"; for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"; do [ ! -f "$manifest" ] || sha256sum "$manifest" | cut -d " " -f 1; done; } | sha256sum | cut -d " " -f 1)"`,
-    "      if jq -e '.workspaces != null' \"$worktree/package.json\" >/dev/null 2>&1; then",
-    '        snapshot_key="$snapshot_key-$worktree_id"',
-    "      fi",
     '      rm -rf "$projection_root"',
     '      mkdir -p "$projection_node_modules"',
     '      for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do',
@@ -682,6 +868,8 @@ export class DockerExecutor {
   private lastLoggedExecutionConfig = "";
   private lastLoggedEndpointRewrite = "";
   private warmedBackends = new Set<string>();
+  private preparedDependencyProjectionIds = new Set<string>();
+  private dependencyStoreReconciled = false;
   private preparedMergeConflictJobs = new Set<string>();
   private mergeConflictRefreshPromise: Promise<void> | null = null;
   private readonly config: WorkerpalsRuntimeConfig;
@@ -912,8 +1100,27 @@ export class DockerExecutor {
       await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath);
       await this.ensureWorktreeAccessibleInWarmContainer(worktreePath);
+      const backend = this.currentBackend();
+      const capabilityCheck = await this.runWarmShell(
+        buildDockerRuntimeCapabilityCanaryCommand(backend),
+        { timeoutMs: 15_000 },
+      );
+      if (!capabilityCheck.ok) {
+        throw new Error(
+          `Docker runtime capability canary failed: ${
+            capabilityCheck.stderr || capabilityCheck.stdout || `exit ${capabilityCheck.exitCode}`
+          }`,
+        );
+      }
       console.log(
-        `[DockerExecutor] Startup self-check passed (git/worktree in container and warm container).`,
+        `[DockerExecutor] Runtime capability canary passed (${capabilityCheck.stdout.trim()}).`,
+      );
+      // Use the backend's production warmup probe here as well. This validates
+      // the executable fallback, Python wrapper, and configured auth mode
+      // before the worker advertises itself as ready for a real job.
+      await this.ensureBackendWarmup(backend);
+      console.log(
+        `[DockerExecutor] Startup self-check passed (git/worktree, runtime tools, dependency store, and backend readiness).`,
       );
     } finally {
       await this.removeWorktree(worktreePath).catch(() => {
@@ -962,36 +1169,57 @@ export class DockerExecutor {
     await this.ensureFreshWorktreePath(worktreePath);
 
     // Create worktree from configured base ref (detached)
-    let proc = Bun.spawn(["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef)], {
-      cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    let exitCode = await proc.exited;
-    let stdout = await new Response(proc.stdout).text();
-    let stderr = await new Response(proc.stderr).text();
-    let detail = [stderr, stdout].filter(Boolean).join("\n").trim();
-
-    if (exitCode !== 0 && /already registered worktree/i.test(detail)) {
-      const prune = Bun.spawn(["git", "worktree", "prune"], {
+    let result = await this.runHostCommandCapture(
+      ["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef)],
+      {
         cwd: this.options.repo,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      await prune.exited;
+        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+      },
+    );
+    let exitCode = result.exitCode;
+    let stdout = result.stdout;
+    let stderr = result.stderr;
+    let detail = [
+      stderr,
+      stdout,
+      result.timedOut ? `git worktree add timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms` : "",
+    ]
+      .filter(Boolean)
+      .join("\n")
+      .trim();
 
-      proc = Bun.spawn(["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef, true)], {
+    if (!result.timedOut && exitCode !== 0 && /already registered worktree/i.test(detail)) {
+      const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
         cwd: this.options.repo,
-        stdout: "pipe",
-        stderr: "pipe",
+        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
       });
-      exitCode = await proc.exited;
-      stdout = await new Response(proc.stdout).text();
-      stderr = await new Response(proc.stderr).text();
-      detail = [stderr, stdout].filter(Boolean).join("\n").trim();
+      if (prune.timedOut) {
+        throw new Error(`git worktree prune timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`);
+      }
+
+      result = await this.runHostCommandCapture(
+        ["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef, true)],
+        {
+          cwd: this.options.repo,
+          timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+        },
+      );
+      exitCode = result.exitCode;
+      stdout = result.stdout;
+      stderr = result.stderr;
+      detail = [
+        stderr,
+        stdout,
+        result.timedOut
+          ? `forced git worktree add timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+        .trim();
     }
 
-    if (exitCode !== 0) {
+    if (result.timedOut || exitCode !== 0) {
       throw new Error(`Failed to create worktree from ${baseRef}: ${detail}`);
     }
 
@@ -1069,31 +1297,37 @@ export class DockerExecutor {
    */
   private async removeWorktree(worktreePath: string): Promise<void> {
     // Remove worktree
-    const proc = Bun.spawn(["git", "worktree", "remove", "--force", "--force", worktreePath], {
-      cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const removal = await this.runHostCommandCapture(
+      ["git", "worktree", "remove", "--force", "--force", worktreePath],
+      {
+        cwd: this.options.repo,
+        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+      },
+    );
 
-    const stdoutPromise = new Response(proc.stdout).text();
-    const stderrPromise = new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-
-    if (exitCode !== 0) {
-      console.warn(`[DockerExecutor] Worktree removal warning: ${stderr || stdout}`);
+    if (removal.timedOut || removal.exitCode !== 0) {
+      console.warn(
+        `[DockerExecutor] Worktree removal warning: ${
+          removal.timedOut
+            ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`
+            : removal.stderr || removal.stdout || `exit ${removal.exitCode}`
+        }`,
+      );
     }
 
     // Also prune worktree list
-    const prune = Bun.spawn(["git", "worktree", "prune"], {
+    const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
       cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
     });
-    const pruneExit = await prune.exited;
-    if (pruneExit !== 0) {
-      const pruneStderr = await new Response(prune.stderr).text();
-      console.warn(`[DockerExecutor] Worktree prune warning: ${pruneStderr}`);
+    if (prune.timedOut || prune.exitCode !== 0) {
+      console.warn(
+        `[DockerExecutor] Worktree prune warning: ${
+          prune.timedOut
+            ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`
+            : prune.stderr || prune.stdout || `exit ${prune.exitCode}`
+        }`,
+      );
     }
 
     const forced = await forceDeleteWorktreePath(worktreePath, {
@@ -1109,17 +1343,67 @@ export class DockerExecutor {
   }
 
   private async cleanupContainerDependencyProjection(worktreePath: string): Promise<void> {
-    const worktreeId = basename(worktreePath).replace(/[^A-Za-z0-9_.-]/g, "");
-    if (!worktreeId) return;
+    const worktreeId = this.dependencyProjectionId(worktreePath);
+    if (!worktreeId || !this.preparedDependencyProjectionIds.has(worktreeId)) return;
+    const projectionPath = `/workspace/.pushpals/dependency-store/projections/${worktreeId}`;
+    const command = `rm -rf ${shellSingleQuote(projectionPath)}`;
     try {
-      await this.runWarmShell(
-        `rm -rf ${shellSingleQuote(`/workspace/.pushpals/dependency-store/projections/${worktreeId}`)}`,
-        { timeoutMs: 30_000 },
-      );
+      const cleanup = await this.runWarmShell(command, { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS });
+      if (cleanup.ok) {
+        this.preparedDependencyProjectionIds.delete(worktreeId);
+        return;
+      }
     } catch {
-      // The warm container may already have been recycled. A later projection
-      // with the same worktree id removes the stale container-native path.
+      // Fall through to a one-shot volume cleanup if the warm container is gone.
     }
+
+    try {
+      const cleanup = await this.runDockerCommandCapture(
+        [
+          resolveDockerExecutable(),
+          "run",
+          "--rm",
+          "--network",
+          "none",
+          "--mount",
+          `type=volume,source=${this.dependencyVolumeName},target=/workspace/.pushpals/dependency-store`,
+          "--entrypoint",
+          "/bin/sh",
+          this.options.imageName,
+          "-lc",
+          command,
+        ],
+        { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS },
+      );
+      if (!cleanup.timedOut && cleanup.exitCode === 0) {
+        this.preparedDependencyProjectionIds.delete(worktreeId);
+        return;
+      }
+      console.warn(
+        `[DockerExecutor] Dependency projection cleanup was not confirmed for ${worktreeId}: ${
+          cleanup.timedOut
+            ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms`
+            : cleanup.stderr || cleanup.stdout || `exit ${cleanup.exitCode}`
+        }`,
+      );
+    } catch (error) {
+      console.warn(
+        `[DockerExecutor] Dependency projection cleanup failed for ${worktreeId}: ${this.compactError(error)}`,
+      );
+    }
+    // Keep failed cleanup IDs retryable. The next warm-container startup or
+    // worker shutdown reconciles them after their host worktrees disappear.
+    this.dependencyStoreReconciled = false;
+  }
+
+  private dependencyProjectionId(worktreePath: string): string {
+    return (
+      String(worktreePath ?? "")
+        .replace(/\\/g, "/")
+        .split("/")
+        .filter(Boolean)
+        .at(-1) ?? ""
+    ).replace(/[^A-Za-z0-9_.-]/g, "");
   }
 
   /**
@@ -1242,7 +1526,11 @@ export class DockerExecutor {
     this.clearIdleTimer();
     this.idleTimer = setTimeout(() => {
       if (this.activeJobs > 0) return;
-      void this.stopWarmContainer("idle timeout");
+      void this.stopWarmContainer("idle timeout").catch((error) => {
+        console.warn(
+          `[DockerExecutor] Idle warm-container cleanup failed: ${this.compactError(error)}`,
+        );
+      });
     }, this.options.idleTimeoutMs);
   }
 
@@ -1320,27 +1608,51 @@ export class DockerExecutor {
 
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
 
-    const proc = Bun.spawn([resolveDockerExecutable(), ...args], {
-      stdout: "pipe",
-      stderr: "pipe",
+    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), ...args], {
+      timeoutMs: DOCKER_CONTROL_TIMEOUT_MS,
     });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
-    if (exitCode !== 0) {
+    if (result.timedOut || result.exitCode !== 0) {
       throw new Error(
-        `Failed to start warm container (exit ${exitCode}): ${
-          stderr.trim() || stdout.trim() || "no docker output"
+        `Failed to start warm container (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${
+          result.stderr || result.stdout || "no docker output"
         }`,
       );
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
+    await this.reconcileContainerDependencyStore();
+  }
+
+  private async reconcileContainerDependencyStore(): Promise<void> {
+    if (this.dependencyStoreReconciled && this.preparedDependencyProjectionIds.size === 0) return;
+    try {
+      const result = await this.runWarmShell(buildDependencyStoreReconciliationCommand(), {
+        timeoutMs: DOCKER_CONTROL_TIMEOUT_MS,
+      });
+      if (!result.ok) {
+        this.dependencyStoreReconciled = false;
+        console.warn(
+          `[DockerExecutor] Dependency store reconciliation was not confirmed: ${
+            result.stderr || result.stdout || `exit ${result.exitCode}`
+          }`,
+        );
+        return;
+      }
+      for (const worktreeId of this.preparedDependencyProjectionIds) {
+        if (!existsSync(resolve(this.worktreeDir, worktreeId))) {
+          this.preparedDependencyProjectionIds.delete(worktreeId);
+        }
+      }
+      this.dependencyStoreReconciled = true;
+    } catch (error) {
+      this.dependencyStoreReconciled = false;
+      console.warn(
+        `[DockerExecutor] Dependency store reconciliation failed: ${this.compactError(error)}`,
+      );
+    }
   }
 
   private async ensureNamedVolume(name: string, component: string): Promise<void> {
-    const volume = Bun.spawn(
+    const result = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
         "volume",
@@ -1351,17 +1663,12 @@ export class DockerExecutor {
         `pushpals.repo=${this.options.repo}`,
         name,
       ],
-      { stdout: "pipe", stderr: "pipe" },
+      { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS },
     );
-    const [volumeExitCode, volumeStdout, volumeStderr] = await Promise.all([
-      volume.exited,
-      new Response(volume.stdout).text(),
-      new Response(volume.stderr).text(),
-    ]);
-    if (volumeExitCode !== 0) {
+    if (result.timedOut || result.exitCode !== 0) {
       throw new Error(
-        `Failed to prepare ${component} volume (exit ${volumeExitCode}): ${
-          volumeStderr.trim() || volumeStdout.trim() || "no docker output"
+        `Failed to prepare ${component} volume (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${
+          result.stderr || result.stdout || "no docker output"
         }`,
       );
     }
@@ -1429,7 +1736,7 @@ export class DockerExecutor {
   }
 
   private async ensureWarmContainer(): Promise<void> {
-    const inspect = Bun.spawn(
+    const inspect = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
         "inspect",
@@ -1437,17 +1744,14 @@ export class DockerExecutor {
         "{{.State.Running}}|{{.HostConfig.NetworkMode}}",
         this.warmContainerName,
       ],
-      { stdout: "pipe", stderr: "pipe" },
+      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
     );
-    const [exitCode, stdout] = await Promise.all([
-      inspect.exited,
-      new Response(inspect.stdout).text(),
-    ]);
-    if (exitCode === 0) {
-      const [runningRaw, networkModeRaw] = stdout.trim().split("|");
+    if (!inspect.timedOut && inspect.exitCode === 0) {
+      const [runningRaw, networkModeRaw] = inspect.stdout.trim().split("|");
       const running = runningRaw?.trim() === "true";
       const networkMode = (networkModeRaw ?? "").trim();
       if (running && networkMode === this.options.networkMode) {
+        await this.reconcileContainerDependencyStore();
         return;
       }
       if (running && networkMode && networkMode !== this.options.networkMode) {
@@ -1475,10 +1779,8 @@ export class DockerExecutor {
     const timeoutMs =
       typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)
         ? Math.max(1_000, Math.floor(options.timeoutMs))
-        : 0;
-    const effectiveCommand = timeoutMs
-      ? `timeout --signal=TERM --kill-after=5s ${Math.max(1, Math.ceil(timeoutMs / 1_000))}s /bin/sh -lc ${shellSingleQuote(command)}`
-      : command;
+        : DOCKER_PROBE_TIMEOUT_MS;
+    const effectiveCommand = `timeout --signal=TERM --kill-after=5s ${Math.max(1, Math.ceil(timeoutMs / 1_000))}s /bin/sh -lc ${shellSingleQuote(command)}`;
     const proc = Bun.spawn(
       [
         resolveDockerExecutable(),
@@ -1498,6 +1800,7 @@ export class DockerExecutor {
     const stdout = proc.stdout;
     const stderr = proc.stderr;
     if (!isReadableByteStream(stdout) || !isReadableByteStream(stderr)) {
+      await terminateDockerExecProcessTree(proc);
       throw new Error("warm shell stdout/stderr pipes were not available");
     }
     const streamAbort = new AbortController();
@@ -1507,31 +1810,38 @@ export class DockerExecutor {
     ]);
     let hostTimer: ReturnType<typeof setTimeout> | null = null;
     let hostTimedOut = false;
+    let processExitCode: number | null = null;
     try {
-      if (timeoutMs) {
-        const outcome = await Promise.race([
-          streams.then(() => "streams" as const),
-          new Promise<"timeout">((resolvePromise) => {
-            hostTimer = setTimeout(() => resolvePromise("timeout"), timeoutMs + 10_000);
-          }),
-        ]);
-        if (outcome === "timeout") {
-          hostTimedOut = true;
-          await terminateDockerExecProcessTree(proc);
-          const drained = await settleWithin(
-            streams.catch(() => undefined),
-            DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
-          );
-          if (drained === null) {
-            streamAbort.abort();
-            await settleWithin(
-              streams.catch(() => undefined),
-              250,
-            );
-          }
-        }
+      const streamFailure = streams.then(
+        () => new Promise<never>(() => {}),
+        (error) => ({ kind: "stream_error" as const, error }),
+      );
+      const outcome = await Promise.race([
+        proc.exited.then((exitCode) => ({ kind: "exit" as const, exitCode })),
+        streamFailure,
+        new Promise<{ kind: "timeout" }>((resolvePromise) => {
+          hostTimer = setTimeout(() => resolvePromise({ kind: "timeout" }), timeoutMs + 10_000);
+        }),
+      ]);
+      if (outcome.kind === "stream_error") {
+        throw outcome.error;
+      }
+      if (outcome.kind === "timeout") {
+        hostTimedOut = true;
+        await terminateDockerExecProcessTree(proc);
       } else {
-        await streams;
+        processExitCode = outcome.exitCode;
+      }
+      const drained = await settleWithin(
+        streams.catch(() => undefined),
+        DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
+      );
+      if (drained === null) {
+        streamAbort.abort();
+        await settleWithin(
+          streams.catch(() => undefined),
+          250,
+        );
       }
     } catch (error) {
       streamAbort.abort();
@@ -1540,9 +1850,10 @@ export class DockerExecutor {
     } finally {
       if (hostTimer) clearTimeout(hostTimer);
     }
-    const exitCode = hostTimedOut
-      ? ((await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS)) ?? 124)
-      : await proc.exited;
+    const exitCode =
+      processExitCode ??
+      (await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS)) ??
+      124;
     const timedOut = hostTimedOut || exitCode === 124;
     return {
       ok: !timedOut && exitCode === 0,
@@ -1558,13 +1869,45 @@ export class DockerExecutor {
     };
   }
 
+  private async runBoundedDockerControl(args: string[], timeoutMs: number): Promise<boolean> {
+    try {
+      const result = await this.runDockerCommandCapture([resolveDockerExecutable(), ...args], {
+        timeoutMs,
+      });
+      return !result.timedOut && result.exitCode === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private async recycleWarmContainerAfterExecutionTimeout(
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): Promise<void> {
+    // Backend readiness belongs to a specific container process. Never let a
+    // timed-out exec leave the replacement marked warm before it is probed.
+    this.warmedBackends.clear();
+    const restarted = await this.runBoundedDockerControl(
+      ["restart", "-t", "1", this.warmContainerName],
+      DOCKER_TIMEOUT_RECYCLE_TIMEOUT_MS,
+    );
+    if (restarted) return;
+
+    const warning = `[DockerExecutor] Timed-out warm container could not be restarted cleanly; removing it before the next job.`;
+    console.warn(warning);
+    onLog?.("stderr", warning);
+    await this.runBoundedDockerControl(
+      ["rm", "-f", this.warmContainerName],
+      DOCKER_TIMEOUT_RECYCLE_TIMEOUT_MS,
+    );
+  }
+
   private async runWarmWorktreeProbe(containerWorktreePath: string): Promise<{
     ok: boolean;
     stdout: string;
     stderr: string;
     exitCode: number;
   }> {
-    const proc = Bun.spawn(
+    const result = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
         "exec",
@@ -1575,26 +1918,22 @@ export class DockerExecutor {
         "-lc",
         "git rev-parse --is-inside-work-tree && git rev-parse --git-dir",
       ],
-      {
-        stdout: "pipe",
-        stderr: "pipe",
-      },
+      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
     );
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
     return {
-      ok: exitCode === 0,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      exitCode,
+      ok: !result.timedOut && result.exitCode === 0,
+      stdout: result.stdout,
+      stderr: result.timedOut
+        ? [result.stderr, `Docker worktree probe timed out after ${DOCKER_PROBE_TIMEOUT_MS}ms.`]
+            .filter(Boolean)
+            .join("\n")
+        : result.stderr,
+      exitCode: result.timedOut ? 124 : result.exitCode,
     };
   }
 
   private async inspectWarmContainerState(): Promise<string> {
-    const proc = Bun.spawn(
+    const result = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
         "inspect",
@@ -1602,36 +1941,29 @@ export class DockerExecutor {
         "running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} oom={{.State.OOMKilled}}",
         this.warmContainerName,
       ],
-      { stdout: "pipe", stderr: "pipe" },
+      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
     );
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    const out = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-    return exitCode === 0
+    const out = [result.stdout, result.stderr].filter(Boolean).join("\n");
+    if (result.timedOut) {
+      return `docker inspect timed out after ${DOCKER_PROBE_TIMEOUT_MS}ms${out ? `\n${out}` : ""}`;
+    }
+    return result.exitCode === 0
       ? out || "no inspect output"
-      : `docker inspect failed (exit ${exitCode})${out ? `\n${out}` : ""}`;
+      : `docker inspect failed (exit ${result.exitCode})${out ? `\n${out}` : ""}`;
   }
 
   private async readWarmContainerLogs(tail = 160): Promise<string> {
-    const proc = Bun.spawn(
+    const result = await this.runDockerCommandCapture(
       [resolveDockerExecutable(), "logs", "--tail", String(tail), this.warmContainerName],
-      {
-        stdout: "pipe",
-        stderr: "pipe",
-      },
+      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
     );
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    const out = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-    return exitCode === 0
+    const out = [result.stdout, result.stderr].filter(Boolean).join("\n");
+    if (result.timedOut) {
+      return `docker logs timed out after ${DOCKER_PROBE_TIMEOUT_MS}ms${out ? `\n${out}` : ""}`;
+    }
+    return result.exitCode === 0
       ? out || "(no docker logs)"
-      : `docker logs failed (exit ${exitCode})${out ? `\n${out}` : ""}`;
+      : `docker logs failed (exit ${result.exitCode})${out ? `\n${out}` : ""}`;
   }
 
   private workerLlmProbeUrls(endpoint: string): string[] {
@@ -1670,22 +2002,14 @@ export class DockerExecutor {
 
     let lastError = "unreachable";
     for (const probe of probes) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort("timeout"), 2_500);
       try {
-        const response = await fetch(probe, {
-          method: "GET",
-          signal: controller.signal,
-          headers: { Accept: "application/json, text/plain, */*" },
-        });
-        if (response.status >= 200 && response.status < 500) {
-          return `reachable via ${probe} (HTTP ${response.status})`;
+        const status = await probeWorkerLlmHttpEndpointStatus(probe);
+        if (status >= 200 && status < 500) {
+          return `reachable via ${probe} (HTTP ${status})`;
         }
-        lastError = `${probe}: HTTP ${response.status}`;
+        lastError = `${probe}: HTTP ${status}`;
       } catch (err) {
         lastError = `${probe}: ${String(err)}`;
-      } finally {
-        clearTimeout(timeout);
       }
     }
     return `UNREACHABLE (${lastError})`;
@@ -1779,26 +2103,36 @@ export class DockerExecutor {
 
   private async stopWarmContainer(reason: string, quiet = false): Promise<void> {
     this.clearIdleTimer();
-    const stopProc = Bun.spawn([resolveDockerExecutable(), "rm", "-f", this.warmContainerName], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const exitCode = await stopProc.exited;
-    if (exitCode === 0) {
-      if (!quiet)
+    const result = await this.runDockerCommandCapture(
+      [resolveDockerExecutable(), "rm", "-f", this.warmContainerName],
+      { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS },
+    );
+    if (!result.timedOut && result.exitCode === 0) {
+      if (!quiet) {
         console.log(
           `[DockerExecutor] Warm container stopped (${reason}): ${this.warmContainerName}`,
         );
+      }
+      this.warmedBackends.clear();
       return;
     }
-    const stderr = (await new Response(stopProc.stderr).text()).trim();
+    const stderr = [
+      result.stderr,
+      result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
     const notFound = /No such container/i.test(stderr);
     if (!quiet && !notFound) {
       console.error(`[DockerExecutor] Failed to stop warm container: ${stderr}`);
     }
+    this.warmedBackends.clear();
   }
 
   async shutdown(): Promise<void> {
+    if (this.preparedDependencyProjectionIds.size > 0) {
+      await this.reconcileContainerDependencyStore();
+    }
     await this.stopWarmContainer("worker shutdown", true);
   }
 
@@ -2040,6 +2374,7 @@ export class DockerExecutor {
 
     let timedOutByDocker = false;
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+    let processExitCode: number | null = null;
 
     // Process streams
     const stdoutLines: string[] = [];
@@ -2057,38 +2392,41 @@ export class DockerExecutor {
         this.readStream(stdout, "stdout", onLog, stdoutLines, streamAbort.signal),
         this.readStream(stderr, "stderr", onLog, stderrLines, streamAbort.signal),
       ]);
+      const streamFailure = streams.then(
+        () => new Promise<never>(() => {}),
+        (error) => ({ kind: "stream_error" as const, error }),
+      );
       const outcome = await Promise.race([
-        streams.then(() => "streams" as const),
-        new Promise<"timeout">((resolvePromise) => {
-          timeoutTimer = setTimeout(() => resolvePromise("timeout"), timeoutMs);
+        proc.exited.then((exitCode) => ({ kind: "exit" as const, exitCode })),
+        streamFailure,
+        new Promise<{ kind: "timeout" }>((resolvePromise) => {
+          timeoutTimer = setTimeout(() => resolvePromise({ kind: "timeout" }), timeoutMs);
         }),
       ]);
-      if (outcome === "timeout") {
+      if (outcome.kind === "stream_error") {
+        throw outcome.error;
+      }
+      if (outcome.kind === "timeout") {
         timedOutByDocker = true;
         const elapsedMs = Math.max(1, Date.now() - startedAtMs);
         const timeoutMsg = `[DockerExecutor] Job timeout in warm container after ${elapsedMs}ms (limit ${timeoutMs}ms): ${this.warmContainerName}`;
         console.log(timeoutMsg);
         onLog?.("stderr", timeoutMsg);
         await terminateDockerExecProcessTree(proc);
-        try {
-          Bun.spawn([resolveDockerExecutable(), "restart", "-t", "1", this.warmContainerName], {
-            stdout: "ignore",
-            stderr: "ignore",
-          });
-        } catch {
-          // The next job's warm-container readiness check will recover it.
-        }
-        const drained = await settleWithin(
+        await this.recycleWarmContainerAfterExecutionTimeout(onLog);
+      } else {
+        processExitCode = outcome.exitCode;
+      }
+      const drained = await settleWithin(
+        streams.catch(() => undefined),
+        DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
+      );
+      if (drained === null) {
+        streamAbort.abort();
+        await settleWithin(
           streams.catch(() => undefined),
-          DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
+          250,
         );
-        if (drained === null) {
-          streamAbort.abort();
-          await settleWithin(
-            streams.catch(() => undefined),
-            250,
-          );
-        }
       }
     } catch (err) {
       clearTimeout(warningTimer);
@@ -2104,9 +2442,10 @@ export class DockerExecutor {
 
     clearTimeout(warningTimer);
     if (timeoutTimer) clearTimeout(timeoutTimer);
-    const exitCode = timedOutByDocker
-      ? ((await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS)) ?? 124)
-      : await proc.exited;
+    const exitCode =
+      processExitCode ??
+      (await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS)) ??
+      124;
     const elapsedMs = Math.max(1, Date.now() - startedAtMs);
 
     // Parse result from stdout (look for ___RESULT___ sentinel)
@@ -2214,6 +2553,8 @@ export class DockerExecutor {
     artifacts: string[];
   }> {
     const startedAt = Date.now();
+    const worktreeId = this.dependencyProjectionId(containerWorktreePath);
+    if (worktreeId) this.preparedDependencyProjectionIds.add(worktreeId);
     let currentPhase = "starting";
     let currentProgress = 0;
     const startNote = `[DependencyPreparation] phase=${currentPhase} progress=${currentProgress} timeout_ms=${this.dependencyPreparationTimeoutMs}`;
@@ -2426,20 +2767,18 @@ export class DockerExecutor {
         "fi",
       ].join("\n"),
     ];
-    const proc = Bun.spawn(args, {
-      stdout: "pipe",
-      stderr: "pipe",
+    const result = await this.runDockerCommandCapture(args, {
+      timeoutMs: DOCKER_SELF_CHECK_TIMEOUT_MS,
     });
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-
-    if (exitCode !== 0) {
-      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
-      throw new Error(`Docker git/worktree startup self-check failed: ${detail}`);
+    if (result.timedOut || result.exitCode !== 0) {
+      const detail = [result.stderr, result.stdout].filter(Boolean).join("\n");
+      throw new Error(
+        `Docker git/worktree startup self-check failed (${
+          result.timedOut
+            ? `timed out after ${DOCKER_SELF_CHECK_TIMEOUT_MS}ms`
+            : `exit ${result.exitCode}`
+        }): ${detail}`,
+      );
     }
   }
 
@@ -2452,10 +2791,17 @@ export class DockerExecutor {
     onLog: ((stream: "stdout" | "stderr", line: string) => void) | undefined,
     lines: string[],
     signal?: AbortSignal,
+    maxRetainedChars = DOCKER_CAPTURE_MAX_CHARS,
   ): Promise<void> {
     const decoder = new TextDecoder();
     const reader = readable.getReader();
     let pending = "";
+    const retentionLimit = Math.max(128, Math.floor(maxRetainedChars));
+    let retainedChars = lines.reduce((total, line) => total + line.length + 1, 0);
+    let droppedChars = 0;
+    let droppedLines = 0;
+    let droppedPrefixCount = 0;
+    let pendingTruncationReported = false;
     const abortReader = () => {
       try {
         void reader.cancel().catch(() => {});
@@ -2468,7 +2814,28 @@ export class DockerExecutor {
     const forwardLine = (line: string) => {
       const cleanLine = line.endsWith("\r") ? line.slice(0, -1) : line;
       if (!cleanLine) return;
-      lines.push(cleanLine);
+
+      let retainedLine = cleanLine;
+      if (retainedLine.length + 1 > retentionLimit) {
+        const retainedLength = Math.max(1, retentionLimit - 1);
+        droppedChars += retainedLine.length - retainedLength;
+        retainedLine = retainedLine.slice(-retainedLength);
+      }
+      lines.push(retainedLine);
+      retainedChars += retainedLine.length + 1;
+      while (retainedChars > retentionLimit && droppedPrefixCount < lines.length) {
+        const removed = lines[droppedPrefixCount];
+        retainedChars -= removed.length + 1;
+        droppedChars += removed.length + 1;
+        droppedLines += 1;
+        droppedPrefixCount += 1;
+      }
+      // Compact in batches so a noisy process cannot turn tail retention into
+      // quadratic Array.shift() work while still keeping memory bounded.
+      if (droppedPrefixCount >= 1_024) {
+        lines.splice(0, droppedPrefixCount);
+        droppedPrefixCount = 0;
+      }
 
       // For stderr, try to parse as JSON log line
       if (streamName === "stderr") {
@@ -2498,6 +2865,19 @@ export class DockerExecutor {
           forwardLine(line);
           newlineIndex = pending.indexOf("\n");
         }
+        const pendingLimit = Math.max(128, Math.min(retentionLimit, DOCKER_PENDING_LINE_MAX_CHARS));
+        if (pending.length > pendingLimit) {
+          const omittedChars = pending.length - pendingLimit;
+          droppedChars += omittedChars;
+          pending = pending.slice(-pendingLimit);
+          if (!pendingTruncationReported) {
+            pendingTruncationReported = true;
+            onLog?.(
+              streamName,
+              `${DOCKER_PENDING_LINE_TRUNCATION_MARKER} (${omittedChars}+ chars omitted).`,
+            );
+          }
+        }
       }
 
       pending += decoder.decode();
@@ -2512,6 +2892,14 @@ export class DockerExecutor {
         reader.releaseLock();
       } catch {
         // Reader already released or cancelled.
+      }
+      if (droppedPrefixCount > 0) {
+        lines.splice(0, droppedPrefixCount);
+      }
+      if (droppedChars > 0 || droppedLines > 0) {
+        lines.unshift(
+          `${DOCKER_STREAM_TRUNCATION_MARKER} (${droppedLines} lines, ${droppedChars} chars omitted; bounded tail retained).`,
+        );
       }
     }
   }
@@ -2681,7 +3069,7 @@ export class DockerExecutor {
         ...warmContext,
         warmContainerName: this.warmContainerName,
         runWarmShell: (command: string): Promise<DockerWarmShellResult> =>
-          this.runWarmShell(command),
+          this.runWarmShell(command, { timeoutMs: this.warmAgentStartupTimeoutMs }),
         restartWarmContainer: async () => {
           await this.startWarmContainer();
         },
@@ -2692,7 +3080,9 @@ export class DockerExecutor {
     }
     const cmd = spec.warmupProbeCommand?.(SHARED_CONTAINER_VENV_PYTHON);
     if (cmd) {
-      const result = await this.runWarmShell(cmd);
+      const result = await this.runWarmShell(cmd, {
+        timeoutMs: this.warmAgentStartupTimeoutMs,
+      });
       if (!result.ok) {
         const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
         throw new Error(
@@ -2713,43 +3103,84 @@ export class DockerExecutor {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
   }
 
-  private async runDockerCommandCapture(
+  private async runHostCommandCapture(
     command: string[],
     opts: { cwd?: string; timeoutMs?: number } = {},
   ): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean }> {
     const proc = Bun.spawn(command, {
       cwd: opts.cwd,
+      stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
     });
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    if (
-      typeof opts.timeoutMs === "number" &&
-      Number.isFinite(opts.timeoutMs) &&
-      opts.timeoutMs > 0
-    ) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        try {
-          proc.kill();
-        } catch {
-          // best-effort timeout termination only
-        }
-      }, opts.timeoutMs);
+    const stdout = proc.stdout;
+    const stderr = proc.stderr;
+    if (!isReadableByteStream(stdout) || !isReadableByteStream(stderr)) {
+      await terminateDockerExecProcessTree(proc);
+      throw new Error(`bounded process capture pipes were unavailable: ${command.join(" ")}`);
     }
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
+
+    const timeoutMs =
+      typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+        ? Math.max(1, Math.floor(opts.timeoutMs))
+        : DOCKER_CONTROL_TIMEOUT_MS;
+    const streamAbort = new AbortController();
+    const streams = Promise.all([
+      readCapturedProcessStream(stdout, streamAbort.signal),
+      readCapturedProcessStream(stderr, streamAbort.signal),
+    ]);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const streamFailure = streams.then(
+      () => new Promise<never>(() => {}),
+      (error) => ({ kind: "stream_error" as const, error }),
+    );
+    const outcome = await Promise.race([
+      proc.exited.then((exitCode) => ({ kind: "exit" as const, exitCode })),
+      streamFailure,
+      new Promise<{ kind: "timeout" }>((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise({ kind: "timeout" }), timeoutMs);
+      }),
     ]);
     if (timer) clearTimeout(timer);
+
+    if (outcome.kind === "stream_error") {
+      streamAbort.abort();
+      await terminateDockerExecProcessTree(proc);
+      throw outcome.error;
+    }
+
+    const timedOut = outcome.kind === "timeout";
+    if (timedOut) {
+      await terminateDockerExecProcessTree(proc);
+    }
+
+    let captured = await settleWithin(
+      streams.catch(() => ["", ""] as [string, string]),
+      DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
+    );
+    if (captured === null) {
+      streamAbort.abort();
+      captured = (await settleWithin(
+        streams.catch(() => ["", ""] as [string, string]),
+        250,
+      )) ?? ["", ""];
+    }
+    const exitCode = timedOut
+      ? ((await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS)) ?? 124)
+      : outcome.exitCode;
     return {
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
+      stdout: captured[0].trim(),
+      stderr: captured[1].trim(),
       exitCode,
       timedOut,
     };
+  }
+
+  private async runDockerCommandCapture(
+    command: string[],
+    opts: { cwd?: string; timeoutMs?: number } = {},
+  ): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean }> {
+    return this.runHostCommandCapture(command, opts);
   }
 
   private compactError(err: unknown): string {
@@ -2855,32 +3286,41 @@ export class DockerExecutor {
   async cleanupOrphanedWorktrees(): Promise<void> {
     try {
       // List all worktrees and only prune stale metadata entries.
-      const proc = Bun.spawn(["git", "worktree", "list", "--porcelain"], {
+      const listed = await this.runHostCommandCapture(["git", "worktree", "list", "--porcelain"], {
         cwd: this.options.repo,
-        stdout: "pipe",
+        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
       });
 
-      const output = await new Response(proc.stdout).text();
-      const exitCode = await proc.exited;
+      if (listed.timedOut || listed.exitCode !== 0) {
+        console.warn(
+          `[DockerExecutor] Worktree discovery warning: ${
+            listed.timedOut
+              ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`
+              : listed.stderr || listed.stdout || `exit ${listed.exitCode}`
+          }`,
+        );
+        return;
+      }
 
-      if (exitCode !== 0) return;
-
-      const prunablePaths = collectPrunableEphemeralWorktrees(output);
+      const prunablePaths = collectPrunableEphemeralWorktrees(listed.stdout);
       if (prunablePaths.length > 0) {
         for (const path of prunablePaths) {
           console.log(`[DockerExecutor] Pruning stale worktree metadata: ${path}`);
         }
       }
 
-      const prune = Bun.spawn(["git", "worktree", "prune"], {
+      const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
         cwd: this.options.repo,
-        stdout: "pipe",
-        stderr: "pipe",
+        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
       });
-      const pruneExit = await prune.exited;
-      if (pruneExit !== 0) {
-        const pruneStderr = await new Response(prune.stderr).text();
-        console.warn(`[DockerExecutor] Worktree prune warning: ${pruneStderr}`);
+      if (prune.timedOut || prune.exitCode !== 0) {
+        console.warn(
+          `[DockerExecutor] Worktree prune warning: ${
+            prune.timedOut
+              ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`
+              : prune.stderr || prune.stdout || `exit ${prune.exitCode}`
+          }`,
+        );
       }
     } catch (err) {
       console.error(`[DockerExecutor] Cleanup error: ${err}`);
@@ -2910,22 +3350,18 @@ export class DockerExecutor {
       `[DockerExecutor] Worktree path already exists; forcing cleanup before create: ${worktreePath}`,
     );
 
-    const unregister = Bun.spawn(
+    await this.runHostCommandCapture(
       ["git", "worktree", "remove", "--force", "--force", worktreePath],
       {
         cwd: this.options.repo,
-        stdout: "pipe",
-        stderr: "pipe",
+        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
       },
     );
-    await unregister.exited;
 
-    const prune = Bun.spawn(["git", "worktree", "prune"], {
+    await this.runHostCommandCapture(["git", "worktree", "prune"], {
       cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
     });
-    await prune.exited;
 
     const forced = await forceDeleteWorktreePath(worktreePath, {
       sleepFn: (ms) => this.sleep(ms),
@@ -3005,7 +3441,7 @@ export class DockerExecutor {
     await this.stopWarmContainer("merge-conflict image refresh", true);
     this.warmedBackends.clear();
 
-    const build = Bun.spawn(
+    const build = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
         "build",
@@ -3018,19 +3454,17 @@ export class DockerExecutor {
       ],
       {
         cwd: sandboxContext.root,
-        stdout: "pipe",
-        stderr: "pipe",
+        timeoutMs: DOCKER_IMAGE_BUILD_TIMEOUT_MS,
       },
     );
-    const [exitCode, stdout, stderr] = await Promise.all([
-      build.exited,
-      new Response(build.stdout).text(),
-      new Response(build.stderr).text(),
-    ]);
-    if (exitCode !== 0) {
-      const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+    if (build.timedOut || build.exitCode !== 0) {
+      const detail = [build.stderr, build.stdout].filter(Boolean).join("\n");
       throw new Error(
-        `Failed to rebuild Docker image for merge-conflict job ${job.id}: ${detail || `exit ${exitCode}`}`,
+        `Failed to rebuild Docker image for merge-conflict job ${job.id}: ${
+          build.timedOut
+            ? `timed out after ${DOCKER_IMAGE_BUILD_TIMEOUT_MS}ms`
+            : detail || `exit ${build.exitCode}`
+        }`,
       );
     }
 
@@ -3083,20 +3517,19 @@ export class DockerExecutor {
   private async runGitBaseRefCommand(
     args: string[],
   ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-    const proc = Bun.spawn(["git", ...args], {
+    const result = await this.runHostCommandCapture(["git", ...args], {
       cwd: this.options.repo,
-      stdout: "pipe",
-      stderr: "pipe",
+      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
     });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
     return {
-      ok: exitCode === 0,
-      stdout,
-      stderr,
+      ok: !result.timedOut && result.exitCode === 0,
+      stdout: result.stdout,
+      stderr: [
+        result.stderr,
+        result.timedOut ? `git command timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
     };
   }
 
@@ -3255,10 +3688,15 @@ export class DockerExecutor {
   static async isDockerAvailable(): Promise<boolean> {
     try {
       const proc = Bun.spawn([resolveDockerExecutable(), "version"], {
-        stdout: "pipe",
-        stderr: "pipe",
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
       });
-      const exitCode = await proc.exited;
+      const exitCode = await settleWithin(proc.exited, DOCKER_PROBE_TIMEOUT_MS);
+      if (exitCode === null) {
+        await terminateDockerExecProcessTree(proc);
+        return false;
+      }
       return exitCode === 0;
     } catch {
       return false;

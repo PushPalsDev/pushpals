@@ -42,6 +42,10 @@ import {
   type ClientRuntimePreflightResult,
 } from "../packages/shared/src/client_preflight.js";
 import { normalizePresenceLookupToken } from "../packages/shared/src/communication.js";
+import {
+  fetchBufferedWithHardDeadline,
+  type FetchLike,
+} from "../packages/shared/src/bounded_fetch.js";
 import { resolveGitStateFilePath } from "../packages/shared/src/repo.js";
 import {
   MINIMUM_SUPPORTED_BUN_VERSION,
@@ -294,8 +298,11 @@ const DEFAULT_MONITOR_PORT = 8081;
 const MONITOR_SCAN_PORTS = 32;
 const MONITOR_POLL_MS = 2_000;
 const HTTP_TIMEOUT_MS = 2_500;
+const CLI_HTTP_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const RUNTIME_BINARY_MAX_RESPONSE_BYTES = 256 * 1024 * 1024;
 const LOCALBUDDY_TIMEOUT_MS = 4_000;
 const SSE_RECONNECT_MS = 1_500;
+const MAX_SSE_EVENT_BUFFER_CHARS = 512 * 1024;
 const DOCKER_VERSION_PROBE_TIMEOUT_MS = 10_000;
 const WORKERPAL_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
 const WORKERPAL_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
@@ -306,6 +313,11 @@ const DEFAULT_SERVICE_STABILITY_GRACE_MS = 4_000;
 const DEFAULT_REMOTEBUDDY_CONSUMER_STARTUP_GRACE_MS = 8_000;
 const DEFAULT_COMMAND_OUTPUT_DRAIN_TIMEOUT_MS = 2_000;
 const DEFAULT_COMMAND_OUTPUT_MAX_CHARS = 512_000;
+const DEFAULT_CLI_HELPER_TIMEOUT_MS = 2 * 60_000;
+const OPEN_HELPER_TIMEOUT_MS = 10_000;
+const WINDOWS_ROOT_CA_EXPORT_TIMEOUT_MS = 30_000;
+const MONITOR_EXPORT_TIMEOUT_MS = 120_000;
+const GIT_TRACKED_FILES_TIMEOUT_MS = 10_000;
 const DEFAULT_REMOTEBUDDY_SILENT_STARTUP_FALLBACK_MS = 20_000;
 const DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS = 2_000;
 const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
@@ -1017,7 +1029,7 @@ export async function runCommandWithEnv(
   command: string[],
   cwd: string,
   env: Record<string, string | undefined>,
-  timeoutMs?: number,
+  timeoutMs = DEFAULT_CLI_HELPER_TIMEOUT_MS,
 ): Promise<CommandResult> {
   try {
     const proc = Bun.spawn(command, {
@@ -1029,7 +1041,7 @@ export async function runCommandWithEnv(
     const stdoutCollector = createProcessOutputCollector(proc.stdout);
     const stderrCollector = createProcessOutputCollector(proc.stderr);
     let timedOut = false;
-    const hasTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0;
+    const hasTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
     let timeout: ReturnType<typeof setTimeout> | null = null;
     const exitCode = await Promise.race([
       proc.exited,
@@ -1184,24 +1196,33 @@ try {
     ...env,
     PUSHPALS_WINDOWS_NODE_EXTRA_CA_CERTS_OUT: outPath,
   });
-  const result = Bun.spawnSync(
-    [
-      "powershell.exe",
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-EncodedCommand",
-      encodedScript,
-    ],
-    {
-      cwd: process.cwd(),
-      env: childEnv,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  return result.exitCode === 0 && hasUsablePemCertificate(outPath);
+  try {
+    const result = Bun.spawnSync(
+      [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encodedScript,
+      ],
+      {
+        cwd: process.cwd(),
+        env: childEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: WINDOWS_ROOT_CA_EXPORT_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      },
+    );
+    return result.exitCode === 0 && hasUsablePemCertificate(outPath);
+  } catch {
+    // Missing or blocked PowerShell must not prevent the CLI from starting.
+    // The caller can keep the last known-good bundle or continue without the
+    // optional Node CA projection.
+    return false;
+  }
 }
 
 export function refreshWindowsNodeExtraCaCertsBundle(
@@ -1332,6 +1353,8 @@ function listTrackedRepoFilesForPath(repoRoot: string, sourcePath: string): stri
       GIT_TERMINAL_PROMPT: "0",
       GCM_INTERACTIVE: "Never",
     },
+    timeout: GIT_TRACKED_FILES_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
   if (proc.exitCode !== 0) {
     const stderr = Buffer.from(proc.stderr ?? [])
@@ -1589,6 +1612,8 @@ function exportBundledMonitoringHubFromSourceCheckout(sourceRoot: string): void 
     stdout: "inherit",
     stderr: "inherit",
     env: process.env,
+    timeout: MONITOR_EXPORT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
   if (proc.exitCode !== 0) {
     throw new Error(
@@ -2554,7 +2579,12 @@ async function downloadBinaryAsset(tag: string, assetName: string, outPath: stri
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= RUNTIME_BINARY_DOWNLOAD_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetchWithTimeout(url, { headers: GITHUB_HEADERS }, 60_000);
+      const response = await fetchWithTimeout(
+        url,
+        { headers: GITHUB_HEADERS },
+        60_000,
+        RUNTIME_BINARY_MAX_RESPONSE_BYTES,
+      );
       if (!response.ok) {
         throw new Error(`Failed to download ${assetName} from ${tag} (HTTP ${response.status})`);
       }
@@ -2728,25 +2758,18 @@ export function buildServiceStopCommand(
   return null;
 }
 
-function stopRuntimeServices(services: RuntimeServiceProcess[]): void {
-  for (const service of services) {
-    try {
-      service.stopOutputPipes?.();
-      service.proc.kill("SIGTERM");
-    } catch {
-      // ignore
-    }
-  }
-}
-
 async function stopRuntimeServicesOnWindows(
   services: RuntimeServiceProcess[],
   timeoutMs: number,
 ): Promise<void> {
+  const startedAtMs = Date.now();
   await Promise.allSettled(
     services.map((service) => terminateManagedServiceTree(service, "win32")),
   );
-  await waitForRuntimeServicesExit(services, Math.max(500, timeoutMs));
+  const remainingMs = Math.max(0, timeoutMs - (Date.now() - startedAtMs));
+  if (remainingMs > 0) {
+    await waitForRuntimeServicesExit(services, remainingMs);
+  }
 }
 
 function resolveGracefulShutdownPriority(name: RuntimeServiceName): number {
@@ -2783,7 +2806,6 @@ async function stopRuntimeServicesGracefully(
   );
   if (process.platform === "win32") {
     await stopRuntimeServicesOnWindows(ordered, timeoutMs);
-    await waitForRuntimeServicesExit(ordered, Math.min(1_000, timeoutMs));
     return;
   }
   const nonServer = ordered.filter((service) => service.name !== "server");
@@ -2811,7 +2833,13 @@ async function stopRuntimeServicesGracefully(
 
   const remaining = ordered.filter((service) => !service.exited);
   if (remaining.length > 0) {
-    stopRuntimeServices(remaining);
+    await Promise.allSettled(
+      remaining.map((service) =>
+        terminateManagedServiceTree(service, process.platform, {
+          gracefulSignalAlreadySent: true,
+        }),
+      ),
+    );
   }
 }
 
@@ -2865,7 +2893,7 @@ export async function shutdownEmbeddedServiceManagerGracefully(options: {
   }
 
   await stopRuntimeServicesGracefully(services, serviceStopTimeoutMs);
-  serviceManager.stop();
+  serviceManager.finishShutdownAfterTermination();
   for (const task of cleanupTasks) {
     await task();
   }
@@ -5154,17 +5182,110 @@ export async function waitForWorkerpalCapacity(opts: {
   };
 }
 
-async function fetchWithTimeout(
+export async function fetchWithTimeout(
   url: string,
   init: RequestInit = {},
   timeoutMs = HTTP_TIMEOUT_MS,
+  maxResponseBytes = CLI_HTTP_MAX_RESPONSE_BYTES,
+  fetchImpl?: FetchLike,
+): Promise<Response> {
+  return fetchBufferedWithHardDeadline({
+    input: url,
+    init,
+    timeoutMs,
+    maxResponseBytes,
+    fetchImpl,
+    timeoutMessage: `CLI HTTP request timed out after ${Math.max(1, Math.floor(timeoutMs))}ms`,
+  });
+}
+
+/**
+ * The session event endpoint is intentionally streaming. Bound receipt of its
+ * headers, then keep the caller's shutdown signal attached to the response
+ * body so CLI exit cannot wait forever on an idle SSE reader.
+ */
+export async function fetchStreamingResponseWithHeaderTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = HTTP_TIMEOUT_MS,
+  fetchImpl: FetchLike = fetch,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const upstreamSignal = init.signal;
+  const forwardAbort = () => controller.abort(upstreamSignal?.reason);
+  if (upstreamSignal?.aborted) forwardAbort();
+  else upstreamSignal?.addEventListener("abort", forwardAbort, { once: true });
+  const boundedTimeoutMs = Math.max(1, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`CLI streaming headers timed out after ${boundedTimeoutMs}ms`);
+      controller.abort(error);
+      reject(error);
+    }, boundedTimeoutMs);
+  });
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const response = await Promise.race([
+      fetchImpl(url, { ...init, signal: controller.signal }),
+      deadline,
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!response.body) {
+      upstreamSignal?.removeEventListener("abort", forwardAbort);
+      return response;
+    }
+
+    const reader = response.body.getReader();
+    let cleaned = false;
+    const cancelBody = () => {
+      void reader.cancel(controller.signal.reason).catch(() => undefined);
+    };
+    controller.signal.addEventListener("abort", cancelBody, { once: true });
+    if (controller.signal.aborted) cancelBody();
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      controller.signal.removeEventListener("abort", cancelBody);
+      upstreamSignal?.removeEventListener("abort", forwardAbort);
+      try {
+        reader.releaseLock();
+      } catch {
+        // best-effort reader cleanup
+      }
+    };
+    const body = new ReadableStream<Uint8Array>({
+      async pull(streamController) {
+        try {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            cleanup();
+            streamController.close();
+            return;
+          }
+          streamController.enqueue(chunk.value);
+        } catch (error) {
+          cleanup();
+          streamController.error(error);
+        }
+      },
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason);
+        } finally {
+          cleanup();
+        }
+      },
+    });
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch (error) {
+    upstreamSignal?.removeEventListener("abort", forwardAbort);
+    throw error;
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -6243,9 +6364,29 @@ export function buildEmbeddedMonitoringHubHtml(opts: {
     }
 
     async function fetchJson(path) {
-      const res = await fetch(path, { cache: "no-store" });
-      if (!res.ok) throw new Error(path + " -> HTTP " + res.status);
-      return await res.json();
+      const controller = new AbortController();
+      const timeoutMs = ${HTTP_TIMEOUT_MS};
+      let timer = null;
+      const deadline = new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error("monitor request timed out after " + timeoutMs + "ms");
+          controller.abort(error);
+          reject(error);
+        }, timeoutMs);
+      });
+      try {
+        return await Promise.race([
+          (async () => {
+            const res = await fetch(path, { cache: "no-store", signal: controller.signal });
+            const text = await res.text();
+            if (!res.ok) throw new Error(path + " -> HTTP " + res.status);
+            return text ? JSON.parse(text) : null;
+          })(),
+          deadline,
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
 
     function setList(target, rows, emptyLabel, formatter) {
@@ -6676,6 +6817,19 @@ export function createSessionEventReplayFilter(): SessionEventReplayFilter {
   };
 }
 
+export function appendSessionEventBuffer(
+  current: string,
+  decodedChunk: string,
+  maxChars = MAX_SSE_EVENT_BUFFER_CHARS,
+): string {
+  const boundedMax = Math.max(1, Math.floor(maxChars));
+  const combined = `${current}${decodedChunk}`;
+  if (combined.length > boundedMax) {
+    throw new Error(`Session stream event exceeded ${boundedMax} character buffer limit`);
+  }
+  return combined;
+}
+
 async function runSessionStream(
   serverUrl: string,
   sessionId: string,
@@ -6688,9 +6842,9 @@ async function runSessionStream(
 
   while (!signal.aborted) {
     try {
-      const response = await fetchWithTimeout(
+      const response = await fetchStreamingResponseWithHeaderTimeout(
         `${serverUrl}/sessions/${encodeURIComponent(sessionId)}/events${buildClientTransportQuery(cursor, client)}`,
-        {},
+        { signal },
         15_000,
       );
       if (!response.ok || !response.body) {
@@ -6703,42 +6857,53 @@ async function runSessionStream(
       const decoder = new TextDecoder();
       let buffer = "";
 
-      while (!signal.aborted) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const blocks = buffer.split("\n\n");
-        buffer = blocks.pop() ?? "";
+      try {
+        while (!signal.aborted) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer = appendSessionEventBuffer(buffer, decoder.decode(value, { stream: true }));
+          const blocks = buffer.split("\n\n");
+          buffer = blocks.pop() ?? "";
 
-        for (const block of blocks) {
-          if (!block.trim()) continue;
-          let blockCursor = 0;
-          let rawData = "";
-          for (const line of block.split(/\r?\n/)) {
-            if (line.startsWith("id:")) {
-              const idText = line.slice(3).trim();
-              const parsed = Number.parseInt(idText, 10);
-              if (Number.isFinite(parsed) && parsed > 0) {
-                blockCursor = parsed;
+          for (const block of blocks) {
+            if (!block.trim()) continue;
+            let blockCursor = 0;
+            let rawData = "";
+            for (const line of block.split(/\r?\n/)) {
+              if (line.startsWith("id:")) {
+                const idText = line.slice(3).trim();
+                const parsed = Number.parseInt(idText, 10);
+                if (Number.isFinite(parsed) && parsed > 0) {
+                  blockCursor = parsed;
+                }
+              } else if (line.startsWith("data:")) {
+                rawData += `${line.slice(5).trim()}\n`;
               }
-            } else if (line.startsWith("data:")) {
-              rawData += `${line.slice(5).trim()}\n`;
             }
+            if (!rawData.trim()) continue;
+            let parsed: SessionStreamPayload | null = null;
+            try {
+              parsed = JSON.parse(rawData.trim()) as SessionStreamPayload;
+            } catch {
+              continue;
+            }
+            const serverCursor =
+              typeof parsed.cursor === "number" && Number.isFinite(parsed.cursor)
+                ? parsed.cursor
+                : 0;
+            cursor = Math.max(cursor, blockCursor, serverCursor);
+            if (!parsed.envelope) continue;
+            if (!replayFilter.shouldRender(parsed.envelope)) continue;
+            const line = formatSessionEventLine(parsed.envelope);
+            if (line) print(line);
           }
-          if (!rawData.trim()) continue;
-          let parsed: SessionStreamPayload | null = null;
-          try {
-            parsed = JSON.parse(rawData.trim()) as SessionStreamPayload;
-          } catch {
-            continue;
-          }
-          const serverCursor =
-            typeof parsed.cursor === "number" && Number.isFinite(parsed.cursor) ? parsed.cursor : 0;
-          cursor = Math.max(cursor, blockCursor, serverCursor);
-          if (!parsed.envelope) continue;
-          if (!replayFilter.shouldRender(parsed.envelope)) continue;
-          const line = formatSessionEventLine(parsed.envelope);
-          if (line) print(line);
+        }
+      } finally {
+        await reader.cancel("session stream reconnect").catch(() => undefined);
+        try {
+          reader.releaseLock();
+        } catch {
+          // The stream can already be locked in an aborted read.
         }
       }
     } catch {
@@ -6789,26 +6954,26 @@ export function ensureCliLocalConfigFile(configDir: string): string {
 
 async function openMonitoringHub(url: string): Promise<boolean> {
   const cmd = buildOpenMonitoringHubCommand(url, process.platform);
-  const proc = Bun.spawn(cmd, {
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  const code = await proc.exited;
-  return code === 0;
+  const result = await runCommandWithEnv(
+    cmd,
+    process.cwd(),
+    process.env as Record<string, string | undefined>,
+    OPEN_HELPER_TIMEOUT_MS,
+  );
+  return result.ok;
 }
 
 async function openConfigFile(configDir: string): Promise<{ ok: boolean; path: string }> {
   const configPath = ensureCliLocalConfigFile(configDir);
   console.log(`[pushpals] Opening config file: ${configPath}`);
   const cmd = buildOpenConfigCommand(configPath, process.platform);
-  const proc = Bun.spawn(cmd, {
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  const code = await proc.exited;
-  return { ok: code === 0, path: configPath };
+  const result = await runCommandWithEnv(
+    cmd,
+    process.cwd(),
+    process.env as Record<string, string | undefined>,
+    OPEN_HELPER_TIMEOUT_MS,
+  );
+  return { ok: result.ok, path: configPath };
 }
 
 export function isCliExitCommand(text: string): boolean {

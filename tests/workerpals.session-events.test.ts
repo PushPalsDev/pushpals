@@ -2,18 +2,59 @@ import { describe, expect, test } from "bun:test";
 import {
   buildTrustedValidationCompletionPayload,
   didWorkerWatchdogFire,
+  enqueueCompletion,
   failCompletionEnqueue,
+  failNoPublishableCodeChange,
   holdCommitForTrustedValidation,
   inferWorkerTerminalFailureClass,
   shouldDeferDockerCodexStartupStallForDirectRetry,
   shouldEmitDirectSessionJobEvent,
   shouldRecycleWorkerForCodexUnavailableFailure,
   shouldRecycleWorkerForHeartbeatDegradation,
+  requiresPublishableCodeChange,
   workerJobResultFromDocker,
   workerRecycleExitCodeForResult,
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
+  test("requires a publishable result only for explicit writable code-change jobs", () => {
+    expect(
+      requiresPublishableCodeChange({
+        planning: { intent: "code_change", scope: { writeAllowed: true } },
+      }),
+    ).toBe(true);
+    expect(
+      requiresPublishableCodeChange({
+        planning: { intent: "code_change", scope: { writeAllowed: false } },
+      }),
+    ).toBe(false);
+    expect(
+      requiresPublishableCodeChange({
+        planning: { intent: "investigation", scope: { writeAllowed: true } },
+      }),
+    ).toBe(false);
+    expect(
+      requiresPublishableCodeChange({
+        planning: { intent: "code_change", scope: { writeAllowed: true } },
+        reviewAgent: { resolutionType: "merge_conflict" },
+      }),
+    ).toBe(false);
+  });
+
+  test("turns an unchanged writable coding attempt into a truthful failure", () => {
+    const failed = failNoPublishableCodeChange("job-noop", {
+      ok: true,
+      summary: "task finished",
+      exitCode: 0,
+    });
+
+    expect(failed.ok).toBe(false);
+    expect(failed.exitCode).toBe(4);
+    expect(failed.summary).toContain("no publishable changes");
+    expect(failed.stderr).toContain("Refusing to report an unchanged coding attempt");
+    expect(inferWorkerTerminalFailureClass(failed)).toBe("artifact_only_no_publishable_patch");
+  });
+
   test("importing workerpals_main has no daemon startup side effects", async () => {
     const proc = Bun.spawn(
       [
@@ -153,7 +194,52 @@ describe("workerpals session event emission", () => {
     expect(buildTrustedValidationCompletionPayload(undefined)).toEqual({});
   });
 
-  test("completes an environment-deferred no-change job without publication", () => {
+  test("retries an identical completion handoff after the first response is lost", async () => {
+    const originalFetch = globalThis.fetch;
+    const bodies: string[] = [];
+    let attempts = 0;
+    globalThis.fetch = (async (
+      _input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      attempts += 1;
+      bodies.push(String(init?.body ?? ""));
+      if (attempts === 1) throw new Error("response lost after commit");
+      return Response.json(
+        { ok: true, completionId: "completion-existing", deduped: true },
+        {
+          status: 201,
+        },
+      );
+    }) as typeof fetch;
+    try {
+      const enqueued = await enqueueCompletion(
+        "http://pushpals.test",
+        { "Content-Type": "application/json" },
+        "worker-1",
+        "main_agents",
+        {
+          id: "job-response-lost",
+          taskId: "task-response-lost",
+          kind: "task.execute",
+          sessionId: "dev",
+          params: {},
+        },
+        {
+          branch: "refs/pushpals/agent/worker/job-response-lost",
+          sha: "a".repeat(40),
+        },
+        { ok: true, summary: "candidate ready" },
+      );
+      expect(enqueued).toBe(true);
+      expect(attempts).toBe(2);
+      expect(bodies[1]).toBe(bodies[0]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("never reports an environment-deferred no-change job as successful", () => {
     const held = holdCommitForTrustedValidation(
       {
         ok: true,
@@ -169,11 +255,12 @@ describe("workerpals session event emission", () => {
     );
 
     expect(held.completionCommit).toBeNull();
-    expect(held.result.ok).toBe(true);
+    expect(held.result.ok).toBe(false);
     expect(held.result.publishBlocked).toBeUndefined();
-    expect(held.result.validationBlocked).toBeUndefined();
-    expect(held.result.summary).toContain("no candidate changes require publication");
-    expect(inferWorkerTerminalFailureClass(held.result)).toBe("success");
+    expect(held.result.validationBlocked).toBeDefined();
+    expect(held.result.exitCode).toBe(4);
+    expect(held.result.summary).toContain("no candidate was available to validate");
+    expect(inferWorkerTerminalFailureClass(held.result)).toBe("trusted_validation_required");
   });
 
   test("does not mask an earlier host-side finalization failure with trusted validation", () => {

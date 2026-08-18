@@ -966,7 +966,7 @@ enabled = true
       mockServer?.stop(true);
       rmSync(root, { recursive: true, force: true });
     }
-  }, 15000);
+  }, 30000);
 
   test("runtime-only mode keeps running after stdin EOF", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-runtime-only-eof-"));

@@ -1,3 +1,4 @@
+import { fetchBufferedWithHardDeadline, type FetchLike } from "shared";
 import type { SourceControlManagerConfig } from "./config";
 
 export type SourceControlManagerStartupStatusPhase = "startup" | "online" | "shutdown";
@@ -111,8 +112,6 @@ export function createSourceControlManagerHealthTracker(options: {
     },
   };
 }
-
-type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
 type SystemStatusClientRow = {
   clientId?: unknown;
@@ -290,14 +289,16 @@ export async function probeReviewAgentRuntimeReadiness(options: {
 }): Promise<ReviewAgentRuntimeReadiness> {
   const timeoutMs = Math.max(1, options.timeoutMs ?? 2_500);
   const fetchImpl = options.fetchImpl ?? fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const headers: Record<string, string> = {};
     if (options.authToken) headers.Authorization = `Bearer ${options.authToken}`;
-    const response = await fetchImpl(`${options.serverUrl.replace(/\/+$/, "")}/system/status`, {
-      headers,
-      signal: controller.signal,
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${options.serverUrl.replace(/\/+$/, "")}/system/status`,
+      init: { headers },
+      timeoutMs,
+      fetchImpl,
+      maxResponseBytes: 2 * 1024 * 1024,
+      timeoutMessage: `system status probe timed out after ${timeoutMs}ms`,
     });
     if (!response.ok) {
       return {
@@ -312,7 +313,5 @@ export async function probeReviewAgentRuntimeReadiness(options: {
       ready: false,
       detail: `system status probe failed: ${String(err)}`,
     };
-  } finally {
-    clearTimeout(timer);
   }
 }

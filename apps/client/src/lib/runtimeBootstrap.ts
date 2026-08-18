@@ -49,7 +49,7 @@ function readBootstrapPayload(): RuntimeBootstrapPayload {
 
 export function resolvePushPalsWebRuntimeConfig(): PushPalsWebRuntimeConfig {
   const payload = readBootstrapPayload();
-  const env = typeof process !== "undefined" ? process.env : {};
+  const env: Record<string, string | undefined> = typeof process !== "undefined" ? process.env : {};
   const sessionId =
     normalizeString(payload.sessionId) ||
     normalizeString(env.EXPO_PUBLIC_PUSHPALS_SESSION_ID) ||

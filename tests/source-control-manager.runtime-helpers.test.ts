@@ -210,4 +210,31 @@ describe("source_control_manager runtime helpers", () => {
     expect(requestedUrl).toBe("http://127.0.0.1:3001/system/status");
     expect(requestedAuth).toBe("Bearer secret");
   });
+
+  test("probeReviewAgentRuntimeReadiness bounds a system-status body that never completes", async () => {
+    let bodyCancelled = false;
+    const startedAt = Date.now();
+    const result = await probeReviewAgentRuntimeReadiness({
+      serverUrl: "http://127.0.0.1:3001",
+      sessionId: "dev",
+      timeoutMs: 20,
+      fetchImpl: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"ok":true'));
+            },
+            cancel() {
+              bodyCancelled = true;
+            },
+          }),
+          { status: 200 },
+        ),
+    });
+
+    expect(result.ready).toBe(false);
+    expect(result.detail).toContain("system status probe timed out after 20ms");
+    expect(bodyCancelled).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
 });

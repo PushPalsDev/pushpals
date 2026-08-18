@@ -1,5 +1,6 @@
 import type { EventEnvelope } from "protocol/browser";
 import { PROTOCOL_VERSION, validateEventEnvelope } from "protocol/browser";
+import { fetchClientResponseWithDeadline } from "./httpDeadline";
 
 type TransportType = "auto" | "sse" | "ws";
 
@@ -309,7 +310,7 @@ export async function createSession(
   client?: ClientRegistration,
 ): Promise<{ sessionId: string; created: boolean } | null> {
   try {
-    const response = await fetch(`${baseUrl}/sessions`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
       body: JSON.stringify({
@@ -346,11 +347,14 @@ export async function sendSessionMessage(
   text: string,
 ): Promise<boolean> {
   try {
-    const response = await fetch(buildSessionMessageUrl(baseUrl, sessionId), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
+    const response = await fetchClientResponseWithDeadline(
+      buildSessionMessageUrl(baseUrl, sessionId),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      },
+    );
 
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
@@ -376,7 +380,7 @@ export async function submitApprovalDecision(
   authToken?: string,
 ): Promise<boolean> {
   try {
-    const response = await fetch(`${baseUrl}/approvals/${approvalId}`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/approvals/${approvalId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders(authToken) },
       body: JSON.stringify({ decision }),
@@ -618,6 +622,27 @@ export interface AutonomyOpsSummary {
   recentAlerts: AutonomyOpsAlert[];
   staleDeadLetterCount24h: number;
   lastStaleSweepAt: string | null;
+  reliability?: {
+    windowHours: number;
+    attemptsTotal: number;
+    outcomeCounts: Record<string, number>;
+    attemptSuccessRate: number | null;
+    objectiveTerminalCount: number;
+    objectiveSuccessRate: number | null;
+    nonTerminalRevisionCount: number;
+    nonTerminalRevisionObjectiveCount: number;
+    revisedTerminalObjectiveCount: number;
+    objectiveRevisionRate: number | null;
+    objectiveFirstPassRate: number | null;
+    durationMs: { average: number | null; p50: number | null; p95: number | null };
+    validationFailureRuns: number;
+    validationEvidenceCoverageRate: number | null;
+    validationFingerprintCollisionCount: number;
+    transientValidationRetries: number;
+    activeIncidentCount: number;
+    workerHandoffFailureCount: number;
+    stalledWorkerHandoffCount: number;
+  };
 }
 
 export interface AutonomyEngineSourceInsightRow {
@@ -757,7 +782,7 @@ export async function fetchWorkers(
   authToken?: string,
 ): Promise<WorkerStatusRow[]> {
   try {
-    const response = await fetch(`${baseUrl}/workers`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/workers`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return [];
@@ -780,7 +805,7 @@ export async function fetchRequestsSnapshot(
   slo?: RequestSloSummary;
 }> {
   try {
-    const response = await fetch(`${baseUrl}/requests?limit=250`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/requests?limit=250`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return { requests: [], counts: {}, priorityCounts: {}, pendingSnapshot: [] };
@@ -816,7 +841,7 @@ export async function fetchJobsSnapshot(
   slo?: JobSloSummary;
 }> {
   try {
-    const response = await fetch(`${baseUrl}/jobs?limit=250`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/jobs?limit=250`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return { jobs: [], counts: {}, priorityCounts: {}, pendingSnapshot: [] };
@@ -849,7 +874,7 @@ export async function fetchJobLogsSnapshot(
 ): Promise<JobLogSnapshotRow[]> {
   const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
   try {
-    const response = await fetch(
+    const response = await fetchClientResponseWithDeadline(
       `${baseUrl}/jobs/${encodeURIComponent(jobId)}/logs?limit=${safeLimit}`,
       {
         headers: authHeaders(authToken),
@@ -883,7 +908,7 @@ export async function fetchCompletionsSnapshot(
   authToken?: string,
 ): Promise<{ completions: CompletionSnapshotRow[]; counts: QueueCounts }> {
   try {
-    const response = await fetch(`${baseUrl}/completions?limit=250`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/completions?limit=250`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return { completions: [], counts: {} };
@@ -907,7 +932,7 @@ export async function fetchSystemStatus(
   authToken?: string,
 ): Promise<SystemStatusSummary> {
   try {
-    const response = await fetch(`${baseUrl}/system/status`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/system/status`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return {};
@@ -946,9 +971,12 @@ export async function fetchAutonomyInsights(
       limit: String(Math.max(1, Math.min(200, Math.floor(limit)))),
       feedbackLimit: "10",
     });
-    const response = await fetch(`${baseUrl}/autonomy/insights?${qs.toString()}`, {
-      headers: authHeaders(authToken),
-    });
+    const response = await fetchClientResponseWithDeadline(
+      `${baseUrl}/autonomy/insights?${qs.toString()}`,
+      {
+        headers: authHeaders(authToken),
+      },
+    );
     if (!response.ok) return empty;
     const payload = (await response.json()) as {
       ok?: boolean;
@@ -960,24 +988,24 @@ export async function fetchAutonomyInsights(
     };
     if (!payload.ok) return empty;
     const scorecardRaw =
-      payload.latestEvaluatorScorecard && typeof payload.latestEvaluatorScorecard === "object"
+      payload.latestEvaluatorScorecard &&
+      typeof payload.latestEvaluatorScorecard === "object" &&
+      !Array.isArray(payload.latestEvaluatorScorecard)
         ? payload.latestEvaluatorScorecard
         : null;
+    const nullableNumber = (value: unknown): number | null =>
+      value == null || !Number.isFinite(Number(value)) ? null : Number(value);
+    const finiteNumber = (value: unknown, fallback = 0): number =>
+      value == null || !Number.isFinite(Number(value)) ? fallback : Number(value);
     const scorecard: AutonomyEvaluatorScorecard | null = scorecardRaw
       ? {
           id: String(scorecardRaw.id ?? ""),
-          windowHours: Number(scorecardRaw.windowHours ?? 0),
-          sampleCount: Number(scorecardRaw.sampleCount ?? 0),
-          successRate: Number.isFinite(Number(scorecardRaw.successRate))
-            ? Number(scorecardRaw.successRate)
-            : null,
-          regretRate: Number.isFinite(Number(scorecardRaw.regretRate))
-            ? Number(scorecardRaw.regretRate)
-            : null,
-          avgLatencyMs: Number.isFinite(Number(scorecardRaw.avgLatencyMs))
-            ? Number(scorecardRaw.avgLatencyMs)
-            : null,
-          dispatchCount: Number(scorecardRaw.dispatchCount ?? 0),
+          windowHours: finiteNumber(scorecardRaw.windowHours, 24),
+          sampleCount: finiteNumber(scorecardRaw.sampleCount),
+          successRate: nullableNumber(scorecardRaw.successRate),
+          regretRate: nullableNumber(scorecardRaw.regretRate),
+          avgLatencyMs: nullableNumber(scorecardRaw.avgLatencyMs),
+          dispatchCount: finiteNumber(scorecardRaw.dispatchCount),
           recommendation:
             String(scorecardRaw.recommendation ?? "").toLowerCase() === "pause"
               ? "pause"
@@ -1035,9 +1063,66 @@ export async function fetchAutonomyInsights(
                   } satisfies AutonomyOpsAlert;
                 })
             : [],
-          staleDeadLetterCount24h: Number(opsRaw.staleDeadLetterCount24h ?? 0),
+          staleDeadLetterCount24h: finiteNumber(opsRaw.staleDeadLetterCount24h),
           lastStaleSweepAt:
             typeof opsRaw.lastStaleSweepAt === "string" ? String(opsRaw.lastStaleSweepAt) : null,
+          reliability: (() => {
+            const reliability =
+              opsRaw.reliability &&
+              typeof opsRaw.reliability === "object" &&
+              !Array.isArray(opsRaw.reliability)
+                ? (opsRaw.reliability as Record<string, unknown>)
+                : {};
+            const duration =
+              reliability.durationMs &&
+              typeof reliability.durationMs === "object" &&
+              !Array.isArray(reliability.durationMs)
+                ? (reliability.durationMs as Record<string, unknown>)
+                : {};
+            const outcomeCounts =
+              reliability.outcomeCounts &&
+              typeof reliability.outcomeCounts === "object" &&
+              !Array.isArray(reliability.outcomeCounts)
+                ? Object.fromEntries(
+                    Object.entries(reliability.outcomeCounts as Record<string, unknown>).map(
+                      ([key, value]) => [key, finiteNumber(value)],
+                    ),
+                  )
+                : {};
+            return {
+              windowHours: finiteNumber(reliability.windowHours, 24),
+              attemptsTotal: finiteNumber(reliability.attemptsTotal),
+              outcomeCounts,
+              attemptSuccessRate: nullableNumber(reliability.attemptSuccessRate),
+              objectiveTerminalCount: finiteNumber(reliability.objectiveTerminalCount),
+              objectiveSuccessRate: nullableNumber(reliability.objectiveSuccessRate),
+              nonTerminalRevisionCount: finiteNumber(reliability.nonTerminalRevisionCount),
+              nonTerminalRevisionObjectiveCount: finiteNumber(
+                reliability.nonTerminalRevisionObjectiveCount,
+              ),
+              revisedTerminalObjectiveCount: finiteNumber(
+                reliability.revisedTerminalObjectiveCount,
+              ),
+              objectiveRevisionRate: nullableNumber(reliability.objectiveRevisionRate),
+              objectiveFirstPassRate: nullableNumber(reliability.objectiveFirstPassRate),
+              durationMs: {
+                average: nullableNumber(duration.average),
+                p50: nullableNumber(duration.p50),
+                p95: nullableNumber(duration.p95),
+              },
+              validationFailureRuns: finiteNumber(reliability.validationFailureRuns),
+              validationEvidenceCoverageRate: nullableNumber(
+                reliability.validationEvidenceCoverageRate,
+              ),
+              validationFingerprintCollisionCount: finiteNumber(
+                reliability.validationFingerprintCollisionCount,
+              ),
+              transientValidationRetries: finiteNumber(reliability.transientValidationRetries),
+              activeIncidentCount: finiteNumber(reliability.activeIncidentCount),
+              workerHandoffFailureCount: finiteNumber(reliability.workerHandoffFailureCount),
+              stalledWorkerHandoffCount: finiteNumber(reliability.stalledWorkerHandoffCount),
+            };
+          })(),
         }
       : null;
     return {
@@ -1066,9 +1151,12 @@ export async function fetchAutonomyInspiration(
     const qs = new URLSearchParams({
       limit: String(Math.max(1, Math.min(100, Math.floor(limit)))),
     });
-    const response = await fetch(`${baseUrl}/autonomy/inspiration?${qs.toString()}`, {
-      headers: authHeaders(authToken),
-    });
+    const response = await fetchClientResponseWithDeadline(
+      `${baseUrl}/autonomy/inspiration?${qs.toString()}`,
+      {
+        headers: authHeaders(authToken),
+      },
+    );
     if (!response.ok) return [];
     const payload = (await response.json()) as {
       ok?: boolean;
@@ -1146,9 +1234,12 @@ export async function fetchAutonomyQuestions(
       qs.set("limit", String(Math.max(1, Math.min(500, Math.floor(params.limit)))));
     }
     const suffix = qs.toString();
-    const response = await fetch(`${baseUrl}/questions${suffix ? `?${suffix}` : ""}`, {
-      headers: authHeaders(authToken),
-    });
+    const response = await fetchClientResponseWithDeadline(
+      `${baseUrl}/questions${suffix ? `?${suffix}` : ""}`,
+      {
+        headers: authHeaders(authToken),
+      },
+    );
     if (!response.ok) return [];
     const payload = (await response.json()) as {
       ok?: boolean;
@@ -1212,14 +1303,17 @@ export async function answerAutonomyQuestion(
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
-    const response = await fetch(`${baseUrl}/questions/${encodeURIComponent(questionId)}/answer`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        answer,
-        ...(sessionId ? { sessionId } : {}),
-      }),
-    });
+    const response = await fetchClientResponseWithDeadline(
+      `${baseUrl}/questions/${encodeURIComponent(questionId)}/answer`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          answer,
+          ...(sessionId ? { sessionId } : {}),
+        }),
+      },
+    );
     if (!response.ok) {
       const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
       return {
@@ -1260,15 +1354,18 @@ export async function actOnAutonomyQuestion(
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
-    const response = await fetch(`${baseUrl}/questions/${encodeURIComponent(questionId)}/action`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        action,
-        ...(note ? { note } : {}),
-        ...(sessionId ? { sessionId } : {}),
-      }),
-    });
+    const response = await fetchClientResponseWithDeadline(
+      `${baseUrl}/questions/${encodeURIComponent(questionId)}/action`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          action,
+          ...(note ? { note } : {}),
+          ...(sessionId ? { sessionId } : {}),
+        }),
+      },
+    );
     const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     return {
       ok: Boolean(payload.ok),
@@ -1297,7 +1394,7 @@ export async function fetchAutonomySafety(
   authToken?: string,
 ): Promise<AutonomySafetyState | null> {
   try {
-    const response = await fetch(`${baseUrl}/autonomy/safety`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/autonomy/safety`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return null;
@@ -1331,7 +1428,7 @@ export async function updateAutonomySafety(
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
-    const response = await fetch(`${baseUrl}/autonomy/safety`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/autonomy/safety`, {
       method: "POST",
       headers,
       body: JSON.stringify(update),
@@ -1371,7 +1468,7 @@ export async function fetchRuntimeConfig(
   authToken?: string,
 ): Promise<RuntimeConfigSnapshot | null> {
   try {
-    const response = await fetch(`${baseUrl}/config/runtime`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/config/runtime`, {
       headers: authHeaders(authToken),
     });
     if (!response.ok) return null;
@@ -1399,7 +1496,7 @@ export async function updateRuntimeConfig(
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
-    const response = await fetch(`${baseUrl}/config/runtime`, {
+    const response = await fetchClientResponseWithDeadline(`${baseUrl}/config/runtime`, {
       method: "POST",
       headers,
       body: JSON.stringify({ updates }),
@@ -1455,11 +1552,14 @@ export async function sendCommand(
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
 
-    const response = await fetch(`${baseUrl}/sessions/${sessionId}/command`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(command),
-    });
+    const response = await fetchClientResponseWithDeadline(
+      `${baseUrl}/sessions/${sessionId}/command`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(command),
+      },
+    );
 
     if (!response.ok) return { ok: false };
     return await response.json();

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { Database } from "bun:sqlite";
 import { RequestQueue } from "../apps/server/src/requests";
 
 describe("server RequestQueue", () => {
@@ -83,7 +84,11 @@ describe("server RequestQueue", () => {
     expect(first.ok).toBe(true);
     const firstClaim = queue.claim("remotebuddy-orchestrator");
     expect(firstClaim.ok).toBe(true);
-    const firstComplete = queue.complete(first.requestId!, { result: { ok: true } });
+    const firstComplete = queue.complete(first.requestId!, {
+      agentId: "remotebuddy-orchestrator",
+      claimToken: firstClaim.request?.claimToken,
+      result: { ok: true },
+    });
     expect(firstComplete.ok).toBe(true);
 
     const second = queue.enqueue({
@@ -94,7 +99,11 @@ describe("server RequestQueue", () => {
     expect(second.ok).toBe(true);
     const secondClaim = queue.claim("remotebuddy-orchestrator");
     expect(secondClaim.ok).toBe(true);
-    const secondFail = queue.fail(second.requestId!, { message: "planner failed" });
+    const secondFail = queue.fail(second.requestId!, {
+      agentId: "remotebuddy-orchestrator",
+      claimToken: secondClaim.request?.claimToken,
+      message: "planner failed",
+    });
     expect(secondFail.ok).toBe(true);
 
     const slo = queue.sloSummary(24);
@@ -105,6 +114,117 @@ describe("server RequestQueue", () => {
     expect(slo.durationMs.sampleSize).toBeGreaterThanOrEqual(2);
     expect(slo.queueWaitMs.sampleSize).toBeGreaterThanOrEqual(2);
 
+    queue.close();
+  });
+
+  test("renews claimed request leases only for the current owner", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({ sessionId: "dev", prompt: "plan a durable handoff" });
+    const requestId = String(enqueued.requestId ?? "");
+    const claimed = queue.claim("remotebuddy-a", { leaseMs: 60_000 });
+
+    expect(claimed.ok).toBe(true);
+    expect(claimed.request?.leaseExpiresAt).toBeTruthy();
+    expect(claimed.request?.lastHeartbeatAt).toBeTruthy();
+    expect(claimed.request?.claimAttempts).toBe(1);
+
+    const previousExpiry = String(claimed.request?.leaseExpiresAt ?? "");
+    const claimToken = String(claimed.request?.claimToken ?? "");
+    expect(queue.renewLease(requestId, "remotebuddy-b", claimToken, { leaseMs: 120_000 }).ok).toBe(
+      false,
+    );
+    const renewed = queue.renewLease(requestId, "remotebuddy-a", claimToken, {
+      leaseMs: 120_000,
+    });
+    expect(renewed.ok).toBe(true);
+    expect(Date.parse(String(renewed.leaseExpiresAt))).toBeGreaterThanOrEqual(
+      Date.parse(previousExpiry),
+    );
+    queue.close();
+  });
+
+  test("rejects ownerless terminal writes and worker handoffs", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({ sessionId: "dev", prompt: "keep ownership explicit" });
+    const requestId = String(enqueued.requestId ?? "");
+    expect(queue.claim("remotebuddy-owner").ok).toBe(true);
+
+    expect(queue.recordWorkerHandoff(requestId, "job-ownerless", "", "").ok).toBe(false);
+    expect(queue.complete(requestId, { result: { ok: true } }).ok).toBe(false);
+    expect(queue.fail(requestId, { message: "ownerless" }).ok).toBe(false);
+    expect(queue.getRequest(requestId)?.status).toBe("claimed");
+    queue.close();
+  });
+
+  test("recovers an expired claim and rejects the stale owner's terminal write", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({ sessionId: "dev", prompt: "recover this planner" });
+    const requestId = String(enqueued.requestId ?? "");
+    const claimed = queue.claim("remotebuddy-old", { leaseMs: 30_000 });
+    expect(claimed.ok).toBe(true);
+
+    const recovered = queue.recoverExpiredClaims(
+      new Date(Date.parse(String(claimed.request?.leaseExpiresAt)) + 1),
+    );
+    expect(recovered).toEqual({ recovered: 1, requestIds: [requestId] });
+    expect(queue.getRequest(requestId)?.status).toBe("pending");
+    const staleToken = String(claimed.request?.claimToken ?? "");
+    expect(
+      queue.complete(requestId, {
+        agentId: "remotebuddy-old",
+        claimToken: staleToken,
+        result: { ok: true },
+      }).ok,
+    ).toBe(false);
+
+    const reclaimed = queue.claim("remotebuddy-new");
+    expect(reclaimed.request?.id).toBe(requestId);
+    expect(reclaimed.request?.claimAttempts).toBe(2);
+    expect(
+      queue.complete(requestId, {
+        agentId: "remotebuddy-old",
+        claimToken: staleToken,
+        result: { ok: true },
+      }).ok,
+    ).toBe(false);
+    expect(
+      queue.complete(requestId, {
+        agentId: "remotebuddy-new",
+        claimToken: reclaimed.request?.claimToken,
+        result: { ok: true },
+      }).ok,
+    ).toBe(true);
+    queue.close();
+  });
+
+  test("persists worker requirements and handoffs before completion", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({
+      sessionId: "dev",
+      prompt: "delegate this request",
+      forceWorker: true,
+    });
+    const requestId = String(enqueued.requestId ?? "");
+    const claimed = queue.claim("remotebuddy-owner");
+
+    expect(claimed.request?.workerRequired).toBe(1);
+    expect(claimed.request?.handoffJobId).toBeNull();
+    const claimToken = String(claimed.request?.claimToken ?? "");
+    expect(queue.recordWorkerHandoff(requestId, "job-1", "wrong-owner", claimToken).ok).toBe(false);
+    expect(queue.recordWorkerHandoff(requestId, "job-1", "remotebuddy-owner", claimToken).ok).toBe(
+      true,
+    );
+    expect(queue.getRequest(requestId)).toMatchObject({
+      workerRequired: 1,
+      handoffJobId: "job-1",
+    });
+    expect(
+      queue.complete(requestId, {
+        agentId: "remotebuddy-owner",
+        claimToken,
+        result: { requiresWorker: false },
+      }).ok,
+    ).toBe(true);
     queue.close();
   });
 
@@ -293,6 +413,232 @@ describe("server RequestQueue", () => {
     queue.close();
   });
 
+  test("requeues a failed idempotent request instead of suppressing it forever", () => {
+    const queue = new RequestQueue(":memory:");
+    const body = {
+      sessionId: "dev",
+      prompt: "retry this autonomy objective",
+      priority: "background",
+      forceWorker: true,
+      idempotencyKey: "autonomy:obj-retry",
+    };
+    const first = queue.enqueue(body);
+    const requestId = String(first.requestId ?? "");
+    const claimed = queue.claim("remotebuddy-first");
+    expect(claimed.ok).toBe(true);
+    expect(
+      queue.fail(requestId, {
+        agentId: "remotebuddy-first",
+        claimToken: claimed.request?.claimToken,
+        message: "transient planning transport failure",
+      }).ok,
+    ).toBe(true);
+
+    const retried = queue.enqueue(body);
+    expect(retried).toMatchObject({ ok: true, requestId, requeued: true });
+    expect(retried.deduplicated).not.toBe(true);
+    expect(queue.getRequest(requestId)).toMatchObject({
+      status: "pending",
+      forceWorker: 1,
+      workerRequired: 1,
+      handoffJobId: null,
+      error: null,
+      claimAttempts: 1,
+    });
+    const reclaimed = queue.claim("remotebuddy-second");
+    expect(reclaimed.request).toMatchObject({ id: requestId, claimAttempts: 2 });
+    queue.close();
+  });
+
+  test("fences stale callbacks when the same agent reclaims an expired request", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({ sessionId: "dev", prompt: "same-agent ABA" });
+    const requestId = String(enqueued.requestId ?? "");
+    const first = queue.claim("remotebuddy-stable", { leaseMs: 30_000 });
+    const staleToken = String(first.request?.claimToken ?? "");
+    expect(staleToken).not.toBe("");
+
+    queue.recoverExpiredClaims(new Date(Date.parse(String(first.request?.leaseExpiresAt)) + 1));
+    const second = queue.claim("remotebuddy-stable", { leaseMs: 30_000 });
+    const activeToken = String(second.request?.claimToken ?? "");
+    expect(activeToken).not.toBe(staleToken);
+    expect(second.request?.claimGeneration).toBe(2);
+
+    expect(queue.validateActiveLease(requestId, "remotebuddy-stable", staleToken).ok).toBe(false);
+    expect(queue.renewLease(requestId, "remotebuddy-stable", staleToken).ok).toBe(false);
+    expect(
+      queue.recordWorkerHandoff(requestId, "job-stale", "remotebuddy-stable", staleToken).ok,
+    ).toBe(false);
+    expect(
+      queue.complete(requestId, {
+        agentId: "remotebuddy-stable",
+        claimToken: staleToken,
+        result: { ok: true },
+      }).ok,
+    ).toBe(false);
+    expect(
+      queue.fail(requestId, {
+        agentId: "remotebuddy-stable",
+        claimToken: staleToken,
+        message: "stale failure",
+      }).ok,
+    ).toBe(false);
+    expect(queue.validateActiveLease(requestId, "remotebuddy-stable", activeToken).ok).toBe(true);
+    expect(
+      queue.complete(requestId, {
+        agentId: "remotebuddy-stable",
+        claimToken: activeToken,
+        result: { ok: true },
+      }).ok,
+    ).toBe(true);
+    queue.close();
+  });
+
+  test("replays terminal callbacks idempotently only for the same claim token", () => {
+    const queue = new RequestQueue(":memory:");
+    const completed = queue.enqueue({ sessionId: "dev", prompt: "complete once" });
+    const completedClaim = queue.claim("remotebuddy-stable");
+    const completedBody = {
+      agentId: "remotebuddy-stable",
+      claimToken: completedClaim.request?.claimToken,
+      result: { ok: true },
+    };
+
+    expect(queue.complete(String(completed.requestId), completedBody)).toMatchObject({
+      ok: true,
+      transitioned: true,
+    });
+    expect(queue.complete(String(completed.requestId), completedBody)).toMatchObject({
+      ok: true,
+      transitioned: false,
+      idempotent: true,
+    });
+    expect(
+      queue.complete(String(completed.requestId), {
+        ...completedBody,
+        claimToken: "stale-token",
+      }).ok,
+    ).toBe(false);
+    expect(
+      queue.fail(String(completed.requestId), {
+        agentId: "remotebuddy-stable",
+        claimToken: completedClaim.request?.claimToken,
+        message: "late opposite transition",
+      }).ok,
+    ).toBe(false);
+
+    const failed = queue.enqueue({ sessionId: "dev", prompt: "fail once" });
+    const failedClaim = queue.claim("remotebuddy-stable");
+    const failedBody = {
+      agentId: "remotebuddy-stable",
+      claimToken: failedClaim.request?.claimToken,
+      message: "expected failure",
+    };
+    expect(queue.fail(String(failed.requestId), failedBody)).toMatchObject({
+      ok: true,
+      transitioned: true,
+    });
+    expect(queue.fail(String(failed.requestId), failedBody)).toMatchObject({
+      ok: true,
+      transitioned: false,
+      idempotent: true,
+    });
+    expect(queue.complete(String(failed.requestId), completedBody).ok).toBe(false);
+    queue.close();
+  });
+
+  test("reconciles an expired ordinary request from only its strict durable task job", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-handoff-reconcile-"));
+    const dbPath = join(root, "requests.sqlite");
+    const queue = new RequestQueue(dbPath);
+    const db = new Database(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE jobs (
+          id TEXT PRIMARY KEY,
+          sessionId TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          params TEXT NOT NULL,
+          createdAt TEXT NOT NULL
+        );
+      `);
+      const good = queue.enqueue({ sessionId: "user-session", prompt: "dispatch once" });
+      const wrongSession = queue.enqueue({
+        sessionId: "user-session",
+        prompt: "do not match another session",
+      });
+      const malformed = queue.enqueue({
+        sessionId: "user-session",
+        prompt: "do not match malformed params",
+      });
+      const goodClaim = queue.claim("remotebuddy-stable", { leaseMs: 30_000 });
+      const wrongClaim = queue.claim("remotebuddy-stable", { leaseMs: 30_000 });
+      const malformedClaim = queue.claim("remotebuddy-stable", { leaseMs: 30_000 });
+      expect(goodClaim.request?.id).toBe(good.requestId);
+      expect(wrongClaim.request?.id).toBe(wrongSession.requestId);
+      expect(malformedClaim.request?.id).toBe(malformed.requestId);
+
+      const createdAt = new Date(Date.now() + 1_000).toISOString();
+      const insert = db.prepare(
+        `INSERT INTO jobs (id, sessionId, kind, params, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      );
+      insert.run(
+        "job-good",
+        "user-session",
+        "task.execute",
+        JSON.stringify({ requestId: good.requestId }),
+        createdAt,
+      );
+      insert.run(
+        "job-wrong-session",
+        "other-session",
+        "task.execute",
+        JSON.stringify({ requestId: wrongSession.requestId }),
+        createdAt,
+      );
+      insert.run("job-malformed", "user-session", "task.execute", "{not-json", createdAt);
+      insert.run(
+        "job-wrong-kind",
+        "user-session",
+        "task.inspect",
+        JSON.stringify({ requestId: malformed.requestId }),
+        createdAt,
+      );
+      insert.finalize();
+
+      const reconcileAt = new Date(Date.parse(String(goodClaim.request?.leaseExpiresAt)) + 1);
+      expect(queue.reconcileWorkerHandoffsFromJobs(reconcileAt)).toEqual({
+        completed: 1,
+        requestIds: [good.requestId],
+        jobIds: ["job-good"],
+      });
+      expect(queue.getRequest(String(good.requestId))).toMatchObject({
+        status: "completed",
+        workerRequired: 1,
+        handoffJobId: "job-good",
+        agentId: "remotebuddy-stable",
+        claimToken: goodClaim.request?.claimToken,
+      });
+      expect(queue.getRequest(String(wrongSession.requestId))?.status).toBe("claimed");
+      expect(queue.getRequest(String(malformed.requestId))?.status).toBe("claimed");
+      expect(
+        queue.complete(String(good.requestId), {
+          agentId: "remotebuddy-stable",
+          claimToken: goodClaim.request?.claimToken,
+          result: { requiresWorker: true, jobId: "job-good" },
+        }),
+      ).toMatchObject({ ok: true, idempotent: true });
+    } finally {
+      queue.close();
+      db.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
+  });
+
   test("deduplicates enqueue by idempotency key across queue restart", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-request-queue-restart-"));
     const dbPath = join(root, "requests.sqlite");
@@ -332,4 +678,81 @@ describe("server RequestQueue", () => {
       }
     }
   });
+
+  test("startup migration requeues a claimed request that has no fencing token", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-legacy-claim-"));
+    const dbPath = join(root, "requests.sqlite");
+    let queue: RequestQueue | null = new RequestQueue(dbPath);
+    try {
+      const enqueued = queue.enqueue({ sessionId: "dev", prompt: "legacy active claim" });
+      const requestId = String(enqueued.requestId ?? "");
+      expect(queue.claim("legacy-remotebuddy", { leaseMs: 120_000 }).ok).toBe(true);
+      queue.close();
+      queue = null;
+
+      const db = new Database(dbPath);
+      db.prepare(`UPDATE requests SET claimToken = NULL WHERE id = ?`).run(requestId);
+      db.close();
+
+      queue = new RequestQueue(dbPath);
+      expect(queue.getRequest(requestId)).toMatchObject({
+        status: "pending",
+        agentId: null,
+        claimToken: null,
+        leaseExpiresAt: null,
+      });
+      expect(queue.claim("replacement-remotebuddy").request).toMatchObject({
+        id: requestId,
+        status: "claimed",
+        claimToken: expect.any(String),
+        claimGeneration: 2,
+      });
+    } finally {
+      queue?.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
+  });
+
+  test("tolerates malformed legacy metadata during restart and claim", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-legacy-json-"));
+    const dbPath = join(root, "requests.sqlite");
+    let queue: RequestQueue | null = null;
+
+    try {
+      queue = new RequestQueue(dbPath);
+      const enqueued = queue.enqueue({ sessionId: "dev", prompt: "legacy request" });
+      const requestId = String(enqueued.requestId ?? "");
+      queue.close();
+      queue = null;
+
+      const db = new Database(dbPath);
+      db.prepare(`UPDATE requests SET metadataJson = ? WHERE id = ?`).run("{not-json", requestId);
+      db.close();
+
+      queue = new RequestQueue(dbPath);
+      expect(queue.getRequest(requestId)?.metadata).toBeUndefined();
+      expect(queue.claim("remotebuddy-legacy")).toMatchObject({
+        ok: true,
+        request: { id: requestId, metadata: undefined },
+      });
+    } finally {
+      queue?.close();
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 20; attempt += 1) {
+        try {
+          rmSync(root, { recursive: true, force: true });
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          await Bun.sleep(25 * attempt);
+        }
+      }
+      if (lastError) throw lastError;
+    }
+  }, 15_000);
 });

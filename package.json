@@ -12,6 +12,7 @@
     "cli:verify-package-payload": "bun run scripts/verify-cli-package-payload.ts",
     "cli:monitor:export": "bun run scripts/sync-cli-monitor-ui.ts",
     "replay:worker-job": "bun run scripts/replay-worker-job.ts",
+    "harness:reliability": "bun run scripts/reliability-harness.ts",
     "protocol:build": "bun --cwd packages/protocol build",
     "protocol:typecheck": "bun --cwd packages/protocol typecheck",
     "server:only": "bun --cwd apps/server --env-file ../../.env dev",

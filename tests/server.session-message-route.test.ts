@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { Database } from "bun:sqlite";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
@@ -39,7 +40,18 @@ afterEach(async () => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (!dir) continue;
-    rmSync(dir, { recursive: true, force: true });
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        await Bun.sleep(25 * attempt);
+      }
+    }
+    if (lastError) throw lastError;
   }
 });
 
@@ -150,6 +162,69 @@ async function waitForHealth(
   }
 
   throw new Error(`server did not become healthy within ${timeoutMs}ms`);
+}
+
+function postServerJson(
+  port: number,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function seedPendingPublication(
+  port: number,
+  label: string,
+): Promise<{ jobId: string; completionId: string }> {
+  const enqueued = await postServerJson(port, "/jobs/enqueue", {
+    taskId: `publication-seed-task-${label}`,
+    sessionId: "publication-seed",
+    kind: "task.execute",
+    params: { origin: "user" },
+  });
+  expect(enqueued.status).toBe(201);
+  const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+  expect(jobId).not.toBe("");
+
+  const claimed = await postServerJson(port, "/jobs/claim", {
+    workerId: "publication-seed-worker",
+  });
+  expect(claimed.status).toBe(200);
+  expect(await claimed.json()).toMatchObject({ job: { id: jobId } });
+
+  const completion = await postServerJson(port, "/completions/enqueue", {
+    jobId,
+    sessionId: "publication-seed",
+    origin: "user",
+    commitSha: `candidate-${label}`,
+    branch: `refs/pushpals/publication-seed-${label}`,
+    message: `Pending publication ${label}`,
+  });
+  expect(completion.status).toBe(201);
+  const completionPayload = (await completion.json()) as Record<string, unknown>;
+  const completionId = String(completionPayload.completionId ?? "");
+  expect(completionPayload).toMatchObject({ ok: true });
+  expect(completionId).not.toBe("");
+  return { jobId, completionId };
+}
+
+function autonomyRequestMetadata(label: string): Record<string, unknown> {
+  return {
+    origin: "autonomy",
+    autonomy: {
+      objectiveId: `publication-pressure-${label}`,
+      runId: `publication-pressure-run-${label}`,
+      snapshotId: `publication-pressure-snapshot-${label}`,
+      patternKey: `publication-pressure-pattern-${label}`,
+      componentArea: "apps/server",
+      targetPaths: ["apps/server/src/server_main.ts"],
+      writeGlobs: ["apps/server/src/*.ts"],
+    },
+  };
 }
 
 describe("server session message route", () => {
@@ -334,6 +409,124 @@ describe("server session message route", () => {
     });
   }, 15_000);
 
+  test("authoritatively rejects new autonomy admission at publication capacity", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const firstPublication = await seedPendingPublication(port, "one");
+    const firstPublicationStatus = await fetch(
+      `http://127.0.0.1:${port}/completions/${firstPublication.completionId}/status`,
+    );
+    const firstPublicationStatusPayload = await firstPublicationStatus.json();
+    expect({
+      status: firstPublicationStatus.status,
+      payload: firstPublicationStatusPayload,
+    }).toEqual({
+      status: 200,
+      payload: {
+        ok: true,
+        completion: {
+          id: firstPublication.completionId,
+          status: "pending",
+          commitSha: "candidate-one",
+          branch: "refs/pushpals/publication-seed-one",
+          claimGeneration: 0,
+        },
+      },
+    });
+
+    const belowThreshold = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "autonomy-publication-pressure",
+      prompt: "Use the remaining safe publication capacity.",
+      priority: "background",
+      metadata: autonomyRequestMetadata("below-threshold"),
+    });
+    expect(belowThreshold.status).toBe(201);
+
+    await seedPendingPublication(port, "two");
+    const blockedRequest = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "autonomy-publication-pressure",
+      prompt: "Do not add more publication work yet.",
+      priority: "background",
+      metadata: autonomyRequestMetadata("blocked"),
+    });
+    expect(blockedRequest.status).toBe(429);
+    expect(await blockedRequest.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_publication_backpressure",
+      publication: { backlog: 2 },
+      onlineWorkers: 1,
+      threshold: 2,
+    });
+
+    const blockedDirectJob = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "direct-autonomy-under-publication-pressure",
+      sessionId: "autonomy-publication-pressure",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(blockedDirectJob.status).toBe(429);
+    expect(await blockedDirectJob.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_publication_backpressure",
+    });
+
+    const userRequest = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "user-publication-pressure",
+      prompt: "User work must remain admitted.",
+    });
+    expect(userRequest.status).toBe(201);
+  }, 15_000);
+
+  test("allows an accepted autonomy request to hand off after publication pressure rises", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    await seedPendingPublication(port, "before-admission");
+
+    const accepted = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "autonomy-handoff-pressure",
+      prompt: "Plan this work while publication capacity remains.",
+      priority: "background",
+      forceWorker: true,
+      forceLane: "worker",
+      metadata: autonomyRequestMetadata("accepted-handoff"),
+    });
+    expect(accepted.status).toBe(201);
+    const requestId = String(((await accepted.json()) as Record<string, unknown>).requestId ?? "");
+
+    const claimed = await postServerJson(port, "/requests/claim", {
+      agentId: "remotebuddy-publication-pressure",
+      leaseMs: 60_000,
+    });
+    expect(claimed.status).toBe(200);
+    const claimPayload = (await claimed.json()) as {
+      request?: { id?: string; claimToken?: string };
+    };
+    expect(claimPayload.request?.id).toBe(requestId);
+    const claimToken = String(claimPayload.request?.claimToken ?? "");
+
+    await seedPendingPublication(port, "after-admission");
+    const handoff = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "accepted-autonomy-handoff-under-pressure",
+      sessionId: "autonomy-handoff-pressure",
+      kind: "task.execute",
+      params: { origin: "autonomy", requestId },
+      requestAgentId: "remotebuddy-publication-pressure",
+      requestClaimToken: claimToken,
+      dedupeKey: `task.execute:autonomy:autonomy-handoff-pressure:request:${requestId}:idempotent`,
+      dedupeCooldownMs: 24 * 60 * 60 * 1000,
+    });
+    expect(handoff.status).toBe(201);
+    expect(await handoff.json()).toMatchObject({ ok: true, jobId: expect.any(String) });
+  }, 15_000);
+
   test("blocks new session work after the token budget is exceeded", async () => {
     const root = makeTempDir();
     const port = await getFreePort();
@@ -440,4 +633,285 @@ describe("server session message route", () => {
       code: "accepted",
     });
   }, 15_000);
+
+  test("enforces durable request leases and worker handoffs through the real HTTP routes", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const postJson = (path: string, body: Record<string, unknown>) =>
+      fetch(`http://127.0.0.1:${port}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    const forced = await postJson("/requests/enqueue", {
+      sessionId: "handoff-session",
+      prompt: "This request must reach a worker.",
+      forceWorker: true,
+      forceLane: "worker",
+    });
+    const forcedId = String(((await forced.json()) as Record<string, unknown>).requestId ?? "");
+    expect(forcedId).not.toBe("");
+    const forcedClaim = await postJson("/requests/claim", {
+      agentId: "remotebuddy-route-test",
+      leaseMs: 60_000,
+    });
+    expect(forcedClaim.status).toBe(200);
+    const forcedClaimPayload = (await forcedClaim.json()) as {
+      request: { claimToken: string };
+    };
+    const forcedClaimToken = forcedClaimPayload.request.claimToken;
+
+    // The callback cannot downgrade the durable forceWorker requirement.
+    const missingHandoff = await postJson(`/requests/${forcedId}/complete`, {
+      agentId: "remotebuddy-route-test",
+      claimToken: forcedClaimToken,
+      result: { requiresWorker: false },
+    });
+    expect(missingHandoff.status).toBe(409);
+    expect(await missingHandoff.json()).toMatchObject({
+      ok: false,
+      code: "worker_handoff_missing",
+    });
+
+    const delegated = await postJson("/requests/enqueue", {
+      sessionId: "handoff-session",
+      prompt: "The planner will delegate this request.",
+    });
+    const delegatedId = String(
+      ((await delegated.json()) as Record<string, unknown>).requestId ?? "",
+    );
+    const delegatedClaim = await postJson("/requests/claim", {
+      agentId: "remotebuddy-route-test",
+      leaseMs: 60_000,
+    });
+    expect(delegatedClaim.status).toBe(200);
+    const delegatedClaimPayload = (await delegatedClaim.json()) as {
+      request: { id: string; workerRequired: number; claimToken: string };
+    };
+    expect(delegatedClaimPayload).toMatchObject({
+      request: { id: delegatedId, workerRequired: 0 },
+    });
+    const delegatedClaimToken = delegatedClaimPayload.request.claimToken;
+
+    const staleOwnerJob = await postJson("/jobs/enqueue", {
+      taskId: "task-route-stale-owner",
+      sessionId: "handoff-session",
+      kind: "task.execute",
+      params: { requestId: delegatedId },
+      requestAgentId: "remotebuddy-stale",
+      requestClaimToken: delegatedClaimToken,
+    });
+    expect(staleOwnerJob.status).toBe(409);
+    expect(await staleOwnerJob.json()).toMatchObject({
+      ok: false,
+      code: "request_lease_invalid",
+    });
+
+    const unknownRequestJob = await postJson("/jobs/enqueue", {
+      taskId: "task-route-unknown-request",
+      sessionId: "handoff-session",
+      kind: "task.execute",
+      params: { requestId: "request-does-not-exist" },
+      requestAgentId: "remotebuddy-route-test",
+    });
+    expect(unknownRequestJob.status).toBe(409);
+    expect(await unknownRequestJob.json()).toMatchObject({
+      ok: false,
+      code: "request_not_found",
+    });
+
+    const ownerlessCompletion = await postJson(`/requests/${delegatedId}/complete`, {
+      result: { requiresWorker: false },
+    });
+    expect(ownerlessCompletion.status).toBe(409);
+    expect(await ownerlessCompletion.json()).toMatchObject({
+      ok: false,
+      code: "request_lease_invalid",
+    });
+
+    const jobResponse = await postJson("/jobs/enqueue", {
+      taskId: "task-route-handoff",
+      sessionId: "handoff-session",
+      kind: "task.execute",
+      params: { requestId: delegatedId },
+      requestAgentId: "remotebuddy-route-test",
+      requestClaimToken: delegatedClaimToken,
+      dedupeKey: `task.execute:user:handoff-session:request:${delegatedId}:tests/route.test.ts`,
+    });
+    expect(jobResponse.status).toBe(201);
+    const jobId = String(((await jobResponse.json()) as Record<string, unknown>).jobId ?? "");
+    expect(jobId).not.toBe("");
+
+    const renewed = await postJson(`/requests/${delegatedId}/lease/renew`, {
+      agentId: "remotebuddy-route-test",
+      claimToken: delegatedClaimToken,
+      leaseMs: 120_000,
+    });
+    expect(renewed.status).toBe(200);
+    expect(await renewed.json()).toMatchObject({ ok: true, leaseExpiresAt: expect.any(String) });
+
+    const handoff = await postJson(`/requests/${delegatedId}/worker-handoff`, {
+      agentId: "remotebuddy-route-test",
+      claimToken: delegatedClaimToken,
+      jobId,
+    });
+    expect(handoff.status).toBe(200);
+    expect(await handoff.json()).toMatchObject({ ok: true });
+
+    // The server now infers delegation from its stored handoff, even if the
+    // completion payload omits/reports a false requiresWorker value.
+    const completed = await postJson(`/requests/${delegatedId}/complete`, {
+      agentId: "remotebuddy-route-test",
+      claimToken: delegatedClaimToken,
+      result: { requiresWorker: false, jobId },
+    });
+    expect(completed.status).toBe(200);
+    expect(await completed.json()).toMatchObject({ ok: true });
+
+    const replayedCompletion = await postJson(`/requests/${delegatedId}/complete`, {
+      agentId: "remotebuddy-route-test",
+      claimToken: delegatedClaimToken,
+      result: { requiresWorker: false, jobId },
+    });
+    expect(replayedCompletion.status).toBe(200);
+    expect(await replayedCompletion.json()).toMatchObject({
+      ok: true,
+      idempotent: true,
+      transitioned: false,
+    });
+    const staleReplay = await postJson(`/requests/${delegatedId}/complete`, {
+      agentId: "remotebuddy-route-test",
+      claimToken: "stale-route-token",
+      result: { requiresWorker: false, jobId },
+    });
+    expect(staleReplay.status).toBe(409);
+
+    const requestDetail = await fetch(`http://127.0.0.1:${port}/requests/${delegatedId}`);
+    expect(requestDetail.status).toBe(200);
+    expect(await requestDetail.json()).toMatchObject({
+      ok: true,
+      request: {
+        id: delegatedId,
+        status: "completed",
+        agentId: "remotebuddy-route-test",
+        claimToken: delegatedClaimToken,
+      },
+    });
+
+    const listed = await fetch(`http://127.0.0.1:${port}/requests?status=completed&limit=20`);
+    const listedPayload = (await listed.json()) as {
+      requests: Array<Record<string, unknown>>;
+    };
+    expect(listedPayload.requests).toContainEqual(
+      expect.objectContaining({
+        id: delegatedId,
+        status: "completed",
+        workerRequired: 1,
+        handoffJobId: jobId,
+        leaseExpiresAt: null,
+      }),
+    );
+
+    // Simulate a process crash after /jobs/enqueue returned but before the
+    // separate handoff callback. On the next claim, the generic request/job
+    // reconciler must close the request instead of dispatching it again.
+    const crashWindow = await postJson("/requests/enqueue", {
+      sessionId: "handoff-session",
+      prompt: "Recover my ordinary user handoff after a crash.",
+    });
+    const crashRequestId = String(
+      ((await crashWindow.json()) as Record<string, unknown>).requestId ?? "",
+    );
+    const crashClaim = await postJson("/requests/claim", {
+      agentId: "remotebuddy-crash-window",
+      leaseMs: 60_000,
+    });
+    const crashClaimPayload = (await crashClaim.json()) as {
+      request: { claimToken: string };
+    };
+    const crashJob = await postJson("/jobs/enqueue", {
+      taskId: "task-route-crash-window",
+      sessionId: "handoff-session",
+      kind: "task.execute",
+      params: { requestId: crashRequestId },
+      requestAgentId: "remotebuddy-crash-window",
+      requestClaimToken: crashClaimPayload.request.claimToken,
+      dedupeKey: `task.execute:user:handoff-session:request:${crashRequestId}:tests/crash.test.ts`,
+    });
+    const crashJobId = String(((await crashJob.json()) as Record<string, unknown>).jobId ?? "");
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      db.prepare(`UPDATE requests SET leaseExpiresAt = ? WHERE id = ?`).run(
+        new Date(Date.now() - 1_000).toISOString(),
+        crashRequestId,
+      );
+    } finally {
+      db.close();
+    }
+    const replacementClaim = await postJson("/requests/claim", {
+      agentId: "remotebuddy-replacement",
+    });
+    expect(replacementClaim.status).toBe(404);
+    const reconciledDetail = await fetch(`http://127.0.0.1:${port}/requests/${crashRequestId}`);
+    expect(await reconciledDetail.json()).toMatchObject({
+      ok: true,
+      request: {
+        status: "completed",
+        workerRequired: 1,
+        handoffJobId: crashJobId,
+      },
+    });
+
+    const spoofed = await postJson("/requests/enqueue", {
+      sessionId: "handoff-session",
+      prompt: "Do not trust my completion payload.",
+    });
+    const spoofedId = String(((await spoofed.json()) as Record<string, unknown>).requestId ?? "");
+    const spoofedClaim = await postJson("/requests/claim", {
+      agentId: "remotebuddy-route-test",
+    });
+    expect(spoofedClaim.status).toBe(200);
+    const spoofedClaimToken = String(
+      ((await spoofedClaim.json()) as { request?: { claimToken?: string } }).request?.claimToken ??
+        "",
+    );
+    const spoofedCompletion = await postJson(`/requests/${spoofedId}/complete`, {
+      agentId: "remotebuddy-route-test",
+      claimToken: spoofedClaimToken,
+      result: { requiresWorker: true, jobId: "job-does-not-exist" },
+    });
+    expect(spoofedCompletion.status).toBe(409);
+    expect(await spoofedCompletion.json()).toMatchObject({
+      ok: false,
+      code: "worker_handoff_not_recorded",
+    });
+
+    expect((await postJson("/completions/claim", {})).status).toBe(400);
+    expect((await postJson("/completions/missing/processed", {})).status).toBe(400);
+    expect(
+      (
+        await postJson("/completions/missing/fail", {
+          pusherId: "scm-route-test",
+          error: "must still carry the claim token",
+        })
+      ).status,
+    ).toBe(400);
+
+    const systemStatus = (await (await fetch(`http://127.0.0.1:${port}/system/status`)).json()) as {
+      runtime?: { reconciliation?: Record<string, unknown> };
+    };
+    expect(Object.keys(systemStatus.runtime?.reconciliation ?? {}).sort()).toEqual([
+      "autonomy reservation",
+      "completion lease",
+      "completion lifecycle",
+      "request handoff",
+      "request lease",
+      "worker handoff",
+    ]);
+  }, 20_000);
 });

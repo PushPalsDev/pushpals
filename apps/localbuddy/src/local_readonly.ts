@@ -1,3 +1,5 @@
+import { fetchBufferedWithHardDeadline, runBoundedProcess } from "shared";
+
 type QueueCounts = {
   pending: number;
   claimed: number;
@@ -33,9 +35,11 @@ export interface LocalReadonlyContext {
   repoRoot: string;
   serverUrl: string;
   authHeaders: Record<string, string>;
+  httpTimeoutMs?: number;
 }
 
 const READONLY_COMMAND_TIMEOUT_MS = 8_000;
+const READONLY_HTTP_TIMEOUT_MS = 10_000;
 const MAX_STATUS_LINES = 60;
 
 function truncateLines(lines: string[], maxLines: number): { text: string; hidden: number } {
@@ -52,30 +56,15 @@ async function runReadOnlyCommand(
   command: string[],
   cwd: string,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(command, {
+  const result = await runBoundedProcess(command, {
     cwd,
-    stdout: "pipe",
-    stderr: "pipe",
+    timeoutMs: READONLY_COMMAND_TIMEOUT_MS,
+    outputLimitBytes: 256 * 1024,
   });
-
-  const timer = setTimeout(() => {
-    try {
-      proc.kill();
-    } catch {
-      // ignore kill failures
-    }
-  }, READONLY_COMMAND_TIMEOUT_MS);
-
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  clearTimeout(timer);
   return {
-    ok: exitCode === 0,
-    stdout: String(stdout ?? ""),
-    stderr: String(stderr ?? ""),
+    ok: result.exitCode === 0,
+    stdout: result.stdout,
+    stderr: result.stderr,
   };
 }
 
@@ -138,8 +127,12 @@ async function buildGitStatusReply(repoRoot: string): Promise<string> {
 async function buildSystemStatusReply(ctx: LocalReadonlyContext): Promise<string> {
   let response: Response;
   try {
-    response = await fetch(`${ctx.serverUrl}/system/status`, {
-      headers: ctx.authHeaders,
+    response = await fetchBufferedWithHardDeadline({
+      input: `${ctx.serverUrl}/system/status`,
+      init: { headers: ctx.authHeaders },
+      timeoutMs: Math.max(1, Math.floor(ctx.httpTimeoutMs ?? READONLY_HTTP_TIMEOUT_MS)),
+      maxResponseBytes: 2 * 1024 * 1024,
+      timeoutMessage: "LocalBuddy system-status request timed out",
     });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);

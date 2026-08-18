@@ -4,11 +4,54 @@ import {
   buildWindowsManagedServiceTreeTerminationArgv,
   buildCoreManagedServiceSpecs,
   computeLocalBuddyRestartBackoffMs,
+  defaultProbeServiceHealth,
+  pipeProcessStreamToLines,
   resolveLocalBuddyRuntimeAction,
   resolveLocalBuddyStartGate,
+  shouldDetachManagedServiceProcess,
 } from "../scripts/start_runtime_services";
 
 describe("start runtime service helpers", () => {
+  test("caps no-newline managed service output while continuing to drain", async () => {
+    const lines: string[] = [];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(70_000)));
+        controller.enqueue(new TextEncoder().encode("tail\n"));
+        controller.close();
+      },
+    });
+    const pipe = pipeProcessStreamToLines(stream, (line) => lines.push(line));
+    await pipe.done;
+
+    expect(lines).toContain("[pushpals: managed service output line truncated]");
+    expect(lines.at(-1)).toBe("tail");
+    expect(Math.max(...lines.map((line) => line.length))).toBeLessThanOrEqual(64 * 1024);
+  });
+
+  test("health probes time out when response bodies never finish", async () => {
+    let bodyCancelled = false;
+    const startedAt = Date.now();
+    const health = await defaultProbeServiceHealth(
+      { url: "http://127.0.0.1/stalled", timeoutMs: 25 },
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start() {},
+            cancel() {
+              bodyCancelled = true;
+            },
+          }),
+        ),
+    );
+
+    await Bun.sleep(0);
+    expect(health.ok).toBe(false);
+    expect(health.detail).toContain("timed out after 250ms");
+    expect(bodyCancelled).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   test("builds forced Windows process-tree termination for unhealthy services", () => {
     expect(buildWindowsManagedServiceTreeTerminationArgv(7654)).toEqual([
       "taskkill",
@@ -17,6 +60,12 @@ describe("start runtime service helpers", () => {
       "/T",
       "/F",
     ]);
+  });
+
+  test("creates Unix process groups for managed service tree termination", () => {
+    expect(shouldDetachManagedServiceProcess("linux")).toBe(true);
+    expect(shouldDetachManagedServiceProcess("darwin")).toBe(true);
+    expect(shouldDetachManagedServiceProcess("win32")).toBe(false);
   });
 
   test("buildCoreManagedServiceSpecs excludes LocalBuddy so it can be supervised dynamically", () => {
@@ -199,7 +248,7 @@ describe("start runtime service helpers", () => {
 
       await Bun.sleep(60);
 
-      manager.replaceService({
+      await manager.replaceService({
         name: "remotebuddy",
         color: "red",
         command: ["bun", "run", "apps/remotebuddy/src/remotebuddy_main.ts"],
@@ -249,6 +298,49 @@ describe("start runtime service helpers", () => {
     manager.stop();
 
     expect(killSignal).toBe("SIGTERM");
+  });
+
+  test("ServiceManager stopAndWait awaits bounded whole-tree termination for every service", async () => {
+    const terminated: string[] = [];
+    const manager = new ServiceManager({
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: {
+          pid: spec.name === "remotebuddy" ? 501 : 502,
+          exited: Promise.resolve(0),
+          kill: () => {},
+        } as any,
+        command: [...spec.command],
+        cwd: spec.cwd,
+        env: { ...(spec.env ?? {}) },
+        exited: false,
+        exitCode: null,
+        launchedAtMs: Date.now(),
+        logPath: spec.logPath,
+      }),
+      terminateService: async (service) => {
+        await Bun.sleep(10);
+        terminated.push(service.name);
+        service.exited = true;
+        service.exitCode = 0;
+      },
+    });
+    manager.startService({
+      name: "remotebuddy",
+      color: "red",
+      command: ["fake-remotebuddy"],
+      cwd: process.cwd(),
+    });
+    manager.startService({
+      name: "workerpals",
+      color: "yellow",
+      command: ["fake-workerpals"],
+      cwd: process.cwd(),
+    });
+
+    await manager.stopAndWait(250);
+
+    expect(terminated.sort()).toEqual(["remotebuddy", "workerpals"]);
   });
 
   test("ServiceManager restarts a service after consecutive unhealthy probes", async () => {

@@ -1,6 +1,7 @@
 import type { MergeJob, MergeQueueDB } from "./db";
 import type { CheckConfig, SourceControlManagerConfig } from "./config";
 import { createSourceControlApi, type SourceControlApi } from "./git";
+import { runBoundedScmProcess } from "./bounded_process";
 
 /**
  * Result of processing a single merge job.
@@ -32,25 +33,15 @@ async function runCheck(
   const isWindows = process.platform === "win32";
   const shell = isWindows ? ["cmd", "/c"] : ["sh", "-c"];
 
-  const proc = Bun.spawn([...shell, check.command], {
+  const result = await runBoundedScmProcess([...shell, check.command], {
     cwd: repoPath,
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env },
+    timeoutMs,
   });
-
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-
-  const exitCode = await proc.exited;
-  clearTimeout(timer);
-
-  const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-  return { ok: exitCode === 0, output };
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  return { ok: result.exitCode === 0 && !result.timedOut, output };
 }
 
 // ─── Job runner ─────────────────────────────────────────────────────────────

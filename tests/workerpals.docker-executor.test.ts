@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildDockerRuntimeCapabilityCanaryCommand,
+  buildDependencyStoreReconciliationCommand,
   buildWindowsDockerExecTreeTerminationArgv,
   buildOpenAiCodexHomeStartupCommand,
   buildWorktreeDependencyPreparationCommand,
@@ -8,13 +10,24 @@ import {
   isEphemeralWorkerWorktreePath,
   parseGitWorktreeListPorcelain,
   prependWorkerpalRuntimeCaStartup,
+  probeWorkerLlmHttpEndpointStatus,
   resolveOpenAiCodexContainerHome,
   resolveDockerJobTimeoutMs,
   resolveWorkerpalDockerBuildCaSecretArgs,
   resolveWorkerpalDockerRuntimeCaArgs,
 } from "../apps/workerpals/src/docker_executor";
 import { removeLinkedNodeModulesDependencyArtifact } from "../apps/workerpals/src/execute_job";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readlinkSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -28,6 +41,113 @@ function createExecutor() {
 }
 
 describe("workerpals docker executor internals", () => {
+  test("bounds LLM probes through response-body cancellation", async () => {
+    let observedSignal: AbortSignal | null = null;
+    let cancellationStarted = false;
+    const fetchFn = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? null;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          cancel() {
+            cancellationStarted = true;
+            return new Promise<void>(() => {});
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const startedAt = Date.now();
+    await expect(
+      probeWorkerLlmHttpEndpointStatus("http://127.0.0.1:1234/v1/models", 20, fetchFn),
+    ).rejects.toThrow("WorkerPal LLM endpoint probe timed out after 20ms");
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(cancellationStarted).toBe(true);
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  test("cancels successful LLM probe bodies instead of leaving sockets open", async () => {
+    let cancelled = false;
+    const status = await probeWorkerLlmHttpEndpointStatus(
+      "http://127.0.0.1:1234/v1/models",
+      100,
+      (async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { status: 200 },
+        )) as typeof fetch,
+    );
+
+    expect(status).toBe(200);
+    expect(cancelled).toBe(true);
+  });
+
+  test("requires the complete worker runtime before accepting a warm container", () => {
+    const codexCanary = buildDockerRuntimeCapabilityCanaryCommand("openai_codex");
+    expect(codexCanary).toContain("command -v git");
+    expect(codexCanary).toContain("command -v bun");
+    expect(codexCanary).toContain("command -v node");
+    expect(codexCanary).toContain("command -v flock");
+    expect(codexCanary).toContain("command -v codex");
+    expect(codexCanary).toContain("command -v bunx");
+    expect(codexCanary).toContain("/workspace/.venv/bin/python");
+    expect(codexCanary).toContain('test -w "$dependency_store"');
+    expect(codexCanary).toContain('ln "$dependency_probe/source" "$dependency_probe/link"');
+    expect(codexCanary).toContain('rm -rf -- "$dependency_probe"');
+    expect(codexCanary).toContain("trusted-host-only");
+
+    const openHandsCanary = buildDockerRuntimeCapabilityCanaryCommand("openhands");
+    expect(openHandsCanary).not.toContain("command -v codex");
+  });
+
+  test("bounds the production backend warmup probe", async () => {
+    const executor = createExecutor() as unknown as {
+      ensureBackendWarmup: (backend: "openai_codex") => Promise<void>;
+      runWarmShell: (
+        command: string,
+        options?: { timeoutMs?: number },
+      ) => Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }>;
+      warmAgentStartupTimeoutMs: number;
+    };
+    let observedTimeoutMs = 0;
+    executor.runWarmShell = async (command, options) => {
+      expect(command).toContain("login status");
+      observedTimeoutMs = options?.timeoutMs ?? 0;
+      return { ok: true, stdout: "codex ready", stderr: "", exitCode: 0 };
+    };
+
+    await executor.ensureBackendWarmup("openai_codex");
+
+    expect(observedTimeoutMs).toBe(executor.warmAgentStartupTimeoutMs);
+    expect(observedTimeoutMs).toBeGreaterThanOrEqual(10_000);
+  });
+
+  test("bounds custom backend warmup health checks", async () => {
+    const executor = createExecutor() as unknown as {
+      ensureBackendWarmup: (backend: "openhands") => Promise<void>;
+      runWarmShell: (
+        command: string,
+        options?: { timeoutMs?: number },
+      ) => Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }>;
+      warmAgentStartupTimeoutMs: number;
+    };
+    const observedTimeouts: number[] = [];
+    executor.runWarmShell = async (command, options) => {
+      expect(command).toContain("127.0.0.1");
+      observedTimeouts.push(options?.timeoutMs ?? 0);
+      return { ok: true, stdout: "healthy", stderr: "", exitCode: 0 };
+    };
+
+    await executor.ensureBackendWarmup("openhands");
+
+    expect(observedTimeouts).toEqual([executor.warmAgentStartupTimeoutMs]);
+  });
+
   test("builds forced Windows process-tree termination for Docker exec clients", () => {
     expect(buildWindowsDockerExecTreeTerminationArgv(9876)).toEqual([
       "taskkill",
@@ -36,6 +156,304 @@ describe("workerpals docker executor internals", () => {
       "/T",
       "/F",
     ]);
+  });
+
+  test("bounds process exit even when a child closes its output streams before hanging", async () => {
+    const executor = createExecutor() as unknown as {
+      runDockerCommandCapture: (
+        command: string[],
+        options: { timeoutMs: number },
+      ) => Promise<{ timedOut: boolean; exitCode: number; stdout: string }>;
+    };
+    const startedAt = Date.now();
+    const result = await executor.runDockerCommandCapture(
+      [
+        process.execPath,
+        "-e",
+        'process.stdout.write("ready\\n"); process.stdout.end(); process.stderr.end(); await Bun.sleep(60_000);',
+      ],
+      { timeoutMs: 100 },
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).not.toBe(0);
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+  }, 15_000);
+
+  test("fails a timed-out host git worktree creation without continuing configuration", async () => {
+    const executor = createExecutor() as unknown as {
+      createWorktree: (worktreePath: string, baseRef: string) => Promise<void>;
+      runHostCommandCapture: (
+        command: string[],
+        options: { cwd?: string; timeoutMs?: number },
+      ) => Promise<{ timedOut: boolean; exitCode: number; stdout: string; stderr: string }>;
+    };
+    const commands: string[][] = [];
+    executor.runHostCommandCapture = async (command, options) => {
+      commands.push(command);
+      expect(options.timeoutMs).toBeGreaterThan(0);
+      return { timedOut: true, exitCode: 124, stdout: "", stderr: "" };
+    };
+
+    await expect(
+      executor.createWorktree(
+        join(tmpdir(), `pushpals-timeout-create-${Date.now()}`),
+        "refs/heads/main",
+      ),
+    ).rejects.toThrow("git worktree add timed out");
+    expect(commands).toHaveLength(1);
+    expect(commands[0].slice(0, 4)).toEqual(["git", "-c", "core.autocrlf=false", "-c"]);
+  });
+
+  test("bounds worktree removal and prune independently before filesystem cleanup", async () => {
+    const executor = createExecutor() as unknown as {
+      removeWorktree: (worktreePath: string) => Promise<void>;
+      runHostCommandCapture: (
+        command: string[],
+        options: { cwd?: string; timeoutMs?: number },
+      ) => Promise<{ timedOut: boolean; exitCode: number; stdout: string; stderr: string }>;
+    };
+    const commands: string[][] = [];
+    executor.runHostCommandCapture = async (command, options) => {
+      commands.push(command);
+      expect(options.timeoutMs).toBeGreaterThan(0);
+      return { timedOut: true, exitCode: 124, stdout: "", stderr: "" };
+    };
+
+    await executor.removeWorktree(join(tmpdir(), `pushpals-timeout-remove-${Date.now()}`));
+
+    expect(commands.map((command) => command.slice(0, 3))).toEqual([
+      ["git", "worktree", "remove"],
+      ["git", "worktree", "prune"],
+    ]);
+  });
+
+  test("bounds startup worktree pruning and base-ref git probes", async () => {
+    const executor = createExecutor() as unknown as {
+      cleanupOrphanedWorktrees: () => Promise<void>;
+      runGitBaseRefCommand: (
+        args: string[],
+      ) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
+      runHostCommandCapture: (
+        command: string[],
+        options: { cwd?: string; timeoutMs?: number },
+      ) => Promise<{ timedOut: boolean; exitCode: number; stdout: string; stderr: string }>;
+    };
+    const commands: string[][] = [];
+    executor.runHostCommandCapture = async (command, options) => {
+      commands.push(command);
+      expect(options.timeoutMs).toBeGreaterThan(0);
+      if (command.includes("--porcelain")) {
+        return { timedOut: false, exitCode: 0, stdout: "worktree /repo\nHEAD abc\n", stderr: "" };
+      }
+      return { timedOut: true, exitCode: 124, stdout: "", stderr: "" };
+    };
+
+    await executor.cleanupOrphanedWorktrees();
+    const baseRef = await executor.runGitBaseRefCommand(["rev-parse", "HEAD"]);
+
+    expect(commands.map((command) => command.join(" "))).toEqual([
+      "git worktree list --porcelain",
+      "git worktree prune",
+      "git rev-parse HEAD",
+    ]);
+    expect(baseRef.ok).toBe(false);
+    expect(baseRef.stderr).toContain("git command timed out");
+  });
+
+  test("awaits warm-container recycle and clears stale backend readiness after a timeout", async () => {
+    const executor = createExecutor() as unknown as {
+      warmedBackends: Set<string>;
+      warmContainerName: string;
+      runBoundedDockerControl: (args: string[], timeoutMs: number) => Promise<boolean>;
+      recycleWarmContainerAfterExecutionTimeout: () => Promise<void>;
+    };
+    executor.warmedBackends.add("openai_codex");
+    const commands: string[][] = [];
+    executor.runBoundedDockerControl = async (args, timeoutMs) => {
+      expect(timeoutMs).toBeGreaterThan(0);
+      commands.push(args);
+      return true;
+    };
+
+    await executor.recycleWarmContainerAfterExecutionTimeout();
+
+    expect(executor.warmedBackends.size).toBe(0);
+    expect(commands).toEqual([["restart", "-t", "1", executor.warmContainerName]]);
+  });
+
+  test("removes a timed-out warm container when bounded restart fails", async () => {
+    const executor = createExecutor() as unknown as {
+      warmContainerName: string;
+      runBoundedDockerControl: (args: string[], timeoutMs: number) => Promise<boolean>;
+      recycleWarmContainerAfterExecutionTimeout: () => Promise<void>;
+    };
+    const commands: string[][] = [];
+    executor.runBoundedDockerControl = async (args) => {
+      commands.push(args);
+      return commands.length > 1;
+    };
+
+    await executor.recycleWarmContainerAfterExecutionTimeout();
+
+    expect(commands).toEqual([
+      ["restart", "-t", "1", executor.warmContainerName],
+      ["rm", "-f", executor.warmContainerName],
+    ]);
+  });
+
+  test("cleans dependency projections through the named volume when the warm container is gone", async () => {
+    const executor = createExecutor() as unknown as {
+      cleanupContainerDependencyProjection: (worktreePath: string) => Promise<void>;
+      preparedDependencyProjectionIds: Set<string>;
+      runWarmShell: () => Promise<{
+        ok: boolean;
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+      }>;
+      runDockerCommandCapture: (
+        command: string[],
+        options: { timeoutMs: number },
+      ) => Promise<{ timedOut: boolean; exitCode: number; stdout: string; stderr: string }>;
+    };
+    executor.runWarmShell = async () => ({
+      ok: false,
+      stdout: "",
+      stderr: "warm container missing",
+      exitCode: 1,
+    });
+    executor.preparedDependencyProjectionIds.add("job-cleanup-123");
+    let cleanupCommand: string[] = [];
+    executor.runDockerCommandCapture = async (command, options) => {
+      expect(options.timeoutMs).toBeGreaterThan(0);
+      cleanupCommand = command;
+      return { timedOut: false, exitCode: 0, stdout: "", stderr: "" };
+    };
+
+    await executor.cleanupContainerDependencyProjection(
+      join(process.cwd(), ".worktrees", "job-cleanup-123"),
+    );
+
+    expect(cleanupCommand).toContain("--mount");
+    expect(cleanupCommand.join(" ")).toContain("type=volume,source=pushpals-deps-");
+    expect(cleanupCommand.at(-1)).toContain(
+      "/workspace/.pushpals/dependency-store/projections/job-cleanup-123",
+    );
+  });
+
+  test("retains failed dependency projection cleanup for a later bounded retry", async () => {
+    const executor = createExecutor() as unknown as {
+      cleanupContainerDependencyProjection: (worktreePath: string) => Promise<void>;
+      preparedDependencyProjectionIds: Set<string>;
+      dependencyStoreReconciled: boolean;
+      runWarmShell: () => Promise<{
+        ok: boolean;
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+      }>;
+      runDockerCommandCapture: () => Promise<{
+        timedOut: boolean;
+        exitCode: number;
+        stdout: string;
+        stderr: string;
+      }>;
+    };
+    const worktreeId = "job-cleanup-retry";
+    const worktreePath = join(process.cwd(), ".worktrees", worktreeId);
+    executor.preparedDependencyProjectionIds.add(worktreeId);
+    executor.dependencyStoreReconciled = true;
+    executor.runWarmShell = async () => ({
+      ok: false,
+      stdout: "",
+      stderr: "warm cleanup failed",
+      exitCode: 1,
+    });
+    executor.runDockerCommandCapture = async () => ({
+      timedOut: true,
+      exitCode: 124,
+      stdout: "",
+      stderr: "",
+    });
+
+    await executor.cleanupContainerDependencyProjection(worktreePath);
+    expect(executor.preparedDependencyProjectionIds.has(worktreeId)).toBe(true);
+    expect(executor.dependencyStoreReconciled).toBe(false);
+
+    executor.runDockerCommandCapture = async () => ({
+      timedOut: false,
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    await executor.cleanupContainerDependencyProjection(worktreePath);
+    expect(executor.preparedDependencyProjectionIds.has(worktreeId)).toBe(false);
+  });
+
+  test("reconciles orphan managed projections and bounds snapshot GC safely", async () => {
+    const command = buildDependencyStoreReconciliationCommand("/store", "/repo/.worktrees");
+    expect(command).toContain('case "$projection_id" in job-*|selfcheck-*');
+    expect(command).toContain('[ ! -d "$worktree_root/$projection_id" ]');
+    expect(command).toContain("dependency_snapshot_max_entries=8");
+    expect(command).toContain("dependency_snapshot_max_age_seconds=604800");
+    expect(command).toContain("-name .pushpals-dependency-snapshot");
+    expect(command).toContain('exec 8>"$gc_snapshot_root.lock"');
+    expect(command).toContain("flock -n 8");
+    expect(command).toContain('[ "$gc_snapshot_name" != "$gc_current_key" ]');
+  });
+
+  test("clears retained orphan projection IDs only after startup reconciliation succeeds", async () => {
+    const executor = createExecutor() as unknown as {
+      reconcileContainerDependencyStore: () => Promise<void>;
+      preparedDependencyProjectionIds: Set<string>;
+      dependencyStoreReconciled: boolean;
+      runWarmShell: (
+        command: string,
+        options: { timeoutMs: number },
+      ) => Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }>;
+    };
+    const worktreeId = `job-orphan-${Date.now()}`;
+    executor.preparedDependencyProjectionIds.add(worktreeId);
+    let command = "";
+    executor.runWarmShell = async (observed, options) => {
+      command = observed;
+      expect(options.timeoutMs).toBeGreaterThan(0);
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    };
+
+    await executor.reconcileContainerDependencyStore();
+
+    expect(command).toContain("gc_dependency_snapshots");
+    expect(executor.preparedDependencyProjectionIds.has(worktreeId)).toBe(false);
+    expect(executor.dependencyStoreReconciled).toBe(true);
+  });
+
+  test("reconciles the dependency store when adopting an already-running warm container", async () => {
+    const executor = createExecutor() as unknown as {
+      ensureWarmContainer: () => Promise<void>;
+      reconcileContainerDependencyStore: () => Promise<void>;
+      runDockerCommandCapture: () => Promise<{
+        timedOut: boolean;
+        exitCode: number;
+        stdout: string;
+        stderr: string;
+      }>;
+    };
+    executor.runDockerCommandCapture = async () => ({
+      timedOut: false,
+      exitCode: 0,
+      stdout: "true|bridge",
+      stderr: "",
+    });
+    let reconciliations = 0;
+    executor.reconcileContainerDependencyStore = async () => {
+      reconciliations += 1;
+    };
+
+    await executor.ensureWarmContainer();
+
+    expect(reconciliations).toBe(1);
   });
 
   test("passes an existing host CA bundle to Docker builds as an ephemeral secret", () => {
@@ -123,6 +541,92 @@ describe("workerpals docker executor internals", () => {
     const lines: string[] = [];
     await executor.readStream(stream, "stdout", undefined, lines);
     expect(lines).toEqual(['___RESULT___ {"ok":true,"summary":"ok"}']);
+  });
+
+  test("readStream forwards noisy output while retaining only an explicit bounded tail", async () => {
+    const executor = createExecutor() as unknown as {
+      readStream: (
+        readable: ReadableStream<Uint8Array>,
+        streamName: "stdout" | "stderr",
+        onLog: ((stream: "stdout" | "stderr", line: string) => void) | undefined,
+        lines: string[],
+        signal?: AbortSignal,
+        maxRetainedChars?: number,
+      ) => Promise<void>;
+    };
+    const emittedLines = Array.from(
+      { length: 2_000 },
+      (_, index) => `noisy-line-${index.toString().padStart(4, "0")}-${"x".repeat(64)}`,
+    );
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`${emittedLines.join("\n")}\n`));
+        controller.close();
+      },
+    });
+    const retained: string[] = [];
+    const forwarded: string[] = [];
+
+    await executor.readStream(
+      stream,
+      "stdout",
+      (_stream, line) => forwarded.push(line),
+      retained,
+      undefined,
+      512,
+    );
+
+    expect(forwarded).toHaveLength(emittedLines.length);
+    expect(forwarded[0]).toBe(emittedLines[0]);
+    expect(forwarded.at(-1)).toBe(emittedLines.at(-1));
+    expect(retained[0]).toContain("[PushPals] Earlier process output truncated");
+    expect(retained.join("\n")).not.toContain(emittedLines[0]);
+    expect(retained.at(-1)).toBe(emittedLines.at(-1));
+    expect(retained.slice(1).join("\n").length).toBeLessThanOrEqual(512);
+  });
+
+  test("readStream caps an endless no-newline line while continuing to drain", async () => {
+    const executor = createExecutor() as unknown as {
+      readStream: (
+        readable: ReadableStream<Uint8Array>,
+        streamName: "stdout" | "stderr",
+        onLog: ((stream: "stdout" | "stderr", line: string) => void) | undefined,
+        lines: string[],
+        signal?: AbortSignal,
+        maxRetainedChars?: number,
+      ) => Promise<void>;
+    };
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let index = 0; index < 20; index += 1) {
+          controller.enqueue(
+            encoder.encode(`${String(index).padStart(2, "0")}:${"x".repeat(500)}`),
+          );
+        }
+        controller.enqueue(encoder.encode("retained-tail"));
+        controller.close();
+      },
+    });
+    const retained: string[] = [];
+    const forwarded: string[] = [];
+
+    await executor.readStream(
+      stream,
+      "stdout",
+      (_stream, line) => forwarded.push(line),
+      retained,
+      undefined,
+      512,
+    );
+
+    expect(forwarded[0]).toContain("Oversized unterminated process-output line truncated");
+    expect(forwarded).toHaveLength(2);
+    expect(forwarded.at(-1)).toEndWith("retained-tail");
+    expect(retained[0]).toContain("Earlier process output truncated");
+    expect(retained.slice(1).join("\n").length).toBeLessThanOrEqual(512);
+    expect(retained.at(-1)).toEndWith("retained-tail");
   });
 
   test("parseResult only reports docker-timeout summary when docker timeout fired", () => {
@@ -656,6 +1160,11 @@ describe("workerpals docker executor internals", () => {
       createWorktree: (worktreePath: string, baseRef: string) => Promise<void>;
       runGitSelfCheckContainer: (worktreePath: string) => Promise<void>;
       ensureWorktreeAccessibleInWarmContainer: (worktreePath: string) => Promise<string>;
+      runWarmShell: (
+        command: string,
+        options: { timeoutMs: number },
+      ) => Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }>;
+      ensureBackendWarmup: (backend: string) => Promise<void>;
       removeWorktree: (worktreePath: string) => Promise<void>;
       options: { baseRef: string };
     };
@@ -671,13 +1180,31 @@ describe("workerpals docker executor internals", () => {
       calls.push("warm");
       return "/repo/.worktrees/selfcheck-startup";
     };
+    executor.runWarmShell = async (command, options) => {
+      calls.push("canary");
+      expect(command).toContain("command -v codex");
+      expect(command).toContain("command -v bunx");
+      expect(command).toContain("dependency_probe");
+      expect(options.timeoutMs).toBe(15_000);
+      return {
+        ok: true,
+        stdout:
+          "runtime_tools=git,bun,node,python codex_runtime=codex docker_socket=trusted-host-only dependency_store=write-delete-ok",
+        stderr: "",
+        exitCode: 0,
+      };
+    };
+    executor.ensureBackendWarmup = async (backend) => {
+      calls.push("backend-warmup");
+      expect(backend).toBe("openai_codex");
+    };
     executor.removeWorktree = async () => {
       calls.push("cleanup");
     };
 
     await executor.validateWorktreeGitInterop();
 
-    expect(calls).toEqual(["create", "fresh", "warm", "cleanup"]);
+    expect(calls).toEqual(["create", "fresh", "warm", "canary", "backend-warmup", "cleanup"]);
   });
 
   test("prepares Linux-native dependency artifacts at constant depth for browser hydration", async () => {
@@ -731,6 +1258,7 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).not.toContain("git rev-parse --git-common-dir");
     expect(capturedCommand).toContain("bun install --frozen-lockfile --ignore-scripts >&2");
     expect(capturedCommand).toContain('snapshot_lock="$snapshot_root.lock"');
+    expect(capturedCommand).toContain("flock -w 300 9");
     expect(capturedCommand).toContain(
       'find "$snapshot_root/node_modules" -type f -newer "$snapshot_ready" -print -quit',
     );
@@ -759,7 +1287,7 @@ describe("workerpals docker executor internals", () => {
     expect(logs.join("\n")).toContain("[DependencyPreparation] phase=complete progress=100");
   });
 
-  test("keys shared Linux snapshots by lockfiles and isolates workspace dependency links", () => {
+  test("keys shared Linux snapshots stably and restores isolated workspace dependency links", () => {
     const command = buildWorktreeDependencyPreparationCommand("/repo/.worktrees/job-native-deps");
 
     expect(command).toContain(
@@ -769,20 +1297,34 @@ describe("workerpals docker executor internals", () => {
       'for manifest in "$worktree/package.json" "$worktree/bun.lock" "$worktree/bun.lockb"',
     );
     expect(command).toContain('sha256sum "$manifest" | cut -d " " -f 1');
-    expect(command).toContain("jq -e '.workspaces != null'");
-    expect(command).toContain('snapshot_key="$snapshot_key-$worktree_id"');
-    expect(command).toContain('while [ ! -f "$snapshot_ready" ]; do');
-    expect(command).toContain('if [ "$wait_count" -ge 300 ]; then');
+    expect(command).not.toContain('snapshot_key="$snapshot_key-$worktree_id"');
+    expect(command).not.toContain('mkdir "$snapshot_lock"');
+    expect(command).toContain('exec 9>"$snapshot_lock"');
+    expect(command).toContain("flock -w 300 9");
+    expect(command).toContain('workspace_placeholder="/__pushpals_worktree__"');
+    expect(command).toContain('ln -s "$workspace_placeholder');
+    expect(command).toContain('ln -s "$worktree${workspace_relative:+/$workspace_relative}"');
     expect(command).toContain('printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"');
+    const projectionCopyIndex = command.indexOf('cp -al "$src/." "$projection_node_modules/"');
+    const workspaceRebindIndex = command.indexOf(
+      'ln -s "$worktree${workspace_relative:+/$workspace_relative}"',
+    );
+    const unlockIndex = command.indexOf("flock -u 9");
+    expect(projectionCopyIndex).toBeGreaterThan(0);
+    expect(workspaceRebindIndex).toBeGreaterThan(projectionCopyIndex);
+    expect(unlockIndex).toBeGreaterThan(workspaceRebindIndex);
   });
 
   (process.platform === "linux" &&
     process.env.PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION === "1"
     ? test
     : test.skip)(
-    "projects dependencies through a container-native store without copying into the bind path",
+    "serializes concurrent snapshot materialization and ignores abandoned lock contents",
     async () => {
-      const worktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-"));
+      const worktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-a-"));
+      const secondWorktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-b-"));
+      const thirdWorktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-c-"));
+      const dependencyStore = mkdtempSync(join(tmpdir(), "pushpals-container-store-"));
       try {
         mkdirSync(join(worktree, "fixture-dep"));
         writeFileSync(
@@ -809,40 +1351,191 @@ describe("workerpals docker executor internals", () => {
         expect(await install.exited).toBe(0);
         rmSync(join(worktree, "node_modules"), { recursive: true, force: true });
 
-        const command = buildWorktreeDependencyPreparationCommand(worktree);
+        mkdirSync(join(secondWorktree, "fixture-dep"));
+        copyFileSync(join(worktree, "package.json"), join(secondWorktree, "package.json"));
+        copyFileSync(join(worktree, "bun.lock"), join(secondWorktree, "bun.lock"));
+        copyFileSync(
+          join(worktree, "fixture-dep", "package.json"),
+          join(secondWorktree, "fixture-dep", "package.json"),
+        );
+        mkdirSync(join(thirdWorktree, "fixture-dep"));
+        copyFileSync(join(worktree, "package.json"), join(thirdWorktree, "package.json"));
+        copyFileSync(join(worktree, "bun.lock"), join(thirdWorktree, "bun.lock"));
+        copyFileSync(
+          join(worktree, "fixture-dep", "package.json"),
+          join(thirdWorktree, "fixture-dep", "package.json"),
+        );
+
+        const command = buildWorktreeDependencyPreparationCommand(worktree, dependencyStore);
+        const secondCommand = buildWorktreeDependencyPreparationCommand(
+          secondWorktree,
+          dependencyStore,
+        );
         const first = Bun.spawn(["sh", "-lc", command], {
           stdout: "pipe",
           stderr: "pipe",
         });
-        const [firstExit, firstStdout] = await Promise.all([
-          first.exited,
-          new Response(first.stdout).text(),
-        ]);
-        expect(firstExit).toBe(0);
-        expect(firstStdout).toContain("node_modules-container-native");
-        expect(lstatSync(join(worktree, "node_modules")).isSymbolicLink()).toBe(true);
-        expect(
-          await Bun.file(join(worktree, "node_modules", ".pushpals-dependency-snapshot")).exists(),
-        ).toBe(true);
-
-        const second = Bun.spawn(["sh", "-lc", command], {
+        const second = Bun.spawn(["sh", "-lc", secondCommand], {
           stdout: "pipe",
           stderr: "pipe",
         });
-        const [secondExit, secondStderr] = await Promise.all([
-          second.exited,
-          new Response(second.stderr).text(),
-        ]);
+        const [firstExit, firstStdout, firstStderr, secondExit, secondStdout, secondStderr] =
+          await Promise.all([
+            first.exited,
+            new Response(first.stdout).text(),
+            new Response(first.stderr).text(),
+            second.exited,
+            new Response(second.stdout).text(),
+            new Response(second.stderr).text(),
+          ]);
+        expect(firstExit).toBe(0);
         expect(secondExit).toBe(0);
-        expect(secondStderr).toContain("phase=snapshot_cache_hit");
+        expect(firstStdout).toContain("node_modules-container-native");
+        expect(secondStdout).toContain("node_modules-container-native");
+        expect(`${firstStderr}\n${secondStderr}`).toContain("phase=snapshot_cache_miss");
+        expect(`${firstStderr}\n${secondStderr}`).toContain("phase=snapshot_cache_hit");
+        expect(lstatSync(join(worktree, "node_modules")).isSymbolicLink()).toBe(true);
+        expect(lstatSync(join(secondWorktree, "node_modules")).isSymbolicLink()).toBe(true);
+        expect(
+          await Bun.file(join(worktree, "node_modules", ".pushpals-dependency-snapshot")).exists(),
+        ).toBe(true);
+        const abandonedLockFiles = Array.from(
+          new Bun.Glob("snapshots/**/*.lock").scanSync({ cwd: dependencyStore }),
+        );
+        expect(abandonedLockFiles).toHaveLength(1);
+        writeFileSync(join(dependencyStore, abandonedLockFiles[0]), "abandoned-owner\n", "utf8");
+
+        const thirdCommand = buildWorktreeDependencyPreparationCommand(
+          thirdWorktree,
+          dependencyStore,
+        );
+        const third = Bun.spawn(["sh", "-lc", thirdCommand], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [thirdExit, thirdStderr] = await Promise.all([
+          third.exited,
+          new Response(third.stderr).text(),
+        ]);
+        expect(thirdExit).toBe(0);
+        expect(thirdStderr).toContain("phase=snapshot_cache_hit");
+        expect(lstatSync(join(thirdWorktree, "node_modules")).isSymbolicLink()).toBe(true);
+        const fixtureLink = join(thirdWorktree, "node_modules", "fixture-dep");
+        if (lstatSync(fixtureLink).isSymbolicLink()) {
+          expect(readlinkSync(fixtureLink)).toContain(thirdWorktree);
+        }
+        expect(await Bun.file(join(fixtureLink, "package.json")).exists()).toBe(true);
       } finally {
         rmSync(worktree, { recursive: true, force: true });
+        rmSync(secondWorktree, { recursive: true, force: true });
+        rmSync(thirdWorktree, { recursive: true, force: true });
+        rmSync(dependencyStore, { recursive: true, force: true });
       }
     },
   );
 
-  (process.env.PUSHPALS_RUN_WINDOWS_LINUX_CONTAINER_INTEGRATION === "1" ? test : test.skip)(
-    "reuses dependency and isolated Codex volumes through a Windows-host Linux container",
+  (process.platform === "linux" &&
+    process.env.PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION === "1"
+    ? test
+    : test.skip)(
+    "garbage-collects orphan projections and excess snapshots without deleting referenced or locked entries",
+    async () => {
+      const dependencyStore = mkdtempSync(join(tmpdir(), "pushpals-container-gc-store-"));
+      const worktreeRoot = mkdtempSync(join(tmpdir(), "pushpals-container-gc-worktrees-"));
+      const cacheRoot = join(dependencyStore, "snapshots", "linux-x64");
+      const projectionsRoot = join(dependencyStore, "projections");
+      const referencedKey = "a".repeat(64);
+      const lockedKey = "b".repeat(64);
+      const expiredKey = "c".repeat(64);
+      const freshKeys = Array.from({ length: 10 }, (_, index) =>
+        (index + 1).toString(16).padStart(64, "0"),
+      );
+      const lockReady = join(dependencyStore, "locked.ready");
+      let lockHolder: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        mkdirSync(cacheRoot, { recursive: true });
+        mkdirSync(projectionsRoot, { recursive: true });
+        const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60_000);
+        for (const key of [referencedKey, lockedKey, expiredKey]) {
+          const snapshotRoot = join(cacheRoot, key);
+          mkdirSync(join(snapshotRoot, "node_modules"), { recursive: true });
+          writeFileSync(join(snapshotRoot, "node_modules", "fixture.txt"), key);
+          utimesSync(snapshotRoot, oldDate, oldDate);
+        }
+        for (const [index, key] of freshKeys.entries()) {
+          const snapshotRoot = join(cacheRoot, key);
+          mkdirSync(join(snapshotRoot, "node_modules"), { recursive: true });
+          writeFileSync(join(snapshotRoot, "node_modules", "fixture.txt"), key);
+          const timestamp = new Date(Date.now() - index * 1_000);
+          utimesSync(snapshotRoot, timestamp, timestamp);
+        }
+
+        const activeProjection = join(projectionsRoot, "job-active", "node_modules");
+        mkdirSync(activeProjection, { recursive: true });
+        writeFileSync(
+          join(activeProjection, ".pushpals-dependency-snapshot"),
+          `${referencedKey}\n`,
+        );
+        mkdirSync(join(worktreeRoot, "job-active"));
+        mkdirSync(join(projectionsRoot, "job-orphan", "node_modules"), { recursive: true });
+        mkdirSync(join(projectionsRoot, "external-unmanaged", "node_modules"), {
+          recursive: true,
+        });
+
+        lockHolder = Bun.spawn(
+          ["sh", "-lc", 'flock "$LOCK_PATH" sh -c \': > "$READY_PATH"; sleep 2\''],
+          {
+            stdout: "ignore",
+            stderr: "pipe",
+            env: {
+              ...process.env,
+              LOCK_PATH: `${join(cacheRoot, lockedKey)}.lock`,
+              READY_PATH: lockReady,
+            },
+          },
+        );
+        for (let attempt = 0; attempt < 100 && !existsSync(lockReady); attempt++) {
+          await Bun.sleep(10);
+        }
+        expect(existsSync(lockReady)).toBe(true);
+
+        const reconcile = Bun.spawn(
+          ["sh", "-lc", buildDependencyStoreReconciliationCommand(dependencyStore, worktreeRoot)],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        const [exitCode, stderr] = await Promise.all([
+          reconcile.exited,
+          new Response(reconcile.stderr).text(),
+        ]);
+        expect(exitCode, stderr).toBe(0);
+
+        expect(existsSync(join(projectionsRoot, "job-active"))).toBe(true);
+        expect(existsSync(join(projectionsRoot, "job-orphan"))).toBe(false);
+        expect(existsSync(join(projectionsRoot, "external-unmanaged"))).toBe(true);
+        expect(existsSync(join(cacheRoot, referencedKey))).toBe(true);
+        expect(existsSync(join(cacheRoot, lockedKey))).toBe(true);
+        expect(existsSync(join(cacheRoot, expiredKey))).toBe(false);
+        const retainedFresh = freshKeys.filter((key) => existsSync(join(cacheRoot, key)));
+        expect(retainedFresh).toHaveLength(8);
+        expect(retainedFresh).toEqual(freshKeys.slice(0, 8));
+      } finally {
+        if (lockHolder) {
+          await Promise.race([lockHolder.exited, Bun.sleep(3_000)]);
+          try {
+            lockHolder.kill("SIGKILL");
+          } catch {
+            // The bounded lock holder already exited.
+          }
+        }
+        rmSync(dependencyStore, { recursive: true, force: true });
+        rmSync(worktreeRoot, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  (process.env.PUSHPALS_RUN_CONTAINER_VOLUME_INTEGRATION === "1" ? test : test.skip)(
+    "reuses dependency and isolated Codex volumes inside a Linux container",
     async () => {
       const worktree = mkdtempSync(join(tmpdir(), "pushpals-docker-desktop-deps-"));
       const authRoot = mkdtempSync(join(tmpdir(), "pushpals-docker-desktop-auth-"));
