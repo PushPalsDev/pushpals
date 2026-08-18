@@ -814,6 +814,11 @@ enabled = true
         hostname: "127.0.0.1",
         async fetch(req) {
           const url = new URL(req.url);
+          if (url.pathname === "/") {
+            return new Response("<!doctype html><title>PushPals monitor</title>", {
+              headers: { "content-type": "text/html; charset=utf-8" },
+            });
+          }
           if (url.pathname === "/healthz") {
             return Response.json({ ok: true });
           }
@@ -933,6 +938,7 @@ enabled = true
             PUSHPALS_CLI_PACKAGE_VERSION: "1.0.12-test",
             PUSHPALS_SERVER_URL: "",
             EXPO_PUBLIC_LOCAL_AGENT_URL: "",
+            PUSHPALS_MONITOR_URL: `http://127.0.0.1:${mockServer.port}`,
           },
         },
       );
@@ -990,6 +996,11 @@ enabled = true
         hostname: "127.0.0.1",
         async fetch(req) {
           const url = new URL(req.url);
+          if (url.pathname === "/") {
+            return new Response("<!doctype html><title>PushPals monitor</title>", {
+              headers: { "content-type": "text/html; charset=utf-8" },
+            });
+          }
           if (url.pathname === "/healthz") {
             return Response.json({ ok: true });
           }
@@ -1106,6 +1117,7 @@ enabled = true
             PUSHPALS_CLI_PACKAGE_VERSION: "1.0.12-test",
             PUSHPALS_SERVER_URL: "",
             EXPO_PUBLIC_LOCAL_AGENT_URL: "",
+            PUSHPALS_MONITOR_URL: `http://127.0.0.1:${mockServer.port}`,
           },
         },
       );
