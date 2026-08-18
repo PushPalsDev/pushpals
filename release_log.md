@@ -2,10 +2,10 @@
 
 ## Release Metadata
 
-- version: `v1.2.36`
+- version: `v1.2.37`
 - start_commit: `dcda53b35d0bbefc6cab24d4d91b929b50d33484`
-- end_commit: `5db403f17649d4342069c7fe07241b6011fd0510`
-- commits_in_range: `1`
+- end_commit: `869e05f356f686944e39330dd8e4cd13e2143621`
+- commits_in_range: `3`
 
 ## Highlights
 
@@ -14,6 +14,7 @@
 - Validate and publish exact candidate SHAs with retained trusted-host evidence, disposable-worktree recovery, authoritative publication proof, and fail-closed browser and no-change outcomes.
 - Improve execution speed and job quality with LF-safe Linux worktrees, container-native dependency projection, focused and cached validation, repeated-failure circuit breakers, and end-to-end reliability metrics.
 - Pin the WorkerPal sandbox to Bun 1.3.14 and block release publication on the cross-platform reliability harness.
+- Build protocol workspace artifacts before the release reliability harness, with a workflow-order regression test that prevents host-side server tests from starting against an incomplete workspace.
 
 ## Validation
 
@@ -25,6 +26,9 @@
 - `bun run cli:bundle` completed and synchronized packaged runtime source and generated service bundles.
 - `bun run cli:verify-package-payload` verified `260` package files with no external toolchain files.
 - `git diff --check` passed.
+- Release workflow contract coverage passed `12` tests with `0` failures, including enforced dependency-install, protocol-build, and reliability-harness ordering.
+- The previously blocked server session-message route suite passed `7` tests with `107` assertions and `0` failures after protocol artifacts were built.
+- CLI invocation coverage passed all `13` tests in the Linux release container without triggering an unrelated monitor-UI build.
 
 ## Install
 
