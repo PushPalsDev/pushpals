@@ -2,26 +2,28 @@
 
 ## Release Metadata
 
-- version: `v1.2.35`
-- start_commit: `78a1e5f760df66f75b609178e9310626059cfac5`
-- end_commit: `4f976a59fea4846d870d0236003836e884af0f0c`
+- version: `v1.2.36`
+- start_commit: `dcda53b35d0bbefc6cab24d4d91b929b50d33484`
+- end_commit: `5db403f17649d4342069c7fe07241b6011fd0510`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Stop unrelated successful candidates from repeatedly reopening retained trusted-validation failures. Recovery now requires the same command, the same baseline, a transient failure class, and no named failed-test evidence.
-- Limit automatic trusted-host recovery to one retry, preventing unchanged candidates from cycling through publication for hours while preserving one retry after a demonstrable host recovery.
-- Classify named test failures as `test_failure` even when their test names or teardown diagnostics mention timeouts; process exit code `124` remains an authoritative timeout signal.
-- Reduce the default trusted-host command ceiling from 15 minutes to 8 minutes and ship the synchronized server, SourceControlManager, and shared runtime bundles.
+- Bound HTTP response bodies, subprocess output, service startup and shutdown, Git operations, and Windows/Linux process-tree cleanup so stalled dependencies fail safely instead of freezing PushPals.
+- Add durable completion leases, heartbeats, stale-claim recovery, startup reconciliation, SourceControlManager stall health, and publication-backlog backpressure so work resumes after crashes and finalization cannot deadlock.
+- Validate and publish exact candidate SHAs with retained trusted-host evidence, disposable-worktree recovery, authoritative publication proof, and fail-closed browser and no-change outcomes.
+- Improve execution speed and job quality with LF-safe Linux worktrees, container-native dependency projection, focused and cached validation, repeated-failure circuit breakers, and end-to-end reliability metrics.
+- Pin the WorkerPal sandbox to Bun 1.3.14 and block release publication on the cross-platform reliability harness.
 
 ## Validation
 
-- `bun run test:root` passed `1,168` tests with `5` intentional platform or opt-in skips and `0` failures on Windows with Bun 1.3.14 after bundling.
-- Focused completion-recovery and trusted-validation suites passed `39` tests with `0` failures, including same-baseline transient recovery, named-test blocking, cross-baseline blocking, the one-retry cap, startup reconciliation, and timeout-word classification.
-- Server, SourceControlManager, and shared-package TypeScript checks passed.
-- Protocol integration passed `44` checks with `0` failures.
+- `bun run test:root` passed `1,367` tests with `11` intentional platform or opt-in skips and `0` failures in the Bun 1.3.14 release container.
+- The release reliability harness passed `211` tests with `5` intentional integration skips and `0` failures across failure evidence, durable lifecycle, repair orchestration, and runtime boundaries.
+- CLI bootstrap and invocation suites passed `173` tests with `2` platform skips and `0` failures on Windows.
+- Windows-host/Linux-container worktree boundary, Docker executor, sandbox runtime, dependency-projection, and exact-SHA publication integrations passed.
+- Client, VS Code, SourceControlManager, WorkerPal, RemoteBuddy, and shared-package TypeScript checks passed.
 - `bun run cli:bundle` completed and synchronized packaged runtime source and generated service bundles.
-- `bun run cli:verify-package-payload` verified `257` package files with no external toolchain files.
+- `bun run cli:verify-package-payload` verified `260` package files with no external toolchain files.
 - `git diff --check` passed.
 
 ## Install
@@ -49,5 +51,5 @@ bun install -g @pushpalsdev/cli
 ## Known Issues
 
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when auto-spawn is enabled. `pushpals --clear` treats a stopped Docker daemon as a best-effort cleanup skip.
-- Active runtimes started from an older release must be restarted after installing this release before trusted-validation recovery and timeout behavior changes take effect.
+- Active runtimes started from an older release must be restarted after installing this release before the new lifecycle, publication, and timeout behavior takes effect.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
