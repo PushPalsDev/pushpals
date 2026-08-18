@@ -296,12 +296,18 @@ describe("release package payload verification", () => {
       "Verify GitHub release assets exclude external tool artifacts",
     );
     const createReleaseIndex = workflow.indexOf("Create GitHub release (release log)");
+    const reliabilityJob = workflow.slice(reliabilityJobIndex, publishJobIndex);
+    const reliabilityInstallIndex = reliabilityJob.indexOf("bun install --frozen-lockfile");
+    const reliabilityProtocolBuildIndex = reliabilityJob.indexOf("bun run protocol:build");
+    const reliabilityHarnessIndex = reliabilityJob.indexOf("bun run harness:reliability");
 
     expect(buildPackageIndex).toBeGreaterThanOrEqual(0);
     expect(reliabilityJobIndex).toBeGreaterThanOrEqual(0);
     expect(publishJobIndex).toBeGreaterThan(reliabilityJobIndex);
     expect(workflow).toContain("- reliability_contract");
-    expect(workflow).toContain("bun run harness:reliability");
+    expect(reliabilityInstallIndex).toBeGreaterThanOrEqual(0);
+    expect(reliabilityProtocolBuildIndex).toBeGreaterThan(reliabilityInstallIndex);
+    expect(reliabilityHarnessIndex).toBeGreaterThan(reliabilityProtocolBuildIndex);
     expect(workflow).toContain('PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION: "1"');
     expect(workflow).toContain('PUSHPALS_RUN_CONTAINER_VOLUME_INTEGRATION: "1"');
     expect(workflow).not.toContain('PUSHPALS_RUN_WINDOWS_LINUX_CONTAINER_INTEGRATION: "1"');
