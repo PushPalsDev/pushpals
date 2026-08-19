@@ -20,6 +20,7 @@ import { isAbsolute, relative, resolve } from "path";
 import { fetchWithHardDeadline, loadPushPalsConfig } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type { ExecutorBackend, JobDiagnostics, JobTokenUsage } from "./common/types.js";
+import { validateStructuredJobResultEnvelope } from "./common/execution_utils.js";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 import {
   BACKEND_DOCKER_PASSTHROUGH_ENV,
@@ -721,6 +722,13 @@ export interface DockerJobResult {
   diagnostics?: JobDiagnostics;
 }
 
+interface DockerExecutionResultContext {
+  timedOutByDocker: boolean;
+  streamDrainTimedOut: boolean;
+  elapsedMs: number;
+  timeoutMs: number;
+}
+
 export interface Job {
   id: string;
   taskId: string;
@@ -739,7 +747,7 @@ function compactDockerDiagnosticText(value: unknown, maxChars = 1000): string | 
 
 function dockerFallbackDiagnostics(
   summary: string,
-  context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
+  context: DockerExecutionResultContext,
   exitCode: number,
   failureClass: string,
   metadata: Record<string, unknown> = {},
@@ -749,14 +757,50 @@ function dockerFallbackDiagnostics(
       failureClass,
       terminalStage: "docker",
       summary: compactDockerDiagnosticText(summary),
-      watchdogFired: context.timedOutByDocker,
+      watchdogFired: context.timedOutByDocker === true || context.streamDrainTimedOut === true,
       timeoutMs: context.timeoutMs,
       metadata: {
         structuredResult: false,
         elapsedMs: context.elapsedMs,
         exitCode,
         timedOutByDocker: context.timedOutByDocker,
+        streamDrainTimedOut: context.streamDrainTimedOut === true,
         ...metadata,
+      },
+    },
+  };
+}
+
+function appendDockerFailureDetail(existing: unknown, detail: string): string {
+  return [String(existing ?? "").trim(), detail.trim()].filter(Boolean).join("\n");
+}
+
+function dockerStructuredProcessFailureDiagnostics(
+  existing: JobDiagnostics | undefined,
+  summary: string,
+  context: DockerExecutionResultContext,
+  exitCode: number,
+  failureClass: string,
+  structuredResultSchemaValid = true,
+): JobDiagnostics {
+  return {
+    ...(existing ?? {}),
+    terminal: {
+      ...(existing?.terminal ?? {}),
+      failureClass,
+      terminalStage: "docker",
+      summary: compactDockerDiagnosticText(summary),
+      watchdogFired: context.timedOutByDocker === true || context.streamDrainTimedOut === true,
+      timeoutMs: context.timeoutMs,
+      metadata: {
+        ...(existing?.terminal?.metadata ?? {}),
+        structuredResult: true,
+        elapsedMs: context.elapsedMs,
+        exitCode,
+        timedOutByDocker: context.timedOutByDocker,
+        streamDrainTimedOut: context.streamDrainTimedOut === true,
+        structuredResultSchemaValid,
+        processStateOverrodeStructuredResult: true,
       },
     },
   };
@@ -1810,6 +1854,7 @@ export class DockerExecutor {
     ]);
     let hostTimer: ReturnType<typeof setTimeout> | null = null;
     let hostTimedOut = false;
+    let streamDrainTimedOut = false;
     let processExitCode: number | null = null;
     try {
       const streamFailure = streams.then(
@@ -1837,7 +1882,9 @@ export class DockerExecutor {
         DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
       );
       if (drained === null) {
+        streamDrainTimedOut = true;
         streamAbort.abort();
+        if (!hostTimedOut) await terminateDockerExecProcessTree(proc);
         await settleWithin(
           streams.catch(() => undefined),
           250,
@@ -1854,18 +1901,22 @@ export class DockerExecutor {
       processExitCode ??
       (await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS)) ??
       124;
-    const timedOut = hostTimedOut || exitCode === 124;
+    const timedOut = hostTimedOut || streamDrainTimedOut || exitCode === 124;
     return {
       ok: !timedOut && exitCode === 0,
       stdout: stdoutLines.join("\n").trim(),
       stderr: [
         stderrLines.join("\n").trim(),
-        timedOut ? `Warm-container command timed out after ${timeoutMs}ms.` : "",
+        hostTimedOut ? `Warm-container command timed out after ${timeoutMs}ms.` : "",
+        streamDrainTimedOut
+          ? `Warm-container command streams did not close after ${DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS}ms; terminated the process tree.`
+          : "",
       ]
         .filter(Boolean)
         .join("\n"),
       exitCode: timedOut ? 124 : exitCode,
       ...(timedOut ? { timedOut: true } : {}),
+      ...(streamDrainTimedOut ? { drainTimedOut: true } : {}),
     };
   }
 
@@ -1882,6 +1933,7 @@ export class DockerExecutor {
 
   private async recycleWarmContainerAfterExecutionTimeout(
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
+    reason = "an execution timeout",
   ): Promise<void> {
     // Backend readiness belongs to a specific container process. Never let a
     // timed-out exec leave the replacement marked warm before it is probed.
@@ -1892,7 +1944,7 @@ export class DockerExecutor {
     );
     if (restarted) return;
 
-    const warning = `[DockerExecutor] Timed-out warm container could not be restarted cleanly; removing it before the next job.`;
+    const warning = `[DockerExecutor] Warm container could not be restarted cleanly after ${reason}; removing it before the next job.`;
     console.warn(warning);
     onLog?.("stderr", warning);
     await this.runBoundedDockerControl(
@@ -2373,6 +2425,7 @@ export class DockerExecutor {
     }, warningDelayMs);
 
     let timedOutByDocker = false;
+    let streamDrainTimedOut = false;
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
     let processExitCode: number | null = null;
 
@@ -2422,7 +2475,12 @@ export class DockerExecutor {
         DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
       );
       if (drained === null) {
+        streamDrainTimedOut = true;
         streamAbort.abort();
+        if (!timedOutByDocker) {
+          await terminateDockerExecProcessTree(proc);
+          await this.recycleWarmContainerAfterExecutionTimeout(onLog, "a stream-drain timeout");
+        }
         await settleWithin(
           streams.catch(() => undefined),
           250,
@@ -2451,6 +2509,7 @@ export class DockerExecutor {
     // Parse result from stdout (look for ___RESULT___ sentinel)
     const result = this.parseResult(stdoutLines, stderrLines, exitCode, {
       timedOutByDocker,
+      streamDrainTimedOut,
       elapsedMs,
       timeoutMs,
     });
@@ -2911,30 +2970,176 @@ export class DockerExecutor {
     stdoutLines: string[],
     stderrLines: string[],
     exitCode: number,
-    context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
+    context: DockerExecutionResultContext,
   ): DockerJobResult {
     let sawSentinel = false;
     let sentinelParseError = "";
     // Look for ___RESULT___ sentinel
     for (let i = stdoutLines.length - 1; i >= 0; i--) {
       const line = stdoutLines[i];
-      const match = line.match(/^___RESULT___ (.+)$/);
+      const match = line.trim().match(/^___RESULT___(?:\s(.*))?$/);
       if (match) {
         sawSentinel = true;
         try {
-          const result = JSON.parse(match[1]) as DockerJobResult;
+          const rawPayload = String(match[1] ?? "").trim();
+          if (!rawPayload) {
+            throw new Error("empty structured result payload");
+          }
+          const parsedValue = JSON.parse(rawPayload) as unknown;
+          const parsedRecord =
+            parsedValue && typeof parsedValue === "object" && !Array.isArray(parsedValue)
+              ? (parsedValue as Record<string, unknown>)
+              : {};
+          const result = parsedRecord as unknown as DockerJobResult;
+          const envelope = validateStructuredJobResultEnvelope(parsedValue);
+          if (context.timedOutByDocker) {
+            const summary = `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms) after returning a structured result.`;
+            return {
+              ...result,
+              ok: false,
+              summary,
+              stderr: appendDockerFailureDetail(
+                result.stderr,
+                "Discarded the structured result because the Docker execution deadline fired.",
+              ),
+              exitCode: 124,
+              diagnostics: dockerStructuredProcessFailureDiagnostics(
+                result.diagnostics,
+                summary,
+                context,
+                exitCode,
+                "timeout",
+                envelope.valid,
+              ),
+            };
+          }
+          if (context.streamDrainTimedOut) {
+            const summary = `Job process streams did not close after returning a structured result (${context.elapsedMs}ms elapsed).`;
+            return {
+              ...result,
+              ok: false,
+              summary,
+              stderr: appendDockerFailureDetail(
+                result.stderr,
+                "Discarded the structured result because the Docker stream-drain deadline fired; the process tree and warm container were recycled.",
+              ),
+              exitCode: 124,
+              diagnostics: dockerStructuredProcessFailureDiagnostics(
+                result.diagnostics,
+                summary,
+                context,
+                exitCode,
+                "timeout",
+                envelope.valid,
+              ),
+            };
+          }
+
+          if (!envelope.valid) {
+            const summary = `Worker returned malformed structured result after ${context.elapsedMs}ms`;
+            const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+            return {
+              ok: false,
+              summary,
+              stdout: stdoutLines.join("\n"),
+              stderr: [
+                `Malformed ___RESULT___ payload: ${envelope.detail}.`,
+                stderrLines.join("\n"),
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              exitCode: malformedExitCode,
+              diagnostics: dockerFallbackDiagnostics(
+                summary,
+                context,
+                malformedExitCode,
+                "malformed_structured_result",
+                {
+                  structuredResult: true,
+                  structuredResultSchemaValid: false,
+                  schemaValidationError: envelope.detail,
+                },
+              ),
+            };
+          }
+
+          const structuredExitCode = envelope.exitCode ?? 0;
+          const authoritativeExitCode = exitCode !== 0 ? exitCode : structuredExitCode;
+          if (exitCode !== 0 && !result.ok) {
+            return {
+              ...result,
+              exitCode,
+            };
+          }
+          if (result.ok && authoritativeExitCode !== 0) {
+            const summary = `Job process exited ${authoritativeExitCode} after returning a structured success result.`;
+            return {
+              ...result,
+              ok: false,
+              summary,
+              stderr: appendDockerFailureDetail(
+                result.stderr,
+                `Discarded the structured ok=true result because the job process exit code was ${authoritativeExitCode}.`,
+              ),
+              exitCode: authoritativeExitCode,
+              diagnostics: dockerStructuredProcessFailureDiagnostics(
+                result.diagnostics,
+                summary,
+                context,
+                authoritativeExitCode,
+                "nonzero_exit",
+              ),
+            };
+          }
           return result;
         } catch (err) {
           sentinelParseError = String(err);
           console.error(
             `[DockerExecutor] Failed to parse result JSON (line length=${line.length}): ${sentinelParseError}`,
           );
+          // The newest sentinel is authoritative. Falling back to an older
+          // success after the runner emitted a malformed terminal update can
+          // turn a failed/crashed job into a false pass.
+          break;
         }
       }
     }
 
     const stdout = stdoutLines.join("\n");
     const stderr = stderrLines.join("\n");
+    if (context.timedOutByDocker) {
+      const summary = sawSentinel
+        ? `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms) after emitting a malformed structured result.`
+        : `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms; terminated before structured result).`;
+      return {
+        ok: false,
+        summary,
+        stdout,
+        stderr,
+        exitCode: 124,
+        diagnostics: dockerFallbackDiagnostics(summary, context, 124, "timeout", {
+          ...(sawSentinel ? { sentinelParseError } : {}),
+        }),
+      };
+    }
+    if (context.streamDrainTimedOut) {
+      const summary = sawSentinel
+        ? `Job process streams did not close after emitting a malformed structured result (${context.elapsedMs}ms elapsed).`
+        : `Job process streams did not close before a structured result was produced (${context.elapsedMs}ms elapsed).`;
+      return {
+        ok: false,
+        summary,
+        stdout,
+        stderr: appendDockerFailureDetail(
+          stderr,
+          "The Docker stream-drain deadline fired; the process tree and warm container were recycled.",
+        ),
+        exitCode: 124,
+        diagnostics: dockerFallbackDiagnostics(summary, context, 124, "timeout", {
+          ...(sawSentinel ? { sentinelParseError } : {}),
+        }),
+      };
+    }
     if (sawSentinel) {
       const details = [
         `Malformed ___RESULT___ payload: ${sentinelParseError || "unknown parse error"}`,
@@ -2946,11 +3151,11 @@ export class DockerExecutor {
         summary,
         stdout,
         stderr: details.join("\n"),
-        exitCode,
+        exitCode: exitCode === 0 ? 1 : exitCode,
         diagnostics: dockerFallbackDiagnostics(
           summary,
           context,
-          exitCode,
+          exitCode === 0 ? 1 : exitCode,
           "malformed_structured_result",
           {
             sentinelParseError,
@@ -2959,18 +3164,8 @@ export class DockerExecutor {
       };
     }
 
-    // No sentinel found, return generic result.
-    if (context.timedOutByDocker) {
-      const summary = `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms; terminated before structured result).`;
-      return {
-        ok: false,
-        summary,
-        stdout,
-        stderr,
-        exitCode,
-        diagnostics: dockerFallbackDiagnostics(summary, context, exitCode, "timeout"),
-      };
-    }
+    // No sentinel found: process exit zero is not proof that the job passed.
+    // The job runner contract requires a validated structured result.
     if (exitCode === 143 || exitCode === 137) {
       const summary = `Job process was terminated (exit ${exitCode}) after ${context.elapsedMs}ms before structured result was produced.`;
       return {
@@ -2986,20 +3181,22 @@ export class DockerExecutor {
     const failureClass = unstructuredDockerFailureClass(stdout, stderr);
     const summary =
       exitCode === 0
-        ? `Job completed in ${context.elapsedMs}ms`
+        ? `Job process exited successfully without returning a structured result after ${context.elapsedMs}ms`
         : failureClass === "missing_runtime_asset"
           ? `Job failed because a required WorkerPal runtime asset was missing (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`
           : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
     return {
-      ok: exitCode === 0,
+      ok: false,
       summary,
       stdout,
       stderr,
-      exitCode,
-      diagnostics:
-        exitCode === 0
-          ? undefined
-          : dockerFallbackDiagnostics(summary, context, exitCode, failureClass),
+      exitCode: exitCode === 0 ? 1 : exitCode,
+      diagnostics: dockerFallbackDiagnostics(
+        summary,
+        context,
+        exitCode === 0 ? 1 : exitCode,
+        failureClass,
+      ),
     };
   }
 
@@ -3106,7 +3303,13 @@ export class DockerExecutor {
   private async runHostCommandCapture(
     command: string[],
     opts: { cwd?: string; timeoutMs?: number } = {},
-  ): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean }> {
+  ): Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+    timedOut: boolean;
+    drainTimedOut: boolean;
+  }> {
     const proc = Bun.spawn(command, {
       cwd: opts.cwd,
       stdin: "ignore",
@@ -3158,28 +3361,45 @@ export class DockerExecutor {
       streams.catch(() => ["", ""] as [string, string]),
       DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS,
     );
+    const drainTimedOut = captured === null;
     if (captured === null) {
       streamAbort.abort();
+      if (!timedOut) await terminateDockerExecProcessTree(proc);
       captured = (await settleWithin(
         streams.catch(() => ["", ""] as [string, string]),
         250,
       )) ?? ["", ""];
     }
-    const exitCode = timedOut
+    const processExitCode = timedOut
       ? ((await settleWithin(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS)) ?? 124)
       : outcome.exitCode;
+    const effectiveTimedOut = timedOut || drainTimedOut;
     return {
       stdout: captured[0].trim(),
-      stderr: captured[1].trim(),
-      exitCode,
-      timedOut,
+      stderr: [
+        captured[1].trim(),
+        drainTimedOut
+          ? `Process streams did not close after ${DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS}ms; terminated the process tree.`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      exitCode: effectiveTimedOut ? 124 : processExitCode,
+      timedOut: effectiveTimedOut,
+      drainTimedOut,
     };
   }
 
   private async runDockerCommandCapture(
     command: string[],
     opts: { cwd?: string; timeoutMs?: number } = {},
-  ): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean }> {
+  ): Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+    timedOut: boolean;
+    drainTimedOut: boolean;
+  }> {
     return this.runHostCommandCapture(command, opts);
   }
 

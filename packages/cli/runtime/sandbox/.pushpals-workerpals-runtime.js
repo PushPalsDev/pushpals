@@ -2895,11 +2895,12 @@ function parseStructuredResult(stdout, executorResultPrefix = resolveOutputCompa
   const lines = stdout.split(/\r?\n/);
   for (let i = lines.length - 1;i >= 0; i--) {
     const line = lines[i].trim();
-    if (!line.startsWith(executorResultPrefix))
+    if (!isStructuredResultLine(line, executorResultPrefix))
       continue;
-    const raw = line.slice(executorResultPrefix.length).trim();
+    const barePrefix = executorResultPrefix.trimEnd();
+    const raw = line.slice(barePrefix.length).trim();
     if (!raw)
-      continue;
+      return null;
     try {
       return JSON.parse(raw);
     } catch {
@@ -2908,8 +2909,49 @@ function parseStructuredResult(stdout, executorResultPrefix = resolveOutputCompa
   }
   return null;
 }
+function hasStructuredResultSentinel(stdout, executorResultPrefix = resolveOutputCompactionPolicy().executorResultPrefix) {
+  return stdout.split(/\r?\n/).some((line) => isStructuredResultLine(line.trim(), executorResultPrefix));
+}
+function isStructuredResultLine(line, executorResultPrefix) {
+  const barePrefix = executorResultPrefix.trimEnd();
+  return line === barePrefix || line.startsWith(executorResultPrefix);
+}
+function validateStructuredJobResultEnvelope(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      valid: false,
+      detail: "structured result must be a JSON object"
+    };
+  }
+  const record = value;
+  if (typeof record.ok !== "boolean") {
+    return {
+      valid: false,
+      detail: `structured result field ok must be boolean, received ${describeStructuredFieldType(record.ok)}`
+    };
+  }
+  if (Object.prototype.hasOwnProperty.call(record, "exitCode")) {
+    if (typeof record.exitCode !== "number" || !Number.isFinite(record.exitCode) || !Number.isInteger(record.exitCode)) {
+      return {
+        valid: false,
+        detail: `structured result field exitCode must be a finite integer when present, received ${describeStructuredFieldType(record.exitCode)}`
+      };
+    }
+    return { valid: true, ok: record.ok, exitCode: record.exitCode };
+  }
+  return { valid: true, ok: record.ok };
+}
+function describeStructuredFieldType(value) {
+  if (value === null)
+    return "null";
+  if (Array.isArray(value))
+    return "array";
+  if (typeof value === "number" && !Number.isFinite(value))
+    return String(value);
+  return typeof value;
+}
 function filterResultLines(stdout, executorResultPrefix = resolveOutputCompactionPolicy().executorResultPrefix) {
-  return stdout.split(/\r?\n/).filter((line) => !line.trim().startsWith(executorResultPrefix)).join(`
+  return stdout.split(/\r?\n/).filter((line) => !isStructuredResultLine(line.trim(), executorResultPrefix)).join(`
 `).trim();
 }
 
@@ -3343,12 +3385,26 @@ function resolveGenericPythonExecutorScriptPath(config, runtimeConfig) {
 }
 function normalizeGenericPythonExecutorParsedResultForTimeout(params) {
   const signalTerminatedCodex = params.timedOut && params.backendName === "openai_codex" && /\bopenai_codex interrupted by signal 15\b/i.test(params.summary);
-  if (!signalTerminatedCodex) {
+  if (!params.timedOut) {
     return {
       summary: params.summary,
       stdout: params.stdout,
       stderr: params.stderr,
       exitCode: params.exitCode
+    };
+  }
+  if (!signalTerminatedCodex) {
+    const timeoutDetail2 = String(params.timeoutDetail ?? "").trim();
+    return {
+      summary: `${params.backendName} wrapper timed out after ${params.timeoutMs}ms for ${params.kind}`,
+      stdout: params.stdout,
+      stderr: [
+        params.stderr,
+        `The ${params.backendName} wrapper process exceeded the PushPals execution deadline.`,
+        timeoutDetail2 ? `Timeout detail: ${timeoutDetail2}.` : ""
+      ].filter(Boolean).join(`
+`),
+      exitCode: 124
     };
   }
   const timeoutDetail = String(params.timeoutDetail ?? "").trim();
@@ -3366,6 +3422,35 @@ ${cleanedStderr}` : ""
     stderr,
     exitCode: 124
   };
+}
+function appendExecutorFailureDetail(existing, detail) {
+  return [existing.trim(), detail.trim()].filter(Boolean).join(`
+`);
+}
+function genericExecutorBoundaryDiagnostics(params) {
+  return {
+    terminal: {
+      failureClass: params.failureClass,
+      terminalStage: "executor",
+      executorBackend: params.backendName,
+      summary: params.summary,
+      watchdogFired: params.failureClass === "timeout",
+      timeoutMs: params.timeoutMs,
+      metadata: {
+        classificationOwner: "generic_python_executor",
+        structuredResult: params.structuredResult,
+        exitCode: params.exitCode,
+        ...params.metadata ?? {}
+      }
+    }
+  };
+}
+function workerOwnedInternalErrorDetail(error) {
+  const detail = error instanceof Error ? String(error.stack ?? `${error.name}: ${error.message}`).trim() : String(error ?? "").trim();
+  if (!detail)
+    return null;
+  const firstFrame = detail.split(/\r?\n/).find((line) => /^\s*at\b/i.test(line));
+  return isWorkerOwnedRuntimeStackFrame(firstFrame) ? detail : null;
 }
 function createGenericPythonExecutor(config) {
   const { backendName } = config;
@@ -3439,7 +3524,7 @@ function createGenericPythonExecutor(config) {
       };
       let processResult;
       try {
-        processResult = await runBoundedProcess(args, {
+        processResult = await (config.processRunner ?? runBoundedProcess)(args, {
           cwd: repo,
           env: {
             ...buildWorkerSandboxWritableEnv(repo),
@@ -3462,36 +3547,122 @@ function createGenericPythonExecutor(config) {
         clearInterval(progressTimer);
       }
       timedOut = processResult.timedOut;
+      const drainTimedOut = processResult.drainTimedOut === true;
       const stdout = processResult.stdout;
       const stderr = processResult.stderr;
       const exitCode = processResult.exitCode;
       const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
+      const sawStructuredResultSentinel = hasStructuredResultSentinel(stdout, outputPolicy.executorResultPrefix);
       const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
       const fallbackUsage = estimateJobTokenUsage(backendName, modelId, params, "", filteredStdout, stderr);
       if (!parsed) {
         if (timedOut) {
+          const summary3 = `${backendName} wrapper timed out after ${timeoutMs}ms for ${kind}`;
           return {
             ok: false,
-            summary: `${backendName} wrapper timed out after ${timeoutMs}ms for ${kind}`,
+            summary: summary3,
             stdout: truncate(filteredStdout, outputPolicy),
             stderr: truncate(stderr, outputPolicy),
-            exitCode: exitCode === 0 ? 124 : exitCode,
-            usage: fallbackUsage
+            exitCode: 124,
+            usage: fallbackUsage,
+            diagnostics: genericExecutorBoundaryDiagnostics({
+              backendName,
+              summary: summary3,
+              failureClass: "timeout",
+              exitCode: 124,
+              timeoutMs,
+              structuredResult: false,
+              metadata: { processTimedOut: true }
+            })
           };
         }
+        if (drainTimedOut) {
+          const summary3 = `${backendName} wrapper process streams did not close after execution for ${kind}`;
+          return {
+            ok: false,
+            summary: summary3,
+            stdout: truncate(filteredStdout, outputPolicy),
+            stderr: truncate(appendExecutorFailureDetail(stderr, "The wrapper process stream-drain deadline fired; discarded any incomplete result and terminated the process tree."), outputPolicy),
+            exitCode: 124,
+            usage: fallbackUsage,
+            diagnostics: genericExecutorBoundaryDiagnostics({
+              backendName,
+              summary: summary3,
+              failureClass: "timeout",
+              exitCode: 124,
+              timeoutMs,
+              structuredResult: false,
+              metadata: { streamDrainTimedOut: true }
+            })
+          };
+        }
+        if (sawStructuredResultSentinel) {
+          const summary3 = `${backendName} wrapper returned a malformed structured result for ${kind}`;
+          const malformedDetail = "Malformed structured result: sentinel payload was not a JSON object or could not be parsed.";
+          const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+          return {
+            ok: false,
+            summary: summary3,
+            stdout: truncate(filteredStdout, outputPolicy),
+            stderr: truncate(appendExecutorFailureDetail(stderr, malformedDetail), outputPolicy),
+            exitCode: malformedExitCode,
+            usage: fallbackUsage,
+            diagnostics: genericExecutorBoundaryDiagnostics({
+              backendName,
+              summary: summary3,
+              failureClass: "malformed_structured_result",
+              exitCode: malformedExitCode,
+              timeoutMs,
+              structuredResult: true,
+              metadata: { schemaValidationError: malformedDetail }
+            })
+          };
+        }
+        const summary2 = `${backendName} wrapper did not return a structured result for ${kind}`;
+        const missingExitCode = exitCode === 0 ? 1 : exitCode;
         return {
           ok: false,
-          summary: `${backendName} wrapper did not return a structured result for ${kind}`,
+          summary: summary2,
           stdout: truncate(filteredStdout, outputPolicy),
           stderr: truncate(stderr, outputPolicy),
-          exitCode,
-          usage: fallbackUsage
+          exitCode: missingExitCode,
+          usage: fallbackUsage,
+          diagnostics: genericExecutorBoundaryDiagnostics({
+            backendName,
+            summary: summary2,
+            failureClass: "no_structured_result",
+            exitCode: missingExitCode,
+            timeoutMs,
+            structuredResult: false
+          })
         };
       }
       const summary = typeof parsed.summary === "string" ? parsed.summary : exitCode === 0 ? `${kind} passed via ${backendName}` : `${kind} failed via ${backendName} (exit ${exitCode})`;
       const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
       const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
       const usage = coerceJobTokenUsage(parsed.usage, estimateJobTokenUsage(backendName, modelId, params, summary, parsedStdout, parsedStderr));
+      const envelope = validateStructuredJobResultEnvelope(parsed);
+      const malformedResult = envelope.valid ? null : (() => {
+        const malformedSummary = `${backendName} wrapper returned a malformed structured result for ${kind}`;
+        const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+        return {
+          ok: false,
+          summary: malformedSummary,
+          stdout: truncate(parsedStdout, outputPolicy),
+          stderr: truncate(appendExecutorFailureDetail(parsedStderr, `Malformed structured result: ${envelope.detail}.`), outputPolicy),
+          exitCode: malformedExitCode,
+          usage,
+          diagnostics: genericExecutorBoundaryDiagnostics({
+            backendName,
+            summary: malformedSummary,
+            failureClass: "malformed_structured_result",
+            exitCode: malformedExitCode,
+            timeoutMs,
+            structuredResult: true,
+            metadata: { schemaValidationError: envelope.detail }
+          })
+        };
+      })();
       const normalized = normalizeGenericPythonExecutorParsedResultForTimeout({
         backendName,
         kind,
@@ -3501,17 +3672,103 @@ function createGenericPythonExecutor(config) {
         summary,
         stdout: parsedStdout,
         stderr: parsedStderr,
-        exitCode: typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode) ? parsed.exitCode : exitCode
+        exitCode: envelope.valid && envelope.exitCode !== undefined ? envelope.exitCode : exitCode
       });
+      if (timedOut) {
+        return {
+          ok: false,
+          summary: normalized.summary,
+          stdout: truncate(normalized.stdout, outputPolicy),
+          stderr: truncate(normalized.stderr, outputPolicy),
+          exitCode: 124,
+          usage,
+          diagnostics: genericExecutorBoundaryDiagnostics({
+            backendName,
+            summary: normalized.summary,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: true,
+            metadata: { processTimedOut: true }
+          })
+        };
+      }
+      if (drainTimedOut) {
+        const drainSummary = `${backendName} wrapper process streams did not close after returning a structured result for ${kind}`;
+        return {
+          ok: false,
+          summary: drainSummary,
+          stdout: truncate(normalized.stdout, outputPolicy),
+          stderr: truncate(appendExecutorFailureDetail(normalized.stderr, "Discarded the structured result because the process stream-drain deadline fired and the process tree was terminated."), outputPolicy),
+          exitCode: 124,
+          usage,
+          diagnostics: genericExecutorBoundaryDiagnostics({
+            backendName,
+            summary: drainSummary,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: true,
+            metadata: {
+              streamDrainTimedOut: true,
+              processStateOverrodeStructuredResult: true
+            }
+          })
+        };
+      }
+      if (!envelope.valid)
+        return malformedResult;
+      const parsedExitCode = envelope.exitCode ?? exitCode;
+      const processExitedNonzero = exitCode !== 0;
+      const structuredExitNonzero = parsedExitCode !== 0;
+      const parsedOk = envelope.ok;
+      let finalSummary = normalized.summary;
+      let finalStderr = normalized.stderr;
+      let finalExitCode = normalized.exitCode;
+      if (!timedOut && processExitedNonzero) {
+        finalExitCode = exitCode;
+        if (parsedOk) {
+          finalSummary = `${backendName} wrapper process exited ${exitCode} after returning a structured success result for ${kind}`;
+          finalStderr = appendExecutorFailureDetail(finalStderr, `Discarded the structured ok=true result because the wrapper process exited with code ${exitCode}.`);
+        }
+      } else if (!timedOut && parsedOk && structuredExitNonzero) {
+        finalSummary = `${backendName} wrapper returned exit ${parsedExitCode} with a structured success result for ${kind}`;
+        finalStderr = appendExecutorFailureDetail(finalStderr, `Discarded the structured ok=true result because its exitCode was ${parsedExitCode}.`);
+        finalExitCode = parsedExitCode;
+      }
       return {
-        ok: typeof parsed.ok === "boolean" ? parsed.ok : exitCode === 0,
-        summary: normalized.summary,
+        ok: parsedOk && !timedOut && !processExitedNonzero && !structuredExitNonzero,
+        summary: finalSummary,
         stdout: truncate(normalized.stdout, outputPolicy),
-        stderr: truncate(normalized.stderr, outputPolicy),
-        exitCode: normalized.exitCode,
+        stderr: truncate(finalStderr, outputPolicy),
+        exitCode: finalExitCode,
         usage
       };
     } catch (err) {
+      const internalErrorDetail = workerOwnedInternalErrorDetail(err);
+      if (internalErrorDetail) {
+        const summary = `WorkerPal internal runtime failure in ${backendName} executor for ${kind}`;
+        return {
+          ok: false,
+          summary,
+          stderr: internalErrorDetail,
+          exitCode: 1,
+          usage: estimateJobTokenUsage(backendName, runtimeConfig.workerpals.llm.model.trim(), params, summary, "", internalErrorDetail),
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "worker_runtime",
+              executorBackend: backendName,
+              summary: internalErrorDetail.split(/\r?\n/, 1)[0] || summary,
+              watchdogFired: false,
+              metadata: {
+                caughtBy: "generic_python_executor",
+                jobKind: kind
+              }
+            }
+          }
+        };
+      }
       return {
         ok: false,
         summary: `${backendName} wrapper execution error for ${kind}: ${String(err)}`,
@@ -3678,6 +3935,28 @@ function coerceJobTokenUsage2(value, fallback) {
     modelId: typeof raw.modelId === "string" && raw.modelId.trim().length > 0 ? raw.modelId.trim() : fallback.modelId
   };
 }
+function appendOpenHandsFailureDetail(existing, detail) {
+  return [existing.trim(), detail.trim()].filter(Boolean).join(`
+`);
+}
+function openHandsBoundaryDiagnostics(params) {
+  return {
+    terminal: {
+      failureClass: params.failureClass,
+      terminalStage: "executor",
+      executorBackend: "openhands",
+      summary: params.summary,
+      watchdogFired: params.failureClass === "timeout",
+      timeoutMs: params.timeoutMs,
+      metadata: {
+        classificationOwner: "openhands_task_execute",
+        structuredResult: params.structuredResult,
+        exitCode: params.exitCode,
+        ...params.metadata ?? {}
+      }
+    }
+  };
+}
 function classifyShellCommand(cmd) {
   const trimmed = cmd.trim().toLowerCase();
   if (!trimmed)
@@ -3736,7 +4015,7 @@ function extractClarificationQuestionFromOutput(output) {
   const fallback = [...lines].reverse().find((line) => CLARIFICATION_SIGNAL_REGEX.test(line));
   return fallback ? fallback.slice(0, 280) : null;
 }
-async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, budgets) {
+async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, budgets, executionOptions = {}) {
   const pythonBin = runtimeConfig.workerpals.openhandsPython || "python";
   const scriptPath = OPENHANDS_SCRIPT_PATH;
   if (!existsSync6(scriptPath)) {
@@ -3925,7 +4204,7 @@ async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, bu
       }, msUntilWarn);
     };
     resetWarningTimer();
-    const processResult = await runBoundedProcess(processArgv, {
+    const processResult = await (executionOptions.processRunner ?? runBoundedProcess)(processArgv, {
       cwd: repo,
       env: processEnv,
       timeoutMs,
@@ -3954,6 +4233,7 @@ async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, bu
       }
     });
     timedOut = processResult.timedOut;
+    const drainTimedOut = processResult.drainTimedOut === true;
     const stdout = processResult.stdout;
     const stderr = processResult.stderr;
     const exitCode = processResult.exitCode;
@@ -3963,6 +4243,7 @@ async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, bu
     }
     stopStuckNudges();
     const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
+    const sawStructuredResultSentinel = hasStructuredResultSentinel(stdout, outputPolicy.executorResultPrefix);
     const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
     const fallbackUsage = estimateJobTokenUsage2(runtimeConfig, params, "", filteredStdout, stderr);
     if (!parsed) {
@@ -3973,25 +4254,189 @@ async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, bu
           summary: `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind} (effective limit: ${timeoutLimitSource}${extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""}). Worker returned a timeout failure.${stuckNote}`,
           stdout: truncate(filteredStdout, outputPolicy),
           stderr: truncate(stderr, outputPolicy),
-          exitCode: exitCode === 0 ? 124 : exitCode,
-          usage: fallbackUsage
+          exitCode: 124,
+          usage: fallbackUsage,
+          diagnostics: openHandsBoundaryDiagnostics({
+            summary: `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind}`,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: false,
+            metadata: { processTimedOut: true }
+          })
         };
       }
+      if (drainTimedOut) {
+        const summary3 = `OpenHands wrapper process streams did not close after execution for ${kind}`;
+        return {
+          ok: false,
+          summary: summary3,
+          stdout: truncate(filteredStdout, outputPolicy),
+          stderr: truncate(appendOpenHandsFailureDetail(stderr, "The wrapper process stream-drain deadline fired; discarded any incomplete result and terminated the process tree."), outputPolicy),
+          exitCode: 124,
+          usage: fallbackUsage,
+          diagnostics: openHandsBoundaryDiagnostics({
+            summary: summary3,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: false,
+            metadata: { streamDrainTimedOut: true }
+          })
+        };
+      }
+      if (sawStructuredResultSentinel) {
+        const summary3 = `OpenHands wrapper returned a malformed structured result for ${kind}`;
+        const malformedDetail = "Malformed structured result: sentinel payload was not a JSON object or could not be parsed.";
+        const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+        return {
+          ok: false,
+          summary: summary3,
+          stdout: truncate(filteredStdout, outputPolicy),
+          stderr: truncate(appendOpenHandsFailureDetail(stderr, malformedDetail), outputPolicy),
+          exitCode: malformedExitCode,
+          usage: fallbackUsage,
+          diagnostics: openHandsBoundaryDiagnostics({
+            summary: summary3,
+            failureClass: "malformed_structured_result",
+            exitCode: malformedExitCode,
+            timeoutMs,
+            structuredResult: true,
+            metadata: { schemaValidationError: malformedDetail }
+          })
+        };
+      }
+      const summary2 = `OpenHands wrapper did not return a structured result for ${kind}`;
+      const missingExitCode = exitCode === 0 ? 1 : exitCode;
       return {
         ok: false,
-        summary: `OpenHands wrapper did not return a structured result for ${kind}`,
+        summary: summary2,
         stdout: truncate(filteredStdout, outputPolicy),
         stderr: truncate(stderr, outputPolicy),
-        exitCode,
-        usage: fallbackUsage
+        exitCode: missingExitCode,
+        usage: fallbackUsage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: summary2,
+          failureClass: "no_structured_result",
+          exitCode: missingExitCode,
+          timeoutMs,
+          structuredResult: false
+        })
       };
     }
     const summary = typeof parsed.summary === "string" ? parsed.summary : exitCode === 0 ? `${kind} passed via OpenHands` : `${kind} failed via OpenHands (exit ${exitCode})`;
     const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
     const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
     const usage = coerceJobTokenUsage2(parsed.usage, estimateJobTokenUsage2(runtimeConfig, params, summary, parsedStdout, parsedStderr));
-    const parsedExitCode = typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode) ? parsed.exitCode : exitCode;
-    const parsedOk = typeof parsed.ok === "boolean" ? parsed.ok : parsedExitCode === 0;
+    const envelope = validateStructuredJobResultEnvelope(parsed);
+    if (timedOut) {
+      const timeoutSummary = `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind} after returning a structured result.`;
+      return {
+        ok: false,
+        summary: timeoutSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(appendOpenHandsFailureDetail(parsedStderr, "Discarded the structured result because the PushPals execution deadline fired."), outputPolicy),
+        exitCode: 124,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: timeoutSummary,
+          failureClass: "timeout",
+          exitCode: 124,
+          timeoutMs,
+          structuredResult: true,
+          metadata: {
+            processTimedOut: true,
+            structuredResultSchemaValid: envelope.valid,
+            processStateOverrodeStructuredResult: true
+          }
+        })
+      };
+    }
+    if (drainTimedOut) {
+      const drainSummary = `OpenHands wrapper process streams did not close after returning a structured result for ${kind}`;
+      return {
+        ok: false,
+        summary: drainSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(appendOpenHandsFailureDetail(parsedStderr, "Discarded the structured result because the process stream-drain deadline fired and the process tree was terminated."), outputPolicy),
+        exitCode: 124,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: drainSummary,
+          failureClass: "timeout",
+          exitCode: 124,
+          timeoutMs,
+          structuredResult: true,
+          metadata: {
+            streamDrainTimedOut: true,
+            structuredResultSchemaValid: envelope.valid,
+            processStateOverrodeStructuredResult: true
+          }
+        })
+      };
+    }
+    if (!envelope.valid) {
+      const malformedSummary = `OpenHands wrapper returned a malformed structured result for ${kind}`;
+      const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+      return {
+        ok: false,
+        summary: malformedSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(appendOpenHandsFailureDetail(parsedStderr, `Malformed structured result: ${envelope.detail}.`), outputPolicy),
+        exitCode: malformedExitCode,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: malformedSummary,
+          failureClass: "malformed_structured_result",
+          exitCode: malformedExitCode,
+          timeoutMs,
+          structuredResult: true,
+          metadata: { schemaValidationError: envelope.detail }
+        })
+      };
+    }
+    const parsedExitCode = envelope.exitCode ?? exitCode;
+    const parsedOk = envelope.ok;
+    if (exitCode !== 0) {
+      const processSummary = parsedOk ? `OpenHands wrapper process exited ${exitCode} after returning a structured success result for ${kind}` : summary;
+      return {
+        ok: false,
+        summary: processSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(parsedOk ? appendOpenHandsFailureDetail(parsedStderr, `Discarded the structured ok=true result because the wrapper process exited with code ${exitCode}.`) : parsedStderr, outputPolicy),
+        exitCode,
+        usage,
+        ...parsedOk ? {
+          diagnostics: openHandsBoundaryDiagnostics({
+            summary: processSummary,
+            failureClass: "nonzero_exit",
+            exitCode,
+            timeoutMs,
+            structuredResult: true,
+            metadata: { processStateOverrodeStructuredResult: true }
+          })
+        } : {}
+      };
+    }
+    if (parsedOk && parsedExitCode !== 0) {
+      const structuredExitSummary = `OpenHands wrapper returned exit ${parsedExitCode} with a structured success result for ${kind}`;
+      return {
+        ok: false,
+        summary: structuredExitSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(appendOpenHandsFailureDetail(parsedStderr, `Discarded the structured ok=true result because its exitCode was ${parsedExitCode}.`), outputPolicy),
+        exitCode: parsedExitCode,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: structuredExitSummary,
+          failureClass: "nonzero_exit",
+          exitCode: parsedExitCode,
+          timeoutMs,
+          structuredResult: true,
+          metadata: { processStateOverrodeStructuredResult: true }
+        })
+      };
+    }
     const noChangeResult = parsedOk && (hasOpenHandsNoChangeSignal(summary) || hasOpenHandsNoChangeSignal(String(parsedStdout ?? "")) || hasOpenHandsNoChangeSignal(String(parsedStderr ?? "")));
     if (noChangeResult) {
       const clarificationQuestion = extractClarificationQuestionFromOutput(filteredStdout);
@@ -13015,14 +13460,42 @@ function dockerFallbackDiagnostics(summary, context, exitCode, failureClass, met
       failureClass,
       terminalStage: "docker",
       summary: compactDockerDiagnosticText(summary),
-      watchdogFired: context.timedOutByDocker,
+      watchdogFired: context.timedOutByDocker === true || context.streamDrainTimedOut === true,
       timeoutMs: context.timeoutMs,
       metadata: {
         structuredResult: false,
         elapsedMs: context.elapsedMs,
         exitCode,
         timedOutByDocker: context.timedOutByDocker,
+        streamDrainTimedOut: context.streamDrainTimedOut === true,
         ...metadata
+      }
+    }
+  };
+}
+function appendDockerFailureDetail(existing, detail) {
+  return [String(existing ?? "").trim(), detail.trim()].filter(Boolean).join(`
+`);
+}
+function dockerStructuredProcessFailureDiagnostics(existing, summary, context, exitCode, failureClass, structuredResultSchemaValid = true) {
+  return {
+    ...existing ?? {},
+    terminal: {
+      ...existing?.terminal ?? {},
+      failureClass,
+      terminalStage: "docker",
+      summary: compactDockerDiagnosticText(summary),
+      watchdogFired: context.timedOutByDocker === true || context.streamDrainTimedOut === true,
+      timeoutMs: context.timeoutMs,
+      metadata: {
+        ...existing?.terminal?.metadata ?? {},
+        structuredResult: true,
+        elapsedMs: context.elapsedMs,
+        exitCode,
+        timedOutByDocker: context.timedOutByDocker,
+        streamDrainTimedOut: context.streamDrainTimedOut === true,
+        structuredResultSchemaValid,
+        processStateOverrodeStructuredResult: true
       }
     }
   };
@@ -13705,6 +14178,7 @@ class DockerExecutor {
     ]);
     let hostTimer = null;
     let hostTimedOut = false;
+    let streamDrainTimedOut = false;
     let processExitCode = null;
     try {
       const streamFailure = streams.then(() => new Promise(() => {}), (error) => ({ kind: "stream_error", error }));
@@ -13728,7 +14202,10 @@ class DockerExecutor {
         return;
       }), DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS);
       if (drained === null) {
+        streamDrainTimedOut = true;
         streamAbort.abort();
+        if (!hostTimedOut)
+          await terminateDockerExecProcessTree(proc);
         await settleWithin2(streams.catch(() => {
           return;
         }), 250);
@@ -13742,7 +14219,7 @@ class DockerExecutor {
         clearTimeout(hostTimer);
     }
     const exitCode = processExitCode ?? await settleWithin2(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS) ?? 124;
-    const timedOut = hostTimedOut || exitCode === 124;
+    const timedOut = hostTimedOut || streamDrainTimedOut || exitCode === 124;
     return {
       ok: !timedOut && exitCode === 0,
       stdout: stdoutLines.join(`
@@ -13750,11 +14227,13 @@ class DockerExecutor {
       stderr: [
         stderrLines.join(`
 `).trim(),
-        timedOut ? `Warm-container command timed out after ${timeoutMs}ms.` : ""
+        hostTimedOut ? `Warm-container command timed out after ${timeoutMs}ms.` : "",
+        streamDrainTimedOut ? `Warm-container command streams did not close after ${DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS}ms; terminated the process tree.` : ""
       ].filter(Boolean).join(`
 `),
       exitCode: timedOut ? 124 : exitCode,
-      ...timedOut ? { timedOut: true } : {}
+      ...timedOut ? { timedOut: true } : {},
+      ...streamDrainTimedOut ? { drainTimedOut: true } : {}
     };
   }
   async runBoundedDockerControl(args, timeoutMs) {
@@ -13767,12 +14246,12 @@ class DockerExecutor {
       return false;
     }
   }
-  async recycleWarmContainerAfterExecutionTimeout(onLog) {
+  async recycleWarmContainerAfterExecutionTimeout(onLog, reason = "an execution timeout") {
     this.warmedBackends.clear();
     const restarted = await this.runBoundedDockerControl(["restart", "-t", "1", this.warmContainerName], DOCKER_TIMEOUT_RECYCLE_TIMEOUT_MS);
     if (restarted)
       return;
-    const warning = `[DockerExecutor] Timed-out warm container could not be restarted cleanly; removing it before the next job.`;
+    const warning = `[DockerExecutor] Warm container could not be restarted cleanly after ${reason}; removing it before the next job.`;
     console.warn(warning);
     onLog?.("stderr", warning);
     await this.runBoundedDockerControl(["rm", "-f", this.warmContainerName], DOCKER_TIMEOUT_RECYCLE_TIMEOUT_MS);
@@ -14139,6 +14618,7 @@ ${text}` : `
       onLog?.("stderr", "[DockerExecutor] Worker should finish quickly and return a concise failure/update if task cannot complete in time.");
     }, warningDelayMs);
     let timedOutByDocker = false;
+    let streamDrainTimedOut = false;
     let timeoutTimer = null;
     let processExitCode = null;
     const stdoutLines = [];
@@ -14181,7 +14661,12 @@ ${text}` : `
         return;
       }), DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS);
       if (drained === null) {
+        streamDrainTimedOut = true;
         streamAbort.abort();
+        if (!timedOutByDocker) {
+          await terminateDockerExecProcessTree(proc);
+          await this.recycleWarmContainerAfterExecutionTimeout(onLog, "a stream-drain timeout");
+        }
         await settleWithin2(streams.catch(() => {
           return;
         }), 250);
@@ -14201,6 +14686,7 @@ ${text}` : `
     const elapsedMs = Math.max(1, Date.now() - startedAtMs);
     const result = this.parseResult(stdoutLines, stderrLines, exitCode, {
       timedOutByDocker,
+      streamDrainTimedOut,
       elapsedMs,
       timeoutMs
     });
@@ -14557,15 +15043,86 @@ ${text}` : `
     let sentinelParseError = "";
     for (let i = stdoutLines.length - 1;i >= 0; i--) {
       const line = stdoutLines[i];
-      const match = line.match(/^___RESULT___ (.+)$/);
+      const match = line.trim().match(/^___RESULT___(?:\s(.*))?$/);
       if (match) {
         sawSentinel = true;
         try {
-          const result = JSON.parse(match[1]);
+          const rawPayload = String(match[1] ?? "").trim();
+          if (!rawPayload) {
+            throw new Error("empty structured result payload");
+          }
+          const parsedValue = JSON.parse(rawPayload);
+          const parsedRecord = parsedValue && typeof parsedValue === "object" && !Array.isArray(parsedValue) ? parsedValue : {};
+          const result = parsedRecord;
+          const envelope = validateStructuredJobResultEnvelope(parsedValue);
+          if (context.timedOutByDocker) {
+            const summary2 = `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms) after returning a structured result.`;
+            return {
+              ...result,
+              ok: false,
+              summary: summary2,
+              stderr: appendDockerFailureDetail(result.stderr, "Discarded the structured result because the Docker execution deadline fired."),
+              exitCode: 124,
+              diagnostics: dockerStructuredProcessFailureDiagnostics(result.diagnostics, summary2, context, exitCode, "timeout", envelope.valid)
+            };
+          }
+          if (context.streamDrainTimedOut) {
+            const summary2 = `Job process streams did not close after returning a structured result (${context.elapsedMs}ms elapsed).`;
+            return {
+              ...result,
+              ok: false,
+              summary: summary2,
+              stderr: appendDockerFailureDetail(result.stderr, "Discarded the structured result because the Docker stream-drain deadline fired; the process tree and warm container were recycled."),
+              exitCode: 124,
+              diagnostics: dockerStructuredProcessFailureDiagnostics(result.diagnostics, summary2, context, exitCode, "timeout", envelope.valid)
+            };
+          }
+          if (!envelope.valid) {
+            const summary2 = `Worker returned malformed structured result after ${context.elapsedMs}ms`;
+            const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+            return {
+              ok: false,
+              summary: summary2,
+              stdout: stdoutLines.join(`
+`),
+              stderr: [
+                `Malformed ___RESULT___ payload: ${envelope.detail}.`,
+                stderrLines.join(`
+`)
+              ].filter(Boolean).join(`
+`),
+              exitCode: malformedExitCode,
+              diagnostics: dockerFallbackDiagnostics(summary2, context, malformedExitCode, "malformed_structured_result", {
+                structuredResult: true,
+                structuredResultSchemaValid: false,
+                schemaValidationError: envelope.detail
+              })
+            };
+          }
+          const structuredExitCode = envelope.exitCode ?? 0;
+          const authoritativeExitCode = exitCode !== 0 ? exitCode : structuredExitCode;
+          if (exitCode !== 0 && !result.ok) {
+            return {
+              ...result,
+              exitCode
+            };
+          }
+          if (result.ok && authoritativeExitCode !== 0) {
+            const summary2 = `Job process exited ${authoritativeExitCode} after returning a structured success result.`;
+            return {
+              ...result,
+              ok: false,
+              summary: summary2,
+              stderr: appendDockerFailureDetail(result.stderr, `Discarded the structured ok=true result because the job process exit code was ${authoritativeExitCode}.`),
+              exitCode: authoritativeExitCode,
+              diagnostics: dockerStructuredProcessFailureDiagnostics(result.diagnostics, summary2, context, authoritativeExitCode, "nonzero_exit")
+            };
+          }
           return result;
         } catch (err) {
           sentinelParseError = String(err);
           console.error(`[DockerExecutor] Failed to parse result JSON (line length=${line.length}): ${sentinelParseError}`);
+          break;
         }
       }
     }
@@ -14573,6 +15130,32 @@ ${text}` : `
 `);
     const stderr = stderrLines.join(`
 `);
+    if (context.timedOutByDocker) {
+      const summary2 = sawSentinel ? `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms) after emitting a malformed structured result.` : `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms; terminated before structured result).`;
+      return {
+        ok: false,
+        summary: summary2,
+        stdout,
+        stderr,
+        exitCode: 124,
+        diagnostics: dockerFallbackDiagnostics(summary2, context, 124, "timeout", {
+          ...sawSentinel ? { sentinelParseError } : {}
+        })
+      };
+    }
+    if (context.streamDrainTimedOut) {
+      const summary2 = sawSentinel ? `Job process streams did not close after emitting a malformed structured result (${context.elapsedMs}ms elapsed).` : `Job process streams did not close before a structured result was produced (${context.elapsedMs}ms elapsed).`;
+      return {
+        ok: false,
+        summary: summary2,
+        stdout,
+        stderr: appendDockerFailureDetail(stderr, "The Docker stream-drain deadline fired; the process tree and warm container were recycled."),
+        exitCode: 124,
+        diagnostics: dockerFallbackDiagnostics(summary2, context, 124, "timeout", {
+          ...sawSentinel ? { sentinelParseError } : {}
+        })
+      };
+    }
     if (sawSentinel) {
       const details = [
         `Malformed ___RESULT___ payload: ${sentinelParseError || "unknown parse error"}`
@@ -14586,21 +15169,10 @@ ${text}` : `
         stdout,
         stderr: details.join(`
 `),
-        exitCode,
-        diagnostics: dockerFallbackDiagnostics(summary2, context, exitCode, "malformed_structured_result", {
+        exitCode: exitCode === 0 ? 1 : exitCode,
+        diagnostics: dockerFallbackDiagnostics(summary2, context, exitCode === 0 ? 1 : exitCode, "malformed_structured_result", {
           sentinelParseError
         })
-      };
-    }
-    if (context.timedOutByDocker) {
-      const summary2 = `Job timed out in Docker executor after ${context.elapsedMs}ms (limit ${context.timeoutMs}ms; terminated before structured result).`;
-      return {
-        ok: false,
-        summary: summary2,
-        stdout,
-        stderr,
-        exitCode,
-        diagnostics: dockerFallbackDiagnostics(summary2, context, exitCode, "timeout")
       };
     }
     if (exitCode === 143 || exitCode === 137) {
@@ -14615,14 +15187,14 @@ ${text}` : `
       };
     }
     const failureClass = unstructuredDockerFailureClass(stdout, stderr);
-    const summary = exitCode === 0 ? `Job completed in ${context.elapsedMs}ms` : failureClass === "missing_runtime_asset" ? `Job failed because a required WorkerPal runtime asset was missing (exit ${exitCode}, elapsed ${context.elapsedMs}ms)` : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
+    const summary = exitCode === 0 ? `Job process exited successfully without returning a structured result after ${context.elapsedMs}ms` : failureClass === "missing_runtime_asset" ? `Job failed because a required WorkerPal runtime asset was missing (exit ${exitCode}, elapsed ${context.elapsedMs}ms)` : `Job failed (exit ${exitCode}, elapsed ${context.elapsedMs}ms)`;
     return {
-      ok: exitCode === 0,
+      ok: false,
       summary,
       stdout,
       stderr,
-      exitCode,
-      diagnostics: exitCode === 0 ? undefined : dockerFallbackDiagnostics(summary, context, exitCode, failureClass)
+      exitCode: exitCode === 0 ? 1 : exitCode,
+      diagnostics: dockerFallbackDiagnostics(summary, context, exitCode === 0 ? 1 : exitCode, failureClass)
     };
   }
   async ensureWarmRuntimeReady(job, onLog) {
@@ -14727,7 +15299,7 @@ ${text}` : `
     let timer = null;
     const streamFailure = streams.then(() => new Promise(() => {}), (error) => ({ kind: "stream_error", error }));
     const outcome = await Promise.race([
-      proc.exited.then((exitCode2) => ({ kind: "exit", exitCode: exitCode2 })),
+      proc.exited.then((exitCode) => ({ kind: "exit", exitCode })),
       streamFailure,
       new Promise((resolvePromise) => {
         timer = setTimeout(() => resolvePromise({ kind: "timeout" }), timeoutMs);
@@ -14745,16 +15317,25 @@ ${text}` : `
       await terminateDockerExecProcessTree(proc);
     }
     let captured = await settleWithin2(streams.catch(() => ["", ""]), DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS);
+    const drainTimedOut = captured === null;
     if (captured === null) {
       streamAbort.abort();
+      if (!timedOut)
+        await terminateDockerExecProcessTree(proc);
       captured = await settleWithin2(streams.catch(() => ["", ""]), 250) ?? ["", ""];
     }
-    const exitCode = timedOut ? await settleWithin2(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS) ?? 124 : outcome.exitCode;
+    const processExitCode = timedOut ? await settleWithin2(proc.exited, DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS) ?? 124 : outcome.exitCode;
+    const effectiveTimedOut = timedOut || drainTimedOut;
     return {
       stdout: captured[0].trim(),
-      stderr: captured[1].trim(),
-      exitCode,
-      timedOut
+      stderr: [
+        captured[1].trim(),
+        drainTimedOut ? `Process streams did not close after ${DOCKER_EXEC_STREAM_DRAIN_TIMEOUT_MS}ms; terminated the process tree.` : ""
+      ].filter(Boolean).join(`
+`),
+      exitCode: effectiveTimedOut ? 124 : processExitCode,
+      timedOut: effectiveTimedOut,
+      drainTimedOut
     };
   }
   async runDockerCommandCapture(command, opts = {}) {
@@ -15135,6 +15716,7 @@ class WorkerServerTransport {
   workerId;
   pollMs;
   staleClaimTtlMs;
+  runtimeGeneration;
   fetchFn;
   logInfo;
   logWarn;
@@ -15158,6 +15740,7 @@ class WorkerServerTransport {
     this.workerId = options.workerId;
     this.pollMs = options.pollMs;
     this.staleClaimTtlMs = options.staleClaimTtlMs;
+    this.runtimeGeneration = String(options.runtimeGeneration ?? "").trim();
     this.fetchFn = options.fetchFn ?? fetch;
     this.logInfo = options.logInfo ?? ((message) => console.log(message));
     this.logWarn = options.logWarn ?? ((message) => console.warn(message));
@@ -15196,6 +15779,7 @@ class WorkerServerTransport {
     try {
       const response = await this.postJson("/workers/heartbeat", {
         workerId: this.workerId,
+        ...this.runtimeGeneration ? { runtimeGeneration: this.runtimeGeneration } : {},
         status: payload.status,
         currentJobId: payload.currentJobId,
         pollMs: this.pollMs,
@@ -15388,6 +15972,9 @@ function compactWorkerError(error, maxLength = 220) {
   if (normalized.length <= maxLength)
     return normalized;
   return `${normalized.slice(0, maxLength - 3)}...`;
+}
+function resolveWorkerRuntimeGeneration(env = process.env) {
+  return String(env.PUSHPALS_WORKER_RUNTIME_GENERATION ?? env.PUSHPALS_RUNTIME_TAG ?? env.PUSHPALS_CLI_PACKAGE_VERSION ?? "").trim().slice(0, 200);
 }
 async function postJsonWithTimeout(url, headers, body, timeoutMs = 1e4, fetchFn = fetch) {
   return fetchBufferedWithHardDeadline({
@@ -15617,7 +16204,17 @@ function inferWorkerJobPhaseFromLogLine(line) {
 }
 function mergeWorkerDiagnostics(base, extra) {
   const baseTerminalStage = String(base?.terminal?.terminalStage ?? "").trim().toLowerCase();
-  const trustedBaseTerminalStage = baseTerminalStage === "worker_runtime" || baseTerminalStage === "docker" ? baseTerminalStage : null;
+  const baseClassificationOwner = String(base?.terminal?.metadata?.classificationOwner ?? "").trim().toLowerCase();
+  const trustedExecutorBoundary = baseTerminalStage === "executor" && (baseClassificationOwner === "generic_python_executor" || baseClassificationOwner === "openhands_task_execute");
+  const trustedBaseTerminalIdentity = baseTerminalStage === "worker_runtime" || baseTerminalStage === "docker" || trustedExecutorBoundary;
+  const trustedTerminalFields = trustedBaseTerminalIdentity ? {
+    ...base?.terminal?.failureClass != null ? { failureClass: base.terminal.failureClass } : {},
+    ...base?.terminal?.terminalStage != null ? { terminalStage: base.terminal.terminalStage } : {},
+    ...base?.terminal?.executorBackend != null ? { executorBackend: base.terminal.executorBackend } : {},
+    ...base?.terminal?.summary != null ? { summary: base.terminal.summary } : {},
+    ...base?.terminal?.watchdogFired != null ? { watchdogFired: base.terminal.watchdogFired } : {},
+    ...base?.terminal?.timeoutMs != null ? { timeoutMs: base.terminal.timeoutMs } : {}
+  } : {};
   return {
     ...base ?? {},
     ...extra,
@@ -15628,8 +16225,11 @@ function mergeWorkerDiagnostics(base, extra) {
     terminal: base?.terminal || extra.terminal ? {
       ...base?.terminal ?? {},
       ...extra.terminal ?? {},
-      ...trustedBaseTerminalStage ? { terminalStage: trustedBaseTerminalStage } : {},
-      metadata: {
+      ...trustedTerminalFields,
+      metadata: trustedBaseTerminalIdentity ? {
+        ...extra.terminal?.metadata ?? {},
+        ...base?.terminal?.metadata ?? {}
+      } : {
         ...base?.terminal?.metadata ?? {},
         ...extra.terminal?.metadata ?? {}
       }
@@ -15647,11 +16247,39 @@ ${result.stdout ?? ""}`.toLowerCase();
   return /stalled before first response|startup stall/.test(text);
 }
 function isWorkerRuntimeFailure(text) {
-  const exception = /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/.exec(text);
+  const exception = /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/i.exec(text);
   if (!exception)
     return false;
   const firstFrame = text.slice((exception.index ?? 0) + exception[0].length).split(/\r?\n/).find((line) => /^\s*at\b/.test(line));
   return isWorkerOwnedRuntimeStackFrame(firstFrame);
+}
+function buildUnhandledWorkerFailureResult(error, executorBackend = resolveExecutor(CONFIG)) {
+  const detail = redactSensitiveText(error instanceof Error ? error.stack || error.message : String(error));
+  const errorSummary = compactWorkerError(error);
+  const dockerFailure = error instanceof DockerExecutionExhaustedError;
+  const workerRuntimeFailure = !dockerFailure && isWorkerRuntimeFailure(detail);
+  const failureClass = workerRuntimeFailure ? "worker_runtime_failure" : dockerFailure ? "docker_engine" : "worker_failure";
+  const terminalStage = workerRuntimeFailure ? "worker_runtime" : dockerFailure ? "docker" : "worker";
+  const summary = `Job execution failed before completion: ${errorSummary}`;
+  return {
+    ok: false,
+    summary,
+    stderr: detail,
+    diagnostics: {
+      terminal: {
+        failureClass,
+        terminalStage,
+        executorBackend,
+        summary,
+        watchdogFired: false,
+        metadata: {
+          classificationOwner: "workerpals_main",
+          structuredResult: false,
+          errorName: error instanceof Error ? error.name : typeof error
+        }
+      }
+    }
+  };
 }
 function hasExplicitNoPublishableResult(text) {
   return /\bno publishable[^\r\n]{0,80}\b(?:changes?|patch|progress)\b/.test(text) || /\bonly non-publishable[^\r\n]{0,80}\b(?:artifacts?|paths?|changes?|files?|dependencies?|runtime)\b/.test(text) || /\bartifact_only_no_publishable_patch\b/.test(text);
@@ -15668,7 +16296,10 @@ function inferWorkerTerminalFailureClass(result) {
   if (structuredFailureClass && structuredTerminal?.terminalStage === "worker_runtime") {
     return structuredFailureClass;
   }
-  if (structuredFailureClass && structuredTerminal?.terminalStage === "docker" && structuredTerminal.metadata?.structuredResult === false) {
+  if (structuredFailureClass && structuredTerminal?.terminalStage === "executor" && (structuredTerminal.metadata?.classificationOwner === "generic_python_executor" || structuredTerminal.metadata?.classificationOwner === "openhands_task_execute")) {
+    return structuredFailureClass;
+  }
+  if (structuredFailureClass && structuredTerminal?.terminalStage === "docker" && (structuredTerminal.metadata?.structuredResult === false || structuredTerminal.metadata?.processStateOverrodeStructuredResult === true || structuredTerminal.metadata?.structuredResultSchemaValid === false)) {
     return structuredFailureClass;
   }
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
@@ -16503,6 +17134,7 @@ async function deferClaimedJobForMaintenance(opts, headers, jobId, deferMs, opti
 }
 async function workerLoop(opts, dockerExecutor, runtimeState, transport, requestWorkerRestart) {
   const headers = buildWorkerHeaders(opts.authToken);
+  const runtimeGeneration = resolveWorkerRuntimeGeneration();
   console.log(`[WorkerPals ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
   if (dockerExecutor) {
     console.log(`[WorkerPals ${opts.workerId}] Docker mode enabled (${opts.dockerImage}, network=${opts.dockerNetworkMode})`);
@@ -16510,6 +17142,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
     console.log(`[WorkerPals ${opts.workerId}] Direct mode with isolated worktrees enabled`);
   }
   console.log(`[WorkerPals ${opts.workerId}] Executor backend: ${resolveExecutor(CONFIG)}`);
+  console.log(`[WorkerPals ${opts.workerId}] Runtime generation: ${runtimeGeneration || "server-assigned"}`);
   const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
   const claimTimeoutMs = Math.max(4000, Math.min(15000, opts.pollMs * 3));
   let lastHeartbeatAt = 0;
@@ -16526,7 +17159,8 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
       repo: opts.repo,
       baseRef: opts.worktreeBaseRef,
       dockerImage: opts.docker ? opts.dockerImage : null,
-      dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null
+      dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
+      runtimeGeneration: runtimeGeneration || null
     }
   });
   const maybeHeartbeat = async (status, currentJobId = null, force = false) => {
@@ -16541,7 +17175,10 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
   while (!runtimeState.shutdownRequested) {
     try {
       await maybeHeartbeat("idle");
-      const claimRes = await postJsonWithTimeout(`${opts.server}/jobs/claim`, headers, { workerId: opts.workerId }, claimTimeoutMs);
+      const claimRes = await postJsonWithTimeout(`${opts.server}/jobs/claim`, headers, {
+        workerId: opts.workerId,
+        ...runtimeGeneration ? { runtimeGeneration } : {}
+      }, claimTimeoutMs);
       if (claimRes.ok) {
         const data = await claimRes.json();
         const job = data.job;
@@ -16664,7 +17301,8 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
               stream,
               seq,
               message: cleaned,
-              ts: logTs
+              ts: logTs,
+              claimGeneration: Number(job.claimGeneration ?? 0)
             });
             return true;
           } : undefined;
@@ -16713,11 +17351,8 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
               if (err instanceof DockerExecutionExhaustedError) {
                 cooldownAfterJobMs = Math.max(opts.failureCooldownMs, Number.isFinite(err.cooldownMs) ? err.cooldownMs : 0);
               }
-              const errorSummary = compactWorkerError(err);
               result = {
-                ok: false,
-                summary: `Job execution failed before completion: ${errorSummary}`,
-                stderr: String(err),
+                ...buildUnhandledWorkerFailureResult(err),
                 ...cooldownAfterJobMs > 0 ? { cooldownMs: cooldownAfterJobMs } : {}
               };
             }
@@ -17139,7 +17774,8 @@ async function main() {
     workerId: opts.workerId,
     pollMs: opts.pollMs,
     heartbeatMs: opts.heartbeatMs,
-    staleClaimTtlMs: CONFIG.server.staleClaimTtlMs
+    staleClaimTtlMs: CONFIG.server.staleClaimTtlMs,
+    runtimeGeneration: resolveWorkerRuntimeGeneration()
   });
   let shutdownTriggered = false;
   const shutdownAndExit = (signalName, code) => {
@@ -17220,6 +17856,7 @@ export {
   shouldRecycleWorkerForCodexUnavailableFailure,
   shouldEmitDirectSessionJobEvent,
   shouldDeferDockerCodexStartupStallForDirectRetry,
+  resolveWorkerRuntimeGeneration,
   requiresPublishableCodeChange,
   postJsonWithTimeout,
   mergeWorkerDiagnostics,
@@ -17229,5 +17866,6 @@ export {
   failCompletionEnqueue,
   enqueueCompletion,
   didWorkerWatchdogFire,
+  buildUnhandledWorkerFailureResult,
   buildTrustedValidationCompletionPayload
 };

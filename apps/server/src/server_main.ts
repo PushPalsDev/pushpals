@@ -284,12 +284,45 @@ const AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE = 0.5;
 const AUTONOMY_WORKER_FAILURE_DEFER_MS = 30 * 60 * 1000;
 const AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD = 2;
 const AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS = 30 * 60 * 1000;
+const WORKER_RUNTIME_CIRCUIT_RECHECK_MS = 30_000;
+const WORKER_RUNTIME_CANARY_LEASE_MS = 45_000;
+const EXPLICIT_WORKER_RUNTIME_GENERATION = String(
+  process.env.PUSHPALS_WORKER_RUNTIME_GENERATION ??
+    process.env.PUSHPALS_RUNTIME_TAG ??
+    process.env.PUSHPALS_CLI_PACKAGE_VERSION ??
+    "",
+).trim();
+const WORKER_RUNTIME_GENERATION =
+  EXPLICIT_WORKER_RUNTIME_GENERATION || `server-epoch:${SERVER_STARTED_AT_MS}`;
+const WORKER_RUNTIME_NOT_BEFORE_MS = EXPLICIT_WORKER_RUNTIME_GENERATION
+  ? undefined
+  : SERVER_STARTED_AT_MS;
 const AUTONOMY_SIMILAR_FAILURE_WINDOW_MS = 6 * 60 * 60 * 1000;
 const AUTONOMY_SIMILAR_FAILURE_THRESHOLD = 2;
 const AUTONOMY_SIMILAR_FAILURE_DEFER_MS = 30 * 60 * 1000;
 const MAX_INELIGIBLE_CLAIMS_PER_POLL = 64;
 const CLIENT_TRANSPORT_HEARTBEAT_MS = 15_000;
 const SESSION_TOKEN_BUDGET = Math.max(0, STARTUP_CONFIG.server.sessionTokenBudget);
+
+const startupWorkerRuntimeJobDeferrals = jobQueue.shortenWorkerRuntimeCircuitDeferrals({
+  maxDelayMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
+});
+const startupWorkerRuntimeRequestDeferrals = requestQueue.shortenWorkerRuntimeCircuitDeferredClaims(
+  {
+    maxDelayMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
+    includeLegacyAutonomyClaims: true,
+  },
+);
+if (
+  startupWorkerRuntimeJobDeferrals.shortened > 0 ||
+  startupWorkerRuntimeRequestDeferrals.shortened > 0
+) {
+  console.warn(
+    `[Server] Shortened deferred WorkerPal runtime work after restart: ` +
+      `${startupWorkerRuntimeJobDeferrals.shortened} job(s), ` +
+      `${startupWorkerRuntimeRequestDeferrals.shortened} request(s).`,
+  );
+}
 
 function getSessionTokenBudgetStatus(sessionIdRaw: unknown) {
   const sessionId = String(sessionIdRaw ?? "").trim();
@@ -673,6 +706,8 @@ export function createRequestHandler() {
           windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
           maxBlockMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
           threshold: AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD,
+          runtimeGeneration: WORKER_RUNTIME_GENERATION,
+          notBeforeMs: WORKER_RUNTIME_NOT_BEFORE_MS,
         });
       const autonomyWorkerRuntimeCircuitMessage = (
         runtimeCircuit: ReturnType<typeof autonomyWorkerRuntimeCircuitSummary>,
@@ -697,6 +732,28 @@ export function createRequestHandler() {
             ...runtimeCircuit,
           },
           429,
+        );
+      };
+      const recordWorkerRuntimeCanarySuccess = (jobId: string): void => {
+        const recovered = jobQueue.recordWorkerRuntimeCanarySuccess(jobId);
+        if (!recovered.reopened) return;
+        const releasedRequests = requestQueue.releaseWorkerRuntimeCircuitDeferredClaims();
+        console.warn(
+          `[Server] WorkerPal runtime canary ${jobId} closed circuit ` +
+            `${recovered.runtimeGeneration ?? WORKER_RUNTIME_GENERATION}; released ` +
+            `${recovered.releasedJobCount} job(s) and ${releasedRequests.released} request(s).`,
+        );
+      };
+      const recordWorkerRuntimeCanaryFailure = (jobId: string): void => {
+        const reopened = jobQueue.recordWorkerRuntimeCanaryFailure(jobId, {
+          blockDurationMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
+          recheckMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
+        });
+        if (!reopened.renewed) return;
+        console.warn(
+          `[Server] WorkerPal runtime canary ${jobId} failed; circuit reopened ` +
+            `(${reopened.matchingFailure ? "matching failure" : "bounded recheck"}) until ` +
+            `${reopened.retryAt ?? "unknown"}.`,
         );
       };
       const autonomySimilarFailureSummary = (value: Record<string, unknown>) => {
@@ -812,7 +869,19 @@ export function createRequestHandler() {
           );
         }
 
+        const expiredCanary = jobQueue.recoverExpiredWorkerRuntimeCanary({
+          runtimeGeneration: WORKER_RUNTIME_GENERATION,
+          nowMs,
+          recheckMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
+        });
         const recovered = jobQueue.recoverStaleClaimedJobs(staleClaimTtlMs);
+        if (expiredCanary.recoveredJob) recovered.unshift(expiredCanary.recoveredJob);
+        if (expiredCanary.circuitRecovered) {
+          console.warn(
+            `[Server] Recovered expired WorkerPal runtime canary ` +
+              `${expiredCanary.jobId ?? "unknown"}; next recheck ${expiredCanary.retryAt ?? "ready"}.`,
+          );
+        }
         if (recovered.length === 0) return;
 
         for (const item of recovered) {
@@ -1338,12 +1407,26 @@ export function createRequestHandler() {
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const workerId = (body.workerId as string) || "unknown";
+        const claimedRuntimeGeneration = compactText(body.runtimeGeneration, 200);
+        if (claimedRuntimeGeneration && claimedRuntimeGeneration !== WORKER_RUNTIME_GENERATION) {
+          return makeJson(
+            {
+              ok: false,
+              code: "worker_runtime_generation_mismatch",
+              message:
+                `Worker runtime generation ${claimedRuntimeGeneration} does not match ` +
+                `server generation ${WORKER_RUNTIME_GENERATION}.`,
+              runtimeGeneration: WORKER_RUNTIME_GENERATION,
+            },
+            409,
+          );
+        }
         let skippedCount = 0;
-        let cachedRuntimeCircuit:
-          | ReturnType<typeof autonomyWorkerRuntimeCircuitSummary>
-          | undefined;
+        let runtimeCanaryJobId: string | null = null;
         let cachedFailureCircuit: ReturnType<typeof autonomyFailureCircuitSummary> | undefined;
-        let result = jobQueue.claim(workerId);
+        const claimNextJob = () =>
+          jobQueue.claim(workerId, { runtimeGeneration: WORKER_RUNTIME_GENERATION });
+        let result = claimNextJob();
         while (result.ok && result.job?.id) {
           const budgetStatus = getSessionTokenBudgetStatus(result.job.sessionId);
           if (budgetStatus?.exceeded) {
@@ -1356,43 +1439,18 @@ export function createRequestHandler() {
             if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
               return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
             }
-            result = jobQueue.claim(workerId);
+            result = claimNextJob();
             continue;
           }
-          if (
-            isAutonomyRequestPayload({
-              ...result.job,
-              params: parseJsonRecord(result.job.params),
-            })
-          ) {
-            const jobPayload = {
-              ...result.job,
-              params: parseJsonRecord(result.job.params),
-            };
-            const runtimeCircuit =
-              cachedRuntimeCircuit ??
-              (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
-            if (runtimeCircuit.blocked) {
-              jobQueue.defer(result.job.id, {
-                workerId,
-                deferMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
-                detail: JSON.stringify({
-                  code: "autonomy_worker_runtime_circuit_open",
-                  retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
-                  ...runtimeCircuit,
-                }),
-              });
-              skippedCount += 1;
-              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
-                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
-              }
-              result = jobQueue.claim(workerId);
-              continue;
-            }
+          const jobPayload = {
+            ...result.job,
+            params: parseJsonRecord(result.job.params),
+          };
+          if (isAutonomyRequestPayload(jobPayload)) {
             const failureCircuit =
               cachedFailureCircuit ?? (cachedFailureCircuit = autonomyFailureCircuitSummary());
             if (failureCircuit.blocked) {
-              jobQueue.defer(result.job.id, {
+              const deferred = jobQueue.defer(result.job.id, {
                 workerId,
                 deferMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
                 detail: JSON.stringify({
@@ -1400,16 +1458,27 @@ export function createRequestHandler() {
                   ...failureCircuit,
                 }),
               });
+              if (!deferred.ok) {
+                return makeJson(
+                  {
+                    ok: false,
+                    code: "job_circuit_deferral_failed",
+                    jobId: result.job.id,
+                    message: deferred.message,
+                  },
+                  409,
+                );
+              }
               skippedCount += 1;
               if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
                 return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
               }
-              result = jobQueue.claim(workerId);
+              result = claimNextJob();
               continue;
             }
             const similarFailure = autonomySimilarFailureSummary(jobPayload);
             if (similarFailure.blocked) {
-              jobQueue.defer(result.job.id, {
+              const deferred = jobQueue.defer(result.job.id, {
                 workerId,
                 deferMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
                 detail: JSON.stringify({
@@ -1417,15 +1486,75 @@ export function createRequestHandler() {
                   ...similarFailure,
                 }),
               });
+              if (!deferred.ok) {
+                return makeJson(
+                  {
+                    ok: false,
+                    code: "job_circuit_deferral_failed",
+                    jobId: result.job.id,
+                    message: deferred.message,
+                  },
+                  409,
+                );
+              }
               skippedCount += 1;
               if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
                 return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
               }
-              result = jobQueue.claim(workerId);
+              result = claimNextJob();
               continue;
             }
           }
+          if (result.job.kind === "task.execute") {
+            const runtimeCircuit = jobQueue.acquireWorkerRuntimeCanary(result.job.id, workerId, {
+              windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
+              maxBlockMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
+              threshold: AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD,
+              runtimeGeneration: WORKER_RUNTIME_GENERATION,
+              notBeforeMs: WORKER_RUNTIME_NOT_BEFORE_MS,
+              canaryLeaseMs: WORKER_RUNTIME_CANARY_LEASE_MS,
+            });
+            if (!runtimeCircuit.allowed) {
+              const retryAfterMs = Math.min(
+                WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
+                autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit.summary),
+              );
+              const deferred = jobQueue.defer(result.job.id, {
+                workerId,
+                targetWorkerId: result.job.targetWorkerId ?? null,
+                deferMs: retryAfterMs,
+                reason: "worker_runtime_circuit_open",
+                detail: JSON.stringify({
+                  code: "worker_runtime_circuit_open",
+                  retryAfterMs,
+                  decision: runtimeCircuit.reason,
+                  ...runtimeCircuit.summary,
+                }),
+              });
+              if (!deferred.ok) {
+                return makeJson(
+                  {
+                    ok: false,
+                    code: "job_circuit_deferral_failed",
+                    jobId: result.job.id,
+                    message: deferred.message,
+                  },
+                  409,
+                );
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
+              result = claimNextJob();
+              continue;
+            }
+            if (runtimeCircuit.canary) runtimeCanaryJobId = result.job.id;
+          }
           break;
+        }
+        if (!result.ok && skippedCount > 0 && result.message === "No pending jobs") {
+          return makeJson({ ok: true, job: null, skippedCount }, 200);
         }
         if (result.ok && result.job?.id) {
           const params = parseJsonRecord(result.job.params ?? "");
@@ -1433,7 +1562,16 @@ export function createRequestHandler() {
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, result.job.id);
           autonomyStore.markObjectiveRunningByJobId(result.job.id);
         }
-        return makeJson(result, result.ok ? 200 : 404);
+        return makeJson(
+          runtimeCanaryJobId
+            ? {
+                ...result,
+                runtimeCanary: true,
+                runtimeGeneration: WORKER_RUNTIME_GENERATION,
+              }
+            : result,
+          result.ok ? 200 : 404,
+        );
       }
 
       // POST /workers/heartbeat
@@ -1442,6 +1580,23 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const heartbeatRuntimeGeneration = compactText(body.runtimeGeneration, 200);
+        if (
+          heartbeatRuntimeGeneration &&
+          heartbeatRuntimeGeneration !== WORKER_RUNTIME_GENERATION
+        ) {
+          return makeJson(
+            {
+              ok: false,
+              code: "worker_runtime_generation_mismatch",
+              message:
+                `Worker runtime generation ${heartbeatRuntimeGeneration} does not match ` +
+                `server generation ${WORKER_RUNTIME_GENERATION}.`,
+              runtimeGeneration: WORKER_RUNTIME_GENERATION,
+            },
+            409,
+          );
+        }
         const result = jobQueue.heartbeat(body);
         return makeJson(result, result.ok ? 200 : 400);
       }
@@ -2312,6 +2467,7 @@ export function createRequestHandler() {
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = jobQueue.complete(jobId, body);
         if (result.ok) {
+          recordWorkerRuntimeCanarySuccess(jobId);
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} completed (${durationText})`);
@@ -2349,6 +2505,7 @@ export function createRequestHandler() {
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = jobQueue.fail(jobId, body);
         if (result.ok) {
+          recordWorkerRuntimeCanaryFailure(jobId);
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} failed (${durationText})`);
@@ -2409,6 +2566,7 @@ export function createRequestHandler() {
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const result = jobQueue.publishBlocked(jobId, body);
         if (result.ok) {
+          recordWorkerRuntimeCanarySuccess(jobId);
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} publish-blocked (${durationText})`);
@@ -2510,7 +2668,10 @@ export function createRequestHandler() {
         if (!trimmed) {
           return makeJson({ ok: false, message: "message is required" }, 400);
         }
-        const logId = jobQueue.addLog(jobId, trimmed, logTs || undefined);
+        const claimGeneration = Number(body.claimGeneration);
+        const logId = jobQueue.addLog(jobId, trimmed, logTs || undefined, {
+          ...(Number.isInteger(claimGeneration) && claimGeneration >= 0 ? { claimGeneration } : {}),
+        });
         return makeJson({ ok: true, jobId, logId }, 200);
       }
 
@@ -2676,12 +2837,16 @@ export function createRequestHandler() {
               cachedRuntimeCircuit ??
               (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
             if (runtimeCircuit.blocked) {
-              const retryAfterMs = autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit);
+              const retryAfterMs = Math.min(
+                WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
+                autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+              );
               const deferred = requestQueue.deferClaim(
                 result.request.id,
                 agentId,
                 result.request.claimToken ?? "",
                 retryAfterMs,
+                { reason: "worker_runtime_circuit_open" },
               );
               if (!deferred.ok) {
                 return makeJson(
@@ -3003,6 +3168,7 @@ export function createRequestHandler() {
         if (result.ok) {
           const jobId = compactText(body.jobId, 128);
           if (jobId) {
+            recordWorkerRuntimeCanarySuccess(jobId);
             autonomyStore.markObjectiveRunningByJobId(jobId);
             console.log(
               `[Server] Job ${jobId} is finalizing via completion ${result.completionId ?? "unknown"}`,

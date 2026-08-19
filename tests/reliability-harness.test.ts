@@ -12,6 +12,16 @@ describe("reliability harness release coverage", () => {
     expect(files).toContain("tests/workerpals.generic-python-executor.test.ts");
     expect(files).toContain("tests/workerpals.packaged-generic-python-executor.test.ts");
   });
+
+  test("gates durable runtime-circuit and claim-generation recovery behavior", () => {
+    const lifecycleFiles = listReliabilityHarnessPhaseFiles("durable_lifecycle");
+    const runtimeFiles = listReliabilityHarnessPhaseFiles("runtime_boundary");
+
+    expect(lifecycleFiles).toContain("tests/server.job-diagnostics.test.ts");
+    expect(lifecycleFiles).toContain("tests/server.jobs.stale-recovery.test.ts");
+    expect(lifecycleFiles).toContain("tests/server.session-message-route.test.ts");
+    expect(runtimeFiles).toContain("tests/workerpals.server-transport.test.ts");
+  });
 });
 
 describe("reliability harness process cleanup", () => {

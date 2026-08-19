@@ -20,6 +20,7 @@ export type WorkerServerTransportOptions = {
   pollMs: number;
   heartbeatMs: number;
   staleClaimTtlMs: number;
+  runtimeGeneration?: string;
   fetchFn?: typeof fetch;
   logInfo?: (message: string) => void;
   logWarn?: (message: string) => void;
@@ -65,6 +66,7 @@ export class WorkerServerTransport {
   private readonly workerId: string;
   private readonly pollMs: number;
   private readonly staleClaimTtlMs: number;
+  private readonly runtimeGeneration: string;
   private readonly fetchFn: typeof fetch;
   private readonly logInfo: (message: string) => void;
   private readonly logWarn: (message: string) => void;
@@ -90,6 +92,7 @@ export class WorkerServerTransport {
     this.workerId = options.workerId;
     this.pollMs = options.pollMs;
     this.staleClaimTtlMs = options.staleClaimTtlMs;
+    this.runtimeGeneration = String(options.runtimeGeneration ?? "").trim();
     this.fetchFn = options.fetchFn ?? fetch;
     this.logInfo = options.logInfo ?? ((message) => console.log(message));
     this.logWarn = options.logWarn ?? ((message) => console.warn(message));
@@ -148,6 +151,7 @@ export class WorkerServerTransport {
         "/workers/heartbeat",
         {
           workerId: this.workerId,
+          ...(this.runtimeGeneration ? { runtimeGeneration: this.runtimeGeneration } : {}),
           status: payload.status,
           currentJobId: payload.currentJobId,
           pollMs: this.pollMs,
@@ -214,7 +218,13 @@ export class WorkerServerTransport {
 
   queueJobLog(
     jobId: string,
-    payload: { stream: "stdout" | "stderr"; seq: number; message: string; ts: string },
+    payload: {
+      stream: "stdout" | "stderr";
+      seq: number;
+      message: string;
+      ts: string;
+      claimGeneration?: number;
+    },
   ): Promise<void> {
     return this.enqueueTask({
       label: "job_log",

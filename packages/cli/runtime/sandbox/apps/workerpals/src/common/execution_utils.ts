@@ -127,9 +127,12 @@ export function parseStructuredResult(
   const lines = stdout.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
-    if (!line.startsWith(executorResultPrefix)) continue;
-    const raw = line.slice(executorResultPrefix.length).trim();
-    if (!raw) continue;
+    if (!isStructuredResultLine(line, executorResultPrefix)) continue;
+    const barePrefix = executorResultPrefix.trimEnd();
+    const raw = line.slice(barePrefix.length).trim();
+    // The newest sentinel is authoritative even when its payload is empty.
+    // Never fall back to an older success after a truncated terminal write.
+    if (!raw) return null;
     try {
       return JSON.parse(raw) as Record<string, unknown>;
     } catch {
@@ -139,13 +142,89 @@ export function parseStructuredResult(
   return null;
 }
 
+export function hasStructuredResultSentinel(
+  stdout: string,
+  executorResultPrefix = resolveOutputCompactionPolicy().executorResultPrefix,
+): boolean {
+  return stdout
+    .split(/\r?\n/)
+    .some((line) => isStructuredResultLine(line.trim(), executorResultPrefix));
+}
+
+function isStructuredResultLine(line: string, executorResultPrefix: string): boolean {
+  const barePrefix = executorResultPrefix.trimEnd();
+  return line === barePrefix || line.startsWith(executorResultPrefix);
+}
+
+export type StructuredJobResultEnvelopeValidation =
+  | {
+      valid: true;
+      ok: boolean;
+      exitCode?: number;
+    }
+  | {
+      valid: false;
+      detail: string;
+    };
+
+/**
+ * Validate the process-boundary fields before treating wrapper JSON as a job
+ * result. TypeScript types do not protect this boundary: the payload was
+ * produced by another process and may be stale, truncated, or malformed.
+ */
+export function validateStructuredJobResultEnvelope(
+  value: unknown,
+): StructuredJobResultEnvelopeValidation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      valid: false,
+      detail: "structured result must be a JSON object",
+    };
+  }
+
+  const record = value as Record<string, unknown>;
+  if (typeof record.ok !== "boolean") {
+    return {
+      valid: false,
+      detail: `structured result field ok must be boolean, received ${describeStructuredFieldType(
+        record.ok,
+      )}`,
+    };
+  }
+
+  if (Object.prototype.hasOwnProperty.call(record, "exitCode")) {
+    if (
+      typeof record.exitCode !== "number" ||
+      !Number.isFinite(record.exitCode) ||
+      !Number.isInteger(record.exitCode)
+    ) {
+      return {
+        valid: false,
+        detail: `structured result field exitCode must be a finite integer when present, received ${describeStructuredFieldType(
+          record.exitCode,
+        )}`,
+      };
+    }
+    return { valid: true, ok: record.ok, exitCode: record.exitCode };
+  }
+
+  return { valid: true, ok: record.ok };
+}
+
+function describeStructuredFieldType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+  return typeof value;
+}
+
 export function filterResultLines(
   stdout: string,
   executorResultPrefix = resolveOutputCompactionPolicy().executorResultPrefix,
 ): string {
   return stdout
     .split(/\r?\n/)
-    .filter((line) => !line.trim().startsWith(executorResultPrefix))
+    .filter((line) => !isStructuredResultLine(line.trim(), executorResultPrefix))
     .join("\n")
     .trim();
 }

@@ -92,6 +92,90 @@ describe("JobQueue stale recovery", () => {
     expect(queue.getJob(jobId)?.status).toBe("claimed");
   });
 
+  test("ignores late log activity from an earlier claim generation", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-old-claim");
+    const firstClaimGeneration = Number(queue.getJob(jobId)?.claimGeneration ?? 0);
+    expect(
+      queue.defer(jobId, {
+        workerId: "worker-old-claim",
+        targetWorkerId: null,
+        deferMs: 1_000,
+        reason: "worker_runtime_circuit_open",
+      }).ok,
+    ).toBe(true);
+
+    const db = (queue as unknown as { db: any }).db as any;
+    db.prepare("UPDATE jobs SET availableAt = ? WHERE id = ?").run(
+      new Date(Date.now() - 1_000).toISOString(),
+      jobId,
+    );
+    const reclaimed = queue.claim("worker-current-claim");
+    expect(reclaimed.job?.id).toBe(jobId);
+    expect(reclaimed.job?.claimGeneration).toBe(firstClaimGeneration + 1);
+
+    const staleIso = new Date(Date.now() - 10 * 60_000).toISOString();
+    db.prepare(
+      "UPDATE jobs SET claimedAt = ?, startedAt = ?, firstLogAt = NULL, updatedAt = ? WHERE id = ?",
+    ).run(staleIso, staleIso, staleIso, jobId);
+    db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
+      staleIso,
+      "worker-current-claim",
+    );
+    queue.addLog(jobId, "late log from stale worker", new Date().toISOString(), {
+      claimGeneration: firstClaimGeneration,
+    });
+
+    const recovered = queue.recoverStaleClaimedJobs(120_000);
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.jobId).toBe(jobId);
+    expect(["failed", "abandoned"]).toContain(queue.getJob(jobId)?.status);
+    queue.close();
+  });
+
+  test("deduplicates and bounds repeated circuit deferral logs", () => {
+    const queue = new JobQueue(":memory:");
+    const jobId = enqueueAndClaim(queue, "worker-dedupe");
+    const claimGeneration = Number(queue.getJob(jobId)?.claimGeneration ?? 0);
+    const startMs = Date.parse("2026-08-18T20:00:00.000Z");
+
+    expect(
+      queue.addLog(jobId, "same circuit deferral", new Date(startMs).toISOString(), {
+        claimGeneration,
+        category: "deferral",
+        dedupeKey: "worker_runtime_circuit_open:fingerprint",
+        dedupeWindowMs: 5 * 60_000,
+        retain: 8,
+      }),
+    ).not.toBeNull();
+    expect(
+      queue.addLog(jobId, "same circuit deferral", new Date(startMs + 1_000).toISOString(), {
+        claimGeneration,
+        category: "deferral",
+        dedupeKey: "worker_runtime_circuit_open:fingerprint",
+        dedupeWindowMs: 5 * 60_000,
+        retain: 8,
+      }),
+    ).toBeNull();
+
+    for (let index = 1; index <= 12; index += 1) {
+      queue.addLog(
+        jobId,
+        "same circuit deferral",
+        new Date(startMs + index * 6 * 60_000).toISOString(),
+        {
+          claimGeneration,
+          category: "deferral",
+          dedupeKey: "worker_runtime_circuit_open:fingerprint",
+          dedupeWindowMs: 5 * 60_000,
+          retain: 8,
+        },
+      );
+    }
+    expect(queue.listJobLogs(jobId, 100)).toHaveLength(8);
+    queue.close();
+  });
+
   test("does not let a worker claim a second job while another claim is still active", () => {
     const queue = new JobQueue(":memory:");
 

@@ -25,6 +25,7 @@ const MIN_REQUEST_LEASE_MS = 30_000;
 const MAX_REQUEST_LEASE_MS = 15 * 60_000;
 const MIN_REQUEST_DEFER_MS = 1_000;
 const MAX_REQUEST_DEFER_MS = 30 * 60_000;
+const MAX_RUNTIME_CIRCUIT_RECHECK_MS = 30_000;
 const DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT = 200;
 const MAX_HANDOFF_CHAIN_RECONCILE_LIMIT = 1_000;
 const DEFAULT_HANDOFF_CHAIN_DEPTH = 16;
@@ -193,6 +194,7 @@ export interface RequestRow {
   claimGeneration: number;
   leaseExpiresAt: string | null;
   lastHeartbeatAt: string | null;
+  deferReason: string | null;
   claimAttempts: number;
   result: string | null;
   error: string | null;
@@ -334,6 +336,7 @@ export class RequestQueue {
     claimGeneration,
     leaseExpiresAt,
     lastHeartbeatAt,
+    deferReason,
     claimAttempts,
     result,
     error,
@@ -414,6 +417,7 @@ export class RequestQueue {
         claimGeneration  INTEGER NOT NULL DEFAULT 0,
         leaseExpiresAt   TEXT,
         lastHeartbeatAt  TEXT,
+        deferReason      TEXT,
         claimAttempts    INTEGER NOT NULL DEFAULT 0,
         result           TEXT,
         error            TEXT,
@@ -464,6 +468,7 @@ export class RequestQueue {
     );
     ensureColumn("leaseExpiresAt", `ALTER TABLE requests ADD COLUMN leaseExpiresAt TEXT;`);
     ensureColumn("lastHeartbeatAt", `ALTER TABLE requests ADD COLUMN lastHeartbeatAt TEXT;`);
+    ensureColumn("deferReason", `ALTER TABLE requests ADD COLUMN deferReason TEXT;`);
     ensureColumn(
       "claimAttempts",
       `ALTER TABLE requests ADD COLUMN claimAttempts INTEGER NOT NULL DEFAULT 0;`,
@@ -529,6 +534,7 @@ export class RequestQueue {
              claimedAt = NULL,
              leaseExpiresAt = NULL,
              lastHeartbeatAt = NULL,
+             deferReason = NULL,
              updatedAt = ?
          WHERE status = 'claimed'
            AND (claimToken IS NULL OR claimToken = '')`,
@@ -782,6 +788,7 @@ export class RequestQueue {
                claimedAt = ?,
                leaseExpiresAt = ?,
                lastHeartbeatAt = ?,
+               deferReason = NULL,
                claimAttempts = COALESCE(claimAttempts, 0) + 1,
                completedAt = NULL,
                failedAt = NULL,
@@ -807,6 +814,7 @@ export class RequestQueue {
           claimedAt: now,
           leaseExpiresAt,
           lastHeartbeatAt: now,
+          deferReason: null,
           claimAttempts: Number(row.claimAttempts ?? 0) + 1,
           completedAt: null,
           failedAt: null,
@@ -868,6 +876,7 @@ export class RequestQueue {
     agentIdRaw: string,
     claimTokenRaw: string,
     retryAfterMsRaw: number,
+    options: { reason?: string } = {},
   ): {
     ok: boolean;
     retryAfterMs?: number;
@@ -882,17 +891,24 @@ export class RequestQueue {
     const retryAfterMs = Math.max(
       MIN_REQUEST_DEFER_MS,
       Math.min(
-        MAX_REQUEST_DEFER_MS,
+        options.reason === "worker_runtime_circuit_open"
+          ? MAX_RUNTIME_CIRCUIT_RECHECK_MS
+          : MAX_REQUEST_DEFER_MS,
         Number.isFinite(parsedRetryAfterMs) ? Math.floor(parsedRetryAfterMs) : MIN_REQUEST_DEFER_MS,
       ),
     );
     const now = new Date().toISOString();
     const deferredUntil = new Date(Date.parse(now) + retryAfterMs).toISOString();
+    const deferReason = String(options.reason ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 160);
     const result = this.db
       .prepare(
         `UPDATE requests
          SET leaseExpiresAt = ?,
              lastHeartbeatAt = ?,
+             deferReason = ?,
              updatedAt = ?
          WHERE id = ?
            AND status = 'claimed'
@@ -901,7 +917,7 @@ export class RequestQueue {
            AND leaseExpiresAt IS NOT NULL
            AND leaseExpiresAt > ?`,
       )
-      .run(deferredUntil, now, now, requestId, agentId, claimToken, now);
+      .run(deferredUntil, now, deferReason || null, now, requestId, agentId, claimToken, now);
     if (result.changes === 0) {
       return {
         ok: false,
@@ -968,6 +984,7 @@ export class RequestQueue {
              claimedAt = NULL,
              leaseExpiresAt = NULL,
              lastHeartbeatAt = NULL,
+             deferReason = NULL,
              updatedAt = ?
          WHERE status = 'claimed'
            AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`,
@@ -975,6 +992,95 @@ export class RequestQueue {
       .run(now, now);
     return {
       recovered: result.changes,
+      requestIds: rows.slice(0, result.changes).map((row) => row.id),
+    };
+  }
+
+  shortenWorkerRuntimeCircuitDeferredClaims(
+    options: {
+      maxDelayMs?: number;
+      nowMs?: number;
+      limit?: number;
+      includeLegacyAutonomyClaims?: boolean;
+    } = {},
+  ): { shortened: number; requestIds: string[]; deferredUntil: string } {
+    const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+    const maxDelayMs = Math.max(
+      MIN_REQUEST_DEFER_MS,
+      Math.min(
+        MAX_RUNTIME_CIRCUIT_RECHECK_MS,
+        Math.floor(options.maxDelayMs ?? MAX_RUNTIME_CIRCUIT_RECHECK_MS),
+      ),
+    );
+    const limit = Math.max(1, Math.min(1_000, Math.floor(options.limit ?? 500)));
+    const includeLegacyAutonomyClaims = options.includeLegacyAutonomyClaims !== false;
+    const now = new Date(nowMs).toISOString();
+    const deferredUntil = new Date(nowMs + maxDelayMs).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT id
+         FROM requests
+         WHERE status = 'claimed'
+           AND (
+             deferReason = 'worker_runtime_circuit_open'
+             OR (
+               ? = 1
+               AND deferReason IS NULL
+               AND json_valid(metadataJson)
+               AND json_extract(metadataJson, '$.origin') = 'autonomy'
+             )
+           )
+           AND leaseExpiresAt > ?
+         ORDER BY updatedAt ASC, createdAt ASC
+         LIMIT ?`,
+      )
+      .all(includeLegacyAutonomyClaims ? 1 : 0, deferredUntil, limit) as Array<{ id: string }>;
+    if (rows.length === 0) return { shortened: 0, requestIds: [], deferredUntil };
+
+    const ids = rows.map((row) => row.id);
+    const placeholders = ids.map(() => "?").join(",");
+    const result = this.db
+      .prepare(
+        `UPDATE requests
+         SET leaseExpiresAt = ?, updatedAt = ?
+         WHERE id IN (${placeholders})
+           AND status = 'claimed'
+           AND leaseExpiresAt > ?`,
+      )
+      .run(deferredUntil, now, ...ids, deferredUntil);
+    return {
+      shortened: result.changes,
+      requestIds: ids.slice(0, result.changes),
+      deferredUntil,
+    };
+  }
+
+  releaseWorkerRuntimeCircuitDeferredClaims(nowMs = Date.now()): {
+    released: number;
+    requestIds: string[];
+  } {
+    const now = new Date(nowMs).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT id
+         FROM requests
+         WHERE status = 'claimed'
+           AND deferReason = 'worker_runtime_circuit_open'
+         ORDER BY updatedAt ASC, createdAt ASC
+         LIMIT 1000`,
+      )
+      .all() as Array<{ id: string }>;
+    if (rows.length === 0) return { released: 0, requestIds: [] };
+    const result = this.db
+      .prepare(
+        `UPDATE requests
+         SET leaseExpiresAt = ?, deferReason = NULL, updatedAt = ?
+         WHERE status = 'claimed'
+           AND deferReason = 'worker_runtime_circuit_open'`,
+      )
+      .run(now, now);
+    return {
+      released: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id),
     };
   }
@@ -1267,6 +1373,7 @@ export class RequestQueue {
               failedAt = NULL,
               leaseExpiresAt = NULL,
               lastHeartbeatAt = NULL,
+              deferReason = NULL,
              durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
              updatedAt = ?
          WHERE id = ?
@@ -1317,7 +1424,8 @@ export class RequestQueue {
               failedAt = ?,
               completedAt = NULL,
               leaseExpiresAt = NULL,
-             lastHeartbeatAt = NULL,
+              lastHeartbeatAt = NULL,
+              deferReason = NULL,
              durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
              updatedAt = ?
          WHERE id = ?

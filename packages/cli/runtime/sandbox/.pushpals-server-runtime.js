@@ -9401,6 +9401,11 @@ var JOB_FINALIZATION_BUDGET_MS_DEFAULT = 120000;
 var PR_WORKER_ASSIGNMENT_MAX_AGE_MS = 120000;
 var ORPHANED_CLAIM_HEARTBEAT_GRACE_MS = 15000;
 var RETRY_SAFE_REQUEUE_DELAY_MS = 5000;
+var WORKER_RUNTIME_CANARY_LEASE_MS_DEFAULT = 45000;
+var WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT = 30000;
+var WORKER_RUNTIME_DEFERRAL_LOG_DEDUPE_MS = 5 * 60000;
+var WORKER_RUNTIME_DEFERRAL_LOG_RETAIN = 8;
+var DEFAULT_WORKER_RUNTIME_GENERATION = "default";
 function parseObjectJson(value) {
   if (!value)
     return {};
@@ -9651,6 +9656,14 @@ function resolveWorkerRuntimeCircuitRetryAfterMs(summary, options) {
   const maxRetryAfterMs = Math.max(1000, Math.floor(options?.maxRetryAfterMs ?? 30 * 60 * 1000));
   const minRetryAfterMs = Math.max(1000, Math.min(maxRetryAfterMs, Math.floor(options?.minRetryAfterMs ?? 1000)));
   const nowMs = Number.isFinite(options?.nowMs) ? Number(options?.nowMs) : Date.now();
+  const canaryLeaseExpiresAtMs = Date.parse(String(summary.canaryLeaseExpiresAt ?? ""));
+  if (summary.phase === "half_open" && Number.isFinite(canaryLeaseExpiresAtMs)) {
+    return Math.max(minRetryAfterMs, Math.min(maxRetryAfterMs, Math.floor(canaryLeaseExpiresAtMs - nowMs)));
+  }
+  const retryAtMs = Date.parse(String(summary.retryAt ?? ""));
+  if (Number.isFinite(retryAtMs)) {
+    return Math.max(minRetryAfterMs, Math.min(maxRetryAfterMs, Math.floor(retryAtMs - nowMs)));
+  }
   const lastFailureAtMs = Date.parse(String(summary.lastFailureAt ?? ""));
   if (!Number.isFinite(lastFailureAtMs))
     return maxRetryAfterMs;
@@ -9748,6 +9761,10 @@ function parseIsoMs(value) {
     return null;
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? ms : null;
+}
+function normalizeWorkerRuntimeGeneration(value) {
+  const normalized = String(value ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+  return normalized || DEFAULT_WORKER_RUNTIME_GENERATION;
 }
 function coerceIsoTimestamp(value) {
   if (typeof value !== "string")
@@ -9966,10 +9983,14 @@ class JobQueue {
           status              TEXT NOT NULL DEFAULT 'pending',
           workerId            TEXT,
           targetWorkerId      TEXT,
+          runtimeGeneration   TEXT,
+          claimGeneration     INTEGER NOT NULL DEFAULT 0,
           result              TEXT,
           prUrl               TEXT,
           error               TEXT,
           availableAt         TEXT,
+          deferReason         TEXT,
+          deferredAt          TEXT,
           enqueuedAt          TEXT,
           claimedAt           TEXT,
           startedAt           TEXT,
@@ -9990,10 +10011,13 @@ class JobQueue {
       CREATE INDEX IF NOT EXISTS idx_jobs_session_created ON jobs(sessionId, createdAt);
 
       CREATE TABLE IF NOT EXISTS job_logs (
-        id      INTEGER PRIMARY KEY AUTOINCREMENT,
-        jobId   TEXT NOT NULL,
-        ts      TEXT NOT NULL,
-        message TEXT NOT NULL,
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        jobId           TEXT NOT NULL,
+        ts              TEXT NOT NULL,
+        message         TEXT NOT NULL,
+        claimGeneration INTEGER NOT NULL DEFAULT 0,
+        category        TEXT,
+        dedupeKey       TEXT,
         FOREIGN KEY (jobId) REFERENCES jobs(id)
       );
       CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(jobId, id);
@@ -10143,6 +10167,27 @@ class JobQueue {
 
       CREATE INDEX IF NOT EXISTS idx_workers_last_heartbeat ON workers(lastHeartbeat);
 
+      CREATE TABLE IF NOT EXISTS worker_runtime_circuits (
+        runtimeGeneration     TEXT PRIMARY KEY,
+        state                 TEXT NOT NULL DEFAULT 'closed',
+        fingerprint           TEXT,
+        failureClass          TEXT,
+        executorBackend       TEXT,
+        signatureSample       TEXT,
+        openedAt              TEXT,
+        retryAt               TEXT,
+        lastFailureAt         TEXT,
+        recoveredAt           TEXT,
+        canaryJobId           TEXT,
+        canaryWorkerId        TEXT,
+        canaryClaimedAt       TEXT,
+        canaryLeaseExpiresAt  TEXT,
+        createdAt             TEXT NOT NULL,
+        updatedAt             TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_worker_runtime_circuit_canary
+        ON worker_runtime_circuits(canaryJobId, state);
+
       CREATE TABLE IF NOT EXISTS pr_worker_assignments (
         prUrl         TEXT PRIMARY KEY,
         workerId      TEXT NOT NULL,
@@ -10154,6 +10199,12 @@ class JobQueue {
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
     if (!jobColumns.some((col) => col.name === "targetWorkerId")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN targetWorkerId TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "runtimeGeneration")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN runtimeGeneration TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "claimGeneration")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN claimGeneration INTEGER NOT NULL DEFAULT 0;`);
     }
     if (!jobColumns.some((col) => col.name === "priority")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
@@ -10212,9 +10263,28 @@ class JobQueue {
     if (!jobColumns.some((col) => col.name === "availableAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN availableAt TEXT;`);
     }
+    if (!jobColumns.some((col) => col.name === "deferReason")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN deferReason TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "deferredAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN deferredAt TEXT;`);
+    }
+    const jobLogColumns = this.db.prepare(`PRAGMA table_info(job_logs)`).all();
+    if (!jobLogColumns.some((col) => col.name === "claimGeneration")) {
+      this.db.exec(`ALTER TABLE job_logs ADD COLUMN claimGeneration INTEGER NOT NULL DEFAULT 0;`);
+    }
+    if (!jobLogColumns.some((col) => col.name === "category")) {
+      this.db.exec(`ALTER TABLE job_logs ADD COLUMN category TEXT;`);
+    }
+    if (!jobLogColumns.some((col) => col.name === "dedupeKey")) {
+      this.db.exec(`ALTER TABLE job_logs ADD COLUMN dedupeKey TEXT;`);
+    }
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_available_at ON jobs(status, availableAt);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_runtime_generation ON jobs(runtimeGeneration, status);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_job_logs_claim_generation ON job_logs(jobId, claimGeneration, id);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_job_logs_dedupe ON job_logs(jobId, category, dedupeKey, id);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_created ON jobs(dedupeKey, createdAt);`);
     this.db.exec(`DROP INDEX IF EXISTS idx_jobs_dedupe_active;`);
     this.db.exec(`CREATE UNIQUE INDEX idx_jobs_dedupe_active
@@ -10235,6 +10305,7 @@ class JobQueue {
           ELSE dedupeCooldownMs
         END,
         attempt = CASE WHEN attempt IS NULL OR attempt <= 0 THEN 1 ELSE attempt END,
+        claimGeneration = COALESCE(claimGeneration, 0),
         queueWaitBudgetMs = CASE WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000 ELSE queueWaitBudgetMs END,
         executionBudgetMs = CASE WHEN executionBudgetMs IS NULL OR executionBudgetMs <= 0 THEN 900000 ELSE executionBudgetMs END,
         finalizationBudgetMs = CASE WHEN finalizationBudgetMs IS NULL OR finalizationBudgetMs <= 0 THEN 120000 ELSE finalizationBudgetMs END,
@@ -10454,8 +10525,9 @@ class JobQueue {
       etaMs: etaMs ?? undefined
     };
   }
-  claim(workerIdRaw) {
+  claim(workerIdRaw, options = {}) {
     const workerId = workerIdRaw.trim() || "unknown";
+    const runtimeGeneration = normalizeWorkerRuntimeGeneration(options.runtimeGeneration);
     const now = new Date().toISOString();
     const targetWorkerCutoff = new Date(Date.now() - PR_WORKER_ASSIGNMENT_MAX_AGE_MS).toISOString();
     const tx = this.db.transaction(() => {
@@ -10517,16 +10589,20 @@ class JobQueue {
       this.db.prepare(`UPDATE jobs
            SET status = 'claimed',
                workerId = ?,
+               runtimeGeneration = ?,
+               claimGeneration = COALESCE(claimGeneration, 0) + 1,
                claimedAt = ?,
                startedAt = COALESCE(startedAt, ?),
                availableAt = NULL,
+               deferReason = NULL,
+               deferredAt = NULL,
                failedAt = NULL,
                abandonedAt = NULL,
                publishBlockedAt = NULL,
                completedAt = NULL,
                durationMs = NULL,
                updatedAt = ?
-            WHERE id = ?`).run(workerId, now, now, now, row.id);
+            WHERE id = ?`).run(workerId, runtimeGeneration, now, now, now, row.id);
       this.db.prepare(`UPDATE workers SET status = 'busy', currentJobId = ?, lastHeartbeat = ?, updatedAt = ?
            WHERE workerId = ?`).run(row.id, now, now, workerId);
       this.upsertPrWorkerAssignment(row.prUrl, workerId, now);
@@ -10536,6 +10612,8 @@ class JobQueue {
           ...row,
           status: "claimed",
           workerId,
+          runtimeGeneration,
+          claimGeneration: Number(row.claimGeneration ?? 0) + 1,
           claimedAt: now,
           startedAt: row.startedAt || now,
           failedAt: null,
@@ -10543,6 +10621,8 @@ class JobQueue {
           completedAt: null,
           durationMs: null,
           availableAt: null,
+          deferReason: null,
+          deferredAt: null,
           updatedAt: now
         },
         queueWaitMs
@@ -10572,6 +10652,33 @@ class JobQueue {
       `retrySafety=${retrySafety}`,
       `classificationReason=${classificationReason}`
     ].join("; ");
+    const recordRuntimeRecoveryDiagnostics = (status) => {
+      if (job.kind !== "task.execute")
+        return;
+      const summary = `WorkerPal lost a claimed task without structured terminal diagnostics (${options.recoveryReason})`;
+      try {
+        this.recordJobDiagnostics(job.id, {
+          message: summary,
+          detail: detailWithClassification,
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "worker_runtime",
+              executorBackend: "unknown",
+              summary,
+              watchdogFired: true,
+              metadata: {
+                classificationOwner: "server_claim_recovery",
+                recoveryReason: options.recoveryReason,
+                structuredResult: false
+              }
+            }
+          }
+        }, status, now);
+      } catch (error) {
+        console.error(`[JobQueue] Failed to persist unstructured runtime recovery diagnostics for ${job.id}: ${error instanceof Error ? error.stack || error.message : String(error)}`);
+      }
+    };
     if (retrySafety === "retry_safe") {
       const replacementJobId = randomUUID2();
       const attempt = Math.max(1, Math.floor(Number(job.attempt || 1))) + 1;
@@ -10631,6 +10738,7 @@ class JobQueue {
       });
       if (!recover())
         return null;
+      recordRuntimeRecoveryDiagnostics("abandoned");
       return {
         jobId: job.id,
         taskId: job.taskId,
@@ -10668,6 +10776,7 @@ class JobQueue {
            AND (? IS NULL OR workerId = ?)`).run(failureError, now, now, now, job.id, options.expectedWorkerId ?? null, options.expectedWorkerId ?? null);
     if (failedInfo.changes === 0)
       return null;
+    recordRuntimeRecoveryDiagnostics("failed");
     return {
       jobId: job.id,
       taskId: job.taskId,
@@ -10719,6 +10828,14 @@ class JobQueue {
            details = excluded.details,
            lastHeartbeat = excluded.lastHeartbeat,
            updatedAt = excluded.updatedAt`).run(workerId, status, currentJobId, pollMs, capabilities, details, now, now, now);
+    if (status === "busy" && currentJobId) {
+      const canaryLeaseExpiresAt = new Date(Date.parse(now) + WORKER_RUNTIME_CANARY_LEASE_MS_DEFAULT).toISOString();
+      this.db.prepare(`UPDATE worker_runtime_circuits
+           SET canaryLeaseExpiresAt = ?, updatedAt = ?
+           WHERE state = 'half_open'
+             AND canaryJobId = ?
+             AND canaryWorkerId = ?`).run(canaryLeaseExpiresAt, now, currentJobId, workerId);
+    }
     this.reconcileWorkerHeartbeatMismatch(workerId, status, currentJobId, now);
     return { ok: true };
   }
@@ -10735,17 +10852,19 @@ class JobQueue {
              SELECT MAX(jl.ts)
              FROM job_logs jl
              WHERE jl.jobId = j.id
+               AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
            ) AS lastLogTs,
-           COALESCE(
-             (
+           MAX(
+             COALESCE((
                SELECT MAX(jl.ts)
                FROM job_logs jl
                WHERE jl.jobId = j.id
-             ),
-             j.firstLogAt,
-             j.startedAt,
-             j.claimedAt,
-             j.updatedAt
+                 AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
+             ), ''),
+             COALESCE(j.firstLogAt, ''),
+             COALESCE(j.startedAt, ''),
+             COALESCE(j.claimedAt, ''),
+             COALESCE(j.updatedAt, '')
            ) AS activityAt
          FROM jobs j
          WHERE j.status = 'claimed'
@@ -11020,7 +11139,14 @@ class JobQueue {
     const deferMsRaw = Number.parseInt(String(body.deferMs ?? ""), 10);
     const deferMs = Number.isFinite(deferMsRaw) ? Math.max(1000, Math.min(deferMsRaw, 30 * 60000)) : 60000;
     const availableAt = new Date(Date.now() + deferMs).toISOString();
+    const deferReason = diagnosticText(body.reason, 160);
     const targetWorkerId = body.targetWorkerId === null ? null : typeof body.targetWorkerId === "string" && body.targetWorkerId.trim().length > 0 ? body.targetWorkerId.trim() : workerId;
+    const claimed = this.db.prepare(`SELECT claimGeneration
+         FROM jobs
+         WHERE id = ? AND status = 'claimed' AND workerId = ?`).get(jobId, workerId);
+    if (!claimed) {
+      return { ok: false, message: "Job not found, not claimed, or not owned by worker" };
+    }
     const info = this.db.prepare(`UPDATE jobs
          SET status = 'pending',
              workerId = NULL,
@@ -11029,12 +11155,32 @@ class JobQueue {
              startedAt = NULL,
              firstLogAt = NULL,
              availableAt = ?,
+             deferReason = ?,
+             deferredAt = ?,
              updatedAt = ?
          WHERE id = ?
            AND status = 'claimed'
-           AND workerId = ?`).run(targetWorkerId, availableAt, now, jobId, workerId);
+           AND workerId = ?`).run(targetWorkerId, availableAt, deferReason, now, now, jobId, workerId);
     if (info.changes === 0) {
       return { ok: false, message: "Job not found, not claimed, or not owned by worker" };
+    }
+    const detail = diagnosticText(body.detail, 2000);
+    if (detail) {
+      let fingerprint = "";
+      try {
+        const parsed = JSON.parse(detail);
+        fingerprint = diagnosticText(parsed.fingerprint, 80) ?? "";
+      } catch {}
+      const circuitDeferral = deferReason === "worker_runtime_circuit_open";
+      this.addLog(jobId, `[JobQueue] Deferred: ${detail}`, now, {
+        claimGeneration: Number(claimed.claimGeneration ?? 0),
+        ...circuitDeferral ? {
+          category: "deferral",
+          dedupeKey: `${deferReason}:${fingerprint || "runtime"}`,
+          dedupeWindowMs: WORKER_RUNTIME_DEFERRAL_LOG_DEDUPE_MS,
+          retain: WORKER_RUNTIME_DEFERRAL_LOG_RETAIN
+        } : {}
+      });
     }
     this.setWorkerIdleIfNoClaimedJobs(workerId, now);
     return { ok: true, availableAt };
@@ -11052,6 +11198,8 @@ class JobQueue {
              error = ?,
              failedAt = ?,
              availableAt = NULL,
+             deferReason = NULL,
+             deferredAt = NULL,
              targetWorkerId = NULL,
              completedAt = NULL,
              durationMs = NULL,
@@ -11064,6 +11212,60 @@ class JobQueue {
       return { ok: false, message: "Deferred job not found or not owned by worker" };
     }
     return { ok: true, failedAt: now };
+  }
+  shortenWorkerRuntimeCircuitDeferrals(options = {}) {
+    const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+    const maxDelayMs = Math.max(1000, Math.min(WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT, Math.floor(options.maxDelayMs ?? WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT)));
+    const limit = Math.max(1, Math.min(1000, Math.floor(options.limit ?? 500)));
+    const availableAt = new Date(nowMs + maxDelayMs).toISOString();
+    const rows = this.db.prepare(`SELECT id
+         FROM jobs
+         WHERE status = 'pending'
+           AND availableAt > ?
+           AND (
+             deferReason = 'worker_runtime_circuit_open'
+             OR EXISTS (
+               SELECT 1
+               FROM job_logs jl
+               WHERE jl.jobId = jobs.id
+                 AND jl.message LIKE '%worker_runtime_circuit_open%'
+             )
+           )
+         ORDER BY COALESCE(deferredAt, updatedAt, createdAt) ASC
+         LIMIT ?`).all(availableAt, limit);
+    if (rows.length === 0)
+      return { shortened: 0, jobIds: [], availableAt };
+    const ids = rows.map((row) => row.id);
+    const placeholders = ids.map(() => "?").join(",");
+    const result = this.db.prepare(`UPDATE jobs
+         SET availableAt = ?, updatedAt = ?
+         WHERE id IN (${placeholders})
+           AND status = 'pending'
+           AND availableAt > ?`).run(availableAt, new Date(nowMs).toISOString(), ...ids, availableAt);
+    return {
+      shortened: result.changes,
+      jobIds: ids.slice(0, result.changes),
+      availableAt
+    };
+  }
+  releaseWorkerRuntimeCircuitDeferrals(nowMs = Date.now()) {
+    const now = new Date(nowMs).toISOString();
+    const rows = this.db.prepare(`SELECT id
+         FROM jobs
+         WHERE status = 'pending'
+           AND deferReason = 'worker_runtime_circuit_open'
+         ORDER BY COALESCE(deferredAt, updatedAt, createdAt) ASC
+         LIMIT 1000`).all();
+    if (rows.length === 0)
+      return { released: 0, jobIds: [] };
+    const result = this.db.prepare(`UPDATE jobs
+         SET availableAt = ?, deferReason = NULL, deferredAt = NULL, updatedAt = ?
+         WHERE status = 'pending'
+           AND deferReason = 'worker_runtime_circuit_open'`).run(now, now);
+    return {
+      released: result.changes,
+      jobIds: rows.slice(0, result.changes).map((row) => row.id)
+    };
   }
   recoverStaleClaimedJobs(staleAfterMs, limit = 100) {
     const ttlMs = Number.isFinite(staleAfterMs) ? Math.max(5000, Math.floor(staleAfterMs)) : 120000;
@@ -11085,17 +11287,19 @@ class JobQueue {
              SELECT MAX(jl.ts)
              FROM job_logs jl
              WHERE jl.jobId = j.id
+               AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
            ) AS lastLogTs,
-           COALESCE(
-             (
+           MAX(
+             COALESCE((
                SELECT MAX(jl.ts)
                FROM job_logs jl
                WHERE jl.jobId = j.id
-             ),
-             j.firstLogAt,
-             j.startedAt,
-             j.claimedAt,
-             j.updatedAt
+                 AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
+             ), ''),
+             COALESCE(j.firstLogAt, ''),
+             COALESCE(j.startedAt, ''),
+             COALESCE(j.claimedAt, ''),
+             COALESCE(j.updatedAt, '')
            ) AS activityAt
          FROM jobs j
          LEFT JOIN workers w ON w.workerId = j.workerId
@@ -11524,15 +11728,23 @@ class JobQueue {
       lastFailureAt: row?.lastFailureAt ?? null
     };
   }
+  getWorkerRuntimeCircuit(runtimeGeneration) {
+    return this.db.prepare(`SELECT * FROM worker_runtime_circuits WHERE runtimeGeneration = ?`).get(runtimeGeneration) ?? null;
+  }
   workerRuntimeFailureCircuitSummary(options) {
     const nowMs = Number.isFinite(options?.nowMs) ? Number(options?.nowMs) : Date.now();
+    const now = new Date(nowMs).toISOString();
     const windowMs = Math.max(60000, Math.min(24 * 60 * 60 * 1000, Math.floor(options?.windowMs ?? 60 * 60 * 1000)));
     const blockDurationMs = Math.max(60000, Math.min(windowMs, Math.floor(options?.maxBlockMs ?? 30 * 60 * 1000)));
     const threshold = Math.max(2, Math.min(20, Math.floor(options?.threshold ?? 2)));
-    const cutoffIso = new Date(nowMs - windowMs).toISOString();
+    const notBeforeMs = Number.isFinite(options?.notBeforeMs) ? Math.floor(Number(options?.notBeforeMs)) : Number.NEGATIVE_INFINITY;
+    const runtimeGeneration = normalizeWorkerRuntimeGeneration(options?.runtimeGeneration);
+    const circuitBefore = this.getWorkerRuntimeCircuit(runtimeGeneration);
+    const recoveredAtMs = circuitBefore?.state === "closed" ? parseIsoMs(circuitBefore.recoveredAt) ?? Number.NEGATIVE_INFINITY : Number.NEGATIVE_INFINITY;
+    const cutoffIso = new Date(Math.max(nowMs - windowMs, notBeforeMs, recoveredAtMs)).toISOString();
     const rows = this.db.prepare(`SELECT
            j.error,
-           COALESCE(j.failedAt, d.updatedAt, j.updatedAt) AS failureAt,
+           COALESCE(j.failedAt, j.abandonedAt, d.updatedAt, j.updatedAt) AS failureAt,
            d.failureClass,
            d.terminalStage,
            d.executorBackend,
@@ -11540,10 +11752,11 @@ class JobQueue {
          FROM jobs j
          LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
          WHERE j.kind = 'task.execute'
-           AND j.status = 'failed'
-           AND COALESCE(j.failedAt, d.updatedAt, j.updatedAt) >= ?
-         ORDER BY COALESCE(j.failedAt, d.updatedAt, j.updatedAt) DESC
-         LIMIT 1000`).all(cutoffIso);
+           AND j.status IN ('failed', 'abandoned')
+           AND COALESCE(j.runtimeGeneration, ?) = ?
+           AND COALESCE(j.failedAt, j.abandonedAt, d.updatedAt, j.updatedAt) >= ?
+         ORDER BY COALESCE(j.failedAt, j.abandonedAt, d.updatedAt, j.updatedAt) DESC
+         LIMIT 1000`).all(DEFAULT_WORKER_RUNTIME_GENERATION, runtimeGeneration, cutoffIso);
     const clusters = new Map;
     let qualifyingFailureCount = 0;
     for (const row of rows) {
@@ -11576,34 +11789,260 @@ class JobQueue {
         return countDelta;
       return (parseIsoMs(right[1].lastFailureAt) ?? Number.NEGATIVE_INFINITY) - (parseIsoMs(left[1].lastFailureAt) ?? Number.NEGATIVE_INFINITY);
     });
-    let selected = rankedClusters[0] ?? null;
-    let blocked = false;
-    for (const candidate of rankedClusters) {
-      const [, candidateCluster] = candidate;
-      if (candidateCluster.count < threshold)
-        continue;
-      const candidateLastFailureAtMs = parseIsoMs(candidateCluster.lastFailureAt);
-      if (candidateLastFailureAtMs == null || candidateLastFailureAtMs + blockDurationMs <= nowMs) {
-        continue;
+    const thresholdCluster = rankedClusters.find((candidate) => candidate[1].count >= threshold);
+    if (thresholdCluster) {
+      const [fingerprint2, cluster2] = thresholdCluster;
+      const lastFailureAtMs = parseIsoMs(cluster2.lastFailureAt);
+      const existingFailureAtMs = parseIsoMs(circuitBefore?.lastFailureAt);
+      const newEvidence = !circuitBefore || circuitBefore.fingerprint !== fingerprint2 || lastFailureAtMs != null && (existingFailureAtMs == null || lastFailureAtMs > existingFailureAtMs);
+      if (newEvidence && lastFailureAtMs != null) {
+        const retryAt = new Date(lastFailureAtMs + blockDurationMs).toISOString();
+        this.db.prepare(`INSERT INTO worker_runtime_circuits (
+               runtimeGeneration, state, fingerprint, failureClass, executorBackend,
+               signatureSample, openedAt, retryAt, lastFailureAt, recoveredAt,
+               canaryJobId, canaryWorkerId, canaryClaimedAt, canaryLeaseExpiresAt,
+               createdAt, updatedAt
+             ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+             ON CONFLICT(runtimeGeneration) DO UPDATE SET
+               state = 'open',
+               fingerprint = excluded.fingerprint,
+               failureClass = excluded.failureClass,
+               executorBackend = excluded.executorBackend,
+               signatureSample = excluded.signatureSample,
+               openedAt = excluded.openedAt,
+               retryAt = excluded.retryAt,
+               lastFailureAt = excluded.lastFailureAt,
+               recoveredAt = NULL,
+               canaryJobId = NULL,
+               canaryWorkerId = NULL,
+               canaryClaimedAt = NULL,
+               canaryLeaseExpiresAt = NULL,
+               updatedAt = excluded.updatedAt`).run(runtimeGeneration, fingerprint2, cluster2.failureClass, cluster2.executorBackend, cluster2.signature, now, retryAt, cluster2.lastFailureAt, now, now);
       }
-      selected = candidate;
-      blocked = true;
-      break;
     }
-    const fingerprint = selected?.[0] ?? null;
-    const cluster = selected?.[1] ?? null;
+    const circuit = this.getWorkerRuntimeCircuit(runtimeGeneration);
+    const ranked = rankedClusters[0] ?? null;
+    const fingerprint = circuit?.fingerprint ?? ranked?.[0] ?? null;
+    const cluster = (fingerprint ? clusters.get(fingerprint) : undefined) ?? ranked?.[1] ?? null;
+    const phase = circuit?.state ?? "closed";
     return {
-      blocked,
+      blocked: phase !== "closed",
+      phase,
+      runtimeGeneration,
       windowMs,
       blockDurationMs,
       threshold,
       qualifyingFailureCount,
       recentMatchingFailureCount: cluster?.count ?? 0,
       fingerprint,
-      failureClass: cluster?.failureClass || null,
-      executorBackend: cluster?.executorBackend || null,
-      signatureSample: cluster?.signature ?? null,
-      lastFailureAt: cluster?.lastFailureAt ?? null
+      failureClass: circuit?.failureClass || cluster?.failureClass || null,
+      executorBackend: circuit?.executorBackend || cluster?.executorBackend || null,
+      signatureSample: circuit?.signatureSample ?? cluster?.signature ?? null,
+      lastFailureAt: circuit?.lastFailureAt ?? cluster?.lastFailureAt ?? null,
+      retryAt: circuit?.retryAt ?? null,
+      canaryJobId: circuit?.canaryJobId ?? null,
+      canaryWorkerId: circuit?.canaryWorkerId ?? null,
+      canaryLeaseExpiresAt: circuit?.canaryLeaseExpiresAt ?? null
+    };
+  }
+  acquireWorkerRuntimeCanary(jobId, workerId, options = {}) {
+    const summary = this.workerRuntimeFailureCircuitSummary(options);
+    if (!summary.blocked)
+      return { allowed: true, canary: false, summary };
+    const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+    const now = new Date(nowMs).toISOString();
+    const circuit = this.getWorkerRuntimeCircuit(summary.runtimeGeneration);
+    if (!circuit || circuit.state === "closed") {
+      return {
+        allowed: true,
+        canary: false,
+        summary: this.workerRuntimeFailureCircuitSummary(options)
+      };
+    }
+    if (circuit.state === "half_open") {
+      const leaseExpiresAtMs = parseIsoMs(circuit.canaryLeaseExpiresAt);
+      return {
+        allowed: false,
+        canary: false,
+        summary,
+        reason: leaseExpiresAtMs != null && leaseExpiresAtMs <= nowMs ? "canary_lease_expired" : "canary_in_flight"
+      };
+    }
+    const retryAtMs = parseIsoMs(circuit.retryAt);
+    if (retryAtMs != null && retryAtMs > nowMs) {
+      return { allowed: false, canary: false, summary, reason: "circuit_open" };
+    }
+    const canaryLeaseMs = Math.max(5000, Math.min(5 * 60000, Math.floor(options.canaryLeaseMs ?? WORKER_RUNTIME_CANARY_LEASE_MS_DEFAULT)));
+    const leaseExpiresAt = new Date(nowMs + canaryLeaseMs).toISOString();
+    const acquired = this.db.prepare(`UPDATE worker_runtime_circuits
+         SET state = 'half_open',
+             canaryJobId = ?,
+             canaryWorkerId = ?,
+             canaryClaimedAt = ?,
+             canaryLeaseExpiresAt = ?,
+             updatedAt = ?
+         WHERE runtimeGeneration = ?
+           AND state = 'open'
+           AND (retryAt IS NULL OR retryAt <= ?)`).run(jobId, workerId, now, leaseExpiresAt, now, summary.runtimeGeneration, now);
+    const finalSummary = this.workerRuntimeFailureCircuitSummary(options);
+    if (acquired.changes === 0) {
+      return { allowed: false, canary: false, summary: finalSummary, reason: "canary_in_flight" };
+    }
+    return { allowed: true, canary: true, summary: finalSummary };
+  }
+  recordWorkerRuntimeCanarySuccess(jobId, nowMs = Date.now()) {
+    const now = new Date(nowMs).toISOString();
+    const job = this.getJob(jobId);
+    if (!job || job.status !== "completed" && job.status !== "finalizing" && job.status !== "publish_blocked") {
+      return { reopened: false, releasedJobCount: 0 };
+    }
+    const circuit = this.db.prepare(`SELECT * FROM worker_runtime_circuits
+         WHERE state = 'half_open' AND canaryJobId = ?
+         LIMIT 1`).get(jobId);
+    if (!circuit)
+      return { reopened: false, releasedJobCount: 0 };
+    const result = this.db.prepare(`UPDATE worker_runtime_circuits
+         SET state = 'closed',
+             recoveredAt = ?,
+             retryAt = NULL,
+             canaryJobId = NULL,
+             canaryWorkerId = NULL,
+             canaryClaimedAt = NULL,
+             canaryLeaseExpiresAt = NULL,
+             updatedAt = ?
+         WHERE runtimeGeneration = ?
+           AND state = 'half_open'
+           AND canaryJobId = ?`).run(now, now, circuit.runtimeGeneration, jobId);
+    if (result.changes === 0)
+      return { reopened: false, releasedJobCount: 0 };
+    const released = this.releaseWorkerRuntimeCircuitDeferrals(nowMs);
+    return {
+      reopened: true,
+      runtimeGeneration: circuit.runtimeGeneration,
+      releasedJobCount: released.released
+    };
+  }
+  recordWorkerRuntimeCanaryFailure(jobId, options = {}) {
+    const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+    const now = new Date(nowMs).toISOString();
+    const job = this.getJob(jobId);
+    if (!job || job.status !== "failed" && job.status !== "abandoned") {
+      return { renewed: false, matchingFailure: false };
+    }
+    const circuit = this.db.prepare(`SELECT * FROM worker_runtime_circuits
+         WHERE state = 'half_open' AND canaryJobId = ?
+         LIMIT 1`).get(jobId);
+    if (!circuit)
+      return { renewed: false, matchingFailure: false };
+    const evidence = this.db.prepare(`SELECT j.error, d.failureClass, d.terminalStage, d.executorBackend, d.summary,
+                COALESCE(j.failedAt, j.abandonedAt, d.updatedAt, j.updatedAt) AS failureAt
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.id = ?`).get(jobId);
+    const signature = evidence ? workerRuntimeFailureSignature(evidence.failureClass, evidence.error, evidence.summary, evidence.terminalStage) : null;
+    const matchingFailure = Boolean(signature && signature.fingerprint === circuit.fingerprint);
+    const delayMs = matchingFailure ? Math.max(60000, Math.floor(options.blockDurationMs ?? 30 * 60000)) : Math.max(1000, Math.min(WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT, Math.floor(options.recheckMs ?? WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT)));
+    const retryAt = new Date(nowMs + delayMs).toISOString();
+    const result = this.db.prepare(`UPDATE worker_runtime_circuits
+         SET state = 'open',
+             retryAt = ?,
+             lastFailureAt = COALESCE(?, lastFailureAt),
+             failureClass = CASE WHEN ? THEN COALESCE(?, failureClass) ELSE failureClass END,
+             executorBackend = CASE WHEN ? THEN COALESCE(?, executorBackend) ELSE executorBackend END,
+             signatureSample = CASE WHEN ? THEN COALESCE(?, signatureSample) ELSE signatureSample END,
+             canaryJobId = NULL,
+             canaryWorkerId = NULL,
+             canaryClaimedAt = NULL,
+             canaryLeaseExpiresAt = NULL,
+             recoveredAt = NULL,
+             updatedAt = ?
+         WHERE runtimeGeneration = ?
+           AND state = 'half_open'
+           AND canaryJobId = ?`).run(retryAt, evidence?.failureAt ?? now, matchingFailure ? 1 : 0, signature?.failureClass ?? null, matchingFailure ? 1 : 0, evidence?.executorBackend ?? null, matchingFailure ? 1 : 0, signature?.signature ?? null, now, circuit.runtimeGeneration, jobId);
+    return { renewed: result.changes > 0, matchingFailure, retryAt };
+  }
+  recoverExpiredWorkerRuntimeCanary(options = {}) {
+    const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+    const now = new Date(nowMs).toISOString();
+    const runtimeGeneration = options.runtimeGeneration ? normalizeWorkerRuntimeGeneration(options.runtimeGeneration) : null;
+    const circuit = this.db.prepare(`SELECT * FROM worker_runtime_circuits
+         WHERE state = 'half_open'
+           AND canaryLeaseExpiresAt IS NOT NULL
+           AND canaryLeaseExpiresAt <= ?
+           AND (? IS NULL OR runtimeGeneration = ?)
+         ORDER BY canaryLeaseExpiresAt ASC
+         LIMIT 1`).get(now, runtimeGeneration, runtimeGeneration);
+    if (!circuit?.canaryJobId) {
+      return {
+        circuitRecovered: false,
+        recoveredJob: null,
+        runtimeGeneration,
+        jobId: null,
+        retryAt: null
+      };
+    }
+    const job = this.getJob(circuit.canaryJobId);
+    if (job?.status === "completed" || job?.status === "finalizing" || job?.status === "publish_blocked") {
+      const success = this.recordWorkerRuntimeCanarySuccess(job.id, nowMs);
+      return {
+        circuitRecovered: success.reopened,
+        recoveredJob: null,
+        runtimeGeneration: circuit.runtimeGeneration,
+        jobId: job.id,
+        retryAt: null
+      };
+    }
+    if (job?.status === "failed" || job?.status === "abandoned") {
+      const failure = this.recordWorkerRuntimeCanaryFailure(job.id, {
+        nowMs,
+        recheckMs: options.recheckMs
+      });
+      return {
+        circuitRecovered: failure.renewed,
+        recoveredJob: null,
+        runtimeGeneration: circuit.runtimeGeneration,
+        jobId: job.id,
+        retryAt: failure.retryAt ?? null
+      };
+    }
+    let recoveredJob = null;
+    if (job?.status === "claimed") {
+      recoveredJob = this.recoverClaimedJob(job.id, now, {
+        expectedWorkerId: circuit.canaryWorkerId,
+        recoveryReason: "worker_runtime_canary_lease_expired",
+        failureMessage: "Worker runtime canary lease expired without terminal state",
+        abandonmentMessage: "Worker runtime canary was abandoned after its lease expired",
+        detail: `runtimeGeneration=${circuit.runtimeGeneration}; canaryLeaseExpiresAt=${circuit.canaryLeaseExpiresAt}`
+      });
+      if (job.workerId) {
+        this.db.prepare(`UPDATE workers
+             SET status = 'offline',
+                 currentJobId = CASE WHEN currentJobId = ? THEN NULL ELSE currentJobId END,
+                 updatedAt = ?
+             WHERE workerId = ?`).run(job.id, now, job.workerId);
+      }
+    }
+    const recheckMs = Math.max(1000, Math.min(WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT, Math.floor(options.recheckMs ?? WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT)));
+    const retryAt = new Date(nowMs + recheckMs).toISOString();
+    const updated = this.db.prepare(`UPDATE worker_runtime_circuits
+         SET state = 'open',
+             retryAt = ?,
+             lastFailureAt = ?,
+             canaryJobId = NULL,
+             canaryWorkerId = NULL,
+             canaryClaimedAt = NULL,
+             canaryLeaseExpiresAt = NULL,
+             recoveredAt = NULL,
+             updatedAt = ?
+         WHERE runtimeGeneration = ?
+           AND state = 'half_open'
+           AND canaryJobId = ?`).run(retryAt, now, now, circuit.runtimeGeneration, circuit.canaryJobId);
+    return {
+      circuitRecovered: updated.changes > 0,
+      recoveredJob,
+      runtimeGeneration: circuit.runtimeGeneration,
+      jobId: circuit.canaryJobId,
+      retryAt
     };
   }
   similarNoPublishableFailureSummary(options) {
@@ -11815,21 +12254,52 @@ class JobQueue {
       lastFailureAt: cluster.lastFailureAt
     };
   }
-  addLog(jobId, message, ts) {
+  addLog(jobId, message, ts, options = {}) {
     const now = coerceIsoTimestamp(ts) ?? new Date().toISOString();
     let insertedId = null;
     const tx = this.db.transaction(() => {
-      const insertInfo = this.db.prepare(`INSERT INTO job_logs (jobId, ts, message) VALUES (?, ?, ?)`).run(jobId, now, message);
+      const job = this.db.prepare(`SELECT claimGeneration FROM jobs WHERE id = ?`).get(jobId);
+      const claimGeneration = Number.isFinite(options.claimGeneration) ? Math.max(0, Math.floor(Number(options.claimGeneration))) : Math.max(0, Math.floor(Number(job?.claimGeneration ?? 0)));
+      const category = diagnosticText(options.category, 80);
+      const dedupeKey = diagnosticText(options.dedupeKey, 240);
+      const dedupeWindowMs = Math.max(0, Math.floor(Number(options.dedupeWindowMs ?? 0)));
+      if (category && dedupeKey && dedupeWindowMs > 0) {
+        const latest = this.db.prepare(`SELECT ts
+             FROM job_logs
+             WHERE jobId = ? AND category = ? AND dedupeKey = ?
+             ORDER BY id DESC
+             LIMIT 1`).get(jobId, category, dedupeKey);
+        const latestMs = parseIsoMs(latest?.ts);
+        const nowMs = parseIsoMs(now) ?? Date.now();
+        if (latestMs != null && nowMs - latestMs < dedupeWindowMs)
+          return;
+      }
+      const insertInfo = this.db.prepare(`INSERT INTO job_logs (
+             jobId, ts, message, claimGeneration, category, dedupeKey
+           ) VALUES (?, ?, ?, ?, ?, ?)`).run(jobId, now, message, claimGeneration, category, dedupeKey);
       const rawId = insertInfo.lastInsertRowid;
       if (typeof rawId === "bigint")
         insertedId = Number(rawId);
       else if (typeof rawId === "number" && Number.isFinite(rawId))
         insertedId = rawId;
+      if (category && dedupeKey && Number.isFinite(options.retain)) {
+        const retain = Math.max(1, Math.min(100, Math.floor(Number(options.retain))));
+        this.db.prepare(`DELETE FROM job_logs
+             WHERE id IN (
+               SELECT id
+               FROM job_logs
+               WHERE jobId = ? AND category = ? AND dedupeKey = ?
+               ORDER BY id DESC
+               LIMIT -1 OFFSET ?
+             )`).run(jobId, category, dedupeKey, retain);
+      }
       this.db.prepare(`UPDATE jobs
            SET updatedAt = ?,
                startedAt = COALESCE(startedAt, ?),
                firstLogAt = COALESCE(firstLogAt, ?)
-           WHERE id = ? AND status = 'claimed'`).run(now, now, now, jobId);
+           WHERE id = ?
+             AND status = 'claimed'
+             AND COALESCE(claimGeneration, 0) = ?`).run(now, now, now, jobId, claimGeneration);
     });
     tx();
     return insertedId;
@@ -12064,6 +12534,7 @@ var MIN_REQUEST_LEASE_MS = 30000;
 var MAX_REQUEST_LEASE_MS = 15 * 60000;
 var MIN_REQUEST_DEFER_MS = 1000;
 var MAX_REQUEST_DEFER_MS = 30 * 60000;
+var MAX_RUNTIME_CIRCUIT_RECHECK_MS = 30000;
 var DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT = 200;
 var MAX_HANDOFF_CHAIN_RECONCILE_LIMIT = 1000;
 var DEFAULT_HANDOFF_CHAIN_DEPTH = 16;
@@ -12237,6 +12708,7 @@ class RequestQueue {
     claimGeneration,
     leaseExpiresAt,
     lastHeartbeatAt,
+    deferReason,
     claimAttempts,
     result,
     error,
@@ -12300,6 +12772,7 @@ class RequestQueue {
         claimGeneration  INTEGER NOT NULL DEFAULT 0,
         leaseExpiresAt   TEXT,
         lastHeartbeatAt  TEXT,
+        deferReason      TEXT,
         claimAttempts    INTEGER NOT NULL DEFAULT 0,
         result           TEXT,
         error            TEXT,
@@ -12333,6 +12806,7 @@ class RequestQueue {
     ensureColumn("claimGeneration", `ALTER TABLE requests ADD COLUMN claimGeneration INTEGER NOT NULL DEFAULT 0;`);
     ensureColumn("leaseExpiresAt", `ALTER TABLE requests ADD COLUMN leaseExpiresAt TEXT;`);
     ensureColumn("lastHeartbeatAt", `ALTER TABLE requests ADD COLUMN lastHeartbeatAt TEXT;`);
+    ensureColumn("deferReason", `ALTER TABLE requests ADD COLUMN deferReason TEXT;`);
     ensureColumn("claimAttempts", `ALTER TABLE requests ADD COLUMN claimAttempts INTEGER NOT NULL DEFAULT 0;`);
     ensureColumn("enqueuedAt", `ALTER TABLE requests ADD COLUMN enqueuedAt TEXT;`);
     ensureColumn("claimedAt", `ALTER TABLE requests ADD COLUMN claimedAt TEXT;`);
@@ -12379,6 +12853,7 @@ class RequestQueue {
              claimedAt = NULL,
              leaseExpiresAt = NULL,
              lastHeartbeatAt = NULL,
+             deferReason = NULL,
              updatedAt = ?
          WHERE status = 'claimed'
            AND (claimToken IS NULL OR claimToken = '')`).run(migrationNow);
@@ -12534,6 +13009,7 @@ class RequestQueue {
                claimedAt = ?,
                leaseExpiresAt = ?,
                lastHeartbeatAt = ?,
+               deferReason = NULL,
                claimAttempts = COALESCE(claimAttempts, 0) + 1,
                completedAt = NULL,
                failedAt = NULL,
@@ -12552,6 +13028,7 @@ class RequestQueue {
           claimedAt: now,
           leaseExpiresAt,
           lastHeartbeatAt: now,
+          deferReason: null,
           claimAttempts: Number(row.claimAttempts ?? 0) + 1,
           completedAt: null,
           failedAt: null,
@@ -12591,7 +13068,7 @@ class RequestQueue {
     }
     return { ok: true, leaseExpiresAt };
   }
-  deferClaim(requestId, agentIdRaw, claimTokenRaw, retryAfterMsRaw) {
+  deferClaim(requestId, agentIdRaw, claimTokenRaw, retryAfterMsRaw, options = {}) {
     const agentId = String(agentIdRaw ?? "").trim();
     if (!agentId)
       return { ok: false, message: "agentId is required" };
@@ -12599,19 +13076,21 @@ class RequestQueue {
     if (!claimToken)
       return { ok: false, message: "claimToken is required" };
     const parsedRetryAfterMs = Number(retryAfterMsRaw);
-    const retryAfterMs = Math.max(MIN_REQUEST_DEFER_MS, Math.min(MAX_REQUEST_DEFER_MS, Number.isFinite(parsedRetryAfterMs) ? Math.floor(parsedRetryAfterMs) : MIN_REQUEST_DEFER_MS));
+    const retryAfterMs = Math.max(MIN_REQUEST_DEFER_MS, Math.min(options.reason === "worker_runtime_circuit_open" ? MAX_RUNTIME_CIRCUIT_RECHECK_MS : MAX_REQUEST_DEFER_MS, Number.isFinite(parsedRetryAfterMs) ? Math.floor(parsedRetryAfterMs) : MIN_REQUEST_DEFER_MS));
     const now = new Date().toISOString();
     const deferredUntil = new Date(Date.parse(now) + retryAfterMs).toISOString();
+    const deferReason = String(options.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
     const result = this.db.prepare(`UPDATE requests
          SET leaseExpiresAt = ?,
              lastHeartbeatAt = ?,
+             deferReason = ?,
              updatedAt = ?
          WHERE id = ?
            AND status = 'claimed'
            AND agentId = ?
            AND claimToken = ?
            AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?`).run(deferredUntil, now, now, requestId, agentId, claimToken, now);
+           AND leaseExpiresAt > ?`).run(deferredUntil, now, deferReason || null, now, requestId, agentId, claimToken, now);
     if (result.changes === 0) {
       return {
         ok: false,
@@ -12661,11 +13140,68 @@ class RequestQueue {
              claimedAt = NULL,
              leaseExpiresAt = NULL,
              lastHeartbeatAt = NULL,
+             deferReason = NULL,
              updatedAt = ?
          WHERE status = 'claimed'
            AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`).run(now, now);
     return {
       recovered: result.changes,
+      requestIds: rows.slice(0, result.changes).map((row) => row.id)
+    };
+  }
+  shortenWorkerRuntimeCircuitDeferredClaims(options = {}) {
+    const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+    const maxDelayMs = Math.max(MIN_REQUEST_DEFER_MS, Math.min(MAX_RUNTIME_CIRCUIT_RECHECK_MS, Math.floor(options.maxDelayMs ?? MAX_RUNTIME_CIRCUIT_RECHECK_MS)));
+    const limit = Math.max(1, Math.min(1000, Math.floor(options.limit ?? 500)));
+    const includeLegacyAutonomyClaims = options.includeLegacyAutonomyClaims !== false;
+    const now = new Date(nowMs).toISOString();
+    const deferredUntil = new Date(nowMs + maxDelayMs).toISOString();
+    const rows = this.db.prepare(`SELECT id
+         FROM requests
+         WHERE status = 'claimed'
+           AND (
+             deferReason = 'worker_runtime_circuit_open'
+             OR (
+               ? = 1
+               AND deferReason IS NULL
+               AND json_valid(metadataJson)
+               AND json_extract(metadataJson, '$.origin') = 'autonomy'
+             )
+           )
+           AND leaseExpiresAt > ?
+         ORDER BY updatedAt ASC, createdAt ASC
+         LIMIT ?`).all(includeLegacyAutonomyClaims ? 1 : 0, deferredUntil, limit);
+    if (rows.length === 0)
+      return { shortened: 0, requestIds: [], deferredUntil };
+    const ids = rows.map((row) => row.id);
+    const placeholders = ids.map(() => "?").join(",");
+    const result = this.db.prepare(`UPDATE requests
+         SET leaseExpiresAt = ?, updatedAt = ?
+         WHERE id IN (${placeholders})
+           AND status = 'claimed'
+           AND leaseExpiresAt > ?`).run(deferredUntil, now, ...ids, deferredUntil);
+    return {
+      shortened: result.changes,
+      requestIds: ids.slice(0, result.changes),
+      deferredUntil
+    };
+  }
+  releaseWorkerRuntimeCircuitDeferredClaims(nowMs = Date.now()) {
+    const now = new Date(nowMs).toISOString();
+    const rows = this.db.prepare(`SELECT id
+         FROM requests
+         WHERE status = 'claimed'
+           AND deferReason = 'worker_runtime_circuit_open'
+         ORDER BY updatedAt ASC, createdAt ASC
+         LIMIT 1000`).all();
+    if (rows.length === 0)
+      return { released: 0, requestIds: [] };
+    const result = this.db.prepare(`UPDATE requests
+         SET leaseExpiresAt = ?, deferReason = NULL, updatedAt = ?
+         WHERE status = 'claimed'
+           AND deferReason = 'worker_runtime_circuit_open'`).run(now, now);
+    return {
+      released: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id)
     };
   }
@@ -12883,6 +13419,7 @@ class RequestQueue {
               failedAt = NULL,
               leaseExpiresAt = NULL,
               lastHeartbeatAt = NULL,
+              deferReason = NULL,
              durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
              updatedAt = ?
          WHERE id = ?
@@ -12924,7 +13461,8 @@ class RequestQueue {
               failedAt = ?,
               completedAt = NULL,
               leaseExpiresAt = NULL,
-             lastHeartbeatAt = NULL,
+              lastHeartbeatAt = NULL,
+              deferReason = NULL,
              durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
              updatedAt = ?
          WHERE id = ?
@@ -20121,12 +20659,27 @@ var AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE = 0.5;
 var AUTONOMY_WORKER_FAILURE_DEFER_MS = 30 * 60 * 1000;
 var AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD = 2;
 var AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS = 30 * 60 * 1000;
+var WORKER_RUNTIME_CIRCUIT_RECHECK_MS = 30000;
+var WORKER_RUNTIME_CANARY_LEASE_MS = 45000;
+var EXPLICIT_WORKER_RUNTIME_GENERATION = String(process.env.PUSHPALS_WORKER_RUNTIME_GENERATION ?? process.env.PUSHPALS_RUNTIME_TAG ?? process.env.PUSHPALS_CLI_PACKAGE_VERSION ?? "").trim();
+var WORKER_RUNTIME_GENERATION = EXPLICIT_WORKER_RUNTIME_GENERATION || `server-epoch:${SERVER_STARTED_AT_MS}`;
+var WORKER_RUNTIME_NOT_BEFORE_MS = EXPLICIT_WORKER_RUNTIME_GENERATION ? undefined : SERVER_STARTED_AT_MS;
 var AUTONOMY_SIMILAR_FAILURE_WINDOW_MS = 6 * 60 * 60 * 1000;
 var AUTONOMY_SIMILAR_FAILURE_THRESHOLD = 2;
 var AUTONOMY_SIMILAR_FAILURE_DEFER_MS = 30 * 60 * 1000;
 var MAX_INELIGIBLE_CLAIMS_PER_POLL = 64;
 var CLIENT_TRANSPORT_HEARTBEAT_MS = 15000;
 var SESSION_TOKEN_BUDGET = Math.max(0, STARTUP_CONFIG.server.sessionTokenBudget);
+var startupWorkerRuntimeJobDeferrals = jobQueue.shortenWorkerRuntimeCircuitDeferrals({
+  maxDelayMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS
+});
+var startupWorkerRuntimeRequestDeferrals = requestQueue.shortenWorkerRuntimeCircuitDeferredClaims({
+  maxDelayMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
+  includeLegacyAutonomyClaims: true
+});
+if (startupWorkerRuntimeJobDeferrals.shortened > 0 || startupWorkerRuntimeRequestDeferrals.shortened > 0) {
+  console.warn(`[Server] Shortened deferred WorkerPal runtime work after restart: ` + `${startupWorkerRuntimeJobDeferrals.shortened} job(s), ` + `${startupWorkerRuntimeRequestDeferrals.shortened} request(s).`);
+}
 function getSessionTokenBudgetStatus(sessionIdRaw) {
   const sessionId = String(sessionIdRaw ?? "").trim();
   if (!sessionId || SESSION_TOKEN_BUDGET <= 0)
@@ -20416,7 +20969,9 @@ function createRequestHandler() {
       const autonomyWorkerRuntimeCircuitSummary = () => jobQueue.workerRuntimeFailureCircuitSummary({
         windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
         maxBlockMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
-        threshold: AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD
+        threshold: AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD,
+        runtimeGeneration: WORKER_RUNTIME_GENERATION,
+        notBeforeMs: WORKER_RUNTIME_NOT_BEFORE_MS
       });
       const autonomyWorkerRuntimeCircuitMessage = (runtimeCircuit) => `Autonomy enqueue blocked: WorkerPal repeated the same internal runtime failure ` + `${runtimeCircuit.recentMatchingFailureCount} time(s) within the recent window.`;
       const autonomyWorkerRuntimeCircuitRetryAfterMs = (runtimeCircuit) => resolveWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit, {
@@ -20433,6 +20988,22 @@ function createRequestHandler() {
           retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
           ...runtimeCircuit
         }, 429);
+      };
+      const recordWorkerRuntimeCanarySuccess = (jobId) => {
+        const recovered = jobQueue.recordWorkerRuntimeCanarySuccess(jobId);
+        if (!recovered.reopened)
+          return;
+        const releasedRequests = requestQueue.releaseWorkerRuntimeCircuitDeferredClaims();
+        console.warn(`[Server] WorkerPal runtime canary ${jobId} closed circuit ` + `${recovered.runtimeGeneration ?? WORKER_RUNTIME_GENERATION}; released ` + `${recovered.releasedJobCount} job(s) and ${releasedRequests.released} request(s).`);
+      };
+      const recordWorkerRuntimeCanaryFailure = (jobId) => {
+        const reopened = jobQueue.recordWorkerRuntimeCanaryFailure(jobId, {
+          blockDurationMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
+          recheckMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS
+        });
+        if (!reopened.renewed)
+          return;
+        console.warn(`[Server] WorkerPal runtime canary ${jobId} failed; circuit reopened ` + `(${reopened.matchingFailure ? "matching failure" : "bounded recheck"}) until ` + `${reopened.retryAt ?? "unknown"}.`);
       };
       const autonomySimilarFailureSummary = (value) => {
         const details = extractAutonomyPayloadDetails(value);
@@ -20522,7 +21093,17 @@ function createRequestHandler() {
         if (handoffRecovery.linked > 0 || handoffRecovery.failed > 0) {
           console.warn(`[Server] Reconciled autonomy worker handoffs during stale-claim sweep: ${JSON.stringify(handoffRecovery)}`);
         }
+        const expiredCanary = jobQueue.recoverExpiredWorkerRuntimeCanary({
+          runtimeGeneration: WORKER_RUNTIME_GENERATION,
+          nowMs,
+          recheckMs: WORKER_RUNTIME_CIRCUIT_RECHECK_MS
+        });
         const recovered = jobQueue.recoverStaleClaimedJobs(staleClaimTtlMs);
+        if (expiredCanary.recoveredJob)
+          recovered.unshift(expiredCanary.recoveredJob);
+        if (expiredCanary.circuitRecovered) {
+          console.warn(`[Server] Recovered expired WorkerPal runtime canary ` + `${expiredCanary.jobId ?? "unknown"}; next recheck ${expiredCanary.retryAt ?? "ready"}.`);
+        }
         if (recovered.length === 0)
           return;
         for (const item of recovered) {
@@ -20939,10 +21520,20 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         maybeRecoverStaleClaims();
         const body = await req.json().catch(() => ({}));
         const workerId = body.workerId || "unknown";
+        const claimedRuntimeGeneration = compactText3(body.runtimeGeneration, 200);
+        if (claimedRuntimeGeneration && claimedRuntimeGeneration !== WORKER_RUNTIME_GENERATION) {
+          return makeJson({
+            ok: false,
+            code: "worker_runtime_generation_mismatch",
+            message: `Worker runtime generation ${claimedRuntimeGeneration} does not match ` + `server generation ${WORKER_RUNTIME_GENERATION}.`,
+            runtimeGeneration: WORKER_RUNTIME_GENERATION
+          }, 409);
+        }
         let skippedCount = 0;
-        let cachedRuntimeCircuit;
+        let runtimeCanaryJobId = null;
         let cachedFailureCircuit;
-        let result = jobQueue.claim(workerId);
+        const claimNextJob = () => jobQueue.claim(workerId, { runtimeGeneration: WORKER_RUNTIME_GENERATION });
+        let result = claimNextJob();
         while (result.ok && result.job?.id) {
           const budgetStatus = getSessionTokenBudgetStatus(result.job.sessionId);
           if (budgetStatus?.exceeded) {
@@ -20955,38 +21546,17 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
               return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
             }
-            result = jobQueue.claim(workerId);
+            result = claimNextJob();
             continue;
           }
-          if (isAutonomyRequestPayload({
+          const jobPayload = {
             ...result.job,
             params: parseJsonRecord2(result.job.params)
-          })) {
-            const jobPayload = {
-              ...result.job,
-              params: parseJsonRecord2(result.job.params)
-            };
-            const runtimeCircuit = cachedRuntimeCircuit ?? (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
-            if (runtimeCircuit.blocked) {
-              jobQueue.defer(result.job.id, {
-                workerId,
-                deferMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
-                detail: JSON.stringify({
-                  code: "autonomy_worker_runtime_circuit_open",
-                  retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
-                  ...runtimeCircuit
-                })
-              });
-              skippedCount += 1;
-              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
-                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
-              }
-              result = jobQueue.claim(workerId);
-              continue;
-            }
+          };
+          if (isAutonomyRequestPayload(jobPayload)) {
             const failureCircuit = cachedFailureCircuit ?? (cachedFailureCircuit = autonomyFailureCircuitSummary());
             if (failureCircuit.blocked) {
-              jobQueue.defer(result.job.id, {
+              const deferred = jobQueue.defer(result.job.id, {
                 workerId,
                 deferMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
                 detail: JSON.stringify({
@@ -20994,16 +21564,24 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
                   ...failureCircuit
                 })
               });
+              if (!deferred.ok) {
+                return makeJson({
+                  ok: false,
+                  code: "job_circuit_deferral_failed",
+                  jobId: result.job.id,
+                  message: deferred.message
+                }, 409);
+              }
               skippedCount += 1;
               if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
                 return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
               }
-              result = jobQueue.claim(workerId);
+              result = claimNextJob();
               continue;
             }
             const similarFailure = autonomySimilarFailureSummary(jobPayload);
             if (similarFailure.blocked) {
-              jobQueue.defer(result.job.id, {
+              const deferred = jobQueue.defer(result.job.id, {
                 workerId,
                 deferMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
                 detail: JSON.stringify({
@@ -21011,15 +21589,67 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
                   ...similarFailure
                 })
               });
+              if (!deferred.ok) {
+                return makeJson({
+                  ok: false,
+                  code: "job_circuit_deferral_failed",
+                  jobId: result.job.id,
+                  message: deferred.message
+                }, 409);
+              }
               skippedCount += 1;
               if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
                 return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
               }
-              result = jobQueue.claim(workerId);
+              result = claimNextJob();
               continue;
             }
           }
+          if (result.job.kind === "task.execute") {
+            const runtimeCircuit = jobQueue.acquireWorkerRuntimeCanary(result.job.id, workerId, {
+              windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
+              maxBlockMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
+              threshold: AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD,
+              runtimeGeneration: WORKER_RUNTIME_GENERATION,
+              notBeforeMs: WORKER_RUNTIME_NOT_BEFORE_MS,
+              canaryLeaseMs: WORKER_RUNTIME_CANARY_LEASE_MS
+            });
+            if (!runtimeCircuit.allowed) {
+              const retryAfterMs = Math.min(WORKER_RUNTIME_CIRCUIT_RECHECK_MS, autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit.summary));
+              const deferred = jobQueue.defer(result.job.id, {
+                workerId,
+                targetWorkerId: result.job.targetWorkerId ?? null,
+                deferMs: retryAfterMs,
+                reason: "worker_runtime_circuit_open",
+                detail: JSON.stringify({
+                  code: "worker_runtime_circuit_open",
+                  retryAfterMs,
+                  decision: runtimeCircuit.reason,
+                  ...runtimeCircuit.summary
+                })
+              });
+              if (!deferred.ok) {
+                return makeJson({
+                  ok: false,
+                  code: "job_circuit_deferral_failed",
+                  jobId: result.job.id,
+                  message: deferred.message
+                }, 409);
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
+              result = claimNextJob();
+              continue;
+            }
+            if (runtimeCircuit.canary)
+              runtimeCanaryJobId = result.job.id;
+          }
           break;
+        }
+        if (!result.ok && skippedCount > 0 && result.message === "No pending jobs") {
+          return makeJson({ ok: true, job: null, skippedCount }, 200);
         }
         if (result.ok && result.job?.id) {
           const params = parseJsonRecord2(result.job.params ?? "");
@@ -21028,13 +21658,26 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             autonomyStore.linkJobToObjectiveByRequest(requestId, result.job.id);
           autonomyStore.markObjectiveRunningByJobId(result.job.id);
         }
-        return makeJson(result, result.ok ? 200 : 404);
+        return makeJson(runtimeCanaryJobId ? {
+          ...result,
+          runtimeCanary: true,
+          runtimeGeneration: WORKER_RUNTIME_GENERATION
+        } : result, result.ok ? 200 : 404);
       }
       if (pathname === "/workers/heartbeat" && method === "POST") {
         const denied = requireAuth();
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
+        const heartbeatRuntimeGeneration = compactText3(body.runtimeGeneration, 200);
+        if (heartbeatRuntimeGeneration && heartbeatRuntimeGeneration !== WORKER_RUNTIME_GENERATION) {
+          return makeJson({
+            ok: false,
+            code: "worker_runtime_generation_mismatch",
+            message: `Worker runtime generation ${heartbeatRuntimeGeneration} does not match ` + `server generation ${WORKER_RUNTIME_GENERATION}.`,
+            runtimeGeneration: WORKER_RUNTIME_GENERATION
+          }, 409);
+        }
         const result = jobQueue.heartbeat(body);
         return makeJson(result, result.ok ? 200 : 400);
       }
@@ -21772,6 +22415,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const body = await req.json().catch(() => ({}));
         const result = jobQueue.complete(jobId, body);
         if (result.ok) {
+          recordWorkerRuntimeCanarySuccess(jobId);
           const durationText = typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} completed (${durationText})`);
           const job = jobQueue.getJob(jobId);
@@ -21807,6 +22451,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const body = await req.json().catch(() => ({}));
         const result = jobQueue.fail(jobId, body);
         if (result.ok) {
+          recordWorkerRuntimeCanaryFailure(jobId);
           const durationText = typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} failed (${durationText})`);
           const job = jobQueue.getJob(jobId);
@@ -21863,6 +22508,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const body = await req.json().catch(() => ({}));
         const result = jobQueue.publishBlocked(jobId, body);
         if (result.ok) {
+          recordWorkerRuntimeCanarySuccess(jobId);
           const durationText = typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
           console.log(`[Server] Job ${jobId} publish-blocked (${durationText})`);
           const job = jobQueue.getJob(jobId);
@@ -21949,7 +22595,10 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (!trimmed) {
           return makeJson({ ok: false, message: "message is required" }, 400);
         }
-        const logId = jobQueue.addLog(jobId, trimmed, logTs || undefined);
+        const claimGeneration = Number(body.claimGeneration);
+        const logId = jobQueue.addLog(jobId, trimmed, logTs || undefined, {
+          ...Number.isInteger(claimGeneration) && claimGeneration >= 0 ? { claimGeneration } : {}
+        });
         return makeJson({ ok: true, jobId, logId }, 200);
       }
       if (pathname === "/requests/enqueue" && method === "POST") {
@@ -22074,8 +22723,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           if (isAutonomyRequestPayload(result.request)) {
             const runtimeCircuit = cachedRuntimeCircuit ?? (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
             if (runtimeCircuit.blocked) {
-              const retryAfterMs = autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit);
-              const deferred = requestQueue.deferClaim(result.request.id, agentId, result.request.claimToken ?? "", retryAfterMs);
+              const retryAfterMs = Math.min(WORKER_RUNTIME_CIRCUIT_RECHECK_MS, autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit));
+              const deferred = requestQueue.deferClaim(result.request.id, agentId, result.request.claimToken ?? "", retryAfterMs, { reason: "worker_runtime_circuit_open" });
               if (!deferred.ok) {
                 return makeJson({
                   ok: false,
@@ -22291,6 +22940,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (result.ok) {
           const jobId = compactText3(body.jobId, 128);
           if (jobId) {
+            recordWorkerRuntimeCanarySuccess(jobId);
             autonomyStore.markObjectiveRunningByJobId(jobId);
             console.log(`[Server] Job ${jobId} is finalizing via completion ${result.completionId ?? "unknown"}`);
           }

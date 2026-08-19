@@ -109,7 +109,11 @@ function writeServerConfig(root: string, port: number, serverExtras: string[] = 
   writeFileSync(join(root, ".env"), "", "utf8");
 }
 
-function spawnServer(root: string, port: number): SpawnedServer {
+function spawnServer(
+  root: string,
+  port: number,
+  runtimeGeneration = "session-route-runtime-v1",
+): SpawnedServer {
   const proc = Bun.spawn(
     [bunExecPath, "run", resolve(repoRoot, "apps/server/src/server_main.ts")],
     {
@@ -121,6 +125,7 @@ function spawnServer(root: string, port: number): SpawnedServer {
         PUSHPALS_PROJECT_ROOT_OVERRIDE: root,
         PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
         PUSHPALS_PORT: String(port),
+        PUSHPALS_WORKER_RUNTIME_GENERATION: runtimeGeneration,
       },
     },
   );
@@ -591,7 +596,7 @@ describe("server session message route", () => {
     expect(await handoff.json()).toMatchObject({ ok: true, jobId: expect.any(String) });
   }, 15_000);
 
-  test("defers already queued autonomy work nonterminal while the worker-runtime circuit is open", async () => {
+  test("defers every queued task.execute nonterminal while the worker-runtime circuit is open", async () => {
     const root = makeTempDir();
     const port = await getFreePort();
     writeServerConfig(root, port);
@@ -614,7 +619,7 @@ describe("server session message route", () => {
     await Bun.sleep(10);
     const acceptedUser = await postServerJson(port, "/requests/enqueue", {
       sessionId: "runtime-circuit-user",
-      prompt: "User work remains eligible while autonomy is deferred.",
+      prompt: "Keep planning user work while execution waits for WorkerPal recovery.",
       priority: "background",
     });
     expect(acceptedUser.status).toBe(201);
@@ -672,11 +677,27 @@ describe("server session message route", () => {
     const eligibleUserJobId = String(
       ((await eligibleUserJob.json()) as Record<string, unknown>).jobId ?? "",
     );
+
+    const targetedUserJob = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "targeted-user-job-during-runtime-circuit",
+      sessionId: "runtime-circuit-user-job",
+      kind: "task.execute",
+      targetWorkerId: "runtime-circuit-preferred-worker",
+      params: { origin: "user" },
+    });
+    expect(targetedUserJob.status).toBe(201);
+    const targetedUserJobId = String(
+      ((await targetedUserJob.json()) as Record<string, unknown>).jobId ?? "",
+    );
+
     const claimedJob = await postServerJson(port, "/jobs/claim", {
       workerId: "runtime-circuit-canary-worker",
     });
     expect(claimedJob.status).toBe(200);
-    expect(await claimedJob.json()).toMatchObject({ job: { id: eligibleUserJobId } });
+    expect(await claimedJob.json()).toMatchObject({
+      job: null,
+      skippedCount: 3,
+    });
     const deferredJobsSnapshot = await fetch(`http://127.0.0.1:${port}/jobs?limit=20`);
     const deferredJobsPayload = (await deferredJobsSnapshot.json()) as {
       jobs: Array<Record<string, unknown>>;
@@ -688,6 +709,40 @@ describe("server session message route", () => {
         failedAt: null,
         availableAt: expect.any(String),
       }),
+    );
+    expect(deferredJobsPayload.jobs).toContainEqual(
+      expect.objectContaining({
+        id: eligibleUserJobId,
+        status: "pending",
+        failedAt: null,
+        availableAt: expect.any(String),
+        targetWorkerId: null,
+      }),
+    );
+    expect(deferredJobsPayload.jobs).toContainEqual(
+      expect.objectContaining({
+        id: targetedUserJobId,
+        status: "pending",
+        failedAt: null,
+        availableAt: expect.any(String),
+        targetWorkerId: "runtime-circuit-preferred-worker",
+      }),
+    );
+
+    const deferredUserLogs = await fetch(
+      `http://127.0.0.1:${port}/jobs/${eligibleUserJobId}/logs?limit=10`,
+    );
+    expect(deferredUserLogs.status).toBe(200);
+    const deferredUserLogsPayload = (await deferredUserLogs.json()) as {
+      logs: Array<{ message: string }>;
+    };
+    expect(
+      deferredUserLogsPayload.logs.some((log) =>
+        log.message.includes('"code":"worker_runtime_circuit_open"'),
+      ),
+    ).toBe(true);
+    expect(Math.max(...deferredUserLogsPayload.logs.map((log) => log.message.length))).toBeLessThan(
+      2_100,
     );
 
     const claimedRequest = await postServerJson(port, "/requests/claim", {
@@ -708,8 +763,8 @@ describe("server session message route", () => {
     const deferredClaimToken = String(deferredRequestPayload.request.claimToken ?? "");
     const deferredUntil = String(deferredRequestPayload.request.leaseExpiresAt ?? "");
     expect(deferredClaimToken).not.toBe("");
-    expect(Date.parse(deferredUntil)).toBeGreaterThan(Date.now() + 60_000);
-    expect(Date.parse(deferredUntil)).toBeLessThanOrEqual(Date.now() + 30 * 60_000);
+    expect(Date.parse(deferredUntil)).toBeGreaterThan(Date.now() + 10_000);
+    expect(Date.parse(deferredUntil)).toBeLessThanOrEqual(Date.now() + 30_000);
     expect(deferredRequestPayload).toMatchObject({
       request: {
         id: autonomyRequestId,
@@ -726,21 +781,41 @@ describe("server session message route", () => {
       slo: { terminal: 0, failed: 0 },
     });
 
-    // Simulate the bounded defer expiring after the circuit's failure window.
+    // Make the durable circuit due and prove one successful execution canary
+    // releases the already-admitted request immediately.
     const db = new Database(join(root, "outputs", "data", "pushpals.db"));
     try {
-      const oldFailureAt = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
-      db.prepare(`UPDATE jobs SET failedAt = ?, updatedAt = ? WHERE status = 'failed'`).run(
-        oldFailureAt,
-        oldFailureAt,
-      );
-      db.prepare(`UPDATE requests SET leaseExpiresAt = ? WHERE id = ?`).run(
-        new Date(Date.now() - 1_000).toISOString(),
-        autonomyRequestId,
-      );
+      const dueAt = new Date(Date.now() - 1_000).toISOString();
+      db.prepare(`UPDATE worker_runtime_circuits SET retryAt = ?, updatedAt = ?`).run(dueAt, dueAt);
+      db.prepare(
+        `UPDATE jobs SET availableAt = ? WHERE id IN (?, ?, ?) AND status = 'pending'`,
+      ).run(dueAt, queuedAutonomyJobId, eligibleUserJobId, targetedUserJobId);
     } finally {
       db.close();
     }
+
+    const canaryClaim = await postServerJson(port, "/jobs/claim", {
+      workerId: "runtime-circuit-recovery-canary",
+    });
+    expect(canaryClaim.status).toBe(200);
+    const canaryPayload = (await canaryClaim.json()) as {
+      runtimeCanary?: boolean;
+      job?: { id?: string };
+    };
+    expect(canaryPayload.runtimeCanary).toBe(true);
+    const canaryJobId = String(canaryPayload.job?.id ?? "");
+    expect([queuedAutonomyJobId, eligibleUserJobId, targetedUserJobId]).toContain(canaryJobId);
+    const canaryCompleted = await postServerJson(port, `/jobs/${canaryJobId}/complete`, {
+      summary: "WorkerPal runtime canary completed",
+      diagnostics: {
+        terminal: {
+          failureClass: "success",
+          terminalStage: "completed",
+          executorBackend: "openai_codex",
+        },
+      },
+    });
+    expect(canaryCompleted.status).toBe(200);
 
     const retriedRequest = await postServerJson(port, "/requests/claim", {
       agentId: "remotebuddy-runtime-canary",
@@ -759,7 +834,322 @@ describe("server session message route", () => {
     expect(retriedPayload.request.claimToken).not.toBe(deferredClaimToken);
   }, 20_000);
 
-  test("bounds circuit scans without leaking the next blocked item and advances user work on the next poll", async () => {
+  test("preserves the runtime circuit and bounds already-deferred work across restart", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    await seedWorkerRuntimeCircuit(port, "before-server-restart");
+
+    const blockedBeforeRestart = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "blocked-before-server-restart",
+      sessionId: "runtime-circuit-restart",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(blockedBeforeRestart.status).toBe(429);
+    expect(await blockedBeforeRestart.json()).toMatchObject({
+      code: "autonomy_worker_runtime_circuit_open",
+    });
+
+    const queuedUserJob = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "user-canary-after-server-restart",
+      sessionId: "runtime-circuit-restart",
+      kind: "task.execute",
+      params: { origin: "user" },
+    });
+    expect(queuedUserJob.status).toBe(201);
+    const queuedUserJobId = String(
+      ((await queuedUserJob.json()) as Record<string, unknown>).jobId ?? "",
+    );
+
+    const deferredBeforeRestart = await postServerJson(port, "/jobs/claim", {
+      workerId: "runtime-circuit-before-restart",
+    });
+    expect(deferredBeforeRestart.status).toBe(200);
+    expect(await deferredBeforeRestart.json()).toMatchObject({ job: null, skippedCount: 1 });
+    const dbBeforeRestart = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      dbBeforeRestart
+        .prepare(`UPDATE jobs SET availableAt = ? WHERE id = ?`)
+        .run(new Date(Date.now() + 30 * 60_000).toISOString(), queuedUserJobId);
+    } finally {
+      dbBeforeRestart.close();
+    }
+
+    server.proc.kill();
+    await server.proc.exited;
+    await Promise.allSettled([server.stdout, server.stderr]);
+
+    const restartedServer = spawnServer(root, port);
+    await waitForHealth(restartedServer, port);
+
+    const stillBlocked = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "still-blocked-after-same-runtime-restart",
+      sessionId: "runtime-circuit-restart",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(stillBlocked.status).toBe(429);
+    expect(await stillBlocked.json()).toMatchObject({
+      code: "autonomy_worker_runtime_circuit_open",
+      phase: "open",
+      runtimeGeneration: "session-route-runtime-v1",
+    });
+
+    const restartedJobs = await fetch(`http://127.0.0.1:${port}/jobs?limit=20`);
+    const restartedPayload = (await restartedJobs.json()) as {
+      jobs: Array<{ id: string; availableAt?: string; deferReason?: string }>;
+    };
+    const restartedDeferred = restartedPayload.jobs.find((job) => job.id === queuedUserJobId);
+    expect(restartedDeferred?.deferReason).toBe("worker_runtime_circuit_open");
+    expect(Date.parse(String(restartedDeferred?.availableAt))).toBeLessThanOrEqual(
+      Date.now() + 30_000,
+    );
+
+    const dbAfterRestart = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      const dueAt = new Date(Date.now() - 1_000).toISOString();
+      dbAfterRestart
+        .prepare(`UPDATE worker_runtime_circuits SET retryAt = ?, updatedAt = ?`)
+        .run(dueAt, dueAt);
+      dbAfterRestart
+        .prepare(`UPDATE jobs SET availableAt = ? WHERE id = ?`)
+        .run(dueAt, queuedUserJobId);
+    } finally {
+      dbAfterRestart.close();
+    }
+
+    const canaryClaim = await postServerJson(port, "/jobs/claim", {
+      workerId: "runtime-circuit-restarted-worker",
+    });
+    expect(canaryClaim.status).toBe(200);
+    expect(await canaryClaim.json()).toMatchObject({
+      runtimeCanary: true,
+      runtimeGeneration: "session-route-runtime-v1",
+      job: { id: queuedUserJobId },
+    });
+
+    const canaryCompleted = await postServerJson(port, `/jobs/${queuedUserJobId}/complete`, {
+      summary: "The restarted WorkerPal generation completed its canary.",
+      diagnostics: {
+        terminal: {
+          status: "completed",
+          failureClass: "success",
+          terminalStage: "completed",
+          executorBackend: "openai_codex",
+          summary: "Restart canary completed",
+        },
+      },
+    });
+    expect(canaryCompleted.status).toBe(200);
+    expect(await canaryCompleted.json()).toMatchObject({ ok: true });
+
+    const admittedAfterRecovery = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "admitted-after-canary-recovery",
+      sessionId: "runtime-circuit-restart",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(admittedAfterRecovery.status).toBe(201);
+    expect(await admittedAfterRecovery.json()).toMatchObject({ ok: true });
+  }, 20_000);
+
+  test("starts a clean circuit only when the packaged runtime generation changes", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port, "session-route-runtime-v1");
+    await waitForHealth(server, port);
+    await seedWorkerRuntimeCircuit(port, "before-runtime-upgrade");
+    server.proc.kill();
+    await server.proc.exited;
+    await Promise.allSettled([server.stdout, server.stderr]);
+
+    const upgradedServer = spawnServer(root, port, "session-route-runtime-v2");
+    await waitForHealth(upgradedServer, port);
+    const admitted = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "admitted-after-runtime-upgrade",
+      sessionId: "runtime-circuit-upgrade",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(admitted.status).toBe(201);
+    expect(await admitted.json()).toMatchObject({ ok: true });
+  }, 20_000);
+
+  test("rejects a WorkerPal from a different packaged runtime generation", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port, "session-route-runtime-v1");
+    await waitForHealth(server, port);
+
+    const job = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "runtime-generation-fence",
+      sessionId: "runtime-generation-fence",
+      kind: "task.execute",
+      params: { origin: "user" },
+    });
+    expect(job.status).toBe(201);
+    const rejected = await postServerJson(port, "/jobs/claim", {
+      workerId: "stale-runtime-worker",
+      runtimeGeneration: "session-route-runtime-v0",
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      ok: false,
+      code: "worker_runtime_generation_mismatch",
+      runtimeGeneration: "session-route-runtime-v1",
+    });
+
+    const accepted = await postServerJson(port, "/jobs/claim", {
+      workerId: "current-runtime-worker",
+      runtimeGeneration: "session-route-runtime-v1",
+    });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toMatchObject({
+      job: { runtimeGeneration: "session-route-runtime-v1" },
+    });
+  }, 15_000);
+
+  test("allows only one concurrent half-open canary", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    await seedWorkerRuntimeCircuit(port, "concurrent-canary");
+    const blocked = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "force-runtime-circuit-materialization",
+      sessionId: "concurrent-canary",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(blocked.status).toBe(429);
+
+    const jobIds: string[] = [];
+    for (const label of ["first", "second"]) {
+      const enqueued = await postServerJson(port, "/jobs/enqueue", {
+        taskId: `concurrent-canary-${label}`,
+        sessionId: "concurrent-canary",
+        kind: "task.execute",
+        params: { origin: "user" },
+      });
+      expect(enqueued.status).toBe(201);
+      jobIds.push(String(((await enqueued.json()) as Record<string, unknown>).jobId ?? ""));
+    }
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      const dueAt = new Date(Date.now() - 1_000).toISOString();
+      db.prepare(`UPDATE worker_runtime_circuits SET retryAt = ?, updatedAt = ?`).run(dueAt, dueAt);
+    } finally {
+      db.close();
+    }
+
+    const responses = await Promise.all([
+      postServerJson(port, "/jobs/claim", { workerId: "concurrent-canary-a" }),
+      postServerJson(port, "/jobs/claim", { workerId: "concurrent-canary-b" }),
+    ]);
+    const payloads = await Promise.all(
+      responses.map(
+        async (response) =>
+          (await response.json()) as {
+            runtimeCanary?: boolean;
+            job?: { id?: string } | null;
+          },
+      ),
+    );
+    expect(responses.every((response) => response.status === 200)).toBe(true);
+    const admittedCanaries = payloads.filter(
+      (payload) => payload.runtimeCanary === true && payload.job?.id,
+    );
+    expect(admittedCanaries).toHaveLength(1);
+    expect(jobIds).toContain(String(admittedCanaries[0]?.job?.id));
+    expect(payloads.filter((payload) => payload.job == null)).toHaveLength(1);
+
+    const circuitDb = new Database(join(root, "outputs", "data", "pushpals.db"), {
+      readonly: true,
+    });
+    try {
+      const circuit = circuitDb
+        .prepare(
+          `SELECT state, canaryJobId, canaryWorkerId FROM worker_runtime_circuits
+           WHERE runtimeGeneration = ?`,
+        )
+        .get("session-route-runtime-v1") as Record<string, unknown>;
+      expect(circuit).toMatchObject({
+        state: "half_open",
+        canaryJobId: admittedCanaries[0]?.job?.id,
+      });
+      expect(String(circuit.canaryWorkerId ?? "")).toMatch(/^concurrent-canary-/);
+    } finally {
+      circuitDb.close();
+    }
+  }, 20_000);
+
+  test("returns an observable error when a circuit deferral cannot persist", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    await seedWorkerRuntimeCircuit(port, "deferral-write-failure");
+    const blocked = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "force-deferral-circuit-materialization",
+      sessionId: "deferral-write-failure",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(blocked.status).toBe(429);
+
+    const enqueued = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "deferral-write-failure-user-job",
+      sessionId: "deferral-write-failure",
+      kind: "task.execute",
+      params: { origin: "user" },
+    });
+    const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      db.exec(`
+        CREATE TRIGGER reject_test_runtime_deferral
+        BEFORE UPDATE OF status ON jobs
+        WHEN OLD.id = '${jobId}' AND OLD.status = 'claimed' AND NEW.status = 'pending'
+        BEGIN
+          SELECT RAISE(IGNORE);
+        END;
+      `);
+    } finally {
+      db.close();
+    }
+
+    const claim = await postServerJson(port, "/jobs/claim", {
+      workerId: "deferral-write-failure-worker",
+    });
+    expect(claim.status).toBe(409);
+    expect(await claim.json()).toMatchObject({
+      ok: false,
+      code: "job_circuit_deferral_failed",
+      jobId,
+    });
+    const jobSnapshot = await fetch(`http://127.0.0.1:${port}/jobs?limit=20`);
+    const jobSnapshotPayload = (await jobSnapshot.json()) as {
+      jobs: Array<Record<string, unknown>>;
+    };
+    expect(jobSnapshotPayload.jobs).toContainEqual(
+      expect.objectContaining({
+        id: jobId,
+        status: "claimed",
+        workerId: "deferral-write-failure-worker",
+      }),
+    );
+  }, 20_000);
+
+  test("bounds circuit scans while deferring execution and advancing user planning", async () => {
     const root = makeTempDir();
     const port = await getFreePort();
     writeServerConfig(root, port);
@@ -880,7 +1270,25 @@ describe("server session message route", () => {
       workerId: "bounded-claim-worker",
     });
     expect(secondJobPoll.status).toBe(200);
-    expect(await secondJobPoll.json()).toMatchObject({ job: { id: userJobId } });
+    expect(await secondJobPoll.json()).toMatchObject({
+      ok: true,
+      job: null,
+      skippedCount: 2,
+    });
+
+    const userJobStatus = await fetch(`http://127.0.0.1:${port}/jobs?limit=200`);
+    expect(userJobStatus.status).toBe(200);
+    expect(await userJobStatus.json()).toMatchObject({
+      jobs: expect.arrayContaining([
+        expect.objectContaining({
+          id: userJobId,
+          status: "pending",
+          failedAt: null,
+          availableAt: expect.any(String),
+          targetWorkerId: null,
+        }),
+      ]),
+    });
 
     const secondRequestPoll = await postServerJson(port, "/requests/claim", {
       agentId: "bounded-claim-remotebuddy",

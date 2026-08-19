@@ -43,6 +43,17 @@ At a high level:
 7. Commit metadata is enqueued as completion when applicable.
 8. Worktree is cleaned up.
 
+The daemon sends its packaged runtime generation on claims and heartbeats. The
+Server rejects a WorkerPal from a different generation, preventing a stale
+process from serving a newly started packaged runtime. Log delivery also sends
+the job's claim generation so delayed output remains attributable to the claim
+that produced it.
+
+Unhandled JavaScript failures at the WorkerPal-owned stack boundary are
+reported with structured `worker_runtime_failure` diagnostics owned by
+`workerpals_main`. Expected Docker retry exhaustion remains a Docker-boundary
+failure rather than being mislabeled as a WorkerPal implementation crash.
+
 ## Why Worktree Isolation Matters
 
 Each job runs in an isolated git worktree to avoid cross-job contamination.

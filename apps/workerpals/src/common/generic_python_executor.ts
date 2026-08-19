@@ -9,11 +9,20 @@
 
 import { existsSync } from "fs";
 import { dirname, join, resolve } from "path";
-import { runBoundedProcess as runBoundedWorkerProcess } from "shared";
-import type { JobResult, JobTokenUsage } from "./types.js";
+import {
+  isWorkerOwnedRuntimeStackFrame,
+  runBoundedProcess as runBoundedWorkerProcess,
+} from "shared";
+import type { JobDiagnostics, JobResult, JobTokenUsage } from "./types.js";
 import type { WorkerpalsRuntimeConfig } from "./executor_backend.js";
 import type { BackendTaskExecutor } from "../backends/types.js";
-import { truncate, parseStructuredResult, filterResultLines } from "./execution_utils.js";
+import {
+  truncate,
+  parseStructuredResult,
+  filterResultLines,
+  hasStructuredResultSentinel,
+  validateStructuredJobResultEnvelope,
+} from "./execution_utils.js";
 import { buildWorkerSandboxWritableEnv } from "./sandbox_env.js";
 import {
   createPythonPayloadTransport,
@@ -29,6 +38,8 @@ interface GenericPythonExecutorConfig {
   capTimeoutToExecutionBudget?: boolean;
   /** Override only for deterministic progress-heartbeat tests. */
   progressIntervalMs?: number;
+  /** Override only for deterministic process-outcome tests. */
+  processRunner?: typeof runBoundedWorkerProcess;
 }
 
 const BACKEND_TIMEOUT_RESULT_GRACE_MS = 30_000;
@@ -279,12 +290,28 @@ export function normalizeGenericPythonExecutorParsedResultForTimeout(params: {
     params.timedOut &&
     params.backendName === "openai_codex" &&
     /\bopenai_codex interrupted by signal 15\b/i.test(params.summary);
-  if (!signalTerminatedCodex) {
+  if (!params.timedOut) {
     return {
       summary: params.summary,
       stdout: params.stdout,
       stderr: params.stderr,
       exitCode: params.exitCode,
+    };
+  }
+
+  if (!signalTerminatedCodex) {
+    const timeoutDetail = String(params.timeoutDetail ?? "").trim();
+    return {
+      summary: `${params.backendName} wrapper timed out after ${params.timeoutMs}ms for ${params.kind}`,
+      stdout: params.stdout,
+      stderr: [
+        params.stderr,
+        `The ${params.backendName} wrapper process exceeded the PushPals execution deadline.`,
+        timeoutDetail ? `Timeout detail: ${timeoutDetail}.` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      exitCode: 124,
     };
   }
 
@@ -309,6 +336,47 @@ export function normalizeGenericPythonExecutorParsedResultForTimeout(params: {
     stderr,
     exitCode: 124,
   };
+}
+
+function appendExecutorFailureDetail(existing: string, detail: string): string {
+  return [existing.trim(), detail.trim()].filter(Boolean).join("\n");
+}
+
+function genericExecutorBoundaryDiagnostics(params: {
+  backendName: string;
+  summary: string;
+  failureClass: string;
+  exitCode: number;
+  timeoutMs: number;
+  structuredResult: boolean;
+  metadata?: Record<string, unknown>;
+}): JobDiagnostics {
+  return {
+    terminal: {
+      failureClass: params.failureClass,
+      terminalStage: "executor",
+      executorBackend: params.backendName,
+      summary: params.summary,
+      watchdogFired: params.failureClass === "timeout",
+      timeoutMs: params.timeoutMs,
+      metadata: {
+        classificationOwner: "generic_python_executor",
+        structuredResult: params.structuredResult,
+        exitCode: params.exitCode,
+        ...(params.metadata ?? {}),
+      },
+    },
+  };
+}
+
+function workerOwnedInternalErrorDetail(error: unknown): string | null {
+  const detail =
+    error instanceof Error
+      ? String(error.stack ?? `${error.name}: ${error.message}`).trim()
+      : String(error ?? "").trim();
+  if (!detail) return null;
+  const firstFrame = detail.split(/\r?\n/).find((line) => /^\s*at\b/i.test(line));
+  return isWorkerOwnedRuntimeStackFrame(firstFrame) ? detail : null;
 }
 
 export function createGenericPythonExecutor(
@@ -435,7 +503,7 @@ export function createGenericPythonExecutor(
       };
       let processResult: Awaited<ReturnType<typeof runBoundedWorkerProcess>>;
       try {
-        processResult = await runBoundedWorkerProcess(args, {
+        processResult = await (config.processRunner ?? runBoundedWorkerProcess)(args, {
           cwd: repo,
           env: {
             ...buildWorkerSandboxWritableEnv(repo),
@@ -465,11 +533,16 @@ export function createGenericPythonExecutor(
       }
 
       timedOut = processResult.timedOut;
+      const drainTimedOut = processResult.drainTimedOut === true;
       const stdout = processResult.stdout;
       const stderr = processResult.stderr;
       const exitCode = processResult.exitCode;
 
       const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
+      const sawStructuredResultSentinel = hasStructuredResultSentinel(
+        stdout,
+        outputPolicy.executorResultPrefix,
+      );
       const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
       const fallbackUsage = estimateJobTokenUsage(
         backendName,
@@ -482,22 +555,91 @@ export function createGenericPythonExecutor(
 
       if (!parsed) {
         if (timedOut) {
+          const summary = `${backendName} wrapper timed out after ${timeoutMs}ms for ${kind}`;
           return {
             ok: false,
-            summary: `${backendName} wrapper timed out after ${timeoutMs}ms for ${kind}`,
+            summary,
             stdout: truncate(filteredStdout, outputPolicy),
             stderr: truncate(stderr, outputPolicy),
-            exitCode: exitCode === 0 ? 124 : exitCode,
+            exitCode: 124,
             usage: fallbackUsage,
+            diagnostics: genericExecutorBoundaryDiagnostics({
+              backendName,
+              summary,
+              failureClass: "timeout",
+              exitCode: 124,
+              timeoutMs,
+              structuredResult: false,
+              metadata: { processTimedOut: true },
+            }),
           };
         }
+        if (drainTimedOut) {
+          const summary = `${backendName} wrapper process streams did not close after execution for ${kind}`;
+          return {
+            ok: false,
+            summary,
+            stdout: truncate(filteredStdout, outputPolicy),
+            stderr: truncate(
+              appendExecutorFailureDetail(
+                stderr,
+                "The wrapper process stream-drain deadline fired; discarded any incomplete result and terminated the process tree.",
+              ),
+              outputPolicy,
+            ),
+            exitCode: 124,
+            usage: fallbackUsage,
+            diagnostics: genericExecutorBoundaryDiagnostics({
+              backendName,
+              summary,
+              failureClass: "timeout",
+              exitCode: 124,
+              timeoutMs,
+              structuredResult: false,
+              metadata: { streamDrainTimedOut: true },
+            }),
+          };
+        }
+        if (sawStructuredResultSentinel) {
+          const summary = `${backendName} wrapper returned a malformed structured result for ${kind}`;
+          const malformedDetail =
+            "Malformed structured result: sentinel payload was not a JSON object or could not be parsed.";
+          const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+          return {
+            ok: false,
+            summary,
+            stdout: truncate(filteredStdout, outputPolicy),
+            stderr: truncate(appendExecutorFailureDetail(stderr, malformedDetail), outputPolicy),
+            exitCode: malformedExitCode,
+            usage: fallbackUsage,
+            diagnostics: genericExecutorBoundaryDiagnostics({
+              backendName,
+              summary,
+              failureClass: "malformed_structured_result",
+              exitCode: malformedExitCode,
+              timeoutMs,
+              structuredResult: true,
+              metadata: { schemaValidationError: malformedDetail },
+            }),
+          };
+        }
+        const summary = `${backendName} wrapper did not return a structured result for ${kind}`;
+        const missingExitCode = exitCode === 0 ? 1 : exitCode;
         return {
           ok: false,
-          summary: `${backendName} wrapper did not return a structured result for ${kind}`,
+          summary,
           stdout: truncate(filteredStdout, outputPolicy),
           stderr: truncate(stderr, outputPolicy),
-          exitCode,
+          exitCode: missingExitCode,
           usage: fallbackUsage,
+          diagnostics: genericExecutorBoundaryDiagnostics({
+            backendName,
+            summary,
+            failureClass: "no_structured_result",
+            exitCode: missingExitCode,
+            timeoutMs,
+            structuredResult: false,
+          }),
         };
       }
 
@@ -513,6 +655,36 @@ export function createGenericPythonExecutor(
         parsed.usage,
         estimateJobTokenUsage(backendName, modelId, params, summary, parsedStdout, parsedStderr),
       );
+      const envelope = validateStructuredJobResultEnvelope(parsed);
+      const malformedResult: JobResult | null = envelope.valid
+        ? null
+        : (() => {
+            const malformedSummary = `${backendName} wrapper returned a malformed structured result for ${kind}`;
+            const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+            return {
+              ok: false,
+              summary: malformedSummary,
+              stdout: truncate(parsedStdout, outputPolicy),
+              stderr: truncate(
+                appendExecutorFailureDetail(
+                  parsedStderr,
+                  `Malformed structured result: ${envelope.detail}.`,
+                ),
+                outputPolicy,
+              ),
+              exitCode: malformedExitCode,
+              usage,
+              diagnostics: genericExecutorBoundaryDiagnostics({
+                backendName,
+                summary: malformedSummary,
+                failureClass: "malformed_structured_result",
+                exitCode: malformedExitCode,
+                timeoutMs,
+                structuredResult: true,
+                metadata: { schemaValidationError: envelope.detail },
+              }),
+            };
+          })();
       const normalized = normalizeGenericPythonExecutorParsedResultForTimeout({
         backendName,
         kind,
@@ -522,21 +694,127 @@ export function createGenericPythonExecutor(
         summary,
         stdout: parsedStdout,
         stderr: parsedStderr,
-        exitCode:
-          typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
-            ? parsed.exitCode
-            : exitCode,
+        exitCode: envelope.valid && envelope.exitCode !== undefined ? envelope.exitCode : exitCode,
       });
 
+      if (timedOut) {
+        return {
+          ok: false,
+          summary: normalized.summary,
+          stdout: truncate(normalized.stdout, outputPolicy),
+          stderr: truncate(normalized.stderr, outputPolicy),
+          exitCode: 124,
+          usage,
+          diagnostics: genericExecutorBoundaryDiagnostics({
+            backendName,
+            summary: normalized.summary,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: true,
+            metadata: { processTimedOut: true },
+          }),
+        };
+      }
+
+      if (drainTimedOut) {
+        const drainSummary = `${backendName} wrapper process streams did not close after returning a structured result for ${kind}`;
+        return {
+          ok: false,
+          summary: drainSummary,
+          stdout: truncate(normalized.stdout, outputPolicy),
+          stderr: truncate(
+            appendExecutorFailureDetail(
+              normalized.stderr,
+              "Discarded the structured result because the process stream-drain deadline fired and the process tree was terminated.",
+            ),
+            outputPolicy,
+          ),
+          exitCode: 124,
+          usage,
+          diagnostics: genericExecutorBoundaryDiagnostics({
+            backendName,
+            summary: drainSummary,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: true,
+            metadata: {
+              streamDrainTimedOut: true,
+              processStateOverrodeStructuredResult: true,
+            },
+          }),
+        };
+      }
+
+      if (!envelope.valid) return malformedResult as JobResult;
+
+      const parsedExitCode = envelope.exitCode ?? exitCode;
+      const processExitedNonzero = exitCode !== 0;
+      const structuredExitNonzero = parsedExitCode !== 0;
+      const parsedOk = envelope.ok;
+      let finalSummary = normalized.summary;
+      let finalStderr = normalized.stderr;
+      let finalExitCode = normalized.exitCode;
+
+      if (!timedOut && processExitedNonzero) {
+        finalExitCode = exitCode;
+        if (parsedOk) {
+          finalSummary = `${backendName} wrapper process exited ${exitCode} after returning a structured success result for ${kind}`;
+          finalStderr = appendExecutorFailureDetail(
+            finalStderr,
+            `Discarded the structured ok=true result because the wrapper process exited with code ${exitCode}.`,
+          );
+        }
+      } else if (!timedOut && parsedOk && structuredExitNonzero) {
+        finalSummary = `${backendName} wrapper returned exit ${parsedExitCode} with a structured success result for ${kind}`;
+        finalStderr = appendExecutorFailureDetail(
+          finalStderr,
+          `Discarded the structured ok=true result because its exitCode was ${parsedExitCode}.`,
+        );
+        finalExitCode = parsedExitCode;
+      }
+
       return {
-        ok: typeof parsed.ok === "boolean" ? parsed.ok : exitCode === 0,
-        summary: normalized.summary,
+        ok: parsedOk && !timedOut && !processExitedNonzero && !structuredExitNonzero,
+        summary: finalSummary,
         stdout: truncate(normalized.stdout, outputPolicy),
-        stderr: truncate(normalized.stderr, outputPolicy),
-        exitCode: normalized.exitCode,
+        stderr: truncate(finalStderr, outputPolicy),
+        exitCode: finalExitCode,
         usage,
       };
     } catch (err) {
+      const internalErrorDetail = workerOwnedInternalErrorDetail(err);
+      if (internalErrorDetail) {
+        const summary = `WorkerPal internal runtime failure in ${backendName} executor for ${kind}`;
+        return {
+          ok: false,
+          summary,
+          stderr: internalErrorDetail,
+          exitCode: 1,
+          usage: estimateJobTokenUsage(
+            backendName,
+            runtimeConfig.workerpals.llm.model.trim(),
+            params,
+            summary,
+            "",
+            internalErrorDetail,
+          ),
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "worker_runtime",
+              executorBackend: backendName,
+              summary: internalErrorDetail.split(/\r?\n/, 1)[0] || summary,
+              watchdogFired: false,
+              metadata: {
+                caughtBy: "generic_python_executor",
+                jobKind: kind,
+              },
+            },
+          },
+        };
+      }
       return {
         ok: false,
         summary: `${backendName} wrapper execution error for ${kind}: ${String(err)}`,

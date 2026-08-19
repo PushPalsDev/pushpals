@@ -25,6 +25,30 @@ function neverEndingBodyResponse(status = 200): Response {
 }
 
 describe("workerpals server transport", () => {
+  test("sends the runtime generation with every heartbeat", async () => {
+    let heartbeatBody: Record<string, unknown> | null = null;
+    const transport = new WorkerServerTransport({
+      server: "http://127.0.0.1:3001",
+      headers: { "Content-Type": "application/json" },
+      workerId: "workerpal-generation",
+      pollMs: 2_000,
+      heartbeatMs: 5_000,
+      staleClaimTtlMs: 120_000,
+      runtimeGeneration: "v1.2.39",
+      fetchFn: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        heartbeatBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response("{}", { status: 200 });
+      }) as typeof fetch,
+    });
+
+    expect(await transport.sendHeartbeat(heartbeatPayload(null))).toBe(true);
+    expect(heartbeatBody).toMatchObject({
+      workerId: "workerpal-generation",
+      runtimeGeneration: "v1.2.39",
+      status: "idle",
+    });
+  });
+
   test("keeps heartbeat delivery independent from blocked job-log transport", async () => {
     let resolveLogRequest: (() => void) | null = null;
     const seenUrls: string[] = [];

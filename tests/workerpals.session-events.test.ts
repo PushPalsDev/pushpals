@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildUnhandledWorkerFailureResult,
   buildTrustedValidationCompletionPayload,
   didWorkerWatchdogFire,
   enqueueCompletion,
@@ -13,11 +14,42 @@ import {
   shouldRecycleWorkerForCodexUnavailableFailure,
   shouldRecycleWorkerForHeartbeatDegradation,
   requiresPublishableCodeChange,
+  resolveWorkerRuntimeGeneration,
   workerJobResultFromDocker,
   workerRecycleExitCodeForResult,
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
+  test("uses the packaged runtime tag as the WorkerPal generation", () => {
+    expect(
+      resolveWorkerRuntimeGeneration({
+        PUSHPALS_RUNTIME_TAG: "v1.2.39",
+        PUSHPALS_CLI_PACKAGE_VERSION: "1.2.38",
+      }),
+    ).toBe("v1.2.39");
+    expect(resolveWorkerRuntimeGeneration({})).toBe("");
+  });
+
+  test("classifies an unhandled WorkerPal stack at its owning runtime boundary", () => {
+    const error = new ReferenceError("Cannot access 'timedOut' before initialization");
+    error.stack =
+      `ReferenceError: Cannot access 'timedOut' before initialization\n` +
+      `    at execute (/workspace/apps/workerpals/src/workerpals_main.ts:2074:18)`;
+    const result = buildUnhandledWorkerFailureResult(error, "openai_codex");
+
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("workerpals_main.ts");
+    expect(result.diagnostics?.terminal).toMatchObject({
+      failureClass: "worker_runtime_failure",
+      terminalStage: "worker_runtime",
+      executorBackend: "openai_codex",
+      metadata: {
+        classificationOwner: "workerpals_main",
+        structuredResult: false,
+      },
+    });
+  });
+
   test("preserves structurally owned terminal stages through final diagnostic enrichment", () => {
     for (const terminalStage of ["worker_runtime", "docker"]) {
       const merged = mergeWorkerDiagnostics(
@@ -42,6 +74,63 @@ describe("workerpals session event emission", () => {
         structuredResult: false,
         phase: "executing",
       });
+    }
+  });
+
+  test("preserves host-executor terminal identity through final diagnostic enrichment", () => {
+    for (const classificationOwner of ["generic_python_executor", "openhands_task_execute"]) {
+      const merged = mergeWorkerDiagnostics(
+        {
+          terminal: {
+            failureClass: "nonzero_exit",
+            terminalStage: "executor",
+            executorBackend: "test-backend",
+            summary: "host process state rejected wrapper success",
+            watchdogFired: false,
+            timeoutMs: 10_000,
+            metadata: {
+              classificationOwner,
+              processStateOverrodeStructuredResult: true,
+            },
+          },
+        },
+        {
+          terminal: {
+            failureClass: "worker_failure",
+            terminalStage: "worker",
+            executorBackend: "enrichment-backend",
+            summary: "generic finalization summary",
+            watchdogFired: true,
+            timeoutMs: 99_000,
+            metadata: {
+              classificationOwner: "untrusted_enrichment",
+              phase: "executing",
+            },
+          },
+        },
+      );
+
+      expect(merged.terminal).toMatchObject({
+        failureClass: "nonzero_exit",
+        terminalStage: "executor",
+        executorBackend: "test-backend",
+        summary: "host process state rejected wrapper success",
+        watchdogFired: false,
+        timeoutMs: 10_000,
+        metadata: {
+          classificationOwner,
+          processStateOverrodeStructuredResult: true,
+          phase: "executing",
+        },
+      });
+      expect(
+        inferWorkerTerminalFailureClass({
+          ok: false,
+          summary: "generic finalization summary",
+          exitCode: 3,
+          diagnostics: merged,
+        }),
+      ).toBe("nonzero_exit");
     }
   });
 

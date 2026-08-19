@@ -233,7 +233,10 @@ describe("RemoteBuddy task.execute dedupe", () => {
         timeoutMs: 1_000,
       },
     ) as () => void;
-    await Bun.sleep(35);
+    const renewalDeadline = Date.now() + 1_000;
+    while (renewCalls < 2 && Date.now() < renewalDeadline) {
+      await Bun.sleep(5);
+    }
     stop();
     const callsAtStop = renewCalls;
     await Bun.sleep(15);

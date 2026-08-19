@@ -40,6 +40,25 @@ Each queue has typed statuses (`pending`, `claimed`, `completed`, `failed`, etc.
 
 Jobs claimed by dead workers can be recovered through stale-claim sweeps.
 
+### 5) Durable WorkerPal runtime circuit
+
+Repeated structurally owned WorkerPal runtime failures open a SQLite-backed
+circuit for the packaged runtime generation. The generation comes from the CLI
+runtime tag in packaged installs; source runs use a server epoch. An open
+circuit keeps new autonomy admission closed and defers every `task.execute`
+claim for at most 30 seconds at a time.
+
+After the cooldown, one atomic half-open lease admits exactly one execution
+canary. Heartbeats renew that lease. A successful execution closes the circuit
+and releases tagged request/job deferrals; a matching runtime failure renews
+the full cooldown; a different failure or lost lease schedules another bounded
+recheck. On restart, the same packaged generation retains its circuit and old
+long deferrals are shortened. A changed packaged generation starts clean.
+
+Job logs carry the claim generation so late output from an abandoned claim
+cannot refresh a newer claim's stale-activity clock. Repeated circuit-deferral
+logs are fingerprint-deduplicated and retention-bounded.
+
 ## Endpoint Families
 
 Server endpoints are easiest to reason about by family:
@@ -72,6 +91,7 @@ Jobs include:
 
 - execution/finalization budgets,
 - worker claim metadata,
+- packaged runtime and claim generations,
 - structured logs,
 - queue metrics and SLO summaries.
 

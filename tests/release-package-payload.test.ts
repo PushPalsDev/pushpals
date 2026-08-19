@@ -266,9 +266,11 @@ describe("release package payload verification", () => {
     const reliabilityJobIndex = workflow.indexOf("reliability_contract:");
     const publishJobIndex = workflow.indexOf("publish_npm:");
     const publishedSmokeJobIndex = workflow.indexOf("smoke_published_cli_linux:");
+    const publishReleaseJobIndex = workflow.indexOf("publish_release:");
     const buildJob = workflow.slice(buildJobIndex, reliabilityJobIndex);
     const reliabilityJob = workflow.slice(reliabilityJobIndex, publishJobIndex);
     const publishJob = workflow.slice(publishJobIndex, publishedSmokeJobIndex);
+    const publishReleaseJob = workflow.slice(publishReleaseJobIndex);
     const setVersionIndex = buildJob.indexOf("Set CLI package version from tag");
     const buildPackageIndex = buildJob.indexOf("Build CLI package payload");
     const verifyPackageIndex = buildJob.indexOf(
@@ -284,7 +286,10 @@ describe("release package payload verification", () => {
     );
     const reliabilityDockerIndex = reliabilityJob.indexOf("Build packaged WorkerPal sandbox image");
     const reliabilityCliSmokeIndex = reliabilityJob.indexOf(
-      "Smoke exact immutable CLI package artifact",
+      "Smoke exact immutable CLI and runtime candidate artifacts",
+    );
+    const reliabilityRuntimeDownloadIndex = reliabilityJob.indexOf(
+      "Download immutable Linux runtime candidates",
     );
     const reliabilityHarnessIndex = reliabilityJob.indexOf("bun run harness:reliability");
     const publishDownloadIndex = publishJob.indexOf(
@@ -304,6 +309,7 @@ describe("release package payload verification", () => {
     expect(reliabilityJobIndex).toBeGreaterThan(buildJobIndex);
     expect(publishJobIndex).toBeGreaterThan(reliabilityJobIndex);
     expect(publishedSmokeJobIndex).toBeGreaterThan(publishJobIndex);
+    expect(publishReleaseJobIndex).toBeGreaterThan(publishedSmokeJobIndex);
     expect(buildJob).toContain("needs: meta");
     expect(setVersionIndex).toBeGreaterThanOrEqual(0);
     expect(buildPackageIndex).toBeGreaterThanOrEqual(0);
@@ -318,15 +324,25 @@ describe("release package payload verification", () => {
     expect(buildJob).toContain("name: pushpals-cli-package-${{ needs.meta.outputs.version }}");
 
     expect(reliabilityJob).toContain("- build_cli_package");
+    expect(reliabilityJob).toContain("- build_runtime_binaries");
     expect(reliabilityDownloadIndex).toBeGreaterThan(reliabilityProtocolBuildIndex);
     expect(reliabilityUnpackIndex).toBeGreaterThan(reliabilityDownloadIndex);
-    expect(reliabilityCliSmokeIndex).toBeGreaterThan(reliabilityUnpackIndex);
+    expect(reliabilityRuntimeDownloadIndex).toBeGreaterThan(reliabilityUnpackIndex);
+    expect(reliabilityCliSmokeIndex).toBeGreaterThan(reliabilityRuntimeDownloadIndex);
     expect(reliabilityDockerIndex).toBeGreaterThan(reliabilityCliSmokeIndex);
     expect(reliabilityHarnessIndex).toBeGreaterThan(reliabilityDockerIndex);
     expect(reliabilityJob).toContain("sha256sum -c SHA256SUMS.txt");
     expect(reliabilityJob).toContain('tar -xzf "${tarballs[0]}"');
     expect(reliabilityJob).toContain(
       '--package-spec "${{ steps.tested_package.outputs.tarball }}"',
+    );
+    expect(reliabilityJob).toContain("name: runtime-linux-x64");
+    expect(reliabilityJob).toContain(
+      '--runtime-bin-dir "${{ github.workspace }}/dist/tested-runtime-linux-x64"',
+    );
+    expect(reliabilityJob).toContain('--runtime-tag "${{ needs.meta.outputs.tag }}"');
+    expect(reliabilityJob).toContain(
+      "GitHub release assets do not exist yet. Seed the exact same-run Actions",
     );
     expect(reliabilityJob).toContain(
       "PUSHPALS_PACKAGED_RUNTIME_ROOT: ${{ github.workspace }}/dist/tested-cli-package/package/runtime/sandbox",
@@ -354,6 +370,15 @@ describe("release package payload verification", () => {
     expect(publishJob).not.toContain("working-directory: packages/cli");
     expect(publishJob).not.toContain("npm publish --access public");
     expect(publishJob.match(/^\s+npm publish /gm)).toHaveLength(1);
+
+    expect(publishReleaseJob).toContain("name: pushpals-linux-x64");
+    expect(publishReleaseJob).toContain("name: pushpals-windows-x64.exe");
+    expect(publishReleaseJob).toContain("name: pushpals-macos-x64");
+    expect(publishReleaseJob).toContain("name: pushpals-macos-arm64");
+    expect(publishReleaseJob).toContain("pattern: runtime-*");
+    expect(publishReleaseJob.match(/uses: actions\/download-artifact@v4/g)).toHaveLength(5);
+    expect(publishReleaseJob).not.toContain("name: pushpals-cli-package-");
+    expect(publishReleaseJob).not.toContain("- name: Download binaries");
 
     expect(reliabilityInstallIndex).toBeGreaterThanOrEqual(0);
     expect(reliabilityProtocolBuildIndex).toBeGreaterThan(reliabilityInstallIndex);

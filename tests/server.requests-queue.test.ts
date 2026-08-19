@@ -827,6 +827,81 @@ describe("server RequestQueue", () => {
     queue.close();
   });
 
+  test("caps runtime-circuit claims at 30 seconds and recovers tagged and legacy deferrals", () => {
+    const queue = new RequestQueue(":memory:");
+    const tagged = queue.enqueue({
+      sessionId: "runtime-tagged",
+      prompt: "retry after a bounded runtime recheck",
+    });
+    const taggedClaim = queue.claim("remotebuddy-tagged", { leaseMs: 60_000 });
+    expect(taggedClaim.request?.id).toBe(tagged.requestId);
+    const taggedDeferred = queue.deferClaim(
+      String(tagged.requestId),
+      "remotebuddy-tagged",
+      String(taggedClaim.request?.claimToken),
+      60 * 60_000,
+      { reason: "worker_runtime_circuit_open" },
+    );
+    const legacy = queue.enqueue({
+      sessionId: "runtime-legacy",
+      prompt: "recover a deferral written before reason tags existed",
+      forceWorker: true,
+      forceLane: "worker",
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          objectiveId: "runtime-legacy-objective",
+          runId: "runtime-legacy-run",
+          snapshotId: "runtime-legacy-snapshot",
+          componentArea: "apps/server",
+          targetPaths: ["apps/server/src/requests.ts"],
+          writeGlobs: ["apps/server/src/*.ts"],
+        },
+      },
+    });
+    const legacyClaim = queue.claim("remotebuddy-legacy", { leaseMs: 60_000 });
+    expect(legacyClaim.request?.id).toBe(legacy.requestId);
+    const legacyDeferred = queue.deferClaim(
+      String(legacy.requestId),
+      "remotebuddy-legacy",
+      String(legacyClaim.request?.claimToken),
+      30 * 60_000,
+    );
+    expect(taggedDeferred).toMatchObject({ ok: true, retryAfterMs: 30_000 });
+    expect(legacyDeferred.ok).toBe(true);
+
+    const nowMs = Date.parse("2026-08-18T22:00:00.000Z");
+    const farFuture = new Date(nowMs + 30 * 60_000).toISOString();
+    const db = (queue as unknown as { db: any }).db as any;
+    db.prepare("UPDATE requests SET leaseExpiresAt = ? WHERE id IN (?, ?)").run(
+      farFuture,
+      tagged.requestId,
+      legacy.requestId,
+    );
+    const shortened = queue.shortenWorkerRuntimeCircuitDeferredClaims({
+      nowMs,
+      maxDelayMs: 30_000,
+      includeLegacyAutonomyClaims: true,
+    });
+    expect(shortened.shortened).toBe(2);
+    expect(new Set(shortened.requestIds)).toEqual(
+      new Set([String(tagged.requestId), String(legacy.requestId)]),
+    );
+
+    const released = queue.releaseWorkerRuntimeCircuitDeferredClaims(nowMs + 1);
+    expect(released).toMatchObject({
+      released: 1,
+      requestIds: [String(tagged.requestId)],
+    });
+    expect(queue.recoverExpiredClaims(new Date(nowMs + 2)).requestIds).toContain(
+      String(tagged.requestId),
+    );
+    expect(queue.recoverExpiredClaims(new Date(nowMs + 30_001)).requestIds).toContain(
+      String(legacy.requestId),
+    );
+    queue.close();
+  });
+
   test("rejects ownerless terminal writes and worker handoffs", () => {
     const queue = new RequestQueue(":memory:");
     const enqueued = queue.enqueue({ sessionId: "dev", prompt: "keep ownership explicit" });

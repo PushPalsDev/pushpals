@@ -103,6 +103,7 @@ jobs:
     needs:
       - meta
       - build_cli_package
+      - build_runtime_binaries
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -145,10 +146,21 @@ jobs:
           )
           test -f dist/tested-cli-package/package/runtime/sandbox/apps/workerpals/Dockerfile.sandbox
 
-      - name: Smoke exact immutable CLI package artifact
+      - name: Download immutable Linux runtime candidates
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-linux-x64
+          path: dist/tested-runtime-linux-x64
+
+      # GitHub release assets do not exist yet. Seed the exact same-run Actions
+      # artifacts that publish_release will later promote, then prove the installed
+      # package cold-starts without attempting a public runtime download.
+      - name: Smoke exact immutable CLI and runtime candidate artifacts
         run: >-
           bun run scripts/release-installed-cli-smoke.ts
           --package-spec "${{ steps.tested_package.outputs.tarball }}"
+          --runtime-bin-dir "${{ github.workspace }}/dist/tested-runtime-linux-x64"
+          --runtime-tag "${{ needs.meta.outputs.tag }}"
           --duration-ms 240000
 
       - name: Build packaged WorkerPal sandbox image
@@ -757,9 +769,36 @@ jobs:
         with:
           bun-version: "1.3.14"
 
-      - name: Download binaries
+      # Enumerate release artifacts instead of downloading every workflow artifact.
+      # The immutable npm tarball is an input to publication, not a GitHub binary asset.
+      - name: Download Linux CLI binary
         uses: actions/download-artifact@v4
         with:
+          name: pushpals-linux-x64
+          path: dist
+
+      - name: Download Windows CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pushpals-windows-x64.exe
+          path: dist
+
+      - name: Download macOS x64 CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pushpals-macos-x64
+          path: dist
+
+      - name: Download macOS arm64 CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pushpals-macos-arm64
+          path: dist
+
+      - name: Download runtime service binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
           path: dist
           merge-multiple: true
 

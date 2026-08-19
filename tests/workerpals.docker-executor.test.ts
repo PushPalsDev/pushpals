@@ -17,6 +17,7 @@ import {
   resolveWorkerpalDockerRuntimeCaArgs,
 } from "../apps/workerpals/src/docker_executor";
 import { removeLinkedNodeModulesDependencyArtifact } from "../apps/workerpals/src/execute_job";
+import { inferWorkerTerminalFailureClass } from "../apps/workerpals/src/workerpals_main";
 import {
   copyFileSync,
   existsSync,
@@ -660,6 +661,339 @@ describe("workerpals docker executor internals", () => {
     expect(timedOut.summary).toContain("timed out in Docker executor");
     expect(timedOut.summary).toContain("1234567ms");
     expect(timedOut.summary).toContain("14400000ms");
+  });
+
+  test("parseResult rejects structured success when the Docker deadline fired", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
+      ) => {
+        ok: boolean;
+        summary: string;
+        stderr?: string;
+        exitCode?: number;
+        diagnostics?: {
+          terminal?: { failureClass?: string; metadata?: Record<string, unknown> };
+        };
+      };
+    };
+
+    const result = executor.parseResult(
+      [
+        `___RESULT___ ${JSON.stringify({
+          ok: true,
+          summary: "runner claimed success before hanging",
+          exitCode: 0,
+        })}`,
+      ],
+      [],
+      143,
+      { timedOutByDocker: true, elapsedMs: 90_005, timeoutMs: 90_000 },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(124);
+    expect(result.summary).toContain("timed out in Docker executor");
+    expect(result.stderr).toContain("Discarded the structured result");
+    expect(result.diagnostics?.terminal?.failureClass).toBe("timeout");
+    expect(result.diagnostics?.terminal?.metadata).toMatchObject({
+      structuredResult: true,
+      processStateOverrodeStructuredResult: true,
+      timedOutByDocker: true,
+    });
+  });
+
+  test("parseResult rejects structured success when the job process exits nonzero", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
+      ) => {
+        ok: boolean;
+        summary: string;
+        stderr?: string;
+        exitCode?: number;
+        diagnostics?: { terminal?: { failureClass?: string } };
+      };
+    };
+
+    const result = executor.parseResult(
+      [
+        `___RESULT___ ${JSON.stringify({
+          ok: true,
+          summary: "runner claimed success before crashing",
+          exitCode: 0,
+        })}`,
+      ],
+      [],
+      3,
+      { timedOutByDocker: false, elapsedMs: 1_500, timeoutMs: 90_000 },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(3);
+    expect(result.summary).toContain("process exited 3");
+    expect(result.stderr).toContain("Discarded the structured ok=true result");
+    expect(result.diagnostics?.terminal?.failureClass).toBe("nonzero_exit");
+  });
+
+  test("parseResult preserves a valid zero-exit structured success", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: { timedOutByDocker: boolean; elapsedMs: number; timeoutMs: number },
+      ) => { ok: boolean; summary: string; exitCode?: number };
+    };
+
+    const result = executor.parseResult(
+      [
+        `___RESULT___ ${JSON.stringify({
+          ok: true,
+          summary: "runner completed normally",
+          exitCode: 0,
+        })}`,
+      ],
+      [],
+      0,
+      { timedOutByDocker: false, elapsedMs: 1_500, timeoutMs: 90_000 },
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      summary: "runner completed normally",
+      exitCode: 0,
+    });
+  });
+
+  test("parseResult requires a strict structured-result boundary schema", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: {
+          timedOutByDocker: boolean;
+          streamDrainTimedOut: boolean;
+          elapsedMs: number;
+          timeoutMs: number;
+        },
+      ) => {
+        ok: boolean;
+        summary: string;
+        exitCode?: number;
+        diagnostics?: { terminal?: { failureClass?: string } };
+      };
+    };
+    const malformedPayloads: unknown[] = [
+      { summary: "missing ok", exitCode: 0 },
+      { ok: "false", summary: "string ok", exitCode: 0 },
+      { ok: true, summary: "string exit", exitCode: "3" },
+      { ok: true, summary: "fractional exit", exitCode: 0.5 },
+      [],
+    ];
+
+    for (const payload of malformedPayloads) {
+      const result = executor.parseResult([`___RESULT___ ${JSON.stringify(payload)}`], [], 0, {
+        timedOutByDocker: false,
+        streamDrainTimedOut: false,
+        elapsedMs: 10,
+        timeoutMs: 90_000,
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(1);
+      expect(result.summary).toContain("malformed structured result");
+      expect(result.diagnostics?.terminal?.failureClass).toBe("malformed_structured_result");
+      expect(inferWorkerTerminalFailureClass(result)).toBe("malformed_structured_result");
+    }
+  });
+
+  test("parseResult preserves valid explicit failure and exit-code-omitted success", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: {
+          timedOutByDocker: boolean;
+          streamDrainTimedOut: boolean;
+          elapsedMs: number;
+          timeoutMs: number;
+        },
+      ) => { ok: boolean; summary: string; exitCode?: number };
+    };
+    const context = {
+      timedOutByDocker: false,
+      streamDrainTimedOut: false,
+      elapsedMs: 10,
+      timeoutMs: 90_000,
+    };
+
+    const failure = executor.parseResult(
+      [`___RESULT___ ${JSON.stringify({ ok: false, summary: "valid failure", exitCode: 0 })}`],
+      [],
+      0,
+      context,
+    );
+    const success = executor.parseResult(
+      [`___RESULT___ ${JSON.stringify({ ok: true, summary: "valid success" })}`],
+      [],
+      0,
+      context,
+    );
+
+    expect(failure).toMatchObject({ ok: false, summary: "valid failure", exitCode: 0 });
+    expect(success).toMatchObject({ ok: true, summary: "valid success" });
+  });
+
+  test("parseResult treats only the newest sentinel as authoritative", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: {
+          timedOutByDocker: boolean;
+          streamDrainTimedOut: boolean;
+          elapsedMs: number;
+          timeoutMs: number;
+        },
+      ) => { ok: boolean; summary: string; diagnostics?: { terminal?: { failureClass?: string } } };
+    };
+
+    for (const newestSentinel of ["___RESULT___ {this-is-not-json", "___RESULT___"]) {
+      const result = executor.parseResult(
+        [
+          `___RESULT___ ${JSON.stringify({ ok: true, summary: "stale success", exitCode: 0 })}`,
+          newestSentinel,
+        ],
+        [],
+        0,
+        {
+          timedOutByDocker: false,
+          streamDrainTimedOut: false,
+          elapsedMs: 10,
+          timeoutMs: 90_000,
+        },
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.summary).toContain("malformed structured result");
+      expect(result.diagnostics?.terminal?.failureClass).toBe("malformed_structured_result");
+    }
+  });
+
+  test("parseResult rejects zero-exit jobs without a structured result", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: {
+          timedOutByDocker: boolean;
+          streamDrainTimedOut: boolean;
+          elapsedMs: number;
+          timeoutMs: number;
+        },
+      ) => {
+        ok: boolean;
+        summary: string;
+        exitCode?: number;
+        diagnostics?: { terminal?: { failureClass?: string } };
+      };
+    };
+
+    const result = executor.parseResult(["runner exited quietly"], [], 0, {
+      timedOutByDocker: false,
+      streamDrainTimedOut: false,
+      elapsedMs: 10,
+      timeoutMs: 90_000,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.summary).toContain("without returning a structured result");
+    expect(result.diagnostics?.terminal?.failureClass).toBe("no_structured_result");
+  });
+
+  test("parseResult rejects structured success when stream draining times out", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: {
+          timedOutByDocker: boolean;
+          streamDrainTimedOut: boolean;
+          elapsedMs: number;
+          timeoutMs: number;
+        },
+      ) => {
+        ok: boolean;
+        summary: string;
+        exitCode?: number;
+        diagnostics?: { terminal?: { failureClass?: string; metadata?: Record<string, unknown> } };
+      };
+    };
+
+    const result = executor.parseResult(
+      [`___RESULT___ ${JSON.stringify({ ok: true, summary: "stale success", exitCode: 0 })}`],
+      [],
+      0,
+      {
+        timedOutByDocker: false,
+        streamDrainTimedOut: true,
+        elapsedMs: 2_100,
+        timeoutMs: 90_000,
+      },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(124);
+    expect(result.summary).toContain("streams did not close");
+    expect(result.diagnostics?.terminal?.metadata).toMatchObject({
+      streamDrainTimedOut: true,
+      processStateOverrodeStructuredResult: true,
+    });
+    expect(inferWorkerTerminalFailureClass(result)).toBe("timeout");
+  });
+
+  test("terminal inference trusts Docker-owned process overrides", () => {
+    const executor = createExecutor() as unknown as {
+      parseResult: (
+        stdoutLines: string[],
+        stderrLines: string[],
+        exitCode: number,
+        context: {
+          timedOutByDocker: boolean;
+          streamDrainTimedOut: boolean;
+          elapsedMs: number;
+          timeoutMs: number;
+        },
+      ) => { ok: boolean; summary: string; diagnostics?: { terminal?: { failureClass?: string } } };
+    };
+
+    const result = executor.parseResult(
+      [`___RESULT___ ${JSON.stringify({ ok: true, summary: "stale success", exitCode: 0 })}`],
+      [],
+      3,
+      {
+        timedOutByDocker: false,
+        streamDrainTimedOut: false,
+        elapsedMs: 10,
+        timeoutMs: 90_000,
+      },
+    );
+
+    expect(result.diagnostics?.terminal?.failureClass).toBe("nonzero_exit");
+    expect(inferWorkerTerminalFailureClass(result)).toBe("nonzero_exit");
   });
 
   test("parseResult reports missing prompt assets without misclassifying them as timeouts", () => {

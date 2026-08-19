@@ -8,9 +8,15 @@
 
 import { existsSync } from "fs";
 import { runBoundedProcess as runBoundedWorkerProcess } from "shared";
-import type { JobResult, JobTokenUsage } from "../common/types.js";
+import type { JobDiagnostics, JobResult, JobTokenUsage } from "../common/types.js";
 import type { WorkerpalsRuntimeConfig } from "../common/executor_backend.js";
-import { truncate, parseStructuredResult, filterResultLines } from "../common/execution_utils.js";
+import {
+  truncate,
+  parseStructuredResult,
+  filterResultLines,
+  hasStructuredResultSentinel,
+  validateStructuredJobResultEnvelope,
+} from "../common/execution_utils.js";
 import { buildWorkerSandboxWritableEnv } from "../common/sandbox_env.js";
 import {
   createPythonPayloadTransport,
@@ -26,6 +32,11 @@ const OPENHANDS_SCRIPT_PATH = resolveWorkerpalsSourcePath(
   "openhands",
   "openhands_executor.py",
 );
+
+interface OpenHandsExecutionOptions {
+  /** Override only for deterministic process-boundary tests. */
+  processRunner?: typeof runBoundedWorkerProcess;
+}
 
 // ---- OpenHands-specific helpers ----------------------------------------------
 
@@ -100,6 +111,36 @@ function coerceJobTokenUsage(value: unknown, fallback: JobTokenUsage): JobTokenU
       typeof raw.modelId === "string" && raw.modelId.trim().length > 0
         ? raw.modelId.trim()
         : fallback.modelId,
+  };
+}
+
+function appendOpenHandsFailureDetail(existing: string, detail: string): string {
+  return [existing.trim(), detail.trim()].filter(Boolean).join("\n");
+}
+
+function openHandsBoundaryDiagnostics(params: {
+  summary: string;
+  failureClass: string;
+  exitCode: number;
+  timeoutMs: number;
+  structuredResult: boolean;
+  metadata?: Record<string, unknown>;
+}): JobDiagnostics {
+  return {
+    terminal: {
+      failureClass: params.failureClass,
+      terminalStage: "executor",
+      executorBackend: "openhands",
+      summary: params.summary,
+      watchdogFired: params.failureClass === "timeout",
+      timeoutMs: params.timeoutMs,
+      metadata: {
+        classificationOwner: "openhands_task_execute",
+        structuredResult: params.structuredResult,
+        exitCode: params.exitCode,
+        ...(params.metadata ?? {}),
+      },
+    },
   };
 }
 
@@ -214,6 +255,7 @@ export async function executeWithOpenHands(
   runtimeConfig: WorkerpalsRuntimeConfig,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
   budgets?: { executionBudgetMs?: number; finalizationBudgetMs?: number },
+  executionOptions: OpenHandsExecutionOptions = {},
 ): Promise<JobResult> {
   const pythonBin = runtimeConfig.workerpals.openhandsPython || "python";
   const scriptPath = OPENHANDS_SCRIPT_PATH;
@@ -465,52 +507,56 @@ export async function executeWithOpenHands(
     };
 
     resetWarningTimer();
-    const processResult = await runBoundedWorkerProcess(processArgv, {
-      cwd: repo,
-      env: processEnv,
-      timeoutMs,
-      maxTotalTimeoutMs: timeoutMs + activityExtensionMs,
-      outputLimitBytes: Math.max(
-        64 * 1024,
-        Math.min(4 * 1024 * 1024, runtimeConfig.workerpals.outputMaxChars),
-      ),
-      retainOutputTail: true,
-      onStdoutLine: (line) => onProcessLine("stdout", line),
-      onStderrLine: (line) => onProcessLine("stderr", line),
-      extendTimeoutMs: () => {
-        const nowMs = Date.now();
-        const quietForMs = nowMs - lastActivityAtMs;
-        if (
-          extendedByActivityMs !== 0 ||
-          activityExtensionMs <= 0 ||
-          quietForMs > activityWindowMs
-        ) {
-          return 0;
-        }
-        extendedByActivityMs = activityExtensionMs;
-        timeoutDeadlineMs = nowMs + activityExtensionMs;
-        onLog?.(
-          "stdout",
-          `[OpenHandsExecutor] Extending timeout by ${activityExtensionMs}ms because the agent is still active (last output ${Math.round(
-            quietForMs / 1000,
-          )}s ago).`,
-        );
-        resetWarningTimer();
-        return activityExtensionMs;
+    const processResult = await (executionOptions.processRunner ?? runBoundedWorkerProcess)(
+      processArgv,
+      {
+        cwd: repo,
+        env: processEnv,
+        timeoutMs,
+        maxTotalTimeoutMs: timeoutMs + activityExtensionMs,
+        outputLimitBytes: Math.max(
+          64 * 1024,
+          Math.min(4 * 1024 * 1024, runtimeConfig.workerpals.outputMaxChars),
+        ),
+        retainOutputTail: true,
+        onStdoutLine: (line) => onProcessLine("stdout", line),
+        onStderrLine: (line) => onProcessLine("stderr", line),
+        extendTimeoutMs: () => {
+          const nowMs = Date.now();
+          const quietForMs = nowMs - lastActivityAtMs;
+          if (
+            extendedByActivityMs !== 0 ||
+            activityExtensionMs <= 0 ||
+            quietForMs > activityWindowMs
+          ) {
+            return 0;
+          }
+          extendedByActivityMs = activityExtensionMs;
+          timeoutDeadlineMs = nowMs + activityExtensionMs;
+          onLog?.(
+            "stdout",
+            `[OpenHandsExecutor] Extending timeout by ${activityExtensionMs}ms because the agent is still active (last output ${Math.round(
+              quietForMs / 1000,
+            )}s ago).`,
+          );
+          resetWarningTimer();
+          return activityExtensionMs;
+        },
+        onTimeout: (elapsedMs) => {
+          timedOut = true;
+          timedOutAfterMs = Math.max(1, elapsedMs);
+          onLog?.(
+            "stdout",
+            `[OpenHandsExecutor] Timeout reached for ${kind} after ${timedOutAfterMs}ms (effective limit: ${timeoutLimitSource}${
+              extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
+            }); terminating wrapper process tree.`,
+          );
+          stopStuckNudges();
+        },
       },
-      onTimeout: (elapsedMs) => {
-        timedOut = true;
-        timedOutAfterMs = Math.max(1, elapsedMs);
-        onLog?.(
-          "stdout",
-          `[OpenHandsExecutor] Timeout reached for ${kind} after ${timedOutAfterMs}ms (effective limit: ${timeoutLimitSource}${
-            extendedByActivityMs > 0 ? ` + activity extension ${extendedByActivityMs}ms` : ""
-          }); terminating wrapper process tree.`,
-        );
-        stopStuckNudges();
-      },
-    });
+    );
     timedOut = processResult.timedOut;
+    const drainTimedOut = processResult.drainTimedOut === true;
     const stdout = processResult.stdout;
     const stderr = processResult.stderr;
     const exitCode = processResult.exitCode;
@@ -521,6 +567,10 @@ export async function executeWithOpenHands(
     stopStuckNudges();
 
     const parsed = parseStructuredResult(stdout, outputPolicy.executorResultPrefix);
+    const sawStructuredResultSentinel = hasStructuredResultSentinel(
+      stdout,
+      outputPolicy.executorResultPrefix,
+    );
     const filteredStdout = filterResultLines(stdout, outputPolicy.executorResultPrefix);
     const fallbackUsage = estimateJobTokenUsage(runtimeConfig, params, "", filteredStdout, stderr);
 
@@ -536,17 +586,81 @@ export async function executeWithOpenHands(
           }). Worker returned a timeout failure.${stuckNote}`,
           stdout: truncate(filteredStdout, outputPolicy),
           stderr: truncate(stderr, outputPolicy),
-          exitCode: exitCode === 0 ? 124 : exitCode,
+          exitCode: 124,
           usage: fallbackUsage,
+          diagnostics: openHandsBoundaryDiagnostics({
+            summary: `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind}`,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: false,
+            metadata: { processTimedOut: true },
+          }),
         };
       }
+      if (drainTimedOut) {
+        const summary = `OpenHands wrapper process streams did not close after execution for ${kind}`;
+        return {
+          ok: false,
+          summary,
+          stdout: truncate(filteredStdout, outputPolicy),
+          stderr: truncate(
+            appendOpenHandsFailureDetail(
+              stderr,
+              "The wrapper process stream-drain deadline fired; discarded any incomplete result and terminated the process tree.",
+            ),
+            outputPolicy,
+          ),
+          exitCode: 124,
+          usage: fallbackUsage,
+          diagnostics: openHandsBoundaryDiagnostics({
+            summary,
+            failureClass: "timeout",
+            exitCode: 124,
+            timeoutMs,
+            structuredResult: false,
+            metadata: { streamDrainTimedOut: true },
+          }),
+        };
+      }
+      if (sawStructuredResultSentinel) {
+        const summary = `OpenHands wrapper returned a malformed structured result for ${kind}`;
+        const malformedDetail =
+          "Malformed structured result: sentinel payload was not a JSON object or could not be parsed.";
+        const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+        return {
+          ok: false,
+          summary,
+          stdout: truncate(filteredStdout, outputPolicy),
+          stderr: truncate(appendOpenHandsFailureDetail(stderr, malformedDetail), outputPolicy),
+          exitCode: malformedExitCode,
+          usage: fallbackUsage,
+          diagnostics: openHandsBoundaryDiagnostics({
+            summary,
+            failureClass: "malformed_structured_result",
+            exitCode: malformedExitCode,
+            timeoutMs,
+            structuredResult: true,
+            metadata: { schemaValidationError: malformedDetail },
+          }),
+        };
+      }
+      const summary = `OpenHands wrapper did not return a structured result for ${kind}`;
+      const missingExitCode = exitCode === 0 ? 1 : exitCode;
       return {
         ok: false,
-        summary: `OpenHands wrapper did not return a structured result for ${kind}`,
+        summary,
         stdout: truncate(filteredStdout, outputPolicy),
         stderr: truncate(stderr, outputPolicy),
-        exitCode,
+        exitCode: missingExitCode,
         usage: fallbackUsage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary,
+          failureClass: "no_structured_result",
+          exitCode: missingExitCode,
+          timeoutMs,
+          structuredResult: false,
+        }),
       };
     }
 
@@ -562,11 +676,155 @@ export async function executeWithOpenHands(
       parsed.usage,
       estimateJobTokenUsage(runtimeConfig, params, summary, parsedStdout, parsedStderr),
     );
-    const parsedExitCode =
-      typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode)
-        ? parsed.exitCode
-        : exitCode;
-    const parsedOk = typeof parsed.ok === "boolean" ? parsed.ok : parsedExitCode === 0;
+    const envelope = validateStructuredJobResultEnvelope(parsed);
+
+    if (timedOut) {
+      const timeoutSummary = `OpenHands wrapper timed out after ${timedOutAfterMs}ms for ${kind} after returning a structured result.`;
+      return {
+        ok: false,
+        summary: timeoutSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(
+          appendOpenHandsFailureDetail(
+            parsedStderr,
+            "Discarded the structured result because the PushPals execution deadline fired.",
+          ),
+          outputPolicy,
+        ),
+        exitCode: 124,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: timeoutSummary,
+          failureClass: "timeout",
+          exitCode: 124,
+          timeoutMs,
+          structuredResult: true,
+          metadata: {
+            processTimedOut: true,
+            structuredResultSchemaValid: envelope.valid,
+            processStateOverrodeStructuredResult: true,
+          },
+        }),
+      };
+    }
+
+    if (drainTimedOut) {
+      const drainSummary = `OpenHands wrapper process streams did not close after returning a structured result for ${kind}`;
+      return {
+        ok: false,
+        summary: drainSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(
+          appendOpenHandsFailureDetail(
+            parsedStderr,
+            "Discarded the structured result because the process stream-drain deadline fired and the process tree was terminated.",
+          ),
+          outputPolicy,
+        ),
+        exitCode: 124,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: drainSummary,
+          failureClass: "timeout",
+          exitCode: 124,
+          timeoutMs,
+          structuredResult: true,
+          metadata: {
+            streamDrainTimedOut: true,
+            structuredResultSchemaValid: envelope.valid,
+            processStateOverrodeStructuredResult: true,
+          },
+        }),
+      };
+    }
+
+    if (!envelope.valid) {
+      const malformedSummary = `OpenHands wrapper returned a malformed structured result for ${kind}`;
+      const malformedExitCode = exitCode === 0 ? 1 : exitCode;
+      return {
+        ok: false,
+        summary: malformedSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(
+          appendOpenHandsFailureDetail(
+            parsedStderr,
+            `Malformed structured result: ${envelope.detail}.`,
+          ),
+          outputPolicy,
+        ),
+        exitCode: malformedExitCode,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: malformedSummary,
+          failureClass: "malformed_structured_result",
+          exitCode: malformedExitCode,
+          timeoutMs,
+          structuredResult: true,
+          metadata: { schemaValidationError: envelope.detail },
+        }),
+      };
+    }
+
+    const parsedExitCode = envelope.exitCode ?? exitCode;
+    const parsedOk = envelope.ok;
+    if (exitCode !== 0) {
+      const processSummary = parsedOk
+        ? `OpenHands wrapper process exited ${exitCode} after returning a structured success result for ${kind}`
+        : summary;
+      return {
+        ok: false,
+        summary: processSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(
+          parsedOk
+            ? appendOpenHandsFailureDetail(
+                parsedStderr,
+                `Discarded the structured ok=true result because the wrapper process exited with code ${exitCode}.`,
+              )
+            : parsedStderr,
+          outputPolicy,
+        ),
+        exitCode,
+        usage,
+        ...(parsedOk
+          ? {
+              diagnostics: openHandsBoundaryDiagnostics({
+                summary: processSummary,
+                failureClass: "nonzero_exit",
+                exitCode,
+                timeoutMs,
+                structuredResult: true,
+                metadata: { processStateOverrodeStructuredResult: true },
+              }),
+            }
+          : {}),
+      };
+    }
+    if (parsedOk && parsedExitCode !== 0) {
+      const structuredExitSummary = `OpenHands wrapper returned exit ${parsedExitCode} with a structured success result for ${kind}`;
+      return {
+        ok: false,
+        summary: structuredExitSummary,
+        stdout: truncate(parsedStdout, outputPolicy),
+        stderr: truncate(
+          appendOpenHandsFailureDetail(
+            parsedStderr,
+            `Discarded the structured ok=true result because its exitCode was ${parsedExitCode}.`,
+          ),
+          outputPolicy,
+        ),
+        exitCode: parsedExitCode,
+        usage,
+        diagnostics: openHandsBoundaryDiagnostics({
+          summary: structuredExitSummary,
+          failureClass: "nonzero_exit",
+          exitCode: parsedExitCode,
+          timeoutMs,
+          structuredResult: true,
+          metadata: { processStateOverrodeStructuredResult: true },
+        }),
+      };
+    }
     const noChangeResult =
       parsedOk &&
       (hasOpenHandsNoChangeSignal(summary) ||

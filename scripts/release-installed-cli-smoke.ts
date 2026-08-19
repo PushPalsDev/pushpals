@@ -1,6 +1,17 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync } from "fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { basename, delimiter, join, resolve } from "path";
 
@@ -12,6 +23,8 @@ type SmokeOptions = {
   useRepoDataDir: boolean;
   keepTemp: boolean;
   workerpalAutospawn: boolean;
+  runtimeBinDir: string | null;
+  runtimeTag: string | null;
 };
 
 type CommandResult = {
@@ -30,6 +43,88 @@ const OUTPUT_DRAIN_TIMEOUT_MS = 2_000;
 const OUTPUT_MAX_CHARS = 512_000;
 const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
 const TEMP_CLEANUP_TIMEOUT_MS = 15_000;
+const RUNTIME_SERVICE_TOKENS = [
+  "server",
+  "localbuddy",
+  "remotebuddy",
+  "workerpals",
+  "source-control-manager",
+] as const;
+
+export function runtimeCandidateBinaryNames(platformKey: string): string[] {
+  if (!/^(?:linux|windows|macos)-(?:x64|arm64)$/.test(platformKey)) {
+    throw new Error(`Unsupported candidate runtime platform: ${platformKey}`);
+  }
+  const extension = platformKey.startsWith("windows-") ? ".exe" : "";
+  return RUNTIME_SERVICE_TOKENS.map(
+    (service) => `pushpals-runtime-${service}-${platformKey}${extension}`,
+  );
+}
+
+export function currentRuntimePlatformKey(
+  platform = process.platform,
+  architecture = process.arch,
+): string {
+  const family = platform === "win32" ? "windows" : platform === "darwin" ? "macos" : platform;
+  const platformKey = `${family}-${architecture}`;
+  runtimeCandidateBinaryNames(platformKey);
+  return platformKey;
+}
+
+export function seedCandidateRuntimeBinaries(input: {
+  runtimeRoot: string;
+  runtimeBinDir: string;
+  runtimeTag: string;
+  platformKey?: string;
+}): { binDir: string; binaryNames: string[]; tagMarkerPath: string } {
+  const runtimeTag = String(input.runtimeTag ?? "").trim();
+  if (!/^v\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?$/.test(runtimeTag)) {
+    throw new Error(`Invalid candidate runtime tag: ${runtimeTag || "(empty)"}`);
+  }
+  const platformKey = input.platformKey ?? currentRuntimePlatformKey();
+  const binaryNames = runtimeCandidateBinaryNames(platformKey);
+  const sourceDir = resolve(input.runtimeBinDir);
+  const binDir = join(resolve(input.runtimeRoot), "bin", platformKey);
+  const tagMarkerPath = join(binDir, ".runtime-tag");
+  mkdirSync(binDir, { recursive: true });
+
+  // A marker is authoritative only after every candidate binary is validated and copied.
+  rmSync(tagMarkerPath, { force: true });
+  const invalidSources = binaryNames.filter((name) => {
+    const source = join(sourceDir, name);
+    try {
+      const stat = statSync(source);
+      return !stat.isFile() || stat.size <= 0;
+    } catch {
+      return true;
+    }
+  });
+  if (invalidSources.length > 0) {
+    throw new Error(
+      `Candidate runtime artifact is missing required non-empty file(s): ${invalidSources.join(", ")}`,
+    );
+  }
+
+  for (const name of binaryNames) {
+    const destination = join(binDir, name);
+    copyFileSync(join(sourceDir, name), destination);
+    if (!platformKey.startsWith("windows-") && process.platform !== "win32") {
+      chmodSync(destination, 0o755);
+    }
+  }
+
+  const pendingMarker = join(
+    binDir,
+    `.runtime-tag.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  try {
+    writeFileSync(pendingMarker, `${runtimeTag}\n`, "utf8");
+    renameSync(pendingMarker, tagMarkerPath);
+  } finally {
+    rmSync(pendingMarker, { force: true });
+  }
+  return { binDir, binaryNames, tagMarkerPath };
+}
 
 function parseArgs(argv: string[]): SmokeOptions {
   let packageSpec = "";
@@ -39,6 +134,8 @@ function parseArgs(argv: string[]): SmokeOptions {
   let useRepoDataDir = false;
   let keepTemp = false;
   let workerpalAutospawn = false;
+  let runtimeBinDir: string | null = null;
+  let runtimeTag: string | null = null;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -67,6 +164,12 @@ function parseArgs(argv: string[]): SmokeOptions {
       case "--workerpal-autospawn":
         workerpalAutospawn = true;
         break;
+      case "--runtime-bin-dir":
+        runtimeBinDir = String(argv[++index] ?? "").trim() || null;
+        break;
+      case "--runtime-tag":
+        runtimeTag = String(argv[++index] ?? "").trim() || null;
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }
@@ -74,6 +177,9 @@ function parseArgs(argv: string[]): SmokeOptions {
 
   if (!packageSpec) {
     throw new Error("--package-spec is required");
+  }
+  if (Boolean(runtimeBinDir) !== Boolean(runtimeTag)) {
+    throw new Error("--runtime-bin-dir and --runtime-tag must be provided together");
   }
 
   return {
@@ -84,6 +190,8 @@ function parseArgs(argv: string[]): SmokeOptions {
     useRepoDataDir,
     keepTemp,
     workerpalAutospawn,
+    runtimeBinDir: runtimeBinDir ? resolve(runtimeBinDir) : null,
+    runtimeTag,
   };
 }
 
@@ -528,6 +636,17 @@ async function main(): Promise<void> {
     );
     assertCommandSucceeded(clearResult, "pushpals --clear");
 
+    if (options.runtimeBinDir && options.runtimeTag) {
+      const seeded = seedCandidateRuntimeBinaries({
+        runtimeRoot,
+        runtimeBinDir: options.runtimeBinDir,
+        runtimeTag: options.runtimeTag,
+      });
+      console.log(
+        `[installed-cli-smoke] Seeded ${seeded.binaryNames.length} candidate runtime binaries for ${options.runtimeTag} in ${seeded.binDir}.`,
+      );
+    }
+
     const statusResult = await runWithTimeout(
       [pushpalsPath, "--status-once", "--runtime-root", runtimeRoot],
       repoPath,
@@ -538,6 +657,26 @@ async function main(): Promise<void> {
 
     const combined = `${statusResult.stdout}\n${statusResult.stderr}`;
     assertNoStartupFailure(combined);
+    if (options.runtimeTag) {
+      if (!combined.includes(`[pushpals] runtimeTag=${options.runtimeTag}`)) {
+        throw new Error(
+          `Installed CLI did not select candidate runtime ${options.runtimeTag}.\n${summarizeTail(combined)}`,
+        );
+      }
+      if (!combined.includes("[pushpals] Embedded runtime binaries are already present.")) {
+        throw new Error(
+          `Installed CLI did not reuse the seeded candidate runtime binaries.\n${summarizeTail(combined)}`,
+        );
+      }
+      if (
+        combined.includes("Downloading embedded runtime binary") ||
+        combined.includes("runtime binary asset(s) with bounded parallelism")
+      ) {
+        throw new Error(
+          `Installed CLI attempted a GitHub runtime download during candidate validation.\n${summarizeTail(combined)}`,
+        );
+      }
+    }
     if (!combined.includes("[pushpals] startup timing summary: outcome=ready")) {
       throw new Error(`Missing startup readiness summary.\n${summarizeTail(combined)}`);
     }
@@ -579,4 +718,6 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+if (import.meta.main) {
+  await main();
+}

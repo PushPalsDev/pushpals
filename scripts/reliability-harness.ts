@@ -36,6 +36,8 @@ const phases: HarnessPhase[] = [
     files: [
       "tests/server.autonomy-store.test.ts",
       "tests/server.lifecycle-reconciliation.test.ts",
+      "tests/server.job-diagnostics.test.ts",
+      "tests/server.jobs.stale-recovery.test.ts",
       "tests/server.requests-queue.test.ts",
       "tests/server.session-message-route.test.ts",
       "tests/remotebuddy.task-dedupe.test.ts",
@@ -65,6 +67,7 @@ const phases: HarnessPhase[] = [
       "tests/workerpals.docker-executor.test.ts",
       "tests/workerpals.worktree-boundary.test.ts",
       "tests/workerpals.http-deadline.test.ts",
+      "tests/workerpals.server-transport.test.ts",
       "tests/bounded-line-buffer.test.ts",
       "tests/shared.bounded-fetch.test.ts",
       "tests/shared.bounded-process.test.ts",

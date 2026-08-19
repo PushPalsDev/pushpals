@@ -14,6 +14,7 @@ import {
   resolveGenericPythonExecutorTimeoutMs,
   resolveOpenAICodexValidationReserveMs,
 } from "../apps/workerpals/src/common/generic_python_executor";
+import { inferWorkerTerminalFailureClass } from "../apps/workerpals/src/workerpals_main";
 
 describe("python payload transport", () => {
   test("keeps large executor payloads out of process argv", () => {
@@ -143,6 +144,352 @@ describe("generic python executor timeout resolution", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("rejects a structured ok result when the wrapper process timed out", async () => {
+    const resultPrefix = "__PUSHPALS_TIMEOUT_RESULT__ ";
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const execute = createGenericPythonExecutor({
+      backendName: "test",
+      scriptPath: process.execPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      processRunner: (async () => ({
+        stdout: `${resultPrefix}${JSON.stringify({
+          ok: true,
+          summary: "wrapper claimed success before hanging",
+          exitCode: 0,
+        })}\n`,
+        stderr: "",
+        exitCode: 143,
+        timedOut: true,
+      })) as never,
+    });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+        executorResultPrefix: resultPrefix,
+      },
+    } as never;
+
+    const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(124);
+    expect(result.summary).toContain("wrapper timed out after 10000ms");
+    expect(result.stderr).toContain("exceeded the PushPals execution deadline");
+  });
+
+  test("rejects a structured ok result when the wrapper process exits nonzero", async () => {
+    const resultPrefix = "__PUSHPALS_NONZERO_RESULT__ ";
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const execute = createGenericPythonExecutor({
+      backendName: "test",
+      scriptPath: process.execPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      processRunner: (async () => ({
+        stdout: `${resultPrefix}${JSON.stringify({
+          ok: true,
+          summary: "wrapper claimed success before crashing",
+          exitCode: 0,
+        })}\n`,
+        stderr: "native wrapper failure",
+        exitCode: 3,
+        timedOut: false,
+      })) as never,
+    });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+        executorResultPrefix: resultPrefix,
+      },
+    } as never;
+
+    const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(3);
+    expect(result.summary).toContain("process exited 3");
+    expect(result.stderr).toContain("Discarded the structured ok=true result");
+  });
+
+  test("rejects a structured result when process stream draining times out", async () => {
+    const resultPrefix = "__PUSHPALS_DRAIN_RESULT__ ";
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const execute = createGenericPythonExecutor({
+      backendName: "test",
+      scriptPath: process.execPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      processRunner: (async () => ({
+        stdout: `${resultPrefix}${JSON.stringify({
+          ok: true,
+          summary: "wrapper claimed success before leaving inherited pipes open",
+          exitCode: 0,
+        })}\n`,
+        stderr: "",
+        exitCode: 0,
+        timedOut: false,
+        drainTimedOut: true,
+      })) as never,
+    });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+        executorResultPrefix: resultPrefix,
+      },
+    } as never;
+
+    const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(124);
+    expect(result.summary).toContain("streams did not close");
+    expect(result.diagnostics?.terminal?.metadata).toMatchObject({
+      streamDrainTimedOut: true,
+      processStateOverrodeStructuredResult: true,
+    });
+    expect(inferWorkerTerminalFailureClass(result)).toBe("timeout");
+  });
+
+  test("requires a strict structured-result boundary schema", async () => {
+    const resultPrefix = "__PUSHPALS_SCHEMA_RESULT__ ";
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+        executorResultPrefix: resultPrefix,
+      },
+    } as never;
+    const malformedPayloads: unknown[] = [
+      { summary: "missing ok", exitCode: 0 },
+      { ok: "false", summary: "string ok", exitCode: 0 },
+      { ok: true, summary: "string exit", exitCode: "3" },
+      { ok: true, summary: "fractional exit", exitCode: 0.5 },
+      [],
+    ];
+
+    for (const payload of malformedPayloads) {
+      const execute = createGenericPythonExecutor({
+        backendName: "test",
+        scriptPath: process.execPath,
+        pythonConfigKey: "testPython",
+        timeoutConfigKey: "testTimeoutMs",
+        processRunner: (async () => ({
+          stdout: `${resultPrefix}${JSON.stringify(payload)}\n`,
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          drainTimedOut: false,
+        })) as never,
+      });
+
+      const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(1);
+      expect(result.summary).toContain("malformed structured result");
+      expect(result.diagnostics?.terminal?.failureClass).toBe("malformed_structured_result");
+      expect(inferWorkerTerminalFailureClass(result)).toBe("malformed_structured_result");
+    }
+  });
+
+  test("treats only the newest structured-result sentinel as authoritative", async () => {
+    const resultPrefix = "__PUSHPALS_NEWEST_RESULT__ ";
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+        executorResultPrefix: resultPrefix,
+      },
+    } as never;
+
+    for (const newestSentinel of [`${resultPrefix}{this-is-not-json`, resultPrefix.trimEnd()]) {
+      const execute = createGenericPythonExecutor({
+        backendName: "test",
+        scriptPath: process.execPath,
+        pythonConfigKey: "testPython",
+        timeoutConfigKey: "testTimeoutMs",
+        processRunner: (async () => ({
+          stdout: [
+            `${resultPrefix}${JSON.stringify({ ok: true, summary: "stale success", exitCode: 0 })}`,
+            newestSentinel,
+          ].join("\n"),
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          drainTimedOut: false,
+        })) as never,
+      });
+
+      const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+      expect(result.ok).toBe(false);
+      expect(result.summary).toContain("malformed structured result");
+      expect(result.diagnostics?.terminal?.failureClass).toBe("malformed_structured_result");
+    }
+  });
+
+  test("preserves valid explicit failure and exit-code-omitted success", async () => {
+    const resultPrefix = "__PUSHPALS_VALID_SCHEMA_RESULT__ ";
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+        executorResultPrefix: resultPrefix,
+      },
+    } as never;
+    const run = async (payload: Record<string, unknown>) => {
+      const execute = createGenericPythonExecutor({
+        backendName: "test",
+        scriptPath: process.execPath,
+        pythonConfigKey: "testPython",
+        timeoutConfigKey: "testTimeoutMs",
+        processRunner: (async () => ({
+          stdout: `${resultPrefix}${JSON.stringify(payload)}\n`,
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          drainTimedOut: false,
+        })) as never,
+      });
+      return execute("task.execute", {}, process.cwd(), runtimeConfig);
+    };
+
+    const failure = await run({ ok: false, summary: "valid failure", exitCode: 0 });
+    const success = await run({ ok: true, summary: "valid success" });
+
+    expect(failure).toMatchObject({ ok: false, summary: "valid failure", exitCode: 0 });
+    expect(success).toMatchObject({ ok: true, summary: "valid success", exitCode: 0 });
+  });
+
+  test("preserves WorkerPal ownership and stack for caught internal executor exceptions", async () => {
+    const internalError = new ReferenceError("internal executor state was unavailable");
+    internalError.stack = [
+      "ReferenceError: internal executor state was unavailable",
+      "    at execute (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)",
+    ].join("\n");
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const execute = createGenericPythonExecutor({
+      backendName: "test",
+      scriptPath: process.execPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      processRunner: (async () => {
+        throw internalError;
+      }) as never,
+    });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+      },
+    } as never;
+
+    const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+    expect(result).toMatchObject({
+      ok: false,
+      exitCode: 1,
+      diagnostics: {
+        terminal: {
+          failureClass: "worker_runtime_failure",
+          terminalStage: "worker_runtime",
+          executorBackend: "test",
+        },
+      },
+    });
+    expect(result.stderr).toContain("generic_python_executor.ts:412:13");
+    expect(inferWorkerTerminalFailureClass(result)).toBe("worker_runtime_failure");
+  });
+
+  test("recognizes packaged and Windows WorkerPal stack ownership", async () => {
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+      },
+    } as never;
+    const ownedFrames = [
+      "    at execute (C:\\workspace\\apps\\workerpals\\src\\common\\generic_python_executor.ts:412:13)",
+      "    at execute (C:\\Users\\tester\\.pushpals\\runtime\\sandbox\\.pushpals-workerpals-runtime.js:120:8)",
+    ];
+
+    for (const frame of ownedFrames) {
+      const internalError = new ReferenceError("owned runtime failure");
+      internalError.stack = ["ReferenceError: owned runtime failure", frame].join("\n");
+      const execute = createGenericPythonExecutor({
+        backendName: "test",
+        scriptPath: process.execPath,
+        pythonConfigKey: "testPython",
+        timeoutConfigKey: "testTimeoutMs",
+        processRunner: (async () => {
+          throw internalError;
+        }) as never,
+      });
+
+      const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+      expect(result.diagnostics?.terminal?.failureClass).toBe("worker_runtime_failure");
+      expect(result.stderr).toContain(frame.trim());
+    }
+  });
+
+  test("does not claim errors whose first stack frame belongs to external code", async () => {
+    const externalError = new TypeError("external runner failed");
+    externalError.stack = [
+      "TypeError: external runner failed",
+      "    at run (C:\\workspace\\node_modules\\external-runner\\index.js:12:4)",
+      "    at execute (C:\\workspace\\apps\\workerpals\\src\\common\\generic_python_executor.ts:412:13)",
+    ].join("\n");
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const execute = createGenericPythonExecutor({
+      backendName: "test",
+      scriptPath: process.execPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      processRunner: (async () => {
+        throw externalError;
+      }) as never,
+    });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+      },
+    } as never;
+
+    const result = await execute("task.execute", {}, process.cwd(), runtimeConfig);
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("wrapper execution error");
+    expect(result.diagnostics?.terminal?.failureClass).not.toBe("worker_runtime_failure");
   });
 
   test("caps normal backends to the job execution budget", () => {

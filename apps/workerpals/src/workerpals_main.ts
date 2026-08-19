@@ -130,6 +130,19 @@ function compactWorkerError(error: unknown, maxLength = 220): string {
   return `${normalized.slice(0, maxLength - 3)}...`;
 }
 
+export function resolveWorkerRuntimeGeneration(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string {
+  return String(
+    env.PUSHPALS_WORKER_RUNTIME_GENERATION ??
+      env.PUSHPALS_RUNTIME_TAG ??
+      env.PUSHPALS_CLI_PACKAGE_VERSION ??
+      "",
+  )
+    .trim()
+    .slice(0, 200);
+}
+
 export async function postJsonWithTimeout(
   url: string,
   headers: Record<string, string>,
@@ -494,10 +507,35 @@ export function mergeWorkerDiagnostics(
   const baseTerminalStage = String(base?.terminal?.terminalStage ?? "")
     .trim()
     .toLowerCase();
-  const trustedBaseTerminalStage =
-    baseTerminalStage === "worker_runtime" || baseTerminalStage === "docker"
-      ? baseTerminalStage
-      : null;
+  const baseClassificationOwner = String(base?.terminal?.metadata?.classificationOwner ?? "")
+    .trim()
+    .toLowerCase();
+  const trustedExecutorBoundary =
+    baseTerminalStage === "executor" &&
+    (baseClassificationOwner === "generic_python_executor" ||
+      baseClassificationOwner === "openhands_task_execute");
+  const trustedBaseTerminalIdentity =
+    baseTerminalStage === "worker_runtime" ||
+    baseTerminalStage === "docker" ||
+    trustedExecutorBoundary;
+  const trustedTerminalFields = trustedBaseTerminalIdentity
+    ? {
+        ...(base?.terminal?.failureClass != null
+          ? { failureClass: base.terminal.failureClass }
+          : {}),
+        ...(base?.terminal?.terminalStage != null
+          ? { terminalStage: base.terminal.terminalStage }
+          : {}),
+        ...(base?.terminal?.executorBackend != null
+          ? { executorBackend: base.terminal.executorBackend }
+          : {}),
+        ...(base?.terminal?.summary != null ? { summary: base.terminal.summary } : {}),
+        ...(base?.terminal?.watchdogFired != null
+          ? { watchdogFired: base.terminal.watchdogFired }
+          : {}),
+        ...(base?.terminal?.timeoutMs != null ? { timeoutMs: base.terminal.timeoutMs } : {}),
+      }
+    : {};
   return {
     ...(base ?? {}),
     ...extra,
@@ -510,11 +548,16 @@ export function mergeWorkerDiagnostics(
         ? {
             ...(base?.terminal ?? {}),
             ...(extra.terminal ?? {}),
-            ...(trustedBaseTerminalStage ? { terminalStage: trustedBaseTerminalStage } : {}),
-            metadata: {
-              ...(base?.terminal?.metadata ?? {}),
-              ...(extra.terminal?.metadata ?? {}),
-            },
+            ...trustedTerminalFields,
+            metadata: trustedBaseTerminalIdentity
+              ? {
+                  ...(extra.terminal?.metadata ?? {}),
+                  ...(base?.terminal?.metadata ?? {}),
+                }
+              : {
+                  ...(base?.terminal?.metadata ?? {}),
+                  ...(extra.terminal?.metadata ?? {}),
+                },
           }
         : undefined,
     metadata: {
@@ -532,7 +575,7 @@ function isCodexStartupStallResult(result: JobResult): boolean {
 
 function isWorkerRuntimeFailure(text: string): boolean {
   const exception =
-    /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/.exec(
+    /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/i.exec(
       text,
     );
   if (!exception) return false;
@@ -541,6 +584,48 @@ function isWorkerRuntimeFailure(text: string): boolean {
     .split(/\r?\n/)
     .find((line) => /^\s*at\b/.test(line));
   return isWorkerOwnedRuntimeStackFrame(firstFrame);
+}
+
+export function buildUnhandledWorkerFailureResult(
+  error: unknown,
+  executorBackend = resolveExecutor(CONFIG),
+): WorkerJobResult {
+  const detail = redactSensitiveText(
+    error instanceof Error ? error.stack || error.message : String(error),
+  );
+  const errorSummary = compactWorkerError(error);
+  const dockerFailure = error instanceof DockerExecutionExhaustedError;
+  const workerRuntimeFailure = !dockerFailure && isWorkerRuntimeFailure(detail);
+  const failureClass = workerRuntimeFailure
+    ? "worker_runtime_failure"
+    : dockerFailure
+      ? "docker_engine"
+      : "worker_failure";
+  const terminalStage = workerRuntimeFailure
+    ? "worker_runtime"
+    : dockerFailure
+      ? "docker"
+      : "worker";
+  const summary = `Job execution failed before completion: ${errorSummary}`;
+  return {
+    ok: false,
+    summary,
+    stderr: detail,
+    diagnostics: {
+      terminal: {
+        failureClass,
+        terminalStage,
+        executorBackend,
+        summary,
+        watchdogFired: false,
+        metadata: {
+          classificationOwner: "workerpals_main",
+          structuredResult: false,
+          errorName: error instanceof Error ? error.name : typeof error,
+        },
+      },
+    },
+  };
 }
 
 function hasExplicitNoPublishableResult(text: string): boolean {
@@ -566,12 +651,24 @@ export function inferWorkerTerminalFailureClass(result: JobResult): string {
   }
   if (
     structuredFailureClass &&
-    structuredTerminal?.terminalStage === "docker" &&
-    structuredTerminal.metadata?.structuredResult === false
+    structuredTerminal?.terminalStage === "executor" &&
+    (structuredTerminal.metadata?.classificationOwner === "generic_python_executor" ||
+      structuredTerminal.metadata?.classificationOwner === "openhands_task_execute")
   ) {
-    // DockerExecutor owns classification when a child dies before returning a
-    // sentinel. Preserve that structured boundary evidence instead of parsing
-    // incidental dependency paths or task narration a second time.
+    // Host executors create these markers after validating the external
+    // wrapper boundary. Never trust an executor stage supplied by wrapper JSON.
+    return structuredFailureClass;
+  }
+  if (
+    structuredFailureClass &&
+    structuredTerminal?.terminalStage === "docker" &&
+    (structuredTerminal.metadata?.structuredResult === false ||
+      structuredTerminal.metadata?.processStateOverrodeStructuredResult === true ||
+      structuredTerminal.metadata?.structuredResultSchemaValid === false)
+  ) {
+    // DockerExecutor owns these markers after observing host process state or
+    // validating the sentinel schema. Preserve that boundary evidence instead
+    // of parsing incidental dependency paths or task narration a second time.
     return structuredFailureClass;
   }
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
@@ -1717,6 +1814,7 @@ async function workerLoop(
   requestWorkerRestart: (reason: string) => void,
 ): Promise<void> {
   const headers = buildWorkerHeaders(opts.authToken);
+  const runtimeGeneration = resolveWorkerRuntimeGeneration();
 
   console.log(`[WorkerPals ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
   if (dockerExecutor) {
@@ -1727,6 +1825,9 @@ async function workerLoop(
     console.log(`[WorkerPals ${opts.workerId}] Direct mode with isolated worktrees enabled`);
   }
   console.log(`[WorkerPals ${opts.workerId}] Executor backend: ${resolveExecutor(CONFIG)}`);
+  console.log(
+    `[WorkerPals ${opts.workerId}] Runtime generation: ${runtimeGeneration || "server-assigned"}`,
+  );
   const heartbeatEveryMs = Math.max(1000, opts.heartbeatMs);
   const claimTimeoutMs = Math.max(4_000, Math.min(15_000, opts.pollMs * 3));
   let lastHeartbeatAt = 0;
@@ -1747,6 +1848,7 @@ async function workerLoop(
       baseRef: opts.worktreeBaseRef,
       dockerImage: opts.docker ? opts.dockerImage : null,
       dockerNetworkMode: opts.docker ? opts.dockerNetworkMode : null,
+      runtimeGeneration: runtimeGeneration || null,
     },
   });
 
@@ -1769,7 +1871,10 @@ async function workerLoop(
       const claimRes = await postJsonWithTimeout(
         `${opts.server}/jobs/claim`,
         headers,
-        { workerId: opts.workerId },
+        {
+          workerId: opts.workerId,
+          ...(runtimeGeneration ? { runtimeGeneration } : {}),
+        },
         claimTimeoutMs,
       );
 
@@ -1946,6 +2051,7 @@ async function workerLoop(
                   seq,
                   message: cleaned,
                   ts: logTs,
+                  claimGeneration: Number(job.claimGeneration ?? 0),
                 });
                 return true;
               }
@@ -2036,11 +2142,8 @@ async function workerLoop(
                   Number.isFinite(err.cooldownMs) ? err.cooldownMs : 0,
                 );
               }
-              const errorSummary = compactWorkerError(err);
               result = {
-                ok: false,
-                summary: `Job execution failed before completion: ${errorSummary}`,
-                stderr: String(err),
+                ...buildUnhandledWorkerFailureResult(err),
                 ...(cooldownAfterJobMs > 0 ? { cooldownMs: cooldownAfterJobMs } : {}),
               };
             }
@@ -2633,6 +2736,7 @@ async function main(): Promise<void> {
     pollMs: opts.pollMs,
     heartbeatMs: opts.heartbeatMs,
     staleClaimTtlMs: CONFIG.server.staleClaimTtlMs,
+    runtimeGeneration: resolveWorkerRuntimeGeneration(),
   });
   let shutdownTriggered = false;
   const shutdownAndExit = (signalName: string, code: number) => {
