@@ -8,6 +8,7 @@ export type ToolFailureClass =
   | "permission"
   | "policy_denied"
   | "timeout"
+  | "worker_runtime_failure"
   | "nonzero_exit"
   | "repo_state"
   | "sandbox_mount"
@@ -87,13 +88,48 @@ const KNOWN_TOOL_NAMES = new Set([
 export const DEFAULT_TOOL_REGISTRY: ToolRegistry = {
   fallbackKind: "discovered",
   adapters: [
-    { tool: "git", kind: "known", executableHints: ["git"], defaultEffects: ["read", "write", "git"] },
-    { tool: "codex", kind: "known", executableHints: ["codex", "bunx @openai/codex"], defaultEffects: ["read", "write", "network", "process"] },
-    { tool: "bun", kind: "known", executableHints: ["bun"], defaultEffects: ["read", "write", "process"] },
-    { tool: "docker", kind: "known", executableHints: ["docker"], defaultEffects: ["read", "write", "network", "process"] },
-    { tool: "gh", kind: "known", executableHints: ["gh"], defaultEffects: ["read", "write", "network"] },
-    { tool: "node", kind: "known", executableHints: ["node"], defaultEffects: ["read", "write", "process"] },
-    { tool: "shell", kind: "shell", executableHints: ["sh", "bash", "cmd", "powershell"], defaultEffects: ["read", "write", "process"] },
+    {
+      tool: "git",
+      kind: "known",
+      executableHints: ["git"],
+      defaultEffects: ["read", "write", "git"],
+    },
+    {
+      tool: "codex",
+      kind: "known",
+      executableHints: ["codex", "bunx @openai/codex"],
+      defaultEffects: ["read", "write", "network", "process"],
+    },
+    {
+      tool: "bun",
+      kind: "known",
+      executableHints: ["bun"],
+      defaultEffects: ["read", "write", "process"],
+    },
+    {
+      tool: "docker",
+      kind: "known",
+      executableHints: ["docker"],
+      defaultEffects: ["read", "write", "network", "process"],
+    },
+    {
+      tool: "gh",
+      kind: "known",
+      executableHints: ["gh"],
+      defaultEffects: ["read", "write", "network"],
+    },
+    {
+      tool: "node",
+      kind: "known",
+      executableHints: ["node"],
+      defaultEffects: ["read", "write", "process"],
+    },
+    {
+      tool: "shell",
+      kind: "shell",
+      executableHints: ["sh", "bash", "cmd", "powershell"],
+      defaultEffects: ["read", "write", "process"],
+    },
   ],
 };
 
@@ -121,7 +157,10 @@ export function redactToolText(value: unknown): string {
   const text = cleanText(value);
   if (!text) return "";
   return text
-    .replace(/\b(OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|PUSHPALS_AUTH_TOKEN)=([^\s]+)/gi, "$1=[redacted]")
+    .replace(
+      /\b(OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|PUSHPALS_AUTH_TOKEN)=([^\s]+)/gi,
+      "$1=[redacted]",
+    )
     .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}/gi, "$1[redacted]")
     .replace(/\b(ghp|github_pat)_[A-Za-z0-9_]{20,}/g, "[redacted-github-token]")
     .replace(/\bsk-[A-Za-z0-9_-]{20,}/g, "[redacted-openai-key]");
@@ -134,7 +173,13 @@ export function normalizeToolName(tool: unknown): string {
   const name = basename(raw).replace(/\.(exe|cmd|bat|ps1)$/i, "");
   if (name === "bunx") return "bun";
   if (name === "python3") return "python";
-  if (name === "pwsh" || name === "powershell" || name === "bash" || name === "sh" || name === "cmd") {
+  if (
+    name === "pwsh" ||
+    name === "powershell" ||
+    name === "bash" ||
+    name === "sh" ||
+    name === "cmd"
+  ) {
     return "shell";
   }
   return name || "shell";
@@ -205,18 +250,81 @@ function combinedFailureText(input: ToolFailureInput): string {
 
 function hasNodeEnvRuntimeFailure(text: string): boolean {
   return (
-    /env:\s*[`'"\u2018\u2019\u201c\u201d]?node[`'"\u2018\u2019\u201c\u201d]?:?\s+no such file or directory/i.test(text) ||
+    /env:\s*[`'"\u2018\u2019\u201c\u201d]?node[`'"\u2018\u2019\u201c\u201d]?:?\s+no such file or directory/i.test(
+      text,
+    ) ||
     /\bnode:\s+not found\b/i.test(text) ||
     /\bnode\.exe.*not found\b/i.test(text)
   );
+}
+
+function hasObservedTimeoutFailure(input: ToolFailureInput, text: string): boolean {
+  if (input.timedOut || input.exitCode === 124) return true;
+  return (
+    /(?:^|[\r\n])\s*(?:error:\s*)?(?:command|job|process|request|operation|executor|wrapper|script|test|validation|build|fetch)\s+(?:(?:was|has been)\s+)?timed out(?:\s+(?:after|while|waiting)\b|\s*[.!:]|$)/i.test(
+      text,
+    ) ||
+    /(?:^|[\r\n])\s*(?:error:\s*)?timed out(?:\s+after\b|\s*[.!:]|$)/i.test(text) ||
+    /\b(?:context )?deadline exceeded\b/i.test(text) ||
+    /\bETIMEDOUT\b/i.test(text) ||
+    /(?:^|[\r\n])\s*(?:error:\s*)?(?:(?:command|job|process|request|operation|executor|wrapper|script|test|validation|build|fetch)\s+)?timeout\s+(?:reached|expired|exceeded|after|while|waiting|occurred)\b/i.test(
+      text,
+    ) ||
+    /(?:^|[\r\n])\s*(?:error:\s*)?(?:job|command|process|request|operation|executor|wrapper)\s+timeout(?:\s+(?:reached|expired|after)\b|\s*[.!:]|$)/i.test(
+      text,
+    ) ||
+    /(?:^|[\r\n])\s*timeout\s*(?:[.!:]|$)/i.test(text)
+  );
+}
+
+export function isWorkerOwnedRuntimeStackFrame(frame: unknown): boolean {
+  const normalized = String(frame ?? "")
+    .replace(/\\/g, "/")
+    .toLowerCase();
+  return (
+    normalized.includes("/workspace/apps/workerpals/") ||
+    normalized.includes("/pushpals/apps/workerpals/") ||
+    normalized.includes("/packages/cli/runtime/sandbox/apps/workerpals/") ||
+    normalized.includes("/.pushpals/runtime/sandbox/apps/workerpals/") ||
+    normalized.includes("/.pushpals/runtime/sandbox/.pushpals-workerpals-runtime.js")
+  );
+}
+
+function hasWorkerRuntimeFailure(text: string): boolean {
+  const exception =
+    /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/i.exec(
+      text,
+    );
+  if (!exception) return false;
+  const firstFrame = text
+    .slice((exception.index ?? 0) + exception[0].length)
+    .split(/\r?\n/)
+    .find((line) => /^\s*at\b/i.test(line));
+  return isWorkerOwnedRuntimeStackFrame(firstFrame);
 }
 
 export function classifyToolFailure(input: ToolFailureInput): ToolFailureClassification {
   const tool = inferToolNameFromFailureText(input);
   const text = combinedFailureText(input);
   const lower = text.toLowerCase();
+  const terminalText = [input.summary, input.detail, input.stderr]
+    .map(cleanText)
+    .filter(Boolean)
+    .join("\n");
 
-  if (input.timedOut || lower.includes("timed out") || lower.includes("timeout")) {
+  if (hasWorkerRuntimeFailure(terminalText)) {
+    return {
+      failureClass: "worker_runtime_failure",
+      retryable: false,
+      remediation:
+        "The PushPals WorkerPal runtime failed internally. Use a fixed PushPals runtime before retrying this workload.",
+    };
+  }
+
+  // Timeout configuration, task wording, and earlier stdout are context, not
+  // terminal evidence. Only explicit process state/exit or terminal fields may
+  // make a failed tool run a timeout.
+  if (hasObservedTimeoutFailure(input, terminalText)) {
     return {
       failureClass: "timeout",
       retryable: true,
@@ -255,7 +363,8 @@ export function classifyToolFailure(input: ToolFailureInput): ToolFailureClassif
     return {
       failureClass: "missing_runtime",
       retryable: false,
-      remediation: "Start Docker Desktop/the Docker daemon, then retry the Docker-backed operation.",
+      remediation:
+        "Start Docker Desktop/the Docker daemon, then retry the Docker-backed operation.",
     };
   }
 
@@ -332,7 +441,8 @@ export function classifyToolFailure(input: ToolFailureInput): ToolFailureClassif
     return {
       failureClass: "repo_state",
       retryable: false,
-      remediation: "Resolve the repository state conflict before retrying the same publish/sync step.",
+      remediation:
+        "Resolve the repository state conflict before retrying the same publish/sync step.",
     };
   }
 
@@ -364,33 +474,36 @@ export function classifyToolFailure(input: ToolFailureInput): ToolFailureClassif
   };
 }
 
-export function createToolRunRecordFromFailure(input: ToolFailureInput & {
-  id: string;
-  jobId?: string | null;
-  workerId?: string | null;
-  sessionId?: string | null;
-  phase?: string | null;
-  kind?: ToolKind;
-  capability?: string | null;
-  envProfile?: string | null;
-  cwd?: string | null;
-  allowedEffects?: ToolEffect[];
-  durationMs?: number | null;
-  startedAt?: string | null;
-  finishedAt?: string | null;
-  metadata?: Record<string, unknown>;
-}): ToolRunRecord {
+export function createToolRunRecordFromFailure(
+  input: ToolFailureInput & {
+    id: string;
+    jobId?: string | null;
+    workerId?: string | null;
+    sessionId?: string | null;
+    phase?: string | null;
+    kind?: ToolKind;
+    capability?: string | null;
+    envProfile?: string | null;
+    cwd?: string | null;
+    allowedEffects?: ToolEffect[];
+    durationMs?: number | null;
+    startedAt?: string | null;
+    finishedAt?: string | null;
+    metadata?: Record<string, unknown>;
+  },
+): ToolRunRecord {
   const finishedAt = cleanText(input.finishedAt) || new Date().toISOString();
   const durationMs =
-    typeof input.durationMs === "number" && Number.isFinite(input.durationMs) && input.durationMs >= 0
+    typeof input.durationMs === "number" &&
+    Number.isFinite(input.durationMs) &&
+    input.durationMs >= 0
       ? Math.round(input.durationMs)
       : 0;
   const finishedMs = Date.parse(finishedAt);
   const fallbackStartedAt = Number.isFinite(finishedMs)
     ? new Date(Math.max(0, finishedMs - durationMs)).toISOString()
     : new Date().toISOString();
-  const startedAt =
-    cleanText(input.startedAt) || fallbackStartedAt;
+  const startedAt = cleanText(input.startedAt) || fallbackStartedAt;
   const tool = inferToolNameFromFailureText(input);
   const classification = classifyToolFailure({ ...input, tool });
   return {
@@ -408,7 +521,8 @@ export function createToolRunRecordFromFailure(input: ToolFailureInput & {
     commandLine: cleanText(input.commandLine) || null,
     allowedEffects: Array.isArray(input.allowedEffects) ? input.allowedEffects : [],
     ok: false,
-    exitCode: typeof input.exitCode === "number" && Number.isFinite(input.exitCode) ? input.exitCode : null,
+    exitCode:
+      typeof input.exitCode === "number" && Number.isFinite(input.exitCode) ? input.exitCode : null,
     failureClass: classification.failureClass,
     retryable: classification.retryable,
     remediation: classification.remediation,

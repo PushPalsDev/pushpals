@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { Database } from "bun:sqlite";
+import { JobQueue } from "../apps/server/src/jobs";
 import { RequestQueue } from "../apps/server/src/requests";
 
 describe("server RequestQueue", () => {
@@ -117,6 +118,619 @@ describe("server RequestQueue", () => {
     queue.close();
   });
 
+  test("keeps durable worker handoffs delegated until the exact job terminates", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-outcome-"));
+    const dbPath = join(root, "requests.sqlite");
+    const queue = new RequestQueue(dbPath);
+    const db = new Database(dbPath);
+
+    try {
+      db.exec(`
+        CREATE TABLE jobs (
+          id TEXT PRIMARY KEY,
+          sessionId TEXT NOT NULL DEFAULT '',
+          kind TEXT NOT NULL DEFAULT 'task.execute',
+          params TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL,
+          failedAt TEXT,
+          abandonedAt TEXT,
+          publishBlockedAt TEXT,
+          completedAt TEXT,
+          createdAt TEXT NOT NULL DEFAULT '',
+          updatedAt TEXT
+        );
+      `);
+      const request = queue.enqueue({
+        sessionId: "truthful-request-outcome",
+        prompt: "delegate this work",
+      });
+      const requestId = String(request.requestId ?? "");
+      const claim = queue.claim("remotebuddy-truthful");
+      const claimToken = String(claim.request?.claimToken ?? "");
+      const jobId = "job-truthful-outcome";
+      const jobCreatedAt = new Date().toISOString();
+      db.prepare(`INSERT INTO jobs (id, status, updatedAt) VALUES (?, 'claimed', ?)`).run(
+        jobId,
+        jobCreatedAt,
+      );
+      expect(
+        queue.recordWorkerHandoff(requestId, jobId, "remotebuddy-truthful", claimToken),
+      ).toMatchObject({ ok: true });
+      expect(
+        queue.complete(requestId, {
+          agentId: "remotebuddy-truthful",
+          claimToken,
+          result: { requiresWorker: true, jobId },
+        }),
+      ).toMatchObject({ ok: true });
+
+      expect(queue.getRequest(requestId)).toMatchObject({
+        status: "completed",
+        workerRequired: 1,
+        handoffJobId: jobId,
+        handoffJobStatus: "claimed",
+        outcomeStatus: "delegated",
+        outcomeDurationMs: null,
+      });
+      expect(queue.sloSummary(24)).toMatchObject({
+        terminal: 0,
+        completed: 0,
+        failed: 0,
+        successRate: null,
+      });
+
+      const failedAt = new Date(Date.now() + 1_000).toISOString();
+      db.prepare(`UPDATE jobs SET status = 'failed', failedAt = ?, updatedAt = ? WHERE id = ?`).run(
+        failedAt,
+        failedAt,
+        jobId,
+      );
+
+      expect(queue.listRequests({ status: "completed" })).toContainEqual(
+        expect.objectContaining({
+          id: requestId,
+          status: "completed",
+          handoffJobStatus: "failed",
+          outcomeStatus: "failed",
+          outcomeUpdatedAt: failedAt,
+        }),
+      );
+      expect(queue.sloSummary(24)).toMatchObject({
+        terminal: 1,
+        completed: 0,
+        failed: 1,
+        successRate: 0,
+        durationMs: { sampleSize: 1 },
+      });
+    } finally {
+      queue.close();
+      db.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
+  });
+
+  test.each(["completed", "failed"])(
+    "repoints a retry-safe recovered handoff and projects the successor as %s",
+    (terminalStatus) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-request-recovery-handoff-"));
+      const dbPath = join(root, "requests.sqlite");
+      const requestQueue = new RequestQueue(dbPath);
+      const jobQueue = new JobQueue(dbPath);
+
+      try {
+        const request = requestQueue.enqueue({
+          sessionId: "truthful-recovery",
+          prompt: `recover and finish as ${terminalStatus}`,
+          forceWorker: true,
+        });
+        const requestId = String(request.requestId ?? "");
+        const requestClaim = requestQueue.claim("remotebuddy-recovery");
+        const requestClaimToken = String(requestClaim.request?.claimToken ?? "");
+
+        const enqueuedJob = jobQueue.enqueue({
+          taskId: `task-recovery-${terminalStatus}`,
+          sessionId: "truthful-recovery",
+          kind: "task.execute",
+          params: { requestId, retrySafety: "retry_safe" },
+        });
+        const originalJobId = String(enqueuedJob.jobId ?? "");
+        expect(jobQueue.claim("worker-original")).toMatchObject({
+          ok: true,
+          job: { id: originalJobId },
+        });
+        expect(
+          requestQueue.recordWorkerHandoff(
+            requestId,
+            originalJobId,
+            "remotebuddy-recovery",
+            requestClaimToken,
+          ),
+        ).toMatchObject({ ok: true });
+        expect(
+          requestQueue.complete(requestId, {
+            agentId: "remotebuddy-recovery",
+            claimToken: requestClaimToken,
+            result: { requiresWorker: true, jobId: originalJobId },
+          }),
+        ).toMatchObject({ ok: true });
+
+        const staleIso = new Date(Date.now() - 10 * 60_000).toISOString();
+        const jobsDb = (jobQueue as unknown as { db: Database }).db;
+        jobsDb
+          .prepare(`UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?`)
+          .run(staleIso, "worker-original");
+        jobsDb
+          .prepare(
+            `UPDATE jobs
+             SET updatedAt = ?, claimedAt = ?, startedAt = ?, firstLogAt = NULL
+             WHERE id = ?`,
+          )
+          .run(staleIso, staleIso, staleIso, originalJobId);
+
+        const recovered = jobQueue.recoverStaleClaimedJobs(120_000);
+        expect(recovered).toHaveLength(1);
+        const replacementJobId = String(recovered[0]?.replacementJobId ?? "");
+        expect(replacementJobId).not.toBe("");
+        expect(jobQueue.getJob(originalJobId)?.status).toBe("abandoned");
+        expect(requestQueue.getRequest(requestId)).toMatchObject({
+          status: "completed",
+          workerRequired: 1,
+          handoffJobId: replacementJobId,
+          handoffJobStatus: "pending",
+          outcomeStatus: "delegated",
+          outcomeDurationMs: null,
+        });
+
+        jobsDb
+          .prepare(`UPDATE jobs SET availableAt = ? WHERE id = ?`)
+          .run(new Date(Date.now() - 1_000).toISOString(), replacementJobId);
+        expect(jobQueue.claim("worker-successor")).toMatchObject({
+          ok: true,
+          job: { id: replacementJobId },
+        });
+        if (terminalStatus === "completed") {
+          expect(
+            jobQueue.complete(replacementJobId, { summary: "recovered successfully" }).ok,
+          ).toBe(true);
+        } else {
+          expect(
+            jobQueue.fail(replacementJobId, {
+              message: "successor failed with a real terminal error",
+            }).ok,
+          ).toBe(true);
+        }
+
+        expect(requestQueue.getRequest(requestId)).toMatchObject({
+          status: "completed",
+          handoffJobId: replacementJobId,
+          handoffJobStatus: terminalStatus,
+          outcomeStatus: terminalStatus,
+          outcomeUpdatedAt: expect.any(String),
+        });
+        expect(requestQueue.sloSummary(24)).toMatchObject({
+          terminal: 1,
+          completed: terminalStatus === "completed" ? 1 : 0,
+          failed: terminalStatus === "failed" ? 1 : 0,
+          successRate: terminalStatus === "completed" ? 1 : 0,
+        });
+      } finally {
+        jobQueue.close();
+        requestQueue.close();
+        try {
+          rmSync(root, { recursive: true, force: true });
+        } catch {
+          // best-effort cleanup for Windows file lock timing
+        }
+      }
+    },
+  );
+
+  test.each([
+    ["pending", "delegated"],
+    ["completed", "completed"],
+    ["failed", "failed"],
+  ] as const)(
+    "repairs an upgraded durable request pinned to an abandoned predecessor with a %s leaf",
+    (leafStatus, expectedOutcomeStatus) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-request-legacy-chain-"));
+      const dbPath = join(root, "requests.sqlite");
+      const jobQueue = new JobQueue(dbPath);
+      const requestQueue = new RequestQueue(dbPath);
+      const db = new Database(dbPath);
+
+      try {
+        const requestId = String(
+          requestQueue.enqueue({
+            sessionId: `legacy-${leafStatus}`,
+            prompt: `recover the ${leafStatus} successor`,
+            forceWorker: true,
+          }).requestId ?? "",
+        );
+        const predecessorJobId = `job-legacy-${leafStatus}-predecessor`;
+        const leafJobId = `job-legacy-${leafStatus}-leaf`;
+        const fixtureBaseMs = Date.now();
+        const predecessorAt = new Date(fixtureBaseMs + 1_000).toISOString();
+        const leafAt = new Date(fixtureBaseMs + 2_000).toISOString();
+        const insertJob = db.prepare(
+          `INSERT INTO jobs (
+             id, taskId, sessionId, kind, status, resumeOfJobId, attempt,
+             abandonedAt, failedAt, completedAt, createdAt, updatedAt
+           ) VALUES (?, ?, ?, 'task.execute', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        insertJob.run(
+          predecessorJobId,
+          `task-${leafStatus}`,
+          `legacy-${leafStatus}`,
+          "abandoned",
+          null,
+          1,
+          predecessorAt,
+          null,
+          null,
+          predecessorAt,
+          predecessorAt,
+        );
+        insertJob.run(
+          leafJobId,
+          `task-${leafStatus}`,
+          `legacy-${leafStatus}`,
+          leafStatus,
+          predecessorJobId,
+          2,
+          null,
+          leafStatus === "failed" ? leafAt : null,
+          leafStatus === "completed" ? leafAt : null,
+          leafAt,
+          leafAt,
+        );
+        db.prepare(
+          `UPDATE requests
+           SET workerRequired = 1,
+               handoffJobId = ?,
+               status = 'completed',
+               completedAt = ?,
+               updatedAt = ?
+           WHERE id = ?`,
+        ).run(predecessorJobId, predecessorAt, predecessorAt, requestId);
+
+        expect(requestQueue.getRequest(requestId)).toMatchObject({
+          handoffJobId: predecessorJobId,
+          handoffJobStatus: "abandoned",
+          outcomeStatus: "failed",
+        });
+
+        expect(requestQueue.reconcileRecoveredWorkerHandoffChains()).toEqual({
+          scanned: 1,
+          repointed: 1,
+          requestIds: [requestId],
+          previousJobIds: [predecessorJobId],
+          replacementJobIds: [leafJobId],
+          cycleDetected: 0,
+          depthLimitReached: 0,
+        });
+        expect(requestQueue.getRequest(requestId)).toMatchObject({
+          handoffJobId: leafJobId,
+          handoffJobStatus: leafStatus,
+          outcomeStatus: expectedOutcomeStatus,
+          outcomeDurationMs: leafStatus === "pending" ? null : expect.any(Number),
+        });
+        expect(requestQueue.reconcileRecoveredWorkerHandoffChains()).toMatchObject({
+          scanned: 0,
+          repointed: 0,
+        });
+      } finally {
+        db.close();
+        requestQueue.close();
+        jobQueue.close();
+        try {
+          rmSync(root, { recursive: true, force: true });
+        } catch {
+          // best-effort cleanup for Windows file lock timing
+        }
+      }
+    },
+  );
+
+  test("follows a deterministic multi-hop retry chain without crossing its depth bound", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-multihop-chain-"));
+    const dbPath = join(root, "requests.sqlite");
+    const jobQueue = new JobQueue(dbPath);
+    const requestQueue = new RequestQueue(dbPath);
+    const db = new Database(dbPath);
+
+    try {
+      const requestId = String(
+        requestQueue.enqueue({
+          sessionId: "legacy-multihop",
+          prompt: "recover the full successor chain",
+          forceWorker: true,
+        }).requestId ?? "",
+      );
+      const insertJob = db.prepare(
+        `INSERT INTO jobs (
+           id, taskId, sessionId, kind, status, resumeOfJobId, attempt,
+           abandonedAt, completedAt, createdAt, updatedAt
+         ) VALUES (?, 'task-multihop', 'legacy-multihop', 'task.execute', ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      insertJob.run(
+        "job-chain-root",
+        "abandoned",
+        null,
+        1,
+        "2026-08-18T02:00:00.000Z",
+        null,
+        "2026-08-18T02:00:00.000Z",
+        "2026-08-18T02:00:00.000Z",
+      );
+      insertJob.run(
+        "job-chain-middle",
+        "abandoned",
+        "job-chain-root",
+        2,
+        "2026-08-18T02:01:00.000Z",
+        null,
+        "2026-08-18T02:01:00.000Z",
+        "2026-08-18T02:01:00.000Z",
+      );
+      insertJob.run(
+        "job-chain-leaf",
+        "completed",
+        "job-chain-middle",
+        3,
+        null,
+        "2026-08-18T02:02:00.000Z",
+        "2026-08-18T02:02:00.000Z",
+        "2026-08-18T02:02:00.000Z",
+      );
+      // A malformed older fork must not win over the higher-attempt retry chain.
+      insertJob.run(
+        "job-chain-old-fork",
+        "failed",
+        "job-chain-root",
+        1,
+        null,
+        null,
+        "2026-08-18T02:03:00.000Z",
+        "2026-08-18T02:03:00.000Z",
+      );
+      db.prepare(
+        `UPDATE requests
+         SET workerRequired = 1,
+             handoffJobId = 'job-chain-root',
+             status = 'completed',
+             completedAt = '2026-08-18T02:00:00.000Z',
+             updatedAt = '2026-08-18T02:00:00.000Z'
+         WHERE id = ?`,
+      ).run(requestId);
+
+      expect(
+        requestQueue.reconcileRecoveredWorkerHandoffChains({ maxRequests: 1, maxDepth: 1 }),
+      ).toMatchObject({
+        scanned: 1,
+        repointed: 0,
+        cycleDetected: 0,
+        depthLimitReached: 1,
+      });
+      expect(requestQueue.getRequest(requestId)?.handoffJobId).toBe("job-chain-root");
+
+      expect(
+        requestQueue.reconcileRecoveredWorkerHandoffChains({ maxRequests: 1, maxDepth: 2 }),
+      ).toMatchObject({
+        scanned: 1,
+        repointed: 1,
+        replacementJobIds: ["job-chain-leaf"],
+        cycleDetected: 0,
+        depthLimitReached: 0,
+      });
+      expect(requestQueue.getRequest(requestId)).toMatchObject({
+        handoffJobId: "job-chain-leaf",
+        handoffJobStatus: "completed",
+        outcomeStatus: "completed",
+      });
+    } finally {
+      db.close();
+      requestQueue.close();
+      jobQueue.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
+  });
+
+  test("bounds cyclic legacy retry metadata without changing the durable handoff", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-cycle-chain-"));
+    const dbPath = join(root, "requests.sqlite");
+    const jobQueue = new JobQueue(dbPath);
+    const requestQueue = new RequestQueue(dbPath);
+    const db = new Database(dbPath);
+
+    try {
+      const requestId = String(
+        requestQueue.enqueue({
+          sessionId: "legacy-cycle",
+          prompt: "do not loop over corrupt retry metadata",
+          forceWorker: true,
+        }).requestId ?? "",
+      );
+      const insertJob = db.prepare(
+        `INSERT INTO jobs (
+           id, taskId, sessionId, kind, status, resumeOfJobId, attempt,
+           abandonedAt, createdAt, updatedAt
+         ) VALUES (?, 'task-cycle', 'legacy-cycle', 'task.execute', 'abandoned', ?, ?, ?, ?, ?)`,
+      );
+      insertJob.run(
+        "job-cycle-a",
+        "job-cycle-b",
+        1,
+        "2026-08-18T03:00:00.000Z",
+        "2026-08-18T03:00:00.000Z",
+        "2026-08-18T03:00:00.000Z",
+      );
+      insertJob.run(
+        "job-cycle-b",
+        "job-cycle-a",
+        2,
+        "2026-08-18T03:01:00.000Z",
+        "2026-08-18T03:01:00.000Z",
+        "2026-08-18T03:01:00.000Z",
+      );
+      db.prepare(
+        `UPDATE requests
+         SET workerRequired = 1,
+             handoffJobId = 'job-cycle-a',
+             status = 'completed'
+         WHERE id = ?`,
+      ).run(requestId);
+
+      expect(requestQueue.reconcileRecoveredWorkerHandoffChains({ maxDepth: 64 })).toMatchObject({
+        scanned: 1,
+        repointed: 0,
+        cycleDetected: 1,
+        depthLimitReached: 0,
+      });
+      expect(requestQueue.getRequest(requestId)).toMatchObject({
+        handoffJobId: "job-cycle-a",
+        handoffJobStatus: "abandoned",
+        outcomeStatus: "failed",
+      });
+    } finally {
+      db.close();
+      requestQueue.close();
+      jobQueue.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
+  });
+
+  test("leaves no-successor, unrelated, and non-durable handoffs unchanged", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-request-unrelated-chain-"));
+    const dbPath = join(root, "requests.sqlite");
+    const jobQueue = new JobQueue(dbPath);
+    const requestQueue = new RequestQueue(dbPath);
+    const db = new Database(dbPath);
+
+    try {
+      const insertJob = db.prepare(
+        `INSERT INTO jobs (
+           id, taskId, sessionId, kind, status, resumeOfJobId, attempt,
+           abandonedAt, completedAt, createdAt, updatedAt
+         ) VALUES (?, ?, 'legacy-unrelated', 'task.execute', ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      insertJob.run(
+        "job-no-successor",
+        "task-no-successor",
+        "abandoned",
+        null,
+        1,
+        "2026-08-18T04:00:00.000Z",
+        null,
+        "2026-08-18T04:00:00.000Z",
+        "2026-08-18T04:00:00.000Z",
+      );
+      insertJob.run(
+        "job-nondurable-root",
+        "task-nondurable",
+        "abandoned",
+        null,
+        1,
+        "2026-08-18T04:01:00.000Z",
+        null,
+        "2026-08-18T04:01:00.000Z",
+        "2026-08-18T04:01:00.000Z",
+      );
+      insertJob.run(
+        "job-nondurable-leaf",
+        "task-nondurable",
+        "completed",
+        "job-nondurable-root",
+        2,
+        null,
+        "2026-08-18T04:02:00.000Z",
+        "2026-08-18T04:02:00.000Z",
+        "2026-08-18T04:02:00.000Z",
+      );
+      insertJob.run(
+        "job-unrelated-complete",
+        "task-unrelated",
+        "completed",
+        null,
+        1,
+        null,
+        "2026-08-18T04:03:00.000Z",
+        "2026-08-18T04:03:00.000Z",
+        "2026-08-18T04:03:00.000Z",
+      );
+
+      const createPinnedRequest = (prompt: string, jobId: string, workerRequired: 0 | 1) => {
+        const requestId = String(
+          requestQueue.enqueue({ sessionId: "legacy-unrelated", prompt }).requestId ?? "",
+        );
+        db.prepare(
+          `UPDATE requests
+           SET workerRequired = ?, handoffJobId = ?, status = 'completed'
+           WHERE id = ?`,
+        ).run(workerRequired, jobId, requestId);
+        return requestId;
+      };
+      const noSuccessorRequestId = createPinnedRequest(
+        "abandoned without a retry",
+        "job-no-successor",
+        1,
+      );
+      const nonDurableRequestId = createPinnedRequest(
+        "not a durable worker handoff",
+        "job-nondurable-root",
+        0,
+      );
+      const unrelatedRequestId = createPinnedRequest(
+        "already points to a terminal leaf",
+        "job-unrelated-complete",
+        1,
+      );
+
+      expect(requestQueue.reconcileRecoveredWorkerHandoffChains()).toEqual({
+        scanned: 0,
+        repointed: 0,
+        requestIds: [],
+        previousJobIds: [],
+        replacementJobIds: [],
+        cycleDetected: 0,
+        depthLimitReached: 0,
+      });
+      expect(requestQueue.getRequest(noSuccessorRequestId)).toMatchObject({
+        handoffJobId: "job-no-successor",
+        outcomeStatus: "failed",
+      });
+      expect(requestQueue.getRequest(nonDurableRequestId)).toMatchObject({
+        workerRequired: 0,
+        handoffJobId: "job-nondurable-root",
+        outcomeStatus: "completed",
+      });
+      expect(requestQueue.getRequest(unrelatedRequestId)).toMatchObject({
+        handoffJobId: "job-unrelated-complete",
+        outcomeStatus: "completed",
+      });
+    } finally {
+      db.close();
+      requestQueue.close();
+      jobQueue.close();
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
+  });
+
   test("renews claimed request leases only for the current owner", () => {
     const queue = new RequestQueue(":memory:");
     const enqueued = queue.enqueue({ sessionId: "dev", prompt: "plan a durable handoff" });
@@ -140,6 +754,76 @@ describe("server RequestQueue", () => {
     expect(Date.parse(String(renewed.leaseExpiresAt))).toBeGreaterThanOrEqual(
       Date.parse(previousExpiry),
     );
+    queue.close();
+  });
+
+  test("defers a fenced claim without terminating it and requeues it after a bounded delay", () => {
+    const queue = new RequestQueue(":memory:");
+    const deferredRequest = queue.enqueue({
+      sessionId: "autonomy-deferred",
+      prompt: "retry this autonomy request after the circuit closes",
+      priority: "background",
+    });
+    const eligibleRequest = queue.enqueue({
+      sessionId: "user-eligible",
+      prompt: "continue to this eligible request",
+      priority: "background",
+    });
+    const requestId = String(deferredRequest.requestId ?? "");
+    const firstClaim = queue.claim("remotebuddy-circuit", { leaseMs: 60_000 });
+    const firstClaimToken = String(firstClaim.request?.claimToken ?? "");
+    expect(firstClaim.request?.id).toBe(requestId);
+
+    const deferred = queue.deferClaim(
+      requestId,
+      "remotebuddy-circuit",
+      firstClaimToken,
+      60 * 60_000,
+    );
+    expect(deferred).toMatchObject({ ok: true, retryAfterMs: 30 * 60_000 });
+    const deferredUntil = String(deferred.deferredUntil ?? "");
+    expect(Date.parse(deferredUntil)).toBeGreaterThan(Date.now());
+    expect(queue.getRequest(requestId)).toMatchObject({
+      status: "claimed",
+      agentId: "remotebuddy-circuit",
+      claimToken: firstClaimToken,
+      leaseExpiresAt: deferredUntil,
+      failedAt: null,
+      error: null,
+    });
+
+    const nextClaim = queue.claim("remotebuddy-circuit");
+    expect(nextClaim.request?.id).toBe(eligibleRequest.requestId);
+    expect(
+      queue.complete(String(eligibleRequest.requestId), {
+        agentId: "remotebuddy-circuit",
+        claimToken: nextClaim.request?.claimToken,
+        result: { ok: true },
+      }).ok,
+    ).toBe(true);
+
+    expect(queue.recoverExpiredClaims(new Date(Date.parse(deferredUntil) - 1))).toEqual({
+      recovered: 0,
+      requestIds: [],
+    });
+    expect(queue.recoverExpiredClaims(new Date(Date.parse(deferredUntil) + 1))).toEqual({
+      recovered: 1,
+      requestIds: [requestId],
+    });
+    const reclaimed = queue.claim("remotebuddy-retry");
+    expect(reclaimed.request).toMatchObject({
+      id: requestId,
+      status: "claimed",
+      claimAttempts: 2,
+    });
+    expect(reclaimed.request?.claimToken).not.toBe(firstClaimToken);
+    expect(
+      queue.complete(requestId, {
+        agentId: "remotebuddy-circuit",
+        claimToken: firstClaimToken,
+        result: { stale: true },
+      }).ok,
+    ).toBe(false);
     queue.close();
   });
 

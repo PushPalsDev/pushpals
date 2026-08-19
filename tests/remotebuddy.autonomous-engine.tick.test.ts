@@ -431,6 +431,47 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect((engine as any).suppressedFailureTargetReason(["src/other.ts"])).toBeNull();
   });
 
+  test("backs off when the worker-runtime admission circuit is open", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-runtime-circuit-"));
+    tempDirs.push(root);
+    globalThis.fetch = (async () =>
+      jsonResponse(429, {
+        ok: false,
+        code: "autonomy_worker_runtime_circuit_open",
+        message: "WorkerPal repeated the same internal runtime failure",
+        retryAfterMs: 120_000,
+        recentMatchingFailureCount: 2,
+      })) as typeof fetch;
+
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_runtime_circuit",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const beforeEnqueueMs = Date.now();
+    const requestId = await (engine as any).enqueueSyntheticRequest("Background task", {
+      objectiveId: "objective_runtime_circuit",
+      runId: "run_runtime_circuit",
+      snapshotId: "snapshot_runtime_circuit",
+      patternKey: "runtime.circuit",
+      componentArea: "workerpals",
+      targetPaths: ["apps/workerpals/src/common/generic_python_executor.ts"],
+      writeGlobs: ["apps/workerpals/src/**"],
+    });
+
+    expect(requestId).toBeNull();
+    expect((engine as any).dispatchBackoffReason).toBe("autonomy_worker_runtime_circuit_open");
+    expect((engine as any).dispatchBackoffUntilMs).toBeGreaterThanOrEqual(
+      beforeEnqueueMs + 120_000,
+    );
+    expect((engine as any).dispatchBackoffUntilMs).toBeLessThanOrEqual(Date.now() + 120_000);
+  });
+
   test("tick auto-ingests inspiration and dispatches an objective end-to-end", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();

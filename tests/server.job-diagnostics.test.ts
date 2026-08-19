@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { JobQueue } from "../apps/server/src/jobs";
+import { JobQueue, resolveWorkerRuntimeCircuitRetryAfterMs } from "../apps/server/src/jobs";
 
 describe("server JobQueue diagnostics", () => {
   function enqueueClaimedJob(
@@ -51,6 +51,57 @@ describe("server JobQueue diagnostics", () => {
           executorBackend: "openai_codex",
           summary: "openai_codex made no publishable changes before the no-edit watchdog",
           watchdogFired: true,
+          publishableFileCount: 0,
+          artifactOnlyPathCount: 0,
+          changedPathSample: [],
+        },
+      },
+    });
+    expect(failed.ok).toBe(true);
+  }
+
+  function failWorkerRuntimeJob(
+    queue: JobQueue,
+    taskId: string,
+    options?: {
+      failureClass?: string;
+      detail?: string;
+      summary?: string;
+      terminalStage?: string;
+    },
+  ): void {
+    const jobId = enqueueClaimedJob(queue, taskId, {
+      origin: "autonomy",
+      autonomy: { patternKey: `runtime.${taskId}` },
+    });
+    const detail =
+      options?.detail ??
+      `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+        `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)\n` +
+        `Bun v1.3.14`;
+    const summary = options?.summary ?? "Job failed before returning a structured result";
+    const failed = queue.fail(jobId, {
+      message: "WorkerPal job execution failed",
+      detail,
+      diagnostics: {
+        attempts: [
+          {
+            attempt: 1,
+            workerId: "worker-diagnostics",
+            backend: "openai_codex",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString(),
+            durationMs: 15_000,
+            terminalReason: detail,
+            exitCode: 1,
+          },
+        ],
+        terminal: {
+          status: "failed",
+          failureClass: options?.failureClass ?? "worker_runtime_failure",
+          terminalStage: options?.terminalStage ?? "executor",
+          executorBackend: "openai_codex",
+          summary,
           publishableFileCount: 0,
           artifactOnlyPathCount: 0,
           changedPathSample: [],
@@ -378,6 +429,244 @@ describe("server JobQueue diagnostics", () => {
     } finally {
       queue.close();
     }
+  });
+
+  test("opens the worker-runtime circuit after two identical internal failures", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      failWorkerRuntimeJob(queue, "task-runtime-reference-error-1", {
+        // Live v1.2.37 diagnostics mislabeled this exact WorkerPal crash as an
+        // artifact-only patch. Strong internal stack evidence must override
+        // that legacy classifier label.
+        failureClass: "artifact_only_no_publishable_patch",
+        detail:
+          `jobId=6a5b9b85-1111-4222-8333-123456789abc\n` +
+          `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+          `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)`,
+      });
+      expect(
+        queue.workerRuntimeFailureCircuitSummary({
+          windowMs: 60 * 60 * 1000,
+          threshold: 2,
+        }).blocked,
+      ).toBe(false);
+
+      failWorkerRuntimeJob(queue, "task-runtime-reference-error-2", {
+        failureClass: "no_structured_result",
+        detail:
+          `jobId=17fc74d9-2222-4333-8444-abcdef123456\n` +
+          `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+          `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:419:9)`,
+      });
+      failWorkerRuntimeJob(queue, "task-runtime-distinct-reference-error", {
+        failureClass: "worker_runtime_failure",
+        detail:
+          `jobId=d63d44be-3333-4444-8555-fedcba654321\n` +
+          `ReferenceError: Cannot access 'processResult' before initialization.\n` +
+          `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)`,
+      });
+      const summary = queue.workerRuntimeFailureCircuitSummary({
+        windowMs: 60 * 60 * 1000,
+        threshold: 2,
+      });
+      expect(summary.blocked).toBe(true);
+      expect(summary.qualifyingFailureCount).toBe(3);
+      expect(summary.recentMatchingFailureCount).toBe(2);
+      expect(summary.fingerprint).toHaveLength(24);
+      expect(summary.failureClass).toBe("worker_runtime_failure");
+      expect(summary.signatureSample).toContain("generic_python_executor.ts");
+      expect(summary.signatureSample).not.toContain("generic_python_executor.ts:41");
+      expect(summary.lastFailureAt).toBeTruthy();
+
+      const lastFailureAtMs = Date.parse(String(summary.lastFailureAt));
+      const nearExpiry = queue.workerRuntimeFailureCircuitSummary({
+        windowMs: 60 * 60 * 1000,
+        maxBlockMs: 30 * 60 * 1000,
+        threshold: 2,
+        nowMs: lastFailureAtMs + 29 * 60 * 1000,
+      });
+      expect(nearExpiry.blocked).toBe(true);
+      expect(
+        resolveWorkerRuntimeCircuitRetryAfterMs(nearExpiry, {
+          nowMs: lastFailureAtMs + 29 * 60 * 1000,
+        }),
+      ).toBe(60 * 1000);
+
+      const canaryDue = queue.workerRuntimeFailureCircuitSummary({
+        windowMs: 60 * 60 * 1000,
+        maxBlockMs: 30 * 60 * 1000,
+        threshold: 2,
+        nowMs: lastFailureAtMs + 30 * 60 * 1000,
+      });
+      expect(canaryDue.blocked).toBe(false);
+      expect(canaryDue.recentMatchingFailureCount).toBe(2);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("keeps ordinary user-code failures outside the worker-runtime circuit", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      for (const taskId of ["task-user-code-1", "task-user-code-2"]) {
+        const jobId = enqueueClaimedJob(queue, taskId, { origin: "autonomy" });
+        const failed = queue.fail(jobId, {
+          message: "focused validation failed",
+          detail:
+            `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+            `    at routeShell (src/routeShell.ts:42:7)\n` +
+            `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)`,
+          diagnostics: {
+            terminal: {
+              status: "failed",
+              failureClass: "validation_failed",
+              terminalStage: "quality_gate",
+              summary: "SectorCommand focused test failed",
+            },
+          },
+        });
+        expect(failed.ok).toBe(true);
+      }
+
+      const summary = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      expect(summary.blocked).toBe(false);
+      expect(summary.qualifyingFailureCount).toBe(0);
+      expect(summary.recentMatchingFailureCount).toBe(0);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("rejects user filenames that collide with WorkerPal runtime basenames", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      for (const taskId of [
+        "task-runtime-basename-collision-1",
+        "task-runtime-basename-collision-2",
+      ]) {
+        failWorkerRuntimeJob(queue, taskId, {
+          failureClass: "worker_runtime_failure",
+          detail: "TypeError: user fixture broke\n    at src/generic_python_executor.ts:42:7",
+        });
+      }
+
+      const summary = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      expect(summary.blocked).toBe(false);
+      expect(summary.qualifyingFailureCount).toBe(0);
+      expect(summary.recentMatchingFailureCount).toBe(0);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("accepts structurally owned JobRunner runtime failures without a serialized stack", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      for (const taskId of ["task-job-runner-fatal-1", "task-job-runner-fatal-2"]) {
+        failWorkerRuntimeJob(queue, taskId, {
+          failureClass: "worker_runtime_failure",
+          terminalStage: "worker_runtime",
+          detail: "TypeError: internal state unavailable",
+          summary: "WorkerPal encountered an unexpected runtime failure",
+        });
+      }
+
+      const summary = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      expect(summary.blocked).toBe(true);
+      expect(summary.qualifyingFailureCount).toBe(2);
+      expect(summary.recentMatchingFailureCount).toBe(2);
+      expect(summary.failureClass).toBe("worker_runtime_failure");
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("normalizes volatile durations when clustering missing structured results", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      failWorkerRuntimeJob(queue, "task-no-result-1", {
+        failureClass: "no_structured_result",
+        detail: "Worker returned no structured result after elapsed=20173ms (pid=1234)",
+        summary: "Executor returned no structured result after 20173ms",
+      });
+      failWorkerRuntimeJob(queue, "task-no-result-2", {
+        failureClass: "no_structured_result",
+        detail: "Worker returned no structured result after elapsed=42900ms (pid=9876)",
+        summary: "Executor returned no structured result after 42900ms",
+      });
+
+      const summary = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      expect(summary.blocked).toBe(true);
+      expect(summary.recentMatchingFailureCount).toBe(2);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("does not treat a different successful task as proof the failed runtime path recovered", async () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      const overlapping = queue.enqueue({
+        taskId: "task-runtime-overlapping-before-failure",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: {},
+      });
+      expect(overlapping.ok).toBe(true);
+      const overlappingJobId = String(overlapping.jobId ?? "");
+      expect(queue.claim("worker-overlapping").job?.id).toBe(overlappingJobId);
+
+      failWorkerRuntimeJob(queue, "task-runtime-before-recovery-1");
+      failWorkerRuntimeJob(queue, "task-runtime-before-recovery-2");
+      expect(queue.workerRuntimeFailureCircuitSummary({ threshold: 2 }).blocked).toBe(true);
+
+      await Bun.sleep(2);
+      expect(
+        queue.complete(overlappingJobId, {
+          summary: "older overlapping work eventually completed",
+          diagnostics: {
+            terminal: {
+              status: "completed",
+              failureClass: "success",
+              terminalStage: "completed",
+              executorBackend: "openai_codex",
+              summary: "older overlapping work eventually completed",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+      expect(queue.workerRuntimeFailureCircuitSummary({ threshold: 2 }).blocked).toBe(true);
+
+      const stillBlocked = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      expect(stillBlocked.recentMatchingFailureCount).toBe(2);
+      expect(stillBlocked.blocked).toBe(true);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("caps worker-runtime backoff and shrinks it to the remaining circuit window", () => {
+    const nowMs = Date.parse("2026-08-18T22:00:00.000Z");
+    const base = {
+      blockDurationMs: 60 * 60 * 1000,
+      lastFailureAt: new Date(nowMs - 10 * 60 * 1000).toISOString(),
+    };
+    expect(
+      resolveWorkerRuntimeCircuitRetryAfterMs(base, {
+        nowMs,
+        maxRetryAfterMs: 30 * 60 * 1000,
+      }),
+    ).toBe(30 * 60 * 1000);
+    expect(
+      resolveWorkerRuntimeCircuitRetryAfterMs(
+        {
+          ...base,
+          blockDurationMs: 30 * 60 * 1000,
+          lastFailureAt: new Date(nowMs - 22 * 60 * 1000).toISOString(),
+        },
+        { nowMs, maxRetryAfterMs: 30 * 60 * 1000 },
+      ),
+    ).toBe(8 * 60 * 1000);
   });
 
   test("suppresses similar autonomy no-publishable failures by pattern key", () => {

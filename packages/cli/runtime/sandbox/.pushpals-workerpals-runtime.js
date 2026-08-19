@@ -1729,13 +1729,48 @@ var KNOWN_TOOL_NAMES = new Set([
 var DEFAULT_TOOL_REGISTRY = {
   fallbackKind: "discovered",
   adapters: [
-    { tool: "git", kind: "known", executableHints: ["git"], defaultEffects: ["read", "write", "git"] },
-    { tool: "codex", kind: "known", executableHints: ["codex", "bunx @openai/codex"], defaultEffects: ["read", "write", "network", "process"] },
-    { tool: "bun", kind: "known", executableHints: ["bun"], defaultEffects: ["read", "write", "process"] },
-    { tool: "docker", kind: "known", executableHints: ["docker"], defaultEffects: ["read", "write", "network", "process"] },
-    { tool: "gh", kind: "known", executableHints: ["gh"], defaultEffects: ["read", "write", "network"] },
-    { tool: "node", kind: "known", executableHints: ["node"], defaultEffects: ["read", "write", "process"] },
-    { tool: "shell", kind: "shell", executableHints: ["sh", "bash", "cmd", "powershell"], defaultEffects: ["read", "write", "process"] }
+    {
+      tool: "git",
+      kind: "known",
+      executableHints: ["git"],
+      defaultEffects: ["read", "write", "git"]
+    },
+    {
+      tool: "codex",
+      kind: "known",
+      executableHints: ["codex", "bunx @openai/codex"],
+      defaultEffects: ["read", "write", "network", "process"]
+    },
+    {
+      tool: "bun",
+      kind: "known",
+      executableHints: ["bun"],
+      defaultEffects: ["read", "write", "process"]
+    },
+    {
+      tool: "docker",
+      kind: "known",
+      executableHints: ["docker"],
+      defaultEffects: ["read", "write", "network", "process"]
+    },
+    {
+      tool: "gh",
+      kind: "known",
+      executableHints: ["gh"],
+      defaultEffects: ["read", "write", "network"]
+    },
+    {
+      tool: "node",
+      kind: "known",
+      executableHints: ["node"],
+      defaultEffects: ["read", "write", "process"]
+    },
+    {
+      tool: "shell",
+      kind: "shell",
+      executableHints: ["sh", "bash", "cmd", "powershell"],
+      defaultEffects: ["read", "write", "process"]
+    }
   ]
 };
 var TOOL_RUN_TAIL_CHARS = 8000;
@@ -1835,11 +1870,36 @@ function combinedFailureText(input) {
 function hasNodeEnvRuntimeFailure(text) {
   return /env:\s*[`'"\u2018\u2019\u201c\u201d]?node[`'"\u2018\u2019\u201c\u201d]?:?\s+no such file or directory/i.test(text) || /\bnode:\s+not found\b/i.test(text) || /\bnode\.exe.*not found\b/i.test(text);
 }
+function hasObservedTimeoutFailure(input, text) {
+  if (input.timedOut || input.exitCode === 124)
+    return true;
+  return /(?:^|[\r\n])\s*(?:error:\s*)?(?:command|job|process|request|operation|executor|wrapper|script|test|validation|build|fetch)\s+(?:(?:was|has been)\s+)?timed out(?:\s+(?:after|while|waiting)\b|\s*[.!:]|$)/i.test(text) || /(?:^|[\r\n])\s*(?:error:\s*)?timed out(?:\s+after\b|\s*[.!:]|$)/i.test(text) || /\b(?:context )?deadline exceeded\b/i.test(text) || /\bETIMEDOUT\b/i.test(text) || /(?:^|[\r\n])\s*(?:error:\s*)?(?:(?:command|job|process|request|operation|executor|wrapper|script|test|validation|build|fetch)\s+)?timeout\s+(?:reached|expired|exceeded|after|while|waiting|occurred)\b/i.test(text) || /(?:^|[\r\n])\s*(?:error:\s*)?(?:job|command|process|request|operation|executor|wrapper)\s+timeout(?:\s+(?:reached|expired|after)\b|\s*[.!:]|$)/i.test(text) || /(?:^|[\r\n])\s*timeout\s*(?:[.!:]|$)/i.test(text);
+}
+function isWorkerOwnedRuntimeStackFrame(frame) {
+  const normalized = String(frame ?? "").replace(/\\/g, "/").toLowerCase();
+  return normalized.includes("/workspace/apps/workerpals/") || normalized.includes("/pushpals/apps/workerpals/") || normalized.includes("/packages/cli/runtime/sandbox/apps/workerpals/") || normalized.includes("/.pushpals/runtime/sandbox/apps/workerpals/") || normalized.includes("/.pushpals/runtime/sandbox/.pushpals-workerpals-runtime.js");
+}
+function hasWorkerRuntimeFailure(text) {
+  const exception = /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/i.exec(text);
+  if (!exception)
+    return false;
+  const firstFrame = text.slice((exception.index ?? 0) + exception[0].length).split(/\r?\n/).find((line) => /^\s*at\b/i.test(line));
+  return isWorkerOwnedRuntimeStackFrame(firstFrame);
+}
 function classifyToolFailure(input) {
   const tool = inferToolNameFromFailureText(input);
   const text = combinedFailureText(input);
   const lower = text.toLowerCase();
-  if (input.timedOut || lower.includes("timed out") || lower.includes("timeout")) {
+  const terminalText = [input.summary, input.detail, input.stderr].map(cleanText).filter(Boolean).join(`
+`);
+  if (hasWorkerRuntimeFailure(terminalText)) {
+    return {
+      failureClass: "worker_runtime_failure",
+      retryable: false,
+      remediation: "The PushPals WorkerPal runtime failed internally. Use a fixed PushPals runtime before retrying this workload."
+    };
+  }
+  if (hasObservedTimeoutFailure(input, terminalText)) {
     return {
       failureClass: "timeout",
       retryable: true,
@@ -3358,9 +3418,10 @@ function createGenericPythonExecutor(config) {
         maxOutputHeadLines: runtimeConfig.workerpals.outputMaxHeadLines,
         executorResultPrefix: runtimeConfig.workerpals.executorResultPrefix
       };
-      const progressIntervalMs = 15000;
+      const progressIntervalMs = Math.max(1, Math.floor(config.progressIntervalMs ?? 15000));
       const startedAt = Date.now();
       let sawProcessOutput = false;
+      let timedOut = false;
       const progressTimer = setInterval(() => {
         if (timedOut || sawProcessOutput)
           return;
@@ -3393,13 +3454,14 @@ function createGenericPythonExecutor(config) {
           onStdoutLine: (line) => onProcessLine("stdout", line),
           onStderrLine: (line) => onProcessLine("stderr", line),
           onTimeout: () => {
+            timedOut = true;
             onLog?.("stdout", `[${backendLabel}Executor] Timeout reached after ${timeoutMs}ms; terminating process tree.`);
           }
         });
       } finally {
         clearInterval(progressTimer);
       }
-      const timedOut = processResult.timedOut;
+      timedOut = processResult.timedOut;
       const stdout = processResult.stdout;
       const stderr = processResult.stderr;
       const exitCode = processResult.exitCode;
@@ -15554,6 +15616,8 @@ function inferWorkerJobPhaseFromLogLine(line) {
   return null;
 }
 function mergeWorkerDiagnostics(base, extra) {
+  const baseTerminalStage = String(base?.terminal?.terminalStage ?? "").trim().toLowerCase();
+  const trustedBaseTerminalStage = baseTerminalStage === "worker_runtime" || baseTerminalStage === "docker" ? baseTerminalStage : null;
   return {
     ...base ?? {},
     ...extra,
@@ -15564,6 +15628,7 @@ function mergeWorkerDiagnostics(base, extra) {
     terminal: base?.terminal || extra.terminal ? {
       ...base?.terminal ?? {},
       ...extra.terminal ?? {},
+      ...trustedBaseTerminalStage ? { terminalStage: trustedBaseTerminalStage } : {},
       metadata: {
         ...base?.terminal?.metadata ?? {},
         ...extra.terminal?.metadata ?? {}
@@ -15581,6 +15646,16 @@ ${result.stderr ?? ""}
 ${result.stdout ?? ""}`.toLowerCase();
   return /stalled before first response|startup stall/.test(text);
 }
+function isWorkerRuntimeFailure(text) {
+  const exception = /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/.exec(text);
+  if (!exception)
+    return false;
+  const firstFrame = text.slice((exception.index ?? 0) + exception[0].length).split(/\r?\n/).find((line) => /^\s*at\b/.test(line));
+  return isWorkerOwnedRuntimeStackFrame(firstFrame);
+}
+function hasExplicitNoPublishableResult(text) {
+  return /\bno publishable[^\r\n]{0,80}\b(?:changes?|patch|progress)\b/.test(text) || /\bonly non-publishable[^\r\n]{0,80}\b(?:artifacts?|paths?|changes?|files?|dependencies?|runtime)\b/.test(text) || /\bartifact_only_no_publishable_patch\b/.test(text);
+}
 function inferWorkerTerminalFailureClass(result) {
   if (result.publishBlocked?.stage === "validation")
     return "environment";
@@ -15588,6 +15663,14 @@ function inferWorkerTerminalFailureClass(result) {
     return "trusted_validation_required";
   if (result.ok)
     return "success";
+  const structuredTerminal = result.diagnostics?.terminal;
+  const structuredFailureClass = String(structuredTerminal?.failureClass ?? "").trim();
+  if (structuredFailureClass && structuredTerminal?.terminalStage === "worker_runtime") {
+    return structuredFailureClass;
+  }
+  if (structuredFailureClass && structuredTerminal?.terminalStage === "docker" && structuredTerminal.metadata?.structuredResult === false) {
+    return structuredFailureClass;
+  }
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text = `${result.summary ?? ""}
 ${result.stderr ?? ""}
@@ -15596,30 +15679,31 @@ ${result.stdout ?? ""}`.toLowerCase();
 ${result.stderr ?? ""}`.toLowerCase();
   if (isCodexStartupStallResult(result))
     return "codex_startup_stall";
+  if (isWorkerRuntimeFailure(terminalText))
+    return "worker_runtime_failure";
   if (/(?:fatal error|enoent|no such file or directory)/.test(terminalText) && /(?:\/workspace\/prompts|[\\/]prompts[\\/]|\[prompts\])/.test(terminalText)) {
     return "missing_runtime_asset";
   }
   if (/validationgate|validation/.test(summaryText))
     return "validation";
-  if (/no publishable|non-publishable|node_modules/.test(text))
+  if (hasExplicitNoPublishableResult(terminalText))
     return "artifact_only_no_publishable_patch";
   if (result.exitCode === 124 || /timed out|job timeout|signal 15|terminated \(exit|exit 143|exit 137/.test(terminalText))
     return "timeout";
-  if (/validationgate|validation/.test(text))
+  if (/validationgate|validation/.test(terminalText))
     return "validation";
-  if (/scopegate|scope/.test(text))
+  if (/scopegate|scope/.test(terminalText))
     return "scope";
-  if (/criticgate|critic/.test(text))
+  if (/criticgate|critic/.test(terminalText))
     return "critic";
-  if (/publish/.test(text))
+  if (/publish/.test(terminalText))
     return "publish";
   return "worker_failure";
 }
 function didWorkerWatchdogFire(result) {
-  const text = `${result.summary ?? ""}
-${result.stderr ?? ""}
-${result.stdout ?? ""}`;
-  return /watchdog|rollout coach|stalled before first response|startup stall|\[DockerExecutor\] Job timeout|Job timed out in Docker executor|signal 15|terminated \(exit (?:143|137)\)|exit (?:143|137)/i.test(text);
+  const terminalText = `${result.summary ?? ""}
+${result.stderr ?? ""}`;
+  return /(?:no-edit watchdog|rollout coach|startup[- ]stall watchdog) (?:fired|triggered)|stalled before first response|startup stall|\[DockerExecutor\] Job timeout|Job timed out in Docker executor|signal 15|terminated \(exit (?:143|137)\)|exit (?:143|137)/i.test(terminalText);
 }
 function buildPhaseSpanDiagnostics(spans, attempt, fallbackFinishedAtMs, outcome) {
   return spans.slice(0, 32).map((span) => {
@@ -17138,6 +17222,7 @@ export {
   shouldDeferDockerCodexStartupStallForDirectRetry,
   requiresPublishableCodeChange,
   postJsonWithTimeout,
+  mergeWorkerDiagnostics,
   inferWorkerTerminalFailureClass,
   holdCommitForTrustedValidation,
   failNoPublishableCodeChange,

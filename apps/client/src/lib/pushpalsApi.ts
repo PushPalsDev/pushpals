@@ -414,6 +414,12 @@ export interface RequestSnapshotRow {
   priority?: "interactive" | "normal" | "background";
   queueWaitBudgetMs?: number | null;
   status: "pending" | "claimed" | "completed" | "failed";
+  workerRequired?: number;
+  handoffJobId?: string | null;
+  handoffJobStatus?: string | null;
+  outcomeStatus?: "pending" | "claimed" | "delegated" | "completed" | "failed";
+  outcomeUpdatedAt?: string | null;
+  outcomeDurationMs?: number | null;
   agentId: string | null;
   result: string | null;
   error: string | null;

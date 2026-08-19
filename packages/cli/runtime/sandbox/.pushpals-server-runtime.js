@@ -8879,13 +8879,48 @@ var KNOWN_TOOL_NAMES = new Set([
 var DEFAULT_TOOL_REGISTRY = {
   fallbackKind: "discovered",
   adapters: [
-    { tool: "git", kind: "known", executableHints: ["git"], defaultEffects: ["read", "write", "git"] },
-    { tool: "codex", kind: "known", executableHints: ["codex", "bunx @openai/codex"], defaultEffects: ["read", "write", "network", "process"] },
-    { tool: "bun", kind: "known", executableHints: ["bun"], defaultEffects: ["read", "write", "process"] },
-    { tool: "docker", kind: "known", executableHints: ["docker"], defaultEffects: ["read", "write", "network", "process"] },
-    { tool: "gh", kind: "known", executableHints: ["gh"], defaultEffects: ["read", "write", "network"] },
-    { tool: "node", kind: "known", executableHints: ["node"], defaultEffects: ["read", "write", "process"] },
-    { tool: "shell", kind: "shell", executableHints: ["sh", "bash", "cmd", "powershell"], defaultEffects: ["read", "write", "process"] }
+    {
+      tool: "git",
+      kind: "known",
+      executableHints: ["git"],
+      defaultEffects: ["read", "write", "git"]
+    },
+    {
+      tool: "codex",
+      kind: "known",
+      executableHints: ["codex", "bunx @openai/codex"],
+      defaultEffects: ["read", "write", "network", "process"]
+    },
+    {
+      tool: "bun",
+      kind: "known",
+      executableHints: ["bun"],
+      defaultEffects: ["read", "write", "process"]
+    },
+    {
+      tool: "docker",
+      kind: "known",
+      executableHints: ["docker"],
+      defaultEffects: ["read", "write", "network", "process"]
+    },
+    {
+      tool: "gh",
+      kind: "known",
+      executableHints: ["gh"],
+      defaultEffects: ["read", "write", "network"]
+    },
+    {
+      tool: "node",
+      kind: "known",
+      executableHints: ["node"],
+      defaultEffects: ["read", "write", "process"]
+    },
+    {
+      tool: "shell",
+      kind: "shell",
+      executableHints: ["sh", "bash", "cmd", "powershell"],
+      defaultEffects: ["read", "write", "process"]
+    }
   ]
 };
 var TOOL_RUN_TAIL_CHARS = 8000;
@@ -8985,11 +9020,36 @@ function combinedFailureText(input) {
 function hasNodeEnvRuntimeFailure(text) {
   return /env:\s*[`'"\u2018\u2019\u201c\u201d]?node[`'"\u2018\u2019\u201c\u201d]?:?\s+no such file or directory/i.test(text) || /\bnode:\s+not found\b/i.test(text) || /\bnode\.exe.*not found\b/i.test(text);
 }
+function hasObservedTimeoutFailure(input, text) {
+  if (input.timedOut || input.exitCode === 124)
+    return true;
+  return /(?:^|[\r\n])\s*(?:error:\s*)?(?:command|job|process|request|operation|executor|wrapper|script|test|validation|build|fetch)\s+(?:(?:was|has been)\s+)?timed out(?:\s+(?:after|while|waiting)\b|\s*[.!:]|$)/i.test(text) || /(?:^|[\r\n])\s*(?:error:\s*)?timed out(?:\s+after\b|\s*[.!:]|$)/i.test(text) || /\b(?:context )?deadline exceeded\b/i.test(text) || /\bETIMEDOUT\b/i.test(text) || /(?:^|[\r\n])\s*(?:error:\s*)?(?:(?:command|job|process|request|operation|executor|wrapper|script|test|validation|build|fetch)\s+)?timeout\s+(?:reached|expired|exceeded|after|while|waiting|occurred)\b/i.test(text) || /(?:^|[\r\n])\s*(?:error:\s*)?(?:job|command|process|request|operation|executor|wrapper)\s+timeout(?:\s+(?:reached|expired|after)\b|\s*[.!:]|$)/i.test(text) || /(?:^|[\r\n])\s*timeout\s*(?:[.!:]|$)/i.test(text);
+}
+function isWorkerOwnedRuntimeStackFrame(frame) {
+  const normalized = String(frame ?? "").replace(/\\/g, "/").toLowerCase();
+  return normalized.includes("/workspace/apps/workerpals/") || normalized.includes("/pushpals/apps/workerpals/") || normalized.includes("/packages/cli/runtime/sandbox/apps/workerpals/") || normalized.includes("/.pushpals/runtime/sandbox/apps/workerpals/") || normalized.includes("/.pushpals/runtime/sandbox/.pushpals-workerpals-runtime.js");
+}
+function hasWorkerRuntimeFailure(text) {
+  const exception = /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/i.exec(text);
+  if (!exception)
+    return false;
+  const firstFrame = text.slice((exception.index ?? 0) + exception[0].length).split(/\r?\n/).find((line) => /^\s*at\b/i.test(line));
+  return isWorkerOwnedRuntimeStackFrame(firstFrame);
+}
 function classifyToolFailure(input) {
   const tool = inferToolNameFromFailureText(input);
   const text = combinedFailureText(input);
   const lower = text.toLowerCase();
-  if (input.timedOut || lower.includes("timed out") || lower.includes("timeout")) {
+  const terminalText = [input.summary, input.detail, input.stderr].map(cleanText).filter(Boolean).join(`
+`);
+  if (hasWorkerRuntimeFailure(terminalText)) {
+    return {
+      failureClass: "worker_runtime_failure",
+      retryable: false,
+      remediation: "The PushPals WorkerPal runtime failed internally. Use a fixed PushPals runtime before retrying this workload."
+    };
+  }
+  if (hasObservedTimeoutFailure(input, terminalText)) {
     return {
       failureClass: "timeout",
       retryable: true,
@@ -9377,6 +9437,7 @@ var TOOL_FAILURE_CLASSES = [
   "permission",
   "policy_denied",
   "timeout",
+  "worker_runtime_failure",
   "nonzero_exit",
   "repo_state",
   "sandbox_mount",
@@ -9545,6 +9606,56 @@ function jobFailureText(value) {
   } catch {
     return raw;
   }
+}
+var WORKER_RUNTIME_CIRCUIT_FAILURE_CLASSES = new Set([
+  "worker_runtime_failure",
+  "missing_runtime_asset",
+  "no_structured_result",
+  "malformed_structured_result"
+]);
+function normalizeWorkerRuntimeFailureEvidence(value) {
+  return jobFailureText(value).replace(/\u001b\[[0-9;]*m/g, "").replace(/\\/g, "/").replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/gi, "<timestamp>").replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, "<uuid>").replace(/\b[0-9a-f]{32,64}\b/gi, "<hash>").replace(/\/\.worktrees\/[^/\s:)]+/gi, "/.worktrees/<worktree>").replace(/\b(job|request|task)(?:Id)?[=: ]+[a-z0-9_-]{8,}\b/gi, "$1=<id>").replace(/\b(?:elapsed|duration|uptime|timeout|limit)(?:_ms)?[=: ]+\d+(?:\.\d+)?(?:\s*(?:ms|s))?\b/gi, (match) => match.replace(/\d+(?:\.\d+)?(?:\s*(?:ms|s))?/i, "<duration>")).replace(/\b\d+(?:\.\d+)?\s*(?:milliseconds?|ms|seconds?|s)\b/gi, "<duration>").replace(/\bpid[=: ]+\d+\b/gi, "pid=<pid>").replace(/\s+/g, " ").trim().toLowerCase();
+}
+function workerRuntimeFailureSignature(failureClassValue, errorValue, summaryValue, terminalStageValue) {
+  const failureClass = String(failureClassValue ?? "").trim().toLowerCase();
+  const rawEvidence = [jobFailureText(errorValue), String(summaryValue ?? "")].filter(Boolean).join(`
+`).replace(/\\/g, "/");
+  const exceptionMatch = /\b(?:ReferenceError|TypeError|SyntaxError|RangeError|URIError|EvalError|AggregateError|Error):[^\r\n]{1,500}/i.exec(rawEvidence);
+  const exception = exceptionMatch?.[0];
+  const firstFrameLine = exceptionMatch ? rawEvidence.slice((exceptionMatch.index ?? 0) + exceptionMatch[0].length).split(/\r?\n/).find((line) => /^\s*at\b/i.test(line)) : undefined;
+  const normalizedFirstFrame = String(firstFrameLine ?? "").replace(/\\/g, "/");
+  const sourceWorkerFrame = normalizedFirstFrame.match(/(?:file:\/\/)?(?:[^\s():]+\/)?(apps\/workerpals\/src\/[^\s():]+):\d+:\d+/i);
+  const packagedWorkerFrame = normalizedFirstFrame.match(/(?:\.pushpals\/runtime\/sandbox\/)?(\.pushpals-workerpals-runtime\.js):\d+:\d+/i);
+  const workerFramePath = sourceWorkerFrame?.[1] ?? packagedWorkerFrame?.[1];
+  const hasStrongInternalStackEvidence = Boolean(exception && workerFramePath && isWorkerOwnedRuntimeStackFrame(firstFrameLine));
+  const hasStructuredWorkerRuntimeEvidence = String(terminalStageValue ?? "").trim().toLowerCase() === "worker_runtime" && (failureClass === "worker_runtime_failure" || failureClass === "missing_runtime_asset");
+  if (!hasStrongInternalStackEvidence && !hasStructuredWorkerRuntimeEvidence && (!WORKER_RUNTIME_CIRCUIT_FAILURE_CLASSES.has(failureClass) || failureClass === "worker_runtime_failure")) {
+    return null;
+  }
+  let signature = "";
+  if (hasStrongInternalStackEvidence && exception && workerFramePath) {
+    signature = `${normalizeWorkerRuntimeFailureEvidence(exception)} at ${workerFramePath.toLowerCase()}`;
+  } else {
+    const normalized = normalizeWorkerRuntimeFailureEvidence(rawEvidence);
+    if (!normalized)
+      return null;
+    signature = `${failureClass}: ${normalized.slice(0, 1200)}`;
+  }
+  return {
+    fingerprint: createHash2("sha256").update(signature).digest("hex").slice(0, 24),
+    signature: signature.slice(0, 500),
+    failureClass: hasStrongInternalStackEvidence ? "worker_runtime_failure" : failureClass
+  };
+}
+function resolveWorkerRuntimeCircuitRetryAfterMs(summary, options) {
+  const maxRetryAfterMs = Math.max(1000, Math.floor(options?.maxRetryAfterMs ?? 30 * 60 * 1000));
+  const minRetryAfterMs = Math.max(1000, Math.min(maxRetryAfterMs, Math.floor(options?.minRetryAfterMs ?? 1000)));
+  const nowMs = Number.isFinite(options?.nowMs) ? Number(options?.nowMs) : Date.now();
+  const lastFailureAtMs = Date.parse(String(summary.lastFailureAt ?? ""));
+  if (!Number.isFinite(lastFailureAtMs))
+    return maxRetryAfterMs;
+  const remainingBlockMs = lastFailureAtMs + summary.blockDurationMs - nowMs;
+  return Math.max(minRetryAfterMs, Math.min(maxRetryAfterMs, Math.floor(remainingBlockMs)));
 }
 function nestedFailureCommand(value) {
   const text = jobFailureText(value);
@@ -10189,28 +10300,6 @@ class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-               OR targetWorkerId = ?
-               OR (
-                 targetWorkerId IS NOT NULL
-                 AND NOT EXISTS (
-                   SELECT 1
-                   FROM workers tw
-                   WHERE tw.workerId = jobs.targetWorkerId
-                     AND COALESCE(tw.status, 'idle') <> 'offline'
-                     AND tw.lastHeartbeat >= ?
-                 )
-               )
-             )
-             AND (
-               targetWorkerId IS NULL
-               OR targetWorkerId = ?
-               OR NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
              )
            ORDER BY
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
@@ -10220,7 +10309,7 @@ class JobQueue {
                WHEN 'background' THEN 2
                ELSE 1
              END ASC,
-             createdAt ASC`).all(targetWorkerId, targetWorkerCutoff, now, targetWorkerId, targetWorkerCutoff, targetWorkerId, targetWorkerCutoff, targetWorkerId);
+             createdAt ASC`).all(targetWorkerId, targetWorkerCutoff, now, targetWorkerId);
       return rows2.map((row) => row.id);
     }
     const rows = this.db.prepare(`SELECT id
@@ -10229,16 +10318,6 @@ class JobQueue {
            AND (
              availableAt IS NULL
              OR availableAt <= ?
-             OR (
-               targetWorkerId IS NOT NULL
-               AND NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
-             )
            )
            AND (
              targetWorkerId IS NULL
@@ -10257,7 +10336,7 @@ class JobQueue {
              WHEN 'background' THEN 2
              ELSE 1
            END ASC,
-           createdAt ASC`).all(now, targetWorkerCutoff, targetWorkerCutoff);
+           createdAt ASC`).all(now, targetWorkerCutoff);
     return rows.map((row) => row.id);
   }
   queuePosition(jobId, targetWorkerId = null) {
@@ -10419,28 +10498,6 @@ class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-               OR targetWorkerId = ?
-               OR (
-                 targetWorkerId IS NOT NULL
-                 AND NOT EXISTS (
-                   SELECT 1
-                   FROM workers tw
-                   WHERE tw.workerId = jobs.targetWorkerId
-                     AND COALESCE(tw.status, 'idle') <> 'offline'
-                     AND tw.lastHeartbeat >= ?
-                 )
-               )
-             )
-             AND (
-               targetWorkerId IS NULL
-               OR targetWorkerId = ?
-               OR NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
              )
            ORDER BY
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
@@ -10451,7 +10508,7 @@ class JobQueue {
                ELSE 1
              END ASC,
              createdAt ASC
-           LIMIT 1`).get(workerId, targetWorkerCutoff, now, workerId, targetWorkerCutoff, workerId, targetWorkerCutoff, workerId);
+           LIMIT 1`).get(workerId, targetWorkerCutoff, now, workerId);
       if (!row) {
         this.db.prepare(`UPDATE workers SET status = 'idle', currentJobId = NULL, lastHeartbeat = ?, updatedAt = ?
              WHERE workerId = ?`).run(now, now, workerId);
@@ -10485,6 +10542,7 @@ class JobQueue {
           publishBlockedAt: null,
           completedAt: null,
           durationMs: null,
+          availableAt: null,
           updatedAt: now
         },
         queueWaitMs
@@ -10535,38 +10593,44 @@ class JobQueue {
         replacementJobId,
         replacementAvailableAt
       });
-      const abandonedInfo = this.db.prepare(`UPDATE jobs
-           SET status = 'abandoned',
-               error = ?,
-               failedAt = NULL,
-               abandonedAt = ?,
-               publishBlockedAt = NULL,
-               availableAt = NULL,
-               completedAt = NULL,
-               durationMs = MAX(
-                 0,
-                 CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
-               ),
-               updatedAt = ?
-           WHERE id = ?
-             AND status = 'claimed'
-             AND (? IS NULL OR workerId = ?)`).run(abandonmentError, now, now, now, job.id, options.expectedWorkerId ?? null, options.expectedWorkerId ?? null);
-      if (abandonedInfo.changes === 0)
+      const recover = this.db.transaction(() => {
+        const abandonedInfo = this.db.prepare(`UPDATE jobs
+             SET status = 'abandoned',
+                 error = ?,
+                 failedAt = NULL,
+                 abandonedAt = ?,
+                 publishBlockedAt = NULL,
+                 availableAt = NULL,
+                 completedAt = NULL,
+                 durationMs = MAX(
+                   0,
+                   CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+                 ),
+                 updatedAt = ?
+             WHERE id = ?
+               AND status = 'claimed'
+               AND (? IS NULL OR workerId = ?)`).run(abandonmentError, now, now, now, job.id, options.expectedWorkerId ?? null, options.expectedWorkerId ?? null);
+        if (abandonedInfo.changes === 0)
+          return false;
+        this.db.prepare(`INSERT INTO jobs (
+               id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
+               queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+               status, workerId, targetWorkerId, result, prUrl, error, availableAt,
+               enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
+               durationMs, resumeOfJobId, attempt, createdAt, updatedAt
+             )
+             VALUES (
+               ?, ?, ?, ?, ?, ?, ?, ?,
+               ?, ?, ?,
+               'pending', NULL, ?, NULL, ?, NULL, ?,
+               ?, NULL, NULL, NULL, NULL, NULL, NULL,
+               NULL, ?, ?, ?, ?
+             )`).run(replacementJobId, job.taskId, job.sessionId, job.kind, JSON.stringify(replacementParams), job.dedupeKey, job.dedupeCooldownMs, job.priority, job.queueWaitBudgetMs, job.executionBudgetMs, job.finalizationBudgetMs, nextTargetWorkerId, job.prUrl, replacementAvailableAt, now, job.id, attempt, now, now);
+        this.repointDurableRequestHandoffs(job.id, replacementJobId, now);
+        return true;
+      });
+      if (!recover())
         return null;
-      this.db.prepare(`INSERT INTO jobs (
-             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
-             queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-             status, workerId, targetWorkerId, result, prUrl, error, availableAt,
-             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
-             durationMs, resumeOfJobId, attempt, createdAt, updatedAt
-           )
-           VALUES (
-             ?, ?, ?, ?, ?, ?, ?, ?,
-             ?, ?, ?,
-             'pending', NULL, ?, NULL, ?, NULL, ?,
-             ?, NULL, NULL, NULL, NULL, NULL, NULL,
-             NULL, ?, ?, ?, ?
-           )`).run(replacementJobId, job.taskId, job.sessionId, job.kind, JSON.stringify(replacementParams), job.dedupeKey, job.dedupeCooldownMs, job.priority, job.queueWaitBudgetMs, job.executionBudgetMs, job.finalizationBudgetMs, nextTargetWorkerId, job.prUrl, replacementAvailableAt, now, job.id, attempt, now, now);
       return {
         jobId: job.id,
         taskId: job.taskId,
@@ -10616,6 +10680,22 @@ class JobQueue {
       retrySafety,
       recoveredAt: now
     };
+  }
+  repointDurableRequestHandoffs(previousJobId, replacementJobId, now) {
+    const requestColumns = this.db.prepare(`PRAGMA table_info(requests)`).all();
+    const names = new Set(requestColumns.map((column) => column.name));
+    if (!names.has("handoffJobId"))
+      return;
+    const durablePredicate = names.has("workerRequired") ? " AND workerRequired = 1" : "";
+    if (names.has("updatedAt")) {
+      this.db.prepare(`UPDATE requests
+           SET handoffJobId = ?, updatedAt = ?
+           WHERE handoffJobId = ?${durablePredicate}`).run(replacementJobId, now, previousJobId);
+      return;
+    }
+    this.db.prepare(`UPDATE requests
+         SET handoffJobId = ?
+         WHERE handoffJobId = ?${durablePredicate}`).run(replacementJobId, previousJobId);
   }
   heartbeat(body) {
     const workerIdRaw = body.workerId;
@@ -11196,16 +11276,6 @@ class JobQueue {
            AND (
              availableAt IS NULL
              OR availableAt <= ?
-             OR (
-               targetWorkerId IS NOT NULL
-               AND NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
-             )
            )
            AND (
              targetWorkerId IS NULL
@@ -11216,7 +11286,7 @@ class JobQueue {
                  AND COALESCE(tw.status, 'idle') <> 'offline'
                  AND tw.lastHeartbeat >= ?
              )
-           )`).get(normalizedKind, now, targetWorkerCutoff, targetWorkerCutoff);
+           )`).get(normalizedKind, now, targetWorkerCutoff);
     return Number(row?.count || 0);
   }
   listWorkerPrBacklog(limit = 200) {
@@ -11452,6 +11522,88 @@ class JobQueue {
       noPublishableFailureRate,
       completedCount,
       lastFailureAt: row?.lastFailureAt ?? null
+    };
+  }
+  workerRuntimeFailureCircuitSummary(options) {
+    const nowMs = Number.isFinite(options?.nowMs) ? Number(options?.nowMs) : Date.now();
+    const windowMs = Math.max(60000, Math.min(24 * 60 * 60 * 1000, Math.floor(options?.windowMs ?? 60 * 60 * 1000)));
+    const blockDurationMs = Math.max(60000, Math.min(windowMs, Math.floor(options?.maxBlockMs ?? 30 * 60 * 1000)));
+    const threshold = Math.max(2, Math.min(20, Math.floor(options?.threshold ?? 2)));
+    const cutoffIso = new Date(nowMs - windowMs).toISOString();
+    const rows = this.db.prepare(`SELECT
+           j.error,
+           COALESCE(j.failedAt, d.updatedAt, j.updatedAt) AS failureAt,
+           d.failureClass,
+           d.terminalStage,
+           d.executorBackend,
+           d.summary
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.kind = 'task.execute'
+           AND j.status = 'failed'
+           AND COALESCE(j.failedAt, d.updatedAt, j.updatedAt) >= ?
+         ORDER BY COALESCE(j.failedAt, d.updatedAt, j.updatedAt) DESC
+         LIMIT 1000`).all(cutoffIso);
+    const clusters = new Map;
+    let qualifyingFailureCount = 0;
+    for (const row of rows) {
+      const signature = workerRuntimeFailureSignature(row.failureClass, row.error, row.summary, row.terminalStage);
+      if (!signature)
+        continue;
+      qualifyingFailureCount += 1;
+      const previous = clusters.get(signature.fingerprint);
+      if (previous) {
+        previous.count += 1;
+        if ((parseIsoMs(row.failureAt) ?? Number.NEGATIVE_INFINITY) > (parseIsoMs(previous.lastFailureAt) ?? Number.NEGATIVE_INFINITY)) {
+          previous.lastFailureAt = row.failureAt;
+          previous.failureClass = signature.failureClass;
+          previous.executorBackend = String(row.executorBackend ?? "");
+          previous.signature = signature.signature;
+        }
+        continue;
+      }
+      clusters.set(signature.fingerprint, {
+        count: 1,
+        failureClass: signature.failureClass,
+        executorBackend: String(row.executorBackend ?? ""),
+        signature: signature.signature,
+        lastFailureAt: row.failureAt
+      });
+    }
+    const rankedClusters = [...clusters.entries()].sort((left, right) => {
+      const countDelta = right[1].count - left[1].count;
+      if (countDelta !== 0)
+        return countDelta;
+      return (parseIsoMs(right[1].lastFailureAt) ?? Number.NEGATIVE_INFINITY) - (parseIsoMs(left[1].lastFailureAt) ?? Number.NEGATIVE_INFINITY);
+    });
+    let selected = rankedClusters[0] ?? null;
+    let blocked = false;
+    for (const candidate of rankedClusters) {
+      const [, candidateCluster] = candidate;
+      if (candidateCluster.count < threshold)
+        continue;
+      const candidateLastFailureAtMs = parseIsoMs(candidateCluster.lastFailureAt);
+      if (candidateLastFailureAtMs == null || candidateLastFailureAtMs + blockDurationMs <= nowMs) {
+        continue;
+      }
+      selected = candidate;
+      blocked = true;
+      break;
+    }
+    const fingerprint = selected?.[0] ?? null;
+    const cluster = selected?.[1] ?? null;
+    return {
+      blocked,
+      windowMs,
+      blockDurationMs,
+      threshold,
+      qualifyingFailureCount,
+      recentMatchingFailureCount: cluster?.count ?? 0,
+      fingerprint,
+      failureClass: cluster?.failureClass || null,
+      executorBackend: cluster?.executorBackend || null,
+      signatureSample: cluster?.signature ?? null,
+      lastFailureAt: cluster?.lastFailureAt ?? null
     };
   }
   similarNoPublishableFailureSummary(options) {
@@ -11910,6 +12062,12 @@ import { randomUUID as randomUUID3 } from "crypto";
 var DEFAULT_REQUEST_LEASE_MS = 3 * 60000;
 var MIN_REQUEST_LEASE_MS = 30000;
 var MAX_REQUEST_LEASE_MS = 15 * 60000;
+var MIN_REQUEST_DEFER_MS = 1000;
+var MAX_REQUEST_DEFER_MS = 30 * 60000;
+var DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT = 200;
+var MAX_HANDOFF_CHAIN_RECONCILE_LIMIT = 1000;
+var DEFAULT_HANDOFF_CHAIN_DEPTH = 16;
+var MAX_HANDOFF_CHAIN_DEPTH = 64;
 var PRIORITY_SLA_MS = {
   interactive: 20000,
   normal: 90000,
@@ -12025,6 +12183,39 @@ function summarizeSamples2(samples) {
     sampleSize: valid.length
   };
 }
+var FAILED_HANDOFF_JOB_STATUSES = new Set(["failed", "abandoned", "publish_blocked"]);
+function projectRequestOutcome(row, handoffJob) {
+  const handoffJobStatus = asString2(handoffJob?.status).toLowerCase() || null;
+  const hasDurableWorkerHandoff = row.workerRequired === 1 && Boolean(asString2(row.handoffJobId));
+  let outcomeStatus = row.status;
+  let outcomeUpdatedAt = row.status === "failed" ? row.failedAt ?? row.updatedAt : row.status === "completed" ? row.completedAt ?? row.updatedAt : row.updatedAt;
+  let outcomeDurationMs = row.durationMs;
+  if (row.status !== "failed" && hasDurableWorkerHandoff) {
+    if (handoffJobStatus === "completed") {
+      outcomeStatus = "completed";
+      outcomeUpdatedAt = handoffJob?.completedAt ?? handoffJob?.updatedAt ?? row.updatedAt;
+    } else if (handoffJobStatus && FAILED_HANDOFF_JOB_STATUSES.has(handoffJobStatus)) {
+      outcomeStatus = "failed";
+      outcomeUpdatedAt = (handoffJobStatus === "failed" ? handoffJob?.failedAt : handoffJobStatus === "abandoned" ? handoffJob?.abandonedAt : handoffJob?.publishBlockedAt) ?? handoffJob?.updatedAt ?? row.updatedAt;
+    } else {
+      outcomeStatus = "delegated";
+      outcomeUpdatedAt = handoffJob?.updatedAt ?? row.updatedAt;
+      outcomeDurationMs = null;
+    }
+    if (outcomeStatus === "completed" || outcomeStatus === "failed") {
+      const startedAt = parseIsoMs2(row.enqueuedAt) ?? parseIsoMs2(row.createdAt);
+      const endedAt = parseIsoMs2(outcomeUpdatedAt);
+      outcomeDurationMs = startedAt != null && endedAt != null && endedAt >= startedAt ? Math.round(endedAt - startedAt) : null;
+    }
+  }
+  return {
+    ...row,
+    handoffJobStatus,
+    outcomeStatus,
+    outcomeUpdatedAt,
+    outcomeDurationMs
+  };
+}
 
 class RequestQueue {
   db;
@@ -12061,6 +12252,33 @@ class RequestQueue {
     this.db = new Database3(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this._migrate();
+  }
+  supportsJobOutcomeProjection() {
+    const columns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
+    const names = new Set(columns.map((column) => column.name));
+    return [
+      "id",
+      "status",
+      "failedAt",
+      "abandonedAt",
+      "publishBlockedAt",
+      "completedAt",
+      "updatedAt"
+    ].every((name) => names.has(name));
+  }
+  projectOutcomes(rows) {
+    if (rows.length === 0)
+      return [];
+    const handoffIds = Array.from(new Set(rows.filter((row) => row.workerRequired === 1).map((row) => asString2(row.handoffJobId)).filter(Boolean)));
+    if (handoffIds.length === 0 || !this.supportsJobOutcomeProjection()) {
+      return rows.map((row) => projectRequestOutcome(row, null));
+    }
+    const placeholders = handoffIds.map(() => "?").join(", ");
+    const handoffJobs = this.db.prepare(`SELECT id, status, failedAt, abandonedAt, publishBlockedAt, completedAt, updatedAt
+         FROM jobs
+         WHERE id IN (${placeholders})`).all(...handoffIds);
+    const jobsById = new Map(handoffJobs.map((job) => [job.id, job]));
+    return rows.map((row) => projectRequestOutcome(row, jobsById.get(asString2(row.handoffJobId)) ?? null));
   }
   _migrate() {
     this.db.exec(`
@@ -12373,6 +12591,35 @@ class RequestQueue {
     }
     return { ok: true, leaseExpiresAt };
   }
+  deferClaim(requestId, agentIdRaw, claimTokenRaw, retryAfterMsRaw) {
+    const agentId = String(agentIdRaw ?? "").trim();
+    if (!agentId)
+      return { ok: false, message: "agentId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken)
+      return { ok: false, message: "claimToken is required" };
+    const parsedRetryAfterMs = Number(retryAfterMsRaw);
+    const retryAfterMs = Math.max(MIN_REQUEST_DEFER_MS, Math.min(MAX_REQUEST_DEFER_MS, Number.isFinite(parsedRetryAfterMs) ? Math.floor(parsedRetryAfterMs) : MIN_REQUEST_DEFER_MS));
+    const now = new Date().toISOString();
+    const deferredUntil = new Date(Date.parse(now) + retryAfterMs).toISOString();
+    const result = this.db.prepare(`UPDATE requests
+         SET leaseExpiresAt = ?,
+             lastHeartbeatAt = ?,
+             updatedAt = ?
+         WHERE id = ?
+           AND status = 'claimed'
+           AND agentId = ?
+           AND claimToken = ?
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?`).run(deferredUntil, now, now, requestId, agentId, claimToken, now);
+    if (result.changes === 0) {
+      return {
+        ok: false,
+        message: "Request is not claimed with an active lease owned by this agent"
+      };
+    }
+    return { ok: true, retryAfterMs, deferredUntil };
+  }
   validateActiveLease(requestId, agentIdRaw, claimTokenRaw, nowInput = new Date) {
     const agentId = String(agentIdRaw ?? "").trim();
     if (!agentId)
@@ -12421,6 +12668,93 @@ class RequestQueue {
       recovered: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id)
     };
+  }
+  reconcileRecoveredWorkerHandoffChains(options) {
+    const emptyResult = () => ({
+      scanned: 0,
+      repointed: 0,
+      requestIds: [],
+      previousJobIds: [],
+      replacementJobIds: [],
+      cycleDetected: 0,
+      depthLimitReached: 0
+    });
+    const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
+    const requiredJobColumns = ["id", "status", "resumeOfJobId", "attempt", "createdAt"];
+    const jobColumnNames = new Set(jobColumns.map((column) => column.name));
+    if (!requiredJobColumns.every((name) => jobColumnNames.has(name)))
+      return emptyResult();
+    const requestedMaxRequests = Number(options?.maxRequests);
+    const requestedMaxDepth = Number(options?.maxDepth);
+    const maxRequests = Number.isFinite(requestedMaxRequests) ? Math.max(1, Math.min(MAX_HANDOFF_CHAIN_RECONCILE_LIMIT, Math.floor(requestedMaxRequests))) : DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT;
+    const maxDepth = Number.isFinite(requestedMaxDepth) ? Math.max(1, Math.min(MAX_HANDOFF_CHAIN_DEPTH, Math.floor(requestedMaxDepth))) : DEFAULT_HANDOFF_CHAIN_DEPTH;
+    const now = new Date().toISOString();
+    const reconcile = this.db.transaction(() => {
+      const result = emptyResult();
+      const candidates = this.db.prepare(`SELECT r.id AS requestId, r.handoffJobId AS previousJobId
+           FROM requests r
+           JOIN jobs currentJob ON currentJob.id = r.handoffJobId
+           WHERE r.workerRequired = 1
+             AND r.handoffJobId IS NOT NULL
+             AND currentJob.status = 'abandoned'
+             AND EXISTS (
+               SELECT 1
+               FROM jobs successor
+               WHERE successor.resumeOfJobId = currentJob.id
+             )
+           ORDER BY r.createdAt ASC, r.id ASC
+           LIMIT ?`).all(maxRequests);
+      result.scanned = candidates.length;
+      if (candidates.length === 0)
+        return result;
+      const nextSuccessor = this.db.prepare(`SELECT id, status
+         FROM jobs
+         WHERE resumeOfJobId = ?
+         ORDER BY attempt DESC, createdAt DESC, id DESC
+         LIMIT 1`);
+      const repoint = this.db.prepare(`UPDATE requests
+         SET handoffJobId = ?, updatedAt = ?
+         WHERE id = ?
+           AND workerRequired = 1
+           AND handoffJobId = ?`);
+      for (const candidate of candidates) {
+        const visited = new Set([candidate.previousJobId]);
+        let currentJobId = candidate.previousJobId;
+        let currentStatus = "abandoned";
+        let traversed = 0;
+        let invalidChain = false;
+        while (currentStatus === "abandoned") {
+          const successor = nextSuccessor.get(currentJobId);
+          if (!successor)
+            break;
+          if (visited.has(successor.id)) {
+            result.cycleDetected += 1;
+            invalidChain = true;
+            break;
+          }
+          if (traversed >= maxDepth) {
+            result.depthLimitReached += 1;
+            invalidChain = true;
+            break;
+          }
+          visited.add(successor.id);
+          currentJobId = successor.id;
+          currentStatus = asString2(successor.status).toLowerCase();
+          traversed += 1;
+        }
+        if (invalidChain || traversed === 0)
+          continue;
+        const updated = repoint.run(currentJobId, now, candidate.requestId, candidate.previousJobId);
+        if (updated.changes === 0)
+          continue;
+        result.repointed += 1;
+        result.requestIds.push(candidate.requestId);
+        result.previousJobIds.push(candidate.previousJobId);
+        result.replacementJobIds.push(currentJobId);
+      }
+      return result;
+    });
+    return reconcile();
   }
   reconcileWorkerHandoffsFromJobs(nowInput = new Date) {
     const jobsTable = this.db.prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`).get();
@@ -12611,7 +12945,7 @@ class RequestQueue {
     const row = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`).get(requestId) ?? null;
     if (!row)
       return null;
-    return { ...row, metadata: parseMetadataJson(row.metadataJson) };
+    return this.projectOutcomes([{ ...row, metadata: parseMetadataJson(row.metadataJson) }])[0] ?? null;
   }
   getPendingRequests() {
     const rows = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
@@ -12635,14 +12969,14 @@ class RequestQueue {
            FROM requests
            ORDER BY createdAt DESC
            LIMIT ?`).all(limit);
-      return rows2.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
+      return this.projectOutcomes(rows2.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })));
     }
     const rows = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
          FROM requests
          WHERE status = ?
          ORDER BY createdAt DESC
          LIMIT ?`).all(status, limit);
-    return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
+    return this.projectOutcomes(rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })));
   }
   countByStatus() {
     const rows = this.db.prepare(`SELECT status, COUNT(*) AS count FROM requests GROUP BY status`).all();
@@ -12708,21 +13042,34 @@ class RequestQueue {
   sloSummary(windowHours = 24) {
     const boundedWindowHours = Number.isFinite(windowHours) && windowHours > 0 ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours))) : 24;
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
-    const rows = this.db.prepare(`SELECT status, durationMs, enqueuedAt, claimedAt, createdAt, updatedAt
-         FROM requests
-         WHERE status IN ('completed', 'failed')
-           AND updatedAt >= ?`).all(cutoffIso);
+    const rows = this.supportsJobOutcomeProjection() ? this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
+             FROM requests
+             WHERE updatedAt >= ?
+                OR handoffJobId IN (
+                  SELECT id
+                  FROM jobs
+                  WHERE COALESCE(completedAt, failedAt, abandonedAt, publishBlockedAt, updatedAt) >= ?
+                )`).all(cutoffIso, cutoffIso) : this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
+             FROM requests
+             WHERE status IN ('completed', 'failed')
+               AND updatedAt >= ?`).all(cutoffIso);
+    const projectedRows = this.projectOutcomes(rows);
     let completed = 0;
     let failed = 0;
     const durationSamples = [];
     const queueWaitSamples = [];
-    for (const row of rows) {
-      if (row.status === "completed")
+    for (const row of projectedRows) {
+      const outcomeUpdatedAt = parseIsoMs2(row.outcomeUpdatedAt);
+      if (outcomeUpdatedAt == null || outcomeUpdatedAt < Date.parse(cutoffIso))
+        continue;
+      if (row.outcomeStatus === "completed")
         completed += 1;
-      if (row.status === "failed")
+      if (row.outcomeStatus === "failed")
         failed += 1;
-      if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) {
-        durationSamples.push(Math.round(row.durationMs));
+      if (row.outcomeStatus !== "completed" && row.outcomeStatus !== "failed")
+        continue;
+      if (typeof row.outcomeDurationMs === "number" && Number.isFinite(row.outcomeDurationMs) && row.outcomeDurationMs >= 0) {
+        durationSamples.push(Math.round(row.outcomeDurationMs));
       }
       const queueStart = parseIsoMs2(row.enqueuedAt) ?? parseIsoMs2(row.createdAt) ?? null;
       const queueEnd = parseIsoMs2(row.claimedAt) ?? parseIsoMs2(row.updatedAt) ?? null;
@@ -19645,6 +19992,15 @@ function guardedReconciliation(label, fallback, reconcile) {
   });
 }
 var requestHandoffReconciliation = guardedReconciliation("request handoff", { completed: 0, requestIds: [], jobIds: [] }, () => requestQueue.reconcileWorkerHandoffsFromJobs());
+var requestHandoffChainReconciliation = guardedReconciliation("request retry chain", {
+  scanned: 0,
+  repointed: 0,
+  requestIds: [],
+  previousJobIds: [],
+  replacementJobIds: [],
+  cycleDetected: 0,
+  depthLimitReached: 0
+}, () => requestQueue.reconcileRecoveredWorkerHandoffChains());
 var requestLeaseReconciliation = guardedReconciliation("request lease", { recovered: 0, requestIds: [] }, () => requestQueue.recoverExpiredClaims());
 var completionLeaseReconciliation = guardedReconciliation("completion lease", { recovered: 0, completionIds: [] }, () => completionQueue.recoverExpiredClaims());
 var lifecycleReconciliation = guardedReconciliation("completion lifecycle", { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 }, () => autonomyStore.reconcileJobLinkedOutcomeLifecycle());
@@ -19665,10 +20021,31 @@ if (requestLeaseReconciliation.recovered > 0) {
 if (requestHandoffReconciliation.completed > 0) {
   console.warn(`[Server] Reconciled ${requestHandoffReconciliation.completed} durable request/job handoff(s) after a planner crash.`);
 }
+if (requestHandoffChainReconciliation.repointed > 0) {
+  console.warn(`[Server] Repointed ${requestHandoffChainReconciliation.repointed} legacy durable request handoff(s) to their retry-chain leaf.`);
+}
+if (requestHandoffChainReconciliation.cycleDetected > 0 || requestHandoffChainReconciliation.depthLimitReached > 0) {
+  console.warn(`[Server] Legacy request retry-chain reconciliation found bounded invalid state: ${JSON.stringify(requestHandoffChainReconciliation)}`);
+}
 if (completionLeaseReconciliation.recovered > 0) {
   console.warn(`[Server] Requeued ${completionLeaseReconciliation.recovered} completion(s) with expired publication leases.`);
 }
 var lifecycleWatchdogTimer = setInterval(() => {
+  const requestHandoffChainRecovery = guardedReconciliation("request retry chain", {
+    scanned: 0,
+    repointed: 0,
+    requestIds: [],
+    previousJobIds: [],
+    replacementJobIds: [],
+    cycleDetected: 0,
+    depthLimitReached: 0
+  }, () => requestQueue.reconcileRecoveredWorkerHandoffChains());
+  if (requestHandoffChainRecovery.repointed > 0) {
+    console.warn(`[Server] Periodic watchdog repointed ${requestHandoffChainRecovery.repointed} legacy durable request handoff(s) to their retry-chain leaf.`);
+  }
+  if (requestHandoffChainRecovery.cycleDetected > 0 || requestHandoffChainRecovery.depthLimitReached > 0) {
+    console.warn(`[Server] Periodic watchdog found bounded invalid legacy request retry-chain state: ${JSON.stringify(requestHandoffChainRecovery)}`);
+  }
   const requestHandoffRecovery = guardedReconciliation("request handoff", { completed: 0, requestIds: [], jobIds: [] }, () => requestQueue.reconcileWorkerHandoffsFromJobs());
   if (requestHandoffRecovery.completed > 0) {
     console.warn(`[Server] Periodic watchdog reconciled ${requestHandoffRecovery.completed} durable request/job handoff(s).`);
@@ -19742,9 +20119,12 @@ var AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS = 60 * 60 * 1000;
 var AUTONOMY_WORKER_FAILURE_CIRCUIT_THRESHOLD = 3;
 var AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE = 0.5;
 var AUTONOMY_WORKER_FAILURE_DEFER_MS = 30 * 60 * 1000;
+var AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD = 2;
+var AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS = 30 * 60 * 1000;
 var AUTONOMY_SIMILAR_FAILURE_WINDOW_MS = 6 * 60 * 60 * 1000;
 var AUTONOMY_SIMILAR_FAILURE_THRESHOLD = 2;
 var AUTONOMY_SIMILAR_FAILURE_DEFER_MS = 30 * 60 * 1000;
+var MAX_INELIGIBLE_CLAIMS_PER_POLL = 64;
 var CLIENT_TRANSPORT_HEARTBEAT_MS = 15000;
 var SESSION_TOKEN_BUDGET = Math.max(0, STARTUP_CONFIG.server.sessionTokenBudget);
 function getSessionTokenBudgetStatus(sessionIdRaw) {
@@ -20031,6 +20411,27 @@ function createRequestHandler() {
           message: autonomyFailureCircuitMessage(failureCircuit),
           retryAfterMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
           ...failureCircuit
+        }, 429);
+      };
+      const autonomyWorkerRuntimeCircuitSummary = () => jobQueue.workerRuntimeFailureCircuitSummary({
+        windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
+        maxBlockMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
+        threshold: AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD
+      });
+      const autonomyWorkerRuntimeCircuitMessage = (runtimeCircuit) => `Autonomy enqueue blocked: WorkerPal repeated the same internal runtime failure ` + `${runtimeCircuit.recentMatchingFailureCount} time(s) within the recent window.`;
+      const autonomyWorkerRuntimeCircuitRetryAfterMs = (runtimeCircuit) => resolveWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit, {
+        maxRetryAfterMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS
+      });
+      const makeAutonomyWorkerRuntimeCircuitResponse = () => {
+        const runtimeCircuit = autonomyWorkerRuntimeCircuitSummary();
+        if (!runtimeCircuit.blocked)
+          return null;
+        return makeJson({
+          ok: false,
+          code: "autonomy_worker_runtime_circuit_open",
+          message: autonomyWorkerRuntimeCircuitMessage(runtimeCircuit),
+          retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+          ...runtimeCircuit
         }, 429);
       };
       const autonomySimilarFailureSummary = (value) => {
@@ -20515,6 +20916,9 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse)
             return reservationResponse;
+          const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
+          if (runtimeCircuitResponse)
+            return runtimeCircuitResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse)
             return failureCircuitResponse;
@@ -20535,9 +20939,11 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         maybeRecoverStaleClaims();
         const body = await req.json().catch(() => ({}));
         const workerId = body.workerId || "unknown";
+        let skippedCount = 0;
+        let cachedRuntimeCircuit;
+        let cachedFailureCircuit;
         let result = jobQueue.claim(workerId);
-        let skipped = 0;
-        while (result.ok && result.job?.id && skipped < 64) {
+        while (result.ok && result.job?.id) {
           const budgetStatus = getSessionTokenBudgetStatus(result.job.sessionId);
           if (budgetStatus?.exceeded) {
             emitSessionBudgetPauseNotice(result.job.sessionId, budgetStatus);
@@ -20545,7 +20951,10 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               message: "Session token budget exceeded",
               detail: sessionTokenBudgetMessage(budgetStatus)
             });
-            skipped += 1;
+            skippedCount += 1;
+            if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+              return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+            }
             result = jobQueue.claim(workerId);
             continue;
           }
@@ -20557,7 +20966,25 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               ...result.job,
               params: parseJsonRecord2(result.job.params)
             };
-            const failureCircuit = autonomyFailureCircuitSummary();
+            const runtimeCircuit = cachedRuntimeCircuit ?? (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
+            if (runtimeCircuit.blocked) {
+              jobQueue.defer(result.job.id, {
+                workerId,
+                deferMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+                detail: JSON.stringify({
+                  code: "autonomy_worker_runtime_circuit_open",
+                  retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+                  ...runtimeCircuit
+                })
+              });
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
+              result = jobQueue.claim(workerId);
+              continue;
+            }
+            const failureCircuit = cachedFailureCircuit ?? (cachedFailureCircuit = autonomyFailureCircuitSummary());
             if (failureCircuit.blocked) {
               jobQueue.defer(result.job.id, {
                 workerId,
@@ -20567,7 +20994,10 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
                   ...failureCircuit
                 })
               });
-              skipped += 1;
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
               result = jobQueue.claim(workerId);
               continue;
             }
@@ -20581,7 +21011,10 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
                   ...similarFailure
                 })
               });
-              skipped += 1;
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
               result = jobQueue.claim(workerId);
               continue;
             }
@@ -21537,6 +21970,9 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse)
             return reservationResponse;
+          const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
+          if (runtimeCircuitResponse)
+            return runtimeCircuitResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse)
             return failureCircuitResponse;
@@ -21614,9 +22050,11 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (!agentId)
           return makeJson({ ok: false, message: "agentId is required" }, 400);
         const leaseMs = typeof body.leaseMs === "number" ? body.leaseMs : undefined;
+        let skippedCount = 0;
+        let cachedRuntimeCircuit;
+        let cachedFailureCircuit;
         let result = requestQueue.claim(agentId, { leaseMs });
-        let skipped = 0;
-        while (result.ok && result.request?.id && skipped < 64) {
+        while (result.ok && result.request?.id) {
           const budgetStatus = getSessionTokenBudgetStatus(result.request.sessionId);
           if (budgetStatus?.exceeded) {
             emitSessionBudgetPauseNotice(result.request.sessionId, budgetStatus);
@@ -21626,38 +22064,63 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               message: "Session token budget exceeded",
               detail: sessionTokenBudgetMessage(budgetStatus)
             });
-            skipped += 1;
+            skippedCount += 1;
+            if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+              return makeJson({ ok: true, request: null, skippedCount, scanLimitReached: true }, 200);
+            }
             result = requestQueue.claim(agentId, { leaseMs });
             continue;
           }
           if (isAutonomyRequestPayload(result.request)) {
-            const failureCircuit = autonomyFailureCircuitSummary();
+            const runtimeCircuit = cachedRuntimeCircuit ?? (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
+            if (runtimeCircuit.blocked) {
+              const retryAfterMs = autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit);
+              const deferred = requestQueue.deferClaim(result.request.id, agentId, result.request.claimToken ?? "", retryAfterMs);
+              if (!deferred.ok) {
+                return makeJson({
+                  ok: false,
+                  code: "request_circuit_deferral_failed",
+                  message: deferred.message
+                }, 409);
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, request: null, skippedCount, scanLimitReached: true }, 200);
+              }
+              result = requestQueue.claim(agentId, { leaseMs });
+              continue;
+            }
+            const failureCircuit = cachedFailureCircuit ?? (cachedFailureCircuit = autonomyFailureCircuitSummary());
             if (failureCircuit.blocked) {
-              requestQueue.fail(result.request.id, {
-                agentId,
-                claimToken: result.request.claimToken,
-                message: autonomyFailureCircuitMessage(failureCircuit),
-                detail: JSON.stringify({
-                  code: "autonomy_worker_failure_circuit_open",
-                  ...failureCircuit
-                })
-              });
-              skipped += 1;
+              const deferred = requestQueue.deferClaim(result.request.id, agentId, result.request.claimToken ?? "", AUTONOMY_WORKER_FAILURE_DEFER_MS);
+              if (!deferred.ok) {
+                return makeJson({
+                  ok: false,
+                  code: "request_circuit_deferral_failed",
+                  message: deferred.message
+                }, 409);
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, request: null, skippedCount, scanLimitReached: true }, 200);
+              }
               result = requestQueue.claim(agentId, { leaseMs });
               continue;
             }
             const similarFailure = autonomySimilarFailureSummary(result.request);
             if (similarFailure.blocked) {
-              requestQueue.fail(result.request.id, {
-                agentId,
-                claimToken: result.request.claimToken,
-                message: `Autonomy request suppressed after ` + `${similarFailure.recentSimilarFailureCount} unchanged target-and-failure fingerprint occurrence(s).`,
-                detail: JSON.stringify({
-                  code: "autonomy_similar_failure_suppressed",
-                  ...similarFailure
-                })
-              });
-              skipped += 1;
+              const deferred = requestQueue.deferClaim(result.request.id, agentId, result.request.claimToken ?? "", AUTONOMY_SIMILAR_FAILURE_DEFER_MS);
+              if (!deferred.ok) {
+                return makeJson({
+                  ok: false,
+                  code: "request_circuit_deferral_failed",
+                  message: deferred.message
+                }, 409);
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, request: null, skippedCount, scanLimitReached: true }, 200);
+              }
               result = requestQueue.claim(agentId, { leaseMs });
               continue;
             }

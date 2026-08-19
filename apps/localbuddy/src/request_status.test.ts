@@ -427,4 +427,80 @@ describe("buildRequestStatusReply", () => {
       "RemoteBuddy finished orchestration; no WorkerPal job is linked yet.",
     );
   });
+
+  test("reports a planner-completed worker handoff as delegated until its job terminates", () => {
+    const sessionId = "session-delegated";
+    const requestId = "dddd4444-eeee-ffff-aaaa-111111111111";
+    const jobId = "eeee5555-ffff-aaaa-bbbb-222222222222";
+    const request = makeRequest({
+      id: requestId,
+      sessionId,
+      status: "completed",
+      workerRequired: 1,
+      handoffJobId: jobId,
+      outcomeStatus: "delegated",
+      updatedAt: "2025-02-07T10:00:00.000Z",
+    });
+    const job = makeJob({
+      id: jobId,
+      sessionId,
+      status: "claimed",
+      workerId: "worker-delegated",
+      params: JSON.stringify({ requestId }),
+      updatedAt: "2025-02-07T10:02:00.000Z",
+    });
+
+    const reply = buildRequestStatusReply({
+      userPrompt: `status request ${requestId.slice(0, 8)}`,
+      sessionId,
+      requests: [request],
+      jobs: [job],
+      summarizeFailure,
+      formatTime: stableFormatTime,
+    });
+
+    expect(reply).toContain(`Request ${requestId.slice(0, 8)} is delegated`);
+    expect(reply).not.toContain(`Request ${requestId.slice(0, 8)} is completed`);
+    expect(reply).toContain(`WorkerPal job ${jobId.slice(0, 8)} is claimed`);
+  });
+
+  test("reports the linked worker failure as the request outcome", () => {
+    const sessionId = "session-delegated-failure";
+    const requestId = "ffff6666-aaaa-bbbb-cccc-333333333333";
+    const jobId = "aaaa7777-bbbb-cccc-dddd-444444444444";
+    const request = makeRequest({
+      id: requestId,
+      sessionId,
+      status: "completed",
+      workerRequired: 1,
+      handoffJobId: jobId,
+      outcomeStatus: "failed",
+      outcomeUpdatedAt: "2025-02-07T11:05:00.000Z",
+      outcomeDurationMs: 305_000,
+      updatedAt: "2025-02-07T11:00:00.000Z",
+    });
+    const job = makeJob({
+      id: jobId,
+      sessionId,
+      status: "failed",
+      workerId: "worker-failed",
+      params: JSON.stringify({ requestId }),
+      error: JSON.stringify({ message: "worker runtime crashed" }),
+      updatedAt: "2025-02-07T11:05:00.000Z",
+    });
+
+    const reply = buildRequestStatusReply({
+      userPrompt: `status request ${requestId.slice(0, 8)}`,
+      sessionId,
+      requests: [request],
+      jobs: [job],
+      summarizeFailure,
+      formatTime: stableFormatTime,
+    });
+
+    expect(reply).toContain(`Request ${requestId.slice(0, 8)} is failed`);
+    expect(reply).not.toContain(`Request ${requestId.slice(0, 8)} is completed`);
+    expect(reply).toContain("End-to-end: 5m 5s.");
+    expect(reply).toContain("Failure: worker runtime crashed");
+  });
 });

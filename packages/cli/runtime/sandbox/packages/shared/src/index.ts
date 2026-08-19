@@ -77,6 +77,7 @@ export {
   classifyToolFailure,
   createToolRunRecordFromFailure,
   inferToolNameFromFailureText,
+  isWorkerOwnedRuntimeStackFrame,
   normalizeToolName,
   redactToolText,
   resolveToolKind,

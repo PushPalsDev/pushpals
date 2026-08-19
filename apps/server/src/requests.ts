@@ -17,11 +17,18 @@ import {
 } from "shared";
 
 export type RequestStatus = "pending" | "claimed" | "completed" | "failed";
+export type RequestOutcomeStatus = RequestStatus | "delegated";
 export type QueuePriority = "interactive" | "normal" | "background";
 
 export const DEFAULT_REQUEST_LEASE_MS = 3 * 60_000;
 const MIN_REQUEST_LEASE_MS = 30_000;
 const MAX_REQUEST_LEASE_MS = 15 * 60_000;
+const MIN_REQUEST_DEFER_MS = 1_000;
+const MAX_REQUEST_DEFER_MS = 30 * 60_000;
+const DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT = 200;
+const MAX_HANDOFF_CHAIN_RECONCILE_LIMIT = 1_000;
+const DEFAULT_HANDOFF_CHAIN_DEPTH = 16;
+const MAX_HANDOFF_CHAIN_DEPTH = 64;
 
 const PRIORITY_ORDER: QueuePriority[] = ["interactive", "normal", "background"];
 const PRIORITY_SLA_MS: Record<QueuePriority, number> = {
@@ -172,6 +179,14 @@ export interface RequestRow {
   forceLane: string | null; // "worker" | "deterministic" | null
   workerRequired: number; // Durable server-owned planning/handoff invariant (0/1)
   handoffJobId: string | null;
+  /**
+   * Read-model fields. `status` remains the planner queue protocol state, while
+   * `outcomeStatus` follows a durable WorkerPal handoff through execution.
+   */
+  handoffJobStatus?: string | null;
+  outcomeStatus?: RequestOutcomeStatus;
+  outcomeUpdatedAt?: string | null;
+  outcomeDurationMs?: number | null;
   status: RequestStatus;
   agentId: string | null;
   claimToken: string | null;
@@ -207,10 +222,89 @@ export interface RequestSloSummary {
   queueWaitMs: SloMetricSummary;
 }
 
+interface HandoffJobOutcomeRow {
+  id: string;
+  status: string;
+  failedAt: string | null;
+  abandonedAt: string | null;
+  publishBlockedAt: string | null;
+  completedAt: string | null;
+  updatedAt: string | null;
+}
+
+const FAILED_HANDOFF_JOB_STATUSES = new Set(["failed", "abandoned", "publish_blocked"]);
+
+function projectRequestOutcome(
+  row: RequestRow,
+  handoffJob: HandoffJobOutcomeRow | null,
+): RequestRow {
+  const handoffJobStatus = asString(handoffJob?.status).toLowerCase() || null;
+  const hasDurableWorkerHandoff = row.workerRequired === 1 && Boolean(asString(row.handoffJobId));
+  let outcomeStatus: RequestOutcomeStatus = row.status;
+  let outcomeUpdatedAt: string | null =
+    row.status === "failed"
+      ? (row.failedAt ?? row.updatedAt)
+      : row.status === "completed"
+        ? (row.completedAt ?? row.updatedAt)
+        : row.updatedAt;
+  let outcomeDurationMs = row.durationMs;
+
+  // A planner failure is terminal regardless of whether it had begun a
+  // handoff. Otherwise, a durable handoff owns the user-visible outcome until
+  // its exact WorkerPal job terminates.
+  if (row.status !== "failed" && hasDurableWorkerHandoff) {
+    if (handoffJobStatus === "completed") {
+      outcomeStatus = "completed";
+      outcomeUpdatedAt = handoffJob?.completedAt ?? handoffJob?.updatedAt ?? row.updatedAt;
+    } else if (handoffJobStatus && FAILED_HANDOFF_JOB_STATUSES.has(handoffJobStatus)) {
+      outcomeStatus = "failed";
+      outcomeUpdatedAt =
+        (handoffJobStatus === "failed"
+          ? handoffJob?.failedAt
+          : handoffJobStatus === "abandoned"
+            ? handoffJob?.abandonedAt
+            : handoffJob?.publishBlockedAt) ??
+        handoffJob?.updatedAt ??
+        row.updatedAt;
+    } else {
+      outcomeStatus = "delegated";
+      outcomeUpdatedAt = handoffJob?.updatedAt ?? row.updatedAt;
+      outcomeDurationMs = null;
+    }
+
+    if (outcomeStatus === "completed" || outcomeStatus === "failed") {
+      const startedAt = parseIsoMs(row.enqueuedAt) ?? parseIsoMs(row.createdAt);
+      const endedAt = parseIsoMs(outcomeUpdatedAt);
+      outcomeDurationMs =
+        startedAt != null && endedAt != null && endedAt >= startedAt
+          ? Math.round(endedAt - startedAt)
+          : null;
+    }
+  }
+
+  return {
+    ...row,
+    handoffJobStatus,
+    outcomeStatus,
+    outcomeUpdatedAt,
+    outcomeDurationMs,
+  };
+}
+
 export interface RequestHandoffReconciliationResult {
   completed: number;
   requestIds: string[];
   jobIds: string[];
+}
+
+export interface RequestHandoffChainReconciliationResult {
+  scanned: number;
+  repointed: number;
+  requestIds: string[];
+  previousJobIds: string[];
+  replacementJobIds: string[];
+  cycleDetected: number;
+  depthLimitReached: number;
 }
 
 export interface RequestTerminalTransitionResult {
@@ -256,6 +350,48 @@ export class RequestQueue {
     this.db = new Database(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this._migrate();
+  }
+
+  private supportsJobOutcomeProjection(): boolean {
+    const columns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+    return [
+      "id",
+      "status",
+      "failedAt",
+      "abandonedAt",
+      "publishBlockedAt",
+      "completedAt",
+      "updatedAt",
+    ].every((name) => names.has(name));
+  }
+
+  private projectOutcomes(rows: RequestRow[]): RequestRow[] {
+    if (rows.length === 0) return [];
+    const handoffIds = Array.from(
+      new Set(
+        rows
+          .filter((row) => row.workerRequired === 1)
+          .map((row) => asString(row.handoffJobId))
+          .filter(Boolean),
+      ),
+    );
+    if (handoffIds.length === 0 || !this.supportsJobOutcomeProjection()) {
+      return rows.map((row) => projectRequestOutcome(row, null));
+    }
+
+    const placeholders = handoffIds.map(() => "?").join(", ");
+    const handoffJobs = this.db
+      .prepare(
+        `SELECT id, status, failedAt, abandonedAt, publishBlockedAt, completedAt, updatedAt
+         FROM jobs
+         WHERE id IN (${placeholders})`,
+      )
+      .all(...handoffIds) as HandoffJobOutcomeRow[];
+    const jobsById = new Map(handoffJobs.map((job) => [job.id, job]));
+    return rows.map((row) =>
+      projectRequestOutcome(row, jobsById.get(asString(row.handoffJobId)) ?? null),
+    );
   }
 
   private _migrate(): void {
@@ -721,6 +857,60 @@ export class RequestQueue {
     return { ok: true, leaseExpiresAt };
   }
 
+  /**
+   * Keep a claimed request nonterminal while a temporary admission circuit is
+   * open. The claim remains unavailable until ordinary stale-claim recovery
+   * requeues it. Only the current fenced owner can defer a claim, and the
+   * delay is bounded so a circuit cannot strand work indefinitely.
+   */
+  deferClaim(
+    requestId: string,
+    agentIdRaw: string,
+    claimTokenRaw: string,
+    retryAfterMsRaw: number,
+  ): {
+    ok: boolean;
+    retryAfterMs?: number;
+    deferredUntil?: string;
+    message?: string;
+  } {
+    const agentId = String(agentIdRaw ?? "").trim();
+    if (!agentId) return { ok: false, message: "agentId is required" };
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!claimToken) return { ok: false, message: "claimToken is required" };
+    const parsedRetryAfterMs = Number(retryAfterMsRaw);
+    const retryAfterMs = Math.max(
+      MIN_REQUEST_DEFER_MS,
+      Math.min(
+        MAX_REQUEST_DEFER_MS,
+        Number.isFinite(parsedRetryAfterMs) ? Math.floor(parsedRetryAfterMs) : MIN_REQUEST_DEFER_MS,
+      ),
+    );
+    const now = new Date().toISOString();
+    const deferredUntil = new Date(Date.parse(now) + retryAfterMs).toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE requests
+         SET leaseExpiresAt = ?,
+             lastHeartbeatAt = ?,
+             updatedAt = ?
+         WHERE id = ?
+           AND status = 'claimed'
+           AND agentId = ?
+           AND claimToken = ?
+           AND leaseExpiresAt IS NOT NULL
+           AND leaseExpiresAt > ?`,
+      )
+      .run(deferredUntil, now, now, requestId, agentId, claimToken, now);
+    if (result.changes === 0) {
+      return {
+        ok: false,
+        message: "Request is not claimed with an active lease owned by this agent",
+      };
+    }
+    return { ok: true, retryAfterMs, deferredUntil };
+  }
+
   validateActiveLease(
     requestId: string,
     agentIdRaw: string,
@@ -787,6 +977,129 @@ export class RequestQueue {
       recovered: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id),
     };
+  }
+
+  /**
+   * Repair durable requests persisted by older runtimes before retry-safe stale
+   * recovery atomically repointed request handoffs. Only abandoned handoffs
+   * with a deterministic successor are candidates. Traversal is bounded and
+   * cycle-safe so corrupt legacy metadata cannot stall startup or the periodic
+   * lifecycle watchdog.
+   */
+  reconcileRecoveredWorkerHandoffChains(options?: {
+    maxRequests?: number;
+    maxDepth?: number;
+  }): RequestHandoffChainReconciliationResult {
+    const emptyResult = (): RequestHandoffChainReconciliationResult => ({
+      scanned: 0,
+      repointed: 0,
+      requestIds: [],
+      previousJobIds: [],
+      replacementJobIds: [],
+      cycleDetected: 0,
+      depthLimitReached: 0,
+    });
+    const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{
+      name: string;
+    }>;
+    const requiredJobColumns = ["id", "status", "resumeOfJobId", "attempt", "createdAt"];
+    const jobColumnNames = new Set(jobColumns.map((column) => column.name));
+    if (!requiredJobColumns.every((name) => jobColumnNames.has(name))) return emptyResult();
+
+    const requestedMaxRequests = Number(options?.maxRequests);
+    const requestedMaxDepth = Number(options?.maxDepth);
+    const maxRequests = Number.isFinite(requestedMaxRequests)
+      ? Math.max(1, Math.min(MAX_HANDOFF_CHAIN_RECONCILE_LIMIT, Math.floor(requestedMaxRequests)))
+      : DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT;
+    const maxDepth = Number.isFinite(requestedMaxDepth)
+      ? Math.max(1, Math.min(MAX_HANDOFF_CHAIN_DEPTH, Math.floor(requestedMaxDepth)))
+      : DEFAULT_HANDOFF_CHAIN_DEPTH;
+    const now = new Date().toISOString();
+
+    const reconcile = this.db.transaction((): RequestHandoffChainReconciliationResult => {
+      const result = emptyResult();
+      const candidates = this.db
+        .prepare(
+          `SELECT r.id AS requestId, r.handoffJobId AS previousJobId
+           FROM requests r
+           JOIN jobs currentJob ON currentJob.id = r.handoffJobId
+           WHERE r.workerRequired = 1
+             AND r.handoffJobId IS NOT NULL
+             AND currentJob.status = 'abandoned'
+             AND EXISTS (
+               SELECT 1
+               FROM jobs successor
+               WHERE successor.resumeOfJobId = currentJob.id
+             )
+           ORDER BY r.createdAt ASC, r.id ASC
+           LIMIT ?`,
+        )
+        .all(maxRequests) as Array<{ requestId: string; previousJobId: string }>;
+      result.scanned = candidates.length;
+      if (candidates.length === 0) return result;
+
+      const nextSuccessor = this.db.prepare(
+        `SELECT id, status
+         FROM jobs
+         WHERE resumeOfJobId = ?
+         ORDER BY attempt DESC, createdAt DESC, id DESC
+         LIMIT 1`,
+      );
+      const repoint = this.db.prepare(
+        `UPDATE requests
+         SET handoffJobId = ?, updatedAt = ?
+         WHERE id = ?
+           AND workerRequired = 1
+           AND handoffJobId = ?`,
+      );
+
+      for (const candidate of candidates) {
+        const visited = new Set([candidate.previousJobId]);
+        let currentJobId = candidate.previousJobId;
+        let currentStatus = "abandoned";
+        let traversed = 0;
+        let invalidChain = false;
+
+        while (currentStatus === "abandoned") {
+          const successor = nextSuccessor.get(currentJobId) as
+            | { id: string; status: string }
+            | undefined;
+          if (!successor) break;
+          if (visited.has(successor.id)) {
+            result.cycleDetected += 1;
+            invalidChain = true;
+            break;
+          }
+          if (traversed >= maxDepth) {
+            result.depthLimitReached += 1;
+            invalidChain = true;
+            break;
+          }
+
+          visited.add(successor.id);
+          currentJobId = successor.id;
+          currentStatus = asString(successor.status).toLowerCase();
+          traversed += 1;
+        }
+
+        if (invalidChain || traversed === 0) continue;
+        const updated = repoint.run(
+          currentJobId,
+          now,
+          candidate.requestId,
+          candidate.previousJobId,
+        );
+        if (updated.changes === 0) continue;
+        result.repointed += 1;
+        result.requestIds.push(candidate.requestId);
+        result.previousJobIds.push(candidate.previousJobId);
+        result.replacementJobIds.push(currentJobId);
+      }
+
+      return result;
+    });
+
+    return reconcile();
   }
 
   /**
@@ -1032,7 +1345,9 @@ export class RequestQueue {
         .prepare(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`)
         .get(requestId) as RequestRow | undefined) ?? null;
     if (!row) return null;
-    return { ...row, metadata: parseMetadataJson(row.metadataJson) };
+    return (
+      this.projectOutcomes([{ ...row, metadata: parseMetadataJson(row.metadataJson) }])[0] ?? null
+    );
   }
 
   getPendingRequests(): RequestRow[] {
@@ -1070,7 +1385,9 @@ export class RequestQueue {
            LIMIT ?`,
         )
         .all(limit) as RequestRow[];
-      return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
+      return this.projectOutcomes(
+        rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })),
+      );
     }
 
     const rows = this.db
@@ -1082,7 +1399,9 @@ export class RequestQueue {
          LIMIT ?`,
       )
       .all(status, limit) as RequestRow[];
-    return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
+    return this.projectOutcomes(
+      rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })),
+    );
   }
 
   countByStatus(): Record<RequestStatus, number> {
@@ -1186,36 +1505,46 @@ export class RequestQueue {
         ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours)))
         : 24;
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
-    const rows = this.db
-      .prepare(
-        `SELECT status, durationMs, enqueuedAt, claimedAt, createdAt, updatedAt
-         FROM requests
-         WHERE status IN ('completed', 'failed')
-           AND updatedAt >= ?`,
-      )
-      .all(cutoffIso) as Array<{
-      status: RequestStatus;
-      durationMs: number | null;
-      enqueuedAt: string | null;
-      claimedAt: string | null;
-      createdAt: string | null;
-      updatedAt: string | null;
-    }>;
+    const rows = this.supportsJobOutcomeProjection()
+      ? (this.db
+          .prepare(
+            `SELECT ${RequestQueue.SELECT_COLUMNS}
+             FROM requests
+             WHERE updatedAt >= ?
+                OR handoffJobId IN (
+                  SELECT id
+                  FROM jobs
+                  WHERE COALESCE(completedAt, failedAt, abandonedAt, publishBlockedAt, updatedAt) >= ?
+                )`,
+          )
+          .all(cutoffIso, cutoffIso) as RequestRow[])
+      : (this.db
+          .prepare(
+            `SELECT ${RequestQueue.SELECT_COLUMNS}
+             FROM requests
+             WHERE status IN ('completed', 'failed')
+               AND updatedAt >= ?`,
+          )
+          .all(cutoffIso) as RequestRow[]);
+    const projectedRows = this.projectOutcomes(rows);
 
     let completed = 0;
     let failed = 0;
     const durationSamples: number[] = [];
     const queueWaitSamples: number[] = [];
 
-    for (const row of rows) {
-      if (row.status === "completed") completed += 1;
-      if (row.status === "failed") failed += 1;
+    for (const row of projectedRows) {
+      const outcomeUpdatedAt = parseIsoMs(row.outcomeUpdatedAt);
+      if (outcomeUpdatedAt == null || outcomeUpdatedAt < Date.parse(cutoffIso)) continue;
+      if (row.outcomeStatus === "completed") completed += 1;
+      if (row.outcomeStatus === "failed") failed += 1;
+      if (row.outcomeStatus !== "completed" && row.outcomeStatus !== "failed") continue;
       if (
-        typeof row.durationMs === "number" &&
-        Number.isFinite(row.durationMs) &&
-        row.durationMs >= 0
+        typeof row.outcomeDurationMs === "number" &&
+        Number.isFinite(row.outcomeDurationMs) &&
+        row.outcomeDurationMs >= 0
       ) {
-        durationSamples.push(Math.round(row.durationMs));
+        durationSamples.push(Math.round(row.outcomeDurationMs));
       }
       const queueStart = parseIsoMs(row.enqueuedAt) ?? parseIsoMs(row.createdAt) ?? null;
       const queueEnd = parseIsoMs(row.claimedAt) ?? parseIsoMs(row.updatedAt) ?? null;

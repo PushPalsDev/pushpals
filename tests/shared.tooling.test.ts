@@ -37,6 +37,123 @@ describe("shared tool failure classification", () => {
       failureClass: "nonzero_exit",
       retryable: false,
     });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: [
+          "ReferenceError: route state is unavailable",
+          "    at src/routeShell.ts:42:7",
+          "    at /workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13",
+        ].join("\n"),
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "nonzero_exit", retryable: false });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: "TypeError: user fixture broke\n    at src/generic_python_executor.ts:42:7",
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "nonzero_exit", retryable: false });
+  });
+
+  test("does not mistake configured timeout budgets for an observed timeout", () => {
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        commandLine: "bun apps/workerpals/src/workerpals_main.ts",
+        stdout:
+          "[DockerExecutor] running with timeout=1320000ms codex_child_timeout=1200000ms\nDependency projection: /workspace/node_modules",
+        stderr:
+          "ReferenceError: Cannot access 'timedOut' before initialization\n    at /workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13",
+        exitCode: 1,
+      }),
+    ).toMatchObject({
+      failureClass: "worker_runtime_failure",
+      retryable: false,
+    });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stdout: "An earlier focused test timed out before this attempt restarted.",
+        stderr:
+          "ReferenceError: Cannot access 'timedOut' before initialization\n    at /workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13",
+        exitCode: 1,
+      }),
+    ).toMatchObject({
+      failureClass: "worker_runtime_failure",
+      retryable: false,
+    });
+  });
+
+  test("still classifies observed timeout signals and explicit timeout state", () => {
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: "Command timed out after 1320000ms; terminated process tree.",
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "timeout", retryable: true });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: "process exited after its deadline handler",
+        exitCode: 124,
+      }),
+    ).toMatchObject({ failureClass: "timeout", retryable: true });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: "context deadline exceeded",
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "timeout", retryable: true });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: "Operation timeout after 5000ms",
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "timeout", retryable: true });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: "process exited without a timeout message",
+        exitCode: 1,
+        timedOut: true,
+      }),
+    ).toMatchObject({ failureClass: "timeout", retryable: true });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: 'AssertionError: expected "failure" to contain "timed out"',
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "nonzero_exit", retryable: false });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: 'Test expected output to contain "timed out", but received "failed"',
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "nonzero_exit", retryable: false });
+
+    expect(
+      classifyToolFailure({
+        tool: "bun",
+        stderr: 'Command option --message="timed out" was rejected',
+        exitCode: 1,
+      }),
+    ).toMatchObject({ failureClass: "nonzero_exit", retryable: false });
   });
 
   test("attributes .codex branch-sync blockers to git rather than Codex", () => {
@@ -78,7 +195,8 @@ describe("shared tool failure classification", () => {
     ).toEqual({
       failureClass: "missing_runtime",
       retryable: false,
-      remediation: "Start Docker Desktop/the Docker daemon, then retry the Docker-backed operation.",
+      remediation:
+        "Start Docker Desktop/the Docker daemon, then retry the Docker-backed operation.",
     });
   });
 

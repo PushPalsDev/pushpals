@@ -48,12 +48,15 @@ export function deriveCoordinationRows(
     const linkedCompletions = linkedJobs.flatMap((job) => completionsByJob.get(job.id) ?? []);
     const anyFailed =
       request.status === "failed" ||
+      request.outcomeStatus === "failed" ||
       linkedJobs.some((job) => job.status === "failed") ||
       linkedCompletions.some((completion) => completion.status === "failed");
     const processedCompletion = linkedCompletions.find(
       (completion) => completion.status === "processed",
     );
-    const anyRunning = linkedJobs.some((job) => job.status === "claimed");
+    const anyRunning =
+      request.outcomeStatus === "delegated" ||
+      linkedJobs.some((job) => job.status === "claimed" || job.status === "finalizing");
     const anyPlanned =
       linkedJobs.length > 0 || request.status === "claimed" || request.status === "completed";
 

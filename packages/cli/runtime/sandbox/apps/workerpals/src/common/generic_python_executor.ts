@@ -27,6 +27,8 @@ interface GenericPythonExecutorConfig {
   pythonConfigKey: string;
   timeoutConfigKey: string;
   capTimeoutToExecutionBudget?: boolean;
+  /** Override only for deterministic progress-heartbeat tests. */
+  progressIntervalMs?: number;
 }
 
 const BACKEND_TIMEOUT_RESULT_GRACE_MS = 30_000;
@@ -405,9 +407,13 @@ export function createGenericPythonExecutor(
         maxOutputHeadLines: runtimeConfig.workerpals.outputMaxHeadLines,
         executorResultPrefix: runtimeConfig.workerpals.executorResultPrefix,
       };
-      const progressIntervalMs = 15_000;
+      const progressIntervalMs = Math.max(1, Math.floor(config.progressIntervalMs ?? 15_000));
       const startedAt = Date.now();
       let sawProcessOutput = false;
+      // This state must exist before the interval starts. The bounded process can
+      // remain quiet for many minutes, so its first progress tick is a production
+      // execution path rather than merely diagnostic logging.
+      let timedOut = false;
       const progressTimer = setInterval(() => {
         if (timedOut || sawProcessOutput) return;
         const elapsedMs = Math.max(0, Date.now() - startedAt);
@@ -447,6 +453,7 @@ export function createGenericPythonExecutor(
           onStdoutLine: (line) => onProcessLine("stdout", line),
           onStderrLine: (line) => onProcessLine("stderr", line),
           onTimeout: () => {
+            timedOut = true;
             onLog?.(
               "stdout",
               `[${backendLabel}Executor] Timeout reached after ${timeoutMs}ms; terminating process tree.`,
@@ -457,7 +464,7 @@ export function createGenericPythonExecutor(
         clearInterval(progressTimer);
       }
 
-      const timedOut = processResult.timedOut;
+      timedOut = processResult.timedOut;
       const stdout = processResult.stdout;
       const stderr = processResult.stderr;
       const exitCode = processResult.exitCode;

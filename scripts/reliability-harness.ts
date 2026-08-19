@@ -70,6 +70,8 @@ const phases: HarnessPhase[] = [
       "tests/shared.bounded-process.test.ts",
       "tests/workerpals.bounded-process.test.ts",
       "tests/shared.communication.test.ts",
+      "tests/workerpals.generic-python-executor.test.ts",
+      "tests/workerpals.packaged-generic-python-executor.test.ts",
       "apps/localbuddy/src/http_deadlines.test.ts",
       "tests/cli.http-deadline.test.ts",
       "tests/cli.sse-buffer.test.ts",
@@ -86,6 +88,10 @@ const phases: HarnessPhase[] = [
     timeoutMs: 360_000,
   },
 ];
+
+export function listReliabilityHarnessPhaseFiles(phaseName: string): string[] {
+  return [...(phases.find((phase) => phase.name === phaseName)?.files ?? [])];
+}
 
 function emit(event: Omit<HarnessEvent, "harness" | "observedAt">): void {
   console.log(

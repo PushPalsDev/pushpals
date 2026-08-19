@@ -1,6 +1,6 @@
 import { EventEnvelope, PROTOCOL_VERSION } from "protocol";
 import { SessionManager, type SessionMessageResult } from "./events.js";
-import { JobQueue } from "./jobs.js";
+import { JobQueue, resolveWorkerRuntimeCircuitRetryAfterMs } from "./jobs.js";
 import { RequestQueue } from "./requests.js";
 import { CompletionQueue } from "./completions.js";
 import { AutonomyStore } from "./autonomy.js";
@@ -57,6 +57,19 @@ const requestHandoffReconciliation = guardedReconciliation(
   { completed: 0, requestIds: [] as string[], jobIds: [] as string[] },
   () => requestQueue.reconcileWorkerHandoffsFromJobs(),
 );
+const requestHandoffChainReconciliation = guardedReconciliation(
+  "request retry chain",
+  {
+    scanned: 0,
+    repointed: 0,
+    requestIds: [] as string[],
+    previousJobIds: [] as string[],
+    replacementJobIds: [] as string[],
+    cycleDetected: 0,
+    depthLimitReached: 0,
+  },
+  () => requestQueue.reconcileRecoveredWorkerHandoffChains(),
+);
 const requestLeaseReconciliation = guardedReconciliation(
   "request lease",
   { recovered: 0, requestIds: [] as string[] },
@@ -111,12 +124,51 @@ if (requestHandoffReconciliation.completed > 0) {
     `[Server] Reconciled ${requestHandoffReconciliation.completed} durable request/job handoff(s) after a planner crash.`,
   );
 }
+if (requestHandoffChainReconciliation.repointed > 0) {
+  console.warn(
+    `[Server] Repointed ${requestHandoffChainReconciliation.repointed} legacy durable request handoff(s) to their retry-chain leaf.`,
+  );
+}
+if (
+  requestHandoffChainReconciliation.cycleDetected > 0 ||
+  requestHandoffChainReconciliation.depthLimitReached > 0
+) {
+  console.warn(
+    `[Server] Legacy request retry-chain reconciliation found bounded invalid state: ${JSON.stringify(requestHandoffChainReconciliation)}`,
+  );
+}
 if (completionLeaseReconciliation.recovered > 0) {
   console.warn(
     `[Server] Requeued ${completionLeaseReconciliation.recovered} completion(s) with expired publication leases.`,
   );
 }
 const lifecycleWatchdogTimer = setInterval(() => {
+  const requestHandoffChainRecovery = guardedReconciliation(
+    "request retry chain",
+    {
+      scanned: 0,
+      repointed: 0,
+      requestIds: [] as string[],
+      previousJobIds: [] as string[],
+      replacementJobIds: [] as string[],
+      cycleDetected: 0,
+      depthLimitReached: 0,
+    },
+    () => requestQueue.reconcileRecoveredWorkerHandoffChains(),
+  );
+  if (requestHandoffChainRecovery.repointed > 0) {
+    console.warn(
+      `[Server] Periodic watchdog repointed ${requestHandoffChainRecovery.repointed} legacy durable request handoff(s) to their retry-chain leaf.`,
+    );
+  }
+  if (
+    requestHandoffChainRecovery.cycleDetected > 0 ||
+    requestHandoffChainRecovery.depthLimitReached > 0
+  ) {
+    console.warn(
+      `[Server] Periodic watchdog found bounded invalid legacy request retry-chain state: ${JSON.stringify(requestHandoffChainRecovery)}`,
+    );
+  }
   const requestHandoffRecovery = guardedReconciliation(
     "request handoff",
     { completed: 0, requestIds: [] as string[], jobIds: [] as string[] },
@@ -230,9 +282,12 @@ const AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS = 60 * 60 * 1000;
 const AUTONOMY_WORKER_FAILURE_CIRCUIT_THRESHOLD = 3;
 const AUTONOMY_WORKER_FAILURE_CIRCUIT_RATE = 0.5;
 const AUTONOMY_WORKER_FAILURE_DEFER_MS = 30 * 60 * 1000;
+const AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD = 2;
+const AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS = 30 * 60 * 1000;
 const AUTONOMY_SIMILAR_FAILURE_WINDOW_MS = 6 * 60 * 60 * 1000;
 const AUTONOMY_SIMILAR_FAILURE_THRESHOLD = 2;
 const AUTONOMY_SIMILAR_FAILURE_DEFER_MS = 30 * 60 * 1000;
+const MAX_INELIGIBLE_CLAIMS_PER_POLL = 64;
 const CLIENT_TRANSPORT_HEARTBEAT_MS = 15_000;
 const SESSION_TOKEN_BUDGET = Math.max(0, STARTUP_CONFIG.server.sessionTokenBudget);
 
@@ -609,6 +664,37 @@ export function createRequestHandler() {
             message: autonomyFailureCircuitMessage(failureCircuit),
             retryAfterMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
             ...failureCircuit,
+          },
+          429,
+        );
+      };
+      const autonomyWorkerRuntimeCircuitSummary = () =>
+        jobQueue.workerRuntimeFailureCircuitSummary({
+          windowMs: AUTONOMY_WORKER_FAILURE_CIRCUIT_WINDOW_MS,
+          maxBlockMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
+          threshold: AUTONOMY_WORKER_RUNTIME_CIRCUIT_THRESHOLD,
+        });
+      const autonomyWorkerRuntimeCircuitMessage = (
+        runtimeCircuit: ReturnType<typeof autonomyWorkerRuntimeCircuitSummary>,
+      ): string =>
+        `Autonomy enqueue blocked: WorkerPal repeated the same internal runtime failure ` +
+        `${runtimeCircuit.recentMatchingFailureCount} time(s) within the recent window.`;
+      const autonomyWorkerRuntimeCircuitRetryAfterMs = (
+        runtimeCircuit: ReturnType<typeof autonomyWorkerRuntimeCircuitSummary>,
+      ): number =>
+        resolveWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit, {
+          maxRetryAfterMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
+        });
+      const makeAutonomyWorkerRuntimeCircuitResponse = (): Response | null => {
+        const runtimeCircuit = autonomyWorkerRuntimeCircuitSummary();
+        if (!runtimeCircuit.blocked) return null;
+        return makeJson(
+          {
+            ok: false,
+            code: "autonomy_worker_runtime_circuit_open",
+            message: autonomyWorkerRuntimeCircuitMessage(runtimeCircuit),
+            retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+            ...runtimeCircuit,
           },
           429,
         );
@@ -1231,6 +1317,8 @@ export function createRequestHandler() {
           // while RemoteBuddy is planning it.
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse) return reservationResponse;
+          const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
+          if (runtimeCircuitResponse) return runtimeCircuitResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse) return failureCircuitResponse;
           const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
@@ -1250,9 +1338,13 @@ export function createRequestHandler() {
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
         const workerId = (body.workerId as string) || "unknown";
+        let skippedCount = 0;
+        let cachedRuntimeCircuit:
+          | ReturnType<typeof autonomyWorkerRuntimeCircuitSummary>
+          | undefined;
+        let cachedFailureCircuit: ReturnType<typeof autonomyFailureCircuitSummary> | undefined;
         let result = jobQueue.claim(workerId);
-        let skipped = 0;
-        while (result.ok && result.job?.id && skipped < 64) {
+        while (result.ok && result.job?.id) {
           const budgetStatus = getSessionTokenBudgetStatus(result.job.sessionId);
           if (budgetStatus?.exceeded) {
             emitSessionBudgetPauseNotice(result.job.sessionId, budgetStatus);
@@ -1260,7 +1352,10 @@ export function createRequestHandler() {
               message: "Session token budget exceeded",
               detail: sessionTokenBudgetMessage(budgetStatus),
             });
-            skipped += 1;
+            skippedCount += 1;
+            if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+              return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+            }
             result = jobQueue.claim(workerId);
             continue;
           }
@@ -1274,7 +1369,28 @@ export function createRequestHandler() {
               ...result.job,
               params: parseJsonRecord(result.job.params),
             };
-            const failureCircuit = autonomyFailureCircuitSummary();
+            const runtimeCircuit =
+              cachedRuntimeCircuit ??
+              (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
+            if (runtimeCircuit.blocked) {
+              jobQueue.defer(result.job.id, {
+                workerId,
+                deferMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+                detail: JSON.stringify({
+                  code: "autonomy_worker_runtime_circuit_open",
+                  retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+                  ...runtimeCircuit,
+                }),
+              });
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
+              result = jobQueue.claim(workerId);
+              continue;
+            }
+            const failureCircuit =
+              cachedFailureCircuit ?? (cachedFailureCircuit = autonomyFailureCircuitSummary());
             if (failureCircuit.blocked) {
               jobQueue.defer(result.job.id, {
                 workerId,
@@ -1284,7 +1400,10 @@ export function createRequestHandler() {
                   ...failureCircuit,
                 }),
               });
-              skipped += 1;
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
               result = jobQueue.claim(workerId);
               continue;
             }
@@ -1298,7 +1417,10 @@ export function createRequestHandler() {
                   ...similarFailure,
                 }),
               });
-              skipped += 1;
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
+              }
               result = jobQueue.claim(workerId);
               continue;
             }
@@ -2415,6 +2537,8 @@ export function createRequestHandler() {
         if (isAutonomyRequestPayload(body)) {
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse) return reservationResponse;
+          const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
+          if (runtimeCircuitResponse) return runtimeCircuitResponse;
           const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
           if (failureCircuitResponse) return failureCircuitResponse;
           const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
@@ -2521,9 +2645,13 @@ export function createRequestHandler() {
         const agentId = compactText(body.agentId, 128);
         if (!agentId) return makeJson({ ok: false, message: "agentId is required" }, 400);
         const leaseMs = typeof body.leaseMs === "number" ? body.leaseMs : undefined;
+        let skippedCount = 0;
+        let cachedRuntimeCircuit:
+          | ReturnType<typeof autonomyWorkerRuntimeCircuitSummary>
+          | undefined;
+        let cachedFailureCircuit: ReturnType<typeof autonomyFailureCircuitSummary> | undefined;
         let result = requestQueue.claim(agentId, { leaseMs });
-        let skipped = 0;
-        while (result.ok && result.request?.id && skipped < 64) {
+        while (result.ok && result.request?.id) {
           const budgetStatus = getSessionTokenBudgetStatus(result.request.sessionId);
           if (budgetStatus?.exceeded) {
             emitSessionBudgetPauseNotice(result.request.sessionId, budgetStatus);
@@ -2533,23 +2661,74 @@ export function createRequestHandler() {
               message: "Session token budget exceeded",
               detail: sessionTokenBudgetMessage(budgetStatus),
             });
-            skipped += 1;
+            skippedCount += 1;
+            if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+              return makeJson(
+                { ok: true, request: null, skippedCount, scanLimitReached: true },
+                200,
+              );
+            }
             result = requestQueue.claim(agentId, { leaseMs });
             continue;
           }
           if (isAutonomyRequestPayload(result.request as unknown as Record<string, unknown>)) {
-            const failureCircuit = autonomyFailureCircuitSummary();
-            if (failureCircuit.blocked) {
-              requestQueue.fail(result.request.id, {
+            const runtimeCircuit =
+              cachedRuntimeCircuit ??
+              (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
+            if (runtimeCircuit.blocked) {
+              const retryAfterMs = autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit);
+              const deferred = requestQueue.deferClaim(
+                result.request.id,
                 agentId,
-                claimToken: result.request.claimToken,
-                message: autonomyFailureCircuitMessage(failureCircuit),
-                detail: JSON.stringify({
-                  code: "autonomy_worker_failure_circuit_open",
-                  ...failureCircuit,
-                }),
-              });
-              skipped += 1;
+                result.request.claimToken ?? "",
+                retryAfterMs,
+              );
+              if (!deferred.ok) {
+                return makeJson(
+                  {
+                    ok: false,
+                    code: "request_circuit_deferral_failed",
+                    message: deferred.message,
+                  },
+                  409,
+                );
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson(
+                  { ok: true, request: null, skippedCount, scanLimitReached: true },
+                  200,
+                );
+              }
+              result = requestQueue.claim(agentId, { leaseMs });
+              continue;
+            }
+            const failureCircuit =
+              cachedFailureCircuit ?? (cachedFailureCircuit = autonomyFailureCircuitSummary());
+            if (failureCircuit.blocked) {
+              const deferred = requestQueue.deferClaim(
+                result.request.id,
+                agentId,
+                result.request.claimToken ?? "",
+                AUTONOMY_WORKER_FAILURE_DEFER_MS,
+              );
+              if (!deferred.ok) {
+                return makeJson(
+                  {
+                    ok: false,
+                    code: "request_circuit_deferral_failed",
+                    message: deferred.message,
+                  },
+                  409,
+                );
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson(
+                  { ok: true, request: null, skippedCount, scanLimitReached: true },
+                  200,
+                );
+              }
               result = requestQueue.claim(agentId, { leaseMs });
               continue;
             }
@@ -2557,18 +2736,29 @@ export function createRequestHandler() {
               result.request as unknown as Record<string, unknown>,
             );
             if (similarFailure.blocked) {
-              requestQueue.fail(result.request.id, {
+              const deferred = requestQueue.deferClaim(
+                result.request.id,
                 agentId,
-                claimToken: result.request.claimToken,
-                message:
-                  `Autonomy request suppressed after ` +
-                  `${similarFailure.recentSimilarFailureCount} unchanged target-and-failure fingerprint occurrence(s).`,
-                detail: JSON.stringify({
-                  code: "autonomy_similar_failure_suppressed",
-                  ...similarFailure,
-                }),
-              });
-              skipped += 1;
+                result.request.claimToken ?? "",
+                AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
+              );
+              if (!deferred.ok) {
+                return makeJson(
+                  {
+                    ok: false,
+                    code: "request_circuit_deferral_failed",
+                    message: deferred.message,
+                  },
+                  409,
+                );
+              }
+              skippedCount += 1;
+              if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
+                return makeJson(
+                  { ok: true, request: null, skippedCount, scanLimitReached: true },
+                  200,
+                );
+              }
               result = requestQueue.claim(agentId, { leaseMs });
               continue;
             }

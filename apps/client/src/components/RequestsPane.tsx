@@ -46,7 +46,7 @@ export function RequestsPane({
           theme={theme}
         />
         <MetricTile
-          title="Completed"
+          title="Planner Done"
           value={String(queueValue(counts, "completed"))}
           tone="positive"
           theme={theme}
@@ -72,7 +72,8 @@ export function RequestsPane({
         </View>
       ) : (
         rows.map((request) => {
-          const rowColor = statusColor(theme, request.status);
+          const displayStatus = request.outcomeStatus ?? request.status;
+          const rowColor = statusColor(theme, displayStatus);
           const resultText = parseJsonText(request.result);
           const errorText = parseJsonText(request.error);
           const queueMeta = pendingById.get(request.id);
@@ -80,15 +81,22 @@ export function RequestsPane({
           const phaseBits = [
             request.enqueuedAt ? `enq ${prettyTs(request.enqueuedAt)}` : null,
             request.claimedAt ? `claim ${prettyTs(request.claimedAt)}` : null,
-            request.completedAt ? `done ${prettyTs(request.completedAt)}` : null,
+            request.completedAt
+              ? `${request.workerRequired === 1 ? "plan" : "done"} ${prettyTs(request.completedAt)}`
+              : null,
             request.failedAt ? `fail ${prettyTs(request.failedAt)}` : null,
+            request.handoffJobStatus ? `worker ${request.handoffJobStatus}` : null,
           ].filter(Boolean) as string[];
           const lifecycleSummary =
             request.status === "pending" && queueMeta
               ? `queue #${queueMeta.position} (eta ${formatEtaMs(queueMeta.etaMs)})`
-              : request.durationMs != null
-                ? `elapsed ${formatDuration(request.durationMs)}`
-                : "in progress";
+              : displayStatus === "delegated"
+                ? `delegated to ${request.handoffJobId?.slice(0, 8) ?? "WorkerPal"}`
+                : request.outcomeDurationMs != null
+                  ? `end-to-end ${formatDuration(request.outcomeDurationMs)}`
+                  : request.durationMs != null
+                    ? `planner elapsed ${formatDuration(request.durationMs)}`
+                    : "in progress";
 
           return (
             <View
@@ -117,7 +125,7 @@ export function RequestsPane({
                   <Text
                     style={[styles.statusPillText, { color: rowColor, fontFamily: theme.fontSans }]}
                   >
-                    {request.status}
+                    {displayStatus}
                   </Text>
                 </View>
               </View>
@@ -141,7 +149,7 @@ export function RequestsPane({
                 ]}
               >
                 agent {request.agentId ?? "--"} | created {prettyTs(request.createdAt)} | updated{" "}
-                {relativeMs(request.updatedAt)}
+                {relativeMs(request.outcomeUpdatedAt ?? request.updatedAt)}
               </Text>
               {phaseBits.length > 0 ? (
                 <Text
@@ -170,7 +178,7 @@ export function RequestsPane({
                     { color: theme.textMuted, fontFamily: theme.fontSans },
                   ]}
                 >
-                  request duration {formatDuration(request.durationMs)}
+                  planner duration {formatDuration(request.durationMs)}
                 </Text>
               ) : null}
               {resultText ? (

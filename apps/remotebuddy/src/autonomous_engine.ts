@@ -5583,7 +5583,8 @@ export class RemoteBuddyAutonomousEngine {
       }
       if (
         res.status === 429 &&
-        (code === "autonomy_worker_failure_circuit_open" ||
+        (code === "autonomy_worker_runtime_circuit_open" ||
+          code === "autonomy_worker_failure_circuit_open" ||
           code === "autonomy_similar_no_publishable_suppressed" ||
           code === "autonomy_queue_backpressure" ||
           code === "autonomy_publication_backpressure" ||

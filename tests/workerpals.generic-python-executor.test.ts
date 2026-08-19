@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { randomUUID } from "crypto";
+import { loadPushPalsConfig } from "shared";
 import { createPythonPayloadTransport } from "../apps/workerpals/src/common/python_payload_transport";
 import {
+  createGenericPythonExecutor,
   normalizeGenericPythonExecutorParsedResultForTimeout,
   resolveGenericPythonExecutorScriptPath,
   resolveGenericPythonExecutorChildTimeoutEnv,
@@ -33,6 +35,116 @@ describe("python payload transport", () => {
 });
 
 describe("generic python executor timeout resolution", () => {
+  test("keeps a quiet executor alive across progress ticks and clears the timer", async () => {
+    const root = join(tmpdir(), `pushpals-generic-executor-${randomUUID()}`);
+    const scriptPath = join(root, "quiet-wrapper.ts");
+    const resultPrefix = "__PUSHPALS_TEST_RESULT__ ";
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      scriptPath,
+      [
+        "await Bun.sleep(80);",
+        `console.log(${JSON.stringify(resultPrefix)} + JSON.stringify({`,
+        "  ok: true,",
+        '  summary: "quiet wrapper completed",',
+        '  stdout: "wrapper stdout",',
+        '  stderr: "",',
+        "  exitCode: 0,",
+        "}));",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+        executorResultPrefix: resultPrefix,
+      },
+    } as never;
+    const logs: string[] = [];
+    const execute = createGenericPythonExecutor({
+      backendName: "test",
+      scriptPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      progressIntervalMs: 10,
+    });
+
+    try {
+      const result = await execute(
+        "task.execute",
+        { instruction: "exercise the quiet progress path" },
+        process.cwd(),
+        runtimeConfig,
+        (_stream, line) => logs.push(line),
+      );
+
+      expect(result).toMatchObject({
+        ok: true,
+        summary: "quiet wrapper completed",
+        stdout: "wrapper stdout",
+        stderr: "",
+        exitCode: 0,
+      });
+      expect(logs.some((line) => line.includes("Still running"))).toBe(true);
+
+      const logCountAfterCompletion = logs.length;
+      await Bun.sleep(40);
+      expect(logs).toHaveLength(logCountAfterCompletion);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("clears progress ticks after a silent wrapper returns without a result", async () => {
+    const root = join(tmpdir(), `pushpals-silent-executor-${randomUUID()}`);
+    const scriptPath = join(root, "silent-wrapper.ts");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(scriptPath, "await Bun.sleep(80);\n", "utf8");
+
+    const baseConfig = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const runtimeConfig = {
+      ...baseConfig,
+      workerpals: {
+        ...baseConfig.workerpals,
+        testPython: process.execPath,
+        testTimeoutMs: 10_000,
+      },
+    } as never;
+    const logs: string[] = [];
+    const execute = createGenericPythonExecutor({
+      backendName: "test",
+      scriptPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      progressIntervalMs: 10,
+    });
+
+    try {
+      const result = await execute(
+        "task.execute",
+        { instruction: "exercise silent timer cleanup" },
+        process.cwd(),
+        runtimeConfig,
+        (_stream, line) => logs.push(line),
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.summary).toContain("did not return a structured result");
+      expect(logs.some((line) => line.includes("Still running"))).toBe(true);
+
+      const logCountAfterCompletion = logs.length;
+      await Bun.sleep(40);
+      expect(logs).toHaveLength(logCountAfterCompletion);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("caps normal backends to the job execution budget", () => {
     expect(
       resolveGenericPythonExecutorTimeoutMs({

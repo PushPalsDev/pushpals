@@ -1,63 +1,87 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "fs";
-import { resolve } from "path";
+import { readdirSync, readFileSync } from "fs";
+import { join, relative, resolve } from "path";
 
 import * as sourceSandboxEnv from "../apps/workerpals/src/common/sandbox_env";
 import * as packagedSandboxEnv from "../packages/cli/runtime/sandbox/apps/workerpals/src/common/sandbox_env";
 
-const MIRRORED_WORKERPALS_FILES = [
-  "common/direct_worktree.ts",
-  "common/sandbox_env.ts",
-  "common/generic_python_executor.ts",
-  "backends/openhands_task_execute.ts",
-  "docker_executor.ts",
-  "execute_job.ts",
-  "merge_conflict_job.ts",
-  "workerpals_main.ts",
-  "worktree_base_ref.ts",
+const repoRoot = resolve(import.meta.dir, "..");
+const packagedSandboxRoot = process.env.PUSHPALS_PACKAGED_RUNTIME_ROOT
+  ? resolve(process.env.PUSHPALS_PACKAGED_RUNTIME_ROOT)
+  : resolve(repoRoot, "packages", "cli", "runtime", "sandbox");
+const MIRRORED_RUNTIME_TREES = [
+  {
+    sourceRoot: "apps/workerpals",
+    packagedRoot: "apps/workerpals",
+  },
+  {
+    sourceRoot: "packages/shared",
+    packagedRoot: "packages/shared",
+  },
+  {
+    sourceRoot: "packages/protocol",
+    packagedRoot: "packages/protocol",
+  },
 ] as const;
 
-const MIRRORED_SHARED_FILES = [
-  "bounded_fetch.ts",
-  "bounded_process.ts",
-  "communication.ts",
-  "index.ts",
-  "trusted_validation.ts",
-  "validation_repair_lease.ts",
-] as const;
+function normalizePath(pathValue: string): string {
+  return pathValue.replace(/\\/g, "/");
+}
+
+function listTrackedTreeFiles(sourceRoot: string): string[] {
+  const result = Bun.spawnSync(["git", "ls-files", "-z", "--", sourceRoot], {
+    cwd: repoRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(
+    result.exitCode,
+    Buffer.from(result.stderr).toString("utf8") || `git ls-files failed for ${sourceRoot}`,
+  ).toBe(0);
+  const prefix = `${normalizePath(sourceRoot)}/`;
+  return Buffer.from(result.stdout)
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .map(normalizePath)
+    .map((pathValue) => {
+      expect(pathValue.startsWith(prefix), pathValue).toBe(true);
+      return pathValue.slice(prefix.length);
+    })
+    .sort();
+}
+
+function listPackagedTreeFiles(packagedRoot: string): string[] {
+  const absoluteRoot = resolve(packagedSandboxRoot, packagedRoot);
+  const files: string[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolutePath = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(absolutePath);
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
+        files.push(normalizePath(relative(absoluteRoot, absolutePath)));
+      }
+    }
+  };
+  visit(absoluteRoot);
+  return files.sort();
+}
 
 describe("packaged WorkerPal sandbox runtime parity", () => {
-  test("keeps path and review-lease runtime files byte-identical", () => {
-    for (const relativePath of MIRRORED_WORKERPALS_FILES) {
-      const sourcePath = resolve("apps", "workerpals", "src", relativePath);
-      const packagedPath = resolve(
-        "packages",
-        "cli",
-        "runtime",
-        "sandbox",
-        "apps",
-        "workerpals",
-        "src",
-        relativePath,
-      );
+  test("keeps every tracked sandbox runtime file byte-identical", () => {
+    for (const tree of MIRRORED_RUNTIME_TREES) {
+      const trackedFiles = listTrackedTreeFiles(tree.sourceRoot);
+      const packagedFiles = listPackagedTreeFiles(tree.packagedRoot);
+      expect(packagedFiles, tree.packagedRoot).toEqual(trackedFiles);
 
-      expect(readFileSync(packagedPath)).toEqual(readFileSync(sourcePath));
-    }
-
-    for (const relativePath of MIRRORED_SHARED_FILES) {
-      const sourcePath = resolve("packages", "shared", "src", relativePath);
-      const packagedPath = resolve(
-        "packages",
-        "cli",
-        "runtime",
-        "sandbox",
-        "packages",
-        "shared",
-        "src",
-        relativePath,
-      );
-
-      expect(readFileSync(packagedPath)).toEqual(readFileSync(sourcePath));
+      for (const relativePath of trackedFiles) {
+        const sourcePath = resolve(repoRoot, tree.sourceRoot, relativePath);
+        const packagedPath = resolve(packagedSandboxRoot, tree.packagedRoot, relativePath);
+        expect(readFileSync(packagedPath), `${tree.packagedRoot}/${relativePath}`).toEqual(
+          readFileSync(sourcePath),
+        );
+      }
     }
   });
 

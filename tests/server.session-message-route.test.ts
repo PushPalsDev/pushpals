@@ -227,6 +227,70 @@ function autonomyRequestMetadata(label: string): Record<string, unknown> {
   };
 }
 
+async function seedWorkerRuntimeCircuit(
+  port: number,
+  label: string,
+  beforeCircuitOpens?: () => Promise<void>,
+): Promise<string[]> {
+  const jobIds: string[] = [];
+  for (let index = 1; index <= 2; index += 1) {
+    const enqueued = await postServerJson(port, "/jobs/enqueue", {
+      taskId: `runtime-circuit-${label}-${index}`,
+      sessionId: `runtime-circuit-${label}`,
+      kind: "task.execute",
+      params: {
+        origin: "autonomy",
+        autonomy: { patternKey: `runtime-circuit-${label}-${index}` },
+      },
+    });
+    expect(enqueued.status).toBe(201);
+    const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+    jobIds.push(jobId);
+
+    const claimed = await postServerJson(port, "/jobs/claim", {
+      workerId: `runtime-circuit-worker-${index}`,
+    });
+    expect(claimed.status).toBe(200);
+    expect(await claimed.json()).toMatchObject({ job: { id: jobId } });
+
+    const runtimeDetail =
+      `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+      `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)`;
+    if (index === 2 && beforeCircuitOpens) await beforeCircuitOpens();
+    const failed = await postServerJson(port, `/jobs/${jobId}/fail`, {
+      message: "WorkerPal job execution failed",
+      detail: runtimeDetail,
+      diagnostics: {
+        attempts: [
+          {
+            attempt: 1,
+            workerId: `runtime-circuit-worker-${index}`,
+            backend: "openai_codex",
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString(),
+            durationMs: 15_000,
+            terminalReason: runtimeDetail,
+            exitCode: 1,
+          },
+        ],
+        terminal: {
+          status: "failed",
+          failureClass: "worker_runtime_failure",
+          terminalStage: "executor",
+          executorBackend: "openai_codex",
+          summary: "Job failed before returning a structured result",
+          publishableFileCount: 0,
+          artifactOnlyPathCount: 0,
+          changedPathSample: [],
+        },
+      },
+    });
+    expect(failed.status).toBe(200);
+    expect(await failed.json()).toMatchObject({ ok: true });
+  }
+  return jobIds;
+}
+
 describe("server session message route", () => {
   test("returns non-2xx for missing sessions and invalid messages", async () => {
     const root = makeTempDir();
@@ -526,6 +590,306 @@ describe("server session message route", () => {
     expect(handoff.status).toBe(201);
     expect(await handoff.json()).toMatchObject({ ok: true, jobId: expect.any(String) });
   }, 15_000);
+
+  test("defers already queued autonomy work nonterminal while the worker-runtime circuit is open", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const acceptedAutonomy = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "runtime-circuit-request",
+      prompt: "Keep this accepted autonomy request for a canary retry.",
+      priority: "background",
+      forceWorker: true,
+      forceLane: "worker",
+      metadata: autonomyRequestMetadata("runtime-circuit-deferred"),
+    });
+    expect(acceptedAutonomy.status).toBe(201);
+    const autonomyRequestId = String(
+      ((await acceptedAutonomy.json()) as Record<string, unknown>).requestId ?? "",
+    );
+    await Bun.sleep(10);
+    const acceptedUser = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "runtime-circuit-user",
+      prompt: "User work remains eligible while autonomy is deferred.",
+      priority: "background",
+    });
+    expect(acceptedUser.status).toBe(201);
+    const userRequestId = String(
+      ((await acceptedUser.json()) as Record<string, unknown>).requestId ?? "",
+    );
+
+    let queuedAutonomyJobId = "";
+    await seedWorkerRuntimeCircuit(port, "request-deferral", async () => {
+      const queuedJob = await postServerJson(port, "/jobs/enqueue", {
+        taskId: "accepted-autonomy-job-before-runtime-circuit",
+        sessionId: "runtime-circuit-job",
+        kind: "task.execute",
+        params: { origin: "autonomy" },
+      });
+      expect(queuedJob.status).toBe(201);
+      queuedAutonomyJobId = String(
+        ((await queuedJob.json()) as Record<string, unknown>).jobId ?? "",
+      );
+    });
+
+    const blockedRequest = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "runtime-circuit-blocked-request",
+      prompt: "Do not admit new autonomy while the runtime circuit is open.",
+      priority: "background",
+      metadata: autonomyRequestMetadata("runtime-circuit-blocked"),
+    });
+    expect(blockedRequest.status).toBe(429);
+    expect(await blockedRequest.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_worker_runtime_circuit_open",
+      retryAfterMs: expect.any(Number),
+    });
+
+    const blockedJob = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "blocked-autonomy-job-after-runtime-circuit",
+      sessionId: "runtime-circuit-job",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(blockedJob.status).toBe(429);
+    expect(await blockedJob.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_worker_runtime_circuit_open",
+      retryAfterMs: expect.any(Number),
+    });
+
+    const eligibleUserJob = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "eligible-user-job-during-runtime-circuit",
+      sessionId: "runtime-circuit-user-job",
+      kind: "task.execute",
+      params: { origin: "user" },
+    });
+    expect(eligibleUserJob.status).toBe(201);
+    const eligibleUserJobId = String(
+      ((await eligibleUserJob.json()) as Record<string, unknown>).jobId ?? "",
+    );
+    const claimedJob = await postServerJson(port, "/jobs/claim", {
+      workerId: "runtime-circuit-canary-worker",
+    });
+    expect(claimedJob.status).toBe(200);
+    expect(await claimedJob.json()).toMatchObject({ job: { id: eligibleUserJobId } });
+    const deferredJobsSnapshot = await fetch(`http://127.0.0.1:${port}/jobs?limit=20`);
+    const deferredJobsPayload = (await deferredJobsSnapshot.json()) as {
+      jobs: Array<Record<string, unknown>>;
+    };
+    expect(deferredJobsPayload.jobs).toContainEqual(
+      expect.objectContaining({
+        id: queuedAutonomyJobId,
+        status: "pending",
+        failedAt: null,
+        availableAt: expect.any(String),
+      }),
+    );
+
+    const claimedRequest = await postServerJson(port, "/requests/claim", {
+      agentId: "remotebuddy-runtime-circuit",
+      leaseMs: 60_000,
+    });
+    expect(claimedRequest.status).toBe(200);
+    expect(await claimedRequest.json()).toMatchObject({
+      request: { id: userRequestId, sessionId: "runtime-circuit-user" },
+    });
+
+    const deferredRequestStatus = await fetch(
+      `http://127.0.0.1:${port}/requests/${autonomyRequestId}`,
+    );
+    const deferredRequestPayload = (await deferredRequestStatus.json()) as {
+      request: Record<string, unknown>;
+    };
+    const deferredClaimToken = String(deferredRequestPayload.request.claimToken ?? "");
+    const deferredUntil = String(deferredRequestPayload.request.leaseExpiresAt ?? "");
+    expect(deferredClaimToken).not.toBe("");
+    expect(Date.parse(deferredUntil)).toBeGreaterThan(Date.now() + 60_000);
+    expect(Date.parse(deferredUntil)).toBeLessThanOrEqual(Date.now() + 30 * 60_000);
+    expect(deferredRequestPayload).toMatchObject({
+      request: {
+        id: autonomyRequestId,
+        status: "claimed",
+        failedAt: null,
+        error: null,
+        leaseExpiresAt: deferredUntil,
+      },
+    });
+
+    const requestsSnapshot = await fetch(`http://127.0.0.1:${port}/requests?limit=20`);
+    expect(await requestsSnapshot.json()).toMatchObject({
+      counts: { failed: 0 },
+      slo: { terminal: 0, failed: 0 },
+    });
+
+    // Simulate the bounded defer expiring after the circuit's failure window.
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      const oldFailureAt = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
+      db.prepare(`UPDATE jobs SET failedAt = ?, updatedAt = ? WHERE status = 'failed'`).run(
+        oldFailureAt,
+        oldFailureAt,
+      );
+      db.prepare(`UPDATE requests SET leaseExpiresAt = ? WHERE id = ?`).run(
+        new Date(Date.now() - 1_000).toISOString(),
+        autonomyRequestId,
+      );
+    } finally {
+      db.close();
+    }
+
+    const retriedRequest = await postServerJson(port, "/requests/claim", {
+      agentId: "remotebuddy-runtime-canary",
+    });
+    expect(retriedRequest.status).toBe(200);
+    const retriedPayload = (await retriedRequest.json()) as {
+      request: Record<string, unknown>;
+    };
+    expect(retriedPayload).toMatchObject({
+      request: {
+        id: autonomyRequestId,
+        status: "claimed",
+        claimAttempts: 2,
+      },
+    });
+    expect(retriedPayload.request.claimToken).not.toBe(deferredClaimToken);
+  }, 20_000);
+
+  test("bounds circuit scans without leaking the next blocked item and advances user work on the next poll", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const autonomyJobIds: string[] = [];
+    const autonomyRequestIds: string[] = [];
+    await seedWorkerRuntimeCircuit(port, "bounded-claim-scan", async () => {
+      for (let index = 0; index < 65; index += 1) {
+        const job = await postServerJson(port, "/jobs/enqueue", {
+          taskId: `bounded-autonomy-job-${index}`,
+          sessionId: "bounded-claim-jobs",
+          kind: "task.execute",
+          priority: "normal",
+          params: { origin: "autonomy" },
+        });
+        expect(job.status).toBe(201);
+        autonomyJobIds.push(String(((await job.json()) as Record<string, unknown>).jobId ?? ""));
+
+        const request = await postServerJson(port, "/requests/enqueue", {
+          sessionId: `bounded-claim-request-${index}`,
+          prompt: `Deferred autonomy request ${index}`,
+          priority: "normal",
+          forceWorker: true,
+          forceLane: "worker",
+          metadata: autonomyRequestMetadata(`bounded-claim-${index}`),
+        });
+        expect(request.status).toBe(201);
+        autonomyRequestIds.push(
+          String(((await request.json()) as Record<string, unknown>).requestId ?? ""),
+        );
+      }
+    });
+    expect(autonomyJobIds).toHaveLength(65);
+    expect(autonomyRequestIds).toHaveLength(65);
+
+    // Keep the eligible user work behind every autonomy row even when many
+    // inserts share the same millisecond timestamp.
+    await Bun.sleep(10);
+    const userJob = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "bounded-user-job",
+      sessionId: "bounded-claim-user-job",
+      kind: "task.execute",
+      priority: "background",
+      params: { origin: "user" },
+    });
+    expect(userJob.status).toBe(201);
+    const userJobId = String(((await userJob.json()) as Record<string, unknown>).jobId ?? "");
+
+    const userRequest = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "bounded-claim-user-request",
+      prompt: "Eligible user request after a bounded autonomy scan.",
+      priority: "background",
+    });
+    expect(userRequest.status).toBe(201);
+    const userRequestId = String(
+      ((await userRequest.json()) as Record<string, unknown>).requestId ?? "",
+    );
+
+    const firstJobPoll = await postServerJson(port, "/jobs/claim", {
+      workerId: "bounded-claim-worker",
+    });
+    expect(firstJobPoll.status).toBe(200);
+    expect(await firstJobPoll.json()).toMatchObject({
+      ok: true,
+      job: null,
+      skippedCount: 64,
+      scanLimitReached: true,
+    });
+
+    const firstRequestPoll = await postServerJson(port, "/requests/claim", {
+      agentId: "bounded-claim-remotebuddy",
+    });
+    expect(firstRequestPoll.status).toBe(200);
+    expect(await firstRequestPoll.json()).toMatchObject({
+      ok: true,
+      request: null,
+      skippedCount: 64,
+      scanLimitReached: true,
+    });
+
+    const jobsAfterFirstPoll = await fetch(`http://127.0.0.1:${port}/jobs?limit=200`);
+    const jobsAfterFirstPayload = (await jobsAfterFirstPoll.json()) as {
+      jobs: Array<Record<string, unknown>>;
+    };
+    const autonomyJobsAfterFirst = jobsAfterFirstPayload.jobs.filter((job) =>
+      autonomyJobIds.includes(String(job.id ?? "")),
+    );
+    expect(autonomyJobsAfterFirst).toHaveLength(65);
+    expect(
+      autonomyJobsAfterFirst.filter((job) => job.status === "pending" && job.availableAt == null),
+    ).toHaveLength(1);
+    expect(
+      autonomyJobsAfterFirst.filter(
+        (job) => job.status === "pending" && typeof job.availableAt === "string",
+      ),
+    ).toHaveLength(64);
+    expect(autonomyJobsAfterFirst.some((job) => job.status === "claimed")).toBe(false);
+
+    const requestsAfterFirstPoll = await fetch(`http://127.0.0.1:${port}/requests?limit=200`);
+    const requestsAfterFirstPayload = (await requestsAfterFirstPoll.json()) as {
+      requests: Array<Record<string, unknown>>;
+    };
+    const autonomyRequestsAfterFirst = requestsAfterFirstPayload.requests.filter((request) =>
+      autonomyRequestIds.includes(String(request.id ?? "")),
+    );
+    expect(autonomyRequestsAfterFirst).toHaveLength(65);
+    expect(
+      autonomyRequestsAfterFirst.filter((request) => request.status === "claimed"),
+    ).toHaveLength(64);
+    expect(
+      autonomyRequestsAfterFirst.filter((request) => request.status === "pending"),
+    ).toHaveLength(1);
+
+    const secondJobPoll = await postServerJson(port, "/jobs/claim", {
+      workerId: "bounded-claim-worker",
+    });
+    expect(secondJobPoll.status).toBe(200);
+    expect(await secondJobPoll.json()).toMatchObject({ job: { id: userJobId } });
+
+    const secondRequestPoll = await postServerJson(port, "/requests/claim", {
+      agentId: "bounded-claim-remotebuddy",
+    });
+    expect(secondRequestPoll.status).toBe(200);
+    expect(await secondRequestPoll.json()).toMatchObject({
+      request: { id: userRequestId, sessionId: "bounded-claim-user-request" },
+    });
+  }, 30_000);
 
   test("blocks new session work after the token budget is exceeded", async () => {
     const root = makeTempDir();
@@ -911,6 +1275,7 @@ describe("server session message route", () => {
       "completion lifecycle",
       "request handoff",
       "request lease",
+      "request retry chain",
       "worker handoff",
     ]);
   }, 20_000);

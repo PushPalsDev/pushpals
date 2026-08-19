@@ -1,8 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildHarnessWindowsTreeKillArgv,
+  listReliabilityHarnessPhaseFiles,
   terminateHarnessProcessTree,
 } from "../scripts/reliability-harness";
+
+describe("reliability harness release coverage", () => {
+  test("gates both source and packaged generic-executor progress behavior", () => {
+    const files = listReliabilityHarnessPhaseFiles("runtime_boundary");
+
+    expect(files).toContain("tests/workerpals.generic-python-executor.test.ts");
+    expect(files).toContain("tests/workerpals.packaged-generic-python-executor.test.ts");
+  });
+});
 
 describe("reliability harness process cleanup", () => {
   test("uses taskkill tree termination on Windows and confirms target exit", async () => {

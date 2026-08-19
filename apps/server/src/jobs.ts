@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "crypto";
 import {
   classifyToolFailure,
   inferToolNameFromFailureText,
+  isWorkerOwnedRuntimeStackFrame,
   normalizeToolName,
   redactToolText,
   resolveToolKind,
@@ -92,6 +93,20 @@ export interface NoPublishableFailureCircuitSummary {
   noPublishableFailureCount: number;
   noPublishableFailureRate: number;
   completedCount: number;
+  lastFailureAt: string | null;
+}
+
+export interface WorkerRuntimeFailureCircuitSummary {
+  blocked: boolean;
+  windowMs: number;
+  blockDurationMs: number;
+  threshold: number;
+  qualifyingFailureCount: number;
+  recentMatchingFailureCount: number;
+  fingerprint: string | null;
+  failureClass: string | null;
+  executorBackend: string | null;
+  signatureSample: string | null;
   lastFailureAt: string | null;
 }
 
@@ -271,6 +286,7 @@ const TOOL_FAILURE_CLASSES: ToolFailureClass[] = [
   "permission",
   "policy_denied",
   "timeout",
+  "worker_runtime_failure",
   "nonzero_exit",
   "repo_state",
   "sandbox_mount",
@@ -470,6 +486,115 @@ function jobFailureText(value: unknown): string {
   } catch {
     return raw;
   }
+}
+
+const WORKER_RUNTIME_CIRCUIT_FAILURE_CLASSES = new Set([
+  "worker_runtime_failure",
+  "missing_runtime_asset",
+  "no_structured_result",
+  "malformed_structured_result",
+]);
+
+function normalizeWorkerRuntimeFailureEvidence(value: unknown): string {
+  return jobFailureText(value)
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\\/g, "/")
+    .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/gi, "<timestamp>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, "<uuid>")
+    .replace(/\b[0-9a-f]{32,64}\b/gi, "<hash>")
+    .replace(/\/\.worktrees\/[^/\s:)]+/gi, "/.worktrees/<worktree>")
+    .replace(/\b(job|request|task)(?:Id)?[=: ]+[a-z0-9_-]{8,}\b/gi, "$1=<id>")
+    .replace(
+      /\b(?:elapsed|duration|uptime|timeout|limit)(?:_ms)?[=: ]+\d+(?:\.\d+)?(?:\s*(?:ms|s))?\b/gi,
+      (match) => match.replace(/\d+(?:\.\d+)?(?:\s*(?:ms|s))?/i, "<duration>"),
+    )
+    .replace(/\b\d+(?:\.\d+)?\s*(?:milliseconds?|ms|seconds?|s)\b/gi, "<duration>")
+    .replace(/\bpid[=: ]+\d+\b/gi, "pid=<pid>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function workerRuntimeFailureSignature(
+  failureClassValue: unknown,
+  errorValue: unknown,
+  summaryValue: unknown,
+  terminalStageValue: unknown,
+): { fingerprint: string; signature: string; failureClass: string } | null {
+  const failureClass = String(failureClassValue ?? "")
+    .trim()
+    .toLowerCase();
+
+  const rawEvidence = [jobFailureText(errorValue), String(summaryValue ?? "")]
+    .filter(Boolean)
+    .join("\n")
+    .replace(/\\/g, "/");
+  const exceptionMatch =
+    /\b(?:ReferenceError|TypeError|SyntaxError|RangeError|URIError|EvalError|AggregateError|Error):[^\r\n]{1,500}/i.exec(
+      rawEvidence,
+    );
+  const exception = exceptionMatch?.[0];
+  const firstFrameLine = exceptionMatch
+    ? rawEvidence
+        .slice((exceptionMatch.index ?? 0) + exceptionMatch[0].length)
+        .split(/\r?\n/)
+        .find((line) => /^\s*at\b/i.test(line))
+    : undefined;
+  const normalizedFirstFrame = String(firstFrameLine ?? "").replace(/\\/g, "/");
+  const sourceWorkerFrame = normalizedFirstFrame.match(
+    /(?:file:\/\/)?(?:[^\s():]+\/)?(apps\/workerpals\/src\/[^\s():]+):\d+:\d+/i,
+  );
+  const packagedWorkerFrame = normalizedFirstFrame.match(
+    /(?:\.pushpals\/runtime\/sandbox\/)?(\.pushpals-workerpals-runtime\.js):\d+:\d+/i,
+  );
+  const workerFramePath = sourceWorkerFrame?.[1] ?? packagedWorkerFrame?.[1];
+  const hasStrongInternalStackEvidence = Boolean(
+    exception && workerFramePath && isWorkerOwnedRuntimeStackFrame(firstFrameLine),
+  );
+  const hasStructuredWorkerRuntimeEvidence =
+    String(terminalStageValue ?? "")
+      .trim()
+      .toLowerCase() === "worker_runtime" &&
+    (failureClass === "worker_runtime_failure" || failureClass === "missing_runtime_asset");
+  if (
+    !hasStrongInternalStackEvidence &&
+    !hasStructuredWorkerRuntimeEvidence &&
+    (!WORKER_RUNTIME_CIRCUIT_FAILURE_CLASSES.has(failureClass) ||
+      failureClass === "worker_runtime_failure")
+  ) {
+    return null;
+  }
+
+  let signature = "";
+  if (hasStrongInternalStackEvidence && exception && workerFramePath) {
+    signature = `${normalizeWorkerRuntimeFailureEvidence(exception)} at ${workerFramePath.toLowerCase()}`;
+  } else {
+    const normalized = normalizeWorkerRuntimeFailureEvidence(rawEvidence);
+    if (!normalized) return null;
+    signature = `${failureClass}: ${normalized.slice(0, 1_200)}`;
+  }
+
+  return {
+    fingerprint: createHash("sha256").update(signature).digest("hex").slice(0, 24),
+    signature: signature.slice(0, 500),
+    failureClass: hasStrongInternalStackEvidence ? "worker_runtime_failure" : failureClass,
+  };
+}
+
+export function resolveWorkerRuntimeCircuitRetryAfterMs(
+  summary: Pick<WorkerRuntimeFailureCircuitSummary, "blockDurationMs" | "lastFailureAt">,
+  options?: { nowMs?: number; maxRetryAfterMs?: number; minRetryAfterMs?: number },
+): number {
+  const maxRetryAfterMs = Math.max(1_000, Math.floor(options?.maxRetryAfterMs ?? 30 * 60 * 1000));
+  const minRetryAfterMs = Math.max(
+    1_000,
+    Math.min(maxRetryAfterMs, Math.floor(options?.minRetryAfterMs ?? 1_000)),
+  );
+  const nowMs = Number.isFinite(options?.nowMs) ? Number(options?.nowMs) : Date.now();
+  const lastFailureAtMs = Date.parse(String(summary.lastFailureAt ?? ""));
+  if (!Number.isFinite(lastFailureAtMs)) return maxRetryAfterMs;
+  const remainingBlockMs = lastFailureAtMs + summary.blockDurationMs - nowMs;
+  return Math.max(minRetryAfterMs, Math.min(maxRetryAfterMs, Math.floor(remainingBlockMs)));
 }
 
 function nestedFailureCommand(value: unknown): string {
@@ -1220,28 +1345,6 @@ export class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-               OR targetWorkerId = ?
-               OR (
-                 targetWorkerId IS NOT NULL
-                 AND NOT EXISTS (
-                   SELECT 1
-                   FROM workers tw
-                   WHERE tw.workerId = jobs.targetWorkerId
-                     AND COALESCE(tw.status, 'idle') <> 'offline'
-                     AND tw.lastHeartbeat >= ?
-                 )
-               )
-             )
-             AND (
-               targetWorkerId IS NULL
-               OR targetWorkerId = ?
-               OR NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
              )
            ORDER BY
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
@@ -1253,16 +1356,7 @@ export class JobQueue {
              END ASC,
              createdAt ASC`,
         )
-        .all(
-          targetWorkerId,
-          targetWorkerCutoff,
-          now,
-          targetWorkerId,
-          targetWorkerCutoff,
-          targetWorkerId,
-          targetWorkerCutoff,
-          targetWorkerId,
-        ) as Array<{ id: string }>;
+        .all(targetWorkerId, targetWorkerCutoff, now, targetWorkerId) as Array<{ id: string }>;
       return rows.map((row) => row.id);
     }
 
@@ -1274,16 +1368,6 @@ export class JobQueue {
            AND (
              availableAt IS NULL
              OR availableAt <= ?
-             OR (
-               targetWorkerId IS NOT NULL
-               AND NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
-             )
            )
            AND (
              targetWorkerId IS NULL
@@ -1304,7 +1388,7 @@ export class JobQueue {
            END ASC,
            createdAt ASC`,
       )
-      .all(now, targetWorkerCutoff, targetWorkerCutoff) as Array<{ id: string }>;
+      .all(now, targetWorkerCutoff) as Array<{ id: string }>;
     return rows.map((row) => row.id);
   }
 
@@ -1556,28 +1640,6 @@ export class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-               OR targetWorkerId = ?
-               OR (
-                 targetWorkerId IS NOT NULL
-                 AND NOT EXISTS (
-                   SELECT 1
-                   FROM workers tw
-                   WHERE tw.workerId = jobs.targetWorkerId
-                     AND COALESCE(tw.status, 'idle') <> 'offline'
-                     AND tw.lastHeartbeat >= ?
-                 )
-               )
-             )
-             AND (
-               targetWorkerId IS NULL
-               OR targetWorkerId = ?
-               OR NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
              )
            ORDER BY
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
@@ -1590,16 +1652,7 @@ export class JobQueue {
              createdAt ASC
            LIMIT 1`,
         )
-        .get(
-          workerId,
-          targetWorkerCutoff,
-          now,
-          workerId,
-          targetWorkerCutoff,
-          workerId,
-          targetWorkerCutoff,
-          workerId,
-        ) as JobRow | undefined;
+        .get(workerId, targetWorkerCutoff, now, workerId) as JobRow | undefined;
 
       if (!row) {
         this.db
@@ -1653,6 +1706,7 @@ export class JobQueue {
           publishBlockedAt: null,
           completedAt: null,
           durationMs: null,
+          availableAt: null,
           updatedAt: now,
         },
         queueWaitMs,
@@ -1717,74 +1771,80 @@ export class JobQueue {
         replacementJobId,
         replacementAvailableAt,
       });
-      const abandonedInfo = this.db
-        .prepare(
-          `UPDATE jobs
-           SET status = 'abandoned',
-               error = ?,
-               failedAt = NULL,
-               abandonedAt = ?,
-               publishBlockedAt = NULL,
-               availableAt = NULL,
-               completedAt = NULL,
-               durationMs = MAX(
-                 0,
-                 CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
-               ),
-               updatedAt = ?
-           WHERE id = ?
-             AND status = 'claimed'
-             AND (? IS NULL OR workerId = ?)`,
-        )
-        .run(
-          abandonmentError,
-          now,
-          now,
-          now,
-          job.id,
-          options.expectedWorkerId ?? null,
-          options.expectedWorkerId ?? null,
-        );
-      if (abandonedInfo.changes === 0) return null;
+      const recover = this.db.transaction(() => {
+        const abandonedInfo = this.db
+          .prepare(
+            `UPDATE jobs
+             SET status = 'abandoned',
+                 error = ?,
+                 failedAt = NULL,
+                 abandonedAt = ?,
+                 publishBlockedAt = NULL,
+                 availableAt = NULL,
+                 completedAt = NULL,
+                 durationMs = MAX(
+                   0,
+                   CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+                 ),
+                 updatedAt = ?
+             WHERE id = ?
+               AND status = 'claimed'
+               AND (? IS NULL OR workerId = ?)`,
+          )
+          .run(
+            abandonmentError,
+            now,
+            now,
+            now,
+            job.id,
+            options.expectedWorkerId ?? null,
+            options.expectedWorkerId ?? null,
+          );
+        if (abandonedInfo.changes === 0) return false;
 
-      this.db
-        .prepare(
-          `INSERT INTO jobs (
-             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
-             queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-             status, workerId, targetWorkerId, result, prUrl, error, availableAt,
-             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
-             durationMs, resumeOfJobId, attempt, createdAt, updatedAt
-           )
-           VALUES (
-             ?, ?, ?, ?, ?, ?, ?, ?,
-             ?, ?, ?,
-             'pending', NULL, ?, NULL, ?, NULL, ?,
-             ?, NULL, NULL, NULL, NULL, NULL, NULL,
-             NULL, ?, ?, ?, ?
-           )`,
-        )
-        .run(
-          replacementJobId,
-          job.taskId,
-          job.sessionId,
-          job.kind,
-          JSON.stringify(replacementParams),
-          job.dedupeKey,
-          job.dedupeCooldownMs,
-          job.priority,
-          job.queueWaitBudgetMs,
-          job.executionBudgetMs,
-          job.finalizationBudgetMs,
-          nextTargetWorkerId,
-          job.prUrl,
-          replacementAvailableAt,
-          now,
-          job.id,
-          attempt,
-          now,
-          now,
-        );
+        this.db
+          .prepare(
+            `INSERT INTO jobs (
+               id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
+               queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+               status, workerId, targetWorkerId, result, prUrl, error, availableAt,
+               enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
+               durationMs, resumeOfJobId, attempt, createdAt, updatedAt
+             )
+             VALUES (
+               ?, ?, ?, ?, ?, ?, ?, ?,
+               ?, ?, ?,
+               'pending', NULL, ?, NULL, ?, NULL, ?,
+               ?, NULL, NULL, NULL, NULL, NULL, NULL,
+               NULL, ?, ?, ?, ?
+             )`,
+          )
+          .run(
+            replacementJobId,
+            job.taskId,
+            job.sessionId,
+            job.kind,
+            JSON.stringify(replacementParams),
+            job.dedupeKey,
+            job.dedupeCooldownMs,
+            job.priority,
+            job.queueWaitBudgetMs,
+            job.executionBudgetMs,
+            job.finalizationBudgetMs,
+            nextTargetWorkerId,
+            job.prUrl,
+            replacementAvailableAt,
+            now,
+            job.id,
+            attempt,
+            now,
+            now,
+          );
+
+        this.repointDurableRequestHandoffs(job.id, replacementJobId, now);
+        return true;
+      });
+      if (!recover()) return null;
 
       return {
         jobId: job.id,
@@ -1848,6 +1908,38 @@ export class JobQueue {
       retrySafety,
       recoveredAt: now,
     };
+  }
+
+  private repointDurableRequestHandoffs(
+    previousJobId: string,
+    replacementJobId: string,
+    now: string,
+  ): void {
+    const requestColumns = this.db.prepare(`PRAGMA table_info(requests)`).all() as Array<{
+      name: string;
+    }>;
+    const names = new Set(requestColumns.map((column) => column.name));
+    if (!names.has("handoffJobId")) return;
+
+    const durablePredicate = names.has("workerRequired") ? " AND workerRequired = 1" : "";
+    if (names.has("updatedAt")) {
+      this.db
+        .prepare(
+          `UPDATE requests
+           SET handoffJobId = ?, updatedAt = ?
+           WHERE handoffJobId = ?${durablePredicate}`,
+        )
+        .run(replacementJobId, now, previousJobId);
+      return;
+    }
+
+    this.db
+      .prepare(
+        `UPDATE requests
+         SET handoffJobId = ?
+         WHERE handoffJobId = ?${durablePredicate}`,
+      )
+      .run(replacementJobId, previousJobId);
   }
 
   heartbeat(body: Record<string, unknown>): { ok: boolean; message?: string } {
@@ -2786,16 +2878,6 @@ export class JobQueue {
            AND (
              availableAt IS NULL
              OR availableAt <= ?
-             OR (
-               targetWorkerId IS NOT NULL
-               AND NOT EXISTS (
-                 SELECT 1
-                 FROM workers tw
-                 WHERE tw.workerId = jobs.targetWorkerId
-                   AND COALESCE(tw.status, 'idle') <> 'offline'
-                   AND tw.lastHeartbeat >= ?
-               )
-             )
            )
            AND (
              targetWorkerId IS NULL
@@ -2808,9 +2890,7 @@ export class JobQueue {
              )
            )`,
       )
-      .get(normalizedKind, now, targetWorkerCutoff, targetWorkerCutoff) as
-      | { count: number }
-      | undefined;
+      .get(normalizedKind, now, targetWorkerCutoff) as { count: number } | undefined;
     return Number(row?.count || 0);
   }
 
@@ -3140,6 +3220,132 @@ export class JobQueue {
       noPublishableFailureRate,
       completedCount,
       lastFailureAt: row?.lastFailureAt ?? null,
+    };
+  }
+
+  workerRuntimeFailureCircuitSummary(options?: {
+    windowMs?: number;
+    maxBlockMs?: number;
+    threshold?: number;
+    nowMs?: number;
+  }): WorkerRuntimeFailureCircuitSummary {
+    const nowMs = Number.isFinite(options?.nowMs) ? Number(options?.nowMs) : Date.now();
+    const windowMs = Math.max(
+      60_000,
+      Math.min(24 * 60 * 60 * 1000, Math.floor(options?.windowMs ?? 60 * 60 * 1000)),
+    );
+    const blockDurationMs = Math.max(
+      60_000,
+      Math.min(windowMs, Math.floor(options?.maxBlockMs ?? 30 * 60 * 1000)),
+    );
+    const threshold = Math.max(2, Math.min(20, Math.floor(options?.threshold ?? 2)));
+    const cutoffIso = new Date(nowMs - windowMs).toISOString();
+    const rows = this.db
+      .prepare(
+        `SELECT
+           j.error,
+           COALESCE(j.failedAt, d.updatedAt, j.updatedAt) AS failureAt,
+           d.failureClass,
+           d.terminalStage,
+           d.executorBackend,
+           d.summary
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.kind = 'task.execute'
+           AND j.status = 'failed'
+           AND COALESCE(j.failedAt, d.updatedAt, j.updatedAt) >= ?
+         ORDER BY COALESCE(j.failedAt, d.updatedAt, j.updatedAt) DESC
+         LIMIT 1000`,
+      )
+      .all(cutoffIso) as Array<{
+      error: string | null;
+      failureAt: string | null;
+      failureClass: string | null;
+      terminalStage: string | null;
+      executorBackend: string | null;
+      summary: string | null;
+    }>;
+
+    const clusters = new Map<
+      string,
+      {
+        count: number;
+        failureClass: string;
+        executorBackend: string;
+        signature: string;
+        lastFailureAt: string | null;
+      }
+    >();
+    let qualifyingFailureCount = 0;
+    for (const row of rows) {
+      const signature = workerRuntimeFailureSignature(
+        row.failureClass,
+        row.error,
+        row.summary,
+        row.terminalStage,
+      );
+      if (!signature) continue;
+      qualifyingFailureCount += 1;
+      const previous = clusters.get(signature.fingerprint);
+      if (previous) {
+        previous.count += 1;
+        if (
+          (parseIsoMs(row.failureAt) ?? Number.NEGATIVE_INFINITY) >
+          (parseIsoMs(previous.lastFailureAt) ?? Number.NEGATIVE_INFINITY)
+        ) {
+          previous.lastFailureAt = row.failureAt;
+          previous.failureClass = signature.failureClass;
+          previous.executorBackend = String(row.executorBackend ?? "");
+          previous.signature = signature.signature;
+        }
+        continue;
+      }
+      clusters.set(signature.fingerprint, {
+        count: 1,
+        failureClass: signature.failureClass,
+        executorBackend: String(row.executorBackend ?? ""),
+        signature: signature.signature,
+        lastFailureAt: row.failureAt,
+      });
+    }
+
+    const rankedClusters = [...clusters.entries()].sort((left, right) => {
+      const countDelta = right[1].count - left[1].count;
+      if (countDelta !== 0) return countDelta;
+      return (
+        (parseIsoMs(right[1].lastFailureAt) ?? Number.NEGATIVE_INFINITY) -
+        (parseIsoMs(left[1].lastFailureAt) ?? Number.NEGATIVE_INFINITY)
+      );
+    });
+    let selected = rankedClusters[0] ?? null;
+    let blocked = false;
+    for (const candidate of rankedClusters) {
+      const [, candidateCluster] = candidate;
+      if (candidateCluster.count < threshold) continue;
+      const candidateLastFailureAtMs = parseIsoMs(candidateCluster.lastFailureAt);
+      if (candidateLastFailureAtMs == null || candidateLastFailureAtMs + blockDurationMs <= nowMs) {
+        continue;
+      }
+      selected = candidate;
+      blocked = true;
+      break;
+    }
+
+    const fingerprint = selected?.[0] ?? null;
+    const cluster = selected?.[1] ?? null;
+
+    return {
+      blocked,
+      windowMs,
+      blockDurationMs,
+      threshold,
+      qualifyingFailureCount,
+      recentMatchingFailureCount: cluster?.count ?? 0,
+      fingerprint,
+      failureClass: cluster?.failureClass || null,
+      executorBackend: cluster?.executorBackend || null,
+      signatureSample: cluster?.signature ?? null,
+      lastFailureAt: cluster?.lastFailureAt ?? null,
     };
   }
 

@@ -7,6 +7,7 @@ import {
   failNoPublishableCodeChange,
   holdCommitForTrustedValidation,
   inferWorkerTerminalFailureClass,
+  mergeWorkerDiagnostics,
   shouldDeferDockerCodexStartupStallForDirectRetry,
   shouldEmitDirectSessionJobEvent,
   shouldRecycleWorkerForCodexUnavailableFailure,
@@ -17,6 +18,33 @@ import {
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
+  test("preserves structurally owned terminal stages through final diagnostic enrichment", () => {
+    for (const terminalStage of ["worker_runtime", "docker"]) {
+      const merged = mergeWorkerDiagnostics(
+        {
+          terminal: {
+            failureClass: "worker_runtime_failure",
+            terminalStage,
+            metadata: { structuredResult: false },
+          },
+        },
+        {
+          terminal: {
+            failureClass: "worker_runtime_failure",
+            terminalStage: "worker",
+            metadata: { phase: "executing" },
+          },
+        },
+      );
+
+      expect(merged.terminal?.terminalStage).toBe(terminalStage);
+      expect(merged.terminal?.metadata).toMatchObject({
+        structuredResult: false,
+        phase: "executing",
+      });
+    }
+  });
+
   test("requires a publishable result only for explicit writable code-change jobs", () => {
     expect(
       requiresPublishableCodeChange({
@@ -383,6 +411,117 @@ describe("workerpals session event emission", () => {
     ).toBe("validation");
   });
 
+  test("classifies internal WorkerPal JavaScript crashes before incidental runtime context", () => {
+    const runtimeContext =
+      "[DockerExecutor] running with timeout=1320000ms codex_child_timeout=1200000ms\nDependency projection: /workspace/node_modules";
+
+    for (const error of [
+      "ReferenceError: Cannot access 'timedOut' before initialization",
+      "TypeError: undefined is not an object",
+      "SyntaxError: Unexpected token '}'",
+      "RangeError: Maximum call stack size exceeded",
+    ]) {
+      const result = {
+        ok: false,
+        summary: "Job failed (exit 1, elapsed 20173ms)",
+        stderr: `${error}\n    at /workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13\nBun v1.3.14 (Linux x64 baseline)`,
+        stdout: runtimeContext,
+        exitCode: 1,
+      };
+
+      expect(inferWorkerTerminalFailureClass(result)).toBe("worker_runtime_failure");
+      expect(didWorkerWatchdogFire(result)).toBe(false);
+    }
+
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary: "Job failed (exit 1, elapsed 20173ms)",
+        stderr: "child exited before returning its result",
+        stdout: "Dependency projection: /workspace/node_modules",
+        exitCode: 1,
+        diagnostics: {
+          terminal: {
+            failureClass: "worker_runtime_failure",
+            terminalStage: "docker",
+            metadata: {
+              structuredResult: false,
+              timedOutByDocker: false,
+            },
+          },
+        },
+      }),
+    ).toBe("worker_runtime_failure");
+
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary: "Job failed",
+        stderr: [
+          "ReferenceError: route state is unavailable",
+          "    at src/routeShell.ts:42:7",
+          "    at /workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13",
+        ].join("\n"),
+        exitCode: 1,
+      }),
+    ).toBe("worker_failure");
+
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary: "Job failed",
+        stderr: "TypeError: user fixture broke\n    at src/generic_python_executor.ts:42:7",
+        exitCode: 1,
+      }),
+    ).toBe("worker_failure");
+
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary: "WorkerPal encountered an unexpected runtime failure",
+        stderr: "TypeError: internal state unavailable",
+        exitCode: 1,
+        diagnostics: {
+          terminal: {
+            failureClass: "worker_runtime_failure",
+            terminalStage: "worker_runtime",
+          },
+        },
+      }),
+    ).toBe("worker_runtime_failure");
+  });
+
+  test("requires explicit no-publishable semantics for artifact-only failures", () => {
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary: "Worker command failed",
+        stderr: "dependency projection was prepared before the command exited 1",
+        stdout: "Dependency projection: /workspace/node_modules",
+        exitCode: 1,
+      }),
+    ).toBe("worker_failure");
+
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary: "Executor authentication failed",
+        stderr: "Unauthorized: login is required",
+        stdout: "Earlier agent narration said there were no publishable changes yet",
+        exitCode: 1,
+      }),
+    ).toBe("worker_failure");
+
+    expect(
+      inferWorkerTerminalFailureClass({
+        ok: false,
+        summary: "Executor produced no publishable code changes",
+        stderr: "Only non-publishable artifact paths changed: node_modules/.cache",
+        exitCode: 1,
+      }),
+    ).toBe("artifact_only_no_publishable_patch");
+  });
+
   test("classifies missing runtime prompts before incidental timeout task text", () => {
     const result = {
       ok: false,
@@ -410,10 +549,48 @@ describe("workerpals session event emission", () => {
     expect(
       didWorkerWatchdogFire({
         ok: false,
+        summary: "Authentication failed",
+        stdout: "Please add watchdog tests and follow the rollout coach guidance.",
+        stderr: "Unauthorized",
+        exitCode: 1,
+      }),
+    ).toBe(false);
+    expect(
+      didWorkerWatchdogFire({
+        ok: false,
+        summary: "Validation failed",
+        stdout: "Add regression coverage for signal 15 and exit 137 process cleanup.",
+        stderr: "assertion failed",
+        exitCode: 1,
+      }),
+    ).toBe(false);
+    expect(
+      didWorkerWatchdogFire({
+        ok: false,
         summary: "Job timed out in Docker executor after 900000ms",
         exitCode: 124,
       }),
     ).toBe(true);
+  });
+
+  test("recognizes the executor's actual rollout-coach watchdog event", () => {
+    expect(
+      didWorkerWatchdogFire({
+        ok: false,
+        summary: "openai_codex rollout coach could not safely reset broad changes",
+        stderr: "Rollout coach fired after 180s: broad diff exceeded the safe scope. Failing fast.",
+        exitCode: 124,
+      }),
+    ).toBe(true);
+    expect(
+      didWorkerWatchdogFire({
+        ok: false,
+        summary: "Authentication failed",
+        stdout: "Please follow the rollout coach guidance before retrying.",
+        stderr: "Unauthorized",
+        exitCode: 1,
+      }),
+    ).toBe(false);
   });
 
   test("recycles a worker after a codex startup stall", () => {

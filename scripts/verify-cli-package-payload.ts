@@ -23,14 +23,32 @@ const WINDOWS_SOURCE_RUNTIME_ASSET_PATHS = [
   "runtime/sandbox/.pushpals-source-control-manager-runtime.js",
   "runtime/sandbox/.pushpals-runtime-launch-trampoline.js",
 ] as const;
-const REQUIRED_CLI_PACKAGE_PATHS = new Set([
+export const REQUIRED_CLI_PACKAGE_PATHS = [
   "bin/pushpals.cjs",
   "dist/pushpals-cli.js",
   ...WINDOWS_SOURCE_RUNTIME_ASSET_PATHS,
+  "runtime/sandbox/package.json",
+  "runtime/sandbox/bun.lock",
+  "runtime/sandbox/configs/default.toml",
+  "runtime/sandbox/apps/workerpals/Dockerfile.sandbox",
+  "runtime/sandbox/apps/workerpals/package.json",
+  "runtime/sandbox/apps/workerpals/uv.lock",
+  "runtime/sandbox/apps/workerpals/src/job_runner.ts",
+  "runtime/sandbox/apps/workerpals/src/workerpals_main.ts",
+  "runtime/sandbox/apps/workerpals/src/common/generic_python_executor.ts",
+  "runtime/sandbox/apps/workerpals/src/backends/openai_codex_backend.ts",
+  "runtime/sandbox/apps/workerpals/src/backends/openai_codex/openai_codex_executor.py",
+  "runtime/sandbox/packages/shared/package.json",
+  "runtime/sandbox/packages/shared/src/index.ts",
+  "runtime/sandbox/packages/shared/src/tooling.ts",
+  "runtime/sandbox/packages/protocol/package.json",
+  "runtime/sandbox/packages/protocol/tsconfig.json",
+  "runtime/sandbox/packages/protocol/src/index.ts",
+  "runtime/sandbox/packages/protocol/src/schemas/envelope.schema.json",
   "runtime/sandbox/prompts/review_agent/reviewer.md",
   "runtime/sandbox/prompts/workerpals/task_quality_critic_system_prompt.md",
   "runtime/sandbox/prompts/workerpals/task_quality_critic_user_prompt.md",
-]);
+] as const;
 const ALLOWED_EXECUTABLE_PACKAGE_PATHS = new Set([
   "bin/pushpals.cjs",
   "dist/pushpals-cli.js",

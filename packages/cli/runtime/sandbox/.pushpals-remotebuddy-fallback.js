@@ -8209,7 +8209,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         console.warn(`[RemoteBuddyAutonomousEngine] Suppressing failed target cluster for ${retryAfterMs}ms and continuing future selection on other components.`);
         return null;
       }
-      if (res.status === 429 && (code === "autonomy_worker_failure_circuit_open" || code === "autonomy_similar_no_publishable_suppressed" || code === "autonomy_queue_backpressure" || code === "autonomy_publication_backpressure" || code === "autonomy_open_pr_limit")) {
+      if (res.status === 429 && (code === "autonomy_worker_runtime_circuit_open" || code === "autonomy_worker_failure_circuit_open" || code === "autonomy_similar_no_publishable_suppressed" || code === "autonomy_queue_backpressure" || code === "autonomy_publication_backpressure" || code === "autonomy_open_pr_limit")) {
         this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
         this.dispatchBackoffReason = compactStatusDetail(code || String(errorPayload.message ?? "autonomy_enqueue_rejected")) || "autonomy_enqueue_rejected";
       }

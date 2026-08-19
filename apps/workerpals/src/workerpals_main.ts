@@ -31,6 +31,7 @@ import {
   resolveGitTokenForRemote,
   createToolRunRecordFromFailure,
   fetchBufferedWithHardDeadline,
+  isWorkerOwnedRuntimeStackFrame,
 } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
 import { Logger } from "./common/logger.js";
@@ -486,10 +487,17 @@ function inferWorkerJobPhaseFromLogLine(line: string): WorkerJobPhase | null {
   return null;
 }
 
-function mergeWorkerDiagnostics(
+export function mergeWorkerDiagnostics(
   base: JobDiagnostics | undefined,
   extra: JobDiagnostics,
 ): JobDiagnostics {
+  const baseTerminalStage = String(base?.terminal?.terminalStage ?? "")
+    .trim()
+    .toLowerCase();
+  const trustedBaseTerminalStage =
+    baseTerminalStage === "worker_runtime" || baseTerminalStage === "docker"
+      ? baseTerminalStage
+      : null;
   return {
     ...(base ?? {}),
     ...extra,
@@ -502,6 +510,7 @@ function mergeWorkerDiagnostics(
         ? {
             ...(base?.terminal ?? {}),
             ...(extra.terminal ?? {}),
+            ...(trustedBaseTerminalStage ? { terminalStage: trustedBaseTerminalStage } : {}),
             metadata: {
               ...(base?.terminal?.metadata ?? {}),
               ...(extra.terminal?.metadata ?? {}),
@@ -521,15 +530,56 @@ function isCodexStartupStallResult(result: JobResult): boolean {
   return /stalled before first response|startup stall/.test(text);
 }
 
+function isWorkerRuntimeFailure(text: string): boolean {
+  const exception =
+    /\b(?:referenceerror|typeerror|syntaxerror|rangeerror|urierror|evalerror|aggregateerror|error):[^\r\n]*/.exec(
+      text,
+    );
+  if (!exception) return false;
+  const firstFrame = text
+    .slice((exception.index ?? 0) + exception[0].length)
+    .split(/\r?\n/)
+    .find((line) => /^\s*at\b/.test(line));
+  return isWorkerOwnedRuntimeStackFrame(firstFrame);
+}
+
+function hasExplicitNoPublishableResult(text: string): boolean {
+  return (
+    /\bno publishable[^\r\n]{0,80}\b(?:changes?|patch|progress)\b/.test(text) ||
+    /\bonly non-publishable[^\r\n]{0,80}\b(?:artifacts?|paths?|changes?|files?|dependencies?|runtime)\b/.test(
+      text,
+    ) ||
+    /\bartifact_only_no_publishable_patch\b/.test(text)
+  );
+}
+
 export function inferWorkerTerminalFailureClass(result: JobResult): string {
   if (result.publishBlocked?.stage === "validation") return "environment";
   if (result.validationBlocked) return "trusted_validation_required";
   if (result.ok) return "success";
+  const structuredTerminal = result.diagnostics?.terminal;
+  const structuredFailureClass = String(structuredTerminal?.failureClass ?? "").trim();
+  if (structuredFailureClass && structuredTerminal?.terminalStage === "worker_runtime") {
+    // JobRunner owns this boundary and emits it only for fatal failures in the
+    // WorkerPal process itself. It may not have a stack after serialization.
+    return structuredFailureClass;
+  }
+  if (
+    structuredFailureClass &&
+    structuredTerminal?.terminalStage === "docker" &&
+    structuredTerminal.metadata?.structuredResult === false
+  ) {
+    // DockerExecutor owns classification when a child dies before returning a
+    // sentinel. Preserve that structured boundary evidence instead of parsing
+    // incidental dependency paths or task narration a second time.
+    return structuredFailureClass;
+  }
   const summaryText = `${result.summary ?? ""}`.toLowerCase();
   const text =
     `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
   const terminalText = `${result.summary ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
   if (isCodexStartupStallResult(result)) return "codex_startup_stall";
+  if (isWorkerRuntimeFailure(terminalText)) return "worker_runtime_failure";
   if (
     /(?:fatal error|enoent|no such file or directory)/.test(terminalText) &&
     /(?:\/workspace\/prompts|[\\/]prompts[\\/]|\[prompts\])/.test(terminalText)
@@ -537,24 +587,26 @@ export function inferWorkerTerminalFailureClass(result: JobResult): string {
     return "missing_runtime_asset";
   }
   if (/validationgate|validation/.test(summaryText)) return "validation";
-  if (/no publishable|non-publishable|node_modules/.test(text))
-    return "artifact_only_no_publishable_patch";
+  if (hasExplicitNoPublishableResult(terminalText)) return "artifact_only_no_publishable_patch";
   if (
     result.exitCode === 124 ||
     /timed out|job timeout|signal 15|terminated \(exit|exit 143|exit 137/.test(terminalText)
   )
     return "timeout";
-  if (/validationgate|validation/.test(text)) return "validation";
-  if (/scopegate|scope/.test(text)) return "scope";
-  if (/criticgate|critic/.test(text)) return "critic";
-  if (/publish/.test(text)) return "publish";
+  if (/validationgate|validation/.test(terminalText)) return "validation";
+  if (/scopegate|scope/.test(terminalText)) return "scope";
+  if (/criticgate|critic/.test(terminalText)) return "critic";
+  if (/publish/.test(terminalText)) return "publish";
   return "worker_failure";
 }
 
 export function didWorkerWatchdogFire(result: JobResult): boolean {
-  const text = `${result.summary ?? ""}\n${result.stderr ?? ""}\n${result.stdout ?? ""}`;
-  return /watchdog|rollout coach|stalled before first response|startup stall|\[DockerExecutor\] Job timeout|Job timed out in Docker executor|signal 15|terminated \(exit (?:143|137)\)|exit (?:143|137)/i.test(
-    text,
+  // Executor stdout contains task narration and prior tool output. Treat only
+  // terminal fields as watchdog evidence so work about signals/timeouts cannot
+  // manufacture a watchdog event.
+  const terminalText = `${result.summary ?? ""}\n${result.stderr ?? ""}`;
+  return /(?:no-edit watchdog|rollout coach|startup[- ]stall watchdog) (?:fired|triggered)|stalled before first response|startup stall|\[DockerExecutor\] Job timeout|Job timed out in Docker executor|signal 15|terminated \(exit (?:143|137)\)|exit (?:143|137)/i.test(
+    terminalText,
   );
 }
 

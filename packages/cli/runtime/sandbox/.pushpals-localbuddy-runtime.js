@@ -3352,6 +3352,23 @@ function extractJobRequestId(job) {
   const normalized = requestId.trim();
   return normalized || null;
 }
+function effectiveRequestOutcome(request, relatedJobs) {
+  if (request.status === "failed")
+    return "failed";
+  const handoffJobId = String(request.handoffJobId ?? "").trim();
+  const hasDurableWorkerHandoff = request.workerRequired === 1 && Boolean(handoffJobId);
+  if (!hasDurableWorkerHandoff)
+    return request.outcomeStatus ?? request.status;
+  const handoffJob = relatedJobs.find((job) => job.id === handoffJobId) ?? null;
+  if (handoffJob?.status === "completed")
+    return "completed";
+  if (handoffJob?.status === "failed" || handoffJob?.status === "abandoned" || handoffJob?.status === "publish_blocked") {
+    return "failed";
+  }
+  if (handoffJob)
+    return "delegated";
+  return request.outcomeStatus ?? "delegated";
+}
 function selectRelevantJobForPrompt(args) {
   const requestedToken = extractReferencedJobToken(args.userPrompt);
   const isJobQuery = isJobStatusPrompt(args.userPrompt);
@@ -3499,45 +3516,53 @@ function buildRequestStatusReply(args) {
       return latest ? `I couldn't find request ${requestedToken}. Recent request IDs: ${latest}.` : `I couldn't find request ${requestedToken}.`;
     }
   } else {
-    request = requests.find((row) => row.status === "pending" || row.status === "claimed") ?? requests[0];
+    request = requests.find((row) => row.outcomeStatus === "delegated") ?? requests.find((row) => row.status === "pending" || row.status === "claimed") ?? requests[0];
   }
   if (!request) {
     return "I couldn't resolve which request to check.";
   }
   const requestId = request.id;
-  const relatedJobs = jobs.filter((job) => extractJobRequestId(job) === requestId);
+  const handoffJobId = String(request.handoffJobId ?? "").trim();
+  const relatedJobs = jobs.filter((job) => job.id === handoffJobId || extractJobRequestId(job) === requestId);
   relatedJobs.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   const requestShort = requestId.slice(0, 8);
-  const requestTime = formatTime(request.updatedAt);
-  let summary = `Request ${requestShort} is ${request.status} (updated ${requestTime}).`;
+  const outcomeStatus = effectiveRequestOutcome(request, relatedJobs);
+  const requestTime = formatTime(request.outcomeUpdatedAt ?? request.updatedAt);
+  let summary = `Request ${requestShort} is ${outcomeStatus} (updated ${requestTime}).`;
   if (request.priority) {
     summary = `${summary} Priority: ${request.priority}.`;
   }
-  if (request.status === "claimed" && request.agentId) {
+  if ((outcomeStatus === "completed" || outcomeStatus === "failed") && typeof request.outcomeDurationMs === "number" && Number.isFinite(request.outcomeDurationMs) && request.outcomeDurationMs >= 0) {
+    summary += ` End-to-end: ${formatDuration(request.outcomeDurationMs)}.`;
+  }
+  if (outcomeStatus === "claimed" && request.agentId) {
     summary = `Request ${requestShort} is claimed by ${request.agentId} (updated ${requestTime}).`;
     if (request.priority) {
       summary += ` Priority: ${request.priority}.`;
     }
   }
-  if (request.status === "failed") {
+  if (outcomeStatus === "failed" && request.status === "failed") {
     const requestError = parseStructuredError(request.error, summarizeFailure);
     if (requestError) {
       summary = `${summary} Failure: ${requestError}`;
     }
   }
   if (relatedJobs.length === 0) {
-    if (request.status === "pending") {
+    if (outcomeStatus === "pending") {
       return `${summary} It is waiting for RemoteBuddy to claim it.`;
     }
-    if (request.status === "claimed") {
+    if (outcomeStatus === "claimed") {
       return `${summary} RemoteBuddy is still planning and has not enqueued a WorkerPal job yet.`;
     }
-    if (request.status === "completed") {
+    if (outcomeStatus === "delegated") {
+      return `${summary} RemoteBuddy handed it to WorkerPal job ${handoffJobId.slice(0, 8)}, which has not reported a terminal outcome yet.`;
+    }
+    if (outcomeStatus === "completed") {
       return `${summary} RemoteBuddy finished orchestration; no WorkerPal job is linked yet.`;
     }
     return summary;
   }
-  const latestJob = relatedJobs[0];
+  const latestJob = relatedJobs.find((job) => job.id === handoffJobId) ?? relatedJobs[0];
   const latestJobShort = latestJob.id.slice(0, 8);
   const latestJobTime = formatTime(latestJob.updatedAt);
   let jobSummary = `Latest WorkerPal job ${latestJobShort} is ${latestJob.status} (updated ${latestJobTime})`;
@@ -3545,7 +3570,7 @@ function buildRequestStatusReply(args) {
     jobSummary += ` on ${latestJob.workerId}`;
   }
   jobSummary += ".";
-  if (latestJob.status === "failed") {
+  if (latestJob.status === "failed" || latestJob.status === "abandoned" || latestJob.status === "publish_blocked") {
     const jobError = parseStructuredError(latestJob.error, summarizeFailure);
     if (jobError) {
       jobSummary += ` Failure: ${jobError}`;
@@ -3555,12 +3580,17 @@ function buildRequestStatusReply(args) {
     const counts = {
       pending: 0,
       claimed: 0,
+      finalizing: 0,
       completed: 0,
-      failed: 0
+      failed: 0,
+      abandoned: 0,
+      publish_blocked: 0
     };
     for (const row of relatedJobs)
       counts[row.status] += 1;
-    const countsText = `Jobs: ${relatedJobs.length} total (${counts.pending} pending, ${counts.claimed} claimed, ${counts.completed} completed, ${counts.failed} failed).`;
+    const failedJobs = counts.failed + counts.abandoned + counts.publish_blocked;
+    const finalizingText = counts.finalizing > 0 ? `, ${counts.finalizing} finalizing` : "";
+    const countsText = `Jobs: ${relatedJobs.length} total (${counts.pending} pending, ${counts.claimed} claimed${finalizingText}, ${counts.completed} completed, ${failedJobs} failed).`;
     return `${summary} ${jobSummary} ${countsText}`;
   }
   return `${summary} ${jobSummary}`;

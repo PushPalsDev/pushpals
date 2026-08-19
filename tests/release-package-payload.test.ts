@@ -6,34 +6,16 @@ import { dirname, join, resolve } from "node:path";
 import {
   findDisallowedCliPackageEntries,
   findDisallowedReleaseArtifactEntries,
+  REQUIRED_CLI_PACKAGE_PATHS,
 } from "../scripts/verify-cli-package-payload.ts";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const verifierScript = join(repoRoot, "scripts", "verify-cli-package-payload.ts");
-const windowsSourceRuntimeAssets = [
-  ".pushpals-server-runtime.js",
-  ".pushpals-localbuddy-runtime.js",
-  ".pushpals-remotebuddy-fallback.js",
-  ".pushpals-workerpals-runtime.js",
-  ".pushpals-source-control-manager-runtime.js",
-  ".pushpals-runtime-launch-trampoline.js",
-];
-const requiredRuntimePayloadEntries = windowsSourceRuntimeAssets.map((asset) => ({
-  path: `runtime/sandbox/${asset}`,
-}));
-const requiredSandboxPromptEntries = [
-  "runtime/sandbox/prompts/review_agent/reviewer.md",
-  "runtime/sandbox/prompts/workerpals/task_quality_critic_system_prompt.md",
-  "runtime/sandbox/prompts/workerpals/task_quality_critic_user_prompt.md",
-].map((path) => ({ path }));
-
 function requiredCliPackageFiles() {
-  return [
-    { path: "bin/pushpals.cjs", mode: 0o755 },
-    { path: "dist/pushpals-cli.js", mode: 0o755 },
-    ...requiredRuntimePayloadEntries,
-    ...requiredSandboxPromptEntries,
-  ];
+  return REQUIRED_CLI_PACKAGE_PATHS.map((path) => ({
+    path,
+    ...(path === "bin/pushpals.cjs" || path === "dist/pushpals-cli.js" ? { mode: 0o755 } : {}),
+  }));
 }
 
 function withTempPackage<T>(fn: (packageDir: string) => T): T {
@@ -59,15 +41,10 @@ function withTempPackage<T>(fn: (packageDir: string) => T): T {
       "utf8",
     );
     writeFileSync(join(packageDir, "README.md"), "# fixture\n", "utf8");
-    writeFileSync(join(packageDir, "bin", "pushpals.cjs"), "console.log('fixture');\n", "utf8");
-    writeFileSync(join(packageDir, "dist", "pushpals-cli.js"), "export {};\n", "utf8");
-    for (const asset of windowsSourceRuntimeAssets) {
-      writeFileSync(join(packageDir, "runtime", "sandbox", asset), "export {};\n", "utf8");
-    }
-    for (const prompt of requiredSandboxPromptEntries) {
-      const promptPath = join(packageDir, prompt.path);
-      mkdirSync(dirname(promptPath), { recursive: true });
-      writeFileSync(promptPath, "# fixture prompt\n", "utf8");
+    for (const requiredPath of REQUIRED_CLI_PACKAGE_PATHS) {
+      const fixturePath = join(packageDir, requiredPath);
+      mkdirSync(dirname(fixturePath), { recursive: true });
+      writeFileSync(fixturePath, "fixture\n", "utf8");
     }
     return fn(packageDir);
   } finally {
@@ -84,6 +61,27 @@ function runVerifier(args: string[]) {
 }
 
 describe("release package payload verification", () => {
+  test("requires the complete WorkerPal sandbox bootstrap surface", () => {
+    expect(REQUIRED_CLI_PACKAGE_PATHS).toEqual(
+      expect.arrayContaining([
+        "runtime/sandbox/package.json",
+        "runtime/sandbox/bun.lock",
+        "runtime/sandbox/configs/default.toml",
+        "runtime/sandbox/apps/workerpals/Dockerfile.sandbox",
+        "runtime/sandbox/apps/workerpals/package.json",
+        "runtime/sandbox/apps/workerpals/uv.lock",
+        "runtime/sandbox/apps/workerpals/src/job_runner.ts",
+        "runtime/sandbox/apps/workerpals/src/common/generic_python_executor.ts",
+        "runtime/sandbox/apps/workerpals/src/backends/openai_codex/openai_codex_executor.py",
+        "runtime/sandbox/packages/shared/src/index.ts",
+        "runtime/sandbox/packages/shared/src/tooling.ts",
+        "runtime/sandbox/packages/protocol/package.json",
+        "runtime/sandbox/packages/protocol/src/index.ts",
+        "runtime/sandbox/packages/protocol/src/schemas/envelope.schema.json",
+      ]),
+    );
+  });
+
   test("rejects developer-local runtime configuration from npm packages", () => {
     const issues = findDisallowedCliPackageEntries([
       ...requiredCliPackageFiles(),
@@ -145,16 +143,8 @@ describe("release package payload verification", () => {
   test("allows the expected CLI package payload shape without vendored tool binaries", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "README.md" },
-      { path: "bin/pushpals.cjs", mode: 0o755 },
-      { path: "dist/pushpals-cli.js", mode: 0o755 },
+      ...requiredCliPackageFiles(),
       { path: "runtime/configs/default.toml" },
-      ...windowsSourceRuntimeAssets.map((asset) => ({
-        path: `runtime/sandbox/${asset}`,
-        mode: 0o755,
-      })),
-      ...requiredSandboxPromptEntries,
-      { path: "runtime/sandbox/bun.lock" },
-      { path: "runtime/sandbox/apps/workerpals/uv.lock" },
       {
         path: "monitor-ui/assets/__node_modules/@expo/vector-icons/build/vendor/react-native-vector-icons/Fonts/Ionicons.ttf",
       },
@@ -165,10 +155,7 @@ describe("release package payload verification", () => {
 
   test("rejects external toolchain binaries and runtime dependency directories", () => {
     const issues = findDisallowedCliPackageEntries([
-      { path: "bin/pushpals.cjs" },
-      { path: "dist/pushpals-cli.js" },
-      ...requiredRuntimePayloadEntries,
-      ...requiredSandboxPromptEntries,
+      ...requiredCliPackageFiles(),
       { path: "runtime/bin/bun.exe" },
       { path: "runtime/bin/node" },
       { path: "runtime/bin/git.cmd" },
@@ -199,12 +186,8 @@ describe("release package payload verification", () => {
 
   test("normalizes Windows package paths before matching blocked tools and directories", () => {
     const issues = findDisallowedCliPackageEntries([
-      { path: "bin\\pushpals.cjs" },
-      { path: "dist\\pushpals-cli.js" },
-      ...windowsSourceRuntimeAssets.map((asset) => ({
-        path: `runtime\\sandbox\\${asset}`,
-      })),
-      ...requiredSandboxPromptEntries.map((entry) => ({
+      ...requiredCliPackageFiles().map((entry) => ({
+        ...entry,
         path: entry.path.replaceAll("/", "\\"),
       })),
       { path: "runtime\\bin\\bun.exe" },
@@ -220,12 +203,7 @@ describe("release package payload verification", () => {
   test("rejects package payloads missing required CLI entry files", () => {
     const issues = findDisallowedCliPackageEntries([{ path: "README.md" }]);
 
-    expect(issues.map((issue) => issue.path)).toEqual([
-      "bin/pushpals.cjs",
-      "dist/pushpals-cli.js",
-      ...windowsSourceRuntimeAssets.map((asset) => `runtime/sandbox/${asset}`),
-      ...requiredSandboxPromptEntries.map((entry) => entry.path),
-    ]);
+    expect(issues.map((issue) => issue.path)).toEqual([...REQUIRED_CLI_PACKAGE_PATHS]);
     expect(issues.every((issue) => issue.reason === "required CLI package entry is missing")).toBe(
       true,
     );
@@ -278,41 +256,110 @@ describe("release package payload verification", () => {
     });
   });
 
-  test("release workflow verifies package payload before npm publish and artifacts before upload", () => {
+  test("release workflow tests and publishes one immutable CLI package artifact", () => {
     const workflow = readFileSync(
       join(repoRoot, ".github", "workflows", "release-cli.yml"),
       "utf8",
     );
 
-    const buildPackageIndex = workflow.indexOf("Build CLI package payload");
+    const buildJobIndex = workflow.indexOf("build_cli_package:");
     const reliabilityJobIndex = workflow.indexOf("reliability_contract:");
     const publishJobIndex = workflow.indexOf("publish_npm:");
-    const verifyPackageIndex = workflow.indexOf(
+    const publishedSmokeJobIndex = workflow.indexOf("smoke_published_cli_linux:");
+    const buildJob = workflow.slice(buildJobIndex, reliabilityJobIndex);
+    const reliabilityJob = workflow.slice(reliabilityJobIndex, publishJobIndex);
+    const publishJob = workflow.slice(publishJobIndex, publishedSmokeJobIndex);
+    const setVersionIndex = buildJob.indexOf("Set CLI package version from tag");
+    const buildPackageIndex = buildJob.indexOf("Build CLI package payload");
+    const verifyPackageIndex = buildJob.indexOf(
       "Verify CLI package payload excludes external toolchains",
     );
-    const publishIndex = workflow.indexOf("Publish to npm");
+    const packPackageIndex = buildJob.indexOf("Pack immutable CLI package artifact");
+    const uploadPackageIndex = buildJob.indexOf("Upload immutable CLI package artifact");
+    const reliabilityDownloadIndex = reliabilityJob.indexOf(
+      "Download immutable CLI package artifact",
+    );
+    const reliabilityUnpackIndex = reliabilityJob.indexOf(
+      "Verify and unpack immutable CLI package artifact",
+    );
+    const reliabilityDockerIndex = reliabilityJob.indexOf("Build packaged WorkerPal sandbox image");
+    const reliabilityCliSmokeIndex = reliabilityJob.indexOf(
+      "Smoke exact immutable CLI package artifact",
+    );
+    const reliabilityHarnessIndex = reliabilityJob.indexOf("bun run harness:reliability");
+    const publishDownloadIndex = publishJob.indexOf(
+      "Download tested immutable CLI package artifact",
+    );
+    const publishVerifyIndex = publishJob.indexOf("Verify tested immutable CLI package artifact");
+    const publishIndex = publishJob.indexOf("Publish to npm");
     const checksumIndex = workflow.indexOf("Generate checksums");
     const verifyReleaseIndex = workflow.indexOf(
       "Verify GitHub release assets exclude external tool artifacts",
     );
     const createReleaseIndex = workflow.indexOf("Create GitHub release (release log)");
-    const reliabilityJob = workflow.slice(reliabilityJobIndex, publishJobIndex);
     const reliabilityInstallIndex = reliabilityJob.indexOf("bun install --frozen-lockfile");
     const reliabilityProtocolBuildIndex = reliabilityJob.indexOf("bun run protocol:build");
-    const reliabilityHarnessIndex = reliabilityJob.indexOf("bun run harness:reliability");
 
-    expect(buildPackageIndex).toBeGreaterThanOrEqual(0);
-    expect(reliabilityJobIndex).toBeGreaterThanOrEqual(0);
+    expect(buildJobIndex).toBeGreaterThanOrEqual(0);
+    expect(reliabilityJobIndex).toBeGreaterThan(buildJobIndex);
     expect(publishJobIndex).toBeGreaterThan(reliabilityJobIndex);
+    expect(publishedSmokeJobIndex).toBeGreaterThan(publishJobIndex);
+    expect(buildJob).toContain("needs: meta");
+    expect(setVersionIndex).toBeGreaterThanOrEqual(0);
+    expect(buildPackageIndex).toBeGreaterThanOrEqual(0);
+    expect(buildPackageIndex).toBeGreaterThan(setVersionIndex);
+    expect(verifyPackageIndex).toBeGreaterThan(buildPackageIndex);
+    expect(packPackageIndex).toBeGreaterThan(verifyPackageIndex);
+    expect(uploadPackageIndex).toBeGreaterThan(packPackageIndex);
+    expect(buildJob).toContain(
+      "npm pack ./packages/cli --ignore-scripts --pack-destination dist/tested-cli-artifact",
+    );
+    expect(buildJob).toContain('sha256sum "$tarball_name" > SHA256SUMS.txt');
+    expect(buildJob).toContain("name: pushpals-cli-package-${{ needs.meta.outputs.version }}");
+
+    expect(reliabilityJob).toContain("- build_cli_package");
+    expect(reliabilityDownloadIndex).toBeGreaterThan(reliabilityProtocolBuildIndex);
+    expect(reliabilityUnpackIndex).toBeGreaterThan(reliabilityDownloadIndex);
+    expect(reliabilityCliSmokeIndex).toBeGreaterThan(reliabilityUnpackIndex);
+    expect(reliabilityDockerIndex).toBeGreaterThan(reliabilityCliSmokeIndex);
+    expect(reliabilityHarnessIndex).toBeGreaterThan(reliabilityDockerIndex);
+    expect(reliabilityJob).toContain("sha256sum -c SHA256SUMS.txt");
+    expect(reliabilityJob).toContain('tar -xzf "${tarballs[0]}"');
+    expect(reliabilityJob).toContain(
+      '--package-spec "${{ steps.tested_package.outputs.tarball }}"',
+    );
+    expect(reliabilityJob).toContain(
+      "PUSHPALS_PACKAGED_RUNTIME_ROOT: ${{ github.workspace }}/dist/tested-cli-package/package/runtime/sandbox",
+    );
+    expect(reliabilityJob).toContain(
+      "docker build -f dist/tested-cli-package/package/runtime/sandbox/apps/workerpals/Dockerfile.sandbox -t pushpals-worker-sandbox:latest dist/tested-cli-package/package/runtime/sandbox",
+    );
+    expect(reliabilityJob).not.toContain(
+      "docker build -f apps/workerpals/Dockerfile.sandbox -t pushpals-worker-sandbox:latest .",
+    );
+    expect(reliabilityJob).not.toContain(
+      "docker build -f packages/cli/runtime/sandbox/apps/workerpals/Dockerfile.sandbox",
+    );
+
+    expect(publishJob).toContain("- build_cli_package");
     expect(workflow).toContain("- reliability_contract");
+    expect(publishDownloadIndex).toBeGreaterThanOrEqual(0);
+    expect(publishVerifyIndex).toBeGreaterThan(publishDownloadIndex);
+    expect(publishIndex).toBeGreaterThan(publishVerifyIndex);
+    expect(publishJob).toContain("sha256sum -c SHA256SUMS.txt");
+    expect(publishJob).toContain(
+      'npm publish "${{ steps.tested_package.outputs.tarball }}" --ignore-scripts --access public --provenance',
+    );
+    expect(publishJob).not.toContain("bun run --cwd packages/cli build");
+    expect(publishJob).not.toContain("working-directory: packages/cli");
+    expect(publishJob).not.toContain("npm publish --access public");
+    expect(publishJob.match(/^\s+npm publish /gm)).toHaveLength(1);
+
     expect(reliabilityInstallIndex).toBeGreaterThanOrEqual(0);
     expect(reliabilityProtocolBuildIndex).toBeGreaterThan(reliabilityInstallIndex);
-    expect(reliabilityHarnessIndex).toBeGreaterThan(reliabilityProtocolBuildIndex);
     expect(workflow).toContain('PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION: "1"');
     expect(workflow).toContain('PUSHPALS_RUN_CONTAINER_VOLUME_INTEGRATION: "1"');
     expect(workflow).not.toContain('PUSHPALS_RUN_WINDOWS_LINUX_CONTAINER_INTEGRATION: "1"');
-    expect(verifyPackageIndex).toBeGreaterThan(buildPackageIndex);
-    expect(publishIndex).toBeGreaterThan(verifyPackageIndex);
     expect(checksumIndex).toBeGreaterThanOrEqual(0);
     expect(verifyReleaseIndex).toBeGreaterThan(checksumIndex);
     expect(createReleaseIndex).toBeGreaterThan(verifyReleaseIndex);

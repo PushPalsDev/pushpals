@@ -124,7 +124,7 @@ describe("JobQueue stale recovery", () => {
     expect(queue.listWorkers()[0]?.currentJobId).toBe(first.jobId);
   });
 
-  test("deferred claimed jobs return to pending and stay pinned to the deferring worker", () => {
+  test("deferred claimed jobs stay unavailable until their retry time, including to the target worker", () => {
     const queue = new JobQueue(":memory:");
     const enqueue = queue.enqueue({
       taskId: "task-deferred",
@@ -154,8 +154,16 @@ describe("JobQueue stale recovery", () => {
     expect(wrongWorkerClaim.ok).toBe(false);
 
     const rightWorkerClaim = queue.claim("worker-merge");
-    expect(rightWorkerClaim.ok).toBe(true);
-    expect(rightWorkerClaim.job?.id).toBe(jobId);
+    expect(rightWorkerClaim.ok).toBe(false);
+
+    const db = (queue as unknown as { db: any }).db as any;
+    db.prepare("UPDATE jobs SET availableAt = ? WHERE id = ?").run(
+      new Date(Date.now() - 1_000).toISOString(),
+      jobId,
+    );
+    const retryAtEligibleTime = queue.claim("worker-merge");
+    expect(retryAtEligibleTime.ok).toBe(true);
+    expect(retryAtEligibleTime.job?.id).toBe(jobId);
   });
 
   test("deferred claimed jobs can clear the target worker for replacement retry", () => {
@@ -222,6 +230,11 @@ describe("JobQueue stale recovery", () => {
       "worker-stale-target",
     );
 
+    expect(queue.claim("worker-replacement").ok).toBe(false);
+    db.prepare("UPDATE jobs SET availableAt = ? WHERE id = ?").run(
+      new Date(Date.now() - 1_000).toISOString(),
+      jobId,
+    );
     const claimByReplacement = queue.claim("worker-replacement");
     expect(claimByReplacement.ok).toBe(true);
     expect(claimByReplacement.job?.id).toBe(jobId);
@@ -255,6 +268,11 @@ describe("JobQueue stale recovery", () => {
     );
 
     expect(queue.countByKindAndStatus("task.execute", "pending")).toBe(1);
+    expect(queue.countAutoscalablePendingByKind("task.execute")).toBe(0);
+    db.prepare("UPDATE jobs SET availableAt = ? WHERE id = ?").run(
+      new Date(Date.now() - 1_000).toISOString(),
+      jobId,
+    );
     expect(queue.countAutoscalablePendingByKind("task.execute")).toBe(1);
   });
 
@@ -298,8 +316,14 @@ describe("JobQueue stale recovery", () => {
     expect(originalWorkerClaim.ok).toBe(false);
 
     const replacementClaim = queue.claim("worker-replacement");
-    expect(replacementClaim.ok).toBe(true);
-    expect(replacementClaim.job?.id).toBe(jobId);
+    expect(replacementClaim.ok).toBe(false);
+    db.prepare("UPDATE jobs SET availableAt = ? WHERE id = ?").run(
+      new Date(Date.now() - 1_000).toISOString(),
+      jobId,
+    );
+    const eligibleReplacementClaim = queue.claim("worker-replacement");
+    expect(eligibleReplacementClaim.ok).toBe(true);
+    expect(eligibleReplacementClaim.job?.id).toBe(jobId);
   });
 
   test("generic fail does not allow failing pending deferred jobs", () => {
@@ -426,6 +450,9 @@ describe("JobQueue stale recovery", () => {
     });
     const db = (queue as unknown as { db: any }).db as any;
     const staleIso = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+
+    // Legacy databases may have a requests table that predates durable handoff columns.
+    db.exec(`CREATE TABLE requests (id TEXT PRIMARY KEY)`);
 
     db.prepare("UPDATE workers SET lastHeartbeat = ? WHERE workerId = ?").run(
       staleIso,
