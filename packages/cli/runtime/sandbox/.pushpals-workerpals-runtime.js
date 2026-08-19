@@ -9388,7 +9388,8 @@ async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog) 
     ...(planning.requiredValidationSteps ?? []).map((entry) => `${entry} (required by vision.md testing criteria)`)
   ].map((entry) => `- ${entry}`).join(`
 `) || "- (none)";
-  const changedPathsText = quality.changedPaths.map((entry) => `- ${entry}`).join(`
+  const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
+  const changedPathsText = criticChangedPaths.map((entry) => `- ${entry}`).join(`
 `) || "- (none)";
   const criticSystem = loadPromptTemplate("workerpals/task_quality_critic_system_prompt.md").trim();
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
@@ -9399,7 +9400,7 @@ async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog) 
   if (apiKey)
     headers.Authorization = `Bearer ${apiKey}`;
   const buildAttemptPayload = async (compact) => {
-    const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
+    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
     let diffText = await buildCriticDiffText(repo, changedForDiff);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(0, resolveQualityCriticMaxDiffChars(runtimeConfig, compact));
     const validationSummary = buildCriticValidationSummary(quality, resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact));
@@ -9864,7 +9865,7 @@ async function git2(cwd, args) {
   }
 }
 async function buildCriticDiffText(repo, changedPaths) {
-  const paths = Array.from(new Set(changedPaths.map((path) => normalizeChangedPathForCommit(String(path ?? ""))).filter((path) => Boolean(path))));
+  const paths = Array.from(new Set(publishableChangedPaths(changedPaths).map((path) => normalizeChangedPathForCommit(String(path ?? ""))).filter((path) => Boolean(path))));
   if (paths.length === 0)
     return "";
   const chunks = [];
@@ -11810,8 +11811,9 @@ async function runCodexCriticReview(repo, params, quality, runtimeConfig, onLog)
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
   const criticModel = resolveQualityCriticModel(runtimeConfig);
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
+  const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
   const buildCriticInstruction = async (compact) => {
-    const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
+    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
     let diffText = await buildCriticDiffText(repo, changedForDiff);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(0, resolveQualityCriticMaxDiffChars(runtimeConfig, compact));
     const validationSummary = buildCriticValidationSummary(quality, resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact));
@@ -11819,7 +11821,7 @@ async function runCodexCriticReview(repo, params, quality, runtimeConfig, onLog)
       instruction,
       acceptance_criteria: planning.acceptanceCriteria.map((c) => `- ${c}`).join(`
 `) || "- (none)",
-      changed_paths: quality.changedPaths.join(", ") || "(none)",
+      changed_paths: criticChangedPaths.join(", ") || "(none)",
       diff_section: diffText ? `Diff:
 ${diffText}` : "Diff: (empty - no changes detected)",
       validation_section: validationSummary ? `Validation:

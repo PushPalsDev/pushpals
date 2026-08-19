@@ -230,7 +230,7 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toBe(false);
   });
 
-  test("builds critic diff evidence for tracked and untracked changes", async () => {
+  test("builds critic diff evidence for tracked and untracked publishable changes only", async () => {
     const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-critic-diff-"));
     try {
       runGit(tempRoot, ["init"]);
@@ -243,14 +243,23 @@ describe("workerpals quality gate critic issue formatting", () => {
       writeFileSync(join(tempRoot, "tracked.txt"), "after\n");
       mkdirSync(join(tempRoot, "docs"), { recursive: true });
       writeFileSync(join(tempRoot, "docs", "new-guide.md"), "# New guide\n");
+      mkdirSync(join(tempRoot, "node_modules"), { recursive: true });
+      writeFileSync(join(tempRoot, "node_modules", "artifact.txt"), "dependency artifact\n");
 
-      const diff = await buildCriticDiffText(tempRoot, ["tracked.txt", "docs/new-guide.md"]);
+      const diff = await buildCriticDiffText(tempRoot, [
+        "tracked.txt",
+        "docs/new-guide.md",
+        "node_modules",
+        "node_modules/artifact.txt",
+      ]);
 
       expect(diff).toContain("-before");
       expect(diff).toContain("+after");
       expect(diff).toContain("new file mode");
       expect(diff).toContain("+++ b/docs/new-guide.md");
       expect(diff).toContain("+# New guide");
+      expect(diff).not.toContain("node_modules");
+      expect(diff).not.toContain("dependency artifact");
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }
@@ -318,6 +327,7 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(
       publishableChangedPaths([
         "components/GameControlPanel.tsx",
+        "node_modules",
         "node_modules/react/index.js",
         "outputs/data/runtime.log",
         ".worktrees/job-123/tmp.txt",

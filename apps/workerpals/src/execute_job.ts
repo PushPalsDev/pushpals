@@ -6340,8 +6340,8 @@ async function runTaskCriticReview(
     ]
       .map((entry) => `- ${entry}`)
       .join("\n") || "- (none)";
-  const changedPathsText =
-    quality.changedPaths.map((entry) => `- ${entry}`).join("\n") || "- (none)";
+  const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
+  const changedPathsText = criticChangedPaths.map((entry) => `- ${entry}`).join("\n") || "- (none)";
   const criticSystem = loadPromptTemplate("workerpals/task_quality_critic_system_prompt.md").trim();
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
 
@@ -6352,7 +6352,7 @@ async function runTaskCriticReview(
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   const buildAttemptPayload = async (compact: boolean) => {
-    const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
+    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
     let diffText = await buildCriticDiffText(repo, changedForDiff);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
       0,
@@ -7124,7 +7124,7 @@ export async function git(
 export async function buildCriticDiffText(repo: string, changedPaths: string[]): Promise<string> {
   const paths = Array.from(
     new Set(
-      changedPaths
+      publishableChangedPaths(changedPaths)
         .map((path) => normalizeChangedPathForCommit(String(path ?? "")))
         .filter((path): path is string => Boolean(path)),
     ),
@@ -9801,9 +9801,10 @@ async function runCodexCriticReview(
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
   const criticModel = resolveQualityCriticModel(runtimeConfig);
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
+  const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
 
   const buildCriticInstruction = async (compact: boolean) => {
-    const changedForDiff = quality.changedPaths.slice(0, compact ? 4 : 8);
+    const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
     let diffText = await buildCriticDiffText(repo, changedForDiff);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
       0,
@@ -9819,7 +9820,7 @@ async function runCodexCriticReview(
         instruction,
         acceptance_criteria:
           planning.acceptanceCriteria.map((c) => `- ${c}`).join("\n") || "- (none)",
-        changed_paths: quality.changedPaths.join(", ") || "(none)",
+        changed_paths: criticChangedPaths.join(", ") || "(none)",
         diff_section: diffText ? `Diff:\n${diffText}` : "Diff: (empty - no changes detected)",
         validation_section: validationSummary
           ? `Validation:\n${validationSummary}`
