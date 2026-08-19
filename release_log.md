@@ -2,33 +2,30 @@
 
 ## Release Metadata
 
-- version: `v1.2.37`
-- start_commit: `dcda53b35d0bbefc6cab24d4d91b929b50d33484`
-- end_commit: `869e05f356f686944e39330dd8e4cd13e2143621`
-- commits_in_range: `3`
+- version: `v1.2.38`
+- start_commit: `457594e419a469801cd297dd031aab6401fee297`
+- end_commit: `65e16d402200b200783b45454b11156079261cbd`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Bound HTTP response bodies, subprocess output, service startup and shutdown, Git operations, and Windows/Linux process-tree cleanup so stalled dependencies fail safely instead of freezing PushPals.
-- Add durable completion leases, heartbeats, stale-claim recovery, startup reconciliation, SourceControlManager stall health, and publication-backlog backpressure so work resumes after crashes and finalization cannot deadlock.
-- Validate and publish exact candidate SHAs with retained trusted-host evidence, disposable-worktree recovery, authoritative publication proof, and fail-closed browser and no-change outcomes.
-- Improve execution speed and job quality with LF-safe Linux worktrees, container-native dependency projection, focused and cached validation, repeated-failure circuit breakers, and end-to-end reliability metrics.
-- Pin the WorkerPal sandbox to Bun 1.3.14 and block release publication on the cross-platform reliability harness.
-- Build protocol workspace artifacts before the release reliability harness, with a workflow-order regression test that prevents host-side server tests from starting against an incomplete workspace.
+- Fix the generic Python executor's quiet-progress timer so WorkerPals no longer crash with `Cannot access 'timedOut' before initialization` immediately after claiming a job.
+- Preserve authoritative WorkerPal runtime failures end to end, distinguish them from artifact-only task failures, and defer a repeated normalized runtime signature after two failures instead of admitting an endless stream of doomed work.
+- Keep delegated requests nonterminal until their exact WorkerPal handoff finishes, atomically repoint stale retries to their successor, and reconcile legacy retry chains on startup and watchdog ticks.
+- Bound blocked queue scans while allowing later runnable user work to advance, and expose delegated/end-to-end request state consistently in LocalBuddy and the monitor UI.
+- Build one immutable CLI tarball, checksum and test that exact tarball and its Linux worker image, then publish the same artifact without rebuilding in the publish job.
 
 ## Validation
 
-- `bun run test:root` passed `1,367` tests with `11` intentional platform or opt-in skips and `0` failures in the Bun 1.3.14 release container.
-- The release reliability harness passed `211` tests with `5` intentional integration skips and `0` failures across failure evidence, durable lifecycle, repair orchestration, and runtime boundaries.
-- CLI bootstrap and invocation suites passed `173` tests with `2` platform skips and `0` failures on Windows.
-- Windows-host/Linux-container worktree boundary, Docker executor, sandbox runtime, dependency-projection, and exact-SHA publication integrations passed.
-- Client, VS Code, SourceControlManager, WorkerPal, RemoteBuddy, and shared-package TypeScript checks passed.
+- `bun run test:root` passed `1,399` tests with `12` intentional platform or opt-in skips and `0` failures in a resource-bounded Bun 1.3.14 Linux container with Node and npm present.
+- All four release reliability phases passed with no timeouts or failures; the runtime-boundary phase passed `233` tests with `3` intentional integration skips.
+- The affected diagnostic, queue, retry-chain, executor, and package suites passed `171` tests with `1` opt-in Docker skip and `0` failures before the exact-image gate.
+- The exact packed WorkerPal runtime passed all `6` source-parity and Linux release-image tests, including the formerly crashing quiet-progress path.
+- Client, LocalBuddy, RemoteBuddy, server, WorkerPal, and shared-package TypeScript checks passed.
 - `bun run cli:bundle` completed and synchronized packaged runtime source and generated service bundles.
 - `bun run cli:verify-package-payload` verified `260` package files with no external toolchain files.
 - `git diff --check` passed.
-- Release workflow contract coverage passed `12` tests with `0` failures, including enforced dependency-install, protocol-build, and reliability-harness ordering.
-- The previously blocked server session-message route suite passed `7` tests with `107` assertions and `0` failures after protocol artifacts were built.
-- CLI invocation coverage passed all `13` tests in the Linux release container without triggering an unrelated monitor-UI build.
+- Release workflow and package contract coverage passed `20` tests with `0` failures, including immutable artifact promotion and full sandbox mirror enforcement.
 
 ## Install
 
