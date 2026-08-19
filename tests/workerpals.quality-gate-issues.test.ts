@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -47,11 +47,12 @@ import {
   workerAttemptRolloutScore,
 } from "../apps/workerpals/src/execute_job";
 
-function runGit(cwd: string, args: string[]): void {
+function runGit(cwd: string, args: string[]): string {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) {
     throw new Error(new TextDecoder().decode(result.stderr));
   }
+  return new TextDecoder().decode(result.stdout);
 }
 
 describe("workerpals quality gate critic issue formatting", () => {
@@ -258,6 +259,52 @@ describe("workerpals quality gate critic issue formatting", () => {
       expect(diff).toContain("new file mode");
       expect(diff).toContain("+++ b/docs/new-guide.md");
       expect(diff).toContain("+# New guide");
+      expect(diff).not.toContain("node_modules");
+      expect(diff).not.toContain("dependency artifact");
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("excludes a real root dependency link discovered by git from critic paths and diff", async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "pushpals-critic-reparse-"));
+    const repo = join(tempRoot, "repo");
+    const dependencyTarget = join(tempRoot, "dependency-target");
+    try {
+      mkdirSync(repo);
+      mkdirSync(dependencyTarget);
+      writeFileSync(join(tempRoot, "empty-git-excludes"), "");
+      writeFileSync(join(dependencyTarget, "artifact.txt"), "dependency artifact\n");
+      runGit(repo, ["init"]);
+      runGit(repo, ["config", "user.name", "PushPals Test"]);
+      runGit(repo, ["config", "user.email", "pushpals-test@example.com"]);
+      runGit(repo, ["config", "core.excludesFile", join(tempRoot, "empty-git-excludes")]);
+      writeFileSync(join(repo, "source.ts"), "export const value = 'before';\n");
+      runGit(repo, ["add", "source.ts"]);
+      runGit(repo, ["commit", "-m", "initial"]);
+
+      writeFileSync(join(repo, "source.ts"), "export const value = 'after';\n");
+      symlinkSync(
+        dependencyTarget,
+        join(repo, "node_modules"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      const status = runGit(repo, ["status", "--porcelain", "-z", "--untracked-files=normal"]);
+      const discoveredPaths = status
+        .split("\0")
+        .filter(Boolean)
+        .map((entry) => entry.slice(3).replace(/\\/g, "/").replace(/\/+$/, ""));
+
+      expect(discoveredPaths).toContain("source.ts");
+      expect(
+        discoveredPaths.some((path) => path === "node_modules" || path.startsWith("node_modules/")),
+      ).toBe(true);
+      expect(publishableChangedPaths(discoveredPaths)).toEqual(["source.ts"]);
+
+      const diff = await buildCriticDiffText(repo, discoveredPaths);
+      expect(diff).toContain("-export const value = 'before';");
+      expect(diff).toContain("+export const value = 'after';");
       expect(diff).not.toContain("node_modules");
       expect(diff).not.toContain("dependency artifact");
     } finally {

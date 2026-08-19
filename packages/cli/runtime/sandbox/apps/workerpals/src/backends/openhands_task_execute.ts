@@ -36,6 +36,10 @@ const OPENHANDS_SCRIPT_PATH = resolveWorkerpalsSourcePath(
 interface OpenHandsExecutionOptions {
   /** Override only for deterministic process-boundary tests. */
   processRunner?: typeof runBoundedWorkerProcess;
+  /** Override only for deterministic process-boundary tests. */
+  scriptPath?: string;
+  /** Override only for deterministic process-boundary tests. */
+  minimumTimeoutMs?: number;
 }
 
 // ---- OpenHands-specific helpers ----------------------------------------------
@@ -258,7 +262,7 @@ export async function executeWithOpenHands(
   executionOptions: OpenHandsExecutionOptions = {},
 ): Promise<JobResult> {
   const pythonBin = runtimeConfig.workerpals.openhandsPython || "python";
-  const scriptPath = OPENHANDS_SCRIPT_PATH;
+  const scriptPath = executionOptions.scriptPath ?? OPENHANDS_SCRIPT_PATH;
   if (!existsSync(scriptPath)) {
     return {
       ok: false,
@@ -267,7 +271,15 @@ export async function executeWithOpenHands(
     };
   }
 
-  const configuredTimeoutMs = Math.max(10_000, runtimeConfig.workerpals.openhandsTimeoutMs);
+  const minimumTimeoutMs =
+    typeof executionOptions.minimumTimeoutMs === "number" &&
+    Number.isFinite(executionOptions.minimumTimeoutMs)
+      ? Math.max(1, Math.floor(executionOptions.minimumTimeoutMs))
+      : 10_000;
+  const configuredTimeoutMs = Math.max(
+    minimumTimeoutMs,
+    runtimeConfig.workerpals.openhandsTimeoutMs,
+  );
   const executionBudgetMs =
     typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
       ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))

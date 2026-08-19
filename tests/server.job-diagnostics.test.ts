@@ -1,4 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CompletionQueue } from "../apps/server/src/completions";
 import { JobQueue, resolveWorkerRuntimeCircuitRetryAfterMs } from "../apps/server/src/jobs";
 
 describe("server JobQueue diagnostics", () => {
@@ -720,6 +724,337 @@ describe("server JobQueue diagnostics", () => {
       ).toMatchObject({ blocked: true, phase: "open" });
     } finally {
       queue.close();
+    }
+  });
+
+  test("nonmatching canary failure uses a bounded recheck and preserves the open signature", () => {
+    const queue = new JobQueue(":memory:");
+    const baseMs = Date.parse("2026-08-19T12:00:00.000Z");
+    try {
+      setSystemTime(baseMs);
+      failWorkerRuntimeJob(queue, "task-runtime-nonmatching-1");
+      failWorkerRuntimeJob(queue, "task-runtime-nonmatching-2");
+      const open = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      const canaryDueMs = Date.parse(String(open.retryAt)) + 1;
+      setSystemTime(canaryDueMs);
+      const canaryJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-nonmatching-canary",
+        { origin: "user" },
+        "worker-nonmatching-canary",
+      );
+      expect(
+        queue.acquireWorkerRuntimeCanary(canaryJobId, "worker-nonmatching-canary", {
+          threshold: 2,
+          nowMs: canaryDueMs,
+          canaryLeaseMs: 5_000,
+        }).canary,
+      ).toBe(true);
+      setSystemTime(canaryDueMs + 1);
+      expect(
+        queue.fail(canaryJobId, {
+          message: "WorkerPal job execution failed",
+          detail:
+            `ReferenceError: Cannot access 'processResult' before initialization.\n` +
+            `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:999:4)`,
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "executor",
+              executorBackend: "openai_codex",
+              summary: "Job failed before returning a structured result",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+
+      // Simulate a process crash after the terminal job update but before the
+      // WorkerPal failure callback could reopen the durable circuit.
+      const recoveredAtMs = canaryDueMs + 5_001;
+      setSystemTime(recoveredAtMs);
+      const recovered = queue.recoverExpiredWorkerRuntimeCanary({
+        nowMs: recoveredAtMs,
+        // Even an accidentally large caller value remains bounded by the
+        // circuit's short recheck ceiling.
+        recheckMs: 10 * 60_000,
+      });
+      const summary = queue.workerRuntimeFailureCircuitSummary({
+        threshold: 2,
+        nowMs: recoveredAtMs + 1,
+      });
+
+      expect(recovered).toMatchObject({
+        circuitRecovered: true,
+        recoveredJob: null,
+        jobId: canaryJobId,
+      });
+      expect(Date.parse(String(recovered.retryAt)) - recoveredAtMs).toBe(30_000);
+      expect(summary).toMatchObject({
+        blocked: true,
+        phase: "open",
+        fingerprint: open.fingerprint,
+        failureClass: open.failureClass,
+        executorBackend: open.executorBackend,
+        signatureSample: open.signatureSample,
+      });
+      expect(summary.signatureSample).toContain("timedout");
+      expect(summary.signatureSample).not.toContain("processresult");
+    } finally {
+      queue.close();
+      setSystemTime();
+    }
+  });
+
+  test("expired matching terminal canary recovery restores the full cooldown", () => {
+    const queue = new JobQueue(":memory:");
+    const baseMs = Date.parse("2026-08-19T13:00:00.000Z");
+    try {
+      setSystemTime(baseMs);
+      failWorkerRuntimeJob(queue, "task-runtime-matching-crash-1");
+      failWorkerRuntimeJob(queue, "task-runtime-matching-crash-2");
+      const open = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      const canaryDueMs = Date.parse(String(open.retryAt)) + 1;
+      setSystemTime(canaryDueMs);
+      const canaryJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-matching-crash-canary",
+        { origin: "user" },
+        "worker-matching-crash-canary",
+      );
+      expect(
+        queue.acquireWorkerRuntimeCanary(canaryJobId, "worker-matching-crash-canary", {
+          threshold: 2,
+          nowMs: canaryDueMs,
+          canaryLeaseMs: 5_000,
+        }).canary,
+      ).toBe(true);
+      setSystemTime(canaryDueMs + 1);
+      expect(
+        queue.fail(canaryJobId, {
+          message: "WorkerPal job execution failed",
+          detail:
+            `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+            `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:999:4)`,
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "executor",
+              executorBackend: "openai_codex",
+              summary: "Job failed before returning a structured result",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+
+      const recoveredAtMs = canaryDueMs + 5_001;
+      setSystemTime(recoveredAtMs);
+      const recovered = queue.recoverExpiredWorkerRuntimeCanary({ nowMs: recoveredAtMs });
+      const summary = queue.workerRuntimeFailureCircuitSummary({
+        threshold: 2,
+        nowMs: recoveredAtMs + 1,
+      });
+
+      expect(recovered).toMatchObject({
+        circuitRecovered: true,
+        recoveredJob: null,
+        jobId: canaryJobId,
+      });
+      expect(Date.parse(String(recovered.retryAt)) - recoveredAtMs).toBe(30 * 60_000);
+      expect(summary).toMatchObject({
+        blocked: true,
+        phase: "open",
+        fingerprint: open.fingerprint,
+        signatureSample: open.signatureSample,
+      });
+    } finally {
+      queue.close();
+      setSystemTime();
+    }
+  });
+
+  test("expired finalizing canary closes the circuit and releases deferred backlog", async () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), "pushpals-runtime-canary-finalizing-"));
+    const dbPath = join(fixtureDir, "pushpals.db");
+    const baseMs = Date.parse("2026-08-19T14:00:00.000Z");
+    let queue = new JobQueue(dbPath);
+    let completions = new CompletionQueue(dbPath);
+    let queueOpen = true;
+    let completionsOpen = true;
+    try {
+      setSystemTime(baseMs);
+      failWorkerRuntimeJob(queue, "task-runtime-finalizing-crash-1");
+      failWorkerRuntimeJob(queue, "task-runtime-finalizing-crash-2");
+      const open = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      const canaryDueMs = Date.parse(String(open.retryAt)) + 1;
+      setSystemTime(canaryDueMs);
+      const canaryJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-finalizing-crash-canary",
+        { origin: "user" },
+        "worker-finalizing-crash-canary",
+      );
+      expect(
+        queue.acquireWorkerRuntimeCanary(canaryJobId, "worker-finalizing-crash-canary", {
+          threshold: 2,
+          nowMs: canaryDueMs,
+          canaryLeaseMs: 5_000,
+        }).canary,
+      ).toBe(true);
+      const deferredJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-finalizing-crash-backlog",
+        { origin: "user" },
+        "worker-finalizing-backlog",
+      );
+      expect(
+        queue.defer(deferredJobId, {
+          workerId: "worker-finalizing-backlog",
+          deferMs: 30_000,
+          reason: "worker_runtime_circuit_open",
+          detail: JSON.stringify({ fingerprint: open.fingerprint }),
+        }).ok,
+      ).toBe(true);
+      setSystemTime(canaryDueMs + 1);
+      expect(
+        completions.enqueue(
+          {
+            jobId: canaryJobId,
+            sessionId: "dev",
+            commitSha: "runtime-canary-candidate",
+            branch: "refs/pushpals/agent/worker/runtime-canary-candidate",
+            message: "runtime canary reached publication",
+            jobResultSummary: "runtime canary produced a valid candidate",
+          },
+          { beginJobFinalization: true },
+        ),
+      ).toMatchObject({ ok: true, jobStatus: "finalizing" });
+      expect(queue.getJob(canaryJobId)?.status).toBe("finalizing");
+
+      // Simulate restart after publication handoff but before the normal
+      // success callback had a chance to close the circuit.
+      const recoveredAtMs = canaryDueMs + 5_001;
+      completions.close();
+      completionsOpen = false;
+      queue.close();
+      queueOpen = false;
+      setSystemTime(recoveredAtMs);
+      queue = new JobQueue(dbPath);
+      queueOpen = true;
+      completions = new CompletionQueue(dbPath);
+      completionsOpen = true;
+      const recovered = queue.recoverExpiredWorkerRuntimeCanary({ nowMs: recoveredAtMs });
+
+      expect(recovered).toMatchObject({
+        circuitRecovered: true,
+        recoveredJob: null,
+        jobId: canaryJobId,
+        retryAt: null,
+      });
+      expect(queue.getJob(deferredJobId)).toMatchObject({
+        status: "pending",
+        availableAt: new Date(recoveredAtMs).toISOString(),
+        deferReason: null,
+        deferredAt: null,
+      });
+      expect(
+        queue.workerRuntimeFailureCircuitSummary({ threshold: 2, nowMs: recoveredAtMs + 1 }),
+      ).toMatchObject({ blocked: false, phase: "closed" });
+    } finally {
+      if (completionsOpen) completions.close();
+      if (queueOpen) queue.close();
+      setSystemTime();
+      Bun.gc(true);
+      let cleanupError: unknown = null;
+      for (let attempt = 1; attempt <= 10; attempt += 1) {
+        try {
+          rmSync(fixtureDir, { recursive: true, force: true });
+          cleanupError = null;
+          break;
+        } catch (error) {
+          cleanupError = error;
+          await Bun.sleep(25 * attempt);
+        }
+      }
+      if (cleanupError) throw cleanupError;
+    }
+  });
+
+  test("heartbeat renews a canary lease only for the exact worker and job association", () => {
+    const queue = new JobQueue(":memory:");
+    const baseMs = Date.parse("2026-08-19T12:00:00.000Z");
+    setSystemTime(baseMs);
+    try {
+      failWorkerRuntimeJob(queue, "task-runtime-heartbeat-1");
+      failWorkerRuntimeJob(queue, "task-runtime-heartbeat-2");
+      const open = queue.workerRuntimeFailureCircuitSummary({
+        threshold: 2,
+        maxBlockMs: 60_000,
+      });
+      const canaryDueMs = Date.parse(String(open.retryAt)) + 1;
+      setSystemTime(canaryDueMs);
+      const canaryJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-heartbeat-canary",
+        { origin: "user" },
+        "worker-heartbeat-canary",
+      );
+      expect(
+        queue.acquireWorkerRuntimeCanary(canaryJobId, "worker-heartbeat-canary", {
+          threshold: 2,
+          maxBlockMs: 60_000,
+          canaryLeaseMs: 5_000,
+        }).canary,
+      ).toBe(true);
+      const summary = () =>
+        queue.workerRuntimeFailureCircuitSummary({
+          threshold: 2,
+          maxBlockMs: 60_000,
+        });
+      const initialLease = summary().canaryLeaseExpiresAt;
+      expect(Date.parse(String(initialLease)) - canaryDueMs).toBe(5_000);
+
+      expect(
+        queue.heartbeat({
+          workerId: "worker-heartbeat-mismatch",
+          status: "busy",
+          currentJobId: canaryJobId,
+        }).ok,
+      ).toBe(true);
+      expect(summary().canaryLeaseExpiresAt).toBe(initialLease);
+
+      expect(
+        queue.heartbeat({
+          workerId: "worker-heartbeat-canary",
+          status: "busy",
+          currentJobId: "different-job",
+        }).ok,
+      ).toBe(true);
+      expect(summary().canaryLeaseExpiresAt).toBe(initialLease);
+
+      expect(
+        queue.heartbeat({
+          workerId: "worker-heartbeat-canary",
+          status: "idle",
+          currentJobId: canaryJobId,
+        }).ok,
+      ).toBe(true);
+      expect(summary().canaryLeaseExpiresAt).toBe(initialLease);
+
+      expect(
+        queue.heartbeat({
+          workerId: "worker-heartbeat-canary",
+          status: "busy",
+          currentJobId: canaryJobId,
+        }).ok,
+      ).toBe(true);
+      expect(Date.parse(String(summary().canaryLeaseExpiresAt)) - canaryDueMs).toBe(45_000);
+      expect(queue.getJob(canaryJobId)).toMatchObject({
+        status: "claimed",
+        workerId: "worker-heartbeat-canary",
+      });
+    } finally {
+      queue.close();
+      setSystemTime();
     }
   });
 

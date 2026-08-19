@@ -1608,7 +1608,11 @@ describe("packaged CLI end-to-end", () => {
           artifacts.platformKey,
           runtimeBinaryFilename("source_control_manager", artifacts.platformKey, extension),
         );
-        await terminateProcessByCommandNeedle(scmBinaryPath, 30_000);
+        const scmProcessNeedle =
+          process.platform === "win32"
+            ? join(runtimeRoot, "sandbox", ".pushpals-source-control-manager-runtime.js")
+            : scmBinaryPath;
+        await terminateProcessByCommandNeedle(scmProcessNeedle, 30_000);
         await waitForLogLine(
           runtimeServicesLogPath,
           "[pushpals] Embedded source_control_manager exited",

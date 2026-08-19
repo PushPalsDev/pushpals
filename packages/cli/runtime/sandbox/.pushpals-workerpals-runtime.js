@@ -4017,7 +4017,7 @@ function extractClarificationQuestionFromOutput(output) {
 }
 async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, budgets, executionOptions = {}) {
   const pythonBin = runtimeConfig.workerpals.openhandsPython || "python";
-  const scriptPath = OPENHANDS_SCRIPT_PATH;
+  const scriptPath = executionOptions.scriptPath ?? OPENHANDS_SCRIPT_PATH;
   if (!existsSync6(scriptPath)) {
     return {
       ok: false,
@@ -4025,7 +4025,8 @@ async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, bu
       exitCode: 1
     };
   }
-  const configuredTimeoutMs = Math.max(1e4, runtimeConfig.workerpals.openhandsTimeoutMs);
+  const minimumTimeoutMs = typeof executionOptions.minimumTimeoutMs === "number" && Number.isFinite(executionOptions.minimumTimeoutMs) ? Math.max(1, Math.floor(executionOptions.minimumTimeoutMs)) : 1e4;
+  const configuredTimeoutMs = Math.max(minimumTimeoutMs, runtimeConfig.workerpals.openhandsTimeoutMs);
   const executionBudgetMs = typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs) ? Math.max(1e4, Math.floor(budgets.executionBudgetMs)) : null;
   const timeoutMs = executionBudgetMs != null ? Math.min(configuredTimeoutMs, executionBudgetMs) : configuredTimeoutMs;
   const timeoutLimitSource = executionBudgetMs == null ? `workerpals.openhands_timeout_ms=${configuredTimeoutMs}ms` : executionBudgetMs < configuredTimeoutMs ? `planning executionBudgetMs=${executionBudgetMs}ms (worker cap=${configuredTimeoutMs}ms)` : executionBudgetMs > configuredTimeoutMs ? `workerpals.openhands_timeout_ms=${configuredTimeoutMs}ms (planning executionBudgetMs=${executionBudgetMs}ms)` : `planning executionBudgetMs=${executionBudgetMs}ms (matches worker cap)`;

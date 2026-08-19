@@ -1149,6 +1149,308 @@ describe("server session message route", () => {
     );
   }, 20_000);
 
+  test("retains request ownership when a runtime-circuit deferral cannot persist", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const requestId = "request-deferral-write-failure";
+    await seedWorkerRuntimeCircuit(port, "request-deferral-write-failure", async () => {
+      const now = new Date().toISOString();
+      const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+      try {
+        db.prepare(
+          `INSERT INTO requests (
+             id, sessionId, prompt, priority, metadataJson, status,
+             enqueuedAt, createdAt, updatedAt
+           ) VALUES (?, ?, ?, 'normal', ?, 'pending', ?, ?, ?)`,
+        ).run(
+          requestId,
+          "request-deferral-write-failure",
+          "Preserve this request when circuit deferral persistence fails.",
+          JSON.stringify({
+            origin: "autonomy",
+            autonomy: {
+              objectiveId: "request-deferral-objective",
+              runId: "request-deferral-run",
+              snapshotId: "request-deferral-snapshot",
+              patternKey: "request-deferral-pattern",
+              componentArea: "apps/server",
+              targetPaths: ["apps/server/src/server_main.ts"],
+              writeGlobs: ["apps/server/src/*.ts"],
+            },
+          }),
+          now,
+          now,
+          now,
+        );
+      } finally {
+        db.close();
+      }
+    });
+
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      db.exec(`
+        CREATE TRIGGER reject_test_request_runtime_deferral
+        BEFORE UPDATE OF leaseExpiresAt ON requests
+        WHEN OLD.id = '${requestId}'
+          AND OLD.status = 'claimed'
+          AND NEW.deferReason = 'worker_runtime_circuit_open'
+        BEGIN
+          SELECT RAISE(IGNORE);
+        END;
+      `);
+    } finally {
+      db.close();
+    }
+
+    const claim = await postServerJson(port, "/requests/claim", {
+      agentId: "request-deferral-owner",
+      leaseMs: 60_000,
+    });
+    expect(claim.status).toBe(409);
+    expect(await claim.json()).toMatchObject({
+      ok: false,
+      code: "request_circuit_deferral_failed",
+    });
+
+    const snapshot = await fetch(`http://127.0.0.1:${port}/requests/${requestId}`);
+    expect(snapshot.status).toBe(200);
+    expect(await snapshot.json()).toMatchObject({
+      ok: true,
+      request: {
+        id: requestId,
+        status: "claimed",
+        agentId: "request-deferral-owner",
+        claimToken: expect.any(String),
+        deferReason: null,
+        failedAt: null,
+        error: null,
+      },
+    });
+
+    const competingClaim = await postServerJson(port, "/requests/claim", {
+      agentId: "request-deferral-competitor",
+      leaseMs: 60_000,
+    });
+    expect(competingClaim.status).toBe(404);
+    expect(await competingClaim.json()).toMatchObject({
+      ok: false,
+      message: "No pending requests",
+    });
+  }, 20_000);
+
+  test("upgrades pre-circuit durable work and bounds legacy deferrals on startup", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const dataDir = join(root, "outputs", "data");
+    mkdirSync(dataDir, { recursive: true });
+    const dbPath = join(dataDir, "pushpals.db");
+    const legacyJobId = "legacy-runtime-deferred-job";
+    const legacyRequestId = "legacy-runtime-deferred-request";
+    const now = new Date().toISOString();
+    const farFuture = "2099-01-01T00:00:00.000Z";
+    const legacyDb = new Database(dbPath);
+    try {
+      legacyDb.exec(`
+        CREATE TABLE jobs (
+          id TEXT PRIMARY KEY,
+          taskId TEXT NOT NULL,
+          sessionId TEXT NOT NULL DEFAULT '',
+          kind TEXT NOT NULL,
+          params TEXT NOT NULL DEFAULT '{}',
+          dedupeKey TEXT,
+          dedupeCooldownMs INTEGER NOT NULL DEFAULT 0,
+          priority TEXT NOT NULL DEFAULT 'normal',
+          queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000,
+          executionBudgetMs INTEGER NOT NULL DEFAULT 900000,
+          finalizationBudgetMs INTEGER NOT NULL DEFAULT 120000,
+          status TEXT NOT NULL DEFAULT 'pending',
+          workerId TEXT,
+          targetWorkerId TEXT,
+          result TEXT,
+          prUrl TEXT,
+          error TEXT,
+          availableAt TEXT,
+          enqueuedAt TEXT,
+          claimedAt TEXT,
+          startedAt TEXT,
+          firstLogAt TEXT,
+          failedAt TEXT,
+          abandonedAt TEXT,
+          publishBlockedAt TEXT,
+          completedAt TEXT,
+          durationMs INTEGER,
+          resumeOfJobId TEXT,
+          attempt INTEGER NOT NULL DEFAULT 1,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        );
+        CREATE TABLE job_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          jobId TEXT NOT NULL,
+          ts TEXT NOT NULL,
+          message TEXT NOT NULL,
+          FOREIGN KEY (jobId) REFERENCES jobs(id)
+        );
+        CREATE TABLE requests (
+          id TEXT PRIMARY KEY,
+          sessionId TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          priority TEXT NOT NULL DEFAULT 'normal',
+          queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000,
+          metadataJson TEXT,
+          idempotencyKey TEXT,
+          forceWorker INTEGER NOT NULL DEFAULT 0,
+          forceLane TEXT,
+          workerRequired INTEGER NOT NULL DEFAULT 0,
+          handoffJobId TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          agentId TEXT,
+          claimToken TEXT,
+          claimGeneration INTEGER NOT NULL DEFAULT 0,
+          leaseExpiresAt TEXT,
+          lastHeartbeatAt TEXT,
+          claimAttempts INTEGER NOT NULL DEFAULT 0,
+          result TEXT,
+          error TEXT,
+          enqueuedAt TEXT,
+          claimedAt TEXT,
+          completedAt TEXT,
+          failedAt TEXT,
+          durationMs INTEGER,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        );
+      `);
+      legacyDb
+        .prepare(
+          `INSERT INTO jobs (
+           id, taskId, sessionId, kind, params, status, availableAt,
+           enqueuedAt, createdAt, updatedAt
+         ) VALUES (?, ?, 'legacy-upgrade', 'task.execute', ?, 'pending', ?, ?, ?, ?)`,
+        )
+        .run(
+          legacyJobId,
+          "legacy-runtime-task",
+          JSON.stringify({ origin: "user" }),
+          farFuture,
+          now,
+          now,
+          now,
+        );
+      legacyDb
+        .prepare(`INSERT INTO job_logs (jobId, ts, message) VALUES (?, ?, ?)`)
+        .run(legacyJobId, now, JSON.stringify({ code: "worker_runtime_circuit_open" }));
+      legacyDb
+        .prepare(
+          `INSERT INTO requests (
+           id, sessionId, prompt, metadataJson, status, agentId, claimToken,
+           claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts,
+           enqueuedAt, claimedAt, createdAt, updatedAt
+         ) VALUES (?, 'legacy-upgrade', ?, ?, 'claimed', 'legacy-agent', 'legacy-token',
+                   1, ?, ?, 1, ?, ?, ?, ?)`,
+        )
+        .run(
+          legacyRequestId,
+          "Recover this legacy runtime-circuit request.",
+          JSON.stringify({ origin: "autonomy" }),
+          farFuture,
+          now,
+          now,
+          now,
+          now,
+          now,
+        );
+    } finally {
+      legacyDb.close();
+    }
+
+    const startupStartedAt = Date.now();
+    const server = spawnServer(root, port, "legacy-upgrade-runtime-v2");
+    await waitForHealth(server, port);
+
+    const migratedDb = new Database(dbPath);
+    try {
+      const jobColumns = migratedDb.query(`PRAGMA table_info(jobs)`).all() as Array<{
+        name: string;
+      }>;
+      const requestColumns = migratedDb.query(`PRAGMA table_info(requests)`).all() as Array<{
+        name: string;
+      }>;
+      expect(jobColumns.map((column) => column.name)).toEqual(
+        expect.arrayContaining([
+          "runtimeGeneration",
+          "claimGeneration",
+          "deferReason",
+          "deferredAt",
+        ]),
+      );
+      expect(requestColumns.map((column) => column.name)).toContain("deferReason");
+      expect(
+        migratedDb
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name = 'worker_runtime_circuits'`,
+          )
+          .get(),
+      ).toMatchObject({ name: "worker_runtime_circuits" });
+
+      const migratedJob = migratedDb
+        .prepare(`SELECT availableAt FROM jobs WHERE id = ?`)
+        .get(legacyJobId) as { availableAt: string };
+      const migratedRequest = migratedDb
+        .prepare(`SELECT leaseExpiresAt, deferReason FROM requests WHERE id = ?`)
+        .get(legacyRequestId) as { leaseExpiresAt: string; deferReason: string | null };
+      expect(Date.parse(migratedJob.availableAt)).toBeGreaterThan(startupStartedAt);
+      expect(Date.parse(migratedJob.availableAt)).toBeLessThanOrEqual(Date.now() + 30_000);
+      expect(Date.parse(migratedRequest.leaseExpiresAt)).toBeGreaterThan(startupStartedAt);
+      expect(Date.parse(migratedRequest.leaseExpiresAt)).toBeLessThanOrEqual(Date.now() + 30_000);
+      expect(migratedRequest.deferReason).toBeNull();
+
+      const dueAt = new Date(Date.now() - 1_000).toISOString();
+      migratedDb.prepare(`UPDATE jobs SET availableAt = ? WHERE id = ?`).run(dueAt, legacyJobId);
+      migratedDb
+        .prepare(`UPDATE requests SET leaseExpiresAt = ? WHERE id = ?`)
+        .run(dueAt, legacyRequestId);
+    } finally {
+      migratedDb.close();
+    }
+
+    const claimedJob = await postServerJson(port, "/jobs/claim", {
+      workerId: "legacy-upgrade-worker",
+      runtimeGeneration: "legacy-upgrade-runtime-v2",
+    });
+    expect(claimedJob.status).toBe(200);
+    expect(await claimedJob.json()).toMatchObject({
+      ok: true,
+      job: {
+        id: legacyJobId,
+        runtimeGeneration: "legacy-upgrade-runtime-v2",
+        claimGeneration: 1,
+      },
+    });
+
+    const claimedRequest = await postServerJson(port, "/requests/claim", {
+      agentId: "legacy-upgrade-agent",
+      leaseMs: 60_000,
+    });
+    expect(claimedRequest.status).toBe(200);
+    expect(await claimedRequest.json()).toMatchObject({
+      ok: true,
+      request: {
+        id: legacyRequestId,
+        agentId: "legacy-upgrade-agent",
+        claimGeneration: 2,
+      },
+    });
+  }, 20_000);
+
   test("bounds circuit scans while deferring execution and advancing user planning", async () => {
     const root = makeTempDir();
     const port = await getFreePort();

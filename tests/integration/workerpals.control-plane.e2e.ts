@@ -243,6 +243,50 @@ function writeCodexWorkaroundStub(repoPath: string): string {
   return scriptPath;
 }
 
+function writeDeterministicDockerStub(root: string): string {
+  const result = JSON.stringify({
+    ok: false,
+    summary: "Deterministic Docker execution failure",
+    stderr: "fake Docker backend rejected execution",
+    exitCode: 7,
+  });
+  const sourcePath = join(root, "fake-docker.ts");
+  writeFileSync(
+    sourcePath,
+    [
+      "const args = process.argv.slice(2);",
+      `const result = ${JSON.stringify(result)};`,
+      'if (args[0] === "inspect") console.log("true|bridge");',
+      'if (args[0] === "exec" && args[1] === "-i") {',
+      "  await Bun.stdin.text();",
+      "  console.log(`___RESULT___ ${result}`);",
+      "  process.exit(7);",
+      "}",
+      "process.exit(0);",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const executablePath = join(
+    root,
+    process.platform === "win32" ? "fake-docker.exe" : "fake-docker",
+  );
+  const compiled = Bun.spawnSync(
+    [process.execPath, "build", sourcePath, "--compile", "--outfile", executablePath],
+    {
+      cwd: root,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  if (compiled.exitCode !== 0) {
+    throw new Error(
+      `Failed to compile deterministic Docker stub: ${decodeOutput(compiled.stderr) || decodeOutput(compiled.stdout)}`,
+    );
+  }
+  return executablePath;
+}
+
 function dockerAvailable(): boolean {
   const proc = Bun.spawnSync(["docker", "version", "--format", "{{.Server.Version}}"], {
     cwd: sourceRepoRoot,
@@ -591,6 +635,398 @@ test(
   },
   30_000,
 );
+
+async function removeTestRoot(root: string): Promise<void> {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      await Bun.sleep(100);
+    }
+  }
+  throw lastError;
+}
+
+test("runtime-generation claim rejection stays polling-only and never consumes a job", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pushpals-worker-generation-rejection-"));
+  let serverHandle: Awaited<ReturnType<typeof startJsonServer>> | null = null;
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  try {
+    const repoPath = initializeMinimalRepo(root);
+    const expectedGeneration = "candidate-generation-mismatch";
+    const claimBodies: Array<Record<string, unknown>> = [];
+    let heartbeatCount = 0;
+    const unexpectedJobRequests: string[] = [];
+
+    serverHandle = await startJsonServer((req, res, body) => {
+      const url = req.url ?? "/";
+      if (req.method !== "POST") {
+        res.statusCode = 404;
+        res.end("{}");
+        return;
+      }
+      if (url === "/workers/heartbeat") {
+        heartbeatCount += 1;
+        res.statusCode = 200;
+        res.end('{"ok":true}');
+        return;
+      }
+      if (url === "/jobs/claim") {
+        claimBodies.push(body as Record<string, unknown>);
+        res.statusCode = 409;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            ok: false,
+            code: "runtime_generation_mismatch",
+            message: "worker runtime generation is not active",
+          }),
+        );
+        return;
+      }
+      if (url.startsWith("/jobs/") || url.startsWith("/sessions/")) {
+        unexpectedJobRequests.push(url);
+      }
+      res.statusCode = 200;
+      res.end("{}");
+    });
+
+    proc = Bun.spawn(
+      [
+        process.execPath,
+        "run",
+        workerMainPath,
+        "--server",
+        serverHandle.baseUrl,
+        "--poll",
+        "100",
+        "--heartbeat",
+        "500",
+        "--repo",
+        repoPath,
+        "--base-ref",
+        "HEAD",
+        "--workerId",
+        "workerpal-generation-rejection-it",
+      ],
+      {
+        cwd: repoPath,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          PUSHPALS_WORKER_RUNTIME_GENERATION: expectedGeneration,
+        },
+      },
+    );
+
+    await waitForCondition(
+      () => claimBodies.length >= 3,
+      10_000,
+      "Timed out waiting for bounded polling after generation rejection",
+    );
+    await expectProcessRunning(proc, 500);
+
+    const output = await stopWorker(proc);
+    proc = null;
+    expect(heartbeatCount).toBeGreaterThan(0);
+    expect(claimBodies.every((body) => body.runtimeGeneration === expectedGeneration)).toBe(true);
+    expect(unexpectedJobRequests).toEqual([]);
+    expect(output).not.toContain("Claimed job");
+    expect(output).not.toContain("Fatal:");
+  } finally {
+    if (proc) await stopWorker(proc);
+    if (serverHandle) await serverHandle.close();
+    await removeTestRoot(root);
+  }
+}, 30_000);
+
+for (const deferFailureMode of ["rejected", "timed-out"] as const) {
+  test(`worker preserves its claimed-job fallback when maintenance deferral is ${deferFailureMode}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), `pushpals-worker-defer-${deferFailureMode}-`));
+    let serverHandle: Awaited<ReturnType<typeof startJsonServer>> | null = null;
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const repoPath = initializeMinimalRepo(root);
+      const reviewLease = initializeReviewLeaseRemote(root, repoPath);
+      const dockerStub = writeDeterministicDockerStub(root);
+      const jobId = `job-defer-${deferFailureMode}`;
+      let claimCount = 0;
+      let deferCount = 0;
+      let failurePayload: Record<string, unknown> | null = null;
+      let completionSeen = false;
+      const sessionCommands: string[] = [];
+
+      serverHandle = await startJsonServer(async (req, res, body) => {
+        const url = req.url ?? "/";
+        if (req.method !== "POST") {
+          res.statusCode = 404;
+          res.end("{}");
+          return;
+        }
+        if (url === "/jobs/claim") {
+          claimCount += 1;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              job:
+                claimCount === 1
+                  ? {
+                      id: jobId,
+                      taskId: `defer-${deferFailureMode}`,
+                      kind: "warmup.execute",
+                      params: {
+                        reviewAgent: {
+                          resolutionType: "merge_conflict",
+                          prHeadRef: reviewLease.headRef,
+                          prHeadSha: reviewLease.headSha,
+                          prBaseRef: reviewLease.baseRef,
+                          prBaseSha: reviewLease.baseSha,
+                        },
+                      },
+                      sessionId: `session-defer-${deferFailureMode}`,
+                    }
+                  : null,
+            }),
+          );
+          return;
+        }
+        if (url === `/jobs/${jobId}/defer`) {
+          deferCount += 1;
+          if (deferFailureMode === "timed-out") {
+            await Bun.sleep(10_500);
+          }
+          res.statusCode = 503;
+          res.setHeader("Content-Type", "application/json");
+          res.end('{"ok":false,"message":"deferral persistence unavailable"}');
+          return;
+        }
+        if (url === `/jobs/${jobId}/fail`) {
+          failurePayload = body as Record<string, unknown>;
+          res.statusCode = 200;
+          res.end('{"ok":true}');
+          return;
+        }
+        if (url === `/jobs/${jobId}/complete`) {
+          completionSeen = true;
+          res.statusCode = 200;
+          res.end('{"ok":true}');
+          return;
+        }
+        if (url === `/jobs/${jobId}/diagnostics`) {
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end('{"ok":true,"counts":{"validationRuns":0,"patchSnapshots":0}}');
+          return;
+        }
+        if (url === `/sessions/session-defer-${deferFailureMode}/command`) {
+          if (typeof body?.type === "string") sessionCommands.push(body.type);
+          res.statusCode = 200;
+          res.end("{}");
+          return;
+        }
+        res.statusCode = 200;
+        res.end("{}");
+      });
+
+      proc = Bun.spawn(
+        [
+          process.execPath,
+          "run",
+          workerMainPath,
+          "--server",
+          serverHandle.baseUrl,
+          "--poll",
+          "100",
+          "--heartbeat",
+          "500",
+          "--repo",
+          repoPath,
+          "--base-ref",
+          "HEAD",
+          "--workerId",
+          `workerpal-defer-${deferFailureMode}-it`,
+          "--docker",
+          "--docker-image",
+          "pushpals-fake-control-plane:test",
+        ],
+        {
+          cwd: repoPath,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...process.env,
+            PUSHPALS_DOCKER_BIN_ABSOLUTE: dockerStub,
+            WORKERPALS_SKIP_DOCKER_SELF_CHECK: "true",
+          },
+        },
+      );
+
+      try {
+        await waitForCondition(
+          () => failurePayload !== null,
+          deferFailureMode === "timed-out" ? 35_000 : 20_000,
+          `Timed out waiting for safe execution fallback after ${deferFailureMode} deferral`,
+        );
+      } catch (error) {
+        const output = proc ? await stopWorker(proc) : "";
+        proc = null;
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\n` +
+            `claimCount=${claimCount}\n` +
+            `deferCount=${deferCount}\n` +
+            `completionSeen=${completionSeen}\n` +
+            `failurePayload=${JSON.stringify(failurePayload)}\n` +
+            `sessionCommands=${JSON.stringify(sessionCommands)}\n` +
+            `workerOutput=\n${output}`,
+        );
+      }
+
+      await expectProcessRunning(proc, 300);
+      const output = await stopWorker(proc);
+      proc = null;
+
+      expect(deferCount).toBe(1);
+      expect(failurePayload?.message).toBe("Deterministic Docker execution failure");
+      expect(completionSeen).toBe(false);
+      expect(sessionCommands).toContain("job_claimed");
+      expect(sessionCommands).not.toContain("job_completed");
+      expect(output).toContain("falling back to claimed execution path");
+      expect(output).toContain(`Claimed job ${jobId}`);
+    } finally {
+      if (proc) await stopWorker(proc);
+      if (serverHandle) await serverHandle.close();
+      await removeTestRoot(root);
+    }
+  }, 60_000);
+}
+
+test("failed terminal persistence emits only the direct failure fallback event", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pushpals-worker-terminal-persistence-"));
+  let serverHandle: Awaited<ReturnType<typeof startJsonServer>> | null = null;
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  try {
+    const repoPath = initializeMinimalRepo(root);
+    const jobId = "job-terminal-persistence-failure";
+    let claimCount = 0;
+    let failCount = 0;
+    let completionSeen = false;
+    const sessionCommands: Array<{ type: string; payload: Record<string, unknown> }> = [];
+
+    serverHandle = await startJsonServer((req, res, body) => {
+      const url = req.url ?? "/";
+      if (req.method !== "POST") {
+        res.statusCode = 404;
+        res.end("{}");
+        return;
+      }
+      if (url === "/jobs/claim") {
+        claimCount += 1;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            job:
+              claimCount === 1
+                ? {
+                    id: jobId,
+                    taskId: "terminal-persistence-failure",
+                    kind: "unsupported.execute",
+                    params: {},
+                    sessionId: "session-terminal-persistence",
+                  }
+                : null,
+          }),
+        );
+        return;
+      }
+      if (url === `/jobs/${jobId}/fail`) {
+        failCount += 1;
+        res.statusCode = 503;
+        res.end('{"ok":false,"message":"terminal persistence unavailable"}');
+        return;
+      }
+      if (url === `/jobs/${jobId}/complete`) {
+        completionSeen = true;
+        res.statusCode = 200;
+        res.end('{"ok":true}');
+        return;
+      }
+      if (url === `/jobs/${jobId}/diagnostics`) {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end('{"ok":true,"counts":{"validationRuns":0,"patchSnapshots":0}}');
+        return;
+      }
+      if (url === "/sessions/session-terminal-persistence/command") {
+        if (typeof body?.type === "string") {
+          sessionCommands.push({
+            type: body.type,
+            payload:
+              body.payload && typeof body.payload === "object"
+                ? (body.payload as Record<string, unknown>)
+                : {},
+          });
+        }
+        res.statusCode = 200;
+        res.end("{}");
+        return;
+      }
+      res.statusCode = 200;
+      res.end("{}");
+    });
+
+    proc = Bun.spawn(
+      [
+        process.execPath,
+        "run",
+        workerMainPath,
+        "--server",
+        serverHandle.baseUrl,
+        "--poll",
+        "100",
+        "--heartbeat",
+        "500",
+        "--repo",
+        repoPath,
+        "--base-ref",
+        "HEAD",
+        "--workerId",
+        "workerpal-terminal-persistence-it",
+      ],
+      {
+        cwd: repoPath,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env },
+      },
+    );
+
+    await waitForCondition(
+      () => sessionCommands.some((command) => command.type === "job_failed"),
+      15_000,
+      "Timed out waiting for direct job_failed fallback event",
+    );
+    await expectProcessRunning(proc, 300);
+
+    const output = await stopWorker(proc);
+    proc = null;
+    const failedEvents = sessionCommands.filter((command) => command.type === "job_failed");
+    expect(failCount).toBe(1);
+    expect(completionSeen).toBe(false);
+    expect(failedEvents).toHaveLength(1);
+    expect(failedEvents[0]?.payload.jobId).toBe(jobId);
+    expect(sessionCommands.some((command) => command.type === "job_completed")).toBe(false);
+    expect(output).not.toContain(`Job ${jobId} completed`);
+    expect(output).not.toContain("Fatal:");
+  } finally {
+    if (proc) await stopWorker(proc);
+    if (serverHandle) await serverHandle.close();
+    await removeTestRoot(root);
+  }
+}, 30_000);
 
 test(
   "worker defers merge-conflict jobs, rebuilds the Docker image, reclaims, and completes execution",
