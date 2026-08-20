@@ -97,6 +97,10 @@ describe("workerpals control-plane HTTP deadlines", () => {
       40,
       (async () => neverEndingBodyResponse()) as typeof fetch,
     );
+    const stalledClaimError = stalledClaim.then(
+      () => null,
+      (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+    );
     const transport = new WorkerServerTransport({
       server: "http://127.0.0.1:3001",
       headers: { "Content-Type": "application/json" },
@@ -105,11 +109,11 @@ describe("workerpals control-plane HTTP deadlines", () => {
       heartbeatMs: 5_000,
       heartbeatTimeoutMs: 20,
       staleClaimTtlMs: 120_000,
-      fetchFn: (async () => new Response("{}", { status: 200 })) as typeof fetch,
+      fetchFn: (async () => Response.json({ ok: true }, { status: 200 })) as typeof fetch,
     });
 
     expect(await transport.sendHeartbeat({ status: "idle", currentJobId: null })).toBe(true);
-    await expect(stalledClaim).rejects.toThrow("request timed out after 40ms");
+    expect((await stalledClaimError)?.message).toContain("request timed out after 40ms");
   });
 
   test("preserves critic timeout semantics when fetch ignores abort during body consumption", async () => {

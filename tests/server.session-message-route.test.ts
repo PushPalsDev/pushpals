@@ -17,8 +17,24 @@ type SpawnedServer = {
 
 const tempDirs: string[] = [];
 const spawnedServers: SpawnedServer[] = [];
+const openSockets: WebSocket[] = [];
+
+type SessionSocketEvent = {
+  type?: string;
+  from?: string;
+  payload?: Record<string, unknown>;
+};
 
 afterEach(async () => {
+  while (openSockets.length > 0) {
+    const socket = openSockets.pop();
+    try {
+      socket?.close();
+    } catch {
+      // best effort
+    }
+  }
+
   while (spawnedServers.length > 0) {
     const server = spawnedServers.pop();
     if (!server) continue;
@@ -181,6 +197,69 @@ function postServerJson(
   });
 }
 
+async function connectSessionSocket(
+  port: number,
+  sessionId: string,
+): Promise<{ ws: WebSocket; events: SessionSocketEvent[] }> {
+  const created = await postServerJson(port, "/sessions", { sessionId });
+  if (!created.ok) {
+    throw new Error(`session creation failed before websocket connect (${created.status})`);
+  }
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/sessions/${sessionId}/ws?after=0`);
+  const events: SessionSocketEvent[] = [];
+  openSockets.push(ws);
+  ws.addEventListener("message", (event) => {
+    try {
+      const raw =
+        typeof event.data === "string"
+          ? event.data
+          : event.data instanceof ArrayBuffer
+            ? new TextDecoder().decode(event.data)
+            : String(event.data);
+      const parsed = JSON.parse(raw) as {
+        envelope?: SessionSocketEvent;
+      };
+      events.push(parsed.envelope ?? (parsed as SessionSocketEvent));
+    } catch {
+      // ignore malformed frames in tests
+    }
+  });
+  await new Promise<void>((resolveOpen, rejectOpen) => {
+    const timer = setTimeout(() => rejectOpen(new Error("websocket open timed out")), 5_000);
+    ws.addEventListener(
+      "open",
+      () => {
+        clearTimeout(timer);
+        resolveOpen();
+      },
+      { once: true },
+    );
+    ws.addEventListener(
+      "error",
+      (error) => {
+        clearTimeout(timer);
+        rejectOpen(error instanceof Error ? error : new Error(String(error)));
+      },
+      { once: true },
+    );
+  });
+  return { ws, events };
+}
+
+async function waitForSessionSocketEvent(
+  events: SessionSocketEvent[],
+  predicate: (event: SessionSocketEvent) => boolean,
+  timeoutMs = 5_000,
+): Promise<SessionSocketEvent> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const match = events.find(predicate);
+    if (match) return match;
+    await Bun.sleep(25);
+  }
+  throw new Error(`timed out waiting for matching websocket event after ${timeoutMs}ms`);
+}
+
 async function seedPendingPublication(
   port: number,
   label: string,
@@ -199,10 +278,15 @@ async function seedPendingPublication(
     workerId: "publication-seed-worker",
   });
   expect(claimed.status).toBe(200);
-  expect(await claimed.json()).toMatchObject({ job: { id: jobId } });
+  const claimedPayload = (await claimed.json()) as {
+    job: { id: string; workerId: string; claimGeneration: number };
+  };
+  expect(claimedPayload).toMatchObject({ job: { id: jobId } });
 
   const completion = await postServerJson(port, "/completions/enqueue", {
     jobId,
+    workerId: claimedPayload.job.workerId,
+    claimGeneration: claimedPayload.job.claimGeneration,
     sessionId: "publication-seed",
     origin: "user",
     commitSha: `candidate-${label}`,
@@ -256,13 +340,18 @@ async function seedWorkerRuntimeCircuit(
       workerId: `runtime-circuit-worker-${index}`,
     });
     expect(claimed.status).toBe(200);
-    expect(await claimed.json()).toMatchObject({ job: { id: jobId } });
+    const claimedPayload = (await claimed.json()) as {
+      job: { id: string; workerId: string; claimGeneration: number };
+    };
+    expect(claimedPayload).toMatchObject({ job: { id: jobId } });
 
     const runtimeDetail =
       `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
       `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)`;
     if (index === 2 && beforeCircuitOpens) await beforeCircuitOpens();
     const failed = await postServerJson(port, `/jobs/${jobId}/fail`, {
+      workerId: claimedPayload.job.workerId,
+      claimGeneration: claimedPayload.job.claimGeneration,
       message: "WorkerPal job execution failed",
       detail: runtimeDetail,
       diagnostics: {
@@ -800,12 +889,14 @@ describe("server session message route", () => {
     expect(canaryClaim.status).toBe(200);
     const canaryPayload = (await canaryClaim.json()) as {
       runtimeCanary?: boolean;
-      job?: { id?: string };
+      job?: { id?: string; workerId?: string; claimGeneration?: number };
     };
     expect(canaryPayload.runtimeCanary).toBe(true);
     const canaryJobId = String(canaryPayload.job?.id ?? "");
     expect([queuedAutonomyJobId, eligibleUserJobId, targetedUserJobId]).toContain(canaryJobId);
     const canaryCompleted = await postServerJson(port, `/jobs/${canaryJobId}/complete`, {
+      workerId: canaryPayload.job?.workerId,
+      claimGeneration: canaryPayload.job?.claimGeneration,
       summary: "WorkerPal runtime canary completed",
       diagnostics: {
         terminal: {
@@ -926,13 +1017,20 @@ describe("server session message route", () => {
       workerId: "runtime-circuit-restarted-worker",
     });
     expect(canaryClaim.status).toBe(200);
-    expect(await canaryClaim.json()).toMatchObject({
+    const canaryPayload = (await canaryClaim.json()) as {
+      runtimeCanary?: boolean;
+      runtimeGeneration?: string;
+      job?: { id?: string; workerId?: string; claimGeneration?: number };
+    };
+    expect(canaryPayload).toMatchObject({
       runtimeCanary: true,
       runtimeGeneration: "session-route-runtime-v1",
       job: { id: queuedUserJobId },
     });
 
     const canaryCompleted = await postServerJson(port, `/jobs/${queuedUserJobId}/complete`, {
+      workerId: canaryPayload.job?.workerId,
+      claimGeneration: canaryPayload.job?.claimGeneration,
       summary: "The restarted WorkerPal generation completed its canary.",
       diagnostics: {
         terminal: {
@@ -1015,6 +1113,122 @@ describe("server session message route", () => {
       job: { runtimeGeneration: "session-route-runtime-v1" },
     });
   }, 15_000);
+
+  test("reapplies circuit admission when a committed claim is replayed after restart", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port, "session-route-runtime-v1");
+    await waitForHealth(server, port);
+    await seedWorkerRuntimeCircuit(port, "claim-before-admission-crash");
+
+    const materializedCircuit = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "materialize-claim-before-admission-circuit",
+      sessionId: "claim-before-admission-crash",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    expect(materializedCircuit.status).toBe(429);
+
+    const enqueued = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "claim-before-admission-crash",
+      sessionId: "claim-before-admission-crash",
+      kind: "task.execute",
+      params: { origin: "user" },
+    });
+    expect(enqueued.status).toBe(201);
+    const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+    expect(jobId).not.toBe("");
+
+    server.proc.kill();
+    await server.proc.exited;
+    await Promise.allSettled([server.stdout, server.stderr]);
+
+    // Recreate the durable boundary after JobQueue.claim() commits but before
+    // the HTTP handler can acquire the due half-open canary.
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      const claimedAt = new Date().toISOString();
+      const dueAt = new Date(Date.now() - 1_000).toISOString();
+      db.prepare(
+        `UPDATE jobs
+         SET status = 'claimed',
+             workerId = ?,
+             runtimeGeneration = ?,
+             claimGeneration = COALESCE(claimGeneration, 0) + 1,
+             claimedAt = ?,
+             startedAt = COALESCE(startedAt, ?),
+             updatedAt = ?
+         WHERE id = ?`,
+      ).run(
+        "claim-before-admission-worker",
+        "session-route-runtime-v1",
+        claimedAt,
+        claimedAt,
+        claimedAt,
+        jobId,
+      );
+      db.prepare(
+        `UPDATE worker_runtime_circuits
+         SET state = 'open', retryAt = ?, updatedAt = ?,
+             canaryJobId = NULL, canaryWorkerId = NULL,
+             canaryClaimedAt = NULL, canaryLeaseExpiresAt = NULL
+         WHERE runtimeGeneration = ?`,
+      ).run(dueAt, dueAt, "session-route-runtime-v1");
+    } finally {
+      db.close();
+    }
+
+    const restarted = spawnServer(root, port, "session-route-runtime-v1");
+    await waitForHealth(restarted, port);
+    const replay = await postServerJson(port, "/jobs/claim", {
+      workerId: "claim-before-admission-worker",
+      runtimeGeneration: "session-route-runtime-v1",
+    });
+    expect(replay.status).toBe(200);
+    const replayPayload = (await replay.json()) as {
+      replayed?: boolean;
+      runtimeCanary?: boolean;
+      job?: { id?: string; workerId?: string; claimGeneration?: number };
+    };
+    expect(replayPayload).toMatchObject({
+      replayed: true,
+      runtimeCanary: true,
+      job: {
+        id: jobId,
+        workerId: "claim-before-admission-worker",
+        claimGeneration: 1,
+      },
+    });
+
+    const circuitDb = new Database(join(root, "outputs", "data", "pushpals.db"), {
+      readonly: true,
+    });
+    try {
+      expect(
+        circuitDb
+          .prepare(
+            `SELECT state, canaryJobId, canaryWorkerId
+             FROM worker_runtime_circuits
+             WHERE runtimeGeneration = ?`,
+          )
+          .get("session-route-runtime-v1"),
+      ).toMatchObject({
+        state: "half_open",
+        canaryJobId: jobId,
+        canaryWorkerId: "claim-before-admission-worker",
+      });
+    } finally {
+      circuitDb.close();
+    }
+
+    const completed = await postServerJson(port, `/jobs/${jobId}/complete`, {
+      workerId: replayPayload.job?.workerId,
+      claimGeneration: replayPayload.job?.claimGeneration,
+      summary: "Recovered claim completed its runtime canary.",
+    });
+    expect(completed.status).toBe(200);
+  }, 20_000);
 
   test("allows only one concurrent half-open canary", async () => {
     const root = makeTempDir();
@@ -1253,6 +1467,7 @@ describe("server session message route", () => {
     const dbPath = join(dataDir, "pushpals.db");
     const legacyJobId = "legacy-runtime-deferred-job";
     const legacyRequestId = "legacy-runtime-deferred-request";
+    const legacyBulkRows = 505;
     const now = new Date().toISOString();
     const farFuture = "2099-01-01T00:00:00.000Z";
     const legacyDb = new Database(dbPath);
@@ -1367,6 +1582,55 @@ describe("server session message route", () => {
           now,
           now,
         );
+      const insertLegacyJob = legacyDb.prepare(
+        `INSERT INTO jobs (
+           id, taskId, sessionId, kind, params, status, availableAt,
+           enqueuedAt, createdAt, updatedAt
+         ) VALUES (?, ?, 'legacy-upgrade', 'task.execute', ?, 'pending', ?, ?, ?, ?)`,
+      );
+      const insertLegacyJobLog = legacyDb.prepare(
+        `INSERT INTO job_logs (jobId, ts, message) VALUES (?, ?, ?)`,
+      );
+      const insertLegacyRequest = legacyDb.prepare(
+        `INSERT INTO requests (
+           id, sessionId, prompt, metadataJson, status, agentId, claimToken,
+           claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts,
+           enqueuedAt, claimedAt, createdAt, updatedAt
+         ) VALUES (?, 'legacy-upgrade', ?, ?, 'claimed', ?, ?, 1, ?, ?, 1, ?, ?, ?, ?)`,
+      );
+      const seedLegacyBacklog = legacyDb.transaction(() => {
+        for (let index = 0; index < legacyBulkRows; index += 1) {
+          const jobId = `${legacyJobId}-${String(index).padStart(4, "0")}`;
+          insertLegacyJob.run(
+            jobId,
+            `legacy-runtime-task-${index}`,
+            JSON.stringify({ origin: "user" }),
+            farFuture,
+            now,
+            now,
+            now,
+          );
+          insertLegacyJobLog.run(
+            jobId,
+            now,
+            JSON.stringify({ code: "worker_runtime_circuit_open", index }),
+          );
+          insertLegacyRequest.run(
+            `${legacyRequestId}-${String(index).padStart(4, "0")}`,
+            `Recover legacy runtime-circuit request ${index}.`,
+            JSON.stringify({ origin: "autonomy" }),
+            `legacy-agent-${index}`,
+            `legacy-token-${index}`,
+            farFuture,
+            now,
+            now,
+            now,
+            now,
+            now,
+          );
+        }
+      });
+      seedLegacyBacklog();
     } finally {
       legacyDb.close();
     }
@@ -1407,11 +1671,40 @@ describe("server session message route", () => {
       const migratedRequest = migratedDb
         .prepare(`SELECT leaseExpiresAt, deferReason FROM requests WHERE id = ?`)
         .get(legacyRequestId) as { leaseExpiresAt: string; deferReason: string | null };
+      const migratedJobBacklog = migratedDb
+        .prepare(
+          `SELECT COUNT(*) AS count, MIN(availableAt) AS earliest, MAX(availableAt) AS latest
+           FROM jobs
+           WHERE id LIKE ?`,
+        )
+        .get(`${legacyJobId}%`) as { count: number; earliest: string; latest: string };
+      const migratedRequestBacklog = migratedDb
+        .prepare(
+          `SELECT COUNT(*) AS count,
+                  MIN(leaseExpiresAt) AS earliest,
+                  MAX(leaseExpiresAt) AS latest,
+                  SUM(CASE WHEN deferReason IS NULL THEN 1 ELSE 0 END) AS untagged
+           FROM requests
+           WHERE id LIKE ?`,
+        )
+        .get(`${legacyRequestId}%`) as {
+        count: number;
+        earliest: string;
+        latest: string;
+        untagged: number;
+      };
       expect(Date.parse(migratedJob.availableAt)).toBeGreaterThan(startupStartedAt);
       expect(Date.parse(migratedJob.availableAt)).toBeLessThanOrEqual(Date.now() + 30_000);
       expect(Date.parse(migratedRequest.leaseExpiresAt)).toBeGreaterThan(startupStartedAt);
       expect(Date.parse(migratedRequest.leaseExpiresAt)).toBeLessThanOrEqual(Date.now() + 30_000);
       expect(migratedRequest.deferReason).toBeNull();
+      expect(migratedJobBacklog.count).toBe(legacyBulkRows + 1);
+      expect(Date.parse(migratedJobBacklog.earliest)).toBeGreaterThan(startupStartedAt);
+      expect(Date.parse(migratedJobBacklog.latest)).toBeLessThanOrEqual(Date.now() + 30_000);
+      expect(migratedRequestBacklog.count).toBe(legacyBulkRows + 1);
+      expect(migratedRequestBacklog.untagged).toBe(legacyBulkRows + 1);
+      expect(Date.parse(migratedRequestBacklog.earliest)).toBeGreaterThan(startupStartedAt);
+      expect(Date.parse(migratedRequestBacklog.latest)).toBeLessThanOrEqual(Date.now() + 30_000);
 
       const dueAt = new Date(Date.now() - 1_000).toISOString();
       migratedDb.prepare(`UPDATE jobs SET availableAt = ? WHERE id = ?`).run(dueAt, legacyJobId);
@@ -1988,5 +2281,748 @@ describe("server session message route", () => {
       "request retry chain",
       "worker handoff",
     ]);
+  }, 20_000);
+
+  test("projects an offline-heartbeat execution failure exactly once before fail replay", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const { events } = await connectSessionSocket(port, "dev");
+
+    const enqueued = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "heartbeat-authoritative-failure",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {
+        origin: "autonomy",
+        autonomy: { patternKey: "heartbeat-authoritative-failure" },
+      },
+    });
+    const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+    const claimed = await postServerJson(port, "/jobs/claim", {
+      workerId: "heartbeat-authoritative-worker",
+    });
+    const authority = (await claimed.json()) as {
+      job: { id: string; workerId: string; claimGeneration: number };
+    };
+    expect(authority.job.id).toBe(jobId);
+    expect(
+      (
+        await postServerJson(port, `/jobs/${jobId}/start`, {
+          workerId: authority.job.workerId,
+          claimGeneration: authority.job.claimGeneration,
+        })
+      ).status,
+    ).toBe(200);
+
+    const dbPath = join(root, "outputs", "data", "pushpals.db");
+    const db = new Database(dbPath);
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    const now = new Date().toISOString();
+    try {
+      db.prepare(`UPDATE jobs SET lastActivityAt = ?, updatedAt = ? WHERE id = ?`).run(
+        staleAt,
+        staleAt,
+        jobId,
+      );
+      db.prepare(
+        `INSERT INTO worker_runtime_circuits (
+           runtimeGeneration, state, canaryJobId, canaryWorkerId,
+           canaryClaimedAt, canaryLeaseExpiresAt, createdAt, updatedAt
+         ) VALUES (?, 'half_open', ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "session-route-runtime-v1",
+        jobId,
+        authority.job.workerId,
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+        now,
+      );
+    } finally {
+      db.close();
+    }
+
+    const heartbeat = await postServerJson(port, "/workers/heartbeat", {
+      workerId: authority.job.workerId,
+      runtimeGeneration: "session-route-runtime-v1",
+      status: "offline",
+      currentJobId: null,
+    });
+    expect(heartbeat.status).toBe(200);
+    expect(await heartbeat.json()).toMatchObject({
+      ok: true,
+      recoveredJobs: [
+        {
+          jobId,
+          action: "failed",
+          finalStatus: "failed",
+          retrySafety: "manual_retry_required",
+        },
+      ],
+    });
+
+    const projected = await waitForSessionSocketEvent(
+      events,
+      (event) => event.type === "job_failed" && event.payload?.jobId === jobId,
+    );
+    expect(projected).toMatchObject({
+      from: "server:stale-claim-recovery",
+      payload: { jobId, origin: "autonomy" },
+    });
+
+    const replay = await postServerJson(port, `/jobs/${jobId}/fail`, {
+      workerId: authority.job.workerId,
+      claimGeneration: authority.job.claimGeneration,
+      message: "late worker failure replay",
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ ok: true, replayed: true });
+    await Bun.sleep(150);
+    expect(
+      events.filter((event) => event.type === "job_failed" && event.payload?.jobId === jobId),
+    ).toHaveLength(1);
+
+    const verified = new Database(dbPath);
+    try {
+      expect(verified.prepare(`SELECT status FROM jobs WHERE id = ?`).get(jobId)).toEqual({
+        status: "failed",
+      });
+      expect(
+        verified
+          .prepare(
+            `SELECT state, canaryJobId, canaryWorkerId
+             FROM worker_runtime_circuits WHERE runtimeGeneration = ?`,
+          )
+          .get("session-route-runtime-v1"),
+      ).toEqual({ state: "open", canaryJobId: null, canaryWorkerId: null });
+      expect(
+        verified
+          .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE job_id = ?`)
+          .get(jobId),
+      ).toEqual({ count: 1 });
+      expect(
+        verified
+          .prepare(
+            `SELECT COUNT(*) AS count FROM events
+             WHERE type = 'job_failed'
+               AND json_extract(envelope, '$.payload.jobId') = ?`,
+          )
+          .get(jobId),
+      ).toEqual({ count: 1 });
+    } finally {
+      verified.close();
+    }
+  }, 20_000);
+
+  test("projects a pre-start heartbeat requeue as a successor recovery log", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const { events } = await connectSessionSocket(port, "dev");
+    const requestId = "heartbeat-pre-start-request";
+
+    const enqueued = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "heartbeat-pre-start-requeue",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {
+        origin: "user",
+      },
+    });
+    const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+    const claimed = await postServerJson(port, "/jobs/claim", {
+      workerId: "heartbeat-pre-start-worker",
+    });
+    const authority = (await claimed.json()) as {
+      job: { id: string; workerId: string; claimGeneration: number; startedAt: string | null };
+    };
+    expect(authority.job).toMatchObject({ id: jobId, startedAt: null });
+
+    const dbPath = join(root, "outputs", "data", "pushpals.db");
+    const db = new Database(dbPath);
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    try {
+      db.prepare(`UPDATE jobs SET lastActivityAt = ?, updatedAt = ? WHERE id = ?`).run(
+        staleAt,
+        staleAt,
+        jobId,
+      );
+      db.prepare(
+        `INSERT INTO autonomy_objectives (
+           id, run_id, snapshot_id, session_id, title, instruction,
+           objective_type, component_area, trigger_type, pattern_key,
+           status, source, confidence, risk_level, request_id, job_id,
+           scope_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "objective-heartbeat-pre-start",
+        "run-heartbeat-pre-start",
+        "snapshot-heartbeat-pre-start",
+        "dev",
+        "Recover pre-start claim",
+        "Recover the pre-start claim without losing its objective",
+        "repair",
+        "server",
+        "runtime",
+        "heartbeat-pre-start-requeue",
+        "running",
+        "autonomous",
+        1,
+        "low",
+        requestId,
+        jobId,
+        "{}",
+        staleAt,
+        staleAt,
+      );
+    } finally {
+      db.close();
+    }
+
+    const heartbeat = await postServerJson(port, "/workers/heartbeat", {
+      workerId: authority.job.workerId,
+      status: "offline",
+      currentJobId: null,
+    });
+    const heartbeatPayload = (await heartbeat.json()) as {
+      recoveredJobs?: Array<{ jobId: string; action: string; replacementJobId?: string }>;
+    };
+    const replacementJobId = heartbeatPayload.recoveredJobs?.[0]?.replacementJobId;
+    expect(heartbeat.status).toBe(200);
+    expect(heartbeatPayload).toMatchObject({
+      recoveredJobs: [{ jobId, action: "requeued" }],
+    });
+    expect(typeof replacementJobId).toBe("string");
+
+    const recoveryLog = await waitForSessionSocketEvent(
+      events,
+      (event) =>
+        event.type === "log" &&
+        String(event.payload?.message ?? "").includes(jobId) &&
+        String(event.payload?.message ?? "").includes(String(replacementJobId)),
+    );
+    expect(recoveryLog.from).toBe("server:stale-claim-recovery");
+    await Bun.sleep(150);
+    expect(
+      events.filter((event) => event.type === "job_failed" && event.payload?.jobId === jobId),
+    ).toHaveLength(0);
+
+    const verified = new Database(dbPath);
+    try {
+      expect(verified.prepare(`SELECT status FROM jobs WHERE id = ?`).get(jobId)).toEqual({
+        status: "abandoned",
+      });
+      expect(
+        verified
+          .prepare(`SELECT status, resumeOfJobId, startedAt FROM jobs WHERE id = ?`)
+          .get(replacementJobId),
+      ).toEqual({ status: "pending", resumeOfJobId: jobId, startedAt: null });
+      expect(
+        verified
+          .prepare(`SELECT job_id AS jobId, status FROM autonomy_objectives WHERE request_id = ?`)
+          .get(requestId),
+      ).toEqual({ jobId: replacementJobId, status: "running" });
+      expect(
+        verified
+          .prepare(
+            `SELECT COUNT(*) AS count FROM events
+             WHERE type = 'job_failed'
+               AND json_extract(envelope, '$.payload.jobId') = ?`,
+          )
+          .get(jobId),
+      ).toEqual({ count: 0 });
+    } finally {
+      verified.close();
+    }
+  }, 20_000);
+
+  test("projects fail-deferred once across an exact persistence replay", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const { events } = await connectSessionSocket(port, "dev");
+
+    const enqueued = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "fail-deferred-authoritative-projection",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: {
+        origin: "autonomy",
+        autonomy: { patternKey: "fail-deferred-authoritative-projection" },
+      },
+    });
+    const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+    const claimed = await postServerJson(port, "/jobs/claim", {
+      workerId: "fail-deferred-projection-worker",
+    });
+    const authority = (await claimed.json()) as {
+      job: { id: string; workerId: string; claimGeneration: number };
+    };
+    expect(authority.job.id).toBe(jobId);
+    expect(
+      (
+        await postServerJson(port, `/jobs/${jobId}/defer`, {
+          workerId: authority.job.workerId,
+          claimGeneration: authority.job.claimGeneration,
+          deferMs: 60_000,
+          reason: "pre_execution_maintenance",
+        })
+      ).status,
+    ).toBe(200);
+
+    const failureBody = {
+      workerId: authority.job.workerId,
+      claimGeneration: authority.job.claimGeneration,
+      message: "pre-execution maintenance failed",
+      detail: "runtime dependency repair could not be persisted",
+    };
+    const failed = await postServerJson(port, `/jobs/${jobId}/fail-deferred`, failureBody);
+    expect(failed.status).toBe(200);
+    const failedPayload = (await failed.json()) as Record<string, unknown>;
+    expect(failedPayload.ok).toBe(true);
+    expect(typeof failedPayload.failedAt).toBe("string");
+    expect(failedPayload).not.toHaveProperty("replayed");
+    const projected = await waitForSessionSocketEvent(
+      events,
+      (event) => event.type === "job_failed" && event.payload?.jobId === jobId,
+    );
+    expect(projected).toMatchObject({
+      from: "server:job-fail-deferred",
+      payload: {
+        jobId,
+        origin: "autonomy",
+        message: failureBody.message,
+        detail: failureBody.detail,
+      },
+    });
+
+    const replay = await postServerJson(port, `/jobs/${jobId}/fail-deferred`, failureBody);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ ok: true, replayed: true });
+    await Bun.sleep(150);
+    expect(
+      events.filter((event) => event.type === "job_failed" && event.payload?.jobId === jobId),
+    ).toHaveLength(1);
+
+    const verified = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      expect(verified.prepare(`SELECT status FROM jobs WHERE id = ?`).get(jobId)).toEqual({
+        status: "failed",
+      });
+      expect(
+        verified
+          .prepare(`SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE job_id = ?`)
+          .get(jobId),
+      ).toEqual({ count: 1 });
+      expect(
+        verified
+          .prepare(
+            `SELECT COUNT(*) AS count FROM events
+             WHERE type = 'job_failed'
+               AND json_extract(envelope, '$.payload.jobId') = ?`,
+          )
+          .get(jobId),
+      ).toEqual({ count: 1 });
+    } finally {
+      verified.close();
+    }
+  }, 20_000);
+
+  test("fences job attempt mutations and replays a lost claim response", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const overlongWorkerId = "w".repeat(129);
+    const overlongClaim = await postServerJson(port, "/jobs/claim", {
+      workerId: overlongWorkerId,
+    });
+    expect(overlongClaim.status).toBe(400);
+    expect(await overlongClaim.json()).toMatchObject({
+      ok: false,
+      message: "workerId must be at most 128 characters",
+    });
+    const overlongHeartbeat = await postServerJson(port, "/workers/heartbeat", {
+      workerId: overlongWorkerId,
+      status: "idle",
+    });
+    expect(overlongHeartbeat.status).toBe(400);
+
+    const boundaryWorkerId = `worker-${"x".repeat(121)}`;
+    expect(boundaryWorkerId).toHaveLength(128);
+    const paddedBoundaryWorkerId = `  ${boundaryWorkerId}  `;
+    const boundaryEnqueue = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "job-worker-id-boundary",
+      sessionId: "job-claim-authority-session",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(boundaryEnqueue.status).toBe(201);
+    const boundaryJobId = String(
+      ((await boundaryEnqueue.json()) as Record<string, unknown>).jobId ?? "",
+    );
+    expect(boundaryJobId).not.toBe("");
+    const boundaryClaim = await postServerJson(port, "/jobs/claim", {
+      workerId: paddedBoundaryWorkerId,
+    });
+    const boundaryPayload = (await boundaryClaim.json()) as {
+      job: { id: string; workerId: string; claimGeneration: number };
+    };
+    expect(boundaryClaim.status).toBe(200);
+    expect(boundaryPayload).toMatchObject({
+      job: { id: boundaryJobId, workerId: boundaryWorkerId, claimGeneration: 1 },
+    });
+    const boundaryHeartbeat = await postServerJson(port, "/workers/heartbeat", {
+      workerId: paddedBoundaryWorkerId,
+      status: "busy",
+      currentJobId: boundaryJobId,
+    });
+    expect(boundaryHeartbeat.status).toBe(200);
+    const boundaryComplete = await postServerJson(port, `/jobs/${boundaryJobId}/complete`, {
+      workerId: paddedBoundaryWorkerId,
+      claimGeneration: boundaryPayload.job.claimGeneration,
+      summary: "boundary worker identity remained canonical",
+    });
+    expect(boundaryComplete.status).toBe(200);
+
+    const enqueue = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "job-claim-authority",
+      sessionId: "job-claim-authority-session",
+      kind: "task.execute",
+      params: {},
+    });
+    expect(enqueue.status).toBe(201);
+    const jobId = String(((await enqueue.json()) as Record<string, unknown>).jobId ?? "");
+    expect(jobId).not.toBe("");
+
+    const missingWorker = await postServerJson(port, "/jobs/claim", {});
+    expect(missingWorker.status).toBe(400);
+    expect(await missingWorker.json()).toMatchObject({
+      ok: false,
+      message: "workerId is required",
+    });
+
+    const firstClaim = await postServerJson(port, "/jobs/claim", {
+      workerId: "worker-authority-a",
+    });
+    expect(firstClaim.status).toBe(200);
+    const firstPayload = (await firstClaim.json()) as {
+      replayed?: boolean;
+      job: { id: string; workerId: string; claimGeneration: number; startedAt: string | null };
+    };
+    expect(firstPayload).toMatchObject({
+      job: {
+        id: jobId,
+        workerId: "worker-authority-a",
+        claimGeneration: 1,
+        startedAt: null,
+      },
+    });
+
+    const queuedBehind = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "job-queued-behind-replay",
+      sessionId: "job-claim-authority-session",
+      kind: "task.execute",
+      params: {},
+    });
+    const queuedBehindId = String(
+      ((await queuedBehind.json()) as Record<string, unknown>).jobId ?? "",
+    );
+
+    const replay = await postServerJson(port, "/jobs/claim", {
+      workerId: "worker-authority-a",
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      ok: true,
+      replayed: true,
+      job: {
+        id: jobId,
+        workerId: "worker-authority-a",
+        claimGeneration: firstPayload.job.claimGeneration,
+        startedAt: null,
+      },
+    });
+
+    const missingAuthority = await postServerJson(port, `/jobs/${jobId}/complete`, {
+      summary: "must not complete without lease authority",
+    });
+    expect(missingAuthority.status).toBe(400);
+
+    const unsafeAuthority = await postServerJson(port, `/jobs/${jobId}/complete`, {
+      workerId: firstPayload.job.workerId,
+      claimGeneration: Number.MAX_SAFE_INTEGER + 1,
+      summary: "must not complete with an imprecise lease generation",
+    });
+    expect(unsafeAuthority.status).toBe(400);
+    expect(await unsafeAuthority.json()).toMatchObject({
+      ok: false,
+      message: "claimGeneration must be a positive safe integer",
+    });
+
+    const malformedAuthorityRoutes: Array<{
+      path: string;
+      body: Record<string, unknown>;
+    }> = [
+      { path: `/jobs/${jobId}/complete`, body: { summary: "malformed complete" } },
+      {
+        path: `/jobs/${jobId}/complete`,
+        body: {
+          workerId: firstPayload.job.workerId,
+          claimGeneration: true,
+          summary: "boolean generation must not coerce",
+        },
+      },
+      { path: `/jobs/${jobId}/fail`, body: { message: "malformed fail" } },
+      { path: `/jobs/${jobId}/start`, body: { workerId: "worker-authority-a" } },
+      {
+        path: `/jobs/${jobId}/fail`,
+        body: {
+          workerId: firstPayload.job.workerId,
+          claimGeneration: "1",
+          message: "string generation must not coerce",
+        },
+      },
+      {
+        path: `/jobs/${jobId}/publish-blocked`,
+        body: { message: "malformed publish blocked" },
+      },
+      { path: `/jobs/${jobId}/defer`, body: { workerId: "worker-authority-a", deferMs: 1_000 } },
+      {
+        path: `/jobs/${jobId}/fail-deferred`,
+        body: { workerId: "worker-authority-a", message: "malformed deferred failure" },
+      },
+      { path: `/jobs/${jobId}/log`, body: { message: "malformed log" } },
+      {
+        path: `/jobs/${jobId}/diagnostics`,
+        body: { diagnostics: { terminal: { summary: "malformed diagnostics" } } },
+      },
+      {
+        path: "/completions/enqueue",
+        body: {
+          jobId,
+          sessionId: "job-claim-authority-session",
+          commitSha: "malformed-candidate",
+          branch: "refs/pushpals/malformed-candidate",
+          message: "malformed completion handoff",
+        },
+      },
+    ];
+    const malformedAuthorityResponses = await Promise.all(
+      malformedAuthorityRoutes.map(({ path, body }) => postServerJson(port, path, body)),
+    );
+    expect(malformedAuthorityResponses.map((response) => response.status)).toEqual(
+      malformedAuthorityRoutes.map(() => 400),
+    );
+
+    const deferralDb = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      deferralDb.exec(
+        `CREATE TRIGGER reject_claim_authority_deferral_log
+         BEFORE INSERT ON job_logs
+         BEGIN
+           SELECT RAISE(ABORT, 'forced deferral log failure');
+         END;`,
+      );
+    } finally {
+      deferralDb.close();
+    }
+    const failedDeferral = await postServerJson(port, `/jobs/${jobId}/defer`, {
+      workerId: firstPayload.job.workerId,
+      claimGeneration: firstPayload.job.claimGeneration,
+      targetWorkerId: null,
+      deferMs: 1_000,
+      reason: "claim_authority_test",
+      detail: "force the atomic diagnostic-log boundary",
+    });
+    expect(failedDeferral.status).toBe(500);
+    expect(await failedDeferral.json()).toMatchObject({
+      ok: false,
+      code: "job_deferral_persistence_failed",
+    });
+
+    const rolledBackDb = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      expect(
+        rolledBackDb
+          .prepare(`SELECT status, workerId, claimGeneration FROM jobs WHERE id = ?`)
+          .get(jobId),
+      ).toMatchObject({
+        status: "claimed",
+        workerId: "worker-authority-a",
+        claimGeneration: 1,
+      });
+      expect(
+        rolledBackDb
+          .prepare(`SELECT status, currentJobId FROM workers WHERE workerId = ?`)
+          .get("worker-authority-a"),
+      ).toEqual({ status: "busy", currentJobId: jobId });
+      rolledBackDb.exec(`DROP TRIGGER reject_claim_authority_deferral_log;`);
+    } finally {
+      rolledBackDb.close();
+    }
+
+    const deferred = await postServerJson(port, `/jobs/${jobId}/defer`, {
+      workerId: firstPayload.job.workerId,
+      claimGeneration: firstPayload.job.claimGeneration,
+      targetWorkerId: null,
+      deferMs: 1_000,
+      reason: "claim_authority_test",
+      detail: "persisted after the failed transaction was removed",
+    });
+    expect(deferred.status).toBe(200);
+
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      db.prepare(`UPDATE jobs SET availableAt = ? WHERE id = ?`).run(
+        new Date(Date.now() - 1_000).toISOString(),
+        jobId,
+      );
+    } finally {
+      db.close();
+    }
+
+    const secondClaim = await postServerJson(port, "/jobs/claim", {
+      workerId: "worker-authority-b",
+    });
+    expect(secondClaim.status).toBe(200);
+    const secondPayload = (await secondClaim.json()) as {
+      job: { id: string; workerId: string; claimGeneration: number; startedAt: string | null };
+    };
+    expect(secondPayload).toMatchObject({
+      job: {
+        id: jobId,
+        workerId: "worker-authority-b",
+        claimGeneration: 2,
+        startedAt: null,
+      },
+    });
+
+    const staleAuthority = {
+      workerId: firstPayload.job.workerId,
+      claimGeneration: firstPayload.job.claimGeneration,
+    };
+    const staleResponses = await Promise.all([
+      postServerJson(port, `/jobs/${jobId}/complete`, {
+        ...staleAuthority,
+        summary: "stale complete",
+      }),
+      postServerJson(port, `/jobs/${jobId}/start`, staleAuthority),
+      postServerJson(port, `/jobs/${jobId}/fail`, {
+        ...staleAuthority,
+        message: "stale fail",
+      }),
+      postServerJson(port, `/jobs/${jobId}/publish-blocked`, {
+        ...staleAuthority,
+        message: "stale publish blocked",
+      }),
+      postServerJson(port, `/jobs/${jobId}/defer`, {
+        ...staleAuthority,
+        deferMs: 1_000,
+      }),
+      postServerJson(port, `/jobs/${jobId}/fail-deferred`, {
+        ...staleAuthority,
+        message: "stale deferred failure",
+      }),
+      postServerJson(port, `/jobs/${jobId}/log`, {
+        ...staleAuthority,
+        message: "stale future log",
+        ts: "2099-01-01T00:00:00.000Z",
+      }),
+      postServerJson(port, `/jobs/${jobId}/diagnostics`, {
+        ...staleAuthority,
+        diagnostics: { terminal: { summary: "stale diagnostics" } },
+      }),
+      postServerJson(port, "/completions/enqueue", {
+        ...staleAuthority,
+        jobId,
+        sessionId: "job-claim-authority-session",
+        commitSha: "stale-candidate",
+        branch: "refs/pushpals/stale-candidate",
+        message: "stale finalization handoff",
+      }),
+    ]);
+    expect(staleResponses.map((response) => response.status)).toEqual(
+      staleResponses.map(() => 409),
+    );
+
+    const authorityDb = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      expect(
+        authorityDb
+          .prepare(`SELECT status, workerId, claimGeneration FROM jobs WHERE id = ?`)
+          .get(jobId),
+      ).toMatchObject({
+        status: "claimed",
+        workerId: "worker-authority-b",
+        claimGeneration: 2,
+      });
+    } finally {
+      authorityDb.close();
+    }
+
+    const currentAuthority = {
+      workerId: secondPayload.job.workerId,
+      claimGeneration: secondPayload.job.claimGeneration,
+    };
+    const started = await postServerJson(port, `/jobs/${jobId}/start`, currentAuthority);
+    expect(started.status).toBe(200);
+    const startedPayload = (await started.json()) as {
+      ok?: boolean;
+      replayed?: boolean;
+      startedAt?: string;
+    };
+    expect(startedPayload).toMatchObject({ ok: true });
+    expect(startedPayload.replayed).not.toBe(true);
+    expect(startedPayload.startedAt).toBeTruthy();
+
+    const startReplay = await postServerJson(port, `/jobs/${jobId}/start`, currentAuthority);
+    expect(startReplay.status).toBe(200);
+    expect(await startReplay.json()).toMatchObject({
+      ok: true,
+      replayed: true,
+      startedAt: startedPayload.startedAt,
+    });
+
+    const completed = await postServerJson(port, `/jobs/${jobId}/complete`, {
+      ...currentAuthority,
+      summary: "authoritative completion",
+    });
+    expect(completed.status).toBe(200);
+    expect(await completed.json()).toMatchObject({ ok: true });
+
+    const completionReplay = await postServerJson(port, `/jobs/${jobId}/complete`, {
+      ...currentAuthority,
+      summary: "response-loss retry does not rewrite the outcome",
+    });
+    expect(completionReplay.status).toBe(200);
+    expect(await completionReplay.json()).toMatchObject({ ok: true, replayed: true });
+
+    const finalDb = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      expect(
+        finalDb
+          .prepare(`SELECT status, workerId, claimGeneration FROM jobs WHERE id = ?`)
+          .get(jobId),
+      ).toMatchObject({
+        status: "completed",
+        workerId: "worker-authority-b",
+        claimGeneration: 2,
+      });
+      expect(finalDb.prepare(`SELECT status FROM jobs WHERE id = ?`).get(queuedBehindId)).toEqual({
+        status: "pending",
+      });
+    } finally {
+      finalDb.close();
+    }
   }, 20_000);
 });

@@ -20,6 +20,7 @@ import {
   type TrustedValidationExecutionResult,
   type TrustedValidationReport,
 } from "../../../packages/shared/src/trusted_validation.js";
+import { repointDurableRecoveryLinks, type JobClaimAuthority } from "./jobs.js";
 
 export type CompletionStatus = "pending" | "claimed" | "processed" | "failed";
 
@@ -78,6 +79,29 @@ const TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 1;
 export const DEFAULT_COMPLETION_LEASE_MS = 3 * 60_000;
 const MIN_COMPLETION_LEASE_MS = 30_000;
 const MAX_COMPLETION_LEASE_MS = 15 * 60_000;
+
+export type CompletionEnqueueOptions =
+  | {
+      beginJobFinalization?: false;
+      jobClaimAuthority?: never;
+    }
+  | {
+      beginJobFinalization: true;
+      jobClaimAuthority: JobClaimAuthority;
+    };
+
+export const COMPLETION_HANDOFF_CONFLICT_CODE = "completion_handoff_conflict" as const;
+
+export type CompletionEnqueueResult = {
+  ok: boolean;
+  completionId?: string;
+  message?: string;
+  code?: typeof COMPLETION_HANDOFF_CONFLICT_CODE;
+  deduped?: boolean;
+  jobStatus?: "finalizing";
+};
+
+class CompletionHandoffConflictError extends Error {}
 
 export type CompletionLeaseRecoveryResult = {
   recovered: number;
@@ -265,6 +289,7 @@ function trustedValidationCommandKey(value: unknown): string {
 
 function completionHandoffMatches(
   existing: CompletionRow,
+  parentResultJson: string | null,
   expected: {
     jobId: string;
     sessionId: string;
@@ -276,6 +301,9 @@ function completionHandoffMatches(
     prTitle: string | null;
     prBody: string | null;
     trustedValidationCommandsJson: string | null;
+    trustedValidationSummary: string | null;
+    trustedValidationDetail: string | null;
+    parentResultJson: string;
   },
 ): boolean {
   return (
@@ -288,7 +316,10 @@ function completionHandoffMatches(
     (expected.prUrl === null || (existing.prUrl ?? null) === expected.prUrl) &&
     (existing.prTitle ?? null) === expected.prTitle &&
     (existing.prBody ?? null) === expected.prBody &&
-    (existing.trustedValidationCommandsJson ?? null) === expected.trustedValidationCommandsJson
+    (existing.trustedValidationCommandsJson ?? null) === expected.trustedValidationCommandsJson &&
+    (existing.trustedValidationSummary ?? null) === expected.trustedValidationSummary &&
+    (existing.trustedValidationDetail ?? null) === expected.trustedValidationDetail &&
+    (parentResultJson ?? null) === expected.parentResultJson
   );
 }
 
@@ -436,19 +467,74 @@ export class CompletionQueue {
     if (!jobsTable) return;
     const now = new Date().toISOString();
     const tx = this.db.transaction(() => {
-      // Older workers marked the job completed immediately after enqueueing a
-      // candidate. Restore unresolved handoffs to a nonterminal state.
+      // JobQueue's startup migration widens the active dedupe index to include
+      // finalizing jobs. Legacy workers could persist the completion before
+      // moving its parent out of pending/claimed, while older releases marked
+      // the parent completed. Normalize every unresolved handoff so SCM can
+      // terminalize it, resolving dedupe collisions before changing status.
+      const unresolvedParentRows = this.db
+        .prepare(
+          `SELECT id, workerId
+           FROM jobs
+           WHERE status IN ('pending', 'claimed', 'completed')
+             AND EXISTS (
+               SELECT 1 FROM completions c
+               WHERE c.jobId = jobs.id AND c.status IN ('pending', 'claimed')
+             )`,
+        )
+        .all() as Array<{ id: string; workerId: string | null }>;
+      this.reconcilePublicationDedupeBeforeFinalizing(
+        unresolvedParentRows.map((row) => row.id),
+        now,
+        "completion startup reconciliation",
+      );
+
+      // Restore all unresolved handoffs to the only state accepted by SCM's
+      // atomic processed/failed publication transitions.
       this.db
         .prepare(
           `UPDATE jobs
-           SET status = 'finalizing', completedAt = NULL, updatedAt = ?
-           WHERE status = 'completed'
+           SET status = 'finalizing',
+               availableAt = NULL,
+               completedAt = NULL,
+               updatedAt = ?
+           WHERE status IN ('pending', 'claimed', 'completed')
              AND EXISTS (
                SELECT 1 FROM completions c
                WHERE c.jobId = jobs.id AND c.status IN ('pending', 'claimed')
              )`,
         )
         .run(now);
+
+      const workerIds = new Set(
+        unresolvedParentRows
+          .map((row) => row.workerId?.trim() ?? "")
+          .filter((workerId) => workerId.length > 0),
+      );
+      if (workerIds.size > 0) {
+        const reconcileWorker = this.db.prepare(
+          `UPDATE workers
+           SET status = CASE
+                 WHEN EXISTS (
+                   SELECT 1 FROM jobs active
+                   WHERE active.workerId = ? AND active.status = 'claimed'
+                 ) THEN 'busy'
+                 ELSE 'idle'
+               END,
+               currentJobId = (
+                 SELECT active.id FROM jobs active
+                 WHERE active.workerId = ? AND active.status = 'claimed'
+                 ORDER BY active.claimedAt ASC, active.createdAt ASC, active.id ASC
+                 LIMIT 1
+               ),
+               lastHeartbeat = ?,
+               updatedAt = ?
+           WHERE workerId = ?`,
+        );
+        for (const workerId of workerIds) {
+          reconcileWorker.run(workerId, workerId, now, now, workerId);
+        }
+      }
 
       // Repair persisted false positives from releases where completion
       // failure did not propagate back to the parent job.
@@ -533,6 +619,158 @@ export class CompletionQueue {
     tx();
   }
 
+  /**
+   * Make a set of publication parents safe to enter finalizing under the
+   * active-dedupe unique index. Publication work always outranks ordinary
+   * pending/claimed work. If more than one publication parent shares a key,
+   * every parent remains publishable and only the extra key ownership is
+   * released, with an audit record on the affected job.
+   *
+   * The caller must run inside the same transaction as the status transition.
+   */
+  private reconcilePublicationDedupeBeforeFinalizing(
+    jobIds: string[],
+    now: string,
+    context: string,
+  ): void {
+    const targetIds = [...new Set(jobIds.map((jobId) => jobId.trim()).filter(Boolean))];
+    if (targetIds.length === 0) return;
+
+    const targetIdsJson = JSON.stringify(targetIds);
+    const conflictingRows = this.db
+      .prepare(
+        `WITH target_ids(id) AS (
+           SELECT CAST(value AS TEXT) FROM json_each(?)
+         ), affected_keys(dedupeKey) AS (
+           SELECT DISTINCT j.dedupeKey
+           FROM jobs j
+           JOIN target_ids target ON target.id = j.id
+           WHERE j.dedupeKey IS NOT NULL AND j.dedupeKey <> ''
+         )
+         SELECT j.id,
+                j.dedupeKey,
+                j.status,
+                j.claimGeneration,
+                j.createdAt,
+                CASE
+                  WHEN target.id IS NOT NULL
+                    OR j.status = 'finalizing'
+                    OR EXISTS (
+                      SELECT 1 FROM completions unresolved
+                      WHERE unresolved.jobId = j.id
+                        AND unresolved.status IN ('pending', 'claimed')
+                    )
+                  THEN 1
+                  ELSE 0
+                END AS publicationParent
+         FROM jobs j
+         LEFT JOIN target_ids target ON target.id = j.id
+         WHERE j.dedupeKey IN (SELECT dedupeKey FROM affected_keys)
+           AND (
+             target.id IS NOT NULL
+             OR j.status IN ('pending', 'claimed', 'finalizing')
+           )
+         ORDER BY j.dedupeKey ASC,
+           CASE
+             WHEN target.id IS NOT NULL
+               OR j.status = 'finalizing'
+               OR EXISTS (
+                 SELECT 1 FROM completions unresolved
+                 WHERE unresolved.jobId = j.id
+                   AND unresolved.status IN ('pending', 'claimed')
+               )
+             THEN 0
+             WHEN j.status = 'claimed' THEN 1
+             ELSE 2
+           END ASC,
+           j.createdAt ASC,
+           j.id ASC`,
+      )
+      .all(targetIdsJson) as Array<{
+      id: string;
+      dedupeKey: string;
+      status: string;
+      claimGeneration: number | null;
+      createdAt: string;
+      publicationParent: 0 | 1;
+    }>;
+
+    if (conflictingRows.length < 2) return;
+
+    const releasePublicationDedupeKey = this.db.prepare(
+      `UPDATE jobs
+       SET dedupeKey = NULL,
+           updatedAt = ?
+       WHERE id = ? AND dedupeKey = ?`,
+    );
+    const abandonDuplicate = this.db.prepare(
+      `UPDATE jobs
+       SET status = 'abandoned',
+           error = COALESCE(error, ?),
+           availableAt = NULL,
+           abandonedAt = COALESCE(abandonedAt, ?),
+           updatedAt = ?
+       WHERE id = ?
+         AND status IN ('pending', 'claimed')`,
+    );
+    const releaseWorker = this.db.prepare(
+      `UPDATE workers
+       SET status = 'idle',
+           currentJobId = NULL,
+           updatedAt = ?
+       WHERE currentJobId = ?`,
+    );
+    const recordReconciliation = this.db.prepare(
+      `INSERT INTO job_logs (
+         jobId, ts, message, claimGeneration, category, dedupeKey
+       ) VALUES (?, ?, ?, ?, 'server_dedupe_migration', ?)`,
+    );
+
+    let currentDedupeKey: string | null = null;
+    let canonicalJobId = "";
+    for (const row of conflictingRows) {
+      if (row.dedupeKey !== currentDedupeKey) {
+        currentDedupeKey = row.dedupeKey;
+        canonicalJobId = row.id;
+        continue;
+      }
+
+      if (row.publicationParent === 1) {
+        const released = releasePublicationDedupeKey.run(now, row.id, row.dedupeKey);
+        if (released.changes === 0) {
+          throw new Error(`Failed to release duplicate publication dedupe key for job ${row.id}`);
+        }
+        recordReconciliation.run(
+          row.id,
+          now,
+          `Released duplicate dedupe key during ${context}; publication remains active and job ${canonicalJobId} retains the key.`,
+          Number(row.claimGeneration ?? 0),
+          row.dedupeKey,
+        );
+        continue;
+      }
+
+      const error = JSON.stringify({
+        message: `Abandoned duplicate active job during ${context}`,
+        canonicalJobId,
+        dedupeKey: row.dedupeKey,
+      });
+      repointDurableRecoveryLinks(this.db, row.id, canonicalJobId, now);
+      const abandoned = abandonDuplicate.run(error, now, now, row.id);
+      if (abandoned.changes === 0) {
+        throw new Error(`Failed to abandon duplicate active job ${row.id}`);
+      }
+      releaseWorker.run(now, row.id);
+      recordReconciliation.run(
+        row.id,
+        now,
+        `Abandoned duplicate active job during ${context}; job ${canonicalJobId} retains the dedupe key.`,
+        Number(row.claimGeneration ?? 0),
+        row.dedupeKey,
+      );
+    }
+  }
+
   private reconcileRecoverableTrustedValidationFailures(): void {
     const requiredTables = ["jobs", "job_validation_runs", "job_terminal_diagnostics"];
     const present = this.db
@@ -603,7 +841,11 @@ export class CompletionQueue {
     if (eligible.size === 0) return;
     const now = new Date().toISOString();
     const tx = this.db.transaction(() =>
-      this.restoreTrustedValidationBlockedCompletions([...eligible.values()], now),
+      this.restoreTrustedValidationBlockedCompletions(
+        [...eligible.values()],
+        now,
+        "startup trusted-validation recovery",
+      ),
     );
     const recovered = tx();
     if (recovered.jobIds.length > 0) {
@@ -618,18 +860,13 @@ export class CompletionQueue {
    */
   enqueue(
     body: Record<string, unknown>,
-    options: { beginJobFinalization?: boolean } = {},
-  ): {
-    ok: boolean;
-    completionId?: string;
-    message?: string;
-    deduped?: boolean;
-    jobStatus?: "finalizing";
-  } {
-    const jobId = body.jobId as string;
-    const sessionId = body.sessionId as string;
-    const commitSha = body.commitSha as string | undefined;
-    const branch = body.branch as string | undefined;
+    options: CompletionEnqueueOptions = {},
+  ): CompletionEnqueueResult {
+    const jobId = typeof body.jobId === "string" ? body.jobId.trim() : "";
+    const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+    const commitSha =
+      typeof body.commitSha === "string" ? body.commitSha.trim() || undefined : undefined;
+    const branch = typeof body.branch === "string" ? body.branch.trim() || undefined : undefined;
     const message = body.message as string;
     const origin = body.origin === "autonomy" ? "autonomy" : "user";
     const prUrl =
@@ -663,15 +900,82 @@ export class CompletionQueue {
       return { ok: false, message: "jobId, sessionId, and message are required" };
     }
 
+    let jobClaimAuthority: JobClaimAuthority | null = null;
+    let parentResultJson: string | null = null;
+    if (options.beginJobFinalization) {
+      if (!commitSha || !branch) {
+        return {
+          ok: false,
+          message: "commitSha and branch are required before beginning job finalization",
+        };
+      }
+      const workerId = String(options.jobClaimAuthority?.workerId ?? "").trim();
+      const claimGeneration = Number(options.jobClaimAuthority?.claimGeneration);
+      if (!workerId || !Number.isSafeInteger(claimGeneration) || claimGeneration < 1) {
+        return {
+          ok: false,
+          message: "A valid jobClaimAuthority with workerId and claimGeneration is required",
+        };
+      }
+      jobClaimAuthority = { workerId, claimGeneration };
+      const summary = typeof body.jobResultSummary === "string" ? body.jobResultSummary.trim() : "";
+      const artifacts = Array.isArray(body.jobArtifacts) ? body.jobArtifacts : [];
+      try {
+        parentResultJson = JSON.stringify({ summary: summary || message, artifacts });
+      } catch {
+        return { ok: false, message: "jobArtifacts must be JSON-serializable" };
+      }
+    }
+
     const completionId = randomUUID();
     const now = new Date().toISOString();
 
     const tx = this.db.transaction(() => {
       if (options.beginJobFinalization) {
-        const job = this.db.prepare(`SELECT status, workerId FROM jobs WHERE id = ?`).get(jobId) as
-          | { status: string; workerId: string | null }
+        const authority = jobClaimAuthority;
+        const expectedParentResultJson = parentResultJson;
+        if (!authority || !expectedParentResultJson) {
+          return {
+            ok: false as const,
+            message: "Validated completion handoff identity is unavailable",
+          };
+        }
+        const job = this.db
+          .prepare(
+            `SELECT status, workerId, claimGeneration, sessionId, result
+             FROM jobs
+             WHERE id = ?`,
+          )
+          .get(jobId) as
+          | {
+              status: string;
+              workerId: string | null;
+              claimGeneration: number | null;
+              sessionId: string;
+              result: string | null;
+            }
           | undefined;
         if (!job) return { ok: false as const, message: "Job not found" };
+        if (job.sessionId !== sessionId) {
+          return {
+            ok: false as const,
+            code: COMPLETION_HANDOFF_CONFLICT_CODE,
+            message: `Completion session ${sessionId} does not match parent job session ${job.sessionId}`,
+          };
+        }
+        if (
+          job.workerId !== authority.workerId ||
+          Number(job.claimGeneration ?? 0) !== authority.claimGeneration
+        ) {
+          return {
+            ok: false as const,
+            code: COMPLETION_HANDOFF_CONFLICT_CODE,
+            message:
+              "Job claim authority is stale or owned by another worker " +
+              `(expected ${authority.workerId}/${authority.claimGeneration}, ` +
+              `found ${job.workerId ?? "unowned"}/${Number(job.claimGeneration ?? 0)})`,
+          };
+        }
 
         const existing = this.db
           .prepare(
@@ -682,7 +986,7 @@ export class CompletionQueue {
           )
           .get(jobId) as CompletionRow | undefined;
         if (existing) {
-          const exactRetry = completionHandoffMatches(existing, {
+          const exactRetry = completionHandoffMatches(existing, job.result, {
             jobId,
             sessionId,
             origin,
@@ -693,10 +997,14 @@ export class CompletionQueue {
             prTitle,
             prBody,
             trustedValidationCommandsJson,
+            trustedValidationSummary,
+            trustedValidationDetail,
+            parentResultJson: expectedParentResultJson,
           });
           if (!exactRetry) {
             return {
               ok: false as const,
+              code: COMPLETION_HANDOFF_CONFLICT_CODE,
               message: `Job already has completion ${existing.id} with different immutable handoff metadata`,
             };
           }
@@ -710,6 +1018,7 @@ export class CompletionQueue {
         if (job.status !== "claimed") {
           return {
             ok: false as const,
+            code: COMPLETION_HANDOFF_CONFLICT_CODE,
             message: `Job is ${job.status}; expected claimed before completion handoff`,
           };
         }
@@ -742,9 +1051,11 @@ export class CompletionQueue {
         );
 
       if (options.beginJobFinalization) {
-        const summary =
-          typeof body.jobResultSummary === "string" ? body.jobResultSummary.trim() : "";
-        const artifacts = Array.isArray(body.jobArtifacts) ? body.jobArtifacts : [];
+        const authority = jobClaimAuthority;
+        const finalizationResultJson = parentResultJson;
+        if (!authority || !finalizationResultJson) {
+          throw new Error("Validated completion handoff identity is unavailable");
+        }
         const transitioned = this.db
           .prepare(
             `UPDATE jobs
@@ -757,11 +1068,23 @@ export class CompletionQueue {
                  abandonedAt = NULL,
                  publishBlockedAt = NULL,
                  updatedAt = ?
-             WHERE id = ? AND status = 'claimed'`,
+             WHERE id = ?
+               AND status = 'claimed'
+               AND workerId = ?
+               AND claimGeneration = ?`,
           )
-          .run(JSON.stringify({ summary: summary || message, artifacts }), prUrl, now, jobId);
+          .run(
+            finalizationResultJson,
+            prUrl,
+            now,
+            jobId,
+            authority.workerId,
+            authority.claimGeneration,
+          );
         if (transitioned.changes === 0) {
-          throw new Error(`Job ${jobId} left claimed state during completion handoff`);
+          throw new CompletionHandoffConflictError(
+            `Job ${jobId} left claimed state during completion handoff`,
+          );
         }
         this.db
           .prepare(
@@ -791,6 +1114,9 @@ export class CompletionQueue {
     } catch (error) {
       return {
         ok: false,
+        ...(error instanceof CompletionHandoffConflictError
+          ? { code: COMPLETION_HANDOFF_CONFLICT_CODE }
+          : {}),
         message: error instanceof Error ? error.message : String(error),
       };
     }
@@ -1411,12 +1737,17 @@ export class CompletionQueue {
       });
     }
 
-    return this.restoreTrustedValidationBlockedCompletions([...eligible.values()], now);
+    return this.restoreTrustedValidationBlockedCompletions(
+      [...eligible.values()],
+      now,
+      "runtime trusted-validation recovery",
+    );
   }
 
   private restoreTrustedValidationBlockedCompletions(
     candidates: TrustedValidationRecoveryCandidate[],
     now: string,
+    context: string,
   ): { completionIds: string[]; jobIds: string[] } {
     const completionIds: string[] = [];
     const jobIds: string[] = [];
@@ -1439,6 +1770,7 @@ export class CompletionQueue {
         )
         .run(now, row.completionId, TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS);
       if (completionUpdate.changes === 0) continue;
+      this.reconcilePublicationDedupeBeforeFinalizing([row.jobId], now, context);
       const jobUpdate = this.db
         .prepare(
           `UPDATE jobs

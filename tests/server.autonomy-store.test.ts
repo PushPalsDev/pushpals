@@ -428,7 +428,10 @@ describe("server AutonomyStore policy gates", () => {
         dedupeKey: `trusted-host:${suffix}`,
       });
       const jobId = String(enqueued.jobId ?? "");
-      expect(jobs.claim(`worker-${suffix}`).job?.id).toBe(jobId);
+      const workerId = `worker-${suffix}`;
+      const claimedJob = jobs.claim(workerId).job;
+      expect(claimedJob?.id).toBe(jobId);
+      expect(claimedJob?.claimGeneration).toBeGreaterThanOrEqual(1);
       const handoff = completions.enqueue(
         {
           jobId,
@@ -438,7 +441,13 @@ describe("server AutonomyStore policy gates", () => {
           message: "candidate",
           trustedValidationCommands: ["bun run validate"],
         },
-        { beginJobFinalization: true },
+        {
+          beginJobFinalization: true,
+          jobClaimAuthority: {
+            workerId,
+            claimGeneration: Number(claimedJob?.claimGeneration ?? 0),
+          },
+        },
       );
       const completionId = handoff.completionId ?? "";
       const pusherId = `scm-${suffix}`;
@@ -559,7 +568,10 @@ describe("server AutonomyStore policy gates", () => {
         dedupeKey: `transient-terminal:${suffix}`,
       });
       const jobId = String(enqueued.jobId ?? "");
-      expect(jobs.claim(`worker-transient-terminal-${suffix}`).job?.id).toBe(jobId);
+      const workerId = `worker-transient-terminal-${suffix}`;
+      const claimedJob = jobs.claim(workerId).job;
+      expect(claimedJob?.id).toBe(jobId);
+      expect(claimedJob?.claimGeneration).toBeGreaterThanOrEqual(1);
       const handoff = completions.enqueue(
         {
           jobId,
@@ -569,7 +581,13 @@ describe("server AutonomyStore policy gates", () => {
           message: "candidate",
           trustedValidationCommands: [command],
         },
-        { beginJobFinalization: true },
+        {
+          beginJobFinalization: true,
+          jobClaimAuthority: {
+            workerId,
+            claimGeneration: Number(claimedJob?.claimGeneration ?? 0),
+          },
+        },
       );
       const pusherId = `scm-transient-terminal-${suffix}`;
       const claimed = completions.claim(pusherId).completion;

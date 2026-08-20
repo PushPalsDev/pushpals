@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildUnhandledWorkerFailureResult,
+  buildWorkerJobClaimAuthority,
+  buildWorkerPreparationFailureResult,
   buildTrustedValidationCompletionPayload,
   didWorkerWatchdogFire,
   enqueueCompletion,
@@ -9,6 +11,8 @@ import {
   holdCommitForTrustedValidation,
   inferWorkerTerminalFailureClass,
   mergeWorkerDiagnostics,
+  normalizeWorkerPalId,
+  persistWorkerTerminalStatus,
   shouldDeferDockerCodexStartupStallForDirectRetry,
   shouldEmitDirectSessionJobEvent,
   shouldRecycleWorkerForCodexUnavailableFailure,
@@ -20,6 +24,28 @@ import {
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
+  test("requires exact positive-integer claimed-job authority", () => {
+    expect(buildWorkerJobClaimAuthority("worker-authority", 17)).toEqual({
+      workerId: "worker-authority",
+      claimGeneration: 17,
+    });
+    expect(() => buildWorkerJobClaimAuthority("worker-authority", "23")).toThrow(
+      "positive safe integer",
+    );
+    expect(() => buildWorkerJobClaimAuthority("worker-authority", 0)).toThrow(
+      "positive safe integer",
+    );
+    expect(() => buildWorkerJobClaimAuthority("worker-authority", undefined)).toThrow(
+      "positive safe integer",
+    );
+    expect(buildWorkerJobClaimAuthority("  worker-authority  ", 18)).toEqual({
+      workerId: "worker-authority",
+      claimGeneration: 18,
+    });
+    expect(() => buildWorkerJobClaimAuthority("x".repeat(129), 19)).toThrow("at most 128");
+    expect(() => normalizeWorkerPalId("   ")).toThrow("non-empty string");
+  });
+
   test("uses the packaged runtime tag as the WorkerPal generation", () => {
     expect(
       resolveWorkerRuntimeGeneration({
@@ -46,6 +72,30 @@ describe("workerpals session event emission", () => {
       metadata: {
         classificationOwner: "workerpals_main",
         structuredResult: false,
+      },
+    });
+  });
+
+  test("classifies post-start preparation failures without claiming executor invocation", () => {
+    const error = new Error("failed to create isolated worktree");
+    const result = buildWorkerPreparationFailureResult(error, "openai_codex");
+
+    expect(result).toMatchObject({
+      ok: false,
+      summary: "Job preparation failed before execution: failed to create isolated worktree",
+      diagnostics: {
+        terminal: {
+          failureClass: "worker_preparation_failure",
+          terminalStage: "preparation",
+          executorBackend: "openai_codex",
+          watchdogFired: false,
+          metadata: {
+            classificationOwner: "workerpals_main",
+            structuredResult: true,
+            executionInvoked: false,
+            errorName: "Error",
+          },
+        },
       },
     });
   });
@@ -330,7 +380,7 @@ describe("workerpals session event emission", () => {
       );
     }) as typeof fetch;
     try {
-      const enqueued = await enqueueCompletion(
+      const enqueueOutcome = await enqueueCompletion(
         "http://pushpals.test",
         { "Content-Type": "application/json" },
         "worker-1",
@@ -340,6 +390,7 @@ describe("workerpals session event emission", () => {
           taskId: "task-response-lost",
           kind: "task.execute",
           sessionId: "dev",
+          claimGeneration: 41,
           params: {},
         },
         {
@@ -348,11 +399,151 @@ describe("workerpals session event emission", () => {
         },
         { ok: true, summary: "candidate ready" },
       );
-      expect(enqueued).toBe(true);
+      expect(enqueueOutcome).toEqual({
+        ok: true,
+        authorityRejected: false,
+        outcomeUnconfirmed: false,
+      });
       expect(attempts).toBe(2);
       expect(bodies[1]).toBe(bodies[0]);
+      expect(JSON.parse(bodies[0] ?? "{}")).toMatchObject({
+        workerId: "worker-1",
+        claimGeneration: 41,
+        jobId: "job-response-lost",
+      });
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("surfaces claim-authority rejection from completion handoff", async () => {
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      return Response.json({ ok: false, code: "job_claim_authority_rejected" }, { status: 409 });
+    }) as typeof fetch;
+    try {
+      const outcome = await enqueueCompletion(
+        "http://pushpals.test",
+        { "Content-Type": "application/json" },
+        "worker-stale",
+        "main_agents",
+        {
+          id: "job-stale-completion",
+          taskId: "task-stale-completion",
+          kind: "task.execute",
+          sessionId: "dev",
+          claimGeneration: 52,
+          params: {},
+        },
+        {
+          branch: "refs/pushpals/agent/worker/job-stale-completion",
+          sha: "b".repeat(40),
+        },
+        { ok: true, summary: "candidate ready" },
+      );
+
+      expect(outcome).toEqual({
+        ok: false,
+        authorityRejected: true,
+        outcomeUnconfirmed: false,
+      });
+      expect(attempts).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("treats malformed completion success responses as an unconfirmed handoff", async () => {
+    for (const mode of ["malformed-success", "response-lost-then-malformed"] as const) {
+      const originalFetch = globalThis.fetch;
+      const bodies: string[] = [];
+      let attempts = 0;
+      globalThis.fetch = (async (
+        _input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        attempts += 1;
+        bodies.push(String(init?.body ?? ""));
+        if (mode === "response-lost-then-malformed" && attempts === 1) {
+          throw new Error("response lost after completion commit");
+        }
+        return Response.json(attempts % 2 === 0 ? { ok: false } : {}, { status: 200 });
+      }) as typeof fetch;
+      try {
+        const outcome = await enqueueCompletion(
+          "http://pushpals.test",
+          { "Content-Type": "application/json" },
+          "worker-malformed-completion",
+          "main_agents",
+          {
+            id: `job-${mode}`,
+            taskId: `task-${mode}`,
+            kind: "task.execute",
+            sessionId: "dev",
+            claimGeneration: 53,
+            params: {},
+          },
+          {
+            branch: `refs/pushpals/agent/worker/job-${mode}`,
+            sha: "c".repeat(40),
+          },
+          { ok: true, summary: "candidate ready" },
+        );
+
+        expect(outcome).toEqual({
+          ok: false,
+          authorityRejected: false,
+          outcomeUnconfirmed: true,
+        });
+        expect(attempts).toBe(3);
+        expect(bodies.every((body) => body === bodies[0])).toBe(true);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  });
+
+  test("requires exact positive acknowledgement for terminal persistence", async () => {
+    for (const mode of ["malformed-success", "response-lost-then-malformed"] as const) {
+      const originalFetch = globalThis.fetch;
+      const bodies: string[] = [];
+      let attempts = 0;
+      globalThis.fetch = (async (
+        _input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        attempts += 1;
+        bodies.push(String(init?.body ?? ""));
+        if (mode === "response-lost-then-malformed" && attempts === 1) {
+          throw new Error("response lost after terminal commit");
+        }
+        return Response.json(attempts % 2 === 0 ? { ok: false } : {}, { status: 200 });
+      }) as typeof fetch;
+      try {
+        const outcome = await persistWorkerTerminalStatus(
+          "http://pushpals.test/jobs/job-terminal/fail",
+          { "Content-Type": "application/json" },
+          {
+            workerId: "worker-terminal",
+            claimGeneration: 54,
+            message: "failed",
+          },
+          { attempts: 3, timeoutMs: 1_000, retryDelayMs: 0 },
+        );
+
+        expect(outcome).toEqual({
+          ok: false,
+          authorityRejected: false,
+          outcomeUnconfirmed: true,
+          message: expect.stringContaining("200"),
+        });
+        expect(attempts).toBe(3);
+        expect(bodies.every((body) => body === bodies[0])).toBe(true);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
     }
   });
 
@@ -431,13 +622,36 @@ describe("workerpals session event emission", () => {
     ).toBe(false);
   });
 
-  test("falls back to a direct failure event when server fail persistence did not succeed", () => {
+  test("suppresses direct terminal projection while server persistence is unconfirmed", () => {
     expect(
       shouldEmitDirectSessionJobEvent({
         ok: false,
         statusPersistedToServer: false,
       }),
-    ).toBe(true);
+    ).toBe(false);
+    expect(
+      shouldEmitDirectSessionJobEvent({
+        ok: true,
+        statusPersistedToServer: false,
+      }),
+    ).toBe(false);
+  });
+
+  test("suppresses every direct terminal projection after claim authority rejection", () => {
+    expect(
+      shouldEmitDirectSessionJobEvent({
+        ok: true,
+        statusPersistedToServer: false,
+        authorityRejected: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldEmitDirectSessionJobEvent({
+        ok: false,
+        statusPersistedToServer: false,
+        authorityRejected: true,
+      }),
+    ).toBe(false);
   });
 
   test("does not recycle heartbeat transport once job execution has moved into finalization", () => {

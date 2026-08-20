@@ -611,6 +611,270 @@ describe("server JobQueue diagnostics", () => {
     }
   });
 
+  test("preserves the active half-open canary when pre-existing work fails later", () => {
+    const queue = new JobQueue(":memory:");
+    const baseMs = Date.parse("2026-08-19T10:00:00.000Z");
+    try {
+      setSystemTime(baseMs);
+      failWorkerRuntimeJob(queue, "task-runtime-canary-race-1");
+      failWorkerRuntimeJob(queue, "task-runtime-canary-race-2");
+      const open = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      const canaryDueMs = Date.parse(String(open.retryAt)) + 1;
+
+      const preExistingJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-canary-race-pre-existing",
+        { origin: "user" },
+        "worker-canary-race-pre-existing",
+      );
+      const deferredJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-canary-race-backlog",
+        { origin: "user" },
+        "worker-canary-race-backlog",
+      );
+      expect(
+        queue.defer(deferredJobId, {
+          workerId: "worker-canary-race-backlog",
+          deferMs: 2 * 60 * 60_000,
+          reason: "worker_runtime_circuit_open",
+          detail: JSON.stringify({ fingerprint: open.fingerprint }),
+        }).ok,
+      ).toBe(true);
+      const canaryJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-canary-race-a",
+        { origin: "user" },
+        "worker-canary-race-a",
+      );
+      const competingJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-canary-race-c",
+        { origin: "user" },
+        "worker-canary-race-c",
+      );
+
+      setSystemTime(canaryDueMs);
+      const acquired = queue.acquireWorkerRuntimeCanary(canaryJobId, "worker-canary-race-a", {
+        threshold: 2,
+        nowMs: canaryDueMs,
+        canaryLeaseMs: 60_000,
+      });
+      expect(acquired).toMatchObject({ allowed: true, canary: true });
+      const canaryLeaseExpiresAt = acquired.summary.canaryLeaseExpiresAt;
+
+      setSystemTime(canaryDueMs + 1);
+      expect(
+        queue.fail(preExistingJobId, {
+          message: "WorkerPal job execution failed",
+          detail:
+            `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+            `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:999:4)`,
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "executor",
+              executorBackend: "openai_codex",
+              summary: "Job failed before returning a structured result",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+
+      const afterPreExistingFailure = queue.workerRuntimeFailureCircuitSummary({
+        threshold: 2,
+        nowMs: canaryDueMs + 1,
+      });
+      expect(afterPreExistingFailure).toMatchObject({
+        blocked: true,
+        phase: "half_open",
+        canaryJobId,
+        canaryWorkerId: "worker-canary-race-a",
+        canaryLeaseExpiresAt,
+      });
+      expect(
+        queue.acquireWorkerRuntimeCanary(canaryJobId, "worker-canary-race-a", {
+          threshold: 2,
+          nowMs: canaryDueMs + 2,
+        }),
+      ).toMatchObject({
+        allowed: true,
+        canary: true,
+        summary: {
+          phase: "half_open",
+          canaryJobId,
+          canaryWorkerId: "worker-canary-race-a",
+          canaryLeaseExpiresAt,
+        },
+      });
+      expect(
+        queue.acquireWorkerRuntimeCanary(competingJobId, "worker-canary-race-c", {
+          threshold: 2,
+          nowMs: canaryDueMs + 2,
+        }),
+      ).toMatchObject({
+        allowed: false,
+        canary: false,
+        reason: "canary_in_flight",
+        summary: {
+          phase: "half_open",
+          canaryJobId,
+          canaryWorkerId: "worker-canary-race-a",
+          canaryLeaseExpiresAt,
+        },
+      });
+
+      setSystemTime(canaryDueMs + 3);
+      expect(
+        queue.complete(canaryJobId, {
+          summary: "runtime canary completed",
+          diagnostics: {
+            terminal: {
+              failureClass: "success",
+              terminalStage: "completed",
+              executorBackend: "openai_codex",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+      expect(queue.recordWorkerRuntimeCanarySuccess(canaryJobId, canaryDueMs + 4)).toMatchObject({
+        reopened: true,
+        releasedJobCount: 1,
+      });
+      expect(queue.getJob(deferredJobId)).toMatchObject({
+        status: "pending",
+        deferReason: null,
+        deferredAt: null,
+      });
+      expect(
+        queue.workerRuntimeFailureCircuitSummary({ threshold: 2, nowMs: canaryDueMs + 5 }),
+      ).toMatchObject({ blocked: false, phase: "closed" });
+    } finally {
+      queue.close();
+      setSystemTime();
+    }
+  });
+
+  test("restores the full cooldown when pending matching evidence outlives a nonmatching canary", () => {
+    const queue = new JobQueue(":memory:");
+    const baseMs = Date.parse("2026-08-19T10:30:00.000Z");
+    try {
+      setSystemTime(baseMs);
+      failWorkerRuntimeJob(queue, "task-runtime-canary-trailing-match-1");
+      failWorkerRuntimeJob(queue, "task-runtime-canary-trailing-match-2");
+      const open = queue.workerRuntimeFailureCircuitSummary({ threshold: 2 });
+      const canaryDueMs = Date.parse(String(open.retryAt)) + 1;
+
+      const preExistingJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-canary-trailing-match-b",
+        { origin: "user" },
+        "worker-canary-trailing-match-b",
+      );
+      const canaryJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-canary-trailing-match-a",
+        { origin: "user" },
+        "worker-canary-trailing-match-a",
+      );
+      const competingJobId = enqueueClaimedJob(
+        queue,
+        "task-runtime-canary-trailing-match-c",
+        { origin: "user" },
+        "worker-canary-trailing-match-c",
+      );
+
+      setSystemTime(canaryDueMs);
+      expect(
+        queue.acquireWorkerRuntimeCanary(canaryJobId, "worker-canary-trailing-match-a", {
+          threshold: 2,
+          nowMs: canaryDueMs,
+          canaryLeaseMs: 60_000,
+        }),
+      ).toMatchObject({ allowed: true, canary: true });
+
+      const trailingMatchingFailureAtMs = canaryDueMs + 1;
+      setSystemTime(trailingMatchingFailureAtMs);
+      expect(
+        queue.fail(preExistingJobId, {
+          message: "WorkerPal job execution failed",
+          detail:
+            `ReferenceError: Cannot access 'timedOut' before initialization.\n` +
+            `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:999:4)`,
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "executor",
+              executorBackend: "openai_codex",
+              summary: "Job failed before returning a structured result",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+      expect(
+        queue.workerRuntimeFailureCircuitSummary({
+          threshold: 2,
+          nowMs: trailingMatchingFailureAtMs,
+        }),
+      ).toMatchObject({
+        phase: "half_open",
+        canaryJobId,
+        canaryWorkerId: "worker-canary-trailing-match-a",
+      });
+
+      setSystemTime(canaryDueMs + 2);
+      expect(
+        queue.fail(canaryJobId, {
+          message: "WorkerPal job execution failed",
+          detail:
+            `ReferenceError: Cannot access 'processResult' before initialization.\n` +
+            `    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:999:4)`,
+          diagnostics: {
+            terminal: {
+              failureClass: "worker_runtime_failure",
+              terminalStage: "executor",
+              executorBackend: "openai_codex",
+              summary: "Job failed before returning a structured result",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+      const canaryFailureAtMs = canaryDueMs + 3;
+      const failed = queue.recordWorkerRuntimeCanaryFailure(canaryJobId, {
+        nowMs: canaryFailureAtMs,
+        recheckMs: 30_000,
+      });
+      expect(failed).toMatchObject({ renewed: true, matchingFailure: false });
+      expect(Date.parse(String(failed.retryAt)) - canaryFailureAtMs).toBe(30_000);
+
+      const shortRecheckDueMs = Date.parse(String(failed.retryAt)) + 1;
+      setSystemTime(shortRecheckDueMs);
+      const blocked = queue.acquireWorkerRuntimeCanary(
+        competingJobId,
+        "worker-canary-trailing-match-c",
+        {
+          threshold: 2,
+          nowMs: shortRecheckDueMs,
+        },
+      );
+      expect(blocked).toMatchObject({
+        allowed: false,
+        canary: false,
+        reason: "circuit_open",
+        summary: {
+          phase: "open",
+          fingerprint: open.fingerprint,
+        },
+      });
+      expect(Date.parse(String(blocked.summary.retryAt)) - trailingMatchingFailureAtMs).toBe(
+        30 * 60_000,
+      );
+    } finally {
+      queue.close();
+      setSystemTime();
+    }
+  });
+
   test("successful canary closes the circuit and releases deferred jobs", () => {
     const queue = new JobQueue(":memory:");
     try {
@@ -915,6 +1179,10 @@ describe("server JobQueue diagnostics", () => {
         }).ok,
       ).toBe(true);
       setSystemTime(canaryDueMs + 1);
+      const canaryJob = queue.getJob(canaryJobId);
+      expect(canaryJob?.status).toBe("claimed");
+      expect(canaryJob?.workerId).toBe("worker-finalizing-crash-canary");
+      expect(canaryJob?.claimGeneration).toBeGreaterThanOrEqual(1);
       expect(
         completions.enqueue(
           {
@@ -925,7 +1193,13 @@ describe("server JobQueue diagnostics", () => {
             message: "runtime canary reached publication",
             jobResultSummary: "runtime canary produced a valid candidate",
           },
-          { beginJobFinalization: true },
+          {
+            beginJobFinalization: true,
+            jobClaimAuthority: {
+              workerId: String(canaryJob?.workerId ?? ""),
+              claimGeneration: Number(canaryJob?.claimGeneration ?? 0),
+            },
+          },
         ),
       ).toMatchObject({ ok: true, jobStatus: "finalizing" });
       expect(queue.getJob(canaryJobId)?.status).toBe("finalizing");

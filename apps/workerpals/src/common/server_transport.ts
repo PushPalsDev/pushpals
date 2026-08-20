@@ -160,9 +160,22 @@ export class WorkerServerTransport {
         },
         this.heartbeatTimeoutMs,
       );
-      if (!response.ok) {
-        const detail = await readResponseDetail(response);
-        throw new Error(`heartbeat rejected (${response.status})${detail ? `: ${detail}` : ""}`);
+      const detail = await readResponseDetail(response);
+      let ackPayload: Record<string, unknown> | null = null;
+      if (detail) {
+        try {
+          const parsed = JSON.parse(detail) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            ackPayload = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // A malformed success body is not an authoritative heartbeat ack.
+        }
+      }
+      if (!response.ok || ackPayload?.ok !== true) {
+        throw new Error(
+          `heartbeat rejected (${response.status})${detail ? `: ${detail}` : ": missing positive acknowledgement"}`,
+        );
       }
       const previousFailures = this.consecutiveHeartbeatFailures;
       this.lastHeartbeatSuccessAt = this.nowFn();
@@ -231,7 +244,11 @@ export class WorkerServerTransport {
       priority: "normal",
       droppable: true,
       run: async () => {
-        const response = await this.postJson(`/jobs/${jobId}/log`, payload, this.requestTimeoutMs);
+        const response = await this.postJson(
+          `/jobs/${jobId}/log`,
+          { ...payload, workerId: this.workerId },
+          this.requestTimeoutMs,
+        );
         if (!response.ok) {
           const detail = await readResponseDetail(response);
           this.logWarn(

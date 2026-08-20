@@ -59,6 +59,38 @@ Job logs carry the claim generation so late output from an abandoned claim
 cannot refresh a newer claim's stale-activity clock. Repeated circuit-deferral
 logs are fingerprint-deduplicated and retention-bounded.
 
+Every WorkerPal-owned mutation (logs, diagnostics, deferral, terminal status,
+and completion handoff) carries the worker ID and claim generation. The server
+checks both in the same transaction as the state change, so a delayed callback
+cannot mutate a reclaimed job. Repeating `/jobs/claim` with the same worker ID
+replays its active claim and generation, which makes a lost claim response
+recoverable without dequeuing another job. Publication handoff additionally
+requires a commit SHA, branch, and the parent job's session ID. Worker IDs are
+process identities: manually launched concurrent workers must never reuse one.
+Worker IDs are trimmed consistently and limited to 128 characters; overlength
+identities are rejected instead of being silently truncated.
+
+Claim liveness is tracked with a server-receipt activity timestamp refreshed by
+claim replay, an exact-authority execution-start acknowledgement, busy
+heartbeats, and authorized logs. A claim remains explicitly pre-execution until
+`POST /jobs/:id/start` is positively acknowledged; recovery before that boundary
+is retry-safe and does not become WorkerPal runtime-failure evidence. Indexed
+stale sweeps therefore stay bounded and cannot be delayed or accelerated by a
+worker clock. Heartbeat recovery, periodic recovery, and deferred-maintenance
+failure share the same replay-safe session, request, autonomy, and runtime-canary
+projection path.
+
+WorkerPal retries the identical lease-bound deferral, completion handoff, or
+terminal request after an ambiguous response. WorkerPal and
+SourceControlManager require an explicit JSON `{ "ok": true }` acknowledgement
+for authoritative state changes; a malformed HTTP success remains unconfirmed.
+If persistence still cannot be confirmed, the process suppresses terminal
+projection and recycles so stale recovery remains authoritative. An active
+half-open runtime canary keeps its sole lease until success, failure, or lease
+recovery, even when older in-flight work reports a matching failure. Startup
+migrations preserve every unresolved publication candidate while releasing
+only duplicate active dedupe-key ownership.
+
 ## Endpoint Families
 
 Server endpoints are easiest to reason about by family:

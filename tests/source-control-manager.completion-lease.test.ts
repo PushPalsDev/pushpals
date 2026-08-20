@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { CompletionLeaseRenewalCoordinator } from "../apps/source_control_manager/src/completion_lease";
+import {
+  CompletionLeaseRenewalCoordinator,
+  parseCompletionLeaseRenewalResponse,
+} from "../apps/source_control_manager/src/completion_lease";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -12,6 +15,45 @@ function deferred<T>() {
 }
 
 describe("SourceControlManager completion lease renewal", () => {
+  test("requires an explicit positive acknowledgement and distinguishes lease loss", async () => {
+    await expect(
+      parseCompletionLeaseRenewalResponse(
+        new Response(JSON.stringify({ ok: true }), { status: 200 }),
+      ),
+    ).resolves.toEqual({ ok: true });
+
+    await expect(
+      parseCompletionLeaseRenewalResponse(
+        new Response(JSON.stringify({ accepted: true }), { status: 200 }),
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      leaseLost: false,
+      detail:
+        "Completion publication lease renewal returned HTTP 200 without an explicit positive acknowledgement.",
+    });
+
+    await expect(
+      parseCompletionLeaseRenewalResponse(
+        new Response(JSON.stringify({ ok: false }), { status: 409 }),
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      leaseLost: true,
+      detail: "Completion publication lease could not be renewed (HTTP 409).",
+    });
+
+    await expect(
+      parseCompletionLeaseRenewalResponse(
+        new Response(JSON.stringify({ ok: false }), { status: 400 }),
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      leaseLost: false,
+      detail: "Completion publication lease could not be renewed (HTTP 400).",
+    });
+  });
+
   test("required publication barrier fails when its shared heartbeat renewal fails", async () => {
     const renewal = deferred<{ ok: boolean; detail: string }>();
     let attempts = 0;

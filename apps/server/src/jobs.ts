@@ -50,6 +50,7 @@ const WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT = 30_000;
 const WORKER_RUNTIME_DEFERRAL_LOG_DEDUPE_MS = 5 * 60_000;
 const WORKER_RUNTIME_DEFERRAL_LOG_RETAIN = 8;
 const DEFAULT_WORKER_RUNTIME_GENERATION = "default";
+export const MAX_JOB_WORKER_ID_LENGTH = 128;
 
 export interface JobRow {
   id: string;
@@ -66,6 +67,7 @@ export interface JobRow {
   status: JobStatus;
   workerId: string | null;
   targetWorkerId: string | null;
+  deferredByWorkerId: string | null;
   runtimeGeneration: string | null;
   claimGeneration: number;
   result: string | null;
@@ -78,6 +80,7 @@ export interface JobRow {
   claimedAt: string | null;
   startedAt: string | null;
   firstLogAt: string | null;
+  lastActivityAt: string | null;
   failedAt: string | null;
   abandonedAt: string | null;
   publishBlockedAt: string | null;
@@ -87,6 +90,69 @@ export interface JobRow {
   attempt: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface JobClaimAuthority {
+  workerId: string;
+  claimGeneration: number;
+}
+
+export const JOB_DEFERRAL_CONFLICT_CODE = "job_deferral_conflict" as const;
+export const JOB_DEFERRAL_PERSISTENCE_FAILED_CODE = "job_deferral_persistence_failed" as const;
+export type JobDeferralResultCode =
+  | typeof JOB_DEFERRAL_CONFLICT_CODE
+  | typeof JOB_DEFERRAL_PERSISTENCE_FAILED_CODE;
+
+export function normalizeJobWorkerId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const workerId = value.trim();
+  if (!workerId || workerId.length > MAX_JOB_WORKER_ID_LENGTH) return null;
+  return workerId;
+}
+
+export function repointDurableRecoveryLinks(
+  db: Database,
+  previousJobId: string,
+  replacementJobId: string,
+  now: string,
+): void {
+  const requestColumns = db.prepare(`PRAGMA table_info(requests)`).all() as Array<{
+    name: string;
+  }>;
+  const names = new Set(requestColumns.map((column) => column.name));
+  if (names.has("handoffJobId")) {
+    const durablePredicate = names.has("workerRequired") ? " AND workerRequired = 1" : "";
+    if (names.has("updatedAt")) {
+      db.prepare(
+        `UPDATE requests
+         SET handoffJobId = ?, updatedAt = ?
+         WHERE handoffJobId = ?${durablePredicate}`,
+      ).run(replacementJobId, now, previousJobId);
+    } else {
+      db.prepare(
+        `UPDATE requests
+         SET handoffJobId = ?
+         WHERE handoffJobId = ?${durablePredicate}`,
+      ).run(replacementJobId, previousJobId);
+    }
+  }
+
+  const objectiveColumns = db.prepare(`PRAGMA table_info(autonomy_objectives)`).all() as Array<{
+    name: string;
+  }>;
+  const objectiveNames = new Set(objectiveColumns.map((column) => column.name));
+  if (
+    objectiveNames.has("job_id") &&
+    objectiveNames.has("status") &&
+    objectiveNames.has("updated_at")
+  ) {
+    db.prepare(
+      `UPDATE autonomy_objectives
+       SET job_id = ?, updated_at = ?
+       WHERE job_id = ?
+         AND status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`,
+    ).run(replacementJobId, now, previousJobId);
+  }
 }
 
 export interface JobLogRow {
@@ -265,6 +331,12 @@ export interface RecoveredStaleJob {
   replacementJobId?: string;
   replacementAvailableAt?: string | null;
   recoveredAt: string;
+}
+
+export interface WorkerHeartbeatResult {
+  ok: boolean;
+  message?: string;
+  recoveredJobs?: RecoveredStaleJob[];
 }
 
 export interface JobSloMetricSummary {
@@ -804,6 +876,13 @@ function coerceIsoTimestamp(value: unknown): string | null {
   return new Date(ms).toISOString();
 }
 
+class JobClaimAuthorityError extends Error {
+  constructor() {
+    super("Job not found, not claimed, or claim ownership changed");
+    this.name = "JobClaimAuthorityError";
+  }
+}
+
 function percentile(values: number[], p: number): number | null {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -1050,6 +1129,7 @@ export class JobQueue {
           status              TEXT NOT NULL DEFAULT 'pending',
           workerId            TEXT,
           targetWorkerId      TEXT,
+          deferredByWorkerId  TEXT,
           runtimeGeneration   TEXT,
           claimGeneration     INTEGER NOT NULL DEFAULT 0,
           result              TEXT,
@@ -1062,6 +1142,7 @@ export class JobQueue {
           claimedAt           TEXT,
           startedAt           TEXT,
           firstLogAt          TEXT,
+          lastActivityAt      TEXT,
           failedAt            TEXT,
           abandonedAt         TEXT,
           publishBlockedAt    TEXT,
@@ -1268,6 +1349,9 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "targetWorkerId")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN targetWorkerId TEXT;`);
     }
+    if (!jobColumns.some((col) => col.name === "deferredByWorkerId")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN deferredByWorkerId TEXT;`);
+    }
     if (!jobColumns.some((col) => col.name === "runtimeGeneration")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN runtimeGeneration TEXT;`);
     }
@@ -1307,6 +1391,9 @@ export class JobQueue {
     }
     if (!jobColumns.some((col) => col.name === "firstLogAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN firstLogAt TEXT;`);
+    }
+    if (!jobColumns.some((col) => col.name === "lastActivityAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN lastActivityAt TEXT;`);
     }
     if (!jobColumns.some((col) => col.name === "failedAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN failedAt TEXT;`);
@@ -1355,6 +1442,69 @@ export class JobQueue {
       this.db.exec(`ALTER TABLE job_logs ADD COLUMN dedupeKey TEXT;`);
     }
 
+    // Older workers could copy their clock into job_logs.ts and the job's
+    // activity columns. Normalize claimed jobs once into a server-authoritative
+    // activity lease; every new claim/log write maintains this field directly.
+    const activityNowMs = Date.now();
+    const activityNow = new Date(activityNowMs).toISOString();
+    const legacyActivityRows = this.db
+      .prepare(
+        `SELECT id, claimGeneration, firstLogAt, startedAt, claimedAt, updatedAt, createdAt
+         FROM jobs
+         WHERE status = 'claimed'
+           AND (
+             lastActivityAt IS NULL
+             OR julianday(lastActivityAt) IS NULL
+             OR julianday(lastActivityAt) > julianday(?)
+           )`,
+      )
+      .all(activityNow) as Array<{
+      id: string;
+      claimGeneration: number | null;
+      firstLogAt: string | null;
+      startedAt: string | null;
+      claimedAt: string | null;
+      updatedAt: string;
+      createdAt: string;
+    }>;
+    if (legacyActivityRows.length > 0) {
+      const latestLog = this.db.prepare(
+        `SELECT ts
+         FROM job_logs
+         WHERE jobId = ?
+           AND COALESCE(claimGeneration, 0) = ?
+           AND julianday(ts) IS NOT NULL
+           AND julianday(ts) <= julianday(?)
+         ORDER BY julianday(ts) DESC, id DESC
+         LIMIT 1`,
+      );
+      const updateActivity = this.db.prepare(
+        `UPDATE jobs SET lastActivityAt = ? WHERE id = ? AND status = 'claimed'`,
+      );
+      const backfillActivity = this.db.transaction(() => {
+        for (const row of legacyActivityRows) {
+          const log = latestLog.get(row.id, Number(row.claimGeneration ?? 0), activityNow) as
+            | { ts: string | null }
+            | undefined;
+          const candidates = [
+            log?.ts,
+            row.firstLogAt,
+            row.startedAt,
+            row.claimedAt,
+            row.updatedAt,
+            row.createdAt,
+          ]
+            .map((value) => parseIsoMs(value))
+            .filter((value): value is number => value != null && value <= activityNowMs);
+          const lastActivityAt = new Date(
+            candidates.length > 0 ? Math.max(...candidates) : activityNowMs,
+          ).toISOString();
+          updateActivity.run(lastActivityAt, row.id);
+        }
+      });
+      backfillActivity();
+    }
+
     // Column-dependent indexes are created after legacy column backfills complete.
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
     this.db.exec(
@@ -1362,10 +1512,17 @@ export class JobQueue {
     );
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_available_at ON jobs(status, availableAt);`);
     this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_jobs_stale_activity ON jobs(status, lastActivityAt, id);`,
+    );
+    this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_runtime_generation ON jobs(runtimeGeneration, status);`,
     );
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_job_logs_claim_generation ON job_logs(jobId, claimGeneration, id);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_job_logs_activity
+         ON job_logs(jobId, COALESCE(claimGeneration, 0), julianday(ts) DESC, id DESC);`,
     );
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_job_logs_dedupe ON job_logs(jobId, category, dedupeKey, id);`,
@@ -1375,14 +1532,145 @@ export class JobQueue {
     );
     // Keep publication-in-flight jobs active for dedupe. Recreate the partial
     // index so databases made by older releases pick up the finalizing state.
-    this.db.exec(`DROP INDEX IF EXISTS idx_jobs_dedupe_active;`);
-    this.db.exec(
-      `CREATE UNIQUE INDEX idx_jobs_dedupe_active
-         ON jobs(dedupeKey)
-       WHERE dedupeKey IS NOT NULL
-         AND dedupeKey <> ''
-         AND status IN ('pending','claimed','finalizing');`,
+    // The old index excluded finalizing jobs, so a valid legacy database can
+    // contain a publication candidate plus newer pending/claimed work for the
+    // same key. Reconcile those rows transactionally before widening the index.
+    const completionsTablePresent = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 AS present FROM sqlite_master
+           WHERE type = 'table' AND name = 'completions'`,
+        )
+        .get(),
     );
+    const unresolvedCompletionPredicate = completionsTablePresent
+      ? `EXISTS (
+           SELECT 1 FROM completions unresolved
+           WHERE unresolved.jobId = j.id
+             AND unresolved.status IN ('pending', 'claimed')
+         )`
+      : "0";
+    const migrateActiveDedupeIndex = this.db.transaction(() => {
+      this.db.exec(`DROP INDEX IF EXISTS idx_jobs_dedupe_active;`);
+
+      const conflictingRows = this.db
+        .prepare(
+          `SELECT j.id, j.dedupeKey, j.status, j.claimGeneration, j.createdAt,
+                  CASE
+                    WHEN j.status = 'finalizing' OR ${unresolvedCompletionPredicate} THEN 1
+                    ELSE 0
+                  END AS publicationParent
+           FROM jobs j
+           WHERE j.dedupeKey IS NOT NULL
+             AND j.dedupeKey <> ''
+             AND j.status IN ('pending','claimed','finalizing')
+             AND j.dedupeKey IN (
+               SELECT duplicate.dedupeKey
+               FROM jobs duplicate
+               WHERE duplicate.dedupeKey IS NOT NULL
+                 AND duplicate.dedupeKey <> ''
+                 AND duplicate.status IN ('pending','claimed','finalizing')
+               GROUP BY duplicate.dedupeKey
+               HAVING COUNT(*) > 1
+             )
+           ORDER BY j.dedupeKey ASC,
+             CASE
+               WHEN j.status = 'finalizing' OR ${unresolvedCompletionPredicate} THEN 0
+               WHEN j.status = 'claimed' THEN 1
+               ELSE 2
+             END ASC,
+             j.createdAt ASC,
+             j.id ASC`,
+        )
+        .all() as Array<{
+        id: string;
+        dedupeKey: string;
+        status: "pending" | "claimed" | "finalizing";
+        claimGeneration: number | null;
+        createdAt: string;
+        publicationParent: 0 | 1;
+      }>;
+
+      if (conflictingRows.length > 0) {
+        const now = new Date().toISOString();
+        const abandonDuplicate = this.db.prepare(
+          `UPDATE jobs
+           SET status = 'abandoned',
+               error = COALESCE(error, ?),
+               availableAt = NULL,
+               abandonedAt = COALESCE(abandonedAt, ?),
+               updatedAt = ?
+           WHERE id = ?
+             AND status IN ('pending','claimed')`,
+        );
+        const releasePublicationDedupeKey = this.db.prepare(
+          `UPDATE jobs
+           SET dedupeKey = NULL,
+               updatedAt = ?
+           WHERE id = ?
+             AND dedupeKey = ?`,
+        );
+        const releaseWorker = this.db.prepare(
+          `UPDATE workers
+           SET status = 'idle',
+               currentJobId = NULL,
+               updatedAt = ?
+           WHERE currentJobId = ?`,
+        );
+        const recordReconciliation = this.db.prepare(
+          `INSERT INTO job_logs (
+             jobId, ts, message, claimGeneration, category, dedupeKey
+           ) VALUES (?, ?, ?, ?, 'server_dedupe_migration', ?)`,
+        );
+
+        let currentDedupeKey: string | null = null;
+        let canonicalJobId = "";
+        for (const row of conflictingRows) {
+          if (row.dedupeKey !== currentDedupeKey) {
+            currentDedupeKey = row.dedupeKey;
+            canonicalJobId = row.id;
+            continue;
+          }
+
+          if (row.publicationParent === 1) {
+            releasePublicationDedupeKey.run(now, row.id, row.dedupeKey);
+            recordReconciliation.run(
+              row.id,
+              now,
+              `Released duplicate dedupe key during migration; publication remains active and job ${canonicalJobId} retains the key.`,
+              Number(row.claimGeneration ?? 0),
+              row.dedupeKey,
+            );
+            continue;
+          }
+
+          const error = JSON.stringify({
+            message: "Abandoned duplicate active job during dedupe index migration",
+            canonicalJobId,
+            dedupeKey: row.dedupeKey,
+          });
+          repointDurableRecoveryLinks(this.db, row.id, canonicalJobId, now);
+          abandonDuplicate.run(error, now, now, row.id);
+          releaseWorker.run(now, row.id);
+          recordReconciliation.run(
+            row.id,
+            now,
+            `Abandoned duplicate active job during migration; job ${canonicalJobId} retains the dedupe key.`,
+            Number(row.claimGeneration ?? 0),
+            row.dedupeKey,
+          );
+        }
+      }
+
+      this.db.exec(
+        `CREATE UNIQUE INDEX idx_jobs_dedupe_active
+           ON jobs(dedupeKey)
+         WHERE dedupeKey IS NOT NULL
+           AND dedupeKey <> ''
+           AND status IN ('pending','claimed','finalizing');`,
+      );
+    });
+    migrateActiveDedupeIndex();
 
     this.db.exec(`
       UPDATE jobs
@@ -1715,9 +2003,12 @@ export class JobQueue {
     ok: boolean;
     job?: JobRow;
     queueWaitMs?: number;
+    replayed?: boolean;
+    code?: "worker_runtime_generation_mismatch";
     message?: string;
   } {
-    const workerId = workerIdRaw.trim() || "unknown";
+    const workerId = normalizeJobWorkerId(workerIdRaw);
+    if (!workerId) return { ok: false, message: "workerId is required" };
     const runtimeGeneration = normalizeWorkerRuntimeGeneration(options.runtimeGeneration);
     const now = new Date().toISOString();
     const targetWorkerCutoff = new Date(Date.now() - PR_WORKER_ASSIGNMENT_MAX_AGE_MS).toISOString();
@@ -1744,6 +2035,25 @@ export class JobQueue {
         .get(workerId) as JobRow | undefined;
 
       if (existingClaim) {
+        if (
+          normalizeWorkerRuntimeGeneration(existingClaim.runtimeGeneration) !== runtimeGeneration
+        ) {
+          return {
+            job: existingClaim,
+            queueWaitMs: 0,
+            runtimeGenerationMismatch: true as const,
+          };
+        }
+        this.db
+          .prepare(
+            `UPDATE jobs
+             SET lastActivityAt = ?
+             WHERE id = ?
+               AND status = 'claimed'
+               AND workerId = ?
+               AND COALESCE(claimGeneration, 0) = ?`,
+          )
+          .run(now, existingClaim.id, workerId, Number(existingClaim.claimGeneration ?? 0));
         this.db
           .prepare(
             `UPDATE workers SET status = 'busy', currentJobId = ?, lastHeartbeat = ?, updatedAt = ?
@@ -1755,6 +2065,7 @@ export class JobQueue {
             ...existingClaim,
             workerId,
             status: "claimed" as JobStatus,
+            lastActivityAt: now,
           },
           queueWaitMs: 0,
           reusedActiveClaim: true as const,
@@ -1808,10 +2119,12 @@ export class JobQueue {
           `UPDATE jobs
            SET status = 'claimed',
                workerId = ?,
+               deferredByWorkerId = NULL,
                runtimeGeneration = ?,
                claimGeneration = COALESCE(claimGeneration, 0) + 1,
                claimedAt = ?,
-               startedAt = COALESCE(startedAt, ?),
+               startedAt = NULL,
+               lastActivityAt = ?,
                availableAt = NULL,
                deferReason = NULL,
                deferredAt = NULL,
@@ -1843,10 +2156,12 @@ export class JobQueue {
           ...row,
           status: "claimed" as JobStatus,
           workerId,
+          deferredByWorkerId: null,
           runtimeGeneration,
           claimGeneration: Number(row.claimGeneration ?? 0) + 1,
           claimedAt: now,
-          startedAt: row.startedAt || now,
+          startedAt: null,
+          lastActivityAt: now,
           failedAt: null,
           publishBlockedAt: null,
           completedAt: null,
@@ -1862,13 +2177,84 @@ export class JobQueue {
 
     const claimed = tx();
     if (!claimed) return { ok: false, message: "No pending jobs" };
-    if ("reusedActiveClaim" in claimed) {
+    if ("runtimeGenerationMismatch" in claimed) {
       return {
         ok: false,
-        message: `Worker ${workerId} already has claimed job ${claimed.job.id}`,
+        code: "worker_runtime_generation_mismatch",
+        message:
+          `Worker ${workerId} already owns job ${claimed.job.id} under runtime generation ` +
+          `${claimed.job.runtimeGeneration ?? DEFAULT_WORKER_RUNTIME_GENERATION}`,
+      };
+    }
+    if ("reusedActiveClaim" in claimed) {
+      return {
+        ok: true,
+        job: claimed.job,
+        queueWaitMs: claimed.queueWaitMs,
+        replayed: true,
       };
     }
     return { ok: true, job: claimed.job, queueWaitMs: claimed.queueWaitMs };
+  }
+
+  startClaimedExecution(
+    jobId: string,
+    authority: JobClaimAuthority,
+  ): { ok: boolean; replayed?: boolean; startedAt?: string; message?: string } {
+    const workerId = normalizeJobWorkerId(authority.workerId);
+    if (
+      !workerId ||
+      !Number.isSafeInteger(authority.claimGeneration) ||
+      authority.claimGeneration < 1
+    ) {
+      return { ok: false, message: "Valid claim authority is required" };
+    }
+
+    const now = new Date().toISOString();
+    const tx = this.db.transaction(() => {
+      const claimed = this.db
+        .prepare(
+          `SELECT startedAt
+           FROM jobs
+           WHERE id = ?
+             AND status = 'claimed'
+             AND workerId = ?
+             AND COALESCE(claimGeneration, 0) = ?`,
+        )
+        .get(jobId, workerId, authority.claimGeneration) as
+        | { startedAt: string | null }
+        | undefined;
+      if (!claimed) return null;
+
+      const startedAt = claimed.startedAt ?? now;
+      this.db
+        .prepare(
+          `UPDATE jobs
+           SET startedAt = ?, lastActivityAt = ?, updatedAt = ?
+           WHERE id = ?
+             AND status = 'claimed'
+             AND workerId = ?
+             AND COALESCE(claimGeneration, 0) = ?`,
+        )
+        .run(startedAt, now, now, jobId, workerId, authority.claimGeneration);
+      this.db
+        .prepare(
+          `UPDATE workers
+           SET status = 'busy', currentJobId = ?, lastHeartbeat = ?, updatedAt = ?
+           WHERE workerId = ?`,
+        )
+        .run(jobId, now, now, workerId);
+      return { replayed: claimed.startedAt !== null, startedAt };
+    });
+
+    const started = tx();
+    if (!started) {
+      return {
+        ok: false,
+        message: "Job not found, not claimed, or claim ownership changed",
+      };
+    }
+    return { ok: true, ...started };
   }
 
   private recoverClaimedJob(
@@ -1887,14 +2273,25 @@ export class JobQueue {
     if (options.expectedWorkerId && job.workerId !== options.expectedWorkerId) return null;
 
     const params = parseJobParamsRecord(job.params);
-    const { retrySafety, reason: classificationReason } = classifyJobRetrySafety(job.kind, params);
+    const classifiedRetry = classifyJobRetrySafety(job.kind, params);
+    const executionStarted = job.startedAt !== null;
+    const retrySafety: JobRetrySafety = executionStarted
+      ? classifiedRetry.retrySafety
+      : "retry_safe";
+    const classificationReason = executionStarted
+      ? classifiedRetry.reason
+      : "job never crossed the authoritative execution boundary (startedAt is null)";
     const detailWithClassification = [
       options.detail,
+      `executionStarted=${executionStarted ? "yes" : "no"}`,
       `retrySafety=${retrySafety}`,
       `classificationReason=${classificationReason}`,
     ].join("; ");
     const recordRuntimeRecoveryDiagnostics = (status: JobStatus): void => {
-      if (job.kind !== "task.execute") return;
+      // A claim lost before the worker's exact busy heartbeat or first authorized
+      // log is a control-plane handoff failure, not evidence that the runtime
+      // failed. Do not let it contribute synthetic worker-runtime circuit data.
+      if (job.kind !== "task.execute" || !executionStarted) return;
       const summary = `WorkerPal lost a claimed task without structured terminal diagnostics (${options.recoveryReason})`;
       try {
         this.recordJobDiagnostics(
@@ -2023,7 +2420,7 @@ export class JobQueue {
             now,
           );
 
-        this.repointDurableRequestHandoffs(job.id, replacementJobId, now);
+        repointDurableRecoveryLinks(this.db, job.id, replacementJobId, now);
         return true;
       });
       if (!recover()) return null;
@@ -2094,44 +2491,9 @@ export class JobQueue {
     };
   }
 
-  private repointDurableRequestHandoffs(
-    previousJobId: string,
-    replacementJobId: string,
-    now: string,
-  ): void {
-    const requestColumns = this.db.prepare(`PRAGMA table_info(requests)`).all() as Array<{
-      name: string;
-    }>;
-    const names = new Set(requestColumns.map((column) => column.name));
-    if (!names.has("handoffJobId")) return;
-
-    const durablePredicate = names.has("workerRequired") ? " AND workerRequired = 1" : "";
-    if (names.has("updatedAt")) {
-      this.db
-        .prepare(
-          `UPDATE requests
-           SET handoffJobId = ?, updatedAt = ?
-           WHERE handoffJobId = ?${durablePredicate}`,
-        )
-        .run(replacementJobId, now, previousJobId);
-      return;
-    }
-
-    this.db
-      .prepare(
-        `UPDATE requests
-         SET handoffJobId = ?
-         WHERE handoffJobId = ?${durablePredicate}`,
-      )
-      .run(replacementJobId, previousJobId);
-  }
-
-  heartbeat(body: Record<string, unknown>): { ok: boolean; message?: string } {
-    const workerIdRaw = body.workerId;
-    if (typeof workerIdRaw !== "string" || workerIdRaw.trim().length === 0) {
-      return { ok: false, message: "workerId is required" };
-    }
-    const workerId = workerIdRaw.trim();
+  heartbeat(body: Record<string, unknown>): WorkerHeartbeatResult {
+    const workerId = normalizeJobWorkerId(body.workerId);
+    if (!workerId) return { ok: false, message: "workerId is required" };
     const status = normalizeWorkerStatus(body.status);
     const currentJobId =
       typeof body.currentJobId === "string" && body.currentJobId.trim().length > 0
@@ -2171,6 +2533,16 @@ export class JobQueue {
       .run(workerId, status, currentJobId, pollMs, capabilities, details, now, now, now);
 
     if (status === "busy" && currentJobId) {
+      this.db
+        .prepare(
+          `UPDATE jobs
+           SET lastActivityAt = ?
+           WHERE id = ?
+             AND status = 'claimed'
+             AND workerId = ?
+             AND startedAt IS NOT NULL`,
+        )
+        .run(now, currentJobId, workerId);
       const canaryLeaseExpiresAt = new Date(
         Date.parse(now) + WORKER_RUNTIME_CANARY_LEASE_MS_DEFAULT,
       ).toISOString();
@@ -2185,9 +2557,17 @@ export class JobQueue {
         .run(canaryLeaseExpiresAt, now, currentJobId, workerId);
     }
 
-    this.reconcileWorkerHeartbeatMismatch(workerId, status, currentJobId, now);
+    const recoveredJobs = this.reconcileWorkerHeartbeatMismatch(
+      workerId,
+      status,
+      currentJobId,
+      now,
+    );
 
-    return { ok: true };
+    return {
+      ok: true,
+      ...(recoveredJobs.length > 0 ? { recoveredJobs } : {}),
+    };
   }
 
   private reconcileWorkerHeartbeatMismatch(
@@ -2195,7 +2575,7 @@ export class JobQueue {
     status: WorkerStatus,
     currentJobId: string | null,
     now: string,
-  ): void {
+  ): RecoveredStaleJob[] {
     const rows = this.db
       .prepare(
         `SELECT
@@ -2212,30 +2592,20 @@ export class JobQueue {
              WHERE jl.jobId = j.id
                AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
            ) AS lastLogTs,
-           MAX(
-             COALESCE((
-               SELECT MAX(jl.ts)
-               FROM job_logs jl
-               WHERE jl.jobId = j.id
-                 AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
-             ), ''),
-             COALESCE(j.firstLogAt, ''),
-             COALESCE(j.startedAt, ''),
-             COALESCE(j.claimedAt, ''),
-             COALESCE(j.updatedAt, '')
-           ) AS activityAt
+           j.lastActivityAt AS activityAt
          FROM jobs j
          WHERE j.status = 'claimed'
            AND j.workerId = ?`,
       )
       .all(workerId) as ClaimedJobActivityRow[];
-    if (rows.length === 0) return;
+    if (rows.length === 0) return [];
 
     const mismatchedRows =
       status === "busy" && currentJobId ? rows.filter((row) => row.jobId !== currentJobId) : rows;
-    if (mismatchedRows.length === 0) return;
+    if (mismatchedRows.length === 0) return [];
 
     const nowMs = Date.parse(now);
+    const recoveredJobs: RecoveredStaleJob[] = [];
     const tx = this.db.transaction((claimedRows: ClaimedJobActivityRow[]) => {
       for (const row of claimedRows) {
         const activityMs = parseIsoMs(row.activityAt) ?? parseIsoMs(row.updatedAt) ?? nowMs;
@@ -2264,10 +2634,12 @@ export class JobQueue {
           detail,
         });
         if (!recovered) continue;
+        recoveredJobs.push(recovered);
       }
     });
 
     tx(mismatchedRows);
+    return recoveredJobs;
   }
 
   listWorkers(onlineTtlMs: number = 15_000): WorkerRow[] {
@@ -2322,33 +2694,48 @@ export class JobQueue {
     body: Record<string, unknown>,
     status: JobStatus,
     now: string,
+    authority?: JobClaimAuthority,
   ): void {
     const diagnostics = recordFromUnknown(body.diagnostics);
-    if (!diagnostics) return;
 
-    const hasAttempts = Array.isArray(diagnostics.attempts);
-    const hasPhaseSpans = Array.isArray(diagnostics.phaseSpans);
-    const hasValidationRuns = Array.isArray(diagnostics.validationRuns);
-    const hasPatchSnapshots = Array.isArray(diagnostics.patchSnapshots);
-    const attempts = arrayFromUnknown(diagnostics.attempts)
+    const hasAttempts = Array.isArray(diagnostics?.attempts);
+    const hasPhaseSpans = Array.isArray(diagnostics?.phaseSpans);
+    const hasValidationRuns = Array.isArray(diagnostics?.validationRuns);
+    const hasPatchSnapshots = Array.isArray(diagnostics?.patchSnapshots);
+    const attempts = arrayFromUnknown(diagnostics?.attempts)
       .map(recordFromUnknown)
       .filter((entry): entry is Record<string, unknown> => Boolean(entry))
       .slice(0, MAX_JOB_DIAGNOSTIC_ATTEMPTS);
-    const phaseSpans = arrayFromUnknown(diagnostics.phaseSpans)
+    const phaseSpans = arrayFromUnknown(diagnostics?.phaseSpans)
       .map(recordFromUnknown)
       .filter((entry): entry is Record<string, unknown> => Boolean(entry))
       .slice(0, MAX_JOB_DIAGNOSTIC_PHASE_SPANS);
-    const validationRuns = arrayFromUnknown(diagnostics.validationRuns)
+    const validationRuns = arrayFromUnknown(diagnostics?.validationRuns)
       .map(recordFromUnknown)
       .filter((entry): entry is Record<string, unknown> => Boolean(entry))
       .slice(0, MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS);
-    const patchSnapshots = arrayFromUnknown(diagnostics.patchSnapshots)
+    const patchSnapshots = arrayFromUnknown(diagnostics?.patchSnapshots)
       .map(recordFromUnknown)
       .filter((entry): entry is Record<string, unknown> => Boolean(entry))
       .slice(0, MAX_JOB_DIAGNOSTIC_PATCH_SNAPSHOTS);
-    const terminal = recordFromUnknown(diagnostics.terminal);
+    const terminal = recordFromUnknown(diagnostics?.terminal);
 
     const tx = this.db.transaction(() => {
+      if (authority) {
+        const owned = this.db
+          .prepare(
+            `SELECT 1
+             FROM jobs
+             WHERE id = ?
+               AND status IN ('claimed', 'finalizing')
+               AND workerId = ?
+               AND COALESCE(claimGeneration, 0) = ?`,
+          )
+          .get(jobId, authority.workerId, authority.claimGeneration);
+        if (!owned) throw new JobClaimAuthorityError();
+      }
+      if (!diagnostics) return;
+
       if (hasAttempts) this.db.prepare(`DELETE FROM job_attempts WHERE jobId = ?`).run(jobId);
       if (hasPhaseSpans) this.db.prepare(`DELETE FROM job_phase_spans WHERE jobId = ?`).run(jobId);
       if (hasValidationRuns) {
@@ -2486,16 +2873,23 @@ export class JobQueue {
   complete(
     jobId: string,
     body: Record<string, unknown>,
-  ): { ok: boolean; message?: string; durationMs?: number; completedAt?: string } {
+    authority?: JobClaimAuthority,
+  ): {
+    ok: boolean;
+    message?: string;
+    durationMs?: number;
+    completedAt?: string;
+    replayed?: boolean;
+  } {
     const now = new Date().toISOString();
     const summary = (body.summary as string) ?? null;
     const artifacts = body.artifacts ? JSON.stringify(body.artifacts) : null;
     const prUrl =
       typeof body.prUrl === "string" && body.prUrl.trim().length > 0 ? body.prUrl.trim() : null;
 
-    const jobRow = this.db.prepare(`SELECT workerId FROM jobs WHERE id = ?`).get(jobId) as
-      | { workerId: string | null }
-      | undefined;
+    const jobRow = this.db
+      .prepare(`SELECT workerId, claimGeneration FROM jobs WHERE id = ?`)
+      .get(jobId) as { workerId: string | null; claimGeneration: number | null } | undefined;
 
     const info = this.db
       .prepare(
@@ -2512,12 +2906,54 @@ export class JobQueue {
                CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
              ),
              updatedAt = ?
-         WHERE id = ? AND status = 'claimed'`,
+         WHERE id = ? AND status = 'claimed'
+           ${authority ? "AND workerId = ? AND COALESCE(claimGeneration, 0) = ?" : ""}`,
       )
-      .run(JSON.stringify({ summary, artifacts }), prUrl, now, now, now, jobId);
+      .run(
+        JSON.stringify({ summary, artifacts }),
+        prUrl,
+        now,
+        now,
+        now,
+        jobId,
+        ...(authority ? [authority.workerId, authority.claimGeneration] : []),
+      );
 
     if (info.changes === 0) {
-      return { ok: false, message: "Job not found or not in claimed state" };
+      const existing = authority
+        ? (this.db
+            .prepare(
+              `SELECT status, workerId, claimGeneration, durationMs, completedAt
+               FROM jobs WHERE id = ?`,
+            )
+            .get(jobId) as
+            | {
+                status: JobStatus;
+                workerId: string | null;
+                claimGeneration: number | null;
+                durationMs: number | null;
+                completedAt: string | null;
+              }
+            | undefined)
+        : undefined;
+      if (
+        existing?.status === "completed" &&
+        existing.workerId === authority?.workerId &&
+        Number(existing.claimGeneration ?? 0) === authority.claimGeneration
+      ) {
+        return {
+          ok: true,
+          replayed: true,
+          durationMs: existing.durationMs ?? undefined,
+          completedAt: existing.completedAt ?? undefined,
+        };
+      }
+      return {
+        ok: false,
+        message: authority
+          ? "Job not found, not claimed, or claim ownership changed"
+          : "Job not found or not in claimed state",
+      };
     }
 
     try {
@@ -2552,14 +2988,21 @@ export class JobQueue {
   fail(
     jobId: string,
     body: Record<string, unknown>,
-  ): { ok: boolean; message?: string; durationMs?: number; failedAt?: string } {
+    authority?: JobClaimAuthority,
+  ): {
+    ok: boolean;
+    message?: string;
+    durationMs?: number;
+    failedAt?: string;
+    replayed?: boolean;
+  } {
     const now = new Date().toISOString();
     const message = String(body.message ?? "Unknown error");
     const detail = body.detail == null ? null : String(body.detail);
 
-    const jobRow = this.db.prepare(`SELECT workerId FROM jobs WHERE id = ?`).get(jobId) as
-      | { workerId: string | null }
-      | undefined;
+    const jobRow = this.db
+      .prepare(`SELECT workerId, claimGeneration FROM jobs WHERE id = ?`)
+      .get(jobId) as { workerId: string | null; claimGeneration: number | null } | undefined;
 
     const info = this.db
       .prepare(
@@ -2576,12 +3019,53 @@ export class JobQueue {
                CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
              ),
              updatedAt = ?
-         WHERE id = ? AND status = 'claimed'`,
+         WHERE id = ? AND status = 'claimed'
+           ${authority ? "AND workerId = ? AND COALESCE(claimGeneration, 0) = ?" : ""}`,
       )
-      .run(JSON.stringify({ message, detail }), now, now, now, jobId);
+      .run(
+        JSON.stringify({ message, detail }),
+        now,
+        now,
+        now,
+        jobId,
+        ...(authority ? [authority.workerId, authority.claimGeneration] : []),
+      );
 
     if (info.changes === 0) {
-      return { ok: false, message: "Job not found or not in claimed state" };
+      const existing = authority
+        ? (this.db
+            .prepare(
+              `SELECT status, workerId, claimGeneration, durationMs, failedAt
+               FROM jobs WHERE id = ?`,
+            )
+            .get(jobId) as
+            | {
+                status: JobStatus;
+                workerId: string | null;
+                claimGeneration: number | null;
+                durationMs: number | null;
+                failedAt: string | null;
+              }
+            | undefined)
+        : undefined;
+      if (
+        existing?.status === "failed" &&
+        existing.workerId === authority?.workerId &&
+        Number(existing.claimGeneration ?? 0) === authority.claimGeneration
+      ) {
+        return {
+          ok: true,
+          replayed: true,
+          durationMs: existing.durationMs ?? undefined,
+          failedAt: existing.failedAt ?? undefined,
+        };
+      }
+      return {
+        ok: false,
+        message: authority
+          ? "Job not found, not claimed, or claim ownership changed"
+          : "Job not found or not in claimed state",
+      };
     }
 
     try {
@@ -2616,15 +3100,22 @@ export class JobQueue {
   publishBlocked(
     jobId: string,
     body: Record<string, unknown>,
-  ): { ok: boolean; message?: string; durationMs?: number; publishBlockedAt?: string } {
+    authority?: JobClaimAuthority,
+  ): {
+    ok: boolean;
+    message?: string;
+    durationMs?: number;
+    publishBlockedAt?: string;
+    replayed?: boolean;
+  } {
     const now = new Date().toISOString();
     const message = String(body.message ?? "Publish blocked");
     const detail = body.detail == null ? null : String(body.detail);
     const publishBlocked = body.publishBlocked ?? null;
 
-    const jobRow = this.db.prepare(`SELECT workerId FROM jobs WHERE id = ?`).get(jobId) as
-      | { workerId: string | null }
-      | undefined;
+    const jobRow = this.db
+      .prepare(`SELECT workerId, claimGeneration FROM jobs WHERE id = ?`)
+      .get(jobId) as { workerId: string | null; claimGeneration: number | null } | undefined;
 
     const info = this.db
       .prepare(
@@ -2641,12 +3132,53 @@ export class JobQueue {
                CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
              ),
              updatedAt = ?
-         WHERE id = ? AND status = 'claimed'`,
+         WHERE id = ? AND status = 'claimed'
+           ${authority ? "AND workerId = ? AND COALESCE(claimGeneration, 0) = ?" : ""}`,
       )
-      .run(JSON.stringify({ message, detail, publishBlocked }), now, now, now, jobId);
+      .run(
+        JSON.stringify({ message, detail, publishBlocked }),
+        now,
+        now,
+        now,
+        jobId,
+        ...(authority ? [authority.workerId, authority.claimGeneration] : []),
+      );
 
     if (info.changes === 0) {
-      return { ok: false, message: "Job not found or not in claimed state" };
+      const existing = authority
+        ? (this.db
+            .prepare(
+              `SELECT status, workerId, claimGeneration, durationMs, publishBlockedAt
+               FROM jobs WHERE id = ?`,
+            )
+            .get(jobId) as
+            | {
+                status: JobStatus;
+                workerId: string | null;
+                claimGeneration: number | null;
+                durationMs: number | null;
+                publishBlockedAt: string | null;
+              }
+            | undefined)
+        : undefined;
+      if (
+        existing?.status === "publish_blocked" &&
+        existing.workerId === authority?.workerId &&
+        Number(existing.claimGeneration ?? 0) === authority.claimGeneration
+      ) {
+        return {
+          ok: true,
+          replayed: true,
+          durationMs: existing.durationMs ?? undefined,
+          publishBlockedAt: existing.publishBlockedAt ?? undefined,
+        };
+      }
+      return {
+        ok: false,
+        message: authority
+          ? "Job not found, not claimed, or claim ownership changed"
+          : "Job not found or not in claimed state",
+      };
     }
 
     try {
@@ -2681,10 +3213,24 @@ export class JobQueue {
   defer(
     jobId: string,
     body: Record<string, unknown>,
-  ): { ok: boolean; message?: string; availableAt?: string } {
+    authority?: JobClaimAuthority,
+  ): {
+    ok: boolean;
+    code?: JobDeferralResultCode;
+    message?: string;
+    availableAt?: string;
+    replayed?: boolean;
+  } {
     const workerId = String(body.workerId ?? "").trim();
     if (!workerId) {
       return { ok: false, message: "workerId is required" };
+    }
+    if (authority && authority.workerId !== workerId) {
+      return {
+        ok: false,
+        code: JOB_DEFERRAL_CONFLICT_CODE,
+        message: "Job not found, not claimed, or claim ownership changed",
+      };
     }
     const now = new Date().toISOString();
     const deferMsRaw = Number.parseInt(String(body.deferMs ?? ""), 10);
@@ -2699,73 +3245,169 @@ export class JobQueue {
         : typeof body.targetWorkerId === "string" && body.targetWorkerId.trim().length > 0
           ? body.targetWorkerId.trim()
           : workerId;
-    const claimed = this.db
-      .prepare(
-        `SELECT claimGeneration
-         FROM jobs
-         WHERE id = ? AND status = 'claimed' AND workerId = ?`,
-      )
-      .get(jobId, workerId) as { claimGeneration: number | null } | undefined;
-    if (!claimed) {
-      return { ok: false, message: "Job not found, not claimed, or not owned by worker" };
-    }
-
-    const info = this.db
-      .prepare(
-        `UPDATE jobs
-         SET status = 'pending',
-             workerId = NULL,
-             targetWorkerId = ?,
-             claimedAt = NULL,
-             startedAt = NULL,
-             firstLogAt = NULL,
-             availableAt = ?,
-             deferReason = ?,
-             deferredAt = ?,
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND workerId = ?`,
-      )
-      .run(targetWorkerId, availableAt, deferReason, now, now, jobId, workerId);
-
-    if (info.changes === 0) {
-      return { ok: false, message: "Job not found, not claimed, or not owned by worker" };
-    }
-
     const detail = diagnosticText(body.detail, 2_000);
+    let fingerprint = "";
     if (detail) {
-      let fingerprint = "";
       try {
         const parsed = JSON.parse(detail) as Record<string, unknown>;
         fingerprint = diagnosticText(parsed.fingerprint, 80) ?? "";
       } catch {
         // Keep a reason-only key for non-JSON maintenance detail.
       }
-      const circuitDeferral = deferReason === "worker_runtime_circuit_open";
-      this.addLog(jobId, `[JobQueue] Deferred: ${detail}`, now, {
-        claimGeneration: Number(claimed.claimGeneration ?? 0),
-        ...(circuitDeferral
-          ? {
-              category: "deferral",
-              dedupeKey: `${deferReason}:${fingerprint || "runtime"}`,
-              dedupeWindowMs: WORKER_RUNTIME_DEFERRAL_LOG_DEDUPE_MS,
-              retain: WORKER_RUNTIME_DEFERRAL_LOG_RETAIN,
-            }
-          : {}),
-      });
     }
+
+    type DeferResult = {
+      ok: boolean;
+      code?: JobDeferralResultCode;
+      message?: string;
+      availableAt?: string;
+      replayed?: boolean;
+    };
+    const persistDeferral = this.db.transaction((): DeferResult => {
+      const claimed = this.db
+        .prepare(
+          `SELECT claimGeneration
+           FROM jobs
+           WHERE id = ? AND status = 'claimed' AND workerId = ?
+             ${authority ? "AND COALESCE(claimGeneration, 0) = ?" : ""}`,
+        )
+        .get(jobId, workerId, ...(authority ? [authority.claimGeneration] : [])) as
+        | { claimGeneration: number | null }
+        | undefined;
+      if (!claimed) {
+        if (authority) {
+          const existing = this.db
+            .prepare(
+              `SELECT status, claimGeneration, targetWorkerId, deferredByWorkerId, availableAt
+               FROM jobs WHERE id = ?`,
+            )
+            .get(jobId) as
+            | {
+                status: JobStatus;
+                claimGeneration: number | null;
+                targetWorkerId: string | null;
+                deferredByWorkerId: string | null;
+                availableAt: string | null;
+              }
+            | undefined;
+          if (
+            existing?.status === "pending" &&
+            Number(existing.claimGeneration ?? 0) === authority.claimGeneration &&
+            existing.deferredByWorkerId === authority.workerId &&
+            existing.availableAt &&
+            existing.targetWorkerId === targetWorkerId
+          ) {
+            return { ok: true, availableAt: existing.availableAt, replayed: true };
+          }
+        }
+        return {
+          ok: false,
+          code: JOB_DEFERRAL_CONFLICT_CODE,
+          message: authority
+            ? "Job not found, not claimed, or claim ownership changed"
+            : "Job not found, not claimed, or not owned by worker",
+        };
+      }
+
+      const info = this.db
+        .prepare(
+          `UPDATE jobs
+           SET status = 'pending',
+               workerId = NULL,
+               targetWorkerId = ?,
+               deferredByWorkerId = ?,
+               claimedAt = NULL,
+               startedAt = NULL,
+               firstLogAt = NULL,
+               availableAt = ?,
+               deferReason = ?,
+               deferredAt = ?,
+               updatedAt = ?
+           WHERE id = ?
+             AND status = 'claimed'
+             AND workerId = ?
+             ${authority ? "AND COALESCE(claimGeneration, 0) = ?" : ""}`,
+        )
+        .run(
+          targetWorkerId,
+          workerId,
+          availableAt,
+          deferReason,
+          now,
+          now,
+          jobId,
+          workerId,
+          ...(authority ? [authority.claimGeneration] : []),
+        );
+
+      if (info.changes === 0) {
+        return {
+          ok: false,
+          code: JOB_DEFERRAL_CONFLICT_CODE,
+          message: authority
+            ? "Job not found, not claimed, or claim ownership changed"
+            : "Job not found, not claimed, or not owned by worker",
+        };
+      }
+
+      if (detail) {
+        const circuitDeferral = deferReason === "worker_runtime_circuit_open";
+        const logResult = this.insertJobLog(jobId, `[JobQueue] Deferred: ${detail}`, now, {
+          claimGeneration: Number(claimed.claimGeneration ?? 0),
+          ...(circuitDeferral
+            ? {
+                category: "deferral",
+                dedupeKey: `${deferReason}:${fingerprint || "runtime"}`,
+                dedupeWindowMs: WORKER_RUNTIME_DEFERRAL_LOG_DEDUPE_MS,
+                retain: WORKER_RUNTIME_DEFERRAL_LOG_RETAIN,
+              }
+            : {}),
+        });
+        if (!logResult.ok) {
+          throw new Error(logResult.message ?? "Failed to persist deferral log");
+        }
+      }
+      return { ok: true, availableAt };
+    });
+
+    let result: DeferResult;
+    try {
+      result = persistDeferral();
+    } catch (error) {
+      return {
+        ok: false,
+        code: JOB_DEFERRAL_PERSISTENCE_FAILED_CODE,
+        message: `Failed to persist job deferral: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
+    if (!result.ok || result.replayed) return result;
     this.setWorkerIdleIfNoClaimedJobs(workerId, now);
-    return { ok: true, availableAt };
+    return result;
   }
 
   failDeferred(
     jobId: string,
     body: Record<string, unknown>,
-  ): { ok: boolean; message?: string; failedAt?: string } {
+    authority?: JobClaimAuthority,
+  ): {
+    ok: boolean;
+    code?: JobDeferralResultCode;
+    message?: string;
+    failedAt?: string;
+    replayed?: boolean;
+  } {
     const workerId = String(body.workerId ?? "").trim();
     if (!workerId) {
       return { ok: false, message: "workerId is required" };
+    }
+    if (authority && authority.workerId !== workerId) {
+      return {
+        ok: false,
+        code: JOB_DEFERRAL_CONFLICT_CODE,
+        message: "Deferred job not found or claim ownership changed",
+      };
     }
     const now = new Date().toISOString();
     const message = String(body.message ?? "Unknown error");
@@ -2786,13 +3428,51 @@ export class JobQueue {
              updatedAt = ?
          WHERE id = ?
            AND status = 'pending'
-           AND targetWorkerId = ?
-           AND availableAt IS NOT NULL`,
+           AND availableAt IS NOT NULL
+           ${
+             authority
+               ? "AND deferredByWorkerId = ? AND COALESCE(claimGeneration, 0) = ?"
+               : "AND targetWorkerId = ?"
+           }`,
       )
-      .run(JSON.stringify({ message, detail }), now, now, jobId, workerId);
+      .run(
+        JSON.stringify({ message, detail }),
+        now,
+        now,
+        jobId,
+        ...(authority ? [authority.workerId, authority.claimGeneration] : [workerId]),
+      );
 
     if (info.changes === 0) {
-      return { ok: false, message: "Deferred job not found or not owned by worker" };
+      const existing = authority
+        ? (this.db
+            .prepare(
+              `SELECT status, claimGeneration, deferredByWorkerId, failedAt
+               FROM jobs WHERE id = ?`,
+            )
+            .get(jobId) as
+            | {
+                status: JobStatus;
+                claimGeneration: number | null;
+                deferredByWorkerId: string | null;
+                failedAt: string | null;
+              }
+            | undefined)
+        : undefined;
+      if (
+        existing?.status === "failed" &&
+        Number(existing.claimGeneration ?? 0) === authority?.claimGeneration &&
+        existing.deferredByWorkerId === authority?.workerId
+      ) {
+        return { ok: true, failedAt: existing.failedAt ?? undefined, replayed: true };
+      }
+      return {
+        ok: false,
+        code: JOB_DEFERRAL_CONFLICT_CODE,
+        message: authority
+          ? "Deferred job not found or claim ownership changed"
+          : "Deferred job not found or not owned by worker",
+      };
     }
 
     return { ok: true, failedAt: now };
@@ -2804,7 +3484,12 @@ export class JobQueue {
       nowMs?: number;
       limit?: number;
     } = {},
-  ): { shortened: number; jobIds: string[]; availableAt: string } {
+  ): {
+    shortened: number;
+    jobIds: string[];
+    unreportedJobIds: number;
+    availableAt: string;
+  } {
     const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
     const maxDelayMs = Math.max(
       1_000,
@@ -2815,43 +3500,72 @@ export class JobQueue {
     );
     const limit = Math.max(1, Math.min(1_000, Math.floor(options.limit ?? 500)));
     const availableAt = new Date(nowMs + maxDelayMs).toISOString();
-    const rows = this.db
-      .prepare(
-        `SELECT id
-         FROM jobs
-         WHERE status = 'pending'
-           AND availableAt > ?
-           AND (
-             deferReason = 'worker_runtime_circuit_open'
-             OR EXISTS (
-               SELECT 1
-               FROM job_logs jl
-               WHERE jl.jobId = jobs.id
-                 AND jl.message LIKE '%worker_runtime_circuit_open%'
+    const now = new Date(nowMs).toISOString();
+    const shorten = this.db.transaction(() => {
+      // Keep the returned ID list bounded for startup observability, then let
+      // SQLite shorten every remaining durable deferral in one set operation.
+      // The option historically named `limit` now limits only reported IDs;
+      // it must never cap restart recovery itself.
+      const rows = this.db
+        .prepare(
+          `SELECT id
+           FROM jobs
+           WHERE status = 'pending'
+             AND availableAt > ?
+             AND (
+               deferReason = 'worker_runtime_circuit_open'
+               OR EXISTS (
+                 SELECT 1
+                 FROM job_logs jl
+                 WHERE jl.jobId = jobs.id
+                   AND jl.message LIKE '%worker_runtime_circuit_open%'
+               )
              )
-           )
-         ORDER BY COALESCE(deferredAt, updatedAt, createdAt) ASC
-         LIMIT ?`,
-      )
-      .all(availableAt, limit) as Array<{ id: string }>;
-    if (rows.length === 0) return { shortened: 0, jobIds: [], availableAt };
+           ORDER BY COALESCE(deferredAt, updatedAt, createdAt) ASC
+           LIMIT ?`,
+        )
+        .all(availableAt, limit) as Array<{ id: string }>;
+      if (rows.length === 0) {
+        return { shortened: 0, jobIds: [], unreportedJobIds: 0, availableAt };
+      }
 
-    const ids = rows.map((row) => row.id);
-    const placeholders = ids.map(() => "?").join(",");
-    const result = this.db
-      .prepare(
-        `UPDATE jobs
-         SET availableAt = ?, updatedAt = ?
-         WHERE id IN (${placeholders})
-           AND status = 'pending'
-           AND availableAt > ?`,
-      )
-      .run(availableAt, new Date(nowMs).toISOString(), ...ids, availableAt);
-    return {
-      shortened: result.changes,
-      jobIds: ids.slice(0, result.changes),
-      availableAt,
-    };
+      const ids = rows.map((row) => row.id);
+      const placeholders = ids.map(() => "?").join(",");
+      const reportedRows = this.db
+        .prepare(
+          `UPDATE jobs
+           SET availableAt = ?, updatedAt = ?
+           WHERE id IN (${placeholders})
+             AND status = 'pending'
+             AND availableAt > ?
+           RETURNING id`,
+        )
+        .all(availableAt, now, ...ids, availableAt) as Array<{ id: string }>;
+      const unreported = this.db
+        .prepare(
+          `UPDATE jobs
+           SET availableAt = ?, updatedAt = ?
+           WHERE status = 'pending'
+             AND availableAt > ?
+             AND (
+               deferReason = 'worker_runtime_circuit_open'
+               OR EXISTS (
+                 SELECT 1
+                 FROM job_logs jl
+                 WHERE jl.jobId = jobs.id
+                   AND jl.message LIKE '%worker_runtime_circuit_open%'
+               )
+             )`,
+        )
+        .run(availableAt, now, availableAt);
+      return {
+        shortened: reportedRows.length + unreported.changes,
+        jobIds: reportedRows.map((row) => row.id),
+        unreportedJobIds: unreported.changes,
+        availableAt,
+      };
+    });
+    return shorten();
   }
 
   releaseWorkerRuntimeCircuitDeferrals(nowMs = Date.now()): {
@@ -2890,6 +3604,7 @@ export class JobQueue {
       : 120_000;
     const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.floor(limit))) : 100;
     const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
     const cutoff = new Date(nowMs - ttlMs).toISOString();
 
     type StaleCandidate = {
@@ -2920,41 +3635,55 @@ export class JobQueue {
            w.currentJobId AS workerCurrentJobId,
            w.lastHeartbeat AS workerLastHeartbeat,
            j.updatedAt AS jobUpdatedAt,
-           (
-             SELECT MAX(jl.ts)
-             FROM job_logs jl
-             WHERE jl.jobId = j.id
-               AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
-           ) AS lastLogTs,
-           MAX(
-             COALESCE((
-               SELECT MAX(jl.ts)
-               FROM job_logs jl
-               WHERE jl.jobId = j.id
-                 AND COALESCE(jl.claimGeneration, 0) = COALESCE(j.claimGeneration, 0)
-             ), ''),
-             COALESCE(j.firstLogAt, ''),
-             COALESCE(j.startedAt, ''),
-             COALESCE(j.claimedAt, ''),
-             COALESCE(j.updatedAt, '')
-           ) AS activityAt
+           NULL AS lastLogTs,
+           j.lastActivityAt AS activityAt
          FROM jobs j
          LEFT JOIN workers w ON w.workerId = j.workerId
          WHERE j.status = 'claimed'
-         ORDER BY activityAt ASC
+           AND j.lastActivityAt IS NOT NULL
+           AND j.lastActivityAt <= ?
+           AND (
+             j.workerId IS NULL
+             OR w.status IS NULL
+             OR w.status <> 'busy'
+             OR w.currentJobId IS NULL
+             OR w.currentJobId <> j.id
+             OR julianday(w.lastHeartbeat) IS NULL
+             OR julianday(w.lastHeartbeat) > julianday(?)
+             OR julianday(w.lastHeartbeat) <= julianday(?)
+           )
+         ORDER BY j.lastActivityAt ASC, j.id ASC
          LIMIT ?`,
       )
-      .all(maxRows) as StaleCandidate[];
+      .all(cutoff, now, cutoff, maxRows) as StaleCandidate[];
+
+    if (candidates.length > 0) {
+      const latestLog = this.db.prepare(
+        `SELECT ts
+         FROM job_logs
+         WHERE jobId = ?
+           AND julianday(ts) IS NOT NULL
+           AND julianday(ts) <= julianday(?)
+         ORDER BY julianday(ts) DESC, id DESC
+         LIMIT 1`,
+      );
+      for (const row of candidates) {
+        const log = latestLog.get(row.jobId, now) as { ts: string | null } | undefined;
+        row.lastLogTs = log?.ts ?? null;
+      }
+    }
 
     if (candidates.length === 0) return [];
 
-    const now = new Date().toISOString();
     const recovered: RecoveredStaleJob[] = [];
 
     const tx = this.db.transaction((rows: StaleCandidate[]) => {
       for (const row of rows) {
-        const activityMs = parseIsoMs(row.activityAt) ?? parseIsoMs(row.jobUpdatedAt) ?? nowMs;
-        const heartbeatMs = parseIsoMs(row.workerLastHeartbeat);
+        if (recovered.length >= maxRows) break;
+        const activityMs = parseIsoMs(row.activityAt) ?? nowMs;
+        const parsedHeartbeatMs = parseIsoMs(row.workerLastHeartbeat);
+        const heartbeatMs =
+          parsedHeartbeatMs != null && parsedHeartbeatMs <= nowMs ? parsedHeartbeatMs : null;
         const activityAgeMs = Math.max(0, nowMs - activityMs);
         const heartbeatAgeMs =
           heartbeatMs == null ? Number.POSITIVE_INFINITY : Math.max(0, nowMs - heartbeatMs);
@@ -3671,12 +4400,22 @@ export class JobQueue {
       const [fingerprint, cluster] = thresholdCluster;
       const lastFailureAtMs = parseIsoMs(cluster.lastFailureAt);
       const existingFailureAtMs = parseIsoMs(circuitBefore?.lastFailureAt);
+      const canaryLeaseExpiresAtMs = parseIsoMs(circuitBefore?.canaryLeaseExpiresAt);
+      const hasActiveHalfOpenCanary =
+        circuitBefore?.state === "half_open" &&
+        Boolean(circuitBefore.canaryJobId) &&
+        Boolean(circuitBefore.canaryWorkerId) &&
+        (canaryLeaseExpiresAtMs == null || canaryLeaseExpiresAtMs > nowMs);
       const newEvidence =
         !circuitBefore ||
         circuitBefore.fingerprint !== fingerprint ||
         (lastFailureAtMs != null &&
           (existingFailureAtMs == null || lastFailureAtMs > existingFailureAtMs));
-      if (newEvidence && lastFailureAtMs != null) {
+      // A failure from work admitted before the circuit opened must not evict
+      // the single in-flight canary. Leave that evidence pending until the
+      // canary resolves: success supersedes it, while failure or lease recovery
+      // can reassess it without weakening the exact half-open ownership fence.
+      if (newEvidence && lastFailureAtMs != null && !hasActiveHalfOpenCanary) {
         const retryAt = new Date(lastFailureAtMs + blockDurationMs).toISOString();
         this.db
           .prepare(
@@ -3771,6 +4510,13 @@ export class JobQueue {
     }
     if (circuit.state === "half_open") {
       const leaseExpiresAtMs = parseIsoMs(circuit.canaryLeaseExpiresAt);
+      if (
+        circuit.canaryJobId === jobId &&
+        circuit.canaryWorkerId === workerId &&
+        (leaseExpiresAtMs == null || leaseExpiresAtMs > nowMs)
+      ) {
+        return { allowed: true, canary: true, summary };
+      }
       return {
         allowed: false,
         canary: false,
@@ -3922,7 +4668,7 @@ export class JobQueue {
         `UPDATE worker_runtime_circuits
          SET state = 'open',
              retryAt = ?,
-             lastFailureAt = COALESCE(?, lastFailureAt),
+             lastFailureAt = CASE WHEN ? THEN COALESCE(?, lastFailureAt) ELSE lastFailureAt END,
              failureClass = CASE WHEN ? THEN COALESCE(?, failureClass) ELSE failureClass END,
              executorBackend = CASE WHEN ? THEN COALESCE(?, executorBackend) ELSE executorBackend END,
              signatureSample = CASE WHEN ? THEN COALESCE(?, signatureSample) ELSE signatureSample END,
@@ -3938,6 +4684,7 @@ export class JobQueue {
       )
       .run(
         retryAt,
+        matchingFailure ? 1 : 0,
         evidence?.failureAt ?? now,
         matchingFailure ? 1 : 0,
         signature?.failureClass ?? null,
@@ -4400,12 +5147,74 @@ export class JobQueue {
       retain?: number;
     } = {},
   ): number | null {
-    const now = coerceIsoTimestamp(ts) ?? new Date().toISOString();
+    const result = this.insertJobLog(jobId, message, ts, options);
+    return result.ok ? (result.logId ?? null) : null;
+  }
+
+  addClaimedLog(
+    jobId: string,
+    message: string,
+    authority: JobClaimAuthority,
+    ts?: string,
+  ): { ok: boolean; logId?: number | null; message?: string } {
+    return this.insertJobLog(
+      jobId,
+      message,
+      ts,
+      { claimGeneration: authority.claimGeneration },
+      authority,
+    );
+  }
+
+  private insertJobLog(
+    jobId: string,
+    message: string,
+    ts: string | undefined,
+    options: {
+      claimGeneration?: number;
+      category?: string;
+      dedupeKey?: string;
+      dedupeWindowMs?: number;
+      retain?: number;
+    },
+    authority?: JobClaimAuthority,
+  ): { ok: boolean; logId?: number | null; message?: string } {
+    const receivedAtMs = Date.now();
+    const receivedAt = new Date(receivedAtMs).toISOString();
+    const requestedAt = coerceIsoTimestamp(ts);
+    const requestedAtMs = parseIsoMs(requestedAt);
+    // Worker clocks are not liveness authority. Remote logs use server receipt
+    // time; trusted internal callers may retain a non-future event timestamp.
+    const now = authority
+      ? receivedAt
+      : requestedAt && requestedAtMs != null && requestedAtMs <= receivedAtMs
+        ? requestedAt
+        : receivedAt;
+    const boundedMessage = diagnosticText(message, 16_000);
+    if (!boundedMessage) return { ok: false, message: "message is required" };
     let insertedId: number | null = null;
-    const tx = this.db.transaction(() => {
-      const job = this.db.prepare(`SELECT claimGeneration FROM jobs WHERE id = ?`).get(jobId) as
-        | { claimGeneration: number | null }
+    const tx = this.db.transaction((): { ok: boolean; logId?: number | null; message?: string } => {
+      const job = this.db
+        .prepare(`SELECT status, workerId, claimGeneration FROM jobs WHERE id = ?`)
+        .get(jobId) as
+        | { status: JobStatus; workerId: string | null; claimGeneration: number | null }
         | undefined;
+      if (!job) return { ok: false, message: "Job not found" };
+      const acceptsWorkerLog =
+        job.status === "claimed" ||
+        job.status === "finalizing" ||
+        job.status === "completed" ||
+        job.status === "failed" ||
+        job.status === "abandoned" ||
+        job.status === "publish_blocked";
+      if (
+        authority &&
+        (!acceptsWorkerLog ||
+          job.workerId !== authority.workerId ||
+          Number(job.claimGeneration ?? 0) !== authority.claimGeneration)
+      ) {
+        return { ok: false, message: "Job not owned by this worker generation" };
+      }
       const claimGeneration = Number.isFinite(options.claimGeneration)
         ? Math.max(0, Math.floor(Number(options.claimGeneration)))
         : Math.max(0, Math.floor(Number(job?.claimGeneration ?? 0)));
@@ -4424,7 +5233,9 @@ export class JobQueue {
           .get(jobId, category, dedupeKey) as { ts: string } | undefined;
         const latestMs = parseIsoMs(latest?.ts);
         const nowMs = parseIsoMs(now) ?? Date.now();
-        if (latestMs != null && nowMs - latestMs < dedupeWindowMs) return;
+        if (latestMs != null && nowMs - latestMs < dedupeWindowMs) {
+          return { ok: true, logId: null };
+        }
       }
       const insertInfo = this.db
         .prepare(
@@ -4432,7 +5243,7 @@ export class JobQueue {
              jobId, ts, message, claimGeneration, category, dedupeKey
            ) VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(jobId, now, message, claimGeneration, category, dedupeKey);
+        .run(jobId, now, boundedMessage, claimGeneration, category, dedupeKey);
       const rawId = (insertInfo as { lastInsertRowid?: unknown }).lastInsertRowid;
       if (typeof rawId === "bigint") insertedId = Number(rawId);
       else if (typeof rawId === "number" && Number.isFinite(rawId)) insertedId = rawId;
@@ -4456,15 +5267,16 @@ export class JobQueue {
           `UPDATE jobs
            SET updatedAt = ?,
                startedAt = COALESCE(startedAt, ?),
-               firstLogAt = COALESCE(firstLogAt, ?)
+               firstLogAt = COALESCE(firstLogAt, ?),
+               lastActivityAt = ?
            WHERE id = ?
              AND status = 'claimed'
              AND COALESCE(claimGeneration, 0) = ?`,
         )
-        .run(now, now, now, jobId, claimGeneration);
+        .run(receivedAt, receivedAt, receivedAt, receivedAt, jobId, claimGeneration);
+      return { ok: true, logId: insertedId };
     });
-    tx();
-    return insertedId;
+    return tx();
   }
 
   listJobLogs(jobId: string, limit = 50, afterId?: number): JobLogRow[] {
@@ -4844,12 +5656,20 @@ export class JobQueue {
   saveJobDiagnostics(
     jobId: string,
     body: Record<string, unknown>,
+    authority?: JobClaimAuthority,
   ): { ok: boolean; message?: string; counts?: Record<string, number> } {
     const row = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(jobId) as
       | { status: JobStatus }
       | undefined;
     if (!row) return { ok: false, message: "Job not found" };
-    this.recordJobDiagnostics(jobId, body, row.status, new Date().toISOString());
+    try {
+      this.recordJobDiagnostics(jobId, body, row.status, new Date().toISOString(), authority);
+    } catch (error) {
+      if (error instanceof JobClaimAuthorityError) {
+        return { ok: false, message: error.message };
+      }
+      throw error;
+    }
     const diagnostics = this.getJobDiagnostics(jobId);
     return {
       ok: true,

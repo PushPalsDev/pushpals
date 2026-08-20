@@ -1,8 +1,17 @@
 import { EventEnvelope, PROTOCOL_VERSION } from "protocol";
 import { SessionManager, type SessionMessageResult } from "./events.js";
-import { JobQueue, resolveWorkerRuntimeCircuitRetryAfterMs } from "./jobs.js";
+import {
+  JOB_DEFERRAL_CONFLICT_CODE,
+  JOB_DEFERRAL_PERSISTENCE_FAILED_CODE,
+  MAX_JOB_WORKER_ID_LENGTH,
+  JobQueue,
+  normalizeJobWorkerId,
+  resolveWorkerRuntimeCircuitRetryAfterMs,
+  type JobClaimAuthority,
+  type RecoveredStaleJob,
+} from "./jobs.js";
 import { RequestQueue } from "./requests.js";
-import { CompletionQueue } from "./completions.js";
+import { COMPLETION_HANDOFF_CONFLICT_CODE, CompletionQueue } from "./completions.js";
 import { AutonomyStore } from "./autonomy.js";
 import {
   ClientPresenceRegistry,
@@ -511,6 +520,29 @@ export function createRequestHandler() {
         if (text.length <= maxChars) return text;
         return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
       };
+      const parseJobClaimAuthority = (
+        body: Record<string, unknown>,
+      ): { ok: true; authority: JobClaimAuthority } | { ok: false; message: string } => {
+        const workerId = normalizeJobWorkerId(body.workerId);
+        if (!workerId) {
+          return {
+            ok: false,
+            message:
+              typeof body.workerId === "string" && body.workerId.trim().length > 0
+                ? `workerId must be at most ${MAX_JOB_WORKER_ID_LENGTH} characters`
+                : "workerId is required",
+          };
+        }
+        const claimGeneration = body.claimGeneration;
+        if (
+          typeof claimGeneration !== "number" ||
+          !Number.isSafeInteger(claimGeneration) ||
+          claimGeneration < 1
+        ) {
+          return { ok: false, message: "claimGeneration must be a positive safe integer" };
+        }
+        return { ok: true, authority: { workerId, claimGeneration } };
+      };
       const parseJsonRecord = (value: unknown): Record<string, unknown> => {
         if (typeof value !== "string" || !value.trim()) return {};
         try {
@@ -756,6 +788,103 @@ export function createRequestHandler() {
             `${reopened.retryAt ?? "unknown"}.`,
         );
       };
+      const projectAuthoritativeJobFailure = (options: {
+        jobId: string;
+        message: string;
+        detail?: string | null;
+        ts?: string | null;
+        from: string;
+        notifyRuntimeCanary: boolean;
+      }): void => {
+        if (options.notifyRuntimeCanary) recordWorkerRuntimeCanaryFailure(options.jobId);
+
+        const job = jobQueue.getJob(options.jobId);
+        if (!job) return;
+        const params = parseJsonRecord(job.params ?? "");
+        const origin = deriveJobOrigin(params);
+        const requestId = compactText(params.requestId, 128);
+        if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, options.jobId);
+        const outcomeContext = autonomyStore.resolveJobOutcomeContext(options.jobId, params);
+        if (outcomeContext) {
+          autonomyStore.recordOutcome({
+            objectiveId: outcomeContext.objectiveId,
+            requestId: outcomeContext.requestId ?? requestId,
+            jobId: options.jobId,
+            patternKey: outcomeContext.patternKey,
+            success: false,
+            latencyMs: job.durationMs ?? null,
+            userAction: "failed",
+            reopenedWithin24h: false,
+            regressionFlag: true,
+          });
+        }
+
+        if (!job.sessionId) return;
+        const session = sessionManager.getSession(job.sessionId);
+        if (!session) return;
+        const message = compactText(options.message, 240) || "WorkerPal job failed";
+        const detail = compactText(options.detail, 600);
+        const envelope: EventEnvelope<"job_failed"> = {
+          protocolVersion: PROTOCOL_VERSION,
+          id: randomUUID(),
+          ts: options.ts || new Date().toISOString(),
+          sessionId: job.sessionId,
+          type: "job_failed",
+          from: options.from,
+          payload: {
+            jobId: options.jobId,
+            message,
+            origin,
+            ...(detail ? { detail } : {}),
+          },
+        };
+        session.emit(envelope);
+      };
+      const projectAuthoritativeClaimRecovery = (item: RecoveredStaleJob): void => {
+        if (item.action === "requeued") {
+          console.warn(
+            `[Server] Requeued retry-safe stale claimed job ${item.jobId} as ${item.replacementJobId ?? "unknown"} (worker=${item.workerId ?? "unknown"})`,
+          );
+          const replacementJobId = item.replacementJobId ?? null;
+          const replacement = replacementJobId ? jobQueue.getJob(replacementJobId) : null;
+          const source = jobQueue.getJob(item.jobId);
+          const params = parseJsonRecord(replacement?.params ?? source?.params ?? "");
+          const requestId = compactText(params.requestId, 128);
+          if (requestId && replacementJobId) {
+            autonomyStore.linkJobToObjectiveByRequest(requestId, replacementJobId);
+          }
+          if (replacementJobId) autonomyStore.markObjectiveRunningByJobId(replacementJobId);
+
+          const session = sessionManager.getSession(item.sessionId);
+          session?.emit({
+            protocolVersion: PROTOCOL_VERSION,
+            id: randomUUID(),
+            ts: item.recoveredAt,
+            sessionId: item.sessionId,
+            type: "log",
+            from: "server:stale-claim-recovery",
+            payload: {
+              level: "warn",
+              message:
+                `job ${item.jobId} was abandoned after a stale claim and requeued as ` +
+                `${replacementJobId ?? "unknown"} (${item.detail})`,
+            },
+          });
+          return;
+        }
+
+        console.warn(
+          `[Server] Recovered stale claimed job ${item.jobId} (worker=${item.workerId ?? "unknown"})`,
+        );
+        projectAuthoritativeJobFailure({
+          jobId: item.jobId,
+          message: item.message,
+          detail: item.detail,
+          ts: item.recoveredAt,
+          from: "server:stale-claim-recovery",
+          notifyRuntimeCanary: true,
+        });
+      };
       const autonomySimilarFailureSummary = (value: Record<string, unknown>) => {
         const details = extractAutonomyPayloadDetails(value);
         return jobQueue.similarFailureFingerprintSummary({
@@ -885,47 +1014,7 @@ export function createRequestHandler() {
         if (recovered.length === 0) return;
 
         for (const item of recovered) {
-          if (item.action === "requeued") {
-            console.warn(
-              `[Server] Requeued retry-safe stale claimed job ${item.jobId} as ${item.replacementJobId ?? "unknown"} (worker=${item.workerId ?? "unknown"})`,
-            );
-          } else {
-            console.warn(
-              `[Server] Recovered stale claimed job ${item.jobId} (worker=${item.workerId ?? "unknown"})`,
-            );
-          }
-          const session = sessionManager.getSession(item.sessionId);
-          if (!session) continue;
-
-          if (item.action === "requeued") {
-            session.emit({
-              protocolVersion: PROTOCOL_VERSION,
-              id: randomUUID(),
-              ts: item.recoveredAt,
-              sessionId: item.sessionId,
-              type: "log",
-              from: "server:stale-claim-recovery",
-              payload: {
-                level: "warn",
-                message: `job ${item.jobId} was abandoned after a stale claim and requeued as ${item.replacementJobId ?? "unknown"} (${item.detail})`,
-              },
-            });
-          } else {
-            const envelope: EventEnvelope<"job_failed"> = {
-              protocolVersion: PROTOCOL_VERSION,
-              id: randomUUID(),
-              ts: item.recoveredAt,
-              sessionId: item.sessionId,
-              type: "job_failed",
-              from: "server:stale-claim-recovery",
-              payload: {
-                jobId: item.jobId,
-                message: item.message,
-                detail: item.detail,
-              },
-            };
-            session.emit(envelope);
-          }
+          projectAuthoritativeClaimRecovery(item);
         }
       };
       const initiateShutdown = (reason: string): void => {
@@ -962,7 +1051,7 @@ export function createRequestHandler() {
       // Noisy poll endpoints: only log these at debug level.
       const isNoisyPoll =
         (method === "POST" &&
-          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/log|telemetry\/llm-usage)\/?$/.test(
+          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/(start|log)|telemetry\/llm-usage)\/?$/.test(
             pathname,
           )) ||
         (method === "GET" &&
@@ -1406,7 +1495,19 @@ export function createRequestHandler() {
         maybeRecoverStaleClaims();
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const workerId = (body.workerId as string) || "unknown";
+        const workerId = normalizeJobWorkerId(body.workerId);
+        if (!workerId) {
+          return makeJson(
+            {
+              ok: false,
+              message:
+                typeof body.workerId === "string" && body.workerId.trim().length > 0
+                  ? `workerId must be at most ${MAX_JOB_WORKER_ID_LENGTH} characters`
+                  : "workerId is required",
+            },
+            400,
+          );
+        }
         const claimedRuntimeGeneration = compactText(body.runtimeGeneration, 200);
         if (claimedRuntimeGeneration && claimedRuntimeGeneration !== WORKER_RUNTIME_GENERATION) {
           return makeJson(
@@ -1428,13 +1529,25 @@ export function createRequestHandler() {
           jobQueue.claim(workerId, { runtimeGeneration: WORKER_RUNTIME_GENERATION });
         let result = claimNextJob();
         while (result.ok && result.job?.id) {
+          // Re-run admission for a replay. The claim transaction can commit
+          // before a server crash, so replay alone is not proof that budget
+          // and circuit gates completed. Canary acquisition is idempotent for
+          // the exact same job/worker lease.
+          const claimAuthority: JobClaimAuthority = {
+            workerId,
+            claimGeneration: result.job.claimGeneration,
+          };
           const budgetStatus = getSessionTokenBudgetStatus(result.job.sessionId);
           if (budgetStatus?.exceeded) {
             emitSessionBudgetPauseNotice(result.job.sessionId, budgetStatus);
-            jobQueue.fail(result.job.id, {
-              message: "Session token budget exceeded",
-              detail: sessionTokenBudgetMessage(budgetStatus),
-            });
+            jobQueue.fail(
+              result.job.id,
+              {
+                message: "Session token budget exceeded",
+                detail: sessionTokenBudgetMessage(budgetStatus),
+              },
+              claimAuthority,
+            );
             skippedCount += 1;
             if (skippedCount >= MAX_INELIGIBLE_CLAIMS_PER_POLL) {
               return makeJson({ ok: true, job: null, skippedCount, scanLimitReached: true }, 200);
@@ -1450,14 +1563,18 @@ export function createRequestHandler() {
             const failureCircuit =
               cachedFailureCircuit ?? (cachedFailureCircuit = autonomyFailureCircuitSummary());
             if (failureCircuit.blocked) {
-              const deferred = jobQueue.defer(result.job.id, {
-                workerId,
-                deferMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
-                detail: JSON.stringify({
-                  code: "autonomy_worker_failure_circuit_open",
-                  ...failureCircuit,
-                }),
-              });
+              const deferred = jobQueue.defer(
+                result.job.id,
+                {
+                  workerId,
+                  deferMs: AUTONOMY_WORKER_FAILURE_DEFER_MS,
+                  detail: JSON.stringify({
+                    code: "autonomy_worker_failure_circuit_open",
+                    ...failureCircuit,
+                  }),
+                },
+                claimAuthority,
+              );
               if (!deferred.ok) {
                 return makeJson(
                   {
@@ -1478,14 +1595,18 @@ export function createRequestHandler() {
             }
             const similarFailure = autonomySimilarFailureSummary(jobPayload);
             if (similarFailure.blocked) {
-              const deferred = jobQueue.defer(result.job.id, {
-                workerId,
-                deferMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
-                detail: JSON.stringify({
-                  code: "autonomy_similar_failure_suppressed",
-                  ...similarFailure,
-                }),
-              });
+              const deferred = jobQueue.defer(
+                result.job.id,
+                {
+                  workerId,
+                  deferMs: AUTONOMY_SIMILAR_FAILURE_DEFER_MS,
+                  detail: JSON.stringify({
+                    code: "autonomy_similar_failure_suppressed",
+                    ...similarFailure,
+                  }),
+                },
+                claimAuthority,
+              );
               if (!deferred.ok) {
                 return makeJson(
                   {
@@ -1519,18 +1640,22 @@ export function createRequestHandler() {
                 WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
                 autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit.summary),
               );
-              const deferred = jobQueue.defer(result.job.id, {
-                workerId,
-                targetWorkerId: result.job.targetWorkerId ?? null,
-                deferMs: retryAfterMs,
-                reason: "worker_runtime_circuit_open",
-                detail: JSON.stringify({
-                  code: "worker_runtime_circuit_open",
-                  retryAfterMs,
-                  decision: runtimeCircuit.reason,
-                  ...runtimeCircuit.summary,
-                }),
-              });
+              const deferred = jobQueue.defer(
+                result.job.id,
+                {
+                  workerId,
+                  targetWorkerId: result.job.targetWorkerId ?? null,
+                  deferMs: retryAfterMs,
+                  reason: "worker_runtime_circuit_open",
+                  detail: JSON.stringify({
+                    code: "worker_runtime_circuit_open",
+                    retryAfterMs,
+                    decision: runtimeCircuit.reason,
+                    ...runtimeCircuit.summary,
+                  }),
+                },
+                claimAuthority,
+              );
               if (!deferred.ok) {
                 return makeJson(
                   {
@@ -1570,7 +1695,7 @@ export function createRequestHandler() {
                 runtimeGeneration: WORKER_RUNTIME_GENERATION,
               }
             : result,
-          result.ok ? 200 : 404,
+          result.ok ? 200 : result.code === "worker_runtime_generation_mismatch" ? 409 : 404,
         );
       }
 
@@ -1598,6 +1723,11 @@ export function createRequestHandler() {
           );
         }
         const result = jobQueue.heartbeat(body);
+        if (result.ok) {
+          for (const recovered of result.recoveredJobs ?? []) {
+            projectAuthoritativeClaimRecovery(recovered);
+          }
+        }
         return makeJson(result, result.ok ? 200 : 400);
       }
 
@@ -2400,9 +2530,11 @@ export function createRequestHandler() {
 
         const jobId = jobDiagnosticsMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
         try {
-          const result = jobQueue.saveJobDiagnostics(jobId, body);
-          return makeJson(result, result.ok ? 200 : 404);
+          const result = jobQueue.saveJobDiagnostics(jobId, body, parsedAuthority.authority);
+          return makeJson(result, result.ok ? 200 : 409);
         } catch (error) {
           console.error(
             `[Server] Failed to persist diagnostics for job ${jobId}: ${
@@ -2457,6 +2589,20 @@ export function createRequestHandler() {
           : makeJson({ ok: false, message: "Completion not found" }, 404);
       }
 
+      // POST /jobs/:id/start
+      const jobStartMatch = pathname.match(/^\/jobs\/([^/]+)\/start$/);
+      if (jobStartMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const jobId = jobStartMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = jobQueue.startClaimedExecution(jobId, parsedAuthority.authority);
+        return makeJson(result, result.ok ? 200 : 409);
+      }
+
       // POST /jobs/:id/complete
       const jobCompleteMatch = pathname.match(/^\/jobs\/([^/]+)\/complete$/);
       if (jobCompleteMatch && method === "POST") {
@@ -2465,8 +2611,10 @@ export function createRequestHandler() {
 
         const jobId = jobCompleteMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = jobQueue.complete(jobId, body);
-        if (result.ok) {
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = jobQueue.complete(jobId, body, parsedAuthority.authority);
+        if (result.ok && !result.replayed) {
           recordWorkerRuntimeCanarySuccess(jobId);
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
@@ -2492,7 +2640,7 @@ export function createRequestHandler() {
             });
           }
         }
-        return makeJson(result, result.ok ? 200 : 400);
+        return makeJson(result, result.ok ? 200 : 409);
       }
 
       // POST /jobs/:id/fail
@@ -2503,8 +2651,10 @@ export function createRequestHandler() {
 
         const jobId = jobFailMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = jobQueue.fail(jobId, body);
-        if (result.ok) {
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = jobQueue.fail(jobId, body, parsedAuthority.authority);
+        if (result.ok && !result.replayed) {
           recordWorkerRuntimeCanaryFailure(jobId);
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
@@ -2553,7 +2703,7 @@ export function createRequestHandler() {
             }
           }
         }
-        return makeJson(result, result.ok ? 200 : 400);
+        return makeJson(result, result.ok ? 200 : 409);
       }
 
       // POST /jobs/:id/publish-blocked
@@ -2564,8 +2714,10 @@ export function createRequestHandler() {
 
         const jobId = jobPublishBlockedMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = jobQueue.publishBlocked(jobId, body);
-        if (result.ok) {
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = jobQueue.publishBlocked(jobId, body, parsedAuthority.authority);
+        if (result.ok && !result.replayed) {
           recordWorkerRuntimeCanarySuccess(jobId);
           const durationText =
             typeof result.durationMs === "number" ? `${result.durationMs}ms` : "unknown duration";
@@ -2614,7 +2766,7 @@ export function createRequestHandler() {
             }
           }
         }
-        return makeJson(result, result.ok ? 200 : 400);
+        return makeJson(result, result.ok ? 200 : 409);
       }
 
       // POST /jobs/:id/fail-deferred
@@ -2625,11 +2777,24 @@ export function createRequestHandler() {
 
         const jobId = jobFailDeferredMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = jobQueue.failDeferred(jobId, body);
-        if (result.ok) {
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = jobQueue.failDeferred(jobId, body, parsedAuthority.authority);
+        if (result.ok && !result.replayed) {
           console.log(`[Server] Deferred job ${jobId} failed during pre-execution maintenance`);
+          projectAuthoritativeJobFailure({
+            jobId,
+            message: compactText(body.message, 240) || "Deferred WorkerPal job failed",
+            detail: compactText(body.detail, 600),
+            ts: result.failedAt,
+            from: "server:job-fail-deferred",
+            notifyRuntimeCanary: true,
+          });
         }
-        return makeJson(result, result.ok ? 200 : 400);
+        return makeJson(
+          result,
+          result.ok ? 200 : result.code === JOB_DEFERRAL_CONFLICT_CODE ? 409 : 400,
+        );
       }
 
       // POST /jobs/:id/defer
@@ -2640,13 +2805,24 @@ export function createRequestHandler() {
 
         const jobId = jobDeferMatch[1];
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = jobQueue.defer(jobId, body);
-        if (result.ok) {
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = jobQueue.defer(jobId, body, parsedAuthority.authority);
+        if (result.ok && !result.replayed) {
           console.log(
             `[Server] Job ${jobId} deferred until ${result.availableAt ?? "unknown"} by worker ${String(body.workerId ?? "unknown")}`,
           );
         }
-        return makeJson(result, result.ok ? 200 : 400);
+        return makeJson(
+          result,
+          result.ok
+            ? 200
+            : result.code === JOB_DEFERRAL_CONFLICT_CODE
+              ? 409
+              : result.code === JOB_DEFERRAL_PERSISTENCE_FAILED_CODE
+                ? 500
+                : 400,
+        );
       }
 
       // POST /jobs/:id/log
@@ -2668,11 +2844,15 @@ export function createRequestHandler() {
         if (!trimmed) {
           return makeJson({ ok: false, message: "message is required" }, 400);
         }
-        const claimGeneration = Number(body.claimGeneration);
-        const logId = jobQueue.addLog(jobId, trimmed, logTs || undefined, {
-          ...(Number.isInteger(claimGeneration) && claimGeneration >= 0 ? { claimGeneration } : {}),
-        });
-        return makeJson({ ok: true, jobId, logId }, 200);
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = jobQueue.addClaimedLog(
+          jobId,
+          trimmed,
+          parsedAuthority.authority,
+          logTs || undefined,
+        );
+        return makeJson(result.ok ? { ...result, jobId } : result, result.ok ? 200 : 409);
       }
 
       // ── Request queue endpoints (auth protected) ────────────────────────────
@@ -3164,7 +3344,12 @@ export function createRequestHandler() {
         if (denied) return denied;
 
         const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-        const result = completionQueue.enqueue(body, { beginJobFinalization: true });
+        const parsedAuthority = parseJobClaimAuthority(body);
+        if (!parsedAuthority.ok) return makeJson(parsedAuthority, 400);
+        const result = completionQueue.enqueue(body, {
+          beginJobFinalization: true,
+          jobClaimAuthority: parsedAuthority.authority,
+        });
         if (result.ok) {
           const jobId = compactText(body.jobId, 128);
           if (jobId) {
@@ -3175,7 +3360,10 @@ export function createRequestHandler() {
             );
           }
         }
-        return makeJson(result, result.ok ? 201 : 400);
+        return makeJson(
+          result,
+          result.ok ? 201 : result.code === COMPLETION_HANDOFF_CONFLICT_CODE ? 409 : 400,
+        );
       }
 
       // POST /completions/claim

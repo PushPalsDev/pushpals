@@ -10,6 +10,26 @@ export type CompletionCallbackResult = {
   lastError: string | null;
 };
 
+/**
+ * A successful HTTP status is only transport-level success. Completion
+ * mutations are authoritative only when the server also returns its explicit
+ * positive acknowledgement.
+ */
+export async function parseCompletionPositiveAck(
+  response: Response,
+): Promise<CompletionCallbackResponse> {
+  const payload: unknown = await response.json().catch(() => null);
+  const explicitlyAcknowledged =
+    typeof payload === "object" &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    (payload as Record<string, unknown>).ok === true;
+  return {
+    ok: response.ok && explicitlyAcknowledged,
+    status: response.status,
+  };
+}
+
 export async function withHardDeadline<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,

@@ -83,6 +83,24 @@ type WorkerJobResult = JobResult & {
   cooldownMs?: number;
 };
 
+export type WorkerJobClaimAuthority = {
+  workerId: string;
+  claimGeneration: number;
+};
+
+export type CompletionEnqueueOutcome = {
+  ok: boolean;
+  authorityRejected: boolean;
+  outcomeUnconfirmed: boolean;
+};
+
+export type WorkerTerminalPersistenceOutcome = {
+  ok: boolean;
+  authorityRejected: boolean;
+  outcomeUnconfirmed: boolean;
+  message?: string;
+};
+
 const DEFAULT_LLM_MODEL = "local-model";
 const CODEX_UNAVAILABLE_WORKER_EXIT_CODE = 86;
 const CODEX_STARTUP_STALL_WORKER_EXIT_CODE = 87;
@@ -90,8 +108,44 @@ const CODEX_UNAVAILABLE_DOCKER_SHUTDOWN_GRACE_MS = 5_000;
 const CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS = 4_000;
 const CODEX_STARTUP_STALL_DIRECT_RETRY_DEFER_MS = 5_000;
 const DEFAULT_JOB_PROGRESS_LOG_EVERY_MS = 60_000;
+const MAINTENANCE_DEFER_TRANSPORT_ATTEMPTS = 2;
+const MAINTENANCE_DEFER_RETRY_DELAY_MS = 150;
+const EXECUTION_START_CONFIRMATION_ATTEMPTS = 2;
+const EXECUTION_START_RETRY_DELAY_MS = 150;
+const TERMINAL_PERSISTENCE_ATTEMPTS = 3;
+const TERMINAL_PERSISTENCE_RETRY_DELAY_MS = 150;
+const MAX_WORKER_ID_LENGTH = 128;
 const CONFIG = loadPushPalsConfig();
 const LOG = new Logger("WorkerPals");
+
+export function normalizeWorkerPalId(value: unknown): string {
+  if (typeof value !== "string") throw new TypeError("Worker ID must be a non-empty string");
+  const workerId = value.trim();
+  if (!workerId) throw new TypeError("Worker ID must be a non-empty string");
+  if (workerId.length > MAX_WORKER_ID_LENGTH) {
+    throw new TypeError(`Worker ID must be at most ${MAX_WORKER_ID_LENGTH} characters`);
+  }
+  return workerId;
+}
+
+export function buildWorkerJobClaimAuthority(
+  workerId: string,
+  claimGeneration: unknown,
+): WorkerJobClaimAuthority {
+  if (
+    typeof claimGeneration !== "number" ||
+    !Number.isSafeInteger(claimGeneration) ||
+    claimGeneration < 1
+  ) {
+    throw new TypeError(
+      `Worker job claim generation must be a positive safe integer; received ${String(claimGeneration)}`,
+    );
+  }
+  return {
+    workerId: normalizeWorkerPalId(workerId),
+    claimGeneration,
+  };
+}
 
 function workerLlmConfig(runtimeConfig: ReturnType<typeof loadPushPalsConfig>): {
   model: string;
@@ -163,10 +217,85 @@ export async function postJsonWithTimeout(
   });
 }
 
+function isRetryableWorkerControlPlaneStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+export async function persistWorkerTerminalStatus(
+  url: string,
+  headers: Record<string, string>,
+  body: Readonly<Record<string, unknown>>,
+  options: { attempts?: number; timeoutMs?: number; retryDelayMs?: number } = {},
+): Promise<WorkerTerminalPersistenceOutcome> {
+  const attempts = Math.max(1, Math.floor(options.attempts ?? TERMINAL_PERSISTENCE_ATTEMPTS));
+  const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? 10_000));
+  const retryDelayMs = Math.max(
+    0,
+    Math.floor(options.retryDelayMs ?? TERMINAL_PERSISTENCE_RETRY_DELAY_MS),
+  );
+  let lastMessage = "terminal persistence transport failed";
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await postJsonWithTimeout(url, headers, body, timeoutMs);
+      const responseText = (await response.text().catch(() => "")).trim();
+      let responsePayload: Record<string, unknown> | null = null;
+      if (responseText) {
+        try {
+          const parsed = JSON.parse(responseText) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            responsePayload = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // A malformed successful response is not an acknowledgement.
+        }
+      }
+      if (response.ok && responsePayload?.ok === true) {
+        return { ok: true, authorityRejected: false, outcomeUnconfirmed: false };
+      }
+
+      lastMessage = `${response.status}${responseText ? ` ${responseText}` : ""}`;
+      if (response.status === 409) {
+        return {
+          ok: false,
+          authorityRejected: true,
+          outcomeUnconfirmed: false,
+          message: lastMessage,
+        };
+      }
+      if (!response.ok && !isRetryableWorkerControlPlaneStatus(response.status)) {
+        return {
+          ok: false,
+          authorityRejected: false,
+          outcomeUnconfirmed: true,
+          message: lastMessage,
+        };
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : String(error);
+    }
+
+    if (attempt < attempts) {
+      console.warn(
+        `[WorkerPals] Terminal persistence attempt ${attempt}/${attempts} did not confirm; retrying the identical request.`,
+      );
+      await Bun.sleep(retryDelayMs * attempt);
+    }
+  }
+
+  return {
+    ok: false,
+    authorityRejected: false,
+    outcomeUnconfirmed: true,
+    message: lastMessage,
+  };
+}
+
 async function persistWorkerDiagnostics(
   server: string,
   headers: Record<string, string>,
   jobId: string,
+  authority: WorkerJobClaimAuthority,
   diagnostics: JobDiagnostics | undefined,
 ): Promise<boolean> {
   if (!diagnostics) return true;
@@ -176,7 +305,7 @@ async function persistWorkerDiagnostics(
     const response = await postJsonWithTimeout(
       `${server}/jobs/${jobId}/diagnostics`,
       headers,
-      { diagnostics },
+      { ...authority, diagnostics },
       5_000,
     );
     const payload = (await response.json().catch(() => null)) as {
@@ -628,6 +757,36 @@ export function buildUnhandledWorkerFailureResult(
   };
 }
 
+export function buildWorkerPreparationFailureResult(
+  error: unknown,
+  executorBackend = resolveExecutor(CONFIG),
+): WorkerJobResult {
+  const detail = redactSensitiveText(
+    error instanceof Error ? error.stack || error.message : String(error),
+  );
+  const summary = `Job preparation failed before execution: ${compactWorkerError(error)}`;
+  return {
+    ok: false,
+    summary,
+    stderr: detail,
+    diagnostics: {
+      terminal: {
+        failureClass: "worker_preparation_failure",
+        terminalStage: "preparation",
+        executorBackend,
+        summary,
+        watchdogFired: false,
+        metadata: {
+          classificationOwner: "workerpals_main",
+          structuredResult: true,
+          executionInvoked: false,
+          errorName: error instanceof Error ? error.name : typeof error,
+        },
+      },
+    },
+  };
+}
+
 function hasExplicitNoPublishableResult(text: string): boolean {
   return (
     /\bno publishable[^\r\n]{0,80}\b(?:changes?|patch|progress)\b/.test(text) ||
@@ -731,10 +890,12 @@ export function shouldEmitDirectSessionJobEvent(options: {
   ok: boolean;
   statusPersistedToServer: boolean;
   finalizing?: boolean;
+  authorityRejected?: boolean;
 }): boolean {
+  if (options.authorityRejected) return false;
   if (options.finalizing) return false;
-  if (options.ok) return true;
-  return !options.statusPersistedToServer;
+  if (!options.statusPersistedToServer) return false;
+  return options.ok;
 }
 
 export function shouldRecycleWorkerForHeartbeatDegradation(options: {
@@ -916,7 +1077,7 @@ function parseArgs(): {
     pollMs,
     heartbeatMs: Number.isFinite(heartbeatMs) && heartbeatMs > 0 ? heartbeatMs : pollMs,
     repo,
-    workerId,
+    workerId: normalizeWorkerPalId(workerId),
     authToken: resolved.authToken,
     docker,
     requireDocker,
@@ -1597,11 +1758,12 @@ export async function enqueueCompletion(
     taskId: string;
     kind: string;
     sessionId: string;
+    claimGeneration: number;
     params?: Record<string, unknown>;
   },
   commit: CommitRef,
   result: WorkerJobResult,
-): Promise<boolean> {
+): Promise<CompletionEnqueueOutcome> {
   try {
     const reviewAgent =
       job.params?.reviewAgent && typeof job.params.reviewAgent === "object"
@@ -1655,6 +1817,7 @@ export async function enqueueCompletion(
     );
 
     const payload = {
+      ...buildWorkerJobClaimAuthority(workerId, job.claimGeneration),
       jobId: job.id,
       sessionId: job.sessionId,
       origin: taskExecuteOrigin(job.params),
@@ -1673,6 +1836,8 @@ export async function enqueueCompletion(
     };
 
     let lastDetail = "no response";
+    let authorityRejected = false;
+    let outcomeUnconfirmed = false;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         const response = await postJsonWithTimeout(
@@ -1680,33 +1845,52 @@ export async function enqueueCompletion(
           headers,
           payload,
         );
-        if (response.ok) {
+        const responseText = (await response.text().catch(() => "")).trim();
+        let responsePayload: Record<string, unknown> | null = null;
+        if (responseText) {
+          try {
+            const parsed = JSON.parse(responseText) as unknown;
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              responsePayload = parsed as Record<string, unknown>;
+            }
+          } catch {
+            // A malformed successful response is not an acknowledgement.
+          }
+        }
+        if (response.ok && responsePayload?.ok === true) {
           console.log(
             `[WorkerPals] Enqueued completion for job ${job.id} (commit ${commit.sha})${
               attempt > 1 ? ` after ${attempt} attempts` : ""
             }`,
           );
-          return true;
+          return { ok: true, authorityRejected: false, outcomeUnconfirmed: false };
         }
-        lastDetail = `${response.status} ${await response.text()}`.trim();
+        authorityRejected = response.status === 409;
+        lastDetail = `${response.status}${responseText ? ` ${responseText}` : ""}`;
+        if (authorityRejected) {
+          return { ok: false, authorityRejected: true, outcomeUnconfirmed: false };
+        }
+        if (response.ok) outcomeUnconfirmed = true;
         const retryable =
           response.status === 408 || response.status === 429 || response.status >= 500;
-        if (!retryable) break;
+        if (!response.ok && !outcomeUnconfirmed && !retryable) break;
       } catch (error) {
+        outcomeUnconfirmed = true;
         lastDetail = error instanceof Error ? error.message : String(error);
       }
       if (attempt < 3) await Bun.sleep(150 * attempt);
     }
     console.error(`[WorkerPals] Failed to enqueue completion: ${lastDetail}`);
-    return false;
+    return { ok: false, authorityRejected, outcomeUnconfirmed };
   } catch (err) {
     console.error(`[WorkerPals] Failed to enqueue completion:`, err);
-    return false;
+    return { ok: false, authorityRejected: false, outcomeUnconfirmed: true };
   }
 }
 
 type WorkerRuntimeState = {
   currentJobId: string | null;
+  currentClaimGeneration: number | null;
   currentSessionId: string | null;
   shutdownRequested: boolean;
 };
@@ -1726,17 +1910,29 @@ async function failActiveJobOnShutdown(
 ): Promise<void> {
   const activeJobId = runtimeState.currentJobId;
   if (!activeJobId) return;
+  const authority = buildWorkerJobClaimAuthority(
+    opts.workerId,
+    runtimeState.currentClaimGeneration,
+  );
 
   const message = "Worker process shutting down during claimed job";
   const detail = `worker=${opts.workerId}; signal=${signalName}; action=fail-claimed-job-on-shutdown`;
   let statusPersistedToServer = false;
+  let authorityRejected = false;
 
   try {
-    const response = await postJsonWithTimeout(`${opts.server}/jobs/${activeJobId}/fail`, headers, {
-      message,
-      detail,
-    });
-    statusPersistedToServer = response.ok;
+    const persistence = await persistWorkerTerminalStatus(
+      `${opts.server}/jobs/${activeJobId}/fail`,
+      headers,
+      {
+        ...authority,
+        message,
+        detail,
+      },
+      { attempts: 3, timeoutMs: 700, retryDelayMs: 75 },
+    );
+    statusPersistedToServer = persistence.ok;
+    authorityRejected = persistence.authorityRejected;
   } catch (err) {
     console.error(
       `[WorkerPals] Failed to mark active job ${activeJobId} as failed during shutdown:`,
@@ -1746,7 +1942,11 @@ async function failActiveJobOnShutdown(
 
   if (
     runtimeState.currentSessionId &&
-    shouldEmitDirectSessionJobEvent({ ok: false, statusPersistedToServer })
+    shouldEmitDirectSessionJobEvent({
+      ok: false,
+      statusPersistedToServer,
+      authorityRejected,
+    })
   ) {
     await transport.queueSessionCommand(
       runtimeState.currentSessionId,
@@ -1768,42 +1968,142 @@ async function deferClaimedJobForMaintenance(
   opts: ReturnType<typeof parseArgs>,
   headers: Record<string, string>,
   jobId: string,
+  authority: WorkerJobClaimAuthority,
   deferMs: number,
   options: { targetWorkerId?: string | null; reason?: string } = {},
-): Promise<{ ok: boolean; availableAt?: string; message?: string }> {
-  try {
-    const body: Record<string, unknown> = {
-      workerId: opts.workerId,
-      deferMs,
-    };
-    if (Object.prototype.hasOwnProperty.call(options, "targetWorkerId")) {
-      body.targetWorkerId = options.targetWorkerId;
-    }
-    if (options.reason) {
-      body.reason = options.reason;
-    }
-    const response = await postJsonWithTimeout(`${opts.server}/jobs/${jobId}/defer`, headers, body);
-    const payload = (await response.json().catch(() => ({}))) as {
-      ok?: boolean;
-      availableAt?: string;
-      message?: string;
-    };
-    if (!response.ok || !payload.ok) {
-      return {
-        ok: false,
-        message: payload.message || `HTTP ${response.status}`,
-      };
-    }
-    return {
-      ok: true,
-      availableAt: payload.availableAt,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      message: error instanceof Error ? error.message : String(error),
-    };
+): Promise<{
+  ok: boolean;
+  availableAt?: string;
+  message?: string;
+  authorityRejected?: boolean;
+  transportAmbiguous?: boolean;
+}> {
+  const body: Record<string, unknown> = {
+    ...authority,
+    deferMs,
+  };
+  if (Object.prototype.hasOwnProperty.call(options, "targetWorkerId")) {
+    body.targetWorkerId = options.targetWorkerId;
   }
+  if (options.reason) {
+    body.reason = options.reason;
+  }
+
+  let lastFailureMessage = "unknown transport error";
+  let sawTransportFailure = false;
+  for (let attempt = 1; attempt <= MAINTENANCE_DEFER_TRANSPORT_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await postJsonWithTimeout(
+        `${opts.server}/jobs/${jobId}/defer`,
+        headers,
+        body,
+      );
+      const payload = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        availableAt?: string;
+        message?: string;
+      };
+      if (response.ok && payload.ok) {
+        return {
+          ok: true,
+          availableAt: payload.availableAt,
+        };
+      }
+      if (response.ok) {
+        sawTransportFailure = true;
+        lastFailureMessage = payload.message || "HTTP 2xx response omitted deferral confirmation";
+      } else {
+        const message = payload.message || `HTTP ${response.status}`;
+        if (response.status === 409) {
+          return {
+            ok: false,
+            message,
+            authorityRejected: true,
+          };
+        }
+        // Once a request may have reached the server, a later rejection cannot
+        // prove that the first attempt did not commit. Only an exact successful
+        // replay or an ownership conflict makes the outcome definitive.
+        if (!sawTransportFailure) {
+          return {
+            ok: false,
+            message,
+          };
+        }
+        lastFailureMessage = message;
+      }
+    } catch (error) {
+      sawTransportFailure = true;
+      lastFailureMessage = error instanceof Error ? error.message : String(error);
+    }
+    if (attempt < MAINTENANCE_DEFER_TRANSPORT_ATTEMPTS) {
+      console.warn(
+        `[WorkerPals] Maintenance deferral response for job ${jobId} was lost; retrying the identical request (${attempt + 1}/${MAINTENANCE_DEFER_TRANSPORT_ATTEMPTS}).`,
+      );
+      await Bun.sleep(MAINTENANCE_DEFER_RETRY_DELAY_MS);
+    }
+  }
+
+  return {
+    ok: false,
+    message: lastFailureMessage,
+    transportAmbiguous: true,
+  };
+}
+
+async function confirmClaimedJobExecutionStart(
+  opts: ReturnType<typeof parseArgs>,
+  headers: Record<string, string>,
+  jobId: string,
+  authority: WorkerJobClaimAuthority,
+): Promise<{
+  ok: boolean;
+  message?: string;
+  authorityRejected?: boolean;
+  transportAmbiguous?: boolean;
+}> {
+  let lastFailureMessage = "execution-start confirmation failed";
+  let sawTransportFailure = false;
+  for (let attempt = 1; attempt <= EXECUTION_START_CONFIRMATION_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await postJsonWithTimeout(
+        `${opts.server}/jobs/${jobId}/start`,
+        headers,
+        authority,
+      );
+      const payload = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        message?: string;
+      };
+      if (response.ok && payload.ok === true) return { ok: true };
+
+      const message = payload.message || `HTTP ${response.status}`;
+      if (response.status === 409) {
+        return { ok: false, message, authorityRejected: true };
+      }
+      if (!sawTransportFailure && !response.ok) {
+        return { ok: false, message };
+      }
+      sawTransportFailure = true;
+      lastFailureMessage = message;
+    } catch (error) {
+      sawTransportFailure = true;
+      lastFailureMessage = error instanceof Error ? error.message : String(error);
+    }
+
+    if (attempt < EXECUTION_START_CONFIRMATION_ATTEMPTS) {
+      console.warn(
+        `[WorkerPals] Execution-start response for job ${jobId} was lost; retrying the identical request (${attempt + 1}/${EXECUTION_START_CONFIRMATION_ATTEMPTS}).`,
+      );
+      await Bun.sleep(EXECUTION_START_RETRY_DELAY_MS);
+    }
+  }
+
+  return {
+    ok: false,
+    message: lastFailureMessage,
+    transportAmbiguous: sawTransportFailure,
+  };
 }
 
 async function workerLoop(
@@ -1883,10 +2183,46 @@ async function workerLoop(
         const job = data.job;
 
         if (job) {
+          let claimAuthority: WorkerJobClaimAuthority;
+          try {
+            claimAuthority = buildWorkerJobClaimAuthority(opts.workerId, job.claimGeneration);
+          } catch (error) {
+            console.error(
+              `[WorkerPals] Refusing to execute job ${String(job.id ?? "<unknown>")} with invalid claim authority: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            requestWorkerRestart(
+              `invalid claim authority returned for job ${String(job.id ?? "<unknown>")}`,
+            );
+            continue;
+          }
+
           if (dockerExecutor && dockerExecutor.shouldPrepareMergeConflictJobBeforeExecution(job)) {
             const deferMs = dockerExecutor.recommendedMergeConflictDeferMs();
-            const deferred = await deferClaimedJobForMaintenance(opts, headers, job.id, deferMs);
+            const deferred = await deferClaimedJobForMaintenance(
+              opts,
+              headers,
+              job.id,
+              claimAuthority,
+              deferMs,
+            );
             if (!deferred.ok) {
+              if (deferred.authorityRejected) {
+                console.warn(
+                  `[WorkerPals] Merge-conflict deferral for job ${job.id} was rejected because this worker no longer owns the claim; skipping stale execution.`,
+                );
+                continue;
+              }
+              if (deferred.transportAmbiguous) {
+                console.error(
+                  `[WorkerPals] Merge-conflict deferral for job ${job.id} remained transport-ambiguous after bounded retries; refusing stale execution and recycling this worker.`,
+                );
+                requestWorkerRestart(
+                  `maintenance deferral outcome remained ambiguous for job ${job.id}`,
+                );
+                continue;
+              }
               console.warn(
                 `[WorkerPals] Failed to defer merge-conflict job ${job.id} for image refresh; falling back to claimed execution path: ${
                   deferred.message || "unknown error"
@@ -1921,33 +2257,26 @@ async function workerLoop(
                 console.error(
                   `[WorkerPals] Merge-conflict environment preparation failed for ${job.id}: ${detail}`,
                 );
-                try {
-                  const failResponse = await postJsonWithTimeout(
-                    `${opts.server}/jobs/${job.id}/fail-deferred`,
-                    headers,
-                    {
-                      workerId: opts.workerId,
-                      message: "Merge-conflict environment preparation failed",
-                      detail,
-                    },
-                  );
-                  const failPayload = (await failResponse.json().catch(() => ({}))) as {
-                    ok?: boolean;
-                    message?: string;
-                  };
-                  if (!failResponse.ok || !failPayload.ok) {
-                    console.error(
-                      `[WorkerPals] Failed to mark deferred job ${job.id} as failed: ${
-                        failPayload.message || `HTTP ${failResponse.status}`
-                      }`,
-                    );
-                  }
-                } catch (failErr) {
+                const deferredFailure = await persistWorkerTerminalStatus(
+                  `${opts.server}/jobs/${job.id}/fail-deferred`,
+                  headers,
+                  {
+                    ...claimAuthority,
+                    message: "Merge-conflict environment preparation failed",
+                    detail,
+                  },
+                );
+                if (!deferredFailure.ok) {
                   console.error(
                     `[WorkerPals] Failed to mark deferred job ${job.id} as failed: ${
-                      failErr instanceof Error ? failErr.message : String(failErr)
+                      deferredFailure.message || "unconfirmed persistence outcome"
                     }`,
                   );
+                  if (!deferredFailure.authorityRejected) {
+                    requestWorkerRestart(
+                      `deferred preparation failure persistence remained unconfirmed for job ${job.id}`,
+                    );
+                  }
                 }
               } finally {
                 clearInterval(maintenanceHeartbeat);
@@ -1957,7 +2286,36 @@ async function workerLoop(
             }
           }
 
+          const executionStart = await confirmClaimedJobExecutionStart(
+            opts,
+            headers,
+            job.id,
+            claimAuthority,
+          );
+          if (!executionStart.ok) {
+            if (executionStart.authorityRejected) {
+              console.warn(
+                `[WorkerPals] Execution start for job ${job.id} was rejected because this worker no longer owns the claim; skipping stale execution.`,
+              );
+              continue;
+            }
+            console.error(
+              `[WorkerPals] Execution start for job ${job.id} was not confirmed; refusing execution and recycling this worker: ${
+                executionStart.message || "unknown error"
+              }`,
+            );
+            requestWorkerRestart(
+              `${
+                executionStart.transportAmbiguous
+                  ? "execution-start outcome remained ambiguous"
+                  : "execution-start persistence failed"
+              } for job ${job.id}`,
+            );
+            continue;
+          }
+
           runtimeState.currentJobId = job.id;
+          runtimeState.currentClaimGeneration = claimAuthority.claimGeneration;
           runtimeState.currentSessionId = job.sessionId ?? null;
           console.log(`[WorkerPals] Claimed job ${job.id} (${job.kind})`);
           await maybeHeartbeat("busy", job.id, true);
@@ -2051,7 +2409,7 @@ async function workerLoop(
                   seq,
                   message: cleaned,
                   ts: logTs,
-                  claimGeneration: Number(job.claimGeneration ?? 0),
+                  claimGeneration: claimAuthority.claimGeneration,
                 });
                 return true;
               }
@@ -2087,36 +2445,72 @@ async function workerLoop(
           let executionRepo = opts.repo;
           let result: WorkerJobResult | null = null;
           let recycleWorkerAfterJob = false;
+          let recycleWorkerAfterUnconfirmedTerminal = false;
 
           try {
-            let parsedParams =
-              typeof job.params === "string"
-                ? (JSON.parse(job.params) as Record<string, unknown>)
-                : job.params;
+            let parsedParams: Record<string, unknown>;
+            const preparationStartedAtMs = Date.now();
+            try {
+              parsedParams =
+                typeof job.params === "string"
+                  ? (JSON.parse(job.params) as Record<string, unknown>)
+                  : job.params;
 
-            if (!dockerExecutor) {
-              const jobBaseRef = await resolveWorktreeBaseRefForJob(
-                opts.repo,
-                opts.worktreeBaseRef,
-                job.id,
-                parsedParams,
-              );
-              directWorktreePath = await createIsolatedWorktree(
-                opts.repo,
-                job.id,
-                jobBaseRef,
-                onLog,
-              );
-              executionRepo = directWorktreePath;
-              if (isMergeConflictResolutionParams(parsedParams)) {
-                const prepared = await prepareMergeConflictWorktreeOnHost(
-                  executionRepo,
+              if (!dockerExecutor) {
+                const jobBaseRef = await resolveWorktreeBaseRefForJob(
+                  opts.repo,
+                  opts.worktreeBaseRef,
                   job.id,
                   parsedParams,
+                );
+                directWorktreePath = await createIsolatedWorktree(
+                  opts.repo,
+                  job.id,
+                  jobBaseRef,
                   onLog,
                 );
-                parsedParams = applyMergeConflictExecutionHints(parsedParams, prepared);
+                executionRepo = directWorktreePath;
+                if (isMergeConflictResolutionParams(parsedParams)) {
+                  const prepared = await prepareMergeConflictWorktreeOnHost(
+                    executionRepo,
+                    job.id,
+                    parsedParams,
+                    onLog,
+                  );
+                  parsedParams = applyMergeConflictExecutionHints(parsedParams, prepared);
+                }
               }
+            } catch (preparationError) {
+              result = buildWorkerPreparationFailureResult(preparationError);
+              const preparationDurationMs = Math.max(0, Date.now() - preparationStartedAtMs);
+              allowHeartbeatRecycle = false;
+              await transport.flush();
+              const persistence = await persistWorkerTerminalStatus(
+                `${opts.server}/jobs/${job.id}/fail`,
+                headers,
+                {
+                  ...claimAuthority,
+                  message: result.summary,
+                  detail: redactSensitiveText(result.stderr ?? ""),
+                  durationMs: preparationDurationMs,
+                  diagnostics: result.diagnostics,
+                },
+              );
+              if (persistence.ok) {
+                console.error(
+                  `[WorkerPals] Job ${job.id} failed during preparation after ${formatDurationMs(preparationDurationMs)}: ${result.summary}`,
+                );
+              } else if (persistence.authorityRejected) {
+                console.warn(
+                  `[WorkerPals] Preparation failure for job ${job.id} was rejected because this worker no longer owns the claim; suppressing stale terminal projection.`,
+                );
+              } else {
+                recycleWorkerAfterUnconfirmedTerminal = true;
+                console.error(
+                  `[WorkerPals] Preparation failure persistence for job ${job.id} remained unconfirmed after bounded attempts; suppressing direct terminal projection and recycling this worker.`,
+                );
+              }
+              continue;
             }
 
             const jobData = {
@@ -2264,8 +2658,10 @@ async function workerLoop(
             ));
 
             let completionEnqueued = false;
+            let completionAuthorityRejected = false;
+            let completionOutcomeUnconfirmed = false;
             if (completionCommit) {
-              const enqueued = await enqueueCompletion(
+              const enqueueOutcome = await enqueueCompletion(
                 opts.server,
                 headers,
                 opts.workerId,
@@ -2276,11 +2672,14 @@ async function workerLoop(
                   kind: job.kind,
                   sessionId: job.sessionId,
                   params: parsedParams,
+                  claimGeneration: claimAuthority.claimGeneration,
                 },
                 completionCommit,
                 result,
               );
-              if (!enqueued) {
+              completionAuthorityRejected = enqueueOutcome.authorityRejected;
+              completionOutcomeUnconfirmed = enqueueOutcome.outcomeUnconfirmed;
+              if (!enqueueOutcome.ok) {
                 result = failCompletionEnqueue(result, completionCommit);
               } else {
                 completionEnqueued = true;
@@ -2353,11 +2752,23 @@ async function workerLoop(
                 },
               }),
             };
-            await persistWorkerDiagnostics(opts.server, headers, job.id, result.diagnostics);
+            await persistWorkerDiagnostics(
+              opts.server,
+              headers,
+              job.id,
+              claimAuthority,
+              result.diagnostics,
+            );
 
             let statusPersistedToServer = false;
             let deferredForDirectRetry = false;
-            if (result.publishBlocked) {
+            let terminalAuthorityRejected = completionAuthorityRejected;
+            let terminalStatusUnconfirmed = completionOutcomeUnconfirmed;
+            if (completionOutcomeUnconfirmed) {
+              // The completion handoff may already have committed and moved the
+              // job into finalizing. Do not race it with a contradictory terminal
+              // mutation; bounded recycling lets the server reconcile authority.
+            } else if (result.publishBlocked) {
               await reportToolRunForUnsuccessfulJob({
                 opts,
                 headers,
@@ -2366,10 +2777,11 @@ async function workerLoop(
                 durationMs: jobDurationMs,
                 phase: `publish:${result.publishBlocked.stage}`,
               });
-              const response = await postJsonWithTimeout(
+              const persistence = await persistWorkerTerminalStatus(
                 `${opts.server}/jobs/${job.id}/publish-blocked`,
                 headers,
                 {
+                  ...claimAuthority,
                   message: result.summary,
                   detail: redactSensitiveText(result.stderr ?? ""),
                   publishBlocked: result.publishBlocked,
@@ -2377,10 +2789,14 @@ async function workerLoop(
                   diagnostics: result.diagnostics,
                 },
               );
-              statusPersistedToServer = response.ok;
-              console.log(
-                `[WorkerPals] Job ${job.id} publish-blocked in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
-              );
+              statusPersistedToServer = persistence.ok;
+              terminalAuthorityRejected ||= persistence.authorityRejected;
+              terminalStatusUnconfirmed ||= persistence.outcomeUnconfirmed;
+              if (persistence.ok) {
+                console.log(
+                  `[WorkerPals] Job ${job.id} publish-blocked in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+                );
+              }
             } else if (result.ok && completionEnqueued) {
               statusPersistedToServer = true;
               console.log(
@@ -2397,10 +2813,11 @@ async function workerLoop(
                 reviewAgent.prUrl.trim().length > 0
                   ? reviewAgent.prUrl.trim()
                   : null;
-              const response = await postJsonWithTimeout(
+              const persistence = await persistWorkerTerminalStatus(
                 `${opts.server}/jobs/${job.id}/complete`,
                 headers,
                 {
+                  ...claimAuthority,
                   summary: result.summary,
                   durationMs: jobDurationMs,
                   prUrl: jobPrUrl,
@@ -2411,10 +2828,14 @@ async function workerLoop(
                   ],
                 },
               );
-              statusPersistedToServer = response.ok;
-              console.log(
-                `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
-              );
+              statusPersistedToServer = persistence.ok;
+              terminalAuthorityRejected ||= persistence.authorityRejected;
+              terminalStatusUnconfirmed ||= persistence.outcomeUnconfirmed;
+              if (persistence.ok) {
+                console.log(
+                  `[WorkerPals] Job ${job.id} completed in ${formatDurationMs(jobDurationMs)}: ${result.summary}`,
+                );
+              }
             } else {
               const failedResult = result;
               let unsuccessfulToolRunReported = false;
@@ -2432,20 +2853,25 @@ async function workerLoop(
               };
               const failCurrentJob = async () => {
                 await reportUnsuccessfulToolRun(job.kind);
-                const response = await postJsonWithTimeout(
+                const persistence = await persistWorkerTerminalStatus(
                   `${opts.server}/jobs/${job.id}/fail`,
                   headers,
                   {
+                    ...claimAuthority,
                     message: failedResult.summary,
                     detail: redactSensitiveText(failedResult.stderr ?? ""),
                     durationMs: jobDurationMs,
                     diagnostics: failedResult.diagnostics,
                   },
                 );
-                statusPersistedToServer = response.ok;
-                console.log(
-                  `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${failedResult.summary}`,
-                );
+                statusPersistedToServer = persistence.ok;
+                terminalAuthorityRejected ||= persistence.authorityRejected;
+                terminalStatusUnconfirmed ||= persistence.outcomeUnconfirmed;
+                if (persistence.ok) {
+                  console.log(
+                    `[WorkerPals] Job ${job.id} failed in ${formatDurationMs(jobDurationMs)}: ${failedResult.summary}`,
+                  );
+                }
                 recycleWorkerAfterJob = shouldRecycleWorkerForCodexUnavailableFailure(
                   failedResult.summary,
                   failedResult.stderr,
@@ -2468,6 +2894,7 @@ async function workerLoop(
                   opts,
                   headers,
                   job.id,
+                  claimAuthority,
                   CODEX_STARTUP_STALL_DIRECT_RETRY_DEFER_MS,
                   {
                     targetWorkerId: null,
@@ -2483,6 +2910,17 @@ async function workerLoop(
                       deferred.availableAt ?? "a direct WorkerPal retry"
                     }; recycling this worker so RemoteBuddy can spawn a direct isolated-worktree WorkerPal.`,
                   );
+                } else if (deferred.authorityRejected) {
+                  terminalAuthorityRejected = true;
+                  console.warn(
+                    `[WorkerPals] Direct-retry deferral for job ${job.id} was rejected because this worker no longer owns the claim; suppressing stale terminal projection.`,
+                  );
+                } else if (deferred.transportAmbiguous) {
+                  deferredForDirectRetry = true;
+                  recycleWorkerAfterJob = true;
+                  console.error(
+                    `[WorkerPals] Direct-retry deferral for job ${job.id} remained transport-ambiguous after bounded retries; suppressing terminal projection and recycling this worker.`,
+                  );
                 } else {
                   console.warn(
                     `[WorkerPals] Failed to defer Docker Codex startup-stall job ${job.id}; marking failed: ${
@@ -2496,7 +2934,19 @@ async function workerLoop(
               }
             }
 
-            if (job.sessionId && !deferredForDirectRetry) {
+            if (terminalStatusUnconfirmed) {
+              recycleWorkerAfterUnconfirmedTerminal = true;
+              console.error(
+                `[WorkerPals] Terminal persistence for job ${job.id} remained unconfirmed after bounded attempts; suppressing direct terminal projection and recycling this worker.`,
+              );
+            }
+
+            if (
+              job.sessionId &&
+              !deferredForDirectRetry &&
+              !terminalAuthorityRejected &&
+              !terminalStatusUnconfirmed
+            ) {
               const jobOrigin = taskExecuteOrigin(parsedParams);
               const responseMode = String(parsedParams.responseMode ?? "")
                 .trim()
@@ -2535,6 +2985,7 @@ async function workerLoop(
                   ok: result.ok,
                   statusPersistedToServer,
                   finalizing: completionEnqueued,
+                  authorityRejected: terminalAuthorityRejected,
                 })
               ) {
                 const eventCmd = result.ok
@@ -2575,14 +3026,20 @@ async function workerLoop(
           } finally {
             clearInterval(busyHeartbeat);
             if (jobProgressTimer) clearInterval(jobProgressTimer);
-            if (recycleWorkerAfterJob) {
-              const recycleExitCode = result
-                ? workerRecycleExitCodeForResult(result)
-                : CODEX_UNAVAILABLE_WORKER_EXIT_CODE;
+            if (recycleWorkerAfterJob || recycleWorkerAfterUnconfirmedTerminal) {
+              const recycleExitCode = recycleWorkerAfterUnconfirmedTerminal
+                ? 91
+                : result
+                  ? workerRecycleExitCodeForResult(result)
+                  : CODEX_UNAVAILABLE_WORKER_EXIT_CODE;
               runtimeState.shutdownRequested = true;
               const forceExitTimer = setTimeout(() => {
                 console.warn(
-                  `[WorkerPals] Forcing worker recycle ${CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS}ms after Codex backend failure.`,
+                  `[WorkerPals] Forcing worker recycle ${CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS}ms after ${
+                    recycleWorkerAfterUnconfirmedTerminal
+                      ? "unconfirmed terminal persistence"
+                      : "Codex backend failure"
+                  }.`,
                 );
                 process.exit(recycleExitCode);
               }, CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS);
@@ -2627,6 +3084,7 @@ async function workerLoop(
             }
             await maybeHeartbeat("idle", null, true);
             runtimeState.currentJobId = null;
+            runtimeState.currentClaimGeneration = null;
             runtimeState.currentSessionId = null;
             if (directWorktreePath) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
@@ -2725,6 +3183,7 @@ async function main(): Promise<void> {
 
   const runtimeState: WorkerRuntimeState = {
     currentJobId: null,
+    currentClaimGeneration: null,
     currentSessionId: null,
     shutdownRequested: false,
   };

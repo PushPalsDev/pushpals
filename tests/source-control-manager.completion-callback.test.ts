@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  parseCompletionPositiveAck,
   postCompletionCallbackWithRetry,
   postCompletionProcessedWithRetry,
   withHardDeadline,
@@ -7,6 +8,27 @@ import {
 import { fetchBufferedWithHardDeadline } from "../packages/shared/src/bounded_fetch";
 
 describe("SourceControlManager completion callback recovery", () => {
+  test("requires the server's explicit positive acknowledgement", async () => {
+    await expect(
+      parseCompletionPositiveAck(
+        new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    ).resolves.toEqual({ ok: true, status: 200 });
+
+    for (const body of ["", "not-json", JSON.stringify({ ok: false }), JSON.stringify({})]) {
+      await expect(
+        parseCompletionPositiveAck(new Response(body, { status: 200 })),
+      ).resolves.toEqual({ ok: false, status: 200 });
+    }
+    await expect(parseCompletionPositiveAck(new Response(null, { status: 204 }))).resolves.toEqual({
+      ok: false,
+      status: 204,
+    });
+  });
+
   test("replays the same callback after the committed response is lost", async () => {
     let calls = 0;
     const result = await postCompletionProcessedWithRetry({
@@ -56,6 +78,29 @@ describe("SourceControlManager completion callback recovery", () => {
 
     expect(result).toMatchObject({ confirmed: false, attempts: 3, lastStatus: 503 });
     expect(calls).toBe(3);
+  });
+
+  test("does not confirm a callback when a lost response is followed by malformed 2xx", async () => {
+    let calls = 0;
+    const result = await postCompletionCallbackWithRetry({
+      attempts: 2,
+      retryDelayMs: 0,
+      request: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("connection closed after server commit");
+        return parseCompletionPositiveAck(
+          new Response(JSON.stringify({ accepted: true }), { status: 200 }),
+        );
+      },
+    });
+
+    expect(result).toEqual({
+      confirmed: false,
+      attempts: 2,
+      lastStatus: 200,
+      lastError: null,
+    });
+    expect(calls).toBe(2);
   });
 
   test("aborts every unresponsive callback attempt instead of wedging the SCM tick", async () => {

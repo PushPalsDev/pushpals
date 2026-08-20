@@ -37,6 +37,7 @@ import {
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
 import {
+  parseCompletionPositiveAck,
   postCompletionCallbackWithRetry,
   postCompletionProcessedWithRetry,
 } from "./completion_callback";
@@ -51,7 +52,10 @@ import {
   type CompletionGcRecord,
   type CompletionProcessingAuthority,
 } from "./completion_gc";
-import { CompletionLeaseRenewalCoordinator } from "./completion_lease";
+import {
+  CompletionLeaseRenewalCoordinator,
+  parseCompletionLeaseRenewalResponse,
+} from "./completion_lease";
 import {
   assertFinalAuthoritativePublicationProof,
   authoritativeAncestryFromGitResult,
@@ -973,14 +977,7 @@ async function tick(): Promise<void> {
         timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
         timeoutMessage: `Completion publication lease renewal timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
       });
-      if (!leaseResponse.ok) {
-        return {
-          ok: false,
-          leaseLost: leaseResponse.status === 400 || leaseResponse.status === 409,
-          detail: `Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`,
-        };
-      }
-      return { ok: true };
+      return parseCompletionLeaseRenewalResponse(leaseResponse);
     });
     const renewCompletionLease = async (required = false): Promise<boolean> => {
       const renewed = await completionLeaseRenewal.renew(required);
@@ -1825,8 +1822,7 @@ async function tick(): Promise<void> {
             timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
             timeoutMessage: `Completion processed callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
           });
-          const payload = (await response.json().catch(() => null)) as { ok?: boolean } | null;
-          return { ok: response.ok && payload?.ok === true, status: response.status };
+          return parseCompletionPositiveAck(response);
         },
       });
 
@@ -1940,8 +1936,8 @@ async function tick(): Promise<void> {
         // a side effect is durable, stale-claim reconciliation owns recovery.
         const failResult = await postCompletionCallbackWithRetry({
           attempts: 2,
-          request: (signal) =>
-            fetchBufferedWithHardDeadline({
+          request: async (signal) => {
+            const response = await fetchBufferedWithHardDeadline({
               input: `${config.serverUrl}/completions/${completion.id}/fail`,
               init: {
                 method: "POST",
@@ -1959,7 +1955,9 @@ async function tick(): Promise<void> {
               },
               timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
               timeoutMessage: `Completion failure callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`,
-            }),
+            });
+            return parseCompletionPositiveAck(response);
+          },
         });
 
         if (!failResult.confirmed) {

@@ -266,10 +266,11 @@ describe("server RequestQueue", () => {
         jobsDb
           .prepare(
             `UPDATE jobs
-             SET updatedAt = ?, claimedAt = ?, startedAt = ?, firstLogAt = NULL
+             SET updatedAt = ?, claimedAt = ?, startedAt = ?,
+                 firstLogAt = NULL, lastActivityAt = ?
              WHERE id = ?`,
           )
-          .run(staleIso, staleIso, staleIso, originalJobId);
+          .run(staleIso, staleIso, staleIso, staleIso, originalJobId);
 
         const recovered = jobQueue.recoverStaleClaimedJobs(120_000);
         expect(recovered).toHaveLength(1);
@@ -899,6 +900,98 @@ describe("server RequestQueue", () => {
     expect(queue.recoverExpiredClaims(new Date(nowMs + 30_001)).requestIds).toContain(
       String(legacy.requestId),
     );
+    queue.close();
+  });
+
+  test("shortens every durable runtime-circuit claim beyond the reported ID limit", () => {
+    const queue = new RequestQueue(":memory:");
+    const db = (queue as unknown as { db: any }).db as any;
+    const nowMs = Date.parse("2026-08-19T19:00:00.000Z");
+    const now = new Date(nowMs).toISOString();
+    const farFuture = new Date(nowMs + 60 * 60_000).toISOString();
+    const expectedDeferredUntil = new Date(nowMs + 30_000).toISOString();
+    const eligibleCount = 605;
+    const insertRequest = db.prepare(
+      `INSERT INTO requests (
+         id, sessionId, prompt, metadataJson, status, agentId, claimToken,
+         claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts,
+         deferReason, enqueuedAt, claimedAt, createdAt, updatedAt
+       ) VALUES (?, 'bulk-runtime-restart', ?, ?, 'claimed', ?, ?, 1, ?, ?, 1, ?, ?, ?, ?, ?)`,
+    );
+    const seed = db.transaction(() => {
+      for (let index = 0; index < eligibleCount; index += 1) {
+        const id = `bulk-runtime-request-${String(index).padStart(4, "0")}`;
+        const tagged = index % 2 === 0;
+        insertRequest.run(
+          id,
+          `Recover durable request ${index}`,
+          tagged ? JSON.stringify({ origin: "user" }) : JSON.stringify({ origin: "autonomy" }),
+          `bulk-runtime-agent-${index}`,
+          `bulk-runtime-token-${index}`,
+          farFuture,
+          now,
+          tagged ? "worker_runtime_circuit_open" : null,
+          now,
+          now,
+          now,
+          now,
+        );
+      }
+      insertRequest.run(
+        "bulk-runtime-request-unrelated",
+        "Leave this unrelated claim untouched",
+        JSON.stringify({ origin: "user" }),
+        "bulk-runtime-agent-unrelated",
+        "bulk-runtime-token-unrelated",
+        farFuture,
+        now,
+        null,
+        now,
+        now,
+        now,
+        now,
+      );
+    });
+    seed();
+
+    const shortened = queue.shortenWorkerRuntimeCircuitDeferredClaims({
+      nowMs,
+      maxDelayMs: 30_000,
+      includeLegacyAutonomyClaims: true,
+    });
+    expect(shortened).toMatchObject({
+      shortened: eligibleCount,
+      unreportedRequestIds: eligibleCount - 500,
+      deferredUntil: expectedDeferredUntil,
+    });
+    expect(shortened.requestIds).toHaveLength(500);
+    expect(new Set(shortened.requestIds).size).toBe(500);
+    expect(shortened.requestIds.every((id) => id.startsWith("bulk-runtime-request-"))).toBe(true);
+
+    const eligible = db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM requests
+         WHERE id LIKE 'bulk-runtime-request-%'
+           AND id != 'bulk-runtime-request-unrelated'
+           AND leaseExpiresAt = ?`,
+      )
+      .get(expectedDeferredUntil) as { count: number };
+    expect(eligible.count).toBe(eligibleCount);
+    expect(queue.getRequest("bulk-runtime-request-unrelated")?.leaseExpiresAt).toBe(farFuture);
+
+    expect(
+      queue.shortenWorkerRuntimeCircuitDeferredClaims({
+        nowMs,
+        maxDelayMs: 30_000,
+        includeLegacyAutonomyClaims: true,
+      }),
+    ).toEqual({
+      shortened: 0,
+      requestIds: [],
+      unreportedRequestIds: 0,
+      deferredUntil: expectedDeferredUntil,
+    });
     queue.close();
   });
 

@@ -1003,7 +1003,12 @@ export class RequestQueue {
       limit?: number;
       includeLegacyAutonomyClaims?: boolean;
     } = {},
-  ): { shortened: number; requestIds: string[]; deferredUntil: string } {
+  ): {
+    shortened: number;
+    requestIds: string[];
+    unreportedRequestIds: number;
+    deferredUntil: string;
+  } {
     const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
     const maxDelayMs = Math.max(
       MIN_REQUEST_DEFER_MS,
@@ -1016,43 +1021,77 @@ export class RequestQueue {
     const includeLegacyAutonomyClaims = options.includeLegacyAutonomyClaims !== false;
     const now = new Date(nowMs).toISOString();
     const deferredUntil = new Date(nowMs + maxDelayMs).toISOString();
-    const rows = this.db
-      .prepare(
-        `SELECT id
-         FROM requests
-         WHERE status = 'claimed'
-           AND (
-             deferReason = 'worker_runtime_circuit_open'
-             OR (
-               ? = 1
-               AND deferReason IS NULL
-               AND json_valid(metadataJson)
-               AND json_extract(metadataJson, '$.origin') = 'autonomy'
+    const shorten = this.db.transaction(() => {
+      // Report only a bounded ID sample while shortening the complete durable
+      // set in SQLite. Restart recovery must not strand row limit + 1 behind a
+      // legacy long lease.
+      const rows = this.db
+        .prepare(
+          `SELECT id
+           FROM requests
+           WHERE status = 'claimed'
+             AND (
+               deferReason = 'worker_runtime_circuit_open'
+               OR (
+                 ? = 1
+                 AND deferReason IS NULL
+                 AND json_valid(metadataJson)
+                 AND json_extract(metadataJson, '$.origin') = 'autonomy'
+               )
              )
-           )
-           AND leaseExpiresAt > ?
-         ORDER BY updatedAt ASC, createdAt ASC
-         LIMIT ?`,
-      )
-      .all(includeLegacyAutonomyClaims ? 1 : 0, deferredUntil, limit) as Array<{ id: string }>;
-    if (rows.length === 0) return { shortened: 0, requestIds: [], deferredUntil };
+             AND leaseExpiresAt > ?
+           ORDER BY updatedAt ASC, createdAt ASC
+           LIMIT ?`,
+        )
+        .all(includeLegacyAutonomyClaims ? 1 : 0, deferredUntil, limit) as Array<{
+        id: string;
+      }>;
+      if (rows.length === 0) {
+        return {
+          shortened: 0,
+          requestIds: [],
+          unreportedRequestIds: 0,
+          deferredUntil,
+        };
+      }
 
-    const ids = rows.map((row) => row.id);
-    const placeholders = ids.map(() => "?").join(",");
-    const result = this.db
-      .prepare(
-        `UPDATE requests
-         SET leaseExpiresAt = ?, updatedAt = ?
-         WHERE id IN (${placeholders})
-           AND status = 'claimed'
-           AND leaseExpiresAt > ?`,
-      )
-      .run(deferredUntil, now, ...ids, deferredUntil);
-    return {
-      shortened: result.changes,
-      requestIds: ids.slice(0, result.changes),
-      deferredUntil,
-    };
+      const ids = rows.map((row) => row.id);
+      const placeholders = ids.map(() => "?").join(",");
+      const reportedRows = this.db
+        .prepare(
+          `UPDATE requests
+           SET leaseExpiresAt = ?, updatedAt = ?
+           WHERE id IN (${placeholders})
+             AND status = 'claimed'
+             AND leaseExpiresAt > ?
+           RETURNING id`,
+        )
+        .all(deferredUntil, now, ...ids, deferredUntil) as Array<{ id: string }>;
+      const unreported = this.db
+        .prepare(
+          `UPDATE requests
+           SET leaseExpiresAt = ?, updatedAt = ?
+           WHERE status = 'claimed'
+             AND (
+               deferReason = 'worker_runtime_circuit_open'
+               OR (
+                 ? = 1
+                 AND deferReason IS NULL
+                 AND json_valid(metadataJson)
+                 AND json_extract(metadataJson, '$.origin') = 'autonomy'
+               )
+             )
+             AND leaseExpiresAt > ?`,
+        )
+        .run(deferredUntil, now, includeLegacyAutonomyClaims ? 1 : 0, deferredUntil);
+      return {
+        shortened: reportedRows.length + unreported.changes,
+        requestIds: reportedRows.map((row) => row.id),
+        unreportedRequestIds: unreported.changes,
+        deferredUntil,
+      };
+    });
+    return shorten();
   }
 
   releaseWorkerRuntimeCircuitDeferredClaims(nowMs = Date.now()): {

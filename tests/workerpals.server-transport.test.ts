@@ -25,6 +25,41 @@ function neverEndingBodyResponse(status = 200): Response {
 }
 
 describe("workerpals server transport", () => {
+  test("attaches worker and claim-generation authority to every job log", async () => {
+    let jobLogBody: Record<string, unknown> | null = null;
+    const transport = new WorkerServerTransport({
+      server: "http://127.0.0.1:3001",
+      headers: { "Content-Type": "application/json" },
+      workerId: "workerpal-log-authority",
+      pollMs: 2_000,
+      heartbeatMs: 5_000,
+      staleClaimTtlMs: 120_000,
+      fetchFn: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        jobLogBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response('{"ok":true}', { status: 200 });
+      }) as typeof fetch,
+    });
+
+    const payload = {
+      stream: "stdout",
+      seq: 3,
+      message: "bounded progress",
+      ts: "2026-08-19T20:00:00.000Z",
+      claimGeneration: 29,
+      workerId: "stale-worker-id",
+    } as const;
+    await transport.queueJobLog("job-authority", payload);
+
+    expect(jobLogBody).toEqual({
+      workerId: "workerpal-log-authority",
+      stream: "stdout",
+      seq: 3,
+      message: "bounded progress",
+      ts: "2026-08-19T20:00:00.000Z",
+      claimGeneration: 29,
+    });
+  });
+
   test("sends the runtime generation with every heartbeat", async () => {
     let heartbeatBody: Record<string, unknown> | null = null;
     const transport = new WorkerServerTransport({
@@ -37,7 +72,7 @@ describe("workerpals server transport", () => {
       runtimeGeneration: "v1.2.39",
       fetchFn: (async (_input: RequestInfo | URL, init?: RequestInit) => {
         heartbeatBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
-        return new Response("{}", { status: 200 });
+        return new Response('{"ok":true}', { status: 200 });
       }) as typeof fetch,
     });
 
@@ -47,6 +82,26 @@ describe("workerpals server transport", () => {
       runtimeGeneration: "v1.2.39",
       status: "idle",
     });
+  });
+
+  test("does not treat malformed HTTP 2xx heartbeat bodies as delivered", async () => {
+    for (const responseBody of ["{}", '{"ok":false}', "not-json"]) {
+      const warnings: string[] = [];
+      const transport = new WorkerServerTransport({
+        server: "http://127.0.0.1:3001",
+        headers: { "Content-Type": "application/json" },
+        workerId: "workerpal-malformed-heartbeat",
+        pollMs: 2_000,
+        heartbeatMs: 5_000,
+        staleClaimTtlMs: 120_000,
+        logWarn: (message) => warnings.push(message),
+        fetchFn: (async () => new Response(responseBody, { status: 200 })) as typeof fetch,
+      });
+
+      expect(await transport.sendHeartbeat(heartbeatPayload())).toBe(false);
+      expect(transport.getHealthSnapshot().consecutiveHeartbeatFailures).toBe(1);
+      expect(warnings.join("\n")).toContain("heartbeat rejected (200)");
+    }
   });
 
   test("keeps heartbeat delivery independent from blocked job-log transport", async () => {
@@ -64,10 +119,10 @@ describe("workerpals server transport", () => {
         seenUrls.push(url);
         if (url.endsWith("/jobs/job-1/log")) {
           return new Promise<Response>((resolve) => {
-            resolveLogRequest = () => resolve(new Response("{}", { status: 200 }));
+            resolveLogRequest = () => resolve(new Response('{"ok":true}', { status: 200 }));
           });
         }
-        return Promise.resolve(new Response("{}", { status: 200 }));
+        return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
       }) as typeof fetch,
     });
 
@@ -105,13 +160,13 @@ describe("workerpals server transport", () => {
         if (url.endsWith("/jobs/job-1/log")) {
           return new Promise<Response>((resolve) => {
             if (!releaseBlockedLog) {
-              releaseBlockedLog = () => resolve(new Response("{}", { status: 200 }));
+              releaseBlockedLog = () => resolve(new Response('{"ok":true}', { status: 200 }));
               return;
             }
-            resolve(new Response("{}", { status: 200 }));
+            resolve(new Response('{"ok":true}', { status: 200 }));
           });
         }
-        return Promise.resolve(new Response("{}", { status: 200 }));
+        return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
       }) as typeof fetch,
     });
 
@@ -155,10 +210,10 @@ describe("workerpals server transport", () => {
         if (url.endsWith("/workers/heartbeat")) {
           heartbeatRequests += 1;
           return new Promise<Response>((resolve) => {
-            resolveHeartbeat = () => resolve(new Response("{}", { status: 200 }));
+            resolveHeartbeat = () => resolve(new Response('{"ok":true}', { status: 200 }));
           });
         }
-        return Promise.resolve(new Response("{}", { status: 200 }));
+        return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
       }) as typeof fetch,
     });
 
@@ -210,7 +265,7 @@ describe("workerpals server transport", () => {
         const url = String(input);
         seenUrls.push(url);
         if (url.endsWith("/jobs/job-1/log")) return neverEndingBodyResponse();
-        return new Response("{}", { status: 200 });
+        return new Response('{"ok":true}', { status: 200 });
       }) as typeof fetch,
     });
 

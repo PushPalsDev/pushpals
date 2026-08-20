@@ -5870,6 +5870,14 @@ function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = p
 }
 
 // apps/source_control_manager/src/completion_callback.ts
+async function parseCompletionPositiveAck(response) {
+  const payload = await response.json().catch(() => null);
+  const explicitlyAcknowledged = typeof payload === "object" && payload !== null && !Array.isArray(payload) && payload.ok === true;
+  return {
+    ok: response.ok && explicitlyAcknowledged,
+    status: response.status
+  };
+}
 async function withHardDeadline(operation, timeoutMs, timeoutMessage = "operation timed out") {
   const controller = new AbortController;
   let timer = null;
@@ -6186,6 +6194,18 @@ async function claimBeforeCompletionGc(options) {
 }
 
 // apps/source_control_manager/src/completion_lease.ts
+async function parseCompletionLeaseRenewalResponse(response) {
+  const acknowledgement = await parseCompletionPositiveAck(response);
+  if (acknowledgement.ok)
+    return { ok: true };
+  const malformedPositiveResponse = response.ok;
+  return {
+    ok: false,
+    leaseLost: response.status === 409,
+    detail: malformedPositiveResponse ? `Completion publication lease renewal returned HTTP ${response.status} without an explicit positive acknowledgement.` : `Completion publication lease could not be renewed (HTTP ${response.status}).`
+  };
+}
+
 class CompletionLeaseRenewalCoordinator {
   attempt;
   inFlight = null;
@@ -7803,14 +7823,7 @@ async function tick() {
         timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
         timeoutMessage: `Completion publication lease renewal timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
       });
-      if (!leaseResponse.ok) {
-        return {
-          ok: false,
-          leaseLost: leaseResponse.status === 400 || leaseResponse.status === 409,
-          detail: `Completion publication lease could not be renewed (HTTP ${leaseResponse.status}).`
-        };
-      }
-      return { ok: true };
+      return parseCompletionLeaseRenewalResponse(leaseResponse);
     });
     const renewCompletionLease = async (required = false) => {
       const renewed = await completionLeaseRenewal.renew(required);
@@ -8394,8 +8407,7 @@ async function tick() {
             timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
             timeoutMessage: `Completion processed callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
           });
-          const payload = await response2.json().catch(() => null);
-          return { ok: response2.ok && payload?.ok === true, status: response2.status };
+          return parseCompletionPositiveAck(response2);
         }
       });
       if (!markResult.confirmed) {
@@ -8462,25 +8474,28 @@ async function tick() {
         console.error(`[${ts2()}] Failed to process completion ${completion.id}: ${err.message}`);
         const failResult = await postCompletionCallbackWithRetry({
           attempts: 2,
-          request: (signal) => fetchBufferedWithHardDeadline({
-            input: `${config.serverUrl}/completions/${completion.id}/fail`,
-            init: {
-              method: "POST",
-              headers,
-              signal,
-              body: JSON.stringify({
-                pusherId,
-                claimToken: completionClaimToken,
-                error: err.message,
-                trustedInstallDurationMs,
-                trustedValidationDurationMs,
-                trustedValidationCacheHit,
-                trustedValidationReport: trustedValidationReport()
-              })
-            },
-            timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
-            timeoutMessage: `Completion failure callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
-          })
+          request: async (signal) => {
+            const response2 = await fetchBufferedWithHardDeadline({
+              input: `${config.serverUrl}/completions/${completion.id}/fail`,
+              init: {
+                method: "POST",
+                headers,
+                signal,
+                body: JSON.stringify({
+                  pusherId,
+                  claimToken: completionClaimToken,
+                  error: err.message,
+                  trustedInstallDurationMs,
+                  trustedValidationDurationMs,
+                  trustedValidationCacheHit,
+                  trustedValidationReport: trustedValidationReport()
+                })
+              },
+              timeoutMs: SERVER_CONTROL_HTTP_TIMEOUT_MS,
+              timeoutMessage: `Completion failure callback timed out after ${SERVER_CONTROL_HTTP_TIMEOUT_MS}ms.`
+            });
+            return parseCompletionPositiveAck(response2);
+          }
         });
         if (!failResult.confirmed) {
           const callbackDetail = failResult.lastStatus ? `HTTP ${failResult.lastStatus}` : failResult.lastError || "no response";

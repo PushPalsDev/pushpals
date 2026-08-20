@@ -1,3 +1,5 @@
+import { parseCompletionPositiveAck } from "./completion_callback";
+
 export type CompletionLeaseRenewalResult = {
   ok: boolean;
   detail?: string;
@@ -5,6 +7,22 @@ export type CompletionLeaseRenewalResult = {
 };
 
 export type CompletionLeaseRenewalAttempt = () => Promise<CompletionLeaseRenewalResult>;
+
+export async function parseCompletionLeaseRenewalResponse(
+  response: Response,
+): Promise<CompletionLeaseRenewalResult> {
+  const acknowledgement = await parseCompletionPositiveAck(response);
+  if (acknowledgement.ok) return { ok: true };
+
+  const malformedPositiveResponse = response.ok;
+  return {
+    ok: false,
+    leaseLost: response.status === 409,
+    detail: malformedPositiveResponse
+      ? `Completion publication lease renewal returned HTTP ${response.status} without an explicit positive acknowledgement.`
+      : `Completion publication lease could not be renewed (HTTP ${response.status}).`,
+  };
+}
 
 /**
  * Shares one in-flight lease renewal between the periodic heartbeat and the
