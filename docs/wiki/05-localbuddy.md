@@ -2,7 +2,7 @@
 
 ## Purpose
 
-LocalBuddy is the user ingress service and fast responder. It sits between client UX and deeper orchestration.
+LocalBuddy is an optional fast-ingress service for callers that want lightweight replies before deeper orchestration.
 
 Main responsibilities:
 
@@ -11,12 +11,20 @@ Main responsibilities:
 - route execution-heavy requests into the Request Queue for RemoteBuddy,
 - provide status lookup and read-only helper behaviors.
 
+## Component Contract
+
+- Receives: a repo-scoped session and prompt through `POST /message`.
+- Owns: ingress validation, local-versus-remote routing, and lightweight read-only responses.
+- Produces: an immediate session reply or a durable request for RemoteBuddy.
+- Does not own: deep planning, code execution, queue persistence, or commit integration.
+
+The handoff is intentionally small: `message -> local reply` or `message -> request enqueue`.
+
 ## Key Files
 
 - `apps/localbuddy/src/localbuddy_main.ts` - HTTP entrypoint and routing logic.
 - `apps/localbuddy/src/local_readonly.ts` - local read-only query handling.
 - `apps/localbuddy/src/request_status.ts` - request/job status response helpers.
-- `apps/localbuddy/src/planner.ts` - heuristic/LLM planning adapter for local tasks.
 
 ## Behavioral Model
 
@@ -42,7 +50,7 @@ It also supports explicit routing via `/ask_remote_buddy ...`.
 
 ## Why This Layer Exists
 
-Without LocalBuddy, every user interaction would hit deep orchestration paths, increasing latency and noise.
+For callers that use it, LocalBuddy keeps simple chat, status, and read-only requests out of deeper orchestration paths.
 
 LocalBuddy provides:
 
@@ -55,6 +63,12 @@ LocalBuddy provides:
 - Prompt sanitization for local LLM replies.
 - Fallback reply behavior when structured output is malformed.
 - Lightweight failure summarization for user-visible status.
+
+## Quick Debugging
+
+1. Confirm LocalBuddy resolved the expected repository root and Server URL.
+2. Check whether the prompt chose the local or remote path.
+3. For remote work, follow the returned `requestId` in the Server queue and session events.
 
 ## Safe Change Guidance
 

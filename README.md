@@ -21,10 +21,11 @@ Both modes flow through the same queues, events, and integration pipeline so beh
 
 ```mermaid
 flowchart LR
-  U[User] --> C[apps/client]
-  C -->|POST /message| L[apps/localbuddy]
-  L -->|POST /requests/enqueue| S[(apps/server)]
+  U[User] --> C[CLI / Expo / VS Code]
+  C -->|POST /sessions/:id/message| S[(apps/server)]
   S -->|SSE/WS session events| C
+  U -. optional POST /message .-> L[apps/localbuddy]
+  L -->|POST /requests/enqueue| S
 
   S -->|POST /requests/claim| R[apps/remotebuddy]
   R -->|POST /jobs/enqueue| S
@@ -42,27 +43,20 @@ flowchart LR
 
 ## Services and Responsibilities
 
-- `apps/client`
-  - Expo mission-control UI (web/iOS/Android).
-  - Subscribes to server event stream and renders live timeline/status.
-- `apps/localbuddy`
-  - User ingress on `POST /message`.
-  - Handles lightweight local responses and status/read-only prompts.
-  - Enqueues delegated requests for remote orchestration.
-- `apps/server`
-  - Central control plane and event hub.
-  - Hosts session/event transport, queue APIs, worker heartbeats, and autonomy APIs.
-  - Persists all state in SQLite (`outputs/data/pushpals.db` by default).
-- `apps/remotebuddy`
-  - Planner/orchestrator.
-  - Claims queued requests, produces strict planning JSON, emits assistant messages, optionally enqueues `task.execute` jobs.
-  - Runs optional autonomy loop for objective ideation/scoring/dispatch.
-- `apps/workerpals`
-  - Job execution daemon (host worktree mode or Docker mode).
-  - Claims jobs, executes backend agent (`miniswe` or `openhands`), streams logs, emits completion records.
-- `apps/source_control_manager`
-  - Completion consumer and integration daemon.
-  - Applies worker output (cherry-pick/no-ff/ff-only), runs checks, pushes integration branch, optionally opens/reuses PR.
+PushPals keeps coordination, planning, execution, and publication separate. The
+`Owns` column identifies the authoritative component for each responsibility.
+
+| Component                                                         | Owns                                                         | Main handoff                                                          | Guide                                                           |
+| ----------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------- | --------------------------------------------------------------- |
+| Expo client (`apps/client`)                                       | Mission-control UI and live projections                      | User actions and Server events -> visible session/queue state         | [Client surfaces](docs/wiki/09-client-surfaces.md)              |
+| VS Code client (`apps/vscode-client`)                             | Editor UI and local stack controls                           | Editor prompts -> Server session ingress; controls -> local services  | [Client surfaces](docs/wiki/09-client-surfaces.md)              |
+| Terminal CLI (`packages/cli`)                                     | Repo-aware terminal ingress and packaged runtime supervision | Terminal prompt -> Server session ingress; runtime health -> operator | [CLI surface](docs/wiki/09-client-surfaces.md)                  |
+| LocalBuddy (`apps/localbuddy`)                                    | Fast user ingress and lightweight replies                    | `POST /message` -> local answer or queued request                     | [LocalBuddy](docs/wiki/05-localbuddy.md)                        |
+| Server (`apps/server`)                                            | Durable sessions, events, queues, leases, and worker state   | API mutations -> persisted state, claims, snapshots, and events       | [Server control plane](docs/wiki/04-server-control-plane.md)    |
+| RemoteBuddy (`apps/remotebuddy`)                                  | Planning, request orchestration, and autonomy                | Claimed request -> direct reply or scoped `task.execute` job          | [RemoteBuddy](docs/wiki/06-remotebuddy.md)                      |
+| WorkerPals (`apps/workerpals`)                                    | Isolated execution, validation, and candidate commits        | Claimed job -> logs and completion candidate                          | [WorkerPals](docs/wiki/07-workerpals.md)                        |
+| SourceControlManager (`apps/source_control_manager`)              | Trusted validation and publication policy                    | Completion candidate -> integrated commit or PR outcome               | [SourceControlManager](docs/wiki/08-source-control-manager.md)  |
+| Protocol/shared packages (`packages/protocol`, `packages/shared`) | Wire contracts and reusable infrastructure                   | Typed payloads/configuration -> consistent service behavior           | [Shared packages](docs/wiki/10-shared-packages-and-protocol.md) |
 
 ## Quick Start
 
@@ -118,7 +112,7 @@ Copy-Item configs/local.example.toml configs/local.toml
 
 ### Terminal CLI (`pushpals`)
 
-Use this for terminal-first chat routed through `LocalBuddy -> RemoteBuddy`.
+Use this for terminal-first chat through the Server session control plane.
 
 Install globally from npm:
 
@@ -147,13 +141,13 @@ pushpals
 Notes:
 
 - `pushpals` hard-fails if current directory is not a git repo.
-- If LocalBuddy is down, `pushpals` auto-starts embedded `server + localbuddy + remotebuddy + source_control_manager`.
+- If no healthy repo-affine Server is available, `pushpals` auto-starts the packaged control runtime; runtime-only sessions also honor `localbuddy.enabled`.
 - Auto-start does not clone this repository; it installs packaged runtime assets into `~/.pushpals/runtime` and downloads release-tagged standalone service binaries only on non-Windows platforms.
 - On Windows, the npm CLI skips the unused standalone binary downloads and starts each embedded service and auto-spawned WorkerPal from a packaged source bundle through an isolated launcher with a bounded startup deadline. A blocked child launch is terminated and retried without freezing the CLI or the other services.
 - Override runtime tag when needed via `pushpals --runtime-tag vX.Y.Z`.
 - Open the active local runtime config with `pushpals --open_config` or `pushpals --open-config`.
-- `pushpals` validates LocalBuddy is attached to the same repo root.
-- It stores endpoint state in `.git/pushpals-cli-state.json`, including a copyable `monitoringHubUrl=...`.
+- `pushpals` validates that the Server is attached to the same repo root.
+- It stores endpoint state in the repository's Git metadata directory, including a copyable `monitoringHubUrl=...`.
 - Direct OS binaries are published per release under:
   `https://github.com/PushPalsDev/pushpals/releases`
 
@@ -265,7 +259,10 @@ Useful eval knobs:
 
 Configured in `configs/backend.toml` and resolved by `apps/workerpals/src/backends/backend_config.ts`.
 
-- `miniswe` (default)
+- `openai_codex` (default)
+  - Python executor: `apps/workerpals/src/backends/openai_codex/openai_codex_executor.py`
+  - Runs the OpenAI Codex CLI with the configured auth mode and model.
+- `miniswe`
   - Python executor: `apps/workerpals/src/backends/miniswe/miniswe_executor.py`
   - Uses `mini-swe-agent`.
 - `openhands`
@@ -277,7 +274,7 @@ How to switch:
 ```toml
 # configs/local.toml
 [workerpals]
-executor = "openhands" # or "miniswe"
+executor = "openai_codex" # or "openhands" / "miniswe"
 ```
 
 Or via env override:
@@ -298,6 +295,8 @@ Supported backend values:
 
 - `lmstudio`
 - `ollama`
+- `openai`
+- `openai_codex`
 
 Compatibility aliases accepted by config normalizer:
 
@@ -315,8 +314,8 @@ Related settings per service:
 
 ### 1) Ingress and routing
 
-- Client sends user text to LocalBuddy: `POST /message`.
-- LocalBuddy chooses:
+- CLI, Expo, and VS Code send user text to the Server: `POST /sessions/:id/message`.
+- LocalBuddy remains an optional fast ingress on `POST /message` and chooses:
   - local reply path for lightweight chat/status/read-only requests, or
   - remote delegation path by enqueuing to server: `POST /requests/enqueue`.
 - Explicit remote override command supported in chat: `/ask_remote_buddy ...`.
@@ -330,7 +329,7 @@ Main server route families in `apps/server/src/server_main.ts`:
   - `GET /sessions/:id/events` (SSE replay via `after` cursor)
   - `GET /sessions/:id/ws` (WebSocket replay)
   - `POST /sessions/:id/message`
-  - `POST /sessions/:id/command` (auth protected)
+  - `POST /sessions/:id/command` (local-only)
 - Request queue:
   - `POST /requests/enqueue`
   - `POST /requests/claim`
@@ -360,7 +359,7 @@ Main server route families in `apps/server/src/server_main.ts`:
 - Status/ops:
   - `GET /system/status`
   - `GET /healthz`
-  - `POST /admin/shutdown` (auth protected)
+  - `POST /admin/shutdown` (local-only)
 
 ### 3) Queue semantics
 

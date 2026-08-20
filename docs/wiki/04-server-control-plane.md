@@ -12,6 +12,15 @@
 
 If PushPals were an operating system, this is the kernel.
 
+## Component Contract
+
+- Receives: session commands and queue mutations from every runtime service.
+- Owns: durable SQLite state, queue transitions, request/worker/publisher leases, and session history.
+- Produces: replayable events, queue claims, status snapshots, and recovery projections.
+- Does not own: LLM planning, repository execution, or git publication.
+
+Publication-bearing jobs follow `pending -> claimed (pre-start) -> claimed (started) -> finalizing -> completed`. Successful no-candidate jobs can move directly from `claimed (started)` to `completed`; recovery may return work to `pending`, while `failed`, `abandoned`, and `publish_blocked` are terminal branches.
+
 ## Key Files
 
 - `apps/server/src/server_main.ts` - HTTP router and endpoint orchestration.
@@ -21,6 +30,7 @@ If PushPals were an operating system, this is the kernel.
 - `apps/server/src/jobs.ts` - job queue + logs + worker state.
 - `apps/server/src/completions.ts` - completion queue model.
 - `apps/server/src/autonomy.ts` - autonomy snapshot/policy persistence and lock state.
+- `apps/server/src/lifecycle_reconciliation.ts` - guarded startup and periodic recovery tracking.
 
 ## Design Choices That Matter
 

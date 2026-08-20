@@ -1,5 +1,11 @@
 # 10. Shared Packages and Protocol
 
+## Component Contract
+
+- `packages/protocol` owns versioned wire shapes and validation shared by producers and consumers.
+- `packages/shared` owns reusable runtime behavior such as configuration, deadlines, policy, and validation primitives.
+- Neither package owns service lifecycle, queue/session persistence, or app-specific orchestration.
+
 ## `packages/protocol`
 
 `packages/protocol` defines the contract language for cross-service communication.
@@ -36,6 +42,10 @@ Key modules:
   - repo root detection/context helpers.
 - `packages/shared/src/prompts.ts`
   - prompt template loading.
+- `packages/shared/src/bounded_fetch.ts` and `packages/shared/src/bounded_process.ts`
+  - complete-exchange HTTP and child-process deadlines.
+- `packages/shared/src/trusted_validation.ts`
+  - safe validation-command normalization and failure evidence.
 
 ## Ownership Rule of Thumb
 

@@ -1,47 +1,38 @@
 # @pushpalsdev/cli
 
-Terminal-first PushPals client that routes chat through `LocalBuddy -> RemoteBuddy`.
+The PushPals CLI is the terminal client and optional local runtime supervisor. It submits messages through the Server session control plane, streams lifecycle events, and can start the packaged Server, LocalBuddy, RemoteBuddy, and SourceControlManager when no healthy runtime is already serving the current repository. Planning, execution, and publication remain owned by those services.
 
 ## Install
 
 ```bash
-npm i -g @pushpalsdev/cli
+npm install -g @pushpalsdev/cli
 ```
 
-or:
+`bun install -g @pushpalsdev/cli` is also supported.
 
-```bash
-bun install -g @pushpalsdev/cli
-```
+The npm entrypoint requires Node.js 20+ and Bun 1.3.14+. Native binaries are also available from [GitHub Releases](https://github.com/PushPalsDev/pushpals/releases).
 
-## Run
+## Common Commands
 
-From a git repository that is attached to your running PushPals stack:
+Run from inside the Git repository you want PushPals to manage.
 
-```bash
-pushpals
-```
+| Command                         | Purpose                                                                |
+| ------------------------------- | ---------------------------------------------------------------------- |
+| `pushpals`                      | Connect or auto-start, then open interactive chat and event streaming. |
+| `pushpals --runtime-tag vX.Y.Z` | Pin embedded assets and binaries to a release.                         |
+| `pushpals --no-auto-start`      | Require an existing healthy runtime.                                   |
+| `pushpals --runtime-only`       | Supervise the local runtime without interactive chat.                  |
+| `pushpals --status-once`        | Print endpoints and readiness once, then exit.                         |
+| `pushpals --open-config`        | Open the active local runtime configuration.                           |
+| `pushpals --clear`              | Stop the repo's managed runtime and remove repo-local PushPals state.  |
 
-The CLI hard-fails if:
+The CLI refuses to run outside a Git repository or against a Server attached to a different repository. Embedded release assets live under `~/.pushpals/runtime`; repo-specific CLI state lives in the repository's Git metadata directory.
 
-- current directory is not a git repository
-- LocalBuddy is attached to a different repo root
-- Bun runtime is not installed (for npm-installed entrypoint execution)
+## Implementation Map
 
-Behavior:
+- `bin/pushpals.cjs` - npm shim, Bun version check, bootstrap watchdog, and signal forwarding.
+- `../../scripts/pushpals-cli.ts` - bundled CLI, preflights, runtime supervision, session transport, and interactive commands.
+- `../../scripts/sync-cli-runtime-assets.ts` - packaged runtime mirror generation.
+- `package.json` - package payload and build contract.
 
-- If LocalBuddy is unavailable, CLI auto-start bootstraps embedded
-  `server + localbuddy + remotebuddy + source_control_manager`.
-- Auto-start does not clone the PushPals repo; it downloads release-tagged runtime binaries
-  and prompt/config assets into `~/.pushpals/runtime`.
-- Override runtime tag with `pushpals --runtime-tag vX.Y.Z`.
-- Open the active local runtime config with `pushpals --open_config` or `pushpals --open-config`.
-- Set `[workerpals] execution_platform = "windows"` in the active local runtime
-  config when repo validation must run with Windows host semantics.
-- Disable auto-start with `pushpals --no-auto-start`.
-
-## No npm/Bun install
-
-Download native binaries from GitHub Releases:
-
-https://github.com/PushPalsDev/pushpals/releases
+For startup flow, component boundaries, and troubleshooting, see [Client Surfaces](../../docs/wiki/09-client-surfaces.md).

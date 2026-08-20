@@ -19,16 +19,21 @@ It does not own:
 - git integration/PR merge policy (SourceControlManager),
 - queue persistence (Server).
 
+The request handoff is `claimed request + planning context -> sanitized plan -> direct response or task.execute enqueue -> request completion/failure`. Claims are lease-bound and job enqueue uses a request-derived dedupe key, so callback uncertainty can be reconciled from durable Server state without dispatching duplicate work.
+
 ## Key Files
 
 - `apps/remotebuddy/src/remotebuddy_main.ts` - orchestrator loop, planning, dispatch, and memory usage.
+- `apps/remotebuddy/src/remotebuddy_supervisor.ts` - bounded restart and process-tree shutdown.
 - `apps/remotebuddy/src/brain.ts` - planner contract + repair/fallback behavior.
+- `apps/remotebuddy/src/command_policy.ts` and `path_targeting.ts` - validation and repository targeting.
 - `apps/remotebuddy/src/memory.ts` - memory backend interface, noop/in-memory/composite backends.
 - `apps/remotebuddy/src/persistent_memory.ts` - SQLite-backed persistent memory backend.
 - `apps/remotebuddy/src/idempotency.ts` - replay-safe duplicate suppression.
+- `apps/remotebuddy/src/worker_spawn.ts` - managed WorkerPal launch commands.
 - `apps/remotebuddy/src/autonomous_engine.ts` - bounded autonomous objective dispatch.
 
-## New Memory Layer
+## Memory Layer
 
 RemoteBuddy now has a modular memory backend layer instead of hardwiring a single store.
 

@@ -12,12 +12,22 @@ Main responsibilities:
 - create job-scoped commits,
 - enqueue completion records for integration.
 
+## Component Contract
+
+- Receives: a fenced `task.execute` claim and its planning/validation contract.
+- Owns: isolated worktree preparation, backend execution, validation, logs, and candidate commits.
+- Produces: diagnostics plus a terminal job result or an immutable completion handoff.
+- Does not own: queue truth, runtime-circuit admission, or publication policy.
+
 ## Key Files
 
 - `apps/workerpals/src/workerpals_main.ts` - daemon loop, claim/report lifecycle.
 - `apps/workerpals/src/execute_job.ts` - task execution orchestration and quality gates.
 - `apps/workerpals/src/docker_executor.ts` - warm-container runtime and worktree isolation.
 - `apps/workerpals/src/job_runner.ts` - container-side execution wrapper.
+- `apps/workerpals/src/common/server_transport.ts` - bounded heartbeat and control-plane delivery.
+- `apps/workerpals/src/common/direct_worktree.ts` - host worktree preparation and cleanup boundary.
+- `apps/workerpals/src/timeout_policy.ts` - shared execution deadline policy.
 - `apps/workerpals/src/backends/backend_config.ts` - backend registry/config mapping.
 - `apps/workerpals/src/backends/*` - backend-specific integrations.
 
@@ -33,15 +43,17 @@ Main responsibilities:
 
 At a high level:
 
-1. Worker claims job.
-2. Isolated worktree is created.
-3. Backend executor runs task.
-4. Logs stream to server as job logs.
+1. Worker claims or replays a job with exact worker/generation authority.
+2. Circuit-blocked work is deferred; admitted work receives a positive `/start` acknowledgement.
+3. Isolated worktree is created and the backend executor runs the task.
+4. Logs stream to Server as fenced job logs.
 5. Job result, token usage, cooldowns, validation runs, and patch snapshots cross
    the Docker boundary as one structured result.
-6. Job result is reported complete/fail/publish-blocked.
-7. Commit metadata is enqueued as completion when applicable.
+6. If a candidate commit exists, WorkerPals enqueues its immutable completion handoff and the job becomes `finalizing`.
+7. Otherwise it persists the exact `complete`, `fail`, or `publish-blocked` terminal result.
 8. Worktree is cleaned up.
+
+Logs, diagnostics, deferrals, terminal reports, and completion handoffs carry `workerId + claimGeneration`. Authoritative control transitions are confirmed only by an explicit JSON `{ "ok": true }`. After an ambiguous response, WorkerPals retries the identical transition a bounded number of times; if it remains unconfirmed, it suppresses contradictory projection and recycles so Server recovery stays authoritative. Server admission permits only its single half-open runtime canary to cross the execution boundary.
 
 The daemon sends its packaged runtime generation on claims and heartbeats. The
 Server rejects a WorkerPal from a different generation, preventing a stale

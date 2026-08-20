@@ -1,8 +1,12 @@
-# 09. Client Surfaces (Expo + VS Code)
+# 09. Client Surfaces (CLI, Expo, and VS Code)
 
-## Why There Are Two Clients
+## Why There Are Three Clients
 
-PushPals has two user surfaces with different strengths:
+PushPals has three user surfaces with different strengths:
+
+- `packages/cli` (terminal):
+  - repo-scoped chat and embedded runtime supervision,
+  - minimal terminal-first setup.
 
 - `apps/client` (Expo web/mobile):
   - mission-control dashboard,
@@ -12,6 +16,19 @@ PushPals has two user surfaces with different strengths:
   - in-editor control,
   - local stack start/stop,
   - editor-native chat panel and logs.
+
+## Terminal CLI (`packages/cli`)
+
+### Key Files
+
+- `scripts/pushpals-cli.ts` - terminal UX, repo attachment, and embedded runtime supervision.
+- `packages/cli/bin/pushpals.cjs` - installed npm launcher and Bun bootstrap watchdog.
+- `packages/cli/README.md` - installation and common command reference.
+- `packages/cli/runtime/` - packaged configuration, prompts, schemas, and runtime bundles.
+
+### Runtime Model
+
+The CLI runs from the current git repository and submits chat through the Server session API. If the local stack is unavailable, it can start the packaged control services and WorkerPal capacity, storing repo attachment state in the repository's Git metadata directory and installed assets under `~/.pushpals/runtime`. `pushpals --clear` removes repo-local PushPals state. The CLI owns terminal interaction and supervision; planning, execution, and publication remain with their runtime services.
 
 ## Expo Client (`apps/client`)
 

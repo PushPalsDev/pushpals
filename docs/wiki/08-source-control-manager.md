@@ -6,6 +6,15 @@ SourceControlManager (SCM) owns integration policy.
 
 WorkerPals executes/commits; SCM decides how those commits become branch updates and PRs.
 
+## Component Contract
+
+- Receives: immutable completion records containing candidate commit and branch metadata.
+- Owns: trusted validation, merge strategy, push/PR policy, and publication recovery.
+- Produces: an integrated branch or PR plus a processed/failed completion acknowledgement.
+- Does not own: the original coding execution or authoritative Server job/completion queue state.
+
+The publication path is `claim completion -> validate candidate -> publish -> acknowledge processed/failed`.
+
 ## Key Files
 
 - `apps/source_control_manager/src/source_control_manager_main.ts` - daemon bootstrap and completion processing.
@@ -13,6 +22,9 @@ WorkerPals executes/commits; SCM decides how those commits become branch updates
 - `apps/source_control_manager/src/github_pr.ts` - GitHub API operations (PR list/diff/comments/merge/delete ref).
 - `apps/source_control_manager/src/git.ts` - local git operations and integration branch handling.
 - `apps/source_control_manager/src/db.ts` - local merge queue persistence/logs.
+- `apps/source_control_manager/src/completion_lease.ts` - shared lease-renewal barrier.
+- `apps/source_control_manager/src/completion_callback.ts` - bounded authoritative callback retries.
+- `apps/source_control_manager/src/trusted_validation.ts` - trusted-host validation orchestration.
 
 ## Current Operating Modes
 
@@ -46,7 +58,7 @@ When rejected:
 
 ### 2) Direct Integration Mode (`review_agent.enabled=false`)
 
-SCM fast-forwards validated temp branch into integration branch (`main_agents` by default), pushes, and optionally opens/reuses a PR from integration to base.
+SCM applies the validated candidate using the configured `cherry-pick`, `no-ff`, or `ff-only` strategy, pushes the integration branch (`main_agents` by default), and optionally opens or reuses a PR from integration to base.
 
 ## ReviewAgent Decision Policy (Important)
 
@@ -73,6 +85,8 @@ This keeps provider-specific auth behavior in one place and reduces duplicated a
 - ReviewAgent fix jobs carry structured `reviewAgent` metadata (`prNumber`, `prUrl`, `prHeadRef`, previous score/summary, etc.).
 
 ## Recovery and Safety Features
+
+A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server mutations are fenced by the pusher and token, while the generation identifies immutable recovery checkpoints. Lease renewals and processed/failed callbacks require an explicit JSON `{ "ok": true }`; a `409` loses the lease, and a malformed success remains unconfirmed rather than being treated as publication authority.
 
 - process lock prevents dual SCM daemons on one state directory,
 - completion claims use renewable leases and stable pusher ownership; expired,

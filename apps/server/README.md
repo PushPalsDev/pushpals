@@ -1,69 +1,49 @@
 # PushPals Server
 
-A simple Bun-based server that streams events to clients via **SSE (Server-Sent Events)** and **WebSocket**.
+`apps/server` is the durable control plane for PushPals. It owns session history, request/job/completion queues, worker presence, runtime configuration, and autonomy state. It does not plan tasks, execute repository changes, or publish commits.
 
 ## Quick Start
 
+Run from the repository root:
+
 ```bash
-# Install dependencies (from repo root)
 bun install
-
-# Run the server
-bun --cwd apps/server dev
-
-# Server runs on http://localhost:3001
+bun run server
 ```
 
-## Architecture
+`bun run server` builds the shared protocol first, then starts the Server in watch mode. If the protocol is already current, use `bun run server:only`. App-local commands are `bun run dev`, `bun run start`, and `bun run build` from `apps/server`.
 
-### Event Bus
+The default endpoint is `http://127.0.0.1:3001`; `GET /healthz` is the smallest readiness check.
 
-Each session has an internal `SessionEventBus` that:
+## Component Contract
 
-- Manages subscriptions (in-memory)
-- Validates events against JSON Schema before emitting
-- Notifies all SSE and WebSocket subscribers simultaneously
+- Receives session messages and queue mutations from clients, LocalBuddy, RemoteBuddy, WorkerPals, and SourceControlManager.
+- Persists events before broadcasting them over SSE or WebSocket, so clients can reconnect with a cursor and replay missed history.
+- Owns all queue transitions. Callers propose a mutation; the Server validates ownership and commits it atomically.
+- Exposes queue snapshots, job logs and diagnostics, worker health, runtime configuration, and autonomy endpoints.
 
-### Endpoints
+The candidate-producing pipeline is:
 
-- `POST /sessions` - Create a new session
-- `GET /sessions/:id/events` - SSE stream
-- `GET /sessions/:id/ws` - WebSocket stream
-- `POST /sessions/:id/message` - Send a message
-- `POST /approvals/:id` - Submit approval decision
+```text
+request -> RemoteBuddy claim -> job -> WorkerPal claim/start -> completion -> SCM publication
+```
 
-### Session Manager
+## Durable State and Recovery
 
-Global `SessionManager` handles:
+The configured `paths.shared_db_path` is the shared SQLite database; it defaults to `outputs/data/pushpals.db`. It stores sessions, replayable events, queues, job activity, worker state, and autonomy records.
 
-- Session creation and lifecycle
-- Event emission
-- Approval workflows
-- In-memory storage (cleared on restart)
+Worker-owned job writes are fenced by `workerId` plus `claimGeneration`. A claim is pre-execution until `POST /jobs/:id/start` is positively acknowledged. Stale-claim sweeps, lease recovery, lifecycle reconciliation, and the durable WorkerPal runtime circuit recover interrupted work without accepting late writes from an old owner. Completion processing similarly uses renewable, fenced claims.
 
-## Key Features
+## Auth and Exposure
 
-✅ Validates all events against JSON Schema  
-✅ SSE and WebSocket emit identical EventEnvelope messages  
-✅ Same event bus for both transports  
-✅ In-memory approvals and sessions  
-✅ Keepalive pings on SSE (15 seconds)  
-✅ 100% local; no external dependencies
+PushPals currently runs in local-only mode. The Server binds to `127.0.0.1` by default and explicitly ignores configured auth tokens. Do not expose it on an untrusted interface without first adding and validating an authentication boundary.
 
-## Files
+## Key Entrypoints
 
-- `src/server_main.ts` - HTTP server and route handlers
-- `src/events.ts` - SessionEventBus and SessionManager
+- `src/server_main.ts` - HTTP routing and lifecycle orchestration.
+- `src/events.ts` and `src/db.ts` - durable session events and replay.
+- `src/requests.ts`, `src/jobs.ts`, `src/completions.ts` - queue state machines.
+- `src/autonomy.ts` - objectives, snapshots, policy evidence, and locks.
+- `src/lifecycle_reconciliation.ts` - bounded recovery watchdog.
 
-## Protocol
-
-All events conform to the shared `EventEnvelope` schema in `packages/protocol`.
-
-See [Protocol README](../../packages/protocol/README.md) for details.
-
-## Future
-
-- Persist sessions to database (PostgreSQL)
-- Real Git integration (currently mocked)
-- Authentication / authorization
-- Rate limiting
+For endpoint families, invariants, and on-call guidance, see the [Server Control Plane wiki](../../docs/wiki/04-server-control-plane.md).

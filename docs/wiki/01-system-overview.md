@@ -30,6 +30,8 @@ Both modes end up in the same request/job/completion queues so behavior is visib
   - Mission-control UI (Expo web/native).
 - `apps/vscode-client`
   - VS Code extension client and stack orchestrator.
+- `packages/cli`
+  - Repo-aware terminal client and packaged runtime supervisor.
 - `apps/localbuddy`
   - Fast ingress endpoint (`POST /message`) and lightweight handling.
 - `apps/server`

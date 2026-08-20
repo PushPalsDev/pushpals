@@ -5,30 +5,51 @@ This wiki is written for two audiences:
 - New engineers who need a clear system mental model.
 - Maintainers who need precise operational and architectural details.
 
-This wiki is hopefully synced via:
-https://github.com/PushPalsDev/pushpals/actions/workflows/publish-wiki.yml
+`docs/wiki` is the canonical source. The
+[`publish-wiki`](https://github.com/PushPalsDev/pushpals/actions/workflows/publish-wiki.yml)
+workflow publishes it to the GitHub wiki; edit these files rather than the
+published copy.
 
 ## Recommended Reading Paths
 
-## Path A: New Engineer (first 60 minutes)
+### Path A: New Engineer (first 60 minutes)
 
-1. `docs/wiki/01-system-overview.md`
-2. `docs/wiki/02-runtime-architecture.md`
-3. `docs/wiki/09-client-surfaces.md`
-4. `docs/wiki/12-operations-testing-and-roadmap.md`
+1. [System overview](https://github.com/PushPalsDev/pushpals/wiki/01-system-overview)
+2. [Runtime architecture](https://github.com/PushPalsDev/pushpals/wiki/02-runtime-architecture)
+3. [Client surfaces](https://github.com/PushPalsDev/pushpals/wiki/09-client-surfaces)
+4. [Operations and testing](https://github.com/PushPalsDev/pushpals/wiki/12-operations-testing-and-roadmap)
 
-## Path B: Runtime and Reliability
+### Path B: Runtime and Reliability
 
-1. `docs/wiki/04-server-control-plane.md`
-2. `docs/wiki/06-remotebuddy.md`
-3. `docs/wiki/07-workerpals.md`
-4. `docs/wiki/08-source-control-manager.md`
+1. [Server control plane](https://github.com/PushPalsDev/pushpals/wiki/04-server-control-plane)
+2. [RemoteBuddy](https://github.com/PushPalsDev/pushpals/wiki/06-remotebuddy)
+3. [WorkerPals](https://github.com/PushPalsDev/pushpals/wiki/07-workerpals)
+4. [SourceControlManager](https://github.com/PushPalsDev/pushpals/wiki/08-source-control-manager)
 
-## Path C: Platform and Contracts
+### Path C: Platform and Contracts
 
-1. `docs/wiki/03-configuration-and-environments.md`
-2. `docs/wiki/10-shared-packages-and-protocol.md`
-3. `docs/wiki/11-prompts-llm-and-safety.md`
+1. [Configuration and environments](https://github.com/PushPalsDev/pushpals/wiki/03-configuration-and-environments)
+2. [Shared packages and protocol](https://github.com/PushPalsDev/pushpals/wiki/10-shared-packages-and-protocol)
+3. [Prompts, LLMs, and safety](https://github.com/PushPalsDev/pushpals/wiki/11-prompts-llm-and-safety)
+
+## Component Map
+
+The common candidate-producing execution path is:
+
+`CLI/UI -> Server session ingress -> request queue -> RemoteBuddy -> job queue -> WorkerPals -> completion queue -> SourceControlManager`
+
+LocalBuddy is an optional fast ingress that can answer locally or enqueue into
+the same Server request queue.
+
+| Component                    | Contract                                                                                                      | Detailed guide                                                                                  |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| CLI and clients              | Collect user intent, supervise local runtimes, and project durable Server state; they do not own queue state. | [Client surfaces](https://github.com/PushPalsDev/pushpals/wiki/09-client-surfaces)              |
+| LocalBuddy                   | Turns `POST /message` into a quick reply or a durable queued request; it does not plan or execute jobs.       | [LocalBuddy](https://github.com/PushPalsDev/pushpals/wiki/05-localbuddy)                        |
+| Server                       | Owns sessions, events, queues, leases, and worker state; it does not plan, execute, or publish code.          | [Server control plane](https://github.com/PushPalsDev/pushpals/wiki/04-server-control-plane)    |
+| RemoteBuddy                  | Turns a claimed request into a direct response or scoped job; it does not mutate the repository.              | [RemoteBuddy](https://github.com/PushPalsDev/pushpals/wiki/06-remotebuddy)                      |
+| WorkerPals                   | Turns an authorized job into a terminal result or validated candidate commit; it does not decide publication. | [WorkerPals](https://github.com/PushPalsDev/pushpals/wiki/07-workerpals)                        |
+| SourceControlManager         | Validates and publishes completion candidates; it does not execute the original coding job.                   | [SourceControlManager](https://github.com/PushPalsDev/pushpals/wiki/08-source-control-manager)  |
+| Protocol and shared packages | Define wire contracts and reusable runtime behavior; they own no service state.                               | [Shared packages](https://github.com/PushPalsDev/pushpals/wiki/10-shared-packages-and-protocol) |
 
 ## Core Principle
 
@@ -38,7 +59,7 @@ PushPals is intentionally split into small services with strict boundaries:
 - Planning is isolated in `apps/remotebuddy`.
 - Execution is isolated in `apps/workerpals`.
 - Integration is isolated in `apps/source_control_manager`.
-- User surfaces stay thin (`apps/client`, `apps/vscode-client`).
+- User surfaces stay thin (`packages/cli`, `apps/client`, `apps/vscode-client`).
 
 This separation increases observability and recoverability, at the cost of higher orchestration complexity.
 

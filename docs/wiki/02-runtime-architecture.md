@@ -4,21 +4,24 @@
 
 At runtime, a typical interactive request flows like this:
 
-1. Client sends user message to LocalBuddy (`POST /message`).
-2. LocalBuddy may answer directly or enqueue a request into Server (`/requests/enqueue`).
-3. RemoteBuddy claims request (`/requests/claim`), plans work, emits status/messages.
+1. CLI, Expo, or VS Code submits a Server session message (`POST /sessions/:id/message`).
+2. Server persists the message and enqueues a durable request.
+3. RemoteBuddy claims the request (`/requests/claim`), plans work, and emits status/messages.
 4. RemoteBuddy may enqueue a job (`/jobs/enqueue`).
-5. WorkerPals claims and executes (`/jobs/claim` -> run -> complete/fail).
-6. WorkerPals enqueues completion metadata (`/completions/enqueue`).
-7. SourceControlManager claims completion and integrates it.
-8. Server emits session events over SSE/WS so UI can render the full lifecycle.
+5. WorkerPals claims, starts, and executes the job.
+6. Candidate-producing work enters the completion queue; other outcomes terminate on the job.
+7. SourceControlManager claims a completion and integrates or publishes it.
+8. Server emits session events over SSE/WS so clients can render the full lifecycle.
+
+LocalBuddy provides an optional `POST /message` ingress that can answer locally
+or enqueue into the same Server request queue.
 
 ## Flow Boundaries
 
 Three boundaries matter most during design and debugging:
 
 - Planning boundary:
-  - LocalBuddy/RemoteBuddy decide what should be done.
+  - RemoteBuddy decides what planned work should be done; LocalBuddy only decides quick reply versus delegation on its ingress.
 - Execution boundary:
   - WorkerPals decides how planned work is executed.
 - Integration boundary:
