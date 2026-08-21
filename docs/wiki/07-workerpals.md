@@ -101,6 +101,12 @@ This provides:
 - optional critic/revision loops (backend-specific),
 - output compaction and structured result handling.
 
+Docs-only declared targets override incidental test terminology, and read-only
+discovery hints alone do not classify a job as test-focused. The local revision
+circuit compares failed-test identities and assertion context, so a changed
+failure cluster can receive another bounded repair while an exact repeat still
+stops.
+
 Packaged WorkerPal sandbox images receive the complete runtime prompt bundle,
 including the shared ReviewAgent rubric used by CriticGate. Package-payload and
 runtime-completeness checks require the critical critic/reviewer files. If an

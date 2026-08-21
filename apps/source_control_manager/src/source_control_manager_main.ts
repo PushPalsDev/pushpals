@@ -63,6 +63,7 @@ import {
   durablePublicationRecoveryState,
   isValidationCheckpointPublished,
   PublicationAuthorityUnreachableError,
+  PublicationConfirmationPendingError,
   publicationFailureDisposition,
   publishWithAuthoritativeProof,
   shouldSkipValidationForDurableRecovery,
@@ -1850,6 +1851,7 @@ async function tick(): Promise<void> {
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err: any) {
+      const publicationConfirmationPending = err instanceof PublicationConfirmationPendingError;
       const publicationAttemptUncertain = err instanceof PublicationAuthorityUnreachableError;
       let authoritativeReprobe: AuthoritativePublicationReprobe = "absent";
       if (validatedCheckpointRecoveryPending && previousValidationCheckpoint?.validationProven) {
@@ -1894,6 +1896,7 @@ async function tick(): Promise<void> {
       const failureDisposition = publicationFailureDisposition({
         publicationReadyForFinalization,
         publicationAttemptUncertain,
+        publicationConfirmationPending,
         authoritativeReprobe,
         validatedCheckpointRecoveryPending,
       });
@@ -1915,12 +1918,12 @@ async function tick(): Promise<void> {
         }
       } else if (failureDisposition === "reconcile") {
         console.warn(
-          `[${ts()}] Publication outcome is uncertain for ${completion.id} because the authoritative ref remained unreachable. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`,
+          `[${ts()}] Publication outcome is not yet confirmed for ${completion.id}. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`,
         );
         try {
           await emitPusherMessage(
             comm,
-            `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it when the authoritative ref is reachable; the job was not marked failed.`,
+            `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`,
             completion.id,
             completionEventMeta,
           );

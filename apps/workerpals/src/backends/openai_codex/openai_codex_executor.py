@@ -1191,31 +1191,86 @@ def _task_explicitly_requests_mock_harness_repair(task_text: str) -> bool:
     text = str(task_text or "").lower()
     if not text:
         return False
-    if "reactnativemock" in text or "tests/reactnativemock" in text:
-        return True
-    repair_markers = (
-        "stabilize",
-        "harden",
-        "repair",
-        "fix",
-        "sync",
-        "synchronize",
-        "align",
-        "resettable",
-        "deterministic",
-        "typings",
-        "declarations",
+    if re.search(
+        r"\b(?:do not|don't|must not|without)\s+(?:modify|change|edit|touch|repair|update)\b"
+        r"[^\n.;]{0,60}\b(?:implementation|mock|harness|reactnativemock)\b"
+        r"|\b(?:documentation|docs)[ -]?only\b|\bno implementation changes?\b",
+        text,
+        re.I,
+    ):
+        return False
+
+    repair_target = (
+        r"(?:react\s*native|rn|shared)\s+mock(?:\s+(?:helper|harness))?"
+        r"|(?:tests[\\/])?reactnativemock(?:\.(?:js|ts|d\.ts))?"
+        r"|(?:mock|test)\s+harness|__mocks__"
     )
-    mock_harness_markers = (
-        "react native mock",
-        "rn mock",
-        "mock harness",
-        "test harness",
-        "shared mock",
-        "__mocks__",
+    direct_repair_pattern = re.compile(
+        r"\b(?:fix|repair|stabilize|harden|sync|synchronize|align|reset|rewrite|replace|modify)\b"
+        rf"(?:(?!\b(?:document|documentation|guidance|contract|rules)\b).){{0,80}}\b(?:{repair_target})\b",
+        re.I,
     )
-    return any(marker in text for marker in mock_harness_markers) and any(
-        marker in text for marker in repair_markers
+    direct_construction_pattern = re.compile(
+        r"\b(?:add|create|implement|update|edit|change|alter)\b\s+"
+        r"(?:(?:a|an|the|new|focused)\s+)?"
+        rf"(?:{repair_target})\b",
+        re.I,
+    )
+    explicit_harness_path_pattern = re.compile(
+        r"\b(?:fix|repair|stabilize|harden|sync|synchronize|align|reset|rewrite|replace|"
+        r"modify|update|edit|change|alter)\b"
+        r"(?:(?!\b(?:docs?|document|documentation|guidance|contract|rules)\b).){0,100}"
+        r"\b(?:tests[\\/])?reactnativemock(?:\.(?:js|ts|d\.ts))?\b",
+        re.I,
+    )
+    direct_matches = [
+        match
+        for match in (
+            direct_repair_pattern.search(text),
+            direct_construction_pattern.search(text),
+            explicit_harness_path_pattern.search(text),
+        )
+        if match is not None
+    ]
+    if not direct_matches:
+        return False
+
+    documentation_framing = re.search(
+        r"\b(?:document|documenting|describe|describing|codify)\b"
+        r"|\b(?:write|add|update)\b[^\n.;]{0,80}\b(?:docs?|documentation|guidance)\b"
+        r"|\b(?:docs[\\/][^\s:;]+|[^\s:;]+\.md)\b",
+        text,
+        re.I,
+    )
+    first_direct_position = min(match.start() for match in direct_matches)
+    if documentation_framing is not None and documentation_framing.start() <= first_direct_position:
+        return False
+    return True
+
+
+def _task_requests_test_harness_documentation_inspection(task_text: str) -> bool:
+    text = str(task_text or "").lower()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "docs/",
+            ".md",
+            "document",
+            "documentation",
+            "codify",
+            "guidance",
+        )
+    ) and any(
+        marker in text
+        for marker in (
+            "teardown",
+            "lifecycle",
+            "cleanup",
+            "bun test",
+            "test harness",
+        )
     )
 
 
@@ -1242,8 +1297,9 @@ def _task_allows_repo_native_test_harness_reference(task_text: str) -> bool:
         "route stack",
         "route shell",
     )
-    return any(marker in text for marker in test_markers) and any(
-        marker in text for marker in owner_markers
+    allows_owner_reference = any(marker in text for marker in owner_markers)
+    return any(marker in text for marker in test_markers) and (
+        allows_owner_reference or _task_requests_test_harness_documentation_inspection(text)
     )
 
 
@@ -1263,8 +1319,23 @@ def _trace_mentions_existing_or_focused_harness_reference(text: str) -> bool:
         "opportunity-graph.contract",
         "narrow contract",
         "focused contract",
+        "focused cleanup harness",
+        "react native mock validation passed",
     )
     return any(marker in text for marker in markers)
+
+
+def _trace_describes_harness_documentation(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:(?:add(?:ing)?|writ(?:e|ing)|updat(?:e|ing))\s+"
+            r"(?:documentation|guidance)\b[^\n]{0,100}|"
+            r"(?:document(?:ing)?|describ(?:e|ing))\b[^\n]{0,100})"
+            r"\b(?:shared|react native) mock\b",
+            text,
+            re.I,
+        )
+    )
 
 
 def _detect_offtrack_rollout(
@@ -1288,19 +1359,85 @@ def _detect_offtrack_rollout(
         return "the worker is drifting into full render or full-surface harness work"
 
     task_allows_mock_harness = _task_explicitly_requests_mock_harness_repair(task_text)
-    broad_mock_pattern = re.compile(r"(broad .*mock|shared mock|adding .*mock helper)", re.I)
-    if not task_allows_mock_harness and broad_mock_pattern.search(text):
+    task_allows_harness_reference = _task_allows_repo_native_test_harness_reference(task_text)
+    trace_lines = [line for line in text.splitlines() if line.strip()]
+
+    def line_allows_harness_reference(line: str) -> bool:
+        return task_allows_harness_reference and (
+            _trace_mentions_existing_or_focused_harness_reference(line)
+            or _trace_describes_harness_documentation(line)
+            or any(
+                marker in line
+                for marker in (
+                    "shared mock registers",
+                    "shared react native reset",
+                    "representative teardown tests",
+                )
+            )
+        )
+
+    direct_mock_mutation_pattern = re.compile(
+        r"(broad .*mock|(?:add(?:ing)?|creat(?:e|ed|ing)|expand(?:ing)?|repair(?:ing)?|"
+        r"rewrit(?:e|ing|ten)|replac(?:e|ed|ing)|modif(?:y|ied|ying)|updat(?:e|ed|ing)|"
+        r"edit(?:ed|ing)?|chang(?:e|ed|ing)|alter(?:ed|ing)?|complet(?:e|ed|ing))\s+"
+        r"(?:(?:a|an|the|new|broad)\s+)?(?:shared|react native) mock)",
+        re.I,
+    )
+    descriptive_mock_mutation_pattern = re.compile(
+        r"(?:shared|react native) mock[^\n;]{0,80}"
+        r"(?:repair|expansion|rewrite|replacement|modification)",
+        re.I,
+    )
+    mutation_clause_boundary_pattern = re.compile(
+        r";|\bthen\b|\band\s+(?=(?:i\s+)?(?:also\s+)?(?:updated|edited|changed|created|"
+        r"modified|completed|repaired|replaced|rewrote|expanded)\b)",
+        re.I,
+    )
+
+    def mutation_clause(line: str, mutation_start: int) -> tuple[str, int]:
+        clause_start = 0
+        for boundary in mutation_clause_boundary_pattern.finditer(line[:mutation_start]):
+            clause_start = boundary.end()
+        return line[clause_start:].strip(), clause_start
+
+    def direct_mutation_is_documentation(line: str, match: re.Match[str]) -> bool:
+        clause, clause_start = mutation_clause(line, match.start())
+        if not line_allows_harness_reference(clause):
+            return False
+        return bool(
+            re.search(
+                r"\b(?:how|when)\s+to\s*$",
+                line[clause_start : match.start()],
+                re.I,
+            )
+        )
+
+    has_unexplained_direct_mutation = any(
+        not direct_mutation_is_documentation(line, match)
+        for line in trace_lines
+        for match in direct_mock_mutation_pattern.finditer(line)
+    )
+    has_unexplained_descriptive_mutation = any(
+        not line_allows_harness_reference(mutation_clause(line, match.start())[0])
+        for line in trace_lines
+        for match in descriptive_mock_mutation_pattern.finditer(line)
+    )
+    if not task_allows_mock_harness and (
+        has_unexplained_direct_mutation
+        or has_unexplained_descriptive_mutation
+    ):
         return "the worker is drifting into broad test-harness or React Native mock repair"
 
-    soft_harness_pattern = re.compile(r"(test harness repair|react native mock)", re.I)
-    allows_existing_harness_reference = (
-        _task_allows_repo_native_test_harness_reference(task_text)
-        and _trace_mentions_existing_or_focused_harness_reference(text)
+    soft_harness_pattern = re.compile(
+        r"(test harness repair|(?:shared|react native) mock)", re.I
+    )
+    has_unexplained_soft_harness_reference = any(
+        soft_harness_pattern.search(line) and not line_allows_harness_reference(line)
+        for line in trace_lines
     )
     if (
         not task_allows_mock_harness
-        and not allows_existing_harness_reference
-        and soft_harness_pattern.search(text)
+        and has_unexplained_soft_harness_reference
     ):
         return "the worker is drifting into broad test-harness or React Native mock repair"
 

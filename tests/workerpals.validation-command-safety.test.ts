@@ -31,6 +31,7 @@ import {
   isTestSupportPath,
   isTestLikeValidationStep,
   isValidationToolingPath,
+  packageScriptSequenceReferences,
   playwrightBrowserInstallArgv,
   playwrightBrowserRuntimeCacheMarkerPath,
   prepareValidationCommandArgv,
@@ -1203,6 +1204,8 @@ describe("workerpals validation command safety", () => {
         JSON.stringify({
           scripts: {
             validate: "node ./scripts/validate.js",
+            "web:review:validate":
+              "node ./scripts/run-package-script-sequence.js validate worker:deploy:dry-run",
             "test:supabase": "node ./scripts/test-supabase.js",
             "worker:deploy:dry-run": "wrangler deploy --dry-run",
           },
@@ -1221,6 +1224,12 @@ describe("workerpals validation command safety", () => {
       );
 
       expect(validationCommandRequiresDockerDaemon(root, "bun run validate")).toBe(true);
+      expect(
+        packageScriptSequenceReferences(
+          "node ./scripts/run-package-script-sequence.js validate worker:deploy:dry-run",
+        ),
+      ).toEqual(["validate", "worker:deploy:dry-run"]);
+      expect(validationCommandRequiresDockerDaemon(root, "bun run web:review:validate")).toBe(true);
       expect(validationCommandRequiresDockerDaemon(root, "bun run worker:deploy:dry-run")).toBe(
         false,
       );
@@ -1232,6 +1241,11 @@ describe("workerpals validation command safety", () => {
       const deferredDetail = trustedEnvironmentValidationDeferralReason(root, "bun run validate", {
         PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable",
       });
+      expect(
+        trustedEnvironmentValidationDeferralReason(root, "bun run web:review:validate", {
+          PUSHPALS_WORKER_DOCKER_CAPABILITY: "unavailable",
+        }),
+      ).toContain("trusted host");
       expect(
         detectValidationBlocker([
           {
@@ -2016,6 +2030,81 @@ describe("workerpals validation command safety", () => {
         }) as any,
         "tests/workerpals.validation-command-safety.test.ts",
       ),
+    ).toBe(true);
+  });
+
+  test("does not classify explicit docs-only work as test-focused from inspection language", () => {
+    const teardownDocsInstruction =
+      "Update `docs/codebase_context.md` to codify the repository's supported Bun test teardown contract. Read `vision.md` and verify relevant unit tests/configuration before documenting anything. Specify the supported teardown API and import/registration pattern, require deterministic cleanup of timers, listeners, servers, sockets, subscriptions, and pending async work, and describe assertions that expose lifecycle leaks instead of masking them. Include concise guidance for diagnosing suite-wide teardown failures and avoiding unsupported Bun APIs. Keep the guidance aligned with current implementation and tests; update other directly relevant documentation only if necessary. Run `bun run validate` and report the result, distinguishing any pre-existing failures from changes introduced by this work.";
+    const teardownDocsPlanning = planningFixture({
+      targetPaths: ["docs/codebase_context.md"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["docs/codebase_context.md"],
+      },
+      discovery: {
+        ripgrepQueries: ["afterEach|teardown|Bun test"],
+        likelyDirs: ["docs", "account/__tests__", "tests"],
+      },
+      acceptanceCriteria: [
+        "Read vision.md and inspect relevant tests, imports, and Bun configuration before editing documentation.",
+        "Only directly relevant documentation is changed.",
+      ],
+    }) as any;
+    expect(
+      isTestFocusedTask(teardownDocsInstruction, teardownDocsPlanning, "docs/codebase_context.md"),
+    ).toBe(false);
+
+    const accountDocsInstruction =
+      "Update `docs/account_testing.md` to define the missing account/economy rejection contract and its required review evidence. First read `docs/codebase_context.md`, `vision.md`, and the relevant existing implementation/tests; treat current behavior as authoritative. Add a concise acceptance matrix covering HTTP status, stable error code, sanitized response body, and request-ID behavior for rejected account restoration and rejected Sector Coin or entitlement mutations. Explicitly require evidence that failures do not mutate authoritative server state. Distinguish checks requiring web review from those established by Worker dry-run validation, and avoid expanding into recently completed or explicitly excluded test targets. Update other directly relevant documentation only if needed for consistency. Validate with `bun run validate` and `bun run worker:deploy:dry-run`; report changed files, results, and any behavior/documentation mismatch discovered.";
+    const accountDocsPlanning = planningFixture({
+      targetPaths: ["docs/account_testing.md"],
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["docs/account_testing.md"],
+      },
+      discovery: {
+        ripgrepQueries: ["account restoration|Sector Coin|entitlement"],
+        likelyDirs: ["docs", "account", "cloudflare", "multiplayer", "engine"],
+      },
+      acceptanceCriteria: [
+        "Existing behavior, implementation, tests, and unrelated test targets remain unchanged.",
+      ],
+    }) as any;
+    expect(
+      isTestFocusedTask(accountDocsInstruction, accountDocsPlanning, "docs/account_testing.md"),
+    ).toBe(false);
+
+    const writeGlobsOnlyPlanning = planningFixture({
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["docs/**"],
+      },
+      discovery: {
+        ripgrepQueries: ["test teardown|shared mock"],
+        likelyDirs: ["docs", "tests"],
+      },
+      acceptanceCriteria: ["Inspect relevant tests before updating the documentation."],
+    }) as any;
+    expect(
+      isTestFocusedTask(
+        "Update the documentation after inspecting the test teardown harness.",
+        writeGlobsOnlyPlanning,
+      ),
+    ).toBe(false);
+
+    const escapingDocsPlanning = planningFixture({
+      scope: {
+        readAnywhere: true,
+        writeAllowed: true,
+        writeGlobs: ["docs/**/../../src/**"],
+      },
+    }) as any;
+    expect(
+      isTestFocusedTask("Update tests for the affected source behavior.", escapingDocsPlanning),
     ).toBe(true);
   });
 });

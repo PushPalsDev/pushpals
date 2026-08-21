@@ -6,6 +6,7 @@ import {
   durablePublicationRecoveryState,
   isValidationCheckpointPublished,
   PublicationAuthorityUnreachableError,
+  PublicationConfirmationPendingError,
   PublicationProofLostError,
   publicationFailureDisposition,
   publishWithAuthoritativeProof,
@@ -151,6 +152,100 @@ describe("SourceControlManager publication recovery", () => {
     expect(publication.recoveredFromAmbiguousFailure).toBe(true);
   });
 
+  test("waits for a successful push to become authoritative", async () => {
+    let proofAttempts = 0;
+    const waits: number[] = [];
+    const publication = await publishWithAuthoritativeProof({
+      mutate: async () => ({ ok: true, stderr: "push accepted" }),
+      provePublished: async () => {
+        proofAttempts += 1;
+        return proofAttempts === 3;
+      },
+      failurePrefix: "push failed",
+      proofRetry: {
+        attempts: 3,
+        initialDelayMs: 10,
+        maxDelayMs: 20,
+        wait: async (delayMs) => {
+          waits.push(delayMs);
+        },
+      },
+    });
+
+    expect(publication).toEqual({
+      result: { ok: true, stderr: "push accepted" },
+      recoveredFromAmbiguousFailure: false,
+    });
+    expect(proofAttempts).toBe(3);
+    expect(waits).toEqual([10, 20]);
+  });
+
+  test("keeps a successful push nonterminal when bounded proof remains absent", async () => {
+    const pending = publishWithAuthoritativeProof({
+      mutate: async () => ({ ok: true, stderr: "remote accepted update" }),
+      provePublished: async () => false,
+      failurePrefix: "push failed",
+      proofRetry: {
+        attempts: 3,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        wait: async () => {},
+      },
+    });
+
+    await expect(pending).rejects.toBeInstanceOf(PublicationConfirmationPendingError);
+    expect(
+      publicationFailureDisposition({
+        publicationReadyForFinalization: false,
+        publicationAttemptUncertain: false,
+        publicationConfirmationPending: true,
+        authoritativeReprobe: "absent",
+      }),
+    ).toBe("reconcile");
+  });
+
+  test("fails a rejected push after bounded authoritative absence", async () => {
+    let proofAttempts = 0;
+    const rejected = publishWithAuthoritativeProof({
+      mutate: async () => ({ ok: false, stderr: "force-with-lease rejected" }),
+      provePublished: async () => {
+        proofAttempts += 1;
+        return false;
+      },
+      failurePrefix: "push failed",
+      proofRetry: {
+        attempts: 2,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        wait: async () => {},
+      },
+    });
+
+    await expect(rejected).rejects.toThrow("push failed: force-with-lease rejected");
+    expect(proofAttempts).toBe(2);
+  });
+
+  test("does not multiply a bounded network-probe failure", async () => {
+    let proofAttempts = 0;
+    const pending = publishWithAuthoritativeProof({
+      mutate: async () => ({ ok: true }),
+      provePublished: async () => {
+        proofAttempts += 1;
+        throw new Error("remote authority unavailable");
+      },
+      failurePrefix: "push failed",
+      proofRetry: {
+        attempts: 2,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        wait: async () => {},
+      },
+    });
+
+    await expect(pending).rejects.toBeInstanceOf(PublicationConfirmationPendingError);
+    expect(proofAttempts).toBe(1);
+  });
+
   test("keeps a mutation nonterminal when both authoritative probes are unreachable", async () => {
     const firstAttempt = publishWithAuthoritativeProof({
       mutate: async () => {
@@ -160,6 +255,12 @@ describe("SourceControlManager publication recovery", () => {
         throw new Error("remote authority unavailable");
       },
       failurePrefix: "push failed",
+      proofRetry: {
+        attempts: 2,
+        initialDelayMs: 0,
+        maxDelayMs: 0,
+        wait: async () => {},
+      },
     });
 
     await expect(firstAttempt).rejects.toBeInstanceOf(PublicationAuthorityUnreachableError);

@@ -5110,6 +5110,8 @@ var REPO_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 900000;
 var REPO_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120000;
 var IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 600000;
 var IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120000;
+var CRITIC_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 420000;
+var CRITIC_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120000;
 function qualityRevisionLoopUpperBound(policy, opts = {}) {
   return Math.max(policy.maxAutoRevisions, policy.validationMaxAutoRevisions, opts.browserValidation ? BROWSER_VALIDATION_MAX_AUTO_REVISIONS : 0);
 }
@@ -5129,6 +5131,52 @@ function qualityRevisionBudgetDecision(opts) {
     shouldStart: remainingBudgetMs >= minimumRevisionBudgetMs,
     remainingBudgetMs,
     minimumRevisionBudgetMs
+  };
+}
+function criticActionableFeedbackCount(critic) {
+  if (!critic)
+    return 0;
+  return critic.mustFix.length + critic.findings.length + (String(critic.revisionGuidance ?? "").trim() ? 1 : 0);
+}
+function criticRepairContinuationBudgetDecision(opts) {
+  const stop = (reason) => ({
+    shouldContinue: false,
+    executionBudgetMs: 0,
+    finalizationBudgetMs: 0,
+    reason
+  });
+  if (opts.revisionBudget.shouldStart)
+    return stop("standard revision budget is available");
+  if (opts.continuationAlreadyUsed)
+    return stop("final critic repair continuation was already used");
+  if (opts.deterministicRequiresRevision || !opts.criticRequiresRevision) {
+    return stop("failure is not critic-only");
+  }
+  if (opts.requiredValidationFailures.length > 0) {
+    return stop("required validation has a non-environment failure");
+  }
+  if (opts.revisionAttempt >= opts.maxAutoRevisions) {
+    return stop("critic revision limit is already exhausted");
+  }
+  if (publishableChangedPaths(opts.changedPaths).length === 0) {
+    return stop("no publishable critic repair patch is present");
+  }
+  const score = Number(opts.criticScore);
+  const threshold = Number(opts.criticMinScore);
+  if (!Number.isFinite(score) || !Number.isFinite(threshold) || score >= threshold || threshold - score > 1) {
+    return stop("critic score is unavailable or outside the bounded repair window");
+  }
+  if (Math.max(0, Math.floor(opts.actionableFeedbackCount)) === 0) {
+    return stop("critic supplied no actionable repair feedback");
+  }
+  if (opts.softPassOnExhausted && (opts.trustedValidationPendingCommands?.length ?? 0) === 0) {
+    return stop("existing critic-only soft-pass policy applies");
+  }
+  return {
+    shouldContinue: true,
+    executionBudgetMs: CRITIC_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS,
+    finalizationBudgetMs: CRITIC_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS,
+    reason: "near-threshold critic feedback has one final bounded repair budget"
   };
 }
 function browserValidationRepairContinuationBudgetDecision(opts) {
@@ -5573,6 +5621,8 @@ function isDockerDaemonValidationBlocker(value) {
 function classifyValidationRunFailure(run) {
   if (run.ok)
     return null;
+  if (run.inheritedFailureClass)
+    return run.inheritedFailureClass;
   const combined = `${run.command}
 ${run.stdout}
 ${run.stderr}`.toLowerCase();
@@ -5606,10 +5656,14 @@ function buildValidationRunDiagnostics(runs, attempt) {
     failureClass: classifyValidationRunFailure(run),
     stdoutTail: compactDiagnosticText(run.stdout),
     stderrTail: compactDiagnosticText(run.stderr),
-    ...run.browserSignal ? {
+    ...run.browserSignal || run.inheritedFailureClass || run.deferredByCommand ? {
       metadata: {
-        browserSignal: run.browserSignal,
-        terminalStatusSource: run.terminalStatusSource ?? "process_exit"
+        ...run.browserSignal ? {
+          browserSignal: run.browserSignal,
+          terminalStatusSource: run.terminalStatusSource ?? "process_exit"
+        } : {},
+        ...run.inheritedFailureClass ? { inheritedFailureClass: run.inheritedFailureClass } : {},
+        ...run.deferredByCommand ? { deferredByCommand: run.deferredByCommand } : {}
       }
     } : {}
   }));
@@ -6647,6 +6701,15 @@ function validationTextRequiresDockerDaemon(text) {
   }
   return /\bsupabase\b/i.test(text) && /\blocal stack\b|run\s*\(\s*\[\s*["'](?:status|start|stop)["']/i.test(text);
 }
+function packageScriptSequenceReferences(script) {
+  const argv = tokenizeValidationCommandArgv(script);
+  if (!argv)
+    return [];
+  const runnerIndex = argv.findIndex((token) => /(?:^|\/)run-package-script-sequence\.(?:c?js|mjs|ts)$/i.test(token.replace(/\\/g, "/")));
+  if (runnerIndex < 0)
+    return [];
+  return Array.from(new Set(argv.slice(runnerIndex + 1).map((token) => token.trim()).filter((token) => /^[A-Za-z0-9][A-Za-z0-9:._-]*$/.test(token))));
+}
 function validationCommandRequiresDockerDaemon(repo, command) {
   const visited = new Set;
   const visit = (currentCommand, depth) => {
@@ -6674,6 +6737,9 @@ ${referencedText}`;
     for (const match of combined.matchAll(/["']run["']\s*,\s*["']([A-Za-z0-9:_-]+)["']/gi)) {
       if (match[1])
         nestedScriptNames.add(match[1]);
+    }
+    for (const scriptName of packageScriptSequenceReferences(resolvedScript.script)) {
+      nestedScriptNames.add(scriptName);
     }
     return Array.from(nestedScriptNames).some((scriptName) => visit(`bun run ${scriptName}`, depth + 1));
   };
@@ -7326,6 +7392,12 @@ function detectValidationBlocker(runs) {
   const failedRuns = runs.filter((run) => !run.ok);
   if (failedRuns.length === 0)
     return null;
+  if (failedRuns.every((run) => run.inheritedFailureClass === "environment")) {
+    return {
+      category: "environment",
+      detail: "Validation was skipped because a lower-tier command is blocked by the worker environment. Preserve the candidate and rerun the blocked command chain on the trusted host."
+    };
+  }
   const combined = failedRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean).join(`
 `).toLowerCase();
   if (!combined)
@@ -7597,13 +7669,18 @@ function validationCommandExecutionTier(command) {
   }
   return 1;
 }
-function shouldDeferHigherTierValidationAfterFailure(command, previousRuns) {
+function higherTierValidationDeferralAfterFailure(command, previousRuns) {
   const candidateTier = validationCommandExecutionTier(command);
   const blocker = previousRuns.find((run) => !run.ok && run.exitCode !== 125 && validationCommandExecutionTier(run.command) < candidateTier);
   if (!blocker)
     return null;
   const digest = extractValidationFailureDigest(blocker);
-  return `lower-tier validation already failed for "${blocker.command}"${digest ? ` (${digest})` : ""}`;
+  const reason = `lower-tier validation already failed for "${blocker.command}"${digest ? ` (${digest})` : ""}`;
+  return {
+    reason,
+    blockerCommand: blocker.command,
+    ...detectValidationBlocker([blocker])?.category === "environment" ? { inheritedFailureClass: "environment" } : {}
+  };
 }
 function validationFileFingerprint(repo, changedPaths) {
   const hash = createHash4("sha256");
@@ -7683,6 +7760,62 @@ function extractValidationFailureDigest(run) {
     return `timed out${elapsed}`;
   }
   return "";
+}
+function validationFailedTestIdentities(run) {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join(`
+`));
+  const identities = new Set;
+  for (const rawLine of combined.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const bunFailure = line.match(/^\(fail\)\s+(.+?)(?:\s+\[\d+(?:\.\d+)?ms\])?$/i)?.[1];
+    const pytestFailure = line.match(/^FAILED\s+(.+?)(?:\s+-\s+.+)?$/i)?.[1];
+    const identity = bunFailure ?? pytestFailure;
+    if (!identity)
+      continue;
+    identities.add(toSingleLine(identity, 240));
+  }
+  return [...identities].sort((a, b) => a.localeCompare(b));
+}
+function validationFailureAssertionContext(run) {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join(`
+`));
+  const context = new Set;
+  for (const rawLine of combined.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (/^(?:Expected|Received):\s*\S.*$/i.test(line) || /^(?:E\s+)?(?:AssertionError|ReferenceError|TypeError):\s*\S.*$/i.test(line)) {
+      context.add(toSingleLine(line.replace(/^E\s+(?=(?:AssertionError|ReferenceError|TypeError):)/i, ""), 240));
+    }
+  }
+  return [...context].sort((a, b) => a.localeCompare(b));
+}
+function extractValidationFailureExcerpt(run, maxLength = 700) {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join(`
+`));
+  const lines = combined.split(/\r?\n/);
+  const failedTests = validationFailedTestIdentities(run);
+  const selected = new Set;
+  for (let index = 0;index < lines.length; index += 1) {
+    if (/^\s*\(fail\)\s+/i.test(lines[index] ?? "") || /^\s*FAILED\s+/i.test(lines[index] ?? "") || /\b(?:AssertionError|ReferenceError|TypeError):|\berror:\s*expect\(/i.test(lines[index] ?? "")) {
+      for (let contextIndex = Math.max(0, index - 2);contextIndex <= index + 3; contextIndex += 1) {
+        if (contextIndex < lines.length)
+          selected.add(contextIndex);
+      }
+    }
+  }
+  const parts = [];
+  if (failedTests.length > 0) {
+    const displayed = failedTests.slice(0, 5);
+    parts.push(`Failed tests (${failedTests.length}): ${displayed.join(" | ")}${failedTests.length > displayed.length ? ` | ... +${failedTests.length - displayed.length}` : ""}`);
+  }
+  const keyErrors = Array.from(new Set(lines.map((line) => line.trim()).filter((line) => /\b(?:AssertionError|ReferenceError|TypeError):|\berror:\s*expect\(/i.test(line)))).slice(0, 5);
+  if (keyErrors.length > 0)
+    parts.push(`Key errors: ${keyErrors.join(" | ")}`);
+  if (selected.size > 0) {
+    parts.push([...selected].sort((a, b) => a - b).map((index) => lines[index]).join(`
+`));
+  }
+  return toSingleLine(parts.join(`
+`) || combined, maxLength);
 }
 function classifyBrowserValidationFailureKindFromText(text) {
   const combined = stripAnsiControlSequences(text);
@@ -8322,8 +8455,12 @@ function recordValidationRemedyMemory(repo, jobFamily, runs) {
 }
 function extractValidationFailureRetryDigest(run, repo) {
   const baseDigest = extractValidationFailureDigest(run);
+  const failedTests = validationFailedTestIdentities(run);
+  const failedTestDigest = failedTests.length > 0 ? `failed tests (${failedTests.length}, signature=${createHash4("sha256").update(failedTests.join("\x00")).digest("hex").slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}` : "";
+  const assertionContext = validationFailureAssertionContext(run);
+  const assertionDigest = assertionContext.length > 0 ? `assertion context (${assertionContext.length}, signature=${createHash4("sha256").update(assertionContext.join("\x00")).digest("hex").slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}` : "";
   if (!isLongRunningBrowserValidationCommand(run.command) && !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command))) {
-    return baseDigest;
+    return toSingleLine([baseDigest, failedTestDigest, assertionDigest].filter(Boolean).join(" | "), 900);
   }
   const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join(`
 `));
@@ -8341,6 +8478,8 @@ ${combined}`);
   const output = summarizeBrowserValidationOutput(enrichedBrowserContext);
   const parts = [
     baseDigest,
+    failedTestDigest,
+    assertionDigest,
     stage ? `stage=${stage}` : "",
     selector ? `selector=${selector}` : "",
     expected ? `expected=${expected}` : "",
@@ -8710,16 +8849,26 @@ function quoteValidationCommandArg2(arg) {
   return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
 }
 function isTestFocusedTask(instruction, planning, targetPath) {
+  const normalizePathHint = (value) => String(value ?? "").replace(/\\/g, "/").replace(/^\.\/+/, "").trim().toLowerCase();
+  const isDocumentationWriteHint = (value) => {
+    const normalized = normalizePathHint(value);
+    if (normalized.split("/").includes(".."))
+      return false;
+    return normalized === "docs" || normalized.startsWith("docs/") || /\.(?:md|mdx|txt)$/.test(normalized);
+  };
+  const explicitTargets = [targetPath ?? "", ...planning.targetPaths ?? []].filter((entry) => String(entry ?? "").trim());
+  const writableHints = (planning.scope.writeGlobs ?? []).filter((entry) => String(entry ?? "").trim());
+  const declaredWriteHints = [...explicitTargets, ...writableHints];
+  if (declaredWriteHints.length > 0 && declaredWriteHints.every(isDocumentationWriteHint)) {
+    return false;
+  }
   const lowerInstruction = instruction.toLowerCase();
   if (/\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(lowerInstruction) || /\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b.{0,80}\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b/.test(lowerInstruction)) {
     return true;
   }
   if (targetPath && isLikelyTestPath(targetPath))
     return true;
-  const pathHints = [
-    ...planning.scope.writeGlobs ?? [],
-    ...planning.discovery?.likelyDirs ?? []
-  ];
+  const pathHints = [...planning.targetPaths ?? [], ...planning.scope.writeGlobs ?? []];
   if (pathHints.some((entry) => isLikelyTestPath(entry)))
     return true;
   if (planning.acceptanceCriteria.some((entry) => /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/i.test(entry))) {
@@ -8982,10 +9131,10 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
         const playwrightBrowserRuntimeReadyTargets = new Set;
         for (let commandIndex = 0;commandIndex < commandsToRun.length; ) {
           const nextCommand = commandsToRun[commandIndex];
-          const higherTierDeferredReason = shouldDeferHigherTierValidationAfterFailure(nextCommand, validationRuns);
-          if (higherTierDeferredReason) {
+          const higherTierDeferral = higherTierValidationDeferralAfterFailure(nextCommand, validationRuns);
+          if (higherTierDeferral) {
             commandIndex += 1;
-            const stderr = `Skipped higher-tier validation command because ${higherTierDeferredReason}. ` + "Fix the focused blocker first; PushPals will run this gate after lower-tier validation is clean.";
+            const stderr = `Skipped higher-tier validation command because ${higherTierDeferral.reason}. ` + "Fix the focused blocker first; PushPals will run this gate after lower-tier validation is clean.";
             validationRuns.push({
               step: nextCommand,
               command: nextCommand,
@@ -8993,9 +9142,13 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
               exitCode: 125,
               stdout: "",
               stderr,
-              elapsedMs: 1
+              elapsedMs: 1,
+              ...higherTierDeferral.inheritedFailureClass ? {
+                inheritedFailureClass: higherTierDeferral.inheritedFailureClass,
+                deferredByCommand: higherTierDeferral.blockerCommand
+              } : {}
             });
-            onLog?.("stderr", `[ValidationGate] Deferred higher-tier validation after lower-tier failure: ${nextCommand} (${higherTierDeferredReason})`);
+            onLog?.("stderr", `[ValidationGate] Deferred higher-tier validation after lower-tier failure: ${nextCommand} (${higherTierDeferral.reason})`);
             continue;
           }
           const parallelBatch = [];
@@ -9692,8 +9845,7 @@ function buildQualityRevisionHint(issues, critic, planning, reviewFixContext, va
     const runsToShow = browserRepairPacket ? failedValidationRuns.filter((run) => run.command === browserRepairPacket.command).slice(0, 1) : failedValidationRuns.slice(0, 5);
     for (const run of runsToShow) {
       lines.push(`- ${run.command} failed with exit ${run.exitCode} after ${run.elapsedMs}ms.`);
-      const output = toSingleLine(stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join(`
-`)), 700);
+      const output = extractValidationFailureExcerpt(run, 700);
       if (output)
         lines.push(`  Output: ${output}`);
     }
@@ -12050,6 +12202,7 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
   const diagnosticValidationRuns = [];
   const diagnosticPatchSnapshots = [];
   let nextQualityRevisionExecuteBudgets = null;
+  let criticRepairContinuationUsed = false;
   while (revisionAttempt <= qualityRevisionLoopMax) {
     const attemptStartedAt = Date.now();
     const attemptParams = { ...normalizedParams };
@@ -12568,6 +12721,18 @@ ${result.stderr ?? ""}`;
         };
         return annotateTerminalResult(failure2, "validation");
       }
+      if (criticRepairContinuationUsed) {
+        const failure2 = {
+          ok: false,
+          summary: `Final bounded critic repair did not meet the quality threshold: ${toSingleLine(issueSummary, 240)}`,
+          stdout: result.stdout,
+          stderr: truncate([result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""].filter(Boolean).join(`
+`), outputPolicyForRuntime(runtimeConfig)),
+          exitCode: 4
+        };
+        onLog?.("stderr", `[QualityGate] ${failure2.summary}`);
+        return annotateTerminalResult(failure2, "quality");
+      }
       if (qualitySoftPassOnExhausted) {
         const diagnostics = truncate([result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""].filter(Boolean).join(`
 `), outputPolicyForRuntime(runtimeConfig));
@@ -12611,7 +12776,22 @@ ${result.stderr ?? ""}`;
       changedPaths: quality.changedPaths,
       revisionBudget
     });
-    if (!revisionBudget.shouldStart && !browserValidationContinuation.shouldContinue && !repoValidationContinuation.shouldContinue && !inScopeValidationContinuation.shouldContinue) {
+    const criticRepairContinuation = criticRepairContinuationBudgetDecision({
+      deterministicRequiresRevision,
+      criticRequiresRevision,
+      criticScore: critic?.score ?? null,
+      criticMinScore: qualityCriticMinScore,
+      actionableFeedbackCount: criticActionableFeedbackCount(critic),
+      requiredValidationFailures: qualityForCritic.requiredValidationFailures,
+      trustedValidationPendingCommands: qualityForCritic.trustedValidationPendingCommands,
+      softPassOnExhausted: qualitySoftPassOnExhausted,
+      changedPaths: quality.changedPaths,
+      revisionAttempt,
+      maxAutoRevisions: activeMaxAutoRevisions,
+      continuationAlreadyUsed: criticRepairContinuationUsed,
+      revisionBudget
+    });
+    if (!revisionBudget.shouldStart && !browserValidationContinuation.shouldContinue && !repoValidationContinuation.shouldContinue && !inScopeValidationContinuation.shouldContinue && !criticRepairContinuation.shouldContinue) {
       if (shouldSoftPassCriticOnlyBudgetExhaustion({
         softPassOnExhausted: qualitySoftPassOnExhausted,
         deterministicRequiresRevision,
@@ -12669,6 +12849,13 @@ ${result.stderr ?? ""}`;
         finalizationBudgetMs: inScopeValidationContinuation.finalizationBudgetMs
       };
       onLog?.("stderr", `[QualityGate] Continuing in-scope validation repair ${revisionAttempt + 1}/${activeMaxAutoRevisions} with dedicated budget ${inScopeValidationContinuation.executionBudgetMs}ms execution + ${inScopeValidationContinuation.finalizationBudgetMs}ms finalization after original remaining budget ${revisionBudget.remainingBudgetMs}ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(issueSummary, 220)}`);
+    } else if (!revisionBudget.shouldStart && criticRepairContinuation.shouldContinue) {
+      criticRepairContinuationUsed = true;
+      nextQualityRevisionExecuteBudgets = {
+        executionBudgetMs: criticRepairContinuation.executionBudgetMs,
+        finalizationBudgetMs: criticRepairContinuation.finalizationBudgetMs
+      };
+      onLog?.("stderr", `[QualityGate] Continuing one final bounded critic repair ${revisionAttempt + 1}/${activeMaxAutoRevisions} with dedicated budget ${criticRepairContinuation.executionBudgetMs}ms execution + ${criticRepairContinuation.finalizationBudgetMs}ms finalization after original remaining budget ${revisionBudget.remainingBudgetMs}ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(issueSummary, 220)}`);
     }
     revisionAttempt += 1;
     revisionHint = buildQualityRevisionHint(issues, critic, planning, reviewFixContext, qualityForCritic.validationRuns, qualityForCritic.blocker, validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? null : browserRepairPacket, quality.changedPaths, validationRemedyHints, repoValidationRepairMode);

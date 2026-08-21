@@ -6264,6 +6264,10 @@ class CompletionLeaseRenewalCoordinator {
 }
 
 // apps/source_control_manager/src/publication_recovery.ts
+var DEFAULT_PUBLICATION_PROOF_ATTEMPTS = 5;
+var DEFAULT_PUBLICATION_PROOF_INITIAL_DELAY_MS = 250;
+var DEFAULT_PUBLICATION_PROOF_MAX_DELAY_MS = 2000;
+
 class PublicationAuthorityUnreachableError extends Error {
   mutationError;
   probeError;
@@ -6273,6 +6277,17 @@ class PublicationAuthorityUnreachableError extends Error {
     this.name = "PublicationAuthorityUnreachableError";
     this.mutationError = options.mutationError;
     this.probeError = options.probeError;
+  }
+}
+
+class PublicationConfirmationPendingError extends Error {
+  proofAttempts;
+  lastProbeError;
+  constructor(options) {
+    super(`${options.failurePrefix}; the publication command succeeded, but the authoritative ref did not expose the exact candidate after ${options.proofAttempts} bounded proof attempt(s).`);
+    this.name = "PublicationConfirmationPendingError";
+    this.proofAttempts = options.proofAttempts;
+    this.lastProbeError = options.lastProbeError ?? null;
   }
 }
 
@@ -6311,6 +6326,8 @@ function publicationFailureDisposition(options) {
   }
   if (options.validatedCheckpointRecoveryPending)
     return "reconcile";
+  if (options.publicationConfirmationPending)
+    return "reconcile";
   if (options.publicationAttemptUncertain && options.authoritativeReprobe === "unreachable") {
     return "reconcile";
   }
@@ -6339,22 +6356,55 @@ function durablePublicationRecoveryState(durablePublicationProven) {
 function shouldSkipValidationForDurableRecovery(options) {
   return options.validationProven && options.publicationProven;
 }
+function positiveIntegerOrDefault(value, fallback) {
+  if (!Number.isFinite(value) || Number(value) <= 0)
+    return fallback;
+  return Math.max(1, Math.floor(Number(value)));
+}
+function nonNegativeIntegerOrDefault(value, fallback) {
+  if (!Number.isFinite(value) || Number(value) < 0)
+    return fallback;
+  return Math.floor(Number(value));
+}
+async function provePublicationWithBoundedRetry(options) {
+  const attempts = positiveIntegerOrDefault(options.retry?.attempts, DEFAULT_PUBLICATION_PROOF_ATTEMPTS);
+  const initialDelayMs = nonNegativeIntegerOrDefault(options.retry?.initialDelayMs, DEFAULT_PUBLICATION_PROOF_INITIAL_DELAY_MS);
+  const maxDelayMs = Math.max(initialDelayMs, nonNegativeIntegerOrDefault(options.retry?.maxDelayMs, DEFAULT_PUBLICATION_PROOF_MAX_DELAY_MS));
+  const wait = options.retry?.wait ?? ((delayMs) => Bun.sleep(delayMs));
+  let lastProbeError = null;
+  for (let attempt = 1;attempt <= attempts; attempt += 1) {
+    try {
+      if (await options.provePublished()) {
+        return { published: true, attempts: attempt, lastProbeError: null };
+      }
+      lastProbeError = null;
+    } catch (error) {
+      return { published: false, attempts: attempt, lastProbeError: error };
+    }
+    if (attempt < attempts) {
+      const delayMs = Math.min(initialDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      await wait(delayMs);
+    }
+  }
+  return { published: false, attempts, lastProbeError };
+}
 async function publishWithAuthoritativeProof(options) {
   let result;
   try {
     result = await options.mutate();
   } catch (error) {
-    let published2;
-    try {
-      published2 = await options.provePublished();
-    } catch (probeError) {
+    const proof2 = await provePublicationWithBoundedRetry({
+      provePublished: options.provePublished,
+      retry: options.proofRetry
+    });
+    if (proof2.lastProbeError) {
       throw new PublicationAuthorityUnreachableError({
         failurePrefix: options.failurePrefix,
         mutationError: error,
-        probeError
+        probeError: proof2.lastProbeError
       });
     }
-    if (published2) {
+    if (proof2.published) {
       return {
         result: {
           ok: false,
@@ -6365,21 +6415,29 @@ async function publishWithAuthoritativeProof(options) {
     }
     throw error;
   }
-  let published;
-  try {
-    published = await options.provePublished();
-  } catch (probeError) {
-    throw new PublicationAuthorityUnreachableError({
+  const proof = await provePublicationWithBoundedRetry({
+    provePublished: options.provePublished,
+    retry: options.proofRetry
+  });
+  if (proof.published) {
+    return { result, recoveredFromAmbiguousFailure: !result.ok };
+  }
+  if (result.ok) {
+    throw new PublicationConfirmationPendingError({
       failurePrefix: options.failurePrefix,
-      probeError
+      proofAttempts: proof.attempts,
+      lastProbeError: proof.lastProbeError
     });
   }
-  if (!published) {
-    const detail = [result.stderr, result.stdout].filter(Boolean).join(`
-`).trim();
-    throw new Error(`${options.failurePrefix}${detail ? `: ${detail}` : ""}`);
+  if (proof.lastProbeError) {
+    throw new PublicationAuthorityUnreachableError({
+      failurePrefix: options.failurePrefix,
+      probeError: proof.lastProbeError
+    });
   }
-  return { result, recoveredFromAmbiguousFailure: !result.ok };
+  const detail = [result.stderr, result.stdout].filter(Boolean).join(`
+`).trim();
+  throw new Error(`${options.failurePrefix}${detail ? `: ${detail}` : ""}`);
 }
 async function isValidationCheckpointPublished(options) {
   const candidateSha = String(options.candidateSha ?? "").trim();
@@ -8421,6 +8479,7 @@ async function tick() {
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err) {
+      const publicationConfirmationPending = err instanceof PublicationConfirmationPendingError;
       const publicationAttemptUncertain = err instanceof PublicationAuthorityUnreachableError;
       let authoritativeReprobe = "absent";
       if (validatedCheckpointRecoveryPending && previousValidationCheckpoint?.validationProven) {
@@ -8453,6 +8512,7 @@ async function tick() {
       const failureDisposition = publicationFailureDisposition({
         publicationReadyForFinalization,
         publicationAttemptUncertain,
+        publicationConfirmationPending,
         authoritativeReprobe,
         validatedCheckpointRecoveryPending
       });
@@ -8464,9 +8524,9 @@ async function tick() {
           console.warn(`[${ts2()}] Could not emit pending-finalization status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
         }
       } else if (failureDisposition === "reconcile") {
-        console.warn(`[${ts2()}] Publication outcome is uncertain for ${completion.id} because the authoritative ref remained unreachable. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`);
+        console.warn(`[${ts2()}] Publication outcome is not yet confirmed for ${completion.id}. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`);
         try {
-          await emitPusherMessage(comm, `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it when the authoritative ref is reachable; the job was not marked failed.`, completion.id, completionEventMeta);
+          await emitPusherMessage(comm, `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`, completion.id, completionEventMeta);
         } catch (messageError) {
           console.warn(`[${ts2()}] Could not emit uncertain-publication status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
         }

@@ -2880,6 +2880,44 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(reason, "")
 
+    def test_offtrack_rollout_allows_explicit_react_native_mock_typing_targets(self) -> None:
+        tasks = (
+            "Update the typings in tests/reactNativeMock.d.ts.",
+            "Change declarations in tests/reactNativeMock.d.ts.",
+        )
+
+        for task_text in tasks:
+            with self.subTest(task_text=task_text):
+                reason = _detect_offtrack_rollout(
+                    {
+                        "summaries": [
+                            "item.completed | I updated the React Native mock.",
+                        ],
+                    },
+                    task_text=task_text,
+                )
+
+                self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_allows_mock_repair_with_unrelated_scope_constraints(self) -> None:
+        tasks = (
+            "Repair the shared mock; do not change production code.",
+            "Fix the React Native mock, but do not touch unrelated files.",
+        )
+
+        for task_text in tasks:
+            with self.subTest(task_text=task_text):
+                reason = _detect_offtrack_rollout(
+                    {
+                        "summaries": [
+                            "item.completed | I updated the React Native mock.",
+                        ],
+                    },
+                    task_text=task_text,
+                )
+
+                self.assertEqual(reason, "")
+
     def test_offtrack_rollout_allows_repo_native_layout_autonomy_contract_test(self) -> None:
         trace = {
             "summaries": [
@@ -2915,6 +2953,273 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_allows_test_teardown_documentation_inspection(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | The shared mock registers afterEach during module evaluation.",
+                "item.completed | Focused cleanup harness and React Native mock validation passed.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Update docs/codebase_context.md to codify the supported Bun test teardown "
+                "contract. Inspect relevant tests and cleanup lifecycle helpers before "
+                "documenting the module-scope afterEach pattern."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_allows_documenting_shared_mock_lifecycle(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am adding documentation that explains the shared mock lifecycle.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Update docs/codebase_context.md to document the Bun test teardown lifecycle contract."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_allows_guidance_about_react_native_mock_cleanup(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am adding guidance describing the React Native mock cleanup contract.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Update docs/codebase_context.md to document the Bun test teardown lifecycle contract."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_allows_directly_documenting_react_native_mock_cleanup(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am documenting the React Native mock cleanup contract.",
+                "item.completed | I am describing the shared mock lifecycle.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Update docs/codebase_context.md to document the Bun test teardown lifecycle contract."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_allows_mock_change_nouns_in_documentation_prose(self) -> None:
+        summaries = (
+            "I am adding guidance for the shared mock repair contract.",
+            "I am documenting the React Native mock modification rules.",
+            "I am adding documentation explaining how to update the shared mock.",
+            "I am writing guidance for how to modify the React Native mock.",
+            "I am documenting when to repair the shared mock.",
+        )
+
+        for summary in summaries:
+            with self.subTest(summary=summary):
+                reason = _detect_offtrack_rollout(
+                    {"summaries": [f"item.completed | {summary}"]},
+                    task_text=(
+                        "Update docs/codebase_context.md to document the Bun test teardown "
+                        "lifecycle contract."
+                    ),
+                )
+
+                self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_blocks_direct_mock_mutation_even_with_documentation_context(
+        self,
+    ) -> None:
+        summaries = (
+            "I will modify the shared mock.",
+            "I am adding a shared mock.",
+            "I am adding a shared mock helper before writing documentation.",
+            "I updated the shared mock.",
+            "I edited the shared mock.",
+            "I changed the shared mock.",
+            "I created a shared mock.",
+        )
+
+        for summary in summaries:
+            with self.subTest(summary=summary):
+                reason = _detect_offtrack_rollout(
+                    {"summaries": [f"item.completed | {summary}"]},
+                    task_text=(
+                        "Update docs/codebase_context.md to document the Bun test teardown "
+                        "lifecycle contract."
+                    ),
+                )
+
+                self.assertIn("broad test-harness", reason)
+
+    def test_offtrack_rollout_does_not_treat_documentation_about_repairs_as_repair_authority(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "Update docs/testing.md to document the shared mock repair contract; "
+                "do not modify implementation.",
+                "I will modify the shared mock.",
+            ),
+            (
+                "Add docs guidance for repairing the React Native mock lifecycle.",
+                "I am adding a shared mock helper.",
+            ),
+            (
+                "Document how to fix the shared mock.",
+                "I will modify the shared mock.",
+            ),
+            (
+                "Write guidance explaining how to repair the React Native mock lifecycle.",
+                "I am adding a shared mock helper.",
+            ),
+            (
+                "Update docs/testing.md: how to stabilize the shared mock.",
+                "I updated the shared mock.",
+            ),
+            (
+                "Document how to update the typings in tests/reactNativeMock.d.ts.",
+                "I updated the React Native mock.",
+            ),
+            (
+                "Write guidance explaining how to fix the shared mock; refer to "
+                "tests/reactNativeMock.js.",
+                "I will modify the shared mock.",
+            ),
+            (
+                "Update docs/testing.md to explain how to repair the React Native mock in "
+                "tests/reactNativeMock.js.",
+                "I updated the React Native mock.",
+            ),
+        )
+
+        for task_text, summary in cases:
+            with self.subTest(task_text=task_text, summary=summary):
+                reason = _detect_offtrack_rollout(
+                    {"summaries": [f"item.completed | {summary}"]},
+                    task_text=task_text,
+                )
+
+                self.assertIn("broad test-harness", reason)
+
+    def test_offtrack_rollout_allows_mock_repair_before_documentation_work(self) -> None:
+        reason = _detect_offtrack_rollout(
+            {
+                "summaries": [
+                    "item.completed | I updated the React Native mock and documented the contract.",
+                ],
+            },
+            task_text=(
+                "Update the typings in tests/reactNativeMock.d.ts and document the contract."
+            ),
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_offtrack_rollout_does_not_exempt_a_separate_mock_mutation_summary(self) -> None:
+        traces = (
+            [
+                "item.completed | I am documenting the shared mock lifecycle.",
+                "item.completed | Shared mock replacement complete.",
+            ],
+            [
+                "item.completed | I am documenting the shared mock lifecycle and updated "
+                "the shared mock.",
+            ],
+            [
+                "item.completed | I am writing guidance about the React Native mock; I also "
+                "modified the React Native mock.",
+            ],
+            [
+                "item.completed | I am documenting the shared mock lifecycle and completed "
+                "the shared mock replacement.",
+            ],
+            [
+                "item.completed | I am writing guidance about the React Native mock; the "
+                "React Native mock modification is complete.",
+            ],
+        )
+
+        for summaries in traces:
+            with self.subTest(summaries=summaries):
+                reason = _detect_offtrack_rollout(
+                    {"summaries": summaries},
+                    task_text=(
+                        "Update docs/codebase_context.md to document the Bun test teardown "
+                        "lifecycle contract."
+                    ),
+                )
+
+                self.assertIn("broad test-harness", reason)
+
+    def test_offtrack_rollout_still_blocks_mock_expansion_during_teardown_documentation(self) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am adding a shared mock helper before writing the documentation.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Update docs/codebase_context.md to document the supported Bun test teardown contract."
+            ),
+        )
+
+        self.assertIn("broad test-harness", reason)
+
+    def test_offtrack_rollout_still_blocks_generic_harness_repair_during_teardown_documentation(
+        self,
+    ) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am doing a test harness repair before writing the teardown documentation.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Update docs/codebase_context.md to document the Bun test teardown lifecycle contract."
+            ),
+        )
+
+        self.assertIn("broad test-harness", reason)
+
+    def test_offtrack_rollout_still_blocks_cleanup_harness_repair_during_teardown_documentation(
+        self,
+    ) -> None:
+        trace = {
+            "summaries": [
+                "item.completed | I am doing a test harness repair in the cleanup harness "
+                "before writing the teardown documentation.",
+            ],
+        }
+
+        reason = _detect_offtrack_rollout(
+            trace,
+            task_text=(
+                "Update docs/codebase_context.md to document the Bun test teardown lifecycle contract."
+            ),
+        )
+
+        self.assertIn("broad test-harness", reason)
 
     def test_offtrack_rollout_still_blocks_broad_mock_expansion_for_shell_contract_guard(self) -> None:
         trace = {

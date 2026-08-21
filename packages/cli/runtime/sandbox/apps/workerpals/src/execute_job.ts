@@ -109,6 +109,9 @@ export interface ValidationExecutionResult {
   /** Informational browser/e2e marker observed in output; never a terminal-status source. */
   browserSignal?: "failure" | "success" | "failure_and_success";
   terminalStatusSource?: "process_exit" | "deadline";
+  /** Synthetic higher-tier skips inherit an environment-only lower-tier blocker. */
+  inheritedFailureClass?: "environment";
+  deferredByCommand?: string;
 }
 
 export interface ValidationBlocker {
@@ -232,6 +235,8 @@ const REPO_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 900_000;
 const REPO_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
 const IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 600_000;
 const IN_SCOPE_VALIDATION_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
+const CRITIC_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS = 420_000;
+const CRITIC_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS = 120_000;
 
 export function qualityRevisionLoopUpperBound(
   policy: {
@@ -280,6 +285,85 @@ export function qualityRevisionBudgetDecision(opts: {
     shouldStart: remainingBudgetMs >= minimumRevisionBudgetMs,
     remainingBudgetMs,
     minimumRevisionBudgetMs,
+  };
+}
+
+export function criticActionableFeedbackCount(
+  critic: { mustFix: string[]; findings: string[]; revisionGuidance?: string } | null | undefined,
+): number {
+  if (!critic) return 0;
+  return (
+    critic.mustFix.length +
+    critic.findings.length +
+    (String(critic.revisionGuidance ?? "").trim() ? 1 : 0)
+  );
+}
+
+export function criticRepairContinuationBudgetDecision(opts: {
+  deterministicRequiresRevision: boolean;
+  criticRequiresRevision: boolean;
+  criticScore: number | null;
+  criticMinScore: number;
+  actionableFeedbackCount: number;
+  requiredValidationFailures: string[];
+  trustedValidationPendingCommands?: string[];
+  softPassOnExhausted: boolean;
+  changedPaths: string[];
+  revisionAttempt: number;
+  maxAutoRevisions: number;
+  continuationAlreadyUsed: boolean;
+  revisionBudget: Pick<
+    ReturnType<typeof qualityRevisionBudgetDecision>,
+    "shouldStart" | "remainingBudgetMs" | "minimumRevisionBudgetMs"
+  >;
+}): {
+  shouldContinue: boolean;
+  executionBudgetMs: number;
+  finalizationBudgetMs: number;
+  reason: string;
+} {
+  const stop = (reason: string) => ({
+    shouldContinue: false,
+    executionBudgetMs: 0,
+    finalizationBudgetMs: 0,
+    reason,
+  });
+  if (opts.revisionBudget.shouldStart) return stop("standard revision budget is available");
+  if (opts.continuationAlreadyUsed)
+    return stop("final critic repair continuation was already used");
+  if (opts.deterministicRequiresRevision || !opts.criticRequiresRevision) {
+    return stop("failure is not critic-only");
+  }
+  if (opts.requiredValidationFailures.length > 0) {
+    return stop("required validation has a non-environment failure");
+  }
+  if (opts.revisionAttempt >= opts.maxAutoRevisions) {
+    return stop("critic revision limit is already exhausted");
+  }
+  if (publishableChangedPaths(opts.changedPaths).length === 0) {
+    return stop("no publishable critic repair patch is present");
+  }
+  const score = Number(opts.criticScore);
+  const threshold = Number(opts.criticMinScore);
+  if (
+    !Number.isFinite(score) ||
+    !Number.isFinite(threshold) ||
+    score >= threshold ||
+    threshold - score > 1
+  ) {
+    return stop("critic score is unavailable or outside the bounded repair window");
+  }
+  if (Math.max(0, Math.floor(opts.actionableFeedbackCount)) === 0) {
+    return stop("critic supplied no actionable repair feedback");
+  }
+  if (opts.softPassOnExhausted && (opts.trustedValidationPendingCommands?.length ?? 0) === 0) {
+    return stop("existing critic-only soft-pass policy applies");
+  }
+  return {
+    shouldContinue: true,
+    executionBudgetMs: CRITIC_REPAIR_CONTINUATION_EXECUTION_BUDGET_MS,
+    finalizationBudgetMs: CRITIC_REPAIR_CONTINUATION_FINALIZATION_BUDGET_MS,
+    reason: "near-threshold critic feedback has one final bounded repair budget",
   };
 }
 
@@ -939,6 +1023,7 @@ function isDockerDaemonValidationBlocker(value: string): boolean {
 
 export function classifyValidationRunFailure(run: ValidationExecutionResult): string | null {
   if (run.ok) return null;
+  if (run.inheritedFailureClass) return run.inheritedFailureClass;
   const combined = `${run.command}\n${run.stdout}\n${run.stderr}`.toLowerCase();
   const command = run.command.toLowerCase();
   const output = `${run.stdout}\n${run.stderr}`.toLowerCase();
@@ -994,11 +1079,19 @@ function buildValidationRunDiagnostics(
     failureClass: classifyValidationRunFailure(run),
     stdoutTail: compactDiagnosticText(run.stdout),
     stderrTail: compactDiagnosticText(run.stderr),
-    ...(run.browserSignal
+    ...(run.browserSignal || run.inheritedFailureClass || run.deferredByCommand
       ? {
           metadata: {
-            browserSignal: run.browserSignal,
-            terminalStatusSource: run.terminalStatusSource ?? "process_exit",
+            ...(run.browserSignal
+              ? {
+                  browserSignal: run.browserSignal,
+                  terminalStatusSource: run.terminalStatusSource ?? "process_exit",
+                }
+              : {}),
+            ...(run.inheritedFailureClass
+              ? { inheritedFailureClass: run.inheritedFailureClass }
+              : {}),
+            ...(run.deferredByCommand ? { deferredByCommand: run.deferredByCommand } : {}),
           },
         }
       : {}),
@@ -2386,6 +2479,23 @@ function validationTextRequiresDockerDaemon(text: string): boolean {
   );
 }
 
+export function packageScriptSequenceReferences(script: string): string[] {
+  const argv = tokenizeValidationCommandArgv(script);
+  if (!argv) return [];
+  const runnerIndex = argv.findIndex((token) =>
+    /(?:^|\/)run-package-script-sequence\.(?:c?js|mjs|ts)$/i.test(token.replace(/\\/g, "/")),
+  );
+  if (runnerIndex < 0) return [];
+  return Array.from(
+    new Set(
+      argv
+        .slice(runnerIndex + 1)
+        .map((token) => token.trim())
+        .filter((token) => /^[A-Za-z0-9][A-Za-z0-9:._-]*$/.test(token)),
+    ),
+  );
+}
+
 export function validationCommandRequiresDockerDaemon(repo: string, command: string): boolean {
   const visited = new Set<string>();
   const visit = (currentCommand: string, depth: number): boolean => {
@@ -2412,6 +2522,9 @@ export function validationCommandRequiresDockerDaemon(repo: string, command: str
     }
     for (const match of combined.matchAll(/["']run["']\s*,\s*["']([A-Za-z0-9:_-]+)["']/gi)) {
       if (match[1]) nestedScriptNames.add(match[1]);
+    }
+    for (const scriptName of packageScriptSequenceReferences(resolvedScript.script)) {
+      nestedScriptNames.add(scriptName);
     }
     return Array.from(nestedScriptNames).some((scriptName) =>
       visit(`bun run ${scriptName}`, depth + 1),
@@ -3334,6 +3447,13 @@ export function detectValidationBlocker(
 ): ValidationBlocker | null {
   const failedRuns = runs.filter((run) => !run.ok);
   if (failedRuns.length === 0) return null;
+  if (failedRuns.every((run) => run.inheritedFailureClass === "environment")) {
+    return {
+      category: "environment",
+      detail:
+        "Validation was skipped because a lower-tier command is blocked by the worker environment. Preserve the candidate and rerun the blocked command chain on the trusted host.",
+    };
+  }
 
   const combined = failedRuns
     .flatMap((run) => [run.stdout, run.stderr])
@@ -3743,6 +3863,17 @@ export function shouldDeferHigherTierValidationAfterFailure(
   command: string,
   previousRuns: ValidationExecutionResult[],
 ): string | null {
+  return higherTierValidationDeferralAfterFailure(command, previousRuns)?.reason ?? null;
+}
+
+export function higherTierValidationDeferralAfterFailure(
+  command: string,
+  previousRuns: ValidationExecutionResult[],
+): {
+  reason: string;
+  blockerCommand: string;
+  inheritedFailureClass?: "environment";
+} | null {
   const candidateTier = validationCommandExecutionTier(command);
   const blocker = previousRuns.find(
     (run) =>
@@ -3752,9 +3883,16 @@ export function shouldDeferHigherTierValidationAfterFailure(
   );
   if (!blocker) return null;
   const digest = extractValidationFailureDigest(blocker);
-  return `lower-tier validation already failed for "${blocker.command}"${
+  const reason = `lower-tier validation already failed for "${blocker.command}"${
     digest ? ` (${digest})` : ""
   }`;
+  return {
+    reason,
+    blockerCommand: blocker.command,
+    ...(detectValidationBlocker([blocker])?.category === "environment"
+      ? { inheritedFailureClass: "environment" as const }
+      : {}),
+  };
 }
 
 function validationFileFingerprint(repo: string, changedPaths: string[]): string {
@@ -3855,6 +3993,98 @@ export function extractValidationFailureDigest(run: {
     return `timed out${elapsed}`;
   }
   return "";
+}
+
+function validationFailedTestIdentities(run: { stdout?: string; stderr?: string }): string[] {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  const identities = new Set<string>();
+  for (const rawLine of combined.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const bunFailure = line.match(/^\(fail\)\s+(.+?)(?:\s+\[\d+(?:\.\d+)?ms\])?$/i)?.[1];
+    const pytestFailure = line.match(/^FAILED\s+(.+?)(?:\s+-\s+.+)?$/i)?.[1];
+    const identity = bunFailure ?? pytestFailure;
+    if (!identity) continue;
+    identities.add(toSingleLine(identity, 240));
+  }
+  return [...identities].sort((a, b) => a.localeCompare(b));
+}
+
+function validationFailureAssertionContext(run: { stdout?: string; stderr?: string }): string[] {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  const context = new Set<string>();
+  for (const rawLine of combined.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (
+      /^(?:Expected|Received):\s*\S.*$/i.test(line) ||
+      /^(?:E\s+)?(?:AssertionError|ReferenceError|TypeError):\s*\S.*$/i.test(line)
+    ) {
+      context.add(
+        toSingleLine(
+          line.replace(/^E\s+(?=(?:AssertionError|ReferenceError|TypeError):)/i, ""),
+          240,
+        ),
+      );
+    }
+  }
+  return [...context].sort((a, b) => a.localeCompare(b));
+}
+
+export function extractValidationFailureExcerpt(
+  run: {
+    stdout?: string;
+    stderr?: string;
+  },
+  maxLength = 700,
+): string {
+  const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
+  const lines = combined.split(/\r?\n/);
+  const failedTests = validationFailedTestIdentities(run);
+  const selected = new Set<number>();
+  for (let index = 0; index < lines.length; index += 1) {
+    if (
+      /^\s*\(fail\)\s+/i.test(lines[index] ?? "") ||
+      /^\s*FAILED\s+/i.test(lines[index] ?? "") ||
+      /\b(?:AssertionError|ReferenceError|TypeError):|\berror:\s*expect\(/i.test(lines[index] ?? "")
+    ) {
+      for (
+        let contextIndex = Math.max(0, index - 2);
+        contextIndex <= index + 3;
+        contextIndex += 1
+      ) {
+        if (contextIndex < lines.length) selected.add(contextIndex);
+      }
+    }
+  }
+  const parts: string[] = [];
+  if (failedTests.length > 0) {
+    const displayed = failedTests.slice(0, 5);
+    parts.push(
+      `Failed tests (${failedTests.length}): ${displayed.join(" | ")}${
+        failedTests.length > displayed.length
+          ? ` | ... +${failedTests.length - displayed.length}`
+          : ""
+      }`,
+    );
+  }
+  const keyErrors = Array.from(
+    new Set(
+      lines
+        .map((line) => line.trim())
+        .filter((line) =>
+          /\b(?:AssertionError|ReferenceError|TypeError):|\berror:\s*expect\(/i.test(line),
+        ),
+    ),
+  ).slice(0, 5);
+  if (keyErrors.length > 0) parts.push(`Key errors: ${keyErrors.join(" | ")}`);
+  if (selected.size > 0) {
+    parts.push(
+      [...selected]
+        .sort((a, b) => a - b)
+        .map((index) => lines[index])
+        .join("\n"),
+    );
+  }
+  return toSingleLine(parts.join("\n") || combined, maxLength);
 }
 
 function classifyBrowserValidationFailureKindFromText(text: string): BrowserValidationFailureKind {
@@ -4698,11 +4928,30 @@ export function extractValidationFailureRetryDigest(
   repo?: string,
 ): string {
   const baseDigest = extractValidationFailureDigest(run);
+  const failedTests = validationFailedTestIdentities(run);
+  const failedTestDigest =
+    failedTests.length > 0
+      ? `failed tests (${failedTests.length}, signature=${createHash("sha256")
+          .update(failedTests.join("\0"))
+          .digest("hex")
+          .slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}`
+      : "";
+  const assertionContext = validationFailureAssertionContext(run);
+  const assertionDigest =
+    assertionContext.length > 0
+      ? `assertion context (${assertionContext.length}, signature=${createHash("sha256")
+          .update(assertionContext.join("\0"))
+          .digest("hex")
+          .slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}`
+      : "";
   if (
     !isLongRunningBrowserValidationCommand(run.command) &&
     !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command))
   ) {
-    return baseDigest;
+    return toSingleLine(
+      [baseDigest, failedTestDigest, assertionDigest].filter(Boolean).join(" | "),
+      900,
+    );
   }
   const combined = stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n"));
   const failureKind = classifyBrowserValidationFailureKindFromText(`${baseDigest}\n${combined}`);
@@ -4722,6 +4971,8 @@ export function extractValidationFailureRetryDigest(
   const output = summarizeBrowserValidationOutput(enrichedBrowserContext);
   const parts = [
     baseDigest,
+    failedTestDigest,
+    assertionDigest,
     stage ? `stage=${stage}` : "",
     selector ? `selector=${selector}` : "",
     expected ? `expected=${expected}` : "",
@@ -5242,6 +5493,32 @@ export function isTestFocusedTask(
   planning: TaskExecutePlanning,
   targetPath?: string,
 ): boolean {
+  const normalizePathHint = (value: string): string =>
+    String(value ?? "")
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "")
+      .trim()
+      .toLowerCase();
+  const isDocumentationWriteHint = (value: string): boolean => {
+    const normalized = normalizePathHint(value);
+    if (normalized.split("/").includes("..")) return false;
+    return (
+      normalized === "docs" ||
+      normalized.startsWith("docs/") ||
+      /\.(?:md|mdx|txt)$/.test(normalized)
+    );
+  };
+  const explicitTargets = [targetPath ?? "", ...(planning.targetPaths ?? [])].filter((entry) =>
+    String(entry ?? "").trim(),
+  );
+  const writableHints = (planning.scope.writeGlobs ?? []).filter((entry) =>
+    String(entry ?? "").trim(),
+  );
+  const declaredWriteHints = [...explicitTargets, ...writableHints];
+  if (declaredWriteHints.length > 0 && declaredWriteHints.every(isDocumentationWriteHint)) {
+    return false;
+  }
+
   const lowerInstruction = instruction.toLowerCase();
   if (
     /\b(add|write|create|update|extend|expand|harden|improve|refactor|move|extract|fix)\b.{0,80}\b(test|tests|coverage|unit test|integration test|unittest|pytest)\b/.test(
@@ -5254,10 +5531,7 @@ export function isTestFocusedTask(
     return true;
   }
   if (targetPath && isLikelyTestPath(targetPath)) return true;
-  const pathHints = [
-    ...(planning.scope.writeGlobs ?? []),
-    ...(planning.discovery?.likelyDirs ?? []),
-  ];
+  const pathHints = [...(planning.targetPaths ?? []), ...(planning.scope.writeGlobs ?? [])];
   if (pathHints.some((entry) => isLikelyTestPath(entry))) return true;
   if (
     planning.acceptanceCriteria.some((entry) =>
@@ -5656,14 +5930,14 @@ async function runDeterministicQualityGate(
         const playwrightBrowserRuntimeReadyTargets = new Set<string>();
         for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
           const nextCommand = commandsToRun[commandIndex];
-          const higherTierDeferredReason = shouldDeferHigherTierValidationAfterFailure(
+          const higherTierDeferral = higherTierValidationDeferralAfterFailure(
             nextCommand,
             validationRuns,
           );
-          if (higherTierDeferredReason) {
+          if (higherTierDeferral) {
             commandIndex += 1;
             const stderr =
-              `Skipped higher-tier validation command because ${higherTierDeferredReason}. ` +
+              `Skipped higher-tier validation command because ${higherTierDeferral.reason}. ` +
               "Fix the focused blocker first; PushPals will run this gate after lower-tier validation is clean.";
             validationRuns.push({
               step: nextCommand,
@@ -5673,10 +5947,16 @@ async function runDeterministicQualityGate(
               stdout: "",
               stderr,
               elapsedMs: 1,
+              ...(higherTierDeferral.inheritedFailureClass
+                ? {
+                    inheritedFailureClass: higherTierDeferral.inheritedFailureClass,
+                    deferredByCommand: higherTierDeferral.blockerCommand,
+                  }
+                : {}),
             });
             onLog?.(
               "stderr",
-              `[ValidationGate] Deferred higher-tier validation after lower-tier failure: ${nextCommand} (${higherTierDeferredReason})`,
+              `[ValidationGate] Deferred higher-tier validation after lower-tier failure: ${nextCommand} (${higherTierDeferral.reason})`,
             );
             continue;
           }
@@ -6805,10 +7085,7 @@ export function buildQualityRevisionHint(
       : failedValidationRuns.slice(0, 5);
     for (const run of runsToShow) {
       lines.push(`- ${run.command} failed with exit ${run.exitCode} after ${run.elapsedMs}ms.`);
-      const output = toSingleLine(
-        stripAnsiControlSequences([run.stderr, run.stdout].filter(Boolean).join("\n")),
-        700,
-      );
+      const output = extractValidationFailureExcerpt(run, 700);
       if (output) lines.push(`  Output: ${output}`);
     }
   }
@@ -10177,6 +10454,7 @@ export async function executeJob(
     executionBudgetMs: number;
     finalizationBudgetMs: number;
   } | null = null;
+  let criticRepairContinuationUsed = false;
   while (revisionAttempt <= qualityRevisionLoopMax) {
     const attemptStartedAt = Date.now();
     const attemptParams: Record<string, unknown> = { ...normalizedParams };
@@ -10933,6 +11211,25 @@ export async function executeJob(
         };
         return annotateTerminalResult(failure, "validation");
       }
+      if (criticRepairContinuationUsed) {
+        const failure: JobResult = {
+          ok: false,
+          summary: `Final bounded critic repair did not meet the quality threshold: ${toSingleLine(
+            issueSummary,
+            240,
+          )}`,
+          stdout: result.stdout,
+          stderr: truncate(
+            [result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""]
+              .filter(Boolean)
+              .join("\n"),
+            outputPolicyForRuntime(runtimeConfig),
+          ),
+          exitCode: 4,
+        };
+        onLog?.("stderr", `[QualityGate] ${failure.summary}`);
+        return annotateTerminalResult(failure, "quality");
+      }
       if (qualitySoftPassOnExhausted) {
         const diagnostics = truncate(
           [result.stderr ?? "", critic ? `Critic raw: ${critic.raw}` : ""]
@@ -11000,11 +11297,27 @@ export async function executeJob(
       changedPaths: quality.changedPaths,
       revisionBudget,
     });
+    const criticRepairContinuation = criticRepairContinuationBudgetDecision({
+      deterministicRequiresRevision,
+      criticRequiresRevision,
+      criticScore: critic?.score ?? null,
+      criticMinScore: qualityCriticMinScore,
+      actionableFeedbackCount: criticActionableFeedbackCount(critic),
+      requiredValidationFailures: qualityForCritic.requiredValidationFailures,
+      trustedValidationPendingCommands: qualityForCritic.trustedValidationPendingCommands,
+      softPassOnExhausted: qualitySoftPassOnExhausted,
+      changedPaths: quality.changedPaths,
+      revisionAttempt,
+      maxAutoRevisions: activeMaxAutoRevisions,
+      continuationAlreadyUsed: criticRepairContinuationUsed,
+      revisionBudget,
+    });
     if (
       !revisionBudget.shouldStart &&
       !browserValidationContinuation.shouldContinue &&
       !repoValidationContinuation.shouldContinue &&
-      !inScopeValidationContinuation.shouldContinue
+      !inScopeValidationContinuation.shouldContinue &&
+      !criticRepairContinuation.shouldContinue
     ) {
       if (
         shouldSoftPassCriticOnlyBudgetExhaustion({
@@ -11125,6 +11438,27 @@ export async function executeJob(
           inScopeValidationContinuation.executionBudgetMs
         }ms execution + ${
           inScopeValidationContinuation.finalizationBudgetMs
+        }ms finalization after original remaining budget ${
+          revisionBudget.remainingBudgetMs
+        }ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(
+          issueSummary,
+          220,
+        )}`,
+      );
+    } else if (!revisionBudget.shouldStart && criticRepairContinuation.shouldContinue) {
+      criticRepairContinuationUsed = true;
+      nextQualityRevisionExecuteBudgets = {
+        executionBudgetMs: criticRepairContinuation.executionBudgetMs,
+        finalizationBudgetMs: criticRepairContinuation.finalizationBudgetMs,
+      };
+      onLog?.(
+        "stderr",
+        `[QualityGate] Continuing one final bounded critic repair ${
+          revisionAttempt + 1
+        }/${activeMaxAutoRevisions} with dedicated budget ${
+          criticRepairContinuation.executionBudgetMs
+        }ms execution + ${
+          criticRepairContinuation.finalizationBudgetMs
         }ms finalization after original remaining budget ${
           revisionBudget.remainingBudgetMs
         }ms fell below ${revisionBudget.minimumRevisionBudgetMs}ms: ${toSingleLine(

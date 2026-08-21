@@ -8,6 +8,8 @@ import {
   buildCriticValidationSummary,
   buildCriticDiffText,
   browserValidationRepairContinuationBudgetDecision,
+  criticActionableFeedbackCount,
+  criticRepairContinuationBudgetDecision,
   buildQualityRevisionHint,
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
@@ -16,6 +18,7 @@ import {
   detectValidationBlocker,
   expandKnownArtifactDirectoryPaths,
   findUnchangedValidationFailure,
+  higherTierValidationDeferralAfterFailure,
   extractValidationFailureRetryDigest,
   isBrowserValidationInfrastructureDigest,
   knownFailureHintsForPacket,
@@ -125,6 +128,55 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(criticSummary).toContain("Command: bun run validate");
     expect(criticSummary).toContain("not a candidate failure");
     expect(criticSummary).toContain("Do not request a worker revision solely to rerun it");
+  });
+
+  test("inherits an environment blocker across a synthetic higher-tier skip", () => {
+    const environmentRun = {
+      step: "bun run web:review",
+      command: "bun run web:review",
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+      elapsedMs: 20,
+    };
+    const deferral = higherTierValidationDeferralAfterFailure("bun run validate", [environmentRun]);
+    expect(deferral).toEqual({
+      reason:
+        'lower-tier validation already failed for "bun run web:review" (Cannot connect to the Docker daemon at unix:///var/run/docker.sock)',
+      blockerCommand: "bun run web:review",
+      inheritedFailureClass: "environment",
+    });
+    const syntheticSkip = {
+      step: "bun run validate",
+      command: "bun run validate",
+      ok: false,
+      exitCode: 125,
+      stdout: "",
+      stderr: `Skipped higher-tier validation command because ${deferral?.reason}.`,
+      elapsedMs: 1,
+      inheritedFailureClass: deferral?.inheritedFailureClass,
+      deferredByCommand: deferral?.blockerCommand,
+    };
+
+    expect(classifyValidationRunFailure(syntheticSkip)).toBe("environment");
+    expect(detectValidationBlocker([syntheticSkip])).toMatchObject({ category: "environment" });
+    const isolated = isolatePureEnvironmentValidationDeferral({
+      ok: false,
+      skipped: false,
+      issues: ["ValidationGate: Required vision.md validation failed"],
+      scopeIssues: [],
+      validationIssues: ["Required vision.md validation failed"],
+      changedPaths: ["package.json"],
+      changedTestPaths: [],
+      validationRuns: [environmentRun, syntheticSkip],
+      requiredValidationFailures: ["bun run validate exited 125"],
+      blocker: { category: "environment", detail: "Docker is unavailable" },
+      validationFailureScope: "outside_task_scope",
+    });
+    expect(isolated.pureEnvironmentDeferral).toBe(true);
+    expect(isolated.blockedCommands).toEqual(["bun run web:review", "bun run validate"]);
+    expect(isolated.qualityForCritic.requiredValidationFailures).toEqual([]);
   });
 
   test("does not defer a mixed environment and assertion failure cluster", () => {
@@ -476,6 +528,112 @@ describe("workerpals quality gate critic issue formatting", () => {
         changedPaths: ["node_modules/react/index.js"],
       }),
     ).toBe(false);
+  });
+
+  test("allows exactly one bounded near-threshold critic repair when ordinary budget is exhausted", () => {
+    const revisionBudget = qualityRevisionBudgetDecision({
+      jobElapsedMs: 1_149_008,
+      executionBudgetMs: 1_200_000,
+    });
+    const base = {
+      deterministicRequiresRevision: false,
+      criticRequiresRevision: true,
+      criticScore: 7.7,
+      criticMinScore: 8.1,
+      actionableFeedbackCount: 3,
+      requiredValidationFailures: [],
+      trustedValidationPendingCommands: ["bun run validate"],
+      softPassOnExhausted: true,
+      changedPaths: ["docs/account_testing.md"],
+      revisionAttempt: 2,
+      maxAutoRevisions: 3,
+      continuationAlreadyUsed: false,
+      revisionBudget,
+    };
+
+    expect(criticRepairContinuationBudgetDecision(base)).toEqual({
+      shouldContinue: true,
+      executionBudgetMs: 420_000,
+      finalizationBudgetMs: 120_000,
+      reason: "near-threshold critic feedback has one final bounded repair budget",
+    });
+    expect(
+      criticRepairContinuationBudgetDecision({
+        ...base,
+        criticScore: 7.1,
+      }).shouldContinue,
+    ).toBe(true);
+    expect(
+      criticRepairContinuationBudgetDecision({
+        ...base,
+        criticScore: 7.09,
+      }).shouldContinue,
+    ).toBe(false);
+    expect(
+      criticRepairContinuationBudgetDecision({
+        ...base,
+        continuationAlreadyUsed: true,
+      }).shouldContinue,
+    ).toBe(false);
+    expect(
+      criticRepairContinuationBudgetDecision({
+        ...base,
+        revisionAttempt: 3,
+      }).shouldContinue,
+    ).toBe(false);
+    expect(
+      criticRepairContinuationBudgetDecision({
+        ...base,
+        deterministicRequiresRevision: true,
+      }).shouldContinue,
+    ).toBe(false);
+    expect(
+      criticRepairContinuationBudgetDecision({
+        ...base,
+        trustedValidationPendingCommands: [],
+      }).shouldContinue,
+    ).toBe(false);
+    expect(
+      criticRepairContinuationBudgetDecision({
+        ...base,
+        trustedValidationPendingCommands: [],
+        softPassOnExhausted: false,
+      }),
+    ).toMatchObject({
+      shouldContinue: true,
+      executionBudgetMs: 420_000,
+      finalizationBudgetMs: 120_000,
+    });
+  });
+
+  test("treats nonempty critic revision guidance as actionable continuation feedback", () => {
+    const actionableFeedbackCount = criticActionableFeedbackCount({
+      mustFix: [],
+      findings: [],
+      revisionGuidance:
+        "  Consolidate the duplicate acceptance matrices and fixture identifiers.  ",
+    });
+    expect(actionableFeedbackCount).toBe(1);
+    expect(
+      criticRepairContinuationBudgetDecision({
+        deterministicRequiresRevision: false,
+        criticRequiresRevision: true,
+        criticScore: 7.7,
+        criticMinScore: 8.1,
+        actionableFeedbackCount,
+        requiredValidationFailures: [],
+        trustedValidationPendingCommands: ["bun run validate"],
+        softPassOnExhausted: true,
+        changedPaths: ["docs/account_testing.md"],
+        revisionAttempt: 2,
+        maxAutoRevisions: 3,
+        continuationAlreadyUsed: false,
+        revisionBudget: qualityRevisionBudgetDecision({
+          jobElapsedMs: 1_149_008,
+          executionBudgetMs: 1_200_000,
+        }),
+      }).shouldContinue,
+    ).toBe(true);
   });
 
   test("continues in-scope browser validation repair after the generic revision budget is exhausted", () => {
@@ -1061,6 +1219,52 @@ describe("workerpals quality gate critic issue formatting", () => {
     expect(hint).toContain("Validation ownership rule");
   });
 
+  test("surfaces late failing-test blocks ahead of leading passing output in revision hints", () => {
+    const passingNoise = Array.from(
+      { length: 80 },
+      (_, index) => `(pass) account doctor > healthy case ${index}`,
+    ).join("\n");
+    const hint = buildQualityRevisionHint(
+      ["Required validation failed: bun test scripts/__tests__ exited 1."],
+      null,
+      {
+        intent: "code_change",
+        riskLevel: "medium",
+        scope: { readAnywhere: true, writeAllowed: true },
+        acceptanceCriteria: [],
+        validationSteps: ["bun test scripts/__tests__"],
+        queuePriority: "normal",
+        queueWaitBudgetMs: 90_000,
+        executionBudgetMs: 1_800_000,
+        finalizationBudgetMs: 120_000,
+      },
+      null,
+      [
+        {
+          step: "bun test scripts/__tests__",
+          command: "bun test scripts/__tests__",
+          ok: false,
+          exitCode: 1,
+          stdout: "bun test v1.3.14",
+          stderr: [
+            passingNoise,
+            "error: expect(received).toEqual(expected)",
+            "ReferenceError: createProcessStub is not defined",
+            "(fail) cleanup harness > reports pending residual checks from the process exit assertion [1.71ms]",
+            "7 tests failed",
+          ].join("\n"),
+          elapsedMs: 1_898,
+        },
+      ],
+    );
+
+    expect(hint).toContain(
+      "Failed tests (1): cleanup harness > reports pending residual checks from the process exit assertion",
+    );
+    expect(hint).toContain("ReferenceError: createProcessStub is not defined");
+    expect(hint).not.toContain("healthy case 0");
+  });
+
   test("marks outside-scope required validation revisions as repo validation repair mode", () => {
     const hint = buildQualityRevisionHint(
       [
@@ -1344,6 +1548,12 @@ describe("workerpals quality gate critic issue formatting", () => {
 
   test("persists known browser failure fingerprints for repo job families", () => {
     const repo = mkdtempSync(join(tmpdir(), "pushpals-browser-failure-memory-"));
+    const previousProjectRoot = process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE;
+    const previousRepoRoot = process.env.PUSHPALS_REPO_ROOT_OVERRIDE;
+    const previousRepoPath = process.env.PUSHPALS_REPO_PATH;
+    process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE = repo;
+    delete process.env.PUSHPALS_REPO_ROOT_OVERRIDE;
+    delete process.env.PUSHPALS_REPO_PATH;
     try {
       const params = {
         planning: {
@@ -1386,6 +1596,12 @@ describe("workerpals quality gate critic issue formatting", () => {
       expect(hints.join("\n")).toContain("seen 2x before");
       expect(hints.join("\n")).toContain("Read the latest artifact/log/DOM state before editing");
     } finally {
+      if (previousProjectRoot === undefined) delete process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE;
+      else process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE = previousProjectRoot;
+      if (previousRepoRoot === undefined) delete process.env.PUSHPALS_REPO_ROOT_OVERRIDE;
+      else process.env.PUSHPALS_REPO_ROOT_OVERRIDE = previousRepoRoot;
+      if (previousRepoPath === undefined) delete process.env.PUSHPALS_REPO_PATH;
+      else process.env.PUSHPALS_REPO_PATH = previousRepoPath;
       rmSync(repo, { recursive: true, force: true });
     }
   });
@@ -1838,6 +2054,104 @@ describe("workerpals quality gate critic issue formatting", () => {
       command: run.command,
       digest,
     });
+  });
+
+  test("keeps changed failed-test identities out of the unchanged-validation circuit", () => {
+    const firstRun = {
+      step: "bun test scripts/__tests__",
+      command: "bun test scripts/__tests__",
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: [
+        "error: expect(received).toEqual(expected)",
+        "(fail) cleanup harness > runs successful residual checks after cleanups [3.87ms]",
+        "(fail) cleanup harness > aggregates mixed cleanup and residual failures with stage metadata [2.22ms]",
+        "2 tests failed",
+      ].join("\n"),
+      elapsedMs: 1_892,
+    };
+    const regressedRun = {
+      ...firstRun,
+      stderr: [
+        "error: expect(received).toEqual(expected)",
+        "(fail) cleanup harness > runs successful residual checks after cleanups [3.94ms]",
+        "(fail) cleanup harness > aggregates mixed cleanup and residual failures with stage metadata [2.05ms]",
+        "(fail) cleanup harness > unregisters residual checks before they run or assert on exit [2.05ms]",
+        "ReferenceError: createProcessStub is not defined",
+        "7 tests failed",
+      ].join("\n"),
+      elapsedMs: 1_898,
+    };
+    const firstDigest = extractValidationFailureRetryDigest(firstRun, process.cwd());
+    const regressedDigest = extractValidationFailureRetryDigest(regressedRun, process.cwd());
+
+    expect(firstDigest).toContain("failed tests (2, signature=");
+    expect(regressedDigest).toContain("failed tests (3, signature=");
+    expect(regressedDigest).not.toBe(firstDigest);
+    expect(
+      findUnchangedValidationFailure(
+        [regressedRun],
+        new Map([[firstRun.command, firstDigest]]),
+        process.cwd(),
+      ),
+    ).toBeNull();
+
+    const sameFailuresWithDifferentTimings = {
+      ...firstRun,
+      stderr: firstRun.stderr.replace("3.87ms", "9.10ms").replace("2.22ms", "4.40ms"),
+    };
+    expect(
+      findUnchangedValidationFailure(
+        [sameFailuresWithDifferentTimings],
+        new Map([[firstRun.command, firstDigest]]),
+        process.cwd(),
+      ),
+    ).toEqual({ command: firstRun.command, digest: firstDigest });
+  });
+
+  test("distinguishes changed assertion details while ignoring timing-only changes", () => {
+    const firstRun = {
+      step: "bun test scripts/__tests__",
+      command: "bun test scripts/__tests__",
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: [
+        "error: expect(received).toEqual(expected)",
+        "Expected: 2",
+        "Received: 3",
+        "TypeError: cleanup state 2 is invalid",
+        "(fail) cleanup harness > aggregates residual failures [3.87ms]",
+      ].join("\n"),
+      elapsedMs: 1_892,
+    };
+    const changedAssertion = {
+      ...firstRun,
+      stderr: firstRun.stderr.replace("Expected: 2", "Expected: 4"),
+    };
+    const timingOnlyChange = {
+      ...firstRun,
+      stderr: firstRun.stderr.replace("3.87ms", "9.10ms"),
+      elapsedMs: 2_014,
+    };
+    const changedTypeError = {
+      ...firstRun,
+      stderr: firstRun.stderr.replace("cleanup state 2", "cleanup state 4"),
+    };
+
+    const firstDigest = extractValidationFailureRetryDigest(firstRun, process.cwd());
+    const changedDigest = extractValidationFailureRetryDigest(changedAssertion, process.cwd());
+    const timingDigest = extractValidationFailureRetryDigest(timingOnlyChange, process.cwd());
+    const changedTypeErrorDigest = extractValidationFailureRetryDigest(
+      changedTypeError,
+      process.cwd(),
+    );
+
+    expect(firstDigest).toContain("assertion context (3, signature=");
+    expect(changedDigest).not.toBe(firstDigest);
+    expect(changedTypeErrorDigest).not.toBe(firstDigest);
+    expect(timingDigest).toBe(firstDigest);
   });
 
   test("prioritizes browser validation repair guidance over lower-priority gate chatter", () => {

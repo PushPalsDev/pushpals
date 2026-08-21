@@ -93,6 +93,9 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
   legacy, and same-pusher restart claims are reconciled back to FIFO pending work,
 - processed/failed callbacks verify lease ownership so a stale publisher cannot
   finalize a completion reclaimed by another SCM instance,
+- a successful publication command receives bounded exact-ref proof checks;
+  delayed visibility retains the validated checkpoint for reconciliation rather
+  than falsely marking the candidate `publish_blocked`,
 - `/health` becomes unhealthy when an active tick stops making progress or an
   old publication backlog remains idle; the embedded supervisor then terminates
   the full Windows process tree with `taskkill /T /F` and restarts SCM,
