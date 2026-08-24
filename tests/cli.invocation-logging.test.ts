@@ -44,6 +44,45 @@ async function findAvailablePort(): Promise<number> {
 }
 
 describe("pushpals CLI invocation logging", () => {
+  test("version aliases print version context and exit without repository or runtime startup", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pushpals-cli-version-"));
+
+    try {
+      for (const versionArg of ["--version", "-V"]) {
+        const proc = Bun.spawn([bunExecPath, cliScriptPath, versionArg], {
+          cwd,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: {
+            ...process.env,
+            PUSHPALS_CLI_PACKAGE_VERSION: "1.2.41-test",
+            // A version query must not inspect or prepare an embedded runtime.
+            PUSHPALS_RUNTIME_ROOT: join(cwd, "missing-runtime"),
+          },
+        });
+
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+
+        expect(code).toBe(0);
+        expect(stderr.trim()).toBe("");
+        expect(stdout).toContain(`[pushpals] version=1.2.41-test runtime=bun@${Bun.version}`);
+        expect(stdout).toContain(`[pushpals] platform=${process.platform}/${process.arch}`);
+        expect(stdout).toContain(`[pushpals] args=${versionArg}`);
+        expect(stdout).not.toContain("Unknown argument");
+        expect(stdout).not.toContain("Refusing to start");
+        expect(stdout).not.toContain("Running runtime preflight");
+        expect(stdout).not.toContain("Starting embedded");
+        expect(stdout).not.toContain("PushPals CLI\n\nUsage:");
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("prints invocation context before help output", async () => {
     const proc = Bun.spawn([bunExecPath, cliScriptPath, "--help"], {
       cwd: repoRoot,
@@ -67,6 +106,7 @@ describe("pushpals CLI invocation logging", () => {
     expect(stdout).toContain("[pushpals] args=--help");
     expect(stdout).toContain("PushPals CLI");
     expect(stdout).toContain("--open_config, --open-config");
+    expect(stdout).toContain("-V, --version");
   });
 
   test("prints invocation context before early non-git failure", async () => {

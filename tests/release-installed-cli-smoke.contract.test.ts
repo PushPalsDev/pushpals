@@ -11,11 +11,103 @@ import {
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  assertCliVersionCommand,
+  expectedCliVersionFromReleaseInput,
   runtimeCandidateBinaryNames,
   seedCandidateRuntimeBinaries,
 } from "../scripts/release-installed-cli-smoke.ts";
 
 describe("published Windows CLI runtime soak contract", () => {
+  test("derives and verifies the exact installed CLI release version", () => {
+    expect(expectedCliVersionFromReleaseInput("@pushpalsdev/cli@1.2.42", null)).toBe("1.2.42");
+    expect(
+      expectedCliVersionFromReleaseInput("C:/artifacts/pushpalsdev-cli-1.2.42.tgz", "v1.2.42"),
+    ).toBe("1.2.42");
+    expect(expectedCliVersionFromReleaseInput("@pushpalsdev/cli@latest", null)).toBeNull();
+
+    const smoke = readFileSync(
+      join(process.cwd(), "scripts", "release-installed-cli-smoke.ts"),
+      "utf8",
+    );
+    expect(smoke).toContain("await assertCliVersionCommand");
+    expect(smoke).toContain('label: "Installed pushpals --version"');
+  });
+
+  test("runs version checks through the bounded process harness", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-version-contract-"));
+    const fixture = join(root, "version-fixture.ts");
+    try {
+      writeFileSync(
+        fixture,
+        `if (!process.argv.includes("--version")) process.exit(2);
+console.log("[pushpals] version=1.2.42 runtime=bun@" + Bun.version);
+console.log("[pushpals] platform=" + process.platform + "/" + process.arch);
+`,
+        "utf8",
+      );
+      const output = await assertCliVersionCommand({
+        command: [process.execPath, fixture],
+        cwd: root,
+        env: process.env,
+        expectedVersion: "1.2.42",
+        timeoutMs: 5_000,
+      });
+      expect(output).toContain("[pushpals] version=1.2.42 runtime=bun@");
+      await expect(
+        assertCliVersionCommand({
+          command: [process.execPath, fixture],
+          cwd: root,
+          env: process.env,
+          expectedVersion: "1.2.43",
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow("did not report exact package version 1.2.43");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("times out a stuck version command and terminates its descendant", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-version-timeout-"));
+    const fixture = join(root, "stuck-version-fixture.ts");
+    const childPidFile = join(root, "child.pid");
+    try {
+      writeFileSync(
+        fixture,
+        `const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+  stdin: "ignore",
+  stdout: "ignore",
+  stderr: "ignore",
+});
+await Bun.write(String(process.env.PUSHPALS_SMOKE_CHILD_PID_FILE ?? ""), String(child.pid));
+setInterval(() => {}, 1000);
+`,
+        "utf8",
+      );
+      const startedAt = Date.now();
+      await expect(
+        assertCliVersionCommand({
+          command: [process.execPath, fixture],
+          cwd: root,
+          env: {
+            ...process.env,
+            PUSHPALS_SMOKE_CHILD_PID_FILE: childPidFile,
+          },
+          expectedVersion: "1.2.42",
+          timeoutMs: 1_000,
+        }),
+      ).rejects.toThrow("Timed out after 1000ms");
+      expect(Date.now() - startedAt).toBeLessThan(8_000);
+
+      const childPid = Number.parseInt(readFileSync(childPidFile, "utf8"), 10);
+      expect(Number.isFinite(childPid)).toBeTrue();
+      await Bun.sleep(100);
+      expect(() => process.kill(childPid, 0)).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("validates the exact CLI tarball against same-run runtime candidates", () => {
     const workflow = readFileSync(
       join(process.cwd(), ".github", "workflows", "release-cli.yml"),

@@ -735,6 +735,7 @@ function printUsage(): void {
   console.log("  --open_config, --open-config");
   console.log("                        Open the active local config file and exit");
   console.log("  --create_vision_md     Create a starter vision.md in the current repo and exit");
+  console.log("  -V, --version          Print CLI and runtime version information and exit");
   console.log("  -h, --help             Show this help");
   console.log("");
   console.log("Chat commands:");
@@ -766,6 +767,12 @@ function parseArgs(argv: string[]): CliOptions | null {
     const arg = argv[i];
     if (arg === "-h" || arg === "--help") {
       printUsage();
+      return null;
+    }
+    if (arg === "-V" || arg === "--version") {
+      // Invocation logging above already emits the package version, Bun runtime,
+      // and platform. Returning here keeps this informational command independent
+      // from repository discovery, runtime preparation, and service startup.
       return null;
     }
     if (arg === "--no-stream") {

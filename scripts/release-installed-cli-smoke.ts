@@ -14,6 +14,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { basename, delimiter, join, resolve } from "path";
+import { runBoundedProcess } from "../packages/shared/src/bounded_process.ts";
 
 type SmokeOptions = {
   packageSpec: string;
@@ -69,6 +70,22 @@ export function currentRuntimePlatformKey(
   const platformKey = `${family}-${architecture}`;
   runtimeCandidateBinaryNames(platformKey);
   return platformKey;
+}
+
+export function expectedCliVersionFromReleaseInput(
+  packageSpec: string,
+  runtimeTag: string | null,
+): string | null {
+  const runtimeVersion = String(runtimeTag ?? "")
+    .trim()
+    .match(/^v(\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?)$/)?.[1];
+  if (runtimeVersion) return runtimeVersion;
+
+  const spec = String(packageSpec ?? "").trim();
+  const exactPackageVersion = spec.match(/@(\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?)$/)?.[1];
+  if (exactPackageVersion) return exactPackageVersion;
+
+  return basename(spec).match(/-(\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?)\.tgz$/)?.[1] ?? null;
 }
 
 export function seedCandidateRuntimeBinaries(input: {
@@ -313,47 +330,25 @@ async function runWithTimeout(
   env: Record<string, string | undefined>,
   timeoutMs: number,
 ): Promise<CommandResult> {
-  const proc = Bun.spawn(cmd, {
+  const result = await runBoundedProcess(cmd, {
     cwd,
     env,
     stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
+    timeoutMs,
+    outputLimitBytes: OUTPUT_MAX_CHARS,
+    streamDrainTimeoutMs: OUTPUT_DRAIN_TIMEOUT_MS,
+    retainOutputTail: true,
+    preserveOutputWhitespace: true,
   });
-  const stdoutCollector = collectOutput(proc.stdout);
-  const stderrCollector = collectOutput(proc.stderr);
-  let timeout: ReturnType<typeof setTimeout> | null = null;
-  const exitCode = await Promise.race([
-    proc.exited,
-    new Promise<number>((resolveTimeout) => {
-      timeout = setTimeout(() => {
-        killProcessTree(proc);
-        resolveTimeout(-999);
-      }, timeoutMs);
-    }),
-  ]);
-  if (timeout) {
-    clearTimeout(timeout);
-    timeout = null;
-  }
-  if (exitCode === -999) {
-    await Promise.race([proc.exited.catch(() => -999), Bun.sleep(OUTPUT_DRAIN_TIMEOUT_MS)]);
-    stdoutCollector.cancel();
-    stderrCollector.cancel();
-  }
-  const [stdout, stderr] = await Promise.all([
-    finishOutput(stdoutCollector),
-    finishOutput(stderrCollector),
-  ]);
-  if (exitCode === -999) {
+  if (result.timedOut) {
     throw new Error(
-      `Timed out after ${timeoutMs}ms: ${cmd.join(" ")}\n${summarizeTail(`${stdout}\n${stderr}`)}`,
+      `Timed out after ${timeoutMs}ms: ${cmd.join(" ")}\n${summarizeTail(`${result.stdout}\n${result.stderr}`)}`,
     );
   }
   return {
-    exitCode,
-    stdout,
-    stderr,
+    exitCode: result.exitCode,
+    stdout: result.stdout,
+    stderr: result.stderr,
   };
 }
 
@@ -422,6 +417,46 @@ function assertCommandSucceeded(result: CommandResult, label: string): void {
       `${label} failed with exit code ${result.exitCode}\n${summarizeTail(`${result.stdout}\n${result.stderr}`)}`,
     );
   }
+}
+
+export async function assertCliVersionCommand(input: {
+  command: string[];
+  cwd: string;
+  env: Record<string, string | undefined>;
+  expectedVersion: string;
+  timeoutMs?: number;
+  label?: string;
+}): Promise<string> {
+  const expectedVersion = String(input.expectedVersion ?? "").trim();
+  if (!/^\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?$/.test(expectedVersion)) {
+    throw new Error(`Invalid expected CLI version: ${expectedVersion || "(empty)"}`);
+  }
+  if (input.command.length === 0 || input.command.some((part) => !String(part).trim())) {
+    throw new Error("CLI version command must contain non-empty arguments");
+  }
+
+  const result = await runWithTimeout(
+    [...input.command, "--version"],
+    input.cwd,
+    input.env,
+    Math.max(1_000, input.timeoutMs ?? 30_000),
+  );
+  const label = input.label ?? "CLI --version";
+  assertCommandSucceeded(result, label);
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (!output.includes(`[pushpals] version=${expectedVersion} runtime=bun@`)) {
+    throw new Error(
+      `${label} did not report exact package version ${expectedVersion}.\n${summarizeTail(output)}`,
+    );
+  }
+  if (
+    output.includes("Unknown argument") ||
+    output.includes("Running runtime preflight") ||
+    output.includes("Starting embedded")
+  ) {
+    throw new Error(`${label} performed unexpected startup work.\n${summarizeTail(output)}`);
+  }
+  return output;
 }
 
 function assertNoStartupFailure(text: string): void {
@@ -627,6 +662,23 @@ async function main(): Promise<void> {
       ...(options.useRepoDataDir ? {} : { PUSHPALS_DATA_DIR_OVERRIDE: dataDir }),
     } as Record<string, string>;
     finalClear = { pushpalsPath, repoPath, commandEnv };
+
+    const expectedCliVersion = expectedCliVersionFromReleaseInput(
+      options.packageSpec,
+      options.runtimeTag,
+    );
+    if (!expectedCliVersion) {
+      throw new Error(
+        `Could not derive an exact CLI version from package spec ${options.packageSpec} and runtime tag ${options.runtimeTag ?? "(none)"}.`,
+      );
+    }
+    await assertCliVersionCommand({
+      command: [pushpalsPath],
+      cwd: root,
+      env: commandEnv,
+      expectedVersion: expectedCliVersion,
+      label: "Installed pushpals --version",
+    });
 
     const clearResult = await runWithTimeout(
       [pushpalsPath, "--clear", "--runtime-root", runtimeRoot],

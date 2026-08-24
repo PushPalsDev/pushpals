@@ -23,6 +23,7 @@ Run from inside the Git repository you want PushPals to manage.
 | `pushpals --no-auto-start`      | Require an existing healthy runtime.                                   |
 | `pushpals --runtime-only`       | Supervise the local runtime without interactive chat.                  |
 | `pushpals --status-once`        | Print endpoints and readiness once, then exit.                         |
+| `pushpals --version`            | Print CLI, Bun runtime, and platform versions, then exit.              |
 | `pushpals --open-config`        | Open the active local runtime configuration.                           |
 | `pushpals --clear`              | Stop the repo's managed runtime and remove repo-local PushPals state.  |
 

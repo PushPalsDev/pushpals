@@ -19,6 +19,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "Release publication requires a tag ref; observed ${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
           tag="${GITHUB_REF_NAME}"
           if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)$ ]]; then
             echo "Tag '$tag' is not a valid semver release tag (expected vX.Y.Z)." >&2
@@ -194,8 +198,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          registry-url: "https://registry.npmjs.org"
+          node-version: "24.11.0"
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -217,60 +220,21 @@ jobs:
             echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Verify npm publish token
+      - name: Install npm trusted publishing CLI
         if: steps.npm_publish_check.outputs.already_published != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm install --global npm@11.6.1
+
+      - name: Verify npm trusted publishing prerequisites
+        if: steps.npm_publish_check.outputs.already_published != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN secret is required to publish @pushpalsdev/cli." >&2
+          node_version="$(node --version)"
+          npm_version="$(npm --version)"
+          echo "Trusted publishing toolchain: node=${node_version} npm=${npm_version}"
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::GitHub OIDC is unavailable. The publish job requires permissions.id-token=write." >&2
             exit 1
-          fi
-
-          whoami_stderr="$RUNNER_TEMP/npm-whoami.stderr"
-          token_user="$(npm whoami --registry=https://registry.npmjs.org 2>"$whoami_stderr" || true)"
-          if [ -z "$token_user" ]; then
-            echo "::error::NPM_TOKEN is set, but npm whoami failed. The token is invalid, expired, or not accepted by registry.npmjs.org." >&2
-            cat "$whoami_stderr" >&2 || true
-            exit 1
-          fi
-          echo "NPM_TOKEN authenticates as npm user: ${token_user}"
-
-          owners_stderr="$RUNNER_TEMP/npm-owner-ls.stderr"
-          owners="$(npm owner ls @pushpalsdev/cli --registry=https://registry.npmjs.org 2>"$owners_stderr" || true)"
-          if [ -z "$owners" ]; then
-            echo "::error::Could not read @pushpalsdev/cli npm owners. The token may not be able to access the package." >&2
-            cat "$owners_stderr" >&2 || true
-            exit 1
-          fi
-          if ! printf '%s\n' "$owners" | awk '{print $1}' | grep -Fxq "$token_user"; then
-            echo "::error::NPM_TOKEN authenticates as '${token_user}', but that user is not listed as an owner for @pushpalsdev/cli. Create the secret from a package owner or grant this npm user publish rights." >&2
-            echo "Current @pushpalsdev/cli owners:" >&2
-            printf '%s\n' "$owners" >&2
-            exit 1
-          fi
-
-          access_json="$RUNNER_TEMP/npm-access-collaborators.json"
-          access_stderr="$RUNNER_TEMP/npm-access-collaborators.stderr"
-          if npm access list collaborators @pushpalsdev/cli --json --registry=https://registry.npmjs.org >"$access_json" 2>"$access_stderr"; then
-            ACCESS_JSON="$access_json" TOKEN_USER="$token_user" node <<'JS'
-          const fs = require("fs");
-          const raw = fs.readFileSync(process.env.ACCESS_JSON, "utf8").replace(/^\uFEFF/, "");
-          const access = JSON.parse(raw);
-          const permission = access[process.env.TOKEN_USER];
-          if (!permission || !String(permission).includes("write")) {
-            console.error(
-              `::error::NPM_TOKEN user ${process.env.TOKEN_USER} does not have write access to @pushpalsdev/cli. Observed permission: ${permission || "(none)"}.`,
-            );
-            process.exit(1);
-          }
-          console.log(`Verified npm write access for @pushpalsdev/cli: ${permission}`);
-          JS
-          else
-            echo "::warning::Could not verify @pushpalsdev/cli collaborator permissions through npm access. Package-scoped granular tokens can be blocked from metadata endpoints; continuing to npm publish after owner verification." >&2
-            cat "$access_stderr" >&2 || true
           fi
 
       - name: Download tested immutable CLI package artifact
@@ -298,13 +262,7 @@ jobs:
 
       - name: Publish to npm
         if: steps.npm_publish_check.outputs.already_published != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "NPM_TOKEN secret is required to publish @pushpalsdev/cli." >&2
-            exit 1
-          fi
           npm publish "${{ steps.tested_package.outputs.tarball }}" --ignore-scripts --access public --provenance
 
   smoke_published_cli_linux:
@@ -377,10 +335,10 @@ jobs:
             runs_on: windows-2022
           - target: bun-darwin-x64
             output_name: pushpals-macos-x64
-            runs_on: macos-14
+            runs_on: macos-15-intel
           - target: bun-darwin-arm64
             output_name: pushpals-macos-arm64
-            runs_on: macos-14
+            runs_on: macos-15
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout
@@ -400,10 +358,16 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           output="dist/${{ matrix.output_name }}"
-          bun build scripts/pushpals-cli.ts --compile --target=${{ matrix.target }} --outfile "$output"
+          bun build scripts/pushpals-cli.ts --compile --target=${{ matrix.target }} --outfile "$output" \
+            --define "process.env.PUSHPALS_CLI_PACKAGE_VERSION='${{ needs.meta.outputs.version }}'"
           if [[ "${{ matrix.target }}" != "bun-windows-x64" ]]; then
             chmod +x "$output"
           fi
+
+          bun run scripts/release-cli-version-smoke.ts \
+            --binary "$output" \
+            --expected-version "${{ needs.meta.outputs.version }}" \
+            --timeout-ms 60000
 
       - name: Install Windows signing tool
         if: matrix.target == 'bun-windows-x64' && env.WINDOWS_CODESIGN_PFX_BASE64 != '' && runner.os != 'Windows'

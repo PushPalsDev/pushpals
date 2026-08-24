@@ -359,6 +359,16 @@ describe("release package payload verification", () => {
 
     expect(publishJob).toContain("- build_cli_package");
     expect(workflow).toContain("- reliability_contract");
+    expect(publishJob).toContain("id-token: write");
+    expect(publishJob).toContain('node-version: "24.11.0"');
+    expect(publishJob).toContain("npm install --global npm@11.6.1");
+    expect(publishJob).toContain("ACTIONS_ID_TOKEN_REQUEST_URL");
+    expect(publishJob).not.toContain("NPM_TOKEN");
+    expect(publishJob).not.toContain("NODE_AUTH_TOKEN");
+    expect(publishJob).not.toContain("npm whoami");
+    expect(publishJob).not.toContain("registry-url:");
+    expect(publishJob).not.toContain("_authToken");
+    expect(workflow).toContain('if [[ "${GITHUB_REF_TYPE}" != "tag" ]]');
     expect(publishDownloadIndex).toBeGreaterThanOrEqual(0);
     expect(publishVerifyIndex).toBeGreaterThan(publishDownloadIndex);
     expect(publishIndex).toBeGreaterThan(publishVerifyIndex);
@@ -370,6 +380,15 @@ describe("release package payload verification", () => {
     expect(publishJob).not.toContain("working-directory: packages/cli");
     expect(publishJob).not.toContain("npm publish --access public");
     expect(publishJob.match(/^\s+npm publish /gm)).toHaveLength(1);
+
+    expect(workflow).toContain(
+      "--define \"process.env.PUSHPALS_CLI_PACKAGE_VERSION='${{ needs.meta.outputs.version }}'\"",
+    );
+    expect(workflow).toContain("bun run scripts/release-cli-version-smoke.ts");
+    expect(workflow).toContain('--expected-version "${{ needs.meta.outputs.version }}"');
+    expect(workflow).toContain("--timeout-ms 60000");
+    expect(workflow).toContain("runs_on: macos-15-intel");
+    expect(workflow).toContain("runs_on: macos-15");
 
     expect(publishReleaseJob).toContain("name: pushpals-linux-x64");
     expect(publishReleaseJob).toContain("name: pushpals-windows-x64.exe");

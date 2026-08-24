@@ -5,6 +5,31 @@ releases are tag-driven: pushing a `vX.Y.Z` tag starts the `Release CLI` GitHub
 Actions workflow, which publishes npm, builds runtime binaries, and creates the
 GitHub release.
 
+## npm Trusted Publishing
+
+The release workflow publishes `@pushpalsdev/cli` through npm trusted publishing
+with short-lived GitHub OIDC credentials. It must not depend on a long-lived
+`NPM_TOKEN` secret.
+
+Configure the package once in npm package settings with these exact trusted
+publisher values:
+
+- provider: GitHub Actions
+- organization: `PushPalsDev`
+- repository: `pushpals`
+- workflow filename: `release-cli.yml`
+- environment: none
+- allowed action: `npm publish`
+
+The publish job requires `id-token: write`, Node `22.14.0` or newer, and npm
+`11.5.1` or newer. `npm whoami` does not validate OIDC publishing because npm
+exchanges the workflow identity only during `npm publish`.
+
+Do not set `registry-url` on `actions/setup-node` in the publish job. That option
+writes a classic `_authToken` entry to npm's user config; without a
+`NODE_AUTH_TOKEN`, the empty entry can prevent npm from attempting the OIDC
+exchange. npm already defaults to `https://registry.npmjs.org`.
+
 ## When To Cut A Release
 
 Cut a patch release when a committed change affects any published CLI behavior,
@@ -159,6 +184,10 @@ pushpals --clear
 - `release_log.md` was not updated, so the GitHub release body is stale.
 - `packages/cli/runtime` was not regenerated after runtime changes.
 - The npm package published, but a platform binary smoke failed.
+- npm publish reports `ENEEDAUTH`; verify the npm trusted publisher matches
+  `PushPalsDev/pushpals` and `release-cli.yml` exactly, including case and file
+  extension, verify the publish job retains `id-token: write`, and verify its
+  npm config does not contain a classic `_authToken` entry.
 - The CLI package payload check fails because an external tool binary, native
   library, virtualenv, or `node_modules` directory would be shipped. Remove the
   vendored artifact and rely on environment discovery/downloads instead.
