@@ -2,38 +2,36 @@
 
 ## Release Metadata
 
-- version: `v1.2.41`
-- start_commit: `e6fc7370814902cdc5e15bba9e7d22b6f29481b1`
-- end_commit: `d7c9e025fcca76744b859ea898129bd978e37a0e`
-- commits_in_range: `4`
+- version: `v1.2.42`
+- start_commit: `40a2a455940f2d1e0c996c33ebef3df2ba194c99`
+- end_commit: `e437e27b50dba7d18cc8be941c9e7de13939bd6d`
+- commits_in_range: `1`
 
 ## Highlights
 
-- Fence every WorkerPal job mutation with exact claim authority, require a confirmed execution-start boundary, and recover pre-start work without replaying already-started side effects.
-- Keep runtime-failure circuits bounded and restart-safe with a single half-open canary, durable backlog release, corrected activity timestamps, and deduplicated diagnostics.
-- Preserve completion ownership and durable request/autonomy links across legacy dedupe migrations, ambiguous callbacks, heartbeat recovery, and large deferred backlogs.
-- Reconcile successful source-control publication when authoritative remote proof is briefly delayed instead of falsely marking the job `publish_blocked`.
-- Improve WorkerPal convergence with docs-aware scope classification, recursive Docker dependency detection, stable failure identities, useful late failure excerpts, and one bounded near-threshold critic revision.
-- Add focused lifecycle, migration, response-loss, publication, quality-gate, packaged-runtime, and process-boundary regressions, with concise component contracts in the wiki and app READMEs.
+- Add `pushpals --version` and `pushpals -V`, reporting the package, Bun runtime, and platform versions without requiring a Git repository or starting local services.
+- Verify the exact installed-package and standalone-binary version during releases, with non-repository isolation, bounded output draining, and whole-process-tree timeout recovery.
+- Replace the expired long-lived npm publication token with short-lived GitHub OIDC trusted publishing, while preserving immutable package checks and provenance.
+- Require release publication from a real tag and build macOS artifacts on native, supported Intel and Arm runners.
+- Add regression coverage for CLI early exit, installed version derivation, stuck descendant cleanup, OIDC workflow invariants, and standalone version injection.
 
 ## Validation
 
-- `bun run test:root` passed `1,528` tests with `12` intentional platform or opt-in skips, `0` failures, and `8,155` assertions across `150` files in a resource-bounded Bun 1.3.14 Linux container with Node and npm present.
-- The OpenAI Codex executor Python suite passed all `119` tests, including the documentation-inspection and test-harness authority matrix.
-- WorkerPal and SourceControlManager TypeScript builds passed, along with the focused publication-recovery, quality-gate, validation-safety, runtime-mirror, launch, and session suites.
-- `bun run cli:bundle` completed and synchronized packaged runtime source and generated service bundles.
+- `bun run test:root` passed `1,532` tests with `12` intentional platform or opt-in skips, `0` failures, and `8,203` assertions across `150` files in a resource-bounded Bun 1.3.14 Linux container with Node and npm present.
+- The focused CLI, installed-release, release-workflow, and bounded-process regression suite passed all `41` tests.
+- `bun run cli:bundle` completed in a clean Git checkout and produced no tracked runtime or monitor-UI changes.
 - `bun run cli:verify-package-payload` verified `260` package files with no external toolchain files.
-- Changed WorkerPal source mirrors were byte-identical to their packaged copies, and both generated runtime bundles passed Node syntax checks and isolated packaged startup.
-- `git diff --check` passed.
+- A compiled Linux standalone CLI reported the injected `1.2.42` version and exited without repository discovery or runtime startup.
+- Release workflow YAML parsing, Prettier, and `git diff --check` passed.
 
 ## Install
 
 ```bash
-npm i -g @pushpalsdev/cli@1.2.41
+npm i -g @pushpalsdev/cli@1.2.42
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.41
+bun install -g @pushpalsdev/cli@1.2.42
 ```
 
 ## Artifacts
@@ -51,5 +49,5 @@ bun install -g @pushpalsdev/cli@1.2.41
 ## Known Issues
 
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when auto-spawn is enabled. `pushpals --clear` treats a stopped Docker daemon as a best-effort cleanup skip.
-- Active runtimes started from an older release must be restarted after installing this release before the new lifecycle, publication, and timeout behavior takes effect.
+- `v1.2.41` was tagged but not published to npm; upgrade directly from `1.2.40` to `1.2.42`.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
