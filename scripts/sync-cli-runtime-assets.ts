@@ -53,6 +53,26 @@ const copyPairs: Array<[string, string]> = [
     join(repoRoot, "packages", "shared", "src", "validation_repair_lease.ts"),
     join(outDir, "sandbox", "packages", "shared", "src", "validation_repair_lease.ts"),
   ],
+  [
+    join(repoRoot, "packages", "shared", "src", "repo_validation.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "repo_validation.ts"),
+  ],
+  [
+    join(repoRoot, "packages", "shared", "src", "memory.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "memory.ts"),
+  ],
+  [
+    join(repoRoot, "packages", "shared", "src", "repository_agent.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "repository_agent.ts"),
+  ],
+  [
+    join(repoRoot, "packages", "shared", "src", "repository_identity.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "repository_identity.ts"),
+  ],
+  [
+    join(repoRoot, "packages", "shared", "src", "repository_snapshot.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "repository_snapshot.ts"),
+  ],
 ];
 const trackedSandboxCopyPairs: Array<[string, string]> = [
   ["package.json", join(outDir, "sandbox", "package.json")],

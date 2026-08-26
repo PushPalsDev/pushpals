@@ -1425,7 +1425,75 @@ export function copyTrackedRepoPath(
   }
 }
 
-function isCompleteWorkerpalSandboxRoot(root: string): boolean {
+const REQUIRED_REPOSITORY_AGENT_SHARED_RUNTIME_CONTRACTS = {
+  "memory.ts": ["export interface MemoryStore"],
+  "repo_validation.ts": ["export function inferRepositoryValidationSteps"],
+  "repository_agent.ts": ["export interface RepositoryAgent"],
+  "repository_identity.ts": ["export async function resolveRepositoryIdentity"],
+  "repository_snapshot.ts": ["export async function resolveRepositorySnapshot"],
+} as const;
+
+const REQUIRED_REPOSITORY_AGENT_PROMPT_TOKENS = [
+  "{{json_requirements}}",
+  "{{json_schema_block}}",
+  "{{max_tokens_line}}",
+  "{{system_instruction}}",
+  "{{conversation_transcript}}",
+] as const;
+
+const REQUIRED_WINDOWS_SOURCE_RUNTIME_ASSET_FILES = [
+  ".pushpals-server-runtime.js",
+  ".pushpals-localbuddy-runtime.js",
+  ".pushpals-remotebuddy-fallback.js",
+  ".pushpals-workerpals-runtime.js",
+  ".pushpals-source-control-manager-runtime.js",
+  ".pushpals-runtime-launch-trampoline.js",
+] as const;
+
+function fileContainsRuntimeContract(
+  pathValue: string,
+  requiredTokens: readonly string[],
+): boolean {
+  try {
+    const stat = lstatSync(pathValue);
+    if (!stat.isFile() || stat.size <= 0) return false;
+    if (requiredTokens.length === 0) return true;
+    const contents = readFileSync(pathValue, "utf8");
+    return contents.trim().length > 0 && requiredTokens.every((token) => contents.includes(token));
+  } catch {
+    return false;
+  }
+}
+
+function hasCompleteRepositoryAgentSharedRuntime(root: string): boolean {
+  return Object.entries(REQUIRED_REPOSITORY_AGENT_SHARED_RUNTIME_CONTRACTS).every(
+    ([fileName, requiredTokens]) =>
+      fileContainsRuntimeContract(join(root, fileName), requiredTokens),
+  );
+}
+
+function hasCompleteRepositoryAgentPrompt(promptsRoot: string): boolean {
+  return fileContainsRuntimeContract(
+    join(promptsRoot, "remotebuddy", "repository_agent_codex_prompt_template.md"),
+    REQUIRED_REPOSITORY_AGENT_PROMPT_TOKENS,
+  );
+}
+
+function hasCompleteRepositoryAgentRuntimeAssets(runtimeRoot: string): boolean {
+  const sandbox = buildWorkerpalSandboxPaths(runtimeRoot);
+  return (
+    hasCompleteRepositoryAgentPrompt(sandbox.promptsDir) &&
+    hasCompleteRepositoryAgentSharedRuntime(join(sandbox.sharedDir, "src"))
+  );
+}
+
+function hasCompleteWindowsSourceRuntimeAssets(sandboxRoot: string): boolean {
+  return REQUIRED_WINDOWS_SOURCE_RUNTIME_ASSET_FILES.every((fileName) =>
+    fileContainsRuntimeContract(join(sandboxRoot, fileName), []),
+  );
+}
+
+function isCompleteWorkerpalDockerBuildRoot(root: string): boolean {
   return (
     existsSync(join(root, "package.json")) &&
     existsSync(join(root, "apps", "workerpals", "Dockerfile.sandbox")) &&
@@ -1437,6 +1505,15 @@ function isCompleteWorkerpalSandboxRoot(root: string): boolean {
     existsSync(join(root, "prompts", "review_agent", "reviewer.md")) &&
     existsSync(join(root, "protocol", "schemas", "envelope.schema.json")) &&
     existsSync(join(root, "protocol", "schemas", "events.schema.json"))
+  );
+}
+
+function isCompleteWorkerpalSandboxRoot(root: string): boolean {
+  return (
+    isCompleteWorkerpalDockerBuildRoot(root) &&
+    hasCompleteWindowsSourceRuntimeAssets(root) &&
+    hasCompleteRepositoryAgentPrompt(join(root, "prompts")) &&
+    hasCompleteRepositoryAgentSharedRuntime(join(root, "packages", "shared", "src"))
   );
 }
 
@@ -1478,6 +1555,30 @@ function copySourceCheckoutWorkerpalSandboxBuildContext(
   for (const [fromPath, toPath] of copyPairs) {
     copyTrackedRepoPath(sourceRoot, fromPath, toPath, force);
   }
+  // These runtime primitives may be newly introduced and therefore not yet
+  // visible to git-based copying during a source-checkout pre-commit run.
+  // Copy their explicit, bounded contract so completeness repair works before
+  // and after the files become tracked.
+  for (const fileName of Object.keys(REQUIRED_REPOSITORY_AGENT_SHARED_RUNTIME_CONTRACTS)) {
+    const sourcePath = join(sourceRoot, "packages", "shared", "src", fileName);
+    const destinationPath = join(sandbox.sharedDir, "src", fileName);
+    mkdirSync(dirname(destinationPath), { recursive: true });
+    cpSync(sourcePath, destinationPath, {
+      recursive: false,
+      force,
+      errorOnExist: false,
+    });
+  }
+  const sourceRuntimeSandbox = join(sourceRoot, "packages", "cli", "runtime", "sandbox");
+  for (const fileName of REQUIRED_WINDOWS_SOURCE_RUNTIME_ASSET_FILES) {
+    const sourcePath = join(sourceRuntimeSandbox, fileName);
+    if (!fileContainsRuntimeContract(sourcePath, [])) continue;
+    cpSync(sourcePath, join(sandbox.root, fileName), {
+      recursive: false,
+      force,
+      errorOnExist: false,
+    });
+  }
   if (existsSync(join(sourceRoot, "bun.lock"))) {
     copyTrackedRepoPath(sourceRoot, "bun.lock", join(sandbox.root, "bun.lock"), force);
   }
@@ -1503,11 +1604,16 @@ function copyWorkerpalSandboxBuildContext(
 }
 
 function isCompleteRuntimeAssetSource(source: RuntimeAssetSource): boolean {
+  const sharedRuntimeComplete = [
+    join(source.root, "packages", "shared", "src"),
+    join(source.root, "sandbox", "packages", "shared", "src"),
+  ].some(hasCompleteRepositoryAgentSharedRuntime);
   return (
     existsSync(source.envExamplePath) &&
     existsSync(source.visionExamplePath) &&
     existsSync(join(source.configsDir, "default.toml")) &&
-    existsSync(source.promptsDir) &&
+    hasCompleteRepositoryAgentPrompt(source.promptsDir) &&
+    sharedRuntimeComplete &&
     existsSync(join(source.protocolSchemasDir, "envelope.schema.json")) &&
     existsSync(join(source.protocolSchemasDir, "events.schema.json"))
   );
@@ -1906,8 +2012,61 @@ function copyRuntimeAssetBundle(
 function copyBundledRuntimeAssets(runtimeRoot: string, force = true): boolean {
   const bundledSource = resolveBundledRuntimeAssetSource();
   if (!bundledSource) return false;
+  const localConfigPath = join(runtimeRoot, "configs", "local.toml");
+  const preservedLocalConfig = existsSync(localConfigPath) ? readFileSync(localConfigPath) : null;
   copyRuntimeAssetBundle(bundledSource, runtimeRoot, force);
+  // configs/local.toml is machine-owned state, not an immutable runtime asset.
+  // A source checkout may contain an ignored developer override, so never let
+  // bundle refresh replace a target runtime's override or project it into the
+  // WorkerPal sandbox.
+  if (preservedLocalConfig) {
+    mkdirSync(dirname(localConfigPath), { recursive: true });
+    writeFileSync(localConfigPath, preservedLocalConfig);
+  } else {
+    rmSync(localConfigPath, { force: true });
+  }
+  rmSync(join(runtimeRoot, "sandbox", "configs", "local.toml"), { force: true });
   return true;
+}
+
+function repairBundledRepositoryAgentRuntimeAssets(runtimeRoot: string): boolean {
+  const bundledSource = resolveBundledRuntimeAssetSource();
+  if (!bundledSource) return false;
+
+  const sourceSharedRoot = [
+    join(bundledSource.root, "packages", "shared", "src"),
+    join(bundledSource.root, "sandbox", "packages", "shared", "src"),
+  ].find(hasCompleteRepositoryAgentSharedRuntime);
+  if (!sourceSharedRoot || !hasCompleteRepositoryAgentPrompt(bundledSource.promptsDir)) {
+    return false;
+  }
+
+  const sandbox = buildWorkerpalSandboxPaths(runtimeRoot);
+  for (const fileName of Object.keys(REQUIRED_REPOSITORY_AGENT_SHARED_RUNTIME_CONTRACTS)) {
+    const destinationPath = join(sandbox.sharedDir, "src", fileName);
+    mkdirSync(dirname(destinationPath), { recursive: true });
+    cpSync(join(sourceSharedRoot, fileName), destinationPath, {
+      recursive: false,
+      force: true,
+      errorOnExist: false,
+    });
+  }
+
+  const relativePromptPath = join("remotebuddy", "repository_agent_codex_prompt_template.md");
+  const sourcePromptPath = join(bundledSource.promptsDir, relativePromptPath);
+  for (const destinationPath of [
+    join(runtimeRoot, "prompts", relativePromptPath),
+    join(sandbox.promptsDir, relativePromptPath),
+  ]) {
+    mkdirSync(dirname(destinationPath), { recursive: true });
+    cpSync(sourcePromptPath, destinationPath, {
+      recursive: false,
+      force: true,
+      errorOnExist: false,
+    });
+  }
+
+  return hasCompleteRepositoryAgentRuntimeAssets(runtimeRoot);
 }
 
 function hasSeededRuntimePreflightAssets(runtimeRoot: string): boolean {
@@ -1927,7 +2086,14 @@ function hasSeededRuntimePreflightAssets(runtimeRoot: string): boolean {
 
 function seedRuntimePreflightAssets(runtimeRoot: string): void {
   if (!hasSeededRuntimePreflightAssets(runtimeRoot)) {
+    // Seed missing baseline files without replacing a caller's existing runtime
+    // configuration. RepositoryAgent assets have semantic completeness checks,
+    // so repair only that bounded immutable surface when existing files are
+    // truncated or corrupt.
     copyBundledRuntimeAssets(runtimeRoot, false);
+    if (!hasCompleteRepositoryAgentRuntimeAssets(runtimeRoot)) {
+      repairBundledRepositoryAgentRuntimeAssets(runtimeRoot);
+    }
   }
   writeTextFileIfMissing(join(runtimeRoot, ".env"), "# Local PushPals runtime environment\n");
   const localExamplePath = join(runtimeRoot, "configs", "local.example.toml");
@@ -3689,7 +3855,7 @@ export async function ensureWorkerpalDockerImageReady(opts: {
 
   await (opts.ensureRuntimeAssetsFn ?? ensureRuntimeAssets)(opts.runtimeRoot, runtimeTag);
   const sandbox = buildWorkerpalSandboxPaths(opts.runtimeRoot);
-  if (!isCompleteWorkerpalSandboxRoot(sandbox.root)) {
+  if (!isCompleteWorkerpalDockerBuildRoot(sandbox.root)) {
     return {
       ok: false,
       detail: `embedded WorkerPal sandbox assets are incomplete at ${sandbox.root}`,

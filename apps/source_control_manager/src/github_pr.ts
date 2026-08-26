@@ -1,4 +1,7 @@
-import { fetchBufferedWithHardDeadline } from "../../../packages/shared/src/bounded_fetch.js";
+import {
+  fetchBufferedWithHardDeadline,
+  type FetchLike,
+} from "../../../packages/shared/src/bounded_fetch.js";
 
 export interface PullRequestUpsertResult {
   created: boolean;
@@ -12,7 +15,19 @@ export interface GitHubPR {
   title: string;
   body: string | null;
   state: string;
-  head: { ref: string; sha: string; label: string };
+  merged_at?: string | null;
+  closed_at?: string | null;
+  updated_at?: string | null;
+  head: {
+    ref: string;
+    sha: string;
+    label: string;
+    repo?: {
+      full_name?: string | null;
+      name?: string | null;
+      owner?: { login?: string | null } | null;
+    } | null;
+  };
   base: { ref: string; sha: string };
 }
 
@@ -24,11 +39,47 @@ export interface EnsurePullRequestOptions {
   title: string;
   body: string;
   draft?: boolean;
+  fetchImpl?: FetchLike;
 }
 
 type GitHubRepoRef = { owner: string; repo: string };
 
 const DEFAULT_GITHUB_API_TIMEOUT_MS = 30_000;
+const MAX_OPEN_PR_PAGES = 4;
+const MAX_RECENTLY_CLOSED_PR_PAGES = 4;
+const GITHUB_PULL_REQUEST_PAGE_SIZE = 100;
+
+/**
+ * A caller-owned continuation for bounded pull-request scans. Keeping this
+ * cursor outside the provider helper avoids process-global state while letting
+ * long-running reconcilers cover repositories with more than one scan window.
+ */
+export interface PullRequestScanCursor {
+  page: number;
+  offset: number;
+}
+
+export type PullRequestScanComplete = (nextCursor: PullRequestScanCursor | null) => void;
+
+function normalizePullRequestScanCursor(
+  cursor: PullRequestScanCursor | null | undefined,
+): PullRequestScanCursor {
+  const rawPage = Number(cursor?.page);
+  const rawOffset = Number(cursor?.offset);
+  const page = Number.isSafeInteger(rawPage) && rawPage > 0 ? rawPage : 1;
+  const offset =
+    Number.isSafeInteger(rawOffset) && rawOffset >= 0 && rawOffset < GITHUB_PULL_REQUEST_PAGE_SIZE
+      ? rawOffset
+      : 0;
+  return { page, offset };
+}
+
+function notifyPullRequestScanComplete(
+  callback: PullRequestScanComplete | undefined,
+  nextCursor: PullRequestScanCursor | null,
+): void {
+  callback?.(nextCursor);
+}
 
 function githubApiTimeoutMs(): number {
   const configured = Number(process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS);
@@ -37,12 +88,17 @@ function githubApiTimeoutMs(): number {
     : DEFAULT_GITHUB_API_TIMEOUT_MS;
 }
 
-function githubFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+function githubFetch(
+  input: string | URL | Request,
+  init?: RequestInit,
+  fetchImpl?: FetchLike,
+): Promise<Response> {
   const timeoutMs = githubApiTimeoutMs();
   return fetchBufferedWithHardDeadline({
     input,
     init,
     timeoutMs,
+    fetchImpl,
     timeoutMessage: `GitHub API request timed out after ${timeoutMs}ms`,
   });
 }
@@ -64,6 +120,37 @@ function parseGitHubRepo(remoteUrl: string): GitHubRepoRef | null {
   return null;
 }
 
+export function isSupportedGitHubRemoteUrl(remoteUrl: string): boolean {
+  return parseGitHubRepo(remoteUrl) !== null;
+}
+
+export function parseGitHubPullRequestNumberForRemote(
+  prUrl: string,
+  remoteUrl: string,
+): number | null {
+  const repo = parseGitHubRepo(remoteUrl);
+  if (!repo) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(String(prUrl ?? "").trim());
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname.toLowerCase() !== "github.com") return null;
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (
+    parts.length !== 4 ||
+    parts[0]?.toLowerCase() !== repo.owner.toLowerCase() ||
+    parts[1]?.toLowerCase() !== repo.repo.toLowerCase() ||
+    parts[2]?.toLowerCase() !== "pull"
+  ) {
+    return null;
+  }
+  if (!/^[1-9]\d*$/.test(parts[3] ?? "")) return null;
+  const prNumber = Number.parseInt(parts[3] ?? "", 10);
+  return Number.isSafeInteger(prNumber) && prNumber > 0 ? prNumber : null;
+}
+
 function githubHeaders(token: string): Record<string, string> {
   return {
     Accept: "application/vnd.github+json",
@@ -76,6 +163,25 @@ function githubHeaders(token: string): Record<string, string> {
 
 function githubError(responseStatus: number, bodyText: string): Error {
   return new Error(`GitHub API ${responseStatus}: ${bodyText || "no response body"}`);
+}
+
+function pullRequestHeadBelongsToRepo(pr: GitHubPR, repo: GitHubRepoRef): boolean {
+  const expected = `${repo.owner}/${repo.repo}`.toLowerCase();
+  const headRepo = pr?.head?.repo;
+  if (!headRepo) return false;
+
+  const fullName = typeof headRepo.full_name === "string" ? headRepo.full_name.trim() : "";
+  if (fullName) return fullName.toLowerCase() === expected;
+
+  const owner =
+    headRepo.owner && typeof headRepo.owner.login === "string" ? headRepo.owner.login.trim() : "";
+  const name = typeof headRepo.name === "string" ? headRepo.name.trim() : "";
+  return Boolean(owner && name && `${owner}/${name}`.toLowerCase() === expected);
+}
+
+export function pullRequestHeadBelongsToRemoteRepository(pr: GitHubPR, remoteUrl: string): boolean {
+  const repo = parseGitHubRepo(remoteUrl);
+  return repo ? pullRequestHeadBelongsToRepo(pr, repo) : false;
 }
 
 export async function ensureIntegrationPullRequest(
@@ -92,32 +198,47 @@ export async function ensureIntegrationPullRequest(
   const headSpec = `${repo.owner}:${opts.headBranch}`;
 
   const listUrl = `${apiBase}/pulls?state=open&head=${encodeURIComponent(headSpec)}&base=${encodeURIComponent(opts.baseBranch)}`;
-  const listResponse = await githubFetch(listUrl, {
-    method: "GET",
-    headers: githubHeaders(opts.token),
-  });
+  const listResponse = await githubFetch(
+    listUrl,
+    {
+      method: "GET",
+      headers: githubHeaders(opts.token),
+    },
+    opts.fetchImpl,
+  );
   if (!listResponse.ok) {
     const text = await listResponse.text();
     throw githubError(listResponse.status, text);
   }
 
-  const openPrs = (await listResponse.json()) as Array<{ number: number; html_url: string }>;
-  if (Array.isArray(openPrs) && openPrs.length > 0) {
-    const existing = openPrs[0];
+  const openPrs = (await listResponse.json()) as GitHubPR[];
+  const existing = Array.isArray(openPrs)
+    ? openPrs.find(
+        (pr) =>
+          pr.head?.ref === opts.headBranch &&
+          pr.base?.ref === opts.baseBranch &&
+          pullRequestHeadBelongsToRepo(pr, repo),
+      )
+    : undefined;
+  if (existing) {
     return { created: false, number: existing.number, htmlUrl: existing.html_url };
   }
 
-  const createResponse = await githubFetch(`${apiBase}/pulls`, {
-    method: "POST",
-    headers: githubHeaders(opts.token),
-    body: JSON.stringify({
-      title: opts.title,
-      head: opts.headBranch,
-      base: opts.baseBranch,
-      body: opts.body,
-      draft: !!opts.draft,
-    }),
-  });
+  const createResponse = await githubFetch(
+    `${apiBase}/pulls`,
+    {
+      method: "POST",
+      headers: githubHeaders(opts.token),
+      body: JSON.stringify({
+        title: opts.title,
+        head: opts.headBranch,
+        base: opts.baseBranch,
+        body: opts.body,
+        draft: !!opts.draft,
+      }),
+    },
+    opts.fetchImpl,
+  );
 
   if (createResponse.ok) {
     const created = (await createResponse.json()) as { number: number; html_url: string };
@@ -126,18 +247,30 @@ export async function ensureIntegrationPullRequest(
 
   // Handle races where another process created the PR between list and create.
   if (createResponse.status === 422) {
-    const retryListResponse = await githubFetch(listUrl, {
-      method: "GET",
-      headers: githubHeaders(opts.token),
-    });
+    const retryListResponse = await githubFetch(
+      listUrl,
+      {
+        method: "GET",
+        headers: githubHeaders(opts.token),
+      },
+      opts.fetchImpl,
+    );
     if (retryListResponse.ok) {
-      const retryOpenPrs = (await retryListResponse.json()) as Array<{
-        number: number;
-        html_url: string;
-      }>;
-      if (Array.isArray(retryOpenPrs) && retryOpenPrs.length > 0) {
-        const existing = retryOpenPrs[0];
-        return { created: false, number: existing.number, htmlUrl: existing.html_url };
+      const retryOpenPrs = (await retryListResponse.json()) as GitHubPR[];
+      const racedExisting = Array.isArray(retryOpenPrs)
+        ? retryOpenPrs.find(
+            (pr) =>
+              pr.head?.ref === opts.headBranch &&
+              pr.base?.ref === opts.baseBranch &&
+              pullRequestHeadBelongsToRepo(pr, repo),
+          )
+        : undefined;
+      if (racedExisting) {
+        return {
+          created: false,
+          number: racedExisting.number,
+          htmlUrl: racedExisting.html_url,
+        };
       }
     }
   }
@@ -151,6 +284,9 @@ export async function listOpenPullRequests(opts: {
   remoteUrl: string;
   headPrefix: string;
   base: string;
+  cursor?: PullRequestScanCursor | null;
+  onScanComplete?: PullRequestScanComplete;
+  fetchImpl?: FetchLike;
 }): Promise<GitHubPR[]> {
   const repo = parseGitHubRepo(opts.remoteUrl);
   if (!repo) {
@@ -158,23 +294,180 @@ export async function listOpenPullRequests(opts: {
   }
 
   const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
-  const url = `${apiBase}/pulls?state=open&base=${encodeURIComponent(opts.base)}&per_page=100`;
+  const matches: GitHubPR[] = [];
+  const cursor = normalizePullRequestScanCursor(opts.cursor);
+  let page = cursor.page;
+  let offset = cursor.offset;
+  for (let pagesFetched = 0; pagesFetched < MAX_OPEN_PR_PAGES; pagesFetched += 1) {
+    const url =
+      `${apiBase}/pulls?state=open&base=${encodeURIComponent(opts.base)}` +
+      `&per_page=${GITHUB_PULL_REQUEST_PAGE_SIZE}&page=${page}`;
+    const response = await githubFetch(
+      url,
+      {
+        method: "GET",
+        headers: githubHeaders(opts.token),
+      },
+      opts.fetchImpl,
+    );
 
-  const response = await githubFetch(url, {
-    method: "GET",
-    headers: githubHeaders(opts.token),
-  });
+    if (!response.ok) {
+      const text = await response.text();
+      throw githubError(response.status, text);
+    }
 
+    const prs = (await response.json()) as GitHubPR[];
+    if (!Array.isArray(prs)) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+
+    for (const pr of prs.slice(offset)) {
+      const headRef = typeof pr?.head?.ref === "string" ? pr.head.ref : "";
+      if (opts.headPrefix && !headRef.startsWith(opts.headPrefix)) continue;
+      if (!pullRequestHeadBelongsToRepo(pr, repo)) continue;
+      matches.push(pr);
+    }
+
+    if (prs.length < GITHUB_PULL_REQUEST_PAGE_SIZE) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+    page += 1;
+    offset = 0;
+  }
+
+  notifyPullRequestScanComplete(opts.onScanComplete, { page, offset: 0 });
+  return matches;
+}
+
+/**
+ * List a bounded, recent slice of closed pull requests for provider-state
+ * reconciliation. The caller supplies a cutoff so long-running daemons and
+ * restarts do not scan unbounded repository history.
+ */
+export async function listRecentlyClosedPullRequests(opts: {
+  token: string;
+  remoteUrl: string;
+  headPrefix: string;
+  base: string;
+  updatedSince: string;
+  limit?: number;
+  cursor?: PullRequestScanCursor | null;
+  onScanComplete?: PullRequestScanComplete;
+  fetchImpl?: FetchLike;
+}): Promise<GitHubPR[]> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const limit = Number.isFinite(opts.limit)
+    ? Math.max(1, Math.min(100, Math.floor(opts.limit ?? 50)))
+    : 50;
+  const cutoffMs = Date.parse(String(opts.updatedSince ?? "").trim());
+  if (!Number.isFinite(cutoffMs)) {
+    throw new Error(
+      `updatedSince must be a valid timestamp, got ${JSON.stringify(opts.updatedSince)}`,
+    );
+  }
+
+  const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
+  const matches: GitHubPR[] = [];
+  const cursor = normalizePullRequestScanCursor(opts.cursor);
+  let page = cursor.page;
+  let offset = cursor.offset;
+  for (let pagesFetched = 0; pagesFetched < MAX_RECENTLY_CLOSED_PR_PAGES; pagesFetched += 1) {
+    const url =
+      `${apiBase}/pulls?state=closed&base=${encodeURIComponent(opts.base)}` +
+      `&sort=updated&direction=desc&per_page=${GITHUB_PULL_REQUEST_PAGE_SIZE}&page=${page}`;
+    const response = await githubFetch(
+      url,
+      {
+        method: "GET",
+        headers: githubHeaders(opts.token),
+      },
+      opts.fetchImpl,
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw githubError(response.status, text);
+    }
+
+    const prs = (await response.json()) as GitHubPR[];
+    if (!Array.isArray(prs)) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+
+    let reachedCutoff = false;
+    let nextOffset = offset;
+    for (let index = offset; index < prs.length; index += 1) {
+      const pr = prs[index];
+      nextOffset = index + 1;
+      const updatedAtMs = Date.parse(String(pr.updated_at ?? pr.closed_at ?? ""));
+      if (!Number.isFinite(updatedAtMs)) continue;
+      if (updatedAtMs < cutoffMs) {
+        reachedCutoff = true;
+        break;
+      }
+      const headRef = typeof pr?.head?.ref === "string" ? pr.head.ref : "";
+      if (opts.headPrefix && !headRef.startsWith(opts.headPrefix)) continue;
+      if (!pullRequestHeadBelongsToRepo(pr, repo)) continue;
+      matches.push(pr);
+      if (matches.length >= limit) {
+        const nextCursor =
+          nextOffset < prs.length
+            ? { page, offset: nextOffset }
+            : prs.length >= GITHUB_PULL_REQUEST_PAGE_SIZE
+              ? { page: page + 1, offset: 0 }
+              : null;
+        notifyPullRequestScanComplete(opts.onScanComplete, nextCursor);
+        return matches;
+      }
+    }
+
+    if (reachedCutoff || prs.length < GITHUB_PULL_REQUEST_PAGE_SIZE) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+    page += 1;
+    offset = 0;
+  }
+
+  notifyPullRequestScanComplete(opts.onScanComplete, { page, offset: 0 });
+  return matches;
+}
+
+export async function getPullRequest(opts: {
+  token: string;
+  remoteUrl: string;
+  prNumber: number;
+  fetchImpl?: FetchLike;
+}): Promise<GitHubPR> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+  if (!Number.isSafeInteger(opts.prNumber) || opts.prNumber <= 0) {
+    throw new Error(`prNumber must be a positive integer, got ${JSON.stringify(opts.prNumber)}`);
+  }
+
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
+  const response = await githubFetch(
+    url,
+    {
+      method: "GET",
+      headers: githubHeaders(opts.token),
+    },
+    opts.fetchImpl,
+  );
   if (!response.ok) {
     const text = await response.text();
     throw githubError(response.status, text);
   }
-
-  const prs = (await response.json()) as GitHubPR[];
-  if (!Array.isArray(prs)) return [];
-
-  if (!opts.headPrefix) return prs;
-  return prs.filter((pr) => pr.head.ref.startsWith(opts.headPrefix));
+  return (await response.json()) as GitHubPR;
 }
 
 export async function getPullRequestDiff(opts: {

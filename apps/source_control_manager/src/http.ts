@@ -20,6 +20,7 @@ export function createStatusServer(
     activeCompletionId: null,
     phase: "unknown",
     publication: null,
+    reviewProvider: null,
   }),
 ): ReturnType<typeof Bun.serve> {
   return Bun.serve({

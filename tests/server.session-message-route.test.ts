@@ -57,14 +57,14 @@ afterEach(async () => {
     const dir = tempDirs.pop();
     if (!dir) continue;
     let lastError: unknown = null;
-    for (let attempt = 1; attempt <= 10; attempt += 1) {
+    for (let attempt = 1; attempt <= 20; attempt += 1) {
       try {
         rmSync(dir, { recursive: true, force: true });
         lastError = null;
         break;
       } catch (error) {
         lastError = error;
-        await Bun.sleep(25 * attempt);
+        await Bun.sleep(Math.min(1_000, 50 * attempt));
       }
     }
     if (lastError) throw lastError;
@@ -2276,6 +2276,10 @@ describe("server session message route", () => {
       "autonomy reservation",
       "completion lease",
       "completion lifecycle",
+      "repository agent deadlines",
+      "repository agent health",
+      "repository agent lease",
+      "repository agent memory feedback",
       "request handoff",
       "request lease",
       "request retry chain",
@@ -3023,6 +3027,58 @@ describe("server session message route", () => {
       });
     } finally {
       finalDb.close();
+    }
+  }, 20_000);
+
+  test("normalizes a published completion PR URL for provider reconciliation", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+
+    const { jobId, completionId } = await seedPendingPublication(port, "normalized-pr-link");
+    const claimed = await postServerJson(port, "/completions/claim", {
+      pusherId: "provider-reconciliation-test",
+    });
+    expect(claimed.status).toBe(200);
+    const claimPayload = (await claimed.json()) as {
+      completion?: { id?: string; claimToken?: string };
+    };
+    expect(claimPayload.completion?.id).toBe(completionId);
+    const claimToken = String(claimPayload.completion?.claimToken ?? "");
+    expect(claimToken).not.toBe("");
+
+    const publishedPrUrl = "HTTPS://GITHUB.COM/Example/Repository/pull/901/?source=provider";
+    const processed = await postServerJson(port, `/completions/${completionId}/processed`, {
+      pusherId: "provider-reconciliation-test",
+      claimToken,
+      prUrl: publishedPrUrl,
+    });
+    expect(processed.status).toBe(200);
+    expect(await processed.json()).toMatchObject({
+      ok: true,
+      jobId,
+      jobTransitioned: true,
+    });
+
+    const linksResponse = await fetch(`http://127.0.0.1:${port}/jobs/pr-links?limit=10`);
+    expect(linksResponse.status).toBe(200);
+    expect(await linksResponse.json()).toMatchObject({
+      ok: true,
+      links: [expect.objectContaining({ jobId, prUrl: publishedPrUrl })],
+    });
+
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      expect(db.prepare(`SELECT prUrl, prUrlNormalized FROM jobs WHERE id = ?`).get(jobId)).toEqual(
+        {
+          prUrl: publishedPrUrl,
+          prUrlNormalized: "https://github.com/example/repository/pull/901",
+        },
+      );
+    } finally {
+      db.close();
     }
   }, 20_000);
 });

@@ -149,7 +149,8 @@ describe("server RequestQueue", () => {
       const claimToken = String(claim.request?.claimToken ?? "");
       const jobId = "job-truthful-outcome";
       const jobCreatedAt = new Date().toISOString();
-      db.prepare(`INSERT INTO jobs (id, status, updatedAt) VALUES (?, 'claimed', ?)`).run(
+      db.run(
+        `INSERT INTO jobs (id, status, updatedAt) VALUES (?, 'claimed', ?)`,
         jobId,
         jobCreatedAt,
       );
@@ -180,7 +181,8 @@ describe("server RequestQueue", () => {
       });
 
       const failedAt = new Date(Date.now() + 1_000).toISOString();
-      db.prepare(`UPDATE jobs SET status = 'failed', failedAt = ?, updatedAt = ? WHERE id = ?`).run(
+      db.run(
+        `UPDATE jobs SET status = 'failed', failedAt = ?, updatedAt = ? WHERE id = ?`,
         failedAt,
         failedAt,
         jobId,
@@ -204,7 +206,7 @@ describe("server RequestQueue", () => {
       });
     } finally {
       queue.close();
-      db.close();
+      db.close(true);
       try {
         rmSync(root, { recursive: true, force: true });
       } catch {
@@ -388,7 +390,8 @@ describe("server RequestQueue", () => {
           leafAt,
           leafAt,
         );
-        db.prepare(
+        insertJob.finalize();
+        db.run(
           `UPDATE requests
            SET workerRequired = 1,
                handoffJobId = ?,
@@ -396,7 +399,11 @@ describe("server RequestQueue", () => {
                completedAt = ?,
                updatedAt = ?
            WHERE id = ?`,
-        ).run(predecessorJobId, predecessorAt, predecessorAt, requestId);
+          predecessorJobId,
+          predecessorAt,
+          predecessorAt,
+          requestId,
+        );
 
         expect(requestQueue.getRequest(requestId)).toMatchObject({
           handoffJobId: predecessorJobId,
@@ -424,7 +431,7 @@ describe("server RequestQueue", () => {
           repointed: 0,
         });
       } finally {
-        db.close();
+        db.close(true);
         requestQueue.close();
         jobQueue.close();
         try {
@@ -498,7 +505,8 @@ describe("server RequestQueue", () => {
         "2026-08-18T02:03:00.000Z",
         "2026-08-18T02:03:00.000Z",
       );
-      db.prepare(
+      insertJob.finalize();
+      db.run(
         `UPDATE requests
          SET workerRequired = 1,
              handoffJobId = 'job-chain-root',
@@ -506,7 +514,8 @@ describe("server RequestQueue", () => {
              completedAt = '2026-08-18T02:00:00.000Z',
              updatedAt = '2026-08-18T02:00:00.000Z'
          WHERE id = ?`,
-      ).run(requestId);
+        requestId,
+      );
 
       expect(
         requestQueue.reconcileRecoveredWorkerHandoffChains({ maxRequests: 1, maxDepth: 1 }),
@@ -533,7 +542,7 @@ describe("server RequestQueue", () => {
         outcomeStatus: "completed",
       });
     } finally {
-      db.close();
+      db.close(true);
       requestQueue.close();
       jobQueue.close();
       try {
@@ -581,13 +590,15 @@ describe("server RequestQueue", () => {
         "2026-08-18T03:01:00.000Z",
         "2026-08-18T03:01:00.000Z",
       );
-      db.prepare(
+      insertJob.finalize();
+      db.run(
         `UPDATE requests
          SET workerRequired = 1,
              handoffJobId = 'job-cycle-a',
              status = 'completed'
          WHERE id = ?`,
-      ).run(requestId);
+        requestId,
+      );
 
       expect(requestQueue.reconcileRecoveredWorkerHandoffChains({ maxDepth: 64 })).toMatchObject({
         scanned: 1,
@@ -601,7 +612,7 @@ describe("server RequestQueue", () => {
         outcomeStatus: "failed",
       });
     } finally {
-      db.close();
+      db.close(true);
       requestQueue.close();
       jobQueue.close();
       try {
@@ -670,16 +681,20 @@ describe("server RequestQueue", () => {
         "2026-08-18T04:03:00.000Z",
         "2026-08-18T04:03:00.000Z",
       );
+      insertJob.finalize();
 
       const createPinnedRequest = (prompt: string, jobId: string, workerRequired: 0 | 1) => {
         const requestId = String(
           requestQueue.enqueue({ sessionId: "legacy-unrelated", prompt }).requestId ?? "",
         );
-        db.prepare(
+        db.run(
           `UPDATE requests
            SET workerRequired = ?, handoffJobId = ?, status = 'completed'
            WHERE id = ?`,
-        ).run(workerRequired, jobId, requestId);
+          workerRequired,
+          jobId,
+          requestId,
+        );
         return requestId;
       };
       const noSuccessorRequestId = createPinnedRequest(
@@ -721,7 +736,7 @@ describe("server RequestQueue", () => {
         outcomeStatus: "completed",
       });
     } finally {
-      db.close();
+      db.close(true);
       requestQueue.close();
       jobQueue.close();
       try {
@@ -874,7 +889,8 @@ describe("server RequestQueue", () => {
     const nowMs = Date.parse("2026-08-18T22:00:00.000Z");
     const farFuture = new Date(nowMs + 30 * 60_000).toISOString();
     const db = (queue as unknown as { db: any }).db as any;
-    db.prepare("UPDATE requests SET leaseExpiresAt = ? WHERE id IN (?, ?)").run(
+    db.run(
+      "UPDATE requests SET leaseExpiresAt = ? WHERE id IN (?, ?)",
       farFuture,
       tagged.requestId,
       legacy.requestId,
@@ -952,7 +968,11 @@ describe("server RequestQueue", () => {
         now,
       );
     });
-    seed();
+    try {
+      seed();
+    } finally {
+      insertRequest.finalize();
+    }
 
     const shortened = queue.shortenWorkerRuntimeCircuitDeferredClaims({
       nowMs,
@@ -968,16 +988,21 @@ describe("server RequestQueue", () => {
     expect(new Set(shortened.requestIds).size).toBe(500);
     expect(shortened.requestIds.every((id) => id.startsWith("bulk-runtime-request-"))).toBe(true);
 
-    const eligible = db
-      .prepare(
-        `SELECT COUNT(*) AS count
-         FROM requests
-         WHERE id LIKE 'bulk-runtime-request-%'
-           AND id != 'bulk-runtime-request-unrelated'
-           AND leaseExpiresAt = ?`,
-      )
-      .get(expectedDeferredUntil) as { count: number };
-    expect(eligible.count).toBe(eligibleCount);
+    const eligibleStatement = db.prepare(
+      `SELECT COUNT(*) AS count
+       FROM requests
+       WHERE id LIKE 'bulk-runtime-request-%'
+         AND id != 'bulk-runtime-request-unrelated'
+         AND leaseExpiresAt = ?`,
+    );
+    let eligible: { count: number } | null;
+    try {
+      eligible = eligibleStatement.get(expectedDeferredUntil) as { count: number } | null;
+    } finally {
+      eligibleStatement.finalize();
+    }
+    expect(eligible).not.toBeNull();
+    expect(eligible?.count).toBe(eligibleCount);
     expect(queue.getRequest("bulk-runtime-request-unrelated")?.leaseExpiresAt).toBe(farFuture);
 
     expect(
@@ -1098,6 +1123,15 @@ describe("server RequestQueue", () => {
           componentArea: "tests/integration",
           targetPaths: ["tests/integration/test_workerpals_e2e.py"],
           writeGlobs: ["tests/integration/*.py"],
+          validationIncident: {
+            incidentId: "valid_inc_integration",
+            candidateSha: "c".repeat(40),
+            candidateRef: "refs/heads/repair/integration",
+            baselineSha: "b".repeat(40),
+            validationScope: "candidate_specific",
+            failureFingerprint: "fp_integration",
+            arbitrarySecret: "must-not-survive",
+          },
         },
       },
     });
@@ -1110,6 +1144,14 @@ describe("server RequestQueue", () => {
     expect(Array.isArray(autonomy.writeGlobs)).toBe(true);
     expect((autonomy.writeGlobs as string[])[0]).toBe("tests/integration/*.py");
     expect(autonomy.reservationRequired).toBe(true);
+    expect(autonomy.validationIncident).toEqual({
+      incidentId: "valid_inc_integration",
+      candidateSha: "c".repeat(40),
+      candidateRef: "refs/heads/repair/integration",
+      baselineSha: "b".repeat(40),
+      validationScope: "candidate_specific",
+      failureFingerprint: "fp_integration",
+    });
     queue.close();
   });
 
@@ -1482,7 +1524,7 @@ describe("server RequestQueue", () => {
       ).toMatchObject({ ok: true, idempotent: true });
     } finally {
       queue.close();
-      db.close();
+      db.close(true);
       try {
         rmSync(root, { recursive: true, force: true });
       } catch {
@@ -1543,8 +1585,8 @@ describe("server RequestQueue", () => {
       queue = null;
 
       const db = new Database(dbPath);
-      db.prepare(`UPDATE requests SET claimToken = NULL WHERE id = ?`).run(requestId);
-      db.close();
+      db.run(`UPDATE requests SET claimToken = NULL WHERE id = ?`, requestId);
+      db.close(true);
 
       queue = new RequestQueue(dbPath);
       expect(queue.getRequest(requestId)).toMatchObject({
@@ -1569,7 +1611,7 @@ describe("server RequestQueue", () => {
     }
   });
 
-  test("tolerates malformed legacy metadata during restart and claim", async () => {
+  test("tolerates malformed legacy metadata and releases database handles on close", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-request-legacy-json-"));
     const dbPath = join(root, "requests.sqlite");
     let queue: RequestQueue | null = null;
@@ -1582,8 +1624,8 @@ describe("server RequestQueue", () => {
       queue = null;
 
       const db = new Database(dbPath);
-      db.prepare(`UPDATE requests SET metadataJson = ? WHERE id = ?`).run("{not-json", requestId);
-      db.close();
+      db.run(`UPDATE requests SET metadataJson = ? WHERE id = ?`, "{not-json", requestId);
+      db.close(true);
 
       queue = new RequestQueue(dbPath);
       expect(queue.getRequest(requestId)?.metadata).toBeUndefined();
@@ -1593,18 +1635,9 @@ describe("server RequestQueue", () => {
       });
     } finally {
       queue?.close();
-      let lastError: unknown;
-      for (let attempt = 1; attempt <= 20; attempt += 1) {
-        try {
-          rmSync(root, { recursive: true, force: true });
-          lastError = null;
-          break;
-        } catch (error) {
-          lastError = error;
-          await Bun.sleep(25 * attempt);
-        }
-      }
-      if (lastError) throw lastError;
+      // RequestQueue.close() is a synchronous ownership boundary: callers must
+      // be able to rotate or delete the SQLite/WAL files immediately.
+      rmSync(root, { recursive: true, force: true });
     }
-  }, 15_000);
+  });
 });

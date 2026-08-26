@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   deriveQualityGatePolicy,
   extractReviewFixContext,
+  normalizeReviewBranchPrefix,
+  resolveJobCompletionBranch,
   resolveReviewFixCompletionBranch,
   resolveReviewNoChangeCompletionBranch,
   resolveWorkerCriticReviewContext,
@@ -30,6 +32,66 @@ describe("workerpals review fix completion branch resolution", () => {
     });
   });
 
+  test("accepts only the configured custom review branch prefix", () => {
+    expect(
+      resolveReviewFixCompletionBranch(
+        "refs/heads/automation/workerpal-1/job-abc",
+        "automation/default",
+        "automation/",
+      ),
+    ).toEqual({
+      branch: "automation/workerpal-1/job-abc",
+      overridden: true,
+    });
+    expect(
+      resolveReviewFixCompletionBranch(
+        "refs/heads/agent/workerpal-1/job-abc",
+        "automation/default",
+        "automation/",
+      ),
+    ).toEqual({ branch: "automation/default", overridden: false });
+  });
+
+  test("uses the SCM job prefix when WorkerPal runtime configuration is stale", () => {
+    expect(
+      resolveJobCompletionBranch(
+        {
+          completionBranch: "refs/heads/automation/workerpal-1/job-abc",
+          reviewAgent: {
+            resolutionType: "review_fix",
+            branchPrefix: "automation/",
+            prHeadRef: "refs/heads/automation/workerpal-1/job-abc",
+          },
+        },
+        "agent/workerpal-1/fallback",
+        "agent/",
+      ),
+    ).toEqual({
+      branch: "automation/workerpal-1/job-abc",
+      overridden: true,
+    });
+  });
+
+  test("rejects untrusted per-job prefixes outside an SCM review resolution", () => {
+    expect(normalizeReviewBranchPrefix("../main")).toBeNull();
+    expect(
+      resolveJobCompletionBranch(
+        {
+          completionBranch: "refs/heads/untrusted/job-abc",
+          reviewAgent: {
+            branchPrefix: "untrusted/",
+            prHeadRef: "refs/heads/untrusted/job-abc",
+          },
+        },
+        "agent/workerpal-1/fallback",
+        "agent/",
+      ),
+    ).toEqual({
+      branch: "agent/workerpal-1/fallback",
+      overridden: false,
+    });
+  });
+
   test("resolves no-change re-review branch from completionBranch", () => {
     const branch = resolveReviewNoChangeCompletionBranch({
       completionBranch: "refs/heads/agent/workerpal-1/job-abc",
@@ -43,6 +105,16 @@ describe("workerpals review fix completion branch resolution", () => {
       reviewAgent: { prHeadRef: "refs/heads/agent/workerpal-1/job-xyz" },
     });
     expect(branch).toBe("agent/workerpal-1/job-xyz");
+  });
+
+  test("resolves no-change review branches with the configured prefix metadata", () => {
+    const branch = resolveReviewNoChangeCompletionBranch({
+      reviewAgent: {
+        branchPrefix: "automation/",
+        prHeadRef: "refs/heads/automation/workerpal-1/job-xyz",
+      },
+    });
+    expect(branch).toBe("automation/workerpal-1/job-xyz");
   });
 
   test("returns null for unsafe no-change re-review branch", () => {

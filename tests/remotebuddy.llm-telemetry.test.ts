@@ -8,6 +8,125 @@ afterEach(() => {
 });
 
 describe("remotebuddy llm telemetry", () => {
+  test("an upstream abort cancels an Ollama response body and rejects with the caller reason", async () => {
+    let requestSignal: AbortSignal | null = null;
+    let bodyCancelled = 0;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestSignal = init?.signal ?? null;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"message":'));
+          },
+          cancel() {
+            bodyCancelled += 1;
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const client = createLLMClient({
+      service: "repository_agent",
+      backend: "ollama",
+      endpoint: "http://ollama.test/api/chat",
+      model: "tiny-model",
+      httpTimeoutMs: 30_000,
+    });
+    const controller = new AbortController();
+    const reason = new Error("repository request deadline expired");
+    const operation = client.generate({
+      system: "Answer briefly.",
+      messages: [{ role: "user", content: "Status?" }],
+      signal: controller.signal,
+    });
+
+    for (let attempt = 0; attempt < 20 && requestSignal == null; attempt += 1) {
+      await Bun.sleep(5);
+    }
+    expect(requestSignal).not.toBeNull();
+    controller.abort(reason);
+
+    await expect(operation).rejects.toBe(reason);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(bodyCancelled).toBe(1);
+  });
+
+  test("an upstream abort reaches OpenAI-compatible completion fetch and body work", async () => {
+    let completionSignal: AbortSignal | null = null;
+    let bodyCancelled = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/models")) {
+        return Response.json({ data: [{ id: "gpt-test" }] });
+      }
+      completionSignal = init?.signal ?? null;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"choices":'));
+          },
+          cancel() {
+            bodyCancelled += 1;
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const client = createLLMClient({
+      service: "repository_agent",
+      backend: "openai",
+      endpoint: "http://openai.test/v1/chat/completions",
+      apiKey: "test-key",
+      model: "gpt-test",
+      httpTimeoutMs: 30_000,
+    });
+    const controller = new AbortController();
+    const reason = new Error("repository discovery timed out");
+    const operation = client.generate({
+      system: "Answer briefly.",
+      messages: [{ role: "user", content: "Status?" }],
+      signal: controller.signal,
+    });
+
+    for (let attempt = 0; attempt < 20 && completionSignal == null; attempt += 1) {
+      await Bun.sleep(5);
+    }
+    expect(completionSignal).not.toBeNull();
+    controller.abort(reason);
+
+    await expect(operation).rejects.toBe(reason);
+    expect(completionSignal?.aborted).toBe(true);
+    expect(bodyCancelled).toBe(1);
+  });
+
+  test("reports the model identity returned by an OpenAI-compatible provider", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/models")) {
+        return Response.json({ data: [{ id: "requested-model" }] });
+      }
+      return Response.json({
+        model: "actual-provider-model",
+        choices: [{ message: { content: "Ready." } }],
+      });
+    }) as typeof fetch;
+    const client = createLLMClient({
+      service: "repository_agent",
+      backend: "openai",
+      endpoint: "http://openai.test/v1/chat/completions",
+      apiKey: "test-key",
+      model: "requested-model",
+    });
+
+    const output = await client.generate({
+      system: "Answer briefly.",
+      messages: [{ role: "user", content: "Status?" }],
+    });
+
+    expect(output.provider).toBe("openai");
+    expect(output.modelId).toBe("actual-provider-model");
+  });
+
   test("bounds an Ollama completion body that never finishes", async () => {
     globalThis.fetch = (async () =>
       new Response(
@@ -81,10 +200,16 @@ describe("remotebuddy llm telemetry", () => {
       calls.push({ url, init });
 
       if (url === "http://ollama.test/api/chat") {
-        return new Response(JSON.stringify({ message: { content: "Queue depth is stable." } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({
+            model: "actual-tiny-model",
+            message: { content: "Queue depth is stable." },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
       }
 
       if (url === "http://server.test/telemetry/llm-usage") {
@@ -114,6 +239,8 @@ describe("remotebuddy llm telemetry", () => {
     });
 
     expect(output.text).toContain("stable");
+    expect(output.provider).toBe("ollama");
+    expect(output.modelId).toBe("actual-tiny-model");
     expect(output.usage?.promptTokens).toBeGreaterThan(0);
     expect(output.usage?.completionTokens).toBeGreaterThan(0);
 
@@ -127,7 +254,7 @@ describe("remotebuddy llm telemetry", () => {
     >;
     expect(payload.service).toBe("localbuddy");
     expect(payload.backend).toBe("ollama");
-    expect(payload.modelId).toBe("tiny-model");
+    expect(payload.modelId).toBe("actual-tiny-model");
     expect(payload.estimated).toBe(true);
     expect(payload.totalTokens).toBe(
       Number(payload.promptTokens ?? 0) + Number(payload.completionTokens ?? 0),

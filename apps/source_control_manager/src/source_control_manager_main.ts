@@ -4,12 +4,16 @@ import { mkdirSync } from "fs";
 import { createHash, randomUUID } from "crypto";
 import { CommunicationManager } from "../../../packages/shared/src/communication.js";
 import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
-import { resolveGitTokenForRemote } from "../../../packages/shared/src/git_backend.js";
+import {
+  parseGitRemoteHost,
+  resolveGitTokenForRemote,
+} from "../../../packages/shared/src/git_backend.js";
 import { fetchBufferedWithHardDeadline } from "../../../packages/shared/src/bounded_fetch.js";
+import { createRepositoryAgentServiceClients } from "../../../packages/shared/src/repository_agent.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { createSourceControlApi, runGitCommandCapture, type SourceControlApi } from "./git";
-import { ensureIntegrationPullRequest } from "./github_pr";
+import { ensureIntegrationPullRequest, isSupportedGitHubRemoteUrl } from "./github_pr";
 import {
   IntegrationMaintenanceRunner,
   maintainIntegrationBeforeCompletionClaim,
@@ -27,12 +31,16 @@ import {
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { reviewApplyFailureBlocksPublication } from "./review_apply_fallback";
 import {
+  buildReviewAgentRuntimeFingerprint,
   cloneSourceControlManagerConfigSnapshot,
+  createBlockedReviewProviderHealth,
   createStartupStatusTracker,
   createSourceControlManagerHealthTracker,
   createSingleFlightExecutor,
   probeReviewAgentRuntimeReadiness,
+  withReviewProviderHealth,
   type SourceControlManagerPublicationHealth,
+  type SourceControlManagerReviewProviderHealth,
 } from "./runtime_helpers";
 import { createStatusServer } from "./http";
 import { resolveSourceControlManagerRuntimeRepoRoot } from "./runtime_paths";
@@ -271,10 +279,24 @@ const sourceControlManagerPusherId = `source_control_manager-${createHash("sha25
   .update(`${config.repoPath}\n${config.mainBranch}\n${config.remote}`)
   .digest("hex")
   .slice(0, 12)}-${process.pid}-${randomUUID().slice(0, 8)}`;
+const repositoryServices = createRepositoryAgentServiceClients({
+  serverUrl: config.serverUrl,
+  callerService: "source_control_manager",
+  callerInstanceId: sourceControlManagerPusherId,
+  authToken: config.authToken,
+});
 const healthTracker = createSourceControlManagerHealthTracker({
   tickStallMs: SCM_TICK_STALL_MS,
   idleBacklogGraceMs: Math.max(30_000, config.pollIntervalSeconds * 3_000),
 });
+let reviewAgentInstance: ReviewAgent | null = null;
+let blockedReviewProviderHealth: SourceControlManagerReviewProviderHealth | null = null;
+
+function sourceControlManagerHealthSnapshot() {
+  const reviewProvider =
+    reviewAgentInstance?.getProviderHealthSnapshot() ?? blockedReviewProviderHealth;
+  return withReviewProviderHealth(healthTracker.snapshot(), reviewProvider);
+}
 
 // Recover any jobs stuck in 'running' from a previous crash
 const recovered = db.recoverStuckJobs();
@@ -291,7 +313,7 @@ const completionGcJournal = new CompletionGcJournal(config.stateDir);
 
 let server: ReturnType<typeof createStatusServer> | undefined;
 try {
-  server = createStatusServer(db, config.port, healthTracker.snapshot);
+  server = createStatusServer(db, config.port, sourceControlManagerHealthSnapshot);
   console.log(`[${ts()}] Status server listening on http://127.0.0.1:${config.port}`);
 } catch (err: unknown) {
   const code = err instanceof Error && "code" in err ? (err as { code: string }).code : undefined;
@@ -311,12 +333,18 @@ let publicationHealthTimer: ReturnType<typeof setInterval> | null = null;
 let publicationHealthProbeInFlight = false;
 let reviewAgentPollTimer: ReturnType<typeof setInterval> | null = null;
 let reviewAgentConfigPollTimer: ReturnType<typeof setInterval> | null = null;
-let reviewAgentInstance: ReviewAgent | null = null;
 let statusSessionReady = false;
 let shutdownPromise: Promise<void> | null = null;
 const startupStatusTracker = createStartupStatusTracker();
 let reviewAgentRuntimeStateKey = "startup";
 let reviewAgentRuntimeFingerprint = "";
+let reviewAgentProviderRetryKey = "";
+let reviewAgentProviderRetryAfterMs = 0;
+let reviewAgentProviderTokenCache: {
+  key: string;
+  token: string;
+  expiresAtMs: number;
+} | null = null;
 
 async function refreshPublicationHealth(): Promise<void> {
   if (publicationHealthProbeInFlight) return;
@@ -362,6 +390,8 @@ const integrationMaintenanceRunner = new IntegrationMaintenanceRunner({
 });
 
 const reviewAgentConfigPollMs = 3_000;
+const reviewAgentProviderRetryBackoffMs = 30_000;
+const reviewAgentProviderTokenCacheMs = 5 * 60_000;
 const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(async () => {
   const latestConfig = applyCliOverrides(loadConfig({ reload: true }), cliOverrides);
   validateConfig(latestConfig);
@@ -369,30 +399,11 @@ const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(asyn
   config.prBaseBranch = latestConfig.prBaseBranch;
   config.gitToken = latestConfig.gitToken;
 
-  if (!config.reviewAgent.enabled) {
-    clearReviewAgentPollLoop();
-    logReviewAgentRuntimeState(
-      "disabled",
-      `[${ts()}] ReviewAgent disabled via runtime config (source_control_manager.review_agent.enabled=false).`,
-    );
-    return;
-  }
-
-  const runtimeReadiness = await probeReviewAgentRuntimeReadiness({
-    serverUrl: config.serverUrl,
-    sessionId: statusSessionId,
-    authToken: config.authToken,
-    timeoutMs: 2_500,
-  });
-  if (!runtimeReadiness.ready) {
-    clearReviewAgentPollLoop();
-    logReviewAgentRuntimeState(
-      `blocked:runtime_not_ready:${runtimeReadiness.detail}`,
-      `[${ts()}] ReviewAgent waiting for embedded runtime readiness before polling PRs (${runtimeReadiness.detail}).`,
-      "warn",
-    );
-    return;
-  }
+  // Provider reconciliation must remain active even when AI review is disabled.
+  // Only the AI review path depends on RemoteBuddy and WorkerPal readiness; the
+  // lightweight closed-PR poll needs just provider and server connectivity.
+  let aiReviewRuntimeReady = false;
+  let aiReviewRuntimeDetail = "AI review is disabled";
 
   const remoteUrlResult = await runGitCapture(
     ["-C", config.repoPath, "remote", "get-url", config.remote],
@@ -400,50 +411,137 @@ const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(asyn
   );
   const remoteUrl = remoteUrlResult.ok ? remoteUrlResult.stdout.trim() : "";
   if (!remoteUrl) {
-    clearReviewAgentPollLoop();
+    blockedReviewProviderHealth = createBlockedReviewProviderHealth(
+      "git remote URL could not be resolved",
+    );
+    await clearReviewAgentPollLoop();
     logReviewAgentRuntimeState(
       "blocked:missing_remote",
-      `[${ts()}] ReviewAgent enabled but could not resolve remote URL; waiting for runtime config or git remote changes before starting.`,
+      `[${ts()}] PR outcome reconciliation could not resolve remote URL; waiting for runtime config or git remote changes before starting.`,
       "warn",
     );
     return;
   }
 
-  const gitProviderToken = await resolveGitAuthToken(remoteUrl, config.gitToken ?? "");
-  if (!gitProviderToken) {
-    clearReviewAgentPollLoop();
+  if (!isSupportedGitHubRemoteUrl(remoteUrl)) {
+    const remoteHost = parseGitRemoteHost(remoteUrl) || "unknown host";
+    blockedReviewProviderHealth = createBlockedReviewProviderHealth(
+      `unsupported git provider host: ${remoteHost}`,
+    );
+    await clearReviewAgentPollLoop();
     logReviewAgentRuntimeState(
-      "blocked:missing_token",
-      `[${ts()}] ReviewAgent enabled but no git provider token found (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN); waiting for credentials before starting.`,
+      `blocked:unsupported_provider:${remoteHost}`,
+      `[${ts()}] PR outcome reconciliation is unavailable for provider host ${remoteHost}; the current reconciler supports GitHub remotes only.`,
       "warn",
     );
     return;
+  }
+
+  const providerRetryKey = JSON.stringify({ remoteUrl, gitToken: config.gitToken ?? "" });
+  const providerNowMs = Date.now();
+  if (
+    reviewAgentProviderRetryKey === providerRetryKey &&
+    providerNowMs < reviewAgentProviderRetryAfterMs &&
+    reviewAgentProviderRetryAfterMs - providerNowMs <= reviewAgentProviderRetryBackoffMs
+  ) {
+    return;
+  }
+  let gitProviderToken =
+    reviewAgentProviderTokenCache?.key === providerRetryKey &&
+    providerNowMs < reviewAgentProviderTokenCache.expiresAtMs &&
+    reviewAgentProviderTokenCache.expiresAtMs - providerNowMs <= reviewAgentProviderTokenCacheMs
+      ? reviewAgentProviderTokenCache.token
+      : "";
+  let resolvedProviderTokenFresh = false;
+  if (!gitProviderToken) {
+    gitProviderToken = await resolveGitAuthToken(remoteUrl, config.gitToken ?? "");
+    resolvedProviderTokenFresh = true;
+  }
+  if (!gitProviderToken) {
+    reviewAgentProviderTokenCache = null;
+    reviewAgentProviderRetryKey = providerRetryKey;
+    reviewAgentProviderRetryAfterMs = providerNowMs + reviewAgentProviderRetryBackoffMs;
+    blockedReviewProviderHealth = createBlockedReviewProviderHealth(
+      "git provider token is unavailable",
+    );
+    await clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState(
+      "blocked:missing_token",
+      `[${ts()}] PR outcome reconciliation has no git provider token (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN); waiting for credentials before starting.`,
+      "warn",
+    );
+    return;
+  }
+  if (resolvedProviderTokenFresh) {
+    reviewAgentProviderTokenCache = {
+      key: providerRetryKey,
+      token: gitProviderToken,
+      expiresAtMs: providerNowMs + reviewAgentProviderTokenCacheMs,
+    };
+  }
+  reviewAgentProviderRetryKey = "";
+  reviewAgentProviderRetryAfterMs = 0;
+  blockedReviewProviderHealth = null;
+
+  if (config.reviewAgent.enabled) {
+    const runtimeReadiness = await probeReviewAgentRuntimeReadiness({
+      serverUrl: config.serverUrl,
+      sessionId: statusSessionId,
+      authToken: config.authToken,
+      timeoutMs: 2_500,
+    });
+    aiReviewRuntimeReady = runtimeReadiness.ready;
+    aiReviewRuntimeDetail = runtimeReadiness.detail;
   }
 
   const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
-  const fingerprint = JSON.stringify({
+  const effectiveReviewAgentConfig = {
+    ...config.reviewAgent,
+    enabled: config.reviewAgent.enabled && aiReviewRuntimeReady,
+  };
+  const fingerprint = buildReviewAgentRuntimeFingerprint({
     serverUrl: config.serverUrl,
     remoteUrl,
     prBaseBranch,
+    branchPrefix: config.branchPrefix,
     reviewAgent: config.reviewAgent,
     gitProviderToken,
+    serverAuthToken: config.authToken,
   });
   if (
     reviewAgentInstance &&
     reviewAgentPollTimer &&
     reviewAgentRuntimeFingerprint === fingerprint
   ) {
+    const runtimeUpdate = reviewAgentInstance.updateRuntimeConfig(effectiveReviewAgentConfig);
+    logReviewAgentRuntimeState(
+      `running:${fingerprint}:ai:${effectiveReviewAgentConfig.enabled ? "ready" : "waiting"}`,
+      effectiveReviewAgentConfig.enabled
+        ? `[${ts()}] ReviewAgent AI review became ready without restarting provider reconciliation.`
+        : config.reviewAgent.enabled
+          ? `[${ts()}] ReviewAgent AI review is waiting for embedded runtime readiness without resetting provider reconciliation state (${aiReviewRuntimeDetail}).`
+          : `[${ts()}] PR outcome reconciliation remains active while AI review is disabled.`,
+    );
+    if (runtimeUpdate.becameEnabled) {
+      void reviewAgentInstance.poll().catch((err: any) => {
+        console.error(
+          `[${ts()}] [ReviewAgent] Readiness transition poll error: ${err?.message ?? err}`,
+        );
+      });
+    }
     return;
   }
 
-  clearReviewAgentPollLoop();
+  await clearReviewAgentPollLoop();
   const reviewAgent = new ReviewAgent(
-    config.reviewAgent,
+    effectiveReviewAgentConfig,
     config.serverUrl,
     gitProviderToken,
     remoteUrl,
     prBaseBranch,
     config.authToken,
+    { repositoryServices },
+    config.branchPrefix,
   );
   reviewAgentInstance = reviewAgent;
   reviewAgentRuntimeFingerprint = fingerprint;
@@ -456,7 +554,11 @@ const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(asyn
   );
   logReviewAgentRuntimeState(
     `running:${fingerprint}`,
-    `[${ts()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10)`,
+    effectiveReviewAgentConfig.enabled
+      ? `[${ts()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10, branch prefix: ${config.branchPrefix})`
+      : config.reviewAgent.enabled
+        ? `[${ts()}] PR outcome reconciler started while AI review waits for embedded runtime readiness (${aiReviewRuntimeDetail}; poll interval: ${config.reviewAgent.pollIntervalMs}ms, branch prefix: ${config.branchPrefix})`
+        : `[${ts()}] PR outcome reconciler started while AI review is disabled (poll interval: ${config.reviewAgent.pollIntervalMs}ms, branch prefix: ${config.branchPrefix})`,
   );
   void reviewAgent.poll().catch((err: any) => {
     console.error(`[${ts()}] [ReviewAgent] Initial poll error: ${err?.message ?? err}`);
@@ -577,13 +679,15 @@ function startStatusHeartbeat(): void {
   }, statusHeartbeatMs);
 }
 
-function clearReviewAgentPollLoop(): void {
+async function clearReviewAgentPollLoop(): Promise<void> {
   if (reviewAgentPollTimer) {
     clearInterval(reviewAgentPollTimer);
     reviewAgentPollTimer = null;
   }
+  const retiringReviewAgent = reviewAgentInstance;
   reviewAgentInstance = null;
   reviewAgentRuntimeFingerprint = "";
+  await retiringReviewAgent?.stopAndDrain();
 }
 
 function logReviewAgentRuntimeState(
@@ -2300,8 +2404,15 @@ async function main(): Promise<void> {
   startStatusHeartbeat();
   startPublicationHealthPolling();
 
-  await syncReviewAgentRuntimeConfig();
   startReviewAgentRuntimeConfigPolling();
+  void syncReviewAgentRuntimeConfig().catch((err: any) => {
+    const detail = err?.message ?? String(err);
+    logReviewAgentRuntimeState(
+      `config-error:${detail}`,
+      `[${ts()}] Initial ReviewAgent runtime config sync failed: ${detail}`,
+      "warn",
+    );
+  });
 
   // ReviewAgent startup is managed by runtime config polling above.
 
@@ -2349,7 +2460,7 @@ async function shutdown(): Promise<void> {
       clearInterval(reviewAgentConfigPollTimer);
       reviewAgentConfigPollTimer = null;
     }
-    clearReviewAgentPollLoop();
+    await clearReviewAgentPollLoop();
     void createSessionComm(statusSessionId).status(
       "source_control_manager",
       "shutting_down",
@@ -2387,6 +2498,7 @@ async function shutdown(): Promise<void> {
       console.warn(`[${ts()}] Shutdown temp-branch cleanup failed: ${err?.message ?? err}`);
     }
 
+    await repositoryServices.close();
     db.close();
     lock.release();
     console.log(`[${ts()}] Goodbye.`);

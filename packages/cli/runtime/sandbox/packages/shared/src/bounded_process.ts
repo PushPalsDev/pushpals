@@ -28,6 +28,12 @@ export type BoundedProcessResult = {
   drainTimedOut: boolean;
 };
 
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The subprocess was aborted", "AbortError");
+}
+
 const DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_DRAIN_TIMEOUT_MS = 2_000;
 const DEFAULT_TERMINATION_TIMEOUT_MS = 5_000;
@@ -353,8 +359,15 @@ export async function runBoundedProcess(
     onTimeoutExtended?: (extensionMs: number, deadlineAtMs: number) => void;
     onTimeout?: (elapsedMs: number) => void;
     maxTotalTimeoutMs?: number;
+    /**
+     * Cancels the command and its descendants. The returned promise rejects
+     * only after whole-tree termination and bounded stream draining finish, so
+     * callers can safely start replacement provider work after observing it.
+     */
+    signal?: AbortSignal;
   },
 ): Promise<BoundedProcessResult> {
+  if (options.signal?.aborted) throw abortReason(options.signal);
   const spawn = options.spawn ?? defaultSpawner;
   const platform = options.platform ?? process.platform;
   const proc = spawn(argv, {
@@ -381,9 +394,33 @@ export async function runBoundedProcess(
   let deadlineAtMs = startedAtMs + timeoutMs;
 
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let removeAbortListener: () => void = () => undefined;
+  const aborted = new Promise<{
+    timedOut: false;
+    aborted: true;
+    exitCode: 130;
+    reason: Error;
+  }>((resolve) => {
+    const onAbort = () =>
+      resolve({
+        timedOut: false,
+        aborted: true,
+        exitCode: 130,
+        reason: abortReason(options.signal!),
+      });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+    // Close the pre-spawn/pre-listener race without relying on another turn of
+    // the event loop.
+    if (options.signal?.aborted) onAbort();
+  });
   const outcome = await Promise.race([
-    proc.exited.then((exitCode) => ({ timedOut: false as const, exitCode })),
-    new Promise<{ timedOut: true; exitCode: 124 }>((resolve) => {
+    proc.exited.then((exitCode) => ({
+      timedOut: false as const,
+      aborted: false as const,
+      exitCode,
+    })),
+    new Promise<{ timedOut: true; aborted: false; exitCode: 124 }>((resolve) => {
       const scheduleDeadline = () => {
         timer = setTimeout(
           () => {
@@ -419,20 +456,22 @@ export async function runBoundedProcess(
             } catch {
               // Observability callbacks do not control termination.
             }
-            resolve({ timedOut: true, exitCode: 124 });
+            resolve({ timedOut: true, aborted: false, exitCode: 124 });
           },
           Math.max(1, deadlineAtMs - Date.now()),
         );
       };
       scheduleDeadline();
     }),
+    ...(options.signal ? [aborted] : []),
   ]);
   if (timer) clearTimeout(timer);
+  removeAbortListener();
 
   const terminate =
     options.terminate ??
     ((target: BoundedSubprocess) => terminateProcessTree(target, { platform, spawn }));
-  if (outcome.timedOut) await terminate(proc);
+  if (outcome.timedOut || outcome.aborted) await terminate(proc);
 
   const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
   let streams = await settleWithin(
@@ -441,7 +480,7 @@ export async function runBoundedProcess(
   );
   const drainTimedOut = !streams.settled;
   if (!streams.settled) {
-    if (!outcome.timedOut) {
+    if (!outcome.timedOut && !outcome.aborted) {
       if (options.terminate) {
         await options.terminate(proc);
       } else {
@@ -468,6 +507,8 @@ export async function runBoundedProcess(
     ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.`
     : "";
   const trimOutput = (text: string) => (options.preserveOutputWhitespace ? text : text.trim());
+
+  if (outcome.aborted) throw outcome.reason;
 
   return {
     stdout: trimOutput(stdout),

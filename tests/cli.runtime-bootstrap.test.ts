@@ -2698,6 +2698,71 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
+  test("prepareCliRuntime repairs missing or corrupt RepositoryAgent runtime assets", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-repository-agent-repair-"));
+    const targetRepoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+    const sourceRoot = resolve(import.meta.dir, "..");
+    const sandboxSharedRoot = join(runtimeRoot, "sandbox", "packages", "shared", "src");
+    const sandboxPromptPath = join(
+      runtimeRoot,
+      "sandbox",
+      "prompts",
+      "remotebuddy",
+      "repository_agent_codex_prompt_template.md",
+    );
+    const memoryPath = join(sandboxSharedRoot, "memory.ts");
+    const repositoryAgentPath = join(sandboxSharedRoot, "repository_agent.ts");
+
+    try {
+      mkdirSync(targetRepoRoot, { recursive: true });
+      const defaultConfigPath = join(runtimeRoot, "configs", "default.toml");
+      const localConfigPath = join(runtimeRoot, "configs", "local.toml");
+      const customDefaultConfig = [
+        'profile = "dev"',
+        'session_id = "repair-test"',
+        "",
+        "[server]",
+        'url = "http://127.0.0.1:45671"',
+        "",
+        "[remotebuddy.autonomy]",
+        "enabled = false",
+        "",
+      ].join("\n");
+      mkdirSync(dirname(defaultConfigPath), { recursive: true });
+      writeFileSync(defaultConfigPath, customDefaultConfig, "utf8");
+      writeFileSync(localConfigPath, "# caller-owned local overrides\n", "utf8");
+
+      await prepareCliRuntime({ repoRoot: targetRepoRoot, runtimeRoot });
+      const originalLocalConfig = readFileSync(localConfigPath, "utf8");
+      expect(readFileSync(defaultConfigPath, "utf8")).toBe(customDefaultConfig);
+
+      rmSync(memoryPath);
+      writeFileSync(repositoryAgentPath, "export const truncated = true;\n", "utf8");
+      writeFileSync(sandboxPromptPath, "# truncated prompt\n", "utf8");
+
+      const repaired = await prepareCliRuntime({ repoRoot: targetRepoRoot, runtimeRoot });
+
+      expect(repaired.preflightUsesEmbeddedRuntime).toBe(true);
+      expect(readFileSync(memoryPath)).toEqual(
+        readFileSync(join(sourceRoot, "packages", "shared", "src", "memory.ts")),
+      );
+      expect(readFileSync(repositoryAgentPath)).toEqual(
+        readFileSync(join(sourceRoot, "packages", "shared", "src", "repository_agent.ts")),
+      );
+      expect(readFileSync(sandboxPromptPath)).toEqual(
+        readFileSync(
+          join(sourceRoot, "prompts", "remotebuddy", "repository_agent_codex_prompt_template.md"),
+        ),
+      );
+      expect(readFileSync(localConfigPath, "utf8")).toBe(originalLocalConfig);
+      expect(readFileSync(defaultConfigPath, "utf8")).toBe(customDefaultConfig);
+      expect(existsSync(join(runtimeRoot, "sandbox", "configs", "local.toml"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("prepareCliRuntime does not seed embedded runtime configs for source checkouts", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-source-checkout-"));
     const repoRoot = join(root, "repo");
@@ -5039,6 +5104,16 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(prepared.runtimePreflight.issues.map((issue) => issue.code)).toEqual([
         "missing_vision_doc",
       ]);
+      for (const fileName of [
+        ".pushpals-server-runtime.js",
+        ".pushpals-localbuddy-runtime.js",
+        ".pushpals-remotebuddy-fallback.js",
+        ".pushpals-workerpals-runtime.js",
+        ".pushpals-source-control-manager-runtime.js",
+        ".pushpals-runtime-launch-trampoline.js",
+      ]) {
+        expect(readFileSync(join(runtimeRoot, "sandbox", fileName)).length).toBeGreaterThan(0);
+      }
     } finally {
       globalThis.fetch = originalFetch;
       rmSync(root, { recursive: true, force: true });

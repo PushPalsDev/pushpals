@@ -7184,9 +7184,16 @@ class SessionManager {
 
 // apps/server/src/jobs.ts
 import { Database as Database2 } from "bun:sqlite";
-import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash5, randomUUID as randomUUID3 } from "crypto";
+
+// packages/shared/src/repo.ts
+import { existsSync, readFileSync as readFileSync2, statSync } from "fs";
+import { resolve } from "path";
 
 // packages/shared/src/bounded_process.ts
+function abortReason(signal) {
+  return signal.reason instanceof Error ? signal.reason : new DOMException("The subprocess was aborted", "AbortError");
+}
 var DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 var DEFAULT_DRAIN_TIMEOUT_MS = 2000;
 var DEFAULT_TERMINATION_TIMEOUT_MS = 5000;
@@ -7434,6 +7441,8 @@ async function terminateProcessTree(proc, options = {}) {
   await settleWithin(proc.exited, exitGraceMs);
 }
 async function runBoundedProcess(argv, options) {
+  if (options.signal?.aborted)
+    throw abortReason(options.signal);
   const spawn = options.spawn ?? defaultSpawner;
   const platform = options.platform ?? process.platform;
   const proc = spawn(argv, {
@@ -7459,8 +7468,27 @@ async function runBoundedProcess(argv, options) {
   let effectiveTimeoutMs = timeoutMs;
   let deadlineAtMs = startedAtMs + timeoutMs;
   let timer = null;
+  let removeAbortListener = () => {
+    return;
+  };
+  const aborted = new Promise((resolve) => {
+    const onAbort = () => resolve({
+      timedOut: false,
+      aborted: true,
+      exitCode: 130,
+      reason: abortReason(options.signal)
+    });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+    if (options.signal?.aborted)
+      onAbort();
+  });
   const outcome = await Promise.race([
-    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    proc.exited.then((exitCode) => ({
+      timedOut: false,
+      aborted: false,
+      exitCode
+    })),
     new Promise((resolve) => {
       const scheduleDeadline = () => {
         timer = setTimeout(() => {
@@ -7488,22 +7516,24 @@ async function runBoundedProcess(argv, options) {
           try {
             options.onTimeout?.(Math.max(1, nowMs - startedAtMs));
           } catch {}
-          resolve({ timedOut: true, exitCode: 124 });
+          resolve({ timedOut: true, aborted: false, exitCode: 124 });
         }, Math.max(1, deadlineAtMs - Date.now()));
       };
       scheduleDeadline();
-    })
+    }),
+    ...options.signal ? [aborted] : []
   ]);
   if (timer)
     clearTimeout(timer);
+  removeAbortListener();
   const terminate = options.terminate ?? ((target) => terminateProcessTree(target, { platform, spawn }));
-  if (outcome.timedOut)
+  if (outcome.timedOut || outcome.aborted)
     await terminate(proc);
   const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
   let streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), drainTimeoutMs);
   const drainTimedOut = !streams.settled;
   if (!streams.settled) {
-    if (!outcome.timedOut) {
+    if (!outcome.timedOut && !outcome.aborted) {
       if (options.terminate) {
         await options.terminate(proc);
       } else {
@@ -7522,6 +7552,8 @@ async function runBoundedProcess(argv, options) {
   const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
   const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
   const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
+  if (outcome.aborted)
+    throw outcome.reason;
   return {
     stdout: trimOutput(stdout),
     stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
@@ -7531,17 +7563,2016 @@ async function runBoundedProcess(argv, options) {
     drainTimedOut
   };
 }
+
+// packages/shared/src/repo.ts
+function resolveDotGitEntry(repoRoot) {
+  return resolve(repoRoot, ".git");
+}
+function findGitRepoRoot(startDir) {
+  const override = String(process.env.PUSHPALS_REPO_ROOT_OVERRIDE ?? "").trim();
+  if (override) {
+    const resolvedOverride = resolve(override);
+    if (resolveGitMetadataDir(resolvedOverride)) {
+      return resolvedOverride;
+    }
+    console.warn(`[repo] PUSHPALS_REPO_ROOT_OVERRIDE does not point to a git repository: ${resolvedOverride}`);
+  }
+  let current = resolve(startDir);
+  const root = resolve(current, "/");
+  while (current !== root) {
+    if (resolveGitMetadataDir(current)) {
+      return current;
+    }
+    current = resolve(current, "..");
+  }
+  return resolveGitMetadataDir(root) ? root : null;
+}
+function resolveGitMetadataDir(repoRoot) {
+  const dotGitPath = resolveDotGitEntry(repoRoot);
+  if (!existsSync(dotGitPath))
+    return null;
+  try {
+    const stat = statSync(dotGitPath);
+    if (stat.isDirectory()) {
+      return dotGitPath;
+    }
+    if (!stat.isFile()) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  try {
+    const firstLine = readFileSync2(dotGitPath, "utf8").split(/\r?\n/, 1)[0] ?? "";
+    const match = firstLine.match(/^gitdir:\s*(.+)\s*$/i);
+    if (!match)
+      return null;
+    const gitDir = resolve(repoRoot, match[1].trim());
+    return existsSync(gitDir) ? gitDir : null;
+  } catch {
+    return null;
+  }
+}
+function detectRepoRoot(startDir) {
+  const repoRoot = findGitRepoRoot(startDir);
+  if (repoRoot) {
+    return repoRoot;
+  }
+  console.warn(`[repo] No .git directory found, using: ${startDir}`);
+  return startDir;
+}
+// packages/shared/src/repository_identity.ts
+import { createHash } from "crypto";
+import { realpathSync } from "fs";
+import { isAbsolute, resolve as resolve2 } from "path";
+
+// packages/shared/src/git_backend.ts
+function trimToken(value) {
+  return String(value ?? "").trim();
+}
+function sanitizeGitRemoteUrl(remoteUrl) {
+  const raw = trimToken(remoteUrl);
+  if (!raw)
+    return "";
+  return raw.replace(/^(https?:\/\/)[^@/]+@/i, "$1");
+}
+function parseGitRemoteHost(remoteUrl) {
+  const raw = trimToken(remoteUrl);
+  if (!raw)
+    return "";
+  const patterns = [
+    /^https?:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
+    /^ssh:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
+    /^(?:[^@:\s]+@)?([^:/\s]+):[^?\s]+$/i
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    const host = match?.[1] ? trimToken(match[1]) : "";
+    if (host)
+      return host.toLowerCase();
+  }
+  return "";
+}
+function inferGitBackendFromRemote(remoteUrl) {
+  const host = parseGitRemoteHost(remoteUrl);
+  if (!host)
+    return "unknown";
+  if (host === "github.com" || host.endsWith(".github.com") || host.includes("github")) {
+    return "github";
+  }
+  if (host === "gitlab.com" || host.endsWith(".gitlab.com") || host.includes("gitlab")) {
+    return "gitlab";
+  }
+  return "unknown";
+}
+function parseGitHubRepo(remoteUrl) {
+  const sanitized = sanitizeGitRemoteUrl(remoteUrl);
+  if (!sanitized)
+    return null;
+  const httpsMatch = sanitized.match(/^https?:\/\/(?:[^@/]+@)?github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?(?:[/?#].*)?$/i);
+  if (httpsMatch) {
+    return { owner: httpsMatch[1], repo: httpsMatch[2] };
+  }
+  const sshMatch = sanitized.match(/^(?:ssh:\/\/)?(?:[^@/\s]+@)?github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?$/i);
+  if (sshMatch) {
+    return { owner: sshMatch[1], repo: sshMatch[2] };
+  }
+  return null;
+}
+function toGitHubRepoWebUrl(remoteUrl) {
+  const repo = parseGitHubRepo(remoteUrl);
+  if (!repo)
+    return null;
+  return `https://github.com/${repo.owner}/${repo.repo}`;
+}
+
+// packages/shared/src/repository_identity.ts
+function normalizeRemotePath(value) {
+  return value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/").replace(/\.git$/i, "");
+}
+function normalizeRepositoryOriginRemote(remoteUrl) {
+  const sanitized = sanitizeGitRemoteUrl(String(remoteUrl ?? "").trim());
+  if (!sanitized)
+    return "";
+  const urlLike = /^[a-z][a-z0-9+.-]*:\/\//i.test(sanitized);
+  if (urlLike) {
+    try {
+      const parsed = new URL(sanitized);
+      const host = parsed.hostname.toLowerCase();
+      const port = parsed.port ? `:${parsed.port}` : "";
+      const path = normalizeRemotePath(parsed.pathname);
+      if (host && path)
+        return `${host}${port}/${path}`;
+      if (host)
+        return `${host}${port}`;
+      if (parsed.protocol === "file:" && path)
+        return `local/${path}`;
+    } catch {}
+  }
+  const scp = sanitized.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+  if (scp?.[1] && scp[2]) {
+    const path = normalizeRemotePath(scp[2]);
+    return path ? `${scp[1].toLowerCase()}/${path}` : scp[1].toLowerCase();
+  }
+  return normalizeRemotePath(sanitized.split(/[?#]/, 1)[0] ?? "");
+}
+function canonicalPath(value) {
+  let canonical = resolve2(value);
+  try {
+    canonical = realpathSync.native(canonical);
+  } catch {}
+  canonical = canonical.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+async function defaultRunGit(repoRoot, args, timeoutMs) {
+  try {
+    const result = await runBoundedProcess(["git", "-C", repoRoot, ...args], {
+      cwd: repoRoot,
+      timeoutMs,
+      outputLimitBytes: 256 * 1024,
+      streamDrainTimeoutMs: 1000
+    });
+    return { ok: result.exitCode === 0, stdout: result.stdout };
+  } catch {
+    return { ok: false, stdout: "" };
+  }
+}
+function normalizeRootCommits(stdout) {
+  const commits = stdout.split(/\r?\n/).map((line) => line.trim().toLowerCase()).filter((line) => /^[0-9a-f]{7,128}$/.test(line)).sort();
+  return commits.length > 0 ? commits.join(",") : null;
+}
+async function resolveRepositoryIdentity(repoRoot, options = {}) {
+  const absoluteRepoRoot = resolve2(repoRoot);
+  const timeoutMs = Math.max(100, Math.min(30000, Math.floor(options.timeoutMs ?? 5000)));
+  const runGit = options.runGit ?? defaultRunGit;
+  const commonResult = await runGit(absoluteRepoRoot, ["rev-parse", "--git-common-dir"], timeoutMs);
+  const commonOutput = commonResult.stdout.trim().split(/\r?\n/, 1)[0] ?? "";
+  if (!commonResult.ok || !commonOutput) {
+    throw new Error("Cannot resolve repository identity: Git common directory is unavailable");
+  }
+  const commonPath = isAbsolute(commonOutput) ? commonOutput : resolve2(absoluteRepoRoot, commonOutput);
+  const gitCommonDir = canonicalPath(commonPath);
+  const [originResult, rootsResult] = await Promise.all([
+    runGit(absoluteRepoRoot, ["remote", "get-url", "origin"], timeoutMs),
+    runGit(absoluteRepoRoot, ["rev-list", "--max-parents=0", "HEAD"], timeoutMs)
+  ]);
+  const normalizedOrigin = originResult.ok ? normalizeRepositoryOriginRemote(originResult.stdout.trim().split(/\r?\n/, 1)[0] ?? "") || null : null;
+  const rootCommit = rootsResult.ok ? normalizeRootCommits(rootsResult.stdout) : null;
+  const source = normalizedOrigin ? "origin" : "git-common-dir";
+  const seed = normalizedOrigin ? `origin\x00${normalizedOrigin}\x00root\x00${rootCommit ?? "unborn"}` : `git-common-dir\x00${gitCommonDir}`;
+  const repositoryId = `repo_${createHash("sha256").update(seed, "utf8").digest("hex")}`;
+  return {
+    repositoryId,
+    source,
+    normalizedOrigin,
+    rootCommit,
+    gitCommonDir
+  };
+}
+// packages/shared/src/repository_snapshot.ts
+import { createHash as createHash2 } from "crypto";
+import { realpathSync as realpathSync2, statSync as statSync2 } from "fs";
+import { resolve as resolve3 } from "path";
+var DEFAULT_GIT_TIMEOUT_MS = 5000;
+var DEFAULT_DIFF_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
+var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
+var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
+var MAX_HASH_PATHS_PER_INVOCATION = 128;
+var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
+var OUTPUT_TRUNCATION_MARKER = "[pushpals: process output truncated]";
+
+class RepositorySnapshotError extends Error {
+  code;
+  gitArgs;
+  exitCode;
+  constructor(code, message, options = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "RepositorySnapshotError";
+    this.code = code;
+    this.gitArgs = Object.freeze([...options.gitArgs ?? []]);
+    this.exitCode = options.exitCode ?? null;
+  }
+}
+function normalizePositiveInt(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+function canonicalDirectory(pathValue, label) {
+  const absolute = resolve3(pathValue);
+  try {
+    if (!statSync2(absolute).isDirectory()) {
+      throw new RepositorySnapshotError("invalid_root", `${label} is not a directory: ${absolute}`);
+    }
+    return realpathSync2.native(absolute);
+  } catch (error) {
+    if (error instanceof RepositorySnapshotError)
+      throw error;
+    throw new RepositorySnapshotError("invalid_root", `${label} is unavailable: ${absolute}`, {
+      cause: error
+    });
+  }
+}
+async function defaultRunGit2(repoRoot, args, options) {
+  const result = await runBoundedProcess(["git", "-C", repoRoot, ...args], {
+    timeoutMs: options.timeoutMs,
+    outputLimitBytes: options.outputLimitBytes,
+    streamDrainTimeoutMs: 1000,
+    retainOutputTail: true,
+    preserveOutputWhitespace: true
+  });
+  return result;
+}
+function compactErrorOutput(value) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text)
+    return "no diagnostic output";
+  return text.length <= 1000 ? text : `${text.slice(0, 986)}...[truncated]`;
+}
+function hasTruncationMarker(result) {
+  return result.stdout.includes(OUTPUT_TRUNCATION_MARKER) || result.stderr.includes(OUTPUT_TRUNCATION_MARKER);
+}
+function assertGitResult(args, result) {
+  if (result.timedOut) {
+    throw new RepositorySnapshotError("git_timeout", `Git command timed out while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: args, exitCode: result.exitCode });
+  }
+  if (result.drainTimedOut) {
+    throw new RepositorySnapshotError("git_failed", `Git command streams did not drain while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: args, exitCode: result.exitCode });
+  }
+  if (hasTruncationMarker(result)) {
+    throw new RepositorySnapshotError("git_output_truncated", `Git output exceeded the configured snapshot bound: git ${args.join(" ")}`, { gitArgs: args, exitCode: result.exitCode });
+  }
+  if (result.exitCode !== 0) {
+    throw new RepositorySnapshotError("git_failed", `Git command failed while resolving repository snapshot: git ${args.join(" ")} (${compactErrorOutput(result.stderr)})`, { gitArgs: args, exitCode: result.exitCode });
+  }
+  return result;
+}
+function parseObjectId(value, label) {
+  const oid = value.trim().split(/\r?\n/, 1)[0]?.toLowerCase() ?? "";
+  if (!/^[0-9a-f]{40,64}$/.test(oid)) {
+    throw new RepositorySnapshotError("invalid_git_output", `Git returned an invalid ${label} object ID`);
+  }
+  return oid;
+}
+function updateHashPart(hash, label, value) {
+  const bytes = Buffer.from(value, "utf8");
+  hash.update(`${label}\x00${bytes.byteLength}\x00`, "utf8");
+  hash.update(bytes);
+  hash.update("\x00", "utf8");
+}
+function dirtyTreeFingerprint(input) {
+  const hash = createHash2("sha256");
+  hash.update("pushpals-repository-snapshot-v2\x00", "utf8");
+  updateHashPart(hash, "HEAD", input.revision);
+  updateHashPart(hash, "status", input.status);
+  updateHashPart(hash, "staged", input.stagedDiff);
+  updateHashPart(hash, "unstaged", input.unstagedDiff);
+  updateHashPart(hash, "untracked", input.untrackedFiles);
+  return `dirty:sha256:${hash.digest("hex")}`;
+}
+var STATUS_ARGS = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+var DIFF_ARGS = [
+  "diff",
+  "--binary",
+  "--full-index",
+  "--no-color",
+  "--no-ext-diff",
+  "--no-textconv",
+  "--no-renames"
+];
+var UNTRACKED_FILES_ARGS = [
+  "ls-files",
+  "--others",
+  "--exclude-standard",
+  "--full-name",
+  "-z"
+];
+function parseNullTerminatedPaths(value, args) {
+  if (!value)
+    return [];
+  if (!value.endsWith("\x00")) {
+    throw new RepositorySnapshotError("invalid_git_output", `Git returned an unterminated path list while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: [...args] });
+  }
+  const paths = value.slice(0, -1).split("\x00");
+  if (paths.some((path) => path.length === 0)) {
+    throw new RepositorySnapshotError("invalid_git_output", `Git returned an invalid empty path while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: [...args] });
+  }
+  return paths;
+}
+function pathArgumentChunks(paths) {
+  const chunks = [];
+  let chunk = [];
+  let chunkBytes = 0;
+  for (const path of paths) {
+    const pathBytes = Buffer.byteLength(path, "utf8") + 1;
+    if (chunk.length > 0 && (chunk.length >= MAX_HASH_PATHS_PER_INVOCATION || chunkBytes + pathBytes > MAX_HASH_PATH_ARGUMENT_BYTES)) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkBytes = 0;
+    }
+    chunk.push(path);
+    chunkBytes += pathBytes;
+  }
+  if (chunk.length > 0)
+    chunks.push(chunk);
+  return chunks;
+}
+function parseObjectIdList(value, expectedCount, args) {
+  const lines = value.split(/\r?\n/);
+  if (lines.at(-1) === "")
+    lines.pop();
+  const objectIds = lines.map((line) => line.toLowerCase());
+  if (objectIds.length !== expectedCount || objectIds.some((objectId) => !/^[0-9a-f]{40,64}$/.test(objectId))) {
+    throw new RepositorySnapshotError("invalid_git_output", `Git returned an invalid untracked-file object ID list: git ${args.join(" ")}`, { gitArgs: [...args] });
+  }
+  return objectIds;
+}
+async function captureUntrackedFiles(root, run, outputLimitBytes) {
+  const listResult = await run(root, UNTRACKED_FILES_ARGS, outputLimitBytes);
+  const paths = parseNullTerminatedPaths(listResult.stdout, UNTRACKED_FILES_ARGS);
+  const hash = createHash2("sha256");
+  hash.update("pushpals-repository-untracked-files-v1\x00", "utf8");
+  const objectIdsByPath = new Map;
+  const filePaths = paths.filter((path) => !path.endsWith("/"));
+  for (const pathChunk of pathArgumentChunks(filePaths)) {
+    const args = ["hash-object", "--no-filters", "--", ...pathChunk];
+    const result = await run(root, args, SMALL_GIT_OUTPUT_LIMIT_BYTES);
+    const objectIds = parseObjectIdList(result.stdout, pathChunk.length, args);
+    for (let index = 0;index < pathChunk.length; index += 1) {
+      objectIdsByPath.set(pathChunk[index], objectIds[index]);
+    }
+  }
+  for (const path of paths) {
+    updateHashPart(hash, "path", path);
+    updateHashPart(hash, "blob", objectIdsByPath.get(path) ?? "nested-repository-directory");
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+async function captureDirtyState(root, run, outputLimitBytes) {
+  const [stagedResult, unstagedResult, untrackedFiles] = await Promise.all([
+    run(root, [...DIFF_ARGS.slice(0, 1), "--cached", ...DIFF_ARGS.slice(1)], outputLimitBytes),
+    run(root, DIFF_ARGS, outputLimitBytes),
+    captureUntrackedFiles(root, run, outputLimitBytes)
+  ]);
+  return {
+    stagedDiff: stagedResult.stdout,
+    unstagedDiff: unstagedResult.stdout,
+    untrackedFiles
+  };
+}
+function dirtyStatesEqual(left, right) {
+  return left.stagedDiff === right.stagedDiff && left.unstagedDiff === right.unstagedDiff && left.untrackedFiles === right.untrackedFiles;
+}
+async function resolveRepositorySnapshot(repoRoot, options = {}) {
+  const requestedRoot = canonicalDirectory(repoRoot, "Repository root");
+  const timeoutMs = normalizePositiveInt(options.timeoutMs, DEFAULT_GIT_TIMEOUT_MS, 100, 30000);
+  const diffOutputLimitBytes = normalizePositiveInt(options.diffOutputLimitBytes, DEFAULT_DIFF_OUTPUT_LIMIT_BYTES, 64 * 1024, MAX_DIFF_OUTPUT_LIMIT_BYTES);
+  const runGit = options.runGit ?? defaultRunGit2;
+  const run = async (root2, args, outputLimitBytes) => {
+    try {
+      return assertGitResult([...args], await runGit(root2, [...args], { timeoutMs, outputLimitBytes }));
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw new RepositorySnapshotError("git_failed", `Git command could not start while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: [...args], cause: error });
+    }
+  };
+  const topLevelResult = await run(requestedRoot, ["rev-parse", "--show-toplevel"], SMALL_GIT_OUTPUT_LIMIT_BYTES);
+  const topLevelOutput = topLevelResult.stdout.trim().split(/\r?\n/, 1)[0] ?? "";
+  if (!topLevelOutput) {
+    throw new RepositorySnapshotError("invalid_git_output", "Git returned an empty repository top-level path");
+  }
+  const root = canonicalDirectory(topLevelOutput, "Git repository root");
+  const identityResolver = options.resolveIdentity ?? resolveRepositoryIdentity;
+  let identity;
+  try {
+    identity = await identityResolver(root, {
+      timeoutMs,
+      runGit: async (identityRoot, args, identityTimeoutMs) => {
+        try {
+          const result = assertGitResult(args, await runGit(identityRoot, args, {
+            timeoutMs: identityTimeoutMs,
+            outputLimitBytes: SMALL_GIT_OUTPUT_LIMIT_BYTES
+          }));
+          return { ok: true, stdout: result.stdout };
+        } catch {
+          return { ok: false, stdout: "" };
+        }
+      }
+    });
+  } catch (error) {
+    throw new RepositorySnapshotError("git_failed", "Cannot resolve stable repository identity for snapshot", { cause: error });
+  }
+  if (!/^repo_[0-9a-f]{64}$/.test(identity.repositoryId)) {
+    throw new RepositorySnapshotError("invalid_git_output", "Repository identity resolver returned an invalid identity");
+  }
+  const [revisionResult, cleanTreeResult, statusResult] = await Promise.all([
+    run(root, ["rev-parse", "--verify", "HEAD^{commit}"], SMALL_GIT_OUTPUT_LIMIT_BYTES),
+    run(root, ["rev-parse", "--verify", "HEAD^{tree}"], SMALL_GIT_OUTPUT_LIMIT_BYTES),
+    run(root, STATUS_ARGS, SMALL_GIT_OUTPUT_LIMIT_BYTES)
+  ]);
+  const revision = parseObjectId(revisionResult.stdout, "HEAD commit");
+  const cleanTree = parseObjectId(cleanTreeResult.stdout, "HEAD tree");
+  const status = statusResult.stdout;
+  if (!status) {
+    return {
+      identity: identity.repositoryId,
+      root,
+      revision,
+      tree: cleanTree,
+      dirty: false
+    };
+  }
+  const dirtyState = await captureDirtyState(root, run, diffOutputLimitBytes);
+  const dirtyStateAfter = await captureDirtyState(root, run, diffOutputLimitBytes);
+  const [revisionAfterResult, statusAfter] = await Promise.all([
+    run(root, ["rev-parse", "--verify", "HEAD^{commit}"], SMALL_GIT_OUTPUT_LIMIT_BYTES),
+    run(root, STATUS_ARGS, SMALL_GIT_OUTPUT_LIMIT_BYTES)
+  ]);
+  const revisionAfter = parseObjectId(revisionAfterResult.stdout, "HEAD commit");
+  if (revisionAfter !== revision || statusAfter.stdout !== status || !dirtyStatesEqual(dirtyStateAfter, dirtyState)) {
+    throw new RepositorySnapshotError("repository_changed", "Repository content changed while its dirty snapshot was being captured; retry from a stable worktree", { gitArgs: [...STATUS_ARGS] });
+  }
+  return {
+    identity: identity.repositoryId,
+    root,
+    revision,
+    tree: dirtyTreeFingerprint({
+      revision,
+      status,
+      stagedDiff: dirtyState.stagedDiff,
+      unstagedDiff: dirtyState.unstagedDiff,
+      untrackedFiles: dirtyState.untrackedFiles
+    }),
+    dirty: true
+  };
+}
+// packages/shared/src/memory.ts
+import { createHash as createHash3, randomUUID as randomUUID2 } from "crypto";
+
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
+async function fetchWithHardDeadline(options) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.max(1, Math.floor(options.timeoutMs)) : 1;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const controller = new AbortController;
+  const upstreamSignal = options.init?.signal;
+  let rejectUpstreamAbort = null;
+  const upstreamAbort = new Promise((_resolve, reject) => {
+    rejectUpstreamAbort = reject;
+  });
+  const abortFromUpstream = () => {
+    controller.abort(upstreamSignal?.reason);
+    rejectUpstreamAbort?.(upstreamSignal?.reason instanceof Error ? upstreamSignal.reason : new DOMException("The HTTP request was aborted", "AbortError"));
+  };
+  if (upstreamSignal?.aborted) {
+    abortFromUpstream();
+  } else {
+    upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+  }
+  let timer = null;
+  const operation = Promise.resolve().then(async () => {
+    const response = await fetchImpl(options.input, {
+      ...options.init,
+      signal: controller.signal
+    });
+    return await options.consume(response, controller.signal);
+  });
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(options.timeoutMessage ?? `HTTP request timed out after ${timeoutMs}ms`));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race(upstreamSignal ? [operation, deadline, upstreamAbort] : [operation, deadline]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+  }
+}
+async function fetchBufferedWithHardDeadline(options) {
+  const { maxResponseBytes: configuredMaxResponseBytes, ...requestOptions } = options;
+  const maxResponseBytes = typeof configuredMaxResponseBytes === "number" && Number.isFinite(configuredMaxResponseBytes) && configuredMaxResponseBytes >= 0 ? Math.floor(configuredMaxResponseBytes) : DEFAULT_MAX_BUFFERED_RESPONSE_BYTES;
+  return fetchWithHardDeadline({
+    ...requestOptions,
+    consume: async (response, signal) => {
+      const responseInit = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      };
+      if (!response.body)
+        return new Response(null, responseInit);
+      const reader = response.body.getReader();
+      const sizeError = () => new Error(`HTTP response exceeded ${maxResponseBytes} byte buffer limit`);
+      const cancelReader = () => {
+        try {
+          reader.cancel(signal.reason).catch(() => {
+            return;
+          });
+        } catch {}
+      };
+      signal.addEventListener("abort", cancelReader, { once: true });
+      if (signal.aborted)
+        cancelReader();
+      try {
+        const contentLengthHeader = response.headers.get("content-length");
+        const contentLength = contentLengthHeader == null ? null : Number(contentLengthHeader);
+        if (contentLength != null && Number.isFinite(contentLength) && contentLength > maxResponseBytes) {
+          const error = sizeError();
+          await reader.cancel(error).catch(() => {
+            return;
+          });
+          throw error;
+        }
+        const chunks = [];
+        let totalBytes = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done)
+            break;
+          totalBytes += value.byteLength;
+          if (totalBytes > maxResponseBytes) {
+            const error = sizeError();
+            await reader.cancel(error).catch(() => {
+              return;
+            });
+            throw error;
+          }
+          chunks.push(value);
+        }
+        if (totalBytes === 0)
+          return new Response(null, responseInit);
+        const body = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          body.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return new Response(body, responseInit);
+      } finally {
+        signal.removeEventListener("abort", cancelReader);
+        try {
+          reader.releaseLock();
+        } catch {}
+      }
+    }
+  });
+}
+
+// packages/shared/src/memory.ts
+var MEMORY_REINFORCEMENT_OUTCOMES = Object.freeze([
+  "confirmed",
+  "successful",
+  "failed",
+  "contradicted"
+]);
+var MEMORY_LIMITS = Object.freeze({
+  namespaceChars: 128,
+  repositoryIdChars: 256,
+  sessionIdChars: 256,
+  keyChars: 512,
+  kindChars: 128,
+  subjectKeyChars: 512,
+  summaryChars: 16000,
+  listItems: 128,
+  listItemChars: 256,
+  tagChars: 128,
+  evidenceItems: 128,
+  evidencePathChars: 1000,
+  evidenceBlobOidChars: 256,
+  evidenceSourceIdChars: 512,
+  evidenceDetailChars: 2000,
+  provenanceServiceChars: 128,
+  provenanceFieldChars: 512,
+  searchTextChars: 2000,
+  selectorReasonChars: 1000,
+  recordIdChars: 256,
+  searchMaxItems: 128,
+  searchMaxChars: 1e6,
+  searchCandidateRows: 4096
+});
+var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
+var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
+var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
+  "repository_agent_cache",
+  "repository_facts"
+]);
+var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+
+class MemoryConflictError extends Error {
+  code;
+  constructor(message, code = "conflict") {
+    super(message);
+    this.name = "MemoryConflictError";
+    this.code = code;
+  }
+}
+
+class MemoryStoreClosedError extends Error {
+  constructor() {
+    super("Memory store is closed");
+    this.name = "MemoryStoreClosedError";
+  }
+}
+
+class MemoryValidationError extends TypeError {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.name = "MemoryValidationError";
+    this.code = code;
+  }
+}
+
+class MemoryHttpError extends Error {
+  status;
+  code;
+  constructor(message, status = 0, code) {
+    super(message);
+    this.name = "MemoryHttpError";
+    this.status = status;
+    this.code = typeof code === "string" && code.trim() ? code.trim() : null;
+  }
+}
+function isMemoryReinforcementOutcome(value) {
+  return typeof value === "string" && MEMORY_REINFORCEMENT_OUTCOMES.includes(value);
+}
+function assertMemoryReinforcementOutcome(value) {
+  if (isMemoryReinforcementOutcome(value))
+    return;
+  throw new MemoryValidationError(`memory reinforcement outcome must be one of: ${MEMORY_REINFORCEMENT_OUTCOMES.join(", ")}`, "invalid_reinforcement_outcome");
+}
+function normalizedText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+function requiredText(value, label) {
+  const normalized = normalizedText(value);
+  if (!normalized)
+    throw new TypeError(`${label} is required`);
+  return normalized;
+}
+function compactText(value, maxChars) {
+  return normalizedText(value).slice(0, maxChars);
+}
+function boundedAddressText(value, label, maxChars, required) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    if (required)
+      throw new TypeError(`${label} is required`);
+    return null;
+  }
+  if (normalized.length > maxChars) {
+    throw new TypeError(`${label} must be at most ${maxChars} characters`);
+  }
+  if (normalized.includes("\x00"))
+    throw new TypeError(`${label} must not contain NUL characters`);
+  return normalized;
+}
+function normalizedOptionalText(value) {
+  return normalizedText(value) || null;
+}
+function normalizeScope(scope) {
+  return {
+    namespace: boundedAddressText(scope?.namespace, "memory scope namespace", MEMORY_LIMITS.namespaceChars, true),
+    repositoryId: boundedAddressText(scope?.repositoryId, "memory scope repositoryId", MEMORY_LIMITS.repositoryIdChars, false),
+    sessionId: boundedAddressText(scope?.sessionId, "memory scope sessionId", MEMORY_LIMITS.sessionIdChars, false)
+  };
+}
+function scopeKey(scope) {
+  const normalized = normalizeScope(scope);
+  return JSON.stringify([
+    normalized.namespace,
+    normalized.repositoryId ?? "",
+    normalized.sessionId ?? ""
+  ]);
+}
+function addressKey(address) {
+  const key = boundedAddressText(address.key, "memory key", MEMORY_LIMITS.keyChars, true);
+  return `${scopeKey(address.scope)}\x00${key}`;
+}
+function clampUnit(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed))
+    return fallback;
+  return Math.max(0, Math.min(1, parsed));
+}
+function normalizedStringList(values, maxItems = MEMORY_LIMITS.listItems, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!Array.isArray(values))
+    return [];
+  const output = [];
+  const seen = new Set;
+  for (const value of values) {
+    const item = compactText(value, maxChars);
+    if (!item || seen.has(item))
+      continue;
+    seen.add(item);
+    output.push(item);
+    if (output.length >= maxItems)
+      break;
+  }
+  return output;
+}
+function normalizeEvidence(evidence) {
+  if (!Array.isArray(evidence))
+    return [];
+  const output = [];
+  for (const raw of evidence.slice(0, MEMORY_LIMITS.evidenceItems)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      continue;
+    const row = raw;
+    const path = compactText(row.path, MEMORY_LIMITS.evidencePathChars).replace(/\\/g, "/") || undefined;
+    if (path && (/^(?:[a-z]:)?\//i.test(path) || path.split("/").includes(".."))) {
+      throw new TypeError("memory evidence paths must be repository-relative and contained");
+    }
+    const normalized = {
+      ...path ? { path } : {},
+      ...compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) ? { blobOid: compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) } : {},
+      ...compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) ? { sourceId: compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) } : {},
+      ...compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) ? { detail: compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) } : {},
+      ...normalizedOptionalText(row.observedAt) ? { observedAt: normalizeTimestamp(row.observedAt, "evidence observedAt") } : {}
+    };
+    if (Object.keys(normalized).length > 0)
+      output.push(normalized);
+  }
+  return output;
+}
+function normalizeProvenance(value) {
+  const service = compactText(value?.service, MEMORY_LIMITS.provenanceServiceChars);
+  if (!service)
+    throw new TypeError("memory provenance service is required");
+  const optional = (input) => compactText(input, MEMORY_LIMITS.provenanceFieldChars) || undefined;
+  return {
+    service,
+    ...optional(value.agentId) ? { agentId: optional(value.agentId) } : {},
+    ...optional(value.runId) ? { runId: optional(value.runId) } : {},
+    ...optional(value.requestId) ? { requestId: optional(value.requestId) } : {},
+    ...optional(value.jobId) ? { jobId: optional(value.jobId) } : {},
+    ...optional(value.modelId) ? { modelId: optional(value.modelId) } : {},
+    ...optional(value.headSha) ? { headSha: optional(value.headSha) } : {},
+    ...optional(value.promptVersion) ? { promptVersion: optional(value.promptVersion) } : {}
+  };
+}
+function normalizeTimestamp(value, label) {
+  const timestamp = compactText(value, 64);
+  const parsed = Date.parse(timestamp);
+  if (!timestamp || !Number.isFinite(parsed))
+    throw new TypeError(`${label} must be an ISO timestamp`);
+  return new Date(parsed).toISOString();
+}
+function normalizeStatus(value, fallback = "active") {
+  return value === "active" || value === "stale" || value === "superseded" || value === "invalid" ? value : fallback;
+}
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function cloneObservation(observation) {
+  return {
+    ...observation,
+    ...observation.evidence ? { evidence: observation.evidence.map((entry) => ({ ...entry })) } : {},
+    ...observation.provenance ? { provenance: { ...observation.provenance } } : {}
+  };
+}
+function cloneRecord(record) {
+  return {
+    ...record,
+    scope: { ...record.scope },
+    value: record.value == null ? null : cloneJson(record.value),
+    tags: [...record.tags],
+    evidence: record.evidence.map((entry) => ({ ...entry })),
+    observations: record.observations.map(cloneObservation),
+    provenance: { ...record.provenance }
+  };
+}
+function serializedMemoryRecordChars(record) {
+  return JSON.stringify(record).length;
+}
+function isExpired(record, nowMs) {
+  return record.expiresAt != null && Date.parse(record.expiresAt) <= nowMs;
+}
+function sameScope(left, right) {
+  return scopeKey(left) === scopeKey(right);
+}
+function matchesAny(value, candidates, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!candidates || candidates.length === 0)
+    return true;
+  if (value == null)
+    return false;
+  return new Set(normalizedStringList(candidates, MEMORY_LIMITS.listItems, maxChars).map((entry) => entry.toLowerCase())).has(value.toLowerCase());
+}
+function hasAllTags(record, tags) {
+  const requested = normalizedStringList(tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars).map((tag) => tag.toLowerCase());
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.tags.map((tag) => tag.toLowerCase()));
+  return requested.every((tag) => available.has(tag));
+}
+function hasAnyEvidencePath(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.some((path) => available.has(path));
+}
+function hasAllEvidencePaths(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.every((path) => available.has(path));
+}
+function resolveMemoryReinforcement(record, outcome, requestedWeight = 1) {
+  assertMemoryReinforcementOutcome(outcome);
+  const parsedWeight = Number(requestedWeight);
+  const weight = Math.max(0, Math.min(4, Number.isFinite(parsedWeight) ? parsedWeight : 1));
+  const positive = outcome === "confirmed" || outcome === "successful";
+  const confidence = positive ? record.confidence + (1 - record.confidence) * 0.15 * weight : record.confidence * (1 - 0.25 * weight);
+  const usefulness = positive ? record.usefulness + (1 - record.usefulness) * 0.12 * weight : record.usefulness * (1 - 0.2 * weight);
+  const status = outcome === "contradicted" ? "superseded" : positive && record.status === "stale" ? "active" : record.status;
+  return {
+    weight,
+    confidence: clampUnit(confidence, record.confidence),
+    usefulness: clampUnit(usefulness, record.usefulness),
+    status
+  };
+}
+function reinforcementObservationId(recordId, input) {
+  const explicit = normalizedOptionalText(input.observationId);
+  const provenance = input.provenance;
+  const inferredParts = provenance ? [
+    normalizedOptionalText(provenance.service),
+    normalizedOptionalText(provenance.requestId),
+    normalizedOptionalText(provenance.jobId),
+    normalizedOptionalText(provenance.runId)
+  ].filter((part) => part != null) : [];
+  const inferredIdentity = inferredParts.length > 1 ? inferredParts.join("\x00") : null;
+  if (!explicit && !inferredIdentity)
+    return randomUUID2();
+  const identity = explicit ? [recordId, "explicit", explicit] : [recordId, "inferred", inferredIdentity, input.outcome];
+  return `observation_${createHash3("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 32)}`;
+}
+function createMemoryReinforcementObservation(recordId, input, observedAt) {
+  assertMemoryReinforcementOutcome(input.outcome);
+  const effect = resolveMemoryReinforcement({ confidence: 0, usefulness: 0, status: "active" }, input.outcome, input.weight);
+  const evidence = normalizeEvidence(input.evidence);
+  return {
+    id: reinforcementObservationId(recordId, input),
+    outcome: input.outcome,
+    weight: effect.weight,
+    observedAt: normalizeTimestamp(observedAt, "reinforcement observedAt"),
+    ...evidence.length > 0 ? { evidence } : {},
+    ...input.provenance ? { provenance: normalizeProvenance(input.provenance) } : {}
+  };
+}
+function appendMemoryReinforcementObservation(existing, observation) {
+  const prior = existing.find((entry) => entry.id === observation.id);
+  if (prior)
+    assertMemoryReinforcementObservationCompatible(prior, observation);
+  const appended = prior == null;
+  const candidates = appended ? [...existing, observation] : existing;
+  const seen = new Set;
+  const observations = [];
+  for (let index = candidates.length - 1;index >= 0; index--) {
+    const candidate = candidates[index];
+    if (!candidate || seen.has(candidate.id))
+      continue;
+    seen.add(candidate.id);
+    observations.unshift(cloneObservation(candidate));
+    if (observations.length >= MAX_MEMORY_REINFORCEMENT_OBSERVATIONS)
+      break;
+  }
+  return { observations, appended };
+}
+function canonicalObservationPayload(observation) {
+  const evidence = (observation.evidence ?? []).map((entry) => JSON.stringify({
+    path: entry.path ?? null,
+    blobOid: entry.blobOid ?? null,
+    sourceId: entry.sourceId ?? null,
+    detail: entry.detail ?? null,
+    observedAt: entry.observedAt ?? null
+  })).sort();
+  const provenance = observation.provenance ? {
+    service: observation.provenance.service,
+    agentId: observation.provenance.agentId ?? null,
+    runId: observation.provenance.runId ?? null,
+    requestId: observation.provenance.requestId ?? null,
+    jobId: observation.provenance.jobId ?? null,
+    modelId: observation.provenance.modelId ?? null,
+    headSha: observation.provenance.headSha ?? null,
+    promptVersion: observation.provenance.promptVersion ?? null
+  } : null;
+  return JSON.stringify({
+    outcome: observation.outcome,
+    weight: observation.weight,
+    evidence,
+    provenance
+  });
+}
+function assertMemoryReinforcementObservationCompatible(existing, candidate) {
+  if (existing.id !== candidate.id)
+    return;
+  if (canonicalObservationPayload(existing) === canonicalObservationPayload(candidate))
+    return;
+  throw new MemoryConflictError(`Memory observation conflict for ${candidate.id}: the id was already used for a different outcome payload`);
+}
+function memoryRecordRankingQuality(record) {
+  return (clampUnit(record.confidence, 0.5) + clampUnit(record.usefulness, 0.5)) / 2;
+}
+function searchScore(record, text) {
+  const tokens = normalizedText(text).toLowerCase().split(/[^a-z0-9_.\/-]+/).filter((token) => token.length > 1).slice(0, 64);
+  if (tokens.length === 0)
+    return 0;
+  const subject = (record.subjectKey ?? "").toLowerCase();
+  const haystack = [record.key, record.kind, subject, record.summary, ...record.tags].join(" ").toLowerCase();
+  let score = 0;
+  for (const token of new Set(tokens)) {
+    if (record.key.toLowerCase() === token || subject === token)
+      score += 6;
+    else if (record.key.toLowerCase().includes(token) || subject.includes(token))
+      score += 3;
+    else if (haystack.includes(token))
+      score += 1;
+  }
+  return score;
+}
+
+class InMemoryMemoryStore {
+  records = new Map;
+  now;
+  closed = false;
+  constructor(options = {}) {
+    this.now = options.now ?? (() => new Date);
+  }
+  assertOpen() {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+  }
+  async put(input, options = {}) {
+    this.assertOpen();
+    const normalizedScope = normalizeScope(input.scope);
+    const key = boundedAddressText(input.key, "memory key", MEMORY_LIMITS.keyChars, true);
+    const storageKey = addressKey({ scope: normalizedScope, key });
+    const existing = this.records.get(storageKey);
+    if (options.expectedRevision != null) {
+      const actualRevision = existing?.revision ?? 0;
+      if (actualRevision !== options.expectedRevision) {
+        throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
+      }
+    }
+    const now = this.now().toISOString();
+    let expiresAt;
+    if (input.expiresAt !== undefined) {
+      expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
+    } else if (input.ttlMs !== undefined && input.ttlMs !== null) {
+      const ttlMs = Number(input.ttlMs);
+      if (!Number.isFinite(ttlMs) || ttlMs <= 0)
+        throw new TypeError("ttlMs must be positive");
+      expiresAt = new Date(Date.parse(now) + Math.floor(ttlMs)).toISOString();
+    } else {
+      expiresAt = existing?.expiresAt ?? null;
+    }
+    const status = normalizeStatus(input.status, existing?.status ?? "active");
+    const preserveLearnedScores = existing != null && options.expectedRevision === undefined;
+    const remainsInvalid = status === "invalid" && existing?.status === "invalid";
+    const record = {
+      id: existing?.id ?? randomUUID2(),
+      scope: normalizedScope,
+      key,
+      kind: requiredText(compactText(input.kind, MEMORY_LIMITS.kindChars), "memory kind"),
+      subjectKey: compactText(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null,
+      summary: requiredText(compactText(input.summary, MEMORY_LIMITS.summaryChars), "memory summary"),
+      value: input.value == null ? null : cloneJson(input.value),
+      tags: normalizedStringList(input.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars),
+      evidence: normalizeEvidence(input.evidence),
+      observations: existing?.observations.map(cloneObservation) ?? [],
+      provenance: existing?.provenance ?? normalizeProvenance(input.provenance),
+      confidence: preserveLearnedScores ? existing.confidence : clampUnit(input.confidence, existing?.confidence ?? 0.5),
+      usefulness: preserveLearnedScores ? existing.usefulness : clampUnit(input.usefulness, existing?.usefulness ?? 0.5),
+      status,
+      revision: (existing?.revision ?? 0) + 1,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      expiresAt,
+      invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
+      invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
+    };
+    this.records.set(storageKey, record);
+    return cloneRecord(record);
+  }
+  async get(address, options = {}) {
+    this.assertOpen();
+    const record = this.records.get(addressKey(address));
+    if (!record)
+      return null;
+    if (!options.includeExpired && isExpired(record, this.now().getTime()))
+      return null;
+    const statuses = options.statuses?.length ? options.statuses : ["active"];
+    if (!statuses.includes(record.status))
+      return null;
+    return cloneRecord(record);
+  }
+  async search(query) {
+    this.assertOpen();
+    const scope = normalizeScope(query.scope);
+    const statuses = query.statuses?.length ? query.statuses : ["active"];
+    const nowMs = this.now().getTime();
+    const candidates = [...this.records.values()].filter((record) => sameScope(record.scope, scope)).filter((record) => query.includeExpired || !isExpired(record, nowMs)).filter((record) => statuses.includes(record.status)).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.revision - left.revision || left.key.localeCompare(right.key)).slice(0, MEMORY_LIMITS.searchCandidateRows);
+    const scored = candidates.filter((record) => matchesAny(record.kind, query.kinds, MEMORY_LIMITS.kindChars)).filter((record) => matchesAny(record.subjectKey, query.subjectKeys, MEMORY_LIMITS.subjectKeyChars)).filter((record) => hasAllTags(record, query.tags)).filter((record) => hasAllEvidencePaths(record, query.evidencePaths)).map((record) => ({
+      record,
+      score: searchScore(record, compactText(query.text, MEMORY_LIMITS.searchTextChars))
+    })).filter((entry) => !compactText(query.text, MEMORY_LIMITS.searchTextChars) || entry.score > 0).sort((left, right) => right.score - left.score || memoryRecordRankingQuality(right.record) - memoryRecordRankingQuality(left.record) || Date.parse(right.record.updatedAt) - Date.parse(left.record.updatedAt) || right.record.revision - left.record.revision || left.record.key.localeCompare(right.record.key));
+    const requestedMaxItems = Number(query.maxItems ?? 12);
+    const maxItems = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxItems, Number.isFinite(requestedMaxItems) ? Math.floor(requestedMaxItems) : 12));
+    const requestedMaxChars = Number(query.maxChars ?? 16000);
+    const maxChars = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxChars, Number.isFinite(requestedMaxChars) ? Math.floor(requestedMaxChars) : 16000));
+    const output = [];
+    let usedChars = 0;
+    for (const { record } of scored) {
+      if (output.length >= maxItems)
+        break;
+      const cloned = cloneRecord(record);
+      const cost = serializedMemoryRecordChars(cloned);
+      if (usedChars + cost > maxChars)
+        continue;
+      output.push(cloned);
+      usedChars += cost;
+    }
+    return output;
+  }
+  async invalidate(selector) {
+    this.assertOpen();
+    const scope = normalizeScope(selector.scope);
+    const reason = compactText(selector.reason, MEMORY_LIMITS.selectorReasonChars) || "invalidated";
+    const now = this.now().toISOString();
+    let changed = 0;
+    for (const [key, record] of this.records) {
+      if (!sameScope(record.scope, scope))
+        continue;
+      if (!matchesAny(record.key, selector.keys, MEMORY_LIMITS.keyChars))
+        continue;
+      if (!matchesAny(record.kind, selector.kinds, MEMORY_LIMITS.kindChars))
+        continue;
+      if (!matchesAny(record.subjectKey, selector.subjectKeys, MEMORY_LIMITS.subjectKeyChars))
+        continue;
+      if (!hasAllTags(record, selector.tags))
+        continue;
+      if (!hasAnyEvidencePath(record, selector.evidencePaths))
+        continue;
+      if (selector.statuses?.length && !selector.statuses.includes(record.status))
+        continue;
+      if (record.status === "invalid")
+        continue;
+      this.records.set(key, {
+        ...record,
+        status: "invalid",
+        revision: record.revision + 1,
+        updatedAt: now,
+        invalidatedAt: now,
+        invalidationReason: reason
+      });
+      changed++;
+    }
+    return changed;
+  }
+  async reinforce(input) {
+    this.assertOpen();
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const storageKey = addressKey(input);
+    const record = this.records.get(storageKey);
+    if (!record)
+      return null;
+    if (input.expectedId !== undefined) {
+      const expectedId = boundedAddressText(input.expectedId, "memory expectedId", MEMORY_LIMITS.recordIdChars, true);
+      if (record.id !== expectedId) {
+        throw new MemoryConflictError(`Memory record conflict for ${record.scope.namespace}/${record.key}: expected id ${expectedId}, got ${record.id}`, "record_conflict");
+      }
+    }
+    const effect = resolveMemoryReinforcement(record, input.outcome, input.weight);
+    const now = this.now().toISOString();
+    const observation = createMemoryReinforcementObservation(record.id, input, now);
+    const appended = appendMemoryReinforcementObservation(record.observations, observation);
+    if (!appended.appended)
+      return cloneRecord(record);
+    const updated = {
+      ...record,
+      confidence: effect.confidence,
+      usefulness: effect.usefulness,
+      status: effect.status,
+      evidence: input.evidence && input.evidence.length > 0 ? normalizeEvidence([...record.evidence, ...input.evidence]) : record.evidence,
+      observations: appended.observations,
+      provenance: record.provenance,
+      revision: record.revision + 1,
+      updatedAt: now,
+      invalidatedAt: effect.status === "invalid" ? record.invalidatedAt : null,
+      invalidationReason: effect.status === "invalid" ? record.invalidationReason : null
+    };
+    this.records.set(storageKey, updated);
+    return cloneRecord(updated);
+  }
+  async prune(options = {}) {
+    this.assertOpen();
+    const expiryCutoff = options.expiredBefore ? Date.parse(normalizeTimestamp(options.expiredBefore, "expiredBefore")) : this.now().getTime();
+    const updatedCutoff = options.updatedBefore ? Date.parse(normalizeTimestamp(options.updatedBefore, "updatedBefore")) : null;
+    const ageStatuses = options.statuses?.length ? options.statuses : ["invalid", "superseded"];
+    let removed = 0;
+    for (const [key, record] of this.records) {
+      if (options.scope && !sameScope(record.scope, options.scope))
+        continue;
+      const expired = record.expiresAt != null && Date.parse(record.expiresAt) <= expiryCutoff;
+      const agedTerminal = updatedCutoff != null && ageStatuses.includes(record.status) && Date.parse(record.updatedAt) <= updatedCutoff;
+      if (!expired && !agedTerminal)
+        continue;
+      this.records.delete(key);
+      removed++;
+    }
+    return removed;
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+
+class MemoryHttpClient {
+  serverUrl;
+  authToken;
+  callerService;
+  authority;
+  fetchImpl;
+  timeoutMs;
+  maxResponseBytes;
+  closed = false;
+  constructor(options) {
+    this.serverUrl = requiredText(options.serverUrl, "memory server URL").replace(/\/+$/, "");
+    this.authToken = normalizedOptionalText(options.authToken);
+    const callerService = normalizedText(options.callerService ?? "client");
+    if (callerService !== "server" && callerService !== "localbuddy" && callerService !== "remotebuddy" && callerService !== "workerpals" && callerService !== "source_control_manager" && callerService !== "repository_agent" && callerService !== "cli" && callerService !== "client") {
+      throw new TypeError(`Unsupported memory caller service: ${callerService}`);
+    }
+    this.callerService = callerService;
+    const authority = normalizedOptionalText(options.authority);
+    if (authority && authority !== "repository_agent" && authority !== "server") {
+      throw new TypeError(`Unsupported memory authority: ${authority}`);
+    }
+    this.authority = authority === "repository_agent" || authority === "server" ? authority : null;
+    this.fetchImpl = options.fetchImpl;
+    const requestedTimeoutMs = Number(options.timeoutMs ?? 1e4);
+    this.timeoutMs = Math.max(1, Math.min(120000, Number.isFinite(requestedTimeoutMs) ? Math.floor(requestedTimeoutMs) : 1e4));
+    const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
+    this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
+  }
+  async request(path, method, body) {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+    const headers = {
+      "Content-Type": "application/json",
+      [MEMORY_HTTP_CALLER_HEADER]: this.callerService,
+      ...this.authority ? { [MEMORY_HTTP_AUTHORITY_HEADER]: this.authority } : {}
+    };
+    if (this.authToken)
+      headers.Authorization = `Bearer ${this.authToken}`;
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${this.serverUrl}${path}`,
+      init: { method, headers, body: JSON.stringify(body) },
+      timeoutMs: this.timeoutMs,
+      maxResponseBytes: this.maxResponseBytes,
+      fetchImpl: this.fetchImpl,
+      timeoutMessage: `Memory request ${method} ${path} timed out after ${this.timeoutMs}ms`
+    });
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch {
+      if (response.ok)
+        throw new MemoryHttpError("Memory server returned invalid JSON", response.status);
+    }
+    if (!response.ok || payload.ok === false) {
+      const detail = normalizedText(payload.message ?? payload.error) || response.statusText || "request failed";
+      if (response.status === 409) {
+        throw new MemoryConflictError(detail, payload.code === "record_conflict" ? "record_conflict" : "conflict");
+      }
+      throw new MemoryHttpError(`Memory server request failed: ${detail}`, response.status, payload.code);
+    }
+    return payload;
+  }
+  async put(input, options = {}) {
+    const payload = await this.request("/memory/records", "PUT", { input, options });
+    if (!payload.record)
+      throw new MemoryHttpError("Memory server response omitted record");
+    return payload.record;
+  }
+  async get(address, options = {}) {
+    const payload = await this.request("/memory/get", "POST", { address, options });
+    return payload.record ?? null;
+  }
+  async search(query) {
+    const payload = await this.request("/memory/search", "POST", { query });
+    if (!Array.isArray(payload.records)) {
+      throw new MemoryHttpError("Memory server response omitted records");
+    }
+    return payload.records;
+  }
+  async invalidate(selector) {
+    const payload = await this.request("/memory/invalidate", "POST", { selector });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async reinforce(input) {
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const payload = await this.request("/memory/reinforce", "POST", { input });
+    return payload.record ?? null;
+  }
+  async prune(options = {}) {
+    const payload = await this.request("/memory/prune", "POST", { options });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+// packages/shared/src/repository_agent.ts
+var REPOSITORY_AGENT_SCHEMA_VERSION = 1;
+var REPOSITORY_AGENT_LIMITS = Object.freeze({
+  requestBytes: 256 * 1024,
+  responseBytes: 2 * 1024 * 1024,
+  deadlineHorizonMs: 60 * 60000,
+  questionChars: 32000,
+  contextChars: 96000,
+  contextDepth: 8,
+  contextEntries: 1024,
+  contextStringChars: 16000,
+  answerChars: 128000,
+  summaryChars: 16000,
+  evidenceItems: 128,
+  recommendationItems: 64,
+  validationProposalItems: 32,
+  memoryRefItems: 128
+});
+
+class RepositoryAgentClientError extends Error {
+  code;
+  status;
+  requestId;
+  retryAfterMs;
+  remoteCode;
+  detail;
+  retryable;
+  constructor(code, message, options = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "RepositoryAgentClientError";
+    this.code = code;
+    this.status = options.status ?? null;
+    this.requestId = options.requestId ?? null;
+    this.retryAfterMs = options.retryAfterMs ?? null;
+    this.remoteCode = options.remoteCode ?? null;
+    this.detail = options.detail ?? null;
+    this.retryable = options.retryable ?? null;
+  }
+}
+async function reinforceRepositoryAgentMemoryRefs(input) {
+  const repositoryId = String(input.repositoryId ?? "").trim();
+  if (!repositoryId)
+    throw new TypeError("repositoryId is required for memory reinforcement");
+  const defaultRoles = input.outcome === "successful" || input.outcome === "failed" ? ["analysis_cache"] : ["analysis_cache", "evidence_fact", "recalled_fact"];
+  const permittedRoles = new Set(input.roles?.length ? input.roles : defaultRoles);
+  const addresses = new Map;
+  for (const ref of input.memoryRefs.slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems)) {
+    if (!permittedRoles.has(ref.role))
+      continue;
+    const id = String(ref.id ?? "").trim();
+    const namespace = String(ref.namespace ?? "").trim();
+    const key = String(ref.key ?? "").trim();
+    if (!id || !namespace || !key)
+      continue;
+    addresses.set(`${namespace}\x00${key}\x00${id}`, { id, namespace, key });
+  }
+  const updated = [];
+  const missing = [];
+  const failed = [];
+  for (const address of addresses.values()) {
+    try {
+      const record = await input.memory.reinforce({
+        scope: { namespace: address.namespace, repositoryId },
+        key: address.key,
+        outcome: input.outcome,
+        expectedId: address.id,
+        ...input.observationId ? { observationId: input.observationId } : {},
+        ...input.weight == null ? {} : { weight: input.weight },
+        ...input.evidence ? { evidence: input.evidence } : {},
+        ...input.provenance ? { provenance: input.provenance } : {}
+      });
+      if (record)
+        updated.push(record);
+      else
+        missing.push(address);
+    } catch (error) {
+      failed.push({
+        ...address,
+        message: String(error instanceof Error ? error.message : error).slice(0, 2000),
+        ...error instanceof MemoryConflictError && error.code === "record_conflict" ? { code: "record_conflict" } : {}
+      });
+    }
+  }
+  return { attempted: addresses.size, updated, missing, failed };
+}
+var CALLER_SERVICES = new Set([
+  "server",
+  "localbuddy",
+  "remotebuddy",
+  "workerpals",
+  "source_control_manager",
+  "repository_agent",
+  "cli",
+  "client"
+]);
+var PURPOSES = new Set([
+  "architecture",
+  "priority",
+  "ownership",
+  "validation",
+  "debug",
+  "impact",
+  "general"
+]);
+var PRIORITIES = new Set(["interactive", "normal", "background"]);
+var FRESHNESS_VALUES = new Set([
+  "cache_preferred",
+  "fresh_required",
+  "cache_only"
+]);
+var MEMORY_ROLES = new Set([
+  "analysis_cache",
+  "evidence_fact",
+  "recalled_fact"
+]);
+var REQUEST_STATUSES = new Set([
+  "queued",
+  "claimed",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+var TERMINAL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+function invalidRequest(message) {
+  throw new RepositoryAgentClientError("invalid_request", message);
+}
+function invalidResponse(message) {
+  throw new RepositoryAgentClientError("invalid_response", message);
+}
+function contractViolation(source, message) {
+  return source === "request" ? invalidRequest(message) : invalidResponse(message);
+}
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function requiredString(value, label, maxChars, source) {
+  if (typeof value !== "string") {
+    return source === "request" ? invalidRequest(`${label} must be a string`) : invalidResponse(`${label} must be a string`);
+  }
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized) {
+    return source === "request" ? invalidRequest(`${label} is required`) : invalidResponse(`${label} is required`);
+  }
+  if (normalized.length > maxChars) {
+    return source === "request" ? invalidRequest(`${label} exceeds ${maxChars} characters`) : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+  }
+  return normalized;
+}
+function optionalString(value, maxChars) {
+  if (typeof value !== "string")
+    return;
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized)
+    return;
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+}
+function finiteInt(value, options) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    if (options.fallback !== undefined)
+      return options.fallback;
+    invalidResponse("Expected a finite integer");
+  }
+  return Math.max(options.min, Math.min(options.max, Math.floor(parsed)));
+}
+function normalizedIso(value, label, source) {
+  const raw = requiredString(value, label, 128, source);
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) {
+    return source === "request" ? invalidRequest(`${label} must be a valid ISO-8601 timestamp`) : invalidResponse(`${label} must be a valid ISO-8601 timestamp`);
+  }
+  return new Date(parsed).toISOString();
+}
+function sanitizeRelativePath(value, label) {
+  const path = optionalString(value, 1024)?.replace(/\\/g, "/");
+  if (!path || path.startsWith("/") || /^[a-z]:\//i.test(path))
+    return null;
+  const segments = path.split("/").filter(Boolean);
+  if (segments.some((segment) => segment === ".." || segment === "."))
+    return null;
+  return segments.join("/") || (label === "cwd" && path === "." ? "." : null);
+}
+function sanitizeJsonValue(value, label, depth, budget, source) {
+  if (depth > REPOSITORY_AGENT_LIMITS.contextDepth) {
+    contractViolation(source, `${label} exceeds maximum nesting depth`);
+  }
+  if (value === null || typeof value === "boolean")
+    return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      contractViolation(source, `${label} contains a non-finite number`);
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    if (value.length > REPOSITORY_AGENT_LIMITS.contextStringChars) {
+      contractViolation(source, `${label} contains a string longer than ${REPOSITORY_AGENT_LIMITS.contextStringChars} characters`);
+    }
+    budget.chars += value.length;
+    if (budget.chars > REPOSITORY_AGENT_LIMITS.contextChars) {
+      contractViolation(source, `${label} exceeds ${REPOSITORY_AGENT_LIMITS.contextChars} characters`);
+    }
+    return value.replace(/\u0000/g, "");
+  }
+  if (Array.isArray(value)) {
+    budget.entries += value.length;
+    if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+      contractViolation(source, `${label} contains too many entries`);
+    }
+    return value.map((entry, index) => sanitizeJsonValue(entry, `${label}[${index}]`, depth + 1, budget, source));
+  }
+  if (!isRecord(value)) {
+    contractViolation(source, `${label} must contain JSON-compatible values`);
+  }
+  const entries = Object.entries(value);
+  budget.entries += entries.length;
+  if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+    contractViolation(source, `${label} contains too many entries`);
+  }
+  const output = {};
+  for (const [rawKey, entry] of entries) {
+    const key = rawKey.replace(/\u0000/g, "").trim();
+    if (!key || key.length > 256) {
+      contractViolation(source, `${label} contains an invalid key`);
+    }
+    if (["__proto__", "prototype", "constructor"].includes(key)) {
+      contractViolation(source, `${label} contains an unsafe key`);
+    }
+    budget.chars += key.length;
+    output[key] = sanitizeJsonValue(entry, `${label}.${key}`, depth + 1, budget, source);
+  }
+  return output;
+}
+function sanitizeContext(value, label = "context", source = "request") {
+  if (value == null)
+    return;
+  if (!isRecord(value))
+    contractViolation(source, `${label} must be an object`);
+  return sanitizeJsonValue(value, label, 0, { entries: 0, chars: 0 }, source);
+}
+function sanitizeCaller(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("caller must be an object") : invalidResponse("caller must be an object");
+  }
+  const service = requiredString(value.service, "caller.service", 64, source);
+  if (!CALLER_SERVICES.has(service)) {
+    return source === "request" ? invalidRequest(`Unsupported caller.service: ${service}`) : invalidResponse(`Unsupported caller.service: ${service}`);
+  }
+  return {
+    service,
+    ...optionalString(value.instanceId, 256) ? { instanceId: optionalString(value.instanceId, 256) } : {},
+    ...optionalString(value.sessionId, 256) ? { sessionId: optionalString(value.sessionId, 256) } : {},
+    ...optionalString(value.correlationId, 256) ? { correlationId: optionalString(value.correlationId, 256) } : {}
+  };
+}
+function sanitizeRepository(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("repository must be an object") : invalidResponse("repository must be an object");
+  }
+  if (typeof value.dirty !== "boolean") {
+    return source === "request" ? invalidRequest("repository.dirty must be a boolean") : invalidResponse("repository.dirty must be a boolean");
+  }
+  return {
+    identity: requiredString(value.identity, "repository.identity", 1024, source),
+    root: requiredString(value.root, "repository.root", 4096, source),
+    revision: requiredString(value.revision, "repository.revision", 512, source),
+    tree: requiredString(value.tree, "repository.tree", 512, source),
+    dirty: value.dirty
+  };
+}
+function sanitizeRequest(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("Repository Agent request must be an object") : invalidResponse("Repository Agent request must be an object");
+  }
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    return source === "request" ? invalidRequest(`schemaVersion must be ${REPOSITORY_AGENT_SCHEMA_VERSION}`) : invalidResponse(`Unsupported Repository Agent schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const purpose = requiredString(value.purpose, "purpose", 32, source);
+  const priority = requiredString(value.priority, "priority", 32, source);
+  const freshness = requiredString(value.freshness, "freshness", 32, source);
+  if (!PURPOSES.has(purpose)) {
+    return source === "request" ? invalidRequest(`Unsupported purpose: ${purpose}`) : invalidResponse(`Unsupported purpose: ${purpose}`);
+  }
+  if (!PRIORITIES.has(priority)) {
+    return source === "request" ? invalidRequest(`Unsupported priority: ${priority}`) : invalidResponse(`Unsupported priority: ${priority}`);
+  }
+  if (!FRESHNESS_VALUES.has(freshness)) {
+    return source === "request" ? invalidRequest(`Unsupported freshness: ${freshness}`) : invalidResponse(`Unsupported freshness: ${freshness}`);
+  }
+  const deadlineAt = normalizedIso(value.deadlineAt, "deadlineAt", source);
+  if (source === "request" && Date.parse(deadlineAt) <= Date.now()) {
+    invalidRequest("deadlineAt must be in the future");
+  }
+  if (source === "request" && Date.parse(deadlineAt) - Date.now() > REPOSITORY_AGENT_LIMITS.deadlineHorizonMs) {
+    invalidRequest(`deadlineAt must be no more than ${REPOSITORY_AGENT_LIMITS.deadlineHorizonMs}ms in the future`);
+  }
+  const context = sanitizeContext(value.context, "context", source);
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    caller: sanitizeCaller(value.caller, source),
+    purpose,
+    repository: sanitizeRepository(value.repository, source),
+    question: requiredString(value.question, "question", REPOSITORY_AGENT_LIMITS.questionChars, source),
+    ...context ? { context } : {},
+    priority,
+    deadlineAt,
+    freshness,
+    idempotencyKey: requiredString(value.idempotencyKey, "idempotencyKey", 256, source)
+  };
+}
+function sanitizeRepositoryAgentRequest(value) {
+  return sanitizeRequest(value, "request");
+}
+function sanitizeStatus(value) {
+  const status = requiredString(value, "status", 32, "response");
+  if (!REQUEST_STATUSES.has(status)) {
+    invalidResponse(`Unsupported Repository Agent request status: ${status}`);
+  }
+  return status;
+}
+function sanitizeEvidence(value) {
+  if (!isRecord(value))
+    return null;
+  const path = sanitizeRelativePath(value.path, "path");
+  const revision = optionalString(value.revision, 512);
+  if (!path || !revision)
+    return null;
+  const startLine = value.startLine == null ? undefined : finiteInt(value.startLine, { min: 1, max: 1e7, fallback: 1 });
+  const endLine = value.endLine == null ? undefined : finiteInt(value.endLine, {
+    min: startLine ?? 1,
+    max: 1e7,
+    fallback: startLine ?? 1
+  });
+  return {
+    path,
+    revision,
+    ...optionalString(value.blobHash, 512) ? { blobHash: optionalString(value.blobHash, 512) } : {},
+    ...startLine == null ? {} : { startLine },
+    ...endLine == null ? {} : { endLine },
+    ...optionalString(value.excerpt, 4000) ? { excerpt: optionalString(value.excerpt, 4000) } : {},
+    ...optionalString(value.rationale, 2000) ? { rationale: optionalString(value.rationale, 2000) } : {}
+  };
+}
+function sanitizeRecommendation(value) {
+  if (!isRecord(value))
+    return null;
+  const title = optionalString(value.title, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  if (!title || !rationale)
+    return null;
+  const priority = optionalString(value.priority, 16);
+  const paths = Array.isArray(value.paths) ? value.paths.map((path) => sanitizeRelativePath(path, "path")).filter((path) => Boolean(path)).slice(0, 64) : undefined;
+  return {
+    title,
+    rationale,
+    ...priority === "high" || priority === "normal" || priority === "low" ? { priority } : {},
+    ...paths?.length ? { paths } : {}
+  };
+}
+function sanitizeValidationProposal(value) {
+  if (!isRecord(value))
+    return null;
+  const label = optionalString(value.label, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  const rawCwd = optionalString(value.cwd, 1024) ?? ".";
+  const cwd = rawCwd === "." ? "." : sanitizeRelativePath(rawCwd, "cwd");
+  const argv = Array.isArray(value.argv) ? value.argv.filter((entry) => typeof entry === "string").map((entry) => entry.replace(/\u0000/g, "").trim()).filter(Boolean).slice(0, 64).map((entry) => entry.length <= 4096 ? entry : `${entry.slice(0, 4082)}...[truncated]`) : [];
+  if (!label || !rationale || !cwd || argv.length === 0)
+    return null;
+  return { label, cwd, argv, rationale };
+}
+function sanitizeMemoryRef(value) {
+  if (!isRecord(value))
+    return null;
+  const id = optionalString(value.id, 512);
+  const namespace = optionalString(value.namespace, 256);
+  const role = optionalString(value.role, 64);
+  if (!id || !namespace || !MEMORY_ROLES.has(role))
+    return null;
+  const relevance = typeof value.relevance === "number" && Number.isFinite(value.relevance) ? Math.max(0, Math.min(1, value.relevance)) : undefined;
+  return {
+    id,
+    namespace,
+    role,
+    ...optionalString(value.key, 512) ? { key: optionalString(value.key, 512) } : {},
+    ...relevance == null ? {} : { relevance },
+    ...optionalString(value.sourceRevision, 512) ? { sourceRevision: optionalString(value.sourceRevision, 512) } : {}
+  };
+}
+function sanitizeRepositoryAgentResult(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent result must be an object");
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    invalidResponse(`Unsupported Repository Agent result schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const requestId = requiredString(value.requestId, "result.requestId", 256, "response");
+  if (expectedRequestId && requestId !== expectedRequestId) {
+    invalidResponse(`Repository Agent result requestId does not match ${expectedRequestId}`);
+  }
+  if (!isRecord(value.analyzedRepository)) {
+    invalidResponse("result.analyzedRepository must be an object");
+  }
+  const analyzedRepository = {
+    identity: requiredString(value.analyzedRepository.identity, "result.analyzedRepository.identity", 1024, "response"),
+    revision: requiredString(value.analyzedRepository.revision, "result.analyzedRepository.revision", 512, "response"),
+    tree: requiredString(value.analyzedRepository.tree, "result.analyzedRepository.tree", 512, "response")
+  };
+  const confidence = Number(value.confidence);
+  if (!Number.isFinite(confidence))
+    invalidResponse("result.confidence must be finite");
+  const cacheRecord = isRecord(value.cache) ? value.cache : {};
+  const completedAt = normalizedIso(value.completedAt, "result.completedAt", "response");
+  const data = value.data === undefined ? undefined : sanitizeJsonValue(value.data, "result.data", 0, { entries: 0, chars: 0 }, "response");
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    requestId,
+    analyzedRepository,
+    answer: requiredString(value.answer, "result.answer", REPOSITORY_AGENT_LIMITS.answerChars, "response"),
+    summary: requiredString(value.summary, "result.summary", REPOSITORY_AGENT_LIMITS.summaryChars, "response"),
+    ...data === undefined ? {} : { data },
+    confidence: Math.max(0, Math.min(1, confidence)),
+    evidence: (Array.isArray(value.evidence) ? value.evidence : []).slice(0, REPOSITORY_AGENT_LIMITS.evidenceItems).map(sanitizeEvidence).filter((entry) => Boolean(entry)),
+    recommendations: (Array.isArray(value.recommendations) ? value.recommendations : []).slice(0, REPOSITORY_AGENT_LIMITS.recommendationItems).map(sanitizeRecommendation).filter((entry) => Boolean(entry)),
+    validationProposals: (Array.isArray(value.validationProposals) ? value.validationProposals : []).slice(0, REPOSITORY_AGENT_LIMITS.validationProposalItems).map(sanitizeValidationProposal).filter((entry) => Boolean(entry)),
+    cache: {
+      hit: cacheRecord.hit === true,
+      key: optionalString(cacheRecord.key, 1024) ?? null,
+      ...optionalString(cacheRecord.storedAt, 128) ? { storedAt: optionalString(cacheRecord.storedAt, 128) } : {},
+      ...optionalString(cacheRecord.expiresAt, 128) ? { expiresAt: optionalString(cacheRecord.expiresAt, 128) } : {}
+    },
+    memoryRefs: (Array.isArray(value.memoryRefs) ? value.memoryRefs : []).slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems).map(sanitizeMemoryRef).filter((entry) => Boolean(entry)),
+    completedAt
+  };
+}
+function sanitizeRemoteError(value) {
+  if (!isRecord(value))
+    return;
+  const code = optionalString(value.code, 128);
+  const message = optionalString(value.message, 8000);
+  if (!code || !message)
+    return;
+  return {
+    code,
+    message,
+    ...optionalString(value.detail, 16000) ? { detail: optionalString(value.detail, 16000) } : {},
+    retryable: value.retryable === true
+  };
+}
+function sanitizeSnapshot(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent request snapshot must be an object");
+  const requestId = requiredString(value.requestId, "requestId", 256, "response");
+  if (requestId !== expectedRequestId)
+    invalidResponse("Repository Agent snapshot requestId mismatch");
+  const status = sanitizeStatus(value.status);
+  const result = value.result == null ? undefined : sanitizeRepositoryAgentResult(value.result, requestId);
+  const error = sanitizeRemoteError(value.error);
+  return {
+    requestId,
+    status,
+    submittedAt: normalizedIso(value.submittedAt, "submittedAt", "response"),
+    updatedAt: normalizedIso(value.updatedAt, "updatedAt", "response"),
+    ...value.pollAfterMs == null ? {} : { pollAfterMs: finiteInt(value.pollAfterMs, { min: 100, max: 30000, fallback: 1000 }) },
+    ...result ? { result } : {},
+    ...error ? { error } : {}
+  };
+}
+function normalizePositiveDuration(value, fallback, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return fallback;
+  return Math.max(1, Math.min(max, Math.floor(parsed)));
+}
+function sleepWithSignal(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+  }
+  return new Promise((resolve4, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer)
+        clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve4();
+    }, Math.max(0, ms));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+class RepositoryAgentHttpClient {
+  serverUrl;
+  authToken;
+  fetchImpl;
+  requestTimeoutMs;
+  pollIntervalMs;
+  maxResponseBytes;
+  constructor(options) {
+    const rawServerUrl = requiredString(options.serverUrl, "serverUrl", 4096, "request").replace(/\/+$/, "");
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawServerUrl);
+    } catch {
+      invalidRequest("serverUrl must be an absolute HTTP URL");
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      invalidRequest("serverUrl must use HTTP or HTTPS");
+    }
+    this.serverUrl = rawServerUrl;
+    this.authToken = optionalString(options.authToken, 8192) ?? null;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = normalizePositiveDuration(options.requestTimeoutMs, 1e4, 120000);
+    this.pollIntervalMs = normalizePositiveDuration(options.pollIntervalMs, 1000, 30000);
+    this.maxResponseBytes = normalizePositiveDuration(options.maxResponseBytes, REPOSITORY_AGENT_LIMITS.responseBytes, 16 * 1024 * 1024);
+  }
+  headers() {
+    return {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}
+    };
+  }
+  async requestJson(path, init, options = {}) {
+    const timeoutMs = normalizePositiveDuration(options.timeoutMs, this.requestTimeoutMs, 30 * 60000);
+    try {
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${this.serverUrl}${path}`,
+        init: {
+          ...init,
+          headers: { ...this.headers(), ...init.headers ?? {} },
+          signal: options.signal
+        },
+        timeoutMs,
+        fetchImpl: this.fetchImpl,
+        maxResponseBytes: this.maxResponseBytes,
+        timeoutMessage: `Repository Agent request timed out after ${timeoutMs}ms`
+      });
+      const text = await response.text();
+      let payload = {};
+      if (text.trim()) {
+        try {
+          payload = JSON.parse(text);
+        } catch (cause) {
+          throw new RepositoryAgentClientError("invalid_response", "Repository Agent returned malformed JSON", { status: response.status, cause });
+        }
+      }
+      if (!isRecord(payload)) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response must be a JSON object", { status: response.status });
+      }
+      if (!response.ok) {
+        const retryAfterHeaderMs = Number(response.headers.get("retry-after")) * 1000;
+        const retryAfterMs = Number(payload.retryAfterMs);
+        throw new RepositoryAgentClientError("http_error", optionalString(payload.message, 8000) ?? `Repository Agent request failed with HTTP ${response.status}`, {
+          status: response.status,
+          requestId: optionalString(payload.requestId, 256) ?? null,
+          remoteCode: optionalString(payload.code, 128) ?? null,
+          detail: optionalString(payload.detail, 16000) ?? null,
+          retryable: typeof payload.retryable === "boolean" ? payload.retryable : response.status >= 500,
+          retryAfterMs: Number.isFinite(retryAfterMs) ? Math.max(0, Math.floor(retryAfterMs)) : Number.isFinite(retryAfterHeaderMs) ? Math.max(0, Math.floor(retryAfterHeaderMs)) : null
+        });
+      }
+      if (payload.ok !== true) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response is missing an exact positive acknowledgement", { status: response.status });
+      }
+      return payload;
+    } catch (error) {
+      if (error instanceof RepositoryAgentClientError)
+        throw error;
+      if (options.signal?.aborted) {
+        throw new RepositoryAgentClientError("aborted", "Repository Agent call aborted", {
+          cause: error
+        });
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timed out|timeout/i.test(message)) {
+        throw new RepositoryAgentClientError("timeout", message, { cause: error });
+      }
+      throw new RepositoryAgentClientError("transport_error", message, { cause: error });
+    }
+  }
+}
+
+class RepositoryAgentClient extends RepositoryAgentHttpClient {
+  callerService;
+  callerInstanceId;
+  askTimeoutMs;
+  constructor(options) {
+    super(options);
+    if (!CALLER_SERVICES.has(options.callerService)) {
+      invalidRequest(`Unsupported callerService: ${String(options.callerService)}`);
+    }
+    this.callerService = options.callerService;
+    this.callerInstanceId = optionalString(options.callerInstanceId, 256);
+    this.askTimeoutMs = normalizePositiveDuration(options.askTimeoutMs, 120000, 30 * 60000);
+  }
+  buildRequest(input) {
+    const request = sanitizeRequest({
+      ...input,
+      schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+      caller: {
+        ...input.caller ?? {},
+        ...this.callerInstanceId ? { instanceId: this.callerInstanceId } : {},
+        service: this.callerService
+      }
+    }, "request");
+    const encoded = JSON.stringify(request);
+    if (new TextEncoder().encode(encoded).byteLength > REPOSITORY_AGENT_LIMITS.requestBytes) {
+      invalidRequest(`Repository Agent request exceeds ${REPOSITORY_AGENT_LIMITS.requestBytes} bytes`);
+    }
+    return request;
+  }
+  async submit(input, options = {}) {
+    const request = this.buildRequest(input);
+    const payload = await this.requestJson("/repository-agent/requests", { method: "POST", body: JSON.stringify(request) }, options);
+    const requestId = requiredString(payload.requestId, "requestId", 256, "response");
+    const status = sanitizeStatus(payload.status);
+    const result = payload.result == null ? undefined : sanitizeRepositoryAgentResult(payload.result, requestId);
+    return {
+      requestId,
+      status,
+      deduplicated: payload.deduplicated === true,
+      pollAfterMs: finiteInt(payload.pollAfterMs, {
+        min: 100,
+        max: 30000,
+        fallback: this.pollIntervalMs
+      }),
+      ...result ? { result } : {}
+    };
+  }
+  async get(requestIdRaw, options = {}) {
+    const requestId = requiredString(requestIdRaw, "requestId", 256, "request");
+    const payload = await this.requestJson(`/repository-agent/requests/${encodeURIComponent(requestId)}`, { method: "GET" }, options);
+    return sanitizeSnapshot(payload.request, requestId);
+  }
+  async ask(input, options = {}) {
+    const overallTimeoutMs = normalizePositiveDuration(options.timeoutMs, this.askTimeoutMs, 30 * 60000);
+    const durableDeadlineMs = Date.parse(input.deadlineAt);
+    const deadlineMs = Math.min(Date.now() + overallTimeoutMs, durableDeadlineMs);
+    const remaining = () => Math.max(0, deadlineMs - Date.now());
+    const callOptions = () => ({
+      signal: options.signal,
+      timeoutMs: Math.max(1, Math.min(this.requestTimeoutMs, remaining()))
+    });
+    if (remaining() <= 0)
+      invalidRequest("deadlineAt must be in the future");
+    const submitted = await this.submit(input, callOptions());
+    if (submitted.status === "completed" && submitted.result)
+      return submitted.result;
+    let pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? submitted.pollAfterMs, this.pollIntervalMs, 30000);
+    while (remaining() > 0) {
+      await sleepWithSignal(Math.min(pollAfterMs, remaining()), options.signal);
+      if (remaining() <= 0)
+        break;
+      const snapshot = await this.get(submitted.requestId, callOptions());
+      if (snapshot.status === "completed") {
+        if (!snapshot.result) {
+          invalidResponse("Completed Repository Agent request has no result");
+        }
+        return snapshot.result;
+      }
+      if (snapshot.status === "failed") {
+        throw new RepositoryAgentClientError("remote_failed", snapshot.error?.message ?? "Repository Agent request failed", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "cancelled") {
+        throw new RepositoryAgentClientError("remote_cancelled", snapshot.error?.message ?? "Repository Agent request was cancelled", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "expired") {
+        throw new RepositoryAgentClientError("remote_expired", snapshot.error?.message ?? "Repository Agent request expired", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? snapshot.pollAfterMs, pollAfterMs, 30000);
+    }
+    throw new RepositoryAgentClientError("timeout", `Repository Agent request ${submitted.requestId} did not complete before the caller deadline`, { requestId: submitted.requestId });
+  }
+}
+function createRepositoryAgentServiceClients(options) {
+  const repositoryAgent = options.repositoryAgent ?? new RepositoryAgentClient({
+    serverUrl: options.serverUrl,
+    callerService: options.callerService,
+    callerInstanceId: options.callerInstanceId,
+    authToken: options.authToken,
+    fetchImpl: options.fetchImpl,
+    requestTimeoutMs: options.requestTimeoutMs,
+    askTimeoutMs: options.askTimeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    maxResponseBytes: options.maxResponseBytes
+  });
+  const ownsMemoryStore = options.memoryStore === undefined;
+  const memoryStore = options.memoryStore ?? new MemoryHttpClient({
+    serverUrl: options.serverUrl,
+    authToken: options.authToken,
+    callerService: options.callerService,
+    authority: options.memoryAuthority,
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.memoryTimeoutMs,
+    maxResponseBytes: options.memoryMaxResponseBytes
+  });
+  let closePromise = null;
+  return Object.freeze({
+    repositoryAgent,
+    memoryStore,
+    close() {
+      if (!closePromise) {
+        closePromise = ownsMemoryStore ? memoryStore.close() : Promise.resolve();
+      }
+      return closePromise;
+    }
+  });
+}
 // packages/shared/src/prompts.ts
 var promptTemplateCache = new Map;
 var repoDocCache = new Map;
 // packages/shared/src/config.ts
-import { existsSync, readFileSync as readFileSync2 } from "fs";
-import { join as join2, resolve, isAbsolute } from "path";
+import { existsSync as existsSync2, readFileSync as readFileSync3 } from "fs";
+import { join as join2, resolve as resolve4, isAbsolute as isAbsolute2 } from "path";
 
 // packages/shared/src/autonomy_policy.ts
-import { createHash } from "crypto";
+import { createHash as createHash4 } from "crypto";
 var PATH_META_RE = /[*?\[\]{}()!]/;
 var DRIVE_RE = /^[A-Za-z]:\//;
 var SLASH_RE = /\/+/g;
@@ -7903,7 +9934,7 @@ function makePatternKey(objectiveType, targetPaths, triggerType, componentArea) 
     String(triggerType ?? "").trim(),
     String(componentArea ?? "").trim()
   ].join("|");
-  const digest = createHash("sha256").update(payload).digest("hex");
+  const digest = createHash4("sha256").update(payload).digest("hex");
   return `pk_${digest}`;
 }
 
@@ -7934,9 +9965,14 @@ function isLoopbackOrigin(origin) {
   }
 }
 function buildLocalCorsHeaders(options) {
+  const allowedHeaders = [
+    "content-type",
+    ...options.allowAuthorizationHeader ? ["authorization"] : [],
+    ...(options.additionalAllowedHeaders ?? []).map((header) => String(header ?? "").trim().toLowerCase()).filter((header) => /^[a-z0-9-]+$/.test(header))
+  ];
   const headers = {
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": options.allowAuthorizationHeader ? "content-type, authorization" : "content-type"
+    "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": [...new Set(allowedHeaders)].join(", ")
   };
   const origin = String(options.origin ?? "").trim();
   if (isLoopbackOrigin(origin)) {
@@ -7972,7 +10008,7 @@ function normalizeLoopbackHttpUrl(value, fallbackPort) {
 }
 
 // packages/shared/src/config.ts
-var PROJECT_ROOT = resolve(import.meta.dir, "..", "..", "..");
+var PROJECT_ROOT = resolve4(import.meta.dir, "..", "..", "..");
 var DEFAULT_CONFIG_DIR = "configs";
 var TRUTHY = new Set(["1", "true", "yes", "on"]);
 var FALSY = new Set(["0", "false", "no", "off"]);
@@ -8030,16 +10066,16 @@ function parseIntEnv(name) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 function parseTomlFile(path) {
-  if (!existsSync(path))
+  if (!existsSync2(path))
     return {};
-  const raw = readFileSync2(path, "utf-8").replace(/^\uFEFF/, "");
+  const raw = readFileSync3(path, "utf-8").replace(/^\uFEFF/, "");
   const parsed = Bun.TOML.parse(raw);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
     return {};
   return parsed;
 }
 function parseRequiredTomlFile(path) {
-  if (!existsSync(path)) {
+  if (!existsSync2(path)) {
     throw new Error(`Missing required runtime config file: ${path}`);
   }
   return parseTomlFile(path);
@@ -8155,9 +10191,9 @@ function asStringNumberRecord(value) {
 function resolvePathFromRoot(projectRoot, value) {
   if (!value)
     return projectRoot;
-  if (isAbsolute(value))
-    return resolve(value);
-  return resolve(projectRoot, value);
+  if (isAbsolute2(value))
+    return resolve4(value);
+  return resolve4(projectRoot, value);
 }
 function resolveRuntimeConfigDir(projectRoot, configuredDir) {
   if (configuredDir && configuredDir.trim()) {
@@ -8236,7 +10272,7 @@ function resolveLlmConfig(serviceNode, envPrefix, defaults, globalSessionId) {
 }
 function loadPushPalsConfig(options = {}) {
   const projectRootOverride = firstNonEmpty(options.projectRoot, process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE, PROJECT_ROOT);
-  const projectRoot = resolve(projectRootOverride);
+  const projectRoot = resolve4(projectRootOverride);
   const configDirOverride = firstNonEmpty(options.configDir, process.env.PUSHPALS_CONFIG_DIR_OVERRIDE, "");
   const configDir = resolveRuntimeConfigDir(projectRoot, configDirOverride);
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
@@ -8805,65 +10841,6 @@ function sanitizeConfigValueForLogging(value, parentKey = "") {
 function sanitizePushPalsConfigForLogging(value) {
   return sanitizeConfigValueForLogging(value);
 }
-// packages/shared/src/git_backend.ts
-function trimToken(value) {
-  return String(value ?? "").trim();
-}
-function sanitizeGitRemoteUrl(remoteUrl) {
-  const raw = trimToken(remoteUrl);
-  if (!raw)
-    return "";
-  return raw.replace(/^(https?:\/\/)[^@/]+@/i, "$1");
-}
-function parseGitRemoteHost(remoteUrl) {
-  const raw = trimToken(remoteUrl);
-  if (!raw)
-    return "";
-  const patterns = [
-    /^https?:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
-    /^ssh:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
-    /^(?:[^@:\s]+@)?([^:/\s]+):[^?\s]+$/i
-  ];
-  for (const pattern of patterns) {
-    const match = raw.match(pattern);
-    const host = match?.[1] ? trimToken(match[1]) : "";
-    if (host)
-      return host.toLowerCase();
-  }
-  return "";
-}
-function inferGitBackendFromRemote(remoteUrl) {
-  const host = parseGitRemoteHost(remoteUrl);
-  if (!host)
-    return "unknown";
-  if (host === "github.com" || host.endsWith(".github.com") || host.includes("github")) {
-    return "github";
-  }
-  if (host === "gitlab.com" || host.endsWith(".gitlab.com") || host.includes("gitlab")) {
-    return "gitlab";
-  }
-  return "unknown";
-}
-function parseGitHubRepo(remoteUrl) {
-  const sanitized = sanitizeGitRemoteUrl(remoteUrl);
-  if (!sanitized)
-    return null;
-  const httpsMatch = sanitized.match(/^https?:\/\/(?:[^@/]+@)?github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?(?:[/?#].*)?$/i);
-  if (httpsMatch) {
-    return { owner: httpsMatch[1], repo: httpsMatch[2] };
-  }
-  const sshMatch = sanitized.match(/^(?:ssh:\/\/)?(?:[^@/\s]+@)?github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?$/i);
-  if (sshMatch) {
-    return { owner: sshMatch[1], repo: sshMatch[2] };
-  }
-  return null;
-}
-function toGitHubRepoWebUrl(remoteUrl) {
-  const repo = parseGitHubRepo(remoteUrl);
-  if (!repo)
-    return null;
-  return `https://github.com/${repo.owner}/${repo.repo}`;
-}
 // packages/shared/src/tooling.ts
 var KNOWN_TOOL_NAMES = new Set([
   "bun",
@@ -9168,29 +11145,53 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
 var MAX_TRUSTED_VALIDATION_COMMANDS = 8;
 var MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1000;
 var TRUSTED_VALIDATION_EXECUTABLES = new Set([
+  "bazel",
   "bun",
   "bunx",
+  "buf",
+  "bundle",
+  "cabal",
   "cargo",
+  "clojure",
+  "cmake",
   "coverage",
+  "ctest",
+  "dart",
   "deno",
   "docker",
   "docker-compose",
+  "dotnet",
   "eslint",
+  "flutter",
+  "git",
   "go",
+  "gradle",
   "jest",
+  "lein",
   "make",
+  "mix",
+  "mvn",
   "mypy",
   "node",
   "npm",
   "npx",
   "pnpm",
+  "composer",
+  "php",
   "pytest",
   "python",
   "python3",
   "ruff",
+  "rscript",
+  "ruby",
+  "stack",
+  "swift",
+  "terraform",
   "tsc",
   "uv",
   "vitest",
+  "zig",
+  "luac",
   "yarn"
 ]);
 var ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -9283,6 +11284,27 @@ function extractTrustedValidationFailureEvidence(options) {
     failureLines: uniqueSorted(failureLines).slice(0, 20)
   };
 }
+function isSafeRelativeValidationPath(value, allowDot = false) {
+  const normalized = String(value ?? "").replace(/\\/g, "/");
+  const pathSegments = normalized.replace(/^\.\//, "").split("/");
+  if (allowDot && normalized === ".")
+    return true;
+  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.includes("://") || pathSegments.some((segment) => segment === ".." || [".git", ".pushpals", ".worktrees", "node_modules"].includes(segment.toLowerCase())) || normalized.startsWith("-") && !normalized.startsWith("./-")) {
+    return false;
+  }
+  return /^[\p{L}\p{N}_@+.,()[\]/ -]+$/u.test(normalized);
+}
+function isSafeTestSourcePath(value, extensions) {
+  if (!isSafeRelativeValidationPath(value))
+    return false;
+  const normalized = value.toLowerCase().replace(/^\.\//, "");
+  if (/(^|\/)(?:tests?|specs?|integration_test)$/.test(normalized))
+    return true;
+  return extensions.some((extension) => normalized.endsWith(extension)) && /(^|\/)(?:tests?|specs?|integration_test)(\/|$)|_(?:test|spec)\.[^/]+$/.test(normalized);
+}
+function expectedCmakeBuildPath(sourcePath) {
+  return sourcePath === "." ? "build" : `${sourcePath.replace(/\/$/, "")}/build`;
+}
 function tokenizeTrustedValidationCommand(command) {
   const trimmed = String(command ?? "").trim();
   if (!trimmed || trimmed.length > MAX_TRUSTED_VALIDATION_COMMAND_LENGTH)
@@ -9342,6 +11364,95 @@ function tokenizeTrustedValidationCommand(command) {
   const firstArg = argv[1]?.toLowerCase() ?? "";
   if (["bun", "deno", "node"].includes(executable) && ["-e", "--eval"].includes(firstArg) || ["python", "python3"].includes(executable) && firstArg === "-c") {
     return null;
+  }
+  if (executable === "ruby" && (firstArg !== "-c" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".rb"))) {
+    return null;
+  }
+  if (executable === "php" && (firstArg !== "-l" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".php"))) {
+    return null;
+  }
+  if (executable === "dotnet" && !(firstArg === "test" && (argv.length === 2 || argv.length === 3 && isSafeRelativeValidationPath(argv[2] ?? "") && /\.(?:sln|csproj|fsproj)$/i.test(argv[2] ?? "")))) {
+    return null;
+  }
+  if (executable === "bundle" && !(firstArg === "exec" && (argv[2]?.toLowerCase() === "rspec" || argv[2]?.toLowerCase() === "rake" && argv.length === 4 && argv[3]?.toLowerCase() === "test"))) {
+    return null;
+  }
+  if (executable === "bundle" && argv[2]?.toLowerCase() === "rspec" && (argv.length > 7 || argv.slice(3).some((path) => !isSafeTestSourcePath(path, [".rb"])))) {
+    return null;
+  }
+  const trailingTest = argv[argv.length - 1]?.toLowerCase() === "test";
+  const safeComposer = argv.length === 2 && firstArg === "test" || argv.length === 3 && firstArg === "run" && argv[2]?.toLowerCase() === "test" || argv.length === 4 && firstArg === "--working-dir" && trailingTest || argv.length === 3 && firstArg.startsWith("--working-dir=") && trailingTest;
+  if (executable === "composer" && (!safeComposer || firstArg === "--working-dir" && !isSafeRelativeValidationPath(argv[2] ?? "") || firstArg.startsWith("--working-dir=") && !isSafeRelativeValidationPath(argv[1]?.slice("--working-dir=".length) ?? ""))) {
+    return null;
+  }
+  const safeMavenOrGradle = argv.length === 2 && trailingTest || argv.length === 4 && ["-f", "--file", "-p", "--project-dir"].includes(firstArg) && trailingTest;
+  if (["mvn", "gradle"].includes(executable) && !safeMavenOrGradle) {
+    return null;
+  }
+  if (["mvn", "gradle"].includes(executable) && argv.length === 4 && (!isSafeRelativeValidationPath(argv[2] ?? "") || executable === "mvn" && !argv[2]?.toLowerCase().endsWith("pom.xml"))) {
+    return null;
+  }
+  if (executable === "git" && !(argv.length === 3 && firstArg === "diff" && argv[2]?.toLowerCase() === "--check")) {
+    return null;
+  }
+  if (executable === "cmake") {
+    const safeConfigure = argv.length === 5 && firstArg === "-s" && argv[3]?.toLowerCase() === "-b" && isSafeRelativeValidationPath(argv[2] ?? "", true) && isSafeRelativeValidationPath(argv[4] ?? "") && argv[4] === expectedCmakeBuildPath(argv[2] ?? "");
+    const safeBuild = argv.length === 3 && firstArg === "--build" && isSafeRelativeValidationPath(argv[2] ?? "") && /(^|\/)build$/.test(argv[2] ?? "");
+    if (!safeConfigure && !safeBuild)
+      return null;
+  }
+  if (executable === "ctest" && !(argv.length === 4 && firstArg === "--test-dir" && isSafeRelativeValidationPath(argv[2] ?? "") && /(^|\/)build$/.test(argv[2] ?? "") && argv[3]?.toLowerCase() === "--output-on-failure")) {
+    return null;
+  }
+  if (executable === "make" && !(argv.length === 2 && ["test", "check"].includes(firstArg) || argv.length === 4 && firstArg === "-c" && isSafeRelativeValidationPath(argv[2] ?? "") && ["test", "check"].includes(argv[3]?.toLowerCase() ?? ""))) {
+    return null;
+  }
+  if (executable === "bazel" && !(argv.length === 3 && firstArg === "test" && /^\/\/[A-Za-z0-9_@+.,/-]*\.\.\.$/.test(argv[2] ?? ""))) {
+    return null;
+  }
+  if (executable === "buf" && !(firstArg === "lint" && (argv.length === 2 || argv.length === 3 && isSafeRelativeValidationPath(argv[2] ?? "")))) {
+    return null;
+  }
+  if (executable === "swift" && !(argv.length === 2 && firstArg === "test" || argv.length === 4 && firstArg === "test" && argv[2]?.toLowerCase() === "--package-path" && isSafeRelativeValidationPath(argv[3] ?? ""))) {
+    return null;
+  }
+  if (["dart", "flutter"].includes(executable)) {
+    const safeDartDirectoryTest = executable === "dart" && firstArg === "--directory" && argv.length === 4 && isSafeRelativeValidationPath(argv[2] ?? "") && argv[3]?.toLowerCase() === "test";
+    if (!safeDartDirectoryTest && (firstArg !== "test" || argv.length > 6 || argv.slice(2).some((path) => !isSafeTestSourcePath(path, [".dart"])))) {
+      return null;
+    }
+  }
+  if (executable === "mix" && !(firstArg === "test" && argv.length <= 6 && argv.slice(2).every((path) => isSafeTestSourcePath(path, [".exs"])) || firstArg === "--cd" && argv.length === 4 && isSafeRelativeValidationPath(argv[2] ?? "") && argv[3]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "cabal" && !(argv.length === 3 && firstArg === "test" && argv[2]?.toLowerCase() === "all")) {
+    return null;
+  }
+  if (executable === "stack" && !(argv.length === 2 && firstArg === "test" || argv.length === 4 && firstArg === "--stack-yaml" && isSafeRelativeValidationPath(argv[2] ?? "") && argv[2]?.toLowerCase().endsWith("/stack.yaml") && argv[3]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "clojure" && !(argv.length === 2 && ["-x:test", "-m:test"].includes(firstArg))) {
+    return null;
+  }
+  if (executable === "lein" && !(argv.length === 2 && firstArg === "test"))
+    return null;
+  if (executable === "zig" && !(argv.length === 3 && firstArg === "build" && argv[2]?.toLowerCase() === "test" || argv.length === 5 && firstArg === "build" && argv[2]?.toLowerCase() === "--build-file" && isSafeRelativeValidationPath(argv[3] ?? "") && argv[3]?.toLowerCase().endsWith("/build.zig") && argv[4]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "terraform" && !(firstArg === "fmt" && argv[2]?.toLowerCase() === "-check" && argv.length >= 4 && argv.length <= 7 && argv.slice(3).every((path) => isSafeRelativeValidationPath(path) && /\.(?:tf|tfvars)$/i.test(path)))) {
+    return null;
+  }
+  if (executable === "luac") {
+    if (firstArg !== "-p" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".lua")) {
+      return null;
+    }
+  }
+  if (executable === "rscript") {
+    const expression = argv.length === 3 && firstArg === "-e" ? argv[2] ?? "" : "";
+    const parsedPath = expression.match(/^parse\(file='([^']+)'\)$/)?.[1] ?? "";
+    if (!parsedPath || !isSafeRelativeValidationPath(parsedPath) || !parsedPath.toLowerCase().endsWith(".r")) {
+      return null;
+    }
   }
   return argv;
 }
@@ -9682,7 +11793,7 @@ function workerRuntimeFailureSignature(failureClassValue, errorValue, summaryVal
     signature = `${failureClass}: ${normalized.slice(0, 1200)}`;
   }
   return {
-    fingerprint: createHash2("sha256").update(signature).digest("hex").slice(0, 24),
+    fingerprint: createHash5("sha256").update(signature).digest("hex").slice(0, 24),
     signature: signature.slice(0, 500),
     failureClass: hasStrongInternalStackEvidence ? "worker_runtime_failure" : failureClass
   };
@@ -9759,7 +11870,7 @@ function extractFailedTestSample(...values) {
   return [...samples].sort();
 }
 function failureFingerprint(parts) {
-  return createHash2("sha256").update(JSON.stringify({
+  return createHash5("sha256").update(JSON.stringify({
     targetPaths: [...parts.targetPaths].sort(),
     failureClass: parts.failureClass,
     command: parts.command,
@@ -9976,12 +12087,7 @@ function normalizePrFeedbackVerdict(value) {
 }
 function isMergedPrFeedbackVerdict(value) {
   const verdict = normalizePrFeedbackVerdict(value);
-  if (!verdict)
-    return false;
-  if (verdict.includes("unmergeable") || verdict.includes("merge_conflict") || verdict.includes("merge_failed")) {
-    return false;
-  }
-  return verdict.includes("merged");
+  return verdict === "approved_merged" || verdict === "merged";
 }
 function isClosedPrFeedbackVerdict(value) {
   const verdict = normalizePrFeedbackVerdict(value);
@@ -9989,7 +12095,7 @@ function isClosedPrFeedbackVerdict(value) {
     return false;
   if (isMergedPrFeedbackVerdict(verdict))
     return false;
-  return verdict.includes("closed");
+  return verdict === "closed_unmerged" || verdict === "rejected_comment_cap_closed" || verdict === "rejected_re_review_cap_closed";
 }
 function extractReviewAgentPrUrl(params) {
   const reviewAgent = params.reviewAgent;
@@ -10030,6 +12136,7 @@ class JobQueue {
           claimGeneration     INTEGER NOT NULL DEFAULT 0,
           result              TEXT,
           prUrl               TEXT,
+          prUrlNormalized     TEXT,
           error               TEXT,
           availableAt         TEXT,
           deferReason         TEXT,
@@ -10239,6 +12346,20 @@ class JobQueue {
         updatedAt     TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_pr_worker_assignments_worker ON pr_worker_assignments(workerId);
+
+      CREATE TABLE IF NOT EXISTS pr_provider_outcomes (
+        normalizedPrUrl TEXT PRIMARY KEY,
+        prUrl           TEXT NOT NULL,
+        jobId           TEXT,
+        verdict         TEXT NOT NULL,
+        terminal        INTEGER NOT NULL DEFAULT 0,
+        merged          INTEGER NOT NULL DEFAULT 0,
+        providerStateAt TEXT NOT NULL,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_provider_outcomes_terminal_updated
+        ON pr_provider_outcomes(terminal, updatedAt DESC);
     `);
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
     if (!jobColumns.some((col) => col.name === "targetWorkerId")) {
@@ -10310,6 +12431,9 @@ class JobQueue {
     if (!jobColumns.some((col) => col.name === "prUrl")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN prUrl TEXT;`);
     }
+    if (!jobColumns.some((col) => col.name === "prUrlNormalized")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN prUrlNormalized TEXT;`);
+    }
     if (!jobColumns.some((col) => col.name === "availableAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN availableAt TEXT;`);
     }
@@ -10319,6 +12443,35 @@ class JobQueue {
     if (!jobColumns.some((col) => col.name === "deferredAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN deferredAt TEXT;`);
     }
+    const providerOutcomeColumns = this.db.prepare(`PRAGMA table_info(pr_provider_outcomes)`).all();
+    if (!providerOutcomeColumns.some((col) => col.name === "providerStateAt")) {
+      this.db.exec(`ALTER TABLE pr_provider_outcomes ADD COLUMN providerStateAt TEXT;`);
+    }
+    this.db.exec(`
+      UPDATE pr_provider_outcomes
+      SET providerStateAt = COALESCE(providerStateAt, updatedAt, createdAt)
+      WHERE providerStateAt IS NULL OR TRIM(providerStateAt) = '';
+    `);
+    const legacyPrRows = this.db.prepare(`SELECT id, prUrl
+         FROM jobs
+         WHERE prUrl IS NOT NULL
+           AND TRIM(prUrl) <> ''
+           AND (prUrlNormalized IS NULL OR TRIM(prUrlNormalized) = '')`).all();
+    if (legacyPrRows.length > 0) {
+      const updateNormalizedPrUrl = this.db.prepare(`UPDATE jobs SET prUrlNormalized = ? WHERE id = ?`);
+      this.db.transaction(() => {
+        for (const row of legacyPrRows) {
+          updateNormalizedPrUrl.run(normalizePrUrl(row.prUrl), row.id);
+        }
+      })();
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_jobs_pr_url_normalized
+        ON jobs(prUrlNormalized, status);
+      CREATE INDEX IF NOT EXISTS idx_jobs_pr_url_latest
+        ON jobs(prUrlNormalized, updatedAt DESC)
+        WHERE prUrlNormalized IS NOT NULL;
+    `);
     const jobLogColumns = this.db.prepare(`PRAGMA table_info(job_logs)`).all();
     if (!jobLogColumns.some((col) => col.name === "claimGeneration")) {
       this.db.exec(`ALTER TABLE job_logs ADD COLUMN claimGeneration INTEGER NOT NULL DEFAULT 0;`);
@@ -10650,23 +12803,23 @@ class JobQueue {
         }
       }
     }
-    const jobId = randomUUID2();
+    const jobId = randomUUID3();
     const now = new Date().toISOString();
     try {
       this.db.prepare(`INSERT INTO jobs (
             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
             queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-            status, workerId, targetWorkerId, result, prUrl, error,
+            status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error,
             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
             createdAt, updatedAt
           )
            VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?,
-            'pending', NULL, ?, NULL, ?, NULL,
+            'pending', NULL, ?, NULL, ?, ?, NULL,
             ?, NULL, NULL, NULL, NULL, NULL, NULL,
             ?, ?
-           )`).run(jobId, taskId, sessionId, kind, JSON.stringify(params), dedupeKey, dedupeCooldownMs, priority, queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs, targetWorkerId, prUrl, now, now, now);
+           )`).run(jobId, taskId, sessionId, kind, JSON.stringify(params), dedupeKey, dedupeCooldownMs, priority, queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs, targetWorkerId, prUrl, normalizePrUrl(prUrl), now, now, now);
     } catch (err) {
       const message = String(err?.message ?? err ?? "");
       if (dedupeKey && /UNIQUE constraint failed/i.test(message)) {
@@ -10922,7 +13075,7 @@ class JobQueue {
       }
     };
     if (retrySafety === "retry_safe") {
-      const replacementJobId = randomUUID2();
+      const replacementJobId = randomUUID3();
       const attempt = Math.max(1, Math.floor(Number(job.attempt || 1))) + 1;
       const replacementAvailableAt = new Date(Date.parse(now) + RETRY_SAFE_REQUEUE_DELAY_MS).toISOString();
       const replacementParams = buildResumeParams(params, {
@@ -10964,17 +13117,17 @@ class JobQueue {
         this.db.prepare(`INSERT INTO jobs (
                id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
                queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-               status, workerId, targetWorkerId, result, prUrl, error, availableAt,
+               status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error, availableAt,
                enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
                durationMs, resumeOfJobId, attempt, createdAt, updatedAt
              )
              VALUES (
                ?, ?, ?, ?, ?, ?, ?, ?,
                ?, ?, ?,
-               'pending', NULL, ?, NULL, ?, NULL, ?,
+               'pending', NULL, ?, NULL, ?, ?, NULL, ?,
                ?, NULL, NULL, NULL, NULL, NULL, NULL,
                NULL, ?, ?, ?, ?
-             )`).run(replacementJobId, job.taskId, job.sessionId, job.kind, JSON.stringify(replacementParams), job.dedupeKey, job.dedupeCooldownMs, job.priority, job.queueWaitBudgetMs, job.executionBudgetMs, job.finalizationBudgetMs, nextTargetWorkerId, job.prUrl, replacementAvailableAt, now, job.id, attempt, now, now);
+             )`).run(replacementJobId, job.taskId, job.sessionId, job.kind, JSON.stringify(replacementParams), job.dedupeKey, job.dedupeCooldownMs, job.priority, job.queueWaitBudgetMs, job.executionBudgetMs, job.finalizationBudgetMs, nextTargetWorkerId, job.prUrl, normalizePrUrl(job.prUrl), replacementAvailableAt, now, job.id, attempt, now, now);
         repointDurableRecoveryLinks(this.db, job.id, replacementJobId, now);
         return true;
       });
@@ -11260,11 +13413,13 @@ class JobQueue {
     const summary = body.summary ?? null;
     const artifacts = body.artifacts ? JSON.stringify(body.artifacts) : null;
     const prUrl = typeof body.prUrl === "string" && body.prUrl.trim().length > 0 ? body.prUrl.trim() : null;
+    const prUrlNormalized = normalizePrUrl(prUrl);
     const jobRow = this.db.prepare(`SELECT workerId, claimGeneration FROM jobs WHERE id = ?`).get(jobId);
     const info = this.db.prepare(`UPDATE jobs
          SET status = 'completed',
              result = ?,
              prUrl = COALESCE(?, prUrl),
+             prUrlNormalized = COALESCE(?, prUrlNormalized),
              completedAt = ?,
              failedAt = NULL,
              abandonedAt = NULL,
@@ -11275,7 +13430,7 @@ class JobQueue {
              ),
              updatedAt = ?
          WHERE id = ? AND status = 'claimed'
-           ${authority ? "AND workerId = ? AND COALESCE(claimGeneration, 0) = ?" : ""}`).run(JSON.stringify({ summary, artifacts }), prUrl, now, now, now, jobId, ...authority ? [authority.workerId, authority.claimGeneration] : []);
+           ${authority ? "AND workerId = ? AND COALESCE(claimGeneration, 0) = ?" : ""}`).run(JSON.stringify({ summary, artifacts }), prUrl, prUrlNormalized, now, now, now, jobId, ...authority ? [authority.workerId, authority.claimGeneration] : []);
     if (info.changes === 0) {
       const existing = authority ? this.db.prepare(`SELECT status, workerId, claimGeneration, durationMs, completedAt
                FROM jobs WHERE id = ?`).get(jobId) : undefined;
@@ -11749,15 +13904,17 @@ class JobQueue {
          WHERE workerId = ?`).run(now, now, workerId);
   }
   setPrUrl(jobId, prUrl) {
-    const normalizedPrUrl = typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
-    if (!normalizedPrUrl) {
+    const persistedPrUrl = typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
+    const normalizedPrUrl = normalizePrUrl(persistedPrUrl);
+    if (!persistedPrUrl || !normalizedPrUrl) {
       return { ok: false, message: "prUrl is required" };
     }
     const now = new Date().toISOString();
     const info = this.db.prepare(`UPDATE jobs
          SET prUrl = COALESCE(?, prUrl),
+             prUrlNormalized = COALESCE(?, prUrlNormalized),
              updatedAt = ?
-         WHERE id = ?`).run(normalizedPrUrl, now, jobId);
+         WHERE id = ?`).run(persistedPrUrl, normalizedPrUrl, now, jobId);
     if (info.changes === 0) {
       return { ok: false, message: "Job not found" };
     }
@@ -11865,18 +14022,28 @@ class JobQueue {
   }
   listWorkerPrBacklog(limit = 200) {
     const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(2000, Math.floor(limit))) : 200;
-    const scanRows = Math.max(50, maxRows * 8);
     const latestJobs = new Map;
-    const jobRows = this.db.prepare(`SELECT
-           id,
-           prUrl,
-           status,
-           COALESCE(completedAt, failedAt, updatedAt, createdAt) AS latestJobAt
-         FROM jobs
-         WHERE prUrl IS NOT NULL
-           AND TRIM(prUrl) <> ''
-         ORDER BY latestJobAt DESC
-         LIMIT ?`).all(scanRows);
+    const jobRows = this.db.prepare(`WITH ranked_jobs AS (
+           SELECT
+             id,
+             prUrl,
+             status,
+             updatedAt AS latestJobAt,
+             ROW_NUMBER() OVER (
+               PARTITION BY prUrlNormalized
+               ORDER BY datetime(updatedAt) DESC, rowid DESC
+             ) AS prRank
+           FROM jobs
+           WHERE prUrl IS NOT NULL
+             AND TRIM(prUrl) <> ''
+             AND prUrlNormalized IS NOT NULL
+             AND TRIM(prUrlNormalized) <> ''
+         )
+         SELECT id, prUrl, status, latestJobAt
+         FROM ranked_jobs
+         WHERE prRank = 1
+         ORDER BY datetime(latestJobAt) DESC, id DESC
+         LIMIT ?`).all(maxRows);
     for (const row of jobRows) {
       const normalizedPrUrl = normalizePrUrl(row.prUrl);
       if (!normalizedPrUrl || latestJobs.has(normalizedPrUrl))
@@ -11887,30 +14054,46 @@ class JobQueue {
         latestJobStatus: row.status,
         latestJobAt: row.latestJobAt
       });
-      if (latestJobs.size >= maxRows)
-        break;
     }
     const latestFeedbackByPr = new Map;
+    const readProviderOutcome = this.db.prepare(`SELECT verdict, updatedAt, jobId, merged
+       FROM pr_provider_outcomes
+       WHERE normalizedPrUrl = ?
+         AND terminal = 1
+       LIMIT 1`);
+    let readAutonomyFeedback = null;
     try {
-      const feedbackRows = this.db.prepare(`SELECT pr_url AS prUrl, verdict, created_at AS createdAt
-           FROM autonomy_pr_feedback
-           WHERE pr_url IS NOT NULL
-             AND TRIM(pr_url) <> ''
-           ORDER BY created_at DESC
-           LIMIT ?`).all(Math.max(200, maxRows * 12));
-      for (const row of feedbackRows) {
-        const normalizedPrUrl = normalizePrUrl(row.prUrl);
-        if (!normalizedPrUrl || latestFeedbackByPr.has(normalizedPrUrl))
-          continue;
-        latestFeedbackByPr.set(normalizedPrUrl, {
-          verdict: row.verdict ? String(row.verdict).trim() : null,
-          createdAt: row.createdAt ? String(row.createdAt).trim() : null
-        });
-      }
+      readAutonomyFeedback = this.db.prepare(`SELECT verdict, created_at AS createdAt, job_id AS jobId
+         FROM autonomy_pr_feedback
+         WHERE pr_url_normalized = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`);
     } catch {}
+    for (const normalizedPrUrl of latestJobs.keys()) {
+      const provider = readProviderOutcome.get(normalizedPrUrl);
+      if (provider) {
+        latestFeedbackByPr.set(normalizedPrUrl, {
+          verdict: provider.verdict ? String(provider.verdict).trim() : null,
+          createdAt: provider.updatedAt ? String(provider.updatedAt).trim() : null,
+          jobId: provider.jobId ? String(provider.jobId).trim() : null,
+          merged: Number(provider.merged) === 1
+        });
+        continue;
+      }
+      const feedback = readAutonomyFeedback?.get(normalizedPrUrl);
+      if (!feedback)
+        continue;
+      latestFeedbackByPr.set(normalizedPrUrl, {
+        verdict: feedback.verdict ? String(feedback.verdict).trim() : null,
+        createdAt: feedback.createdAt ? String(feedback.createdAt).trim() : null,
+        jobId: feedback.jobId ? String(feedback.jobId).trim() : null,
+        merged: isMergedPrFeedbackVerdict(feedback.verdict)
+      });
+    }
     const entries = [];
     for (const [normalizedPrUrl, job] of latestJobs.entries()) {
-      const feedback = latestFeedbackByPr.get(normalizedPrUrl);
+      const feedbackCandidate = latestFeedbackByPr.get(normalizedPrUrl);
+      const feedback = feedbackCandidate && (feedbackCandidate.merged || feedbackCandidate.jobId === job.latestJobId) ? feedbackCandidate : undefined;
       const latestFeedbackVerdict = feedback?.verdict ?? null;
       const mergeState = isMergedPrFeedbackVerdict(latestFeedbackVerdict) ? "merged" : isClosedPrFeedbackVerdict(latestFeedbackVerdict) ? "closed_unmerged" : "open_unmerged";
       entries.push({
@@ -11925,6 +14108,41 @@ class JobQueue {
       });
     }
     return entries.slice(0, maxRows);
+  }
+  listPersistedPrLinksPage(options = {}) {
+    const limit = Number.isFinite(options.limit) ? Math.max(1, Math.min(101, Math.floor(options.limit ?? 50))) : 50;
+    const beforeCursor = typeof options.beforeCursor === "number" && Number.isSafeInteger(options.beforeCursor) && options.beforeCursor > 0 ? options.beforeCursor : null;
+    const cursorFilter = beforeCursor === null ? "" : "AND jobs.rowid < ?";
+    const args = beforeCursor === null ? [limit] : [beforeCursor, limit];
+    return this.db.prepare(`SELECT
+           jobs.rowid AS cursor,
+           jobs.id AS jobId,
+           jobs.sessionId AS sessionId,
+           jobs.prUrl AS prUrl,
+           COALESCE(jobs.completedAt, jobs.updatedAt, jobs.createdAt) AS updatedAt
+         FROM jobs
+         WHERE jobs.status = 'completed'
+           AND jobs.prUrl IS NOT NULL
+           AND TRIM(jobs.prUrl) <> ''
+           AND jobs.prUrlNormalized IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM pr_provider_outcomes provider
+             WHERE provider.normalizedPrUrl = jobs.prUrlNormalized
+               AND provider.terminal = 1
+               AND (
+                 provider.merged = 1
+                 OR EXISTS (
+                   SELECT 1
+                   FROM jobs authority_job
+                   WHERE authority_job.id = provider.jobId
+                     AND authority_job.rowid >= jobs.rowid
+                 )
+               )
+           )
+           ${cursorFilter}
+         ORDER BY jobs.rowid DESC
+         LIMIT ?`).all(...args);
   }
   countOpenUnmergedWorkerPrs(limit = 500) {
     return this.listWorkerPrBacklog(limit).filter((entry) => entry.mergeState === "open_unmerged").length;
@@ -12719,7 +14937,7 @@ class JobQueue {
   }
   recordToolRun(body) {
     const now = new Date().toISOString();
-    const id = compactDbText(body.id, 128) ?? randomUUID2();
+    const id = compactDbText(body.id, 128) ?? randomUUID3();
     const jobId = compactDbText(body.jobId, 128);
     const workerId = compactDbText(body.workerId, 128);
     const sessionId = compactDbText(body.sessionId, 128);
@@ -12932,7 +15150,7 @@ class JobQueue {
 
 // apps/server/src/requests.ts
 import { Database as Database3 } from "bun:sqlite";
-import { randomUUID as randomUUID3 } from "crypto";
+import { randomUUID as randomUUID4 } from "crypto";
 var DEFAULT_REQUEST_LEASE_MS = 3 * 60000;
 var MIN_REQUEST_LEASE_MS = 30000;
 var MAX_REQUEST_LEASE_MS = 15 * 60000;
@@ -13015,6 +15233,16 @@ function sanitizeRequestMetadata(input) {
       error: `autonomy metadata scope invalid: ${scope.errors.join("; ")}`
     };
   }
+  const validationIncidentInput = asObject(autonomy.validationIncident ?? autonomy.validation_incident);
+  const validationIncidentId = asString2(validationIncidentInput?.incidentId ?? validationIncidentInput?.incident_id).slice(0, 256);
+  const validationIncident = validationIncidentId ? {
+    incidentId: validationIncidentId,
+    candidateSha: asString2(validationIncidentInput?.candidateSha ?? validationIncidentInput?.candidate_sha).slice(0, 128),
+    candidateRef: asString2(validationIncidentInput?.candidateRef ?? validationIncidentInput?.candidate_ref).slice(0, 256),
+    baselineSha: asString2(validationIncidentInput?.baselineSha ?? validationIncidentInput?.baseline_sha).slice(0, 128),
+    validationScope: asString2(validationIncidentInput?.validationScope ?? validationIncidentInput?.validation_scope).slice(0, 64),
+    failureFingerprint: asString2(validationIncidentInput?.failureFingerprint ?? validationIncidentInput?.failure_fingerprint).slice(0, 256)
+  } : null;
   return {
     metadata: {
       origin: "autonomy",
@@ -13026,7 +15254,8 @@ function sanitizeRequestMetadata(input) {
         componentArea: scope.componentArea ?? componentAreaRaw,
         targetPaths: scope.normalizedTargetPaths,
         writeGlobs: scope.normalizedWriteGlobs,
-        reservationRequired: autonomy.reservationRequired === true || autonomy.reservation_required === true
+        reservationRequired: autonomy.reservationRequired === true || autonomy.reservation_required === true,
+        ...validationIncident ? { validationIncident } : {}
       }
     }
   };
@@ -13129,8 +15358,32 @@ class RequestQueue {
     this.db.exec("PRAGMA journal_mode = WAL;");
     this._migrate();
   }
+  all(sql, ...bindings) {
+    const statement = this.db.prepare(sql);
+    try {
+      return statement.all(...bindings);
+    } finally {
+      statement.finalize();
+    }
+  }
+  get(sql, ...bindings) {
+    const statement = this.db.prepare(sql);
+    try {
+      return statement.get(...bindings);
+    } finally {
+      statement.finalize();
+    }
+  }
+  run(sql, ...bindings) {
+    const statement = this.db.prepare(sql);
+    try {
+      return statement.run(...bindings);
+    } finally {
+      statement.finalize();
+    }
+  }
   supportsJobOutcomeProjection() {
-    const columns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
+    const columns = this.all(`PRAGMA table_info(jobs)`);
     const names = new Set(columns.map((column) => column.name));
     return [
       "id",
@@ -13150,9 +15403,9 @@ class RequestQueue {
       return rows.map((row) => projectRequestOutcome(row, null));
     }
     const placeholders = handoffIds.map(() => "?").join(", ");
-    const handoffJobs = this.db.prepare(`SELECT id, status, failedAt, abandonedAt, publishBlockedAt, completedAt, updatedAt
-         FROM jobs
-         WHERE id IN (${placeholders})`).all(...handoffIds);
+    const handoffJobs = this.all(`SELECT id, status, failedAt, abandonedAt, publishBlockedAt, completedAt, updatedAt
+       FROM jobs
+       WHERE id IN (${placeholders})`, ...handoffIds);
     const jobsById = new Map(handoffJobs.map((job) => [job.id, job]));
     return rows.map((row) => projectRequestOutcome(row, jobsById.get(asString2(row.handoffJobId)) ?? null));
   }
@@ -13192,7 +15445,7 @@ class RequestQueue {
       CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(sessionId);
     `);
-    const columns = this.db.prepare(`PRAGMA table_info(requests)`).all();
+    const columns = this.all(`PRAGMA table_info(requests)`);
     const ensureColumn = (name, sql) => {
       if (!columns.some((col) => col.name === name))
         this.db.exec(sql);
@@ -13250,30 +15503,30 @@ class RequestQueue {
       WHERE 1 = 1;
     `);
     const migrationNow = new Date().toISOString();
-    this.db.prepare(`UPDATE requests
-         SET status = 'pending',
-             agentId = NULL,
-             claimToken = NULL,
-             claimedAt = NULL,
-             leaseExpiresAt = NULL,
-             lastHeartbeatAt = NULL,
-             deferReason = NULL,
-             updatedAt = ?
-         WHERE status = 'claimed'
-           AND (claimToken IS NULL OR claimToken = '')`).run(migrationNow);
+    this.run(`UPDATE requests
+       SET status = 'pending',
+           agentId = NULL,
+           claimToken = NULL,
+           claimedAt = NULL,
+           leaseExpiresAt = NULL,
+           lastHeartbeatAt = NULL,
+           deferReason = NULL,
+           updatedAt = ?
+       WHERE status = 'claimed'
+         AND (claimToken IS NULL OR claimToken = '')`, migrationNow);
   }
   pendingOrderedIds() {
-    const rows = this.db.prepare(`SELECT id, priority, createdAt
-         FROM requests
-         WHERE status = 'pending'
-         ORDER BY
-           CASE LOWER(priority)
-             WHEN 'interactive' THEN 0
-             WHEN 'normal' THEN 1
-             WHEN 'background' THEN 2
-             ELSE 1
-           END ASC,
-           createdAt ASC`).all();
+    const rows = this.all(`SELECT id, priority, createdAt
+       FROM requests
+       WHERE status = 'pending'
+       ORDER BY
+         CASE LOWER(priority)
+           WHEN 'interactive' THEN 0
+           WHEN 'normal' THEN 1
+           WHEN 'background' THEN 2
+           ELSE 1
+         END ASC,
+         createdAt ASC`);
     return rows.map((row) => row.id);
   }
   queuePosition(requestId) {
@@ -13309,38 +15562,38 @@ class RequestQueue {
       return { ok: false, message: "sessionId and prompt are required" };
     }
     if (idempotencyKey) {
-      const existing = this.db.prepare(`SELECT id, priority, status
-           FROM requests
-           WHERE idempotencyKey = ?
-           ORDER BY createdAt DESC
-           LIMIT 1`).get(idempotencyKey);
+      const existing = this.get(`SELECT id, priority, status
+         FROM requests
+         WHERE idempotencyKey = ?
+         ORDER BY createdAt DESC
+         LIMIT 1`, idempotencyKey);
       if (existing?.id) {
         if (existing.status === "failed") {
           const now2 = new Date().toISOString();
-          const reopened = this.db.prepare(`UPDATE requests
-               SET sessionId = ?,
-                   prompt = ?,
-                   priority = ?,
-                   queueWaitBudgetMs = ?,
-                   metadataJson = ?,
-                   forceWorker = ?,
-                   forceLane = ?,
-                   workerRequired = ?,
-                   handoffJobId = NULL,
-                   status = 'pending',
-                   agentId = NULL,
-                   claimToken = NULL,
-                   result = NULL,
-                   error = NULL,
-                   enqueuedAt = ?,
-                   claimedAt = NULL,
-                   leaseExpiresAt = NULL,
-                   lastHeartbeatAt = NULL,
-                   completedAt = NULL,
-                   failedAt = NULL,
-                   durationMs = NULL,
-                   updatedAt = ?
-               WHERE id = ? AND status = 'failed'`).run(sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, forceWorker, forceLane, forceWorker, now2, now2, existing.id);
+          const reopened = this.run(`UPDATE requests
+             SET sessionId = ?,
+                 prompt = ?,
+                 priority = ?,
+                 queueWaitBudgetMs = ?,
+                 metadataJson = ?,
+                 forceWorker = ?,
+                 forceLane = ?,
+                 workerRequired = ?,
+                 handoffJobId = NULL,
+                 status = 'pending',
+                 agentId = NULL,
+                 claimToken = NULL,
+                 result = NULL,
+                 error = NULL,
+                 enqueuedAt = ?,
+                 claimedAt = NULL,
+                 leaseExpiresAt = NULL,
+                 lastHeartbeatAt = NULL,
+                 completedAt = NULL,
+                 failedAt = NULL,
+                 durationMs = NULL,
+                 updatedAt = ?
+             WHERE id = ? AND status = 'failed'`, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, forceWorker, forceLane, forceWorker, now2, now2, existing.id);
           if (reopened.changes > 0) {
             const queuePosition3 = this.queuePosition(existing.id);
             const etaMs3 = this.estimateEtaMs(priority, queuePosition3);
@@ -13364,14 +15617,14 @@ class RequestQueue {
         };
       }
     }
-    const requestId = randomUUID3();
+    const requestId = randomUUID4();
     const now = new Date().toISOString();
-    this.db.prepare(`INSERT INTO requests (
-          id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
-          workerRequired, handoffJobId, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
-          enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
-        )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`).run(requestId, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane, forceWorker, now, now, now);
+    this.run(`INSERT INTO requests (
+        id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
+        workerRequired, handoffJobId, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
+        enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
+      )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`, requestId, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane, forceWorker, now, now, now);
     const queuePosition = this.queuePosition(requestId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);
     return {
@@ -13386,40 +15639,40 @@ class RequestQueue {
     const agentId = String(agentIdRaw ?? "").trim();
     if (!agentId)
       return { ok: false, message: "agentId is required" };
-    const claimToken = randomUUID3();
+    const claimToken = randomUUID4();
     const leaseExpiresAt = new Date(Date.parse(now) + normalizeRequestLeaseMs(options.leaseMs)).toISOString();
     this.reconcileWorkerHandoffsFromJobs(now);
     const tx = this.db.transaction(() => {
       this.recoverExpiredClaims(now);
-      const row = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
-           FROM requests
-           WHERE status = 'pending'
-           ORDER BY
-             CASE LOWER(priority)
-               WHEN 'interactive' THEN 0
-               WHEN 'normal' THEN 1
-               WHEN 'background' THEN 2
-               ELSE 1
-             END ASC,
-             createdAt ASC
-           LIMIT 1`).get();
+      const row = this.get(`SELECT ${RequestQueue.SELECT_COLUMNS}
+         FROM requests
+         WHERE status = 'pending'
+         ORDER BY
+           CASE LOWER(priority)
+             WHEN 'interactive' THEN 0
+             WHEN 'normal' THEN 1
+             WHEN 'background' THEN 2
+             ELSE 1
+           END ASC,
+           createdAt ASC
+         LIMIT 1`);
       if (!row)
         return null;
-      this.db.prepare(`UPDATE requests
-           SET status = 'claimed',
-               agentId = ?,
-               claimToken = ?,
-               claimGeneration = COALESCE(claimGeneration, 0) + 1,
-               claimedAt = ?,
-               leaseExpiresAt = ?,
-               lastHeartbeatAt = ?,
-               deferReason = NULL,
-               claimAttempts = COALESCE(claimAttempts, 0) + 1,
-               completedAt = NULL,
-               failedAt = NULL,
-               durationMs = NULL,
-               updatedAt = ?
-           WHERE id = ?`).run(agentId, claimToken, now, leaseExpiresAt, now, now, row.id);
+      this.run(`UPDATE requests
+         SET status = 'claimed',
+             agentId = ?,
+             claimToken = ?,
+             claimGeneration = COALESCE(claimGeneration, 0) + 1,
+             claimedAt = ?,
+             leaseExpiresAt = ?,
+             lastHeartbeatAt = ?,
+             deferReason = NULL,
+             claimAttempts = COALESCE(claimAttempts, 0) + 1,
+             completedAt = NULL,
+             failedAt = NULL,
+             durationMs = NULL,
+             updatedAt = ?
+         WHERE id = ?`, agentId, claimToken, now, leaseExpiresAt, now, now, row.id);
       const queueWaitMs = Math.max(0, Math.floor(Date.parse(now) - Date.parse(row.enqueuedAt || row.createdAt || now) || 0));
       return {
         request: {
@@ -13456,14 +15709,14 @@ class RequestQueue {
       return { ok: false, message: "claimToken is required" };
     const now = new Date().toISOString();
     const leaseExpiresAt = new Date(Date.parse(now) + normalizeRequestLeaseMs(options.leaseMs)).toISOString();
-    const result = this.db.prepare(`UPDATE requests
-         SET lastHeartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND agentId = ?
-           AND claimToken = ?
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?`).run(now, leaseExpiresAt, now, requestId, agentId, claimToken, now);
+    const result = this.run(`UPDATE requests
+       SET lastHeartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND agentId = ?
+         AND claimToken = ?
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?`, now, leaseExpiresAt, now, requestId, agentId, claimToken, now);
     if (result.changes === 0) {
       return {
         ok: false,
@@ -13484,17 +15737,17 @@ class RequestQueue {
     const now = new Date().toISOString();
     const deferredUntil = new Date(Date.parse(now) + retryAfterMs).toISOString();
     const deferReason = String(options.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
-    const result = this.db.prepare(`UPDATE requests
-         SET leaseExpiresAt = ?,
-             lastHeartbeatAt = ?,
-             deferReason = ?,
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND agentId = ?
-           AND claimToken = ?
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?`).run(deferredUntil, now, deferReason || null, now, requestId, agentId, claimToken, now);
+    const result = this.run(`UPDATE requests
+       SET leaseExpiresAt = ?,
+           lastHeartbeatAt = ?,
+           deferReason = ?,
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND agentId = ?
+         AND claimToken = ?
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?`, deferredUntil, now, deferReason || null, now, requestId, agentId, claimToken, now);
     if (result.changes === 0) {
       return {
         ok: false,
@@ -13531,23 +15784,23 @@ class RequestQueue {
   recoverExpiredClaims(nowInput = new Date) {
     const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
     const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
-    const rows = this.db.prepare(`SELECT id FROM requests
-         WHERE status = 'claimed'
-           AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
-         ORDER BY createdAt ASC`).all(now);
+    const rows = this.all(`SELECT id FROM requests
+       WHERE status = 'claimed'
+         AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+       ORDER BY createdAt ASC`, now);
     if (rows.length === 0)
       return { recovered: 0, requestIds: [] };
-    const result = this.db.prepare(`UPDATE requests
-         SET status = 'pending',
-             agentId = NULL,
-             claimToken = NULL,
-             claimedAt = NULL,
-             leaseExpiresAt = NULL,
-             lastHeartbeatAt = NULL,
-             deferReason = NULL,
-             updatedAt = ?
-         WHERE status = 'claimed'
-           AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`).run(now, now);
+    const result = this.run(`UPDATE requests
+       SET status = 'pending',
+           agentId = NULL,
+           claimToken = NULL,
+           claimedAt = NULL,
+           leaseExpiresAt = NULL,
+           lastHeartbeatAt = NULL,
+           deferReason = NULL,
+           updatedAt = ?
+       WHERE status = 'claimed'
+         AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`, now, now);
     return {
       recovered: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id)
@@ -13561,21 +15814,21 @@ class RequestQueue {
     const now = new Date(nowMs).toISOString();
     const deferredUntil = new Date(nowMs + maxDelayMs).toISOString();
     const shorten = this.db.transaction(() => {
-      const rows = this.db.prepare(`SELECT id
-           FROM requests
-           WHERE status = 'claimed'
-             AND (
-               deferReason = 'worker_runtime_circuit_open'
-               OR (
-                 ? = 1
-                 AND deferReason IS NULL
-                 AND json_valid(metadataJson)
-                 AND json_extract(metadataJson, '$.origin') = 'autonomy'
-               )
+      const rows = this.all(`SELECT id
+         FROM requests
+         WHERE status = 'claimed'
+           AND (
+             deferReason = 'worker_runtime_circuit_open'
+             OR (
+               ? = 1
+               AND deferReason IS NULL
+               AND json_valid(metadataJson)
+               AND json_extract(metadataJson, '$.origin') = 'autonomy'
              )
-             AND leaseExpiresAt > ?
-           ORDER BY updatedAt ASC, createdAt ASC
-           LIMIT ?`).all(includeLegacyAutonomyClaims ? 1 : 0, deferredUntil, limit);
+           )
+           AND leaseExpiresAt > ?
+         ORDER BY updatedAt ASC, createdAt ASC
+         LIMIT ?`, includeLegacyAutonomyClaims ? 1 : 0, deferredUntil, limit);
       if (rows.length === 0) {
         return {
           shortened: 0,
@@ -13586,25 +15839,25 @@ class RequestQueue {
       }
       const ids = rows.map((row) => row.id);
       const placeholders = ids.map(() => "?").join(",");
-      const reportedRows = this.db.prepare(`UPDATE requests
-           SET leaseExpiresAt = ?, updatedAt = ?
-           WHERE id IN (${placeholders})
-             AND status = 'claimed'
-             AND leaseExpiresAt > ?
-           RETURNING id`).all(deferredUntil, now, ...ids, deferredUntil);
-      const unreported = this.db.prepare(`UPDATE requests
-           SET leaseExpiresAt = ?, updatedAt = ?
-           WHERE status = 'claimed'
-             AND (
-               deferReason = 'worker_runtime_circuit_open'
-               OR (
-                 ? = 1
-                 AND deferReason IS NULL
-                 AND json_valid(metadataJson)
-                 AND json_extract(metadataJson, '$.origin') = 'autonomy'
-               )
+      const reportedRows = this.all(`UPDATE requests
+         SET leaseExpiresAt = ?, updatedAt = ?
+         WHERE id IN (${placeholders})
+           AND status = 'claimed'
+           AND leaseExpiresAt > ?
+         RETURNING id`, deferredUntil, now, ...ids, deferredUntil);
+      const unreported = this.run(`UPDATE requests
+         SET leaseExpiresAt = ?, updatedAt = ?
+         WHERE status = 'claimed'
+           AND (
+             deferReason = 'worker_runtime_circuit_open'
+             OR (
+               ? = 1
+               AND deferReason IS NULL
+               AND json_valid(metadataJson)
+               AND json_extract(metadataJson, '$.origin') = 'autonomy'
              )
-             AND leaseExpiresAt > ?`).run(deferredUntil, now, includeLegacyAutonomyClaims ? 1 : 0, deferredUntil);
+           )
+           AND leaseExpiresAt > ?`, deferredUntil, now, includeLegacyAutonomyClaims ? 1 : 0, deferredUntil);
       return {
         shortened: reportedRows.length + unreported.changes,
         requestIds: reportedRows.map((row) => row.id),
@@ -13616,18 +15869,18 @@ class RequestQueue {
   }
   releaseWorkerRuntimeCircuitDeferredClaims(nowMs = Date.now()) {
     const now = new Date(nowMs).toISOString();
-    const rows = this.db.prepare(`SELECT id
-         FROM requests
-         WHERE status = 'claimed'
-           AND deferReason = 'worker_runtime_circuit_open'
-         ORDER BY updatedAt ASC, createdAt ASC
-         LIMIT 1000`).all();
+    const rows = this.all(`SELECT id
+       FROM requests
+       WHERE status = 'claimed'
+         AND deferReason = 'worker_runtime_circuit_open'
+       ORDER BY updatedAt ASC, createdAt ASC
+       LIMIT 1000`);
     if (rows.length === 0)
       return { released: 0, requestIds: [] };
-    const result = this.db.prepare(`UPDATE requests
-         SET leaseExpiresAt = ?, deferReason = NULL, updatedAt = ?
-         WHERE status = 'claimed'
-           AND deferReason = 'worker_runtime_circuit_open'`).run(now, now);
+    const result = this.run(`UPDATE requests
+       SET leaseExpiresAt = ?, deferReason = NULL, updatedAt = ?
+       WHERE status = 'claimed'
+         AND deferReason = 'worker_runtime_circuit_open'`, now, now);
     return {
       released: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id)
@@ -13643,7 +15896,7 @@ class RequestQueue {
       cycleDetected: 0,
       depthLimitReached: 0
     });
-    const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
+    const jobColumns = this.all(`PRAGMA table_info(jobs)`);
     const requiredJobColumns = ["id", "status", "resumeOfJobId", "attempt", "createdAt"];
     const jobColumnNames = new Set(jobColumns.map((column) => column.name));
     if (!requiredJobColumns.every((name) => jobColumnNames.has(name)))
@@ -13655,19 +15908,19 @@ class RequestQueue {
     const now = new Date().toISOString();
     const reconcile = this.db.transaction(() => {
       const result = emptyResult();
-      const candidates = this.db.prepare(`SELECT r.id AS requestId, r.handoffJobId AS previousJobId
-           FROM requests r
-           JOIN jobs currentJob ON currentJob.id = r.handoffJobId
-           WHERE r.workerRequired = 1
-             AND r.handoffJobId IS NOT NULL
-             AND currentJob.status = 'abandoned'
-             AND EXISTS (
-               SELECT 1
-               FROM jobs successor
-               WHERE successor.resumeOfJobId = currentJob.id
-             )
-           ORDER BY r.createdAt ASC, r.id ASC
-           LIMIT ?`).all(maxRequests);
+      const candidates = this.all(`SELECT r.id AS requestId, r.handoffJobId AS previousJobId
+         FROM requests r
+         JOIN jobs currentJob ON currentJob.id = r.handoffJobId
+         WHERE r.workerRequired = 1
+           AND r.handoffJobId IS NOT NULL
+           AND currentJob.status = 'abandoned'
+           AND EXISTS (
+             SELECT 1
+             FROM jobs successor
+             WHERE successor.resumeOfJobId = currentJob.id
+           )
+         ORDER BY r.createdAt ASC, r.id ASC
+         LIMIT ?`, maxRequests);
       result.scanned = candidates.length;
       if (candidates.length === 0)
         return result;
@@ -13681,105 +15934,110 @@ class RequestQueue {
          WHERE id = ?
            AND workerRequired = 1
            AND handoffJobId = ?`);
-      for (const candidate of candidates) {
-        const visited = new Set([candidate.previousJobId]);
-        let currentJobId = candidate.previousJobId;
-        let currentStatus = "abandoned";
-        let traversed = 0;
-        let invalidChain = false;
-        while (currentStatus === "abandoned") {
-          const successor = nextSuccessor.get(currentJobId);
-          if (!successor)
-            break;
-          if (visited.has(successor.id)) {
-            result.cycleDetected += 1;
-            invalidChain = true;
-            break;
+      try {
+        for (const candidate of candidates) {
+          const visited = new Set([candidate.previousJobId]);
+          let currentJobId = candidate.previousJobId;
+          let currentStatus = "abandoned";
+          let traversed = 0;
+          let invalidChain = false;
+          while (currentStatus === "abandoned") {
+            const successor = nextSuccessor.get(currentJobId);
+            if (!successor)
+              break;
+            if (visited.has(successor.id)) {
+              result.cycleDetected += 1;
+              invalidChain = true;
+              break;
+            }
+            if (traversed >= maxDepth) {
+              result.depthLimitReached += 1;
+              invalidChain = true;
+              break;
+            }
+            visited.add(successor.id);
+            currentJobId = successor.id;
+            currentStatus = asString2(successor.status).toLowerCase();
+            traversed += 1;
           }
-          if (traversed >= maxDepth) {
-            result.depthLimitReached += 1;
-            invalidChain = true;
-            break;
-          }
-          visited.add(successor.id);
-          currentJobId = successor.id;
-          currentStatus = asString2(successor.status).toLowerCase();
-          traversed += 1;
+          if (invalidChain || traversed === 0)
+            continue;
+          const updated = repoint.run(currentJobId, now, candidate.requestId, candidate.previousJobId);
+          if (updated.changes === 0)
+            continue;
+          result.repointed += 1;
+          result.requestIds.push(candidate.requestId);
+          result.previousJobIds.push(candidate.previousJobId);
+          result.replacementJobIds.push(currentJobId);
         }
-        if (invalidChain || traversed === 0)
-          continue;
-        const updated = repoint.run(currentJobId, now, candidate.requestId, candidate.previousJobId);
-        if (updated.changes === 0)
-          continue;
-        result.repointed += 1;
-        result.requestIds.push(candidate.requestId);
-        result.previousJobIds.push(candidate.previousJobId);
-        result.replacementJobIds.push(currentJobId);
+      } finally {
+        nextSuccessor.finalize();
+        repoint.finalize();
       }
       return result;
     });
     return reconcile();
   }
   reconcileWorkerHandoffsFromJobs(nowInput = new Date) {
-    const jobsTable = this.db.prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`).get();
+    const jobsTable = this.get(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`);
     if (!jobsTable)
       return { completed: 0, requestIds: [], jobIds: [] };
     const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
     const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
-    const rows = this.db.prepare(`SELECT r.id AS requestId,
-                r.sessionId AS requestSessionId,
-                j.id AS jobId
-         FROM requests r
-         JOIN jobs j ON j.id = (
-           SELECT candidate.id
-           FROM jobs candidate
-           WHERE candidate.kind = 'task.execute'
-             AND candidate.sessionId = r.sessionId
-             AND json_valid(candidate.params)
-             AND json_extract(candidate.params, '$.requestId') = r.id
-             AND datetime(candidate.createdAt) >= datetime(COALESCE(r.enqueuedAt, r.createdAt))
-           ORDER BY candidate.createdAt DESC, candidate.id DESC
-           LIMIT 1
-         )
-         WHERE r.status = 'pending'
-            OR (
-              r.status = 'claimed'
-              AND (r.leaseExpiresAt IS NULL OR r.leaseExpiresAt <= ?)
-            )
-         ORDER BY r.createdAt ASC
-         LIMIT 400`).all(now);
+    const rows = this.all(`SELECT r.id AS requestId,
+              r.sessionId AS requestSessionId,
+              j.id AS jobId
+       FROM requests r
+       JOIN jobs j ON j.id = (
+         SELECT candidate.id
+         FROM jobs candidate
+         WHERE candidate.kind = 'task.execute'
+           AND candidate.sessionId = r.sessionId
+           AND json_valid(candidate.params)
+           AND json_extract(candidate.params, '$.requestId') = r.id
+           AND datetime(candidate.createdAt) >= datetime(COALESCE(r.enqueuedAt, r.createdAt))
+         ORDER BY candidate.createdAt DESC, candidate.id DESC
+         LIMIT 1
+       )
+       WHERE r.status = 'pending'
+          OR (
+            r.status = 'claimed'
+            AND (r.leaseExpiresAt IS NULL OR r.leaseExpiresAt <= ?)
+          )
+       ORDER BY r.createdAt ASC
+       LIMIT 400`, now);
     if (rows.length === 0)
       return { completed: 0, requestIds: [], jobIds: [] };
     const requestIds = [];
     const jobIds = [];
     const tx = this.db.transaction(() => {
       for (const row of rows) {
-        const updated = this.db.prepare(`UPDATE requests
-             SET workerRequired = 1,
-                 handoffJobId = ?,
-                 status = 'completed',
-                 result = CASE
-                   WHEN result IS NULL OR result = '' THEN ?
-                   ELSE result
-                 END,
-                 completedAt = COALESCE(completedAt, ?),
-                 failedAt = NULL,
-                 leaseExpiresAt = NULL,
-                 lastHeartbeatAt = NULL,
-                 durationMs = MAX(
-                   0,
-                   CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)
-                 ),
-                 updatedAt = ?
-             WHERE id = ?
-               AND sessionId = ?
-               AND (
-                 status = 'pending'
-                 OR (
-                   status = 'claimed'
-                   AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
-                 )
-               )`).run(row.jobId, JSON.stringify({
+        const updated = this.run(`UPDATE requests
+           SET workerRequired = 1,
+               handoffJobId = ?,
+               status = 'completed',
+               result = CASE
+                 WHEN result IS NULL OR result = '' THEN ?
+                 ELSE result
+               END,
+               completedAt = COALESCE(completedAt, ?),
+               failedAt = NULL,
+               leaseExpiresAt = NULL,
+               lastHeartbeatAt = NULL,
+               durationMs = MAX(
+                 0,
+                 CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+               ),
+               updatedAt = ?
+           WHERE id = ?
+             AND sessionId = ?
+             AND (
+               status = 'pending'
+               OR (
+                 status = 'claimed'
+                 AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+               )
+             )`, row.jobId, JSON.stringify({
           requiresWorker: true,
           jobId: row.jobId,
           reconciledAfterCrash: true
@@ -13804,16 +16062,16 @@ class RequestQueue {
     if (!claimToken)
       return { ok: false, message: "claimToken is required" };
     const now = new Date().toISOString();
-    const result = this.db.prepare(`UPDATE requests
-         SET workerRequired = 1,
-             handoffJobId = ?,
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND agentId = ?
-           AND claimToken = ?
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?`).run(jobId, now, requestId, agentId, claimToken, now);
+    const result = this.run(`UPDATE requests
+       SET workerRequired = 1,
+           handoffJobId = ?,
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND agentId = ?
+         AND claimToken = ?
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?`, jobId, now, requestId, agentId, claimToken, now);
     if (result.changes === 0) {
       return {
         ok: false,
@@ -13840,22 +16098,22 @@ class RequestQueue {
       }
       return { ok: false, message: "Request completion token is stale or owned by another agent" };
     }
-    const info = this.db.prepare(`UPDATE requests
-         SET status = 'completed',
-              result = ?,
-              completedAt = ?,
-              failedAt = NULL,
-              leaseExpiresAt = NULL,
-              lastHeartbeatAt = NULL,
-              deferReason = NULL,
-             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?
-           AND agentId = ?
-           AND claimToken = ?`).run(result, now, now, now, requestId, now, agentId, claimToken);
+    const info = this.run(`UPDATE requests
+       SET status = 'completed',
+            result = ?,
+            completedAt = ?,
+            failedAt = NULL,
+            leaseExpiresAt = NULL,
+            lastHeartbeatAt = NULL,
+            deferReason = NULL,
+           durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?
+         AND agentId = ?
+         AND claimToken = ?`, result, now, now, now, requestId, now, agentId, claimToken);
     if (info.changes === 0) {
       return {
         ok: false,
@@ -13883,22 +16141,22 @@ class RequestQueue {
       }
       return { ok: false, message: "Request failure token is stale or owned by another agent" };
     }
-    const info = this.db.prepare(`UPDATE requests
-         SET status = 'failed',
-              error = ?,
-              failedAt = ?,
-              completedAt = NULL,
-              leaseExpiresAt = NULL,
-              lastHeartbeatAt = NULL,
-              deferReason = NULL,
-             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?
-           AND agentId = ?
-           AND claimToken = ?`).run(JSON.stringify({ message, detail }), now, now, now, requestId, now, agentId, claimToken);
+    const info = this.run(`UPDATE requests
+       SET status = 'failed',
+            error = ?,
+            failedAt = ?,
+            completedAt = NULL,
+            leaseExpiresAt = NULL,
+            lastHeartbeatAt = NULL,
+            deferReason = NULL,
+           durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?
+         AND agentId = ?
+         AND claimToken = ?`, JSON.stringify({ message, detail }), now, now, now, requestId, now, agentId, claimToken);
     if (info.changes === 0) {
       return {
         ok: false,
@@ -13908,44 +16166,44 @@ class RequestQueue {
     return { ok: true, transitioned: true };
   }
   getRequest(requestId) {
-    const row = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`).get(requestId) ?? null;
+    const row = this.get(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`, requestId);
     if (!row)
       return null;
     return this.projectOutcomes([{ ...row, metadata: parseMetadataJson(row.metadataJson) }])[0] ?? null;
   }
   getPendingRequests() {
-    const rows = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
-         FROM requests
-         WHERE status = 'pending'
-         ORDER BY
-           CASE LOWER(priority)
-             WHEN 'interactive' THEN 0
-             WHEN 'normal' THEN 1
-             WHEN 'background' THEN 2
-             ELSE 1
-            END ASC,
-            createdAt ASC`).all();
+    const rows = this.all(`SELECT ${RequestQueue.SELECT_COLUMNS}
+       FROM requests
+       WHERE status = 'pending'
+       ORDER BY
+         CASE LOWER(priority)
+           WHEN 'interactive' THEN 0
+           WHEN 'normal' THEN 1
+           WHEN 'background' THEN 2
+           ELSE 1
+          END ASC,
+          createdAt ASC`);
     return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
   }
   listRequests(options) {
     const status = options?.status ?? "all";
     const limit = typeof options?.limit === "number" && Number.isFinite(options.limit) ? Math.max(1, Math.min(500, Math.floor(options.limit))) : 200;
     if (status === "all") {
-      const rows2 = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
-           FROM requests
-           ORDER BY createdAt DESC
-           LIMIT ?`).all(limit);
+      const rows2 = this.all(`SELECT ${RequestQueue.SELECT_COLUMNS}
+         FROM requests
+         ORDER BY createdAt DESC
+         LIMIT ?`, limit);
       return this.projectOutcomes(rows2.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })));
     }
-    const rows = this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
-         FROM requests
-         WHERE status = ?
-         ORDER BY createdAt DESC
-         LIMIT ?`).all(status, limit);
+    const rows = this.all(`SELECT ${RequestQueue.SELECT_COLUMNS}
+       FROM requests
+       WHERE status = ?
+       ORDER BY createdAt DESC
+       LIMIT ?`, status, limit);
     return this.projectOutcomes(rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })));
   }
   countByStatus() {
-    const rows = this.db.prepare(`SELECT status, COUNT(*) AS count FROM requests GROUP BY status`).all();
+    const rows = this.all(`SELECT status, COUNT(*) AS count FROM requests GROUP BY status`);
     const counts = {
       pending: 0,
       claimed: 0,
@@ -13959,10 +16217,10 @@ class RequestQueue {
     return counts;
   }
   countByPriority() {
-    const rows = this.db.prepare(`SELECT priority, COUNT(*) AS count
-         FROM requests
-         WHERE status IN ('pending', 'claimed')
-         GROUP BY priority`).all();
+    const rows = this.all(`SELECT priority, COUNT(*) AS count
+       FROM requests
+       WHERE status IN ('pending', 'claimed')
+       GROUP BY priority`);
     const counts = {
       interactive: 0,
       normal: 0,
@@ -13979,11 +16237,11 @@ class RequestQueue {
     if (normalized.length === 0)
       return 0;
     const placeholders = normalized.map(() => "?").join(", ");
-    const rows = this.db.prepare(`SELECT metadataJson
-         FROM requests
-         WHERE status IN (${placeholders})
-           AND metadataJson IS NOT NULL
-           AND metadataJson <> ''`).all(...normalized);
+    const rows = this.all(`SELECT metadataJson
+       FROM requests
+       WHERE status IN (${placeholders})
+         AND metadataJson IS NOT NULL
+         AND metadataJson <> ''`, ...normalized);
     let count = 0;
     for (const row of rows) {
       const metadata = parseMetadataJson(row.metadataJson);
@@ -13995,7 +16253,7 @@ class RequestQueue {
   nextPendingSnapshot(limit = 10) {
     const ordered = this.pendingOrderedIds().slice(0, Math.max(1, Math.min(limit, 50)));
     return ordered.map((id, idx) => {
-      const row = this.db.prepare(`SELECT priority FROM requests WHERE id = ?`).get(id);
+      const row = this.get(`SELECT priority FROM requests WHERE id = ?`, id);
       const priority = normalizePriority(row?.priority);
       return {
         id,
@@ -14008,17 +16266,17 @@ class RequestQueue {
   sloSummary(windowHours = 24) {
     const boundedWindowHours = Number.isFinite(windowHours) && windowHours > 0 ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours))) : 24;
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
-    const rows = this.supportsJobOutcomeProjection() ? this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
-             FROM requests
-             WHERE updatedAt >= ?
-                OR handoffJobId IN (
-                  SELECT id
-                  FROM jobs
-                  WHERE COALESCE(completedAt, failedAt, abandonedAt, publishBlockedAt, updatedAt) >= ?
-                )`).all(cutoffIso, cutoffIso) : this.db.prepare(`SELECT ${RequestQueue.SELECT_COLUMNS}
-             FROM requests
-             WHERE status IN ('completed', 'failed')
-               AND updatedAt >= ?`).all(cutoffIso);
+    const rows = this.supportsJobOutcomeProjection() ? this.all(`SELECT ${RequestQueue.SELECT_COLUMNS}
+           FROM requests
+           WHERE updatedAt >= ?
+              OR handoffJobId IN (
+                SELECT id
+                FROM jobs
+                WHERE COALESCE(completedAt, failedAt, abandonedAt, publishBlockedAt, updatedAt) >= ?
+              )`, cutoffIso, cutoffIso) : this.all(`SELECT ${RequestQueue.SELECT_COLUMNS}
+           FROM requests
+           WHERE status IN ('completed', 'failed')
+             AND updatedAt >= ?`, cutoffIso);
     const projectedRows = this.projectOutcomes(rows);
     let completed = 0;
     let failed = 0;
@@ -14056,13 +16314,13 @@ class RequestQueue {
     };
   }
   close() {
-    this.db.close();
+    this.db.close(true);
   }
 }
 
 // apps/server/src/completions.ts
 import { Database as Database4 } from "bun:sqlite";
-import { createHash as createHash3, randomUUID as randomUUID4 } from "crypto";
+import { createHash as createHash6, randomUUID as randomUUID5 } from "crypto";
 var TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 1;
 var DEFAULT_COMPLETION_LEASE_MS = 3 * 60000;
 var MIN_COMPLETION_LEASE_MS = 30000;
@@ -14163,7 +16421,7 @@ function normalizeTrustedValidationReport(value) {
 function trustedValidationFailureFingerprint(result) {
   const failureLines = trustedValidationStringArray(result.failureLines).map(normalizeTrustedValidationFingerprintLine);
   const fallback = result.output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").split(/\r?\n/).map(normalizeTrustedValidationFingerprintLine).filter((line) => /\b(?:error|fail|failed|failure|timeout)\b/i.test(line)).slice(0, 4);
-  return createHash3("sha256").update(JSON.stringify({
+  return createHash6("sha256").update(JSON.stringify({
     command: result.command.trim().replace(/\s+/g, " ").toLowerCase(),
     failureClass: result.failureClass ?? "trusted_validation_failed",
     failedTests: trustedValidationStringArray(result.failedTests).map(normalizeTrustedValidationFingerprintLine),
@@ -14605,7 +16863,7 @@ class CompletionQueue {
         return { ok: false, message: "jobArtifacts must be JSON-serializable" };
       }
     }
-    const completionId = randomUUID4();
+    const completionId = randomUUID5();
     const now = new Date().toISOString();
     const tx = this.db.transaction(() => {
       if (options.beginJobFinalization) {
@@ -14738,7 +16996,7 @@ class CompletionQueue {
     const pusherId = String(pusherIdRaw ?? "").trim();
     if (!pusherId)
       return { ok: false, message: "pusherId is required" };
-    const claimToken = randomUUID4();
+    const claimToken = randomUUID5();
     const leaseMs = normalizeCompletionLeaseMs(options.leaseMs);
     const leaseExpiresAt = new Date(Date.parse(now) + leaseMs).toISOString();
     const tx = this.db.transaction(() => {
@@ -15261,7 +17519,41 @@ class CompletionQueue {
 
 // apps/server/src/autonomy.ts
 import { Database as Database5 } from "bun:sqlite";
-import { createHash as createHash4, randomUUID as randomUUID5 } from "crypto";
+import { createHash as createHash7, randomUUID as randomUUID6 } from "crypto";
+var REPOSITORY_AGENT_MEMORY_ROLES = new Set(["analysis_cache", "evidence_fact", "recalled_fact"]);
+var REPOSITORY_AGENT_MEMORY_FEEDBACK_PENDING_UNHEALTHY_MS = 5 * 60000;
+var REPOSITORY_AGENT_MEMORY_FEEDBACK_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60000;
+var REPOSITORY_AGENT_MEMORY_FEEDBACK_MAX_TERMINAL_ROWS = 1e5;
+var REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_BATCH = 500;
+var REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_INTERVAL_MS = 15 * 60000;
+function asRepositoryAgentMemoryRefs(value) {
+  if (!Array.isArray(value))
+    return [];
+  const refs = [];
+  const seen = new Set;
+  for (const entry of value.slice(0, 128)) {
+    const record = asObject2(entry);
+    const id = asString3(record.id).slice(0, 512);
+    const namespace = asString3(record.namespace).slice(0, 256);
+    const key = asString3(record.key).slice(0, 512);
+    const role = asString3(record.role);
+    if (!id || !namespace || !key || !REPOSITORY_AGENT_MEMORY_ROLES.has(role))
+      continue;
+    const identity = `${namespace}\x00${key}\x00${role}`;
+    if (seen.has(identity))
+      continue;
+    seen.add(identity);
+    refs.push({
+      id,
+      namespace,
+      key,
+      role,
+      ...Number.isFinite(asNumber(record.relevance, Number.NaN)) ? { relevance: clamp012(asNumber(record.relevance, 0)) } : {},
+      ...asString3(record.sourceRevision) ? { sourceRevision: asString3(record.sourceRevision).slice(0, 512) } : {}
+    });
+  }
+  return refs;
+}
 function normalizeObjectiveTargetPath(value) {
   return asString3(value).replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/").replace(/\/$/, "").toLowerCase();
 }
@@ -15348,34 +17640,22 @@ var ENGINE_SOURCE_PROMOTE_MIN_SAMPLES = 5;
 var ENGINE_SOURCE_ARCHIVE_MIN_SAMPLES = 8;
 var ENGINE_SOURCE_WATCHLIST_MIN_SAMPLES = 4;
 var ENGINE_SOURCE_FRESHNESS_HALF_LIFE_DAYS = 14;
-function isNegativePrFeedbackVerdict(value) {
+var PROVIDER_STATE_MAX_FUTURE_SKEW_MS = 5 * 60000;
+var NON_TERMINAL_NEGATIVE_PR_FEEDBACK_VERDICTS = new Set([
+  "rejected",
+  "changes_requested",
+  "merge_failed",
+  "failed"
+]);
+function isNegativePrFeedbackSignal(value) {
   const text = value.toLowerCase();
   return text.includes("reject") || text.includes("merge_failed") || text.includes("failed");
 }
 function deriveOutcomeFromPrFeedbackVerdict(verdict) {
-  const text = verdict.toLowerCase();
-  if (text.includes("approved_unmergeable") || text.includes("approved") && (text.includes("unmergeable") || text.includes("merge_conflict"))) {
+  const text = verdict.trim().toLowerCase();
+  if (text === "approved_unmergeable")
     return null;
-  }
-  if (text.includes("rejected_comment_cap_closed") || text.includes("closed")) {
-    return {
-      success: false,
-      userAction: "rejected",
-      reopenedWithin24h: true,
-      regressionFlag: true,
-      terminal: true
-    };
-  }
-  if (isNegativePrFeedbackVerdict(text)) {
-    return {
-      success: false,
-      userAction: "rejected",
-      reopenedWithin24h: true,
-      regressionFlag: true,
-      terminal: !text.includes("reject")
-    };
-  }
-  if (text.includes("approved") || text.includes("merged")) {
+  if (text === "approved_merged" || text === "merged") {
     return {
       success: true,
       userAction: "accepted",
@@ -15384,13 +17664,31 @@ function deriveOutcomeFromPrFeedbackVerdict(verdict) {
       terminal: true
     };
   }
+  if (text === "closed_unmerged" || text === "rejected_comment_cap_closed" || text === "rejected_re_review_cap_closed") {
+    return {
+      success: false,
+      userAction: "rejected",
+      reopenedWithin24h: false,
+      regressionFlag: true,
+      terminal: true
+    };
+  }
+  if (NON_TERMINAL_NEGATIVE_PR_FEEDBACK_VERDICTS.has(text)) {
+    return {
+      success: false,
+      userAction: "rejected",
+      reopenedWithin24h: false,
+      regressionFlag: true,
+      terminal: false
+    };
+  }
   return null;
 }
 function asIsoNow() {
   return new Date().toISOString();
 }
 function sha256Hex(value) {
-  return createHash4("sha256").update(value).digest("hex");
+  return createHash7("sha256").update(value).digest("hex");
 }
 function jsonByteLength(value) {
   return Buffer.byteLength(value, "utf8");
@@ -15411,6 +17709,40 @@ function asObject2(value) {
 }
 function asString3(value) {
   return String(value ?? "").trim();
+}
+function normalizePrUrl2(value) {
+  if (typeof value !== "string")
+    return null;
+  const trimmed = value.trim();
+  if (!trimmed)
+    return null;
+  try {
+    const parsed = new URL(trimmed);
+    parsed.hash = "";
+    parsed.search = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return trimmed.replace(/\/+$/, "").toLowerCase();
+  }
+}
+function normalizeIsoTimestamp(value) {
+  const text = asString3(value);
+  if (!text)
+    return null;
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+function normalizeProviderStateTimestamp(value, receiptIso) {
+  const normalized = normalizeIsoTimestamp(value);
+  if (!normalized)
+    return receiptIso;
+  const stateMs = Date.parse(normalized);
+  const receiptMs = Date.parse(receiptIso);
+  if (Number.isFinite(stateMs) && Number.isFinite(receiptMs) && stateMs > receiptMs + PROVIDER_STATE_MAX_FUTURE_SKEW_MS) {
+    return receiptIso;
+  }
+  return normalized;
 }
 function normalizeServiceName(value) {
   return asString3(value).toLowerCase();
@@ -15463,27 +17795,23 @@ function failedTestNamesFromOutput(...values) {
   return [...tests].sort();
 }
 var PUSHPALS_INTERNAL_CANDIDATE_PATTERNS = [
-  /\bqueue[_-]?health\b/i,
   /\bworkerpals?\b/i,
   /\bremotebuddy\b/i,
   /\blocalbuddy\b/i,
-  /\bsource[_-]?control[_-]?manager\b/i,
-  /\bsourcecontrolmanager\b/i,
-  /\breview[_-]?agent\b/i,
-  /\breviewagent\b/i,
   /\bpushpals?\b/i,
-  /\bdispatch locks?\b/i,
-  /\bautonomy diagnostics?\b/i
+  /\bartifact[_-]?only[_-]?no[_-]?publishable[_-]?patch\b/i,
+  /\bno[-_\s]?reviewable[-_\s]?patch\b/i,
+  /\bno[-_\s]?publishable[-_\s]?(?:patch|changes?|progress)\b/i,
+  /\bautonomy[-_\s]?internal\b/i
 ];
 var PUSHPALS_OWNED_PATH_PATTERNS = [
-  /^apps\/(?:workerpals|remotebuddy|localbuddy|source_control_manager|server)\b/i,
-  /^packages\/(?:cli|shared)\b/i,
-  /^prompts\/(?:workerpals|review_agent|remotebuddy|localbuddy)\b/i,
-  /^scripts\/(?:pushpals|sync-cli|build-runtime|release|replay-worker-job)/i,
+  /^apps\/(?:workerpals|remotebuddy|localbuddy)\b/i,
+  /^prompts\/(?:workerpals|remotebuddy|localbuddy)\b/i,
+  /^scripts\/(?:pushpals|sync-pushpals|build-pushpals-runtime|replay-worker-job)/i,
   /\bpushpals\b/i,
   /\bworkerpals\b/i,
   /\bremotebuddy\b/i,
-  /\bsource_control_manager\b/i
+  /\blocalbuddy\b/i
 ];
 function pushpalsInternalCandidateReason(record) {
   const scope = asObject2(record.scope);
@@ -15824,9 +18152,9 @@ function scopedCandidateStorageId(runId, candidateId) {
   const normalizedRunId = asString3(runId);
   const normalizedCandidateId = asString3(candidateId);
   if (!normalizedRunId)
-    return normalizedCandidateId || randomUUID5();
+    return normalizedCandidateId || randomUUID6();
   if (!normalizedCandidateId)
-    return `${normalizedRunId}:${randomUUID5()}`;
+    return `${normalizedRunId}:${randomUUID6()}`;
   const prefix = `${normalizedRunId}:`;
   if (normalizedCandidateId.startsWith(prefix))
     return normalizedCandidateId;
@@ -15841,7 +18169,7 @@ function deriveInspirationSourceKey(params) {
   const sourceUrl = asString3(params.sourceUrl).toLowerCase();
   if (!sourceType && !sourceLabel && !sourceUrl)
     return "";
-  return `source:${createHash4("sha256").update([sourceType, sourceLabel, sourceUrl].join("|")).digest("hex")}`;
+  return `source:${createHash7("sha256").update([sourceType, sourceLabel, sourceUrl].join("|")).digest("hex")}`;
 }
 function normalizeEngineSourceCurationStatus(value) {
   const text = asString3(value).toLowerCase();
@@ -16143,6 +18471,7 @@ class AutonomyStore {
   lastEvaluatorRunAtMs = 0;
   lastStaleObjectiveSweepAtMs = 0;
   lastStaleObjectiveSweepAtIso = null;
+  lastRepositoryAgentMemoryFeedbackPruneAtMs = 0;
   constructor(dbPath) {
     this.db = new Database5(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
@@ -16217,6 +18546,7 @@ class AutonomyStore {
         policy_version TEXT,
         impact_model_version TEXT,
         dispatched_at TEXT,
+        awaiting_review_since TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -16346,6 +18676,7 @@ class AutonomyStore {
         pattern_key TEXT NOT NULL,
         pr_number INTEGER,
         pr_url TEXT,
+        pr_url_normalized TEXT,
         verdict TEXT NOT NULL,
         review_score REAL,
         review_threshold REAL,
@@ -16364,6 +18695,19 @@ class AutonomyStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_key
         ON autonomy_pr_feedback(feedback_key)
         WHERE feedback_key IS NOT NULL AND feedback_key <> '';
+      CREATE TABLE IF NOT EXISTS pr_provider_outcomes (
+        normalizedPrUrl TEXT PRIMARY KEY,
+        prUrl           TEXT NOT NULL,
+        jobId           TEXT,
+        verdict         TEXT NOT NULL,
+        terminal        INTEGER NOT NULL DEFAULT 0,
+        merged          INTEGER NOT NULL DEFAULT 0,
+        providerStateAt TEXT NOT NULL,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_provider_outcomes_terminal_updated
+        ON pr_provider_outcomes(terminal, updatedAt DESC);
       CREATE TABLE IF NOT EXISTS questions_queue (
         id TEXT PRIMARY KEY,
         objective_id TEXT NOT NULL,
@@ -16456,6 +18800,35 @@ class AutonomyStore {
         token_usage_json TEXT,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS autonomy_repository_agent_memory_links (
+        objective_id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL,
+        repository_agent_request_id TEXT NOT NULL,
+        memory_refs_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS autonomy_repository_agent_memory_feedback (
+        observation_id TEXT PRIMARY KEY,
+        objective_id TEXT NOT NULL,
+        repository_id TEXT NOT NULL,
+        repository_agent_request_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        authority_kind TEXT NOT NULL,
+        authority_id TEXT NOT NULL,
+        weight REAL NOT NULL DEFAULT 1,
+        memory_refs_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        claim_token TEXT,
+        claim_generation INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at TEXT,
+        claimed_at TEXT,
+        next_attempt_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        applied_at TEXT
+      );
       CREATE TABLE IF NOT EXISTS llm_usage_events (
         id TEXT PRIMARY KEY,
         service TEXT NOT NULL,
@@ -16483,10 +18856,26 @@ class AutonomyStore {
         updated_at TEXT NOT NULL
       );
     `);
+    const tableHasColumn = (table, column) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
+        throw new TypeError(`Unsafe migration table name: ${table}`);
+      }
+      return this.db.prepare(`PRAGMA table_info(${table})`).all().some((entry) => entry.name === column);
+    };
     const ensureColumn = (table, columnSql) => {
+      const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:\s|$)/.exec(columnSql.trim());
+      if (!match)
+        throw new TypeError(`Invalid migration column declaration: ${columnSql}`);
+      const column = match[1];
+      if (tableHasColumn(table, column))
+        return;
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnSql}`);
-      } catch {}
+      } catch (error) {
+        if (tableHasColumn(table, column))
+          return;
+        throw error;
+      }
     };
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_key TEXT");
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_type TEXT");
@@ -16500,7 +18889,23 @@ class AutonomyStore {
     ensureColumn("autonomy_engine_source_stats", "last_reinforced_at TEXT");
     ensureColumn("questions_queue", "closed_reason TEXT");
     ensureColumn("autonomy_objectives", "incident_key TEXT");
+    ensureColumn("autonomy_objectives", "awaiting_review_since TEXT");
     ensureColumn("autonomy_outcomes", "terminal INTEGER NOT NULL DEFAULT 1");
+    ensureColumn("autonomy_pr_feedback", "pr_url_normalized TEXT");
+    ensureColumn("pr_provider_outcomes", "providerStateAt TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "weight REAL NOT NULL DEFAULT 1");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "claim_token TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "claim_generation INTEGER NOT NULL DEFAULT 0");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "lease_expires_at TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "claimed_at TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "next_attempt_at TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "last_error TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "applied_at TEXT");
+    this.db.exec(`
+      UPDATE pr_provider_outcomes
+      SET providerStateAt = COALESCE(providerStateAt, updatedAt, createdAt)
+      WHERE providerStateAt IS NULL OR TRIM(providerStateAt) = '';
+    `);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_autonomy_engine_trials_source
         ON autonomy_engine_idea_trials(inspiration_source_key, created_at DESC);
@@ -16508,8 +18913,46 @@ class AutonomyStore {
         ON autonomy_objectives(incident_key, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_autonomy_outcomes_terminal_created
         ON autonomy_outcomes(terminal, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_outcomes_objective_terminal_id
+        ON autonomy_outcomes(objective_id, terminal, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_pending
+        ON autonomy_repository_agent_memory_feedback(status, next_attempt_at, created_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_lease
+        ON autonomy_repository_agent_memory_feedback(status, lease_expires_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_status_created
+        ON autonomy_repository_agent_memory_feedback(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_objective_created
+        ON autonomy_repository_agent_memory_feedback(objective_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_memory_links_updated
+        ON autonomy_repository_agent_memory_links(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_objectives_source_status_updated
+        ON autonomy_objectives(source, status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_objectives_job_updated
+        ON autonomy_objectives(job_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_objectives_request_updated
+        ON autonomy_objectives(request_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_normalized_url
+        ON autonomy_pr_feedback(pr_url_normalized, created_at DESC);
     `);
     const now = asIsoNow();
+    this.db.exec(`
+      UPDATE autonomy_objectives
+      SET awaiting_review_since = COALESCE(awaiting_review_since, updated_at)
+      WHERE status = 'awaiting_review';
+    `);
+    const legacyFeedbackUrls = this.db.prepare(`SELECT id, pr_url AS prUrl
+         FROM autonomy_pr_feedback
+         WHERE pr_url IS NOT NULL
+           AND TRIM(pr_url) <> ''
+           AND (pr_url_normalized IS NULL OR TRIM(pr_url_normalized) = '')`).all();
+    if (legacyFeedbackUrls.length > 0) {
+      const updateFeedbackUrl = this.db.prepare(`UPDATE autonomy_pr_feedback SET pr_url_normalized = ? WHERE id = ?`);
+      this.db.transaction(() => {
+        for (const row of legacyFeedbackUrls) {
+          updateFeedbackUrl.run(normalizePrUrl2(row.prUrl), row.id);
+        }
+      })();
+    }
     this.db.prepare(`INSERT OR IGNORE INTO autonomy_safety_state (
           state_id, kill_switch_enabled, freeze_until, freeze_reason, updated_at
         ) VALUES ('global', 0, NULL, NULL, ?)`).run(now);
@@ -16732,7 +19175,7 @@ class AutonomyStore {
            occurrence_count = 1`).run(alertType, params.severity, message, detailsJson, nowIso, nowIso);
     this.db.prepare(`INSERT INTO autonomy_ops_alerts (
           id, alert_type, severity, message, details_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)`).run(`alert_${randomUUID5().slice(0, 8)}`, alertType, params.severity, message, detailsJson, nowIso);
+        ) VALUES (?, ?, ?, ?, ?, ?)`).run(`alert_${randomUUID6().slice(0, 8)}`, alertType, params.severity, message, detailsJson, nowIso);
   }
   resolveOpsAlert(alertTypeRaw, nowIso = asIsoNow()) {
     const alertType = asString3(alertTypeRaw);
@@ -16876,6 +19319,64 @@ class AutonomyStore {
       latestTerminalAt: asString3(health?.latest_terminal_at) || null
     };
   }
+  getAutonomyReviewDeliveryHealth(nowIso, windowHours) {
+    const backlog = this.db.prepare(`SELECT COUNT(*) AS awaiting_count,
+                MIN(COALESCE(awaiting_review_since, updated_at)) AS oldest_awaiting_at
+         FROM autonomy_objectives
+         WHERE source = 'autonomous'
+           AND status = 'awaiting_review'`).get();
+    const resolved = this.hasTable("jobs") ? this.db.prepare(`SELECT
+           COUNT(DISTINCT outcome.objective_id) AS resolved_count,
+           COUNT(DISTINCT CASE
+             WHEN outcome.success = 1 AND LOWER(COALESCE(outcome.user_action, '')) = 'accepted'
+             THEN outcome.objective_id END) AS merged_count,
+           COUNT(DISTINCT CASE
+             WHEN outcome.success = 0 THEN outcome.objective_id END) AS closed_unmerged_count
+         FROM autonomy_outcomes outcome
+         JOIN autonomy_objectives objective ON objective.id = outcome.objective_id
+         JOIN jobs job ON job.id = outcome.job_id
+         WHERE objective.source = 'autonomous'
+           AND outcome.terminal = 1
+           AND COALESCE(job.prUrl, '') != ''
+           AND datetime(outcome.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`).get(nowIso) : undefined;
+    const revisions = this.hasTable("jobs") ? this.db.prepare(`WITH resolved AS (
+               SELECT DISTINCT outcome.objective_id
+               FROM autonomy_outcomes outcome
+               JOIN jobs job ON job.id = outcome.job_id
+               WHERE outcome.terminal = 1
+                 AND outcome.objective_id IS NOT NULL
+                 AND COALESCE(job.prUrl, '') != ''
+                 AND datetime(outcome.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')
+             )
+             SELECT COUNT(DISTINCT feedback.objective_id) AS revision_objective_count
+             FROM autonomy_pr_feedback feedback
+             JOIN resolved ON resolved.objective_id = feedback.objective_id
+             WHERE (
+               LOWER(COALESCE(feedback.verdict, '')) LIKE '%reject%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%unmergeable%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%merge_conflict%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%changes_requested%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%revision%'
+             )`).get(nowIso) : undefined;
+    const awaitingReviewCount = Math.max(0, Math.floor(asNumber(backlog?.awaiting_count, 0)));
+    const oldestAwaitingAtMs = Date.parse(asString3(backlog?.oldest_awaiting_at));
+    const nowMs = Date.parse(nowIso);
+    const oldestAwaitingReviewAgeMs = awaitingReviewCount > 0 && Number.isFinite(oldestAwaitingAtMs) && Number.isFinite(nowMs) ? Math.max(0, nowMs - oldestAwaitingAtMs) : 0;
+    const resolvedCount = Math.max(0, Math.floor(asNumber(resolved?.resolved_count, 0)));
+    const mergedCount = Math.max(0, Math.floor(asNumber(resolved?.merged_count, 0)));
+    const closedUnmergedCount = Math.max(0, Math.floor(asNumber(resolved?.closed_unmerged_count, 0)));
+    const revisionObjectiveCount = Math.max(0, Math.floor(asNumber(revisions?.revision_objective_count, 0)));
+    return {
+      awaitingReviewCount,
+      oldestAwaitingReviewAt: asString3(backlog?.oldest_awaiting_at) || null,
+      oldestAwaitingReviewAgeMs,
+      resolvedCount,
+      mergedCount,
+      closedUnmergedCount,
+      revisionObjectiveCount,
+      revisionRate: resolvedCount > 0 ? clamp012(revisionObjectiveCount / resolvedCount) : null
+    };
+  }
   latestEvaluatorScorecard() {
     const row = this.db.prepare(`SELECT id, window_hours, sample_count, success_rate, regret_rate, avg_latency_ms, dispatch_count,
                 recommendation, payload_json, created_at
@@ -16900,6 +19401,10 @@ class AutonomyStore {
       jobTimeoutRate: Number.isFinite(asNumber(payload.jobTimeoutRate, Number.NaN)) ? clamp012(asNumber(payload.jobTimeoutRate, 0)) : null,
       activeRuntimeMs: Math.max(0, Math.floor(asNumber(payload.activeRuntimeMs, 0))),
       repeatedFailureCount: Math.max(0, Math.floor(asNumber(payload.repeatedFailureCount, 0))),
+      awaitingReviewCount: Math.max(0, Math.floor(asNumber(payload.awaitingReviewCount, 0))),
+      oldestAwaitingReviewAgeMs: Math.max(0, Math.floor(asNumber(payload.oldestAwaitingReviewAgeMs, 0))),
+      reviewResolvedCount: Math.max(0, Math.floor(asNumber(payload.reviewResolvedCount, 0))),
+      reviewRevisionRate: Number.isFinite(asNumber(payload.reviewRevisionRate, Number.NaN)) ? clamp012(asNumber(payload.reviewRevisionRate, 0)) : null,
       tokenBudgetExhausted: asBoolean2(payload.tokenBudgetExhausted, false),
       runtimeBudgetExhausted: asBoolean2(payload.runtimeBudgetExhausted, false),
       recommendation,
@@ -16957,6 +19462,10 @@ class AutonomyStore {
     const maxRegretRate = clamp012(asNumber(cfg.evaluatorMaxRegretRate, 0.35));
     const rawSampleCount = Math.max(0, Math.floor(asNumber(rows?.raw_sample_count, sampleCount)));
     const jobHealth = this.getAutonomyJobHealth(nowIso, windowHours);
+    const reviewHealth = this.getAutonomyReviewDeliveryHealth(nowIso, windowHours);
+    const reviewBacklogStalled = reviewHealth.awaitingReviewCount >= 2 && reviewHealth.oldestAwaitingReviewAgeMs >= 6 * 60 * 60 * 1000;
+    const reviewBacklogSeverelyStalled = reviewHealth.awaitingReviewCount >= 5 && reviewHealth.oldestAwaitingReviewAgeMs >= 24 * 60 * 60 * 1000;
+    const hasReviewEvidence = reviewHealth.resolvedCount >= minSamples;
     const reliability = this.getReliabilityMetrics(windowHours, nowIso);
     const infrastructureFailureRate = reliability.attemptsTotal > 0 ? (reliability.outcomeCounts.infrastructure_failed + reliability.outcomeCounts.environment_blocked) / reliability.attemptsTotal : null;
     const resourceBudget = this.resourceBudgetSnapshot(nowIso);
@@ -16965,11 +19474,13 @@ class AutonomyStore {
     let recommendation = "healthy";
     if (resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted) {
       recommendation = "pause";
+    } else if (reviewBacklogSeverelyStalled) {
+      recommendation = "pause";
     } else if (!hasOutcomeEvidence && !hasJobEvidence) {
       recommendation = "constrain";
-    } else if (hasOutcomeEvidence && (typeof successRate === "number" && successRate < minSuccessRate || typeof regretRate === "number" && regretRate > maxRegretRate) || hasJobEvidence && (typeof infrastructureFailureRate === "number" && infrastructureFailureRate >= 0.3 || typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.3)) {
+    } else if (hasOutcomeEvidence && (typeof successRate === "number" && successRate < minSuccessRate || typeof regretRate === "number" && regretRate > maxRegretRate) || hasJobEvidence && (typeof infrastructureFailureRate === "number" && infrastructureFailureRate >= 0.3 || typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.3) || hasReviewEvidence && typeof reviewHealth.revisionRate === "number" && reviewHealth.revisionRate >= Math.max(0.5, maxRegretRate)) {
       recommendation = "pause";
-    } else if (hasOutcomeEvidence && (typeof successRate === "number" && successRate < Math.min(1, Math.max(0.8, minSuccessRate + 0.08)) || typeof regretRate === "number" && regretRate > maxRegretRate * 0.8) || hasJobEvidence && (typeof reliability.attemptSuccessRate === "number" && reliability.attemptSuccessRate < 0.8 || typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.2) || jobHealth.repeatedFailureCount >= 2) {
+    } else if (hasOutcomeEvidence && (typeof successRate === "number" && successRate < Math.min(1, Math.max(0.8, minSuccessRate + 0.08)) || typeof regretRate === "number" && regretRate > maxRegretRate * 0.8) || hasJobEvidence && (typeof reliability.attemptSuccessRate === "number" && reliability.attemptSuccessRate < 0.8 || typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.2) || jobHealth.repeatedFailureCount >= 2 || reviewBacklogStalled || hasReviewEvidence && typeof reviewHealth.revisionRate === "number" && reviewHealth.revisionRate > maxRegretRate * 0.8) {
       recommendation = "constrain";
     }
     const evaluatorEvidenceKey = sha256Hex(JSON.stringify({
@@ -16982,6 +19493,12 @@ class AutonomyStore {
       jobSuccessRate: jobHealth.successRate,
       jobTimeoutRate: jobHealth.timeoutRate,
       repeatedFailureCount: jobHealth.repeatedFailureCount,
+      awaitingReviewCount: reviewHealth.awaitingReviewCount,
+      oldestAwaitingReviewAt: reviewHealth.oldestAwaitingReviewAt,
+      reviewBacklogStalled,
+      reviewBacklogSeverelyStalled,
+      reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewRevisionRate: reviewHealth.revisionRate,
       outcomeCounts: reliability.outcomeCounts,
       infrastructureFailureRate,
       latestJobTerminalAt: jobHealth.latestTerminalAt
@@ -17011,18 +19528,25 @@ class AutonomyStore {
       jobTimeoutRate: jobHealth.timeoutRate,
       activeRuntimeMs: jobHealth.activeRuntimeMs,
       repeatedFailureCount: jobHealth.repeatedFailureCount,
+      awaitingReviewCount: reviewHealth.awaitingReviewCount,
+      oldestAwaitingReviewAgeMs: reviewHealth.oldestAwaitingReviewAgeMs,
+      reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewMergedCount: reviewHealth.mergedCount,
+      reviewClosedUnmergedCount: reviewHealth.closedUnmergedCount,
+      reviewRevisionObjectiveCount: reviewHealth.revisionObjectiveCount,
+      reviewRevisionRate: reviewHealth.revisionRate,
       reliability,
       infrastructureFailureRate,
       tokenBudgetExhausted: resourceBudget.token_budget_exhausted,
       runtimeBudgetExhausted: resourceBudget.runtime_budget_exhausted,
       evaluatorEvidenceKey
     };
-    const id = `eval_${randomUUID5().slice(0, 8)}`;
+    const id = `eval_${randomUUID6().slice(0, 8)}`;
     this.db.prepare(`INSERT INTO autonomy_evaluator_scorecards (
           id, window_hours, sample_count, success_rate, regret_rate, avg_latency_ms, dispatch_count,
           recommendation, payload_json, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, windowHours, sampleCount, successRate, regretRate, avgLatencyMs, dispatchCount, recommendation, JSON.stringify(payload), nowIso);
-    if (recommendation === "pause" && (hasOutcomeEvidence || hasJobEvidence || resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted)) {
+    if (recommendation === "pause" && (hasOutcomeEvidence || hasJobEvidence || reviewBacklogSeverelyStalled || hasReviewEvidence || resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted)) {
       this.recordOpsAlert({
         alertType: "evaluator_pause",
         severity: "critical",
@@ -17044,7 +19568,7 @@ class AutonomyStore {
         nowIso
       });
       this.resolveOpsAlert("evaluator_constrain", nowIso);
-    } else if (recommendation === "constrain" && (hasOutcomeEvidence || hasJobEvidence)) {
+    } else if (recommendation === "constrain" && (hasOutcomeEvidence || hasJobEvidence || reviewBacklogStalled || hasReviewEvidence)) {
       this.recordOpsAlert({
         alertType: "evaluator_constrain",
         severity: "warning",
@@ -17078,6 +19602,10 @@ class AutonomyStore {
       jobTimeoutRate: jobHealth.timeoutRate,
       activeRuntimeMs: jobHealth.activeRuntimeMs,
       repeatedFailureCount: jobHealth.repeatedFailureCount,
+      awaitingReviewCount: reviewHealth.awaitingReviewCount,
+      oldestAwaitingReviewAgeMs: reviewHealth.oldestAwaitingReviewAgeMs,
+      reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewRevisionRate: reviewHealth.revisionRate,
       tokenBudgetExhausted: resourceBudget.token_budget_exhausted,
       runtimeBudgetExhausted: resourceBudget.runtime_budget_exhausted,
       recommendation,
@@ -17133,7 +19661,7 @@ class AutonomyStore {
              AND status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`).run(nowIso, row.id);
       this.db.prepare(`INSERT INTO autonomy_dead_letters (
             id, objective_id, previous_status, reason, details_json, created_at
-          ) VALUES (?, ?, ?, 'stale_objective_timeout', ?, ?)`).run(`dl_${randomUUID5().slice(0, 10)}`, row.id, asString3(row.status) || "unknown", JSON.stringify({
+          ) VALUES (?, ?, ?, 'stale_objective_timeout', ?, ?)`).run(`dl_${randomUUID6().slice(0, 10)}`, row.id, asString3(row.status) || "unknown", JSON.stringify({
         staleByMs: Math.max(0, nowMs - updatedAtMs),
         staleObjectiveTtlMs: ttlMs
       }), nowIso);
@@ -17456,7 +19984,7 @@ ${attempt}`);
     this.db.prepare(`INSERT OR REPLACE INTO llm_usage_events (
           id, service, session_id, backend, model_id, prompt_tokens, completion_tokens,
           total_tokens, estimated, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(asString3(body.id) || randomUUID5(), service, sessionId || null, asString3(body.backend) || null, asString3(body.modelId ?? body.model_id) || null, promptTokens, completionTokens, totalTokens, asBoolean2(body.estimated, false) ? 1 : 0, asIsoNow());
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(asString3(body.id) || randomUUID6(), service, sessionId || null, asString3(body.backend) || null, asString3(body.modelId ?? body.model_id) || null, promptTokens, completionTokens, totalTokens, asBoolean2(body.estimated, false) ? 1 : 0, asIsoNow());
     const sessionBudget = sessionId && sessionBudgetLimit > 0 ? this.getSessionTokenBudgetStatus(sessionId, sessionBudgetLimit, sessionBudgetAction) : null;
     return {
       ok: true,
@@ -17950,7 +20478,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       prFeedbackRows = [];
     }
     if (prFeedbackRows.length > 0) {
-      const negativeRows = prFeedbackRows.filter((row) => isNegativePrFeedbackVerdict(asString3(row.verdict)));
+      const negativeRows = prFeedbackRows.filter((row) => isNegativePrFeedbackSignal(asString3(row.verdict)));
       if (negativeRows.length > 0) {
         const totalComments = negativeRows.reduce((sum, row) => sum + Math.max(0, Math.floor(asNumber(row.comment_count, 0))), 0);
         const negativeRatio = negativeRows.length / Math.max(1, prFeedbackRows.length);
@@ -18163,7 +20691,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         evidence: `dispatch usage ${params.dispatchBudget.globalCount}/${globalLimit} in last hour`
       });
     }
-    const activeCount = params.openObjectives.length;
+    const activeCount = params.openObjectives.filter((objective) => asString3(objective.status).toLowerCase() !== "awaiting_review").length;
     const concurrentLimit = Math.max(1, this.config.remotebuddy.autonomy.maxConcurrentObjectives);
     const activePressure = clamp012(activeCount / concurrentLimit);
     if (activePressure >= 1) {
@@ -18568,7 +21096,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     this.maybeSweepStaleObjectives(now);
     const evaluatorCard = this.maybeRunEvaluator(now);
     const safetyState = this.getSafetyState(now);
-    const snapshotId = `snap_${Date.now()}_${randomUUID5().slice(0, 8)}`;
+    const snapshotId = `snap_${Date.now()}_${randomUUID6().slice(0, 8)}`;
     const ttlMs = this.config.remotebuddy.autonomy.tickIntervalMs * 2;
     const executionHealth = this.recentExecutionHealthSummary();
     const validationIncident = this.detectActiveValidationIncident(now);
@@ -18617,16 +21145,19 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
            ORDER BY datetime(latest_validation.createdAt) DESC, latest_validation.id DESC
            LIMIT 1
          )` : "";
-    const openObjectiveRows = this.db.prepare(`SELECT o.id AS objective_id, o.status, o.objective_type, o.component_area,
+    const openObjectiveRows = this.db.prepare(`SELECT o.id AS objective_id, o.title, o.status, o.objective_type, o.component_area,
                 o.pattern_key, o.incident_key, o.job_id, o.scope_json, o.updated_at,
+                o.evidence_json,
                 ${objectiveJobProjection},
                 ${objectiveValidationProjection}
          FROM autonomy_objectives o
          ${objectiveJobJoins}
          ${objectiveValidationJoins}
-         WHERE o.status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
-         ORDER BY o.updated_at DESC
-         LIMIT 50`).all();
+         WHERE o.status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')
+         ORDER BY CASE WHEN o.status = 'awaiting_review' THEN 1 ELSE 0 END ASC,
+                  datetime(o.updated_at) DESC,
+                  o.id DESC
+         LIMIT 200`).all();
     const hydrateObjective = (row) => {
       const scopeRecord = parseJsonObject(row.scope_json);
       const targetPaths = asStringArray3(scopeRecord.targetPaths ?? scopeRecord.target_paths);
@@ -18650,6 +21181,8 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       }).fingerprint : null;
       return {
         objective_id: row.objective_id,
+        title: row.title,
+        vision_objective_id: asString3(asObject2(parseJsonObject(row.evidence_json).portfolio).vision_objective_id) || null,
         status: row.status,
         objective_type: row.objective_type,
         component_area: row.component_area,
@@ -18669,14 +21202,15 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       };
     };
     const openObjectives = openObjectiveRows.map(hydrateObjective);
-    const recentObjectiveRows = this.db.prepare(`SELECT o.id AS objective_id, o.status, o.objective_type, o.component_area,
+    const recentObjectiveRows = this.db.prepare(`SELECT o.id AS objective_id, o.title, o.status, o.objective_type, o.component_area,
                 o.pattern_key, o.incident_key, o.job_id, o.scope_json, o.updated_at,
+                o.evidence_json,
                 ${objectiveJobProjection},
                 ${objectiveValidationProjection}
          FROM autonomy_objectives o
          ${objectiveJobJoins}
          ${objectiveValidationJoins}
-         WHERE o.status NOT IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
+         WHERE o.status NOT IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')
            AND o.updated_at >= ?
          ORDER BY o.updated_at DESC
          LIMIT 100`).all(new Date(Date.parse(now) - 24 * 60 * 60000).toISOString());
@@ -18838,6 +21372,30 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const liveIncident = this.detectActiveValidationIncident(asIsoNow());
     return Boolean(snapshotIncidentId && liveIncident?.active && liveIncident.incident_id === snapshotIncidentId);
   }
+  authorizesValidationIncidentRepair(params) {
+    const objectiveId = asString3(params.objectiveId);
+    const incidentId = asString3(params.incidentId);
+    if (!objectiveId || !incidentId)
+      return false;
+    const row = this.db.prepare(`SELECT snapshot_id, evidence_json
+         FROM autonomy_objectives
+         WHERE id = ?
+           AND source = 'autonomous'
+           AND incident_key = ?
+           AND status IN ('gated','dispatched','running','blocked','needs_clarification')
+         LIMIT 1`).get(objectiveId, incidentId);
+    if (!row)
+      return false;
+    const snapshotId = asString3(row.snapshot_id);
+    if (asString3(params.snapshotId) && asString3(params.snapshotId) !== snapshotId)
+      return false;
+    const evidence = parseJsonObject(row.evidence_json);
+    const incidentEvidence = asObject2(evidence.validation_incident ?? evidence.validationIncident);
+    const evidenceIncidentId = asString3(incidentEvidence.incident_id ?? incidentEvidence.incidentId);
+    if (evidenceIncidentId !== incidentId)
+      return false;
+    return this.snapshotAuthorizesRequiredValidationRepair(snapshotId);
+  }
   evaluateEligibility(body) {
     const runId = asString3(body.runId);
     const snapshotId = asString3(body.snapshotId);
@@ -18860,18 +21418,18 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const requiredValidationRepairAuthorized = this.snapshotAuthorizesRequiredValidationRepair(snapshotId);
     const activePatternRows = this.db.prepare(`SELECT DISTINCT pattern_key AS patternKey
          FROM autonomy_objectives
-         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`).all();
+         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')`).all();
     const activePatternKeys = new Set(activePatternRows.map((row) => asString3(row.patternKey)).filter(Boolean));
     const activeTargetRows = this.db.prepare(`SELECT scope_json AS scopeJson
          FROM autonomy_objectives
-         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`).all();
+         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')`).all();
     const activeTargetPaths = activeTargetRows.flatMap((row) => {
       const scope = parseJsonObject(row.scopeJson);
       return asStringArray3(scope.targetPaths ?? scope.target_paths).map(normalizeObjectiveTargetPath).filter(Boolean);
     });
     const results = candidates.map((raw) => {
       const record = asObject2(raw);
-      const candidateId = asString3(record.id ?? record.candidateId ?? record.candidate_id) || randomUUID5();
+      const candidateId = asString3(record.id ?? record.candidateId ?? record.candidate_id) || randomUUID6();
       const objectiveTypeRaw = asString3(record.objectiveType ?? record.objective_type);
       const objectiveType = asObjectiveType(objectiveTypeRaw);
       if (!objectiveType) {
@@ -18992,6 +21550,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     }
     const candidates = Array.isArray(body.candidates) ? body.candidates : [];
     const candidateEngineTrialMetaById = new Map;
+    const candidatePortfolioMetaById = new Map;
     for (const raw of candidates) {
       const record = asObject2(raw);
       const objectiveTypeRaw2 = asString3(record.objectiveType ?? record.objective_type);
@@ -19046,14 +21605,29 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       const objectiveTypePersist = (objectiveType2 ?? objectiveTypeRaw2) || "invalid";
       const triggerTypePersist = (triggerType2 ?? triggerTypeRaw2) || "invalid";
       const componentAreaPersist = scopeValidation2.componentArea ?? componentAreaRaw2 ?? "invalid";
-      const candidateExternalId = asString3(record.id) || randomUUID5();
+      const candidateExternalId = asString3(record.id) || randomUUID6();
       const candidateStorageId = scopedCandidateStorageId(runId, candidateExternalId);
       const engineTrialMeta = extractEngineTrialCandidateMeta(record);
       if (engineTrialMeta) {
         candidateEngineTrialMetaById.set(candidateStorageId, engineTrialMeta);
       }
+      const portfolioMeta = {
+        work_kind: asString3(record.work_kind ?? record.workKind) || null,
+        work_area_key: asString3(record.work_area_key ?? record.workAreaKey) || null,
+        work_target_key: asString3(record.work_target_key ?? record.workTargetKey) || null,
+        vision_objective_id: asString3(record.vision_objective_id ?? record.visionObjectiveId) || null,
+        vision_objective_weight: Number.isFinite(asNumber(record.vision_objective_weight ?? record.visionObjectiveWeight, Number.NaN)) ? clamp012(asNumber(record.vision_objective_weight ?? record.visionObjectiveWeight, 0)) : null,
+        vision_priority_rank: Number.isFinite(asNumber(record.vision_priority_rank ?? record.visionPriorityRank, Number.NaN)) ? Math.max(1, Math.floor(asNumber(record.vision_priority_rank ?? record.visionPriorityRank, 1))) : null,
+        vision_source_bucket: asString3(record.vision_source_bucket ?? record.visionSourceBucket) || null,
+        vision_category: asString3(record.vision_category ?? record.visionCategory) || null,
+        vision_alignment_reason: asString3(record.vision_alignment_reason ?? record.visionAlignmentReason) || null,
+        vision_section_refs: asStringArray3(record.vision_section_refs ?? record.visionSectionRefs),
+        feature_hypotheses: asStringArray3(record.feature_hypotheses ?? record.featureHypotheses).slice(0, 24)
+      };
+      candidatePortfolioMetaById.set(candidateStorageId, portfolioMeta);
       const debugRecord = {
         ...asObject2(record.debug),
+        ...portfolioMeta,
         candidate_external_id: candidateExternalId
       };
       this.db.prepare(`INSERT OR REPLACE INTO autonomy_candidates (
@@ -19074,14 +21648,14 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
             id, run_id, snapshot_id, objective_id, phase, prompt_template_version, prompt_hash,
             request_payload_hash, model_id, temperature, timeout_ms, response_json, response_hash,
             token_usage_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(asString3(call.id) || randomUUID5(), runId, snapshotId, asString3(call.objectiveId ?? call.objective_id) || null, asString3(call.phase), asString3(call.promptTemplateVersion ?? call.prompt_template_version) || null, asString3(call.promptHash ?? call.prompt_hash) || null, asString3(call.requestPayloadHash ?? call.request_payload_hash) || null, asString3(call.modelId ?? call.model_id) || null, Number.isFinite(asNumber(call.temperature, Number.NaN)) ? asNumber(call.temperature, 0) : null, Number.isFinite(asNumber(call.timeoutMs ?? call.timeout_ms, Number.NaN)) ? Math.floor(asNumber(call.timeoutMs ?? call.timeout_ms, 0)) : null, this.llmResponseJsonForStorage(call), asString3(call.responseHash ?? call.response_hash) || null, JSON.stringify(asObject2(call.tokenUsage ?? call.token_usage)), asIsoNow());
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(asString3(call.id) || randomUUID6(), runId, snapshotId, asString3(call.objectiveId ?? call.objective_id) || null, asString3(call.phase), asString3(call.promptTemplateVersion ?? call.prompt_template_version) || null, asString3(call.promptHash ?? call.prompt_hash) || null, asString3(call.requestPayloadHash ?? call.request_payload_hash) || null, asString3(call.modelId ?? call.model_id) || null, Number.isFinite(asNumber(call.temperature, Number.NaN)) ? asNumber(call.temperature, 0) : null, Number.isFinite(asNumber(call.timeoutMs ?? call.timeout_ms, Number.NaN)) ? Math.floor(asNumber(call.timeoutMs ?? call.timeout_ms, 0)) : null, this.llmResponseJsonForStorage(call), asString3(call.responseHash ?? call.response_hash) || null, JSON.stringify(asObject2(call.tokenUsage ?? call.token_usage)), asIsoNow());
     }
     if (llmCalls.length > 0)
       this.enforceReplayRetention();
     const objective = asObject2(body.objective);
     if (Object.keys(objective).length === 0)
       return { ok: true };
-    const objectiveId = asString3(objective.id) || randomUUID5();
+    const objectiveId = asString3(objective.id) || randomUUID6();
     const objectiveTypeRaw = asString3(objective.objectiveType ?? objective.objective_type);
     const objectiveType = asObjectiveType(objectiveTypeRaw);
     const now = asIsoNow();
@@ -19119,16 +21693,29 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     if (pushpalsInternalErr) {
       return { ok: false, objectiveId, reason: pushpalsInternalErr };
     }
+    const objectiveCandidateRaw = asString3(objective.candidateId ?? objective.candidate_id);
+    const objectiveCandidateId = objectiveCandidateRaw ? scopedCandidateStorageId(runId, objectiveCandidateRaw) : null;
     const patternKey = makePatternKey(objectiveType, scopeValidation.normalizedTargetPaths, triggerType, normalizedComponentArea);
-    const objectiveEvidence = asObject2(objective.evidence);
+    const objectiveEvidence = {
+      ...asObject2(objective.evidence),
+      ...objectiveCandidateId && candidatePortfolioMetaById.has(objectiveCandidateId) ? { portfolio: candidatePortfolioMetaById.get(objectiveCandidateId) } : {}
+    };
     const validationIncidentEvidence = asObject2(objectiveEvidence.validation_incident ?? objectiveEvidence.validationIncident);
     const incidentKey = asString3(objective.incidentKey ?? objective.incident_key ?? validationIncidentEvidence.incident_id ?? validationIncidentEvidence.incidentId ?? validationIncidentEvidence.failure_fingerprint ?? validationIncidentEvidence.failureFingerprint).slice(0, 256);
-    if (incidentKey && ["proposed", "gated", "dispatched", "running", "blocked", "needs_clarification"].includes(objectiveStatus)) {
+    if (incidentKey && [
+      "proposed",
+      "gated",
+      "dispatched",
+      "running",
+      "blocked",
+      "needs_clarification",
+      "awaiting_review"
+    ].includes(objectiveStatus)) {
       const existing = this.db.prepare(`SELECT id
            FROM autonomy_objectives
            WHERE incident_key = ?
              AND id != ?
-             AND status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
+             AND status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')
            ORDER BY updated_at DESC
            LIMIT 1`).get(incidentKey, objectiveId);
       if (existing?.id) {
@@ -19140,8 +21727,6 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         };
       }
     }
-    const objectiveCandidateRaw = asString3(objective.candidateId ?? objective.candidate_id);
-    const objectiveCandidateId = objectiveCandidateRaw ? scopedCandidateStorageId(runId, objectiveCandidateRaw) : null;
     if (objectiveStatus === "gated" || objectiveStatus === "dispatched") {
       const requiredValidationRepair = asBoolean2(objective.requiredValidationRepair ?? objective.required_validation_repair ?? asObject2(body.candidate).requiredValidationRepair ?? asObject2(body.candidate).required_validation_repair ?? body.requiredValidationRepair ?? body.required_validation_repair, false);
       const overrideCooldown = asBoolean2(objective.overrideCooldown ?? objective.override_cooldown ?? body.overrideCooldown ?? body.override_cooldown, false);
@@ -19189,6 +21774,46 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       writeGlobs: scopeValidation.normalizedWriteGlobs,
       targetPaths: scopeValidation.normalizedTargetPaths
     }), JSON.stringify(objectiveEvidence), JSON.stringify(asObject2(objective.scoreBreakdown ?? objective.score_breakdown)), asString3(objective.policyVersion ?? objective.policy_version) || this.config.remotebuddy.autonomy.policyVersion, asString3(objective.impactModelVersion ?? objective.impact_model_version) || this.config.remotebuddy.autonomy.impactModelVersion, objectiveStatus === "dispatched" ? now : null, now, now);
+    const hasRepositoryAgentAttribution = Object.prototype.hasOwnProperty.call(body, "repositoryAgentMemory") || Object.prototype.hasOwnProperty.call(body, "repository_agent_memory");
+    const repositoryAgentMemory = asObject2(body.repositoryAgentMemory ?? body.repository_agent_memory);
+    const repositoryAgentRequestId = asString3(repositoryAgentMemory.requestId ?? repositoryAgentMemory.request_id).slice(0, 256);
+    let repositoryAgentLink;
+    if (repositoryAgentRequestId && this.hasTable("repository_agent_requests")) {
+      const authoritative = this.db.prepare(`SELECT sessionId, callerService, repositoryId, revision, treeHash,
+                  requestJson, resultJson
+           FROM repository_agent_requests
+           WHERE id = ? AND status = 'completed'
+           LIMIT 1`).get(repositoryAgentRequestId);
+      if (authoritative && asString3(authoritative.sessionId) === sessionId && asString3(authoritative.callerService) === "remotebuddy" && authoritative.resultJson) {
+        try {
+          const request = sanitizeRepositoryAgentRequest(JSON.parse(authoritative.requestJson));
+          const result = sanitizeRepositoryAgentResult(JSON.parse(authoritative.resultJson), repositoryAgentRequestId);
+          const repositoryId = asString3(authoritative.repositoryId).slice(0, 512);
+          const memoryRefs = asRepositoryAgentMemoryRefs(result.memoryRefs).filter((ref) => ref.key);
+          if (repositoryId && request.caller.service === "remotebuddy" && request.caller.sessionId === sessionId && request.caller.correlationId === runId && request.purpose === "priority" && request.repository.identity === repositoryId && request.repository.revision === asString3(authoritative.revision) && request.repository.tree === asString3(authoritative.treeHash) && result.analyzedRepository.identity === repositoryId && result.analyzedRepository.revision === request.repository.revision && result.analyzedRepository.tree === request.repository.tree && memoryRefs.length > 0) {
+            repositoryAgentLink = { repositoryId, memoryRefs };
+          }
+        } catch {}
+      }
+    }
+    if (repositoryAgentLink) {
+      this.db.prepare(`INSERT INTO autonomy_repository_agent_memory_links (
+             objective_id, repository_id, repository_agent_request_id,
+             memory_refs_json, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(objective_id) DO UPDATE SET
+             repository_id = excluded.repository_id,
+             repository_agent_request_id = excluded.repository_agent_request_id,
+             memory_refs_json = excluded.memory_refs_json,
+             updated_at = excluded.updated_at`).run(objectiveId, repositoryAgentLink.repositoryId, repositoryAgentRequestId, JSON.stringify(repositoryAgentLink.memoryRefs), now, now);
+    } else if (hasRepositoryAgentAttribution) {
+      this.db.prepare(`DELETE FROM autonomy_repository_agent_memory_links WHERE objective_id = ?`).run(objectiveId);
+    }
+    if (objectiveStatus === "awaiting_review") {
+      this.db.prepare(`UPDATE autonomy_objectives
+           SET awaiting_review_since = COALESCE(awaiting_review_since, ?)
+           WHERE id = ?`).run(now, objectiveId);
+    }
     const trialMeta = (objectiveCandidateId ? candidateEngineTrialMetaById.get(objectiveCandidateId) : undefined) ?? null;
     if (trialMeta) {
       const trialId = `trial_${objectiveId}`;
@@ -19204,7 +21829,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     let questionId;
     const question = asObject2(body.question);
     if (Object.keys(question).length > 0) {
-      questionId = asString3(question.id) || randomUUID5();
+      questionId = asString3(question.id) || randomUUID6();
       this.db.prepare(`INSERT OR REPLACE INTO questions_queue (
             id, objective_id, session_id, question, question_type, expected_answer_schema_json,
             context_json, status, answer_json, answer_validation_status, validation_error, created_at,
@@ -19301,17 +21926,141 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const requestIdRaw = asString3(body.requestId ?? body.request_id) || null;
     const jobIdRaw = asString3(body.jobId ?? body.job_id) || null;
     const prUrl = asString3(body.prUrl ?? body.pr_url) || null;
+    const normalizedFeedbackPrUrl = normalizePrUrl2(prUrl);
+    const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
+    const hasJobsTable = this.hasTable("jobs");
+    if (mappedOutcome?.terminal && hasJobsTable && (!jobIdRaw || !normalizedFeedbackPrUrl)) {
+      return {
+        ok: true,
+        ignored: true,
+        reason: "terminal PR feedback requires matching jobId and prUrl authority"
+      };
+    }
+    let persistedJobPrUrl = null;
+    if (jobIdRaw && normalizedFeedbackPrUrl && hasJobsTable) {
+      const providerJob = this.db.prepare(`SELECT prUrl FROM jobs WHERE id = ? LIMIT 1`).get(jobIdRaw);
+      if (!providerJob) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "PR feedback jobId does not identify a persisted job"
+        };
+      }
+      persistedJobPrUrl = normalizePrUrl2(providerJob.prUrl);
+      if (persistedJobPrUrl && persistedJobPrUrl !== normalizedFeedbackPrUrl) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "PR feedback URL does not match the persisted job PR URL"
+        };
+      }
+      if (mappedOutcome?.terminal && !persistedJobPrUrl) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "terminal PR feedback requires a persisted job-to-PR link"
+        };
+      }
+      if (mappedOutcome?.terminal && !mappedOutcome.success) {
+        const latestJob = this.db.prepare(`SELECT id
+             FROM jobs
+             WHERE prUrlNormalized = ?
+             ORDER BY rowid DESC
+             LIMIT 1`).get(normalizedFeedbackPrUrl);
+        if (!latestJob || latestJob.id !== jobIdRaw) {
+          return {
+            ok: true,
+            ignored: true,
+            acknowledged: true,
+            reason: "closed PR feedback belongs to an older job generation"
+          };
+        }
+      }
+    }
     let patternKey = asString3(body.patternKey ?? body.pattern_key) || null;
-    const resolved = this.resolvePatternContext({
+    const resolvedFromJob = jobIdRaw ? this.resolvePatternContext({ jobId: jobIdRaw }) : null;
+    const resolved = resolvedFromJob ?? this.resolvePatternContext({
       objectiveId: objectiveIdRaw,
       requestId: requestIdRaw,
-      jobId: jobIdRaw,
       prUrl
     });
+    const identityMismatch = objectiveIdRaw && resolvedFromJob?.objectiveId && objectiveIdRaw !== resolvedFromJob.objectiveId || requestIdRaw && resolvedFromJob?.requestId && requestIdRaw !== resolvedFromJob.requestId || patternKey && resolvedFromJob?.patternKey && patternKey !== resolvedFromJob.patternKey;
+    if (identityMismatch) {
+      return {
+        ok: true,
+        ignored: true,
+        reason: "PR feedback identifiers do not match the persisted job context"
+      };
+    }
     if (!patternKey) {
       patternKey = asString3(resolved?.patternKey) || null;
     }
+    const persistProviderOutcome = (jobId2) => {
+      if (!normalizedFeedbackPrUrl || !persistedJobPrUrl || !mappedOutcome?.terminal)
+        return;
+      const providerStateAt = normalizeProviderStateTimestamp(body.providerStateAt ?? body.provider_state_at, now);
+      if (!mappedOutcome.success) {
+        const latestJob = this.db.prepare(`SELECT id
+             FROM jobs
+             WHERE prUrlNormalized = ?
+             ORDER BY rowid DESC
+             LIMIT 1`).get(normalizedFeedbackPrUrl);
+        if (!jobId2 || latestJob?.id !== jobId2)
+          return;
+      }
+      const existingProviderOutcome = this.db.prepare(`SELECT jobId, verdict, merged, providerStateAt
+           FROM pr_provider_outcomes
+           WHERE normalizedPrUrl = ?
+           LIMIT 1`).get(normalizedFeedbackPrUrl);
+      if (Number(existingProviderOutcome?.merged) === 1)
+        return;
+      if (!mappedOutcome.success && existingProviderOutcome) {
+        const existingStateMs = Date.parse(asString3(existingProviderOutcome.providerStateAt));
+        const incomingStateMs = Date.parse(providerStateAt);
+        if (Number.isFinite(existingStateMs) && existingStateMs > incomingStateMs)
+          return;
+        if (existingProviderOutcome.jobId === jobId2 && asString3(existingProviderOutcome.verdict).toLowerCase() === verdict && Number.isFinite(existingStateMs) && existingStateMs === incomingStateMs) {
+          return;
+        }
+      }
+      this.db.prepare(`INSERT INTO pr_provider_outcomes (
+             normalizedPrUrl, prUrl, jobId, verdict, terminal, merged,
+             providerStateAt, createdAt, updatedAt
+           ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+           ON CONFLICT(normalizedPrUrl) DO UPDATE SET
+             prUrl = excluded.prUrl,
+             jobId = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.jobId
+               ELSE excluded.jobId
+             END,
+             verdict = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.verdict
+               ELSE excluded.verdict
+             END,
+             terminal = MAX(pr_provider_outcomes.terminal, excluded.terminal),
+             merged = MAX(pr_provider_outcomes.merged, excluded.merged),
+             providerStateAt = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.providerStateAt
+               ELSE excluded.providerStateAt
+             END,
+             updatedAt = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.updatedAt
+               WHEN pr_provider_outcomes.jobId IS excluded.jobId
+                 AND pr_provider_outcomes.verdict = excluded.verdict
+               THEN pr_provider_outcomes.updatedAt
+               ELSE excluded.updatedAt
+             END`).run(normalizedFeedbackPrUrl, prUrl, jobId2, verdict, mappedOutcome.success ? 1 : 0, providerStateAt, now, now);
+    };
     if (!patternKey) {
+      if (mappedOutcome?.terminal && persistedJobPrUrl) {
+        persistProviderOutcome(jobIdRaw);
+        return {
+          ok: true,
+          ignored: true,
+          acknowledged: true,
+          reason: "provider outcome recorded for a non-autonomy job"
+        };
+      }
       return {
         ok: true,
         ignored: true,
@@ -19346,24 +22095,95 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const commentCount = Math.max(payloadCommentCount, comments.length);
     const insertInfo = this.db.prepare(`INSERT OR IGNORE INTO autonomy_pr_feedback (
           feedback_key, objective_id, request_id, job_id, pattern_key, pr_number, pr_url,
-          verdict, review_score, review_threshold, summary, comment_count, comments_json, source, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(feedbackKey, objectiveId, requestId, jobId, patternKey, prNumber, prUrl, verdict, reviewScore, reviewThreshold, summary || null, commentCount, comments.length > 0 ? JSON.stringify(comments) : null, source, now);
+          pr_url_normalized, verdict, review_score, review_threshold, summary, comment_count,
+          comments_json, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(feedbackKey, objectiveId, requestId, jobId, patternKey, prNumber, prUrl, normalizedFeedbackPrUrl, verdict, reviewScore, reviewThreshold, summary || null, commentCount, comments.length > 0 ? JSON.stringify(comments) : null, source, now);
     const inserted = Number(insertInfo.changes ?? 0) > 0;
     if (!inserted) {
+      const existingFeedback = feedbackKey ? this.db.prepare(`SELECT objective_id, request_id, job_id, pattern_key, pr_url_normalized, verdict
+               FROM autonomy_pr_feedback
+               WHERE feedback_key = ?
+               LIMIT 1`).get(feedbackKey) : undefined;
+      const sameEvent = existingFeedback && (asString3(existingFeedback.objective_id) || null) === objectiveId && (asString3(existingFeedback.request_id) || null) === requestId && (asString3(existingFeedback.job_id) || null) === jobId && asString3(existingFeedback.pattern_key) === patternKey && (asString3(existingFeedback.pr_url_normalized) || null) === normalizedFeedbackPrUrl && asString3(existingFeedback.verdict).toLowerCase() === verdict;
+      if (!sameEvent) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "feedbackKey already belongs to a different PR feedback event"
+        };
+      }
+    }
+    const markAwaitingReview = () => {
+      if (!objectiveId)
+        return;
+      this.db.prepare(`UPDATE autonomy_objectives
+           SET status = 'awaiting_review',
+               awaiting_review_since = COALESCE(awaiting_review_since, ?),
+               updated_at = ?
+           WHERE id = ?
+             AND status NOT IN ('failed','dead_letter')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM autonomy_outcomes final_outcome
+               WHERE final_outcome.objective_id = autonomy_objectives.id
+                 AND final_outcome.terminal = 1
+                 AND final_outcome.success = 1
+                 AND LOWER(COALESCE(final_outcome.user_action, '')) = 'accepted'
+             )`).run(now, now, objectiveId);
+    };
+    if (!mappedOutcome) {
+      markAwaitingReview();
       return {
         ok: true,
-        deduped: true,
+        ...!inserted ? { deduped: true } : {},
         patternKey,
         ...objectiveId ? { objectiveId } : {}
       };
     }
-    const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
-    if (!mappedOutcome) {
-      return {
-        ok: true,
-        patternKey,
-        ...objectiveId ? { objectiveId } : {}
-      };
+    if (!inserted) {
+      const projectedOutcome = this.db.prepare(`SELECT 1
+           FROM autonomy_outcomes
+           WHERE pattern_key = ?
+             AND success = ?
+             AND terminal = ?
+             AND LOWER(COALESCE(user_action, '')) = ?
+             AND (? IS NULL OR objective_id = ?)
+             AND (? IS NULL OR job_id = ?)
+           LIMIT 1`).get(patternKey, mappedOutcome.success ? 1 : 0, mappedOutcome.terminal ? 1 : 0, mappedOutcome.userAction.toLowerCase(), objectiveId, objectiveId, jobId, jobId);
+      if (projectedOutcome) {
+        if (mappedOutcome.terminal)
+          persistProviderOutcome(jobId);
+        return {
+          ok: true,
+          deduped: true,
+          patternKey,
+          ...objectiveId ? { objectiveId } : {},
+          success: mappedOutcome.success,
+          userAction: mappedOutcome.userAction
+        };
+      }
+    }
+    if (!mappedOutcome.terminal) {
+      markAwaitingReview();
+    } else if (objectiveId) {
+      const acceptedOutcome = this.db.prepare(`SELECT 1
+           FROM autonomy_outcomes
+           WHERE objective_id = ?
+             AND terminal = 1
+             AND success = 1
+             AND LOWER(COALESCE(user_action, '')) = 'accepted'
+           LIMIT 1`).get(objectiveId);
+      if (acceptedOutcome) {
+        persistProviderOutcome(jobId);
+        return {
+          ok: true,
+          ...!inserted ? { deduped: true } : {},
+          patternKey,
+          objectiveId,
+          success: true,
+          userAction: "accepted"
+        };
+      }
     }
     const outcome = this.recordOutcome({
       objectiveId,
@@ -19384,8 +22204,11 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         reason: outcome.reason
       };
     }
+    if (mappedOutcome.terminal)
+      persistProviderOutcome(jobId);
     return {
       ok: true,
+      ...!inserted ? { deduped: true } : {},
       patternKey,
       ...objectiveId ? { objectiveId } : {},
       success: mappedOutcome.success,
@@ -19393,6 +22216,9 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     };
   }
   recordOutcome(body) {
+    return this.db.transaction(() => this.recordOutcomeMutation(body))();
+  }
+  recordOutcomeMutation(body) {
     let patternKey = asString3(body.patternKey ?? body.pattern_key);
     const objectiveIdRaw = asString3(body.objectiveId ?? body.objective_id) || null;
     const requestIdRaw = asString3(body.requestId ?? body.request_id) || null;
@@ -19897,6 +22723,76 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
          WHERE src.curation_status = 'archived'
          ORDER BY src.updated_at DESC, src.sample_count DESC
          LIMIT ?`).all(limit);
+    const portfolioWindowHours = 24;
+    const portfolioObjectiveRows = this.db.prepare(`SELECT id, status, evidence_json, updated_at
+         FROM autonomy_objectives
+         WHERE source = 'autonomous'
+           AND datetime(created_at) >= datetime(?, '-${portfolioWindowHours} hours')`).all(now);
+    const portfolioFeedbackRows = this.db.prepare(`SELECT feedback.objective_id, feedback.verdict, feedback.created_at
+         FROM autonomy_pr_feedback feedback
+         JOIN autonomy_objectives objective ON objective.id = feedback.objective_id
+         WHERE objective.source = 'autonomous'
+           AND datetime(objective.created_at) >= datetime(?, '-${portfolioWindowHours} hours')
+         ORDER BY datetime(feedback.created_at) ASC, feedback.id ASC`).all(now);
+    const portfolioOutcomeRows = this.db.prepare(`SELECT outcome.objective_id, outcome.success, outcome.user_action, outcome.created_at
+         FROM autonomy_outcomes outcome
+         JOIN autonomy_objectives objective ON objective.id = outcome.objective_id
+         WHERE objective.source = 'autonomous'
+           AND outcome.terminal = 1
+           AND datetime(objective.created_at) >= datetime(?, '-${portfolioWindowHours} hours')
+         ORDER BY datetime(outcome.created_at) ASC, outcome.id ASC`).all(now);
+    const visionObjectiveIds = new Set;
+    let visionAlignedObjectiveCount = 0;
+    let userObservableObjectiveCount = 0;
+    for (const row of portfolioObjectiveRows) {
+      const portfolio2 = asObject2(parseJsonObject(row.evidence_json).portfolio);
+      const visionObjectiveId = asString3(portfolio2.vision_objective_id);
+      if (visionObjectiveId) {
+        visionAlignedObjectiveCount += 1;
+        visionObjectiveIds.add(visionObjectiveId);
+      }
+      const category = asString3(portfolio2.vision_category);
+      if (["product_core", "user_experience", "onboarding", "growth", "content"].includes(category)) {
+        userObservableObjectiveCount += 1;
+      }
+    }
+    const revisionCountByObjective = new Map;
+    const closedObjectiveIds = new Set;
+    for (const row of portfolioFeedbackRows) {
+      const objectiveId2 = asString3(row.objective_id);
+      if (!objectiveId2)
+        continue;
+      const verdict = asString3(row.verdict).toLowerCase();
+      if (verdict.includes("reject") || verdict.includes("unmergeable") || verdict.includes("merge_conflict") || verdict.includes("changes_requested") || verdict.includes("revision")) {
+        revisionCountByObjective.set(objectiveId2, (revisionCountByObjective.get(objectiveId2) ?? 0) + 1);
+      }
+      const mapped = deriveOutcomeFromPrFeedbackVerdict(verdict);
+      if (mapped?.terminal && !mapped.success)
+        closedObjectiveIds.add(objectiveId2);
+    }
+    const acceptedObjectiveIds = new Set(portfolioOutcomeRows.filter((row) => asNumber(row.success, 0) === 1 && asString3(row.user_action).toLowerCase() === "accepted").map((row) => asString3(row.objective_id)).filter(Boolean));
+    const mergedObjectiveIds = [...acceptedObjectiveIds];
+    const closedUnmergedObjectiveCount = [...closedObjectiveIds].filter((objectiveId2) => !acceptedObjectiveIds.has(objectiveId2)).length;
+    const reviewRevisionCount = [...revisionCountByObjective.values()].reduce((sum, count) => sum + count, 0);
+    const firstPassMergeCount = mergedObjectiveIds.filter((objectiveId2) => (revisionCountByObjective.get(objectiveId2) ?? 0) === 0).length;
+    const resolvedObjectiveCount = mergedObjectiveIds.length + closedUnmergedObjectiveCount;
+    const awaitingReviewRows = portfolioObjectiveRows.filter((row) => asString3(row.status) === "awaiting_review");
+    const nowMs = Date.parse(now);
+    const oldestAwaitingAtMs = Math.min(...awaitingReviewRows.map((row) => Date.parse(asString3(row.updated_at))).filter(Number.isFinite));
+    const portfolio = {
+      windowHours: portfolioWindowHours,
+      objectiveCount: portfolioObjectiveRows.length,
+      visionAlignedObjectiveCount,
+      userObservableObjectiveCount,
+      uniqueVisionObjectiveCount: visionObjectiveIds.size,
+      awaitingReviewCount: awaitingReviewRows.length,
+      oldestAwaitingReviewAgeMs: awaitingReviewRows.length > 0 && Number.isFinite(nowMs) && Number.isFinite(oldestAwaitingAtMs) ? Math.max(0, nowMs - oldestAwaitingAtMs) : 0,
+      resolvedObjectiveCount,
+      mergedObjectiveCount: mergedObjectiveIds.length,
+      closedUnmergedObjectiveCount,
+      reviewRevisionCount,
+      firstPassMergeRate: resolvedObjectiveCount > 0 ? firstPassMergeCount / resolvedObjectiveCount : null
+    };
     return {
       patternStats: patternStatsRows.map((row) => ({
         patternKey: asString3(row.pattern_key),
@@ -19940,6 +22836,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           comments
         };
       }),
+      portfolio,
       engineSourceStats: sourceStatsRows.map((row) => ({
         sourceKey: asString3(row.source_key),
         sourceType: asString3(row.source_type) || "unknown",
@@ -20420,20 +23317,475 @@ Apply this clarification while keeping changes scoped to the existing objective 
          WHERE job_id = ?
            AND status IN ('dispatched','gated','blocked','needs_clarification')`).run(asIsoNow(), jobId);
   }
+  pruneRepositoryAgentMemoryFeedback(options = {}) {
+    const parsedNow = Date.parse(asString3(options.nowIso));
+    const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+    const terminalRetentionMs = Math.max(60000, Math.min(365 * 24 * 60 * 60000, Math.floor(asNumber(options.terminalRetentionMs, REPOSITORY_AGENT_MEMORY_FEEDBACK_TERMINAL_RETENTION_MS))));
+    const maxTerminalRows = Math.max(1, Math.min(1e6, Math.floor(asNumber(options.maxTerminalRows, REPOSITORY_AGENT_MEMORY_FEEDBACK_MAX_TERMINAL_ROWS))));
+    const batchSize = Math.max(1, Math.min(5000, Math.floor(asNumber(options.batchSize, REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_BATCH))));
+    const cutoff = new Date(nowMs - terminalRetentionMs).toISOString();
+    return this.db.transaction(() => {
+      let feedbackDeleted = 0;
+      let linksDeleted = 0;
+      const expired = this.db.prepare(`DELETE FROM autonomy_repository_agent_memory_feedback
+           WHERE observation_id IN (
+             SELECT observation_id
+             FROM autonomy_repository_agent_memory_feedback
+             WHERE status IN ('applied', 'failed') AND created_at <= ?
+             ORDER BY created_at ASC, observation_id ASC
+             LIMIT ?
+           )`).run(cutoff, batchSize);
+      feedbackDeleted += Math.max(0, Number(expired.changes ?? 0));
+      const remainingBatch = Math.max(0, batchSize - feedbackDeleted);
+      if (remainingBatch > 0) {
+        const terminalCount = this.db.prepare(`SELECT COUNT(*) AS count
+             FROM autonomy_repository_agent_memory_feedback
+             WHERE status IN ('applied', 'failed')`).get();
+        const excess = Math.max(0, Math.floor(asNumber(terminalCount?.count, 0)) - maxTerminalRows);
+        if (excess > 0) {
+          const cappedRows = this.db.prepare(`SELECT terminal.observation_id AS observationId,
+                      terminal.objective_id AS objectiveId
+               FROM autonomy_repository_agent_memory_feedback terminal
+               WHERE terminal.status IN ('applied', 'failed')
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM autonomy_repository_agent_memory_feedback active
+                   WHERE active.objective_id = terminal.objective_id
+                     AND active.status IN ('pending', 'processing')
+                 )
+               ORDER BY terminal.created_at ASC, terminal.rowid ASC
+               LIMIT ?`).all(Math.min(remainingBatch, excess));
+          const deleteCappedFeedback = this.db.prepare(`DELETE FROM autonomy_repository_agent_memory_feedback
+             WHERE observation_id = ? AND status IN ('applied', 'failed')`);
+          const retireCappedLink = this.db.prepare(`DELETE FROM autonomy_repository_agent_memory_links
+             WHERE objective_id = ?
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM autonomy_repository_agent_memory_feedback active
+                 WHERE active.objective_id = ?
+                   AND active.status IN ('pending', 'processing')
+               )`);
+          const evictedObjectives = new Set;
+          for (const capped of cappedRows) {
+            feedbackDeleted += Math.max(0, Number(deleteCappedFeedback.run(capped.observationId).changes ?? 0));
+            if (capped.objectiveId)
+              evictedObjectives.add(capped.objectiveId);
+          }
+          for (const objectiveId of evictedObjectives) {
+            linksDeleted += Math.max(0, Number(retireCappedLink.run(objectiveId, objectiveId).changes ?? 0));
+          }
+        }
+      }
+      const oldSettledLinks = this.db.prepare(`DELETE FROM autonomy_repository_agent_memory_links
+           WHERE objective_id IN (
+             SELECT link.objective_id
+             FROM autonomy_repository_agent_memory_links link
+             LEFT JOIN autonomy_objectives objective ON objective.id = link.objective_id
+             WHERE link.updated_at <= ?
+               AND (objective.id IS NULL OR objective.status IN ('completed', 'failed', 'dead_letter'))
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM autonomy_repository_agent_memory_feedback feedback
+                 WHERE feedback.objective_id = link.objective_id
+                   AND feedback.status IN ('pending', 'processing')
+               )
+             ORDER BY link.updated_at ASC, link.objective_id ASC
+             LIMIT ?
+           )`).run(cutoff, batchSize);
+      linksDeleted += Math.max(0, Number(oldSettledLinks.changes ?? 0));
+      return {
+        feedbackDeleted,
+        linksDeleted
+      };
+    })();
+  }
+  maybePruneRepositoryAgentMemoryFeedback() {
+    const nowMs = Date.now();
+    if (this.lastRepositoryAgentMemoryFeedbackPruneAtMs > 0 && nowMs - this.lastRepositoryAgentMemoryFeedbackPruneAtMs < REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_INTERVAL_MS) {
+      return;
+    }
+    this.pruneRepositoryAgentMemoryFeedback({ nowIso: new Date(nowMs).toISOString() });
+    this.lastRepositoryAgentMemoryFeedbackPruneAtMs = nowMs;
+  }
+  reconcileRepositoryAgentMemoryFeedback() {
+    if (!this.hasTable("jobs") || !this.hasTable("completions") || !this.hasTable("job_terminal_diagnostics") || !this.hasTable("autonomy_outcomes") || !this.hasTable("pr_provider_outcomes")) {
+      return { queued: 0 };
+    }
+    const now = asIsoNow();
+    let queued = 0;
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO autonomy_repository_agent_memory_feedback (
+         observation_id, objective_id, repository_id, repository_agent_request_id,
+         outcome, authority_kind, authority_id, weight, memory_refs_json,
+         status, attempts, claim_token, claim_generation, lease_expires_at, claimed_at,
+         next_attempt_at, last_error, created_at, applied_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 'pending', 0, NULL, 0, NULL, NULL, NULL, NULL, ?, NULL)`);
+    const providerAuthorityExpression = `
+      provider.normalizedPrUrl || char(31) || COALESCE(provider.jobId, '') || char(31) ||
+      COALESCE(provider.providerStateAt, '') || char(31) ||
+      LOWER(COALESCE(provider.verdict, '')) || char(31) || CAST(provider.merged AS TEXT)`;
+    const providerRows = this.db.prepare(`SELECT link.objective_id AS objectiveId,
+                link.repository_id AS repositoryId,
+                link.repository_agent_request_id AS repositoryAgentRequestId,
+                link.memory_refs_json AS memoryRefsJson,
+                CASE WHEN provider.merged = 1 THEN 'successful' ELSE 'failed' END AS outcome,
+                'provider_terminal' AS authorityKind,
+                ${providerAuthorityExpression} AS authorityId,
+                1 AS weight,
+                provider.providerStateAt AS eventAt
+         FROM autonomy_repository_agent_memory_links link
+         JOIN autonomy_objectives objective ON objective.id = link.objective_id
+         JOIN jobs job ON job.id = objective.job_id
+         JOIN pr_provider_outcomes provider
+           ON provider.jobId = job.id
+          AND provider.normalizedPrUrl = job.prUrlNormalized
+         WHERE provider.terminal = 1
+           AND provider.providerStateAt >= ?
+           AND (
+             (provider.merged = 1 AND objective.status = 'completed') OR
+             (provider.merged = 0 AND objective.status = 'failed')
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback reflected
+             WHERE reflected.authority_kind = 'provider_terminal'
+               AND reflected.authority_id = ${providerAuthorityExpression}
+           )
+         ORDER BY provider.providerStateAt DESC, provider.normalizedPrUrl DESC
+         LIMIT 500`).all(new Date(Date.parse(now) - 30 * 24 * 60 * 60000).toISOString());
+    const completionAuthorityExpression = `
+      job.id || char(31) || completion.id || char(31) ||
+      completion.status || char(31) || completion.updatedAt`;
+    const successfulJobRows = this.db.prepare(`SELECT link.objective_id AS objectiveId,
+                link.repository_id AS repositoryId,
+                link.repository_agent_request_id AS repositoryAgentRequestId,
+                link.memory_refs_json AS memoryRefsJson,
+                'successful' AS outcome,
+                'job_terminal' AS authorityKind,
+                ${completionAuthorityExpression} AS authorityId,
+                1 AS weight,
+                completion.updatedAt AS eventAt
+         FROM autonomy_repository_agent_memory_links link
+         JOIN autonomy_objectives objective ON objective.id = link.objective_id
+         JOIN jobs job ON job.id = objective.job_id
+         JOIN completions completion ON completion.jobId = job.id
+         WHERE job.status = 'completed'
+           AND objective.status = 'completed'
+           AND COALESCE(job.prUrl, '') = ''
+           AND completion.status = 'processed'
+           AND completion.updatedAt >= ?
+           AND completion.rowid = (
+             SELECT MAX(latest.rowid) FROM completions latest
+             WHERE latest.jobId = job.id AND latest.status = 'processed'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback reflected
+             WHERE reflected.authority_kind = 'job_terminal'
+               AND reflected.authority_id = ${completionAuthorityExpression}
+           )
+         ORDER BY completion.updatedAt DESC, completion.id DESC
+         LIMIT 500`).all(new Date(Date.parse(now) - 30 * 24 * 60 * 60000).toISOString());
+    const jobFailureAuthorityExpression = `
+      job.id || char(31) || job.status || char(31) ||
+      COALESCE(diagnostics.updatedAt, '') || char(31) ||
+      LOWER(COALESCE(outcome.user_action, '')) || char(31) ||
+      LOWER(COALESCE(diagnostics.failureClass, '')) || char(31) ||
+      LOWER(COALESCE(diagnostics.terminalStage, ''))`;
+    const negativeJobRows = this.db.prepare(`SELECT link.objective_id AS objectiveId,
+                link.repository_id AS repositoryId,
+                link.repository_agent_request_id AS repositoryAgentRequestId,
+                link.memory_refs_json AS memoryRefsJson,
+                'failed' AS outcome,
+                'job_terminal' AS authorityKind,
+                ${jobFailureAuthorityExpression} AS authorityId,
+                CASE WHEN LOWER(COALESCE(outcome.user_action, '')) = 'rejected' THEN 1 ELSE 0.5 END AS weight,
+                COALESCE(diagnostics.updatedAt, outcome.created_at) AS eventAt,
+                job.status AS jobStatus,
+                diagnostics.failureClass AS failureClass,
+                diagnostics.terminalStage AS terminalStage,
+                diagnostics.summary AS diagnosticSummary,
+                outcome.user_action AS userAction
+         FROM autonomy_repository_agent_memory_links link
+         JOIN autonomy_objectives objective ON objective.id = link.objective_id
+         JOIN jobs job ON job.id = objective.job_id
+         JOIN autonomy_outcomes outcome ON outcome.objective_id = objective.id
+         LEFT JOIN job_terminal_diagnostics diagnostics ON diagnostics.jobId = job.id
+         WHERE objective.status = 'failed'
+           AND COALESCE(job.prUrl, '') = ''
+           AND outcome.terminal = 1
+           AND outcome.id = (
+             SELECT MAX(latest.id)
+             FROM autonomy_outcomes latest
+             WHERE latest.objective_id = objective.id AND latest.terminal = 1
+           )
+           AND COALESCE(diagnostics.updatedAt, outcome.created_at) >= ?
+           AND job.status IN ('completed', 'failed', 'abandoned', 'publish_blocked')
+           AND NOT EXISTS (
+             SELECT 1 FROM completions active
+             WHERE active.jobId = job.id AND active.status IN ('pending', 'claimed')
+           )
+           AND (
+             LOWER(COALESCE(outcome.user_action, '')) IN ('rejected', 'no_change', 'needs_clarification')
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%artifact_only_no_publishable_patch%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%quality%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%critic%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%validation%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%test_failure%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%lint_failure%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%typecheck_failure%'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback reflected
+             WHERE reflected.authority_kind = 'job_terminal'
+               AND reflected.authority_id = ${jobFailureAuthorityExpression}
+           )
+         ORDER BY COALESCE(diagnostics.updatedAt, outcome.created_at) DESC, job.id DESC
+         LIMIT 500`).all(new Date(Date.parse(now) - 30 * 24 * 60 * 60000).toISOString());
+    const eligibleNegativeJobRows = negativeJobRows.filter((row) => {
+      const directNegative = ["rejected", "no_change", "needs_clarification"].includes(asString3(row.userAction).toLowerCase());
+      const classified = classifyAutonomyAttemptOutcome({
+        status: row.jobStatus,
+        failureClass: row.failureClass,
+        terminalStage: row.terminalStage,
+        summary: row.diagnosticSummary
+      });
+      return directNegative || ["quality_rejected", "validation_blocked", "no_change"].includes(classified);
+    });
+    const candidates = [...providerRows, ...successfulJobRows, ...eligibleNegativeJobRows].sort((left, right) => right.eventAt.localeCompare(left.eventAt)).slice(0, 500);
+    for (const row of candidates) {
+      const observationId = `repository-agent:${sha256Hex(JSON.stringify([row.objectiveId, row.authorityKind, row.authorityId]))}`;
+      const inserted = insert.run(observationId, row.objectiveId, row.repositoryId, row.repositoryAgentRequestId, row.outcome, row.authorityKind, row.authorityId, row.weight, row.memoryRefsJson, now);
+      queued += Number(inserted.changes ?? 0);
+    }
+    return { queued };
+  }
+  hydrateRepositoryAgentMemoryFeedbackRows(rows) {
+    return rows.flatMap((row) => {
+      const memoryRefs = asRepositoryAgentMemoryRefs(parseJsonArray2(row.memoryRefsJson));
+      if (!row.observationId || !row.objectiveId || !row.repositoryId || !row.repositoryAgentRequestId || row.outcome !== "successful" && row.outcome !== "failed" || row.authorityKind !== "provider_terminal" && row.authorityKind !== "job_terminal" || memoryRefs.length === 0) {
+        return [];
+      }
+      return [
+        {
+          observationId: row.observationId,
+          objectiveId: row.objectiveId,
+          repositoryId: row.repositoryId,
+          repositoryAgentRequestId: row.repositoryAgentRequestId,
+          outcome: row.outcome,
+          authorityKind: row.authorityKind,
+          authorityId: row.authorityId,
+          weight: Math.max(0, Math.min(4, asNumber(row.weight, 1))),
+          memoryRefs,
+          attempts: Math.max(0, Math.floor(asNumber(row.attempts, 0)))
+        }
+      ];
+    });
+  }
+  listPendingRepositoryAgentMemoryFeedback(limit = 20) {
+    const boundedLimit = Math.max(1, Math.min(100, Math.floor(asNumber(limit, 20))));
+    const now = asIsoNow();
+    const rows = this.db.prepare(`SELECT feedback.observation_id AS observationId,
+                feedback.objective_id AS objectiveId,
+                feedback.repository_id AS repositoryId,
+                feedback.repository_agent_request_id AS repositoryAgentRequestId,
+                feedback.outcome, feedback.authority_kind AS authorityKind,
+                feedback.authority_id AS authorityId, feedback.weight,
+                feedback.memory_refs_json AS memoryRefsJson, feedback.attempts
+         FROM autonomy_repository_agent_memory_feedback feedback
+         WHERE feedback.status = 'pending' AND feedback.attempts < 5
+           AND (
+             feedback.next_attempt_at IS NULL OR TRIM(feedback.next_attempt_at) = '' OR
+             julianday(feedback.next_attempt_at) IS NULL OR feedback.next_attempt_at <= ?
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback predecessor
+             WHERE predecessor.objective_id = feedback.objective_id
+               AND predecessor.status IN ('pending', 'processing')
+               AND predecessor.rowid < feedback.rowid
+           )
+         ORDER BY feedback.created_at ASC, feedback.rowid ASC
+         LIMIT ?`).all(now, boundedLimit);
+    return this.hydrateRepositoryAgentMemoryFeedbackRows(rows);
+  }
+  recoverExpiredRepositoryAgentMemoryFeedback() {
+    const now = asIsoNow();
+    return this.db.prepare(`UPDATE autonomy_repository_agent_memory_feedback
+         SET status = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'pending' END,
+             claim_token = NULL, lease_expires_at = NULL, claimed_at = NULL,
+             next_attempt_at = CASE
+               WHEN attempts >= 5 THEN NULL
+               ELSE COALESCE(next_attempt_at, ?)
+             END,
+             last_error = CASE
+               WHEN attempts >= 5
+               THEN COALESCE(last_error, 'feedback lease expired after final attempt')
+               ELSE last_error
+             END
+         WHERE status = 'processing'
+           AND (
+             lease_expires_at IS NULL OR TRIM(lease_expires_at) = '' OR
+             julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?
+           )`).run(now, now).changes;
+  }
+  claimRepositoryAgentMemoryFeedback(limit = 20, leaseMs = 60000) {
+    this.maybePruneRepositoryAgentMemoryFeedback();
+    const boundedLimit = Math.min(1, Math.max(1, Math.floor(asNumber(limit, 20))));
+    const boundedLeaseMs = Math.max(5000, Math.min(5 * 60000, Math.floor(asNumber(leaseMs, 60000))));
+    const now = asIsoNow();
+    const leaseExpiresAt = new Date(Date.parse(now) + boundedLeaseMs).toISOString();
+    return this.db.transaction(() => {
+      this.recoverExpiredRepositoryAgentMemoryFeedback();
+      const candidates = this.listPendingRepositoryAgentMemoryFeedback(boundedLimit);
+      const claims = [];
+      for (const candidate of candidates) {
+        const claimToken = randomUUID6();
+        const claimed = this.db.prepare(`UPDATE autonomy_repository_agent_memory_feedback
+             SET status = 'processing', attempts = attempts + 1,
+                 claim_token = ?, claim_generation = claim_generation + 1,
+                 lease_expires_at = ?, claimed_at = ?, next_attempt_at = NULL
+             WHERE observation_id = ? AND status = 'pending' AND attempts < 5
+               AND (
+                 next_attempt_at IS NULL OR TRIM(next_attempt_at) = '' OR
+                 julianday(next_attempt_at) IS NULL OR next_attempt_at <= ?
+               )`).run(claimToken, leaseExpiresAt, now, candidate.observationId, now);
+        if (claimed.changes !== 1)
+          continue;
+        const generation = this.db.prepare(`SELECT claim_generation AS claimGeneration
+             FROM autonomy_repository_agent_memory_feedback
+             WHERE observation_id = ?`).get(candidate.observationId);
+        claims.push({
+          ...candidate,
+          attempts: candidate.attempts + 1,
+          claimToken,
+          claimGeneration: Math.max(1, Math.floor(asNumber(generation?.claimGeneration, 1))),
+          leaseExpiresAt
+        });
+      }
+      return claims;
+    })();
+  }
+  markRepositoryAgentMemoryFeedback(observationId, authority, applied, error) {
+    const normalizedObservationId = asString3(observationId);
+    const claimToken = asString3(authority.claimToken);
+    const claimGeneration = Math.max(0, Math.floor(asNumber(authority.claimGeneration, 0)));
+    if (!normalizedObservationId || !claimToken || claimGeneration < 1)
+      return false;
+    const now = asIsoNow();
+    if (applied) {
+      return this.db.prepare(`UPDATE autonomy_repository_agent_memory_feedback
+             SET status = 'applied', claim_token = NULL, lease_expires_at = NULL,
+                 claimed_at = NULL, next_attempt_at = NULL, last_error = NULL, applied_at = ?
+             WHERE observation_id = ? AND status = 'processing'
+               AND claim_token = ? AND claim_generation = ?
+               AND lease_expires_at IS NOT NULL
+               AND julianday(lease_expires_at) IS NOT NULL
+               AND lease_expires_at > ?`).run(now, normalizedObservationId, claimToken, claimGeneration, now).changes === 1;
+    }
+    const row = this.db.prepare(`SELECT attempts
+         FROM autonomy_repository_agent_memory_feedback
+         WHERE observation_id = ? AND status = 'processing'
+           AND claim_token = ? AND claim_generation = ?
+           AND lease_expires_at IS NOT NULL
+           AND julianday(lease_expires_at) IS NOT NULL
+           AND lease_expires_at > ?
+         LIMIT 1`).get(normalizedObservationId, claimToken, claimGeneration, now);
+    if (!row)
+      return false;
+    const attempts = Math.max(0, Math.floor(asNumber(row.attempts, 0)));
+    const exhausted = attempts >= 5;
+    const retryDelayMs = Math.min(15 * 60000, 1000 * 2 ** Math.max(0, attempts - 1));
+    const updateNow = asIsoNow();
+    return this.db.prepare(`UPDATE autonomy_repository_agent_memory_feedback
+           SET status = ?, claim_token = NULL, lease_expires_at = NULL, claimed_at = NULL,
+               next_attempt_at = ?, last_error = ?
+           WHERE observation_id = ? AND status = 'processing'
+             AND claim_token = ? AND claim_generation = ?
+             AND lease_expires_at IS NOT NULL
+             AND julianday(lease_expires_at) IS NOT NULL
+             AND lease_expires_at > ?`).run(exhausted ? "failed" : "pending", exhausted ? null : new Date(Date.parse(updateNow) + retryDelayMs).toISOString(), truncateText(error instanceof Error ? error.message : String(error ?? "unknown error"), 4000), normalizedObservationId, claimToken, claimGeneration, updateNow).changes === 1;
+  }
+  repositoryAgentMemoryFeedbackHealth() {
+    const rows = this.db.prepare(`SELECT status, COUNT(*) AS count, MIN(created_at) AS oldest
+         FROM autonomy_repository_agent_memory_feedback
+         GROUP BY status`).all();
+    const health = {
+      pending: 0,
+      processing: 0,
+      applied: 0,
+      failed: 0,
+      oldestPendingAgeMs: null,
+      oldPendingCount: 0,
+      pendingUnhealthyAfterMs: REPOSITORY_AGENT_MEMORY_FEEDBACK_PENDING_UNHEALTHY_MS,
+      staleClaimCount: 0,
+      unhealthy: false
+    };
+    for (const row of rows) {
+      if (row.status === "pending") {
+        health.pending = Math.max(0, Math.floor(asNumber(row.count, 0)));
+        const oldestMs = Date.parse(asString3(row.oldest));
+        health.oldestPendingAgeMs = Number.isFinite(oldestMs) ? Math.max(0, Date.now() - oldestMs) : null;
+      } else if (row.status === "processing") {
+        health.processing = Math.max(0, Math.floor(asNumber(row.count, 0)));
+      } else if (row.status === "applied") {
+        health.applied = Math.max(0, Math.floor(asNumber(row.count, 0)));
+      } else if (row.status === "failed") {
+        health.failed = Math.max(0, Math.floor(asNumber(row.count, 0)));
+      }
+    }
+    const now = asIsoNow();
+    const stale = this.db.prepare(`SELECT COUNT(*) AS count
+         FROM autonomy_repository_agent_memory_feedback
+         WHERE status = 'processing'
+           AND (
+             lease_expires_at IS NULL OR TRIM(lease_expires_at) = '' OR
+             julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?
+           )`).get(now);
+    health.staleClaimCount = Math.max(0, Math.floor(asNumber(stale?.count, 0)));
+    const pendingCutoff = new Date(Date.parse(now) - REPOSITORY_AGENT_MEMORY_FEEDBACK_PENDING_UNHEALTHY_MS).toISOString();
+    const oldPending = this.db.prepare(`SELECT COUNT(*) AS count
+         FROM autonomy_repository_agent_memory_feedback
+         WHERE status = 'pending' AND created_at <= ?`).get(pendingCutoff);
+    health.oldPendingCount = Math.max(0, Math.floor(asNumber(oldPending?.count, 0)));
+    health.unhealthy = health.failed > 0 || health.staleClaimCount > 0 || health.oldPendingCount > 0;
+    return health;
+  }
+  markObjectiveAwaitingReviewByJobId(jobId) {
+    if (!jobId)
+      return;
+    const now = asIsoNow();
+    this.db.prepare(`UPDATE autonomy_objectives
+         SET status = 'awaiting_review',
+             awaiting_review_since = COALESCE(awaiting_review_since, ?),
+             block_reason = NULL,
+             updated_at = ?
+         WHERE job_id = ?
+           AND status IN ('dispatched','gated','running','completed')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_outcomes final_outcome
+             WHERE final_outcome.objective_id = autonomy_objectives.id
+               AND final_outcome.terminal = 1
+               AND final_outcome.success = 1
+               AND LOWER(COALESCE(final_outcome.user_action, '')) = 'accepted'
+           )`).run(now, now, jobId);
+  }
   reconcileJobLinkedOutcomeLifecycle() {
     const affectedPatterns = this.db.prepare(`SELECT DISTINCT ao.pattern_key AS patternKey
          FROM autonomy_outcomes ao
          JOIN jobs j ON j.id = ao.job_id
          WHERE ao.terminal = 1
            AND ao.success = 1
-           AND j.status IN ('finalizing', 'failed', 'abandoned', 'publish_blocked')`).all();
-    if (affectedPatterns.length === 0) {
-      return {
-        correctedFailures: 0,
-        removedPrematureSuccesses: 0,
-        correctedObjectives: 0
-      };
-    }
+           AND (
+             j.status IN ('finalizing', 'failed', 'abandoned', 'publish_blocked')
+             OR (
+               j.status = 'completed'
+               AND COALESCE(j.prUrl, '') != ''
+               AND LOWER(COALESCE(ao.user_action, '')) IN ('applied', 'accepted')
+             )
+           )`).all();
     const now = asIsoNow();
     let correctedFailures = 0;
     let removedPrematureSuccesses = 0;
@@ -20442,7 +23794,30 @@ Apply this clarification while keeping changes scoped to the existing objective 
       const removed = this.db.prepare(`DELETE FROM autonomy_outcomes
            WHERE terminal = 1
              AND success = 1
-             AND job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')`).run();
+             AND (
+               job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')
+               OR (
+                 job_id IN (
+                   SELECT id FROM jobs
+                   WHERE status = 'completed' AND COALESCE(prUrl, '') != ''
+                 )
+                 AND (
+                   LOWER(COALESCE(user_action, '')) = 'applied'
+                   OR (
+                     LOWER(COALESCE(user_action, '')) = 'accepted'
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM autonomy_pr_feedback feedback
+                       WHERE (
+                         feedback.objective_id = autonomy_outcomes.objective_id
+                         OR feedback.job_id = autonomy_outcomes.job_id
+                       )
+                         AND LOWER(COALESCE(feedback.verdict, '')) IN ('approved_merged', 'merged')
+                     )
+                   )
+                 )
+               )
+             )`).run();
       removedPrematureSuccesses = Number(removed.changes ?? 0);
       const corrected = this.db.prepare(`UPDATE autonomy_outcomes
            SET success = 0,
@@ -20467,7 +23842,22 @@ Apply this clarification while keeping changes scoped to the existing objective 
              WHERE status IN ('failed', 'abandoned', 'publish_blocked')
            )
              AND status <> 'failed'`).run(now);
-      correctedObjectives = Number(runningObjectives.changes ?? 0) + Number(failedObjectives.changes ?? 0);
+      const awaitingReviewObjectives = this.db.prepare(`UPDATE autonomy_objectives
+           SET status = 'awaiting_review',
+               awaiting_review_since = COALESCE(awaiting_review_since, ?),
+               updated_at = ?
+           WHERE job_id IN (
+             SELECT id FROM jobs
+             WHERE status = 'completed' AND COALESCE(prUrl, '') != ''
+           )
+             AND status = 'completed'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM autonomy_outcomes final_outcome
+               WHERE final_outcome.objective_id = autonomy_objectives.id
+                 AND final_outcome.terminal = 1
+             )`).run(now, now);
+      correctedObjectives = Number(runningObjectives.changes ?? 0) + Number(failedObjectives.changes ?? 0) + Number(awaitingReviewObjectives.changes ?? 0);
       for (const affected of affectedPatterns) {
         const patternKey = asString3(affected.patternKey);
         if (!patternKey)
@@ -20524,10 +23914,1464 @@ Apply this clarification while keeping changes scoped to the existing objective 
   }
 }
 
+// apps/server/src/memory_store.ts
+import { Database as Database6 } from "bun:sqlite";
+import { randomUUID as randomUUID7 } from "crypto";
+var MEMORY_SELECT_COLUMNS = `
+  id, namespace, repositoryId, sessionId, memoryKey, kind, subjectKey, summary,
+  valueJson, tagsJson, evidenceJson, provenanceJson, confidence, usefulness,
+  status, revision, createdAt, updatedAt, expiresAt, invalidatedAt,
+  invalidationReason
+`;
+var ALL_MEMORY_STATUSES = ["active", "stale", "superseded", "invalid"];
+function compact(value, maxChars) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+function required(value, name, maxChars) {
+  const text = compact(value, maxChars);
+  if (!text)
+    throw new TypeError(`${name} is required`);
+  return text;
+}
+function addressPart(value, name, maxChars, isRequired) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    if (isRequired)
+      throw new TypeError(`${name} is required`);
+    return null;
+  }
+  if (text.length > maxChars) {
+    throw new TypeError(`${name} must be at most ${maxChars} characters`);
+  }
+  if (text.includes("\x00"))
+    throw new TypeError(`${name} must not contain NUL characters`);
+  return text;
+}
+function clampUnit2(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : fallback;
+}
+function normalizeTimestamp2(value, name) {
+  const timestamp = compact(value, 64);
+  const parsed = Date.parse(timestamp);
+  if (!timestamp || !Number.isFinite(parsed)) {
+    throw new TypeError(`${name} must be an ISO timestamp`);
+  }
+  return new Date(parsed).toISOString();
+}
+function normalizeScope2(scope) {
+  return {
+    namespace: addressPart(scope?.namespace, "memory scope namespace", MEMORY_LIMITS.namespaceChars, true),
+    repositoryId: addressPart(scope?.repositoryId, "memory scope repositoryId", MEMORY_LIMITS.repositoryIdChars, false),
+    sessionId: addressPart(scope?.sessionId, "memory scope sessionId", MEMORY_LIMITS.sessionIdChars, false)
+  };
+}
+function normalizeList(values, maxItems = MEMORY_LIMITS.listItems, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!Array.isArray(values))
+    return [];
+  const seen = new Set;
+  const result = [];
+  for (const value of values) {
+    const item = compact(value, maxChars);
+    if (!item || seen.has(item))
+      continue;
+    seen.add(item);
+    result.push(item);
+    if (result.length >= maxItems)
+      break;
+  }
+  return result;
+}
+function normalizeEvidence2(values) {
+  if (!Array.isArray(values))
+    return [];
+  return values.slice(0, MEMORY_LIMITS.evidenceItems).flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      return [];
+    const raw = entry;
+    const path = compact(raw.path, MEMORY_LIMITS.evidencePathChars).replace(/\\/g, "/");
+    if (path && (path.startsWith("/") || /^[a-z]:\//i.test(path) || path.split("/").includes(".."))) {
+      throw new TypeError("memory evidence paths must be repository-relative and contained");
+    }
+    const observedAt = compact(raw.observedAt, 64);
+    if (observedAt && !Number.isFinite(Date.parse(observedAt))) {
+      throw new TypeError("memory evidence observedAt must be an ISO timestamp");
+    }
+    const normalized = {
+      ...path ? { path } : {},
+      ...compact(raw.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) ? { blobOid: compact(raw.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) } : {},
+      ...compact(raw.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) ? { sourceId: compact(raw.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) } : {},
+      ...compact(raw.detail, MEMORY_LIMITS.evidenceDetailChars) ? { detail: compact(raw.detail, MEMORY_LIMITS.evidenceDetailChars) } : {},
+      ...observedAt ? { observedAt: new Date(observedAt).toISOString() } : {}
+    };
+    return Object.keys(normalized).length > 0 ? [normalized] : [];
+  });
+}
+function parseJson(raw, fallback) {
+  if (!raw)
+    return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+function hydrate(row, observations = []) {
+  return {
+    id: row.id,
+    scope: {
+      namespace: row.namespace,
+      repositoryId: row.repositoryId || null,
+      sessionId: row.sessionId || null
+    },
+    key: row.memoryKey,
+    kind: row.kind,
+    subjectKey: row.subjectKey,
+    summary: row.summary,
+    value: parseJson(row.valueJson, null),
+    tags: parseJson(row.tagsJson, []),
+    evidence: parseJson(row.evidenceJson, []),
+    observations,
+    provenance: parseJson(row.provenanceJson, { service: "unknown" }),
+    confidence: Number(row.confidence),
+    usefulness: Number(row.usefulness),
+    status: row.status,
+    revision: Number(row.revision),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    expiresAt: row.expiresAt,
+    invalidatedAt: row.invalidatedAt,
+    invalidationReason: row.invalidationReason
+  };
+}
+function evidencePathSet(evidence) {
+  return new Set(evidence.map((entry) => compact(entry.path, 1000).replace(/\\/g, "/")).filter(Boolean));
+}
+function matchesAny2(value, candidates) {
+  if (candidates.length === 0)
+    return true;
+  if (value == null)
+    return false;
+  const normalizedValue = value.toLowerCase();
+  return candidates.some((candidate) => candidate.toLowerCase() === normalizedValue);
+}
+function includesAll(haystack, needles) {
+  if (needles.length === 0)
+    return true;
+  const values = new Set(haystack.map((value) => value.toLowerCase()));
+  return needles.every((needle) => values.has(needle.toLowerCase()));
+}
+function lexicalScore(record, text) {
+  const tokens = compact(text, MEMORY_LIMITS.searchTextChars).toLowerCase().split(/[^a-z0-9_.\/-]+/).filter((token) => token.length > 1).slice(0, 64);
+  if (tokens.length === 0)
+    return 0;
+  const subject = (record.subjectKey ?? "").toLowerCase();
+  const haystack = [record.key, record.kind, subject, record.summary, ...record.tags].join(" ").toLowerCase();
+  let score = 0;
+  for (const token of new Set(tokens)) {
+    if (record.key.toLowerCase() === token || subject === token)
+      score += 6;
+    else if (record.key.toLowerCase().includes(token) || subject.includes(token))
+      score += 3;
+    else if (haystack.includes(token))
+      score += 1;
+  }
+  return score;
+}
+
+class SqliteMemoryStore {
+  db;
+  closed = false;
+  constructor(dbPath = ":memory:") {
+    this.db = new Database6(dbPath);
+    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA synchronous = NORMAL;");
+    this.db.exec("PRAGMA busy_timeout = 3000;");
+    this.migrate();
+  }
+  assertOpen() {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+  }
+  migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_records (
+        id                 TEXT PRIMARY KEY,
+        namespace          TEXT NOT NULL,
+        repositoryId       TEXT NOT NULL DEFAULT '',
+        sessionId          TEXT NOT NULL DEFAULT '',
+        memoryKey          TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        subjectKey         TEXT,
+        summary            TEXT NOT NULL,
+        valueJson          TEXT,
+        tagsJson           TEXT NOT NULL DEFAULT '[]',
+        evidenceJson       TEXT NOT NULL DEFAULT '[]',
+        provenanceJson     TEXT NOT NULL,
+        confidence         REAL NOT NULL DEFAULT 0.5,
+        usefulness         REAL NOT NULL DEFAULT 0.5,
+        status             TEXT NOT NULL DEFAULT 'active',
+        revision           INTEGER NOT NULL DEFAULT 1,
+        createdAt          TEXT NOT NULL,
+        updatedAt          TEXT NOT NULL,
+        expiresAt          TEXT,
+        invalidatedAt      TEXT,
+        invalidationReason TEXT,
+        UNIQUE(namespace, repositoryId, sessionId, memoryKey)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_memory_scope_status_updated
+        ON memory_records(namespace, repositoryId, sessionId, status, updatedAt DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_expiry ON memory_records(expiresAt);
+
+      CREATE TABLE IF NOT EXISTS memory_observations (
+        id             TEXT PRIMARY KEY,
+        memoryRecordId TEXT NOT NULL,
+        outcome        TEXT NOT NULL
+          CHECK(outcome IN ('confirmed', 'successful', 'failed', 'contradicted')),
+        weight         REAL NOT NULL,
+        evidenceJson   TEXT NOT NULL DEFAULT '[]',
+        provenanceJson TEXT,
+        createdAt      TEXT NOT NULL,
+        FOREIGN KEY(memoryRecordId) REFERENCES memory_records(id)
+      );
+
+      CREATE TRIGGER IF NOT EXISTS trg_memory_observations_valid_outcome_insert
+      BEFORE INSERT ON memory_observations
+      FOR EACH ROW WHEN NEW.outcome NOT IN ('confirmed', 'successful', 'failed', 'contradicted')
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid memory reinforcement outcome');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_memory_observations_valid_outcome_update
+      BEFORE UPDATE OF outcome ON memory_observations
+      FOR EACH ROW WHEN NEW.outcome NOT IN ('confirmed', 'successful', 'failed', 'contradicted')
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid memory reinforcement outcome');
+      END;
+
+      CREATE INDEX IF NOT EXISTS idx_memory_observation_record
+        ON memory_observations(memoryRecordId, createdAt DESC);
+    `);
+  }
+  rowForAddress(address) {
+    const scope = normalizeScope2(address.scope);
+    const key = addressPart(address.key, "memory key", MEMORY_LIMITS.keyChars, true);
+    return this.db.prepare(`SELECT ${MEMORY_SELECT_COLUMNS} FROM memory_records
+           WHERE namespace = ? AND repositoryId = ? AND sessionId = ? AND memoryKey = ?
+           LIMIT 1`).get(scope.namespace, scope.repositoryId ?? "", scope.sessionId ?? "", key) ?? null;
+  }
+  observationsForRecord(recordId) {
+    const rows = this.db.prepare(`SELECT id, outcome, weight, evidenceJson, provenanceJson, createdAt
+         FROM memory_observations WHERE memoryRecordId = ?
+         ORDER BY createdAt DESC, rowid DESC LIMIT ?`).all(recordId, MAX_MEMORY_REINFORCEMENT_OBSERVATIONS);
+    const seen = new Set;
+    return rows.filter((row) => {
+      if (seen.has(row.id))
+        return false;
+      seen.add(row.id);
+      return row.outcome === "confirmed" || row.outcome === "successful" || row.outcome === "failed" || row.outcome === "contradicted";
+    }).map((row) => {
+      const evidence = parseJson(row.evidenceJson, []);
+      const provenance = parseJson(row.provenanceJson, null);
+      return {
+        id: row.id,
+        outcome: row.outcome,
+        weight: Number(row.weight),
+        observedAt: row.createdAt,
+        ...evidence.length > 0 ? { evidence } : {},
+        ...provenance ? { provenance } : {}
+      };
+    }).reverse();
+  }
+  hydrateRecord(row) {
+    return hydrate(row, this.observationsForRecord(row.id));
+  }
+  async put(input, options = {}) {
+    this.assertOpen();
+    const scope = normalizeScope2(input.scope);
+    const key = addressPart(input.key, "memory key", MEMORY_LIMITS.keyChars, true);
+    const kind = required(input.kind, "memory kind", MEMORY_LIMITS.kindChars);
+    const summary = required(input.summary, "memory summary", MEMORY_LIMITS.summaryChars);
+    const optionalProvenance = (value) => compact(value, MEMORY_LIMITS.provenanceFieldChars) || undefined;
+    const provenance = {
+      service: required(input.provenance?.service, "memory provenance service", MEMORY_LIMITS.provenanceServiceChars),
+      ...optionalProvenance(input.provenance?.agentId) ? { agentId: optionalProvenance(input.provenance?.agentId) } : {},
+      ...optionalProvenance(input.provenance?.runId) ? { runId: optionalProvenance(input.provenance?.runId) } : {},
+      ...optionalProvenance(input.provenance?.requestId) ? { requestId: optionalProvenance(input.provenance?.requestId) } : {},
+      ...optionalProvenance(input.provenance?.jobId) ? { jobId: optionalProvenance(input.provenance?.jobId) } : {},
+      ...optionalProvenance(input.provenance?.modelId) ? { modelId: optionalProvenance(input.provenance?.modelId) } : {},
+      ...optionalProvenance(input.provenance?.headSha) ? { headSha: optionalProvenance(input.provenance?.headSha) } : {},
+      ...optionalProvenance(input.provenance?.promptVersion) ? { promptVersion: optionalProvenance(input.provenance?.promptVersion) } : {}
+    };
+    const tags = normalizeList(input.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars);
+    const evidence = normalizeEvidence2(input.evidence);
+    const requestedStatus = ALL_MEMORY_STATUSES.includes(input.status) ? input.status : undefined;
+    const now = new Date().toISOString();
+    const tx = this.db.transaction(() => {
+      const existing = this.rowForAddress({ scope, key });
+      const expected = options.expectedRevision;
+      if (expected !== undefined) {
+        const actual = existing?.revision ?? 0;
+        if (actual !== expected) {
+          throw new MemoryConflictError(`Memory revision conflict for ${scope.namespace}/${key}: expected ${expected}, actual ${actual}`);
+        }
+      }
+      let expiresAt;
+      if (input.expiresAt !== undefined) {
+        expiresAt = input.expiresAt === null ? null : normalizeTimestamp2(input.expiresAt, "expiresAt");
+      } else if (input.ttlMs !== undefined && input.ttlMs !== null) {
+        const ttlMs = Number(input.ttlMs);
+        if (!Number.isFinite(ttlMs) || ttlMs <= 0)
+          throw new TypeError("ttlMs must be positive");
+        expiresAt = new Date(Date.parse(now) + Math.floor(ttlMs)).toISOString();
+      } else {
+        expiresAt = existing?.expiresAt ?? null;
+      }
+      const status = requestedStatus ?? existing?.status ?? "active";
+      const remainsInvalid = status === "invalid" && existing?.status === "invalid";
+      const invalidatedAt = status === "invalid" ? remainsInvalid ? existing?.invalidatedAt : now : null;
+      const invalidationReason = status === "invalid" && remainsInvalid ? existing?.invalidationReason ?? null : null;
+      if (!existing) {
+        const id = randomUUID7();
+        this.db.prepare(`INSERT INTO memory_records (
+               id, namespace, repositoryId, sessionId, memoryKey, kind, subjectKey,
+               summary, valueJson, tagsJson, evidenceJson, provenanceJson,
+               confidence, usefulness, status, revision, createdAt, updatedAt,
+               expiresAt, invalidatedAt, invalidationReason
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`).run(id, scope.namespace, scope.repositoryId ?? "", scope.sessionId ?? "", key, kind, compact(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null, summary, input.value === undefined ? null : JSON.stringify(input.value), JSON.stringify(tags), JSON.stringify(evidence), JSON.stringify(provenance), clampUnit2(input.confidence, 0.5), clampUnit2(input.usefulness, 0.5), status, now, now, expiresAt, invalidatedAt, invalidationReason);
+        return this.rowForAddress({ scope, key });
+      }
+      const preserveLearnedScores = options.expectedRevision === undefined;
+      this.db.prepare(`UPDATE memory_records SET
+             kind = ?, subjectKey = ?, summary = ?, valueJson = ?, tagsJson = ?,
+             evidenceJson = ?, confidence = ?, usefulness = ?,
+             status = ?, revision = revision + 1, updatedAt = ?, expiresAt = ?,
+             invalidatedAt = ?, invalidationReason = ?
+           WHERE id = ?`).run(kind, compact(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null, summary, input.value === undefined ? null : JSON.stringify(input.value), JSON.stringify(tags), JSON.stringify(evidence), preserveLearnedScores ? existing.confidence : clampUnit2(input.confidence, existing.confidence), preserveLearnedScores ? existing.usefulness : clampUnit2(input.usefulness, existing.usefulness), status, now, expiresAt, invalidatedAt, invalidationReason, existing.id);
+      return this.rowForAddress({ scope, key });
+    });
+    return this.hydrateRecord(tx());
+  }
+  async get(address, options = {}) {
+    this.assertOpen();
+    const row = this.rowForAddress(address);
+    if (!row)
+      return null;
+    const now = Date.now();
+    if (!options.includeExpired && row.expiresAt && Date.parse(row.expiresAt) <= now)
+      return null;
+    const statuses = options.statuses?.length ? options.statuses : ["active"];
+    if (!statuses.includes(row.status))
+      return null;
+    return this.hydrateRecord(row);
+  }
+  async search(query) {
+    this.assertOpen();
+    const scope = normalizeScope2(query.scope);
+    const requestedStatuses = query.statuses?.length ? query.statuses : ["active"];
+    const statuses = [
+      ...new Set(requestedStatuses.filter((status) => ALL_MEMORY_STATUSES.includes(status)))
+    ];
+    if (statuses.length === 0)
+      return [];
+    const now = new Date().toISOString();
+    const statusPlaceholders = statuses.map(() => "?").join(", ");
+    const expiryPredicate = query.includeExpired ? "" : " AND (expiresAt IS NULL OR expiresAt > ?)";
+    const rows = this.db.prepare(`SELECT ${MEMORY_SELECT_COLUMNS} FROM memory_records
+         WHERE namespace = ? AND repositoryId = ? AND sessionId = ?
+           AND status IN (${statusPlaceholders})${expiryPredicate}
+         ORDER BY updatedAt DESC, revision DESC, memoryKey ASC
+         LIMIT ?`).all(scope.namespace, scope.repositoryId ?? "", scope.sessionId ?? "", ...statuses, ...query.includeExpired ? [] : [now], MEMORY_LIMITS.searchCandidateRows);
+    const kinds = normalizeList(query.kinds, MEMORY_LIMITS.listItems, MEMORY_LIMITS.kindChars);
+    const subjects = normalizeList(query.subjectKeys, MEMORY_LIMITS.listItems, MEMORY_LIMITS.subjectKeyChars);
+    const tags = normalizeList(query.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars);
+    const paths = normalizeList(query.evidencePaths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+    const text = compact(query.text, MEMORY_LIMITS.searchTextChars);
+    const requestedMaxItems = Number(query.maxItems ?? 12);
+    const maxItems = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxItems, Number.isFinite(requestedMaxItems) ? Math.floor(requestedMaxItems) : 12));
+    const requestedMaxChars = Number(query.maxChars ?? 16000);
+    const maxChars = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxChars, Number.isFinite(requestedMaxChars) ? Math.floor(requestedMaxChars) : 16000));
+    let usedChars = 0;
+    const candidates = rows.map((row) => hydrate(row)).filter((record) => matchesAny2(record.kind, kinds)).filter((record) => matchesAny2(record.subjectKey, subjects)).filter((record) => includesAll(record.tags, tags)).filter((record) => {
+      if (paths.length === 0)
+        return true;
+      const evidencePaths = evidencePathSet(record.evidence);
+      return paths.every((path) => evidencePaths.has(path));
+    }).map((record) => ({
+      record,
+      lexical: lexicalScore(record, text)
+    })).filter((row) => !text || row.lexical > 0).sort((left, right) => right.lexical - left.lexical || memoryRecordRankingQuality(right.record) - memoryRecordRankingQuality(left.record) || Date.parse(right.record.updatedAt) - Date.parse(left.record.updatedAt) || right.record.revision - left.record.revision || left.record.key.localeCompare(right.record.key));
+    const selected = [];
+    for (const { record } of candidates) {
+      if (selected.length >= maxItems)
+        break;
+      if (usedChars + serializedMemoryRecordChars(record) > maxChars)
+        continue;
+      const hydratedRecord = {
+        ...record,
+        observations: this.observationsForRecord(record.id)
+      };
+      const size = serializedMemoryRecordChars(hydratedRecord);
+      if (usedChars + size > maxChars)
+        continue;
+      selected.push(hydratedRecord);
+      usedChars += size;
+    }
+    return selected;
+  }
+  async invalidate(selector) {
+    this.assertOpen();
+    const scope = normalizeScope2(selector.scope);
+    const keys = normalizeList(selector.keys, MEMORY_LIMITS.listItems, MEMORY_LIMITS.keyChars);
+    const kinds = normalizeList(selector.kinds, MEMORY_LIMITS.listItems, MEMORY_LIMITS.kindChars);
+    const subjects = normalizeList(selector.subjectKeys, MEMORY_LIMITS.listItems, MEMORY_LIMITS.subjectKeyChars);
+    const tags = normalizeList(selector.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars);
+    const paths = normalizeList(selector.evidencePaths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+    const statuses = selector.statuses?.length ? selector.statuses : ALL_MEMORY_STATUSES;
+    const selected = this.db.prepare(`SELECT ${MEMORY_SELECT_COLUMNS} FROM memory_records
+           WHERE namespace = ? AND repositoryId = ? AND sessionId = ?`).all(scope.namespace, scope.repositoryId ?? "", scope.sessionId ?? "").map((row) => hydrate(row)).filter((record) => record.status !== "invalid" && statuses.includes(record.status)).filter((record) => matchesAny2(record.key, keys)).filter((record) => matchesAny2(record.kind, kinds)).filter((record) => matchesAny2(record.subjectKey, subjects)).filter((record) => includesAll(record.tags, tags)).filter((record) => {
+      if (paths.length === 0)
+        return true;
+      const cited = evidencePathSet(record.evidence);
+      return paths.some((path) => cited.has(path));
+    });
+    if (selected.length === 0)
+      return 0;
+    const now = new Date().toISOString();
+    const reason = compact(selector.reason, MEMORY_LIMITS.selectorReasonChars) || "invalidated";
+    const statement = this.db.prepare(`UPDATE memory_records SET status = 'invalid', revision = revision + 1,
+       invalidatedAt = ?, invalidationReason = ?, updatedAt = ? WHERE id = ?`);
+    const tx = this.db.transaction(() => {
+      let count = 0;
+      for (const record of selected)
+        count += statement.run(now, reason, now, record.id).changes;
+      return count;
+    });
+    return tx();
+  }
+  async reinforce(input) {
+    this.assertOpen();
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const now = new Date().toISOString();
+    const tx = this.db.transaction(() => {
+      const existing = this.rowForAddress(input);
+      if (!existing)
+        return null;
+      if (input.expectedId !== undefined) {
+        const expectedId = addressPart(input.expectedId, "memory expectedId", MEMORY_LIMITS.recordIdChars, true);
+        if (existing.id !== expectedId) {
+          throw new MemoryConflictError(`Memory record conflict for ${existing.namespace}/${existing.memoryKey}: expected id ${expectedId}, got ${existing.id}`, "record_conflict");
+        }
+      }
+      const hydrated = hydrate(existing);
+      const observation = createMemoryReinforcementObservation(existing.id, input, now);
+      const priorObservation = this.db.prepare(`SELECT id, outcome, weight, evidenceJson, provenanceJson, createdAt
+           FROM memory_observations WHERE id = ? LIMIT 1`).get(observation.id);
+      if (priorObservation) {
+        const priorEvidence = parseJson(priorObservation.evidenceJson, []);
+        const priorProvenance = parseJson(priorObservation.provenanceJson, null);
+        assertMemoryReinforcementObservationCompatible({
+          id: priorObservation.id,
+          outcome: priorObservation.outcome,
+          weight: Number(priorObservation.weight),
+          observedAt: priorObservation.createdAt,
+          ...priorEvidence.length > 0 ? { evidence: priorEvidence } : {},
+          ...priorProvenance ? { provenance: priorProvenance } : {}
+        }, observation);
+        return existing;
+      }
+      const inserted = this.db.prepare(`INSERT OR IGNORE INTO memory_observations (
+             id, memoryRecordId, outcome, weight, evidenceJson, provenanceJson, createdAt
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(observation.id, existing.id, observation.outcome, observation.weight, JSON.stringify(observation.evidence ?? []), observation.provenance ? JSON.stringify(observation.provenance) : null, observation.observedAt);
+      if (inserted.changes === 0) {
+        const collided = this.db.prepare(`SELECT id, outcome, weight, evidenceJson, provenanceJson, createdAt
+             FROM memory_observations WHERE id = ? LIMIT 1`).get(observation.id);
+        if (!collided) {
+          throw new MemoryConflictError(`Memory observation conflict for ${observation.id}: insert was rejected`);
+        }
+        const collidedEvidence = parseJson(collided.evidenceJson, []);
+        const collidedProvenance = parseJson(collided.provenanceJson, null);
+        assertMemoryReinforcementObservationCompatible({
+          id: collided.id,
+          outcome: collided.outcome,
+          weight: Number(collided.weight),
+          observedAt: collided.createdAt,
+          ...collidedEvidence.length > 0 ? { evidence: collidedEvidence } : {},
+          ...collidedProvenance ? { provenance: collidedProvenance } : {}
+        }, observation);
+        return existing;
+      }
+      const effect = resolveMemoryReinforcement(hydrated, input.outcome, input.weight);
+      const evidence = observation.evidence && observation.evidence.length > 0 ? normalizeEvidence2([...hydrated.evidence, ...observation.evidence]) : hydrated.evidence;
+      this.db.prepare(`UPDATE memory_records SET confidence = ?, usefulness = ?, status = ?,
+           evidenceJson = ?, revision = revision + 1, updatedAt = ?,
+           invalidatedAt = ?, invalidationReason = ? WHERE id = ?`).run(effect.confidence, effect.usefulness, effect.status, JSON.stringify(evidence), now, effect.status === "invalid" ? existing.invalidatedAt : null, effect.status === "invalid" ? existing.invalidationReason : null, existing.id);
+      this.db.prepare(`DELETE FROM memory_observations WHERE memoryRecordId = ? AND id NOT IN (
+             SELECT id FROM memory_observations WHERE memoryRecordId = ?
+             ORDER BY createdAt DESC, rowid DESC LIMIT ?
+           )`).run(existing.id, existing.id, MAX_MEMORY_REINFORCEMENT_OBSERVATIONS);
+      return this.rowForAddress(input);
+    });
+    const row = tx();
+    return row ? this.hydrateRecord(row) : null;
+  }
+  async prune(options = {}) {
+    this.assertOpen();
+    const expiredBefore = options.expiredBefore ? normalizeTimestamp2(options.expiredBefore, "expiredBefore") : new Date().toISOString();
+    const updatedBefore = options.updatedBefore ? normalizeTimestamp2(options.updatedBefore, "updatedBefore") : null;
+    const statuses = options.statuses?.length ? options.statuses : ["invalid", "superseded"];
+    const scope = options.scope ? normalizeScope2(options.scope) : null;
+    const rows = this.db.prepare(`SELECT ${MEMORY_SELECT_COLUMNS} FROM memory_records`).all();
+    const ids = rows.filter((row) => !scope || row.namespace === scope.namespace && row.repositoryId === (scope.repositoryId ?? "") && row.sessionId === (scope.sessionId ?? "")).filter((row) => row.expiresAt != null && row.expiresAt <= expiredBefore || updatedBefore != null && statuses.includes(row.status) && row.updatedAt <= updatedBefore).map((row) => row.id);
+    if (ids.length === 0)
+      return 0;
+    const deleteObservations = this.db.prepare(`DELETE FROM memory_observations WHERE memoryRecordId = ?`);
+    const deleteRecord = this.db.prepare(`DELETE FROM memory_records WHERE id = ?`);
+    const tx = this.db.transaction(() => {
+      let count = 0;
+      for (const id of ids) {
+        deleteObservations.run(id);
+        count += deleteRecord.run(id).changes;
+      }
+      return count;
+    });
+    return tx();
+  }
+  async close() {
+    if (this.closed)
+      return;
+    this.closed = true;
+    this.db.close();
+  }
+}
+
+// apps/server/src/repository_agent_queue.ts
+import { Database as Database7 } from "bun:sqlite";
+import { createHash as createHash8, randomUUID as randomUUID8 } from "crypto";
+var DEFAULT_LEASE_MS = 3 * 60000;
+var MIN_LEASE_MS = 1e4;
+var MAX_LEASE_MS = 15 * 60000;
+var REPOSITORY_AGENT_MAX_DEADLINE_HORIZON_MS = 60 * 60000;
+var REPOSITORY_AGENT_MAX_CLAIM_ATTEMPTS = 3;
+var REPOSITORY_AGENT_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60000;
+var RETRY_BASE_DELAY_MS = 1000;
+var RETRY_MAX_DELAY_MS = 30000;
+var MAINTENANCE_INTERVAL_MS = 5 * 60000;
+var MAINTENANCE_PRUNE_LIMIT = 500;
+var HEALTH_PENDING_UNHEALTHY_AFTER_MS = 5 * 60000;
+function canonicalJson(value, ancestors = new Set) {
+  if (value === null)
+    return "null";
+  if (typeof value === "string" || typeof value === "boolean")
+    return JSON.stringify(value);
+  if (typeof value === "number")
+    return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (Array.isArray(value)) {
+    if (ancestors.has(value))
+      throw new TypeError("RepositoryAgent request must not be cyclic");
+    ancestors.add(value);
+    const encoded = `[${value.map((entry) => entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? "null" : canonicalJson(entry, ancestors)).join(",")}]`;
+    ancestors.delete(value);
+    return encoded;
+  }
+  if (typeof value === "object") {
+    if (ancestors.has(value))
+      throw new TypeError("RepositoryAgent request must not be cyclic");
+    ancestors.add(value);
+    const record = value;
+    const encoded = `{${Object.keys(record).sort().flatMap((key) => {
+      const entry = record[key];
+      return entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? [] : [`${JSON.stringify(key)}:${canonicalJson(entry, ancestors)}`];
+    }).join(",")}}`;
+    ancestors.delete(value);
+    return encoded;
+  }
+  return "null";
+}
+function fingerprintRequest(input) {
+  const deadlineMs = Date.parse(input.deadlineAt);
+  const canonical = canonicalJson({
+    schema: "pushpals-repository-agent-idempotency-v1",
+    sessionId: String(input.sessionId ?? "").trim(),
+    callerService: String(input.callerService ?? "").trim(),
+    purpose: String(input.purpose ?? "").trim(),
+    repositoryId: String(input.repositoryId ?? "").trim(),
+    repositoryRoot: String(input.repositoryRoot ?? "").trim(),
+    revision: String(input.revision ?? "").trim(),
+    treeHash: String(input.treeHash ?? "").trim(),
+    dirty: input.dirty === true || Number(input.dirty) === 1,
+    priority: input.priority,
+    deadlineAt: Number.isFinite(deadlineMs) ? new Date(deadlineMs).toISOString() : String(input.deadlineAt ?? "").trim(),
+    idempotencyKey: String(input.idempotencyKey ?? "").trim(),
+    request: input.request
+  });
+  return createHash8("sha256").update(canonical, "utf8").digest("hex");
+}
+function retryDelayMs(claimAttempts) {
+  const exponent = Math.max(0, Math.min(10, Math.floor(claimAttempts) - 1));
+  return Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** exponent);
+}
+function normalizedNow(value) {
+  return Number.isFinite(value.getTime()) ? value : new Date;
+}
+function parseRetryableError(raw) {
+  const compact2 = String(raw ?? "RepositoryAgent request failed").slice(0, 4000);
+  try {
+    const parsed = JSON.parse(compact2);
+    return {
+      retryable: parsed?.retryable === true,
+      message: typeof parsed?.message === "string" && parsed.message.trim() ? parsed.message.trim().slice(0, 1500) : "RepositoryAgent request failed"
+    };
+  } catch {
+    return { retryable: false, message: compact2 };
+  }
+}
+function retryExhaustedError(original, claimAttempts) {
+  const parsed = parseRetryableError(original);
+  return JSON.stringify({
+    code: "repository_agent_retry_exhausted",
+    message: `RepositoryAgent request exhausted ${claimAttempts} bounded attempt(s): ${parsed.message}`,
+    detail: String(original ?? "").slice(0, 2000),
+    retryable: false
+  });
+}
+function retryDeadlineExhaustedError(original, claimAttempts) {
+  const parsed = parseRetryableError(original);
+  return JSON.stringify({
+    code: "repository_agent_retry_deadline_exhausted",
+    message: `RepositoryAgent request cannot retry attempt ${claimAttempts} before its deadline: ${parsed.message}`,
+    detail: String(original ?? "").slice(0, 2000),
+    retryable: false
+  });
+}
+function boundedLeaseMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return DEFAULT_LEASE_MS;
+  return Math.max(MIN_LEASE_MS, Math.min(MAX_LEASE_MS, Math.floor(parsed)));
+}
+function boundedIntegerOption(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  const candidate = Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+  return Math.max(minimum, Math.min(maximum, candidate));
+}
+function parseObject(raw) {
+  if (!raw)
+    return null;
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function hydrateRow(row) {
+  if (!row)
+    return null;
+  return {
+    ...row,
+    dirty: Number(row.dirty) === 1 ? 1 : 0,
+    claimGeneration: Number(row.claimGeneration ?? 0),
+    claimAttempts: Number(row.claimAttempts ?? 0),
+    request: parseObject(row.requestJson) ?? undefined,
+    result: parseObject(row.resultJson)
+  };
+}
+
+class RepositoryAgentQueue {
+  db;
+  now;
+  maxDeadlineHorizonMs;
+  maxClaimAttempts;
+  terminalRetentionMs;
+  lastMaintenanceAtMs = 0;
+  static SELECT_COLUMNS = `
+    id, sessionId, callerService, purpose, repositoryId, repositoryRoot, revision,
+    treeHash, dirty, priority, deadlineAt, idempotencyKey, requestFingerprint,
+    requestJson, status, agentId, claimToken, claimGeneration, claimAttempts,
+    nextAttemptAt, leaseExpiresAt,
+    lastHeartbeatAt, resultJson, error, createdAt, updatedAt, claimedAt,
+    completedAt, failedAt
+  `;
+  constructor(dbPath = ":memory:", options = {}) {
+    this.db = new Database7(dbPath);
+    this.now = options.now ?? (() => new Date);
+    this.maxDeadlineHorizonMs = boundedIntegerOption(options.maxDeadlineHorizonMs, REPOSITORY_AGENT_MAX_DEADLINE_HORIZON_MS, 60000, 24 * 60 * 60000);
+    this.maxClaimAttempts = boundedIntegerOption(options.maxClaimAttempts, REPOSITORY_AGENT_MAX_CLAIM_ATTEMPTS, 1, 20);
+    this.terminalRetentionMs = boundedIntegerOption(options.terminalRetentionMs, REPOSITORY_AGENT_TERMINAL_RETENTION_MS, 60000, 365 * 24 * 60 * 60000);
+    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA synchronous = NORMAL;");
+    this.db.exec("PRAGMA busy_timeout = 3000;");
+    this.migrate();
+  }
+  migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS repository_agent_requests (
+        id              TEXT PRIMARY KEY,
+        sessionId       TEXT NOT NULL,
+        callerService   TEXT NOT NULL,
+        purpose         TEXT NOT NULL,
+        repositoryId    TEXT NOT NULL,
+        repositoryRoot  TEXT NOT NULL,
+        revision        TEXT NOT NULL,
+        treeHash        TEXT NOT NULL,
+        dirty           INTEGER NOT NULL DEFAULT 0,
+        priority        TEXT NOT NULL DEFAULT 'normal',
+        deadlineAt      TEXT NOT NULL,
+        idempotencyKey  TEXT NOT NULL,
+        requestFingerprint TEXT NOT NULL DEFAULT '',
+        requestJson     TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        agentId         TEXT,
+        claimToken      TEXT,
+        claimGeneration INTEGER NOT NULL DEFAULT 0,
+        claimAttempts   INTEGER NOT NULL DEFAULT 0,
+        nextAttemptAt   TEXT,
+        leaseExpiresAt  TEXT,
+        lastHeartbeatAt TEXT,
+        resultJson      TEXT,
+        error           TEXT,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL,
+        claimedAt       TEXT,
+        completedAt     TEXT,
+        failedAt        TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_repository_agent_request_claim
+        ON repository_agent_requests(status, priority, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_repository_agent_request_deadline
+        ON repository_agent_requests(status, deadlineAt);
+    `);
+    const columns = new Set(this.db.prepare("PRAGMA table_info(repository_agent_requests)").all().map((column) => column.name));
+    if (!columns.has("requestFingerprint")) {
+      this.db.exec("ALTER TABLE repository_agent_requests ADD COLUMN requestFingerprint TEXT NOT NULL DEFAULT '';");
+    }
+    if (!columns.has("nextAttemptAt")) {
+      this.db.exec("ALTER TABLE repository_agent_requests ADD COLUMN nextAttemptAt TEXT;");
+    }
+    const idempotencyIndexColumns = this.db.prepare("PRAGMA index_info(idx_repository_agent_request_idempotency)").all().map((column) => column.name);
+    if (idempotencyIndexColumns.join("\x00") !== ["repositoryId", "callerService", "sessionId", "idempotencyKey"].join("\x00")) {
+      this.db.exec(`
+        DROP INDEX IF EXISTS idx_repository_agent_request_idempotency;
+        CREATE UNIQUE INDEX idx_repository_agent_request_idempotency
+          ON repository_agent_requests(repositoryId, callerService, sessionId, idempotencyKey);
+      `);
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_repository_agent_request_available
+        ON repository_agent_requests(status, nextAttemptAt, priority, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_repository_agent_request_terminal_retention
+        ON repository_agent_requests(status, completedAt, failedAt, updatedAt);
+    `);
+    this.backfillRequestFingerprints();
+  }
+  currentDate() {
+    return normalizedNow(this.now());
+  }
+  backfillRequestFingerprints() {
+    const select = this.db.prepare(`SELECT id, sessionId, callerService, purpose, repositoryId, repositoryRoot,
+              revision, treeHash, dirty, priority, deadlineAt, idempotencyKey,
+              requestJson
+       FROM repository_agent_requests
+       WHERE requestFingerprint IS NULL OR requestFingerprint = ''
+       ORDER BY id ASC
+       LIMIT 250`);
+    const update = this.db.prepare(`UPDATE repository_agent_requests SET requestFingerprint = ?
+       WHERE id = ? AND (requestFingerprint IS NULL OR requestFingerprint = '')`);
+    const backfillBatch = this.db.transaction((rows) => {
+      for (const row of rows) {
+        const request = parseObject(row.requestJson) ?? { legacyRequestJson: row.requestJson };
+        update.run(fingerprintRequest({ ...row, request }), row.id);
+      }
+    });
+    while (true) {
+      const rows = select.all();
+      if (rows.length === 0)
+        return;
+      backfillBatch(rows);
+    }
+  }
+  maybeMaintain(now) {
+    const nowMs = now.getTime();
+    if (nowMs - this.lastMaintenanceAtMs < MAINTENANCE_INTERVAL_MS)
+      return;
+    this.lastMaintenanceAtMs = nowMs;
+    this.pruneTerminal({
+      now,
+      retentionMs: this.terminalRetentionMs,
+      limit: MAINTENANCE_PRUNE_LIMIT
+    });
+  }
+  enqueue(input) {
+    const required2 = [
+      ["sessionId", input.sessionId],
+      ["callerService", input.callerService],
+      ["purpose", input.purpose],
+      ["repositoryId", input.repositoryId],
+      ["repositoryRoot", input.repositoryRoot],
+      ["revision", input.revision],
+      ["treeHash", input.treeHash],
+      ["idempotencyKey", input.idempotencyKey]
+    ];
+    for (const [name, value] of required2) {
+      if (!String(value ?? "").trim())
+        return { ok: false, message: `${name} is required` };
+    }
+    const nowDate = this.currentDate();
+    const nowMs = nowDate.getTime();
+    const deadlineMs = Date.parse(input.deadlineAt);
+    if (!Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
+      return { ok: false, message: "deadlineAt must be a future ISO timestamp" };
+    }
+    if (deadlineMs - nowMs > this.maxDeadlineHorizonMs) {
+      return {
+        ok: false,
+        message: `deadlineAt must be no more than ${this.maxDeadlineHorizonMs}ms in the future`
+      };
+    }
+    let requestJson;
+    let requestFingerprint;
+    try {
+      requestJson = JSON.stringify(input.request);
+      if (!requestJson)
+        throw new TypeError("request must be a JSON object");
+      requestFingerprint = fingerprintRequest({ ...input, request: JSON.parse(requestJson) });
+    } catch (error) {
+      return {
+        ok: false,
+        message: `request must be finite, acyclic JSON: ${String(error)}`
+      };
+    }
+    this.maybeMaintain(nowDate);
+    const prior = this.db.prepare(`SELECT id, status, requestFingerprint
+         FROM repository_agent_requests
+         WHERE repositoryId = ? AND callerService = ? AND sessionId = ? AND idempotencyKey = ?
+         LIMIT 1`).get(input.repositoryId.trim(), input.callerService.trim(), input.sessionId.trim(), input.idempotencyKey.trim());
+    if (prior) {
+      if (prior.requestFingerprint !== requestFingerprint) {
+        return {
+          ok: false,
+          requestId: prior.id,
+          conflict: true,
+          code: "idempotency_conflict",
+          message: "RepositoryAgent idempotency key is already bound to a different caller, request, or repository snapshot"
+        };
+      }
+      return {
+        ok: true,
+        requestId: prior.id,
+        deduplicated: true,
+        status: prior.status
+      };
+    }
+    const id = randomUUID8();
+    const now = nowDate.toISOString();
+    try {
+      this.db.prepare(`INSERT INTO repository_agent_requests (
+             id, sessionId, callerService, purpose, repositoryId, repositoryRoot,
+             revision, treeHash, dirty, priority, deadlineAt, idempotencyKey,
+             requestFingerprint, requestJson, status, claimGeneration, claimAttempts,
+             nextAttemptAt, createdAt, updatedAt
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, NULL, ?, ?)`).run(id, input.sessionId.trim(), input.callerService.trim(), input.purpose.trim(), input.repositoryId.trim(), input.repositoryRoot.trim(), input.revision.trim(), input.treeHash.trim(), input.dirty ? 1 : 0, input.priority, new Date(deadlineMs).toISOString(), input.idempotencyKey.trim(), requestFingerprint, requestJson, now, now);
+    } catch (error) {
+      const raced = this.db.prepare(`SELECT id, status, requestFingerprint FROM repository_agent_requests
+           WHERE repositoryId = ? AND callerService = ? AND sessionId = ? AND idempotencyKey = ?
+           LIMIT 1`).get(input.repositoryId.trim(), input.callerService.trim(), input.sessionId.trim(), input.idempotencyKey.trim());
+      if (raced) {
+        if (raced.requestFingerprint !== requestFingerprint) {
+          return {
+            ok: false,
+            requestId: raced.id,
+            conflict: true,
+            code: "idempotency_conflict",
+            message: "RepositoryAgent idempotency key raced with a different caller, request, or repository snapshot"
+          };
+        }
+        return {
+          ok: true,
+          requestId: raced.id,
+          deduplicated: true,
+          status: raced.status
+        };
+      }
+      return { ok: false, message: String(error) };
+    }
+    return { ok: true, requestId: id, deduplicated: false, status: "pending" };
+  }
+  get(requestId) {
+    const row = this.db.prepare(`SELECT ${RepositoryAgentQueue.SELECT_COLUMNS}
+         FROM repository_agent_requests WHERE id = ? LIMIT 1`).get(requestId);
+    return hydrateRow(row);
+  }
+  claim(agentIdRaw, options = {}) {
+    const agentId = String(agentIdRaw ?? "").trim();
+    if (!agentId)
+      return { ok: false, message: "agentId is required" };
+    const nowDate = this.currentDate();
+    const now = nowDate.toISOString();
+    this.maybeMaintain(nowDate);
+    const claimToken = randomUUID8();
+    const leaseExpiresAt = new Date(nowDate.getTime() + boundedLeaseMs(options.leaseMs)).toISOString();
+    const tx = this.db.transaction(() => {
+      this.recoverExpiredClaims(now);
+      this.expirePastDeadlines(now);
+      this.deadLetterExhaustedPending(now);
+      const repositoryIdentities = Array.from(new Set((options.repositoryIdentities ?? []).map((identity) => String(identity ?? "").trim()).filter(Boolean))).slice(0, 128);
+      const identityClause = repositoryIdentities.length ? `AND repositoryId IN (${repositoryIdentities.map(() => "?").join(",")})` : "";
+      const row = this.db.prepare(`SELECT ${RepositoryAgentQueue.SELECT_COLUMNS}
+           FROM repository_agent_requests
+           WHERE status = 'pending' AND deadlineAt > ?
+             AND claimAttempts < ?
+             AND (nextAttemptAt IS NULL OR nextAttemptAt <= ?)
+             ${identityClause}
+           ORDER BY
+             CASE LOWER(priority)
+               WHEN 'interactive' THEN 0
+               WHEN 'normal' THEN 1
+               WHEN 'background' THEN 2
+               ELSE 1
+             END,
+             createdAt ASC
+           LIMIT 1`).get(now, this.maxClaimAttempts, now, ...repositoryIdentities);
+      if (!row)
+        return null;
+      const updated = this.db.prepare(`UPDATE repository_agent_requests
+           SET status = 'claimed', agentId = ?, claimToken = ?,
+               claimGeneration = claimGeneration + 1,
+               claimAttempts = claimAttempts + 1,
+               nextAttemptAt = NULL, leaseExpiresAt = ?, lastHeartbeatAt = ?,
+               claimedAt = ?, updatedAt = ?
+           WHERE id = ? AND status = 'pending' AND claimAttempts < ?
+             AND (nextAttemptAt IS NULL OR nextAttemptAt <= ?)`).run(agentId, claimToken, leaseExpiresAt, now, now, now, row.id, this.maxClaimAttempts, now);
+      if (updated.changes !== 1)
+        return null;
+      return hydrateRow({
+        ...row,
+        status: "claimed",
+        agentId,
+        claimToken,
+        claimGeneration: Number(row.claimGeneration ?? 0) + 1,
+        claimAttempts: Number(row.claimAttempts ?? 0) + 1,
+        nextAttemptAt: null,
+        leaseExpiresAt,
+        lastHeartbeatAt: now,
+        claimedAt: now,
+        updatedAt: now
+      });
+    });
+    const request = tx();
+    return request ? { ok: true, request } : { ok: false, message: "No pending requests" };
+  }
+  renewLease(requestId, agentIdRaw, claimTokenRaw, claimGeneration, options = {}) {
+    const agentId = String(agentIdRaw ?? "").trim();
+    const claimToken = String(claimTokenRaw ?? "").trim();
+    if (!agentId || !claimToken || !Number.isSafeInteger(claimGeneration) || claimGeneration < 1) {
+      return { ok: false, message: "agentId, claimToken, and claimGeneration are required" };
+    }
+    const nowDate = this.currentDate();
+    const now = nowDate.toISOString();
+    const leaseExpiresAt = new Date(nowDate.getTime() + boundedLeaseMs(options.leaseMs)).toISOString();
+    const result = this.db.prepare(`UPDATE repository_agent_requests
+         SET leaseExpiresAt = ?, lastHeartbeatAt = ?, updatedAt = ?
+         WHERE id = ? AND status = 'claimed' AND agentId = ? AND claimToken = ?
+           AND claimGeneration = ?
+           AND leaseExpiresAt IS NOT NULL AND leaseExpiresAt > ? AND deadlineAt > ?`).run(leaseExpiresAt, now, now, requestId, agentId, claimToken, claimGeneration, now, now);
+    return result.changes === 1 ? { ok: true, leaseExpiresAt } : {
+      ok: false,
+      message: "RepositoryAgent lease is stale, expired, or owned by another agent"
+    };
+  }
+  complete(requestId, input) {
+    const now = this.currentDate().toISOString();
+    const result = this.db.prepare(`UPDATE repository_agent_requests
+         SET status = 'completed', resultJson = ?, error = NULL, completedAt = ?,
+             claimToken = NULL, nextAttemptAt = NULL, leaseExpiresAt = NULL,
+             lastHeartbeatAt = ?, updatedAt = ?
+         WHERE id = ? AND status = 'claimed' AND agentId = ? AND claimToken = ?
+           AND claimGeneration = ?
+           AND leaseExpiresAt IS NOT NULL AND leaseExpiresAt > ? AND deadlineAt > ?`).run(JSON.stringify(input.result), now, now, now, requestId, input.agentId.trim(), input.claimToken.trim(), input.claimGeneration, now, now);
+    return result.changes === 1 ? { ok: true } : { ok: false, message: "RepositoryAgent completion rejected by lease fencing" };
+  }
+  fail(requestId, input) {
+    const nowDate = this.currentDate();
+    const now = nowDate.toISOString();
+    const message = String(input.message ?? "RepositoryAgent request failed").slice(0, 4000);
+    const authority = this.db.prepare(`SELECT claimAttempts, deadlineAt
+         FROM repository_agent_requests
+         WHERE id = ? AND status = 'claimed' AND agentId = ? AND claimToken = ?
+           AND claimGeneration = ? AND leaseExpiresAt IS NOT NULL AND leaseExpiresAt > ?
+         LIMIT 1`).get(requestId, input.agentId.trim(), input.claimToken.trim(), input.claimGeneration, now);
+    if (!authority) {
+      return { ok: false, message: "RepositoryAgent failure rejected by lease fencing" };
+    }
+    const claimAttempts = Number(authority.claimAttempts ?? 0);
+    const deadlineMs = Date.parse(authority.deadlineAt);
+    const retryable = parseRetryableError(message).retryable;
+    const retryAtMs = nowDate.getTime() + retryDelayMs(claimAttempts);
+    const mayRetry = retryable && claimAttempts < this.maxClaimAttempts && Number.isFinite(deadlineMs) && retryAtMs < deadlineMs;
+    if (mayRetry) {
+      const nextAttemptAt = new Date(retryAtMs).toISOString();
+      const requeued = this.db.prepare(`UPDATE repository_agent_requests
+           SET status = 'pending', agentId = NULL, claimToken = NULL,
+               leaseExpiresAt = NULL, lastHeartbeatAt = NULL, claimedAt = NULL,
+               nextAttemptAt = ?, error = ?, failedAt = NULL, updatedAt = ?
+           WHERE id = ? AND status = 'claimed' AND agentId = ? AND claimToken = ?
+             AND claimGeneration = ? AND leaseExpiresAt IS NOT NULL AND leaseExpiresAt > ?`).run(nextAttemptAt, message, now, requestId, input.agentId.trim(), input.claimToken.trim(), input.claimGeneration, now);
+      return requeued.changes === 1 ? { ok: true, requeued: true, nextAttemptAt } : { ok: false, message: "RepositoryAgent failure rejected by lease fencing" };
+    }
+    const deadlineExpired = !Number.isFinite(deadlineMs) || deadlineMs <= nowDate.getTime();
+    const attemptsExhausted = retryable && claimAttempts >= this.maxClaimAttempts;
+    const retryDeadlineExhausted = retryable && !attemptsExhausted && retryAtMs >= deadlineMs;
+    const deadLettered = attemptsExhausted || retryDeadlineExhausted;
+    const terminalError = attemptsExhausted ? retryExhaustedError(message, claimAttempts) : retryDeadlineExhausted ? retryDeadlineExhaustedError(message, claimAttempts) : deadlineExpired ? "RepositoryAgent request deadline expired" : message;
+    const failed = this.db.prepare(`UPDATE repository_agent_requests
+         SET status = 'failed', error = ?, failedAt = ?, nextAttemptAt = NULL,
+             leaseExpiresAt = NULL, claimToken = NULL, lastHeartbeatAt = ?, updatedAt = ?
+         WHERE id = ? AND status = 'claimed' AND agentId = ? AND claimToken = ?
+           AND claimGeneration = ? AND leaseExpiresAt IS NOT NULL AND leaseExpiresAt > ?`).run(terminalError, now, now, now, requestId, input.agentId.trim(), input.claimToken.trim(), input.claimGeneration, now);
+    return failed.changes === 1 ? { ok: true, ...deadLettered ? { deadLettered: true } : {} } : { ok: false, message: "RepositoryAgent failure rejected by lease fencing" };
+  }
+  recoverExpiredClaims(nowInput) {
+    const parsed = nowInput instanceof Date ? nowInput : nowInput ? new Date(nowInput) : this.currentDate();
+    const nowDate = Number.isFinite(parsed.getTime()) ? parsed : this.currentDate();
+    const now = nowDate.toISOString();
+    const rows = this.db.prepare(`SELECT id, claimAttempts, error FROM repository_agent_requests
+         WHERE status = 'claimed' AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+           AND deadlineAt > ? ORDER BY createdAt ASC`).all(now, now);
+    if (rows.length === 0)
+      return { recovered: 0, requestIds: [] };
+    const recover = this.db.prepare(`UPDATE repository_agent_requests
+       SET status = 'pending', agentId = NULL, claimToken = NULL,
+           leaseExpiresAt = NULL, lastHeartbeatAt = NULL, claimedAt = NULL,
+           nextAttemptAt = ?, updatedAt = ?
+       WHERE id = ? AND status = 'claimed'
+         AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?) AND deadlineAt > ?`);
+    const deadLetter = this.db.prepare(`UPDATE repository_agent_requests
+       SET status = 'failed', agentId = NULL, claimToken = NULL,
+           leaseExpiresAt = NULL, nextAttemptAt = NULL, failedAt = ?, updatedAt = ?,
+           error = ?
+       WHERE id = ? AND status = 'claimed'
+         AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?) AND deadlineAt > ?`);
+    const recoveredIds = [];
+    for (const row of rows) {
+      const claimAttempts = Number(row.claimAttempts ?? 0);
+      if (claimAttempts >= this.maxClaimAttempts) {
+        deadLetter.run(now, now, retryExhaustedError(row.error ?? JSON.stringify({
+          code: "repository_agent_lease_expired",
+          message: "RepositoryAgent worker lease repeatedly expired",
+          retryable: true
+        }), claimAttempts), row.id, now, now);
+        continue;
+      }
+      const nextAttemptAt = new Date(nowDate.getTime() + retryDelayMs(claimAttempts)).toISOString();
+      if (recover.run(nextAttemptAt, now, row.id, now, now).changes === 1) {
+        recoveredIds.push(row.id);
+      }
+    }
+    return { recovered: recoveredIds.length, requestIds: recoveredIds };
+  }
+  deadLetterExhaustedPending(now) {
+    const error = JSON.stringify({
+      code: "repository_agent_retry_exhausted",
+      message: "RepositoryAgent request exhausted bounded attempts before claim",
+      retryable: false
+    });
+    return this.db.prepare(`UPDATE repository_agent_requests
+         SET status = 'failed', failedAt = ?, updatedAt = ?, nextAttemptAt = NULL,
+             error = ?
+         WHERE status = 'pending' AND claimAttempts >= ? AND deadlineAt > ?`).run(now, now, error, this.maxClaimAttempts, now).changes;
+  }
+  expirePastDeadlines(nowInput) {
+    const parsed = nowInput instanceof Date ? nowInput : nowInput ? new Date(nowInput) : this.currentDate();
+    const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : this.currentDate().toISOString();
+    return this.db.prepare(`UPDATE repository_agent_requests
+         SET status = 'failed', error = 'RepositoryAgent request deadline expired',
+             failedAt = ?, agentId = NULL, claimToken = NULL, nextAttemptAt = NULL,
+             leaseExpiresAt = NULL, updatedAt = ?
+         WHERE status IN ('pending', 'claimed') AND deadlineAt <= ?`).run(now, now, now).changes;
+  }
+  countByStatus() {
+    const counts = {
+      pending: 0,
+      claimed: 0,
+      completed: 0,
+      failed: 0
+    };
+    const rows = this.db.prepare(`SELECT status, COUNT(*) AS count FROM repository_agent_requests GROUP BY status`).all();
+    for (const row of rows) {
+      if (row.status in counts)
+        counts[row.status] = Number(row.count ?? 0);
+    }
+    return counts;
+  }
+  pruneTerminal(options = {}) {
+    const parsed = options.now instanceof Date ? options.now : options.now ? new Date(options.now) : this.currentDate();
+    const now = Number.isFinite(parsed.getTime()) ? parsed : this.currentDate();
+    const rawRetentionMs = Number(options.retentionMs);
+    const retentionMs = Number.isFinite(rawRetentionMs) ? Math.max(0, Math.min(365 * 24 * 60 * 60000, Math.floor(rawRetentionMs))) : this.terminalRetentionMs;
+    const limit = Math.max(1, Math.min(5000, Math.floor(Number(options.limit) || 500)));
+    const cutoff = new Date(now.getTime() - retentionMs).toISOString();
+    const rows = this.db.prepare(`SELECT id FROM repository_agent_requests
+         WHERE status IN ('completed', 'failed')
+           AND COALESCE(completedAt, failedAt, updatedAt) <= ?
+         ORDER BY COALESCE(completedAt, failedAt, updatedAt) ASC
+         LIMIT ?`).all(cutoff, limit);
+    if (rows.length === 0)
+      return { pruned: 0, requestIds: [] };
+    const placeholders = rows.map(() => "?").join(",");
+    const result = this.db.prepare(`DELETE FROM repository_agent_requests
+         WHERE status IN ('completed', 'failed') AND id IN (${placeholders})`).run(...rows.map((row) => row.id));
+    return { pruned: result.changes, requestIds: rows.map((row) => row.id) };
+  }
+  healthSummary(nowInput = this.currentDate()) {
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const nowDate = Number.isFinite(parsed.getTime()) ? parsed : this.currentDate();
+    const now = nowDate.toISOString();
+    const active = this.db.prepare(`SELECT
+           MIN(CASE WHEN status = 'pending' THEN createdAt END) AS oldestPendingAt,
+           MIN(CASE WHEN status = 'claimed' THEN COALESCE(claimedAt, updatedAt) END) AS oldestClaimedAt,
+           SUM(CASE WHEN status = 'pending' AND nextAttemptAt > ? THEN 1 ELSE 0 END) AS delayedRetryCount,
+           SUM(CASE WHEN status = 'claimed' AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?) THEN 1 ELSE 0 END) AS staleClaimCount,
+           SUM(CASE WHEN status IN ('pending', 'claimed') AND deadlineAt <= ? THEN 1 ELSE 0 END) AS pastDeadlineActiveCount,
+           SUM(CASE WHEN status = 'pending' AND claimAttempts >= ? THEN 1 ELSE 0 END) AS exhaustedPendingCount
+         FROM repository_agent_requests`).get(now, now, now, this.maxClaimAttempts);
+    const age = (timestamp) => {
+      const value = timestamp ? Date.parse(timestamp) : Number.NaN;
+      return Number.isFinite(value) ? Math.max(0, nowDate.getTime() - value) : 0;
+    };
+    const oldestPendingAgeMs = age(active.oldestPendingAt);
+    const oldestClaimedAgeMs = age(active.oldestClaimedAt);
+    const staleClaimCount = Number(active.staleClaimCount ?? 0);
+    const pastDeadlineActiveCount = Number(active.pastDeadlineActiveCount ?? 0);
+    const exhaustedPendingCount = Number(active.exhaustedPendingCount ?? 0);
+    return {
+      counts: this.countByStatus(),
+      oldestPendingAgeMs,
+      oldestClaimedAgeMs,
+      delayedRetryCount: Number(active.delayedRetryCount ?? 0),
+      staleClaimCount,
+      pastDeadlineActiveCount,
+      exhaustedPendingCount,
+      maxClaimAttempts: this.maxClaimAttempts,
+      pendingUnhealthyAfterMs: HEALTH_PENDING_UNHEALTHY_AFTER_MS,
+      unhealthy: oldestPendingAgeMs >= HEALTH_PENDING_UNHEALTHY_AFTER_MS || staleClaimCount > 0 || pastDeadlineActiveCount > 0 || exhaustedPendingCount > 0
+    };
+  }
+  close() {
+    this.db.close();
+  }
+}
+
+// apps/server/src/repository_agent_context.ts
+import { existsSync as existsSync3, realpathSync as realpathSync3, statSync as statSync3 } from "fs";
+import { resolve as resolve5 } from "path";
+function canonicalPath2(path) {
+  const resolved = resolve5(path);
+  const canonical = existsSync3(resolved) ? realpathSync3.native(resolved) : resolved;
+  const normalized = canonical.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+async function registeredWorktrees(canonicalRepoRoot) {
+  const result = await runBoundedProcess(["git", "-C", canonicalRepoRoot, "worktree", "list", "--porcelain", "-z"], {
+    timeoutMs: 5000,
+    outputLimitBytes: 512 * 1024,
+    streamDrainTimeoutMs: 1000
+  });
+  if (result.timedOut || result.drainTimedOut || result.exitCode !== 0)
+    return [];
+  const worktrees = [];
+  const seen = new Set;
+  let current = null;
+  const appendCurrent = () => {
+    if (!current || seen.has(current.root))
+      return;
+    seen.add(current.root);
+    worktrees.push(current);
+  };
+  for (const field of result.stdout.split("\x00")) {
+    if (!field) {
+      appendCurrent();
+      current = null;
+      continue;
+    }
+    if (field.startsWith("worktree ")) {
+      appendCurrent();
+      current = null;
+      const raw = field.slice("worktree ".length).trim();
+      if (!raw || !existsSync3(raw))
+        continue;
+      try {
+        if (!statSync3(raw).isDirectory())
+          continue;
+        current = { root: canonicalPath2(raw), head: null };
+      } catch {}
+      continue;
+    }
+    if (current && field.startsWith("HEAD ")) {
+      const head = field.slice("HEAD ".length).trim().toLowerCase();
+      current.head = /^[0-9a-f]{7,128}$/.test(head) ? head : null;
+    }
+  }
+  appendCurrent();
+  return worktrees;
+}
+function assertSameRepository(canonicalIdentity, candidateIdentity) {
+  if (candidateIdentity.repositoryId !== canonicalIdentity.repositoryId || candidateIdentity.gitCommonDir !== canonicalIdentity.gitCommonDir) {
+    throw new Error("requested worktree does not belong to the registered repository");
+  }
+}
+function snapshotMatchesRequested(snapshot, requested) {
+  const revision = String(requested?.revision ?? "").trim();
+  const tree = String(requested?.tree ?? "").trim();
+  return (!revision || snapshot.revision === revision) && (!tree || snapshot.tree === tree) && (typeof requested?.dirty !== "boolean" || snapshot.dirty === requested.dirty);
+}
+async function resolveRepositoryAgentContext(options) {
+  const canonicalRepoRoot = canonicalPath2(options.canonicalRepoRoot);
+  const canonicalSnapshot = await resolveRepositorySnapshot(canonicalRepoRoot, {
+    timeoutMs: 1e4
+  });
+  const requestedIdentity = String(options.requested?.identity ?? "").trim();
+  if (requestedIdentity && requestedIdentity !== canonicalSnapshot.identity) {
+    throw new Error("RepositoryAgent request identity does not match the server repository");
+  }
+  const requestedRoot = String(options.requested?.root ?? "").trim();
+  let repositoryRoot = canonicalRepoRoot;
+  let requestedRootMapped = Boolean(requestedRoot && canonicalPath2(requestedRoot) !== canonicalRepoRoot);
+  let exactHostRootSelected = false;
+  if (requestedRoot && existsSync3(requestedRoot)) {
+    if (!statSync3(requestedRoot).isDirectory()) {
+      throw new Error("RepositoryAgent requested repository root is not a directory");
+    }
+    const canonicalRequestedRoot = canonicalPath2(requestedRoot);
+    if (canonicalRequestedRoot === canonicalRepoRoot) {
+      requestedRootMapped = false;
+      exactHostRootSelected = true;
+    } else {
+      const registrations = await registeredWorktrees(canonicalRepoRoot);
+      const registration = registrations.find((entry) => entry.root === canonicalRequestedRoot);
+      if (!registration) {
+        throw new Error("RepositoryAgent requested worktree is not registered with this repository");
+      }
+      const canonicalIdentity = await resolveRepositoryIdentity(canonicalRepoRoot);
+      const requestedRepoIdentity = await resolveRepositoryIdentity(requestedRoot);
+      assertSameRepository(canonicalIdentity, requestedRepoIdentity);
+      repositoryRoot = registration.root;
+      requestedRootMapped = false;
+      exactHostRootSelected = true;
+    }
+  }
+  let snapshot = repositoryRoot === canonicalRepoRoot ? canonicalSnapshot : await resolveRepositorySnapshot(repositoryRoot, { timeoutMs: 1e4 });
+  if (!exactHostRootSelected && !snapshotMatchesRequested(snapshot, options.requested)) {
+    const canonicalIdentity = await resolveRepositoryIdentity(canonicalRepoRoot);
+    const requestedRevision2 = String(options.requested?.revision ?? "").trim().toLowerCase();
+    const candidates = await registeredWorktrees(canonicalRepoRoot);
+    let mapped = null;
+    for (const candidate of candidates) {
+      if (candidate.root === canonicalRepoRoot)
+        continue;
+      if (requestedRevision2 && candidate.head && candidate.head !== requestedRevision2)
+        continue;
+      try {
+        const candidateIdentity = await resolveRepositoryIdentity(candidate.root);
+        assertSameRepository(canonicalIdentity, candidateIdentity);
+        const candidateSnapshot = await resolveRepositorySnapshot(candidate.root, {
+          timeoutMs: 1e4
+        });
+        if (candidateSnapshot.identity === canonicalSnapshot.identity && snapshotMatchesRequested(candidateSnapshot, options.requested)) {
+          mapped = candidateSnapshot;
+          break;
+        }
+      } catch {}
+    }
+    if (mapped) {
+      snapshot = mapped;
+      repositoryRoot = mapped.root;
+      requestedRootMapped = true;
+    }
+  }
+  if (repositoryRoot !== canonicalRepoRoot) {
+    const [canonicalIdentity, selectedIdentity] = await Promise.all([
+      resolveRepositoryIdentity(canonicalRepoRoot),
+      resolveRepositoryIdentity(repositoryRoot)
+    ]);
+    assertSameRepository(canonicalIdentity, selectedIdentity);
+    if (canonicalPath2(snapshot.root) !== canonicalPath2(repositoryRoot)) {
+      throw new Error("RepositoryAgent snapshot root does not match the registered worktree");
+    }
+  }
+  const { revision, tree, dirty } = snapshot;
+  const requestedRevision = String(options.requested?.revision ?? "").trim();
+  if (requestedRevision && requestedRevision !== revision) {
+    throw new Error(`RepositoryAgent baseline is stale: requested ${requestedRevision}, server has ${revision}`);
+  }
+  const requestedTree = String(options.requested?.tree ?? "").trim();
+  if (requestedTree && requestedTree !== tree) {
+    throw new Error("RepositoryAgent content-tree fingerprint is stale");
+  }
+  return {
+    repository: {
+      identity: canonicalSnapshot.identity,
+      root: repositoryRoot,
+      revision,
+      tree,
+      dirty
+    },
+    requestedRootMapped
+  };
+}
+
+// apps/server/src/repository_agent_memory_feedback.ts
+async function applyRepositoryAgentMemoryFeedbackBatch(input) {
+  const logger = input.logger ?? console;
+  const batchLimit = Math.max(1, Math.min(100, Math.floor(input.limit ?? 20)));
+  let scanned = 0;
+  let appliedCount = 0;
+  let deferred = 0;
+  let missingRecords = 0;
+  let staleRecords = 0;
+  while (scanned < batchLimit) {
+    const feedback = input.autonomyStore.claimRepositoryAgentMemoryFeedback(1, 5 * 60000)[0];
+    if (!feedback)
+      break;
+    scanned += 1;
+    try {
+      const result = await applyRepositoryAgentMemoryFeedback(input.memoryStore, feedback);
+      const replacedRecords = result.failed.filter((entry) => entry.code === "record_conflict");
+      const retryableFailures = result.failed.filter((entry) => entry.code !== "record_conflict");
+      if (retryableFailures.length > 0) {
+        throw new Error(`failed to reinforce ${retryableFailures.length}/${result.attempted} memory record(s): ${retryableFailures.map((entry) => `${entry.namespace}/${entry.key}: ${entry.message}`).join("; ")}`);
+      }
+      missingRecords += result.missing.length + replacedRecords.length;
+      staleRecords += replacedRecords.length;
+      if (result.missing.length > 0 || replacedRecords.length > 0) {
+        logger.warn(`[Memory] authoritative RepositoryAgent outcome ${feedback.observationId} referenced ` + `${result.missing.length} expired/removed and ${replacedRecords.length} replaced ` + `record(s); remaining records were applied.`);
+      }
+      const acknowledged = input.autonomyStore.markRepositoryAgentMemoryFeedback(feedback.observationId, {
+        claimToken: feedback.claimToken,
+        claimGeneration: feedback.claimGeneration
+      }, true);
+      if (!acknowledged) {
+        throw new Error("feedback claim expired or was superseded before acknowledgement");
+      }
+      appliedCount += 1;
+    } catch (error) {
+      input.autonomyStore.markRepositoryAgentMemoryFeedback(feedback.observationId, {
+        claimToken: feedback.claimToken,
+        claimGeneration: feedback.claimGeneration
+      }, false, error);
+      deferred += 1;
+      logger.error(`[Memory] RepositoryAgent outcome reinforcement ${feedback.observationId} failed and will be retried: ${String(error instanceof Error ? error.message : error)}`);
+    }
+  }
+  return {
+    scanned,
+    applied: appliedCount,
+    deferred,
+    missingRecords,
+    staleRecords
+  };
+}
+async function applyRepositoryAgentMemoryFeedback(memoryStore, feedback) {
+  return reinforceRepositoryAgentMemoryRefs({
+    memory: memoryStore,
+    repositoryId: feedback.repositoryId,
+    memoryRefs: feedback.memoryRefs,
+    outcome: feedback.outcome,
+    observationId: feedback.observationId,
+    weight: feedback.weight,
+    provenance: {
+      service: "server",
+      requestId: feedback.repositoryAgentRequestId,
+      runId: feedback.objectiveId
+    }
+  });
+}
+
+// apps/server/src/memory_http_authority.ts
+var CALLER_SERVICES2 = new Set([
+  "server",
+  "localbuddy",
+  "remotebuddy",
+  "workerpals",
+  "source_control_manager",
+  "repository_agent",
+  "cli",
+  "client"
+]);
+var INTERNAL_NAMESPACES = new Set(REPOSITORY_AGENT_MEMORY_NAMESPACES);
+function callerServiceFromHeader(value) {
+  const normalized = String(value ?? "").trim();
+  return CALLER_SERVICES2.has(normalized) ? normalized : null;
+}
+function authorityFromHeader(value) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized)
+    return null;
+  return normalized === "repository_agent" || normalized === "server" ? normalized : "invalid";
+}
+function authorizeMemoryHttpRequest(input) {
+  const callerService = callerServiceFromHeader(input.headers.get(MEMORY_HTTP_CALLER_HEADER));
+  if (!callerService) {
+    return { allowed: false, message: "A recognized memory caller service is required" };
+  }
+  const authority = authorityFromHeader(input.headers.get(MEMORY_HTTP_AUTHORITY_HEADER));
+  if (authority === "invalid") {
+    return { allowed: false, message: "The requested memory authority is not recognized" };
+  }
+  if (authority === "repository_agent" && callerService !== "repository_agent") {
+    return { allowed: false, message: "RepositoryAgent memory authority is not valid here" };
+  }
+  if (authority === "server" && callerService !== "server") {
+    return { allowed: false, message: "Server memory authority is not valid here" };
+  }
+  const namespace = String(input.namespace ?? "").trim();
+  const isInternalNamespace = INTERNAL_NAMESPACES.has(namespace);
+  const hasServerAuthority = callerService === "server" && authority === "server";
+  if (input.operation === "prune" && (!namespace || isInternalNamespace) && !hasServerAuthority) {
+    return {
+      allowed: false,
+      message: "Global and RepositoryAgent memory pruning is reserved for Server"
+    };
+  }
+  const repositoryAgentConfirmation = input.operation === "reinforce" && isInternalNamespace && authority === "repository_agent" && input.reinforcementOutcome === "confirmed";
+  if (input.operation === "reinforce" && isInternalNamespace && !hasServerAuthority && !repositoryAgentConfirmation) {
+    return {
+      allowed: false,
+      message: "RepositoryAgent memory reinforcement is reserved for Server"
+    };
+  }
+  if (isInternalNamespace && authority !== "repository_agent" && authority !== "server") {
+    return {
+      allowed: false,
+      message: `Memory namespace ${namespace} is internal to RepositoryAgent`
+    };
+  }
+  return { allowed: true, callerService, authority };
+}
+function memoryHttpReinforcementOutcome(body) {
+  const input = body.input;
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    return null;
+  return input.outcome;
+}
+function memoryHttpNamespace(operation, body) {
+  const input = operation === "get" ? body.address : operation === "search" ? body.query : operation === "invalidate" ? body.selector : operation === "prune" ? body.options : body.input;
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    return null;
+  const scope = input.scope;
+  if (!scope || typeof scope !== "object" || Array.isArray(scope))
+    return null;
+  const namespace = scope.namespace;
+  return typeof namespace === "string" ? namespace.trim() : null;
+}
+
 // apps/server/src/client_presence.ts
 var DISCONNECTED_RETENTION_MS = 10 * 60 * 1000;
 var CONNECTED_RETENTION_MS = 90 * 1000;
-function compactText(value, maxChars) {
+function compactText2(value, maxChars) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (!text)
     return "";
@@ -20536,7 +25380,7 @@ function compactText(value, maxChars) {
   return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 function normalizeKind(value) {
-  const text = compactText(value, 48).toLowerCase();
+  const text = compactText2(value, 48).toLowerCase();
   if (!text)
     return "";
   return text.replace(/[^a-z0-9._-]+/g, "_");
@@ -20556,23 +25400,23 @@ function defaultLabelForKind(kind) {
   }
 }
 function readHeader(headers, name) {
-  return compactText(headers.get(name), 512);
+  return compactText2(headers.get(name), 512);
 }
 function readParam(url, name) {
-  return compactText(url.searchParams.get(name), 512);
+  return compactText2(url.searchParams.get(name), 512);
 }
 function normalizeMetadata(value, userAgent) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
   const record = value;
-  const clientId = compactText(record.clientId, 128);
+  const clientId = compactText2(record.clientId, 128);
   const kind = normalizeKind(record.kind);
   if (!clientId || !kind)
     return null;
-  const label = compactText(record.label, 120) || defaultLabelForKind(kind);
-  const version = compactText(record.version, 64);
-  const platform = compactText(record.platform, 120);
-  const repoRoot = compactText(record.repoRoot, 400);
+  const label = compactText2(record.label, 120) || defaultLabelForKind(kind);
+  const version = compactText2(record.version, 64);
+  const platform = compactText2(record.platform, 120);
+  const repoRoot = compactText2(record.repoRoot, 400);
   return {
     clientId,
     kind,
@@ -20740,11 +25584,11 @@ class ClientPresenceRegistry {
 }
 
 // apps/server/src/server_main.ts
-import { randomUUID as randomUUID6 } from "crypto";
+import { randomUUID as randomUUID9 } from "crypto";
 import { mkdirSync as mkdirSync2 } from "fs";
 
 // apps/server/src/runtime_config.ts
-import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync3, writeFileSync } from "fs";
+import { existsSync as existsSync4, mkdirSync, readFileSync as readFileSync4, writeFileSync } from "fs";
 import { dirname as dirname2, join as join3, relative } from "path";
 function getRuntimeConfigFiles(config) {
   return {
@@ -20837,7 +25681,7 @@ function normalizeTomlKey(rawKey) {
 }
 function patchEnvFile(path, changes) {
   ensureParentDir(path);
-  const original = existsSync2(path) ? readFileSync3(path, "utf8") : "";
+  const original = existsSync4(path) ? readFileSync4(path, "utf8") : "";
   const eol = detectEol(original);
   const lines = original.length > 0 ? original.split(/\r?\n/) : [];
   const indexByKey = new Map;
@@ -20875,7 +25719,7 @@ function serializeEnvValue(value) {
 }
 function patchTomlFile(path, changes) {
   ensureParentDir(path);
-  const original = existsSync2(path) ? readFileSync3(path, "utf8") : "";
+  const original = existsSync4(path) ? readFileSync4(path, "utf8") : "";
   const eol = detectEol(original);
   const lines = original.length > 0 ? original.split(/\r?\n/) : [];
   for (const change of changes) {
@@ -21072,7 +25916,7 @@ function parseJsonRecord(value) {
     return {};
   }
 }
-function compactText2(value, maxChars) {
+function compactText3(value, maxChars) {
   return String(value ?? "").trim().slice(0, maxChars);
 }
 function stringValues(...values) {
@@ -21096,9 +25940,19 @@ function extractAutonomyPayloadDetails(value) {
   const paramsAutonomy = objectRecord(params.autonomy);
   const planning = objectRecord(params.planning);
   const scope = objectRecord(planning?.scope);
-  const patternKey = compactText2(metadataAutonomy?.patternKey ?? metadataAutonomy?.pattern_key ?? paramsAutonomy?.patternKey ?? paramsAutonomy?.pattern_key, 240) || null;
+  const validationIncident = objectRecord(metadataAutonomy?.validationIncident ?? metadataAutonomy?.validation_incident) ?? objectRecord(paramsAutonomy?.validationIncident ?? paramsAutonomy?.validation_incident);
+  const validationIncidentId = compactText3(validationIncident?.incidentId ?? validationIncident?.incident_id, 256) || null;
+  const objectiveId = compactText3(metadataAutonomy?.objectiveId ?? metadataAutonomy?.objective_id ?? paramsAutonomy?.objectiveId ?? paramsAutonomy?.objective_id, 128) || null;
+  const snapshotId = compactText3(metadataAutonomy?.snapshotId ?? metadataAutonomy?.snapshot_id ?? paramsAutonomy?.snapshotId ?? paramsAutonomy?.snapshot_id, 128) || null;
+  const reservationRequired = Boolean(metadataAutonomy?.reservationRequired === true || metadataAutonomy?.reservation_required === true || paramsAutonomy?.reservationRequired === true || paramsAutonomy?.reservation_required === true);
+  const patternKey = compactText3(metadataAutonomy?.patternKey ?? metadataAutonomy?.pattern_key ?? paramsAutonomy?.patternKey ?? paramsAutonomy?.pattern_key, 240) || null;
   return {
+    objectiveId,
+    snapshotId,
     patternKey,
+    reservationRequired,
+    validationIncidentId,
+    isValidationIncidentRepair: Boolean(validationIncidentId),
     targetPaths: stringValues(metadataAutonomy?.targetPaths, metadataAutonomy?.target_paths, metadataAutonomy?.targetPath, metadataAutonomy?.target_path, paramsAutonomy?.targetPaths, paramsAutonomy?.target_paths, paramsAutonomy?.targetPath, paramsAutonomy?.target_path, params.paths, params.path, params.targetPaths, params.target_paths, params.targetPath, params.target_path, planning?.targetPaths, planning?.target_paths, planning?.targetPath, planning?.target_path, value.targetPaths, value.target_paths, value.targetPath, value.target_path),
     writeGlobs: stringValues(metadataAutonomy?.writeGlobs, metadataAutonomy?.write_globs, metadataAutonomy?.writeGlob, metadataAutonomy?.write_glob, paramsAutonomy?.writeGlobs, paramsAutonomy?.write_globs, paramsAutonomy?.writeGlob, paramsAutonomy?.write_glob, scope?.writeGlobs, scope?.write_globs, scope?.writeGlob, scope?.write_glob)
   };
@@ -21155,6 +26009,16 @@ var jobQueue = new JobQueue(sharedDbPath);
 var requestQueue = new RequestQueue(sharedDbPath);
 var completionQueue = new CompletionQueue(sharedDbPath);
 var autonomyStore = new AutonomyStore(sharedDbPath);
+var memoryStore = new SqliteMemoryStore(sharedDbPath);
+var repositoryAgentQueue = new RepositoryAgentQueue(sharedDbPath);
+var repositoryServices = createRepositoryAgentServiceClients({
+  serverUrl: STARTUP_CONFIG.server.url,
+  callerService: "server",
+  callerInstanceId: `server-${process.pid}`,
+  memoryAuthority: "server",
+  memoryStore
+});
+var repositoryAgentRepoRoot = detectRepoRoot(process.cwd());
 var reconciliationTracker = new LifecycleReconciliationTracker;
 function guardedReconciliation(label, fallback, reconcile) {
   return reconciliationTracker.run(label, fallback, reconcile, (detail) => {
@@ -21173,6 +26037,8 @@ var requestHandoffChainReconciliation = guardedReconciliation("request retry cha
 }, () => requestQueue.reconcileRecoveredWorkerHandoffChains());
 var requestLeaseReconciliation = guardedReconciliation("request lease", { recovered: 0, requestIds: [] }, () => requestQueue.recoverExpiredClaims());
 var completionLeaseReconciliation = guardedReconciliation("completion lease", { recovered: 0, completionIds: [] }, () => completionQueue.recoverExpiredClaims());
+var repositoryAgentLeaseReconciliation = guardedReconciliation("repository agent lease", { recovered: 0, requestIds: [] }, () => repositoryAgentQueue.recoverExpiredClaims());
+guardedReconciliation("repository agent deadlines", 0, () => repositoryAgentQueue.expirePastDeadlines());
 var lifecycleReconciliation = guardedReconciliation("completion lifecycle", { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 }, () => autonomyStore.reconcileJobLinkedOutcomeLifecycle());
 var reservationReconciliation = guardedReconciliation("autonomy reservation", { linked: 0, failed: 0 }, () => autonomyStore.reconcileGatedObjectiveReservations());
 var handoffReconciliation = guardedReconciliation("worker handoff", { linked: 0, failed: 0, pending: 0, scanned: 0 }, () => autonomyStore.reconcileObjectiveWorkerHandoffs());
@@ -21199,6 +26065,9 @@ if (requestHandoffChainReconciliation.cycleDetected > 0 || requestHandoffChainRe
 }
 if (completionLeaseReconciliation.recovered > 0) {
   console.warn(`[Server] Requeued ${completionLeaseReconciliation.recovered} completion(s) with expired publication leases.`);
+}
+if (repositoryAgentLeaseReconciliation.recovered > 0) {
+  console.warn(`[Server] Requeued ${repositoryAgentLeaseReconciliation.recovered} RepositoryAgent request(s) with expired leases.`);
 }
 var lifecycleWatchdogTimer = setInterval(() => {
   const requestHandoffChainRecovery = guardedReconciliation("request retry chain", {
@@ -21228,6 +26097,15 @@ var lifecycleWatchdogTimer = setInterval(() => {
   if (completionLeaseRecovery.recovered > 0) {
     console.warn(`[Server] Periodic watchdog requeued ${completionLeaseRecovery.recovered} completion(s) with expired publication leases.`);
   }
+  const repositoryAgentLeaseRecovery = guardedReconciliation("repository agent lease", { recovered: 0, requestIds: [] }, () => repositoryAgentQueue.recoverExpiredClaims());
+  const expiredRepositoryAgentRequests = guardedReconciliation("repository agent deadlines", 0, () => repositoryAgentQueue.expirePastDeadlines());
+  const repositoryAgentRetention = guardedReconciliation("repository agent retention", { pruned: 0, requestIds: [] }, () => repositoryAgentQueue.pruneTerminal());
+  if (repositoryAgentLeaseRecovery.recovered > 0 || expiredRepositoryAgentRequests > 0) {
+    console.warn(`[Server] RepositoryAgent watchdog recovered=${repositoryAgentLeaseRecovery.recovered} expired=${expiredRepositoryAgentRequests}.`);
+  }
+  if (repositoryAgentRetention.pruned > 0) {
+    console.log(`[Server] RepositoryAgent watchdog pruned=${repositoryAgentRetention.pruned} terminal request(s).`);
+  }
   const completionLifecycleRecovery = guardedReconciliation("completion lifecycle", { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 }, () => autonomyStore.reconcileJobLinkedOutcomeLifecycle());
   if (completionLifecycleRecovery.correctedFailures > 0 || completionLifecycleRecovery.removedPrematureSuccesses > 0 || completionLifecycleRecovery.correctedObjectives > 0) {
     console.warn(`[Server] Periodic completion-lifecycle reconciliation: ${JSON.stringify(completionLifecycleRecovery)}`);
@@ -21250,6 +26128,79 @@ var clientPresencePruneTimer = setInterval(() => {
   }
 }, 60000);
 clientPresencePruneTimer.unref?.();
+var SHARED_MEMORY_MAINTENANCE_INTERVAL_MS = 15 * 60000;
+var SHARED_MEMORY_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60000;
+var sharedMemoryMaintenanceRunning = false;
+var sharedMemoryMaintenanceTimer = setInterval(() => {
+  if (sharedMemoryMaintenanceRunning)
+    return;
+  sharedMemoryMaintenanceRunning = true;
+  memoryStore.prune({
+    updatedBefore: new Date(Date.now() - SHARED_MEMORY_TERMINAL_RETENTION_MS).toISOString(),
+    statuses: ["invalid", "stale", "superseded"]
+  }).then((removed) => {
+    if (removed > 0)
+      console.log(`[Memory] pruned ${removed} expired/terminal record(s)`);
+  }).catch((error) => {
+    console.error(`[Memory] periodic pruning failed and will be retried: ${String(error)}`);
+  }).finally(() => {
+    sharedMemoryMaintenanceRunning = false;
+  });
+}, SHARED_MEMORY_MAINTENANCE_INTERVAL_MS);
+sharedMemoryMaintenanceTimer.unref?.();
+var REPOSITORY_AGENT_MEMORY_FEEDBACK_INTERVAL_MS = 30000;
+var repositoryAgentMemoryFeedbackState = {
+  running: false,
+  lastStartedAt: null,
+  lastCompletedAt: null,
+  lastError: null,
+  lastQueued: 0,
+  lastBatch: null
+};
+var repositoryAgentMemoryFeedbackTask = null;
+function reconcileRepositoryAgentMemoryFeedback() {
+  if (repositoryAgentMemoryFeedbackTask)
+    return repositoryAgentMemoryFeedbackTask;
+  repositoryAgentMemoryFeedbackTask = (async () => {
+    repositoryAgentMemoryFeedbackState.running = true;
+    repositoryAgentMemoryFeedbackState.lastStartedAt = new Date().toISOString();
+    let reconciliationFailed = false;
+    try {
+      const queued = reconciliationTracker.run("repository agent memory feedback", { queued: 0 }, () => autonomyStore.reconcileRepositoryAgentMemoryFeedback(), (detail) => {
+        reconciliationFailed = true;
+        repositoryAgentMemoryFeedbackState.lastError = detail.slice(0, 2000);
+        console.error(`[Memory] RepositoryAgent outcome reconciliation failed and will be retried: ${detail}`);
+      });
+      if (queued.queued > 0) {
+        console.log(`[Memory] queued ${queued.queued} authoritative RepositoryAgent outcome(s).`);
+      }
+      repositoryAgentMemoryFeedbackState.lastQueued = queued.queued;
+      const batch = await applyRepositoryAgentMemoryFeedbackBatch({
+        autonomyStore,
+        memoryStore,
+        limit: 20
+      });
+      repositoryAgentMemoryFeedbackState.lastBatch = batch;
+      if (!reconciliationFailed) {
+        repositoryAgentMemoryFeedbackState.lastError = batch.deferred > 0 ? `${batch.deferred}/${batch.scanned} RepositoryAgent feedback deliveries deferred` : null;
+      }
+    } catch (error) {
+      repositoryAgentMemoryFeedbackState.lastError = String(error instanceof Error ? error.message : error).slice(0, 2000);
+      console.error(`[Memory] RepositoryAgent feedback delivery failed and will be retried: ${repositoryAgentMemoryFeedbackState.lastError}`);
+    } finally {
+      repositoryAgentMemoryFeedbackState.running = false;
+      repositoryAgentMemoryFeedbackState.lastCompletedAt = new Date().toISOString();
+    }
+  })().finally(() => {
+    repositoryAgentMemoryFeedbackTask = null;
+  });
+  return repositoryAgentMemoryFeedbackTask;
+}
+reconcileRepositoryAgentMemoryFeedback();
+var repositoryAgentMemoryFeedbackTimer = setInterval(() => {
+  reconcileRepositoryAgentMemoryFeedback();
+}, REPOSITORY_AGENT_MEMORY_FEEDBACK_INTERVAL_MS);
+repositoryAgentMemoryFeedbackTimer.unref?.();
 sessionManager.authToken = null;
 sessionManager.setClientMessageIngress((sessionId, accepted) => {
   const budgetStatus = getSessionTokenBudgetStatus(sessionId);
@@ -21331,7 +26282,7 @@ function emitSessionBudgetPauseNotice(sessionIdRaw, status) {
   const message = sessionTokenBudgetMessage(status);
   session.emit({
     protocolVersion: PROTOCOL_VERSION,
-    id: randomUUID6(),
+    id: randomUUID9(),
     ts: new Date().toISOString(),
     sessionId,
     type: "assistant_message",
@@ -21340,7 +26291,7 @@ function emitSessionBudgetPauseNotice(sessionIdRaw, status) {
   });
   session.emit({
     protocolVersion: PROTOCOL_VERSION,
-    id: randomUUID6(),
+    id: randomUUID9(),
     ts: new Date().toISOString(),
     sessionId,
     type: "status",
@@ -21392,6 +26343,91 @@ async function getRepoStatusSummary(repoPath, remote) {
   repoStatusCache = { value, fetchedAtMs: now };
   return value;
 }
+function repositoryAgentPublicStatus(row) {
+  if (row.status === "pending")
+    return "queued";
+  if (row.status === "failed" && row.error?.includes("deadline expired"))
+    return "expired";
+  return row.status;
+}
+function repositoryAgentRemoteError(raw) {
+  if (!raw)
+    return;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.code === "string" && typeof parsed.message === "string") {
+      return {
+        code: parsed.code.slice(0, 128),
+        message: parsed.message.slice(0, 8000),
+        ...parsed.detail ? { detail: String(parsed.detail).slice(0, 16000) } : {},
+        retryable: parsed.retryable === true
+      };
+    }
+  } catch {}
+  return {
+    code: raw.includes("deadline expired") ? "deadline_expired" : "repository_agent_failed",
+    message: raw.slice(0, 8000),
+    retryable: false
+  };
+}
+function repositoryAgentSnapshot(row) {
+  const status = repositoryAgentPublicStatus(row);
+  return {
+    requestId: row.id,
+    status,
+    submittedAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...status === "queued" || status === "claimed" ? { pollAfterMs: 500 } : {},
+    ...status === "completed" && row.result ? { result: row.result } : {},
+    ...status === "failed" || status === "expired" ? { error: repositoryAgentRemoteError(row.error) } : {}
+  };
+}
+
+class BoundedJsonBodyError extends Error {
+  status;
+  constructor(status, message) {
+    super(message);
+    this.name = "BoundedJsonBodyError";
+    this.status = status;
+  }
+}
+async function readBoundedJsonObject(req, maxBytes, label) {
+  const declaredLength = Number(req.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new BoundedJsonBodyError(413, `${label} body is too large`);
+  }
+  if (!req.body)
+    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
+  const reader = req.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      if (!value)
+        continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        throw new BoundedJsonBodyError(413, `${label} body is too large`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
+  } catch {
+    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new BoundedJsonBodyError(400, `${label} body must be a JSON object`);
+  }
+  return parsed;
+}
 function createRequestHandler() {
   const startupConfig = loadPushPalsConfig();
   if (startupConfig.authToken) {
@@ -21422,7 +26458,8 @@ function createRequestHandler() {
       }
       const corsHeaders = buildLocalCorsHeaders({
         origin: originHeader,
-        allowAuthorizationHeader: true
+        allowAuthorizationHeader: true,
+        additionalAllowedHeaders: [MEMORY_HTTP_CALLER_HEADER, MEMORY_HTTP_AUTHORITY_HEADER]
       });
       const jsonHeaders = {
         "Content-Type": "application/json",
@@ -21452,7 +26489,7 @@ function createRequestHandler() {
           return false;
         return fallback;
       };
-      const compactText3 = (value, maxChars = 500) => {
+      const compactText4 = (value, maxChars = 500) => {
         const text = String(value ?? "").replace(/\s+/g, " ").trim();
         if (!text)
           return "";
@@ -21501,20 +26538,20 @@ function createRequestHandler() {
       };
       const classifyAutonomyJobCompletion = (body) => {
         const parts = [];
-        const summary = compactText3(body.summary, 1400);
+        const summary = compactText4(body.summary, 1400);
         if (summary)
           parts.push(summary);
-        const detail = compactText3(body.detail, 1400);
+        const detail = compactText4(body.detail, 1400);
         if (detail)
           parts.push(detail);
         if (typeof body.result === "string") {
-          parts.push(compactText3(body.result, 1400));
+          parts.push(compactText4(body.result, 1400));
         } else if (body.result && typeof body.result === "object" && !Array.isArray(body.result)) {
-          parts.push(compactText3(JSON.stringify(body.result), 1800));
+          parts.push(compactText4(JSON.stringify(body.result), 1800));
         }
         const artifacts = Array.isArray(body.artifacts) ? body.artifacts.filter((entry) => entry && typeof entry === "object") : [];
         for (const artifact of artifacts.slice(0, 8)) {
-          const artifactText = compactText3(artifact.text ?? artifact.message, 400);
+          const artifactText = compactText4(artifact.text ?? artifact.message, 400);
           if (artifactText)
             parts.push(artifactText);
         }
@@ -21571,13 +26608,13 @@ function createRequestHandler() {
         if (!reservationRequired)
           return null;
         const reservationIdentity = {
-          objectiveId: compactText3(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128),
-          sessionId: compactText3(value.sessionId, 128),
-          runId: compactText3(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
-          snapshotId: compactText3(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128)
+          objectiveId: compactText4(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128),
+          sessionId: compactText4(value.sessionId, 128),
+          runId: compactText4(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+          snapshotId: compactText4(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128)
         };
         const expectedIdempotencyKey = `autonomy:${reservationIdentity.objectiveId}`;
-        const actualIdempotencyKey = compactText3(value.idempotencyKey ?? value.idempotency_key, 256);
+        const actualIdempotencyKey = compactText4(value.idempotencyKey ?? value.idempotency_key, 256);
         if (!reservationIdentity.objectiveId || !reservationIdentity.sessionId || !reservationIdentity.runId || !reservationIdentity.snapshotId || actualIdempotencyKey !== expectedIdempotencyKey) {
           return makeJson({
             ok: false,
@@ -21659,7 +26696,7 @@ function createRequestHandler() {
           return;
         const params = parseJsonRecord2(job.params ?? "");
         const origin = deriveJobOrigin(params);
-        const requestId = compactText3(params.requestId, 128);
+        const requestId = compactText4(params.requestId, 128);
         if (requestId)
           autonomyStore.linkJobToObjectiveByRequest(requestId, options.jobId);
         const outcomeContext = autonomyStore.resolveJobOutcomeContext(options.jobId, params);
@@ -21681,11 +26718,11 @@ function createRequestHandler() {
         const session = sessionManager.getSession(job.sessionId);
         if (!session)
           return;
-        const message = compactText3(options.message, 240) || "WorkerPal job failed";
-        const detail = compactText3(options.detail, 600);
+        const message = compactText4(options.message, 240) || "WorkerPal job failed";
+        const detail = compactText4(options.detail, 600);
         const envelope = {
           protocolVersion: PROTOCOL_VERSION,
-          id: randomUUID6(),
+          id: randomUUID9(),
           ts: options.ts || new Date().toISOString(),
           sessionId: job.sessionId,
           type: "job_failed",
@@ -21706,7 +26743,7 @@ function createRequestHandler() {
           const replacement = replacementJobId ? jobQueue.getJob(replacementJobId) : null;
           const source = jobQueue.getJob(item.jobId);
           const params = parseJsonRecord2(replacement?.params ?? source?.params ?? "");
-          const requestId = compactText3(params.requestId, 128);
+          const requestId = compactText4(params.requestId, 128);
           if (requestId && replacementJobId) {
             autonomyStore.linkJobToObjectiveByRequest(requestId, replacementJobId);
           }
@@ -21715,7 +26752,7 @@ function createRequestHandler() {
           const session = sessionManager.getSession(item.sessionId);
           session?.emit({
             protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID6(),
+            id: randomUUID9(),
             ts: item.recoveredAt,
             sessionId: item.sessionId,
             type: "log",
@@ -21739,6 +26776,19 @@ function createRequestHandler() {
       };
       const autonomySimilarFailureSummary = (value) => {
         const details = extractAutonomyPayloadDetails(value);
+        if (details.isValidationIncidentRepair && details.reservationRequired && details.objectiveId && details.validationIncidentId && autonomyStore.authorizesValidationIncidentRepair({
+          objectiveId: details.objectiveId,
+          incidentId: details.validationIncidentId,
+          snapshotId: details.snapshotId
+        })) {
+          return {
+            blocked: false,
+            recentSimilarFailureCount: 0,
+            failureFingerprint: null,
+            targetPathSample: details.targetPaths.slice(0, 8),
+            validationIncidentRepairExempt: true
+          };
+        }
         return jobQueue.similarFailureFingerprintSummary({
           targetPaths: details.targetPaths,
           windowMs: AUTONOMY_SIMILAR_FAILURE_WINDOW_MS,
@@ -21847,7 +26897,18 @@ function createRequestHandler() {
           return;
         isShuttingDown = true;
         console.warn(`[Server] Shutdown requested: ${reason}`);
-        setTimeout(() => {
+        clearInterval(lifecycleWatchdogTimer);
+        clearInterval(clientPresencePruneTimer);
+        clearInterval(sharedMemoryMaintenanceTimer);
+        clearInterval(repositoryAgentMemoryFeedbackTimer);
+        setTimeout(async () => {
+          const activeFeedback = repositoryAgentMemoryFeedbackTask;
+          if (activeFeedback) {
+            await Promise.race([
+              activeFeedback.catch(() => {}),
+              new Promise((resolve6) => setTimeout(resolve6, 2000))
+            ]);
+          }
           try {
             requestQueue.close();
           } catch (_e) {}
@@ -21861,6 +26922,10 @@ function createRequestHandler() {
             autonomyStore.close();
           } catch (_e) {}
           try {
+            repositoryAgentQueue.close();
+          } catch (_e) {}
+          memoryStore.close().catch(() => {});
+          try {
             server.stop(true);
           } catch (_e) {}
         }, 25);
@@ -21871,7 +26936,7 @@ function createRequestHandler() {
           headers: jsonHeaders
         });
       }
-      const isNoisyPoll = method === "POST" && /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/(start|log)|telemetry\/llm-usage)\/?$/.test(pathname) || method === "GET" && /^\/+(workers|workers\/autoscale|system\/status|requests|jobs|completions|questions|autonomy\/insights|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(pathname);
+      const isNoisyPoll = method === "POST" && /^\/+((jobs|requests|completions)\/claim|repository-agent\/requests\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/(start|log)|telemetry\/llm-usage)\/?$/.test(pathname) || method === "GET" && /^\/+(workers|workers\/autoscale|system\/status|requests|jobs|completions|questions|autonomy\/insights|repository-agent\/requests\/[^/]+|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(pathname);
       if (isNoisyPoll) {
         if (isDebugHttpLogsEnabled())
           console.log(`[${method}] ${pathname}`);
@@ -21894,7 +26959,7 @@ function createRequestHandler() {
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const reason = compactText3(body.reason, 180) || "remote shutdown request";
+        const reason = compactText4(body.reason, 180) || "remote shutdown request";
         initiateShutdown(reason);
         return makeJson({ ok: true, shuttingDown: true, reason }, 202);
       }
@@ -21945,6 +27010,256 @@ function createRequestHandler() {
           files: describeRuntimeConfigFiles(files)
         }, 200);
       }
+      if (pathname.startsWith("/memory/") && ["POST", "PUT"].includes(method)) {
+        const denied = requireAuth();
+        if (denied)
+          return denied;
+        let body;
+        try {
+          body = await readBoundedJsonObject(req, 2 * 1024 * 1024, "Memory request");
+        } catch (error) {
+          const bounded = error;
+          return makeJson({ ok: false, message: bounded.message || "Invalid Memory request body" }, bounded.status === 413 ? 413 : 400);
+        }
+        const operation = pathname === "/memory/records" && method === "PUT" ? "put" : pathname === "/memory/get" && method === "POST" ? "get" : pathname === "/memory/search" && method === "POST" ? "search" : pathname === "/memory/invalidate" && method === "POST" ? "invalidate" : pathname === "/memory/reinforce" && method === "POST" ? "reinforce" : pathname === "/memory/prune" && method === "POST" ? "prune" : null;
+        if (!operation)
+          return makeJson({ ok: false, message: "Unknown memory endpoint" }, 404);
+        let reinforcementOutcome = null;
+        if (operation === "reinforce") {
+          try {
+            const candidate = memoryHttpReinforcementOutcome(body);
+            assertMemoryReinforcementOutcome(candidate);
+            reinforcementOutcome = candidate;
+          } catch (error) {
+            const message = compactText4(error instanceof Error ? error.message : error, 2000);
+            return makeJson({
+              ok: false,
+              code: error instanceof MemoryValidationError ? error.code : "invalid_reinforcement_outcome",
+              message: message || "Invalid memory reinforcement outcome"
+            }, 400);
+          }
+        }
+        const access = authorizeMemoryHttpRequest({
+          headers: req.headers,
+          operation,
+          namespace: memoryHttpNamespace(operation, body),
+          reinforcementOutcome
+        });
+        if (!access.allowed) {
+          return makeJson({ ok: false, message: access.message ?? "Forbidden" }, 403);
+        }
+        try {
+          if (pathname === "/memory/records" && method === "PUT") {
+            const record = await memoryStore.put(body.input, body.options ?? {});
+            return makeJson({ ok: true, record }, 200);
+          }
+          if (pathname === "/memory/get" && method === "POST") {
+            const record = await memoryStore.get(body.address, body.options ?? {});
+            return makeJson({ ok: true, record }, 200);
+          }
+          if (pathname === "/memory/search" && method === "POST") {
+            const records = await memoryStore.search(body.query);
+            return makeJson({ ok: true, records }, 200);
+          }
+          if (pathname === "/memory/invalidate" && method === "POST") {
+            const count = await memoryStore.invalidate(body.selector);
+            return makeJson({ ok: true, count }, 200);
+          }
+          if (pathname === "/memory/reinforce" && method === "POST") {
+            const record = await memoryStore.reinforce(body.input);
+            return makeJson({ ok: true, record }, 200);
+          }
+          if (pathname === "/memory/prune" && method === "POST") {
+            const count = await memoryStore.prune(body.options ?? {});
+            return makeJson({ ok: true, count }, 200);
+          }
+        } catch (error) {
+          const message = compactText4(error instanceof Error ? error.message : error, 2000);
+          const status = error instanceof MemoryConflictError ? 409 : 400;
+          return makeJson({
+            ok: false,
+            message: message || "Memory operation failed",
+            ...error instanceof MemoryConflictError ? { code: error.code } : {},
+            ...error instanceof MemoryValidationError ? { code: error.code } : {}
+          }, status);
+        }
+        return makeJson({ ok: false, message: "Unknown memory endpoint" }, 404);
+      }
+      if (pathname === "/repository-agent/requests" && method === "POST") {
+        const denied = requireAuth();
+        if (denied)
+          return denied;
+        let body;
+        try {
+          body = await readBoundedJsonObject(req, 256 * 1024, "RepositoryAgent request");
+        } catch (error) {
+          const bounded = error;
+          return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent request body" }, bounded.status === 413 ? 413 : 400);
+        }
+        try {
+          const request = sanitizeRepositoryAgentRequest(body);
+          const resolved = await resolveRepositoryAgentContext({
+            canonicalRepoRoot: repositoryAgentRepoRoot,
+            requested: request.repository
+          });
+          const normalizedRequest = {
+            ...request,
+            repository: resolved.repository,
+            context: {
+              ...request.context ?? {},
+              ...resolved.requestedRootMapped ? { callerRootMappedToHost: true } : {}
+            }
+          };
+          const enqueued = repositoryAgentQueue.enqueue({
+            sessionId: request.caller.sessionId ?? "dev",
+            callerService: request.caller.service,
+            purpose: request.purpose,
+            repositoryId: resolved.repository.identity,
+            repositoryRoot: resolved.repository.root,
+            revision: resolved.repository.revision,
+            treeHash: resolved.repository.tree,
+            dirty: resolved.repository.dirty,
+            priority: request.priority,
+            deadlineAt: request.deadlineAt,
+            idempotencyKey: request.idempotencyKey,
+            request: normalizedRequest
+          });
+          if (!enqueued.ok || !enqueued.requestId) {
+            return makeJson({
+              ok: false,
+              ...enqueued.code ? { code: enqueued.code } : {},
+              ...enqueued.requestId ? { requestId: enqueued.requestId } : {},
+              message: enqueued.message ?? "enqueue failed"
+            }, enqueued.conflict ? 409 : 400);
+          }
+          const row = repositoryAgentQueue.get(enqueued.requestId);
+          if (!row)
+            return makeJson({ ok: false, message: "enqueued request disappeared" }, 500);
+          return makeJson({
+            ok: true,
+            requestId: row.id,
+            status: repositoryAgentPublicStatus(row),
+            deduplicated: enqueued.deduplicated === true,
+            pollAfterMs: 500,
+            ...row.status === "completed" && row.result ? { result: row.result } : {}
+          }, enqueued.deduplicated ? 200 : 202);
+        } catch (error) {
+          const message = compactText4(error instanceof Error ? error.message : error, 2000);
+          const status = /stale|does not match/i.test(message) ? 409 : 400;
+          return makeJson({ ok: false, message: message || "Invalid RepositoryAgent request" }, status);
+        }
+      }
+      if (pathname === "/repository-agent/requests/claim" && method === "POST") {
+        const denied = requireAuth();
+        if (denied)
+          return denied;
+        let body;
+        try {
+          body = await readBoundedJsonObject(req, 64 * 1024, "RepositoryAgent claim");
+        } catch (error) {
+          const bounded = error;
+          return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent claim body" }, bounded.status === 413 ? 413 : 400);
+        }
+        const agentId = compactText4(body.agentId, 256);
+        const identities = Array.isArray(body.repositoryIdentities) ? body.repositoryIdentities.map((value) => compactText4(value, 1024)).filter(Boolean) : [];
+        const claim = repositoryAgentQueue.claim(agentId, {
+          leaseMs: Number(body.leaseMs),
+          repositoryIdentities: identities
+        });
+        if (!claim.ok || !claim.request) {
+          return makeJson({ ok: true, claim: null, pollAfterMs: 750 }, 200);
+        }
+        return makeJson({
+          ok: true,
+          claim: {
+            requestId: claim.request.id,
+            claimToken: claim.request.claimToken,
+            claimGeneration: claim.request.claimGeneration,
+            leaseExpiresAt: claim.request.leaseExpiresAt,
+            request: claim.request.request
+          },
+          pollAfterMs: 250
+        }, 200);
+      }
+      const repositoryAgentRequestMatch = pathname.match(/^\/repository-agent\/requests\/([^/]+)(?:\/(lease\/renew|complete|fail))?$/);
+      if (repositoryAgentRequestMatch) {
+        const denied = requireAuth();
+        if (denied)
+          return denied;
+        const requestId = decodeURIComponent(repositoryAgentRequestMatch[1] ?? "");
+        const action = repositoryAgentRequestMatch[2] ?? "";
+        if (method === "GET" && !action) {
+          guardedReconciliation("repository agent deadlines", 0, () => repositoryAgentQueue.expirePastDeadlines());
+          const row = repositoryAgentQueue.get(requestId);
+          return row ? makeJson({ ok: true, request: repositoryAgentSnapshot(row) }, 200) : makeJson({ ok: false, message: "RepositoryAgent request not found" }, 404);
+        }
+        if (method !== "POST" || !action) {
+          return makeJson({ ok: false, message: "Method not allowed" }, 405);
+        }
+        let body;
+        try {
+          body = await readBoundedJsonObject(req, 2 * 1024 * 1024, `RepositoryAgent ${action}`);
+        } catch (error) {
+          const bounded = error;
+          return makeJson({ ok: false, requestId, message: bounded.message || "Invalid RepositoryAgent body" }, bounded.status === 413 ? 413 : 400);
+        }
+        const agentId = compactText4(body.agentId, 256);
+        const claimToken = compactText4(body.claimToken, 512);
+        const claimGeneration = Number(body.claimGeneration);
+        if (action === "lease/renew") {
+          const renewed = repositoryAgentQueue.renewLease(requestId, agentId, claimToken, claimGeneration, { leaseMs: Number(body.leaseMs) });
+          return renewed.ok ? makeJson({
+            ok: true,
+            requestId,
+            status: "claimed",
+            leaseExpiresAt: renewed.leaseExpiresAt
+          }, 200) : makeJson({ ok: false, requestId, message: renewed.message }, 409);
+        }
+        if (action === "complete") {
+          try {
+            const queued = repositoryAgentQueue.get(requestId);
+            if (!queued || !queued.request) {
+              return makeJson({ ok: false, message: "RepositoryAgent request not found" }, 404);
+            }
+            const result = sanitizeRepositoryAgentResult(body.result, requestId);
+            const requestedRepository = queued.request.repository;
+            if (result.analyzedRepository.identity !== requestedRepository.identity || result.analyzedRepository.revision !== requestedRepository.revision || result.analyzedRepository.tree !== requestedRepository.tree) {
+              return makeJson({ ok: false, requestId, message: "RepositoryAgent result baseline mismatch" }, 409);
+            }
+            const completed = repositoryAgentQueue.complete(requestId, {
+              agentId,
+              claimToken,
+              claimGeneration,
+              result
+            });
+            return completed.ok ? makeJson({ ok: true, requestId, status: "completed" }, 200) : makeJson({ ok: false, requestId, message: completed.message }, 409);
+          } catch (error) {
+            return makeJson({
+              ok: false,
+              requestId,
+              message: compactText4(error instanceof Error ? error.message : error, 2000)
+            }, 400);
+          }
+        }
+        const remoteError = body.error && typeof body.error === "object" ? body.error : {
+          code: "repository_agent_failed",
+          message: "RepositoryAgent request failed",
+          retryable: false
+        };
+        const failed = repositoryAgentQueue.fail(requestId, {
+          agentId,
+          claimToken,
+          claimGeneration,
+          message: JSON.stringify(remoteError)
+        });
+        return failed.ok ? makeJson({
+          ok: true,
+          requestId,
+          status: failed.requeued ? "queued" : "failed",
+          ...failed.nextAttemptAt ? { nextAttemptAt: failed.nextAttemptAt } : {},
+          ...failed.deadLettered ? { deadLettered: true } : {}
+        }, 200) : makeJson({ ok: false, requestId, message: failed.message }, 409);
+      }
       if (pathname === "/sessions" && method === "POST") {
         const denied = requireAuth();
         if (denied)
@@ -21984,7 +27299,7 @@ function createRequestHandler() {
         }
         const encoder = new TextEncoder;
         const client = readClientPresenceFromTransportRequest(url, req.headers);
-        const clientConnectionId = client ? randomUUID6() : null;
+        const clientConnectionId = client ? randomUUID9() : null;
         if (client) {
           clientPresence.connect(sessionId, client, "sse", clientConnectionId);
         }
@@ -22105,7 +27420,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           console.warn(`[WS] Session ${sessionId} requested cursor ${requestedAfterEventId} > latest ${latestCursor}; resetting replay to 0`);
         }
         const client = readClientPresenceFromTransportRequest(url, req.headers);
-        const clientConnectionId = client ? randomUUID6() : null;
+        const clientConnectionId = client ? randomUUID9() : null;
         const success = server.upgrade(req, {
           data: {
             sessionId,
@@ -22168,7 +27483,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           }, 429);
         }
         const enqueueParams = body.params && typeof body.params === "object" && !Array.isArray(body.params) ? body.params : {};
-        const lifecycleRequestId = compactText3(enqueueParams.requestId, 128);
+        const lifecycleRequestId = compactText4(enqueueParams.requestId, 128);
         const lifecycleRequest = lifecycleRequestId ? requestQueue.getRequest(lifecycleRequestId) : null;
         if (lifecycleRequestId && !lifecycleRequest) {
           return makeJson({
@@ -22179,7 +27494,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         }
         let validLifecycleHandoff = false;
         if (lifecycleRequest) {
-          const lease = requestQueue.validateActiveLease(lifecycleRequestId, compactText3(body.requestAgentId, 128), compactText3(body.requestClaimToken, 256));
+          const lease = requestQueue.validateActiveLease(lifecycleRequestId, compactText4(body.requestAgentId, 128), compactText4(body.requestClaimToken, 256));
           if (!lease.ok) {
             return makeJson({
               ok: false,
@@ -22222,7 +27537,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             message: typeof body.workerId === "string" && body.workerId.trim().length > 0 ? `workerId must be at most ${MAX_JOB_WORKER_ID_LENGTH} characters` : "workerId is required"
           }, 400);
         }
-        const claimedRuntimeGeneration = compactText3(body.runtimeGeneration, 200);
+        const claimedRuntimeGeneration = compactText4(body.runtimeGeneration, 200);
         if (claimedRuntimeGeneration && claimedRuntimeGeneration !== WORKER_RUNTIME_GENERATION) {
           return makeJson({
             ok: false,
@@ -22359,7 +27674,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         }
         if (result.ok && result.job?.id) {
           const params = parseJsonRecord2(result.job.params ?? "");
-          const requestId = compactText3(params.requestId, 128);
+          const requestId = compactText4(params.requestId, 128);
           if (requestId)
             autonomyStore.linkJobToObjectiveByRequest(requestId, result.job.id);
           autonomyStore.markObjectiveRunningByJobId(result.job.id);
@@ -22375,7 +27690,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const heartbeatRuntimeGeneration = compactText3(body.runtimeGeneration, 200);
+        const heartbeatRuntimeGeneration = compactText4(body.runtimeGeneration, 200);
         if (heartbeatRuntimeGeneration && heartbeatRuntimeGeneration !== WORKER_RUNTIME_GENERATION) {
           return makeJson({
             ok: false,
@@ -22462,6 +27777,20 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const requestPriorityCounts = requestQueue.countByPriority();
         const requestPendingSnapshot = requestQueue.nextPendingSnapshot(10);
         const requestSlo = requestQueue.sloSummary(24);
+        guardedReconciliation("repository agent deadlines", 0, () => repositoryAgentQueue.expirePastDeadlines());
+        const repositoryAgentHealth = guardedReconciliation("repository agent health", {
+          counts: { pending: 0, claimed: 0, completed: 0, failed: 0 },
+          oldestPendingAgeMs: 0,
+          oldestClaimedAgeMs: 0,
+          delayedRetryCount: 0,
+          staleClaimCount: 0,
+          pastDeadlineActiveCount: 0,
+          exhaustedPendingCount: 0,
+          maxClaimAttempts: 3,
+          pendingUnhealthyAfterMs: 5 * 60000,
+          unhealthy: true
+        }, () => repositoryAgentQueue.healthSummary());
+        const repositoryAgentCounts = repositoryAgentHealth.counts;
         const jobCounts = jobQueue.countByStatus();
         const jobPriorityCounts = jobQueue.countByPriority();
         const jobPendingSnapshot = jobQueue.nextPendingSnapshot(10);
@@ -22498,6 +27827,12 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             requests: requestCounts,
             requestPriorities: requestPriorityCounts,
             requestPendingSnapshot,
+            repositoryAgent: repositoryAgentCounts,
+            repositoryAgentHealth,
+            repositoryAgentMemoryFeedback: {
+              ...autonomyStore.repositoryAgentMemoryFeedbackHealth(),
+              worker: { ...repositoryAgentMemoryFeedbackState }
+            },
             jobs: jobCounts,
             jobPriorities: jobPriorityCounts,
             jobPendingSnapshot,
@@ -22576,8 +27911,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const sessionId = compactText3(body.sessionId, 128);
-        const runId = compactText3(body.runId, 128);
+        const sessionId = compactText4(body.sessionId, 128);
+        const runId = compactText4(body.runId, 128);
         const ttlMs = Number(body.ttlMs);
         const staleAfterMs = Number(body.staleAfterMs);
         if (!sessionId || !runId) {
@@ -22598,8 +27933,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const sessionId = compactText3(body.sessionId, 128);
-        const runId = compactText3(body.runId, 128);
+        const sessionId = compactText4(body.sessionId, 128);
+        const runId = compactText4(body.runId, 128);
         if (!sessionId || !runId) {
           return makeJson({ ok: false, message: "sessionId and runId are required" }, 400);
         }
@@ -22610,8 +27945,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const sessionId = compactText3(body.sessionId, 128);
-        const runId = compactText3(body.runId, 128);
+        const sessionId = compactText4(body.sessionId, 128);
+        const runId = compactText4(body.runId, 128);
         const ttlMs = Number(body.ttlMs);
         if (!sessionId || !runId) {
           return makeJson({ ok: false, message: "sessionId and runId are required" }, 400);
@@ -22651,8 +27986,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const denied = requireAuth();
         if (denied)
           return denied;
-        const patternKey = compactText3(url.searchParams.get("patternKey"), 256) || undefined;
-        const objectiveId = compactText3(url.searchParams.get("objectiveId"), 256) || undefined;
+        const patternKey = compactText4(url.searchParams.get("patternKey"), 256) || undefined;
+        const objectiveId = compactText4(url.searchParams.get("objectiveId"), 256) || undefined;
         const limit = parseLimit(url.searchParams.get("limit"), 20);
         const feedbackLimit = parseLimit(url.searchParams.get("feedbackLimit"), 30);
         const insights = autonomyStore.listInsights({
@@ -22689,9 +28024,9 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const denied = requireAuth();
         if (denied)
           return denied;
-        const sourceType = compactText3(url.searchParams.get("sourceType"), 64) || undefined;
-        const tag = compactText3(url.searchParams.get("tag"), 64).toLowerCase() || undefined;
-        const q = compactText3(url.searchParams.get("q"), 240) || undefined;
+        const sourceType = compactText4(url.searchParams.get("sourceType"), 64) || undefined;
+        const tag = compactText4(url.searchParams.get("tag"), 64).toLowerCase() || undefined;
+        const q = compactText4(url.searchParams.get("q"), 240) || undefined;
         const limit = parseLimit(url.searchParams.get("limit"), 40);
         const patterns = autonomyStore.listInspirationPatterns({
           sourceType,
@@ -22719,22 +28054,22 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           return makeJson(result, 400);
         }
         const objective = body.objective && typeof body.objective === "object" ? body.objective : null;
-        const sessionId = compactText3(body.sessionId, 128);
-        const runId = compactText3(body.runId, 128);
-        const snapshotId = compactText3(body.snapshotId, 128);
+        const sessionId = compactText4(body.sessionId, 128);
+        const runId = compactText4(body.runId, 128);
+        const snapshotId = compactText4(body.snapshotId, 128);
         const candidateRows = Array.isArray(body.candidates) ? body.candidates.filter((entry) => entry && typeof entry === "object") : [];
         if (objective && sessionId) {
           const objectiveRecord = objective;
-          const objectiveId = compactText3(objectiveRecord.id ?? result.objectiveId, 128);
-          const status = compactText3(objectiveRecord.status, 64);
-          const requestId = compactText3(objectiveRecord.requestId ?? objectiveRecord.request_id, 128);
-          const patternKey = compactText3(result.patternKey ?? objectiveRecord.patternKey ?? objectiveRecord.pattern_key, 128);
+          const objectiveId = compactText4(objectiveRecord.id ?? result.objectiveId, 128);
+          const status = compactText4(objectiveRecord.status, 64);
+          const requestId = compactText4(objectiveRecord.requestId ?? objectiveRecord.request_id, 128);
+          const patternKey = compactText4(result.patternKey ?? objectiveRecord.patternKey ?? objectiveRecord.pattern_key, 128);
           const session = sessionManager.getSession(sessionId);
           if (session && objectiveId && runId && snapshotId) {
             if (status === "dispatched" && requestId) {
               session.emit({
                 protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID6(),
+                id: randomUUID9(),
                 ts: new Date().toISOString(),
                 sessionId,
                 type: "autonomy_objective_dispatched",
@@ -22751,7 +28086,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             } else if (status === "blocked") {
               session.emit({
                 protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID6(),
+                id: randomUUID9(),
                 ts: new Date().toISOString(),
                 sessionId,
                 type: "autonomy_objective_blocked",
@@ -22760,7 +28095,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
                   runId,
                   snapshotId,
                   objectiveId,
-                  reason: compactText3(objectiveRecord.blockReason ?? objectiveRecord.block_reason ?? "blocked", 300),
+                  reason: compactText4(objectiveRecord.blockReason ?? objectiveRecord.block_reason ?? "blocked", 300),
                   origin: "autonomy",
                   ...result.questionId ? { questionId: result.questionId } : {},
                   ...patternKey ? { patternKey } : {}
@@ -22772,7 +28107,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             const q = body.question && typeof body.question === "object" ? body.question : {};
             session.emit({
               protocolVersion: PROTOCOL_VERSION,
-              id: randomUUID6(),
+              id: randomUUID9(),
               ts: new Date().toISOString(),
               sessionId,
               type: "question_asked",
@@ -22780,8 +28115,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               payload: {
                 questionId: result.questionId,
                 objectiveId: objectiveId || "unknown",
-                question: compactText3(q.question, 500),
-                questionType: compactText3(q.questionType ?? q.question_type, 120) || "unknown"
+                question: compactText4(q.question, 500),
+                questionType: compactText4(q.questionType ?? q.question_type, 120) || "unknown"
               }
             });
           }
@@ -22790,7 +28125,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const session = sessionManager.getSession(sessionId);
           if (session) {
             const topCandidateIds = candidateRows.map((entry) => ({
-              id: compactText3(entry.id, 128),
+              id: compactText4(entry.id, 128),
               selected: Boolean(entry.selected),
               score: Number(entry.final_score ?? entry.finalScore ?? Number.NEGATIVE_INFINITY)
             })).sort((a, b) => {
@@ -22802,7 +28137,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             }).map((entry) => entry.id).filter(Boolean).slice(0, 3);
             session.emit({
               protocolVersion: PROTOCOL_VERSION,
-              id: randomUUID6(),
+              id: randomUUID9(),
               ts: new Date().toISOString(),
               sessionId,
               type: "autonomy_candidates_generated",
@@ -22826,20 +28161,20 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const result = autonomyStore.recordOutcome(body);
         if (!result.ok)
           return makeJson(result, 400);
-        const sessionId = compactText3(body.sessionId, 128);
+        const sessionId = compactText4(body.sessionId, 128);
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
         if (session) {
           session.emit({
             protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID6(),
+            id: randomUUID9(),
             ts: new Date().toISOString(),
             sessionId,
             type: "autonomy_feedback_recorded",
             from: "server:autonomy",
             payload: {
-              objectiveId: compactText3(body.objectiveId ?? body.objective_id, 128) || "unknown",
-              patternKey: compactText3(body.patternKey ?? body.pattern_key, 128) || "unknown",
-              outcome: compactText3(body.userAction ?? body.user_action ?? "recorded", 120),
+              objectiveId: compactText4(body.objectiveId ?? body.objective_id, 128) || "unknown",
+              patternKey: compactText4(body.patternKey ?? body.pattern_key, 128) || "unknown",
+              outcome: compactText4(body.userAction ?? body.user_action ?? "recorded", 120),
               success: Boolean(body.success)
             }
           });
@@ -22854,20 +28189,20 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const result = autonomyStore.recordPrFeedback(body);
         if (!result.ok)
           return makeJson(result, 400);
-        const sessionId = compactText3(body.sessionId, 128);
+        const sessionId = compactText4(body.sessionId, 128);
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
         if (session && !result.ignored) {
           session.emit({
             protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID6(),
+            id: randomUUID9(),
             ts: new Date().toISOString(),
             sessionId,
             type: "autonomy_feedback_recorded",
             from: "server:autonomy",
             payload: {
-              objectiveId: compactText3(body.objectiveId ?? body.objective_id ?? result.objectiveId, 128) || "unknown",
-              patternKey: compactText3(body.patternKey ?? body.pattern_key ?? result.patternKey, 128) || "unknown",
-              outcome: compactText3(body.verdict ?? body.userAction ?? body.user_action ?? "pr_feedback", 120) || "pr_feedback",
+              objectiveId: compactText4(body.objectiveId ?? body.objective_id ?? result.objectiveId, 128) || "unknown",
+              patternKey: compactText4(body.patternKey ?? body.pattern_key ?? result.patternKey, 128) || "unknown",
+              outcome: compactText4(body.verdict ?? body.userAction ?? body.user_action ?? "pr_feedback", 120) || "pr_feedback",
               success: typeof result.success === "boolean" ? result.success : Boolean(body.success)
             }
           });
@@ -22898,7 +28233,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const result = autonomyStore.answerQuestion(questionId, body.answer);
         if (!result.ok)
           return makeJson(result, 400);
-        const sessionId = compactText3(body.sessionId, 128) || compactText3(result.sessionId, 128);
+        const sessionId = compactText4(body.sessionId, 128) || compactText4(result.sessionId, 128);
         let resumeError = "";
         let resumedRequestId = "";
         if (result.status === "valid" && result.resume) {
@@ -22929,7 +28264,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             if (dispatchSession) {
               dispatchSession.emit({
                 protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID6(),
+                id: randomUUID9(),
                 ts: new Date().toISOString(),
                 sessionId: result.resume.sessionId,
                 type: "autonomy_objective_dispatched",
@@ -22945,14 +28280,14 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               });
             }
           } else {
-            resumeError = compactText3(enqueueResult.message, 300) || "failed to enqueue autonomy resume request";
+            resumeError = compactText4(enqueueResult.message, 300) || "failed to enqueue autonomy resume request";
           }
         }
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
         if (session) {
           session.emit({
             protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID6(),
+            id: randomUUID9(),
             ts: new Date().toISOString(),
             sessionId,
             type: "question_answered",
@@ -22961,7 +28296,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               questionId,
               objectiveId: result.objectiveId || "unknown",
               status: result.status === "valid" ? "valid" : "invalid",
-              ...result.reason || resumeError ? { answerSummary: compactText3(result.reason || resumeError, 240) } : {}
+              ...result.reason || resumeError ? { answerSummary: compactText4(result.reason || resumeError, 240) } : {}
             }
           });
         }
@@ -22981,23 +28316,51 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const result = autonomyStore.actOnQuestion(questionId, body.action, body.note);
         if (!result.ok)
           return makeJson(result, 400);
-        const sessionId = compactText3(body.sessionId, 128) || compactText3(result.sessionId, 128);
+        const sessionId = compactText4(body.sessionId, 128) || compactText4(result.sessionId, 128);
         const session = sessionId ? sessionManager.getSession(sessionId) : null;
         if (session) {
           session.emit({
             protocolVersion: PROTOCOL_VERSION,
-            id: randomUUID6(),
+            id: randomUUID9(),
             ts: new Date().toISOString(),
             sessionId,
             type: "log",
             from: "server:autonomy",
             payload: {
               level: "info",
-              message: compactText3(`question ${questionId} action=${result.action || "closed"} objective=${result.objectiveId || "unknown"}${body.note ? ` note=${String(body.note)}` : ""}`, 240)
+              message: compactText4(`question ${questionId} action=${result.action || "closed"} objective=${result.objectiveId || "unknown"}${body.note ? ` note=${String(body.note)}` : ""}`, 240)
             }
           });
         }
         return makeJson(result, 200);
+      }
+      if (pathname === "/jobs/pr-links" && method === "GET") {
+        const denied = requireAuth();
+        if (denied)
+          return denied;
+        const pageSize = Math.min(100, parseLimit(url.searchParams.get("limit"), 50));
+        const rawCursor = url.searchParams.get("cursor");
+        const beforeCursor = parseCursor(rawCursor);
+        if (rawCursor && (!/^[1-9]\d*$/.test(rawCursor) || beforeCursor === null || !Number.isSafeInteger(beforeCursor))) {
+          return makeJson({ ok: false, message: "Invalid PR-link cursor" }, 400);
+        }
+        const rows = jobQueue.listPersistedPrLinksPage({
+          limit: pageSize + 1,
+          beforeCursor
+        });
+        const hasMore = rows.length > pageSize;
+        const page = rows.slice(0, pageSize);
+        const lastCursor = page.at(-1)?.cursor ?? null;
+        return makeJson({
+          ok: true,
+          links: page.map((row) => ({
+            jobId: row.jobId,
+            sessionId: row.sessionId || null,
+            prUrl: row.prUrl,
+            updatedAt: row.updatedAt
+          })),
+          nextCursor: hasMore && lastCursor ? String(lastCursor) : null
+        });
       }
       if (pathname === "/jobs" && method === "GET") {
         const denied = requireAuth();
@@ -23150,7 +28513,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           console.log(`[Server] Job ${jobId} completed (${durationText})`);
           const job = jobQueue.getJob(jobId);
           const params = parseJsonRecord2(job?.params ?? "");
-          const requestId = compactText3(params.requestId, 128);
+          const requestId = compactText4(params.requestId, 128);
           if (requestId)
             autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           autonomyStore.markObjectiveRunningByJobId(jobId);
@@ -23190,7 +28553,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const job = jobQueue.getJob(jobId);
           const params = parseJsonRecord2(job?.params ?? "");
           const origin = deriveJobOrigin(params);
-          const requestId = compactText3(params.requestId, 128);
+          const requestId = compactText4(params.requestId, 128);
           if (requestId)
             autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
@@ -23210,11 +28573,11 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           if (job?.sessionId) {
             const session = sessionManager.getSession(job.sessionId);
             if (session) {
-              const message = compactText3(body.message, 240) || "WorkerPal job failed";
-              const detail = compactText3(body.detail, 600);
+              const message = compactText4(body.message, 240) || "WorkerPal job failed";
+              const detail = compactText4(body.detail, 600);
               const envelope = {
                 protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID6(),
+                id: randomUUID9(),
                 ts: new Date().toISOString(),
                 sessionId: job.sessionId,
                 type: "job_failed",
@@ -23250,7 +28613,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const job = jobQueue.getJob(jobId);
           const params = parseJsonRecord2(job?.params ?? "");
           const origin = deriveJobOrigin(params);
-          const requestId = compactText3(params.requestId, 128);
+          const requestId = compactText4(params.requestId, 128);
           if (requestId)
             autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
@@ -23270,11 +28633,11 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           if (job?.sessionId) {
             const session = sessionManager.getSession(job.sessionId);
             if (session) {
-              const message = compactText3(body.message, 240) || "WorkerPal job publish-blocked";
-              const detail = compactText3(body.detail, 600);
+              const message = compactText4(body.message, 240) || "WorkerPal job publish-blocked";
+              const detail = compactText4(body.detail, 600);
               const envelope = {
                 protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID6(),
+                id: randomUUID9(),
                 ts: new Date().toISOString(),
                 sessionId: job.sessionId,
                 type: "job_failed",
@@ -23307,8 +28670,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           console.log(`[Server] Deferred job ${jobId} failed during pre-execution maintenance`);
           projectAuthoritativeJobFailure({
             jobId,
-            message: compactText3(body.message, 240) || "Deferred WorkerPal job failed",
-            detail: compactText3(body.detail, 600),
+            message: compactText4(body.message, 240) || "Deferred WorkerPal job failed",
+            detail: compactText4(body.detail, 600),
             ts: result.failedAt,
             from: "server:job-fail-deferred",
             notifyRuntimeCanary: true
@@ -23413,25 +28776,25 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const result = requestQueue.enqueue(body);
         const autonomyMetadata = autonomyMetadataFromPayload(body);
         if (result.ok && result.requestId && (autonomyMetadata.reservationRequired === true || autonomyMetadata.reservation_required === true)) {
-          const objectiveId = compactText3(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128);
+          const objectiveId = compactText4(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128);
           if (objectiveId) {
             autonomyStore.markObjectiveDispatched(objectiveId, result.requestId);
-            const sessionId = compactText3(body.sessionId, 128);
+            const sessionId = compactText4(body.sessionId, 128);
             const session = sessionManager.getSession(sessionId);
             if (session) {
               session.emit({
                 protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID6(),
+                id: randomUUID9(),
                 ts: new Date().toISOString(),
                 sessionId,
                 type: "autonomy_objective_dispatched",
                 from: "server:autonomy",
                 payload: {
-                  runId: compactText3(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
-                  snapshotId: compactText3(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128),
+                  runId: compactText4(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+                  snapshotId: compactText4(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128),
                   objectiveId,
                   requestId: result.requestId,
-                  patternKey: compactText3(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) || "unknown",
+                  patternKey: compactText4(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) || "unknown",
                   origin: "autonomy"
                 }
               });
@@ -23445,7 +28808,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const agentId = compactText3(body.agentId, 128);
+        const agentId = compactText4(body.agentId, 128);
         if (!agentId)
           return makeJson({ ok: false, message: "agentId is required" }, 400);
         const leaseMs = typeof body.leaseMs === "number" ? body.leaseMs : undefined;
@@ -23535,7 +28898,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           return denied;
         const requestId = reqLeaseRenewMatch[1];
         const body = await req.json().catch(() => ({}));
-        const result = requestQueue.renewLease(requestId, compactText3(body.agentId, 128), compactText3(body.claimToken, 256), {
+        const result = requestQueue.renewLease(requestId, compactText4(body.agentId, 128), compactText4(body.claimToken, 256), {
           leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined
         });
         return makeJson(result, result.ok ? 200 : 409);
@@ -23548,10 +28911,10 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const requestId = reqWorkerHandoffMatch[1];
         const body = await req.json().catch(() => ({}));
         const request = requestQueue.getRequest(requestId);
-        const handoffJobId = compactText3(body.jobId, 128);
+        const handoffJobId = compactText4(body.jobId, 128);
         const handoffJob = handoffJobId ? jobQueue.getJob(handoffJobId) : null;
         const handoffParams = parseJsonRecord2(handoffJob?.params ?? "");
-        const linkedRequestId = compactText3(handoffParams.requestId, 128);
+        const linkedRequestId = compactText4(handoffParams.requestId, 128);
         if (!request || request.status !== "claimed" || !handoffJob || handoffJob.kind !== "task.execute" || handoffJob.sessionId !== request.sessionId || linkedRequestId !== requestId) {
           return makeJson({
             ok: false,
@@ -23559,7 +28922,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             message: "Worker handoff must reference this claimed request's durable task.execute job."
           }, 409);
         }
-        const result = requestQueue.recordWorkerHandoff(requestId, handoffJobId, compactText3(body.agentId, 128), compactText3(body.claimToken, 256));
+        const result = requestQueue.recordWorkerHandoff(requestId, handoffJobId, compactText4(body.agentId, 128), compactText4(body.claimToken, 256));
         if (result.ok) {
           autonomyStore.linkJobToObjectiveByRequest(requestId, handoffJobId);
         }
@@ -23572,8 +28935,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           return denied;
         const requestId = reqCompleteMatch[1];
         const body = await req.json().catch(() => ({}));
-        const requestAgentId = compactText3(body.agentId, 128);
-        const requestClaimToken = compactText3(body.claimToken, 256);
+        const requestAgentId = compactText4(body.agentId, 128);
+        const requestClaimToken = compactText4(body.claimToken, 256);
         const storedRequest = requestQueue.getRequest(requestId);
         if (storedRequest?.status === "completed") {
           const replay = requestQueue.complete(requestId, body);
@@ -23605,11 +28968,11 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           }, 409);
         }
         if (wasDelegatedToWorker) {
-          const handoffJobId = compactText3(storedRequest?.handoffJobId, 128);
+          const handoffJobId = compactText4(storedRequest?.handoffJobId, 128);
           const handoffJob = handoffJobId ? jobQueue.getJob(handoffJobId) : null;
           const handoffParams = parseJsonRecord2(handoffJob?.params ?? "");
-          const linkedRequestId = compactText3(handoffParams.requestId, 128);
-          const payloadJobId = compactText3(resultPayload?.jobId, 128);
+          const linkedRequestId = compactText4(handoffParams.requestId, 128);
+          const payloadJobId = compactText4(resultPayload?.jobId, 128);
           if (!handoffJobId || !handoffJob || linkedRequestId !== requestId || payloadJobId && payloadJobId !== handoffJobId) {
             requestQueue.fail(requestId, {
               agentId: requestAgentId,
@@ -23650,13 +29013,13 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           return denied;
         const requestId = reqFailMatch[1];
         const body = await req.json().catch(() => ({}));
-        const requestAgentId = compactText3(body.agentId, 128);
+        const requestAgentId = compactText4(body.agentId, 128);
         const storedRequest = requestQueue.getRequest(requestId);
         if (storedRequest?.status === "failed") {
           const replay = requestQueue.fail(requestId, body);
           return makeJson(replay, replay.ok ? 200 : 409);
         }
-        const lease = requestQueue.validateActiveLease(requestId, requestAgentId, compactText3(body.claimToken, 256));
+        const lease = requestQueue.validateActiveLease(requestId, requestAgentId, compactText4(body.claimToken, 256));
         if (!lease.ok) {
           return makeJson({
             ok: false,
@@ -23694,7 +29057,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           jobClaimAuthority: parsedAuthority.authority
         });
         if (result.ok) {
-          const jobId = compactText3(body.jobId, 128);
+          const jobId = compactText4(body.jobId, 128);
           if (jobId) {
             recordWorkerRuntimeCanarySuccess(jobId);
             autonomyStore.markObjectiveRunningByJobId(jobId);
@@ -23708,7 +29071,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (denied)
           return denied;
         const body = await req.json().catch(() => ({}));
-        const pusherId = compactText3(body.pusherId, 128);
+        const pusherId = compactText4(body.pusherId, 128);
         if (!pusherId)
           return makeJson({ ok: false, message: "pusherId is required" }, 400);
         const result = completionQueue.claim(pusherId, {
@@ -23725,7 +29088,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const pusherId = typeof body.pusherId === "string" ? body.pusherId.trim() : "";
         if (!pusherId)
           return makeJson({ ok: false, message: "pusherId is required" }, 400);
-        const claimToken = compactText3(body.claimToken, 256);
+        const claimToken = compactText4(body.claimToken, 256);
         if (!claimToken)
           return makeJson({ ok: false, message: "claimToken is required" }, 400);
         const result = completionQueue.renewLease(compLeaseMatch[1], pusherId, claimToken, {
@@ -23740,8 +29103,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           return denied;
         const completionId = compProcMatch[1];
         const body = await req.json().catch(() => ({}));
-        const pusherId = compactText3(body.pusherId, 128);
-        const claimToken = compactText3(body.claimToken, 256);
+        const pusherId = compactText4(body.pusherId, 128);
+        const claimToken = compactText4(body.claimToken, 256);
         if (!pusherId)
           return makeJson({ ok: false, message: "pusherId is required" }, 400);
         if (!claimToken)
@@ -23762,9 +29125,14 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");
           const origin = deriveJobOrigin(params);
-          const requestId = compactText3(params.requestId, 128);
+          const requestId = compactText4(params.requestId, 128);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
+          const publishedPrUrl = compactText4(prUrl, 2000) || compactText4(job?.prUrl, 2000) || null;
+          if (publishedPrUrl)
+            jobQueue.setPrUrl(result.jobId, publishedPrUrl);
           if (outcomeContext) {
+            if (publishedPrUrl)
+              autonomyStore.markObjectiveAwaitingReviewByJobId(result.jobId);
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -23772,9 +29140,10 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               patternKey: outcomeContext.patternKey,
               success: true,
               latencyMs: result.durationMs ?? null,
-              userAction: "applied",
+              userAction: publishedPrUrl ? "published" : "applied",
               reopenedWithin24h: false,
-              regressionFlag: false
+              regressionFlag: false,
+              terminal: !publishedPrUrl
             });
           }
           if (job?.sessionId) {
@@ -23782,14 +29151,14 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             const savedResult = parseJsonRecord2(job.result ?? "");
             session?.emit({
               protocolVersion: PROTOCOL_VERSION,
-              id: randomUUID6(),
+              id: randomUUID9(),
               ts: new Date().toISOString(),
               sessionId: job.sessionId,
               type: "job_completed",
               from: "server:completion-processed",
               payload: {
                 jobId: result.jobId,
-                summary: compactText3(savedResult.summary, 1200) || "Candidate published successfully",
+                summary: compactText4(savedResult.summary, 1200) || "Candidate published successfully",
                 origin
               }
             });
@@ -23805,8 +29174,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           return denied;
         const completionId = compFailMatch[1];
         const body = await req.json().catch(() => ({}));
-        const pusherId = compactText3(body.pusherId, 128);
-        const claimToken = compactText3(body.claimToken, 256);
+        const pusherId = compactText4(body.pusherId, 128);
+        const claimToken = compactText4(body.claimToken, 256);
         if (!pusherId)
           return makeJson({ ok: false, message: "pusherId is required" }, 400);
         if (!claimToken)
@@ -23821,7 +29190,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");
           const origin = deriveJobOrigin(params);
-          const requestId = compactText3(params.requestId, 128);
+          const requestId = compactText4(params.requestId, 128);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
           if (outcomeContext) {
             autonomyStore.recordOutcome({
@@ -23840,7 +29209,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             const session = sessionManager.getSession(job.sessionId);
             session?.emit({
               protocolVersion: PROTOCOL_VERSION,
-              id: randomUUID6(),
+              id: randomUUID9(),
               ts: new Date().toISOString(),
               sessionId: job.sessionId,
               type: "job_failed",
@@ -23849,7 +29218,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
                 jobId: result.jobId,
                 message: "Candidate publication failed",
                 origin,
-                detail: compactText3(error, 600)
+                detail: compactText4(error, 600)
               }
             });
           }
@@ -23882,7 +29251,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           try {
             const envelope = {
               protocolVersion: PROTOCOL_VERSION,
-              id: randomUUID6(),
+              id: randomUUID9(),
               ts: new Date().toISOString(),
               sessionId,
               type: "error",
@@ -23949,6 +29318,9 @@ if (import.meta.main) {
 export {
   sessionMessageResultStatus,
   sessionManager,
+  repositoryServices,
+  repositoryAgentQueue,
+  memoryStore,
   jobQueue,
   createRequestHandler,
   autonomyStore

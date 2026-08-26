@@ -30,6 +30,7 @@ import {
   fetchBufferedWithHardDeadline,
   loadPushPalsConfig,
   normalizeAutonomyComponentArea,
+  createRepositoryAgentServiceClients,
   resolveLocalServerConnection,
   sanitizePushPalsConfigForLogging,
   terminateProcessTree,
@@ -37,10 +38,11 @@ import {
   normalizeTargetPath,
   normalizeWriteGlob,
 } from "shared";
-import type { AutonomyComponentArea } from "shared";
+import type { AutonomyComponentArea, RepositoryAgentServiceClients } from "shared";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { resolve } from "path";
 import { RemoteBuddyAutonomousEngine } from "./autonomous_engine.js";
+import { createRepositoryAgentWorker, type RepositoryAgentWorker } from "./repository_agent.js";
 import {
   extractExplicitTargetPath,
   normalizePathHints,
@@ -208,6 +210,7 @@ export type PlannerRisk = "low" | "medium" | "high";
 
 export type AutonomyJobMetadata = {
   origin: "autonomy";
+  reservationRequired?: boolean;
   objectiveId?: string;
   runId?: string;
   snapshotId?: string;
@@ -487,6 +490,8 @@ function parseAutonomyRequestMetadata(value: unknown): RequestAutonomyMetadata |
   ).trim();
   return {
     origin: "autonomy",
+    reservationRequired:
+      payload.reservationRequired === true || payload.reservation_required === true,
     objectiveId: String(payload.objectiveId ?? payload.objective_id ?? "").trim() || undefined,
     runId: String(payload.runId ?? payload.run_id ?? "").trim() || undefined,
     snapshotId: String(payload.snapshotId ?? payload.snapshot_id ?? "").trim() || undefined,
@@ -1155,6 +1160,8 @@ export class RemoteBuddyOrchestrator {
   private readonly executionBudgetBackgroundMs: number;
   private readonly finalizationBudgetMs: number;
   private readonly autonomousEngine: RemoteBuddyAutonomousEngine;
+  private readonly repositoryServices: RepositoryAgentServiceClients;
+  private readonly repositoryAgentWorker: RepositoryAgentWorker;
   private autonomyRuntimeEnabled: boolean;
   private readonly autonomyConfigPollMs: number;
   private autonomyConfigPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -1218,6 +1225,8 @@ export class RemoteBuddyOrchestrator {
     authToken: string | null;
     brain: AgentBrain;
     llm: LLMClient;
+    repositoryAgentLlm?: LLMClient;
+    repositoryServices?: RepositoryAgentServiceClients;
     idempotency: IdempotencyStore;
     persistentMemory: SessionMemoryBackend;
     jobsDbPath: string;
@@ -1233,6 +1242,18 @@ export class RemoteBuddyOrchestrator {
     this.idempotency = opts.idempotency;
     this.persistentMemory = opts.persistentMemory;
     this.jobsDbPath = opts.jobsDbPath;
+    this.repositoryServices =
+      opts.repositoryServices ??
+      createRepositoryAgentServiceClients({
+        serverUrl: this.server,
+        callerService: "remotebuddy",
+        callerInstanceId: this.agentId,
+        authToken: this.authToken,
+        fetchImpl: this.fetchImpl,
+        requestTimeoutMs: SERVICE_CONTROL_HTTP_TIMEOUT_MS,
+        askTimeoutMs: Math.max(120_000, CONFIG.remotebuddy.autonomy.llmTimeoutMs + 30_000),
+        pollIntervalMs: 250,
+      });
     const remoteCfg = CONFIG.remotebuddy;
     this.workerOnlineTtlMs = Math.max(1_000, remoteCfg.workerpalOnlineTtlMs);
     this.waitForWorkerMs = Math.max(0, remoteCfg.waitForWorkerpalMs);
@@ -1356,12 +1377,25 @@ export class RemoteBuddyOrchestrator {
       from: `agent:${this.agentId}`,
       fetchImpl: this.fetchImpl,
     });
+    this.repositoryAgentWorker = createRepositoryAgentWorker({
+      serverUrl: this.server,
+      authToken: this.authToken,
+      fetchImpl: this.fetchImpl,
+      llm: opts.repositoryAgentLlm ?? opts.llm,
+      // RepositoryAgent always gives the assigned model a bounded evidence
+      // packet. Even a Codex-backed client runs in an isolated neutral repo,
+      // never with the customer repository as its process cwd.
+      repositoryTools: false,
+      modelId: CONFIG.remotebuddy.llm.model,
+      pollMs: Math.max(250, Math.min(2_000, CONFIG.remotebuddy.pollMs)),
+    });
     this.autonomousEngine = new RemoteBuddyAutonomousEngine({
       server: this.server,
       sessionId: this.sessionId,
       authToken: this.authToken,
       repo: this.repo,
       llm: opts.llm,
+      repositoryAgent: this.repositoryServices.repositoryAgent,
       comm: this.comm,
       config: CONFIG,
     });
@@ -3460,6 +3494,7 @@ export class RemoteBuddyOrchestrator {
             origin: "autonomy",
             autonomy: {
               origin: "autonomy",
+              ...(autonomyMetadata.reservationRequired ? { reservationRequired: true } : {}),
               ...(autonomyMetadata.objectiveId
                 ? { objectiveId: autonomyMetadata.objectiveId }
                 : {}),
@@ -3787,6 +3822,13 @@ export class RemoteBuddyOrchestrator {
     this.autonomousEngine.start();
   }
 
+  startRepositoryAgent(): void {
+    this.repositoryAgentWorker.start();
+    console.log(
+      `[RepositoryAgent] Started shared repository capability (model=${CONFIG.remotebuddy.llm.model}, access=bounded-evidence).`,
+    );
+  }
+
   private applyAutonomyEnabledFromRuntimeConfig(enabled: boolean): void {
     if (enabled === this.autonomyRuntimeEnabled) return;
 
@@ -3827,6 +3869,8 @@ export class RemoteBuddyOrchestrator {
       this.autonomyConfigPollTimer = null;
     }
     this.autonomousEngine.stop();
+    await this.repositoryAgentWorker.stop().catch(() => {});
+    await this.repositoryServices.close().catch(() => {});
     if (this.statusHeartbeatTimer) {
       clearInterval(this.statusHeartbeatTimer);
       this.statusHeartbeatTimer = null;
@@ -3961,7 +4005,26 @@ async function main() {
     serverUrl: opts.server,
     authToken: opts.authToken,
   });
+  const repositoryAgentLlm = createLLMClient({
+    service: "repository_agent",
+    sessionId,
+    backend: llmCfg.backend,
+    endpoint: llmCfg.endpoint,
+    model: llmCfg.model,
+    apiKey: llmCfg.apiKey,
+    serverUrl: opts.server,
+    authToken: opts.authToken,
+  });
   brain = new AgentBrain(llm);
+  const repositoryServices = createRepositoryAgentServiceClients({
+    serverUrl: opts.server,
+    callerService: "remotebuddy",
+    callerInstanceId: "remotebuddy-orchestrator",
+    authToken: opts.authToken,
+    requestTimeoutMs: SERVICE_CONTROL_HTTP_TIMEOUT_MS,
+    askTimeoutMs: Math.max(120_000, CONFIG.remotebuddy.autonomy.llmTimeoutMs + 30_000),
+    pollIntervalMs: 250,
+  });
 
   const orchestrator = new RemoteBuddyOrchestrator({
     server: opts.server,
@@ -3969,6 +4032,8 @@ async function main() {
     authToken: opts.authToken,
     brain,
     llm,
+    repositoryAgentLlm,
+    repositoryServices,
     idempotency,
     persistentMemory,
     jobsDbPath: sharedDbPath,
@@ -3998,6 +4063,7 @@ async function main() {
   orchestrator.startStatusHeartbeat();
   orchestrator.startSessionEventMonitor();
   orchestrator.startWorkerCapacityPrewarmOnStartup();
+  orchestrator.startRepositoryAgent();
   orchestrator.startAutonomy();
   orchestrator.startAutonomyRuntimeConfigPolling();
 

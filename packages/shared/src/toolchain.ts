@@ -54,24 +54,38 @@ const NODE_BACKED_CLI_NAMES = new Set([
 
 const DIRECT_TOOL_CANDIDATES: Record<string, string[]> = {
   bash: ["bash"],
+  bazel: ["bazel"],
   bun: ["bun"],
   bunx: ["bun"],
+  buf: ["buf"],
   cargo: ["cargo"],
+  cabal: ["cabal"],
+  clojure: ["clojure"],
+  bundle: ["bundle"],
   cc: ["cc"],
   clang: ["clang"],
   "clang++": ["clang++"],
   cmake: ["cmake"],
+  ctest: ["ctest"],
   cypress: ["cypress"],
   docker: ["docker"],
+  dart: ["dart"],
   eslint: ["eslint"],
   expo: ["expo"],
+  flutter: ["flutter"],
   gcc: ["gcc"],
   "g++": ["g++"],
   gh: ["gh"],
+  git: ["git"],
   go: ["go"],
+  gradle: ["gradle"],
   java: ["java"],
   javac: ["javac"],
+  lein: ["lein"],
   make: ["make"],
+  mix: ["mix"],
+  composer: ["composer"],
+  dotnet: ["dotnet"],
   mvn: ["mvn"],
   next: ["next"],
   ninja: ["ninja"],
@@ -80,16 +94,24 @@ const DIRECT_TOOL_CANDIDATES: Record<string, string[]> = {
   npx: ["npx"],
   playwright: ["playwright"],
   pnpm: ["pnpm"],
+  php: ["php"],
   powershell: ["powershell"],
   pwsh: ["pwsh"],
   python: ["python3", "python", "py"],
   python3: ["python3", "python"],
   pytest: ["python3", "python", "py"],
   rustc: ["rustc"],
+  rscript: ["Rscript"],
+  ruby: ["ruby"],
   sh: ["sh"],
+  stack: ["stack"],
+  swift: ["swift"],
+  terraform: ["terraform"],
   tsc: ["tsc"],
   vite: ["vite"],
   vitest: ["vitest"],
+  zig: ["zig"],
+  luac: ["luac"],
   yarn: ["yarn"],
 };
 
@@ -185,6 +207,22 @@ export function inferToolRequirementsForValidationCommand(
   addDirectExecutableRequirement(requirements, first, command);
   addNodeBackedCliRequirement(requirements, first, `validation command "${command}"`, command);
 
+  const nestedShellCommand = nestedValidationCommandFromShell(tokens);
+  if (nestedShellCommand) {
+    for (const requirement of inferToolRequirementsForValidationCommand(
+      repoRoot,
+      nestedShellCommand,
+      nativeSignals,
+      maxScriptScanChars,
+    )) {
+      requirements.push({
+        ...requirement,
+        detectedFrom: `nested command in validation wrapper "${command}"`,
+        requiredFor: [command],
+      });
+    }
+  }
+
   const bunSubcommand = resolveBunSubcommand(tokens);
   if (bunSubcommand?.kind === "x") {
     addNodeBackedCliRequirement(
@@ -237,6 +275,35 @@ export function inferToolRequirementsForValidationCommand(
   }
 
   return dedupeToolRequirements(requirements);
+}
+
+function nestedValidationCommandFromShell(tokens: string[]): string | null {
+  const executable = normalizeToolToken(tokens[0] ?? "");
+  let script = "";
+  if (["sh", "bash"].includes(executable) && tokens[1]?.toLowerCase() === "-c") {
+    script = tokens.slice(2).join(" ");
+  } else if (["cmd", "cmd.exe"].includes(executable)) {
+    const commandIndex = tokens.findIndex((token) => token.toLowerCase() === "/c");
+    if (commandIndex >= 0) script = tokens.slice(commandIndex + 1).join(" ");
+  }
+  if (!script) return null;
+  const marker = script.toLowerCase().lastIndexOf("&& exec ");
+  const fallbackMarker = script.lastIndexOf("&&");
+  const nested =
+    marker >= 0
+      ? script.slice(marker + "&& exec ".length).trim()
+      : fallbackMarker >= 0
+        ? script.slice(fallbackMarker + 2).trim()
+        : "";
+  if (!nested || /[;&|`$<>]/.test(nested)) return null;
+  const nestedTokens = tokenizeToolchainCommand(nested);
+  if (
+    !nestedTokens?.length ||
+    ["sh", "bash", "cmd", "cmd.exe"].includes(normalizeToolToken(nestedTokens[0] ?? ""))
+  ) {
+    return null;
+  }
+  return nested;
 }
 
 export function requirementsForValidationCommand(
@@ -495,7 +562,11 @@ function resolvePackageScript(
   }
 }
 
-function inferReferencedScriptPaths(repoRoot: string, scriptCwd: string, tokens: string[]): string[] {
+function inferReferencedScriptPaths(
+  repoRoot: string,
+  scriptCwd: string,
+  tokens: string[],
+): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const token of tokens) {
@@ -758,7 +829,12 @@ function detectNativeSignals(repoRoot: string, maxEntries = 1_000): NativeSignal
 function usesNativeBuildCommand(tokens: string[]): boolean {
   return tokens.some((token) => {
     const normalized = normalizeToolToken(token);
-    return normalized === "make" || normalized === "cmake" || normalized === "ninja";
+    return (
+      normalized === "bazel" ||
+      normalized === "make" ||
+      normalized === "cmake" ||
+      normalized === "ninja"
+    );
   });
 }
 

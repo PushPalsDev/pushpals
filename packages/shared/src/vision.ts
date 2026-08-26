@@ -1,4 +1,4 @@
-const SECTION_HEADING_RE = /^##\s+(\d+)\)\s+(.+?)\s*$/;
+const SECTION_HEADING_RE = /^##\s+(?:(\d+)[.)]\s*)?(.+?)\s*$/;
 const ANY_HEADING_RE = /^##+\s+(.+?)\s*$/;
 const ONE_SENTENCE_PROMPT_RE = /^\>\s*\*\*One sentence:\*\*\s*(.+)\s*$/i;
 const BLOCKQUOTE_RE = /^\>\s*(.+?)\s*$/;
@@ -46,6 +46,53 @@ function toLines(markdown: string): string[] {
     .split("\n");
 }
 
+function maskNonProseMarkdownLines(lines: string[]): string[] {
+  let inFrontmatter = lines[0]?.trim() === "---";
+  let inHtmlComment = false;
+  let fenceCharacter = "";
+  let fenceLength = 0;
+  return lines.map((line, index) => {
+    const trimmed = line.trim();
+    if (inFrontmatter) {
+      if (index > 0 && trimmed === "---") inFrontmatter = false;
+      return "";
+    }
+
+    let visible = line;
+    if (inHtmlComment) {
+      const commentEnd = visible.indexOf("-->");
+      if (commentEnd < 0) return "";
+      visible = visible.slice(commentEnd + 3);
+      inHtmlComment = false;
+    }
+    while (visible.includes("<!--")) {
+      const commentStart = visible.indexOf("<!--");
+      const commentEnd = visible.indexOf("-->", commentStart + 4);
+      if (commentEnd < 0) {
+        visible = visible.slice(0, commentStart);
+        inHtmlComment = true;
+        break;
+      }
+      visible = `${visible.slice(0, commentStart)}${visible.slice(commentEnd + 3)}`;
+    }
+
+    const fence = visible.match(/^\s{0,3}(`{3,}|~{3,})/);
+    if (fence) {
+      const marker = fence[1];
+      if (!fenceCharacter) {
+        fenceCharacter = marker[0];
+        fenceLength = marker.length;
+      } else if (marker[0] === fenceCharacter && marker.length >= fenceLength) {
+        fenceCharacter = "";
+        fenceLength = 0;
+      }
+      return "";
+    }
+    if (fenceCharacter) return "";
+    return visible;
+  });
+}
+
 function extractOneSentence(lines: string[]): string {
   let expectNextBlockquoteSentence = false;
   for (const line of lines) {
@@ -74,6 +121,31 @@ function extractOneSentence(lines: string[]): string {
     if (/^Example:/i.test(text)) continue;
     return text;
   }
+  // Repositories commonly use a plain introductory paragraph rather than the
+  // PushPals starter template's blockquote marker. Treat the first concise
+  // prose line as the summary while ignoring headings, lists, and code fences.
+  let inFrontmatter = lines[0]?.trim() === "---";
+  for (const [index, line] of lines.entries()) {
+    const text = line.trim();
+    if (inFrontmatter) {
+      if (index > 0 && text === "---") inFrontmatter = false;
+      continue;
+    }
+    if (
+      !text ||
+      /^(?:---|\*\*\*|___)$/.test(text) ||
+      /^#{1,6}\s/.test(text) ||
+      BULLET_RE.test(text) ||
+      /^```/.test(text) ||
+      /^<!--/.test(text) ||
+      /^!\[/.test(text) ||
+      /^\[!\[/.test(text) ||
+      /^\|/.test(text)
+    ) {
+      continue;
+    }
+    return text;
+  }
   return "";
 }
 
@@ -100,9 +172,29 @@ function dedupeAndClamp(values: string[]): string[] {
 
 function classifyHeadingBucket(heading: string): keyof VisionKeyItems | null {
   const text = heading.toLowerCase();
-  if (text.includes("who this is for") || text.includes("user")) return "targetUsers";
-  if (text.includes("priorit")) return "priorities";
-  if (text.includes("objective")) return "objectives";
+  if (
+    text.includes("priorit") ||
+    text.includes("roadmap") ||
+    text.includes("focus") ||
+    text.includes("strategy") ||
+    text.includes("what's next") ||
+    text.includes("what is next")
+  ) {
+    return "priorities";
+  }
+  if (text.includes("objective") || text.includes("goal") || text.includes("outcome")) {
+    return "objectives";
+  }
+  if (
+    text.includes("who this is for") ||
+    text.includes("target user") ||
+    text.includes("intended user") ||
+    text.includes("audience") ||
+    text.includes("persona") ||
+    /^(?:the\s+)?users?$/.test(text.trim())
+  ) {
+    return "targetUsers";
+  }
   if (text.includes("principle") || text.includes("guardrail")) return "guardrails";
   if (text.includes("constraint")) return "constraints";
   if (text.includes("non-goal") || text.includes("out of scope") || text.includes("not ")) {
@@ -117,7 +209,12 @@ function classifyHeadingBucket(heading: string): keyof VisionKeyItems | null {
   ) {
     return "testingCriteria";
   }
-  if (text.includes("measure") || text.includes("metric") || text.includes("good looks like")) {
+  if (
+    text.includes("measure") ||
+    text.includes("metric") ||
+    text.includes("success") ||
+    text.includes("good looks like")
+  ) {
     return "metrics";
   }
   if (text.includes("risk") || text.includes("gate")) return "riskPolicy";
@@ -132,7 +229,7 @@ export function normalizeVisionSectionRef(value: string): string {
   const match = text.match(/\d+/);
   if (!match) return "";
   const numeric = Number.parseInt(match[0], 10);
-  return Number.isFinite(numeric) && numeric > 0 ? String(numeric) : "";
+  return Number.isFinite(numeric) && numeric >= 0 ? String(numeric) : "";
 }
 
 export function normalizeVisionSectionRefs(
@@ -154,10 +251,28 @@ export function normalizeVisionSectionRefs(
 
 export function parseVisionDoc(markdown: string): ParsedVisionDoc {
   const lines = toLines(markdown);
+  const proseLines = maskNonProseMarkdownLines(lines);
   const sections: VisionSection[] = [];
   let currentNumber = "";
   let currentTitle = "";
   let currentBody: string[] = [];
+  const usedSectionNumbers = new Set(
+    proseLines.map((line) => line.match(SECTION_HEADING_RE)?.[1] ?? "").filter(Boolean),
+  );
+  let nextSyntheticSectionNumber = 1;
+
+  const allocateSectionNumber = (explicit: string | undefined): string => {
+    if (explicit) {
+      return explicit;
+    }
+    while (usedSectionNumbers.has(String(nextSyntheticSectionNumber))) {
+      nextSyntheticSectionNumber += 1;
+    }
+    const generated = String(nextSyntheticSectionNumber);
+    usedSectionNumbers.add(generated);
+    nextSyntheticSectionNumber += 1;
+    return generated;
+  };
 
   const flushCurrent = (): void => {
     if (!currentNumber) return;
@@ -171,16 +286,16 @@ export function parseVisionDoc(markdown: string): ParsedVisionDoc {
     currentBody = [];
   };
 
-  for (const line of lines) {
+  for (const [index, line] of proseLines.entries()) {
     const heading = line.match(SECTION_HEADING_RE);
     if (heading) {
       flushCurrent();
-      currentNumber = heading[1];
+      currentNumber = allocateSectionNumber(heading[1]);
       currentTitle = heading[2].trim();
       continue;
     }
     if (currentNumber) {
-      currentBody.push(line);
+      currentBody.push(lines[index] ?? "");
     }
   }
   flushCurrent();
@@ -193,14 +308,14 @@ export function parseVisionDoc(markdown: string): ParsedVisionDoc {
   }
 
   return {
-    oneSentence: extractOneSentence(lines),
+    oneSentence: extractOneSentence(proseLines),
     sections,
     sectionByNumber,
   };
 }
 
 export function extractVisionKeyItems(markdown: string): VisionKeyItems {
-  const lines = toLines(markdown);
+  const lines = maskNonProseMarkdownLines(toLines(markdown));
   const buckets: VisionKeyItems = {
     targetUsers: [],
     priorities: [],

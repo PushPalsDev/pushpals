@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -158,6 +159,39 @@ describe("autonomy integration baseline", () => {
       console.warn = originalWarn;
     }
   });
+
+  test("reads fresh vision priorities from the prepared autonomy worktree", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-vision-worktree-"));
+    tempDirs.push(root);
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_vision_worktree",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const autonomyRepo = String((engine as any).autonomyRepo);
+    mkdirSync(autonomyRepo, { recursive: true });
+    writeFileSync(
+      join(autonomyRepo, "vision.md"),
+      "# Vision\n\n## Priorities\n- Improve import recovery\n",
+      "utf8",
+    );
+    const initial = (engine as any).loadVisionContext("run_vision_initial");
+
+    writeFileSync(
+      join(autonomyRepo, "vision.md"),
+      "# Vision\n\n## Priorities\n- Improve semantic search ranking\n",
+      "utf8",
+    );
+    const refreshed = (engine as any).loadVisionContext("run_vision_refreshed");
+
+    expect(initial?.key_items?.priorities).toEqual(["Improve import recovery"]);
+    expect(refreshed?.key_items?.priorities).toEqual(["Improve semantic search ranking"]);
+    expect(refreshed?.sha256).not.toBe(initial?.sha256);
+  });
 });
 
 function jsonResponse(status: number, payload: unknown): Response {
@@ -169,12 +203,16 @@ function jsonResponse(status: number, payload: unknown): Response {
 
 function makeConfig(): any {
   return {
+    workerpals: {
+      executionPlatform: "auto",
+    },
     sourceControlManager: {
       remote: "origin",
       mainBranch: "main_agents",
       baseBranch: "main",
     },
     remotebuddy: {
+      workerpalDocker: true,
       llm: {
         backend: "openai_codex",
         endpoint: "http://127.0.0.1:1234",
@@ -265,6 +303,116 @@ function makeSnapshot() {
   };
 }
 
+describe("RepositoryAgent autonomy ideation", () => {
+  test("asks the shared RepositoryAgent to inspect the exact repo before legacy ideation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-agent-"));
+    tempDirs.push(root);
+    execFileSync("git", ["init"], { cwd: root });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    execFileSync("git", ["config", "user.name", "PushPals Test"], { cwd: root });
+    writeFileSync(join(root, "vision.md"), "# Vision\n\n## Priorities\n- Improve startup\n");
+    writeFileSync(join(root, "service.ts"), "export const ready = true;\n");
+    execFileSync("git", ["add", "."], { cwd: root });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: root });
+
+    let submitted: Record<string, unknown> | null = null;
+    const repositoryAgent = {
+      async ask(input: Record<string, unknown>) {
+        submitted = input;
+        const repository = input.repository as Record<string, unknown>;
+        return {
+          schemaVersion: 1,
+          requestId: "repo-request-1",
+          analyzedRepository: {
+            identity: repository.identity,
+            revision: repository.revision,
+            tree: repository.tree,
+          },
+          answer: "One grounded candidate",
+          summary: "Startup is the highest vision priority.",
+          data: {
+            candidates: [
+              {
+                id: "candidate-startup",
+                title: "Improve startup readiness",
+                objective_type: "feature_small",
+                problem_statement: "Make startup readiness explicit.",
+                trigger_type: "queue_health",
+                component_area: "service.ts",
+                target_paths: ["service.ts"],
+                scope: { read_anywhere: true, write_globs: ["service.ts"] },
+                risk_level: "low",
+                expected_validation: ["git diff --check"],
+                estimated_effort: "small",
+                why_now_signal_ids: ["sig_queue"],
+                confidence: 0.9,
+                vision_alignment_reason: "Directly supports the top priority.",
+                vision_section_refs: ["1"],
+                feature_hypotheses: ["Explicit readiness reduces startup failures."],
+              },
+            ],
+          },
+          confidence: 0.9,
+          evidence: [
+            { path: "service.ts", revision: repository.revision, rationale: "startup owner" },
+          ],
+          recommendations: [],
+          validationProposals: [],
+          cache: { hit: false, key: "cache-1" },
+          memoryRefs: [{ id: "memory-1", namespace: "repository_fact", role: "analysis_cache" }],
+          completedAt: new Date().toISOString(),
+        };
+      },
+    };
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_repository_agent",
+      authToken: "tok",
+      repo: root,
+      llm: { generate: async () => ({ text: "{}" }) },
+      repositoryAgent: repositoryAgent as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).autonomyRepo = root;
+    const result = await (engine as any).repositoryAgentIdeation({
+      runId: "run-repository-agent",
+      snapshot: makeSnapshot(),
+      visionContext: {
+        path: "vision.md",
+        markdown: "# Vision",
+        one_sentence: "Improve startup",
+        sections: [{ number: "1", title: "Priorities", markdown: "Improve startup" }],
+        key_items: {
+          target_users: [],
+          priorities: ["Improve startup"],
+          objectives: [],
+          guardrails: [],
+          constraints: [],
+          non_goals: [],
+          metrics: [],
+          testing_criteria: [],
+          risk_policy: [],
+          operating_model: [],
+          governance: [],
+        },
+        section_numbers: ["1"],
+        sha256: "vision-hash",
+        truncated: false,
+      },
+      cycleDeadline: Date.now() + 30_000,
+    });
+
+    expect(result?.json.candidates).toHaveLength(1);
+    expect(result?.llmCall.provider).toBe("repository_agent");
+    expect((submitted?.repository as Record<string, unknown>).root).toBe(root);
+    expect((submitted?.context as Record<string, unknown>).operation).toBe(
+      "analyze_autonomy_opportunities",
+    );
+    expect(JSON.stringify(submitted)).not.toContain("repo_targets");
+  });
+});
+
 function mockGitSpawnForTest(): void {
   originalSpawn = Bun.spawn;
   (Bun as any).spawn = (cmd: string[], opts?: unknown) => {
@@ -321,6 +469,12 @@ function seedPushpalsAutonomyRepoLayout(root: string): void {
     mkdirSync(join(fullPath, ".."), { recursive: true });
     writeFileSync(fullPath, "// test fixture\n", "utf8");
   }
+  writeFileSync(
+    join(root, "package.json"),
+    JSON.stringify({ packageManager: "bun@1.3.14", scripts: { "test:root": "bun test" } }),
+    "utf8",
+  );
+  writeFileSync(join(root, "bun.lock"), "", "utf8");
 }
 
 function seedGenericAutonomyRepoLayout(root: string): void {
@@ -330,6 +484,12 @@ function seedGenericAutonomyRepoLayout(root: string): void {
     mkdirSync(join(fullPath, ".."), { recursive: true });
     writeFileSync(fullPath, "// generic repo fixture\n", "utf8");
   }
+  writeFileSync(
+    join(root, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+    "utf8",
+  );
+  writeFileSync(join(root, "package-lock.json"), "{}\n", "utf8");
 }
 
 afterEach(() => {
@@ -470,6 +630,165 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       beforeEnqueueMs + 120_000,
     );
     expect((engine as any).dispatchBackoffUntilMs).toBeLessThanOrEqual(Date.now() + 120_000);
+  });
+
+  test("does not attribute deterministic fallback candidates to an empty RepositoryAgent result", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-fallback-"));
+    tempDirs.push(root);
+    seedGenericAutonomyRepoLayout(root);
+    writeFileSync(
+      join(root, "vision.md"),
+      "# Vision\n\n## Priorities\n- Make queue processing reliable for users\n",
+      "utf8",
+    );
+    execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["config", "user.name", "PushPals Test"], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
+
+    const repositoryRequestId = "repo-request-without-candidates";
+    const repositoryMemoryId = "repository-memory-must-not-be-attributed";
+    let repositoryAgentCalls = 0;
+    const repositoryAgent = {
+      async ask(input: Record<string, unknown>) {
+        repositoryAgentCalls += 1;
+        const repository = input.repository as Record<string, unknown>;
+        return {
+          schemaVersion: 1,
+          requestId: repositoryRequestId,
+          analyzedRepository: {
+            identity: repository.identity,
+            revision: repository.revision,
+            tree: repository.tree,
+          },
+          answer: "No grounded candidate was available.",
+          summary: "Repository analysis completed without a usable candidate.",
+          data: { candidates: [] },
+          confidence: 0.2,
+          evidence: [],
+          recommendations: [],
+          validationProposals: [],
+          cache: { hit: false, key: "empty-repository-result" },
+          memoryRefs: [
+            {
+              id: repositoryMemoryId,
+              namespace: "repository_agent_cache",
+              role: "analysis_cache",
+            },
+          ],
+          completedAt: new Date().toISOString(),
+        };
+      },
+    };
+    let llmCall = 0;
+    const llm = {
+      async generate(input: { messages?: Array<{ content?: unknown }> }) {
+        llmCall += 1;
+        if (llmCall === 1) {
+          // Force the engine's bounded repo/vision fallback path after the
+          // RepositoryAgent also returned no usable candidates.
+          return { text: JSON.stringify({ candidates: [] }), usage: {} };
+        }
+        if (llmCall === 2) {
+          const payload = JSON.parse(String(input.messages?.at(-1)?.content ?? "{}")) as {
+            candidates?: Array<{ id?: string }>;
+          };
+          return {
+            text: JSON.stringify({
+              scores: (payload.candidates ?? []).map((candidate) => ({
+                id: candidate.id,
+                llm_score: 0.9,
+              })),
+            }),
+            usage: {},
+          };
+        }
+        return {
+          text: JSON.stringify({
+            instruction: "Improve the selected queue path and run the repository-native tests.",
+          }),
+          usage: {},
+        };
+      },
+    };
+    const objectivePosts: Array<Record<string, unknown>> = [];
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_repository_fallback",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      repositoryAgent: repositoryAgent as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).autonomyRepo = root;
+    (engine as any).acquireDispatchLock = async () => ({ ok: true });
+    (engine as any).renewDispatchLock = async () => true;
+    (engine as any).releaseDispatchLock = async () => undefined;
+    (engine as any).ensureAutonomyRepoReady = async () => true;
+    (engine as any).fetchSnapshot = async () => makeSnapshot();
+    (engine as any).fetchWorkerLoadSnapshot = async () => null;
+    (engine as any).loadVisionContext = () => ({
+      path: "vision.md",
+      markdown: "# Vision\n\n## Priorities\n- Make queue processing reliable for users\n",
+      one_sentence: "Make queue processing reliable for users.",
+      sections: [
+        {
+          number: "1",
+          title: "Priorities",
+          markdown: "Make queue processing reliable for users.",
+          truncated: false,
+        },
+      ],
+      key_items: {
+        target_users: ["application users"],
+        priorities: ["Make queue processing reliable for users"],
+        objectives: ["Reduce stalled background work"],
+        guardrails: ["Keep changes narrowly scoped"],
+        constraints: [],
+        non_goals: [],
+        metrics: ["Fewer stalled jobs"],
+        testing_criteria: ["Run repository-native tests"],
+        risk_policy: ["Low-risk autonomous changes"],
+        operating_model: [],
+        governance: [],
+      },
+      section_numbers: ["1"],
+      sha256: "fallback-vision-hash",
+      truncated: false,
+    });
+    (engine as any).loadCommitHistoryHints = async () => [];
+    (engine as any).ingestAutoInspirationPatterns = async () => undefined;
+    (engine as any).fetchInspirationPatterns = async () => [];
+    (engine as any).fetchInspirationSourceInsights = async () => [];
+    (engine as any).fetchEligibility = async (
+      _runId: string,
+      _snapshotId: string,
+      candidates: Array<{ id: string }>,
+    ) => new Map(candidates.map((candidate) => [candidate.id, { ok: true }]));
+    (engine as any).postObjective = async (payload: Record<string, unknown>) => {
+      objectivePosts.push(payload);
+      return true;
+    };
+    (engine as any).enqueueSyntheticRequest = async () => "req_repository_fallback";
+
+    await engine.tick();
+
+    expect(repositoryAgentCalls).toBe(1);
+    expect(objectivePosts).toHaveLength(1);
+    const reservation = objectivePosts[0] ?? {};
+    expect(reservation.objective).toBeDefined();
+    expect(reservation).not.toHaveProperty("repositoryAgentMemory");
+    expect(JSON.stringify(reservation)).not.toContain(repositoryRequestId);
+    expect(JSON.stringify(reservation)).not.toContain(repositoryMemoryId);
   });
 
   test("tick auto-ingests inspiration and dispatches an objective end-to-end", async () => {
@@ -678,6 +997,193 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     const objective = (lastObjective.objective ?? {}) as Record<string, unknown>;
     expect(String(objective.status ?? "")).toBe("gated");
     expect(objective.expected_validation).toEqual(["bun run test:root"]);
+  });
+
+  test("tick replaces an LLM-proposed Bun command with Python-native validation", async () => {
+    originalFetch = globalThis.fetch;
+    mockGitSpawnForTest();
+    const root = mkdtempSync(join(tmpdir(), "pushpals-generic-python-tick-"));
+    tempDirs.push(root);
+    const calls: FetchCall[] = [];
+    const objectivePosts: Array<Record<string, unknown>> = [];
+    let llmCall = 0;
+    let ideationInput: Record<string, unknown> | null = null;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = String(init?.method ?? "GET").toUpperCase();
+      const bodyRaw = typeof init?.body === "string" ? init.body : "";
+      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+      calls.push({ url, method, body });
+
+      if (url.includes("/autonomy/lock/acquire"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/renew"))
+        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+      if (url.includes("/autonomy/lock/release"))
+        return jsonResponse(200, { ok: true, released: true });
+      if (url.includes("/autonomy/snapshot"))
+        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+      if (url.includes("/workers/autoscale"))
+        return jsonResponse(200, {
+          ok: true,
+          workers: { total: 1, online: 1, busy: 0, idle: 1 },
+          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+          prs: { openUnmerged: 0 },
+        });
+      if (url.includes("/autonomy/inspiration/ingest"))
+        return jsonResponse(200, { ok: true, inserted: 0, updated: 0, skipped: 0 });
+      if (url.includes("/autonomy/inspiration?"))
+        return jsonResponse(200, { ok: true, patterns: [] });
+      if (url.includes("/autonomy/insights?"))
+        return jsonResponse(200, { ok: true, engineSourceStats: [] });
+      if (url.endsWith("/autonomy/eligibility")) {
+        const candidates = Array.isArray((body as Record<string, unknown>).candidates)
+          ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
+          : [];
+        return jsonResponse(200, {
+          ok: true,
+          results: candidates.map((entry) => ({
+            candidate_id: String(entry.id ?? entry.candidate_id ?? ""),
+            ok: true,
+          })),
+        });
+      }
+      if (url.endsWith("/requests/enqueue"))
+        return jsonResponse(201, { ok: true, requestId: "req_python_native_validation" });
+      if (url.endsWith("/autonomy/objectives")) {
+        objectivePosts.push(body as Record<string, unknown>);
+        return jsonResponse(200, {
+          ok: true,
+          objectiveId: "obj_python_native_validation",
+          patternKey: "small_refactor::src::queue_health",
+        });
+      }
+      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const llm = {
+      async generate(input: { messages?: Array<{ content?: unknown }> }) {
+        llmCall += 1;
+        if (llmCall === 1) {
+          const content = String(input.messages?.at(-1)?.content ?? "{}");
+          ideationInput = JSON.parse(content) as Record<string, unknown>;
+          return {
+            text: JSON.stringify({
+              candidates: [
+                {
+                  id: "cand_python_native_validation",
+                  title: "Improve Python recovery safety",
+                  objective_type: "small_refactor",
+                  problem_statement: "Make the Python recovery handler safer and easier to verify.",
+                  trigger_type: "queue_health",
+                  component_area: "src",
+                  target_paths: ["src/recovery.py"],
+                  scope: { read_anywhere: false, write_globs: ["src/*.py"] },
+                  risk_level: "low",
+                  expected_validation: ["bun run test:root"],
+                  estimated_effort: "small",
+                  why_now_signal_ids: ["sig_queue"],
+                  confidence: 0.92,
+                  vision_alignment_reason: "Advances the recovery safety priority.",
+                  vision_section_refs: ["1"],
+                  feature_hypotheses: ["A focused recovery guard reduces failed user operations."],
+                  requires_user_input: false,
+                },
+              ],
+            }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        }
+        if (llmCall === 2) {
+          return {
+            text: JSON.stringify({
+              scores: [{ id: "cand_python_native_validation", llm_score: 0.95 }],
+            }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        }
+        return {
+          text: JSON.stringify({
+            instruction:
+              "Improve recovery safety in src/recovery.py and verify the focused Python tests.",
+          }),
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      },
+    };
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_python_native_validation",
+      authToken: "tok",
+      repo: root,
+      llm: llm as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).ensureAutonomyRepoReady = async () => {
+      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+      mkdirSync(join(autonomyRepo, "src"), { recursive: true });
+      mkdirSync(join(autonomyRepo, "tests"), { recursive: true });
+      writeFileSync(
+        join(autonomyRepo, "src", "recovery.py"),
+        "def recover(): return True\n",
+        "utf8",
+      );
+      writeFileSync(
+        join(autonomyRepo, "tests", "test_recovery.py"),
+        "from src.recovery import recover\n\ndef test_recover(): assert recover()\n",
+        "utf8",
+      );
+      writeFileSync(
+        join(autonomyRepo, "pyproject.toml"),
+        '[project]\nname = "generic-recovery"\nversion = "0.1.0"\n[project.optional-dependencies]\ntest = ["pytest"]\n',
+        "utf8",
+      );
+      return true;
+    };
+    (engine as any).loadVisionContext = () => ({
+      path: "vision.md",
+      markdown: "# Vision\n",
+      one_sentence: "Help users recover interrupted work safely.",
+      sections: [
+        {
+          number: "1",
+          title: "Improve recovery safety",
+          markdown: "Keep recovery deterministic.",
+          truncated: false,
+        },
+      ],
+      key_items: {
+        target_users: ["application users"],
+        priorities: ["Improve recovery safety"],
+        objectives: [],
+        guardrails: ["small scoped changes"],
+        constraints: ["preserve compatibility"],
+        non_goals: [],
+        metrics: ["fewer failed recovery attempts"],
+        testing_criteria: [],
+        risk_policy: ["low risk autonomous"],
+        operating_model: [],
+        governance: [],
+      },
+      section_numbers: ["1"],
+      sha256: "generic-python-vision",
+      truncated: false,
+    });
+    (engine as any).loadCommitHistoryHints = async () => [];
+
+    await engine.tick();
+
+    expect(objectivePosts).toHaveLength(1);
+    const objective = (objectivePosts[0]?.objective ?? {}) as Record<string, unknown>;
+    expect(objective.expected_validation).toEqual(["python -m pytest"]);
+    expect(JSON.stringify(objective)).not.toContain("bun run test:root");
+    expect(calls.some((entry) => entry.url.includes("/autonomy/inspiration/ingest"))).toBe(false);
+    const ideationSnapshot = (ideationInput?.snapshot ?? {}) as Record<string, unknown>;
+    expect(ideationSnapshot.top_signals).toEqual([]);
+    expect(ideationSnapshot.state_traits).toEqual([]);
   });
 
   test("tick dispatches validation repair before normal ideation when required validation is red", async () => {
@@ -1079,8 +1585,9 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     });
 
     expect(eligibilityCalls).toBe(1);
-    expect(outcome.handled).toBe(true);
+    expect(outcome.handled).toBe(false);
     expect(outcome.detail).toContain("validation_repair_not_eligible");
+    expect(outcome.detail).toContain("continue_ideation");
     expect(outcome.detail).not.toContain("circuit_open");
   });
 
@@ -1233,6 +1740,84 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       handled: false,
       outcome: "skipped",
       detail: "validation_repair_already_active_continue_ideation",
+    });
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("a completed repair waits for validation evidence newer than the repaired incident", async () => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-validation-completed-"));
+    tempDirs.push(root);
+    mkdirSync(join(root, "tests"), { recursive: true });
+    writeFileSync(join(root, "tests", "catalog.test.ts"), "// target\n", "utf8");
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_validation_completed",
+      authToken: "tok",
+      repo: root,
+      llm: { async generate() {} } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const incident = {
+      active: true,
+      incident_id: "valid_inc_catalog_completed",
+      command: "bun test tests/catalog.test.ts",
+      signal_type: "test_failure",
+      failure_class: "test_failure",
+      failure_count: 2,
+      total_runs: 2,
+      failed_job_ids: ["job_a", "job_b"],
+      last_failed_job_id: "job_b",
+      first_failed_at: "2026-08-17T01:00:00.000Z",
+      last_failed_at: "2026-08-17T01:05:00.000Z",
+      digest: "catalog_completed",
+      sample_error: "(fail) catalog ranking remains stale",
+      required_commands: ["bun test tests/catalog.test.ts"],
+      target_path_hints: ["tests/catalog.test.ts"],
+      failed_tests: ["catalog ranking remains stale"],
+      failure_fingerprint: "fp_catalog_completed",
+      candidate_sha: "c".repeat(40),
+      candidate_shas: ["c".repeat(40)],
+      validation_scope: "candidate_specific" as const,
+      baseline_failure_proven: false,
+      evidence_quality: "high" as const,
+      failure_lines: ["(fail) catalog ranking remains stale"],
+      source: "trusted_host" as const,
+      cross_job_circuit_open: true,
+    };
+    const snapshot = {
+      ...makeSnapshot(),
+      validation_incident: incident,
+      recent_objectives: [
+        {
+          objective_id: "obj_completed_repair",
+          status: "completed",
+          objective_type: "flaky_test",
+          pattern_key: "pk_validation_completed",
+          incident_key: incident.incident_id,
+          job_id: "job_completed_repair",
+          updated_at: "2026-08-17T01:06:00.000Z",
+        },
+      ],
+    };
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      throw new Error("completed repair must await fresh incident evidence");
+    }) as typeof globalThis.fetch;
+
+    expect(
+      await (engine as any).dispatchValidationIncidentRepair({
+        runId: "run_validation_completed",
+        snapshot,
+        repoTargets: [],
+        visionSectionRefs: ["1"],
+      }),
+    ).toEqual({
+      handled: false,
+      outcome: "skipped",
+      detail: "validation_repair_completed_awaiting_fresh_evidence_continue_ideation",
     });
     expect(fetchCalls).toBe(0);
   });
@@ -1435,8 +2020,8 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       ],
       key_items: {
         target_users: ["maintainers"],
-        priorities: ["reliability"],
-        objectives: ["reliable autonomous delivery"],
+        priorities: [],
+        objectives: [],
         guardrails: ["small scoped changes"],
         constraints: ["safe defaults"],
         non_goals: [],
@@ -2319,8 +2904,8 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
           status: "completed",
           objective_type: "small_refactor",
           component_area: "src",
-          target_paths: ["src"],
-          scope: { write_globs: ["src/**"] },
+          target_paths: ["src", "package.json", "package-lock.json"],
+          scope: { write_globs: ["src/**", "package.json", "package-lock.json"] },
           updated_at: now,
         },
         {
@@ -2419,6 +3004,12 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       mkdirSync(join(targetPath, ".."), { recursive: true });
       writeFileSync(targetPath, "// recent target fixture\n", "utf8");
       writeFileSync(join(autonomyRepo, "vision.md"), "# Vision\n", "utf8");
+      writeFileSync(
+        join(autonomyRepo, "package.json"),
+        JSON.stringify({ scripts: { test: "node --test" } }),
+        "utf8",
+      );
+      writeFileSync(join(autonomyRepo, "package-lock.json"), "{}\n", "utf8");
       return true;
     };
     (engine as any).loadVisionContext = () => ({

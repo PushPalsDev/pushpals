@@ -22,18 +22,25 @@ const MIRRORED_RUNTIME_TREES = [
     sourceRoot: "packages/protocol",
     packagedRoot: "packages/protocol",
   },
+  {
+    sourceRoot: "prompts",
+    packagedRoot: "prompts",
+  },
 ] as const;
 
 function normalizePath(pathValue: string): string {
   return pathValue.replace(/\\/g, "/");
 }
 
-function listTrackedTreeFiles(sourceRoot: string): string[] {
-  const result = Bun.spawnSync(["git", "ls-files", "-z", "--", sourceRoot], {
-    cwd: repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+function listRuntimeTreeFiles(sourceRoot: string): string[] {
+  const result = Bun.spawnSync(
+    ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", sourceRoot],
+    {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
   expect(
     result.exitCode,
     Buffer.from(result.stderr).toString("utf8") || `git ls-files failed for ${sourceRoot}`,
@@ -69,9 +76,9 @@ function listPackagedTreeFiles(packagedRoot: string): string[] {
 }
 
 describe("packaged WorkerPal sandbox runtime parity", () => {
-  test("keeps every tracked sandbox runtime file byte-identical", () => {
+  test("keeps every runtime source file byte-identical", () => {
     for (const tree of MIRRORED_RUNTIME_TREES) {
-      const trackedFiles = listTrackedTreeFiles(tree.sourceRoot);
+      const trackedFiles = listRuntimeTreeFiles(tree.sourceRoot);
       const packagedFiles = listPackagedTreeFiles(tree.packagedRoot);
       expect(packagedFiles, tree.packagedRoot).toEqual(trackedFiles);
 
@@ -82,6 +89,31 @@ describe("packaged WorkerPal sandbox runtime parity", () => {
           readFileSync(sourcePath),
         );
       }
+    }
+  });
+
+  test("keeps the service prompt bundle byte-identical outside and inside the sandbox", () => {
+    const trackedFiles = listRuntimeTreeFiles("prompts");
+    const packagedRuntimePromptsRoot = resolve(packagedSandboxRoot, "..", "prompts");
+    const packagedRuntimeFiles: string[] = [];
+    const visit = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const absolutePath = join(directory, entry.name);
+        if (entry.isDirectory()) visit(absolutePath);
+        else if (entry.isFile() || entry.isSymbolicLink()) {
+          packagedRuntimeFiles.push(
+            normalizePath(relative(packagedRuntimePromptsRoot, absolutePath)),
+          );
+        }
+      }
+    };
+    visit(packagedRuntimePromptsRoot);
+    expect(packagedRuntimeFiles.sort()).toEqual(trackedFiles);
+    for (const relativePath of trackedFiles) {
+      expect(
+        readFileSync(resolve(packagedRuntimePromptsRoot, relativePath)),
+        `runtime/prompts/${relativePath}`,
+      ).toEqual(readFileSync(resolve(repoRoot, "prompts", relativePath)));
     }
   });
 

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join, resolve } from "path";
 import {
   ReviewAgent,
   buildReviewFeedbackContext,
@@ -7,6 +9,8 @@ import {
   buildCodexExecArgs,
   collectReviewHygieneIssuesFromDiff,
   deriveFixWriteGlobsFromDiff,
+  deriveReviewTaskValidationSteps,
+  listPersistedPrLinks,
   parseReviewVerdict,
   resolveCodexCmd,
   resolveReviewerMdPath,
@@ -39,6 +43,11 @@ function makePr(overrides: Partial<GitHubPR> = {}): GitHubPR {
       ref: "agent/test-branch",
       sha: "abc123def456",
       label: "owner:agent/test-branch",
+      repo: {
+        full_name: "org/repo",
+        name: "repo",
+        owner: { login: "org" },
+      },
       ...(overrides.head ?? {}),
     },
     base: {
@@ -54,6 +63,11 @@ const silentLogs = {
   logInfo: () => {},
   logWarn: () => {},
   logError: () => {},
+  listRecentlyClosedPullRequests: async () => [],
+  listPersistedPrLinks: async () => ({ links: [], nextCursor: null }),
+  feedbackFetchImpl: async () =>
+    new Response(JSON.stringify({ ok: true, ignored: false }), { status: 200 }),
+  sleep: async () => {},
   closePullRequest: async () => ({ state: "closed", closed: true }),
   deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
 };
@@ -223,21 +237,169 @@ describe("ReviewAgent", () => {
     expect(globs).toContain("apps/local buddy/**");
   });
 
-  test("flags deterministic PR hygiene issues before reviewer loops", () => {
+  test("derives review-job validation from the target repository instead of PushPals", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-review-validation-"));
+    try {
+      mkdirSync(join(root, "tests"), { recursive: true });
+      writeFileSync(
+        join(root, "pyproject.toml"),
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\n",
+        "utf8",
+      );
+      writeFileSync(join(root, "tests", "test_review.py"), "def test_review(): pass\n", "utf8");
+      expect(deriveReviewTaskValidationSteps(["tests/test_review.py"], root)).toEqual([
+        "python -m pytest tests/test_review.py",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not reject helpers or product-name references without evidence of a leak", () => {
     const issues = collectReviewHygieneIssuesFromDiff(
       [
         "diff --git a/.gitignore b/.gitignore",
         "+node_modules",
-        "diff --git a/app/__tests__/_layout.autonomy.test.ts b/app/__tests__/_layout.autonomy.test.ts",
+        "diff --git a/tests/workflow.test.ts b/tests/workflow.test.ts",
         "+test('queue_health workerpal diagnostics are visible', () => {})",
-        "diff --git a/utils/queueHealth.ts b/utils/queueHealth.ts",
-        "+export function queueHealth() { return true; }",
+        "diff --git a/utils/retryHelper.ts b/utils/retryHelper.ts",
+        "+export function retryHelper() { return true; }",
       ].join("\n"),
     );
 
-    expect(issues.some((issue) => issue.includes(".gitignore"))).toBe(true);
-    expect(issues.some((issue) => issue.includes("PushPals-internal"))).toBe(true);
-    expect(issues.some((issue) => issue.includes("runtime integration"))).toBe(true);
+    expect(issues.some((issue) => issue.includes(".gitignore"))).toBe(false);
+    expect(issues.some((issue) => issue.includes("private monorepo"))).toBe(false);
+    expect(issues.some((issue) => issue.includes("runtime integration"))).toBe(false);
+  });
+
+  test("distinguishes private source-layout leaks from legitimate PushPals integration", () => {
+    const publicIntegration = collectReviewHygieneIssuesFromDiff(
+      [
+        "diff --git a/tests/pushpals-cli.test.ts b/tests/pushpals-cli.test.ts",
+        "+import { runCli } from '@pushpalsdev/cli';",
+        "+test('pushpals CLI starts', () => runCli());",
+      ].join("\n"),
+      { repositoryIdentity: "https://github.com/example/product.git" },
+    );
+    expect(publicIntegration).toEqual([]);
+
+    const privateLayoutDiff = [
+      "diff --git a/tests/orchestration.test.ts b/tests/orchestration.test.ts",
+      "+import { executeJob } from '../apps/workerpals/src/execute_job';",
+      "+test('runs internal worker', () => executeJob());",
+    ].join("\n");
+    const externalLeak = collectReviewHygieneIssuesFromDiff(privateLayoutDiff, {
+      repositoryIdentity: "git@github.com:example/product.git",
+    });
+    expect(externalLeak.some((issue) => issue.includes("private monorepo source layout"))).toBe(
+      true,
+    );
+
+    const selfRepoChange = collectReviewHygieneIssuesFromDiff(privateLayoutDiff, {
+      repositoryIdentity: "https://github.com/PushPalsDev/pushpals.git",
+    });
+    expect(selfRepoChange).toEqual([]);
+  });
+
+  test("allows legitimate dependency ignore policy changes", () => {
+    const issues = collectReviewHygieneIssuesFromDiff(
+      [
+        "diff --git a/.gitignore b/.gitignore",
+        "--- a/.gitignore",
+        "+++ b/.gitignore",
+        "+node_modules/",
+        "+vendor/",
+      ].join("\n"),
+    );
+    expect(issues).toEqual([]);
+  });
+
+  test("detects removed test declarations across common language families", () => {
+    const declarations = [
+      "test('works', () => {})",
+      "def test_works():",
+      "func TestWorks(t *testing.T) {",
+      "#[test]",
+      "@Test",
+      "[Fact]",
+      "it('works') { true }",
+      "public function testWorks() {",
+      "func testWorks() throws {",
+    ];
+    for (const declaration of declarations) {
+      const removed = collectReviewHygieneIssuesFromDiff(
+        [
+          "diff --git a/tests/example.txt b/tests/example.txt",
+          `-${declaration}`,
+          `-${declaration}`,
+          `-${declaration}`,
+        ].join("\n"),
+      );
+      expect(removed.some((issue) => issue.includes("existing test declarations"))).toBe(true);
+
+      const intentionalRemoval = collectReviewHygieneIssuesFromDiff(
+        [
+          "diff --git a/tests/example.txt b/tests/example.txt",
+          `-${declaration}`,
+          `-${declaration}`,
+          `-${declaration}`,
+        ].join("\n"),
+        { taskIntent: "Refactor and replace obsolete test coverage" },
+      );
+      expect(intentionalRemoval.some((issue) => issue.includes("existing test declarations"))).toBe(
+        false,
+      );
+
+      const replaced = collectReviewHygieneIssuesFromDiff(
+        [
+          "diff --git a/tests/example.txt b/tests/example.txt",
+          `-${declaration}`,
+          `-${declaration}`,
+          `-${declaration}`,
+          `+${declaration}`,
+          `+${declaration}`,
+          `+${declaration}`,
+        ].join("\n"),
+      );
+      expect(replaced.some((issue) => issue.includes("existing test declarations"))).toBe(false);
+    }
+  });
+
+  test("recognizes test and helper paths across common repository ecosystems", () => {
+    const fixtures = [
+      ["tests/retry.test.ts", "src/helpers/retry.ts"],
+      ["tests/test_retry.py", "src/helpers/retry.py"],
+      ["internal/retry_test.go", "internal/helpers/retry.go"],
+      ["tests/retry.rs", "src/utils/retry.rs"],
+      ["src/test/java/RetryTest.java", "src/main/java/helpers/Retry.java"],
+      ["tests/RetryTests.cs", "src/Helpers/Retry.cs"],
+      ["spec/retry_spec.rb", "lib/helpers/retry.rb"],
+      ["tests/RetryTest.php", "src/Helpers/Retry.php"],
+      ["Tests/AppTests/RetryTests.swift", "Sources/App/Helpers/Retry.swift"],
+    ];
+    for (const [testPath, helperPath] of fixtures) {
+      const issues = collectReviewHygieneIssuesFromDiff(
+        [
+          `diff --git a/${testPath} b/${testPath}`,
+          "+test coverage",
+          `diff --git a/${helperPath} b/${helperPath}`,
+          "+helper implementation",
+        ].join("\n"),
+      );
+      expect(issues.some((issue) => issue.includes("runtime integration"))).toBe(false);
+    }
+
+    const integrated = collectReviewHygieneIssuesFromDiff(
+      [
+        "diff --git a/tests/test_retry.py b/tests/test_retry.py",
+        "+def test_retry(): pass",
+        "diff --git a/src/helpers/retry.py b/src/helpers/retry.py",
+        "+def retry(): pass",
+        "diff --git a/src/services/import_service.py b/src/services/import_service.py",
+        "+retry()",
+      ].join("\n"),
+    );
+    expect(integrated.some((issue) => issue.includes("runtime integration"))).toBe(false);
   });
 
   test("summarizes repeated review findings as hard constraints", () => {
@@ -276,6 +438,1093 @@ describe("ReviewAgent", () => {
 
     await agent.poll();
     expect(capturedBase).toBe("release");
+  });
+
+  test("retains independent provider scan cursors between bounded polls", async () => {
+    let now = Date.parse("2026-08-25T18:00:00.000Z");
+    const openCursors: Array<{ page: number; offset: number } | null | undefined> = [];
+    const closedCursors: Array<{ page: number; offset: number } | null | undefined> = [];
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => now,
+        listOpenPullRequests: async (opts) => {
+          openCursors.push(opts.cursor);
+          opts.onScanComplete?.({ page: 5, offset: 0 });
+          return [];
+        },
+        listRecentlyClosedPullRequests: async (opts) => {
+          closedCursors.push(opts.cursor);
+          opts.onScanComplete?.({ page: 9, offset: 25 });
+          return [];
+        },
+      },
+    );
+
+    await agent.poll();
+    now += 60_000;
+    await agent.poll();
+
+    expect(openCursors).toEqual([null, { page: 5, offset: 0 }]);
+    expect(closedCursors).toEqual([null, { page: 9, offset: 25 }]);
+  });
+
+  test("keeps provider reconciliation active with AI review disabled and a custom branch prefix", async () => {
+    const externallyMergedPr = makePr({
+      number: 80,
+      state: "closed",
+      merged_at: "2026-08-25T17:00:00.000Z",
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+      head: {
+        ref: "automation/merged-branch",
+        sha: "external-merge-sha",
+        label: "org:automation/merged-branch",
+      },
+    });
+    let openListCalls = 0;
+    let capturedClosedPrefix = "";
+    let now = Date.parse("2026-08-25T18:00:00.000Z");
+    const feedbackPayloads: Array<Record<string, unknown>> = [];
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => now,
+        listOpenPullRequests: async () => {
+          openListCalls += 1;
+          return [];
+        },
+        listRecentlyClosedPullRequests: async (opts) => {
+          capturedClosedPrefix = opts.headPrefix;
+          return [externallyMergedPr];
+        },
+        feedbackFetchImpl: async (_input, init) => {
+          feedbackPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+          return new Response(JSON.stringify({ ok: true, ignored: true, acknowledged: true }), {
+            status: 200,
+          });
+        },
+      },
+      "automation/",
+    );
+
+    await agent.poll();
+    now += 60_000;
+    await agent.poll();
+
+    expect(openListCalls).toBe(0);
+    expect(capturedClosedPrefix).toBe("automation/");
+    expect(feedbackPayloads).toHaveLength(1);
+    expect(feedbackPayloads[0]).toMatchObject({
+      feedbackKey: "review_agent:pr:80:head:external-merge-sha:state:merged:job:job-1",
+      verdict: "approved_merged",
+    });
+  });
+
+  test("enables AI review in place without losing provider or re-review state", async () => {
+    let openListCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/example/repository.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => {
+          openListCalls += 1;
+          return [];
+        },
+      },
+    );
+    agent.requestReReview(42, "head-sha");
+    const forceReReview = (agent as any).forceReReview;
+
+    await agent.poll();
+    expect(openListCalls).toBe(0);
+
+    expect(agent.updateRuntimeConfig({ ...baseConfig, enabled: true })).toEqual({
+      becameEnabled: true,
+    });
+    expect((agent as any).forceReReview).toBe(forceReReview);
+    expect((agent as any).forceReReview.get(42)).toBe("head-sha");
+    await agent.poll();
+    expect(openListCalls).toBe(1);
+
+    expect(agent.updateRuntimeConfig({ ...baseConfig, enabled: false })).toEqual({
+      becameEnabled: false,
+    });
+    await agent.poll();
+    expect(openListCalls).toBe(1);
+  });
+
+  test("exposes provider reconciliation failures and resets them after recovery", async () => {
+    let now = Date.parse("2026-08-25T18:00:00.000Z");
+    let providerUnavailable = true;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/example/repository.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => now,
+        listRecentlyClosedPullRequests: async () => {
+          if (providerUnavailable) throw new Error("provider unavailable");
+          return [];
+        },
+      },
+    );
+
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "idle",
+      consecutiveFailedPolls: 0,
+      failureEvents: 0,
+    });
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await agent.poll();
+      expect(agent.getProviderHealthSnapshot()).toMatchObject({
+        status: "degraded",
+        consecutiveFailedPolls: attempt,
+        failureEvents: attempt,
+        lastError: expect.stringContaining("provider unavailable"),
+      });
+      now += 60_000;
+    }
+
+    providerUnavailable = false;
+    await agent.poll();
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "ok",
+      pollAgeMs: 0,
+      stalled: false,
+      consecutiveFailedPolls: 0,
+      failureEvents: 3,
+      lastError: null,
+      lastSuccessfulPollAt: expect.any(String),
+    });
+  });
+
+  test("marks an old in-flight provider poll stalled until it completes", async () => {
+    let nowMs = 0;
+    let releaseProviderPoll!: () => void;
+    const providerPollGate = new Promise<void>((resolve) => {
+      releaseProviderPoll = resolve;
+    });
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/example/repository.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => {
+          await providerPollGate;
+          return [];
+        },
+        listPersistedPrLinks: async () => ({ links: [], nextCursor: null }),
+      },
+    );
+
+    const activePoll = agent.poll();
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "running",
+      inFlight: true,
+      pollAgeMs: 0,
+      stalled: false,
+    });
+
+    nowMs = 299_999;
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "running",
+      pollAgeMs: 299_999,
+      stalled: false,
+    });
+    nowMs = 300_000;
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "stalled",
+      inFlight: true,
+      pollAgeMs: 300_000,
+      stalled: true,
+    });
+
+    releaseProviderPoll();
+    await activePoll;
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "ok",
+      inFlight: false,
+      pollAgeMs: 0,
+      stalled: false,
+    });
+  });
+
+  test("stopAndDrain blocks replacement until active polls settle and rejects new work", async () => {
+    let providerPollCalls = 0;
+    let releaseProviderPoll!: () => void;
+    const providerPollGate = new Promise<void>((resolve) => {
+      releaseProviderPoll = resolve;
+    });
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/example/repository.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listRecentlyClosedPullRequests: async () => {
+          providerPollCalls += 1;
+          await providerPollGate;
+          return [];
+        },
+        listPersistedPrLinks: async () => ({ links: [], nextCursor: null }),
+      },
+    );
+
+    const activePoll = agent.poll();
+    expect(providerPollCalls).toBe(1);
+    let drainCompleted = false;
+    const draining = agent.stopAndDrain().then(() => {
+      drainCompleted = true;
+    });
+    await Bun.sleep(0);
+    expect(drainCompleted).toBe(false);
+
+    agent.requestReReview(42, "late-sha");
+    expect(agent.updateRuntimeConfig({ ...baseConfig, enabled: true })).toEqual({
+      becameEnabled: false,
+    });
+    await agent.poll();
+    expect(providerPollCalls).toBe(1);
+    expect((agent as any).forceReReview.has(42)).toBe(false);
+
+    releaseProviderPoll();
+    await Promise.all([activePoll, draining]);
+    expect(drainCompleted).toBe(true);
+    await agent.poll();
+    expect(providerPollCalls).toBe(1);
+  });
+
+  test("uses the configured branch prefix for open PR review polling", async () => {
+    let capturedOpenPrefix = "";
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async (opts) => {
+          capturedOpenPrefix = opts.headPrefix;
+          return [];
+        },
+      },
+      "pushpals-bot/",
+    );
+
+    await agent.poll();
+
+    expect(capturedOpenPrefix).toBe("pushpals-bot/");
+  });
+
+  test("reconciles recently closed provider outcomes once with provider terminal timestamps", async () => {
+    const mergedPr = makePr({
+      number: 81,
+      html_url: "https://github.com/org/repo/pull/81",
+      state: "closed",
+      merged_at: "2026-08-25T17:00:00.000Z",
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:30:00.000Z",
+      body: "<!-- pushpals-jobId: job-merged -->\n<!-- pushpals-sessionId: session-merged -->",
+      head: {
+        ref: "agent/merged-branch",
+        sha: "merged123",
+        label: "org:agent/merged-branch",
+      },
+    });
+    const closedPr = makePr({
+      number: 82,
+      html_url: "https://github.com/org/repo/pull/82",
+      state: "closed",
+      merged_at: null,
+      closed_at: "2026-08-25T17:05:00.000Z",
+      updated_at: "2026-08-25T17:35:00.000Z",
+      body: "<!-- pushpals-jobId: job-closed -->\n<!-- pushpals-sessionId: session-closed -->",
+      head: {
+        ref: "agent/closed-branch",
+        sha: "closed123",
+        label: "org:agent/closed-branch",
+      },
+    });
+    const unmanagedPr = makePr({
+      number: 83,
+      state: "closed",
+      merged_at: "2026-08-25T17:10:00.000Z",
+      updated_at: "2026-08-25T17:10:00.000Z",
+      body: null,
+    });
+    const feedbackPayloads: Array<Record<string, unknown>> = [];
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    const deletedBranches: string[] = [];
+
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listOpenPullRequests: async () => [],
+        listRecentlyClosedPullRequests: async () => [mergedPr, closedPr, unmanagedPr],
+        feedbackFetchImpl: async (_input, init) => {
+          feedbackPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+          return new Response(JSON.stringify({ ok: true, ignored: false }), { status: 200 });
+        },
+        deleteBranchRef: async (opts) => {
+          deletedBranches.push(opts.branchRef);
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+    await agent.poll();
+
+    expect(feedbackPayloads).toHaveLength(2);
+    expect(feedbackPayloads[0]).toMatchObject({
+      feedbackKey: "review_agent:pr:81:head:merged123:state:merged:job:job-merged",
+      jobId: "job-merged",
+      sessionId: "session-merged",
+      prNumber: 81,
+      verdict: "approved_merged",
+      providerStateAt: "2026-08-25T17:00:00.000Z",
+    });
+    expect(feedbackPayloads[1]).toMatchObject({
+      feedbackKey: "review_agent:pr:82:head:closed123:state:closed_unmerged:job:job-closed",
+      jobId: "job-closed",
+      sessionId: "session-closed",
+      prNumber: 82,
+      verdict: "closed_unmerged",
+      providerStateAt: "2026-08-25T17:05:00.000Z",
+    });
+    expect(deletedBranches).toEqual(["agent/merged-branch", "agent/closed-branch"]);
+  });
+
+  test("retries ignored feedback and only acknowledges a closed PR after server acceptance", async () => {
+    const pr = makePr({
+      number: 84,
+      state: "closed",
+      merged_at: "2026-08-25T17:00:00.000Z",
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+    });
+    let feedbackCalls = 0;
+    let deleteCalls = 0;
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listOpenPullRequests: async () => [],
+        listRecentlyClosedPullRequests: async () => [pr],
+        feedbackFetchImpl: async () => {
+          feedbackCalls += 1;
+          if (feedbackCalls === 1) return new Response("unavailable", { status: 503 });
+          if (feedbackCalls === 2) {
+            return new Response(JSON.stringify({ ok: true, ignored: true }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ ok: true, ignored: false }), { status: 200 });
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+    nowMs += 60_001;
+    await agent.poll();
+
+    expect(feedbackCalls).toBe(3);
+    expect(deleteCalls).toBe(1);
+  });
+
+  test("prioritizes unseen closed outcomes over backed-off ignored outcomes", async () => {
+    const prs = Array.from({ length: 9 }, (_, index) =>
+      makePr({
+        number: 200 + index,
+        state: "closed",
+        merged_at: "2026-08-25T17:00:00.000Z",
+        closed_at: "2026-08-25T17:00:00.000Z",
+        updated_at: "2026-08-25T17:00:00.000Z",
+        body: `<!-- pushpals-jobId: job-${index} -->\n<!-- pushpals-sessionId: dev -->`,
+        head: {
+          ref: `agent/starvation-${index}`,
+          sha: `starvation-sha-${index}`,
+          label: `org:agent/starvation-${index}`,
+        },
+      }),
+    );
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    const attemptedJobIds: string[] = [];
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => prs,
+        feedbackFetchImpl: async (_input, init) => {
+          const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          const jobId = String(payload.jobId ?? "");
+          attemptedJobIds.push(jobId);
+          return new Response(
+            JSON.stringify(
+              jobId === "job-8" ? { ok: true, ignored: false } : { ok: true, ignored: true },
+            ),
+            { status: 200 },
+          );
+        },
+      },
+    );
+
+    await agent.poll();
+    nowMs += 60_001;
+    await agent.poll();
+
+    expect(attemptedJobIds.slice(0, 8)).toEqual([
+      "job-0",
+      "job-1",
+      "job-2",
+      "job-3",
+      "job-4",
+      "job-5",
+      "job-6",
+      "job-7",
+    ]);
+    expect(attemptedJobIds).toContain("job-8");
+  });
+
+  test("recovers old markerless PR outcomes from persisted job links", async () => {
+    const persistedPr = makePr({
+      number: 240,
+      html_url: "https://github.com/org/repo/pull/240",
+      body: null,
+      state: "closed",
+      merged_at: "2026-01-01T00:00:00.000Z",
+      closed_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+    });
+    const feedbackPayloads: Array<Record<string, unknown>> = [];
+    const persistedPageUrls: string[] = [];
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => [],
+        listPersistedPrLinks,
+        getPullRequest: async () => persistedPr,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.includes("/jobs/pr-links")) {
+            persistedPageUrls.push(url);
+            if (persistedPageUrls.length > 1) {
+              return Response.json({ ok: true, links: [], nextCursor: null });
+            }
+            return Response.json({
+              ok: true,
+              links: [
+                {
+                  jobId: "persisted-job-240",
+                  sessionId: "persisted-session",
+                  prUrl: persistedPr.html_url,
+                  updatedAt: "2026-01-01T00:00:00.000Z",
+                },
+                {
+                  jobId: "different-repo-job",
+                  sessionId: "other",
+                  prUrl: "https://github.com/other/repo/pull/240",
+                  updatedAt: "2026-01-01T00:00:00.000Z",
+                },
+              ],
+              nextCursor: "123",
+            });
+          }
+          return Response.json({ ok: true });
+        },
+        feedbackFetchImpl: async (_input, init) => {
+          feedbackPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+          return new Response(JSON.stringify({ ok: true, ignored: false }), { status: 200 });
+        },
+      },
+    );
+
+    await agent.poll();
+    nowMs += 60_000;
+    await agent.poll();
+
+    expect(feedbackPayloads).toHaveLength(1);
+    expect(feedbackPayloads[0]).toMatchObject({
+      jobId: "persisted-job-240",
+      sessionId: "persisted-session",
+      prNumber: 240,
+      verdict: "approved_merged",
+    });
+    expect(new URL(persistedPageUrls[0] ?? "").searchParams.get("limit")).toBe("8");
+    expect(new URL(persistedPageUrls[1] ?? "").searchParams.get("cursor")).toBe("123");
+  });
+
+  test("reconciles a reopened PR linked to a new job when it recloses at the same head", async () => {
+    const pr = makePr({
+      number: 241,
+      html_url: "https://github.com/org/repo/pull/241",
+      body: "<!-- pushpals-jobId: stale-body-job -->\n<!-- pushpals-sessionId: stale -->",
+      state: "closed",
+      merged_at: null,
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+      head: {
+        ref: "agent/reopened-same-head",
+        sha: "same-head-sha",
+        label: "org:agent/reopened-same-head",
+      },
+    });
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    let generation = 1;
+    const feedbackPayloads: Array<Record<string, unknown>> = [];
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => [pr],
+        listPersistedPrLinks: async () => ({
+          links: [
+            {
+              jobId: `reopened-job-${generation}`,
+              sessionId: "dev",
+              prNumber: pr.number,
+              prUrl: pr.html_url,
+              updatedAt: `2026-08-25T17:0${generation}:00.000Z`,
+            },
+          ],
+          nextCursor: null,
+        }),
+        getPullRequest: async () => pr,
+        feedbackFetchImpl: async (_input, init) => {
+          feedbackPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+          return Response.json({ ok: true, ignored: true, acknowledged: true });
+        },
+      },
+    );
+
+    await agent.poll();
+    generation = 2;
+    nowMs += 60_000;
+    await agent.poll();
+
+    expect(feedbackPayloads).toHaveLength(2);
+    expect(feedbackPayloads.map((payload) => payload.jobId)).toEqual([
+      "reopened-job-1",
+      "reopened-job-2",
+    ]);
+    expect(feedbackPayloads.map((payload) => payload.feedbackKey)).toEqual([
+      "review_agent:pr:241:head:same-head-sha:state:closed_unmerged:job:reopened-job-1",
+      "review_agent:pr:241:head:same-head-sha:state:closed_unmerged:job:reopened-job-2",
+    ]);
+  });
+
+  test("uses persisted job metadata before stale PR body markers", async () => {
+    const pr = makePr({
+      number: 242,
+      html_url: "https://github.com/org/repo/pull/242",
+      body: "<!-- pushpals-jobId: stale-job -->\n<!-- pushpals-sessionId: stale-session -->",
+      state: "closed",
+      merged_at: "2026-08-25T17:00:00.000Z",
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+    });
+    const feedbackPayloads: Array<Record<string, unknown>> = [];
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => Date.parse("2026-08-25T18:00:00.000Z"),
+        listRecentlyClosedPullRequests: async () => [pr],
+        listPersistedPrLinks: async () => ({
+          links: [
+            {
+              jobId: "authoritative-job",
+              sessionId: "authoritative-session",
+              prNumber: 242,
+              prUrl: pr.html_url,
+              updatedAt: "2026-08-25T17:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        }),
+        getPullRequest: async () => pr,
+        feedbackFetchImpl: async (_input, init) => {
+          feedbackPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+          return Response.json({ ok: true, ignored: false });
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(feedbackPayloads).toHaveLength(1);
+    expect(feedbackPayloads[0]).toMatchObject({
+      jobId: "authoritative-job",
+      sessionId: "authoritative-session",
+      prNumber: 242,
+      verdict: "approved_merged",
+    });
+  });
+
+  test("retains a failed persisted PR probe while advancing the fair cursor", async () => {
+    const failedThenClosedPr = makePr({
+      number: 243,
+      html_url: "https://github.com/org/repo/pull/243",
+      body: null,
+      state: "closed",
+      merged_at: null,
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+    });
+    const openPr = makePr({
+      number: 244,
+      html_url: "https://github.com/org/repo/pull/244",
+      body: null,
+      state: "open",
+    });
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    let failedPrProbeCalls = 0;
+    const observedCursors: Array<string | null | undefined> = [];
+    const feedbackJobIds: string[] = [];
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listPersistedPrLinks: async (opts) => {
+          observedCursors.push(opts.cursor);
+          return opts.cursor
+            ? {
+                links: [
+                  {
+                    jobId: "open-job",
+                    sessionId: "dev",
+                    prNumber: 244,
+                    prUrl: openPr.html_url,
+                    updatedAt: "2026-08-25T17:01:00.000Z",
+                  },
+                ],
+                nextCursor: null,
+              }
+            : {
+                links: [
+                  {
+                    jobId: "retry-job",
+                    sessionId: "dev",
+                    prNumber: 243,
+                    prUrl: failedThenClosedPr.html_url,
+                    updatedAt: "2026-08-25T17:00:00.000Z",
+                  },
+                ],
+                nextCursor: "200",
+              };
+        },
+        getPullRequest: async (opts) => {
+          if (opts.prNumber === 244) return openPr;
+          failedPrProbeCalls += 1;
+          if (failedPrProbeCalls === 1) throw new Error("temporary provider outage");
+          return failedThenClosedPr;
+        },
+        feedbackFetchImpl: async (_input, init) => {
+          const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          feedbackJobIds.push(String(payload.jobId ?? ""));
+          return Response.json({ ok: true, ignored: false });
+        },
+      },
+    );
+
+    await agent.poll();
+    nowMs += 60_000;
+    await agent.poll();
+
+    expect(observedCursors).toEqual([null, "200"]);
+    expect(failedPrProbeCalls).toBe(2);
+    expect(feedbackJobIds).toEqual(["retry-job"]);
+  });
+
+  test("does not let a fresh cursor page bypass persisted-link retry backoff", async () => {
+    const poisonPr = makePr({
+      number: 245,
+      html_url: "https://github.com/org/repo/pull/245",
+      body: null,
+      state: "closed",
+      merged_at: null,
+    });
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    let providerProbeCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listPersistedPrLinks: async () => ({
+          links: [
+            {
+              jobId: "poison-job",
+              sessionId: "dev",
+              prNumber: poisonPr.number,
+              prUrl: poisonPr.html_url,
+              updatedAt: "2026-08-25T17:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        }),
+        getPullRequest: async () => {
+          providerProbeCalls += 1;
+          throw new Error("persistent provider failure");
+        },
+      },
+    );
+
+    const observedProbeCounts: number[] = [];
+    for (let poll = 0; poll < 4; poll += 1) {
+      await agent.poll();
+      observedProbeCounts.push(providerProbeCalls);
+      nowMs += 60_000;
+    }
+
+    expect(observedProbeCounts).toEqual([1, 2, 2, 3]);
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      persistedLinkRetryCount: 1,
+      failureEvents: 3,
+    });
+  });
+
+  test("reconciles but never deletes an unowned branch from a persisted PR link", async () => {
+    const persistedPr = makePr({
+      number: 241,
+      html_url: "https://github.com/org/repo/pull/241",
+      body: null,
+      state: "closed",
+      merged_at: null,
+      closed_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      head: {
+        ref: "release",
+        sha: "unowned-release-sha",
+        label: "org:release",
+      },
+    });
+    let feedbackCalls = 0;
+    let deleteCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => Date.parse("2026-08-25T18:00:00.000Z"),
+        listPersistedPrLinks: async () => ({
+          links: [
+            {
+              jobId: "persisted-job-241",
+              sessionId: "dev",
+              prNumber: 241,
+              prUrl: persistedPr.html_url,
+              updatedAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        }),
+        getPullRequest: async () => persistedPr,
+        feedbackFetchImpl: async () => {
+          feedbackCalls += 1;
+          return Response.json({ ok: true, ignored: false });
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(feedbackCalls).toBe(1);
+    expect(deleteCalls).toBe(0);
+  });
+
+  test("never deletes a same-named base branch for a persisted fork PR", async () => {
+    const forkPr = makePr({
+      number: 246,
+      html_url: "https://github.com/org/repo/pull/246",
+      body: null,
+      state: "closed",
+      merged_at: "2026-08-25T17:00:00.000Z",
+      head: {
+        ref: "agent/fork-owned-branch",
+        sha: "fork-owned-sha",
+        label: "attacker:agent/fork-owned-branch",
+        repo: {
+          full_name: "attacker/repo",
+          name: "repo",
+          owner: { login: "attacker" },
+        },
+      },
+    });
+    let deleteCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listPersistedPrLinks: async () => ({
+          links: [
+            {
+              jobId: "fork-job",
+              sessionId: "dev",
+              prNumber: forkPr.number,
+              prUrl: forkPr.html_url,
+              updatedAt: "2026-08-25T17:00:00.000Z",
+            },
+          ],
+          nextCursor: null,
+        }),
+        getPullRequest: async () => forkPr,
+        feedbackFetchImpl: async () => Response.json({ ok: true, acknowledged: true }),
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+    expect(deleteCalls).toBe(0);
+  });
+
+  test("bounds closed-PR feedback reconciliation work per poll", async () => {
+    const prs = Array.from({ length: 12 }, (_, index) =>
+      makePr({
+        number: 100 + index,
+        state: "closed",
+        merged_at: "2026-08-25T17:00:00.000Z",
+        closed_at: "2026-08-25T17:00:00.000Z",
+        updated_at: "2026-08-25T17:00:00.000Z",
+        body: `<!-- pushpals-jobId: job-${index} -->\n<!-- pushpals-sessionId: dev -->`,
+        head: {
+          ref: `agent/closed-${index}`,
+          sha: `closed-sha-${index}`,
+          label: `org:agent/closed-${index}`,
+        },
+      }),
+    );
+    let feedbackCalls = 0;
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => Date.parse("2026-08-25T18:00:00.000Z"),
+        listOpenPullRequests: async () => [],
+        listRecentlyClosedPullRequests: async () => prs,
+        feedbackFetchImpl: async () => {
+          feedbackCalls += 1;
+          return new Response(JSON.stringify({ ok: true, ignored: false }), { status: 200 });
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(feedbackCalls).toBe(8);
+  });
+
+  test("reconciles an external close after a feedback outage and disabled-agent restart", async () => {
+    const pr = makePr({
+      number: 85,
+      state: "closed",
+      merged_at: null,
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+    });
+    let failedFeedbackCalls = 0;
+    let deleteCalls = 0;
+    const sharedDeps = {
+      ...silentLogs,
+      now: () => Date.parse("2026-08-25T18:00:00.000Z"),
+      listOpenPullRequests: async () => {
+        throw new Error("AI review polling must remain disabled");
+      },
+      listRecentlyClosedPullRequests: async () => [pr],
+      deleteBranchRef: async () => {
+        deleteCalls += 1;
+        return { deleted: true, reason: "deleted" as const };
+      },
+    };
+    const beforeRestart = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...sharedDeps,
+        feedbackFetchImpl: async () => {
+          failedFeedbackCalls += 1;
+          return new Response("unavailable", { status: 503 });
+        },
+      },
+    );
+
+    await beforeRestart.poll();
+    expect(failedFeedbackCalls).toBe(3);
+    expect(deleteCalls).toBe(0);
+
+    const afterRestart = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...sharedDeps,
+        feedbackFetchImpl: async () =>
+          new Response(JSON.stringify({ ok: true, ignored: false }), { status: 200 }),
+      },
+    );
+    await afterRestart.poll();
+
+    expect(deleteCalls).toBe(1);
+  });
+
+  test("does not report or delete when GitHub returns merged=false", async () => {
+    const pr = makePr({ number: 86, html_url: "https://github.com/org/repo/pull/86" });
+    let mergeCalls = 0;
+    let feedbackCalls = 0;
+    let deleteCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [pr],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () =>
+          JSON.stringify({
+            score: 9.1,
+            summary: "Ready to merge",
+            issues: [],
+            fix_instruction: "",
+          }),
+        addPullRequestComment: async () => {},
+        getCommitMessage: async () => "feat: improve repository behavior",
+        mergePullRequest: async () => {
+          mergeCalls += 1;
+          return { merged: false, sha: "", message: "merge was declined" };
+        },
+        feedbackFetchImpl: async () => {
+          feedbackCalls += 1;
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+
+    expect(mergeCalls).toBe(1);
+    expect(feedbackCalls).toBe(0);
+    expect(deleteCalls).toBe(0);
   });
 
   test("retries same PR SHA when verdict parsing fails", async () => {
@@ -499,6 +1748,7 @@ describe("ReviewAgent", () => {
     const pr = makePr({ number: 78, html_url: "https://example.com/pr/78" });
     let enqueueCalls = 0;
     let enqueuedResolutionType = "";
+    let enqueuedBranchPrefix = "";
 
     const agent = new ReviewAgent(
       { ...baseConfig, passThreshold: 8.5 },
@@ -560,6 +1810,7 @@ describe("ReviewAgent", () => {
                 ? (params.reviewAgent as Record<string, unknown>)
                 : {};
             enqueuedResolutionType = String(reviewAgent.resolutionType ?? "");
+            enqueuedBranchPrefix = String(reviewAgent.branchPrefix ?? "");
             return new Response(JSON.stringify({ ok: true, jobId: "merge-conflict-job" }), {
               status: 200,
             });
@@ -574,10 +1825,19 @@ describe("ReviewAgent", () => {
 
     expect(enqueueCalls).toBe(1);
     expect(enqueuedResolutionType).toBe("merge_conflict");
+    expect(enqueuedBranchPrefix).toBe("agent/");
   });
 
   test("enqueues fallback instruction when reviewer omits fix_instruction", async () => {
-    const pr = makePr({ number: 7, html_url: "https://example.com/pr/7" });
+    const pr = makePr({
+      number: 7,
+      html_url: "https://example.com/pr/7",
+      head: {
+        ref: "automation/test-branch",
+        sha: "abc123def456",
+        label: "owner:automation/test-branch",
+      },
+    });
     let enqueuedInstruction = "";
     let enqueuedPlannerWorkerInstruction = "";
     let enqueuedWriteGlobs: string[] = [];
@@ -589,6 +1849,7 @@ describe("ReviewAgent", () => {
     let enqueuedDedupeKey = "";
     let enqueuedDedupeCooldownMs = -1;
     let enqueuedResolutionType = "";
+    let enqueuedBranchPrefix = "";
     let enqueuedReviewThreshold = 0;
     let enqueuedReviewerFindings: string[] = [];
     let createdTaskTitle = "";
@@ -670,6 +1931,7 @@ describe("ReviewAgent", () => {
               ? planning.validationSteps.map((entry) => String(entry))
               : [];
             enqueuedResolutionType = String(reviewAgent.resolutionType ?? "");
+            enqueuedBranchPrefix = String(reviewAgent.branchPrefix ?? "");
             enqueuedReviewThreshold = Number(reviewAgent.reviewThreshold ?? 0);
             enqueuedReviewerFindings = Array.isArray(reviewAgent.reviewerFindings)
               ? reviewAgent.reviewerFindings.map((entry) => String(entry))
@@ -695,6 +1957,7 @@ describe("ReviewAgent", () => {
         now: () => 123,
         ...silentLogs,
       },
+      "automation/",
     );
 
     await agent.poll();
@@ -704,7 +1967,7 @@ describe("ReviewAgent", () => {
     expect(enqueuedTaskId).toBe("review-fix-pr7-123");
     expect(enqueuedDedupeKey).toBe("7:abc123def456");
     expect(enqueuedDedupeCooldownMs).toBe(60_000);
-    expect(enqueuedCompletionBranch).toBe("agent/test-branch");
+    expect(enqueuedCompletionBranch).toBe("automation/test-branch");
     expect(enqueuedPlannerWorkerInstruction).toContain("Rejected PR revision brief:");
     expect(enqueuedPlannerWorkerInstruction).toContain("Previous ReviewAgent score: 7.2 / 10");
     expect(enqueuedPlannerWorkerInstruction).toContain("Required approval threshold: 9.5 / 10");
@@ -714,6 +1977,7 @@ describe("ReviewAgent", () => {
     expect(enqueuedTargetPaths).toEqual(["tests/api/review.test.ts"]);
     expect(enqueuedValidationSteps).toEqual(["bun test ./tests/api/review.test.ts"]);
     expect(enqueuedResolutionType).toBe("review_fix");
+    expect(enqueuedBranchPrefix).toBe("automation/");
     expect(enqueuedReviewThreshold).toBe(9.5);
     expect(enqueuedReviewerFindings).toEqual(["Missing negative-path assertions"]);
     expect(enqueuedPlannerWorkerInstruction).toContain("Do not return an unchanged branch");
@@ -885,6 +2149,150 @@ describe("ReviewAgent", () => {
     await Promise.all([agent.poll(), agent.poll()]);
 
     expect(listCalls).toBe(1);
+  });
+
+  test("bounds each open-review lane run and rotates fairly through large PR sets", async () => {
+    const probed: number[] = [];
+    const prs = Array.from({ length: 100 }, (_, index) =>
+      makePr({
+        number: index + 1,
+        head: {
+          ref: `agent/job-${index + 1}`,
+          sha: `sha-${index + 1}`,
+          label: `owner:agent/job-${index + 1}`,
+        },
+      }),
+    );
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => prs,
+        getPullRequestDiff: async ({ prNumber }) => {
+          probed.push(prNumber);
+          throw new Error("simulated bounded review failure");
+        },
+      },
+    );
+
+    await agent.poll();
+    await agent.poll();
+    await agent.poll();
+
+    expect(probed).toEqual([1, 2, 3]);
+  });
+
+  test("keeps provider reconciliation polling while the open-review lane is stalled", async () => {
+    let releaseOpenList: (() => void) | null = null;
+    let closedListCalls = 0;
+    let nowMs = 0;
+    const openListGate = new Promise<void>((resolve) => {
+      releaseOpenList = resolve;
+    });
+    const agent = new ReviewAgent(
+      baseConfig,
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listOpenPullRequests: async () => {
+          await openListGate;
+          return [];
+        },
+        listRecentlyClosedPullRequests: async () => {
+          closedListCalls += 1;
+          return [];
+        },
+      },
+    );
+
+    const stalledPoll = agent.poll();
+    await Bun.sleep(5);
+    nowMs += 60_000;
+    await agent.poll();
+    expect(closedListCalls).toBe(2);
+
+    releaseOpenList?.();
+    await stalledPoll;
+  });
+
+  test("does not freeze provider reconciliation when the system clock moves backward", async () => {
+    let nowMs = 120_000;
+    let closedListCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => {
+          closedListCalls += 1;
+          return [];
+        },
+      },
+    );
+
+    await agent.poll();
+    nowMs = 60_000;
+    await agent.poll();
+
+    expect(closedListCalls).toBe(2);
+  });
+
+  test("retries unacknowledged provider feedback after the system clock moves backward", async () => {
+    const pr = makePr({
+      number: 245,
+      state: "closed",
+      merged_at: null,
+      closed_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+    });
+    let nowMs = 120_000;
+    let feedbackCalls = 0;
+    let deleteCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => [pr],
+        feedbackFetchImpl: async () => {
+          feedbackCalls += 1;
+          return Response.json(
+            feedbackCalls === 1 ? { ok: true, ignored: true } : { ok: true, ignored: false },
+          );
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+    nowMs = 60_000;
+    await agent.poll();
+
+    expect(feedbackCalls).toBe(2);
+    expect(deleteCalls).toBe(1);
   });
 
   test("approves by score threshold even when reviewer sets approved=false", async () => {
@@ -1484,7 +2892,7 @@ describe("ReviewAgent", () => {
     );
     expect(enqueuedPlannerWorkerInstruction).toContain("Expected remote lease SHA: abc123def456");
     expect(enqueuedTargetPaths).toEqual(["apps/remotebuddy/README.md"]);
-    expect(enqueuedValidationSteps).toEqual(["bun test"]);
+    expect(enqueuedValidationSteps).toEqual(["git diff --check"]);
     expect(createdTaskTitle).toBe("Resolve merge conflicts for PR #70 @ abc123de");
     expect(createdTaskTags).toEqual(["review-agent", "merge-conflict"]);
     expect(emittedCommandTypes).toEqual(["task_created", "task_started", "job_enqueued"]);

@@ -25,6 +25,7 @@ import { mkdirSync } from "fs";
 import { resolve } from "path";
 import {
   detectRepoRoot,
+  createRepositoryAgentServiceClients,
   loadPromptTemplate,
   loadPushPalsConfig,
   resolveLocalServerConnection,
@@ -32,6 +33,7 @@ import {
   createToolRunRecordFromFailure,
   fetchBufferedWithHardDeadline,
   isWorkerOwnedRuntimeStackFrame,
+  type RepositoryAgentServiceClients,
 } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
 import { Logger } from "./common/logger.js";
@@ -2111,6 +2113,7 @@ async function workerLoop(
   dockerExecutor: DockerExecutor | null,
   runtimeState: WorkerRuntimeState,
   transport: WorkerServerTransport,
+  repositoryServices: RepositoryAgentServiceClients,
   requestWorkerRestart: (reason: string) => void,
 ): Promise<void> {
   const headers = buildWorkerHeaders(opts.authToken);
@@ -3103,6 +3106,7 @@ async function workerLoop(
     if (runtimeState.shutdownRequested) break;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, opts.pollMs));
   }
+  await repositoryServices.close();
 }
 
 async function main(): Promise<void> {
@@ -3197,6 +3201,12 @@ async function main(): Promise<void> {
     staleClaimTtlMs: CONFIG.server.staleClaimTtlMs,
     runtimeGeneration: resolveWorkerRuntimeGeneration(),
   });
+  const repositoryServices = createRepositoryAgentServiceClients({
+    serverUrl: opts.server,
+    callerService: "workerpals",
+    callerInstanceId: opts.workerId,
+    authToken: opts.authToken,
+  });
   let shutdownTriggered = false;
   const shutdownAndExit = (signalName: string, code: number) => {
     if (shutdownTriggered) return;
@@ -3234,6 +3244,7 @@ async function main(): Promise<void> {
         failActiveJobOnShutdown(opts, headers, runtimeState, transport, signalName),
       );
       await withTimeout(transport.flush());
+      await withTimeout(repositoryServices.close());
       if (dockerExecutor) {
         await withTimeout(
           dockerExecutor.shutdown().catch((err) => {
@@ -3253,6 +3264,7 @@ async function main(): Promise<void> {
   }
   process.once("exit", () => {
     runtimeState.shutdownRequested = true;
+    void repositoryServices.close().catch(() => {});
     if (shutdownTriggered) return;
     shutdownTriggered = true;
     if (dockerExecutor) {
@@ -3268,8 +3280,16 @@ async function main(): Promise<void> {
     shutdownAndExit("CONTROL_PLANE_UNHEALTHY", 91);
   };
 
-  workerLoop(opts, dockerExecutor, runtimeState, transport, requestWorkerRestart).catch((err) => {
+  workerLoop(
+    opts,
+    dockerExecutor,
+    runtimeState,
+    transport,
+    repositoryServices,
+    requestWorkerRestart,
+  ).catch(async (err) => {
     console.error("[WorkerPals] Fatal:", err);
+    await repositoryServices.close().catch(() => {});
     process.exit(1);
   });
 }

@@ -92,6 +92,14 @@ export interface JobRow {
   updatedAt: string;
 }
 
+export interface PersistedPrLinkRow {
+  cursor: number;
+  jobId: string;
+  sessionId: string;
+  prUrl: string;
+  updatedAt: string;
+}
+
 export interface JobClaimAuthority {
   workerId: string;
   claimGeneration: number;
@@ -1072,22 +1080,18 @@ function normalizePrFeedbackVerdict(value: unknown): string {
 
 function isMergedPrFeedbackVerdict(value: unknown): boolean {
   const verdict = normalizePrFeedbackVerdict(value);
-  if (!verdict) return false;
-  if (
-    verdict.includes("unmergeable") ||
-    verdict.includes("merge_conflict") ||
-    verdict.includes("merge_failed")
-  ) {
-    return false;
-  }
-  return verdict.includes("merged");
+  return verdict === "approved_merged" || verdict === "merged";
 }
 
 function isClosedPrFeedbackVerdict(value: unknown): boolean {
   const verdict = normalizePrFeedbackVerdict(value);
   if (!verdict) return false;
   if (isMergedPrFeedbackVerdict(verdict)) return false;
-  return verdict.includes("closed");
+  return (
+    verdict === "closed_unmerged" ||
+    verdict === "rejected_comment_cap_closed" ||
+    verdict === "rejected_re_review_cap_closed"
+  );
 }
 
 function extractReviewAgentPrUrl(params: Record<string, unknown>): string | null {
@@ -1134,6 +1138,7 @@ export class JobQueue {
           claimGeneration     INTEGER NOT NULL DEFAULT 0,
           result              TEXT,
           prUrl               TEXT,
+          prUrlNormalized     TEXT,
           error               TEXT,
           availableAt         TEXT,
           deferReason         TEXT,
@@ -1343,6 +1348,20 @@ export class JobQueue {
         updatedAt     TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_pr_worker_assignments_worker ON pr_worker_assignments(workerId);
+
+      CREATE TABLE IF NOT EXISTS pr_provider_outcomes (
+        normalizedPrUrl TEXT PRIMARY KEY,
+        prUrl           TEXT NOT NULL,
+        jobId           TEXT,
+        verdict         TEXT NOT NULL,
+        terminal        INTEGER NOT NULL DEFAULT 0,
+        merged          INTEGER NOT NULL DEFAULT 0,
+        providerStateAt TEXT NOT NULL,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_provider_outcomes_terminal_updated
+        ON pr_provider_outcomes(terminal, updatedAt DESC);
     `);
 
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{ name: string }>;
@@ -1419,6 +1438,9 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "prUrl")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN prUrl TEXT;`);
     }
+    if (!jobColumns.some((col) => col.name === "prUrlNormalized")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN prUrlNormalized TEXT;`);
+    }
     if (!jobColumns.some((col) => col.name === "availableAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN availableAt TEXT;`);
     }
@@ -1428,6 +1450,45 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "deferredAt")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN deferredAt TEXT;`);
     }
+
+    const providerOutcomeColumns = this.db
+      .prepare(`PRAGMA table_info(pr_provider_outcomes)`)
+      .all() as Array<{ name: string }>;
+    if (!providerOutcomeColumns.some((col) => col.name === "providerStateAt")) {
+      this.db.exec(`ALTER TABLE pr_provider_outcomes ADD COLUMN providerStateAt TEXT;`);
+    }
+    this.db.exec(`
+      UPDATE pr_provider_outcomes
+      SET providerStateAt = COALESCE(providerStateAt, updatedAt, createdAt)
+      WHERE providerStateAt IS NULL OR TRIM(providerStateAt) = '';
+    `);
+
+    const legacyPrRows = this.db
+      .prepare(
+        `SELECT id, prUrl
+         FROM jobs
+         WHERE prUrl IS NOT NULL
+           AND TRIM(prUrl) <> ''
+           AND (prUrlNormalized IS NULL OR TRIM(prUrlNormalized) = '')`,
+      )
+      .all() as Array<{ id: string; prUrl: string }>;
+    if (legacyPrRows.length > 0) {
+      const updateNormalizedPrUrl = this.db.prepare(
+        `UPDATE jobs SET prUrlNormalized = ? WHERE id = ?`,
+      );
+      this.db.transaction(() => {
+        for (const row of legacyPrRows) {
+          updateNormalizedPrUrl.run(normalizePrUrl(row.prUrl), row.id);
+        }
+      })();
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_jobs_pr_url_normalized
+        ON jobs(prUrlNormalized, status);
+      CREATE INDEX IF NOT EXISTS idx_jobs_pr_url_latest
+        ON jobs(prUrlNormalized, updatedAt DESC)
+        WHERE prUrlNormalized IS NOT NULL;
+    `);
 
     const jobLogColumns = this.db.prepare(`PRAGMA table_info(job_logs)`).all() as Array<{
       name: string;
@@ -1929,14 +1990,14 @@ export class JobQueue {
           `INSERT INTO jobs (
             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
             queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-            status, workerId, targetWorkerId, result, prUrl, error,
+            status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error,
             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
             createdAt, updatedAt
           )
            VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?,
-            'pending', NULL, ?, NULL, ?, NULL,
+            'pending', NULL, ?, NULL, ?, ?, NULL,
             ?, NULL, NULL, NULL, NULL, NULL, NULL,
             ?, ?
            )`,
@@ -1955,6 +2016,7 @@ export class JobQueue {
           finalizationBudgetMs,
           targetWorkerId,
           prUrl,
+          normalizePrUrl(prUrl),
           now,
           now,
           now,
@@ -2386,14 +2448,14 @@ export class JobQueue {
             `INSERT INTO jobs (
                id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
                queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
-               status, workerId, targetWorkerId, result, prUrl, error, availableAt,
+               status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error, availableAt,
                enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
                durationMs, resumeOfJobId, attempt, createdAt, updatedAt
              )
              VALUES (
                ?, ?, ?, ?, ?, ?, ?, ?,
                ?, ?, ?,
-               'pending', NULL, ?, NULL, ?, NULL, ?,
+               'pending', NULL, ?, NULL, ?, ?, NULL, ?,
                ?, NULL, NULL, NULL, NULL, NULL, NULL,
                NULL, ?, ?, ?, ?
              )`,
@@ -2412,6 +2474,7 @@ export class JobQueue {
             job.finalizationBudgetMs,
             nextTargetWorkerId,
             job.prUrl,
+            normalizePrUrl(job.prUrl),
             replacementAvailableAt,
             now,
             job.id,
@@ -2886,6 +2949,7 @@ export class JobQueue {
     const artifacts = body.artifacts ? JSON.stringify(body.artifacts) : null;
     const prUrl =
       typeof body.prUrl === "string" && body.prUrl.trim().length > 0 ? body.prUrl.trim() : null;
+    const prUrlNormalized = normalizePrUrl(prUrl);
 
     const jobRow = this.db
       .prepare(`SELECT workerId, claimGeneration FROM jobs WHERE id = ?`)
@@ -2897,6 +2961,7 @@ export class JobQueue {
          SET status = 'completed',
              result = ?,
              prUrl = COALESCE(?, prUrl),
+             prUrlNormalized = COALESCE(?, prUrlNormalized),
              completedAt = ?,
              failedAt = NULL,
              abandonedAt = NULL,
@@ -2912,6 +2977,7 @@ export class JobQueue {
       .run(
         JSON.stringify({ summary, artifacts }),
         prUrl,
+        prUrlNormalized,
         now,
         now,
         now,
@@ -3788,9 +3854,10 @@ export class JobQueue {
   }
 
   setPrUrl(jobId: string, prUrl: string | null | undefined): { ok: boolean; message?: string } {
-    const normalizedPrUrl =
+    const persistedPrUrl =
       typeof prUrl === "string" && prUrl.trim().length > 0 ? prUrl.trim() : null;
-    if (!normalizedPrUrl) {
+    const normalizedPrUrl = normalizePrUrl(persistedPrUrl);
+    if (!persistedPrUrl || !normalizedPrUrl) {
       return { ok: false, message: "prUrl is required" };
     }
     const now = new Date().toISOString();
@@ -3798,10 +3865,11 @@ export class JobQueue {
       .prepare(
         `UPDATE jobs
          SET prUrl = COALESCE(?, prUrl),
+             prUrlNormalized = COALESCE(?, prUrlNormalized),
              updatedAt = ?
          WHERE id = ?`,
       )
-      .run(normalizedPrUrl, now, jobId);
+      .run(persistedPrUrl, normalizedPrUrl, now, jobId);
     if (info.changes === 0) {
       return { ok: false, message: "Job not found" };
     }
@@ -3951,7 +4019,6 @@ export class JobQueue {
 
   listWorkerPrBacklog(limit = 200): WorkerPrBacklogEntry[] {
     const maxRows = Number.isFinite(limit) ? Math.max(1, Math.min(2_000, Math.floor(limit))) : 200;
-    const scanRows = Math.max(50, maxRows * 8);
     const latestJobs = new Map<
       string,
       {
@@ -3963,18 +4030,29 @@ export class JobQueue {
     >();
     const jobRows = this.db
       .prepare(
-        `SELECT
-           id,
-           prUrl,
-           status,
-           COALESCE(completedAt, failedAt, updatedAt, createdAt) AS latestJobAt
-         FROM jobs
-         WHERE prUrl IS NOT NULL
-           AND TRIM(prUrl) <> ''
-         ORDER BY latestJobAt DESC
+        `WITH ranked_jobs AS (
+           SELECT
+             id,
+             prUrl,
+             status,
+             updatedAt AS latestJobAt,
+             ROW_NUMBER() OVER (
+               PARTITION BY prUrlNormalized
+               ORDER BY datetime(updatedAt) DESC, rowid DESC
+             ) AS prRank
+           FROM jobs
+           WHERE prUrl IS NOT NULL
+             AND TRIM(prUrl) <> ''
+             AND prUrlNormalized IS NOT NULL
+             AND TRIM(prUrlNormalized) <> ''
+         )
+         SELECT id, prUrl, status, latestJobAt
+         FROM ranked_jobs
+         WHERE prRank = 1
+         ORDER BY datetime(latestJobAt) DESC, id DESC
          LIMIT ?`,
       )
-      .all(scanRows) as Array<{
+      .all(maxRows) as Array<{
       id: string;
       prUrl: string | null;
       status: JobStatus;
@@ -3990,7 +4068,6 @@ export class JobQueue {
         latestJobStatus: row.status,
         latestJobAt: row.latestJobAt,
       });
-      if (latestJobs.size >= maxRows) break;
     }
 
     const latestFeedbackByPr = new Map<
@@ -3998,38 +4075,67 @@ export class JobQueue {
       {
         verdict: string | null;
         createdAt: string | null;
+        jobId: string | null;
+        merged: boolean;
       }
     >();
+    const readProviderOutcome = this.db.prepare(
+      `SELECT verdict, updatedAt, jobId, merged
+       FROM pr_provider_outcomes
+       WHERE normalizedPrUrl = ?
+         AND terminal = 1
+       LIMIT 1`,
+    );
+    let readAutonomyFeedback: ReturnType<Database["prepare"]> | null = null;
     try {
-      const feedbackRows = this.db
-        .prepare(
-          `SELECT pr_url AS prUrl, verdict, created_at AS createdAt
-           FROM autonomy_pr_feedback
-           WHERE pr_url IS NOT NULL
-             AND TRIM(pr_url) <> ''
-           ORDER BY created_at DESC
-           LIMIT ?`,
-        )
-        .all(Math.max(200, maxRows * 12)) as Array<{
-        prUrl: string | null;
-        verdict: string | null;
-        createdAt: string | null;
-      }>;
-      for (const row of feedbackRows) {
-        const normalizedPrUrl = normalizePrUrl(row.prUrl);
-        if (!normalizedPrUrl || latestFeedbackByPr.has(normalizedPrUrl)) continue;
-        latestFeedbackByPr.set(normalizedPrUrl, {
-          verdict: row.verdict ? String(row.verdict).trim() : null,
-          createdAt: row.createdAt ? String(row.createdAt).trim() : null,
-        });
-      }
+      readAutonomyFeedback = this.db.prepare(
+        `SELECT verdict, created_at AS createdAt, job_id AS jobId
+         FROM autonomy_pr_feedback
+         WHERE pr_url_normalized = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`,
+      );
     } catch {
       // autonomy_pr_feedback may not exist in isolated JobQueue tests.
+    }
+    for (const normalizedPrUrl of latestJobs.keys()) {
+      const provider = readProviderOutcome.get(normalizedPrUrl) as
+        | {
+            verdict: string | null;
+            updatedAt: string | null;
+            jobId: string | null;
+            merged: number;
+          }
+        | undefined;
+      if (provider) {
+        latestFeedbackByPr.set(normalizedPrUrl, {
+          verdict: provider.verdict ? String(provider.verdict).trim() : null,
+          createdAt: provider.updatedAt ? String(provider.updatedAt).trim() : null,
+          jobId: provider.jobId ? String(provider.jobId).trim() : null,
+          merged: Number(provider.merged) === 1,
+        });
+        continue;
+      }
+      const feedback = readAutonomyFeedback?.get(normalizedPrUrl) as
+        | { verdict: string | null; createdAt: string | null; jobId: string | null }
+        | undefined;
+      if (!feedback) continue;
+      latestFeedbackByPr.set(normalizedPrUrl, {
+        verdict: feedback.verdict ? String(feedback.verdict).trim() : null,
+        createdAt: feedback.createdAt ? String(feedback.createdAt).trim() : null,
+        jobId: feedback.jobId ? String(feedback.jobId).trim() : null,
+        merged: isMergedPrFeedbackVerdict(feedback.verdict),
+      });
     }
 
     const entries: WorkerPrBacklogEntry[] = [];
     for (const [normalizedPrUrl, job] of latestJobs.entries()) {
-      const feedback = latestFeedbackByPr.get(normalizedPrUrl);
+      const feedbackCandidate = latestFeedbackByPr.get(normalizedPrUrl);
+      const feedback =
+        feedbackCandidate &&
+        (feedbackCandidate.merged || feedbackCandidate.jobId === job.latestJobId)
+          ? feedbackCandidate
+          : undefined;
       const latestFeedbackVerdict = feedback?.verdict ?? null;
       const mergeState: WorkerPrMergeState = isMergedPrFeedbackVerdict(latestFeedbackVerdict)
         ? "merged"
@@ -4048,6 +4154,58 @@ export class JobQueue {
       });
     }
     return entries.slice(0, maxRows);
+  }
+
+  listPersistedPrLinksPage(
+    options: {
+      limit?: number;
+      beforeCursor?: number | null;
+    } = {},
+  ): PersistedPrLinkRow[] {
+    const limit = Number.isFinite(options.limit)
+      ? Math.max(1, Math.min(101, Math.floor(options.limit ?? 50)))
+      : 50;
+    const beforeCursor =
+      typeof options.beforeCursor === "number" &&
+      Number.isSafeInteger(options.beforeCursor) &&
+      options.beforeCursor > 0
+        ? options.beforeCursor
+        : null;
+    const cursorFilter = beforeCursor === null ? "" : "AND jobs.rowid < ?";
+    const args = beforeCursor === null ? [limit] : [beforeCursor, limit];
+    return this.db
+      .prepare(
+        `SELECT
+           jobs.rowid AS cursor,
+           jobs.id AS jobId,
+           jobs.sessionId AS sessionId,
+           jobs.prUrl AS prUrl,
+           COALESCE(jobs.completedAt, jobs.updatedAt, jobs.createdAt) AS updatedAt
+         FROM jobs
+         WHERE jobs.status = 'completed'
+           AND jobs.prUrl IS NOT NULL
+           AND TRIM(jobs.prUrl) <> ''
+           AND jobs.prUrlNormalized IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM pr_provider_outcomes provider
+             WHERE provider.normalizedPrUrl = jobs.prUrlNormalized
+               AND provider.terminal = 1
+               AND (
+                 provider.merged = 1
+                 OR EXISTS (
+                   SELECT 1
+                   FROM jobs authority_job
+                   WHERE authority_job.id = provider.jobId
+                     AND authority_job.rowid >= jobs.rowid
+                 )
+               )
+           )
+           ${cursorFilter}
+         ORDER BY jobs.rowid DESC
+         LIMIT ?`,
+      )
+      .all(...args) as PersistedPrLinkRow[];
   }
 
   countOpenUnmergedWorkerPrs(limit = 500): number {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { OpenAiCodexCliClient, __TEST_ONLY__ } from "../apps/remotebuddy/src/llm";
@@ -49,6 +49,27 @@ process.exit(0);
   return scriptPath;
 }
 
+function isEffectivelyAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const state = stat
+        .slice(stat.lastIndexOf(")") + 1)
+        .trim()
+        .split(/\s+/, 1)[0];
+      if (state === "Z") return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 afterEach(() => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
@@ -74,6 +95,58 @@ describe("RemoteBuddy OpenAI Codex CLI client", () => {
     expect(result.code).toBe(124);
     expect(Date.now() - startedAt).toBeLessThan(3_000);
   });
+
+  test("aborting Codex provider work terminates its real descendant tree before rejecting", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pushpals-codex-cancel-tree-"));
+    tempDirs.push(dir);
+    const pidPath = join(dir, "descendant.pid");
+    const script = [
+      `const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });`,
+      `await Bun.write(${JSON.stringify(pidPath)}, String(child.pid));`,
+      `setInterval(() => {}, 1000);`,
+    ].join("\n");
+    const controller = new AbortController();
+    const reason = new Error("repository discovery timed out");
+    const operation = __TEST_ONLY__.runProcessWithBun([process.execPath, "-e", script], {
+      cwd: process.cwd(),
+      env: process.env,
+      timeoutMs: 30_000,
+      signal: controller.signal,
+    });
+
+    let descendantPid = 0;
+    try {
+      for (let attempt = 0; attempt < 100 && !existsSync(pidPath); attempt += 1) {
+        await Bun.sleep(20);
+      }
+      expect(existsSync(pidPath)).toBe(true);
+      descendantPid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+      expect(descendantPid).toBeGreaterThan(0);
+
+      controller.abort(reason);
+      await expect(operation).rejects.toBe(reason);
+
+      let alive = true;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (!isEffectivelyAlive(descendantPid)) {
+          alive = false;
+          break;
+        }
+        await Bun.sleep(50);
+      }
+      expect(alive).toBe(false);
+    } finally {
+      controller.abort(reason);
+      await operation.catch(() => undefined);
+      if (descendantPid > 0) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch {
+          // Whole-tree cancellation already stopped it.
+        }
+      }
+    }
+  }, 15_000);
 
   test("chooses the newest Codex CLI probe for default launcher candidates", () => {
     const oldProbe = {
@@ -131,6 +204,8 @@ describe("RemoteBuddy OpenAI Codex CLI client", () => {
     });
 
     expect(output.text).toBe("fallback:gpt-5.5");
+    expect(output.provider).toBe("openai_codex");
+    expect(output.modelId).toBe("gpt-5.5");
     expect(usageEvents).toHaveLength(1);
     expect(usageEvents[0]?.modelId).toBe("gpt-5.5");
   });

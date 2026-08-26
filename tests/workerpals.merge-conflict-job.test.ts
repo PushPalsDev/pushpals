@@ -8,6 +8,7 @@ import {
   resumePreparedMergeConflictRebase,
 } from "../apps/workerpals/src/execute_job";
 import {
+  applyMergeConflictExecutionHints,
   extractMergeConflictReviewContext,
   prepareMergeConflictWorktreeOnHost,
 } from "../apps/workerpals/src/merge_conflict_job";
@@ -51,6 +52,57 @@ test("integration reconciliation permits the configured integration branch but n
       },
     }),
   ).toBeNull();
+});
+
+test("merge-conflict reconciliation accepts the SCM job's configured branch prefix", () => {
+  expect(
+    extractMergeConflictReviewContext({
+      completionBranch: "refs/heads/automation/workerpal-1/job-123",
+      reviewAgent: {
+        resolutionType: "merge_conflict",
+        branchPrefix: "automation/",
+        prHeadRef: "refs/heads/automation/workerpal-1/job-123",
+        prBaseRef: "main",
+        prHeadSha: "a".repeat(40),
+        prBaseSha: "b".repeat(40),
+      },
+    }),
+  ).toMatchObject({
+    resolutionType: "merge_conflict",
+    publicBranch: "automation/workerpal-1/job-123",
+    baseBranch: "main",
+  });
+});
+
+test("merge-conflict hints replace a stale Bun default with repo-native validation", () => {
+  const root = mkdtempSync(join(tmpdir(), "pushpals-merge-validation-"));
+  try {
+    mkdirSync(join(root, "tests"), { recursive: true });
+    writeFileSync(
+      join(root, "pyproject.toml"),
+      "[tool.pytest.ini_options]\ntestpaths = ['tests']\n",
+      "utf8",
+    );
+    writeFileSync(join(root, "tests", "test_merge.py"), "def test_merge(): pass\n", "utf8");
+    const hinted = applyMergeConflictExecutionHints(
+      {
+        planning: { validationSteps: ["bun test", "git status --porcelain"] },
+        reviewAgent: { resolutionType: "merge_conflict" },
+      },
+      {
+        repoPath: root,
+        cleanup: () => {},
+        conflictPaths: ["tests/test_merge.py"],
+        plannerGuidance: "Resolve the prepared conflict.",
+        rebasedCleanly: false,
+        currentHeadSha: "a".repeat(40),
+      },
+    );
+    const planning = hinted.planning as Record<string, unknown>;
+    expect(planning.validationSteps).toEqual(["python -m pytest tests/test_merge.py"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function stubBackendScriptSegmentsForTesting(

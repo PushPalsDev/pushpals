@@ -42,6 +42,7 @@ describe("shared local network helpers", () => {
       buildLocalCorsHeaders({
         origin: "http://127.0.0.1:8081",
         allowAuthorizationHeader: true,
+        additionalAllowedHeaders: ["X-PushPals-Memory-Caller", "invalid header"],
       })["Access-Control-Allow-Origin"],
     ).toBe("http://127.0.0.1:8081");
 
@@ -51,5 +52,15 @@ describe("shared local network helpers", () => {
         allowAuthorizationHeader: true,
       })["Access-Control-Allow-Origin"],
     ).toBeUndefined();
+
+    const headers = buildLocalCorsHeaders({
+      origin: "http://127.0.0.1:8081",
+      allowAuthorizationHeader: true,
+      additionalAllowedHeaders: ["X-PushPals-Memory-Caller", "x-pushpals-memory-caller"],
+    });
+    expect(headers["Access-Control-Allow-Methods"]).toContain("PUT");
+    expect(headers["Access-Control-Allow-Headers"]).toBe(
+      "content-type, authorization, x-pushpals-memory-caller",
+    );
   });
 });

@@ -34,12 +34,22 @@ export function isLoopbackOrigin(origin: string | null | undefined): boolean {
 export function buildLocalCorsHeaders(options: {
   origin: string | null | undefined;
   allowAuthorizationHeader?: boolean;
+  additionalAllowedHeaders?: string[];
 }): Record<string, string> {
+  const allowedHeaders = [
+    "content-type",
+    ...(options.allowAuthorizationHeader ? ["authorization"] : []),
+    ...(options.additionalAllowedHeaders ?? [])
+      .map((header) =>
+        String(header ?? "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter((header) => /^[a-z0-9-]+$/.test(header)),
+  ];
   const headers: Record<string, string> = {
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": options.allowAuthorizationHeader
-      ? "content-type, authorization"
-      : "content-type",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": [...new Set(allowedHeaders)].join(", "),
   };
   const origin = String(options.origin ?? "").trim();
   if (isLoopbackOrigin(origin)) {

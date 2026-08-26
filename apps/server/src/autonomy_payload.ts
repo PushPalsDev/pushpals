@@ -33,9 +33,14 @@ function stringValues(...values: unknown[]): string[] {
 }
 
 export type AutonomyPayloadDetails = {
+  objectiveId: string | null;
+  snapshotId: string | null;
   patternKey: string | null;
   targetPaths: string[];
   writeGlobs: string[];
+  reservationRequired: boolean;
+  validationIncidentId: string | null;
+  isValidationIncidentRepair: boolean;
 };
 
 export function extractAutonomyPayloadDetails(
@@ -48,6 +53,33 @@ export function extractAutonomyPayloadDetails(
   const paramsAutonomy = objectRecord(params.autonomy);
   const planning = objectRecord(params.planning);
   const scope = objectRecord(planning?.scope);
+  const validationIncident =
+    objectRecord(metadataAutonomy?.validationIncident ?? metadataAutonomy?.validation_incident) ??
+    objectRecord(paramsAutonomy?.validationIncident ?? paramsAutonomy?.validation_incident);
+  const validationIncidentId =
+    compactText(validationIncident?.incidentId ?? validationIncident?.incident_id, 256) || null;
+  const objectiveId =
+    compactText(
+      metadataAutonomy?.objectiveId ??
+        metadataAutonomy?.objective_id ??
+        paramsAutonomy?.objectiveId ??
+        paramsAutonomy?.objective_id,
+      128,
+    ) || null;
+  const snapshotId =
+    compactText(
+      metadataAutonomy?.snapshotId ??
+        metadataAutonomy?.snapshot_id ??
+        paramsAutonomy?.snapshotId ??
+        paramsAutonomy?.snapshot_id,
+      128,
+    ) || null;
+  const reservationRequired = Boolean(
+    metadataAutonomy?.reservationRequired === true ||
+    metadataAutonomy?.reservation_required === true ||
+    paramsAutonomy?.reservationRequired === true ||
+    paramsAutonomy?.reservation_required === true,
+  );
   const patternKey =
     compactText(
       metadataAutonomy?.patternKey ??
@@ -58,7 +90,12 @@ export function extractAutonomyPayloadDetails(
     ) || null;
 
   return {
+    objectiveId,
+    snapshotId,
     patternKey,
+    reservationRequired,
+    validationIncidentId,
+    isValidationIncidentRepair: Boolean(validationIncidentId),
     targetPaths: stringValues(
       metadataAutonomy?.targetPaths,
       metadataAutonomy?.target_paths,

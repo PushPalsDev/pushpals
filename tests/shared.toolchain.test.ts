@@ -79,10 +79,7 @@ describe("toolchain inference", () => {
   test("infers node for bun x tsc because tsc is a Node-backed CLI", () => {
     const repo = makeRepo();
 
-    const requirements = inferToolRequirementsForValidationCommand(
-      repo,
-      "bun x tsc --noEmit",
-    );
+    const requirements = inferToolRequirementsForValidationCommand(repo, "bun x tsc --noEmit");
 
     expect(requirements.map((entry) => entry.tool)).toContain("bun");
     expect(requirements.map((entry) => entry.tool)).toContain("node");
@@ -365,6 +362,69 @@ describe("toolchain inference", () => {
     });
 
     expect(plan.requirements.map((entry) => entry.tool)).toContain("make");
+    expect(plan.requirements.map((entry) => entry.tool)).toContain("cxx-compiler");
+  });
+
+  test("projects every repo-native validation executable before dispatch", () => {
+    const repo = makeRepo();
+    const cases = [
+      ["cmake -S . -B build", "cmake"],
+      ["ctest --test-dir build --output-on-failure", "ctest"],
+      ["bazel test //src/...", "bazel"],
+      ["buf lint", "buf"],
+      ["swift test", "swift"],
+      ["dart test", "dart"],
+      ["flutter test", "flutter"],
+      ["mix test", "mix"],
+      ["cabal test all", "cabal"],
+      ["stack test", "stack"],
+      ["clojure -X:test", "clojure"],
+      ["lein test", "lein"],
+      ["git diff --check", "git"],
+    ] as const;
+
+    for (const [command, expectedTool] of cases) {
+      expect(
+        inferToolRequirementsForValidationCommand(repo, command).some(
+          (requirement) => requirement.tool === expectedTool,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  test("projects the real runner inside bounded nested-project shell wrappers", () => {
+    const repo = makeRepo();
+    const commands = [
+      [`sh -c 'cd -- services/api && exec bundle exec rspec'`, "bundle"],
+      [`cmd /d /s /c "cd /d services/api && buf lint"`, "buf"],
+    ] as const;
+
+    for (const [command, expectedTool] of commands) {
+      const requirements = inferToolRequirementsForValidationCommand(repo, command);
+      expect(requirements.map((entry) => entry.tool)).toContain(expectedTool);
+      expect(
+        requirementsForValidationCommand(
+          buildToolchainPlan({
+            repoRoot: repo,
+            validationCommands: [command],
+          }),
+          command,
+        ).map((entry) => entry.tool),
+      ).toContain(expectedTool);
+    }
+  });
+
+  test("projects native compiler requirements for Bazel validation", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "MODULE.bazel"), 'module(name = "sample")\n', "utf8");
+    writeFileSync(join(repo, "widget.cpp"), "int widget() { return 1; }\n", "utf8");
+
+    const plan = buildToolchainPlan({
+      repoRoot: repo,
+      validationCommands: ["bazel test //..."],
+    });
+
+    expect(plan.requirements.map((entry) => entry.tool)).toContain("bazel");
     expect(plan.requirements.map((entry) => entry.tool)).toContain("cxx-compiler");
   });
 

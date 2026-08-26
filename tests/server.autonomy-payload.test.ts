@@ -30,7 +30,12 @@ describe("server autonomy payload extraction", () => {
     });
 
     expect(details).toEqual({
+      objectiveId: null,
+      snapshotId: null,
       patternKey: "route-shell",
+      reservationRequired: false,
+      validationIncidentId: null,
+      isValidationIncidentRepair: false,
       targetPaths: [
         "apps/shared.ts",
         "apps/metadata.ts",
@@ -62,5 +67,45 @@ describe("server autonomy payload extraction", () => {
 
     expect(details.patternKey).toBe("encoded-pattern");
     expect(details.targetPaths).toEqual(["src/metadata.ts", "src/params.ts", "src/planning.ts"]);
+  });
+
+  test("detects bounded validation repair markers across request and job payloads", () => {
+    const request = extractAutonomyPayloadDetails({
+      metadata: {
+        autonomy: {
+          objective_id: "obj_parser",
+          snapshot_id: "snapshot_parser",
+          reservation_required: true,
+          validation_incident: { incident_id: "valid_inc_parser" },
+        },
+      },
+    });
+    expect(request.validationIncidentId).toBe("valid_inc_parser");
+    expect(request.isValidationIncidentRepair).toBe(true);
+    expect(request.objectiveId).toBe("obj_parser");
+    expect(request.snapshotId).toBe("snapshot_parser");
+    expect(request.reservationRequired).toBe(true);
+
+    const job = extractAutonomyPayloadDetails({
+      params: JSON.stringify({
+        autonomy: {
+          objectiveId: "obj_runtime",
+          snapshotId: "snapshot_runtime",
+          reservationRequired: true,
+          validationIncident: { incidentId: "valid_inc_runtime" },
+        },
+      }),
+    });
+    expect(job.validationIncidentId).toBe("valid_inc_runtime");
+    expect(job.isValidationIncidentRepair).toBe(true);
+    expect(job.objectiveId).toBe("obj_runtime");
+    expect(job.snapshotId).toBe("snapshot_runtime");
+    expect(job.reservationRequired).toBe(true);
+
+    expect(
+      extractAutonomyPayloadDetails({
+        metadata: { autonomy: { validationIncident: { incidentId: "" } } },
+      }).isValidationIncidentRepair,
+    ).toBe(false);
   });
 });

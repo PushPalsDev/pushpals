@@ -35,9 +35,9 @@ Both modes end up in the same request/job/completion queues so behavior is visib
 - `apps/localbuddy`
   - Fast ingress endpoint (`POST /message`) and lightweight handling.
 - `apps/server`
-  - Shared control plane: sessions, events, queues, autonomy endpoints.
+  - Shared control plane: sessions, events, queues, RepositoryAgent broker, shared memory, and autonomy endpoints.
 - `apps/remotebuddy`
-  - Planner/orchestrator and autonomy engine.
+  - Planner/orchestrator and autonomy engine; currently hosts the logical RepositoryAgent worker.
 - `apps/workerpals`
   - Execution workers (host or Docker-isolated).
 - `apps/source_control_manager`
@@ -45,7 +45,9 @@ Both modes end up in the same request/job/completion queues so behavior is visib
 - `packages/protocol`
   - Event contracts, versioning, validators.
 - `packages/shared`
-  - Config loader, communication client, path/policy utilities.
+  - Config loader, communication clients, repository identity/snapshot helpers, memory contract, and path/policy utilities.
+
+RepositoryAgent is a logical capability rather than another required process. Any service can submit a typed repository question through the Server broker. The worker that answers it currently runs inside RemoteBuddy and uses RemoteBuddy's assigned LLM against the exact requested repository snapshot. This placement avoids another runtime process without making callers depend on RemoteBuddy internals.
 
 ## Core Architectural Choice
 
@@ -68,9 +70,12 @@ Costs:
 These assumptions should remain true unless we intentionally redesign the platform:
 
 - Requests and jobs are queue-mediated, not direct ad-hoc calls.
+- RepositoryAgent work uses its own durable, leased queue; callers never call its RemoteBuddy host or database directly.
 - Event history is replayable for session recovery.
 - Execution and integration are separate responsibilities.
 - Worker execution is isolated to a per-job repo worktree/sandbox; planning scope metadata guides relevance and review rather than acting as a filesystem write boundary.
+- RepositoryAgent output is advisory. Deterministic policy, validation, execution, review, and publication gates remain authoritative.
+- Shared memory is evidence-backed and repository-scoped; an LLM answer alone cannot promote a fact into an authoritative gate result.
 - Human-guided and autonomous flows converge into the same control plane.
 
 ## Explicit Non-Goals
@@ -108,6 +113,8 @@ Cons:
   - inspect completion queue and SourceControlManager logs.
 - "Planner output is inconsistent":
   - inspect RemoteBuddy planner schema handling and fallback path.
+- "Repository guidance is missing or stale":
+  - inspect the RepositoryAgent request, lease/deadline state, exact snapshot identity, and memory evidence references.
 - "Autonomy did nothing":
   - inspect lock, cooldown, policy, and budget constraints.
 

@@ -1,15 +1,50 @@
 import { describe, expect, test } from "bun:test";
 import { loadConfig } from "../apps/source_control_manager/src/config";
 import {
+  buildReviewAgentRuntimeFingerprint,
   cloneSourceControlManagerConfigSnapshot,
+  createBlockedReviewProviderHealth,
   createSourceControlManagerHealthTracker,
   createStartupStatusTracker,
   createSingleFlightExecutor,
   probeReviewAgentRuntimeReadiness,
   summarizeReviewAgentRuntimeReadiness,
+  withReviewProviderHealth,
 } from "../apps/source_control_manager/src/runtime_helpers";
 
 describe("source_control_manager runtime helpers", () => {
+  test("review runtime fingerprint is stable across readiness flaps", () => {
+    const config = loadConfig();
+    const structural = {
+      serverUrl: config.serverUrl,
+      remoteUrl: "https://github.com/example/repository.git",
+      prBaseBranch: "main",
+      branchPrefix: "automation/",
+      reviewAgent: { ...config.reviewAgent, enabled: true },
+      gitProviderToken: "token",
+    };
+
+    const waitingFingerprint = buildReviewAgentRuntimeFingerprint(structural);
+    const readyFingerprint = buildReviewAgentRuntimeFingerprint(structural);
+
+    expect(readyFingerprint).toBe(waitingFingerprint);
+    expect(
+      buildReviewAgentRuntimeFingerprint({
+        ...structural,
+        reviewAgent: { ...structural.reviewAgent, passThreshold: 8.7 },
+      }),
+    ).toBe(waitingFingerprint);
+    expect(
+      buildReviewAgentRuntimeFingerprint({
+        ...structural,
+        reviewAgent: {
+          ...structural.reviewAgent,
+          pollIntervalMs: structural.reviewAgent.pollIntervalMs + 5_000,
+        },
+      }),
+    ).not.toBe(waitingFingerprint);
+  });
+
   test("health tracker marks a tick unhealthy only after progress stalls", () => {
     let now = Date.parse("2026-08-11T00:00:00.000Z");
     const tracker = createSourceControlManagerHealthTracker({
@@ -51,6 +86,88 @@ describe("source_control_manager runtime helpers", () => {
     expect(tracker.snapshot()).toMatchObject({
       healthy: false,
       reason: expect.stringContaining("publication_backlog_stalled_12"),
+    });
+  });
+
+  test("provider reconciliation degradation is visible without restarting healthy publication", () => {
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 60_000,
+      idleBacklogGraceMs: 30_000,
+    });
+    const provider = {
+      status: "degraded" as const,
+      inFlight: false,
+      pollAgeMs: 0,
+      stalled: false,
+      lastPollStartedAt: "2026-08-11T00:03:00.000Z",
+      lastPollCompletedAt: "2026-08-11T00:03:01.000Z",
+      lastSuccessfulPollAt: null,
+      consecutiveFailedPolls: 3,
+      failureEvents: 3,
+      lastError: "provider unavailable",
+      persistedLinkRetryCount: 2,
+      persistedLinkCursor: "120",
+    };
+
+    const degraded = withReviewProviderHealth(tracker.snapshot(), provider);
+    expect(degraded).toMatchObject({
+      healthy: true,
+      status: "ok",
+      degradedComponents: ["review_provider"],
+      reviewProvider: provider,
+    });
+    expect(
+      withReviewProviderHealth(tracker.snapshot(), {
+        ...provider,
+        status: "ok",
+        consecutiveFailedPolls: 0,
+      }),
+    ).toMatchObject({
+      healthy: true,
+      degradedComponents: [],
+      reviewProvider: { status: "ok" },
+    });
+  });
+
+  test("blocked provider setup remains visible as degraded health", () => {
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 60_000,
+      idleBacklogGraceMs: 30_000,
+    });
+    const blocked = createBlockedReviewProviderHealth("git provider token is unavailable");
+
+    expect(withReviewProviderHealth(tracker.snapshot(), blocked)).toMatchObject({
+      healthy: true,
+      status: "ok",
+      degradedComponents: ["review_provider"],
+      reviewProvider: {
+        status: "degraded",
+        stalled: false,
+        lastError: "git provider token is unavailable",
+      },
+    });
+  });
+
+  test("stalled provider reconciliation is unhealthy and restartable", () => {
+    const tracker = createSourceControlManagerHealthTracker({
+      tickStallMs: 60_000,
+      idleBacklogGraceMs: 30_000,
+    });
+    const stalled = {
+      ...createBlockedReviewProviderHealth("provider poll stalled"),
+      status: "stalled" as const,
+      inFlight: true,
+      pollAgeMs: 300_000,
+      stalled: true,
+      consecutiveFailedPolls: 0,
+    };
+
+    expect(withReviewProviderHealth(tracker.snapshot(), stalled)).toMatchObject({
+      healthy: false,
+      status: "unhealthy",
+      reason: "review_provider_reconciliation_stalled_300000ms",
+      degradedComponents: ["review_provider"],
+      reviewProvider: { status: "stalled", pollAgeMs: 300_000, stalled: true },
     });
   });
 

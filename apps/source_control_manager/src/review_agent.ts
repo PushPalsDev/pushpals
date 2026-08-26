@@ -6,22 +6,31 @@ import {
   type FetchLike,
 } from "../../../packages/shared/src/bounded_fetch.js";
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
+import { inferRepositoryValidationSteps } from "../../../packages/shared/src/repo_validation.js";
+import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
+import type { RepositoryAgentServiceClients } from "../../../packages/shared/src/repository_agent.js";
 import {
   addPullRequestComment,
   closePullRequest,
   deleteBranchRef,
   type DeleteBranchRefResult,
   getCommitMessage,
+  getPullRequest,
   listPullRequestComments,
   getPullRequestCommitMessage,
   getPullRequestDiff,
+  listRecentlyClosedPullRequests,
   listOpenPullRequests,
   mergePullRequest,
+  parseGitHubPullRequestNumberForRemote,
+  pullRequestHeadBelongsToRemoteRepository,
   type GitHubPR,
   type PullRequestComment,
+  type PullRequestScanCursor,
 } from "./github_pr";
 import type { ReviewAgentConfig as SourceControlManagerReviewAgentConfig } from "./config";
 import { runBoundedScmProcess } from "./bounded_process";
+import type { SourceControlManagerReviewProviderHealth } from "./runtime_helpers";
 
 export type ReviewAgentConfig = SourceControlManagerReviewAgentConfig;
 
@@ -32,8 +41,88 @@ interface ReviewVerdict {
   fix_instruction: string;
 }
 
+export interface PersistedPrLink {
+  jobId: string;
+  sessionId: string | null;
+  prNumber: number;
+  prUrl: string;
+  updatedAt: string | null;
+}
+
+export interface PersistedPrLinkPage {
+  links: PersistedPrLink[];
+  nextCursor: string | null;
+}
+
+export async function listPersistedPrLinks(opts: {
+  serverUrl: string;
+  remoteUrl: string;
+  authToken?: string;
+  fetchImpl: FetchLike;
+  cursor?: string | null;
+  limit?: number;
+}): Promise<PersistedPrLinkPage> {
+  const headers: Record<string, string> = {};
+  if (opts.authToken) headers.Authorization = `Bearer ${opts.authToken}`;
+  const limit = Number.isFinite(opts.limit)
+    ? Math.max(1, Math.min(100, Math.floor(opts.limit ?? 8)))
+    : 8;
+  const cursor = String(opts.cursor ?? "").trim();
+  const url = new URL(`${opts.serverUrl.replace(/\/+$/, "")}/jobs/pr-links`);
+  url.searchParams.set("limit", String(limit));
+  if (cursor) url.searchParams.set("cursor", cursor);
+  const response = await opts.fetchImpl(url, { method: "GET", headers });
+  const responseText = await response.text().catch(() => "");
+  if (!response.ok) {
+    throw new Error(
+      `persisted PR link scan failed: HTTP ${response.status}${responseText ? `: ${responseText}` : ""}`,
+    );
+  }
+  let payload: Record<string, unknown> | null = null;
+  try {
+    const parsed = responseText ? (JSON.parse(responseText) as unknown) : null;
+    payload =
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+  } catch {
+    payload = null;
+  }
+  if (payload?.ok !== true || !Array.isArray(payload.links)) {
+    throw new Error("persisted PR link scan did not return an acknowledged compact page");
+  }
+
+  const links: PersistedPrLink[] = [];
+  const seenPrNumbers = new Set<number>();
+  for (const entry of payload.links.slice(0, limit)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const row = entry as Record<string, unknown>;
+    const jobId = String(row.jobId ?? "").trim();
+    const prUrl = String(row.prUrl ?? "").trim();
+    const prNumber = parseGitHubPullRequestNumberForRemote(prUrl, opts.remoteUrl);
+    if (!jobId || !prNumber || seenPrNumbers.has(prNumber)) continue;
+    seenPrNumbers.add(prNumber);
+    links.push({
+      jobId,
+      sessionId: String(row.sessionId ?? "").trim() || null,
+      prNumber,
+      prUrl,
+      updatedAt: String(row.updatedAt ?? "").trim() || null,
+    });
+  }
+  const nextCursor = String(payload.nextCursor ?? "").trim();
+  if (nextCursor && !/^\d{1,20}$/.test(nextCursor)) {
+    throw new Error("persisted PR link scan returned an invalid next cursor");
+  }
+  return { links, nextCursor: nextCursor || null };
+}
+
 interface ReviewAgentDeps {
+  repositoryServices: RepositoryAgentServiceClients | null;
   listOpenPullRequests: typeof listOpenPullRequests;
+  listRecentlyClosedPullRequests: typeof listRecentlyClosedPullRequests;
+  getPullRequest: typeof getPullRequest;
+  listPersistedPrLinks: typeof listPersistedPrLinks;
   getPullRequestDiff: typeof getPullRequestDiff;
   getCommitMessage: typeof getCommitMessage;
   getPullRequestCommitMessage: typeof getPullRequestCommitMessage;
@@ -44,12 +133,15 @@ interface ReviewAgentDeps {
   addPullRequestComment: typeof addPullRequestComment;
   invokeCodexReview: (prompt: string, config: ReviewAgentConfig) => Promise<string>;
   fetchImpl: FetchLike;
+  feedbackFetchImpl: FetchLike;
   httpTimeoutMs: number;
   httpMaxResponseBytes: number;
   now: () => number;
+  sleep: (ms: number) => Promise<void>;
   logInfo: (line: string) => void;
   logWarn: (line: string) => void;
   logError: (line: string) => void;
+  validationRepoRoot: () => string;
 }
 
 const MAX_DIFF_BYTES = 150_000;
@@ -60,6 +152,18 @@ const MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3_000;
 const MAX_AUTONOMY_FEEDBACK_COMMENTS = 12;
 const MAX_AUTONOMY_FEEDBACK_COMMENT_CHARS = 500;
 const MAX_AUTONOMY_FEEDBACK_SUMMARY_CHARS = 500;
+const MAX_RECENTLY_CLOSED_PRS = 50;
+const MAX_CLOSED_PR_RECONCILIATIONS_PER_POLL = 8;
+const MAX_PERSISTED_PR_STATE_PROBES_PER_POLL = 8;
+const MAX_PERSISTED_PR_RETRY_PROBES_PER_POLL = 4;
+const MAX_PERSISTED_PR_RETRY_QUEUE_SIZE = 64;
+const PROVIDER_RECONCILIATION_MIN_INTERVAL_MS = 60_000;
+const PROVIDER_RECONCILIATION_STALL_MS = 5 * 60_000;
+const MAX_OPEN_PR_REVIEWS_PER_LANE_RUN = 1;
+const CLOSED_PR_RECONCILIATION_WINDOW_MS = 7 * 24 * 60 * 60_000;
+const CLOSED_PR_RECONCILIATION_RETRY_COOLDOWN_MS = 60_000;
+const AUTONOMY_FEEDBACK_MAX_ATTEMPTS = 3;
+const AUTONOMY_FEEDBACK_RETRY_DELAYS_MS = [0, 100, 300] as const;
 const MAX_ACTIVE_FIX_JOB_SCAN = 500;
 const REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS = 60_000;
 const REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 30 * 60_000;
@@ -75,8 +179,25 @@ const DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 const ts = () => new Date().toISOString();
 
+function resolveReviewValidationRepoRoot(): string {
+  try {
+    const config = loadPushPalsConfig();
+    const scmRepo = String(config.sourceControlManager.repoPath ?? "").trim();
+    if (scmRepo && existsSync(scmRepo)) return resolve(scmRepo);
+    const projectRoot = String(config.projectRoot ?? "").trim();
+    if (projectRoot && existsSync(projectRoot)) return resolve(projectRoot);
+  } catch {
+    // Tests and narrowly embedded consumers can still use their process root.
+  }
+  return resolve(process.cwd());
+}
+
 const DEFAULT_DEPS: ReviewAgentDeps = {
+  repositoryServices: null,
   listOpenPullRequests,
+  listRecentlyClosedPullRequests,
+  getPullRequest,
+  listPersistedPrLinks,
   getPullRequestDiff,
   getCommitMessage,
   getPullRequestCommitMessage,
@@ -87,12 +208,15 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   addPullRequestComment,
   invokeCodexReview,
   fetchImpl: fetch,
+  feedbackFetchImpl: fetch,
   httpTimeoutMs: DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS,
   httpMaxResponseBytes: DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES,
   now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   logInfo: (line) => console.log(line),
   logWarn: (line) => console.warn(line),
   logError: (line) => console.error(line),
+  validationRepoRoot: resolveReviewValidationRepoRoot,
 };
 
 export function createBoundedReviewAgentFetch(
@@ -596,11 +720,6 @@ const REVIEW_FINDING_THEMES: Array<{
     patterns: [/\.gitignore/i, /\bnode_modules\b/i],
   },
   {
-    key: "unused-react-native-mock",
-    label: "unused or unrelated React Native mock changes",
-    patterns: [/reactnativemock/i],
-  },
-  {
     key: "deleted-existing-coverage",
     label: "deleted or weakened existing test coverage",
     patterns: [/\b(delet|remov)\w*\b.{0,80}\b(test|coverage|assertion|case)s?\b/i],
@@ -639,9 +758,7 @@ const REVIEW_FINDING_THEMES: Array<{
   {
     key: "pushpals-internal-leak",
     label: "PushPals-internal/autonomy concepts leaked into the user repo",
-    patterns: [
-      /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i,
-    ],
+    patterns: [/\b(workerpal|remotebuddy|pushpals)\b/i],
   },
 ];
 
@@ -714,81 +831,93 @@ function testDeclarationCounts(diff: string): { added: number; removed: number }
   let added = 0;
   let removed = 0;
   for (const line of diff.split(/\r?\n/)) {
-    if (/^\+\s*(?:test|it|describe)\s*\(/.test(line)) added += 1;
-    if (/^-\s*(?:test|it|describe)\s*\(/.test(line)) removed += 1;
+    if (!/^[+-](?![+-])/.test(line)) continue;
+    const declaration = line.slice(1).trim();
+    const isTestDeclaration =
+      /^(?:(?:test|it|describe|context|RSpec\.describe)\s*\(|(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|func\s+Test[A-Za-z0-9_]*\s*\(|#\[test\]|@Test\b|\[(?:Fact|Theory|Test|TestCase)\b|(?:public\s+|private\s+|internal\s+)?(?:async\s+)?(?:void|Task|ValueTask|func)\s+[Tt]est[A-Za-z0-9_]*\s*\(|(?:public\s+|protected\s+)?function\s+test[A-Za-z0-9_]*\s*\()/i.test(
+        declaration,
+      );
+    if (!isTestDeclaration) continue;
+    if (line.startsWith("+")) added += 1;
+    else removed += 1;
   }
   return { added, removed };
 }
 
-function countDiffTokenOutsideFile(diff: string, token: RegExp, excludedPath: string): number {
-  let currentPath = "";
-  let count = 0;
-  for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith("diff --git ")) {
-      const parsed = parseDiffGitLinePaths(line);
-      currentPath = normalizeDiffPath(parsed?.bPath ?? parsed?.aPath ?? "") ?? "";
-      continue;
-    }
-    if (currentPath === excludedPath) continue;
-    if (token.test(line)) count += 1;
-  }
-  return count;
+function isReviewTestPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/");
+  const base = normalized.split("/").pop() ?? normalized;
+  return (
+    /(^|\/)(?:__tests__|tests?|specs?)(?:\/|$)/i.test(normalized) ||
+    /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(base) ||
+    /^test_.*\.py$/i.test(base) ||
+    /_test\.go$/i.test(base) ||
+    /_spec\.rb$/i.test(base) ||
+    /(?:Test|Tests)\.(?:java|kt|kts|cs|fs|php|swift)$/i.test(base) ||
+    /\.Tests?\.(?:csproj|fsproj)$/i.test(base)
+  );
 }
 
-export function collectReviewHygieneIssuesFromDiff(diff: string): string[] {
+export interface ReviewHygieneContext {
+  /** Repository identity, normally the canonical Git remote URL. */
+  repositoryIdentity?: string;
+  /** PR title/body or another authoritative description of the requested change. */
+  taskIntent?: string;
+}
+
+function isPushPalsSelfRepository(identity: string): boolean {
+  return /(?:^|[:/])pushpalsdev\/pushpals(?:\.git)?\/?$/i.test(String(identity ?? "").trim());
+}
+
+function explicitlyAllowsTestRemoval(taskIntent: string): boolean {
+  const normalized = collapseWhitespace(taskIntent);
+  return (
+    /\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b.{0,80}\b(?:test|coverage|suite)s?\b/i.test(
+      normalized,
+    ) ||
+    /\b(?:test|coverage|suite)s?\b.{0,80}\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b/i.test(
+      normalized,
+    )
+  );
+}
+
+function addedDiffText(diff: string): string {
+  return diff
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .join("\n");
+}
+
+export function collectReviewHygieneIssuesFromDiff(
+  diff: string,
+  context: ReviewHygieneContext = {},
+): string[] {
   const changedPaths = parseChangedPathsFromDiff(diff);
-  const changedPathSet = new Set(changedPaths);
   const issues: string[] = [];
 
-  if (changedPathSet.has(".gitignore") && /^\+node_modules\s*$/m.test(diff)) {
-    issues.push(
-      "PR adds bare node_modules noise to .gitignore. Keep dependency/cache hygiene out of feature PRs unless the task explicitly changes repo ignore policy.",
-    );
-  }
-
-  if (
-    changedPathSet.has("tests/reactNativeMock.ts") &&
-    countDiffTokenOutsideFile(diff, /reactNativeMock/i, "tests/reactNativeMock.ts") === 0
-  ) {
-    issues.push(
-      "PR adds or changes tests/reactNativeMock.ts without wiring it into a changed test. Remove the unrelated mock or add a focused consumer in the same PR.",
-    );
-  }
-
   const declarationCounts = testDeclarationCounts(diff);
-  if (declarationCounts.removed >= 3 && declarationCounts.removed > declarationCounts.added) {
+  if (
+    declarationCounts.removed >= 3 &&
+    declarationCounts.removed > declarationCounts.added &&
+    !explicitlyAllowsTestRemoval(context.taskIntent ?? "")
+  ) {
     issues.push(
       "PR removes multiple existing test declarations without replacing equivalent coverage. Preserve existing coverage unless the task is explicitly a test deletion/refactor.",
     );
   }
 
-  const changedTestPaths = changedPaths.filter((path) =>
-    /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
-  );
-  const changedRuntimePaths = changedPaths.filter(
-    (path) =>
-      /\.(?:[cm]?[jt]sx?)$/i.test(path) &&
-      !/(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
-  );
-  if (
-    changedTestPaths.length > 0 &&
-    changedRuntimePaths.length > 0 &&
-    changedRuntimePaths.every((path) => /^utils\//i.test(path)) &&
-    !changedRuntimePaths.some((path) =>
-      /(?:index|route|screen|component|store|service)/i.test(path),
-    )
-  ) {
-    issues.push(
-      "PR adds utility/helper code with tests but no clear runtime integration point. Integrate the helper into behavior-owning code or keep it as a test fixture.",
+  const changedTestPaths = changedPaths.filter(isReviewTestPath);
+  const externalRepo =
+    Boolean(String(context.repositoryIdentity ?? "").trim()) &&
+    !isPushPalsSelfRepository(context.repositoryIdentity ?? "");
+  const leakedInternalSourceLayout =
+    /(?:^|["'`\s(])(?:\.\.\/)*(?:apps\/(?:workerpals|remotebuddy|source_control_manager)|packages\/cli\/runtime\/sandbox\/apps\/(?:workerpals|remotebuddy|source_control_manager))(?:\/|["'`\s)])/im.test(
+      addedDiffText(diff).replace(/\\/g, "/"),
     );
-  }
-
-  if (
-    changedPaths.some((path) => /(^|\/)_layout\.autonomy\.test\.[cm]?[jt]sx?$/i.test(path)) &&
-    /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i.test(diff)
-  ) {
+  if (externalRepo && changedTestPaths.length > 0 && leakedInternalSourceLayout) {
     issues.push(
-      "Layout autonomy tests contain PushPals-internal orchestration concepts. Keep user-repo review coverage focused on app behavior and route/startup contracts.",
+      "User-repo tests reference PushPals' private monorepo source layout. Exercise the installed public interface instead of coupling another repository to PushPals internals.",
     );
   }
 
@@ -819,7 +948,7 @@ function normalizeDiffPath(value: string): string | null {
   return parts.join("/");
 }
 
-function normalizeReviewPrHeadRef(value: unknown): string | null {
+function normalizeReviewPrHeadRef(value: unknown, headPrefix = "agent/"): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -829,7 +958,13 @@ function normalizeReviewPrHeadRef(value: unknown): string | null {
     .replace(/\/+/g, "/")
     .replace(/^\/+|\/+$/g, "");
   if (!normalized) return null;
-  if (!normalized.startsWith("agent/")) return null;
+  const normalizedHeadPrefix = String(headPrefix ?? "")
+    .trim()
+    .replace(/^refs\/heads\//, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+/, "");
+  if (!normalizedHeadPrefix || !normalized.startsWith(normalizedHeadPrefix)) return null;
   if (
     normalized.includes("..") ||
     normalized.includes("@{") ||
@@ -997,34 +1132,8 @@ function deriveReviewTaskLikelyDirs(paths: string[]): string[] {
   return [...dirs];
 }
 
-function deriveReviewTaskValidationSteps(paths: string[]): string[] {
-  const targeted = paths
-    .filter((path) =>
-      /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path),
-    )
-    .slice(0, 4)
-    .map((path) => `bun test ${formatBunTestPathArg(path)}`);
-  return targeted.length > 0 ? targeted : ["bun test"];
-}
-
-function formatBunTestPathArg(path: string): string {
-  const normalized = String(path ?? "")
-    .replace(/\\/g, "/")
-    .trim();
-  if (!normalized) return normalized;
-  const pathArg =
-    normalized.startsWith("./") ||
-    normalized.startsWith("../") ||
-    normalized.startsWith("/") ||
-    /^[A-Za-z]:\//.test(normalized)
-      ? normalized
-      : `./${normalized}`;
-  return quoteValidationCommandArg(pathArg);
-}
-
-function quoteValidationCommandArg(arg: string): string {
-  if (!/[\s"\\]/.test(arg)) return arg;
-  return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+export function deriveReviewTaskValidationSteps(paths: string[], repoRoot: string): string[] {
+  return inferRepositoryValidationSteps({ repoRoot, changedPaths: paths, maxSteps: 4 });
 }
 
 function buildReviewFixPlannerWorkerInstruction(options: {
@@ -1110,6 +1219,27 @@ function normalizeReviewFixHeadSha(value: string): string {
   return String(value ?? "")
     .trim()
     .toLowerCase();
+}
+
+type ClosedPrProviderState = "merged" | "closed_unmerged";
+
+function providerStateFeedbackKey(
+  pr: GitHubPR,
+  state: ClosedPrProviderState,
+  jobId?: string | null,
+): string {
+  const normalizedHeadSha = normalizeReviewFixHeadSha(pr.head?.sha ?? "") || "unknown";
+  const normalizedJobId = String(jobId ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .slice(0, 120);
+  return `review_agent:pr:${pr.number}:head:${normalizedHeadSha}:state:${state}${
+    normalizedJobId ? `:job:${normalizedJobId}` : ""
+  }`;
+}
+
+function persistedLinkReconciliationKey(link: PersistedPrLink): string {
+  return `${link.prNumber}:${link.jobId}:${link.updatedAt ?? "unknown"}`;
 }
 
 function reviewFixDedupeKey(prNumber: number, headSha: string): string {
@@ -1211,9 +1341,33 @@ export class ReviewAgent {
   private reviewed = new Map<number, string>();
   private forceReReview = new Map<number, string>();
   private reReviewEnqueueCounts = new Map<number, number>();
+  private reconciledClosedPrStates = new Map<string, number>();
+  private attemptedClosedPrStates = new Map<
+    string,
+    { lastAttemptedAtMs: number; failures: number }
+  >();
+  private reconciledPersistedLinkStates = new Map<string, number>();
+  private persistedPrLinkRetries = new Map<
+    number,
+    { link: PersistedPrLink; lastAttemptedAtMs: number; failures: number }
+  >();
+  private persistedPrLinkCursor: string | null = null;
+  private openPrScanCursor: PullRequestScanCursor | null = null;
+  private recentlyClosedPrScanCursor: PullRequestScanCursor | null = null;
+  private lastProviderPollStartedAtMs: number | null = null;
+  private lastProviderPollCompletedAtMs: number | null = null;
+  private lastSuccessfulProviderPollAtMs: number | null = null;
+  private consecutiveFailedProviderPolls = 0;
+  private providerFailureEvents = 0;
+  private lastProviderError: string | null = null;
+  private lastOpenPrReviewNumber: number | null = null;
   private reviewerMd = "";
-  private pollInFlight = false;
+  private providerPollInFlight = false;
+  private reviewPollInFlight = false;
+  private stopped = false;
+  private activePollRuns = new Set<Promise<void>>();
   private readonly deps: ReviewAgentDeps;
+  private readonly headPrefix: string;
 
   constructor(
     private config: ReviewAgentConfig,
@@ -1223,11 +1377,18 @@ export class ReviewAgent {
     private prBaseBranch: string,
     private authToken?: string,
     deps?: Partial<ReviewAgentDeps>,
+    headPrefix = "agent/",
   ) {
+    this.headPrefix = String(headPrefix ?? "").trim() || "agent/";
     const resolvedDeps = { ...DEFAULT_DEPS, ...(deps ?? {}) };
+    const rawFeedbackFetchImpl = deps?.feedbackFetchImpl ?? deps?.fetchImpl ?? fetch;
     this.deps = {
       ...resolvedDeps,
       fetchImpl: createBoundedReviewAgentFetch(resolvedDeps.fetchImpl, {
+        timeoutMs: resolvedDeps.httpTimeoutMs,
+        maxResponseBytes: resolvedDeps.httpMaxResponseBytes,
+      }),
+      feedbackFetchImpl: createBoundedReviewAgentFetch(rawFeedbackFetchImpl, {
         timeoutMs: resolvedDeps.httpTimeoutMs,
         maxResponseBytes: resolvedDeps.httpMaxResponseBytes,
       }),
@@ -1235,9 +1396,66 @@ export class ReviewAgent {
   }
 
   requestReReview(prNumber: number, sha: string): void {
+    if (this.stopped) return;
     const normalizedSha = String(sha ?? "").trim();
     if (!normalizedSha) return;
     this.forceReReview.set(prNumber, normalizedSha);
+  }
+
+  /**
+   * Apply readiness-only runtime changes without replacing the reconciler.
+   * Provider cursors, retry queues, review hashes, and fairness state belong to
+   * this long-lived instance and must survive transient service readiness.
+   */
+  updateRuntimeConfig(nextConfig: ReviewAgentConfig): { becameEnabled: boolean } {
+    if (this.stopped) return { becameEnabled: false };
+    const becameEnabled = !this.config.enabled && nextConfig.enabled;
+    const reviewerPathChanged =
+      String(this.config.reviewerMdPath ?? "").trim() !==
+      String(nextConfig.reviewerMdPath ?? "").trim();
+    this.config = { ...nextConfig };
+    if (reviewerPathChanged) this.reviewerMd = "";
+    return { becameEnabled };
+  }
+
+  getProviderHealthSnapshot(): SourceControlManagerReviewProviderHealth {
+    const toIso = (value: number | null): string | null =>
+      value === null ? null : new Date(value).toISOString();
+    const rawPollAgeMs =
+      this.providerPollInFlight && this.lastProviderPollStartedAtMs !== null
+        ? this.deps.now() - this.lastProviderPollStartedAtMs
+        : 0;
+    const pollAgeMs = Number.isFinite(rawPollAgeMs) ? Math.max(0, rawPollAgeMs) : 0;
+    const stalled = this.providerPollInFlight && pollAgeMs >= PROVIDER_RECONCILIATION_STALL_MS;
+    const status: SourceControlManagerReviewProviderHealth["status"] = stalled
+      ? "stalled"
+      : this.providerPollInFlight
+        ? "running"
+        : this.consecutiveFailedProviderPolls > 0
+          ? "degraded"
+          : this.lastProviderPollCompletedAtMs === null
+            ? "idle"
+            : "ok";
+    return {
+      status,
+      inFlight: this.providerPollInFlight,
+      pollAgeMs,
+      stalled,
+      lastPollStartedAt: toIso(this.lastProviderPollStartedAtMs),
+      lastPollCompletedAt: toIso(this.lastProviderPollCompletedAtMs),
+      lastSuccessfulPollAt: toIso(this.lastSuccessfulProviderPollAtMs),
+      consecutiveFailedPolls: this.consecutiveFailedProviderPolls,
+      failureEvents: this.providerFailureEvents,
+      lastError: this.lastProviderError,
+      persistedLinkRetryCount: this.persistedPrLinkRetries.size,
+      persistedLinkCursor: this.persistedPrLinkCursor,
+    };
+  }
+
+  private recordProviderFailure(context: string, err?: unknown): void {
+    const detail = String(err instanceof Error ? err.message : (err ?? "")).trim();
+    this.providerFailureEvents += 1;
+    this.lastProviderError = `${context}${detail ? `: ${detail}` : ""}`.slice(0, 600);
   }
 
   private loadReviewerMd(): string {
@@ -1255,33 +1473,438 @@ export class ReviewAgent {
     }
   }
 
-  async poll(): Promise<void> {
-    if (this.pollInFlight) {
-      this.deps.logInfo("[ReviewAgent] Poll already in progress, skipping overlapping tick.");
+  poll(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    let trackedPoll!: Promise<void>;
+    trackedPoll = this.pollLanes().finally(() => {
+      this.activePollRuns.delete(trackedPoll);
+    });
+    this.activePollRuns.add(trackedPoll);
+    return trackedPoll;
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stopped = true;
+    while (this.activePollRuns.size > 0) {
+      await Promise.allSettled([...this.activePollRuns]);
+    }
+  }
+
+  private async pollLanes(): Promise<void> {
+    const lanes: Promise<void>[] = [this.pollProviderOutcomes()];
+    if (this.config.enabled) lanes.push(this.pollOpenPrReviews());
+    await Promise.all(lanes);
+  }
+
+  private async pollProviderOutcomes(): Promise<void> {
+    if (this.providerPollInFlight) {
+      this.deps.logInfo(
+        "[ReviewAgent] Provider reconciliation already in progress, skipping overlapping lane tick.",
+      );
       return;
     }
 
-    this.pollInFlight = true;
+    const nowMs = this.deps.now();
+    if (
+      this.lastProviderPollStartedAtMs !== null &&
+      nowMs >= this.lastProviderPollStartedAtMs &&
+      nowMs - this.lastProviderPollStartedAtMs < PROVIDER_RECONCILIATION_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.lastProviderPollStartedAtMs = nowMs;
+    const failureEventsAtStart = this.providerFailureEvents;
+    this.providerPollInFlight = true;
+    try {
+      const closedPrCutoff = new Date(nowMs - CLOSED_PR_RECONCILIATION_WINDOW_MS).toISOString();
+      const recentClosedPrs = this.deps
+        .listRecentlyClosedPullRequests({
+          token: this.githubToken,
+          remoteUrl: this.remoteUrl,
+          headPrefix: this.headPrefix,
+          base: this.prBaseBranch,
+          updatedSince: closedPrCutoff,
+          limit: MAX_CLOSED_PR_RECONCILIATIONS_PER_POLL,
+          cursor: this.recentlyClosedPrScanCursor,
+          onScanComplete: (nextCursor) => {
+            this.recentlyClosedPrScanCursor = nextCursor;
+          },
+        })
+        .catch((err: any) => {
+          this.recordProviderFailure("list recently closed pull requests", err);
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Failed to list recently closed PRs for outcome reconciliation: ${err?.message ?? err}`,
+          );
+          return [] as GitHubPR[];
+        });
+      const persistedProviderOutcomes = (async (): Promise<Set<number>> => {
+        let pageLinks: PersistedPrLink[] = [];
+        try {
+          const page = await this.deps.listPersistedPrLinks({
+            serverUrl: this.serverUrl,
+            remoteUrl: this.remoteUrl,
+            authToken: this.authToken,
+            fetchImpl: this.deps.fetchImpl,
+            cursor: this.persistedPrLinkCursor,
+            limit: MAX_PERSISTED_PR_STATE_PROBES_PER_POLL,
+          });
+          pageLinks = page.links;
+          this.persistedPrLinkCursor = page.nextCursor;
+        } catch (err: any) {
+          this.recordProviderFailure("list persisted job/PR links", err);
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Failed to reconcile persisted job/PR links: ${err?.message ?? err}`,
+          );
+        }
+
+        const retryLinks = this.takeDuePersistedPrLinkRetries(nowMs);
+        const uniqueLinks = new Map<number, PersistedPrLink>();
+        // Fresh cursor work stays ahead of retries so a poison link cannot
+        // starve the durable server-backed scan. Failed links are retained in
+        // a bounded local queue and receive an additional bounded retry lane.
+        for (const link of pageLinks) {
+          if (this.persistedPrLinkRetryIsCoolingDown(link, nowMs)) continue;
+          if (!uniqueLinks.has(link.prNumber)) uniqueLinks.set(link.prNumber, link);
+        }
+        for (const link of retryLinks) {
+          if (!uniqueLinks.has(link.prNumber)) uniqueLinks.set(link.prNumber, link);
+        }
+        return this.reconcilePersistedPrLinks([...uniqueLinks.values()], nowMs);
+      })();
+      // Persisted job-to-PR links are the lifecycle authority. Process that
+      // lane before body-marker fallback so concurrent discovery of the same
+      // PR cannot attach its terminal outcome to stale or malformed markers.
+      // The GitHub listing still runs concurrently to keep the poll bounded.
+      const persistedAuthorityPrNumbers = await persistedProviderOutcomes;
+      await this.reconcileRecentlyClosedPrFeedback(
+        await recentClosedPrs,
+        nowMs,
+        new Map(),
+        persistedAuthorityPrNumbers,
+      );
+    } finally {
+      const completedAtMs = this.deps.now();
+      this.lastProviderPollCompletedAtMs = completedAtMs;
+      if (this.providerFailureEvents === failureEventsAtStart) {
+        this.lastSuccessfulProviderPollAtMs = completedAtMs;
+        this.consecutiveFailedProviderPolls = 0;
+        this.lastProviderError = null;
+      } else {
+        this.consecutiveFailedProviderPolls += 1;
+      }
+      this.providerPollInFlight = false;
+    }
+  }
+
+  private takeDuePersistedPrLinkRetries(nowMs: number): PersistedPrLink[] {
+    const due: PersistedPrLink[] = [];
+    for (const retry of this.persistedPrLinkRetries.values()) {
+      const retryDelayMs = this.persistedPrLinkRetryDelayMs(retry.failures);
+      const elapsedMs = nowMs - retry.lastAttemptedAtMs;
+      if (elapsedMs >= 0 && elapsedMs < retryDelayMs) continue;
+      due.push(retry.link);
+      if (due.length >= MAX_PERSISTED_PR_RETRY_PROBES_PER_POLL) break;
+    }
+    return due;
+  }
+
+  private persistedPrLinkRetryDelayMs(failures: number): number {
+    return Math.min(
+      6 * 60 * 60_000,
+      CLOSED_PR_RECONCILIATION_RETRY_COOLDOWN_MS * 2 ** Math.min(8, Math.max(0, failures - 1)),
+    );
+  }
+
+  private persistedPrLinkRetryIsCoolingDown(link: PersistedPrLink, nowMs: number): boolean {
+    const retry = this.persistedPrLinkRetries.get(link.prNumber);
+    if (!retry) return false;
+    if (persistedLinkReconciliationKey(retry.link) !== persistedLinkReconciliationKey(link)) {
+      return false;
+    }
+    const elapsedMs = nowMs - retry.lastAttemptedAtMs;
+    return elapsedMs >= 0 && elapsedMs < this.persistedPrLinkRetryDelayMs(retry.failures);
+  }
+
+  private retainPersistedPrLinkRetry(link: PersistedPrLink, nowMs: number): void {
+    const prior = this.persistedPrLinkRetries.get(link.prNumber);
+    // Reinsert at the tail after every failed attempt so other retained links
+    // get a fair chance within the bounded retry budget.
+    this.persistedPrLinkRetries.delete(link.prNumber);
+    this.persistedPrLinkRetries.set(link.prNumber, {
+      link,
+      lastAttemptedAtMs: nowMs,
+      failures: (prior?.failures ?? 0) + 1,
+    });
+    while (this.persistedPrLinkRetries.size > MAX_PERSISTED_PR_RETRY_QUEUE_SIZE) {
+      const oldestPrNumber = this.persistedPrLinkRetries.keys().next().value as number | undefined;
+      if (oldestPrNumber === undefined) break;
+      this.persistedPrLinkRetries.delete(oldestPrNumber);
+    }
+  }
+
+  private async reconcilePersistedPrLinks(
+    links: PersistedPrLink[],
+    nowMs: number,
+  ): Promise<Set<number>> {
+    const resolvedCutoffMs = nowMs - CLOSED_PR_RECONCILIATION_WINDOW_MS;
+    for (const [linkKey, reconciledAtMs] of this.reconciledPersistedLinkStates) {
+      if (reconciledAtMs < resolvedCutoffMs || reconciledAtMs > nowMs) {
+        this.reconciledPersistedLinkStates.delete(linkKey);
+      }
+    }
+
+    const candidates = links.filter((link) => {
+      if (!this.reconciledPersistedLinkStates.has(persistedLinkReconciliationKey(link)))
+        return true;
+      this.persistedPrLinkRetries.delete(link.prNumber);
+      return false;
+    });
+    if (candidates.length === 0) return new Set();
+
+    const persistedMetadata = new Map<
+      number,
+      { jobId: string; sessionId: string | null; allowBranchDelete: boolean }
+    >();
+    const closedPrs = (
+      await Promise.all(
+        candidates.map(async (link) => {
+          try {
+            const pr = await this.deps.getPullRequest({
+              token: this.githubToken,
+              remoteUrl: this.remoteUrl,
+              prNumber: link.prNumber,
+            });
+            if (pr.number !== link.prNumber) {
+              throw new Error(
+                `provider returned PR #${pr.number} while probing persisted PR #${link.prNumber}`,
+              );
+            }
+            if (
+              String(pr.state ?? "")
+                .trim()
+                .toLowerCase() !== "closed"
+            ) {
+              this.persistedPrLinkRetries.delete(link.prNumber);
+              return null;
+            }
+            persistedMetadata.set(pr.number, {
+              jobId: link.jobId,
+              sessionId: link.sessionId,
+              allowBranchDelete:
+                String(pr.head?.ref ?? "").startsWith(this.headPrefix) &&
+                pullRequestHeadBelongsToRemoteRepository(pr, this.remoteUrl),
+            });
+            return pr;
+          } catch (err: any) {
+            this.recordProviderFailure(`probe persisted PR #${link.prNumber}`, err);
+            this.retainPersistedPrLinkRetry(link, nowMs);
+            this.deps.logWarn(
+              `[${ts()}] [ReviewAgent] Failed persisted provider-state probe for PR #${link.prNumber}: ${err?.message ?? err}`,
+            );
+            return null;
+          }
+        }),
+      )
+    ).filter((pr): pr is GitHubPR => Boolean(pr));
+
+    await this.reconcileRecentlyClosedPrFeedback(closedPrs, nowMs, persistedMetadata);
+    for (const pr of closedPrs) {
+      const providerState: ClosedPrProviderState = pr.merged_at ? "merged" : "closed_unmerged";
+      const metadata = persistedMetadata.get(pr.number);
+      const link = candidates.find(
+        (candidate) => candidate.prNumber === pr.number && candidate.jobId === metadata?.jobId,
+      );
+      if (
+        link &&
+        this.reconciledClosedPrStates.has(
+          providerStateFeedbackKey(pr, providerState, metadata?.jobId),
+        )
+      ) {
+        this.reconciledPersistedLinkStates.set(persistedLinkReconciliationKey(link), nowMs);
+        this.persistedPrLinkRetries.delete(pr.number);
+      } else {
+        if (link) this.retainPersistedPrLinkRetry(link, nowMs);
+      }
+    }
+    return new Set(closedPrs.map((pr) => pr.number));
+  }
+
+  private async pollOpenPrReviews(): Promise<void> {
+    if (this.reviewPollInFlight) {
+      this.deps.logInfo(
+        "[ReviewAgent] Open PR review already in progress, skipping overlapping lane tick.",
+      );
+      return;
+    }
+
+    this.reviewPollInFlight = true;
     try {
       let prs: GitHubPR[];
       try {
         prs = await this.deps.listOpenPullRequests({
           token: this.githubToken,
           remoteUrl: this.remoteUrl,
-          headPrefix: "agent/",
+          headPrefix: this.headPrefix,
           base: this.prBaseBranch,
+          cursor: this.openPrScanCursor,
+          onScanComplete: (nextCursor) => {
+            this.openPrScanCursor = nextCursor;
+          },
         });
       } catch (err: any) {
         this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to list PRs: ${err?.message ?? err}`);
         return;
       }
 
-      for (const pr of prs) {
+      const eligible = prs
+        .filter((pr) => {
+          const reviewedSha = this.reviewed.get(pr.number);
+          const forcedSha = this.forceReReview.get(pr.number);
+          return reviewedSha !== pr.head.sha || forcedSha === pr.head.sha;
+        })
+        .sort((a, b) => a.number - b.number);
+      const startIndex =
+        this.lastOpenPrReviewNumber == null
+          ? 0
+          : Math.max(
+              0,
+              eligible.findIndex((pr) => pr.number > (this.lastOpenPrReviewNumber ?? -1)),
+            );
+      const ordered =
+        startIndex > 0
+          ? [...eligible.slice(startIndex), ...eligible.slice(0, startIndex)]
+          : eligible;
+      for (const pr of ordered.slice(0, MAX_OPEN_PR_REVIEWS_PER_LANE_RUN)) {
+        this.lastOpenPrReviewNumber = pr.number;
         await this.reviewPr(pr);
       }
     } finally {
-      this.pollInFlight = false;
+      this.reviewPollInFlight = false;
     }
+  }
+
+  private async reconcileRecentlyClosedPrFeedback(
+    prs: GitHubPR[],
+    nowMs: number,
+    persistedMetadata = new Map<
+      number,
+      { jobId: string; sessionId: string | null; allowBranchDelete: boolean }
+    >(),
+    skipPrNumbers = new Set<number>(),
+  ): Promise<void> {
+    const cacheCutoffMs = nowMs - CLOSED_PR_RECONCILIATION_WINDOW_MS;
+    for (const [key, acknowledgedAtMs] of this.reconciledClosedPrStates) {
+      if (acknowledgedAtMs < cacheCutoffMs || acknowledgedAtMs > nowMs) {
+        this.reconciledClosedPrStates.delete(key);
+      }
+    }
+    for (const [key, attempt] of this.attemptedClosedPrStates) {
+      if (attempt.lastAttemptedAtMs < cacheCutoffMs) this.attemptedClosedPrStates.delete(key);
+    }
+
+    const freshPending: Array<{
+      pr: GitHubPR;
+      jobId: string;
+      sessionId: string | null;
+      providerState: ClosedPrProviderState;
+      stateKey: string;
+      allowBranchDelete: boolean;
+    }> = [];
+    const retryPending: typeof freshPending = [];
+    for (const pr of prs.slice(0, MAX_RECENTLY_CLOSED_PRS)) {
+      if (skipPrNumbers.has(pr.number)) continue;
+      const bodyMetadata = extractPrMeta(pr.body);
+      const authoritativeMetadata = persistedMetadata.get(pr.number);
+      const jobId = authoritativeMetadata?.jobId ?? bodyMetadata.jobId;
+      const sessionId = authoritativeMetadata?.sessionId ?? bodyMetadata.sessionId;
+      if (!jobId) {
+        this.deps.logInfo(
+          `[${ts()}] [ReviewAgent] Skipping closed PR #${pr.number} reconciliation: missing ${JOB_ID_MARKER} metadata.`,
+        );
+        continue;
+      }
+
+      const providerState: ClosedPrProviderState = pr.merged_at ? "merged" : "closed_unmerged";
+      const stateKey = providerStateFeedbackKey(pr, providerState, jobId);
+      const allowBranchDelete = authoritativeMetadata?.allowBranchDelete ?? true;
+      if (this.reconciledClosedPrStates.has(stateKey)) continue;
+      const priorAttempt = this.attemptedClosedPrStates.get(stateKey);
+      if (!priorAttempt) {
+        freshPending.push({
+          pr,
+          jobId,
+          sessionId,
+          providerState,
+          stateKey,
+          allowBranchDelete,
+        });
+        continue;
+      }
+      const retryDelayMs = Math.min(
+        6 * 60 * 60_000,
+        CLOSED_PR_RECONCILIATION_RETRY_COOLDOWN_MS *
+          2 ** Math.min(8, Math.max(0, priorAttempt.failures - 1)),
+      );
+      const elapsedSinceAttemptMs = nowMs - priorAttempt.lastAttemptedAtMs;
+      if (elapsedSinceAttemptMs < 0 || elapsedSinceAttemptMs >= retryDelayMs) {
+        retryPending.push({
+          pr,
+          jobId,
+          sessionId,
+          providerState,
+          stateKey,
+          allowBranchDelete,
+        });
+      }
+    }
+
+    // Never let permanently ignored/unresolvable outcomes at the front of the
+    // provider result monopolize the bounded per-poll budget. Every newly seen
+    // state gets one attempt before failed states enter exponential backoff.
+    const pending = [...freshPending, ...retryPending];
+    await Promise.all(
+      pending.slice(0, MAX_CLOSED_PR_RECONCILIATIONS_PER_POLL).map(async (entry) => {
+        const { pr, jobId, sessionId, providerState, stateKey, allowBranchDelete } = entry;
+        const priorFailures = this.attemptedClosedPrStates.get(stateKey)?.failures ?? 0;
+        this.attemptedClosedPrStates.set(stateKey, {
+          lastAttemptedAtMs: nowMs,
+          failures: priorFailures + 1,
+        });
+        const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+          pr,
+          feedbackKey: stateKey,
+          verdict: providerState === "merged" ? "approved_merged" : "closed_unmerged",
+          providerStateAt:
+            providerState === "merged" ? (pr.merged_at ?? undefined) : (pr.closed_at ?? undefined),
+          verdictSummary:
+            providerState === "merged"
+              ? `GitHub confirms PR #${pr.number} merged${pr.merged_at ? ` at ${pr.merged_at}` : ""}.`
+              : `GitHub confirms PR #${pr.number} closed without merge${pr.closed_at ? ` at ${pr.closed_at}` : ""}.`,
+          jobId,
+          sessionId,
+        });
+        if (!feedbackAcknowledged) {
+          this.recordProviderFailure(`publish provider outcome for PR #${pr.number}`);
+          return;
+        }
+
+        this.attemptedClosedPrStates.delete(stateKey);
+        this.reconciledClosedPrStates.set(stateKey, nowMs);
+        if (allowBranchDelete) {
+          await this.deletePrHeadBranch(pr, providerState === "merged" ? "merged" : "closed");
+        } else {
+          this.deps.logInfo(
+            `[${ts()}] [ReviewAgent] Preserved unowned persisted PR head ${pr.head?.ref ?? "(unknown)"} after ${providerState} reconciliation for PR #${pr.number}.`,
+          );
+        }
+        this.reReviewEnqueueCounts.delete(pr.number);
+        this.forceReReview.delete(pr.number);
+        this.reviewed.delete(pr.number);
+        this.deps.logInfo(
+          `[${ts()}] [ReviewAgent] Reconciled ${providerState} outcome for closed PR #${pr.number}.`,
+        );
+      }),
+    );
   }
 
   private async reviewPr(pr: GitHubPR): Promise<void> {
@@ -1332,7 +1955,10 @@ export class ReviewAgent {
       return;
     }
 
-    const deterministicHygieneIssues = collectReviewHygieneIssuesFromDiff(diff);
+    const deterministicHygieneIssues = collectReviewHygieneIssuesFromDiff(diff, {
+      repositoryIdentity: this.remoteUrl,
+      taskIntent: `${pr.title ?? ""}\n${pr.body ?? ""}`,
+    });
     if (deterministicHygieneIssues.length > 0) {
       const verdict = buildDeterministicReviewHygieneVerdict(
         deterministicHygieneIssues,
@@ -1445,16 +2071,19 @@ export class ReviewAgent {
         commitTitle,
         commitMessage,
       });
+      if (result.merged !== true) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] GitHub did not merge PR #${pr.number}: ${result.message || "provider returned merged=false"}`,
+        );
+        return false;
+      }
       this.deps.logInfo(
-        `[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${result.sha.slice(0, 8)})`,
+        `[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${String(result.sha ?? "").slice(0, 8) || "unknown"})`,
       );
-      await this.deleteMergedPrHeadBranch(pr);
-      this.reReviewEnqueueCounts.delete(pr.number);
-      this.forceReReview.delete(pr.number);
-      this.reviewed.delete(pr.number);
       const comments = await this.listRecentPrComments(pr.number);
-      await this.postAutonomyPrFeedback({
+      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
         pr,
+        feedbackKey: providerStateFeedbackKey(pr, "merged", jobId),
         verdict: "approved_merged",
         verdictSummary: verdict.summary,
         reviewScore: verdict.score,
@@ -1462,6 +2091,16 @@ export class ReviewAgent {
         sessionId,
         comments,
       });
+      if (!feedbackAcknowledged) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] PR #${pr.number} merged, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`,
+        );
+        return false;
+      }
+      await this.deleteMergedPrHeadBranch(pr);
+      this.reReviewEnqueueCounts.delete(pr.number);
+      this.forceReReview.delete(pr.number);
+      this.reviewed.delete(pr.number);
       return true;
     } catch (err: any) {
       if (isUnmergeablePullRequestError(err)) {
@@ -1527,7 +2166,7 @@ export class ReviewAgent {
     );
     if (handled) {
       const comments = await this.listRecentPrComments(pr.number);
-      await this.postAutonomyPrFeedback({
+      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
         pr,
         verdict: "approved_unmergeable",
         verdictSummary:
@@ -1537,6 +2176,12 @@ export class ReviewAgent {
         sessionId,
         comments,
       });
+      if (!feedbackAcknowledged) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] PR #${pr.number} merge-conflict feedback was not acknowledged; the unchanged PR will be reviewed again.`,
+        );
+        return false;
+      }
     }
     return handled;
   }
@@ -1601,7 +2246,7 @@ export class ReviewAgent {
         `[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`,
       );
     }
-    await this.postAutonomyPrFeedback({
+    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
       pr,
       verdict: "rejected",
       verdictSummary: effectiveVerdict.summary,
@@ -1611,13 +2256,11 @@ export class ReviewAgent {
       comments: recentComments,
     });
 
-    // Always return true here so the SHA is cached and we don't post duplicate
-    // rejection comments if the enqueue below fails. Enqueue errors are logged.
     if (!sessionId) {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] PR #${pr.number} has no pushpals-sessionId in body - cannot re-queue`,
       );
-      return true;
+      return feedbackAcknowledged;
     }
 
     const priorReReviewEnqueues = this.reReviewEnqueueCounts.get(pr.number) ?? 0;
@@ -1645,7 +2288,7 @@ export class ReviewAgent {
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`,
       );
-      return true;
+      return feedbackAcknowledged;
     }
 
     const nextReReviewEnqueues = priorReReviewEnqueues + 1;
@@ -1670,7 +2313,7 @@ export class ReviewAgent {
     } else {
       this.reReviewEnqueueCounts.delete(pr.number);
     }
-    return true;
+    return feedbackAcknowledged;
   }
 
   private async giveUpOnRejectedPr(
@@ -1724,8 +2367,9 @@ export class ReviewAgent {
       );
     }
 
-    await this.postAutonomyPrFeedback({
+    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
       pr,
+      feedbackKey: providerStateFeedbackKey(pr, "closed_unmerged", context.jobId),
       verdict: context.feedbackVerdict ?? "rejected_comment_cap_closed",
       verdictSummary: `${verdict.summary} | ${
         context.feedbackSummarySuffix ??
@@ -1737,10 +2381,17 @@ export class ReviewAgent {
       comments: context.recentComments,
     });
 
-    await this.deletePrHeadBranch(pr, "closed");
     this.reReviewEnqueueCounts.delete(pr.number);
     this.forceReReview.delete(pr.number);
     this.reviewed.delete(pr.number);
+    if (!feedbackAcknowledged) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} closed, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`,
+      );
+      return false;
+    }
+
+    await this.deletePrHeadBranch(pr, "closed");
     return true;
   }
 
@@ -2034,23 +2685,30 @@ export class ReviewAgent {
 
   private async postAutonomyPrFeedback(args: {
     pr: GitHubPR;
+    feedbackKey?: string;
     verdict: string;
     verdictSummary: string;
-    reviewScore: number;
+    providerStateAt?: string;
+    reviewScore?: number;
     jobId: string | null;
     sessionId: string | null;
     comments?: PullRequestComment[];
-  }): Promise<void> {
+  }): Promise<boolean> {
     const normalizedVerdict = String(args.verdict ?? "")
       .trim()
       .toLowerCase();
-    if (!normalizedVerdict) return;
+    if (!normalizedVerdict) return false;
+    const providerStateAt = String(args.providerStateAt ?? "").trim();
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
 
     const normalizedHeadSha = normalizeReviewFixHeadSha(args.pr.head.sha) || "unknown";
-    const feedbackKey = `review_agent:pr:${args.pr.number}:head:${normalizedHeadSha}:verdict:${normalizedVerdict}`;
+    const feedbackKey =
+      String(args.feedbackKey ?? "")
+        .trim()
+        .slice(0, 512) ||
+      `review_agent:pr:${args.pr.number}:head:${normalizedHeadSha}:verdict:${normalizedVerdict}`;
     const comments = (Array.isArray(args.comments) ? args.comments : [])
       .slice(0, MAX_AUTONOMY_FEEDBACK_COMMENTS)
       .map((comment) => ({
@@ -2069,6 +2727,7 @@ export class ReviewAgent {
       prNumber: args.pr.number,
       prUrl: args.pr.html_url,
       verdict: normalizedVerdict,
+      providerStateAt: providerStateAt || undefined,
       reviewScore: Number.isFinite(args.reviewScore) ? args.reviewScore : undefined,
       reviewThreshold: this.config.passThreshold,
       summary: summarizeFeedbackText(args.verdictSummary || args.pr.title || normalizedVerdict),
@@ -2076,23 +2735,67 @@ export class ReviewAgent {
       comments,
     };
 
-    try {
-      const response = await this.deps.fetchImpl(`${this.serverUrl}/autonomy/pr-feedback`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-      });
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        this.deps.logWarn(
-          `[${ts()}] [ReviewAgent] Failed to post autonomy PR feedback for PR #${args.pr.number}: HTTP ${response.status}${text ? `: ${text}` : ""}`,
+    let lastFailure = "feedback acknowledgement missing";
+    let attemptsMade = 0;
+    for (let attempt = 1; attempt <= AUTONOMY_FEEDBACK_MAX_ATTEMPTS; attempt += 1) {
+      attemptsMade = attempt;
+      const retryDelayMs = AUTONOMY_FEEDBACK_RETRY_DELAYS_MS[attempt - 1] ?? 0;
+      if (retryDelayMs > 0) await this.deps.sleep(retryDelayMs);
+
+      let retryable = true;
+      try {
+        const response = await this.deps.feedbackFetchImpl(
+          `${this.serverUrl}/autonomy/pr-feedback`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify(payload),
+          },
         );
+        const responseText = await response.text().catch(() => "");
+        if (response.ok) {
+          let acknowledgement: Record<string, unknown> | null = null;
+          try {
+            const parsed = responseText ? (JSON.parse(responseText) as unknown) : null;
+            acknowledgement =
+              parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                ? (parsed as Record<string, unknown>)
+                : null;
+          } catch {
+            acknowledgement = null;
+          }
+          if (
+            acknowledgement?.ok === true &&
+            (acknowledgement.ignored !== true || acknowledgement.acknowledged === true)
+          ) {
+            return true;
+          }
+          lastFailure =
+            acknowledgement?.ignored === true
+              ? "server returned ignored=true"
+              : "server response did not contain a positive acknowledgement";
+          // An ignored response is a semantic rejection, not a transient
+          // transport failure. Retry it on a later provider poll with backoff
+          // so it cannot consume every immediate retry slot.
+          if (acknowledgement?.ignored === true) retryable = false;
+        } else {
+          lastFailure = `HTTP ${response.status}${responseText ? `: ${responseText}` : ""}`;
+          retryable =
+            response.status === 408 ||
+            response.status === 425 ||
+            response.status === 429 ||
+            response.status >= 500;
+        }
+      } catch (err: any) {
+        lastFailure = String(err?.message ?? err);
       }
-    } catch (err: any) {
-      this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Failed to post autonomy PR feedback for PR #${args.pr.number}: ${err?.message ?? err}`,
-      );
+
+      if (!retryable || attempt >= AUTONOMY_FEEDBACK_MAX_ATTEMPTS) break;
     }
+    this.deps.logWarn(
+      `[${ts()}] [ReviewAgent] Failed to post acknowledged autonomy PR feedback for PR #${args.pr.number} after ${attemptsMade} bounded attempt(s): ${lastFailure}`,
+    );
+    return false;
   }
 
   private async enqueueFixJob(
@@ -2114,8 +2817,11 @@ export class ReviewAgent {
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const changedPaths = deriveReviewTaskTargetPathsFromDiff(diff);
     const likelyDirs = deriveReviewTaskLikelyDirs(changedPaths);
-    const validationSteps = deriveReviewTaskValidationSteps(changedPaths);
-    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
+    const validationSteps = deriveReviewTaskValidationSteps(
+      changedPaths,
+      this.deps.validationRepoRoot(),
+    );
+    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref, this.headPrefix);
     const feedbackContext = await this.getRecentFeedbackContext(
       pr,
       excludedBodies,
@@ -2188,6 +2894,7 @@ export class ReviewAgent {
         },
         completionBranch: prHeadRef ?? undefined,
         reviewAgent: {
+          branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
@@ -2282,8 +2989,11 @@ export class ReviewAgent {
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const changedPaths = deriveReviewTaskTargetPathsFromDiff(diff);
     const likelyDirs = deriveReviewTaskLikelyDirs(changedPaths);
-    const validationSteps = deriveReviewTaskValidationSteps(changedPaths);
-    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
+    const validationSteps = deriveReviewTaskValidationSteps(
+      changedPaths,
+      this.deps.validationRepoRoot(),
+    );
+    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref, this.headPrefix);
     const mergeErrorSummary = truncateText(
       collapseWhitespace(
         String((mergeError as { message?: unknown })?.message ?? mergeError ?? ""),
@@ -2352,6 +3062,7 @@ export class ReviewAgent {
         },
         completionBranch: prHeadRef ?? undefined,
         reviewAgent: {
+          branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),

@@ -7,6 +7,8 @@
 - session lifecycle,
 - event transport and replay,
 - request/job/completion queue APIs,
+- a service-neutral RepositoryAgent request broker,
+- evidence-backed shared memory APIs,
 - worker heartbeat and claim lifecycle,
 - autonomy state and lock APIs.
 
@@ -15,9 +17,9 @@ If PushPals were an operating system, this is the kernel.
 ## Component Contract
 
 - Receives: session commands and queue mutations from every runtime service.
-- Owns: durable SQLite state, queue transitions, request/worker/publisher leases, and session history.
-- Produces: replayable events, queue claims, status snapshots, and recovery projections.
-- Does not own: LLM planning, repository execution, or git publication.
+- Owns: durable SQLite state, queue transitions, request/worker/publisher/RepositoryAgent leases, shared memory records, and session history.
+- Produces: replayable events, queue claims, RepositoryAgent results, memory operations, status snapshots, and recovery projections.
+- Does not own: LLM planning or repository analysis, repository execution, or git publication.
 
 Publication-bearing jobs follow `pending -> claimed (pre-start) -> claimed (started) -> finalizing -> completed`. Successful no-candidate jobs can move directly from `claimed (started)` to `completed`; recovery may return work to `pending`, while `failed`, `abandoned`, and `publish_blocked` are terminal branches.
 
@@ -29,6 +31,9 @@ Publication-bearing jobs follow `pending -> claimed (pre-start) -> claimed (star
 - `apps/server/src/requests.ts` - request queue model.
 - `apps/server/src/jobs.ts` - job queue + logs + worker state.
 - `apps/server/src/completions.ts` - completion queue model.
+- `apps/server/src/repository_agent_queue.ts` - durable RepositoryAgent requests, leases, deadlines, and stale-claim recovery.
+- `apps/server/src/repository_agent_context.ts` - canonical repository identity and exact-snapshot validation.
+- `apps/server/src/memory_store.ts` - server-owned shared memory records and reinforcement observations.
 - `apps/server/src/autonomy.ts` - autonomy snapshot/policy persistence and lock state.
 - `apps/server/src/lifecycle_reconciliation.ts` - guarded startup and periodic recovery tracking.
 
@@ -101,6 +106,14 @@ recovery, even when older in-flight work reports a matching failure. Startup
 migrations preserve every unresolved publication candidate while releasing
 only duplicate active dedupe-key ownership.
 
+### 6) Brokered repository intelligence
+
+RepositoryAgent is a logical capability, not Server-side model execution. Server validates and persists typed questions, while a worker currently hosted inside RemoteBuddy claims them from a dedicated queue. Claim token plus generation fencing prevents a stale worker from renewing, completing, or failing a newer claim. Heartbeats extend leases; expired claims return to `pending`; retryable failures use bounded backoff; exhausted attempts and passed deadlines become terminal. Canonical request fingerprints prevent a reused idempotency key from returning an unrelated result, and terminal retention bounds the queue.
+
+Submission is idempotent within `(repository identity, caller service, session, idempotency key)`. This lets independent services use conventional operation names without colliding. Before enqueue, Server resolves the request against its canonical repository root and rejects identity, revision, or content-tree drift. Completion repeats that identity/revision/tree fence so an answer cannot silently describe another checkout.
+
+Shared memory is a separate Server-owned subsystem. Other processes call it through the typed HTTP client and never open the SQLite database directly. This avoids cross-process database contention and keeps validation, compare-and-set revisions, invalidation, expiry, and reinforcement behavior consistent. Server also reconciles authoritative autonomy lifecycle outcomes into a durable, leased, idempotent RepositoryAgent feedback ledger; only analysis-cache references are trained by delivery outcomes, and infrastructure/environment failures are excluded.
+
 ## Endpoint Families
 
 Server endpoints are easiest to reason about by family:
@@ -113,6 +126,16 @@ Server endpoints are easiest to reason about by family:
   - enqueue, claim, log, complete/fail, worker heartbeat.
 - Completion queue:
   - enqueue, claim, processed/failed state updates.
+- RepositoryAgent broker:
+  - `POST /repository-agent/requests` to submit,
+  - `GET /repository-agent/requests/:id` to poll,
+  - `POST /repository-agent/requests/claim` to claim,
+  - `POST /repository-agent/requests/:id/lease/renew` to heartbeat,
+  - `POST /repository-agent/requests/:id/complete` for fenced completion,
+  - `POST /repository-agent/requests/:id/fail` for fenced failure.
+- Shared memory:
+  - `PUT /memory/records`,
+  - `POST /memory/get`, `/memory/search`, `/memory/invalidate`, `/memory/reinforce`, and `/memory/prune`.
 - Autonomy:
   - snapshot/objective state, lock lifecycle, replay payload storage.
 
@@ -156,6 +179,8 @@ When a workflow appears stuck:
 3. Check completion queue pending/claimed counts.
 4. Check latest session cursor and whether new events are still being persisted.
 5. Check stale-claim recovery logs for automatic handback behavior.
+6. For repository assistance, inspect request deadline, lease expiry, claim generation, and requested versus canonical snapshot.
+7. For stale guidance, inspect memory scope, evidence blob IDs, status, expiry, and reinforcement observations.
 
 ## Tradeoffs
 

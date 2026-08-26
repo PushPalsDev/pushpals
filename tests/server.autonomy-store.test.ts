@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { AutonomyStore, type AutonomyEvaluatorScorecard } from "../apps/server/src/autonomy";
 import { CompletionQueue } from "../apps/server/src/completions";
 import { JobQueue } from "../apps/server/src/jobs";
+import { SqliteMemoryStore } from "../apps/server/src/memory_store";
+import { applyRepositoryAgentMemoryFeedbackBatch } from "../apps/server/src/repository_agent_memory_feedback";
+import { RepositoryAgentQueue } from "../apps/server/src/repository_agent_queue";
 import { RequestQueue } from "../apps/server/src/requests";
 
 const stores: AutonomyStore[] = [];
@@ -64,6 +68,46 @@ function autonomyPatternSampleCount(store: AutonomyStore, patternKey: string): n
   return Math.max(0, Math.floor(Number(row?.sample_count ?? 0)));
 }
 
+function seedRepositoryAgentMemoryFeedback(
+  store: AutonomyStore,
+  input: {
+    observationId: string;
+    objectiveId?: string;
+    recordId?: string;
+    memoryKey?: string;
+    status?: "pending" | "processing" | "applied" | "failed";
+    createdAt?: string;
+    appliedAt?: string | null;
+  },
+): void {
+  const db = (store as unknown as { db: any }).db;
+  const objectiveId = input.objectiveId ?? `objective-${input.observationId}`;
+  db.prepare(
+    `INSERT INTO autonomy_repository_agent_memory_feedback (
+       observation_id, objective_id, repository_id, repository_agent_request_id,
+       outcome, authority_kind, authority_id, weight, memory_refs_json,
+       status, attempts, claim_generation, created_at, applied_at
+     ) VALUES (?, ?, ?, ?, 'successful', 'job_terminal', ?, 1, ?, ?, 0, 0, ?, ?)`,
+  ).run(
+    input.observationId,
+    objectiveId,
+    "github.com/example/project",
+    `request-${input.observationId}`,
+    `authority-${input.observationId}`,
+    JSON.stringify([
+      {
+        id: input.recordId ?? `record-${input.observationId}`,
+        namespace: "repository_agent_cache",
+        key: input.memoryKey ?? `cache-${input.observationId}`,
+        role: "analysis_cache",
+      },
+    ]),
+    input.status ?? "pending",
+    input.createdAt ?? new Date().toISOString(),
+    input.appliedAt ?? null,
+  );
+}
+
 afterEach(() => {
   while (stores.length > 0) {
     stores.pop()?.close();
@@ -80,6 +124,1161 @@ afterEach(() => {
 });
 
 describe("server AutonomyStore policy gates", () => {
+  test("migrates legacy RepositoryAgent feedback columns before creating lease indexes", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-feedback-legacy-migration-"));
+    const dbPath = join(root, "autonomy.sqlite");
+    tempDirs.push(root);
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE autonomy_repository_agent_memory_feedback (
+        observation_id TEXT PRIMARY KEY,
+        objective_id TEXT NOT NULL,
+        repository_id TEXT NOT NULL,
+        repository_agent_request_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        authority_kind TEXT NOT NULL,
+        authority_id TEXT NOT NULL,
+        memory_refs_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        applied_at TEXT
+      );
+    `);
+    legacy.close();
+
+    const migrated = new AutonomyStore(dbPath);
+    stores.push(migrated);
+    const db = (migrated as unknown as { db: any }).db;
+    const columns = new Set(
+      (db.prepare("PRAGMA table_info(autonomy_repository_agent_memory_feedback)").all() as Array<{
+        name: string;
+      }>).map((entry) => entry.name),
+    );
+    expect([...columns]).toEqual(
+      expect.arrayContaining([
+        "weight",
+        "claim_token",
+        "claim_generation",
+        "lease_expires_at",
+        "claimed_at",
+      ]),
+    );
+    const indexes = new Set(
+      (db
+        .prepare(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'index' AND tbl_name = 'autonomy_repository_agent_memory_feedback'`,
+        )
+        .all() as Array<{ name: string }>).map((entry) => entry.name),
+    );
+    expect(indexes.has("idx_autonomy_repository_agent_feedback_lease")).toBe(true);
+    expect(indexes.has("idx_autonomy_repository_agent_feedback_objective_created")).toBe(true);
+  });
+
+  test("durably applies one idempotent RepositoryAgent learning event from a terminal job", async () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repository-agent-feedback-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const repositoryAgentQueue = new RepositoryAgentQueue(dbPath);
+    let memory = new SqliteMemoryStore(dbPath);
+    const repositoryId = "github.com/example/project";
+    const cached = await memory.put({
+      scope: { namespace: "repository_agent_cache", repositoryId },
+      key: "analysis-key-1",
+      kind: "repository_analysis",
+      summary: "Candidate analysis",
+      provenance: { service: "repository_agent", requestId: "seed" },
+      confidence: 0.8,
+      usefulness: 0.8,
+    });
+    const fact = await memory.put({
+      scope: { namespace: "repository_facts", repositoryId },
+      key: "fact-key-1",
+      kind: "repository_evidence_observation",
+      summary: "Host-verified evidence",
+      provenance: { service: "repository_agent", requestId: "seed" },
+      confidence: 0.9,
+      usefulness: 0.7,
+    });
+    const repositoryAgentDeadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const repositoryAgentRequest = repositoryAgentQueue.enqueue({
+      sessionId: "dev",
+      callerService: "remotebuddy",
+      purpose: "priority",
+      repositoryId,
+      repositoryRoot: "C:/repo",
+      revision: "head-1",
+      treeHash: "tree-1",
+      dirty: false,
+      priority: "background",
+      deadlineAt: repositoryAgentDeadlineAt,
+      idempotencyKey: "repository-agent-feedback",
+      request: {
+        schemaVersion: 1,
+        caller: {
+          service: "remotebuddy",
+          sessionId: "dev",
+          correlationId: "run-repository-agent-feedback",
+        },
+        purpose: "priority",
+        repository: {
+          identity: repositoryId,
+          root: "C:/repo",
+          revision: "head-1",
+          tree: "tree-1",
+          dirty: false,
+        },
+        question: "Which repository improvement should run next?",
+        priority: "background",
+        deadlineAt: repositoryAgentDeadlineAt,
+        freshness: "cache_preferred",
+        idempotencyKey: "repository-agent-feedback",
+      },
+    });
+    const repositoryAgentRequestId = String(repositoryAgentRequest.requestId ?? "");
+    const repositoryAgentClaim = repositoryAgentQueue.claim("repository-agent-test");
+    expect(repositoryAgentClaim.request?.id).toBe(repositoryAgentRequestId);
+    expect(
+      repositoryAgentQueue.complete(repositoryAgentRequestId, {
+        agentId: "repository-agent-test",
+        claimToken: repositoryAgentClaim.request?.claimToken ?? "",
+        claimGeneration: repositoryAgentClaim.request?.claimGeneration ?? 0,
+        result: {
+          schemaVersion: 1,
+          requestId: repositoryAgentRequestId,
+          analyzedRepository: { identity: repositoryId, revision: "head-1", tree: "tree-1" },
+          answer: "Improve repository routing.",
+          summary: "Repository routing is the highest-value bounded target.",
+          confidence: 0.9,
+          evidence: [
+            { path: "src/routing/index.ts", revision: "head-1", rationale: "owns routing" },
+          ],
+          recommendations: [],
+          validationProposals: [],
+          cache: { hit: false, key: "analysis-key-1" },
+          memoryRefs: [
+            {
+              id: cached.id,
+              namespace: "repository_agent_cache",
+              key: cached.key,
+              role: "analysis_cache",
+              relevance: 0.95,
+              sourceRevision: "head-1",
+            },
+            {
+              id: fact.id,
+              namespace: "repository_facts",
+              key: fact.key,
+              role: "evidence_fact",
+              relevance: 0.8,
+              sourceRevision: "head-1",
+            },
+          ],
+          completedAt: new Date().toISOString(),
+        },
+      }).ok,
+    ).toBe(true);
+    const enqueued = jobs.enqueue({
+      taskId: "task-repository-agent-feedback",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    const jobId = String(enqueued.jobId ?? "");
+    expect(jobs.claim("worker-repository-agent-feedback").job?.id).toBe(jobId);
+
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run-repository-agent-feedback",
+    }).snapshot_id;
+    const objective = {
+      id: "objective-repository-agent-feedback",
+      title: "Improve repository routing",
+      instruction: "Improve and validate repository routing.",
+      objective_type: "feature_small",
+      component_area: "src/routing",
+      trigger_type: "queue_health",
+      target_paths: ["src/routing/index.ts"],
+      scope: { read_anywhere: false, write_globs: ["src/routing/index.ts"] },
+      confidence: 0.9,
+      risk_level: "low",
+      expected_validation: ["bun test"],
+      status: "running",
+      job_id: jobId,
+    };
+    const decision = store.recordObjectiveDecision({
+      runId: "run-repository-agent-feedback",
+      snapshotId,
+      sessionId: "dev",
+      repositoryAgentMemory: {
+        // These caller-supplied addresses are deliberately false. Only the
+        // completed server-owned RepositoryAgent request may be linked.
+        repositoryId: "attacker.example/spoofed",
+        requestId: repositoryAgentRequestId,
+        memoryRefs: [
+          {
+            id: "spoofed-memory",
+            namespace: "spoofed",
+            key: "spoofed",
+            role: "analysis_cache",
+          },
+        ],
+      },
+      objective,
+    });
+    expect(decision).toMatchObject({ ok: true });
+    expect(
+      store.recordObjectiveDecision({
+        runId: "run-repository-agent-feedback",
+        snapshotId,
+        sessionId: "dev",
+        // Normal lifecycle updates do not repeat RepositoryAgent attribution.
+        objective: { ...objective, status: "running" },
+      }).ok,
+    ).toBe(true);
+    expect(
+      jobs.fail(jobId, {
+        message: "candidate made no publishable repository change",
+        diagnostics: {
+          terminal: {
+            failureClass: "artifact_only_no_publishable_patch",
+            terminalStage: "quality",
+            summary: "candidate made no publishable repository change",
+          },
+        },
+      }).ok,
+    ).toBe(true);
+    expect(
+      store.recordOutcome({
+        objectiveId: "objective-repository-agent-feedback",
+        patternKey: decision.patternKey,
+        jobId,
+        success: false,
+        userAction: "no_change",
+      }).ok,
+    ).toBe(true);
+
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 1 });
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 0 });
+    const pending = store.listPendingRepositoryAgentMemoryFeedback();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      objectiveId: "objective-repository-agent-feedback",
+      repositoryId,
+      repositoryAgentRequestId,
+      outcome: "failed",
+      authorityKind: "job_terminal",
+      weight: 0.5,
+      attempts: 0,
+    });
+    expect(pending[0]?.memoryRefs.map((ref) => ref.role)).toEqual([
+      "analysis_cache",
+      "evidence_fact",
+    ]);
+
+    closeTrackedStore(store);
+    const restarted = new AutonomyStore(dbPath);
+    stores.push(restarted);
+    expect(restarted.listPendingRepositoryAgentMemoryFeedback()).toHaveLength(1);
+
+    expect(
+      await applyRepositoryAgentMemoryFeedbackBatch({
+        autonomyStore: restarted,
+        memoryStore: memory,
+        logger: { warn: () => {}, error: () => {} },
+      }),
+    ).toEqual({
+      scanned: 1,
+      applied: 1,
+      deferred: 0,
+      missingRecords: 0,
+      staleRecords: 0,
+    });
+    const learnedCache = await memory.get(cached);
+    const protectedFact = await memory.get(fact);
+    expect(learnedCache?.usefulness).toBeLessThan(cached.usefulness);
+    expect(learnedCache?.observations).toHaveLength(1);
+    expect(protectedFact?.usefulness).toBe(fact.usefulness);
+    expect(protectedFact?.observations).toHaveLength(0);
+    expect(restarted.repositoryAgentMemoryFeedbackHealth()).toEqual({
+      pending: 0,
+      processing: 0,
+      applied: 1,
+      failed: 0,
+      oldestPendingAgeMs: null,
+      oldPendingCount: 0,
+      pendingUnhealthyAfterMs: 5 * 60_000,
+      staleClaimCount: 0,
+      unhealthy: false,
+    });
+    await memory.close();
+    memory = new SqliteMemoryStore(dbPath);
+    expect((await memory.get(cached))?.observations).toHaveLength(1);
+    expect(
+      await applyRepositoryAgentMemoryFeedbackBatch({
+        autonomyStore: restarted,
+        memoryStore: memory,
+        logger: { warn: () => {}, error: () => {} },
+      }),
+    ).toEqual({
+      scanned: 0,
+      applied: 0,
+      deferred: 0,
+      missingRecords: 0,
+      staleRecords: 0,
+    });
+    await memory.close();
+    completions.close();
+    jobs.close();
+    repositoryAgentQueue.close();
+  });
+
+  test("refuses planner memory addresses without a matching completed RepositoryAgent run", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repository-agent-untrusted-link-");
+    const repositoryAgentQueue = new RepositoryAgentQueue(dbPath);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const pending = repositoryAgentQueue.enqueue({
+      sessionId: "dev",
+      callerService: "remotebuddy",
+      purpose: "priority",
+      repositoryId: "github.com/example/project",
+      repositoryRoot: "C:/repo",
+      revision: "head-1",
+      treeHash: "tree-1",
+      dirty: false,
+      priority: "background",
+      deadlineAt,
+      idempotencyKey: "untrusted-link",
+      request: {
+        schemaVersion: 1,
+        caller: {
+          service: "remotebuddy",
+          sessionId: "dev",
+          correlationId: "run-repository-agent-untrusted-link",
+        },
+        purpose: "priority",
+        repository: {
+          identity: "github.com/example/project",
+          root: "C:/repo",
+          revision: "head-1",
+          tree: "tree-1",
+          dirty: false,
+        },
+        question: "Which improvement should run next?",
+        priority: "background",
+        deadlineAt,
+        freshness: "cache_preferred",
+        idempotencyKey: "untrusted-link",
+      },
+    });
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run-repository-agent-untrusted-link",
+    }).snapshot_id;
+    expect(
+      store.recordObjectiveDecision({
+        runId: "run-repository-agent-untrusted-link",
+        snapshotId,
+        sessionId: "dev",
+        repositoryAgentMemory: {
+          requestId: pending.requestId,
+          repositoryId: "attacker.example/spoofed",
+          memoryRefs: [
+            {
+              id: "spoofed",
+              namespace: "repository_agent_cache",
+              key: "spoofed",
+              role: "analysis_cache",
+            },
+          ],
+        },
+        objective: {
+          id: "objective-repository-agent-untrusted-link",
+          title: "Improve repository routing",
+          instruction: "Improve and validate repository routing.",
+          objective_type: "feature_small",
+          component_area: "src/routing",
+          trigger_type: "queue_health",
+          target_paths: ["src/routing/index.ts"],
+          scope: { read_anywhere: false, write_globs: ["src/routing/index.ts"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          status: "proposed",
+        },
+      }).ok,
+    ).toBe(true);
+    const db = (store as unknown as { db: any }).db;
+    expect(
+      Number(
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM autonomy_repository_agent_memory_links
+             WHERE objective_id = ?`,
+          )
+          .get("objective-repository-agent-untrusted-link").count ?? 0,
+      ),
+    ).toBe(0);
+    repositoryAgentQueue.close();
+  });
+
+  test("does not learn from infrastructure failures but accepts an explicit negative outcome", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repository-agent-authority-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const enqueued = jobs.enqueue({
+      taskId: "task-repository-agent-authority",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    const jobId = String(enqueued.jobId ?? "");
+    expect(jobs.claim("worker-repository-agent-authority").job?.id).toBe(jobId);
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run-repository-agent-authority",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run-repository-agent-authority",
+      snapshotId,
+      sessionId: "dev",
+      objective: {
+        id: "objective-repository-agent-authority",
+        title: "Improve repository diagnostics",
+        instruction: "Improve and validate repository diagnostics.",
+        objective_type: "feature_small",
+        component_area: "src/diagnostics",
+        trigger_type: "queue_health",
+        target_paths: ["src/diagnostics/index.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/diagnostics/index.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        status: "running",
+        job_id: jobId,
+      },
+    });
+    expect(decision.ok).toBe(true);
+    const db = (store as unknown as { db: any }).db;
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO autonomy_repository_agent_memory_links (
+         objective_id, repository_id, repository_agent_request_id,
+         memory_refs_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "objective-repository-agent-authority",
+      "github.com/example/project",
+      "repository-agent-authority",
+      JSON.stringify([
+        {
+          id: "cache-authority",
+          namespace: "repository_agent_cache",
+          key: "cache-authority",
+          role: "analysis_cache",
+        },
+      ]),
+      now,
+      now,
+    );
+    expect(
+      jobs.fail(jobId, {
+        message: "worker runtime exited before the candidate could be evaluated",
+        diagnostics: {
+          terminal: {
+            failureClass: "worker_runtime_failure",
+            terminalStage: "executor",
+            summary: "worker runtime process exited",
+          },
+        },
+      }).ok,
+    ).toBe(true);
+    expect(
+      store.recordOutcome({
+        objectiveId: "objective-repository-agent-authority",
+        patternKey: decision.patternKey,
+        jobId,
+        success: false,
+        userAction: "failed",
+      }).ok,
+    ).toBe(true);
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 0 });
+    expect(store.listPendingRepositoryAgentMemoryFeedback()).toHaveLength(0);
+
+    expect(
+      store.recordOutcome({
+        objectiveId: "objective-repository-agent-authority",
+        patternKey: decision.patternKey,
+        jobId,
+        success: false,
+        userAction: "rejected",
+      }).ok,
+    ).toBe(true);
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 1 });
+    expect(store.listPendingRepositoryAgentMemoryFeedback()[0]).toMatchObject({
+      outcome: "failed",
+      authorityKind: "job_terminal",
+      weight: 1,
+    });
+    completions.close();
+    jobs.close();
+  });
+
+  test("waits for authoritative publication finalization before learning success", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repository-agent-finalization-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const enqueued = jobs.enqueue({
+      taskId: "task-repository-agent-finalization",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    const jobId = String(enqueued.jobId ?? "");
+    expect(jobs.claim("worker-repository-agent-finalization").job?.id).toBe(jobId);
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run-repository-agent-finalization",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run-repository-agent-finalization",
+      snapshotId,
+      sessionId: "dev",
+      objective: {
+        id: "objective-repository-agent-finalization",
+        title: "Improve repository finalization",
+        instruction: "Improve and validate repository finalization.",
+        objective_type: "feature_small",
+        component_area: "src/finalization",
+        trigger_type: "queue_health",
+        target_paths: ["src/finalization/index.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/finalization/index.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        status: "running",
+        job_id: jobId,
+      },
+    });
+    expect(decision.ok).toBe(true);
+    const db = (store as unknown as { db: any }).db;
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO autonomy_repository_agent_memory_links (
+         objective_id, repository_id, repository_agent_request_id,
+         memory_refs_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "objective-repository-agent-finalization",
+      "github.com/example/project",
+      "repository-agent-finalization",
+      JSON.stringify([
+        {
+          id: "cache-finalization",
+          namespace: "repository_agent_cache",
+          key: "cache-finalization",
+          role: "analysis_cache",
+        },
+      ]),
+      now,
+      now,
+    );
+    const handoff = completions.enqueue({
+      jobId,
+      sessionId: "dev",
+      origin: "autonomy",
+      message: "publish candidate",
+    });
+    expect(jobs.complete(jobId, { summary: "worker candidate ready" }).ok).toBe(true);
+    expect(
+      store.recordOutcome({
+        objectiveId: "objective-repository-agent-finalization",
+        patternKey: decision.patternKey,
+        jobId,
+        success: true,
+        userAction: "applied",
+      }).ok,
+    ).toBe(true);
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 0 });
+
+    const claimed = completions.claim("scm-repository-agent-finalization");
+    expect(claimed.completion?.id).toBe(handoff.completionId);
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 0 });
+    expect(
+      completions.markProcessedAndFinalizeJob(
+        handoff.completionId ?? "",
+        null,
+        undefined,
+        undefined,
+        "scm-repository-agent-finalization",
+        claimed.completion?.claimToken,
+      ).ok,
+    ).toBe(true);
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 1 });
+    expect(store.listPendingRepositoryAgentMemoryFeedback()).toEqual([
+      expect.objectContaining({
+        outcome: "successful",
+        authorityKind: "job_terminal",
+        weight: 1,
+      }),
+    ]);
+    completions.close();
+    jobs.close();
+  });
+
+  test("records a later provider merge as a distinct correction after closed-unmerged", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repository-agent-provider-transition-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const prUrl = "https://github.com/example/project/pull/42";
+    const enqueued = jobs.enqueue({
+      taskId: "task-repository-agent-provider-transition",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    const jobId = String(enqueued.jobId ?? "");
+    expect(jobs.claim("worker-repository-agent-provider-transition").job?.id).toBe(jobId);
+    expect(jobs.complete(jobId, { summary: "candidate ready", prUrl }).ok).toBe(true);
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run-repository-agent-provider-transition",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run-repository-agent-provider-transition",
+      snapshotId,
+      sessionId: "dev",
+      objective: {
+        id: "objective-repository-agent-provider-transition",
+        title: "Improve provider transitions",
+        instruction: "Improve and validate provider transitions.",
+        objective_type: "feature_small",
+        component_area: "src/provider",
+        trigger_type: "queue_health",
+        target_paths: ["src/provider/index.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/provider/index.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        status: "running",
+        job_id: jobId,
+      },
+    });
+    const db = (store as unknown as { db: any }).db;
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO autonomy_repository_agent_memory_links (
+         objective_id, repository_id, repository_agent_request_id,
+         memory_refs_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "objective-repository-agent-provider-transition",
+      "github.com/example/project",
+      "repository-agent-provider-transition",
+      JSON.stringify([
+        {
+          id: "cache-provider-transition",
+          namespace: "repository_agent_cache",
+          key: "cache-provider-transition",
+          role: "analysis_cache",
+        },
+      ]),
+      now,
+      now,
+    );
+    const jobRow = db
+      .prepare(`SELECT prUrlNormalized FROM jobs WHERE id = ?`)
+      .get(jobId) as { prUrlNormalized: string };
+    const closedAt = new Date(Date.now() - 1_000).toISOString();
+    db.prepare(
+      `INSERT INTO pr_provider_outcomes (
+         normalizedPrUrl, prUrl, jobId, verdict, terminal, merged,
+         providerStateAt, createdAt, updatedAt
+       ) VALUES (?, ?, ?, 'closed_unmerged', 1, 0, ?, ?, ?)`,
+    ).run(jobRow.prUrlNormalized, prUrl, jobId, closedAt, closedAt, closedAt);
+    expect(
+      store.recordOutcome({
+        objectiveId: "objective-repository-agent-provider-transition",
+        patternKey: decision.patternKey,
+        jobId,
+        success: false,
+        userAction: "rejected",
+      }).ok,
+    ).toBe(true);
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 1 });
+    const firstObservationId = store.listPendingRepositoryAgentMemoryFeedback()[0]!.observationId;
+
+    const mergedAt = new Date().toISOString();
+    db.prepare(
+      `UPDATE pr_provider_outcomes
+       SET verdict = 'merged', merged = 1, providerStateAt = ?, updatedAt = ?
+       WHERE normalizedPrUrl = ?`,
+    ).run(mergedAt, mergedAt, jobRow.prUrlNormalized);
+    expect(
+      store.recordOutcome({
+        objectiveId: "objective-repository-agent-provider-transition",
+        patternKey: decision.patternKey,
+        jobId,
+        success: true,
+        userAction: "accepted",
+      }).ok,
+    ).toBe(true);
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 1 });
+    const firstClaim = store.claimRepositoryAgentMemoryFeedback(10, 30_000)[0]!;
+    expect(firstClaim.outcome).toBe("failed");
+    expect(
+      store.markRepositoryAgentMemoryFeedback(
+        firstClaim.observationId,
+        { claimToken: firstClaim.claimToken, claimGeneration: firstClaim.claimGeneration },
+        true,
+      ),
+    ).toBe(true);
+    const corrected = store.listPendingRepositoryAgentMemoryFeedback(10);
+    expect(corrected).toEqual([
+      expect.objectContaining({ outcome: "successful", authorityKind: "provider_terminal" }),
+    ]);
+    expect(corrected[0]!.observationId).not.toBe(firstObservationId);
+    completions.close();
+    jobs.close();
+  });
+
+  test("does not starve an older unreflected authority behind 500 reflected outcomes", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repository-agent-feedback-page-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const db = (store as unknown as { db: any }).db;
+    const memoryRefsJson = JSON.stringify([
+      {
+        id: "cache-feedback-page",
+        namespace: "repository_agent_cache",
+        key: "cache-feedback-page",
+        role: "analysis_cache",
+      },
+    ]);
+    const insertJob = db.prepare(
+      `INSERT INTO jobs (
+         id, taskId, sessionId, kind, params, status, prUrl, prUrlNormalized,
+         createdAt, updatedAt
+       ) VALUES (?, ?, 'dev', 'task.execute', '{}', 'completed', ?, ?, ?, ?)`,
+    );
+    const insertObjective = db.prepare(
+      `INSERT INTO autonomy_objectives (
+         id, run_id, snapshot_id, session_id, title, instruction, objective_type,
+         component_area, trigger_type, pattern_key, status, confidence, risk_level,
+         job_id, scope_json, created_at, updated_at
+       ) VALUES (?, ?, 'snapshot-feedback-page', 'dev', 'Paged objective',
+                 'Validate paged feedback.', 'feature_small', 'src/paged', 'queue_health',
+                 ?, 'completed', 0.9, 'low', ?,
+                 '{"readAnywhere":false,"writeGlobs":["src/paged/**"],"targetPaths":["src/paged"]}',
+                 ?, ?)`,
+    );
+    const insertLink = db.prepare(
+      `INSERT INTO autonomy_repository_agent_memory_links (
+         objective_id, repository_id, repository_agent_request_id,
+         memory_refs_json, created_at, updated_at
+       ) VALUES (?, 'github.com/example/project', ?, ?, ?, ?)`,
+    );
+    const insertProvider = db.prepare(
+      `INSERT INTO pr_provider_outcomes (
+         normalizedPrUrl, prUrl, jobId, verdict, terminal, merged,
+         providerStateAt, createdAt, updatedAt
+       ) VALUES (?, ?, ?, 'merged', 1, 1, ?, ?, ?)`,
+    );
+    const insertReflected = db.prepare(
+      `INSERT INTO autonomy_repository_agent_memory_feedback (
+         observation_id, objective_id, repository_id, repository_agent_request_id,
+         outcome, authority_kind, authority_id, weight, memory_refs_json,
+         status, attempts, claim_generation, created_at, applied_at
+       ) VALUES (?, ?, 'github.com/example/project', ?, 'successful',
+                 'provider_terminal', ?, 1, ?, 'applied', 1, 1, ?, ?)`,
+    );
+    const seed = db.transaction(() => {
+      for (let index = 0; index <= 500; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        const jobId = `job-feedback-page-${suffix}`;
+        const objectiveId = `objective-feedback-page-${suffix}`;
+        const requestId = `repository-agent-feedback-page-${suffix}`;
+        const prUrl = `https://github.com/example/project/pull/${1000 + index}`;
+        const normalizedPrUrl = prUrl.toLowerCase();
+        const eventAt = new Date(Date.now() - (501 - index) * 1_000).toISOString();
+        const authorityId = [normalizedPrUrl, jobId, eventAt, "merged", "1"].join("\u001f");
+        insertJob.run(jobId, `task-feedback-page-${suffix}`, prUrl, normalizedPrUrl, eventAt, eventAt);
+        insertObjective.run(
+          objectiveId,
+          `run-feedback-page-${suffix}`,
+          `pattern-feedback-page-${suffix}`,
+          jobId,
+          eventAt,
+          eventAt,
+        );
+        insertLink.run(objectiveId, requestId, memoryRefsJson, eventAt, eventAt);
+        insertProvider.run(
+          normalizedPrUrl,
+          prUrl,
+          jobId,
+          eventAt,
+          eventAt,
+          eventAt,
+        );
+        if (index > 0) {
+          insertReflected.run(
+            `observation-feedback-page-${suffix}`,
+            objectiveId,
+            requestId,
+            authorityId,
+            memoryRefsJson,
+            eventAt,
+            eventAt,
+          );
+        }
+      }
+    });
+    seed();
+
+    expect(store.reconcileRepositoryAgentMemoryFeedback()).toEqual({ queued: 1 });
+    expect(store.listPendingRepositoryAgentMemoryFeedback()).toEqual([
+      expect.objectContaining({
+        objectiveId: "objective-feedback-page-000",
+        outcome: "successful",
+        authorityKind: "provider_terminal",
+      }),
+    ]);
+    completions.close();
+    jobs.close();
+  });
+
+  test("claims RepositoryAgent feedback once and fences stale acknowledgements", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repository-agent-feedback-lease-");
+    const peer = new AutonomyStore(dbPath);
+    stores.push(peer);
+    const db = (store as unknown as { db: any }).db;
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO autonomy_repository_agent_memory_feedback (
+         observation_id, objective_id, repository_id, repository_agent_request_id,
+         outcome, authority_kind, authority_id, weight, memory_refs_json,
+         status, attempts, claim_generation, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?)`,
+    ).run(
+      "observation-feedback-lease",
+      "objective-feedback-lease",
+      "github.com/example/project",
+      "repository-agent-feedback-lease",
+      "successful",
+      "job_terminal",
+      "1",
+      1,
+      JSON.stringify([
+        {
+          id: "cache-feedback-lease",
+          namespace: "repository_agent_cache",
+          key: "cache-feedback-lease",
+          role: "analysis_cache",
+        },
+      ]),
+      now,
+    );
+    const claim = store.claimRepositoryAgentMemoryFeedback(1, 30_000);
+    expect(claim).toHaveLength(1);
+    expect(peer.claimRepositoryAgentMemoryFeedback(1, 30_000)).toHaveLength(0);
+    expect(
+      peer.markRepositoryAgentMemoryFeedback(
+        claim[0]!.observationId,
+        { claimToken: "stale-token", claimGeneration: claim[0]!.claimGeneration },
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      store.markRepositoryAgentMemoryFeedback(
+        claim[0]!.observationId,
+        { claimToken: claim[0]!.claimToken, claimGeneration: claim[0]!.claimGeneration },
+        true,
+      ),
+    ).toBe(true);
+    expect(store.repositoryAgentMemoryFeedbackHealth()).toMatchObject({
+      pending: 0,
+      processing: 0,
+      applied: 1,
+      staleClaimCount: 0,
+      unhealthy: false,
+    });
+  });
+
+  test("rejects expired leases and recovers missing or malformed lease timestamps", () => {
+    const store = makeStore();
+    seedRepositoryAgentMemoryFeedback(store, { observationId: "lease-expiry" });
+    const db = (store as unknown as { db: any }).db;
+
+    const first = store.claimRepositoryAgentMemoryFeedback(1, 30_000)[0]!;
+    db.prepare(
+      `UPDATE autonomy_repository_agent_memory_feedback
+       SET lease_expires_at = ? WHERE observation_id = ?`,
+    ).run(new Date(Date.now() - 1_000).toISOString(), first.observationId);
+    expect(
+      store.markRepositoryAgentMemoryFeedback(
+        first.observationId,
+        { claimToken: first.claimToken, claimGeneration: first.claimGeneration },
+        true,
+      ),
+    ).toBe(false);
+    expect(store.recoverExpiredRepositoryAgentMemoryFeedback()).toBe(1);
+
+    const second = store.claimRepositoryAgentMemoryFeedback(1, 30_000)[0]!;
+    expect(second.claimGeneration).toBe(first.claimGeneration + 1);
+    db.prepare(
+      `UPDATE autonomy_repository_agent_memory_feedback
+       SET lease_expires_at = 'not-an-iso-timestamp' WHERE observation_id = ?`,
+    ).run(second.observationId);
+    expect(
+      store.markRepositoryAgentMemoryFeedback(
+        second.observationId,
+        { claimToken: second.claimToken, claimGeneration: second.claimGeneration },
+        false,
+        new Error("late worker"),
+      ),
+    ).toBe(false);
+    expect(store.repositoryAgentMemoryFeedbackHealth().staleClaimCount).toBe(1);
+    expect(store.recoverExpiredRepositoryAgentMemoryFeedback()).toBe(1);
+
+    const third = store.claimRepositoryAgentMemoryFeedback(1, 30_000)[0]!;
+    expect(third.claimGeneration).toBe(second.claimGeneration + 1);
+    expect(
+      store.markRepositoryAgentMemoryFeedback(
+        third.observationId,
+        { claimToken: third.claimToken, claimGeneration: third.claimGeneration },
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      store.markRepositoryAgentMemoryFeedback(
+        first.observationId,
+        { claimToken: first.claimToken, claimGeneration: first.claimGeneration },
+        true,
+      ),
+    ).toBe(false);
+
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "exhausted-first",
+      objectiveId: "exhausted-objective",
+      status: "processing",
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "after-exhausted",
+      objectiveId: "exhausted-objective",
+    });
+    db.prepare(
+      `UPDATE autonomy_repository_agent_memory_feedback
+       SET attempts = 5, claim_token = 'expired-final-token', claim_generation = 5,
+           lease_expires_at = ?
+       WHERE observation_id = 'exhausted-first'`,
+    ).run(new Date(Date.now() - 1_000).toISOString());
+    expect(store.recoverExpiredRepositoryAgentMemoryFeedback()).toBe(1);
+    expect(
+      db
+        .prepare(
+          `SELECT status FROM autonomy_repository_agent_memory_feedback
+           WHERE observation_id = 'exhausted-first'`,
+        )
+        .get(),
+    ).toEqual({ status: "failed" });
+    expect(store.claimRepositoryAgentMemoryFeedback(1, 30_000)[0]?.observationId).toBe(
+      "after-exhausted",
+    );
+  });
+
+  test("claims feedback just in time and serializes events for one objective", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-feedback-ordering-");
+    const peer = new AutonomyStore(dbPath);
+    stores.push(peer);
+    const baseMs = Date.now() - 10_000;
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "objective-a-first",
+      objectiveId: "objective-a",
+      createdAt: new Date(baseMs).toISOString(),
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "objective-a-second",
+      objectiveId: "objective-a",
+      createdAt: new Date(baseMs + 1_000).toISOString(),
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "objective-b-first",
+      objectiveId: "objective-b",
+      createdAt: new Date(baseMs + 2_000).toISOString(),
+    });
+
+    const first = store.claimRepositoryAgentMemoryFeedback(100, 30_000);
+    expect(first.map((entry) => entry.observationId)).toEqual(["objective-a-first"]);
+    const concurrent = peer.claimRepositoryAgentMemoryFeedback(100, 30_000);
+    expect(concurrent.map((entry) => entry.observationId)).toEqual(["objective-b-first"]);
+    expect(
+      store.markRepositoryAgentMemoryFeedback(
+        first[0]!.observationId,
+        { claimToken: first[0]!.claimToken, claimGeneration: first[0]!.claimGeneration },
+        true,
+      ),
+    ).toBe(true);
+    const nextForObjective = store.claimRepositoryAgentMemoryFeedback(100, 30_000);
+    expect(nextForObjective.map((entry) => entry.observationId)).toEqual([
+      "objective-a-second",
+    ]);
+  });
+
+  test("prunes terminal feedback and settled links while surfacing old pending work", () => {
+    const store = makeStore();
+    const db = (store as unknown as { db: any }).db;
+    const now = new Date();
+    const old = new Date(now.getTime() - 40 * 24 * 60 * 60_000).toISOString();
+    const recentlyOldPending = new Date(now.getTime() - 10 * 60_000).toISOString();
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "old-applied",
+      status: "applied",
+      createdAt: old,
+      appliedAt: old,
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "old-failed",
+      status: "failed",
+      createdAt: old,
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "recent-applied-one",
+      status: "applied",
+      createdAt: new Date(now.getTime() - 2_000).toISOString(),
+      appliedAt: new Date(now.getTime() - 2_000).toISOString(),
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "recent-applied-two",
+      status: "applied",
+      createdAt: new Date(now.getTime() - 1_000).toISOString(),
+      appliedAt: new Date(now.getTime() - 1_000).toISOString(),
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "old-pending",
+      status: "pending",
+      createdAt: recentlyOldPending,
+    });
+    const insertLink = db.prepare(
+      `INSERT INTO autonomy_repository_agent_memory_links (
+         objective_id, repository_id, repository_agent_request_id,
+         memory_refs_json, created_at, updated_at
+       ) VALUES (?, ?, ?, '[]', ?, ?)`,
+    );
+    insertLink.run(
+      "orphan-old-link",
+      "github.com/example/project",
+      "request-old-link",
+      old,
+      old,
+    );
+    insertLink.run(
+      "objective-recent-applied-one",
+      "github.com/example/project",
+      "request-recent-applied-one",
+      now.toISOString(),
+      now.toISOString(),
+    );
+    insertLink.run(
+      "objective-old-pending",
+      "github.com/example/project",
+      "request-old-pending",
+      old,
+      old,
+    );
+
+    expect(
+      store.pruneRepositoryAgentMemoryFeedback({
+        nowIso: now.toISOString(),
+        terminalRetentionMs: 30 * 24 * 60 * 60_000,
+        maxTerminalRows: 1,
+        batchSize: 20,
+      }),
+    ).toEqual({ feedbackDeleted: 3, linksDeleted: 2 });
+    const retainedLinks = (
+      db.prepare(`SELECT objective_id AS objectiveId FROM autonomy_repository_agent_memory_links`).all() as Array<{
+        objectiveId: string;
+      }>
+    ).map((entry) => entry.objectiveId);
+    expect(retainedLinks).not.toContain("orphan-old-link");
+    expect(retainedLinks).not.toContain("objective-recent-applied-one");
+    expect(retainedLinks).toContain("objective-old-pending");
+    const health = store.repositoryAgentMemoryFeedbackHealth();
+    expect(health).toMatchObject({
+      pending: 1,
+      applied: 1,
+      failed: 0,
+      oldPendingCount: 1,
+      pendingUnhealthyAfterMs: 5 * 60_000,
+      unhealthy: true,
+    });
+    db.prepare(
+      `UPDATE autonomy_repository_agent_memory_feedback
+       SET created_at = ? WHERE observation_id = 'old-pending'`,
+    ).run(now.toISOString());
+    expect(store.repositoryAgentMemoryFeedbackHealth()).toMatchObject({
+      oldPendingCount: 0,
+      unhealthy: false,
+    });
+  });
+
+  test("acknowledges a stale memory record id without teaching its replacement", async () => {
+    const { store, dbPath } = makePersistentStore("pushpals-feedback-stale-record-");
+    const memory = new SqliteMemoryStore(dbPath);
+    const scope = {
+      namespace: "repository_agent_cache",
+      repositoryId: "github.com/example/project",
+    };
+    const original = await memory.put({
+      scope,
+      key: "reused-analysis",
+      kind: "repository_analysis",
+      summary: "Original analysis",
+      provenance: { service: "repository_agent" },
+      expiresAt: new Date(Date.now() - 1_000).toISOString(),
+    });
+    expect(await memory.prune()).toBe(1);
+    const replacement = await memory.put({
+      scope,
+      key: "reused-analysis",
+      kind: "repository_analysis",
+      summary: "Replacement analysis",
+      provenance: { service: "repository_agent" },
+    });
+    seedRepositoryAgentMemoryFeedback(store, {
+      observationId: "stale-record-feedback",
+      recordId: original.id,
+      memoryKey: "reused-analysis",
+    });
+
+    expect(
+      await applyRepositoryAgentMemoryFeedbackBatch({
+        autonomyStore: store,
+        memoryStore: memory,
+        limit: 1,
+        logger: { warn: () => {}, error: () => {} },
+      }),
+    ).toEqual({
+      scanned: 1,
+      applied: 1,
+      deferred: 0,
+      missingRecords: 1,
+      staleRecords: 1,
+    });
+    const unchanged = await memory.get(replacement);
+    expect(unchanged?.revision).toBe(replacement.revision);
+    expect(unchanged?.observations).toEqual([]);
+    expect(store.repositoryAgentMemoryFeedbackHealth()).toMatchObject({
+      applied: 1,
+      failed: 0,
+      unhealthy: false,
+    });
+    await memory.close();
+  });
+
   test("repairs premature success telemetry after legacy publication failure reconciliation", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-lifecycle-");
     const jobs = new JobQueue(dbPath);
@@ -146,6 +1345,82 @@ describe("server AutonomyStore policy gates", () => {
     jobs.close();
   });
 
+  test("removes legacy approval-only PR success until provider-confirmed merge", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-legacy-approval-");
+    const jobs = new JobQueue(dbPath);
+    const enqueued = jobs.enqueue({
+      taskId: "task-legacy-approval",
+      sessionId: "dev",
+      kind: "task.execute",
+      params: { origin: "autonomy" },
+    });
+    const jobId = String(enqueued.jobId ?? "");
+    expect(jobs.claim("worker-legacy-approval").job?.id).toBe(jobId);
+    expect(
+      jobs.complete(jobId, {
+        summary: "published for review",
+        prUrl: "https://github.com/example/repo/pull/77",
+      }).ok,
+    ).toBe(true);
+
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run-legacy-approval",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run-legacy-approval",
+      snapshotId,
+      sessionId: "dev",
+      objective: {
+        id: "obj-legacy-approval",
+        title: "Improve import recovery",
+        instruction: "Improve and validate import recovery.",
+        objective_type: "feature_small",
+        component_area: "src/imports",
+        trigger_type: "queue_health",
+        target_paths: ["src/imports/recover.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/imports/recover.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["npm test"],
+        status: "running",
+        job_id: jobId,
+      },
+    });
+    expect(decision.ok).toBe(true);
+    expect(
+      store.recordOutcome({
+        objectiveId: "obj-legacy-approval",
+        jobId,
+        patternKey: decision.patternKey,
+        success: true,
+        userAction: "accepted",
+        terminal: true,
+      }).ok,
+    ).toBe(true);
+
+    const repaired = store.reconcileJobLinkedOutcomeLifecycle();
+    expect(repaired.removedPrematureSuccesses).toBe(1);
+    expect(autonomyOutcomeCount(store, "obj-legacy-approval")).toBe(0);
+    expect(autonomyObjectiveStatus(store, "obj-legacy-approval")).toBe("awaiting_review");
+
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "legacy-approval:provider-merge",
+        objectiveId: "obj-legacy-approval",
+        jobId,
+        patternKey: decision.patternKey,
+        prNumber: 77,
+        prUrl: "https://github.com/example/repo/pull/77",
+        verdict: "approved_merged",
+      }).ok,
+    ).toBe(true);
+    expect(store.reconcileJobLinkedOutcomeLifecycle().removedPrematureSuccesses).toBe(0);
+    expect(autonomyOutcomeCount(store, "obj-legacy-approval")).toBe(1);
+    expect(autonomyObjectiveStatus(store, "obj-legacy-approval")).toBe("completed");
+    jobs.close();
+  });
+
   test("createSnapshot builds multi-source state traits", () => {
     const store = makeStore();
     const snapshot = store.createSnapshot({
@@ -169,6 +1444,78 @@ describe("server AutonomyStore policy gates", () => {
     );
     expect(snapshot.state_traits.some((trait) => trait.trait_id === "repo_dirty_worktree")).toBe(
       true,
+    );
+  });
+
+  test("large review backlogs do not hide execution-active objectives", () => {
+    const store = makeStore();
+    const seedSnapshot = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run-large-review-backlog-seed",
+    });
+    for (let index = 0; index < 60; index += 1) {
+      expect(
+        store.recordObjectiveDecision({
+          runId: `run-review-${index}`,
+          snapshotId: seedSnapshot.snapshot_id,
+          sessionId: "s1",
+          objective: {
+            id: `obj-review-${index}`,
+            title: `Review backlog ${index}`,
+            instruction: "Wait for provider review.",
+            objective_type: "feature_small",
+            component_area: `packages/item-${index}`,
+            trigger_type: "queue_health",
+            target_paths: [`packages/item-${index}/src/index.ts`],
+            scope: {
+              read_anywhere: false,
+              write_globs: [`packages/item-${index}/src/index.ts`],
+            },
+            confidence: 0.9,
+            risk_level: "low",
+            expected_validation: ["npm test"],
+            status: "awaiting_review",
+          },
+        }).ok,
+      ).toBe(true);
+    }
+    expect(
+      store.recordObjectiveDecision({
+        runId: "run-active-after-review-backlog",
+        snapshotId: seedSnapshot.snapshot_id,
+        sessionId: "s1",
+        objective: {
+          id: "obj-active-after-review-backlog",
+          title: "Active recovery work",
+          instruction: "Continue active recovery work.",
+          objective_type: "small_refactor",
+          component_area: "services/recovery",
+          trigger_type: "queue_health",
+          target_paths: ["services/recovery/runner.go"],
+          scope: { read_anywhere: false, write_globs: ["services/recovery/runner.go"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["go test ./..."],
+          status: "running",
+        },
+      }).ok,
+    ).toBe(true);
+    const db = (store as unknown as { db: any }).db;
+    db.prepare(
+      `UPDATE autonomy_objectives SET updated_at = ? WHERE id = 'obj-active-after-review-backlog'`,
+    ).run(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+
+    const snapshot = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run-large-review-backlog-check",
+    });
+    expect(
+      snapshot.open_objectives.some(
+        (row) => row.objective_id === "obj-active-after-review-backlog",
+      ),
+    ).toBe(true);
+    expect(snapshot.open_objectives.filter((row) => row.status === "awaiting_review").length).toBe(
+      60,
     );
   });
 
@@ -1615,6 +2962,17 @@ describe("server AutonomyStore policy gates", () => {
           scope: { read_anywhere: true, write_globs: ["apps/workerpals/**"] },
           confidence: 0.95,
         },
+        {
+          candidate_id: "cand_generic_queue_product",
+          objective_type: "small_refactor",
+          component_area: "apps/server",
+          pattern_key: "queue_health_contract",
+          title: "Improve queue health reporting",
+          instruction: "Make the product's durable message queue health easier to inspect.",
+          target_paths: ["apps/server/src/queue.ts"],
+          scope: { read_anywhere: true, write_globs: ["apps/server/src/**"] },
+          confidence: 0.95,
+        },
       ],
     });
 
@@ -1626,6 +2984,10 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(result.results?.[0]?.reason ?? "")).toContain("PushPals-internal");
     expect(result.results?.[1]).toMatchObject({
       candidate_id: "cand_pushpals_runtime",
+      ok: true,
+    });
+    expect(result.results?.[2]).toMatchObject({
+      candidate_id: "cand_generic_queue_product",
       ok: true,
     });
 
@@ -1766,10 +3128,13 @@ describe("server AutonomyStore policy gates", () => {
           }).ok,
         ).toBe(true);
       }
-      const snapshotId = store.createSnapshot({
+      const repairSnapshot = store.createSnapshot({
         sessionId: "s1",
         runId: "run_required_repair",
-      }).snapshot_id;
+      });
+      const snapshotId = repairSnapshot.snapshot_id;
+      const incidentId = String(repairSnapshot.validation_incident?.incident_id ?? "");
+      expect(incidentId).not.toBe("");
       const seeded = store.recordObjectiveDecision({
         runId: "run_required_repair",
         snapshotId,
@@ -1865,9 +3230,35 @@ describe("server AutonomyStore policy gates", () => {
           expected_validation: ["bun test"],
           status: "dispatched",
           required_validation_repair: true,
+          incident_key: incidentId,
+          evidence: { validation_incident: repairSnapshot.validation_incident },
         },
       });
       expect(dispatched.ok).toBe(true);
+      expect(
+        store.authorizesValidationIncidentRepair({
+          objectiveId: "obj_required_repair",
+          incidentId,
+          snapshotId,
+        }),
+      ).toBe(true);
+      expect(
+        store.authorizesValidationIncidentRepair({
+          objectiveId: "obj_required_repair",
+          incidentId: "valid_inc_spoofed",
+          snapshotId,
+        }),
+      ).toBe(false);
+      (store as any).db
+        .prepare("UPDATE autonomy_objectives SET evidence_json = '{}' WHERE id = ?")
+        .run("obj_required_repair");
+      expect(
+        store.authorizesValidationIncidentRepair({
+          objectiveId: "obj_required_repair",
+          incidentId,
+          snapshotId,
+        }),
+      ).toBe(false);
 
       store.updateSafetyState({
         freezeForMs: 60_000,
@@ -3244,6 +4635,646 @@ describe("server AutonomyStore policy gates", () => {
     expect(feedback.ok).toBe(true);
     expect(feedback.success).toBeUndefined();
     expect(autonomyOutcomeCount(store, "obj_merge_conflict_feedback")).toBe(0);
+    expect(store.listInsights().portfolio.reviewRevisionCount).toBe(1);
+  });
+
+  test("does not infer terminal lifecycle state from natural-language verdict text", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_natural_language_feedback",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_natural_language_feedback",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_natural_language_feedback",
+        title: "Keep provider lifecycle classification exact",
+        instruction: "Do not treat prose as an authoritative provider state.",
+        objective_type: "lint_fix",
+        component_area: "src",
+        trigger_type: "test_failure",
+        target_paths: ["src/provider-state.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/provider-state.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["test"],
+        status: "awaiting_review",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const feedback = store.recordPrFeedback({
+      feedbackKey: "natural-language-feedback:not-failed",
+      objectiveId: "obj_natural_language_feedback",
+      patternKey: decision.patternKey,
+      verdict: "not failed; provider review is still open",
+    });
+
+    expect(feedback).toMatchObject({ ok: true });
+    expect(feedback.success).toBeUndefined();
+    expect(autonomyOutcomeCount(store, "obj_natural_language_feedback")).toBe(0);
+    expect(autonomyObjectiveStatus(store, "obj_natural_language_feedback")).toBe("awaiting_review");
+  });
+
+  test("rejects terminal provider feedback without complete persisted job and PR authority", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-feedback-authority-");
+    const queue = new JobQueue(dbPath);
+    try {
+      const prUrl = "https://github.com/example/repo/pull/807";
+      const enqueued = queue.enqueue({
+        taskId: "feedback-authority",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: { origin: "autonomy" },
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(queue.claim("worker-feedback-authority").job?.id).toBe(jobId);
+      expect(queue.complete(jobId, { summary: "published", prUrl }).ok).toBe(true);
+      const snapshotId = store.createSnapshot({
+        sessionId: "dev",
+        runId: "run_feedback_authority",
+      }).snapshot_id;
+      const decision = store.recordObjectiveDecision({
+        runId: "run_feedback_authority",
+        snapshotId,
+        sessionId: "dev",
+        objective: {
+          id: "obj_feedback_authority",
+          title: "Require provider authority",
+          instruction: "Reject incomplete terminal delivery claims.",
+          objective_type: "small_refactor",
+          component_area: "src",
+          trigger_type: "regret_signal",
+          target_paths: ["src/provider.ts"],
+          scope: { read_anywhere: false, write_globs: ["src/provider.ts"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["git diff --check"],
+          status: "awaiting_review",
+          job_id: jobId,
+        },
+      });
+      expect(decision.ok).toBe(true);
+
+      expect(
+        store.recordPrFeedback({
+          feedbackKey: "authority:missing-url",
+          objectiveId: "obj_feedback_authority",
+          jobId,
+          patternKey: decision.patternKey,
+          verdict: "approved_merged",
+        }),
+      ).toMatchObject({ ok: true, ignored: true });
+      expect(
+        store.recordPrFeedback({
+          feedbackKey: "authority:missing-job",
+          objectiveId: "obj_feedback_authority",
+          patternKey: decision.patternKey,
+          prUrl,
+          verdict: "approved_merged",
+        }),
+      ).toMatchObject({ ok: true, ignored: true });
+      expect(autonomyOutcomeCount(store, "obj_feedback_authority")).toBe(0);
+      expect(autonomyObjectiveStatus(store, "obj_feedback_authority")).toBe("awaiting_review");
+      expect(queue.listPersistedPrLinksPage({ limit: 10 })).toHaveLength(1);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("does not reuse a feedback key for a different lifecycle event", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run_feedback_key",
+    }).snapshot_id;
+    const makeDecision = (id: string, path: string) =>
+      store.recordObjectiveDecision({
+        runId: "run_feedback_key",
+        snapshotId,
+        sessionId: "dev",
+        objective: {
+          id,
+          title: `Feedback identity ${id}`,
+          instruction: "Keep feedback identities immutable.",
+          objective_type: "small_refactor",
+          component_area: "src",
+          trigger_type: "regret_signal",
+          target_paths: [path],
+          scope: { read_anywhere: false, write_globs: [path] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["git diff --check"],
+          status: "awaiting_review",
+        },
+      });
+    const first = makeDecision("obj_feedback_key_first", "src/first.ts");
+    const second = makeDecision("obj_feedback_key_second", "src/second.ts");
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "immutable-feedback-key",
+        objectiveId: "obj_feedback_key_first",
+        patternKey: first.patternKey,
+        verdict: "rejected",
+      }).ok,
+    ).toBe(true);
+
+    const conflict = store.recordPrFeedback({
+      feedbackKey: "immutable-feedback-key",
+      objectiveId: "obj_feedback_key_second",
+      patternKey: second.patternKey,
+      verdict: "approved_merged",
+    });
+    expect(conflict).toMatchObject({
+      ok: true,
+      ignored: true,
+      reason: "feedbackKey already belongs to a different PR feedback event",
+    });
+    expect(autonomyOutcomeCount(store, "obj_feedback_key_second")).toBe(0);
+    expect(autonomyObjectiveStatus(store, "obj_feedback_key_second")).toBe("awaiting_review");
+  });
+
+  test("replays terminal lifecycle projection after a crash following feedback persistence", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-feedback-replay-");
+    const queue = new JobQueue(dbPath);
+    try {
+      const prUrl = "https://github.com/example/repo/pull/808";
+      const enqueued = queue.enqueue({
+        taskId: "feedback-replay",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: { origin: "autonomy" },
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(queue.claim("worker-feedback-replay").job?.id).toBe(jobId);
+      expect(queue.complete(jobId, { summary: "published", prUrl }).ok).toBe(true);
+
+      const snapshotId = store.createSnapshot({
+        sessionId: "dev",
+        runId: "run_feedback_replay",
+      }).snapshot_id;
+      const decision = store.recordObjectiveDecision({
+        runId: "run_feedback_replay",
+        snapshotId,
+        sessionId: "dev",
+        objective: {
+          id: "obj_feedback_replay",
+          title: "Recover feedback projection",
+          instruction: "Project the provider-confirmed merge exactly once.",
+          objective_type: "small_refactor",
+          component_area: "src",
+          trigger_type: "queue_health",
+          target_paths: ["src/recovery.ts"],
+          scope: { read_anywhere: false, write_globs: ["src/recovery.ts"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["git diff --check"],
+          status: "awaiting_review",
+          job_id: jobId,
+        },
+      });
+      expect(decision.ok).toBe(true);
+
+      const feedbackKey = "provider:feedback-replay:merged";
+      const db = (store as unknown as { db: any }).db;
+      db.prepare(
+        `INSERT INTO autonomy_pr_feedback (
+           feedback_key, objective_id, job_id, pattern_key, pr_number, pr_url,
+           pr_url_normalized, verdict, source, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'review_agent', ?)`,
+      ).run(
+        feedbackKey,
+        "obj_feedback_replay",
+        jobId,
+        decision.patternKey,
+        808,
+        prUrl,
+        prUrl,
+        "approved_merged",
+        new Date().toISOString(),
+      );
+
+      const replay = store.recordPrFeedback({
+        feedbackKey,
+        objectiveId: "obj_feedback_replay",
+        jobId,
+        patternKey: decision.patternKey,
+        prNumber: 808,
+        prUrl,
+        verdict: "approved_merged",
+      });
+      expect(replay).toMatchObject({ ok: true, deduped: true, success: true });
+      expect(autonomyObjectiveStatus(store, "obj_feedback_replay")).toBe("completed");
+      expect(autonomyOutcomeCount(store, "obj_feedback_replay")).toBe(1);
+      expect(queue.listPersistedPrLinksPage({ limit: 10 })).toHaveLength(0);
+
+      expect(
+        store.recordPrFeedback({
+          feedbackKey,
+          objectiveId: "obj_feedback_replay",
+          jobId,
+          patternKey: decision.patternKey,
+          prNumber: 808,
+          prUrl,
+          verdict: "approved_merged",
+        }).ok,
+      ).toBe(true);
+      expect(autonomyOutcomeCount(store, "obj_feedback_replay")).toBe(1);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("rolls back a partial terminal outcome projection and replays it atomically", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-outcome-atomic-");
+    const queue = new JobQueue(dbPath);
+    try {
+      const prUrl = "https://github.com/example/repo/pull/809";
+      const enqueued = queue.enqueue({
+        taskId: "outcome-atomic",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: { origin: "autonomy" },
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(queue.claim("worker-outcome-atomic").job?.id).toBe(jobId);
+      expect(queue.complete(jobId, { summary: "published", prUrl }).ok).toBe(true);
+      const snapshotId = store.createSnapshot({
+        sessionId: "dev",
+        runId: "run_outcome_atomic",
+      }).snapshot_id;
+      const decision = store.recordObjectiveDecision({
+        runId: "run_outcome_atomic",
+        snapshotId,
+        sessionId: "dev",
+        objective: {
+          id: "obj_outcome_atomic",
+          title: "Keep terminal projection atomic",
+          instruction: "Commit terminal delivery state and learning together.",
+          objective_type: "small_refactor",
+          component_area: "src",
+          trigger_type: "regret_signal",
+          target_paths: ["src/delivery.ts"],
+          scope: { read_anywhere: false, write_globs: ["src/delivery.ts"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["git diff --check"],
+          status: "awaiting_review",
+          job_id: jobId,
+        },
+      });
+      expect(decision.ok).toBe(true);
+      const db = (store as unknown as { db: any }).db;
+      db.exec(`
+        CREATE TEMP TRIGGER fail_outcome_projection
+        BEFORE UPDATE OF status ON autonomy_objectives
+        WHEN NEW.id = 'obj_outcome_atomic' AND NEW.status = 'completed'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected projection crash');
+        END;
+      `);
+      const feedback = {
+        feedbackKey: "provider:outcome-atomic:merged",
+        objectiveId: "obj_outcome_atomic",
+        jobId,
+        patternKey: decision.patternKey,
+        prNumber: 809,
+        prUrl,
+        verdict: "approved_merged",
+      };
+
+      expect(() => store.recordPrFeedback(feedback)).toThrow("injected projection crash");
+      expect(autonomyOutcomeCount(store, "obj_outcome_atomic")).toBe(0);
+      expect(autonomyObjectiveStatus(store, "obj_outcome_atomic")).toBe("awaiting_review");
+      expect(autonomyPatternSampleCount(store, decision.patternKey ?? "")).toBe(0);
+      expect(queue.listPersistedPrLinksPage({ limit: 10 })).toHaveLength(1);
+      expect(
+        (
+          db
+            .prepare(`SELECT COUNT(*) AS count FROM autonomy_pr_feedback WHERE feedback_key = ?`)
+            .get(feedback.feedbackKey) as { count: number }
+        ).count,
+      ).toBe(1);
+
+      db.exec(`DROP TRIGGER fail_outcome_projection;`);
+      expect(store.recordPrFeedback(feedback)).toMatchObject({
+        ok: true,
+        deduped: true,
+        success: true,
+      });
+      expect(autonomyOutcomeCount(store, "obj_outcome_atomic")).toBe(1);
+      expect(autonomyObjectiveStatus(store, "obj_outcome_atomic")).toBe("completed");
+      expect(autonomyPatternSampleCount(store, decision.patternKey ?? "")).toBe(1);
+      expect(queue.listPersistedPrLinksPage({ limit: 10 })).toHaveLength(0);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("counts one merged objective once across sibling jobs for the same PR", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-sibling-merge-");
+    const queue = new JobQueue(dbPath);
+    try {
+      const prUrl = "https://github.com/example/repo/pull/810";
+      const jobIds: string[] = [];
+      for (let index = 0; index < 2; index += 1) {
+        const enqueued = queue.enqueue({
+          taskId: `sibling-merge-${index}`,
+          sessionId: "dev",
+          kind: "task.execute",
+          params: { origin: "autonomy" },
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        jobIds.push(jobId);
+        expect(queue.claim(`worker-sibling-merge-${index}`).job?.id).toBe(jobId);
+        expect(queue.complete(jobId, { summary: "published", prUrl }).ok).toBe(true);
+      }
+      const snapshotId = store.createSnapshot({
+        sessionId: "dev",
+        runId: "run_sibling_merge",
+      }).snapshot_id;
+      const decision = store.recordObjectiveDecision({
+        runId: "run_sibling_merge",
+        snapshotId,
+        sessionId: "dev",
+        objective: {
+          id: "obj_sibling_merge",
+          title: "Count one delivered PR once",
+          instruction: "Deduplicate provider confirmation across sibling jobs.",
+          objective_type: "small_refactor",
+          component_area: "src",
+          trigger_type: "regret_signal",
+          target_paths: ["src/count-once.ts"],
+          scope: { read_anywhere: false, write_globs: ["src/count-once.ts"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["git diff --check"],
+          status: "awaiting_review",
+          job_id: jobIds[0],
+        },
+      });
+      expect(decision.ok).toBe(true);
+
+      for (let index = 0; index < jobIds.length; index += 1) {
+        expect(
+          store.recordPrFeedback({
+            feedbackKey: `sibling-merge:${index}`,
+            objectiveId: "obj_sibling_merge",
+            jobId: jobIds[index],
+            patternKey: decision.patternKey,
+            prUrl,
+            verdict: "approved_merged",
+          }).ok,
+        ).toBe(true);
+      }
+
+      expect(autonomyOutcomeCount(store, "obj_sibling_merge")).toBe(1);
+      expect(autonomyPatternSampleCount(store, decision.patternKey ?? "")).toBe(1);
+      expect(autonomyObjectiveStatus(store, "obj_sibling_merge")).toBe("completed");
+      expect(queue.listPersistedPrLinksPage({ limit: 10 })).toHaveLength(0);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("PR publication remains pending until an authoritative merge outcome", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_pr_delivery_lifecycle",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run_pr_delivery_lifecycle",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_pr_delivery_lifecycle",
+        title: "Improve repository behavior",
+        instruction: "Implement and validate one behavior improvement.",
+        objective_type: "feature_small",
+        component_area: "src/search",
+        trigger_type: "queue_health",
+        target_paths: ["src/search/rank.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/search/rank.ts"] },
+        confidence: 0.92,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        status: "running",
+        job_id: "job_pr_delivery_lifecycle",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    store.markObjectiveAwaitingReviewByJobId("job_pr_delivery_lifecycle");
+    const lifecycleDb = (store as unknown as { db: any }).db;
+    const awaitingReviewSince = (
+      lifecycleDb
+        .prepare(`SELECT awaiting_review_since AS value FROM autonomy_objectives WHERE id = ?`)
+        .get("obj_pr_delivery_lifecycle") as { value: string | null }
+    ).value;
+    expect(awaitingReviewSince).toEqual(expect.any(String));
+    expect(
+      store.recordOutcome({
+        objectiveId: "obj_pr_delivery_lifecycle",
+        jobId: "job_pr_delivery_lifecycle",
+        patternKey: decision.patternKey,
+        success: true,
+        userAction: "published",
+        terminal: false,
+      }).ok,
+    ).toBe(true);
+    expect(autonomyObjectiveStatus(store, "obj_pr_delivery_lifecycle")).toBe("awaiting_review");
+    expect(
+      (store as unknown as { activeObjectiveCount: () => number }).activeObjectiveCount(),
+    ).toBe(0);
+    const whileReviewing = store.evaluateEligibility({
+      runId: "run_pr_delivery_lifecycle",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_unrelated_while_reviewing",
+          objective_type: "feature_small",
+          component_area: "src/imports",
+          pattern_key: "feature_small::src/imports::health",
+          target_paths: ["src/imports/parse.ts"],
+          confidence: 0.9,
+        },
+        {
+          candidate_id: "cand_duplicate_while_reviewing",
+          objective_type: "type_fix",
+          component_area: "src/search",
+          pattern_key: "type_fix::src/search::typecheck_failure",
+          target_paths: ["src/search/rank.ts"],
+          confidence: 0.9,
+        },
+      ],
+      applySequentialAccounting: false,
+    });
+    expect(whileReviewing.results?.[0]).toEqual({
+      candidate_id: "cand_unrelated_while_reviewing",
+      ok: true,
+    });
+    expect(whileReviewing.results?.[1]?.ok).toBe(false);
+    expect(String(whileReviewing.results?.[1]?.reason ?? "")).toContain(
+      "target path already has active objective",
+    );
+    expect(runEvaluatorNow(store).sampleCount).toBe(0);
+    expect(autonomyPatternSampleCount(store, decision.patternKey ?? "")).toBe(0);
+
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "pr-delivery:revision-1",
+        objectiveId: "obj_pr_delivery_lifecycle",
+        jobId: "job_pr_delivery_lifecycle",
+        patternKey: decision.patternKey,
+        verdict: "rejected",
+      }).ok,
+    ).toBe(true);
+    expect(autonomyObjectiveStatus(store, "obj_pr_delivery_lifecycle")).toBe("awaiting_review");
+    expect(
+      (
+        lifecycleDb
+          .prepare(`SELECT awaiting_review_since AS value FROM autonomy_objectives WHERE id = ?`)
+          .get("obj_pr_delivery_lifecycle") as { value: string | null }
+      ).value,
+    ).toBe(awaitingReviewSince);
+    expect(runEvaluatorNow(store).sampleCount).toBe(0);
+
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "pr-delivery:merged",
+        objectiveId: "obj_pr_delivery_lifecycle",
+        jobId: "job_pr_delivery_lifecycle",
+        patternKey: decision.patternKey,
+        verdict: "approved_merged",
+      }).ok,
+    ).toBe(true);
+    expect(autonomyObjectiveStatus(store, "obj_pr_delivery_lifecycle")).toBe("completed");
+    expect(runEvaluatorNow(store).sampleCount).toBe(1);
+    expect(autonomyPatternSampleCount(store, decision.patternKey ?? "")).toBe(1);
+
+    store.markObjectiveAwaitingReviewByJobId("job_pr_delivery_lifecycle");
+    expect(autonomyObjectiveStatus(store, "obj_pr_delivery_lifecycle")).toBe("completed");
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "pr-delivery:late-close",
+        objectiveId: "obj_pr_delivery_lifecycle",
+        jobId: "job_pr_delivery_lifecycle",
+        patternKey: decision.patternKey,
+        verdict: "closed_unmerged",
+      }).ok,
+    ).toBe(true);
+    expect(autonomyObjectiveStatus(store, "obj_pr_delivery_lifecycle")).toBe("completed");
+    expect(runEvaluatorNow(store).sampleCount).toBe(1);
+  });
+
+  test("portfolio insights retain vision provenance and review quality outcomes", () => {
+    const store = makeStore();
+    const runId = "run_portfolio_insights";
+    const snapshotId = store.createSnapshot({ sessionId: "s1", runId }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId,
+      snapshotId,
+      sessionId: "s1",
+      candidates: [
+        {
+          id: "cand_portfolio_insights",
+          title: "Improve import recovery",
+          objective_type: "feature_small",
+          problem_statement: "Make interrupted imports recover predictably.",
+          trigger_type: "queue_health",
+          component_area: "src/imports",
+          target_paths: ["src/imports/recover.ts"],
+          scope: { read_anywhere: false, write_globs: ["src/imports/recover.ts"] },
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          estimated_effort: "small",
+          why_now_signal_ids: ["sig_queue"],
+          confidence: 0.9,
+          work_kind: "product_behavior",
+          work_area_key: "src/imports",
+          work_target_key: "src/imports/recover.ts",
+          vision_objective_id: "reliable-import-recovery",
+          vision_objective_weight: 0.91,
+          vision_priority_rank: 1,
+          vision_source_bucket: "priorities",
+          vision_category: "product_core",
+          vision_alignment_reason: "Directly advances the top repository priority.",
+          vision_section_refs: ["3"],
+          feature_hypotheses: ["Interrupted imports resume without duplicate writes."],
+        },
+      ],
+      objective: {
+        id: "obj_portfolio_insights",
+        candidate_id: "cand_portfolio_insights",
+        title: "Improve import recovery",
+        instruction: "Implement one bounded import recovery improvement.",
+        objective_type: "feature_small",
+        component_area: "src/imports",
+        trigger_type: "queue_health",
+        target_paths: ["src/imports/recover.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/imports/recover.ts"] },
+        confidence: 0.9,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        status: "running",
+        job_id: "job_portfolio_insights",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    store.markObjectiveAwaitingReviewByJobId("job_portfolio_insights");
+    expect(
+      store.recordOutcome({
+        objectiveId: "obj_portfolio_insights",
+        jobId: "job_portfolio_insights",
+        patternKey: decision.patternKey,
+        success: true,
+        userAction: "published",
+        terminal: false,
+      }).ok,
+    ).toBe(true);
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "portfolio:revision",
+        objectiveId: "obj_portfolio_insights",
+        jobId: "job_portfolio_insights",
+        patternKey: decision.patternKey,
+        verdict: "rejected",
+      }).ok,
+    ).toBe(true);
+
+    const pending = store.listInsights();
+    expect(pending.portfolio).toMatchObject({
+      objectiveCount: 1,
+      visionAlignedObjectiveCount: 1,
+      userObservableObjectiveCount: 1,
+      uniqueVisionObjectiveCount: 1,
+      awaitingReviewCount: 1,
+      mergedObjectiveCount: 0,
+      reviewRevisionCount: 1,
+      firstPassMergeRate: null,
+    });
+
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "portfolio:merged",
+        objectiveId: "obj_portfolio_insights",
+        jobId: "job_portfolio_insights",
+        patternKey: decision.patternKey,
+        verdict: "approved_merged",
+      }).ok,
+    ).toBe(true);
+    expect(store.listInsights().portfolio).toMatchObject({
+      awaitingReviewCount: 0,
+      mergedObjectiveCount: 1,
+      reviewRevisionCount: 1,
+      firstPassMergeRate: 0,
+    });
   });
 
   test("evaluator excludes iterative PR revisions until a terminal objective outcome", () => {
@@ -3294,7 +5325,7 @@ describe("server AutonomyStore policy gates", () => {
     expect(rejectedCard.successRate).toBeNull();
     expect(rejectedCard.regretRate).toBeNull();
     expect(rejectedCard.recommendation).toBe("constrain");
-    expect(autonomyObjectiveStatus(store, "obj_review_loop")).toBe("dispatched");
+    expect(autonomyObjectiveStatus(store, "obj_review_loop")).toBe("awaiting_review");
     expect(autonomyPatternSampleCount(store, decision.patternKey)).toBe(0);
     expect(store.getReliabilityMetrics()).toMatchObject({
       objectiveTerminalCount: 0,
@@ -3349,6 +5380,95 @@ describe("server AutonomyStore policy gates", () => {
       objectiveRevisionRate: 1,
       objectiveFirstPassRate: 0,
     });
+  });
+
+  test("review revision rate uses the resolved PR cohort, not unresolved revision work", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-review-cohort-");
+    const queue = new JobQueue(dbPath);
+    const internal = store as unknown as {
+      config: { remotebuddy: { autonomy: { evaluatorMinSamples: number } } };
+    };
+    const originalEvaluatorMinSamples = internal.config.remotebuddy.autonomy.evaluatorMinSamples;
+    try {
+      internal.config.remotebuddy.autonomy.evaluatorMinSamples = 1;
+      const snapshotId = store.createSnapshot({
+        sessionId: "dev",
+        runId: "run_review_cohort",
+      }).snapshot_id;
+
+      const createPublishedObjective = (index: number) => {
+        const prUrl = `https://github.com/example/repo/pull/${900 + index}`;
+        const enqueued = queue.enqueue({
+          taskId: `review-cohort-${index}`,
+          sessionId: "dev",
+          kind: "task.execute",
+          params: { origin: "autonomy" },
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        expect(queue.claim(`worker-review-cohort-${index}`).job?.id).toBe(jobId);
+        expect(queue.complete(jobId, { summary: "published", prUrl }).ok).toBe(true);
+        const objectiveId = `obj_review_cohort_${index}`;
+        const decision = store.recordObjectiveDecision({
+          runId: "run_review_cohort",
+          snapshotId,
+          sessionId: "dev",
+          objective: {
+            id: objectiveId,
+            title: `Review cohort objective ${index}`,
+            instruction: "Validate review delivery cohort accounting.",
+            objective_type: "small_refactor",
+            component_area: `src/area-${index}`,
+            trigger_type: "queue_health",
+            target_paths: [`src/area-${index}/index.ts`],
+            scope: {
+              read_anywhere: false,
+              write_globs: [`src/area-${index}/index.ts`],
+            },
+            confidence: 0.9,
+            risk_level: "low",
+            expected_validation: ["npm test"],
+            status: "awaiting_review",
+            job_id: jobId,
+          },
+        });
+        expect(decision.ok).toBe(true);
+        return { objectiveId, jobId, prUrl, patternKey: decision.patternKey };
+      };
+
+      const merged = createPublishedObjective(0);
+      expect(
+        store.recordPrFeedback({
+          feedbackKey: "review-cohort:merged",
+          objectiveId: merged.objectiveId,
+          jobId: merged.jobId,
+          patternKey: merged.patternKey,
+          prUrl: merged.prUrl,
+          verdict: "approved_merged",
+        }).ok,
+      ).toBe(true);
+
+      for (let index = 1; index <= 3; index += 1) {
+        const unresolved = createPublishedObjective(index);
+        expect(
+          store.recordPrFeedback({
+            feedbackKey: `review-cohort:revision:${index}`,
+            objectiveId: unresolved.objectiveId,
+            jobId: unresolved.jobId,
+            patternKey: unresolved.patternKey,
+            prUrl: unresolved.prUrl,
+            verdict: "rejected",
+          }).ok,
+        ).toBe(true);
+      }
+
+      const card = runEvaluatorNow(store);
+      expect(card.reviewResolvedCount).toBe(1);
+      expect(card.reviewRevisionRate).toBe(0);
+      expect(card.recommendation).toBe("healthy");
+    } finally {
+      internal.config.remotebuddy.autonomy.evaluatorMinSamples = originalEvaluatorMinSamples;
+      queue.close();
+    }
   });
 
   test("evaluator selects the chronologically latest outcome after replayed backfills", () => {
@@ -3555,6 +5675,84 @@ describe("server AutonomyStore policy gates", () => {
     const withNewEvidence = internal.runEvaluator(new Date(firstAtMs + 62_000).toISOString());
     expect(withNewEvidence.recommendation).toBe("pause");
     expect(store.getSafetyState().isFrozen).toBe(true);
+  });
+
+  test("does not re-arm an expired review-backlog freeze as wall-clock age increases", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-review-freeze-");
+    const queue = new JobQueue(dbPath);
+    try {
+      const internal = store as unknown as {
+        config: {
+          remotebuddy: {
+            autonomy: {
+              autoFreezeDurationMs: number;
+            };
+          };
+        };
+        runEvaluator: (nowIso?: string) => AutonomyEvaluatorScorecard;
+      };
+      internal.config.remotebuddy.autonomy.autoFreezeDurationMs = 60_000;
+
+      const enqueued = queue.enqueue({
+        taskId: "review-freeze-health",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: { origin: "autonomy" },
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(queue.claim("worker-review-freeze").job?.id).toBe(jobId);
+      expect(queue.complete(jobId, { summary: "published" }).ok).toBe(true);
+
+      const snapshotId = store.createSnapshot({
+        sessionId: "dev",
+        runId: "run_review_freeze",
+      }).snapshot_id;
+      for (let index = 0; index < 5; index += 1) {
+        expect(
+          store.recordObjectiveDecision({
+            runId: "run_review_freeze",
+            snapshotId,
+            sessionId: "dev",
+            objective: {
+              id: `obj_review_freeze_${index}`,
+              title: `Review backlog item ${index}`,
+              instruction: "Keep the published change pending until provider reconciliation.",
+              objective_type: "docs",
+              component_area: "docs",
+              trigger_type: "queue_health",
+              target_paths: [`docs/review-${index}.md`],
+              scope: { read_anywhere: false, write_globs: [`docs/review-${index}.md`] },
+              confidence: 0.9,
+              risk_level: "low",
+              expected_validation: ["git diff --check"],
+              status: "awaiting_review",
+            },
+          }).ok,
+        ).toBe(true);
+      }
+
+      const firstAtMs = Date.now() + 1_000;
+      const db = (store as unknown as { db: any }).db;
+      db.prepare(
+        `UPDATE autonomy_objectives
+         SET updated_at = ?, awaiting_review_since = ?
+         WHERE id LIKE 'obj_review_freeze_%'`,
+      ).run(
+        new Date(firstAtMs - 25 * 60 * 60 * 1_000).toISOString(),
+        new Date(firstAtMs - 25 * 60 * 60 * 1_000).toISOString(),
+      );
+
+      const first = internal.runEvaluator(new Date(firstAtMs).toISOString());
+      expect(first.recommendation).toBe("pause");
+      expect(store.getSafetyState(new Date(firstAtMs).toISOString()).isFrozen).toBe(true);
+
+      const afterExpiry = new Date(firstAtMs + 61_000).toISOString();
+      const unchanged = internal.runEvaluator(afterExpiry);
+      expect(unchanged.recommendation).toBe("constrain");
+      expect(store.getSafetyState(afterExpiry).isFrozen).toBe(false);
+    } finally {
+      queue.close();
+    }
   });
 
   test("evaluator pauses degraded end-to-end job health and preserves null latency", () => {
@@ -3962,10 +6160,33 @@ describe("server AutonomyStore policy gates", () => {
       },
     });
     expect(decision.ok).toBe(true);
+    const reviewDecision = store.recordObjectiveDecision({
+      runId: "run_stale_sweep",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_stale_review",
+        title: "Published objective under provider review",
+        instruction: "Keep provider review state pending until reconciled.",
+        objective_type: "docs",
+        component_area: "docs",
+        trigger_type: "queue_health",
+        target_paths: ["docs/guide.md"],
+        scope: { read_anywhere: false, write_globs: ["docs/guide.md"] },
+        confidence: 0.92,
+        risk_level: "low",
+        expected_validation: ["git diff --check"],
+        status: "awaiting_review",
+      },
+    });
+    expect(reviewDecision.ok).toBe(true);
     const db = (store as unknown as { db: any }).db;
     db.prepare(
       `UPDATE autonomy_objectives SET updated_at = datetime('now', '-5 hours') WHERE id = ?`,
     ).run("obj_stale_sweep");
+    db.prepare(
+      `UPDATE autonomy_objectives SET updated_at = datetime('now', '-3 days') WHERE id = ?`,
+    ).run("obj_stale_review");
 
     const sweep = store.maybeSweepStaleObjectives(new Date(Date.now() + 120_000).toISOString());
     expect(sweep.ok).toBe(true);
@@ -3975,6 +6196,7 @@ describe("server AutonomyStore policy gates", () => {
       .get("obj_stale_sweep") as { status: string; block_reason: string | null };
     expect(objectiveRow.status).toBe("dead_letter");
     expect(objectiveRow.block_reason).toBe("stale_objective_timeout");
+    expect(autonomyObjectiveStatus(store, "obj_stale_review")).toBe("awaiting_review");
   });
 
   test("restart recovery sweep closes stale blocked objective + question without orphans", () => {

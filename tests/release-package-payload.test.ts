@@ -74,10 +74,17 @@ describe("release package payload verification", () => {
         "runtime/sandbox/apps/workerpals/src/common/generic_python_executor.ts",
         "runtime/sandbox/apps/workerpals/src/backends/openai_codex/openai_codex_executor.py",
         "runtime/sandbox/packages/shared/src/index.ts",
+        "runtime/sandbox/packages/shared/src/memory.ts",
+        "runtime/sandbox/packages/shared/src/repo_validation.ts",
+        "runtime/sandbox/packages/shared/src/repository_agent.ts",
+        "runtime/sandbox/packages/shared/src/repository_identity.ts",
+        "runtime/sandbox/packages/shared/src/repository_snapshot.ts",
         "runtime/sandbox/packages/shared/src/tooling.ts",
         "runtime/sandbox/packages/protocol/package.json",
         "runtime/sandbox/packages/protocol/src/index.ts",
         "runtime/sandbox/packages/protocol/src/schemas/envelope.schema.json",
+        "runtime/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
+        "runtime/sandbox/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
       ]),
     );
   });
@@ -207,6 +214,28 @@ describe("release package payload verification", () => {
     expect(issues.every((issue) => issue.reason === "required CLI package entry is missing")).toBe(
       true,
     );
+  });
+
+  test("rejects packages missing RepositoryAgent shared code or its isolated prompt", () => {
+    const repositoryAgentRuntimePaths = [
+      "runtime/sandbox/packages/shared/src/memory.ts",
+      "runtime/sandbox/packages/shared/src/repository_agent.ts",
+      "runtime/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
+      "runtime/sandbox/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
+    ];
+
+    for (const missingPath of repositoryAgentRuntimePaths) {
+      const issues = findDisallowedCliPackageEntries(
+        requiredCliPackageFiles().filter((file) => file.path !== missingPath),
+      );
+
+      expect(issues).toEqual([
+        {
+          path: missingPath,
+          reason: "required CLI package entry is missing",
+        },
+      ]);
+    }
   });
 
   test("release artifact guard allows only PushPals release assets", () => {

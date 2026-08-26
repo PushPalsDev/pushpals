@@ -1304,9 +1304,31 @@ export function relaxAdvisoryQualityIssues(
   return relaxed;
 }
 
+export function normalizeReviewBranchPrefix(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value
+    .trim()
+    .replace(/^refs\/heads\//, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+/, "");
+  if (
+    !normalized ||
+    /[~^:?*\[\]\s]/.test(normalized) ||
+    normalized.includes("..") ||
+    normalized.includes("@{") ||
+    normalized.endsWith(".") ||
+    normalized.endsWith(".lock")
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
 export function resolveReviewFixCompletionBranch(
   value: unknown,
   fallbackBranch: string,
+  allowedBranchPrefix = "agent/",
 ): { branch: string; overridden: boolean } {
   if (typeof value !== "string") {
     return { branch: fallbackBranch, overridden: false };
@@ -1318,7 +1340,10 @@ export function resolveReviewFixCompletionBranch(
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/^\/+|\/+$/g, "");
-  if (!normalized.startsWith("agent/")) return { branch: fallbackBranch, overridden: false };
+  const normalizedPrefix = normalizeReviewBranchPrefix(allowedBranchPrefix);
+  if (!normalizedPrefix || !normalized.startsWith(normalizedPrefix)) {
+    return { branch: fallbackBranch, overridden: false };
+  }
   if (
     normalized.includes("..") ||
     normalized.includes("@{") ||
@@ -1329,6 +1354,34 @@ export function resolveReviewFixCompletionBranch(
   }
   if (/[~^:?*\[\]\s]/.test(normalized)) return { branch: fallbackBranch, overridden: false };
   return { branch: normalized, overridden: true };
+}
+
+export function resolveJobCompletionBranch(
+  params: Record<string, unknown> | null | undefined,
+  fallbackBranch: string,
+  runtimeBranchPrefix: unknown,
+): { branch: string; overridden: boolean } {
+  const runtimePrefix = normalizeReviewBranchPrefix(runtimeBranchPrefix) ?? "agent/";
+  const reviewAgent =
+    params?.reviewAgent &&
+    typeof params.reviewAgent === "object" &&
+    !Array.isArray(params.reviewAgent)
+      ? (params.reviewAgent as Record<string, unknown>)
+      : null;
+  const resolutionType = String(reviewAgent?.resolutionType ?? "")
+    .trim()
+    .toLowerCase();
+  const isScmReviewJob =
+    (resolutionType === "review_fix" || resolutionType === "merge_conflict") &&
+    typeof reviewAgent?.prHeadRef === "string";
+  const allowedPrefix = isScmReviewJob
+    ? (normalizeReviewBranchPrefix(reviewAgent?.branchPrefix) ?? runtimePrefix)
+    : runtimePrefix;
+  return resolveReviewFixCompletionBranch(
+    params?.completionBranch ?? reviewAgent?.prHeadRef,
+    fallbackBranch,
+    allowedPrefix,
+  );
 }
 
 export function resolveReviewNoChangeCompletionBranch(
@@ -1343,7 +1396,11 @@ export function resolveReviewNoChangeCompletionBranch(
       : null;
   const reviewAgentHeadRef = reviewAgent?.prHeadRef;
   const candidate = params.completionBranch ?? reviewAgentHeadRef;
-  const resolved = resolveReviewFixCompletionBranch(candidate, "");
+  const resolved = resolveReviewFixCompletionBranch(
+    candidate,
+    "",
+    normalizeReviewBranchPrefix(reviewAgent?.branchPrefix) ?? "agent/",
+  );
   return resolved.overridden ? resolved.branch : null;
 }
 
@@ -7587,16 +7644,13 @@ export async function createJobCommit(
   },
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
 ): Promise<CreateJobCommitResult> {
-  const defaultPublicBranchName = `agent/${workerId}/${job.id}`;
-  const reviewAgentHeadRef =
-    job.params?.reviewAgent &&
-    typeof job.params.reviewAgent === "object" &&
-    !Array.isArray(job.params.reviewAgent)
-      ? (job.params.reviewAgent as Record<string, unknown>).prHeadRef
-      : undefined;
-  const resolvedPublicBranch = resolveReviewFixCompletionBranch(
-    job.params?.completionBranch ?? reviewAgentHeadRef,
+  const configuredBranchPrefix =
+    normalizeReviewBranchPrefix(runtimeConfig.sourceControlManager.branchPrefix) ?? "agent/";
+  const defaultPublicBranchName = `${configuredBranchPrefix}${workerId}/${job.id}`;
+  const resolvedPublicBranch = resolveJobCompletionBranch(
+    job.params,
     defaultPublicBranchName,
+    configuredBranchPrefix,
   );
   const publicBranchName = resolvedPublicBranch.branch;
   const reviewFixContext = extractReviewFixContext(job.params ?? null);

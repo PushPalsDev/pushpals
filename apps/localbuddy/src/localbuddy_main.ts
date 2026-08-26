@@ -15,12 +15,14 @@ import { randomUUID } from "crypto";
 import {
   buildLocalCorsHeaders,
   CommunicationManager,
+  createRepositoryAgentServiceClients,
   detectRepoRoot,
   fetchBufferedWithHardDeadline,
   isLoopbackOrigin,
   loadPromptTemplate,
   loadPushPalsConfig,
   resolveLocalServerConnection,
+  type RepositoryAgentServiceClients,
 } from "shared";
 import { createLLMClient, preflightServiceLlm, type LLMClient } from "../../remotebuddy/src/llm.js";
 import {
@@ -414,13 +416,20 @@ class LocalBuddyServer {
   private repo: string;
   private authToken: string | null;
   private llm: LLMClient;
+  private readonly repositoryServices: RepositoryAgentServiceClients;
   private readonly recentJobFailures: Array<{ jobId: string; summary: string; ts: string }> = [];
   private readonly seenJobFailureKeys = new Set<string>();
 
-  constructor(opts: { server: string; sessionId: string; authToken: string | null }) {
+  constructor(opts: {
+    server: string;
+    sessionId: string;
+    authToken: string | null;
+    repositoryServices: RepositoryAgentServiceClients;
+  }) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
+    this.repositoryServices = opts.repositoryServices;
 
     // Detect repo root from current working directory
     this.repo = detectRepoRoot(process.cwd());
@@ -773,6 +782,7 @@ class LocalBuddyServer {
       } catch {
         // ignore shutdown errors
       }
+      void this.repositoryServices.close().catch(() => {});
     };
     process.once("SIGINT", stopMonitor);
     process.once("SIGTERM", stopMonitor);
@@ -1132,14 +1142,29 @@ async function main() {
   const sessionId = await connectWithRetry(opts.server, opts.sessionId);
   console.log(`[LocalBuddy] Using session: ${sessionId}`);
 
+  const repositoryServices = createRepositoryAgentServiceClients({
+    serverUrl: opts.server,
+    callerService: "localbuddy",
+    callerInstanceId: "localbuddy-1",
+    authToken: opts.authToken,
+    requestTimeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+    memoryTimeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+  });
+
   // Start LocalBuddy HTTP server
   const agent = new LocalBuddyServer({
     server: opts.server,
     sessionId,
     authToken: opts.authToken,
+    repositoryServices,
   });
 
-  await agent.startServer(opts.port);
+  try {
+    await agent.startServer(opts.port);
+  } catch (error) {
+    await repositoryServices.close();
+    throw error;
+  }
 }
 
 main().catch((err) => {

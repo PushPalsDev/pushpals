@@ -6,6 +6,9 @@ import { existsSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
 
 // packages/shared/src/bounded_process.ts
+function abortReason(signal) {
+  return signal.reason instanceof Error ? signal.reason : new DOMException("The subprocess was aborted", "AbortError");
+}
 var DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 var DEFAULT_DRAIN_TIMEOUT_MS = 2000;
 var DEFAULT_TERMINATION_TIMEOUT_MS = 5000;
@@ -253,6 +256,8 @@ async function terminateProcessTree(proc, options = {}) {
   await settleWithin(proc.exited, exitGraceMs);
 }
 async function runBoundedProcess(argv, options) {
+  if (options.signal?.aborted)
+    throw abortReason(options.signal);
   const spawn = options.spawn ?? defaultSpawner;
   const platform = options.platform ?? process.platform;
   const proc = spawn(argv, {
@@ -278,8 +283,27 @@ async function runBoundedProcess(argv, options) {
   let effectiveTimeoutMs = timeoutMs;
   let deadlineAtMs = startedAtMs + timeoutMs;
   let timer = null;
+  let removeAbortListener = () => {
+    return;
+  };
+  const aborted = new Promise((resolve) => {
+    const onAbort = () => resolve({
+      timedOut: false,
+      aborted: true,
+      exitCode: 130,
+      reason: abortReason(options.signal)
+    });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+    if (options.signal?.aborted)
+      onAbort();
+  });
   const outcome = await Promise.race([
-    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    proc.exited.then((exitCode) => ({
+      timedOut: false,
+      aborted: false,
+      exitCode
+    })),
     new Promise((resolve) => {
       const scheduleDeadline = () => {
         timer = setTimeout(() => {
@@ -307,22 +331,24 @@ async function runBoundedProcess(argv, options) {
           try {
             options.onTimeout?.(Math.max(1, nowMs - startedAtMs));
           } catch {}
-          resolve({ timedOut: true, exitCode: 124 });
+          resolve({ timedOut: true, aborted: false, exitCode: 124 });
         }, Math.max(1, deadlineAtMs - Date.now()));
       };
       scheduleDeadline();
-    })
+    }),
+    ...options.signal ? [aborted] : []
   ]);
   if (timer)
     clearTimeout(timer);
+  removeAbortListener();
   const terminate = options.terminate ?? ((target) => terminateProcessTree(target, { platform, spawn }));
-  if (outcome.timedOut)
+  if (outcome.timedOut || outcome.aborted)
     await terminate(proc);
   const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
   let streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), drainTimeoutMs);
   const drainTimedOut = !streams.settled;
   if (!streams.settled) {
-    if (!outcome.timedOut) {
+    if (!outcome.timedOut && !outcome.aborted) {
       if (options.terminate) {
         await options.terminate(proc);
       } else {
@@ -341,6 +367,8 @@ async function runBoundedProcess(argv, options) {
   const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
   const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
   const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
+  if (outcome.aborted)
+    throw outcome.reason;
   return {
     stdout: trimOutput(stdout),
     stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
@@ -408,6 +436,14 @@ function detectRepoRoot(startDir) {
   console.warn(`[repo] No .git directory found, using: ${startDir}`);
   return startDir;
 }
+// packages/shared/src/repository_snapshot.ts
+var DEFAULT_DIFF_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
+var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
+var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
+var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
+// packages/shared/src/memory.ts
+import { createHash, randomUUID } from "crypto";
+
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
 async function fetchWithHardDeadline(options) {
@@ -520,6 +556,1358 @@ async function fetchBufferedWithHardDeadline(options) {
   });
 }
 
+// packages/shared/src/memory.ts
+var MEMORY_REINFORCEMENT_OUTCOMES = Object.freeze([
+  "confirmed",
+  "successful",
+  "failed",
+  "contradicted"
+]);
+var MEMORY_LIMITS = Object.freeze({
+  namespaceChars: 128,
+  repositoryIdChars: 256,
+  sessionIdChars: 256,
+  keyChars: 512,
+  kindChars: 128,
+  subjectKeyChars: 512,
+  summaryChars: 16000,
+  listItems: 128,
+  listItemChars: 256,
+  tagChars: 128,
+  evidenceItems: 128,
+  evidencePathChars: 1000,
+  evidenceBlobOidChars: 256,
+  evidenceSourceIdChars: 512,
+  evidenceDetailChars: 2000,
+  provenanceServiceChars: 128,
+  provenanceFieldChars: 512,
+  searchTextChars: 2000,
+  selectorReasonChars: 1000,
+  recordIdChars: 256,
+  searchMaxItems: 128,
+  searchMaxChars: 1e6,
+  searchCandidateRows: 4096
+});
+var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
+var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
+var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
+  "repository_agent_cache",
+  "repository_facts"
+]);
+var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+
+class MemoryConflictError extends Error {
+  code;
+  constructor(message, code = "conflict") {
+    super(message);
+    this.name = "MemoryConflictError";
+    this.code = code;
+  }
+}
+
+class MemoryStoreClosedError extends Error {
+  constructor() {
+    super("Memory store is closed");
+    this.name = "MemoryStoreClosedError";
+  }
+}
+
+class MemoryValidationError extends TypeError {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.name = "MemoryValidationError";
+    this.code = code;
+  }
+}
+
+class MemoryHttpError extends Error {
+  status;
+  code;
+  constructor(message, status = 0, code) {
+    super(message);
+    this.name = "MemoryHttpError";
+    this.status = status;
+    this.code = typeof code === "string" && code.trim() ? code.trim() : null;
+  }
+}
+function isMemoryReinforcementOutcome(value) {
+  return typeof value === "string" && MEMORY_REINFORCEMENT_OUTCOMES.includes(value);
+}
+function assertMemoryReinforcementOutcome(value) {
+  if (isMemoryReinforcementOutcome(value))
+    return;
+  throw new MemoryValidationError(`memory reinforcement outcome must be one of: ${MEMORY_REINFORCEMENT_OUTCOMES.join(", ")}`, "invalid_reinforcement_outcome");
+}
+function normalizedText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+function requiredText(value, label) {
+  const normalized = normalizedText(value);
+  if (!normalized)
+    throw new TypeError(`${label} is required`);
+  return normalized;
+}
+function compactText(value, maxChars) {
+  return normalizedText(value).slice(0, maxChars);
+}
+function boundedAddressText(value, label, maxChars, required) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    if (required)
+      throw new TypeError(`${label} is required`);
+    return null;
+  }
+  if (normalized.length > maxChars) {
+    throw new TypeError(`${label} must be at most ${maxChars} characters`);
+  }
+  if (normalized.includes("\x00"))
+    throw new TypeError(`${label} must not contain NUL characters`);
+  return normalized;
+}
+function normalizedOptionalText(value) {
+  return normalizedText(value) || null;
+}
+function normalizeScope(scope) {
+  return {
+    namespace: boundedAddressText(scope?.namespace, "memory scope namespace", MEMORY_LIMITS.namespaceChars, true),
+    repositoryId: boundedAddressText(scope?.repositoryId, "memory scope repositoryId", MEMORY_LIMITS.repositoryIdChars, false),
+    sessionId: boundedAddressText(scope?.sessionId, "memory scope sessionId", MEMORY_LIMITS.sessionIdChars, false)
+  };
+}
+function scopeKey(scope) {
+  const normalized = normalizeScope(scope);
+  return JSON.stringify([
+    normalized.namespace,
+    normalized.repositoryId ?? "",
+    normalized.sessionId ?? ""
+  ]);
+}
+function addressKey(address) {
+  const key = boundedAddressText(address.key, "memory key", MEMORY_LIMITS.keyChars, true);
+  return `${scopeKey(address.scope)}\x00${key}`;
+}
+function clampUnit(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed))
+    return fallback;
+  return Math.max(0, Math.min(1, parsed));
+}
+function normalizedStringList(values, maxItems = MEMORY_LIMITS.listItems, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!Array.isArray(values))
+    return [];
+  const output = [];
+  const seen = new Set;
+  for (const value of values) {
+    const item = compactText(value, maxChars);
+    if (!item || seen.has(item))
+      continue;
+    seen.add(item);
+    output.push(item);
+    if (output.length >= maxItems)
+      break;
+  }
+  return output;
+}
+function normalizeEvidence(evidence) {
+  if (!Array.isArray(evidence))
+    return [];
+  const output = [];
+  for (const raw of evidence.slice(0, MEMORY_LIMITS.evidenceItems)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      continue;
+    const row = raw;
+    const path = compactText(row.path, MEMORY_LIMITS.evidencePathChars).replace(/\\/g, "/") || undefined;
+    if (path && (/^(?:[a-z]:)?\//i.test(path) || path.split("/").includes(".."))) {
+      throw new TypeError("memory evidence paths must be repository-relative and contained");
+    }
+    const normalized = {
+      ...path ? { path } : {},
+      ...compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) ? { blobOid: compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) } : {},
+      ...compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) ? { sourceId: compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) } : {},
+      ...compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) ? { detail: compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) } : {},
+      ...normalizedOptionalText(row.observedAt) ? { observedAt: normalizeTimestamp(row.observedAt, "evidence observedAt") } : {}
+    };
+    if (Object.keys(normalized).length > 0)
+      output.push(normalized);
+  }
+  return output;
+}
+function normalizeProvenance(value) {
+  const service = compactText(value?.service, MEMORY_LIMITS.provenanceServiceChars);
+  if (!service)
+    throw new TypeError("memory provenance service is required");
+  const optional = (input) => compactText(input, MEMORY_LIMITS.provenanceFieldChars) || undefined;
+  return {
+    service,
+    ...optional(value.agentId) ? { agentId: optional(value.agentId) } : {},
+    ...optional(value.runId) ? { runId: optional(value.runId) } : {},
+    ...optional(value.requestId) ? { requestId: optional(value.requestId) } : {},
+    ...optional(value.jobId) ? { jobId: optional(value.jobId) } : {},
+    ...optional(value.modelId) ? { modelId: optional(value.modelId) } : {},
+    ...optional(value.headSha) ? { headSha: optional(value.headSha) } : {},
+    ...optional(value.promptVersion) ? { promptVersion: optional(value.promptVersion) } : {}
+  };
+}
+function normalizeTimestamp(value, label) {
+  const timestamp = compactText(value, 64);
+  const parsed = Date.parse(timestamp);
+  if (!timestamp || !Number.isFinite(parsed))
+    throw new TypeError(`${label} must be an ISO timestamp`);
+  return new Date(parsed).toISOString();
+}
+function normalizeStatus(value, fallback = "active") {
+  return value === "active" || value === "stale" || value === "superseded" || value === "invalid" ? value : fallback;
+}
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function cloneObservation(observation) {
+  return {
+    ...observation,
+    ...observation.evidence ? { evidence: observation.evidence.map((entry) => ({ ...entry })) } : {},
+    ...observation.provenance ? { provenance: { ...observation.provenance } } : {}
+  };
+}
+function cloneRecord(record) {
+  return {
+    ...record,
+    scope: { ...record.scope },
+    value: record.value == null ? null : cloneJson(record.value),
+    tags: [...record.tags],
+    evidence: record.evidence.map((entry) => ({ ...entry })),
+    observations: record.observations.map(cloneObservation),
+    provenance: { ...record.provenance }
+  };
+}
+function serializedMemoryRecordChars(record) {
+  return JSON.stringify(record).length;
+}
+function isExpired(record, nowMs) {
+  return record.expiresAt != null && Date.parse(record.expiresAt) <= nowMs;
+}
+function sameScope(left, right) {
+  return scopeKey(left) === scopeKey(right);
+}
+function matchesAny(value, candidates, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!candidates || candidates.length === 0)
+    return true;
+  if (value == null)
+    return false;
+  return new Set(normalizedStringList(candidates, MEMORY_LIMITS.listItems, maxChars).map((entry) => entry.toLowerCase())).has(value.toLowerCase());
+}
+function hasAllTags(record, tags) {
+  const requested = normalizedStringList(tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars).map((tag) => tag.toLowerCase());
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.tags.map((tag) => tag.toLowerCase()));
+  return requested.every((tag) => available.has(tag));
+}
+function hasAnyEvidencePath(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.some((path) => available.has(path));
+}
+function hasAllEvidencePaths(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.every((path) => available.has(path));
+}
+function resolveMemoryReinforcement(record, outcome, requestedWeight = 1) {
+  assertMemoryReinforcementOutcome(outcome);
+  const parsedWeight = Number(requestedWeight);
+  const weight = Math.max(0, Math.min(4, Number.isFinite(parsedWeight) ? parsedWeight : 1));
+  const positive = outcome === "confirmed" || outcome === "successful";
+  const confidence = positive ? record.confidence + (1 - record.confidence) * 0.15 * weight : record.confidence * (1 - 0.25 * weight);
+  const usefulness = positive ? record.usefulness + (1 - record.usefulness) * 0.12 * weight : record.usefulness * (1 - 0.2 * weight);
+  const status = outcome === "contradicted" ? "superseded" : positive && record.status === "stale" ? "active" : record.status;
+  return {
+    weight,
+    confidence: clampUnit(confidence, record.confidence),
+    usefulness: clampUnit(usefulness, record.usefulness),
+    status
+  };
+}
+function reinforcementObservationId(recordId, input) {
+  const explicit = normalizedOptionalText(input.observationId);
+  const provenance = input.provenance;
+  const inferredParts = provenance ? [
+    normalizedOptionalText(provenance.service),
+    normalizedOptionalText(provenance.requestId),
+    normalizedOptionalText(provenance.jobId),
+    normalizedOptionalText(provenance.runId)
+  ].filter((part) => part != null) : [];
+  const inferredIdentity = inferredParts.length > 1 ? inferredParts.join("\x00") : null;
+  if (!explicit && !inferredIdentity)
+    return randomUUID();
+  const identity = explicit ? [recordId, "explicit", explicit] : [recordId, "inferred", inferredIdentity, input.outcome];
+  return `observation_${createHash("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 32)}`;
+}
+function createMemoryReinforcementObservation(recordId, input, observedAt) {
+  assertMemoryReinforcementOutcome(input.outcome);
+  const effect = resolveMemoryReinforcement({ confidence: 0, usefulness: 0, status: "active" }, input.outcome, input.weight);
+  const evidence = normalizeEvidence(input.evidence);
+  return {
+    id: reinforcementObservationId(recordId, input),
+    outcome: input.outcome,
+    weight: effect.weight,
+    observedAt: normalizeTimestamp(observedAt, "reinforcement observedAt"),
+    ...evidence.length > 0 ? { evidence } : {},
+    ...input.provenance ? { provenance: normalizeProvenance(input.provenance) } : {}
+  };
+}
+function appendMemoryReinforcementObservation(existing, observation) {
+  const prior = existing.find((entry) => entry.id === observation.id);
+  if (prior)
+    assertMemoryReinforcementObservationCompatible(prior, observation);
+  const appended = prior == null;
+  const candidates = appended ? [...existing, observation] : existing;
+  const seen = new Set;
+  const observations = [];
+  for (let index = candidates.length - 1;index >= 0; index--) {
+    const candidate = candidates[index];
+    if (!candidate || seen.has(candidate.id))
+      continue;
+    seen.add(candidate.id);
+    observations.unshift(cloneObservation(candidate));
+    if (observations.length >= MAX_MEMORY_REINFORCEMENT_OBSERVATIONS)
+      break;
+  }
+  return { observations, appended };
+}
+function canonicalObservationPayload(observation) {
+  const evidence = (observation.evidence ?? []).map((entry) => JSON.stringify({
+    path: entry.path ?? null,
+    blobOid: entry.blobOid ?? null,
+    sourceId: entry.sourceId ?? null,
+    detail: entry.detail ?? null,
+    observedAt: entry.observedAt ?? null
+  })).sort();
+  const provenance = observation.provenance ? {
+    service: observation.provenance.service,
+    agentId: observation.provenance.agentId ?? null,
+    runId: observation.provenance.runId ?? null,
+    requestId: observation.provenance.requestId ?? null,
+    jobId: observation.provenance.jobId ?? null,
+    modelId: observation.provenance.modelId ?? null,
+    headSha: observation.provenance.headSha ?? null,
+    promptVersion: observation.provenance.promptVersion ?? null
+  } : null;
+  return JSON.stringify({
+    outcome: observation.outcome,
+    weight: observation.weight,
+    evidence,
+    provenance
+  });
+}
+function assertMemoryReinforcementObservationCompatible(existing, candidate) {
+  if (existing.id !== candidate.id)
+    return;
+  if (canonicalObservationPayload(existing) === canonicalObservationPayload(candidate))
+    return;
+  throw new MemoryConflictError(`Memory observation conflict for ${candidate.id}: the id was already used for a different outcome payload`);
+}
+function memoryRecordRankingQuality(record) {
+  return (clampUnit(record.confidence, 0.5) + clampUnit(record.usefulness, 0.5)) / 2;
+}
+function searchScore(record, text) {
+  const tokens = normalizedText(text).toLowerCase().split(/[^a-z0-9_.\/-]+/).filter((token) => token.length > 1).slice(0, 64);
+  if (tokens.length === 0)
+    return 0;
+  const subject = (record.subjectKey ?? "").toLowerCase();
+  const haystack = [record.key, record.kind, subject, record.summary, ...record.tags].join(" ").toLowerCase();
+  let score = 0;
+  for (const token of new Set(tokens)) {
+    if (record.key.toLowerCase() === token || subject === token)
+      score += 6;
+    else if (record.key.toLowerCase().includes(token) || subject.includes(token))
+      score += 3;
+    else if (haystack.includes(token))
+      score += 1;
+  }
+  return score;
+}
+
+class InMemoryMemoryStore {
+  records = new Map;
+  now;
+  closed = false;
+  constructor(options = {}) {
+    this.now = options.now ?? (() => new Date);
+  }
+  assertOpen() {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+  }
+  async put(input, options = {}) {
+    this.assertOpen();
+    const normalizedScope = normalizeScope(input.scope);
+    const key = boundedAddressText(input.key, "memory key", MEMORY_LIMITS.keyChars, true);
+    const storageKey = addressKey({ scope: normalizedScope, key });
+    const existing = this.records.get(storageKey);
+    if (options.expectedRevision != null) {
+      const actualRevision = existing?.revision ?? 0;
+      if (actualRevision !== options.expectedRevision) {
+        throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
+      }
+    }
+    const now = this.now().toISOString();
+    let expiresAt;
+    if (input.expiresAt !== undefined) {
+      expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
+    } else if (input.ttlMs !== undefined && input.ttlMs !== null) {
+      const ttlMs = Number(input.ttlMs);
+      if (!Number.isFinite(ttlMs) || ttlMs <= 0)
+        throw new TypeError("ttlMs must be positive");
+      expiresAt = new Date(Date.parse(now) + Math.floor(ttlMs)).toISOString();
+    } else {
+      expiresAt = existing?.expiresAt ?? null;
+    }
+    const status = normalizeStatus(input.status, existing?.status ?? "active");
+    const preserveLearnedScores = existing != null && options.expectedRevision === undefined;
+    const remainsInvalid = status === "invalid" && existing?.status === "invalid";
+    const record = {
+      id: existing?.id ?? randomUUID(),
+      scope: normalizedScope,
+      key,
+      kind: requiredText(compactText(input.kind, MEMORY_LIMITS.kindChars), "memory kind"),
+      subjectKey: compactText(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null,
+      summary: requiredText(compactText(input.summary, MEMORY_LIMITS.summaryChars), "memory summary"),
+      value: input.value == null ? null : cloneJson(input.value),
+      tags: normalizedStringList(input.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars),
+      evidence: normalizeEvidence(input.evidence),
+      observations: existing?.observations.map(cloneObservation) ?? [],
+      provenance: existing?.provenance ?? normalizeProvenance(input.provenance),
+      confidence: preserveLearnedScores ? existing.confidence : clampUnit(input.confidence, existing?.confidence ?? 0.5),
+      usefulness: preserveLearnedScores ? existing.usefulness : clampUnit(input.usefulness, existing?.usefulness ?? 0.5),
+      status,
+      revision: (existing?.revision ?? 0) + 1,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      expiresAt,
+      invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
+      invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
+    };
+    this.records.set(storageKey, record);
+    return cloneRecord(record);
+  }
+  async get(address, options = {}) {
+    this.assertOpen();
+    const record = this.records.get(addressKey(address));
+    if (!record)
+      return null;
+    if (!options.includeExpired && isExpired(record, this.now().getTime()))
+      return null;
+    const statuses = options.statuses?.length ? options.statuses : ["active"];
+    if (!statuses.includes(record.status))
+      return null;
+    return cloneRecord(record);
+  }
+  async search(query) {
+    this.assertOpen();
+    const scope = normalizeScope(query.scope);
+    const statuses = query.statuses?.length ? query.statuses : ["active"];
+    const nowMs = this.now().getTime();
+    const candidates = [...this.records.values()].filter((record) => sameScope(record.scope, scope)).filter((record) => query.includeExpired || !isExpired(record, nowMs)).filter((record) => statuses.includes(record.status)).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.revision - left.revision || left.key.localeCompare(right.key)).slice(0, MEMORY_LIMITS.searchCandidateRows);
+    const scored = candidates.filter((record) => matchesAny(record.kind, query.kinds, MEMORY_LIMITS.kindChars)).filter((record) => matchesAny(record.subjectKey, query.subjectKeys, MEMORY_LIMITS.subjectKeyChars)).filter((record) => hasAllTags(record, query.tags)).filter((record) => hasAllEvidencePaths(record, query.evidencePaths)).map((record) => ({
+      record,
+      score: searchScore(record, compactText(query.text, MEMORY_LIMITS.searchTextChars))
+    })).filter((entry) => !compactText(query.text, MEMORY_LIMITS.searchTextChars) || entry.score > 0).sort((left, right) => right.score - left.score || memoryRecordRankingQuality(right.record) - memoryRecordRankingQuality(left.record) || Date.parse(right.record.updatedAt) - Date.parse(left.record.updatedAt) || right.record.revision - left.record.revision || left.record.key.localeCompare(right.record.key));
+    const requestedMaxItems = Number(query.maxItems ?? 12);
+    const maxItems = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxItems, Number.isFinite(requestedMaxItems) ? Math.floor(requestedMaxItems) : 12));
+    const requestedMaxChars = Number(query.maxChars ?? 16000);
+    const maxChars = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxChars, Number.isFinite(requestedMaxChars) ? Math.floor(requestedMaxChars) : 16000));
+    const output = [];
+    let usedChars = 0;
+    for (const { record } of scored) {
+      if (output.length >= maxItems)
+        break;
+      const cloned = cloneRecord(record);
+      const cost = serializedMemoryRecordChars(cloned);
+      if (usedChars + cost > maxChars)
+        continue;
+      output.push(cloned);
+      usedChars += cost;
+    }
+    return output;
+  }
+  async invalidate(selector) {
+    this.assertOpen();
+    const scope = normalizeScope(selector.scope);
+    const reason = compactText(selector.reason, MEMORY_LIMITS.selectorReasonChars) || "invalidated";
+    const now = this.now().toISOString();
+    let changed = 0;
+    for (const [key, record] of this.records) {
+      if (!sameScope(record.scope, scope))
+        continue;
+      if (!matchesAny(record.key, selector.keys, MEMORY_LIMITS.keyChars))
+        continue;
+      if (!matchesAny(record.kind, selector.kinds, MEMORY_LIMITS.kindChars))
+        continue;
+      if (!matchesAny(record.subjectKey, selector.subjectKeys, MEMORY_LIMITS.subjectKeyChars))
+        continue;
+      if (!hasAllTags(record, selector.tags))
+        continue;
+      if (!hasAnyEvidencePath(record, selector.evidencePaths))
+        continue;
+      if (selector.statuses?.length && !selector.statuses.includes(record.status))
+        continue;
+      if (record.status === "invalid")
+        continue;
+      this.records.set(key, {
+        ...record,
+        status: "invalid",
+        revision: record.revision + 1,
+        updatedAt: now,
+        invalidatedAt: now,
+        invalidationReason: reason
+      });
+      changed++;
+    }
+    return changed;
+  }
+  async reinforce(input) {
+    this.assertOpen();
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const storageKey = addressKey(input);
+    const record = this.records.get(storageKey);
+    if (!record)
+      return null;
+    if (input.expectedId !== undefined) {
+      const expectedId = boundedAddressText(input.expectedId, "memory expectedId", MEMORY_LIMITS.recordIdChars, true);
+      if (record.id !== expectedId) {
+        throw new MemoryConflictError(`Memory record conflict for ${record.scope.namespace}/${record.key}: expected id ${expectedId}, got ${record.id}`, "record_conflict");
+      }
+    }
+    const effect = resolveMemoryReinforcement(record, input.outcome, input.weight);
+    const now = this.now().toISOString();
+    const observation = createMemoryReinforcementObservation(record.id, input, now);
+    const appended = appendMemoryReinforcementObservation(record.observations, observation);
+    if (!appended.appended)
+      return cloneRecord(record);
+    const updated = {
+      ...record,
+      confidence: effect.confidence,
+      usefulness: effect.usefulness,
+      status: effect.status,
+      evidence: input.evidence && input.evidence.length > 0 ? normalizeEvidence([...record.evidence, ...input.evidence]) : record.evidence,
+      observations: appended.observations,
+      provenance: record.provenance,
+      revision: record.revision + 1,
+      updatedAt: now,
+      invalidatedAt: effect.status === "invalid" ? record.invalidatedAt : null,
+      invalidationReason: effect.status === "invalid" ? record.invalidationReason : null
+    };
+    this.records.set(storageKey, updated);
+    return cloneRecord(updated);
+  }
+  async prune(options = {}) {
+    this.assertOpen();
+    const expiryCutoff = options.expiredBefore ? Date.parse(normalizeTimestamp(options.expiredBefore, "expiredBefore")) : this.now().getTime();
+    const updatedCutoff = options.updatedBefore ? Date.parse(normalizeTimestamp(options.updatedBefore, "updatedBefore")) : null;
+    const ageStatuses = options.statuses?.length ? options.statuses : ["invalid", "superseded"];
+    let removed = 0;
+    for (const [key, record] of this.records) {
+      if (options.scope && !sameScope(record.scope, options.scope))
+        continue;
+      const expired = record.expiresAt != null && Date.parse(record.expiresAt) <= expiryCutoff;
+      const agedTerminal = updatedCutoff != null && ageStatuses.includes(record.status) && Date.parse(record.updatedAt) <= updatedCutoff;
+      if (!expired && !agedTerminal)
+        continue;
+      this.records.delete(key);
+      removed++;
+    }
+    return removed;
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+
+class MemoryHttpClient {
+  serverUrl;
+  authToken;
+  callerService;
+  authority;
+  fetchImpl;
+  timeoutMs;
+  maxResponseBytes;
+  closed = false;
+  constructor(options) {
+    this.serverUrl = requiredText(options.serverUrl, "memory server URL").replace(/\/+$/, "");
+    this.authToken = normalizedOptionalText(options.authToken);
+    const callerService = normalizedText(options.callerService ?? "client");
+    if (callerService !== "server" && callerService !== "localbuddy" && callerService !== "remotebuddy" && callerService !== "workerpals" && callerService !== "source_control_manager" && callerService !== "repository_agent" && callerService !== "cli" && callerService !== "client") {
+      throw new TypeError(`Unsupported memory caller service: ${callerService}`);
+    }
+    this.callerService = callerService;
+    const authority = normalizedOptionalText(options.authority);
+    if (authority && authority !== "repository_agent" && authority !== "server") {
+      throw new TypeError(`Unsupported memory authority: ${authority}`);
+    }
+    this.authority = authority === "repository_agent" || authority === "server" ? authority : null;
+    this.fetchImpl = options.fetchImpl;
+    const requestedTimeoutMs = Number(options.timeoutMs ?? 1e4);
+    this.timeoutMs = Math.max(1, Math.min(120000, Number.isFinite(requestedTimeoutMs) ? Math.floor(requestedTimeoutMs) : 1e4));
+    const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
+    this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
+  }
+  async request(path, method, body) {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+    const headers = {
+      "Content-Type": "application/json",
+      [MEMORY_HTTP_CALLER_HEADER]: this.callerService,
+      ...this.authority ? { [MEMORY_HTTP_AUTHORITY_HEADER]: this.authority } : {}
+    };
+    if (this.authToken)
+      headers.Authorization = `Bearer ${this.authToken}`;
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${this.serverUrl}${path}`,
+      init: { method, headers, body: JSON.stringify(body) },
+      timeoutMs: this.timeoutMs,
+      maxResponseBytes: this.maxResponseBytes,
+      fetchImpl: this.fetchImpl,
+      timeoutMessage: `Memory request ${method} ${path} timed out after ${this.timeoutMs}ms`
+    });
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch {
+      if (response.ok)
+        throw new MemoryHttpError("Memory server returned invalid JSON", response.status);
+    }
+    if (!response.ok || payload.ok === false) {
+      const detail = normalizedText(payload.message ?? payload.error) || response.statusText || "request failed";
+      if (response.status === 409) {
+        throw new MemoryConflictError(detail, payload.code === "record_conflict" ? "record_conflict" : "conflict");
+      }
+      throw new MemoryHttpError(`Memory server request failed: ${detail}`, response.status, payload.code);
+    }
+    return payload;
+  }
+  async put(input, options = {}) {
+    const payload = await this.request("/memory/records", "PUT", { input, options });
+    if (!payload.record)
+      throw new MemoryHttpError("Memory server response omitted record");
+    return payload.record;
+  }
+  async get(address, options = {}) {
+    const payload = await this.request("/memory/get", "POST", { address, options });
+    return payload.record ?? null;
+  }
+  async search(query) {
+    const payload = await this.request("/memory/search", "POST", { query });
+    if (!Array.isArray(payload.records)) {
+      throw new MemoryHttpError("Memory server response omitted records");
+    }
+    return payload.records;
+  }
+  async invalidate(selector) {
+    const payload = await this.request("/memory/invalidate", "POST", { selector });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async reinforce(input) {
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const payload = await this.request("/memory/reinforce", "POST", { input });
+    return payload.record ?? null;
+  }
+  async prune(options = {}) {
+    const payload = await this.request("/memory/prune", "POST", { options });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+// packages/shared/src/repository_agent.ts
+var REPOSITORY_AGENT_SCHEMA_VERSION = 1;
+var REPOSITORY_AGENT_LIMITS = Object.freeze({
+  requestBytes: 256 * 1024,
+  responseBytes: 2 * 1024 * 1024,
+  deadlineHorizonMs: 60 * 60000,
+  questionChars: 32000,
+  contextChars: 96000,
+  contextDepth: 8,
+  contextEntries: 1024,
+  contextStringChars: 16000,
+  answerChars: 128000,
+  summaryChars: 16000,
+  evidenceItems: 128,
+  recommendationItems: 64,
+  validationProposalItems: 32,
+  memoryRefItems: 128
+});
+
+class RepositoryAgentClientError extends Error {
+  code;
+  status;
+  requestId;
+  retryAfterMs;
+  remoteCode;
+  detail;
+  retryable;
+  constructor(code, message, options = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "RepositoryAgentClientError";
+    this.code = code;
+    this.status = options.status ?? null;
+    this.requestId = options.requestId ?? null;
+    this.retryAfterMs = options.retryAfterMs ?? null;
+    this.remoteCode = options.remoteCode ?? null;
+    this.detail = options.detail ?? null;
+    this.retryable = options.retryable ?? null;
+  }
+}
+var CALLER_SERVICES = new Set([
+  "server",
+  "localbuddy",
+  "remotebuddy",
+  "workerpals",
+  "source_control_manager",
+  "repository_agent",
+  "cli",
+  "client"
+]);
+var PURPOSES = new Set([
+  "architecture",
+  "priority",
+  "ownership",
+  "validation",
+  "debug",
+  "impact",
+  "general"
+]);
+var PRIORITIES = new Set(["interactive", "normal", "background"]);
+var FRESHNESS_VALUES = new Set([
+  "cache_preferred",
+  "fresh_required",
+  "cache_only"
+]);
+var MEMORY_ROLES = new Set([
+  "analysis_cache",
+  "evidence_fact",
+  "recalled_fact"
+]);
+var REQUEST_STATUSES = new Set([
+  "queued",
+  "claimed",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+var TERMINAL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+function invalidRequest(message) {
+  throw new RepositoryAgentClientError("invalid_request", message);
+}
+function invalidResponse(message) {
+  throw new RepositoryAgentClientError("invalid_response", message);
+}
+function contractViolation(source, message) {
+  return source === "request" ? invalidRequest(message) : invalidResponse(message);
+}
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function requiredString(value, label, maxChars, source) {
+  if (typeof value !== "string") {
+    return source === "request" ? invalidRequest(`${label} must be a string`) : invalidResponse(`${label} must be a string`);
+  }
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized) {
+    return source === "request" ? invalidRequest(`${label} is required`) : invalidResponse(`${label} is required`);
+  }
+  if (normalized.length > maxChars) {
+    return source === "request" ? invalidRequest(`${label} exceeds ${maxChars} characters`) : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+  }
+  return normalized;
+}
+function optionalString(value, maxChars) {
+  if (typeof value !== "string")
+    return;
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized)
+    return;
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+}
+function finiteInt(value, options) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    if (options.fallback !== undefined)
+      return options.fallback;
+    invalidResponse("Expected a finite integer");
+  }
+  return Math.max(options.min, Math.min(options.max, Math.floor(parsed)));
+}
+function normalizedIso(value, label, source) {
+  const raw = requiredString(value, label, 128, source);
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) {
+    return source === "request" ? invalidRequest(`${label} must be a valid ISO-8601 timestamp`) : invalidResponse(`${label} must be a valid ISO-8601 timestamp`);
+  }
+  return new Date(parsed).toISOString();
+}
+function sanitizeRelativePath(value, label) {
+  const path = optionalString(value, 1024)?.replace(/\\/g, "/");
+  if (!path || path.startsWith("/") || /^[a-z]:\//i.test(path))
+    return null;
+  const segments = path.split("/").filter(Boolean);
+  if (segments.some((segment) => segment === ".." || segment === "."))
+    return null;
+  return segments.join("/") || (label === "cwd" && path === "." ? "." : null);
+}
+function sanitizeJsonValue(value, label, depth, budget, source) {
+  if (depth > REPOSITORY_AGENT_LIMITS.contextDepth) {
+    contractViolation(source, `${label} exceeds maximum nesting depth`);
+  }
+  if (value === null || typeof value === "boolean")
+    return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      contractViolation(source, `${label} contains a non-finite number`);
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    if (value.length > REPOSITORY_AGENT_LIMITS.contextStringChars) {
+      contractViolation(source, `${label} contains a string longer than ${REPOSITORY_AGENT_LIMITS.contextStringChars} characters`);
+    }
+    budget.chars += value.length;
+    if (budget.chars > REPOSITORY_AGENT_LIMITS.contextChars) {
+      contractViolation(source, `${label} exceeds ${REPOSITORY_AGENT_LIMITS.contextChars} characters`);
+    }
+    return value.replace(/\u0000/g, "");
+  }
+  if (Array.isArray(value)) {
+    budget.entries += value.length;
+    if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+      contractViolation(source, `${label} contains too many entries`);
+    }
+    return value.map((entry, index) => sanitizeJsonValue(entry, `${label}[${index}]`, depth + 1, budget, source));
+  }
+  if (!isRecord(value)) {
+    contractViolation(source, `${label} must contain JSON-compatible values`);
+  }
+  const entries = Object.entries(value);
+  budget.entries += entries.length;
+  if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+    contractViolation(source, `${label} contains too many entries`);
+  }
+  const output = {};
+  for (const [rawKey, entry] of entries) {
+    const key = rawKey.replace(/\u0000/g, "").trim();
+    if (!key || key.length > 256) {
+      contractViolation(source, `${label} contains an invalid key`);
+    }
+    if (["__proto__", "prototype", "constructor"].includes(key)) {
+      contractViolation(source, `${label} contains an unsafe key`);
+    }
+    budget.chars += key.length;
+    output[key] = sanitizeJsonValue(entry, `${label}.${key}`, depth + 1, budget, source);
+  }
+  return output;
+}
+function sanitizeContext(value, label = "context", source = "request") {
+  if (value == null)
+    return;
+  if (!isRecord(value))
+    contractViolation(source, `${label} must be an object`);
+  return sanitizeJsonValue(value, label, 0, { entries: 0, chars: 0 }, source);
+}
+function sanitizeCaller(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("caller must be an object") : invalidResponse("caller must be an object");
+  }
+  const service = requiredString(value.service, "caller.service", 64, source);
+  if (!CALLER_SERVICES.has(service)) {
+    return source === "request" ? invalidRequest(`Unsupported caller.service: ${service}`) : invalidResponse(`Unsupported caller.service: ${service}`);
+  }
+  return {
+    service,
+    ...optionalString(value.instanceId, 256) ? { instanceId: optionalString(value.instanceId, 256) } : {},
+    ...optionalString(value.sessionId, 256) ? { sessionId: optionalString(value.sessionId, 256) } : {},
+    ...optionalString(value.correlationId, 256) ? { correlationId: optionalString(value.correlationId, 256) } : {}
+  };
+}
+function sanitizeRepository(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("repository must be an object") : invalidResponse("repository must be an object");
+  }
+  if (typeof value.dirty !== "boolean") {
+    return source === "request" ? invalidRequest("repository.dirty must be a boolean") : invalidResponse("repository.dirty must be a boolean");
+  }
+  return {
+    identity: requiredString(value.identity, "repository.identity", 1024, source),
+    root: requiredString(value.root, "repository.root", 4096, source),
+    revision: requiredString(value.revision, "repository.revision", 512, source),
+    tree: requiredString(value.tree, "repository.tree", 512, source),
+    dirty: value.dirty
+  };
+}
+function sanitizeRequest(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("Repository Agent request must be an object") : invalidResponse("Repository Agent request must be an object");
+  }
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    return source === "request" ? invalidRequest(`schemaVersion must be ${REPOSITORY_AGENT_SCHEMA_VERSION}`) : invalidResponse(`Unsupported Repository Agent schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const purpose = requiredString(value.purpose, "purpose", 32, source);
+  const priority = requiredString(value.priority, "priority", 32, source);
+  const freshness = requiredString(value.freshness, "freshness", 32, source);
+  if (!PURPOSES.has(purpose)) {
+    return source === "request" ? invalidRequest(`Unsupported purpose: ${purpose}`) : invalidResponse(`Unsupported purpose: ${purpose}`);
+  }
+  if (!PRIORITIES.has(priority)) {
+    return source === "request" ? invalidRequest(`Unsupported priority: ${priority}`) : invalidResponse(`Unsupported priority: ${priority}`);
+  }
+  if (!FRESHNESS_VALUES.has(freshness)) {
+    return source === "request" ? invalidRequest(`Unsupported freshness: ${freshness}`) : invalidResponse(`Unsupported freshness: ${freshness}`);
+  }
+  const deadlineAt = normalizedIso(value.deadlineAt, "deadlineAt", source);
+  if (source === "request" && Date.parse(deadlineAt) <= Date.now()) {
+    invalidRequest("deadlineAt must be in the future");
+  }
+  if (source === "request" && Date.parse(deadlineAt) - Date.now() > REPOSITORY_AGENT_LIMITS.deadlineHorizonMs) {
+    invalidRequest(`deadlineAt must be no more than ${REPOSITORY_AGENT_LIMITS.deadlineHorizonMs}ms in the future`);
+  }
+  const context = sanitizeContext(value.context, "context", source);
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    caller: sanitizeCaller(value.caller, source),
+    purpose,
+    repository: sanitizeRepository(value.repository, source),
+    question: requiredString(value.question, "question", REPOSITORY_AGENT_LIMITS.questionChars, source),
+    ...context ? { context } : {},
+    priority,
+    deadlineAt,
+    freshness,
+    idempotencyKey: requiredString(value.idempotencyKey, "idempotencyKey", 256, source)
+  };
+}
+function sanitizeStatus(value) {
+  const status = requiredString(value, "status", 32, "response");
+  if (!REQUEST_STATUSES.has(status)) {
+    invalidResponse(`Unsupported Repository Agent request status: ${status}`);
+  }
+  return status;
+}
+function sanitizeEvidence(value) {
+  if (!isRecord(value))
+    return null;
+  const path = sanitizeRelativePath(value.path, "path");
+  const revision = optionalString(value.revision, 512);
+  if (!path || !revision)
+    return null;
+  const startLine = value.startLine == null ? undefined : finiteInt(value.startLine, { min: 1, max: 1e7, fallback: 1 });
+  const endLine = value.endLine == null ? undefined : finiteInt(value.endLine, {
+    min: startLine ?? 1,
+    max: 1e7,
+    fallback: startLine ?? 1
+  });
+  return {
+    path,
+    revision,
+    ...optionalString(value.blobHash, 512) ? { blobHash: optionalString(value.blobHash, 512) } : {},
+    ...startLine == null ? {} : { startLine },
+    ...endLine == null ? {} : { endLine },
+    ...optionalString(value.excerpt, 4000) ? { excerpt: optionalString(value.excerpt, 4000) } : {},
+    ...optionalString(value.rationale, 2000) ? { rationale: optionalString(value.rationale, 2000) } : {}
+  };
+}
+function sanitizeRecommendation(value) {
+  if (!isRecord(value))
+    return null;
+  const title = optionalString(value.title, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  if (!title || !rationale)
+    return null;
+  const priority = optionalString(value.priority, 16);
+  const paths = Array.isArray(value.paths) ? value.paths.map((path) => sanitizeRelativePath(path, "path")).filter((path) => Boolean(path)).slice(0, 64) : undefined;
+  return {
+    title,
+    rationale,
+    ...priority === "high" || priority === "normal" || priority === "low" ? { priority } : {},
+    ...paths?.length ? { paths } : {}
+  };
+}
+function sanitizeValidationProposal(value) {
+  if (!isRecord(value))
+    return null;
+  const label = optionalString(value.label, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  const rawCwd = optionalString(value.cwd, 1024) ?? ".";
+  const cwd = rawCwd === "." ? "." : sanitizeRelativePath(rawCwd, "cwd");
+  const argv = Array.isArray(value.argv) ? value.argv.filter((entry) => typeof entry === "string").map((entry) => entry.replace(/\u0000/g, "").trim()).filter(Boolean).slice(0, 64).map((entry) => entry.length <= 4096 ? entry : `${entry.slice(0, 4082)}...[truncated]`) : [];
+  if (!label || !rationale || !cwd || argv.length === 0)
+    return null;
+  return { label, cwd, argv, rationale };
+}
+function sanitizeMemoryRef(value) {
+  if (!isRecord(value))
+    return null;
+  const id = optionalString(value.id, 512);
+  const namespace = optionalString(value.namespace, 256);
+  const role = optionalString(value.role, 64);
+  if (!id || !namespace || !MEMORY_ROLES.has(role))
+    return null;
+  const relevance = typeof value.relevance === "number" && Number.isFinite(value.relevance) ? Math.max(0, Math.min(1, value.relevance)) : undefined;
+  return {
+    id,
+    namespace,
+    role,
+    ...optionalString(value.key, 512) ? { key: optionalString(value.key, 512) } : {},
+    ...relevance == null ? {} : { relevance },
+    ...optionalString(value.sourceRevision, 512) ? { sourceRevision: optionalString(value.sourceRevision, 512) } : {}
+  };
+}
+function sanitizeRepositoryAgentResult(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent result must be an object");
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    invalidResponse(`Unsupported Repository Agent result schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const requestId = requiredString(value.requestId, "result.requestId", 256, "response");
+  if (expectedRequestId && requestId !== expectedRequestId) {
+    invalidResponse(`Repository Agent result requestId does not match ${expectedRequestId}`);
+  }
+  if (!isRecord(value.analyzedRepository)) {
+    invalidResponse("result.analyzedRepository must be an object");
+  }
+  const analyzedRepository = {
+    identity: requiredString(value.analyzedRepository.identity, "result.analyzedRepository.identity", 1024, "response"),
+    revision: requiredString(value.analyzedRepository.revision, "result.analyzedRepository.revision", 512, "response"),
+    tree: requiredString(value.analyzedRepository.tree, "result.analyzedRepository.tree", 512, "response")
+  };
+  const confidence = Number(value.confidence);
+  if (!Number.isFinite(confidence))
+    invalidResponse("result.confidence must be finite");
+  const cacheRecord = isRecord(value.cache) ? value.cache : {};
+  const completedAt = normalizedIso(value.completedAt, "result.completedAt", "response");
+  const data = value.data === undefined ? undefined : sanitizeJsonValue(value.data, "result.data", 0, { entries: 0, chars: 0 }, "response");
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    requestId,
+    analyzedRepository,
+    answer: requiredString(value.answer, "result.answer", REPOSITORY_AGENT_LIMITS.answerChars, "response"),
+    summary: requiredString(value.summary, "result.summary", REPOSITORY_AGENT_LIMITS.summaryChars, "response"),
+    ...data === undefined ? {} : { data },
+    confidence: Math.max(0, Math.min(1, confidence)),
+    evidence: (Array.isArray(value.evidence) ? value.evidence : []).slice(0, REPOSITORY_AGENT_LIMITS.evidenceItems).map(sanitizeEvidence).filter((entry) => Boolean(entry)),
+    recommendations: (Array.isArray(value.recommendations) ? value.recommendations : []).slice(0, REPOSITORY_AGENT_LIMITS.recommendationItems).map(sanitizeRecommendation).filter((entry) => Boolean(entry)),
+    validationProposals: (Array.isArray(value.validationProposals) ? value.validationProposals : []).slice(0, REPOSITORY_AGENT_LIMITS.validationProposalItems).map(sanitizeValidationProposal).filter((entry) => Boolean(entry)),
+    cache: {
+      hit: cacheRecord.hit === true,
+      key: optionalString(cacheRecord.key, 1024) ?? null,
+      ...optionalString(cacheRecord.storedAt, 128) ? { storedAt: optionalString(cacheRecord.storedAt, 128) } : {},
+      ...optionalString(cacheRecord.expiresAt, 128) ? { expiresAt: optionalString(cacheRecord.expiresAt, 128) } : {}
+    },
+    memoryRefs: (Array.isArray(value.memoryRefs) ? value.memoryRefs : []).slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems).map(sanitizeMemoryRef).filter((entry) => Boolean(entry)),
+    completedAt
+  };
+}
+function sanitizeRemoteError(value) {
+  if (!isRecord(value))
+    return;
+  const code = optionalString(value.code, 128);
+  const message = optionalString(value.message, 8000);
+  if (!code || !message)
+    return;
+  return {
+    code,
+    message,
+    ...optionalString(value.detail, 16000) ? { detail: optionalString(value.detail, 16000) } : {},
+    retryable: value.retryable === true
+  };
+}
+function sanitizeSnapshot(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent request snapshot must be an object");
+  const requestId = requiredString(value.requestId, "requestId", 256, "response");
+  if (requestId !== expectedRequestId)
+    invalidResponse("Repository Agent snapshot requestId mismatch");
+  const status = sanitizeStatus(value.status);
+  const result = value.result == null ? undefined : sanitizeRepositoryAgentResult(value.result, requestId);
+  const error = sanitizeRemoteError(value.error);
+  return {
+    requestId,
+    status,
+    submittedAt: normalizedIso(value.submittedAt, "submittedAt", "response"),
+    updatedAt: normalizedIso(value.updatedAt, "updatedAt", "response"),
+    ...value.pollAfterMs == null ? {} : { pollAfterMs: finiteInt(value.pollAfterMs, { min: 100, max: 30000, fallback: 1000 }) },
+    ...result ? { result } : {},
+    ...error ? { error } : {}
+  };
+}
+function normalizePositiveDuration(value, fallback, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return fallback;
+  return Math.max(1, Math.min(max, Math.floor(parsed)));
+}
+function sleepWithSignal(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+  }
+  return new Promise((resolve2, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer)
+        clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve2();
+    }, Math.max(0, ms));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+class RepositoryAgentHttpClient {
+  serverUrl;
+  authToken;
+  fetchImpl;
+  requestTimeoutMs;
+  pollIntervalMs;
+  maxResponseBytes;
+  constructor(options) {
+    const rawServerUrl = requiredString(options.serverUrl, "serverUrl", 4096, "request").replace(/\/+$/, "");
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawServerUrl);
+    } catch {
+      invalidRequest("serverUrl must be an absolute HTTP URL");
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      invalidRequest("serverUrl must use HTTP or HTTPS");
+    }
+    this.serverUrl = rawServerUrl;
+    this.authToken = optionalString(options.authToken, 8192) ?? null;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = normalizePositiveDuration(options.requestTimeoutMs, 1e4, 120000);
+    this.pollIntervalMs = normalizePositiveDuration(options.pollIntervalMs, 1000, 30000);
+    this.maxResponseBytes = normalizePositiveDuration(options.maxResponseBytes, REPOSITORY_AGENT_LIMITS.responseBytes, 16 * 1024 * 1024);
+  }
+  headers() {
+    return {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}
+    };
+  }
+  async requestJson(path, init, options = {}) {
+    const timeoutMs = normalizePositiveDuration(options.timeoutMs, this.requestTimeoutMs, 30 * 60000);
+    try {
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${this.serverUrl}${path}`,
+        init: {
+          ...init,
+          headers: { ...this.headers(), ...init.headers ?? {} },
+          signal: options.signal
+        },
+        timeoutMs,
+        fetchImpl: this.fetchImpl,
+        maxResponseBytes: this.maxResponseBytes,
+        timeoutMessage: `Repository Agent request timed out after ${timeoutMs}ms`
+      });
+      const text = await response.text();
+      let payload = {};
+      if (text.trim()) {
+        try {
+          payload = JSON.parse(text);
+        } catch (cause) {
+          throw new RepositoryAgentClientError("invalid_response", "Repository Agent returned malformed JSON", { status: response.status, cause });
+        }
+      }
+      if (!isRecord(payload)) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response must be a JSON object", { status: response.status });
+      }
+      if (!response.ok) {
+        const retryAfterHeaderMs = Number(response.headers.get("retry-after")) * 1000;
+        const retryAfterMs = Number(payload.retryAfterMs);
+        throw new RepositoryAgentClientError("http_error", optionalString(payload.message, 8000) ?? `Repository Agent request failed with HTTP ${response.status}`, {
+          status: response.status,
+          requestId: optionalString(payload.requestId, 256) ?? null,
+          remoteCode: optionalString(payload.code, 128) ?? null,
+          detail: optionalString(payload.detail, 16000) ?? null,
+          retryable: typeof payload.retryable === "boolean" ? payload.retryable : response.status >= 500,
+          retryAfterMs: Number.isFinite(retryAfterMs) ? Math.max(0, Math.floor(retryAfterMs)) : Number.isFinite(retryAfterHeaderMs) ? Math.max(0, Math.floor(retryAfterHeaderMs)) : null
+        });
+      }
+      if (payload.ok !== true) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response is missing an exact positive acknowledgement", { status: response.status });
+      }
+      return payload;
+    } catch (error) {
+      if (error instanceof RepositoryAgentClientError)
+        throw error;
+      if (options.signal?.aborted) {
+        throw new RepositoryAgentClientError("aborted", "Repository Agent call aborted", {
+          cause: error
+        });
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timed out|timeout/i.test(message)) {
+        throw new RepositoryAgentClientError("timeout", message, { cause: error });
+      }
+      throw new RepositoryAgentClientError("transport_error", message, { cause: error });
+    }
+  }
+}
+
+class RepositoryAgentClient extends RepositoryAgentHttpClient {
+  callerService;
+  callerInstanceId;
+  askTimeoutMs;
+  constructor(options) {
+    super(options);
+    if (!CALLER_SERVICES.has(options.callerService)) {
+      invalidRequest(`Unsupported callerService: ${String(options.callerService)}`);
+    }
+    this.callerService = options.callerService;
+    this.callerInstanceId = optionalString(options.callerInstanceId, 256);
+    this.askTimeoutMs = normalizePositiveDuration(options.askTimeoutMs, 120000, 30 * 60000);
+  }
+  buildRequest(input) {
+    const request = sanitizeRequest({
+      ...input,
+      schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+      caller: {
+        ...input.caller ?? {},
+        ...this.callerInstanceId ? { instanceId: this.callerInstanceId } : {},
+        service: this.callerService
+      }
+    }, "request");
+    const encoded = JSON.stringify(request);
+    if (new TextEncoder().encode(encoded).byteLength > REPOSITORY_AGENT_LIMITS.requestBytes) {
+      invalidRequest(`Repository Agent request exceeds ${REPOSITORY_AGENT_LIMITS.requestBytes} bytes`);
+    }
+    return request;
+  }
+  async submit(input, options = {}) {
+    const request = this.buildRequest(input);
+    const payload = await this.requestJson("/repository-agent/requests", { method: "POST", body: JSON.stringify(request) }, options);
+    const requestId = requiredString(payload.requestId, "requestId", 256, "response");
+    const status = sanitizeStatus(payload.status);
+    const result = payload.result == null ? undefined : sanitizeRepositoryAgentResult(payload.result, requestId);
+    return {
+      requestId,
+      status,
+      deduplicated: payload.deduplicated === true,
+      pollAfterMs: finiteInt(payload.pollAfterMs, {
+        min: 100,
+        max: 30000,
+        fallback: this.pollIntervalMs
+      }),
+      ...result ? { result } : {}
+    };
+  }
+  async get(requestIdRaw, options = {}) {
+    const requestId = requiredString(requestIdRaw, "requestId", 256, "request");
+    const payload = await this.requestJson(`/repository-agent/requests/${encodeURIComponent(requestId)}`, { method: "GET" }, options);
+    return sanitizeSnapshot(payload.request, requestId);
+  }
+  async ask(input, options = {}) {
+    const overallTimeoutMs = normalizePositiveDuration(options.timeoutMs, this.askTimeoutMs, 30 * 60000);
+    const durableDeadlineMs = Date.parse(input.deadlineAt);
+    const deadlineMs = Math.min(Date.now() + overallTimeoutMs, durableDeadlineMs);
+    const remaining = () => Math.max(0, deadlineMs - Date.now());
+    const callOptions = () => ({
+      signal: options.signal,
+      timeoutMs: Math.max(1, Math.min(this.requestTimeoutMs, remaining()))
+    });
+    if (remaining() <= 0)
+      invalidRequest("deadlineAt must be in the future");
+    const submitted = await this.submit(input, callOptions());
+    if (submitted.status === "completed" && submitted.result)
+      return submitted.result;
+    let pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? submitted.pollAfterMs, this.pollIntervalMs, 30000);
+    while (remaining() > 0) {
+      await sleepWithSignal(Math.min(pollAfterMs, remaining()), options.signal);
+      if (remaining() <= 0)
+        break;
+      const snapshot = await this.get(submitted.requestId, callOptions());
+      if (snapshot.status === "completed") {
+        if (!snapshot.result) {
+          invalidResponse("Completed Repository Agent request has no result");
+        }
+        return snapshot.result;
+      }
+      if (snapshot.status === "failed") {
+        throw new RepositoryAgentClientError("remote_failed", snapshot.error?.message ?? "Repository Agent request failed", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "cancelled") {
+        throw new RepositoryAgentClientError("remote_cancelled", snapshot.error?.message ?? "Repository Agent request was cancelled", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "expired") {
+        throw new RepositoryAgentClientError("remote_expired", snapshot.error?.message ?? "Repository Agent request expired", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? snapshot.pollAfterMs, pollAfterMs, 30000);
+    }
+    throw new RepositoryAgentClientError("timeout", `Repository Agent request ${submitted.requestId} did not complete before the caller deadline`, { requestId: submitted.requestId });
+  }
+}
+function createRepositoryAgentServiceClients(options) {
+  const repositoryAgent = options.repositoryAgent ?? new RepositoryAgentClient({
+    serverUrl: options.serverUrl,
+    callerService: options.callerService,
+    callerInstanceId: options.callerInstanceId,
+    authToken: options.authToken,
+    fetchImpl: options.fetchImpl,
+    requestTimeoutMs: options.requestTimeoutMs,
+    askTimeoutMs: options.askTimeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    maxResponseBytes: options.maxResponseBytes
+  });
+  const ownsMemoryStore = options.memoryStore === undefined;
+  const memoryStore = options.memoryStore ?? new MemoryHttpClient({
+    serverUrl: options.serverUrl,
+    authToken: options.authToken,
+    callerService: options.callerService,
+    authority: options.memoryAuthority,
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.memoryTimeoutMs,
+    maxResponseBytes: options.memoryMaxResponseBytes
+  });
+  let closePromise = null;
+  return Object.freeze({
+    repositoryAgent,
+    memoryStore,
+    close() {
+      if (!closePromise) {
+        closePromise = ownsMemoryStore ? memoryStore.close() : Promise.resolve();
+      }
+      return closePromise;
+    }
+  });
+}
 // packages/shared/src/communication.ts
 function stripPresenceSourcePrefix(value) {
   return value.replace(/^(agent|client)(?:[\s:./_-]+)+/i, "");
@@ -813,9 +2201,14 @@ function isLoopbackOrigin(origin) {
   }
 }
 function buildLocalCorsHeaders(options) {
+  const allowedHeaders = [
+    "content-type",
+    ...options.allowAuthorizationHeader ? ["authorization"] : [],
+    ...(options.additionalAllowedHeaders ?? []).map((header) => String(header ?? "").trim().toLowerCase()).filter((header) => /^[a-z0-9-]+$/.test(header))
+  ];
   const headers = {
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": options.allowAuthorizationHeader ? "content-type, authorization" : "content-type"
+    "Access-Control-Allow-Methods": "GET,POST,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": [...new Set(allowedHeaders)].join(", ")
   };
   const origin = String(options.origin ?? "").trim();
   if (isLoopbackOrigin(origin)) {
@@ -1696,29 +3089,53 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
 ]);
 // packages/shared/src/trusted_validation.ts
 var TRUSTED_VALIDATION_EXECUTABLES = new Set([
+  "bazel",
   "bun",
   "bunx",
+  "buf",
+  "bundle",
+  "cabal",
   "cargo",
+  "clojure",
+  "cmake",
   "coverage",
+  "ctest",
+  "dart",
   "deno",
   "docker",
   "docker-compose",
+  "dotnet",
   "eslint",
+  "flutter",
+  "git",
   "go",
+  "gradle",
   "jest",
+  "lein",
   "make",
+  "mix",
+  "mvn",
   "mypy",
   "node",
   "npm",
   "npx",
   "pnpm",
+  "composer",
+  "php",
   "pytest",
   "python",
   "python3",
   "ruff",
+  "rscript",
+  "ruby",
+  "stack",
+  "swift",
+  "terraform",
   "tsc",
   "uv",
   "vitest",
+  "zig",
+  "luac",
   "yarn"
 ]);
 // packages/shared/src/session_event_visibility.ts
@@ -1750,6 +3167,13 @@ function resolveLlmHttpTimeoutMs(explicit, fallback) {
   const environmentValue = Number(process.env.PUSHPALS_LLM_HTTP_TIMEOUT_MS);
   const configured = typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0 ? explicit : Number.isFinite(environmentValue) && environmentValue > 0 ? environmentValue : fallback;
   return Math.max(1, Math.floor(configured));
+}
+function llmAbortReason(signal) {
+  return signal.reason instanceof Error ? signal.reason : new DOMException("The LLM request was aborted", "AbortError");
+}
+function throwIfLlmAborted(signal) {
+  if (signal?.aborted)
+    throw llmAbortReason(signal);
 }
 function fetchLlmHttpResponse(input, init, timeoutMs, operation) {
   return fetchBufferedWithHardDeadline({
@@ -1954,6 +3378,7 @@ function normalizeOpenAiBaseFromEndpoint(rawEndpoint) {
   return trimmed;
 }
 async function runProcess(command, opts) {
+  throwIfLlmAborted(opts.signal);
   const bunRuntime = globalThis.Bun;
   if (typeof bunRuntime?.spawn === "function") {
     return runProcessWithBun(command, opts);
@@ -1968,7 +3393,8 @@ async function runProcessWithBun(command, opts) {
     stdin: typeof opts.stdin === "string" ? new Blob([opts.stdin]) : "ignore",
     timeoutMs,
     outputLimitBytes: 4 * 1024 * 1024,
-    streamDrainTimeoutMs: 2000
+    streamDrainTimeoutMs: 2000,
+    signal: opts.signal
   });
   return {
     code: result.exitCode,
@@ -1979,33 +3405,128 @@ async function runProcessWithBun(command, opts) {
   };
 }
 async function runProcessWithNode(command, opts) {
+  throwIfLlmAborted(opts.signal);
   const timeoutMs = opts.timeoutMs ?? 0;
   return new Promise((resolve4, reject) => {
     const child = spawn(command[0], command.slice(1), {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: "pipe"
+      stdio: "pipe",
+      detached: process.platform !== "win32",
+      windowsHide: true
     });
+    const nodeTerminationSpawner = (argv, spawnOptions) => {
+      const helper = spawn(argv[0], argv.slice(1), {
+        ...spawnOptions.cwd ? { cwd: spawnOptions.cwd } : {},
+        ...spawnOptions.env ? { env: spawnOptions.env } : {},
+        stdio: "ignore",
+        detached: spawnOptions.detached,
+        windowsHide: true
+      });
+      const exited = new Promise((resolveExit) => {
+        helper.once("error", () => resolveExit(1));
+        helper.once("exit", (code) => resolveExit(typeof code === "number" ? code : 1));
+      });
+      return {
+        pid: helper.pid ?? 0,
+        exited,
+        kill: (signal) => {
+          helper.kill(signal);
+        }
+      };
+    };
+    const outputLimit = 4 * 1024 * 1024;
     let stdout = "";
     let stderr = "";
     let finished = false;
-    let timedOut = false;
     let timeout = null;
+    let drainTimeout = null;
+    let closeResult = null;
+    let stopKind = null;
+    let stopReason = null;
+    let terminationFinished = false;
+    let resolveRootExit = null;
+    const rootExited = new Promise((resolveExit) => {
+      resolveRootExit = resolveExit;
+    });
+    const appendBounded = (current, chunk) => {
+      if (current.length >= outputLimit)
+        return current;
+      return `${current}${String(chunk)}`.slice(0, outputLimit);
+    };
     const cleanup = () => {
       if (timeout) {
         clearTimeout(timeout);
         timeout = null;
       }
+      if (drainTimeout) {
+        clearTimeout(drainTimeout);
+        drainTimeout = null;
+      }
+      opts.signal?.removeEventListener("abort", onAbort);
     };
+    const finish = () => {
+      if (finished)
+        return;
+      finished = true;
+      cleanup();
+      if (stopKind === "abort") {
+        reject(stopReason ?? new DOMException("The LLM subprocess was aborted", "AbortError"));
+        return;
+      }
+      resolve4({
+        code: stopKind === "timeout" ? 124 : closeResult?.code ?? null,
+        signal: stopKind ? "SIGKILL" : closeResult?.signal ?? null,
+        stdout,
+        stderr,
+        timedOut: stopKind === "timeout"
+      });
+    };
+    const finishAfterBoundedDrain = () => {
+      if (closeResult) {
+        finish();
+        return;
+      }
+      drainTimeout = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.stdin?.destroy();
+        finish();
+      }, 2000);
+      drainTimeout.unref();
+    };
+    const terminate = (kind, reason) => {
+      if (stopKind || finished)
+        return;
+      stopKind = kind;
+      stopReason = reason ?? null;
+      const target = {
+        pid: child.pid ?? 0,
+        exited: rootExited,
+        kill: (signal) => {
+          child.kill(signal);
+        }
+      };
+      terminateProcessTree(target, { spawn: nodeTerminationSpawner }).catch(() => {
+        return;
+      }).then(() => {
+        terminationFinished = true;
+        finishAfterBoundedDrain();
+      });
+    };
+    const onAbort = () => terminate("abort", llmAbortReason(opts.signal));
     child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
+      stdout = appendBounded(stdout, chunk);
     });
     child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
+      stderr = appendBounded(stderr, chunk);
     });
+    child.stdin?.on("error", () => {});
     child.once("error", (err) => {
       if (finished)
         return;
+      resolveRootExit?.(1);
+      resolveRootExit = null;
       finished = true;
       cleanup();
       reject(err);
@@ -2013,23 +3534,26 @@ async function runProcessWithNode(command, opts) {
     child.once("close", (code, signal) => {
       if (finished)
         return;
-      finished = true;
-      cleanup();
-      resolve4({ code, signal, stdout, stderr, timedOut });
+      closeResult = { code, signal };
+      resolveRootExit?.(typeof code === "number" ? code : 1);
+      resolveRootExit = null;
+      if (stopKind && !terminationFinished)
+        return;
+      finish();
+    });
+    child.once("exit", (code) => {
+      resolveRootExit?.(typeof code === "number" ? code : 1);
+      resolveRootExit = null;
     });
     if (timeoutMs > 0) {
       timeout = setTimeout(() => {
-        timedOut = true;
-        try {
-          child.kill("SIGTERM");
-        } catch {}
-        setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
-        }, 1000).unref();
+        terminate("timeout");
       }, timeoutMs);
+      timeout.unref();
     }
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    if (opts.signal?.aborted)
+      onAbort();
     if (typeof opts.stdin === "string") {
       child.stdin?.write(opts.stdin);
     }
@@ -2041,7 +3565,8 @@ function bunCodexCommandFromEnv(env) {
   const bunBin = (env.PUSHPALS_BUN_BIN ?? "").trim();
   return bunBin ? [bunBin, "x", "--yes", "@openai/codex"] : [];
 }
-async function resolveCodexCommandPrefix(configuredCommand) {
+async function resolveCodexCommandPrefix(configuredCommand, signal) {
+  throwIfLlmAborted(signal);
   const override = codexCommandOverrideParts(configuredCommand);
   const cacheKey = override.join("\x00");
   const cached = cachedCodexCommandPrefix.get(cacheKey);
@@ -2075,6 +3600,7 @@ async function resolveCodexCommandPrefix(configuredCommand) {
   const attemptErrors = [];
   const successfulProbes = [];
   for (const candidate of candidates) {
+    throwIfLlmAborted(signal);
     if (candidate.length === 0)
       continue;
     const rendered = `${candidate.join(" ")} --version`;
@@ -2082,7 +3608,8 @@ async function resolveCodexCommandPrefix(configuredCommand) {
       const probe = await runProcess([...candidate, "--version"], {
         cwd,
         env,
-        timeoutMs: 15000
+        timeoutMs: 15000,
+        signal
       });
       if (probe.code === 0) {
         const versionText = (probe.stdout || probe.stderr || "").trim().split(/\r?\n/, 1)[0] ?? "";
@@ -2098,6 +3625,7 @@ async function resolveCodexCommandPrefix(configuredCommand) {
       const detail = (probe.stderr || probe.stdout || "").trim();
       attemptErrors.push(`${rendered} -> exit ${probe.code ?? "unknown"}${detail ? ` (${detail.split(/\r?\n/, 1)[0]})` : ""}`);
     } catch (err) {
+      throwIfLlmAborted(signal);
       attemptErrors.push(`${rendered} -> ${String(err)}`);
     }
   }
@@ -2515,7 +4043,7 @@ class LmStudioClient {
     }
     return uniqueNonEmptyStrings([`${trimmed}/v1/models`, `${trimmed}/models`]);
   }
-  async discoverAvailableModels() {
+  async discoverAvailableModels(signal) {
     const probes = this.modelProbeUrls();
     const headers = { Accept: "application/json" };
     if (this.apiKey.trim()) {
@@ -2524,8 +4052,9 @@ class LmStudioClient {
     let lastDetail = "model-list probe failed";
     const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
     for (const url of probes) {
+      throwIfLlmAborted(signal);
       try {
-        const res = await fetchLlmHttpResponse(url, { method: "GET", headers }, timeoutMs, `${this.providerLabel} model-list probe`);
+        const res = await fetchLlmHttpResponse(url, { method: "GET", headers, signal }, timeoutMs, `${this.providerLabel} model-list probe`);
         if (!res.ok) {
           const body = await res.text();
           const hint = body.trim().slice(0, 120);
@@ -2539,32 +4068,43 @@ class LmStudioClient {
         }
         lastDetail = `${url} -> no models in payload`;
       } catch (err) {
+        throwIfLlmAborted(signal);
         lastDetail = `${url}: ${String(err)}`;
       }
     }
     return { models: [], detail: lastDetail };
   }
-  async resolveModelForRequest() {
+  async resolveUncachedModel(signal) {
+    throwIfLlmAborted(signal);
+    const configuredModel = this.model.trim();
+    const discovered = await this.discoverAvailableModels(signal);
+    throwIfLlmAborted(signal);
+    const selected = pickConfiguredOrAvailableModel(configuredModel, discovered.models);
+    if (selected.source === "available_fallback") {
+      console.warn(`[LLM] Configured model "${configuredModel || "(empty)"}" not present in ${this.providerLabel} model list; using discovered fallback "${selected.model}".`);
+    } else if (selected.source === "available_default") {
+      console.warn(`[LLM] No model configured; using discovered ${this.providerLabel} model "${selected.model}".`);
+    } else if (selected.source === "default_local_model") {
+      console.warn(`[LLM] No configured/discovered ${this.providerLabel} model available; falling back to default "${DEFAULT_MODEL}".`);
+    } else if (selected.source === "configured_unverified") {
+      console.warn(`[LLM] Could not verify configured model "${configuredModel}" via model list (${discovered.detail}); continuing with configured model.`);
+    }
+    console.log(`[LLM] ${this.providerLabel} resolved model "${selected.model}" (${selected.source}).`);
+    return selected.model;
+  }
+  async resolveModelForRequest(signal) {
+    throwIfLlmAborted(signal);
     if (this.resolvedModel)
       return this.resolvedModel;
+    if (signal) {
+      const resolved = await this.resolveUncachedModel(signal);
+      throwIfLlmAborted(signal);
+      this.resolvedModel = resolved;
+      return resolved;
+    }
     if (this.resolveModelPromise)
       return this.resolveModelPromise;
-    this.resolveModelPromise = (async () => {
-      const configuredModel = this.model.trim();
-      const discovered = await this.discoverAvailableModels();
-      const selected = pickConfiguredOrAvailableModel(configuredModel, discovered.models);
-      if (selected.source === "available_fallback") {
-        console.warn(`[LLM] Configured model "${configuredModel || "(empty)"}" not present in ${this.providerLabel} model list; using discovered fallback "${selected.model}".`);
-      } else if (selected.source === "available_default") {
-        console.warn(`[LLM] No model configured; using discovered ${this.providerLabel} model "${selected.model}".`);
-      } else if (selected.source === "default_local_model") {
-        console.warn(`[LLM] No configured/discovered ${this.providerLabel} model available; falling back to default "${DEFAULT_MODEL}".`);
-      } else if (selected.source === "configured_unverified") {
-        console.warn(`[LLM] Could not verify configured model "${configuredModel}" via model list (${discovered.detail}); continuing with configured model.`);
-      }
-      console.log(`[LLM] ${this.providerLabel} resolved model "${selected.model}" (${selected.source}).`);
-      return selected.model;
-    })();
+    this.resolveModelPromise = this.resolveUncachedModel();
     try {
       this.resolvedModel = await this.resolveModelPromise;
       return this.resolvedModel;
@@ -2587,7 +4127,8 @@ class LmStudioClient {
     }
   }
   async runLmStudioCompletion(messages, opts) {
-    const model = await this.resolveModelForRequest();
+    throwIfLlmAborted(opts.signal);
+    const model = await this.resolveModelForRequest(opts.signal);
     const coreBody = {
       model,
       messages,
@@ -2645,6 +4186,7 @@ class LmStudioClient {
     let loggedSessionFallback = false;
     let loggedResponseFormatFallback = false;
     for (let i = 0;i < bodyVariants.length; i++) {
+      throwIfLlmAborted(opts.signal);
       const body = bodyVariants[i];
       const headers = {
         ...lmStudioHeaders(this.apiKey)
@@ -2657,7 +4199,8 @@ class LmStudioClient {
       const res = await fetchLlmHttpResponse(this.endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: opts.signal
       }, this.httpTimeoutMs, `${this.providerLabel} completion request`);
       if (!res.ok) {
         lastStatus = res.status;
@@ -2683,6 +4226,7 @@ class LmStudioClient {
       const data = await res.json();
       const choice = data.choices?.[0];
       const text = choice?.message?.content ?? "";
+      const actualModelId = typeof data.model === "string" && data.model.trim() ? data.model.trim() : model;
       if ("session_id" in body || "conversation_id" in body) {
         this.lmStudioSupportsExtendedSessionFields = true;
       }
@@ -2693,9 +4237,13 @@ class LmStudioClient {
         promptTokens: Number(data.usage.prompt_tokens ?? 0),
         completionTokens: Number(data.usage.completion_tokens ?? 0)
       } : undefined, tokenUsageFromEstimate(messages, text));
-      await this.maybeReportUsage(model, usage);
+      throwIfLlmAborted(opts.signal);
+      await this.maybeReportUsage(actualModelId, usage);
+      throwIfLlmAborted(opts.signal);
       return {
         text,
+        provider: this.providerKind,
+        modelId: actualModelId,
         usage: {
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens
@@ -2704,7 +4252,7 @@ class LmStudioClient {
     }
     throw new Error(`${this.providerLabel} API error ${lastStatus}: ${lastError}`);
   }
-  async packContextInBatches(fullMessages, promptTokenBudget) {
+  async packContextInBatches(fullMessages, promptTokenBudget, signal) {
     const tailCount = this.batchTailMessages;
     const tailMessages = fullMessages.slice(-tailCount);
     const reservedTailTokens = sumEstimatedTokens(tailMessages) + 220;
@@ -2720,6 +4268,7 @@ class LmStudioClient {
     }
     let memory = "";
     for (let i = 0;i < chunks.length; i++) {
+      throwIfLlmAborted(signal);
       const chunk = chunks[i];
       const packPrompt = loadPromptTemplate("remotebuddy/context_packer_user_prompt.md", {
         batch_index: String(i + 1),
@@ -2734,7 +4283,7 @@ class LmStudioClient {
           content: CONTEXT_PACKER_SYSTEM_PROMPT
         },
         { role: "user", content: packPrompt }
-      ], { json: false, maxTokens: packMaxTokens, temperature: 0 });
+      ], { json: false, maxTokens: packMaxTokens, temperature: 0, signal });
       memory = packed.text.trim() || memory;
     }
     const packedMessages = [
@@ -2752,6 +4301,7 @@ ${memory}`
     return { messages: packedMessages, chunkCount: chunks.length };
   }
   async generate(input) {
+    throwIfLlmAborted(input.signal);
     const contextWindow = this.contextWindow;
     const minOutputTokens = this.minOutputTokens;
     const desiredMaxTokens = input.maxTokens ?? 2048;
@@ -2769,7 +4319,7 @@ ${memory}`
     let latestUserOverflow = false;
     if (promptTokensEstimate > promptTokenBudget) {
       try {
-        const packed = await this.packContextInBatches(fullMessages, promptTokenBudget);
+        const packed = await this.packContextInBatches(fullMessages, promptTokenBudget, input.signal);
         messages = packed.messages;
         packedChunkCount = packed.chunkCount;
         promptTokensEstimate = sumEstimatedTokens(messages);
@@ -2786,6 +4336,7 @@ ${memory}`
           latestUserOverflow = latestUserOverflow || packedTrimmed.latestUserOverflow;
         }
       } catch (err) {
+        throwIfLlmAborted(input.signal);
         throw new Error(`${this.providerLabel} batch context packing failed: ${String(err)}`);
       }
     }
@@ -2802,7 +4353,8 @@ ${memory}`
       json: input.json,
       jsonSchema: input.jsonSchema,
       maxTokens: safeMaxTokens,
-      temperature: input.temperature ?? 0.3
+      temperature: input.temperature ?? 0.3,
+      signal: input.signal
     });
   }
 }
@@ -2817,13 +4369,44 @@ ${JSON.stringify(input.jsonSchema, null, 2)}` : "";
 ${message.content ?? ""}
 `).join(`
 `);
-  return loadPromptTemplate("remotebuddy/codex_adapter_prompt_template.md", {
+  const promptTemplate = input.executionContext?.repositoryMode === "isolated-evidence" ? "remotebuddy/repository_agent_codex_prompt_template.md" : "remotebuddy/codex_adapter_prompt_template.md";
+  return loadPromptTemplate(promptTemplate, {
     json_requirements: jsonRequirements,
     json_schema_block: jsonSchemaBlock,
     max_tokens_line: maxTokensLine,
     system_instruction: input.system,
     conversation_transcript: conversationTranscript
   });
+}
+async function prepareCodexExecutionWorkspace(input) {
+  throwIfLlmAborted(input.signal);
+  const repositoryMode = input.executionContext?.repositoryMode ?? "none";
+  if (repositoryMode !== "isolated-evidence") {
+    return { cwd: process.cwd(), repositoryMode: "none", cleanup: () => {
+      return;
+    } };
+  }
+  if ("cwd" in input.executionContext && String(input.executionContext.cwd ?? "").trim()) {
+    throw new Error("Codex isolated-evidence execution does not accept a target repository cwd.");
+  }
+  const cwd = mkdtempSync(join3(tmpdir(), "pushpals-repository-agent-neutral-"));
+  const cleanup = () => rmSync(cwd, { recursive: true, force: true });
+  try {
+    const initialized = await runProcess(["git", "init", "--quiet"], {
+      cwd,
+      env: process.env,
+      timeoutMs: 5000,
+      signal: input.signal
+    });
+    if (initialized.timedOut || initialized.code !== 0) {
+      const detail = (initialized.stderr || initialized.stdout || "git init failed").trim();
+      throw new Error(`Cannot prepare isolated Repository Agent workspace: ${detail}`);
+    }
+    return { cwd, repositoryMode, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }
 
 class OpenAiCodexCliClient {
@@ -2874,11 +4457,12 @@ class OpenAiCodexCliClient {
     const envKey = (process.env.OPENAI_API_KEY ?? "").trim();
     return this.apiKey || envKey ? "api_key" : "chatgpt";
   }
-  async ensureChatGptLoginReady(commandPrefix, env) {
+  async ensureChatGptLoginReady(commandPrefix, env, signal) {
     const status = await runProcess([...commandPrefix, "login", "status"], {
       cwd: process.cwd(),
       env,
-      timeoutMs: 25000
+      timeoutMs: 25000,
+      signal
     });
     if (status.code === 0)
       return;
@@ -2903,15 +4487,19 @@ class OpenAiCodexCliClient {
       await this.ensureChatGptLoginReady(commandPrefix, env);
     }
   }
-  async runCodexExec(prompt) {
+  async runCodexExec(prompt, cwd, repositoryMode, signal) {
     return this.runCodexExecAttempt(prompt, {
       model: this.model,
-      modelCompatibilityRecoveryAttempt: 0
+      modelCompatibilityRecoveryAttempt: 0,
+      cwd,
+      repositoryMode,
+      signal
     });
   }
   async runCodexExecAttempt(prompt, opts) {
+    throwIfLlmAborted(opts.signal);
     const model = normalizeCodexModel(opts.model);
-    const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
+    const commandPrefix = await resolveCodexCommandPrefix(this.codexBin, opts.signal);
     const env = { ...process.env };
     env.PYTHONIOENCODING = "utf-8";
     env.PUSHPALS_LLM_SERVICE = this.service;
@@ -2921,7 +4509,7 @@ class OpenAiCodexCliClient {
       delete env.OPENAI_API_KEY;
       delete env.OPENAI_BASE_URL;
       delete env.OPENAI_API_BASE;
-      await this.ensureChatGptLoginReady(commandPrefix, env);
+      await this.ensureChatGptLoginReady(commandPrefix, env, opts.signal);
     } else {
       const finalApiKey = this.apiKey || (process.env.OPENAI_API_KEY ?? "").trim();
       if (!finalApiKey) {
@@ -2945,11 +4533,25 @@ class OpenAiCodexCliClient {
         ...commandPrefix,
         "-c",
         `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort, model)}"`,
+        ...opts.repositoryMode === "isolated-evidence" ? [
+          "-c",
+          "project_doc_max_bytes=0",
+          "-c",
+          "project_doc_fallback_filenames=[]",
+          "-c",
+          'web_search="disabled"',
+          "--strict-config",
+          "--disable",
+          "shell_tool",
+          "--disable",
+          "apps"
+        ] : [],
         "-a",
         "never",
         "-s",
         "read-only",
         "exec",
+        ...opts.repositoryMode === "isolated-evidence" ? ["--ignore-user-config", "--ignore-rules", "--ephemeral"] : [],
         "--color",
         "never",
         "--output-last-message",
@@ -2960,10 +4562,11 @@ class OpenAiCodexCliClient {
       }
       command.push("-");
       const result = await runProcess(command, {
-        cwd: process.cwd(),
+        cwd: opts.cwd,
         env,
         stdin: prompt,
-        timeoutMs: codexTimeoutMs(this.codexTimeoutMs)
+        timeoutMs: codexTimeoutMs(this.codexTimeoutMs),
+        signal: opts.signal
       });
       if (result.timedOut) {
         throw new Error(`Codex CLI request timed out after ${codexTimeoutMs(this.codexTimeoutMs)}ms.`);
@@ -2977,7 +4580,10 @@ class OpenAiCodexCliClient {
           console.warn(`[LLM] Codex CLI rejected default model ${DEFAULT_CODEX_MODEL}; retrying once with ${LEGACY_CODEX_MODEL_FALLBACK}. Upgrade Codex CLI to use ${DEFAULT_CODEX_MODEL}.`);
           return this.runCodexExecAttempt(prompt, {
             model: LEGACY_CODEX_MODEL_FALLBACK,
-            modelCompatibilityRecoveryAttempt: opts.modelCompatibilityRecoveryAttempt + 1
+            modelCompatibilityRecoveryAttempt: opts.modelCompatibilityRecoveryAttempt + 1,
+            cwd: opts.cwd,
+            repositoryMode: opts.repositoryMode,
+            signal: opts.signal
           });
         }
         throw new Error(`Codex CLI request failed (exit ${result.code ?? "unknown"}): ${detail}`);
@@ -2992,26 +4598,36 @@ class OpenAiCodexCliClient {
     }
   }
   async generate(input) {
+    throwIfLlmAborted(input.signal);
     const prompt = renderCodexPrompt(input);
-    const result = await this.runCodexExec(prompt);
-    if (result.stderr) {
-      const firstLine = result.stderr.split(/\r?\n/).find((line) => line.trim().length > 0);
-      if (firstLine) {
-        console.warn(`[LLM] Codex CLI stderr (${this.service}): ${firstLine.trim()}`);
+    const workspace = await prepareCodexExecutionWorkspace(input);
+    try {
+      const result = await this.runCodexExec(prompt, workspace.cwd, workspace.repositoryMode, input.signal);
+      throwIfLlmAborted(input.signal);
+      if (result.stderr) {
+        const firstLine = result.stderr.split(/\r?\n/).find((line) => line.trim().length > 0);
+        if (firstLine) {
+          console.warn(`[LLM] Codex CLI stderr (${this.service}): ${firstLine.trim()}`);
+        }
       }
+      const usage = normalizeTokenUsage(undefined, {
+        promptTokens: estimateTokensFromText(prompt),
+        completionTokens: estimateTokensFromText(result.text)
+      });
+      await this.maybeReportUsage({ ...usage, modelId: result.model });
+      throwIfLlmAborted(input.signal);
+      return {
+        text: result.text,
+        provider: "openai_codex",
+        modelId: result.model,
+        usage: {
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens
+        }
+      };
+    } finally {
+      workspace.cleanup();
     }
-    const usage = normalizeTokenUsage(undefined, {
-      promptTokens: estimateTokensFromText(prompt),
-      completionTokens: estimateTokensFromText(result.text)
-    });
-    await this.maybeReportUsage({ ...usage, modelId: result.model });
-    return {
-      text: result.text,
-      usage: {
-        promptTokens: usage.promptTokens,
-        completionTokens: usage.completionTokens
-      }
-    };
   }
 }
 
@@ -3031,7 +4647,7 @@ class OllamaClient {
     this.usageReporter = opts?.usageReporter ?? null;
     this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
-  async maybeReportUsage(usage) {
+  async maybeReportUsage(modelId, usage) {
     if (!this.usageReporter)
       return;
     try {
@@ -3039,7 +4655,7 @@ class OllamaClient {
         service: this.service,
         sessionId: this.sessionTag || undefined,
         backend: "ollama",
-        modelId: this.model,
+        modelId,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         totalTokens: usage.promptTokens + usage.completionTokens,
@@ -3090,6 +4706,7 @@ class OllamaClient {
     }
   }
   async generate(input) {
+    throwIfLlmAborted(input.signal);
     const body = {
       model: this.model,
       messages: [
@@ -3110,7 +4727,8 @@ class OllamaClient {
     const res = await fetchLlmHttpResponse(this.endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: input.signal
     }, this.httpTimeoutMs, "Ollama completion request");
     if (!res.ok) {
       const err = await res.text();
@@ -3118,10 +4736,15 @@ class OllamaClient {
     }
     const data = await res.json();
     const text = data.message?.content ?? "";
+    const actualModelId = typeof data.model === "string" && data.model.trim() ? data.model.trim() : this.model;
     const usage = normalizeTokenUsage(undefined, tokenUsageFromEstimate(body.messages, text));
-    await this.maybeReportUsage(usage);
+    throwIfLlmAborted(input.signal);
+    await this.maybeReportUsage(actualModelId, usage);
+    throwIfLlmAborted(input.signal);
     return {
       text,
+      provider: "ollama",
+      modelId: actualModelId,
       usage: {
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens
@@ -3979,12 +5602,14 @@ class LocalBuddyServer {
   repo;
   authToken;
   llm;
+  repositoryServices;
   recentJobFailures = [];
   seenJobFailureKeys = new Set;
   constructor(opts) {
     this.server = opts.server;
     this.sessionId = opts.sessionId;
     this.authToken = opts.authToken;
+    this.repositoryServices = opts.repositoryServices;
     this.repo = detectRepoRoot(process.cwd());
     console.log(`[LocalBuddy] Detected repo root: ${this.repo}`);
     const llmCfg = CONFIG.localbuddy.llm;
@@ -4295,6 +5920,7 @@ ${tail.join(`
       try {
         stopSessionEvents();
       } catch {}
+      this.repositoryServices.close().catch(() => {});
     };
     process.once("SIGINT", stopMonitor);
     process.once("SIGTERM", stopMonitor);
@@ -4554,12 +6180,26 @@ async function main() {
   console.log(`[LocalBuddy] Ensuring session "${opts.sessionId}" exists on server\u2026`);
   const sessionId = await connectWithRetry(opts.server, opts.sessionId);
   console.log(`[LocalBuddy] Using session: ${sessionId}`);
+  const repositoryServices = createRepositoryAgentServiceClients({
+    serverUrl: opts.server,
+    callerService: "localbuddy",
+    callerInstanceId: "localbuddy-1",
+    authToken: opts.authToken,
+    requestTimeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS,
+    memoryTimeoutMs: LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS
+  });
   const agent = new LocalBuddyServer({
     server: opts.server,
     sessionId,
-    authToken: opts.authToken
+    authToken: opts.authToken,
+    repositoryServices
   });
-  await agent.startServer(opts.port);
+  try {
+    await agent.startServer(opts.port);
+  } catch (error) {
+    await repositoryServices.close();
+    throw error;
+  }
 }
 main().catch((err) => {
   console.error("[LocalBuddy] Fatal:", err);

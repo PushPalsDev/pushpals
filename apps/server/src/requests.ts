@@ -8,7 +8,7 @@
  *   4. RemoteBuddy processes and marks complete/failed
  */
 
-import { Database } from "bun:sqlite";
+import { Database, type Changes, type SQLQueryBindings } from "bun:sqlite";
 import { randomUUID } from "crypto";
 import {
   normalizeAutonomyComponentArea,
@@ -120,6 +120,33 @@ function sanitizeRequestMetadata(input: unknown): {
       error: `autonomy metadata scope invalid: ${scope.errors.join("; ")}`,
     };
   }
+  const validationIncidentInput = asObject(
+    autonomy.validationIncident ?? autonomy.validation_incident,
+  );
+  const validationIncidentId = asString(
+    validationIncidentInput?.incidentId ?? validationIncidentInput?.incident_id,
+  ).slice(0, 256);
+  const validationIncident = validationIncidentId
+    ? {
+        incidentId: validationIncidentId,
+        candidateSha: asString(
+          validationIncidentInput?.candidateSha ?? validationIncidentInput?.candidate_sha,
+        ).slice(0, 128),
+        candidateRef: asString(
+          validationIncidentInput?.candidateRef ?? validationIncidentInput?.candidate_ref,
+        ).slice(0, 256),
+        baselineSha: asString(
+          validationIncidentInput?.baselineSha ?? validationIncidentInput?.baseline_sha,
+        ).slice(0, 128),
+        validationScope: asString(
+          validationIncidentInput?.validationScope ?? validationIncidentInput?.validation_scope,
+        ).slice(0, 64),
+        failureFingerprint: asString(
+          validationIncidentInput?.failureFingerprint ??
+            validationIncidentInput?.failure_fingerprint,
+        ).slice(0, 256),
+      }
+    : null;
   return {
     metadata: {
       origin: "autonomy",
@@ -133,6 +160,7 @@ function sanitizeRequestMetadata(input: unknown): {
         writeGlobs: scope.normalizedWriteGlobs,
         reservationRequired:
           autonomy.reservationRequired === true || autonomy.reservation_required === true,
+        ...(validationIncident ? { validationIncident } : {}),
       },
     },
   };
@@ -355,8 +383,41 @@ export class RequestQueue {
     this._migrate();
   }
 
+  /**
+   * Bun finalizes transient prepared statements during garbage collection.
+   * That is normally invisible, but `sqlite3_close_v2` keeps the database and
+   * WAL handles alive until those finalizers run. Keep statement ownership
+   * synchronous so `close()` is a real lifecycle boundary on Windows too.
+   */
+  private all<T>(sql: string, ...bindings: SQLQueryBindings[]): T[] {
+    const statement = this.db.prepare<T, SQLQueryBindings[]>(sql);
+    try {
+      return statement.all(...bindings);
+    } finally {
+      statement.finalize();
+    }
+  }
+
+  private get<T>(sql: string, ...bindings: SQLQueryBindings[]): T | null {
+    const statement = this.db.prepare<T, SQLQueryBindings[]>(sql);
+    try {
+      return statement.get(...bindings);
+    } finally {
+      statement.finalize();
+    }
+  }
+
+  private run(sql: string, ...bindings: SQLQueryBindings[]): Changes {
+    const statement = this.db.prepare<unknown, SQLQueryBindings[]>(sql);
+    try {
+      return statement.run(...bindings);
+    } finally {
+      statement.finalize();
+    }
+  }
+
   private supportsJobOutcomeProjection(): boolean {
-    const columns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{ name: string }>;
+    const columns = this.all<{ name: string }>(`PRAGMA table_info(jobs)`);
     const names = new Set(columns.map((column) => column.name));
     return [
       "id",
@@ -384,13 +445,12 @@ export class RequestQueue {
     }
 
     const placeholders = handoffIds.map(() => "?").join(", ");
-    const handoffJobs = this.db
-      .prepare(
-        `SELECT id, status, failedAt, abandonedAt, publishBlockedAt, completedAt, updatedAt
-         FROM jobs
-         WHERE id IN (${placeholders})`,
-      )
-      .all(...handoffIds) as HandoffJobOutcomeRow[];
+    const handoffJobs = this.all<HandoffJobOutcomeRow>(
+      `SELECT id, status, failedAt, abandonedAt, publishBlockedAt, completedAt, updatedAt
+       FROM jobs
+       WHERE id IN (${placeholders})`,
+      ...handoffIds,
+    );
     const jobsById = new Map(handoffJobs.map((job) => [job.id, job]));
     return rows.map((row) =>
       projectRequestOutcome(row, jobsById.get(asString(row.handoffJobId)) ?? null),
@@ -434,7 +494,7 @@ export class RequestQueue {
       CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(sessionId);
     `);
 
-    const columns = this.db.prepare(`PRAGMA table_info(requests)`).all() as Array<{ name: string }>;
+    const columns = this.all<{ name: string }>(`PRAGMA table_info(requests)`);
     const ensureColumn = (name: string, sql: string) => {
       if (!columns.some((col) => col.name === name)) this.db.exec(sql);
     };
@@ -525,39 +585,36 @@ export class RequestQueue {
     // stale callback after a same-agent reclaim. Requeue legacy claims so the
     // next owner receives a fresh token and generation.
     const migrationNow = new Date().toISOString();
-    this.db
-      .prepare(
-        `UPDATE requests
-         SET status = 'pending',
-             agentId = NULL,
-             claimToken = NULL,
-             claimedAt = NULL,
-             leaseExpiresAt = NULL,
-             lastHeartbeatAt = NULL,
-             deferReason = NULL,
-             updatedAt = ?
-         WHERE status = 'claimed'
-           AND (claimToken IS NULL OR claimToken = '')`,
-      )
-      .run(migrationNow);
+    this.run(
+      `UPDATE requests
+       SET status = 'pending',
+           agentId = NULL,
+           claimToken = NULL,
+           claimedAt = NULL,
+           leaseExpiresAt = NULL,
+           lastHeartbeatAt = NULL,
+           deferReason = NULL,
+           updatedAt = ?
+       WHERE status = 'claimed'
+         AND (claimToken IS NULL OR claimToken = '')`,
+      migrationNow,
+    );
   }
 
   private pendingOrderedIds(): string[] {
-    const rows = this.db
-      .prepare(
-        `SELECT id, priority, createdAt
-         FROM requests
-         WHERE status = 'pending'
-         ORDER BY
-           CASE LOWER(priority)
-             WHEN 'interactive' THEN 0
-             WHEN 'normal' THEN 1
-             WHEN 'background' THEN 2
-             ELSE 1
-           END ASC,
-           createdAt ASC`,
-      )
-      .all() as Array<{ id: string }>;
+    const rows = this.all<{ id: string }>(
+      `SELECT id, priority, createdAt
+       FROM requests
+       WHERE status = 'pending'
+       ORDER BY
+         CASE LOWER(priority)
+           WHEN 'interactive' THEN 0
+           WHEN 'normal' THEN 1
+           WHEN 'background' THEN 2
+           ELSE 1
+         END ASC,
+         createdAt ASC`,
+    );
     return rows.map((row) => row.id);
   }
 
@@ -611,62 +668,58 @@ export class RequestQueue {
     }
 
     if (idempotencyKey) {
-      const existing = this.db
-        .prepare(
-          `SELECT id, priority, status
-           FROM requests
-           WHERE idempotencyKey = ?
-           ORDER BY createdAt DESC
-           LIMIT 1`,
-        )
-        .get(idempotencyKey) as {
+      const existing = this.get<{
         id: string;
         priority: QueuePriority;
         status: RequestStatus;
-      } | null;
+      }>(
+        `SELECT id, priority, status
+         FROM requests
+         WHERE idempotencyKey = ?
+         ORDER BY createdAt DESC
+         LIMIT 1`,
+        idempotencyKey,
+      );
       if (existing?.id) {
         if (existing.status === "failed") {
           const now = new Date().toISOString();
-          const reopened = this.db
-            .prepare(
-              `UPDATE requests
-               SET sessionId = ?,
-                   prompt = ?,
-                   priority = ?,
-                   queueWaitBudgetMs = ?,
-                   metadataJson = ?,
-                   forceWorker = ?,
-                   forceLane = ?,
-                   workerRequired = ?,
-                   handoffJobId = NULL,
-                   status = 'pending',
-                   agentId = NULL,
-                   claimToken = NULL,
-                   result = NULL,
-                   error = NULL,
-                   enqueuedAt = ?,
-                   claimedAt = NULL,
-                   leaseExpiresAt = NULL,
-                   lastHeartbeatAt = NULL,
-                   completedAt = NULL,
-                   failedAt = NULL,
-                   durationMs = NULL,
-                   updatedAt = ?
-               WHERE id = ? AND status = 'failed'`,
-            )
-            .run(
-              sessionId,
-              prompt,
-              priority,
-              queueWaitBudgetMs,
-              metadataJson,
-              forceWorker,
-              forceLane,
-              forceWorker,
-              now,
-              now,
-              existing.id,
-            );
+          const reopened = this.run(
+            `UPDATE requests
+             SET sessionId = ?,
+                 prompt = ?,
+                 priority = ?,
+                 queueWaitBudgetMs = ?,
+                 metadataJson = ?,
+                 forceWorker = ?,
+                 forceLane = ?,
+                 workerRequired = ?,
+                 handoffJobId = NULL,
+                 status = 'pending',
+                 agentId = NULL,
+                 claimToken = NULL,
+                 result = NULL,
+                 error = NULL,
+                 enqueuedAt = ?,
+                 claimedAt = NULL,
+                 leaseExpiresAt = NULL,
+                 lastHeartbeatAt = NULL,
+                 completedAt = NULL,
+                 failedAt = NULL,
+                 durationMs = NULL,
+                 updatedAt = ?
+             WHERE id = ? AND status = 'failed'`,
+            sessionId,
+            prompt,
+            priority,
+            queueWaitBudgetMs,
+            metadataJson,
+            forceWorker,
+            forceLane,
+            forceWorker,
+            now,
+            now,
+            existing.id,
+          );
           if (reopened.changes > 0) {
             const queuePosition = this.queuePosition(existing.id);
             const etaMs = this.estimateEtaMs(priority, queuePosition);
@@ -695,30 +748,27 @@ export class RequestQueue {
     const requestId = randomUUID();
     const now = new Date().toISOString();
 
-    this.db
-      .prepare(
-        `INSERT INTO requests (
-          id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
-          workerRequired, handoffJobId, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
-          enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
-        )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+    this.run(
+      `INSERT INTO requests (
+        id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
+        workerRequired, handoffJobId, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
+        enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
       )
-      .run(
-        requestId,
-        sessionId,
-        prompt,
-        priority,
-        queueWaitBudgetMs,
-        metadataJson,
-        idempotencyKey,
-        forceWorker,
-        forceLane,
-        forceWorker,
-        now,
-        now,
-        now,
-      );
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+      requestId,
+      sessionId,
+      prompt,
+      priority,
+      queueWaitBudgetMs,
+      metadataJson,
+      idempotencyKey,
+      forceWorker,
+      forceLane,
+      forceWorker,
+      now,
+      now,
+      now,
+    );
 
     const queuePosition = this.queuePosition(requestId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);
@@ -759,44 +809,47 @@ export class RequestQueue {
 
     const tx = this.db.transaction(() => {
       this.recoverExpiredClaims(now);
-      const row = this.db
-        .prepare(
-          `SELECT ${RequestQueue.SELECT_COLUMNS}
-           FROM requests
-           WHERE status = 'pending'
-           ORDER BY
-             CASE LOWER(priority)
-               WHEN 'interactive' THEN 0
-               WHEN 'normal' THEN 1
-               WHEN 'background' THEN 2
-               ELSE 1
-             END ASC,
-             createdAt ASC
-           LIMIT 1`,
-        )
-        .get() as RequestRow | undefined;
+      const row = this.get<RequestRow>(
+        `SELECT ${RequestQueue.SELECT_COLUMNS}
+         FROM requests
+         WHERE status = 'pending'
+         ORDER BY
+           CASE LOWER(priority)
+             WHEN 'interactive' THEN 0
+             WHEN 'normal' THEN 1
+             WHEN 'background' THEN 2
+             ELSE 1
+           END ASC,
+           createdAt ASC
+         LIMIT 1`,
+      );
 
       if (!row) return null;
 
-      this.db
-        .prepare(
-          `UPDATE requests
-           SET status = 'claimed',
-               agentId = ?,
-               claimToken = ?,
-               claimGeneration = COALESCE(claimGeneration, 0) + 1,
-               claimedAt = ?,
-               leaseExpiresAt = ?,
-               lastHeartbeatAt = ?,
-               deferReason = NULL,
-               claimAttempts = COALESCE(claimAttempts, 0) + 1,
-               completedAt = NULL,
-               failedAt = NULL,
-               durationMs = NULL,
-               updatedAt = ?
-           WHERE id = ?`,
-        )
-        .run(agentId, claimToken, now, leaseExpiresAt, now, now, row.id);
+      this.run(
+        `UPDATE requests
+         SET status = 'claimed',
+             agentId = ?,
+             claimToken = ?,
+             claimGeneration = COALESCE(claimGeneration, 0) + 1,
+             claimedAt = ?,
+             leaseExpiresAt = ?,
+             lastHeartbeatAt = ?,
+             deferReason = NULL,
+             claimAttempts = COALESCE(claimAttempts, 0) + 1,
+             completedAt = NULL,
+             failedAt = NULL,
+             durationMs = NULL,
+             updatedAt = ?
+         WHERE id = ?`,
+        agentId,
+        claimToken,
+        now,
+        leaseExpiresAt,
+        now,
+        now,
+        row.id,
+      );
 
       const queueWaitMs = Math.max(
         0,
@@ -844,18 +897,23 @@ export class RequestQueue {
     const leaseExpiresAt = new Date(
       Date.parse(now) + normalizeRequestLeaseMs(options.leaseMs),
     ).toISOString();
-    const result = this.db
-      .prepare(
-        `UPDATE requests
-         SET lastHeartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND agentId = ?
-           AND claimToken = ?
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?`,
-      )
-      .run(now, leaseExpiresAt, now, requestId, agentId, claimToken, now);
+    const result = this.run(
+      `UPDATE requests
+       SET lastHeartbeatAt = ?, leaseExpiresAt = ?, updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND agentId = ?
+         AND claimToken = ?
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?`,
+      now,
+      leaseExpiresAt,
+      now,
+      requestId,
+      agentId,
+      claimToken,
+      now,
+    );
     if (result.changes === 0) {
       return {
         ok: false,
@@ -903,21 +961,27 @@ export class RequestQueue {
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 160);
-    const result = this.db
-      .prepare(
-        `UPDATE requests
-         SET leaseExpiresAt = ?,
-             lastHeartbeatAt = ?,
-             deferReason = ?,
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND agentId = ?
-           AND claimToken = ?
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?`,
-      )
-      .run(deferredUntil, now, deferReason || null, now, requestId, agentId, claimToken, now);
+    const result = this.run(
+      `UPDATE requests
+       SET leaseExpiresAt = ?,
+           lastHeartbeatAt = ?,
+           deferReason = ?,
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND agentId = ?
+         AND claimToken = ?
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?`,
+      deferredUntil,
+      now,
+      deferReason || null,
+      now,
+      requestId,
+      agentId,
+      claimToken,
+      now,
+    );
     if (result.changes === 0) {
       return {
         ok: false,
@@ -966,30 +1030,29 @@ export class RequestQueue {
   } {
     const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
     const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
-    const rows = this.db
-      .prepare(
-        `SELECT id FROM requests
-         WHERE status = 'claimed'
-           AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
-         ORDER BY createdAt ASC`,
-      )
-      .all(now) as Array<{ id: string }>;
+    const rows = this.all<{ id: string }>(
+      `SELECT id FROM requests
+       WHERE status = 'claimed'
+         AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+       ORDER BY createdAt ASC`,
+      now,
+    );
     if (rows.length === 0) return { recovered: 0, requestIds: [] };
-    const result = this.db
-      .prepare(
-        `UPDATE requests
-         SET status = 'pending',
-             agentId = NULL,
-             claimToken = NULL,
-             claimedAt = NULL,
-             leaseExpiresAt = NULL,
-             lastHeartbeatAt = NULL,
-             deferReason = NULL,
-             updatedAt = ?
-         WHERE status = 'claimed'
-           AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`,
-      )
-      .run(now, now);
+    const result = this.run(
+      `UPDATE requests
+       SET status = 'pending',
+           agentId = NULL,
+           claimToken = NULL,
+           claimedAt = NULL,
+           leaseExpiresAt = NULL,
+           lastHeartbeatAt = NULL,
+           deferReason = NULL,
+           updatedAt = ?
+       WHERE status = 'claimed'
+         AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`,
+      now,
+      now,
+    );
     return {
       recovered: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id),
@@ -1025,27 +1088,26 @@ export class RequestQueue {
       // Report only a bounded ID sample while shortening the complete durable
       // set in SQLite. Restart recovery must not strand row limit + 1 behind a
       // legacy long lease.
-      const rows = this.db
-        .prepare(
-          `SELECT id
-           FROM requests
-           WHERE status = 'claimed'
-             AND (
-               deferReason = 'worker_runtime_circuit_open'
-               OR (
-                 ? = 1
-                 AND deferReason IS NULL
-                 AND json_valid(metadataJson)
-                 AND json_extract(metadataJson, '$.origin') = 'autonomy'
-               )
+      const rows = this.all<{ id: string }>(
+        `SELECT id
+         FROM requests
+         WHERE status = 'claimed'
+           AND (
+             deferReason = 'worker_runtime_circuit_open'
+             OR (
+               ? = 1
+               AND deferReason IS NULL
+               AND json_valid(metadataJson)
+               AND json_extract(metadataJson, '$.origin') = 'autonomy'
              )
-             AND leaseExpiresAt > ?
-           ORDER BY updatedAt ASC, createdAt ASC
-           LIMIT ?`,
-        )
-        .all(includeLegacyAutonomyClaims ? 1 : 0, deferredUntil, limit) as Array<{
-        id: string;
-      }>;
+           )
+           AND leaseExpiresAt > ?
+         ORDER BY updatedAt ASC, createdAt ASC
+         LIMIT ?`,
+        includeLegacyAutonomyClaims ? 1 : 0,
+        deferredUntil,
+        limit,
+      );
       if (rows.length === 0) {
         return {
           shortened: 0,
@@ -1057,33 +1119,37 @@ export class RequestQueue {
 
       const ids = rows.map((row) => row.id);
       const placeholders = ids.map(() => "?").join(",");
-      const reportedRows = this.db
-        .prepare(
-          `UPDATE requests
-           SET leaseExpiresAt = ?, updatedAt = ?
-           WHERE id IN (${placeholders})
-             AND status = 'claimed'
-             AND leaseExpiresAt > ?
-           RETURNING id`,
-        )
-        .all(deferredUntil, now, ...ids, deferredUntil) as Array<{ id: string }>;
-      const unreported = this.db
-        .prepare(
-          `UPDATE requests
-           SET leaseExpiresAt = ?, updatedAt = ?
-           WHERE status = 'claimed'
-             AND (
-               deferReason = 'worker_runtime_circuit_open'
-               OR (
-                 ? = 1
-                 AND deferReason IS NULL
-                 AND json_valid(metadataJson)
-                 AND json_extract(metadataJson, '$.origin') = 'autonomy'
-               )
+      const reportedRows = this.all<{ id: string }>(
+        `UPDATE requests
+         SET leaseExpiresAt = ?, updatedAt = ?
+         WHERE id IN (${placeholders})
+           AND status = 'claimed'
+           AND leaseExpiresAt > ?
+         RETURNING id`,
+        deferredUntil,
+        now,
+        ...ids,
+        deferredUntil,
+      );
+      const unreported = this.run(
+        `UPDATE requests
+         SET leaseExpiresAt = ?, updatedAt = ?
+         WHERE status = 'claimed'
+           AND (
+             deferReason = 'worker_runtime_circuit_open'
+             OR (
+               ? = 1
+               AND deferReason IS NULL
+               AND json_valid(metadataJson)
+               AND json_extract(metadataJson, '$.origin') = 'autonomy'
              )
-             AND leaseExpiresAt > ?`,
-        )
-        .run(deferredUntil, now, includeLegacyAutonomyClaims ? 1 : 0, deferredUntil);
+           )
+           AND leaseExpiresAt > ?`,
+        deferredUntil,
+        now,
+        includeLegacyAutonomyClaims ? 1 : 0,
+        deferredUntil,
+      );
       return {
         shortened: reportedRows.length + unreported.changes,
         requestIds: reportedRows.map((row) => row.id),
@@ -1099,25 +1165,23 @@ export class RequestQueue {
     requestIds: string[];
   } {
     const now = new Date(nowMs).toISOString();
-    const rows = this.db
-      .prepare(
-        `SELECT id
-         FROM requests
-         WHERE status = 'claimed'
-           AND deferReason = 'worker_runtime_circuit_open'
-         ORDER BY updatedAt ASC, createdAt ASC
-         LIMIT 1000`,
-      )
-      .all() as Array<{ id: string }>;
+    const rows = this.all<{ id: string }>(
+      `SELECT id
+       FROM requests
+       WHERE status = 'claimed'
+         AND deferReason = 'worker_runtime_circuit_open'
+       ORDER BY updatedAt ASC, createdAt ASC
+       LIMIT 1000`,
+    );
     if (rows.length === 0) return { released: 0, requestIds: [] };
-    const result = this.db
-      .prepare(
-        `UPDATE requests
-         SET leaseExpiresAt = ?, deferReason = NULL, updatedAt = ?
-         WHERE status = 'claimed'
-           AND deferReason = 'worker_runtime_circuit_open'`,
-      )
-      .run(now, now);
+    const result = this.run(
+      `UPDATE requests
+       SET leaseExpiresAt = ?, deferReason = NULL, updatedAt = ?
+       WHERE status = 'claimed'
+         AND deferReason = 'worker_runtime_circuit_open'`,
+      now,
+      now,
+    );
     return {
       released: result.changes,
       requestIds: rows.slice(0, result.changes).map((row) => row.id),
@@ -1144,9 +1208,7 @@ export class RequestQueue {
       cycleDetected: 0,
       depthLimitReached: 0,
     });
-    const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{
-      name: string;
-    }>;
+    const jobColumns = this.all<{ name: string }>(`PRAGMA table_info(jobs)`);
     const requiredJobColumns = ["id", "status", "resumeOfJobId", "attempt", "createdAt"];
     const jobColumnNames = new Set(jobColumns.map((column) => column.name));
     if (!requiredJobColumns.every((name) => jobColumnNames.has(name))) return emptyResult();
@@ -1163,34 +1225,33 @@ export class RequestQueue {
 
     const reconcile = this.db.transaction((): RequestHandoffChainReconciliationResult => {
       const result = emptyResult();
-      const candidates = this.db
-        .prepare(
-          `SELECT r.id AS requestId, r.handoffJobId AS previousJobId
-           FROM requests r
-           JOIN jobs currentJob ON currentJob.id = r.handoffJobId
-           WHERE r.workerRequired = 1
-             AND r.handoffJobId IS NOT NULL
-             AND currentJob.status = 'abandoned'
-             AND EXISTS (
-               SELECT 1
-               FROM jobs successor
-               WHERE successor.resumeOfJobId = currentJob.id
-             )
-           ORDER BY r.createdAt ASC, r.id ASC
-           LIMIT ?`,
-        )
-        .all(maxRequests) as Array<{ requestId: string; previousJobId: string }>;
+      const candidates = this.all<{ requestId: string; previousJobId: string }>(
+        `SELECT r.id AS requestId, r.handoffJobId AS previousJobId
+         FROM requests r
+         JOIN jobs currentJob ON currentJob.id = r.handoffJobId
+         WHERE r.workerRequired = 1
+           AND r.handoffJobId IS NOT NULL
+           AND currentJob.status = 'abandoned'
+           AND EXISTS (
+             SELECT 1
+             FROM jobs successor
+             WHERE successor.resumeOfJobId = currentJob.id
+           )
+         ORDER BY r.createdAt ASC, r.id ASC
+         LIMIT ?`,
+        maxRequests,
+      );
       result.scanned = candidates.length;
       if (candidates.length === 0) return result;
 
-      const nextSuccessor = this.db.prepare(
+      const nextSuccessor = this.db.prepare<{ id: string; status: string }, [string]>(
         `SELECT id, status
          FROM jobs
          WHERE resumeOfJobId = ?
          ORDER BY attempt DESC, createdAt DESC, id DESC
          LIMIT 1`,
       );
-      const repoint = this.db.prepare(
+      const repoint = this.db.prepare<unknown, [string, string, string, string]>(
         `UPDATE requests
          SET handoffJobId = ?, updatedAt = ?
          WHERE id = ?
@@ -1198,47 +1259,50 @@ export class RequestQueue {
            AND handoffJobId = ?`,
       );
 
-      for (const candidate of candidates) {
-        const visited = new Set([candidate.previousJobId]);
-        let currentJobId = candidate.previousJobId;
-        let currentStatus = "abandoned";
-        let traversed = 0;
-        let invalidChain = false;
+      try {
+        for (const candidate of candidates) {
+          const visited = new Set([candidate.previousJobId]);
+          let currentJobId = candidate.previousJobId;
+          let currentStatus = "abandoned";
+          let traversed = 0;
+          let invalidChain = false;
 
-        while (currentStatus === "abandoned") {
-          const successor = nextSuccessor.get(currentJobId) as
-            | { id: string; status: string }
-            | undefined;
-          if (!successor) break;
-          if (visited.has(successor.id)) {
-            result.cycleDetected += 1;
-            invalidChain = true;
-            break;
-          }
-          if (traversed >= maxDepth) {
-            result.depthLimitReached += 1;
-            invalidChain = true;
-            break;
+          while (currentStatus === "abandoned") {
+            const successor = nextSuccessor.get(currentJobId);
+            if (!successor) break;
+            if (visited.has(successor.id)) {
+              result.cycleDetected += 1;
+              invalidChain = true;
+              break;
+            }
+            if (traversed >= maxDepth) {
+              result.depthLimitReached += 1;
+              invalidChain = true;
+              break;
+            }
+
+            visited.add(successor.id);
+            currentJobId = successor.id;
+            currentStatus = asString(successor.status).toLowerCase();
+            traversed += 1;
           }
 
-          visited.add(successor.id);
-          currentJobId = successor.id;
-          currentStatus = asString(successor.status).toLowerCase();
-          traversed += 1;
+          if (invalidChain || traversed === 0) continue;
+          const updated = repoint.run(
+            currentJobId,
+            now,
+            candidate.requestId,
+            candidate.previousJobId,
+          );
+          if (updated.changes === 0) continue;
+          result.repointed += 1;
+          result.requestIds.push(candidate.requestId);
+          result.previousJobIds.push(candidate.previousJobId);
+          result.replacementJobIds.push(currentJobId);
         }
-
-        if (invalidChain || traversed === 0) continue;
-        const updated = repoint.run(
-          currentJobId,
-          now,
-          candidate.requestId,
-          candidate.previousJobId,
-        );
-        if (updated.changes === 0) continue;
-        result.repointed += 1;
-        result.requestIds.push(candidate.requestId);
-        result.previousJobIds.push(candidate.previousJobId);
-        result.replacementJobIds.push(currentJobId);
+      } finally {
+        nextSuccessor.finalize();
+        repoint.finalize();
       }
 
       return result;
@@ -1256,88 +1320,84 @@ export class RequestQueue {
   reconcileWorkerHandoffsFromJobs(
     nowInput: string | Date = new Date(),
   ): RequestHandoffReconciliationResult {
-    const jobsTable = this.db
-      .prepare(`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`)
-      .get() as { present: number } | undefined;
+    const jobsTable = this.get<{ present: number }>(
+      `SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`,
+    );
     if (!jobsTable) return { completed: 0, requestIds: [], jobIds: [] };
 
     const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
     const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
-    const rows = this.db
-      .prepare(
-        `SELECT r.id AS requestId,
-                r.sessionId AS requestSessionId,
-                j.id AS jobId
-         FROM requests r
-         JOIN jobs j ON j.id = (
-           SELECT candidate.id
-           FROM jobs candidate
-           WHERE candidate.kind = 'task.execute'
-             AND candidate.sessionId = r.sessionId
-             AND json_valid(candidate.params)
-             AND json_extract(candidate.params, '$.requestId') = r.id
-             AND datetime(candidate.createdAt) >= datetime(COALESCE(r.enqueuedAt, r.createdAt))
-           ORDER BY candidate.createdAt DESC, candidate.id DESC
-           LIMIT 1
-         )
-         WHERE r.status = 'pending'
-            OR (
-              r.status = 'claimed'
-              AND (r.leaseExpiresAt IS NULL OR r.leaseExpiresAt <= ?)
-            )
-         ORDER BY r.createdAt ASC
-         LIMIT 400`,
-      )
-      .all(now) as Array<{ requestId: string; requestSessionId: string; jobId: string }>;
+    const rows = this.all<{ requestId: string; requestSessionId: string; jobId: string }>(
+      `SELECT r.id AS requestId,
+              r.sessionId AS requestSessionId,
+              j.id AS jobId
+       FROM requests r
+       JOIN jobs j ON j.id = (
+         SELECT candidate.id
+         FROM jobs candidate
+         WHERE candidate.kind = 'task.execute'
+           AND candidate.sessionId = r.sessionId
+           AND json_valid(candidate.params)
+           AND json_extract(candidate.params, '$.requestId') = r.id
+           AND datetime(candidate.createdAt) >= datetime(COALESCE(r.enqueuedAt, r.createdAt))
+         ORDER BY candidate.createdAt DESC, candidate.id DESC
+         LIMIT 1
+       )
+       WHERE r.status = 'pending'
+          OR (
+            r.status = 'claimed'
+            AND (r.leaseExpiresAt IS NULL OR r.leaseExpiresAt <= ?)
+          )
+       ORDER BY r.createdAt ASC
+       LIMIT 400`,
+      now,
+    );
     if (rows.length === 0) return { completed: 0, requestIds: [], jobIds: [] };
 
     const requestIds: string[] = [];
     const jobIds: string[] = [];
     const tx = this.db.transaction(() => {
       for (const row of rows) {
-        const updated = this.db
-          .prepare(
-            `UPDATE requests
-             SET workerRequired = 1,
-                 handoffJobId = ?,
-                 status = 'completed',
-                 result = CASE
-                   WHEN result IS NULL OR result = '' THEN ?
-                   ELSE result
-                 END,
-                 completedAt = COALESCE(completedAt, ?),
-                 failedAt = NULL,
-                 leaseExpiresAt = NULL,
-                 lastHeartbeatAt = NULL,
-                 durationMs = MAX(
-                   0,
-                   CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)
-                 ),
-                 updatedAt = ?
-             WHERE id = ?
-               AND sessionId = ?
-               AND (
-                 status = 'pending'
-                 OR (
-                   status = 'claimed'
-                   AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
-                 )
-               )`,
-          )
-          .run(
-            row.jobId,
-            JSON.stringify({
-              requiresWorker: true,
-              jobId: row.jobId,
-              reconciledAfterCrash: true,
-            }),
-            now,
-            now,
-            now,
-            row.requestId,
-            row.requestSessionId,
-            now,
-          );
+        const updated = this.run(
+          `UPDATE requests
+           SET workerRequired = 1,
+               handoffJobId = ?,
+               status = 'completed',
+               result = CASE
+                 WHEN result IS NULL OR result = '' THEN ?
+                 ELSE result
+               END,
+               completedAt = COALESCE(completedAt, ?),
+               failedAt = NULL,
+               leaseExpiresAt = NULL,
+               lastHeartbeatAt = NULL,
+               durationMs = MAX(
+                 0,
+                 CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+               ),
+               updatedAt = ?
+           WHERE id = ?
+             AND sessionId = ?
+             AND (
+               status = 'pending'
+               OR (
+                 status = 'claimed'
+                 AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+               )
+             )`,
+          row.jobId,
+          JSON.stringify({
+            requiresWorker: true,
+            jobId: row.jobId,
+            reconciledAfterCrash: true,
+          }),
+          now,
+          now,
+          now,
+          row.requestId,
+          row.requestSessionId,
+          now,
+        );
         if (updated.changes === 0) continue;
         requestIds.push(row.requestId);
         jobIds.push(row.jobId);
@@ -1360,20 +1420,24 @@ export class RequestQueue {
     if (!agentId) return { ok: false, message: "agentId is required" };
     if (!claimToken) return { ok: false, message: "claimToken is required" };
     const now = new Date().toISOString();
-    const result = this.db
-      .prepare(
-        `UPDATE requests
-         SET workerRequired = 1,
-             handoffJobId = ?,
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND agentId = ?
-           AND claimToken = ?
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?`,
-      )
-      .run(jobId, now, requestId, agentId, claimToken, now);
+    const result = this.run(
+      `UPDATE requests
+       SET workerRequired = 1,
+           handoffJobId = ?,
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND agentId = ?
+         AND claimToken = ?
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?`,
+      jobId,
+      now,
+      requestId,
+      agentId,
+      claimToken,
+      now,
+    );
     if (result.changes === 0) {
       return {
         ok: false,
@@ -1403,26 +1467,32 @@ export class RequestQueue {
       return { ok: false, message: "Request completion token is stale or owned by another agent" };
     }
 
-    const info = this.db
-      .prepare(
-        `UPDATE requests
-         SET status = 'completed',
-              result = ?,
-              completedAt = ?,
-              failedAt = NULL,
-              leaseExpiresAt = NULL,
-              lastHeartbeatAt = NULL,
-              deferReason = NULL,
-             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?
-           AND agentId = ?
-           AND claimToken = ?`,
-      )
-      .run(result, now, now, now, requestId, now, agentId, claimToken);
+    const info = this.run(
+      `UPDATE requests
+       SET status = 'completed',
+            result = ?,
+            completedAt = ?,
+            failedAt = NULL,
+            leaseExpiresAt = NULL,
+            lastHeartbeatAt = NULL,
+            deferReason = NULL,
+           durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?
+         AND agentId = ?
+         AND claimToken = ?`,
+      result,
+      now,
+      now,
+      now,
+      requestId,
+      now,
+      agentId,
+      claimToken,
+    );
 
     if (info.changes === 0) {
       return {
@@ -1455,26 +1525,32 @@ export class RequestQueue {
       return { ok: false, message: "Request failure token is stale or owned by another agent" };
     }
 
-    const info = this.db
-      .prepare(
-        `UPDATE requests
-         SET status = 'failed',
-              error = ?,
-              failedAt = ?,
-              completedAt = NULL,
-              leaseExpiresAt = NULL,
-              lastHeartbeatAt = NULL,
-              deferReason = NULL,
-             durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
-             updatedAt = ?
-         WHERE id = ?
-           AND status = 'claimed'
-           AND leaseExpiresAt IS NOT NULL
-           AND leaseExpiresAt > ?
-           AND agentId = ?
-           AND claimToken = ?`,
-      )
-      .run(JSON.stringify({ message, detail }), now, now, now, requestId, now, agentId, claimToken);
+    const info = this.run(
+      `UPDATE requests
+       SET status = 'failed',
+            error = ?,
+            failedAt = ?,
+            completedAt = NULL,
+            leaseExpiresAt = NULL,
+            lastHeartbeatAt = NULL,
+            deferReason = NULL,
+           durationMs = MAX(0, CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)),
+           updatedAt = ?
+       WHERE id = ?
+         AND status = 'claimed'
+         AND leaseExpiresAt IS NOT NULL
+         AND leaseExpiresAt > ?
+         AND agentId = ?
+         AND claimToken = ?`,
+      JSON.stringify({ message, detail }),
+      now,
+      now,
+      now,
+      requestId,
+      now,
+      agentId,
+      claimToken,
+    );
 
     if (info.changes === 0) {
       return {
@@ -1487,10 +1563,10 @@ export class RequestQueue {
   }
 
   getRequest(requestId: string): RequestRow | null {
-    const row =
-      (this.db
-        .prepare(`SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`)
-        .get(requestId) as RequestRow | undefined) ?? null;
+    const row = this.get<RequestRow>(
+      `SELECT ${RequestQueue.SELECT_COLUMNS} FROM requests WHERE id = ?`,
+      requestId,
+    );
     if (!row) return null;
     return (
       this.projectOutcomes([{ ...row, metadata: parseMetadataJson(row.metadataJson) }])[0] ?? null
@@ -1498,21 +1574,19 @@ export class RequestQueue {
   }
 
   getPendingRequests(): RequestRow[] {
-    const rows = this.db
-      .prepare(
-        `SELECT ${RequestQueue.SELECT_COLUMNS}
-         FROM requests
-         WHERE status = 'pending'
-         ORDER BY
-           CASE LOWER(priority)
-             WHEN 'interactive' THEN 0
-             WHEN 'normal' THEN 1
-             WHEN 'background' THEN 2
-             ELSE 1
-            END ASC,
-            createdAt ASC`,
-      )
-      .all() as RequestRow[];
+    const rows = this.all<RequestRow>(
+      `SELECT ${RequestQueue.SELECT_COLUMNS}
+       FROM requests
+       WHERE status = 'pending'
+       ORDER BY
+         CASE LOWER(priority)
+           WHEN 'interactive' THEN 0
+           WHEN 'normal' THEN 1
+           WHEN 'background' THEN 2
+           ELSE 1
+          END ASC,
+          createdAt ASC`,
+    );
     return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
   }
 
@@ -1524,37 +1598,36 @@ export class RequestQueue {
         : 200;
 
     if (status === "all") {
-      const rows = this.db
-        .prepare(
-          `SELECT ${RequestQueue.SELECT_COLUMNS}
-           FROM requests
-           ORDER BY createdAt DESC
-           LIMIT ?`,
-        )
-        .all(limit) as RequestRow[];
+      const rows = this.all<RequestRow>(
+        `SELECT ${RequestQueue.SELECT_COLUMNS}
+         FROM requests
+         ORDER BY createdAt DESC
+         LIMIT ?`,
+        limit,
+      );
       return this.projectOutcomes(
         rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })),
       );
     }
 
-    const rows = this.db
-      .prepare(
-        `SELECT ${RequestQueue.SELECT_COLUMNS}
-         FROM requests
-         WHERE status = ?
-         ORDER BY createdAt DESC
-         LIMIT ?`,
-      )
-      .all(status, limit) as RequestRow[];
+    const rows = this.all<RequestRow>(
+      `SELECT ${RequestQueue.SELECT_COLUMNS}
+       FROM requests
+       WHERE status = ?
+       ORDER BY createdAt DESC
+       LIMIT ?`,
+      status,
+      limit,
+    );
     return this.projectOutcomes(
       rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })),
     );
   }
 
   countByStatus(): Record<RequestStatus, number> {
-    const rows = this.db
-      .prepare(`SELECT status, COUNT(*) AS count FROM requests GROUP BY status`)
-      .all() as Array<{ status: RequestStatus; count: number }>;
+    const rows = this.all<{ status: RequestStatus; count: number }>(
+      `SELECT status, COUNT(*) AS count FROM requests GROUP BY status`,
+    );
 
     const counts: Record<RequestStatus, number> = {
       pending: 0,
@@ -1569,14 +1642,12 @@ export class RequestQueue {
   }
 
   countByPriority(): Record<QueuePriority, number> {
-    const rows = this.db
-      .prepare(
-        `SELECT priority, COUNT(*) AS count
-         FROM requests
-         WHERE status IN ('pending', 'claimed')
-         GROUP BY priority`,
-      )
-      .all() as Array<{ priority: string; count: number }>;
+    const rows = this.all<{ priority: string; count: number }>(
+      `SELECT priority, COUNT(*) AS count
+       FROM requests
+       WHERE status IN ('pending', 'claimed')
+       GROUP BY priority`,
+    );
 
     const counts: Record<QueuePriority, number> = {
       interactive: 0,
@@ -1610,15 +1681,14 @@ export class RequestQueue {
     );
     if (normalized.length === 0) return 0;
     const placeholders = normalized.map(() => "?").join(", ");
-    const rows = this.db
-      .prepare(
-        `SELECT metadataJson
-         FROM requests
-         WHERE status IN (${placeholders})
-           AND metadataJson IS NOT NULL
-           AND metadataJson <> ''`,
-      )
-      .all(...normalized) as Array<{ metadataJson: string | null }>;
+    const rows = this.all<{ metadataJson: string | null }>(
+      `SELECT metadataJson
+       FROM requests
+       WHERE status IN (${placeholders})
+         AND metadataJson IS NOT NULL
+         AND metadataJson <> ''`,
+      ...normalized,
+    );
 
     let count = 0;
     for (const row of rows) {
@@ -1633,9 +1703,7 @@ export class RequestQueue {
   ): Array<{ id: string; priority: QueuePriority; position: number; etaMs: number }> {
     const ordered = this.pendingOrderedIds().slice(0, Math.max(1, Math.min(limit, 50)));
     return ordered.map((id, idx) => {
-      const row = this.db.prepare(`SELECT priority FROM requests WHERE id = ?`).get(id) as
-        | { priority: string }
-        | undefined;
+      const row = this.get<{ priority: string }>(`SELECT priority FROM requests WHERE id = ?`, id);
       const priority = normalizePriority(row?.priority);
       return {
         id,
@@ -1653,26 +1721,25 @@ export class RequestQueue {
         : 24;
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
     const rows = this.supportsJobOutcomeProjection()
-      ? (this.db
-          .prepare(
-            `SELECT ${RequestQueue.SELECT_COLUMNS}
-             FROM requests
-             WHERE updatedAt >= ?
-                OR handoffJobId IN (
-                  SELECT id
-                  FROM jobs
-                  WHERE COALESCE(completedAt, failedAt, abandonedAt, publishBlockedAt, updatedAt) >= ?
-                )`,
-          )
-          .all(cutoffIso, cutoffIso) as RequestRow[])
-      : (this.db
-          .prepare(
-            `SELECT ${RequestQueue.SELECT_COLUMNS}
-             FROM requests
-             WHERE status IN ('completed', 'failed')
-               AND updatedAt >= ?`,
-          )
-          .all(cutoffIso) as RequestRow[]);
+      ? this.all<RequestRow>(
+          `SELECT ${RequestQueue.SELECT_COLUMNS}
+           FROM requests
+           WHERE updatedAt >= ?
+              OR handoffJobId IN (
+                SELECT id
+                FROM jobs
+                WHERE COALESCE(completedAt, failedAt, abandonedAt, publishBlockedAt, updatedAt) >= ?
+              )`,
+          cutoffIso,
+          cutoffIso,
+        )
+      : this.all<RequestRow>(
+          `SELECT ${RequestQueue.SELECT_COLUMNS}
+           FROM requests
+           WHERE status IN ('completed', 'failed')
+             AND updatedAt >= ?`,
+          cutoffIso,
+        );
     const projectedRows = this.projectOutcomes(rows);
 
     let completed = 0;
@@ -1715,6 +1782,13 @@ export class RequestQueue {
   }
 
   close(): void {
-    this.db.close();
+    // `Database.close()` defaults to `close(false)`, which lets outstanding
+    // statements finish after this method returns. That is a poor ownership
+    // boundary for a queue: callers reasonably expect `close()` to release the
+    // SQLite/WAL handles before they rotate, replace, or remove the database.
+    // It is especially observable on Windows, where a deferred handle keeps the
+    // parent directory locked. All RequestQueue operations are synchronous, so
+    // a pending statement here is a lifecycle bug that should fail visibly.
+    this.db.close(true);
   }
 }

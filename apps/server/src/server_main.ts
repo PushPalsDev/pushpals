@@ -13,6 +13,20 @@ import {
 import { RequestQueue } from "./requests.js";
 import { COMPLETION_HANDOFF_CONFLICT_CODE, CompletionQueue } from "./completions.js";
 import { AutonomyStore } from "./autonomy.js";
+import { SqliteMemoryStore } from "./memory_store.js";
+import {
+  RepositoryAgentQueue,
+  type RepositoryAgentQueueRow,
+  type RepositoryAgentQueueStatus,
+} from "./repository_agent_queue.js";
+import { resolveRepositoryAgentContext } from "./repository_agent_context.js";
+import { applyRepositoryAgentMemoryFeedbackBatch } from "./repository_agent_memory_feedback.js";
+import {
+  authorizeMemoryHttpRequest,
+  memoryHttpNamespace,
+  memoryHttpReinforcementOutcome,
+  type MemoryHttpOperation,
+} from "./memory_http_authority.js";
 import {
   ClientPresenceRegistry,
   readClientPresenceFromSessionBody,
@@ -22,14 +36,34 @@ import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import {
   buildLocalCorsHeaders,
+  createRepositoryAgentServiceClients,
+  detectRepoRoot,
   invalidatePushPalsConfigCache,
   inferGitBackendFromRemote,
   isLoopbackOrigin,
   loadPushPalsConfig,
   runBoundedProcess,
+  sanitizeRepositoryAgentRequest,
+  sanitizeRepositoryAgentResult,
   sanitizePushPalsConfigForLogging,
   sanitizeGitRemoteUrl,
   toGitHubRepoWebUrl,
+  MemoryConflictError,
+  MemoryValidationError,
+  MEMORY_HTTP_AUTHORITY_HEADER,
+  MEMORY_HTTP_CALLER_HEADER,
+  assertMemoryReinforcementOutcome,
+  type MemoryAddress,
+  type MemoryGetOptions,
+  type MemoryInvalidateSelector,
+  type MemoryPruneOptions,
+  type MemoryPutInput,
+  type MemoryPutOptions,
+  type MemoryReinforcementOutcome,
+  type MemoryReinforceInput,
+  type MemorySearchQuery,
+  type RepositoryAgentRemoteError,
+  type RepositoryAgentRequest,
 } from "shared";
 import {
   applyRuntimeConfigMutations,
@@ -53,6 +87,16 @@ const jobQueue = new JobQueue(sharedDbPath);
 const requestQueue = new RequestQueue(sharedDbPath);
 const completionQueue = new CompletionQueue(sharedDbPath);
 const autonomyStore = new AutonomyStore(sharedDbPath);
+const memoryStore = new SqliteMemoryStore(sharedDbPath);
+const repositoryAgentQueue = new RepositoryAgentQueue(sharedDbPath);
+const repositoryServices = createRepositoryAgentServiceClients({
+  serverUrl: STARTUP_CONFIG.server.url,
+  callerService: "server",
+  callerInstanceId: `server-${process.pid}`,
+  memoryAuthority: "server",
+  memoryStore,
+});
+const repositoryAgentRepoRoot = detectRepoRoot(process.cwd());
 const reconciliationTracker = new LifecycleReconciliationTracker();
 function guardedReconciliation<T>(label: string, fallback: T, reconcile: () => T): T {
   return reconciliationTracker.run(label, fallback, reconcile, (detail) => {
@@ -88,6 +132,14 @@ const completionLeaseReconciliation = guardedReconciliation(
   "completion lease",
   { recovered: 0, completionIds: [] as string[] },
   () => completionQueue.recoverExpiredClaims(),
+);
+const repositoryAgentLeaseReconciliation = guardedReconciliation(
+  "repository agent lease",
+  { recovered: 0, requestIds: [] as string[] },
+  () => repositoryAgentQueue.recoverExpiredClaims(),
+);
+guardedReconciliation("repository agent deadlines", 0, () =>
+  repositoryAgentQueue.expirePastDeadlines(),
 );
 const lifecycleReconciliation = guardedReconciliation(
   "completion lifecycle",
@@ -151,6 +203,11 @@ if (completionLeaseReconciliation.recovered > 0) {
     `[Server] Requeued ${completionLeaseReconciliation.recovered} completion(s) with expired publication leases.`,
   );
 }
+if (repositoryAgentLeaseReconciliation.recovered > 0) {
+  console.warn(
+    `[Server] Requeued ${repositoryAgentLeaseReconciliation.recovered} RepositoryAgent request(s) with expired leases.`,
+  );
+}
 const lifecycleWatchdogTimer = setInterval(() => {
   const requestHandoffChainRecovery = guardedReconciliation(
     "request retry chain",
@@ -208,6 +265,31 @@ const lifecycleWatchdogTimer = setInterval(() => {
       `[Server] Periodic watchdog requeued ${completionLeaseRecovery.recovered} completion(s) with expired publication leases.`,
     );
   }
+  const repositoryAgentLeaseRecovery = guardedReconciliation(
+    "repository agent lease",
+    { recovered: 0, requestIds: [] as string[] },
+    () => repositoryAgentQueue.recoverExpiredClaims(),
+  );
+  const expiredRepositoryAgentRequests = guardedReconciliation(
+    "repository agent deadlines",
+    0,
+    () => repositoryAgentQueue.expirePastDeadlines(),
+  );
+  const repositoryAgentRetention = guardedReconciliation(
+    "repository agent retention",
+    { pruned: 0, requestIds: [] as string[] },
+    () => repositoryAgentQueue.pruneTerminal(),
+  );
+  if (repositoryAgentLeaseRecovery.recovered > 0 || expiredRepositoryAgentRequests > 0) {
+    console.warn(
+      `[Server] RepositoryAgent watchdog recovered=${repositoryAgentLeaseRecovery.recovered} expired=${expiredRepositoryAgentRequests}.`,
+    );
+  }
+  if (repositoryAgentRetention.pruned > 0) {
+    console.log(
+      `[Server] RepositoryAgent watchdog pruned=${repositoryAgentRetention.pruned} terminal request(s).`,
+    );
+  }
   const completionLifecycleRecovery = guardedReconciliation(
     "completion lifecycle",
     { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 },
@@ -252,6 +334,107 @@ const clientPresencePruneTimer = setInterval(() => {
   }
 }, 60_000);
 clientPresencePruneTimer.unref?.();
+const SHARED_MEMORY_MAINTENANCE_INTERVAL_MS = 15 * 60_000;
+const SHARED_MEMORY_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60_000;
+let sharedMemoryMaintenanceRunning = false;
+const sharedMemoryMaintenanceTimer = setInterval(() => {
+  if (sharedMemoryMaintenanceRunning) return;
+  sharedMemoryMaintenanceRunning = true;
+  void memoryStore
+    .prune({
+      updatedBefore: new Date(Date.now() - SHARED_MEMORY_TERMINAL_RETENTION_MS).toISOString(),
+      statuses: ["invalid", "stale", "superseded"],
+    })
+    .then((removed) => {
+      if (removed > 0) console.log(`[Memory] pruned ${removed} expired/terminal record(s)`);
+    })
+    .catch((error) => {
+      console.error(`[Memory] periodic pruning failed and will be retried: ${String(error)}`);
+    })
+    .finally(() => {
+      sharedMemoryMaintenanceRunning = false;
+    });
+}, SHARED_MEMORY_MAINTENANCE_INTERVAL_MS);
+sharedMemoryMaintenanceTimer.unref?.();
+const REPOSITORY_AGENT_MEMORY_FEEDBACK_INTERVAL_MS = 30_000;
+const repositoryAgentMemoryFeedbackState: {
+  running: boolean;
+  lastStartedAt: string | null;
+  lastCompletedAt: string | null;
+  lastError: string | null;
+  lastQueued: number;
+  lastBatch: {
+    scanned: number;
+    applied: number;
+    deferred: number;
+    missingRecords: number;
+    staleRecords: number;
+  } | null;
+} = {
+  running: false,
+  lastStartedAt: null,
+  lastCompletedAt: null,
+  lastError: null,
+  lastQueued: 0,
+  lastBatch: null,
+};
+let repositoryAgentMemoryFeedbackTask: Promise<void> | null = null;
+function reconcileRepositoryAgentMemoryFeedback(): Promise<void> {
+  if (repositoryAgentMemoryFeedbackTask) return repositoryAgentMemoryFeedbackTask;
+  repositoryAgentMemoryFeedbackTask = (async () => {
+    repositoryAgentMemoryFeedbackState.running = true;
+    repositoryAgentMemoryFeedbackState.lastStartedAt = new Date().toISOString();
+    let reconciliationFailed = false;
+    try {
+      const queued = reconciliationTracker.run(
+        "repository agent memory feedback",
+        { queued: 0 },
+        () => autonomyStore.reconcileRepositoryAgentMemoryFeedback(),
+        (detail) => {
+          reconciliationFailed = true;
+          repositoryAgentMemoryFeedbackState.lastError = detail.slice(0, 2_000);
+          console.error(
+            `[Memory] RepositoryAgent outcome reconciliation failed and will be retried: ${detail}`,
+          );
+        },
+      );
+      if (queued.queued > 0) {
+        console.log(`[Memory] queued ${queued.queued} authoritative RepositoryAgent outcome(s).`);
+      }
+      repositoryAgentMemoryFeedbackState.lastQueued = queued.queued;
+      const batch = await applyRepositoryAgentMemoryFeedbackBatch({
+        autonomyStore,
+        memoryStore,
+        limit: 20,
+      });
+      repositoryAgentMemoryFeedbackState.lastBatch = batch;
+      if (!reconciliationFailed) {
+        repositoryAgentMemoryFeedbackState.lastError =
+          batch.deferred > 0
+            ? `${batch.deferred}/${batch.scanned} RepositoryAgent feedback deliveries deferred`
+            : null;
+      }
+    } catch (error) {
+      repositoryAgentMemoryFeedbackState.lastError = String(
+        error instanceof Error ? error.message : error,
+      ).slice(0, 2_000);
+      console.error(
+        `[Memory] RepositoryAgent feedback delivery failed and will be retried: ${repositoryAgentMemoryFeedbackState.lastError}`,
+      );
+    } finally {
+      repositoryAgentMemoryFeedbackState.running = false;
+      repositoryAgentMemoryFeedbackState.lastCompletedAt = new Date().toISOString();
+    }
+  })().finally(() => {
+    repositoryAgentMemoryFeedbackTask = null;
+  });
+  return repositoryAgentMemoryFeedbackTask;
+}
+void reconcileRepositoryAgentMemoryFeedback();
+const repositoryAgentMemoryFeedbackTimer = setInterval(() => {
+  void reconcileRepositoryAgentMemoryFeedback();
+}, REPOSITORY_AGENT_MEMORY_FEEDBACK_INTERVAL_MS);
+repositoryAgentMemoryFeedbackTimer.unref?.();
 sessionManager.authToken = null;
 sessionManager.setClientMessageIngress((sessionId, accepted) => {
   const budgetStatus = getSessionTokenBudgetStatus(sessionId);
@@ -446,6 +629,108 @@ async function getRepoStatusSummary(repoPath: string, remote: string): Promise<R
   return value;
 }
 
+function repositoryAgentPublicStatus(
+  row: Pick<RepositoryAgentQueueRow, "status" | "error">,
+): "queued" | "claimed" | "completed" | "failed" | "expired" {
+  if (row.status === "pending") return "queued";
+  if (row.status === "failed" && row.error?.includes("deadline expired")) return "expired";
+  return row.status;
+}
+
+function repositoryAgentRemoteError(raw: string | null): RepositoryAgentRemoteError | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as RepositoryAgentRemoteError;
+    if (parsed && typeof parsed.code === "string" && typeof parsed.message === "string") {
+      return {
+        code: parsed.code.slice(0, 128),
+        message: parsed.message.slice(0, 8_000),
+        ...(parsed.detail ? { detail: String(parsed.detail).slice(0, 16_000) } : {}),
+        retryable: parsed.retryable === true,
+      };
+    }
+  } catch {
+    // Fall through to a stable legacy error envelope.
+  }
+  return {
+    code: raw.includes("deadline expired") ? "deadline_expired" : "repository_agent_failed",
+    message: raw.slice(0, 8_000),
+    retryable: false,
+  };
+}
+
+function repositoryAgentSnapshot(row: RepositoryAgentQueueRow) {
+  const status = repositoryAgentPublicStatus(row);
+  return {
+    requestId: row.id,
+    status,
+    submittedAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(status === "queued" || status === "claimed" ? { pollAfterMs: 500 } : {}),
+    ...(status === "completed" && row.result ? { result: row.result } : {}),
+    ...(status === "failed" || status === "expired"
+      ? { error: repositoryAgentRemoteError(row.error) }
+      : {}),
+  };
+}
+
+class BoundedJsonBodyError extends Error {
+  readonly status: 400 | 413;
+
+  constructor(status: 400 | 413, message: string) {
+    super(message);
+    this.name = "BoundedJsonBodyError";
+    this.status = status;
+  }
+}
+
+/**
+ * Read JSON without trusting Content-Length. This is intentionally used by
+ * the shared-memory and RepositoryAgent control-plane routes, including
+ * chunked requests, so a local service cannot make Server buffer an
+ * unbounded body before validation.
+ */
+async function readBoundedJsonObject(
+  req: Request,
+  maxBytes: number,
+  label: string,
+): Promise<Record<string, unknown>> {
+  const declaredLength = Number(req.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new BoundedJsonBodyError(413, `${label} body is too large`);
+  }
+  if (!req.body) throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        throw new BoundedJsonBodyError(413, `${label} body is too large`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
+  } catch {
+    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new BoundedJsonBodyError(400, `${label} body must be a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
 /**
  * HTTP Middleware & Routes
  */
@@ -482,6 +767,7 @@ export function createRequestHandler() {
       const corsHeaders = buildLocalCorsHeaders({
         origin: originHeader,
         allowAuthorizationHeader: true,
+        additionalAllowedHeaders: [MEMORY_HTTP_CALLER_HEADER, MEMORY_HTTP_AUTHORITY_HEADER],
       });
 
       // Common JSON headers (CORS + no-store cache)
@@ -887,6 +1173,25 @@ export function createRequestHandler() {
       };
       const autonomySimilarFailureSummary = (value: Record<string, unknown>) => {
         const details = extractAutonomyPayloadDetails(value);
+        if (
+          details.isValidationIncidentRepair &&
+          details.reservationRequired &&
+          details.objectiveId &&
+          details.validationIncidentId &&
+          autonomyStore.authorizesValidationIncidentRepair({
+            objectiveId: details.objectiveId,
+            incidentId: details.validationIncidentId,
+            snapshotId: details.snapshotId,
+          })
+        ) {
+          return {
+            blocked: false,
+            recentSimilarFailureCount: 0,
+            failureFingerprint: null,
+            targetPathSample: details.targetPaths.slice(0, 8),
+            validationIncidentRepairExempt: true,
+          };
+        }
         return jobQueue.similarFailureFingerprintSummary({
           targetPaths: details.targetPaths,
           windowMs: AUTONOMY_SIMILAR_FAILURE_WINDOW_MS,
@@ -1021,7 +1326,18 @@ export function createRequestHandler() {
         if (isShuttingDown) return;
         isShuttingDown = true;
         console.warn(`[Server] Shutdown requested: ${reason}`);
-        setTimeout(() => {
+        clearInterval(lifecycleWatchdogTimer);
+        clearInterval(clientPresencePruneTimer);
+        clearInterval(sharedMemoryMaintenanceTimer);
+        clearInterval(repositoryAgentMemoryFeedbackTimer);
+        setTimeout(async () => {
+          const activeFeedback = repositoryAgentMemoryFeedbackTask;
+          if (activeFeedback) {
+            await Promise.race([
+              activeFeedback.catch(() => {}),
+              new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+            ]);
+          }
           try {
             requestQueue.close();
           } catch (_e) {}
@@ -1034,6 +1350,10 @@ export function createRequestHandler() {
           try {
             autonomyStore.close();
           } catch (_e) {}
+          try {
+            repositoryAgentQueue.close();
+          } catch (_e) {}
+          void memoryStore.close().catch(() => {});
           try {
             server.stop(true);
           } catch (_e) {}
@@ -1051,11 +1371,11 @@ export function createRequestHandler() {
       // Noisy poll endpoints: only log these at debug level.
       const isNoisyPoll =
         (method === "POST" &&
-          /^\/+((jobs|requests|completions)\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/(start|log)|telemetry\/llm-usage)\/?$/.test(
+          /^\/+((jobs|requests|completions)\/claim|repository-agent\/requests\/claim|workers\/heartbeat|sessions\/[^/]+\/command|jobs\/[^/]+\/(start|log)|telemetry\/llm-usage)\/?$/.test(
             pathname,
           )) ||
         (method === "GET" &&
-          /^\/+(workers|workers\/autoscale|system\/status|requests|jobs|completions|questions|autonomy\/insights|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(
+          /^\/+(workers|workers\/autoscale|system\/status|requests|jobs|completions|questions|autonomy\/insights|repository-agent\/requests\/[^/]+|requests\/[^/]+|jobs\/[^/]+|completions\/[^/]+|jobs\/[^/]+\/logs)(\/)?$/.test(
             pathname,
           ));
       if (isNoisyPoll) {
@@ -1154,6 +1474,350 @@ export function createRequestHandler() {
           },
           200,
         );
+      }
+
+      // Shared memory is server-owned. Services use the typed HTTP client so
+      // they never contend on SQLite files or depend on host-only paths.
+      if (pathname.startsWith("/memory/") && ["POST", "PUT"].includes(method)) {
+        const denied = requireAuth();
+        if (denied) return denied;
+        let body: Record<string, unknown>;
+        try {
+          body = await readBoundedJsonObject(req, 2 * 1024 * 1024, "Memory request");
+        } catch (error) {
+          const bounded = error as BoundedJsonBodyError;
+          return makeJson(
+            { ok: false, message: bounded.message || "Invalid Memory request body" },
+            bounded.status === 413 ? 413 : 400,
+          );
+        }
+        const operation: MemoryHttpOperation | null =
+          pathname === "/memory/records" && method === "PUT"
+            ? "put"
+            : pathname === "/memory/get" && method === "POST"
+              ? "get"
+              : pathname === "/memory/search" && method === "POST"
+                ? "search"
+                : pathname === "/memory/invalidate" && method === "POST"
+                  ? "invalidate"
+                  : pathname === "/memory/reinforce" && method === "POST"
+                    ? "reinforce"
+                    : pathname === "/memory/prune" && method === "POST"
+                      ? "prune"
+                      : null;
+        if (!operation) return makeJson({ ok: false, message: "Unknown memory endpoint" }, 404);
+        let reinforcementOutcome: MemoryReinforcementOutcome | null = null;
+        if (operation === "reinforce") {
+          try {
+            const candidate = memoryHttpReinforcementOutcome(body);
+            assertMemoryReinforcementOutcome(candidate);
+            reinforcementOutcome = candidate;
+          } catch (error) {
+            const message = compactText(error instanceof Error ? error.message : error, 2_000);
+            return makeJson(
+              {
+                ok: false,
+                code:
+                  error instanceof MemoryValidationError
+                    ? error.code
+                    : "invalid_reinforcement_outcome",
+                message: message || "Invalid memory reinforcement outcome",
+              },
+              400,
+            );
+          }
+        }
+        const access = authorizeMemoryHttpRequest({
+          headers: req.headers,
+          operation,
+          namespace: memoryHttpNamespace(operation, body),
+          reinforcementOutcome,
+        });
+        if (!access.allowed) {
+          return makeJson({ ok: false, message: access.message ?? "Forbidden" }, 403);
+        }
+        try {
+          if (pathname === "/memory/records" && method === "PUT") {
+            const record = await memoryStore.put(
+              body.input as MemoryPutInput,
+              (body.options ?? {}) as MemoryPutOptions,
+            );
+            return makeJson({ ok: true, record }, 200);
+          }
+          if (pathname === "/memory/get" && method === "POST") {
+            const record = await memoryStore.get(
+              body.address as MemoryAddress,
+              (body.options ?? {}) as MemoryGetOptions,
+            );
+            return makeJson({ ok: true, record }, 200);
+          }
+          if (pathname === "/memory/search" && method === "POST") {
+            const records = await memoryStore.search(body.query as MemorySearchQuery);
+            return makeJson({ ok: true, records }, 200);
+          }
+          if (pathname === "/memory/invalidate" && method === "POST") {
+            const count = await memoryStore.invalidate(body.selector as MemoryInvalidateSelector);
+            return makeJson({ ok: true, count }, 200);
+          }
+          if (pathname === "/memory/reinforce" && method === "POST") {
+            const record = await memoryStore.reinforce(body.input as MemoryReinforceInput);
+            return makeJson({ ok: true, record }, 200);
+          }
+          if (pathname === "/memory/prune" && method === "POST") {
+            const count = await memoryStore.prune((body.options ?? {}) as MemoryPruneOptions);
+            return makeJson({ ok: true, count }, 200);
+          }
+        } catch (error) {
+          const message = compactText(error instanceof Error ? error.message : error, 2_000);
+          const status = error instanceof MemoryConflictError ? 409 : 400;
+          return makeJson(
+            {
+              ok: false,
+              message: message || "Memory operation failed",
+              ...(error instanceof MemoryConflictError ? { code: error.code } : {}),
+              ...(error instanceof MemoryValidationError ? { code: error.code } : {}),
+            },
+            status,
+          );
+        }
+        return makeJson({ ok: false, message: "Unknown memory endpoint" }, 404);
+      }
+
+      // POST /repository-agent/requests - durable service-neutral submission.
+      if (pathname === "/repository-agent/requests" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        let body: Record<string, unknown>;
+        try {
+          body = await readBoundedJsonObject(req, 256 * 1024, "RepositoryAgent request");
+        } catch (error) {
+          const bounded = error as BoundedJsonBodyError;
+          return makeJson(
+            { ok: false, message: bounded.message || "Invalid RepositoryAgent request body" },
+            bounded.status === 413 ? 413 : 400,
+          );
+        }
+        try {
+          const request = sanitizeRepositoryAgentRequest(body);
+          const resolved = await resolveRepositoryAgentContext({
+            canonicalRepoRoot: repositoryAgentRepoRoot,
+            requested: request.repository,
+          });
+          const normalizedRequest: RepositoryAgentRequest = {
+            ...request,
+            repository: resolved.repository,
+            context: {
+              ...(request.context ?? {}),
+              ...(resolved.requestedRootMapped ? { callerRootMappedToHost: true } : {}),
+            },
+          };
+          const enqueued = repositoryAgentQueue.enqueue({
+            sessionId: request.caller.sessionId ?? "dev",
+            callerService: request.caller.service,
+            purpose: request.purpose,
+            repositoryId: resolved.repository.identity,
+            repositoryRoot: resolved.repository.root,
+            revision: resolved.repository.revision,
+            treeHash: resolved.repository.tree,
+            dirty: resolved.repository.dirty,
+            priority: request.priority,
+            deadlineAt: request.deadlineAt,
+            idempotencyKey: request.idempotencyKey,
+            request: normalizedRequest as unknown as Record<string, unknown>,
+          });
+          if (!enqueued.ok || !enqueued.requestId) {
+            return makeJson(
+              {
+                ok: false,
+                ...(enqueued.code ? { code: enqueued.code } : {}),
+                ...(enqueued.requestId ? { requestId: enqueued.requestId } : {}),
+                message: enqueued.message ?? "enqueue failed",
+              },
+              enqueued.conflict ? 409 : 400,
+            );
+          }
+          const row = repositoryAgentQueue.get(enqueued.requestId);
+          if (!row) return makeJson({ ok: false, message: "enqueued request disappeared" }, 500);
+          return makeJson(
+            {
+              ok: true,
+              requestId: row.id,
+              status: repositoryAgentPublicStatus(row),
+              deduplicated: enqueued.deduplicated === true,
+              pollAfterMs: 500,
+              ...(row.status === "completed" && row.result ? { result: row.result } : {}),
+            },
+            enqueued.deduplicated ? 200 : 202,
+          );
+        } catch (error) {
+          const message = compactText(error instanceof Error ? error.message : error, 2_000);
+          const status = /stale|does not match/i.test(message) ? 409 : 400;
+          return makeJson(
+            { ok: false, message: message || "Invalid RepositoryAgent request" },
+            status,
+          );
+        }
+      }
+
+      // POST /repository-agent/requests/claim - RemoteBuddy-hosted worker claim.
+      if (pathname === "/repository-agent/requests/claim" && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        let body: Record<string, unknown>;
+        try {
+          body = await readBoundedJsonObject(req, 64 * 1024, "RepositoryAgent claim");
+        } catch (error) {
+          const bounded = error as BoundedJsonBodyError;
+          return makeJson(
+            { ok: false, message: bounded.message || "Invalid RepositoryAgent claim body" },
+            bounded.status === 413 ? 413 : 400,
+          );
+        }
+        const agentId = compactText(body.agentId, 256);
+        const identities = Array.isArray(body.repositoryIdentities)
+          ? body.repositoryIdentities.map((value) => compactText(value, 1_024)).filter(Boolean)
+          : [];
+        const claim = repositoryAgentQueue.claim(agentId, {
+          leaseMs: Number(body.leaseMs),
+          repositoryIdentities: identities,
+        });
+        if (!claim.ok || !claim.request) {
+          return makeJson({ ok: true, claim: null, pollAfterMs: 750 }, 200);
+        }
+        return makeJson(
+          {
+            ok: true,
+            claim: {
+              requestId: claim.request.id,
+              claimToken: claim.request.claimToken,
+              claimGeneration: claim.request.claimGeneration,
+              leaseExpiresAt: claim.request.leaseExpiresAt,
+              request: claim.request.request,
+            },
+            pollAfterMs: 250,
+          },
+          200,
+        );
+      }
+
+      const repositoryAgentRequestMatch = pathname.match(
+        /^\/repository-agent\/requests\/([^/]+)(?:\/(lease\/renew|complete|fail))?$/,
+      );
+      if (repositoryAgentRequestMatch) {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const requestId = decodeURIComponent(repositoryAgentRequestMatch[1] ?? "");
+        const action = repositoryAgentRequestMatch[2] ?? "";
+        if (method === "GET" && !action) {
+          guardedReconciliation("repository agent deadlines", 0, () =>
+            repositoryAgentQueue.expirePastDeadlines(),
+          );
+          const row = repositoryAgentQueue.get(requestId);
+          return row
+            ? makeJson({ ok: true, request: repositoryAgentSnapshot(row) }, 200)
+            : makeJson({ ok: false, message: "RepositoryAgent request not found" }, 404);
+        }
+        if (method !== "POST" || !action) {
+          return makeJson({ ok: false, message: "Method not allowed" }, 405);
+        }
+        let body: Record<string, unknown>;
+        try {
+          body = await readBoundedJsonObject(req, 2 * 1024 * 1024, `RepositoryAgent ${action}`);
+        } catch (error) {
+          const bounded = error as BoundedJsonBodyError;
+          return makeJson(
+            { ok: false, requestId, message: bounded.message || "Invalid RepositoryAgent body" },
+            bounded.status === 413 ? 413 : 400,
+          );
+        }
+        const agentId = compactText(body.agentId, 256);
+        const claimToken = compactText(body.claimToken, 512);
+        const claimGeneration = Number(body.claimGeneration);
+        if (action === "lease/renew") {
+          const renewed = repositoryAgentQueue.renewLease(
+            requestId,
+            agentId,
+            claimToken,
+            claimGeneration,
+            { leaseMs: Number(body.leaseMs) },
+          );
+          return renewed.ok
+            ? makeJson(
+                {
+                  ok: true,
+                  requestId,
+                  status: "claimed",
+                  leaseExpiresAt: renewed.leaseExpiresAt,
+                },
+                200,
+              )
+            : makeJson({ ok: false, requestId, message: renewed.message }, 409);
+        }
+        if (action === "complete") {
+          try {
+            const queued = repositoryAgentQueue.get(requestId);
+            if (!queued || !queued.request) {
+              return makeJson({ ok: false, message: "RepositoryAgent request not found" }, 404);
+            }
+            const result = sanitizeRepositoryAgentResult(body.result, requestId);
+            const requestedRepository = (queued.request as unknown as RepositoryAgentRequest)
+              .repository;
+            if (
+              result.analyzedRepository.identity !== requestedRepository.identity ||
+              result.analyzedRepository.revision !== requestedRepository.revision ||
+              result.analyzedRepository.tree !== requestedRepository.tree
+            ) {
+              return makeJson(
+                { ok: false, requestId, message: "RepositoryAgent result baseline mismatch" },
+                409,
+              );
+            }
+            const completed = repositoryAgentQueue.complete(requestId, {
+              agentId,
+              claimToken,
+              claimGeneration,
+              result: result as unknown as Record<string, unknown>,
+            });
+            return completed.ok
+              ? makeJson({ ok: true, requestId, status: "completed" }, 200)
+              : makeJson({ ok: false, requestId, message: completed.message }, 409);
+          } catch (error) {
+            return makeJson(
+              {
+                ok: false,
+                requestId,
+                message: compactText(error instanceof Error ? error.message : error, 2_000),
+              },
+              400,
+            );
+          }
+        }
+        const remoteError =
+          body.error && typeof body.error === "object"
+            ? (body.error as RepositoryAgentRemoteError)
+            : {
+                code: "repository_agent_failed",
+                message: "RepositoryAgent request failed",
+                retryable: false,
+              };
+        const failed = repositoryAgentQueue.fail(requestId, {
+          agentId,
+          claimToken,
+          claimGeneration,
+          message: JSON.stringify(remoteError),
+        });
+        return failed.ok
+          ? makeJson(
+              {
+                ok: true,
+                requestId,
+                status: failed.requeued ? "queued" : "failed",
+                ...(failed.nextAttemptAt ? { nextAttemptAt: failed.nextAttemptAt } : {}),
+                ...(failed.deadLettered ? { deadLettered: true } : {}),
+              },
+              200,
+            )
+          : makeJson({ ok: false, requestId, message: failed.message }, 409);
       }
 
       // POST /sessions - Create (or join) a session
@@ -1814,6 +2478,26 @@ export function createRequestHandler() {
         const requestPriorityCounts = requestQueue.countByPriority();
         const requestPendingSnapshot = requestQueue.nextPendingSnapshot(10);
         const requestSlo = requestQueue.sloSummary(24);
+        guardedReconciliation("repository agent deadlines", 0, () =>
+          repositoryAgentQueue.expirePastDeadlines(),
+        );
+        const repositoryAgentHealth = guardedReconciliation(
+          "repository agent health",
+          {
+            counts: { pending: 0, claimed: 0, completed: 0, failed: 0 },
+            oldestPendingAgeMs: 0,
+            oldestClaimedAgeMs: 0,
+            delayedRetryCount: 0,
+            staleClaimCount: 0,
+            pastDeadlineActiveCount: 0,
+            exhaustedPendingCount: 0,
+            maxClaimAttempts: 3,
+            pendingUnhealthyAfterMs: 5 * 60_000,
+            unhealthy: true,
+          },
+          () => repositoryAgentQueue.healthSummary(),
+        );
+        const repositoryAgentCounts = repositoryAgentHealth.counts;
         const jobCounts = jobQueue.countByStatus();
         const jobPriorityCounts = jobQueue.countByPriority();
         const jobPendingSnapshot = jobQueue.nextPendingSnapshot(10);
@@ -1855,6 +2539,12 @@ export function createRequestHandler() {
             requests: requestCounts,
             requestPriorities: requestPriorityCounts,
             requestPendingSnapshot,
+            repositoryAgent: repositoryAgentCounts,
+            repositoryAgentHealth,
+            repositoryAgentMemoryFeedback: {
+              ...autonomyStore.repositoryAgentMemoryFeedbackHealth(),
+              worker: { ...repositoryAgentMemoryFeedbackState },
+            },
             jobs: jobCounts,
             jobPriorities: jobPriorityCounts,
             jobPendingSnapshot,
@@ -2430,6 +3120,43 @@ export function createRequestHandler() {
           });
         }
         return makeJson(result, 200);
+      }
+
+      // GET /jobs/pr-links
+      // Compact, cursor-paged authority for SourceControlManager provider
+      // reconciliation. Never expose full job params/results on this hot poll.
+      if (pathname === "/jobs/pr-links" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const pageSize = Math.min(100, parseLimit(url.searchParams.get("limit"), 50));
+        const rawCursor = url.searchParams.get("cursor");
+        const beforeCursor = parseCursor(rawCursor);
+        if (
+          rawCursor &&
+          (!/^[1-9]\d*$/.test(rawCursor) ||
+            beforeCursor === null ||
+            !Number.isSafeInteger(beforeCursor))
+        ) {
+          return makeJson({ ok: false, message: "Invalid PR-link cursor" }, 400);
+        }
+        const rows = jobQueue.listPersistedPrLinksPage({
+          limit: pageSize + 1,
+          beforeCursor,
+        });
+        const hasMore = rows.length > pageSize;
+        const page = rows.slice(0, pageSize);
+        const lastCursor = page.at(-1)?.cursor ?? null;
+        return makeJson({
+          ok: true,
+          links: page.map((row) => ({
+            jobId: row.jobId,
+            sessionId: row.sessionId || null,
+            prUrl: row.prUrl,
+            updatedAt: row.updatedAt,
+          })),
+          nextCursor: hasMore && lastCursor ? String(lastCursor) : null,
+        });
       }
 
       // GET /jobs
@@ -3443,7 +4170,11 @@ export function createRequestHandler() {
           const origin = deriveJobOrigin(params);
           const requestId = compactText(params.requestId, 128);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
+          const publishedPrUrl =
+            compactText(prUrl, 2_000) || compactText(job?.prUrl, 2_000) || null;
+          if (publishedPrUrl) jobQueue.setPrUrl(result.jobId, publishedPrUrl);
           if (outcomeContext) {
+            if (publishedPrUrl) autonomyStore.markObjectiveAwaitingReviewByJobId(result.jobId);
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -3451,9 +4182,10 @@ export function createRequestHandler() {
               patternKey: outcomeContext.patternKey,
               success: true,
               latencyMs: result.durationMs ?? null,
-              userAction: "applied",
+              userAction: publishedPrUrl ? "published" : "applied",
               reopenedWithin24h: false,
               regressionFlag: false,
+              terminal: !publishedPrUrl,
             });
           }
           if (job?.sessionId) {
@@ -3653,7 +4385,14 @@ export function createRequestHandler() {
   });
 }
 
-export { sessionManager, jobQueue, autonomyStore };
+export {
+  sessionManager,
+  jobQueue,
+  autonomyStore,
+  memoryStore,
+  repositoryAgentQueue,
+  repositoryServices,
+};
 
 // If this file is executed directly, start the server.
 if (import.meta.main) {

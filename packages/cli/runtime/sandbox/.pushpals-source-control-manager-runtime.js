@@ -3,9 +3,9 @@ var __require = import.meta.require;
 
 // apps/source_control_manager/src/source_control_manager_main.ts
 import { parseArgs } from "util";
-import { isAbsolute as isAbsolute3, join as join6, relative, resolve as resolve9 } from "path";
+import { isAbsolute as isAbsolute3, join as join6, relative as relative2, resolve as resolve10 } from "path";
 import { mkdirSync as mkdirSync3 } from "fs";
-import { createHash as createHash4, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash5, randomUUID as randomUUID3 } from "crypto";
 
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -1198,6 +1198,9 @@ function loadPushPalsConfig(options = {}) {
 }
 
 // packages/shared/src/bounded_process.ts
+function abortReason(signal) {
+  return signal.reason instanceof Error ? signal.reason : new DOMException("The subprocess was aborted", "AbortError");
+}
 var DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 var DEFAULT_DRAIN_TIMEOUT_MS = 2000;
 var DEFAULT_TERMINATION_TIMEOUT_MS = 5000;
@@ -1445,6 +1448,8 @@ async function terminateProcessTree(proc, options = {}) {
   await settleWithin(proc.exited, exitGraceMs);
 }
 async function runBoundedProcess(argv, options) {
+  if (options.signal?.aborted)
+    throw abortReason(options.signal);
   const spawn = options.spawn ?? defaultSpawner;
   const platform = options.platform ?? process.platform;
   const proc = spawn(argv, {
@@ -1470,8 +1475,27 @@ async function runBoundedProcess(argv, options) {
   let effectiveTimeoutMs = timeoutMs;
   let deadlineAtMs = startedAtMs + timeoutMs;
   let timer = null;
+  let removeAbortListener = () => {
+    return;
+  };
+  const aborted = new Promise((resolve2) => {
+    const onAbort = () => resolve2({
+      timedOut: false,
+      aborted: true,
+      exitCode: 130,
+      reason: abortReason(options.signal)
+    });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+    if (options.signal?.aborted)
+      onAbort();
+  });
   const outcome = await Promise.race([
-    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    proc.exited.then((exitCode) => ({
+      timedOut: false,
+      aborted: false,
+      exitCode
+    })),
     new Promise((resolve2) => {
       const scheduleDeadline = () => {
         timer = setTimeout(() => {
@@ -1499,22 +1523,24 @@ async function runBoundedProcess(argv, options) {
           try {
             options.onTimeout?.(Math.max(1, nowMs - startedAtMs));
           } catch {}
-          resolve2({ timedOut: true, exitCode: 124 });
+          resolve2({ timedOut: true, aborted: false, exitCode: 124 });
         }, Math.max(1, deadlineAtMs - Date.now()));
       };
       scheduleDeadline();
-    })
+    }),
+    ...options.signal ? [aborted] : []
   ]);
   if (timer)
     clearTimeout(timer);
+  removeAbortListener();
   const terminate = options.terminate ?? ((target) => terminateProcessTree(target, { platform, spawn }));
-  if (outcome.timedOut)
+  if (outcome.timedOut || outcome.aborted)
     await terminate(proc);
   const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
   let streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), drainTimeoutMs);
   const drainTimedOut = !streams.settled;
   if (!streams.settled) {
-    if (!outcome.timedOut) {
+    if (!outcome.timedOut && !outcome.aborted) {
       if (options.terminate) {
         await options.terminate(proc);
       } else {
@@ -1533,6 +1559,8 @@ async function runBoundedProcess(argv, options) {
   const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
   const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
   const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
+  if (outcome.aborted)
+    throw outcome.reason;
   return {
     stdout: trimOutput(stdout),
     stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
@@ -1645,6 +1673,1361 @@ async function resolveGitTokenForRemote(options) {
     return { backend, host, token: cliToken, source: "cli" };
   }
   return { backend, host, token: "", source: "none" };
+}
+
+// packages/shared/src/memory.ts
+import { createHash, randomUUID } from "crypto";
+var MEMORY_REINFORCEMENT_OUTCOMES = Object.freeze([
+  "confirmed",
+  "successful",
+  "failed",
+  "contradicted"
+]);
+var MEMORY_LIMITS = Object.freeze({
+  namespaceChars: 128,
+  repositoryIdChars: 256,
+  sessionIdChars: 256,
+  keyChars: 512,
+  kindChars: 128,
+  subjectKeyChars: 512,
+  summaryChars: 16000,
+  listItems: 128,
+  listItemChars: 256,
+  tagChars: 128,
+  evidenceItems: 128,
+  evidencePathChars: 1000,
+  evidenceBlobOidChars: 256,
+  evidenceSourceIdChars: 512,
+  evidenceDetailChars: 2000,
+  provenanceServiceChars: 128,
+  provenanceFieldChars: 512,
+  searchTextChars: 2000,
+  selectorReasonChars: 1000,
+  recordIdChars: 256,
+  searchMaxItems: 128,
+  searchMaxChars: 1e6,
+  searchCandidateRows: 4096
+});
+var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
+var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
+var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
+  "repository_agent_cache",
+  "repository_facts"
+]);
+var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+
+class MemoryConflictError extends Error {
+  code;
+  constructor(message, code = "conflict") {
+    super(message);
+    this.name = "MemoryConflictError";
+    this.code = code;
+  }
+}
+
+class MemoryStoreClosedError extends Error {
+  constructor() {
+    super("Memory store is closed");
+    this.name = "MemoryStoreClosedError";
+  }
+}
+
+class MemoryValidationError extends TypeError {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.name = "MemoryValidationError";
+    this.code = code;
+  }
+}
+
+class MemoryHttpError extends Error {
+  status;
+  code;
+  constructor(message, status = 0, code) {
+    super(message);
+    this.name = "MemoryHttpError";
+    this.status = status;
+    this.code = typeof code === "string" && code.trim() ? code.trim() : null;
+  }
+}
+function isMemoryReinforcementOutcome(value) {
+  return typeof value === "string" && MEMORY_REINFORCEMENT_OUTCOMES.includes(value);
+}
+function assertMemoryReinforcementOutcome(value) {
+  if (isMemoryReinforcementOutcome(value))
+    return;
+  throw new MemoryValidationError(`memory reinforcement outcome must be one of: ${MEMORY_REINFORCEMENT_OUTCOMES.join(", ")}`, "invalid_reinforcement_outcome");
+}
+function normalizedText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+function requiredText(value, label) {
+  const normalized = normalizedText(value);
+  if (!normalized)
+    throw new TypeError(`${label} is required`);
+  return normalized;
+}
+function compactText(value, maxChars) {
+  return normalizedText(value).slice(0, maxChars);
+}
+function boundedAddressText(value, label, maxChars, required) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    if (required)
+      throw new TypeError(`${label} is required`);
+    return null;
+  }
+  if (normalized.length > maxChars) {
+    throw new TypeError(`${label} must be at most ${maxChars} characters`);
+  }
+  if (normalized.includes("\x00"))
+    throw new TypeError(`${label} must not contain NUL characters`);
+  return normalized;
+}
+function normalizedOptionalText(value) {
+  return normalizedText(value) || null;
+}
+function normalizeScope(scope) {
+  return {
+    namespace: boundedAddressText(scope?.namespace, "memory scope namespace", MEMORY_LIMITS.namespaceChars, true),
+    repositoryId: boundedAddressText(scope?.repositoryId, "memory scope repositoryId", MEMORY_LIMITS.repositoryIdChars, false),
+    sessionId: boundedAddressText(scope?.sessionId, "memory scope sessionId", MEMORY_LIMITS.sessionIdChars, false)
+  };
+}
+function scopeKey(scope) {
+  const normalized = normalizeScope(scope);
+  return JSON.stringify([
+    normalized.namespace,
+    normalized.repositoryId ?? "",
+    normalized.sessionId ?? ""
+  ]);
+}
+function addressKey(address) {
+  const key = boundedAddressText(address.key, "memory key", MEMORY_LIMITS.keyChars, true);
+  return `${scopeKey(address.scope)}\x00${key}`;
+}
+function clampUnit(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed))
+    return fallback;
+  return Math.max(0, Math.min(1, parsed));
+}
+function normalizedStringList(values, maxItems = MEMORY_LIMITS.listItems, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!Array.isArray(values))
+    return [];
+  const output = [];
+  const seen = new Set;
+  for (const value of values) {
+    const item = compactText(value, maxChars);
+    if (!item || seen.has(item))
+      continue;
+    seen.add(item);
+    output.push(item);
+    if (output.length >= maxItems)
+      break;
+  }
+  return output;
+}
+function normalizeEvidence(evidence) {
+  if (!Array.isArray(evidence))
+    return [];
+  const output = [];
+  for (const raw of evidence.slice(0, MEMORY_LIMITS.evidenceItems)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      continue;
+    const row = raw;
+    const path = compactText(row.path, MEMORY_LIMITS.evidencePathChars).replace(/\\/g, "/") || undefined;
+    if (path && (/^(?:[a-z]:)?\//i.test(path) || path.split("/").includes(".."))) {
+      throw new TypeError("memory evidence paths must be repository-relative and contained");
+    }
+    const normalized = {
+      ...path ? { path } : {},
+      ...compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) ? { blobOid: compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) } : {},
+      ...compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) ? { sourceId: compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) } : {},
+      ...compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) ? { detail: compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) } : {},
+      ...normalizedOptionalText(row.observedAt) ? { observedAt: normalizeTimestamp(row.observedAt, "evidence observedAt") } : {}
+    };
+    if (Object.keys(normalized).length > 0)
+      output.push(normalized);
+  }
+  return output;
+}
+function normalizeProvenance(value) {
+  const service = compactText(value?.service, MEMORY_LIMITS.provenanceServiceChars);
+  if (!service)
+    throw new TypeError("memory provenance service is required");
+  const optional = (input) => compactText(input, MEMORY_LIMITS.provenanceFieldChars) || undefined;
+  return {
+    service,
+    ...optional(value.agentId) ? { agentId: optional(value.agentId) } : {},
+    ...optional(value.runId) ? { runId: optional(value.runId) } : {},
+    ...optional(value.requestId) ? { requestId: optional(value.requestId) } : {},
+    ...optional(value.jobId) ? { jobId: optional(value.jobId) } : {},
+    ...optional(value.modelId) ? { modelId: optional(value.modelId) } : {},
+    ...optional(value.headSha) ? { headSha: optional(value.headSha) } : {},
+    ...optional(value.promptVersion) ? { promptVersion: optional(value.promptVersion) } : {}
+  };
+}
+function normalizeTimestamp(value, label) {
+  const timestamp = compactText(value, 64);
+  const parsed = Date.parse(timestamp);
+  if (!timestamp || !Number.isFinite(parsed))
+    throw new TypeError(`${label} must be an ISO timestamp`);
+  return new Date(parsed).toISOString();
+}
+function normalizeStatus(value, fallback = "active") {
+  return value === "active" || value === "stale" || value === "superseded" || value === "invalid" ? value : fallback;
+}
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function cloneObservation(observation) {
+  return {
+    ...observation,
+    ...observation.evidence ? { evidence: observation.evidence.map((entry) => ({ ...entry })) } : {},
+    ...observation.provenance ? { provenance: { ...observation.provenance } } : {}
+  };
+}
+function cloneRecord(record) {
+  return {
+    ...record,
+    scope: { ...record.scope },
+    value: record.value == null ? null : cloneJson(record.value),
+    tags: [...record.tags],
+    evidence: record.evidence.map((entry) => ({ ...entry })),
+    observations: record.observations.map(cloneObservation),
+    provenance: { ...record.provenance }
+  };
+}
+function serializedMemoryRecordChars(record) {
+  return JSON.stringify(record).length;
+}
+function isExpired(record, nowMs) {
+  return record.expiresAt != null && Date.parse(record.expiresAt) <= nowMs;
+}
+function sameScope(left, right) {
+  return scopeKey(left) === scopeKey(right);
+}
+function matchesAny(value, candidates, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!candidates || candidates.length === 0)
+    return true;
+  if (value == null)
+    return false;
+  return new Set(normalizedStringList(candidates, MEMORY_LIMITS.listItems, maxChars).map((entry) => entry.toLowerCase())).has(value.toLowerCase());
+}
+function hasAllTags(record, tags) {
+  const requested = normalizedStringList(tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars).map((tag) => tag.toLowerCase());
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.tags.map((tag) => tag.toLowerCase()));
+  return requested.every((tag) => available.has(tag));
+}
+function hasAnyEvidencePath(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.some((path) => available.has(path));
+}
+function hasAllEvidencePaths(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.every((path) => available.has(path));
+}
+function resolveMemoryReinforcement(record, outcome, requestedWeight = 1) {
+  assertMemoryReinforcementOutcome(outcome);
+  const parsedWeight = Number(requestedWeight);
+  const weight = Math.max(0, Math.min(4, Number.isFinite(parsedWeight) ? parsedWeight : 1));
+  const positive = outcome === "confirmed" || outcome === "successful";
+  const confidence = positive ? record.confidence + (1 - record.confidence) * 0.15 * weight : record.confidence * (1 - 0.25 * weight);
+  const usefulness = positive ? record.usefulness + (1 - record.usefulness) * 0.12 * weight : record.usefulness * (1 - 0.2 * weight);
+  const status = outcome === "contradicted" ? "superseded" : positive && record.status === "stale" ? "active" : record.status;
+  return {
+    weight,
+    confidence: clampUnit(confidence, record.confidence),
+    usefulness: clampUnit(usefulness, record.usefulness),
+    status
+  };
+}
+function reinforcementObservationId(recordId, input) {
+  const explicit = normalizedOptionalText(input.observationId);
+  const provenance = input.provenance;
+  const inferredParts = provenance ? [
+    normalizedOptionalText(provenance.service),
+    normalizedOptionalText(provenance.requestId),
+    normalizedOptionalText(provenance.jobId),
+    normalizedOptionalText(provenance.runId)
+  ].filter((part) => part != null) : [];
+  const inferredIdentity = inferredParts.length > 1 ? inferredParts.join("\x00") : null;
+  if (!explicit && !inferredIdentity)
+    return randomUUID();
+  const identity = explicit ? [recordId, "explicit", explicit] : [recordId, "inferred", inferredIdentity, input.outcome];
+  return `observation_${createHash("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 32)}`;
+}
+function createMemoryReinforcementObservation(recordId, input, observedAt) {
+  assertMemoryReinforcementOutcome(input.outcome);
+  const effect = resolveMemoryReinforcement({ confidence: 0, usefulness: 0, status: "active" }, input.outcome, input.weight);
+  const evidence = normalizeEvidence(input.evidence);
+  return {
+    id: reinforcementObservationId(recordId, input),
+    outcome: input.outcome,
+    weight: effect.weight,
+    observedAt: normalizeTimestamp(observedAt, "reinforcement observedAt"),
+    ...evidence.length > 0 ? { evidence } : {},
+    ...input.provenance ? { provenance: normalizeProvenance(input.provenance) } : {}
+  };
+}
+function appendMemoryReinforcementObservation(existing, observation) {
+  const prior = existing.find((entry) => entry.id === observation.id);
+  if (prior)
+    assertMemoryReinforcementObservationCompatible(prior, observation);
+  const appended = prior == null;
+  const candidates = appended ? [...existing, observation] : existing;
+  const seen = new Set;
+  const observations = [];
+  for (let index = candidates.length - 1;index >= 0; index--) {
+    const candidate = candidates[index];
+    if (!candidate || seen.has(candidate.id))
+      continue;
+    seen.add(candidate.id);
+    observations.unshift(cloneObservation(candidate));
+    if (observations.length >= MAX_MEMORY_REINFORCEMENT_OBSERVATIONS)
+      break;
+  }
+  return { observations, appended };
+}
+function canonicalObservationPayload(observation) {
+  const evidence = (observation.evidence ?? []).map((entry) => JSON.stringify({
+    path: entry.path ?? null,
+    blobOid: entry.blobOid ?? null,
+    sourceId: entry.sourceId ?? null,
+    detail: entry.detail ?? null,
+    observedAt: entry.observedAt ?? null
+  })).sort();
+  const provenance = observation.provenance ? {
+    service: observation.provenance.service,
+    agentId: observation.provenance.agentId ?? null,
+    runId: observation.provenance.runId ?? null,
+    requestId: observation.provenance.requestId ?? null,
+    jobId: observation.provenance.jobId ?? null,
+    modelId: observation.provenance.modelId ?? null,
+    headSha: observation.provenance.headSha ?? null,
+    promptVersion: observation.provenance.promptVersion ?? null
+  } : null;
+  return JSON.stringify({
+    outcome: observation.outcome,
+    weight: observation.weight,
+    evidence,
+    provenance
+  });
+}
+function assertMemoryReinforcementObservationCompatible(existing, candidate) {
+  if (existing.id !== candidate.id)
+    return;
+  if (canonicalObservationPayload(existing) === canonicalObservationPayload(candidate))
+    return;
+  throw new MemoryConflictError(`Memory observation conflict for ${candidate.id}: the id was already used for a different outcome payload`);
+}
+function memoryRecordRankingQuality(record) {
+  return (clampUnit(record.confidence, 0.5) + clampUnit(record.usefulness, 0.5)) / 2;
+}
+function searchScore(record, text) {
+  const tokens = normalizedText(text).toLowerCase().split(/[^a-z0-9_.\/-]+/).filter((token) => token.length > 1).slice(0, 64);
+  if (tokens.length === 0)
+    return 0;
+  const subject = (record.subjectKey ?? "").toLowerCase();
+  const haystack = [record.key, record.kind, subject, record.summary, ...record.tags].join(" ").toLowerCase();
+  let score = 0;
+  for (const token of new Set(tokens)) {
+    if (record.key.toLowerCase() === token || subject === token)
+      score += 6;
+    else if (record.key.toLowerCase().includes(token) || subject.includes(token))
+      score += 3;
+    else if (haystack.includes(token))
+      score += 1;
+  }
+  return score;
+}
+
+class InMemoryMemoryStore {
+  records = new Map;
+  now;
+  closed = false;
+  constructor(options = {}) {
+    this.now = options.now ?? (() => new Date);
+  }
+  assertOpen() {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+  }
+  async put(input, options = {}) {
+    this.assertOpen();
+    const normalizedScope = normalizeScope(input.scope);
+    const key = boundedAddressText(input.key, "memory key", MEMORY_LIMITS.keyChars, true);
+    const storageKey = addressKey({ scope: normalizedScope, key });
+    const existing = this.records.get(storageKey);
+    if (options.expectedRevision != null) {
+      const actualRevision = existing?.revision ?? 0;
+      if (actualRevision !== options.expectedRevision) {
+        throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
+      }
+    }
+    const now = this.now().toISOString();
+    let expiresAt;
+    if (input.expiresAt !== undefined) {
+      expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
+    } else if (input.ttlMs !== undefined && input.ttlMs !== null) {
+      const ttlMs = Number(input.ttlMs);
+      if (!Number.isFinite(ttlMs) || ttlMs <= 0)
+        throw new TypeError("ttlMs must be positive");
+      expiresAt = new Date(Date.parse(now) + Math.floor(ttlMs)).toISOString();
+    } else {
+      expiresAt = existing?.expiresAt ?? null;
+    }
+    const status = normalizeStatus(input.status, existing?.status ?? "active");
+    const preserveLearnedScores = existing != null && options.expectedRevision === undefined;
+    const remainsInvalid = status === "invalid" && existing?.status === "invalid";
+    const record = {
+      id: existing?.id ?? randomUUID(),
+      scope: normalizedScope,
+      key,
+      kind: requiredText(compactText(input.kind, MEMORY_LIMITS.kindChars), "memory kind"),
+      subjectKey: compactText(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null,
+      summary: requiredText(compactText(input.summary, MEMORY_LIMITS.summaryChars), "memory summary"),
+      value: input.value == null ? null : cloneJson(input.value),
+      tags: normalizedStringList(input.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars),
+      evidence: normalizeEvidence(input.evidence),
+      observations: existing?.observations.map(cloneObservation) ?? [],
+      provenance: existing?.provenance ?? normalizeProvenance(input.provenance),
+      confidence: preserveLearnedScores ? existing.confidence : clampUnit(input.confidence, existing?.confidence ?? 0.5),
+      usefulness: preserveLearnedScores ? existing.usefulness : clampUnit(input.usefulness, existing?.usefulness ?? 0.5),
+      status,
+      revision: (existing?.revision ?? 0) + 1,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      expiresAt,
+      invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
+      invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
+    };
+    this.records.set(storageKey, record);
+    return cloneRecord(record);
+  }
+  async get(address, options = {}) {
+    this.assertOpen();
+    const record = this.records.get(addressKey(address));
+    if (!record)
+      return null;
+    if (!options.includeExpired && isExpired(record, this.now().getTime()))
+      return null;
+    const statuses = options.statuses?.length ? options.statuses : ["active"];
+    if (!statuses.includes(record.status))
+      return null;
+    return cloneRecord(record);
+  }
+  async search(query) {
+    this.assertOpen();
+    const scope = normalizeScope(query.scope);
+    const statuses = query.statuses?.length ? query.statuses : ["active"];
+    const nowMs = this.now().getTime();
+    const candidates = [...this.records.values()].filter((record) => sameScope(record.scope, scope)).filter((record) => query.includeExpired || !isExpired(record, nowMs)).filter((record) => statuses.includes(record.status)).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.revision - left.revision || left.key.localeCompare(right.key)).slice(0, MEMORY_LIMITS.searchCandidateRows);
+    const scored = candidates.filter((record) => matchesAny(record.kind, query.kinds, MEMORY_LIMITS.kindChars)).filter((record) => matchesAny(record.subjectKey, query.subjectKeys, MEMORY_LIMITS.subjectKeyChars)).filter((record) => hasAllTags(record, query.tags)).filter((record) => hasAllEvidencePaths(record, query.evidencePaths)).map((record) => ({
+      record,
+      score: searchScore(record, compactText(query.text, MEMORY_LIMITS.searchTextChars))
+    })).filter((entry) => !compactText(query.text, MEMORY_LIMITS.searchTextChars) || entry.score > 0).sort((left, right) => right.score - left.score || memoryRecordRankingQuality(right.record) - memoryRecordRankingQuality(left.record) || Date.parse(right.record.updatedAt) - Date.parse(left.record.updatedAt) || right.record.revision - left.record.revision || left.record.key.localeCompare(right.record.key));
+    const requestedMaxItems = Number(query.maxItems ?? 12);
+    const maxItems = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxItems, Number.isFinite(requestedMaxItems) ? Math.floor(requestedMaxItems) : 12));
+    const requestedMaxChars = Number(query.maxChars ?? 16000);
+    const maxChars = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxChars, Number.isFinite(requestedMaxChars) ? Math.floor(requestedMaxChars) : 16000));
+    const output = [];
+    let usedChars = 0;
+    for (const { record } of scored) {
+      if (output.length >= maxItems)
+        break;
+      const cloned = cloneRecord(record);
+      const cost = serializedMemoryRecordChars(cloned);
+      if (usedChars + cost > maxChars)
+        continue;
+      output.push(cloned);
+      usedChars += cost;
+    }
+    return output;
+  }
+  async invalidate(selector) {
+    this.assertOpen();
+    const scope = normalizeScope(selector.scope);
+    const reason = compactText(selector.reason, MEMORY_LIMITS.selectorReasonChars) || "invalidated";
+    const now = this.now().toISOString();
+    let changed = 0;
+    for (const [key, record] of this.records) {
+      if (!sameScope(record.scope, scope))
+        continue;
+      if (!matchesAny(record.key, selector.keys, MEMORY_LIMITS.keyChars))
+        continue;
+      if (!matchesAny(record.kind, selector.kinds, MEMORY_LIMITS.kindChars))
+        continue;
+      if (!matchesAny(record.subjectKey, selector.subjectKeys, MEMORY_LIMITS.subjectKeyChars))
+        continue;
+      if (!hasAllTags(record, selector.tags))
+        continue;
+      if (!hasAnyEvidencePath(record, selector.evidencePaths))
+        continue;
+      if (selector.statuses?.length && !selector.statuses.includes(record.status))
+        continue;
+      if (record.status === "invalid")
+        continue;
+      this.records.set(key, {
+        ...record,
+        status: "invalid",
+        revision: record.revision + 1,
+        updatedAt: now,
+        invalidatedAt: now,
+        invalidationReason: reason
+      });
+      changed++;
+    }
+    return changed;
+  }
+  async reinforce(input) {
+    this.assertOpen();
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const storageKey = addressKey(input);
+    const record = this.records.get(storageKey);
+    if (!record)
+      return null;
+    if (input.expectedId !== undefined) {
+      const expectedId = boundedAddressText(input.expectedId, "memory expectedId", MEMORY_LIMITS.recordIdChars, true);
+      if (record.id !== expectedId) {
+        throw new MemoryConflictError(`Memory record conflict for ${record.scope.namespace}/${record.key}: expected id ${expectedId}, got ${record.id}`, "record_conflict");
+      }
+    }
+    const effect = resolveMemoryReinforcement(record, input.outcome, input.weight);
+    const now = this.now().toISOString();
+    const observation = createMemoryReinforcementObservation(record.id, input, now);
+    const appended = appendMemoryReinforcementObservation(record.observations, observation);
+    if (!appended.appended)
+      return cloneRecord(record);
+    const updated = {
+      ...record,
+      confidence: effect.confidence,
+      usefulness: effect.usefulness,
+      status: effect.status,
+      evidence: input.evidence && input.evidence.length > 0 ? normalizeEvidence([...record.evidence, ...input.evidence]) : record.evidence,
+      observations: appended.observations,
+      provenance: record.provenance,
+      revision: record.revision + 1,
+      updatedAt: now,
+      invalidatedAt: effect.status === "invalid" ? record.invalidatedAt : null,
+      invalidationReason: effect.status === "invalid" ? record.invalidationReason : null
+    };
+    this.records.set(storageKey, updated);
+    return cloneRecord(updated);
+  }
+  async prune(options = {}) {
+    this.assertOpen();
+    const expiryCutoff = options.expiredBefore ? Date.parse(normalizeTimestamp(options.expiredBefore, "expiredBefore")) : this.now().getTime();
+    const updatedCutoff = options.updatedBefore ? Date.parse(normalizeTimestamp(options.updatedBefore, "updatedBefore")) : null;
+    const ageStatuses = options.statuses?.length ? options.statuses : ["invalid", "superseded"];
+    let removed = 0;
+    for (const [key, record] of this.records) {
+      if (options.scope && !sameScope(record.scope, options.scope))
+        continue;
+      const expired = record.expiresAt != null && Date.parse(record.expiresAt) <= expiryCutoff;
+      const agedTerminal = updatedCutoff != null && ageStatuses.includes(record.status) && Date.parse(record.updatedAt) <= updatedCutoff;
+      if (!expired && !agedTerminal)
+        continue;
+      this.records.delete(key);
+      removed++;
+    }
+    return removed;
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+
+class MemoryHttpClient {
+  serverUrl;
+  authToken;
+  callerService;
+  authority;
+  fetchImpl;
+  timeoutMs;
+  maxResponseBytes;
+  closed = false;
+  constructor(options) {
+    this.serverUrl = requiredText(options.serverUrl, "memory server URL").replace(/\/+$/, "");
+    this.authToken = normalizedOptionalText(options.authToken);
+    const callerService = normalizedText(options.callerService ?? "client");
+    if (callerService !== "server" && callerService !== "localbuddy" && callerService !== "remotebuddy" && callerService !== "workerpals" && callerService !== "source_control_manager" && callerService !== "repository_agent" && callerService !== "cli" && callerService !== "client") {
+      throw new TypeError(`Unsupported memory caller service: ${callerService}`);
+    }
+    this.callerService = callerService;
+    const authority = normalizedOptionalText(options.authority);
+    if (authority && authority !== "repository_agent" && authority !== "server") {
+      throw new TypeError(`Unsupported memory authority: ${authority}`);
+    }
+    this.authority = authority === "repository_agent" || authority === "server" ? authority : null;
+    this.fetchImpl = options.fetchImpl;
+    const requestedTimeoutMs = Number(options.timeoutMs ?? 1e4);
+    this.timeoutMs = Math.max(1, Math.min(120000, Number.isFinite(requestedTimeoutMs) ? Math.floor(requestedTimeoutMs) : 1e4));
+    const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
+    this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
+  }
+  async request(path, method, body) {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+    const headers = {
+      "Content-Type": "application/json",
+      [MEMORY_HTTP_CALLER_HEADER]: this.callerService,
+      ...this.authority ? { [MEMORY_HTTP_AUTHORITY_HEADER]: this.authority } : {}
+    };
+    if (this.authToken)
+      headers.Authorization = `Bearer ${this.authToken}`;
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${this.serverUrl}${path}`,
+      init: { method, headers, body: JSON.stringify(body) },
+      timeoutMs: this.timeoutMs,
+      maxResponseBytes: this.maxResponseBytes,
+      fetchImpl: this.fetchImpl,
+      timeoutMessage: `Memory request ${method} ${path} timed out after ${this.timeoutMs}ms`
+    });
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch {
+      if (response.ok)
+        throw new MemoryHttpError("Memory server returned invalid JSON", response.status);
+    }
+    if (!response.ok || payload.ok === false) {
+      const detail = normalizedText(payload.message ?? payload.error) || response.statusText || "request failed";
+      if (response.status === 409) {
+        throw new MemoryConflictError(detail, payload.code === "record_conflict" ? "record_conflict" : "conflict");
+      }
+      throw new MemoryHttpError(`Memory server request failed: ${detail}`, response.status, payload.code);
+    }
+    return payload;
+  }
+  async put(input, options = {}) {
+    const payload = await this.request("/memory/records", "PUT", { input, options });
+    if (!payload.record)
+      throw new MemoryHttpError("Memory server response omitted record");
+    return payload.record;
+  }
+  async get(address, options = {}) {
+    const payload = await this.request("/memory/get", "POST", { address, options });
+    return payload.record ?? null;
+  }
+  async search(query) {
+    const payload = await this.request("/memory/search", "POST", { query });
+    if (!Array.isArray(payload.records)) {
+      throw new MemoryHttpError("Memory server response omitted records");
+    }
+    return payload.records;
+  }
+  async invalidate(selector) {
+    const payload = await this.request("/memory/invalidate", "POST", { selector });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async reinforce(input) {
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const payload = await this.request("/memory/reinforce", "POST", { input });
+    return payload.record ?? null;
+  }
+  async prune(options = {}) {
+    const payload = await this.request("/memory/prune", "POST", { options });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+
+// packages/shared/src/repository_agent.ts
+var REPOSITORY_AGENT_SCHEMA_VERSION = 1;
+var REPOSITORY_AGENT_LIMITS = Object.freeze({
+  requestBytes: 256 * 1024,
+  responseBytes: 2 * 1024 * 1024,
+  deadlineHorizonMs: 60 * 60000,
+  questionChars: 32000,
+  contextChars: 96000,
+  contextDepth: 8,
+  contextEntries: 1024,
+  contextStringChars: 16000,
+  answerChars: 128000,
+  summaryChars: 16000,
+  evidenceItems: 128,
+  recommendationItems: 64,
+  validationProposalItems: 32,
+  memoryRefItems: 128
+});
+
+class RepositoryAgentClientError extends Error {
+  code;
+  status;
+  requestId;
+  retryAfterMs;
+  remoteCode;
+  detail;
+  retryable;
+  constructor(code, message, options = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "RepositoryAgentClientError";
+    this.code = code;
+    this.status = options.status ?? null;
+    this.requestId = options.requestId ?? null;
+    this.retryAfterMs = options.retryAfterMs ?? null;
+    this.remoteCode = options.remoteCode ?? null;
+    this.detail = options.detail ?? null;
+    this.retryable = options.retryable ?? null;
+  }
+}
+var CALLER_SERVICES = new Set([
+  "server",
+  "localbuddy",
+  "remotebuddy",
+  "workerpals",
+  "source_control_manager",
+  "repository_agent",
+  "cli",
+  "client"
+]);
+var PURPOSES = new Set([
+  "architecture",
+  "priority",
+  "ownership",
+  "validation",
+  "debug",
+  "impact",
+  "general"
+]);
+var PRIORITIES = new Set(["interactive", "normal", "background"]);
+var FRESHNESS_VALUES = new Set([
+  "cache_preferred",
+  "fresh_required",
+  "cache_only"
+]);
+var MEMORY_ROLES = new Set([
+  "analysis_cache",
+  "evidence_fact",
+  "recalled_fact"
+]);
+var REQUEST_STATUSES = new Set([
+  "queued",
+  "claimed",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+var TERMINAL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+function invalidRequest(message) {
+  throw new RepositoryAgentClientError("invalid_request", message);
+}
+function invalidResponse(message) {
+  throw new RepositoryAgentClientError("invalid_response", message);
+}
+function contractViolation(source, message) {
+  return source === "request" ? invalidRequest(message) : invalidResponse(message);
+}
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function requiredString(value, label, maxChars, source) {
+  if (typeof value !== "string") {
+    return source === "request" ? invalidRequest(`${label} must be a string`) : invalidResponse(`${label} must be a string`);
+  }
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized) {
+    return source === "request" ? invalidRequest(`${label} is required`) : invalidResponse(`${label} is required`);
+  }
+  if (normalized.length > maxChars) {
+    return source === "request" ? invalidRequest(`${label} exceeds ${maxChars} characters`) : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+  }
+  return normalized;
+}
+function optionalString(value, maxChars) {
+  if (typeof value !== "string")
+    return;
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized)
+    return;
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+}
+function finiteInt(value, options) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    if (options.fallback !== undefined)
+      return options.fallback;
+    invalidResponse("Expected a finite integer");
+  }
+  return Math.max(options.min, Math.min(options.max, Math.floor(parsed)));
+}
+function normalizedIso(value, label, source) {
+  const raw = requiredString(value, label, 128, source);
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) {
+    return source === "request" ? invalidRequest(`${label} must be a valid ISO-8601 timestamp`) : invalidResponse(`${label} must be a valid ISO-8601 timestamp`);
+  }
+  return new Date(parsed).toISOString();
+}
+function sanitizeRelativePath(value, label) {
+  const path = optionalString(value, 1024)?.replace(/\\/g, "/");
+  if (!path || path.startsWith("/") || /^[a-z]:\//i.test(path))
+    return null;
+  const segments = path.split("/").filter(Boolean);
+  if (segments.some((segment) => segment === ".." || segment === "."))
+    return null;
+  return segments.join("/") || (label === "cwd" && path === "." ? "." : null);
+}
+function sanitizeJsonValue(value, label, depth, budget, source) {
+  if (depth > REPOSITORY_AGENT_LIMITS.contextDepth) {
+    contractViolation(source, `${label} exceeds maximum nesting depth`);
+  }
+  if (value === null || typeof value === "boolean")
+    return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      contractViolation(source, `${label} contains a non-finite number`);
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    if (value.length > REPOSITORY_AGENT_LIMITS.contextStringChars) {
+      contractViolation(source, `${label} contains a string longer than ${REPOSITORY_AGENT_LIMITS.contextStringChars} characters`);
+    }
+    budget.chars += value.length;
+    if (budget.chars > REPOSITORY_AGENT_LIMITS.contextChars) {
+      contractViolation(source, `${label} exceeds ${REPOSITORY_AGENT_LIMITS.contextChars} characters`);
+    }
+    return value.replace(/\u0000/g, "");
+  }
+  if (Array.isArray(value)) {
+    budget.entries += value.length;
+    if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+      contractViolation(source, `${label} contains too many entries`);
+    }
+    return value.map((entry, index) => sanitizeJsonValue(entry, `${label}[${index}]`, depth + 1, budget, source));
+  }
+  if (!isRecord(value)) {
+    contractViolation(source, `${label} must contain JSON-compatible values`);
+  }
+  const entries = Object.entries(value);
+  budget.entries += entries.length;
+  if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+    contractViolation(source, `${label} contains too many entries`);
+  }
+  const output = {};
+  for (const [rawKey, entry] of entries) {
+    const key = rawKey.replace(/\u0000/g, "").trim();
+    if (!key || key.length > 256) {
+      contractViolation(source, `${label} contains an invalid key`);
+    }
+    if (["__proto__", "prototype", "constructor"].includes(key)) {
+      contractViolation(source, `${label} contains an unsafe key`);
+    }
+    budget.chars += key.length;
+    output[key] = sanitizeJsonValue(entry, `${label}.${key}`, depth + 1, budget, source);
+  }
+  return output;
+}
+function sanitizeContext(value, label = "context", source = "request") {
+  if (value == null)
+    return;
+  if (!isRecord(value))
+    contractViolation(source, `${label} must be an object`);
+  return sanitizeJsonValue(value, label, 0, { entries: 0, chars: 0 }, source);
+}
+function sanitizeCaller(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("caller must be an object") : invalidResponse("caller must be an object");
+  }
+  const service = requiredString(value.service, "caller.service", 64, source);
+  if (!CALLER_SERVICES.has(service)) {
+    return source === "request" ? invalidRequest(`Unsupported caller.service: ${service}`) : invalidResponse(`Unsupported caller.service: ${service}`);
+  }
+  return {
+    service,
+    ...optionalString(value.instanceId, 256) ? { instanceId: optionalString(value.instanceId, 256) } : {},
+    ...optionalString(value.sessionId, 256) ? { sessionId: optionalString(value.sessionId, 256) } : {},
+    ...optionalString(value.correlationId, 256) ? { correlationId: optionalString(value.correlationId, 256) } : {}
+  };
+}
+function sanitizeRepository(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("repository must be an object") : invalidResponse("repository must be an object");
+  }
+  if (typeof value.dirty !== "boolean") {
+    return source === "request" ? invalidRequest("repository.dirty must be a boolean") : invalidResponse("repository.dirty must be a boolean");
+  }
+  return {
+    identity: requiredString(value.identity, "repository.identity", 1024, source),
+    root: requiredString(value.root, "repository.root", 4096, source),
+    revision: requiredString(value.revision, "repository.revision", 512, source),
+    tree: requiredString(value.tree, "repository.tree", 512, source),
+    dirty: value.dirty
+  };
+}
+function sanitizeRequest(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("Repository Agent request must be an object") : invalidResponse("Repository Agent request must be an object");
+  }
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    return source === "request" ? invalidRequest(`schemaVersion must be ${REPOSITORY_AGENT_SCHEMA_VERSION}`) : invalidResponse(`Unsupported Repository Agent schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const purpose = requiredString(value.purpose, "purpose", 32, source);
+  const priority = requiredString(value.priority, "priority", 32, source);
+  const freshness = requiredString(value.freshness, "freshness", 32, source);
+  if (!PURPOSES.has(purpose)) {
+    return source === "request" ? invalidRequest(`Unsupported purpose: ${purpose}`) : invalidResponse(`Unsupported purpose: ${purpose}`);
+  }
+  if (!PRIORITIES.has(priority)) {
+    return source === "request" ? invalidRequest(`Unsupported priority: ${priority}`) : invalidResponse(`Unsupported priority: ${priority}`);
+  }
+  if (!FRESHNESS_VALUES.has(freshness)) {
+    return source === "request" ? invalidRequest(`Unsupported freshness: ${freshness}`) : invalidResponse(`Unsupported freshness: ${freshness}`);
+  }
+  const deadlineAt = normalizedIso(value.deadlineAt, "deadlineAt", source);
+  if (source === "request" && Date.parse(deadlineAt) <= Date.now()) {
+    invalidRequest("deadlineAt must be in the future");
+  }
+  if (source === "request" && Date.parse(deadlineAt) - Date.now() > REPOSITORY_AGENT_LIMITS.deadlineHorizonMs) {
+    invalidRequest(`deadlineAt must be no more than ${REPOSITORY_AGENT_LIMITS.deadlineHorizonMs}ms in the future`);
+  }
+  const context = sanitizeContext(value.context, "context", source);
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    caller: sanitizeCaller(value.caller, source),
+    purpose,
+    repository: sanitizeRepository(value.repository, source),
+    question: requiredString(value.question, "question", REPOSITORY_AGENT_LIMITS.questionChars, source),
+    ...context ? { context } : {},
+    priority,
+    deadlineAt,
+    freshness,
+    idempotencyKey: requiredString(value.idempotencyKey, "idempotencyKey", 256, source)
+  };
+}
+function sanitizeStatus(value) {
+  const status = requiredString(value, "status", 32, "response");
+  if (!REQUEST_STATUSES.has(status)) {
+    invalidResponse(`Unsupported Repository Agent request status: ${status}`);
+  }
+  return status;
+}
+function sanitizeEvidence(value) {
+  if (!isRecord(value))
+    return null;
+  const path = sanitizeRelativePath(value.path, "path");
+  const revision = optionalString(value.revision, 512);
+  if (!path || !revision)
+    return null;
+  const startLine = value.startLine == null ? undefined : finiteInt(value.startLine, { min: 1, max: 1e7, fallback: 1 });
+  const endLine = value.endLine == null ? undefined : finiteInt(value.endLine, {
+    min: startLine ?? 1,
+    max: 1e7,
+    fallback: startLine ?? 1
+  });
+  return {
+    path,
+    revision,
+    ...optionalString(value.blobHash, 512) ? { blobHash: optionalString(value.blobHash, 512) } : {},
+    ...startLine == null ? {} : { startLine },
+    ...endLine == null ? {} : { endLine },
+    ...optionalString(value.excerpt, 4000) ? { excerpt: optionalString(value.excerpt, 4000) } : {},
+    ...optionalString(value.rationale, 2000) ? { rationale: optionalString(value.rationale, 2000) } : {}
+  };
+}
+function sanitizeRecommendation(value) {
+  if (!isRecord(value))
+    return null;
+  const title = optionalString(value.title, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  if (!title || !rationale)
+    return null;
+  const priority = optionalString(value.priority, 16);
+  const paths = Array.isArray(value.paths) ? value.paths.map((path) => sanitizeRelativePath(path, "path")).filter((path) => Boolean(path)).slice(0, 64) : undefined;
+  return {
+    title,
+    rationale,
+    ...priority === "high" || priority === "normal" || priority === "low" ? { priority } : {},
+    ...paths?.length ? { paths } : {}
+  };
+}
+function sanitizeValidationProposal(value) {
+  if (!isRecord(value))
+    return null;
+  const label = optionalString(value.label, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  const rawCwd = optionalString(value.cwd, 1024) ?? ".";
+  const cwd = rawCwd === "." ? "." : sanitizeRelativePath(rawCwd, "cwd");
+  const argv = Array.isArray(value.argv) ? value.argv.filter((entry) => typeof entry === "string").map((entry) => entry.replace(/\u0000/g, "").trim()).filter(Boolean).slice(0, 64).map((entry) => entry.length <= 4096 ? entry : `${entry.slice(0, 4082)}...[truncated]`) : [];
+  if (!label || !rationale || !cwd || argv.length === 0)
+    return null;
+  return { label, cwd, argv, rationale };
+}
+function sanitizeMemoryRef(value) {
+  if (!isRecord(value))
+    return null;
+  const id = optionalString(value.id, 512);
+  const namespace = optionalString(value.namespace, 256);
+  const role = optionalString(value.role, 64);
+  if (!id || !namespace || !MEMORY_ROLES.has(role))
+    return null;
+  const relevance = typeof value.relevance === "number" && Number.isFinite(value.relevance) ? Math.max(0, Math.min(1, value.relevance)) : undefined;
+  return {
+    id,
+    namespace,
+    role,
+    ...optionalString(value.key, 512) ? { key: optionalString(value.key, 512) } : {},
+    ...relevance == null ? {} : { relevance },
+    ...optionalString(value.sourceRevision, 512) ? { sourceRevision: optionalString(value.sourceRevision, 512) } : {}
+  };
+}
+function sanitizeRepositoryAgentResult(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent result must be an object");
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    invalidResponse(`Unsupported Repository Agent result schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const requestId = requiredString(value.requestId, "result.requestId", 256, "response");
+  if (expectedRequestId && requestId !== expectedRequestId) {
+    invalidResponse(`Repository Agent result requestId does not match ${expectedRequestId}`);
+  }
+  if (!isRecord(value.analyzedRepository)) {
+    invalidResponse("result.analyzedRepository must be an object");
+  }
+  const analyzedRepository = {
+    identity: requiredString(value.analyzedRepository.identity, "result.analyzedRepository.identity", 1024, "response"),
+    revision: requiredString(value.analyzedRepository.revision, "result.analyzedRepository.revision", 512, "response"),
+    tree: requiredString(value.analyzedRepository.tree, "result.analyzedRepository.tree", 512, "response")
+  };
+  const confidence = Number(value.confidence);
+  if (!Number.isFinite(confidence))
+    invalidResponse("result.confidence must be finite");
+  const cacheRecord = isRecord(value.cache) ? value.cache : {};
+  const completedAt = normalizedIso(value.completedAt, "result.completedAt", "response");
+  const data = value.data === undefined ? undefined : sanitizeJsonValue(value.data, "result.data", 0, { entries: 0, chars: 0 }, "response");
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    requestId,
+    analyzedRepository,
+    answer: requiredString(value.answer, "result.answer", REPOSITORY_AGENT_LIMITS.answerChars, "response"),
+    summary: requiredString(value.summary, "result.summary", REPOSITORY_AGENT_LIMITS.summaryChars, "response"),
+    ...data === undefined ? {} : { data },
+    confidence: Math.max(0, Math.min(1, confidence)),
+    evidence: (Array.isArray(value.evidence) ? value.evidence : []).slice(0, REPOSITORY_AGENT_LIMITS.evidenceItems).map(sanitizeEvidence).filter((entry) => Boolean(entry)),
+    recommendations: (Array.isArray(value.recommendations) ? value.recommendations : []).slice(0, REPOSITORY_AGENT_LIMITS.recommendationItems).map(sanitizeRecommendation).filter((entry) => Boolean(entry)),
+    validationProposals: (Array.isArray(value.validationProposals) ? value.validationProposals : []).slice(0, REPOSITORY_AGENT_LIMITS.validationProposalItems).map(sanitizeValidationProposal).filter((entry) => Boolean(entry)),
+    cache: {
+      hit: cacheRecord.hit === true,
+      key: optionalString(cacheRecord.key, 1024) ?? null,
+      ...optionalString(cacheRecord.storedAt, 128) ? { storedAt: optionalString(cacheRecord.storedAt, 128) } : {},
+      ...optionalString(cacheRecord.expiresAt, 128) ? { expiresAt: optionalString(cacheRecord.expiresAt, 128) } : {}
+    },
+    memoryRefs: (Array.isArray(value.memoryRefs) ? value.memoryRefs : []).slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems).map(sanitizeMemoryRef).filter((entry) => Boolean(entry)),
+    completedAt
+  };
+}
+function sanitizeRemoteError(value) {
+  if (!isRecord(value))
+    return;
+  const code = optionalString(value.code, 128);
+  const message = optionalString(value.message, 8000);
+  if (!code || !message)
+    return;
+  return {
+    code,
+    message,
+    ...optionalString(value.detail, 16000) ? { detail: optionalString(value.detail, 16000) } : {},
+    retryable: value.retryable === true
+  };
+}
+function sanitizeSnapshot(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent request snapshot must be an object");
+  const requestId = requiredString(value.requestId, "requestId", 256, "response");
+  if (requestId !== expectedRequestId)
+    invalidResponse("Repository Agent snapshot requestId mismatch");
+  const status = sanitizeStatus(value.status);
+  const result = value.result == null ? undefined : sanitizeRepositoryAgentResult(value.result, requestId);
+  const error = sanitizeRemoteError(value.error);
+  return {
+    requestId,
+    status,
+    submittedAt: normalizedIso(value.submittedAt, "submittedAt", "response"),
+    updatedAt: normalizedIso(value.updatedAt, "updatedAt", "response"),
+    ...value.pollAfterMs == null ? {} : { pollAfterMs: finiteInt(value.pollAfterMs, { min: 100, max: 30000, fallback: 1000 }) },
+    ...result ? { result } : {},
+    ...error ? { error } : {}
+  };
+}
+function normalizePositiveDuration(value, fallback, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return fallback;
+  return Math.max(1, Math.min(max, Math.floor(parsed)));
+}
+function sleepWithSignal(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+  }
+  return new Promise((resolve2, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer)
+        clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve2();
+    }, Math.max(0, ms));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+class RepositoryAgentHttpClient {
+  serverUrl;
+  authToken;
+  fetchImpl;
+  requestTimeoutMs;
+  pollIntervalMs;
+  maxResponseBytes;
+  constructor(options) {
+    const rawServerUrl = requiredString(options.serverUrl, "serverUrl", 4096, "request").replace(/\/+$/, "");
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawServerUrl);
+    } catch {
+      invalidRequest("serverUrl must be an absolute HTTP URL");
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      invalidRequest("serverUrl must use HTTP or HTTPS");
+    }
+    this.serverUrl = rawServerUrl;
+    this.authToken = optionalString(options.authToken, 8192) ?? null;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = normalizePositiveDuration(options.requestTimeoutMs, 1e4, 120000);
+    this.pollIntervalMs = normalizePositiveDuration(options.pollIntervalMs, 1000, 30000);
+    this.maxResponseBytes = normalizePositiveDuration(options.maxResponseBytes, REPOSITORY_AGENT_LIMITS.responseBytes, 16 * 1024 * 1024);
+  }
+  headers() {
+    return {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}
+    };
+  }
+  async requestJson(path, init, options = {}) {
+    const timeoutMs = normalizePositiveDuration(options.timeoutMs, this.requestTimeoutMs, 30 * 60000);
+    try {
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${this.serverUrl}${path}`,
+        init: {
+          ...init,
+          headers: { ...this.headers(), ...init.headers ?? {} },
+          signal: options.signal
+        },
+        timeoutMs,
+        fetchImpl: this.fetchImpl,
+        maxResponseBytes: this.maxResponseBytes,
+        timeoutMessage: `Repository Agent request timed out after ${timeoutMs}ms`
+      });
+      const text = await response.text();
+      let payload = {};
+      if (text.trim()) {
+        try {
+          payload = JSON.parse(text);
+        } catch (cause) {
+          throw new RepositoryAgentClientError("invalid_response", "Repository Agent returned malformed JSON", { status: response.status, cause });
+        }
+      }
+      if (!isRecord(payload)) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response must be a JSON object", { status: response.status });
+      }
+      if (!response.ok) {
+        const retryAfterHeaderMs = Number(response.headers.get("retry-after")) * 1000;
+        const retryAfterMs = Number(payload.retryAfterMs);
+        throw new RepositoryAgentClientError("http_error", optionalString(payload.message, 8000) ?? `Repository Agent request failed with HTTP ${response.status}`, {
+          status: response.status,
+          requestId: optionalString(payload.requestId, 256) ?? null,
+          remoteCode: optionalString(payload.code, 128) ?? null,
+          detail: optionalString(payload.detail, 16000) ?? null,
+          retryable: typeof payload.retryable === "boolean" ? payload.retryable : response.status >= 500,
+          retryAfterMs: Number.isFinite(retryAfterMs) ? Math.max(0, Math.floor(retryAfterMs)) : Number.isFinite(retryAfterHeaderMs) ? Math.max(0, Math.floor(retryAfterHeaderMs)) : null
+        });
+      }
+      if (payload.ok !== true) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response is missing an exact positive acknowledgement", { status: response.status });
+      }
+      return payload;
+    } catch (error) {
+      if (error instanceof RepositoryAgentClientError)
+        throw error;
+      if (options.signal?.aborted) {
+        throw new RepositoryAgentClientError("aborted", "Repository Agent call aborted", {
+          cause: error
+        });
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timed out|timeout/i.test(message)) {
+        throw new RepositoryAgentClientError("timeout", message, { cause: error });
+      }
+      throw new RepositoryAgentClientError("transport_error", message, { cause: error });
+    }
+  }
+}
+
+class RepositoryAgentClient extends RepositoryAgentHttpClient {
+  callerService;
+  callerInstanceId;
+  askTimeoutMs;
+  constructor(options) {
+    super(options);
+    if (!CALLER_SERVICES.has(options.callerService)) {
+      invalidRequest(`Unsupported callerService: ${String(options.callerService)}`);
+    }
+    this.callerService = options.callerService;
+    this.callerInstanceId = optionalString(options.callerInstanceId, 256);
+    this.askTimeoutMs = normalizePositiveDuration(options.askTimeoutMs, 120000, 30 * 60000);
+  }
+  buildRequest(input) {
+    const request = sanitizeRequest({
+      ...input,
+      schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+      caller: {
+        ...input.caller ?? {},
+        ...this.callerInstanceId ? { instanceId: this.callerInstanceId } : {},
+        service: this.callerService
+      }
+    }, "request");
+    const encoded = JSON.stringify(request);
+    if (new TextEncoder().encode(encoded).byteLength > REPOSITORY_AGENT_LIMITS.requestBytes) {
+      invalidRequest(`Repository Agent request exceeds ${REPOSITORY_AGENT_LIMITS.requestBytes} bytes`);
+    }
+    return request;
+  }
+  async submit(input, options = {}) {
+    const request = this.buildRequest(input);
+    const payload = await this.requestJson("/repository-agent/requests", { method: "POST", body: JSON.stringify(request) }, options);
+    const requestId = requiredString(payload.requestId, "requestId", 256, "response");
+    const status = sanitizeStatus(payload.status);
+    const result = payload.result == null ? undefined : sanitizeRepositoryAgentResult(payload.result, requestId);
+    return {
+      requestId,
+      status,
+      deduplicated: payload.deduplicated === true,
+      pollAfterMs: finiteInt(payload.pollAfterMs, {
+        min: 100,
+        max: 30000,
+        fallback: this.pollIntervalMs
+      }),
+      ...result ? { result } : {}
+    };
+  }
+  async get(requestIdRaw, options = {}) {
+    const requestId = requiredString(requestIdRaw, "requestId", 256, "request");
+    const payload = await this.requestJson(`/repository-agent/requests/${encodeURIComponent(requestId)}`, { method: "GET" }, options);
+    return sanitizeSnapshot(payload.request, requestId);
+  }
+  async ask(input, options = {}) {
+    const overallTimeoutMs = normalizePositiveDuration(options.timeoutMs, this.askTimeoutMs, 30 * 60000);
+    const durableDeadlineMs = Date.parse(input.deadlineAt);
+    const deadlineMs = Math.min(Date.now() + overallTimeoutMs, durableDeadlineMs);
+    const remaining = () => Math.max(0, deadlineMs - Date.now());
+    const callOptions = () => ({
+      signal: options.signal,
+      timeoutMs: Math.max(1, Math.min(this.requestTimeoutMs, remaining()))
+    });
+    if (remaining() <= 0)
+      invalidRequest("deadlineAt must be in the future");
+    const submitted = await this.submit(input, callOptions());
+    if (submitted.status === "completed" && submitted.result)
+      return submitted.result;
+    let pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? submitted.pollAfterMs, this.pollIntervalMs, 30000);
+    while (remaining() > 0) {
+      await sleepWithSignal(Math.min(pollAfterMs, remaining()), options.signal);
+      if (remaining() <= 0)
+        break;
+      const snapshot = await this.get(submitted.requestId, callOptions());
+      if (snapshot.status === "completed") {
+        if (!snapshot.result) {
+          invalidResponse("Completed Repository Agent request has no result");
+        }
+        return snapshot.result;
+      }
+      if (snapshot.status === "failed") {
+        throw new RepositoryAgentClientError("remote_failed", snapshot.error?.message ?? "Repository Agent request failed", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "cancelled") {
+        throw new RepositoryAgentClientError("remote_cancelled", snapshot.error?.message ?? "Repository Agent request was cancelled", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "expired") {
+        throw new RepositoryAgentClientError("remote_expired", snapshot.error?.message ?? "Repository Agent request expired", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? snapshot.pollAfterMs, pollAfterMs, 30000);
+    }
+    throw new RepositoryAgentClientError("timeout", `Repository Agent request ${submitted.requestId} did not complete before the caller deadline`, { requestId: submitted.requestId });
+  }
+}
+function createRepositoryAgentServiceClients(options) {
+  const repositoryAgent = options.repositoryAgent ?? new RepositoryAgentClient({
+    serverUrl: options.serverUrl,
+    callerService: options.callerService,
+    callerInstanceId: options.callerInstanceId,
+    authToken: options.authToken,
+    fetchImpl: options.fetchImpl,
+    requestTimeoutMs: options.requestTimeoutMs,
+    askTimeoutMs: options.askTimeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    maxResponseBytes: options.maxResponseBytes
+  });
+  const ownsMemoryStore = options.memoryStore === undefined;
+  const memoryStore = options.memoryStore ?? new MemoryHttpClient({
+    serverUrl: options.serverUrl,
+    authToken: options.authToken,
+    callerService: options.callerService,
+    authority: options.memoryAuthority,
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.memoryTimeoutMs,
+    maxResponseBytes: options.memoryMaxResponseBytes
+  });
+  let closePromise = null;
+  return Object.freeze({
+    repositoryAgent,
+    memoryStore,
+    close() {
+      if (!closePromise) {
+        closePromise = ownsMemoryStore ? memoryStore.close() : Promise.resolve();
+      }
+      return closePromise;
+    }
+  });
 }
 
 // apps/source_control_manager/src/db.ts
@@ -1889,7 +3272,7 @@ function isProcessAlive(pid) {
 }
 
 // apps/source_control_manager/src/git.ts
-import { resolve as resolve4, win32 as pathWin32 } from "path";
+import { resolve as resolve5, win32 as pathWin32 } from "path";
 
 // packages/shared/src/repo.ts
 import { existsSync as existsSync3, readFileSync as readFileSync3, statSync } from "fs";
@@ -1950,6 +3333,11 @@ function detectRepoRoot(startDir) {
   console.warn(`[repo] No .git directory found, using: ${startDir}`);
   return startDir;
 }
+// packages/shared/src/repository_snapshot.ts
+var DEFAULT_DIFF_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
+var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
+var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
+var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
 // packages/shared/src/prompts.ts
 import { readFileSync as readFileSync4 } from "fs";
 import { join as join3, resolve as resolve3 } from "path";
@@ -2083,33 +3471,61 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
   "-C",
   "-F"
 ]);
+// packages/shared/src/repo_validation.ts
+import { closeSync, existsSync as existsSync4, openSync, readSync, readdirSync } from "fs";
+import { basename, dirname, extname, relative, resolve as resolve4 } from "path";
+
 // packages/shared/src/trusted_validation.ts
 var MAX_TRUSTED_VALIDATION_COMMANDS = 8;
 var MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1000;
 var TRUSTED_VALIDATION_EXECUTABLES = new Set([
+  "bazel",
   "bun",
   "bunx",
+  "buf",
+  "bundle",
+  "cabal",
   "cargo",
+  "clojure",
+  "cmake",
   "coverage",
+  "ctest",
+  "dart",
   "deno",
   "docker",
   "docker-compose",
+  "dotnet",
   "eslint",
+  "flutter",
+  "git",
   "go",
+  "gradle",
   "jest",
+  "lein",
   "make",
+  "mix",
+  "mvn",
   "mypy",
   "node",
   "npm",
   "npx",
   "pnpm",
+  "composer",
+  "php",
   "pytest",
   "python",
   "python3",
   "ruff",
+  "rscript",
+  "ruby",
+  "stack",
+  "swift",
+  "terraform",
   "tsc",
   "uv",
   "vitest",
+  "zig",
+  "luac",
   "yarn"
 ]);
 var ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -2234,6 +3650,27 @@ ${failureContext}` : "",
   ].filter(Boolean).join(`
 `).slice(0, boundedMax);
 }
+function isSafeRelativeValidationPath(value, allowDot = false) {
+  const normalized = String(value ?? "").replace(/\\/g, "/");
+  const pathSegments = normalized.replace(/^\.\//, "").split("/");
+  if (allowDot && normalized === ".")
+    return true;
+  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.includes("://") || pathSegments.some((segment) => segment === ".." || [".git", ".pushpals", ".worktrees", "node_modules"].includes(segment.toLowerCase())) || normalized.startsWith("-") && !normalized.startsWith("./-")) {
+    return false;
+  }
+  return /^[\p{L}\p{N}_@+.,()[\]/ -]+$/u.test(normalized);
+}
+function isSafeTestSourcePath(value, extensions) {
+  if (!isSafeRelativeValidationPath(value))
+    return false;
+  const normalized = value.toLowerCase().replace(/^\.\//, "");
+  if (/(^|\/)(?:tests?|specs?|integration_test)$/.test(normalized))
+    return true;
+  return extensions.some((extension) => normalized.endsWith(extension)) && /(^|\/)(?:tests?|specs?|integration_test)(\/|$)|_(?:test|spec)\.[^/]+$/.test(normalized);
+}
+function expectedCmakeBuildPath(sourcePath) {
+  return sourcePath === "." ? "build" : `${sourcePath.replace(/\/$/, "")}/build`;
+}
 function tokenizeTrustedValidationCommand(command) {
   const trimmed = String(command ?? "").trim();
   if (!trimmed || trimmed.length > MAX_TRUSTED_VALIDATION_COMMAND_LENGTH)
@@ -2294,6 +3731,95 @@ function tokenizeTrustedValidationCommand(command) {
   if (["bun", "deno", "node"].includes(executable) && ["-e", "--eval"].includes(firstArg) || ["python", "python3"].includes(executable) && firstArg === "-c") {
     return null;
   }
+  if (executable === "ruby" && (firstArg !== "-c" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".rb"))) {
+    return null;
+  }
+  if (executable === "php" && (firstArg !== "-l" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".php"))) {
+    return null;
+  }
+  if (executable === "dotnet" && !(firstArg === "test" && (argv.length === 2 || argv.length === 3 && isSafeRelativeValidationPath(argv[2] ?? "") && /\.(?:sln|csproj|fsproj)$/i.test(argv[2] ?? "")))) {
+    return null;
+  }
+  if (executable === "bundle" && !(firstArg === "exec" && (argv[2]?.toLowerCase() === "rspec" || argv[2]?.toLowerCase() === "rake" && argv.length === 4 && argv[3]?.toLowerCase() === "test"))) {
+    return null;
+  }
+  if (executable === "bundle" && argv[2]?.toLowerCase() === "rspec" && (argv.length > 7 || argv.slice(3).some((path) => !isSafeTestSourcePath(path, [".rb"])))) {
+    return null;
+  }
+  const trailingTest = argv[argv.length - 1]?.toLowerCase() === "test";
+  const safeComposer = argv.length === 2 && firstArg === "test" || argv.length === 3 && firstArg === "run" && argv[2]?.toLowerCase() === "test" || argv.length === 4 && firstArg === "--working-dir" && trailingTest || argv.length === 3 && firstArg.startsWith("--working-dir=") && trailingTest;
+  if (executable === "composer" && (!safeComposer || firstArg === "--working-dir" && !isSafeRelativeValidationPath(argv[2] ?? "") || firstArg.startsWith("--working-dir=") && !isSafeRelativeValidationPath(argv[1]?.slice("--working-dir=".length) ?? ""))) {
+    return null;
+  }
+  const safeMavenOrGradle = argv.length === 2 && trailingTest || argv.length === 4 && ["-f", "--file", "-p", "--project-dir"].includes(firstArg) && trailingTest;
+  if (["mvn", "gradle"].includes(executable) && !safeMavenOrGradle) {
+    return null;
+  }
+  if (["mvn", "gradle"].includes(executable) && argv.length === 4 && (!isSafeRelativeValidationPath(argv[2] ?? "") || executable === "mvn" && !argv[2]?.toLowerCase().endsWith("pom.xml"))) {
+    return null;
+  }
+  if (executable === "git" && !(argv.length === 3 && firstArg === "diff" && argv[2]?.toLowerCase() === "--check")) {
+    return null;
+  }
+  if (executable === "cmake") {
+    const safeConfigure = argv.length === 5 && firstArg === "-s" && argv[3]?.toLowerCase() === "-b" && isSafeRelativeValidationPath(argv[2] ?? "", true) && isSafeRelativeValidationPath(argv[4] ?? "") && argv[4] === expectedCmakeBuildPath(argv[2] ?? "");
+    const safeBuild = argv.length === 3 && firstArg === "--build" && isSafeRelativeValidationPath(argv[2] ?? "") && /(^|\/)build$/.test(argv[2] ?? "");
+    if (!safeConfigure && !safeBuild)
+      return null;
+  }
+  if (executable === "ctest" && !(argv.length === 4 && firstArg === "--test-dir" && isSafeRelativeValidationPath(argv[2] ?? "") && /(^|\/)build$/.test(argv[2] ?? "") && argv[3]?.toLowerCase() === "--output-on-failure")) {
+    return null;
+  }
+  if (executable === "make" && !(argv.length === 2 && ["test", "check"].includes(firstArg) || argv.length === 4 && firstArg === "-c" && isSafeRelativeValidationPath(argv[2] ?? "") && ["test", "check"].includes(argv[3]?.toLowerCase() ?? ""))) {
+    return null;
+  }
+  if (executable === "bazel" && !(argv.length === 3 && firstArg === "test" && /^\/\/[A-Za-z0-9_@+.,/-]*\.\.\.$/.test(argv[2] ?? ""))) {
+    return null;
+  }
+  if (executable === "buf" && !(firstArg === "lint" && (argv.length === 2 || argv.length === 3 && isSafeRelativeValidationPath(argv[2] ?? "")))) {
+    return null;
+  }
+  if (executable === "swift" && !(argv.length === 2 && firstArg === "test" || argv.length === 4 && firstArg === "test" && argv[2]?.toLowerCase() === "--package-path" && isSafeRelativeValidationPath(argv[3] ?? ""))) {
+    return null;
+  }
+  if (["dart", "flutter"].includes(executable)) {
+    const safeDartDirectoryTest = executable === "dart" && firstArg === "--directory" && argv.length === 4 && isSafeRelativeValidationPath(argv[2] ?? "") && argv[3]?.toLowerCase() === "test";
+    if (!safeDartDirectoryTest && (firstArg !== "test" || argv.length > 6 || argv.slice(2).some((path) => !isSafeTestSourcePath(path, [".dart"])))) {
+      return null;
+    }
+  }
+  if (executable === "mix" && !(firstArg === "test" && argv.length <= 6 && argv.slice(2).every((path) => isSafeTestSourcePath(path, [".exs"])) || firstArg === "--cd" && argv.length === 4 && isSafeRelativeValidationPath(argv[2] ?? "") && argv[3]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "cabal" && !(argv.length === 3 && firstArg === "test" && argv[2]?.toLowerCase() === "all")) {
+    return null;
+  }
+  if (executable === "stack" && !(argv.length === 2 && firstArg === "test" || argv.length === 4 && firstArg === "--stack-yaml" && isSafeRelativeValidationPath(argv[2] ?? "") && argv[2]?.toLowerCase().endsWith("/stack.yaml") && argv[3]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "clojure" && !(argv.length === 2 && ["-x:test", "-m:test"].includes(firstArg))) {
+    return null;
+  }
+  if (executable === "lein" && !(argv.length === 2 && firstArg === "test"))
+    return null;
+  if (executable === "zig" && !(argv.length === 3 && firstArg === "build" && argv[2]?.toLowerCase() === "test" || argv.length === 5 && firstArg === "build" && argv[2]?.toLowerCase() === "--build-file" && isSafeRelativeValidationPath(argv[3] ?? "") && argv[3]?.toLowerCase().endsWith("/build.zig") && argv[4]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "terraform" && !(firstArg === "fmt" && argv[2]?.toLowerCase() === "-check" && argv.length >= 4 && argv.length <= 7 && argv.slice(3).every((path) => isSafeRelativeValidationPath(path) && /\.(?:tf|tfvars)$/i.test(path)))) {
+    return null;
+  }
+  if (executable === "luac") {
+    if (firstArg !== "-p" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".lua")) {
+      return null;
+    }
+  }
+  if (executable === "rscript") {
+    const expression = argv.length === 3 && firstArg === "-e" ? argv[2] ?? "" : "";
+    const parsedPath = expression.match(/^parse\(file='([^']+)'\)$/)?.[1] ?? "";
+    if (!parsedPath || !isSafeRelativeValidationPath(parsedPath) || !parsedPath.toLowerCase().endsWith(".r")) {
+      return null;
+    }
+  }
   return argv;
 }
 function normalizeTrustedValidationCommands(value) {
@@ -2331,6 +3857,770 @@ function normalizeTrustedValidationCommands(value) {
     commands.push(command);
   }
   return commands.length > 0 ? { ok: true, commands } : { ok: false, message: "trusted validation commands must be a non-empty array" };
+}
+
+// packages/shared/src/repo_validation.ts
+var FALLBACK_VALIDATION_STEP = "git diff --check";
+var MAX_JSON_BYTES = 1e6;
+var MAX_PROJECT_EVIDENCE_BYTES = 256000;
+function normalizeRepoPath(value) {
+  const normalized = String(value ?? "").replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/").replace(/\/$/, "").trim();
+  if (!normalized || normalized === "." || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.split("/").some((part) => part === "..") || !/^[\p{L}\p{N}_@+.,()[\]/ -]+$/u.test(normalized)) {
+    return "";
+  }
+  return normalized;
+}
+function commandPathArg(value, prefixRelative = false) {
+  const normalized = normalizeRepoPath(value);
+  if (!normalized)
+    return "";
+  const optionSafe = normalized.startsWith("-") ? `./${normalized}` : prefixRelative && !normalized.startsWith("./") ? `./${normalized}` : normalized;
+  return /\s/.test(optionSafe) ? `"${optionSafe}"` : optionSafe;
+}
+function dedupeCompletePlans(plans, maxItems) {
+  const out = [];
+  const seen = new Set;
+  for (const plan of plans) {
+    const pending = [];
+    for (const rawValue of plan) {
+      const value = String(rawValue ?? "").trim();
+      if (!value)
+        continue;
+      const key = value.replace(/\s+/g, " ").toLowerCase();
+      if (seen.has(key) || pending.some((entry) => entry.key === key))
+        continue;
+      pending.push({ value, key });
+    }
+    if (out.length + pending.length > maxItems)
+      continue;
+    for (const entry of pending) {
+      seen.add(entry.key);
+      out.push(entry.value);
+    }
+  }
+  return out;
+}
+function readTextBounded(path, maxBytes = MAX_PROJECT_EVIDENCE_BYTES) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.allocUnsafe(maxBytes + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const count = readSync(fd, buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+      if (count === 0)
+        break;
+      bytesRead += count;
+    }
+    return {
+      text: buffer.subarray(0, Math.min(bytesRead, maxBytes)).toString("utf8"),
+      truncated: bytesRead > maxBytes
+    };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+  }
+}
+function readJson(path) {
+  const read = readTextBounded(path, MAX_JSON_BYTES);
+  if (!read || read.truncated)
+    return null;
+  try {
+    const parsed = JSON.parse(read.text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function ecosystemForPath(path) {
+  const filename = basename(path).toLowerCase();
+  const extension = extname(path).toLowerCase();
+  if (filename === "package.json" || ["bun.lock", "bun.lockb", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"].includes(filename)) {
+    return "package";
+  }
+  if (["pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini"].includes(filename) || /^requirements(?:-[^.]+)?\.txt$/.test(filename)) {
+    return "python";
+  }
+  if (filename === "go.mod" || filename === "go.sum")
+    return "go";
+  if (filename === "cargo.toml" || filename === "cargo.lock")
+    return "rust";
+  if ([
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts"
+  ].includes(filename)) {
+    return "jvm";
+  }
+  if (/\.(?:sln|csproj|fsproj)$/i.test(filename))
+    return "dotnet";
+  if (["gemfile", "rakefile", ".rspec"].includes(filename))
+    return "ruby";
+  if (filename === "composer.json" || filename === "composer.lock")
+    return "php";
+  if (filename === "cmakelists.txt" || ["makefile", "gnumakefile"].includes(filename) || ["build", "build.bazel", "module.bazel", "workspace", "workspace.bazel"].includes(filename)) {
+    return "native";
+  }
+  if (["buf.yaml", "buf.work.yaml", "buf.gen.yaml", "buf.lock"].includes(filename)) {
+    return "protobuf";
+  }
+  if (filename === "package.swift" || filename === "package.resolved")
+    return "swift";
+  if (["pubspec.yaml", "pubspec.lock", "analysis_options.yaml"].includes(filename))
+    return "dart";
+  if (filename === "mix.exs" || filename === "mix.lock")
+    return "elixir";
+  if (filename === "cabal.project" || filename === "cabal.project.local" || filename === "stack.yaml" || extension === ".cabal") {
+    return "haskell";
+  }
+  if (["deps.edn", "project.clj", "build.clj"].includes(filename))
+    return "clojure";
+  if (["build.zig", "build.zig.zon"].includes(filename))
+    return "zig";
+  if (filename === ".terraform.lock.hcl")
+    return "terraform";
+  if ([
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".vue",
+    ".svelte",
+    ".css",
+    ".scss",
+    ".less",
+    ".html",
+    ".htm"
+  ].includes(extension)) {
+    return "package";
+  }
+  if (extension === ".py")
+    return "python";
+  if (extension === ".go")
+    return "go";
+  if (extension === ".rs")
+    return "rust";
+  if ([".java", ".kt", ".kts", ".scala"].includes(extension))
+    return "jvm";
+  if ([".cs", ".fs", ".fsx"].includes(extension))
+    return "dotnet";
+  if (extension === ".rb")
+    return "ruby";
+  if (extension === ".php")
+    return "php";
+  if ([".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"].includes(extension)) {
+    return "native";
+  }
+  if (extension === ".proto")
+    return "protobuf";
+  if (extension === ".swift")
+    return "swift";
+  if (extension === ".dart")
+    return "dart";
+  if ([".ex", ".exs"].includes(extension))
+    return "elixir";
+  if ([".hs", ".lhs"].includes(extension))
+    return "haskell";
+  if ([".clj", ".cljs", ".cljc", ".edn"].includes(extension))
+    return "clojure";
+  if (extension === ".zig")
+    return "zig";
+  if ([".tf", ".tfvars"].includes(extension))
+    return "terraform";
+  if (extension === ".r")
+    return "r";
+  if (extension === ".lua")
+    return "lua";
+  return null;
+}
+function pathsByEcosystem(paths) {
+  const grouped = new Map;
+  for (const path of paths) {
+    const ecosystem = ecosystemForPath(path);
+    if (!ecosystem)
+      continue;
+    const existing = grouped.get(ecosystem);
+    if (existing)
+      existing.push(path);
+    else
+      grouped.set(ecosystem, [path]);
+  }
+  return [...grouped.entries()].map(([ecosystem, ecosystemPaths]) => ({
+    ecosystem,
+    paths: ecosystemPaths
+  }));
+}
+function validationSearchDirectories(paths) {
+  const out = [];
+  const seen = new Set;
+  const add = (directory) => {
+    const normalized = directory === "." ? "" : normalizeRepoPath(directory);
+    if (directory && directory !== "." && !normalized)
+      return;
+    if (seen.has(normalized))
+      return;
+    seen.add(normalized);
+    out.push(normalized);
+  };
+  for (const path of paths) {
+    let directory = dirname(path).replace(/\\/g, "/");
+    while (directory && directory !== ".") {
+      add(directory);
+      const parent = dirname(directory).replace(/\\/g, "/");
+      if (parent === directory)
+        break;
+      directory = parent;
+    }
+  }
+  add("");
+  return out;
+}
+function packageManagerAt(directory) {
+  const manifest = readJson(resolve4(directory, "package.json"));
+  const declared = String(manifest?.packageManager ?? "").trim().split("@")[0]?.toLowerCase();
+  if (["bun", "pnpm", "yarn", "npm"].includes(declared)) {
+    return declared;
+  }
+  if (existsSync4(resolve4(directory, "bun.lock")) || existsSync4(resolve4(directory, "bun.lockb"))) {
+    return "bun";
+  }
+  if (existsSync4(resolve4(directory, "pnpm-lock.yaml")))
+    return "pnpm";
+  if (existsSync4(resolve4(directory, "yarn.lock")))
+    return "yarn";
+  if (existsSync4(resolve4(directory, "package-lock.json")))
+    return "npm";
+  return null;
+}
+function resolvePackageManager(repoRoot, manifestDirectory) {
+  const absoluteRoot = resolve4(repoRoot);
+  let cursor = resolve4(manifestDirectory);
+  while (true) {
+    const manager = packageManagerAt(cursor);
+    if (manager)
+      return manager;
+    if (cursor === absoluteRoot)
+      break;
+    const parent = dirname(cursor);
+    const relativeParent = relative(absoluteRoot, parent).replace(/\\/g, "/");
+    if (parent === cursor || relativeParent.startsWith("../"))
+      break;
+    cursor = parent;
+  }
+  return "npm";
+}
+function isJavaScriptTestPath(path) {
+  return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path);
+}
+function packageValidationSteps(repoRoot, directory, changedPaths) {
+  const manifestDirectory = resolve4(repoRoot, directory || ".");
+  const manifest = readJson(resolve4(manifestDirectory, "package.json"));
+  if (!manifest)
+    return null;
+  const manager = resolvePackageManager(repoRoot, manifestDirectory);
+  const scripts = manifest.scripts && typeof manifest.scripts === "object" && !Array.isArray(manifest.scripts) ? manifest.scripts : {};
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  if (directory && !directoryArg)
+    return null;
+  if (manager === "bun") {
+    const focusedTests = changedPaths.filter(isJavaScriptTestPath).map((path) => {
+      const relativeTest = relative(manifestDirectory, resolve4(repoRoot, path)).replace(/\\/g, "/");
+      if (!relativeTest || relativeTest.startsWith("../"))
+        return "";
+      return commandPathArg(relativeTest, true);
+    }).filter(Boolean).slice(0, 4);
+    if (focusedTests.length > 0) {
+      return [`${directory ? `bun --cwd ${directoryArg}` : "bun"} test ${focusedTests.join(" ")}`];
+    }
+  }
+  const scriptName = ["test", "check", "lint"].find((name) => {
+    const script = typeof scripts[name] === "string" ? scripts[name].trim() : "";
+    return Boolean(script && !(name === "test" && (/no test specified/i.test(script) || /(?:^|[;&|])\s*exit\s+1(?:\s|$)/i.test(script))));
+  });
+  if (!scriptName)
+    return null;
+  if (manager === "bun") {
+    return [directoryArg ? `bun --cwd ${directoryArg} run ${scriptName}` : `bun run ${scriptName}`];
+  }
+  if (manager === "pnpm") {
+    return [
+      directoryArg ? `pnpm --dir ${directoryArg} run ${scriptName}` : `pnpm run ${scriptName}`
+    ];
+  }
+  if (manager === "yarn") {
+    return [
+      directoryArg ? `yarn --cwd ${directoryArg} run ${scriptName}` : `yarn run ${scriptName}`
+    ];
+  }
+  return [
+    directoryArg ? `npm --prefix ${directoryArg} run ${scriptName}` : `npm run ${scriptName}`
+  ];
+}
+function pythonValidationSteps(repoRoot, directory, paths) {
+  const root = resolve4(repoRoot, directory || ".");
+  const manifestNames = [
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    "pytest.ini",
+    "tox.ini",
+    "requirements.txt"
+  ];
+  const hasManifest = manifestNames.some((name) => existsSync4(resolve4(root, name)));
+  const pythonPaths = paths.filter((path) => extname(path).toLowerCase() === ".py");
+  if (!hasManifest)
+    return null;
+  const testPaths = pythonPaths.filter((path) => /(^|\/)(?:tests?|specs?)(\/|$)|(^|\/)test_[^/]+\.py$|_test\.py$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  let evidence = "";
+  for (const name of [...manifestNames, "requirements-dev.txt", "conftest.py"]) {
+    const read = readTextBounded(resolve4(root, name));
+    if (read)
+      evidence += `
+${read.text}`;
+  }
+  if (testPaths.length > 0 || /\bpytest\b/i.test(evidence)) {
+    return [`python -m pytest${testPaths.length > 0 ? ` ${testPaths.join(" ")}` : ""}`];
+  }
+  if (existsSync4(resolve4(root, "manage.py"))) {
+    const managePath = commandPathArg(directory ? `${directory}/manage.py` : "manage.py");
+    return managePath ? [`python ${managePath} test`] : null;
+  }
+  const compileTargets = pythonPaths.map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  return compileTargets.length > 0 ? [`python -m compileall ${compileTargets.join(" ")}`] : null;
+}
+function goValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve4(repoRoot, directory || ".", "go.mod")))
+    return null;
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./..."];
+}
+function rustValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve4(repoRoot, directory || ".", "Cargo.toml")))
+    return null;
+  if (!directory)
+    return ["cargo test"];
+  const manifestArg = commandPathArg(`${directory}/Cargo.toml`);
+  return manifestArg ? [`cargo test --manifest-path ${manifestArg}`] : null;
+}
+function jvmValidationSteps(repoRoot, directory) {
+  const root = resolve4(repoRoot, directory || ".");
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  if (existsSync4(resolve4(root, "pom.xml"))) {
+    const manifestArg = commandPathArg(directory ? `${directory}/pom.xml` : "pom.xml");
+    return [directory && manifestArg ? `mvn -f ${manifestArg} test` : "mvn test"];
+  }
+  if (existsSync4(resolve4(root, "build.gradle")) || existsSync4(resolve4(root, "build.gradle.kts"))) {
+    return [directoryArg ? `gradle -p ${directoryArg} test` : "gradle test"];
+  }
+  return null;
+}
+function dotnetValidationSteps(repoRoot, directory, paths) {
+  const root = resolve4(repoRoot, directory || ".");
+  const explicitProject = paths.find((path) => /\.(?:sln|csproj|fsproj)$/i.test(path));
+  let project = explicitProject ?? "";
+  if (!project) {
+    try {
+      const filename = readdirSync(root).filter((entry) => /\.(?:sln|csproj|fsproj)$/i.test(entry)).sort()[0];
+      project = filename ? directory ? `${directory}/${filename}` : filename : "";
+    } catch {
+      project = "";
+    }
+  }
+  const projectArg = commandPathArg(project);
+  return projectArg ? [`dotnet test ${projectArg}`] : null;
+}
+function rubyValidationSteps(repoRoot, directory, paths) {
+  const root = resolve4(repoRoot, directory || ".");
+  const rubyPaths = paths.filter((path) => extname(path).toLowerCase() === ".rb");
+  const hasRubyProjectEvidence = existsSync4(resolve4(root, "Gemfile")) || existsSync4(resolve4(root, "Rakefile")) || existsSync4(resolve4(root, ".rspec"));
+  if (directory && !hasRubyProjectEvidence)
+    return null;
+  if (!directory && existsSync4(resolve4(root, "Gemfile"))) {
+    const tests = rubyPaths.filter((path) => /(^|\/)spec(s)?(\/|$)|_spec\.rb$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+    if (tests.length > 0 || existsSync4(resolve4(root, "spec")) || existsSync4(resolve4(root, ".rspec"))) {
+      return [`bundle exec rspec${tests.length > 0 ? ` ${tests.join(" ")}` : ""}`];
+    }
+    if (existsSync4(resolve4(root, "Rakefile")))
+      return ["bundle exec rake test"];
+  }
+  const target = commandPathArg(rubyPaths[0] ?? "");
+  return target ? [`ruby -c ${target}`] : null;
+}
+function phpValidationSteps(repoRoot, directory, paths) {
+  const root = resolve4(repoRoot, directory || ".");
+  const composer = readJson(resolve4(root, "composer.json"));
+  if (directory && !composer)
+    return null;
+  const scripts = composer?.scripts && typeof composer.scripts === "object" && !Array.isArray(composer.scripts) ? composer.scripts : null;
+  if (scripts?.test != null) {
+    const directoryArg = directory ? commandPathArg(directory) : "";
+    return [directoryArg ? `composer --working-dir ${directoryArg} test` : "composer test"];
+  }
+  const phpPath = paths.find((path) => extname(path).toLowerCase() === ".php") ?? "";
+  const target = commandPathArg(phpPath);
+  return target ? [`php -l ${target}`] : null;
+}
+function changedManifestAt(paths, directory, names) {
+  const expectedDir = directory || ".";
+  const lowerNames = new Set(names.map((name) => name.toLowerCase()));
+  return paths.some((path) => {
+    const pathDirectory = dirname(path).replace(/\\/g, "/");
+    return (pathDirectory || ".") === expectedDir && lowerNames.has(basename(path).toLowerCase());
+  });
+}
+function makeValidationSteps(repoRoot, directory) {
+  const root = resolve4(repoRoot, directory || ".");
+  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve4(root, name)));
+  if (!makefile)
+    return null;
+  const evidence = readTextBounded(resolve4(root, makefile));
+  if (!evidence)
+    return null;
+  const target = ["test", "check"].find((name) => new RegExp(`^${name}\\s*:(?![=])`, "m").test(evidence.text));
+  if (!target)
+    return null;
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `make -C ${directoryArg} ${target}` : `make ${target}`];
+}
+function cmakeValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve4(repoRoot, directory || ".", "CMakeLists.txt")))
+    return null;
+  const sourceArg = directory ? commandPathArg(directory) : ".";
+  const buildPath = directory ? `${directory}/build` : "build";
+  const buildArg = commandPathArg(buildPath);
+  if (!sourceArg || !buildArg)
+    return null;
+  return [
+    `cmake -S ${sourceArg} -B ${buildArg}`,
+    `cmake --build ${buildArg}`,
+    `ctest --test-dir ${buildArg} --output-on-failure`
+  ];
+}
+function hasBazelWorkspaceAt(repoRoot) {
+  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve4(repoRoot, name)));
+}
+function bazelValidationSteps(repoRoot, directory) {
+  if (!hasBazelWorkspaceAt(repoRoot))
+    return null;
+  const root = resolve4(repoRoot, directory || ".");
+  const hasPackage = existsSync4(resolve4(root, "BUILD")) || existsSync4(resolve4(root, "BUILD.bazel"));
+  if (directory && !hasPackage)
+    return null;
+  const target = directory ? `//${directory}/...` : "//...";
+  return /^\/\/[A-Za-z0-9_@+.,/-]*\.\.\.$/.test(target) ? [`bazel test ${target}`] : null;
+}
+function nativeValidationSteps(repoRoot, directory, paths) {
+  const directCMake = changedManifestAt(paths, directory, ["CMakeLists.txt"]);
+  const directMake = changedManifestAt(paths, directory, ["Makefile", "makefile", "GNUmakefile"]);
+  const directBazel = changedManifestAt(paths, directory, [
+    "BUILD",
+    "BUILD.bazel",
+    "MODULE.bazel",
+    "WORKSPACE",
+    "WORKSPACE.bazel"
+  ]);
+  if (directCMake)
+    return cmakeValidationSteps(repoRoot, directory);
+  if (directBazel)
+    return bazelValidationSteps(repoRoot, directory);
+  if (directMake)
+    return makeValidationSteps(repoRoot, directory);
+  return cmakeValidationSteps(repoRoot, directory) ?? bazelValidationSteps(repoRoot, directory) ?? makeValidationSteps(repoRoot, directory);
+}
+function protobufValidationSteps(repoRoot, directory) {
+  const root = resolve4(repoRoot, directory || ".");
+  if (!existsSync4(resolve4(root, "buf.yaml")) && !existsSync4(resolve4(root, "buf.work.yaml"))) {
+    return null;
+  }
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `buf lint ${directoryArg}` : "buf lint"];
+}
+function swiftValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve4(repoRoot, directory || ".", "Package.swift")))
+    return null;
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `swift test --package-path ${directoryArg}` : "swift test"];
+}
+function isDartTestPath(path) {
+  return /(^|\/)(?:test|integration_test)(\/|$)|_test\.dart$/i.test(path);
+}
+function withoutYamlComments(text) {
+  return text.split(/\r?\n/).map((line) => line.replace(/^\s*#.*$|\s+#.*$/, "")).join(`
+`);
+}
+function dartValidationSteps(repoRoot, directory, paths) {
+  const root = resolve4(repoRoot, directory || ".");
+  const pubspec = readTextBounded(resolve4(root, "pubspec.yaml"));
+  if (!pubspec)
+    return null;
+  const pubspecEvidence = withoutYamlComments(pubspec.text);
+  const executable = /\bsdk\s*:\s*flutter\b|^flutter\s*:/m.test(pubspecEvidence) ? "flutter" : "dart";
+  if (directory && executable === "flutter") {
+    const rootPubspec = readTextBounded(resolve4(repoRoot, "pubspec.yaml"));
+    if (!rootPubspec || !/^workspace\s*:/m.test(withoutYamlComments(rootPubspec.text)) || !/^resolution\s*:\s*workspace\s*$/m.test(pubspecEvidence)) {
+      return null;
+    }
+  }
+  if (directory && executable === "dart") {
+    const directoryArg = commandPathArg(directory);
+    return directoryArg ? [`dart --directory ${directoryArg} test`] : null;
+  }
+  const focusedTests = paths.filter(isDartTestPath).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  if (focusedTests.length > 0)
+    return [`${executable} test ${focusedTests.join(" ")}`];
+  if (!directory)
+    return [`${executable} test`];
+  const relativeTests = existsSync4(resolve4(root, "test")) ? `${directory}/test` : existsSync4(resolve4(root, "integration_test")) ? `${directory}/integration_test` : "";
+  const target = commandPathArg(relativeTests);
+  return target ? [`${executable} test ${target}`] : null;
+}
+function elixirValidationSteps(repoRoot, directory, paths) {
+  if (!existsSync4(resolve4(repoRoot, directory || ".", "mix.exs")))
+    return null;
+  if (directory) {
+    const directoryArg = commandPathArg(directory);
+    return directoryArg ? [`mix --cd ${directoryArg} test`] : null;
+  }
+  const focusedTests = paths.filter((path) => /(^|\/)test(\/|$)|_test\.exs$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  return [`mix test${focusedTests.length > 0 ? ` ${focusedTests.join(" ")}` : ""}`];
+}
+function hasCabalManifest(directory) {
+  if (existsSync4(resolve4(directory, "cabal.project")))
+    return true;
+  try {
+    return readdirSync(directory).some((entry) => entry.toLowerCase().endsWith(".cabal"));
+  } catch {
+    return false;
+  }
+}
+function haskellValidationSteps(repoRoot, directory) {
+  const root = resolve4(repoRoot, directory || ".");
+  if (existsSync4(resolve4(root, "stack.yaml"))) {
+    if (!directory)
+      return ["stack test"];
+    const yamlArg = commandPathArg(`${directory}/stack.yaml`);
+    return yamlArg ? [`stack --stack-yaml ${yamlArg} test`] : null;
+  }
+  if (!directory && hasCabalManifest(root))
+    return ["cabal test all"];
+  return null;
+}
+function ednMapAfterKeyword(text, keyword) {
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const keywordIndex = text.indexOf(keyword, searchFrom);
+    if (keywordIndex < 0)
+      return "";
+    const next = text[keywordIndex + keyword.length] ?? "";
+    if (next && /[A-Za-z0-9_!?*+.-]/.test(next)) {
+      searchFrom = keywordIndex + keyword.length;
+      continue;
+    }
+    let cursor = keywordIndex + keyword.length;
+    while (cursor < text.length && /[\s,]/.test(text[cursor] ?? ""))
+      cursor += 1;
+    if (text[cursor] !== "{") {
+      searchFrom = cursor + 1;
+      continue;
+    }
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let index = cursor;index < text.length; index += 1) {
+      const ch = text[index] ?? "";
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (quoted && ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        quoted = !quoted;
+        continue;
+      }
+      if (quoted)
+        continue;
+      if (ch === "{")
+        depth += 1;
+      if (ch === "}") {
+        depth -= 1;
+        if (depth === 0)
+          return text.slice(cursor, index + 1);
+      }
+    }
+    return "";
+  }
+  return "";
+}
+function clojureValidationSteps(repoRoot, directory) {
+  if (directory)
+    return null;
+  const deps = readTextBounded(resolve4(repoRoot, "deps.edn"));
+  if (deps) {
+    const testAlias = ednMapAfterKeyword(deps.text, ":test");
+    if (/:exec-fn\b/.test(testAlias))
+      return ["clojure -X:test"];
+    if (/:main-opts\b/.test(testAlias))
+      return ["clojure -M:test"];
+  }
+  if (existsSync4(resolve4(repoRoot, "project.clj")))
+    return ["lein test"];
+  return null;
+}
+function zigValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve4(repoRoot, directory || ".", "build.zig")))
+    return null;
+  if (!directory)
+    return ["zig build test"];
+  const buildFile = commandPathArg(`${directory}/build.zig`);
+  return buildFile ? [`zig build --build-file ${buildFile} test`] : null;
+}
+function terraformValidationSteps(paths) {
+  const targets = paths.filter((path) => [".tf", ".tfvars"].includes(extname(path).toLowerCase())).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  return targets.length > 0 ? [`terraform fmt -check ${targets.join(" ")}`] : null;
+}
+function validationForEcosystem(ecosystem, repoRoot, directory, paths) {
+  if (ecosystem === "package")
+    return packageValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "python")
+    return pythonValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "go")
+    return goValidationSteps(repoRoot, directory);
+  if (ecosystem === "rust")
+    return rustValidationSteps(repoRoot, directory);
+  if (ecosystem === "jvm")
+    return jvmValidationSteps(repoRoot, directory);
+  if (ecosystem === "dotnet")
+    return dotnetValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "ruby")
+    return rubyValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "php")
+    return phpValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "native")
+    return nativeValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "protobuf")
+    return protobufValidationSteps(repoRoot, directory);
+  if (ecosystem === "swift")
+    return swiftValidationSteps(repoRoot, directory);
+  if (ecosystem === "dart")
+    return dartValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "elixir")
+    return elixirValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "haskell")
+    return haskellValidationSteps(repoRoot, directory);
+  if (ecosystem === "clojure")
+    return clojureValidationSteps(repoRoot, directory);
+  if (ecosystem === "zig")
+    return zigValidationSteps(repoRoot, directory);
+  if (ecosystem === "terraform")
+    return terraformValidationSteps(paths);
+  return null;
+}
+function syntaxFallbackForEcosystem(ecosystem, paths) {
+  if (ecosystem === "python") {
+    const targets = paths.filter((path) => extname(path).toLowerCase() === ".py").map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+    return targets.length > 0 ? [`python -m compileall ${targets.join(" ")}`] : null;
+  }
+  if (ecosystem === "ruby") {
+    const target = commandPathArg(paths.find((path) => extname(path).toLowerCase() === ".rb") ?? "");
+    return target ? [`ruby -c ${target}`] : null;
+  }
+  if (ecosystem === "php") {
+    const target = commandPathArg(paths.find((path) => extname(path).toLowerCase() === ".php") ?? "");
+    return target ? [`php -l ${target}`] : null;
+  }
+  if (ecosystem === "r") {
+    const target = normalizeRepoPath(paths.find((path) => extname(path).toLowerCase() === ".r") ?? "");
+    return target ? [`Rscript -e "parse(file='${target}')"`] : null;
+  }
+  if (ecosystem === "lua") {
+    const target = commandPathArg(paths.find((path) => extname(path).toLowerCase() === ".lua") ?? "");
+    return target ? [`luac -p ${target}`] : null;
+  }
+  return null;
+}
+function isFallbackEligiblePath(path) {
+  const filename = basename(path).toLowerCase();
+  const extension = extname(path).toLowerCase();
+  if (/^(?:readme|license|licence|changelog|contributing|authors|notice)(?:\..*)?$/.test(filename)) {
+    return true;
+  }
+  return [
+    ".md",
+    ".mdx",
+    ".rst",
+    ".adoc",
+    ".txt",
+    ".json",
+    ".jsonc",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".xml",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".webm"
+  ].includes(extension);
+}
+function inferRepositoryValidationSteps(options) {
+  const maxSteps = Math.max(1, Math.min(8, Math.floor(options.maxSteps ?? 4)));
+  const repoRoot = resolve4(options.repoRoot || ".");
+  const paths = (options.changedPaths ?? []).map(normalizeRepoPath).filter(Boolean);
+  const plans = [];
+  for (const group of pathsByEcosystem(paths)) {
+    const pathsByOwner = new Map;
+    const pathsWithoutOwner = [];
+    for (const path of group.paths) {
+      const owner = validationSearchDirectories([path]).find((directory) => Boolean(validationForEcosystem(group.ecosystem, repoRoot, directory, [path])?.length));
+      if (owner === undefined) {
+        pathsWithoutOwner.push(path);
+        continue;
+      }
+      const ownerPaths = pathsByOwner.get(owner) ?? [];
+      ownerPaths.push(path);
+      pathsByOwner.set(owner, ownerPaths);
+    }
+    for (const [directory, ownerPaths] of pathsByOwner) {
+      const plan = validationForEcosystem(group.ecosystem, repoRoot, directory, ownerPaths);
+      if (plan?.length)
+        plans.push(plan);
+    }
+    const fallback = syntaxFallbackForEcosystem(group.ecosystem, pathsWithoutOwner);
+    if (fallback?.length)
+      plans.push(fallback);
+  }
+  if (plans.length > 0)
+    return dedupeCompletePlans(plans, maxSteps);
+  if (paths.length === 0 || paths.every(isFallbackEligiblePath)) {
+    return [FALLBACK_VALIDATION_STEP];
+  }
+  return [];
 }
 // packages/shared/src/validation_repair_lease.ts
 var LEASE_KEYS = {
@@ -2436,7 +4726,7 @@ function resolveGitCommandTimeoutMs(args, requestedTimeout, env = process.env) {
   return networkCommand ? positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_NETWORK_TIMEOUT_MS, DEFAULT_GIT_NETWORK_TIMEOUT_MS) : positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_COMMAND_TIMEOUT_MS, DEFAULT_GIT_COMMAND_TIMEOUT_MS);
 }
 function normalizeFsPathForComparison(value) {
-  const resolved = resolve4(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
+  const resolved = resolve5(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 function parseGitWorktreeListPorcelain(stdout) {
@@ -3029,16 +5319,30 @@ class GitSourceControlApi {
 
 // apps/source_control_manager/src/github_pr.ts
 var DEFAULT_GITHUB_API_TIMEOUT_MS = 30000;
+var MAX_OPEN_PR_PAGES = 4;
+var MAX_RECENTLY_CLOSED_PR_PAGES = 4;
+var GITHUB_PULL_REQUEST_PAGE_SIZE = 100;
+function normalizePullRequestScanCursor(cursor) {
+  const rawPage = Number(cursor?.page);
+  const rawOffset = Number(cursor?.offset);
+  const page = Number.isSafeInteger(rawPage) && rawPage > 0 ? rawPage : 1;
+  const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 && rawOffset < GITHUB_PULL_REQUEST_PAGE_SIZE ? rawOffset : 0;
+  return { page, offset };
+}
+function notifyPullRequestScanComplete(callback, nextCursor) {
+  callback?.(nextCursor);
+}
 function githubApiTimeoutMs() {
   const configured = Number(process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS);
   return Number.isFinite(configured) && configured > 0 ? Math.max(1000, Math.floor(configured)) : DEFAULT_GITHUB_API_TIMEOUT_MS;
 }
-function githubFetch(input, init) {
+function githubFetch(input, init, fetchImpl) {
   const timeoutMs = githubApiTimeoutMs();
   return fetchBufferedWithHardDeadline({
     input,
     init,
     timeoutMs,
+    fetchImpl,
     timeoutMessage: `GitHub API request timed out after ${timeoutMs}ms`
   });
 }
@@ -3059,6 +5363,30 @@ function parseGitHubRepo2(remoteUrl) {
   }
   return null;
 }
+function isSupportedGitHubRemoteUrl(remoteUrl) {
+  return parseGitHubRepo2(remoteUrl) !== null;
+}
+function parseGitHubPullRequestNumberForRemote(prUrl, remoteUrl) {
+  const repo = parseGitHubRepo2(remoteUrl);
+  if (!repo)
+    return null;
+  let parsed;
+  try {
+    parsed = new URL(String(prUrl ?? "").trim());
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname.toLowerCase() !== "github.com")
+    return null;
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parts.length !== 4 || parts[0]?.toLowerCase() !== repo.owner.toLowerCase() || parts[1]?.toLowerCase() !== repo.repo.toLowerCase() || parts[2]?.toLowerCase() !== "pull") {
+    return null;
+  }
+  if (!/^[1-9]\d*$/.test(parts[3] ?? ""))
+    return null;
+  const prNumber = Number.parseInt(parts[3] ?? "", 10);
+  return Number.isSafeInteger(prNumber) && prNumber > 0 ? prNumber : null;
+}
 function githubHeaders(token) {
   return {
     Accept: "application/vnd.github+json",
@@ -3071,6 +5399,22 @@ function githubHeaders(token) {
 function githubError(responseStatus, bodyText) {
   return new Error(`GitHub API ${responseStatus}: ${bodyText || "no response body"}`);
 }
+function pullRequestHeadBelongsToRepo(pr, repo) {
+  const expected = `${repo.owner}/${repo.repo}`.toLowerCase();
+  const headRepo = pr?.head?.repo;
+  if (!headRepo)
+    return false;
+  const fullName = typeof headRepo.full_name === "string" ? headRepo.full_name.trim() : "";
+  if (fullName)
+    return fullName.toLowerCase() === expected;
+  const owner = headRepo.owner && typeof headRepo.owner.login === "string" ? headRepo.owner.login.trim() : "";
+  const name = typeof headRepo.name === "string" ? headRepo.name.trim() : "";
+  return Boolean(owner && name && `${owner}/${name}`.toLowerCase() === expected);
+}
+function pullRequestHeadBelongsToRemoteRepository(pr, remoteUrl) {
+  const repo = parseGitHubRepo2(remoteUrl);
+  return repo ? pullRequestHeadBelongsToRepo(pr, repo) : false;
+}
 async function ensureIntegrationPullRequest(opts) {
   const repo = parseGitHubRepo2(opts.remoteUrl);
   if (!repo) {
@@ -3082,14 +5426,14 @@ async function ensureIntegrationPullRequest(opts) {
   const listResponse = await githubFetch(listUrl, {
     method: "GET",
     headers: githubHeaders(opts.token)
-  });
+  }, opts.fetchImpl);
   if (!listResponse.ok) {
     const text = await listResponse.text();
     throw githubError(listResponse.status, text);
   }
   const openPrs = await listResponse.json();
-  if (Array.isArray(openPrs) && openPrs.length > 0) {
-    const existing = openPrs[0];
+  const existing = Array.isArray(openPrs) ? openPrs.find((pr) => pr.head?.ref === opts.headBranch && pr.base?.ref === opts.baseBranch && pullRequestHeadBelongsToRepo(pr, repo)) : undefined;
+  if (existing) {
     return { created: false, number: existing.number, htmlUrl: existing.html_url };
   }
   const createResponse = await githubFetch(`${apiBase}/pulls`, {
@@ -3102,7 +5446,7 @@ async function ensureIntegrationPullRequest(opts) {
       body: opts.body,
       draft: !!opts.draft
     })
-  });
+  }, opts.fetchImpl);
   if (createResponse.ok) {
     const created = await createResponse.json();
     return { created: true, number: created.number, htmlUrl: created.html_url };
@@ -3111,12 +5455,16 @@ async function ensureIntegrationPullRequest(opts) {
     const retryListResponse = await githubFetch(listUrl, {
       method: "GET",
       headers: githubHeaders(opts.token)
-    });
+    }, opts.fetchImpl);
     if (retryListResponse.ok) {
       const retryOpenPrs = await retryListResponse.json();
-      if (Array.isArray(retryOpenPrs) && retryOpenPrs.length > 0) {
-        const existing = retryOpenPrs[0];
-        return { created: false, number: existing.number, htmlUrl: existing.html_url };
+      const racedExisting = Array.isArray(retryOpenPrs) ? retryOpenPrs.find((pr) => pr.head?.ref === opts.headBranch && pr.base?.ref === opts.baseBranch && pullRequestHeadBelongsToRepo(pr, repo)) : undefined;
+      if (racedExisting) {
+        return {
+          created: false,
+          number: racedExisting.number,
+          htmlUrl: racedExisting.html_url
+        };
       }
     }
   }
@@ -3129,21 +5477,125 @@ async function listOpenPullRequests(opts) {
     throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
   }
   const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
-  const url = `${apiBase}/pulls?state=open&base=${encodeURIComponent(opts.base)}&per_page=100`;
+  const matches = [];
+  const cursor = normalizePullRequestScanCursor(opts.cursor);
+  let page = cursor.page;
+  let offset = cursor.offset;
+  for (let pagesFetched = 0;pagesFetched < MAX_OPEN_PR_PAGES; pagesFetched += 1) {
+    const url = `${apiBase}/pulls?state=open&base=${encodeURIComponent(opts.base)}` + `&per_page=${GITHUB_PULL_REQUEST_PAGE_SIZE}&page=${page}`;
+    const response = await githubFetch(url, {
+      method: "GET",
+      headers: githubHeaders(opts.token)
+    }, opts.fetchImpl);
+    if (!response.ok) {
+      const text = await response.text();
+      throw githubError(response.status, text);
+    }
+    const prs = await response.json();
+    if (!Array.isArray(prs)) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+    for (const pr of prs.slice(offset)) {
+      const headRef = typeof pr?.head?.ref === "string" ? pr.head.ref : "";
+      if (opts.headPrefix && !headRef.startsWith(opts.headPrefix))
+        continue;
+      if (!pullRequestHeadBelongsToRepo(pr, repo))
+        continue;
+      matches.push(pr);
+    }
+    if (prs.length < GITHUB_PULL_REQUEST_PAGE_SIZE) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+    page += 1;
+    offset = 0;
+  }
+  notifyPullRequestScanComplete(opts.onScanComplete, { page, offset: 0 });
+  return matches;
+}
+async function listRecentlyClosedPullRequests(opts) {
+  const repo = parseGitHubRepo2(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+  const limit = Number.isFinite(opts.limit) ? Math.max(1, Math.min(100, Math.floor(opts.limit ?? 50))) : 50;
+  const cutoffMs = Date.parse(String(opts.updatedSince ?? "").trim());
+  if (!Number.isFinite(cutoffMs)) {
+    throw new Error(`updatedSince must be a valid timestamp, got ${JSON.stringify(opts.updatedSince)}`);
+  }
+  const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`;
+  const matches = [];
+  const cursor = normalizePullRequestScanCursor(opts.cursor);
+  let page = cursor.page;
+  let offset = cursor.offset;
+  for (let pagesFetched = 0;pagesFetched < MAX_RECENTLY_CLOSED_PR_PAGES; pagesFetched += 1) {
+    const url = `${apiBase}/pulls?state=closed&base=${encodeURIComponent(opts.base)}` + `&sort=updated&direction=desc&per_page=${GITHUB_PULL_REQUEST_PAGE_SIZE}&page=${page}`;
+    const response = await githubFetch(url, {
+      method: "GET",
+      headers: githubHeaders(opts.token)
+    }, opts.fetchImpl);
+    if (!response.ok) {
+      const text = await response.text();
+      throw githubError(response.status, text);
+    }
+    const prs = await response.json();
+    if (!Array.isArray(prs)) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+    let reachedCutoff = false;
+    let nextOffset = offset;
+    for (let index = offset;index < prs.length; index += 1) {
+      const pr = prs[index];
+      nextOffset = index + 1;
+      const updatedAtMs = Date.parse(String(pr.updated_at ?? pr.closed_at ?? ""));
+      if (!Number.isFinite(updatedAtMs))
+        continue;
+      if (updatedAtMs < cutoffMs) {
+        reachedCutoff = true;
+        break;
+      }
+      const headRef = typeof pr?.head?.ref === "string" ? pr.head.ref : "";
+      if (opts.headPrefix && !headRef.startsWith(opts.headPrefix))
+        continue;
+      if (!pullRequestHeadBelongsToRepo(pr, repo))
+        continue;
+      matches.push(pr);
+      if (matches.length >= limit) {
+        const nextCursor = nextOffset < prs.length ? { page, offset: nextOffset } : prs.length >= GITHUB_PULL_REQUEST_PAGE_SIZE ? { page: page + 1, offset: 0 } : null;
+        notifyPullRequestScanComplete(opts.onScanComplete, nextCursor);
+        return matches;
+      }
+    }
+    if (reachedCutoff || prs.length < GITHUB_PULL_REQUEST_PAGE_SIZE) {
+      notifyPullRequestScanComplete(opts.onScanComplete, null);
+      return matches;
+    }
+    page += 1;
+    offset = 0;
+  }
+  notifyPullRequestScanComplete(opts.onScanComplete, { page, offset: 0 });
+  return matches;
+}
+async function getPullRequest(opts) {
+  const repo = parseGitHubRepo2(opts.remoteUrl);
+  if (!repo) {
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+  if (!Number.isSafeInteger(opts.prNumber) || opts.prNumber <= 0) {
+    throw new Error(`prNumber must be a positive integer, got ${JSON.stringify(opts.prNumber)}`);
+  }
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}`;
   const response = await githubFetch(url, {
     method: "GET",
     headers: githubHeaders(opts.token)
-  });
+  }, opts.fetchImpl);
   if (!response.ok) {
     const text = await response.text();
     throw githubError(response.status, text);
   }
-  const prs = await response.json();
-  if (!Array.isArray(prs))
-    return [];
-  if (!opts.headPrefix)
-    return prs;
-  return prs.filter((pr) => pr.head.ref.startsWith(opts.headPrefix));
+  return await response.json();
 }
 async function getPullRequestDiff(opts) {
   const repo = parseGitHubRepo2(opts.remoteUrl);
@@ -3630,9 +6082,60 @@ async function maintainIntegrationBeforeCompletionClaim(options) {
 }
 
 // apps/source_control_manager/src/review_agent.ts
-import { existsSync as existsSync4, readFileSync as readFileSync5 } from "fs";
+import { existsSync as existsSync5, readFileSync as readFileSync5 } from "fs";
 import { tmpdir } from "os";
-import { basename, delimiter, isAbsolute as isAbsolute2, join as join4, resolve as resolve5 } from "path";
+import { basename as basename2, delimiter, isAbsolute as isAbsolute2, join as join4, resolve as resolve6 } from "path";
+async function listPersistedPrLinks(opts) {
+  const headers = {};
+  if (opts.authToken)
+    headers.Authorization = `Bearer ${opts.authToken}`;
+  const limit = Number.isFinite(opts.limit) ? Math.max(1, Math.min(100, Math.floor(opts.limit ?? 8))) : 8;
+  const cursor = String(opts.cursor ?? "").trim();
+  const url = new URL(`${opts.serverUrl.replace(/\/+$/, "")}/jobs/pr-links`);
+  url.searchParams.set("limit", String(limit));
+  if (cursor)
+    url.searchParams.set("cursor", cursor);
+  const response = await opts.fetchImpl(url, { method: "GET", headers });
+  const responseText = await response.text().catch(() => "");
+  if (!response.ok) {
+    throw new Error(`persisted PR link scan failed: HTTP ${response.status}${responseText ? `: ${responseText}` : ""}`);
+  }
+  let payload = null;
+  try {
+    const parsed = responseText ? JSON.parse(responseText) : null;
+    payload = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    payload = null;
+  }
+  if (payload?.ok !== true || !Array.isArray(payload.links)) {
+    throw new Error("persisted PR link scan did not return an acknowledged compact page");
+  }
+  const links = [];
+  const seenPrNumbers = new Set;
+  for (const entry of payload.links.slice(0, limit)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      continue;
+    const row = entry;
+    const jobId = String(row.jobId ?? "").trim();
+    const prUrl = String(row.prUrl ?? "").trim();
+    const prNumber = parseGitHubPullRequestNumberForRemote(prUrl, opts.remoteUrl);
+    if (!jobId || !prNumber || seenPrNumbers.has(prNumber))
+      continue;
+    seenPrNumbers.add(prNumber);
+    links.push({
+      jobId,
+      sessionId: String(row.sessionId ?? "").trim() || null,
+      prNumber,
+      prUrl,
+      updatedAt: String(row.updatedAt ?? "").trim() || null
+    });
+  }
+  const nextCursor = String(payload.nextCursor ?? "").trim();
+  if (nextCursor && !/^\d{1,20}$/.test(nextCursor)) {
+    throw new Error("persisted PR link scan returned an invalid next cursor");
+  }
+  return { links, nextCursor: nextCursor || null };
+}
 var MAX_DIFF_BYTES = 150000;
 var MAX_PR_RE_REVIEW_ENQUEUES = 3;
 var MAX_REVIEW_CONTEXT_COMMENTS = 8;
@@ -3641,6 +6144,18 @@ var MAX_REVIEW_CONTEXT_TOTAL_CHARS = 3000;
 var MAX_AUTONOMY_FEEDBACK_COMMENTS = 12;
 var MAX_AUTONOMY_FEEDBACK_COMMENT_CHARS = 500;
 var MAX_AUTONOMY_FEEDBACK_SUMMARY_CHARS = 500;
+var MAX_RECENTLY_CLOSED_PRS = 50;
+var MAX_CLOSED_PR_RECONCILIATIONS_PER_POLL = 8;
+var MAX_PERSISTED_PR_STATE_PROBES_PER_POLL = 8;
+var MAX_PERSISTED_PR_RETRY_PROBES_PER_POLL = 4;
+var MAX_PERSISTED_PR_RETRY_QUEUE_SIZE = 64;
+var PROVIDER_RECONCILIATION_MIN_INTERVAL_MS = 60000;
+var PROVIDER_RECONCILIATION_STALL_MS = 5 * 60000;
+var MAX_OPEN_PR_REVIEWS_PER_LANE_RUN = 1;
+var CLOSED_PR_RECONCILIATION_WINDOW_MS = 7 * 24 * 60 * 60000;
+var CLOSED_PR_RECONCILIATION_RETRY_COOLDOWN_MS = 60000;
+var AUTONOMY_FEEDBACK_MAX_ATTEMPTS = 3;
+var AUTONOMY_FEEDBACK_RETRY_DELAYS_MS = [0, 100, 300];
 var MAX_ACTIVE_FIX_JOB_SCAN = 500;
 var REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS = 60000;
 var REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS = 30 * 60000;
@@ -3650,12 +6165,28 @@ var REPEATED_REVIEW_FINDING_MIN_PRIOR_COMMENTS = 3;
 var PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 var JOB_ID_MARKER = "pushpals-jobId";
 var SESSION_ID_MARKER = "pushpals-sessionId";
-var DEFAULT_WORKSPACE_ROOT = resolve5(import.meta.dir, "..", "..", "..");
+var DEFAULT_WORKSPACE_ROOT = resolve6(import.meta.dir, "..", "..", "..");
 var DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS = 5000;
 var DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 var ts = () => new Date().toISOString();
+function resolveReviewValidationRepoRoot() {
+  try {
+    const config = loadPushPalsConfig();
+    const scmRepo = String(config.sourceControlManager.repoPath ?? "").trim();
+    if (scmRepo && existsSync5(scmRepo))
+      return resolve6(scmRepo);
+    const projectRoot = String(config.projectRoot ?? "").trim();
+    if (projectRoot && existsSync5(projectRoot))
+      return resolve6(projectRoot);
+  } catch {}
+  return resolve6(process.cwd());
+}
 var DEFAULT_DEPS = {
+  repositoryServices: null,
   listOpenPullRequests,
+  listRecentlyClosedPullRequests,
+  getPullRequest,
+  listPersistedPrLinks,
   getPullRequestDiff,
   getCommitMessage,
   getPullRequestCommitMessage,
@@ -3666,12 +6197,15 @@ var DEFAULT_DEPS = {
   addPullRequestComment,
   invokeCodexReview,
   fetchImpl: fetch,
+  feedbackFetchImpl: fetch,
   httpTimeoutMs: DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS,
   httpMaxResponseBytes: DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES,
   now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve7) => setTimeout(resolve7, ms)),
   logInfo: (line) => console.log(line),
   logWarn: (line) => console.warn(line),
-  logError: (line) => console.error(line)
+  logError: (line) => console.error(line),
+  validationRepoRoot: resolveReviewValidationRepoRoot
 };
 function createBoundedReviewAgentFetch(fetchImpl, options = {}) {
   const timeoutMs = typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) ? Math.max(1, Math.floor(options.timeoutMs)) : DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS;
@@ -3730,14 +6264,14 @@ function splitArgs(raw) {
 function currentBunExecPath() {
   const explicit = String(process.env.PUSHPALS_BUN_BIN ?? "").trim();
   if (explicit) {
-    const leaf2 = basename(explicit).toLowerCase();
+    const leaf2 = basename2(explicit).toLowerCase();
     if (leaf2 === "bun" || leaf2 === "bun.exe")
       return explicit;
   }
   const execPath = (process.execPath ?? "").trim();
   if (!execPath)
     return "";
-  const leaf = basename(execPath).toLowerCase();
+  const leaf = basename2(execPath).toLowerCase();
   if (leaf === "bun" || leaf === "bun.exe")
     return execPath;
   const pathValue = process.platform === "win32" ? String(process.env.PATH ?? process.env.Path ?? "").trim() : String(process.env.PATH ?? "").trim();
@@ -3750,7 +6284,7 @@ function currentBunExecPath() {
       continue;
     for (const candidate of candidates) {
       const fullPath = join4(dir, candidate);
-      if (existsSync4(fullPath))
+      if (existsSync5(fullPath))
         return fullPath;
     }
   }
@@ -3793,26 +6327,26 @@ function resolveReviewerMdPath(reviewerMdPath, options) {
   if (!raw)
     return "";
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
-  const workspaceRoot = resolve5(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
-  const cwd = resolve5(options?.cwd || process.cwd());
+  const workspaceRoot = resolve6(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  const cwd = resolve6(options?.cwd || process.cwd());
   if (isAbsolute2(raw))
     return raw;
   const candidates = new Set;
-  candidates.add(resolve5(workspaceRoot, raw));
-  candidates.add(resolve5(cwd, raw));
+  candidates.add(resolve6(workspaceRoot, raw));
+  candidates.add(resolve6(cwd, raw));
   let cursor = cwd;
   for (let i = 0;i < 6; i += 1) {
-    const parent = resolve5(cursor, "..");
+    const parent = resolve6(cursor, "..");
     if (parent === cursor)
       break;
-    candidates.add(resolve5(parent, raw));
+    candidates.add(resolve6(parent, raw));
     cursor = parent;
   }
   for (const candidate of candidates) {
-    if (existsSync4(candidate))
+    if (existsSync5(candidate))
       return candidate;
   }
-  return resolve5(workspaceRoot, raw);
+  return resolve6(workspaceRoot, raw);
 }
 function buildCodexEnv(config) {
   const env = { ...process.env };
@@ -4070,11 +6604,6 @@ var REVIEW_FINDING_THEMES = [
     patterns: [/\.gitignore/i, /\bnode_modules\b/i]
   },
   {
-    key: "unused-react-native-mock",
-    label: "unused or unrelated React Native mock changes",
-    patterns: [/reactnativemock/i]
-  },
-  {
     key: "deleted-existing-coverage",
     label: "deleted or weakened existing test coverage",
     patterns: [/\b(delet|remov)\w*\b.{0,80}\b(test|coverage|assertion|case)s?\b/i]
@@ -4113,9 +6642,7 @@ var REVIEW_FINDING_THEMES = [
   {
     key: "pushpals-internal-leak",
     label: "PushPals-internal/autonomy concepts leaked into the user repo",
-    patterns: [
-      /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i
-    ]
+    patterns: [/\b(workerpal|remotebuddy|pushpals)\b/i]
   }
 ];
 function reviewFindingThemeKeys(text) {
@@ -4171,50 +6698,47 @@ function testDeclarationCounts(diff) {
   let added = 0;
   let removed = 0;
   for (const line of diff.split(/\r?\n/)) {
-    if (/^\+\s*(?:test|it|describe)\s*\(/.test(line))
+    if (!/^[+-](?![+-])/.test(line))
+      continue;
+    const declaration = line.slice(1).trim();
+    const isTestDeclaration = /^(?:(?:test|it|describe|context|RSpec\.describe)\s*\(|(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|func\s+Test[A-Za-z0-9_]*\s*\(|#\[test\]|@Test\b|\[(?:Fact|Theory|Test|TestCase)\b|(?:public\s+|private\s+|internal\s+)?(?:async\s+)?(?:void|Task|ValueTask|func)\s+[Tt]est[A-Za-z0-9_]*\s*\(|(?:public\s+|protected\s+)?function\s+test[A-Za-z0-9_]*\s*\()/i.test(declaration);
+    if (!isTestDeclaration)
+      continue;
+    if (line.startsWith("+"))
       added += 1;
-    if (/^-\s*(?:test|it|describe)\s*\(/.test(line))
+    else
       removed += 1;
   }
   return { added, removed };
 }
-function countDiffTokenOutsideFile(diff, token, excludedPath) {
-  let currentPath = "";
-  let count = 0;
-  for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith("diff --git ")) {
-      const parsed = parseDiffGitLinePaths(line);
-      currentPath = normalizeDiffPath(parsed?.bPath ?? parsed?.aPath ?? "") ?? "";
-      continue;
-    }
-    if (currentPath === excludedPath)
-      continue;
-    if (token.test(line))
-      count += 1;
-  }
-  return count;
+function isReviewTestPath(path) {
+  const normalized = path.replace(/\\/g, "/");
+  const base = normalized.split("/").pop() ?? normalized;
+  return /(^|\/)(?:__tests__|tests?|specs?)(?:\/|$)/i.test(normalized) || /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(base) || /^test_.*\.py$/i.test(base) || /_test\.go$/i.test(base) || /_spec\.rb$/i.test(base) || /(?:Test|Tests)\.(?:java|kt|kts|cs|fs|php|swift)$/i.test(base) || /\.Tests?\.(?:csproj|fsproj)$/i.test(base);
 }
-function collectReviewHygieneIssuesFromDiff(diff) {
+function isPushPalsSelfRepository(identity) {
+  return /(?:^|[:/])pushpalsdev\/pushpals(?:\.git)?\/?$/i.test(String(identity ?? "").trim());
+}
+function explicitlyAllowsTestRemoval(taskIntent) {
+  const normalized = collapseWhitespace(taskIntent);
+  return /\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b.{0,80}\b(?:test|coverage|suite)s?\b/i.test(normalized) || /\b(?:test|coverage|suite)s?\b.{0,80}\b(?:delete|remove|retire|replace|consolidate|migrate|refactor)\w*\b/i.test(normalized);
+}
+function addedDiffText(diff) {
+  return diff.split(/\r?\n/).filter((line) => line.startsWith("+") && !line.startsWith("+++")).map((line) => line.slice(1)).join(`
+`);
+}
+function collectReviewHygieneIssuesFromDiff(diff, context = {}) {
   const changedPaths = parseChangedPathsFromDiff(diff);
-  const changedPathSet = new Set(changedPaths);
   const issues = [];
-  if (changedPathSet.has(".gitignore") && /^\+node_modules\s*$/m.test(diff)) {
-    issues.push("PR adds bare node_modules noise to .gitignore. Keep dependency/cache hygiene out of feature PRs unless the task explicitly changes repo ignore policy.");
-  }
-  if (changedPathSet.has("tests/reactNativeMock.ts") && countDiffTokenOutsideFile(diff, /reactNativeMock/i, "tests/reactNativeMock.ts") === 0) {
-    issues.push("PR adds or changes tests/reactNativeMock.ts without wiring it into a changed test. Remove the unrelated mock or add a focused consumer in the same PR.");
-  }
   const declarationCounts = testDeclarationCounts(diff);
-  if (declarationCounts.removed >= 3 && declarationCounts.removed > declarationCounts.added) {
+  if (declarationCounts.removed >= 3 && declarationCounts.removed > declarationCounts.added && !explicitlyAllowsTestRemoval(context.taskIntent ?? "")) {
     issues.push("PR removes multiple existing test declarations without replacing equivalent coverage. Preserve existing coverage unless the task is explicitly a test deletion/refactor.");
   }
-  const changedTestPaths = changedPaths.filter((path) => /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path));
-  const changedRuntimePaths = changedPaths.filter((path) => /\.(?:[cm]?[jt]sx?)$/i.test(path) && !/(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path));
-  if (changedTestPaths.length > 0 && changedRuntimePaths.length > 0 && changedRuntimePaths.every((path) => /^utils\//i.test(path)) && !changedRuntimePaths.some((path) => /(?:index|route|screen|component|store|service)/i.test(path))) {
-    issues.push("PR adds utility/helper code with tests but no clear runtime integration point. Integrate the helper into behavior-owning code or keep it as a test fixture.");
-  }
-  if (changedPaths.some((path) => /(^|\/)_layout\.autonomy\.test\.[cm]?[jt]sx?$/i.test(path)) && /\b(queue_health|workerpal|remotebuddy|sourcecontrolmanager|reviewagent|pushpals)\b/i.test(diff)) {
-    issues.push("Layout autonomy tests contain PushPals-internal orchestration concepts. Keep user-repo review coverage focused on app behavior and route/startup contracts.");
+  const changedTestPaths = changedPaths.filter(isReviewTestPath);
+  const externalRepo = Boolean(String(context.repositoryIdentity ?? "").trim()) && !isPushPalsSelfRepository(context.repositoryIdentity ?? "");
+  const leakedInternalSourceLayout = /(?:^|["'`\s(])(?:\.\.\/)*(?:apps\/(?:workerpals|remotebuddy|source_control_manager)|packages\/cli\/runtime\/sandbox\/apps\/(?:workerpals|remotebuddy|source_control_manager))(?:\/|["'`\s)])/im.test(addedDiffText(diff).replace(/\\/g, "/"));
+  if (externalRepo && changedTestPaths.length > 0 && leakedInternalSourceLayout) {
+    issues.push("User-repo tests reference PushPals' private monorepo source layout. Exercise the installed public interface instead of coupling another repository to PushPals internals.");
   }
   return uniqueNonEmptyLines(issues);
 }
@@ -4240,7 +6764,7 @@ function normalizeDiffPath(value) {
     return null;
   return parts.join("/");
 }
-function normalizeReviewPrHeadRef(value) {
+function normalizeReviewPrHeadRef(value, headPrefix = "agent/") {
   if (typeof value !== "string")
     return null;
   const trimmed = value.trim();
@@ -4250,7 +6774,8 @@ function normalizeReviewPrHeadRef(value) {
   const normalized = withoutPrefix.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
   if (!normalized)
     return null;
-  if (!normalized.startsWith("agent/"))
+  const normalizedHeadPrefix = String(headPrefix ?? "").trim().replace(/^refs\/heads\//, "").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+/, "");
+  if (!normalizedHeadPrefix || !normalized.startsWith(normalizedHeadPrefix))
     return null;
   if (normalized.includes("..") || normalized.includes("@{") || normalized.endsWith(".") || normalized.endsWith(".lock")) {
     return null;
@@ -4405,21 +6930,8 @@ function deriveReviewTaskLikelyDirs(paths) {
   }
   return [...dirs];
 }
-function deriveReviewTaskValidationSteps(paths) {
-  const targeted = paths.filter((path) => /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path)).slice(0, 4).map((path) => `bun test ${formatBunTestPathArg(path)}`);
-  return targeted.length > 0 ? targeted : ["bun test"];
-}
-function formatBunTestPathArg(path) {
-  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
-  if (!normalized)
-    return normalized;
-  const pathArg = normalized.startsWith("./") || normalized.startsWith("../") || normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) ? normalized : `./${normalized}`;
-  return quoteValidationCommandArg(pathArg);
-}
-function quoteValidationCommandArg(arg) {
-  if (!/[\s"\\]/.test(arg))
-    return arg;
-  return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+function deriveReviewTaskValidationSteps(paths, repoRoot) {
+  return inferRepositoryValidationSteps({ repoRoot, changedPaths: paths, maxSteps: 4 });
 }
 function buildReviewFixPlannerWorkerInstruction(options) {
   const lines = [
@@ -4476,6 +6988,14 @@ function buildMergeConflictPlannerWorkerInstruction(options) {
 }
 function normalizeReviewFixHeadSha(value) {
   return String(value ?? "").trim().toLowerCase();
+}
+function providerStateFeedbackKey(pr, state, jobId) {
+  const normalizedHeadSha = normalizeReviewFixHeadSha(pr.head?.sha ?? "") || "unknown";
+  const normalizedJobId = String(jobId ?? "").trim().replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 120);
+  return `review_agent:pr:${pr.number}:head:${normalizedHeadSha}:state:${state}${normalizedJobId ? `:job:${normalizedJobId}` : ""}`;
+}
+function persistedLinkReconciliationKey(link) {
+  return `${link.prNumber}:${link.jobId}:${link.updatedAt ?? "unknown"}`;
 }
 function reviewFixDedupeKey(prNumber, headSha) {
   return `${prNumber}:${normalizeReviewFixHeadSha(headSha)}`;
@@ -4552,30 +7072,92 @@ class ReviewAgent {
   reviewed = new Map;
   forceReReview = new Map;
   reReviewEnqueueCounts = new Map;
+  reconciledClosedPrStates = new Map;
+  attemptedClosedPrStates = new Map;
+  reconciledPersistedLinkStates = new Map;
+  persistedPrLinkRetries = new Map;
+  persistedPrLinkCursor = null;
+  openPrScanCursor = null;
+  recentlyClosedPrScanCursor = null;
+  lastProviderPollStartedAtMs = null;
+  lastProviderPollCompletedAtMs = null;
+  lastSuccessfulProviderPollAtMs = null;
+  consecutiveFailedProviderPolls = 0;
+  providerFailureEvents = 0;
+  lastProviderError = null;
+  lastOpenPrReviewNumber = null;
   reviewerMd = "";
-  pollInFlight = false;
+  providerPollInFlight = false;
+  reviewPollInFlight = false;
+  stopped = false;
+  activePollRuns = new Set;
   deps;
-  constructor(config, serverUrl, githubToken, remoteUrl, prBaseBranch, authToken, deps) {
+  headPrefix;
+  constructor(config, serverUrl, githubToken, remoteUrl, prBaseBranch, authToken, deps, headPrefix = "agent/") {
     this.config = config;
     this.serverUrl = serverUrl;
     this.githubToken = githubToken;
     this.remoteUrl = remoteUrl;
     this.prBaseBranch = prBaseBranch;
     this.authToken = authToken;
+    this.headPrefix = String(headPrefix ?? "").trim() || "agent/";
     const resolvedDeps = { ...DEFAULT_DEPS, ...deps ?? {} };
+    const rawFeedbackFetchImpl = deps?.feedbackFetchImpl ?? deps?.fetchImpl ?? fetch;
     this.deps = {
       ...resolvedDeps,
       fetchImpl: createBoundedReviewAgentFetch(resolvedDeps.fetchImpl, {
+        timeoutMs: resolvedDeps.httpTimeoutMs,
+        maxResponseBytes: resolvedDeps.httpMaxResponseBytes
+      }),
+      feedbackFetchImpl: createBoundedReviewAgentFetch(rawFeedbackFetchImpl, {
         timeoutMs: resolvedDeps.httpTimeoutMs,
         maxResponseBytes: resolvedDeps.httpMaxResponseBytes
       })
     };
   }
   requestReReview(prNumber, sha) {
+    if (this.stopped)
+      return;
     const normalizedSha = String(sha ?? "").trim();
     if (!normalizedSha)
       return;
     this.forceReReview.set(prNumber, normalizedSha);
+  }
+  updateRuntimeConfig(nextConfig) {
+    if (this.stopped)
+      return { becameEnabled: false };
+    const becameEnabled = !this.config.enabled && nextConfig.enabled;
+    const reviewerPathChanged = String(this.config.reviewerMdPath ?? "").trim() !== String(nextConfig.reviewerMdPath ?? "").trim();
+    this.config = { ...nextConfig };
+    if (reviewerPathChanged)
+      this.reviewerMd = "";
+    return { becameEnabled };
+  }
+  getProviderHealthSnapshot() {
+    const toIso = (value) => value === null ? null : new Date(value).toISOString();
+    const rawPollAgeMs = this.providerPollInFlight && this.lastProviderPollStartedAtMs !== null ? this.deps.now() - this.lastProviderPollStartedAtMs : 0;
+    const pollAgeMs = Number.isFinite(rawPollAgeMs) ? Math.max(0, rawPollAgeMs) : 0;
+    const stalled = this.providerPollInFlight && pollAgeMs >= PROVIDER_RECONCILIATION_STALL_MS;
+    const status = stalled ? "stalled" : this.providerPollInFlight ? "running" : this.consecutiveFailedProviderPolls > 0 ? "degraded" : this.lastProviderPollCompletedAtMs === null ? "idle" : "ok";
+    return {
+      status,
+      inFlight: this.providerPollInFlight,
+      pollAgeMs,
+      stalled,
+      lastPollStartedAt: toIso(this.lastProviderPollStartedAtMs),
+      lastPollCompletedAt: toIso(this.lastProviderPollCompletedAtMs),
+      lastSuccessfulPollAt: toIso(this.lastSuccessfulProviderPollAtMs),
+      consecutiveFailedPolls: this.consecutiveFailedProviderPolls,
+      failureEvents: this.providerFailureEvents,
+      lastError: this.lastProviderError,
+      persistedLinkRetryCount: this.persistedPrLinkRetries.size,
+      persistedLinkCursor: this.persistedPrLinkCursor
+    };
+  }
+  recordProviderFailure(context, err) {
+    const detail = String(err instanceof Error ? err.message : err ?? "").trim();
+    this.providerFailureEvents += 1;
+    this.lastProviderError = `${context}${detail ? `: ${detail}` : ""}`.slice(0, 600);
   }
   loadReviewerMd() {
     if (this.reviewerMd)
@@ -4589,31 +7171,328 @@ class ReviewAgent {
       return "";
     }
   }
-  async poll() {
-    if (this.pollInFlight) {
-      this.deps.logInfo("[ReviewAgent] Poll already in progress, skipping overlapping tick.");
+  poll() {
+    if (this.stopped)
+      return Promise.resolve();
+    let trackedPoll;
+    trackedPoll = this.pollLanes().finally(() => {
+      this.activePollRuns.delete(trackedPoll);
+    });
+    this.activePollRuns.add(trackedPoll);
+    return trackedPoll;
+  }
+  async stopAndDrain() {
+    this.stopped = true;
+    while (this.activePollRuns.size > 0) {
+      await Promise.allSettled([...this.activePollRuns]);
+    }
+  }
+  async pollLanes() {
+    const lanes = [this.pollProviderOutcomes()];
+    if (this.config.enabled)
+      lanes.push(this.pollOpenPrReviews());
+    await Promise.all(lanes);
+  }
+  async pollProviderOutcomes() {
+    if (this.providerPollInFlight) {
+      this.deps.logInfo("[ReviewAgent] Provider reconciliation already in progress, skipping overlapping lane tick.");
       return;
     }
-    this.pollInFlight = true;
+    const nowMs = this.deps.now();
+    if (this.lastProviderPollStartedAtMs !== null && nowMs >= this.lastProviderPollStartedAtMs && nowMs - this.lastProviderPollStartedAtMs < PROVIDER_RECONCILIATION_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.lastProviderPollStartedAtMs = nowMs;
+    const failureEventsAtStart = this.providerFailureEvents;
+    this.providerPollInFlight = true;
+    try {
+      const closedPrCutoff = new Date(nowMs - CLOSED_PR_RECONCILIATION_WINDOW_MS).toISOString();
+      const recentClosedPrs = this.deps.listRecentlyClosedPullRequests({
+        token: this.githubToken,
+        remoteUrl: this.remoteUrl,
+        headPrefix: this.headPrefix,
+        base: this.prBaseBranch,
+        updatedSince: closedPrCutoff,
+        limit: MAX_CLOSED_PR_RECONCILIATIONS_PER_POLL,
+        cursor: this.recentlyClosedPrScanCursor,
+        onScanComplete: (nextCursor) => {
+          this.recentlyClosedPrScanCursor = nextCursor;
+        }
+      }).catch((err) => {
+        this.recordProviderFailure("list recently closed pull requests", err);
+        this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to list recently closed PRs for outcome reconciliation: ${err?.message ?? err}`);
+        return [];
+      });
+      const persistedProviderOutcomes = (async () => {
+        let pageLinks = [];
+        try {
+          const page = await this.deps.listPersistedPrLinks({
+            serverUrl: this.serverUrl,
+            remoteUrl: this.remoteUrl,
+            authToken: this.authToken,
+            fetchImpl: this.deps.fetchImpl,
+            cursor: this.persistedPrLinkCursor,
+            limit: MAX_PERSISTED_PR_STATE_PROBES_PER_POLL
+          });
+          pageLinks = page.links;
+          this.persistedPrLinkCursor = page.nextCursor;
+        } catch (err) {
+          this.recordProviderFailure("list persisted job/PR links", err);
+          this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to reconcile persisted job/PR links: ${err?.message ?? err}`);
+        }
+        const retryLinks = this.takeDuePersistedPrLinkRetries(nowMs);
+        const uniqueLinks = new Map;
+        for (const link of pageLinks) {
+          if (this.persistedPrLinkRetryIsCoolingDown(link, nowMs))
+            continue;
+          if (!uniqueLinks.has(link.prNumber))
+            uniqueLinks.set(link.prNumber, link);
+        }
+        for (const link of retryLinks) {
+          if (!uniqueLinks.has(link.prNumber))
+            uniqueLinks.set(link.prNumber, link);
+        }
+        return this.reconcilePersistedPrLinks([...uniqueLinks.values()], nowMs);
+      })();
+      const persistedAuthorityPrNumbers = await persistedProviderOutcomes;
+      await this.reconcileRecentlyClosedPrFeedback(await recentClosedPrs, nowMs, new Map, persistedAuthorityPrNumbers);
+    } finally {
+      const completedAtMs = this.deps.now();
+      this.lastProviderPollCompletedAtMs = completedAtMs;
+      if (this.providerFailureEvents === failureEventsAtStart) {
+        this.lastSuccessfulProviderPollAtMs = completedAtMs;
+        this.consecutiveFailedProviderPolls = 0;
+        this.lastProviderError = null;
+      } else {
+        this.consecutiveFailedProviderPolls += 1;
+      }
+      this.providerPollInFlight = false;
+    }
+  }
+  takeDuePersistedPrLinkRetries(nowMs) {
+    const due = [];
+    for (const retry of this.persistedPrLinkRetries.values()) {
+      const retryDelayMs = this.persistedPrLinkRetryDelayMs(retry.failures);
+      const elapsedMs = nowMs - retry.lastAttemptedAtMs;
+      if (elapsedMs >= 0 && elapsedMs < retryDelayMs)
+        continue;
+      due.push(retry.link);
+      if (due.length >= MAX_PERSISTED_PR_RETRY_PROBES_PER_POLL)
+        break;
+    }
+    return due;
+  }
+  persistedPrLinkRetryDelayMs(failures) {
+    return Math.min(6 * 60 * 60000, CLOSED_PR_RECONCILIATION_RETRY_COOLDOWN_MS * 2 ** Math.min(8, Math.max(0, failures - 1)));
+  }
+  persistedPrLinkRetryIsCoolingDown(link, nowMs) {
+    const retry = this.persistedPrLinkRetries.get(link.prNumber);
+    if (!retry)
+      return false;
+    if (persistedLinkReconciliationKey(retry.link) !== persistedLinkReconciliationKey(link)) {
+      return false;
+    }
+    const elapsedMs = nowMs - retry.lastAttemptedAtMs;
+    return elapsedMs >= 0 && elapsedMs < this.persistedPrLinkRetryDelayMs(retry.failures);
+  }
+  retainPersistedPrLinkRetry(link, nowMs) {
+    const prior = this.persistedPrLinkRetries.get(link.prNumber);
+    this.persistedPrLinkRetries.delete(link.prNumber);
+    this.persistedPrLinkRetries.set(link.prNumber, {
+      link,
+      lastAttemptedAtMs: nowMs,
+      failures: (prior?.failures ?? 0) + 1
+    });
+    while (this.persistedPrLinkRetries.size > MAX_PERSISTED_PR_RETRY_QUEUE_SIZE) {
+      const oldestPrNumber = this.persistedPrLinkRetries.keys().next().value;
+      if (oldestPrNumber === undefined)
+        break;
+      this.persistedPrLinkRetries.delete(oldestPrNumber);
+    }
+  }
+  async reconcilePersistedPrLinks(links, nowMs) {
+    const resolvedCutoffMs = nowMs - CLOSED_PR_RECONCILIATION_WINDOW_MS;
+    for (const [linkKey, reconciledAtMs] of this.reconciledPersistedLinkStates) {
+      if (reconciledAtMs < resolvedCutoffMs || reconciledAtMs > nowMs) {
+        this.reconciledPersistedLinkStates.delete(linkKey);
+      }
+    }
+    const candidates = links.filter((link) => {
+      if (!this.reconciledPersistedLinkStates.has(persistedLinkReconciliationKey(link)))
+        return true;
+      this.persistedPrLinkRetries.delete(link.prNumber);
+      return false;
+    });
+    if (candidates.length === 0)
+      return new Set;
+    const persistedMetadata = new Map;
+    const closedPrs = (await Promise.all(candidates.map(async (link) => {
+      try {
+        const pr = await this.deps.getPullRequest({
+          token: this.githubToken,
+          remoteUrl: this.remoteUrl,
+          prNumber: link.prNumber
+        });
+        if (pr.number !== link.prNumber) {
+          throw new Error(`provider returned PR #${pr.number} while probing persisted PR #${link.prNumber}`);
+        }
+        if (String(pr.state ?? "").trim().toLowerCase() !== "closed") {
+          this.persistedPrLinkRetries.delete(link.prNumber);
+          return null;
+        }
+        persistedMetadata.set(pr.number, {
+          jobId: link.jobId,
+          sessionId: link.sessionId,
+          allowBranchDelete: String(pr.head?.ref ?? "").startsWith(this.headPrefix) && pullRequestHeadBelongsToRemoteRepository(pr, this.remoteUrl)
+        });
+        return pr;
+      } catch (err) {
+        this.recordProviderFailure(`probe persisted PR #${link.prNumber}`, err);
+        this.retainPersistedPrLinkRetry(link, nowMs);
+        this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed persisted provider-state probe for PR #${link.prNumber}: ${err?.message ?? err}`);
+        return null;
+      }
+    }))).filter((pr) => Boolean(pr));
+    await this.reconcileRecentlyClosedPrFeedback(closedPrs, nowMs, persistedMetadata);
+    for (const pr of closedPrs) {
+      const providerState = pr.merged_at ? "merged" : "closed_unmerged";
+      const metadata = persistedMetadata.get(pr.number);
+      const link = candidates.find((candidate) => candidate.prNumber === pr.number && candidate.jobId === metadata?.jobId);
+      if (link && this.reconciledClosedPrStates.has(providerStateFeedbackKey(pr, providerState, metadata?.jobId))) {
+        this.reconciledPersistedLinkStates.set(persistedLinkReconciliationKey(link), nowMs);
+        this.persistedPrLinkRetries.delete(pr.number);
+      } else {
+        if (link)
+          this.retainPersistedPrLinkRetry(link, nowMs);
+      }
+    }
+    return new Set(closedPrs.map((pr) => pr.number));
+  }
+  async pollOpenPrReviews() {
+    if (this.reviewPollInFlight) {
+      this.deps.logInfo("[ReviewAgent] Open PR review already in progress, skipping overlapping lane tick.");
+      return;
+    }
+    this.reviewPollInFlight = true;
     try {
       let prs;
       try {
         prs = await this.deps.listOpenPullRequests({
           token: this.githubToken,
           remoteUrl: this.remoteUrl,
-          headPrefix: "agent/",
-          base: this.prBaseBranch
+          headPrefix: this.headPrefix,
+          base: this.prBaseBranch,
+          cursor: this.openPrScanCursor,
+          onScanComplete: (nextCursor) => {
+            this.openPrScanCursor = nextCursor;
+          }
         });
       } catch (err) {
         this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to list PRs: ${err?.message ?? err}`);
         return;
       }
-      for (const pr of prs) {
+      const eligible = prs.filter((pr) => {
+        const reviewedSha = this.reviewed.get(pr.number);
+        const forcedSha = this.forceReReview.get(pr.number);
+        return reviewedSha !== pr.head.sha || forcedSha === pr.head.sha;
+      }).sort((a, b) => a.number - b.number);
+      const startIndex = this.lastOpenPrReviewNumber == null ? 0 : Math.max(0, eligible.findIndex((pr) => pr.number > (this.lastOpenPrReviewNumber ?? -1)));
+      const ordered = startIndex > 0 ? [...eligible.slice(startIndex), ...eligible.slice(0, startIndex)] : eligible;
+      for (const pr of ordered.slice(0, MAX_OPEN_PR_REVIEWS_PER_LANE_RUN)) {
+        this.lastOpenPrReviewNumber = pr.number;
         await this.reviewPr(pr);
       }
     } finally {
-      this.pollInFlight = false;
+      this.reviewPollInFlight = false;
     }
+  }
+  async reconcileRecentlyClosedPrFeedback(prs, nowMs, persistedMetadata = new Map, skipPrNumbers = new Set) {
+    const cacheCutoffMs = nowMs - CLOSED_PR_RECONCILIATION_WINDOW_MS;
+    for (const [key, acknowledgedAtMs] of this.reconciledClosedPrStates) {
+      if (acknowledgedAtMs < cacheCutoffMs || acknowledgedAtMs > nowMs) {
+        this.reconciledClosedPrStates.delete(key);
+      }
+    }
+    for (const [key, attempt] of this.attemptedClosedPrStates) {
+      if (attempt.lastAttemptedAtMs < cacheCutoffMs)
+        this.attemptedClosedPrStates.delete(key);
+    }
+    const freshPending = [];
+    const retryPending = [];
+    for (const pr of prs.slice(0, MAX_RECENTLY_CLOSED_PRS)) {
+      if (skipPrNumbers.has(pr.number))
+        continue;
+      const bodyMetadata = extractPrMeta(pr.body);
+      const authoritativeMetadata = persistedMetadata.get(pr.number);
+      const jobId = authoritativeMetadata?.jobId ?? bodyMetadata.jobId;
+      const sessionId = authoritativeMetadata?.sessionId ?? bodyMetadata.sessionId;
+      if (!jobId) {
+        this.deps.logInfo(`[${ts()}] [ReviewAgent] Skipping closed PR #${pr.number} reconciliation: missing ${JOB_ID_MARKER} metadata.`);
+        continue;
+      }
+      const providerState = pr.merged_at ? "merged" : "closed_unmerged";
+      const stateKey = providerStateFeedbackKey(pr, providerState, jobId);
+      const allowBranchDelete = authoritativeMetadata?.allowBranchDelete ?? true;
+      if (this.reconciledClosedPrStates.has(stateKey))
+        continue;
+      const priorAttempt = this.attemptedClosedPrStates.get(stateKey);
+      if (!priorAttempt) {
+        freshPending.push({
+          pr,
+          jobId,
+          sessionId,
+          providerState,
+          stateKey,
+          allowBranchDelete
+        });
+        continue;
+      }
+      const retryDelayMs = Math.min(6 * 60 * 60000, CLOSED_PR_RECONCILIATION_RETRY_COOLDOWN_MS * 2 ** Math.min(8, Math.max(0, priorAttempt.failures - 1)));
+      const elapsedSinceAttemptMs = nowMs - priorAttempt.lastAttemptedAtMs;
+      if (elapsedSinceAttemptMs < 0 || elapsedSinceAttemptMs >= retryDelayMs) {
+        retryPending.push({
+          pr,
+          jobId,
+          sessionId,
+          providerState,
+          stateKey,
+          allowBranchDelete
+        });
+      }
+    }
+    const pending = [...freshPending, ...retryPending];
+    await Promise.all(pending.slice(0, MAX_CLOSED_PR_RECONCILIATIONS_PER_POLL).map(async (entry) => {
+      const { pr, jobId, sessionId, providerState, stateKey, allowBranchDelete } = entry;
+      const priorFailures = this.attemptedClosedPrStates.get(stateKey)?.failures ?? 0;
+      this.attemptedClosedPrStates.set(stateKey, {
+        lastAttemptedAtMs: nowMs,
+        failures: priorFailures + 1
+      });
+      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+        pr,
+        feedbackKey: stateKey,
+        verdict: providerState === "merged" ? "approved_merged" : "closed_unmerged",
+        providerStateAt: providerState === "merged" ? pr.merged_at ?? undefined : pr.closed_at ?? undefined,
+        verdictSummary: providerState === "merged" ? `GitHub confirms PR #${pr.number} merged${pr.merged_at ? ` at ${pr.merged_at}` : ""}.` : `GitHub confirms PR #${pr.number} closed without merge${pr.closed_at ? ` at ${pr.closed_at}` : ""}.`,
+        jobId,
+        sessionId
+      });
+      if (!feedbackAcknowledged) {
+        this.recordProviderFailure(`publish provider outcome for PR #${pr.number}`);
+        return;
+      }
+      this.attemptedClosedPrStates.delete(stateKey);
+      this.reconciledClosedPrStates.set(stateKey, nowMs);
+      if (allowBranchDelete) {
+        await this.deletePrHeadBranch(pr, providerState === "merged" ? "merged" : "closed");
+      } else {
+        this.deps.logInfo(`[${ts()}] [ReviewAgent] Preserved unowned persisted PR head ${pr.head?.ref ?? "(unknown)"} after ${providerState} reconciliation for PR #${pr.number}.`);
+      }
+      this.reReviewEnqueueCounts.delete(pr.number);
+      this.forceReReview.delete(pr.number);
+      this.reviewed.delete(pr.number);
+      this.deps.logInfo(`[${ts()}] [ReviewAgent] Reconciled ${providerState} outcome for closed PR #${pr.number}.`);
+    }));
   }
   async reviewPr(pr) {
     const sha = pr.head.sha;
@@ -4650,7 +7529,11 @@ class ReviewAgent {
       this.reviewed.set(pr.number, sha);
       return;
     }
-    const deterministicHygieneIssues = collectReviewHygieneIssuesFromDiff(diff);
+    const deterministicHygieneIssues = collectReviewHygieneIssuesFromDiff(diff, {
+      repositoryIdentity: this.remoteUrl,
+      taskIntent: `${pr.title ?? ""}
+${pr.body ?? ""}`
+    });
     if (deterministicHygieneIssues.length > 0) {
       const verdict2 = buildDeterministicReviewHygieneVerdict(deterministicHygieneIssues, this.config.passThreshold);
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} failed deterministic hygiene gate (${deterministicHygieneIssues.length} issue(s)); skipping Codex review.`);
@@ -4735,14 +7618,15 @@ ${raw.slice(0, 500)}`);
         commitTitle,
         commitMessage
       });
-      this.deps.logInfo(`[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${result.sha.slice(0, 8)})`);
-      await this.deleteMergedPrHeadBranch(pr);
-      this.reReviewEnqueueCounts.delete(pr.number);
-      this.forceReReview.delete(pr.number);
-      this.reviewed.delete(pr.number);
+      if (result.merged !== true) {
+        this.deps.logWarn(`[${ts()}] [ReviewAgent] GitHub did not merge PR #${pr.number}: ${result.message || "provider returned merged=false"}`);
+        return false;
+      }
+      this.deps.logInfo(`[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${String(result.sha ?? "").slice(0, 8) || "unknown"})`);
       const comments = await this.listRecentPrComments(pr.number);
-      await this.postAutonomyPrFeedback({
+      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
         pr,
+        feedbackKey: providerStateFeedbackKey(pr, "merged", jobId),
         verdict: "approved_merged",
         verdictSummary: verdict.summary,
         reviewScore: verdict.score,
@@ -4750,6 +7634,14 @@ ${raw.slice(0, 500)}`);
         sessionId,
         comments
       });
+      if (!feedbackAcknowledged) {
+        this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} merged, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`);
+        return false;
+      }
+      await this.deleteMergedPrHeadBranch(pr);
+      this.reReviewEnqueueCounts.delete(pr.number);
+      this.forceReReview.delete(pr.number);
+      this.reviewed.delete(pr.number);
       return true;
     } catch (err) {
       if (isUnmergeablePullRequestError(err)) {
@@ -4782,7 +7674,7 @@ ${raw.slice(0, 500)}`);
     const handled = await this.enqueueMergeConflictJob(pr, verdict, sessionId, jobId, diff, mergeError);
     if (handled) {
       const comments = await this.listRecentPrComments(pr.number);
-      await this.postAutonomyPrFeedback({
+      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
         pr,
         verdict: "approved_unmergeable",
         verdictSummary: `${verdict.summary} merge blocked: ${String(mergeError?.message ?? mergeError ?? "")}`.trim(),
@@ -4791,6 +7683,10 @@ ${raw.slice(0, 500)}`);
         sessionId,
         comments
       });
+      if (!feedbackAcknowledged) {
+        this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} merge-conflict feedback was not acknowledged; the unchanged PR will be reviewed again.`);
+        return false;
+      }
     }
     return handled;
   }
@@ -4840,7 +7736,7 @@ ${raw.slice(0, 500)}`);
     } catch (err) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`);
     }
-    await this.postAutonomyPrFeedback({
+    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
       pr,
       verdict: "rejected",
       verdictSummary: effectiveVerdict.summary,
@@ -4851,7 +7747,7 @@ ${raw.slice(0, 500)}`);
     });
     if (!sessionId) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has no pushpals-sessionId in body - cannot re-queue`);
-      return true;
+      return feedbackAcknowledged;
     }
     const priorReReviewEnqueues = this.reReviewEnqueueCounts.get(pr.number) ?? 0;
     if (priorReReviewEnqueues >= MAX_PR_RE_REVIEW_ENQUEUES) {
@@ -4869,7 +7765,7 @@ ${raw.slice(0, 500)}`);
     const existingFixJobId = await this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha, "review_fix");
     if (existingFixJobId) {
       this.deps.logInfo(`[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`);
-      return true;
+      return feedbackAcknowledged;
     }
     const nextReReviewEnqueues = priorReReviewEnqueues + 1;
     this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
@@ -4883,7 +7779,7 @@ ${raw.slice(0, 500)}`);
     } else {
       this.reReviewEnqueueCounts.delete(pr.number);
     }
-    return true;
+    return feedbackAcknowledged;
   }
   async giveUpOnRejectedPr(pr, verdict, context) {
     const reason = context.reason ?? `Reached PR feedback comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}).`;
@@ -4913,8 +7809,9 @@ ${raw.slice(0, 500)}`);
     } catch (err) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] Closed PR #${pr.number} but failed to post give-up comment: ${err?.message ?? err}`);
     }
-    await this.postAutonomyPrFeedback({
+    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
       pr,
+      feedbackKey: providerStateFeedbackKey(pr, "closed_unmerged", context.jobId),
       verdict: context.feedbackVerdict ?? "rejected_comment_cap_closed",
       verdictSummary: `${verdict.summary} | ${context.feedbackSummarySuffix ?? `closed after reaching PR comment cap (${context.maxPrCommentsBeforeGiveUp}).`}`,
       reviewScore: verdict.score,
@@ -4922,10 +7819,14 @@ ${raw.slice(0, 500)}`);
       sessionId: context.sessionId,
       comments: context.recentComments
     });
-    await this.deletePrHeadBranch(pr, "closed");
     this.reReviewEnqueueCounts.delete(pr.number);
     this.forceReReview.delete(pr.number);
     this.reviewed.delete(pr.number);
+    if (!feedbackAcknowledged) {
+      this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} closed, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`);
+      return false;
+    }
+    await this.deletePrHeadBranch(pr, "closed");
     return true;
   }
   async deleteMergedPrHeadBranch(pr) {
@@ -5121,12 +8022,13 @@ ${raw.slice(0, 500)}`);
   async postAutonomyPrFeedback(args) {
     const normalizedVerdict = String(args.verdict ?? "").trim().toLowerCase();
     if (!normalizedVerdict)
-      return;
+      return false;
+    const providerStateAt = String(args.providerStateAt ?? "").trim();
     const headers = { "Content-Type": "application/json" };
     if (this.authToken)
       headers.Authorization = `Bearer ${this.authToken}`;
     const normalizedHeadSha = normalizeReviewFixHeadSha(args.pr.head.sha) || "unknown";
-    const feedbackKey = `review_agent:pr:${args.pr.number}:head:${normalizedHeadSha}:verdict:${normalizedVerdict}`;
+    const feedbackKey = String(args.feedbackKey ?? "").trim().slice(0, 512) || `review_agent:pr:${args.pr.number}:head:${normalizedHeadSha}:verdict:${normalizedVerdict}`;
     const comments = (Array.isArray(args.comments) ? args.comments : []).slice(0, MAX_AUTONOMY_FEEDBACK_COMMENTS).map((comment) => ({
       body: truncateText(normalizeCommentBody(comment.body), MAX_AUTONOMY_FEEDBACK_COMMENT_CHARS),
       userLogin: String(comment.userLogin ?? "").trim(),
@@ -5141,25 +8043,54 @@ ${raw.slice(0, 500)}`);
       prNumber: args.pr.number,
       prUrl: args.pr.html_url,
       verdict: normalizedVerdict,
+      providerStateAt: providerStateAt || undefined,
       reviewScore: Number.isFinite(args.reviewScore) ? args.reviewScore : undefined,
       reviewThreshold: this.config.passThreshold,
       summary: summarizeFeedbackText(args.verdictSummary || args.pr.title || normalizedVerdict),
       commentCount: comments.length,
       comments
     };
-    try {
-      const response = await this.deps.fetchImpl(`${this.serverUrl}/autonomy/pr-feedback`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to post autonomy PR feedback for PR #${args.pr.number}: HTTP ${response.status}${text ? `: ${text}` : ""}`);
+    let lastFailure = "feedback acknowledgement missing";
+    let attemptsMade = 0;
+    for (let attempt = 1;attempt <= AUTONOMY_FEEDBACK_MAX_ATTEMPTS; attempt += 1) {
+      attemptsMade = attempt;
+      const retryDelayMs = AUTONOMY_FEEDBACK_RETRY_DELAYS_MS[attempt - 1] ?? 0;
+      if (retryDelayMs > 0)
+        await this.deps.sleep(retryDelayMs);
+      let retryable = true;
+      try {
+        const response = await this.deps.feedbackFetchImpl(`${this.serverUrl}/autonomy/pr-feedback`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload)
+        });
+        const responseText = await response.text().catch(() => "");
+        if (response.ok) {
+          let acknowledgement = null;
+          try {
+            const parsed = responseText ? JSON.parse(responseText) : null;
+            acknowledgement = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+          } catch {
+            acknowledgement = null;
+          }
+          if (acknowledgement?.ok === true && (acknowledgement.ignored !== true || acknowledgement.acknowledged === true)) {
+            return true;
+          }
+          lastFailure = acknowledgement?.ignored === true ? "server returned ignored=true" : "server response did not contain a positive acknowledgement";
+          if (acknowledgement?.ignored === true)
+            retryable = false;
+        } else {
+          lastFailure = `HTTP ${response.status}${responseText ? `: ${responseText}` : ""}`;
+          retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+        }
+      } catch (err) {
+        lastFailure = String(err?.message ?? err);
       }
-    } catch (err) {
-      this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to post autonomy PR feedback for PR #${args.pr.number}: ${err?.message ?? err}`);
+      if (!retryable || attempt >= AUTONOMY_FEEDBACK_MAX_ATTEMPTS)
+        break;
     }
+    this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to post acknowledged autonomy PR feedback for PR #${args.pr.number} after ${attemptsMade} bounded attempt(s): ${lastFailure}`);
+    return false;
   }
   async enqueueFixJob(pr, verdict, sessionId, jobId, diff, excludedBodies = [], prefetchedComments) {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
@@ -5170,8 +8101,8 @@ ${raw.slice(0, 500)}`);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const changedPaths = deriveReviewTaskTargetPathsFromDiff(diff);
     const likelyDirs = deriveReviewTaskLikelyDirs(changedPaths);
-    const validationSteps2 = deriveReviewTaskValidationSteps(changedPaths);
-    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
+    const validationSteps2 = deriveReviewTaskValidationSteps(changedPaths, this.deps.validationRepoRoot());
+    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref, this.headPrefix);
     const feedbackContext = await this.getRecentFeedbackContext(pr, excludedBodies, prefetchedComments);
     const feedbackHighlights = feedbackContext.filter((line) => line.trim().startsWith("- ")).map((line) => line.trim().replace(/^- /, "")).slice(0, 4);
     const plannerWorkerInstruction = buildReviewFixPlannerWorkerInstruction({
@@ -5233,6 +8164,7 @@ ${raw.slice(0, 500)}`);
         },
         completionBranch: prHeadRef ?? undefined,
         reviewAgent: {
+          branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
@@ -5302,8 +8234,8 @@ ${raw.slice(0, 500)}`);
     const writeGlobs = deriveFixWriteGlobsFromDiff(diff);
     const changedPaths = deriveReviewTaskTargetPathsFromDiff(diff);
     const likelyDirs = deriveReviewTaskLikelyDirs(changedPaths);
-    const validationSteps2 = deriveReviewTaskValidationSteps(changedPaths);
-    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref);
+    const validationSteps2 = deriveReviewTaskValidationSteps(changedPaths, this.deps.validationRepoRoot());
+    const prHeadRef = normalizeReviewPrHeadRef(pr.head.ref, this.headPrefix);
     const mergeErrorSummary = truncateText(collapseWhitespace(String(mergeError?.message ?? mergeError ?? "")), 360);
     const plannerWorkerInstruction = buildMergeConflictPlannerWorkerInstruction({
       prNumber: pr.number,
@@ -5364,6 +8296,7 @@ ${raw.slice(0, 500)}`);
         },
         completionBranch: prHeadRef ?? undefined,
         reviewAgent: {
+          branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
@@ -5566,6 +8499,50 @@ function reviewApplyFailureBlocksPublication(input) {
 }
 
 // apps/source_control_manager/src/runtime_helpers.ts
+function buildReviewAgentRuntimeFingerprint(params) {
+  return JSON.stringify({
+    serverUrl: params.serverUrl,
+    remoteUrl: params.remoteUrl,
+    prBaseBranch: params.prBaseBranch,
+    branchPrefix: params.branchPrefix,
+    pollIntervalMs: params.reviewAgent.pollIntervalMs,
+    gitProviderToken: params.gitProviderToken,
+    serverAuthToken: params.serverAuthToken ?? ""
+  });
+}
+function createBlockedReviewProviderHealth(reason) {
+  return {
+    status: "degraded",
+    inFlight: false,
+    pollAgeMs: 0,
+    stalled: false,
+    lastPollStartedAt: null,
+    lastPollCompletedAt: null,
+    lastSuccessfulPollAt: null,
+    consecutiveFailedPolls: 1,
+    failureEvents: 1,
+    lastError: String(reason || "review provider reconciliation is blocked").slice(0, 600),
+    persistedLinkRetryCount: 0,
+    persistedLinkCursor: null
+  };
+}
+function withReviewProviderHealth(snapshot, reviewProvider) {
+  const providerStalled = reviewProvider?.stalled === true;
+  const degradedComponents = new Set(snapshot.degradedComponents ?? []);
+  if (reviewProvider && (reviewProvider.status === "degraded" || reviewProvider.status === "stalled" || reviewProvider.consecutiveFailedPolls > 0)) {
+    degradedComponents.add("review_provider");
+  } else {
+    degradedComponents.delete("review_provider");
+  }
+  return {
+    ...snapshot,
+    healthy: snapshot.healthy && !providerStalled,
+    status: snapshot.healthy && providerStalled ? "unhealthy" : snapshot.status,
+    reason: snapshot.reason ?? (providerStalled ? `review_provider_reconciliation_stalled_${reviewProvider.pollAgeMs}ms` : null),
+    reviewProvider: reviewProvider ? { ...reviewProvider } : null,
+    degradedComponents: [...degradedComponents]
+  };
+}
 function createSourceControlManagerHealthTracker(options) {
   const now = options.now ?? Date.now;
   const startedAtMs = now();
@@ -5627,7 +8604,8 @@ function createSourceControlManagerHealthTracker(options) {
         activeTick,
         activeCompletionId,
         phase,
-        publication: publication ? { ...publication } : null
+        publication: publication ? { ...publication } : null,
+        reviewProvider: null
       };
     }
   };
@@ -5673,7 +8651,7 @@ function createStartupStatusTracker(initialPhase = "startup") {
     }
   };
 }
-function isRecord(value) {
+function isRecord2(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function normalizePresenceToken(value) {
@@ -5685,12 +8663,12 @@ function isRemoteBuddyClientRow(row) {
   return clientId.includes("remotebuddy") || label.includes("remotebuddy");
 }
 function getStatusClientRows(statusPayload) {
-  if (!isRecord(statusPayload))
+  if (!isRecord2(statusPayload))
     return [];
   const clients = statusPayload.clients;
-  if (!isRecord(clients) || !Array.isArray(clients.items))
+  if (!isRecord2(clients) || !Array.isArray(clients.items))
     return [];
-  return clients.items.filter((row) => isRecord(row));
+  return clients.items.filter((row) => isRecord2(row));
 }
 function getFiniteNonNegativeNumber(value) {
   const numberValue = Number(value);
@@ -5699,7 +8677,7 @@ function getFiniteNonNegativeNumber(value) {
   return numberValue;
 }
 function getWorkerCapacity(statusPayload) {
-  if (!isRecord(statusPayload) || !isRecord(statusPayload.workers)) {
+  if (!isRecord2(statusPayload) || !isRecord2(statusPayload.workers)) {
     return { online: null, idle: null };
   }
   return {
@@ -5708,7 +8686,7 @@ function getWorkerCapacity(statusPayload) {
   };
 }
 function summarizeReviewAgentRuntimeReadiness(statusPayload, sessionId) {
-  if (!isRecord(statusPayload) || statusPayload.ok !== true) {
+  if (!isRecord2(statusPayload) || statusPayload.ok !== true) {
     return { ready: false, detail: "server /system/status is not healthy" };
   }
   const expectedSessionId = sessionId.trim();
@@ -5798,7 +8776,8 @@ function createStatusServer(db, port, healthProvider = () => ({
   activeTick: false,
   activeCompletionId: null,
   phase: "unknown",
-  publication: null
+  publication: null,
+  reviewProvider: null
 })) {
   return Bun.serve({
     port,
@@ -5860,13 +8839,13 @@ function createStatusServer(db, port, healthProvider = () => ({
 }
 
 // apps/source_control_manager/src/runtime_paths.ts
-import { resolve as resolve6 } from "path";
+import { resolve as resolve7 } from "path";
 function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = process.cwd()) {
   const configuredRoot = String(projectRoot ?? "").trim();
   if (configuredRoot) {
-    return resolve6(configuredRoot);
+    return resolve7(configuredRoot);
   }
-  return resolve6(fallbackCwd);
+  return resolve7(fallbackCwd);
 }
 
 // apps/source_control_manager/src/completion_callback.ts
@@ -5925,15 +8904,15 @@ async function postCompletionCallbackWithRetry(options) {
 var postCompletionProcessedWithRetry = postCompletionCallbackWithRetry;
 
 // apps/source_control_manager/src/completion_gc.ts
-import { createHash, randomUUID } from "crypto";
+import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
 import {
-  closeSync,
-  existsSync as existsSync5,
+  closeSync as closeSync2,
+  existsSync as existsSync6,
   fsyncSync,
   mkdirSync as mkdirSync2,
-  openSync,
+  openSync as openSync2,
   readFileSync as readFileSync6,
-  readdirSync,
+  readdirSync as readdirSync2,
   renameSync,
   unlinkSync as unlinkSync2,
   writeFileSync as writeFileSync2
@@ -5947,7 +8926,7 @@ var SAFE_PUSHPALS_REF_RE = /^refs\/pushpals\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 var SAFE_VALIDATION_REF_RE = /^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/(?:baseline|candidate|validated)$/i;
 var MAX_ADDITIONAL_VALIDATION_REFS = 24;
 function validationNamespace(completionId) {
-  const key = createHash("sha256").update(completionId).digest("hex").slice(0, 32);
+  const key = createHash2("sha256").update(completionId).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function isSafePushpalsRef(value) {
@@ -6066,37 +9045,37 @@ class CompletionGcJournal {
     mkdirSync2(this.directory, { recursive: true });
   }
   pathFor(record) {
-    const key = createHash("sha256").update(record.completionId).digest("hex").slice(0, 32);
+    const key = createHash2("sha256").update(record.completionId).digest("hex").slice(0, 32);
     return join5(this.directory, `${key}-${record.claimGeneration}.json`);
   }
   enqueue(input) {
     const record = normalizeRecord(input);
     const destination = this.pathFor(record);
-    if (existsSync5(destination)) {
+    if (existsSync6(destination)) {
       const existing = normalizeRecord(JSON.parse(readFileSync6(destination, "utf8")));
       if (!sameRecord(existing, record)) {
         throw new Error(`Completion GC record ${record.completionId}/${record.claimGeneration} conflicts with an existing durable record.`);
       }
       return existing;
     }
-    const temporary = `${destination}.tmp-${process.pid}-${randomUUID()}`;
+    const temporary = `${destination}.tmp-${process.pid}-${randomUUID2()}`;
     let fd = null;
     try {
-      fd = openSync(temporary, "wx", 384);
+      fd = openSync2(temporary, "wx", 384);
       writeFileSync2(fd, `${JSON.stringify(record)}
 `, "utf8");
       fsyncSync(fd);
-      closeSync(fd);
+      closeSync2(fd);
       fd = null;
       renameSync(temporary, destination);
       return record;
     } catch (error) {
       if (fd !== null)
-        closeSync(fd);
+        closeSync2(fd);
       try {
         unlinkSync2(temporary);
       } catch {}
-      if (existsSync5(destination)) {
+      if (existsSync6(destination)) {
         const existing = normalizeRecord(JSON.parse(readFileSync6(destination, "utf8")));
         if (sameRecord(existing, record))
           return existing;
@@ -6107,7 +9086,7 @@ class CompletionGcJournal {
   list(limit = 4, onWarning = () => {
     return;
   }) {
-    const names = readdirSync(this.directory).filter((name) => /^[0-9a-f]{32}-[1-9][0-9]*\.json$/i.test(name)).sort((a, b) => a.localeCompare(b));
+    const names = readdirSync2(this.directory).filter((name) => /^[0-9a-f]{32}-[1-9][0-9]*\.json$/i.test(name)).sort((a, b) => a.localeCompare(b));
     if (names.length === 0) {
       this.cursor = 0;
       return [];
@@ -6454,9 +9433,9 @@ async function isValidationCheckpointPublished(options) {
 }
 
 // apps/source_control_manager/src/trusted_validation.ts
-import { createHash as createHash2 } from "crypto";
-import { existsSync as existsSync6, readFileSync as readFileSync7, writeFileSync as writeFileSync3 } from "fs";
-import { basename as basename2, resolve as resolve7 } from "path";
+import { createHash as createHash3 } from "crypto";
+import { existsSync as existsSync7, readFileSync as readFileSync7, writeFileSync as writeFileSync3 } from "fs";
+import { basename as basename3, resolve as resolve8 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60000;
 var PROCESS_STREAM_DRAIN_GRACE_MS = 2000;
 var PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
@@ -6497,7 +9476,7 @@ function currentBunExecutable(explicit) {
   if (configured)
     return configured;
   const execPath = String(process.execPath ?? "").trim();
-  return /^(?:bun|bun\.exe)$/i.test(basename2(execPath)) ? execPath : "";
+  return /^(?:bun|bun\.exe)$/i.test(basename3(execPath)) ? execPath : "";
 }
 function resolveTrustedValidationArgv(argv, bunExecutable) {
   if (argv.length === 0)
@@ -6515,7 +9494,7 @@ function resolveTrustedValidationArgv(argv, bunExecutable) {
   return [...argv];
 }
 function resolveTrustedValidationPreparationArgv(options) {
-  const hasBunProject = existsSync6(`${options.repoPath}/package.json`) && (existsSync6(`${options.repoPath}/bun.lock`) || existsSync6(`${options.repoPath}/bun.lockb`));
+  const hasBunProject = existsSync7(`${options.repoPath}/package.json`) && (existsSync7(`${options.repoPath}/bun.lock`) || existsSync7(`${options.repoPath}/bun.lockb`));
   const needsDependencies = options.commandArgv.some((argv) => BUN_DEPENDENCY_COMMANDS.has(String(argv[0] ?? "").trim().toLowerCase()));
   if (!hasBunProject || !needsDependencies)
     return null;
@@ -6523,14 +9502,14 @@ function resolveTrustedValidationPreparationArgv(options) {
   return [bun || "bun", "install", "--frozen-lockfile"];
 }
 function trustedValidationInstallFingerprint(options) {
-  const packagePath = resolve7(options.repoPath, "package.json");
+  const packagePath = resolve8(options.repoPath, "package.json");
   const lockPath = [
-    resolve7(options.repoPath, "bun.lock"),
-    resolve7(options.repoPath, "bun.lockb")
-  ].find((path) => existsSync6(path));
-  if (!existsSync6(packagePath) || !lockPath)
+    resolve8(options.repoPath, "bun.lock"),
+    resolve8(options.repoPath, "bun.lockb")
+  ].find((path) => existsSync7(path));
+  if (!existsSync7(packagePath) || !lockPath)
     return null;
-  const hash = createHash2("sha256");
+  const hash = createHash3("sha256");
   hash.update(`platform=${process.platform}-${process.arch}
 `);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}
@@ -6543,7 +9522,7 @@ function trustedValidationInstallFingerprint(options) {
   return hash.digest("hex");
 }
 function trustedInstallMarkerPath(repoPath) {
-  return resolve7(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
+  return resolve8(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
 }
 function hasFreshTrustedValidationInstall(options) {
   const fingerprint = trustedValidationInstallFingerprint(options);
@@ -6573,7 +9552,7 @@ async function ensureTrustedValidationInstall(options) {
       phase: "dependency_install"
     };
   }
-  const flightKey = resolve7(options.repoPath);
+  const flightKey = resolve8(options.repoPath);
   const activeFlight = trustedInstallFlights.get(flightKey);
   if (activeFlight)
     return await activeFlight;
@@ -6793,7 +9772,7 @@ function isTransientTrustedValidationFailure(result) {
 }
 
 // apps/source_control_manager/src/validation_repair_publication.ts
-import { createHash as createHash3 } from "crypto";
+import { createHash as createHash4 } from "crypto";
 var SHA_RE3 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 var MAX_REPAIR_CHAIN_COMMITS = 32;
 function normalizeSha3(value) {
@@ -6801,7 +9780,7 @@ function normalizeSha3(value) {
   return SHA_RE3.test(normalized) ? normalized : "";
 }
 function validationCheckpointNamespace(completionId) {
-  const key = createHash3("sha256").update(String(completionId)).digest("hex").slice(0, 32);
+  const key = createHash4("sha256").update(String(completionId)).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function validationCheckpointRefs(completionId, claimGeneration) {
@@ -7177,7 +10156,7 @@ ${dirty}`, dirty);
 }
 
 // apps/source_control_manager/src/config.ts
-import { resolve as resolve8 } from "path";
+import { resolve as resolve9 } from "path";
 function buildDefaults(options = {}) {
   const pushConfig = loadPushPalsConfig({ reload: options.reload });
   const defaultLocalServer = resolveLocalServerConnection({
@@ -7186,7 +10165,7 @@ function buildDefaults(options = {}) {
     fallbackPort: pushConfig.server.port
   });
   return {
-    repoPath: resolve8(pushConfig.sourceControlManager.repoPath),
+    repoPath: resolve9(pushConfig.sourceControlManager.repoPath),
     serverUrl: defaultLocalServer.serverUrl,
     remote: pushConfig.sourceControlManager.remote,
     mainBranch: pushConfig.sourceControlManager.mainBranch,
@@ -7194,7 +10173,7 @@ function buildDefaults(options = {}) {
     branchPrefix: pushConfig.sourceControlManager.branchPrefix,
     pollIntervalSeconds: pushConfig.sourceControlManager.pollIntervalSeconds,
     checks: pushConfig.sourceControlManager.checks.map((check) => ({ ...check })),
-    stateDir: resolve8(pushConfig.sourceControlManager.stateDir),
+    stateDir: resolve9(pushConfig.sourceControlManager.stateDir),
     port: pushConfig.sourceControlManager.port,
     deleteAfterMerge: pushConfig.sourceControlManager.deleteAfterMerge,
     maxAttempts: pushConfig.sourceControlManager.maxAttempts,
@@ -7285,7 +10264,7 @@ function validateConfig(config) {
 // apps/source_control_manager/src/source_control_manager_main.ts
 var PUSH_CONFIG = loadPushPalsConfig();
 var repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
-var defaultSourceControlManagerRepoPath = resolve9(PUSH_CONFIG.sourceControlManager.repoPath);
+var defaultSourceControlManagerRepoPath = resolve10(PUSH_CONFIG.sourceControlManager.repoPath);
 var COMPLETION_LEASE_MS = 3 * 60000;
 var COMPLETION_LEASE_HEARTBEAT_MS = 30000;
 var PUBLICATION_HEALTH_POLL_MS = 1e4;
@@ -7343,7 +10322,7 @@ if (typeof args.config === "string" && args.config.trim()) {
 var config = loadConfig();
 var cliOverrides = {};
 if (typeof args.repo === "string")
-  cliOverrides.repoPath = resolve9(args.repo);
+  cliOverrides.repoPath = resolve10(args.repo);
 if (typeof args.server === "string")
   cliOverrides.serverUrl = args.server;
 if (typeof args.port === "string") {
@@ -7371,14 +10350,14 @@ if (typeof args.interval === "string") {
   }
 }
 if (typeof args["state-dir"] === "string")
-  cliOverrides.stateDir = resolve9(args["state-dir"]);
+  cliOverrides.stateDir = resolve10(args["state-dir"]);
 if (args["delete-after-merge"])
   cliOverrides.deleteAfterMerge = true;
 config = applyCliOverrides(config, cliOverrides);
-config.repoPath = resolve9(config.repoPath);
+config.repoPath = resolve10(config.repoPath);
 var integrationBaseBranch = config.integrationBaseBranch;
 var integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
-var usingDefaultRepoPath = resolve9(config.repoPath) === resolve9(defaultSourceControlManagerRepoPath);
+var usingDefaultRepoPath = resolve10(config.repoPath) === resolve10(defaultSourceControlManagerRepoPath);
 try {
   validateConfig(config);
 } catch (err) {
@@ -7417,13 +10396,25 @@ console.log(`[${ts2()}] Lock acquired`);
 var dbPath = join6(config.stateDir, "merge_queue.db");
 var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
-var sourceControlManagerPusherId = `source_control_manager-${createHash4("sha256").update(`${config.repoPath}
+var sourceControlManagerPusherId = `source_control_manager-${createHash5("sha256").update(`${config.repoPath}
 ${config.mainBranch}
-${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID2().slice(0, 8)}`;
+${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID3().slice(0, 8)}`;
+var repositoryServices = createRepositoryAgentServiceClients({
+  serverUrl: config.serverUrl,
+  callerService: "source_control_manager",
+  callerInstanceId: sourceControlManagerPusherId,
+  authToken: config.authToken
+});
 var healthTracker = createSourceControlManagerHealthTracker({
   tickStallMs: SCM_TICK_STALL_MS,
   idleBacklogGraceMs: Math.max(30000, config.pollIntervalSeconds * 3000)
 });
+var reviewAgentInstance = null;
+var blockedReviewProviderHealth = null;
+function sourceControlManagerHealthSnapshot() {
+  const reviewProvider = reviewAgentInstance?.getProviderHealthSnapshot() ?? blockedReviewProviderHealth;
+  return withReviewProviderHealth(healthTracker.snapshot(), reviewProvider);
+}
 var recovered = db.recoverStuckJobs();
 if (recovered > 0) {
   console.log(`[${ts2()}] Recovered ${recovered} stuck running job(s) -> queued`);
@@ -7432,7 +10423,7 @@ var gitOps = createSourceControlApi(config);
 var completionGcJournal = new CompletionGcJournal(config.stateDir);
 var server;
 try {
-  server = createStatusServer(db, config.port, healthTracker.snapshot);
+  server = createStatusServer(db, config.port, sourceControlManagerHealthSnapshot);
   console.log(`[${ts2()}] Status server listening on http://127.0.0.1:${config.port}`);
 } catch (err) {
   const code = err instanceof Error && "code" in err ? err.code : undefined;
@@ -7449,12 +10440,14 @@ var publicationHealthTimer = null;
 var publicationHealthProbeInFlight = false;
 var reviewAgentPollTimer = null;
 var reviewAgentConfigPollTimer = null;
-var reviewAgentInstance = null;
 var statusSessionReady = false;
 var shutdownPromise = null;
 var startupStatusTracker = createStartupStatusTracker();
 var reviewAgentRuntimeStateKey = "startup";
 var reviewAgentRuntimeFingerprint = "";
+var reviewAgentProviderRetryKey = "";
+var reviewAgentProviderRetryAfterMs = 0;
+var reviewAgentProviderTokenCache = null;
 async function refreshPublicationHealth() {
   if (publicationHealthProbeInFlight)
     return;
@@ -7491,60 +10484,103 @@ var integrationMaintenanceRunner = new IntegrationMaintenanceRunner({
   intervalMs: integrationMaintenanceIntervalMs
 });
 var reviewAgentConfigPollMs = 3000;
+var reviewAgentProviderRetryBackoffMs = 30000;
+var reviewAgentProviderTokenCacheMs = 5 * 60000;
 var syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(async () => {
   const latestConfig = applyCliOverrides(loadConfig({ reload: true }), cliOverrides);
   validateConfig(latestConfig);
   config.reviewAgent = { ...latestConfig.reviewAgent };
   config.prBaseBranch = latestConfig.prBaseBranch;
   config.gitToken = latestConfig.gitToken;
-  if (!config.reviewAgent.enabled) {
-    clearReviewAgentPollLoop();
-    logReviewAgentRuntimeState("disabled", `[${ts2()}] ReviewAgent disabled via runtime config (source_control_manager.review_agent.enabled=false).`);
-    return;
-  }
-  const runtimeReadiness = await probeReviewAgentRuntimeReadiness({
-    serverUrl: config.serverUrl,
-    sessionId: statusSessionId,
-    authToken: config.authToken,
-    timeoutMs: 2500
-  });
-  if (!runtimeReadiness.ready) {
-    clearReviewAgentPollLoop();
-    logReviewAgentRuntimeState(`blocked:runtime_not_ready:${runtimeReadiness.detail}`, `[${ts2()}] ReviewAgent waiting for embedded runtime readiness before polling PRs (${runtimeReadiness.detail}).`, "warn");
-    return;
-  }
+  let aiReviewRuntimeReady = false;
+  let aiReviewRuntimeDetail = "AI review is disabled";
   const remoteUrlResult = await runGitCapture(["-C", config.repoPath, "remote", "get-url", config.remote], repoRoot);
   const remoteUrl = remoteUrlResult.ok ? remoteUrlResult.stdout.trim() : "";
   if (!remoteUrl) {
-    clearReviewAgentPollLoop();
-    logReviewAgentRuntimeState("blocked:missing_remote", `[${ts2()}] ReviewAgent enabled but could not resolve remote URL; waiting for runtime config or git remote changes before starting.`, "warn");
+    blockedReviewProviderHealth = createBlockedReviewProviderHealth("git remote URL could not be resolved");
+    await clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState("blocked:missing_remote", `[${ts2()}] PR outcome reconciliation could not resolve remote URL; waiting for runtime config or git remote changes before starting.`, "warn");
     return;
   }
-  const gitProviderToken = await resolveGitAuthToken(remoteUrl, config.gitToken ?? "");
-  if (!gitProviderToken) {
-    clearReviewAgentPollLoop();
-    logReviewAgentRuntimeState("blocked:missing_token", `[${ts2()}] ReviewAgent enabled but no git provider token found (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN); waiting for credentials before starting.`, "warn");
+  if (!isSupportedGitHubRemoteUrl(remoteUrl)) {
+    const remoteHost = parseGitRemoteHost(remoteUrl) || "unknown host";
+    blockedReviewProviderHealth = createBlockedReviewProviderHealth(`unsupported git provider host: ${remoteHost}`);
+    await clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState(`blocked:unsupported_provider:${remoteHost}`, `[${ts2()}] PR outcome reconciliation is unavailable for provider host ${remoteHost}; the current reconciler supports GitHub remotes only.`, "warn");
     return;
+  }
+  const providerRetryKey = JSON.stringify({ remoteUrl, gitToken: config.gitToken ?? "" });
+  const providerNowMs = Date.now();
+  if (reviewAgentProviderRetryKey === providerRetryKey && providerNowMs < reviewAgentProviderRetryAfterMs && reviewAgentProviderRetryAfterMs - providerNowMs <= reviewAgentProviderRetryBackoffMs) {
+    return;
+  }
+  let gitProviderToken = reviewAgentProviderTokenCache?.key === providerRetryKey && providerNowMs < reviewAgentProviderTokenCache.expiresAtMs && reviewAgentProviderTokenCache.expiresAtMs - providerNowMs <= reviewAgentProviderTokenCacheMs ? reviewAgentProviderTokenCache.token : "";
+  let resolvedProviderTokenFresh = false;
+  if (!gitProviderToken) {
+    gitProviderToken = await resolveGitAuthToken(remoteUrl, config.gitToken ?? "");
+    resolvedProviderTokenFresh = true;
+  }
+  if (!gitProviderToken) {
+    reviewAgentProviderTokenCache = null;
+    reviewAgentProviderRetryKey = providerRetryKey;
+    reviewAgentProviderRetryAfterMs = providerNowMs + reviewAgentProviderRetryBackoffMs;
+    blockedReviewProviderHealth = createBlockedReviewProviderHealth("git provider token is unavailable");
+    await clearReviewAgentPollLoop();
+    logReviewAgentRuntimeState("blocked:missing_token", `[${ts2()}] PR outcome reconciliation has no git provider token (set PUSHPALS_GIT_TOKEN or provider token such as GITHUB_TOKEN/GH_TOKEN/GITLAB_TOKEN/GL_TOKEN); waiting for credentials before starting.`, "warn");
+    return;
+  }
+  if (resolvedProviderTokenFresh) {
+    reviewAgentProviderTokenCache = {
+      key: providerRetryKey,
+      token: gitProviderToken,
+      expiresAtMs: providerNowMs + reviewAgentProviderTokenCacheMs
+    };
+  }
+  reviewAgentProviderRetryKey = "";
+  reviewAgentProviderRetryAfterMs = 0;
+  blockedReviewProviderHealth = null;
+  if (config.reviewAgent.enabled) {
+    const runtimeReadiness = await probeReviewAgentRuntimeReadiness({
+      serverUrl: config.serverUrl,
+      sessionId: statusSessionId,
+      authToken: config.authToken,
+      timeoutMs: 2500
+    });
+    aiReviewRuntimeReady = runtimeReadiness.ready;
+    aiReviewRuntimeDetail = runtimeReadiness.detail;
   }
   const prBaseBranch = (config.prBaseBranch || integrationBaseBranch).trim();
-  const fingerprint = JSON.stringify({
+  const effectiveReviewAgentConfig = {
+    ...config.reviewAgent,
+    enabled: config.reviewAgent.enabled && aiReviewRuntimeReady
+  };
+  const fingerprint = buildReviewAgentRuntimeFingerprint({
     serverUrl: config.serverUrl,
     remoteUrl,
     prBaseBranch,
+    branchPrefix: config.branchPrefix,
     reviewAgent: config.reviewAgent,
-    gitProviderToken
+    gitProviderToken,
+    serverAuthToken: config.authToken
   });
   if (reviewAgentInstance && reviewAgentPollTimer && reviewAgentRuntimeFingerprint === fingerprint) {
+    const runtimeUpdate = reviewAgentInstance.updateRuntimeConfig(effectiveReviewAgentConfig);
+    logReviewAgentRuntimeState(`running:${fingerprint}:ai:${effectiveReviewAgentConfig.enabled ? "ready" : "waiting"}`, effectiveReviewAgentConfig.enabled ? `[${ts2()}] ReviewAgent AI review became ready without restarting provider reconciliation.` : config.reviewAgent.enabled ? `[${ts2()}] ReviewAgent AI review is waiting for embedded runtime readiness without resetting provider reconciliation state (${aiReviewRuntimeDetail}).` : `[${ts2()}] PR outcome reconciliation remains active while AI review is disabled.`);
+    if (runtimeUpdate.becameEnabled) {
+      reviewAgentInstance.poll().catch((err) => {
+        console.error(`[${ts2()}] [ReviewAgent] Readiness transition poll error: ${err?.message ?? err}`);
+      });
+    }
     return;
   }
-  clearReviewAgentPollLoop();
-  const reviewAgent = new ReviewAgent(config.reviewAgent, config.serverUrl, gitProviderToken, remoteUrl, prBaseBranch, config.authToken);
+  await clearReviewAgentPollLoop();
+  const reviewAgent = new ReviewAgent(effectiveReviewAgentConfig, config.serverUrl, gitProviderToken, remoteUrl, prBaseBranch, config.authToken, { repositoryServices }, config.branchPrefix);
   reviewAgentInstance = reviewAgent;
   reviewAgentRuntimeFingerprint = fingerprint;
   reviewAgentPollTimer = setInterval(() => reviewAgent.poll().catch((err) => {
     console.error(`[${ts2()}] [ReviewAgent] Poll error: ${err?.message ?? err}`);
   }), config.reviewAgent.pollIntervalMs);
-  logReviewAgentRuntimeState(`running:${fingerprint}`, `[${ts2()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10)`);
+  logReviewAgentRuntimeState(`running:${fingerprint}`, effectiveReviewAgentConfig.enabled ? `[${ts2()}] ReviewAgent started (poll interval: ${config.reviewAgent.pollIntervalMs}ms, pass threshold: ${config.reviewAgent.passThreshold}/10, branch prefix: ${config.branchPrefix})` : config.reviewAgent.enabled ? `[${ts2()}] PR outcome reconciler started while AI review waits for embedded runtime readiness (${aiReviewRuntimeDetail}; poll interval: ${config.reviewAgent.pollIntervalMs}ms, branch prefix: ${config.branchPrefix})` : `[${ts2()}] PR outcome reconciler started while AI review is disabled (poll interval: ${config.reviewAgent.pollIntervalMs}ms, branch prefix: ${config.branchPrefix})`);
   reviewAgent.poll().catch((err) => {
     console.error(`[${ts2()}] [ReviewAgent] Initial poll error: ${err?.message ?? err}`);
   });
@@ -7645,13 +10681,15 @@ function startStatusHeartbeat() {
     })();
   }, statusHeartbeatMs);
 }
-function clearReviewAgentPollLoop() {
+async function clearReviewAgentPollLoop() {
   if (reviewAgentPollTimer) {
     clearInterval(reviewAgentPollTimer);
     reviewAgentPollTimer = null;
   }
+  const retiringReviewAgent = reviewAgentInstance;
   reviewAgentInstance = null;
   reviewAgentRuntimeFingerprint = "";
+  await retiringReviewAgent?.stopAndDrain();
 }
 function logReviewAgentRuntimeState(key, message, level = "log") {
   if (reviewAgentRuntimeStateKey === key)
@@ -8692,7 +11730,7 @@ async function ensureDefaultSourceControlManagerWorktree() {
   const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
   if (probe.ok)
     return;
-  mkdirSync3(resolve9(config.repoPath, ".."), { recursive: true });
+  mkdirSync3(resolve10(config.repoPath, ".."), { recursive: true });
   await runGitCapture(["worktree", "prune"]);
   const seedCandidates = [
     `${config.remote}/${config.mainBranch}`,
@@ -8730,7 +11768,7 @@ ${addResult.stdout}`.toLowerCase();
   console.log(`[${ts2()}] Created default source_control_manager worktree: ${config.repoPath} (seed: ${seedRef})`);
 }
 function ensureRepoPathIsIsolatedWorktree() {
-  const rel = relative(repoRoot, config.repoPath).replace(/\\/g, "/");
+  const rel = relative2(repoRoot, config.repoPath).replace(/\\/g, "/");
   const insideRepoRoot = rel === "" || !rel.startsWith("../") && !isAbsolute3(rel);
   const insideWorktrees = rel === ".worktrees" || rel.startsWith(".worktrees/");
   if (insideRepoRoot && !insideWorktrees) {
@@ -8788,8 +11826,11 @@ async function main() {
   await emitStartupStatus();
   startStatusHeartbeat();
   startPublicationHealthPolling();
-  await syncReviewAgentRuntimeConfig();
   startReviewAgentRuntimeConfigPolling();
+  syncReviewAgentRuntimeConfig().catch((err) => {
+    const detail = err?.message ?? String(err);
+    logReviewAgentRuntimeState(`config-error:${detail}`, `[${ts2()}] Initial ReviewAgent runtime config sync failed: ${detail}`, "warn");
+  });
   for (let attempt = 1;; attempt++) {
     try {
       await tick();
@@ -8829,7 +11870,7 @@ async function shutdown() {
       clearInterval(reviewAgentConfigPollTimer);
       reviewAgentConfigPollTimer = null;
     }
-    clearReviewAgentPollLoop();
+    await clearReviewAgentPollLoop();
     createSessionComm(statusSessionId).status("source_control_manager", "shutting_down", "SourceControlManager shutting down");
     server?.stop();
     try {
@@ -8849,6 +11890,7 @@ async function shutdown() {
     } catch (err) {
       console.warn(`[${ts2()}] Shutdown temp-branch cleanup failed: ${err?.message ?? err}`);
     }
+    await repositoryServices.close();
     db.close();
     lock.release();
     console.log(`[${ts2()}] Goodbye.`);

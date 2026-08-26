@@ -4,7 +4,10 @@ import {
   extractTrustedValidationFailureEvidence,
   loadPushPalsConfig,
   normalizeTrustedValidationFingerprintLine,
+  sanitizeRepositoryAgentRequest,
+  sanitizeRepositoryAgentResult,
   type PushPalsConfig,
+  type RepositoryAgentMemoryRef,
 } from "shared";
 import {
   normalizeAutonomyComponentArea,
@@ -84,6 +87,62 @@ interface EngineSourcePrior {
   updated_at: string;
 }
 
+const REPOSITORY_AGENT_MEMORY_ROLES = new Set(["analysis_cache", "evidence_fact", "recalled_fact"]);
+const REPOSITORY_AGENT_MEMORY_FEEDBACK_PENDING_UNHEALTHY_MS = 5 * 60_000;
+const REPOSITORY_AGENT_MEMORY_FEEDBACK_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const REPOSITORY_AGENT_MEMORY_FEEDBACK_MAX_TERMINAL_ROWS = 100_000;
+const REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_BATCH = 500;
+const REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_INTERVAL_MS = 15 * 60_000;
+
+function asRepositoryAgentMemoryRefs(value: unknown): RepositoryAgentMemoryRef[] {
+  if (!Array.isArray(value)) return [];
+  const refs: RepositoryAgentMemoryRef[] = [];
+  const seen = new Set<string>();
+  for (const entry of value.slice(0, 128)) {
+    const record = asObject(entry);
+    const id = asString(record.id).slice(0, 512);
+    const namespace = asString(record.namespace).slice(0, 256);
+    const key = asString(record.key).slice(0, 512);
+    const role = asString(record.role);
+    if (!id || !namespace || !key || !REPOSITORY_AGENT_MEMORY_ROLES.has(role)) continue;
+    const identity = `${namespace}\0${key}\0${role}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    refs.push({
+      id,
+      namespace,
+      key,
+      role: role as RepositoryAgentMemoryRef["role"],
+      ...(Number.isFinite(asNumber(record.relevance, Number.NaN))
+        ? { relevance: clamp01(asNumber(record.relevance, 0)) }
+        : {}),
+      ...(asString(record.sourceRevision)
+        ? { sourceRevision: asString(record.sourceRevision).slice(0, 512) }
+        : {}),
+    });
+  }
+  return refs;
+}
+
+export type RepositoryAgentMemoryFeedbackRow = {
+  observationId: string;
+  objectiveId: string;
+  repositoryId: string;
+  repositoryAgentRequestId: string;
+  outcome: "successful" | "failed";
+  authorityKind: "provider_terminal" | "job_terminal";
+  authorityId: string;
+  weight: number;
+  memoryRefs: RepositoryAgentMemoryRef[];
+  attempts: number;
+};
+
+export type RepositoryAgentMemoryFeedbackClaim = RepositoryAgentMemoryFeedbackRow & {
+  claimToken: string;
+  claimGeneration: number;
+  leaseExpiresAt: string;
+};
+
 interface PrFeedbackSignalRow {
   verdict: string | null;
   summary: string | null;
@@ -135,6 +194,8 @@ interface PrFeedbackComment {
 
 interface OpenObjective {
   objective_id: string;
+  title: string;
+  vision_objective_id?: string | null;
   status: string;
   objective_type: string;
   component_area?: string;
@@ -278,10 +339,18 @@ const ENGINE_SOURCE_PROMOTE_MIN_SAMPLES = 5;
 const ENGINE_SOURCE_ARCHIVE_MIN_SAMPLES = 8;
 const ENGINE_SOURCE_WATCHLIST_MIN_SAMPLES = 4;
 const ENGINE_SOURCE_FRESHNESS_HALF_LIFE_DAYS = 14;
+const PROVIDER_STATE_MAX_FUTURE_SKEW_MS = 5 * 60_000;
 
 type EngineSourceCurationStatus = "candidate" | "trusted" | "watchlist" | "archived";
 
-function isNegativePrFeedbackVerdict(value: string): boolean {
+const NON_TERMINAL_NEGATIVE_PR_FEEDBACK_VERDICTS = new Set([
+  "rejected",
+  "changes_requested",
+  "merge_failed",
+  "failed",
+]);
+
+function isNegativePrFeedbackSignal(value: string): boolean {
   const text = value.toLowerCase();
   return text.includes("reject") || text.includes("merge_failed") || text.includes("failed");
 }
@@ -293,32 +362,9 @@ function deriveOutcomeFromPrFeedbackVerdict(verdict: string): {
   regressionFlag: boolean;
   terminal: boolean;
 } | null {
-  const text = verdict.toLowerCase();
-  if (
-    text.includes("approved_unmergeable") ||
-    (text.includes("approved") && (text.includes("unmergeable") || text.includes("merge_conflict")))
-  ) {
-    return null;
-  }
-  if (text.includes("rejected_comment_cap_closed") || text.includes("closed")) {
-    return {
-      success: false,
-      userAction: "rejected",
-      reopenedWithin24h: true,
-      regressionFlag: true,
-      terminal: true,
-    };
-  }
-  if (isNegativePrFeedbackVerdict(text)) {
-    return {
-      success: false,
-      userAction: "rejected",
-      reopenedWithin24h: true,
-      regressionFlag: true,
-      terminal: !text.includes("reject"),
-    };
-  }
-  if (text.includes("approved") || text.includes("merged")) {
+  const text = verdict.trim().toLowerCase();
+  if (text === "approved_unmergeable") return null;
+  if (text === "approved_merged" || text === "merged") {
     return {
       success: true,
       userAction: "accepted",
@@ -327,6 +373,30 @@ function deriveOutcomeFromPrFeedbackVerdict(verdict: string): {
       terminal: true,
     };
   }
+  if (
+    text === "closed_unmerged" ||
+    text === "rejected_comment_cap_closed" ||
+    text === "rejected_re_review_cap_closed"
+  ) {
+    return {
+      success: false,
+      userAction: "rejected",
+      reopenedWithin24h: false,
+      regressionFlag: true,
+      terminal: true,
+    };
+  }
+  if (NON_TERMINAL_NEGATIVE_PR_FEEDBACK_VERDICTS.has(text)) {
+    return {
+      success: false,
+      userAction: "rejected",
+      reopenedWithin24h: false,
+      regressionFlag: true,
+      terminal: false,
+    };
+  }
+  // Approval is a review event, not delivery. A PR-backed objective becomes
+  // successful only after the provider confirms that the PR merged.
   return null;
 }
 
@@ -457,6 +527,10 @@ export interface AutonomyEvaluatorScorecard {
   jobTimeoutRate: number | null;
   activeRuntimeMs: number;
   repeatedFailureCount: number;
+  awaitingReviewCount: number;
+  oldestAwaitingReviewAgeMs: number;
+  reviewResolvedCount: number;
+  reviewRevisionRate: number | null;
   tokenBudgetExhausted: boolean;
   runtimeBudgetExhausted: boolean;
   recommendation: "healthy" | "constrain" | "pause";
@@ -567,11 +641,27 @@ export interface SessionTokenBudgetStatus extends SessionLlmUsageSummary {
 export interface AutonomyInsights {
   patternStats: AutonomyPatternStatsInsight[];
   recentPrFeedback: AutonomyPrFeedbackInsight[];
+  portfolio: AutonomyPortfolioMetrics;
   engineSourceStats: AutonomyEngineSourceInsight[];
   trustedInspirationShortlist: AutonomyTrustedInspirationInsight[];
   archivedInspirationSources: AutonomyTrustedInspirationInsight[];
   latestEvaluatorScorecard: AutonomyEvaluatorScorecard | null;
   opsSummary: AutonomyOpsSummary;
+}
+
+export interface AutonomyPortfolioMetrics {
+  windowHours: number;
+  objectiveCount: number;
+  visionAlignedObjectiveCount: number;
+  userObservableObjectiveCount: number;
+  uniqueVisionObjectiveCount: number;
+  awaitingReviewCount: number;
+  oldestAwaitingReviewAgeMs: number;
+  resolvedObjectiveCount: number;
+  mergedObjectiveCount: number;
+  closedUnmergedObjectiveCount: number;
+  reviewRevisionCount: number;
+  firstPassMergeRate: number | null;
 }
 
 export interface AutonomyInspirationPattern {
@@ -622,6 +712,43 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string {
   return String(value ?? "").trim();
+}
+
+function normalizePrUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    parsed.hash = "";
+    parsed.search = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return trimmed.replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+function normalizeIsoTimestamp(value: unknown): string | null {
+  const text = asString(value);
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function normalizeProviderStateTimestamp(value: unknown, receiptIso: string): string {
+  const normalized = normalizeIsoTimestamp(value);
+  if (!normalized) return receiptIso;
+  const stateMs = Date.parse(normalized);
+  const receiptMs = Date.parse(receiptIso);
+  if (
+    Number.isFinite(stateMs) &&
+    Number.isFinite(receiptMs) &&
+    stateMs > receiptMs + PROVIDER_STATE_MAX_FUTURE_SKEW_MS
+  ) {
+    return receiptIso;
+  }
+  return normalized;
 }
 
 function normalizeServiceName(value: unknown): string {
@@ -687,28 +814,24 @@ function failedTestNamesFromOutput(...values: unknown[]): string[] {
 }
 
 const PUSHPALS_INTERNAL_CANDIDATE_PATTERNS: RegExp[] = [
-  /\bqueue[_-]?health\b/i,
   /\bworkerpals?\b/i,
   /\bremotebuddy\b/i,
   /\blocalbuddy\b/i,
-  /\bsource[_-]?control[_-]?manager\b/i,
-  /\bsourcecontrolmanager\b/i,
-  /\breview[_-]?agent\b/i,
-  /\breviewagent\b/i,
   /\bpushpals?\b/i,
-  /\bdispatch locks?\b/i,
-  /\bautonomy diagnostics?\b/i,
+  /\bartifact[_-]?only[_-]?no[_-]?publishable[_-]?patch\b/i,
+  /\bno[-_\s]?reviewable[-_\s]?patch\b/i,
+  /\bno[-_\s]?publishable[-_\s]?(?:patch|changes?|progress)\b/i,
+  /\bautonomy[-_\s]?internal\b/i,
 ];
 
 const PUSHPALS_OWNED_PATH_PATTERNS: RegExp[] = [
-  /^apps\/(?:workerpals|remotebuddy|localbuddy|source_control_manager|server)\b/i,
-  /^packages\/(?:cli|shared)\b/i,
-  /^prompts\/(?:workerpals|review_agent|remotebuddy|localbuddy)\b/i,
-  /^scripts\/(?:pushpals|sync-cli|build-runtime|release|replay-worker-job)/i,
+  /^apps\/(?:workerpals|remotebuddy|localbuddy)\b/i,
+  /^prompts\/(?:workerpals|remotebuddy|localbuddy)\b/i,
+  /^scripts\/(?:pushpals|sync-pushpals|build-pushpals-runtime|replay-worker-job)/i,
   /\bpushpals\b/i,
   /\bworkerpals\b/i,
   /\bremotebuddy\b/i,
-  /\bsource_control_manager\b/i,
+  /\blocalbuddy\b/i,
 ];
 
 function pushpalsInternalCandidateReason(record: Record<string, unknown>): string | null {
@@ -1621,6 +1744,7 @@ export class AutonomyStore {
   private lastEvaluatorRunAtMs = 0;
   private lastStaleObjectiveSweepAtMs = 0;
   private lastStaleObjectiveSweepAtIso: string | null = null;
+  private lastRepositoryAgentMemoryFeedbackPruneAtMs = 0;
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -1697,6 +1821,7 @@ export class AutonomyStore {
         policy_version TEXT,
         impact_model_version TEXT,
         dispatched_at TEXT,
+        awaiting_review_since TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -1826,6 +1951,7 @@ export class AutonomyStore {
         pattern_key TEXT NOT NULL,
         pr_number INTEGER,
         pr_url TEXT,
+        pr_url_normalized TEXT,
         verdict TEXT NOT NULL,
         review_score REAL,
         review_threshold REAL,
@@ -1844,6 +1970,19 @@ export class AutonomyStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_key
         ON autonomy_pr_feedback(feedback_key)
         WHERE feedback_key IS NOT NULL AND feedback_key <> '';
+      CREATE TABLE IF NOT EXISTS pr_provider_outcomes (
+        normalizedPrUrl TEXT PRIMARY KEY,
+        prUrl           TEXT NOT NULL,
+        jobId           TEXT,
+        verdict         TEXT NOT NULL,
+        terminal        INTEGER NOT NULL DEFAULT 0,
+        merged          INTEGER NOT NULL DEFAULT 0,
+        providerStateAt TEXT NOT NULL,
+        createdAt       TEXT NOT NULL,
+        updatedAt       TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_provider_outcomes_terminal_updated
+        ON pr_provider_outcomes(terminal, updatedAt DESC);
       CREATE TABLE IF NOT EXISTS questions_queue (
         id TEXT PRIMARY KEY,
         objective_id TEXT NOT NULL,
@@ -1936,6 +2075,35 @@ export class AutonomyStore {
         token_usage_json TEXT,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS autonomy_repository_agent_memory_links (
+        objective_id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL,
+        repository_agent_request_id TEXT NOT NULL,
+        memory_refs_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS autonomy_repository_agent_memory_feedback (
+        observation_id TEXT PRIMARY KEY,
+        objective_id TEXT NOT NULL,
+        repository_id TEXT NOT NULL,
+        repository_agent_request_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        authority_kind TEXT NOT NULL,
+        authority_id TEXT NOT NULL,
+        weight REAL NOT NULL DEFAULT 1,
+        memory_refs_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        claim_token TEXT,
+        claim_generation INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at TEXT,
+        claimed_at TEXT,
+        next_attempt_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        applied_at TEXT
+      );
       CREATE TABLE IF NOT EXISTS llm_usage_events (
         id TEXT PRIMARY KEY,
         service TEXT NOT NULL,
@@ -1963,11 +2131,26 @@ export class AutonomyStore {
         updated_at TEXT NOT NULL
       );
     `);
+    const tableHasColumn = (table: string, column: string): boolean => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
+        throw new TypeError(`Unsafe migration table name: ${table}`);
+      }
+      return (
+        this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      ).some((entry) => entry.name === column);
+    };
     const ensureColumn = (table: string, columnSql: string): void => {
+      const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:\s|$)/.exec(columnSql.trim());
+      if (!match) throw new TypeError(`Invalid migration column declaration: ${columnSql}`);
+      const column = match[1]!;
+      if (tableHasColumn(table, column)) return;
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnSql}`);
-      } catch {
-        // no-op when column already exists
+      } catch (error) {
+        // A concurrently starting peer may have completed the same additive
+        // migration after our schema read. Suppress only that verified race.
+        if (tableHasColumn(table, column)) return;
+        throw error;
       }
     };
     ensureColumn("autonomy_engine_idea_trials", "inspiration_source_key TEXT");
@@ -1985,7 +2168,29 @@ export class AutonomyStore {
     ensureColumn("autonomy_engine_source_stats", "last_reinforced_at TEXT");
     ensureColumn("questions_queue", "closed_reason TEXT");
     ensureColumn("autonomy_objectives", "incident_key TEXT");
+    ensureColumn("autonomy_objectives", "awaiting_review_since TEXT");
     ensureColumn("autonomy_outcomes", "terminal INTEGER NOT NULL DEFAULT 1");
+    ensureColumn("autonomy_pr_feedback", "pr_url_normalized TEXT");
+    ensureColumn("pr_provider_outcomes", "providerStateAt TEXT");
+    ensureColumn(
+      "autonomy_repository_agent_memory_feedback",
+      "weight REAL NOT NULL DEFAULT 1",
+    );
+    ensureColumn("autonomy_repository_agent_memory_feedback", "claim_token TEXT");
+    ensureColumn(
+      "autonomy_repository_agent_memory_feedback",
+      "claim_generation INTEGER NOT NULL DEFAULT 0",
+    );
+    ensureColumn("autonomy_repository_agent_memory_feedback", "lease_expires_at TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "claimed_at TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "next_attempt_at TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "last_error TEXT");
+    ensureColumn("autonomy_repository_agent_memory_feedback", "applied_at TEXT");
+    this.db.exec(`
+      UPDATE pr_provider_outcomes
+      SET providerStateAt = COALESCE(providerStateAt, updatedAt, createdAt)
+      WHERE providerStateAt IS NULL OR TRIM(providerStateAt) = '';
+    `);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_autonomy_engine_trials_source
         ON autonomy_engine_idea_trials(inspiration_source_key, created_at DESC);
@@ -1993,8 +2198,52 @@ export class AutonomyStore {
         ON autonomy_objectives(incident_key, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_autonomy_outcomes_terminal_created
         ON autonomy_outcomes(terminal, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_outcomes_objective_terminal_id
+        ON autonomy_outcomes(objective_id, terminal, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_pending
+        ON autonomy_repository_agent_memory_feedback(status, next_attempt_at, created_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_lease
+        ON autonomy_repository_agent_memory_feedback(status, lease_expires_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_status_created
+        ON autonomy_repository_agent_memory_feedback(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_feedback_objective_created
+        ON autonomy_repository_agent_memory_feedback(objective_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_repository_agent_memory_links_updated
+        ON autonomy_repository_agent_memory_links(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_objectives_source_status_updated
+        ON autonomy_objectives(source, status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_objectives_job_updated
+        ON autonomy_objectives(job_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_objectives_request_updated
+        ON autonomy_objectives(request_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_normalized_url
+        ON autonomy_pr_feedback(pr_url_normalized, created_at DESC);
     `);
     const now = asIsoNow();
+    this.db.exec(`
+      UPDATE autonomy_objectives
+      SET awaiting_review_since = COALESCE(awaiting_review_since, updated_at)
+      WHERE status = 'awaiting_review';
+    `);
+    const legacyFeedbackUrls = this.db
+      .prepare(
+        `SELECT id, pr_url AS prUrl
+         FROM autonomy_pr_feedback
+         WHERE pr_url IS NOT NULL
+           AND TRIM(pr_url) <> ''
+           AND (pr_url_normalized IS NULL OR TRIM(pr_url_normalized) = '')`,
+      )
+      .all() as Array<{ id: number; prUrl: string }>;
+    if (legacyFeedbackUrls.length > 0) {
+      const updateFeedbackUrl = this.db.prepare(
+        `UPDATE autonomy_pr_feedback SET pr_url_normalized = ? WHERE id = ?`,
+      );
+      this.db.transaction(() => {
+        for (const row of legacyFeedbackUrls) {
+          updateFeedbackUrl.run(normalizePrUrl(row.prUrl), row.id);
+        }
+      })();
+    }
     this.db
       .prepare(
         `INSERT OR IGNORE INTO autonomy_safety_state (
@@ -2563,6 +2812,108 @@ export class AutonomyStore {
     };
   }
 
+  private getAutonomyReviewDeliveryHealth(
+    nowIso: string,
+    windowHours: number,
+  ): {
+    awaitingReviewCount: number;
+    oldestAwaitingReviewAt: string | null;
+    oldestAwaitingReviewAgeMs: number;
+    resolvedCount: number;
+    mergedCount: number;
+    closedUnmergedCount: number;
+    revisionObjectiveCount: number;
+    revisionRate: number | null;
+  } {
+    const backlog = this.db
+      .prepare(
+        `SELECT COUNT(*) AS awaiting_count,
+                MIN(COALESCE(awaiting_review_since, updated_at)) AS oldest_awaiting_at
+         FROM autonomy_objectives
+         WHERE source = 'autonomous'
+           AND status = 'awaiting_review'`,
+      )
+      .get() as { awaiting_count: number | null; oldest_awaiting_at: string | null } | undefined;
+    const resolved = this.hasTable("jobs")
+      ? (this.db
+          .prepare(
+            `SELECT
+           COUNT(DISTINCT outcome.objective_id) AS resolved_count,
+           COUNT(DISTINCT CASE
+             WHEN outcome.success = 1 AND LOWER(COALESCE(outcome.user_action, '')) = 'accepted'
+             THEN outcome.objective_id END) AS merged_count,
+           COUNT(DISTINCT CASE
+             WHEN outcome.success = 0 THEN outcome.objective_id END) AS closed_unmerged_count
+         FROM autonomy_outcomes outcome
+         JOIN autonomy_objectives objective ON objective.id = outcome.objective_id
+         JOIN jobs job ON job.id = outcome.job_id
+         WHERE objective.source = 'autonomous'
+           AND outcome.terminal = 1
+           AND COALESCE(job.prUrl, '') != ''
+           AND datetime(outcome.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`,
+          )
+          .get(nowIso) as
+          | {
+              resolved_count: number | null;
+              merged_count: number | null;
+              closed_unmerged_count: number | null;
+            }
+          | undefined)
+      : undefined;
+    const revisions = this.hasTable("jobs")
+      ? (this.db
+          .prepare(
+            `WITH resolved AS (
+               SELECT DISTINCT outcome.objective_id
+               FROM autonomy_outcomes outcome
+               JOIN jobs job ON job.id = outcome.job_id
+               WHERE outcome.terminal = 1
+                 AND outcome.objective_id IS NOT NULL
+                 AND COALESCE(job.prUrl, '') != ''
+                 AND datetime(outcome.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')
+             )
+             SELECT COUNT(DISTINCT feedback.objective_id) AS revision_objective_count
+             FROM autonomy_pr_feedback feedback
+             JOIN resolved ON resolved.objective_id = feedback.objective_id
+             WHERE (
+               LOWER(COALESCE(feedback.verdict, '')) LIKE '%reject%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%unmergeable%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%merge_conflict%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%changes_requested%'
+               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%revision%'
+             )`,
+          )
+          .get(nowIso) as { revision_objective_count: number | null } | undefined)
+      : undefined;
+    const awaitingReviewCount = Math.max(0, Math.floor(asNumber(backlog?.awaiting_count, 0)));
+    const oldestAwaitingAtMs = Date.parse(asString(backlog?.oldest_awaiting_at));
+    const nowMs = Date.parse(nowIso);
+    const oldestAwaitingReviewAgeMs =
+      awaitingReviewCount > 0 && Number.isFinite(oldestAwaitingAtMs) && Number.isFinite(nowMs)
+        ? Math.max(0, nowMs - oldestAwaitingAtMs)
+        : 0;
+    const resolvedCount = Math.max(0, Math.floor(asNumber(resolved?.resolved_count, 0)));
+    const mergedCount = Math.max(0, Math.floor(asNumber(resolved?.merged_count, 0)));
+    const closedUnmergedCount = Math.max(
+      0,
+      Math.floor(asNumber(resolved?.closed_unmerged_count, 0)),
+    );
+    const revisionObjectiveCount = Math.max(
+      0,
+      Math.floor(asNumber(revisions?.revision_objective_count, 0)),
+    );
+    return {
+      awaitingReviewCount,
+      oldestAwaitingReviewAt: asString(backlog?.oldest_awaiting_at) || null,
+      oldestAwaitingReviewAgeMs,
+      resolvedCount,
+      mergedCount,
+      closedUnmergedCount,
+      revisionObjectiveCount,
+      revisionRate: resolvedCount > 0 ? clamp01(revisionObjectiveCount / resolvedCount) : null,
+    };
+  }
+
   private latestEvaluatorScorecard(): AutonomyEvaluatorScorecard | null {
     const row = this.db
       .prepare(
@@ -2618,6 +2969,15 @@ export class AutonomyStore {
         : null,
       activeRuntimeMs: Math.max(0, Math.floor(asNumber(payload.activeRuntimeMs, 0))),
       repeatedFailureCount: Math.max(0, Math.floor(asNumber(payload.repeatedFailureCount, 0))),
+      awaitingReviewCount: Math.max(0, Math.floor(asNumber(payload.awaitingReviewCount, 0))),
+      oldestAwaitingReviewAgeMs: Math.max(
+        0,
+        Math.floor(asNumber(payload.oldestAwaitingReviewAgeMs, 0)),
+      ),
+      reviewResolvedCount: Math.max(0, Math.floor(asNumber(payload.reviewResolvedCount, 0))),
+      reviewRevisionRate: Number.isFinite(asNumber(payload.reviewRevisionRate, Number.NaN))
+        ? clamp01(asNumber(payload.reviewRevisionRate, 0))
+        : null,
       tokenBudgetExhausted: asBoolean(payload.tokenBudgetExhausted, false),
       runtimeBudgetExhausted: asBoolean(payload.runtimeBudgetExhausted, false),
       recommendation,
@@ -2695,6 +3055,14 @@ export class AutonomyStore {
     const maxRegretRate = clamp01(asNumber(cfg.evaluatorMaxRegretRate, 0.35));
     const rawSampleCount = Math.max(0, Math.floor(asNumber(rows?.raw_sample_count, sampleCount)));
     const jobHealth = this.getAutonomyJobHealth(nowIso, windowHours);
+    const reviewHealth = this.getAutonomyReviewDeliveryHealth(nowIso, windowHours);
+    const reviewBacklogStalled =
+      reviewHealth.awaitingReviewCount >= 2 &&
+      reviewHealth.oldestAwaitingReviewAgeMs >= 6 * 60 * 60 * 1_000;
+    const reviewBacklogSeverelyStalled =
+      reviewHealth.awaitingReviewCount >= 5 &&
+      reviewHealth.oldestAwaitingReviewAgeMs >= 24 * 60 * 60 * 1_000;
+    const hasReviewEvidence = reviewHealth.resolvedCount >= minSamples;
     const reliability = this.getReliabilityMetrics(windowHours, nowIso);
     const infrastructureFailureRate =
       reliability.attemptsTotal > 0
@@ -2709,6 +3077,8 @@ export class AutonomyStore {
     let recommendation: "healthy" | "constrain" | "pause" = "healthy";
     if (resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted) {
       recommendation = "pause";
+    } else if (reviewBacklogSeverelyStalled) {
+      recommendation = "pause";
     } else if (!hasOutcomeEvidence && !hasJobEvidence) {
       recommendation = "constrain";
     } else if (
@@ -2717,7 +3087,10 @@ export class AutonomyStore {
           (typeof regretRate === "number" && regretRate > maxRegretRate))) ||
       (hasJobEvidence &&
         ((typeof infrastructureFailureRate === "number" && infrastructureFailureRate >= 0.3) ||
-          (typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.3)))
+          (typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.3))) ||
+      (hasReviewEvidence &&
+        typeof reviewHealth.revisionRate === "number" &&
+        reviewHealth.revisionRate >= Math.max(0.5, maxRegretRate))
     ) {
       recommendation = "pause";
     } else if (
@@ -2729,7 +3102,11 @@ export class AutonomyStore {
         ((typeof reliability.attemptSuccessRate === "number" &&
           reliability.attemptSuccessRate < 0.8) ||
           (typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.2))) ||
-      jobHealth.repeatedFailureCount >= 2
+      jobHealth.repeatedFailureCount >= 2 ||
+      reviewBacklogStalled ||
+      (hasReviewEvidence &&
+        typeof reviewHealth.revisionRate === "number" &&
+        reviewHealth.revisionRate > maxRegretRate * 0.8)
     ) {
       recommendation = "constrain";
     }
@@ -2745,6 +3122,12 @@ export class AutonomyStore {
         jobSuccessRate: jobHealth.successRate,
         jobTimeoutRate: jobHealth.timeoutRate,
         repeatedFailureCount: jobHealth.repeatedFailureCount,
+        awaitingReviewCount: reviewHealth.awaitingReviewCount,
+        oldestAwaitingReviewAt: reviewHealth.oldestAwaitingReviewAt,
+        reviewBacklogStalled,
+        reviewBacklogSeverelyStalled,
+        reviewResolvedCount: reviewHealth.resolvedCount,
+        reviewRevisionRate: reviewHealth.revisionRate,
         outcomeCounts: reliability.outcomeCounts,
         infrastructureFailureRate,
         latestJobTerminalAt: jobHealth.latestTerminalAt,
@@ -2781,6 +3164,13 @@ export class AutonomyStore {
       jobTimeoutRate: jobHealth.timeoutRate,
       activeRuntimeMs: jobHealth.activeRuntimeMs,
       repeatedFailureCount: jobHealth.repeatedFailureCount,
+      awaitingReviewCount: reviewHealth.awaitingReviewCount,
+      oldestAwaitingReviewAgeMs: reviewHealth.oldestAwaitingReviewAgeMs,
+      reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewMergedCount: reviewHealth.mergedCount,
+      reviewClosedUnmergedCount: reviewHealth.closedUnmergedCount,
+      reviewRevisionObjectiveCount: reviewHealth.revisionObjectiveCount,
+      reviewRevisionRate: reviewHealth.revisionRate,
       reliability,
       infrastructureFailureRate,
       tokenBudgetExhausted: resourceBudget.token_budget_exhausted,
@@ -2812,6 +3202,8 @@ export class AutonomyStore {
       recommendation === "pause" &&
       (hasOutcomeEvidence ||
         hasJobEvidence ||
+        reviewBacklogSeverelyStalled ||
+        hasReviewEvidence ||
         resourceBudget.token_budget_exhausted ||
         resourceBudget.runtime_budget_exhausted)
     ) {
@@ -2843,7 +3235,10 @@ export class AutonomyStore {
         nowIso,
       });
       this.resolveOpsAlert("evaluator_constrain", nowIso);
-    } else if (recommendation === "constrain" && (hasOutcomeEvidence || hasJobEvidence)) {
+    } else if (
+      recommendation === "constrain" &&
+      (hasOutcomeEvidence || hasJobEvidence || reviewBacklogStalled || hasReviewEvidence)
+    ) {
       this.recordOpsAlert({
         alertType: "evaluator_constrain",
         severity: "warning",
@@ -2882,6 +3277,10 @@ export class AutonomyStore {
       jobTimeoutRate: jobHealth.timeoutRate,
       activeRuntimeMs: jobHealth.activeRuntimeMs,
       repeatedFailureCount: jobHealth.repeatedFailureCount,
+      awaitingReviewCount: reviewHealth.awaitingReviewCount,
+      oldestAwaitingReviewAgeMs: reviewHealth.oldestAwaitingReviewAgeMs,
+      reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewRevisionRate: reviewHealth.revisionRate,
       tokenBudgetExhausted: resourceBudget.token_budget_exhausted,
       runtimeBudgetExhausted: resourceBudget.runtime_budget_exhausted,
       recommendation,
@@ -4190,7 +4589,7 @@ export class AutonomyStore {
     }
     if (prFeedbackRows.length > 0) {
       const negativeRows = prFeedbackRows.filter((row) =>
-        isNegativePrFeedbackVerdict(asString(row.verdict)),
+        isNegativePrFeedbackSignal(asString(row.verdict)),
       );
       if (negativeRows.length > 0) {
         const totalComments = negativeRows.reduce(
@@ -4454,7 +4853,11 @@ export class AutonomyStore {
       });
     }
 
-    const activeCount = params.openObjectives.length;
+    // Published PRs still reserve their target/pattern against duplicate work,
+    // but review latency must not consume an execution-concurrency slot.
+    const activeCount = params.openObjectives.filter(
+      (objective) => asString(objective.status).toLowerCase() !== "awaiting_review",
+    ).length;
     const concurrentLimit = Math.max(1, this.config.remotebuddy.autonomy.maxConcurrentObjectives);
     const activePressure = clamp01(activeCount / concurrentLimit);
     if (activePressure >= 1) {
@@ -5058,6 +5461,7 @@ export class AutonomyStore {
       }));
     type ObjectiveSnapshotRow = Omit<OpenObjective, "target_paths" | "scope"> & {
       scope_json: string | null;
+      evidence_json: string | null;
       job_status: string | null;
       job_failure_class: string | null;
       job_terminal_stage: string | null;
@@ -5107,16 +5511,19 @@ export class AutonomyStore {
       : "";
     const openObjectiveRows = this.db
       .prepare(
-        `SELECT o.id AS objective_id, o.status, o.objective_type, o.component_area,
+        `SELECT o.id AS objective_id, o.title, o.status, o.objective_type, o.component_area,
                 o.pattern_key, o.incident_key, o.job_id, o.scope_json, o.updated_at,
+                o.evidence_json,
                 ${objectiveJobProjection},
                 ${objectiveValidationProjection}
          FROM autonomy_objectives o
          ${objectiveJobJoins}
          ${objectiveValidationJoins}
-         WHERE o.status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
-         ORDER BY o.updated_at DESC
-         LIMIT 50`,
+         WHERE o.status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')
+         ORDER BY CASE WHEN o.status = 'awaiting_review' THEN 1 ELSE 0 END ASC,
+                  datetime(o.updated_at) DESC,
+                  o.id DESC
+         LIMIT 200`,
       )
       .all() as ObjectiveSnapshotRow[];
     const hydrateObjective = (row: ObjectiveSnapshotRow): OpenObjective => {
@@ -5150,6 +5557,10 @@ export class AutonomyStore {
           : null;
       return {
         objective_id: row.objective_id,
+        title: row.title,
+        vision_objective_id:
+          asString(asObject(parseJsonObject(row.evidence_json).portfolio).vision_objective_id) ||
+          null,
         status: row.status,
         objective_type: row.objective_type,
         component_area: row.component_area,
@@ -5171,14 +5582,15 @@ export class AutonomyStore {
     const openObjectives: OpenObjective[] = openObjectiveRows.map(hydrateObjective);
     const recentObjectiveRows = this.db
       .prepare(
-        `SELECT o.id AS objective_id, o.status, o.objective_type, o.component_area,
+        `SELECT o.id AS objective_id, o.title, o.status, o.objective_type, o.component_area,
                 o.pattern_key, o.incident_key, o.job_id, o.scope_json, o.updated_at,
+                o.evidence_json,
                 ${objectiveJobProjection},
                 ${objectiveValidationProjection}
          FROM autonomy_objectives o
          ${objectiveJobJoins}
          ${objectiveValidationJoins}
-         WHERE o.status NOT IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
+         WHERE o.status NOT IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')
            AND o.updated_at >= ?
          ORDER BY o.updated_at DESC
          LIMIT 100`,
@@ -5381,6 +5793,39 @@ export class AutonomyStore {
     );
   }
 
+  authorizesValidationIncidentRepair(params: {
+    objectiveId: string;
+    incidentId: string;
+    snapshotId?: string | null;
+  }): boolean {
+    const objectiveId = asString(params.objectiveId);
+    const incidentId = asString(params.incidentId);
+    if (!objectiveId || !incidentId) return false;
+    const row = this.db
+      .prepare(
+        `SELECT snapshot_id, evidence_json
+         FROM autonomy_objectives
+         WHERE id = ?
+           AND source = 'autonomous'
+           AND incident_key = ?
+           AND status IN ('gated','dispatched','running','blocked','needs_clarification')
+         LIMIT 1`,
+      )
+      .get(objectiveId, incidentId) as
+      | { snapshot_id: string | null; evidence_json: string | null }
+      | undefined;
+    if (!row) return false;
+    const snapshotId = asString(row.snapshot_id);
+    if (asString(params.snapshotId) && asString(params.snapshotId) !== snapshotId) return false;
+    const evidence = parseJsonObject(row.evidence_json);
+    const incidentEvidence = asObject(evidence.validation_incident ?? evidence.validationIncident);
+    const evidenceIncidentId = asString(
+      incidentEvidence.incident_id ?? incidentEvidence.incidentId,
+    );
+    if (evidenceIncidentId !== incidentId) return false;
+    return this.snapshotAuthorizesRequiredValidationRepair(snapshotId);
+  }
+
   evaluateEligibility(body: Record<string, unknown>): {
     ok: boolean;
     results?: Array<{ candidate_id: string; ok: boolean; reason?: string }>;
@@ -5413,7 +5858,7 @@ export class AutonomyStore {
       .prepare(
         `SELECT DISTINCT pattern_key AS patternKey
          FROM autonomy_objectives
-         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`,
+         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')`,
       )
       .all() as Array<{ patternKey: string }>;
     const activePatternKeys = new Set(
@@ -5423,7 +5868,7 @@ export class AutonomyStore {
       .prepare(
         `SELECT scope_json AS scopeJson
          FROM autonomy_objectives
-         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')`,
+         WHERE status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')`,
       )
       .all() as Array<{ scopeJson: string }>;
     const activeTargetPaths = activeTargetRows.flatMap((row) => {
@@ -5583,6 +6028,7 @@ export class AutonomyStore {
 
     const candidates = Array.isArray(body.candidates) ? body.candidates : [];
     const candidateEngineTrialMetaById = new Map<string, EngineTrialCandidateMeta>();
+    const candidatePortfolioMetaById = new Map<string, Record<string, unknown>>();
     for (const raw of candidates) {
       const record = asObject(raw);
       const objectiveTypeRaw = asString(record.objectiveType ?? record.objective_type);
@@ -5653,8 +6099,39 @@ export class AutonomyStore {
       if (engineTrialMeta) {
         candidateEngineTrialMetaById.set(candidateStorageId, engineTrialMeta);
       }
+      const portfolioMeta = {
+        work_kind: asString(record.work_kind ?? record.workKind) || null,
+        work_area_key: asString(record.work_area_key ?? record.workAreaKey) || null,
+        work_target_key: asString(record.work_target_key ?? record.workTargetKey) || null,
+        vision_objective_id:
+          asString(record.vision_objective_id ?? record.visionObjectiveId) || null,
+        vision_objective_weight: Number.isFinite(
+          asNumber(record.vision_objective_weight ?? record.visionObjectiveWeight, Number.NaN),
+        )
+          ? clamp01(asNumber(record.vision_objective_weight ?? record.visionObjectiveWeight, 0))
+          : null,
+        vision_priority_rank: Number.isFinite(
+          asNumber(record.vision_priority_rank ?? record.visionPriorityRank, Number.NaN),
+        )
+          ? Math.max(
+              1,
+              Math.floor(asNumber(record.vision_priority_rank ?? record.visionPriorityRank, 1)),
+            )
+          : null,
+        vision_source_bucket:
+          asString(record.vision_source_bucket ?? record.visionSourceBucket) || null,
+        vision_category: asString(record.vision_category ?? record.visionCategory) || null,
+        vision_alignment_reason:
+          asString(record.vision_alignment_reason ?? record.visionAlignmentReason) || null,
+        vision_section_refs: asStringArray(record.vision_section_refs ?? record.visionSectionRefs),
+        feature_hypotheses: asStringArray(
+          record.feature_hypotheses ?? record.featureHypotheses,
+        ).slice(0, 24),
+      };
+      candidatePortfolioMetaById.set(candidateStorageId, portfolioMeta);
       const debugRecord = {
         ...asObject(record.debug),
+        ...portfolioMeta,
         candidate_external_id: candidateExternalId,
       };
 
@@ -5803,13 +6280,22 @@ export class AutonomyStore {
       return { ok: false, objectiveId, reason: pushpalsInternalErr };
     }
 
+    const objectiveCandidateRaw = asString(objective.candidateId ?? objective.candidate_id);
+    const objectiveCandidateId = objectiveCandidateRaw
+      ? scopedCandidateStorageId(runId, objectiveCandidateRaw)
+      : null;
     const patternKey = makePatternKey(
       objectiveType,
       scopeValidation.normalizedTargetPaths,
       triggerType,
       normalizedComponentArea,
     );
-    const objectiveEvidence = asObject(objective.evidence);
+    const objectiveEvidence: Record<string, unknown> = {
+      ...asObject(objective.evidence),
+      ...(objectiveCandidateId && candidatePortfolioMetaById.has(objectiveCandidateId)
+        ? { portfolio: candidatePortfolioMetaById.get(objectiveCandidateId) }
+        : {}),
+    };
     const validationIncidentEvidence = asObject(
       objectiveEvidence.validation_incident ?? objectiveEvidence.validationIncident,
     );
@@ -5823,9 +6309,15 @@ export class AutonomyStore {
     ).slice(0, 256);
     if (
       incidentKey &&
-      ["proposed", "gated", "dispatched", "running", "blocked", "needs_clarification"].includes(
-        objectiveStatus,
-      )
+      [
+        "proposed",
+        "gated",
+        "dispatched",
+        "running",
+        "blocked",
+        "needs_clarification",
+        "awaiting_review",
+      ].includes(objectiveStatus)
     ) {
       const existing = this.db
         .prepare(
@@ -5833,7 +6325,7 @@ export class AutonomyStore {
            FROM autonomy_objectives
            WHERE incident_key = ?
              AND id != ?
-             AND status IN ('proposed','gated','dispatched','running','blocked','needs_clarification')
+             AND status IN ('proposed','gated','dispatched','running','blocked','needs_clarification','awaiting_review')
            ORDER BY updated_at DESC
            LIMIT 1`,
         )
@@ -5847,10 +6339,6 @@ export class AutonomyStore {
         };
       }
     }
-    const objectiveCandidateRaw = asString(objective.candidateId ?? objective.candidate_id);
-    const objectiveCandidateId = objectiveCandidateRaw
-      ? scopedCandidateStorageId(runId, objectiveCandidateRaw)
-      : null;
     if (objectiveStatus === "gated" || objectiveStatus === "dispatched") {
       const requiredValidationRepair = asBoolean(
         objective.requiredValidationRepair ??
@@ -5948,6 +6436,119 @@ export class AutonomyStore {
         now,
         now,
       );
+    // The planner supplies only the completed request identity. Repository and
+    // memory addresses are resolved from Server-owned RepositoryAgent state so
+    // an echoed objective payload cannot redirect outcome learning.
+    const hasRepositoryAgentAttribution =
+      Object.prototype.hasOwnProperty.call(body, "repositoryAgentMemory") ||
+      Object.prototype.hasOwnProperty.call(body, "repository_agent_memory");
+    const repositoryAgentMemory = asObject(
+      body.repositoryAgentMemory ?? body.repository_agent_memory,
+    );
+    const repositoryAgentRequestId = asString(
+      repositoryAgentMemory.requestId ?? repositoryAgentMemory.request_id,
+    ).slice(0, 256);
+    let repositoryAgentLink:
+      | {
+          repositoryId: string;
+          memoryRefs: RepositoryAgentMemoryRef[];
+        }
+      | undefined;
+    if (repositoryAgentRequestId && this.hasTable("repository_agent_requests")) {
+      const authoritative = this.db
+        .prepare(
+          `SELECT sessionId, callerService, repositoryId, revision, treeHash,
+                  requestJson, resultJson
+           FROM repository_agent_requests
+           WHERE id = ? AND status = 'completed'
+           LIMIT 1`,
+        )
+        .get(repositoryAgentRequestId) as
+        | {
+            sessionId: string;
+            callerService: string;
+            repositoryId: string;
+            revision: string;
+            treeHash: string;
+            requestJson: string;
+            resultJson: string | null;
+          }
+        | undefined;
+      if (
+        authoritative &&
+        asString(authoritative.sessionId) === sessionId &&
+        asString(authoritative.callerService) === "remotebuddy" &&
+        authoritative.resultJson
+      ) {
+        try {
+          const request = sanitizeRepositoryAgentRequest(
+            JSON.parse(authoritative.requestJson) as unknown,
+          );
+          const result = sanitizeRepositoryAgentResult(
+            JSON.parse(authoritative.resultJson) as unknown,
+            repositoryAgentRequestId,
+          );
+          const repositoryId = asString(authoritative.repositoryId).slice(0, 512);
+          const memoryRefs = asRepositoryAgentMemoryRefs(result.memoryRefs).filter((ref) => ref.key);
+          if (
+            repositoryId &&
+            request.caller.service === "remotebuddy" &&
+            request.caller.sessionId === sessionId &&
+            request.caller.correlationId === runId &&
+            request.purpose === "priority" &&
+            request.repository.identity === repositoryId &&
+            request.repository.revision === asString(authoritative.revision) &&
+            request.repository.tree === asString(authoritative.treeHash) &&
+            result.analyzedRepository.identity === repositoryId &&
+            result.analyzedRepository.revision === request.repository.revision &&
+            result.analyzedRepository.tree === request.repository.tree &&
+            memoryRefs.length > 0
+          ) {
+            repositoryAgentLink = { repositoryId, memoryRefs };
+          }
+        } catch {
+          // Invalid or stale RepositoryAgent results are never linked to learning.
+        }
+      }
+    }
+    if (repositoryAgentLink) {
+      this.db
+        .prepare(
+          `INSERT INTO autonomy_repository_agent_memory_links (
+             objective_id, repository_id, repository_agent_request_id,
+             memory_refs_json, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(objective_id) DO UPDATE SET
+             repository_id = excluded.repository_id,
+             repository_agent_request_id = excluded.repository_agent_request_id,
+             memory_refs_json = excluded.memory_refs_json,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          objectiveId,
+          repositoryAgentLink.repositoryId,
+          repositoryAgentRequestId,
+          JSON.stringify(repositoryAgentLink.memoryRefs),
+          now,
+          now,
+        );
+    } else if (hasRepositoryAgentAttribution) {
+      // An explicit but invalid attribution must not leave a prior link in
+      // place. Ordinary lifecycle updates omit this field and preserve the
+      // link established by the initial gated reservation.
+      this.db
+        .prepare(`DELETE FROM autonomy_repository_agent_memory_links WHERE objective_id = ?`)
+        .run(objectiveId);
+    }
+    if (objectiveStatus === "awaiting_review") {
+      this.db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET awaiting_review_since = COALESCE(awaiting_review_since, ?)
+           WHERE id = ?`,
+        )
+        .run(now, objectiveId);
+    }
     const trialMeta =
       (objectiveCandidateId ? candidateEngineTrialMetaById.get(objectiveCandidateId) : undefined) ??
       null;
@@ -6238,6 +6839,7 @@ export class AutonomyStore {
     ok: boolean;
     reason?: string;
     ignored?: boolean;
+    acknowledged?: boolean;
     patternKey?: string;
     objectiveId?: string;
     deduped?: boolean;
@@ -6253,18 +6855,193 @@ export class AutonomyStore {
     const requestIdRaw = asString(body.requestId ?? body.request_id) || null;
     const jobIdRaw = asString(body.jobId ?? body.job_id) || null;
     const prUrl = asString(body.prUrl ?? body.pr_url) || null;
+    const normalizedFeedbackPrUrl = normalizePrUrl(prUrl);
+    const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
+    const hasJobsTable = this.hasTable("jobs");
+
+    if (mappedOutcome?.terminal && hasJobsTable && (!jobIdRaw || !normalizedFeedbackPrUrl)) {
+      return {
+        ok: true,
+        ignored: true,
+        reason: "terminal PR feedback requires matching jobId and prUrl authority",
+      };
+    }
+
+    let persistedJobPrUrl: string | null = null;
+    if (jobIdRaw && normalizedFeedbackPrUrl && hasJobsTable) {
+      const providerJob = this.db
+        .prepare(`SELECT prUrl FROM jobs WHERE id = ? LIMIT 1`)
+        .get(jobIdRaw) as { prUrl: string | null } | undefined;
+      if (!providerJob) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "PR feedback jobId does not identify a persisted job",
+        };
+      }
+      persistedJobPrUrl = normalizePrUrl(providerJob.prUrl);
+      if (persistedJobPrUrl && persistedJobPrUrl !== normalizedFeedbackPrUrl) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "PR feedback URL does not match the persisted job PR URL",
+        };
+      }
+      if (mappedOutcome?.terminal && !persistedJobPrUrl) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "terminal PR feedback requires a persisted job-to-PR link",
+        };
+      }
+      if (mappedOutcome?.terminal && !mappedOutcome.success) {
+        const latestJob = this.db
+          .prepare(
+            `SELECT id
+             FROM jobs
+             WHERE prUrlNormalized = ?
+             ORDER BY rowid DESC
+             LIMIT 1`,
+          )
+          .get(normalizedFeedbackPrUrl) as { id: string } | undefined;
+        if (!latestJob || latestJob.id !== jobIdRaw) {
+          return {
+            ok: true,
+            ignored: true,
+            acknowledged: true,
+            reason: "closed PR feedback belongs to an older job generation",
+          };
+        }
+      }
+    }
 
     let patternKey = asString(body.patternKey ?? body.pattern_key) || null;
-    const resolved = this.resolvePatternContext({
-      objectiveId: objectiveIdRaw,
-      requestId: requestIdRaw,
-      jobId: jobIdRaw,
-      prUrl,
-    });
+    const resolvedFromJob = jobIdRaw ? this.resolvePatternContext({ jobId: jobIdRaw }) : null;
+    const resolved =
+      resolvedFromJob ??
+      this.resolvePatternContext({
+        objectiveId: objectiveIdRaw,
+        requestId: requestIdRaw,
+        prUrl,
+      });
+    const identityMismatch =
+      (objectiveIdRaw &&
+        resolvedFromJob?.objectiveId &&
+        objectiveIdRaw !== resolvedFromJob.objectiveId) ||
+      (requestIdRaw && resolvedFromJob?.requestId && requestIdRaw !== resolvedFromJob.requestId) ||
+      (patternKey && resolvedFromJob?.patternKey && patternKey !== resolvedFromJob.patternKey);
+    if (identityMismatch) {
+      return {
+        ok: true,
+        ignored: true,
+        reason: "PR feedback identifiers do not match the persisted job context",
+      };
+    }
     if (!patternKey) {
       patternKey = asString(resolved?.patternKey) || null;
     }
+    const persistProviderOutcome = (jobId: string | null): void => {
+      if (!normalizedFeedbackPrUrl || !persistedJobPrUrl || !mappedOutcome?.terminal) return;
+      const providerStateAt = normalizeProviderStateTimestamp(
+        body.providerStateAt ?? body.provider_state_at,
+        now,
+      );
+      if (!mappedOutcome.success) {
+        const latestJob = this.db
+          .prepare(
+            `SELECT id
+             FROM jobs
+             WHERE prUrlNormalized = ?
+             ORDER BY rowid DESC
+             LIMIT 1`,
+          )
+          .get(normalizedFeedbackPrUrl) as { id: string } | undefined;
+        // A closed-without-merge observation is scoped to the latest job
+        // generation for that PR. An old acknowledgement must not close a
+        // later job created after the PR was reopened. A provider-confirmed
+        // merge remains global and monotonic for the PR URL.
+        if (!jobId || latestJob?.id !== jobId) return;
+      }
+      const existingProviderOutcome = this.db
+        .prepare(
+          `SELECT jobId, verdict, merged, providerStateAt
+           FROM pr_provider_outcomes
+           WHERE normalizedPrUrl = ?
+           LIMIT 1`,
+        )
+        .get(normalizedFeedbackPrUrl) as
+        | {
+            jobId: string | null;
+            verdict: string;
+            merged: number;
+            providerStateAt: string | null;
+          }
+        | undefined;
+      if (Number(existingProviderOutcome?.merged) === 1) return;
+      if (!mappedOutcome.success && existingProviderOutcome) {
+        const existingStateMs = Date.parse(asString(existingProviderOutcome.providerStateAt));
+        const incomingStateMs = Date.parse(providerStateAt);
+        if (Number.isFinite(existingStateMs) && existingStateMs > incomingStateMs) return;
+        if (
+          existingProviderOutcome.jobId === jobId &&
+          asString(existingProviderOutcome.verdict).toLowerCase() === verdict &&
+          Number.isFinite(existingStateMs) &&
+          existingStateMs === incomingStateMs
+        ) {
+          return;
+        }
+      }
+      this.db
+        .prepare(
+          `INSERT INTO pr_provider_outcomes (
+             normalizedPrUrl, prUrl, jobId, verdict, terminal, merged,
+             providerStateAt, createdAt, updatedAt
+           ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+           ON CONFLICT(normalizedPrUrl) DO UPDATE SET
+             prUrl = excluded.prUrl,
+             jobId = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.jobId
+               ELSE excluded.jobId
+             END,
+             verdict = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.verdict
+               ELSE excluded.verdict
+             END,
+             terminal = MAX(pr_provider_outcomes.terminal, excluded.terminal),
+             merged = MAX(pr_provider_outcomes.merged, excluded.merged),
+             providerStateAt = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.providerStateAt
+               ELSE excluded.providerStateAt
+             END,
+             updatedAt = CASE
+               WHEN pr_provider_outcomes.merged = 1 THEN pr_provider_outcomes.updatedAt
+               WHEN pr_provider_outcomes.jobId IS excluded.jobId
+                 AND pr_provider_outcomes.verdict = excluded.verdict
+               THEN pr_provider_outcomes.updatedAt
+               ELSE excluded.updatedAt
+             END`,
+        )
+        .run(
+          normalizedFeedbackPrUrl,
+          prUrl,
+          jobId,
+          verdict,
+          mappedOutcome.success ? 1 : 0,
+          providerStateAt,
+          now,
+          now,
+        );
+    };
     if (!patternKey) {
+      if (mappedOutcome?.terminal && persistedJobPrUrl) {
+        persistProviderOutcome(jobIdRaw);
+        return {
+          ok: true,
+          ignored: true,
+          acknowledged: true,
+          reason: "provider outcome recorded for a non-autonomy job",
+        };
+      }
       return {
         ok: true,
         ignored: true,
@@ -6336,8 +7113,9 @@ export class AutonomyStore {
       .prepare(
         `INSERT OR IGNORE INTO autonomy_pr_feedback (
           feedback_key, objective_id, request_id, job_id, pattern_key, pr_number, pr_url,
-          verdict, review_score, review_threshold, summary, comment_count, comments_json, source, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          pr_url_normalized, verdict, review_score, review_threshold, summary, comment_count,
+          comments_json, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         feedbackKey,
@@ -6347,6 +7125,7 @@ export class AutonomyStore {
         patternKey,
         prNumber,
         prUrl,
+        normalizedFeedbackPrUrl,
         verdict,
         reviewScore,
         reviewThreshold,
@@ -6358,21 +7137,133 @@ export class AutonomyStore {
       );
     const inserted = Number(insertInfo.changes ?? 0) > 0;
     if (!inserted) {
+      const existingFeedback = feedbackKey
+        ? (this.db
+            .prepare(
+              `SELECT objective_id, request_id, job_id, pattern_key, pr_url_normalized, verdict
+               FROM autonomy_pr_feedback
+               WHERE feedback_key = ?
+               LIMIT 1`,
+            )
+            .get(feedbackKey) as
+            | {
+                objective_id: string | null;
+                request_id: string | null;
+                job_id: string | null;
+                pattern_key: string;
+                pr_url_normalized: string | null;
+                verdict: string;
+              }
+            | undefined)
+        : undefined;
+      const sameEvent =
+        existingFeedback &&
+        (asString(existingFeedback.objective_id) || null) === objectiveId &&
+        (asString(existingFeedback.request_id) || null) === requestId &&
+        (asString(existingFeedback.job_id) || null) === jobId &&
+        asString(existingFeedback.pattern_key) === patternKey &&
+        (asString(existingFeedback.pr_url_normalized) || null) === normalizedFeedbackPrUrl &&
+        asString(existingFeedback.verdict).toLowerCase() === verdict;
+      if (!sameEvent) {
+        return {
+          ok: true,
+          ignored: true,
+          reason: "feedbackKey already belongs to a different PR feedback event",
+        };
+      }
+    }
+    const markAwaitingReview = (): void => {
+      if (!objectiveId) return;
+      this.db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET status = 'awaiting_review',
+               awaiting_review_since = COALESCE(awaiting_review_since, ?),
+               updated_at = ?
+           WHERE id = ?
+             AND status NOT IN ('failed','dead_letter')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM autonomy_outcomes final_outcome
+               WHERE final_outcome.objective_id = autonomy_objectives.id
+                 AND final_outcome.terminal = 1
+                 AND final_outcome.success = 1
+                 AND LOWER(COALESCE(final_outcome.user_action, '')) = 'accepted'
+             )`,
+        )
+        .run(now, now, objectiveId);
+    };
+    if (!mappedOutcome) {
+      markAwaitingReview();
       return {
         ok: true,
-        deduped: true,
+        ...(!inserted ? { deduped: true } : {}),
         patternKey,
         ...(objectiveId ? { objectiveId } : {}),
       };
     }
 
-    const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
-    if (!mappedOutcome) {
-      return {
-        ok: true,
-        patternKey,
-        ...(objectiveId ? { objectiveId } : {}),
-      };
+    if (!inserted) {
+      const projectedOutcome = this.db
+        .prepare(
+          `SELECT 1
+           FROM autonomy_outcomes
+           WHERE pattern_key = ?
+             AND success = ?
+             AND terminal = ?
+             AND LOWER(COALESCE(user_action, '')) = ?
+             AND (? IS NULL OR objective_id = ?)
+             AND (? IS NULL OR job_id = ?)
+           LIMIT 1`,
+        )
+        .get(
+          patternKey,
+          mappedOutcome.success ? 1 : 0,
+          mappedOutcome.terminal ? 1 : 0,
+          mappedOutcome.userAction.toLowerCase(),
+          objectiveId,
+          objectiveId,
+          jobId,
+          jobId,
+        );
+      if (projectedOutcome) {
+        if (mappedOutcome.terminal) persistProviderOutcome(jobId);
+        return {
+          ok: true,
+          deduped: true,
+          patternKey,
+          ...(objectiveId ? { objectiveId } : {}),
+          success: mappedOutcome.success,
+          userAction: mappedOutcome.userAction,
+        };
+      }
+    }
+
+    if (!mappedOutcome.terminal) {
+      markAwaitingReview();
+    } else if (objectiveId) {
+      const acceptedOutcome = this.db
+        .prepare(
+          `SELECT 1
+           FROM autonomy_outcomes
+           WHERE objective_id = ?
+             AND terminal = 1
+             AND success = 1
+             AND LOWER(COALESCE(user_action, '')) = 'accepted'
+           LIMIT 1`,
+        )
+        .get(objectiveId);
+      if (acceptedOutcome) {
+        persistProviderOutcome(jobId);
+        return {
+          ok: true,
+          ...(!inserted ? { deduped: true } : {}),
+          patternKey,
+          objectiveId,
+          success: true,
+          userAction: "accepted",
+        };
+      }
     }
 
     const outcome = this.recordOutcome({
@@ -6394,8 +7285,10 @@ export class AutonomyStore {
         reason: outcome.reason,
       };
     }
+    if (mappedOutcome.terminal) persistProviderOutcome(jobId);
     return {
       ok: true,
+      ...(!inserted ? { deduped: true } : {}),
       patternKey,
       ...(objectiveId ? { objectiveId } : {}),
       success: mappedOutcome.success,
@@ -6404,6 +7297,10 @@ export class AutonomyStore {
   }
 
   recordOutcome(body: Record<string, unknown>): { ok: boolean; reason?: string } {
+    return this.db.transaction(() => this.recordOutcomeMutation(body))();
+  }
+
+  private recordOutcomeMutation(body: Record<string, unknown>): { ok: boolean; reason?: string } {
     let patternKey = asString(body.patternKey ?? body.pattern_key);
     const objectiveIdRaw = asString(body.objectiveId ?? body.objective_id) || null;
     const requestIdRaw = asString(body.requestId ?? body.request_id) || null;
@@ -7363,6 +8260,140 @@ export class AutonomyStore {
       summary: string | null;
     }>;
 
+    const portfolioWindowHours = 24;
+    const portfolioObjectiveRows = this.db
+      .prepare(
+        `SELECT id, status, evidence_json, updated_at
+         FROM autonomy_objectives
+         WHERE source = 'autonomous'
+           AND datetime(created_at) >= datetime(?, '-${portfolioWindowHours} hours')`,
+      )
+      .all(now) as Array<{
+      id: string;
+      status: string;
+      evidence_json: string | null;
+      updated_at: string;
+    }>;
+    const portfolioFeedbackRows = this.db
+      .prepare(
+        `SELECT feedback.objective_id, feedback.verdict, feedback.created_at
+         FROM autonomy_pr_feedback feedback
+         JOIN autonomy_objectives objective ON objective.id = feedback.objective_id
+         WHERE objective.source = 'autonomous'
+           AND datetime(objective.created_at) >= datetime(?, '-${portfolioWindowHours} hours')
+         ORDER BY datetime(feedback.created_at) ASC, feedback.id ASC`,
+      )
+      .all(now) as Array<{
+      objective_id: string;
+      verdict: string | null;
+      created_at: string;
+    }>;
+    const portfolioOutcomeRows = this.db
+      .prepare(
+        `SELECT outcome.objective_id, outcome.success, outcome.user_action, outcome.created_at
+         FROM autonomy_outcomes outcome
+         JOIN autonomy_objectives objective ON objective.id = outcome.objective_id
+         WHERE objective.source = 'autonomous'
+           AND outcome.terminal = 1
+           AND datetime(objective.created_at) >= datetime(?, '-${portfolioWindowHours} hours')
+         ORDER BY datetime(outcome.created_at) ASC, outcome.id ASC`,
+      )
+      .all(now) as Array<{
+      objective_id: string;
+      success: number;
+      user_action: string | null;
+      created_at: string;
+    }>;
+    const visionObjectiveIds = new Set<string>();
+    let visionAlignedObjectiveCount = 0;
+    let userObservableObjectiveCount = 0;
+    for (const row of portfolioObjectiveRows) {
+      const portfolio = asObject(parseJsonObject(row.evidence_json).portfolio);
+      const visionObjectiveId = asString(portfolio.vision_objective_id);
+      if (visionObjectiveId) {
+        visionAlignedObjectiveCount += 1;
+        visionObjectiveIds.add(visionObjectiveId);
+      }
+      const category = asString(portfolio.vision_category);
+      if (
+        ["product_core", "user_experience", "onboarding", "growth", "content"].includes(category)
+      ) {
+        userObservableObjectiveCount += 1;
+      }
+    }
+    const revisionCountByObjective = new Map<string, number>();
+    const closedObjectiveIds = new Set<string>();
+    for (const row of portfolioFeedbackRows) {
+      const objectiveId = asString(row.objective_id);
+      if (!objectiveId) continue;
+      const verdict = asString(row.verdict).toLowerCase();
+      if (
+        verdict.includes("reject") ||
+        verdict.includes("unmergeable") ||
+        verdict.includes("merge_conflict") ||
+        verdict.includes("changes_requested") ||
+        verdict.includes("revision")
+      ) {
+        revisionCountByObjective.set(
+          objectiveId,
+          (revisionCountByObjective.get(objectiveId) ?? 0) + 1,
+        );
+      }
+      const mapped = deriveOutcomeFromPrFeedbackVerdict(verdict);
+      if (mapped?.terminal && !mapped.success) closedObjectiveIds.add(objectiveId);
+    }
+    const acceptedObjectiveIds = new Set(
+      portfolioOutcomeRows
+        .filter(
+          (row) =>
+            asNumber(row.success, 0) === 1 &&
+            asString(row.user_action).toLowerCase() === "accepted",
+        )
+        .map((row) => asString(row.objective_id))
+        .filter(Boolean),
+    );
+    const mergedObjectiveIds = [...acceptedObjectiveIds];
+    const closedUnmergedObjectiveCount = [...closedObjectiveIds].filter(
+      (objectiveId) => !acceptedObjectiveIds.has(objectiveId),
+    ).length;
+    const reviewRevisionCount = [...revisionCountByObjective.values()].reduce(
+      (sum, count) => sum + count,
+      0,
+    );
+    const firstPassMergeCount = mergedObjectiveIds.filter(
+      (objectiveId) => (revisionCountByObjective.get(objectiveId) ?? 0) === 0,
+    ).length;
+    const resolvedObjectiveCount = mergedObjectiveIds.length + closedUnmergedObjectiveCount;
+    const awaitingReviewRows = portfolioObjectiveRows.filter(
+      (row) => asString(row.status) === "awaiting_review",
+    );
+    const nowMs = Date.parse(now);
+    const oldestAwaitingAtMs = Math.min(
+      ...awaitingReviewRows
+        .map((row) => Date.parse(asString(row.updated_at)))
+        .filter(Number.isFinite),
+    );
+    const portfolio: AutonomyPortfolioMetrics = {
+      windowHours: portfolioWindowHours,
+      objectiveCount: portfolioObjectiveRows.length,
+      visionAlignedObjectiveCount,
+      userObservableObjectiveCount,
+      uniqueVisionObjectiveCount: visionObjectiveIds.size,
+      awaitingReviewCount: awaitingReviewRows.length,
+      oldestAwaitingReviewAgeMs:
+        awaitingReviewRows.length > 0 &&
+        Number.isFinite(nowMs) &&
+        Number.isFinite(oldestAwaitingAtMs)
+          ? Math.max(0, nowMs - oldestAwaitingAtMs)
+          : 0,
+      resolvedObjectiveCount,
+      mergedObjectiveCount: mergedObjectiveIds.length,
+      closedUnmergedObjectiveCount,
+      reviewRevisionCount,
+      firstPassMergeRate:
+        resolvedObjectiveCount > 0 ? firstPassMergeCount / resolvedObjectiveCount : null,
+    };
+
     return {
       patternStats: patternStatsRows.map((row) => ({
         patternKey: asString(row.pattern_key),
@@ -7413,6 +8444,7 @@ export class AutonomyStore {
           comments,
         };
       }),
+      portfolio,
       engineSourceStats: sourceStatsRows.map((row) => ({
         sourceKey: asString(row.source_key),
         sourceType: asString(row.source_type) || "unknown",
@@ -8211,6 +9243,728 @@ export class AutonomyStore {
       .run(asIsoNow(), jobId);
   }
 
+  pruneRepositoryAgentMemoryFeedback(
+    options: {
+      nowIso?: string;
+      terminalRetentionMs?: number;
+      maxTerminalRows?: number;
+      batchSize?: number;
+    } = {},
+  ): { feedbackDeleted: number; linksDeleted: number } {
+    const parsedNow = Date.parse(asString(options.nowIso));
+    const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+    const terminalRetentionMs = Math.max(
+      60_000,
+      Math.min(
+        365 * 24 * 60 * 60_000,
+        Math.floor(
+          asNumber(
+            options.terminalRetentionMs,
+            REPOSITORY_AGENT_MEMORY_FEEDBACK_TERMINAL_RETENTION_MS,
+          ),
+        ),
+      ),
+    );
+    const maxTerminalRows = Math.max(
+      1,
+      Math.min(
+        1_000_000,
+        Math.floor(
+          asNumber(
+            options.maxTerminalRows,
+            REPOSITORY_AGENT_MEMORY_FEEDBACK_MAX_TERMINAL_ROWS,
+          ),
+        ),
+      ),
+    );
+    const batchSize = Math.max(
+      1,
+      Math.min(
+        5_000,
+        Math.floor(
+          asNumber(options.batchSize, REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_BATCH),
+        ),
+      ),
+    );
+    const cutoff = new Date(nowMs - terminalRetentionMs).toISOString();
+
+    return this.db.transaction(() => {
+      let feedbackDeleted = 0;
+      let linksDeleted = 0;
+      const expired = this.db
+        .prepare(
+          `DELETE FROM autonomy_repository_agent_memory_feedback
+           WHERE observation_id IN (
+             SELECT observation_id
+             FROM autonomy_repository_agent_memory_feedback
+             WHERE status IN ('applied', 'failed') AND created_at <= ?
+             ORDER BY created_at ASC, observation_id ASC
+             LIMIT ?
+           )`,
+        )
+        .run(cutoff, batchSize);
+      feedbackDeleted += Math.max(0, Number(expired.changes ?? 0));
+
+      const remainingBatch = Math.max(0, batchSize - feedbackDeleted);
+      if (remainingBatch > 0) {
+        const terminalCount = this.db
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM autonomy_repository_agent_memory_feedback
+             WHERE status IN ('applied', 'failed')`,
+          )
+          .get() as { count: number } | undefined;
+        const excess = Math.max(
+          0,
+          Math.floor(asNumber(terminalCount?.count, 0)) - maxTerminalRows,
+        );
+        if (excess > 0) {
+          const cappedRows = this.db
+            .prepare(
+              `SELECT terminal.observation_id AS observationId,
+                      terminal.objective_id AS objectiveId
+               FROM autonomy_repository_agent_memory_feedback terminal
+               WHERE terminal.status IN ('applied', 'failed')
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM autonomy_repository_agent_memory_feedback active
+                   WHERE active.objective_id = terminal.objective_id
+                     AND active.status IN ('pending', 'processing')
+                 )
+               ORDER BY terminal.created_at ASC, terminal.rowid ASC
+               LIMIT ?`,
+            )
+            .all(Math.min(remainingBatch, excess)) as Array<{
+            observationId: string;
+            objectiveId: string;
+          }>;
+          const deleteCappedFeedback = this.db.prepare(
+            `DELETE FROM autonomy_repository_agent_memory_feedback
+             WHERE observation_id = ? AND status IN ('applied', 'failed')`,
+          );
+          const retireCappedLink = this.db.prepare(
+            `DELETE FROM autonomy_repository_agent_memory_links
+             WHERE objective_id = ?
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM autonomy_repository_agent_memory_feedback active
+                 WHERE active.objective_id = ?
+                   AND active.status IN ('pending', 'processing')
+               )`,
+          );
+          const evictedObjectives = new Set<string>();
+          for (const capped of cappedRows) {
+            feedbackDeleted += Math.max(
+              0,
+              Number(deleteCappedFeedback.run(capped.observationId).changes ?? 0),
+            );
+            if (capped.objectiveId) evictedObjectives.add(capped.objectiveId);
+          }
+          // Hard-cap eviction deliberately retires the settled link in the
+          // same transaction. Otherwise an in-window authority would recreate
+          // the feedback row on the next reconciliation tick.
+          for (const objectiveId of evictedObjectives) {
+            linksDeleted += Math.max(
+              0,
+              Number(retireCappedLink.run(objectiveId, objectiveId).changes ?? 0),
+            );
+          }
+        }
+      }
+
+      const oldSettledLinks = this.db
+        .prepare(
+          `DELETE FROM autonomy_repository_agent_memory_links
+           WHERE objective_id IN (
+             SELECT link.objective_id
+             FROM autonomy_repository_agent_memory_links link
+             LEFT JOIN autonomy_objectives objective ON objective.id = link.objective_id
+             WHERE link.updated_at <= ?
+               AND (objective.id IS NULL OR objective.status IN ('completed', 'failed', 'dead_letter'))
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM autonomy_repository_agent_memory_feedback feedback
+                 WHERE feedback.objective_id = link.objective_id
+                   AND feedback.status IN ('pending', 'processing')
+               )
+             ORDER BY link.updated_at ASC, link.objective_id ASC
+             LIMIT ?
+           )`,
+        )
+        .run(cutoff, batchSize);
+      linksDeleted += Math.max(0, Number(oldSettledLinks.changes ?? 0));
+      return {
+        feedbackDeleted,
+        linksDeleted,
+      };
+    })();
+  }
+
+  private maybePruneRepositoryAgentMemoryFeedback(): void {
+    const nowMs = Date.now();
+    if (
+      this.lastRepositoryAgentMemoryFeedbackPruneAtMs > 0 &&
+      nowMs - this.lastRepositoryAgentMemoryFeedbackPruneAtMs <
+        REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.pruneRepositoryAgentMemoryFeedback({ nowIso: new Date(nowMs).toISOString() });
+    this.lastRepositoryAgentMemoryFeedbackPruneAtMs = nowMs;
+  }
+
+  reconcileRepositoryAgentMemoryFeedback(): { queued: number } {
+    if (
+      !this.hasTable("jobs") ||
+      !this.hasTable("completions") ||
+      !this.hasTable("job_terminal_diagnostics") ||
+      !this.hasTable("autonomy_outcomes") ||
+      !this.hasTable("pr_provider_outcomes")
+    ) {
+      return { queued: 0 };
+    }
+    const now = asIsoNow();
+    let queued = 0;
+    const insert = this.db.prepare(
+      `INSERT OR IGNORE INTO autonomy_repository_agent_memory_feedback (
+         observation_id, objective_id, repository_id, repository_agent_request_id,
+         outcome, authority_kind, authority_id, weight, memory_refs_json,
+         status, attempts, claim_token, claim_generation, lease_expires_at, claimed_at,
+         next_attempt_at, last_error, created_at, applied_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 'pending', 0, NULL, 0, NULL, NULL, NULL, NULL, ?, NULL)`,
+    );
+
+    type AuthorityCandidate = {
+      objectiveId: string;
+      repositoryId: string;
+      repositoryAgentRequestId: string;
+      memoryRefsJson: string;
+      outcome: "successful" | "failed";
+      authorityKind: "provider_terminal" | "job_terminal";
+      authorityId: string;
+      weight: number;
+      eventAt: string;
+    };
+
+    // PR delivery is not successful when a worker merely creates or updates a
+    // branch. Only the provider's terminal merged/closed state is authoritative.
+    const providerAuthorityExpression = `
+      provider.normalizedPrUrl || char(31) || COALESCE(provider.jobId, '') || char(31) ||
+      COALESCE(provider.providerStateAt, '') || char(31) ||
+      LOWER(COALESCE(provider.verdict, '')) || char(31) || CAST(provider.merged AS TEXT)`;
+    const providerRows = this.db
+      .prepare(
+        `SELECT link.objective_id AS objectiveId,
+                link.repository_id AS repositoryId,
+                link.repository_agent_request_id AS repositoryAgentRequestId,
+                link.memory_refs_json AS memoryRefsJson,
+                CASE WHEN provider.merged = 1 THEN 'successful' ELSE 'failed' END AS outcome,
+                'provider_terminal' AS authorityKind,
+                ${providerAuthorityExpression} AS authorityId,
+                1 AS weight,
+                provider.providerStateAt AS eventAt
+         FROM autonomy_repository_agent_memory_links link
+         JOIN autonomy_objectives objective ON objective.id = link.objective_id
+         JOIN jobs job ON job.id = objective.job_id
+         JOIN pr_provider_outcomes provider
+           ON provider.jobId = job.id
+          AND provider.normalizedPrUrl = job.prUrlNormalized
+         WHERE provider.terminal = 1
+           AND provider.providerStateAt >= ?
+           AND (
+             (provider.merged = 1 AND objective.status = 'completed') OR
+             (provider.merged = 0 AND objective.status = 'failed')
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback reflected
+             WHERE reflected.authority_kind = 'provider_terminal'
+               AND reflected.authority_id = ${providerAuthorityExpression}
+           )
+         ORDER BY provider.providerStateAt DESC, provider.normalizedPrUrl DESC
+         LIMIT 500`,
+      )
+      .all(new Date(Date.parse(now) - 30 * 24 * 60 * 60_000).toISOString()) as AuthorityCandidate[];
+
+    // A non-PR completion becomes successful only after SourceControlManager
+    // atomically marks the completion processed and the parent job completed.
+    const completionAuthorityExpression = `
+      job.id || char(31) || completion.id || char(31) ||
+      completion.status || char(31) || completion.updatedAt`;
+    const successfulJobRows = this.db
+      .prepare(
+        `SELECT link.objective_id AS objectiveId,
+                link.repository_id AS repositoryId,
+                link.repository_agent_request_id AS repositoryAgentRequestId,
+                link.memory_refs_json AS memoryRefsJson,
+                'successful' AS outcome,
+                'job_terminal' AS authorityKind,
+                ${completionAuthorityExpression} AS authorityId,
+                1 AS weight,
+                completion.updatedAt AS eventAt
+         FROM autonomy_repository_agent_memory_links link
+         JOIN autonomy_objectives objective ON objective.id = link.objective_id
+         JOIN jobs job ON job.id = objective.job_id
+         JOIN completions completion ON completion.jobId = job.id
+         WHERE job.status = 'completed'
+           AND objective.status = 'completed'
+           AND COALESCE(job.prUrl, '') = ''
+           AND completion.status = 'processed'
+           AND completion.updatedAt >= ?
+           AND completion.rowid = (
+             SELECT MAX(latest.rowid) FROM completions latest
+             WHERE latest.jobId = job.id AND latest.status = 'processed'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback reflected
+             WHERE reflected.authority_kind = 'job_terminal'
+               AND reflected.authority_id = ${completionAuthorityExpression}
+           )
+         ORDER BY completion.updatedAt DESC, completion.id DESC
+         LIMIT 500`,
+      )
+      .all(new Date(Date.parse(now) - 30 * 24 * 60 * 60_000).toISOString()) as AuthorityCandidate[];
+
+    // Pre-publication quality outcomes are useful negative evidence only when
+    // no PR exists. Environment/runtime/publication failures are filtered out.
+    const jobFailureAuthorityExpression = `
+      job.id || char(31) || job.status || char(31) ||
+      COALESCE(diagnostics.updatedAt, '') || char(31) ||
+      LOWER(COALESCE(outcome.user_action, '')) || char(31) ||
+      LOWER(COALESCE(diagnostics.failureClass, '')) || char(31) ||
+      LOWER(COALESCE(diagnostics.terminalStage, ''))`;
+    const negativeJobRows = this.db
+      .prepare(
+        `SELECT link.objective_id AS objectiveId,
+                link.repository_id AS repositoryId,
+                link.repository_agent_request_id AS repositoryAgentRequestId,
+                link.memory_refs_json AS memoryRefsJson,
+                'failed' AS outcome,
+                'job_terminal' AS authorityKind,
+                ${jobFailureAuthorityExpression} AS authorityId,
+                CASE WHEN LOWER(COALESCE(outcome.user_action, '')) = 'rejected' THEN 1 ELSE 0.5 END AS weight,
+                COALESCE(diagnostics.updatedAt, outcome.created_at) AS eventAt,
+                job.status AS jobStatus,
+                diagnostics.failureClass AS failureClass,
+                diagnostics.terminalStage AS terminalStage,
+                diagnostics.summary AS diagnosticSummary,
+                outcome.user_action AS userAction
+         FROM autonomy_repository_agent_memory_links link
+         JOIN autonomy_objectives objective ON objective.id = link.objective_id
+         JOIN jobs job ON job.id = objective.job_id
+         JOIN autonomy_outcomes outcome ON outcome.objective_id = objective.id
+         LEFT JOIN job_terminal_diagnostics diagnostics ON diagnostics.jobId = job.id
+         WHERE objective.status = 'failed'
+           AND COALESCE(job.prUrl, '') = ''
+           AND outcome.terminal = 1
+           AND outcome.id = (
+             SELECT MAX(latest.id)
+             FROM autonomy_outcomes latest
+             WHERE latest.objective_id = objective.id AND latest.terminal = 1
+           )
+           AND COALESCE(diagnostics.updatedAt, outcome.created_at) >= ?
+           AND job.status IN ('completed', 'failed', 'abandoned', 'publish_blocked')
+           AND NOT EXISTS (
+             SELECT 1 FROM completions active
+             WHERE active.jobId = job.id AND active.status IN ('pending', 'claimed')
+           )
+           AND (
+             LOWER(COALESCE(outcome.user_action, '')) IN ('rejected', 'no_change', 'needs_clarification')
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%artifact_only_no_publishable_patch%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%quality%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%critic%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%validation%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%test_failure%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%lint_failure%'
+             OR LOWER(COALESCE(diagnostics.failureClass, '')) LIKE '%typecheck_failure%'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback reflected
+             WHERE reflected.authority_kind = 'job_terminal'
+               AND reflected.authority_id = ${jobFailureAuthorityExpression}
+           )
+         ORDER BY COALESCE(diagnostics.updatedAt, outcome.created_at) DESC, job.id DESC
+         LIMIT 500`,
+      )
+      .all(new Date(Date.parse(now) - 30 * 24 * 60 * 60_000).toISOString()) as Array<
+      AuthorityCandidate & {
+        jobStatus: string;
+        failureClass: string | null;
+        terminalStage: string | null;
+        diagnosticSummary: string | null;
+        userAction: string | null;
+      }
+    >;
+
+    const eligibleNegativeJobRows = negativeJobRows.filter((row) => {
+      const directNegative = ["rejected", "no_change", "needs_clarification"].includes(
+        asString(row.userAction).toLowerCase(),
+      );
+      const classified = classifyAutonomyAttemptOutcome({
+        status: row.jobStatus,
+        failureClass: row.failureClass,
+        terminalStage: row.terminalStage,
+        summary: row.diagnosticSummary,
+      });
+      return (
+        directNegative ||
+        ["quality_rejected", "validation_blocked", "no_change"].includes(classified)
+      );
+    });
+
+    const candidates = [...providerRows, ...successfulJobRows, ...eligibleNegativeJobRows]
+      .sort((left, right) => right.eventAt.localeCompare(left.eventAt))
+      .slice(0, 500);
+    for (const row of candidates) {
+      const observationId = `repository-agent:${sha256Hex(
+        JSON.stringify([row.objectiveId, row.authorityKind, row.authorityId]),
+      )}`;
+      const inserted = insert.run(
+        observationId,
+        row.objectiveId,
+        row.repositoryId,
+        row.repositoryAgentRequestId,
+        row.outcome,
+        row.authorityKind,
+        row.authorityId,
+        row.weight,
+        row.memoryRefsJson,
+        now,
+      );
+      queued += Number(inserted.changes ?? 0);
+    }
+    return { queued };
+  }
+
+  private hydrateRepositoryAgentMemoryFeedbackRows(
+    rows: Array<{
+      observationId: string;
+      objectiveId: string;
+      repositoryId: string;
+      repositoryAgentRequestId: string;
+      outcome: string;
+      authorityKind: string;
+      authorityId: string;
+      weight: number;
+      memoryRefsJson: string;
+      attempts: number;
+    }>,
+  ): RepositoryAgentMemoryFeedbackRow[] {
+    return rows.flatMap((row) => {
+      const memoryRefs = asRepositoryAgentMemoryRefs(parseJsonArray(row.memoryRefsJson));
+      if (
+        !row.observationId ||
+        !row.objectiveId ||
+        !row.repositoryId ||
+        !row.repositoryAgentRequestId ||
+        (row.outcome !== "successful" && row.outcome !== "failed") ||
+        (row.authorityKind !== "provider_terminal" && row.authorityKind !== "job_terminal") ||
+        memoryRefs.length === 0
+      ) {
+        return [];
+      }
+      return [
+        {
+          observationId: row.observationId,
+          objectiveId: row.objectiveId,
+          repositoryId: row.repositoryId,
+          repositoryAgentRequestId: row.repositoryAgentRequestId,
+          outcome: row.outcome,
+          authorityKind: row.authorityKind,
+          authorityId: row.authorityId,
+          weight: Math.max(0, Math.min(4, asNumber(row.weight, 1))),
+          memoryRefs,
+          attempts: Math.max(0, Math.floor(asNumber(row.attempts, 0))),
+        },
+      ];
+    });
+  }
+
+  listPendingRepositoryAgentMemoryFeedback(limit = 20): RepositoryAgentMemoryFeedbackRow[] {
+    const boundedLimit = Math.max(1, Math.min(100, Math.floor(asNumber(limit, 20))));
+    const now = asIsoNow();
+    const rows = this.db
+      .prepare(
+        `SELECT feedback.observation_id AS observationId,
+                feedback.objective_id AS objectiveId,
+                feedback.repository_id AS repositoryId,
+                feedback.repository_agent_request_id AS repositoryAgentRequestId,
+                feedback.outcome, feedback.authority_kind AS authorityKind,
+                feedback.authority_id AS authorityId, feedback.weight,
+                feedback.memory_refs_json AS memoryRefsJson, feedback.attempts
+         FROM autonomy_repository_agent_memory_feedback feedback
+         WHERE feedback.status = 'pending' AND feedback.attempts < 5
+           AND (
+             feedback.next_attempt_at IS NULL OR TRIM(feedback.next_attempt_at) = '' OR
+             julianday(feedback.next_attempt_at) IS NULL OR feedback.next_attempt_at <= ?
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_repository_agent_memory_feedback predecessor
+             WHERE predecessor.objective_id = feedback.objective_id
+               AND predecessor.status IN ('pending', 'processing')
+               AND predecessor.rowid < feedback.rowid
+           )
+         ORDER BY feedback.created_at ASC, feedback.rowid ASC
+         LIMIT ?`,
+      )
+      .all(now, boundedLimit) as Parameters<
+      AutonomyStore["hydrateRepositoryAgentMemoryFeedbackRows"]
+    >[0];
+    return this.hydrateRepositoryAgentMemoryFeedbackRows(rows);
+  }
+
+  recoverExpiredRepositoryAgentMemoryFeedback(): number {
+    const now = asIsoNow();
+    return this.db
+      .prepare(
+        `UPDATE autonomy_repository_agent_memory_feedback
+         SET status = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'pending' END,
+             claim_token = NULL, lease_expires_at = NULL, claimed_at = NULL,
+             next_attempt_at = CASE
+               WHEN attempts >= 5 THEN NULL
+               ELSE COALESCE(next_attempt_at, ?)
+             END,
+             last_error = CASE
+               WHEN attempts >= 5
+               THEN COALESCE(last_error, 'feedback lease expired after final attempt')
+               ELSE last_error
+             END
+         WHERE status = 'processing'
+           AND (
+             lease_expires_at IS NULL OR TRIM(lease_expires_at) = '' OR
+             julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?
+           )`,
+      )
+      .run(now, now).changes;
+  }
+
+  claimRepositoryAgentMemoryFeedback(
+    limit = 20,
+    leaseMs = 60_000,
+  ): RepositoryAgentMemoryFeedbackClaim[] {
+    this.maybePruneRepositoryAgentMemoryFeedback();
+    // Claims are deliberately acquired just in time. Returning one prevents a
+    // sequential consumer from aging later leases before their work begins.
+    const boundedLimit = Math.min(1, Math.max(1, Math.floor(asNumber(limit, 20))));
+    const boundedLeaseMs = Math.max(
+      5_000,
+      Math.min(5 * 60_000, Math.floor(asNumber(leaseMs, 60_000))),
+    );
+    const now = asIsoNow();
+    const leaseExpiresAt = new Date(Date.parse(now) + boundedLeaseMs).toISOString();
+    return this.db.transaction(() => {
+      this.recoverExpiredRepositoryAgentMemoryFeedback();
+      const candidates = this.listPendingRepositoryAgentMemoryFeedback(boundedLimit);
+      const claims: RepositoryAgentMemoryFeedbackClaim[] = [];
+      for (const candidate of candidates) {
+        const claimToken = randomUUID();
+        const claimed = this.db
+          .prepare(
+            `UPDATE autonomy_repository_agent_memory_feedback
+             SET status = 'processing', attempts = attempts + 1,
+                 claim_token = ?, claim_generation = claim_generation + 1,
+                 lease_expires_at = ?, claimed_at = ?, next_attempt_at = NULL
+             WHERE observation_id = ? AND status = 'pending' AND attempts < 5
+               AND (
+                 next_attempt_at IS NULL OR TRIM(next_attempt_at) = '' OR
+                 julianday(next_attempt_at) IS NULL OR next_attempt_at <= ?
+               )`,
+          )
+          .run(claimToken, leaseExpiresAt, now, candidate.observationId, now);
+        if (claimed.changes !== 1) continue;
+        const generation = this.db
+          .prepare(
+            `SELECT claim_generation AS claimGeneration
+             FROM autonomy_repository_agent_memory_feedback
+             WHERE observation_id = ?`,
+          )
+          .get(candidate.observationId) as { claimGeneration: number } | undefined;
+        claims.push({
+          ...candidate,
+          attempts: candidate.attempts + 1,
+          claimToken,
+          claimGeneration: Math.max(1, Math.floor(asNumber(generation?.claimGeneration, 1))),
+          leaseExpiresAt,
+        });
+      }
+      return claims;
+    })();
+  }
+
+  markRepositoryAgentMemoryFeedback(
+    observationId: string,
+    authority: { claimToken: string; claimGeneration: number },
+    applied: boolean,
+    error?: unknown,
+  ): boolean {
+    const normalizedObservationId = asString(observationId);
+    const claimToken = asString(authority.claimToken);
+    const claimGeneration = Math.max(0, Math.floor(asNumber(authority.claimGeneration, 0)));
+    if (!normalizedObservationId || !claimToken || claimGeneration < 1) return false;
+    const now = asIsoNow();
+    if (applied) {
+      return (
+        this.db
+          .prepare(
+            `UPDATE autonomy_repository_agent_memory_feedback
+             SET status = 'applied', claim_token = NULL, lease_expires_at = NULL,
+                 claimed_at = NULL, next_attempt_at = NULL, last_error = NULL, applied_at = ?
+             WHERE observation_id = ? AND status = 'processing'
+               AND claim_token = ? AND claim_generation = ?
+               AND lease_expires_at IS NOT NULL
+               AND julianday(lease_expires_at) IS NOT NULL
+               AND lease_expires_at > ?`,
+          )
+          .run(now, normalizedObservationId, claimToken, claimGeneration, now).changes === 1
+      );
+    }
+    const row = this.db
+      .prepare(
+        `SELECT attempts
+         FROM autonomy_repository_agent_memory_feedback
+         WHERE observation_id = ? AND status = 'processing'
+           AND claim_token = ? AND claim_generation = ?
+           AND lease_expires_at IS NOT NULL
+           AND julianday(lease_expires_at) IS NOT NULL
+           AND lease_expires_at > ?
+         LIMIT 1`,
+      )
+      .get(normalizedObservationId, claimToken, claimGeneration, now) as
+      | { attempts: number }
+      | undefined;
+    if (!row) return false;
+    const attempts = Math.max(0, Math.floor(asNumber(row.attempts, 0)));
+    const exhausted = attempts >= 5;
+    const retryDelayMs = Math.min(15 * 60_000, 1_000 * 2 ** Math.max(0, attempts - 1));
+    const updateNow = asIsoNow();
+    return (
+      this.db
+        .prepare(
+          `UPDATE autonomy_repository_agent_memory_feedback
+           SET status = ?, claim_token = NULL, lease_expires_at = NULL, claimed_at = NULL,
+               next_attempt_at = ?, last_error = ?
+           WHERE observation_id = ? AND status = 'processing'
+             AND claim_token = ? AND claim_generation = ?
+             AND lease_expires_at IS NOT NULL
+             AND julianday(lease_expires_at) IS NOT NULL
+             AND lease_expires_at > ?`,
+        )
+        .run(
+          exhausted ? "failed" : "pending",
+          exhausted ? null : new Date(Date.parse(updateNow) + retryDelayMs).toISOString(),
+          truncateText(
+            error instanceof Error ? error.message : String(error ?? "unknown error"),
+            4_000,
+          ),
+          normalizedObservationId,
+          claimToken,
+          claimGeneration,
+          updateNow,
+        ).changes === 1
+    );
+  }
+
+  repositoryAgentMemoryFeedbackHealth(): {
+    pending: number;
+    processing: number;
+    applied: number;
+    failed: number;
+    oldestPendingAgeMs: number | null;
+    oldPendingCount: number;
+    pendingUnhealthyAfterMs: number;
+    staleClaimCount: number;
+    unhealthy: boolean;
+  } {
+    const rows = this.db
+      .prepare(
+        `SELECT status, COUNT(*) AS count, MIN(created_at) AS oldest
+         FROM autonomy_repository_agent_memory_feedback
+         GROUP BY status`,
+      )
+      .all() as Array<{ status: string; count: number; oldest: string | null }>;
+    const health = {
+      pending: 0,
+      processing: 0,
+      applied: 0,
+      failed: 0,
+      oldestPendingAgeMs: null as number | null,
+      oldPendingCount: 0,
+      pendingUnhealthyAfterMs: REPOSITORY_AGENT_MEMORY_FEEDBACK_PENDING_UNHEALTHY_MS,
+      staleClaimCount: 0,
+      unhealthy: false,
+    };
+    for (const row of rows) {
+      if (row.status === "pending") {
+        health.pending = Math.max(0, Math.floor(asNumber(row.count, 0)));
+        const oldestMs = Date.parse(asString(row.oldest));
+        health.oldestPendingAgeMs = Number.isFinite(oldestMs)
+          ? Math.max(0, Date.now() - oldestMs)
+          : null;
+      } else if (row.status === "processing") {
+        health.processing = Math.max(0, Math.floor(asNumber(row.count, 0)));
+      } else if (row.status === "applied") {
+        health.applied = Math.max(0, Math.floor(asNumber(row.count, 0)));
+      } else if (row.status === "failed") {
+        health.failed = Math.max(0, Math.floor(asNumber(row.count, 0)));
+      }
+    }
+    const now = asIsoNow();
+    const stale = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM autonomy_repository_agent_memory_feedback
+         WHERE status = 'processing'
+           AND (
+             lease_expires_at IS NULL OR TRIM(lease_expires_at) = '' OR
+             julianday(lease_expires_at) IS NULL OR lease_expires_at <= ?
+           )`,
+      )
+      .get(now) as { count: number } | undefined;
+    health.staleClaimCount = Math.max(0, Math.floor(asNumber(stale?.count, 0)));
+    const pendingCutoff = new Date(
+      Date.parse(now) - REPOSITORY_AGENT_MEMORY_FEEDBACK_PENDING_UNHEALTHY_MS,
+    ).toISOString();
+    const oldPending = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM autonomy_repository_agent_memory_feedback
+         WHERE status = 'pending' AND created_at <= ?`,
+      )
+      .get(pendingCutoff) as { count: number } | undefined;
+    health.oldPendingCount = Math.max(0, Math.floor(asNumber(oldPending?.count, 0)));
+    health.unhealthy =
+      health.failed > 0 || health.staleClaimCount > 0 || health.oldPendingCount > 0;
+    return health;
+  }
+
+  markObjectiveAwaitingReviewByJobId(jobId: string): void {
+    if (!jobId) return;
+    const now = asIsoNow();
+    this.db
+      .prepare(
+        `UPDATE autonomy_objectives
+         SET status = 'awaiting_review',
+             awaiting_review_since = COALESCE(awaiting_review_since, ?),
+             block_reason = NULL,
+             updated_at = ?
+         WHERE job_id = ?
+           AND status IN ('dispatched','gated','running','completed')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM autonomy_outcomes final_outcome
+             WHERE final_outcome.objective_id = autonomy_objectives.id
+               AND final_outcome.terminal = 1
+               AND final_outcome.success = 1
+               AND LOWER(COALESCE(final_outcome.user_action, '')) = 'accepted'
+           )`,
+      )
+      .run(now, now, jobId);
+  }
+
   /**
    * Repair outcome rows written by releases that completed jobs before their
    * completion handoff reached a terminal publication result.
@@ -8227,17 +9981,16 @@ export class AutonomyStore {
          JOIN jobs j ON j.id = ao.job_id
          WHERE ao.terminal = 1
            AND ao.success = 1
-           AND j.status IN ('finalizing', 'failed', 'abandoned', 'publish_blocked')`,
+           AND (
+             j.status IN ('finalizing', 'failed', 'abandoned', 'publish_blocked')
+             OR (
+               j.status = 'completed'
+               AND COALESCE(j.prUrl, '') != ''
+               AND LOWER(COALESCE(ao.user_action, '')) IN ('applied', 'accepted')
+             )
+           )`,
       )
       .all() as Array<{ patternKey: string }>;
-    if (affectedPatterns.length === 0) {
-      return {
-        correctedFailures: 0,
-        removedPrematureSuccesses: 0,
-        correctedObjectives: 0,
-      };
-    }
-
     const now = asIsoNow();
     let correctedFailures = 0;
     let removedPrematureSuccesses = 0;
@@ -8248,7 +10001,30 @@ export class AutonomyStore {
           `DELETE FROM autonomy_outcomes
            WHERE terminal = 1
              AND success = 1
-             AND job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')`,
+             AND (
+               job_id IN (SELECT id FROM jobs WHERE status = 'finalizing')
+               OR (
+                 job_id IN (
+                   SELECT id FROM jobs
+                   WHERE status = 'completed' AND COALESCE(prUrl, '') != ''
+                 )
+                 AND (
+                   LOWER(COALESCE(user_action, '')) = 'applied'
+                   OR (
+                     LOWER(COALESCE(user_action, '')) = 'accepted'
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM autonomy_pr_feedback feedback
+                       WHERE (
+                         feedback.objective_id = autonomy_outcomes.objective_id
+                         OR feedback.job_id = autonomy_outcomes.job_id
+                       )
+                         AND LOWER(COALESCE(feedback.verdict, '')) IN ('approved_merged', 'merged')
+                     )
+                   )
+                 )
+               )
+             )`,
         )
         .run();
       removedPrematureSuccesses = Number(removed.changes ?? 0);
@@ -8289,8 +10065,29 @@ export class AutonomyStore {
              AND status <> 'failed'`,
         )
         .run(now);
+      const awaitingReviewObjectives = this.db
+        .prepare(
+          `UPDATE autonomy_objectives
+           SET status = 'awaiting_review',
+               awaiting_review_since = COALESCE(awaiting_review_since, ?),
+               updated_at = ?
+           WHERE job_id IN (
+             SELECT id FROM jobs
+             WHERE status = 'completed' AND COALESCE(prUrl, '') != ''
+           )
+             AND status = 'completed'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM autonomy_outcomes final_outcome
+               WHERE final_outcome.objective_id = autonomy_objectives.id
+                 AND final_outcome.terminal = 1
+             )`,
+        )
+        .run(now, now);
       correctedObjectives =
-        Number(runningObjectives.changes ?? 0) + Number(failedObjectives.changes ?? 0);
+        Number(runningObjectives.changes ?? 0) +
+        Number(failedObjectives.changes ?? 0) +
+        Number(awaitingReviewObjectives.changes ?? 0);
 
       for (const affected of affectedPatterns) {
         const patternKey = asString(affected.patternKey);

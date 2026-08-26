@@ -7,6 +7,31 @@ export type ReviewAgentRuntimeReadiness = {
   detail: string;
 };
 
+export function buildReviewAgentRuntimeFingerprint(params: {
+  serverUrl: string;
+  remoteUrl: string;
+  prBaseBranch: string;
+  branchPrefix: string;
+  reviewAgent: SourceControlManagerConfig["reviewAgent"];
+  gitProviderToken: string;
+  serverAuthToken?: string;
+}): string {
+  // Runtime readiness and mutable review policy deliberately are not
+  // structural identity. Recreating the agent for a threshold, merge policy,
+  // reviewer prompt, or readiness change loses provider cursors and retry
+  // state. The timer cadence is structural because changing it requires a new
+  // interval.
+  return JSON.stringify({
+    serverUrl: params.serverUrl,
+    remoteUrl: params.remoteUrl,
+    prBaseBranch: params.prBaseBranch,
+    branchPrefix: params.branchPrefix,
+    pollIntervalMs: params.reviewAgent.pollIntervalMs,
+    gitProviderToken: params.gitProviderToken,
+    serverAuthToken: params.serverAuthToken ?? "",
+  });
+}
+
 export type SourceControlManagerPublicationHealth = {
   backlog: number;
   pending: number;
@@ -17,6 +42,40 @@ export type SourceControlManagerPublicationHealth = {
   unhealthy: boolean;
   observedAt?: string;
 };
+
+export type SourceControlManagerReviewProviderHealth = {
+  status: "idle" | "running" | "ok" | "degraded" | "stalled";
+  inFlight: boolean;
+  pollAgeMs: number;
+  stalled: boolean;
+  lastPollStartedAt: string | null;
+  lastPollCompletedAt: string | null;
+  lastSuccessfulPollAt: string | null;
+  consecutiveFailedPolls: number;
+  failureEvents: number;
+  lastError: string | null;
+  persistedLinkRetryCount: number;
+  persistedLinkCursor: string | null;
+};
+
+export function createBlockedReviewProviderHealth(
+  reason: string,
+): SourceControlManagerReviewProviderHealth {
+  return {
+    status: "degraded",
+    inFlight: false,
+    pollAgeMs: 0,
+    stalled: false,
+    lastPollStartedAt: null,
+    lastPollCompletedAt: null,
+    lastSuccessfulPollAt: null,
+    consecutiveFailedPolls: 1,
+    failureEvents: 1,
+    lastError: String(reason || "review provider reconciliation is blocked").slice(0, 600),
+    persistedLinkRetryCount: 0,
+    persistedLinkCursor: null,
+  };
+}
 
 export type SourceControlManagerHealthSnapshot = {
   healthy: boolean;
@@ -30,7 +89,39 @@ export type SourceControlManagerHealthSnapshot = {
   activeCompletionId: string | null;
   phase: string;
   publication: SourceControlManagerPublicationHealth | null;
+  reviewProvider: SourceControlManagerReviewProviderHealth | null;
+  degradedComponents?: string[];
 };
+
+export function withReviewProviderHealth(
+  snapshot: SourceControlManagerHealthSnapshot,
+  reviewProvider: SourceControlManagerReviewProviderHealth | null,
+): SourceControlManagerHealthSnapshot {
+  const providerStalled = reviewProvider?.stalled === true;
+  const degradedComponents = new Set(snapshot.degradedComponents ?? []);
+  if (
+    reviewProvider &&
+    (reviewProvider.status === "degraded" ||
+      reviewProvider.status === "stalled" ||
+      reviewProvider.consecutiveFailedPolls > 0)
+  ) {
+    degradedComponents.add("review_provider");
+  } else {
+    degradedComponents.delete("review_provider");
+  }
+  return {
+    ...snapshot,
+    healthy: snapshot.healthy && !providerStalled,
+    status: snapshot.healthy && providerStalled ? "unhealthy" : snapshot.status,
+    reason:
+      snapshot.reason ??
+      (providerStalled
+        ? `review_provider_reconciliation_stalled_${reviewProvider.pollAgeMs}ms`
+        : null),
+    reviewProvider: reviewProvider ? { ...reviewProvider } : null,
+    degradedComponents: [...degradedComponents],
+  };
+}
 
 export function createSourceControlManagerHealthTracker(options: {
   tickStallMs: number;
@@ -108,6 +199,7 @@ export function createSourceControlManagerHealthTracker(options: {
         activeCompletionId,
         phase,
         publication: publication ? { ...publication } : null,
+        reviewProvider: null,
       };
     },
   };

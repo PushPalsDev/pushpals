@@ -105,6 +105,70 @@ describe("shared bounded subprocess", () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
+  test("acknowledges cancellation only after tree termination and bounded stream drain", async () => {
+    const controller = new AbortController();
+    const reason = new Error("provider discovery cancelled");
+    let releaseTermination: (() => void) | null = null;
+    const terminationGate = new Promise<void>((resolveTermination) => {
+      releaseTermination = resolveTermination;
+    });
+    let terminated = 0;
+    let outputCancelled = 0;
+    const processHandle: BoundedSubprocess = {
+      pid: 4330,
+      stdout: new ReadableStream<Uint8Array>({
+        cancel() {
+          outputCancelled += 1;
+        },
+      }),
+      stderr: null,
+      exited: new Promise<number>(() => {}),
+      kill() {},
+    };
+
+    let settled = false;
+    const operation = runBoundedProcess(["cancelled-provider"], {
+      timeoutMs: 10_000,
+      streamDrainTimeoutMs: 20,
+      signal: controller.signal,
+      spawn: () => processHandle,
+      terminate: async () => {
+        terminated += 1;
+        await terminationGate;
+      },
+    }).finally(() => {
+      settled = true;
+    });
+
+    controller.abort(reason);
+    await Bun.sleep(20);
+    expect(settled).toBe(false);
+    expect(terminated).toBe(1);
+
+    releaseTermination?.();
+    await expect(operation).rejects.toBe(reason);
+    expect(outputCancelled).toBe(1);
+  });
+
+  test("does not spawn a subprocess for an already-aborted request", async () => {
+    const controller = new AbortController();
+    const reason = new Error("request already expired");
+    controller.abort(reason);
+    let spawned = 0;
+
+    await expect(
+      runBoundedProcess(["must-not-start"], {
+        timeoutMs: 1_000,
+        signal: controller.signal,
+        spawn: () => {
+          spawned += 1;
+          throw new Error("unexpected spawn");
+        },
+      }),
+    ).rejects.toBe(reason);
+    expect(spawned).toBe(0);
+  });
+
   test("force-stops without repeating a graceful signal that already timed out", async () => {
     const signals: Array<NodeJS.Signals | number | undefined> = [];
     const target: BoundedSubprocess = {

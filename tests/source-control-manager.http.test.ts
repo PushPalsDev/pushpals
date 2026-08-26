@@ -18,6 +18,7 @@ describe("SourceControlManager status health", () => {
       activeCompletionId: "completion-1",
       phase: "trusted_validation",
       publication: null,
+      reviewProvider: null,
     }));
     try {
       const healthyResponse = await fetch(`http://127.0.0.1:${server.port}/health`);

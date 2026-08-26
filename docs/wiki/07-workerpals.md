@@ -125,6 +125,12 @@ merge or PR publication after they pass. A failed trusted check retains the
 internal ref for diagnosis; a failed queue handoff is reported as
 `publish_blocked` instead of silently deleting the candidate.
 
+For review repairs and merge-conflict work, validation commands are inferred
+from the exact target worktree and its nearest owning manifests. The inference
+supports multiple package managers and language ecosystems, emits single-process
+commands without shell chaining, and does not substitute a PushPals-specific
+test command into another repository.
+
 ## Operational Failure Patterns
 
 - Backend output parse errors:

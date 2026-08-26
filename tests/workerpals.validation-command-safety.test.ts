@@ -110,6 +110,12 @@ describe("workerpals validation command safety", () => {
       "test",
       './tests/quote"case.test.ts',
     ]);
+    expect(
+      tokenizeValidationCommandArgv('cmake -S "native module" -B "native module/build"'),
+    ).toEqual(["cmake", "-S", "native module", "-B", "native module/build"]);
+    expect(
+      tokenizeValidationCommandArgv('stack --stack-yaml "compiler app/stack.yaml" test'),
+    ).toEqual(["stack", "--stack-yaml", "compiler app/stack.yaml", "test"]);
   });
 
   test("rejects shell control chaining tokens", () => {

@@ -15,6 +15,9 @@ import {
   loadPromptTemplate,
   loadPushPalsConfig,
   runBoundedProcess,
+  terminateProcessTree,
+  type BoundedProcessSpawner,
+  type BoundedSubprocess,
   type PushPalsLmStudioConfig,
 } from "shared";
 
@@ -34,20 +37,30 @@ export interface LLMGenerateInput {
   // Max tokens to generate.
   maxTokens?: number;
   temperature?: number;
+  // Optional execution context for agentic backends. HTTP-only completion
+  // backends intentionally ignore this context.
+  executionContext?: {
+    repositoryMode: "isolated-evidence" | "none";
+  };
+  /** Best-effort cancellation for callers with an earlier lifecycle deadline. */
+  signal?: AbortSignal;
 }
 
 export interface LLMGenerateOutput {
   text: string;
   // Usage stats if available.
   usage?: { promptTokens: number; completionTokens: number };
+  /** Actual provider/model used after discovery or compatibility fallback. */
+  provider?: LlmBackend;
+  modelId?: string;
 }
 
 export interface LLMClient {
   generate(input: LLMGenerateInput): Promise<LLMGenerateOutput>;
 }
 
-type LlmBackend = "lmstudio" | "ollama" | "openai" | "openai_codex";
-type LlmService = "localbuddy" | "remotebuddy" | "workerpals";
+export type LlmBackend = "lmstudio" | "ollama" | "openai" | "openai_codex";
+type LlmService = "localbuddy" | "remotebuddy" | "workerpals" | "repository_agent";
 
 export interface LLMUsageEvent {
   service: LlmService;
@@ -120,6 +133,16 @@ function resolveLlmHttpTimeoutMs(explicit: number | undefined, fallback: number)
         ? environmentValue
         : fallback;
   return Math.max(1, Math.floor(configured));
+}
+
+function llmAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The LLM request was aborted", "AbortError");
+}
+
+function throwIfLlmAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw llmAbortReason(signal);
 }
 
 function fetchLlmHttpResponse(
@@ -388,8 +411,15 @@ function normalizeOpenAiBaseFromEndpoint(rawEndpoint: string): string {
 
 async function runProcess(
   command: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+  opts: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdin?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  },
 ): Promise<ProcessRunResult> {
+  throwIfLlmAborted(opts.signal);
   const bunRuntime = (globalThis as { Bun?: { spawn?: unknown } }).Bun;
   if (typeof bunRuntime?.spawn === "function") {
     return runProcessWithBun(command, opts);
@@ -399,7 +429,13 @@ async function runProcess(
 
 async function runProcessWithBun(
   command: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+  opts: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdin?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  },
 ): Promise<ProcessRunResult> {
   const timeoutMs =
     typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
@@ -412,6 +448,7 @@ async function runProcessWithBun(
     timeoutMs,
     outputLimitBytes: 4 * 1024 * 1024,
     streamDrainTimeoutMs: 2_000,
+    signal: opts.signal,
   });
   return {
     code: result.exitCode,
@@ -424,64 +461,167 @@ async function runProcessWithBun(
 
 async function runProcessWithNode(
   command: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+  opts: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdin?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  },
 ): Promise<ProcessRunResult> {
+  throwIfLlmAborted(opts.signal);
   const timeoutMs = opts.timeoutMs ?? 0;
   return new Promise<ProcessRunResult>((resolve, reject) => {
     const child = spawn(command[0]!, command.slice(1), {
       cwd: opts.cwd,
       env: opts.env,
       stdio: "pipe",
+      detached: process.platform !== "win32",
+      windowsHide: true,
     });
+    const nodeTerminationSpawner: BoundedProcessSpawner = (argv, spawnOptions) => {
+      const helper = spawn(argv[0]!, argv.slice(1), {
+        ...(spawnOptions.cwd ? { cwd: spawnOptions.cwd } : {}),
+        ...(spawnOptions.env ? { env: spawnOptions.env } : {}),
+        stdio: "ignore",
+        detached: spawnOptions.detached,
+        windowsHide: true,
+      });
+      const exited = new Promise<number>((resolveExit) => {
+        helper.once("error", () => resolveExit(1));
+        helper.once("exit", (code) => resolveExit(typeof code === "number" ? code : 1));
+      });
+      return {
+        pid: helper.pid ?? 0,
+        exited,
+        kill: (signal) => {
+          helper.kill(signal);
+        },
+      };
+    };
+    const outputLimit = 4 * 1024 * 1024;
     let stdout = "";
     let stderr = "";
     let finished = false;
-    let timedOut = false;
     let timeout: NodeJS.Timeout | null = null;
+    let drainTimeout: NodeJS.Timeout | null = null;
+    let closeResult: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    let stopKind: "abort" | "timeout" | null = null;
+    let stopReason: Error | null = null;
+    let terminationFinished = false;
+    let resolveRootExit: ((code: number) => void) | null = null;
+    const rootExited = new Promise<number>((resolveExit) => {
+      resolveRootExit = resolveExit;
+    });
+
+    const appendBounded = (current: string, chunk: unknown): string => {
+      if (current.length >= outputLimit) return current;
+      return `${current}${String(chunk)}`.slice(0, outputLimit);
+    };
 
     const cleanup = () => {
       if (timeout) {
         clearTimeout(timeout);
         timeout = null;
       }
+      if (drainTimeout) {
+        clearTimeout(drainTimeout);
+        drainTimeout = null;
+      }
+      opts.signal?.removeEventListener("abort", onAbort);
     };
 
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      if (stopKind === "abort") {
+        reject(stopReason ?? new DOMException("The LLM subprocess was aborted", "AbortError"));
+        return;
+      }
+      resolve({
+        code: stopKind === "timeout" ? 124 : (closeResult?.code ?? null),
+        signal: stopKind ? "SIGKILL" : (closeResult?.signal ?? null),
+        stdout,
+        stderr,
+        timedOut: stopKind === "timeout",
+      });
+    };
+
+    const finishAfterBoundedDrain = () => {
+      if (closeResult) {
+        finish();
+        return;
+      }
+      drainTimeout = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.stdin?.destroy();
+        finish();
+      }, 2_000);
+      drainTimeout.unref();
+    };
+
+    const terminate = (kind: "abort" | "timeout", reason?: Error) => {
+      if (stopKind || finished) return;
+      stopKind = kind;
+      stopReason = reason ?? null;
+      const target: BoundedSubprocess = {
+        pid: child.pid ?? 0,
+        exited: rootExited,
+        kill: (signal) => {
+          child.kill(signal);
+        },
+      };
+      void terminateProcessTree(target, { spawn: nodeTerminationSpawner })
+        .catch(() => undefined)
+        .then(() => {
+          terminationFinished = true;
+          finishAfterBoundedDrain();
+        });
+    };
+
+    const onAbort = () => terminate("abort", llmAbortReason(opts.signal!));
+
     child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
+      stdout = appendBounded(stdout, chunk);
     });
     child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
+      stderr = appendBounded(stderr, chunk);
+    });
+    child.stdin?.on("error", () => {
+      // Cancellation can close stdin while the prompt is still being written.
     });
     child.once("error", (err) => {
       if (finished) return;
+      resolveRootExit?.(1);
+      resolveRootExit = null;
       finished = true;
       cleanup();
       reject(err);
     });
     child.once("close", (code, signal) => {
       if (finished) return;
-      finished = true;
-      cleanup();
-      resolve({ code, signal, stdout, stderr, timedOut });
+      closeResult = { code, signal };
+      resolveRootExit?.(typeof code === "number" ? code : 1);
+      resolveRootExit = null;
+      if (stopKind && !terminationFinished) return;
+      finish();
+    });
+    child.once("exit", (code) => {
+      resolveRootExit?.(typeof code === "number" ? code : 1);
+      resolveRootExit = null;
     });
 
     if (timeoutMs > 0) {
       timeout = setTimeout(() => {
-        timedOut = true;
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // best effort
-        }
-        setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // best effort
-          }
-        }, 1_000).unref();
+        terminate("timeout");
       }, timeoutMs);
+      timeout.unref();
     }
+
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    if (opts.signal?.aborted) onAbort();
 
     if (typeof opts.stdin === "string") {
       child.stdin?.write(opts.stdin);
@@ -497,7 +637,11 @@ function bunCodexCommandFromEnv(env: NodeJS.ProcessEnv): string[] {
   return bunBin ? [bunBin, "x", "--yes", "@openai/codex"] : [];
 }
 
-async function resolveCodexCommandPrefix(configuredCommand?: string | null): Promise<string[]> {
+async function resolveCodexCommandPrefix(
+  configuredCommand?: string | null,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  throwIfLlmAborted(signal);
   const override = codexCommandOverrideParts(configuredCommand);
   const cacheKey = override.join("\u0000");
   const cached = cachedCodexCommandPrefix.get(cacheKey);
@@ -528,6 +672,7 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
   const attemptErrors: string[] = [];
   const successfulProbes: CodexCommandProbe[] = [];
   for (const candidate of candidates) {
+    throwIfLlmAborted(signal);
     if (candidate.length === 0) continue;
     const rendered = `${candidate.join(" ")} --version`;
     try {
@@ -535,6 +680,7 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
         cwd,
         env,
         timeoutMs: 15_000,
+        signal,
       });
       if (probe.code === 0) {
         const versionText = (probe.stdout || probe.stderr || "").trim().split(/\r?\n/, 1)[0] ?? "";
@@ -551,6 +697,7 @@ async function resolveCodexCommandPrefix(configuredCommand?: string | null): Pro
         `${rendered} -> exit ${probe.code ?? "unknown"}${detail ? ` (${detail.split(/\r?\n/, 1)[0]})` : ""}`,
       );
     } catch (err) {
+      throwIfLlmAborted(signal);
       attemptErrors.push(`${rendered} -> ${String(err)}`);
     }
   }
@@ -1101,7 +1248,9 @@ export class LmStudioClient implements LLMClient {
     return uniqueNonEmptyStrings([`${trimmed}/v1/models`, `${trimmed}/models`]);
   }
 
-  private async discoverAvailableModels(): Promise<{ models: string[]; detail: string }> {
+  private async discoverAvailableModels(
+    signal?: AbortSignal,
+  ): Promise<{ models: string[]; detail: string }> {
     const probes = this.modelProbeUrls();
     const headers: Record<string, string> = { Accept: "application/json" };
     if (this.apiKey.trim()) {
@@ -1111,10 +1260,11 @@ export class LmStudioClient implements LLMClient {
     let lastDetail = "model-list probe failed";
     const timeoutMs = Math.min(this.httpTimeoutMs, DEFAULT_LLM_MODEL_PROBE_TIMEOUT_MS);
     for (const url of probes) {
+      throwIfLlmAborted(signal);
       try {
         const res = await fetchLlmHttpResponse(
           url,
-          { method: "GET", headers },
+          { method: "GET", headers, signal },
           timeoutMs,
           `${this.providerLabel} model-list probe`,
         );
@@ -1137,6 +1287,7 @@ export class LmStudioClient implements LLMClient {
         }
         lastDetail = `${url} -> no models in payload`;
       } catch (err) {
+        throwIfLlmAborted(signal);
         lastDetail = `${url}: ${String(err)}`;
       }
     }
@@ -1144,39 +1295,53 @@ export class LmStudioClient implements LLMClient {
     return { models: [], detail: lastDetail };
   }
 
-  private async resolveModelForRequest(): Promise<string> {
+  private async resolveUncachedModel(signal?: AbortSignal): Promise<string> {
+    throwIfLlmAborted(signal);
+    const configuredModel = this.model.trim();
+    const discovered = await this.discoverAvailableModels(signal);
+    throwIfLlmAborted(signal);
+    const selected = pickConfiguredOrAvailableModel(configuredModel, discovered.models);
+
+    if (selected.source === "available_fallback") {
+      console.warn(
+        `[LLM] Configured model "${configuredModel || "(empty)"}" not present in ${this.providerLabel} model list; using discovered fallback "${selected.model}".`,
+      );
+    } else if (selected.source === "available_default") {
+      console.warn(
+        `[LLM] No model configured; using discovered ${this.providerLabel} model "${selected.model}".`,
+      );
+    } else if (selected.source === "default_local_model") {
+      console.warn(
+        `[LLM] No configured/discovered ${this.providerLabel} model available; falling back to default "${DEFAULT_MODEL}".`,
+      );
+    } else if (selected.source === "configured_unverified") {
+      console.warn(
+        `[LLM] Could not verify configured model "${configuredModel}" via model list (${discovered.detail}); continuing with configured model.`,
+      );
+    }
+
+    console.log(
+      `[LLM] ${this.providerLabel} resolved model "${selected.model}" (${selected.source}).`,
+    );
+    return selected.model;
+  }
+
+  private async resolveModelForRequest(signal?: AbortSignal): Promise<string> {
+    throwIfLlmAborted(signal);
     if (this.resolvedModel) return this.resolvedModel;
+
+    // A signal belongs to one request. Do not attach it to a shared discovery
+    // promise, because aborting one caller must neither strand that provider
+    // request nor cancel an unrelated caller awaiting the same promise.
+    if (signal) {
+      const resolved = await this.resolveUncachedModel(signal);
+      throwIfLlmAborted(signal);
+      this.resolvedModel = resolved;
+      return resolved;
+    }
     if (this.resolveModelPromise) return this.resolveModelPromise;
 
-    this.resolveModelPromise = (async () => {
-      const configuredModel = this.model.trim();
-      const discovered = await this.discoverAvailableModels();
-      const selected = pickConfiguredOrAvailableModel(configuredModel, discovered.models);
-
-      if (selected.source === "available_fallback") {
-        console.warn(
-          `[LLM] Configured model "${configuredModel || "(empty)"}" not present in ${this.providerLabel} model list; using discovered fallback "${selected.model}".`,
-        );
-      } else if (selected.source === "available_default") {
-        console.warn(
-          `[LLM] No model configured; using discovered ${this.providerLabel} model "${selected.model}".`,
-        );
-      } else if (selected.source === "default_local_model") {
-        console.warn(
-          `[LLM] No configured/discovered ${this.providerLabel} model available; falling back to default "${DEFAULT_MODEL}".`,
-        );
-      } else if (selected.source === "configured_unverified") {
-        console.warn(
-          `[LLM] Could not verify configured model "${configuredModel}" via model list (${discovered.detail}); continuing with configured model.`,
-        );
-      }
-
-      console.log(
-        `[LLM] ${this.providerLabel} resolved model "${selected.model}" (${selected.source}).`,
-      );
-
-      return selected.model;
-    })();
+    this.resolveModelPromise = this.resolveUncachedModel();
 
     try {
       this.resolvedModel = await this.resolveModelPromise;
@@ -1213,9 +1378,11 @@ export class LmStudioClient implements LLMClient {
       jsonSchema?: Record<string, unknown>;
       maxTokens: number;
       temperature: number;
+      signal?: AbortSignal;
     },
   ): Promise<LLMGenerateOutput> {
-    const model = await this.resolveModelForRequest();
+    throwIfLlmAborted(opts.signal);
+    const model = await this.resolveModelForRequest(opts.signal);
     const coreBody: Record<string, unknown> = {
       model,
       messages,
@@ -1280,6 +1447,7 @@ export class LmStudioClient implements LLMClient {
     let loggedSessionFallback = false;
     let loggedResponseFormatFallback = false;
     for (let i = 0; i < bodyVariants.length; i++) {
+      throwIfLlmAborted(opts.signal);
       const body = bodyVariants[i];
       const headers: Record<string, string> = {
         ...lmStudioHeaders(this.apiKey),
@@ -1295,6 +1463,7 @@ export class LmStudioClient implements LLMClient {
           method: "POST",
           headers,
           body: JSON.stringify(body),
+          signal: opts.signal,
         },
         this.httpTimeoutMs,
         `${this.providerLabel} completion request`,
@@ -1334,6 +1503,8 @@ export class LmStudioClient implements LLMClient {
       const data = (await res.json()) as any;
       const choice = data.choices?.[0];
       const text = choice?.message?.content ?? "";
+      const actualModelId =
+        typeof data.model === "string" && data.model.trim() ? data.model.trim() : model;
       if ("session_id" in body || "conversation_id" in body) {
         this.lmStudioSupportsExtendedSessionFields = true;
       }
@@ -1349,10 +1520,14 @@ export class LmStudioClient implements LLMClient {
           : undefined,
         tokenUsageFromEstimate(messages, text),
       );
-      await this.maybeReportUsage(model, usage);
+      throwIfLlmAborted(opts.signal);
+      await this.maybeReportUsage(actualModelId, usage);
+      throwIfLlmAborted(opts.signal);
 
       return {
         text,
+        provider: this.providerKind,
+        modelId: actualModelId,
         usage: {
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens,
@@ -1366,6 +1541,7 @@ export class LmStudioClient implements LLMClient {
   private async packContextInBatches(
     fullMessages: Array<{ role: string; content: string }>,
     promptTokenBudget: number,
+    signal?: AbortSignal,
   ): Promise<{ messages: Array<{ role: string; content: string }>; chunkCount: number }> {
     const tailCount = this.batchTailMessages;
     const tailMessages = fullMessages.slice(-tailCount);
@@ -1394,6 +1570,7 @@ export class LmStudioClient implements LLMClient {
 
     let memory = "";
     for (let i = 0; i < chunks.length; i++) {
+      throwIfLlmAborted(signal);
       const chunk = chunks[i];
       const packPrompt = loadPromptTemplate("remotebuddy/context_packer_user_prompt.md", {
         batch_index: String(i + 1),
@@ -1411,7 +1588,7 @@ export class LmStudioClient implements LLMClient {
           },
           { role: "user", content: packPrompt },
         ],
-        { json: false, maxTokens: packMaxTokens, temperature: 0.0 },
+        { json: false, maxTokens: packMaxTokens, temperature: 0.0, signal },
       );
       memory = packed.text.trim() || memory;
     }
@@ -1431,6 +1608,7 @@ export class LmStudioClient implements LLMClient {
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+    throwIfLlmAborted(input.signal);
     const contextWindow = this.contextWindow;
     const minOutputTokens = this.minOutputTokens;
     const desiredMaxTokens = input.maxTokens ?? 2048;
@@ -1457,7 +1635,11 @@ export class LmStudioClient implements LLMClient {
 
     if (promptTokensEstimate > promptTokenBudget) {
       try {
-        const packed = await this.packContextInBatches(fullMessages, promptTokenBudget);
+        const packed = await this.packContextInBatches(
+          fullMessages,
+          promptTokenBudget,
+          input.signal,
+        );
         messages = packed.messages;
         packedChunkCount = packed.chunkCount;
         promptTokensEstimate = sumEstimatedTokens(messages);
@@ -1479,6 +1661,7 @@ export class LmStudioClient implements LLMClient {
           latestUserOverflow = latestUserOverflow || packedTrimmed.latestUserOverflow;
         }
       } catch (err) {
+        throwIfLlmAborted(input.signal);
         throw new Error(`${this.providerLabel} batch context packing failed: ${String(err)}`);
       }
     }
@@ -1509,6 +1692,7 @@ export class LmStudioClient implements LLMClient {
       jsonSchema: input.jsonSchema,
       maxTokens: safeMaxTokens,
       temperature: input.temperature ?? 0.3,
+      signal: input.signal,
     });
   }
 }
@@ -1530,13 +1714,58 @@ function renderCodexPrompt(input: LLMGenerateInput): string {
     .map((message) => `[${message.role}]\n${message.content ?? ""}\n`)
     .join("\n");
 
-  return loadPromptTemplate("remotebuddy/codex_adapter_prompt_template.md", {
+  const promptTemplate =
+    input.executionContext?.repositoryMode === "isolated-evidence"
+      ? "remotebuddy/repository_agent_codex_prompt_template.md"
+      : "remotebuddy/codex_adapter_prompt_template.md";
+  return loadPromptTemplate(promptTemplate, {
     json_requirements: jsonRequirements,
     json_schema_block: jsonSchemaBlock,
     max_tokens_line: maxTokensLine,
     system_instruction: input.system,
     conversation_transcript: conversationTranscript,
   });
+}
+
+type CodexExecutionWorkspace = {
+  cwd: string;
+  repositoryMode: "isolated-evidence" | "none";
+  cleanup: () => void;
+};
+
+async function prepareCodexExecutionWorkspace(
+  input: LLMGenerateInput,
+): Promise<CodexExecutionWorkspace> {
+  throwIfLlmAborted(input.signal);
+  const repositoryMode = input.executionContext?.repositoryMode ?? "none";
+  if (repositoryMode !== "isolated-evidence") {
+    return { cwd: process.cwd(), repositoryMode: "none", cleanup: () => undefined };
+  }
+  if (
+    "cwd" in (input.executionContext as Record<string, unknown>) &&
+    String((input.executionContext as Record<string, unknown>).cwd ?? "").trim()
+  ) {
+    throw new Error("Codex isolated-evidence execution does not accept a target repository cwd.");
+  }
+
+  const cwd = mkdtempSync(join(tmpdir(), "pushpals-repository-agent-neutral-"));
+  const cleanup = () => rmSync(cwd, { recursive: true, force: true });
+  try {
+    const initialized = await runProcess(["git", "init", "--quiet"], {
+      cwd,
+      env: process.env,
+      timeoutMs: 5_000,
+      signal: input.signal,
+    });
+    if (initialized.timedOut || initialized.code !== 0) {
+      const detail = (initialized.stderr || initialized.stdout || "git init failed").trim();
+      throw new Error(`Cannot prepare isolated Repository Agent workspace: ${detail}`);
+    }
+    return { cwd, repositoryMode, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }
 
 export class OpenAiCodexCliClient implements LLMClient {
@@ -1608,11 +1837,13 @@ export class OpenAiCodexCliClient implements LLMClient {
   private async ensureChatGptLoginReady(
     commandPrefix: string[],
     env: NodeJS.ProcessEnv,
+    signal?: AbortSignal,
   ): Promise<void> {
     const status = await runProcess([...commandPrefix, "login", "status"], {
       cwd: process.cwd(),
       env,
       timeoutMs: 25_000,
+      signal,
     });
     if (status.code === 0) return;
     const detail = (status.stderr || status.stdout || "").trim();
@@ -1646,19 +1877,32 @@ export class OpenAiCodexCliClient implements LLMClient {
 
   private async runCodexExec(
     prompt: string,
+    cwd: string,
+    repositoryMode: "isolated-evidence" | "none",
+    signal?: AbortSignal,
   ): Promise<{ text: string; stderr: string; model: string }> {
     return this.runCodexExecAttempt(prompt, {
       model: this.model,
       modelCompatibilityRecoveryAttempt: 0,
+      cwd,
+      repositoryMode,
+      signal,
     });
   }
 
   private async runCodexExecAttempt(
     prompt: string,
-    opts: { model: string; modelCompatibilityRecoveryAttempt: number },
+    opts: {
+      model: string;
+      modelCompatibilityRecoveryAttempt: number;
+      cwd: string;
+      repositoryMode: "isolated-evidence" | "none";
+      signal?: AbortSignal;
+    },
   ): Promise<{ text: string; stderr: string; model: string }> {
+    throwIfLlmAborted(opts.signal);
     const model = normalizeCodexModel(opts.model);
-    const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
+    const commandPrefix = await resolveCodexCommandPrefix(this.codexBin, opts.signal);
     const env: NodeJS.ProcessEnv = { ...process.env };
     env.PYTHONIOENCODING = "utf-8";
     env.PUSHPALS_LLM_SERVICE = this.service;
@@ -1669,7 +1913,7 @@ export class OpenAiCodexCliClient implements LLMClient {
       delete env.OPENAI_API_KEY;
       delete env.OPENAI_BASE_URL;
       delete env.OPENAI_API_BASE;
-      await this.ensureChatGptLoginReady(commandPrefix, env);
+      await this.ensureChatGptLoginReady(commandPrefix, env, opts.signal);
     } else {
       const finalApiKey = this.apiKey || (process.env.OPENAI_API_KEY ?? "").trim();
       if (!finalApiKey) {
@@ -1696,11 +1940,31 @@ export class OpenAiCodexCliClient implements LLMClient {
         ...commandPrefix,
         "-c",
         `model_reasoning_effort="${codexReasoningEffort(this.reasoningEffort, model)}"`,
+        ...(opts.repositoryMode === "isolated-evidence"
+          ? [
+              // The model receives a bounded evidence packet and no repository
+              // inspection tools. Fail closed if these controls are unsupported.
+              "-c",
+              "project_doc_max_bytes=0",
+              "-c",
+              "project_doc_fallback_filenames=[]",
+              "-c",
+              'web_search="disabled"',
+              "--strict-config",
+              "--disable",
+              "shell_tool",
+              "--disable",
+              "apps",
+            ]
+          : []),
         "-a",
         "never",
         "-s",
         "read-only",
         "exec",
+        ...(opts.repositoryMode === "isolated-evidence"
+          ? ["--ignore-user-config", "--ignore-rules", "--ephemeral"]
+          : []),
         "--color",
         "never",
         "--output-last-message",
@@ -1712,10 +1976,11 @@ export class OpenAiCodexCliClient implements LLMClient {
       command.push("-");
 
       const result = await runProcess(command, {
-        cwd: process.cwd(),
+        cwd: opts.cwd,
         env,
         stdin: prompt,
         timeoutMs: codexTimeoutMs(this.codexTimeoutMs),
+        signal: opts.signal,
       });
       if (result.timedOut) {
         throw new Error(
@@ -1741,6 +2006,9 @@ export class OpenAiCodexCliClient implements LLMClient {
           return this.runCodexExecAttempt(prompt, {
             model: LEGACY_CODEX_MODEL_FALLBACK,
             modelCompatibilityRecoveryAttempt: opts.modelCompatibilityRecoveryAttempt + 1,
+            cwd: opts.cwd,
+            repositoryMode: opts.repositoryMode,
+            signal: opts.signal,
           });
         }
         throw new Error(`Codex CLI request failed (exit ${result.code ?? "unknown"}): ${detail}`);
@@ -1756,26 +2024,41 @@ export class OpenAiCodexCliClient implements LLMClient {
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+    throwIfLlmAborted(input.signal);
     const prompt = renderCodexPrompt(input);
-    const result = await this.runCodexExec(prompt);
-    if (result.stderr) {
-      const firstLine = result.stderr.split(/\r?\n/).find((line) => line.trim().length > 0);
-      if (firstLine) {
-        console.warn(`[LLM] Codex CLI stderr (${this.service}): ${firstLine.trim()}`);
+    const workspace = await prepareCodexExecutionWorkspace(input);
+    try {
+      const result = await this.runCodexExec(
+        prompt,
+        workspace.cwd,
+        workspace.repositoryMode,
+        input.signal,
+      );
+      throwIfLlmAborted(input.signal);
+      if (result.stderr) {
+        const firstLine = result.stderr.split(/\r?\n/).find((line) => line.trim().length > 0);
+        if (firstLine) {
+          console.warn(`[LLM] Codex CLI stderr (${this.service}): ${firstLine.trim()}`);
+        }
       }
+      const usage = normalizeTokenUsage(undefined, {
+        promptTokens: estimateTokensFromText(prompt),
+        completionTokens: estimateTokensFromText(result.text),
+      });
+      await this.maybeReportUsage({ ...usage, modelId: result.model });
+      throwIfLlmAborted(input.signal);
+      return {
+        text: result.text,
+        provider: "openai_codex",
+        modelId: result.model,
+        usage: {
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+        },
+      };
+    } finally {
+      workspace.cleanup();
     }
-    const usage = normalizeTokenUsage(undefined, {
-      promptTokens: estimateTokensFromText(prompt),
-      completionTokens: estimateTokensFromText(result.text),
-    });
-    await this.maybeReportUsage({ ...usage, modelId: result.model });
-    return {
-      text: result.text,
-      usage: {
-        promptTokens: usage.promptTokens,
-        completionTokens: usage.completionTokens,
-      },
-    };
   }
 }
 
@@ -1804,18 +2087,21 @@ export class OllamaClient implements LLMClient {
     this.httpTimeoutMs = resolveLlmHttpTimeoutMs(opts?.httpTimeoutMs, DEFAULT_LLM_HTTP_TIMEOUT_MS);
   }
 
-  private async maybeReportUsage(usage: {
-    promptTokens: number;
-    completionTokens: number;
-    estimated: boolean;
-  }): Promise<void> {
+  private async maybeReportUsage(
+    modelId: string,
+    usage: {
+      promptTokens: number;
+      completionTokens: number;
+      estimated: boolean;
+    },
+  ): Promise<void> {
     if (!this.usageReporter) return;
     try {
       await this.usageReporter.reportUsage({
         service: this.service,
         sessionId: this.sessionTag || undefined,
         backend: "ollama",
-        modelId: this.model,
+        modelId,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         totalTokens: usage.promptTokens + usage.completionTokens,
@@ -1887,6 +2173,7 @@ export class OllamaClient implements LLMClient {
   }
 
   async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+    throwIfLlmAborted(input.signal);
     const body: Record<string, unknown> = {
       model: this.model,
       messages: [
@@ -1913,6 +2200,7 @@ export class OllamaClient implements LLMClient {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: input.signal,
       },
       this.httpTimeoutMs,
       "Ollama completion request",
@@ -1925,13 +2213,19 @@ export class OllamaClient implements LLMClient {
 
     const data = (await res.json()) as any;
     const text = data.message?.content ?? "";
+    const actualModelId =
+      typeof data.model === "string" && data.model.trim() ? data.model.trim() : this.model;
     const usage = normalizeTokenUsage(
       undefined,
       tokenUsageFromEstimate(body.messages as Array<{ role: string; content: string }>, text),
     );
-    await this.maybeReportUsage(usage);
+    throwIfLlmAborted(input.signal);
+    await this.maybeReportUsage(actualModelId, usage);
+    throwIfLlmAborted(input.signal);
     return {
       text,
+      provider: "ollama",
+      modelId: actualModelId,
       usage: {
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,

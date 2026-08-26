@@ -1,5 +1,8 @@
 import { basename, dirname, resolve } from "path";
-import { runBoundedProcess as runBoundedWorkerProcess } from "shared";
+import {
+  mergeRepositoryValidationSteps,
+  runBoundedProcess as runBoundedWorkerProcess,
+} from "shared";
 
 type LogFn = (stream: "stdout" | "stderr", line: string) => void;
 
@@ -35,6 +38,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function normalizeBranchName(
   value: unknown,
   resolutionType: "merge_conflict" | "integration_reconcile",
+  branchPrefix: unknown = "agent/",
 ): string {
   const trimmed = String(value ?? "")
     .trim()
@@ -43,7 +47,18 @@ function normalizeBranchName(
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/^\/+|\/+$/g, "");
-  if (resolutionType === "merge_conflict" && !normalized.startsWith("agent/")) return "";
+  const normalizedPrefix = String(branchPrefix ?? "")
+    .trim()
+    .replace(/^refs\/heads\//, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+/g, "");
+  if (
+    resolutionType === "merge_conflict" &&
+    (!normalizedPrefix || !normalized.startsWith(normalizedPrefix))
+  ) {
+    return "";
+  }
   if (
     normalized.includes("..") ||
     normalized.includes("@{") ||
@@ -127,41 +142,6 @@ function deriveRipgrepQueries(paths: string[]): string[] {
   return dedupeStrings(paths.map((entry) => basename(entry)).filter(Boolean), 8);
 }
 
-function isTestPath(path: string): boolean {
-  return /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path);
-}
-
-function formatBunTestPathArg(path: string): string {
-  const normalized = String(path ?? "")
-    .replace(/\\/g, "/")
-    .trim();
-  if (!normalized) return normalized;
-  const pathArg =
-    normalized.startsWith("./") ||
-    normalized.startsWith("../") ||
-    normalized.startsWith("/") ||
-    /^[A-Za-z]:\//.test(normalized)
-      ? normalized
-      : `./${normalized}`;
-  return quoteValidationCommandArg(pathArg);
-}
-
-function quoteValidationCommandArg(arg: string): string {
-  if (!/[\s"\\]/.test(arg)) return arg;
-  return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
-
-function deriveValidationSteps(existing: unknown, conflictPaths: string[]): string[] {
-  const preserved = Array.isArray(existing)
-    ? existing.map((entry) => String(entry ?? "").trim()).filter(Boolean)
-    : [];
-  const targeted = conflictPaths
-    .filter(isTestPath)
-    .map((entry) => `bun test ${formatBunTestPathArg(entry)}`);
-  const merged = dedupeStrings([...targeted, ...preserved], 8);
-  return merged.length > 0 ? merged : ["bun test"];
-}
-
 function extractConflictPaths(stdout: string): string[] {
   return dedupeStrings(
     String(stdout ?? "")
@@ -233,6 +213,7 @@ export function extractMergeConflictReviewContext(
   const publicBranch = normalizeBranchName(
     params?.completionBranch ?? reviewAgent.prHeadRef,
     resolutionType,
+    reviewAgent.branchPrefix,
   );
   const baseBranch = normalizeBaseBranch(reviewAgent.prBaseRef);
   if (!publicBranch || !baseBranch || publicBranch === baseBranch) return null;
@@ -319,7 +300,12 @@ export function applyMergeConflictExecutionHints(
       16,
     );
     planning.discovery = discovery;
-    planning.validationSteps = deriveValidationSteps(planning.validationSteps, hintedPaths);
+    planning.validationSteps = mergeRepositoryValidationSteps({
+      repoRoot: preparation.repoPath,
+      changedPaths: hintedPaths,
+      existingSteps: planning.validationSteps,
+      maxSteps: 8,
+    });
   }
 
   next.planning = planning;

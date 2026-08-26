@@ -83,6 +83,16 @@ This keeps provider-specific auth behavior in one place and reduces duplicated a
 - SCM records the processed PR URL when marking completions processed (`/completions/:id/processed` with `prUrl`).
 - SCM emits pusher/status messages with created/reused PR URLs for operator visibility.
 - ReviewAgent fix jobs carry structured `reviewAgent` metadata (`prNumber`, `prUrl`, `prHeadRef`, previous score/summary, etc.).
+- A published PR remains an awaiting-review delivery until the provider confirms
+  `merged` or `closed_unmerged`; approval alone is not counted as successful
+  delivery.
+- Provider reconciliation remains active when AI review is disabled or its
+  runtime is temporarily unready. Readiness changes update the live agent in
+  place, preserving provider cursors, retries, and review fairness state.
+- Durable normalized PR outcomes resolve every job linked to the same PR while
+  retaining newer jobs if a previously closed PR is reopened. Provider event
+  timestamps and job generations prevent delayed close events from masking a
+  newer attempt, while a confirmed merge remains monotonic.
 
 ## Recovery and Safety Features
 
@@ -99,6 +109,20 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
 - `/health` becomes unhealthy when an active tick stops making progress or an
   old publication backlog remains idle; the embedded supervisor then terminates
   the full Windows process tree with `taskkill /T /F` and restarts SCM,
+- `/health.reviewProvider` reports provider poll timestamps, consecutive
+  failures, retry backlog, and the durable-link cursor. Provider API outages are
+  exposed as a degraded component without restarting the otherwise healthy
+  publication loop,
+- missing provider credentials, an unsupported remote, or an unresolved remote
+  are reported as an explicit degraded provider state instead of disappearing
+  from health telemetry; a provider poll that remains in flight for five minutes
+  is reported as stalled and makes `/health` restartable,
+- runtime reconfiguration retires a ReviewAgent only after its active polls
+  drain, preventing the old and replacement agents from publishing overlapping
+  provider outcomes,
+- GitHub open/closed scans keep bounded page cursors, so each poll has a fixed
+  API-work ceiling while long-running reconciliation still reaches PRs beyond
+  the newest page window,
 - trusted validation and configured checks terminate their Windows descendant
   trees on timeout and stop draining inherited output pipes after a bounded grace;
   trusted-host commands default to an eight-minute ceiling,
@@ -111,6 +135,10 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
 - bounded review diff size,
 - overlap-safe poll loop (skips concurrent poll tick overlap),
 - protected branch safeguards for post-merge deletion.
+
+Review-fix and merge-conflict jobs derive validation from the target
+repository's changed paths and nearest manifests. They do not assume PushPals'
+package manager or test command.
 
 ## Debugging Checklist
 

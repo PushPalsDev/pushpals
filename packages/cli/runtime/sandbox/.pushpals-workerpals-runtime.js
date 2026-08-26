@@ -2,15 +2,18 @@
 // @bun
 
 // apps/workerpals/src/workerpals_main.ts
-import { randomUUID as randomUUID2 } from "crypto";
+import { randomUUID as randomUUID3 } from "crypto";
 import { mkdirSync as mkdirSync5 } from "fs";
-import { resolve as resolve12 } from "path";
+import { resolve as resolve13 } from "path";
 
 // packages/shared/src/repo.ts
 import { existsSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
 
 // packages/shared/src/bounded_process.ts
+function abortReason(signal) {
+  return signal.reason instanceof Error ? signal.reason : new DOMException("The subprocess was aborted", "AbortError");
+}
 var DEFAULT_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 var DEFAULT_DRAIN_TIMEOUT_MS = 2000;
 var DEFAULT_TERMINATION_TIMEOUT_MS = 5000;
@@ -258,6 +261,8 @@ async function terminateProcessTree(proc, options = {}) {
   await settleWithin(proc.exited, exitGraceMs);
 }
 async function runBoundedProcess(argv, options) {
+  if (options.signal?.aborted)
+    throw abortReason(options.signal);
   const spawn = options.spawn ?? defaultSpawner;
   const platform = options.platform ?? process.platform;
   const proc = spawn(argv, {
@@ -283,8 +288,27 @@ async function runBoundedProcess(argv, options) {
   let effectiveTimeoutMs = timeoutMs;
   let deadlineAtMs = startedAtMs + timeoutMs;
   let timer = null;
+  let removeAbortListener = () => {
+    return;
+  };
+  const aborted = new Promise((resolve) => {
+    const onAbort = () => resolve({
+      timedOut: false,
+      aborted: true,
+      exitCode: 130,
+      reason: abortReason(options.signal)
+    });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+    if (options.signal?.aborted)
+      onAbort();
+  });
   const outcome = await Promise.race([
-    proc.exited.then((exitCode) => ({ timedOut: false, exitCode })),
+    proc.exited.then((exitCode) => ({
+      timedOut: false,
+      aborted: false,
+      exitCode
+    })),
     new Promise((resolve) => {
       const scheduleDeadline = () => {
         timer = setTimeout(() => {
@@ -312,22 +336,24 @@ async function runBoundedProcess(argv, options) {
           try {
             options.onTimeout?.(Math.max(1, nowMs - startedAtMs));
           } catch {}
-          resolve({ timedOut: true, exitCode: 124 });
+          resolve({ timedOut: true, aborted: false, exitCode: 124 });
         }, Math.max(1, deadlineAtMs - Date.now()));
       };
       scheduleDeadline();
-    })
+    }),
+    ...options.signal ? [aborted] : []
   ]);
   if (timer)
     clearTimeout(timer);
+  removeAbortListener();
   const terminate = options.terminate ?? ((target) => terminateProcessTree(target, { platform, spawn }));
-  if (outcome.timedOut)
+  if (outcome.timedOut || outcome.aborted)
     await terminate(proc);
   const drainTimeoutMs = Math.max(1, options.streamDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
   let streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), drainTimeoutMs);
   const drainTimedOut = !streams.settled;
   if (!streams.settled) {
-    if (!outcome.timedOut) {
+    if (!outcome.timedOut && !outcome.aborted) {
       if (options.terminate) {
         await options.terminate(proc);
       } else {
@@ -346,6 +372,8 @@ async function runBoundedProcess(argv, options) {
   const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
   const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
   const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
+  if (outcome.aborted)
+    throw outcome.reason;
   return {
     stdout: trimOutput(stdout),
     stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
@@ -420,6 +448,117 @@ function detectRepoRoot(startDir) {
   console.warn(`[repo] No .git directory found, using: ${startDir}`);
   return startDir;
 }
+// packages/shared/src/git_backend.ts
+function trimToken(value) {
+  return String(value ?? "").trim();
+}
+function firstNonEmpty(env, keys) {
+  for (const key of keys) {
+    const value = trimToken(env[key]);
+    if (value)
+      return value;
+  }
+  return "";
+}
+function parseGitRemoteHost(remoteUrl) {
+  const raw = trimToken(remoteUrl);
+  if (!raw)
+    return "";
+  const patterns = [
+    /^https?:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
+    /^ssh:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
+    /^(?:[^@:\s]+@)?([^:/\s]+):[^?\s]+$/i
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    const host = match?.[1] ? trimToken(match[1]) : "";
+    if (host)
+      return host.toLowerCase();
+  }
+  return "";
+}
+function inferGitBackendFromRemote(remoteUrl) {
+  const host = parseGitRemoteHost(remoteUrl);
+  if (!host)
+    return "unknown";
+  if (host === "github.com" || host.endsWith(".github.com") || host.includes("github")) {
+    return "github";
+  }
+  if (host === "gitlab.com" || host.endsWith(".gitlab.com") || host.includes("gitlab")) {
+    return "gitlab";
+  }
+  return "unknown";
+}
+async function defaultRunCommand(command, cwd) {
+  try {
+    const result = await runBoundedProcess(command, {
+      cwd,
+      timeoutMs: 1e4,
+      outputLimitBytes: 256 * 1024
+    });
+    return {
+      ok: result.exitCode === 0,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: String(err),
+      exitCode: 127
+    };
+  }
+}
+async function resolveGitHubCliToken(host, runCommand, cwd) {
+  const useHostname = host && host !== "github.com";
+  const command = useHostname ? ["gh", "auth", "token", "--hostname", host] : ["gh", "auth", "token"];
+  const result = await runCommand(command, cwd);
+  return result.ok ? trimToken(result.stdout) : "";
+}
+async function resolveGitLabCliToken(runCommand, cwd) {
+  const result = await runCommand(["glab", "auth", "token"], cwd);
+  return result.ok ? trimToken(result.stdout) : "";
+}
+async function resolveGitTokenForRemote(options) {
+  const configuredToken = trimToken(options.configuredToken);
+  const host = parseGitRemoteHost(options.remoteUrl);
+  const backend = inferGitBackendFromRemote(options.remoteUrl);
+  const env = options.env ?? process.env;
+  if (configuredToken) {
+    return { backend, host, token: configuredToken, source: "configured" };
+  }
+  const envVarOrder = backend === "gitlab" ? ["PUSHPALS_GIT_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"] : backend === "github" ? ["PUSHPALS_GIT_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] : ["PUSHPALS_GIT_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"];
+  const envToken = firstNonEmpty(env, envVarOrder);
+  if (envToken) {
+    return { backend, host, token: envToken, source: "env" };
+  }
+  const runCommand = options.runCommand ?? defaultRunCommand;
+  let cliToken = "";
+  if (backend === "github") {
+    cliToken = await resolveGitHubCliToken(host, runCommand, options.cwd);
+  } else if (backend === "gitlab") {
+    cliToken = await resolveGitLabCliToken(runCommand, options.cwd);
+  } else {
+    cliToken = await resolveGitHubCliToken(host, runCommand, options.cwd);
+    if (!cliToken) {
+      cliToken = await resolveGitLabCliToken(runCommand, options.cwd);
+    }
+  }
+  if (cliToken) {
+    return { backend, host, token: cliToken, source: "cli" };
+  }
+  return { backend, host, token: "", source: "none" };
+}
+// packages/shared/src/repository_snapshot.ts
+var DEFAULT_DIFF_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
+var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
+var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
+var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
+// packages/shared/src/memory.ts
+import { createHash, randomUUID } from "crypto";
+
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
 async function fetchWithHardDeadline(options) {
@@ -528,6 +667,1359 @@ async function fetchBufferedWithHardDeadline(options) {
           reader.releaseLock();
         } catch {}
       }
+    }
+  });
+}
+
+// packages/shared/src/memory.ts
+var MEMORY_REINFORCEMENT_OUTCOMES = Object.freeze([
+  "confirmed",
+  "successful",
+  "failed",
+  "contradicted"
+]);
+var MEMORY_LIMITS = Object.freeze({
+  namespaceChars: 128,
+  repositoryIdChars: 256,
+  sessionIdChars: 256,
+  keyChars: 512,
+  kindChars: 128,
+  subjectKeyChars: 512,
+  summaryChars: 16000,
+  listItems: 128,
+  listItemChars: 256,
+  tagChars: 128,
+  evidenceItems: 128,
+  evidencePathChars: 1000,
+  evidenceBlobOidChars: 256,
+  evidenceSourceIdChars: 512,
+  evidenceDetailChars: 2000,
+  provenanceServiceChars: 128,
+  provenanceFieldChars: 512,
+  searchTextChars: 2000,
+  selectorReasonChars: 1000,
+  recordIdChars: 256,
+  searchMaxItems: 128,
+  searchMaxChars: 1e6,
+  searchCandidateRows: 4096
+});
+var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
+var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
+var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
+  "repository_agent_cache",
+  "repository_facts"
+]);
+var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+
+class MemoryConflictError extends Error {
+  code;
+  constructor(message, code = "conflict") {
+    super(message);
+    this.name = "MemoryConflictError";
+    this.code = code;
+  }
+}
+
+class MemoryStoreClosedError extends Error {
+  constructor() {
+    super("Memory store is closed");
+    this.name = "MemoryStoreClosedError";
+  }
+}
+
+class MemoryValidationError extends TypeError {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.name = "MemoryValidationError";
+    this.code = code;
+  }
+}
+
+class MemoryHttpError extends Error {
+  status;
+  code;
+  constructor(message, status = 0, code) {
+    super(message);
+    this.name = "MemoryHttpError";
+    this.status = status;
+    this.code = typeof code === "string" && code.trim() ? code.trim() : null;
+  }
+}
+function isMemoryReinforcementOutcome(value) {
+  return typeof value === "string" && MEMORY_REINFORCEMENT_OUTCOMES.includes(value);
+}
+function assertMemoryReinforcementOutcome(value) {
+  if (isMemoryReinforcementOutcome(value))
+    return;
+  throw new MemoryValidationError(`memory reinforcement outcome must be one of: ${MEMORY_REINFORCEMENT_OUTCOMES.join(", ")}`, "invalid_reinforcement_outcome");
+}
+function normalizedText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+function requiredText(value, label) {
+  const normalized = normalizedText(value);
+  if (!normalized)
+    throw new TypeError(`${label} is required`);
+  return normalized;
+}
+function compactText(value, maxChars) {
+  return normalizedText(value).slice(0, maxChars);
+}
+function boundedAddressText(value, label, maxChars, required) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    if (required)
+      throw new TypeError(`${label} is required`);
+    return null;
+  }
+  if (normalized.length > maxChars) {
+    throw new TypeError(`${label} must be at most ${maxChars} characters`);
+  }
+  if (normalized.includes("\x00"))
+    throw new TypeError(`${label} must not contain NUL characters`);
+  return normalized;
+}
+function normalizedOptionalText(value) {
+  return normalizedText(value) || null;
+}
+function normalizeScope(scope) {
+  return {
+    namespace: boundedAddressText(scope?.namespace, "memory scope namespace", MEMORY_LIMITS.namespaceChars, true),
+    repositoryId: boundedAddressText(scope?.repositoryId, "memory scope repositoryId", MEMORY_LIMITS.repositoryIdChars, false),
+    sessionId: boundedAddressText(scope?.sessionId, "memory scope sessionId", MEMORY_LIMITS.sessionIdChars, false)
+  };
+}
+function scopeKey(scope) {
+  const normalized = normalizeScope(scope);
+  return JSON.stringify([
+    normalized.namespace,
+    normalized.repositoryId ?? "",
+    normalized.sessionId ?? ""
+  ]);
+}
+function addressKey(address) {
+  const key = boundedAddressText(address.key, "memory key", MEMORY_LIMITS.keyChars, true);
+  return `${scopeKey(address.scope)}\x00${key}`;
+}
+function clampUnit(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed))
+    return fallback;
+  return Math.max(0, Math.min(1, parsed));
+}
+function normalizedStringList(values, maxItems = MEMORY_LIMITS.listItems, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!Array.isArray(values))
+    return [];
+  const output = [];
+  const seen = new Set;
+  for (const value of values) {
+    const item = compactText(value, maxChars);
+    if (!item || seen.has(item))
+      continue;
+    seen.add(item);
+    output.push(item);
+    if (output.length >= maxItems)
+      break;
+  }
+  return output;
+}
+function normalizeEvidence(evidence) {
+  if (!Array.isArray(evidence))
+    return [];
+  const output = [];
+  for (const raw of evidence.slice(0, MEMORY_LIMITS.evidenceItems)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      continue;
+    const row = raw;
+    const path = compactText(row.path, MEMORY_LIMITS.evidencePathChars).replace(/\\/g, "/") || undefined;
+    if (path && (/^(?:[a-z]:)?\//i.test(path) || path.split("/").includes(".."))) {
+      throw new TypeError("memory evidence paths must be repository-relative and contained");
+    }
+    const normalized = {
+      ...path ? { path } : {},
+      ...compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) ? { blobOid: compactText(row.blobOid, MEMORY_LIMITS.evidenceBlobOidChars) } : {},
+      ...compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) ? { sourceId: compactText(row.sourceId, MEMORY_LIMITS.evidenceSourceIdChars) } : {},
+      ...compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) ? { detail: compactText(row.detail, MEMORY_LIMITS.evidenceDetailChars) } : {},
+      ...normalizedOptionalText(row.observedAt) ? { observedAt: normalizeTimestamp(row.observedAt, "evidence observedAt") } : {}
+    };
+    if (Object.keys(normalized).length > 0)
+      output.push(normalized);
+  }
+  return output;
+}
+function normalizeProvenance(value) {
+  const service = compactText(value?.service, MEMORY_LIMITS.provenanceServiceChars);
+  if (!service)
+    throw new TypeError("memory provenance service is required");
+  const optional = (input) => compactText(input, MEMORY_LIMITS.provenanceFieldChars) || undefined;
+  return {
+    service,
+    ...optional(value.agentId) ? { agentId: optional(value.agentId) } : {},
+    ...optional(value.runId) ? { runId: optional(value.runId) } : {},
+    ...optional(value.requestId) ? { requestId: optional(value.requestId) } : {},
+    ...optional(value.jobId) ? { jobId: optional(value.jobId) } : {},
+    ...optional(value.modelId) ? { modelId: optional(value.modelId) } : {},
+    ...optional(value.headSha) ? { headSha: optional(value.headSha) } : {},
+    ...optional(value.promptVersion) ? { promptVersion: optional(value.promptVersion) } : {}
+  };
+}
+function normalizeTimestamp(value, label) {
+  const timestamp = compactText(value, 64);
+  const parsed = Date.parse(timestamp);
+  if (!timestamp || !Number.isFinite(parsed))
+    throw new TypeError(`${label} must be an ISO timestamp`);
+  return new Date(parsed).toISOString();
+}
+function normalizeStatus(value, fallback = "active") {
+  return value === "active" || value === "stale" || value === "superseded" || value === "invalid" ? value : fallback;
+}
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function cloneObservation(observation) {
+  return {
+    ...observation,
+    ...observation.evidence ? { evidence: observation.evidence.map((entry) => ({ ...entry })) } : {},
+    ...observation.provenance ? { provenance: { ...observation.provenance } } : {}
+  };
+}
+function cloneRecord(record) {
+  return {
+    ...record,
+    scope: { ...record.scope },
+    value: record.value == null ? null : cloneJson(record.value),
+    tags: [...record.tags],
+    evidence: record.evidence.map((entry) => ({ ...entry })),
+    observations: record.observations.map(cloneObservation),
+    provenance: { ...record.provenance }
+  };
+}
+function serializedMemoryRecordChars(record) {
+  return JSON.stringify(record).length;
+}
+function isExpired(record, nowMs) {
+  return record.expiresAt != null && Date.parse(record.expiresAt) <= nowMs;
+}
+function sameScope(left, right) {
+  return scopeKey(left) === scopeKey(right);
+}
+function matchesAny(value, candidates, maxChars = MEMORY_LIMITS.listItemChars) {
+  if (!candidates || candidates.length === 0)
+    return true;
+  if (value == null)
+    return false;
+  return new Set(normalizedStringList(candidates, MEMORY_LIMITS.listItems, maxChars).map((entry) => entry.toLowerCase())).has(value.toLowerCase());
+}
+function hasAllTags(record, tags) {
+  const requested = normalizedStringList(tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars).map((tag) => tag.toLowerCase());
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.tags.map((tag) => tag.toLowerCase()));
+  return requested.every((tag) => available.has(tag));
+}
+function hasAnyEvidencePath(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.some((path) => available.has(path));
+}
+function hasAllEvidencePaths(record, paths) {
+  const requested = normalizedStringList(paths, MEMORY_LIMITS.listItems, MEMORY_LIMITS.evidencePathChars).map((path) => path.replace(/\\/g, "/"));
+  if (requested.length === 0)
+    return true;
+  const available = new Set(record.evidence.map((entry) => entry.path?.replace(/\\/g, "/")).filter((path) => Boolean(path)));
+  return requested.every((path) => available.has(path));
+}
+function resolveMemoryReinforcement(record, outcome, requestedWeight = 1) {
+  assertMemoryReinforcementOutcome(outcome);
+  const parsedWeight = Number(requestedWeight);
+  const weight = Math.max(0, Math.min(4, Number.isFinite(parsedWeight) ? parsedWeight : 1));
+  const positive = outcome === "confirmed" || outcome === "successful";
+  const confidence = positive ? record.confidence + (1 - record.confidence) * 0.15 * weight : record.confidence * (1 - 0.25 * weight);
+  const usefulness = positive ? record.usefulness + (1 - record.usefulness) * 0.12 * weight : record.usefulness * (1 - 0.2 * weight);
+  const status = outcome === "contradicted" ? "superseded" : positive && record.status === "stale" ? "active" : record.status;
+  return {
+    weight,
+    confidence: clampUnit(confidence, record.confidence),
+    usefulness: clampUnit(usefulness, record.usefulness),
+    status
+  };
+}
+function reinforcementObservationId(recordId, input) {
+  const explicit = normalizedOptionalText(input.observationId);
+  const provenance = input.provenance;
+  const inferredParts = provenance ? [
+    normalizedOptionalText(provenance.service),
+    normalizedOptionalText(provenance.requestId),
+    normalizedOptionalText(provenance.jobId),
+    normalizedOptionalText(provenance.runId)
+  ].filter((part) => part != null) : [];
+  const inferredIdentity = inferredParts.length > 1 ? inferredParts.join("\x00") : null;
+  if (!explicit && !inferredIdentity)
+    return randomUUID();
+  const identity = explicit ? [recordId, "explicit", explicit] : [recordId, "inferred", inferredIdentity, input.outcome];
+  return `observation_${createHash("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 32)}`;
+}
+function createMemoryReinforcementObservation(recordId, input, observedAt) {
+  assertMemoryReinforcementOutcome(input.outcome);
+  const effect = resolveMemoryReinforcement({ confidence: 0, usefulness: 0, status: "active" }, input.outcome, input.weight);
+  const evidence = normalizeEvidence(input.evidence);
+  return {
+    id: reinforcementObservationId(recordId, input),
+    outcome: input.outcome,
+    weight: effect.weight,
+    observedAt: normalizeTimestamp(observedAt, "reinforcement observedAt"),
+    ...evidence.length > 0 ? { evidence } : {},
+    ...input.provenance ? { provenance: normalizeProvenance(input.provenance) } : {}
+  };
+}
+function appendMemoryReinforcementObservation(existing, observation) {
+  const prior = existing.find((entry) => entry.id === observation.id);
+  if (prior)
+    assertMemoryReinforcementObservationCompatible(prior, observation);
+  const appended = prior == null;
+  const candidates = appended ? [...existing, observation] : existing;
+  const seen = new Set;
+  const observations = [];
+  for (let index = candidates.length - 1;index >= 0; index--) {
+    const candidate = candidates[index];
+    if (!candidate || seen.has(candidate.id))
+      continue;
+    seen.add(candidate.id);
+    observations.unshift(cloneObservation(candidate));
+    if (observations.length >= MAX_MEMORY_REINFORCEMENT_OBSERVATIONS)
+      break;
+  }
+  return { observations, appended };
+}
+function canonicalObservationPayload(observation) {
+  const evidence = (observation.evidence ?? []).map((entry) => JSON.stringify({
+    path: entry.path ?? null,
+    blobOid: entry.blobOid ?? null,
+    sourceId: entry.sourceId ?? null,
+    detail: entry.detail ?? null,
+    observedAt: entry.observedAt ?? null
+  })).sort();
+  const provenance = observation.provenance ? {
+    service: observation.provenance.service,
+    agentId: observation.provenance.agentId ?? null,
+    runId: observation.provenance.runId ?? null,
+    requestId: observation.provenance.requestId ?? null,
+    jobId: observation.provenance.jobId ?? null,
+    modelId: observation.provenance.modelId ?? null,
+    headSha: observation.provenance.headSha ?? null,
+    promptVersion: observation.provenance.promptVersion ?? null
+  } : null;
+  return JSON.stringify({
+    outcome: observation.outcome,
+    weight: observation.weight,
+    evidence,
+    provenance
+  });
+}
+function assertMemoryReinforcementObservationCompatible(existing, candidate) {
+  if (existing.id !== candidate.id)
+    return;
+  if (canonicalObservationPayload(existing) === canonicalObservationPayload(candidate))
+    return;
+  throw new MemoryConflictError(`Memory observation conflict for ${candidate.id}: the id was already used for a different outcome payload`);
+}
+function memoryRecordRankingQuality(record) {
+  return (clampUnit(record.confidence, 0.5) + clampUnit(record.usefulness, 0.5)) / 2;
+}
+function searchScore(record, text) {
+  const tokens = normalizedText(text).toLowerCase().split(/[^a-z0-9_.\/-]+/).filter((token) => token.length > 1).slice(0, 64);
+  if (tokens.length === 0)
+    return 0;
+  const subject = (record.subjectKey ?? "").toLowerCase();
+  const haystack = [record.key, record.kind, subject, record.summary, ...record.tags].join(" ").toLowerCase();
+  let score = 0;
+  for (const token of new Set(tokens)) {
+    if (record.key.toLowerCase() === token || subject === token)
+      score += 6;
+    else if (record.key.toLowerCase().includes(token) || subject.includes(token))
+      score += 3;
+    else if (haystack.includes(token))
+      score += 1;
+  }
+  return score;
+}
+
+class InMemoryMemoryStore {
+  records = new Map;
+  now;
+  closed = false;
+  constructor(options = {}) {
+    this.now = options.now ?? (() => new Date);
+  }
+  assertOpen() {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+  }
+  async put(input, options = {}) {
+    this.assertOpen();
+    const normalizedScope = normalizeScope(input.scope);
+    const key = boundedAddressText(input.key, "memory key", MEMORY_LIMITS.keyChars, true);
+    const storageKey = addressKey({ scope: normalizedScope, key });
+    const existing = this.records.get(storageKey);
+    if (options.expectedRevision != null) {
+      const actualRevision = existing?.revision ?? 0;
+      if (actualRevision !== options.expectedRevision) {
+        throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
+      }
+    }
+    const now = this.now().toISOString();
+    let expiresAt;
+    if (input.expiresAt !== undefined) {
+      expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
+    } else if (input.ttlMs !== undefined && input.ttlMs !== null) {
+      const ttlMs = Number(input.ttlMs);
+      if (!Number.isFinite(ttlMs) || ttlMs <= 0)
+        throw new TypeError("ttlMs must be positive");
+      expiresAt = new Date(Date.parse(now) + Math.floor(ttlMs)).toISOString();
+    } else {
+      expiresAt = existing?.expiresAt ?? null;
+    }
+    const status = normalizeStatus(input.status, existing?.status ?? "active");
+    const preserveLearnedScores = existing != null && options.expectedRevision === undefined;
+    const remainsInvalid = status === "invalid" && existing?.status === "invalid";
+    const record = {
+      id: existing?.id ?? randomUUID(),
+      scope: normalizedScope,
+      key,
+      kind: requiredText(compactText(input.kind, MEMORY_LIMITS.kindChars), "memory kind"),
+      subjectKey: compactText(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null,
+      summary: requiredText(compactText(input.summary, MEMORY_LIMITS.summaryChars), "memory summary"),
+      value: input.value == null ? null : cloneJson(input.value),
+      tags: normalizedStringList(input.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars),
+      evidence: normalizeEvidence(input.evidence),
+      observations: existing?.observations.map(cloneObservation) ?? [],
+      provenance: existing?.provenance ?? normalizeProvenance(input.provenance),
+      confidence: preserveLearnedScores ? existing.confidence : clampUnit(input.confidence, existing?.confidence ?? 0.5),
+      usefulness: preserveLearnedScores ? existing.usefulness : clampUnit(input.usefulness, existing?.usefulness ?? 0.5),
+      status,
+      revision: (existing?.revision ?? 0) + 1,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      expiresAt,
+      invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
+      invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
+    };
+    this.records.set(storageKey, record);
+    return cloneRecord(record);
+  }
+  async get(address, options = {}) {
+    this.assertOpen();
+    const record = this.records.get(addressKey(address));
+    if (!record)
+      return null;
+    if (!options.includeExpired && isExpired(record, this.now().getTime()))
+      return null;
+    const statuses = options.statuses?.length ? options.statuses : ["active"];
+    if (!statuses.includes(record.status))
+      return null;
+    return cloneRecord(record);
+  }
+  async search(query) {
+    this.assertOpen();
+    const scope = normalizeScope(query.scope);
+    const statuses = query.statuses?.length ? query.statuses : ["active"];
+    const nowMs = this.now().getTime();
+    const candidates = [...this.records.values()].filter((record) => sameScope(record.scope, scope)).filter((record) => query.includeExpired || !isExpired(record, nowMs)).filter((record) => statuses.includes(record.status)).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.revision - left.revision || left.key.localeCompare(right.key)).slice(0, MEMORY_LIMITS.searchCandidateRows);
+    const scored = candidates.filter((record) => matchesAny(record.kind, query.kinds, MEMORY_LIMITS.kindChars)).filter((record) => matchesAny(record.subjectKey, query.subjectKeys, MEMORY_LIMITS.subjectKeyChars)).filter((record) => hasAllTags(record, query.tags)).filter((record) => hasAllEvidencePaths(record, query.evidencePaths)).map((record) => ({
+      record,
+      score: searchScore(record, compactText(query.text, MEMORY_LIMITS.searchTextChars))
+    })).filter((entry) => !compactText(query.text, MEMORY_LIMITS.searchTextChars) || entry.score > 0).sort((left, right) => right.score - left.score || memoryRecordRankingQuality(right.record) - memoryRecordRankingQuality(left.record) || Date.parse(right.record.updatedAt) - Date.parse(left.record.updatedAt) || right.record.revision - left.record.revision || left.record.key.localeCompare(right.record.key));
+    const requestedMaxItems = Number(query.maxItems ?? 12);
+    const maxItems = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxItems, Number.isFinite(requestedMaxItems) ? Math.floor(requestedMaxItems) : 12));
+    const requestedMaxChars = Number(query.maxChars ?? 16000);
+    const maxChars = Math.max(1, Math.min(MEMORY_LIMITS.searchMaxChars, Number.isFinite(requestedMaxChars) ? Math.floor(requestedMaxChars) : 16000));
+    const output = [];
+    let usedChars = 0;
+    for (const { record } of scored) {
+      if (output.length >= maxItems)
+        break;
+      const cloned = cloneRecord(record);
+      const cost = serializedMemoryRecordChars(cloned);
+      if (usedChars + cost > maxChars)
+        continue;
+      output.push(cloned);
+      usedChars += cost;
+    }
+    return output;
+  }
+  async invalidate(selector) {
+    this.assertOpen();
+    const scope = normalizeScope(selector.scope);
+    const reason = compactText(selector.reason, MEMORY_LIMITS.selectorReasonChars) || "invalidated";
+    const now = this.now().toISOString();
+    let changed = 0;
+    for (const [key, record] of this.records) {
+      if (!sameScope(record.scope, scope))
+        continue;
+      if (!matchesAny(record.key, selector.keys, MEMORY_LIMITS.keyChars))
+        continue;
+      if (!matchesAny(record.kind, selector.kinds, MEMORY_LIMITS.kindChars))
+        continue;
+      if (!matchesAny(record.subjectKey, selector.subjectKeys, MEMORY_LIMITS.subjectKeyChars))
+        continue;
+      if (!hasAllTags(record, selector.tags))
+        continue;
+      if (!hasAnyEvidencePath(record, selector.evidencePaths))
+        continue;
+      if (selector.statuses?.length && !selector.statuses.includes(record.status))
+        continue;
+      if (record.status === "invalid")
+        continue;
+      this.records.set(key, {
+        ...record,
+        status: "invalid",
+        revision: record.revision + 1,
+        updatedAt: now,
+        invalidatedAt: now,
+        invalidationReason: reason
+      });
+      changed++;
+    }
+    return changed;
+  }
+  async reinforce(input) {
+    this.assertOpen();
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const storageKey = addressKey(input);
+    const record = this.records.get(storageKey);
+    if (!record)
+      return null;
+    if (input.expectedId !== undefined) {
+      const expectedId = boundedAddressText(input.expectedId, "memory expectedId", MEMORY_LIMITS.recordIdChars, true);
+      if (record.id !== expectedId) {
+        throw new MemoryConflictError(`Memory record conflict for ${record.scope.namespace}/${record.key}: expected id ${expectedId}, got ${record.id}`, "record_conflict");
+      }
+    }
+    const effect = resolveMemoryReinforcement(record, input.outcome, input.weight);
+    const now = this.now().toISOString();
+    const observation = createMemoryReinforcementObservation(record.id, input, now);
+    const appended = appendMemoryReinforcementObservation(record.observations, observation);
+    if (!appended.appended)
+      return cloneRecord(record);
+    const updated = {
+      ...record,
+      confidence: effect.confidence,
+      usefulness: effect.usefulness,
+      status: effect.status,
+      evidence: input.evidence && input.evidence.length > 0 ? normalizeEvidence([...record.evidence, ...input.evidence]) : record.evidence,
+      observations: appended.observations,
+      provenance: record.provenance,
+      revision: record.revision + 1,
+      updatedAt: now,
+      invalidatedAt: effect.status === "invalid" ? record.invalidatedAt : null,
+      invalidationReason: effect.status === "invalid" ? record.invalidationReason : null
+    };
+    this.records.set(storageKey, updated);
+    return cloneRecord(updated);
+  }
+  async prune(options = {}) {
+    this.assertOpen();
+    const expiryCutoff = options.expiredBefore ? Date.parse(normalizeTimestamp(options.expiredBefore, "expiredBefore")) : this.now().getTime();
+    const updatedCutoff = options.updatedBefore ? Date.parse(normalizeTimestamp(options.updatedBefore, "updatedBefore")) : null;
+    const ageStatuses = options.statuses?.length ? options.statuses : ["invalid", "superseded"];
+    let removed = 0;
+    for (const [key, record] of this.records) {
+      if (options.scope && !sameScope(record.scope, options.scope))
+        continue;
+      const expired = record.expiresAt != null && Date.parse(record.expiresAt) <= expiryCutoff;
+      const agedTerminal = updatedCutoff != null && ageStatuses.includes(record.status) && Date.parse(record.updatedAt) <= updatedCutoff;
+      if (!expired && !agedTerminal)
+        continue;
+      this.records.delete(key);
+      removed++;
+    }
+    return removed;
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+
+class MemoryHttpClient {
+  serverUrl;
+  authToken;
+  callerService;
+  authority;
+  fetchImpl;
+  timeoutMs;
+  maxResponseBytes;
+  closed = false;
+  constructor(options) {
+    this.serverUrl = requiredText(options.serverUrl, "memory server URL").replace(/\/+$/, "");
+    this.authToken = normalizedOptionalText(options.authToken);
+    const callerService = normalizedText(options.callerService ?? "client");
+    if (callerService !== "server" && callerService !== "localbuddy" && callerService !== "remotebuddy" && callerService !== "workerpals" && callerService !== "source_control_manager" && callerService !== "repository_agent" && callerService !== "cli" && callerService !== "client") {
+      throw new TypeError(`Unsupported memory caller service: ${callerService}`);
+    }
+    this.callerService = callerService;
+    const authority = normalizedOptionalText(options.authority);
+    if (authority && authority !== "repository_agent" && authority !== "server") {
+      throw new TypeError(`Unsupported memory authority: ${authority}`);
+    }
+    this.authority = authority === "repository_agent" || authority === "server" ? authority : null;
+    this.fetchImpl = options.fetchImpl;
+    const requestedTimeoutMs = Number(options.timeoutMs ?? 1e4);
+    this.timeoutMs = Math.max(1, Math.min(120000, Number.isFinite(requestedTimeoutMs) ? Math.floor(requestedTimeoutMs) : 1e4));
+    const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
+    this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
+  }
+  async request(path, method, body) {
+    if (this.closed)
+      throw new MemoryStoreClosedError;
+    const headers = {
+      "Content-Type": "application/json",
+      [MEMORY_HTTP_CALLER_HEADER]: this.callerService,
+      ...this.authority ? { [MEMORY_HTTP_AUTHORITY_HEADER]: this.authority } : {}
+    };
+    if (this.authToken)
+      headers.Authorization = `Bearer ${this.authToken}`;
+    const response = await fetchBufferedWithHardDeadline({
+      input: `${this.serverUrl}${path}`,
+      init: { method, headers, body: JSON.stringify(body) },
+      timeoutMs: this.timeoutMs,
+      maxResponseBytes: this.maxResponseBytes,
+      fetchImpl: this.fetchImpl,
+      timeoutMessage: `Memory request ${method} ${path} timed out after ${this.timeoutMs}ms`
+    });
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch {
+      if (response.ok)
+        throw new MemoryHttpError("Memory server returned invalid JSON", response.status);
+    }
+    if (!response.ok || payload.ok === false) {
+      const detail = normalizedText(payload.message ?? payload.error) || response.statusText || "request failed";
+      if (response.status === 409) {
+        throw new MemoryConflictError(detail, payload.code === "record_conflict" ? "record_conflict" : "conflict");
+      }
+      throw new MemoryHttpError(`Memory server request failed: ${detail}`, response.status, payload.code);
+    }
+    return payload;
+  }
+  async put(input, options = {}) {
+    const payload = await this.request("/memory/records", "PUT", { input, options });
+    if (!payload.record)
+      throw new MemoryHttpError("Memory server response omitted record");
+    return payload.record;
+  }
+  async get(address, options = {}) {
+    const payload = await this.request("/memory/get", "POST", { address, options });
+    return payload.record ?? null;
+  }
+  async search(query) {
+    const payload = await this.request("/memory/search", "POST", { query });
+    if (!Array.isArray(payload.records)) {
+      throw new MemoryHttpError("Memory server response omitted records");
+    }
+    return payload.records;
+  }
+  async invalidate(selector) {
+    const payload = await this.request("/memory/invalidate", "POST", { selector });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async reinforce(input) {
+    assertMemoryReinforcementOutcome(input?.outcome);
+    const payload = await this.request("/memory/reinforce", "POST", { input });
+    return payload.record ?? null;
+  }
+  async prune(options = {}) {
+    const payload = await this.request("/memory/prune", "POST", { options });
+    return Math.max(0, Math.floor(Number(payload.count ?? 0)) || 0);
+  }
+  async close() {
+    this.closed = true;
+  }
+}
+// packages/shared/src/repository_agent.ts
+var REPOSITORY_AGENT_SCHEMA_VERSION = 1;
+var REPOSITORY_AGENT_LIMITS = Object.freeze({
+  requestBytes: 256 * 1024,
+  responseBytes: 2 * 1024 * 1024,
+  deadlineHorizonMs: 60 * 60000,
+  questionChars: 32000,
+  contextChars: 96000,
+  contextDepth: 8,
+  contextEntries: 1024,
+  contextStringChars: 16000,
+  answerChars: 128000,
+  summaryChars: 16000,
+  evidenceItems: 128,
+  recommendationItems: 64,
+  validationProposalItems: 32,
+  memoryRefItems: 128
+});
+
+class RepositoryAgentClientError extends Error {
+  code;
+  status;
+  requestId;
+  retryAfterMs;
+  remoteCode;
+  detail;
+  retryable;
+  constructor(code, message, options = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "RepositoryAgentClientError";
+    this.code = code;
+    this.status = options.status ?? null;
+    this.requestId = options.requestId ?? null;
+    this.retryAfterMs = options.retryAfterMs ?? null;
+    this.remoteCode = options.remoteCode ?? null;
+    this.detail = options.detail ?? null;
+    this.retryable = options.retryable ?? null;
+  }
+}
+var CALLER_SERVICES = new Set([
+  "server",
+  "localbuddy",
+  "remotebuddy",
+  "workerpals",
+  "source_control_manager",
+  "repository_agent",
+  "cli",
+  "client"
+]);
+var PURPOSES = new Set([
+  "architecture",
+  "priority",
+  "ownership",
+  "validation",
+  "debug",
+  "impact",
+  "general"
+]);
+var PRIORITIES = new Set(["interactive", "normal", "background"]);
+var FRESHNESS_VALUES = new Set([
+  "cache_preferred",
+  "fresh_required",
+  "cache_only"
+]);
+var MEMORY_ROLES = new Set([
+  "analysis_cache",
+  "evidence_fact",
+  "recalled_fact"
+]);
+var REQUEST_STATUSES = new Set([
+  "queued",
+  "claimed",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+var TERMINAL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "expired"
+]);
+function invalidRequest(message) {
+  throw new RepositoryAgentClientError("invalid_request", message);
+}
+function invalidResponse(message) {
+  throw new RepositoryAgentClientError("invalid_response", message);
+}
+function contractViolation(source, message) {
+  return source === "request" ? invalidRequest(message) : invalidResponse(message);
+}
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function requiredString(value, label, maxChars, source) {
+  if (typeof value !== "string") {
+    return source === "request" ? invalidRequest(`${label} must be a string`) : invalidResponse(`${label} must be a string`);
+  }
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized) {
+    return source === "request" ? invalidRequest(`${label} is required`) : invalidResponse(`${label} is required`);
+  }
+  if (normalized.length > maxChars) {
+    return source === "request" ? invalidRequest(`${label} exceeds ${maxChars} characters`) : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+  }
+  return normalized;
+}
+function optionalString(value, maxChars) {
+  if (typeof value !== "string")
+    return;
+  const normalized = value.replace(/\u0000/g, "").trim();
+  if (!normalized)
+    return;
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(1, maxChars - 14))}...[truncated]`;
+}
+function finiteInt(value, options) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    if (options.fallback !== undefined)
+      return options.fallback;
+    invalidResponse("Expected a finite integer");
+  }
+  return Math.max(options.min, Math.min(options.max, Math.floor(parsed)));
+}
+function normalizedIso(value, label, source) {
+  const raw = requiredString(value, label, 128, source);
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) {
+    return source === "request" ? invalidRequest(`${label} must be a valid ISO-8601 timestamp`) : invalidResponse(`${label} must be a valid ISO-8601 timestamp`);
+  }
+  return new Date(parsed).toISOString();
+}
+function sanitizeRelativePath(value, label) {
+  const path = optionalString(value, 1024)?.replace(/\\/g, "/");
+  if (!path || path.startsWith("/") || /^[a-z]:\//i.test(path))
+    return null;
+  const segments = path.split("/").filter(Boolean);
+  if (segments.some((segment) => segment === ".." || segment === "."))
+    return null;
+  return segments.join("/") || (label === "cwd" && path === "." ? "." : null);
+}
+function sanitizeJsonValue(value, label, depth, budget, source) {
+  if (depth > REPOSITORY_AGENT_LIMITS.contextDepth) {
+    contractViolation(source, `${label} exceeds maximum nesting depth`);
+  }
+  if (value === null || typeof value === "boolean")
+    return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      contractViolation(source, `${label} contains a non-finite number`);
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    if (value.length > REPOSITORY_AGENT_LIMITS.contextStringChars) {
+      contractViolation(source, `${label} contains a string longer than ${REPOSITORY_AGENT_LIMITS.contextStringChars} characters`);
+    }
+    budget.chars += value.length;
+    if (budget.chars > REPOSITORY_AGENT_LIMITS.contextChars) {
+      contractViolation(source, `${label} exceeds ${REPOSITORY_AGENT_LIMITS.contextChars} characters`);
+    }
+    return value.replace(/\u0000/g, "");
+  }
+  if (Array.isArray(value)) {
+    budget.entries += value.length;
+    if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+      contractViolation(source, `${label} contains too many entries`);
+    }
+    return value.map((entry, index) => sanitizeJsonValue(entry, `${label}[${index}]`, depth + 1, budget, source));
+  }
+  if (!isRecord(value)) {
+    contractViolation(source, `${label} must contain JSON-compatible values`);
+  }
+  const entries = Object.entries(value);
+  budget.entries += entries.length;
+  if (budget.entries > REPOSITORY_AGENT_LIMITS.contextEntries) {
+    contractViolation(source, `${label} contains too many entries`);
+  }
+  const output = {};
+  for (const [rawKey, entry] of entries) {
+    const key = rawKey.replace(/\u0000/g, "").trim();
+    if (!key || key.length > 256) {
+      contractViolation(source, `${label} contains an invalid key`);
+    }
+    if (["__proto__", "prototype", "constructor"].includes(key)) {
+      contractViolation(source, `${label} contains an unsafe key`);
+    }
+    budget.chars += key.length;
+    output[key] = sanitizeJsonValue(entry, `${label}.${key}`, depth + 1, budget, source);
+  }
+  return output;
+}
+function sanitizeContext(value, label = "context", source = "request") {
+  if (value == null)
+    return;
+  if (!isRecord(value))
+    contractViolation(source, `${label} must be an object`);
+  return sanitizeJsonValue(value, label, 0, { entries: 0, chars: 0 }, source);
+}
+function sanitizeCaller(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("caller must be an object") : invalidResponse("caller must be an object");
+  }
+  const service = requiredString(value.service, "caller.service", 64, source);
+  if (!CALLER_SERVICES.has(service)) {
+    return source === "request" ? invalidRequest(`Unsupported caller.service: ${service}`) : invalidResponse(`Unsupported caller.service: ${service}`);
+  }
+  return {
+    service,
+    ...optionalString(value.instanceId, 256) ? { instanceId: optionalString(value.instanceId, 256) } : {},
+    ...optionalString(value.sessionId, 256) ? { sessionId: optionalString(value.sessionId, 256) } : {},
+    ...optionalString(value.correlationId, 256) ? { correlationId: optionalString(value.correlationId, 256) } : {}
+  };
+}
+function sanitizeRepository(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("repository must be an object") : invalidResponse("repository must be an object");
+  }
+  if (typeof value.dirty !== "boolean") {
+    return source === "request" ? invalidRequest("repository.dirty must be a boolean") : invalidResponse("repository.dirty must be a boolean");
+  }
+  return {
+    identity: requiredString(value.identity, "repository.identity", 1024, source),
+    root: requiredString(value.root, "repository.root", 4096, source),
+    revision: requiredString(value.revision, "repository.revision", 512, source),
+    tree: requiredString(value.tree, "repository.tree", 512, source),
+    dirty: value.dirty
+  };
+}
+function sanitizeRequest(value, source) {
+  if (!isRecord(value)) {
+    return source === "request" ? invalidRequest("Repository Agent request must be an object") : invalidResponse("Repository Agent request must be an object");
+  }
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    return source === "request" ? invalidRequest(`schemaVersion must be ${REPOSITORY_AGENT_SCHEMA_VERSION}`) : invalidResponse(`Unsupported Repository Agent schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const purpose = requiredString(value.purpose, "purpose", 32, source);
+  const priority = requiredString(value.priority, "priority", 32, source);
+  const freshness = requiredString(value.freshness, "freshness", 32, source);
+  if (!PURPOSES.has(purpose)) {
+    return source === "request" ? invalidRequest(`Unsupported purpose: ${purpose}`) : invalidResponse(`Unsupported purpose: ${purpose}`);
+  }
+  if (!PRIORITIES.has(priority)) {
+    return source === "request" ? invalidRequest(`Unsupported priority: ${priority}`) : invalidResponse(`Unsupported priority: ${priority}`);
+  }
+  if (!FRESHNESS_VALUES.has(freshness)) {
+    return source === "request" ? invalidRequest(`Unsupported freshness: ${freshness}`) : invalidResponse(`Unsupported freshness: ${freshness}`);
+  }
+  const deadlineAt = normalizedIso(value.deadlineAt, "deadlineAt", source);
+  if (source === "request" && Date.parse(deadlineAt) <= Date.now()) {
+    invalidRequest("deadlineAt must be in the future");
+  }
+  if (source === "request" && Date.parse(deadlineAt) - Date.now() > REPOSITORY_AGENT_LIMITS.deadlineHorizonMs) {
+    invalidRequest(`deadlineAt must be no more than ${REPOSITORY_AGENT_LIMITS.deadlineHorizonMs}ms in the future`);
+  }
+  const context = sanitizeContext(value.context, "context", source);
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    caller: sanitizeCaller(value.caller, source),
+    purpose,
+    repository: sanitizeRepository(value.repository, source),
+    question: requiredString(value.question, "question", REPOSITORY_AGENT_LIMITS.questionChars, source),
+    ...context ? { context } : {},
+    priority,
+    deadlineAt,
+    freshness,
+    idempotencyKey: requiredString(value.idempotencyKey, "idempotencyKey", 256, source)
+  };
+}
+function sanitizeStatus(value) {
+  const status = requiredString(value, "status", 32, "response");
+  if (!REQUEST_STATUSES.has(status)) {
+    invalidResponse(`Unsupported Repository Agent request status: ${status}`);
+  }
+  return status;
+}
+function sanitizeEvidence(value) {
+  if (!isRecord(value))
+    return null;
+  const path = sanitizeRelativePath(value.path, "path");
+  const revision = optionalString(value.revision, 512);
+  if (!path || !revision)
+    return null;
+  const startLine = value.startLine == null ? undefined : finiteInt(value.startLine, { min: 1, max: 1e7, fallback: 1 });
+  const endLine = value.endLine == null ? undefined : finiteInt(value.endLine, {
+    min: startLine ?? 1,
+    max: 1e7,
+    fallback: startLine ?? 1
+  });
+  return {
+    path,
+    revision,
+    ...optionalString(value.blobHash, 512) ? { blobHash: optionalString(value.blobHash, 512) } : {},
+    ...startLine == null ? {} : { startLine },
+    ...endLine == null ? {} : { endLine },
+    ...optionalString(value.excerpt, 4000) ? { excerpt: optionalString(value.excerpt, 4000) } : {},
+    ...optionalString(value.rationale, 2000) ? { rationale: optionalString(value.rationale, 2000) } : {}
+  };
+}
+function sanitizeRecommendation(value) {
+  if (!isRecord(value))
+    return null;
+  const title = optionalString(value.title, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  if (!title || !rationale)
+    return null;
+  const priority = optionalString(value.priority, 16);
+  const paths = Array.isArray(value.paths) ? value.paths.map((path) => sanitizeRelativePath(path, "path")).filter((path) => Boolean(path)).slice(0, 64) : undefined;
+  return {
+    title,
+    rationale,
+    ...priority === "high" || priority === "normal" || priority === "low" ? { priority } : {},
+    ...paths?.length ? { paths } : {}
+  };
+}
+function sanitizeValidationProposal(value) {
+  if (!isRecord(value))
+    return null;
+  const label = optionalString(value.label, 1000);
+  const rationale = optionalString(value.rationale, 4000);
+  const rawCwd = optionalString(value.cwd, 1024) ?? ".";
+  const cwd = rawCwd === "." ? "." : sanitizeRelativePath(rawCwd, "cwd");
+  const argv = Array.isArray(value.argv) ? value.argv.filter((entry) => typeof entry === "string").map((entry) => entry.replace(/\u0000/g, "").trim()).filter(Boolean).slice(0, 64).map((entry) => entry.length <= 4096 ? entry : `${entry.slice(0, 4082)}...[truncated]`) : [];
+  if (!label || !rationale || !cwd || argv.length === 0)
+    return null;
+  return { label, cwd, argv, rationale };
+}
+function sanitizeMemoryRef(value) {
+  if (!isRecord(value))
+    return null;
+  const id = optionalString(value.id, 512);
+  const namespace = optionalString(value.namespace, 256);
+  const role = optionalString(value.role, 64);
+  if (!id || !namespace || !MEMORY_ROLES.has(role))
+    return null;
+  const relevance = typeof value.relevance === "number" && Number.isFinite(value.relevance) ? Math.max(0, Math.min(1, value.relevance)) : undefined;
+  return {
+    id,
+    namespace,
+    role,
+    ...optionalString(value.key, 512) ? { key: optionalString(value.key, 512) } : {},
+    ...relevance == null ? {} : { relevance },
+    ...optionalString(value.sourceRevision, 512) ? { sourceRevision: optionalString(value.sourceRevision, 512) } : {}
+  };
+}
+function sanitizeRepositoryAgentResult(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent result must be an object");
+  if (value.schemaVersion !== REPOSITORY_AGENT_SCHEMA_VERSION) {
+    invalidResponse(`Unsupported Repository Agent result schemaVersion: ${String(value.schemaVersion)}`);
+  }
+  const requestId = requiredString(value.requestId, "result.requestId", 256, "response");
+  if (expectedRequestId && requestId !== expectedRequestId) {
+    invalidResponse(`Repository Agent result requestId does not match ${expectedRequestId}`);
+  }
+  if (!isRecord(value.analyzedRepository)) {
+    invalidResponse("result.analyzedRepository must be an object");
+  }
+  const analyzedRepository = {
+    identity: requiredString(value.analyzedRepository.identity, "result.analyzedRepository.identity", 1024, "response"),
+    revision: requiredString(value.analyzedRepository.revision, "result.analyzedRepository.revision", 512, "response"),
+    tree: requiredString(value.analyzedRepository.tree, "result.analyzedRepository.tree", 512, "response")
+  };
+  const confidence = Number(value.confidence);
+  if (!Number.isFinite(confidence))
+    invalidResponse("result.confidence must be finite");
+  const cacheRecord = isRecord(value.cache) ? value.cache : {};
+  const completedAt = normalizedIso(value.completedAt, "result.completedAt", "response");
+  const data = value.data === undefined ? undefined : sanitizeJsonValue(value.data, "result.data", 0, { entries: 0, chars: 0 }, "response");
+  return {
+    schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+    requestId,
+    analyzedRepository,
+    answer: requiredString(value.answer, "result.answer", REPOSITORY_AGENT_LIMITS.answerChars, "response"),
+    summary: requiredString(value.summary, "result.summary", REPOSITORY_AGENT_LIMITS.summaryChars, "response"),
+    ...data === undefined ? {} : { data },
+    confidence: Math.max(0, Math.min(1, confidence)),
+    evidence: (Array.isArray(value.evidence) ? value.evidence : []).slice(0, REPOSITORY_AGENT_LIMITS.evidenceItems).map(sanitizeEvidence).filter((entry) => Boolean(entry)),
+    recommendations: (Array.isArray(value.recommendations) ? value.recommendations : []).slice(0, REPOSITORY_AGENT_LIMITS.recommendationItems).map(sanitizeRecommendation).filter((entry) => Boolean(entry)),
+    validationProposals: (Array.isArray(value.validationProposals) ? value.validationProposals : []).slice(0, REPOSITORY_AGENT_LIMITS.validationProposalItems).map(sanitizeValidationProposal).filter((entry) => Boolean(entry)),
+    cache: {
+      hit: cacheRecord.hit === true,
+      key: optionalString(cacheRecord.key, 1024) ?? null,
+      ...optionalString(cacheRecord.storedAt, 128) ? { storedAt: optionalString(cacheRecord.storedAt, 128) } : {},
+      ...optionalString(cacheRecord.expiresAt, 128) ? { expiresAt: optionalString(cacheRecord.expiresAt, 128) } : {}
+    },
+    memoryRefs: (Array.isArray(value.memoryRefs) ? value.memoryRefs : []).slice(0, REPOSITORY_AGENT_LIMITS.memoryRefItems).map(sanitizeMemoryRef).filter((entry) => Boolean(entry)),
+    completedAt
+  };
+}
+function sanitizeRemoteError(value) {
+  if (!isRecord(value))
+    return;
+  const code = optionalString(value.code, 128);
+  const message = optionalString(value.message, 8000);
+  if (!code || !message)
+    return;
+  return {
+    code,
+    message,
+    ...optionalString(value.detail, 16000) ? { detail: optionalString(value.detail, 16000) } : {},
+    retryable: value.retryable === true
+  };
+}
+function sanitizeSnapshot(value, expectedRequestId) {
+  if (!isRecord(value))
+    invalidResponse("Repository Agent request snapshot must be an object");
+  const requestId = requiredString(value.requestId, "requestId", 256, "response");
+  if (requestId !== expectedRequestId)
+    invalidResponse("Repository Agent snapshot requestId mismatch");
+  const status = sanitizeStatus(value.status);
+  const result = value.result == null ? undefined : sanitizeRepositoryAgentResult(value.result, requestId);
+  const error = sanitizeRemoteError(value.error);
+  return {
+    requestId,
+    status,
+    submittedAt: normalizedIso(value.submittedAt, "submittedAt", "response"),
+    updatedAt: normalizedIso(value.updatedAt, "updatedAt", "response"),
+    ...value.pollAfterMs == null ? {} : { pollAfterMs: finiteInt(value.pollAfterMs, { min: 100, max: 30000, fallback: 1000 }) },
+    ...result ? { result } : {},
+    ...error ? { error } : {}
+  };
+}
+function normalizePositiveDuration(value, fallback, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return fallback;
+  return Math.max(1, Math.min(max, Math.floor(parsed)));
+}
+function sleepWithSignal(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+  }
+  return new Promise((resolve2, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer)
+        clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve2();
+    }, Math.max(0, ms));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+class RepositoryAgentHttpClient {
+  serverUrl;
+  authToken;
+  fetchImpl;
+  requestTimeoutMs;
+  pollIntervalMs;
+  maxResponseBytes;
+  constructor(options) {
+    const rawServerUrl = requiredString(options.serverUrl, "serverUrl", 4096, "request").replace(/\/+$/, "");
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawServerUrl);
+    } catch {
+      invalidRequest("serverUrl must be an absolute HTTP URL");
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      invalidRequest("serverUrl must use HTTP or HTTPS");
+    }
+    this.serverUrl = rawServerUrl;
+    this.authToken = optionalString(options.authToken, 8192) ?? null;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = normalizePositiveDuration(options.requestTimeoutMs, 1e4, 120000);
+    this.pollIntervalMs = normalizePositiveDuration(options.pollIntervalMs, 1000, 30000);
+    this.maxResponseBytes = normalizePositiveDuration(options.maxResponseBytes, REPOSITORY_AGENT_LIMITS.responseBytes, 16 * 1024 * 1024);
+  }
+  headers() {
+    return {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}
+    };
+  }
+  async requestJson(path, init, options = {}) {
+    const timeoutMs = normalizePositiveDuration(options.timeoutMs, this.requestTimeoutMs, 30 * 60000);
+    try {
+      const response = await fetchBufferedWithHardDeadline({
+        input: `${this.serverUrl}${path}`,
+        init: {
+          ...init,
+          headers: { ...this.headers(), ...init.headers ?? {} },
+          signal: options.signal
+        },
+        timeoutMs,
+        fetchImpl: this.fetchImpl,
+        maxResponseBytes: this.maxResponseBytes,
+        timeoutMessage: `Repository Agent request timed out after ${timeoutMs}ms`
+      });
+      const text = await response.text();
+      let payload = {};
+      if (text.trim()) {
+        try {
+          payload = JSON.parse(text);
+        } catch (cause) {
+          throw new RepositoryAgentClientError("invalid_response", "Repository Agent returned malformed JSON", { status: response.status, cause });
+        }
+      }
+      if (!isRecord(payload)) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response must be a JSON object", { status: response.status });
+      }
+      if (!response.ok) {
+        const retryAfterHeaderMs = Number(response.headers.get("retry-after")) * 1000;
+        const retryAfterMs = Number(payload.retryAfterMs);
+        throw new RepositoryAgentClientError("http_error", optionalString(payload.message, 8000) ?? `Repository Agent request failed with HTTP ${response.status}`, {
+          status: response.status,
+          requestId: optionalString(payload.requestId, 256) ?? null,
+          remoteCode: optionalString(payload.code, 128) ?? null,
+          detail: optionalString(payload.detail, 16000) ?? null,
+          retryable: typeof payload.retryable === "boolean" ? payload.retryable : response.status >= 500,
+          retryAfterMs: Number.isFinite(retryAfterMs) ? Math.max(0, Math.floor(retryAfterMs)) : Number.isFinite(retryAfterHeaderMs) ? Math.max(0, Math.floor(retryAfterHeaderMs)) : null
+        });
+      }
+      if (payload.ok !== true) {
+        throw new RepositoryAgentClientError("invalid_response", "Repository Agent response is missing an exact positive acknowledgement", { status: response.status });
+      }
+      return payload;
+    } catch (error) {
+      if (error instanceof RepositoryAgentClientError)
+        throw error;
+      if (options.signal?.aborted) {
+        throw new RepositoryAgentClientError("aborted", "Repository Agent call aborted", {
+          cause: error
+        });
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timed out|timeout/i.test(message)) {
+        throw new RepositoryAgentClientError("timeout", message, { cause: error });
+      }
+      throw new RepositoryAgentClientError("transport_error", message, { cause: error });
+    }
+  }
+}
+
+class RepositoryAgentClient extends RepositoryAgentHttpClient {
+  callerService;
+  callerInstanceId;
+  askTimeoutMs;
+  constructor(options) {
+    super(options);
+    if (!CALLER_SERVICES.has(options.callerService)) {
+      invalidRequest(`Unsupported callerService: ${String(options.callerService)}`);
+    }
+    this.callerService = options.callerService;
+    this.callerInstanceId = optionalString(options.callerInstanceId, 256);
+    this.askTimeoutMs = normalizePositiveDuration(options.askTimeoutMs, 120000, 30 * 60000);
+  }
+  buildRequest(input) {
+    const request = sanitizeRequest({
+      ...input,
+      schemaVersion: REPOSITORY_AGENT_SCHEMA_VERSION,
+      caller: {
+        ...input.caller ?? {},
+        ...this.callerInstanceId ? { instanceId: this.callerInstanceId } : {},
+        service: this.callerService
+      }
+    }, "request");
+    const encoded = JSON.stringify(request);
+    if (new TextEncoder().encode(encoded).byteLength > REPOSITORY_AGENT_LIMITS.requestBytes) {
+      invalidRequest(`Repository Agent request exceeds ${REPOSITORY_AGENT_LIMITS.requestBytes} bytes`);
+    }
+    return request;
+  }
+  async submit(input, options = {}) {
+    const request = this.buildRequest(input);
+    const payload = await this.requestJson("/repository-agent/requests", { method: "POST", body: JSON.stringify(request) }, options);
+    const requestId = requiredString(payload.requestId, "requestId", 256, "response");
+    const status = sanitizeStatus(payload.status);
+    const result = payload.result == null ? undefined : sanitizeRepositoryAgentResult(payload.result, requestId);
+    return {
+      requestId,
+      status,
+      deduplicated: payload.deduplicated === true,
+      pollAfterMs: finiteInt(payload.pollAfterMs, {
+        min: 100,
+        max: 30000,
+        fallback: this.pollIntervalMs
+      }),
+      ...result ? { result } : {}
+    };
+  }
+  async get(requestIdRaw, options = {}) {
+    const requestId = requiredString(requestIdRaw, "requestId", 256, "request");
+    const payload = await this.requestJson(`/repository-agent/requests/${encodeURIComponent(requestId)}`, { method: "GET" }, options);
+    return sanitizeSnapshot(payload.request, requestId);
+  }
+  async ask(input, options = {}) {
+    const overallTimeoutMs = normalizePositiveDuration(options.timeoutMs, this.askTimeoutMs, 30 * 60000);
+    const durableDeadlineMs = Date.parse(input.deadlineAt);
+    const deadlineMs = Math.min(Date.now() + overallTimeoutMs, durableDeadlineMs);
+    const remaining = () => Math.max(0, deadlineMs - Date.now());
+    const callOptions = () => ({
+      signal: options.signal,
+      timeoutMs: Math.max(1, Math.min(this.requestTimeoutMs, remaining()))
+    });
+    if (remaining() <= 0)
+      invalidRequest("deadlineAt must be in the future");
+    const submitted = await this.submit(input, callOptions());
+    if (submitted.status === "completed" && submitted.result)
+      return submitted.result;
+    let pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? submitted.pollAfterMs, this.pollIntervalMs, 30000);
+    while (remaining() > 0) {
+      await sleepWithSignal(Math.min(pollAfterMs, remaining()), options.signal);
+      if (remaining() <= 0)
+        break;
+      const snapshot = await this.get(submitted.requestId, callOptions());
+      if (snapshot.status === "completed") {
+        if (!snapshot.result) {
+          invalidResponse("Completed Repository Agent request has no result");
+        }
+        return snapshot.result;
+      }
+      if (snapshot.status === "failed") {
+        throw new RepositoryAgentClientError("remote_failed", snapshot.error?.message ?? "Repository Agent request failed", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "cancelled") {
+        throw new RepositoryAgentClientError("remote_cancelled", snapshot.error?.message ?? "Repository Agent request was cancelled", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      if (snapshot.status === "expired") {
+        throw new RepositoryAgentClientError("remote_expired", snapshot.error?.message ?? "Repository Agent request expired", {
+          requestId: snapshot.requestId,
+          remoteCode: snapshot.error?.code ?? null,
+          detail: snapshot.error?.detail ?? null,
+          retryable: snapshot.error?.retryable ?? null
+        });
+      }
+      pollAfterMs = normalizePositiveDuration(options.pollIntervalMs ?? snapshot.pollAfterMs, pollAfterMs, 30000);
+    }
+    throw new RepositoryAgentClientError("timeout", `Repository Agent request ${submitted.requestId} did not complete before the caller deadline`, { requestId: submitted.requestId });
+  }
+}
+function createRepositoryAgentServiceClients(options) {
+  const repositoryAgent = options.repositoryAgent ?? new RepositoryAgentClient({
+    serverUrl: options.serverUrl,
+    callerService: options.callerService,
+    callerInstanceId: options.callerInstanceId,
+    authToken: options.authToken,
+    fetchImpl: options.fetchImpl,
+    requestTimeoutMs: options.requestTimeoutMs,
+    askTimeoutMs: options.askTimeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    maxResponseBytes: options.maxResponseBytes
+  });
+  const ownsMemoryStore = options.memoryStore === undefined;
+  const memoryStore = options.memoryStore ?? new MemoryHttpClient({
+    serverUrl: options.serverUrl,
+    authToken: options.authToken,
+    callerService: options.callerService,
+    authority: options.memoryAuthority,
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.memoryTimeoutMs,
+    maxResponseBytes: options.memoryMaxResponseBytes
+  });
+  let closePromise = null;
+  return Object.freeze({
+    repositoryAgent,
+    memoryStore,
+    close() {
+      if (!closePromise) {
+        closePromise = ownsMemoryStore ? memoryStore.close() : Promise.resolve();
+      }
+      return closePromise;
     }
   });
 }
@@ -715,7 +2207,7 @@ var DEFAULT_OPENAI_CODEX_MODEL = "gpt-5.6-sol";
 var DEFAULT_OPENAI_CODEX_REASONING_EFFORT = "xhigh";
 var cachedConfig = null;
 var cachedConfigKey = "";
-function firstNonEmpty(...values) {
+function firstNonEmpty2(...values) {
   for (const value of values) {
     const trimmed = (value ?? "").trim();
     if (trimmed)
@@ -920,18 +2412,18 @@ function defaultApiKeyForBackend(backend, endpoint) {
 }
 function resolveLlmConfig(serviceNode, envPrefix, defaults, globalSessionId) {
   const llmNode = getObject(serviceNode, "llm");
-  const backend = normalizeBackend(firstNonEmpty(process.env[`${envPrefix}_LLM_BACKEND`], asString(llmNode.backend, defaults.backend), defaults.backend));
-  const endpoint = firstNonEmpty(process.env[`${envPrefix}_LLM_ENDPOINT`], asString(llmNode.endpoint, defaults.endpoint), defaults.endpoint);
-  const envModel = firstNonEmpty(process.env[`${envPrefix}_LLM_MODEL`]);
-  const configuredFileModel = firstNonEmpty(asString(llmNode.model, ""));
-  const configuredModel = firstNonEmpty(envModel, configuredFileModel);
+  const backend = normalizeBackend(firstNonEmpty2(process.env[`${envPrefix}_LLM_BACKEND`], asString(llmNode.backend, defaults.backend), defaults.backend));
+  const endpoint = firstNonEmpty2(process.env[`${envPrefix}_LLM_ENDPOINT`], asString(llmNode.endpoint, defaults.endpoint), defaults.endpoint);
+  const envModel = firstNonEmpty2(process.env[`${envPrefix}_LLM_MODEL`]);
+  const configuredFileModel = firstNonEmpty2(asString(llmNode.model, ""));
+  const configuredModel = firstNonEmpty2(envModel, configuredFileModel);
   const modelFallback = backend === "openai_codex" ? DEFAULT_OPENAI_CODEX_MODEL : defaults.model;
-  const model = backend === "openai_codex" && !envModel && (!configuredFileModel || configuredFileModel === defaults.model) ? DEFAULT_OPENAI_CODEX_MODEL : firstNonEmpty(configuredModel, modelFallback) ?? modelFallback;
-  const sessionId = firstNonEmpty(process.env[`${envPrefix}_LLM_SESSION_ID`], asString(llmNode.session_id, defaults.sessionId), process.env.PUSHPALS_LLM_SESSION_ID, globalSessionId);
-  const apiKey = firstNonEmpty(process.env[`${envPrefix}_LLM_API_KEY`], defaultApiKeyForBackend(backend, endpoint));
-  const reasoningEffort = firstNonEmpty(process.env[`${envPrefix}_LLM_REASONING_EFFORT`], asString(llmNode.reasoning_effort, ""), backend === "openai_codex" ? DEFAULT_OPENAI_CODEX_REASONING_EFFORT : "");
-  const codexAuthMode = firstNonEmpty(process.env[`${envPrefix}_LLM_CODEX_AUTH_MODE`], asString(llmNode.codex_auth_mode, ""));
-  const codexBin = firstNonEmpty(process.env[`${envPrefix}_LLM_CODEX_BIN`], asString(llmNode.codex_bin, ""));
+  const model = backend === "openai_codex" && !envModel && (!configuredFileModel || configuredFileModel === defaults.model) ? DEFAULT_OPENAI_CODEX_MODEL : firstNonEmpty2(configuredModel, modelFallback) ?? modelFallback;
+  const sessionId = firstNonEmpty2(process.env[`${envPrefix}_LLM_SESSION_ID`], asString(llmNode.session_id, defaults.sessionId), process.env.PUSHPALS_LLM_SESSION_ID, globalSessionId);
+  const apiKey = firstNonEmpty2(process.env[`${envPrefix}_LLM_API_KEY`], defaultApiKeyForBackend(backend, endpoint));
+  const reasoningEffort = firstNonEmpty2(process.env[`${envPrefix}_LLM_REASONING_EFFORT`], asString(llmNode.reasoning_effort, ""), backend === "openai_codex" ? DEFAULT_OPENAI_CODEX_REASONING_EFFORT : "");
+  const codexAuthMode = firstNonEmpty2(process.env[`${envPrefix}_LLM_CODEX_AUTH_MODE`], asString(llmNode.codex_auth_mode, ""));
+  const codexBin = firstNonEmpty2(process.env[`${envPrefix}_LLM_CODEX_BIN`], asString(llmNode.codex_bin, ""));
   const codexTimeoutMs = Math.max(1e4, asInt(parseIntEnv(`${envPrefix}_LLM_CODEX_TIMEOUT_MS`) ?? llmNode.codex_timeout_ms, 120000));
   return {
     backend,
@@ -946,22 +2438,22 @@ function resolveLlmConfig(serviceNode, envPrefix, defaults, globalSessionId) {
   };
 }
 function loadPushPalsConfig(options = {}) {
-  const projectRootOverride = firstNonEmpty(options.projectRoot, process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE, PROJECT_ROOT);
+  const projectRootOverride = firstNonEmpty2(options.projectRoot, process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE, PROJECT_ROOT);
   const projectRoot = resolve3(projectRootOverride);
-  const configDirOverride = firstNonEmpty(options.configDir, process.env.PUSHPALS_CONFIG_DIR_OVERRIDE, "");
+  const configDirOverride = firstNonEmpty2(options.configDir, process.env.PUSHPALS_CONFIG_DIR_OVERRIDE, "");
   const configDir = resolveRuntimeConfigDir(projectRoot, configDirOverride);
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;
   }
   const defaultToml = parseRequiredTomlFile(join2(configDir, "default.toml"));
-  const preferredProfile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(defaultToml.profile, "dev"), "dev");
+  const preferredProfile = firstNonEmpty2(process.env.PUSHPALS_PROFILE, asString(defaultToml.profile, "dev"), "dev");
   const profileToml = parseTomlFile(join2(configDir, `${preferredProfile}.toml`));
   const localExampleToml = parseTomlFile(join2(configDir, "local.example.toml"));
   const localToml = parseTomlFile(join2(configDir, "local.toml"));
   const merged = mergeDeep(mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml), localToml);
-  const profile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(merged.profile, preferredProfile), preferredProfile);
-  const sessionId = firstNonEmpty(process.env.PUSHPALS_SESSION_ID, asString(merged.session_id, "dev"), "dev");
+  const profile = firstNonEmpty2(process.env.PUSHPALS_PROFILE, asString(merged.profile, preferredProfile), preferredProfile);
+  const sessionId = firstNonEmpty2(process.env.PUSHPALS_SESSION_ID, asString(merged.session_id, "dev"), "dev");
   const llmNode = getObject(merged, "llm");
   const lmStudioNode = getObject(llmNode, "lmstudio");
   const lmStudioContextWindow = Math.max(512, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_CONTEXT_WINDOW") ?? lmStudioNode.context_window, 4096));
@@ -971,13 +2463,13 @@ function loadPushPalsConfig(options = {}) {
   const lmStudioBatchChunkTokens = Math.max(0, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_BATCH_CHUNK_TOKENS") ?? lmStudioNode.batch_chunk_tokens, 0));
   const lmStudioBatchMemoryChars = Math.max(0, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_BATCH_MEMORY_CHARS") ?? lmStudioNode.batch_memory_chars, 0));
   const pathsNode = getObject(merged, "paths");
-  const dataDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DATA_DIR, asString(pathsNode.data_dir, "outputs/data")));
-  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join2(dataDir, "pushpals.db"))));
-  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join2(dataDir, "remotebuddy-state.db"))));
+  const dataDir = resolvePathFromRoot(projectRoot, firstNonEmpty2(process.env.PUSHPALS_DATA_DIR, asString(pathsNode.data_dir, "outputs/data")));
+  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty2(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join2(dataDir, "pushpals.db"))));
+  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty2(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join2(dataDir, "remotebuddy-state.db"))));
   const serverNode = getObject(merged, "server");
   const serverPort = Math.max(1, asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001));
-  const serverUrl = normalizeLoopbackHttpUrl(firstNonEmpty(process.env.PUSHPALS_SERVER_URL, asString(serverNode.url, `http://127.0.0.1:${serverPort}`), `http://127.0.0.1:${serverPort}`), serverPort);
-  const serverHost = normalizeLoopbackHost(firstNonEmpty(process.env.PUSHPALS_HOST, asString(serverNode.host, "127.0.0.1")));
+  const serverUrl = normalizeLoopbackHttpUrl(firstNonEmpty2(process.env.PUSHPALS_SERVER_URL, asString(serverNode.url, `http://127.0.0.1:${serverPort}`), `http://127.0.0.1:${serverPort}`), serverPort);
+  const serverHost = normalizeLoopbackHost(firstNonEmpty2(process.env.PUSHPALS_HOST, asString(serverNode.host, "127.0.0.1")));
   const debugHttp = parseBoolEnv("PUSHPALS_DEBUG_HTTP") ?? asBoolean(serverNode.debug_http, false);
   const staleClaimTtlMs = Math.max(5000, asInt(parseIntEnv("PUSHPALS_STALE_CLAIM_TTL_MS") ?? serverNode.stale_claim_ttl_ms, 120000));
   const staleClaimSweepIntervalMs = Math.max(1000, asInt(parseIntEnv("PUSHPALS_STALE_CLAIM_SWEEP_INTERVAL_MS") ?? serverNode.stale_claim_sweep_interval_ms, 5000));
@@ -1067,7 +2559,7 @@ function loadPushPalsConfig(options = {}) {
   }
   const workerNode = getObject(merged, "workerpals");
   const workerOpenHandsNode = getObject(workerNode, "openhands");
-  const workerExecutionPlatform = normalizeWorkerPalsExecutionPlatform(firstNonEmpty(process.env.WORKERPALS_EXECUTION_PLATFORM, process.env.PUSHPALS_WORKERPALS_EXECUTION_PLATFORM, asString(workerNode.execution_platform, DEFAULT_WORKERPALS_EXECUTION_PLATFORM), DEFAULT_WORKERPALS_EXECUTION_PLATFORM));
+  const workerExecutionPlatform = normalizeWorkerPalsExecutionPlatform(firstNonEmpty2(process.env.WORKERPALS_EXECUTION_PLATFORM, process.env.PUSHPALS_WORKERPALS_EXECUTION_PLATFORM, asString(workerNode.execution_platform, DEFAULT_WORKERPALS_EXECUTION_PLATFORM), DEFAULT_WORKERPALS_EXECUTION_PLATFORM));
   const configuredRemoteWorkerpalDocker = parseBoolEnv("REMOTEBUDDY_WORKERPAL_DOCKER") ?? asBoolean(remoteNode.workerpal_docker, true);
   const configuredRemoteWorkerpalRequireDocker = parseBoolEnv("REMOTEBUDDY_WORKERPAL_REQUIRE_DOCKER") ?? asBoolean(remoteNode.workerpal_require_docker, true);
   const configuredWorkerRequireDocker = parseBoolEnv("WORKERPALS_REQUIRE_DOCKER") ?? asBoolean(workerNode.require_docker, false);
@@ -1076,17 +2568,17 @@ function loadPushPalsConfig(options = {}) {
   const effectiveWorkerRequireDocker = workerExecutionPlatform === "windows" ? false : workerExecutionPlatform === "linux_docker" ? true : configuredWorkerRequireDocker;
   const workerPollMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_POLL_MS") ?? workerNode.poll_ms, 2000));
   const workerHeartbeatMs = Math.max(200, asInt(parseIntEnv("WORKERPALS_HEARTBEAT_MS") ?? workerNode.heartbeat_ms, 5000));
-  const workerExecutor = firstNonEmpty(process.env.WORKERPALS_EXECUTOR, asString(workerNode.executor, DEFAULT_WORKERPALS_EXECUTOR), DEFAULT_WORKERPALS_EXECUTOR).toLowerCase();
-  const workerOpenHandsPython = firstNonEmpty(process.env.WORKERPALS_OPENHANDS_PYTHON, asString(workerNode.openhands_python, "python"), "python");
+  const workerExecutor = firstNonEmpty2(process.env.WORKERPALS_EXECUTOR, asString(workerNode.executor, DEFAULT_WORKERPALS_EXECUTOR), DEFAULT_WORKERPALS_EXECUTOR).toLowerCase();
+  const workerOpenHandsPython = firstNonEmpty2(process.env.WORKERPALS_OPENHANDS_PYTHON, asString(workerNode.openhands_python, "python"), "python");
   const workerOpenHandsTimeoutMs = Math.max(1e4, asInt(parseIntEnv("WORKERPALS_OPENHANDS_TIMEOUT_MS") ?? workerNode.openhands_timeout_ms, 1800000));
-  const workerMiniswePython = firstNonEmpty(process.env.WORKERPALS_MINISWE_PYTHON, asString(workerNode.miniswe_python, "python"), "python");
+  const workerMiniswePython = firstNonEmpty2(process.env.WORKERPALS_MINISWE_PYTHON, asString(workerNode.miniswe_python, "python"), "python");
   const workerMinisweTimeoutMs = Math.max(1e4, asInt(parseIntEnv("WORKERPALS_MINISWE_TIMEOUT_MS") ?? workerNode.miniswe_timeout_ms, 1800000));
-  const workerOpenAICodexPython = firstNonEmpty(process.env.PUSHPALS_OPENAI_CODEX_PYTHON, asString(workerNode.openai_codex_python, "python"), "python");
+  const workerOpenAICodexPython = firstNonEmpty2(process.env.PUSHPALS_OPENAI_CODEX_PYTHON, asString(workerNode.openai_codex_python, "python"), "python");
   const workerOpenAICodexTimeoutMs = Math.max(1e4, asInt(workerNode.openai_codex_timeout_ms, 7200000));
   const workerQualityMaxAutoRevisions = Math.max(0, Math.min(10, asInt(parseIntEnv("WORKERPALS_QUALITY_MAX_AUTO_REVISIONS") ?? workerNode.quality_max_auto_revisions, DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS)));
   const workerQualityValidationMaxAutoRevisions = Math.max(0, Math.min(10, asInt(parseIntEnv("WORKERPALS_QUALITY_VALIDATION_MAX_AUTO_REVISIONS") ?? workerNode.quality_validation_max_auto_revisions, DEFAULT_WORKERPALS_QUALITY_MAX_AUTO_REVISIONS)));
   const workerFileModifyingJobs = (() => {
-    const envRaw = firstNonEmpty(process.env.WORKERPALS_FILE_MODIFYING_JOBS);
+    const envRaw = firstNonEmpty2(process.env.WORKERPALS_FILE_MODIFYING_JOBS);
     const parsed = envRaw ? envRaw.split(",").map((entry) => entry.trim()).filter(Boolean) : asStringArray(workerNode.file_modifying_jobs);
     const out = parsed.length > 0 ? parsed : DEFAULT_WORKERPALS_FILE_MODIFYING_JOBS;
     return [...new Set(out)];
@@ -1104,13 +2596,13 @@ function loadPushPalsConfig(options = {}) {
   const workerQualityPublishGateEnabled = parseBoolEnv("WORKERPALS_QUALITY_PUBLISH_GATE_ENABLED") ?? asBoolean(workerNode.quality_publish_gate_enabled, true);
   const workerQualityCriticMinScore = (() => {
     const configThresholdRaw = workerNode.quality_critic_min_score == null ? "" : String(workerNode.quality_critic_min_score);
-    const raw = firstNonEmpty(process.env.WORKERPALS_QUALITY_CRITIC_MIN_SCORE, configThresholdRaw, String(DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE));
+    const raw = firstNonEmpty2(process.env.WORKERPALS_QUALITY_CRITIC_MIN_SCORE, configThresholdRaw, String(DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE));
     const parsed = Number.parseFloat(raw);
     if (!Number.isFinite(parsed))
       return DEFAULT_WORKERPALS_QUALITY_CRITIC_MIN_SCORE;
     return Math.max(0, Math.min(10, parsed));
   })();
-  const workerQualityCriticModel = firstNonEmpty(process.env.WORKERPALS_QUALITY_CRITIC_MODEL, asString(workerNode.quality_critic_model, ""), "");
+  const workerQualityCriticModel = firstNonEmpty2(process.env.WORKERPALS_QUALITY_CRITIC_MODEL, asString(workerNode.quality_critic_model, ""), "");
   const workerQualityCriticMaxDiffChars = Math.max(256, Math.min(524288, asInt(parseIntEnv("WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS") ?? workerNode.quality_critic_max_diff_chars, DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_DIFF_CHARS)));
   const workerQualityCriticMaxValidationOutputChars = Math.max(256, Math.min(524288, asInt(parseIntEnv("WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS") ?? workerNode.quality_critic_max_validation_output_chars, DEFAULT_WORKERPALS_QUALITY_CRITIC_MAX_VALIDATION_OUTPUT_CHARS)));
   const workerExecutorResultPrefix = (() => {
@@ -1152,18 +2644,18 @@ function loadPushPalsConfig(options = {}) {
     sessionId: "workerpals-dev"
   }, sessionId);
   const scmNode = getObject(merged, "source_control_manager");
-  const scmRepoPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REPO_PATH, asString(scmNode.repo_path, ".worktrees/source_control_manager"), ".worktrees/source_control_manager"));
+  const scmRepoPath = resolvePathFromRoot(projectRoot, firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_REPO_PATH, asString(scmNode.repo_path, ".worktrees/source_control_manager"), ".worktrees/source_control_manager"));
   const scmRemote = asString(process.env.SOURCE_CONTROL_MANAGER_REMOTE ?? scmNode.remote, "origin");
-  const scmMainBranch = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_MAIN_BRANCH, process.env.PUSHPALS_INTEGRATION_BRANCH, asString(scmNode.pushpals_branch, "main_agents"), "main_agents");
-  const scmBaseBranch = firstNonEmpty(process.env.PUSHPALS_INTEGRATION_BASE_BRANCH, asString(scmNode.base_branch, "main"), "main");
+  const scmMainBranch = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_MAIN_BRANCH, process.env.PUSHPALS_INTEGRATION_BRANCH, asString(scmNode.pushpals_branch, "main_agents"), "main_agents");
+  const scmBaseBranch = firstNonEmpty2(process.env.PUSHPALS_INTEGRATION_BASE_BRANCH, asString(scmNode.base_branch, "main"), "main");
   const scmBranchPrefix = asString(process.env.SOURCE_CONTROL_MANAGER_BRANCH_PREFIX ?? scmNode.branch_prefix, "agent/");
   const scmPollIntervalSeconds = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_POLL_INTERVAL_SECONDS") ?? scmNode.poll_interval_seconds, 10));
   const scmChecks = asCheckArray(scmNode.checks);
-  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join2(dataDir, "source_control_manager")), join2(dataDir, "source_control_manager")));
+  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join2(dataDir, "source_control_manager")), join2(dataDir, "source_control_manager")));
   const scmPort = Math.max(1, Math.min(65535, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_PORT") ?? scmNode.port, 3002)));
   const scmDeleteAfterMerge = parseBoolEnv("SOURCE_CONTROL_MANAGER_DELETE_AFTER_MERGE") ?? asBoolean(scmNode.delete_after_merge, false);
   const scmMaxAttempts = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_MAX_ATTEMPTS") ?? scmNode.max_attempts, 3));
-  const scmMergeStrategyRaw = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_MERGE_STRATEGY, asString(scmNode.merge_strategy, "cherry-pick"), "cherry-pick");
+  const scmMergeStrategyRaw = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_MERGE_STRATEGY, asString(scmNode.merge_strategy, "cherry-pick"), "cherry-pick");
   const scmMergeStrategy = scmMergeStrategyRaw === "no-ff" || scmMergeStrategyRaw === "ff-only" ? scmMergeStrategyRaw : "cherry-pick";
   let scmPushMainAfterMerge = asBoolean(scmNode.push_main_after_merge, true);
   const scmPushMainAfterMergeEnv = parseBoolEnv("SOURCE_CONTROL_MANAGER_PUSH_MAIN_AFTER_MERGE");
@@ -1179,9 +2671,9 @@ function loadPushPalsConfig(options = {}) {
   const scmDisableAutoPrEnv = parseBoolEnv("SOURCE_CONTROL_MANAGER_DISABLE_AUTO_PR");
   if (scmDisableAutoPrEnv != null)
     scmOpenPrAfterPush = !scmDisableAutoPrEnv;
-  const scmPrBaseBranch = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH, asString(scmNode.pr_base_branch, scmBaseBranch), scmBaseBranch);
-  const scmPrTitle = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_PR_TITLE, asString(scmNode.pr_title, ""));
-  const scmPrBody = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_PR_BODY, asString(scmNode.pr_body, ""));
+  const scmPrBaseBranch = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_PR_BASE_BRANCH, asString(scmNode.pr_base_branch, scmBaseBranch), scmBaseBranch);
+  const scmPrTitle = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_PR_TITLE, asString(scmNode.pr_title, ""));
+  const scmPrBody = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_PR_BODY, asString(scmNode.pr_body, ""));
   const scmPrDraft = parseBoolEnv("SOURCE_CONTROL_MANAGER_PR_DRAFT") ?? asBoolean(scmNode.pr_draft, false);
   const scmStatusHeartbeatMs = Math.max(0, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_STATUS_HEARTBEAT_MS") ?? globalStatusHeartbeatMs ?? scmNode.status_heartbeat_ms, 120000));
   const scmSkipCleanCheck = parseBoolEnv("SOURCE_CONTROL_MANAGER_SKIP_CLEAN_CHECK") ?? asBoolean(scmNode.skip_clean_check, false);
@@ -1189,39 +2681,39 @@ function loadPushPalsConfig(options = {}) {
   const scmReviewAgentNode = getObject(scmNode, "review_agent");
   const scmReviewAgentEnabled = parseBoolEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_ENABLED") ?? asBoolean(scmReviewAgentNode.enabled, false);
   const scmReviewAgentPollIntervalMs = Math.max(5000, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_POLL_INTERVAL_MS") ?? scmReviewAgentNode.poll_interval_ms, 60000));
-  const scmReviewAgentReviewerMdPath = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_REVIEWER_MD_PATH, asString(scmReviewAgentNode.reviewer_md_path, "prompts/review_agent/reviewer.md"), "prompts/review_agent/reviewer.md");
+  const scmReviewAgentReviewerMdPath = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_REVIEWER_MD_PATH, asString(scmReviewAgentNode.reviewer_md_path, "prompts/review_agent/reviewer.md"), "prompts/review_agent/reviewer.md");
   const scmReviewAgentPassThreshold = (() => {
     const configThresholdRaw = scmReviewAgentNode.pass_threshold == null ? "" : String(scmReviewAgentNode.pass_threshold);
-    const raw = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_PASS_THRESHOLD, configThresholdRaw, "9.5");
+    const raw = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_PASS_THRESHOLD, configThresholdRaw, "9.5");
     const parsed = Number.parseFloat(raw);
     return Number.isFinite(parsed) ? Math.max(1, Math.min(10, parsed)) : 9.5;
   })();
   const scmReviewAgentMaxPrCommentsBeforeGiveUp = Math.max(1, Math.min(100, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MAX_PR_COMMENTS_BEFORE_GIVE_UP") ?? scmReviewAgentNode.max_pr_comments_before_give_up, 10)));
-  const scmReviewAgentMergeMethodRaw = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MERGE_METHOD, asString(scmReviewAgentNode.merge_method, "squash"), "squash").toLowerCase();
+  const scmReviewAgentMergeMethodRaw = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MERGE_METHOD, asString(scmReviewAgentNode.merge_method, "squash"), "squash").toLowerCase();
   const scmReviewAgentMergeMethod = scmReviewAgentMergeMethodRaw === "merge" || scmReviewAgentMergeMethodRaw === "rebase" ? scmReviewAgentMergeMethodRaw : "squash";
-  const scmReviewAgentCodexBin = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_BIN, asString(scmReviewAgentNode.codex_bin, "bun x --yes @openai/codex"), "bun x --yes @openai/codex");
-  const scmReviewAgentCodexAuthMode = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_AUTH_MODE, asString(scmReviewAgentNode.codex_auth_mode, "chatgpt"), "chatgpt");
-  const scmReviewAgentCodexHomeDir = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_HOME_DIR, asString(scmReviewAgentNode.codex_home_dir, ""));
+  const scmReviewAgentCodexBin = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_BIN, asString(scmReviewAgentNode.codex_bin, "bun x --yes @openai/codex"), "bun x --yes @openai/codex");
+  const scmReviewAgentCodexAuthMode = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_AUTH_MODE, asString(scmReviewAgentNode.codex_auth_mode, "chatgpt"), "chatgpt");
+  const scmReviewAgentCodexHomeDir = firstNonEmpty2(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_HOME_DIR, asString(scmReviewAgentNode.codex_home_dir, ""));
   const scmReviewAgentCodexTimeoutMs = Math.max(30000, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_TIMEOUT_MS") ?? scmReviewAgentNode.codex_timeout_ms, 300000));
   const startupNode = getObject(merged, "startup");
-  const startupWorkerImageRebuild = normalizeWorkerImageRebuildMode(firstNonEmpty(process.env.PUSHPALS_WORKER_IMAGE_REBUILD, asString(startupNode.worker_image_rebuild, "auto"), "auto"));
+  const startupWorkerImageRebuild = normalizeWorkerImageRebuildMode(firstNonEmpty2(process.env.PUSHPALS_WORKER_IMAGE_REBUILD, asString(startupNode.worker_image_rebuild, "auto"), "auto"));
   const startupLogConfigOnStart = parseBoolEnv("PUSHPALS_LOG_CONFIG_ON_START") ?? asBoolean(startupNode.log_config_on_start, true);
   const startupSyncIntegrationWithMain = parseBoolEnv("PUSHPALS_SYNC_INTEGRATION_WITH_MAIN") ?? asBoolean(startupNode.sync_integration_with_main, true);
   const startupSkipLlmPreflight = parseBoolEnv("PUSHPALS_SKIP_LLM_PREFLIGHT") ?? asBoolean(startupNode.skip_llm_preflight, false);
   const startupAutoStartLmStudio = parseBoolEnv("PUSHPALS_AUTO_START_LMSTUDIO") ?? asBoolean(startupNode.auto_start_lmstudio, true);
   const startupLmStudioReadyTimeoutMs = Math.max(1000, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_READY_TIMEOUT_MS") ?? startupNode.lmstudio_ready_timeout_ms, 120000));
-  const startupLmStudioCli = firstNonEmpty(process.env.PUSHPALS_LMSTUDIO_CLI, asString(startupNode.lmstudio_cli, "lms"), "lms");
+  const startupLmStudioCli = firstNonEmpty2(process.env.PUSHPALS_LMSTUDIO_CLI, asString(startupNode.lmstudio_cli, "lms"), "lms");
   const startupLmStudioPort = Math.max(1, Math.min(65535, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_PORT") ?? startupNode.lmstudio_port, 1234)));
-  const startupLmStudioStartArgs = firstNonEmpty(process.env.PUSHPALS_LMSTUDIO_START_ARGS, asString(startupNode.lmstudio_start_args, ""));
+  const startupLmStudioStartArgs = firstNonEmpty2(process.env.PUSHPALS_LMSTUDIO_START_ARGS, asString(startupNode.lmstudio_start_args, ""));
   const startupWarmup = parseBoolEnv("PUSHPALS_STARTUP_WARMUP") ?? asBoolean(startupNode.startup_warmup, true);
   const startupWarmupTimeoutMs = Math.max(15000, asInt(parseIntEnv("PUSHPALS_STARTUP_WARMUP_TIMEOUT_MS") ?? startupNode.startup_warmup_timeout_ms, 120000));
   const startupWarmupPollMs = Math.max(250, Math.min(5000, asInt(parseIntEnv("PUSHPALS_STARTUP_WARMUP_POLL_MS") ?? startupNode.startup_warmup_poll_ms, 1000)));
   const startupAllowExternalClean = parseBoolEnv("PUSHPALS_ALLOW_EXTERNAL_CLEAN") ?? asBoolean(startupNode.allow_external_clean, false);
   const startupPortPreflight = parseBoolEnv("PUSHPALS_STARTUP_PORT_PREFLIGHT") ?? asBoolean(startupNode.port_preflight, true);
-  const startupPortConflictPolicy = normalizeStartupPortConflictPolicy(firstNonEmpty(process.env.PUSHPALS_STARTUP_PORT_CONFLICT_POLICY, asString(startupNode.port_conflict_policy, "terminate_pushpals"), "terminate_pushpals"));
+  const startupPortConflictPolicy = normalizeStartupPortConflictPolicy(firstNonEmpty2(process.env.PUSHPALS_STARTUP_PORT_CONFLICT_POLICY, asString(startupNode.port_conflict_policy, "terminate_pushpals"), "terminate_pushpals"));
   const clientNode = getObject(merged, "client");
-  const authToken = firstNonEmpty(process.env.PUSHPALS_AUTH_TOKEN) || null;
-  const gitToken = firstNonEmpty(process.env.PUSHPALS_GIT_TOKEN, process.env.GITHUB_TOKEN, process.env.GH_TOKEN) || null;
+  const authToken = firstNonEmpty2(process.env.PUSHPALS_AUTH_TOKEN) || null;
+  const gitToken = firstNonEmpty2(process.env.PUSHPALS_GIT_TOKEN, process.env.GITHUB_TOKEN, process.env.GH_TOKEN) || null;
   const config = {
     projectRoot,
     configDir,
@@ -1271,10 +2763,10 @@ function loadPushPalsConfig(options = {}) {
       workerpalStartupTimeoutMs: Math.max(1000, asInt(parseIntEnv("REMOTEBUDDY_WORKERPAL_STARTUP_TIMEOUT_MS") ?? remoteNode.workerpal_startup_timeout_ms, 1e4)),
       workerpalDocker: effectiveRemoteWorkerpalDocker,
       workerpalRequireDocker: effectiveRemoteWorkerpalRequireDocker,
-      workerpalImage: firstNonEmpty(process.env.REMOTEBUDDY_WORKERPAL_IMAGE, asString(remoteNode.workerpal_image, "")) || null,
+      workerpalImage: firstNonEmpty2(process.env.REMOTEBUDDY_WORKERPAL_IMAGE, asString(remoteNode.workerpal_image, "")) || null,
       workerpalPollMs: asIntOrNull(parseIntEnv("REMOTEBUDDY_WORKERPAL_POLL_MS")) ?? asIntOrNull(remoteNode.workerpal_poll_ms),
       workerpalHeartbeatMs: asIntOrNull(parseIntEnv("REMOTEBUDDY_WORKERPAL_HEARTBEAT_MS")) ?? asIntOrNull(remoteNode.workerpal_heartbeat_ms),
-      workerpalLabels: firstNonEmpty(process.env.REMOTEBUDDY_WORKERPAL_LABELS) ? firstNonEmpty(process.env.REMOTEBUDDY_WORKERPAL_LABELS).split(",").map((value) => value.trim()).filter(Boolean) : asStringArray(remoteNode.workerpal_labels),
+      workerpalLabels: firstNonEmpty2(process.env.REMOTEBUDDY_WORKERPAL_LABELS) ? firstNonEmpty2(process.env.REMOTEBUDDY_WORKERPAL_LABELS).split(",").map((value) => value.trim()).filter(Boolean) : asStringArray(remoteNode.workerpal_labels),
       executionBudgetInteractiveMs: Math.max(60000, asInt(parseIntEnv("REMOTEBUDDY_EXECUTION_BUDGET_INTERACTIVE_MS") ?? remoteNode.execution_budget_interactive_ms, 300000)),
       executionBudgetNormalMs: Math.max(120000, asInt(parseIntEnv("REMOTEBUDDY_EXECUTION_BUDGET_NORMAL_MS") ?? remoteNode.execution_budget_normal_ms, 900000)),
       executionBudgetBackgroundMs: Math.max(180000, asInt(parseIntEnv("REMOTEBUDDY_EXECUTION_BUDGET_BACKGROUND_MS") ?? remoteNode.execution_budget_background_ms, 1200000)),
@@ -1303,11 +2795,11 @@ function loadPushPalsConfig(options = {}) {
         ideationMaxCandidates: Math.max(1, Math.min(100, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_IDEATION_MAX_CANDIDATES") ?? remoteAutonomyNode.ideation_max_candidates, 20))),
         topK: Math.max(1, Math.min(20, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_TOP_K") ?? remoteAutonomyNode.top_k, 3))),
         exploreRate: Math.max(0, Math.min(1, (() => {
-          const parsed = Number.parseFloat(String(firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_EXPLORE_RATE, asString(remoteAutonomyNode.explore_rate, "0.3"), "0.3")));
+          const parsed = Number.parseFloat(String(firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_EXPLORE_RATE, asString(remoteAutonomyNode.explore_rate, "0.3"), "0.3")));
           return Number.isFinite(parsed) ? parsed : 0.3;
         })())),
         minConfidence: Math.max(0, Math.min(1, (() => {
-          const parsed = Number.parseFloat(String(firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_MIN_CONFIDENCE, asString(remoteAutonomyNode.min_confidence, "0.65"), "0.65")));
+          const parsed = Number.parseFloat(String(firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_MIN_CONFIDENCE, asString(remoteAutonomyNode.min_confidence, "0.65"), "0.65")));
           return Number.isFinite(parsed) ? parsed : 0.65;
         })())),
         maxConcurrentObjectives: Math.max(1, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_MAX_CONCURRENT_OBJECTIVES") ?? remoteAutonomyNode.max_concurrent_objectives, 2)),
@@ -1325,21 +2817,21 @@ function loadPushPalsConfig(options = {}) {
         evaluatorWindowHours: Math.max(1, Math.min(168, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_EVALUATOR_WINDOW_HOURS") ?? remoteAutonomyNode.evaluator_window_hours, 24))),
         evaluatorMinSamples: Math.max(1, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_EVALUATOR_MIN_SAMPLES") ?? remoteAutonomyNode.evaluator_min_samples, 6)),
         evaluatorMinSuccessRate: Math.max(0, Math.min(1, (() => {
-          const parsed = Number.parseFloat(String(firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_EVALUATOR_MIN_SUCCESS_RATE, asString(remoteAutonomyNode.evaluator_min_success_rate, "0.45"), "0.45")));
+          const parsed = Number.parseFloat(String(firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_EVALUATOR_MIN_SUCCESS_RATE, asString(remoteAutonomyNode.evaluator_min_success_rate, "0.45"), "0.45")));
           return Number.isFinite(parsed) ? parsed : 0.45;
         })())),
         evaluatorMaxRegretRate: Math.max(0, Math.min(1, (() => {
-          const parsed = Number.parseFloat(String(firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_EVALUATOR_MAX_REGRET_RATE, asString(remoteAutonomyNode.evaluator_max_regret_rate, "0.35"), "0.35")));
+          const parsed = Number.parseFloat(String(firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_EVALUATOR_MAX_REGRET_RATE, asString(remoteAutonomyNode.evaluator_max_regret_rate, "0.35"), "0.35")));
           return Number.isFinite(parsed) ? parsed : 0.35;
         })())),
         evaluatorRunIntervalMs: Math.max(1e4, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_EVALUATOR_RUN_INTERVAL_MS") ?? remoteAutonomyNode.evaluator_run_interval_ms, 120000)),
         alertQueuePendingThreshold: Math.max(1, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_ALERT_QUEUE_PENDING_THRESHOLD") ?? remoteAutonomyNode.alert_queue_pending_threshold, 20)),
         alertJobFailureRateThreshold: Math.max(0, Math.min(1, (() => {
-          const parsed = Number.parseFloat(String(firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_ALERT_JOB_FAILURE_RATE_THRESHOLD, asString(remoteAutonomyNode.alert_job_failure_rate_threshold, "0.3"), "0.3")));
+          const parsed = Number.parseFloat(String(firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_ALERT_JOB_FAILURE_RATE_THRESHOLD, asString(remoteAutonomyNode.alert_job_failure_rate_threshold, "0.3"), "0.3")));
           return Number.isFinite(parsed) ? parsed : 0.3;
         })())),
         alertAutonomyFailureRateThreshold: Math.max(0, Math.min(1, (() => {
-          const parsed = Number.parseFloat(String(firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_ALERT_AUTONOMY_FAILURE_RATE_THRESHOLD, asString(remoteAutonomyNode.alert_autonomy_failure_rate_threshold, "0.45"), "0.45")));
+          const parsed = Number.parseFloat(String(firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_ALERT_AUTONOMY_FAILURE_RATE_THRESHOLD, asString(remoteAutonomyNode.alert_autonomy_failure_rate_threshold, "0.45"), "0.45")));
           return Number.isFinite(parsed) ? parsed : 0.45;
         })())),
         allowReadAnywhere: parseBoolEnv("REMOTEBUDDY_AUTONOMY_ALLOW_READ_ANYWHERE") ?? asBoolean(remoteAutonomyNode.allow_read_anywhere, true),
@@ -1347,8 +2839,8 @@ function loadPushPalsConfig(options = {}) {
         prFeedbackCommentChars: Math.max(32, Math.min(20000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_COMMENT_CHARS") ?? remoteAutonomyNode.pr_feedback_comment_chars, 600))),
         prFeedbackSummaryChars: Math.max(32, Math.min(20000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_PR_FEEDBACK_SUMMARY_CHARS") ?? remoteAutonomyNode.pr_feedback_summary_chars, 600))),
         questionTtlMs: Math.max(60000, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_QUESTION_TTL_MS") ?? remoteAutonomyNode.question_ttl_ms, 259200000)),
-        policyVersion: firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_POLICY_VERSION, asString(remoteAutonomyNode.policy_version, "policy-v3.3"), "policy-v3.3"),
-        impactModelVersion: firstNonEmpty(process.env.REMOTEBUDDY_AUTONOMY_IMPACT_MODEL_VERSION, asString(remoteAutonomyNode.impact_model_version, "impact-v1"), "impact-v1"),
+        policyVersion: firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_POLICY_VERSION, asString(remoteAutonomyNode.policy_version, "policy-v3.3"), "policy-v3.3"),
+        impactModelVersion: firstNonEmpty2(process.env.REMOTEBUDDY_AUTONOMY_IMPACT_MODEL_VERSION, asString(remoteAutonomyNode.impact_model_version, "impact-v1"), "impact-v1"),
         replay: {
           storePromptPayloads: parseBoolEnv("REMOTEBUDDY_AUTONOMY_REPLAY_STORE_PROMPT_PAYLOADS") ?? asBoolean(remoteAutonomyReplayNode.store_prompt_payloads, false),
           maxRunsWithPayloads: Math.max(0, asInt(parseIntEnv("REMOTEBUDDY_AUTONOMY_REPLAY_MAX_RUNS_WITH_PAYLOADS") ?? remoteAutonomyReplayNode.max_runs_with_payloads, 50)),
@@ -1381,7 +2873,7 @@ function loadPushPalsConfig(options = {}) {
       pushAgentBranch: workerPushAgentBranch,
       requireDocker: effectiveWorkerRequireDocker,
       skipDockerSelfCheck: workerSkipDockerSelfCheck,
-      dockerImage: firstNonEmpty(process.env.WORKERPALS_DOCKER_IMAGE, asString(workerNode.docker_image, "pushpals-worker-sandbox:latest"), "pushpals-worker-sandbox:latest"),
+      dockerImage: firstNonEmpty2(process.env.WORKERPALS_DOCKER_IMAGE, asString(workerNode.docker_image, "pushpals-worker-sandbox:latest"), "pushpals-worker-sandbox:latest"),
       dockerTimeoutMs: Math.max(1e4, asInt(parseIntEnv("WORKERPALS_DOCKER_TIMEOUT_MS") ?? workerNode.docker_timeout_ms, 7260000)),
       dockerIdleTimeoutMs: Math.max(0, asInt(parseIntEnv("WORKERPALS_DOCKER_IDLE_TIMEOUT_MS") ?? workerNode.docker_idle_timeout_ms, 600000)),
       dockerAgentStartupTimeoutMs: workerDockerAgentStartupTimeoutMs,
@@ -1412,8 +2904,8 @@ function loadPushPalsConfig(options = {}) {
       qualityCriticMaxValidationOutputChars: workerQualityCriticMaxValidationOutputChars,
       executorResultPrefix: workerExecutorResultPrefix,
       dockerNetworkMode: asString(process.env.WORKERPALS_DOCKER_NETWORK_MODE ?? workerNode.docker_network_mode, "bridge"),
-      baseRef: firstNonEmpty(process.env.WORKERPALS_BASE_REF, asString(workerNode.base_ref, "origin/main_agents"), "origin/main_agents"),
-      labels: firstNonEmpty(process.env.WORKERPALS_LABELS) ? firstNonEmpty(process.env.WORKERPALS_LABELS).split(",").map((value) => value.trim()).filter(Boolean) : asStringArray(workerNode.labels),
+      baseRef: firstNonEmpty2(process.env.WORKERPALS_BASE_REF, asString(workerNode.base_ref, "origin/main_agents"), "origin/main_agents"),
+      labels: firstNonEmpty2(process.env.WORKERPALS_LABELS) ? firstNonEmpty2(process.env.WORKERPALS_LABELS).split(",").map((value) => value.trim()).filter(Boolean) : asStringArray(workerNode.labels),
       failureCooldownMs: Math.max(0, asInt(parseIntEnv("WORKERPALS_FAILURE_COOLDOWN_MS") ?? parseIntEnv("WORKERPALS_DOCKER_FAILURE_COOLDOWN_MS") ?? workerNode.failure_cooldown_ms, 20000)),
       llm: workerLlm
     },
@@ -1470,7 +2962,7 @@ function loadPushPalsConfig(options = {}) {
       portConflictPolicy: startupPortConflictPolicy
     },
     client: {
-      localAgentUrl: normalizeLoopbackHttpUrl(firstNonEmpty(process.env.EXPO_PUBLIC_LOCAL_AGENT_URL, asString(clientNode.local_agent_url, `http://127.0.0.1:${localPort}`), `http://127.0.0.1:${localPort}`), localPort),
+      localAgentUrl: normalizeLoopbackHttpUrl(firstNonEmpty2(process.env.EXPO_PUBLIC_LOCAL_AGENT_URL, asString(clientNode.local_agent_url, `http://127.0.0.1:${localPort}`), `http://127.0.0.1:${localPort}`), localPort),
       traceTailLines: Math.max(10, asInt(parseIntEnv("EXPO_PUBLIC_PUSHPALS_TRACE_TAIL_LINES") ?? clientNode.trace_tail_lines, 100))
     }
   };
@@ -1487,6 +2979,53 @@ function toLines(markdown) {
   return String(markdown ?? "").replace(/\r\n/g, `
 `).split(`
 `);
+}
+function maskNonProseMarkdownLines(lines) {
+  let inFrontmatter = lines[0]?.trim() === "---";
+  let inHtmlComment = false;
+  let fenceCharacter = "";
+  let fenceLength = 0;
+  return lines.map((line, index) => {
+    const trimmed = line.trim();
+    if (inFrontmatter) {
+      if (index > 0 && trimmed === "---")
+        inFrontmatter = false;
+      return "";
+    }
+    let visible = line;
+    if (inHtmlComment) {
+      const commentEnd = visible.indexOf("-->");
+      if (commentEnd < 0)
+        return "";
+      visible = visible.slice(commentEnd + 3);
+      inHtmlComment = false;
+    }
+    while (visible.includes("<!--")) {
+      const commentStart = visible.indexOf("<!--");
+      const commentEnd = visible.indexOf("-->", commentStart + 4);
+      if (commentEnd < 0) {
+        visible = visible.slice(0, commentStart);
+        inHtmlComment = true;
+        break;
+      }
+      visible = `${visible.slice(0, commentStart)}${visible.slice(commentEnd + 3)}`;
+    }
+    const fence = visible.match(/^\s{0,3}(`{3,}|~{3,})/);
+    if (fence) {
+      const marker = fence[1];
+      if (!fenceCharacter) {
+        fenceCharacter = marker[0];
+        fenceLength = marker.length;
+      } else if (marker[0] === fenceCharacter && marker.length >= fenceLength) {
+        fenceCharacter = "";
+        fenceLength = 0;
+      }
+      return "";
+    }
+    if (fenceCharacter)
+      return "";
+    return visible;
+  });
 }
 function normalizeItem(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
@@ -1510,12 +3049,15 @@ function dedupeAndClamp(values) {
 }
 function classifyHeadingBucket(heading) {
   const text = heading.toLowerCase();
-  if (text.includes("who this is for") || text.includes("user"))
-    return "targetUsers";
-  if (text.includes("priorit"))
+  if (text.includes("priorit") || text.includes("roadmap") || text.includes("focus") || text.includes("strategy") || text.includes("what's next") || text.includes("what is next")) {
     return "priorities";
-  if (text.includes("objective"))
+  }
+  if (text.includes("objective") || text.includes("goal") || text.includes("outcome")) {
     return "objectives";
+  }
+  if (text.includes("who this is for") || text.includes("target user") || text.includes("intended user") || text.includes("audience") || text.includes("persona") || /^(?:the\s+)?users?$/.test(text.trim())) {
+    return "targetUsers";
+  }
   if (text.includes("principle") || text.includes("guardrail"))
     return "guardrails";
   if (text.includes("constraint"))
@@ -1526,7 +3068,7 @@ function classifyHeadingBucket(heading) {
   if (text.includes("testing criteria") || text.includes("test criteria") || text.includes("required tests") || text.includes("required validation") || text.includes("validation criteria")) {
     return "testingCriteria";
   }
-  if (text.includes("measure") || text.includes("metric") || text.includes("good looks like")) {
+  if (text.includes("measure") || text.includes("metric") || text.includes("success") || text.includes("good looks like")) {
     return "metrics";
   }
   if (text.includes("risk") || text.includes("gate"))
@@ -1538,7 +3080,7 @@ function classifyHeadingBucket(heading) {
   return null;
 }
 function extractVisionKeyItems(markdown) {
-  const lines = toLines(markdown);
+  const lines = maskNonProseMarkdownLines(toLines(markdown));
   const buckets = {
     targetUsers: [],
     priorities: [],
@@ -1579,109 +3121,6 @@ function extractVisionKeyItems(markdown) {
     operatingModel: dedupeAndClamp(buckets.operatingModel),
     governance: dedupeAndClamp(buckets.governance)
   };
-}
-// packages/shared/src/git_backend.ts
-function trimToken(value) {
-  return String(value ?? "").trim();
-}
-function firstNonEmpty2(env, keys) {
-  for (const key of keys) {
-    const value = trimToken(env[key]);
-    if (value)
-      return value;
-  }
-  return "";
-}
-function parseGitRemoteHost(remoteUrl) {
-  const raw = trimToken(remoteUrl);
-  if (!raw)
-    return "";
-  const patterns = [
-    /^https?:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
-    /^ssh:\/\/(?:[^@/]+@)?([^/:?#]+)(?::\d+)?(?:[/?#].*)?$/i,
-    /^(?:[^@:\s]+@)?([^:/\s]+):[^?\s]+$/i
-  ];
-  for (const pattern of patterns) {
-    const match = raw.match(pattern);
-    const host = match?.[1] ? trimToken(match[1]) : "";
-    if (host)
-      return host.toLowerCase();
-  }
-  return "";
-}
-function inferGitBackendFromRemote(remoteUrl) {
-  const host = parseGitRemoteHost(remoteUrl);
-  if (!host)
-    return "unknown";
-  if (host === "github.com" || host.endsWith(".github.com") || host.includes("github")) {
-    return "github";
-  }
-  if (host === "gitlab.com" || host.endsWith(".gitlab.com") || host.includes("gitlab")) {
-    return "gitlab";
-  }
-  return "unknown";
-}
-async function defaultRunCommand(command, cwd) {
-  try {
-    const result = await runBoundedProcess(command, {
-      cwd,
-      timeoutMs: 1e4,
-      outputLimitBytes: 256 * 1024
-    });
-    return {
-      ok: result.exitCode === 0,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      stdout: "",
-      stderr: String(err),
-      exitCode: 127
-    };
-  }
-}
-async function resolveGitHubCliToken(host, runCommand, cwd) {
-  const useHostname = host && host !== "github.com";
-  const command = useHostname ? ["gh", "auth", "token", "--hostname", host] : ["gh", "auth", "token"];
-  const result = await runCommand(command, cwd);
-  return result.ok ? trimToken(result.stdout) : "";
-}
-async function resolveGitLabCliToken(runCommand, cwd) {
-  const result = await runCommand(["glab", "auth", "token"], cwd);
-  return result.ok ? trimToken(result.stdout) : "";
-}
-async function resolveGitTokenForRemote(options) {
-  const configuredToken = trimToken(options.configuredToken);
-  const host = parseGitRemoteHost(options.remoteUrl);
-  const backend = inferGitBackendFromRemote(options.remoteUrl);
-  const env = options.env ?? process.env;
-  if (configuredToken) {
-    return { backend, host, token: configuredToken, source: "configured" };
-  }
-  const envVarOrder = backend === "gitlab" ? ["PUSHPALS_GIT_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"] : backend === "github" ? ["PUSHPALS_GIT_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] : ["PUSHPALS_GIT_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"];
-  const envToken = firstNonEmpty2(env, envVarOrder);
-  if (envToken) {
-    return { backend, host, token: envToken, source: "env" };
-  }
-  const runCommand = options.runCommand ?? defaultRunCommand;
-  let cliToken = "";
-  if (backend === "github") {
-    cliToken = await resolveGitHubCliToken(host, runCommand, options.cwd);
-  } else if (backend === "gitlab") {
-    cliToken = await resolveGitLabCliToken(runCommand, options.cwd);
-  } else {
-    cliToken = await resolveGitHubCliToken(host, runCommand, options.cwd);
-    if (!cliToken) {
-      cliToken = await resolveGitLabCliToken(runCommand, options.cwd);
-    }
-  }
-  if (cliToken) {
-    return { backend, host, token: cliToken, source: "cli" };
-  }
-  return { backend, host, token: "", source: "none" };
 }
 // packages/shared/src/source_control_api.ts
 function firstNonEmptyString(...values) {
@@ -2043,24 +3482,38 @@ var NODE_BACKED_CLI_NAMES = new Set([
 ]);
 var DIRECT_TOOL_CANDIDATES = {
   bash: ["bash"],
+  bazel: ["bazel"],
   bun: ["bun"],
   bunx: ["bun"],
+  buf: ["buf"],
   cargo: ["cargo"],
+  cabal: ["cabal"],
+  clojure: ["clojure"],
+  bundle: ["bundle"],
   cc: ["cc"],
   clang: ["clang"],
   "clang++": ["clang++"],
   cmake: ["cmake"],
+  ctest: ["ctest"],
   cypress: ["cypress"],
   docker: ["docker"],
+  dart: ["dart"],
   eslint: ["eslint"],
   expo: ["expo"],
+  flutter: ["flutter"],
   gcc: ["gcc"],
   "g++": ["g++"],
   gh: ["gh"],
+  git: ["git"],
   go: ["go"],
+  gradle: ["gradle"],
   java: ["java"],
   javac: ["javac"],
+  lein: ["lein"],
   make: ["make"],
+  mix: ["mix"],
+  composer: ["composer"],
+  dotnet: ["dotnet"],
   mvn: ["mvn"],
   next: ["next"],
   ninja: ["ninja"],
@@ -2069,16 +3522,24 @@ var DIRECT_TOOL_CANDIDATES = {
   npx: ["npx"],
   playwright: ["playwright"],
   pnpm: ["pnpm"],
+  php: ["php"],
   powershell: ["powershell"],
   pwsh: ["pwsh"],
   python: ["python3", "python", "py"],
   python3: ["python3", "python"],
   pytest: ["python3", "python", "py"],
   rustc: ["rustc"],
+  rscript: ["Rscript"],
+  ruby: ["ruby"],
   sh: ["sh"],
+  stack: ["stack"],
+  swift: ["swift"],
+  terraform: ["terraform"],
   tsc: ["tsc"],
   vite: ["vite"],
   vitest: ["vitest"],
+  zig: ["zig"],
+  luac: ["luac"],
   yarn: ["yarn"]
 };
 var BUN_OPTIONS_WITH_VALUE = new Set(["--cwd", "-C"]);
@@ -2153,6 +3614,16 @@ function inferToolRequirementsForValidationCommand(repoRoot, command, nativeSign
   const first = normalizeToolToken(tokens[0] ?? "");
   addDirectExecutableRequirement(requirements, first, command);
   addNodeBackedCliRequirement(requirements, first, `validation command "${command}"`, command);
+  const nestedShellCommand = nestedValidationCommandFromShell(tokens);
+  if (nestedShellCommand) {
+    for (const requirement of inferToolRequirementsForValidationCommand(repoRoot, nestedShellCommand, nativeSignals, maxScriptScanChars)) {
+      requirements.push({
+        ...requirement,
+        detectedFrom: `nested command in validation wrapper "${command}"`,
+        requiredFor: [command]
+      });
+    }
+  }
   const bunSubcommand = resolveBunSubcommand(tokens);
   if (bunSubcommand?.kind === "x") {
     addNodeBackedCliRequirement(requirements, normalizeToolToken(bunSubcommand.value), `bun x package "${bunSubcommand.value}"`, command);
@@ -2185,6 +3656,29 @@ function inferToolRequirementsForValidationCommand(repoRoot, command, nativeSign
     }
   }
   return dedupeToolRequirements(requirements);
+}
+function nestedValidationCommandFromShell(tokens) {
+  const executable = normalizeToolToken(tokens[0] ?? "");
+  let script = "";
+  if (["sh", "bash"].includes(executable) && tokens[1]?.toLowerCase() === "-c") {
+    script = tokens.slice(2).join(" ");
+  } else if (["cmd", "cmd.exe"].includes(executable)) {
+    const commandIndex = tokens.findIndex((token) => token.toLowerCase() === "/c");
+    if (commandIndex >= 0)
+      script = tokens.slice(commandIndex + 1).join(" ");
+  }
+  if (!script)
+    return null;
+  const marker = script.toLowerCase().lastIndexOf("&& exec ");
+  const fallbackMarker = script.lastIndexOf("&&");
+  const nested = marker >= 0 ? script.slice(marker + "&& exec ".length).trim() : fallbackMarker >= 0 ? script.slice(fallbackMarker + 2).trim() : "";
+  if (!nested || /[;&|`$<>]/.test(nested))
+    return null;
+  const nestedTokens = tokenizeToolchainCommand(nested);
+  if (!nestedTokens?.length || ["sh", "bash", "cmd", "cmd.exe"].includes(normalizeToolToken(nestedTokens[0] ?? ""))) {
+    return null;
+  }
+  return nested;
 }
 function requirementsForValidationCommand(plan, command) {
   return plan.requirements.filter((requirement) => requirement.requiredFor.includes(command));
@@ -2653,7 +4147,7 @@ function detectNativeSignals(repoRoot, maxEntries = 1000) {
 function usesNativeBuildCommand(tokens) {
   return tokens.some((token) => {
     const normalized = normalizeToolToken(token);
-    return normalized === "make" || normalized === "cmake" || normalized === "ninja";
+    return normalized === "bazel" || normalized === "make" || normalized === "cmake" || normalized === "ninja";
   });
 }
 function dedupeToolRequirements(requirements) {
@@ -2707,33 +4201,1025 @@ function repoRelativePath(repoRoot, pathValue) {
     return path.slice(root.length + 1);
   return path;
 }
+// packages/shared/src/repo_validation.ts
+import { closeSync, existsSync as existsSync4, openSync, readSync, readdirSync as readdirSync2 } from "fs";
+import { basename as basename2, dirname, extname, relative, resolve as resolve5 } from "path";
+
 // packages/shared/src/trusted_validation.ts
+var MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1000;
 var TRUSTED_VALIDATION_EXECUTABLES = new Set([
+  "bazel",
   "bun",
   "bunx",
+  "buf",
+  "bundle",
+  "cabal",
   "cargo",
+  "clojure",
+  "cmake",
   "coverage",
+  "ctest",
+  "dart",
   "deno",
   "docker",
   "docker-compose",
+  "dotnet",
   "eslint",
+  "flutter",
+  "git",
   "go",
+  "gradle",
   "jest",
+  "lein",
   "make",
+  "mix",
+  "mvn",
   "mypy",
   "node",
   "npm",
   "npx",
   "pnpm",
+  "composer",
+  "php",
   "pytest",
   "python",
   "python3",
   "ruff",
+  "rscript",
+  "ruby",
+  "stack",
+  "swift",
+  "terraform",
   "tsc",
   "uv",
   "vitest",
+  "zig",
+  "luac",
   "yarn"
 ]);
+function isSafeRelativeValidationPath(value, allowDot = false) {
+  const normalized = String(value ?? "").replace(/\\/g, "/");
+  const pathSegments = normalized.replace(/^\.\//, "").split("/");
+  if (allowDot && normalized === ".")
+    return true;
+  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.includes("://") || pathSegments.some((segment) => segment === ".." || [".git", ".pushpals", ".worktrees", "node_modules"].includes(segment.toLowerCase())) || normalized.startsWith("-") && !normalized.startsWith("./-")) {
+    return false;
+  }
+  return /^[\p{L}\p{N}_@+.,()[\]/ -]+$/u.test(normalized);
+}
+function isSafeTestSourcePath(value, extensions) {
+  if (!isSafeRelativeValidationPath(value))
+    return false;
+  const normalized = value.toLowerCase().replace(/^\.\//, "");
+  if (/(^|\/)(?:tests?|specs?|integration_test)$/.test(normalized))
+    return true;
+  return extensions.some((extension) => normalized.endsWith(extension)) && /(^|\/)(?:tests?|specs?|integration_test)(\/|$)|_(?:test|spec)\.[^/]+$/.test(normalized);
+}
+function expectedCmakeBuildPath(sourcePath) {
+  return sourcePath === "." ? "build" : `${sourcePath.replace(/\/$/, "")}/build`;
+}
+function tokenizeTrustedValidationCommand(command) {
+  const trimmed = String(command ?? "").trim();
+  if (!trimmed || trimmed.length > MAX_TRUSTED_VALIDATION_COMMAND_LENGTH)
+    return null;
+  const argv = [];
+  let current = "";
+  let quote = null;
+  let escaped = false;
+  const pushCurrent = () => {
+    if (!current)
+      return;
+    argv.push(current);
+    current = "";
+  };
+  for (const ch of trimmed) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (quote) {
+      if (quote === '"' && ch === "\\") {
+        escaped = true;
+      } else if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+    if (ch === ";" || ch === "|" || ch === "&" || ch === "`" || ch === `
+` || ch === "\r") {
+      return null;
+    }
+    current += ch;
+  }
+  if (escaped || quote)
+    return null;
+  pushCurrent();
+  if (argv.length === 0)
+    return null;
+  if (argv.some((entry) => entry.includes("$(") || entry.includes("${")))
+    return null;
+  if (argv[0].includes("/") || argv[0].includes("\\"))
+    return null;
+  const executable = argv[0].toLowerCase();
+  if (!TRUSTED_VALIDATION_EXECUTABLES.has(executable))
+    return null;
+  const firstArg = argv[1]?.toLowerCase() ?? "";
+  if (["bun", "deno", "node"].includes(executable) && ["-e", "--eval"].includes(firstArg) || ["python", "python3"].includes(executable) && firstArg === "-c") {
+    return null;
+  }
+  if (executable === "ruby" && (firstArg !== "-c" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".rb"))) {
+    return null;
+  }
+  if (executable === "php" && (firstArg !== "-l" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".php"))) {
+    return null;
+  }
+  if (executable === "dotnet" && !(firstArg === "test" && (argv.length === 2 || argv.length === 3 && isSafeRelativeValidationPath(argv[2] ?? "") && /\.(?:sln|csproj|fsproj)$/i.test(argv[2] ?? "")))) {
+    return null;
+  }
+  if (executable === "bundle" && !(firstArg === "exec" && (argv[2]?.toLowerCase() === "rspec" || argv[2]?.toLowerCase() === "rake" && argv.length === 4 && argv[3]?.toLowerCase() === "test"))) {
+    return null;
+  }
+  if (executable === "bundle" && argv[2]?.toLowerCase() === "rspec" && (argv.length > 7 || argv.slice(3).some((path) => !isSafeTestSourcePath(path, [".rb"])))) {
+    return null;
+  }
+  const trailingTest = argv[argv.length - 1]?.toLowerCase() === "test";
+  const safeComposer = argv.length === 2 && firstArg === "test" || argv.length === 3 && firstArg === "run" && argv[2]?.toLowerCase() === "test" || argv.length === 4 && firstArg === "--working-dir" && trailingTest || argv.length === 3 && firstArg.startsWith("--working-dir=") && trailingTest;
+  if (executable === "composer" && (!safeComposer || firstArg === "--working-dir" && !isSafeRelativeValidationPath(argv[2] ?? "") || firstArg.startsWith("--working-dir=") && !isSafeRelativeValidationPath(argv[1]?.slice("--working-dir=".length) ?? ""))) {
+    return null;
+  }
+  const safeMavenOrGradle = argv.length === 2 && trailingTest || argv.length === 4 && ["-f", "--file", "-p", "--project-dir"].includes(firstArg) && trailingTest;
+  if (["mvn", "gradle"].includes(executable) && !safeMavenOrGradle) {
+    return null;
+  }
+  if (["mvn", "gradle"].includes(executable) && argv.length === 4 && (!isSafeRelativeValidationPath(argv[2] ?? "") || executable === "mvn" && !argv[2]?.toLowerCase().endsWith("pom.xml"))) {
+    return null;
+  }
+  if (executable === "git" && !(argv.length === 3 && firstArg === "diff" && argv[2]?.toLowerCase() === "--check")) {
+    return null;
+  }
+  if (executable === "cmake") {
+    const safeConfigure = argv.length === 5 && firstArg === "-s" && argv[3]?.toLowerCase() === "-b" && isSafeRelativeValidationPath(argv[2] ?? "", true) && isSafeRelativeValidationPath(argv[4] ?? "") && argv[4] === expectedCmakeBuildPath(argv[2] ?? "");
+    const safeBuild = argv.length === 3 && firstArg === "--build" && isSafeRelativeValidationPath(argv[2] ?? "") && /(^|\/)build$/.test(argv[2] ?? "");
+    if (!safeConfigure && !safeBuild)
+      return null;
+  }
+  if (executable === "ctest" && !(argv.length === 4 && firstArg === "--test-dir" && isSafeRelativeValidationPath(argv[2] ?? "") && /(^|\/)build$/.test(argv[2] ?? "") && argv[3]?.toLowerCase() === "--output-on-failure")) {
+    return null;
+  }
+  if (executable === "make" && !(argv.length === 2 && ["test", "check"].includes(firstArg) || argv.length === 4 && firstArg === "-c" && isSafeRelativeValidationPath(argv[2] ?? "") && ["test", "check"].includes(argv[3]?.toLowerCase() ?? ""))) {
+    return null;
+  }
+  if (executable === "bazel" && !(argv.length === 3 && firstArg === "test" && /^\/\/[A-Za-z0-9_@+.,/-]*\.\.\.$/.test(argv[2] ?? ""))) {
+    return null;
+  }
+  if (executable === "buf" && !(firstArg === "lint" && (argv.length === 2 || argv.length === 3 && isSafeRelativeValidationPath(argv[2] ?? "")))) {
+    return null;
+  }
+  if (executable === "swift" && !(argv.length === 2 && firstArg === "test" || argv.length === 4 && firstArg === "test" && argv[2]?.toLowerCase() === "--package-path" && isSafeRelativeValidationPath(argv[3] ?? ""))) {
+    return null;
+  }
+  if (["dart", "flutter"].includes(executable)) {
+    const safeDartDirectoryTest = executable === "dart" && firstArg === "--directory" && argv.length === 4 && isSafeRelativeValidationPath(argv[2] ?? "") && argv[3]?.toLowerCase() === "test";
+    if (!safeDartDirectoryTest && (firstArg !== "test" || argv.length > 6 || argv.slice(2).some((path) => !isSafeTestSourcePath(path, [".dart"])))) {
+      return null;
+    }
+  }
+  if (executable === "mix" && !(firstArg === "test" && argv.length <= 6 && argv.slice(2).every((path) => isSafeTestSourcePath(path, [".exs"])) || firstArg === "--cd" && argv.length === 4 && isSafeRelativeValidationPath(argv[2] ?? "") && argv[3]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "cabal" && !(argv.length === 3 && firstArg === "test" && argv[2]?.toLowerCase() === "all")) {
+    return null;
+  }
+  if (executable === "stack" && !(argv.length === 2 && firstArg === "test" || argv.length === 4 && firstArg === "--stack-yaml" && isSafeRelativeValidationPath(argv[2] ?? "") && argv[2]?.toLowerCase().endsWith("/stack.yaml") && argv[3]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "clojure" && !(argv.length === 2 && ["-x:test", "-m:test"].includes(firstArg))) {
+    return null;
+  }
+  if (executable === "lein" && !(argv.length === 2 && firstArg === "test"))
+    return null;
+  if (executable === "zig" && !(argv.length === 3 && firstArg === "build" && argv[2]?.toLowerCase() === "test" || argv.length === 5 && firstArg === "build" && argv[2]?.toLowerCase() === "--build-file" && isSafeRelativeValidationPath(argv[3] ?? "") && argv[3]?.toLowerCase().endsWith("/build.zig") && argv[4]?.toLowerCase() === "test")) {
+    return null;
+  }
+  if (executable === "terraform" && !(firstArg === "fmt" && argv[2]?.toLowerCase() === "-check" && argv.length >= 4 && argv.length <= 7 && argv.slice(3).every((path) => isSafeRelativeValidationPath(path) && /\.(?:tf|tfvars)$/i.test(path)))) {
+    return null;
+  }
+  if (executable === "luac") {
+    if (firstArg !== "-p" || argv.length !== 3 || !isSafeRelativeValidationPath(argv[2] ?? "") || !argv[2]?.toLowerCase().endsWith(".lua")) {
+      return null;
+    }
+  }
+  if (executable === "rscript") {
+    const expression = argv.length === 3 && firstArg === "-e" ? argv[2] ?? "" : "";
+    const parsedPath = expression.match(/^parse\(file='([^']+)'\)$/)?.[1] ?? "";
+    if (!parsedPath || !isSafeRelativeValidationPath(parsedPath) || !parsedPath.toLowerCase().endsWith(".r")) {
+      return null;
+    }
+  }
+  return argv;
+}
+
+// packages/shared/src/repo_validation.ts
+var FALLBACK_VALIDATION_STEP = "git diff --check";
+var MAX_JSON_BYTES = 1e6;
+var MAX_PROJECT_EVIDENCE_BYTES = 256000;
+function normalizeRepoPath(value) {
+  const normalized = String(value ?? "").replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/").replace(/\/$/, "").trim();
+  if (!normalized || normalized === "." || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.split("/").some((part) => part === "..") || !/^[\p{L}\p{N}_@+.,()[\]/ -]+$/u.test(normalized)) {
+    return "";
+  }
+  return normalized;
+}
+function commandPathArg(value, prefixRelative = false) {
+  const normalized = normalizeRepoPath(value);
+  if (!normalized)
+    return "";
+  const optionSafe = normalized.startsWith("-") ? `./${normalized}` : prefixRelative && !normalized.startsWith("./") ? `./${normalized}` : normalized;
+  return /\s/.test(optionSafe) ? `"${optionSafe}"` : optionSafe;
+}
+function dedupe(values, maxItems) {
+  const out = [];
+  const seen = new Set;
+  for (const value of values) {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed)
+      continue;
+    const key = trimmed.replace(/\s+/g, " ").toLowerCase();
+    if (seen.has(key))
+      continue;
+    seen.add(key);
+    out.push(trimmed);
+    if (out.length >= maxItems)
+      break;
+  }
+  return out;
+}
+function dedupeCompletePlans(plans, maxItems) {
+  const out = [];
+  const seen = new Set;
+  for (const plan of plans) {
+    const pending = [];
+    for (const rawValue of plan) {
+      const value = String(rawValue ?? "").trim();
+      if (!value)
+        continue;
+      const key = value.replace(/\s+/g, " ").toLowerCase();
+      if (seen.has(key) || pending.some((entry) => entry.key === key))
+        continue;
+      pending.push({ value, key });
+    }
+    if (out.length + pending.length > maxItems)
+      continue;
+    for (const entry of pending) {
+      seen.add(entry.key);
+      out.push(entry.value);
+    }
+  }
+  return out;
+}
+function readTextBounded(path, maxBytes = MAX_PROJECT_EVIDENCE_BYTES) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.allocUnsafe(maxBytes + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const count = readSync(fd, buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+      if (count === 0)
+        break;
+      bytesRead += count;
+    }
+    return {
+      text: buffer.subarray(0, Math.min(bytesRead, maxBytes)).toString("utf8"),
+      truncated: bytesRead > maxBytes
+    };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+  }
+}
+function readJson(path) {
+  const read = readTextBounded(path, MAX_JSON_BYTES);
+  if (!read || read.truncated)
+    return null;
+  try {
+    const parsed = JSON.parse(read.text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function ecosystemForPath(path) {
+  const filename = basename2(path).toLowerCase();
+  const extension = extname(path).toLowerCase();
+  if (filename === "package.json" || ["bun.lock", "bun.lockb", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"].includes(filename)) {
+    return "package";
+  }
+  if (["pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini"].includes(filename) || /^requirements(?:-[^.]+)?\.txt$/.test(filename)) {
+    return "python";
+  }
+  if (filename === "go.mod" || filename === "go.sum")
+    return "go";
+  if (filename === "cargo.toml" || filename === "cargo.lock")
+    return "rust";
+  if ([
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts"
+  ].includes(filename)) {
+    return "jvm";
+  }
+  if (/\.(?:sln|csproj|fsproj)$/i.test(filename))
+    return "dotnet";
+  if (["gemfile", "rakefile", ".rspec"].includes(filename))
+    return "ruby";
+  if (filename === "composer.json" || filename === "composer.lock")
+    return "php";
+  if (filename === "cmakelists.txt" || ["makefile", "gnumakefile"].includes(filename) || ["build", "build.bazel", "module.bazel", "workspace", "workspace.bazel"].includes(filename)) {
+    return "native";
+  }
+  if (["buf.yaml", "buf.work.yaml", "buf.gen.yaml", "buf.lock"].includes(filename)) {
+    return "protobuf";
+  }
+  if (filename === "package.swift" || filename === "package.resolved")
+    return "swift";
+  if (["pubspec.yaml", "pubspec.lock", "analysis_options.yaml"].includes(filename))
+    return "dart";
+  if (filename === "mix.exs" || filename === "mix.lock")
+    return "elixir";
+  if (filename === "cabal.project" || filename === "cabal.project.local" || filename === "stack.yaml" || extension === ".cabal") {
+    return "haskell";
+  }
+  if (["deps.edn", "project.clj", "build.clj"].includes(filename))
+    return "clojure";
+  if (["build.zig", "build.zig.zon"].includes(filename))
+    return "zig";
+  if (filename === ".terraform.lock.hcl")
+    return "terraform";
+  if ([
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".vue",
+    ".svelte",
+    ".css",
+    ".scss",
+    ".less",
+    ".html",
+    ".htm"
+  ].includes(extension)) {
+    return "package";
+  }
+  if (extension === ".py")
+    return "python";
+  if (extension === ".go")
+    return "go";
+  if (extension === ".rs")
+    return "rust";
+  if ([".java", ".kt", ".kts", ".scala"].includes(extension))
+    return "jvm";
+  if ([".cs", ".fs", ".fsx"].includes(extension))
+    return "dotnet";
+  if (extension === ".rb")
+    return "ruby";
+  if (extension === ".php")
+    return "php";
+  if ([".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"].includes(extension)) {
+    return "native";
+  }
+  if (extension === ".proto")
+    return "protobuf";
+  if (extension === ".swift")
+    return "swift";
+  if (extension === ".dart")
+    return "dart";
+  if ([".ex", ".exs"].includes(extension))
+    return "elixir";
+  if ([".hs", ".lhs"].includes(extension))
+    return "haskell";
+  if ([".clj", ".cljs", ".cljc", ".edn"].includes(extension))
+    return "clojure";
+  if (extension === ".zig")
+    return "zig";
+  if ([".tf", ".tfvars"].includes(extension))
+    return "terraform";
+  if (extension === ".r")
+    return "r";
+  if (extension === ".lua")
+    return "lua";
+  return null;
+}
+function pathsByEcosystem(paths) {
+  const grouped = new Map;
+  for (const path of paths) {
+    const ecosystem = ecosystemForPath(path);
+    if (!ecosystem)
+      continue;
+    const existing = grouped.get(ecosystem);
+    if (existing)
+      existing.push(path);
+    else
+      grouped.set(ecosystem, [path]);
+  }
+  return [...grouped.entries()].map(([ecosystem, ecosystemPaths]) => ({
+    ecosystem,
+    paths: ecosystemPaths
+  }));
+}
+function validationSearchDirectories(paths) {
+  const out = [];
+  const seen = new Set;
+  const add = (directory) => {
+    const normalized = directory === "." ? "" : normalizeRepoPath(directory);
+    if (directory && directory !== "." && !normalized)
+      return;
+    if (seen.has(normalized))
+      return;
+    seen.add(normalized);
+    out.push(normalized);
+  };
+  for (const path of paths) {
+    let directory = dirname(path).replace(/\\/g, "/");
+    while (directory && directory !== ".") {
+      add(directory);
+      const parent = dirname(directory).replace(/\\/g, "/");
+      if (parent === directory)
+        break;
+      directory = parent;
+    }
+  }
+  add("");
+  return out;
+}
+function packageManagerAt(directory) {
+  const manifest = readJson(resolve5(directory, "package.json"));
+  const declared = String(manifest?.packageManager ?? "").trim().split("@")[0]?.toLowerCase();
+  if (["bun", "pnpm", "yarn", "npm"].includes(declared)) {
+    return declared;
+  }
+  if (existsSync4(resolve5(directory, "bun.lock")) || existsSync4(resolve5(directory, "bun.lockb"))) {
+    return "bun";
+  }
+  if (existsSync4(resolve5(directory, "pnpm-lock.yaml")))
+    return "pnpm";
+  if (existsSync4(resolve5(directory, "yarn.lock")))
+    return "yarn";
+  if (existsSync4(resolve5(directory, "package-lock.json")))
+    return "npm";
+  return null;
+}
+function resolvePackageManager(repoRoot, manifestDirectory) {
+  const absoluteRoot = resolve5(repoRoot);
+  let cursor = resolve5(manifestDirectory);
+  while (true) {
+    const manager = packageManagerAt(cursor);
+    if (manager)
+      return manager;
+    if (cursor === absoluteRoot)
+      break;
+    const parent = dirname(cursor);
+    const relativeParent = relative(absoluteRoot, parent).replace(/\\/g, "/");
+    if (parent === cursor || relativeParent.startsWith("../"))
+      break;
+    cursor = parent;
+  }
+  return "npm";
+}
+function isJavaScriptTestPath(path) {
+  return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path);
+}
+function packageValidationSteps(repoRoot, directory, changedPaths) {
+  const manifestDirectory = resolve5(repoRoot, directory || ".");
+  const manifest = readJson(resolve5(manifestDirectory, "package.json"));
+  if (!manifest)
+    return null;
+  const manager = resolvePackageManager(repoRoot, manifestDirectory);
+  const scripts = manifest.scripts && typeof manifest.scripts === "object" && !Array.isArray(manifest.scripts) ? manifest.scripts : {};
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  if (directory && !directoryArg)
+    return null;
+  if (manager === "bun") {
+    const focusedTests = changedPaths.filter(isJavaScriptTestPath).map((path) => {
+      const relativeTest = relative(manifestDirectory, resolve5(repoRoot, path)).replace(/\\/g, "/");
+      if (!relativeTest || relativeTest.startsWith("../"))
+        return "";
+      return commandPathArg(relativeTest, true);
+    }).filter(Boolean).slice(0, 4);
+    if (focusedTests.length > 0) {
+      return [`${directory ? `bun --cwd ${directoryArg}` : "bun"} test ${focusedTests.join(" ")}`];
+    }
+  }
+  const scriptName = ["test", "check", "lint"].find((name) => {
+    const script = typeof scripts[name] === "string" ? scripts[name].trim() : "";
+    return Boolean(script && !(name === "test" && (/no test specified/i.test(script) || /(?:^|[;&|])\s*exit\s+1(?:\s|$)/i.test(script))));
+  });
+  if (!scriptName)
+    return null;
+  if (manager === "bun") {
+    return [directoryArg ? `bun --cwd ${directoryArg} run ${scriptName}` : `bun run ${scriptName}`];
+  }
+  if (manager === "pnpm") {
+    return [
+      directoryArg ? `pnpm --dir ${directoryArg} run ${scriptName}` : `pnpm run ${scriptName}`
+    ];
+  }
+  if (manager === "yarn") {
+    return [
+      directoryArg ? `yarn --cwd ${directoryArg} run ${scriptName}` : `yarn run ${scriptName}`
+    ];
+  }
+  return [
+    directoryArg ? `npm --prefix ${directoryArg} run ${scriptName}` : `npm run ${scriptName}`
+  ];
+}
+function pythonValidationSteps(repoRoot, directory, paths) {
+  const root = resolve5(repoRoot, directory || ".");
+  const manifestNames = [
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    "pytest.ini",
+    "tox.ini",
+    "requirements.txt"
+  ];
+  const hasManifest = manifestNames.some((name) => existsSync4(resolve5(root, name)));
+  const pythonPaths = paths.filter((path) => extname(path).toLowerCase() === ".py");
+  if (!hasManifest)
+    return null;
+  const testPaths = pythonPaths.filter((path) => /(^|\/)(?:tests?|specs?)(\/|$)|(^|\/)test_[^/]+\.py$|_test\.py$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  let evidence = "";
+  for (const name of [...manifestNames, "requirements-dev.txt", "conftest.py"]) {
+    const read = readTextBounded(resolve5(root, name));
+    if (read)
+      evidence += `
+${read.text}`;
+  }
+  if (testPaths.length > 0 || /\bpytest\b/i.test(evidence)) {
+    return [`python -m pytest${testPaths.length > 0 ? ` ${testPaths.join(" ")}` : ""}`];
+  }
+  if (existsSync4(resolve5(root, "manage.py"))) {
+    const managePath = commandPathArg(directory ? `${directory}/manage.py` : "manage.py");
+    return managePath ? [`python ${managePath} test`] : null;
+  }
+  const compileTargets = pythonPaths.map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  return compileTargets.length > 0 ? [`python -m compileall ${compileTargets.join(" ")}`] : null;
+}
+function goValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "go.mod")))
+    return null;
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./..."];
+}
+function rustValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "Cargo.toml")))
+    return null;
+  if (!directory)
+    return ["cargo test"];
+  const manifestArg = commandPathArg(`${directory}/Cargo.toml`);
+  return manifestArg ? [`cargo test --manifest-path ${manifestArg}`] : null;
+}
+function jvmValidationSteps(repoRoot, directory) {
+  const root = resolve5(repoRoot, directory || ".");
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  if (existsSync4(resolve5(root, "pom.xml"))) {
+    const manifestArg = commandPathArg(directory ? `${directory}/pom.xml` : "pom.xml");
+    return [directory && manifestArg ? `mvn -f ${manifestArg} test` : "mvn test"];
+  }
+  if (existsSync4(resolve5(root, "build.gradle")) || existsSync4(resolve5(root, "build.gradle.kts"))) {
+    return [directoryArg ? `gradle -p ${directoryArg} test` : "gradle test"];
+  }
+  return null;
+}
+function dotnetValidationSteps(repoRoot, directory, paths) {
+  const root = resolve5(repoRoot, directory || ".");
+  const explicitProject = paths.find((path) => /\.(?:sln|csproj|fsproj)$/i.test(path));
+  let project = explicitProject ?? "";
+  if (!project) {
+    try {
+      const filename = readdirSync2(root).filter((entry) => /\.(?:sln|csproj|fsproj)$/i.test(entry)).sort()[0];
+      project = filename ? directory ? `${directory}/${filename}` : filename : "";
+    } catch {
+      project = "";
+    }
+  }
+  const projectArg = commandPathArg(project);
+  return projectArg ? [`dotnet test ${projectArg}`] : null;
+}
+function rubyValidationSteps(repoRoot, directory, paths) {
+  const root = resolve5(repoRoot, directory || ".");
+  const rubyPaths = paths.filter((path) => extname(path).toLowerCase() === ".rb");
+  const hasRubyProjectEvidence = existsSync4(resolve5(root, "Gemfile")) || existsSync4(resolve5(root, "Rakefile")) || existsSync4(resolve5(root, ".rspec"));
+  if (directory && !hasRubyProjectEvidence)
+    return null;
+  if (!directory && existsSync4(resolve5(root, "Gemfile"))) {
+    const tests = rubyPaths.filter((path) => /(^|\/)spec(s)?(\/|$)|_spec\.rb$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+    if (tests.length > 0 || existsSync4(resolve5(root, "spec")) || existsSync4(resolve5(root, ".rspec"))) {
+      return [`bundle exec rspec${tests.length > 0 ? ` ${tests.join(" ")}` : ""}`];
+    }
+    if (existsSync4(resolve5(root, "Rakefile")))
+      return ["bundle exec rake test"];
+  }
+  const target = commandPathArg(rubyPaths[0] ?? "");
+  return target ? [`ruby -c ${target}`] : null;
+}
+function phpValidationSteps(repoRoot, directory, paths) {
+  const root = resolve5(repoRoot, directory || ".");
+  const composer = readJson(resolve5(root, "composer.json"));
+  if (directory && !composer)
+    return null;
+  const scripts = composer?.scripts && typeof composer.scripts === "object" && !Array.isArray(composer.scripts) ? composer.scripts : null;
+  if (scripts?.test != null) {
+    const directoryArg = directory ? commandPathArg(directory) : "";
+    return [directoryArg ? `composer --working-dir ${directoryArg} test` : "composer test"];
+  }
+  const phpPath = paths.find((path) => extname(path).toLowerCase() === ".php") ?? "";
+  const target = commandPathArg(phpPath);
+  return target ? [`php -l ${target}`] : null;
+}
+function changedManifestAt(paths, directory, names) {
+  const expectedDir = directory || ".";
+  const lowerNames = new Set(names.map((name) => name.toLowerCase()));
+  return paths.some((path) => {
+    const pathDirectory = dirname(path).replace(/\\/g, "/");
+    return (pathDirectory || ".") === expectedDir && lowerNames.has(basename2(path).toLowerCase());
+  });
+}
+function makeValidationSteps(repoRoot, directory) {
+  const root = resolve5(repoRoot, directory || ".");
+  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve5(root, name)));
+  if (!makefile)
+    return null;
+  const evidence = readTextBounded(resolve5(root, makefile));
+  if (!evidence)
+    return null;
+  const target = ["test", "check"].find((name) => new RegExp(`^${name}\\s*:(?![=])`, "m").test(evidence.text));
+  if (!target)
+    return null;
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `make -C ${directoryArg} ${target}` : `make ${target}`];
+}
+function cmakeValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "CMakeLists.txt")))
+    return null;
+  const sourceArg = directory ? commandPathArg(directory) : ".";
+  const buildPath = directory ? `${directory}/build` : "build";
+  const buildArg = commandPathArg(buildPath);
+  if (!sourceArg || !buildArg)
+    return null;
+  return [
+    `cmake -S ${sourceArg} -B ${buildArg}`,
+    `cmake --build ${buildArg}`,
+    `ctest --test-dir ${buildArg} --output-on-failure`
+  ];
+}
+function hasBazelWorkspaceAt(repoRoot) {
+  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve5(repoRoot, name)));
+}
+function bazelValidationSteps(repoRoot, directory) {
+  if (!hasBazelWorkspaceAt(repoRoot))
+    return null;
+  const root = resolve5(repoRoot, directory || ".");
+  const hasPackage = existsSync4(resolve5(root, "BUILD")) || existsSync4(resolve5(root, "BUILD.bazel"));
+  if (directory && !hasPackage)
+    return null;
+  const target = directory ? `//${directory}/...` : "//...";
+  return /^\/\/[A-Za-z0-9_@+.,/-]*\.\.\.$/.test(target) ? [`bazel test ${target}`] : null;
+}
+function nativeValidationSteps(repoRoot, directory, paths) {
+  const directCMake = changedManifestAt(paths, directory, ["CMakeLists.txt"]);
+  const directMake = changedManifestAt(paths, directory, ["Makefile", "makefile", "GNUmakefile"]);
+  const directBazel = changedManifestAt(paths, directory, [
+    "BUILD",
+    "BUILD.bazel",
+    "MODULE.bazel",
+    "WORKSPACE",
+    "WORKSPACE.bazel"
+  ]);
+  if (directCMake)
+    return cmakeValidationSteps(repoRoot, directory);
+  if (directBazel)
+    return bazelValidationSteps(repoRoot, directory);
+  if (directMake)
+    return makeValidationSteps(repoRoot, directory);
+  return cmakeValidationSteps(repoRoot, directory) ?? bazelValidationSteps(repoRoot, directory) ?? makeValidationSteps(repoRoot, directory);
+}
+function protobufValidationSteps(repoRoot, directory) {
+  const root = resolve5(repoRoot, directory || ".");
+  if (!existsSync4(resolve5(root, "buf.yaml")) && !existsSync4(resolve5(root, "buf.work.yaml"))) {
+    return null;
+  }
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `buf lint ${directoryArg}` : "buf lint"];
+}
+function swiftValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "Package.swift")))
+    return null;
+  const directoryArg = directory ? commandPathArg(directory) : "";
+  return [directoryArg ? `swift test --package-path ${directoryArg}` : "swift test"];
+}
+function isDartTestPath(path) {
+  return /(^|\/)(?:test|integration_test)(\/|$)|_test\.dart$/i.test(path);
+}
+function withoutYamlComments(text) {
+  return text.split(/\r?\n/).map((line) => line.replace(/^\s*#.*$|\s+#.*$/, "")).join(`
+`);
+}
+function dartValidationSteps(repoRoot, directory, paths) {
+  const root = resolve5(repoRoot, directory || ".");
+  const pubspec = readTextBounded(resolve5(root, "pubspec.yaml"));
+  if (!pubspec)
+    return null;
+  const pubspecEvidence = withoutYamlComments(pubspec.text);
+  const executable = /\bsdk\s*:\s*flutter\b|^flutter\s*:/m.test(pubspecEvidence) ? "flutter" : "dart";
+  if (directory && executable === "flutter") {
+    const rootPubspec = readTextBounded(resolve5(repoRoot, "pubspec.yaml"));
+    if (!rootPubspec || !/^workspace\s*:/m.test(withoutYamlComments(rootPubspec.text)) || !/^resolution\s*:\s*workspace\s*$/m.test(pubspecEvidence)) {
+      return null;
+    }
+  }
+  if (directory && executable === "dart") {
+    const directoryArg = commandPathArg(directory);
+    return directoryArg ? [`dart --directory ${directoryArg} test`] : null;
+  }
+  const focusedTests = paths.filter(isDartTestPath).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  if (focusedTests.length > 0)
+    return [`${executable} test ${focusedTests.join(" ")}`];
+  if (!directory)
+    return [`${executable} test`];
+  const relativeTests = existsSync4(resolve5(root, "test")) ? `${directory}/test` : existsSync4(resolve5(root, "integration_test")) ? `${directory}/integration_test` : "";
+  const target = commandPathArg(relativeTests);
+  return target ? [`${executable} test ${target}`] : null;
+}
+function elixirValidationSteps(repoRoot, directory, paths) {
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "mix.exs")))
+    return null;
+  if (directory) {
+    const directoryArg = commandPathArg(directory);
+    return directoryArg ? [`mix --cd ${directoryArg} test`] : null;
+  }
+  const focusedTests = paths.filter((path) => /(^|\/)test(\/|$)|_test\.exs$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  return [`mix test${focusedTests.length > 0 ? ` ${focusedTests.join(" ")}` : ""}`];
+}
+function hasCabalManifest(directory) {
+  if (existsSync4(resolve5(directory, "cabal.project")))
+    return true;
+  try {
+    return readdirSync2(directory).some((entry) => entry.toLowerCase().endsWith(".cabal"));
+  } catch {
+    return false;
+  }
+}
+function haskellValidationSteps(repoRoot, directory) {
+  const root = resolve5(repoRoot, directory || ".");
+  if (existsSync4(resolve5(root, "stack.yaml"))) {
+    if (!directory)
+      return ["stack test"];
+    const yamlArg = commandPathArg(`${directory}/stack.yaml`);
+    return yamlArg ? [`stack --stack-yaml ${yamlArg} test`] : null;
+  }
+  if (!directory && hasCabalManifest(root))
+    return ["cabal test all"];
+  return null;
+}
+function ednMapAfterKeyword(text, keyword) {
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const keywordIndex = text.indexOf(keyword, searchFrom);
+    if (keywordIndex < 0)
+      return "";
+    const next = text[keywordIndex + keyword.length] ?? "";
+    if (next && /[A-Za-z0-9_!?*+.-]/.test(next)) {
+      searchFrom = keywordIndex + keyword.length;
+      continue;
+    }
+    let cursor = keywordIndex + keyword.length;
+    while (cursor < text.length && /[\s,]/.test(text[cursor] ?? ""))
+      cursor += 1;
+    if (text[cursor] !== "{") {
+      searchFrom = cursor + 1;
+      continue;
+    }
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let index = cursor;index < text.length; index += 1) {
+      const ch = text[index] ?? "";
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (quoted && ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        quoted = !quoted;
+        continue;
+      }
+      if (quoted)
+        continue;
+      if (ch === "{")
+        depth += 1;
+      if (ch === "}") {
+        depth -= 1;
+        if (depth === 0)
+          return text.slice(cursor, index + 1);
+      }
+    }
+    return "";
+  }
+  return "";
+}
+function clojureValidationSteps(repoRoot, directory) {
+  if (directory)
+    return null;
+  const deps = readTextBounded(resolve5(repoRoot, "deps.edn"));
+  if (deps) {
+    const testAlias = ednMapAfterKeyword(deps.text, ":test");
+    if (/:exec-fn\b/.test(testAlias))
+      return ["clojure -X:test"];
+    if (/:main-opts\b/.test(testAlias))
+      return ["clojure -M:test"];
+  }
+  if (existsSync4(resolve5(repoRoot, "project.clj")))
+    return ["lein test"];
+  return null;
+}
+function zigValidationSteps(repoRoot, directory) {
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "build.zig")))
+    return null;
+  if (!directory)
+    return ["zig build test"];
+  const buildFile = commandPathArg(`${directory}/build.zig`);
+  return buildFile ? [`zig build --build-file ${buildFile} test`] : null;
+}
+function terraformValidationSteps(paths) {
+  const targets = paths.filter((path) => [".tf", ".tfvars"].includes(extname(path).toLowerCase())).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+  return targets.length > 0 ? [`terraform fmt -check ${targets.join(" ")}`] : null;
+}
+function validationForEcosystem(ecosystem, repoRoot, directory, paths) {
+  if (ecosystem === "package")
+    return packageValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "python")
+    return pythonValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "go")
+    return goValidationSteps(repoRoot, directory);
+  if (ecosystem === "rust")
+    return rustValidationSteps(repoRoot, directory);
+  if (ecosystem === "jvm")
+    return jvmValidationSteps(repoRoot, directory);
+  if (ecosystem === "dotnet")
+    return dotnetValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "ruby")
+    return rubyValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "php")
+    return phpValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "native")
+    return nativeValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "protobuf")
+    return protobufValidationSteps(repoRoot, directory);
+  if (ecosystem === "swift")
+    return swiftValidationSteps(repoRoot, directory);
+  if (ecosystem === "dart")
+    return dartValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "elixir")
+    return elixirValidationSteps(repoRoot, directory, paths);
+  if (ecosystem === "haskell")
+    return haskellValidationSteps(repoRoot, directory);
+  if (ecosystem === "clojure")
+    return clojureValidationSteps(repoRoot, directory);
+  if (ecosystem === "zig")
+    return zigValidationSteps(repoRoot, directory);
+  if (ecosystem === "terraform")
+    return terraformValidationSteps(paths);
+  return null;
+}
+function syntaxFallbackForEcosystem(ecosystem, paths) {
+  if (ecosystem === "python") {
+    const targets = paths.filter((path) => extname(path).toLowerCase() === ".py").map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
+    return targets.length > 0 ? [`python -m compileall ${targets.join(" ")}`] : null;
+  }
+  if (ecosystem === "ruby") {
+    const target = commandPathArg(paths.find((path) => extname(path).toLowerCase() === ".rb") ?? "");
+    return target ? [`ruby -c ${target}`] : null;
+  }
+  if (ecosystem === "php") {
+    const target = commandPathArg(paths.find((path) => extname(path).toLowerCase() === ".php") ?? "");
+    return target ? [`php -l ${target}`] : null;
+  }
+  if (ecosystem === "r") {
+    const target = normalizeRepoPath(paths.find((path) => extname(path).toLowerCase() === ".r") ?? "");
+    return target ? [`Rscript -e "parse(file='${target}')"`] : null;
+  }
+  if (ecosystem === "lua") {
+    const target = commandPathArg(paths.find((path) => extname(path).toLowerCase() === ".lua") ?? "");
+    return target ? [`luac -p ${target}`] : null;
+  }
+  return null;
+}
+function isFallbackEligiblePath(path) {
+  const filename = basename2(path).toLowerCase();
+  const extension = extname(path).toLowerCase();
+  if (/^(?:readme|license|licence|changelog|contributing|authors|notice)(?:\..*)?$/.test(filename)) {
+    return true;
+  }
+  return [
+    ".md",
+    ".mdx",
+    ".rst",
+    ".adoc",
+    ".txt",
+    ".json",
+    ".jsonc",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".xml",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".webm"
+  ].includes(extension);
+}
+function inferRepositoryValidationSteps(options) {
+  const maxSteps = Math.max(1, Math.min(8, Math.floor(options.maxSteps ?? 4)));
+  const repoRoot = resolve5(options.repoRoot || ".");
+  const paths = (options.changedPaths ?? []).map(normalizeRepoPath).filter(Boolean);
+  const plans = [];
+  for (const group of pathsByEcosystem(paths)) {
+    const pathsByOwner = new Map;
+    const pathsWithoutOwner = [];
+    for (const path of group.paths) {
+      const owner = validationSearchDirectories([path]).find((directory) => Boolean(validationForEcosystem(group.ecosystem, repoRoot, directory, [path])?.length));
+      if (owner === undefined) {
+        pathsWithoutOwner.push(path);
+        continue;
+      }
+      const ownerPaths = pathsByOwner.get(owner) ?? [];
+      ownerPaths.push(path);
+      pathsByOwner.set(owner, ownerPaths);
+    }
+    for (const [directory, ownerPaths] of pathsByOwner) {
+      const plan = validationForEcosystem(group.ecosystem, repoRoot, directory, ownerPaths);
+      if (plan?.length)
+        plans.push(plan);
+    }
+    const fallback = syntaxFallbackForEcosystem(group.ecosystem, pathsWithoutOwner);
+    if (fallback?.length)
+      plans.push(fallback);
+  }
+  if (plans.length > 0)
+    return dedupeCompletePlans(plans, maxSteps);
+  if (paths.length === 0 || paths.every(isFallbackEligiblePath)) {
+    return [FALLBACK_VALIDATION_STEP];
+  }
+  return [];
+}
+function mergeRepositoryValidationSteps(options) {
+  const maxSteps = Math.max(1, Math.min(8, Math.floor(options.maxSteps ?? 8)));
+  const inferred = inferRepositoryValidationSteps(options);
+  const inferredUsesBun = inferred.some((step) => /^bun\b/i.test(step));
+  const existing = Array.isArray(options.existingSteps) ? options.existingSteps.map((entry) => String(entry ?? "").trim()).filter((step) => Boolean(step) && Boolean(tokenizeTrustedValidationCommand(step))) : [];
+  const compatibleExisting = existing.filter((step) => inferredUsesBun || !/^bun\b/i.test(step));
+  if (inferred.length === 0)
+    return [];
+  return dedupe([...inferred, ...compatibleExisting], maxSteps);
+}
 // packages/shared/src/validation_repair_lease.ts
 var LEASE_KEYS = {
   version: "pushpals-validationRepairLeaseVersion",
@@ -2829,12 +5315,12 @@ var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 var TRUTHY2 = new Set(["1", "true", "yes", "on"]);
 var FALSY2 = new Set(["0", "false", "no", "off"]);
 // apps/workerpals/src/backends/backend_config.ts
-import { existsSync as existsSync7, readFileSync as readFileSync6 } from "fs";
+import { existsSync as existsSync8, readFileSync as readFileSync6 } from "fs";
 import { join as join7 } from "path";
 
 // apps/workerpals/src/common/generic_python_executor.ts
-import { existsSync as existsSync5 } from "fs";
-import { dirname as dirname2, join as join6, resolve as resolve6 } from "path";
+import { existsSync as existsSync6 } from "fs";
+import { dirname as dirname3, join as join6, resolve as resolve7 } from "path";
 
 // apps/workerpals/src/common/execution_utils.ts
 var DEFAULT_CONFIG = loadPushPalsConfig();
@@ -2956,13 +5442,13 @@ function filterResultLines(stdout, executorResultPrefix = resolveOutputCompactio
 }
 
 // apps/workerpals/src/common/sandbox_env.ts
-import { createHash as createHash2 } from "crypto";
-import { existsSync as existsSync4, mkdirSync, readFileSync as readFileSync5, writeFileSync } from "fs";
+import { createHash as createHash3 } from "crypto";
+import { existsSync as existsSync5, mkdirSync, readFileSync as readFileSync5, writeFileSync } from "fs";
 import { homedir as homedir2, tmpdir as tmpdir2 } from "os";
-import { basename as basename2, dirname, join as join4, resolve as resolve5 } from "path";
+import { basename as basename3, dirname as dirname2, join as join4, resolve as resolve6 } from "path";
 
 // apps/workerpals/src/common/direct_worktree.ts
-import { createHash } from "crypto";
+import { createHash as createHash2 } from "crypto";
 import { homedir, tmpdir } from "os";
 import { posix, win32 } from "path";
 var WINDOWS_DIRECT_WORKTREE_ROOT_NAME = ".ppw";
@@ -2975,7 +5461,7 @@ function normalizeForComparison(value, platform) {
   return platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 function repoKey(repo, platform) {
-  return createHash("sha256").update(normalizeForComparison(repo, platform)).digest("hex").slice(0, 12);
+  return createHash2("sha256").update(normalizeForComparison(repo, platform)).digest("hex").slice(0, 12);
 }
 function resolveDirectWorktreeRoot(repo, platform = process.platform, homeRoot = homedir()) {
   const path = pathApi(platform);
@@ -3054,7 +5540,7 @@ function resolveBunExecutableFromEnv(sourceEnv, platform = process.platform, cur
       continue;
     for (const candidate of candidates) {
       const fullPath = join4(dir, candidate);
-      if (existsSync4(fullPath))
+      if (existsSync5(fullPath))
         return fullPath;
     }
   }
@@ -3063,7 +5549,7 @@ function resolveBunExecutableFromEnv(sourceEnv, platform = process.platform, cur
 function commandDirectory(value) {
   if (!/[\\/]/.test(value))
     return "";
-  return dirname(value);
+  return dirname2(value);
 }
 function withResolvedBunOnPath(sourceEnv, platform = process.platform, currentExecPathOverride = process.execPath) {
   const env = normalizePathEnv(stringEnv(sourceEnv), platform);
@@ -3088,39 +5574,39 @@ function withResolvedBunOnPath(sourceEnv, platform = process.platform, currentEx
   return out;
 }
 function safeRepoSlug(repo, platform = process.platform) {
-  const leaf = basename2(resolve5(repo)).replace(/[^A-Za-z0-9_.-]+/g, "-") || "repo";
-  const resolvedRepo = resolve5(repo);
+  const leaf = basename3(resolve6(repo)).replace(/[^A-Za-z0-9_.-]+/g, "-") || "repo";
+  const resolvedRepo = resolve6(repo);
   const hashInput = platform === "win32" ? resolvedRepo.replace(/\\/g, "/").toLowerCase() : resolvedRepo;
-  const hash = createHash2("sha256").update(hashInput).digest("hex").slice(0, 12);
+  const hash = createHash3("sha256").update(hashInput).digest("hex").slice(0, 12);
   if (platform === "win32")
     return hash;
   return `${leaf}-${hash}`;
 }
 function browserCacheRepoKey(repo, platform = process.platform) {
-  const normalized = resolve5(repo).replace(/\\/g, "/");
+  const normalized = resolve6(repo).replace(/\\/g, "/");
   const marker = "/.worktrees/";
   const markerIndex = normalized.lastIndexOf(marker);
   if (markerIndex >= 0)
     return normalized.slice(0, markerIndex);
-  return directWorktreePoolRoot(repo, platform) ?? resolve5(repo);
+  return directWorktreePoolRoot(repo, platform) ?? resolve6(repo);
 }
 function resolveWorkerSandboxRoot(repo, platform = process.platform, homeRoot = homedir2(), tempRoot = tmpdir2()) {
-  const parent = platform === "win32" ? resolve5(homeRoot, WINDOWS_WORKER_SANDBOX_ROOT_NAME) : resolve5(tempRoot, TEMP_WORKER_SANDBOX_ROOT_NAME);
-  return resolve5(parent, safeRepoSlug(repo, platform));
+  const parent = platform === "win32" ? resolve6(homeRoot, WINDOWS_WORKER_SANDBOX_ROOT_NAME) : resolve6(tempRoot, TEMP_WORKER_SANDBOX_ROOT_NAME);
+  return resolve6(parent, safeRepoSlug(repo, platform));
 }
 function defaultExpoPortForRepo(repo) {
-  const hashPrefix = createHash2("sha256").update(resolve5(repo)).digest("hex").slice(0, 8);
+  const hashPrefix = createHash3("sha256").update(resolve6(repo)).digest("hex").slice(0, 8);
   const offset = Number.parseInt(hashPrefix, 16) % 1000;
   return String(19006 + offset);
 }
 function resolveExpoRouterAppRoot(repo) {
   try {
-    const packageJson = JSON.parse(readFileSync5(resolve5(repo, "package.json"), "utf8"));
+    const packageJson = JSON.parse(readFileSync5(resolve6(repo, "package.json"), "utf8"));
     const usesExpoRouter = typeof packageJson.main === "string" && packageJson.main.includes("expo-router") || packageJson.dependencies?.["expo-router"] !== undefined || packageJson.devDependencies?.["expo-router"] !== undefined;
     if (!usesExpoRouter)
       return;
-    for (const candidate of [resolve5(repo, "src", "app"), resolve5(repo, "app")]) {
-      if (existsSync4(candidate))
+    for (const candidate of [resolve6(repo, "src", "app"), resolve6(repo, "app")]) {
+      if (existsSync5(candidate))
         return candidate;
     }
   } catch {}
@@ -3134,9 +5620,9 @@ function ensureDirs(paths) {
   }
 }
 function ensureSandboxGitConfig(homeDir) {
-  const gitConfigPath = resolve5(homeDir, ".gitconfig");
+  const gitConfigPath = resolve6(homeDir, ".gitconfig");
   try {
-    const existing = existsSync4(gitConfigPath) ? readFileSync5(gitConfigPath, "utf8") : "";
+    const existing = existsSync5(gitConfigPath) ? readFileSync5(gitConfigPath, "utf8") : "";
     if (/(^|\n)\s*directory\s*=\s*\*/.test(existing))
       return;
     const prefix = existing.trim() ? `${existing.replace(/\s+$/, "")}
@@ -3156,9 +5642,9 @@ function withWorkerNodeOptions(value) {
 }
 function withWorkerNodePath(repo, value, platform = process.platform) {
   const delimiter = pathListDelimiter(platform);
-  const jobNodeModules = resolve5(repo, "node_modules");
+  const jobNodeModules = resolve6(repo, "node_modules");
   const existing = (value ?? "").split(delimiter).map((entry) => entry.trim()).filter(Boolean);
-  const remaining = existing.filter((entry) => !(platform === "win32" ? resolve5(entry).toLowerCase() === jobNodeModules.toLowerCase() : resolve5(entry) === jobNodeModules));
+  const remaining = existing.filter((entry) => !(platform === "win32" ? resolve6(entry).toLowerCase() === jobNodeModules.toLowerCase() : resolve6(entry) === jobNodeModules));
   return [jobNodeModules, ...remaining].join(delimiter);
 }
 function resolveOriginalHome(env) {
@@ -3167,8 +5653,8 @@ function resolveOriginalHome(env) {
 function resolveCodexHome(env, originalHome) {
   if (env.CODEX_HOME)
     return env.CODEX_HOME;
-  const defaultCodexHome = resolve5(originalHome, ".codex");
-  return existsSync4(defaultCodexHome) ? defaultCodexHome : undefined;
+  const defaultCodexHome = resolve6(originalHome, ".codex");
+  return existsSync5(defaultCodexHome) ? defaultCodexHome : undefined;
 }
 function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform = process.platform) {
   const env = withResolvedBunOnPath(sourceEnv);
@@ -3176,15 +5662,15 @@ function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform =
   const sandboxHomeRoot = platform === "win32" ? env.USERPROFILE || originalHome : originalHome;
   const codexHome = resolveCodexHome(env, originalHome);
   const baseDir = resolveWorkerSandboxRoot(repo, platform, sandboxHomeRoot);
-  const homeDir = resolve5(baseDir, "home");
-  const cacheDir = resolve5(baseDir, "cache");
-  const expoDir = resolve5(baseDir, "expo");
-  const tempDir = resolve5(baseDir, "tmp");
-  const configDir = resolve5(baseDir, "config");
-  const roamingDir = resolve5(baseDir, "roaming");
-  const localAppDataDir = resolve5(baseDir, "local");
-  const powershellAnalysisCachePath = resolve5(localAppDataDir, "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache");
-  const playwrightBrowsersDir = env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0" ? env.PLAYWRIGHT_BROWSERS_PATH : resolve5(resolveWorkerSandboxRoot(browserCacheRepoKey(repo, platform), platform, sandboxHomeRoot), platform === "win32" ? WINDOWS_PLAYWRIGHT_CACHE_NAME : TEMP_PLAYWRIGHT_CACHE_NAME);
+  const homeDir = resolve6(baseDir, "home");
+  const cacheDir = resolve6(baseDir, "cache");
+  const expoDir = resolve6(baseDir, "expo");
+  const tempDir = resolve6(baseDir, "tmp");
+  const configDir = resolve6(baseDir, "config");
+  const roamingDir = resolve6(baseDir, "roaming");
+  const localAppDataDir = resolve6(baseDir, "local");
+  const powershellAnalysisCachePath = resolve6(localAppDataDir, "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache");
+  const playwrightBrowsersDir = env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0" ? env.PLAYWRIGHT_BROWSERS_PATH : resolve6(resolveWorkerSandboxRoot(browserCacheRepoKey(repo, platform), platform, sandboxHomeRoot), platform === "win32" ? WINDOWS_PLAYWRIGHT_CACHE_NAME : TEMP_PLAYWRIGHT_CACHE_NAME);
   const defaultExpoPort = defaultExpoPortForRepo(repo);
   const expoRouterAppRoot = resolveExpoRouterAppRoot(repo);
   ensureDirs([
@@ -3194,8 +5680,8 @@ function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform =
     tempDir,
     configDir,
     ...platform === "win32" ? [roamingDir, localAppDataDir] : [],
-    ...platform === "win32" ? [dirname(powershellAnalysisCachePath)] : [],
-    resolve5(cacheDir, "npm"),
+    ...platform === "win32" ? [dirname2(powershellAnalysisCachePath)] : [],
+    resolve6(cacheDir, "npm"),
     playwrightBrowsersDir
   ]);
   ensureSandboxGitConfig(homeDir);
@@ -3211,7 +5697,7 @@ function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform =
       LOCALAPPDATA: localAppDataDir,
       PSModuleAnalysisCachePath: powershellAnalysisCachePath
     } : {},
-    npm_config_cache: resolve5(cacheDir, "npm"),
+    npm_config_cache: resolve6(cacheDir, "npm"),
     PLAYWRIGHT_BROWSERS_PATH: env.PLAYWRIGHT_BROWSERS_PATH ?? playwrightBrowsersDir,
     EXPO_HOME: expoDir,
     EXPO_NO_TELEMETRY: env.EXPO_NO_TELEMETRY ?? "1",
@@ -3314,7 +5800,7 @@ function coerceJobTokenUsage(value, fallback) {
 function resolveRuntimeSettings(config, runtimeConfig) {
   const workerCfg = runtimeConfig.workerpals;
   const rawPython = String(workerCfg[config.pythonConfigKey] ?? "python");
-  const pythonBin = rawPython.includes("/") || rawPython.includes("\\") ? resolve6(runtimeConfig.projectRoot, rawPython) : rawPython;
+  const pythonBin = rawPython.includes("/") || rawPython.includes("\\") ? resolve7(runtimeConfig.projectRoot, rawPython) : rawPython;
   const rawTimeout = Number(workerCfg[config.timeoutConfigKey]);
   const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(1e4, Math.floor(rawTimeout)) : 300000;
   return { pythonBin, timeoutMs };
@@ -3369,7 +5855,7 @@ function uniqueStrings(values) {
 function resolveGenericPythonExecutorScriptPath(config, runtimeConfig) {
   const candidates = [];
   if (config.scriptSegments && config.scriptSegments.length > 0) {
-    const runtimeRoot = dirname2(runtimeConfig.configDir);
+    const runtimeRoot = dirname3(runtimeConfig.configDir);
     candidates.push(join6(runtimeRoot, "sandbox", ...config.scriptSegments));
     candidates.push(config.scriptPath);
     candidates.push(join6(runtimeRoot, ...config.scriptSegments));
@@ -3377,9 +5863,9 @@ function resolveGenericPythonExecutorScriptPath(config, runtimeConfig) {
   } else {
     candidates.push(config.scriptPath);
   }
-  const uniqueCandidates = uniqueStrings(candidates.map((candidate) => resolve6(candidate)));
+  const uniqueCandidates = uniqueStrings(candidates.map((candidate) => resolve7(candidate)));
   return {
-    scriptPath: uniqueCandidates.find((candidate) => existsSync5(candidate)) ?? null,
+    scriptPath: uniqueCandidates.find((candidate) => existsSync6(candidate)) ?? null,
     candidates: uniqueCandidates
   };
 }
@@ -3782,11 +6268,11 @@ function createGenericPythonExecutor(config) {
 }
 
 // apps/workerpals/src/common/runtime_paths.ts
-import { resolve as resolve7 } from "path";
+import { resolve as resolve8 } from "path";
 function resolveWorkerpalsSourcePath(...segments) {
   const configuredRoot = String(process.env.PUSHPALS_WORKERPALS_SOURCE_ROOT ?? "").trim();
-  const sourceRoot = configuredRoot || resolve7(import.meta.dir, "..");
-  return resolve7(sourceRoot, ...segments);
+  const sourceRoot = configuredRoot || resolve8(import.meta.dir, "..");
+  return resolve8(sourceRoot, ...segments);
 }
 
 // apps/workerpals/src/backends/miniswe_backend.ts
@@ -3865,7 +6351,7 @@ var OPENAI_CODEX_BACKEND = {
 };
 
 // apps/workerpals/src/backends/openhands_task_execute.ts
-import { existsSync as existsSync6 } from "fs";
+import { existsSync as existsSync7 } from "fs";
 
 // apps/workerpals/src/timeout_policy.ts
 var DEFAULT_DOCKER_TIMEOUT_MS = 1860000;
@@ -4018,7 +6504,7 @@ function extractClarificationQuestionFromOutput(output) {
 async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, budgets, executionOptions = {}) {
   const pythonBin = runtimeConfig.workerpals.openhandsPython || "python";
   const scriptPath = executionOptions.scriptPath ?? OPENHANDS_SCRIPT_PATH;
-  if (!existsSync6(scriptPath)) {
+  if (!existsSync7(scriptPath)) {
     return {
       ok: false,
       summary: `OpenHands wrapper script not found: ${scriptPath}`,
@@ -4592,7 +7078,7 @@ function toStrings(value) {
   return value.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean);
 }
 function parseRequiredBackendToml(path) {
-  if (!existsSync7(path)) {
+  if (!existsSync8(path)) {
     throw new Error(`Missing required runtime backend config file: ${path}`);
   }
   const parsed = Bun.TOML.parse(readFileSync6(path, "utf-8"));
@@ -4709,12 +7195,12 @@ class Logger {
 }
 
 // apps/workerpals/src/execute_job.ts
-import { createHash as createHash4 } from "crypto";
+import { createHash as createHash5 } from "crypto";
 import {
-  existsSync as existsSync8,
+  existsSync as existsSync9,
   lstatSync as lstatSync2,
   mkdirSync as mkdirSync3,
-  readdirSync as readdirSync3,
+  readdirSync as readdirSync4,
   readFileSync as readFileSync8,
   renameSync,
   rmSync as rmSync3,
@@ -4722,22 +7208,22 @@ import {
   unlinkSync,
   writeFileSync as writeFileSync4
 } from "fs";
-import { basename as basename4, isAbsolute as isAbsolute3, resolve as resolve10 } from "path";
+import { basename as basename5, isAbsolute as isAbsolute3, resolve as resolve11 } from "path";
 
 // apps/workerpals/src/common/worktree_dependency_artifacts.ts
-import { createHash as createHash3 } from "crypto";
+import { createHash as createHash4 } from "crypto";
 import {
   copyFileSync,
   lstatSync,
   mkdirSync as mkdirSync2,
   readFileSync as readFileSync7,
-  readdirSync as readdirSync2,
+  readdirSync as readdirSync3,
   rmSync as rmSync2,
   statSync as statSync3,
   symlinkSync,
   writeFileSync as writeFileSync3
 } from "fs";
-import { resolve as resolve8 } from "path";
+import { resolve as resolve9 } from "path";
 var DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS = ["node_modules"];
 var DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-dependency-snapshot";
 var DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-validation-safe-dependency-snapshot";
@@ -4763,10 +7249,10 @@ function linkTypeForHost() {
 }
 var MUTABLE_DEPENDENCY_DIRS = new Set([".cache", ".expo", ".vite"]);
 function dependencySnapshotKey(repo) {
-  const hash = createHash3("sha256");
+  const hash = createHash4("sha256");
   let included = 0;
   for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
-    const path = resolve8(repo, name);
+    const path = resolve9(repo, name);
     try {
       hash.update(name);
       hash.update("\x00");
@@ -4779,9 +7265,9 @@ function dependencySnapshotKey(repo) {
 }
 function materializeDependencySnapshot(source, destination, snapshotKey) {
   mkdirSync2(destination, { recursive: true });
-  for (const entry of readdirSync2(source)) {
-    const sourceEntry = resolve8(source, entry);
-    const destinationEntry = resolve8(destination, entry);
+  for (const entry of readdirSync3(source)) {
+    const sourceEntry = resolve9(source, entry);
+    const destinationEntry = resolve9(destination, entry);
     const stat = lstatSync(sourceEntry);
     if (MUTABLE_DEPENDENCY_DIRS.has(entry)) {
       mkdirSync2(destinationEntry, { recursive: true });
@@ -4791,7 +7277,7 @@ function materializeDependencySnapshot(source, destination, snapshotKey) {
       copyFileSync(sourceEntry, destinationEntry);
     }
   }
-  writeFileSync3(resolve8(destination, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER), `${snapshotKey}
+  writeFileSync3(resolve9(destination, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER), `${snapshotKey}
 `, "utf8");
 }
 function linkDirectWorktreeDependencyArtifacts(repo, worktreePath, onLog, artifactNames = DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS) {
@@ -4799,8 +7285,8 @@ function linkDirectWorktreeDependencyArtifacts(repo, worktreePath, onLog, artifa
   const skipped = [];
   const warnings = [];
   for (const name of artifactNames) {
-    const source = resolve8(repo, name);
-    const destination = resolve8(worktreePath, name);
+    const source = resolve9(repo, name);
+    const destination = resolve9(worktreePath, name);
     if (!sourceCanBeLinked(source)) {
       skipped.push(name);
       continue;
@@ -4834,17 +7320,19 @@ function linkDirectWorktreeDependencyArtifacts(repo, worktreePath, onLog, artifa
   return { linked, skipped, warnings };
 }
 // apps/workerpals/src/merge_conflict_job.ts
-import { basename as basename3, dirname as dirname3, resolve as resolve9 } from "path";
+import { basename as basename4, dirname as dirname4, resolve as resolve10 } from "path";
 function asRecord(value) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
   return value;
 }
-function normalizeBranchName(value, resolutionType) {
+function normalizeBranchName(value, resolutionType, branchPrefix = "agent/") {
   const trimmed = String(value ?? "").trim().replace(/^refs\/heads\//, "");
   const normalized = trimmed.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
-  if (resolutionType === "merge_conflict" && !normalized.startsWith("agent/"))
+  const normalizedPrefix = String(branchPrefix ?? "").trim().replace(/^refs\/heads\//, "").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+/g, "");
+  if (resolutionType === "merge_conflict" && (!normalizedPrefix || !normalized.startsWith(normalizedPrefix))) {
     return "";
+  }
   if (normalized.includes("..") || normalized.includes("@{") || normalized.endsWith(".") || normalized.endsWith(".lock")) {
     return "";
   }
@@ -4896,31 +7384,10 @@ function dedupeStrings(values, maxItems = 16) {
   return out;
 }
 function deriveLikelyDirs(paths) {
-  return dedupeStrings(paths.map((entry) => dirname3(entry).replace(/\\/g, "/")).filter((entry) => entry && entry !== "."), 12);
+  return dedupeStrings(paths.map((entry) => dirname4(entry).replace(/\\/g, "/")).filter((entry) => entry && entry !== "."), 12);
 }
 function deriveRipgrepQueries(paths) {
-  return dedupeStrings(paths.map((entry) => basename3(entry)).filter(Boolean), 8);
-}
-function isTestPath(path) {
-  return /(^tests\/|__tests__\/|\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$)/i.test(path);
-}
-function formatBunTestPathArg(path) {
-  const normalized = String(path ?? "").replace(/\\/g, "/").trim();
-  if (!normalized)
-    return normalized;
-  const pathArg = normalized.startsWith("./") || normalized.startsWith("../") || normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) ? normalized : `./${normalized}`;
-  return quoteValidationCommandArg(pathArg);
-}
-function quoteValidationCommandArg(arg) {
-  if (!/[\s"\\]/.test(arg))
-    return arg;
-  return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
-}
-function deriveValidationSteps(existing, conflictPaths) {
-  const preserved = Array.isArray(existing) ? existing.map((entry) => String(entry ?? "").trim()).filter(Boolean) : [];
-  const targeted = conflictPaths.filter(isTestPath).map((entry) => `bun test ${formatBunTestPathArg(entry)}`);
-  const merged = dedupeStrings([...targeted, ...preserved], 8);
-  return merged.length > 0 ? merged : ["bun test"];
+  return dedupeStrings(paths.map((entry) => basename4(entry)).filter(Boolean), 8);
 }
 function extractConflictPaths(stdout) {
   return dedupeStrings(String(stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean), 32);
@@ -4961,7 +7428,7 @@ function extractMergeConflictReviewContext(params) {
   if (resolutionType !== "merge_conflict" && resolutionType !== "integration_reconcile") {
     return null;
   }
-  const publicBranch = normalizeBranchName(params?.completionBranch ?? reviewAgent.prHeadRef, resolutionType);
+  const publicBranch = normalizeBranchName(params?.completionBranch ?? reviewAgent.prHeadRef, resolutionType, reviewAgent.branchPrefix);
   const baseBranch = normalizeBaseBranch(reviewAgent.prBaseRef);
   if (!publicBranch || !baseBranch || publicBranch === baseBranch)
     return null;
@@ -5015,7 +7482,12 @@ function applyMergeConflictExecutionHints(params, preparation) {
     discovery.likelyDirs = dedupeStrings([...deriveLikelyDirs(hintedPaths), ...likelyDirs], 16);
     discovery.ripgrepQueries = dedupeStrings([...deriveRipgrepQueries(hintedPaths), ...ripgrepQueries], 16);
     planning.discovery = discovery;
-    planning.validationSteps = deriveValidationSteps(planning.validationSteps, hintedPaths);
+    planning.validationSteps = mergeRepositoryValidationSteps({
+      repoRoot: preparation.repoPath,
+      changedPaths: hintedPaths,
+      existingSteps: planning.validationSteps,
+      maxSteps: 8
+    });
   }
   next.planning = planning;
   const reviewAgent = asRecord(next.reviewAgent);
@@ -5069,7 +7541,7 @@ ${rebase.stdout}`)) {
   }
   const preparedHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve prepared host worktree HEAD")).trim();
   return {
-    repoPath: resolve9(worktreePath),
+    repoPath: resolve10(worktreePath),
     cleanup: () => {},
     conflictPaths,
     plannerGuidance: buildPlannerGuidance(context, conflictPaths, rebasedCleanly),
@@ -5085,7 +7557,7 @@ async function refreshMergeConflictWorktreeHints(worktreePath, params) {
   const conflictPaths = extractConflictPaths(unresolved);
   const currentHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "refresh host-prepared worktree HEAD")).trim();
   return applyMergeConflictExecutionHints(params, {
-    repoPath: resolve9(worktreePath),
+    repoPath: resolve10(worktreePath),
     cleanup: () => {},
     conflictPaths,
     plannerGuidance: buildPlannerGuidance(context, conflictPaths, false),
@@ -5821,7 +8293,16 @@ function relaxAdvisoryQualityIssues(qualityIssues, validationRuns, critic, quali
   const relaxed = normalizedQualityIssues.filter((issue) => !isAssertionBalanceIssue(issue));
   return relaxed;
 }
-function resolveReviewFixCompletionBranch(value, fallbackBranch) {
+function normalizeReviewBranchPrefix(value) {
+  if (typeof value !== "string")
+    return null;
+  const normalized = value.trim().replace(/^refs\/heads\//, "").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+/, "");
+  if (!normalized || /[~^:?*\[\]\s]/.test(normalized) || normalized.includes("..") || normalized.includes("@{") || normalized.endsWith(".") || normalized.endsWith(".lock")) {
+    return null;
+  }
+  return normalized;
+}
+function resolveReviewFixCompletionBranch(value, fallbackBranch, allowedBranchPrefix = "agent/") {
   if (typeof value !== "string") {
     return { branch: fallbackBranch, overridden: false };
   }
@@ -5830,8 +8311,10 @@ function resolveReviewFixCompletionBranch(value, fallbackBranch) {
     return { branch: fallbackBranch, overridden: false };
   const withoutPrefix = trimmed.replace(/^refs\/heads\//, "");
   const normalized = withoutPrefix.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
-  if (!normalized.startsWith("agent/"))
+  const normalizedPrefix = normalizeReviewBranchPrefix(allowedBranchPrefix);
+  if (!normalizedPrefix || !normalized.startsWith(normalizedPrefix)) {
     return { branch: fallbackBranch, overridden: false };
+  }
   if (normalized.includes("..") || normalized.includes("@{") || normalized.endsWith(".") || normalized.endsWith(".lock")) {
     return { branch: fallbackBranch, overridden: false };
   }
@@ -5839,13 +8322,21 @@ function resolveReviewFixCompletionBranch(value, fallbackBranch) {
     return { branch: fallbackBranch, overridden: false };
   return { branch: normalized, overridden: true };
 }
+function resolveJobCompletionBranch(params, fallbackBranch, runtimeBranchPrefix) {
+  const runtimePrefix = normalizeReviewBranchPrefix(runtimeBranchPrefix) ?? "agent/";
+  const reviewAgent = params?.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent) ? params.reviewAgent : null;
+  const resolutionType = String(reviewAgent?.resolutionType ?? "").trim().toLowerCase();
+  const isScmReviewJob = (resolutionType === "review_fix" || resolutionType === "merge_conflict") && typeof reviewAgent?.prHeadRef === "string";
+  const allowedPrefix = isScmReviewJob ? normalizeReviewBranchPrefix(reviewAgent?.branchPrefix) ?? runtimePrefix : runtimePrefix;
+  return resolveReviewFixCompletionBranch(params?.completionBranch ?? reviewAgent?.prHeadRef, fallbackBranch, allowedPrefix);
+}
 function resolveReviewNoChangeCompletionBranch(params) {
   if (!params || typeof params !== "object" || Array.isArray(params))
     return null;
   const reviewAgent = params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent) ? params.reviewAgent : null;
   const reviewAgentHeadRef = reviewAgent?.prHeadRef;
   const candidate = params.completionBranch ?? reviewAgentHeadRef;
-  const resolved = resolveReviewFixCompletionBranch(candidate, "");
+  const resolved = resolveReviewFixCompletionBranch(candidate, "", normalizeReviewBranchPrefix(reviewAgent?.branchPrefix) ?? "agent/");
   return resolved.overridden ? resolved.branch : null;
 }
 function toFiniteReviewScore(value) {
@@ -6362,10 +8853,10 @@ async function acquireRepoValidationLease(repo, command, onLog) {
   const commonDirResult = await git2(repo, ["rev-parse", "--git-common-dir"]);
   if (!commonDirResult.ok || !commonDirResult.stdout.trim())
     return () => {};
-  const commonDir = resolve10(repo, commonDirResult.stdout.trim());
-  const leaseParent = resolve10(commonDir, "pushpals");
-  const leaseDir = resolve10(leaseParent, "validation-lease");
-  const ownerPath = resolve10(leaseDir, "owner.json");
+  const commonDir = resolve11(repo, commonDirResult.stdout.trim());
+  const leaseParent = resolve11(commonDir, "pushpals");
+  const leaseDir = resolve11(leaseParent, "validation-lease");
+  const ownerPath = resolve11(leaseDir, "owner.json");
   const owner = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const ownerHost = validationLeaseHostId();
   const waitStartedAt = Date.now();
@@ -6584,8 +9075,8 @@ function shouldDeferLongValidationAfterFastFailures(command, previousRuns, repo)
   return `fast validation already failed for "${first.command}"${digest ? ` (${digest})` : ""}`;
 }
 function readPackageJson(repo) {
-  const packagePath = resolve10(repo, "package.json");
-  if (!existsSync8(packagePath))
+  const packagePath = resolve11(repo, "package.json");
+  if (!existsSync9(packagePath))
     return null;
   try {
     return JSON.parse(readFileSync8(packagePath, "utf8"));
@@ -6615,12 +9106,12 @@ function resolvePackageScriptForValidationCommand(repo, command) {
   const consumeCwdOption = (index) => {
     const token = argv[index] ?? "";
     if ((token === "--cwd" || token === "-C" || token === "--prefix") && argv[index + 1]) {
-      cwd = resolve10(repo, argv[index + 1] ?? "");
+      cwd = resolve11(repo, argv[index + 1] ?? "");
       return index + 2;
     }
     for (const prefix of ["--cwd=", "-C=", "--prefix="]) {
       if (token.startsWith(prefix)) {
-        cwd = resolve10(repo, token.slice(prefix.length));
+        cwd = resolve11(repo, token.slice(prefix.length));
         return index + 1;
       }
     }
@@ -6683,8 +9174,8 @@ function readReferencedValidationScriptText(cwd, script) {
       continue;
     if (token.includes("://") || token.includes("node_modules/"))
       continue;
-    const scriptPath = resolve10(cwd, token);
-    if (!existsSync8(scriptPath))
+    const scriptPath = resolve11(cwd, token);
+    if (!existsSync9(scriptPath))
       continue;
     try {
       texts.push(readFileSync8(scriptPath, "utf8").slice(0, 64000));
@@ -6833,8 +9324,8 @@ function playwrightBrowserRuntimeCacheMarkerPath(repo, targets, env = buildWorke
   const browsersPath = String(env.PLAYWRIGHT_BROWSERS_PATH ?? "").trim();
   if (!browsersPath || browsersPath === "0")
     return null;
-  const cacheKey = createHash4("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
-  return resolve10(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
+  const cacheKey = createHash5("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
+  return resolve11(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
 }
 async function runPlaywrightBrowserRuntimePreflight(repo, command, targets, timeoutMs, outputPolicy) {
   const env = buildWorkerSandboxWritableEnv(repo);
@@ -6920,7 +9411,7 @@ function packageJsonDeclaresDependency(packageJson, name) {
   return declaredPackageDependencyNames(packageJson).includes(name);
 }
 function hasBunLockfile(repo) {
-  return existsSync8(resolve10(repo, "bun.lock")) || existsSync8(resolve10(repo, "bun.lockb"));
+  return existsSync9(resolve11(repo, "bun.lock")) || existsSync9(resolve11(repo, "bun.lockb"));
 }
 function isBunPackageManagedValidationCommand(command) {
   const tokens = tokenizeValidationCommandArgv(command);
@@ -6946,7 +9437,7 @@ function isBunPackageManagedValidationCommand(command) {
   return false;
 }
 function resolvePackageRoot(nodeModulesDir, packageName) {
-  return resolve10(nodeModulesDir, ...packageName.split("/").filter(Boolean));
+  return resolve11(nodeModulesDir, ...packageName.split("/").filter(Boolean));
 }
 function defaultBinNameForPackage(packageName) {
   return packageName.split("/").filter(Boolean).pop() ?? packageName;
@@ -6955,12 +9446,12 @@ function isSafeBinName(value) {
   return Boolean(value.trim()) && !/[\\/:\0]/.test(value);
 }
 function isPathInside(parent, child) {
-  const normalizedParent = resolve10(parent).replace(/\\/g, "/").replace(/\/+$/, "");
-  const normalizedChild = resolve10(child).replace(/\\/g, "/");
+  const normalizedParent = resolve11(parent).replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedChild = resolve11(child).replace(/\\/g, "/");
   return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
 }
 function packageBinaryNames(packageRoot, dependencyName) {
-  const packageJson = readJsonRecord(resolve10(packageRoot, "package.json"));
+  const packageJson = readJsonRecord(resolve11(packageRoot, "package.json"));
   if (!packageJson)
     return [];
   const packageName = typeof packageJson.name === "string" && packageJson.name.trim() ? packageJson.name.trim() : dependencyName;
@@ -6980,57 +9471,57 @@ function packageBinaryNames(packageRoot, dependencyName) {
   return Array.from(new Set(entries.filter(([name, target]) => {
     if (!isSafeBinName(name))
       return false;
-    const targetPath = resolve10(packageRoot, target);
-    return isPathInside(packageRoot, targetPath) && existsSync8(targetPath);
+    const targetPath = resolve11(packageRoot, target);
+    return isPathInside(packageRoot, targetPath) && existsSync9(targetPath);
   }).map(([name]) => name))).sort((a, b) => a.localeCompare(b));
 }
 function hasLocalBinShim(binDir, binName) {
-  const candidates = ["", ".bunx", ".exe", ".cmd", ".ps1"].map((extension) => resolve10(binDir, `${binName}${extension}`));
-  return candidates.some((candidate) => existsSync8(candidate));
+  const candidates = ["", ".bunx", ".exe", ".cmd", ".ps1"].map((extension) => resolve11(binDir, `${binName}${extension}`));
+  return candidates.some((candidate) => existsSync9(candidate));
 }
 function isLinkedNodeModulesDependencyArtifact(repo) {
   try {
-    return lstatSync2(resolve10(repo, "node_modules")).isSymbolicLink();
+    return lstatSync2(resolve11(repo, "node_modules")).isSymbolicLink();
   } catch (err) {
     const code = String(err?.code ?? "").toUpperCase();
     if (process.platform !== "win32" || !["EACCES", "EINVAL"].includes(code))
       return false;
     try {
-      return readdirSync3(repo).some((entry) => entry.toLowerCase() === "node_modules");
+      return readdirSync4(repo).some((entry) => entry.toLowerCase() === "node_modules");
     } catch {
       return false;
     }
   }
 }
 function isManagedLinkedPackageDependencySnapshot(repo) {
-  const nodeModulesDir = resolve10(repo, "node_modules");
-  return existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER)) && !existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
+  const nodeModulesDir = resolve11(repo, "node_modules");
+  return existsSync9(resolve11(nodeModulesDir, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER)) && !existsSync9(resolve11(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
 }
 function bunDependencySnapshotKey(repo, bunVersion = String(process.versions.bun ?? "unknown")) {
-  const packagePath = resolve10(repo, "package.json");
-  if (!existsSync8(packagePath))
+  const packagePath = resolve11(repo, "package.json");
+  if (!existsSync9(packagePath))
     return null;
   const hashInput = [
     `projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}`,
     `bun=${bunVersion}`
   ];
   for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
-    const path = resolve10(repo, name);
-    if (!existsSync8(path))
+    const path = resolve11(repo, name);
+    if (!existsSync9(path))
       continue;
-    hashInput.push(createHash4("sha256").update(readFileSync8(path)).digest("hex"));
+    hashInput.push(createHash5("sha256").update(readFileSync8(path)).digest("hex"));
   }
-  let key = createHash4("sha256").update(`${hashInput.join(`
+  let key = createHash5("sha256").update(`${hashInput.join(`
 `)}
 `).digest("hex");
   const packageJson = readJsonRecord(packagePath);
   if (packageJson?.workspaces != null)
-    key = `${key}-${basename4(resolve10(repo))}`;
+    key = `${key}-${basename5(resolve11(repo))}`;
   return key;
 }
 function validationSafeDependencySnapshotIsCurrent(repo) {
-  const markerPath = resolve10(repo, "node_modules", DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER);
-  if (!existsSync8(markerPath))
+  const markerPath = resolve11(repo, "node_modules", DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER);
+  if (!existsSync9(markerPath))
     return false;
   const expected = bunDependencySnapshotKey(repo);
   if (!expected)
@@ -7045,13 +9536,13 @@ function validationNeedsExpoRouterBrowserLocalInstall(repo, packageJson, validat
   return packageJsonDeclaresDependency(packageJson, "expo-router") && validationCommands.some((command) => validationCommandIncludesLongRunningBrowserWork(repo, command));
 }
 function collectMissingTopLevelDependencyPackages(repo, packageJson) {
-  const nodeModulesDir = resolve10(repo, "node_modules");
+  const nodeModulesDir = resolve11(repo, "node_modules");
   const missing = [];
   for (const dependencyName of declaredPackageDependencyNames(packageJson, [
     "dependencies",
     "devDependencies"
   ])) {
-    if (!existsSync8(resolvePackageRoot(nodeModulesDir, dependencyName))) {
+    if (!existsSync9(resolvePackageRoot(nodeModulesDir, dependencyName))) {
       missing.push(dependencyName);
       if (missing.length >= 8)
         return missing;
@@ -7060,12 +9551,12 @@ function collectMissingTopLevelDependencyPackages(repo, packageJson) {
   return missing;
 }
 function collectMissingTopLevelDependencyBinaryShims(repo, packageJson) {
-  const nodeModulesDir = resolve10(repo, "node_modules");
-  const binDir = resolve10(nodeModulesDir, ".bin");
+  const nodeModulesDir = resolve11(repo, "node_modules");
+  const binDir = resolve11(nodeModulesDir, ".bin");
   const missing = [];
   for (const dependencyName of declaredPackageDependencyNames(packageJson)) {
     const packageRoot = resolvePackageRoot(nodeModulesDir, dependencyName);
-    if (!existsSync8(packageRoot))
+    if (!existsSync9(packageRoot))
       continue;
     for (const binName of packageBinaryNames(packageRoot, dependencyName)) {
       if (!hasLocalBinShim(binDir, binName))
@@ -7082,17 +9573,17 @@ function resolveBunDependencyLayoutPreflight(repo, validationCommands) {
   }
   if (!hasBunLockfile(repo))
     return null;
-  const packageJson = readJsonRecord(resolve10(repo, "package.json"));
+  const packageJson = readJsonRecord(resolve11(repo, "package.json"));
   if (!packageJson)
     return null;
-  const nodeModulesDir = resolve10(repo, "node_modules");
-  if (!existsSync8(nodeModulesDir)) {
+  const nodeModulesDir = resolve11(repo, "node_modules");
+  if (!existsSync9(nodeModulesDir)) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules is missing for Bun validation commands"
     };
   }
-  const validationSafeSnapshotMarkerExists = existsSync8(resolve10(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
+  const validationSafeSnapshotMarkerExists = existsSync9(resolve11(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
   const validationSafeSnapshotIsCurrent = validationSafeSnapshotMarkerExists && validationSafeDependencySnapshotIsCurrent(repo);
   if (validationSafeSnapshotMarkerExists && !validationSafeSnapshotIsCurrent) {
     return {
@@ -7115,8 +9606,8 @@ function resolveBunDependencyLayoutPreflight(repo, validationCommands) {
       removeLinkedNodeModules: true
     };
   }
-  const binDir = resolve10(nodeModulesDir, ".bin");
-  if (!existsSync8(binDir)) {
+  const binDir = resolve11(nodeModulesDir, ".bin");
+  if (!existsSync9(binDir)) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules/.bin is missing for Bun validation commands"
@@ -7164,7 +9655,7 @@ function buildBunDependencyLayoutPreflightFailureRun(args) {
   };
 }
 function removeLinkedNodeModulesDependencyArtifact(repo, onLog) {
-  const nodeModulesDir = resolve10(repo, "node_modules");
+  const nodeModulesDir = resolve11(repo, "node_modules");
   const linkedArtifact = isLinkedNodeModulesDependencyArtifact(repo);
   if (!linkedArtifact && !isManagedLinkedPackageDependencySnapshot(repo)) {
     return { ok: true, removed: false };
@@ -7540,14 +10031,14 @@ function expandKnownArtifactDirectoryPaths(repo, paths) {
       addPath(rawPath);
       continue;
     }
-    const powerShellRoot = resolve10(repo, "Microsoft", "Windows", "PowerShell");
+    const powerShellRoot = resolve11(repo, "Microsoft", "Windows", "PowerShell");
     const knownArtifacts = [];
-    const moduleCache = resolve10(powerShellRoot, "ModuleAnalysisCache");
-    if (existsSync8(moduleCache))
+    const moduleCache = resolve11(powerShellRoot, "ModuleAnalysisCache");
+    if (existsSync9(moduleCache))
       knownArtifacts.push("Microsoft/Windows/PowerShell/ModuleAnalysisCache");
-    const psReadLineRoot = resolve10(powerShellRoot, "PSReadLine");
-    if (existsSync8(psReadLineRoot)) {
-      for (const entry of readdirSync3(psReadLineRoot, { withFileTypes: true })) {
+    const psReadLineRoot = resolve11(powerShellRoot, "PSReadLine");
+    if (existsSync9(psReadLineRoot)) {
+      for (const entry of readdirSync4(psReadLineRoot, { withFileTypes: true })) {
         if (entry.isFile()) {
           knownArtifacts.push(`Microsoft/Windows/PowerShell/PSReadLine/${entry.name}`);
         }
@@ -7683,14 +10174,14 @@ function higherTierValidationDeferralAfterFailure(command, previousRuns) {
   };
 }
 function validationFileFingerprint(repo, changedPaths) {
-  const hash = createHash4("sha256");
+  const hash = createHash5("sha256");
   hash.update(`${process.platform}\x00${process.arch}\x00`);
   const fingerprintPaths = ["bun.lock", "bun.lockb", "package.json", ...changedPaths].map((entry) => entry.replace(/\\/g, "/")).filter((entry, index, values) => values.indexOf(entry) === index).sort();
   for (const relativePath of fingerprintPaths) {
-    const absolutePath = resolve10(repo, relativePath);
+    const absolutePath = resolve11(repo, relativePath);
     hash.update(relativePath);
     hash.update("\x00");
-    if (!existsSync8(absolutePath)) {
+    if (!existsSync9(absolutePath)) {
       hash.update("missing\x00");
       continue;
     }
@@ -8048,20 +10539,20 @@ function extractBrowserValidationArtifacts(text) {
 function collectRecentBrowserValidationFiles(repo, extensions, limit = 8) {
   if (!repo)
     return [];
-  const roots = ["outputs/web-e2e", "test-results", "playwright-report"].map((entry) => resolve10(repo, entry)).filter((entry) => existsSync8(entry));
+  const roots = ["outputs/web-e2e", "test-results", "playwright-report"].map((entry) => resolve11(repo, entry)).filter((entry) => existsSync9(entry));
   const files = [];
   const visit = (dir, depth) => {
     if (depth > 4 || files.length > 2000)
       return;
     let entries;
     try {
-      entries = readdirSync3(dir, { withFileTypes: true });
+      entries = readdirSync4(dir, { withFileTypes: true });
     } catch {
       return;
     }
     for (const entry of entries) {
       const entryName = String(entry.name);
-      const path = resolve10(dir, entryName);
+      const path = resolve11(dir, entryName);
       if (entry.isDirectory()) {
         visit(path, depth + 1);
         continue;
@@ -8177,11 +10668,11 @@ function summarizeBrowserValidationArtifacts(params) {
     let artifactText = "";
     if (params.repo && !/^(?:\/repo|\/workspace|[A-Za-z]:[\\/])/.test(artifact)) {
       try {
-        artifactText = readFileSync8(resolve10(params.repo, artifact), "utf8");
+        artifactText = readFileSync8(resolve11(params.repo, artifact), "utf8");
       } catch {
         artifactText = "";
       }
-    } else if (existsSync8(artifact) && /\.(?:log|txt|json)$/i.test(artifact)) {
+    } else if (existsSync9(artifact) && /\.(?:log|txt|json)$/i.test(artifact)) {
       try {
         artifactText = readFileSync8(artifact, "utf8");
       } catch {
@@ -8254,11 +10745,11 @@ function resolveFailureMemoryPath(repo) {
     process.env.PUSHPALS_REPO_PATH,
     repo
   ].map((entry) => String(entry ?? "").trim()).filter(Boolean);
-  const root = rootCandidates.find((entry) => existsSync8(entry)) ?? repo;
+  const root = rootCandidates.find((entry) => existsSync9(entry)) ?? repo;
   const gitStatePath = resolveGitStateFilePath(root, "pushpals-worker-failure-memory.json");
   if (gitStatePath)
     return gitStatePath;
-  return resolve10(root, "outputs", "data", "workerpals-failure-memory.json");
+  return resolve11(root, "outputs", "data", "workerpals-failure-memory.json");
 }
 function resolveRemedyMemoryPath(repo) {
   const rootCandidates = [
@@ -8267,11 +10758,11 @@ function resolveRemedyMemoryPath(repo) {
     process.env.PUSHPALS_REPO_PATH,
     repo
   ].map((entry) => String(entry ?? "").trim()).filter(Boolean);
-  const root = rootCandidates.find((entry) => existsSync8(entry)) ?? repo;
+  const root = rootCandidates.find((entry) => existsSync9(entry)) ?? repo;
   const gitStatePath = resolveGitStateFilePath(root, "pushpals-worker-remedy-memory.json");
   if (gitStatePath)
     return gitStatePath;
-  return resolve10(root, "outputs", "data", "workerpals-remedy-memory.json");
+  return resolve11(root, "outputs", "data", "workerpals-remedy-memory.json");
 }
 function readBrowserFailureMemory(repo) {
   const memoryPath = resolveFailureMemoryPath(repo);
@@ -8336,7 +10827,7 @@ function recordBrowserFailureMemory(repo, jobFamily, packet) {
   }
   const next = entries.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)).slice(0, 80);
   try {
-    mkdirSync3(resolve10(memoryPath, ".."), { recursive: true });
+    mkdirSync3(resolve11(memoryPath, ".."), { recursive: true });
     writeFileSync4(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}
 `);
   } catch {}
@@ -8448,7 +10939,7 @@ function recordValidationRemedyMemory(repo, jobFamily, runs) {
   }
   const next = entries.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)).slice(0, 120);
   try {
-    mkdirSync3(resolve10(memoryPath, ".."), { recursive: true });
+    mkdirSync3(resolve11(memoryPath, ".."), { recursive: true });
     writeFileSync4(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}
 `);
   } catch {}
@@ -8456,9 +10947,9 @@ function recordValidationRemedyMemory(repo, jobFamily, runs) {
 function extractValidationFailureRetryDigest(run, repo) {
   const baseDigest = extractValidationFailureDigest(run);
   const failedTests = validationFailedTestIdentities(run);
-  const failedTestDigest = failedTests.length > 0 ? `failed tests (${failedTests.length}, signature=${createHash4("sha256").update(failedTests.join("\x00")).digest("hex").slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}` : "";
+  const failedTestDigest = failedTests.length > 0 ? `failed tests (${failedTests.length}, signature=${createHash5("sha256").update(failedTests.join("\x00")).digest("hex").slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}` : "";
   const assertionContext = validationFailureAssertionContext(run);
-  const assertionDigest = assertionContext.length > 0 ? `assertion context (${assertionContext.length}, signature=${createHash4("sha256").update(assertionContext.join("\x00")).digest("hex").slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}` : "";
+  const assertionDigest = assertionContext.length > 0 ? `assertion context (${assertionContext.length}, signature=${createHash5("sha256").update(assertionContext.join("\x00")).digest("hex").slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}` : "";
   if (!isLongRunningBrowserValidationCommand(run.command) && !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command))) {
     return toSingleLine([baseDigest, failedTestDigest, assertionDigest].filter(Boolean).join(" | "), 900);
   }
@@ -8588,8 +11079,8 @@ function extractRequiredValidationStepsFromVisionMarkdown(markdown) {
   return out;
 }
 function loadRequiredValidationStepsFromVision(repo) {
-  const visionPath = resolve10(repo, "vision.md");
-  if (!existsSync8(visionPath))
+  const visionPath = resolve11(repo, "vision.md");
+  if (!existsSync9(visionPath))
     return [];
   try {
     return extractRequiredValidationStepsFromVisionMarkdown(readFileSync8(visionPath, "utf8"));
@@ -8667,7 +11158,7 @@ function normalizeBunTestValidationCommand(command) {
     return command;
   if (runnablePathCount === 0)
     return null;
-  return [...prefix, ...keptArgs].map((entry) => quoteValidationCommandArg2(entry)).join(" ");
+  return [...prefix, ...keptArgs].map((entry) => quoteValidationCommandArg(entry)).join(" ");
 }
 function sanitizeMissingExplicitTestTargets(repo, command) {
   const argv = tokenizeValidationCommandArgv(command);
@@ -8683,7 +11174,7 @@ function sanitizeMissingExplicitTestTargets(repo, command) {
   for (const arg of argv.slice(testIndex + 1)) {
     const normalizedPath = normalizeValidationPathToken(arg);
     const isConcreteTestTarget = Boolean(normalizedPath) && (isAssertionCoverageTestPath(normalizedPath ?? "") || isBrowserSmokeHarnessPath(normalizedPath ?? ""));
-    if (isConcreteTestTarget && normalizedPath && !existsSync8(resolve10(repo, normalizedPath))) {
+    if (isConcreteTestTarget && normalizedPath && !existsSync9(resolve11(repo, normalizedPath))) {
       droppedMissingTarget = true;
       continue;
     }
@@ -8695,7 +11186,7 @@ function sanitizeMissingExplicitTestTargets(repo, command) {
     return command;
   if (!keptConcreteTarget)
     return null;
-  return [...argv.slice(0, testIndex + 1), ...keptArgs].map((entry) => quoteValidationCommandArg2(entry)).join(" ");
+  return [...argv.slice(0, testIndex + 1), ...keptArgs].map((entry) => quoteValidationCommandArg(entry)).join(" ");
 }
 function sanitizeValidationCommandsForCurrentCheckout(repo, commands) {
   if (!repo)
@@ -8808,7 +11299,7 @@ function inferFallbackValidationCommandsForTestTask(instruction, targetPath, pla
   };
   const lowerInstruction = instruction.toLowerCase();
   const pythonSignal = /\b(pytest|python)\b/.test(lowerInstruction) || changedTestPaths.some((entry) => entry.toLowerCase().endsWith(".py"));
-  const bunTestPath = (path) => formatBunTestPathArg2(path);
+  const bunTestPath = (path) => formatBunTestPathArg(path);
   const normalizedTarget = (targetPath ?? "").replace(/\\/g, "/").trim();
   if (normalizedTarget && (isAssertionCoverageTestPath(normalizedTarget) || isBrowserSmokeHarnessPath(normalizedTarget))) {
     add(pythonSignal ? `pytest ${normalizedTarget}` : `bun test ${bunTestPath(normalizedTarget)}`);
@@ -8836,14 +11327,14 @@ function inferFallbackValidationCommandsForTestTask(instruction, targetPath, pla
   }
   return candidates.slice(0, 4);
 }
-function formatBunTestPathArg2(path) {
+function formatBunTestPathArg(path) {
   const normalized = String(path ?? "").replace(/\\/g, "/").trim();
   if (!normalized)
     return normalized;
   const pathArg = normalized.startsWith("./") || normalized.startsWith("../") || normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) ? normalized : `./${normalized}`;
-  return quoteValidationCommandArg2(pathArg);
+  return quoteValidationCommandArg(pathArg);
 }
-function quoteValidationCommandArg2(arg) {
+function quoteValidationCommandArg(arg) {
   if (!/[\s"\\]/.test(arg))
     return arg;
   return `"${arg.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
@@ -8881,7 +11372,7 @@ function hasBalancedPositiveNegativeAssertions(paths, repo) {
   let positiveAssertions = 0;
   let negativeAssertions = 0;
   for (const rel of paths) {
-    const fullPath = resolve10(repo, rel);
+    const fullPath = resolve11(repo, rel);
     let content = "";
     try {
       content = readFileSync8(fullPath, "utf-8");
@@ -8928,7 +11419,7 @@ function collectPrePublishHygieneIssues(params) {
     const changedTestPaths = changedPaths.filter((path) => isAssertionCoverageTestPath(path));
     const hasConsumerInChangedTests = changedTestPaths.some((rel) => {
       try {
-        return /reactNativeMock/i.test(readFileSync8(resolve10(params.repo, rel), "utf8"));
+        return /reactNativeMock/i.test(readFileSync8(resolve11(params.repo, rel), "utf8"));
       } catch {
         return false;
       }
@@ -8944,8 +11435,8 @@ function collectPrePublishHygieneIssues(params) {
   return Array.from(new Set(issues));
 }
 function inferRepoNativeValidationCommands(repo, changedPaths) {
-  const packageJsonPath = resolve10(repo, "package.json");
-  if (!existsSync8(packageJsonPath))
+  const packageJsonPath = resolve11(repo, "package.json");
+  if (!existsSync9(packageJsonPath))
     return [];
   let packageJson = {};
   try {
@@ -8965,7 +11456,7 @@ function inferRepoNativeValidationCommands(repo, changedPaths) {
   if (hasTsChange) {
     if (typeof scripts.typecheck === "string" && scripts.typecheck.trim()) {
       commands.push("bun run typecheck");
-    } else if (existsSync8(resolve10(repo, "tsconfig.json")) || Object.prototype.hasOwnProperty.call(dependencies, "typescript")) {
+    } else if (existsSync9(resolve11(repo, "tsconfig.json")) || Object.prototype.hasOwnProperty.call(dependencies, "typescript")) {
       commands.push("bun x tsc --noEmit");
     }
   }
@@ -9256,7 +11747,7 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
           if (missingPlaywrightBrowserTargets.length > 0) {
             const browserEnv = buildWorkerSandboxWritableEnv(repo);
             const browserReadyMarker = playwrightBrowserRuntimeCacheMarkerPath(repo, missingPlaywrightBrowserTargets, browserEnv);
-            if (browserReadyMarker && existsSync8(browserReadyMarker)) {
+            if (browserReadyMarker && existsSync9(browserReadyMarker)) {
               for (const target of missingPlaywrightBrowserTargets) {
                 playwrightBrowserRuntimeReadyTargets.add(target);
               }
@@ -9462,9 +11953,9 @@ function resolveWorkerCriticReviewContext(repo, params, runtimeConfig = DEFAULT_
   const thresholdRaw = Number(reviewAgent.passThreshold);
   const finalReviewThreshold = Number.isFinite(thresholdRaw) ? Math.max(0, Math.min(10, thresholdRaw)) : 9.5;
   const configuredPath = String(reviewAgent.reviewerMdPath ?? "").trim();
-  const reviewerPath = configuredPath ? isAbsolute3(configuredPath) ? configuredPath : resolve10(repo, configuredPath) : "";
+  const reviewerPath = configuredPath ? isAbsolute3(configuredPath) ? configuredPath : resolve11(repo, configuredPath) : "";
   let finalReviewerRubric = "";
-  if (reviewerPath && existsSync8(reviewerPath)) {
+  if (reviewerPath && existsSync9(reviewerPath)) {
     try {
       finalReviewerRubric = readFileSync8(reviewerPath, "utf8").trim();
     } catch {
@@ -10137,9 +12628,9 @@ function buildPublishBlockedCommitResult(options) {
   };
 }
 async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONFIG3) {
-  const defaultPublicBranchName = `agent/${workerId}/${job.id}`;
-  const reviewAgentHeadRef = job.params?.reviewAgent && typeof job.params.reviewAgent === "object" && !Array.isArray(job.params.reviewAgent) ? job.params.reviewAgent.prHeadRef : undefined;
-  const resolvedPublicBranch = resolveReviewFixCompletionBranch(job.params?.completionBranch ?? reviewAgentHeadRef, defaultPublicBranchName);
+  const configuredBranchPrefix = normalizeReviewBranchPrefix(runtimeConfig.sourceControlManager.branchPrefix) ?? "agent/";
+  const defaultPublicBranchName = `${configuredBranchPrefix}${workerId}/${job.id}`;
+  const resolvedPublicBranch = resolveJobCompletionBranch(job.params, defaultPublicBranchName, configuredBranchPrefix);
   const publicBranchName = resolvedPublicBranch.branch;
   const reviewFixContext = extractReviewFixContext(job.params ?? null);
   if (job.kind === "task.execute") {
@@ -10389,10 +12880,10 @@ function inferRepoNativeCommitArea(targets) {
     return null;
   if (normalized.every(isDocPath))
     return "docs";
-  if (normalized.some(isTestPath2) && normalized.every((path) => isTestPath2(path) || isDocPath(path))) {
+  if (normalized.some(isTestPath) && normalized.every((path) => isTestPath(path) || isDocPath(path))) {
     return "tests";
   }
-  const basis = normalized.find((path) => !isTestPath2(path) && !isDocPath(path)) ?? normalized.find((path) => !isDocPath(path)) ?? normalized[0];
+  const basis = normalized.find((path) => !isTestPath(path) && !isDocPath(path)) ?? normalized.find((path) => !isDocPath(path)) ?? normalized[0];
   if (!basis)
     return null;
   if (/^(package\.json|bun\.lockb?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i.test(basis)) {
@@ -10457,7 +12948,7 @@ function isDocPath(path) {
   const lower = normalizeCommitPath(path);
   return lower.startsWith("docs/") || lower.startsWith("wiki/") || lower === "readme.md" || lower.endsWith(".md") || lower.endsWith(".mdx");
 }
-function isTestPath2(path) {
+function isTestPath(path) {
   const normalized = normalizeCommitPath(path);
   if (/(^|\/)(?:__tests__|tests?|e2e|smoke|specs?)(?:\/|$)/i.test(normalized)) {
     return true;
@@ -10487,7 +12978,7 @@ function deriveSummary(action, params, changedPaths = [], areaHint = "worker") {
     return explicit;
   if (changedPaths.length > 0) {
     const label = humanizeCommitArea(areaHint);
-    const testCount = changedPaths.filter(isTestPath2).length;
+    const testCount = changedPaths.filter(isTestPath).length;
     const docCount = changedPaths.filter(isDocPath).length;
     const codeCount = changedPaths.length - testCount - docCount;
     if (testCount > 0 && codeCount === 0 && docCount === 0) {
@@ -10517,7 +13008,7 @@ function buildChangedPathImplementationPoints(changedPaths) {
     return "";
   const lines = [];
   for (const path of changedPaths.slice(0, 6)) {
-    if (isTestPath2(path)) {
+    if (isTestPath(path)) {
       lines.push(`- add or update tests in ${sanitizeCommitValue(path, 220)}`);
     } else if (isDocPath(path)) {
       lines.push(`- update documentation in ${sanitizeCommitValue(path, 220)}`);
@@ -10736,18 +13227,18 @@ async function gitDirPath(repo) {
   const gitDir = result.stdout.trim();
   if (!gitDir)
     return null;
-  return resolve10(repo, gitDir);
+  return resolve11(repo, gitDir);
 }
 async function activeGitOperation(repo) {
   const gitDir = await gitDirPath(repo);
   if (!gitDir)
     return null;
-  if (existsSync8(resolve10(gitDir, "rebase-merge")) || existsSync8(resolve10(gitDir, "rebase-apply"))) {
+  if (existsSync9(resolve11(gitDir, "rebase-merge")) || existsSync9(resolve11(gitDir, "rebase-apply"))) {
     return "rebase";
   }
-  if (existsSync8(resolve10(gitDir, "MERGE_HEAD")))
+  if (existsSync9(resolve11(gitDir, "MERGE_HEAD")))
     return "merge";
-  if (existsSync8(resolve10(gitDir, "CHERRY_PICK_HEAD")))
+  if (existsSync9(resolve11(gitDir, "CHERRY_PICK_HEAD")))
     return "cherry-pick";
   return null;
 }
@@ -10767,7 +13258,7 @@ async function resumePreparedMergeConflictRebase(repo, kind, params, onLog) {
   if (unresolvedPaths.length > 0) {
     const stillMarked = unresolvedPaths.filter((relativePath) => {
       try {
-        const contents = readFileSync8(resolve10(repo, relativePath), "utf8");
+        const contents = readFileSync8(resolve11(repo, relativePath), "utf8");
         return /^(<{7}|={7}|>{7})( .*)?$/m.test(contents);
       } catch {
         return true;
@@ -11108,8 +13599,8 @@ async function syncHiddenRefWithRemoteBranchByRebase(repo, hiddenCommitRef, publ
         error: `Refusing to reset publication checkout because its Git directory layout could not be verified: ${combinedGitOutput(!gitDir.ok ? gitDir : commonDir)}`
       };
     }
-    const resolvedGitDir = resolve10(repo, gitDir.stdout.trim());
-    const resolvedCommonDir = resolve10(repo, commonDir.stdout.trim());
+    const resolvedGitDir = resolve11(repo, gitDir.stdout.trim());
+    const resolvedCommonDir = resolve11(repo, commonDir.stdout.trim());
     const normalizePath = (value) => process.platform === "win32" ? value.toLowerCase() : value;
     if (normalizePath(resolvedGitDir) === normalizePath(resolvedCommonDir)) {
       return {
@@ -11162,8 +13653,8 @@ async function syncHiddenRefWithRemoteBranchByRebase(repo, hiddenCommitRef, publ
     return resetPublicationResidueInDisposableWorktree("git pull --rebase");
   };
   const scrubKnownPreSyncArtifacts = async () => {
-    const codexPath = resolve10(repo, ".codex");
-    if (!existsSync8(codexPath))
+    const codexPath = resolve11(repo, ".codex");
+    if (!existsSync9(codexPath))
       return { ok: true };
     const trackedCodex = await git2(repo, ["ls-files", "--error-unmatch", "--", ".codex"]);
     if (trackedCodex.ok) {
@@ -11205,7 +13696,7 @@ async function syncHiddenRefWithRemoteBranchByRebase(repo, hiddenCommitRef, publ
         error: `Failed to scrub transient .codex artifact before branch sync: ${String(error)}`
       };
     }
-    if (existsSync8(codexPath)) {
+    if (existsSync9(codexPath)) {
       return {
         ok: false,
         error: "Failed to scrub transient .codex artifact before branch sync: path still exists."
@@ -11332,7 +13823,7 @@ function codexProjectConfigRoots(repo, env) {
     const text = String(raw ?? "").trim();
     if (!text)
       return;
-    const root = resolve10(text);
+    const root = resolve11(text);
     const key = root.toLowerCase();
     if (seen.has(key))
       return;
@@ -11353,17 +13844,17 @@ function codexProjectConfigRoots(repo, env) {
 function maskRepoLocalCodexFilesForCodexCli(repo, env) {
   const masked = [];
   for (const root of codexProjectConfigRoots(repo, env)) {
-    const codexPath = resolve10(root, ".codex");
-    if (!existsSync8(codexPath))
+    const codexPath = resolve11(root, ".codex");
+    if (!existsSync9(codexPath))
       continue;
     try {
       if (lstatSync2(codexPath).isDirectory())
         continue;
-      let backupPath = resolve10(root, `.codex.pushpals-masked-${process.pid}-${masked.length}`);
+      let backupPath = resolve11(root, `.codex.pushpals-masked-${process.pid}-${masked.length}`);
       let suffix = 0;
-      while (existsSync8(backupPath)) {
+      while (existsSync9(backupPath)) {
         suffix += 1;
-        backupPath = resolve10(root, `.codex.pushpals-masked-${process.pid}-${masked.length}-${suffix}`);
+        backupPath = resolve11(root, `.codex.pushpals-masked-${process.pid}-${masked.length}-${suffix}`);
       }
       renameSync(codexPath, backupPath);
       masked.push({ codexPath, backupPath });
@@ -11377,10 +13868,10 @@ function maskRepoLocalCodexFilesForCodexCli(repo, env) {
 function restoreRepoLocalCodexFilesForCodexCli(masked) {
   for (const entry of [...masked].reverse()) {
     try {
-      if (existsSync8(entry.codexPath)) {
+      if (existsSync9(entry.codexPath)) {
         rmSync3(entry.codexPath, { recursive: true, force: true });
       }
-      if (existsSync8(entry.backupPath)) {
+      if (existsSync9(entry.backupPath)) {
         renameSync(entry.backupPath, entry.codexPath);
       }
     } catch (error) {
@@ -11448,7 +13939,7 @@ async function generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtime
     return null;
   const timeoutMs = resolveCommitMessageGeneratorTimeoutMs(runtimeConfig);
   const reasoningEffort = normalizeCodexReasoningEffort(runtimeConfig.workerpals.llm.reasoningEffort, model);
-  const tmpOutputPath = resolve10(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+  const tmpOutputPath = resolve11(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
   const cmd = [
     ...codexPrefix,
     "-c",
@@ -11648,7 +14139,7 @@ function shouldTreatMissingPathHintAsStale(repo, path, taskText) {
   const normalized = normalizeStagePath(path);
   if (!normalized || normalized === "." || pathHintHasGlob(normalized))
     return false;
-  if (existsSync8(resolve10(repo, normalized)))
+  if (existsSync9(resolve11(repo, normalized)))
     return false;
   if (!pathHintLooksLikeConcreteFile(normalized))
     return false;
@@ -11663,7 +14154,7 @@ function pathParentExists(repo, path) {
   const parts = normalized.split("/");
   if (parts.length <= 1)
     return true;
-  return existsSync8(resolve10(repo, parts.slice(0, -1).join("/")));
+  return existsSync9(resolve11(repo, parts.slice(0, -1).join("/")));
 }
 function sanitizeStalePathHints(repo, values, taskText, opts = {}) {
   const stale = [];
@@ -12869,15 +15360,15 @@ ${result.stderr ?? ""}`;
 }
 
 // apps/workerpals/src/docker_executor.ts
-import { createHash as createHash5, randomUUID } from "crypto";
-import { existsSync as existsSync10, mkdirSync as mkdirSync4, readFileSync as readFileSync9, writeFileSync as writeFileSync5 } from "fs";
+import { createHash as createHash6, randomUUID as randomUUID2 } from "crypto";
+import { existsSync as existsSync11, mkdirSync as mkdirSync4, readFileSync as readFileSync9, writeFileSync as writeFileSync5 } from "fs";
 import { homedir as homedir3 } from "os";
-import { isAbsolute as isAbsolute4, relative, resolve as resolve11 } from "path";
+import { isAbsolute as isAbsolute4, relative as relative2, resolve as resolve12 } from "path";
 
 // apps/workerpals/src/common/worktree_cleanup.ts
-import { existsSync as existsSync9, rmSync as rmSync4 } from "fs";
+import { existsSync as existsSync10, rmSync as rmSync4 } from "fs";
 function defaultSleep(ms) {
-  return new Promise((resolve11) => setTimeout(resolve11, ms));
+  return new Promise((resolve12) => setTimeout(resolve12, ms));
 }
 function windowsDeletionCandidates(worktreePath) {
   const seen = new Set;
@@ -12899,7 +15390,7 @@ async function forceDeleteWorktreePath(worktreePath, options = {}) {
   const delayMs = Math.max(0, Math.floor(options.delayMs ?? 120));
   const sleep = options.sleepFn ?? defaultSleep;
   const removePath = options.removeFn ?? ((targetPath) => rmSync4(targetPath, { recursive: true, force: true }));
-  const pathExists = options.existsFn ?? ((targetPath) => existsSync9(targetPath));
+  const pathExists = options.existsFn ?? ((targetPath) => existsSync10(targetPath));
   let lastError = "";
   for (let attempt = 1;attempt <= retries; attempt++) {
     if (!pathExists(worktreePath))
@@ -13518,20 +16009,20 @@ function resolveDockerExecutable() {
     return configured;
   return process.platform === "win32" ? "docker.exe" : "docker";
 }
-function resolveWorkerpalDockerBuildCaSecretArgs(env = process.env, fileExists = existsSync10) {
+function resolveWorkerpalDockerBuildCaSecretArgs(env = process.env, fileExists = existsSync11) {
   const configured = String(env.PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS ?? env.NODE_EXTRA_CA_CERTS ?? "").trim();
   if (!configured)
     return [];
-  const path = resolve11(configured);
+  const path = resolve12(configured);
   if (!fileExists(path))
     return [];
   return ["--secret", `id=${WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID},src=${path}`];
 }
-function resolveWorkerpalDockerRuntimeCaArgs(env = process.env, fileExists = existsSync10, dockerHostPath = (path) => path) {
+function resolveWorkerpalDockerRuntimeCaArgs(env = process.env, fileExists = existsSync11, dockerHostPath = (path) => path) {
   const configured = String(env.PUSHPALS_DOCKER_RUNTIME_EXTRA_CA_CERTS ?? env.PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS ?? env.NODE_EXTRA_CA_CERTS ?? "").trim();
   if (!configured)
     return [];
-  const path = resolve11(configured);
+  const path = resolve12(configured);
   if (!fileExists(path))
     return [];
   return [
@@ -13565,7 +16056,7 @@ function prependWorkerpalRuntimeCaStartup(startupCommand, runtimeCaEnabled) {
 function resolveWorkerpalSandboxBuildContext(repoRoot) {
   const configuredRoot = String(process.env.PUSHPALS_WORKERPALS_SANDBOX_ROOT ?? "").trim();
   const sandboxRoot = configuredRoot || repoRoot;
-  const dockerfilePath = configuredRoot ? resolve11(sandboxRoot, "apps", "workerpals", "Dockerfile.sandbox") : resolve11(repoRoot, "apps", "workerpals", "Dockerfile.sandbox");
+  const dockerfilePath = configuredRoot ? resolve12(sandboxRoot, "apps", "workerpals", "Dockerfile.sandbox") : resolve12(repoRoot, "apps", "workerpals", "Dockerfile.sandbox");
   return {
     root: sandboxRoot,
     dockerfilePath
@@ -13575,7 +16066,7 @@ function resolveWorkerpalRuntimeTag() {
   return String(process.env.PUSHPALS_RUNTIME_TAG ?? "").trim();
 }
 function dockerBuildFileArg(root, dockerfilePath) {
-  const relativePath = relative(root, dockerfilePath).replace(/\\/g, "/").trim();
+  const relativePath = relative2(root, dockerfilePath).replace(/\\/g, "/").trim();
   return relativePath || "apps/workerpals/Dockerfile.sandbox";
 }
 function isMissingDockerImageDetail(detail) {
@@ -13790,11 +16281,11 @@ class DockerExecutor {
       networkMode: "bridge",
       ...optionValues
     };
-    this.worktreeDir = resolve11(this.options.repo, ".worktrees");
+    this.worktreeDir = resolve12(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
-    const dependencyRepoPath = resolve11(this.options.repo);
-    this.dependencyVolumeName = `pushpals-deps-${createHash5("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
-    this.codexVolumeName = `pushpals-codex-${createHash5("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
+    const dependencyRepoPath = resolve12(this.options.repo);
+    this.dependencyVolumeName = `pushpals-deps-${createHash6("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
+    this.codexVolumeName = `pushpals-codex-${createHash6("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
     this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
     this.warmSetupBackoffMs = parseClampedInt(this.config.workerpals.dockerWarmRetryBackoffMs, 2000, 250, 60000);
@@ -13811,7 +16302,7 @@ class DockerExecutor {
     this.activeJobs += 1;
     this.clearIdleTimer();
     const worktreeName = this.buildEphemeralWorktreeName("job", job.id);
-    const worktreePath = resolve11(this.worktreeDir, worktreeName);
+    const worktreePath = resolve12(this.worktreeDir, worktreeName);
     try {
       const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
       await this.createWorktree(worktreePath, worktreeBaseRef);
@@ -13889,7 +16380,7 @@ class DockerExecutor {
   }
   async validateWorktreeGitInterop() {
     const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "startup");
-    const worktreePath = resolve11(this.worktreeDir, worktreeName);
+    const worktreePath = resolve12(this.worktreeDir, worktreeName);
     try {
       await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath);
@@ -13912,7 +16403,7 @@ class DockerExecutor {
       throw new Error(`Invalid LF boundary assertion path: ${assertLfPath}`);
     }
     const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "windows-linux-lf");
-    const worktreePath = resolve11(this.worktreeDir, worktreeName);
+    const worktreePath = resolve12(this.worktreeDir, worktreeName);
     try {
       await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath, normalizedPath);
@@ -13989,7 +16480,7 @@ class DockerExecutor {
   }
   rewriteWorktreeGitdirToRelative(worktreePath) {
     try {
-      const gitFilePath = resolve11(worktreePath, ".git");
+      const gitFilePath = resolve12(worktreePath, ".git");
       const raw = readFileSync9(gitFilePath, "utf-8").trim();
       const match = raw.match(/^gitdir:\s*(.+)$/i);
       if (!match)
@@ -13999,7 +16490,7 @@ class DockerExecutor {
       if (!hasWindowsDrive && !isAbsolute4(gitdirRaw)) {
         return;
       }
-      const rel = relative(worktreePath, gitdirRaw).replace(/\\/g, "/");
+      const rel = relative2(worktreePath, gitdirRaw).replace(/\\/g, "/");
       if (!rel || rel.startsWith("..") === false) {
         return;
       }
@@ -14187,7 +16678,7 @@ class DockerExecutor {
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
     const authMount = this.openaiCodexAuthMount(backend);
-    const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(process.env, existsSync10, (path) => this.toDockerPath(path));
+    const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(process.env, existsSync11, (path) => this.toDockerPath(path));
     const args = [
       "run",
       "-d",
@@ -14258,7 +16749,7 @@ class DockerExecutor {
         return;
       }
       for (const worktreeId of this.preparedDependencyProjectionIds) {
-        if (!existsSync10(resolve11(this.worktreeDir, worktreeId))) {
+        if (!existsSync11(resolve12(this.worktreeDir, worktreeId))) {
           this.preparedDependencyProjectionIds.delete(worktreeId);
         }
       }
@@ -14293,9 +16784,9 @@ class DockerExecutor {
     }
     const hostCodexHomeRaw = (process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
     if (hostCodexHomeRaw && !isAbsolute4(hostCodexHomeRaw)) {
-      console.warn(`[DockerExecutor] Ignoring relative PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME=${hostCodexHomeRaw}; using ${resolve11(homedir3(), ".codex")} so Codex state stays outside the repo worktree.`);
+      console.warn(`[DockerExecutor] Ignoring relative PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME=${hostCodexHomeRaw}; using ${resolve12(homedir3(), ".codex")} so Codex state stays outside the repo worktree.`);
     }
-    const hostCodexHome = (hostCodexHomeRaw && isAbsolute4(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve11(homedir3(), ".codex")).trim();
+    const hostCodexHome = (hostCodexHomeRaw && isAbsolute4(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve12(homedir3(), ".codex")).trim();
     const configuredContainerHome = process.env.PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME;
     const containerCodexHome = resolveOpenAiCodexContainerHome(configuredContainerHome);
     if (configuredContainerHome?.trim() && containerCodexHome !== configuredContainerHome.trim().replace(/\/$/, "")) {
@@ -14307,8 +16798,8 @@ class DockerExecutor {
       "-e",
       `CODEX_HOME=${containerCodexHome}`
     ];
-    const hostAuthPath = resolve11(hostCodexHome, "auth.json");
-    if (!existsSync10(hostAuthPath)) {
+    const hostAuthPath = resolve12(hostCodexHome, "auth.json");
+    if (!existsSync11(hostAuthPath)) {
       console.warn(`[DockerExecutor] Host Codex auth file not found at ${hostAuthPath}; preserving any auth already stored in ${this.codexVolumeName}.`);
       return { args, containerHome: containerCodexHome, hostAuthMounted: false };
     }
@@ -15017,7 +17508,7 @@ ${text}` : `
     throw new Error(`worktree path not visible inside warm container after ${timeoutMs}ms: ${containerWorktreePath}${lastDetail ? ` (${lastDetail})` : ""}`);
   }
   async ensureWorktreeAccessibleInWarmContainer(worktreePath, onLog) {
-    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const worktreeRelPath = relative2(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
     let lastError = null;
     for (let attempt = 1;attempt <= 2; attempt++) {
@@ -15083,7 +17574,7 @@ ${text}` : `
   async runGitSelfCheckContainer(worktreePath, assertLfPath) {
     const containerName = `pushpals-${this.options.workerId}-selfcheck-${Date.now()}`;
     const dockerRepoPath = this.toDockerPath(this.options.repo);
-    const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const worktreeRelPath = relative2(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
     const args = [
       resolveDockerExecutable(),
@@ -15634,7 +18125,7 @@ ${result.stderr ?? ""}`.toLowerCase();
   }
   buildEphemeralWorktreeName(prefix, token) {
     const safeToken = this.sanitizeWorktreeToken(token, prefix === "job" ? 8 : 12);
-    const nonce = `${Date.now().toString(36).slice(-6)}-${randomUUID().slice(0, 6).toLowerCase()}`;
+    const nonce = `${Date.now().toString(36).slice(-6)}-${randomUUID2().slice(0, 6).toLowerCase()}`;
     return `${prefix}-${safeToken}-${nonce}`;
   }
   sanitizeWorktreeToken(value, maxLength) {
@@ -15644,7 +18135,7 @@ ${result.stderr ?? ""}`.toLowerCase();
     return normalized.slice(0, maxLength);
   }
   async ensureFreshWorktreePath(worktreePath) {
-    if (!existsSync10(worktreePath))
+    if (!existsSync11(worktreePath))
       return;
     console.warn(`[DockerExecutor] Worktree path already exists; forcing cleanup before create: ${worktreePath}`);
     await this.runHostCommandCapture(["git", "worktree", "remove", "--force", "--force", worktreePath], {
@@ -15694,7 +18185,7 @@ ${result.stderr ?? ""}`.toLowerCase();
   async rebuildImageForMergeConflictJob(job, onLog) {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
     const dockerfilePath = sandboxContext.dockerfilePath;
-    if (!existsSync10(dockerfilePath)) {
+    if (!existsSync11(dockerfilePath)) {
       throw new Error(`Merge-conflict job ${job.id} requires Docker image refresh, but Dockerfile is missing at ${dockerfilePath}.`);
     }
     const startMsg = `[DockerExecutor] Merge-conflict job ${job.id}: rebuilding ${this.options.imageName} with --no-cache and restarting warm runtime.`;
@@ -15836,7 +18327,7 @@ ${result.stderr ?? ""}`.toLowerCase();
   }
   async buildLocalImage(runtimeTag) {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
-    if (!existsSync10(sandboxContext.dockerfilePath)) {
+    if (!existsSync11(sandboxContext.dockerfilePath)) {
       return false;
     }
     const dockerfileArg = dockerBuildFileArg(sandboxContext.root, sandboxContext.dockerfilePath);
@@ -16042,21 +18533,21 @@ class WorkerServerTransport {
   async flush(timeoutMs = 15000) {
     if (this.queuedRequests.length === 0 && !this.queueDrainInFlight)
       return;
-    await new Promise((resolve12) => {
+    await new Promise((resolve13) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled)
           return;
         settled = true;
         this.logWarn(`[WorkerPals] Timed out flushing queued server transport requests after ${timeoutMs}ms (queued=${this.queuedRequests.length}).`);
-        resolve12();
+        resolve13();
       }, timeoutMs);
       this.queueFlushWaiters.push(() => {
         if (settled)
           return;
         settled = true;
         clearTimeout(timer);
-        resolve12();
+        resolve13();
       });
       this.maybeResolveFlushWaiters();
     });
@@ -16069,8 +18560,8 @@ class WorkerServerTransport {
       }
       return Promise.resolve();
     }
-    return new Promise((resolve12) => {
-      const queued = { ...task, resolve: resolve12 };
+    return new Promise((resolve13) => {
+      const queued = { ...task, resolve: resolve13 };
       if (queued.priority === "high") {
         const firstNormalIndex = this.queuedRequests.findIndex((entry) => entry.priority !== "high");
         if (firstNormalIndex === -1) {
@@ -16324,7 +18815,7 @@ function inferFailureToolInvocation(result) {
 async function reportToolRunForUnsuccessfulJob(args) {
   const invocation = inferFailureToolInvocation(args.result);
   const record = createToolRunRecordFromFailure({
-    id: randomUUID2(),
+    id: randomUUID3(),
     jobId: args.job.id,
     workerId: args.opts.workerId,
     sessionId: args.job.sessionId ?? null,
@@ -16725,7 +19216,7 @@ function parseArgs() {
   let pollMs = CONFIG.workerpals.pollMs;
   let heartbeatMs = CONFIG.workerpals.heartbeatMs;
   let repo = detectRepoRoot(process.cwd());
-  let workerId = `workerpal-${randomUUID2().substring(0, 8)}`;
+  let workerId = `workerpal-${randomUUID3().substring(0, 8)}`;
   let authToken = CONFIG.authToken;
   let docker = false;
   let requireDocker = CONFIG.workerpals.requireDocker;
@@ -16963,7 +19454,7 @@ async function resolveWorktreeBaseRefForJob(repo, requestedRef, jobId, params) {
 async function createIsolatedWorktree(repo, jobId, baseRef, onLog) {
   const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random().toString(36).slice(2, 6)}`;
   const worktreePath = resolveDirectWorktreePath(repo, jobId, nonce);
-  mkdirSync5(resolve12(worktreePath, ".."), { recursive: true });
+  mkdirSync5(resolve13(worktreePath, ".."), { recursive: true });
   const addResult = await git2(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
@@ -17528,7 +20019,7 @@ async function confirmClaimedJobExecutionStart(opts, headers, jobId, authority) 
     transportAmbiguous: sawTransportFailure
   };
 }
-async function workerLoop(opts, dockerExecutor, runtimeState, transport, requestWorkerRestart) {
+async function workerLoop(opts, dockerExecutor, runtimeState, transport, repositoryServices, requestWorkerRestart) {
   const headers = buildWorkerHeaders(opts.authToken);
   const runtimeGeneration = resolveWorkerRuntimeGeneration();
   console.log(`[WorkerPals ${opts.workerId}] Polling ${opts.server} every ${opts.pollMs}ms`);
@@ -18181,6 +20672,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, request
       break;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, opts.pollMs));
   }
+  await repositoryServices.close();
 }
 async function main() {
   const opts = parseArgs();
@@ -18261,6 +20753,12 @@ async function main() {
     staleClaimTtlMs: CONFIG.server.staleClaimTtlMs,
     runtimeGeneration: resolveWorkerRuntimeGeneration()
   });
+  const repositoryServices = createRepositoryAgentServiceClients({
+    serverUrl: opts.server,
+    callerService: "workerpals",
+    callerInstanceId: opts.workerId,
+    authToken: opts.authToken
+  });
   let shutdownTriggered = false;
   const shutdownAndExit = (signalName, code) => {
     if (shutdownTriggered)
@@ -18295,6 +20793,7 @@ async function main() {
       }));
       await withTimeout(failActiveJobOnShutdown(opts, headers, runtimeState, transport, signalName));
       await withTimeout(transport.flush());
+      await withTimeout(repositoryServices.close());
       if (dockerExecutor) {
         await withTimeout(dockerExecutor.shutdown().catch((err) => {
           console.error(`[WorkerPals] Docker shutdown cleanup failed: ${String(err)}`);
@@ -18310,6 +20809,7 @@ async function main() {
   }
   process.once("exit", () => {
     runtimeState.shutdownRequested = true;
+    repositoryServices.close().catch(() => {});
     if (shutdownTriggered)
       return;
     shutdownTriggered = true;
@@ -18325,8 +20825,9 @@ async function main() {
     console.error(`[WorkerPals] Control plane unhealthy: ${reason}. Recycling worker.`);
     shutdownAndExit("CONTROL_PLANE_UNHEALTHY", 91);
   };
-  workerLoop(opts, dockerExecutor, runtimeState, transport, requestWorkerRestart).catch((err) => {
+  workerLoop(opts, dockerExecutor, runtimeState, transport, repositoryServices, requestWorkerRestart).catch(async (err) => {
     console.error("[WorkerPals] Fatal:", err);
+    await repositoryServices.close().catch(() => {});
     process.exit(1);
   });
 }

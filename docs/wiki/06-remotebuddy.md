@@ -12,12 +12,14 @@ It owns:
 - emitting assistant/task/job status events,
 - enqueueing executable jobs for WorkerPals,
 - maintaining durable planning memory for the repository.
+- physically hosting the worker for the logical, cross-service RepositoryAgent capability.
 
 It does not own:
 
 - code execution (WorkerPals),
 - git integration/PR merge policy (SourceControlManager),
-- queue persistence (Server).
+- RepositoryAgent queue or shared-memory persistence (Server),
+- authoritative validation or publication decisions.
 
 The request handoff is `claimed request + planning context -> sanitized plan -> direct response or task.execute enqueue -> request completion/failure`. Claims are lease-bound and job enqueue uses a request-derived dedupe key, so callback uncertainty can be reconciled from durable Server state without dispatching duplicate work.
 
@@ -32,10 +34,33 @@ The request handoff is `claimed request + planning context -> sanitized plan -> 
 - `apps/remotebuddy/src/idempotency.ts` - replay-safe duplicate suppression.
 - `apps/remotebuddy/src/worker_spawn.ts` - managed WorkerPal launch commands.
 - `apps/remotebuddy/src/autonomous_engine.ts` - bounded autonomous objective dispatch.
+- `apps/remotebuddy/src/repository_agent.ts` - read-only RepositoryAgent worker, evidence checks, cache/fact use, and leased polling.
 
-## Memory Layer
+## Hosted RepositoryAgent Worker
 
-RemoteBuddy now has a modular memory backend layer instead of hardwiring a single store.
+RepositoryAgent is logically shared even though its worker currently lives in the RemoteBuddy process. Callers do not invoke RemoteBuddy directly. They use `RepositoryAgentClient` against Server, and Server brokers the durable request to whichever compatible worker holds the lease.
+
+RemoteBuddy starts one bounded worker that:
+
+1. claims from the dedicated RepositoryAgent queue,
+2. heartbeats the fenced claim while it runs,
+3. verifies stable repository identity plus the exact revision/content-tree snapshot,
+4. checks an exact cache and recalls only still-valid evidence-backed facts,
+5. gives RemoteBuddy's assigned LLM a bounded evidence packet; a first bounded model pass can select additional tracked files for the final analysis,
+6. validates cited paths/blob hashes and verifies the snapshot again,
+7. completes or fails through the lease-authority API.
+
+The before/after snapshot fence catches repository drift and unintended writes. Repository content, recalled memory, and tool output are treated as untrusted evidence rather than instructions. Results and validation commands are proposals; the calling service's deterministic policy and validation gates remain authoritative.
+
+RepositoryAgent availability must not deadlock RemoteBuddy's ordinary request loop. The typed client applies bounded HTTP and overall polling deadlines. Autonomy currently falls back to bounded legacy ideation when repository assistance is unavailable or malformed; safety-critical callers should instead fail closed or use an existing deterministic path.
+
+Codex-backed analysis never runs with the target repository as its working directory. It runs in a disposable neutral Git repository with project instructions, user rules, shell, apps, and web access disabled. HTTP completion backends receive the same evidence-only request and ignore the Codex execution hint.
+
+See [RepositoryAgent and shared memory](https://github.com/PushPalsDev/pushpals/wiki/13-repository-agent-and-memory) for the cross-service contract.
+
+## Session Planning Memory
+
+RemoteBuddy retains a private modular memory backend for its existing session-planning context. This is distinct from the new cross-service memory API.
 
 `memory.ts` defines a pluggable interface:
 
@@ -72,7 +97,17 @@ It uses:
 
 RemoteBuddy currently initializes memory as `composite(sqlite)` when enabled.
 
-## What Gets Remembered
+## Shared Repository Memory
+
+RepositoryAgent does not write to RemoteBuddy's private `remotebuddy_memory` table. It uses `MemoryHttpClient` from `packages/shared` to call Server-owned memory endpoints. The shared store separates:
+
+- exact analysis cache entries, keyed by repository snapshot, purpose/question, prompt version, and model,
+- durable repository facts, scoped by stable repository identity and backed by path/blob evidence,
+- reinforcement observations (`confirmed`, `successful`, `failed`, or `contradicted`) that adjust usefulness/confidence without erasing provenance.
+
+Memory recall is advisory and bounded. Evidence blob IDs are rechecked against the requested worktree; stale records are invalidated. Services that adopt shared memory must use the typed interface rather than opening Server SQLite directly.
+
+## What Session Planning Memory Remembers
 
 RemoteBuddy persists high-signal orchestration facts, including:
 
@@ -84,7 +119,7 @@ RemoteBuddy persists high-signal orchestration facts, including:
 
 This history is scoped by repo root and session.
 
-## How Memory Is Used In Planning
+## How Session Planning Memory Is Used In Planning
 
 At plan time, RemoteBuddy builds context from:
 
@@ -148,6 +183,10 @@ Env overrides are also supported via `REMOTEBUDDY_MEMORY_*` variables in `packag
   - inspect `retention_days` and whether old entries were purged.
 - "Planner quality regressed":
   - inspect `Recent PR/job/request memory` lines injected into planning context.
+- "RepositoryAgent is not answering":
+  - inspect the Server-side request status/deadline and the hosted worker's lease renewal logs.
+- "RepositoryAgent answer is stale":
+  - compare requested identity/revision/tree, cited blob hashes, cache metadata, and memory references.
 
 ## Tradeoffs
 

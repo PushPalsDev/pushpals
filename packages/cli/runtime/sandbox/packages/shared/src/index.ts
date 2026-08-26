@@ -9,6 +9,69 @@ export {
   resolveGitMetadataDir,
   resolveGitStateFilePath,
 } from "./repo.js";
+export {
+  normalizeRepositoryOriginRemote,
+  resolveRepositoryIdentity,
+  type RepositoryIdentity,
+  type RepositoryIdentityGitResult,
+  type RepositoryIdentitySource,
+  type ResolveRepositoryIdentityOptions,
+} from "./repository_identity.js";
+export {
+  RepositorySnapshotError,
+  resolveRepositorySnapshot,
+  type RepositorySnapshot,
+  type RepositorySnapshotErrorCode,
+  type RepositorySnapshotGitResult,
+  type RepositorySnapshotGitRunner,
+  type ResolveRepositorySnapshotOptions,
+} from "./repository_snapshot.js";
+export {
+  InMemoryMemoryStore,
+  appendMemoryReinforcementObservation,
+  assertMemoryReinforcementObservationCompatible,
+  assertMemoryReinforcementOutcome,
+  createMemoryReinforcementObservation,
+  MEMORY_HTTP_AUTHORITY_HEADER,
+  MEMORY_HTTP_CALLER_HEADER,
+  MEMORY_LIMITS,
+  MEMORY_REINFORCEMENT_OUTCOMES,
+  MAX_MEMORY_REINFORCEMENT_OBSERVATIONS,
+  MemoryConflictError,
+  MemoryHttpClient,
+  MemoryHttpError,
+  MemoryStoreClosedError,
+  MemoryValidationError,
+  isMemoryReinforcementOutcome,
+  memoryRecordRankingQuality,
+  resolveMemoryReinforcement,
+  REPOSITORY_AGENT_MEMORY_NAMESPACES,
+  serializedMemoryRecordChars,
+  type MemoryAddress,
+  type MemoryEvidence,
+  type MemoryGetOptions,
+  type MemoryHttpClientOptions,
+  type MemoryHttpAuthority,
+  type MemoryHttpCallerService,
+  type MemoryInvalidateSelector,
+  type MemoryJsonPrimitive,
+  type MemoryJsonValue,
+  type MemoryProvenance,
+  type MemoryPruneOptions,
+  type MemoryPutInput,
+  type MemoryPutOptions,
+  type MemoryRecord,
+  type MemoryReinforcementEffect,
+  type MemoryReinforcementObservation,
+  type MemoryReinforcementOutcome,
+  type MemoryReinforceInput,
+  type MemoryScope,
+  type MemorySearchQuery,
+  type MemoryStatus,
+  type MemoryStore,
+  type MemoryValidationErrorCode,
+} from "./memory.js";
+export * from "./repository_agent.js";
 export { CommunicationManager, type CommunicationManagerOptions } from "./communication.js";
 export {
   DEFAULT_MAX_BUFFERED_RESPONSE_BYTES,
@@ -102,6 +165,13 @@ export {
   type ToolchainEnvironmentSource,
   type ToolchainPlan,
 } from "./toolchain.js";
+export {
+  inferRepositoryValidationSteps,
+  mergeRepositoryValidationSteps,
+  type InferRepositoryValidationStepsOptions,
+  type MergeRepositoryValidationStepsOptions,
+  type RepositoryValidationEcosystem,
+} from "./repo_validation.js";
 export {
   MAX_TRUSTED_VALIDATION_COMMANDS,
   MAX_TRUSTED_VALIDATION_COMMAND_LENGTH,

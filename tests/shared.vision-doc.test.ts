@@ -31,6 +31,10 @@ describe("shared vision doc parsing", () => {
 
   test("validateVisionDocStructure allows flexible section numbering", () => {
     const markdown = [
+      "---",
+      "title: Recovery vision",
+      "---",
+      "",
       "# Vision",
       "> **One sentence:** Keep this short.",
       "",
@@ -47,9 +51,63 @@ describe("shared vision doc parsing", () => {
   });
 
   test("normalizeVisionSectionRefs normalizes and filters references", () => {
-    const allowed = new Set(["1", "3", "10"]);
-    const refs = normalizeVisionSectionRefs(["01", "section 3", "10)", "9", "3"], allowed);
-    expect(refs).toEqual(["1", "3", "10"]);
+    const allowed = new Set(["0", "1", "3", "10"]);
+    const refs = normalizeVisionSectionRefs(
+      ["section 0", "01", "section 3", "10)", "9", "3"],
+      allowed,
+    );
+    expect(refs).toEqual(["0", "1", "3", "10"]);
+  });
+
+  test("parses ordinary unnumbered vision headings and plain-language summaries", () => {
+    const markdown = [
+      "---",
+      "title: Recovery vision",
+      "---",
+      "",
+      "<!--",
+      "This commented sentence must not become the vision summary.",
+      "## Commented priorities",
+      "- Ship commented behavior",
+      "-->",
+      "",
+      "```markdown",
+      "## Example goals",
+      "- Ship sample-only behavior",
+      "```",
+      "",
+      "# Vision",
+      "Help operations teams recover interrupted imports without duplicate work.",
+      "",
+      "## Goals",
+      "- Recover interrupted imports safely",
+      "- Keep progress visible",
+      "",
+      "## User experience priorities",
+      "- Improve recovery before adding new import formats",
+      "",
+      "### Design notes",
+      "Nested headings stay inside their parent section.",
+      "",
+      "## Success criteria",
+      "- Recovery completes without duplicate writes",
+    ].join("\n");
+
+    const parsed = parseVisionDoc(markdown);
+    const items = extractVisionKeyItems(markdown);
+    expect(parsed.oneSentence).toBe(
+      "Help operations teams recover interrupted imports without duplicate work.",
+    );
+    expect(parsed.sections.map((section) => section.title)).toEqual([
+      "Goals",
+      "User experience priorities",
+      "Success criteria",
+    ]);
+    expect(items.objectives).toContain("Recover interrupted imports safely");
+    expect(items.priorities).toContain("Improve recovery before adding new import formats");
+    expect(items.metrics).toContain("Recovery completes without duplicate writes");
+    expect(items.priorities).not.toContain("Ship commented behavior");
+    expect(items.objectives).not.toContain("Ship sample-only behavior");
   });
 
   test("extractVisionKeyItems maps key bullets from template sections", () => {
