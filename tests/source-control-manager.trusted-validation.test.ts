@@ -5,6 +5,7 @@ import { join } from "path";
 import {
   buildWindowsProcessTreeTerminationArgv,
   hasFreshTrustedValidationInstall,
+  normalizeTrustedValidationAffectedPaths,
   resolveTrustedValidationOutcome,
   resolveTrustedValidationArgv,
   runProcessWithTreeTimeout,
@@ -522,6 +523,99 @@ describe("SourceControlManager trusted validation", () => {
         runner,
       });
       expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(2);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("scopes invariant preparation cache by base, toolchain, lockfile, and affected paths", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-invariant-cache-"));
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      const calls: string[][] = [];
+      const runner = async (argv: string[]) => {
+        calls.push(argv);
+        if (argv.includes("install"))
+          mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+      const baseSha = "a".repeat(40);
+      const firstContext = {
+        baseSha,
+        affectedPaths: ["src\\router.ts", "./tests/router.test.ts", "src/router.ts"],
+      };
+      const equivalentContext = {
+        baseSha: baseSha.toUpperCase(),
+        affectedPaths: ["tests/router.test.ts", "src/router.ts"],
+      };
+
+      expect(normalizeTrustedValidationAffectedPaths(firstContext.affectedPaths)).toEqual([
+        "src/router.ts",
+        "tests/router.test.ts",
+      ]);
+      expect(
+        trustedValidationInstallFingerprint({
+          repoPath,
+          bunExecutable: "/runtime/bun",
+          invariantContext: firstContext,
+        }),
+      ).toBe(
+        trustedValidationInstallFingerprint({
+          repoPath,
+          bunExecutable: "/runtime/bun",
+          invariantContext: equivalentContext,
+        }),
+      );
+      expect(
+        trustedValidationInstallFingerprint({
+          repoPath,
+          bunExecutable: "/runtime/other-bun",
+          invariantContext: equivalentContext,
+        }),
+      ).not.toBe(
+        trustedValidationInstallFingerprint({
+          repoPath,
+          bunExecutable: "/runtime/bun",
+          invariantContext: equivalentContext,
+        }),
+      );
+
+      await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        invariantContext: firstContext,
+        runner,
+      });
+      const repeated = await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        invariantContext: equivalentContext,
+        runner,
+      });
+      expect(repeated[0]).toMatchObject({ phase: "dependency_install", cached: true });
+      expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(1);
+      // Candidate-sensitive validation is intentionally executed for both
+      // candidates even though invariant dependency preparation was cached.
+      expect(calls.filter((argv) => argv.includes("validate"))).toHaveLength(2);
+
+      await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        invariantContext: { ...firstContext, baseSha: "b".repeat(40) },
+        runner,
+      });
+      await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        invariantContext: { baseSha: "b".repeat(40), affectedPaths: ["src/other.ts"] },
+        runner,
+      });
+      expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(3);
     } finally {
       rmSync(repoPath, { recursive: true, force: true });
     }

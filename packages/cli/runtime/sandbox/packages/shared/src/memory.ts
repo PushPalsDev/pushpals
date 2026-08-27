@@ -60,6 +60,7 @@ export const MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
 export const MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
 export const REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
   "repository_agent_cache",
+  "repository_agent_capabilities",
   "repository_facts",
 ] as const);
 

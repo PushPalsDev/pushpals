@@ -4012,6 +4012,10 @@ async function main() {
     endpoint: llmCfg.endpoint,
     model: llmCfg.model,
     apiKey: llmCfg.apiKey,
+    // RepositoryAgent performs bounded evidence synthesis, not open-ended
+    // implementation. Low reasoning keeps the shared capability inside its
+    // stage deadline while host verification remains authoritative.
+    reasoningEffort: "low",
     serverUrl: opts.server,
     authToken: opts.authToken,
   });

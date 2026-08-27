@@ -6391,6 +6391,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly cfg: PushPalsConfig["remotebuddy"]["autonomy"];
   private readonly workerExecutionPlatform: PushPalsConfig["workerpals"]["executionPlatform"];
   private runtimeEnabled = true;
+  private stopped = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private startupGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private startupFastTickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -6409,6 +6410,7 @@ export class RemoteBuddyAutonomousEngine {
   private dispatchBackoffReason = "";
   private readonly suppressedFailureTargets = new Map<string, number>();
   private pendingIdeationTimeoutRecovery: IdeationTimeoutRecovery | null = null;
+  private activeRepositoryIdeation: AbortController | null = null;
 
   constructor(opts: {
     server: string;
@@ -6454,8 +6456,12 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   setRuntimeEnabled(enabled: boolean): void {
+    if (this.stopped) return;
     this.runtimeEnabled = Boolean(enabled);
     if (!this.runtimeEnabled) {
+      this.activeRepositoryIdeation?.abort(
+        new Error("RepositoryAgent ideation cancelled because autonomy was disabled"),
+      );
       this.nextTickAtMs = 0;
       this.startupFastTickAttemptsRemaining = 0;
       this.clearStartupFastTickTimer();
@@ -7195,17 +7201,88 @@ export class RemoteBuddyAutonomousEngine {
   }): Promise<{
     json: Record<string, unknown>;
     llmCall: Record<string, unknown>;
-    result: RepositoryAgentResult;
+    result: RepositoryAgentResult | null;
   } | null> {
     if (!this.repositoryAgent) return null;
     const startedAt = Date.now();
     const remainingMs = Math.max(0, params.cycleDeadline - startedAt - 1_000);
-    if (remainingMs < 2_000) return null;
     const timeoutMs = Math.max(2_000, Math.min(this.phaseTimeoutMs("ideation"), remainingMs));
+    let requestFingerprint = sha256(
+      JSON.stringify({
+        purpose: "priority",
+        vision: params.visionContext.sha256,
+        repositoryAgentPrompt: "autonomy-priority-v2",
+      }),
+    );
+    let requestController: AbortController | null = null;
+    const deterministicFallbackPhase = (detail: string) => {
+      const response = { candidates: [] };
+      const latencyMs = Date.now() - startedAt;
+      return {
+        json: response,
+        result: null,
+        llmCall: {
+          id: randomUUID(),
+          runId: params.runId,
+          snapshotId: params.snapshot.snapshot_id,
+          phase: "ideation",
+          provider: "repository_agent_deterministic_fallback",
+          promptTemplateVersion: "repository-agent-v4",
+          promptHash: requestFingerprint,
+          requestPayloadHash: requestFingerprint,
+          requestPayload: {
+            purpose: "priority",
+            visionHash: params.visionContext.sha256,
+          },
+          promptInputs: {},
+          modelId: "deterministic_repository_policy",
+          temperature: null,
+          timeoutMs,
+          response,
+          responseHash: sha256(JSON.stringify(response)),
+          tokenUsage: null,
+          latencyMs,
+          cacheHit: false,
+          cacheKey: null,
+          evidenceCount: 0,
+          memoryRefs: [],
+          fallbackDetail: compactStatusDetail(detail),
+        },
+      };
+    };
+    if (remainingMs < 2_000 || !this.runtimeEnabled || this.stopped) {
+      return deterministicFallbackPhase(
+        remainingMs < 2_000
+          ? "repository_agent_budget_too_small"
+          : "repository_agent_autonomy_disabled",
+      );
+    }
+    const controller = new AbortController();
+    requestController = controller;
+    this.activeRepositoryIdeation?.abort(
+      new Error("RepositoryAgent ideation superseded by a newer autonomy request"),
+    );
+    this.activeRepositoryIdeation = controller;
+    if (!this.runtimeEnabled || this.stopped) {
+      controller.abort(
+        new Error("RepositoryAgent ideation cancelled because autonomy is inactive"),
+      );
+    }
     try {
       const repository = await resolveRepositorySnapshot(this.autonomyRepo, {
         timeoutMs: Math.min(10_000, timeoutMs),
+        runGit: async (root, args, options) =>
+          await runBoundedProcess(["git", "-C", root, ...args], {
+            cwd: root,
+            timeoutMs: options.timeoutMs,
+            outputLimitBytes: options.outputLimitBytes,
+            streamDrainTimeoutMs: 1_000,
+            signal: controller.signal,
+          }),
       });
+      if (!this.runtimeEnabled || this.stopped || controller.signal.aborted) {
+        throw controller.signal.reason ?? new Error("RepositoryAgent ideation cancelled");
+      }
       const context = {
         operation: "analyze_autonomy_opportunities",
         vision: {
@@ -7215,22 +7292,13 @@ export class RemoteBuddyAutonomousEngine {
           sections: params.visionContext.sections.map((section) => ({
             number: section.number,
             title: section.title,
-            markdown: section.markdown,
           })),
-          priorities: params.visionContext.key_items.priorities,
-          objectives: params.visionContext.key_items.objectives,
-          guardrails: params.visionContext.key_items.guardrails,
-          constraints: params.visionContext.key_items.constraints,
-          non_goals: params.visionContext.key_items.non_goals,
-          testing_criteria: params.visionContext.key_items.testing_criteria,
-        },
-        runtimeSignals: {
-          topSignals: params.snapshot.top_signals,
-          stateTraits: params.snapshot.state_traits,
-          feedbackPriors: params.snapshot.feedback_priors.slice(0, 12),
-          openObjectives: params.snapshot.open_objectives.slice(0, 12),
-          recentObjectives: (params.snapshot.recent_objectives ?? []).slice(0, 12),
-          activeCooldowns: params.snapshot.active_cooldowns.slice(0, 12),
+          priorities: params.visionContext.key_items.priorities.slice(0, 16),
+          objectives: params.visionContext.key_items.objectives.slice(0, 16),
+          guardrails: params.visionContext.key_items.guardrails.slice(0, 12),
+          constraints: params.visionContext.key_items.constraints.slice(0, 12),
+          non_goals: params.visionContext.key_items.non_goals.slice(0, 8),
+          testing_criteria: params.visionContext.key_items.testing_criteria.slice(0, 12),
         },
         deterministicPolicy: {
           maxCandidates: this.cfg.ideationMaxCandidates,
@@ -7274,13 +7342,12 @@ export class RemoteBuddyAutonomousEngine {
           ],
         },
       };
-      const requestFingerprint = sha256(
+      requestFingerprint = sha256(
         JSON.stringify({
           repository: { identity: repository.identity, tree: repository.tree },
           purpose: "priority",
           vision: params.visionContext.sha256,
-          snapshot: params.snapshot.snapshot_id,
-          context,
+          repositoryAgentPrompt: "autonomy-priority-v2",
         }),
       );
       const result = await this.repositoryAgent.ask(
@@ -7294,17 +7361,22 @@ export class RemoteBuddyAutonomousEngine {
           priority: "background",
           deadlineAt: new Date(startedAt + timeoutMs).toISOString(),
           freshness: repository.dirty ? "fresh_required" : "cache_preferred",
-          idempotencyKey: `autonomy-ideation:${requestFingerprint}`,
+          // Queue idempotency remains per-cycle because the durable request
+          // deadline changes. RepositoryAgent's analysis cache independently
+          // coalesces these calls by tree + vision + purpose + model.
+          idempotencyKey: `autonomy-ideation:${requestFingerprint}:${params.snapshot.snapshot_id}`,
         },
-        { timeoutMs, pollIntervalMs: 250 },
+        { timeoutMs, pollIntervalMs: 250, signal: controller.signal },
       );
+      if (!this.runtimeEnabled || this.stopped || controller.signal.aborted) {
+        throw controller.signal.reason ?? new Error("RepositoryAgent ideation cancelled");
+      }
       const data = asObject(result.data);
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
       if (candidates.length === 0) {
         console.warn(
-          `[RemoteBuddyAutonomousEngine] RepositoryAgent returned no structured candidates for ${params.runId}; using bounded legacy ideation fallback.`,
+          `[RemoteBuddyAutonomousEngine] RepositoryAgent returned no structured candidates for ${params.runId}; using deterministic repo-vision fallback without another model call.`,
         );
-        return null;
       }
       const response = { candidates };
       const latencyMs = Date.now() - startedAt;
@@ -7313,14 +7385,16 @@ export class RemoteBuddyAutonomousEngine {
       );
       return {
         json: response,
-        result,
+        // Evidence/memory from an empty RepositoryAgent answer must not be
+        // attributed to a candidate synthesized by deterministic fallback.
+        result: candidates.length > 0 ? result : null,
         llmCall: {
           id: randomUUID(),
           runId: params.runId,
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v2",
+          promptTemplateVersion: "repository-agent-v4",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -7344,14 +7418,18 @@ export class RemoteBuddyAutonomousEngine {
           cacheHit: result.cache.hit,
           cacheKey: result.cache.key,
           evidenceCount: result.evidence.length,
-          memoryRefs: result.memoryRefs,
+          memoryRefs: candidates.length > 0 ? result.memoryRefs : [],
         },
       };
     } catch (error) {
       console.warn(
-        `[RemoteBuddyAutonomousEngine] RepositoryAgent ideation unavailable for ${params.runId}; using bounded legacy ideation fallback: ${error instanceof Error ? error.message : String(error)}`,
+        `[RemoteBuddyAutonomousEngine] RepositoryAgent ideation unavailable for ${params.runId}; using deterministic repo-vision fallback without another model call: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return null;
+      return deterministicFallbackPhase(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (this.activeRepositoryIdeation === requestController) {
+        this.activeRepositoryIdeation = null;
+      }
     }
   }
 
@@ -8066,7 +8144,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   async tick(): Promise<void> {
-    if (!this.runtimeEnabled || this.cfg.killSwitchEnabled || this.inFlight) return;
+    if (this.stopped || !this.runtimeEnabled || this.cfg.killSwitchEnabled || this.inFlight) return;
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
     this.markTickStart(runId);
@@ -8374,6 +8452,10 @@ export class RemoteBuddyAutonomousEngine {
         visionContext,
         cycleDeadline,
       });
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_during_repository_agent_ideation";
+        return;
+      }
       const repositoryAgentResult = repositoryAgentPhase?.result ?? null;
       let ideationPhase: {
         json: Record<string, unknown>;
@@ -8833,6 +8915,10 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       this.setPhase("renew_lock_before_scoring");
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_before_scoring";
+        return;
+      }
       if (!(await this.renewDispatchLock(runId))) {
         outcomeDetail = "lock_renew_failed_before_scoring";
         return;
@@ -8863,6 +8949,10 @@ export class RemoteBuddyAutonomousEngine {
         } else {
           throw error;
         }
+      }
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_during_scoring";
+        return;
       }
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
         this.setPhase("record_snapshot_expired");
@@ -9248,6 +9338,10 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       this.setPhase("renew_lock_before_enqueue");
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_before_enqueue";
+        return;
+      }
       if (!(await this.renewDispatchLock(runId))) {
         outcomeDetail = "lock_renew_failed_before_enqueue";
         return;
@@ -9301,6 +9395,10 @@ export class RemoteBuddyAutonomousEngine {
         selection_roll: selection.roll,
       };
       this.setPhase("reserve_objective");
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_before_objective_reservation";
+        return;
+      }
       const reservationRecorded = await this.postObjective({
         runId,
         snapshotId: snapshot.snapshot_id,
@@ -9337,6 +9435,10 @@ export class RemoteBuddyAutonomousEngine {
       }
 
       this.setPhase("enqueue_request");
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_before_request_enqueue";
+        return;
+      }
       const requestId = await this.enqueueSyntheticRequest(instruction, {
         objectiveId,
         runId,
@@ -9430,7 +9532,7 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   start(): void {
-    if (!this.runtimeEnabled || this.timer || this.startupGraceTimer) return;
+    if (this.stopped || !this.runtimeEnabled || this.timer || this.startupGraceTimer) return;
     console.log(
       `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
     );
@@ -9467,6 +9569,12 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.runtimeEnabled = false;
+    this.activeRepositoryIdeation?.abort(
+      new Error("RepositoryAgent ideation cancelled because autonomy is stopping"),
+    );
     this.clearStartupGraceTimer();
     this.clearStartupFastTickTimer();
     if (this.timer) {

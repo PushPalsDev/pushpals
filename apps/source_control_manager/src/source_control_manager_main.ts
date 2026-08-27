@@ -78,6 +78,7 @@ import {
   type AuthoritativePublicationReprobe,
 } from "./publication_recovery";
 import {
+  normalizeTrustedValidationAffectedPaths,
   resolveTrustedValidationOutcome,
   runProcessWithTreeTimeout,
   runTrustedValidationCommands,
@@ -1121,6 +1122,7 @@ async function tick(): Promise<void> {
     let trustedValidationBaselineSha: string | null = null;
     let trustedValidationCandidateSha: string | null = null;
     let trustedValidationCandidateRef: string | null = null;
+    let trustedValidationAffectedPaths: string[] = [];
     let trustedValidationResults: TrustedValidationExecutionResult[] = [];
     let publicationAlreadyIntegrated = false;
     let publicationReadyForFinalization = false;
@@ -1520,6 +1522,30 @@ async function tick(): Promise<void> {
       }
       await persistExactValidationCheckpoint();
 
+      if (
+        !skipValidationForDurableRecovery &&
+        completion.trustedValidationCommandsJson &&
+        trustedValidationBaselineSha &&
+        trustedValidationCandidateSha
+      ) {
+        const affectedPathDiff = await validationGit([
+          "diff",
+          "--name-only",
+          "-z",
+          trustedValidationBaselineSha,
+          trustedValidationCandidateSha,
+          "--",
+        ]);
+        if (!affectedPathDiff.ok) {
+          throw new Error(
+            `Unable to derive trusted-validation affected paths for the immutable candidate: ${affectedPathDiff.stderr || affectedPathDiff.stdout}`,
+          );
+        }
+        trustedValidationAffectedPaths = normalizeTrustedValidationAffectedPaths(
+          affectedPathDiff.stdout.split("\0"),
+        );
+      }
+
       // 4. Run checks against the exact immutable candidate. A durable success
       // proof plus authoritative publication proof is the only recovery path
       // allowed to skip re-running mutable validation.
@@ -1538,6 +1564,13 @@ async function tick(): Promise<void> {
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: completion.trustedValidationCommandsJson,
+            invariantContext:
+              trustedValidationBaselineSha && trustedValidationCandidateSha
+                ? {
+                    baseSha: trustedValidationBaselineSha,
+                    affectedPaths: trustedValidationAffectedPaths,
+                  }
+                : undefined,
             onProgress: (event) =>
               healthTracker.progress(trustedValidationHealthPhase(event), completion.id),
           });

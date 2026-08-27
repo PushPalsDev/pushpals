@@ -2151,10 +2151,14 @@ describe("workerpals docker executor internals", () => {
       }) => Promise<void>;
       rebuildImageForMergeConflictJob: () => Promise<void>;
       resolveWorktreeBaseRefForJob: () => Promise<string>;
-      createWorktree: () => Promise<void>;
+      createWorktree: (worktreePath: string) => Promise<void>;
       logExecutionConfig: () => void;
-      runInWarmContainer: () => Promise<{ ok: boolean; summary: string }>;
-      removeWorktree: () => Promise<void>;
+      runInWarmContainer: () => Promise<{
+        ok: boolean;
+        summary: string;
+        commit?: { branch: string; sha: string };
+      }>;
+      removeWorktree: (worktreePath: string) => Promise<void>;
       scheduleIdleShutdown: () => void;
     };
 
@@ -2163,10 +2167,18 @@ describe("workerpals docker executor internals", () => {
       rebuildCalls += 1;
     };
     executor.resolveWorktreeBaseRefForJob = async () => "HEAD";
-    executor.createWorktree = async () => {};
+    executor.createWorktree = async (worktreePath) => {
+      mkdirSync(worktreePath, { recursive: true });
+    };
     executor.logExecutionConfig = () => {};
-    executor.runInWarmContainer = async () => ({ ok: true, summary: "ok" });
-    executor.removeWorktree = async () => {};
+    executor.runInWarmContainer = async () => ({
+      ok: true,
+      summary: "ok",
+      commit: { branch: "agent/workerpal-test/job-regular", sha: "a".repeat(40) },
+    });
+    executor.removeWorktree = async (worktreePath) => {
+      rmSync(worktreePath, { recursive: true, force: true });
+    };
     executor.scheduleIdleShutdown = () => {};
 
     const mergeConflictJob = {

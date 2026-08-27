@@ -6,6 +6,7 @@ import { join } from "path";
 import {
   buildBunDependencyLayoutPreflightFailureRun,
   buildValidationExecutionDag,
+  buildValidationExecutionPlan,
   bunDependencySnapshotKey,
   allowsValidationToolingOnlyChangeForTestFocusedTask,
   classifyValidationFailureScope,
@@ -533,6 +534,25 @@ describe("workerpals validation command safety", () => {
       expect(
         buildValidationExecutionDag(root, ["bun run validate", "bun run validateAlias"]),
       ).toEqual(["bun run validate"]);
+
+      const collected = collectQualityGateValidationCommands({
+        instruction: "Validate the implementation",
+        planning: planningFixture({
+          validationSteps: ["bun run lint", "bun run validate"],
+        }) as any,
+        changedTestPaths: [],
+        isTestTask: false,
+        repo: root,
+        changedPaths: [],
+      });
+      expect(collected.discoveredCommands).toEqual(["bun run lint", "bun run validate"]);
+      expect(collected.commandsToRun).toEqual(["bun run validate"]);
+      expect(buildValidationExecutionPlan(root, collected.discoveredCommands)).toMatchObject([
+        {
+          command: "bun run validate",
+          subsumes: ["bun run lint"],
+        },
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

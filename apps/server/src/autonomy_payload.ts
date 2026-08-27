@@ -41,6 +41,8 @@ export type AutonomyPayloadDetails = {
   reservationRequired: boolean;
   validationIncidentId: string | null;
   isValidationIncidentRepair: boolean;
+  workClass: string | null;
+  isRecoveryWork: boolean;
 };
 
 export function extractAutonomyPayloadDetails(
@@ -88,6 +90,26 @@ export function extractAutonomyPayloadDetails(
         paramsAutonomy?.pattern_key,
       240,
     ) || null;
+  const workClass =
+    compactText(
+      value.workClass ??
+        value.work_class ??
+        planning?.workClass ??
+        planning?.work_class ??
+        metadataAutonomy?.workClass ??
+        metadataAutonomy?.work_class ??
+        paramsAutonomy?.workClass ??
+        paramsAutonomy?.work_class,
+      32,
+    )
+      .toLowerCase()
+      .replace(/[_\s]+/g, "-") || null;
+  const lifecycleRecovery = Boolean(
+    metadataAutonomy?.lifecycleRecovery === true ||
+    metadataAutonomy?.lifecycle_recovery === true ||
+    paramsAutonomy?.lifecycleRecovery === true ||
+    paramsAutonomy?.lifecycle_recovery === true,
+  );
 
   return {
     objectiveId,
@@ -96,6 +118,12 @@ export function extractAutonomyPayloadDetails(
     reservationRequired,
     validationIncidentId,
     isValidationIncidentRepair: Boolean(validationIncidentId),
+    workClass,
+    isRecoveryWork:
+      Boolean(validationIncidentId) ||
+      lifecycleRecovery ||
+      workClass === "recovery" ||
+      workClass === "repair",
     targetPaths: stringValues(
       metadataAutonomy?.targetPaths,
       metadataAutonomy?.target_paths,

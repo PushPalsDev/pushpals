@@ -793,6 +793,9 @@ describe("workerpals merge-conflict sandbox", () => {
               executor: TEST_BACKEND,
               qualityMaxAutoRevisions: 1,
               qualitySoftPassOnExhausted: true,
+              // This fixture exercises host-owned rebase continuation, not the
+              // external critic. Do not rely on the old null-as-pass behavior.
+              qualityCriticGateEnabled: false,
             },
           };
           const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];
@@ -898,6 +901,9 @@ describe("workerpals merge-conflict sandbox", () => {
               executor: TEST_BACKEND,
               qualityMaxAutoRevisions: 1,
               qualitySoftPassOnExhausted: true,
+              // This fixture exercises host-owned rebase continuation, not the
+              // external critic. Do not rely on the old null-as-pass behavior.
+              qualityCriticGateEnabled: false,
             },
           };
           const forwardedLogs: Array<{ stream: "stdout" | "stderr"; line: string }> = [];

@@ -153,9 +153,11 @@ describe("server AutonomyStore policy gates", () => {
     stores.push(migrated);
     const db = (migrated as unknown as { db: any }).db;
     const columns = new Set(
-      (db.prepare("PRAGMA table_info(autonomy_repository_agent_memory_feedback)").all() as Array<{
-        name: string;
-      }>).map((entry) => entry.name),
+      (
+        db.prepare("PRAGMA table_info(autonomy_repository_agent_memory_feedback)").all() as Array<{
+          name: string;
+        }>
+      ).map((entry) => entry.name),
     );
     expect([...columns]).toEqual(
       expect.arrayContaining([
@@ -167,12 +169,14 @@ describe("server AutonomyStore policy gates", () => {
       ]),
     );
     const indexes = new Set(
-      (db
-        .prepare(
-          `SELECT name FROM sqlite_master
+      (
+        db
+          .prepare(
+            `SELECT name FROM sqlite_master
            WHERE type = 'index' AND tbl_name = 'autonomy_repository_agent_memory_feedback'`,
-        )
-        .all() as Array<{ name: string }>).map((entry) => entry.name),
+          )
+          .all() as Array<{ name: string }>
+      ).map((entry) => entry.name),
     );
     expect(indexes.has("idx_autonomy_repository_agent_feedback_lease")).toBe(true);
     expect(indexes.has("idx_autonomy_repository_agent_feedback_objective_created")).toBe(true);
@@ -790,9 +794,9 @@ describe("server AutonomyStore policy gates", () => {
       now,
       now,
     );
-    const jobRow = db
-      .prepare(`SELECT prUrlNormalized FROM jobs WHERE id = ?`)
-      .get(jobId) as { prUrlNormalized: string };
+    const jobRow = db.prepare(`SELECT prUrlNormalized FROM jobs WHERE id = ?`).get(jobId) as {
+      prUrlNormalized: string;
+    };
     const closedAt = new Date(Date.now() - 1_000).toISOString();
     db.prepare(
       `INSERT INTO pr_provider_outcomes (
@@ -906,7 +910,14 @@ describe("server AutonomyStore policy gates", () => {
         const normalizedPrUrl = prUrl.toLowerCase();
         const eventAt = new Date(Date.now() - (501 - index) * 1_000).toISOString();
         const authorityId = [normalizedPrUrl, jobId, eventAt, "merged", "1"].join("\u001f");
-        insertJob.run(jobId, `task-feedback-page-${suffix}`, prUrl, normalizedPrUrl, eventAt, eventAt);
+        insertJob.run(
+          jobId,
+          `task-feedback-page-${suffix}`,
+          prUrl,
+          normalizedPrUrl,
+          eventAt,
+          eventAt,
+        );
         insertObjective.run(
           objectiveId,
           `run-feedback-page-${suffix}`,
@@ -916,14 +927,7 @@ describe("server AutonomyStore policy gates", () => {
           eventAt,
         );
         insertLink.run(objectiveId, requestId, memoryRefsJson, eventAt, eventAt);
-        insertProvider.run(
-          normalizedPrUrl,
-          prUrl,
-          jobId,
-          eventAt,
-          eventAt,
-          eventAt,
-        );
+        insertProvider.run(normalizedPrUrl, prUrl, jobId, eventAt, eventAt, eventAt);
         if (index > 0) {
           insertReflected.run(
             `observation-feedback-page-${suffix}`,
@@ -1123,9 +1127,7 @@ describe("server AutonomyStore policy gates", () => {
       ),
     ).toBe(true);
     const nextForObjective = store.claimRepositoryAgentMemoryFeedback(100, 30_000);
-    expect(nextForObjective.map((entry) => entry.observationId)).toEqual([
-      "objective-a-second",
-    ]);
+    expect(nextForObjective.map((entry) => entry.observationId)).toEqual(["objective-a-second"]);
   });
 
   test("prunes terminal feedback and settled links while surfacing old pending work", () => {
@@ -1168,13 +1170,7 @@ describe("server AutonomyStore policy gates", () => {
          memory_refs_json, created_at, updated_at
        ) VALUES (?, ?, ?, '[]', ?, ?)`,
     );
-    insertLink.run(
-      "orphan-old-link",
-      "github.com/example/project",
-      "request-old-link",
-      old,
-      old,
-    );
+    insertLink.run("orphan-old-link", "github.com/example/project", "request-old-link", old, old);
     insertLink.run(
       "objective-recent-applied-one",
       "github.com/example/project",
@@ -1199,7 +1195,9 @@ describe("server AutonomyStore policy gates", () => {
       }),
     ).toEqual({ feedbackDeleted: 3, linksDeleted: 2 });
     const retainedLinks = (
-      db.prepare(`SELECT objective_id AS objectiveId FROM autonomy_repository_agent_memory_links`).all() as Array<{
+      db
+        .prepare(`SELECT objective_id AS objectiveId FROM autonomy_repository_agent_memory_links`)
+        .all() as Array<{
         objectiveId: string;
       }>
     ).map((entry) => entry.objectiveId);
@@ -2925,6 +2923,57 @@ describe("server AutonomyStore policy gates", () => {
     );
   });
 
+  test("coalesces the same vision objective and acceptance contract across adjacent paths", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_semantic_cluster",
+    }).snapshot_id;
+    const active = store.recordObjectiveDecision({
+      runId: "run_semantic_cluster",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_semantic_cluster",
+        title: "Repair route readiness",
+        instruction: "Make route readiness deterministic.",
+        objective_type: "flaky_test",
+        component_area: "src/routes",
+        trigger_type: "test_failure",
+        target_paths: ["src/routes/alpha.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/routes/alpha.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        vision_objective_id: "vision:route-readiness",
+        acceptance_criteria: ["Route src/routes/alpha.ts becomes ready after 2 retries"],
+        status: "proposed",
+      },
+    });
+    expect(active.ok).toBe(true);
+
+    const duplicate = store.evaluateEligibility({
+      runId: "run_semantic_cluster",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_semantic_cluster_adjacent",
+          objective_type: "flaky_test",
+          component_area: "src/routes",
+          pattern_key: "prompt-variation-that-must-not-escape",
+          target_paths: ["src/routes/beta.ts"],
+          vision_objective_id: "vision:route-readiness",
+          acceptance_criteria: ["Route src/routes/beta.ts becomes ready after 5 retries"],
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(duplicate.results?.[0]).toMatchObject({ ok: false });
+    expect(String(duplicate.results?.[0]?.reason ?? "")).toBe(
+      "pattern already has active objective",
+    );
+  });
+
   test("blocks PushPals-internal autonomy ideas from user-repo targets", () => {
     const store = makeStore();
     const snapshotId = store.createSnapshot({
@@ -3184,6 +3233,9 @@ describe("server AutonomyStore policy gates", () => {
         },
       });
       expect(activeDifferentPattern.ok).toBe(true);
+      (store as any).db
+        .prepare("UPDATE autonomy_objectives SET pattern_key = ? WHERE id = ?")
+        .run(seeded.patternKey, "obj_required_repair_active_target");
 
       const allowed = store.evaluateEligibility({
         runId: "run_required_repair",
@@ -3264,7 +3316,7 @@ describe("server AutonomyStore policy gates", () => {
         freezeForMs: 60_000,
         freezeReason: "test_required_repair_safety",
       });
-      const frozen = store.evaluateEligibility({
+      const recoveryDuringFreeze = store.evaluateEligibility({
         runId: "run_required_repair",
         snapshotId,
         candidates: [
@@ -3272,14 +3324,17 @@ describe("server AutonomyStore policy gates", () => {
             candidate_id: "cand_required_repair_frozen",
             objective_type: "flaky_test",
             component_area: "tests",
-            pattern_key: seeded.patternKey,
+            pattern_key: "pk_required_repair_freeze_probe",
             confidence: 0.95,
             required_validation_repair: true,
+            work_class: "recovery",
           },
         ],
       });
-      expect(frozen.results?.[0]?.ok).toBe(false);
-      expect(String(frozen.results?.[0]?.reason ?? "")).toContain("autonomy frozen");
+      expect(recoveryDuringFreeze.results?.[0]).toMatchObject({
+        candidate_id: "cand_required_repair_frozen",
+        ok: true,
+      });
     } finally {
       jobs.close();
     }
@@ -5257,7 +5312,7 @@ describe("server AutonomyStore policy gates", () => {
       awaitingReviewCount: 1,
       mergedObjectiveCount: 0,
       reviewRevisionCount: 1,
-      firstPassMergeRate: null,
+      firstPassMergeRate: 0,
     });
 
     expect(
@@ -5333,8 +5388,8 @@ describe("server AutonomyStore policy gates", () => {
       nonTerminalRevisionCount: 7,
       nonTerminalRevisionObjectiveCount: 1,
       revisedTerminalObjectiveCount: 0,
-      objectiveRevisionRate: null,
-      objectiveFirstPassRate: null,
+      objectiveRevisionRate: 1,
+      objectiveFirstPassRate: 0,
     });
 
     const frozen = store.updateSafetyState({
@@ -5382,7 +5437,7 @@ describe("server AutonomyStore policy gates", () => {
     });
   });
 
-  test("review revision rate uses the resolved PR cohort, not unresolved revision work", () => {
+  test("review revision rate includes unresolved revision work in the observed cohort", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-review-cohort-");
     const queue = new JobQueue(dbPath);
     const internal = store as unknown as {
@@ -5463,8 +5518,14 @@ describe("server AutonomyStore policy gates", () => {
 
       const card = runEvaluatorNow(store);
       expect(card.reviewResolvedCount).toBe(1);
-      expect(card.reviewRevisionRate).toBe(0);
-      expect(card.recommendation).toBe("healthy");
+      expect(card.reviewRevisionRate).toBe(0.75);
+      expect(card.recommendation).toBe("pause");
+      expect(store.listInsights().portfolio).toMatchObject({
+        resolvedObjectiveCount: 1,
+        mergedObjectiveCount: 1,
+        reviewRevisionCount: 3,
+        firstPassMergeRate: 0.25,
+      });
     } finally {
       internal.config.remotebuddy.autonomy.evaluatorMinSamples = originalEvaluatorMinSamples;
       queue.close();
@@ -5535,7 +5596,7 @@ describe("server AutonomyStore policy gates", () => {
     expect(store.getSafetyState().freezeReason).toBe("auto_freeze:evaluator_pause");
   });
 
-  test("the default automatic freeze is capped at 30 minutes and is not extended", async () => {
+  test("a repeated lane failure opens its cooldown without globally freezing autonomy", async () => {
     const store = makeStore();
     const startedAtMs = Date.now();
 
@@ -5553,12 +5614,12 @@ describe("server AutonomyStore policy gates", () => {
       ).toBe(true);
     }
     const firstFreeze = store.getSafetyState();
-    expect(firstFreeze.isFrozen).toBe(true);
-    expect(firstFreeze.freezeReason).toBe("auto_freeze:fail_streak:pk_non_extending_freeze");
-    expect(firstFreeze.freezeUntil).not.toBeNull();
-    const firstFreezeDurationMs = Date.parse(String(firstFreeze.freezeUntil)) - startedAtMs;
-    expect(firstFreezeDurationMs).toBeGreaterThan(1_799_000);
-    expect(firstFreezeDurationMs).toBeLessThanOrEqual(1_800_500);
+    expect(firstFreeze.isFrozen).toBe(false);
+    const db = (store as unknown as { db: any }).db;
+    const firstCooldown = db
+      .prepare(`SELECT cooldown_until FROM autonomy_pattern_stats WHERE pattern_key = ?`)
+      .get("pk_non_extending_freeze") as { cooldown_until: string | null };
+    expect(Date.parse(String(firstCooldown.cooldown_until))).toBeGreaterThan(startedAtMs);
 
     await Bun.sleep(10);
     expect(
@@ -5573,13 +5634,14 @@ describe("server AutonomyStore policy gates", () => {
       }).ok,
     ).toBe(true);
 
-    const unchangedFreeze = store.getSafetyState();
-    expect(unchangedFreeze.isFrozen).toBe(true);
-    expect(unchangedFreeze.freezeUntil).toBe(firstFreeze.freezeUntil);
-    expect(unchangedFreeze.freezeReason).toBe(firstFreeze.freezeReason);
+    expect(store.getSafetyState().isFrozen).toBe(false);
+    const constrainedAlerts = store
+      .getOpsSummary()
+      .recentAlerts.filter((alert) => alert.alertType.startsWith("autonomy_lane_constrained:"));
+    expect(constrainedAlerts).toHaveLength(1);
   });
 
-  test("evaluator consumes pause evidence while a fail-streak freeze is active", () => {
+  test("evaluator freezes only after independent root-objective evidence reaches minimum samples", () => {
     const store = makeStore();
     const internal = store as unknown as {
       config: {
@@ -5607,14 +5669,14 @@ describe("server AutonomyStore policy gates", () => {
       ).toBe(true);
     }
 
-    const freeze = store.getSafetyState();
+    expect(store.getSafetyState().isFrozen).toBe(false);
+    const evaluatedAt = Date.now() + 1_000;
+    const evaluated = internal.runEvaluator(new Date(evaluatedAt).toISOString());
+    expect(evaluated.recommendation).toBe("pause");
+    const freeze = store.getSafetyState(new Date(evaluatedAt).toISOString());
     expect(freeze.isFrozen).toBe(true);
-    expect(freeze.freezeReason).toBe("auto_freeze:fail_streak:pk_overlapping_freeze");
+    expect(freeze.freezeReason).toBe("auto_freeze:evaluator_pause");
     const freezeUntilMs = Date.parse(String(freeze.freezeUntil));
-
-    const duringFreeze = internal.runEvaluator(new Date(freezeUntilMs - 1_000).toISOString());
-    expect(duringFreeze.recommendation).toBe("pause");
-    expect(store.getSafetyState().freezeUntil).toBe(freeze.freezeUntil);
 
     const afterExpiry = new Date(freezeUntilMs + 1_000).toISOString();
     const unchangedEvidence = internal.runEvaluator(afterExpiry);
@@ -5677,7 +5739,7 @@ describe("server AutonomyStore policy gates", () => {
     expect(store.getSafetyState().isFrozen).toBe(true);
   });
 
-  test("does not re-arm an expired review-backlog freeze as wall-clock age increases", () => {
+  test("does not globally freeze for a review backlog below the independent-root minimum", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-review-freeze-");
     const queue = new JobQueue(dbPath);
     try {
@@ -5743,8 +5805,8 @@ describe("server AutonomyStore policy gates", () => {
       );
 
       const first = internal.runEvaluator(new Date(firstAtMs).toISOString());
-      expect(first.recommendation).toBe("pause");
-      expect(store.getSafetyState(new Date(firstAtMs).toISOString()).isFrozen).toBe(true);
+      expect(first.recommendation).toBe("constrain");
+      expect(store.getSafetyState(new Date(firstAtMs).toISOString()).isFrozen).toBe(false);
 
       const afterExpiry = new Date(firstAtMs + 61_000).toISOString();
       const unchanged = internal.runEvaluator(afterExpiry);
@@ -5755,7 +5817,7 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
-  test("evaluator pauses degraded end-to-end job health and preserves null latency", () => {
+  test("raw child-job health constrains its lane but cannot globally freeze without root outcomes", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-job-health-");
     const queue = new JobQueue(dbPath);
     try {
@@ -5797,8 +5859,112 @@ describe("server AutonomyStore policy gates", () => {
       expect(card.jobTerminalCount).toBe(10);
       expect(card.jobSuccessRate).toBeCloseTo(0.7);
       expect(card.jobTimeoutRate).toBeCloseTo(0.3);
-      expect(card.recommendation).toBe("pause");
-      expect(store.getSafetyState().isFrozen).toBe(true);
+      expect(card.recommendation).toBe("constrain");
+      expect(store.getSafetyState().isFrozen).toBe(false);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("five root objectives and eight failed child jobs do not satisfy the global freeze minimum", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-root-samples-");
+    const queue = new JobQueue(dbPath);
+    try {
+      for (let index = 0; index < 8; index += 1) {
+        const enqueued = queue.enqueue({
+          taskId: `root-sample-child-${index}`,
+          sessionId: "dev",
+          kind: "task.execute",
+          params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        expect(queue.claim(`worker-root-sample-${index}`).job?.id).toBe(jobId);
+        expect(
+          queue.fail(jobId, {
+            message: "critic unavailable before validation handoff",
+            diagnostics: {
+              terminal: {
+                failureClass: "critic_unavailable",
+                terminalStage: "quality_gate",
+                summary: "critic unavailable before validation handoff",
+              },
+            },
+          }).ok,
+        ).toBe(true);
+        expect(
+          store.recordOutcome({
+            objectiveId: `obj_root_sample_${index % 5}`,
+            jobId,
+            patternKey: `cluster_root_sample_${index % 5}`,
+            success: false,
+            userAction: "failed",
+            regressionFlag: false,
+          }).ok,
+        ).toBe(true);
+      }
+
+      const card = runEvaluatorNow(store);
+      expect(card.sampleCount).toBe(5);
+      expect(card.jobTerminalCount).toBe(8);
+      expect(card.recommendation).toBe("constrain");
+      expect(store.getSafetyState().isFrozen).toBe(false);
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("clusters identical objective failures across adjacent target paths", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-adjacent-failures-");
+    const queue = new JobQueue(dbPath);
+    try {
+      for (const [index, route] of ["alpha", "beta"].entries()) {
+        const enqueued = queue.enqueue({
+          taskId: `adjacent-failure-${route}`,
+          sessionId: "dev",
+          kind: "task.execute",
+          params: {
+            origin: "autonomy",
+            autonomy: {
+              origin: "autonomy",
+              objectiveType: "flaky_test",
+              visionObjectiveId: "vision:route-readiness",
+              acceptanceCriteria: [
+                `Route src/routes/${route}.ts becomes ready after ${index + 2} retries`,
+              ],
+              targetPaths: [`src/routes/${route}.ts`],
+            },
+          },
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        expect(queue.claim(`worker-adjacent-${route}`).job?.id).toBe(jobId);
+        expect(
+          queue.fail(jobId, {
+            message: "route readiness assertion failed",
+            diagnostics: {
+              terminal: {
+                failureClass: "test_failure",
+                terminalStage: "focused_validation",
+                summary: "route readiness assertion failed",
+              },
+              validationRuns: [
+                {
+                  attempt: 1,
+                  command: "bun test tests/route-readiness.test.ts",
+                  passed: false,
+                  exitCode: 1,
+                  failureClass: "test_failure",
+                  stderrTail: "(fail) route readiness > restores the route shell",
+                },
+              ],
+            },
+          }).ok,
+        ).toBe(true);
+      }
+
+      const card = runEvaluatorNow(store);
+      expect(card.repeatedFailureCount).toBe(2);
+      expect(card.recommendation).toBe("constrain");
+      expect(store.getSafetyState().isFrozen).toBe(false);
     } finally {
       queue.close();
     }
@@ -6676,10 +6842,14 @@ describe("server AutonomyStore policy gates", () => {
         }
       };
       finish("success", "completed");
+      finish("success_regression_fix", "completed", "fixed regression");
       finish("no_change", "failed", "artifact_only_no_publishable_patch");
       finish("environment", "failed", "missing_runtime_asset");
       finish("completed_no_change", "completed", "completed_no_change");
       finish("publish_environment", "publish_blocked", "missing_runtime_asset");
+      finish("quality_rejected", "failed", "critic_rejected", "quality_gate");
+      finish("critic_unavailable", "failed", "critic_unavailable", "quality_gate");
+      finish("regression", "failed", "regression_detected", "post_publish");
       finish(
         "trusted_validation",
         "publish_blocked",
@@ -6688,14 +6858,17 @@ describe("server AutonomyStore policy gates", () => {
       );
 
       const metrics = store.getReliabilityMetrics();
-      expect(metrics.attemptsTotal).toBe(6);
+      expect(metrics.attemptsTotal).toBe(10);
       expect(metrics.outcomeCounts).toMatchObject({
-        succeeded: 1,
+        succeeded: 2,
         no_change: 2,
         environment_blocked: 2,
         validation_blocked: 1,
+        product_quality_failed: 1,
+        orchestration_failed: 1,
+        regression_detected: 1,
       });
-      expect(metrics.attemptSuccessRate).toBeCloseTo(1 / 6, 5);
+      expect(metrics.attemptSuccessRate).toBeCloseTo(2 / 10, 5);
     } finally {
       jobs.close();
     }
@@ -6808,13 +6981,282 @@ describe("server AutonomyStore policy gates", () => {
         deterministic_repair_failure: false,
       });
       expect(byId.get("obj_circuit_infrastructure")).toMatchObject({
-        attempt_outcome: "infrastructure_failed",
+        attempt_outcome: "orchestration_failed",
         deterministic_repair_failure: false,
       });
       expect(byId.get("obj_circuit_handoff")).toMatchObject({
         job_id: null,
         attempt_outcome: null,
         deterministic_repair_failure: false,
+      });
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("durably tombstones repeated stale provider feedback so reconciliation can advance", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-provider-tombstone-");
+    const jobs = new JobQueue(dbPath);
+    const feedback = {
+      feedbackKey: "review-agent:stale-provider-observation:697",
+      jobId: "job-that-was-pruned",
+      prUrl: "https://github.com/example/repo/pull/697",
+      verdict: "rejected",
+    };
+
+    try {
+      const first = store.recordPrFeedback(feedback);
+      expect(first).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: true,
+        reason: "PR feedback jobId does not identify a persisted job",
+      });
+      expect(first.deduped).toBeUndefined();
+      expect(store.recordPrFeedback(feedback)).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: true,
+        deduped: true,
+      });
+      expect(store.recordPrFeedback({ ...feedback, verdict: "approved_merged" })).toMatchObject({
+        ok: false,
+        reason: "feedbackKey identifies a different tombstoned provider observation",
+      });
+
+      const db = (store as unknown as { db: any }).db;
+      expect(
+        db
+          .prepare(
+            `SELECT reason, occurrence_count AS occurrenceCount
+             FROM autonomy_pr_feedback_tombstones
+             WHERE feedback_key = ?`,
+          )
+          .get(feedback.feedbackKey),
+      ).toMatchObject({
+        reason: "PR feedback jobId does not identify a persisted job",
+        occurrenceCount: 2,
+      });
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("ingests versioned nested validation evidence into reliability coverage", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-validation-evidence-v2-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const enqueued = jobs.enqueue({
+        taskId: "validation-evidence-v2",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+      });
+      const jobId = String(enqueued.jobId ?? "");
+      expect(jobs.claim("worker-validation-evidence-v2").job?.id).toBe(jobId);
+      expect(
+        jobs.fail(jobId, {
+          message: "Focused validation failed",
+          diagnostics: {
+            terminal: {
+              failureClass: "test_failure",
+              terminalStage: "focused_validation",
+              summary: "One focused test failed",
+            },
+            validationRuns: [
+              {
+                attempt: 1,
+                command: "bun test tests/router-shell.test.ts",
+                passed: false,
+                exitCode: 1,
+                failureClass: "test_failure",
+                metadata: {
+                  validation_evidence: {
+                    schema_version: 2,
+                    failure_fingerprint: "router-shell-acceptance-v2",
+                    failed_tests: ["route shell > restores navigation state"],
+                    affected_paths: ["tests/router-shell.test.ts"],
+                    failure_lines: ["expected navigation state to be restored"],
+                  },
+                },
+              },
+            ],
+          },
+        }).ok,
+      ).toBe(true);
+
+      expect(store.getReliabilityMetrics()).toMatchObject({
+        validationFailureRuns: 1,
+        validationEvidenceCoverageRate: 1,
+        validationFingerprintCollisionCount: 0,
+      });
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("records end-to-end objective latency when terminal feedback omits latency", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "dev",
+      runId: "run-end-to-end-latency",
+    }).snapshot_id;
+    const decision = store.recordObjectiveDecision({
+      runId: "run-end-to-end-latency",
+      snapshotId,
+      sessionId: "dev",
+      objective: {
+        id: "obj-end-to-end-latency",
+        title: "Measure full objective delivery latency",
+        instruction: "Carry the objective through worker and review delivery.",
+        objective_type: "small_refactor",
+        component_area: "apps/server",
+        trigger_type: "queue_health",
+        target_paths: ["apps/server/src/autonomy.ts"],
+        scope: { read_anywhere: false, write_globs: ["apps/server/src/autonomy.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun test tests/server.autonomy-store.test.ts"],
+        status: "dispatched",
+        request_id: "req-end-to-end-latency",
+      },
+    });
+    expect(decision.ok).toBe(true);
+
+    const db = (store as unknown as { db: any }).db;
+    const lifecycleStartedAt = new Date(Date.now() - 120_000).toISOString();
+    db.prepare(
+      `UPDATE autonomy_objectives
+       SET created_at = ?, dispatched_at = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(lifecycleStartedAt, lifecycleStartedAt, lifecycleStartedAt, "obj-end-to-end-latency");
+    expect(
+      store.recordOutcome({
+        objectiveId: "obj-end-to-end-latency",
+        requestId: "req-end-to-end-latency",
+        patternKey: decision.patternKey,
+        success: true,
+        userAction: "applied",
+        latencyMs: null,
+      }).ok,
+    ).toBe(true);
+
+    const outcome = db
+      .prepare(`SELECT latency_ms AS latencyMs FROM autonomy_outcomes WHERE objective_id = ?`)
+      .get("obj-end-to-end-latency") as { latencyMs: number };
+    expect(outcome.latencyMs).toBeGreaterThanOrEqual(119_000);
+    expect(runEvaluatorNow(store).avgLatencyMs).toBeGreaterThanOrEqual(119_000);
+  });
+
+  test("resolves a rearmed repair through the original autonomous objective lineage", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-repair-lineage-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const snapshotId = store.createSnapshot({
+        sessionId: "dev",
+        runId: "run-repair-lineage",
+      }).snapshot_id;
+      const decision = store.recordObjectiveDecision({
+        runId: "run-repair-lineage",
+        snapshotId,
+        sessionId: "dev",
+        objective: {
+          id: "obj-repair-lineage",
+          title: "Preserve repair lineage",
+          instruction: "Publish a focused repository repair.",
+          objective_type: "small_refactor",
+          component_area: "apps/server",
+          trigger_type: "queue_health",
+          target_paths: ["apps/server/src/jobs.ts"],
+          scope: { read_anywhere: false, write_globs: ["apps/server/src/jobs.ts"] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun test tests/server.jobs-repair-scheduling.test.ts"],
+          status: "dispatched",
+          request_id: "req-repair-lineage",
+        },
+      });
+      expect(decision.ok).toBe(true);
+
+      const root = jobs.enqueue({
+        taskId: "root-repair-lineage",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: {
+          origin: "autonomy",
+          requestId: "req-repair-lineage",
+          autonomy: {
+            origin: "autonomy",
+            objectiveId: "obj-repair-lineage",
+            patternKey: decision.patternKey,
+          },
+        },
+      });
+      store.linkJobToObjectiveByRequest("req-repair-lineage", String(root.jobId));
+      expect(jobs.claim("worker-repair-lineage").job?.id).toBe(root.jobId);
+      expect(jobs.complete(String(root.jobId), { summary: "candidate published" }).ok).toBe(true);
+
+      const repair = jobs.enqueue({
+        taskId: "review-fix-repair-lineage",
+        sessionId: "dev",
+        kind: "task.execute",
+        prUrl: "https://github.com/example/repo/pull/697",
+        dedupeKey: "review-fix:697:lineage",
+        params: {
+          instruction: "Address review feedback for the published candidate.",
+          reviewAgent: {
+            prNumber: 697,
+            prUrl: "https://github.com/example/repo/pull/697",
+            prHeadSha: "lineage-head-sha",
+            resolutionType: "review_fix",
+            sourceJobId: root.jobId,
+          },
+        },
+      });
+      expect(jobs.claim("worker-repair-lineage").job?.id).toBe(repair.jobId);
+      expect(
+        jobs.fail(String(repair.jobId), {
+          message: "Review repair needs a strategy change",
+          diagnostics: {
+            terminal: {
+              failureClass: "product_quality",
+              terminalStage: "critic",
+              summary: "The first repair did not satisfy the acceptance criteria",
+            },
+          },
+        }).ok,
+      ).toBe(true);
+
+      const recovery = jobs.getPendingJobs().find((job) => job.resumeOfJobId === repair.jobId);
+      const recoveryParams = JSON.parse(String(recovery?.params ?? "{}"));
+      expect(store.resolveJobOutcomeContext(String(recovery?.id ?? ""), recoveryParams)).toEqual({
+        objectiveId: "obj-repair-lineage",
+        requestId: "req-repair-lineage",
+        patternKey: decision.patternKey,
+      });
+
+      const genericRecovery = jobs.enqueue({
+        taskId: "generic-retry-repair-lineage",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: {
+          origin: "autonomy",
+          autonomy: { origin: "autonomy", patternKey: "child-attempt-pattern" },
+        },
+      });
+      const jobsDb = (jobs as unknown as { db: any }).db;
+      jobsDb
+        .prepare(`UPDATE jobs SET resumeOfJobId = ? WHERE id = ?`)
+        .run(root.jobId, genericRecovery.jobId);
+      const genericRecoveryParams = JSON.parse(
+        String(jobs.getJob(String(genericRecovery.jobId))?.params ?? "{}"),
+      );
+      expect(
+        store.resolveJobOutcomeContext(String(genericRecovery.jobId), genericRecoveryParams),
+      ).toEqual({
+        objectiveId: "obj-repair-lineage",
+        requestId: "req-repair-lineage",
+        patternKey: decision.patternKey,
       });
     } finally {
       jobs.close();

@@ -168,6 +168,59 @@ function objectiveTargetPathsOverlap(left: string, right: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
+function normalizeObjectiveClusterText(value: unknown): string {
+  return asString(value)
+    .toLowerCase()
+    .replace(/\b(?:[a-z]:)?[a-z0-9_.-]+(?:[\\/][a-z0-9_.()\[\]-]+)+(?:\.[a-z0-9]+)?\b/gi, "<path>")
+    .replace(/\b\d+(?:\.\d+)?\b/g, "<n>")
+    .replace(/[^a-z0-9<>]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function semanticObjectiveClusterKey(
+  record: Record<string, unknown>,
+  fallback: string,
+  portfolio: Record<string, unknown> = {},
+): string {
+  const evidence = asObject(record.evidence);
+  const evidencePortfolio = asObject(evidence.portfolio);
+  const visionObjectiveId = normalizeObjectiveClusterText(
+    record.visionObjectiveId ??
+      record.vision_objective_id ??
+      portfolio.vision_objective_id ??
+      evidencePortfolio.vision_objective_id,
+  );
+  const acceptanceCriteria = asStringArray(
+    record.acceptanceCriteria ??
+      record.acceptance_criteria ??
+      evidence.acceptanceCriteria ??
+      evidence.acceptance_criteria,
+  )
+    .map(normalizeObjectiveClusterText)
+    .filter(Boolean)
+    .sort();
+  const critic = asObject(evidence.critic ?? record.critic);
+  const criticFingerprint = normalizeObjectiveClusterText(
+    record.criticFingerprint ??
+      record.critic_fingerprint ??
+      evidence.criticFingerprint ??
+      evidence.critic_fingerprint ??
+      critic.fingerprint,
+  );
+  if (!visionObjectiveId && acceptanceCriteria.length === 0 && !criticFingerprint) {
+    return fallback;
+  }
+  return `cluster_${sha256Hex(
+    JSON.stringify({
+      visionObjectiveId,
+      acceptanceCriteria,
+      criticFingerprint,
+      objectiveType: asString(record.objectiveType ?? record.objective_type).toLowerCase(),
+    }),
+  )}`;
+}
+
 interface ObjectiveFailureSignalRow {
   trigger_type: string | null;
   failure_count: number | null;
@@ -570,11 +623,13 @@ export interface AutonomyOpsSummary {
 
 export type AutonomyAttemptOutcome =
   | "succeeded"
-  | "quality_rejected"
+  | "product_quality_failed"
   | "validation_blocked"
   | "environment_blocked"
-  | "no_change"
-  | "infrastructure_failed";
+  | "orchestration_failed"
+  | "publication_failed"
+  | "regression_detected"
+  | "no_change";
 
 export interface AutonomyReliabilityMetrics {
   windowHours: number;
@@ -1059,6 +1114,67 @@ function normalizedValidationEvidenceValues(values: string[], maxItems: number):
     .slice(0, maxItems);
 }
 
+function normalizeValidationEvidenceMetadata(
+  metadata: Record<string, unknown>,
+): Record<string, unknown> {
+  const nested = asObject(
+    metadata.validationEvidence ?? metadata.validation_evidence ?? metadata.evidence,
+  );
+  const values = (...candidates: unknown[]): string[] =>
+    candidates.flatMap((candidate) => asStringArray(candidate));
+  return {
+    ...metadata,
+    ...nested,
+    schemaVersion: Math.max(
+      1,
+      Math.floor(
+        asNumber(
+          nested.schemaVersion ??
+            nested.schema_version ??
+            metadata.schemaVersion ??
+            metadata.schema_version,
+          1,
+        ),
+      ),
+    ),
+    failedTests: values(
+      nested.failedTests,
+      nested.failed_tests,
+      nested.testNames,
+      nested.test_names,
+      metadata.failedTests,
+      metadata.failed_tests,
+    ),
+    targetPathHints: values(
+      nested.targetPathHints,
+      nested.target_path_hints,
+      nested.affectedPaths,
+      nested.affected_paths,
+      metadata.targetPathHints,
+      metadata.target_path_hints,
+    ),
+    failureLines: values(
+      nested.failureLines,
+      nested.failure_lines,
+      nested.diagnostics,
+      metadata.failureLines,
+      metadata.failure_lines,
+    ),
+    failureFingerprint:
+      asString(
+        nested.failureFingerprint ??
+          nested.failure_fingerprint ??
+          nested.fingerprint ??
+          metadata.failureFingerprint ??
+          metadata.failure_fingerprint,
+      ) || undefined,
+    retryReason:
+      asString(
+        nested.retryReason ?? nested.retry_reason ?? metadata.retryReason ?? metadata.retry_reason,
+      ) || undefined,
+  };
+}
+
 function canonicalValidationFailureEvidence(params: {
   command: string;
   failureClass: string | null;
@@ -1071,26 +1187,24 @@ function canonicalValidationFailureEvidence(params: {
   targetPathHints: string[];
   failureLines: string[];
 } {
+  const metadata = normalizeValidationEvidenceMetadata(params.metadata);
   const output = `${asString(params.stderrTail)}\n${asString(params.stdoutTail)}`;
   const derived = extractTrustedValidationFailureEvidence({
     command: params.command,
-    phase:
-      asString(params.metadata.phase) === "dependency_install"
-        ? "dependency_install"
-        : "validation",
+    phase: asString(metadata.phase) === "dependency_install" ? "dependency_install" : "validation",
     output,
     exitCode: 1,
   });
   const failedTests = normalizedValidationEvidenceValues(
-    [...asStringArray(params.metadata.failedTests), ...derived.failedTests],
+    [...asStringArray(metadata.failedTests), ...derived.failedTests],
     20,
   );
   const targetPathHints = normalizedValidationEvidenceValues(
-    [...asStringArray(params.metadata.targetPathHints), ...derived.targetPathHints],
+    [...asStringArray(metadata.targetPathHints), ...derived.targetPathHints],
     20,
   );
   let failureLines = normalizedValidationEvidenceValues(
-    [...asStringArray(params.metadata.failureLines), ...derived.failureLines],
+    [...asStringArray(metadata.failureLines), ...derived.failureLines],
     20,
   );
   if (failureLines.length === 0) {
@@ -1181,12 +1295,16 @@ function classifyAutonomyAttemptOutcome(input: {
   ) {
     return "no_change";
   }
+  if (status === "completed") return "succeeded";
+  if (/\bregression(?:_detected| detected| failure)?\b|reopened[_ -]?within/.test(text)) {
+    return "regression_detected";
+  }
   if (
-    /critic[_ -]?(?:rejected|failed)|quality[_ -]?(?:rejected|revision[_ -]?exhausted)|deterministic_quality[_ -]?failed/.test(
+    /critic[_ -]?rejected|quality[_ -]?(?:rejected|failed|revision[_ -]?exhausted)|revision[_ -]?budget[_ -]?exhausted|deterministic[_ -]?quality[_ -]?failed/.test(
       text,
     )
   ) {
-    return "quality_rejected";
+    return "product_quality_failed";
   }
   if (
     /^(?:environment|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(
@@ -1198,16 +1316,20 @@ function classifyAutonomyAttemptOutcome(input: {
   ) {
     return "environment_blocked";
   }
-  if (status === "completed") return "succeeded";
   if (
-    status === "publish_blocked" ||
-    /trusted[_ -]?validation|validation[_ -]?blocked|test[_ -]?failure|lint[_ -]?failure|typecheck[_ -]?failure/.test(
+    /trusted[_ -]?validation|validation[_ -]?(?:blocked|failed)|test[_ -]?failure|lint[_ -]?failure|typecheck[_ -]?failure/.test(
       text,
     )
   ) {
     return "validation_blocked";
   }
-  return "infrastructure_failed";
+  if (
+    status === "publish_blocked" ||
+    /publication|publish[_ -]?(?:blocked|failed)|push[_ -]?failed|merge[_ -]?failed/.test(text)
+  ) {
+    return "publication_failed";
+  }
+  return "orchestration_failed";
 }
 
 function percentileValue(values: number[], percentile: number): number | null {
@@ -1970,6 +2092,16 @@ export class AutonomyStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_key
         ON autonomy_pr_feedback(feedback_key)
         WHERE feedback_key IS NOT NULL AND feedback_key <> '';
+      CREATE TABLE IF NOT EXISTS autonomy_pr_feedback_tombstones (
+        feedback_key TEXT PRIMARY KEY,
+        reason TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        occurrence_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_tombstones_last_seen
+        ON autonomy_pr_feedback_tombstones(last_seen_at DESC);
       CREATE TABLE IF NOT EXISTS pr_provider_outcomes (
         normalizedPrUrl TEXT PRIMARY KEY,
         prUrl           TEXT NOT NULL,
@@ -2135,9 +2267,9 @@ export class AutonomyStore {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
         throw new TypeError(`Unsafe migration table name: ${table}`);
       }
-      return (
-        this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-      ).some((entry) => entry.name === column);
+      return (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
+        (entry) => entry.name === column,
+      );
     };
     const ensureColumn = (table: string, columnSql: string): void => {
       const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:\s|$)/.exec(columnSql.trim());
@@ -2172,10 +2304,7 @@ export class AutonomyStore {
     ensureColumn("autonomy_outcomes", "terminal INTEGER NOT NULL DEFAULT 1");
     ensureColumn("autonomy_pr_feedback", "pr_url_normalized TEXT");
     ensureColumn("pr_provider_outcomes", "providerStateAt TEXT");
-    ensureColumn(
-      "autonomy_repository_agent_memory_feedback",
-      "weight REAL NOT NULL DEFAULT 1",
-    );
+    ensureColumn("autonomy_repository_agent_memory_feedback", "weight REAL NOT NULL DEFAULT 1");
     ensureColumn("autonomy_repository_agent_memory_feedback", "claim_token TEXT");
     ensureColumn(
       "autonomy_repository_agent_memory_feedback",
@@ -2526,10 +2655,13 @@ export class AutonomyStore {
     return { applied: result.ok && result.state.isFrozen, state: result.state };
   }
 
-  private safetyBlockReason(nowIso = asIsoNow()): string | null {
+  private safetyBlockReason(
+    nowIso = asIsoNow(),
+    options: { allowFrozenRecovery?: boolean } = {},
+  ): string | null {
     const state = this.getSafetyState(nowIso);
     if (state.killSwitchEnabled) return "autonomy kill switch enabled";
-    if (state.isFrozen) {
+    if (state.isFrozen && !options.allowFrozenRecovery) {
       return `autonomy frozen until ${state.freezeUntil}`;
     }
     return null;
@@ -2786,11 +2918,25 @@ export class AutonomyStore {
       }>;
       const fingerprintCounts = new Map<string, number>();
       for (const row of repeatedRows) {
-        const targets = normalizedAutonomyFailureTargets(parseJsonObject(row.params));
-        if (targets.length === 0) continue;
+        const jobParams = parseJsonObject(row.params);
+        const autonomy = asObject(jobParams.autonomy);
+        const semanticCluster = semanticObjectiveClusterKey(
+          {
+            ...jobParams,
+            ...autonomy,
+            evidence: autonomy.evidence ?? jobParams.evidence,
+          },
+          "",
+        );
+        const persistedCluster = asString(autonomy.patternKey ?? autonomy.pattern_key);
+        const objectiveCluster =
+          semanticCluster || (persistedCluster.startsWith("cluster_") ? persistedCluster : "");
+        const targets = normalizedAutonomyFailureTargets(jobParams);
+        if (!objectiveCluster && targets.length === 0) continue;
         const fingerprint = sha256Hex(
           JSON.stringify({
-            targets,
+            objectiveCluster: objectiveCluster || null,
+            targets: objectiveCluster ? [] : targets,
             failureClass: asString(row.failure_class).toLowerCase() || "unknown",
             command: asString(row.failed_command).replace(/\s+/g, " ").toLowerCase(),
             failedTests: failedTestNamesFromOutput(row.stdout_tail, row.stderr_tail, row.summary),
@@ -2822,6 +2968,7 @@ export class AutonomyStore {
     resolvedCount: number;
     mergedCount: number;
     closedUnmergedCount: number;
+    reviewedObjectiveCount: number;
     revisionObjectiveCount: number;
     revisionRate: number | null;
   } {
@@ -2860,31 +3007,24 @@ export class AutonomyStore {
             }
           | undefined)
       : undefined;
-    const revisions = this.hasTable("jobs")
-      ? (this.db
-          .prepare(
-            `WITH resolved AS (
-               SELECT DISTINCT outcome.objective_id
-               FROM autonomy_outcomes outcome
-               JOIN jobs job ON job.id = outcome.job_id
-               WHERE outcome.terminal = 1
-                 AND outcome.objective_id IS NOT NULL
-                 AND COALESCE(job.prUrl, '') != ''
-                 AND datetime(outcome.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')
-             )
-             SELECT COUNT(DISTINCT feedback.objective_id) AS revision_objective_count
-             FROM autonomy_pr_feedback feedback
-             JOIN resolved ON resolved.objective_id = feedback.objective_id
-             WHERE (
-               LOWER(COALESCE(feedback.verdict, '')) LIKE '%reject%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%unmergeable%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%merge_conflict%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%changes_requested%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%revision%'
-             )`,
-          )
-          .get(nowIso) as { revision_objective_count: number | null } | undefined)
-      : undefined;
+    const reviews = this.db
+      .prepare(
+        `SELECT COUNT(DISTINCT feedback.objective_id) AS reviewed_objective_count,
+                COUNT(DISTINCT CASE WHEN (
+                  LOWER(COALESCE(feedback.verdict, '')) LIKE '%reject%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%unmergeable%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%merge_conflict%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%changes_requested%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%revision%'
+                ) THEN feedback.objective_id END) AS revision_objective_count
+         FROM autonomy_pr_feedback feedback
+         JOIN autonomy_objectives objective ON objective.id = feedback.objective_id
+         WHERE objective.source = 'autonomous'
+           AND datetime(feedback.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`,
+      )
+      .get(nowIso) as
+      | { reviewed_objective_count: number | null; revision_objective_count: number | null }
+      | undefined;
     const awaitingReviewCount = Math.max(0, Math.floor(asNumber(backlog?.awaiting_count, 0)));
     const oldestAwaitingAtMs = Date.parse(asString(backlog?.oldest_awaiting_at));
     const nowMs = Date.parse(nowIso);
@@ -2898,9 +3038,13 @@ export class AutonomyStore {
       0,
       Math.floor(asNumber(resolved?.closed_unmerged_count, 0)),
     );
+    const reviewedObjectiveCount = Math.max(
+      0,
+      Math.floor(asNumber(reviews?.reviewed_objective_count, 0)),
+    );
     const revisionObjectiveCount = Math.max(
       0,
-      Math.floor(asNumber(revisions?.revision_objective_count, 0)),
+      Math.floor(asNumber(reviews?.revision_objective_count, 0)),
     );
     return {
       awaitingReviewCount,
@@ -2909,8 +3053,12 @@ export class AutonomyStore {
       resolvedCount,
       mergedCount,
       closedUnmergedCount,
+      reviewedObjectiveCount,
       revisionObjectiveCount,
-      revisionRate: resolvedCount > 0 ? clamp01(revisionObjectiveCount / resolvedCount) : null,
+      revisionRate:
+        reviewedObjectiveCount > 0
+          ? clamp01(revisionObjectiveCount / reviewedObjectiveCount)
+          : null,
     };
   }
 
@@ -3062,11 +3210,11 @@ export class AutonomyStore {
     const reviewBacklogSeverelyStalled =
       reviewHealth.awaitingReviewCount >= 5 &&
       reviewHealth.oldestAwaitingReviewAgeMs >= 24 * 60 * 60 * 1_000;
-    const hasReviewEvidence = reviewHealth.resolvedCount >= minSamples;
+    const hasReviewEvidence = reviewHealth.reviewedObjectiveCount >= minSamples;
     const reliability = this.getReliabilityMetrics(windowHours, nowIso);
     const infrastructureFailureRate =
       reliability.attemptsTotal > 0
-        ? (reliability.outcomeCounts.infrastructure_failed +
+        ? (reliability.outcomeCounts.orchestration_failed +
             reliability.outcomeCounts.environment_blocked) /
           reliability.attemptsTotal
         : null;
@@ -3077,17 +3225,17 @@ export class AutonomyStore {
     let recommendation: "healthy" | "constrain" | "pause" = "healthy";
     if (resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted) {
       recommendation = "pause";
-    } else if (reviewBacklogSeverelyStalled) {
+    } else if (
+      reviewBacklogSeverelyStalled &&
+      (hasOutcomeEvidence || hasReviewEvidence || reviewHealth.awaitingReviewCount >= minSamples)
+    ) {
       recommendation = "pause";
-    } else if (!hasOutcomeEvidence && !hasJobEvidence) {
+    } else if (!hasOutcomeEvidence) {
       recommendation = "constrain";
     } else if (
       (hasOutcomeEvidence &&
         ((typeof successRate === "number" && successRate < minSuccessRate) ||
           (typeof regretRate === "number" && regretRate > maxRegretRate))) ||
-      (hasJobEvidence &&
-        ((typeof infrastructureFailureRate === "number" && infrastructureFailureRate >= 0.3) ||
-          (typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.3))) ||
       (hasReviewEvidence &&
         typeof reviewHealth.revisionRate === "number" &&
         reviewHealth.revisionRate >= Math.max(0.5, maxRegretRate))
@@ -3127,6 +3275,7 @@ export class AutonomyStore {
         reviewBacklogStalled,
         reviewBacklogSeverelyStalled,
         reviewResolvedCount: reviewHealth.resolvedCount,
+        reviewObservedCount: reviewHealth.reviewedObjectiveCount,
         reviewRevisionRate: reviewHealth.revisionRate,
         outcomeCounts: reliability.outcomeCounts,
         infrastructureFailureRate,
@@ -3167,6 +3316,7 @@ export class AutonomyStore {
       awaitingReviewCount: reviewHealth.awaitingReviewCount,
       oldestAwaitingReviewAgeMs: reviewHealth.oldestAwaitingReviewAgeMs,
       reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewObservedCount: reviewHealth.reviewedObjectiveCount,
       reviewMergedCount: reviewHealth.mergedCount,
       reviewClosedUnmergedCount: reviewHealth.closedUnmergedCount,
       reviewRevisionObjectiveCount: reviewHealth.revisionObjectiveCount,
@@ -3201,7 +3351,6 @@ export class AutonomyStore {
     if (
       recommendation === "pause" &&
       (hasOutcomeEvidence ||
-        hasJobEvidence ||
         reviewBacklogSeverelyStalled ||
         hasReviewEvidence ||
         resourceBudget.token_budget_exhausted ||
@@ -3436,11 +3585,13 @@ export class AutonomyStore {
     }
     const outcomeCounts: Record<AutonomyAttemptOutcome, number> = {
       succeeded: 0,
-      quality_rejected: 0,
+      product_quality_failed: 0,
       validation_blocked: 0,
       environment_blocked: 0,
+      orchestration_failed: 0,
+      publication_failed: 0,
+      regression_detected: 0,
       no_change: 0,
-      infrastructure_failed: 0,
     };
     const durations: number[] = [];
     for (const row of attemptRows) {
@@ -3515,6 +3666,10 @@ export class AutonomyStore {
       0,
       Math.floor(asNumber(objectiveRow?.revisedTerminalObjectiveCount, 0)),
     );
+    const reviewObservedObjectiveCount = Math.max(
+      0,
+      objectiveTerminalCount + nonTerminalRevisionObjectiveCount - revisedTerminalObjectiveCount,
+    );
 
     let validationRows: Array<{
       jobId: string;
@@ -3522,12 +3677,15 @@ export class AutonomyStore {
       attempt: number | null;
       passed: number | null;
       failureClass: string | null;
+      stdoutTail: string | null;
+      stderrTail: string | null;
       metadataJson: string | null;
     }> = [];
     if (this.hasTable("job_validation_runs") && this.hasTable("jobs")) {
       validationRows = this.db
         .prepare(
-          `SELECT v.jobId, v.command, v.attempt, v.passed, v.failureClass, v.metadataJson
+          `SELECT v.jobId, v.command, v.attempt, v.passed, v.failureClass,
+                  v.stdoutTail, v.stderrTail, v.metadataJson
           FROM job_validation_runs v
           JOIN jobs j ON j.id = v.jobId
           WHERE datetime(v.createdAt) >= datetime(?, '-${hours} hours')
@@ -3546,19 +3704,17 @@ export class AutonomyStore {
     const transientRetryKeys = new Set<string>();
     const signaturesByFingerprint = new Map<string, Set<string>>();
     for (const row of validationRows) {
-      const metadata = parseJsonObject(row.metadataJson);
-      const failedTests = normalizedValidationEvidenceValues(
-        asStringArray(metadata.failedTests),
-        20,
-      );
-      const targetPathHints = normalizedValidationEvidenceValues(
-        asStringArray(metadata.targetPathHints),
-        20,
-      );
-      const failureLines = normalizedValidationEvidenceValues(
-        asStringArray(metadata.failureLines),
-        20,
-      );
+      const metadata = normalizeValidationEvidenceMetadata(parseJsonObject(row.metadataJson));
+      const canonical = canonicalValidationFailureEvidence({
+        command: asString(row.command),
+        failureClass: row.failureClass,
+        stdoutTail: row.stdoutTail,
+        stderrTail: row.stderrTail,
+        metadata,
+      });
+      const failedTests = canonical.failedTests;
+      const targetPathHints = canonical.targetPathHints;
+      const failureLines = canonical.failureLines;
       const attempt = Math.max(0, Math.floor(asNumber(row.attempt ?? metadata.attempt, 0)));
       if (
         attempt >= 2 &&
@@ -3570,7 +3726,7 @@ export class AutonomyStore {
       if (failedTests.length > 0 || targetPathHints.length > 0 || failureLines.length > 0) {
         validationEvidenceCovered += 1;
       }
-      const fingerprint = asString(metadata.failureFingerprint);
+      const fingerprint = asString(metadata.failureFingerprint) || canonical.fingerprint;
       if (!fingerprint) continue;
       const structuredEvidenceAvailable = failedTests.length > 0 || targetPathHints.length > 0;
       const signature = JSON.stringify({
@@ -3625,11 +3781,13 @@ export class AutonomyStore {
       nonTerminalRevisionObjectiveCount,
       revisedTerminalObjectiveCount,
       objectiveRevisionRate:
-        objectiveTerminalCount > 0 ? revisedTerminalObjectiveCount / objectiveTerminalCount : null,
+        reviewObservedObjectiveCount > 0
+          ? nonTerminalRevisionObjectiveCount / reviewObservedObjectiveCount
+          : null,
       objectiveFirstPassRate:
-        objectiveTerminalCount > 0
-          ? Math.max(0, objectiveTerminalCount - revisedTerminalObjectiveCount) /
-            objectiveTerminalCount
+        reviewObservedObjectiveCount > 0
+          ? Math.max(0, reviewObservedObjectiveCount - nonTerminalRevisionObjectiveCount) /
+            reviewObservedObjectiveCount
           : null,
       durationMs: {
         average:
@@ -5541,7 +5699,7 @@ export class AutonomyStore {
           })
         : null;
       const deterministicRepairFailure =
-        attemptOutcome === "quality_rejected" ||
+        attemptOutcome === "product_quality_failed" ||
         attemptOutcome === "validation_blocked" ||
         attemptOutcome === "no_change";
       const validationCommand = asString(row.job_validation_command);
@@ -5729,7 +5887,11 @@ export class AutonomyStore {
     return null;
   }
 
-  private preflightReason(snapshotId: string, runId?: string): string | null {
+  private preflightReason(
+    snapshotId: string,
+    runId?: string,
+    options: { allowFrozenRecovery?: boolean } = {},
+  ): string | null {
     if (this.isDispatchLockHeldByAnotherRun(runId)) {
       return "repo preflight blocked: dispatch lock held";
     }
@@ -5754,7 +5916,7 @@ export class AutonomyStore {
       return "autonomy kill switch enabled";
     }
     const isFrozen = asBoolean(safety.is_frozen, false);
-    if (isFrozen) {
+    if (isFrozen && !options.allowFrozenRecovery) {
       const freezeUntil = asString(safety.freeze_until);
       return freezeUntil ? `autonomy frozen until ${freezeUntil}` : "autonomy frozen";
     }
@@ -5849,8 +6011,6 @@ export class AutonomyStore {
       body.applySequentialAccounting ?? body.apply_sequential_accounting,
       true,
     );
-    const preflightErr = this.preflightReason(snapshotId, runId);
-    const safetyErr = this.safetyBlockReason(now);
     const resourceBudgetErr = this.resourceBudgetBlockReason(now);
     const requiredValidationRepairAuthorized =
       this.snapshotAuthorizesRequiredValidationRepair(snapshotId);
@@ -5890,7 +6050,10 @@ export class AutonomyStore {
           reason: `invalid objective_type "${objectiveTypeRaw}"`,
         };
       }
-      const patternKey = asString(record.patternKey ?? record.pattern_key);
+      const patternKey = semanticObjectiveClusterKey(
+        record,
+        asString(record.patternKey ?? record.pattern_key),
+      );
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp01(asNumber(record.confidence, 0));
       const targetPaths = asStringArray(record.targetPaths ?? record.target_paths)
@@ -5899,6 +6062,18 @@ export class AutonomyStore {
       const requiredValidationRepair =
         requiredValidationRepairAuthorized &&
         asBoolean(record.requiredValidationRepair ?? record.required_validation_repair, false);
+      const workClass = asString(record.workClass ?? record.work_class).toLowerCase();
+      const lifecycleRecovery =
+        requiredValidationRepair ||
+        workClass === "recovery" ||
+        workClass === "repair" ||
+        asBoolean(record.lifecycleRecovery ?? record.lifecycle_recovery, false);
+      const preflightErr = this.preflightReason(snapshotId, runId, {
+        allowFrozenRecovery: lifecycleRecovery,
+      });
+      const safetyErr = this.safetyBlockReason(now, {
+        allowFrozenRecovery: lifecycleRecovery,
+      });
       const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
       if (pushpalsInternalErr) {
         return {
@@ -5970,7 +6145,7 @@ export class AutonomyStore {
       if (resourceBudgetErr) {
         return { candidate_id: candidateId, ok: false, reason: resourceBudgetErr };
       }
-      if (patternKey && activePatternKeys.has(patternKey)) {
+      if (!requiredValidationRepair && patternKey && activePatternKeys.has(patternKey)) {
         return {
           candidate_id: candidateId,
           ok: false,
@@ -6165,11 +6340,15 @@ export class AutonomyStore {
           asString(record.estimatedEffort ?? record.estimated_effort),
           JSON.stringify(asStringArray(record.whyNowSignalIds ?? record.why_now_signal_ids)),
           clamp01(asNumber(record.confidence, 0)),
-          makePatternKey(
-            objectiveTypePersist,
-            scopeValidation.normalizedTargetPaths,
-            triggerTypePersist,
-            componentAreaPersist,
+          semanticObjectiveClusterKey(
+            record,
+            makePatternKey(
+              objectiveTypePersist,
+              scopeValidation.normalizedTargetPaths,
+              triggerTypePersist,
+              componentAreaPersist,
+            ),
+            portfolioMeta,
           ),
           llmScore,
           impactSignal,
@@ -6284,16 +6463,23 @@ export class AutonomyStore {
     const objectiveCandidateId = objectiveCandidateRaw
       ? scopedCandidateStorageId(runId, objectiveCandidateRaw)
       : null;
-    const patternKey = makePatternKey(
-      objectiveType,
-      scopeValidation.normalizedTargetPaths,
-      triggerType,
-      normalizedComponentArea,
+    const portfolioMeta =
+      (objectiveCandidateId ? candidatePortfolioMetaById.get(objectiveCandidateId) : undefined) ??
+      {};
+    const patternKey = semanticObjectiveClusterKey(
+      objective,
+      makePatternKey(
+        objectiveType,
+        scopeValidation.normalizedTargetPaths,
+        triggerType,
+        normalizedComponentArea,
+      ),
+      portfolioMeta,
     );
     const objectiveEvidence: Record<string, unknown> = {
       ...asObject(objective.evidence),
       ...(objectiveCandidateId && candidatePortfolioMetaById.has(objectiveCandidateId)
-        ? { portfolio: candidatePortfolioMetaById.get(objectiveCandidateId) }
+        ? { portfolio: portfolioMeta }
         : {}),
     };
     const validationIncidentEvidence = asObject(
@@ -6367,6 +6553,9 @@ export class AutonomyStore {
             target_paths: scopeValidation.normalizedTargetPaths,
             confidence: clamp01(asNumber(objective.confidence, 0)),
             required_validation_repair: requiredValidationRepair,
+            work_class: objective.workClass ?? objective.work_class,
+            lifecycle_recovery:
+              objective.lifecycleRecovery ?? objective.lifecycle_recovery ?? false,
           },
         ],
       });
@@ -6489,7 +6678,9 @@ export class AutonomyStore {
             repositoryAgentRequestId,
           );
           const repositoryId = asString(authoritative.repositoryId).slice(0, 512);
-          const memoryRefs = asRepositoryAgentMemoryRefs(result.memoryRefs).filter((ref) => ref.key);
+          const memoryRefs = asRepositoryAgentMemoryRefs(result.memoryRefs).filter(
+            (ref) => ref.key,
+          );
           if (
             repositoryId &&
             request.caller.service === "remotebuddy" &&
@@ -6817,10 +7008,19 @@ export class AutonomyStore {
     const readJobById = (id: string) => readContextFromJobRow("id = ?", [id]);
     const readJobByPrUrl = (url: string) =>
       readContextFromJobRow("prUrl = ? OR LOWER(prUrl) = LOWER(?)", [url, url]);
+    const resolvedJobLineage = jobId ? this.resolveJobOutcomeContext(jobId, {}) : null;
 
     const row =
       (objectiveId ? readByObjective(objectiveId) : undefined) ??
       (jobId ? readByJob(jobId) : undefined) ??
+      (resolvedJobLineage
+        ? {
+            objectiveId: resolvedJobLineage.objectiveId,
+            requestId: resolvedJobLineage.requestId,
+            jobId,
+            patternKey: resolvedJobLineage.patternKey,
+          }
+        : undefined) ??
       (requestId ? readByRequest(requestId) : undefined) ??
       (prUrl ? readByPrUrl(prUrl) : undefined) ??
       (jobId ? readJobById(jobId) : undefined) ??
@@ -6858,13 +7058,63 @@ export class AutonomyStore {
     const normalizedFeedbackPrUrl = normalizePrUrl(prUrl);
     const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
     const hasJobsTable = this.hasTable("jobs");
+    const tombstonePayloadHash = feedbackKey
+      ? sha256Hex(
+          JSON.stringify({
+            verdict,
+            objectiveId: objectiveIdRaw,
+            requestId: requestIdRaw,
+            jobId: jobIdRaw,
+            prUrl: normalizedFeedbackPrUrl,
+          }),
+        )
+      : null;
+    const acknowledgePermanentIgnore = (reason: string, deduped = false) => {
+      if (feedbackKey && tombstonePayloadHash) {
+        this.db
+          .prepare(
+            `INSERT INTO autonomy_pr_feedback_tombstones (
+               feedback_key, reason, payload_hash, occurrence_count, first_seen_at, last_seen_at
+             ) VALUES (?, ?, ?, 1, ?, ?)
+             ON CONFLICT(feedback_key) DO UPDATE SET
+               occurrence_count = autonomy_pr_feedback_tombstones.occurrence_count + 1,
+               last_seen_at = excluded.last_seen_at`,
+          )
+          .run(feedbackKey, reason, tombstonePayloadHash, now, now);
+      }
+      return {
+        ok: true as const,
+        ignored: true as const,
+        acknowledged: true as const,
+        ...(deduped ? { deduped: true as const } : {}),
+        reason,
+      };
+    };
+
+    if (feedbackKey) {
+      const tombstone = this.db
+        .prepare(
+          `SELECT reason, payload_hash AS payloadHash
+           FROM autonomy_pr_feedback_tombstones
+           WHERE feedback_key = ?
+           LIMIT 1`,
+        )
+        .get(feedbackKey) as { reason: string; payloadHash: string | null } | undefined;
+      if (tombstone) {
+        if (asString(tombstone.payloadHash) !== tombstonePayloadHash) {
+          return {
+            ok: false,
+            reason: "feedbackKey identifies a different tombstoned provider observation",
+          };
+        }
+        return acknowledgePermanentIgnore(asString(tombstone.reason), true);
+      }
+    }
 
     if (mappedOutcome?.terminal && hasJobsTable && (!jobIdRaw || !normalizedFeedbackPrUrl)) {
-      return {
-        ok: true,
-        ignored: true,
-        reason: "terminal PR feedback requires matching jobId and prUrl authority",
-      };
+      return acknowledgePermanentIgnore(
+        "terminal PR feedback requires matching jobId and prUrl authority",
+      );
     }
 
     let persistedJobPrUrl: string | null = null;
@@ -6873,26 +7123,18 @@ export class AutonomyStore {
         .prepare(`SELECT prUrl FROM jobs WHERE id = ? LIMIT 1`)
         .get(jobIdRaw) as { prUrl: string | null } | undefined;
       if (!providerJob) {
-        return {
-          ok: true,
-          ignored: true,
-          reason: "PR feedback jobId does not identify a persisted job",
-        };
+        return acknowledgePermanentIgnore("PR feedback jobId does not identify a persisted job");
       }
       persistedJobPrUrl = normalizePrUrl(providerJob.prUrl);
       if (persistedJobPrUrl && persistedJobPrUrl !== normalizedFeedbackPrUrl) {
-        return {
-          ok: true,
-          ignored: true,
-          reason: "PR feedback URL does not match the persisted job PR URL",
-        };
+        return acknowledgePermanentIgnore(
+          "PR feedback URL does not match the persisted job PR URL",
+        );
       }
       if (mappedOutcome?.terminal && !persistedJobPrUrl) {
-        return {
-          ok: true,
-          ignored: true,
-          reason: "terminal PR feedback requires a persisted job-to-PR link",
-        };
+        return acknowledgePermanentIgnore(
+          "terminal PR feedback requires a persisted job-to-PR link",
+        );
       }
       if (mappedOutcome?.terminal && !mappedOutcome.success) {
         const latestJob = this.db
@@ -6905,12 +7147,9 @@ export class AutonomyStore {
           )
           .get(normalizedFeedbackPrUrl) as { id: string } | undefined;
         if (!latestJob || latestJob.id !== jobIdRaw) {
-          return {
-            ok: true,
-            ignored: true,
-            acknowledged: true,
-            reason: "closed PR feedback belongs to an older job generation",
-          };
+          return acknowledgePermanentIgnore(
+            "closed PR feedback belongs to an older job generation",
+          );
         }
       }
     }
@@ -6931,11 +7170,9 @@ export class AutonomyStore {
       (requestIdRaw && resolvedFromJob?.requestId && requestIdRaw !== resolvedFromJob.requestId) ||
       (patternKey && resolvedFromJob?.patternKey && patternKey !== resolvedFromJob.patternKey);
     if (identityMismatch) {
-      return {
-        ok: true,
-        ignored: true,
-        reason: "PR feedback identifiers do not match the persisted job context",
-      };
+      return acknowledgePermanentIgnore(
+        "PR feedback identifiers do not match the persisted job context",
+      );
     }
     if (!patternKey) {
       patternKey = asString(resolved?.patternKey) || null;
@@ -7035,18 +7272,11 @@ export class AutonomyStore {
     if (!patternKey) {
       if (mappedOutcome?.terminal && persistedJobPrUrl) {
         persistProviderOutcome(jobIdRaw);
-        return {
-          ok: true,
-          ignored: true,
-          acknowledged: true,
-          reason: "provider outcome recorded for a non-autonomy job",
-        };
+        return acknowledgePermanentIgnore("provider outcome recorded for a non-autonomy job");
       }
-      return {
-        ok: true,
-        ignored: true,
-        reason: "unable to resolve patternKey from objectiveId/requestId/jobId/prUrl",
-      };
+      return acknowledgePermanentIgnore(
+        "unable to resolve patternKey from objectiveId/requestId/jobId/prUrl",
+      );
     }
 
     const objectiveId = objectiveIdRaw ?? resolved?.objectiveId ?? null;
@@ -7323,9 +7553,46 @@ export class AutonomyStore {
     const now = asIsoNow();
     const success = asBoolean(body.success, false);
     const retries = Math.max(0, Math.floor(asNumber(body.retries, 0)));
-    const latencyMs = Number.isFinite(asNumber(body.latencyMs ?? body.latency_ms, Number.NaN))
+    const reportedLatencyMs = Number.isFinite(
+      asNumber(body.latencyMs ?? body.latency_ms, Number.NaN),
+    )
       ? Math.max(0, Math.floor(asNumber(body.latencyMs ?? body.latency_ms, 0)))
       : null;
+    const lifecycleStart = objectiveId
+      ? (this.db
+          .prepare(
+            `SELECT created_at AS createdAt, dispatched_at AS dispatchedAt
+             FROM autonomy_objectives
+             WHERE id = ?
+             LIMIT 1`,
+          )
+          .get(objectiveId) as
+          | { createdAt: string | null; dispatchedAt: string | null }
+          | undefined)
+      : undefined;
+    const jobStart =
+      jobId && this.hasTable("jobs")
+        ? (this.db
+            .prepare(`SELECT enqueuedAt, createdAt FROM jobs WHERE id = ? LIMIT 1`)
+            .get(jobId) as { enqueuedAt: string | null; createdAt: string | null } | undefined)
+        : undefined;
+    const startCandidates = [
+      lifecycleStart?.createdAt,
+      lifecycleStart?.dispatchedAt,
+      jobStart?.enqueuedAt,
+      jobStart?.createdAt,
+    ]
+      .map((value) => Date.parse(asString(value)))
+      .filter((value) => Number.isFinite(value));
+    const nowMs = Date.parse(now);
+    const endToEndLatencyMs =
+      startCandidates.length > 0 && Number.isFinite(nowMs)
+        ? Math.max(0, Math.floor(nowMs - Math.min(...startCandidates)))
+        : null;
+    const latencyMs =
+      reportedLatencyMs != null && endToEndLatencyMs != null
+        ? Math.max(reportedLatencyMs, endToEndLatencyMs)
+        : (reportedLatencyMs ?? endToEndLatencyMs);
     const userAction = asString(body.userAction ?? body.user_action) || null;
     const reopenedWithin24h = asBoolean(body.reopenedWithin24h ?? body.reopened_within_24h, false);
     const regressionFlag = asBoolean(body.regressionFlag ?? body.regression_flag, false);
@@ -7725,31 +7992,24 @@ export class AutonomyStore {
       Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeFailStreakThreshold, 3)),
     );
     if (!success && nextFailStreak >= autoFreezeThreshold) {
-      const freezeForMs = Math.max(
-        60_000,
-        Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeDurationMs, 1_800_000)),
-      );
-      const freezeResult = this.applyAutomaticFreeze({
-        freezeForMs,
-        freezeReason: `auto_freeze:fail_streak:${patternKey}`,
+      // Repeated attempts in one objective/failure lane are not independent
+      // evidence for a repository-wide stop. The pattern cooldown is the lane
+      // circuit; only the evaluator may freeze globally after enough distinct
+      // root objectives have terminal evidence.
+      this.recordOpsAlert({
+        alertType: `autonomy_lane_constrained:${patternKey}`,
+        severity: "warning",
+        message:
+          `Autonomy lane constrained after fail streak ${nextFailStreak} ` +
+          `for ${patternKey} (threshold ${autoFreezeThreshold})`,
+        details: {
+          patternKey,
+          failStreak: nextFailStreak,
+          threshold: autoFreezeThreshold,
+          cooldownUntil,
+        },
         nowIso: now,
       });
-      if (freezeResult.applied) {
-        this.recordOpsAlert({
-          alertType: "auto_freeze_fail_streak",
-          severity: "critical",
-          message:
-            `Auto-freeze triggered by fail streak ${nextFailStreak} ` +
-            `for ${patternKey} (threshold ${autoFreezeThreshold})`,
-          details: {
-            patternKey,
-            failStreak: nextFailStreak,
-            threshold: autoFreezeThreshold,
-            freezeUntil: freezeResult.state.freezeUntil,
-          },
-          nowIso: now,
-        });
-      }
     }
     this.maybeRunEvaluator(now);
     return { ok: true };
@@ -8323,9 +8583,11 @@ export class AutonomyStore {
     }
     const revisionCountByObjective = new Map<string, number>();
     const closedObjectiveIds = new Set<string>();
+    const reviewedObjectiveIds = new Set<string>();
     for (const row of portfolioFeedbackRows) {
       const objectiveId = asString(row.objective_id);
       if (!objectiveId) continue;
+      reviewedObjectiveIds.add(objectiveId);
       const verdict = asString(row.verdict).toLowerCase();
       if (
         verdict.includes("reject") ||
@@ -8364,6 +8626,11 @@ export class AutonomyStore {
       (objectiveId) => (revisionCountByObjective.get(objectiveId) ?? 0) === 0,
     ).length;
     const resolvedObjectiveCount = mergedObjectiveIds.length + closedUnmergedObjectiveCount;
+    const reviewObservedObjectiveCount = new Set([
+      ...reviewedObjectiveIds,
+      ...mergedObjectiveIds,
+      ...closedObjectiveIds,
+    ]).size;
     const awaitingReviewRows = portfolioObjectiveRows.filter(
       (row) => asString(row.status) === "awaiting_review",
     );
@@ -8391,7 +8658,9 @@ export class AutonomyStore {
       closedUnmergedObjectiveCount,
       reviewRevisionCount,
       firstPassMergeRate:
-        resolvedObjectiveCount > 0 ? firstPassMergeCount / resolvedObjectiveCount : null,
+        reviewObservedObjectiveCount > 0
+          ? firstPassMergeCount / reviewObservedObjectiveCount
+          : null,
     };
 
     return {
@@ -8855,6 +9124,7 @@ export class AutonomyStore {
   findObjectiveByJobId(jobId: string): {
     objectiveId: string;
     patternKey: string;
+    requestId: string | null;
     sessionId: string;
     runId: string;
     snapshotId: string;
@@ -8862,7 +9132,8 @@ export class AutonomyStore {
     if (!jobId) return null;
     const row = this.db
       .prepare(
-        `SELECT id AS objectiveId, pattern_key AS patternKey, session_id AS sessionId, run_id AS runId, snapshot_id AS snapshotId
+        `SELECT id AS objectiveId, pattern_key AS patternKey, request_id AS requestId,
+                session_id AS sessionId, run_id AS runId, snapshot_id AS snapshotId
          FROM autonomy_objectives
          WHERE job_id = ?
          ORDER BY updated_at DESC
@@ -8872,6 +9143,7 @@ export class AutonomyStore {
       | {
           objectiveId: string;
           patternKey: string;
+          requestId: string | null;
           sessionId: string;
           runId: string;
           snapshotId: string;
@@ -8888,24 +9160,81 @@ export class AutonomyStore {
     requestId: string | null;
     patternKey: string;
   } | null {
-    const matched = this.findObjectiveByJobId(jobId);
-    if (matched) {
-      return {
-        objectiveId: matched.objectiveId,
-        requestId: asString(params.requestId) || null,
-        patternKey: matched.patternKey,
-      };
-    }
+    const visited = new Set<string>();
+    const resolve = (
+      currentJobId: string,
+      currentParams?: Record<string, unknown>,
+    ): { objectiveId: string | null; requestId: string | null; patternKey: string } | null => {
+      if (!currentJobId || visited.has(currentJobId) || visited.size >= 16) return null;
+      visited.add(currentJobId);
+      const matched = this.findObjectiveByJobId(currentJobId);
+      if (matched) {
+        return {
+          objectiveId: matched.objectiveId,
+          requestId:
+            asString(currentParams?.requestId ?? currentParams?.request_id) ||
+            asString(matched.requestId) ||
+            null,
+          patternKey: matched.patternKey,
+        };
+      }
 
-    const autonomy = asObject(params.autonomy);
-    const origin = asString(params.origin ?? autonomy.origin).toLowerCase();
-    const patternKey = asString(autonomy.patternKey ?? autonomy.pattern_key);
-    if (origin !== "autonomy" || !patternKey) return null;
-    return {
-      objectiveId: asString(autonomy.objectiveId ?? autonomy.objective_id) || null,
-      requestId: asString(params.requestId ?? params.request_id) || null,
-      patternKey,
+      const row = this.hasTable("jobs")
+        ? (this.db
+            .prepare(`SELECT params, resumeOfJobId FROM jobs WHERE id = ? LIMIT 1`)
+            .get(currentJobId) as
+            | { params: string | null; resumeOfJobId: string | null }
+            | undefined)
+        : undefined;
+      const resolvedParams =
+        currentParams && Object.keys(currentParams).length > 0
+          ? currentParams
+          : parseJsonObject(row?.params ?? null);
+      const autonomy = asObject(resolvedParams.autonomy);
+      const origin = asString(resolvedParams.origin ?? autonomy.origin).toLowerCase();
+      const patternKey = asString(autonomy.patternKey ?? autonomy.pattern_key);
+      const localObjectiveId = asString(autonomy.objectiveId ?? autonomy.objective_id);
+      const localRequestId = asString(resolvedParams.requestId ?? resolvedParams.request_id);
+      if (origin === "autonomy" && patternKey && localObjectiveId) {
+        return {
+          objectiveId: localObjectiveId,
+          requestId: localRequestId || null,
+          patternKey,
+        };
+      }
+      if (localRequestId) {
+        const requestObjective = this.findObjectiveByRequestId(localRequestId);
+        if (requestObjective) {
+          return {
+            objectiveId: requestObjective.objectiveId,
+            requestId: localRequestId,
+            patternKey: requestObjective.patternKey,
+          };
+        }
+      }
+
+      const reviewAgent = asObject(resolvedParams.reviewAgent);
+      const recovery = asObject(resolvedParams.recovery);
+      const parents = [
+        asString(reviewAgent.sourceJobId ?? reviewAgent.source_job_id),
+        asString(reviewAgent.recoverySourceJobId ?? reviewAgent.recovery_source_job_id),
+        asString(recovery.previousJobId ?? recovery.previous_job_id),
+        asString(row?.resumeOfJobId),
+      ].filter(Boolean);
+      for (const parentJobId of parents) {
+        const parent = resolve(parentJobId);
+        if (parent) return parent;
+      }
+      if (origin === "autonomy" && patternKey) {
+        return {
+          objectiveId: localObjectiveId || null,
+          requestId: localRequestId || null,
+          patternKey,
+        };
+      }
+      return null;
     };
+    return resolve(jobId, params);
   }
 
   linkJobToObjectiveByRequest(requestId: string, jobId: string): void {
@@ -9270,10 +9599,7 @@ export class AutonomyStore {
       Math.min(
         1_000_000,
         Math.floor(
-          asNumber(
-            options.maxTerminalRows,
-            REPOSITORY_AGENT_MEMORY_FEEDBACK_MAX_TERMINAL_ROWS,
-          ),
+          asNumber(options.maxTerminalRows, REPOSITORY_AGENT_MEMORY_FEEDBACK_MAX_TERMINAL_ROWS),
         ),
       ),
     );
@@ -9281,9 +9607,7 @@ export class AutonomyStore {
       1,
       Math.min(
         5_000,
-        Math.floor(
-          asNumber(options.batchSize, REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_BATCH),
-        ),
+        Math.floor(asNumber(options.batchSize, REPOSITORY_AGENT_MEMORY_FEEDBACK_PRUNE_BATCH)),
       ),
     );
     const cutoff = new Date(nowMs - terminalRetentionMs).toISOString();
@@ -9314,10 +9638,7 @@ export class AutonomyStore {
              WHERE status IN ('applied', 'failed')`,
           )
           .get() as { count: number } | undefined;
-        const excess = Math.max(
-          0,
-          Math.floor(asNumber(terminalCount?.count, 0)) - maxTerminalRows,
-        );
+        const excess = Math.max(0, Math.floor(asNumber(terminalCount?.count, 0)) - maxTerminalRows);
         if (excess > 0) {
           const cappedRows = this.db
             .prepare(
@@ -9611,7 +9932,7 @@ export class AutonomyStore {
       });
       return (
         directNegative ||
-        ["quality_rejected", "validation_blocked", "no_change"].includes(classified)
+        ["product_quality_failed", "validation_blocked", "no_change"].includes(classified)
       );
     });
 

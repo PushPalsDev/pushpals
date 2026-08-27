@@ -6,6 +6,27 @@ import {
 } from "../scripts/reliability-harness";
 
 describe("reliability harness release coverage", () => {
+  test("gates RepositoryAgent liveness, durable memory, and autonomy integration", () => {
+    const files = listReliabilityHarnessPhaseFiles("repository_intelligence");
+
+    expect(files).toContain("tests/remotebuddy.repository-agent.test.ts");
+    expect(files).toContain("tests/server.repository-agent-queue.test.ts");
+    expect(files).toContain("tests/memory-store-conformance.test.ts");
+    expect(files).toContain("tests/remotebuddy.autonomous-engine.tick.test.ts");
+  });
+
+  test("gates the composed worker quality loop and watchdog policy", () => {
+    const files = listReliabilityHarnessPhaseFiles("quality_loop");
+    const watchdogFiles = listReliabilityHarnessPhaseFiles("worker_watchdog");
+
+    expect(files).toContain("tests/workerpals.quality-gate-issues.test.ts");
+    expect(files).toContain("tests/workerpals.quality-loop-durability.test.ts");
+    expect(files).toContain("tests/workerpals.validation-command-safety.test.ts");
+    expect(watchdogFiles).toContain(
+      "apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py",
+    );
+  });
+
   test("gates both source and packaged generic-executor progress behavior", () => {
     const files = listReliabilityHarnessPhaseFiles("runtime_boundary");
 
@@ -19,6 +40,7 @@ describe("reliability harness release coverage", () => {
 
     expect(lifecycleFiles).toContain("tests/server.job-diagnostics.test.ts");
     expect(lifecycleFiles).toContain("tests/server.jobs.stale-recovery.test.ts");
+    expect(lifecycleFiles).toContain("tests/server.jobs-repair-scheduling.test.ts");
     expect(lifecycleFiles).toContain("tests/server.session-message-route.test.ts");
     expect(runtimeFiles).toContain("tests/workerpals.server-transport.test.ts");
   });

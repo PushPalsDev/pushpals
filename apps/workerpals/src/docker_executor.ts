@@ -19,7 +19,13 @@ import { homedir } from "os";
 import { isAbsolute, relative, resolve } from "path";
 import { fetchWithHardDeadline, loadPushPalsConfig } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
-import type { ExecutorBackend, JobDiagnostics, JobTokenUsage } from "./common/types.js";
+import type {
+  ExecutorBackend,
+  JobCandidateState,
+  JobDiagnostics,
+  JobTokenUsage,
+  JobUsageAttempt,
+} from "./common/types.js";
 import { validateStructuredJobResultEnvelope } from "./common/execution_utils.js";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 import {
@@ -38,7 +44,14 @@ import type {
   DockerWarmStartupContext,
 } from "./backends/types.js";
 import { resolveFreshWorktreeBaseRef, resolveReviewWorktreeBase } from "./worktree_base_ref.js";
-import { createJobCommit, resumePreparedMergeConflictRebase, shouldCommit } from "./execute_job.js";
+import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
+import {
+  checkpointJobCandidate,
+  createJobCommit,
+  git,
+  resumePreparedMergeConflictRebase,
+  shouldCommit,
+} from "./execute_job.js";
 import {
   applyMergeConflictExecutionHints,
   isHostScmOwnedReviewParams,
@@ -662,6 +675,7 @@ export function buildLinuxWorktreeAddArgs(
 export class DockerExecutionExhaustedError extends Error {
   readonly cooldownMs: number;
   readonly category: "warm_setup" | "job_execution";
+  candidateState?: JobCandidateState;
 
   constructor(category: "warm_setup" | "job_execution", message: string, cooldownMs: number) {
     super(message);
@@ -700,6 +714,8 @@ export interface DockerJobResult {
   exitCode?: number;
   cooldownMs?: number;
   usage?: JobTokenUsage;
+  usageAttempts?: JobUsageAttempt[];
+  candidateState?: JobCandidateState;
   publishBlocked?: {
     summary: string;
     detail: string;
@@ -720,6 +736,54 @@ export interface DockerJobResult {
     publicBranch?: string;
   };
   diagnostics?: JobDiagnostics;
+}
+
+export function addHostScmReviewPassUsage(
+  accumulator: UsageAccumulator,
+  result: Pick<DockerJobResult, "usage" | "usageAttempts" | "exitCode">,
+  pass: number,
+): void {
+  if ((result.usageAttempts?.length ?? 0) > 0) {
+    const attemptOffset = accumulator.attempts().length;
+    accumulator.addAttempts(
+      (result.usageAttempts ?? []).map((attempt, index) => ({
+        ...attempt,
+        attempt: attemptOffset + index + 1,
+        source: `${attempt.source}:host_scm_pass_${pass}`,
+      })),
+    );
+    return;
+  }
+  accumulator.add(result.usage, {
+    stage: pass === 1 ? "executor" : "executor_recovery",
+    attempt: accumulator.attempts().length + 1,
+    source: `host_scm_owned_review:pass_${pass}`,
+    timedOut: result.exitCode === 124,
+  });
+}
+
+export function addHostScmFinalizationUsage(
+  accumulator: UsageAccumulator,
+  result: { usage?: JobTokenUsage; usageAttempts?: JobUsageAttempt[] },
+  pass: number,
+): void {
+  if ((result.usageAttempts?.length ?? 0) > 0) {
+    const attemptOffset = accumulator.attempts().length;
+    accumulator.addAttempts(
+      (result.usageAttempts ?? []).map((attempt, index) => ({
+        ...attempt,
+        stage: "finalization",
+        attempt: attemptOffset + index + 1,
+        source: `${attempt.source}:host_scm_finalization_pass_${pass}`,
+      })),
+    );
+    return;
+  }
+  accumulator.add(result.usage, {
+    stage: "finalization",
+    attempt: accumulator.attempts().length + 1,
+    source: `host_scm_finalization:pass_${pass}`,
+  });
 }
 
 interface DockerExecutionResultContext {
@@ -891,6 +955,116 @@ export function resolveDockerJobTimeoutMs(
   return Math.max(Math.min(baseTimeoutMs, boundedTimeoutMs), BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS);
 }
 
+export function resolveDockerJobDeadlineBudgets(
+  configuredTimeoutMs: number,
+  job: Pick<Job, "kind" | "params">,
+): { executionBudgetMs: number; finalizationBudgetMs: number } {
+  const totalTimeoutMs = resolveDockerJobTimeoutMs(configuredTimeoutMs, job);
+  const planning = maybeRecord(job.params.planning);
+  const requestedExecutionBudgetMs = readPositiveNumber(planning?.executionBudgetMs);
+  const requestedFinalizationBudgetMs = readPositiveNumber(planning?.finalizationBudgetMs);
+  if (requestedExecutionBudgetMs === null || requestedFinalizationBudgetMs === null) {
+    return { executionBudgetMs: totalTimeoutMs, finalizationBudgetMs: 0 };
+  }
+
+  // The outer transport deadline may be stricter than a planner-provided
+  // budget. Preserve finalization headroom first, then expose only the
+  // remaining portion to edit/validation work.
+  const finalizationBudgetMs = Math.min(
+    requestedFinalizationBudgetMs,
+    Math.max(0, totalTimeoutMs - 1),
+  );
+  return {
+    executionBudgetMs: Math.min(
+      requestedExecutionBudgetMs,
+      Math.max(1, totalTimeoutMs - finalizationBudgetMs),
+    ),
+    finalizationBudgetMs,
+  };
+}
+
+export function createDockerJobDeadlineLedger(
+  configuredTimeoutMs: number,
+  job: Pick<Job, "kind" | "params">,
+  options: { startedAtMs?: number; now?: () => number } = {},
+): JobDeadlineLedger {
+  const budgets = resolveDockerJobDeadlineBudgets(configuredTimeoutMs, job);
+  return new JobDeadlineLedger({ ...budgets, ...options });
+}
+
+/**
+ * Rewrites the next container invocation to borrow from the host's absolute
+ * ledger. This is intentionally repeated immediately before every retry and
+ * host-owned review pass so no executeJob process can mint a new budget.
+ */
+export function bindDockerJobToDeadline(job: Job, ledger: JobDeadlineLedger): Job | null {
+  if (ledger.workExpired()) return null;
+  const planning = maybeRecord(job.params.planning);
+  const requestedExecutionBudgetMs = readPositiveNumber(planning?.executionBudgetMs);
+  const requestedFinalizationBudgetMs = readPositiveNumber(planning?.finalizationBudgetMs);
+  if (
+    planning === null ||
+    requestedExecutionBudgetMs === null ||
+    requestedFinalizationBudgetMs === null
+  ) {
+    return job;
+  }
+  const budgets = ledger.executorBudgets(requestedExecutionBudgetMs, requestedFinalizationBudgetMs);
+  if (!budgets || budgets.finalizationBudgetMs <= 0) return null;
+  return {
+    ...job,
+    params: {
+      ...job.params,
+      planning: {
+        ...planning,
+        executionBudgetMs: budgets.executionBudgetMs,
+        finalizationBudgetMs: budgets.finalizationBudgetMs,
+      },
+    },
+  };
+}
+
+export function dockerAbsoluteDeadlineResult(
+  job: Pick<Job, "id">,
+  ledger: JobDeadlineLedger,
+  stage: string,
+  priorResult?: DockerJobResult,
+): DockerJobResult {
+  const detail = `The absolute Docker job deadline was exhausted during ${stage}; retries and host-owned review passes share one wall-clock budget.`;
+  return {
+    ...(priorResult ?? {}),
+    ok: false,
+    summary: `Docker job ${job.id} reached its absolute deadline`,
+    stderr: appendDockerFailureDetail(priorResult?.stderr, detail),
+    exitCode: 124,
+    candidateState: priorResult?.candidateState ?? {
+      status: "partial",
+      reason: "absolute_job_deadline",
+      changedPaths: [],
+    },
+    diagnostics: {
+      ...(priorResult?.diagnostics ?? {}),
+      terminal: {
+        ...(priorResult?.diagnostics?.terminal ?? {}),
+        failureClass: "timeout",
+        terminalStage: "docker",
+        summary: detail,
+        watchdogFired: true,
+        timeoutMs: ledger.deadlineAtMs - ledger.startedAtMs,
+        metadata: {
+          ...(priorResult?.diagnostics?.terminal?.metadata ?? {}),
+          absoluteDeadlineStage: stage,
+          jobDeadline: ledger.snapshot(),
+        },
+      },
+      metadata: {
+        ...(priorResult?.diagnostics?.metadata ?? {}),
+        jobDeadline: ledger.snapshot(),
+      },
+    },
+  };
+}
+
 export class DockerExecutor {
   private options: Required<Omit<DockerExecutorOptions, "config">>;
   private worktreeDir: string;
@@ -1010,6 +1184,14 @@ export class DockerExecutor {
     this.clearIdleTimer();
     const worktreeName = this.buildEphemeralWorktreeName("job", job.id);
     const worktreePath = resolve(this.worktreeDir, worktreeName);
+    let terminalResult: DockerJobResult | null = null;
+    let terminalError: unknown = null;
+    let worktreeBaselineSha: string | null = null;
+    let preserveWorktreeForCandidateRecovery = false;
+    const finish = (result: DockerJobResult): DockerJobResult => {
+      terminalResult = result;
+      return result;
+    };
 
     try {
       const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
@@ -1035,21 +1217,79 @@ export class DockerExecutor {
           params: markHostScmGitOwnership(effectiveParams),
         };
       }
+      const baseline = await git(worktreePath, ["rev-parse", "HEAD"]);
+      if (!baseline.ok || !baseline.stdout.trim()) {
+        throw new Error(
+          `Unable to resolve disposable worktree baseline before execution: ${baseline.stderr || baseline.stdout || `git exited ${baseline.exitCode}`}`,
+        );
+      }
+      worktreeBaselineSha = baseline.stdout.trim();
+      const deadlineLedger = createDockerJobDeadlineLedger(this.options.timeoutMs, effectiveJob);
 
       // Step 3: Run Docker container with the worktree mounted
       for (let attempt = 1; attempt <= this.jobRetryMaxAttempts; attempt++) {
+        const deadlineBoundJob = bindDockerJobToDeadline(effectiveJob, deadlineLedger);
+        if (!deadlineBoundJob) {
+          return finish(
+            dockerAbsoluteDeadlineResult(job, deadlineLedger, `Docker attempt ${attempt} setup`),
+          );
+        }
         const attemptStartedAtMs = Date.now();
         try {
           this.logExecutionConfig();
-          const result = isHostScmOwnedReviewParams(effectiveJob.params)
-            ? await this.runHostScmOwnedReviewJob(worktreePath, effectiveJob, onLog)
-            : await this.runInWarmContainer(
+          let result = isHostScmOwnedReviewParams(deadlineBoundJob.params)
+            ? await this.runHostScmOwnedReviewJob(
                 worktreePath,
-                this.encodeJobSpec(effectiveJob),
-                effectiveJob,
+                deadlineBoundJob,
+                deadlineLedger,
                 onLog,
-              );
-          if (result.ok) return result;
+              )
+            : await this.runInWarmContainer(worktreePath, deadlineBoundJob, onLog, deadlineLedger);
+          if (
+            result.ok &&
+            shouldCommit(effectiveJob.kind, this.config) &&
+            !isHostScmOwnedReviewParams(effectiveJob.params) &&
+            (!result.commit || !result.commit.branch || !result.commit.sha)
+          ) {
+            result = {
+              ...result,
+              ok: false,
+              summary: `Docker job ${job.id} completed without durable commit metadata`,
+              stderr: [
+                result.stderr,
+                "The container reported success for a file-modifying job without an exact retained ref/SHA; treating it as a finalization failure before worktree cleanup.",
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              exitCode: 4,
+              candidateState: result.candidateState ?? {
+                status: "held",
+                reason: "commit_finalization_failed",
+                changedPaths: [],
+              },
+            };
+          }
+          if (deadlineLedger.remainingTotalMs() <= 0) {
+            return finish(
+              dockerAbsoluteDeadlineResult(
+                job,
+                deadlineLedger,
+                `Docker attempt ${attempt}`,
+                result,
+              ),
+            );
+          }
+          if (result.ok) return finish(result);
+          if (deadlineLedger.workExpired()) {
+            return finish(
+              dockerAbsoluteDeadlineResult(
+                job,
+                deadlineLedger,
+                `Docker attempt ${attempt}`,
+                result,
+              ),
+            );
+          }
 
           const retryableFailure = this.isRetryableJobFailure(result);
           const attemptElapsedMs = Math.max(1, Date.now() - attemptStartedAtMs);
@@ -1064,12 +1304,12 @@ export class DockerExecutor {
               attempt >= this.jobRetryMaxAttempts &&
               this.retryExhaustionCooldownMs(result) > 0
             ) {
-              return {
+              return finish({
                 ...result,
                 cooldownMs: this.retryExhaustionCooldownMs(result),
-              };
+              });
             }
-            return result;
+            return finish(result);
           }
 
           const retryInMs = this.backoffDelayMs(this.jobRetryBackoffMs, attempt);
@@ -1078,9 +1318,39 @@ export class DockerExecutor {
           }/${this.jobRetryMaxAttempts} in ${retryInMs}ms.`;
           console.warn(note);
           onLog?.("stderr", note);
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(
+              dockerAbsoluteDeadlineResult(
+                job,
+                deadlineLedger,
+                `retry backoff before attempt ${attempt + 1}`,
+                result,
+              ),
+            );
+          }
           await this.stopWarmContainer("job retry after transient failure", true);
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(
+              dockerAbsoluteDeadlineResult(
+                job,
+                deadlineLedger,
+                `retry recovery before attempt ${attempt + 1}`,
+                result,
+              ),
+            );
+          }
           await this.sleep(retryInMs);
         } catch (err) {
+          if (deadlineLedger.workExpired() || deadlineLedger.remainingTotalMs() <= 0) {
+            return finish(
+              dockerAbsoluteDeadlineResult(job, deadlineLedger, `Docker attempt ${attempt}`, {
+                ok: false,
+                summary: `Docker attempt ${attempt} failed at the absolute deadline`,
+                stderr: this.compactError(err),
+                exitCode: 124,
+              }),
+            );
+          }
           const retryableError = this.isRetryableError(err);
           const attemptElapsedMs = Math.max(1, Date.now() - attemptStartedAtMs);
           const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
@@ -1110,24 +1380,132 @@ export class DockerExecutor {
           )}. Retrying attempt ${attempt + 1}/${this.jobRetryMaxAttempts} in ${retryInMs}ms.`;
           console.warn(note);
           onLog?.("stderr", note);
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(
+              dockerAbsoluteDeadlineResult(
+                job,
+                deadlineLedger,
+                `retry backoff before attempt ${attempt + 1}`,
+              ),
+            );
+          }
           await this.stopWarmContainer("job retry after execution error", true);
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(
+              dockerAbsoluteDeadlineResult(
+                job,
+                deadlineLedger,
+                `retry recovery before attempt ${attempt + 1}`,
+              ),
+            );
+          }
           await this.sleep(retryInMs);
         }
       }
 
-      return {
+      return finish({
         ok: false,
         summary: "Docker job retries exhausted",
         stderr: `Retries exhausted after ${this.jobRetryMaxAttempts} attempts`,
-      };
+      });
+    } catch (error) {
+      terminalError = error;
+      throw error;
     } finally {
       this.preparedMergeConflictJobs.delete(job.id);
       this.activeJobs = Math.max(0, this.activeJobs - 1);
       await this.cleanupContainerDependencyProjection(worktreePath);
-      // Step 4: Clean up worktree (always cleanup)
-      await this.removeWorktree(worktreePath).catch((err) => {
-        console.error(`[DockerExecutor] Failed to remove worktree: ${err}`);
-      });
+      const resultForCleanup = (terminalResult ??
+        (terminalError
+          ? {
+              ok: false,
+              summary: `Docker execution threw before producing a structured result: ${this.compactError(terminalError)}`,
+              candidateState: {
+                status: "partial",
+                reason: "execution_exception",
+                changedPaths: [],
+              },
+            }
+          : null)) as DockerJobResult | null;
+      if (resultForCleanup && !resultForCleanup.ok && existsSync(worktreePath)) {
+        const candidateState =
+          resultForCleanup.candidateState ??
+          ({
+            status: resultForCleanup.exitCode === 124 ? "partial" : "held",
+            reason: resultForCleanup.exitCode === 124 ? "execution_timeout" : "terminal_failure",
+            changedPaths: [],
+          } satisfies JobCandidateState);
+        try {
+          const checkpointed = await checkpointJobCandidate(
+            worktreePath,
+            this.options.workerId,
+            job,
+            candidateState,
+            this.config,
+            worktreeBaselineSha,
+          );
+          if (checkpointed.checkpoint) {
+            resultForCleanup.candidateState = checkpointed;
+            if (
+              terminalError &&
+              typeof terminalError === "object" &&
+              Object.isExtensible(terminalError)
+            ) {
+              try {
+                Object.assign(terminalError, { candidateState: checkpointed });
+              } catch {
+                // The durable Git ref is authoritative even if an unusual
+                // thrown object cannot carry structured candidate metadata.
+              }
+            }
+            resultForCleanup.stderr = [
+              resultForCleanup.stderr,
+              `Candidate checkpoint retained at ${checkpointed.checkpoint.ref} (${checkpointed.checkpoint.sha}).`,
+            ]
+              .filter(Boolean)
+              .join("\n");
+            onLog?.(
+              "stderr",
+              `[DockerExecutor] Retained ${checkpointed.status} candidate ${checkpointed.checkpoint.sha.slice(0, 12)} before disposable worktree cleanup.`,
+            );
+          }
+        } catch (error) {
+          preserveWorktreeForCandidateRecovery = true;
+          resultForCleanup.candidateState = candidateState;
+          resultForCleanup.stderr = [
+            resultForCleanup.stderr,
+            `Candidate checkpoint failed; preserving disposable worktree for recovery at ${worktreePath}: ${this.compactError(error)}`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+          if (
+            terminalError &&
+            typeof terminalError === "object" &&
+            Object.isExtensible(terminalError)
+          ) {
+            try {
+              Object.assign(terminalError, {
+                candidateState,
+                candidateWorktreePath: worktreePath,
+              });
+            } catch {
+              // Preserve the physical worktree even when the thrown value is immutable.
+            }
+          }
+          onLog?.(
+            "stderr",
+            `[DockerExecutor] Candidate checkpoint failed; preserving worktree ${worktreePath}: ${this.compactError(error)}`,
+          );
+        }
+      }
+      // Step 4: Clean up only after the candidate is either absent or reachable
+      // from a durable Git ref. A checkpoint failure must never destroy the
+      // sole remaining copy of a partial patch.
+      if (!preserveWorktreeForCandidateRecovery) {
+        await this.removeWorktree(worktreePath).catch((err) => {
+          console.error(`[DockerExecutor] Failed to remove worktree: ${err}`);
+        });
+      }
       this.scheduleIdleShutdown();
     }
   }
@@ -2200,61 +2578,83 @@ export class DockerExecutor {
     ).toString("base64");
   }
 
-  private mergeReviewPassUsage(
-    accumulated: JobTokenUsage | undefined,
-    current: JobTokenUsage | undefined,
-  ): JobTokenUsage | undefined {
-    if (!accumulated) return current;
-    if (!current) return accumulated;
-    const promptTokens = accumulated.promptTokens + current.promptTokens;
-    const completionTokens = accumulated.completionTokens + current.completionTokens;
-    return {
-      promptTokens,
-      completionTokens,
-      totalTokens:
-        (accumulated.totalTokens ?? accumulated.promptTokens + accumulated.completionTokens) +
-        (current.totalTokens ?? current.promptTokens + current.completionTokens),
-      estimated: Boolean(accumulated.estimated || current.estimated),
-      backend: current.backend || accumulated.backend,
-      modelId: current.modelId || accumulated.modelId,
-    };
-  }
-
   private async runHostScmOwnedReviewJob(
     worktreePath: string,
     initialJob: Job,
+    deadlineLedger: JobDeadlineLedger,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
     const maxMergeConflictPasses = 8;
     let effectiveJob = initialJob;
-    let accumulatedUsage: JobTokenUsage | undefined;
+    const accumulatedUsage = new UsageAccumulator();
+    const withAccumulatedUsage = (result: DockerJobResult): DockerJobResult =>
+      accumulatedUsage.apply(result);
 
     for (let pass = 1; pass <= maxMergeConflictPasses; pass++) {
+      const deadlineBoundJob = bindDockerJobToDeadline(effectiveJob, deadlineLedger);
+      if (!deadlineBoundJob) {
+        return withAccumulatedUsage(
+          dockerAbsoluteDeadlineResult(
+            initialJob,
+            deadlineLedger,
+            `host-owned review pass ${pass}`,
+          ),
+        );
+      }
       const result = await this.runInWarmContainer(
         worktreePath,
-        this.encodeJobSpec(effectiveJob),
-        effectiveJob,
+        deadlineBoundJob,
         onLog,
+        deadlineLedger,
       );
-      accumulatedUsage = this.mergeReviewPassUsage(accumulatedUsage, result.usage);
-      if (!result.ok) return { ...result, usage: accumulatedUsage };
+      addHostScmReviewPassUsage(accumulatedUsage, result, pass);
+      if (deadlineLedger.remainingTotalMs() <= 0) {
+        return withAccumulatedUsage(
+          dockerAbsoluteDeadlineResult(
+            initialJob,
+            deadlineLedger,
+            `host-owned review pass ${pass}`,
+            result,
+          ),
+        );
+      }
+      if (!result.ok) return withAccumulatedUsage(result);
 
       if (isMergeConflictResolutionParams(effectiveJob.params)) {
+        if (deadlineLedger.workExpired()) {
+          return withAccumulatedUsage(
+            dockerAbsoluteDeadlineResult(
+              initialJob,
+              deadlineLedger,
+              `host-owned rebase continuation after pass ${pass}`,
+              result,
+            ),
+          );
+        }
         const resume = await resumePreparedMergeConflictRebase(
           worktreePath,
           effectiveJob.kind,
           effectiveJob.params,
           onLog,
         );
+        if (deadlineLedger.workExpired() && (!resume.ok || resume.sequencer)) {
+          return withAccumulatedUsage(
+            dockerAbsoluteDeadlineResult(
+              initialJob,
+              deadlineLedger,
+              `host-owned rebase continuation after pass ${pass}`,
+              result,
+            ),
+          );
+        }
         if (!resume.ok) {
-          return {
+          return withAccumulatedUsage({
             ...result,
             ok: false,
             summary: "Host-side merge-conflict rebase continuation failed",
             stderr: [result.stderr, resume.error].filter(Boolean).join("\n"),
             exitCode: 4,
-            usage: accumulatedUsage,
-          };
+          });
         }
         if (resume.sequencer) {
           if (resume.sequencer !== "rebase" || pass >= maxMergeConflictPasses) {
@@ -2262,14 +2662,13 @@ export class DockerExecutor {
               resume.sequencer !== "rebase"
                 ? `Host-side review worktree left unexpected git ${resume.sequencer} in progress.`
                 : `Host-side merge-conflict repair exceeded ${maxMergeConflictPasses} focused resolver passes.`;
-            return {
+            return withAccumulatedUsage({
               ...result,
               ok: false,
               summary: detail,
               stderr: [result.stderr, resume.detail, detail].filter(Boolean).join("\n"),
               exitCode: 4,
-              usage: accumulatedUsage,
-            };
+            });
           }
 
           const refreshedParams = await refreshMergeConflictWorktreeHints(
@@ -2315,7 +2714,17 @@ export class DockerExecutor {
       }
 
       if (!shouldCommit(effectiveJob.kind, this.config)) {
-        return { ...result, usage: accumulatedUsage };
+        return withAccumulatedUsage(result);
+      }
+      if (deadlineLedger.remainingTotalMs() <= 0) {
+        return withAccumulatedUsage(
+          dockerAbsoluteDeadlineResult(
+            initialJob,
+            deadlineLedger,
+            "host-owned commit finalization",
+            result,
+          ),
+        );
       }
       const commitResult = await createJobCommit(
         worktreePath,
@@ -2331,45 +2740,75 @@ export class DockerExecutor {
         },
         this.config,
       );
+      addHostScmFinalizationUsage(
+        accumulatedUsage,
+        commitResult as typeof commitResult & {
+          usage?: JobTokenUsage;
+          usageAttempts?: JobUsageAttempt[];
+        },
+        pass,
+      );
+      if (deadlineLedger.remainingTotalMs() <= 0) {
+        return withAccumulatedUsage(
+          dockerAbsoluteDeadlineResult(
+            initialJob,
+            deadlineLedger,
+            "host-owned commit finalization",
+            {
+              ...result,
+              ...(commitResult.ok && commitResult.sha && commitResult.branch
+                ? {
+                    commit: {
+                      branch: commitResult.branch,
+                      sha: commitResult.sha,
+                      publicBranch: commitResult.publicBranch,
+                    },
+                  }
+                : {}),
+            },
+          ),
+        );
+      }
       if (!commitResult.ok || !commitResult.sha || !commitResult.branch) {
         const detail =
           commitResult.error ??
           `Host-side completion metadata missing for review job ${effectiveJob.id}.`;
-        return {
+        return withAccumulatedUsage({
           ...result,
           ok: false,
           summary: commitResult.publishBlocked?.summary ?? "Host-side review finalization failed",
           stderr: [result.stderr, detail].filter(Boolean).join("\n"),
           exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 1,
           publishBlocked: commitResult.publishBlocked,
-          usage: accumulatedUsage,
-        };
+        });
       }
-      return {
+      return withAccumulatedUsage({
         ...result,
         commit: {
           branch: commitResult.branch,
           sha: commitResult.sha,
           publicBranch: commitResult.publicBranch,
         },
-        usage: accumulatedUsage,
-      };
+      });
     }
 
-    return {
+    return withAccumulatedUsage({
       ok: false,
       summary: "Host-side review execution exhausted resolver passes",
+      stderr: `Exceeded ${maxMergeConflictPasses} host-owned review passes.`,
       exitCode: 4,
-      usage: accumulatedUsage,
-    };
+    });
   }
 
   private async runInWarmContainer(
     worktreePath: string,
-    base64Spec: string,
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<DockerJobResult> {
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-container setup");
+    }
     await this.ensureWarmRuntimeReady(job, onLog);
     const startedAtMs = Date.now();
     const containerWorktreePath = await this.ensureWorktreeAccessibleInWarmContainer(
@@ -2380,6 +2819,15 @@ export class DockerExecutor {
       containerWorktreePath,
       onLog,
     );
+    const deadlineBoundJob = deadlineLedger ? bindDockerJobToDeadline(job, deadlineLedger) : job;
+    if (!deadlineBoundJob) {
+      return dockerAbsoluteDeadlineResult(
+        job,
+        deadlineLedger as JobDeadlineLedger,
+        "warm-container dependency preparation",
+      );
+    }
+    const base64Spec = this.encodeJobSpec(deadlineBoundJob);
 
     const args = this.buildWarmContainerExecArgs(containerWorktreePath);
 
@@ -2402,10 +2850,21 @@ export class DockerExecutor {
         )}`,
       );
     }
-    const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
-    if (timeoutMs !== this.options.timeoutMs) {
-      const verb = timeoutMs > this.options.timeoutMs ? "Extended" : "Capped";
-      const note = `[DockerExecutor] ${verb} job timeout for browser validation convergence: ${timeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
+    const configuredTimeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, deadlineBoundJob);
+    const remainingDeadlineMs = deadlineLedger?.remainingTotalMs() ?? configuredTimeoutMs;
+    if (remainingDeadlineMs <= 0) {
+      await terminateDockerExecProcessTree(proc);
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger as JobDeadlineLedger, "Docker spawn");
+    }
+    const timeoutMs = Math.max(1, Math.min(configuredTimeoutMs, remainingDeadlineMs));
+    if (configuredTimeoutMs !== this.options.timeoutMs) {
+      const verb = configuredTimeoutMs > this.options.timeoutMs ? "Extended" : "Capped";
+      const note = `[DockerExecutor] ${verb} job timeout for browser validation convergence: ${configuredTimeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
+      console.log(note);
+      onLog?.("stdout", note);
+    }
+    if (timeoutMs < configuredTimeoutMs) {
+      const note = `[DockerExecutor] Capped this container invocation to ${timeoutMs}ms from the shared absolute job deadline (remaining work plus finalization reserve).`;
       console.log(note);
       onLog?.("stdout", note);
     }
@@ -3480,6 +3939,22 @@ export class DockerExecutor {
     const note = `[DockerExecutor] Skipping retry attempt ${
       attempt + 1
     }/${this.jobRetryMaxAttempts}: prior attempt consumed ${attemptElapsedMs}ms of ${timeoutMs}ms budget.`;
+    console.warn(note);
+    onLog?.("stderr", note);
+    return false;
+  }
+
+  private hasAbsoluteBudgetForJobRetry(
+    attempt: number,
+    retryInMs: number,
+    deadlineLedger: JobDeadlineLedger,
+    onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  ): boolean {
+    const remainingWorkMs = deadlineLedger.remainingWorkMs();
+    if (remainingWorkMs > retryInMs) return true;
+    const note = `[DockerExecutor] Skipping retry attempt ${
+      attempt + 1
+    }/${this.jobRetryMaxAttempts}: absolute job deadline has ${remainingWorkMs}ms work budget remaining, which cannot cover ${retryInMs}ms backoff while preserving finalization reserve.`;
     console.warn(note);
     onLog?.("stderr", note);
     return false;

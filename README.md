@@ -126,6 +126,13 @@ or with Bun:
 bun install -g @pushpalsdev/cli
 ```
 
+On Windows hosts that use an enterprise or locally managed certificate store,
+let Bun use the system certificate authorities:
+
+```powershell
+bun install -g --use-system-ca @pushpalsdev/cli
+```
+
 For local development, one-time local command install from repo root:
 
 ```bash

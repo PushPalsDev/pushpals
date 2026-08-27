@@ -45,10 +45,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -92,7 +92,7 @@ jobs:
           echo "tarball_name=$tarball_name" >> "$GITHUB_OUTPUT"
 
       - name: Upload immutable CLI package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pushpals-cli-package-${{ needs.meta.outputs.version }}
           path: |
@@ -111,7 +111,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -125,7 +125,7 @@ jobs:
         run: bun run protocol:build
 
       - name: Download immutable CLI package artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pushpals-cli-package-${{ needs.meta.outputs.version }}
           path: dist/tested-cli-artifact
@@ -151,7 +151,7 @@ jobs:
           test -f dist/tested-cli-package/package/runtime/sandbox/apps/workerpals/Dockerfile.sandbox
 
       - name: Download immutable Linux runtime candidates
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: runtime-linux-x64
           path: dist/tested-runtime-linux-x64
@@ -193,10 +193,10 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24.11.0"
 
@@ -239,7 +239,7 @@ jobs:
 
       - name: Download tested immutable CLI package artifact
         if: steps.npm_publish_check.outputs.already_published != 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pushpals-cli-package-${{ needs.meta.outputs.version }}
           path: dist/tested-cli-artifact
@@ -276,7 +276,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -299,7 +299,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -342,7 +342,7 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -473,7 +473,7 @@ jobs:
           codesign --verify --verbose "$output"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output_name }}
           path: dist/${{ matrix.output_name }}
@@ -507,7 +507,7 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -649,7 +649,7 @@ jobs:
           done
 
       - name: Upload runtime artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: runtime-${{ matrix.platform_key }}
           path: dist/pushpals-runtime-*
@@ -665,7 +665,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -696,7 +696,7 @@ jobs:
           tests/start.runtime-services.test.ts
 
       - name: Download Windows runtime artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: runtime-windows-x64
           path: dist/runtime-windows-x64
@@ -726,7 +726,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -736,31 +736,31 @@ jobs:
       # Enumerate release artifacts instead of downloading every workflow artifact.
       # The immutable npm tarball is an input to publication, not a GitHub binary asset.
       - name: Download Linux CLI binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pushpals-linux-x64
           path: dist
 
       - name: Download Windows CLI binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pushpals-windows-x64.exe
           path: dist
 
       - name: Download macOS x64 CLI binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pushpals-macos-x64
           path: dist
 
       - name: Download macOS arm64 CLI binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pushpals-macos-arm64
           path: dist
 
       - name: Download runtime service binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: runtime-*
           path: dist
@@ -823,7 +823,7 @@ jobs:
 
       - name: Create GitHub release (release log)
         if: steps.release_log.outputs.found == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: PushPals CLI ${{ needs.meta.outputs.tag }}
@@ -837,7 +837,7 @@ jobs:
 
       - name: Create GitHub release (default body)
         if: steps.release_log.outputs.found != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: PushPals CLI ${{ needs.meta.outputs.tag }}

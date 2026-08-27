@@ -174,7 +174,7 @@ gh release view vX.Y.Z --repo PushPalsDev/pushpals
 Optionally smoke the installed package locally:
 
 ```powershell
-bun install -g @pushpalsdev/cli@X.Y.Z
+bun install -g --use-system-ca @pushpalsdev/cli@X.Y.Z
 pushpals --version
 pushpals --clear
 ```
@@ -197,3 +197,5 @@ pushpals --clear
   smoke testing.
 - Git cannot fetch or push on Windows due to certificate backend mismatch; retry
   with `git -c http.sslBackend=schannel`.
+- Bun cannot reach npm on Windows because a managed root CA is not in Bun's
+  bundled trust store; retry installation with `--use-system-ca`.

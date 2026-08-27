@@ -246,7 +246,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     });
 
     const first = await worker.analyze("request-1", request);
-    expect(llm.discoveryCalls).toHaveLength(1);
+    expect(llm.discoveryCalls).toHaveLength(0);
     expect(llm.analysisCalls).toHaveLength(1);
     expect(llm.analysisCalls[0]?.executionContext).toEqual({
       repositoryMode: "isolated-evidence",
@@ -270,7 +270,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       ...request,
       idempotencyKey: "second-request",
     });
-    expect(llm.discoveryCalls).toHaveLength(1);
+    expect(llm.discoveryCalls).toHaveLength(0);
     expect(llm.analysisCalls).toHaveLength(1);
     expect(second.requestId).toBe("request-2");
     expect(second.cache.hit).toBe(true);
@@ -289,13 +289,170 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       idempotencyKey: "fresh-request",
     });
     expect(fresh.cache.hit).toBe(false);
-    expect(llm.discoveryCalls).toHaveLength(2);
+    expect(llm.discoveryCalls).toHaveLength(0);
     expect(llm.analysisCalls).toHaveLength(2);
     const freshPayload = JSON.parse(llm.analysisCalls[1]?.messages[0]?.content ?? "{}") as {
       advisoryMemory?: unknown[];
     };
     expect(freshPayload.advisoryMemory?.length).toBeGreaterThan(0);
   });
+
+  test("reuses a structural autonomy cache across volatile snapshots and invalidates on vision change", async () => {
+    const repo = createRepository();
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      modelId: "structural-cache-model",
+    });
+    const base = await requestFor(repo, {
+      question: "Identify grounded autonomy candidates.",
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: {
+          path: "vision.md",
+          sha256: "a".repeat(64),
+          one_sentence: "Ship reliable improvements.",
+          priorities: ["Reliability"],
+          sections: [{ number: "1", title: "Priorities", markdown: "volatile-full-markdown" }],
+        },
+        runtimeSignals: {
+          snapshotId: "snapshot-one",
+          topSignals: [{ signal_id: "first", evidence: "first transient signal" }],
+        },
+      },
+    });
+
+    const first = await worker.analyze("structural-first", base);
+    const second = await worker.analyze("structural-second", {
+      ...base,
+      idempotencyKey: "structural-second-key",
+      context: {
+        ...(base.context ?? {}),
+        runtimeSignals: {
+          snapshotId: "snapshot-two",
+          topSignals: [{ signal_id: "second", evidence: "different transient signal" }],
+        },
+      },
+    });
+
+    expect(first.cache.hit).toBe(false);
+    expect(second.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(1);
+    expect(second.cache.key).toBeTruthy();
+
+    const changedVision = await worker.analyze("structural-third", {
+      ...base,
+      idempotencyKey: "structural-third-key",
+      context: {
+        ...(base.context ?? {}),
+        vision: {
+          ...((base.context?.vision as Record<string, unknown>) ?? {}),
+          sha256: "b".repeat(64),
+        },
+      },
+    });
+    expect(changedVision.cache.hit).toBe(false);
+    expect(llm.analysisCalls).toHaveLength(2);
+
+    const changedProtocol = await worker.analyze("structural-fourth", {
+      ...base,
+      question: "Identify grounded architecture candidates instead.",
+      idempotencyKey: "structural-fourth-key",
+    });
+    expect(changedProtocol.cache.hit).toBe(false);
+    expect(llm.analysisCalls).toHaveLength(3);
+  });
+
+  test("persists timeout evidence, opens after two matching failures, and recovers half-open", async () => {
+    const repo = createRepository();
+    const memory = new InMemoryMemoryStore();
+    let providerCalls = 0;
+    let providerHealthy = false;
+    const llm: LLMClient = {
+      async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+        providerCalls++;
+        if (providerHealthy) return { text: JSON.stringify(modelResponse()) };
+        return await new Promise<LLMGenerateOutput>((_resolve, reject) => {
+          const onAbort = () => reject(input.signal?.reason ?? new Error("provider aborted"));
+          input.signal?.addEventListener("abort", onAbort, { once: true });
+          if (input.signal?.aborted) onAbort();
+        });
+      },
+    };
+    const makeWorker = () =>
+      new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm,
+        modelId: "circuit-test-model",
+        capabilityCircuitCooldownMs: 2_500,
+        finalizationReserveMs: 500,
+        providerDrainMs: 100,
+        logger: { log: () => {}, warn: () => {}, error: () => {} },
+      });
+    const worker = makeWorker();
+    const timedRequest = async (key: string) =>
+      await requestFor(repo, {
+        freshness: "fresh_required",
+        idempotencyKey: key,
+        deadlineAt: new Date(Date.now() + 3_000).toISOString(),
+      });
+
+    const firstStartedAt = Date.now();
+    const first = await worker.analyze("circuit-first", await timedRequest("circuit-first"));
+    expect(Date.now() - firstStartedAt).toBeLessThan(3_500);
+    const second = await worker.analyze("circuit-second", await timedRequest("circuit-second"));
+    expect((first.data as Record<string, unknown>).repositoryAgentMode).toBe(
+      "deterministic_evidence_fallback",
+    );
+    expect(first.evidence.length).toBeGreaterThan(0);
+    expect(first.memoryRefs.some((ref) => ref.namespace === "repository_facts")).toBe(true);
+    expect((second.data as Record<string, unknown>).repositoryAgentMode).toBe(
+      "deterministic_evidence_fallback",
+    );
+    expect(providerCalls).toBe(2);
+
+    const openCircuit = await memory.search({
+      scope: {
+        namespace: "repository_agent_capabilities",
+        repositoryId: first.analyzedRepository.identity,
+      },
+      maxItems: 10,
+      maxChars: 100_000,
+    });
+    expect(openCircuit).toHaveLength(1);
+    expect((openCircuit[0]?.value as Record<string, unknown>).state).toBe("open");
+    expect((openCircuit[0]?.value as Record<string, unknown>).consecutiveFailures).toBe(2);
+
+    const blocked = await makeWorker().analyze(
+      "circuit-blocked",
+      await timedRequest("circuit-blocked"),
+    );
+    expect((blocked.data as Record<string, unknown>).synthesisStatus).toContain("circuit open");
+    expect(providerCalls).toBe(2);
+
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_600));
+    providerHealthy = true;
+    const recovered = await makeWorker().analyze(
+      "circuit-recovered",
+      await timedRequest("circuit-recovered"),
+    );
+    expect(recovered.answer).toContain("documented reliability priority");
+    expect(providerCalls).toBe(3);
+    const recoveredCircuit = await memory.search({
+      scope: {
+        namespace: "repository_agent_capabilities",
+        repositoryId: recovered.analyzedRepository.identity,
+      },
+      maxItems: 10,
+      maxChars: 100_000,
+    });
+    expect((recoveredCircuit[0]?.value as Record<string, unknown>).state).toBe("closed");
+    expect((recoveredCircuit[0]?.value as Record<string, unknown>).consecutiveFailures).toBe(0);
+  }, 20_000);
 
   test("uses exact clean-snapshot Git blob content and citations across CRLF smudge", async () => {
     const repo = createRepository();
@@ -535,22 +692,20 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
     await worker.analyze("request-packet", request);
 
-    expect(llm.discoveryCalls[0]?.executionContext).toEqual({
-      repositoryMode: "isolated-evidence",
-    });
+    expect(llm.discoveryCalls).toHaveLength(0);
     expect(llm.analysisCalls[0]?.executionContext).toEqual({
       repositoryMode: "isolated-evidence",
     });
     const payload = JSON.parse(llm.analysisCalls[0]?.messages[0]?.content ?? "{}") as {
       evidencePacket: {
         trackedPathCount: number;
-        trackedPaths: string[];
+        selectedPaths: string[];
         files: Array<{ path: string; content: string }>;
         recentGitHistory: string[];
       };
     };
     expect(payload.evidencePacket.trackedPathCount).toBe(5);
-    expect(payload.evidencePacket.trackedPaths).toContain("src/index.ts");
+    expect(payload.evidencePacket.selectedPaths).toEqual([]);
     expect(payload.evidencePacket.files.map((entry) => entry.path)).toEqual(
       expect.arrayContaining([
         "vision.md",
@@ -566,7 +721,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(payload.evidencePacket.recentGitHistory[0]).toContain("initial fixture");
   });
 
-  test("uses model-guided retrieval to add a non-seed source file for a broad question", async () => {
+  test("uses deterministic path-ranked retrieval to add a non-seed source file", async () => {
     const repo = createRepository();
     writeFileSync(
       join(repo, "src", "scheduler.ts"),
@@ -592,13 +747,10 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       question: "Where is background work selected and scheduled?",
       context: {},
     });
-    const llm = new FakeLlm(
-      () =>
-        modelResponse({
-          evidence: [{ path: "src/scheduler.ts", startLine: 1, endLine: 1 }],
-        }),
-      0,
-      () => ({ paths: ["src/scheduler.ts"] }),
+    const llm = new FakeLlm(() =>
+      modelResponse({
+        evidence: [{ path: "src/scheduler.ts", startLine: 1, endLine: 1 }],
+      }),
     );
     const worker = new RepositoryAgentWorker({
       control: unusedControl(),
@@ -609,21 +761,14 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
     const result = await worker.analyze("guided-retrieval", request);
 
-    const discoveryPayload = JSON.parse(llm.discoveryCalls[0]?.messages[0]?.content ?? "{}") as {
-      trackedPathIndex: string[];
-      seedEvidence: { files: Array<{ path: string }> };
-    };
-    expect(discoveryPayload.trackedPathIndex).toContain("src/scheduler.ts");
-    expect(discoveryPayload.seedEvidence.files.map((entry) => entry.path)).not.toContain(
-      "src/scheduler.ts",
-    );
+    expect(llm.discoveryCalls).toHaveLength(0);
     const analysisPayload = JSON.parse(llm.analysisCalls[0]?.messages[0]?.content ?? "{}") as {
       evidencePacket: {
         files: Array<{ path: string; content: string }>;
-        modelSelectedPaths: string[];
+        selectedPaths: string[];
       };
     };
-    expect(analysisPayload.evidencePacket.modelSelectedPaths).toEqual(["src/scheduler.ts"]);
+    expect(analysisPayload.evidencePacket.selectedPaths).toEqual(["src/scheduler.ts"]);
     expect(analysisPayload.evidencePacket.files.map((entry) => entry.path)).toContain(
       "src/scheduler.ts",
     );
@@ -634,7 +779,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(result.evidence[0]?.path).toBe("src/scheduler.ts");
   });
 
-  test("rejects malicious, absolute, and untracked discovery paths", async () => {
+  test("deterministic retrieval never admits absolute or untracked context paths", async () => {
     const repo = createRepository();
     writeFileSync(join(repo, "untracked.txt"), "must not enter the evidence packet\n");
     const extraTrackedPaths = Array.from(
@@ -661,23 +806,17 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     const request = await requestFor(repo, {
       freshness: "fresh_required",
       purpose: "architecture",
-      question: "Which implementation file should be inspected next?",
-      context: {},
-    });
-    const llm = new FakeLlm(
-      () => modelResponse(),
-      0,
-      () => ({
-        paths: [
+      question: "Inspect the explicitly named source coordinate.",
+      context: {
+        targetPaths: [
+          "src/index.ts",
           "../outside-secret.txt",
           join(repo, "src", "index.ts"),
           "untracked.txt",
-          "src/index.ts",
-          "src/index.ts",
-          ...extraTrackedPaths,
         ],
-      }),
-    );
+      },
+    });
+    const llm = new FakeLlm(() => modelResponse());
     const worker = new RepositoryAgentWorker({
       control: unusedControl(),
       memory: new InMemoryMemoryStore(),
@@ -690,19 +829,19 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     const payload = JSON.parse(llm.analysisCalls[0]?.messages[0]?.content ?? "{}") as {
       evidencePacket: {
         files: Array<{ path: string }>;
-        modelSelectedPaths: string[];
+        selectedPaths: string[];
       };
     };
-    expect(payload.evidencePacket.modelSelectedPaths[0]).toBe("src/index.ts");
-    expect(payload.evidencePacket.modelSelectedPaths).toHaveLength(12);
-    expect(payload.evidencePacket.modelSelectedPaths).not.toContain(extraTrackedPaths[11]);
+    expect(llm.discoveryCalls).toHaveLength(0);
+    expect(payload.evidencePacket.files.map((entry) => entry.path)).toContain("src/index.ts");
+    expect(payload.evidencePacket.selectedPaths).not.toContain(extraTrackedPaths[11]);
     expect(payload.evidencePacket.files.map((entry) => entry.path)).not.toContain("untracked.txt");
     expect(payload.evidencePacket.files.map((entry) => entry.path)).not.toContain(
       "../outside-secret.txt",
     );
   });
 
-  test("falls back to the bounded seed packet when discovery is malformed", async () => {
+  test("never invokes provider retrieval and sends one bounded synthesis packet", async () => {
     const repo = createRepository();
     const request = await requestFor(repo, {
       freshness: "fresh_required",
@@ -724,18 +863,18 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
     await worker.analyze("retrieval-fallback", request);
 
-    expect(llm.discoveryCalls).toHaveLength(1);
+    expect(llm.discoveryCalls).toHaveLength(0);
     expect(llm.analysisCalls).toHaveLength(1);
     const payload = JSON.parse(llm.analysisCalls[0]?.messages[0]?.content ?? "{}") as {
-      evidencePacket: { seedPaths: string[]; modelSelectedPaths: string[] };
+      evidencePacket: { seedPaths: string[]; selectedPaths: string[] };
     };
     expect(payload.evidencePacket.seedPaths).toEqual(
       expect.arrayContaining(["vision.md", "README.md", "package.json"]),
     );
-    expect(payload.evidencePacket.modelSelectedPaths).toEqual([]);
+    expect(payload.evidencePacket.selectedPaths).toEqual([]);
   });
 
-  test("waits for discovery cancellation cleanup before continuing with seed evidence", async () => {
+  test("starts exactly one provider stage after deterministic retrieval", async () => {
     const repo = createRepository();
     const request = await requestFor(repo, {
       freshness: "fresh_required",
@@ -744,8 +883,6 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       deadlineAt: new Date(Date.now() + 6_000).toISOString(),
     });
     const analysisCalls: LLMGenerateInput[] = [];
-    let discoveryActive = false;
-    let discoveryCancelledAt = 0;
     let analysisStartedAt = 0;
     const llm: LLMClient = {
       async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
@@ -755,22 +892,8 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
           typeof schemaProperties === "object" &&
           "paths" in schemaProperties &&
           !("answer" in schemaProperties);
-        if (discovery) {
-          discoveryActive = true;
-          return await new Promise<LLMGenerateOutput>((_resolve, reject) => {
-            const onAbort = () => {
-              setTimeout(() => {
-                discoveryActive = false;
-                discoveryCancelledAt = Date.now();
-                reject(input.signal?.reason ?? new Error("discovery aborted"));
-              }, 40);
-            };
-            input.signal?.addEventListener("abort", onAbort, { once: true });
-            if (input.signal?.aborted) onAbort();
-          });
-        }
+        expect(discovery).toBe(false);
         analysisStartedAt = Date.now();
-        expect(discoveryActive).toBe(false);
         analysisCalls.push(input);
         return { text: JSON.stringify(modelResponse()) };
       },
@@ -788,12 +911,11 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
     expect(Date.now() - startedAt).toBeLessThan(5_000);
     expect(analysisCalls).toHaveLength(1);
-    expect(discoveryCancelledAt).toBeGreaterThan(0);
-    expect(analysisStartedAt).toBeGreaterThanOrEqual(discoveryCancelledAt);
+    expect(analysisStartedAt).toBeGreaterThanOrEqual(startedAt);
     const payload = JSON.parse(analysisCalls[0]?.messages[0]?.content ?? "{}") as {
-      evidencePacket: { modelSelectedPaths: string[] };
+      evidencePacket: { selectedPaths: string[] };
     };
-    expect(payload.evidencePacket.modelSelectedPaths).toEqual([]);
+    expect(payload.evidencePacket.selectedPaths).toEqual([]);
     expect(result.evidence[0]?.path).toBe("vision.md");
   });
 
@@ -982,7 +1104,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
     expect(first.confidence).toBe(0.25);
     expect(second.cache.hit).toBe(false);
-    expect(llm.discoveryCalls).toHaveLength(2);
+    expect(llm.discoveryCalls).toHaveLength(0);
     expect(llm.analysisCalls).toHaveLength(2);
     expect(
       await memory.search({
@@ -1356,7 +1478,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
     await worker.pollOnce();
 
-    expect(llm.discoveryCalls).toHaveLength(1);
+    expect(llm.discoveryCalls).toHaveLength(0);
     expect(llm.analysisCalls).toHaveLength(1);
     expect(control.renewals).toBeGreaterThan(0);
     expect(control.completed?.requestId).toBe("claimed-request");

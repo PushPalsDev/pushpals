@@ -38,13 +38,17 @@ import {
 } from "shared";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type {
+  JobCandidateState,
   JobDiagnostics,
   JobPatchSnapshotDiagnostics,
   JobPublishBlockedInfo,
   JobResult,
+  JobTokenUsage,
+  JobUsageAttempt,
   JobTerminalDiagnostics,
   JobValidationRunDiagnostics,
 } from "./common/types.js";
+import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
 import {
   compactJobOutput,
   truncate,
@@ -112,7 +116,27 @@ export interface ValidationExecutionResult {
   /** Synthetic higher-tier skips inherit an environment-only lower-tier blocker. */
   inheritedFailureClass?: "environment";
   deferredByCommand?: string;
+  /** Stable identifier critics must cite for validation claims. */
+  evidenceId?: string;
+  failureClass?: ValidationFailureClass;
+  /** Planned DAG provenance; distinct from the exact outcome-bound evidence ID. */
+  plannedEvidenceId?: string;
+  capability?: "worker" | "trusted_host";
+  subsumes?: string[];
+  subsumedBy?: string[];
 }
+
+export type ValidationFailureClass =
+  | "candidate.assertion"
+  | "candidate.compile"
+  | "repository.dependency"
+  | "environment.docker"
+  | "environment.toolchain"
+  | "environment.browser"
+  | "environment.sandbox"
+  | "environment.network"
+  | "deadline"
+  | "unknown";
 
 export interface ValidationBlocker {
   category: "repo" | "environment";
@@ -191,13 +215,34 @@ export interface DeterministicQualityResult {
   trustedValidationPendingCommands?: string[];
 }
 
-interface CriticReview {
+export interface CriticReview {
   score: number;
   findings: string[];
   mustFix: string[];
   revisionGuidance: string;
   raw: string;
+  evidenceIds?: string[];
+  unsupportedFindings?: string[];
 }
+
+export type CriticOutcome =
+  | { kind: "verdict"; review: CriticReview; usageAttempts: JobUsageAttempt[] }
+  | {
+      kind: "skipped";
+      reason:
+        | "disabled"
+        | "quality_skipped"
+        | "unchanged_validation_failure"
+        | "executor_timeout"
+        | "deterministic_revision"
+        | "revision_budget";
+      usageAttempts: JobUsageAttempt[];
+    }
+  | {
+      kind: "timeout" | "unavailable" | "invalid";
+      reason: string;
+      usageAttempts: JobUsageAttempt[];
+    };
 
 export interface ReviewFixContext {
   resolutionType: "review_fix";
@@ -297,6 +342,27 @@ export function criticActionableFeedbackCount(
     critic.findings.length +
     (String(critic.revisionGuidance ?? "").trim() ? 1 : 0)
   );
+}
+
+export function criticGateDisposition(input: {
+  outcome: CriticOutcome;
+  criticGateEnabled: boolean;
+  deterministicRequiresRevision: boolean;
+  criticMinScore: number;
+}): "pass" | "revise" | "hold_candidate" {
+  if (input.deterministicRequiresRevision) return "revise";
+  if (!input.criticGateEnabled) return "pass";
+  if (input.outcome.kind === "verdict") {
+    if (input.outcome.review.score >= input.criticMinScore) return "pass";
+    return criticActionableFeedbackCount(input.outcome.review) > 0 ? "revise" : "hold_candidate";
+  }
+  if (
+    input.outcome.kind === "skipped" &&
+    (input.outcome.reason === "disabled" || input.outcome.reason === "quality_skipped")
+  ) {
+    return "pass";
+  }
+  return "hold_candidate";
 }
 
 export function criticRepairContinuationBudgetDecision(opts: {
@@ -1021,15 +1087,18 @@ function isDockerDaemonValidationBlocker(value: string): boolean {
   );
 }
 
+function hasConcreteAssertionFailureEvidence(value: string): boolean {
+  return /\bassertionerror\b|\bassert(?:ion)?(?:\s+failed|:)\b|\bexpected\b[\s\S]{0,160}\b(?:received|actual|to be|to equal|to contain|to match)\b|\b(?:\d+\s+)?tests?\s+failed\b|\blocator\.[a-z0-9_]+:\s+timeout\b/.test(
+    value,
+  );
+}
+
 export function classifyValidationRunFailure(run: ValidationExecutionResult): string | null {
   if (run.ok) return null;
   if (run.inheritedFailureClass) return run.inheritedFailureClass;
   const combined = `${run.command}\n${run.stdout}\n${run.stderr}`.toLowerCase();
   const command = run.command.toLowerCase();
   const output = `${run.stdout}\n${run.stderr}`.toLowerCase();
-  if (isDockerDaemonValidationBlocker(combined)) {
-    return "environment";
-  }
   if (
     run.exitCode === 124 ||
     /\b(?:command|process|request|connection|validation|test|browser|playwright|executor)\s+timed out\b/i.test(
@@ -1047,6 +1116,10 @@ export function classifyValidationRunFailure(run: ValidationExecutionResult): st
     combined.includes("not recognized as an internal or external command")
   ) {
     return "missing_tool";
+  }
+  if (hasConcreteAssertionFailureEvidence(combined)) return "nonzero_exit";
+  if (isDockerDaemonValidationBlocker(combined)) {
+    return "environment";
   }
   if (
     /(?:browser|playwright|cypress|web:e2e)/.test(command) ||
@@ -1066,6 +1139,106 @@ export function classifyValidationRunFailure(run: ValidationExecutionResult): st
   return "nonzero_exit";
 }
 
+export function classifyValidationFailureClass(
+  run: ValidationExecutionResult,
+): ValidationFailureClass | null {
+  if (run.ok) return null;
+  if (run.failureClass) return run.failureClass;
+  if (run.inheritedFailureClass === "environment") return "environment.sandbox";
+  const combined = `${run.command}\n${run.stdout}\n${run.stderr}`.toLowerCase();
+  if (run.terminalStatusSource === "deadline" || run.exitCode === 124) return "deadline";
+  // Exit 127 is structural process evidence; unlike output substrings, an
+  // assertion cannot make a process-level missing executable trustworthy.
+  if (run.exitCode === 127) return "environment.toolchain";
+  if (
+    combined.includes("cannot find module") ||
+    combined.includes("module not found") ||
+    combined.includes("failed to resolve import") ||
+    combined.includes("could not resolve") ||
+    combined.includes("no such file or directory") ||
+    combined.includes("package not found")
+  ) {
+    return "repository.dependency";
+  }
+  if (
+    /typecheck|compile|syntaxerror|does not provide an export|no exported member/.test(combined)
+  ) {
+    return "candidate.compile";
+  }
+  // Concrete assertion/test-runner evidence is authoritative even when the
+  // assertion text happens to mention an environmental phrase such as
+  // "permission denied" or "connection refused". Do not hand a broken
+  // candidate to trusted-host validation from an incidental substring.
+  if (hasConcreteAssertionFailureEvidence(combined)) {
+    return "candidate.assertion";
+  }
+  if (isDockerDaemonValidationBlocker(combined)) return "environment.docker";
+  if (
+    combined.includes("browser runtime preflight failed") ||
+    combined.includes("playwright install") ||
+    combined.includes("executable doesn't exist")
+  ) {
+    const fallbackSucceeded =
+      combined.includes("using google chrome for browser automation") ||
+      combined.includes("using chromium for browser automation") ||
+      combined.includes("using firefox for browser automation") ||
+      combined.includes("using webkit for browser automation");
+    if (!fallbackSucceeded) return "environment.browser";
+  }
+  if (
+    combined.includes("missing required tool") ||
+    combined.includes("command not found") ||
+    combined.includes("executable not found") ||
+    combined.includes("not recognized as an internal or external command")
+  ) {
+    return "environment.toolchain";
+  }
+  if (
+    combined.includes("read-only file system") ||
+    combined.includes("permission denied") ||
+    combined.includes("operation not permitted") ||
+    combined.includes("eperm") ||
+    combined.includes("eacces")
+  ) {
+    return "environment.sandbox";
+  }
+  if (
+    combined.includes("network access") ||
+    combined.includes("connection refused") ||
+    combined.includes("getaddrinfo") ||
+    combined.includes("err_socket_bad_port") ||
+    combined.includes("expo exited early")
+  ) {
+    return "environment.network";
+  }
+  return "unknown";
+}
+
+export function validationEvidenceId(
+  run: Pick<ValidationExecutionResult, "command"> &
+    Partial<
+      Pick<
+        ValidationExecutionResult,
+        "ok" | "exitCode" | "stdout" | "stderr" | "terminalStatusSource"
+      >
+    >,
+): string {
+  const hasOutcome = typeof run.ok === "boolean" || typeof run.exitCode === "number";
+  const provenance = hasOutcome
+    ? [
+        validationCommandKey(run.command),
+        run.ok === true ? "pass" : "fail",
+        Number.isFinite(Number(run.exitCode)) ? String(run.exitCode) : "unknown",
+        run.terminalStatusSource ?? "process_exit",
+        createHash("sha256")
+          .update(`${run.stdout ?? ""}\n${run.stderr ?? ""}`)
+          .digest("hex")
+          .slice(0, 16),
+      ].join("\0")
+    : validationCommandKey(run.command);
+  return `validation:${createHash("sha256").update(provenance).digest("hex").slice(0, 12)}`;
+}
+
 function buildValidationRunDiagnostics(
   runs: ValidationExecutionResult[],
   attempt: number,
@@ -1076,12 +1249,22 @@ function buildValidationRunDiagnostics(
     exitCode: run.exitCode,
     durationMs: run.elapsedMs,
     passed: run.ok,
-    failureClass: classifyValidationRunFailure(run),
+    failureClass: classifyValidationFailureClass(run) ?? classifyValidationRunFailure(run),
     stdoutTail: compactDiagnosticText(run.stdout),
     stderrTail: compactDiagnosticText(run.stderr),
-    ...(run.browserSignal || run.inheritedFailureClass || run.deferredByCommand
+    ...(run.browserSignal ||
+    run.inheritedFailureClass ||
+    run.deferredByCommand ||
+    run.evidenceId ||
+    run.plannedEvidenceId ||
+    run.capability
       ? {
           metadata: {
+            evidenceId: run.evidenceId ?? validationEvidenceId(run),
+            ...(run.plannedEvidenceId ? { plannedEvidenceId: run.plannedEvidenceId } : {}),
+            ...(run.capability ? { capability: run.capability } : {}),
+            ...(run.subsumes?.length ? { subsumes: run.subsumes } : {}),
+            ...(run.subsumedBy?.length ? { subsumedBy: run.subsumedBy } : {}),
             ...(run.browserSignal
               ? {
                   browserSignal: run.browserSignal,
@@ -1913,7 +2096,9 @@ export async function runValidationArgv(
   const stderrCapture = captureValidationStream(
     (proc.stderr ?? null) as ReadableStream<Uint8Array> | null,
   );
-  const timeout = Math.max(1_000, timeoutMs);
+  // `timeoutMs` may already be capped to the final milliseconds remaining in
+  // the absolute job ledger. Never round that cap back up and mint time.
+  const timeout = Math.max(1, Math.floor(timeoutMs));
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<ValidationWaitResult>((resolveTimeout) => {
     timeoutTimer = setTimeout(() => {
@@ -2008,7 +2193,7 @@ async function runValidationCommand(
     env,
     timeoutMs,
     outputPolicy,
-    `Validation command timed out after ${Math.max(1_000, timeoutMs)}ms. Captured output is the process output emitted before PushPals terminated the command and its process tree.`,
+    `Validation command timed out after ${Math.max(1, Math.floor(timeoutMs))}ms. Captured output is the process output emitted before PushPals terminated the command and its process tree.`,
   );
 }
 
@@ -2098,6 +2283,7 @@ async function acquireRepoValidationLease(
   repo: string,
   command: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  waitTimeoutMs = 15 * 60_000,
 ): Promise<(() => void) | null> {
   if (!isRepoAggregateValidationCommand(repo, command)) return () => {};
   const commonDirResult = await git(repo, ["rev-parse", "--git-common-dir"]);
@@ -2112,7 +2298,8 @@ async function acquireRepoValidationLease(
   let lastWaitLogAt = 0;
   mkdirSync(leaseParent, { recursive: true });
 
-  while (Date.now() - waitStartedAt < 15 * 60_000) {
+  const waitDeadlineAt = waitStartedAt + Math.max(1, Math.floor(waitTimeoutMs));
+  while (Date.now() < waitDeadlineAt) {
     try {
       mkdirSync(leaseDir);
       const acquiredAt = new Date().toISOString();
@@ -2194,34 +2381,72 @@ async function acquireRepoValidationLease(
           `[ValidationGate] Waiting for another WorkerPal's aggregate validation to finish: ${command}`,
         );
       }
-      await new Promise((resolveWait) => setTimeout(resolveWait, 750));
+      const remainingWaitMs = Math.max(0, waitDeadlineAt - Date.now());
+      if (remainingWaitMs <= 0) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, Math.min(750, remainingWaitMs)));
     }
   }
   return null;
 }
 
-async function runValidationCommandWithRepoLease(
+export async function runValidationCommandWithRepoLease(
   repo: string,
   command: string,
   timeoutMs: number,
   outputPolicy: Partial<OutputCompactionPolicy>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<ValidationExecutionResult> {
-  const release = await acquireRepoValidationLease(repo, command, onLog);
-  if (!release) {
+  const leaseStartedAt = Date.now();
+  const leaseWaitTimeoutMs = deadlineLedger ? deadlineLedger.remainingWorkMs() : 15 * 60_000;
+  if (leaseWaitTimeoutMs <= 0) {
     return {
       step: command,
       command,
       ok: false,
-      exitCode: 75,
+      exitCode: 124,
       stdout: "",
-      stderr:
-        "Timed out waiting for the repo aggregate-validation lease. Another WorkerPal is still validating this repository; retry after it completes.",
-      elapsedMs: 15 * 60_000,
+      stderr: "Validation lease wait did not start because the absolute job deadline expired.",
+      elapsedMs: 0,
+      terminalStatusSource: "deadline",
+      failureClass: "deadline",
+    };
+  }
+  const release = await acquireRepoValidationLease(repo, command, onLog, leaseWaitTimeoutMs);
+  if (!release) {
+    const deadlineExpired = deadlineLedger?.workExpired() === true;
+    return {
+      step: command,
+      command,
+      ok: false,
+      exitCode: deadlineExpired ? 124 : 75,
+      stdout: "",
+      stderr: deadlineExpired
+        ? "The absolute job deadline expired while waiting for the repo aggregate-validation lease."
+        : "Timed out waiting for the repo aggregate-validation lease. Another WorkerPal is still validating this repository; retry after it completes.",
+      elapsedMs: Math.max(1, Date.now() - leaseStartedAt),
+      ...(deadlineExpired
+        ? { terminalStatusSource: "deadline" as const, failureClass: "deadline" as const }
+        : {}),
     };
   }
   try {
-    return await runValidationCommand(repo, command, timeoutMs, outputPolicy);
+    const commandTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(timeoutMs) : timeoutMs;
+    if (commandTimeoutMs <= 0) {
+      return {
+        step: command,
+        command,
+        ok: false,
+        exitCode: 124,
+        stdout: "",
+        stderr:
+          "Validation did not start after acquiring the repo lease because the absolute job deadline expired.",
+        elapsedMs: Math.max(1, Date.now() - leaseStartedAt),
+        terminalStatusSource: "deadline",
+        failureClass: "deadline",
+      };
+    }
+    return await runValidationCommand(repo, command, commandTimeoutMs, outputPolicy);
   } finally {
     release();
   }
@@ -2713,7 +2938,7 @@ async function runPlaywrightBrowserRuntimePreflight(
   outputPolicy: Partial<OutputCompactionPolicy>,
 ): Promise<ValidationExecutionResult> {
   const env = buildWorkerSandboxWritableEnv(repo);
-  const timeout = Math.max(120_000, Math.min(600_000, timeoutMs));
+  const timeout = Math.max(1, Math.min(600_000, Math.floor(timeoutMs)));
   return runValidationArgv(
     repo,
     command,
@@ -3186,6 +3411,7 @@ async function runBunDependencyLayoutPreflight(
   timeoutMs: number,
   outputPolicy: Partial<OutputCompactionPolicy>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<ValidationExecutionResult | null> {
   const preflight = resolveBunDependencyLayoutPreflight(repo, validationCommands);
   if (!preflight) return null;
@@ -3196,16 +3422,29 @@ async function runBunDependencyLayoutPreflight(
   if (preflight.removeLinkedNodeModules) {
     removeLinkedNodeModulesDependencyArtifact(repo, onLog);
   }
-  const run = await runValidationCommand(
+  const requestedTimeoutMs = resolveBunDependencyLayoutPreflightTimeoutForValidationCommands(
     repo,
-    preflight.command,
-    resolveBunDependencyLayoutPreflightTimeoutForValidationCommands(
-      repo,
-      validationCommands,
-      timeoutMs,
-    ),
-    outputPolicy,
+    validationCommands,
+    timeoutMs,
   );
+  const preflightTimeoutMs = deadlineLedger
+    ? deadlineLedger.capWorkTimeout(requestedTimeoutMs)
+    : requestedTimeoutMs;
+  const run =
+    preflightTimeoutMs <= 0
+      ? {
+          step: preflight.command,
+          command: preflight.command,
+          ok: false,
+          exitCode: 124,
+          stdout: "",
+          stderr:
+            "Dependency layout preflight did not start because the absolute job deadline expired.",
+          elapsedMs: 0,
+          terminalStatusSource: "deadline" as const,
+          failureClass: "deadline" as const,
+        }
+      : await runValidationCommand(repo, preflight.command, preflightTimeoutMs, outputPolicy);
   if (run.ok) {
     onLog?.(
       "stdout",
@@ -3273,7 +3512,7 @@ async function checkToolCandidate(
   try {
     const result = await runBoundedWorkerProcess(toolProbeArgv(candidate, spawnEnv), {
       env: spawnEnv,
-      timeoutMs: Math.max(1_000, timeoutMs),
+      timeoutMs: Math.max(1, Math.floor(timeoutMs)),
       outputLimitBytes: 64 * 1024,
     });
     return !result.timedOut && !result.drainTimedOut && result.exitCode === 0;
@@ -3285,13 +3524,16 @@ async function checkToolCandidate(
 async function checkToolAvailability(
   requirements: ToolRequirement[],
   env: Record<string, string> = withResolvedBunOnPath(process.env as Record<string, string>),
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<ToolAvailabilityResult[]> {
   const cache = new Map<string, Promise<boolean>>();
   const check = (candidate: string) => {
     const key = candidate.toLowerCase();
     let cached = cache.get(key);
     if (!cached) {
-      cached = checkToolCandidate(candidate, env);
+      const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(5_000) : 5_000;
+      cached =
+        timeoutMs > 0 ? checkToolCandidate(candidate, env, timeoutMs) : Promise.resolve(false);
       cache.set(key, cached);
     }
     return cached;
@@ -3504,90 +3746,26 @@ export function detectValidationBlocker(
 ): ValidationBlocker | null {
   const failedRuns = runs.filter((run) => !run.ok);
   if (failedRuns.length === 0) return null;
-  if (failedRuns.every((run) => run.inheritedFailureClass === "environment")) {
-    return {
-      category: "environment",
-      detail:
-        "Validation was skipped because a lower-tier command is blocked by the worker environment. Preserve the candidate and rerun the blocked command chain on the trusted host.",
-    };
+  const failureClasses = failedRuns.map((run) => classifyValidationFailureClass(run));
+  const allEnvironment = failureClasses.every(
+    (failureClass) => failureClass?.startsWith("environment.") === true,
+  );
+  if (allEnvironment) {
+    const categories = new Set(failureClasses);
+    const detail = categories.has("environment.docker")
+      ? "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the exact candidate and rerun the blocked command against that SHA in a trusted host environment."
+      : categories.has("environment.toolchain") || categories.has("environment.browser")
+        ? "Validation is blocked by missing required toolchain executables or browser runtime support in the worker environment. Preserve the exact candidate and provision the trusted host before validating that SHA."
+        : "Validation is blocked by sandbox environment restrictions (filesystem, permissions, or network). Preserve the exact candidate and rerun the blocked command chain against that SHA on the trusted host.";
+    return { category: "environment", detail };
   }
-
-  const combined = failedRuns
-    .flatMap((run) => [run.stdout, run.stderr])
-    .filter(Boolean)
-    .join("\n")
-    .toLowerCase();
-  if (!combined) return null;
-
-  const browserFallbackSucceeded =
-    combined.includes("using google chrome for browser automation") ||
-    combined.includes("using chromium for browser automation") ||
-    combined.includes("using firefox for browser automation") ||
-    combined.includes("using webkit for browser automation");
-  const hasMissingBrowserRuntime =
-    !browserFallbackSucceeded &&
-    (combined.includes("browser runtime preflight failed") ||
-      combined.includes("playwright install") ||
-      combined.includes("executable doesn't exist") ||
-      combined.includes("please run the following command to download new browsers"));
-
-  if (isDockerDaemonValidationBlocker(combined)) {
-    return {
-      category: "environment",
-      detail:
-        "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the candidate and rerun the blocked command in a trusted host environment.",
-    };
-  }
-
-  if (
-    combined.includes("validation skipped before execution because required tool") ||
-    combined.includes("missing required tool") ||
-    combined.includes("command not found") ||
-    combined.includes("executable not found") ||
-    hasMissingBrowserRuntime ||
-    combined.includes("not recognized as an internal or external command")
-  ) {
-    return {
-      category: "environment",
-      detail:
-        "Validation is blocked by missing required toolchain executables or browser runtime support in the worker environment. Install/provision the missing tools or browser runtime before retrying this job.",
-    };
-  }
-
-  if (
-    combined.includes("cannot find module") ||
-    combined.includes("module not found") ||
-    combined.includes("failed to resolve import") ||
-    combined.includes("could not resolve") ||
-    combined.includes("no such file or directory") ||
-    combined.includes("package not found")
-  ) {
+  if (failureClasses.every((failureClass) => failureClass === "repository.dependency")) {
     return {
       category: "repo",
       detail:
         "Validation is blocked by missing repo dependencies or imported files. Fix the repository test/runtime setup before retrying this job.",
     };
   }
-
-  if (
-    combined.includes("read-only file system") ||
-    combined.includes("permission denied") ||
-    combined.includes("network access") ||
-    combined.includes("connection refused") ||
-    combined.includes("getaddrinfo") ||
-    combined.includes("err_socket_bad_port") ||
-    combined.includes("expo exited early") ||
-    combined.includes("eperm") ||
-    combined.includes("operation not permitted") ||
-    combined.includes("eacces")
-  ) {
-    return {
-      category: "environment",
-      detail:
-        "Validation is blocked by sandbox environment restrictions (filesystem, permissions, or network). Retry only after the worker environment is fixed.",
-    };
-  }
-
   return null;
 }
 
@@ -3599,7 +3777,9 @@ export function isolatePureEnvironmentValidationDeferral(quality: DeterministicQ
   const failedRuns = quality.validationRuns.filter((run) => !run.ok);
   const pureEnvironmentDeferral =
     failedRuns.length > 0 &&
-    failedRuns.every((run) => detectValidationBlocker([run])?.category === "environment");
+    failedRuns.every(
+      (run) => classifyValidationFailureClass(run)?.startsWith("environment.") === true,
+    );
   if (!pureEnvironmentDeferral) {
     return { pureEnvironmentDeferral: false, qualityForCritic: quality, blockedCommands: [] };
   }
@@ -5378,12 +5558,20 @@ export function buildValidationExecutionDag(repo: string, commands: string[]): s
   const deduped = dedupeValidationCommands(commands);
   const retained = deduped.filter((candidate, candidateIndex) => {
     if (isFocusedValidationCommand(candidate)) return true;
-    return !deduped.some(
-      (aggregate, aggregateIndex) =>
-        aggregateIndex !== candidateIndex &&
-        validationCommandSubsumes(repo, aggregate, candidate) &&
-        (!validationCommandSubsumes(repo, candidate, aggregate) || aggregateIndex < candidateIndex),
-    );
+    return !deduped.some((aggregate, aggregateIndex) => {
+      if (aggregateIndex === candidateIndex) return false;
+      if (!validationCommandSubsumes(repo, aggregate, candidate)) return false;
+      // A trusted-host-only aggregate cannot stand in for a runnable worker
+      // child. Keep the child in the DAG so deterministic evidence is not
+      // silently lost when (for example) `validate` contains both unit tests
+      // and a Docker-dependent stage.
+      const aggregateCapability = trustedEnvironmentValidationDeferralReason(repo, aggregate);
+      const candidateCapability = trustedEnvironmentValidationDeferralReason(repo, candidate);
+      if (aggregateCapability && !candidateCapability) return false;
+      return (
+        !validationCommandSubsumes(repo, candidate, aggregate) || aggregateIndex < candidateIndex
+      );
+    });
   });
   return retained.sort((left, right) => {
     const focusedDelta =
@@ -5403,6 +5591,53 @@ export function buildValidationExecutionDag(repo: string, commands: string[]): s
   });
 }
 
+export interface ValidationExecutionPlanNode {
+  command: string;
+  evidenceId: string;
+  capability: "worker" | "trusted_host";
+  subsumes: string[];
+  subsumedBy: string[];
+}
+
+export function withValidationExecutionPlanProvenance(
+  run: ValidationExecutionResult,
+  plan: ValidationExecutionPlanNode | undefined,
+): ValidationExecutionResult {
+  if (!plan) return run;
+  return {
+    ...run,
+    plannedEvidenceId: plan.evidenceId,
+    capability: plan.capability,
+    subsumes: [...plan.subsumes],
+    subsumedBy: [...plan.subsumedBy],
+  };
+}
+
+export function buildValidationExecutionPlan(
+  repo: string,
+  commands: string[],
+): ValidationExecutionPlanNode[] {
+  const deduped = dedupeValidationCommands(commands);
+  const executionCommands = buildValidationExecutionDag(repo, deduped);
+  return executionCommands.map((command) => ({
+    command,
+    evidenceId: validationEvidenceId({ command }),
+    capability: trustedEnvironmentValidationDeferralReason(repo, command)
+      ? "trusted_host"
+      : "worker",
+    subsumes: deduped.filter(
+      (candidate) =>
+        validationCommandKey(candidate) !== validationCommandKey(command) &&
+        validationCommandSubsumes(repo, command, candidate),
+    ),
+    subsumedBy: deduped.filter(
+      (candidate) =>
+        validationCommandKey(candidate) !== validationCommandKey(command) &&
+        validationCommandSubsumes(repo, candidate, command),
+    ),
+  }));
+}
+
 export function collectQualityGateValidationCommands(params: {
   instruction: string;
   targetPath?: string;
@@ -5412,6 +5647,8 @@ export function collectQualityGateValidationCommands(params: {
   repo?: string;
   changedPaths?: string[];
 }): {
+  /** Complete sanitized discovery set, before aggregate subsumption pruning. */
+  discoveredCommands: string[];
   commandsToRun: string[];
   requiredRunnableSteps: string[];
   plannerRunnableSteps: string[];
@@ -5449,6 +5686,7 @@ export function collectQualityGateValidationCommands(params: {
     ? buildValidationExecutionDag(params.repo, discoveredCommands)
     : discoveredCommands;
   return {
+    discoveredCommands,
     commandsToRun,
     requiredRunnableSteps,
     plannerRunnableSteps,
@@ -5753,6 +5991,7 @@ async function runDeterministicQualityGate(
     revisionAttempt?: number;
     passingValidationCache?: Map<string, ValidationExecutionResult>;
   },
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<DeterministicQualityResult> {
   const instruction = String(params.instruction ?? "");
   const targetPath = String(params.targetPath ?? params.path ?? "").trim() || undefined;
@@ -5865,7 +6104,7 @@ async function runDeterministicQualityGate(
   }
 
   const {
-    commandsToRun: collectedCommandsToRun,
+    discoveredCommands,
     requiredRunnableSteps,
     plannerRunnableSteps,
     fallbackValidationSteps,
@@ -5878,8 +6117,12 @@ async function runDeterministicQualityGate(
     repo,
     changedPaths,
   });
-  const commandsToRun = collectedCommandsToRun
-    .map((command, index) => ({ command, index }))
+  // Build provenance from the complete discovery graph. Building it from the
+  // already-pruned execution list loses aggregate -> fallback relationships,
+  // leaving successful/failed evidence without an auditable capability DAG.
+  const validationExecutionPlan = buildValidationExecutionPlan(repo, discoveredCommands);
+  const commandsToRun = validationExecutionPlan
+    .map(({ command }, index) => ({ command, index }))
     .sort((left, right) => {
       const tierDelta =
         validationCommandExecutionTier(left.command) -
@@ -5888,6 +6131,9 @@ async function runDeterministicQualityGate(
     })
     .map((entry) => entry.command);
   const validationRuns: ValidationExecutionResult[] = [];
+  const validationPlanByCommand = new Map(
+    validationExecutionPlan.map((node) => [validationCommandKey(node.command), node] as const),
+  );
   const cacheContext = await validationCacheContext(repo, changedPaths);
   const runValidationWithCache = async (
     command: string,
@@ -5916,6 +6162,26 @@ async function runDeterministicQualityGate(
     if (!Number.isFinite(value)) return 180_000;
     return Math.max(1_000, Math.min(7_200_000, Math.floor(value)));
   })();
+  const qualityCommandTimeoutMs = (command: string): number => {
+    const requested = resolveValidationCommandTimeoutMs(
+      command,
+      qualityValidationStepTimeoutMs,
+      repo,
+    );
+    return deadlineLedger ? deadlineLedger.capWorkTimeout(requested) : requested;
+  };
+  const deadlineFailureRun = (command: string): ValidationExecutionResult => ({
+    step: command,
+    command,
+    ok: false,
+    exitCode: 124,
+    stdout: "",
+    stderr:
+      "Validation did not start because the absolute WorkerPal job deadline was exhausted; this is not a passing validation result.",
+    elapsedMs: 0,
+    terminalStatusSource: "deadline",
+    failureClass: "deadline",
+  });
   let requiredValidationFailures: string[] = [];
   if (qualityGatePolicy.validationGateEnabled) {
     if (hasRequiredValidationCriteria && requiredRunnableSteps.length === 0) {
@@ -5942,14 +6208,21 @@ async function runDeterministicQualityGate(
           `[ValidationGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`,
         );
       }
-      const dependencyPreflightFailure = await runBunDependencyLayoutPreflight(
-        repo,
-        commandsToRun,
-        requiredRunnableSteps[0] ?? commandsToRun[0] ?? "",
-        qualityValidationStepTimeoutMs,
-        outputPolicy,
-        onLog,
-      );
+      const dependencyPreflightTimeoutMs = deadlineLedger
+        ? deadlineLedger.capWorkTimeout(qualityValidationStepTimeoutMs)
+        : qualityValidationStepTimeoutMs;
+      const dependencyPreflightFailure =
+        dependencyPreflightTimeoutMs <= 0
+          ? deadlineFailureRun(requiredRunnableSteps[0] ?? commandsToRun[0] ?? "validation")
+          : await runBunDependencyLayoutPreflight(
+              repo,
+              commandsToRun,
+              requiredRunnableSteps[0] ?? commandsToRun[0] ?? "",
+              dependencyPreflightTimeoutMs,
+              outputPolicy,
+              onLog,
+              deadlineLedger,
+            );
       if (dependencyPreflightFailure) {
         validationRuns.push(dependencyPreflightFailure);
         onLog?.(
@@ -5972,6 +6245,7 @@ async function runDeterministicQualityGate(
         const toolAvailability = await checkToolAvailability(
           toolchainPlan.requirements,
           buildWorkerSandboxWritableEnv(repo),
+          deadlineLedger,
         );
         const missingToolRequirements = toolAvailability
           .filter((entry) => !entry.ok)
@@ -5987,6 +6261,14 @@ async function runDeterministicQualityGate(
         const playwrightBrowserRuntimeReadyTargets = new Set<string>();
         for (let commandIndex = 0; commandIndex < commandsToRun.length; ) {
           const nextCommand = commandsToRun[commandIndex];
+          if (deadlineLedger?.workExpired()) {
+            validationRuns.push(deadlineFailureRun(nextCommand));
+            onLog?.(
+              "stderr",
+              `[ValidationGate] Absolute job deadline exhausted before validation command: ${nextCommand}`,
+            );
+            break;
+          }
           const higherTierDeferral = higherTierValidationDeferralAfterFailure(
             nextCommand,
             validationRuns,
@@ -6064,18 +6346,12 @@ async function runDeterministicQualityGate(
                     summary: `[ValidationGate] Validation skipped (missing toolchain): ${command}`,
                   };
                 }
-                let run = await runValidationWithCache(command, () =>
-                  runValidationCommand(
-                    repo,
-                    command,
-                    resolveValidationCommandTimeoutMs(
-                      command,
-                      qualityValidationStepTimeoutMs,
-                      repo,
-                    ),
-                    outputPolicy,
-                  ),
-                );
+                let run = await runValidationWithCache(command, () => {
+                  const commandTimeoutMs = qualityCommandTimeoutMs(command);
+                  return commandTimeoutMs <= 0
+                    ? Promise.resolve(deadlineFailureRun(command))
+                    : runValidationCommand(repo, command, commandTimeoutMs, outputPolicy);
+                });
                 if (
                   !run.ok &&
                   (shouldRetryPassingVitestTeardownOnce(run) ||
@@ -6088,16 +6364,11 @@ async function runDeterministicQualityGate(
                       firstDigest ? ` - ${firstDigest}` : ""
                     }`,
                   );
-                  run = await runValidationCommand(
-                    repo,
-                    command,
-                    resolveValidationCommandTimeoutMs(
-                      command,
-                      qualityValidationStepTimeoutMs,
-                      repo,
-                    ),
-                    outputPolicy,
-                  );
+                  const retryTimeoutMs = qualityCommandTimeoutMs(command);
+                  run =
+                    retryTimeoutMs <= 0
+                      ? deadlineFailureRun(command)
+                      : await runValidationCommand(repo, command, retryTimeoutMs, outputPolicy);
                   if (run.ok) {
                     validationRetryState?.passingValidationCache?.set(
                       `${cacheContext}\0${validationCommandKey(command)}`,
@@ -6226,13 +6497,17 @@ async function runDeterministicQualityGate(
                 "stdout",
                 `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`,
               );
-              const browserPreflight = await runPlaywrightBrowserRuntimePreflight(
-                repo,
-                command,
-                missingPlaywrightBrowserTargets,
-                resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
-                outputPolicy,
-              );
+              const browserPreflightTimeoutMs = qualityCommandTimeoutMs(command);
+              const browserPreflight =
+                browserPreflightTimeoutMs <= 0
+                  ? deadlineFailureRun(command)
+                  : await runPlaywrightBrowserRuntimePreflight(
+                      repo,
+                      command,
+                      missingPlaywrightBrowserTargets,
+                      browserPreflightTimeoutMs,
+                      outputPolicy,
+                    );
               if (!browserPreflight.ok) {
                 const digest = extractValidationFailureDigest(browserPreflight);
                 validationRuns.push({
@@ -6296,15 +6571,19 @@ async function runDeterministicQualityGate(
             continue;
           }
           onLog?.("stdout", `[ValidationGate] Running "${command}"`);
-          let run = await runValidationWithCache(command, () =>
-            runValidationCommandWithRepoLease(
-              repo,
-              command,
-              resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
-              outputPolicy,
-              onLog,
-            ),
-          );
+          let run = await runValidationWithCache(command, () => {
+            const commandTimeoutMs = qualityCommandTimeoutMs(command);
+            return commandTimeoutMs <= 0
+              ? Promise.resolve(deadlineFailureRun(command))
+              : runValidationCommandWithRepoLease(
+                  repo,
+                  command,
+                  commandTimeoutMs,
+                  outputPolicy,
+                  onLog,
+                  deadlineLedger,
+                );
+          });
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
           const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run, repo);
           const retryAggregateWorkerValidation = shouldRetryAggregateWorkerValidationRunOnce(
@@ -6334,28 +6613,41 @@ async function runDeterministicQualityGate(
                     : `[ValidationGate] Retrying validation once after transient infrastructure failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`,
             );
             if (retryAggregateWorkerValidation) {
-              await new Promise((resolveWait) => setTimeout(resolveWait, 1_500));
+              const retryDelayMs = deadlineLedger ? deadlineLedger.capWorkTimeout(1_500) : 1_500;
+              if (retryDelayMs > 0) {
+                await new Promise((resolveWait) => setTimeout(resolveWait, retryDelayMs));
+              }
             }
             const retryCommand = focusedAggregateRetryCommand ?? command;
-            let retryRun = await runValidationCommandWithRepoLease(
-              repo,
-              retryCommand,
-              resolveValidationCommandTimeoutMs(retryCommand, qualityValidationStepTimeoutMs, repo),
-              outputPolicy,
-              onLog,
-            );
+            const retryTimeoutMs = qualityCommandTimeoutMs(retryCommand);
+            let retryRun =
+              retryTimeoutMs <= 0
+                ? deadlineFailureRun(retryCommand)
+                : await runValidationCommandWithRepoLease(
+                    repo,
+                    retryCommand,
+                    retryTimeoutMs,
+                    outputPolicy,
+                    onLog,
+                    deadlineLedger,
+                  );
             if (focusedAggregateRetryCommand && retryRun.ok) {
               onLog?.(
                 "stdout",
                 `[ValidationGate] Focused Worker stage passed; rerunning the aggregate command once to verify all remaining stages: ${command}`,
               );
-              retryRun = await runValidationCommandWithRepoLease(
-                repo,
-                command,
-                resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo),
-                outputPolicy,
-                onLog,
-              );
+              const aggregateRetryTimeoutMs = qualityCommandTimeoutMs(command);
+              retryRun =
+                aggregateRetryTimeoutMs <= 0
+                  ? deadlineFailureRun(command)
+                  : await runValidationCommandWithRepoLease(
+                      repo,
+                      command,
+                      aggregateRetryTimeoutMs,
+                      outputPolicy,
+                      onLog,
+                      deadlineLedger,
+                    );
             } else if (focusedAggregateRetryCommand) {
               retryRun = {
                 ...retryRun,
@@ -6446,7 +6738,16 @@ async function runDeterministicQualityGate(
     validationIssues,
     changedPaths,
     changedTestPaths,
-    validationRuns,
+    validationRuns: validationRuns.map((run) =>
+      withValidationExecutionPlanProvenance(
+        {
+          ...run,
+          evidenceId: run.evidenceId ?? validationEvidenceId(run),
+          failureClass: run.failureClass ?? classifyValidationFailureClass(run) ?? undefined,
+        },
+        validationPlanByCommand.get(validationCommandKey(run.command)),
+      ),
+    ),
     requiredValidationFailures,
     blocker,
     validationFailureScope: scopedValidationFailure,
@@ -6504,10 +6805,12 @@ export function buildCriticValidationSummary(
     quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
   const executedSummary = quality.validationRuns
     .map((run) => {
+      const evidenceId = run.evidenceId ?? validationEvidenceId(run);
       const output = allPassed
         ? ""
         : [run.stdout, run.stderr].filter(Boolean).join("\n").slice(0, maxValidationOutputChars);
       return [
+        `Evidence ID: ${evidenceId}`,
         `Command: ${run.command}`,
         `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
         output ? `Output:\n${output}` : "",
@@ -6527,6 +6830,60 @@ export function buildCriticValidationSummary(
       ].join("\n")
     : "";
   return [executedSummary, trustedSummary].filter(Boolean).join("\n\n---\n\n");
+}
+
+function citedCriticEvidenceIds(value: string): string[] {
+  return Array.from(
+    value.matchAll(/(?:\[?evidence[:=]\s*|\b)(validation:[a-f0-9]{12})\]?/gi),
+    (match) => String(match[1] ?? "").toLowerCase(),
+  );
+}
+
+function criticClaimRequiresValidationEvidence(value: string): boolean {
+  return /\b(?:tests?|validation|command|exit|assertions?|fail(?:ed|ure|ing)?|pass(?:ed|ing)?|typecheck|lint|build)\b/i.test(
+    value,
+  );
+}
+
+/**
+ * Free-form critic claims about validation are advisory unless they cite a
+ * validation evidence ID emitted by this exact candidate run.
+ */
+export function enforceCriticEvidenceProvenance(
+  review: CriticReview,
+  quality: Pick<DeterministicQualityResult, "validationRuns">,
+): CriticReview {
+  const available = new Set(
+    quality.validationRuns.map((run) =>
+      (run.evidenceId ?? validationEvidenceId(run)).toLowerCase(),
+    ),
+  );
+  const unsupported: string[] = [];
+  const keep = (value: string): boolean => {
+    if (!criticClaimRequiresValidationEvidence(value)) return true;
+    const cited = citedCriticEvidenceIds(value);
+    const supported = cited.some((evidenceId) => available.has(evidenceId));
+    if (!supported) unsupported.push(value);
+    return supported;
+  };
+  const findings = review.findings.filter(keep);
+  const mustFix = review.mustFix.filter(keep);
+  const revisionGuidance = keep(review.revisionGuidance) ? review.revisionGuidance : "";
+  const evidenceIds = Array.from(
+    new Set(
+      [...findings, ...mustFix, revisionGuidance]
+        .flatMap(citedCriticEvidenceIds)
+        .filter((evidenceId) => available.has(evidenceId)),
+    ),
+  );
+  return {
+    ...review,
+    findings,
+    mustFix,
+    revisionGuidance,
+    evidenceIds,
+    unsupportedFindings: unsupported,
+  };
 }
 
 export interface WorkerCriticReviewContext {
@@ -6606,21 +6963,46 @@ export function resolveWorkerCriticReviewContext(
   };
 }
 
-function criticTimeoutReview(
-  source: "Codex" | "LLM",
-  timeoutMs: number,
-  elapsedMs: number,
-): CriticReview {
-  const summary = `${source} critic timed out after ${elapsedMs}ms (timeout=${timeoutMs}ms).`;
+function estimatedCriticUsageAttempt(options: {
+  promptChars: number;
+  completionChars?: number;
+  backend: string;
+  modelId?: string;
+  attempt: number;
+  timedOut?: boolean;
+}): JobUsageAttempt {
+  const promptTokens = Math.max(1, Math.ceil(Math.max(0, options.promptChars) / 3));
+  const completionTokens = Math.max(0, Math.ceil(Math.max(0, options.completionChars ?? 0) / 3));
   return {
-    score: 0,
-    findings: [summary],
-    mustFix: [
-      "CriticGate timeout behavior is set to block; complete the critic review by reducing critic input, choosing a faster critic model, or increasing workerpals.quality_critic_timeout_ms.",
-    ],
-    revisionGuidance:
-      "Do not change product code for this finding unless product code caused the critic prompt explosion. Adjust CriticGate configuration or reduce validation/diff evidence volume.",
-    raw: JSON.stringify({ score: 0, findings: [summary], must_fix: ["CriticGate timed out"] }),
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: true,
+    backend: options.backend,
+    ...(options.modelId ? { modelId: options.modelId } : {}),
+    stage: "critic",
+    source: options.backend,
+    attempt: options.attempt,
+    ...(options.timedOut === true ? { timedOut: true } : {}),
+  };
+}
+
+function exactHttpUsageAttempt(payload: unknown, fallback: JobUsageAttempt): JobUsageAttempt {
+  const record = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const usage =
+    record.usage && typeof record.usage === "object"
+      ? (record.usage as Record<string, unknown>)
+      : null;
+  if (!usage) return fallback;
+  const promptTokens = Number(usage.prompt_tokens ?? usage.promptTokens);
+  const completionTokens = Number(usage.completion_tokens ?? usage.completionTokens);
+  if (!Number.isFinite(promptTokens) || !Number.isFinite(completionTokens)) return fallback;
+  return {
+    ...fallback,
+    promptTokens: Math.max(0, Math.floor(promptTokens)),
+    completionTokens: Math.max(0, Math.floor(completionTokens)),
+    totalTokens: Math.max(0, Math.floor(promptTokens)) + Math.max(0, Math.floor(completionTokens)),
+    estimated: false,
   };
 }
 
@@ -6657,12 +7039,30 @@ async function runTaskCriticReview(
   quality: DeterministicQualityResult,
   runtimeConfig: WorkerpalsRuntimeConfig,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
-): Promise<CriticReview | null> {
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<CriticOutcome> {
   const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
   const model = resolveQualityCriticModel(runtimeConfig, runtimeConfig.workerpals.llm.model.trim());
-  if (!endpoint || !model) return null;
-  const qualityCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  if (!endpoint || !model) {
+    return {
+      kind: "unavailable",
+      reason: "LLM critic endpoint/model is not configured",
+      usageAttempts: [],
+    };
+  }
+  const configuredCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  const qualityCriticTimeoutMs = deadlineLedger
+    ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs)
+    : configuredCriticTimeoutMs;
+  if (qualityCriticTimeoutMs <= 0) {
+    return {
+      kind: "timeout",
+      reason: "job deadline expired before the LLM critic could start",
+      usageAttempts: [],
+    };
+  }
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
+  const usageAttempts: JobUsageAttempt[] = [];
 
   const planning = params.planning as TaskExecutePlanning;
   const instruction = String(params.instruction ?? "").trim();
@@ -6699,7 +7099,7 @@ async function runTaskCriticReview(
       quality,
       resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact),
     );
-    const criticUser = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
+    const criticUserBase = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
       instruction,
       acceptance_criteria: acceptanceCriteriaText,
       validation_steps: validationStepsText,
@@ -6710,6 +7110,7 @@ async function runTaskCriticReview(
       final_reviewer_rubric: reviewContext.finalReviewerRubric,
       prior_review_context: reviewContext.priorReviewContext,
     });
+    const criticUser = `${criticUserBase}\n\nEvidence contract: Every finding or must_fix claim about tests, validation, command output, pass/fail counts, or exit status MUST cite an exact Evidence ID from the validation evidence as [evidence:validation:...]. Omit claims that have no evidence ID.`;
     const promptChars = criticSystem.length + criticUser.length;
     const promptBytes = new TextEncoder().encode(`${criticSystem}\n${criticUser}`).length;
     return {
@@ -6732,8 +7133,19 @@ async function runTaskCriticReview(
   const runCriticRequest = async (
     bodyBase: Record<string, unknown>,
     responseFormat: Record<string, unknown> | null,
+    promptChars: number,
+    usageAttempt: number,
   ) => {
-    return fetchWorkerCriticResponseWithHardDeadline({
+    const requestTimeoutMs = deadlineLedger
+      ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs)
+      : qualityCriticTimeoutMs;
+    if (requestTimeoutMs <= 0) {
+      return {
+        timedOut: true as const,
+        err: new Error("absolute job deadline exhausted before critic request"),
+      };
+    }
+    const request = await fetchWorkerCriticResponseWithHardDeadline({
       endpoint,
       init: {
         method: "POST",
@@ -6742,8 +7154,28 @@ async function runTaskCriticReview(
           responseFormat ? { ...bodyBase, response_format: responseFormat } : bodyBase,
         ),
       },
-      timeoutMs: qualityCriticTimeoutMs,
+      timeoutMs: requestTimeoutMs,
     });
+    const fallbackUsage = estimatedCriticUsageAttempt({
+      promptChars,
+      backend: "quality_critic_http",
+      modelId: model,
+      attempt: usageAttempt,
+      timedOut: request.timedOut,
+    });
+    if (request.timedOut) {
+      usageAttempts.push(fallbackUsage);
+    } else {
+      const parsed = parseJsonObjectLoose(request.text);
+      usageAttempts.push(
+        exactHttpUsageAttempt(parsed, {
+          ...fallbackUsage,
+          completionTokens: Math.max(0, Math.ceil(request.text.length / 3)),
+          totalTokens: fallbackUsage.promptTokens + Math.max(0, Math.ceil(request.text.length / 3)),
+        }),
+      );
+    }
+    return request;
   };
 
   const runAttempt = async (
@@ -6756,7 +7188,12 @@ async function runTaskCriticReview(
       "stdout",
       `[CriticGate] LLM review attempt ${attempt}${compact ? " (compact)" : ""}: model=${model} timeout_ms=${qualityCriticTimeoutMs} behavior=${timeoutBehavior} prompt_chars=${payload.promptChars} prompt_bytes=${payload.promptBytes} diff_chars=${payload.diffChars} validation_chars=${payload.validationChars}`,
     );
-    let request = await runCriticRequest(payload.bodyBase, { type: "json_object" });
+    let request = await runCriticRequest(
+      payload.bodyBase,
+      { type: "json_object" },
+      payload.promptChars,
+      attempt * 10 + 1,
+    );
     if (request.timedOut) return { status: "timeout" };
     if (!request.response.ok && request.response.status === 400) {
       const lowered = request.text.toLowerCase();
@@ -6765,7 +7202,12 @@ async function runTaskCriticReview(
           "stdout",
           "[CriticGate] fallback: response_format json_object unsupported; retrying without strict response_format.",
         );
-        request = await runCriticRequest(payload.bodyBase, null);
+        request = await runCriticRequest(
+          payload.bodyBase,
+          null,
+          payload.promptChars,
+          attempt * 10 + 2,
+        );
         if (request.timedOut) return { status: "timeout" };
       }
     }
@@ -6813,13 +7255,16 @@ async function runTaskCriticReview(
     );
     return {
       status: "done",
-      review: {
-        score,
-        findings,
-        mustFix,
-        revisionGuidance,
-        raw: compactJobOutput(content, outputPolicyForRuntime(runtimeConfig)),
-      },
+      review: enforceCriticEvidenceProvenance(
+        {
+          score,
+          findings,
+          mustFix,
+          revisionGuidance,
+          raw: compactJobOutput(content, outputPolicyForRuntime(runtimeConfig)),
+        },
+        quality,
+      ),
     };
   };
 
@@ -6833,23 +7278,30 @@ async function runTaskCriticReview(
       attempt = await runAttempt(2, true);
     }
     if (attempt.status === "timeout") {
-      if (timeoutBehavior === "block") {
-        onLog?.(
-          "stderr",
-          `[CriticGate] LLM review timed out after ${qualityCriticTimeoutMs}ms; blocking because quality_critic_timeout_behavior=block.`,
-        );
-        return criticTimeoutReview("LLM", qualityCriticTimeoutMs, qualityCriticTimeoutMs);
-      }
-      onLog?.("stderr", `[CriticGate] LLM timed out after ${qualityCriticTimeoutMs}ms; skipping.`);
-      return null;
+      onLog?.(
+        "stderr",
+        `[CriticGate] LLM timed out after ${qualityCriticTimeoutMs}ms; retaining the candidate (${timeoutBehavior}).`,
+      );
+      return {
+        kind: "timeout",
+        reason: `LLM critic timed out after ${qualityCriticTimeoutMs}ms`,
+        usageAttempts,
+      };
     }
-    return attempt.review;
+    if (!attempt.review) {
+      return { kind: "invalid", reason: "LLM critic returned no usable verdict", usageAttempts };
+    }
+    return { kind: "verdict", review: attempt.review, usageAttempts };
   } catch (err) {
     onLog?.(
       "stderr",
       `[CriticGate] review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`,
     );
-    return null;
+    return {
+      kind: "unavailable",
+      reason: toSingleLine(err, 220),
+      usageAttempts,
+    };
   }
 }
 
@@ -7604,6 +8056,174 @@ export interface CreateJobCommitResult {
   sha?: string;
   error?: string;
   publishBlocked?: JobPublishBlockedInfo;
+  /** Model usage incurred while generating finalization metadata. */
+  usage?: JobTokenUsage;
+  usageAttempts?: JobUsageAttempt[];
+}
+
+function attachCommitFinalizationUsage(
+  result: CreateJobCommitResult,
+  attempts: JobUsageAttempt[],
+): CreateJobCommitResult {
+  if (attempts.length === 0) return result;
+  const usage = new UsageAccumulator();
+  usage.addAttempts(attempts);
+  return {
+    ...result,
+    usage: usage.total(),
+    usageAttempts: usage.attempts(),
+  };
+}
+
+export class CandidateCheckpointError extends Error {
+  readonly stage: "status" | "diff" | "stage" | "commit" | "resolve" | "retain";
+  readonly candidateState: JobCandidateState;
+
+  constructor(
+    stage: CandidateCheckpointError["stage"],
+    detail: string,
+    candidateState: JobCandidateState,
+  ) {
+    super(`Candidate checkpoint ${stage} failed: ${detail}`);
+    this.name = "CandidateCheckpointError";
+    this.stage = stage;
+    this.candidateState = candidateState;
+  }
+}
+
+function retainedCandidateRefComponent(value: string): string {
+  const readable = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 48);
+  return readable || createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+export async function checkpointJobCandidate(
+  repo: string,
+  workerId: string,
+  job: { id: string; kind: string },
+  candidateState: JobCandidateState,
+  runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
+  baselineSha?: string | null,
+): Promise<JobCandidateState> {
+  const candidateRef = `refs/pushpals/candidates/${retainedCandidateRefComponent(
+    workerId,
+  )}/${retainedCandidateRefComponent(job.id)}`;
+  const retainSha = async (sha: string, changedPaths: string[]): Promise<JobCandidateState> => {
+    const retained = await git(repo, ["update-ref", candidateRef, sha]);
+    if (!retained.ok) {
+      throw new CandidateCheckpointError(
+        "retain",
+        retained.stderr || retained.stdout || `git update-ref exited ${retained.exitCode}`,
+        { ...candidateState, changedPaths },
+      );
+    }
+    return {
+      ...candidateState,
+      changedPaths,
+      checkpoint: {
+        ref: candidateRef,
+        sha,
+        capturedAt: new Date().toISOString(),
+      },
+    };
+  };
+
+  const status = await git(repo, ["status", "--porcelain"]);
+  if (!status.ok) {
+    throw new CandidateCheckpointError(
+      "status",
+      status.stderr || status.stdout || `git status exited ${status.exitCode}`,
+      candidateState,
+    );
+  }
+  const rawChangedPaths = expandKnownArtifactDirectoryPaths(
+    repo,
+    parseChangedPathsFromStatus(status.stdout),
+  );
+  const changedPaths = publishableChangedPaths(
+    await filterChangedPathsByGitContentDelta(repo, rawChangedPaths),
+  );
+  if (changedPaths.length === 0) {
+    const normalizedBaselineSha = String(baselineSha ?? "").trim();
+    if (!normalizedBaselineSha) return { ...candidateState, changedPaths: [] };
+    const head = await git(repo, ["rev-parse", "HEAD"]);
+    if (!head.ok) {
+      throw new CandidateCheckpointError(
+        "resolve",
+        head.stderr || head.stdout || `git rev-parse exited ${head.exitCode}`,
+        candidateState,
+      );
+    }
+    const sha = head.stdout.trim();
+    if (!sha || sha.toLowerCase() === normalizedBaselineSha.toLowerCase()) {
+      return { ...candidateState, changedPaths: [] };
+    }
+    const committedDiff = await git(repo, [
+      "diff",
+      "--name-only",
+      `${normalizedBaselineSha}..${sha}`,
+    ]);
+    if (!committedDiff.ok) {
+      throw new CandidateCheckpointError(
+        "diff",
+        committedDiff.stderr || committedDiff.stdout || `git diff exited ${committedDiff.exitCode}`,
+        candidateState,
+      );
+    }
+    const committedPaths = publishableChangedPaths(
+      parseChangedPathsFromNameOnlyOutput(committedDiff.stdout),
+    );
+    if (committedPaths.length === 0) return { ...candidateState, changedPaths: [] };
+    return retainSha(sha, committedPaths);
+  }
+
+  const stage = await git(repo, ["add", "-A", "--", ...changedPaths]);
+  if (!stage.ok) {
+    throw new CandidateCheckpointError(
+      "stage",
+      stage.stderr || stage.stdout || `git add exited ${stage.exitCode}`,
+      { ...candidateState, changedPaths },
+    );
+  }
+  const staged = await git(repo, ["diff", "--cached", "--quiet"]);
+  if (staged.ok) return { ...candidateState, changedPaths };
+  if (staged.exitCode !== 1) {
+    throw new CandidateCheckpointError(
+      "diff",
+      staged.stderr || staged.stdout || `git diff --cached exited ${staged.exitCode}`,
+      { ...candidateState, changedPaths },
+    );
+  }
+
+  const identity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
+  const commit = await git(
+    repo,
+    buildGitCommitArgs(
+      `checkpoint(worker): retain ${candidateState.status} candidate for ${job.id}`,
+      identity,
+    ),
+  );
+  if (!commit.ok) {
+    throw new CandidateCheckpointError(
+      "commit",
+      commit.stderr || commit.stdout || `git commit exited ${commit.exitCode}`,
+      { ...candidateState, changedPaths },
+    );
+  }
+  const shaResult = await git(repo, ["rev-parse", "HEAD"]);
+  if (!shaResult.ok) {
+    throw new CandidateCheckpointError(
+      "resolve",
+      shaResult.stderr || shaResult.stdout || `git rev-parse exited ${shaResult.exitCode}`,
+      { ...candidateState, changedPaths },
+    );
+  }
+  const sha = shaResult.stdout.trim();
+  return retainSha(sha, changedPaths);
 }
 
 function buildPublishBlockedCommitResult(options: {
@@ -7644,6 +8264,9 @@ export async function createJobCommit(
   },
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
 ): Promise<CreateJobCommitResult> {
+  let finalizationUsageAttempts: JobUsageAttempt[] = [];
+  const finish = (result: CreateJobCommitResult): CreateJobCommitResult =>
+    attachCommitFinalizationUsage(result, finalizationUsageAttempts);
   const configuredBranchPrefix =
     normalizeReviewBranchPrefix(runtimeConfig.sourceControlManager.branchPrefix) ?? "agent/";
   const defaultPublicBranchName = `${configuredBranchPrefix}${workerId}/${job.id}`;
@@ -7748,7 +8371,7 @@ export async function createJobCommit(
       ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
       ...loadRequiredValidationStepsFromVision(repo),
     ];
-    const llmCommitMsg = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff })
+    const commitMessageGeneration = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff })
       ? await generateCommitMessageFromDiff(
           diff,
           {
@@ -7761,6 +8384,8 @@ export async function createJobCommit(
           runtimeConfig,
         ).catch(() => null)
       : null;
+    finalizationUsageAttempts = commitMessageGeneration?.usageAttempts ?? [];
+    const llmCommitMsg = commitMessageGeneration?.message ?? null;
     if (!llmCommitMsg) {
       console.warn(
         `[WorkerPals] Commit message generator unavailable for job ${job.id}; using deterministic fallback.`,
@@ -7773,20 +8398,20 @@ export async function createJobCommit(
     const commitIdentity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
     result = await git(repo, buildGitCommitArgs(commitMsg, commitIdentity));
     if (!result.ok) {
-      return { ok: false, error: `Failed to commit: ${result.stderr}` };
+      return finish({ ok: false, error: `Failed to commit: ${result.stderr}` });
     }
 
     // Get commit SHA
     result = await git(repo, ["rev-parse", "HEAD"]);
     if (!result.ok) {
-      return { ok: false, error: `Failed to get commit SHA: ${result.stderr}` };
+      return finish({ ok: false, error: `Failed to get commit SHA: ${result.stderr}` });
     }
     let sha = result.stdout;
 
     // Persist commit under an internal ref so it remains reachable after worktree cleanup.
     result = await git(repo, ["update-ref", hiddenCommitRef, sha]);
     if (!result.ok) {
-      return { ok: false, error: `Failed to store worker commit ref: ${result.stderr}` };
+      return finish({ ok: false, error: `Failed to store worker commit ref: ${result.stderr}` });
     }
     hiddenRefCreated = true;
 
@@ -7794,7 +8419,7 @@ export async function createJobCommit(
       console.log(
         `[WorkerPals] Retained immutable review-fix completion ${hiddenCommitRef} in the shared host repository; SourceControlManager owns publication to ${publicBranchName}.`,
       );
-      return { ok: true, branch: hiddenCommitRef, publicBranch: publicBranchName, sha };
+      return finish({ ok: true, branch: hiddenCommitRef, publicBranch: publicBranchName, sha });
     }
 
     // Push branch to origin (optional; disabled by default for shared-.git workflows)
@@ -7811,14 +8436,16 @@ export async function createJobCommit(
         );
         if (!sync.ok) {
           pushError = `Failed to sync branch before push: ${redactSensitiveText(sync.error)}`;
-          return buildPublishBlockedCommitResult({
-            summary: `Failed to sync and push ${job.kind} commit`,
-            detail: pushError,
-            publicBranch: publicBranchName,
-            localRef: hiddenCommitRef,
-            sha,
-            stage: "sync",
-          });
+          return finish(
+            buildPublishBlockedCommitResult({
+              summary: `Failed to sync and push ${job.kind} commit`,
+              detail: pushError,
+              publicBranch: publicBranchName,
+              localRef: hiddenCommitRef,
+              sha,
+              stage: "sync",
+            }),
+          );
         }
         sha = sync.sha;
 
@@ -7845,19 +8472,21 @@ export async function createJobCommit(
 
       if (!pushed) {
         if (requirePush) {
-          return buildPublishBlockedCommitResult({
-            summary: `Failed to sync and push ${job.kind} commit`,
-            detail: pushError || `Failed to push ${publicBranchName}`,
-            publicBranch: publicBranchName,
-            localRef: hiddenCommitRef,
-            sha,
-            stage: "push",
-          });
+          return finish(
+            buildPublishBlockedCommitResult({
+              summary: `Failed to sync and push ${job.kind} commit`,
+              detail: pushError || `Failed to push ${publicBranchName}`,
+              publicBranch: publicBranchName,
+              localRef: hiddenCommitRef,
+              sha,
+              stage: "push",
+            }),
+          );
         }
         console.warn(
           `[WorkerPals] ${pushError}. Continuing with local commit ref only (set WORKERPALS_REQUIRE_PUSH=1 to enforce push).`,
         );
-        return { ok: true, branch: completionRef, publicBranch: publicBranchName, sha };
+        return finish({ ok: true, branch: completionRef, publicBranch: publicBranchName, sha });
       }
     } else {
       console.log(
@@ -7866,12 +8495,12 @@ export async function createJobCommit(
     }
 
     console.log(`[WorkerPals] Created commit ${sha} on ref ${completionRef}`);
-    return { ok: true, branch: completionRef, publicBranch: publicBranchName, sha };
+    return finish({ ok: true, branch: completionRef, publicBranch: publicBranchName, sha });
   } catch (err) {
     if (hiddenRefCreated) {
       await git(repo, ["update-ref", "-d", hiddenCommitRef]);
     }
-    return { ok: false, error: String(err) };
+    return finish({ ok: false, error: String(err) });
   }
 }
 
@@ -8719,13 +9348,10 @@ async function createMergeConflictJobCommit(
   },
   publicBranchName: string,
   runtimeConfig: WorkerpalsRuntimeConfig,
-): Promise<{
-  ok: boolean;
-  branch?: string;
-  publicBranch?: string;
-  sha?: string;
-  error?: string;
-}> {
+): Promise<CreateJobCommitResult> {
+  let finalizationUsageAttempts: JobUsageAttempt[] = [];
+  const finish = (result: CreateJobCommitResult): CreateJobCommitResult =>
+    attachCommitFinalizationUsage(result, finalizationUsageAttempts);
   const mergeConflictContext = extractMergeConflictReviewContext(job.params ?? null);
   if (!mergeConflictContext) {
     return { ok: false, error: "Merge-conflict context is missing required branch metadata." };
@@ -8831,7 +9457,7 @@ async function createMergeConflictJobCommit(
       ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
       ...loadRequiredValidationStepsFromVision(repo),
     ];
-    const llmCommitMsg = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff })
+    const commitMessageGeneration = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff })
       ? await generateCommitMessageFromDiff(
           diff,
           {
@@ -8844,6 +9470,8 @@ async function createMergeConflictJobCommit(
           runtimeConfig,
         ).catch(() => null)
       : null;
+    finalizationUsageAttempts = commitMessageGeneration?.usageAttempts ?? [];
+    const llmCommitMsg = commitMessageGeneration?.message ?? null;
     if (!llmCommitMsg) {
       console.warn(
         `[WorkerPals] Commit message generator unavailable for merge-conflict job ${job.id}; using deterministic fallback.`,
@@ -8853,42 +9481,45 @@ async function createMergeConflictJobCommit(
     const commitIdentity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
     const commit = await git(repo, buildGitCommitArgs(commitMsg, commitIdentity));
     if (!commit.ok) {
-      return { ok: false, error: `Failed to commit merge-conflict resolution: ${commit.stderr}` };
+      return finish({
+        ok: false,
+        error: `Failed to commit merge-conflict resolution: ${commit.stderr}`,
+      });
     }
     headSha = await currentRefSha(repo, "HEAD");
     if (!headSha) {
-      return {
+      return finish({
         ok: false,
         error: `Failed to resolve committed HEAD SHA for merge-conflict job ${job.id}.`,
-      };
+      });
     }
   }
 
   const baseRemoteRef = `refs/remotes/origin/${mergeConflictContext.baseBranch}`;
   const rebasedOntoBase = await isAncestorRef(repo, baseRemoteRef, "HEAD");
   if (!rebasedOntoBase) {
-    return {
+    return finish({
       ok: false,
       error:
         `Merge-conflict job ${job.id} did not finish rebased onto origin/${mergeConflictContext.baseBranch}. ` +
         `Detached host worktree HEAD must be a descendant of ${baseRemoteRef} before WorkerPals can hand it to SourceControlManager.`,
-    };
+    });
   }
 
   const hiddenCompletionRef = `refs/pushpals/review/${workerId}/${job.id}`;
   const retain = await git(repo, ["update-ref", hiddenCompletionRef, headSha]);
   if (!retain.ok) {
-    return {
+    return finish({
       ok: false,
       error: `Failed to retain rebased merge-conflict commit for SourceControlManager: ${combinedGitOutput(retain)}`,
-    };
+    });
   }
-  return {
+  return finish({
     ok: true,
     branch: hiddenCompletionRef,
     publicBranch: publicBranchName,
     sha: headSha,
-  };
+  });
 }
 
 async function autoResolveRebaseConflicts(
@@ -9358,18 +9989,46 @@ function normalizeCodexReasoningEffort(
   return defaultEffort;
 }
 
+interface CommitMessageGenerationOutcome {
+  message: string | null;
+  usageAttempts: JobUsageAttempt[];
+}
+
+function estimatedCommitMessageUsageAttempt(options: {
+  promptChars: number;
+  completionChars?: number;
+  backend: string;
+  modelId?: string;
+  timedOut?: boolean;
+}): JobUsageAttempt {
+  const promptTokens = Math.max(1, Math.ceil(Math.max(0, options.promptChars) / 3));
+  const completionTokens = Math.max(0, Math.ceil(Math.max(0, options.completionChars ?? 0) / 3));
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: true,
+    backend: options.backend,
+    ...(options.modelId ? { modelId: options.modelId } : {}),
+    stage: "finalization",
+    source: options.backend,
+    attempt: 1,
+    ...(options.timedOut === true ? { timedOut: true } : {}),
+  };
+}
+
 async function generateCommitMessageFromDiff(
   diff: string,
   opts: { instruction: string; type: string; area: string; validationSteps: string[] },
   repo: string,
   runtimeConfig: WorkerpalsRuntimeConfig,
-): Promise<string | null> {
+): Promise<CommitMessageGenerationOutcome | null> {
   const prompt = buildCommitMessageGeneratorPrompt(diff, opts);
   if (!prompt) return null;
   if (shouldUseCodexCliForExecutor(resolveExecutor(runtimeConfig))) {
     return generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtimeConfig);
   }
-  return generateCommitMessageFromDiffViaHttp(prompt, opts, runtimeConfig);
+  return generateCommitMessageFromDiffViaHttpWithUsage(prompt, opts, runtimeConfig);
 }
 
 export function resolveCommitMessageGeneratorTimeoutMs(
@@ -9435,7 +10094,7 @@ async function generateCommitMessageFromDiffViaCodex(
   opts: { type: string; area: string },
   repo: string,
   runtimeConfig: WorkerpalsRuntimeConfig,
-): Promise<string | null> {
+): Promise<CommitMessageGenerationOutcome | null> {
   const model = runtimeConfig.workerpals.llm.model.trim();
   if (!model) return null;
   const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
@@ -9468,8 +10127,10 @@ async function generateCommitMessageFromDiffViaCodex(
 
   const env = buildWorkerSandboxWritableEnv(repo);
   const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
+  const stdinText = `${prompt.systemPrompt}\n\n${prompt.userMessage}`;
+  let callStarted = false;
   try {
-    const stdinText = `${prompt.systemPrompt}\n\n${prompt.userMessage}`;
+    callStarted = true;
     const processResult = await runBoundedWorkerProcess(cmd, {
       cwd: repo,
       env,
@@ -9478,10 +10139,6 @@ async function generateCommitMessageFromDiffViaCodex(
       outputLimitBytes: 512 * 1024,
       retainOutputTail: true,
     });
-    if (processResult.timedOut || processResult.drainTimedOut || processResult.exitCode !== 0) {
-      return null;
-    }
-
     let content = "";
     try {
       content = readFileSync(tmpOutputPath, "utf8").trim();
@@ -9491,11 +10148,32 @@ async function generateCommitMessageFromDiffViaCodex(
     if (!content) {
       content = processResult.stdout.trim();
     }
-    if (!content) return null;
-    const clean = sanitizeGeneratedCommitMessage(content, opts.type, opts.area);
-    return clean;
+    const usageAttempt = estimatedCommitMessageUsageAttempt({
+      promptChars: stdinText.length,
+      completionChars: content.length + processResult.stderr.length,
+      backend: "commit_message_codex",
+      modelId: model,
+      timedOut: processResult.timedOut || processResult.drainTimedOut,
+    });
+    if (processResult.timedOut || processResult.drainTimedOut || processResult.exitCode !== 0) {
+      return { message: null, usageAttempts: [usageAttempt] };
+    }
+
+    const clean = content ? sanitizeGeneratedCommitMessage(content, opts.type, opts.area) : null;
+    return { message: clean, usageAttempts: [usageAttempt] };
   } catch {
-    return null;
+    return callStarted
+      ? {
+          message: null,
+          usageAttempts: [
+            estimatedCommitMessageUsageAttempt({
+              promptChars: stdinText.length,
+              backend: "commit_message_codex",
+              modelId: model,
+            }),
+          ],
+        }
+      : null;
   } finally {
     restoreRepoLocalCodexFilesForCodexCli(codexMask);
     try {
@@ -9512,6 +10190,24 @@ export async function generateCommitMessageFromDiffViaHttp(
   runtimeConfig: WorkerpalsRuntimeConfig,
   requestOptions: { fetchFn?: typeof fetch; timeoutMs?: number } = {},
 ): Promise<string | null> {
+  return (
+    (
+      await generateCommitMessageFromDiffViaHttpWithUsage(
+        prompt,
+        opts,
+        runtimeConfig,
+        requestOptions,
+      )
+    )?.message ?? null
+  );
+}
+
+export async function generateCommitMessageFromDiffViaHttpWithUsage(
+  prompt: CommitMessagePrompt,
+  opts: { type: string; area: string },
+  runtimeConfig: WorkerpalsRuntimeConfig,
+  requestOptions: { fetchFn?: typeof fetch; timeoutMs?: number } = {},
+): Promise<CommitMessageGenerationOutcome | null> {
   const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
   const model = runtimeConfig.workerpals.llm.model.trim();
   if (!endpoint || !model) return null;
@@ -9544,21 +10240,38 @@ export async function generateCommitMessageFromDiffViaHttp(
       fetchImpl: requestOptions.fetchFn,
       timeoutMessage: `commit-message HTTP request timed out after ${timeoutMs}ms`,
     });
-    if (!response.ok) return null;
-    const payload = parseJsonObjectLoose(await response.text());
-    if (!payload) return null;
+    const responseText = await response.text();
+    const fallbackUsage = estimatedCommitMessageUsageAttempt({
+      promptChars: prompt.systemPrompt.length + prompt.userMessage.length,
+      completionChars: responseText.length,
+      backend: "commit_message_http",
+      modelId: model,
+    });
+    if (!response.ok) return { message: null, usageAttempts: [fallbackUsage] };
+    const payload = parseJsonObjectLoose(responseText);
+    const usageAttempt = exactHttpUsageAttempt(payload, fallbackUsage);
+    if (!payload) return { message: null, usageAttempts: [usageAttempt] };
     const choices = Array.isArray(payload.choices)
       ? (payload.choices as Array<Record<string, unknown>>)
       : [];
     const content = String(
       (choices[0]?.message as Record<string, unknown> | undefined)?.content ?? "",
     ).trim();
-    if (!content) return null;
+    if (!content) return { message: null, usageAttempts: [usageAttempt] };
     const clean = sanitizeGeneratedCommitMessage(content, opts.type, opts.area);
-    if (!clean) return null;
-    return clean;
-  } catch {
-    return null;
+    return { message: clean, usageAttempts: [usageAttempt] };
+  } catch (error) {
+    return {
+      message: null,
+      usageAttempts: [
+        estimatedCommitMessageUsageAttempt({
+          promptChars: prompt.systemPrompt.length + prompt.userMessage.length,
+          backend: "commit_message_http",
+          modelId: model,
+          timedOut: /timed out|deadline/i.test(String(error)),
+        }),
+      ],
+    };
   }
 }
 
@@ -10072,12 +10785,13 @@ const cachedCodexCommandPrefix = new Map<string, string[]>();
 async function canExecuteCodexCommandCandidate(
   repo: string,
   candidate: string[],
+  timeoutMs = 15_000,
 ): Promise<boolean> {
-  if (candidate.length === 0) return false;
+  if (candidate.length === 0 || timeoutMs <= 0) return false;
   try {
     const result = await runBoundedWorkerProcess([...candidate, "--version"], {
       cwd: repo,
-      timeoutMs: 15_000,
+      timeoutMs,
       outputLimitBytes: 64 * 1024,
     });
     return !result.timedOut && !result.drainTimedOut && result.exitCode === 0;
@@ -10089,6 +10803,7 @@ async function canExecuteCodexCommandCandidate(
 async function resolveCodexCommandPrefix(
   repo: string,
   configuredCommand = "",
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<string[] | null> {
   const cacheKey = `${repo}\u0000${configuredCommand.trim()}`;
   const cached = cachedCodexCommandPrefix.get(cacheKey);
@@ -10102,7 +10817,9 @@ async function resolveCodexCommandPrefix(
   candidates.push(["codex"]);
 
   for (const candidate of candidates) {
-    if (await canExecuteCodexCommandCandidate(repo, candidate)) {
+    const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(15_000) : 15_000;
+    if (timeoutMs <= 0) return null;
+    if (await canExecuteCodexCommandCandidate(repo, candidate, timeoutMs)) {
       cachedCodexCommandPrefix.set(cacheKey, [...candidate]);
       return candidate;
     }
@@ -10116,20 +10833,54 @@ async function runCodexCriticReview(
   quality: DeterministicQualityResult,
   runtimeConfig: WorkerpalsRuntimeConfig,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
-): Promise<CriticReview | null> {
-  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<CriticOutcome> {
+  const configuredCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  if (deadlineLedger && deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs) <= 0) {
+    return {
+      kind: "timeout",
+      reason: "job deadline expired before the Codex critic could start",
+      usageAttempts: [],
+    };
+  }
+  const codexPrefix = await resolveCodexCommandPrefix(
+    repo,
+    runtimeConfig.workerpals.llm.codexBin,
+    deadlineLedger,
+  );
   if (!codexPrefix) {
+    if (deadlineLedger?.workExpired()) {
+      return {
+        kind: "timeout",
+        reason: "job deadline expired while resolving the Codex critic executable",
+        usageAttempts: [],
+      };
+    }
     onLog?.(
       "stderr",
       "[CriticGate] Codex: unable to resolve Codex CLI command (workerpals.llm.codex_bin/PATH); skipping.",
     );
-    return null;
+    return {
+      kind: "unavailable",
+      reason: "Codex critic executable is unavailable",
+      usageAttempts: [],
+    };
   }
 
   const instruction = String(params.instruction ?? "").trim();
   const planning = params.planning as TaskExecutePlanning;
-  const qualityCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  const qualityCriticTimeoutMs = deadlineLedger
+    ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs)
+    : configuredCriticTimeoutMs;
+  if (qualityCriticTimeoutMs <= 0) {
+    return {
+      kind: "timeout",
+      reason: "job deadline expired before the Codex critic could start",
+      usageAttempts: [],
+    };
+  }
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
+  const usageAttempts: JobUsageAttempt[] = [];
   const criticModel = resolveQualityCriticModel(runtimeConfig);
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
   const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
@@ -10145,7 +10896,7 @@ async function runCodexCriticReview(
       quality,
       resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact),
     );
-    const criticInstruction = loadPromptTemplate(
+    const criticInstructionBase = loadPromptTemplate(
       "workerpals/codex_quality_critic_instruction_prompt.md",
       {
         instruction,
@@ -10161,6 +10912,7 @@ async function runCodexCriticReview(
         prior_review_context: reviewContext.priorReviewContext,
       },
     );
+    const criticInstruction = `${criticInstructionBase}\n\nEvidence contract: Every finding or must_fix claim about tests, validation, command output, pass/fail counts, or exit status MUST cite an exact Evidence ID from the validation section as [evidence:validation:...]. Omit claims that have no evidence ID.`;
     return {
       criticInstruction,
       promptChars: criticInstruction.length,
@@ -10209,6 +10961,12 @@ async function runCodexCriticReview(
       /* ignore stale/missing critic output */
     }
     const payload = payloadOverride ?? (await buildCriticInstruction(compact));
+    const attemptTimeoutMs = deadlineLedger
+      ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs)
+      : qualityCriticTimeoutMs;
+    if (attemptTimeoutMs <= 0) {
+      return { status: "timeout", payload };
+    }
     const startedAt = Date.now();
     onLog?.(
       "stdout",
@@ -10218,15 +10976,26 @@ async function runCodexCriticReview(
       cwd: repo,
       env,
       stdin: new Blob([payload.criticInstruction]),
-      timeoutMs: qualityCriticTimeoutMs,
+      timeoutMs: attemptTimeoutMs,
       outputLimitBytes: 512 * 1024,
       retainOutputTail: true,
     });
 
-    if (processResult.timedOut) {
+    usageAttempts.push(
+      estimatedCriticUsageAttempt({
+        promptChars: payload.promptChars,
+        completionChars: processResult.stdout.length + processResult.stderr.length,
+        backend: "quality_critic_codex",
+        modelId: criticModel || undefined,
+        attempt,
+        timedOut: processResult.timedOut || processResult.drainTimedOut,
+      }),
+    );
+
+    if (processResult.timedOut || processResult.drainTimedOut) {
       return { status: "timeout", payload };
     }
-    if (processResult.drainTimedOut || processResult.exitCode !== 0) {
+    if (processResult.exitCode !== 0) {
       onLog?.(
         "stderr",
         `[CriticGate] Codex exited ${processResult.exitCode}: ${toSingleLine(processResult.stderr, 220)}`,
@@ -10275,13 +11044,16 @@ async function runCodexCriticReview(
     return {
       status: "done",
       payload,
-      review: {
-        score,
-        findings,
-        mustFix,
-        revisionGuidance,
-        raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig)),
-      },
+      review: enforceCriticEvidenceProvenance(
+        {
+          score,
+          findings,
+          mustFix,
+          revisionGuidance,
+          raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig)),
+        },
+        quality,
+      ),
     };
   };
 
@@ -10316,27 +11088,35 @@ async function runCodexCriticReview(
           "stderr",
           `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; compact critic input only reduced prompt by ${reductionPct}% after clean validation; skipping retry.`,
         );
-        return null;
+        return {
+          kind: "timeout",
+          reason: `Codex critic timed out after ${qualityCriticTimeoutMs}ms and compact retry was not viable`,
+          usageAttempts,
+        };
       }
     }
     if (attempt.status === "timeout") {
-      if (timeoutBehavior === "block") {
-        onLog?.(
-          "stderr",
-          `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; blocking because quality_critic_timeout_behavior=block.`,
-        );
-        return criticTimeoutReview("Codex", qualityCriticTimeoutMs, qualityCriticTimeoutMs);
-      }
       onLog?.(
         "stderr",
-        `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; skipping.`,
+        `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; retaining the candidate (${timeoutBehavior}).`,
       );
-      return null;
+      return {
+        kind: "timeout",
+        reason: `Codex critic timed out after ${qualityCriticTimeoutMs}ms`,
+        usageAttempts,
+      };
     }
-    return attempt.review;
+    if (!attempt.review) {
+      return { kind: "invalid", reason: "Codex critic returned no usable verdict", usageAttempts };
+    }
+    return { kind: "verdict", review: attempt.review, usageAttempts };
   } catch (err) {
     onLog?.("stderr", `[CriticGate] Codex error: ${toSingleLine(err, 220)} (skipping).`);
-    return null;
+    return {
+      kind: "unavailable",
+      reason: toSingleLine(err, 220),
+      usageAttempts,
+    };
   } finally {
     restoreRepoLocalCodexFilesForCodexCli(codexMask);
     try {
@@ -10499,6 +11279,23 @@ export async function executeJob(
   let revisionAttempt = 0;
   let revisionHint = "";
   const jobStartedAt = Date.now();
+  const deadlineLedger = new JobDeadlineLedger({
+    executionBudgetMs,
+    finalizationBudgetMs,
+    startedAtMs: jobStartedAt,
+  });
+  const usageAccumulator = new UsageAccumulator();
+  const finalizeResult = <T extends JobResult>(terminalResult: T): T =>
+    usageAccumulator.apply({
+      ...terminalResult,
+      diagnostics: {
+        ...(terminalResult.diagnostics ?? {}),
+        metadata: {
+          ...(terminalResult.diagnostics?.metadata ?? {}),
+          jobDeadline: deadlineLedger.snapshot(),
+        },
+      },
+    } as T);
   const previousValidationFailureDigests = new Map<string, string>();
   const passingValidationCache = new Map<string, ValidationExecutionResult>();
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
@@ -10518,26 +11315,63 @@ export async function executeJob(
     }
 
     const executor = resolveExecutor(runtimeConfig);
-    const defaultExecuteBudgets = nextQualityRevisionExecuteBudgets ?? {
+    const requestedExecuteBudgets = nextQualityRevisionExecuteBudgets ?? {
       executionBudgetMs,
       finalizationBudgetMs,
     };
     nextQualityRevisionExecuteBudgets = null;
+    const defaultExecuteBudgets = deadlineLedger.executorBudgets(
+      requestedExecuteBudgets.executionBudgetMs,
+      requestedExecuteBudgets.finalizationBudgetMs,
+    );
+    if (!defaultExecuteBudgets) {
+      const changed = await git(repo, ["status", "--porcelain"]);
+      const changedPaths = changed.ok
+        ? publishableChangedPaths(parseChangedPathsFromStatus(changed.stdout))
+        : [];
+      return finalizeResult({
+        ok: false,
+        summary: "Job deadline reached before another quality revision could start",
+        stderr:
+          "The absolute execution deadline was exhausted. Any publishable candidate must be checkpointed before worktree cleanup.",
+        exitCode: 124,
+        ...(changedPaths.length > 0
+          ? {
+              candidateState: {
+                status: "partial" as const,
+                reason: "absolute_job_deadline",
+                changedPaths,
+              },
+            }
+          : {}),
+      });
+    }
     const runExecutor = getBackendTaskExecutor(executor);
     if (!runExecutor) {
-      return {
+      return finalizeResult({
         ok: false,
         summary: `No task executor registered for backend "${executor}"`,
         exitCode: 1,
-      };
+      });
     }
     let result: Awaited<ReturnType<typeof runExecutor>> | null = null;
     let mergeConflictPass = 0;
     let executorElapsedMs = 0;
     let nextMergeConflictExecuteBudgets: typeof defaultExecuteBudgets | null = null;
     while (true) {
-      const currentExecuteBudgets = nextMergeConflictExecuteBudgets ?? defaultExecuteBudgets;
+      const requestedMergeBudgets = nextMergeConflictExecuteBudgets ?? defaultExecuteBudgets;
       nextMergeConflictExecuteBudgets = null;
+      const currentExecuteBudgets = deadlineLedger.executorBudgets(
+        requestedMergeBudgets.executionBudgetMs,
+        requestedMergeBudgets.finalizationBudgetMs,
+      );
+      if (!currentExecuteBudgets) {
+        return finalizeResult({
+          ok: false,
+          summary: "Job deadline reached during merge-conflict recovery",
+          exitCode: 124,
+        });
+      }
       const currentResult = await runExecutor(
         kind,
         attemptParams,
@@ -10546,7 +11380,19 @@ export async function executeJob(
         onLog,
         currentExecuteBudgets,
       );
-      if (!currentResult.ok) return currentResult;
+      if ((currentResult.usageAttempts?.length ?? 0) > 0) {
+        usageAccumulator.addAttempts(currentResult.usageAttempts);
+      } else {
+        usageAccumulator.add(currentResult.usage, {
+          stage: mergeConflictPass > 0 ? "executor_recovery" : "executor",
+          attempt: revisionAttempt * 10 + mergeConflictPass + 1,
+          source: executor,
+          timedOut:
+            currentResult.exitCode === 124 ||
+            /\btimed out\b/i.test(`${currentResult.summary}\n${currentResult.stderr ?? ""}`),
+        });
+      }
+      if (!currentResult.ok) return finalizeResult(currentResult);
       result = currentResult;
       if (!mergeConflictContext) break;
       if (isHostScmOwnedReviewParams(attemptParams)) {
@@ -10560,13 +11406,13 @@ export async function executeJob(
       const resume = await resumePreparedMergeConflictRebase(repo, kind, attemptParams, onLog);
       if (!resume.ok) {
         onLog?.("stderr", `[MergeConflict] ${resume.error}`);
-        return {
+        return finalizeResult({
           ok: false,
           summary: "Merge-conflict rebase continuation failed",
           stdout: currentResult.stdout,
           stderr: [currentResult.stderr ?? "", resume.error].filter(Boolean).join("\n"),
           exitCode: 4,
-        };
+        });
       }
       const sequencer = resume.sequencer;
       if (!sequencer) break;
@@ -10577,7 +11423,7 @@ export async function executeJob(
             `Merge-conflict rebase required more than ${MAX_MERGE_CONFLICT_RESOLUTION_PASSES} resolver passes. ` +
             "Stopping to avoid an infinite conflict-resolution loop.";
           onLog?.("stderr", `[MergeConflict] ${detail}`);
-          return {
+          return finalizeResult({
             ok: false,
             summary: detail,
             stdout: currentResult.stdout,
@@ -10585,7 +11431,7 @@ export async function executeJob(
               .filter(Boolean)
               .join("\n"),
             exitCode: 4,
-          };
+          });
         }
         const retryBudget = mergeConflictResolverRetryBudgetDecision({
           jobElapsedMs: Date.now() - attemptStartedAt,
@@ -10597,7 +11443,7 @@ export async function executeJob(
             "Merge-conflict rebase advanced into another conflicted commit, but remaining job budget " +
             `is ${retryBudget.remainingTotalBudgetMs}ms (< ${retryBudget.minimumExecutionBudgetMs}ms execution).`;
           onLog?.("stderr", `[MergeConflict] ${detail}`);
-          return {
+          return finalizeResult({
             ok: false,
             summary: detail,
             stdout: currentResult.stdout,
@@ -10605,7 +11451,7 @@ export async function executeJob(
               .filter(Boolean)
               .join("\n"),
             exitCode: 4,
-          };
+          });
         }
         nextMergeConflictExecuteBudgets = {
           executionBudgetMs: retryBudget.executionBudgetMs,
@@ -10664,20 +11510,20 @@ export async function executeJob(
         `Merge-conflict job returned with git ${sequencer} still in progress. ` +
         `Finish the ${sequencer} before returning control to WorkerPals.`;
       onLog?.("stderr", `[MergeConflict] ${detail}`);
-      return {
+      return finalizeResult({
         ok: false,
         summary: detail,
         stdout: currentResult.stdout,
         stderr: [currentResult.stderr ?? "", detail].filter(Boolean).join("\n"),
         exitCode: 4,
-      };
+      });
     }
     if (!result) {
-      return {
+      return finalizeResult({
         ok: false,
         summary: "Merge-conflict execution ended without an executor result.",
         exitCode: 4,
-      };
+      });
     }
     executorElapsedMs = Date.now() - attemptStartedAt;
 
@@ -10717,17 +11563,19 @@ export async function executeJob(
         stderr: [result.stderr ?? "", detail].filter(Boolean).join("\n"),
         exitCode: 4,
       };
-      return withJobDiagnostics(failure, {
-        terminal: buildTerminalDiagnostics({
-          result: failure,
-          executor,
-          changedPaths: preQualityChangedPaths,
-          terminalStage: "executor",
-          timeoutMs: executionBudgetMs,
-          metadata: { revisionAttempt, executorElapsedMs },
+      return finalizeResult(
+        withJobDiagnostics(failure, {
+          terminal: buildTerminalDiagnostics({
+            result: failure,
+            executor,
+            changedPaths: preQualityChangedPaths,
+            terminalStage: "executor",
+            timeoutMs: executionBudgetMs,
+            metadata: { revisionAttempt, executorElapsedMs },
+          }),
+          patchSnapshots: [...diagnosticPatchSnapshots],
         }),
-        patchSnapshots: [...diagnosticPatchSnapshots],
-      });
+      );
     }
     if (
       shouldFailTaskWithoutPublishableChanges({
@@ -10755,17 +11603,19 @@ export async function executeJob(
         stderr: [result.stderr ?? "", reason].filter(Boolean).join("\n"),
         exitCode: 4,
       };
-      return withJobDiagnostics(failure, {
-        terminal: buildTerminalDiagnostics({
-          result: failure,
-          executor,
-          changedPaths: preQualityChangedPaths,
-          terminalStage: "executor",
-          timeoutMs: executionBudgetMs,
-          metadata: { revisionAttempt, executorElapsedMs, shellWrapperReturn },
+      return finalizeResult(
+        withJobDiagnostics(failure, {
+          terminal: buildTerminalDiagnostics({
+            result: failure,
+            executor,
+            changedPaths: preQualityChangedPaths,
+            terminalStage: "executor",
+            timeoutMs: executionBudgetMs,
+            metadata: { revisionAttempt, executorElapsedMs, shellWrapperReturn },
+          }),
+          patchSnapshots: [...diagnosticPatchSnapshots],
         }),
-        patchSnapshots: [...diagnosticPatchSnapshots],
-      });
+      );
     }
 
     const qualityStartedAt = Date.now();
@@ -10780,6 +11630,7 @@ export async function executeJob(
         revisionAttempt,
         passingValidationCache,
       },
+      deadlineLedger,
     );
     const qualityElapsedMs = Date.now() - qualityStartedAt;
     diagnosticPatchSnapshots.push(
@@ -10897,42 +11748,74 @@ export async function executeJob(
       criticTimeoutMs: resolveQualityCriticTimeoutMs(runtimeConfig),
       criticTimeoutBehavior: resolveQualityCriticTimeoutBehavior(runtimeConfig),
     });
-    const critic =
-      quality.skipped ||
-      !qualityGatePolicy.criticGateEnabled ||
-      unchangedValidationFailure !== null ||
-      skipCriticAfterExecutorTimeout ||
-      skipCriticForDeterministicValidationRevision ||
-      skipCriticForRevisionBudget
-        ? null
-        : executor === "openai_codex"
-          ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog)
-          : await runTaskCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog);
+    const criticOutcome: CriticOutcome = quality.skipped
+      ? { kind: "skipped", reason: "quality_skipped", usageAttempts: [] }
+      : !qualityGatePolicy.criticGateEnabled
+        ? { kind: "skipped", reason: "disabled", usageAttempts: [] }
+        : unchangedValidationFailure !== null
+          ? {
+              kind: "skipped",
+              reason: "unchanged_validation_failure",
+              usageAttempts: [],
+            }
+          : skipCriticAfterExecutorTimeout
+            ? { kind: "skipped", reason: "executor_timeout", usageAttempts: [] }
+            : skipCriticForDeterministicValidationRevision
+              ? { kind: "skipped", reason: "deterministic_revision", usageAttempts: [] }
+              : skipCriticForRevisionBudget
+                ? { kind: "skipped", reason: "revision_budget", usageAttempts: [] }
+                : executor === "openai_codex"
+                  ? await runCodexCriticReview(
+                      repo,
+                      attemptParams,
+                      qualityForCritic,
+                      runtimeConfig,
+                      onLog,
+                      deadlineLedger,
+                    )
+                  : await runTaskCriticReview(
+                      repo,
+                      attemptParams,
+                      qualityForCritic,
+                      runtimeConfig,
+                      onLog,
+                      deadlineLedger,
+                    );
+    usageAccumulator.addAttempts(criticOutcome.usageAttempts);
+    const critic = criticOutcome.kind === "verdict" ? criticOutcome.review : null;
+    if ((critic?.unsupportedFindings?.length ?? 0) > 0) {
+      onLog?.(
+        "stderr",
+        `[CriticGate] Ignored ${critic?.unsupportedFindings?.length ?? 0} validation claim(s) without exact evidence IDs.`,
+      );
+    }
     const annotateTerminalResult = (
       terminalResult: JobResult,
       terminalStage: string,
       changedPaths: string[] = quality.changedPaths,
     ): JobResult =>
-      withJobDiagnostics(terminalResult, {
-        terminal: buildTerminalDiagnostics({
-          result: terminalResult,
-          executor,
-          changedPaths,
-          terminalStage,
-          timeoutMs: executionBudgetMs,
-          metadata: {
-            revisionAttempt,
-            executorElapsedMs,
-            qualityElapsedMs,
-            validationFailureScope: quality.validationFailureScope,
-            repoValidationRepairMode,
-            validationRuns: quality.validationRuns.length,
-            criticScore: critic?.score ?? null,
-          },
+      finalizeResult(
+        withJobDiagnostics(terminalResult, {
+          terminal: buildTerminalDiagnostics({
+            result: terminalResult,
+            executor,
+            changedPaths,
+            terminalStage,
+            timeoutMs: executionBudgetMs,
+            metadata: {
+              revisionAttempt,
+              executorElapsedMs,
+              qualityElapsedMs,
+              validationFailureScope: quality.validationFailureScope,
+              repoValidationRepairMode,
+              validationRuns: quality.validationRuns.length,
+              criticScore: critic?.score ?? null,
+            },
+          }),
+          validationRuns: [...diagnosticValidationRuns],
+          patchSnapshots: [...diagnosticPatchSnapshots],
         }),
-        validationRuns: [...diagnosticValidationRuns],
-        patchSnapshots: [...diagnosticPatchSnapshots],
-      });
+      );
     if (unchangedValidationFailure) {
       const detail =
         `Validation failed unchanged after two attempts for "${unchangedValidationFailure.command}": ` +
@@ -11017,7 +11900,16 @@ export async function executeJob(
     }
     const deterministicRequiresRevision =
       effectiveQualityIssues.length > 0 || qualityForCritic.blocker !== null;
-    const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
+    const criticDisposition = criticGateDisposition({
+      outcome: criticOutcome,
+      criticGateEnabled: qualityGatePolicy.criticGateEnabled,
+      deterministicRequiresRevision,
+      criticMinScore: qualityCriticMinScore,
+    });
+    const criticRequiresRevision = !deterministicRequiresRevision && criticDisposition === "revise";
+    const criticEvidenceInsufficient = Boolean(
+      critic && critic.score < qualityCriticMinScore && criticActionableFeedbackCount(critic) === 0,
+    );
     const trustedEnvironmentHandoffReady = canReturnTrustedEnvironmentValidationHandoff({
       pureEnvironmentDeferral: environmentDeferral.pureEnvironmentDeferral,
       deterministicRequiresRevision,
@@ -11025,6 +11917,60 @@ export async function executeJob(
       criticScore: critic?.score ?? null,
       criticMinScore: qualityCriticMinScore,
     });
+    const criticTerminalProblem =
+      criticDisposition === "hold_candidate" || criticEvidenceInsufficient;
+    if (
+      !deterministicRequiresRevision &&
+      qualityGatePolicy.criticGateEnabled &&
+      (criticTerminalProblem ||
+        (criticOutcome.kind === "skipped" && criticOutcome.reason === "executor_timeout"))
+    ) {
+      const unsupportedEvidence = critic?.unsupportedFindings ?? [];
+      const reason =
+        criticOutcome.kind === "verdict"
+          ? unsupportedEvidence.length > 0
+            ? "critic findings below threshold lacked exact supporting evidence"
+            : "critic score was below threshold without actionable revision feedback"
+          : criticOutcome.kind === "skipped"
+            ? "primary executor timed out before a complete critic review"
+            : criticOutcome.reason;
+      const summary =
+        criticOutcome.kind === "timeout"
+          ? "Critic timed out; candidate retained without reporting success"
+          : criticOutcome.kind === "verdict"
+            ? "Critic evidence was insufficient; candidate retained without reporting success"
+            : "Critic verdict unavailable; candidate retained without reporting success";
+      onLog?.("stderr", `[CriticGate] ${summary}: ${toSingleLine(reason, 220)}`);
+      return annotateTerminalResult(
+        {
+          ok: false,
+          summary,
+          stdout: result.stdout,
+          stderr: truncate(
+            [result.stderr ?? "", reason, ...unsupportedEvidence].filter(Boolean).join("\n"),
+            outputPolicyForRuntime(runtimeConfig),
+          ),
+          exitCode: criticOutcome.kind === "timeout" ? 124 : 4,
+          candidateState: {
+            status:
+              criticOutcome.kind === "timeout" ||
+              (criticOutcome.kind === "skipped" && criticOutcome.reason === "executor_timeout")
+                ? "partial"
+                : "held",
+            reason:
+              criticOutcome.kind === "timeout"
+                ? "critic_timeout"
+                : criticOutcome.kind === "skipped"
+                  ? "executor_timeout"
+                  : criticOutcome.kind === "verdict"
+                    ? "critic_evidence_insufficient"
+                    : "critic_unavailable",
+            changedPaths: publishableChangedPaths(quality.changedPaths),
+          },
+        },
+        criticOutcome.kind === "timeout" ? "critic_timeout" : "critic_unavailable",
+      );
+    }
     if (
       !qualityGatePolicy.publishGateEnabled &&
       (deterministicRequiresRevision || criticRequiresRevision)
@@ -11051,36 +11997,6 @@ export async function executeJob(
       return annotateTerminalResult(advisoryResult, "quality");
     }
 
-    if (
-      environmentDeferral.pureEnvironmentDeferral &&
-      qualityGatePolicy.criticGateEnabled &&
-      !deterministicRequiresRevision &&
-      critic == null
-    ) {
-      const summary = "Critic review unavailable before trusted-environment validation handoff";
-      onLog?.(
-        "stderr",
-        `[CriticGate] ${summary}; retaining the candidate without reporting a publishable success.`,
-      );
-      return annotateTerminalResult(
-        {
-          ok: false,
-          summary,
-          stdout: result.stdout,
-          stderr: truncate(
-            [
-              result.stderr ?? "",
-              "The deterministic validation blocker is environment-only, but the enabled critic did not produce a verdict.",
-              ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean),
-            ].join("\n"),
-            outputPolicyForRuntime(runtimeConfig),
-          ),
-          exitCode: 4,
-        },
-        "critic_unavailable_before_trusted_environment_handoff",
-      );
-    }
-
     if (trustedEnvironmentHandoffReady) {
       const blockerDiagnostics = truncate(
         [
@@ -11105,6 +12021,11 @@ export async function executeJob(
           summary,
           detail: environmentDetail,
           commands: environmentDeferral.blockedCommands,
+        },
+        candidateState: {
+          status: "held",
+          reason: "trusted_environment_validation_required",
+          changedPaths: publishableChangedPaths(quality.changedPaths),
         },
       };
       return annotateTerminalResult(heldCandidate, "trusted_environment_validation_required");
@@ -11544,9 +12465,9 @@ export async function executeJob(
     );
   }
 
-  return {
+  return finalizeResult({
     ok: false,
     summary: "Quality revision loop ended unexpectedly.",
     exitCode: 4,
-  };
+  });
 }

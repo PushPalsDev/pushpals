@@ -2,6 +2,7 @@ type HarnessPhase = {
   name: string;
   files: string[];
   timeoutMs: number;
+  command?: string[];
 };
 
 type HarnessEvent = {
@@ -21,6 +22,22 @@ type HarnessEvent = {
 
 const phases: HarnessPhase[] = [
   {
+    name: "repository_intelligence",
+    files: [
+      "tests/shared.repository-agent-client.test.ts",
+      "tests/shared.repository-snapshot.test.ts",
+      "tests/shared.memory.test.ts",
+      "tests/memory-store-conformance.test.ts",
+      "tests/server.repository-agent-queue.test.ts",
+      "tests/server.repository-agent-context.test.ts",
+      "tests/server.memory-repository-agent-routes.test.ts",
+      "tests/remotebuddy.repository-agent.test.ts",
+      "tests/remotebuddy.llm-repository-context.test.ts",
+      "tests/remotebuddy.autonomous-engine.tick.test.ts",
+    ],
+    timeoutMs: 300_000,
+  },
+  {
     name: "failure_evidence",
     files: [
       "tests/shared.trusted-validation-evidence.test.ts",
@@ -38,6 +55,7 @@ const phases: HarnessPhase[] = [
       "tests/server.lifecycle-reconciliation.test.ts",
       "tests/server.job-diagnostics.test.ts",
       "tests/server.jobs.stale-recovery.test.ts",
+      "tests/server.jobs-repair-scheduling.test.ts",
       "tests/server.requests-queue.test.ts",
       "tests/server.session-message-route.test.ts",
       "tests/remotebuddy.task-dedupe.test.ts",
@@ -60,6 +78,29 @@ const phases: HarnessPhase[] = [
       "tests/workerpals.worktree-base-ref.test.ts",
     ],
     timeoutMs: 120_000,
+  },
+  {
+    name: "quality_loop",
+    files: [
+      "tests/workerpals.execute-job-clarification.test.ts",
+      "tests/workerpals.quality-gate-issues.test.ts",
+      "tests/workerpals.quality-loop-durability.test.ts",
+      "tests/workerpals.validation-command-safety.test.ts",
+      "tests/workerpals.job-runner.test.ts",
+      "tests/workerpals.generic-python-executor.test.ts",
+      "tests/workerpals.session-events.test.ts",
+    ],
+    timeoutMs: 300_000,
+  },
+  {
+    name: "worker_watchdog",
+    files: ["apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py"],
+    command: [
+      process.env.PYTHON?.trim() || "python",
+      "-u",
+      "apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py",
+    ],
+    timeoutMs: 300_000,
   },
   {
     name: "runtime_boundary",
@@ -86,6 +127,7 @@ const phases: HarnessPhase[] = [
       "tests/workerpals.validation-command-safety.test.ts",
       "tests/workerpals.runtime-sandbox-mirror.test.ts",
       "tests/release-package-payload.test.ts",
+      "tests/release-workflow-actions.test.ts",
       "tests/reliability-harness.test.ts",
     ],
     timeoutMs: 360_000,
@@ -109,7 +151,7 @@ function emit(event: Omit<HarnessEvent, "harness" | "observedAt">): void {
 async function runPhase(phase: HarnessPhase): Promise<{ ok: boolean; durationMs: number }> {
   emit({ event: "phase_started", phase: phase.name, files: phase.files });
   const startedAt = Date.now();
-  const processHandle = Bun.spawn([process.execPath, "test", ...phase.files], {
+  const processHandle = Bun.spawn(phase.command ?? [process.execPath, "test", ...phase.files], {
     cwd: process.cwd(),
     stdin: "ignore",
     stdout: "inherit",

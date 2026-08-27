@@ -39,6 +39,8 @@ from openai_codex_executor import (
     _codex_sandbox_additional_dirs,
     _codex_changed_paths,
     _capture_git_change_snapshot,
+    _candidate_artifact_contract_missing,
+    _active_command_deserves_deadline_only_protection,
     _describe_non_publishable_paths,
     _detect_offtrack_rollout,
     _detect_codex_workaround_signal,
@@ -48,6 +50,7 @@ from openai_codex_executor import (
     _looks_like_validation_repair_prompt,
     _mask_repo_local_codex_files,
     _minimum_recovery_attempt_seconds,
+    _meaningful_discovery_command_key,
     _publishable_progress_fingerprint,
     _repo_root_for_prompt_loading,
     _restore_repo_local_codex_files,
@@ -82,6 +85,139 @@ def _link_test_directory(source: Path, destination: Path) -> None:
 
 
 class OpenAICodexRuntimeConfigTests(unittest.TestCase):
+    def test_active_command_protection_is_limited_to_real_long_running_gates(self) -> None:
+        self.assertTrue(
+            _active_command_deserves_deadline_only_protection(
+                "bun test tests/meshSession.test.ts"
+            )
+        )
+        self.assertTrue(
+            _active_command_deserves_deadline_only_protection("uv sync --frozen")
+        )
+        self.assertFalse(
+            _active_command_deserves_deadline_only_protection(
+                "rg -n 'test' apps/workerpals/src"
+            )
+        )
+        self.assertFalse(
+            _active_command_deserves_deadline_only_protection(
+                "cat tests/meshSession.test.ts"
+            )
+        )
+
+    def test_progress_guard_recognizes_targeted_discovery_but_not_broad_inventory(self) -> None:
+        targeted_key = _meaningful_discovery_command_key("rg -n 'meshSession' src tests")
+        self.assertTrue(targeted_key)
+        self.assertEqual(
+            targeted_key,
+            _meaningful_discovery_command_key(
+                "rg --line-number meshSession tests src"
+            ),
+        )
+        self.assertEqual(
+            targeted_key,
+            _meaningful_discovery_command_key(
+                "rg --hidden --color never meshSession ./tests ./src"
+            ),
+        )
+        self.assertEqual(
+            targeted_key,
+            _meaningful_discovery_command_key("rg meshSession ./tests/ ./src/"),
+        )
+        self.assertEqual(_meaningful_discovery_command_key("rg --files"), "")
+        self.assertEqual(
+            _meaningful_discovery_command_key("rg --files -g '*.ts'"), ""
+        )
+        self.assertEqual(
+            _meaningful_discovery_command_key("rg --hidden --files ./src"), ""
+        )
+        self.assertEqual(_meaningful_discovery_command_key("rg -n '.' ."), "")
+        self.assertTrue(_meaningful_discovery_command_key("sed -n 1,160p src/meshSession.ts"))
+        self.assertTrue(_meaningful_discovery_command_key("bun test tests/meshSession.test.ts"))
+        self.assertEqual(_meaningful_discovery_command_key("find . -type f"), "")
+        self.assertEqual(_meaningful_discovery_command_key("ls -R"), "")
+
+    def test_early_stop_requires_explicit_test_and_docs_artifact_contract(self) -> None:
+        instruction = "Update the behavior, add regression tests, and update documentation."
+        self.assertEqual(
+            _candidate_artifact_contract_missing(instruction, ["src/behavior.ts"]),
+            ["docs", "test"],
+        )
+        self.assertEqual(
+            _candidate_artifact_contract_missing(
+                instruction,
+                ["src/behavior.ts", "tests/behavior.test.ts", "docs/behavior.md"],
+            ),
+            [],
+        )
+
+    def test_artifact_contract_does_not_treat_test_outcome_language_as_an_edit_request(self) -> None:
+        self.assertEqual(
+            _candidate_artifact_contract_missing(
+                "Update the parser implementation so tests pass.",
+                ["src/parser.ts"],
+            ),
+            [],
+        )
+        self.assertEqual(
+            _candidate_artifact_contract_missing(
+                "Fix the documentation build so markdown validation passes.",
+                ["src/docs_builder.py"],
+            ),
+            [],
+        )
+        self.assertEqual(
+            _candidate_artifact_contract_missing(
+                "The implementation needs tests to pass before publication.",
+                ["src/parser.ts"],
+            ),
+            [],
+        )
+        self.assertEqual(
+            _candidate_artifact_contract_missing(
+                "Update the parser and add regression tests.",
+                ["src/parser.ts"],
+            ),
+            ["test"],
+        )
+
+    def test_artifact_contract_recognizes_cross_repo_test_conventions(self) -> None:
+        instruction = "Update the parser and add regression tests."
+        for test_path in (
+            "test_parser.py",
+            "parser_test.py",
+            "parser_test.go",
+            "tests/parser.rs",
+            "spec/parser_spec.rb",
+            "src/parser_test.cc",
+            "src/ParserTest.java",
+            "Tests/ParserTests.swift",
+        ):
+            with self.subTest(test_path=test_path):
+                self.assertEqual(
+                    _candidate_artifact_contract_missing(
+                        instruction,
+                        ["src/parser.ts", test_path],
+                    ),
+                    [],
+                )
+
+    def test_artifact_contract_recognizes_cross_repo_docs_conventions(self) -> None:
+        instruction = "Update the parser and update documentation."
+        for docs_path in (
+            "README.rst",
+            "docs/parser.adoc",
+            "guide/parser.mdx",
+        ):
+            with self.subTest(docs_path=docs_path):
+                self.assertEqual(
+                    _candidate_artifact_contract_missing(
+                        instruction,
+                        ["src/parser.ts", docs_path],
+                    ),
+                    [],
+                )
+
     def test_env_overrides_config_for_selected_fields(self) -> None:
         resolver = SettingsResolver(
             env={
@@ -1056,11 +1192,13 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "10",
                 "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
             }
+            usage_attempts = []
             with mock.patch.dict(os.environ, env_overrides, clear=False):
                 result = _run_codex_task(
                     str(repo),
                     "Recover from a shell-wrapper loop after noisy repo changes.",
                     [],
+                    usage_attempts=usage_attempts,
                 )
 
         self.assertTrue(result.get("ok"), result)
@@ -1068,8 +1206,12 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("Recovered after Codex attempts hit command-router shell-wrapper rejections.", stdout)
         self.assertIn("Recovered after noisy shell-wrapper path detection", stdout)
         self.assertNotIn("ValidationGate/CriticGate", stdout)
+        self.assertEqual(
+            [attempt.get("stage") for attempt in usage_attempts],
+            ["executor", "executor_recovery"],
+        )
 
-    def test_run_codex_task_hands_changed_worktree_to_gates_after_timeout(self) -> None:
+    def test_run_codex_task_retains_changed_worktree_as_non_success_after_timeout(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-timeout-changed-") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
@@ -1132,19 +1274,32 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "1",
                 "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
             }
+            usage_attempts = []
             with mock.patch.dict(os.environ, env_overrides, clear=False):
                 result = _run_codex_task(
                     str(repo),
                     "Create a small file, then continue thinking too long.",
                     [],
+                    usage_attempts=usage_attempts,
                 )
 
-        self.assertTrue(result.get("ok"), result)
-        self.assertEqual(result.get("exitCode"), 0)
-        self.assertIn("timed out after modifying", str(result.get("summary") or ""))
-        self.assertIn("partial patch", str(result.get("stdout") or "").lower())
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result.get("exitCode"), 124)
+        self.assertIn("retained partial candidate", str(result.get("summary") or ""))
+        self.assertEqual(
+            result.get("candidateState"),
+            {
+                "status": "partial",
+                "reason": "executor_timeout",
+                "changedPaths": ["src/"],
+            },
+        )
+        self.assertIn("partial candidate", str(result.get("stdout") or "").lower())
         self.assertIn("src/", str(result.get("stdout") or ""))
         self.assertIn("Made a small patch before timeout", str(result.get("stdout") or ""))
+        self.assertEqual(len(usage_attempts), 1)
+        self.assertEqual(usage_attempts[0].get("stage"), "executor")
+        self.assertTrue(usage_attempts[0].get("timedOut"))
 
     def test_run_codex_task_rejects_broad_timeout_partial_patch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-timeout-noisy-") as temp_dir:

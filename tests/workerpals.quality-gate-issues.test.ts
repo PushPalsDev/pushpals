@@ -14,6 +14,7 @@ import {
   buildCriticRevisionIssues,
   buildQualityGateRevisionIssues,
   buildTaskFailureJobFamily,
+  classifyValidationFailureClass,
   classifyValidationRunFailure,
   detectValidationBlocker,
   expandKnownArtifactDirectoryPaths,
@@ -215,6 +216,29 @@ describe("workerpals quality gate critic issue formatting", () => {
     const result = isolatePureEnvironmentValidationDeferral(quality);
     expect(result.pureEnvironmentDeferral).toBe(false);
     expect(result.qualityForCritic).toBe(quality);
+  });
+
+  test("does not classify assertion text as environment-only from incidental substrings", () => {
+    for (const [actual, expected] of [
+      ["permission denied", "access denied"],
+      ["command not found", "missing command"],
+      ["Cannot connect to the Docker daemon", "fixture-specific error"],
+      ["browser runtime preflight failed", "browser fixture error"],
+    ]) {
+      const assertionRun = {
+        step: "bun test permissions.test.ts",
+        command: "bun test permissions.test.ts",
+        ok: false,
+        exitCode: 1,
+        stdout: `AssertionError: Expected '${actual}' to equal '${expected}'`,
+        stderr: "1 test failed after a fixture returned connection refused",
+        elapsedMs: 10,
+      };
+
+      expect(classifyValidationFailureClass(assertionRun)).toBe("candidate.assertion");
+      expect(classifyValidationRunFailure(assertionRun)).toBe("nonzero_exit");
+      expect(detectValidationBlocker([assertionRun])).toBeNull();
+    }
   });
 
   test("does not defer repository dependency failures", () => {
@@ -1852,7 +1876,7 @@ describe("workerpals quality gate critic issue formatting", () => {
     ).toEqual({
       category: "environment",
       detail:
-        "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the candidate and rerun the blocked command in a trusted host environment.",
+        "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the exact candidate and rerun the blocked command against that SHA in a trusted host environment.",
     });
     expect(
       detectValidationBlocker([

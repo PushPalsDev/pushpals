@@ -8,7 +8,9 @@ The PushPals CLI is the terminal client and optional local runtime supervisor. I
 npm install -g @pushpalsdev/cli
 ```
 
-`bun install -g @pushpalsdev/cli` is also supported.
+`bun install -g @pushpalsdev/cli` is also supported. On Windows hosts with a
+managed certificate store, use
+`bun install -g --use-system-ca @pushpalsdev/cli` so Bun trusts the system CAs.
 
 The npm entrypoint requires Node.js 20+ and Bun 1.3.14+. Native binaries are also available from [GitHub Releases](https://github.com/PushPalsDev/pushpals/releases).
 

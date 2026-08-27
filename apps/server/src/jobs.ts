@@ -24,6 +24,13 @@ export type JobStatus =
   | "publish_blocked";
 export type WorkerStatus = "idle" | "busy" | "error" | "offline";
 export type JobPriority = "interactive" | "normal" | "background";
+export type JobWorkClass =
+  | "recovery"
+  | "repair"
+  | "interactive"
+  | "standard"
+  | "autonomy"
+  | "background";
 export type JobRetrySafety = "retry_safe" | "manual_retry_required";
 type JobRecoveryReason =
   | "worker_heartbeat_mismatch"
@@ -61,7 +68,9 @@ export interface JobRow {
   dedupeKey: string | null;
   dedupeCooldownMs: number;
   priority: JobPriority;
+  workClass: JobWorkClass;
   queueWaitBudgetMs: number;
+  queueDeadlineAt: string | null;
   executionBudgetMs: number;
   finalizationBudgetMs: number;
   status: JobStatus;
@@ -362,10 +371,20 @@ export interface JobSloSummary {
   abandoned: number;
   publishBlocked: number;
   timeoutFailures: number;
+  queueDeadlineMisses: number;
   successRate: number | null;
   timeoutRate: number | null;
+  queueDeadlineMissRate: number | null;
   durationMs: JobSloMetricSummary;
   queueWaitMs: JobSloMetricSummary;
+}
+
+export interface JobRecoveryBackpressureSummary {
+  blocked: boolean;
+  pendingRecovery: number;
+  pendingRepair: number;
+  overdue: number;
+  oldestDeadlineAt: string | null;
 }
 
 export type WorkerPrMergeState = "open_unmerged" | "merged" | "closed_unmerged";
@@ -849,6 +868,55 @@ function normalizeJobPriority(value: unknown): JobPriority {
   return "normal";
 }
 
+function normalizeJobWorkClass(
+  value: unknown,
+  params: Record<string, unknown>,
+  priority: JobPriority,
+): JobWorkClass {
+  const explicit = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+  if (explicit === "recovery" || explicit === "repair") return explicit;
+  if (explicit === "interactive") return "interactive";
+  if (explicit === "autonomy" || explicit === "ideation") return "autonomy";
+  if (explicit === "background") return "background";
+  if (explicit === "standard" || explicit === "normal") return "standard";
+
+  const reviewAgent = params.reviewAgent;
+  if (reviewAgent && typeof reviewAgent === "object" && !Array.isArray(reviewAgent)) {
+    return "repair";
+  }
+  const recovery = params.recovery;
+  const resume = params.resume;
+  if (
+    (recovery && typeof recovery === "object" && !Array.isArray(recovery)) ||
+    (resume && typeof resume === "object" && !Array.isArray(resume))
+  ) {
+    return "recovery";
+  }
+  if (priority === "interactive") return "interactive";
+  if (priority === "background") return "background";
+  const autonomy = params.autonomy;
+  if (
+    String(params.origin ?? "")
+      .trim()
+      .toLowerCase() === "autonomy" ||
+    (autonomy && typeof autonomy === "object" && !Array.isArray(autonomy))
+  ) {
+    return "autonomy";
+  }
+  return "standard";
+}
+
+function queueDeadlineAt(enqueuedAt: string, queueWaitBudgetMs: number): string {
+  const startedAtMs = Date.parse(enqueuedAt);
+  return new Date(
+    (Number.isFinite(startedAtMs) ? startedAtMs : Date.now()) +
+      Math.max(1_000, Math.floor(queueWaitBudgetMs)),
+  ).toISOString();
+}
+
 function parseBudgetMs(value: unknown, fallback: number): number {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
@@ -1100,6 +1168,61 @@ function extractReviewAgentPrUrl(params: Record<string, unknown>): string | null
   return normalizePrUrl((reviewAgent as Record<string, unknown>).prUrl);
 }
 
+type ReviewRepairContext = {
+  lifecycleKey: string;
+  prUrlNormalized: string;
+  prNumber: number | null;
+  headSha: string;
+  baseSha: string | null;
+  resolutionType: "review_fix" | "merge_conflict";
+  sourceJobId: string | null;
+};
+
+function extractReviewRepairContext(
+  params: Record<string, unknown>,
+  prUrl: string | null,
+): ReviewRepairContext | null {
+  const reviewAgent = params.reviewAgent;
+  if (!reviewAgent || typeof reviewAgent !== "object" || Array.isArray(reviewAgent)) return null;
+  const record = reviewAgent as Record<string, unknown>;
+  const resolutionRaw = String(record.resolutionType ?? "review_fix")
+    .trim()
+    .toLowerCase();
+  if (resolutionRaw !== "review_fix" && resolutionRaw !== "merge_conflict") return null;
+  const prUrlNormalized = normalizePrUrl(prUrl ?? record.prUrl);
+  const headSha = String(record.prHeadSha ?? "")
+    .trim()
+    .toLowerCase();
+  if (!prUrlNormalized || !headSha) return null;
+  const prNumberRaw = Number(record.prNumber);
+  const prNumber = Number.isSafeInteger(prNumberRaw) && prNumberRaw > 0 ? prNumberRaw : null;
+  const baseSha = String(record.prBaseSha ?? "")
+    .trim()
+    .toLowerCase();
+  const sourceJobId = String(record.sourceJobId ?? record.source_job_id ?? "").trim() || null;
+  const resolutionType = resolutionRaw as ReviewRepairContext["resolutionType"];
+  const lifecycleKey = createHash("sha256")
+    .update(
+      JSON.stringify({
+        prUrlNormalized,
+        headSha,
+        baseSha: resolutionType === "merge_conflict" ? baseSha : "",
+        resolutionType,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 32);
+  return {
+    lifecycleKey,
+    prUrlNormalized,
+    prNumber,
+    headSha,
+    baseSha: baseSha || null,
+    resolutionType,
+    sourceJobId,
+  };
+}
+
 function resolveJobPrUrl(
   body: Record<string, unknown>,
   params: Record<string, unknown>,
@@ -1114,6 +1237,7 @@ export class JobQueue {
     this.db = new Database(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this._migrate();
+    this.reconcileReviewRepairLifecycles();
   }
 
   private _migrate(): void {
@@ -1127,7 +1251,9 @@ export class JobQueue {
           dedupeKey           TEXT,
           dedupeCooldownMs    INTEGER NOT NULL DEFAULT 0,
           priority            TEXT NOT NULL DEFAULT 'normal',
+          workClass           TEXT NOT NULL DEFAULT 'standard',
           queueWaitBudgetMs   INTEGER NOT NULL DEFAULT 90000,
+          queueDeadlineAt     TEXT,
           executionBudgetMs   INTEGER NOT NULL DEFAULT 900000,
           finalizationBudgetMs INTEGER NOT NULL DEFAULT 120000,
           status              TEXT NOT NULL DEFAULT 'pending',
@@ -1162,6 +1288,27 @@ export class JobQueue {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
       CREATE INDEX IF NOT EXISTS idx_jobs_taskId ON jobs(taskId);
       CREATE INDEX IF NOT EXISTS idx_jobs_session_created ON jobs(sessionId, createdAt);
+
+      CREATE TABLE IF NOT EXISTS pr_repair_lifecycle (
+        lifecycleKey       TEXT PRIMARY KEY,
+        prUrlNormalized    TEXT NOT NULL,
+        prNumber           INTEGER,
+        headSha            TEXT NOT NULL,
+        baseSha            TEXT,
+        resolutionType     TEXT NOT NULL,
+        sourceJobId        TEXT,
+        activeJobId        TEXT,
+        status             TEXT NOT NULL,
+        attemptCount       INTEGER NOT NULL DEFAULT 0,
+        maxAttempts        INTEGER NOT NULL DEFAULT 2,
+        nextRetryAt        TEXT,
+        lastFailureClass   TEXT,
+        lastError          TEXT,
+        createdAt          TEXT NOT NULL,
+        updatedAt          TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_status_retry
+        ON pr_repair_lifecycle(status, nextRetryAt, updatedAt);
 
       CREATE TABLE IF NOT EXISTS job_logs (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1380,6 +1527,9 @@ export class JobQueue {
     if (!jobColumns.some((col) => col.name === "priority")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
     }
+    if (!jobColumns.some((col) => col.name === "workClass")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN workClass TEXT NOT NULL DEFAULT 'standard';`);
+    }
     if (!jobColumns.some((col) => col.name === "dedupeKey")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN dedupeKey TEXT;`);
     }
@@ -1388,6 +1538,9 @@ export class JobQueue {
     }
     if (!jobColumns.some((col) => col.name === "queueWaitBudgetMs")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`);
+    }
+    if (!jobColumns.some((col) => col.name === "queueDeadlineAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN queueDeadlineAt TEXT;`);
     }
     if (!jobColumns.some((col) => col.name === "executionBudgetMs")) {
       this.db.exec(
@@ -1571,6 +1724,10 @@ export class JobQueue {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`,
     );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_jobs_work_class_deadline
+         ON jobs(status, workClass, queueDeadlineAt, createdAt);`,
+    );
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_available_at ON jobs(status, availableAt);`);
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_jobs_stale_activity ON jobs(status, lastActivityAt, id);`,
@@ -1741,6 +1898,24 @@ export class JobQueue {
           WHEN 'background' THEN 'background'
           ELSE 'normal'
         END,
+        workClass = CASE
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'recovery' THEN 'recovery'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'repair' THEN 'repair'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'interactive' THEN 'interactive'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'autonomy' THEN 'autonomy'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'background' THEN 'background'
+          WHEN json_valid(params) AND json_type(params, '$.recovery') = 'object' THEN 'recovery'
+          WHEN json_valid(params) AND json_type(params, '$.resume') = 'object' THEN 'recovery'
+          WHEN json_valid(params) AND json_type(params, '$.reviewAgent') = 'object' THEN 'repair'
+          WHEN LOWER(COALESCE(priority, 'normal')) = 'interactive' THEN 'interactive'
+          WHEN LOWER(COALESCE(priority, 'normal')) = 'background' THEN 'background'
+          WHEN json_valid(params) AND LOWER(COALESCE(
+            json_extract(params, '$.origin'),
+            json_extract(params, '$.autonomy.origin'),
+            ''
+          )) = 'autonomy' THEN 'autonomy'
+          ELSE 'standard'
+        END,
         dedupeCooldownMs = CASE
           WHEN dedupeCooldownMs IS NULL OR dedupeCooldownMs < 0 THEN 0
           ELSE dedupeCooldownMs
@@ -1750,9 +1925,343 @@ export class JobQueue {
         queueWaitBudgetMs = CASE WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000 ELSE queueWaitBudgetMs END,
         executionBudgetMs = CASE WHEN executionBudgetMs IS NULL OR executionBudgetMs <= 0 THEN 900000 ELSE executionBudgetMs END,
         finalizationBudgetMs = CASE WHEN finalizationBudgetMs IS NULL OR finalizationBudgetMs <= 0 THEN 120000 ELSE finalizationBudgetMs END,
-        enqueuedAt = COALESCE(enqueuedAt, createdAt)
+        enqueuedAt = COALESCE(enqueuedAt, createdAt),
+        queueDeadlineAt = COALESCE(
+          queueDeadlineAt,
+          datetime(COALESCE(enqueuedAt, createdAt), '+' ||
+            CAST(MAX(1, CASE
+              WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90
+              ELSE queueWaitBudgetMs / 1000
+            END) AS INTEGER) || ' seconds')
+        )
       WHERE 1 = 1;
     `);
+  }
+
+  private trackReviewRepairEnqueued(
+    jobId: string,
+    params: Record<string, unknown>,
+    prUrl: string | null,
+    now: string,
+  ): void {
+    const context = extractReviewRepairContext(params, prUrl);
+    if (!context) return;
+    this.db
+      .prepare(
+        `INSERT INTO pr_repair_lifecycle (
+           lifecycleKey, prUrlNormalized, prNumber, headSha, baseSha, resolutionType,
+           sourceJobId, activeJobId, status, attemptCount, maxAttempts,
+           nextRetryAt, lastFailureClass, lastError, createdAt, updatedAt
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, 2, NULL, NULL, NULL, ?, ?)
+         ON CONFLICT(lifecycleKey) DO UPDATE SET
+           sourceJobId = COALESCE(pr_repair_lifecycle.sourceJobId, excluded.sourceJobId),
+           activeJobId = CASE
+             WHEN pr_repair_lifecycle.status = 'succeeded'
+               THEN pr_repair_lifecycle.activeJobId
+             WHEN pr_repair_lifecycle.status IN ('queued','running')
+               AND pr_repair_lifecycle.activeJobId IS NOT NULL
+               AND pr_repair_lifecycle.activeJobId <> excluded.activeJobId
+               THEN pr_repair_lifecycle.activeJobId
+             ELSE excluded.activeJobId
+           END,
+           status = CASE
+             WHEN pr_repair_lifecycle.status = 'succeeded' THEN pr_repair_lifecycle.status
+             WHEN pr_repair_lifecycle.status IN ('queued','running')
+               AND pr_repair_lifecycle.activeJobId IS NOT NULL
+               AND pr_repair_lifecycle.activeJobId <> excluded.activeJobId
+               THEN pr_repair_lifecycle.status
+             ELSE 'queued'
+           END,
+           attemptCount = CASE
+             WHEN pr_repair_lifecycle.status = 'succeeded'
+               THEN pr_repair_lifecycle.attemptCount
+             WHEN pr_repair_lifecycle.activeJobId = excluded.activeJobId
+               THEN pr_repair_lifecycle.attemptCount
+             ELSE MAX(1, pr_repair_lifecycle.attemptCount)
+           END,
+           nextRetryAt = NULL,
+           updatedAt = excluded.updatedAt`,
+      )
+      .run(
+        context.lifecycleKey,
+        context.prUrlNormalized,
+        context.prNumber,
+        context.headSha,
+        context.baseSha,
+        context.resolutionType,
+        context.sourceJobId,
+        jobId,
+        now,
+        now,
+      );
+  }
+
+  private rearmReviewRepairJob(
+    jobId: string,
+    now: string,
+  ): { jobId: string; created: boolean } | null {
+    const job = this.getJob(jobId);
+    if (!job || !["failed", "publish_blocked", "abandoned"].includes(job.status)) return null;
+    const params = parseJobParamsRecord(job.params);
+    const context = extractReviewRepairContext(params, job.prUrl);
+    if (!context) return null;
+    this.trackReviewRepairEnqueued(job.id, params, job.prUrl, job.createdAt || now);
+
+    const lifecycle = this.db
+      .prepare(
+        `SELECT activeJobId, status, attemptCount, maxAttempts
+         FROM pr_repair_lifecycle
+         WHERE lifecycleKey = ?`,
+      )
+      .get(context.lifecycleKey) as
+      | {
+          activeJobId: string | null;
+          status: string;
+          attemptCount: number;
+          maxAttempts: number;
+        }
+      | undefined;
+    if (!lifecycle || lifecycle.status === "succeeded") return null;
+    if (lifecycle.activeJobId && lifecycle.activeJobId !== jobId) {
+      const active = this.getJob(lifecycle.activeJobId);
+      if (active && ["pending", "claimed", "finalizing"].includes(active.status)) {
+        return { jobId: active.id, created: false };
+      }
+    }
+
+    const attemptCount = Math.max(1, Math.floor(Number(lifecycle.attemptCount || 1)));
+    const maxAttempts = Math.max(1, Math.floor(Number(lifecycle.maxAttempts || 2)));
+    const diagnostic = this.db
+      .prepare(
+        `SELECT failureClass, summary
+         FROM job_terminal_diagnostics
+         WHERE jobId = ?`,
+      )
+      .get(jobId) as { failureClass: string | null; summary: string | null } | undefined;
+    const failureClass = String(diagnostic?.failureClass ?? "").trim() || null;
+    const lastError = String(diagnostic?.summary ?? job.error ?? "").slice(0, 1_000) || null;
+    if (attemptCount >= maxAttempts) {
+      this.db
+        .prepare(
+          `UPDATE pr_repair_lifecycle
+           SET activeJobId = NULL,
+               status = 'exhausted',
+               nextRetryAt = NULL,
+               lastFailureClass = ?,
+               lastError = ?,
+               updatedAt = ?
+           WHERE lifecycleKey = ?`,
+        )
+        .run(failureClass, lastError, now, context.lifecycleKey);
+      return null;
+    }
+
+    const replacementJobId = randomUUID();
+    const nextAttempt = attemptCount + 1;
+    const reviewAgent =
+      params.reviewAgent &&
+      typeof params.reviewAgent === "object" &&
+      !Array.isArray(params.reviewAgent)
+        ? (params.reviewAgent as Record<string, unknown>)
+        : {};
+    const planning =
+      params.planning && typeof params.planning === "object" && !Array.isArray(params.planning)
+        ? (params.planning as Record<string, unknown>)
+        : {};
+    const recentContext = Array.isArray(params.recentContext)
+      ? params.recentContext
+          .map((entry) => String(entry ?? ""))
+          .filter(Boolean)
+          .slice(-20)
+      : [];
+    const recoveryStrategy =
+      job.status === "publish_blocked"
+        ? "publication_root_cause"
+        : failureClass && /environment|runtime|permission|network|timeout/i.test(failureClass)
+          ? "capability_root_cause"
+          : "review_root_cause";
+    const replacementParams: Record<string, unknown> = {
+      ...params,
+      planning: {
+        ...planning,
+        queuePriority: "interactive",
+        queueWaitBudgetMs: Math.min(90_000, Math.max(1_000, job.queueWaitBudgetMs || 90_000)),
+        workClass: "recovery",
+      },
+      reviewAgent: {
+        ...reviewAgent,
+        recoveryAttempt: nextAttempt,
+        recoveryStrategy,
+        recoverySourceJobId: jobId,
+      },
+      recovery: {
+        strategy: recoveryStrategy,
+        previousJobId: jobId,
+        attempt: nextAttempt,
+        failureClass,
+        detail: lastError,
+      },
+      recentContext: [
+        ...recentContext,
+        `Durable PR repair recovery ${nextAttempt}/${maxAttempts}: diagnose the root cause of the prior ${job.status} attempt before editing. Prior failure class: ${failureClass ?? "unknown"}.`,
+      ],
+    };
+    const queueBudgetMs = Math.min(90_000, Math.max(1_000, job.queueWaitBudgetMs || 90_000));
+    const deadlineAt = queueDeadlineAt(now, queueBudgetMs);
+    const insert = this.db.transaction(() => {
+      const existingActive = this.db
+        .prepare(
+          `SELECT id, status
+           FROM jobs
+           WHERE dedupeKey = ?
+             AND status IN ('pending','claimed','finalizing')
+           ORDER BY createdAt DESC
+           LIMIT 1`,
+        )
+        .get(job.dedupeKey) as { id: string; status: JobStatus } | undefined;
+      if (existingActive?.id) {
+        this.db
+          .prepare(
+            `UPDATE pr_repair_lifecycle
+             SET activeJobId = ?,
+                 status = ?,
+                 attemptCount = ?,
+                 nextRetryAt = NULL,
+                 lastFailureClass = ?,
+                 lastError = ?,
+                 updatedAt = ?
+             WHERE lifecycleKey = ?`,
+          )
+          .run(
+            existingActive.id,
+            existingActive.status === "pending" ? "queued" : "running",
+            nextAttempt,
+            failureClass,
+            lastError,
+            now,
+            context.lifecycleKey,
+          );
+        repointDurableRecoveryLinks(this.db, jobId, existingActive.id, now);
+        return existingActive.id;
+      }
+      this.db
+        .prepare(
+          `INSERT INTO jobs (
+             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs,
+             priority, workClass, queueWaitBudgetMs, queueDeadlineAt,
+             executionBudgetMs, finalizationBudgetMs, status, workerId, targetWorkerId,
+             result, prUrl, prUrlNormalized, error, availableAt, enqueuedAt, claimedAt,
+             startedAt, firstLogAt, failedAt, abandonedAt, publishBlockedAt, completedAt,
+             durationMs, resumeOfJobId, attempt, createdAt, updatedAt
+           ) VALUES (
+             ?, ?, ?, ?, ?, ?, ?,
+             'interactive', 'recovery', ?, ?,
+             ?, ?, 'pending', NULL, ?,
+             NULL, ?, ?, NULL, NULL, ?, NULL,
+             NULL, NULL, NULL, NULL, NULL, NULL,
+             NULL, ?, ?, ?, ?
+           )`,
+        )
+        .run(
+          replacementJobId,
+          job.taskId,
+          job.sessionId,
+          job.kind,
+          JSON.stringify(replacementParams),
+          job.dedupeKey,
+          job.dedupeCooldownMs,
+          queueBudgetMs,
+          deadlineAt,
+          job.executionBudgetMs,
+          job.finalizationBudgetMs,
+          job.targetWorkerId,
+          job.prUrl,
+          normalizePrUrl(job.prUrl),
+          now,
+          jobId,
+          Math.max(1, Math.floor(Number(job.attempt || 1))) + 1,
+          now,
+          now,
+        );
+      this.db
+        .prepare(
+          `UPDATE pr_repair_lifecycle
+           SET activeJobId = ?,
+               status = 'queued',
+               attemptCount = ?,
+               nextRetryAt = NULL,
+               lastFailureClass = ?,
+               lastError = ?,
+               updatedAt = ?
+           WHERE lifecycleKey = ?`,
+        )
+        .run(replacementJobId, nextAttempt, failureClass, lastError, now, context.lifecycleKey);
+      repointDurableRecoveryLinks(this.db, jobId, replacementJobId, now);
+      return replacementJobId;
+    });
+    const replacementJobIdOrExisting = insert();
+    return {
+      jobId: replacementJobIdOrExisting,
+      created: replacementJobIdOrExisting === replacementJobId,
+    };
+  }
+
+  private markReviewRepairSucceeded(jobId: string, now: string): void {
+    this.db
+      .prepare(
+        `UPDATE pr_repair_lifecycle
+         SET status = 'succeeded', nextRetryAt = NULL, updatedAt = ?
+         WHERE activeJobId = ?`,
+      )
+      .run(now, jobId);
+  }
+
+  reconcileReviewRepairLifecycles(now = new Date().toISOString()): {
+    scanned: number;
+    rearmed: number;
+    exhausted: number;
+  } {
+    this.db
+      .prepare(
+        `UPDATE pr_repair_lifecycle
+         SET status = 'succeeded', nextRetryAt = NULL, updatedAt = ?
+         WHERE activeJobId IN (
+           SELECT id FROM jobs WHERE status = 'completed'
+         )
+           AND status != 'succeeded'`,
+      )
+      .run(now);
+    const rows = this.db
+      .prepare(
+        `SELECT id, params, prUrl, status, createdAt
+         FROM jobs
+         WHERE status IN ('failed','publish_blocked','abandoned')
+           AND json_valid(params)
+           AND json_type(params, '$.reviewAgent') = 'object'
+         ORDER BY updatedAt DESC
+         LIMIT 500`,
+      )
+      .all() as Array<{
+      id: string;
+      params: string;
+      prUrl: string | null;
+      status: JobStatus;
+      createdAt: string;
+    }>;
+    let rearmed = 0;
+    for (const row of rows) {
+      const params = parseJobParamsRecord(row.params);
+      this.trackReviewRepairEnqueued(row.id, params, row.prUrl, row.createdAt || now);
+      if (this.rearmReviewRepairJob(row.id, now)?.created) rearmed += 1;
+    }
+    const exhausted = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM pr_repair_lifecycle WHERE status = 'exhausted'`)
+      .get() as { count: number } | undefined;
+    return {
+      scanned: rows.length,
+      rearmed,
+      exhausted: Math.max(0, Math.floor(Number(exhausted?.count ?? 0))),
+    };
   }
 
   private assignedWorkerForPr(prUrl: string | null): string | null {
@@ -1829,8 +2338,19 @@ export class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-             )
+           )
            ORDER BY
+             CASE LOWER(COALESCE(workClass, 'standard'))
+               WHEN 'recovery' THEN 0
+               WHEN 'repair' THEN 1
+               WHEN 'interactive' THEN 2
+               WHEN 'standard' THEN 3
+               WHEN 'autonomy' THEN 4
+               WHEN 'background' THEN 5
+               ELSE 3
+             END ASC,
+             CASE WHEN julianday(queueDeadlineAt) <= julianday(?) THEN 0 ELSE 1 END ASC,
+             julianday(queueDeadlineAt) ASC,
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
              CASE LOWER(priority)
                WHEN 'interactive' THEN 0
@@ -1840,7 +2360,7 @@ export class JobQueue {
              END ASC,
              createdAt ASC`,
         )
-        .all(targetWorkerId, targetWorkerCutoff, now, targetWorkerId) as Array<{ id: string }>;
+        .all(targetWorkerId, targetWorkerCutoff, now, now, targetWorkerId) as Array<{ id: string }>;
       return rows.map((row) => row.id);
     }
 
@@ -1864,6 +2384,17 @@ export class JobQueue {
              )
            )
          ORDER BY
+           CASE LOWER(COALESCE(workClass, 'standard'))
+             WHEN 'recovery' THEN 0
+             WHEN 'repair' THEN 1
+             WHEN 'interactive' THEN 2
+             WHEN 'standard' THEN 3
+             WHEN 'autonomy' THEN 4
+             WHEN 'background' THEN 5
+             ELSE 3
+           END ASC,
+           CASE WHEN julianday(queueDeadlineAt) <= julianday(?) THEN 0 ELSE 1 END ASC,
+           julianday(queueDeadlineAt) ASC,
            CASE LOWER(priority)
              WHEN 'interactive' THEN 0
              WHEN 'normal' THEN 1
@@ -1872,7 +2403,7 @@ export class JobQueue {
            END ASC,
            createdAt ASC`,
       )
-      .all(now, targetWorkerCutoff) as Array<{ id: string }>;
+      .all(now, targetWorkerCutoff, now) as Array<{ id: string }>;
     return rows.map((row) => row.id);
   }
 
@@ -1924,6 +2455,11 @@ export class JobQueue {
     const queueWaitBudgetMs = parseBudgetMs(
       body.queueWaitBudgetMs ?? extractPlanningField(params, "queueWaitBudgetMs"),
       JOB_PRIORITY_QUEUE_SLA_MS[priority],
+    );
+    const workClass = normalizeJobWorkClass(
+      body.workClass ?? body.work_class ?? extractPlanningField(params, "workClass"),
+      params,
+      priority,
     );
     const executionBudgetMs = parseBudgetMs(
       body.executionBudgetMs ?? extractPlanningField(params, "executionBudgetMs"),
@@ -1984,19 +2520,20 @@ export class JobQueue {
 
     const jobId = randomUUID();
     const now = new Date().toISOString();
+    const deadlineAt = queueDeadlineAt(now, queueWaitBudgetMs);
     try {
       this.db
         .prepare(
           `INSERT INTO jobs (
-            id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
-            queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+            id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority, workClass,
+            queueWaitBudgetMs, queueDeadlineAt, executionBudgetMs, finalizationBudgetMs,
             status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error,
             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
             createdAt, updatedAt
           )
            VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
             'pending', NULL, ?, NULL, ?, ?, NULL,
             ?, NULL, NULL, NULL, NULL, NULL, NULL,
             ?, ?
@@ -2011,7 +2548,9 @@ export class JobQueue {
           dedupeKey,
           dedupeCooldownMs,
           priority,
+          workClass,
           queueWaitBudgetMs,
+          deadlineAt,
           executionBudgetMs,
           finalizationBudgetMs,
           targetWorkerId,
@@ -2046,6 +2585,8 @@ export class JobQueue {
       }
       throw err;
     }
+
+    this.trackReviewRepairEnqueued(jobId, params, prUrl, now);
 
     const queuePosition = this.queuePosition(jobId, targetWorkerId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);
@@ -2152,8 +2693,19 @@ export class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-             )
+           )
            ORDER BY
+             CASE LOWER(COALESCE(workClass, 'standard'))
+               WHEN 'recovery' THEN 0
+               WHEN 'repair' THEN 1
+               WHEN 'interactive' THEN 2
+               WHEN 'standard' THEN 3
+               WHEN 'autonomy' THEN 4
+               WHEN 'background' THEN 5
+               ELSE 3
+             END ASC,
+             CASE WHEN julianday(queueDeadlineAt) <= julianday(?) THEN 0 ELSE 1 END ASC,
+             julianday(queueDeadlineAt) ASC,
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
              CASE LOWER(priority)
                WHEN 'interactive' THEN 0
@@ -2164,7 +2716,7 @@ export class JobQueue {
              createdAt ASC
            LIMIT 1`,
         )
-        .get(workerId, targetWorkerCutoff, now, workerId) as JobRow | undefined;
+        .get(workerId, targetWorkerCutoff, now, now, workerId) as JobRow | undefined;
 
       if (!row) {
         this.db
@@ -2206,6 +2758,14 @@ export class JobQueue {
            WHERE workerId = ?`,
         )
         .run(row.id, now, now, workerId);
+      this.db
+        .prepare(
+          `UPDATE pr_repair_lifecycle
+           SET status = 'running', updatedAt = ?
+           WHERE activeJobId = ?
+             AND status = 'queued'`,
+        )
+        .run(now, row.id);
       this.upsertPrWorkerAssignment(row.prUrl, workerId, now);
 
       const queueWaitMs = Math.max(
@@ -2446,15 +3006,15 @@ export class JobQueue {
         this.db
           .prepare(
             `INSERT INTO jobs (
-               id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
-               queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+               id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority, workClass,
+               queueWaitBudgetMs, queueDeadlineAt, executionBudgetMs, finalizationBudgetMs,
                status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error, availableAt,
                enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
                durationMs, resumeOfJobId, attempt, createdAt, updatedAt
              )
              VALUES (
-               ?, ?, ?, ?, ?, ?, ?, ?,
-               ?, ?, ?,
+               ?, ?, ?, ?, ?, ?, ?, ?, 'recovery',
+               ?, ?, ?, ?,
                'pending', NULL, ?, NULL, ?, ?, NULL, ?,
                ?, NULL, NULL, NULL, NULL, NULL, NULL,
                NULL, ?, ?, ?, ?
@@ -2470,6 +3030,7 @@ export class JobQueue {
             job.dedupeCooldownMs,
             job.priority,
             job.queueWaitBudgetMs,
+            queueDeadlineAt(now, job.queueWaitBudgetMs),
             job.executionBudgetMs,
             job.finalizationBudgetMs,
             nextTargetWorkerId,
@@ -2484,6 +3045,17 @@ export class JobQueue {
           );
 
         repointDurableRecoveryLinks(this.db, job.id, replacementJobId, now);
+        this.db
+          .prepare(
+            `UPDATE pr_repair_lifecycle
+             SET activeJobId = ?,
+                 status = 'queued',
+                 nextRetryAt = NULL,
+                 updatedAt = ?
+             WHERE activeJobId = ?
+               AND status IN ('queued','running')`,
+          )
+          .run(replacementJobId, now, job.id);
         return true;
       });
       if (!recover()) return null;
@@ -3043,6 +3615,7 @@ export class JobQueue {
       | undefined;
 
     this.refreshPrWorkerAssignmentForJob(jobId, now);
+    this.markReviewRepairSucceeded(jobId, now);
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -3155,6 +3728,7 @@ export class JobQueue {
       | undefined;
 
     this.refreshPrWorkerAssignmentForJob(jobId, now);
+    this.rearmReviewRepairJob(jobId, now);
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -3268,6 +3842,7 @@ export class JobQueue {
       | undefined;
 
     this.refreshPrWorkerAssignmentForJob(jobId, now);
+    this.rearmReviewRepairJob(jobId, now);
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -4213,22 +4788,71 @@ export class JobQueue {
       .length;
   }
 
-  nextPendingSnapshot(
-    limit = 10,
-  ): Array<{ id: string; priority: JobPriority; position: number; etaMs: number }> {
+  nextPendingSnapshot(limit = 10): Array<{
+    id: string;
+    priority: JobPriority;
+    workClass: JobWorkClass;
+    queueDeadlineAt: string | null;
+    deadlineMissed: boolean;
+    position: number;
+    etaMs: number;
+  }> {
     const ordered = this.pendingOrderedIds().slice(0, Math.max(1, Math.min(limit, 50)));
+    const nowMs = Date.now();
     return ordered.map((id, idx) => {
-      const row = this.db.prepare(`SELECT priority FROM jobs WHERE id = ?`).get(id) as
-        | { priority: string }
+      const row = this.db
+        .prepare(`SELECT priority, workClass, queueDeadlineAt FROM jobs WHERE id = ?`)
+        .get(id) as
+        | { priority: string; workClass: string; queueDeadlineAt: string | null }
         | undefined;
       const priority = normalizeJobPriority(row?.priority);
+      const workClass = normalizeJobWorkClass(row?.workClass, {}, priority);
+      const deadlineMs = Date.parse(String(row?.queueDeadlineAt ?? ""));
       return {
         id,
         priority,
+        workClass,
+        queueDeadlineAt: row?.queueDeadlineAt ?? null,
+        deadlineMissed: Number.isFinite(deadlineMs) && deadlineMs <= nowMs,
         position: idx + 1,
         etaMs: this.estimateEtaMs(priority, idx + 1) ?? 0,
       };
     });
+  }
+
+  recoveryBackpressureSummary(nowIso = new Date().toISOString()): JobRecoveryBackpressureSummary {
+    const row = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN LOWER(workClass) = 'recovery' THEN 1 ELSE 0 END) AS pendingRecovery,
+           SUM(CASE WHEN LOWER(workClass) = 'repair' THEN 1 ELSE 0 END) AS pendingRepair,
+           SUM(CASE
+             WHEN queueDeadlineAt IS NOT NULL
+               AND julianday(queueDeadlineAt) <= julianday(?)
+             THEN 1 ELSE 0 END) AS overdue,
+           MIN(queueDeadlineAt) AS oldestDeadlineAt
+         FROM jobs
+         WHERE status = 'pending'
+           AND LOWER(workClass) IN ('recovery','repair')`,
+      )
+      .get(nowIso) as
+      | {
+          pendingRecovery: number | null;
+          pendingRepair: number | null;
+          overdue: number | null;
+          oldestDeadlineAt: string | null;
+        }
+      | undefined;
+    const pendingRecovery = Math.max(0, Math.floor(Number(row?.pendingRecovery ?? 0)));
+    const pendingRepair = Math.max(0, Math.floor(Number(row?.pendingRepair ?? 0)));
+    const overdue = Math.max(0, Math.floor(Number(row?.overdue ?? 0)));
+    return {
+      blocked: overdue > 0,
+      pendingRecovery,
+      pendingRepair,
+      overdue,
+      oldestDeadlineAt: row?.oldestDeadlineAt ?? null,
+    };
   }
 
   sloSummary(windowHours = 24): JobSloSummary {
@@ -4239,7 +4863,8 @@ export class JobQueue {
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
     const rows = this.db
       .prepare(
-        `SELECT status, durationMs, enqueuedAt, claimedAt, createdAt, updatedAt, error
+        `SELECT status, durationMs, enqueuedAt, claimedAt, queueDeadlineAt,
+                createdAt, updatedAt, error
          FROM jobs
          WHERE status IN ('completed', 'failed', 'abandoned', 'publish_blocked')
            AND updatedAt >= ?`,
@@ -4249,6 +4874,7 @@ export class JobQueue {
       durationMs: number | null;
       enqueuedAt: string | null;
       claimedAt: string | null;
+      queueDeadlineAt: string | null;
       createdAt: string | null;
       updatedAt: string | null;
       error: string | null;
@@ -4259,6 +4885,7 @@ export class JobQueue {
     let abandoned = 0;
     let publishBlocked = 0;
     let timeoutFailures = 0;
+    let queueDeadlineMisses = 0;
     const durationSamples: number[] = [];
     const queueWaitSamples: number[] = [];
 
@@ -4286,6 +4913,10 @@ export class JobQueue {
       if (queueStart != null && queueEnd != null && queueEnd >= queueStart) {
         queueWaitSamples.push(queueEnd - queueStart);
       }
+      const queueDeadline = parseIsoMs(row.queueDeadlineAt);
+      if (queueDeadline != null && queueEnd != null && queueEnd > queueDeadline) {
+        queueDeadlineMisses += 1;
+      }
     }
 
     const terminal = completed + failed + abandoned + publishBlocked;
@@ -4300,8 +4931,11 @@ export class JobQueue {
       abandoned,
       publishBlocked,
       timeoutFailures,
+      queueDeadlineMisses,
       successRate,
       timeoutRate,
+      queueDeadlineMissRate:
+        terminal > 0 ? Number((queueDeadlineMisses / terminal).toFixed(4)) : null,
       durationMs: summarizeSamples(durationSamples),
       queueWaitMs: summarizeSamples(queueWaitSamples),
     };

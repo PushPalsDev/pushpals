@@ -632,11 +632,83 @@ describe("server session message route", () => {
       code: "autonomy_publication_backpressure",
     });
 
+    const admittedRepair = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "repair-under-publication-pressure",
+      sessionId: "autonomy-publication-pressure",
+      kind: "task.execute",
+      workClass: "repair",
+      params: {
+        origin: "autonomy",
+        planning: { workClass: "repair", queuePriority: "interactive" },
+      },
+    });
+    expect(admittedRepair.status).toBe(201);
+    expect(await admittedRepair.json()).toMatchObject({ ok: true, jobId: expect.any(String) });
+
     const userRequest = await postServerJson(port, "/requests/enqueue", {
       sessionId: "user-publication-pressure",
       prompt: "User work must remain admitted.",
     });
     expect(userRequest.status).toBe(201);
+  }, 15_000);
+
+  test("overdue recovery work backpressures ideation without blocking another recovery", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const repair = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "deadline-repair",
+      sessionId: "autonomy-recovery-deadline",
+      kind: "task.execute",
+      workClass: "repair",
+      params: {
+        origin: "autonomy",
+        planning: { workClass: "repair", queuePriority: "interactive" },
+      },
+    });
+    expect(repair.status).toBe(201);
+    const repairJobId = String(((await repair.json()) as Record<string, unknown>).jobId ?? "");
+
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      db.prepare(`UPDATE jobs SET queueDeadlineAt = ? WHERE id = ?`).run(
+        new Date(Date.now() - 1_000).toISOString(),
+        repairJobId,
+      );
+    } finally {
+      db.close();
+    }
+
+    const ideation = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "autonomy-recovery-deadline",
+      prompt: "Start another unrelated idea.",
+      priority: "background",
+      metadata: autonomyRequestMetadata("deadline-ideation"),
+    });
+    expect(ideation.status).toBe(429);
+    expect(await ideation.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_recovery_backpressure",
+      recovery: { blocked: true, overdue: 1, pendingRepair: 1 },
+    });
+
+    const recovery = await postServerJson(port, "/requests/enqueue", {
+      sessionId: "autonomy-recovery-deadline",
+      prompt: "Recover the deadline-bound repair queue.",
+      priority: "interactive",
+      metadata: {
+        ...autonomyRequestMetadata("deadline-recovery"),
+        autonomy: {
+          ...(autonomyRequestMetadata("deadline-recovery").autonomy as Record<string, unknown>),
+          workClass: "recovery",
+          lifecycleRecovery: true,
+        },
+      },
+    });
+    expect(recovery.status).toBe(201);
   }, 15_000);
 
   test("allows an accepted autonomy request to hand off after publication pressure rises", async () => {
@@ -2283,6 +2355,7 @@ describe("server session message route", () => {
       "request handoff",
       "request lease",
       "request retry chain",
+      "review repair lifecycle",
       "worker handoff",
     ]);
   }, 20_000);

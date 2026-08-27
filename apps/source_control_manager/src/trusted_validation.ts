@@ -22,6 +22,13 @@ export type TrustedValidationOutcome = {
   terminalFailure: TrustedValidationCommandResult | null;
 };
 
+export type TrustedValidationInvariantContext = {
+  /** Exact integration head the candidate was prepared against. */
+  baseSha: string;
+  /** Repository-relative paths changed between the base and candidate trees. */
+  affectedPaths: readonly string[];
+};
+
 export type TrustedValidationProgressEvent =
   | {
       boundary: "start";
@@ -60,7 +67,10 @@ const PROCESS_TREE_TERMINATION_GRACE_MS = 5_000;
 const PROCESS_STREAM_DRAIN_GRACE_MS = 2_000;
 const PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
 const TRUSTED_INSTALL_MARKER = ".pushpals-trusted-install.json";
-const trustedInstallFlights = new Map<string, Promise<TrustedValidationCommandResult>>();
+const trustedInstallFlights = new Map<
+  string,
+  { fingerprint: string | null; promise: Promise<TrustedValidationCommandResult> }
+>();
 const BUN_DEPENDENCY_COMMANDS = new Set([
   "bun",
   "bunx",
@@ -151,9 +161,27 @@ export function resolveTrustedValidationPreparationArgv(options: {
   return [bun || "bun", "install", "--frozen-lockfile"];
 }
 
+export function normalizeTrustedValidationAffectedPaths(paths: readonly string[]): string[] {
+  return [
+    ...new Set(
+      paths
+        .map((value) =>
+          String(value ?? "")
+            .trim()
+            .replace(/\\/g, "/")
+            .replace(/^\.\//, "")
+            .replace(/\/{2,}/g, "/")
+            .replace(/\/$/, ""),
+        )
+        .filter((value) => value.length > 0 && value !== "."),
+    ),
+  ].sort((left, right) => left.localeCompare(right));
+}
+
 export function trustedValidationInstallFingerprint(options: {
   repoPath: string;
   bunExecutable?: string;
+  invariantContext?: TrustedValidationInvariantContext;
 }): string | null {
   const packagePath = resolve(options.repoPath, "package.json");
   const lockPath = [
@@ -165,6 +193,18 @@ export function trustedValidationInstallFingerprint(options: {
   hash.update(`platform=${process.platform}-${process.arch}\n`);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}\n`);
   hash.update(`version=${typeof Bun !== "undefined" ? Bun.version : "unknown"}\n`);
+  if (options.invariantContext) {
+    hash.update(
+      `base=${String(options.invariantContext.baseSha ?? "")
+        .trim()
+        .toLowerCase()}\n`,
+    );
+    hash.update(
+      `affected=${JSON.stringify(
+        normalizeTrustedValidationAffectedPaths(options.invariantContext.affectedPaths),
+      )}\n`,
+    );
+  }
   hash.update(readFileSync(packagePath));
   hash.update("\0");
   hash.update(readFileSync(lockPath));
@@ -178,6 +218,7 @@ function trustedInstallMarkerPath(repoPath: string): string {
 export function hasFreshTrustedValidationInstall(options: {
   repoPath: string;
   bunExecutable?: string;
+  invariantContext?: TrustedValidationInvariantContext;
 }): boolean {
   const fingerprint = trustedValidationInstallFingerprint(options);
   if (!fingerprint) return false;
@@ -206,6 +247,7 @@ async function ensureTrustedValidationInstall(options: {
   preparationArgv: string[];
   timeoutMs: number;
   bunExecutable?: string;
+  invariantContext?: TrustedValidationInvariantContext;
   runner: CommandRunner;
 }): Promise<TrustedValidationCommandResult> {
   if (hasFreshTrustedValidationInstall(options)) {
@@ -221,8 +263,23 @@ async function ensureTrustedValidationInstall(options: {
   }
 
   const flightKey = resolve(options.repoPath);
+  const requestedFingerprint = trustedValidationInstallFingerprint(options);
   const activeFlight = trustedInstallFlights.get(flightKey);
-  if (activeFlight) return await activeFlight;
+  if (activeFlight) {
+    const activeResult = await activeFlight.promise;
+    if (activeFlight.fingerprint === requestedFingerprint) {
+      if (!activeResult.ok || !hasFreshTrustedValidationInstall(options)) return activeResult;
+      return {
+        command: "bun install --frozen-lockfile",
+        ok: true,
+        output: "Trusted dependency install cache hit after waiting for another validation.",
+        exitCode: 0,
+        durationMs: 0,
+        cached: true,
+        phase: "dependency_install",
+      };
+    }
+  }
   const flight = (async (): Promise<TrustedValidationCommandResult> => {
     if (hasFreshTrustedValidationInstall(options)) {
       return {
@@ -260,7 +317,7 @@ async function ensureTrustedValidationInstall(options: {
         try {
           writeFileSync(
             trustedInstallMarkerPath(options.repoPath),
-            JSON.stringify({ fingerprint, updatedAt: new Date().toISOString() }),
+            JSON.stringify({ schemaVersion: 2, fingerprint, updatedAt: new Date().toISOString() }),
             "utf8",
           );
         } catch {
@@ -271,11 +328,14 @@ async function ensureTrustedValidationInstall(options: {
     }
     return result;
   })();
-  trustedInstallFlights.set(flightKey, flight);
+  const flightRecord = { fingerprint: requestedFingerprint, promise: flight };
+  trustedInstallFlights.set(flightKey, flightRecord);
   try {
     return await flight;
   } finally {
-    if (trustedInstallFlights.get(flightKey) === flight) trustedInstallFlights.delete(flightKey);
+    if (trustedInstallFlights.get(flightKey) === flightRecord) {
+      trustedInstallFlights.delete(flightKey);
+    }
   }
 }
 
@@ -386,6 +446,11 @@ export async function runTrustedValidationCommands(options: {
   runner?: CommandRunner;
   retryTransientFailures?: boolean;
   onProgress?: TrustedValidationProgressCallback;
+  /**
+   * Scopes only candidate-invariant preparation caching. Validation commands
+   * always execute against the exact candidate and are never reused.
+   */
+  invariantContext?: TrustedValidationInvariantContext;
 }): Promise<TrustedValidationCommandResult[]> {
   const normalized = normalizeTrustedValidationCommands(options.commandsJson);
   if (!normalized.ok) {
@@ -419,6 +484,7 @@ export async function runTrustedValidationCommands(options: {
       preparationArgv,
       timeoutMs,
       bunExecutable: options.bunExecutable,
+      invariantContext: options.invariantContext,
       runner,
     });
     emitTrustedValidationProgress(options.onProgress, {
@@ -459,6 +525,7 @@ export async function runTrustedValidationCommands(options: {
           preparationArgv,
           timeoutMs,
           bunExecutable: options.bunExecutable,
+          invariantContext: options.invariantContext,
           runner,
         })),
         attempt: 2,

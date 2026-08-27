@@ -580,7 +580,7 @@ describe("server JobQueue PR URL persistence", () => {
     }
   });
 
-  test("rejects a provider outcome whose job and PR URL do not match", () => {
+  test("acknowledges but does not apply a provider outcome whose job and PR URL do not match", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "pushpals-pr-link-mismatch-"));
     const dbPath = join(tempDir, "shared.db");
     const queue = new JobQueue(dbPath);
@@ -606,8 +606,12 @@ describe("server JobQueue PR URL persistence", () => {
         prUrl: "https://github.com/org/repo/pull/999",
         verdict: "approved_merged",
       });
-      expect(rejected).toMatchObject({ ok: true, ignored: true });
-      expect(rejected.acknowledged).toBeUndefined();
+      expect(rejected).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: true,
+        reason: "PR feedback URL does not match the persisted job PR URL",
+      });
       expect(queue.listPersistedPrLinksPage({ limit: 10 })).toHaveLength(1);
       expect(queue.countOpenUnmergedWorkerPrs()).toBe(1);
     } finally {

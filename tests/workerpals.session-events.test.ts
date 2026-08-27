@@ -100,6 +100,25 @@ describe("workerpals session event emission", () => {
     });
   });
 
+  test("preserves candidate checkpoint metadata from an unhandled Docker exception", () => {
+    const error = Object.assign(new Error("docker transport failed after editing"), {
+      candidateState: {
+        status: "partial" as const,
+        reason: "execution_exception",
+        changedPaths: ["src/retained.ts"],
+        checkpoint: {
+          ref: "refs/pushpals/candidates/workerpal-test/job-retained",
+          sha: "a".repeat(40),
+          capturedAt: "2026-08-26T00:00:00.000Z",
+        },
+      },
+    });
+
+    expect(buildUnhandledWorkerFailureResult(error, "openai_codex").candidateState).toEqual(
+      error.candidateState,
+    );
+  });
+
   test("preserves structurally owned terminal stages through final diagnostic enrichment", () => {
     for (const terminalStage of ["worker_runtime", "docker"]) {
       const merged = mergeWorkerDiagnostics(
@@ -290,6 +309,7 @@ describe("workerpals session event emission", () => {
   });
 
   test("hands an environment-blocked candidate ref to the trusted validation queue", () => {
+    const candidateSha = "a".repeat(40);
     const held = holdCommitForTrustedValidation(
       {
         ok: true,
@@ -304,19 +324,49 @@ describe("workerpals session event emission", () => {
       {
         branch: "refs/pushpals/agent/worker/job",
         publicBranch: "agent/worker/job",
-        sha: "abc123",
+        sha: candidateSha,
       },
     );
 
     expect(held.completionCommit).toEqual({
       branch: "refs/pushpals/agent/worker/job",
       publicBranch: "agent/worker/job",
-      sha: "abc123",
+      sha: candidateSha,
     });
     expect(held.result.ok).toBe(true);
     expect(held.result.publishBlocked).toBeUndefined();
     expect(held.result.summary).toContain("queued for host-side validation");
+    expect(held.result.candidateState).toEqual({
+      status: "held",
+      reason: "trusted_environment_validation_required",
+      changedPaths: [],
+      checkpoint: {
+        ref: "refs/pushpals/agent/worker/job",
+        sha: candidateSha,
+        capturedAt: expect.any(String),
+      },
+    });
     expect(inferWorkerTerminalFailureClass(held.result)).toBe("trusted_validation_required");
+  });
+
+  test("rejects a trusted-host handoff that is not pinned to an exact commit SHA", () => {
+    const held = holdCommitForTrustedValidation(
+      {
+        ok: true,
+        summary: "candidate ready",
+        validationBlocked: {
+          category: "environment",
+          summary: "Trusted validation required",
+          detail: "Docker is unavailable.",
+          commands: ["bun run validate"],
+        },
+      },
+      { branch: "refs/pushpals/agent/worker/job", sha: "HEAD" },
+    );
+
+    expect(held.completionCommit).toBeNull();
+    expect(held.result.ok).toBe(false);
+    expect(held.result.summary).toContain("exact candidate commit SHA");
   });
 
   test("retains the candidate and reports publish-blocked when trusted handoff fails", () => {

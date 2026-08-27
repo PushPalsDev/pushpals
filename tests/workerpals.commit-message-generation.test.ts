@@ -10,6 +10,7 @@ import {
   buildCommitMessageGeneratorUserMessage,
   explicitWorkerCommitIdentityFromEnv,
   generateCommitMessageFromDiffViaHttp,
+  generateCommitMessageFromDiffViaHttpWithUsage,
   isNonFastForwardPushOutput,
   isPullRebaseDirtyWorkingTreeOutput,
   isRebaseConflictOutput,
@@ -156,6 +157,50 @@ describe("workerpals commit message generation helpers", () => {
 
     expect(result).toBeNull();
     expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  test("retains exact commit-message model usage as a finalization attempt", async () => {
+    const outcome = await generateCommitMessageFromDiffViaHttpWithUsage(
+      {
+        systemPrompt: "Write a commit message.",
+        userMessage: "Summarize the staged diff.",
+      },
+      { type: "fix", area: "workerpals" },
+      {
+        workerpals: {
+          llm: {
+            endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+            model: "test-model",
+            apiKey: "",
+          },
+        },
+      } as never,
+      {
+        fetchFn: (async () =>
+          Response.json({
+            choices: [
+              {
+                message: {
+                  content:
+                    "fix(workerpals): track finalization usage\n\nChanges:\n- Track each model call\n\nTests:\n- bun test",
+                },
+              },
+            ],
+            usage: { prompt_tokens: 17, completion_tokens: 9 },
+          })) as typeof fetch,
+      },
+    );
+
+    expect(outcome?.usageAttempts).toEqual([
+      expect.objectContaining({
+        stage: "finalization",
+        source: "commit_message_http",
+        promptTokens: 17,
+        completionTokens: 9,
+        totalTokens: 26,
+        estimated: false,
+      }),
+    ]);
   });
 
   test("skips LLM commit messages for broad staged diffs", () => {

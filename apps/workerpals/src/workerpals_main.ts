@@ -41,6 +41,7 @@ import {
   executeJob,
   shouldCommit,
   createJobCommit,
+  checkpointJobCandidate,
   git,
   redactSensitiveText,
   resolveReviewNoChangeCompletionBranch,
@@ -58,7 +59,7 @@ import { resolveDirectWorktreePath } from "./common/direct_worktree.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 import { resolveFreshWorktreeBaseRef, resolveReviewWorktreeBase } from "./worktree_base_ref.js";
-import type { JobDiagnostics, JobPhaseSpanDiagnostics } from "./common/types.js";
+import type { JobCandidateState, JobDiagnostics, JobPhaseSpanDiagnostics } from "./common/types.js";
 import {
   applyMergeConflictExecutionHints,
   isMergeConflictResolutionParams,
@@ -68,6 +69,7 @@ import {
   appendValidationRepairPublicationLease,
   validationRepairPublicationLeaseFromJobParams,
 } from "shared";
+import { UsageAccumulator } from "./quality_loop_durability.js";
 
 type CommitRef = {
   branch: string;
@@ -738,10 +740,15 @@ export function buildUnhandledWorkerFailureResult(
       ? "docker"
       : "worker";
   const summary = `Job execution failed before completion: ${errorSummary}`;
+  const candidateState =
+    error && typeof error === "object"
+      ? ((error as { candidateState?: JobCandidateState }).candidateState ?? undefined)
+      : undefined;
   return {
     ok: false,
     summary,
     stderr: detail,
+    ...(candidateState ? { candidateState } : {}),
     diagnostics: {
       terminal: {
         failureClass,
@@ -1149,6 +1156,65 @@ async function runJob(
   return executeJob(job.kind, job.params, repo, onLog, runtimeConfig);
 }
 
+export async function retainDirectFailureCandidate(
+  result: WorkerJobResult,
+  repo: string,
+  workerId: string,
+  job: { id: string; kind: string },
+  runtimeConfig: ReturnType<typeof loadPushPalsConfig> = CONFIG,
+  baselineSha?: string | null,
+): Promise<WorkerJobResult> {
+  if (result.ok) return result;
+  const candidateState =
+    result.candidateState ??
+    ({
+      status: result.exitCode === 124 ? "partial" : "held",
+      reason: result.exitCode === 124 ? "execution_timeout" : "terminal_failure",
+      changedPaths: [],
+    } satisfies JobCandidateState);
+  const retained = await checkpointJobCandidate(
+    repo,
+    workerId,
+    job,
+    candidateState,
+    runtimeConfig,
+    baselineSha,
+  );
+  return retained.checkpoint
+    ? {
+        ...result,
+        candidateState: retained,
+        stderr: [
+          result.stderr,
+          `Candidate checkpoint retained at ${retained.checkpoint.ref} (${retained.checkpoint.sha}).`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      }
+    : retained.changedPaths.length > 0
+      ? { ...result, candidateState: retained }
+      : result;
+}
+
+export function buildDirectCommitFinalizationFailure(
+  result: WorkerJobResult,
+  error: string,
+): WorkerJobResult {
+  const detail = error.trim() || "Host-side Git finalization returned no commit metadata.";
+  return {
+    ...result,
+    ok: false,
+    summary: "Failed to finalize the candidate commit",
+    stderr: [result.stderr, detail].filter(Boolean).join("\n"),
+    exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 4,
+    candidateState: result.candidateState ?? {
+      status: "held",
+      reason: "commit_finalization_failed",
+      changedPaths: [],
+    },
+  };
+}
+
 export function workerJobResultFromDocker(result: DockerJobResult): WorkerJobResult {
   return {
     ok: result.ok,
@@ -1158,6 +1224,8 @@ export function workerJobResultFromDocker(result: DockerJobResult): WorkerJobRes
     exitCode: result.exitCode,
     cooldownMs: result.cooldownMs,
     usage: result.usage,
+    usageAttempts: result.usageAttempts,
+    candidateState: result.candidateState,
     publishBlocked: result.publishBlocked,
     validationBlocked: result.validationBlocked,
     commit: result.commit,
@@ -1200,6 +1268,23 @@ export function holdCommitForTrustedValidation(
       completionCommit: null,
     };
   }
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(commit.sha.trim())) {
+    return {
+      result: {
+        ...result,
+        ok: false,
+        summary: "Trusted-environment validation requires an exact candidate commit SHA",
+        stderr: [
+          result.stderr,
+          `Refusing trusted-host handoff with non-immutable candidate identifier: ${commit.sha}`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        exitCode: 4,
+      },
+      completionCommit: null,
+    };
+  }
 
   return {
     result: {
@@ -1208,6 +1293,16 @@ export function holdCommitForTrustedValidation(
       summary: `${result.validationBlocked.summary}; queued for host-side validation`,
       exitCode: 0,
       publishBlocked: undefined,
+      candidateState: {
+        status: "held",
+        reason: "trusted_environment_validation_required",
+        changedPaths: result.candidateState?.changedPaths ?? [],
+        checkpoint: {
+          ref: commit.branch,
+          sha: commit.sha,
+          capturedAt: new Date().toISOString(),
+        },
+      },
     },
     completionCommit: commit,
   };
@@ -2445,6 +2540,8 @@ async function workerLoop(
               : null;
 
           let directWorktreePath: string | null = null;
+          let directWorktreeBaselineSha: string | null = null;
+          let preserveDirectWorktreeForCandidateRecovery = false;
           let executionRepo = opts.repo;
           let result: WorkerJobResult | null = null;
           let recycleWorkerAfterJob = false;
@@ -2473,6 +2570,13 @@ async function workerLoop(
                   onLog,
                 );
                 executionRepo = directWorktreePath;
+                const directBaseline = await git(executionRepo, ["rev-parse", "HEAD"]);
+                if (!directBaseline.ok || !directBaseline.stdout.trim()) {
+                  throw new Error(
+                    `Unable to resolve isolated worktree baseline before execution: ${directBaseline.stderr || directBaseline.stdout || `git exited ${directBaseline.exitCode}`}`,
+                  );
+                }
+                directWorktreeBaselineSha = directBaseline.stdout.trim();
                 if (isMergeConflictResolutionParams(parsedParams)) {
                   const prepared = await prepareMergeConflictWorktreeOnHost(
                     executionRepo,
@@ -2551,6 +2655,46 @@ async function workerLoop(
                 stderr: "Worker result was not produced",
               };
             }
+            if (!dockerExecutor && directWorktreePath && !result.ok) {
+              try {
+                result = await retainDirectFailureCandidate(
+                  result,
+                  executionRepo,
+                  opts.workerId,
+                  jobData,
+                  CONFIG,
+                  directWorktreeBaselineSha,
+                );
+                if (result.candidateState?.checkpoint) {
+                  onLog?.(
+                    "stderr",
+                    `[WorkerPals] Retained ${result.candidateState.status} candidate ${result.candidateState.checkpoint.sha.slice(0, 12)} before direct worktree cleanup.`,
+                  );
+                }
+              } catch (error) {
+                preserveDirectWorktreeForCandidateRecovery = true;
+                result = {
+                  ...result,
+                  candidateState:
+                    result.candidateState ??
+                    ({
+                      status: result.exitCode === 124 ? "partial" : "held",
+                      reason: "checkpoint_failed_worktree_preserved",
+                      changedPaths: [],
+                    } satisfies JobCandidateState),
+                  stderr: [
+                    result.stderr,
+                    `Candidate checkpoint failed; preserving direct worktree at ${executionRepo}: ${compactWorkerError(error)}`,
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                };
+                onLog?.(
+                  "stderr",
+                  `[WorkerPals] Candidate checkpoint failed; preserving direct worktree ${executionRepo}: ${compactWorkerError(error)}`,
+                );
+              }
+            }
             const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
 
             allowHeartbeatRecycle = false;
@@ -2621,6 +2765,19 @@ async function workerLoop(
                   },
                   CONFIG,
                 );
+                if ((commitResult.usageAttempts?.length ?? 0) > 0) {
+                  const usageAccumulator = new UsageAccumulator();
+                  usageAccumulator.addAttempts(result.usageAttempts);
+                  if ((result.usageAttempts?.length ?? 0) === 0 && result.usage) {
+                    usageAccumulator.add(result.usage, {
+                      stage: "executor",
+                      attempt: 1,
+                      source: result.usage.backend ?? "executor_legacy_total",
+                    });
+                  }
+                  usageAccumulator.addAttempts(commitResult.usageAttempts);
+                  result = usageAccumulator.apply(result);
+                }
 
                 if (commitResult.ok && commitResult.sha && commitResult.branch) {
                   if (commitResult.sha !== "no-changes") {
@@ -2649,8 +2806,30 @@ async function workerLoop(
                     publishBlocked: commitResult.publishBlocked,
                   };
                   console.error(`[WorkerPals] Publish blocked: ${commitResult.error}`);
-                } else if (commitResult.error) {
-                  console.error(`[WorkerPals] Failed to create commit: ${commitResult.error}`);
+                } else {
+                  const commitFailureDetail =
+                    commitResult.error ??
+                    `Host-side commit finalization returned incomplete metadata (ok=${commitResult.ok}, branch=${commitResult.branch ?? "missing"}, sha=${commitResult.sha ?? "missing"}).`;
+                  result = buildDirectCommitFinalizationFailure(result, commitFailureDetail);
+                  try {
+                    result = await retainDirectFailureCandidate(
+                      result,
+                      executionRepo,
+                      opts.workerId,
+                      jobData,
+                      CONFIG,
+                      directWorktreeBaselineSha,
+                    );
+                  } catch (error) {
+                    preserveDirectWorktreeForCandidateRecovery = true;
+                    result.stderr = [
+                      result.stderr,
+                      `Candidate checkpoint failed; preserving direct worktree at ${executionRepo}: ${compactWorkerError(error)}`,
+                    ]
+                      .filter(Boolean)
+                      .join("\n");
+                  }
+                  console.error(`[WorkerPals] Failed to create commit: ${commitFailureDetail}`);
                 }
               }
             }
@@ -3048,7 +3227,7 @@ async function workerLoop(
               }, CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS);
               try {
                 await maybeHeartbeat("offline", null, true);
-                if (directWorktreePath) {
+                if (directWorktreePath && !preserveDirectWorktreeForCandidateRecovery) {
                   await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                     console.error(
                       `[WorkerPals] Failed to remove isolated worktree before Codex recycle: ${String(
@@ -3089,10 +3268,14 @@ async function workerLoop(
             runtimeState.currentJobId = null;
             runtimeState.currentClaimGeneration = null;
             runtimeState.currentSessionId = null;
-            if (directWorktreePath) {
+            if (directWorktreePath && !preserveDirectWorktreeForCandidateRecovery) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                 console.error(`[WorkerPals] Failed to remove isolated worktree: ${String(err)}`);
               });
+            } else if (directWorktreePath) {
+              console.error(
+                `[WorkerPals] Preserved isolated worktree for candidate recovery: ${directWorktreePath}`,
+              );
             }
           }
         }

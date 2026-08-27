@@ -1078,6 +1078,100 @@ def _describe_publishable_paths(paths: List[str]) -> str:
     return listed
 
 
+def _explicit_artifact_edit_requested(
+    text: str,
+    noun_pattern: str,
+    *,
+    strong_noun_pattern: str = "",
+) -> bool:
+    qualifiers = (
+        r"(?:(?:a|an|the|new|more|additional|missing|relevant|focused|targeted|"
+        r"regression|unit|integration|e2e|end[- ]to[- ]end|automated|negative|"
+        r"positive|contract|smoke|existing|current|corresponding|appropriate|"
+        r"meaningful|comprehensive)\s+){0,5}"
+    )
+    noun = rf"(?:{noun_pattern})"
+    edit_verbs = r"(?:add|write|create|include|provide|update|extend)"
+    edited_verbs = r"(?:added|written|created|included|provided|updated|extended)"
+    patterns = [
+        # Keep the requested artifact close to the edit verb. In particular,
+        # do not interpret "update the implementation so tests pass" as a
+        # request to edit a test artifact.
+        rf"\b{edit_verbs}\s+{qualifiers}{noun}\b",
+        # Common coordinated request: "update the implementation and tests".
+        rf"\b{edit_verbs}\b[^\n.;,]{{0,50}}\b(?:and|plus|along\s+with)\s+{qualifiers}{noun}\b",
+        rf"\b{noun}\s+(?:(?:must|should)\s+|need(?:s)?\s+to\s+|(?:is|are)\s+(?:required|requested)\s+to\s+)(?:be\s+)?{edited_verbs}\b",
+    ]
+    if strong_noun_pattern:
+        # A task/title consisting of a strong artifact phrase such as
+        # "Regression test for ..." or "Documentation: ..." is explicit even
+        # when it omits an imperative verb.
+        patterns.append(rf"(?:^|[\n:;])\s*{qualifiers}(?:{strong_noun_pattern})\b")
+    return any(re.search(pattern, text, re.I) for pattern in patterns)
+
+
+def _required_candidate_artifacts(task_text: str) -> set[str]:
+    text = str(task_text or "")
+    required: set[str] = set()
+    if _explicit_artifact_edit_requested(
+        text,
+        r"tests?|test\s+coverage|assertions?|assertion\s+coverage|regression\s+coverage",
+        strong_noun_pattern=r"regression\s+tests?|test\s+coverage",
+    ):
+        required.add("test")
+    if _explicit_artifact_edit_requested(
+        text,
+        r"docs?|documentation|readme|markdown",
+        strong_noun_pattern=r"documentation|readme|docs?[/\\][^\s]+\.(?:md|mdx|rst|adoc)",
+    ):
+        required.add("docs")
+    return required
+
+
+def _is_candidate_test_artifact_path(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").strip("/").lower()
+    if not normalized:
+        return False
+    segments = normalized.split("/")
+    if any(
+        segment in {"test", "tests", "__tests__", "spec", "specs"}
+        for segment in segments[:-1]
+    ):
+        return True
+    name = segments[-1]
+    return bool(
+        re.search(r"\.(?:test|spec)\.[cm]?[jt]sx?$", name)
+        or re.search(r"^test_.+\.py$|.+_(?:test|spec)\.py$", name)
+        or re.search(r".+_test\.go$", name)
+        or re.search(r".+_(?:test|spec)\.(?:rb|php|cc|cpp|cxx|c|h|hpp)$", name)
+        or re.search(r".+(?:test|tests|it)\.(?:java|kt|kts|groovy|scala|cs|swift)$", name)
+    )
+
+
+def _is_candidate_docs_artifact_path(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").strip("/").lower()
+    if not normalized:
+        return False
+    name = normalized.rsplit("/", 1)[-1]
+    return (
+        normalized.startswith(("docs/", "doc/"))
+        or name.startswith(("readme", "contributing", "changelog"))
+        or name.endswith((".md", ".mdx", ".rst", ".adoc"))
+    )
+
+
+def _candidate_artifact_contract_missing(task_text: str, changed_paths: List[str]) -> List[str]:
+    required = _required_candidate_artifacts(task_text)
+    if not required:
+        return []
+    present: set[str] = set()
+    if any(_is_candidate_test_artifact_path(path) for path in changed_paths):
+        present.add("test")
+    if any(_is_candidate_docs_artifact_path(path) for path in changed_paths):
+        present.add("docs")
+    return sorted(required - present)
+
+
 def _build_no_edit_recovery_guidance(
     trace_excerpt: str,
     artifact_only_paths: str = "",
@@ -1804,6 +1898,9 @@ def _empty_codex_trace() -> Dict[str, Any]:
         "command_event_count": 0,
         "last_command_activity_at": None,
         "last_command_summary": "",
+        "meaningful_progress_keys": [],
+        "meaningful_progress_count": 0,
+        "last_meaningful_progress_at": None,
         "thread_id": "",
     }
 
@@ -1818,6 +1915,191 @@ def _looks_like_codex_command_item(value: Any) -> bool:
     if any(marker in type_text for marker in ("command_execution", "exec_command", "shell_command")):
         return True
     return any(key in value for key in ("command", "cmd", "exit_code", "aggregated_output"))
+
+
+_SEARCH_OPTIONS_WITH_VALUE = {
+    "-A",
+    "--after-context",
+    "-B",
+    "--before-context",
+    "-C",
+    "--context",
+    "--color",
+    "--colors",
+    "--encoding",
+    "--engine",
+    "-f",
+    "--file",
+    "-g",
+    "--glob",
+    "--iglob",
+    "-j",
+    "--threads",
+    "-m",
+    "--max-count",
+    "--max-depth",
+    "--path-separator",
+    "--pre",
+    "--pre-glob",
+    "--sort",
+    "--sortr",
+    "-t",
+    "--type",
+    "--type-add",
+}
+_SEARCH_PATTERN_OPTIONS = {"-e", "--regexp"}
+_RG_INVENTORY_MODES = {
+    "--files",
+    "--type-list",
+    "--generate",
+    "--help",
+    "-h",
+    "--version",
+    "-V",
+    "--pcre2-version",
+}
+
+
+def _targeted_search_discovery_key(normalized_command: str) -> str:
+    try:
+        tokens = shlex.split(normalized_command, posix=True)
+    except ValueError:
+        tokens = normalized_command.split()
+    if not tokens:
+        return ""
+
+    tool = ""
+    args: List[str] = []
+    for index, token in enumerate(tokens):
+        executable = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if executable in {"rg", "rg.exe"}:
+            tool = "rg"
+            args = tokens[index + 1 :]
+            break
+        if (
+            executable == "git"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].lower() == "grep"
+        ):
+            tool = "git-grep"
+            args = tokens[index + 2 :]
+            break
+    if not tool:
+        return ""
+    if tool == "rg" and any(arg in _RG_INVENTORY_MODES for arg in args):
+        return ""
+
+    explicit_patterns: List[str] = []
+    positionals: List[str] = []
+    index = 0
+    options_ended = False
+    while index < len(args):
+        arg = args[index]
+        if not options_ended and arg == "--":
+            options_ended = True
+            index += 1
+            continue
+        if not options_ended and arg in _SEARCH_PATTERN_OPTIONS:
+            if index + 1 < len(args):
+                explicit_patterns.append(args[index + 1])
+            index += 2
+            continue
+        if not options_ended and arg.startswith("--regexp="):
+            explicit_patterns.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        if not options_ended and arg.startswith("-e") and len(arg) > 2:
+            explicit_patterns.append(arg[2:])
+            index += 1
+            continue
+        if not options_ended and arg in _SEARCH_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if not options_ended and any(
+            arg.startswith(f"{option}=")
+            for option in _SEARCH_OPTIONS_WITH_VALUE
+            if option.startswith("--")
+        ):
+            index += 1
+            continue
+        if not options_ended and arg.startswith("-"):
+            index += 1
+            continue
+        positionals.append(arg)
+        index += 1
+
+    patterns = explicit_patterns
+    scopes = positionals
+    if not patterns:
+        if not positionals:
+            return ""
+        patterns = [positionals[0]]
+        scopes = positionals[1:]
+
+    def normalize_pattern(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+    normalized_patterns = sorted({normalize_pattern(pattern) for pattern in patterns if pattern})
+    broad_patterns = {".", ".*", "^", "$", "^.*$", "[\\s\\s]", "[\\s\\s]*"}
+    normalized_patterns = [
+        pattern
+        for pattern in normalized_patterns
+        if pattern not in broad_patterns and len(re.sub(r"[^a-z0-9_]", "", pattern)) >= 2
+    ]
+    if not normalized_patterns:
+        return ""
+    normalized_scopes = sorted(
+        {
+            re.sub(r"/+", "/", str(scope or "").replace("\\", "/"))
+            .removeprefix("./")
+            .rstrip("/")
+            for scope in scopes
+            if str(scope or "").strip() not in {"", "."}
+        }
+    )
+    return (
+        f"search:{tool}:patterns={','.join(normalized_patterns)}:"
+        f"scopes={','.join(normalized_scopes)}"
+    )[:240]
+
+
+def _meaningful_discovery_command_key(command: str) -> str:
+    command_text = re.sub(r"\s+", " ", str(command or "")).strip()
+    if not command_text:
+        return ""
+    normalized = command_text.lower()
+    # Targeted source inspection, symbol search, diffs and focused checks are
+    # real progress. Broad recursive inventory commands remain bounded by the
+    # ordinary no-edit cap. Search keys discard presentation flags and sort
+    # scopes so trivial flag/order changes cannot reset the progress clock.
+    search_key = _targeted_search_discovery_key(command_text)
+    if search_key:
+        return search_key
+    if re.search(r"(?:^|\s)(?:rg|rg\.exe)(?:\s|$)|\bgit\s+grep\b", normalized):
+        return ""
+    if re.search(r"\b(?:sed|cat|head|tail)\b[^\n]*[a-z0-9_./-]+\.[a-z0-9]{1,8}\b", normalized):
+        return normalized[:240]
+    if re.search(r"\bgit (?:diff|show|status)\b", normalized):
+        return normalized[:240]
+    if re.search(r"\b(?:bun|npm|pnpm|yarn)\b[^\n]*\b(?:test|typecheck|lint|check)\b", normalized):
+        return normalized[:240]
+    return ""
+
+
+def _active_command_deserves_deadline_only_protection(command: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(command or "")).strip().lower()
+    return bool(
+        re.search(
+            r"\b(?:bun|npm|pnpm|yarn)\s+(?:x\s+|run\s+)?"
+            r"(?:test|typecheck|lint|build|validate|check|install)\b"
+            r"|\b(?:pytest|vitest|jest|tsc|eslint|playwright|cypress)\b"
+            r"|\b(?:cargo|go|mvn|gradle|gradlew)\s+(?:test|check|build)\b"
+            r"|\b(?:pip|pip3|uv|poetry)\s+(?:install|sync)\b"
+            r"|\bdocker(?:\s+compose)?\s+(?:build|pull|up)\b",
+            normalized,
+            re.I,
+        )
+    )
 
 
 def _record_codex_command_activity(
@@ -1881,6 +2163,20 @@ def _record_codex_command_activity(
     trace["command_event_count"] = to_int(trace.get("command_event_count"), 0) + 1
     trace["last_command_activity_at"] = float(now)
     trace["last_command_summary"] = command_text or event_type
+    progress_key = _meaningful_discovery_command_key(command_text)
+    if progress_key:
+        progress_keys = trace.setdefault("meaningful_progress_keys", [])
+        if not isinstance(progress_keys, list):
+            progress_keys = []
+            trace["meaningful_progress_keys"] = progress_keys
+        if progress_key not in progress_keys:
+            progress_keys.append(progress_key)
+            if len(progress_keys) > 100:
+                del progress_keys[:-100]
+            trace["meaningful_progress_count"] = to_int(
+                trace.get("meaningful_progress_count"), 0
+            ) + 1
+            trace["last_meaningful_progress_at"] = float(now)
 
 
 def _record_live_codex_stdout_line(
@@ -2987,10 +3283,13 @@ def _run_codex_task(
     baseline_changes: Optional[List[str]] = None,
     execution_deadline_monotonic: Optional[float] = None,
     resume_thread_id: Optional[str] = None,
+    usage_attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     global _ACTIVE_CHILD, _INTERRUPTED_SIGNAL
     _INTERRUPTED_SIGNAL = None
     _install_signal_handlers()
+    if usage_attempts is None:
+        usage_attempts = []
 
     if not _is_git_repo(repo):
         return {
@@ -3475,9 +3774,21 @@ def _run_codex_task(
                             )
                         except Exception:
                             last_command_activity_at = 0.0
+                        try:
+                            last_meaningful_progress_at = float(
+                                live_trace.get("last_meaningful_progress_at") or 0.0
+                            )
+                        except Exception:
+                            last_meaningful_progress_at = 0.0
                         command_progress_cap_reached = False
                         command_progress_elapsed_s = 0
                         if command_event_count > 0 and no_edit_command_grace_s is not None:
+                            active_command_protected = (
+                                active_command_count > 0
+                                and _active_command_deserves_deadline_only_protection(
+                                    str(live_trace.get("last_command_summary") or "")
+                                )
+                            )
                             observed_command_progress_at = (
                                 last_command_activity_at if last_command_activity_at > 0 else now
                             )
@@ -3491,7 +3802,17 @@ def _run_codex_task(
                                 command_progress_elapsed_s = int(
                                     max(0.0, now - first_no_edit_command_progress_at)
                                 )
-                                if now >= command_progress_cap_deadline:
+                                meaningful_progress_recent = (
+                                    last_meaningful_progress_at > 0
+                                    and now
+                                    < last_meaningful_progress_at
+                                    + float(no_edit_command_grace_s)
+                                )
+                                if (
+                                    now >= command_progress_cap_deadline
+                                    and not active_command_protected
+                                    and not meaningful_progress_recent
+                                ):
                                     command_progress_cap_reached = True
                             command_grace_deadline = 0.0
                             if active_command_count > 0:
@@ -3503,9 +3824,22 @@ def _run_codex_task(
                                 command_grace_deadline = last_command_activity_at + float(
                                     no_edit_command_grace_s
                                 )
+                            if last_meaningful_progress_at > 0:
+                                command_grace_deadline = max(
+                                    command_grace_deadline,
+                                    last_meaningful_progress_at
+                                    + float(no_edit_command_grace_s),
+                                )
                             if (
                                 no_edit_command_progress_cap_s is not None
                                 and first_no_edit_command_progress_at is not None
+                                and not active_command_protected
+                                and not (
+                                    last_meaningful_progress_at > 0
+                                    and now
+                                    < last_meaningful_progress_at
+                                    + float(no_edit_command_grace_s)
+                                )
                             ):
                                 command_grace_deadline = min(
                                     command_grace_deadline,
@@ -3597,15 +3931,26 @@ def _run_codex_task(
                         publishable_progress_paths = list(effective_paths)
                         publishable_age_s = now - publishable_progress_seen_at
                         if publishable_age_s >= float(no_edit_recheck_s):
-                            publishable_progress_finalized = True
-                            log.info(
-                                "No-edit watchdog observed durable publishable file changes "
-                                f"({_describe_publishable_paths(effective_paths)}) for "
-                                f"{int(publishable_age_s)}s; stopping Codex early so "
-                                "QualityGate/ValidationGate can use the remaining budget."
+                            missing_artifacts = _candidate_artifact_contract_missing(
+                                instruction, effective_paths
                             )
-                            _terminate_active_child()
-                            break
+                            if missing_artifacts:
+                                log.info(
+                                    "No-edit watchdog observed a durable partial patch, but the "
+                                    "task artifact contract still requires "
+                                    f"{', '.join(missing_artifacts)} content; allowing Codex to "
+                                    "continue instead of stopping early."
+                                )
+                            else:
+                                publishable_progress_finalized = True
+                                log.info(
+                                    "No-edit watchdog observed durable publishable file changes "
+                                    f"({_describe_publishable_paths(effective_paths)}) for "
+                                    f"{int(publishable_age_s)}s; stopping Codex early so "
+                                    "QualityGate/ValidationGate can use the remaining budget."
+                                )
+                                _terminate_active_child()
+                                break
                     no_edit_deadline = now + float(no_edit_recheck_s)
                     log.info(
                         "No-edit watchdog observed publishable-looking file changes "
@@ -3744,6 +4089,15 @@ def _run_codex_task(
             part for part in (stdout, stderr, trace_excerpt) if str(part or "").strip()
         )
         usage = _usage_from_trace_or_estimate(stdout_trace, prompt, usage_output_text, model=model)
+        usage_attempts.append(
+            {
+                **usage,
+                "stage": "executor" if len(usage_attempts) == 0 else "executor_recovery",
+                "attempt": len(usage_attempts) + 1,
+                "source": "openai_codex",
+                **({"timedOut": True} if timed_out else {}),
+            }
+        )
         rejected_shell_wrappers = _collect_disallowed_shell_wrapper_rejections(stdout, stderr)
         with trace_lock:
             tracked = wrapper_rejection_state.get("commands")
@@ -3832,6 +4186,7 @@ def _run_codex_task(
                     model_override=model_override,
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
+                    usage_attempts=usage_attempts,
                 )
             _, _, rollout_effective_paths = _codex_changed_paths(
                 repo,
@@ -3839,6 +4194,28 @@ def _run_codex_task(
                 clean_known_runtime_artifacts=True,
             )
             if rollout_effective_paths:
+                missing_artifacts = _candidate_artifact_contract_missing(
+                    instruction, rollout_effective_paths
+                )
+                if missing_artifacts:
+                    detail = (
+                        "Rollout recovery retained a publishable partial candidate, but the "
+                        "explicit task artifact contract is incomplete: missing "
+                        f"{', '.join(missing_artifacts)} content."
+                    )
+                    return {
+                        "ok": False,
+                        "summary": "openai_codex retained an incomplete partial candidate",
+                        "stdout": _truncate(stdout),
+                        "stderr": _truncate(f"{detail}\n{stderr}".strip()),
+                        "exitCode": 124,
+                        "usage": usage,
+                        "candidateState": {
+                            "status": "partial",
+                            "reason": "artifact_contract_incomplete",
+                            "changedPaths": rollout_effective_paths,
+                        },
+                    }
                 log.info(
                     "Rollout coach exhausted its recovery attempts, but publishable file "
                     "changes remain "
@@ -3933,6 +4310,7 @@ def _run_codex_task(
                     model_override=retry_model_override,
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
+                    usage_attempts=usage_attempts,
                 )
                 retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                 if retry_result.get("ok"):
@@ -3981,6 +4359,7 @@ def _run_codex_task(
                     model_override=model_override,
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
+                    usage_attempts=usage_attempts,
                 )
             detail = "Codex spent too much of the execution budget without producing publishable file changes."
             if trace_excerpt:
@@ -4014,15 +4393,14 @@ def _run_codex_task(
                 log_git_status(repo, log)
                 prefix = (
                     "Codex reached the execution timeout after producing publishable file "
-                    "changes. Returning the partial patch to QualityGate/ValidationGate "
-                    "instead of discarding it; any incomplete edit will be caught by the "
-                    "normal gates or revision loop."
+                    "changes. Retaining the partial candidate at an exact Git ref instead "
+                    "of reporting an ordinary success or discarding it."
                 )
                 return {
-                    "ok": True,
+                    "ok": False,
                     "summary": (
-                        f"openai_codex timed out after modifying {len(effective_paths)} "
-                        "publishable file(s)"
+                        f"openai_codex timed out with a retained partial candidate "
+                        f"({len(effective_paths)} publishable file(s))"
                     ),
                     "stdout": _truncate(
                         _build_success_stdout(
@@ -4033,8 +4411,13 @@ def _run_codex_task(
                         )
                     ),
                     "stderr": _truncate(f"{detail}\n{stderr}".strip()),
-                    "exitCode": 0,
+                    "exitCode": 124,
                     "usage": usage,
+                    "candidateState": {
+                        "status": "partial",
+                        "reason": "executor_timeout",
+                        "changedPaths": effective_paths,
+                    },
                 }
             if effective_paths:
                 listed = _describe_publishable_paths(effective_paths)
@@ -4193,6 +4576,7 @@ def _run_codex_task(
                         baseline_changes=baseline_snapshot,
                         execution_deadline_monotonic=overall_deadline,
                         resume_thread_id=recovery_thread_id or None,
+                        usage_attempts=usage_attempts,
                     )
                     retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                     if wrapper_recovery_attempt == 0 and retry_result.get("ok"):
@@ -4309,6 +4693,7 @@ def _run_codex_task(
                     model_override=LEGACY_CODEX_MODEL_FALLBACK,
                     baseline_changes=baseline_snapshot,
                     execution_deadline_monotonic=overall_deadline,
+                    usage_attempts=usage_attempts,
                 )
                 retry_result["usage"] = _merge_usage_records(usage, retry_result.get("usage"))
                 if retry_result.get("ok"):
@@ -4392,12 +4777,14 @@ def _run_codex_task(
 
 
 def main() -> int:
+    usage_attempts: List[Dict[str, Any]] = []
     try:
         task = parse_task_execute_payload(sys.argv, logger=log)
         result = _run_codex_task(
             task.repo,
             task.instruction,
             task.supplemental_guidance,
+            usage_attempts=usage_attempts,
         )
     except Exception as exc:
         result = {
@@ -4408,6 +4795,9 @@ def main() -> int:
             "exitCode": 1,
             "error": to_single_line(exc, 300),
         }
+
+    if usage_attempts:
+        result["usageAttempts"] = usage_attempts
 
     emit(result)
     return 0 if bool(result.get("ok")) else to_int(result.get("exitCode"), 1)

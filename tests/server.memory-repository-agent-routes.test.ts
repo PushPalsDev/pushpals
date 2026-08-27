@@ -392,6 +392,14 @@ describe("server memory routes", () => {
       provenance: { service: "repository_agent", requestId: "request-1" },
     } as const;
     await expectMemoryForbidden(unprivilegedRemoteBuddy.put(internalInput));
+    const capabilityCircuitInput = {
+      ...internalInput,
+      scope: { namespace: "repository_agent_capabilities", repositoryId: "repo-a" },
+      key: "synthesis-model-purpose",
+      kind: "repository_agent_capability_circuit",
+      summary: "Bounded synthesis circuit state.",
+    } as const;
+    await expectMemoryForbidden(unprivilegedRemoteBuddy.put(capabilityCircuitInput));
 
     const invalidAuthorityOwner = new MemoryHttpClient({
       serverUrl,
@@ -406,6 +414,8 @@ describe("server memory routes", () => {
       authority: "repository_agent",
     });
     const internal = await repositoryAgent.put(internalInput);
+    const capabilityCircuit = await repositoryAgent.put(capabilityCircuitInput);
+    expect(capabilityCircuit.scope.namespace).toBe("repository_agent_capabilities");
     expect(
       await repositoryAgent.search({
         scope: internal.scope,

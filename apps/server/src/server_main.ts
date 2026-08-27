@@ -133,6 +133,11 @@ const completionLeaseReconciliation = guardedReconciliation(
   { recovered: 0, completionIds: [] as string[] },
   () => completionQueue.recoverExpiredClaims(),
 );
+const reviewRepairReconciliation = guardedReconciliation(
+  "review repair lifecycle",
+  { scanned: 0, rearmed: 0, exhausted: 0 },
+  () => jobQueue.reconcileReviewRepairLifecycles(),
+);
 const repositoryAgentLeaseReconciliation = guardedReconciliation(
   "repository agent lease",
   { recovered: 0, requestIds: [] as string[] },
@@ -203,6 +208,11 @@ if (completionLeaseReconciliation.recovered > 0) {
     `[Server] Requeued ${completionLeaseReconciliation.recovered} completion(s) with expired publication leases.`,
   );
 }
+if (reviewRepairReconciliation.rearmed > 0) {
+  console.warn(
+    `[Server] Re-armed ${reviewRepairReconciliation.rearmed} stranded review repair lifecycle(s).`,
+  );
+}
 if (repositoryAgentLeaseReconciliation.recovered > 0) {
   console.warn(
     `[Server] Requeued ${repositoryAgentLeaseReconciliation.recovered} RepositoryAgent request(s) with expired leases.`,
@@ -263,6 +273,16 @@ const lifecycleWatchdogTimer = setInterval(() => {
   if (completionLeaseRecovery.recovered > 0) {
     console.warn(
       `[Server] Periodic watchdog requeued ${completionLeaseRecovery.recovered} completion(s) with expired publication leases.`,
+    );
+  }
+  const reviewRepairRecovery = guardedReconciliation(
+    "review repair lifecycle",
+    { scanned: 0, rearmed: 0, exhausted: 0 },
+    () => jobQueue.reconcileReviewRepairLifecycles(),
+  );
+  if (reviewRepairRecovery.rearmed > 0) {
+    console.warn(
+      `[Server] Periodic watchdog re-armed ${reviewRepairRecovery.rearmed} stranded review repair lifecycle(s).`,
     );
   }
   const repositoryAgentLeaseRecovery = guardedReconciliation(
@@ -920,6 +940,42 @@ export function createRequestHandler() {
           regressionFlag: false,
         };
       };
+      const classifyAutonomyFailureProjection = (
+        body: Record<string, unknown>,
+        params: Record<string, unknown>,
+      ): { terminal: boolean; regressionFlag: boolean } => {
+        const reviewAgent = params.reviewAgent;
+        const isRepairAttempt = Boolean(
+          reviewAgent && typeof reviewAgent === "object" && !Array.isArray(reviewAgent),
+        );
+        const terminalDiagnostic =
+          body.diagnostics &&
+          typeof body.diagnostics === "object" &&
+          !Array.isArray(body.diagnostics)
+            ? (body.diagnostics as Record<string, unknown>).terminal
+            : null;
+        const text = [
+          body.message,
+          body.detail,
+          terminalDiagnostic &&
+          typeof terminalDiagnostic === "object" &&
+          !Array.isArray(terminalDiagnostic)
+            ? JSON.stringify(terminalDiagnostic)
+            : terminalDiagnostic,
+        ]
+          .map((value) => compactText(value, 1_200))
+          .filter(Boolean)
+          .join("\n");
+        return {
+          // Repair attempts are child evidence. They must not terminally close
+          // the root objective; the durable PR-repair lifecycle owns rearm.
+          terminal: !isRepairAttempt,
+          regressionFlag:
+            body.regressionFlag === true ||
+            body.regression_flag === true ||
+            /\b(?:product[_ -]?)?regression(?:[_ -]detected)?\b/i.test(text),
+        };
+      };
       const recordHasAutonomyOrigin = (value: unknown): boolean => {
         if (!value || typeof value !== "object" || Array.isArray(value)) return false;
         const record = value as Record<string, unknown>;
@@ -1092,6 +1148,10 @@ export function createRequestHandler() {
         if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, options.jobId);
         const outcomeContext = autonomyStore.resolveJobOutcomeContext(options.jobId, params);
         if (outcomeContext) {
+          const failureProjection = classifyAutonomyFailureProjection(
+            { message: options.message, detail: options.detail },
+            params,
+          );
           autonomyStore.recordOutcome({
             objectiveId: outcomeContext.objectiveId,
             requestId: outcomeContext.requestId ?? requestId,
@@ -1101,7 +1161,8 @@ export function createRequestHandler() {
             latencyMs: job.durationMs ?? null,
             userAction: "failed",
             reopenedWithin24h: false,
-            regressionFlag: true,
+            regressionFlag: failureProjection.regressionFlag,
+            terminal: failureProjection.terminal,
           });
         }
 
@@ -1259,6 +1320,22 @@ export function createRequestHandler() {
             onlineWorkers: state.onlineWorkers,
             threshold: state.threshold,
             oldestAgeMs: state.oldestAgeMs,
+          },
+          429,
+        );
+      };
+      const makeAutonomyRecoveryBackpressureResponse = (): Response | null => {
+        const recovery = jobQueue.recoveryBackpressureSummary();
+        if (!recovery.blocked) return null;
+        return makeJson(
+          {
+            ok: false,
+            code: "autonomy_recovery_backpressure",
+            message:
+              `Autonomy ideation blocked while ${recovery.overdue} deadline-bound ` +
+              `recovery/repair job(s) wait for execution.`,
+            retryAfterMs: 30_000,
+            recovery,
           },
           429,
         );
@@ -2133,20 +2210,24 @@ export function createRequestHandler() {
           validLifecycleHandoff = true;
         }
         if (isAutonomyRequestPayload(body) && !validLifecycleHandoff) {
-          // A direct autonomy job is a new admission and must honor every
-          // server-side circuit. A valid handoff for an already-admitted,
-          // actively leased request must keep moving even if pressure rises
-          // while RemoteBuddy is planning it.
+          // A direct ideation job is a new admission and must honor the
+          // quality/publication circuits. Explicit recovery/repair work drains
+          // those backlogs, while a valid handoff for an already-admitted,
+          // actively leased request must also keep moving if pressure rises.
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse) return reservationResponse;
           const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
           if (runtimeCircuitResponse) return runtimeCircuitResponse;
-          const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
-          if (failureCircuitResponse) return failureCircuitResponse;
-          const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
-          if (similarFailureResponse) return similarFailureResponse;
-          const publicationResponse = makeAutonomyPublicationBackpressureResponse();
-          if (publicationResponse) return publicationResponse;
+          if (!extractAutonomyPayloadDetails(body).isRecoveryWork) {
+            const recoveryBackpressureResponse = makeAutonomyRecoveryBackpressureResponse();
+            if (recoveryBackpressureResponse) return recoveryBackpressureResponse;
+            const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
+            if (failureCircuitResponse) return failureCircuitResponse;
+            const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
+            if (similarFailureResponse) return similarFailureResponse;
+            const publicationResponse = makeAutonomyPublicationBackpressureResponse();
+            if (publicationResponse) return publicationResponse;
+          }
         }
         const result = jobQueue.enqueue(body);
         return makeJson(result, result.ok ? 201 : 400);
@@ -3394,6 +3475,7 @@ export function createRequestHandler() {
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
           if (outcomeContext) {
+            const failureProjection = classifyAutonomyFailureProjection(body, params);
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -3403,7 +3485,8 @@ export function createRequestHandler() {
               latencyMs: result.durationMs ?? null,
               userAction: "failed",
               reopenedWithin24h: false,
-              regressionFlag: true,
+              regressionFlag: failureProjection.regressionFlag,
+              terminal: failureProjection.terminal,
             });
           }
 
@@ -3457,6 +3540,7 @@ export function createRequestHandler() {
           if (requestId) autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
           if (outcomeContext) {
+            const failureProjection = classifyAutonomyFailureProjection(body, params);
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -3466,7 +3550,8 @@ export function createRequestHandler() {
               latencyMs: result.durationMs ?? null,
               userAction: "failed",
               reopenedWithin24h: false,
-              regressionFlag: true,
+              regressionFlag: failureProjection.regressionFlag,
+              terminal: failureProjection.terminal,
             });
           }
 
@@ -3603,16 +3688,21 @@ export function createRequestHandler() {
           );
         }
         if (isAutonomyRequestPayload(body)) {
+          const autonomyDetails = extractAutonomyPayloadDetails(body);
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse) return reservationResponse;
           const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
           if (runtimeCircuitResponse) return runtimeCircuitResponse;
-          const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
-          if (failureCircuitResponse) return failureCircuitResponse;
-          const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
-          if (similarFailureResponse) return similarFailureResponse;
-          const publicationResponse = makeAutonomyPublicationBackpressureResponse();
-          if (publicationResponse) return publicationResponse;
+          if (!autonomyDetails.isRecoveryWork) {
+            const recoveryBackpressureResponse = makeAutonomyRecoveryBackpressureResponse();
+            if (recoveryBackpressureResponse) return recoveryBackpressureResponse;
+            const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
+            if (failureCircuitResponse) return failureCircuitResponse;
+            const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
+            if (similarFailureResponse) return similarFailureResponse;
+            const publicationResponse = makeAutonomyPublicationBackpressureResponse();
+            if (publicationResponse) return publicationResponse;
+          }
 
           const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
           const schedulableWorkers = workers.filter(
@@ -3622,7 +3712,7 @@ export function createRequestHandler() {
             (worker) => worker.status === "idle" && worker.activeJobCount === 0,
           );
           const workersAllBusy = schedulableWorkers.length > 0 && idleWorkers.length === 0;
-          if (workersAllBusy) {
+          if (workersAllBusy && !autonomyDetails.isRecoveryWork) {
             const autonomyQueued = requestQueue.countAutonomyRequests(["pending", "claimed"]);
             if (autonomyQueued >= AUTONOMY_BUSY_QUEUE_MAX_REQUESTS) {
               return makeJson(
@@ -3644,7 +3734,10 @@ export function createRequestHandler() {
           const openUnmergedWorkerPrs = workerPrBacklog.filter(
             (entry) => entry.mergeState === "open_unmerged",
           );
-          if (openUnmergedWorkerPrs.length >= AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS) {
+          if (
+            !autonomyDetails.isRecoveryWork &&
+            openUnmergedWorkerPrs.length >= AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS
+          ) {
             return makeJson(
               {
                 ok: false,
@@ -4056,7 +4149,7 @@ export function createRequestHandler() {
               success: false,
               userAction: "rejected",
               reopenedWithin24h: true,
-              regressionFlag: true,
+              regressionFlag: false,
             });
           }
         }
@@ -4165,6 +4258,7 @@ export function createRequestHandler() {
           );
         }
         if (result.ok && result.jobTransitioned && result.jobId) {
+          jobQueue.reconcileReviewRepairLifecycles();
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord(job?.params ?? "");
           const origin = deriveJobOrigin(params);
@@ -4248,12 +4342,17 @@ export function createRequestHandler() {
           claimToken,
         );
         if (result.ok && result.jobTransitioned && result.jobId) {
+          jobQueue.reconcileReviewRepairLifecycles();
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord(job?.params ?? "");
           const origin = deriveJobOrigin(params);
           const requestId = compactText(params.requestId, 128);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
           if (outcomeContext) {
+            const failureProjection = classifyAutonomyFailureProjection(
+              { message: "Candidate publication failed", detail: error },
+              params,
+            );
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -4263,7 +4362,8 @@ export function createRequestHandler() {
               latencyMs: result.durationMs ?? null,
               userAction: "failed",
               reopenedWithin24h: false,
-              regressionFlag: true,
+              regressionFlag: failureProjection.regressionFlag,
+              terminal: failureProjection.terminal,
             });
           }
           if (job?.sessionId) {

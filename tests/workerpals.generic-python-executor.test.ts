@@ -375,10 +375,56 @@ describe("generic python executor timeout resolution", () => {
       return execute("task.execute", {}, process.cwd(), runtimeConfig);
     };
 
-    const failure = await run({ ok: false, summary: "valid failure", exitCode: 0 });
+    const failure = await run({
+      ok: false,
+      summary: "valid failure",
+      exitCode: 124,
+      candidateState: {
+        status: "partial",
+        reason: "executor_timeout",
+        changedPaths: ["src/partial.ts"],
+      },
+      usageAttempts: [
+        {
+          promptTokens: 100,
+          completionTokens: 20,
+          totalTokens: 120,
+          backend: "openai_codex",
+          modelId: "gpt-test",
+          stage: "executor",
+          attempt: 1,
+          source: "openai_codex",
+        },
+        {
+          promptTokens: 50,
+          completionTokens: 10,
+          totalTokens: 60,
+          backend: "openai_codex",
+          modelId: "gpt-test",
+          stage: "executor_recovery",
+          attempt: 2,
+          source: "openai_codex",
+          timedOut: true,
+        },
+      ],
+    });
     const success = await run({ ok: true, summary: "valid success" });
 
-    expect(failure).toMatchObject({ ok: false, summary: "valid failure", exitCode: 0 });
+    expect(failure).toMatchObject({
+      ok: false,
+      summary: "valid failure",
+      exitCode: 124,
+      candidateState: {
+        status: "partial",
+        reason: "executor_timeout",
+        changedPaths: ["src/partial.ts"],
+      },
+    });
+    expect(failure.usageAttempts).toHaveLength(2);
+    expect(failure.usageAttempts?.map(({ stage, timedOut }) => ({ stage, timedOut }))).toEqual([
+      { stage: "executor", timedOut: undefined },
+      { stage: "executor_recovery", timedOut: true },
+    ]);
     expect(success).toMatchObject({ ok: true, summary: "valid success", exitCode: 0 });
   });
 
@@ -509,6 +555,23 @@ describe("generic python executor timeout resolution", () => {
         finalizationBudgetMs: 120_000,
       }),
     ).toBe(1_320_000);
+  });
+
+  test("does not round a ledger-capped tail budget back up past the absolute deadline", () => {
+    expect(
+      resolveGenericPythonExecutorTimeoutMs({
+        configuredTimeoutMs: 7_200_000,
+        executionBudgetMs: 4_000,
+        finalizationBudgetMs: 1_000,
+      }),
+    ).toBe(5_000);
+    expect(
+      resolveGenericPythonExecutorChildTimeoutMs({
+        backendName: "openai_codex",
+        hostTimeoutMs: 5_000,
+        executionBudgetMs: 4_000,
+      }),
+    ).toBeLessThanOrEqual(4_000);
   });
 
   test("still supports an explicit opt-out for bespoke backend wrappers", () => {

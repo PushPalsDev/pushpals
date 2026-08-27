@@ -409,7 +409,89 @@ describe("RepositoryAgent autonomy ideation", () => {
     expect((submitted?.context as Record<string, unknown>).operation).toBe(
       "analyze_autonomy_opportunities",
     );
+    expect((submitted?.context as Record<string, unknown>).runtimeSignals).toBeUndefined();
+    expect(String(submitted?.idempotencyKey)).toContain("snap_tick_1");
     expect(JSON.stringify(submitted)).not.toContain("repo_targets");
+  });
+
+  test("cancels in-flight repository ideation when autonomy is disabled and returns deterministic fallback", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-agent-abort-"));
+    tempDirs.push(root);
+    execFileSync("git", ["init"], { cwd: root });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    execFileSync("git", ["config", "user.name", "PushPals Test"], { cwd: root });
+    writeFileSync(join(root, "vision.md"), "# Vision\n\n## Priorities\n- Stay responsive\n");
+    execFileSync("git", ["add", "."], { cwd: root });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: root });
+
+    let observedSignal: AbortSignal | undefined;
+    let markStarted: (() => void) | null = null;
+    const started = new Promise<void>((resolveStarted) => {
+      markStarted = resolveStarted;
+    });
+    let legacyCalls = 0;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_repository_agent_abort",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        async generate() {
+          legacyCalls++;
+          return { text: "{}" };
+        },
+      },
+      repositoryAgent: {
+        async ask(_input: unknown, options: { signal?: AbortSignal }) {
+          observedSignal = options.signal;
+          markStarted?.();
+          return await new Promise((_resolve, reject) => {
+            const onAbort = () => reject(options.signal?.reason ?? new Error("aborted"));
+            options.signal?.addEventListener("abort", onAbort, { once: true });
+            if (options.signal?.aborted) onAbort();
+          });
+        },
+      } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).autonomyRepo = root;
+    const pending = (engine as any).repositoryAgentIdeation({
+      runId: "run-repository-agent-abort",
+      snapshot: makeSnapshot(),
+      visionContext: {
+        path: "vision.md",
+        markdown: "# Vision",
+        one_sentence: "Stay responsive",
+        sections: [{ number: "1", title: "Priorities", markdown: "Stay responsive" }],
+        key_items: {
+          target_users: [],
+          priorities: ["Stay responsive"],
+          objectives: [],
+          guardrails: [],
+          constraints: [],
+          non_goals: [],
+          metrics: [],
+          testing_criteria: [],
+          risk_policy: [],
+          operating_model: [],
+          governance: [],
+        },
+        section_numbers: ["1"],
+        sha256: "vision-abort-hash",
+        truncated: false,
+      },
+      cycleDeadline: Date.now() + 30_000,
+    });
+    await started;
+    engine.setRuntimeEnabled(false);
+    const result = await pending;
+
+    expect(observedSignal?.aborted).toBe(true);
+    expect(result).not.toBeNull();
+    expect(result?.json.candidates).toEqual([]);
+    expect(result?.llmCall.provider).toBe("repository_agent_deterministic_fallback");
+    expect(legacyCalls).toBe(0);
   });
 });
 

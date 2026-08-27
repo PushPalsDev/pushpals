@@ -33,7 +33,7 @@ This arrangement keeps the logical API stable if the worker later moves to a ded
 3. Server maps a non-host path onto its registered repository identity when appropriate, resolves the canonical snapshot, and rejects identity, revision, or tree drift.
 4. Server persists the request in the RepositoryAgent queue. `(repository identity, caller service, session, idempotency key)` is unique and bound to a canonical request fingerprint. An exact retry returns the existing request; changed question, context, or snapshot data within that caller scope receives `409 idempotency_conflict` instead of another request's answer.
 5. The RemoteBuddy-hosted worker claims the next compatible request with a token, generation, and lease expiry.
-6. The worker renews the lease while it validates the worktree, checks exact cache, recalls evidence-backed memory, and invokes the assigned LLM. On a cache miss, a bounded discovery pass may select additional tracked files from the path index before final analysis. Deadlines and shutdown signals propagate into HTTP bodies and whole subprocess trees; the worker waits for bounded provider cleanup before releasing its lease or starting a fallback pass.
+6. The worker renews the lease while it validates the worktree, checks structural/exact cache, recalls evidence-backed memory, and invokes the assigned LLM once. Host code ranks additional tracked paths deterministically, then reserves the tail of the request's single absolute deadline for evidence verification and durable memory. Deadlines and shutdown signals propagate into HTTP bodies and whole subprocess trees; an aborted synthesis receives bounded cleanup and never starts a second provider pass.
 7. The worker validates every cited repository path/blob, rejects symlink/reparse traversal, restricts citations to files actually supplied in the final evidence packet, and checks the repository snapshot again after analysis.
 8. Server accepts completion only from the live claim generation and only when the result describes the requested identity, revision, and tree.
 9. The caller receives the structured result and runs its own deterministic gates.
@@ -147,7 +147,7 @@ Shared memory endpoints:
 
 Services should normally use `createRepositoryAgentServiceClients` instead of hand-writing these requests. Direct `RepositoryAgentClient` and `MemoryHttpClient` construction remains available for specialized integrations. No service other than Server should open the shared SQLite file.
 
-Every memory request carries typed `x-pushpals-memory-caller` identity. The dedicated hosted worker additionally carries `x-pushpals-memory-authority: repository_agent`; ordinary RemoteBuddy code does not. RepositoryAgent cache/fact namespaces require that narrow authority for reads and writes. The worker may reinforce only its own validated cache hit as `confirmed`; authoritative success/failure/contradiction and internal pruning remain Server-owned. Other services retain normal operations in their own namespaces, including scoped pruning, while global pruning requires Server authority. These headers provide an auditable least-privilege boundary between cooperating loopback services, but they are not secrets and cannot defend against a malicious local process that can impersonate another service.
+Every memory request carries typed `x-pushpals-memory-caller` identity. The dedicated hosted worker additionally carries `x-pushpals-memory-authority: repository_agent`; ordinary RemoteBuddy code does not. RepositoryAgent cache, capability-circuit, and fact namespaces require that narrow authority for reads and writes. The worker may reinforce only its own validated cache hit as `confirmed`; authoritative success/failure/contradiction and internal pruning remain Server-owned. Other services retain normal operations in their own namespaces, including scoped pruning, while global pruning requires Server authority. These headers provide an auditable least-privilege boundary between cooperating loopback services, but they are not secrets and cannot defend against a malicious local process that can impersonate another service.
 
 ## Leases, Deadlines, and Recovery
 
@@ -182,7 +182,7 @@ This prevents a dead worker, lost HTTP response, or late callback from owning th
 
 Server accepts only its canonical root or an exact path reported by that repository's authoritative `git worktree list`; registered worktrees may live outside the checkout, including short Windows-host paths such as `~/.ppw`. Before selecting an external worktree, Server proves that its stable repository identity and canonical Git common directory match the configured repository, then resolves the exact revision/tree/dirty snapshot. Existing but unregistered host paths are rejected, while nonexistent foreign/container paths remain advisory and are mapped by identity plus exact snapshot to a registered host worktree. This supports divergent PR heads without trusting caller-provided paths. The worker analyzes that selected worktree, verifies the request snapshot before and after, and disables all durable cache/fact writes for dirty worktrees.
 
-Every assigned LLM receives a bounded evidence packet. For a clean snapshot, packet content and host-refreshed citation excerpts come from the exact Git blob at `<revision>:<path>`; checkout CRLF conversion and clean/smudge filters cannot silently change the evidence under that blob identity. A dirty snapshot instead uses the validated filesystem overlay. A model-guided discovery pass can select a small additional set of tracked paths; host code validates those paths and applies the same total file/character caps before the final pass. Final citations must come from that exact packet, not merely from some other tracked path the model names. Lexically tracked paths whose real canonical file traverses a symlink or Windows junction are excluded so an untracked target cannot inherit a tracked blob identity. For a Codex-backed client, the CLI runs in a disposable neutral Git repository with project docs, user rules, shell, apps, and web disabled. It never receives the target root as `cwd`. Repository instructions such as `AGENTS.md` therefore remain untrusted data rather than executable instruction layers.
+Every assigned LLM receives a bounded evidence packet. For a clean snapshot, packet content and host-refreshed citation excerpts come from the exact Git blob at `<revision>:<path>`; checkout CRLF conversion and clean/smudge filters cannot silently change the evidence under that blob identity. A dirty snapshot instead uses the validated filesystem overlay. Host-side deterministic retrieval ranks a small additional set of tracked paths using bounded question/vision terms and exact path coordinates. It cannot execute repository instructions, consume model time, or overlap synthesis. Host code applies the same total file/character caps before the single model pass. Final citations must come from that exact packet, not merely from some other tracked path the model names. Lexically tracked paths whose real canonical file traverses a symlink or Windows junction are excluded so an untracked target cannot inherit a tracked blob identity. For a Codex-backed client, the CLI runs in a disposable neutral Git repository with project docs, user rules, shell, apps, and web disabled. It never receives the target root as `cwd`. Repository instructions such as `AGENTS.md` therefore remain untrusted data rather than executable instruction layers.
 
 ## Shared Memory Architecture
 
@@ -199,7 +199,11 @@ The compare-and-set `expectedRevision` option prevents lost updates. Ordinary up
 
 ### Exact cache
 
-RepositoryAgent exact-cache keys include schema version, repository identity, revision/tree, purpose, question/context, assigned model, and prompt version. Only clean snapshots with a cache-permitting freshness policy are eligible. On a hit, cited blob evidence is revalidated before use. A stale hit is invalidated; `cache_only` returns a typed miss rather than silently invoking the model. When the provider reports the model actually used, including a compatibility fallback, cache and fact provenance record the normalized `provider/model` attribution rather than the requested label.
+RepositoryAgent cache keys include schema version, repository identity, content tree, purpose, assigned model, and prompt version. Ordinary questions additionally include their question/context. RemoteBuddy autonomy-priority requests instead use the `vision.md` fingerprint plus the stable operation/question protocol, deliberately excluding volatile runtime snapshots, open-objective lists, and signal ordering. Downstream deterministic eligibility still filters a reused candidate against current objectives and cooldowns. Only clean snapshots with a cache-permitting freshness policy are eligible. On a hit, cited blob evidence is revalidated before use. A stale hit is invalidated; `cache_only` returns a typed miss rather than silently invoking the model. When the provider reports the model actually used, including a compatibility fallback, cache and fact provenance record the normalized `provider/model` attribution rather than the requested label.
+
+### Capability circuit
+
+Synthesis failures are fingerprinted by stage/error class in repository-scoped memory. Two matching consecutive failures open a persistent model/purpose circuit for a bounded cooldown. Calls during cooldown return host-verified deterministic evidence without invoking the provider. After cooldown, compare-and-set ownership permits one half-open probe; success closes the circuit and another matching failure reopens it. The record stores no prompt, caller context, provider error body, or credential-bearing text.
 
 ### Durable facts
 
@@ -219,8 +223,8 @@ RemoteBuddy's existing session-planning `remotebuddy_memory` backend remains a p
 
 RepositoryAgent is assistance, so failure behavior must be explicit and bounded:
 
-- On timeout, abort, transport failure, malformed response, stale snapshot, or model failure, release the caller's wait promptly.
-- Use an existing bounded deterministic or legacy path when that path is independently safe. RemoteBuddy autonomy does this for ideation.
+- On synthesis timeout, transport failure, or malformed output, return the already host-verified bounded evidence packet when it is safe to do so and persist its immutable coordinates. Stale snapshots, invalid repositories, fabricated citations, and authority loss still fail closed.
+- Use an existing bounded deterministic path when that path is independently safe. RemoteBuddy autonomy goes directly to repo/vision synthesis and does not launch a fresh legacy-model ideation call after a late RepositoryAgent failure.
 - If repository advice is required to make a safety decision, fail closed and surface the typed error. Never interpret absence of advice as approval.
 - Never skip scope, command, test, review, lease, or publication gates because RepositoryAgent succeeded or failed.
 - Do not use stale memory merely to keep work moving; invalidate it or request fresh analysis.
@@ -257,7 +261,7 @@ For memory issues:
 - `tests/memory-store-conformance.test.ts` - one behavioral contract run against in-memory and SQLite implementations.
 - `tests/shared.memory.test.ts` and `tests/server.memory-store.test.ts` - scope, evidence, expiry, compare-and-set, reinforcement observations, and restart persistence.
 - `tests/remotebuddy.llm-repository-context.test.ts` - neutral Codex workspace and disabled instruction/tool surfaces.
-- `tests/remotebuddy.repository-agent.test.ts` - bounded model-guided retrieval, evidence validation, caching, dirty-snapshot policy, deadlines, and shutdown.
+- `tests/remotebuddy.repository-agent.test.ts` - deterministic retrieval, structural caching, persistent circuit/half-open recovery, partial evidence memory, dirty-snapshot policy, deadlines, and shutdown.
 
 ## Tradeoffs
 
@@ -274,5 +278,5 @@ Costs:
 - another queue and state machine to observe,
 - snapshot strictness can reject useful work during active repository changes,
 - shared memory needs disciplined scope, invalidation, and reinforcement,
-- model-guided retrieval can add one bounded LLM call on a cache miss,
+- host-ranked retrieval is fast and deterministic but may miss a semantically related file whose path carries no useful repository vocabulary,
 - the current single RemoteBuddy-hosted worker limits RepositoryAgent concurrency.
