@@ -7322,13 +7322,16 @@ export class RemoteBuddyAutonomousEngine {
     try {
       const repository = await resolveRepositorySnapshot(this.autonomyRepo, {
         timeoutMs: Math.min(10_000, timeoutMs),
+        signal: controller.signal,
         runGit: async (root, args, options) =>
           await runBoundedProcess(["git", "-C", root, ...args], {
             cwd: root,
             timeoutMs: options.timeoutMs,
             outputLimitBytes: options.outputLimitBytes,
             streamDrainTimeoutMs: 1_000,
-            signal: controller.signal,
+            preserveOutputWhitespace: true,
+            signal: options.signal ?? controller.signal,
+            ...(options.stdin ? { stdin: new Blob([new Uint8Array(options.stdin)]) } : {}),
           }),
       });
       if (!this.runtimeEnabled || this.stopped || controller.signal.aborted) {

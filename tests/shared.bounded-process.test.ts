@@ -32,6 +32,15 @@ function isEffectivelyAlive(pid: number): boolean {
   return true;
 }
 
+function byteStream(...chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+}
+
 describe("shared bounded subprocess", () => {
   test("uses taskkill /T /F for Windows process trees", async () => {
     const spawned: string[][] = [];
@@ -188,7 +197,7 @@ describe("shared bounded subprocess", () => {
     expect(signals).toEqual(["SIGKILL"]);
   });
 
-  test("caps captured output and marks truncation", async () => {
+  test("caps captured output and reports structured truncation", async () => {
     const bytes = new TextEncoder().encode("abcdefghijklmnopqrstuvwxyz");
     const processHandle: BoundedSubprocess = {
       pid: 4323,
@@ -210,8 +219,100 @@ describe("shared bounded subprocess", () => {
     });
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toStartWith("abcde");
-    expect(result.stdout).toContain("process output truncated");
+    expect(result.stdout).toBe("abcde");
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stderrTruncated).toBe(false);
+    expect(result.stdoutDecodeError).toBe(false);
+    expect(result.stderrDecodeError).toBe(false);
+  });
+
+  test("counts the capture limit in bytes rather than decoded characters", async () => {
+    const processHandle: BoundedSubprocess = {
+      pid: 4325,
+      stdout: byteStream(new TextEncoder().encode("ééé")),
+      stderr: null,
+      exited: Promise.resolve(0),
+      kill() {},
+    };
+
+    const result = await runBoundedProcess(["multibyte-output"], {
+      timeoutMs: 100,
+      outputLimitBytes: 4,
+      spawn: () => processHandle,
+    });
+
+    expect(result.stdout).toBe("éé");
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stdoutDecodeError).toBe(false);
+  });
+
+  test("retains bounded head and tail bytes without injecting sentinel content", async () => {
+    const processHandle: BoundedSubprocess = {
+      pid: 4328,
+      stdout: byteStream(new TextEncoder().encode("abcdefghij")),
+      stderr: null,
+      exited: Promise.resolve(0),
+      kill() {},
+    };
+
+    const result = await runBoundedProcess(["head-and-tail-output"], {
+      timeoutMs: 100,
+      outputLimitBytes: 6,
+      retainOutputTail: true,
+      spawn: () => processHandle,
+    });
+
+    expect(result.stdout).toBe("abchij");
+    expect(result.stdout).not.toContain("process output truncated");
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stdoutDecodeError).toBe(false);
+  });
+
+  test("allows a literal truncation marker and a valid replacement character", async () => {
+    const literal = "valid �\n[pushpals: process output truncated]";
+    const encoded = new TextEncoder().encode(literal);
+    const processHandle: BoundedSubprocess = {
+      pid: 4326,
+      // Split the three-byte U+FFFD sequence across stream chunks to exercise
+      // incremental UTF-8 validation rather than chunk-local decoding.
+      stdout: byteStream(encoded.slice(0, 7), encoded.slice(7, 8), encoded.slice(8)),
+      stderr: null,
+      exited: Promise.resolve(0),
+      kill() {},
+    };
+
+    const result = await runBoundedProcess(["literal-marker"], {
+      timeoutMs: 100,
+      outputLimitBytes: 1_024,
+      spawn: () => processHandle,
+    });
+
+    expect(result.stdout).toBe(literal);
+    expect(result.stdoutTruncated).toBe(false);
+    expect(result.stdoutDecodeError).toBe(false);
+  });
+
+  test("reports invalid UTF-8 independently for stdout and stderr", async () => {
+    const processHandle: BoundedSubprocess = {
+      pid: 4327,
+      stdout: byteStream(Uint8Array.from([0x66, 0x80, 0x6f])),
+      stderr: byteStream(Uint8Array.from([0x65, 0xc3])),
+      exited: Promise.resolve(0),
+      kill() {},
+    };
+
+    const result = await runBoundedProcess(["invalid-utf8"], {
+      timeoutMs: 100,
+      outputLimitBytes: 1_024,
+      spawn: () => processHandle,
+    });
+
+    expect(result.stdout).toBe("f�o");
+    expect(result.stderr).toBe("e�");
+    expect(result.stdoutTruncated).toBe(false);
+    expect(result.stderrTruncated).toBe(false);
+    expect(result.stdoutDecodeError).toBe(true);
+    expect(result.stderrDecodeError).toBe(true);
   });
 
   test("kills a real orphan descendant after its root exits", async () => {

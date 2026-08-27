@@ -8,6 +8,7 @@ import {
   RemoteBuddyAutonomousEngine,
   resolveAutonomyGitCommandTimeoutMs,
 } from "../apps/remotebuddy/src/autonomous_engine";
+import { resolveRepositorySnapshot } from "../packages/shared/src";
 
 type FetchCall = {
   url: string;
@@ -513,6 +514,8 @@ describe("RepositoryAgent autonomy ideation", () => {
     writeFileSync(join(root, "service.ts"), "export const ready = true;\n");
     execFileSync("git", ["add", "."], { cwd: root });
     execFileSync("git", ["commit", "-m", "fixture"], { cwd: root });
+    writeFileSync(join(root, "service.ts"), "export const ready = false;\n");
+    const expectedRepository = await resolveRepositorySnapshot(root);
 
     let submitted: Record<string, unknown> | null = null;
     const repositoryAgent = {
@@ -605,6 +608,8 @@ describe("RepositoryAgent autonomy ideation", () => {
     expect(result?.json.candidates).toHaveLength(1);
     expect(result?.llmCall.provider).toBe("repository_agent");
     expect((submitted?.repository as Record<string, unknown>).root).toBe(root);
+    expect((submitted?.repository as Record<string, unknown>).dirty).toBe(true);
+    expect((submitted?.repository as Record<string, unknown>).tree).toBe(expectedRepository.tree);
     expect((submitted?.context as Record<string, unknown>).operation).toBe(
       "analyze_autonomy_opportunities",
     );

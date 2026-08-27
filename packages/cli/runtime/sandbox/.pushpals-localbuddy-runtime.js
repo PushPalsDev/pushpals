@@ -69,39 +69,39 @@ async function settleWithin(promise, timeoutMs) {
       clearTimeout(timer);
   }
 }
+var EMPTY_STREAM_CAPTURE_RESULT = {
+  text: "",
+  truncated: false,
+  decodeError: false
+};
 function captureBoundedStream(stream, maxBytes, options = {}) {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
-    return { done: Promise.resolve(""), cancel: () => {
+    return { done: Promise.resolve(EMPTY_STREAM_CAPTURE_RESULT), cancel: () => {
       return;
     } };
   }
   const reader = stream.getReader();
-  const decoder = new TextDecoder;
+  const lineDecoder = new TextDecoder;
+  const validationDecoder = new TextDecoder("utf-8", { fatal: true });
   const headLimit = options.retainTail ? Math.max(1, Math.floor(maxBytes / 2)) : maxBytes;
   const tailLimit = options.retainTail ? Math.max(0, maxBytes - headLimit) : 0;
-  let head = "";
-  let tail = "";
-  let observedChars = 0;
+  const headBuffer = new Uint8Array(headLimit);
+  const tailBuffer = new Uint8Array(tailLimit);
+  let headLength = 0;
+  let tailLength = 0;
+  let tailWriteOffset = 0;
+  let observedBytes = 0;
   let lineBuffer = "";
-  let truncated = false;
+  let decodeError = false;
+  let validationActive = true;
   let cancelled = false;
   const emitLine = (line) => {
     try {
       options.onLine?.(line);
     } catch {}
   };
-  const retainAndEmit = (text) => {
-    if (!text)
-      return;
-    observedChars += text.length;
-    const headRemaining = Math.max(0, headLimit - head.length);
-    const headPart = headRemaining > 0 ? text.slice(0, headRemaining) : "";
-    head += headPart;
-    const remainder = text.slice(headPart.length);
-    if (remainder && tailLimit > 0)
-      tail = `${tail}${remainder}`.slice(-tailLimit);
-    truncated = observedChars > maxBytes;
-    if (!options.onLine)
+  const emitDecodedLines = (text) => {
+    if (!text || !options.onLine)
       return;
     lineBuffer += text;
     const lines = lineBuffer.split(`
@@ -115,16 +115,79 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
       lineBuffer = "";
     }
   };
+  const appendTail = (bytes) => {
+    if (tailLimit === 0 || bytes.byteLength === 0)
+      return;
+    if (bytes.byteLength >= tailLimit) {
+      tailBuffer.set(bytes.subarray(bytes.byteLength - tailLimit));
+      tailLength = tailLimit;
+      tailWriteOffset = 0;
+      return;
+    }
+    const firstLength = Math.min(bytes.byteLength, tailLimit - tailWriteOffset);
+    tailBuffer.set(bytes.subarray(0, firstLength), tailWriteOffset);
+    const remainingLength = bytes.byteLength - firstLength;
+    if (remainingLength > 0)
+      tailBuffer.set(bytes.subarray(firstLength), 0);
+    tailWriteOffset = (tailWriteOffset + bytes.byteLength) % tailLimit;
+    tailLength = Math.min(tailLimit, tailLength + bytes.byteLength);
+  };
+  const retainedTail = () => {
+    if (tailLength === 0)
+      return new Uint8Array;
+    if (tailLength < tailLimit)
+      return tailBuffer.slice(0, tailLength);
+    if (tailWriteOffset === 0)
+      return tailBuffer.slice();
+    const ordered = new Uint8Array(tailLength);
+    const first = tailBuffer.subarray(tailWriteOffset);
+    ordered.set(first, 0);
+    ordered.set(tailBuffer.subarray(0, tailWriteOffset), first.byteLength);
+    return ordered;
+  };
+  const retainAndValidate = (bytes) => {
+    if (bytes.byteLength === 0)
+      return;
+    observedBytes = Math.min(Number.MAX_SAFE_INTEGER, observedBytes + bytes.byteLength);
+    const headBytes = Math.min(headLimit - headLength, bytes.byteLength);
+    if (headBytes > 0) {
+      headBuffer.set(bytes.subarray(0, headBytes), headLength);
+      headLength += headBytes;
+    }
+    appendTail(bytes.subarray(headBytes));
+    if (validationActive) {
+      try {
+        validationDecoder.decode(bytes, { stream: true });
+      } catch {
+        decodeError = true;
+        validationActive = false;
+      }
+    }
+    if (options.onLine)
+      emitDecodedLines(lineDecoder.decode(bytes, { stream: true }));
+  };
   const done = (async () => {
+    let reachedEnd = false;
     try {
       while (true) {
         const chunk = await reader.read();
-        if (chunk.done)
+        if (chunk.done) {
+          reachedEnd = true;
           break;
-        retainAndEmit(decoder.decode(chunk.value, { stream: true }));
+        }
+        retainAndValidate(chunk.value);
       }
-      retainAndEmit(decoder.decode());
-      if (options.onLine && lineBuffer.length > 0) {
+      if (!cancelled && validationActive) {
+        try {
+          validationDecoder.decode();
+        } catch {
+          decodeError = true;
+          validationActive = false;
+        }
+      }
+      if (options.onLine)
+        emitDecodedLines(lineDecoder.decode());
+      if (options.onLine && reachedEnd && lineBuffer.length > 0) {
         emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
         lineBuffer = "";
       }
@@ -133,12 +196,24 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
         reader.releaseLock();
       } catch {}
     }
-    if (!truncated)
-      return head + tail;
-    const marker = `
-[pushpals: process output truncated]`;
-    return options.retainTail ? `${head}${marker}
-${tail}` : `${head}${marker}`;
+    const truncated = observedBytes > maxBytes;
+    const head = headBuffer.subarray(0, headLength);
+    const tail = retainedTail();
+    if (!truncated) {
+      const retained = new Uint8Array(head.byteLength + tail.byteLength);
+      retained.set(head, 0);
+      retained.set(tail, head.byteLength);
+      return {
+        text: new TextDecoder().decode(retained),
+        truncated,
+        decodeError
+      };
+    }
+    return {
+      text: options.retainTail ? `${new TextDecoder().decode(head)}${new TextDecoder().decode(tail)}` : new TextDecoder().decode(head),
+      truncated,
+      decodeError
+    };
   })();
   return {
     done,
@@ -268,7 +343,8 @@ async function runBoundedProcess(argv, options) {
     stderr: options.stderr ?? "pipe",
     detached: platform !== "win32"
   });
-  const maxBytes = Math.max(1, options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const requestedOutputLimitBytes = Number(options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const maxBytes = Number.isFinite(requestedOutputLimitBytes) ? Math.max(1, Math.floor(requestedOutputLimitBytes)) : DEFAULT_OUTPUT_LIMIT_BYTES;
   const stdoutCapture = captureBoundedStream(proc.stdout, maxBytes, {
     retainTail: options.retainOutputTail,
     onLine: options.onStdoutLine
@@ -363,16 +439,20 @@ async function runBoundedProcess(argv, options) {
     stderrCapture.cancel();
     streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250);
   }
-  const [stdout, rawStderr] = streams.settled ? streams.value : ["", ""];
+  const [stdoutCaptureResult, stderrCaptureResult] = streams.settled ? streams.value : [EMPTY_STREAM_CAPTURE_RESULT, EMPTY_STREAM_CAPTURE_RESULT];
   const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
   const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
   const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
   if (outcome.aborted)
     throw outcome.reason;
   return {
-    stdout: trimOutput(stdout),
-    stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
+    stdout: trimOutput(stdoutCaptureResult.text),
+    stderr: [trimOutput(stderrCaptureResult.text), timeoutDetail, drainDetail].filter(Boolean).join(`
 `),
+    stdoutTruncated: stdoutCaptureResult.truncated,
+    stderrTruncated: stderrCaptureResult.truncated,
+    stdoutDecodeError: stdoutCaptureResult.decodeError,
+    stderrDecodeError: stderrCaptureResult.decodeError,
     exitCode: outcome.exitCode,
     timedOut: outcome.timedOut,
     drainTimedOut
@@ -437,12 +517,291 @@ function detectRepoRoot(startDir) {
   return startDir;
 }
 // packages/shared/src/repository_snapshot.ts
+import { createHash } from "crypto";
+import { isAbsolute, join, relative, resolve as resolve2, sep } from "path";
 var DEFAULT_DIFF_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
 var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
-var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
+var MAX_BOUNDARY_PATHSPEC_BYTES = 16 * 1024;
+var FILE_READ_BUFFER_BYTES = 64 * 1024;
+class RepositorySnapshotError extends Error {
+  code;
+  gitArgs;
+  exitCode;
+  constructor(code, message, options = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "RepositorySnapshotError";
+    this.code = code;
+    this.gitArgs = Object.freeze([...options.gitArgs ?? []]);
+    this.exitCode = options.exitCode ?? null;
+  }
+}
+function snapshotDeadlineError(deadline, operation) {
+  if (deadline.signal?.aborted) {
+    return new RepositorySnapshotError("snapshot_aborted", `Repository snapshot was aborted during ${operation}`, { cause: deadline.signal.reason });
+  }
+  return new RepositorySnapshotError("snapshot_timeout", `Repository snapshot exceeded its overall deadline during ${operation}`);
+}
+function remainingSnapshotMs(deadline, operation) {
+  if (deadline.signal?.aborted || Date.now() >= deadline.deadlineAtMs) {
+    throw snapshotDeadlineError(deadline, operation);
+  }
+  return Math.max(1, deadline.deadlineAtMs - Date.now());
+}
+async function withinSnapshotDeadline(deadline, operation, start, options = {}) {
+  const remainingMs = remainingSnapshotMs(deadline, operation);
+  const promise = start();
+  let timer = null;
+  let removeAbortListener = () => {
+    return;
+  };
+  let stoppedTriggered = false;
+  const stopped = new Promise((_resolve, reject) => {
+    let settled = false;
+    const stop = () => {
+      if (settled)
+        return;
+      settled = true;
+      stoppedTriggered = true;
+      reject(snapshotDeadlineError(deadline, operation));
+    };
+    timer = setTimeout(stop, remainingMs);
+    const onAbort = () => stop();
+    deadline.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => deadline.signal?.removeEventListener("abort", onAbort);
+    if (deadline.signal?.aborted)
+      onAbort();
+  });
+  try {
+    return await Promise.race([promise, stopped]);
+  } catch (error) {
+    if (stoppedTriggered && options.drainOnStopMs && options.drainOnStopMs > 0) {
+      let drainTimer = null;
+      await Promise.race([
+        promise.then(() => {
+          return;
+        }, () => {
+          return;
+        }),
+        new Promise((resolveDrain) => {
+          drainTimer = setTimeout(resolveDrain, options.drainOnStopMs);
+        })
+      ]);
+      if (drainTimer)
+        clearTimeout(drainTimer);
+    } else if (stoppedTriggered) {
+      promise.catch(() => {
+        return;
+      });
+    }
+    throw error;
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    removeAbortListener();
+  }
+}
+function updateHashPart(hash, label, value) {
+  const bytes = Buffer.from(value, "utf8");
+  hash.update(`${label}\x00${bytes.byteLength}\x00`, "utf8");
+  hash.update(bytes);
+  hash.update("\x00", "utf8");
+}
+function updateHashBytes(hash, label, value) {
+  hash.update(`${label}\x00${value.byteLength}\x00`, "utf8");
+  hash.update(value);
+  hash.update("\x00", "utf8");
+}
+var UNTRACKED_FILES_ARGS = [
+  "ls-files",
+  "--others",
+  "--exclude-standard",
+  "--full-name",
+  "-z"
+];
+function stableStatsEqual(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+function repositoryChanged(path, cause) {
+  return new RepositorySnapshotError("repository_changed", `Repository path changed while resolving its dirty snapshot: ${path}`, { gitArgs: [...UNTRACKED_FILES_ARGS], cause });
+}
+function isUnavailablePathError(error) {
+  if (typeof error !== "object" || error === null || !("code" in error))
+    return false;
+  const code = error.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+function indirectionIdentity(path, target) {
+  const hash = createHash("sha256");
+  hash.update("pushpals-repository-indirection-v2\x00", "utf8");
+  updateHashPart(hash, "path", path);
+  updateHashBytes(hash, "target", target);
+  return `indirection:sha256:${hash.digest("hex")}`;
+}
+
+class RepositoryPathInspector {
+  root;
+  fileSystem;
+  deadline;
+  prefixes = new Map;
+  constructor(root, fileSystem, deadline) {
+    this.root = root;
+    this.fileSystem = fileSystem;
+    this.deadline = deadline;
+  }
+  async inspectPrefix(path, absolutePath, allowUnavailable, knownStats) {
+    const existing = this.prefixes.get(path);
+    if (existing)
+      return await existing;
+    const pending = (async () => {
+      let stats;
+      try {
+        stats = knownStats ?? await withinSnapshotDeadline(this.deadline, `lstat ${path}`, () => this.fileSystem.lstat(absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        if (allowUnavailable && isUnavailablePathError(error)) {
+          return { kind: "unavailable", path, absolutePath, stats: null };
+        }
+        throw repositoryChanged(path, error);
+      }
+      if (stats.isSymbolicLink()) {
+        let target;
+        let verified;
+        try {
+          target = await withinSnapshotDeadline(this.deadline, `readlink ${path}`, () => this.fileSystem.readlink(absolutePath));
+          verified = await withinSnapshotDeadline(this.deadline, `revalidate indirection ${path}`, () => this.fileSystem.lstat(absolutePath));
+        } catch (error) {
+          if (error instanceof RepositorySnapshotError)
+            throw error;
+          throw repositoryChanged(path, error);
+        }
+        if (!verified.isSymbolicLink() || !stableStatsEqual(stats, verified)) {
+          throw repositoryChanged(path);
+        }
+        return {
+          kind: "indirection",
+          path,
+          absolutePath,
+          stats,
+          target,
+          identity: indirectionIdentity(path, target)
+        };
+      }
+      if (!stats.isDirectory()) {
+        if (allowUnavailable) {
+          return { kind: "unavailable", path, absolutePath, stats };
+        }
+        throw repositoryChanged(path);
+      }
+      return { kind: "directory", path, absolutePath, stats };
+    })();
+    this.prefixes.set(path, pending);
+    return await pending;
+  }
+  async inspectAncestors(lexical, options = {}) {
+    let absolutePath = this.root;
+    const traversed = [];
+    for (const segment of lexical.segments.slice(0, -1)) {
+      remainingSnapshotMs(this.deadline, `inspect path ${lexical.path}`);
+      traversed.push(segment);
+      absolutePath = join(absolutePath, segment);
+      const prefix = await this.inspectPrefix(traversed.join("/"), absolutePath, options.allowUnavailable === true);
+      if (prefix.kind === "indirection")
+        return prefix;
+      if (prefix.kind === "unavailable") {
+        if (options.allowUnavailable)
+          return null;
+        throw repositoryChanged(prefix.path);
+      }
+    }
+    return null;
+  }
+  async inspectUntracked(lexical) {
+    const ancestor = await this.inspectAncestors(lexical);
+    if (ancestor)
+      return ancestor;
+    let stats;
+    try {
+      stats = await withinSnapshotDeadline(this.deadline, `lstat ${lexical.path}`, () => this.fileSystem.lstat(lexical.absolutePath));
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw repositoryChanged(lexical.path, error);
+    }
+    if (stats.isSymbolicLink()) {
+      const boundary = await this.inspectPrefix(lexical.path, lexical.absolutePath, false, stats);
+      if (boundary.kind !== "indirection")
+        throw repositoryChanged(lexical.path);
+      return boundary;
+    }
+    if (stats.isDirectory()) {
+      await this.inspectPrefix(lexical.path, lexical.absolutePath, false, stats);
+      return { kind: "directory", lexical };
+    }
+    if (stats.isFile())
+      return { kind: "file", lexical, stats };
+    return { kind: "special", lexical, stats };
+  }
+  async inspectDirectoryCandidate(lexical) {
+    const inspected = await this.inspectUntracked(lexical);
+    if (inspected.kind === "indirection")
+      return inspected;
+    if (inspected.kind === "directory")
+      return inspected;
+    return null;
+  }
+  async validatePrefixes() {
+    for (const pending of this.prefixes.values()) {
+      remainingSnapshotMs(this.deadline, "validate repository path prefixes");
+      const prefix = await pending;
+      if (prefix.kind === "unavailable") {
+        try {
+          const stats2 = await withinSnapshotDeadline(this.deadline, `revalidate unavailable path ${prefix.path}`, () => this.fileSystem.lstat(prefix.absolutePath));
+          if (prefix.stats === null || !stableStatsEqual(prefix.stats, stats2)) {
+            throw repositoryChanged(prefix.path);
+          }
+        } catch (error) {
+          if (error instanceof RepositorySnapshotError)
+            throw error;
+          if (prefix.stats === null && isUnavailablePathError(error))
+            continue;
+          throw repositoryChanged(prefix.path, error);
+        }
+        continue;
+      }
+      let stats;
+      try {
+        stats = await withinSnapshotDeadline(this.deadline, `revalidate ${prefix.path}`, () => this.fileSystem.lstat(prefix.absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(prefix.path, error);
+      }
+      if (!stableStatsEqual(prefix.stats, stats))
+        throw repositoryChanged(prefix.path);
+      if (prefix.kind === "directory") {
+        if (!stats.isDirectory())
+          throw repositoryChanged(prefix.path);
+        continue;
+      }
+      if (!stats.isSymbolicLink())
+        throw repositoryChanged(prefix.path);
+      let target;
+      try {
+        target = await withinSnapshotDeadline(this.deadline, `revalidate readlink ${prefix.path}`, () => this.fileSystem.readlink(prefix.absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(prefix.path, error);
+      }
+      if (!target.equals(prefix.target))
+        throw repositoryChanged(prefix.path);
+    }
+  }
+}
 // packages/shared/src/memory.ts
-import { createHash, randomUUID } from "crypto";
+import { createHash as createHash2, randomUUID } from "crypto";
 
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -862,7 +1221,7 @@ function reinforcementObservationId(recordId, input) {
   if (!explicit && !inferredIdentity)
     return randomUUID();
   const identity = explicit ? [recordId, "explicit", explicit] : [recordId, "inferred", inferredIdentity, input.outcome];
-  return `observation_${createHash("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 32)}`;
+  return `observation_${createHash2("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 32)}`;
 }
 function createMemoryReinforcementObservation(recordId, input, observedAt) {
   assertMemoryReinforcementOutcome(input.outcome);
@@ -1680,7 +2039,7 @@ function sleepWithSignal(ms, signal) {
   if (signal?.aborted) {
     return Promise.reject(new RepositoryAgentClientError("aborted", "Repository Agent call aborted"));
   }
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     let timer = null;
     const onAbort = () => {
       if (timer)
@@ -1690,7 +2049,7 @@ function sleepWithSignal(ms, signal) {
     };
     timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
-      resolve2();
+      resolve3();
     }, Math.max(0, ms));
     signal?.addEventListener("abort", onAbort, { once: true });
   });
@@ -2161,14 +2520,14 @@ function copyEnvWithoutScmRepairAuthoritySecret(env = process.env) {
 }
 // packages/shared/src/prompts.ts
 import { readFileSync as readFileSync2 } from "fs";
-import { join, resolve as resolve2 } from "path";
+import { join as join2, resolve as resolve3 } from "path";
 var TEMPLATE_TOKEN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 var promptTemplateCache = new Map;
 var repoDocCache = new Map;
 function resolvePromptPath(relativePath) {
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
-  const repoRoot = promptRootOverride ? resolve2(promptRootOverride) : detectRepoRoot(process.cwd());
-  return join(repoRoot, "prompts", relativePath);
+  const repoRoot = promptRootOverride ? resolve3(promptRootOverride) : detectRepoRoot(process.cwd());
+  return join2(repoRoot, "prompts", relativePath);
 }
 function loadPromptTemplate(relativePath, replacements) {
   const promptPath = resolvePromptPath(relativePath);
@@ -2190,7 +2549,7 @@ function loadPromptTemplate(relativePath, replacements) {
 }
 // packages/shared/src/config.ts
 import { existsSync as existsSync2, readFileSync as readFileSync3 } from "fs";
-import { join as join2, resolve as resolve3, isAbsolute } from "path";
+import { join as join3, resolve as resolve4, isAbsolute as isAbsolute2 } from "path";
 
 // packages/shared/src/autonomy_policy.ts
 var DRIVE_RE = /^[A-Za-z]:\//;
@@ -2308,7 +2667,7 @@ function resolveLocalServerConnection(options) {
 }
 
 // packages/shared/src/config.ts
-var PROJECT_ROOT = resolve3(import.meta.dir, "..", "..", "..");
+var PROJECT_ROOT = resolve4(import.meta.dir, "..", "..", "..");
 var DEFAULT_CONFIG_DIR = "configs";
 var TRUTHY = new Set(["1", "true", "yes", "on"]);
 var FALSY = new Set(["0", "false", "no", "off"]);
@@ -2485,9 +2844,9 @@ function asStringNumberRecord(value) {
 function resolvePathFromRoot(projectRoot, value) {
   if (!value)
     return projectRoot;
-  if (isAbsolute(value))
-    return resolve3(value);
-  return resolve3(projectRoot, value);
+  if (isAbsolute2(value))
+    return resolve4(value);
+  return resolve4(projectRoot, value);
 }
 function resolveRuntimeConfigDir(projectRoot, configuredDir) {
   if (configuredDir && configuredDir.trim()) {
@@ -2566,18 +2925,18 @@ function resolveLlmConfig(serviceNode, envPrefix, defaults, globalSessionId) {
 }
 function loadPushPalsConfig(options = {}) {
   const projectRootOverride = firstNonEmpty(options.projectRoot, process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE, PROJECT_ROOT);
-  const projectRoot = resolve3(projectRootOverride);
+  const projectRoot = resolve4(projectRootOverride);
   const configDirOverride = firstNonEmpty(options.configDir, process.env.PUSHPALS_CONFIG_DIR_OVERRIDE, "");
   const configDir = resolveRuntimeConfigDir(projectRoot, configDirOverride);
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;
   }
-  const defaultToml = parseRequiredTomlFile(join2(configDir, "default.toml"));
+  const defaultToml = parseRequiredTomlFile(join3(configDir, "default.toml"));
   const preferredProfile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(defaultToml.profile, "dev"), "dev");
-  const profileToml = parseTomlFile(join2(configDir, `${preferredProfile}.toml`));
-  const localExampleToml = parseTomlFile(join2(configDir, "local.example.toml"));
-  const localToml = parseTomlFile(join2(configDir, "local.toml"));
+  const profileToml = parseTomlFile(join3(configDir, `${preferredProfile}.toml`));
+  const localExampleToml = parseTomlFile(join3(configDir, "local.example.toml"));
+  const localToml = parseTomlFile(join3(configDir, "local.toml"));
   const merged = mergeDeep(mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml), localToml);
   const profile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(merged.profile, preferredProfile), preferredProfile);
   const sessionId = firstNonEmpty(process.env.PUSHPALS_SESSION_ID, asString(merged.session_id, "dev"), "dev");
@@ -2591,8 +2950,8 @@ function loadPushPalsConfig(options = {}) {
   const lmStudioBatchMemoryChars = Math.max(0, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_BATCH_MEMORY_CHARS") ?? lmStudioNode.batch_memory_chars, 0));
   const pathsNode = getObject(merged, "paths");
   const dataDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DATA_DIR, asString(pathsNode.data_dir, "outputs/data")));
-  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join2(dataDir, "pushpals.db"))));
-  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join2(dataDir, "remotebuddy-state.db"))));
+  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join3(dataDir, "pushpals.db"))));
+  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join3(dataDir, "remotebuddy-state.db"))));
   const serverNode = getObject(merged, "server");
   const serverPort = Math.max(1, asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001));
   const serverUrl = normalizeLoopbackHttpUrl(firstNonEmpty(process.env.PUSHPALS_SERVER_URL, asString(serverNode.url, `http://127.0.0.1:${serverPort}`), `http://127.0.0.1:${serverPort}`), serverPort);
@@ -2778,7 +3137,7 @@ function loadPushPalsConfig(options = {}) {
   const scmBranchPrefix = asString(process.env.SOURCE_CONTROL_MANAGER_BRANCH_PREFIX ?? scmNode.branch_prefix, "agent/");
   const scmPollIntervalSeconds = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_POLL_INTERVAL_SECONDS") ?? scmNode.poll_interval_seconds, 10));
   const scmChecks = asCheckArray(scmNode.checks);
-  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join2(dataDir, "source_control_manager")), join2(dataDir, "source_control_manager")));
+  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join3(dataDir, "source_control_manager")), join3(dataDir, "source_control_manager")));
   const scmPort = Math.max(1, Math.min(65535, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_PORT") ?? scmNode.port, 3002)));
   const scmDeleteAfterMerge = parseBoolEnv("SOURCE_CONTROL_MANAGER_DELETE_AFTER_MERGE") ?? asBoolean(scmNode.delete_after_merge, false);
   const scmMaxAttempts = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_MAX_ATTEMPTS") ?? scmNode.max_attempts, 3));
@@ -3200,7 +3559,7 @@ var FALSY2 = new Set(["0", "false", "no", "off"]);
 import { spawn } from "child_process";
 import { existsSync as existsSync3, mkdtempSync, readFileSync as readFileSync4, rmSync } from "fs";
 import { tmpdir } from "os";
-import { join as join3 } from "path";
+import { join as join4 } from "path";
 var DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 var DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 var DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
@@ -3460,7 +3819,7 @@ async function runProcessWithBun(command, opts) {
 async function runProcessWithNode(command, opts) {
   throwIfLlmAborted(opts.signal);
   const timeoutMs = opts.timeoutMs ?? 0;
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const child = spawn(command[0], command.slice(1), {
       cwd: opts.cwd,
       env: opts.env,
@@ -3527,7 +3886,7 @@ async function runProcessWithNode(command, opts) {
         reject(stopReason ?? new DOMException("The LLM subprocess was aborted", "AbortError"));
         return;
       }
-      resolve4({
+      resolve5({
         code: stopKind === "timeout" ? 124 : closeResult?.code ?? null,
         signal: stopKind ? "SIGKILL" : closeResult?.signal ?? null,
         stdout,
@@ -4445,7 +4804,7 @@ async function prepareCodexExecutionWorkspace(input) {
   if ("cwd" in input.executionContext && String(input.executionContext.cwd ?? "").trim()) {
     throw new Error("Codex isolated-evidence execution does not accept a target repository cwd.");
   }
-  const cwd = mkdtempSync(join3(tmpdir(), "pushpals-repository-agent-neutral-"));
+  const cwd = mkdtempSync(join4(tmpdir(), "pushpals-repository-agent-neutral-"));
   const cleanup = () => rmSync(cwd, { recursive: true, force: true });
   try {
     const initialized = await runProcess(["git", "init", "--quiet"], {
@@ -4582,8 +4941,8 @@ class OpenAiCodexCliClient {
         delete env.OPENAI_API_BASE;
       }
     }
-    const tmp = mkdtempSync(join3(tmpdir(), "pushpals-codex-"));
-    const lastMessagePath = join3(tmp, "codex-last-message.txt");
+    const tmp = mkdtempSync(join4(tmpdir(), "pushpals-codex-"));
+    const lastMessagePath = join4(tmp, "codex-last-message.txt");
     try {
       const command = [
         ...commandPrefix,

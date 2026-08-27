@@ -22,6 +22,8 @@ export {
   resolveRepositorySnapshot,
   type RepositorySnapshot,
   type RepositorySnapshotErrorCode,
+  type RepositorySnapshotFileHandle,
+  type RepositorySnapshotFileSystem,
   type RepositorySnapshotGitResult,
   type RepositorySnapshotGitRunner,
   type ResolveRepositorySnapshotOptions,

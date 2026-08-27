@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "child_process";
 import { createHash } from "crypto";
 import {
@@ -36,6 +36,7 @@ import {
 import { SqliteMemoryStore } from "../apps/server/src/memory_store";
 
 const tempDirs: string[] = [];
+setDefaultTimeout(30_000);
 
 function git(repo: string, args: string[]): string {
   return execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
@@ -224,6 +225,10 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       assertRepositoryGitInspectionResult(["ls-files"], {
         stdout: "vision.md\0",
         stderr: "",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        stdoutDecodeError: false,
+        stderrDecodeError: false,
         exitCode: 0,
         timedOut: false,
         drainTimedOut: true,
@@ -594,8 +599,8 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
         memory,
         llm,
         modelId: "circuit-test-model",
-        capabilityCircuitCooldownMs: 2_500,
-        finalizationReserveMs: 500,
+        capabilityCircuitCooldownMs: 5_000,
+        finalizationReserveMs: 3_000,
         providerDrainMs: 100,
         logger: { log: () => {}, warn: () => {}, error: () => {} },
       });
@@ -604,12 +609,12 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       await requestFor(repo, {
         freshness: "fresh_required",
         idempotencyKey: key,
-        deadlineAt: new Date(Date.now() + 3_000).toISOString(),
+        deadlineAt: new Date(Date.now() + 7_000).toISOString(),
       });
 
     const firstStartedAt = Date.now();
     const first = await worker.analyze("circuit-first", await timedRequest("circuit-first"));
-    expect(Date.now() - firstStartedAt).toBeLessThan(3_500);
+    expect(Date.now() - firstStartedAt).toBeLessThan(7_500);
     const second = await worker.analyze("circuit-second", await timedRequest("circuit-second"));
     expect((first.data as Record<string, unknown>).repositoryAgentMode).toBe(
       "deterministic_evidence_fallback",
@@ -649,7 +654,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect((blocked.data as Record<string, unknown>).synthesisStatus).toContain("circuit open");
     expect(providerCalls).toBe(2);
 
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_600));
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 5_100));
     providerHealthy = true;
     const recovered = await makeWorker().analyze(
       "circuit-recovered",
@@ -667,7 +672,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     });
     expect((recoveredCircuit[0]?.value as Record<string, unknown>).state).toBe("closed");
     expect((recoveredCircuit[0]?.value as Record<string, unknown>).consecutiveFailures).toBe(0);
-  }, 20_000);
+  }, 40_000);
 
   test("fences half-open outcomes to the exact probe owner and revision", async () => {
     const repo = createRepository();
@@ -1500,22 +1505,25 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
         memory: memory as any,
         llm: new FakeLlm(),
         repositoryTools: true,
-        finalizationReserveMs: 800,
+        // Stable snapshot fencing now performs two worktree observations plus
+        // a final HEAD check. Reserve enough real Windows Git time so this
+        // fixture continues to isolate hanging memory stages, not SCM latency.
+        finalizationReserveMs: 3_000,
         logger: { log: () => {}, warn: () => {}, error: () => {} },
       });
       const request = await requestFor(repo, {
         freshness: hangingStage === "get" ? "cache_preferred" : "fresh_required",
         idempotencyKey: `hanging-memory-${hangingStage}`,
-        deadlineAt: new Date(Date.now() + 5_000).toISOString(),
+        deadlineAt: new Date(Date.now() + 7_000).toISOString(),
       });
       const startedAt = Date.now();
 
       const result = await worker.analyze(`hanging-memory-${hangingStage}`, request);
 
-      expect(Date.now() - startedAt).toBeLessThan(5_500);
+      expect(Date.now() - startedAt).toBeLessThan(7_500);
       expect(result.evidence.length).toBeGreaterThan(0);
     }
-  }, 30_000);
+  }, 35_000);
 
   test("fences a delayed staged put so it cannot ghost-write after timeout", async () => {
     const delegate = new InMemoryMemoryStore();
@@ -1758,6 +1766,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
   test("never stores durable facts or exact results from a dirty snapshot", async () => {
     const repo = createRepository();
+    writeFileSync(join(repo, "src", "index.ts"), "export const value = 2;\n");
     writeFileSync(join(repo, "dirty-untracked.txt"), "ephemeral worktree content\n");
     const request = await requestFor(repo, { freshness: "fresh_required" });
     expect(request.repository.dirty).toBe(true);

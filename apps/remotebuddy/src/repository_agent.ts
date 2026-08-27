@@ -62,7 +62,6 @@ const MEMORY_TERMINAL_RESULT_RESERVE_MS = 100;
 const MIN_SYNTHESIS_START_BUDGET_MS = 500;
 const MIN_FINALIZATION_RESERVE_MS = 500;
 const MAX_FINALIZATION_RESERVE_MS = 5_000;
-const OUTPUT_TRUNCATION_MARKER = "[pushpals: process output truncated]";
 
 const MANIFEST_BASENAMES = new Set(
   [
@@ -465,10 +464,17 @@ export function assertRepositoryGitInspectionResult(
       ),
     );
   }
-  if (result.stdout.includes(OUTPUT_TRUNCATION_MARKER)) {
+  if (result.stdoutTruncated || result.stderrTruncated) {
     throw new RepositoryAgentWorkerError(
       "repository_too_large",
       `Repository Git output exceeded the bounded inspection limit for git ${args[0] ?? "command"}`,
+      false,
+    );
+  }
+  if (result.stdoutDecodeError || result.stderrDecodeError) {
+    throw new RepositoryAgentWorkerError(
+      "repository_git_failed",
+      `Repository Git inspection returned invalid UTF-8 for git ${args[0] ?? "command"}`,
       false,
     );
   }
@@ -500,13 +506,16 @@ async function resolveRepositorySnapshotWithinDeadline(
   throwIfAborted(signal);
   return await resolveRepositorySnapshot(repoRoot, {
     timeoutMs: clampInt(deadlineMs - Date.now(), 5_000, 100, 10_000),
+    signal,
     runGit: async (root, args, options) =>
       await runBoundedProcess(["git", "-C", root, ...args], {
         cwd: root,
         timeoutMs: options.timeoutMs,
         outputLimitBytes: options.outputLimitBytes,
         streamDrainTimeoutMs: 1_000,
-        signal,
+        preserveOutputWhitespace: true,
+        signal: options.signal ?? signal,
+        ...(options.stdin ? { stdin: new Blob([new Uint8Array(options.stdin)]) } : {}),
       }),
   });
 }
@@ -686,21 +695,19 @@ async function readRepositoryTextPrefix(
       compactText(result.stderr || `exit ${result.exitCode}`, 2_000),
     );
   }
-  const markerSuffix = `\n${OUTPUT_TRUNCATION_MARKER}`;
-  // Bounded-process capture retains exactly maxChars before appending its own
-  // marker. Length proves capture truncation; blob-controlled content cannot
-  // forge it merely by ending with the same literal marker.
-  const captureTruncated = result.stdout.length > maxChars;
-  if (captureTruncated && !result.stdout.endsWith(markerSuffix)) {
+  if (result.stderrTruncated || result.stderrDecodeError) {
     throw new RepositoryAgentWorkerError(
       "repository_git_failed",
-      `Repository Git blob capture produced an invalid truncation envelope for ${path}`,
+      `Repository Git blob diagnostics were incomplete for ${path}`,
       false,
     );
   }
-  const text = captureTruncated ? result.stdout.slice(0, -markerSuffix.length) : result.stdout;
+  // A tracked blob can be arbitrary binary data. Invalid UTF-8 means it is not
+  // eligible as text evidence, while valid U+FFFD remains ordinary content.
+  if (result.stdoutDecodeError) return null;
+  const text = result.stdout;
   if (text.includes("\0")) return null;
-  const truncated = captureTruncated || Buffer.byteLength(text, "utf8") < declaredSize;
+  const truncated = result.stdoutTruncated || Buffer.byteLength(text, "utf8") < declaredSize;
   return { text, truncated };
 }
 

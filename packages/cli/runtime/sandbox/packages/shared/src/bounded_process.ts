@@ -23,6 +23,10 @@ export type BoundedProcessSpawner = (
 export type BoundedProcessResult = {
   stdout: string;
   stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  stdoutDecodeError: boolean;
+  stderrDecodeError: boolean;
   exitCode: number;
   timedOut: boolean;
   drainTimedOut: boolean;
@@ -108,6 +112,18 @@ async function settleWithin<T>(
   }
 }
 
+type BoundedStreamCaptureResult = {
+  text: string;
+  truncated: boolean;
+  decodeError: boolean;
+};
+
+const EMPTY_STREAM_CAPTURE_RESULT: BoundedStreamCaptureResult = {
+  text: "",
+  truncated: false,
+  decodeError: false,
+};
+
 function captureBoundedStream(
   stream: ProcessStream,
   maxBytes: number,
@@ -115,20 +131,25 @@ function captureBoundedStream(
     retainTail?: boolean;
     onLine?: (line: string) => void;
   } = {},
-): { done: Promise<string>; cancel: () => void } {
+): { done: Promise<BoundedStreamCaptureResult>; cancel: () => void } {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
-    return { done: Promise.resolve(""), cancel: () => undefined };
+    return { done: Promise.resolve(EMPTY_STREAM_CAPTURE_RESULT), cancel: () => undefined };
   }
 
   const reader = stream.getReader();
-  const decoder = new TextDecoder();
+  const lineDecoder = new TextDecoder();
+  const validationDecoder = new TextDecoder("utf-8", { fatal: true });
   const headLimit = options.retainTail ? Math.max(1, Math.floor(maxBytes / 2)) : maxBytes;
   const tailLimit = options.retainTail ? Math.max(0, maxBytes - headLimit) : 0;
-  let head = "";
-  let tail = "";
-  let observedChars = 0;
+  const headBuffer = new Uint8Array(headLimit);
+  const tailBuffer = new Uint8Array(tailLimit);
+  let headLength = 0;
+  let tailLength = 0;
+  let tailWriteOffset = 0;
+  let observedBytes = 0;
   let lineBuffer = "";
-  let truncated = false;
+  let decodeError = false;
+  let validationActive = true;
   let cancelled = false;
   const emitLine = (line: string) => {
     try {
@@ -137,17 +158,8 @@ function captureBoundedStream(
       // Observability callbacks must not strand the subprocess or its pipes.
     }
   };
-  const retainAndEmit = (text: string) => {
-    if (!text) return;
-    observedChars += text.length;
-    const headRemaining = Math.max(0, headLimit - head.length);
-    const headPart = headRemaining > 0 ? text.slice(0, headRemaining) : "";
-    head += headPart;
-    const remainder = text.slice(headPart.length);
-    if (remainder && tailLimit > 0) tail = `${tail}${remainder}`.slice(-tailLimit);
-    truncated = observedChars > maxBytes;
-
-    if (!options.onLine) return;
+  const emitDecodedLines = (text: string) => {
+    if (!text || !options.onLine) return;
     lineBuffer += text;
     const lines = lineBuffer.split("\n");
     lineBuffer = lines.pop() ?? "";
@@ -159,15 +171,72 @@ function captureBoundedStream(
       lineBuffer = "";
     }
   };
+  const appendTail = (bytes: Uint8Array) => {
+    if (tailLimit === 0 || bytes.byteLength === 0) return;
+    if (bytes.byteLength >= tailLimit) {
+      tailBuffer.set(bytes.subarray(bytes.byteLength - tailLimit));
+      tailLength = tailLimit;
+      tailWriteOffset = 0;
+      return;
+    }
+    const firstLength = Math.min(bytes.byteLength, tailLimit - tailWriteOffset);
+    tailBuffer.set(bytes.subarray(0, firstLength), tailWriteOffset);
+    const remainingLength = bytes.byteLength - firstLength;
+    if (remainingLength > 0) tailBuffer.set(bytes.subarray(firstLength), 0);
+    tailWriteOffset = (tailWriteOffset + bytes.byteLength) % tailLimit;
+    tailLength = Math.min(tailLimit, tailLength + bytes.byteLength);
+  };
+  const retainedTail = (): Uint8Array => {
+    if (tailLength === 0) return new Uint8Array();
+    if (tailLength < tailLimit) return tailBuffer.slice(0, tailLength);
+    if (tailWriteOffset === 0) return tailBuffer.slice();
+    const ordered = new Uint8Array(tailLength);
+    const first = tailBuffer.subarray(tailWriteOffset);
+    ordered.set(first, 0);
+    ordered.set(tailBuffer.subarray(0, tailWriteOffset), first.byteLength);
+    return ordered;
+  };
+  const retainAndValidate = (bytes: Uint8Array) => {
+    if (bytes.byteLength === 0) return;
+    observedBytes = Math.min(Number.MAX_SAFE_INTEGER, observedBytes + bytes.byteLength);
+    const headBytes = Math.min(headLimit - headLength, bytes.byteLength);
+    if (headBytes > 0) {
+      headBuffer.set(bytes.subarray(0, headBytes), headLength);
+      headLength += headBytes;
+    }
+    appendTail(bytes.subarray(headBytes));
+
+    if (validationActive) {
+      try {
+        validationDecoder.decode(bytes, { stream: true });
+      } catch {
+        decodeError = true;
+        validationActive = false;
+      }
+    }
+    if (options.onLine) emitDecodedLines(lineDecoder.decode(bytes, { stream: true }));
+  };
   const done = (async () => {
+    let reachedEnd = false;
     try {
       while (true) {
         const chunk = await reader.read();
-        if (chunk.done) break;
-        retainAndEmit(decoder.decode(chunk.value, { stream: true }));
+        if (chunk.done) {
+          reachedEnd = true;
+          break;
+        }
+        retainAndValidate(chunk.value);
       }
-      retainAndEmit(decoder.decode());
-      if (options.onLine && lineBuffer.length > 0) {
+      if (!cancelled && validationActive) {
+        try {
+          validationDecoder.decode();
+        } catch {
+          decodeError = true;
+          validationActive = false;
+        }
+      }
+      if (options.onLine) emitDecodedLines(lineDecoder.decode());
+      if (options.onLine && reachedEnd && lineBuffer.length > 0) {
         emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
         lineBuffer = "";
       }
@@ -180,9 +249,26 @@ function captureBoundedStream(
         // best-effort stream cleanup
       }
     }
-    if (!truncated) return head + tail;
-    const marker = "\n[pushpals: process output truncated]";
-    return options.retainTail ? `${head}${marker}\n${tail}` : `${head}${marker}`;
+    const truncated = observedBytes > maxBytes;
+    const head = headBuffer.subarray(0, headLength);
+    const tail = retainedTail();
+    if (!truncated) {
+      const retained = new Uint8Array(head.byteLength + tail.byteLength);
+      retained.set(head, 0);
+      retained.set(tail, head.byteLength);
+      return {
+        text: new TextDecoder().decode(retained),
+        truncated,
+        decodeError,
+      };
+    }
+    return {
+      text: options.retainTail
+        ? `${new TextDecoder().decode(head)}${new TextDecoder().decode(tail)}`
+        : new TextDecoder().decode(head),
+      truncated,
+      decodeError,
+    };
   })();
 
   return {
@@ -378,7 +464,10 @@ export async function runBoundedProcess(
     stderr: options.stderr ?? "pipe",
     detached: platform !== "win32",
   });
-  const maxBytes = Math.max(1, options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const requestedOutputLimitBytes = Number(options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const maxBytes = Number.isFinite(requestedOutputLimitBytes)
+    ? Math.max(1, Math.floor(requestedOutputLimitBytes))
+    : DEFAULT_OUTPUT_LIMIT_BYTES;
   const stdoutCapture = captureBoundedStream(proc.stdout, maxBytes, {
     retainTail: options.retainOutputTail,
     onLine: options.onStdoutLine,
@@ -499,7 +588,9 @@ export async function runBoundedProcess(
     stderrCapture.cancel();
     streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250);
   }
-  const [stdout, rawStderr] = streams.settled ? streams.value : ["", ""];
+  const [stdoutCaptureResult, stderrCaptureResult] = streams.settled
+    ? streams.value
+    : [EMPTY_STREAM_CAPTURE_RESULT, EMPTY_STREAM_CAPTURE_RESULT];
   const timeoutDetail = outcome.timedOut
     ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.`
     : "";
@@ -511,8 +602,14 @@ export async function runBoundedProcess(
   if (outcome.aborted) throw outcome.reason;
 
   return {
-    stdout: trimOutput(stdout),
-    stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join("\n"),
+    stdout: trimOutput(stdoutCaptureResult.text),
+    stderr: [trimOutput(stderrCaptureResult.text), timeoutDetail, drainDetail]
+      .filter(Boolean)
+      .join("\n"),
+    stdoutTruncated: stdoutCaptureResult.truncated,
+    stderrTruncated: stderrCaptureResult.truncated,
+    stdoutDecodeError: stdoutCaptureResult.decodeError,
+    stderrDecodeError: stderrCaptureResult.decodeError,
     exitCode: outcome.exitCode,
     timedOut: outcome.timedOut,
     drainTimedOut,

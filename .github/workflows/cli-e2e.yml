@@ -23,6 +23,7 @@ on:
       - "tests/integration/cli.e2e.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
+      - "tests/shared.repository-snapshot.test.ts"
       - "tests/runtime-launch-trampoline.test.ts"
       - "tests/start.runtime-services.test.ts"
       - "tests/workerpals.runtime-paths.test.ts"
@@ -58,6 +59,7 @@ on:
       - "tests/integration/cli.e2e.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
+      - "tests/shared.repository-snapshot.test.ts"
       - "tests/runtime-launch-trampoline.test.ts"
       - "tests/start.runtime-services.test.ts"
       - "tests/workerpals.runtime-paths.test.ts"
@@ -98,6 +100,7 @@ jobs:
       - name: Verify compact worktree, sandbox, and packaged-runtime paths
         run: >-
           bun test
+          tests/shared.repository-snapshot.test.ts
           tests/workerpals.direct-worktree.test.ts
           tests/workerpals.sandbox-env.test.ts
           tests/workerpals.runtime-sandbox-mirror.test.ts
@@ -138,6 +141,9 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Verify repository snapshot boundaries
+        run: bun test tests/shared.repository-snapshot.test.ts
 
       - name: Verify Docker engine
         run: docker version

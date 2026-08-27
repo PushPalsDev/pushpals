@@ -9,7 +9,7 @@ import { Database as Database3 } from "bun:sqlite";
 import { spawn } from "child_process";
 import { existsSync as existsSync3, mkdtempSync, readFileSync as readFileSync4, rmSync } from "fs";
 import { tmpdir } from "os";
-import { join as join3 } from "path";
+import { join as join4 } from "path";
 
 // packages/shared/src/repo.ts
 import { existsSync, readFileSync, statSync } from "fs";
@@ -79,39 +79,39 @@ async function settleWithin(promise, timeoutMs) {
       clearTimeout(timer);
   }
 }
+var EMPTY_STREAM_CAPTURE_RESULT = {
+  text: "",
+  truncated: false,
+  decodeError: false
+};
 function captureBoundedStream(stream, maxBytes, options = {}) {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
-    return { done: Promise.resolve(""), cancel: () => {
+    return { done: Promise.resolve(EMPTY_STREAM_CAPTURE_RESULT), cancel: () => {
       return;
     } };
   }
   const reader = stream.getReader();
-  const decoder = new TextDecoder;
+  const lineDecoder = new TextDecoder;
+  const validationDecoder = new TextDecoder("utf-8", { fatal: true });
   const headLimit = options.retainTail ? Math.max(1, Math.floor(maxBytes / 2)) : maxBytes;
   const tailLimit = options.retainTail ? Math.max(0, maxBytes - headLimit) : 0;
-  let head = "";
-  let tail = "";
-  let observedChars = 0;
+  const headBuffer = new Uint8Array(headLimit);
+  const tailBuffer = new Uint8Array(tailLimit);
+  let headLength = 0;
+  let tailLength = 0;
+  let tailWriteOffset = 0;
+  let observedBytes = 0;
   let lineBuffer = "";
-  let truncated = false;
+  let decodeError = false;
+  let validationActive = true;
   let cancelled = false;
   const emitLine = (line) => {
     try {
       options.onLine?.(line);
     } catch {}
   };
-  const retainAndEmit = (text) => {
-    if (!text)
-      return;
-    observedChars += text.length;
-    const headRemaining = Math.max(0, headLimit - head.length);
-    const headPart = headRemaining > 0 ? text.slice(0, headRemaining) : "";
-    head += headPart;
-    const remainder = text.slice(headPart.length);
-    if (remainder && tailLimit > 0)
-      tail = `${tail}${remainder}`.slice(-tailLimit);
-    truncated = observedChars > maxBytes;
-    if (!options.onLine)
+  const emitDecodedLines = (text) => {
+    if (!text || !options.onLine)
       return;
     lineBuffer += text;
     const lines = lineBuffer.split(`
@@ -125,16 +125,79 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
       lineBuffer = "";
     }
   };
+  const appendTail = (bytes) => {
+    if (tailLimit === 0 || bytes.byteLength === 0)
+      return;
+    if (bytes.byteLength >= tailLimit) {
+      tailBuffer.set(bytes.subarray(bytes.byteLength - tailLimit));
+      tailLength = tailLimit;
+      tailWriteOffset = 0;
+      return;
+    }
+    const firstLength = Math.min(bytes.byteLength, tailLimit - tailWriteOffset);
+    tailBuffer.set(bytes.subarray(0, firstLength), tailWriteOffset);
+    const remainingLength = bytes.byteLength - firstLength;
+    if (remainingLength > 0)
+      tailBuffer.set(bytes.subarray(firstLength), 0);
+    tailWriteOffset = (tailWriteOffset + bytes.byteLength) % tailLimit;
+    tailLength = Math.min(tailLimit, tailLength + bytes.byteLength);
+  };
+  const retainedTail = () => {
+    if (tailLength === 0)
+      return new Uint8Array;
+    if (tailLength < tailLimit)
+      return tailBuffer.slice(0, tailLength);
+    if (tailWriteOffset === 0)
+      return tailBuffer.slice();
+    const ordered = new Uint8Array(tailLength);
+    const first = tailBuffer.subarray(tailWriteOffset);
+    ordered.set(first, 0);
+    ordered.set(tailBuffer.subarray(0, tailWriteOffset), first.byteLength);
+    return ordered;
+  };
+  const retainAndValidate = (bytes) => {
+    if (bytes.byteLength === 0)
+      return;
+    observedBytes = Math.min(Number.MAX_SAFE_INTEGER, observedBytes + bytes.byteLength);
+    const headBytes = Math.min(headLimit - headLength, bytes.byteLength);
+    if (headBytes > 0) {
+      headBuffer.set(bytes.subarray(0, headBytes), headLength);
+      headLength += headBytes;
+    }
+    appendTail(bytes.subarray(headBytes));
+    if (validationActive) {
+      try {
+        validationDecoder.decode(bytes, { stream: true });
+      } catch {
+        decodeError = true;
+        validationActive = false;
+      }
+    }
+    if (options.onLine)
+      emitDecodedLines(lineDecoder.decode(bytes, { stream: true }));
+  };
   const done = (async () => {
+    let reachedEnd = false;
     try {
       while (true) {
         const chunk = await reader.read();
-        if (chunk.done)
+        if (chunk.done) {
+          reachedEnd = true;
           break;
-        retainAndEmit(decoder.decode(chunk.value, { stream: true }));
+        }
+        retainAndValidate(chunk.value);
       }
-      retainAndEmit(decoder.decode());
-      if (options.onLine && lineBuffer.length > 0) {
+      if (!cancelled && validationActive) {
+        try {
+          validationDecoder.decode();
+        } catch {
+          decodeError = true;
+          validationActive = false;
+        }
+      }
+      if (options.onLine)
+        emitDecodedLines(lineDecoder.decode());
+      if (options.onLine && reachedEnd && lineBuffer.length > 0) {
         emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
         lineBuffer = "";
       }
@@ -143,12 +206,24 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
         reader.releaseLock();
       } catch {}
     }
-    if (!truncated)
-      return head + tail;
-    const marker = `
-[pushpals: process output truncated]`;
-    return options.retainTail ? `${head}${marker}
-${tail}` : `${head}${marker}`;
+    const truncated = observedBytes > maxBytes;
+    const head = headBuffer.subarray(0, headLength);
+    const tail = retainedTail();
+    if (!truncated) {
+      const retained = new Uint8Array(head.byteLength + tail.byteLength);
+      retained.set(head, 0);
+      retained.set(tail, head.byteLength);
+      return {
+        text: new TextDecoder().decode(retained),
+        truncated,
+        decodeError
+      };
+    }
+    return {
+      text: options.retainTail ? `${new TextDecoder().decode(head)}${new TextDecoder().decode(tail)}` : new TextDecoder().decode(head),
+      truncated,
+      decodeError
+    };
   })();
   return {
     done,
@@ -278,7 +353,8 @@ async function runBoundedProcess(argv, options) {
     stderr: options.stderr ?? "pipe",
     detached: platform !== "win32"
   });
-  const maxBytes = Math.max(1, options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const requestedOutputLimitBytes = Number(options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const maxBytes = Number.isFinite(requestedOutputLimitBytes) ? Math.max(1, Math.floor(requestedOutputLimitBytes)) : DEFAULT_OUTPUT_LIMIT_BYTES;
   const stdoutCapture = captureBoundedStream(proc.stdout, maxBytes, {
     retainTail: options.retainOutputTail,
     onLine: options.onStdoutLine
@@ -373,16 +449,20 @@ async function runBoundedProcess(argv, options) {
     stderrCapture.cancel();
     streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250);
   }
-  const [stdout, rawStderr] = streams.settled ? streams.value : ["", ""];
+  const [stdoutCaptureResult, stderrCaptureResult] = streams.settled ? streams.value : [EMPTY_STREAM_CAPTURE_RESULT, EMPTY_STREAM_CAPTURE_RESULT];
   const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
   const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
   const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
   if (outcome.aborted)
     throw outcome.reason;
   return {
-    stdout: trimOutput(stdout),
-    stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
+    stdout: trimOutput(stdoutCaptureResult.text),
+    stderr: [trimOutput(stderrCaptureResult.text), timeoutDetail, drainDetail].filter(Boolean).join(`
 `),
+    stdoutTruncated: stdoutCaptureResult.truncated,
+    stderrTruncated: stderrCaptureResult.truncated,
+    stdoutDecodeError: stdoutCaptureResult.decodeError,
+    stderrDecodeError: stderrCaptureResult.decodeError,
     exitCode: outcome.exitCode,
     timedOut: outcome.timedOut,
     drainTimedOut
@@ -547,15 +627,24 @@ async function resolveRepositoryIdentity(repoRoot, options = {}) {
 }
 // packages/shared/src/repository_snapshot.ts
 import { createHash as createHash2 } from "crypto";
-import { realpathSync as realpathSync2, statSync as statSync2 } from "fs";
-import { resolve as resolve3 } from "path";
-var DEFAULT_GIT_TIMEOUT_MS = 5000;
+import { constants as fsConstants } from "fs";
+import {
+  lstat as lstatPath,
+  open as openPath,
+  readdir as readdirPath,
+  readlink as readlinkPath,
+  realpath as realpathPath
+} from "fs/promises";
+import { isAbsolute as isAbsolute2, join, relative, resolve as resolve3, sep } from "path";
+var DEFAULT_SNAPSHOT_TIMEOUT_MS = 30000;
 var DEFAULT_DIFF_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
 var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
-var MAX_HASH_PATHS_PER_INVOCATION = 128;
-var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
-var OUTPUT_TRUNCATION_MARKER = "[pushpals: process output truncated]";
+var MAX_BOUNDARY_PATHSPEC_BYTES = 16 * 1024;
+var MAX_UNTRACKED_DIRECTORY_SCAN_ENTRIES = 20000;
+var MAX_NESTED_GIT_MARKER_ENTRIES = 2048;
+var FILE_READ_BUFFER_BYTES = 64 * 1024;
+var GIT_ABORT_DRAIN_TIMEOUT_MS = 12500;
 
 class RepositorySnapshotError extends Error {
   code;
@@ -575,20 +664,151 @@ function normalizePositiveInt(value, fallback, min, max) {
     return fallback;
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
-function canonicalDirectory(pathValue, label) {
-  const absolute = resolve3(pathValue);
+var defaultFileSystem = {
+  async lstat(path) {
+    return await lstatPath(path, { bigint: true });
+  },
+  async readdir(path) {
+    return await readdirPath(path, { withFileTypes: true });
+  },
+  async readlink(path) {
+    return await readlinkPath(path, { encoding: "buffer" });
+  },
+  async realpath(path) {
+    return await realpathPath(path);
+  },
+  async open(path, flags) {
+    return await openPath(path, flags);
+  }
+};
+function snapshotDeadlineError(deadline, operation) {
+  if (deadline.signal?.aborted) {
+    return new RepositorySnapshotError("snapshot_aborted", `Repository snapshot was aborted during ${operation}`, { cause: deadline.signal.reason });
+  }
+  return new RepositorySnapshotError("snapshot_timeout", `Repository snapshot exceeded its overall deadline during ${operation}`);
+}
+function remainingSnapshotMs(deadline, operation) {
+  if (deadline.signal?.aborted || Date.now() >= deadline.deadlineAtMs) {
+    throw snapshotDeadlineError(deadline, operation);
+  }
+  return Math.max(1, deadline.deadlineAtMs - Date.now());
+}
+async function withinSnapshotDeadline(deadline, operation, start, options = {}) {
+  const remainingMs = remainingSnapshotMs(deadline, operation);
+  const promise = start();
+  let timer = null;
+  let removeAbortListener = () => {
+    return;
+  };
+  let stoppedTriggered = false;
+  const stopped = new Promise((_resolve, reject) => {
+    let settled = false;
+    const stop = () => {
+      if (settled)
+        return;
+      settled = true;
+      stoppedTriggered = true;
+      reject(snapshotDeadlineError(deadline, operation));
+    };
+    timer = setTimeout(stop, remainingMs);
+    const onAbort = () => stop();
+    deadline.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => deadline.signal?.removeEventListener("abort", onAbort);
+    if (deadline.signal?.aborted)
+      onAbort();
+  });
   try {
-    if (!statSync2(absolute).isDirectory()) {
-      throw new RepositorySnapshotError("invalid_root", `${label} is not a directory: ${absolute}`);
+    return await Promise.race([promise, stopped]);
+  } catch (error) {
+    if (stoppedTriggered && options.drainOnStopMs && options.drainOnStopMs > 0) {
+      let drainTimer = null;
+      await Promise.race([
+        promise.then(() => {
+          return;
+        }, () => {
+          return;
+        }),
+        new Promise((resolveDrain) => {
+          drainTimer = setTimeout(resolveDrain, options.drainOnStopMs);
+        })
+      ]);
+      if (drainTimer)
+        clearTimeout(drainTimer);
+    } else if (stoppedTriggered) {
+      promise.catch(() => {
+        return;
+      });
     }
-    return realpathSync2.native(absolute);
+    throw error;
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    removeAbortListener();
+  }
+}
+function directorySourceStatsEqual(left, right) {
+  const sameKind = left.isDirectory() && right.isDirectory() || left.isSymbolicLink() && right.isSymbolicLink();
+  return sameKind && left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+function directoryTargetStatsEqual(left, right) {
+  return left.isDirectory() && right.isDirectory() && left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+function directoryObservationsEqual(left, right) {
+  return comparableFileSystemPath(left.canonicalPath) === comparableFileSystemPath(right.canonicalPath) && directorySourceStatsEqual(left.sourceStats, right.sourceStats) && directoryTargetStatsEqual(left.targetStats, right.targetStats) && (left.sourceLinkTarget === null && right.sourceLinkTarget === null || left.sourceLinkTarget !== null && right.sourceLinkTarget !== null && left.sourceLinkTarget.equals(right.sourceLinkTarget));
+}
+async function observeDirectoryAnchor(sourcePath, label, fileSystem, deadline) {
+  const sourceStats = await withinSnapshotDeadline(deadline, `${label} source lstat`, () => fileSystem.lstat(sourcePath));
+  if (!sourceStats.isDirectory() && !sourceStats.isSymbolicLink()) {
+    throw new Error(`${label} source is not a directory or directory indirection`);
+  }
+  const sourceLinkTarget = sourceStats.isSymbolicLink() ? await withinSnapshotDeadline(deadline, `${label} source readlink`, () => fileSystem.readlink(sourcePath)) : null;
+  const canonicalPath2 = await withinSnapshotDeadline(deadline, `${label} realpath`, () => fileSystem.realpath(sourcePath));
+  const targetStats = await withinSnapshotDeadline(deadline, `${label} target lstat`, () => fileSystem.lstat(canonicalPath2));
+  if (!targetStats.isDirectory())
+    throw new Error(`${label} target is not a directory`);
+  return { sourcePath, canonicalPath: canonicalPath2, sourceStats, sourceLinkTarget, targetStats };
+}
+async function canonicalDirectoryAnchor(pathValue, label, fileSystem, deadline) {
+  const sourcePath = resolve3(pathValue);
+  try {
+    const first = await observeDirectoryAnchor(sourcePath, label, fileSystem, deadline);
+    const second = await observeDirectoryAnchor(sourcePath, label, fileSystem, deadline);
+    if (!directoryObservationsEqual(first, second)) {
+      throw new Error(`${label} changed while its directory identity was being captured`);
+    }
+    return { label, ...first };
   } catch (error) {
     if (error instanceof RepositorySnapshotError)
       throw error;
-    throw new RepositorySnapshotError("invalid_root", `${label} is unavailable: ${absolute}`, {
+    throw new RepositorySnapshotError("invalid_root", `${label} is unavailable: ${sourcePath}`, {
       cause: error
     });
   }
+}
+async function validateDirectoryAnchor(anchor, fileSystem, deadline) {
+  try {
+    const first = await observeDirectoryAnchor(anchor.sourcePath, `${anchor.label} anchor`, fileSystem, deadline);
+    const second = await observeDirectoryAnchor(anchor.sourcePath, `${anchor.label} anchor`, fileSystem, deadline);
+    if (!directoryObservationsEqual(first, second) || !directoryObservationsEqual(anchor, first)) {
+      throw new Error(`${anchor.label} anchor identity changed`);
+    }
+  } catch (error) {
+    if (error instanceof RepositorySnapshotError && (error.code === "snapshot_timeout" || error.code === "snapshot_aborted")) {
+      throw error;
+    }
+    throw new RepositorySnapshotError("repository_changed", `${anchor.label} changed while its repository snapshot was being captured`, { cause: error });
+  }
+}
+function assertRequestedRootWithinGitRoot(requested, gitRoot) {
+  const relativePath = relative(gitRoot.canonicalPath, requested.canonicalPath);
+  if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute2(relativePath)) {
+    throw new RepositorySnapshotError("invalid_root", "Requested repository path is outside the Git repository root");
+  }
+}
+async function validateRepositoryAnchors(requested, gitRoot, fileSystem, deadline) {
+  await validateDirectoryAnchor(requested, fileSystem, deadline);
+  await validateDirectoryAnchor(gitRoot, fileSystem, deadline);
+  assertRequestedRootWithinGitRoot(requested, gitRoot);
 }
 async function defaultRunGit2(repoRoot, args, options) {
   const result = await runBoundedProcess(["git", "-C", repoRoot, ...args], {
@@ -596,7 +816,9 @@ async function defaultRunGit2(repoRoot, args, options) {
     outputLimitBytes: options.outputLimitBytes,
     streamDrainTimeoutMs: 1000,
     retainOutputTail: true,
-    preserveOutputWhitespace: true
+    preserveOutputWhitespace: true,
+    ...options.signal ? { signal: options.signal } : {},
+    ...options.stdin ? { stdin: new Blob([new Uint8Array(options.stdin)]) } : {}
   });
   return result;
 }
@@ -606,27 +828,27 @@ function compactErrorOutput(value) {
     return "no diagnostic output";
   return text.length <= 1000 ? text : `${text.slice(0, 986)}...[truncated]`;
 }
-function hasTruncationMarker(result) {
-  return result.stdout.includes(OUTPUT_TRUNCATION_MARKER) || result.stderr.includes(OUTPUT_TRUNCATION_MARKER);
-}
-function assertGitResult(args, result) {
+function assertGitResult(args, result, acceptedExitCodes = [0]) {
   if (result.timedOut) {
     throw new RepositorySnapshotError("git_timeout", `Git command timed out while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: args, exitCode: result.exitCode });
   }
   if (result.drainTimedOut) {
     throw new RepositorySnapshotError("git_failed", `Git command streams did not drain while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: args, exitCode: result.exitCode });
   }
-  if (hasTruncationMarker(result)) {
+  if (result.stdoutTruncated || result.stderrTruncated) {
     throw new RepositorySnapshotError("git_output_truncated", `Git output exceeded the configured snapshot bound: git ${args.join(" ")}`, { gitArgs: args, exitCode: result.exitCode });
   }
-  if (result.exitCode !== 0) {
+  if (!acceptedExitCodes.includes(result.exitCode)) {
     throw new RepositorySnapshotError("git_failed", `Git command failed while resolving repository snapshot: git ${args.join(" ")} (${compactErrorOutput(result.stderr)})`, { gitArgs: args, exitCode: result.exitCode });
+  }
+  if (result.stdoutDecodeError || result.stderrDecodeError) {
+    throw new RepositorySnapshotError("invalid_git_output", `Git returned invalid UTF-8 while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: args, exitCode: result.exitCode });
   }
   return result;
 }
-function parseObjectId(value, label) {
+function parseObjectId(value, label, expectedWidth) {
   const oid = value.trim().split(/\r?\n/, 1)[0]?.toLowerCase() ?? "";
-  if (!/^[0-9a-f]{40,64}$/.test(oid)) {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid) || expectedWidth && oid.length !== expectedWidth) {
     throw new RepositorySnapshotError("invalid_git_output", `Git returned an invalid ${label} object ID`);
   }
   return oid;
@@ -637,9 +859,14 @@ function updateHashPart(hash, label, value) {
   hash.update(bytes);
   hash.update("\x00", "utf8");
 }
+function updateHashBytes(hash, label, value) {
+  hash.update(`${label}\x00${value.byteLength}\x00`, "utf8");
+  hash.update(value);
+  hash.update("\x00", "utf8");
+}
 function dirtyTreeFingerprint(input) {
   const hash = createHash2("sha256");
-  hash.update("pushpals-repository-snapshot-v2\x00", "utf8");
+  hash.update("pushpals-repository-snapshot-v3\x00", "utf8");
   updateHashPart(hash, "HEAD", input.revision);
   updateHashPart(hash, "status", input.status);
   updateHashPart(hash, "staged", input.stagedDiff);
@@ -647,7 +874,7 @@ function dirtyTreeFingerprint(input) {
   updateHashPart(hash, "untracked", input.untrackedFiles);
   return `dirty:sha256:${hash.digest("hex")}`;
 }
-var STATUS_ARGS = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+var STATUS_ARGS = ["status", "--porcelain=v1", "-z", "--untracked-files=no"];
 var DIFF_ARGS = [
   "diff",
   "--binary",
@@ -657,6 +884,15 @@ var DIFF_ARGS = [
   "--no-textconv",
   "--no-renames"
 ];
+var TRACKED_FILES_ARGS = ["ls-files", "--cached", "--stage", "--full-name", "-z"];
+var UNTRACKED_DIRECTORIES_ARGS = [
+  "ls-files",
+  "--others",
+  "--directory",
+  "--exclude-standard",
+  "--full-name",
+  "-z"
+];
 var UNTRACKED_FILES_ARGS = [
   "ls-files",
   "--others",
@@ -664,6 +900,7 @@ var UNTRACKED_FILES_ARGS = [
   "--full-name",
   "-z"
 ];
+var CHECK_IGNORE_ARGS = ["check-ignore", "--no-index", "--stdin", "-z"];
 function parseNullTerminatedPaths(value, args) {
   if (!value)
     return [];
@@ -676,81 +913,766 @@ function parseNullTerminatedPaths(value, args) {
   }
   return paths;
 }
-function pathArgumentChunks(paths) {
-  const chunks = [];
-  let chunk = [];
-  let chunkBytes = 0;
-  for (const path of paths) {
-    const pathBytes = Buffer.byteLength(path, "utf8") + 1;
-    if (chunk.length > 0 && (chunk.length >= MAX_HASH_PATHS_PER_INVOCATION || chunkBytes + pathBytes > MAX_HASH_PATH_ARGUMENT_BYTES)) {
-      chunks.push(chunk);
-      chunk = [];
-      chunkBytes = 0;
+function parseTrackedIndexEntries(value, expectedWidth) {
+  const records = parseNullTerminatedPaths(value, TRACKED_FILES_ARGS);
+  return records.map((record) => {
+    const match = record.match(/^([0-7]{6}) ((?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})) ([0-3])\t([\s\S]+)$/);
+    if (!match || match[2].length !== expectedWidth) {
+      throw new RepositorySnapshotError("invalid_git_output", "Git returned an invalid tracked index entry", { gitArgs: [...TRACKED_FILES_ARGS] });
     }
-    chunk.push(path);
-    chunkBytes += pathBytes;
-  }
-  if (chunk.length > 0)
-    chunks.push(chunk);
-  return chunks;
+    return {
+      path: match[4],
+      identity: `${match[1]} ${match[2].toLowerCase()} ${match[3]}`
+    };
+  });
 }
-function parseObjectIdList(value, expectedCount, args) {
-  const lines = value.split(/\r?\n/);
-  if (lines.at(-1) === "")
-    lines.pop();
-  const objectIds = lines.map((line) => line.toLowerCase());
-  if (objectIds.length !== expectedCount || objectIds.some((objectId) => !/^[0-9a-f]{40,64}$/.test(objectId))) {
-    throw new RepositorySnapshotError("invalid_git_output", `Git returned an invalid untracked-file object ID list: git ${args.join(" ")}`, { gitArgs: [...args] });
+function lexicalRepositoryPath(root, repositoryPath, args) {
+  const absolute = resolve3(root, repositoryPath);
+  const relativePath = relative(root, absolute);
+  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute2(relativePath)) {
+    throw new RepositorySnapshotError("invalid_git_output", `Git returned a path outside the repository: ${repositoryPath}`, { gitArgs: [...args] });
   }
-  return objectIds;
-}
-async function captureUntrackedFiles(root, run, outputLimitBytes) {
-  const listResult = await run(root, UNTRACKED_FILES_ARGS, outputLimitBytes);
-  const paths = parseNullTerminatedPaths(listResult.stdout, UNTRACKED_FILES_ARGS);
-  const hash = createHash2("sha256");
-  hash.update("pushpals-repository-untracked-files-v1\x00", "utf8");
-  const objectIdsByPath = new Map;
-  const filePaths = paths.filter((path) => !path.endsWith("/"));
-  for (const pathChunk of pathArgumentChunks(filePaths)) {
-    const args = ["hash-object", "--no-filters", "--", ...pathChunk];
-    const result = await run(root, args, SMALL_GIT_OUTPUT_LIMIT_BYTES);
-    const objectIds = parseObjectIdList(result.stdout, pathChunk.length, args);
-    for (let index = 0;index < pathChunk.length; index += 1) {
-      objectIdsByPath.set(pathChunk[index], objectIds[index]);
-    }
+  const segments = relativePath.split(sep);
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new RepositorySnapshotError("invalid_git_output", `Git returned an invalid repository path: ${repositoryPath}`, { gitArgs: [...args] });
   }
-  for (const path of paths) {
-    updateHashPart(hash, "path", path);
-    updateHashPart(hash, "blob", objectIdsByPath.get(path) ?? "nested-repository-directory");
-  }
-  return `sha256:${hash.digest("hex")}`;
-}
-async function captureDirtyState(root, run, outputLimitBytes) {
-  const [stagedResult, unstagedResult, untrackedFiles] = await Promise.all([
-    run(root, [...DIFF_ARGS.slice(0, 1), "--cached", ...DIFF_ARGS.slice(1)], outputLimitBytes),
-    run(root, DIFF_ARGS, outputLimitBytes),
-    captureUntrackedFiles(root, run, outputLimitBytes)
-  ]);
   return {
-    stagedDiff: stagedResult.stdout,
-    unstagedDiff: unstagedResult.stdout,
-    untrackedFiles
+    path: segments.join("/"),
+    absolutePath: absolute,
+    segments
   };
 }
-function dirtyStatesEqual(left, right) {
-  return left.stagedDiff === right.stagedDiff && left.unstagedDiff === right.unstagedDiff && left.untrackedFiles === right.untrackedFiles;
+function stableStatsEqual(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
-async function resolveRepositorySnapshot(repoRoot, options = {}) {
-  const requestedRoot = canonicalDirectory(repoRoot, "Repository root");
-  const timeoutMs = normalizePositiveInt(options.timeoutMs, DEFAULT_GIT_TIMEOUT_MS, 100, 30000);
-  const diffOutputLimitBytes = normalizePositiveInt(options.diffOutputLimitBytes, DEFAULT_DIFF_OUTPUT_LIMIT_BYTES, 64 * 1024, MAX_DIFF_OUTPUT_LIMIT_BYTES);
-  const runGit = options.runGit ?? defaultRunGit2;
-  const run = async (root2, args, outputLimitBytes) => {
+function sameFileIdentity(left, right) {
+  return left.isFile() && right.isFile() && left.dev === right.dev && left.ino === right.ino;
+}
+function untrackedGitMode(stats) {
+  if (process.platform === "win32")
+    return "100644";
+  return (stats.mode & 0o111n) !== 0n ? "100755" : "100644";
+}
+function repositoryChanged(path, cause) {
+  return new RepositorySnapshotError("repository_changed", `Repository path changed while resolving its dirty snapshot: ${path}`, { gitArgs: [...UNTRACKED_FILES_ARGS], cause });
+}
+function isUnavailablePathError(error) {
+  if (typeof error !== "object" || error === null || !("code" in error))
+    return false;
+  const code = error.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+function indirectionIdentity(path, target) {
+  const hash = createHash2("sha256");
+  hash.update("pushpals-repository-indirection-v2\x00", "utf8");
+  updateHashPart(hash, "path", path);
+  updateHashBytes(hash, "target", target);
+  return `indirection:sha256:${hash.digest("hex")}`;
+}
+
+class RepositoryPathInspector {
+  root;
+  fileSystem;
+  deadline;
+  prefixes = new Map;
+  constructor(root, fileSystem, deadline) {
+    this.root = root;
+    this.fileSystem = fileSystem;
+    this.deadline = deadline;
+  }
+  async inspectPrefix(path, absolutePath, allowUnavailable, knownStats) {
+    const existing = this.prefixes.get(path);
+    if (existing)
+      return await existing;
+    const pending = (async () => {
+      let stats;
+      try {
+        stats = knownStats ?? await withinSnapshotDeadline(this.deadline, `lstat ${path}`, () => this.fileSystem.lstat(absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        if (allowUnavailable && isUnavailablePathError(error)) {
+          return { kind: "unavailable", path, absolutePath, stats: null };
+        }
+        throw repositoryChanged(path, error);
+      }
+      if (stats.isSymbolicLink()) {
+        let target;
+        let verified;
+        try {
+          target = await withinSnapshotDeadline(this.deadline, `readlink ${path}`, () => this.fileSystem.readlink(absolutePath));
+          verified = await withinSnapshotDeadline(this.deadline, `revalidate indirection ${path}`, () => this.fileSystem.lstat(absolutePath));
+        } catch (error) {
+          if (error instanceof RepositorySnapshotError)
+            throw error;
+          throw repositoryChanged(path, error);
+        }
+        if (!verified.isSymbolicLink() || !stableStatsEqual(stats, verified)) {
+          throw repositoryChanged(path);
+        }
+        return {
+          kind: "indirection",
+          path,
+          absolutePath,
+          stats,
+          target,
+          identity: indirectionIdentity(path, target)
+        };
+      }
+      if (!stats.isDirectory()) {
+        if (allowUnavailable) {
+          return { kind: "unavailable", path, absolutePath, stats };
+        }
+        throw repositoryChanged(path);
+      }
+      return { kind: "directory", path, absolutePath, stats };
+    })();
+    this.prefixes.set(path, pending);
+    return await pending;
+  }
+  async inspectAncestors(lexical, options = {}) {
+    let absolutePath = this.root;
+    const traversed = [];
+    for (const segment of lexical.segments.slice(0, -1)) {
+      remainingSnapshotMs(this.deadline, `inspect path ${lexical.path}`);
+      traversed.push(segment);
+      absolutePath = join(absolutePath, segment);
+      const prefix = await this.inspectPrefix(traversed.join("/"), absolutePath, options.allowUnavailable === true);
+      if (prefix.kind === "indirection")
+        return prefix;
+      if (prefix.kind === "unavailable") {
+        if (options.allowUnavailable)
+          return null;
+        throw repositoryChanged(prefix.path);
+      }
+    }
+    return null;
+  }
+  async inspectUntracked(lexical) {
+    const ancestor = await this.inspectAncestors(lexical);
+    if (ancestor)
+      return ancestor;
+    let stats;
     try {
-      return assertGitResult([...args], await runGit(root2, [...args], { timeoutMs, outputLimitBytes }));
+      stats = await withinSnapshotDeadline(this.deadline, `lstat ${lexical.path}`, () => this.fileSystem.lstat(lexical.absolutePath));
     } catch (error) {
       if (error instanceof RepositorySnapshotError)
         throw error;
+      throw repositoryChanged(lexical.path, error);
+    }
+    if (stats.isSymbolicLink()) {
+      const boundary = await this.inspectPrefix(lexical.path, lexical.absolutePath, false, stats);
+      if (boundary.kind !== "indirection")
+        throw repositoryChanged(lexical.path);
+      return boundary;
+    }
+    if (stats.isDirectory()) {
+      await this.inspectPrefix(lexical.path, lexical.absolutePath, false, stats);
+      return { kind: "directory", lexical };
+    }
+    if (stats.isFile())
+      return { kind: "file", lexical, stats };
+    return { kind: "special", lexical, stats };
+  }
+  async inspectDirectoryCandidate(lexical) {
+    const inspected = await this.inspectUntracked(lexical);
+    if (inspected.kind === "indirection")
+      return inspected;
+    if (inspected.kind === "directory")
+      return inspected;
+    return null;
+  }
+  async validatePrefixes() {
+    for (const pending of this.prefixes.values()) {
+      remainingSnapshotMs(this.deadline, "validate repository path prefixes");
+      const prefix = await pending;
+      if (prefix.kind === "unavailable") {
+        try {
+          const stats2 = await withinSnapshotDeadline(this.deadline, `revalidate unavailable path ${prefix.path}`, () => this.fileSystem.lstat(prefix.absolutePath));
+          if (prefix.stats === null || !stableStatsEqual(prefix.stats, stats2)) {
+            throw repositoryChanged(prefix.path);
+          }
+        } catch (error) {
+          if (error instanceof RepositorySnapshotError)
+            throw error;
+          if (prefix.stats === null && isUnavailablePathError(error))
+            continue;
+          throw repositoryChanged(prefix.path, error);
+        }
+        continue;
+      }
+      let stats;
+      try {
+        stats = await withinSnapshotDeadline(this.deadline, `revalidate ${prefix.path}`, () => this.fileSystem.lstat(prefix.absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(prefix.path, error);
+      }
+      if (!stableStatsEqual(prefix.stats, stats))
+        throw repositoryChanged(prefix.path);
+      if (prefix.kind === "directory") {
+        if (!stats.isDirectory())
+          throw repositoryChanged(prefix.path);
+        continue;
+      }
+      if (!stats.isSymbolicLink())
+        throw repositoryChanged(prefix.path);
+      let target;
+      try {
+        target = await withinSnapshotDeadline(this.deadline, `revalidate readlink ${prefix.path}`, () => this.fileSystem.readlink(prefix.absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(prefix.path, error);
+      }
+      if (!target.equals(prefix.target))
+        throw repositoryChanged(prefix.path);
+    }
+  }
+}
+function pathInputChunks(paths) {
+  const chunks = [];
+  let current = [];
+  let currentBytes = 0;
+  for (const path of paths) {
+    const bytes = Buffer.byteLength(path, "utf8") + 1;
+    if (bytes > MAX_BOUNDARY_PATHSPEC_BYTES) {
+      throw new RepositorySnapshotError("git_output_truncated", `Repository path exceeds the bounded Git input size: ${path}`);
+    }
+    if (current.length > 0 && currentBytes + bytes > MAX_BOUNDARY_PATHSPEC_BYTES) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(path);
+    currentBytes += bytes;
+  }
+  if (current.length > 0)
+    chunks.push(current);
+  return chunks;
+}
+async function checkIgnoredPaths(root, paths, run, outputLimitBytes, deadline) {
+  const ignored = new Set;
+  for (const chunk of pathInputChunks(paths)) {
+    remainingSnapshotMs(deadline, "check ignored untracked paths");
+    const stdin = Buffer.from(`${chunk.join("\x00")}\x00`, "utf8");
+    const result = await run(root, CHECK_IGNORE_ARGS, outputLimitBytes, {
+      acceptedExitCodes: [0, 1],
+      stdin
+    });
+    if (result.exitCode === 1) {
+      if (result.stdout) {
+        throw new RepositorySnapshotError("invalid_git_output", "Git returned ignored paths with a no-match exit code", { gitArgs: [...CHECK_IGNORE_ARGS] });
+      }
+      continue;
+    }
+    const expected = new Set(chunk);
+    for (const repositoryPath of parseNullTerminatedPaths(result.stdout, CHECK_IGNORE_ARGS)) {
+      const normalized = lexicalRepositoryPath(root, repositoryPath, CHECK_IGNORE_ARGS).path;
+      if (!expected.has(normalized)) {
+        throw new RepositorySnapshotError("invalid_git_output", `Git returned an unexpected ignored path: ${repositoryPath}`, { gitArgs: [...CHECK_IGNORE_ARGS] });
+      }
+      ignored.add(normalized);
+    }
+  }
+  return ignored;
+}
+function stableStatsToken(stats) {
+  const kind = stats.isDirectory() ? "directory" : stats.isFile() ? "file" : stats.isSymbolicLink() ? "symlink" : "special";
+  return [kind, stats.dev, stats.ino, stats.mode, stats.size, stats.mtimeNs, stats.ctimeNs].join(":");
+}
+async function captureNestedRepositoryMarker(root, directory, markerName, fileSystem, deadline) {
+  const marker = lexicalRepositoryPath(root, `${directory.path}/${markerName}`, [
+    "nested-repository-marker"
+  ]);
+  let stats;
+  try {
+    stats = await withinSnapshotDeadline(deadline, `lstat ${marker.path}`, () => fileSystem.lstat(marker.absolutePath));
+  } catch (error) {
+    if (error instanceof RepositorySnapshotError)
+      throw error;
+    throw repositoryChanged(marker.path, error);
+  }
+  if (stats.isSymbolicLink() || !stats.isDirectory() && !stats.isFile())
+    return null;
+  const hash = createHash2("sha256");
+  hash.update("pushpals-nested-repository-marker-v1\x00", "utf8");
+  updateHashPart(hash, "path", marker.path);
+  updateHashPart(hash, "marker", stableStatsToken(stats));
+  if (stats.isFile()) {
+    const content = await hashUntrackedFile(root, marker, stats, "sha256", fileSystem, deadline);
+    updateHashPart(hash, "gitfile", content);
+    return {
+      path: marker.path,
+      absolutePath: marker.absolutePath,
+      identity: `git-marker:sha256:${hash.digest("hex")}`,
+      directory,
+      markerName
+    };
+  }
+  let children;
+  try {
+    children = await withinSnapshotDeadline(deadline, `readdir ${marker.path}`, () => fileSystem.readdir(marker.absolutePath));
+  } catch (error) {
+    if (error instanceof RepositorySnapshotError)
+      throw error;
+    throw repositoryChanged(marker.path, error);
+  }
+  if (children.length > MAX_NESTED_GIT_MARKER_ENTRIES) {
+    throw new RepositorySnapshotError("git_output_truncated", `Nested repository marker inspection exceeded ${MAX_NESTED_GIT_MARKER_ENTRIES} entries`);
+  }
+  const sortedChildren = children.map((child) => ({ child, sortKey: Buffer.from(child.name, "utf8") })).sort((left, right) => Buffer.compare(left.sortKey, right.sortKey));
+  const childStats = [];
+  for (const { child } of sortedChildren) {
+    remainingSnapshotMs(deadline, `inspect ${marker.path}`);
+    if (!child.name || child.name === "." || child.name === ".." || child.name.includes("/") || process.platform === "win32" && child.name.includes("\\")) {
+      throw repositoryChanged(marker.path);
+    }
+    const childPath = `${marker.path}/${child.name}`;
+    const absolutePath = join(marker.absolutePath, child.name);
+    let observed;
+    try {
+      observed = await withinSnapshotDeadline(deadline, `lstat ${childPath}`, () => fileSystem.lstat(absolutePath));
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw repositoryChanged(childPath, error);
+    }
+    updateHashPart(hash, "child-name", child.name);
+    updateHashPart(hash, "child-state", stableStatsToken(observed));
+    childStats.push({ path: childPath, absolutePath, stats: observed });
+  }
+  let verifiedMarker;
+  try {
+    verifiedMarker = await withinSnapshotDeadline(deadline, `revalidate ${marker.path}`, () => fileSystem.lstat(marker.absolutePath));
+  } catch (error) {
+    if (error instanceof RepositorySnapshotError)
+      throw error;
+    throw repositoryChanged(marker.path, error);
+  }
+  if (!verifiedMarker.isDirectory() || !stableStatsEqual(stats, verifiedMarker)) {
+    throw repositoryChanged(marker.path);
+  }
+  for (const child of childStats) {
+    let verified;
+    try {
+      verified = await withinSnapshotDeadline(deadline, `revalidate ${child.path}`, () => fileSystem.lstat(child.absolutePath));
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw repositoryChanged(child.path, error);
+    }
+    if (!stableStatsEqual(child.stats, verified))
+      throw repositoryChanged(child.path);
+  }
+  return {
+    path: marker.path,
+    absolutePath: marker.absolutePath,
+    identity: `git-marker:sha256:${hash.digest("hex")}`,
+    directory,
+    markerName
+  };
+}
+async function validateNestedRepositoryMarker(root, expected, fileSystem, deadline) {
+  const current = await captureNestedRepositoryMarker(root, expected.directory, expected.markerName, fileSystem, deadline);
+  if (!current || current.identity !== expected.identity) {
+    throw repositoryChanged(expected.path);
+  }
+}
+async function isValidatedNestedRepository(root, directory, children, run, fileSystem, deadline) {
+  const marker = children.find((child) => process.platform === "win32" ? child.name.toLowerCase() === ".git" : child.name === ".git");
+  if (!marker || marker.isSymbolicLink())
+    return null;
+  let ordinaryMarker = marker.isDirectory() || marker.isFile();
+  if (!ordinaryMarker) {
+    try {
+      const stats = await withinSnapshotDeadline(deadline, `lstat ${directory.path}/.git`, () => fileSystem.lstat(join(directory.absolutePath, marker.name)));
+      ordinaryMarker = !stats.isSymbolicLink() && (stats.isDirectory() || stats.isFile());
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw repositoryChanged(`${directory.path}/.git`, error);
+    }
+  }
+  if (!ordinaryMarker)
+    return null;
+  const markerBefore = await captureNestedRepositoryMarker(root, directory, marker.name, fileSystem, deadline);
+  if (!markerBefore)
+    return null;
+  const args = ["-C", directory.absolutePath, "rev-parse", "--show-toplevel"];
+  const result = await run(root, args, SMALL_GIT_OUTPUT_LIMIT_BYTES, {
+    acceptedExitCodes: [0, 128]
+  });
+  await validateNestedRepositoryMarker(root, markerBefore, fileSystem, deadline);
+  if (result.exitCode !== 0)
+    return null;
+  const reported = result.stdout.trim().split(/\r?\n/, 1)[0] ?? "";
+  if (!reported) {
+    throw new RepositorySnapshotError("invalid_git_output", "Git returned an empty nested repository top-level path", { gitArgs: args });
+  }
+  let canonicalReported;
+  let canonicalDirectoryPath;
+  try {
+    [canonicalReported, canonicalDirectoryPath] = await Promise.all([
+      withinSnapshotDeadline(deadline, `realpath nested root ${directory.path}`, () => fileSystem.realpath(reported)),
+      withinSnapshotDeadline(deadline, `realpath nested directory ${directory.path}`, () => fileSystem.realpath(directory.absolutePath))
+    ]);
+  } catch (error) {
+    if (error instanceof RepositorySnapshotError)
+      throw error;
+    throw repositoryChanged(directory.path, error);
+  }
+  if (comparableFileSystemPath(canonicalReported) !== comparableFileSystemPath(canonicalDirectoryPath)) {
+    return null;
+  }
+  const headArgs = ["-C", directory.absolutePath, "rev-parse", "--verify", "HEAD^{commit}"];
+  const headResult = await run(root, headArgs, SMALL_GIT_OUTPUT_LIMIT_BYTES, {
+    acceptedExitCodes: [0, 128]
+  });
+  await validateNestedRepositoryMarker(root, markerBefore, fileSystem, deadline);
+  if (headResult.exitCode !== 0)
+    return null;
+  return {
+    ...markerBefore,
+    head: parseObjectId(headResult.stdout, "nested HEAD commit")
+  };
+}
+async function validateNestedRepositoryAnchor(root, expected, run, fileSystem, deadline) {
+  await validateNestedRepositoryMarker(root, expected, fileSystem, deadline);
+  const headArgs = [
+    "-C",
+    expected.directory.absolutePath,
+    "rev-parse",
+    "--verify",
+    "HEAD^{commit}"
+  ];
+  const headResult = await run(root, headArgs, SMALL_GIT_OUTPUT_LIMIT_BYTES);
+  await validateNestedRepositoryMarker(root, expected, fileSystem, deadline);
+  const head = parseObjectId(headResult.stdout, "nested HEAD commit", expected.head.length);
+  if (head !== expected.head)
+    throw repositoryChanged(expected.directory.path);
+}
+async function discoverNestedIndirectionCandidates(root, directoryRoots, run, outputLimitBytes, inspector, fileSystem, deadline) {
+  const candidates = new Map;
+  const nestedRepositoryMarkers = [];
+  let currentLevel = [...directoryRoots];
+  const visited = new Set;
+  let inspectedEntries = 0;
+  while (currentLevel.length > 0) {
+    const levelCandidates = [];
+    for (const directory of currentLevel) {
+      remainingSnapshotMs(deadline, "scan untracked directory boundaries");
+      if (visited.has(directory.path))
+        continue;
+      visited.add(directory.path);
+      let children;
+      try {
+        children = await withinSnapshotDeadline(deadline, `readdir ${directory.path}`, () => fileSystem.readdir(directory.absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(directory.path, error);
+      }
+      inspectedEntries += children.length;
+      if (inspectedEntries > MAX_UNTRACKED_DIRECTORY_SCAN_ENTRIES) {
+        throw new RepositorySnapshotError("git_output_truncated", `Untracked directory inspection exceeded ${MAX_UNTRACKED_DIRECTORY_SCAN_ENTRIES} entries`);
+      }
+      const nestedRepositoryMarker = await isValidatedNestedRepository(root, directory, children, run, fileSystem, deadline);
+      if (nestedRepositoryMarker) {
+        nestedRepositoryMarkers.push(nestedRepositoryMarker);
+        continue;
+      }
+      const sortedChildren = children.map((child) => ({ child, sortKey: Buffer.from(child.name, "utf8") })).sort((left, right) => Buffer.compare(left.sortKey, right.sortKey));
+      remainingSnapshotMs(deadline, `sort entries below ${directory.path}`);
+      for (const { child } of sortedChildren) {
+        remainingSnapshotMs(deadline, "inspect nested untracked boundary");
+        if (!child.name || child.name === "." || child.name === ".." || child.name.includes("/") || process.platform === "win32" && child.name.includes("\\")) {
+          throw repositoryChanged(directory.path);
+        }
+        const knownNonDirectory = child.isFile() || child.isBlockDevice() || child.isCharacterDevice() || child.isFIFO() || child.isSocket();
+        if (knownNonDirectory)
+          continue;
+        levelCandidates.push(lexicalRepositoryPath(root, `${directory.path}/${child.name}`, UNTRACKED_DIRECTORIES_ARGS));
+      }
+    }
+    const ignored = await checkIgnoredPaths(root, levelCandidates.map((candidate) => candidate.path), run, outputLimitBytes, deadline);
+    const nextLevel = [];
+    for (const lexical of levelCandidates) {
+      remainingSnapshotMs(deadline, "classify nested untracked boundary");
+      if (ignored.has(lexical.path))
+        continue;
+      const inspected = await inspector.inspectDirectoryCandidate(lexical);
+      if (!inspected)
+        continue;
+      if (inspected.kind === "indirection")
+        candidates.set(inspected.path, inspected);
+      else
+        nextLevel.push(inspected.lexical);
+    }
+    currentLevel = nextLevel;
+  }
+  return { boundaries: candidates, nestedRepositoryMarkers };
+}
+function comparableFileSystemPath(value) {
+  const normalized = value.replace(/\\/g, "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+async function assertOpenedFileIsLexical(root, lexical, expected, handleStats, fileSystem, deadline) {
+  let canonical;
+  let current;
+  try {
+    [canonical, current] = await Promise.all([
+      withinSnapshotDeadline(deadline, `realpath ${lexical.path}`, () => fileSystem.realpath(lexical.absolutePath)),
+      withinSnapshotDeadline(deadline, `revalidate file ${lexical.path}`, () => fileSystem.lstat(lexical.absolutePath))
+    ]);
+  } catch (error) {
+    if (error instanceof RepositorySnapshotError)
+      throw error;
+    throw repositoryChanged(lexical.path, error);
+  }
+  const canonicalRelative = relative(root, canonical);
+  if (!canonicalRelative || canonicalRelative === ".." || canonicalRelative.startsWith(`..${sep}`) || isAbsolute2(canonicalRelative) || comparableFileSystemPath(canonical) !== comparableFileSystemPath(lexical.absolutePath) || !stableStatsEqual(expected, current) || !sameFileIdentity(expected, current) || !sameFileIdentity(current, handleStats)) {
+    throw repositoryChanged(lexical.path);
+  }
+  return current;
+}
+async function openSnapshotFile(lexical, fileSystem, deadline) {
+  const noFollow = Number(fsConstants.O_NOFOLLOW ?? 0);
+  remainingSnapshotMs(deadline, `open ${lexical.path}`);
+  const pending = fileSystem.open(lexical.absolutePath, fsConstants.O_RDONLY | noFollow);
+  try {
+    return await withinSnapshotDeadline(deadline, `open ${lexical.path}`, () => pending);
+  } catch (error) {
+    pending.then(async (handle) => await handle.close(), () => {
+      return;
+    });
+    if (error instanceof RepositorySnapshotError)
+      throw error;
+    throw repositoryChanged(lexical.path, error);
+  }
+}
+async function hashUntrackedFile(root, lexical, expected, objectHashAlgorithm, fileSystem, deadline) {
+  const handle = await openSnapshotFile(lexical, fileSystem, deadline);
+  try {
+    let before;
+    try {
+      before = await withinSnapshotDeadline(deadline, `fstat ${lexical.path}`, () => handle.stat({ bigint: true }));
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw repositoryChanged(lexical.path, error);
+    }
+    await assertOpenedFileIsLexical(root, lexical, expected, before, fileSystem, deadline);
+    const hash = createHash2(objectHashAlgorithm);
+    hash.update(`blob ${before.size.toString()}\x00`, "utf8");
+    const buffer = Buffer.allocUnsafe(FILE_READ_BUFFER_BYTES);
+    let bytesReadTotal = 0n;
+    while (true) {
+      let bytesRead;
+      try {
+        ({ bytesRead } = await withinSnapshotDeadline(deadline, `read ${lexical.path}`, () => handle.read(buffer, 0, buffer.length, null)));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(lexical.path, error);
+      }
+      if (bytesRead === 0)
+        break;
+      bytesReadTotal += BigInt(bytesRead);
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+    let after;
+    try {
+      after = await withinSnapshotDeadline(deadline, `post-read fstat ${lexical.path}`, () => handle.stat({ bigint: true }));
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw repositoryChanged(lexical.path, error);
+    }
+    if (bytesReadTotal !== before.size || !stableStatsEqual(before, after)) {
+      throw repositoryChanged(lexical.path);
+    }
+    await assertOpenedFileIsLexical(root, lexical, expected, after, fileSystem, deadline);
+    return hash.digest("hex");
+  } finally {
+    const closing = handle.close();
+    try {
+      await withinSnapshotDeadline(deadline, `close ${lexical.path}`, () => closing);
+    } catch {
+      closing.catch(() => {
+        return;
+      });
+    }
+  }
+}
+function boundaryPathspecArgs(boundaryPaths) {
+  if (boundaryPaths.length === 0)
+    return [];
+  const sorted = [...boundaryPaths].sort((left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  const bytes = sorted.reduce((total, path) => total + Buffer.byteLength(path, "utf8") + 32, 0);
+  if (bytes > MAX_BOUNDARY_PATHSPEC_BYTES) {
+    throw new RepositorySnapshotError("git_output_truncated", "Repository indirection exclusions exceed the bounded Git pathspec size");
+  }
+  return ["--", ".", ...sorted.map((path) => `:(top,exclude,literal)${path}`)];
+}
+function worktreeEntriesFingerprint(entries) {
+  if (entries.size === 0)
+    return "";
+  const hash = createHash2("sha256");
+  hash.update("pushpals-repository-worktree-entries-v3\x00", "utf8");
+  const sorted = [...entries].sort(([left], [right]) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  for (const [path, identity] of sorted) {
+    updateHashPart(hash, "path", path);
+    updateHashPart(hash, "identity", identity);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+function boundaryIndexIdentity(entries) {
+  const hash = createHash2("sha256");
+  hash.update("pushpals-repository-boundary-index-v1\x00", "utf8");
+  const sorted = [...entries].sort((left, right) => {
+    const pathOrder = Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8"));
+    return pathOrder || left.identity.localeCompare(right.identity);
+  });
+  for (const entry of sorted) {
+    updateHashPart(hash, "path", entry.path);
+    updateHashPart(hash, "index", entry.identity);
+  }
+  return `index:sha256:${hash.digest("hex")}`;
+}
+function nestedRepositoryMarkerFingerprint(markers) {
+  if (markers.length === 0)
+    return "";
+  const hash = createHash2("sha256");
+  hash.update("pushpals-nested-repository-markers-v2\x00", "utf8");
+  const sorted = [...markers].sort((left, right) => Buffer.compare(Buffer.from(left.path, "utf8"), Buffer.from(right.path, "utf8")));
+  for (const marker of sorted) {
+    updateHashPart(hash, "path", marker.path);
+    updateHashPart(hash, "identity", marker.identity);
+    updateHashPart(hash, "head", marker.head);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+async function captureDirtyState(root, run, outputLimitBytes, objectHashAlgorithm, objectIdWidth, fileSystem, deadline) {
+  const inspector = new RepositoryPathInspector(root, fileSystem, deadline);
+  const boundaries = new Map;
+  const trackedBoundaries = new Map;
+  const trackedEntriesByBoundary = new Map;
+  const entries = new Map;
+  const untrackedDirectoryRoots = [];
+  const trackedResult = await run(root, TRACKED_FILES_ARGS, outputLimitBytes);
+  const trackedEntries = parseTrackedIndexEntries(trackedResult.stdout, objectIdWidth);
+  for (const trackedEntry of trackedEntries) {
+    remainingSnapshotMs(deadline, "inspect tracked path boundaries");
+    const lexical = lexicalRepositoryPath(root, trackedEntry.path, TRACKED_FILES_ARGS);
+    const boundary = await inspector.inspectAncestors(lexical, { allowUnavailable: true });
+    if (!boundary)
+      continue;
+    boundaries.set(boundary.path, boundary);
+    trackedBoundaries.set(boundary.path, boundary);
+    const entriesForBoundary = trackedEntriesByBoundary.get(boundary.path) ?? [];
+    entriesForBoundary.push({ path: lexical.path, identity: trackedEntry.identity });
+    trackedEntriesByBoundary.set(boundary.path, entriesForBoundary);
+  }
+  const trackedExclusions = boundaryPathspecArgs([...trackedBoundaries.keys()]);
+  const untrackedDirectoriesArgs = [...UNTRACKED_DIRECTORIES_ARGS, ...trackedExclusions];
+  const untrackedDirectoriesResult = await run(root, untrackedDirectoriesArgs, outputLimitBytes);
+  const untrackedDirectories = parseNullTerminatedPaths(untrackedDirectoriesResult.stdout, untrackedDirectoriesArgs);
+  for (const repositoryPath of untrackedDirectories) {
+    remainingSnapshotMs(deadline, "inspect untracked directory boundaries");
+    const lexical = lexicalRepositoryPath(root, repositoryPath, untrackedDirectoriesArgs);
+    const inspected = await inspector.inspectDirectoryCandidate(lexical);
+    if (inspected?.kind === "indirection")
+      boundaries.set(inspected.path, inspected);
+    else if (inspected?.kind === "directory")
+      untrackedDirectoryRoots.push(inspected.lexical);
+  }
+  const nestedCandidates = await discoverNestedIndirectionCandidates(root, untrackedDirectoryRoots, run, outputLimitBytes, inspector, fileSystem, deadline);
+  for (const boundary of nestedCandidates.boundaries.values()) {
+    boundaries.set(boundary.path, boundary);
+  }
+  const opaqueNestedRepositoryPaths = nestedCandidates.nestedRepositoryMarkers.map((marker) => marker.directory.path);
+  const untrackedArgs = [
+    ...UNTRACKED_FILES_ARGS,
+    ...boundaryPathspecArgs([...boundaries.keys(), ...opaqueNestedRepositoryPaths])
+  ];
+  const untrackedResult = await run(root, untrackedArgs, outputLimitBytes);
+  const untrackedPaths = parseNullTerminatedPaths(untrackedResult.stdout, untrackedArgs);
+  for (const repositoryPath of untrackedPaths) {
+    remainingSnapshotMs(deadline, "inspect untracked files");
+    const lexical = lexicalRepositoryPath(root, repositoryPath, untrackedArgs);
+    const inspected = await inspector.inspectUntracked(lexical);
+    if (inspected.kind === "indirection") {
+      boundaries.set(inspected.path, inspected);
+      continue;
+    }
+    if (inspected.kind === "directory") {
+      entries.set(inspected.lexical.path, "nested-repository-directory");
+      continue;
+    }
+    if (inspected.kind === "special") {
+      entries.set(inspected.lexical.path, `special-file-mode:${inspected.stats.mode.toString(8)}`);
+      continue;
+    }
+    const blob = await hashUntrackedFile(root, inspected.lexical, inspected.stats, objectHashAlgorithm, fileSystem, deadline);
+    entries.set(inspected.lexical.path, `${untrackedGitMode(inspected.stats)}:${blob}`);
+  }
+  for (const boundary of boundaries.values()) {
+    const trackedUnderBoundary = trackedEntriesByBoundary.get(boundary.path) ?? [];
+    entries.set(boundary.path, trackedUnderBoundary.length > 0 ? `${boundary.identity}:${boundaryIndexIdentity(trackedUnderBoundary)}` : boundary.identity);
+  }
+  for (const marker of nestedCandidates.nestedRepositoryMarkers) {
+    entries.set(marker.directory.path, `nested-repository:${marker.identity}:head:${marker.head}`);
+  }
+  const exclusions = trackedExclusions;
+  const stagedArgs = [...DIFF_ARGS.slice(0, 1), "--cached", ...DIFF_ARGS.slice(1), ...exclusions];
+  const statusArgs = [...STATUS_ARGS, ...exclusions];
+  const unstagedArgs = [...DIFF_ARGS, ...exclusions];
+  const statusResult = await run(root, statusArgs, outputLimitBytes);
+  const stagedResult = await run(root, stagedArgs, outputLimitBytes);
+  const unstagedResult = await run(root, unstagedArgs, outputLimitBytes);
+  await inspector.validatePrefixes();
+  for (const marker of nestedCandidates.nestedRepositoryMarkers) {
+    await validateNestedRepositoryAnchor(root, marker, run, fileSystem, deadline);
+  }
+  return {
+    status: statusResult.stdout,
+    stagedDiff: stagedResult.stdout,
+    unstagedDiff: unstagedResult.stdout,
+    untrackedFiles: worktreeEntriesFingerprint(entries),
+    classificationState: nestedRepositoryMarkerFingerprint(nestedCandidates.nestedRepositoryMarkers)
+  };
+}
+function dirtyStatesEqual(left, right) {
+  return left.status === right.status && left.stagedDiff === right.stagedDiff && left.unstagedDiff === right.unstagedDiff && left.untrackedFiles === right.untrackedFiles && left.classificationState === right.classificationState;
+}
+async function resolveRepositorySnapshot(repoRoot, options = {}) {
+  const timeoutMs = normalizePositiveInt(options.timeoutMs, DEFAULT_SNAPSHOT_TIMEOUT_MS, 100, 30000);
+  const deadline = {
+    deadlineAtMs: Date.now() + timeoutMs,
+    ...options.signal ? { signal: options.signal } : {}
+  };
+  const fileSystem = options.fileSystem ?? defaultFileSystem;
+  const requestedRootAnchor = await canonicalDirectoryAnchor(repoRoot, "Repository root", fileSystem, deadline);
+  const requestedRoot = requestedRootAnchor.canonicalPath;
+  const diffOutputLimitBytes = normalizePositiveInt(options.diffOutputLimitBytes, DEFAULT_DIFF_OUTPUT_LIMIT_BYTES, 64 * 1024, MAX_DIFF_OUTPUT_LIMIT_BYTES);
+  const runGit = options.runGit ?? defaultRunGit2;
+  const run = async (root2, args, outputLimitBytes, invocationOptions = {}) => {
+    try {
+      const invocationTimeoutMs = remainingSnapshotMs(deadline, `git ${args.join(" ")}`);
+      return assertGitResult([...args], await withinSnapshotDeadline(deadline, `git ${args.join(" ")}`, () => runGit(root2, [...args], {
+        timeoutMs: invocationTimeoutMs,
+        outputLimitBytes,
+        ...deadline.signal ? { signal: deadline.signal } : {},
+        ...invocationOptions.stdin ? { stdin: invocationOptions.stdin } : {}
+      }), { drainOnStopMs: GIT_ABORT_DRAIN_TIMEOUT_MS }), invocationOptions.acceptedExitCodes);
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      if (deadline.signal?.aborted) {
+        throw snapshotDeadlineError(deadline, `git ${args.join(" ")}`);
+      }
       throw new RepositorySnapshotError("git_failed", `Git command could not start while resolving repository snapshot: git ${args.join(" ")}`, { gitArgs: [...args], cause: error });
     }
   };
@@ -759,39 +1681,64 @@ async function resolveRepositorySnapshot(repoRoot, options = {}) {
   if (!topLevelOutput) {
     throw new RepositorySnapshotError("invalid_git_output", "Git returned an empty repository top-level path");
   }
-  const root = canonicalDirectory(topLevelOutput, "Git repository root");
+  const gitRootAnchor = await canonicalDirectoryAnchor(topLevelOutput, "Git repository root", fileSystem, deadline);
+  const root = gitRootAnchor.canonicalPath;
+  assertRequestedRootWithinGitRoot(requestedRootAnchor, gitRootAnchor);
+  await validateRepositoryAnchors(requestedRootAnchor, gitRootAnchor, fileSystem, deadline);
   const identityResolver = options.resolveIdentity ?? resolveRepositoryIdentity;
   let identity;
   try {
-    identity = await identityResolver(root, {
-      timeoutMs,
+    identity = await withinSnapshotDeadline(deadline, "repository identity", () => identityResolver(root, {
+      timeoutMs: remainingSnapshotMs(deadline, "repository identity"),
       runGit: async (identityRoot, args, identityTimeoutMs) => {
         try {
-          const result = assertGitResult(args, await runGit(identityRoot, args, {
-            timeoutMs: identityTimeoutMs,
-            outputLimitBytes: SMALL_GIT_OUTPUT_LIMIT_BYTES
-          }));
+          const result = assertGitResult(args, await withinSnapshotDeadline(deadline, `identity git ${args.join(" ")}`, () => runGit(identityRoot, args, {
+            timeoutMs: Math.min(identityTimeoutMs, remainingSnapshotMs(deadline, `identity git ${args.join(" ")}`)),
+            outputLimitBytes: SMALL_GIT_OUTPUT_LIMIT_BYTES,
+            ...deadline.signal ? { signal: deadline.signal } : {}
+          }), { drainOnStopMs: GIT_ABORT_DRAIN_TIMEOUT_MS }));
           return { ok: true, stdout: result.stdout };
-        } catch {
+        } catch (error) {
+          if (error instanceof RepositorySnapshotError && (error.code === "snapshot_timeout" || error.code === "snapshot_aborted")) {
+            throw error;
+          }
+          if (deadline.signal?.aborted) {
+            throw snapshotDeadlineError(deadline, `identity git ${args.join(" ")}`);
+          }
           return { ok: false, stdout: "" };
         }
       }
-    });
+    }), { drainOnStopMs: GIT_ABORT_DRAIN_TIMEOUT_MS });
   } catch (error) {
+    if (error instanceof RepositorySnapshotError)
+      throw error;
     throw new RepositorySnapshotError("git_failed", "Cannot resolve stable repository identity for snapshot", { cause: error });
   }
   if (!/^repo_[0-9a-f]{64}$/.test(identity.repositoryId)) {
     throw new RepositorySnapshotError("invalid_git_output", "Repository identity resolver returned an invalid identity");
   }
-  const [revisionResult, cleanTreeResult, statusResult] = await Promise.all([
-    run(root, ["rev-parse", "--verify", "HEAD^{commit}"], SMALL_GIT_OUTPUT_LIMIT_BYTES),
-    run(root, ["rev-parse", "--verify", "HEAD^{tree}"], SMALL_GIT_OUTPUT_LIMIT_BYTES),
-    run(root, STATUS_ARGS, SMALL_GIT_OUTPUT_LIMIT_BYTES)
-  ]);
+  const revisionResult = await run(root, ["rev-parse", "--verify", "HEAD^{commit}"], SMALL_GIT_OUTPUT_LIMIT_BYTES);
   const revision = parseObjectId(revisionResult.stdout, "HEAD commit");
-  const cleanTree = parseObjectId(cleanTreeResult.stdout, "HEAD tree");
-  const status = statusResult.stdout;
-  if (!status) {
+  const objectIdWidth = revision.length;
+  const cleanTreeResult = await run(root, ["rev-parse", "--verify", `${revision}^{tree}`], SMALL_GIT_OUTPUT_LIMIT_BYTES);
+  const cleanTree = parseObjectId(cleanTreeResult.stdout, "HEAD tree", objectIdWidth);
+  const objectHashAlgorithm = revision.length === 64 ? "sha256" : "sha1";
+  const dirtyState = await captureDirtyState(root, run, diffOutputLimitBytes, objectHashAlgorithm, objectIdWidth, fileSystem, deadline);
+  const revisionAfterResult = await run(root, ["rev-parse", "--verify", "HEAD^{commit}"], SMALL_GIT_OUTPUT_LIMIT_BYTES);
+  const revisionAfter = parseObjectId(revisionAfterResult.stdout, "HEAD commit", objectIdWidth);
+  if (revisionAfter !== revision) {
+    throw new RepositorySnapshotError("repository_changed", "Repository revision changed while its snapshot was being captured; retry from a stable worktree", { gitArgs: ["rev-parse", "--verify", "HEAD^{commit}"] });
+  }
+  const dirtyStateAfter = await captureDirtyState(root, run, diffOutputLimitBytes, objectHashAlgorithm, objectIdWidth, fileSystem, deadline);
+  const finalRevisionResult = await run(root, ["rev-parse", "--verify", "HEAD^{commit}"], SMALL_GIT_OUTPUT_LIMIT_BYTES);
+  const finalRevision = parseObjectId(finalRevisionResult.stdout, "HEAD commit", objectIdWidth);
+  if (finalRevision !== revision || !dirtyStatesEqual(dirtyStateAfter, dirtyState)) {
+    throw new RepositorySnapshotError("repository_changed", "Repository content changed while its dirty snapshot was being captured; retry from a stable worktree", { gitArgs: [...STATUS_ARGS] });
+  }
+  remainingSnapshotMs(deadline, "finalize repository snapshot");
+  const dirty = Boolean(dirtyState.status || dirtyState.stagedDiff || dirtyState.unstagedDiff || dirtyState.untrackedFiles);
+  if (!dirty) {
+    await validateRepositoryAnchors(requestedRootAnchor, gitRootAnchor, fileSystem, deadline);
     return {
       identity: identity.repositoryId,
       root,
@@ -800,27 +1747,20 @@ async function resolveRepositorySnapshot(repoRoot, options = {}) {
       dirty: false
     };
   }
-  const dirtyState = await captureDirtyState(root, run, diffOutputLimitBytes);
-  const dirtyStateAfter = await captureDirtyState(root, run, diffOutputLimitBytes);
-  const [revisionAfterResult, statusAfter] = await Promise.all([
-    run(root, ["rev-parse", "--verify", "HEAD^{commit}"], SMALL_GIT_OUTPUT_LIMIT_BYTES),
-    run(root, STATUS_ARGS, SMALL_GIT_OUTPUT_LIMIT_BYTES)
-  ]);
-  const revisionAfter = parseObjectId(revisionAfterResult.stdout, "HEAD commit");
-  if (revisionAfter !== revision || statusAfter.stdout !== status || !dirtyStatesEqual(dirtyStateAfter, dirtyState)) {
-    throw new RepositorySnapshotError("repository_changed", "Repository content changed while its dirty snapshot was being captured; retry from a stable worktree", { gitArgs: [...STATUS_ARGS] });
-  }
+  const dirtyTree = dirtyTreeFingerprint({
+    revision,
+    status: dirtyState.status,
+    stagedDiff: dirtyState.stagedDiff,
+    unstagedDiff: dirtyState.unstagedDiff,
+    untrackedFiles: dirtyState.untrackedFiles
+  });
+  remainingSnapshotMs(deadline, "finalize dirty repository snapshot");
+  await validateRepositoryAnchors(requestedRootAnchor, gitRootAnchor, fileSystem, deadline);
   return {
     identity: identity.repositoryId,
     root,
     revision,
-    tree: dirtyTreeFingerprint({
-      revision,
-      status,
-      stagedDiff: dirtyState.stagedDiff,
-      unstagedDiff: dirtyState.unstagedDiff,
-      untrackedFiles: dirtyState.untrackedFiles
-    }),
+    tree: dirtyTree,
     dirty: true
   };
 }
@@ -2630,14 +3570,14 @@ function copyEnvWithoutScmRepairAuthoritySecret(env = process.env) {
 }
 // packages/shared/src/prompts.ts
 import { readFileSync as readFileSync2 } from "fs";
-import { join, resolve as resolve4 } from "path";
+import { join as join2, resolve as resolve4 } from "path";
 var TEMPLATE_TOKEN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 var promptTemplateCache = new Map;
 var repoDocCache = new Map;
 function resolvePromptPath(relativePath) {
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
   const repoRoot = promptRootOverride ? resolve4(promptRootOverride) : detectRepoRoot(process.cwd());
-  return join(repoRoot, "prompts", relativePath);
+  return join2(repoRoot, "prompts", relativePath);
 }
 function loadPromptTemplate(relativePath, replacements) {
   const promptPath = resolvePromptPath(relativePath);
@@ -2659,7 +3599,7 @@ function loadPromptTemplate(relativePath, replacements) {
 }
 // packages/shared/src/config.ts
 import { existsSync as existsSync2, readFileSync as readFileSync3 } from "fs";
-import { join as join2, resolve as resolve5, isAbsolute as isAbsolute2 } from "path";
+import { join as join3, resolve as resolve5, isAbsolute as isAbsolute3 } from "path";
 
 // packages/shared/src/autonomy_policy.ts
 import { createHash as createHash4 } from "crypto";
@@ -3257,7 +4197,7 @@ function asStringNumberRecord(value) {
 function resolvePathFromRoot(projectRoot, value) {
   if (!value)
     return projectRoot;
-  if (isAbsolute2(value))
+  if (isAbsolute3(value))
     return resolve5(value);
   return resolve5(projectRoot, value);
 }
@@ -3345,11 +4285,11 @@ function loadPushPalsConfig(options = {}) {
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;
   }
-  const defaultToml = parseRequiredTomlFile(join2(configDir, "default.toml"));
+  const defaultToml = parseRequiredTomlFile(join3(configDir, "default.toml"));
   const preferredProfile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(defaultToml.profile, "dev"), "dev");
-  const profileToml = parseTomlFile(join2(configDir, `${preferredProfile}.toml`));
-  const localExampleToml = parseTomlFile(join2(configDir, "local.example.toml"));
-  const localToml = parseTomlFile(join2(configDir, "local.toml"));
+  const profileToml = parseTomlFile(join3(configDir, `${preferredProfile}.toml`));
+  const localExampleToml = parseTomlFile(join3(configDir, "local.example.toml"));
+  const localToml = parseTomlFile(join3(configDir, "local.toml"));
   const merged = mergeDeep(mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml), localToml);
   const profile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(merged.profile, preferredProfile), preferredProfile);
   const sessionId = firstNonEmpty(process.env.PUSHPALS_SESSION_ID, asString(merged.session_id, "dev"), "dev");
@@ -3363,8 +4303,8 @@ function loadPushPalsConfig(options = {}) {
   const lmStudioBatchMemoryChars = Math.max(0, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_BATCH_MEMORY_CHARS") ?? lmStudioNode.batch_memory_chars, 0));
   const pathsNode = getObject(merged, "paths");
   const dataDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DATA_DIR, asString(pathsNode.data_dir, "outputs/data")));
-  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join2(dataDir, "pushpals.db"))));
-  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join2(dataDir, "remotebuddy-state.db"))));
+  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join3(dataDir, "pushpals.db"))));
+  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join3(dataDir, "remotebuddy-state.db"))));
   const serverNode = getObject(merged, "server");
   const serverPort = Math.max(1, asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001));
   const serverUrl = normalizeLoopbackHttpUrl(firstNonEmpty(process.env.PUSHPALS_SERVER_URL, asString(serverNode.url, `http://127.0.0.1:${serverPort}`), `http://127.0.0.1:${serverPort}`), serverPort);
@@ -3550,7 +4490,7 @@ function loadPushPalsConfig(options = {}) {
   const scmBranchPrefix = asString(process.env.SOURCE_CONTROL_MANAGER_BRANCH_PREFIX ?? scmNode.branch_prefix, "agent/");
   const scmPollIntervalSeconds = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_POLL_INTERVAL_SECONDS") ?? scmNode.poll_interval_seconds, 10));
   const scmChecks = asCheckArray(scmNode.checks);
-  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join2(dataDir, "source_control_manager")), join2(dataDir, "source_control_manager")));
+  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join3(dataDir, "source_control_manager")), join3(dataDir, "source_control_manager")));
   const scmPort = Math.max(1, Math.min(65535, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_PORT") ?? scmNode.port, 3002)));
   const scmDeleteAfterMerge = parseBoolEnv("SOURCE_CONTROL_MANAGER_DELETE_AFTER_MERGE") ?? asBoolean(scmNode.delete_after_merge, false);
   const scmMaxAttempts = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_MAX_ATTEMPTS") ?? scmNode.max_attempts, 3));
@@ -5542,7 +6482,7 @@ async function prepareCodexExecutionWorkspace(input) {
   if ("cwd" in input.executionContext && String(input.executionContext.cwd ?? "").trim()) {
     throw new Error("Codex isolated-evidence execution does not accept a target repository cwd.");
   }
-  const cwd = mkdtempSync(join3(tmpdir(), "pushpals-repository-agent-neutral-"));
+  const cwd = mkdtempSync(join4(tmpdir(), "pushpals-repository-agent-neutral-"));
   const cleanup = () => rmSync(cwd, { recursive: true, force: true });
   try {
     const initialized = await runProcess(["git", "init", "--quiet"], {
@@ -5679,8 +6619,8 @@ class OpenAiCodexCliClient {
         delete env.OPENAI_API_BASE;
       }
     }
-    const tmp = mkdtempSync(join3(tmpdir(), "pushpals-codex-"));
-    const lastMessagePath = join3(tmp, "codex-last-message.txt");
+    const tmp = mkdtempSync(join4(tmpdir(), "pushpals-codex-"));
+    const lastMessagePath = join4(tmp, "codex-last-message.txt");
     try {
       const command = [
         ...commandPrefix,
@@ -6844,9 +7784,9 @@ import {
   readSync,
   readdirSync,
   rmSync as rmSync2,
-  statSync as statSync3
+  statSync as statSync2
 } from "fs";
-import { dirname, relative, resolve as resolve6 } from "path";
+import { dirname, relative as relative2, resolve as resolve6 } from "path";
 
 // apps/remotebuddy/src/command_policy.ts
 var YARN_NON_SCRIPT_COMMANDS = new Set([
@@ -8034,7 +8974,7 @@ function collectRepoTargetFiles(repoRoot, startRelativePath, maxResults, maxDept
   const out = [];
   let startStat;
   try {
-    startStat = statSync3(startPath);
+    startStat = statSync2(startPath);
   } catch {
     return [];
   }
@@ -9244,7 +10184,7 @@ function validationSearchDirectories(repoRoot, targetPaths) {
       continue;
     let directory = pathDirname(normalized);
     try {
-      if (statSync3(resolve6(repoRoot, normalized)).isDirectory())
+      if (statSync2(resolve6(repoRoot, normalized)).isDirectory())
         directory = normalized;
     } catch {}
     while (directory) {
@@ -9275,7 +10215,7 @@ function inferPackageValidationCommand(packageJsonPath, packageDirectory, repoRo
       if (manager || managerDirectory === absoluteRepoRoot)
         break;
       const parent = dirname(managerDirectory);
-      const relativeParent = relative(absoluteRepoRoot, parent).replace(/\\/g, "/");
+      const relativeParent = relative2(absoluteRepoRoot, parent).replace(/\\/g, "/");
       if (parent === managerDirectory || relativeParent.startsWith("../"))
         break;
       managerDirectory = parent;
@@ -9615,7 +10555,7 @@ function inferRepoValidationIdeas(repoRoot, targetPaths = [], executionPlatform 
         const candidateRoot = candidateDirectory ? resolve6(repoRoot, candidateDirectory) : repoRoot;
         return existsSync4(resolve6(candidateRoot, "BUILD")) || existsSync4(resolve6(candidateRoot, "BUILD.bazel"));
       });
-      const packagePath = buildDirectory != null && directory ? relative(resolve6(repoRoot, directory), resolve6(repoRoot, buildDirectory)).replace(/\\/g, "/") : buildDirectory ?? "";
+      const packagePath = buildDirectory != null && directory ? relative2(resolve6(repoRoot, directory), resolve6(repoRoot, buildDirectory)).replace(/\\/g, "/") : buildDirectory ?? "";
       const safePackagePath = /^[A-Za-z0-9_@+.,/-]+$/.test(packagePath) ? packagePath : "";
       const target = safePackagePath && !safePackagePath.startsWith("../") ? `//${safePackagePath}/...` : "//...";
       return commandInDirectory(directory, `bazel test ${target}`);
@@ -11705,12 +12645,15 @@ ${JSON.stringify(input.messages ?? [])}`),
     try {
       const repository = await resolveRepositorySnapshot(this.autonomyRepo, {
         timeoutMs: Math.min(1e4, timeoutMs),
+        signal: controller.signal,
         runGit: async (root, args, options) => await runBoundedProcess(["git", "-C", root, ...args], {
           cwd: root,
           timeoutMs: options.timeoutMs,
           outputLimitBytes: options.outputLimitBytes,
           streamDrainTimeoutMs: 1000,
-          signal: controller.signal
+          preserveOutputWhitespace: true,
+          signal: options.signal ?? controller.signal,
+          ...options.stdin ? { stdin: new Blob([new Uint8Array(options.stdin)]) } : {}
         })
       });
       if (!this.runtimeEnabled || this.stopped || controller.signal.aborted) {
@@ -13706,8 +14649,8 @@ Scope:
 
 // apps/remotebuddy/src/repository_agent.ts
 import { createHash as createHash6, randomUUID as randomUUID3 } from "crypto";
-import { closeSync as closeSync2, existsSync as existsSync5, openSync as openSync2, readSync as readSync2, realpathSync as realpathSync3, statSync as statSync4 } from "fs";
-import { basename, isAbsolute as isAbsolute3, relative as relative2, resolve as resolve7 } from "path";
+import { closeSync as closeSync2, existsSync as existsSync5, openSync as openSync2, readSync as readSync2, realpathSync as realpathSync2, statSync as statSync3 } from "fs";
+import { basename, isAbsolute as isAbsolute4, relative as relative3, resolve as resolve7 } from "path";
 var PROMPT_VERSION = "repository-agent-v4-staged-evidence";
 var CACHE_NAMESPACE = "repository_agent_cache";
 var CAPABILITY_NAMESPACE = "repository_agent_capabilities";
@@ -13742,7 +14685,6 @@ var MEMORY_TERMINAL_RESULT_RESERVE_MS = 100;
 var MIN_SYNTHESIS_START_BUDGET_MS = 500;
 var MIN_FINALIZATION_RESERVE_MS = 500;
 var MAX_FINALIZATION_RESERVE_MS = 5000;
-var OUTPUT_TRUNCATION_MARKER2 = "[pushpals: process output truncated]";
 var MANIFEST_BASENAMES = new Set([
   "package.json",
   "deno.json",
@@ -13933,7 +14875,7 @@ function comparablePath(value) {
 }
 function normalizeRelativePath(value) {
   const normalized = String(value ?? "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/").trim();
-  if (!normalized || normalized === "." || isAbsolute3(normalized))
+  if (!normalized || normalized === "." || isAbsolute4(normalized))
     return null;
   if (normalized.split("/").some((segment) => segment === ".." || segment === ""))
     return null;
@@ -13944,8 +14886,8 @@ function containedPath(repoRoot, repositoryPath) {
   if (!normalized)
     return null;
   const absolute = resolve7(repoRoot, normalized);
-  const rel = relative2(repoRoot, absolute);
-  if (!rel || rel.startsWith("..") || isAbsolute3(rel))
+  const rel = relative3(repoRoot, absolute);
+  if (!rel || rel.startsWith("..") || isAbsolute4(rel))
     return null;
   return absolute;
 }
@@ -13957,12 +14899,12 @@ function canonicalContainedFile(repoRoot, repositoryPath) {
   if (!absolute || !existsSync5(absolute))
     return null;
   try {
-    if (!statSync4(absolute).isFile())
+    if (!statSync3(absolute).isFile())
       return null;
-    const canonicalRoot = realpathSync3.native(repoRoot);
-    const canonicalFile = realpathSync3.native(absolute);
-    const rel = relative2(canonicalRoot, canonicalFile);
-    if (!rel || rel.startsWith("..") || isAbsolute3(rel))
+    const canonicalRoot = realpathSync2.native(repoRoot);
+    const canonicalFile = realpathSync2.native(absolute);
+    const rel = relative3(canonicalRoot, canonicalFile);
+    if (!rel || rel.startsWith("..") || isAbsolute4(rel))
       return null;
     const expectedCanonicalFile = resolve7(canonicalRoot, ...normalized.split("/"));
     if (comparablePath(canonicalFile) !== comparablePath(expectedCanonicalFile))
@@ -13975,7 +14917,7 @@ function canonicalContainedFile(repoRoot, repositoryPath) {
 function readUtf8Prefix(path, maxBytes) {
   let fd = null;
   try {
-    const size = statSync4(path).size;
+    const size = statSync3(path).size;
     const readBytes = Math.max(0, Math.min(size, maxBytes));
     const buffer = Buffer.alloc(readBytes);
     fd = openSync2(path, "r");
@@ -14019,8 +14961,11 @@ function assertRepositoryGitInspectionResult(args, result) {
   if (result.timedOut || result.drainTimedOut || result.exitCode !== 0) {
     throw new RepositoryAgentWorkerError("repository_git_failed", `Repository Git inspection failed: git ${args[0] ?? "command"}`, true, compactText2(result.drainTimedOut ? `Git output stream did not drain within its bounded deadline. ${result.stderr || result.stdout}` : result.stderr || result.stdout || `exit ${result.exitCode}`, 2000));
   }
-  if (result.stdout.includes(OUTPUT_TRUNCATION_MARKER2)) {
+  if (result.stdoutTruncated || result.stderrTruncated) {
     throw new RepositoryAgentWorkerError("repository_too_large", `Repository Git output exceeded the bounded inspection limit for git ${args[0] ?? "command"}`, false);
+  }
+  if (result.stdoutDecodeError || result.stderrDecodeError) {
+    throw new RepositoryAgentWorkerError("repository_git_failed", `Repository Git inspection returned invalid UTF-8 for git ${args[0] ?? "command"}`, false);
   }
   return result.stdout;
 }
@@ -14033,12 +14978,15 @@ async function resolveRepositorySnapshotWithinDeadline(repoRoot, deadlineMs, sig
   throwIfAborted(signal);
   return await resolveRepositorySnapshot(repoRoot, {
     timeoutMs: clampInt(deadlineMs - Date.now(), 5000, 100, 1e4),
+    signal,
     runGit: async (root, args, options) => await runBoundedProcess(["git", "-C", root, ...args], {
       cwd: root,
       timeoutMs: options.timeoutMs,
       outputLimitBytes: options.outputLimitBytes,
       streamDrainTimeoutMs: 1000,
-      signal
+      preserveOutputWhitespace: true,
+      signal: options.signal ?? signal,
+      ...options.stdin ? { stdin: new Blob([new Uint8Array(options.stdin)]) } : {}
     })
   });
 }
@@ -14164,16 +15112,15 @@ async function readRepositoryTextPrefix(repoRoot, request, path, maxChars, signa
   if (result.timedOut || result.drainTimedOut || result.exitCode !== 0) {
     throw new RepositoryAgentWorkerError("repository_git_failed", `Repository Git blob inspection failed for ${path}`, true, compactText2(result.stderr || `exit ${result.exitCode}`, 2000));
   }
-  const markerSuffix = `
-${OUTPUT_TRUNCATION_MARKER2}`;
-  const captureTruncated = result.stdout.length > maxChars;
-  if (captureTruncated && !result.stdout.endsWith(markerSuffix)) {
-    throw new RepositoryAgentWorkerError("repository_git_failed", `Repository Git blob capture produced an invalid truncation envelope for ${path}`, false);
+  if (result.stderrTruncated || result.stderrDecodeError) {
+    throw new RepositoryAgentWorkerError("repository_git_failed", `Repository Git blob diagnostics were incomplete for ${path}`, false);
   }
-  const text = captureTruncated ? result.stdout.slice(0, -markerSuffix.length) : result.stdout;
+  if (result.stdoutDecodeError)
+    return null;
+  const text = result.stdout;
   if (text.includes("\x00"))
     return null;
-  const truncated = captureTruncated || Buffer.byteLength(text, "utf8") < declaredSize;
+  const truncated = result.stdoutTruncated || Buffer.byteLength(text, "utf8") < declaredSize;
   return { text, truncated };
 }
 async function appendPacketFiles(repoRoot, request, existingFiles, paths, signal, limits = {}) {
@@ -14440,7 +15387,7 @@ function normalizedValidationProposals(repoRoot, raw) {
     if (rawCwd !== ".") {
       const normalized = normalizeRelativePath(rawCwd);
       const absolute = normalized ? containedPath(repoRoot, normalized) : null;
-      if (!normalized || !absolute || !existsSync5(absolute) || !statSync4(absolute).isDirectory()) {
+      if (!normalized || !absolute || !existsSync5(absolute) || !statSync3(absolute).isDirectory()) {
         return [];
       }
       cwd = normalized;
@@ -15754,7 +16701,7 @@ class RepositoryAgentWorker {
     try {
       throwIfAborted(controller.signal);
       const repoRoot = resolve7(request.repository.root);
-      if (!isAbsolute3(request.repository.root) || !existsSync5(repoRoot) || !statSync4(repoRoot).isDirectory()) {
+      if (!isAbsolute4(request.repository.root) || !existsSync5(repoRoot) || !statSync3(repoRoot).isDirectory()) {
         throw new RepositoryAgentWorkerError("invalid_repository", "Repository Agent request did not resolve to an existing absolute repository root", false);
       }
       const before = await resolveRepositorySnapshotWithinDeadline(repoRoot, deadlineMs, controller.signal);

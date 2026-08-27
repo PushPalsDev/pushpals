@@ -3,9 +3,9 @@ var __require = import.meta.require;
 
 // apps/source_control_manager/src/source_control_manager_main.ts
 import { parseArgs } from "util";
-import { isAbsolute as isAbsolute3, join as join7, relative as relative2, resolve as resolve11 } from "path";
+import { isAbsolute as isAbsolute4, join as join8, relative as relative3, resolve as resolve12 } from "path";
 import { mkdirSync as mkdirSync4 } from "fs";
-import { createHash as createHash5, randomUUID as randomUUID3 } from "crypto";
+import { createHash as createHash6, randomUUID as randomUUID3 } from "crypto";
 
 // packages/shared/src/bounded_fetch.ts
 var DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -1261,39 +1261,39 @@ async function settleWithin(promise, timeoutMs) {
       clearTimeout(timer);
   }
 }
+var EMPTY_STREAM_CAPTURE_RESULT = {
+  text: "",
+  truncated: false,
+  decodeError: false
+};
 function captureBoundedStream(stream, maxBytes, options = {}) {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
-    return { done: Promise.resolve(""), cancel: () => {
+    return { done: Promise.resolve(EMPTY_STREAM_CAPTURE_RESULT), cancel: () => {
       return;
     } };
   }
   const reader = stream.getReader();
-  const decoder = new TextDecoder;
+  const lineDecoder = new TextDecoder;
+  const validationDecoder = new TextDecoder("utf-8", { fatal: true });
   const headLimit = options.retainTail ? Math.max(1, Math.floor(maxBytes / 2)) : maxBytes;
   const tailLimit = options.retainTail ? Math.max(0, maxBytes - headLimit) : 0;
-  let head = "";
-  let tail = "";
-  let observedChars = 0;
+  const headBuffer = new Uint8Array(headLimit);
+  const tailBuffer = new Uint8Array(tailLimit);
+  let headLength = 0;
+  let tailLength = 0;
+  let tailWriteOffset = 0;
+  let observedBytes = 0;
   let lineBuffer = "";
-  let truncated = false;
+  let decodeError = false;
+  let validationActive = true;
   let cancelled = false;
   const emitLine = (line) => {
     try {
       options.onLine?.(line);
     } catch {}
   };
-  const retainAndEmit = (text) => {
-    if (!text)
-      return;
-    observedChars += text.length;
-    const headRemaining = Math.max(0, headLimit - head.length);
-    const headPart = headRemaining > 0 ? text.slice(0, headRemaining) : "";
-    head += headPart;
-    const remainder = text.slice(headPart.length);
-    if (remainder && tailLimit > 0)
-      tail = `${tail}${remainder}`.slice(-tailLimit);
-    truncated = observedChars > maxBytes;
-    if (!options.onLine)
+  const emitDecodedLines = (text) => {
+    if (!text || !options.onLine)
       return;
     lineBuffer += text;
     const lines = lineBuffer.split(`
@@ -1307,16 +1307,79 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
       lineBuffer = "";
     }
   };
+  const appendTail = (bytes) => {
+    if (tailLimit === 0 || bytes.byteLength === 0)
+      return;
+    if (bytes.byteLength >= tailLimit) {
+      tailBuffer.set(bytes.subarray(bytes.byteLength - tailLimit));
+      tailLength = tailLimit;
+      tailWriteOffset = 0;
+      return;
+    }
+    const firstLength = Math.min(bytes.byteLength, tailLimit - tailWriteOffset);
+    tailBuffer.set(bytes.subarray(0, firstLength), tailWriteOffset);
+    const remainingLength = bytes.byteLength - firstLength;
+    if (remainingLength > 0)
+      tailBuffer.set(bytes.subarray(firstLength), 0);
+    tailWriteOffset = (tailWriteOffset + bytes.byteLength) % tailLimit;
+    tailLength = Math.min(tailLimit, tailLength + bytes.byteLength);
+  };
+  const retainedTail = () => {
+    if (tailLength === 0)
+      return new Uint8Array;
+    if (tailLength < tailLimit)
+      return tailBuffer.slice(0, tailLength);
+    if (tailWriteOffset === 0)
+      return tailBuffer.slice();
+    const ordered = new Uint8Array(tailLength);
+    const first = tailBuffer.subarray(tailWriteOffset);
+    ordered.set(first, 0);
+    ordered.set(tailBuffer.subarray(0, tailWriteOffset), first.byteLength);
+    return ordered;
+  };
+  const retainAndValidate = (bytes) => {
+    if (bytes.byteLength === 0)
+      return;
+    observedBytes = Math.min(Number.MAX_SAFE_INTEGER, observedBytes + bytes.byteLength);
+    const headBytes = Math.min(headLimit - headLength, bytes.byteLength);
+    if (headBytes > 0) {
+      headBuffer.set(bytes.subarray(0, headBytes), headLength);
+      headLength += headBytes;
+    }
+    appendTail(bytes.subarray(headBytes));
+    if (validationActive) {
+      try {
+        validationDecoder.decode(bytes, { stream: true });
+      } catch {
+        decodeError = true;
+        validationActive = false;
+      }
+    }
+    if (options.onLine)
+      emitDecodedLines(lineDecoder.decode(bytes, { stream: true }));
+  };
   const done = (async () => {
+    let reachedEnd = false;
     try {
       while (true) {
         const chunk = await reader.read();
-        if (chunk.done)
+        if (chunk.done) {
+          reachedEnd = true;
           break;
-        retainAndEmit(decoder.decode(chunk.value, { stream: true }));
+        }
+        retainAndValidate(chunk.value);
       }
-      retainAndEmit(decoder.decode());
-      if (options.onLine && lineBuffer.length > 0) {
+      if (!cancelled && validationActive) {
+        try {
+          validationDecoder.decode();
+        } catch {
+          decodeError = true;
+          validationActive = false;
+        }
+      }
+      if (options.onLine)
+        emitDecodedLines(lineDecoder.decode());
+      if (options.onLine && reachedEnd && lineBuffer.length > 0) {
         emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
         lineBuffer = "";
       }
@@ -1325,12 +1388,24 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
         reader.releaseLock();
       } catch {}
     }
-    if (!truncated)
-      return head + tail;
-    const marker = `
-[pushpals: process output truncated]`;
-    return options.retainTail ? `${head}${marker}
-${tail}` : `${head}${marker}`;
+    const truncated = observedBytes > maxBytes;
+    const head = headBuffer.subarray(0, headLength);
+    const tail = retainedTail();
+    if (!truncated) {
+      const retained = new Uint8Array(head.byteLength + tail.byteLength);
+      retained.set(head, 0);
+      retained.set(tail, head.byteLength);
+      return {
+        text: new TextDecoder().decode(retained),
+        truncated,
+        decodeError
+      };
+    }
+    return {
+      text: options.retainTail ? `${new TextDecoder().decode(head)}${new TextDecoder().decode(tail)}` : new TextDecoder().decode(head),
+      truncated,
+      decodeError
+    };
   })();
   return {
     done,
@@ -1460,7 +1535,8 @@ async function runBoundedProcess(argv, options) {
     stderr: options.stderr ?? "pipe",
     detached: platform !== "win32"
   });
-  const maxBytes = Math.max(1, options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const requestedOutputLimitBytes = Number(options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES);
+  const maxBytes = Number.isFinite(requestedOutputLimitBytes) ? Math.max(1, Math.floor(requestedOutputLimitBytes)) : DEFAULT_OUTPUT_LIMIT_BYTES;
   const stdoutCapture = captureBoundedStream(proc.stdout, maxBytes, {
     retainTail: options.retainOutputTail,
     onLine: options.onStdoutLine
@@ -1555,16 +1631,20 @@ async function runBoundedProcess(argv, options) {
     stderrCapture.cancel();
     streams = await settleWithin(Promise.all([stdoutCapture.done, stderrCapture.done]), 250);
   }
-  const [stdout, rawStderr] = streams.settled ? streams.value : ["", ""];
+  const [stdoutCaptureResult, stderrCaptureResult] = streams.settled ? streams.value : [EMPTY_STREAM_CAPTURE_RESULT, EMPTY_STREAM_CAPTURE_RESULT];
   const timeoutDetail = outcome.timedOut ? `Command timed out after ${effectiveTimeoutMs}ms; terminated process tree.` : "";
   const drainDetail = drainTimedOut ? `Process streams did not close after ${drainTimeoutMs}ms; terminated process tree and stopped draining.` : "";
   const trimOutput = (text) => options.preserveOutputWhitespace ? text : text.trim();
   if (outcome.aborted)
     throw outcome.reason;
   return {
-    stdout: trimOutput(stdout),
-    stderr: [trimOutput(rawStderr), timeoutDetail, drainDetail].filter(Boolean).join(`
+    stdout: trimOutput(stdoutCaptureResult.text),
+    stderr: [trimOutput(stderrCaptureResult.text), timeoutDetail, drainDetail].filter(Boolean).join(`
 `),
+    stdoutTruncated: stdoutCaptureResult.truncated,
+    stderrTruncated: stderrCaptureResult.truncated,
+    stdoutDecodeError: stdoutCaptureResult.decodeError,
+    stderrDecodeError: stderrCaptureResult.decodeError,
     exitCode: outcome.exitCode,
     timedOut: outcome.timedOut,
     drainTimedOut
@@ -3502,7 +3582,7 @@ function isProcessAlive(pid) {
 }
 
 // apps/source_control_manager/src/git.ts
-import { resolve as resolve6, win32 as pathWin32 } from "path";
+import { resolve as resolve7, win32 as pathWin32 } from "path";
 
 // packages/shared/src/repo.ts
 import { existsSync as existsSync3, readFileSync as readFileSync4, statSync as statSync2 } from "fs";
@@ -3564,20 +3644,299 @@ function detectRepoRoot(startDir) {
   return startDir;
 }
 // packages/shared/src/repository_snapshot.ts
+import { createHash as createHash2 } from "crypto";
+import { isAbsolute as isAbsolute2, join as join4, relative, resolve as resolve4, sep } from "path";
 var DEFAULT_DIFF_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
 var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
-var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
+var MAX_BOUNDARY_PATHSPEC_BYTES = 16 * 1024;
+var FILE_READ_BUFFER_BYTES = 64 * 1024;
+class RepositorySnapshotError extends Error {
+  code;
+  gitArgs;
+  exitCode;
+  constructor(code, message, options = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "RepositorySnapshotError";
+    this.code = code;
+    this.gitArgs = Object.freeze([...options.gitArgs ?? []]);
+    this.exitCode = options.exitCode ?? null;
+  }
+}
+function snapshotDeadlineError(deadline, operation) {
+  if (deadline.signal?.aborted) {
+    return new RepositorySnapshotError("snapshot_aborted", `Repository snapshot was aborted during ${operation}`, { cause: deadline.signal.reason });
+  }
+  return new RepositorySnapshotError("snapshot_timeout", `Repository snapshot exceeded its overall deadline during ${operation}`);
+}
+function remainingSnapshotMs(deadline, operation) {
+  if (deadline.signal?.aborted || Date.now() >= deadline.deadlineAtMs) {
+    throw snapshotDeadlineError(deadline, operation);
+  }
+  return Math.max(1, deadline.deadlineAtMs - Date.now());
+}
+async function withinSnapshotDeadline(deadline, operation, start, options = {}) {
+  const remainingMs = remainingSnapshotMs(deadline, operation);
+  const promise = start();
+  let timer = null;
+  let removeAbortListener = () => {
+    return;
+  };
+  let stoppedTriggered = false;
+  const stopped = new Promise((_resolve, reject) => {
+    let settled = false;
+    const stop = () => {
+      if (settled)
+        return;
+      settled = true;
+      stoppedTriggered = true;
+      reject(snapshotDeadlineError(deadline, operation));
+    };
+    timer = setTimeout(stop, remainingMs);
+    const onAbort = () => stop();
+    deadline.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => deadline.signal?.removeEventListener("abort", onAbort);
+    if (deadline.signal?.aborted)
+      onAbort();
+  });
+  try {
+    return await Promise.race([promise, stopped]);
+  } catch (error) {
+    if (stoppedTriggered && options.drainOnStopMs && options.drainOnStopMs > 0) {
+      let drainTimer = null;
+      await Promise.race([
+        promise.then(() => {
+          return;
+        }, () => {
+          return;
+        }),
+        new Promise((resolveDrain) => {
+          drainTimer = setTimeout(resolveDrain, options.drainOnStopMs);
+        })
+      ]);
+      if (drainTimer)
+        clearTimeout(drainTimer);
+    } else if (stoppedTriggered) {
+      promise.catch(() => {
+        return;
+      });
+    }
+    throw error;
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    removeAbortListener();
+  }
+}
+function updateHashPart(hash, label, value) {
+  const bytes = Buffer.from(value, "utf8");
+  hash.update(`${label}\x00${bytes.byteLength}\x00`, "utf8");
+  hash.update(bytes);
+  hash.update("\x00", "utf8");
+}
+function updateHashBytes(hash, label, value) {
+  hash.update(`${label}\x00${value.byteLength}\x00`, "utf8");
+  hash.update(value);
+  hash.update("\x00", "utf8");
+}
+var UNTRACKED_FILES_ARGS = [
+  "ls-files",
+  "--others",
+  "--exclude-standard",
+  "--full-name",
+  "-z"
+];
+function stableStatsEqual(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+function repositoryChanged(path, cause) {
+  return new RepositorySnapshotError("repository_changed", `Repository path changed while resolving its dirty snapshot: ${path}`, { gitArgs: [...UNTRACKED_FILES_ARGS], cause });
+}
+function isUnavailablePathError(error) {
+  if (typeof error !== "object" || error === null || !("code" in error))
+    return false;
+  const code = error.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+function indirectionIdentity(path, target) {
+  const hash = createHash2("sha256");
+  hash.update("pushpals-repository-indirection-v2\x00", "utf8");
+  updateHashPart(hash, "path", path);
+  updateHashBytes(hash, "target", target);
+  return `indirection:sha256:${hash.digest("hex")}`;
+}
+
+class RepositoryPathInspector {
+  root;
+  fileSystem;
+  deadline;
+  prefixes = new Map;
+  constructor(root, fileSystem, deadline) {
+    this.root = root;
+    this.fileSystem = fileSystem;
+    this.deadline = deadline;
+  }
+  async inspectPrefix(path, absolutePath, allowUnavailable, knownStats) {
+    const existing = this.prefixes.get(path);
+    if (existing)
+      return await existing;
+    const pending = (async () => {
+      let stats;
+      try {
+        stats = knownStats ?? await withinSnapshotDeadline(this.deadline, `lstat ${path}`, () => this.fileSystem.lstat(absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        if (allowUnavailable && isUnavailablePathError(error)) {
+          return { kind: "unavailable", path, absolutePath, stats: null };
+        }
+        throw repositoryChanged(path, error);
+      }
+      if (stats.isSymbolicLink()) {
+        let target;
+        let verified;
+        try {
+          target = await withinSnapshotDeadline(this.deadline, `readlink ${path}`, () => this.fileSystem.readlink(absolutePath));
+          verified = await withinSnapshotDeadline(this.deadline, `revalidate indirection ${path}`, () => this.fileSystem.lstat(absolutePath));
+        } catch (error) {
+          if (error instanceof RepositorySnapshotError)
+            throw error;
+          throw repositoryChanged(path, error);
+        }
+        if (!verified.isSymbolicLink() || !stableStatsEqual(stats, verified)) {
+          throw repositoryChanged(path);
+        }
+        return {
+          kind: "indirection",
+          path,
+          absolutePath,
+          stats,
+          target,
+          identity: indirectionIdentity(path, target)
+        };
+      }
+      if (!stats.isDirectory()) {
+        if (allowUnavailable) {
+          return { kind: "unavailable", path, absolutePath, stats };
+        }
+        throw repositoryChanged(path);
+      }
+      return { kind: "directory", path, absolutePath, stats };
+    })();
+    this.prefixes.set(path, pending);
+    return await pending;
+  }
+  async inspectAncestors(lexical, options = {}) {
+    let absolutePath = this.root;
+    const traversed = [];
+    for (const segment of lexical.segments.slice(0, -1)) {
+      remainingSnapshotMs(this.deadline, `inspect path ${lexical.path}`);
+      traversed.push(segment);
+      absolutePath = join4(absolutePath, segment);
+      const prefix = await this.inspectPrefix(traversed.join("/"), absolutePath, options.allowUnavailable === true);
+      if (prefix.kind === "indirection")
+        return prefix;
+      if (prefix.kind === "unavailable") {
+        if (options.allowUnavailable)
+          return null;
+        throw repositoryChanged(prefix.path);
+      }
+    }
+    return null;
+  }
+  async inspectUntracked(lexical) {
+    const ancestor = await this.inspectAncestors(lexical);
+    if (ancestor)
+      return ancestor;
+    let stats;
+    try {
+      stats = await withinSnapshotDeadline(this.deadline, `lstat ${lexical.path}`, () => this.fileSystem.lstat(lexical.absolutePath));
+    } catch (error) {
+      if (error instanceof RepositorySnapshotError)
+        throw error;
+      throw repositoryChanged(lexical.path, error);
+    }
+    if (stats.isSymbolicLink()) {
+      const boundary = await this.inspectPrefix(lexical.path, lexical.absolutePath, false, stats);
+      if (boundary.kind !== "indirection")
+        throw repositoryChanged(lexical.path);
+      return boundary;
+    }
+    if (stats.isDirectory()) {
+      await this.inspectPrefix(lexical.path, lexical.absolutePath, false, stats);
+      return { kind: "directory", lexical };
+    }
+    if (stats.isFile())
+      return { kind: "file", lexical, stats };
+    return { kind: "special", lexical, stats };
+  }
+  async inspectDirectoryCandidate(lexical) {
+    const inspected = await this.inspectUntracked(lexical);
+    if (inspected.kind === "indirection")
+      return inspected;
+    if (inspected.kind === "directory")
+      return inspected;
+    return null;
+  }
+  async validatePrefixes() {
+    for (const pending of this.prefixes.values()) {
+      remainingSnapshotMs(this.deadline, "validate repository path prefixes");
+      const prefix = await pending;
+      if (prefix.kind === "unavailable") {
+        try {
+          const stats2 = await withinSnapshotDeadline(this.deadline, `revalidate unavailable path ${prefix.path}`, () => this.fileSystem.lstat(prefix.absolutePath));
+          if (prefix.stats === null || !stableStatsEqual(prefix.stats, stats2)) {
+            throw repositoryChanged(prefix.path);
+          }
+        } catch (error) {
+          if (error instanceof RepositorySnapshotError)
+            throw error;
+          if (prefix.stats === null && isUnavailablePathError(error))
+            continue;
+          throw repositoryChanged(prefix.path, error);
+        }
+        continue;
+      }
+      let stats;
+      try {
+        stats = await withinSnapshotDeadline(this.deadline, `revalidate ${prefix.path}`, () => this.fileSystem.lstat(prefix.absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(prefix.path, error);
+      }
+      if (!stableStatsEqual(prefix.stats, stats))
+        throw repositoryChanged(prefix.path);
+      if (prefix.kind === "directory") {
+        if (!stats.isDirectory())
+          throw repositoryChanged(prefix.path);
+        continue;
+      }
+      if (!stats.isSymbolicLink())
+        throw repositoryChanged(prefix.path);
+      let target;
+      try {
+        target = await withinSnapshotDeadline(this.deadline, `revalidate readlink ${prefix.path}`, () => this.fileSystem.readlink(prefix.absolutePath));
+      } catch (error) {
+        if (error instanceof RepositorySnapshotError)
+          throw error;
+        throw repositoryChanged(prefix.path, error);
+      }
+      if (!target.equals(prefix.target))
+        throw repositoryChanged(prefix.path);
+    }
+  }
+}
 // packages/shared/src/prompts.ts
 import { readFileSync as readFileSync5 } from "fs";
-import { join as join4, resolve as resolve4 } from "path";
+import { join as join5, resolve as resolve5 } from "path";
 var TEMPLATE_TOKEN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 var promptTemplateCache = new Map;
 var repoDocCache = new Map;
 function resolvePromptPath(relativePath) {
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
-  const repoRoot = promptRootOverride ? resolve4(promptRootOverride) : detectRepoRoot(process.cwd());
-  return join4(repoRoot, "prompts", relativePath);
+  const repoRoot = promptRootOverride ? resolve5(promptRootOverride) : detectRepoRoot(process.cwd());
+  return join5(repoRoot, "prompts", relativePath);
 }
 function loadPromptTemplate(relativePath, replacements) {
   const promptPath = resolvePromptPath(relativePath);
@@ -3703,7 +4062,7 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
 ]);
 // packages/shared/src/repo_validation.ts
 import { closeSync, existsSync as existsSync4, openSync, readSync, readdirSync } from "fs";
-import { basename, dirname, extname, relative, resolve as resolve5 } from "path";
+import { basename, dirname, extname, relative as relative2, resolve as resolve6 } from "path";
 
 // packages/shared/src/trusted_validation.ts
 var MAX_TRUSTED_VALIDATION_COMMANDS = 8;
@@ -4315,25 +4674,25 @@ function validationSearchDirectories(paths) {
   return out;
 }
 function packageManagerAt(directory) {
-  const manifest = readJson(resolve5(directory, "package.json"));
+  const manifest = readJson(resolve6(directory, "package.json"));
   const declared = String(manifest?.packageManager ?? "").trim().split("@")[0]?.toLowerCase();
   if (["bun", "pnpm", "yarn", "npm"].includes(declared)) {
     return declared;
   }
-  if (existsSync4(resolve5(directory, "bun.lock")) || existsSync4(resolve5(directory, "bun.lockb"))) {
+  if (existsSync4(resolve6(directory, "bun.lock")) || existsSync4(resolve6(directory, "bun.lockb"))) {
     return "bun";
   }
-  if (existsSync4(resolve5(directory, "pnpm-lock.yaml")))
+  if (existsSync4(resolve6(directory, "pnpm-lock.yaml")))
     return "pnpm";
-  if (existsSync4(resolve5(directory, "yarn.lock")))
+  if (existsSync4(resolve6(directory, "yarn.lock")))
     return "yarn";
-  if (existsSync4(resolve5(directory, "package-lock.json")))
+  if (existsSync4(resolve6(directory, "package-lock.json")))
     return "npm";
   return null;
 }
 function resolvePackageManager(repoRoot, manifestDirectory) {
-  const absoluteRoot = resolve5(repoRoot);
-  let cursor = resolve5(manifestDirectory);
+  const absoluteRoot = resolve6(repoRoot);
+  let cursor = resolve6(manifestDirectory);
   while (true) {
     const manager = packageManagerAt(cursor);
     if (manager)
@@ -4341,7 +4700,7 @@ function resolvePackageManager(repoRoot, manifestDirectory) {
     if (cursor === absoluteRoot)
       break;
     const parent = dirname(cursor);
-    const relativeParent = relative(absoluteRoot, parent).replace(/\\/g, "/");
+    const relativeParent = relative2(absoluteRoot, parent).replace(/\\/g, "/");
     if (parent === cursor || relativeParent.startsWith("../"))
       break;
     cursor = parent;
@@ -4352,8 +4711,8 @@ function isJavaScriptTestPath(path) {
   return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path);
 }
 function packageValidationSteps(repoRoot, directory, changedPaths) {
-  const manifestDirectory = resolve5(repoRoot, directory || ".");
-  const manifest = readJson(resolve5(manifestDirectory, "package.json"));
+  const manifestDirectory = resolve6(repoRoot, directory || ".");
+  const manifest = readJson(resolve6(manifestDirectory, "package.json"));
   if (!manifest)
     return null;
   const manager = resolvePackageManager(repoRoot, manifestDirectory);
@@ -4363,7 +4722,7 @@ function packageValidationSteps(repoRoot, directory, changedPaths) {
     return null;
   if (manager === "bun") {
     const focusedTests = changedPaths.filter(isJavaScriptTestPath).map((path) => {
-      const relativeTest = relative(manifestDirectory, resolve5(repoRoot, path)).replace(/\\/g, "/");
+      const relativeTest = relative2(manifestDirectory, resolve6(repoRoot, path)).replace(/\\/g, "/");
       if (!relativeTest || relativeTest.startsWith("../"))
         return "";
       return commandPathArg(relativeTest, true);
@@ -4396,7 +4755,7 @@ function packageValidationSteps(repoRoot, directory, changedPaths) {
   ];
 }
 function pythonValidationSteps(repoRoot, directory, paths) {
-  const root = resolve5(repoRoot, directory || ".");
+  const root = resolve6(repoRoot, directory || ".");
   const manifestNames = [
     "pyproject.toml",
     "setup.cfg",
@@ -4405,14 +4764,14 @@ function pythonValidationSteps(repoRoot, directory, paths) {
     "tox.ini",
     "requirements.txt"
   ];
-  const hasManifest = manifestNames.some((name) => existsSync4(resolve5(root, name)));
+  const hasManifest = manifestNames.some((name) => existsSync4(resolve6(root, name)));
   const pythonPaths = paths.filter((path) => extname(path).toLowerCase() === ".py");
   if (!hasManifest)
     return null;
   const testPaths = pythonPaths.filter((path) => /(^|\/)(?:tests?|specs?)(\/|$)|(^|\/)test_[^/]+\.py$|_test\.py$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
   let evidence = "";
   for (const name of [...manifestNames, "requirements-dev.txt", "conftest.py"]) {
-    const read = readTextBounded(resolve5(root, name));
+    const read = readTextBounded(resolve6(root, name));
     if (read)
       evidence += `
 ${read.text}`;
@@ -4420,7 +4779,7 @@ ${read.text}`;
   if (testPaths.length > 0 || /\bpytest\b/i.test(evidence)) {
     return [`python -m pytest${testPaths.length > 0 ? ` ${testPaths.join(" ")}` : ""}`];
   }
-  if (existsSync4(resolve5(root, "manage.py"))) {
+  if (existsSync4(resolve6(root, "manage.py"))) {
     const managePath = commandPathArg(directory ? `${directory}/manage.py` : "manage.py");
     return managePath ? [`python ${managePath} test`] : null;
   }
@@ -4428,13 +4787,13 @@ ${read.text}`;
   return compileTargets.length > 0 ? [`python -m compileall ${compileTargets.join(" ")}`] : null;
 }
 function goValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve5(repoRoot, directory || ".", "go.mod")))
+  if (!existsSync4(resolve6(repoRoot, directory || ".", "go.mod")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./..."];
 }
 function rustValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve5(repoRoot, directory || ".", "Cargo.toml")))
+  if (!existsSync4(resolve6(repoRoot, directory || ".", "Cargo.toml")))
     return null;
   if (!directory)
     return ["cargo test"];
@@ -4442,19 +4801,19 @@ function rustValidationSteps(repoRoot, directory) {
   return manifestArg ? [`cargo test --manifest-path ${manifestArg}`] : null;
 }
 function jvmValidationSteps(repoRoot, directory) {
-  const root = resolve5(repoRoot, directory || ".");
+  const root = resolve6(repoRoot, directory || ".");
   const directoryArg = directory ? commandPathArg(directory) : "";
-  if (existsSync4(resolve5(root, "pom.xml"))) {
+  if (existsSync4(resolve6(root, "pom.xml"))) {
     const manifestArg = commandPathArg(directory ? `${directory}/pom.xml` : "pom.xml");
     return [directory && manifestArg ? `mvn -f ${manifestArg} test` : "mvn test"];
   }
-  if (existsSync4(resolve5(root, "build.gradle")) || existsSync4(resolve5(root, "build.gradle.kts"))) {
+  if (existsSync4(resolve6(root, "build.gradle")) || existsSync4(resolve6(root, "build.gradle.kts"))) {
     return [directoryArg ? `gradle -p ${directoryArg} test` : "gradle test"];
   }
   return null;
 }
 function dotnetValidationSteps(repoRoot, directory, paths) {
-  const root = resolve5(repoRoot, directory || ".");
+  const root = resolve6(repoRoot, directory || ".");
   const explicitProject = paths.find((path) => /\.(?:sln|csproj|fsproj)$/i.test(path));
   let project = explicitProject ?? "";
   if (!project) {
@@ -4469,25 +4828,25 @@ function dotnetValidationSteps(repoRoot, directory, paths) {
   return projectArg ? [`dotnet test ${projectArg}`] : null;
 }
 function rubyValidationSteps(repoRoot, directory, paths) {
-  const root = resolve5(repoRoot, directory || ".");
+  const root = resolve6(repoRoot, directory || ".");
   const rubyPaths = paths.filter((path) => extname(path).toLowerCase() === ".rb");
-  const hasRubyProjectEvidence = existsSync4(resolve5(root, "Gemfile")) || existsSync4(resolve5(root, "Rakefile")) || existsSync4(resolve5(root, ".rspec"));
+  const hasRubyProjectEvidence = existsSync4(resolve6(root, "Gemfile")) || existsSync4(resolve6(root, "Rakefile")) || existsSync4(resolve6(root, ".rspec"));
   if (directory && !hasRubyProjectEvidence)
     return null;
-  if (!directory && existsSync4(resolve5(root, "Gemfile"))) {
+  if (!directory && existsSync4(resolve6(root, "Gemfile"))) {
     const tests = rubyPaths.filter((path) => /(^|\/)spec(s)?(\/|$)|_spec\.rb$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
-    if (tests.length > 0 || existsSync4(resolve5(root, "spec")) || existsSync4(resolve5(root, ".rspec"))) {
+    if (tests.length > 0 || existsSync4(resolve6(root, "spec")) || existsSync4(resolve6(root, ".rspec"))) {
       return [`bundle exec rspec${tests.length > 0 ? ` ${tests.join(" ")}` : ""}`];
     }
-    if (existsSync4(resolve5(root, "Rakefile")))
+    if (existsSync4(resolve6(root, "Rakefile")))
       return ["bundle exec rake test"];
   }
   const target = commandPathArg(rubyPaths[0] ?? "");
   return target ? [`ruby -c ${target}`] : null;
 }
 function phpValidationSteps(repoRoot, directory, paths) {
-  const root = resolve5(repoRoot, directory || ".");
-  const composer = readJson(resolve5(root, "composer.json"));
+  const root = resolve6(repoRoot, directory || ".");
+  const composer = readJson(resolve6(root, "composer.json"));
   if (directory && !composer)
     return null;
   const scripts = composer?.scripts && typeof composer.scripts === "object" && !Array.isArray(composer.scripts) ? composer.scripts : null;
@@ -4508,11 +4867,11 @@ function changedManifestAt(paths, directory, names) {
   });
 }
 function makeValidationSteps(repoRoot, directory) {
-  const root = resolve5(repoRoot, directory || ".");
-  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve5(root, name)));
+  const root = resolve6(repoRoot, directory || ".");
+  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve6(root, name)));
   if (!makefile)
     return null;
-  const evidence = readTextBounded(resolve5(root, makefile));
+  const evidence = readTextBounded(resolve6(root, makefile));
   if (!evidence)
     return null;
   const target = ["test", "check"].find((name) => new RegExp(`^${name}\\s*:(?![=])`, "m").test(evidence.text));
@@ -4522,7 +4881,7 @@ function makeValidationSteps(repoRoot, directory) {
   return [directoryArg ? `make -C ${directoryArg} ${target}` : `make ${target}`];
 }
 function cmakeValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve5(repoRoot, directory || ".", "CMakeLists.txt")))
+  if (!existsSync4(resolve6(repoRoot, directory || ".", "CMakeLists.txt")))
     return null;
   const sourceArg = directory ? commandPathArg(directory) : ".";
   const buildPath = directory ? `${directory}/build` : "build";
@@ -4536,13 +4895,13 @@ function cmakeValidationSteps(repoRoot, directory) {
   ];
 }
 function hasBazelWorkspaceAt(repoRoot) {
-  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve5(repoRoot, name)));
+  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve6(repoRoot, name)));
 }
 function bazelValidationSteps(repoRoot, directory) {
   if (!hasBazelWorkspaceAt(repoRoot))
     return null;
-  const root = resolve5(repoRoot, directory || ".");
-  const hasPackage = existsSync4(resolve5(root, "BUILD")) || existsSync4(resolve5(root, "BUILD.bazel"));
+  const root = resolve6(repoRoot, directory || ".");
+  const hasPackage = existsSync4(resolve6(root, "BUILD")) || existsSync4(resolve6(root, "BUILD.bazel"));
   if (directory && !hasPackage)
     return null;
   const target = directory ? `//${directory}/...` : "//...";
@@ -4567,15 +4926,15 @@ function nativeValidationSteps(repoRoot, directory, paths) {
   return cmakeValidationSteps(repoRoot, directory) ?? bazelValidationSteps(repoRoot, directory) ?? makeValidationSteps(repoRoot, directory);
 }
 function protobufValidationSteps(repoRoot, directory) {
-  const root = resolve5(repoRoot, directory || ".");
-  if (!existsSync4(resolve5(root, "buf.yaml")) && !existsSync4(resolve5(root, "buf.work.yaml"))) {
+  const root = resolve6(repoRoot, directory || ".");
+  if (!existsSync4(resolve6(root, "buf.yaml")) && !existsSync4(resolve6(root, "buf.work.yaml"))) {
     return null;
   }
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `buf lint ${directoryArg}` : "buf lint"];
 }
 function swiftValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve5(repoRoot, directory || ".", "Package.swift")))
+  if (!existsSync4(resolve6(repoRoot, directory || ".", "Package.swift")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `swift test --package-path ${directoryArg}` : "swift test"];
@@ -4588,14 +4947,14 @@ function withoutYamlComments(text) {
 `);
 }
 function dartValidationSteps(repoRoot, directory, paths) {
-  const root = resolve5(repoRoot, directory || ".");
-  const pubspec = readTextBounded(resolve5(root, "pubspec.yaml"));
+  const root = resolve6(repoRoot, directory || ".");
+  const pubspec = readTextBounded(resolve6(root, "pubspec.yaml"));
   if (!pubspec)
     return null;
   const pubspecEvidence = withoutYamlComments(pubspec.text);
   const executable = /\bsdk\s*:\s*flutter\b|^flutter\s*:/m.test(pubspecEvidence) ? "flutter" : "dart";
   if (directory && executable === "flutter") {
-    const rootPubspec = readTextBounded(resolve5(repoRoot, "pubspec.yaml"));
+    const rootPubspec = readTextBounded(resolve6(repoRoot, "pubspec.yaml"));
     if (!rootPubspec || !/^workspace\s*:/m.test(withoutYamlComments(rootPubspec.text)) || !/^resolution\s*:\s*workspace\s*$/m.test(pubspecEvidence)) {
       return null;
     }
@@ -4609,12 +4968,12 @@ function dartValidationSteps(repoRoot, directory, paths) {
     return [`${executable} test ${focusedTests.join(" ")}`];
   if (!directory)
     return [`${executable} test`];
-  const relativeTests = existsSync4(resolve5(root, "test")) ? `${directory}/test` : existsSync4(resolve5(root, "integration_test")) ? `${directory}/integration_test` : "";
+  const relativeTests = existsSync4(resolve6(root, "test")) ? `${directory}/test` : existsSync4(resolve6(root, "integration_test")) ? `${directory}/integration_test` : "";
   const target = commandPathArg(relativeTests);
   return target ? [`${executable} test ${target}`] : null;
 }
 function elixirValidationSteps(repoRoot, directory, paths) {
-  if (!existsSync4(resolve5(repoRoot, directory || ".", "mix.exs")))
+  if (!existsSync4(resolve6(repoRoot, directory || ".", "mix.exs")))
     return null;
   if (directory) {
     const directoryArg = commandPathArg(directory);
@@ -4624,7 +4983,7 @@ function elixirValidationSteps(repoRoot, directory, paths) {
   return [`mix test${focusedTests.length > 0 ? ` ${focusedTests.join(" ")}` : ""}`];
 }
 function hasCabalManifest(directory) {
-  if (existsSync4(resolve5(directory, "cabal.project")))
+  if (existsSync4(resolve6(directory, "cabal.project")))
     return true;
   try {
     return readdirSync(directory).some((entry) => entry.toLowerCase().endsWith(".cabal"));
@@ -4633,8 +4992,8 @@ function hasCabalManifest(directory) {
   }
 }
 function haskellValidationSteps(repoRoot, directory) {
-  const root = resolve5(repoRoot, directory || ".");
-  if (existsSync4(resolve5(root, "stack.yaml"))) {
+  const root = resolve6(repoRoot, directory || ".");
+  if (existsSync4(resolve6(root, "stack.yaml"))) {
     if (!directory)
       return ["stack test"];
     const yamlArg = commandPathArg(`${directory}/stack.yaml`);
@@ -4696,7 +5055,7 @@ function ednMapAfterKeyword(text, keyword) {
 function clojureValidationSteps(repoRoot, directory) {
   if (directory)
     return null;
-  const deps = readTextBounded(resolve5(repoRoot, "deps.edn"));
+  const deps = readTextBounded(resolve6(repoRoot, "deps.edn"));
   if (deps) {
     const testAlias = ednMapAfterKeyword(deps.text, ":test");
     if (/:exec-fn\b/.test(testAlias))
@@ -4704,12 +5063,12 @@ function clojureValidationSteps(repoRoot, directory) {
     if (/:main-opts\b/.test(testAlias))
       return ["clojure -M:test"];
   }
-  if (existsSync4(resolve5(repoRoot, "project.clj")))
+  if (existsSync4(resolve6(repoRoot, "project.clj")))
     return ["lein test"];
   return null;
 }
 function zigValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve5(repoRoot, directory || ".", "build.zig")))
+  if (!existsSync4(resolve6(repoRoot, directory || ".", "build.zig")))
     return null;
   if (!directory)
     return ["zig build test"];
@@ -4820,7 +5179,7 @@ function isFallbackEligiblePath(path) {
 }
 function inferRepositoryValidationSteps(options) {
   const maxSteps = Math.max(1, Math.min(8, Math.floor(options.maxSteps ?? 4)));
-  const repoRoot = resolve5(options.repoRoot || ".");
+  const repoRoot = resolve6(options.repoRoot || ".");
   const paths = (options.changedPaths ?? []).map(normalizeRepoPath).filter(Boolean);
   const plans = [];
   for (const group of pathsByEcosystem(paths)) {
@@ -4956,7 +5315,7 @@ function resolveGitCommandTimeoutMs(args, requestedTimeout, env = process.env) {
   return networkCommand ? positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_NETWORK_TIMEOUT_MS, DEFAULT_GIT_NETWORK_TIMEOUT_MS) : positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_COMMAND_TIMEOUT_MS, DEFAULT_GIT_COMMAND_TIMEOUT_MS);
 }
 function normalizeFsPathForComparison(value) {
-  const resolved = resolve6(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
+  const resolved = resolve7(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 function parseGitWorktreeListPorcelain(stdout) {
@@ -6314,7 +6673,7 @@ async function maintainIntegrationBeforeCompletionClaim(options) {
 // apps/source_control_manager/src/review_agent.ts
 import { existsSync as existsSync5, readFileSync as readFileSync6 } from "fs";
 import { tmpdir } from "os";
-import { basename as basename2, delimiter, isAbsolute as isAbsolute2, join as join5, resolve as resolve7 } from "path";
+import { basename as basename2, delimiter, isAbsolute as isAbsolute3, join as join6, resolve as resolve8 } from "path";
 async function listPersistedPrLinks(opts) {
   const headers = {};
   if (opts.authToken)
@@ -6395,7 +6754,7 @@ var REPEATED_REVIEW_FINDING_MIN_PRIOR_COMMENTS = 3;
 var PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 var JOB_ID_MARKER = "pushpals-jobId";
 var SESSION_ID_MARKER = "pushpals-sessionId";
-var DEFAULT_WORKSPACE_ROOT = resolve7(import.meta.dir, "..", "..", "..");
+var DEFAULT_WORKSPACE_ROOT = resolve8(import.meta.dir, "..", "..", "..");
 var DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS = 5000;
 var DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 var ts = () => new Date().toISOString();
@@ -6404,12 +6763,12 @@ function resolveReviewValidationRepoRoot() {
     const config = loadPushPalsConfig();
     const scmRepo = String(config.sourceControlManager.repoPath ?? "").trim();
     if (scmRepo && existsSync5(scmRepo))
-      return resolve7(scmRepo);
+      return resolve8(scmRepo);
     const projectRoot = String(config.projectRoot ?? "").trim();
     if (projectRoot && existsSync5(projectRoot))
-      return resolve7(projectRoot);
+      return resolve8(projectRoot);
   } catch {}
-  return resolve7(process.cwd());
+  return resolve8(process.cwd());
 }
 var DEFAULT_DEPS = {
   repositoryServices: null,
@@ -6431,7 +6790,7 @@ var DEFAULT_DEPS = {
   httpTimeoutMs: DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS,
   httpMaxResponseBytes: DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES,
   now: () => Date.now(),
-  sleep: (ms) => new Promise((resolve8) => setTimeout(resolve8, ms)),
+  sleep: (ms) => new Promise((resolve9) => setTimeout(resolve9, ms)),
   logInfo: (line) => console.log(line),
   logWarn: (line) => console.warn(line),
   logError: (line) => console.error(line),
@@ -6514,7 +6873,7 @@ function currentBunExecPath() {
     if (!dir)
       continue;
     for (const candidate of candidates) {
-      const fullPath = join5(dir, candidate);
+      const fullPath = join6(dir, candidate);
       if (existsSync5(fullPath))
         return fullPath;
     }
@@ -6558,26 +6917,26 @@ function resolveReviewerMdPath(reviewerMdPath, options) {
   if (!raw)
     return "";
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
-  const workspaceRoot = resolve7(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
-  const cwd = resolve7(options?.cwd || process.cwd());
-  if (isAbsolute2(raw))
+  const workspaceRoot = resolve8(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  const cwd = resolve8(options?.cwd || process.cwd());
+  if (isAbsolute3(raw))
     return raw;
   const candidates = new Set;
-  candidates.add(resolve7(workspaceRoot, raw));
-  candidates.add(resolve7(cwd, raw));
+  candidates.add(resolve8(workspaceRoot, raw));
+  candidates.add(resolve8(cwd, raw));
   let cursor = cwd;
   for (let i = 0;i < 6; i += 1) {
-    const parent = resolve7(cursor, "..");
+    const parent = resolve8(cursor, "..");
     if (parent === cursor)
       break;
-    candidates.add(resolve7(parent, raw));
+    candidates.add(resolve8(parent, raw));
     cursor = parent;
   }
   for (const candidate of candidates) {
     if (existsSync5(candidate))
       return candidate;
   }
-  return resolve7(workspaceRoot, raw);
+  return resolve8(workspaceRoot, raw);
 }
 function buildCodexEnv(config) {
   const env = copyEnvWithoutScmRepairAuthoritySecret(process.env);
@@ -6588,7 +6947,7 @@ function buildCodexEnv(config) {
   return env;
 }
 async function invokeCodexReview(prompt, config) {
-  const tmpFile = join5(tmpdir(), `review-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+  const tmpFile = join6(tmpdir(), `review-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   const codexCmd = resolveCodexCmd(config.codexBin);
   const args = buildCodexExecArgs(codexCmd, tmpFile);
   try {
@@ -9106,13 +9465,13 @@ function createStatusServer(db, port, healthProvider = () => ({
 }
 
 // apps/source_control_manager/src/runtime_paths.ts
-import { resolve as resolve8 } from "path";
+import { resolve as resolve9 } from "path";
 function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = process.cwd()) {
   const configuredRoot = String(projectRoot ?? "").trim();
   if (configuredRoot) {
-    return resolve8(configuredRoot);
+    return resolve9(configuredRoot);
   }
-  return resolve8(fallbackCwd);
+  return resolve9(fallbackCwd);
 }
 
 // apps/source_control_manager/src/completion_callback.ts
@@ -9171,7 +9530,7 @@ async function postCompletionCallbackWithRetry(options) {
 var postCompletionProcessedWithRetry = postCompletionCallbackWithRetry;
 
 // apps/source_control_manager/src/completion_gc.ts
-import { createHash as createHash2, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash3, randomUUID as randomUUID2 } from "crypto";
 import {
   closeSync as closeSync2,
   existsSync as existsSync6,
@@ -9184,7 +9543,7 @@ import {
   unlinkSync as unlinkSync3,
   writeFileSync as writeFileSync3
 } from "fs";
-import { join as join6 } from "path";
+import { join as join7 } from "path";
 var COMPLETION_GC_VERSION = 1;
 var SHA_RE2 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 var SAFE_COMPLETION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/;
@@ -9193,7 +9552,7 @@ var SAFE_PUSHPALS_REF_RE = /^refs\/pushpals\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 var SAFE_VALIDATION_REF_RE = /^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/(?:baseline|candidate|validated)$/i;
 var MAX_ADDITIONAL_VALIDATION_REFS = 24;
 function validationNamespace(completionId) {
-  const key = createHash2("sha256").update(completionId).digest("hex").slice(0, 32);
+  const key = createHash3("sha256").update(completionId).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function isSafePushpalsRef(value) {
@@ -9308,12 +9667,12 @@ class CompletionGcJournal {
   directory;
   cursor = 0;
   constructor(stateDir) {
-    this.directory = join6(stateDir, "completion-ref-gc");
+    this.directory = join7(stateDir, "completion-ref-gc");
     mkdirSync3(this.directory, { recursive: true });
   }
   pathFor(record) {
-    const key = createHash2("sha256").update(record.completionId).digest("hex").slice(0, 32);
-    return join6(this.directory, `${key}-${record.claimGeneration}.json`);
+    const key = createHash3("sha256").update(record.completionId).digest("hex").slice(0, 32);
+    return join7(this.directory, `${key}-${record.claimGeneration}.json`);
   }
   enqueue(input) {
     const record = normalizeRecord(input);
@@ -9365,7 +9724,7 @@ class CompletionGcJournal {
     this.cursor = (start + selectedCount) % names.length;
     const records = [];
     for (const name of selected) {
-      const path = join6(this.directory, name);
+      const path = join7(this.directory, name);
       try {
         const record = normalizeRecord(JSON.parse(readFileSync7(path, "utf8")));
         if (this.pathFor(record) !== path) {
@@ -9700,9 +10059,9 @@ async function isValidationCheckpointPublished(options) {
 }
 
 // apps/source_control_manager/src/trusted_validation.ts
-import { createHash as createHash3 } from "crypto";
+import { createHash as createHash4 } from "crypto";
 import { existsSync as existsSync7, readFileSync as readFileSync8, rmSync, writeFileSync as writeFileSync4 } from "fs";
-import { basename as basename3, resolve as resolve9 } from "path";
+import { basename as basename3, resolve as resolve10 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60000;
 var PROCESS_STREAM_DRAIN_GRACE_MS = 2000;
 var PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
@@ -9778,14 +10137,14 @@ function trustedValidationInstallFingerprint(options) {
   const baseSha = String(options.invariantContext?.baseSha ?? "").trim().toLowerCase();
   if (!candidateSha || !baseSha)
     return null;
-  const packagePath = resolve9(options.repoPath, "package.json");
+  const packagePath = resolve10(options.repoPath, "package.json");
   const lockPath = [
-    resolve9(options.repoPath, "bun.lock"),
-    resolve9(options.repoPath, "bun.lockb")
+    resolve10(options.repoPath, "bun.lock"),
+    resolve10(options.repoPath, "bun.lockb")
   ].find((path) => existsSync7(path));
   if (!existsSync7(packagePath) || !lockPath)
     return null;
-  const hash = createHash3("sha256");
+  const hash = createHash4("sha256");
   hash.update(`platform=${process.platform}-${process.arch}
 `);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}
@@ -9806,7 +10165,7 @@ function trustedValidationInstallFingerprint(options) {
   return hash.digest("hex");
 }
 function trustedInstallMarkerPath(repoPath) {
-  return resolve9(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
+  return resolve10(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
 }
 function invalidateTrustedInstallMarker(repoPath) {
   const markerPath = trustedInstallMarkerPath(repoPath);
@@ -9868,7 +10227,7 @@ async function waitForTrustedInstallFlight(promise, timeoutMs, signal) {
 async function ensureTrustedValidationInstall(options) {
   const waitStartedAt = Date.now();
   const waitDeadline = waitStartedAt + Math.max(1, options.singleFlightWaitMs ?? options.timeoutMs + 1000);
-  const flightKey = resolve9(options.repoPath);
+  const flightKey = resolve10(options.repoPath);
   const requestedFingerprint = trustedValidationInstallFingerprint(options);
   let waitedForFlight = false;
   while (true) {
@@ -10140,7 +10499,7 @@ function isTransientTrustedValidationFailure(result) {
 }
 
 // apps/source_control_manager/src/validation_repair_publication.ts
-import { createHash as createHash4 } from "crypto";
+import { createHash as createHash5 } from "crypto";
 var SHA_RE3 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 var MAX_REPAIR_CHAIN_COMMITS = 32;
 function normalizeSha3(value) {
@@ -10148,7 +10507,7 @@ function normalizeSha3(value) {
   return SHA_RE3.test(normalized) ? normalized : "";
 }
 function validationCheckpointNamespace(completionId) {
-  const key = createHash4("sha256").update(String(completionId)).digest("hex").slice(0, 32);
+  const key = createHash5("sha256").update(String(completionId)).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function validationCheckpointRefs(completionId, claimGeneration) {
@@ -10524,7 +10883,7 @@ ${dirty}`, dirty);
 }
 
 // apps/source_control_manager/src/config.ts
-import { resolve as resolve10 } from "path";
+import { resolve as resolve11 } from "path";
 function buildDefaults(options = {}) {
   const pushConfig = loadPushPalsConfig({ reload: options.reload });
   const defaultLocalServer = resolveLocalServerConnection({
@@ -10533,7 +10892,7 @@ function buildDefaults(options = {}) {
     fallbackPort: pushConfig.server.port
   });
   return {
-    repoPath: resolve10(pushConfig.sourceControlManager.repoPath),
+    repoPath: resolve11(pushConfig.sourceControlManager.repoPath),
     serverUrl: defaultLocalServer.serverUrl,
     remote: pushConfig.sourceControlManager.remote,
     mainBranch: pushConfig.sourceControlManager.mainBranch,
@@ -10541,7 +10900,7 @@ function buildDefaults(options = {}) {
     branchPrefix: pushConfig.sourceControlManager.branchPrefix,
     pollIntervalSeconds: pushConfig.sourceControlManager.pollIntervalSeconds,
     checks: pushConfig.sourceControlManager.checks.map((check) => ({ ...check })),
-    stateDir: resolve10(pushConfig.sourceControlManager.stateDir),
+    stateDir: resolve11(pushConfig.sourceControlManager.stateDir),
     port: pushConfig.sourceControlManager.port,
     deleteAfterMerge: pushConfig.sourceControlManager.deleteAfterMerge,
     maxAttempts: pushConfig.sourceControlManager.maxAttempts,
@@ -10642,7 +11001,7 @@ try {
   scrubScmRepairAuthoritySecretFromEnv(process.env);
 }
 var repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
-var defaultSourceControlManagerRepoPath = resolve11(PUSH_CONFIG.sourceControlManager.repoPath);
+var defaultSourceControlManagerRepoPath = resolve12(PUSH_CONFIG.sourceControlManager.repoPath);
 var COMPLETION_LEASE_MS = 3 * 60000;
 var COMPLETION_LEASE_HEARTBEAT_MS = 30000;
 var PUBLICATION_HEALTH_POLL_MS = 1e4;
@@ -10700,7 +11059,7 @@ if (typeof args.config === "string" && args.config.trim()) {
 var config = loadConfig();
 var cliOverrides = {};
 if (typeof args.repo === "string")
-  cliOverrides.repoPath = resolve11(args.repo);
+  cliOverrides.repoPath = resolve12(args.repo);
 if (typeof args.server === "string")
   cliOverrides.serverUrl = args.server;
 if (typeof args.port === "string") {
@@ -10728,14 +11087,14 @@ if (typeof args.interval === "string") {
   }
 }
 if (typeof args["state-dir"] === "string")
-  cliOverrides.stateDir = resolve11(args["state-dir"]);
+  cliOverrides.stateDir = resolve12(args["state-dir"]);
 if (args["delete-after-merge"])
   cliOverrides.deleteAfterMerge = true;
 config = applyCliOverrides(config, cliOverrides);
-config.repoPath = resolve11(config.repoPath);
+config.repoPath = resolve12(config.repoPath);
 var integrationBaseBranch = config.integrationBaseBranch;
 var integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
-var usingDefaultRepoPath = resolve11(config.repoPath) === resolve11(defaultSourceControlManagerRepoPath);
+var usingDefaultRepoPath = resolve12(config.repoPath) === resolve12(defaultSourceControlManagerRepoPath);
 try {
   validateConfig(config);
 } catch (err) {
@@ -10771,10 +11130,10 @@ if (!lock.acquire()) {
   process.exit(1);
 }
 console.log(`[${ts2()}] Lock acquired`);
-var dbPath = join7(config.stateDir, "merge_queue.db");
+var dbPath = join8(config.stateDir, "merge_queue.db");
 var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
-var sourceControlManagerPusherId = `source_control_manager-${createHash5("sha256").update(`${config.repoPath}
+var sourceControlManagerPusherId = `source_control_manager-${createHash6("sha256").update(`${config.repoPath}
 ${config.mainBranch}
 ${config.remote}`).digest("hex").slice(0, 12)}-${process.pid}-${randomUUID3().slice(0, 8)}`;
 var repositoryServices = createRepositoryAgentServiceClients({
@@ -12128,7 +12487,7 @@ async function ensureDefaultSourceControlManagerWorktree() {
   const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
   if (probe.ok)
     return;
-  mkdirSync4(resolve11(config.repoPath, ".."), { recursive: true });
+  mkdirSync4(resolve12(config.repoPath, ".."), { recursive: true });
   await runGitCapture(["worktree", "prune"]);
   const seedCandidates = [
     `${config.remote}/${config.mainBranch}`,
@@ -12166,8 +12525,8 @@ ${addResult.stdout}`.toLowerCase();
   console.log(`[${ts2()}] Created default source_control_manager worktree: ${config.repoPath} (seed: ${seedRef})`);
 }
 function ensureRepoPathIsIsolatedWorktree() {
-  const rel = relative2(repoRoot, config.repoPath).replace(/\\/g, "/");
-  const insideRepoRoot = rel === "" || !rel.startsWith("../") && !isAbsolute3(rel);
+  const rel = relative3(repoRoot, config.repoPath).replace(/\\/g, "/");
+  const insideRepoRoot = rel === "" || !rel.startsWith("../") && !isAbsolute4(rel);
   const insideWorktrees = rel === ".worktrees" || rel.startsWith(".worktrees/");
   if (insideRepoRoot && !insideWorktrees) {
     throw new Error(`Unsafe source_control_manager repoPath (${config.repoPath}). Use a dedicated worktree path (recommended: ${defaultSourceControlManagerRepoPath}) so your active workspace branch is never switched.`);

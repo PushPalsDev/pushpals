@@ -62,8 +62,10 @@ describe("bounded WorkerPal subprocesses", () => {
     expect(result.exitCode).toBe(0);
     expect(result.timedOut).toBeFalse();
     expect(result.drainTimedOut).toBeFalse();
-    expect(result.stdout).toContain("[pushpals: process output truncated]");
-    expect(result.stderr).toContain("[pushpals: process output truncated]");
+    expect(result.stdoutTruncated).toBeTrue();
+    expect(result.stderrTruncated).toBeTrue();
+    expect(result.stdout).not.toContain("[pushpals: process output truncated]");
+    expect(result.stderr).not.toContain("[pushpals: process output truncated]");
     expect(result.stdout.length).toBeLessThan(1_100);
     expect(result.stderr.length).toBeLessThan(1_100);
   });
@@ -89,7 +91,8 @@ describe("bounded WorkerPal subprocesses", () => {
       spawn,
     });
 
-    expect(result.stdout).toContain("[pushpals: process output truncated]");
+    expect(result.stdoutTruncated).toBeTrue();
+    expect(result.stdout).not.toContain("[pushpals: process output truncated]");
     expect(result.stdout).toContain(sentinel);
     expect(lines[0]).toBe("first partial line");
     expect(lines.at(-1)).toBe(sentinel);
