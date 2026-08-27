@@ -4,9 +4,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Database } from "bun:sqlite";
+import {
+  SCM_REPAIR_AUTHORITY_HEADER,
+  SCM_REPAIR_AUTHORITY_SECRET_ENV,
+  createScmRepairAuthorityProof,
+} from "../packages/shared/src/scm_repair_authority";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
+const TEST_SCM_REPAIR_AUTHORITY_SECRET = "test-scm-repair-authority-secret-0123456789abcdef";
 
 type SpawnedServer = {
   proc: ReturnType<typeof Bun.spawn>;
@@ -142,6 +148,7 @@ function spawnServer(
         PUSHPALS_CONFIG_DIR_OVERRIDE: join(root, "configs"),
         PUSHPALS_PORT: String(port),
         PUSHPALS_WORKER_RUNTIME_GENERATION: runtimeGeneration,
+        [SCM_REPAIR_AUTHORITY_SECRET_ENV]: TEST_SCM_REPAIR_AUTHORITY_SECRET,
       },
     },
   );
@@ -189,12 +196,22 @@ function postServerJson(
   port: number,
   path: string,
   body: Record<string, unknown>,
+  headers: Record<string, string> = {},
 ): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
+}
+
+function scmRepairAuthorityHeaders(body: Record<string, unknown>): Record<string, string> {
+  return {
+    [SCM_REPAIR_AUTHORITY_HEADER]: createScmRepairAuthorityProof(
+      body,
+      TEST_SCM_REPAIR_AUTHORITY_SECRET,
+    ),
+  };
 }
 
 async function connectSessionSocket(
@@ -299,6 +316,32 @@ async function seedPendingPublication(
   expect(completionPayload).toMatchObject({ ok: true });
   expect(completionId).not.toBe("");
   return { jobId, completionId };
+}
+
+async function seedPublishedPrJob(port: number, label: string, prNumber: number): Promise<string> {
+  const prUrl = `https://github.com/example/repo/pull/${prNumber}`;
+  const enqueued = await postServerJson(port, "/jobs/enqueue", {
+    taskId: `published-pr-source-${label}`,
+    sessionId: `published-pr-source-${label}`,
+    kind: "task.execute",
+    params: { origin: "user" },
+  });
+  expect(enqueued.status).toBe(201);
+  const jobId = String(((await enqueued.json()) as Record<string, unknown>).jobId ?? "");
+  const claimed = await postServerJson(port, "/jobs/claim", {
+    workerId: `published-pr-worker-${label}`,
+  });
+  const claimedJob = ((await claimed.json()) as { job: { id: string; claimGeneration: number } })
+    .job;
+  expect(claimedJob.id).toBe(jobId);
+  const completed = await postServerJson(port, `/jobs/${jobId}/complete`, {
+    workerId: `published-pr-worker-${label}`,
+    claimGeneration: claimedJob.claimGeneration,
+    summary: "published",
+    prUrl,
+  });
+  expect(completed.status).toBe(200);
+  return jobId;
 }
 
 function autonomyRequestMetadata(label: string): Record<string, unknown> {
@@ -545,9 +588,45 @@ describe("server session message route", () => {
     const accepted = await postJson("/requests/enqueue", {
       ...requestBody,
       idempotencyKey: "autonomy:obj_route_reservation",
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationTtlMs: 30_000,
     });
     expect(accepted.status).toBe(201);
-    expect(await accepted.json()).toMatchObject({ ok: true, requestId: expect.any(String) });
+    const acceptedPayload = await accepted.json();
+    const acceptedRequestId = String(acceptedPayload.requestId ?? "");
+    const acceptedConfirmationToken = String(acceptedPayload.dispatchConfirmationToken ?? "");
+    expect(acceptedPayload).toMatchObject({
+      ok: true,
+      requestId: expect.any(String),
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationToken: expect.any(String),
+    });
+
+    const prematureClaim = await postJson("/requests/claim", {
+      agentId: "remotebuddy-before-dispatch-confirmation",
+    });
+    expect(prematureClaim.status).toBe(404);
+
+    const provisionalDetail = await fetch(`http://127.0.0.1:${port}/requests/${acceptedRequestId}`);
+    expect(provisionalDetail.status).toBe(200);
+    expect(await provisionalDetail.json()).toMatchObject({
+      ok: true,
+      request: { dispatchConfirmationToken: null },
+    });
+    const provisionalList = await fetch(`http://127.0.0.1:${port}/requests?status=pending`);
+    expect(provisionalList.status).toBe(200);
+    const provisionalListPayload = await provisionalList.json();
+    expect(
+      (provisionalListPayload.requests as Array<Record<string, unknown>>).find(
+        (entry) => entry.id === acceptedRequestId,
+      )?.dispatchConfirmationToken,
+    ).toBeNull();
+
+    const confirmed = await postJson(`/requests/${acceptedRequestId}/dispatch/confirm`, {
+      dispatchConfirmationToken: acceptedConfirmationToken,
+    });
+    expect(confirmed.status).toBe(200);
+    expect(await confirmed.json()).toMatchObject({ ok: true, confirmed: true });
 
     const claimed = await postJson("/requests/claim", {
       agentId: "remotebuddy-orchestrator",
@@ -565,6 +644,16 @@ describe("server session message route", () => {
         },
       },
     });
+
+    const confirmationReplay = await postJson(`/requests/${acceptedRequestId}/dispatch/confirm`, {
+      dispatchConfirmationToken: acceptedConfirmationToken,
+    });
+    expect(confirmationReplay.status).toBe(200);
+    expect(await confirmationReplay.json()).toMatchObject({
+      ok: true,
+      confirmed: true,
+      idempotent: true,
+    });
   }, 15_000);
 
   test("authoritatively rejects new autonomy admission at publication capacity", async () => {
@@ -574,6 +663,7 @@ describe("server session message route", () => {
 
     const server = spawnServer(root, port);
     await waitForHealth(server, port);
+    const repairSourceJobId = await seedPublishedPrJob(port, "capacity", 697);
     const firstPublication = await seedPendingPublication(port, "one");
     const firstPublicationStatus = await fetch(
       `http://127.0.0.1:${port}/completions/${firstPublication.completionId}/status`,
@@ -616,7 +706,6 @@ describe("server session message route", () => {
       ok: false,
       code: "autonomy_publication_backpressure",
       publication: { backlog: 2 },
-      onlineWorkers: 1,
       threshold: 2,
     });
 
@@ -632,8 +721,8 @@ describe("server session message route", () => {
       code: "autonomy_publication_backpressure",
     });
 
-    const admittedRepair = await postServerJson(port, "/jobs/enqueue", {
-      taskId: "repair-under-publication-pressure",
+    const spoofedRepair = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "spoofed-repair-under-publication-pressure",
       sessionId: "autonomy-publication-pressure",
       kind: "task.execute",
       workClass: "repair",
@@ -642,6 +731,70 @@ describe("server session message route", () => {
         planning: { workClass: "repair", queuePriority: "interactive" },
       },
     });
+    expect(spoofedRepair.status).toBe(429);
+    expect(await spoofedRepair.json()).toMatchObject({
+      ok: false,
+      code: "autonomy_publication_backpressure",
+    });
+
+    const forgedHeadRepair = await postServerJson(
+      port,
+      "/jobs/enqueue",
+      {
+        taskId: "forged-head-under-publication-pressure",
+        sessionId: "autonomy-publication-pressure",
+        kind: "task.execute",
+        workClass: "repair",
+        repositoryIdentity: "https://github.com/example/repo.git",
+        prUrl: "https://github.com/example/repo/pull/697",
+        params: {
+          origin: "autonomy",
+          planning: { workClass: "repair", queuePriority: "interactive" },
+          reviewAgent: {
+            prNumber: 697,
+            prUrl: "https://github.com/example/repo/pull/697",
+            repositoryIdentity: "https://github.com/example/repo.git",
+            prHeadSha: "caller-invented-head",
+            prBaseSha: "caller-invented-base",
+            resolutionType: "review_fix",
+            sourceJobId: repairSourceJobId,
+          },
+        },
+      },
+      { "x-pushpals-caller-service": "source_control_manager" },
+    );
+    expect(forgedHeadRepair.status).toBe(403);
+    expect(await forgedHeadRepair.json()).toMatchObject({
+      ok: false,
+      code: "review_repair_capability_required",
+    });
+
+    const admittedRepairBody = {
+      taskId: "repair-under-publication-pressure",
+      sessionId: "autonomy-publication-pressure",
+      kind: "task.execute",
+      workClass: "repair",
+      repositoryIdentity: "https://github.com/example/repo.git",
+      params: {
+        origin: "autonomy",
+        planning: { workClass: "repair", queuePriority: "interactive" },
+        reviewAgent: {
+          prNumber: 697,
+          prUrl: "https://github.com/example/repo/pull/697",
+          repositoryIdentity: "https://github.com/example/repo.git",
+          prHeadSha: "capacity-head",
+          prBaseSha: "capacity-base",
+          resolutionType: "review_fix",
+          sourceJobId: repairSourceJobId,
+        },
+      },
+    };
+    const admittedRepair = await postServerJson(
+      port,
+      "/jobs/enqueue",
+      admittedRepairBody,
+      scmRepairAuthorityHeaders(admittedRepairBody),
+    );
     expect(admittedRepair.status).toBe(201);
     expect(await admittedRepair.json()).toMatchObject({ ok: true, jobId: expect.any(String) });
 
@@ -659,16 +812,33 @@ describe("server session message route", () => {
 
     const server = spawnServer(root, port);
     await waitForHealth(server, port);
-    const repair = await postServerJson(port, "/jobs/enqueue", {
+    const repairSourceJobId = await seedPublishedPrJob(port, "deadline", 698);
+    const repairBody = {
       taskId: "deadline-repair",
       sessionId: "autonomy-recovery-deadline",
       kind: "task.execute",
       workClass: "repair",
+      repositoryIdentity: "https://github.com/example/repo.git",
       params: {
         origin: "autonomy",
         planning: { workClass: "repair", queuePriority: "interactive" },
+        reviewAgent: {
+          prNumber: 698,
+          prUrl: "https://github.com/example/repo/pull/698",
+          repositoryIdentity: "https://github.com/example/repo.git",
+          prHeadSha: "deadline-head",
+          prBaseSha: "deadline-base",
+          resolutionType: "review_fix",
+          sourceJobId: repairSourceJobId,
+        },
       },
-    });
+    };
+    const repair = await postServerJson(
+      port,
+      "/jobs/enqueue",
+      repairBody,
+      scmRepairAuthorityHeaders(repairBody),
+    );
     expect(repair.status).toBe(201);
     const repairJobId = String(((await repair.json()) as Record<string, unknown>).jobId ?? "");
 
@@ -701,10 +871,18 @@ describe("server session message route", () => {
       priority: "interactive",
       metadata: {
         ...autonomyRequestMetadata("deadline-recovery"),
-        autonomy: {
-          ...(autonomyRequestMetadata("deadline-recovery").autonomy as Record<string, unknown>),
-          workClass: "recovery",
-          lifecycleRecovery: true,
+      },
+      params: {
+        origin: "autonomy",
+        planning: { workClass: "repair" },
+        reviewAgent: {
+          prNumber: 698,
+          prUrl: "https://github.com/example/repo/pull/698",
+          repositoryIdentity: "https://github.com/example/repo.git",
+          prHeadSha: "deadline-head",
+          prBaseSha: "deadline-base",
+          resolutionType: "review_fix",
+          sourceJobId: repairSourceJobId,
         },
       },
     });
@@ -2352,6 +2530,7 @@ describe("server session message route", () => {
       "repository agent health",
       "repository agent lease",
       "repository agent memory feedback",
+      "request dispatch confirmation",
       "request handoff",
       "request lease",
       "request retry chain",

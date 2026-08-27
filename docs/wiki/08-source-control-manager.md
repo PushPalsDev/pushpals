@@ -53,7 +53,8 @@ When rejected:
 - SCM posts rejection comment with issues.
 - SCM auto-enqueues a fix job tied to the same PR/session context.
 - SCM includes recent PR feedback comments as additional context for that fix job.
-- SCM re-review auto-enqueue is capped at `500` attempts per PR.
+- SCM persists a PR/head repair lifecycle with bounded strategy-changing
+  attempts and a terminal exhausted tombstone that survives restart.
 - SCM reuses existing PR on subsequent iterations (no duplicate PR creation for re-review).
 
 ### 2) Direct Integration Mode (`review_agent.enabled=false`)
@@ -130,6 +131,13 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
   same-command pass on the same baseline proves recovery from a transient host
   failure without named test evidence; test, lint, and typecheck failures stay
   blocked until a new repair candidate is produced,
+- trusted dependency preparation is single-flight per repository. Reuse is
+  keyed by the exact candidate/base tree, toolchain, platform, lockfiles, and
+  normalized affected paths; candidate-sensitive validation commands always
+  rerun,
+- startup and watchdog reconciliation page unresolved repair lifecycles rather
+  than repeatedly rewriting a newest-only terminal-job window. Settled and
+  exhausted rows are monotonic and idempotent,
 - clean-repo guard (optional skip in dev),
 - retry/backoff on transient failures,
 - bounded review diff size,

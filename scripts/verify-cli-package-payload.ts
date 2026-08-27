@@ -45,6 +45,7 @@ export const REQUIRED_CLI_PACKAGE_PATHS = [
   "runtime/sandbox/packages/shared/src/repository_agent.ts",
   "runtime/sandbox/packages/shared/src/repository_identity.ts",
   "runtime/sandbox/packages/shared/src/repository_snapshot.ts",
+  "runtime/sandbox/packages/shared/src/scm_repair_authority.ts",
   "runtime/sandbox/packages/shared/src/tooling.ts",
   "runtime/sandbox/packages/protocol/package.json",
   "runtime/sandbox/packages/protocol/tsconfig.json",

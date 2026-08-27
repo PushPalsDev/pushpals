@@ -3,8 +3,8 @@ var __require = import.meta.require;
 
 // apps/source_control_manager/src/source_control_manager_main.ts
 import { parseArgs } from "util";
-import { isAbsolute as isAbsolute3, join as join6, relative as relative2, resolve as resolve10 } from "path";
-import { mkdirSync as mkdirSync3 } from "fs";
+import { isAbsolute as isAbsolute3, join as join7, relative as relative2, resolve as resolve11 } from "path";
+import { mkdirSync as mkdirSync4 } from "fs";
 import { createHash as createHash5, randomUUID as randomUUID3 } from "crypto";
 
 // packages/shared/src/bounded_fetch.ts
@@ -1712,9 +1712,26 @@ var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
 var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
 var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
   "repository_agent_cache",
+  "repository_agent_capabilities",
   "repository_facts"
 ]);
 var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+function assertMemoryPutFence(options, nowMs) {
+  if (options.signal?.aborted) {
+    throw options.signal.reason instanceof Error ? options.signal.reason : new DOMException("The memory write was aborted", "AbortError");
+  }
+  if (options.validUntil === undefined)
+    return;
+  if (typeof options.validUntil !== "string") {
+    throw new TypeError("validUntil must be an ISO timestamp");
+  }
+  const validUntilMs = Date.parse(options.validUntil);
+  if (!Number.isFinite(validUntilMs))
+    throw new TypeError("validUntil must be an ISO timestamp");
+  if (validUntilMs <= nowMs) {
+    throw new Error("Memory write commit fence expired before mutation");
+  }
+}
 
 class MemoryConflictError extends Error {
   code;
@@ -2075,7 +2092,9 @@ class InMemoryMemoryStore {
         throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
       }
     }
-    const now = this.now().toISOString();
+    const writeNow = this.now();
+    assertMemoryPutFence(options, writeNow.getTime());
+    const now = writeNow.toISOString();
     let expiresAt;
     if (input.expiresAt !== undefined) {
       expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
@@ -2112,6 +2131,7 @@ class InMemoryMemoryStore {
       invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
       invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
     };
+    assertMemoryPutFence(options, this.now().getTime());
     this.records.set(storageKey, record);
     return cloneRecord(record);
   }
@@ -2276,7 +2296,7 @@ class MemoryHttpClient {
     const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
     this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
   }
-  async request(path, method, body) {
+  async request(path, method, body, signal) {
     if (this.closed)
       throw new MemoryStoreClosedError;
     const headers = {
@@ -2288,7 +2308,7 @@ class MemoryHttpClient {
       headers.Authorization = `Bearer ${this.authToken}`;
     const response = await fetchBufferedWithHardDeadline({
       input: `${this.serverUrl}${path}`,
-      init: { method, headers, body: JSON.stringify(body) },
+      init: { method, headers, body: JSON.stringify(body), ...signal ? { signal } : {} },
       timeoutMs: this.timeoutMs,
       maxResponseBytes: this.maxResponseBytes,
       fetchImpl: this.fetchImpl,
@@ -2311,7 +2331,8 @@ class MemoryHttpClient {
     return payload;
   }
   async put(input, options = {}) {
-    const payload = await this.request("/memory/records", "PUT", { input, options });
+    const { signal, ...durableOptions } = options;
+    const payload = await this.request("/memory/records", "PUT", { input, options: durableOptions }, signal);
     if (!payload.record)
       throw new MemoryHttpError("Memory server response omitted record");
     return payload.record;
@@ -3030,6 +3051,215 @@ function createRepositoryAgentServiceClients(options) {
   });
 }
 
+// packages/shared/src/scm_repair_authority.ts
+import { createHmac, randomBytes, timingSafeEqual } from "crypto";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  readFileSync as readFileSync2,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from "fs";
+import { join as join2, resolve as resolve2 } from "path";
+var SCM_REPAIR_AUTHORITY_HEADER = "x-pushpals-scm-repair-authority";
+var SCM_REPAIR_AUTHORITY_SECRET_ENV = "PUSHPALS_SCM_REPAIR_AUTHORITY_SECRET";
+var SCM_REPAIR_AUTHORITY_VERSION = "v1";
+var SCM_REPAIR_AUTHORITY_MAX_AGE_MS = 2 * 60000;
+var SCM_REPAIR_AUTHORITY_MIN_SECRET_CHARS = 32;
+var SCM_REPAIR_AUTHORITY_CREATE_RETRY_MS = 5000;
+var SCM_REPAIR_AUTHORITY_INVALID_STABILITY_MS = 2000;
+var SCM_REPAIR_AUTHORITY_CREATE_RETRY_MIN_DELAY_MS = 10;
+var SCM_REPAIR_AUTHORITY_CREATE_RETRY_MAX_DELAY_MS = 100;
+var SCM_REPAIR_AUTHORITY_RETRYABLE_IO_CODES = new Set([
+  "EACCES",
+  "EAGAIN",
+  "EBUSY",
+  "EEXIST",
+  "EMFILE",
+  "ENFILE",
+  "ENOENT",
+  "EPERM",
+  "ETXTBSY"
+]);
+var SCM_REPAIR_AUTHORITY_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
+function normalizeAuthoritySecret(value) {
+  const secret = String(value ?? "").trim();
+  if (secret.length < SCM_REPAIR_AUTHORITY_MIN_SECRET_CHARS)
+    return "";
+  return secret;
+}
+function filesystemErrorCode(error) {
+  return String(error?.code ?? "").toUpperCase();
+}
+function isRetryableAuthorityIoError(error) {
+  return SCM_REPAIR_AUTHORITY_RETRYABLE_IO_CODES.has(filesystemErrorCode(error));
+}
+function waitForAuthorityCreationRetry(delayMs) {
+  Atomics.wait(SCM_REPAIR_AUTHORITY_RETRY_WAIT, 0, 0, Math.max(1, Math.floor(delayMs)));
+}
+function scrubScmRepairAuthoritySecretFromEnv(env) {
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === target)
+      delete env[key];
+  }
+}
+function copyEnvWithoutScmRepairAuthoritySecret(env = process.env) {
+  const copy = {};
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === target || typeof value !== "string")
+      continue;
+    copy[key] = value;
+  }
+  return copy;
+}
+function canonicalJson(value) {
+  if (value === null)
+    return "null";
+  if (typeof value === "string" || typeof value === "boolean")
+    return JSON.stringify(value);
+  if (typeof value === "number")
+    return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry === undefined ? null : entry)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value;
+    const entries = Object.keys(record).filter((key) => record[key] !== undefined).sort((left, right) => left < right ? -1 : left > right ? 1 : 0).map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return "null";
+}
+function authorityMessage(body, issuedAtMs, nonce) {
+  return `${SCM_REPAIR_AUTHORITY_VERSION}
+${issuedAtMs}
+${nonce}
+${canonicalJson(body)}`;
+}
+function authoritySignature(body, secret, issuedAtMs, nonce) {
+  return createHmac("sha256", secret).update(authorityMessage(body, issuedAtMs, nonce), "utf8").digest("base64url");
+}
+function resolveScmRepairAuthoritySecret(options) {
+  const env = options.env ?? process.env;
+  const configured = String(env[SCM_REPAIR_AUTHORITY_SECRET_ENV] ?? "").trim();
+  if (configured) {
+    const valid = normalizeAuthoritySecret(configured);
+    if (!valid) {
+      throw new Error(`${SCM_REPAIR_AUTHORITY_SECRET_ENV} must contain at least 32 characters`);
+    }
+    return valid;
+  }
+  const authorityDir = resolve2(options.dataDir, "control-plane");
+  const secretPath = join2(authorityDir, "scm-repair-authority.key");
+  mkdirSync(authorityDir, { recursive: true, mode: 448 });
+  let lastRetryableIssue = `SCM repair authority key at ${secretPath} was not ready`;
+  const inspectExisting = () => {
+    try {
+      const raw = readFileSync2(secretPath, "utf8");
+      const existing = normalizeAuthoritySecret(raw);
+      if (existing)
+        return { state: "valid", secret: existing };
+      const stats = statSync(secretPath);
+      lastRetryableIssue = `SCM repair authority key at ${secretPath} was incomplete`;
+      return {
+        state: "invalid",
+        fingerprint: `${stats.size}:${Math.floor(stats.mtimeMs)}:${raw}`
+      };
+    } catch (error) {
+      if (!isRetryableAuthorityIoError(error))
+        throw error;
+      const code = filesystemErrorCode(error);
+      lastRetryableIssue = `SCM repair authority key at ${secretPath} was not readable${code ? ` (${code})` : ""}`;
+      return code === "ENOENT" ? { state: "missing" } : { state: "transient", code };
+    }
+  };
+  const initial = inspectExisting();
+  if (initial.state === "valid")
+    return initial.secret;
+  const generated = randomBytes(32).toString("base64url");
+  const temporaryPath = join2(authorityDir, `.scm-repair-authority.${process.pid}.${randomBytes(9).toString("hex")}.tmp`);
+  writeFileSync(temporaryPath, `${generated}
+`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 384
+  });
+  const retryDeadlineMs = Date.now() + SCM_REPAIR_AUTHORITY_CREATE_RETRY_MS;
+  let retryCount = 0;
+  let stableInvalidFingerprint = "";
+  let stableInvalidSinceMs = 0;
+  try {
+    while (true) {
+      const nowMs = Date.now();
+      const existing = inspectExisting();
+      if (existing.state === "valid")
+        return existing.secret;
+      if (existing.state === "invalid") {
+        if (existing.fingerprint !== stableInvalidFingerprint) {
+          stableInvalidFingerprint = existing.fingerprint;
+          stableInvalidSinceMs = nowMs;
+        } else if (nowMs - stableInvalidSinceMs >= SCM_REPAIR_AUTHORITY_INVALID_STABILITY_MS) {
+          const confirmed = inspectExisting();
+          if (confirmed.state === "invalid" && confirmed.fingerprint === stableInvalidFingerprint) {
+            try {
+              unlinkSync(secretPath);
+              stableInvalidFingerprint = "";
+              stableInvalidSinceMs = 0;
+              continue;
+            } catch (error) {
+              if (!isRetryableAuthorityIoError(error))
+                throw error;
+            }
+          }
+        }
+      } else {
+        stableInvalidFingerprint = "";
+        stableInvalidSinceMs = 0;
+      }
+      if (existing.state === "missing") {
+        try {
+          linkSync(temporaryPath, secretPath);
+          try {
+            chmodSync(secretPath, 384);
+          } catch {}
+          return generated;
+        } catch (error) {
+          if (!isRetryableAuthorityIoError(error))
+            throw error;
+          const code = filesystemErrorCode(error);
+          lastRetryableIssue = `SCM repair authority key creation at ${secretPath} is still in progress${code ? ` (${code})` : ""}`;
+        }
+      }
+      const remainingMs = retryDeadlineMs - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(`${lastRetryableIssue}; timed out after ${SCM_REPAIR_AUTHORITY_CREATE_RETRY_MS}ms waiting for a concurrent first-start writer`);
+      }
+      retryCount += 1;
+      const delayMs = Math.min(remainingMs, SCM_REPAIR_AUTHORITY_CREATE_RETRY_MAX_DELAY_MS, SCM_REPAIR_AUTHORITY_CREATE_RETRY_MIN_DELAY_MS * retryCount);
+      waitForAuthorityCreationRetry(delayMs);
+    }
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {}
+  }
+}
+function createScmRepairAuthorityProof(body, secret, options = {}) {
+  const normalizedSecret = normalizeAuthoritySecret(secret);
+  if (!normalizedSecret)
+    throw new Error("SCM repair authority secret must contain 32 characters");
+  const issuedAtMs = Math.floor(options.nowMs ?? Date.now());
+  const nonce = String(options.nonce ?? randomBytes(18).toString("base64url")).trim();
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(nonce)) {
+    throw new Error("SCM repair authority nonce is invalid");
+  }
+  const signature = authoritySignature(body, normalizedSecret, issuedAtMs, nonce);
+  return `${SCM_REPAIR_AUTHORITY_VERSION}.${issuedAtMs}.${nonce}.${signature}`;
+}
+
 // apps/source_control_manager/src/db.ts
 import { Database } from "bun:sqlite";
 
@@ -3207,31 +3437,31 @@ class MergeQueueDB {
 }
 
 // apps/source_control_manager/src/lock.ts
-import { existsSync as existsSync2, mkdirSync, writeFileSync, unlinkSync, readFileSync as readFileSync2 } from "fs";
-import { join as join2 } from "path";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2, readFileSync as readFileSync3 } from "fs";
+import { join as join3 } from "path";
 
 class FileLock {
   lockPath;
   held = false;
   constructor(stateDir) {
-    mkdirSync(stateDir, { recursive: true });
-    this.lockPath = join2(stateDir, "merge_queue.lock");
+    mkdirSync2(stateDir, { recursive: true });
+    this.lockPath = join3(stateDir, "merge_queue.lock");
   }
   acquire() {
     if (this.held)
       return true;
     if (existsSync2(this.lockPath)) {
       try {
-        const contents = readFileSync2(this.lockPath, "utf-8");
+        const contents = readFileSync3(this.lockPath, "utf-8");
         const parsed = JSON.parse(contents);
         const pid = parsed.pid;
         if (isProcessAlive(pid)) {
           return false;
         }
-        unlinkSync(this.lockPath);
+        unlinkSync2(this.lockPath);
       } catch {
         try {
-          unlinkSync(this.lockPath);
+          unlinkSync2(this.lockPath);
         } catch {}
       }
     }
@@ -3240,7 +3470,7 @@ class FileLock {
       startedAt: new Date().toISOString()
     });
     try {
-      writeFileSync(this.lockPath, lockData, { flag: "wx" });
+      writeFileSync2(this.lockPath, lockData, { flag: "wx" });
       this.held = true;
       process.on("exit", () => this.release());
       return true;
@@ -3252,7 +3482,7 @@ class FileLock {
     if (!this.held)
       return;
     try {
-      unlinkSync(this.lockPath);
+      unlinkSync2(this.lockPath);
     } catch {}
     this.held = false;
   }
@@ -3272,30 +3502,30 @@ function isProcessAlive(pid) {
 }
 
 // apps/source_control_manager/src/git.ts
-import { resolve as resolve5, win32 as pathWin32 } from "path";
+import { resolve as resolve6, win32 as pathWin32 } from "path";
 
 // packages/shared/src/repo.ts
-import { existsSync as existsSync3, readFileSync as readFileSync3, statSync } from "fs";
-import { resolve as resolve2 } from "path";
+import { existsSync as existsSync3, readFileSync as readFileSync4, statSync as statSync2 } from "fs";
+import { resolve as resolve3 } from "path";
 function resolveDotGitEntry(repoRoot) {
-  return resolve2(repoRoot, ".git");
+  return resolve3(repoRoot, ".git");
 }
 function findGitRepoRoot(startDir) {
   const override = String(process.env.PUSHPALS_REPO_ROOT_OVERRIDE ?? "").trim();
   if (override) {
-    const resolvedOverride = resolve2(override);
+    const resolvedOverride = resolve3(override);
     if (resolveGitMetadataDir(resolvedOverride)) {
       return resolvedOverride;
     }
     console.warn(`[repo] PUSHPALS_REPO_ROOT_OVERRIDE does not point to a git repository: ${resolvedOverride}`);
   }
-  let current = resolve2(startDir);
-  const root = resolve2(current, "/");
+  let current = resolve3(startDir);
+  const root = resolve3(current, "/");
   while (current !== root) {
     if (resolveGitMetadataDir(current)) {
       return current;
     }
-    current = resolve2(current, "..");
+    current = resolve3(current, "..");
   }
   return resolveGitMetadataDir(root) ? root : null;
 }
@@ -3304,7 +3534,7 @@ function resolveGitMetadataDir(repoRoot) {
   if (!existsSync3(dotGitPath))
     return null;
   try {
-    const stat = statSync(dotGitPath);
+    const stat = statSync2(dotGitPath);
     if (stat.isDirectory()) {
       return dotGitPath;
     }
@@ -3315,11 +3545,11 @@ function resolveGitMetadataDir(repoRoot) {
     return null;
   }
   try {
-    const firstLine = readFileSync3(dotGitPath, "utf8").split(/\r?\n/, 1)[0] ?? "";
+    const firstLine = readFileSync4(dotGitPath, "utf8").split(/\r?\n/, 1)[0] ?? "";
     const match = firstLine.match(/^gitdir:\s*(.+)\s*$/i);
     if (!match)
       return null;
-    const gitDir = resolve2(repoRoot, match[1].trim());
+    const gitDir = resolve3(repoRoot, match[1].trim());
     return existsSync3(gitDir) ? gitDir : null;
   } catch {
     return null;
@@ -3339,21 +3569,21 @@ var MAX_DIFF_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024;
 var SMALL_GIT_OUTPUT_LIMIT_BYTES = 256 * 1024;
 var MAX_HASH_PATH_ARGUMENT_BYTES = 16 * 1024;
 // packages/shared/src/prompts.ts
-import { readFileSync as readFileSync4 } from "fs";
-import { join as join3, resolve as resolve3 } from "path";
+import { readFileSync as readFileSync5 } from "fs";
+import { join as join4, resolve as resolve4 } from "path";
 var TEMPLATE_TOKEN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 var promptTemplateCache = new Map;
 var repoDocCache = new Map;
 function resolvePromptPath(relativePath) {
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
-  const repoRoot = promptRootOverride ? resolve3(promptRootOverride) : detectRepoRoot(process.cwd());
-  return join3(repoRoot, "prompts", relativePath);
+  const repoRoot = promptRootOverride ? resolve4(promptRootOverride) : detectRepoRoot(process.cwd());
+  return join4(repoRoot, "prompts", relativePath);
 }
 function loadPromptTemplate(relativePath, replacements) {
   const promptPath = resolvePromptPath(relativePath);
   let template = promptTemplateCache.get(promptPath);
   if (template === undefined) {
-    template = readFileSync4(promptPath, "utf8");
+    template = readFileSync5(promptPath, "utf8");
     promptTemplateCache.set(promptPath, template);
   }
   if (!replacements || Object.keys(replacements).length === 0) {
@@ -3473,7 +3703,7 @@ var PACKAGE_MANAGER_OPTIONS_WITH_VALUE = new Set([
 ]);
 // packages/shared/src/repo_validation.ts
 import { closeSync, existsSync as existsSync4, openSync, readSync, readdirSync } from "fs";
-import { basename, dirname, extname, relative, resolve as resolve4 } from "path";
+import { basename, dirname, extname, relative, resolve as resolve5 } from "path";
 
 // packages/shared/src/trusted_validation.ts
 var MAX_TRUSTED_VALIDATION_COMMANDS = 8;
@@ -4085,25 +4315,25 @@ function validationSearchDirectories(paths) {
   return out;
 }
 function packageManagerAt(directory) {
-  const manifest = readJson(resolve4(directory, "package.json"));
+  const manifest = readJson(resolve5(directory, "package.json"));
   const declared = String(manifest?.packageManager ?? "").trim().split("@")[0]?.toLowerCase();
   if (["bun", "pnpm", "yarn", "npm"].includes(declared)) {
     return declared;
   }
-  if (existsSync4(resolve4(directory, "bun.lock")) || existsSync4(resolve4(directory, "bun.lockb"))) {
+  if (existsSync4(resolve5(directory, "bun.lock")) || existsSync4(resolve5(directory, "bun.lockb"))) {
     return "bun";
   }
-  if (existsSync4(resolve4(directory, "pnpm-lock.yaml")))
+  if (existsSync4(resolve5(directory, "pnpm-lock.yaml")))
     return "pnpm";
-  if (existsSync4(resolve4(directory, "yarn.lock")))
+  if (existsSync4(resolve5(directory, "yarn.lock")))
     return "yarn";
-  if (existsSync4(resolve4(directory, "package-lock.json")))
+  if (existsSync4(resolve5(directory, "package-lock.json")))
     return "npm";
   return null;
 }
 function resolvePackageManager(repoRoot, manifestDirectory) {
-  const absoluteRoot = resolve4(repoRoot);
-  let cursor = resolve4(manifestDirectory);
+  const absoluteRoot = resolve5(repoRoot);
+  let cursor = resolve5(manifestDirectory);
   while (true) {
     const manager = packageManagerAt(cursor);
     if (manager)
@@ -4122,8 +4352,8 @@ function isJavaScriptTestPath(path) {
   return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path);
 }
 function packageValidationSteps(repoRoot, directory, changedPaths) {
-  const manifestDirectory = resolve4(repoRoot, directory || ".");
-  const manifest = readJson(resolve4(manifestDirectory, "package.json"));
+  const manifestDirectory = resolve5(repoRoot, directory || ".");
+  const manifest = readJson(resolve5(manifestDirectory, "package.json"));
   if (!manifest)
     return null;
   const manager = resolvePackageManager(repoRoot, manifestDirectory);
@@ -4133,7 +4363,7 @@ function packageValidationSteps(repoRoot, directory, changedPaths) {
     return null;
   if (manager === "bun") {
     const focusedTests = changedPaths.filter(isJavaScriptTestPath).map((path) => {
-      const relativeTest = relative(manifestDirectory, resolve4(repoRoot, path)).replace(/\\/g, "/");
+      const relativeTest = relative(manifestDirectory, resolve5(repoRoot, path)).replace(/\\/g, "/");
       if (!relativeTest || relativeTest.startsWith("../"))
         return "";
       return commandPathArg(relativeTest, true);
@@ -4166,7 +4396,7 @@ function packageValidationSteps(repoRoot, directory, changedPaths) {
   ];
 }
 function pythonValidationSteps(repoRoot, directory, paths) {
-  const root = resolve4(repoRoot, directory || ".");
+  const root = resolve5(repoRoot, directory || ".");
   const manifestNames = [
     "pyproject.toml",
     "setup.cfg",
@@ -4175,14 +4405,14 @@ function pythonValidationSteps(repoRoot, directory, paths) {
     "tox.ini",
     "requirements.txt"
   ];
-  const hasManifest = manifestNames.some((name) => existsSync4(resolve4(root, name)));
+  const hasManifest = manifestNames.some((name) => existsSync4(resolve5(root, name)));
   const pythonPaths = paths.filter((path) => extname(path).toLowerCase() === ".py");
   if (!hasManifest)
     return null;
   const testPaths = pythonPaths.filter((path) => /(^|\/)(?:tests?|specs?)(\/|$)|(^|\/)test_[^/]+\.py$|_test\.py$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
   let evidence = "";
   for (const name of [...manifestNames, "requirements-dev.txt", "conftest.py"]) {
-    const read = readTextBounded(resolve4(root, name));
+    const read = readTextBounded(resolve5(root, name));
     if (read)
       evidence += `
 ${read.text}`;
@@ -4190,7 +4420,7 @@ ${read.text}`;
   if (testPaths.length > 0 || /\bpytest\b/i.test(evidence)) {
     return [`python -m pytest${testPaths.length > 0 ? ` ${testPaths.join(" ")}` : ""}`];
   }
-  if (existsSync4(resolve4(root, "manage.py"))) {
+  if (existsSync4(resolve5(root, "manage.py"))) {
     const managePath = commandPathArg(directory ? `${directory}/manage.py` : "manage.py");
     return managePath ? [`python ${managePath} test`] : null;
   }
@@ -4198,13 +4428,13 @@ ${read.text}`;
   return compileTargets.length > 0 ? [`python -m compileall ${compileTargets.join(" ")}`] : null;
 }
 function goValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve4(repoRoot, directory || ".", "go.mod")))
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "go.mod")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./..."];
 }
 function rustValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve4(repoRoot, directory || ".", "Cargo.toml")))
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "Cargo.toml")))
     return null;
   if (!directory)
     return ["cargo test"];
@@ -4212,19 +4442,19 @@ function rustValidationSteps(repoRoot, directory) {
   return manifestArg ? [`cargo test --manifest-path ${manifestArg}`] : null;
 }
 function jvmValidationSteps(repoRoot, directory) {
-  const root = resolve4(repoRoot, directory || ".");
+  const root = resolve5(repoRoot, directory || ".");
   const directoryArg = directory ? commandPathArg(directory) : "";
-  if (existsSync4(resolve4(root, "pom.xml"))) {
+  if (existsSync4(resolve5(root, "pom.xml"))) {
     const manifestArg = commandPathArg(directory ? `${directory}/pom.xml` : "pom.xml");
     return [directory && manifestArg ? `mvn -f ${manifestArg} test` : "mvn test"];
   }
-  if (existsSync4(resolve4(root, "build.gradle")) || existsSync4(resolve4(root, "build.gradle.kts"))) {
+  if (existsSync4(resolve5(root, "build.gradle")) || existsSync4(resolve5(root, "build.gradle.kts"))) {
     return [directoryArg ? `gradle -p ${directoryArg} test` : "gradle test"];
   }
   return null;
 }
 function dotnetValidationSteps(repoRoot, directory, paths) {
-  const root = resolve4(repoRoot, directory || ".");
+  const root = resolve5(repoRoot, directory || ".");
   const explicitProject = paths.find((path) => /\.(?:sln|csproj|fsproj)$/i.test(path));
   let project = explicitProject ?? "";
   if (!project) {
@@ -4239,25 +4469,25 @@ function dotnetValidationSteps(repoRoot, directory, paths) {
   return projectArg ? [`dotnet test ${projectArg}`] : null;
 }
 function rubyValidationSteps(repoRoot, directory, paths) {
-  const root = resolve4(repoRoot, directory || ".");
+  const root = resolve5(repoRoot, directory || ".");
   const rubyPaths = paths.filter((path) => extname(path).toLowerCase() === ".rb");
-  const hasRubyProjectEvidence = existsSync4(resolve4(root, "Gemfile")) || existsSync4(resolve4(root, "Rakefile")) || existsSync4(resolve4(root, ".rspec"));
+  const hasRubyProjectEvidence = existsSync4(resolve5(root, "Gemfile")) || existsSync4(resolve5(root, "Rakefile")) || existsSync4(resolve5(root, ".rspec"));
   if (directory && !hasRubyProjectEvidence)
     return null;
-  if (!directory && existsSync4(resolve4(root, "Gemfile"))) {
+  if (!directory && existsSync4(resolve5(root, "Gemfile"))) {
     const tests = rubyPaths.filter((path) => /(^|\/)spec(s)?(\/|$)|_spec\.rb$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
-    if (tests.length > 0 || existsSync4(resolve4(root, "spec")) || existsSync4(resolve4(root, ".rspec"))) {
+    if (tests.length > 0 || existsSync4(resolve5(root, "spec")) || existsSync4(resolve5(root, ".rspec"))) {
       return [`bundle exec rspec${tests.length > 0 ? ` ${tests.join(" ")}` : ""}`];
     }
-    if (existsSync4(resolve4(root, "Rakefile")))
+    if (existsSync4(resolve5(root, "Rakefile")))
       return ["bundle exec rake test"];
   }
   const target = commandPathArg(rubyPaths[0] ?? "");
   return target ? [`ruby -c ${target}`] : null;
 }
 function phpValidationSteps(repoRoot, directory, paths) {
-  const root = resolve4(repoRoot, directory || ".");
-  const composer = readJson(resolve4(root, "composer.json"));
+  const root = resolve5(repoRoot, directory || ".");
+  const composer = readJson(resolve5(root, "composer.json"));
   if (directory && !composer)
     return null;
   const scripts = composer?.scripts && typeof composer.scripts === "object" && !Array.isArray(composer.scripts) ? composer.scripts : null;
@@ -4278,11 +4508,11 @@ function changedManifestAt(paths, directory, names) {
   });
 }
 function makeValidationSteps(repoRoot, directory) {
-  const root = resolve4(repoRoot, directory || ".");
-  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve4(root, name)));
+  const root = resolve5(repoRoot, directory || ".");
+  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve5(root, name)));
   if (!makefile)
     return null;
-  const evidence = readTextBounded(resolve4(root, makefile));
+  const evidence = readTextBounded(resolve5(root, makefile));
   if (!evidence)
     return null;
   const target = ["test", "check"].find((name) => new RegExp(`^${name}\\s*:(?![=])`, "m").test(evidence.text));
@@ -4292,7 +4522,7 @@ function makeValidationSteps(repoRoot, directory) {
   return [directoryArg ? `make -C ${directoryArg} ${target}` : `make ${target}`];
 }
 function cmakeValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve4(repoRoot, directory || ".", "CMakeLists.txt")))
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "CMakeLists.txt")))
     return null;
   const sourceArg = directory ? commandPathArg(directory) : ".";
   const buildPath = directory ? `${directory}/build` : "build";
@@ -4306,13 +4536,13 @@ function cmakeValidationSteps(repoRoot, directory) {
   ];
 }
 function hasBazelWorkspaceAt(repoRoot) {
-  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve4(repoRoot, name)));
+  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve5(repoRoot, name)));
 }
 function bazelValidationSteps(repoRoot, directory) {
   if (!hasBazelWorkspaceAt(repoRoot))
     return null;
-  const root = resolve4(repoRoot, directory || ".");
-  const hasPackage = existsSync4(resolve4(root, "BUILD")) || existsSync4(resolve4(root, "BUILD.bazel"));
+  const root = resolve5(repoRoot, directory || ".");
+  const hasPackage = existsSync4(resolve5(root, "BUILD")) || existsSync4(resolve5(root, "BUILD.bazel"));
   if (directory && !hasPackage)
     return null;
   const target = directory ? `//${directory}/...` : "//...";
@@ -4337,15 +4567,15 @@ function nativeValidationSteps(repoRoot, directory, paths) {
   return cmakeValidationSteps(repoRoot, directory) ?? bazelValidationSteps(repoRoot, directory) ?? makeValidationSteps(repoRoot, directory);
 }
 function protobufValidationSteps(repoRoot, directory) {
-  const root = resolve4(repoRoot, directory || ".");
-  if (!existsSync4(resolve4(root, "buf.yaml")) && !existsSync4(resolve4(root, "buf.work.yaml"))) {
+  const root = resolve5(repoRoot, directory || ".");
+  if (!existsSync4(resolve5(root, "buf.yaml")) && !existsSync4(resolve5(root, "buf.work.yaml"))) {
     return null;
   }
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `buf lint ${directoryArg}` : "buf lint"];
 }
 function swiftValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve4(repoRoot, directory || ".", "Package.swift")))
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "Package.swift")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `swift test --package-path ${directoryArg}` : "swift test"];
@@ -4358,14 +4588,14 @@ function withoutYamlComments(text) {
 `);
 }
 function dartValidationSteps(repoRoot, directory, paths) {
-  const root = resolve4(repoRoot, directory || ".");
-  const pubspec = readTextBounded(resolve4(root, "pubspec.yaml"));
+  const root = resolve5(repoRoot, directory || ".");
+  const pubspec = readTextBounded(resolve5(root, "pubspec.yaml"));
   if (!pubspec)
     return null;
   const pubspecEvidence = withoutYamlComments(pubspec.text);
   const executable = /\bsdk\s*:\s*flutter\b|^flutter\s*:/m.test(pubspecEvidence) ? "flutter" : "dart";
   if (directory && executable === "flutter") {
-    const rootPubspec = readTextBounded(resolve4(repoRoot, "pubspec.yaml"));
+    const rootPubspec = readTextBounded(resolve5(repoRoot, "pubspec.yaml"));
     if (!rootPubspec || !/^workspace\s*:/m.test(withoutYamlComments(rootPubspec.text)) || !/^resolution\s*:\s*workspace\s*$/m.test(pubspecEvidence)) {
       return null;
     }
@@ -4379,12 +4609,12 @@ function dartValidationSteps(repoRoot, directory, paths) {
     return [`${executable} test ${focusedTests.join(" ")}`];
   if (!directory)
     return [`${executable} test`];
-  const relativeTests = existsSync4(resolve4(root, "test")) ? `${directory}/test` : existsSync4(resolve4(root, "integration_test")) ? `${directory}/integration_test` : "";
+  const relativeTests = existsSync4(resolve5(root, "test")) ? `${directory}/test` : existsSync4(resolve5(root, "integration_test")) ? `${directory}/integration_test` : "";
   const target = commandPathArg(relativeTests);
   return target ? [`${executable} test ${target}`] : null;
 }
 function elixirValidationSteps(repoRoot, directory, paths) {
-  if (!existsSync4(resolve4(repoRoot, directory || ".", "mix.exs")))
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "mix.exs")))
     return null;
   if (directory) {
     const directoryArg = commandPathArg(directory);
@@ -4394,7 +4624,7 @@ function elixirValidationSteps(repoRoot, directory, paths) {
   return [`mix test${focusedTests.length > 0 ? ` ${focusedTests.join(" ")}` : ""}`];
 }
 function hasCabalManifest(directory) {
-  if (existsSync4(resolve4(directory, "cabal.project")))
+  if (existsSync4(resolve5(directory, "cabal.project")))
     return true;
   try {
     return readdirSync(directory).some((entry) => entry.toLowerCase().endsWith(".cabal"));
@@ -4403,8 +4633,8 @@ function hasCabalManifest(directory) {
   }
 }
 function haskellValidationSteps(repoRoot, directory) {
-  const root = resolve4(repoRoot, directory || ".");
-  if (existsSync4(resolve4(root, "stack.yaml"))) {
+  const root = resolve5(repoRoot, directory || ".");
+  if (existsSync4(resolve5(root, "stack.yaml"))) {
     if (!directory)
       return ["stack test"];
     const yamlArg = commandPathArg(`${directory}/stack.yaml`);
@@ -4466,7 +4696,7 @@ function ednMapAfterKeyword(text, keyword) {
 function clojureValidationSteps(repoRoot, directory) {
   if (directory)
     return null;
-  const deps = readTextBounded(resolve4(repoRoot, "deps.edn"));
+  const deps = readTextBounded(resolve5(repoRoot, "deps.edn"));
   if (deps) {
     const testAlias = ednMapAfterKeyword(deps.text, ":test");
     if (/:exec-fn\b/.test(testAlias))
@@ -4474,12 +4704,12 @@ function clojureValidationSteps(repoRoot, directory) {
     if (/:main-opts\b/.test(testAlias))
       return ["clojure -M:test"];
   }
-  if (existsSync4(resolve4(repoRoot, "project.clj")))
+  if (existsSync4(resolve5(repoRoot, "project.clj")))
     return ["lein test"];
   return null;
 }
 function zigValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve4(repoRoot, directory || ".", "build.zig")))
+  if (!existsSync4(resolve5(repoRoot, directory || ".", "build.zig")))
     return null;
   if (!directory)
     return ["zig build test"];
@@ -4590,7 +4820,7 @@ function isFallbackEligiblePath(path) {
 }
 function inferRepositoryValidationSteps(options) {
   const maxSteps = Math.max(1, Math.min(8, Math.floor(options.maxSteps ?? 4)));
-  const repoRoot = resolve4(options.repoRoot || ".");
+  const repoRoot = resolve5(options.repoRoot || ".");
   const paths = (options.changedPaths ?? []).map(normalizeRepoPath).filter(Boolean);
   const plans = [];
   for (const group of pathsByEcosystem(paths)) {
@@ -4726,7 +4956,7 @@ function resolveGitCommandTimeoutMs(args, requestedTimeout, env = process.env) {
   return networkCommand ? positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_NETWORK_TIMEOUT_MS, DEFAULT_GIT_NETWORK_TIMEOUT_MS) : positiveTimeoutFromEnv(env.PUSHPALS_SCM_GIT_COMMAND_TIMEOUT_MS, DEFAULT_GIT_COMMAND_TIMEOUT_MS);
 }
 function normalizeFsPathForComparison(value) {
-  const resolved = resolve5(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
+  const resolved = resolve6(String(value ?? "").trim()).replace(/\\/g, "/").replace(/\/+$/, "");
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 function parseGitWorktreeListPorcelain(stdout) {
@@ -4872,7 +5102,7 @@ async function expandWindowsGitExecutableCandidates(repoPath, candidates) {
           const lookup = await runBoundedScmProcess([whereExecutable, candidate], {
             timeoutMs: positiveTimeoutFromEnv(process.env.PUSHPALS_SCM_GIT_DISCOVERY_TIMEOUT_MS, DEFAULT_GIT_DISCOVERY_TIMEOUT_MS),
             cwd: repoPath,
-            env: process.env,
+            env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
             stdout: "pipe",
             stderr: "ignore"
           });
@@ -4903,7 +5133,7 @@ async function runGitCommandCapture(repoPath, args, opts) {
     try {
       const result = await runBoundedScmProcess(gitArgs, {
         cwd: repoPath,
-        env: process.env,
+        env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
         stdout: "pipe",
         stderr: "pipe",
         timeoutMs
@@ -6082,9 +6312,9 @@ async function maintainIntegrationBeforeCompletionClaim(options) {
 }
 
 // apps/source_control_manager/src/review_agent.ts
-import { existsSync as existsSync5, readFileSync as readFileSync5 } from "fs";
+import { existsSync as existsSync5, readFileSync as readFileSync6 } from "fs";
 import { tmpdir } from "os";
-import { basename as basename2, delimiter, isAbsolute as isAbsolute2, join as join4, resolve as resolve6 } from "path";
+import { basename as basename2, delimiter, isAbsolute as isAbsolute2, join as join5, resolve as resolve7 } from "path";
 async function listPersistedPrLinks(opts) {
   const headers = {};
   if (opts.authToken)
@@ -6165,7 +6395,7 @@ var REPEATED_REVIEW_FINDING_MIN_PRIOR_COMMENTS = 3;
 var PROTECTED_BRANCHES_FOR_AUTO_DELETE = new Set(["main", "main_agent", "main_agents"]);
 var JOB_ID_MARKER = "pushpals-jobId";
 var SESSION_ID_MARKER = "pushpals-sessionId";
-var DEFAULT_WORKSPACE_ROOT = resolve6(import.meta.dir, "..", "..", "..");
+var DEFAULT_WORKSPACE_ROOT = resolve7(import.meta.dir, "..", "..", "..");
 var DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS = 5000;
 var DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 var ts = () => new Date().toISOString();
@@ -6174,12 +6404,12 @@ function resolveReviewValidationRepoRoot() {
     const config = loadPushPalsConfig();
     const scmRepo = String(config.sourceControlManager.repoPath ?? "").trim();
     if (scmRepo && existsSync5(scmRepo))
-      return resolve6(scmRepo);
+      return resolve7(scmRepo);
     const projectRoot = String(config.projectRoot ?? "").trim();
     if (projectRoot && existsSync5(projectRoot))
-      return resolve6(projectRoot);
+      return resolve7(projectRoot);
   } catch {}
-  return resolve6(process.cwd());
+  return resolve7(process.cwd());
 }
 var DEFAULT_DEPS = {
   repositoryServices: null,
@@ -6201,11 +6431,12 @@ var DEFAULT_DEPS = {
   httpTimeoutMs: DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS,
   httpMaxResponseBytes: DEFAULT_REVIEW_AGENT_HTTP_MAX_RESPONSE_BYTES,
   now: () => Date.now(),
-  sleep: (ms) => new Promise((resolve7) => setTimeout(resolve7, ms)),
+  sleep: (ms) => new Promise((resolve8) => setTimeout(resolve8, ms)),
   logInfo: (line) => console.log(line),
   logWarn: (line) => console.warn(line),
   logError: (line) => console.error(line),
-  validationRepoRoot: resolveReviewValidationRepoRoot
+  validationRepoRoot: resolveReviewValidationRepoRoot,
+  scmRepairAuthoritySecret: null
 };
 function createBoundedReviewAgentFetch(fetchImpl, options = {}) {
   const timeoutMs = typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) ? Math.max(1, Math.floor(options.timeoutMs)) : DEFAULT_REVIEW_AGENT_HTTP_TIMEOUT_MS;
@@ -6283,7 +6514,7 @@ function currentBunExecPath() {
     if (!dir)
       continue;
     for (const candidate of candidates) {
-      const fullPath = join4(dir, candidate);
+      const fullPath = join5(dir, candidate);
       if (existsSync5(fullPath))
         return fullPath;
     }
@@ -6327,29 +6558,29 @@ function resolveReviewerMdPath(reviewerMdPath, options) {
   if (!raw)
     return "";
   const promptRootOverride = String(process.env.PUSHPALS_PROMPTS_ROOT_OVERRIDE ?? "").trim();
-  const workspaceRoot = resolve6(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
-  const cwd = resolve6(options?.cwd || process.cwd());
+  const workspaceRoot = resolve7(promptRootOverride || options?.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  const cwd = resolve7(options?.cwd || process.cwd());
   if (isAbsolute2(raw))
     return raw;
   const candidates = new Set;
-  candidates.add(resolve6(workspaceRoot, raw));
-  candidates.add(resolve6(cwd, raw));
+  candidates.add(resolve7(workspaceRoot, raw));
+  candidates.add(resolve7(cwd, raw));
   let cursor = cwd;
   for (let i = 0;i < 6; i += 1) {
-    const parent = resolve6(cursor, "..");
+    const parent = resolve7(cursor, "..");
     if (parent === cursor)
       break;
-    candidates.add(resolve6(parent, raw));
+    candidates.add(resolve7(parent, raw));
     cursor = parent;
   }
   for (const candidate of candidates) {
     if (existsSync5(candidate))
       return candidate;
   }
-  return resolve6(workspaceRoot, raw);
+  return resolve7(workspaceRoot, raw);
 }
 function buildCodexEnv(config) {
-  const env = { ...process.env };
+  const env = copyEnvWithoutScmRepairAuthoritySecret(process.env);
   if (config.codexAuthMode === "chatgpt" && config.codexHomeDir) {
     env.CODEX_HOME = config.codexHomeDir;
     env.HOME = config.codexHomeDir;
@@ -6357,7 +6588,7 @@ function buildCodexEnv(config) {
   return env;
 }
 async function invokeCodexReview(prompt, config) {
-  const tmpFile = join4(tmpdir(), `review-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+  const tmpFile = join5(tmpdir(), `review-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   const codexCmd = resolveCodexCmd(config.codexBin);
   const args = buildCodexExecArgs(codexCmd, tmpFile);
   try {
@@ -6997,8 +7228,16 @@ function providerStateFeedbackKey(pr, state, jobId) {
 function persistedLinkReconciliationKey(link) {
   return `${link.prNumber}:${link.jobId}:${link.updatedAt ?? "unknown"}`;
 }
-function reviewFixDedupeKey(prNumber, headSha) {
-  return `${prNumber}:${normalizeReviewFixHeadSha(headSha)}`;
+function reviewFixDedupeKey(prNumber, headSha, baseSha) {
+  return [
+    "review-fix",
+    Math.floor(prNumber),
+    normalizeReviewFixHeadSha(headSha),
+    normalizeReviewFixHeadSha(baseSha)
+  ].join(":");
+}
+function reviewRevisionFingerprint(pr) {
+  return `${normalizeReviewFixHeadSha(pr.head.sha)}:${normalizeReviewFixHeadSha(pr.base.sha)}`;
 }
 function mergeConflictDedupeKey(prNumber, headSha, baseSha) {
   return [
@@ -7054,7 +7293,7 @@ function extractActiveReviewJobContextFromJob(job) {
   const resolutionType = rawResolutionType || "review_fix";
   const prBaseSha = normalizeReviewFixHeadSha(String(reviewAgentRecord.prBaseSha ?? ""));
   return {
-    dedupeKey: resolutionType === "merge_conflict" ? mergeConflictDedupeKey(Math.floor(prNumber), prHeadSha, prBaseSha) : reviewFixDedupeKey(Math.floor(prNumber), prHeadSha),
+    dedupeKey: resolutionType === "merge_conflict" ? mergeConflictDedupeKey(Math.floor(prNumber), prHeadSha, prBaseSha) : reviewFixDedupeKey(Math.floor(prNumber), prHeadSha, prBaseSha),
     resolutionType,
     prNumber: Math.floor(prNumber),
     headSha: prHeadSha,
@@ -7164,7 +7403,7 @@ class ReviewAgent {
       return this.reviewerMd;
     try {
       const mdPath = resolveReviewerMdPath(this.config.reviewerMdPath);
-      this.reviewerMd = readFileSync5(mdPath, "utf-8");
+      this.reviewerMd = readFileSync6(mdPath, "utf-8");
       return this.reviewerMd;
     } catch (err) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] Could not load reviewer.md from ${this.config.reviewerMdPath} (cwd=${process.cwd()}): ${err?.message ?? err}`);
@@ -7392,9 +7631,9 @@ class ReviewAgent {
         return;
       }
       const eligible = prs.filter((pr) => {
-        const reviewedSha = this.reviewed.get(pr.number);
+        const reviewedRevision = this.reviewed.get(pr.number);
         const forcedSha = this.forceReReview.get(pr.number);
-        return reviewedSha !== pr.head.sha || forcedSha === pr.head.sha;
+        return reviewedRevision !== reviewRevisionFingerprint(pr) || forcedSha === pr.head.sha;
       }).sort((a, b) => a.number - b.number);
       const startIndex = this.lastOpenPrReviewNumber == null ? 0 : Math.max(0, eligible.findIndex((pr) => pr.number > (this.lastOpenPrReviewNumber ?? -1)));
       const ordered = startIndex > 0 ? [...eligible.slice(startIndex), ...eligible.slice(0, startIndex)] : eligible;
@@ -7496,12 +7735,13 @@ class ReviewAgent {
   }
   async reviewPr(pr) {
     const sha = pr.head.sha;
-    const reviewedSha = this.reviewed.get(pr.number);
+    const revisionFingerprint = reviewRevisionFingerprint(pr);
+    const reviewedRevision = this.reviewed.get(pr.number);
     const forcedSha = this.forceReReview.get(pr.number);
-    if (reviewedSha !== sha && forcedSha) {
+    if (reviewedRevision !== revisionFingerprint && forcedSha) {
       this.forceReReview.delete(pr.number);
     }
-    if (reviewedSha === sha) {
+    if (reviewedRevision === revisionFingerprint) {
       if (forcedSha !== sha)
         return;
       this.forceReReview.delete(pr.number);
@@ -7521,12 +7761,12 @@ class ReviewAgent {
     }
     if (!diff.trim()) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has an empty diff - skipping`);
-      this.reviewed.set(pr.number, sha);
+      this.reviewed.set(pr.number, revisionFingerprint);
       return;
     }
     if (diff.length > MAX_DIFF_BYTES * 2) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} diff is too large (${diff.length} bytes) - skipping`);
-      this.reviewed.set(pr.number, sha);
+      this.reviewed.set(pr.number, revisionFingerprint);
       return;
     }
     const deterministicHygieneIssues = collectReviewHygieneIssuesFromDiff(diff, {
@@ -7539,7 +7779,7 @@ ${pr.body ?? ""}`
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} failed deterministic hygiene gate (${deterministicHygieneIssues.length} issue(s)); skipping Codex review.`);
       const finalized2 = await this.rejectPr(pr, verdict2, diff);
       if (finalized2) {
-        this.reviewed.set(pr.number, sha);
+        this.reviewed.set(pr.number, revisionFingerprint);
       }
       return;
     }
@@ -7563,7 +7803,7 @@ ${raw.slice(0, 500)}`);
     this.deps.logInfo(`[${ts()}] [ReviewAgent] PR #${pr.number} score: ${verdict.score.toFixed(1)}/10 - ${approved ? "APPROVED" : "REJECTED"} (threshold ${this.config.passThreshold.toFixed(1)}/10) - ${verdict.summary}`);
     const finalized = approved ? await this.approvePr(pr, verdict, diff) : await this.rejectPr(pr, verdict, diff);
     if (finalized) {
-      this.reviewed.set(pr.number, sha);
+      this.reviewed.set(pr.number, revisionFingerprint);
     }
   }
   async approvePr(pr, verdict, diff) {
@@ -7726,28 +7966,33 @@ ${raw.slice(0, 500)}`);
       });
     }
     const rejectionComment = formatRejectionComment(effectiveVerdict);
-    try {
-      await this.deps.addPullRequestComment({
-        token: this.githubToken,
-        remoteUrl: this.remoteUrl,
-        prNumber: pr.number,
-        body: rejectionComment
+    const acknowledgeRejection = async () => {
+      const commentAlreadyPresent = recentComments.some((comment) => collapseWhitespace(comment.body) === collapseWhitespace(rejectionComment));
+      if (!commentAlreadyPresent) {
+        try {
+          await this.deps.addPullRequestComment({
+            token: this.githubToken,
+            remoteUrl: this.remoteUrl,
+            prNumber: pr.number,
+            body: rejectionComment
+          });
+        } catch (err) {
+          this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`);
+        }
+      }
+      return this.postAutonomyPrFeedback({
+        pr,
+        verdict: "rejected",
+        verdictSummary: effectiveVerdict.summary,
+        reviewScore: effectiveVerdict.score,
+        jobId,
+        sessionId,
+        comments: recentComments
       });
-    } catch (err) {
-      this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`);
-    }
-    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
-      pr,
-      verdict: "rejected",
-      verdictSummary: effectiveVerdict.summary,
-      reviewScore: effectiveVerdict.score,
-      jobId,
-      sessionId,
-      comments: recentComments
-    });
+    };
     if (!sessionId) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has no pushpals-sessionId in body - cannot re-queue`);
-      return feedbackAcknowledged;
+      return acknowledgeRejection();
     }
     const priorReReviewEnqueues = this.reReviewEnqueueCounts.get(pr.number) ?? 0;
     if (priorReReviewEnqueues >= MAX_PR_RE_REVIEW_ENQUEUES) {
@@ -7762,24 +8007,26 @@ ${raw.slice(0, 500)}`);
         feedbackSummarySuffix: `closed after reaching automated review-fix retry cap (${MAX_PR_RE_REVIEW_ENQUEUES}).`
       });
     }
-    const existingFixJobId = await this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha, "review_fix");
+    const existingFixJobId = await this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha, "review_fix", pr.base.sha);
     if (existingFixJobId) {
       this.deps.logInfo(`[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`);
-      return feedbackAcknowledged;
+      return acknowledgeRejection();
     }
     const nextReReviewEnqueues = priorReReviewEnqueues + 1;
     this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
     const enqueued = await this.enqueueFixJob(pr, effectiveVerdict, sessionId, jobId, diff, [rejectionComment], recentComments);
-    if (enqueued) {
-      if (nextReReviewEnqueues === MAX_PR_RE_REVIEW_ENQUEUES) {
-        this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} hit max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); future rejections will not auto-enqueue fix jobs.`);
-      }
-    } else if (priorReReviewEnqueues > 0) {
+    if (!enqueued && priorReReviewEnqueues > 0) {
       this.reReviewEnqueueCounts.set(pr.number, priorReReviewEnqueues);
-    } else {
+    } else if (!enqueued) {
       this.reReviewEnqueueCounts.delete(pr.number);
     }
-    return feedbackAcknowledged;
+    if (!enqueued) {
+      return false;
+    }
+    if (nextReReviewEnqueues === MAX_PR_RE_REVIEW_ENQUEUES) {
+      this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} hit max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); future rejections will not auto-enqueue fix jobs.`);
+    }
+    return acknowledgeRejection();
   }
   async giveUpOnRejectedPr(pr, verdict, context) {
     const reason = context.reason ?? `Reached PR feedback comment cap (${context.recentComments.length}/${context.maxPrCommentsBeforeGiveUp}).`;
@@ -7891,7 +8138,7 @@ ${raw.slice(0, 500)}`);
           }
           if (resolutionType && context.resolutionType !== resolutionType)
             continue;
-          if (resolutionType === "merge_conflict" && normalizedBaseSha && context.baseSha && context.baseSha !== normalizedBaseSha) {
+          if (normalizedBaseSha && context.baseSha !== normalizedBaseSha) {
             continue;
           }
           const jobId = typeof job.id === "string" && job.id.trim().length > 0 ? job.id.trim() : "(unknown)";
@@ -8121,8 +8368,10 @@ ${raw.slice(0, 500)}`);
       taskId,
       sessionId,
       kind: "task.execute",
+      workClass: "repair",
+      repositoryIdentity: this.remoteUrl,
       prUrl: pr.html_url,
-      dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha),
+      dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha, pr.base.sha),
       dedupeCooldownMs: REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS,
       params: {
         schemaVersion: 2,
@@ -8151,7 +8400,8 @@ ${raw.slice(0, 500)}`);
             "All relevant tests pass"
           ],
           validationSteps: validationSteps2,
-          queuePriority: "normal",
+          queuePriority: "interactive",
+          workClass: "repair",
           queueWaitBudgetMs: 90000,
           executionBudgetMs: 1200000,
           finalizationBudgetMs: 120000,
@@ -8167,7 +8417,9 @@ ${raw.slice(0, 500)}`);
           branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
+          repositoryIdentity: this.remoteUrl,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
+          prBaseSha: normalizeReviewFixHeadSha(pr.base.sha),
           prHeadRef: prHeadRef ?? pr.head.ref,
           prBaseRef: pr.base.ref,
           resolutionType: "review_fix",
@@ -8183,23 +8435,30 @@ ${raw.slice(0, 500)}`);
         recentJobs: []
       }
     };
+    const requestBody = JSON.stringify(payload);
     const headers = { "Content-Type": "application/json" };
+    if (this.deps.scmRepairAuthoritySecret) {
+      headers[SCM_REPAIR_AUTHORITY_HEADER] = createScmRepairAuthorityProof(payload, this.deps.scmRepairAuthoritySecret);
+    }
     if (this.authToken)
       headers.Authorization = `Bearer ${this.authToken}`;
     try {
       const response = await this.deps.fetchImpl(`${this.serverUrl}/jobs/enqueue`, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload)
+        body: requestBody
       });
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}: ${text}`);
       }
       const responseBody = await response.json().catch(() => null);
-      const enqueuedJobId = responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId : "";
+      const enqueuedJobId = responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId.trim() : "";
       const deduped = responseBody?.deduped === true;
       const dedupeMessage = responseBody && typeof responseBody.message === "string" ? responseBody.message : "";
+      if (!enqueuedJobId) {
+        throw new Error("Server accepted repair enqueue without returning a jobId; exact repair ownership is unconfirmed");
+      }
       if (enqueuedJobId && !deduped) {
         try {
           await this.emitFixJobQueuedEvents({
@@ -8257,6 +8516,8 @@ ${raw.slice(0, 500)}`);
       taskId,
       sessionId,
       kind: "task.execute",
+      workClass: "repair",
+      repositoryIdentity: this.remoteUrl,
       prUrl: pr.html_url,
       dedupeKey: mergeConflictDedupeKey(pr.number, pr.head.sha, pr.base.sha),
       dedupeCooldownMs: REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS,
@@ -8283,7 +8544,8 @@ ${raw.slice(0, 500)}`);
             "Validation commands relevant to changed files pass."
           ],
           validationSteps: validationSteps2,
-          queuePriority: "normal",
+          queuePriority: "interactive",
+          workClass: "repair",
           queueWaitBudgetMs: 90000,
           executionBudgetMs: 1200000,
           finalizationBudgetMs: 120000,
@@ -8299,6 +8561,7 @@ ${raw.slice(0, 500)}`);
           branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
+          repositoryIdentity: this.remoteUrl,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
           prBaseSha: normalizeReviewFixHeadSha(pr.base.sha),
           prHeadRef: prHeadRef ?? pr.head.ref,
@@ -8314,14 +8577,18 @@ ${raw.slice(0, 500)}`);
         recentJobs: []
       }
     };
+    const requestBody = JSON.stringify(payload);
     const headers = { "Content-Type": "application/json" };
+    if (this.deps.scmRepairAuthoritySecret) {
+      headers[SCM_REPAIR_AUTHORITY_HEADER] = createScmRepairAuthorityProof(payload, this.deps.scmRepairAuthoritySecret);
+    }
     if (this.authToken)
       headers.Authorization = `Bearer ${this.authToken}`;
     try {
       const response = await this.deps.fetchImpl(`${this.serverUrl}/jobs/enqueue`, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload)
+        body: requestBody
       });
       if (!response.ok) {
         const text = await response.text();
@@ -8839,13 +9106,13 @@ function createStatusServer(db, port, healthProvider = () => ({
 }
 
 // apps/source_control_manager/src/runtime_paths.ts
-import { resolve as resolve7 } from "path";
+import { resolve as resolve8 } from "path";
 function resolveSourceControlManagerRuntimeRepoRoot(projectRoot, fallbackCwd = process.cwd()) {
   const configuredRoot = String(projectRoot ?? "").trim();
   if (configuredRoot) {
-    return resolve7(configuredRoot);
+    return resolve8(configuredRoot);
   }
-  return resolve7(fallbackCwd);
+  return resolve8(fallbackCwd);
 }
 
 // apps/source_control_manager/src/completion_callback.ts
@@ -8909,15 +9176,15 @@ import {
   closeSync as closeSync2,
   existsSync as existsSync6,
   fsyncSync,
-  mkdirSync as mkdirSync2,
+  mkdirSync as mkdirSync3,
   openSync as openSync2,
-  readFileSync as readFileSync6,
+  readFileSync as readFileSync7,
   readdirSync as readdirSync2,
   renameSync,
-  unlinkSync as unlinkSync2,
-  writeFileSync as writeFileSync2
+  unlinkSync as unlinkSync3,
+  writeFileSync as writeFileSync3
 } from "fs";
-import { join as join5 } from "path";
+import { join as join6 } from "path";
 var COMPLETION_GC_VERSION = 1;
 var SHA_RE2 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 var SAFE_COMPLETION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/;
@@ -9041,18 +9308,18 @@ class CompletionGcJournal {
   directory;
   cursor = 0;
   constructor(stateDir) {
-    this.directory = join5(stateDir, "completion-ref-gc");
-    mkdirSync2(this.directory, { recursive: true });
+    this.directory = join6(stateDir, "completion-ref-gc");
+    mkdirSync3(this.directory, { recursive: true });
   }
   pathFor(record) {
     const key = createHash2("sha256").update(record.completionId).digest("hex").slice(0, 32);
-    return join5(this.directory, `${key}-${record.claimGeneration}.json`);
+    return join6(this.directory, `${key}-${record.claimGeneration}.json`);
   }
   enqueue(input) {
     const record = normalizeRecord(input);
     const destination = this.pathFor(record);
     if (existsSync6(destination)) {
-      const existing = normalizeRecord(JSON.parse(readFileSync6(destination, "utf8")));
+      const existing = normalizeRecord(JSON.parse(readFileSync7(destination, "utf8")));
       if (!sameRecord(existing, record)) {
         throw new Error(`Completion GC record ${record.completionId}/${record.claimGeneration} conflicts with an existing durable record.`);
       }
@@ -9062,7 +9329,7 @@ class CompletionGcJournal {
     let fd = null;
     try {
       fd = openSync2(temporary, "wx", 384);
-      writeFileSync2(fd, `${JSON.stringify(record)}
+      writeFileSync3(fd, `${JSON.stringify(record)}
 `, "utf8");
       fsyncSync(fd);
       closeSync2(fd);
@@ -9073,10 +9340,10 @@ class CompletionGcJournal {
       if (fd !== null)
         closeSync2(fd);
       try {
-        unlinkSync2(temporary);
+        unlinkSync3(temporary);
       } catch {}
       if (existsSync6(destination)) {
-        const existing = normalizeRecord(JSON.parse(readFileSync6(destination, "utf8")));
+        const existing = normalizeRecord(JSON.parse(readFileSync7(destination, "utf8")));
         if (sameRecord(existing, record))
           return existing;
       }
@@ -9098,9 +9365,9 @@ class CompletionGcJournal {
     this.cursor = (start + selectedCount) % names.length;
     const records = [];
     for (const name of selected) {
-      const path = join5(this.directory, name);
+      const path = join6(this.directory, name);
       try {
-        const record = normalizeRecord(JSON.parse(readFileSync6(path, "utf8")));
+        const record = normalizeRecord(JSON.parse(readFileSync7(path, "utf8")));
         if (this.pathFor(record) !== path) {
           throw new Error("record identity does not match its journal filename");
         }
@@ -9113,7 +9380,7 @@ class CompletionGcJournal {
   }
   remove(record) {
     try {
-      unlinkSync2(this.pathFor(normalizeRecord(record)));
+      unlinkSync3(this.pathFor(normalizeRecord(record)));
     } catch (error) {
       if (error?.code !== "ENOENT")
         throw error;
@@ -9434,8 +9701,8 @@ async function isValidationCheckpointPublished(options) {
 
 // apps/source_control_manager/src/trusted_validation.ts
 import { createHash as createHash3 } from "crypto";
-import { existsSync as existsSync7, readFileSync as readFileSync7, writeFileSync as writeFileSync3 } from "fs";
-import { basename as basename3, resolve as resolve8 } from "path";
+import { existsSync as existsSync7, readFileSync as readFileSync8, rmSync, writeFileSync as writeFileSync4 } from "fs";
+import { basename as basename3, resolve as resolve9 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60000;
 var PROCESS_STREAM_DRAIN_GRACE_MS = 2000;
 var PROCESS_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
@@ -9501,11 +9768,20 @@ function resolveTrustedValidationPreparationArgv(options) {
   const bun = currentBunExecutable(options.bunExecutable);
   return [bun || "bun", "install", "--frozen-lockfile"];
 }
+function normalizeTrustedValidationAffectedPaths(paths) {
+  return [
+    ...new Set(paths.map((value) => String(value ?? "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/{2,}/g, "/").replace(/\/$/, "")).filter((value) => value.length > 0 && value !== "."))
+  ].sort((left, right) => left.localeCompare(right));
+}
 function trustedValidationInstallFingerprint(options) {
-  const packagePath = resolve8(options.repoPath, "package.json");
+  const candidateSha = String(options.invariantContext?.candidateSha ?? "").trim().toLowerCase();
+  const baseSha = String(options.invariantContext?.baseSha ?? "").trim().toLowerCase();
+  if (!candidateSha || !baseSha)
+    return null;
+  const packagePath = resolve9(options.repoPath, "package.json");
   const lockPath = [
-    resolve8(options.repoPath, "bun.lock"),
-    resolve8(options.repoPath, "bun.lockb")
+    resolve9(options.repoPath, "bun.lock"),
+    resolve9(options.repoPath, "bun.lockb")
   ].find((path) => existsSync7(path));
   if (!existsSync7(packagePath) || !lockPath)
     return null;
@@ -9516,20 +9792,35 @@ function trustedValidationInstallFingerprint(options) {
 `);
   hash.update(`version=${typeof Bun !== "undefined" ? Bun.version : "unknown"}
 `);
-  hash.update(readFileSync7(packagePath));
+  if (options.invariantContext) {
+    hash.update(`candidate=${candidateSha}
+`);
+    hash.update(`base=${baseSha}
+`);
+    hash.update(`affected=${JSON.stringify(normalizeTrustedValidationAffectedPaths(options.invariantContext.affectedPaths))}
+`);
+  }
+  hash.update(readFileSync8(packagePath));
   hash.update("\x00");
-  hash.update(readFileSync7(lockPath));
+  hash.update(readFileSync8(lockPath));
   return hash.digest("hex");
 }
 function trustedInstallMarkerPath(repoPath) {
-  return resolve8(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
+  return resolve9(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
+}
+function invalidateTrustedInstallMarker(repoPath) {
+  const markerPath = trustedInstallMarkerPath(repoPath);
+  rmSync(markerPath, { force: true });
+  if (existsSync7(markerPath)) {
+    throw new Error("Could not invalidate the prior trusted dependency install marker.");
+  }
 }
 function hasFreshTrustedValidationInstall(options) {
   const fingerprint = trustedValidationInstallFingerprint(options);
   if (!fingerprint)
     return false;
   try {
-    const marker = JSON.parse(readFileSync7(trustedInstallMarkerPath(options.repoPath), "utf8"));
+    const marker = JSON.parse(readFileSync8(trustedInstallMarkerPath(options.repoPath), "utf8"));
     return marker.fingerprint === fingerprint;
   } catch {
     return false;
@@ -9540,76 +9831,143 @@ async function runTimed(runner, argv, options) {
   const result = await runner(argv, options);
   return { ...result, durationMs: Math.max(0, Date.now() - startedAt) };
 }
-async function ensureTrustedValidationInstall(options) {
-  if (hasFreshTrustedValidationInstall(options)) {
-    return {
-      command: "bun install --frozen-lockfile",
-      ok: true,
-      output: "Trusted dependency install cache hit for unchanged package and lockfile inputs.",
-      exitCode: 0,
-      durationMs: 0,
-      cached: true,
-      phase: "dependency_install"
+function trustedInstallWaitFailure(reason, durationMs) {
+  const message = reason === "cancelled" ? "Trusted dependency install wait was cancelled." : "Timed out waiting for the repository's trusted dependency install lock.";
+  return {
+    command: "bun install --frozen-lockfile",
+    ok: false,
+    output: message,
+    exitCode: 124,
+    durationMs: Math.max(0, durationMs),
+    phase: "dependency_install",
+    failureClass: "timeout",
+    failedTests: [],
+    targetPathHints: [],
+    failureLines: [message]
+  };
+}
+async function waitForTrustedInstallFlight(promise, timeoutMs, signal) {
+  if (signal?.aborted)
+    return { state: "cancelled" };
+  return await new Promise((resolvePromise) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolvePromise(result);
     };
-  }
-  const flightKey = resolve8(options.repoPath);
-  const activeFlight = trustedInstallFlights.get(flightKey);
-  if (activeFlight)
-    return await activeFlight;
-  const flight = (async () => {
+    const onAbort = () => finish({ state: "cancelled" });
+    const timer = setTimeout(() => finish({ state: "timeout" }), Math.max(1, timeoutMs));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    promise.then((result) => finish({ state: "completed", result }), (error) => finish({ state: "failed", error }));
+  });
+}
+async function ensureTrustedValidationInstall(options) {
+  const waitStartedAt = Date.now();
+  const waitDeadline = waitStartedAt + Math.max(1, options.singleFlightWaitMs ?? options.timeoutMs + 1000);
+  const flightKey = resolve9(options.repoPath);
+  const requestedFingerprint = trustedValidationInstallFingerprint(options);
+  let waitedForFlight = false;
+  while (true) {
+    if (options.signal?.aborted) {
+      return trustedInstallWaitFailure("cancelled", Date.now() - waitStartedAt);
+    }
+    const activeFlight = trustedInstallFlights.get(flightKey);
+    if (activeFlight) {
+      waitedForFlight = true;
+      const remainingMs = waitDeadline - Date.now();
+      if (remainingMs <= 0) {
+        return trustedInstallWaitFailure("timeout", Date.now() - waitStartedAt);
+      }
+      const waited = await waitForTrustedInstallFlight(activeFlight.promise, remainingMs, options.signal);
+      if (waited.state === "failed")
+        throw waited.error;
+      if (waited.state !== "completed") {
+        return trustedInstallWaitFailure(waited.state, Date.now() - waitStartedAt);
+      }
+      if (trustedInstallFlights.get(flightKey) === activeFlight) {
+        trustedInstallFlights.delete(flightKey);
+      }
+      if (activeFlight.fingerprint === requestedFingerprint && !waited.result.ok) {
+        return waited.result;
+      }
+      continue;
+    }
     if (hasFreshTrustedValidationInstall(options)) {
       return {
         command: "bun install --frozen-lockfile",
         ok: true,
-        output: "Trusted dependency install cache hit after waiting for another validation.",
+        output: waitedForFlight ? "Trusted dependency install cache hit after waiting for another validation." : "Trusted dependency install cache hit for unchanged candidate inputs.",
         exitCode: 0,
         durationMs: 0,
         cached: true,
         phase: "dependency_install"
       };
     }
-    const preparation = await runTimed(options.runner, options.preparationArgv, {
-      cwd: options.repoPath,
-      timeoutMs: options.timeoutMs
-    });
-    const evidence = preparation.ok ? null : extractTrustedValidationFailureEvidence({
-      command: "bun install --frozen-lockfile",
-      phase: "dependency_install",
-      output: preparation.output,
-      exitCode: preparation.exitCode
-    });
-    const result = {
-      command: "bun install --frozen-lockfile",
-      ...preparation,
-      output: truncateTrustedValidationOutput(preparation.output),
-      phase: "dependency_install",
-      ...evidence ?? {}
-    };
-    if (preparation.ok) {
-      const fingerprint = trustedValidationInstallFingerprint(options);
-      if (fingerprint) {
-        try {
-          writeFileSync3(trustedInstallMarkerPath(options.repoPath), JSON.stringify({ fingerprint, updatedAt: new Date().toISOString() }), "utf8");
-        } catch {}
+    const flight = (async () => {
+      invalidateTrustedInstallMarker(options.repoPath);
+      let preparation;
+      try {
+        preparation = await runTimed(options.runner, options.preparationArgv, {
+          cwd: options.repoPath,
+          timeoutMs: options.timeoutMs,
+          signal: options.signal
+        });
+      } catch (error) {
+        if (options.signal?.aborted) {
+          return trustedInstallWaitFailure("cancelled", Date.now() - waitStartedAt);
+        }
+        throw error;
+      }
+      const evidence = preparation.ok ? null : extractTrustedValidationFailureEvidence({
+        command: "bun install --frozen-lockfile",
+        phase: "dependency_install",
+        output: preparation.output,
+        exitCode: preparation.exitCode
+      });
+      const result = {
+        command: "bun install --frozen-lockfile",
+        ...preparation,
+        output: truncateTrustedValidationOutput(preparation.output),
+        phase: "dependency_install",
+        ...evidence ?? {}
+      };
+      if (preparation.ok) {
+        const fingerprint = trustedValidationInstallFingerprint(options);
+        if (fingerprint) {
+          try {
+            writeFileSync4(trustedInstallMarkerPath(options.repoPath), JSON.stringify({
+              schemaVersion: 3,
+              fingerprint,
+              updatedAt: new Date().toISOString()
+            }), "utf8");
+          } catch {}
+        }
+      }
+      return result;
+    })();
+    const flightRecord = { fingerprint: requestedFingerprint, promise: flight };
+    trustedInstallFlights.set(flightKey, flightRecord);
+    try {
+      return await flight;
+    } finally {
+      if (trustedInstallFlights.get(flightKey) === flightRecord) {
+        trustedInstallFlights.delete(flightKey);
       }
     }
-    return result;
-  })();
-  trustedInstallFlights.set(flightKey, flight);
-  try {
-    return await flight;
-  } finally {
-    if (trustedInstallFlights.get(flightKey) === flight)
-      trustedInstallFlights.delete(flightKey);
   }
 }
 async function runProcessWithTreeTimeout(argv, options) {
   const result = await runBoundedProcess(argv, {
     cwd: options.cwd,
-    env: { ...process.env },
+    env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
     timeoutMs: Math.max(1, options.timeoutMs),
     outputLimitBytes: PROCESS_OUTPUT_LIMIT_BYTES,
-    streamDrainTimeoutMs: PROCESS_STREAM_DRAIN_GRACE_MS
+    streamDrainTimeoutMs: PROCESS_STREAM_DRAIN_GRACE_MS,
+    signal: options.signal
   });
   return {
     ok: !result.timedOut && result.exitCode === 0,
@@ -9651,7 +10009,10 @@ async function runTrustedValidationCommands(options) {
       preparationArgv,
       timeoutMs,
       bunExecutable: options.bunExecutable,
-      runner
+      invariantContext: options.invariantContext,
+      runner,
+      signal: options.signal,
+      singleFlightWaitMs: options.singleFlightWaitMs
     });
     emitTrustedValidationProgress(options.onProgress, {
       boundary: "complete",
@@ -9687,7 +10048,10 @@ async function runTrustedValidationCommands(options) {
           preparationArgv,
           timeoutMs,
           bunExecutable: options.bunExecutable,
-          runner
+          invariantContext: options.invariantContext,
+          runner,
+          signal: options.signal,
+          singleFlightWaitMs: options.singleFlightWaitMs
         }),
         attempt: 2,
         retryReason: "transient_infrastructure"
@@ -9715,7 +10079,11 @@ async function runTrustedValidationCommands(options) {
         command,
         attempt
       });
-      const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
+      const result = await runTimed(runner, resolvedArgv, {
+        cwd: options.repoPath,
+        timeoutMs,
+        signal: options.signal
+      });
       const evidence = result.ok ? null : extractTrustedValidationFailureEvidence({
         command,
         phase: "validation",
@@ -10156,7 +10524,7 @@ ${dirty}`, dirty);
 }
 
 // apps/source_control_manager/src/config.ts
-import { resolve as resolve9 } from "path";
+import { resolve as resolve10 } from "path";
 function buildDefaults(options = {}) {
   const pushConfig = loadPushPalsConfig({ reload: options.reload });
   const defaultLocalServer = resolveLocalServerConnection({
@@ -10165,7 +10533,7 @@ function buildDefaults(options = {}) {
     fallbackPort: pushConfig.server.port
   });
   return {
-    repoPath: resolve9(pushConfig.sourceControlManager.repoPath),
+    repoPath: resolve10(pushConfig.sourceControlManager.repoPath),
     serverUrl: defaultLocalServer.serverUrl,
     remote: pushConfig.sourceControlManager.remote,
     mainBranch: pushConfig.sourceControlManager.mainBranch,
@@ -10173,7 +10541,7 @@ function buildDefaults(options = {}) {
     branchPrefix: pushConfig.sourceControlManager.branchPrefix,
     pollIntervalSeconds: pushConfig.sourceControlManager.pollIntervalSeconds,
     checks: pushConfig.sourceControlManager.checks.map((check) => ({ ...check })),
-    stateDir: resolve9(pushConfig.sourceControlManager.stateDir),
+    stateDir: resolve10(pushConfig.sourceControlManager.stateDir),
     port: pushConfig.sourceControlManager.port,
     deleteAfterMerge: pushConfig.sourceControlManager.deleteAfterMerge,
     maxAttempts: pushConfig.sourceControlManager.maxAttempts,
@@ -10263,8 +10631,18 @@ function validateConfig(config) {
 
 // apps/source_control_manager/src/source_control_manager_main.ts
 var PUSH_CONFIG = loadPushPalsConfig();
+var scmRepairAuthoritySecret = null;
+try {
+  scmRepairAuthoritySecret = resolveScmRepairAuthoritySecret({
+    dataDir: PUSH_CONFIG.paths.dataDir
+  });
+} catch (error) {
+  console.error(`[SourceControlManager] SCM repair authority is unavailable; review repairs cannot be admitted: ${error instanceof Error ? error.message : String(error)}`);
+} finally {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
+}
 var repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
-var defaultSourceControlManagerRepoPath = resolve10(PUSH_CONFIG.sourceControlManager.repoPath);
+var defaultSourceControlManagerRepoPath = resolve11(PUSH_CONFIG.sourceControlManager.repoPath);
 var COMPLETION_LEASE_MS = 3 * 60000;
 var COMPLETION_LEASE_HEARTBEAT_MS = 30000;
 var PUBLICATION_HEALTH_POLL_MS = 1e4;
@@ -10322,7 +10700,7 @@ if (typeof args.config === "string" && args.config.trim()) {
 var config = loadConfig();
 var cliOverrides = {};
 if (typeof args.repo === "string")
-  cliOverrides.repoPath = resolve10(args.repo);
+  cliOverrides.repoPath = resolve11(args.repo);
 if (typeof args.server === "string")
   cliOverrides.serverUrl = args.server;
 if (typeof args.port === "string") {
@@ -10350,14 +10728,14 @@ if (typeof args.interval === "string") {
   }
 }
 if (typeof args["state-dir"] === "string")
-  cliOverrides.stateDir = resolve10(args["state-dir"]);
+  cliOverrides.stateDir = resolve11(args["state-dir"]);
 if (args["delete-after-merge"])
   cliOverrides.deleteAfterMerge = true;
 config = applyCliOverrides(config, cliOverrides);
-config.repoPath = resolve10(config.repoPath);
+config.repoPath = resolve11(config.repoPath);
 var integrationBaseBranch = config.integrationBaseBranch;
 var integrationBaseRef = `${config.remote}/${integrationBaseBranch}`;
-var usingDefaultRepoPath = resolve10(config.repoPath) === resolve10(defaultSourceControlManagerRepoPath);
+var usingDefaultRepoPath = resolve11(config.repoPath) === resolve11(defaultSourceControlManagerRepoPath);
 try {
   validateConfig(config);
 } catch (err) {
@@ -10386,14 +10764,14 @@ if (skipCleanCheck) {
   const source = skipCleanCheckFlag ? "--skip-clean-check flag" : "source_control_manager.skip_clean_check";
   console.log(`[${ts2()}]   mode:     SKIP CLEAN CHECK (${source})`);
 }
-mkdirSync3(config.stateDir, { recursive: true });
+mkdirSync4(config.stateDir, { recursive: true });
 var lock = new FileLock(config.stateDir);
 if (!lock.acquire()) {
   console.error(`[${ts2()}] Another source_control_manager instance is already running. Exiting.`);
   process.exit(1);
 }
 console.log(`[${ts2()}] Lock acquired`);
-var dbPath = join6(config.stateDir, "merge_queue.db");
+var dbPath = join7(config.stateDir, "merge_queue.db");
 var db = new MergeQueueDB(dbPath);
 console.log(`[${ts2()}] Database opened: ${dbPath}`);
 var sourceControlManagerPusherId = `source_control_manager-${createHash5("sha256").update(`${config.repoPath}
@@ -10574,7 +10952,7 @@ var syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(async 
     return;
   }
   await clearReviewAgentPollLoop();
-  const reviewAgent = new ReviewAgent(effectiveReviewAgentConfig, config.serverUrl, gitProviderToken, remoteUrl, prBaseBranch, config.authToken, { repositoryServices }, config.branchPrefix);
+  const reviewAgent = new ReviewAgent(effectiveReviewAgentConfig, config.serverUrl, gitProviderToken, remoteUrl, prBaseBranch, config.authToken, { repositoryServices, scmRepairAuthoritySecret }, config.branchPrefix);
   reviewAgentInstance = reviewAgent;
   reviewAgentRuntimeFingerprint = fingerprint;
   reviewAgentPollTimer = setInterval(() => reviewAgent.poll().catch((err) => {
@@ -10947,6 +11325,7 @@ async function tick() {
     let trustedValidationBaselineSha = null;
     let trustedValidationCandidateSha = null;
     let trustedValidationCandidateRef = null;
+    let trustedValidationAffectedPaths = [];
     let trustedValidationResults = [];
     let publicationAlreadyIntegrated = false;
     let publicationReadyForFinalization = false;
@@ -11210,6 +11589,20 @@ async function tick() {
         });
       }
       await persistExactValidationCheckpoint();
+      if (!skipValidationForDurableRecovery && completion.trustedValidationCommandsJson && trustedValidationBaselineSha && trustedValidationCandidateSha) {
+        const affectedPathDiff = await validationGit([
+          "diff",
+          "--name-only",
+          "-z",
+          trustedValidationBaselineSha,
+          trustedValidationCandidateSha,
+          "--"
+        ]);
+        if (!affectedPathDiff.ok) {
+          throw new Error(`Unable to derive trusted-validation affected paths for the immutable candidate: ${affectedPathDiff.stderr || affectedPathDiff.stdout}`);
+        }
+        trustedValidationAffectedPaths = normalizeTrustedValidationAffectedPaths(affectedPathDiff.stdout.split("\x00"));
+      }
       if (skipValidationForDurableRecovery) {
         await assertValidationWorktree("published recovery");
         console.log(`[${ts2()}] Exact candidate ${trustedValidationCandidateSha?.slice(0, 8)} already has immutable validation-success and publication proof; skipping duplicate validation.`);
@@ -11221,6 +11614,11 @@ async function tick() {
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: completion.trustedValidationCommandsJson,
+            invariantContext: trustedValidationBaselineSha && trustedValidationCandidateSha ? {
+              baseSha: trustedValidationBaselineSha,
+              candidateSha: trustedValidationCandidateSha,
+              affectedPaths: trustedValidationAffectedPaths
+            } : undefined,
             onProgress: (event) => healthTracker.progress(trustedValidationHealthPhase(event), completion.id)
           });
           const validationOutcome = resolveTrustedValidationOutcome(trustedValidationResults);
@@ -11730,7 +12128,7 @@ async function ensureDefaultSourceControlManagerWorktree() {
   const probe = await runGitCapture(["-C", config.repoPath, "rev-parse", "--is-inside-work-tree"]);
   if (probe.ok)
     return;
-  mkdirSync3(resolve10(config.repoPath, ".."), { recursive: true });
+  mkdirSync4(resolve11(config.repoPath, ".."), { recursive: true });
   await runGitCapture(["worktree", "prune"]);
   const seedCandidates = [
     `${config.remote}/${config.mainBranch}`,

@@ -810,7 +810,12 @@ describe("workerpals merge-conflict sandbox", () => {
 
           expect(result.ok).toBe(true);
           expect(resolutionPasses).toBe(2);
-          expect(observedBudgets[0]?.executionBudgetMs).toBe(1_800_000);
+          // The absolute ledger begins before the executor is dispatched, so
+          // normal host preparation may consume a few milliseconds of this
+          // first budget. Assert the invariant (positive and never enlarged)
+          // instead of relying on a zero-duration setup turn.
+          expect(observedBudgets[0]?.executionBudgetMs).toBeGreaterThan(0);
+          expect(observedBudgets[0]?.executionBudgetMs).toBeLessThanOrEqual(1_800_000);
           expect(observedBudgets[1]?.executionBudgetMs).toBe(300_000);
           expect(observedBudgets[1]?.finalizationBudgetMs).toBe(60_000);
           expect(

@@ -50,6 +50,7 @@ import {
 import { validateVisionDocStructure } from "../packages/shared/src/vision.js";
 import { fetchBufferedWithHardDeadline } from "../packages/shared/src/bounded_fetch.js";
 import { runBoundedProcess, terminateProcessTree } from "../packages/shared/src/bounded_process.js";
+import { takeScmRepairAuthoritySecretFromEnv } from "../packages/shared/src/scm_repair_authority.js";
 import {
   buildCoreManagedServiceSpecs,
   computeLocalBuddyRestartBackoffMs,
@@ -62,6 +63,7 @@ import { appendBoundedLineChunk, finishBoundedLineBuffer } from "./bounded_line_
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
+const scmRepairAuthoritySecretOverride = takeScmRepairAuthoritySecretFromEnv(process.env);
 const CONFIG = loadPushPalsConfig({ projectRoot: repoRoot });
 
 const DEFAULT_IMAGE = "pushpals-worker-sandbox:latest";
@@ -4922,7 +4924,12 @@ try {
 }
 
 const bunExecPath = (process.execPath ?? "").trim() || "bun";
-const serviceSpecs = buildCoreManagedServiceSpecs(bunExecPath, repoRoot, { ...process.env });
+const serviceSpecs = buildCoreManagedServiceSpecs(
+  bunExecPath,
+  repoRoot,
+  { ...process.env },
+  scmRepairAuthoritySecretOverride,
+);
 console.log(`[start] Runtime logs are being written to ${relSystemLogPath()}.`);
 if (!LOCALBUDDY_ENABLED) {
   console.log(

@@ -74,6 +74,232 @@ describe("server RequestQueue", () => {
     queue.close();
   });
 
+  test("keeps provisional autonomy dispatches unclaimable until exact confirmation", () => {
+    const queue = new RequestQueue(":memory:");
+    const enqueued = queue.enqueue({
+      sessionId: "dev",
+      prompt: "run only if the autonomy cycle is still live",
+      priority: "background",
+      idempotencyKey: "autonomy:two-phase-dispatch",
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationTtlMs: 30_000,
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          objectiveId: "two-phase-dispatch",
+          runId: "run-two-phase",
+          snapshotId: "snapshot-two-phase",
+          patternKey: "two-phase",
+          componentArea: "apps/server",
+          targetPaths: ["apps/server/src/requests.ts"],
+          writeGlobs: ["apps/server/src/*.ts"],
+          reservationRequired: true,
+        },
+      },
+    });
+    const requestId = String(enqueued.requestId ?? "");
+    const confirmationToken = String(enqueued.dispatchConfirmationToken ?? "");
+
+    expect(enqueued).toMatchObject({
+      ok: true,
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationToken: expect.any(String),
+      dispatchConfirmationExpiresAt: expect.any(String),
+    });
+    expect(enqueued.queuePosition).toBeUndefined();
+    expect(queue.getRequest(requestId)?.dispatchConfirmationToken).toBeNull();
+    expect(queue.listRequests({ status: "pending" })[0]?.dispatchConfirmationToken).toBeNull();
+    expect(queue.getPendingRequests()).toEqual([]);
+    expect(queue.countByStatus().pending).toBe(0);
+    expect(queue.countByPriority().background).toBe(0);
+    expect(queue.countAutonomyRequests()).toBe(0);
+    expect(queue.claim("remotebuddy-before-confirm")).toMatchObject({
+      ok: false,
+      message: "No pending requests",
+    });
+    expect(queue.confirmDispatch(requestId, "wrong-token").ok).toBe(false);
+
+    expect(queue.confirmDispatch(requestId, confirmationToken)).toMatchObject({
+      ok: true,
+      confirmed: true,
+      idempotent: false,
+    });
+    expect(queue.confirmDispatch(requestId, confirmationToken)).toMatchObject({
+      ok: true,
+      confirmed: true,
+      idempotent: true,
+    });
+    expect(queue.countAutonomyRequests()).toBe(1);
+    const claimed = queue.claim("remotebuddy-after-confirm");
+    expect(claimed).toMatchObject({
+      ok: true,
+      request: { id: requestId, dispatchConfirmationToken: null },
+    });
+    expect(queue.confirmDispatch(requestId, confirmationToken)).toMatchObject({
+      ok: true,
+      confirmed: true,
+      idempotent: true,
+    });
+    expect(
+      queue.enqueue({
+        sessionId: "dev",
+        prompt: "run only if the autonomy cycle is still live",
+        priority: "background",
+        idempotencyKey: "autonomy:two-phase-dispatch",
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationTtlMs: 30_000,
+      }),
+    ).toMatchObject({
+      ok: true,
+      requestId,
+      deduplicated: true,
+      dispatchConfirmed: true,
+    });
+    queue.close();
+  });
+
+  test("upgrades an unclaimed legacy idempotent row to fenced dispatch", () => {
+    const queue = new RequestQueue(":memory:");
+    const first = queue.enqueue({
+      sessionId: "dev",
+      prompt: "legacy pending autonomy request",
+      priority: "background",
+      idempotencyKey: "autonomy:legacy-pending-upgrade",
+    });
+
+    const upgraded = queue.enqueue({
+      sessionId: "dev",
+      prompt: "legacy pending autonomy request",
+      priority: "background",
+      idempotencyKey: "autonomy:legacy-pending-upgrade",
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationTtlMs: 30_000,
+    });
+    const confirmationToken = String(upgraded.dispatchConfirmationToken ?? "");
+
+    expect(upgraded).toMatchObject({
+      ok: true,
+      requestId: first.requestId,
+      deduplicated: true,
+      dispatchConfirmationRequired: true,
+    });
+    expect(queue.claim("remotebuddy-before-legacy-upgrade-confirm").ok).toBe(false);
+    expect(queue.confirmDispatch(String(first.requestId), confirmationToken)).toMatchObject({
+      ok: true,
+      confirmed: true,
+    });
+    expect(queue.claim("remotebuddy-after-legacy-upgrade-confirm").ok).toBe(true);
+    queue.close();
+  });
+
+  test("expires abandoned provisional dispatches and rearms their idempotency key", () => {
+    const queue = new RequestQueue(":memory:");
+    const body = {
+      sessionId: "dev",
+      prompt: "do not leak work from an expired cycle",
+      priority: "background",
+      idempotencyKey: "autonomy:expired-two-phase-dispatch",
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationTtlMs: 1_000,
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          objectiveId: "expired-two-phase-dispatch",
+          runId: "run-expired-two-phase",
+          snapshotId: "snapshot-expired-two-phase",
+          patternKey: "expired-two-phase",
+          componentArea: "apps/server",
+          targetPaths: ["apps/server/src/requests.ts"],
+          writeGlobs: ["apps/server/src/*.ts"],
+          reservationRequired: true,
+        },
+      },
+    };
+    const first = queue.enqueue(body);
+    const afterExpiry = new Date(Date.parse(first.dispatchConfirmationExpiresAt!) + 1);
+
+    expect(queue.expireUnconfirmedDispatches(afterExpiry)).toMatchObject({
+      expired: 1,
+      requestIds: [first.requestId],
+    });
+    expect(queue.getRequest(first.requestId!)).toMatchObject({ status: "failed" });
+    expect(
+      queue.confirmDispatch(first.requestId!, first.dispatchConfirmationToken!, afterExpiry).ok,
+    ).toBe(false);
+
+    const retry = queue.enqueue(body);
+    expect(retry).toMatchObject({
+      ok: true,
+      requestId: first.requestId,
+      requeued: true,
+      dispatchConfirmationRequired: true,
+    });
+    expect(retry.dispatchConfirmationToken).not.toBe(first.dispatchConfirmationToken);
+    expect(queue.claim("remotebuddy-before-retry-confirm").ok).toBe(false);
+    queue.close();
+  });
+
+  test("preserves provisional confirmation ownership across a queue restart", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-provisional-request-restart-"));
+    const dbPath = join(root, "requests.sqlite");
+    const body = {
+      sessionId: "dev",
+      prompt: "survive the server restart without becoming claimable",
+      priority: "background",
+      idempotencyKey: "autonomy:restart-two-phase-dispatch",
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationTtlMs: 30_000,
+      dispatchConfirmationDeadlineAt: new Date(Date.now() + 20_000).toISOString(),
+      metadata: {
+        origin: "autonomy",
+        autonomy: {
+          objectiveId: "restart-two-phase-dispatch",
+          runId: "run-restart-two-phase",
+          snapshotId: "snapshot-restart-two-phase",
+          patternKey: "restart-two-phase",
+          componentArea: "apps/server",
+          targetPaths: ["apps/server/src/requests.ts"],
+          writeGlobs: ["apps/server/src/*.ts"],
+          reservationRequired: true,
+        },
+      },
+    };
+    let queue: RequestQueue | null = new RequestQueue(dbPath);
+
+    try {
+      const first = queue.enqueue(body);
+      const requestId = String(first.requestId ?? "");
+      const confirmationToken = String(first.dispatchConfirmationToken ?? "");
+      const requestedDeadlineMs = Date.parse(body.dispatchConfirmationDeadlineAt);
+      expect(Date.parse(first.dispatchConfirmationExpiresAt!)).toBeLessThanOrEqual(
+        requestedDeadlineMs,
+      );
+      queue.close();
+
+      queue = new RequestQueue(dbPath);
+      expect(queue.claim("remotebuddy-after-restart").ok).toBe(false);
+      const replayed = queue.enqueue(body);
+      expect(replayed).toMatchObject({
+        ok: true,
+        requestId,
+        deduplicated: true,
+        dispatchConfirmationRequired: true,
+      });
+      expect(replayed.dispatchConfirmationToken).toBe(confirmationToken);
+      expect(queue.confirmDispatch(requestId, confirmationToken)).toMatchObject({
+        ok: true,
+        confirmed: true,
+      });
+      expect(queue.claim("remotebuddy-confirmed-after-restart")).toMatchObject({
+        ok: true,
+        request: { id: requestId },
+      });
+    } finally {
+      queue?.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("computes request SLO summary for recent terminal requests", () => {
     const queue = new RequestQueue(":memory:");
 
@@ -1522,6 +1748,96 @@ describe("server RequestQueue", () => {
           result: { requiresWorker: true, jobId: "job-good" },
         }),
       ).toMatchObject({ ok: true, idempotent: true });
+    } finally {
+      queue.close();
+      db.close(true);
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup for Windows file lock timing
+      }
+    }
+  });
+
+  test("does not reconcile a stale claimed provisional request until exact dispatch confirmation", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-provisional-handoff-reconcile-"));
+    const dbPath = join(root, "requests.sqlite");
+    const queue = new RequestQueue(dbPath);
+    const db = new Database(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE jobs (
+          id TEXT PRIMARY KEY,
+          sessionId TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          params TEXT NOT NULL,
+          createdAt TEXT NOT NULL
+        );
+      `);
+      const provisional = queue.enqueue({
+        sessionId: "autonomy",
+        prompt: "dispatch only after the live fence confirms",
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationTtlMs: 300_000,
+      });
+      const requestId = String(provisional.requestId ?? "");
+      const confirmationToken = String(provisional.dispatchConfirmationToken ?? "");
+      expect(confirmationToken).not.toBe("");
+
+      const now = new Date();
+      const staleLeaseAt = new Date(now.getTime() - 1_000).toISOString();
+      const markClaimed = db.prepare(
+        `UPDATE requests
+         SET status = 'claimed',
+             agentId = 'legacy-remotebuddy',
+             claimToken = 'legacy-claim-token',
+             claimGeneration = 1,
+             leaseExpiresAt = ?
+         WHERE id = ?`,
+      );
+      markClaimed.run(staleLeaseAt, requestId);
+      markClaimed.finalize();
+      const insertJob = db.prepare(
+        `INSERT INTO jobs (id, sessionId, kind, params, createdAt)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      insertJob.run(
+        "job-provisional-stale-claim",
+        "autonomy",
+        "task.execute",
+        JSON.stringify({ requestId }),
+        new Date(now.getTime() + 1).toISOString(),
+      );
+      insertJob.finalize();
+
+      expect(queue.reconcileWorkerHandoffsFromJobs(now)).toEqual({
+        completed: 0,
+        requestIds: [],
+        jobIds: [],
+      });
+      expect(queue.getRequest(requestId)).toMatchObject({
+        status: "claimed",
+        handoffJobId: null,
+        dispatchConfirmedAt: null,
+      });
+
+      // A provisional request can never normally become claimed before
+      // confirmation. Simulate the persisted confirmation half of a
+      // mixed-version recovery record and prove only that state is eligible.
+      const markConfirmed = db.prepare(
+        `UPDATE requests SET dispatchConfirmedAt = ?, updatedAt = ? WHERE id = ?`,
+      );
+      markConfirmed.run(now.toISOString(), now.toISOString(), requestId);
+      markConfirmed.finalize();
+      expect(queue.reconcileWorkerHandoffsFromJobs(now)).toEqual({
+        completed: 1,
+        requestIds: [requestId],
+        jobIds: ["job-provisional-stale-claim"],
+      });
+      expect(queue.getRequest(requestId)).toMatchObject({
+        status: "completed",
+        handoffJobId: "job-provisional-stale-claim",
+      });
     } finally {
       queue.close();
       db.close(true);

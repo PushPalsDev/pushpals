@@ -6247,18 +6247,18 @@ function isTriggerType(
   );
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: string): Promise<T> {
-  const timeout = Math.max(1_000, timeoutMs);
-  const timeoutError = new Error(reason);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timed = new Promise<T>((_, reject) => {
-    timer = setTimeout(() => reject(timeoutError), timeout);
-  });
-  try {
-    return await Promise.race([promise, timed]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+async function drainPromiseWithin(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  await Promise.race([
+    promise.then(
+      () => undefined,
+      () => undefined,
+    ),
+    new Promise<void>((resolveDrain) => {
+      timer = setTimeout(resolveDrain, Math.max(1, timeoutMs));
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
 }
 
 async function gitOutput(repo: string, args: string[]): Promise<string> {
@@ -6373,6 +6373,7 @@ export function autonomyIntegrationBaselineDecision(options: {
 }
 
 const AUTONOMY_CONTROL_HTTP_TIMEOUT_MS = 10_000;
+const AUTONOMY_LLM_ABORT_DRAIN_MS = 1_000;
 
 export class RemoteBuddyAutonomousEngine {
   private readonly server: string;
@@ -6392,6 +6393,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly workerExecutionPlatform: PushPalsConfig["workerpals"]["executionPlatform"];
   private runtimeEnabled = true;
   private stopped = false;
+  private startRequested = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private startupGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private startupFastTickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -6411,6 +6413,7 @@ export class RemoteBuddyAutonomousEngine {
   private readonly suppressedFailureTargets = new Map<string, number>();
   private pendingIdeationTimeoutRecovery: IdeationTimeoutRecovery | null = null;
   private activeRepositoryIdeation: AbortController | null = null;
+  private activeCycle: { runId: string; controller: AbortController } | null = null;
 
   constructor(opts: {
     server: string;
@@ -6457,21 +6460,36 @@ export class RemoteBuddyAutonomousEngine {
 
   setRuntimeEnabled(enabled: boolean): void {
     if (this.stopped) return;
+    const wasEnabled = this.runtimeEnabled;
     this.runtimeEnabled = Boolean(enabled);
     if (!this.runtimeEnabled) {
+      this.activeCycle?.controller.abort(
+        new Error("Autonomy cycle cancelled because autonomy was disabled"),
+      );
       this.activeRepositoryIdeation?.abort(
         new Error("RepositoryAgent ideation cancelled because autonomy was disabled"),
       );
       this.nextTickAtMs = 0;
       this.startupFastTickAttemptsRemaining = 0;
+      this.clearStartupGraceTimer();
       this.clearStartupFastTickTimer();
+      if (this.timer) {
+        clearInterval(this.timer);
+        this.timer = null;
+      }
+      if (this.heartbeatTimer) {
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+      }
       if (!this.currentRunId) {
         this.lastOutcome = "skipped";
         this.lastDetail = "disabled_by_runtime_config";
         this.lastCompletedAtMs = Date.now();
         this.setPhase("idle");
       }
+      return;
     }
+    if (!wasEnabled && this.startRequested) this.start();
   }
 
   private setPhase(phase: string): void {
@@ -7109,6 +7127,7 @@ export class RemoteBuddyAutonomousEngine {
     input: Parameters<LLMClient["generate"]>[0],
     objectiveId?: string,
     timeoutOverrideMs?: number,
+    cycleSignal?: AbortSignal,
   ): Promise<{
     json: Record<string, unknown>;
     llmCall: Record<string, unknown>;
@@ -7136,18 +7155,45 @@ export class RemoteBuddyAutonomousEngine {
       `[RemoteBuddyAutonomousEngine] ${phase} phase start: timeout_ms=${timeoutMs} system_chars=${systemChars} message_chars=${messageChars} request_bytes=${requestBytes} max_tokens=${input.maxTokens ?? "default"} temperature=${input.temperature ?? "default"}`,
     );
     let output: Awaited<ReturnType<LLMClient["generate"]>>;
+    const controller = new AbortController();
+    const upstreamSignals = [input.signal, cycleSignal].filter((signal): signal is AbortSignal =>
+      Boolean(signal),
+    );
+    const abortFromUpstream = (signal: AbortSignal) => () => controller.abort(signal.reason);
+    const upstreamListeners = upstreamSignals.map((signal) => ({
+      signal,
+      listener: abortFromUpstream(signal),
+    }));
+    for (const { signal, listener } of upstreamListeners) {
+      signal.addEventListener("abort", listener, { once: true });
+      if (signal.aborted) listener();
+    }
+    const timeoutError = new Error(`autonomy ${phase} phase timeout`);
+    const timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
+    const operation = Promise.resolve().then(async () => {
+      if (controller.signal.aborted) {
+        throw controller.signal.reason ?? new Error(`autonomy ${phase} phase aborted`);
+      }
+      return await this.llm.generate({ ...input, signal: controller.signal });
+    });
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const rejectAborted = () =>
+        reject(controller.signal.reason ?? new Error(`autonomy ${phase} phase aborted`));
+      controller.signal.addEventListener("abort", rejectAborted, { once: true });
+      if (controller.signal.aborted) rejectAborted();
+    });
     try {
-      output = await withTimeout(
-        this.llm.generate(input),
-        timeoutMs,
-        `autonomy ${phase} phase timeout`,
-      );
+      output = await Promise.race([operation, aborted]);
     } catch (error) {
+      if (controller.signal.aborted) {
+        await drainPromiseWithin(operation, AUTONOMY_LLM_ABORT_DRAIN_MS);
+      }
+      const phaseError = controller.signal.aborted ? (controller.signal.reason ?? error) : error;
       const elapsedMs = Date.now() - startedAt;
       if (
         phase === "ideation" &&
-        error instanceof Error &&
-        error.message === "autonomy ideation phase timeout"
+        phaseError instanceof Error &&
+        phaseError.message === "autonomy ideation phase timeout"
       ) {
         this.pendingIdeationTimeoutRecovery = {
           previousRunId: runId,
@@ -7156,9 +7202,14 @@ export class RemoteBuddyAutonomousEngine {
         };
       }
       console.warn(
-        `[RemoteBuddyAutonomousEngine] ${phase} phase failed: elapsed_ms=${elapsedMs} timeout_ms=${timeoutMs} system_chars=${systemChars} message_chars=${messageChars} request_bytes=${requestBytes} error=${error instanceof Error ? error.message : String(error)}`,
+        `[RemoteBuddyAutonomousEngine] ${phase} phase failed: elapsed_ms=${elapsedMs} timeout_ms=${timeoutMs} system_chars=${systemChars} message_chars=${messageChars} request_bytes=${requestBytes} error=${phaseError instanceof Error ? phaseError.message : String(phaseError)}`,
       );
-      throw error;
+      throw phaseError;
+    } finally {
+      clearTimeout(timer);
+      for (const { signal, listener } of upstreamListeners) {
+        signal.removeEventListener("abort", listener);
+      }
     }
     const responseJson = parseJsonObject(output.text);
     const tokenUsage = output.usage ?? null;
@@ -7478,14 +7529,41 @@ export class RemoteBuddyAutonomousEngine {
         validationScope?: string;
         failureFingerprint?: string;
       };
+      dispatchFence?: {
+        snapshot: Snapshot;
+        cycleDeadline: number;
+        signal?: AbortSignal;
+      };
     },
   ): Promise<string | null> {
     if (!this.runtimeEnabled) return null;
     const canonicalInstruction = instructionTextForRepo(this.autonomyRepo, instruction);
     const reservationRequired = autonomy.reservationRequired !== false;
+    if (
+      autonomy.dispatchFence &&
+      this.cycleFenceReason(
+        autonomy.dispatchFence.snapshot,
+        autonomy.dispatchFence.cycleDeadline,
+        autonomy.dispatchFence.signal,
+      )
+    ) {
+      return null;
+    }
+    const dispatchConfirmationDeadlineMs = autonomy.dispatchFence
+      ? Math.min(
+          autonomy.dispatchFence.cycleDeadline,
+          Date.parse(autonomy.dispatchFence.snapshot.snapshot_created_at) +
+            autonomy.dispatchFence.snapshot.snapshot_ttl_ms,
+        )
+      : null;
+    const dispatchConfirmationTtlMs =
+      dispatchConfirmationDeadlineMs == null
+        ? null
+        : Math.max(1, Math.min(2 * 60_000, dispatchConfirmationDeadlineMs - Date.now()));
     const res = await this.fetchControl(`${this.server}/requests/enqueue`, {
       method: "POST",
       headers: this.headers(),
+      ...(autonomy.dispatchFence?.signal ? { signal: autonomy.dispatchFence.signal } : {}),
       body: JSON.stringify({
         sessionId: this.sessionId,
         prompt: canonicalInstruction,
@@ -7493,6 +7571,15 @@ export class RemoteBuddyAutonomousEngine {
         forceWorker: true,
         forceLane: "worker",
         ...(reservationRequired ? { idempotencyKey: `autonomy:${autonomy.objectiveId}` } : {}),
+        ...(dispatchConfirmationTtlMs != null
+          ? {
+              dispatchConfirmationRequired: true,
+              dispatchConfirmationTtlMs,
+              dispatchConfirmationDeadlineAt: new Date(
+                dispatchConfirmationDeadlineMs!,
+              ).toISOString(),
+            }
+          : {}),
         metadata: {
           origin: "autonomy",
           autonomy: {
@@ -7555,8 +7642,55 @@ export class RemoteBuddyAutonomousEngine {
       }
       return null;
     }
-    const data = (await res.json()) as { ok?: boolean; requestId?: string };
+    const data = (await res.json()) as {
+      ok?: boolean;
+      requestId?: string;
+      dispatchConfirmationRequired?: boolean;
+      dispatchConfirmationToken?: string;
+      dispatchConfirmed?: boolean;
+    };
     if (data.ok && data.requestId) {
+      if (autonomy.dispatchFence && data.dispatchConfirmed !== true) {
+        if (data.dispatchConfirmationRequired !== true) {
+          console.warn(
+            "[RemoteBuddyAutonomousEngine] Server did not attest two-phase autonomy dispatch; refusing the request ID.",
+          );
+          return null;
+        }
+        const confirmationToken = String(data.dispatchConfirmationToken ?? "").trim();
+        if (!confirmationToken) return null;
+        if (
+          this.cycleFenceReason(
+            autonomy.dispatchFence.snapshot,
+            autonomy.dispatchFence.cycleDeadline,
+            autonomy.dispatchFence.signal,
+          )
+        ) {
+          return null;
+        }
+        const confirmResponse = await this.fetchControl(
+          `${this.server}/requests/${encodeURIComponent(data.requestId)}/dispatch/confirm`,
+          {
+            method: "POST",
+            headers: this.headers(),
+            ...(autonomy.dispatchFence.signal ? { signal: autonomy.dispatchFence.signal } : {}),
+            body: JSON.stringify({ dispatchConfirmationToken: confirmationToken }),
+          },
+          Math.max(
+            1,
+            Math.min(
+              AUTONOMY_CONTROL_HTTP_TIMEOUT_MS,
+              autonomy.dispatchFence.cycleDeadline - Date.now(),
+            ),
+          ),
+        );
+        if (!confirmResponse.ok) return null;
+        const confirmation = (await confirmResponse.json()) as {
+          ok?: boolean;
+          confirmed?: boolean;
+        };
+        if (!confirmation.ok || !confirmation.confirmed) return null;
+      }
       this.dispatchBackoffUntilMs = 0;
       this.dispatchBackoffReason = "";
       return data.requestId;
@@ -7568,6 +7702,16 @@ export class RemoteBuddyAutonomousEngine {
     const createdAt = Date.parse(snapshot.snapshot_created_at);
     if (!Number.isFinite(createdAt)) return true;
     return Date.now() > createdAt + snapshot.snapshot_ttl_ms;
+  }
+
+  private cycleFenceReason(
+    snapshot: Snapshot,
+    cycleDeadline: number,
+    signal?: AbortSignal,
+  ): "disabled" | "snapshot_expired" | null {
+    if (this.stopped || !this.runtimeEnabled || signal?.aborted) return "disabled";
+    if (Date.now() > cycleDeadline || this.isSnapshotExpired(snapshot)) return "snapshot_expired";
+    return null;
   }
 
   private impactSignalV1(snapshot: Snapshot, candidate: AutonomyCandidate): number {
@@ -7857,7 +8001,14 @@ export class RemoteBuddyAutonomousEngine {
     snapshot: Snapshot;
     repoTargets: RepoTargetProfile[];
     visionSectionRefs: string[];
+    cycleDeadline?: number;
+    cycleSignal?: AbortSignal;
   }): Promise<{ handled: boolean; outcome: "success" | "skipped" | "failed"; detail: string }> {
+    const cycleDeadline = params.cycleDeadline ?? Number.POSITIVE_INFINITY;
+    const fenced = (stage: string) => {
+      const reason = this.cycleFenceReason(params.snapshot, cycleDeadline, params.cycleSignal);
+      return reason ? `${reason}_${stage}` : null;
+    };
     const incident = activeValidationIncident(params.snapshot);
     if (!incident) {
       return { handled: false, outcome: "skipped", detail: "no_validation_incident" };
@@ -7950,6 +8101,11 @@ export class RemoteBuddyAutonomousEngine {
       };
     }
 
+    const beforeEligibilityFence = fenced("before_validation_repair_eligibility");
+    if (beforeEligibilityFence) {
+      return { handled: true, outcome: "skipped", detail: beforeEligibilityFence };
+    }
+
     this.setPhase("validation_repair_eligibility");
     const eligibilityById = await this.fetchEligibility(params.runId, params.snapshot.snapshot_id, [
       {
@@ -7962,6 +8118,10 @@ export class RemoteBuddyAutonomousEngine {
         required_validation_repair: true,
       },
     ]);
+    const afterEligibilityFence = fenced("after_validation_repair_eligibility");
+    if (afterEligibilityFence) {
+      return { handled: true, outcome: "skipped", detail: afterEligibilityFence };
+    }
     const eligibility = eligibilityById.get(candidate.id) ?? {
       ok: false,
       reason: "eligibility_unavailable",
@@ -7969,6 +8129,10 @@ export class RemoteBuddyAutonomousEngine {
     const objectiveId = `obj_${randomUUID().slice(0, 8)}`;
     if (!eligibility.ok) {
       const reason = eligibility.reason ?? "validation repair not eligible";
+      const rejectionFence = fenced("before_validation_repair_rejection_record");
+      if (rejectionFence) {
+        return { handled: true, outcome: "skipped", detail: rejectionFence };
+      }
       await this.postObjective({
         runId: params.runId,
         snapshotId: params.snapshot.snapshot_id,
@@ -8010,6 +8174,10 @@ export class RemoteBuddyAutonomousEngine {
     }
 
     this.setPhase("renew_lock_before_validation_repair_enqueue");
+    const beforeRenewFence = fenced("before_validation_repair_lock_renew");
+    if (beforeRenewFence) {
+      return { handled: true, outcome: "skipped", detail: beforeRenewFence };
+    }
     if (!(await this.renewDispatchLock(params.runId))) {
       return {
         handled: true,
@@ -8017,9 +8185,17 @@ export class RemoteBuddyAutonomousEngine {
         detail: "lock_renew_failed_before_validation_repair_enqueue",
       };
     }
+    const afterRenewFence = fenced("after_validation_repair_lock_renew");
+    if (afterRenewFence) {
+      return { handled: true, outcome: "skipped", detail: afterRenewFence };
+    }
 
     const instruction = validationRepairInstruction(candidate, incident, this.autonomyRepo);
     this.setPhase("reserve_validation_repair_objective");
+    const beforeReservationFence = fenced("before_validation_repair_reservation");
+    if (beforeReservationFence) {
+      return { handled: true, outcome: "skipped", detail: beforeReservationFence };
+    }
     const reservationRecorded = await this.postObjective({
       runId: params.runId,
       snapshotId: params.snapshot.snapshot_id,
@@ -8067,7 +8243,15 @@ export class RemoteBuddyAutonomousEngine {
         detail: "validation_repair_reservation_failed",
       };
     }
+    const afterReservationFence = fenced("after_validation_repair_reservation");
+    if (afterReservationFence) {
+      return { handled: true, outcome: "skipped", detail: afterReservationFence };
+    }
     this.setPhase("enqueue_validation_repair");
+    const enqueueFence = fenced("before_validation_repair_enqueue");
+    if (enqueueFence) {
+      return { handled: true, outcome: "skipped", detail: enqueueFence };
+    }
     const requestId = await this.enqueueSyntheticRequest(instruction, {
       objectiveId,
       runId: params.runId,
@@ -8084,8 +8268,17 @@ export class RemoteBuddyAutonomousEngine {
         validationScope: asString(incident.validation_scope) || undefined,
         failureFingerprint: asString(incident.failure_fingerprint) || undefined,
       },
+      dispatchFence: {
+        snapshot: params.snapshot,
+        cycleDeadline,
+        signal: params.cycleSignal,
+      },
     });
     if (!requestId) {
+      const postEnqueueFence = fenced("after_validation_repair_enqueue");
+      if (postEnqueueFence) {
+        return { handled: true, outcome: "skipped", detail: postEnqueueFence };
+      }
       const enqueueSuppressionReason = this.suppressedFailureTargetReason(candidate.target_paths);
       await this.postObjective({
         runId: params.runId,
@@ -8147,6 +8340,8 @@ export class RemoteBuddyAutonomousEngine {
     if (this.stopped || !this.runtimeEnabled || this.cfg.killSwitchEnabled || this.inFlight) return;
     this.inFlight = true;
     const runId = `run_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    const cycleController = new AbortController();
+    this.activeCycle = { runId, controller: cycleController };
     this.markTickStart(runId);
     const cycleDeadline = Date.now() + this.cycleBudgetMs();
     let lockAcquired = false;
@@ -8251,6 +8446,8 @@ export class RemoteBuddyAutonomousEngine {
         snapshot,
         repoTargets,
         visionSectionRefs: visionContext.section_numbers,
+        cycleDeadline,
+        cycleSignal: cycleController.signal,
       });
       if (validationRepair.handled) {
         outcome = validationRepair.outcome;
@@ -8340,8 +8537,26 @@ export class RemoteBuddyAutonomousEngine {
         phase: "ideation",
       });
       this.setPhase("renew_lock_before_ideation");
+      const beforeIdeationRenewFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (beforeIdeationRenewFence) {
+        outcomeDetail = `${beforeIdeationRenewFence}_before_ideation_lock_renew`;
+        return;
+      }
       if (!(await this.renewDispatchLock(runId))) {
         outcomeDetail = "lock_renew_failed_before_ideation";
+        return;
+      }
+      const afterIdeationRenewFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (afterIdeationRenewFence) {
+        outcomeDetail = `${afterIdeationRenewFence}_after_ideation_lock_renew`;
         return;
       }
 
@@ -8470,6 +8685,7 @@ export class RemoteBuddyAutonomousEngine {
             buildIdeationInput(ideationRecovery, Boolean(ideationRecovery)),
             undefined,
             ideationRecovery ? this.ideationRetryTimeoutMs() : undefined,
+            cycleController.signal,
           );
         } catch (error) {
           if (
@@ -8493,6 +8709,7 @@ export class RemoteBuddyAutonomousEngine {
               buildIdeationInput(ideationRecovery, true),
               undefined,
               this.ideationRetryTimeoutMs(),
+              cycleController.signal,
             );
             this.pendingIdeationTimeoutRecovery = null;
           } else {
@@ -8923,22 +9140,39 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "lock_renew_failed_before_scoring";
         return;
       }
+      const afterScoringRenewFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (afterScoringRenewFence) {
+        outcomeDetail = `${afterScoringRenewFence}_after_scoring_lock_renew`;
+        return;
+      }
 
       this.setPhase("scoring");
       let scoringJson: Record<string, unknown> = { scores: [] };
       try {
-        const scoringPhase = await this.llmPhase("scoring", runId, snapshot.snapshot_id, {
-          system: SCORING_SYSTEM_PROMPT,
-          json: true,
-          maxTokens: 1400,
-          temperature: 0.1,
-          messages: [
-            {
-              role: "user",
-              content: JSON.stringify({ candidates: scoringCandidates, top_k: this.cfg.topK }),
-            },
-          ],
-        });
+        const scoringPhase = await this.llmPhase(
+          "scoring",
+          runId,
+          snapshot.snapshot_id,
+          {
+            system: SCORING_SYSTEM_PROMPT,
+            json: true,
+            maxTokens: 1400,
+            temperature: 0.1,
+            messages: [
+              {
+                role: "user",
+                content: JSON.stringify({ candidates: scoringCandidates, top_k: this.cfg.topK }),
+              },
+            ],
+          },
+          undefined,
+          undefined,
+          cycleController.signal,
+        );
         llmCalls.push(scoringPhase.llmCall);
         scoringJson = scoringPhase.json;
       } catch (error) {
@@ -9084,6 +9318,15 @@ export class RemoteBuddyAutonomousEngine {
       this.setPhase("renew_lock_before_selection");
       if (!(await this.renewDispatchLock(runId))) {
         outcomeDetail = "lock_renew_failed_before_selection";
+        return;
+      }
+      const afterSelectionRenewFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (afterSelectionRenewFence) {
+        outcomeDetail = `${afterSelectionRenewFence}_after_selection_lock_renew`;
         return;
       }
       const top = rankedWithEligibility[0];
@@ -9299,8 +9542,21 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       this.setPhase("renew_lock_before_planning");
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_before_planning";
+        return;
+      }
       if (!(await this.renewDispatchLock(runId))) {
         outcomeDetail = "lock_renew_failed_before_planning";
+        return;
+      }
+      const afterPlanningRenewFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (afterPlanningRenewFence) {
+        outcomeDetail = `${afterPlanningRenewFence}_after_planning_lock_renew`;
         return;
       }
 
@@ -9322,9 +9578,15 @@ export class RemoteBuddyAutonomousEngine {
           ],
         },
         objectiveId,
+        undefined,
+        cycleController.signal,
       );
       llmCalls.push(planningPhase.llmCall);
       const planningJson = planningPhase.json;
+      if (this.stopped || !this.runtimeEnabled) {
+        outcomeDetail = "disabled_during_planning";
+        return;
+      }
       if (this.isSnapshotExpired(snapshot) || Date.now() > cycleDeadline) {
         this.setPhase("record_snapshot_expired");
         await this.recordSnapshotExpired(
@@ -9344,6 +9606,15 @@ export class RemoteBuddyAutonomousEngine {
       }
       if (!(await this.renewDispatchLock(runId))) {
         outcomeDetail = "lock_renew_failed_before_enqueue";
+        return;
+      }
+      const afterEnqueueRenewFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (afterEnqueueRenewFence) {
+        outcomeDetail = `${afterEnqueueRenewFence}_after_enqueue_lock_renew`;
         return;
       }
       let instruction = instructionTextForRepo(
@@ -9395,8 +9666,13 @@ export class RemoteBuddyAutonomousEngine {
         selection_roll: selection.roll,
       };
       this.setPhase("reserve_objective");
-      if (this.stopped || !this.runtimeEnabled) {
-        outcomeDetail = "disabled_before_objective_reservation";
+      const beforeReservationFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (beforeReservationFence) {
+        outcomeDetail = `${beforeReservationFence}_before_objective_reservation`;
         return;
       }
       const reservationRecorded = await this.postObjective({
@@ -9433,10 +9709,24 @@ export class RemoteBuddyAutonomousEngine {
         outcomeDetail = "objective_reservation_failed";
         return;
       }
+      const afterReservationFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (afterReservationFence) {
+        outcomeDetail = `${afterReservationFence}_after_objective_reservation`;
+        return;
+      }
 
       this.setPhase("enqueue_request");
-      if (this.stopped || !this.runtimeEnabled) {
-        outcomeDetail = "disabled_before_request_enqueue";
+      const beforeEnqueueFence = this.cycleFenceReason(
+        snapshot,
+        cycleDeadline,
+        cycleController.signal,
+      );
+      if (beforeEnqueueFence) {
+        outcomeDetail = `${beforeEnqueueFence}_before_request_enqueue`;
         return;
       }
       const requestId = await this.enqueueSyntheticRequest(instruction, {
@@ -9447,8 +9737,22 @@ export class RemoteBuddyAutonomousEngine {
         componentArea: selected.candidate.component_area,
         targetPaths: selected.candidate.target_paths,
         writeGlobs: selected.candidate.scope.write_globs,
+        dispatchFence: {
+          snapshot,
+          cycleDeadline,
+          signal: cycleController.signal,
+        },
       });
       if (!requestId) {
+        const postEnqueueFence = this.cycleFenceReason(
+          snapshot,
+          cycleDeadline,
+          cycleController.signal,
+        );
+        if (postEnqueueFence) {
+          outcomeDetail = `${postEnqueueFence}_after_request_enqueue`;
+          return;
+        }
         this.setPhase("record_failed_enqueue");
         await this.postObjective({
           runId,
@@ -9480,11 +9784,23 @@ export class RemoteBuddyAutonomousEngine {
       outcome = "success";
       outcomeDetail = `dispatched_request_${requestId.slice(0, 8)}`;
     } catch (error) {
-      console.error("[RemoteBuddyAutonomousEngine] tick failed:", error);
-      outcome = "failed";
-      outcomeDetail = `error:${error instanceof Error ? error.message : String(error)}`;
+      if (cycleController.signal.aborted && (this.stopped || !this.runtimeEnabled)) {
+        outcome = "skipped";
+        outcomeDetail = compactStatusDetail(`disabled_during_${this.currentPhase}`);
+        console.log(
+          `[RemoteBuddyAutonomousEngine] tick ${runId} stopped at ${this.currentPhase} because autonomy became inactive.`,
+        );
+      } else {
+        console.error("[RemoteBuddyAutonomousEngine] tick failed:", error);
+        outcome = "failed";
+        outcomeDetail = `error:${error instanceof Error ? error.message : String(error)}`;
+      }
     } finally {
       if (lockAcquired) await this.releaseDispatchLock(runId);
+      if (this.activeCycle?.runId === runId) {
+        this.activeCycle.controller.abort(new Error("Autonomy cycle completed"));
+        this.activeCycle = null;
+      }
       this.inFlight = false;
       this.markTickDone(outcome, outcomeDetail);
       if (!lockAcquired && outcomeDetail.startsWith("lock_not_acquired")) {
@@ -9532,7 +9848,9 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   start(): void {
-    if (this.stopped || !this.runtimeEnabled || this.timer || this.startupGraceTimer) return;
+    if (this.stopped) return;
+    this.startRequested = true;
+    if (!this.runtimeEnabled || this.timer || this.startupGraceTimer) return;
     console.log(
       `[RemoteBuddyAutonomousEngine] Using dedicated autonomy worktree ${this.autonomyRepo} (remote=${this.gitRemote} integration=${this.integrationBranch} base=${this.baseBranch}).`,
     );
@@ -9571,7 +9889,11 @@ export class RemoteBuddyAutonomousEngine {
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.startRequested = false;
     this.runtimeEnabled = false;
+    this.activeCycle?.controller.abort(
+      new Error("Autonomy cycle cancelled because autonomy is stopping"),
+    );
     this.activeRepositoryIdeation?.abort(
       new Error("RepositoryAgent ideation cancelled because autonomy is stopping"),
     );

@@ -25,6 +25,7 @@ import { createSessionMemoryBackend, type SessionMemoryBackend } from "./memory.
 import { PersistentSessionMemory } from "./persistent_memory.js";
 import {
   CommunicationManager,
+  copyEnvWithoutScmRepairAuthoritySecret,
   detectRepoRoot,
   extractVisionKeyItems,
   fetchBufferedWithHardDeadline,
@@ -33,6 +34,7 @@ import {
   createRepositoryAgentServiceClients,
   resolveLocalServerConnection,
   sanitizePushPalsConfigForLogging,
+  scrubScmRepairAuthoritySecretFromEnv,
   terminateProcessTree,
   matchesGlob,
   normalizeTargetPath,
@@ -2927,6 +2929,7 @@ export class RemoteBuddyOrchestrator {
       try {
         const child = Bun.spawn(cmd, {
           cwd: this.repo,
+          env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
           stdin: "ignore",
           stdout: "inherit",
           stderr: "inherit",
@@ -3841,8 +3844,6 @@ export class RemoteBuddyOrchestrator {
       );
       return;
     }
-
-    this.autonomousEngine.stop();
     console.log(
       "[RemoteBuddy] Autonomous engine disabled via runtime config (remotebuddy.autonomy.enabled=false).",
     );
@@ -4077,6 +4078,7 @@ async function main() {
 }
 
 if (import.meta.main) {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
   main().catch((err) => {
     console.error("[RemoteBuddy] Fatal:", err);
     process.exit(1);

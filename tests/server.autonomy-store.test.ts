@@ -2972,6 +2972,123 @@ describe("server AutonomyStore policy gates", () => {
     expect(String(duplicate.results?.[0]?.reason ?? "")).toBe(
       "pattern already has active objective",
     );
+
+    const differentFamily = store.evaluateEligibility({
+      runId: "run_semantic_cluster",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_semantic_cluster_other_family",
+          objective_type: "flaky_test",
+          component_area: "src/workers",
+          target_paths: ["src/workers/beta.ts"],
+          vision_objective_id: "vision:route-readiness",
+          acceptance_criteria: ["Route src/workers/beta.ts becomes ready after 5 retries"],
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(differentFamily.results?.[0]).toMatchObject({ ok: true });
+  });
+
+  test("normalizes Unicode cluster identity and honors explicit parent lineage", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_unicode_cluster",
+    }).snapshot_id;
+    const active = store.recordObjectiveDecision({
+      runId: "run_unicode_cluster",
+      snapshotId,
+      sessionId: "s1",
+      objective: {
+        id: "obj_unicode_cluster",
+        title: "Repair résumé export",
+        instruction: "Keep résumé export deterministic.",
+        objective_type: "flaky_test",
+        component_area: "src/export",
+        trigger_type: "test_failure",
+        target_paths: ["src/export/resume.ts"],
+        scope: { read_anywhere: false, write_globs: ["src/export/resume.ts"] },
+        confidence: 0.95,
+        risk_level: "low",
+        expected_validation: ["bun test"],
+        vision_objective_id: "vision:re\u0301sume\u0301-export",
+        acceptance_criteria: ["The re\u0301sume\u0301 export stays stable"],
+        root_objective_id: "root:re\u0301sume\u0301",
+        status: "proposed",
+      },
+    });
+    expect(active.ok).toBe(true);
+
+    const duplicate = store.evaluateEligibility({
+      runId: "run_unicode_cluster",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_unicode_cluster",
+          objective_type: "flaky_test",
+          component_area: "tests/export",
+          target_paths: ["tests/export/resume.test.ts"],
+          vision_objective_id: "vision:résumé-export",
+          acceptance_criteria: ["The résumé export stays stable"],
+          root_objective_id: "root:résumé",
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(duplicate.results?.[0]).toMatchObject({ ok: false });
+    expect(String(duplicate.results?.[0]?.reason ?? "")).toBe(
+      "pattern already has active objective",
+    );
+  });
+
+  test("preserves digits in stable objective identifiers while abstracting prose numbers", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_numeric_objective_ids",
+    }).snapshot_id;
+    expect(
+      store.recordObjectiveDecision({
+        runId: "run_numeric_objective_ids",
+        snapshotId,
+        sessionId: "s1",
+        objective: {
+          id: "obj_numeric_objective_1",
+          title: "Repair route generation 1",
+          instruction: "Stabilize route after 2 retries.",
+          objective_type: "flaky_test",
+          component_area: "src/routes",
+          trigger_type: "test_failure",
+          target_paths: ["src/routes/alpha.ts"],
+          scope: { read_anywhere: false, write_globs: ["src/routes/alpha.ts"] },
+          confidence: 0.95,
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          vision_objective_id: "vision:route-readiness-v1",
+          acceptance_criteria: ["Route becomes ready after 2 retries"],
+          status: "proposed",
+        },
+      }).ok,
+    ).toBe(true);
+
+    const differentStableId = store.evaluateEligibility({
+      runId: "run_numeric_objective_ids",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_numeric_objective_2",
+          objective_type: "flaky_test",
+          component_area: "src/routes",
+          target_paths: ["src/routes/beta.ts"],
+          vision_objective_id: "vision:route-readiness-v2",
+          acceptance_criteria: ["Route becomes ready after 5 retries"],
+          confidence: 0.95,
+        },
+      ],
+    });
+    expect(differentStableId.results?.[0]).toMatchObject({ ok: true });
   });
 
   test("blocks PushPals-internal autonomy ideas from user-repo targets", () => {
@@ -3340,6 +3457,35 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("caller recovery labels cannot bypass an autonomy freeze", () => {
+    const store = makeStore();
+    const snapshotId = store.createSnapshot({
+      sessionId: "s1",
+      runId: "run_spoofed_frozen_recovery",
+    }).snapshot_id;
+    store.updateSafetyState({
+      freezeForMs: 60_000,
+      freezeReason: "test_spoofed_recovery",
+    });
+    const result = store.evaluateEligibility({
+      runId: "run_spoofed_frozen_recovery",
+      snapshotId,
+      candidates: [
+        {
+          candidate_id: "cand_spoofed_frozen_recovery",
+          objective_type: "small_refactor",
+          component_area: "src",
+          target_paths: ["src/file.ts"],
+          confidence: 0.95,
+          work_class: "recovery",
+          lifecycle_recovery: true,
+        },
+      ],
+    });
+    expect(result.results?.[0]).toMatchObject({ ok: false });
+    expect(String(result.results?.[0]?.reason ?? "")).toContain("autonomy frozen until");
+  });
+
   test("validates and reconciles durable gated objective reservations", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-reservation-");
     const queue = new RequestQueue(dbPath);
@@ -3431,6 +3577,81 @@ describe("server AutonomyStore policy gates", () => {
       expect(autonomyObjectiveStatus(store, "obj_orphan_reservation")).toBe("failed");
     } finally {
       queue.close();
+    }
+  });
+
+  test("restart reconciliation ignores provisional reservations until exact confirmation", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-provisional-restart-");
+    let queue: RequestQueue | null = new RequestQueue(dbPath);
+    try {
+      const snapshotId = store.createSnapshot({
+        sessionId: "s_provisional_restart",
+        runId: "run_provisional_restart",
+      }).snapshot_id;
+      expect(
+        store.recordObjectiveDecision({
+          runId: "run_provisional_restart",
+          snapshotId,
+          sessionId: "s_provisional_restart",
+          objective: {
+            id: "obj_provisional_restart",
+            title: "Fence restart reservation recovery",
+            instruction: "Do not dispatch until the exact live cycle confirms.",
+            objective_type: "small_refactor",
+            component_area: "apps/server",
+            trigger_type: "queue_health",
+            target_paths: ["apps/server/src/requests.ts"],
+            scope: { read_anywhere: false, write_globs: ["apps/server/src/*.ts"] },
+            confidence: 0.95,
+            risk_level: "low",
+            expected_validation: ["bun test tests/server.requests-queue.test.ts"],
+            status: "gated",
+          },
+        }),
+      ).toMatchObject({ ok: true });
+      const requestBody = {
+        sessionId: "s_provisional_restart",
+        prompt: "Run only after confirmation",
+        idempotencyKey: "autonomy:obj_provisional_restart",
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationTtlMs: 1_000,
+      };
+      const provisional = queue.enqueue(requestBody);
+      const requestId = String(provisional.requestId ?? "");
+      const expiredAt = new Date(Date.parse(provisional.dispatchConfirmationExpiresAt!) + 1);
+      queue.close();
+
+      queue = new RequestQueue(dbPath);
+      expect(store.reconcileGatedObjectiveReservations()).toEqual({ linked: 0, failed: 0 });
+      expect(autonomyObjectiveStatus(store, "obj_provisional_restart")).toBe("gated");
+      expect(queue.expireUnconfirmedDispatches(expiredAt)).toMatchObject({ expired: 1 });
+      expect(store.reconcileGatedObjectiveReservations(expiredAt.toISOString(), 60_000)).toEqual({
+        linked: 0,
+        failed: 0,
+      });
+      expect(autonomyObjectiveStatus(store, "obj_provisional_restart")).toBe("gated");
+
+      const retry = queue.enqueue({
+        ...requestBody,
+        dispatchConfirmationTtlMs: 30_000,
+        dispatchConfirmationDeadlineAt: new Date(Date.now() + 30_000).toISOString(),
+      });
+      const confirmationToken = String(retry.dispatchConfirmationToken ?? "");
+      expect(retry).toMatchObject({
+        ok: true,
+        requestId,
+        requeued: true,
+        dispatchConfirmationRequired: true,
+      });
+      expect(store.reconcileGatedObjectiveReservations()).toEqual({ linked: 0, failed: 0 });
+      expect(queue.confirmDispatch(requestId, confirmationToken)).toMatchObject({
+        ok: true,
+        confirmed: true,
+      });
+      expect(store.reconcileGatedObjectiveReservations()).toEqual({ linked: 1, failed: 0 });
+      expect(autonomyObjectiveStatus(store, "obj_provisional_restart")).toBe("dispatched");
+    } finally {
+      queue?.close();
     }
   });
 
@@ -4602,7 +4823,6 @@ describe("server AutonomyStore policy gates", () => {
           reviewAgent: {
             prNumber: 123,
             sourceJobId: source.jobId,
-            resolutionType: "review_fix",
           },
         },
       });
@@ -5866,6 +6086,47 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("classifies completed_no_change as no_change rather than job success", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-no-change-health-");
+    const queue = new JobQueue(dbPath);
+    try {
+      for (const [suffix, summary] of [
+        ["published", "published candidate"],
+        ["no-change", "completed_no_change"],
+      ] as const) {
+        const enqueued = queue.enqueue({
+          taskId: `health-${suffix}`,
+          sessionId: "dev",
+          kind: "task.execute",
+          params: { origin: "autonomy", autonomy: { origin: "autonomy" } },
+        });
+        const jobId = String(enqueued.jobId);
+        expect(queue.claim(`worker-health-${suffix}`).job?.id).toBe(jobId);
+        expect(queue.complete(jobId, { summary }).ok).toBe(true);
+      }
+      const health = (
+        store as unknown as {
+          getAutonomyJobHealth(
+            nowIso: string,
+            windowHours: number,
+          ): {
+            terminalCount: number;
+            successRate: number | null;
+          };
+        }
+      ).getAutonomyJobHealth(new Date().toISOString(), 24);
+      expect(health).toMatchObject({ terminalCount: 2, successRate: 0.5 });
+      expect(queue.sloSummary()).toMatchObject({
+        terminal: 2,
+        completed: 2,
+        noChange: 1,
+        successRate: 0.5,
+      });
+    } finally {
+      queue.close();
+    }
+  });
+
   test("five root objectives and eight failed child jobs do not satisfy the global freeze minimum", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-root-samples-");
     const queue = new JobQueue(dbPath);
@@ -6524,6 +6785,16 @@ describe("server AutonomyStore policy gates", () => {
       });
       expect(store.reconcileObjectiveWorkerHandoffs()).toMatchObject({ linked: 1, failed: 0 });
       const db = (store as unknown as { db: any }).db;
+      const promoteProposedObjectiveToGated = (objectiveId: string): void => {
+        const promoted = db
+          .prepare(
+            `UPDATE autonomy_objectives
+             SET status = 'gated'
+             WHERE id = ? AND status = 'proposed'`,
+          )
+          .run(objectiveId);
+        expect(promoted.changes).toBe(1);
+      };
       expect(
         db.prepare(`SELECT job_id FROM autonomy_objectives WHERE id = ?`).get("obj_handoff_linked")
           .job_id,
@@ -6578,14 +6849,17 @@ describe("server AutonomyStore policy gates", () => {
           "run_handoff_slow",
           slowSnapshot.snapshot_id,
           "proposed",
-        ).ok,
-      ).toBe(true);
+        ),
+      ).toMatchObject({ ok: true });
+      promoteProposedObjectiveToGated("obj_handoff_in_flight");
       const inFlightRequest = requests.enqueue({
         sessionId: "s1",
         prompt: "slow but healthy planner handoff",
         idempotencyKey: "autonomy:obj_handoff_in_flight",
       });
-      store.markObjectiveDispatched("obj_handoff_in_flight", inFlightRequest.requestId ?? "");
+      expect(
+        store.markObjectiveDispatched("obj_handoff_in_flight", inFlightRequest.requestId ?? ""),
+      ).toBe(true);
       expect(requests.claim("remote-slow-planner").request?.id).toBe(inFlightRequest.requestId);
       db.prepare(`UPDATE autonomy_objectives SET updated_at = ? WHERE id = ?`).run(
         "2026-08-17T00:00:00.000Z",
@@ -6614,12 +6888,15 @@ describe("server AutonomyStore policy gates", () => {
           "proposed",
         ).ok,
       ).toBe(true);
+      promoteProposedObjectiveToGated("obj_handoff_expired_lease");
       const expiredRequest = requests.enqueue({
         sessionId: "s1",
         prompt: "planner whose completion lease expires",
         idempotencyKey: "autonomy:obj_handoff_expired_lease",
       });
-      store.markObjectiveDispatched("obj_handoff_expired_lease", expiredRequest.requestId ?? "");
+      expect(
+        store.markObjectiveDispatched("obj_handoff_expired_lease", expiredRequest.requestId ?? ""),
+      ).toBe(true);
       expect(requests.claim("remote-expired-planner").request?.id).toBe(expiredRequest.requestId);
       db.prepare(`UPDATE autonomy_objectives SET updated_at = ? WHERE id = ?`).run(
         "2026-08-17T00:00:00.000Z",
@@ -6665,12 +6942,18 @@ describe("server AutonomyStore policy gates", () => {
           "proposed",
         ).ok,
       ).toBe(true);
+      promoteProposedObjectiveToGated("obj_handoff_pending_restart");
       const pendingRequest = requests.enqueue({
         sessionId: "s1",
         prompt: "old pending work remains retryable",
         idempotencyKey: "autonomy:obj_handoff_pending_restart",
       });
-      store.markObjectiveDispatched("obj_handoff_pending_restart", pendingRequest.requestId ?? "");
+      expect(
+        store.markObjectiveDispatched(
+          "obj_handoff_pending_restart",
+          pendingRequest.requestId ?? "",
+        ),
+      ).toBe(true);
       db.prepare(`UPDATE autonomy_objectives SET updated_at = ? WHERE id = ?`).run(
         "2026-08-16T00:00:00.000Z",
         "obj_handoff_pending_restart",
@@ -7009,10 +7292,29 @@ describe("server AutonomyStore policy gates", () => {
       expect(first).toMatchObject({
         ok: true,
         ignored: true,
-        acknowledged: true,
+        acknowledged: false,
+        retryable: true,
         reason: "PR feedback jobId does not identify a persisted job",
       });
       expect(first.deduped).toBeUndefined();
+      expect(store.recordPrFeedback(feedback)).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: false,
+        retryable: true,
+      });
+      expect(store.recordPrFeedback(feedback)).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: false,
+        retryable: true,
+      });
+      const db = (store as unknown as { db: any }).db;
+      db.prepare(
+        `UPDATE autonomy_pr_feedback_tombstones
+         SET first_seen_at = ?
+         WHERE feedback_key = ?`,
+      ).run(new Date(Date.now() - 11 * 60_000).toISOString(), feedback.feedbackKey);
       expect(store.recordPrFeedback(feedback)).toMatchObject({
         ok: true,
         ignored: true,
@@ -7024,22 +7326,138 @@ describe("server AutonomyStore policy gates", () => {
         reason: "feedbackKey identifies a different tombstoned provider observation",
       });
 
-      const db = (store as unknown as { db: any }).db;
       expect(
         db
           .prepare(
-            `SELECT reason, occurrence_count AS occurrenceCount
+            `SELECT reason, disposition, occurrence_count AS occurrenceCount
              FROM autonomy_pr_feedback_tombstones
              WHERE feedback_key = ?`,
           )
           .get(feedback.feedbackKey),
       ).toMatchObject({
         reason: "PR feedback jobId does not identify a persisted job",
-        occurrenceCount: 2,
+        disposition: "permanent",
+        occurrenceCount: 4,
       });
     } finally {
       jobs.close();
     }
+  });
+
+  test("acknowledges an explicitly pruned provider authority without waiting for staleness", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-explicit-pruned-authority-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const result = store.recordPrFeedback({
+        feedbackKey: "review-agent:explicit-pruned-authority:901",
+        jobId: "explicitly-pruned-job",
+        prUrl: "https://github.com/example/repo/pull/901",
+        verdict: "closed_unmerged",
+        providerAuthorityPruned: true,
+      });
+      expect(result).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: true,
+        deduped: true,
+      });
+    } finally {
+      jobs.close();
+    }
+  });
+
+  test("retries provider authority ordering gaps and applies them once the PR link arrives", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-provider-ordering-gap-");
+    const queue = new JobQueue(dbPath);
+    try {
+      const prUrl = "https://github.com/example/repo/pull/812";
+      const enqueued = queue.enqueue({
+        taskId: "provider-ordering-gap",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: {
+          origin: "autonomy",
+          autonomy: {
+            origin: "autonomy",
+            objectiveId: "obj-provider-ordering-gap",
+            patternKey: "cluster-provider-ordering-gap",
+          },
+        },
+      });
+      const jobId = String(enqueued.jobId);
+      const feedback = {
+        feedbackKey: "provider-ordering-gap:812",
+        jobId,
+        prUrl,
+        verdict: "approved_merged",
+      };
+      expect(store.recordPrFeedback(feedback)).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: false,
+        retryable: true,
+      });
+
+      expect(queue.claim("worker-provider-ordering-gap").job?.id).toBe(jobId);
+      expect(queue.complete(jobId, { summary: "published", prUrl }).ok).toBe(true);
+      expect(store.recordPrFeedback(feedback)).toMatchObject({
+        ok: true,
+        patternKey: "cluster-provider-ordering-gap",
+      });
+      const db = (store as unknown as { db: Database }).db;
+      expect(
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM autonomy_pr_feedback_tombstones
+             WHERE feedback_key = ?`,
+          )
+          .get(feedback.feedbackKey),
+      ).toMatchObject({ count: 0 });
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("prunes provider tombstones by retention and a bounded row cap", () => {
+    const store = makeStore();
+    const db = (store as unknown as { db: Database }).db;
+    const recent = new Date().toISOString();
+    const old = "2020-01-01T00:00:00.000Z";
+    const insert = db.prepare(
+      `INSERT INTO autonomy_pr_feedback_tombstones (
+         feedback_key, reason, payload_hash, disposition,
+         occurrence_count, first_seen_at, last_seen_at
+       ) VALUES (?, 'stale', ?, 'permanent', 1, ?, ?)`,
+    );
+    const seed = db.transaction(() => {
+      for (let index = 0; index < 10_002; index += 1) {
+        const key = `provider-tombstone-${String(index).padStart(5, "0")}`;
+        const observedAt = index === 0 ? old : recent;
+        insert.run(key, `hash-${index}`, observedAt, observedAt);
+      }
+    });
+    seed();
+
+    expect(
+      store.recordPrFeedback({
+        feedbackKey: "provider-prune-trigger",
+        patternKey: "cluster-provider-prune",
+        verdict: "approved_unmergeable",
+      }).ok,
+    ).toBe(true);
+    expect(
+      db.prepare(`SELECT COUNT(*) AS count FROM autonomy_pr_feedback_tombstones`).get(),
+    ).toMatchObject({ count: 10_000 });
+    expect(
+      db
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM autonomy_pr_feedback_tombstones
+           WHERE feedback_key = 'provider-tombstone-00000'`,
+        )
+        .get(),
+    ).toMatchObject({ count: 0 });
   });
 
   test("ingests versioned nested validation evidence into reliability coverage", () => {
@@ -7194,12 +7612,18 @@ describe("server AutonomyStore policy gates", () => {
       });
       store.linkJobToObjectiveByRequest("req-repair-lineage", String(root.jobId));
       expect(jobs.claim("worker-repair-lineage").job?.id).toBe(root.jobId);
-      expect(jobs.complete(String(root.jobId), { summary: "candidate published" }).ok).toBe(true);
+      expect(
+        jobs.complete(String(root.jobId), {
+          summary: "candidate published",
+          prUrl: "https://github.com/example/repo/pull/697",
+        }).ok,
+      ).toBe(true);
 
-      const repair = jobs.enqueue({
+      const repairBody = {
         taskId: "review-fix-repair-lineage",
         sessionId: "dev",
         kind: "task.execute",
+        repositoryIdentity: "https://github.com/example/repo.git",
         prUrl: "https://github.com/example/repo/pull/697",
         dedupeKey: "review-fix:697:lineage",
         params: {
@@ -7207,12 +7631,16 @@ describe("server AutonomyStore policy gates", () => {
           reviewAgent: {
             prNumber: 697,
             prUrl: "https://github.com/example/repo/pull/697",
+            repositoryIdentity: "https://github.com/example/repo.git",
             prHeadSha: "lineage-head-sha",
+            prBaseSha: "lineage-base-sha",
             resolutionType: "review_fix",
             sourceJobId: root.jobId,
           },
         },
-      });
+      };
+      expect(jobs.authorizeReviewRepairCapability(repairBody)).toMatchObject({ ok: true });
+      const repair = jobs.enqueue(repairBody, { authorizedElevatedWorkClass: "repair" });
       expect(jobs.claim("worker-repair-lineage").job?.id).toBe(repair.jobId);
       expect(
         jobs.fail(String(repair.jobId), {

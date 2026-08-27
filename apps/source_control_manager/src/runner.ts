@@ -2,6 +2,7 @@ import type { MergeJob, MergeQueueDB } from "./db";
 import type { CheckConfig, SourceControlManagerConfig } from "./config";
 import { createSourceControlApi, type SourceControlApi } from "./git";
 import { runBoundedScmProcess } from "./bounded_process";
+import { copyEnvWithoutScmRepairAuthoritySecret } from "shared";
 
 /**
  * Result of processing a single merge job.
@@ -37,7 +38,7 @@ async function runCheck(
     cwd: repoPath,
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env },
+    env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
     timeoutMs,
   });
   const output = [result.stdout, result.stderr].filter(Boolean).join("\n");

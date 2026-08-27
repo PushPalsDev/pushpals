@@ -13,7 +13,14 @@ import {
   isWorkerOwnedRuntimeStackFrame,
   runBoundedProcess as runBoundedWorkerProcess,
 } from "shared";
-import type { JobDiagnostics, JobResult, JobTokenUsage } from "./types.js";
+import type {
+  JobCandidateState,
+  JobDiagnostics,
+  JobResult,
+  JobTokenUsage,
+  JobUsageAttempt,
+  JobUsageStage,
+} from "./types.js";
 import type { WorkerpalsRuntimeConfig } from "./executor_backend.js";
 import type { BackendTaskExecutor } from "../backends/types.js";
 import {
@@ -123,6 +130,98 @@ function coerceJobTokenUsage(value: unknown, fallback: JobTokenUsage): JobTokenU
   };
 }
 
+const JOB_USAGE_STAGES = new Set<JobUsageStage>([
+  "executor",
+  "executor_recovery",
+  "critic",
+  "validation",
+  "finalization",
+]);
+
+function coerceJobUsageAttempts(
+  value: unknown,
+  backendName: string,
+  modelId: string,
+): JobUsageAttempt[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const attempts: JobUsageAttempt[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const raw = entry as Record<string, unknown>;
+    const stage = String(raw.stage ?? "") as JobUsageStage;
+    const attempt = Number(raw.attempt);
+    const source = String(raw.source ?? "").trim();
+    const hasUsage = [
+      raw.promptTokens,
+      raw.prompt_tokens,
+      raw.completionTokens,
+      raw.completion_tokens,
+      raw.totalTokens,
+      raw.total_tokens,
+    ].some((tokenCount) => Number.isFinite(Number(tokenCount)) && Number(tokenCount) >= 0);
+    if (
+      !JOB_USAGE_STAGES.has(stage) ||
+      !Number.isInteger(attempt) ||
+      attempt <= 0 ||
+      !source ||
+      !hasUsage
+    ) {
+      continue;
+    }
+    const usage = coerceJobTokenUsage(raw, {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      estimated: true,
+      backend: backendName,
+      modelId,
+    });
+    attempts.push({
+      ...usage,
+      stage,
+      attempt,
+      source,
+      ...(raw.timedOut === true ? { timedOut: true } : {}),
+    });
+  }
+  return attempts.length > 0 ? attempts : undefined;
+}
+
+function coerceJobCandidateState(value: unknown): JobCandidateState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (raw.status !== "held" && raw.status !== "partial") return undefined;
+  const reason = typeof raw.reason === "string" ? raw.reason.trim() : "";
+  const changedPaths = Array.isArray(raw.changedPaths)
+    ? raw.changedPaths.map((path) => String(path).trim()).filter(Boolean)
+    : [];
+  if (!reason) return undefined;
+  const checkpointRaw =
+    raw.checkpoint && typeof raw.checkpoint === "object" && !Array.isArray(raw.checkpoint)
+      ? (raw.checkpoint as Record<string, unknown>)
+      : null;
+  const checkpoint =
+    checkpointRaw &&
+    typeof checkpointRaw.ref === "string" &&
+    checkpointRaw.ref.trim() &&
+    typeof checkpointRaw.sha === "string" &&
+    /^[a-f0-9]{40,64}$/i.test(checkpointRaw.sha.trim()) &&
+    typeof checkpointRaw.capturedAt === "string" &&
+    checkpointRaw.capturedAt.trim()
+      ? {
+          ref: checkpointRaw.ref.trim(),
+          sha: checkpointRaw.sha.trim().toLowerCase(),
+          capturedAt: checkpointRaw.capturedAt.trim(),
+        }
+      : undefined;
+  return {
+    status: raw.status,
+    reason,
+    changedPaths,
+    ...(checkpoint ? { checkpoint } : {}),
+  };
+}
+
 function resolveRuntimeSettings(
   config: GenericPythonExecutorConfig,
   runtimeConfig: WorkerpalsRuntimeConfig,
@@ -149,7 +248,7 @@ export function resolveGenericPythonExecutorTimeoutMs(params: {
   const configuredTimeoutMs = Math.max(10_000, Math.floor(params.configuredTimeoutMs));
   const executionBudgetMs =
     typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs)
-      ? Math.max(10_000, Math.floor(params.executionBudgetMs))
+      ? Math.max(1, Math.floor(params.executionBudgetMs))
       : null;
   const finalizationBudgetMs =
     typeof params.finalizationBudgetMs === "number" && Number.isFinite(params.finalizationBudgetMs)
@@ -165,7 +264,7 @@ export function resolveOpenAICodexValidationReserveMs(
   executionBudgetMs: number | null | undefined,
 ): number {
   if (typeof executionBudgetMs !== "number" || !Number.isFinite(executionBudgetMs)) return 0;
-  const budgetMs = Math.max(10_000, Math.floor(executionBudgetMs));
+  const budgetMs = Math.max(1, Math.floor(executionBudgetMs));
   const targetReserveMs = Math.floor(
     Math.min(
       budgetMs,
@@ -190,22 +289,23 @@ export function resolveGenericPythonExecutorChildTimeoutMs(params: {
   hostTimeoutMs: number;
   executionBudgetMs?: number | null;
 }): number | null {
-  const hostTimeoutMs = Math.max(10_000, Math.floor(params.hostTimeoutMs));
+  const hostTimeoutMs = Math.max(1, Math.floor(params.hostTimeoutMs));
   if (params.backendName !== "openai_codex") return null;
   const executionBudgetMs =
     typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs)
-      ? Math.max(10_000, Math.floor(params.executionBudgetMs))
+      ? Math.max(1, Math.floor(params.executionBudgetMs))
       : null;
   const validationReserveMs = resolveOpenAICodexValidationReserveMs(executionBudgetMs);
   const childBudgetMs =
     executionBudgetMs == null
       ? hostTimeoutMs
-      : Math.min(hostTimeoutMs, Math.max(1_000, executionBudgetMs - validationReserveMs));
+      : Math.min(hostTimeoutMs, Math.max(1, executionBudgetMs - validationReserveMs));
   const graceMs = Math.min(
     BACKEND_TIMEOUT_RESULT_GRACE_MS,
     Math.max(2_000, Math.floor(childBudgetMs / 10)),
+    Math.max(0, childBudgetMs - 1),
   );
-  return Math.max(1_000, childBudgetMs - graceMs);
+  return Math.max(1, childBudgetMs - graceMs);
 }
 
 export function resolveGenericPythonExecutorChildTimeoutEnv(params: {
@@ -411,7 +511,7 @@ export function createGenericPythonExecutor(
     const modelId = runtimeConfig.workerpals.llm.model.trim();
     const executionBudgetMs =
       typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs)
-        ? Math.max(10_000, Math.floor(budgets.executionBudgetMs))
+        ? Math.max(1, Math.floor(budgets.executionBudgetMs))
         : null;
     const finalizationBudgetMs =
       typeof budgets?.finalizationBudgetMs === "number" &&
@@ -655,6 +755,8 @@ export function createGenericPythonExecutor(
         parsed.usage,
         estimateJobTokenUsage(backendName, modelId, params, summary, parsedStdout, parsedStderr),
       );
+      const usageAttempts = coerceJobUsageAttempts(parsed.usageAttempts, backendName, modelId);
+      const candidateState = coerceJobCandidateState(parsed.candidateState);
       const envelope = validateStructuredJobResultEnvelope(parsed);
       const malformedResult: JobResult | null = envelope.valid
         ? null
@@ -674,6 +776,7 @@ export function createGenericPythonExecutor(
               ),
               exitCode: malformedExitCode,
               usage,
+              ...(usageAttempts ? { usageAttempts } : {}),
               diagnostics: genericExecutorBoundaryDiagnostics({
                 backendName,
                 summary: malformedSummary,
@@ -705,6 +808,8 @@ export function createGenericPythonExecutor(
           stderr: truncate(normalized.stderr, outputPolicy),
           exitCode: 124,
           usage,
+          ...(usageAttempts ? { usageAttempts } : {}),
+          ...(candidateState ? { candidateState } : {}),
           diagnostics: genericExecutorBoundaryDiagnostics({
             backendName,
             summary: normalized.summary,
@@ -732,6 +837,8 @@ export function createGenericPythonExecutor(
           ),
           exitCode: 124,
           usage,
+          ...(usageAttempts ? { usageAttempts } : {}),
+          ...(candidateState ? { candidateState } : {}),
           diagnostics: genericExecutorBoundaryDiagnostics({
             backendName,
             summary: drainSummary,
@@ -782,6 +889,8 @@ export function createGenericPythonExecutor(
         stderr: truncate(finalStderr, outputPolicy),
         exitCode: finalExitCode,
         usage,
+        ...(usageAttempts ? { usageAttempts } : {}),
+        ...(candidateState ? { candidateState } : {}),
       };
     } catch (err) {
       const internalErrorDetail = workerOwnedInternalErrorDetail(err);

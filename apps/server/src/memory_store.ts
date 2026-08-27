@@ -449,9 +449,31 @@ export class SqliteMemoryStore implements MemoryStore {
     const requestedStatus = ALL_MEMORY_STATUSES.includes(input.status as MemoryStatus)
       ? (input.status as MemoryStatus)
       : undefined;
-    const now = new Date().toISOString();
+    const assertCommitFence = () => {
+      if (options.signal?.aborted) {
+        throw options.signal.reason instanceof Error
+          ? options.signal.reason
+          : new DOMException("The memory write was aborted", "AbortError");
+      }
+      const commitNowMs = Date.now();
+      if (options.validUntil !== undefined) {
+        if (typeof options.validUntil !== "string") {
+          throw new TypeError("validUntil must be an ISO timestamp");
+        }
+        const validUntilMs = Date.parse(options.validUntil);
+        if (!Number.isFinite(validUntilMs)) {
+          throw new TypeError("validUntil must be an ISO timestamp");
+        }
+        if (validUntilMs <= commitNowMs) {
+          throw new Error("Memory write commit fence expired before mutation");
+        }
+      }
+      return commitNowMs;
+    };
 
     const tx = this.db.transaction(() => {
+      const commitNowMs = assertCommitFence();
+      const now = new Date(commitNowMs).toISOString();
       const existing = this.rowForAddress({ scope, key });
       const expected = options.expectedRevision;
       if (expected !== undefined) {
@@ -481,6 +503,7 @@ export class SqliteMemoryStore implements MemoryStore {
         status === "invalid" && remainsInvalid ? (existing?.invalidationReason ?? null) : null;
       if (!existing) {
         const id = randomUUID();
+        assertCommitFence();
         this.db
           .prepare(
             `INSERT INTO memory_records (
@@ -512,10 +535,14 @@ export class SqliteMemoryStore implements MemoryStore {
             invalidatedAt,
             invalidationReason,
           );
+        // Throwing inside the transaction after SQLite returns rolls the
+        // mutation back if the fence expired while preparing/applying it.
+        assertCommitFence();
         return this.rowForAddress({ scope, key })!;
       }
 
       const preserveLearnedScores = options.expectedRevision === undefined;
+      assertCommitFence();
       this.db
         .prepare(
           `UPDATE memory_records SET
@@ -545,6 +572,7 @@ export class SqliteMemoryStore implements MemoryStore {
           invalidationReason,
           existing.id,
         );
+      assertCommitFence();
       return this.rowForAddress({ scope, key })!;
     });
     return this.hydrateRecord<T>(tx());

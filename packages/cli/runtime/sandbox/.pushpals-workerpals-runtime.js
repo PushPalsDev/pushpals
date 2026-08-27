@@ -707,9 +707,26 @@ var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
 var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
 var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
   "repository_agent_cache",
+  "repository_agent_capabilities",
   "repository_facts"
 ]);
 var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+function assertMemoryPutFence(options, nowMs) {
+  if (options.signal?.aborted) {
+    throw options.signal.reason instanceof Error ? options.signal.reason : new DOMException("The memory write was aborted", "AbortError");
+  }
+  if (options.validUntil === undefined)
+    return;
+  if (typeof options.validUntil !== "string") {
+    throw new TypeError("validUntil must be an ISO timestamp");
+  }
+  const validUntilMs = Date.parse(options.validUntil);
+  if (!Number.isFinite(validUntilMs))
+    throw new TypeError("validUntil must be an ISO timestamp");
+  if (validUntilMs <= nowMs) {
+    throw new Error("Memory write commit fence expired before mutation");
+  }
+}
 
 class MemoryConflictError extends Error {
   code;
@@ -1070,7 +1087,9 @@ class InMemoryMemoryStore {
         throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
       }
     }
-    const now = this.now().toISOString();
+    const writeNow = this.now();
+    assertMemoryPutFence(options, writeNow.getTime());
+    const now = writeNow.toISOString();
     let expiresAt;
     if (input.expiresAt !== undefined) {
       expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
@@ -1107,6 +1126,7 @@ class InMemoryMemoryStore {
       invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
       invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
     };
+    assertMemoryPutFence(options, this.now().getTime());
     this.records.set(storageKey, record);
     return cloneRecord(record);
   }
@@ -1271,7 +1291,7 @@ class MemoryHttpClient {
     const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
     this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
   }
-  async request(path, method, body) {
+  async request(path, method, body, signal) {
     if (this.closed)
       throw new MemoryStoreClosedError;
     const headers = {
@@ -1283,7 +1303,7 @@ class MemoryHttpClient {
       headers.Authorization = `Bearer ${this.authToken}`;
     const response = await fetchBufferedWithHardDeadline({
       input: `${this.serverUrl}${path}`,
-      init: { method, headers, body: JSON.stringify(body) },
+      init: { method, headers, body: JSON.stringify(body), ...signal ? { signal } : {} },
       timeoutMs: this.timeoutMs,
       maxResponseBytes: this.maxResponseBytes,
       fetchImpl: this.fetchImpl,
@@ -1306,7 +1326,8 @@ class MemoryHttpClient {
     return payload;
   }
   async put(input, options = {}) {
-    const payload = await this.request("/memory/records", "PUT", { input, options });
+    const { signal, ...durableOptions } = options;
+    const payload = await this.request("/memory/records", "PUT", { input, options: durableOptions }, signal);
     if (!payload.record)
       throw new MemoryHttpError("Memory server response omitted record");
     return payload.record;
@@ -2022,6 +2043,38 @@ function createRepositoryAgentServiceClients(options) {
       return closePromise;
     }
   });
+}
+// packages/shared/src/scm_repair_authority.ts
+var SCM_REPAIR_AUTHORITY_SECRET_ENV = "PUSHPALS_SCM_REPAIR_AUTHORITY_SECRET";
+var SCM_REPAIR_AUTHORITY_MAX_AGE_MS = 2 * 60000;
+var SCM_REPAIR_AUTHORITY_RETRYABLE_IO_CODES = new Set([
+  "EACCES",
+  "EAGAIN",
+  "EBUSY",
+  "EEXIST",
+  "EMFILE",
+  "ENFILE",
+  "ENOENT",
+  "EPERM",
+  "ETXTBSY"
+]);
+var SCM_REPAIR_AUTHORITY_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
+function scrubScmRepairAuthoritySecretFromEnv(env) {
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === target)
+      delete env[key];
+  }
+}
+function copyEnvWithoutScmRepairAuthoritySecret(env = process.env) {
+  const copy = {};
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === target || typeof value !== "string")
+      continue;
+    copy[key] = value;
+  }
+  return copy;
 }
 // packages/shared/src/prompts.ts
 import { readFileSync as readFileSync2 } from "fs";
@@ -5495,12 +5548,7 @@ var TEMP_WORKER_SANDBOX_ROOT_NAME = "pushpals-worker-env";
 var WINDOWS_PLAYWRIGHT_CACHE_NAME = "pw";
 var TEMP_PLAYWRIGHT_CACHE_NAME = "playwright-browsers";
 function stringEnv(source = process.env) {
-  const env = {};
-  for (const [key, value] of Object.entries(source)) {
-    if (typeof value === "string")
-      env[key] = value;
-  }
-  return env;
+  return copyEnvWithoutScmRepairAuthoritySecret(source);
 }
 function pathListDelimiter(platform = process.platform) {
   return platform === "win32" ? ";" : ":";
@@ -5797,6 +5845,76 @@ function coerceJobTokenUsage(value, fallback) {
     modelId: typeof raw.modelId === "string" && raw.modelId.trim().length > 0 ? raw.modelId.trim() : fallback.modelId
   };
 }
+var JOB_USAGE_STAGES = new Set([
+  "executor",
+  "executor_recovery",
+  "critic",
+  "validation",
+  "finalization"
+]);
+function coerceJobUsageAttempts(value, backendName, modelId) {
+  if (!Array.isArray(value))
+    return;
+  const attempts = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      continue;
+    const raw = entry;
+    const stage = String(raw.stage ?? "");
+    const attempt = Number(raw.attempt);
+    const source = String(raw.source ?? "").trim();
+    const hasUsage = [
+      raw.promptTokens,
+      raw.prompt_tokens,
+      raw.completionTokens,
+      raw.completion_tokens,
+      raw.totalTokens,
+      raw.total_tokens
+    ].some((tokenCount) => Number.isFinite(Number(tokenCount)) && Number(tokenCount) >= 0);
+    if (!JOB_USAGE_STAGES.has(stage) || !Number.isInteger(attempt) || attempt <= 0 || !source || !hasUsage) {
+      continue;
+    }
+    const usage = coerceJobTokenUsage(raw, {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      estimated: true,
+      backend: backendName,
+      modelId
+    });
+    attempts.push({
+      ...usage,
+      stage,
+      attempt,
+      source,
+      ...raw.timedOut === true ? { timedOut: true } : {}
+    });
+  }
+  return attempts.length > 0 ? attempts : undefined;
+}
+function coerceJobCandidateState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return;
+  const raw = value;
+  if (raw.status !== "held" && raw.status !== "partial")
+    return;
+  const reason = typeof raw.reason === "string" ? raw.reason.trim() : "";
+  const changedPaths = Array.isArray(raw.changedPaths) ? raw.changedPaths.map((path) => String(path).trim()).filter(Boolean) : [];
+  if (!reason)
+    return;
+  const checkpointRaw = raw.checkpoint && typeof raw.checkpoint === "object" && !Array.isArray(raw.checkpoint) ? raw.checkpoint : null;
+  const checkpoint = checkpointRaw && typeof checkpointRaw.ref === "string" && checkpointRaw.ref.trim() && typeof checkpointRaw.sha === "string" && /^[a-f0-9]{40,64}$/i.test(checkpointRaw.sha.trim()) && typeof checkpointRaw.capturedAt === "string" && checkpointRaw.capturedAt.trim() ? {
+    ref: checkpointRaw.ref.trim(),
+    sha: checkpointRaw.sha.trim().toLowerCase(),
+    capturedAt: checkpointRaw.capturedAt.trim()
+  } : undefined;
+  return {
+    status: raw.status,
+    reason,
+    changedPaths,
+    ...checkpoint ? { checkpoint } : {}
+  };
+}
 function resolveRuntimeSettings(config, runtimeConfig) {
   const workerCfg = runtimeConfig.workerpals;
   const rawPython = String(workerCfg[config.pythonConfigKey] ?? "python");
@@ -5807,7 +5925,7 @@ function resolveRuntimeSettings(config, runtimeConfig) {
 }
 function resolveGenericPythonExecutorTimeoutMs(params) {
   const configuredTimeoutMs = Math.max(1e4, Math.floor(params.configuredTimeoutMs));
-  const executionBudgetMs = typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs) ? Math.max(1e4, Math.floor(params.executionBudgetMs)) : null;
+  const executionBudgetMs = typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs) ? Math.max(1, Math.floor(params.executionBudgetMs)) : null;
   const finalizationBudgetMs = typeof params.finalizationBudgetMs === "number" && Number.isFinite(params.finalizationBudgetMs) ? Math.max(0, Math.floor(params.finalizationBudgetMs)) : 0;
   if (executionBudgetMs != null && params.capTimeoutToExecutionBudget !== false) {
     return Math.min(configuredTimeoutMs, executionBudgetMs + finalizationBudgetMs);
@@ -5817,20 +5935,20 @@ function resolveGenericPythonExecutorTimeoutMs(params) {
 function resolveOpenAICodexValidationReserveMs(executionBudgetMs) {
   if (typeof executionBudgetMs !== "number" || !Number.isFinite(executionBudgetMs))
     return 0;
-  const budgetMs = Math.max(1e4, Math.floor(executionBudgetMs));
+  const budgetMs = Math.max(1, Math.floor(executionBudgetMs));
   const targetReserveMs = Math.floor(Math.min(budgetMs, Math.max(OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS, Math.min(OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS, budgetMs * OPENAI_CODEX_VALIDATION_RESERVE_RATIO))));
   const maxReserveAfterPrimaryTurn = Math.max(0, budgetMs - OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS);
   return Math.max(0, Math.min(targetReserveMs, maxReserveAfterPrimaryTurn));
 }
 function resolveGenericPythonExecutorChildTimeoutMs(params) {
-  const hostTimeoutMs = Math.max(1e4, Math.floor(params.hostTimeoutMs));
+  const hostTimeoutMs = Math.max(1, Math.floor(params.hostTimeoutMs));
   if (params.backendName !== "openai_codex")
     return null;
-  const executionBudgetMs = typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs) ? Math.max(1e4, Math.floor(params.executionBudgetMs)) : null;
+  const executionBudgetMs = typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs) ? Math.max(1, Math.floor(params.executionBudgetMs)) : null;
   const validationReserveMs = resolveOpenAICodexValidationReserveMs(executionBudgetMs);
-  const childBudgetMs = executionBudgetMs == null ? hostTimeoutMs : Math.min(hostTimeoutMs, Math.max(1000, executionBudgetMs - validationReserveMs));
-  const graceMs = Math.min(BACKEND_TIMEOUT_RESULT_GRACE_MS, Math.max(2000, Math.floor(childBudgetMs / 10)));
-  return Math.max(1000, childBudgetMs - graceMs);
+  const childBudgetMs = executionBudgetMs == null ? hostTimeoutMs : Math.min(hostTimeoutMs, Math.max(1, executionBudgetMs - validationReserveMs));
+  const graceMs = Math.min(BACKEND_TIMEOUT_RESULT_GRACE_MS, Math.max(2000, Math.floor(childBudgetMs / 10)), Math.max(0, childBudgetMs - 1));
+  return Math.max(1, childBudgetMs - graceMs);
 }
 function toSnakeConfigKey(key) {
   return key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
@@ -5954,7 +6072,7 @@ function createGenericPythonExecutor(config) {
     }
     const { pythonBin, timeoutMs: configuredTimeoutMs } = resolveRuntimeSettings(config, runtimeConfig);
     const modelId = runtimeConfig.workerpals.llm.model.trim();
-    const executionBudgetMs = typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs) ? Math.max(1e4, Math.floor(budgets.executionBudgetMs)) : null;
+    const executionBudgetMs = typeof budgets?.executionBudgetMs === "number" && Number.isFinite(budgets.executionBudgetMs) ? Math.max(1, Math.floor(budgets.executionBudgetMs)) : null;
     const finalizationBudgetMs = typeof budgets?.finalizationBudgetMs === "number" && Number.isFinite(budgets.finalizationBudgetMs) ? Math.max(0, Math.floor(budgets.finalizationBudgetMs)) : null;
     const timeoutMs = resolveGenericPythonExecutorTimeoutMs({
       configuredTimeoutMs,
@@ -6127,6 +6245,8 @@ function createGenericPythonExecutor(config) {
       const parsedStdout = typeof parsed.stdout === "string" ? parsed.stdout : filteredStdout;
       const parsedStderr = typeof parsed.stderr === "string" ? parsed.stderr : stderr;
       const usage = coerceJobTokenUsage(parsed.usage, estimateJobTokenUsage(backendName, modelId, params, summary, parsedStdout, parsedStderr));
+      const usageAttempts = coerceJobUsageAttempts(parsed.usageAttempts, backendName, modelId);
+      const candidateState = coerceJobCandidateState(parsed.candidateState);
       const envelope = validateStructuredJobResultEnvelope(parsed);
       const malformedResult = envelope.valid ? null : (() => {
         const malformedSummary = `${backendName} wrapper returned a malformed structured result for ${kind}`;
@@ -6138,6 +6258,7 @@ function createGenericPythonExecutor(config) {
           stderr: truncate(appendExecutorFailureDetail(parsedStderr, `Malformed structured result: ${envelope.detail}.`), outputPolicy),
           exitCode: malformedExitCode,
           usage,
+          ...usageAttempts ? { usageAttempts } : {},
           diagnostics: genericExecutorBoundaryDiagnostics({
             backendName,
             summary: malformedSummary,
@@ -6168,6 +6289,8 @@ function createGenericPythonExecutor(config) {
           stderr: truncate(normalized.stderr, outputPolicy),
           exitCode: 124,
           usage,
+          ...usageAttempts ? { usageAttempts } : {},
+          ...candidateState ? { candidateState } : {},
           diagnostics: genericExecutorBoundaryDiagnostics({
             backendName,
             summary: normalized.summary,
@@ -6188,6 +6311,8 @@ function createGenericPythonExecutor(config) {
           stderr: truncate(appendExecutorFailureDetail(normalized.stderr, "Discarded the structured result because the process stream-drain deadline fired and the process tree was terminated."), outputPolicy),
           exitCode: 124,
           usage,
+          ...usageAttempts ? { usageAttempts } : {},
+          ...candidateState ? { candidateState } : {},
           diagnostics: genericExecutorBoundaryDiagnostics({
             backendName,
             summary: drainSummary,
@@ -6228,7 +6353,9 @@ function createGenericPythonExecutor(config) {
         stdout: truncate(normalized.stdout, outputPolicy),
         stderr: truncate(finalStderr, outputPolicy),
         exitCode: finalExitCode,
-        usage
+        usage,
+        ...usageAttempts ? { usageAttempts } : {},
+        ...candidateState ? { candidateState } : {}
       };
     } catch (err) {
       const internalErrorDetail = workerOwnedInternalErrorDetail(err);
@@ -7196,6 +7323,7 @@ class Logger {
 
 // apps/workerpals/src/execute_job.ts
 import { createHash as createHash5 } from "crypto";
+import { AsyncLocalStorage } from "async_hooks";
 import {
   existsSync as existsSync9,
   lstatSync as lstatSync2,
@@ -7209,6 +7337,179 @@ import {
   writeFileSync as writeFileSync4
 } from "fs";
 import { basename as basename5, isAbsolute as isAbsolute3, resolve as resolve11 } from "path";
+
+// apps/workerpals/src/quality_loop_durability.ts
+var MIN_PHASE_TIMEOUT_MS = 1;
+function boundedBudget(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+class JobDeadlineLedger {
+  startedAtMs;
+  deadlineAtMs;
+  finalizationReserveMs;
+  wallNow;
+  monotonicNow;
+  monotonicStartedAtMs;
+  initialElapsedMs;
+  lastObservedWallClockAtMs;
+  lastObservedMonotonicAtMs;
+  effectiveElapsedMs = 0;
+  clockRollbackCount = 0;
+  clockRollbackTotalMs = 0;
+  constructor(options) {
+    this.wallNow = options.now ?? Date.now;
+    this.monotonicNow = options.monotonicNow ?? options.now ?? (() => typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now());
+    const constructedAtMs = this.wallNow();
+    this.startedAtMs = options.startedAtMs ?? constructedAtMs;
+    this.lastObservedWallClockAtMs = constructedAtMs;
+    this.monotonicStartedAtMs = this.monotonicNow();
+    this.lastObservedMonotonicAtMs = this.monotonicStartedAtMs;
+    this.initialElapsedMs = Math.max(0, Math.floor(constructedAtMs - this.startedAtMs));
+    this.effectiveElapsedMs = this.initialElapsedMs;
+    const executionBudgetMs = boundedBudget(options.executionBudgetMs);
+    this.finalizationReserveMs = boundedBudget(options.finalizationBudgetMs);
+    this.deadlineAtMs = this.startedAtMs + executionBudgetMs + this.finalizationReserveMs;
+  }
+  observeEffectiveNow(atMs, monotonicAtMs = this.monotonicNow()) {
+    const observedAtMs = Number.isFinite(atMs) ? Math.floor(atMs) : this.lastObservedWallClockAtMs;
+    const deltaMs = observedAtMs - this.lastObservedWallClockAtMs;
+    this.lastObservedWallClockAtMs = observedAtMs;
+    if (deltaMs < 0) {
+      this.clockRollbackCount += 1;
+      this.clockRollbackTotalMs += Math.abs(deltaMs);
+    }
+    const observedMonotonicAtMs = Number.isFinite(monotonicAtMs) ? monotonicAtMs : this.lastObservedMonotonicAtMs;
+    this.lastObservedMonotonicAtMs = Math.max(this.lastObservedMonotonicAtMs, observedMonotonicAtMs);
+    this.effectiveElapsedMs = Math.max(this.effectiveElapsedMs, this.initialElapsedMs + Math.floor(this.lastObservedMonotonicAtMs - this.monotonicStartedAtMs));
+    return this.startedAtMs + this.effectiveElapsedMs;
+  }
+  remainingTotalMs(atMs = this.wallNow()) {
+    return Math.max(0, Math.floor(this.deadlineAtMs - this.observeEffectiveNow(atMs)));
+  }
+  remainingWorkMs(atMs = this.wallNow()) {
+    return Math.max(0, this.remainingTotalMs(atMs) - this.finalizationReserveMs);
+  }
+  workExpired(atMs = this.wallNow()) {
+    return this.remainingWorkMs(atMs) < MIN_PHASE_TIMEOUT_MS;
+  }
+  capWorkTimeout(requestedMs, minimumMs = MIN_PHASE_TIMEOUT_MS) {
+    const available = this.remainingWorkMs();
+    if (available < minimumMs)
+      return 0;
+    const requested = boundedBudget(requestedMs);
+    if (requested < minimumMs)
+      return 0;
+    return Math.min(requested, available);
+  }
+  capTotalTimeout(requestedMs, minimumMs = MIN_PHASE_TIMEOUT_MS) {
+    const available = this.remainingTotalMs();
+    if (available < minimumMs)
+      return 0;
+    const requested = boundedBudget(requestedMs);
+    if (requested < minimumMs)
+      return 0;
+    return Math.min(requested, available);
+  }
+  executorBudgets(requestedExecutionMs, requestedFinalizationMs) {
+    const executionBudgetMs = this.capWorkTimeout(requestedExecutionMs);
+    if (executionBudgetMs <= 0)
+      return null;
+    const remainingAfterExecutionMs = Math.max(0, this.remainingTotalMs() - executionBudgetMs);
+    return {
+      executionBudgetMs,
+      finalizationBudgetMs: Math.min(boundedBudget(requestedFinalizationMs), this.finalizationReserveMs, remainingAfterExecutionMs)
+    };
+  }
+  snapshot() {
+    const effectiveNowMs = this.observeEffectiveNow(this.wallNow());
+    const remainingTotalMs = Math.max(0, Math.floor(this.deadlineAtMs - effectiveNowMs));
+    return {
+      startedAtMs: this.startedAtMs,
+      deadlineAtMs: this.deadlineAtMs,
+      finalizationReserveMs: this.finalizationReserveMs,
+      effectiveNowMs,
+      observedWallClockAtMs: this.lastObservedWallClockAtMs,
+      monotonicStartedAtMs: this.monotonicStartedAtMs,
+      observedMonotonicAtMs: this.lastObservedMonotonicAtMs,
+      clockRollbackCount: this.clockRollbackCount,
+      clockRollbackTotalMs: this.clockRollbackTotalMs,
+      remainingTotalMs,
+      remainingWorkMs: Math.max(0, remainingTotalMs - this.finalizationReserveMs)
+    };
+  }
+}
+function normalizeUsage(usage) {
+  const promptTokens = Math.max(0, Math.floor(Number(usage.promptTokens) || 0));
+  const completionTokens = Math.max(0, Math.floor(Number(usage.completionTokens) || 0));
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: usage.estimated === true,
+    ...usage.backend ? { backend: usage.backend } : {},
+    ...usage.modelId ? { modelId: usage.modelId } : {}
+  };
+}
+
+class UsageAccumulator {
+  records = [];
+  add(usage, provenance) {
+    if (!usage)
+      return;
+    const normalized = normalizeUsage(usage);
+    this.records.push({ ...normalized, ...provenance });
+  }
+  addAttempts(attempts) {
+    for (const attempt of attempts ?? []) {
+      const { stage, source, attempt: attemptNumber, timedOut, ...usage } = attempt;
+      this.add(usage, {
+        stage,
+        source,
+        attempt: attemptNumber,
+        ...timedOut === true ? { timedOut: true } : {}
+      });
+    }
+  }
+  attempts() {
+    return this.records.map((record) => ({ ...record }));
+  }
+  total() {
+    if (this.records.length === 0)
+      return;
+    const promptTokens = this.records.reduce((sum, usage) => sum + usage.promptTokens, 0);
+    const completionTokens = this.records.reduce((sum, usage) => sum + usage.completionTokens, 0);
+    const backends = new Set(this.records.map((usage) => usage.backend).filter(Boolean));
+    const models = new Set(this.records.map((usage) => usage.modelId).filter(Boolean));
+    return {
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      estimated: this.records.some((usage) => usage.estimated === true),
+      ...backends.size === 1 ? { backend: [...backends][0] } : backends.size > 1 ? { backend: "mixed" } : {},
+      ...models.size === 1 ? { modelId: [...models][0] } : {}
+    };
+  }
+  apply(result) {
+    const usage = this.total();
+    if (!usage)
+      return result;
+    return {
+      ...result,
+      usage,
+      usageAttempts: this.attempts(),
+      diagnostics: {
+        ...result.diagnostics ?? {},
+        metadata: {
+          ...result.diagnostics?.metadata ?? {},
+          usageAttemptCount: this.records.length,
+          timedOutUsageAttemptCount: this.records.filter((record) => record.timedOut).length
+        }
+      }
+    };
+  }
+}
 
 // apps/workerpals/src/common/worktree_dependency_artifacts.ts
 import { createHash as createHash4 } from "crypto";
@@ -7347,9 +7648,17 @@ function isMergeConflictOutput(text) {
   const normalized = String(text ?? "").toLowerCase();
   return normalized.includes("could not apply") || normalized.includes("resolve all conflicts manually") || normalized.includes("merge conflict") || normalized.includes("fix conflicts and then run");
 }
-async function git(cwd, args) {
+async function git(cwd, args, deadlineLedger) {
   const configuredTimeoutMs = Number(Bun.env.PUSHPALS_WORKERPAL_GIT_COMMAND_TIMEOUT_MS);
-  const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0 ? Math.max(1000, Math.min(30 * 60000, Math.floor(configuredTimeoutMs))) : 120000;
+  const configuredBudgetMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0 ? Math.max(1000, Math.min(30 * 60000, Math.floor(configuredTimeoutMs))) : 120000;
+  const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(configuredBudgetMs) : configuredBudgetMs;
+  if (timeoutMs <= 0) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: "git command did not start because the absolute job work deadline expired"
+    };
+  }
   const result = await runBoundedProcess(["git", ...args], {
     cwd,
     timeoutMs,
@@ -7361,8 +7670,8 @@ async function git(cwd, args) {
     stderr: result.stderr.trim()
   };
 }
-async function mustGit(cwd, args, label) {
-  const result = await git(cwd, args);
+async function mustGit(cwd, args, label, deadlineLedger) {
+  const result = await git(cwd, args, deadlineLedger);
   if (!result.ok) {
     throw new Error(`${label} failed: git ${args.join(" ")}
 ${result.stderr || result.stdout}`);
@@ -7502,7 +7811,7 @@ function applyMergeConflictExecutionHints(params, preparation) {
   }
   return next;
 }
-async function prepareMergeConflictWorktreeOnHost(worktreePath, jobId, params, onLog) {
+async function prepareMergeConflictWorktreeOnHost(worktreePath, jobId, params, onLog, deadlineLedger) {
   const context = extractMergeConflictReviewContext(params);
   if (!context) {
     return {
@@ -7514,18 +7823,18 @@ async function prepareMergeConflictWorktreeOnHost(worktreePath, jobId, params, o
       currentHeadSha: ""
     };
   }
-  const currentHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve host worktree HEAD")).trim().toLowerCase();
+  const currentHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve host worktree HEAD", deadlineLedger)).trim().toLowerCase();
   if (context.expectedHeadSha && currentHeadSha !== context.expectedHeadSha.trim().toLowerCase()) {
     throw new Error(`Stale merge-conflict worktree lease for ${jobId}: expected PR head ${context.expectedHeadSha}, but host worktree is ${currentHeadSha}.`);
   }
   const baseRef = context.expectedBaseSha || `refs/remotes/origin/${context.baseBranch}`;
-  const resolvedBaseSha = (await mustGit(worktreePath, ["rev-parse", `${baseRef}^{commit}`], "resolve leased PR base")).trim().toLowerCase();
+  const resolvedBaseSha = (await mustGit(worktreePath, ["rev-parse", `${baseRef}^{commit}`], "resolve leased PR base", deadlineLedger)).trim().toLowerCase();
   if (context.expectedBaseSha && resolvedBaseSha !== context.expectedBaseSha.trim().toLowerCase()) {
     throw new Error(`Stale merge-conflict base lease for ${jobId}: expected ${context.expectedBaseSha}, but host resolved ${resolvedBaseSha}.`);
   }
-  await mustGit(worktreePath, ["config", "rerere.enabled", "true"], "enable rerere");
-  await mustGit(worktreePath, ["config", "rerere.autoupdate", "true"], "enable rerere autoupdate");
-  const rebase = await git(worktreePath, ["-c", "core.editor=true", "rebase", resolvedBaseSha]);
+  await mustGit(worktreePath, ["config", "rerere.enabled", "true"], "enable rerere", deadlineLedger);
+  await mustGit(worktreePath, ["config", "rerere.autoupdate", "true"], "enable rerere autoupdate", deadlineLedger);
+  const rebase = await git(worktreePath, ["-c", "core.editor=true", "rebase", resolvedBaseSha], deadlineLedger);
   let rebasedCleanly = false;
   let conflictPaths = [];
   if (rebase.ok) {
@@ -7533,13 +7842,13 @@ async function prepareMergeConflictWorktreeOnHost(worktreePath, jobId, params, o
     onLog?.("stdout", `[MergeConflictHost] ${jobId}: detached PR head rebased cleanly onto ${resolvedBaseSha.slice(0, 12)} before container execution.`);
   } else if (isMergeConflictOutput(`${rebase.stderr}
 ${rebase.stdout}`)) {
-    const unresolved = await mustGit(worktreePath, ["diff", "--name-only", "--diff-filter=U"], "list host-prepared unresolved conflict paths");
+    const unresolved = await mustGit(worktreePath, ["diff", "--name-only", "--diff-filter=U"], "list host-prepared unresolved conflict paths", deadlineLedger);
     conflictPaths = extractConflictPaths(unresolved);
     onLog?.("stdout", `[MergeConflictHost] ${jobId}: host paused the detached worktree rebase with ${conflictPaths.length} unresolved file(s) before container execution.`);
   } else {
     throw new Error(rebase.stderr || rebase.stdout || "unknown host-side rebase failure");
   }
-  const preparedHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve prepared host worktree HEAD")).trim();
+  const preparedHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve prepared host worktree HEAD", deadlineLedger)).trim();
   return {
     repoPath: resolve10(worktreePath),
     cleanup: () => {},
@@ -7549,13 +7858,13 @@ ${rebase.stdout}`)) {
     currentHeadSha: preparedHeadSha
   };
 }
-async function refreshMergeConflictWorktreeHints(worktreePath, params) {
+async function refreshMergeConflictWorktreeHints(worktreePath, params, deadlineLedger) {
   const context = extractMergeConflictReviewContext(params);
   if (!context)
     return params;
-  const unresolved = await mustGit(worktreePath, ["diff", "--name-only", "--diff-filter=U"], "refresh host-prepared unresolved conflict paths");
+  const unresolved = await mustGit(worktreePath, ["diff", "--name-only", "--diff-filter=U"], "refresh host-prepared unresolved conflict paths", deadlineLedger);
   const conflictPaths = extractConflictPaths(unresolved);
-  const currentHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "refresh host-prepared worktree HEAD")).trim();
+  const currentHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "refresh host-prepared worktree HEAD", deadlineLedger)).trim();
   return applyMergeConflictExecutionHints(params, {
     repoPath: resolve10(worktreePath),
     cleanup: () => {},
@@ -7568,6 +7877,7 @@ async function refreshMergeConflictWorktreeHints(worktreePath, params) {
 
 // apps/workerpals/src/execute_job.ts
 var DEFAULT_CONFIG3 = loadPushPalsConfig();
+var workerGitDeadlineContext = new AsyncLocalStorage;
 var BROWSER_VALIDATION_MAX_AUTO_REVISIONS = 3;
 var REPO_VALIDATION_REPAIR_MAX_AUTO_REVISIONS = 4;
 var CRITIC_COMPACT_RETRY_MIN_REDUCTION_RATIO = 0.25;
@@ -7609,6 +7919,21 @@ function criticActionableFeedbackCount(critic) {
   if (!critic)
     return 0;
   return critic.mustFix.length + critic.findings.length + (String(critic.revisionGuidance ?? "").trim() ? 1 : 0);
+}
+function criticGateDisposition(input) {
+  if (input.deterministicRequiresRevision)
+    return "revise";
+  if (!input.criticGateEnabled)
+    return "pass";
+  if (input.outcome.kind === "verdict") {
+    if (input.outcome.review.score >= input.criticMinScore)
+      return "pass";
+    return criticActionableFeedbackCount(input.outcome.review) > 0 ? "revise" : "hold_candidate";
+  }
+  if (input.outcome.kind === "skipped" && (input.outcome.reason === "disabled" || input.outcome.reason === "quality_skipped")) {
+    return "pass";
+  }
+  return "hold_candidate";
 }
 function criticRepairContinuationBudgetDecision(opts) {
   const stop = (reason) => ({
@@ -8090,6 +8415,9 @@ function isDockerDaemonValidationBlocker(value) {
   const socketUnavailable = /\/var\/run\/docker\.sock/i.test(value) && /\b(?:cannot connect|failed to connect|permission denied|operation not permitted|eacces|eperm)\b/i.test(value);
   return socketUnavailable || /cannot connect to (?:the )?docker daemon/i.test(value) || /is the docker daemon running/i.test(value) || /docker daemon is not running/i.test(value) || /failed to connect to the docker api/i.test(value);
 }
+function hasConcreteAssertionFailureEvidence(value) {
+  return /\bassertionerror\b|\bassert(?:ion)?(?:\s+failed|:)\b|\bexpected\b[\s\S]{0,160}\b(?:received|actual|to be|to equal|to contain|to match)\b|\b(?:\d+\s+)?tests?\s+failed\b|\blocator\.[a-z0-9_]+:\s+timeout\b/.test(value);
+}
 function classifyValidationRunFailure(run) {
   if (run.ok)
     return null;
@@ -8101,14 +8429,18 @@ ${run.stderr}`.toLowerCase();
   const command = run.command.toLowerCase();
   const output = `${run.stdout}
 ${run.stderr}`.toLowerCase();
-  if (isDockerDaemonValidationBlocker(combined)) {
-    return "environment";
-  }
   if (run.exitCode === 124 || /\b(?:command|process|request|connection|validation|test|browser|playwright|executor)\s+timed out\b/i.test(combined) || /\btimeout(?:error)?\b[^a-z0-9]*(?:after|exceeded|expired)/i.test(combined)) {
     return "timeout";
   }
-  if (run.exitCode === 127 || combined.includes("missing required tool") || combined.includes("command not found") || combined.includes("executable not found") || combined.includes("not recognized as an internal or external command")) {
+  if (run.exitCode === 127)
     return "missing_tool";
+  if (hasConcreteAssertionFailureEvidence(combined))
+    return "nonzero_exit";
+  if (combined.includes("missing required tool") || combined.includes("command not found") || combined.includes("executable not found") || combined.includes("not recognized as an internal or external command")) {
+    return "missing_tool";
+  }
+  if (isDockerDaemonValidationBlocker(combined)) {
+    return "environment";
   }
   if (/(?:browser|playwright|cypress|web:e2e)/.test(command) || /\b(?:playwright|cypress|locator|screenshot)\b|page\.(?:goto|waitfor|locator|click|fill)/.test(output)) {
     return "browser_validation";
@@ -8118,6 +8450,59 @@ ${run.stderr}`.toLowerCase();
   }
   return "nonzero_exit";
 }
+function classifyValidationFailureClass(run) {
+  if (run.ok)
+    return null;
+  if (run.failureClass)
+    return run.failureClass;
+  if (run.inheritedFailureClass === "environment")
+    return "environment.sandbox";
+  const combined = `${run.command}
+${run.stdout}
+${run.stderr}`.toLowerCase();
+  if (run.terminalStatusSource === "deadline" || run.exitCode === 124)
+    return "deadline";
+  if (run.exitCode === 127)
+    return "environment.toolchain";
+  if (combined.includes("cannot find module") || combined.includes("module not found") || combined.includes("failed to resolve import") || combined.includes("could not resolve") || combined.includes("no such file or directory") || combined.includes("package not found")) {
+    return "repository.dependency";
+  }
+  if (/typecheck|compile|syntaxerror|does not provide an export|no exported member/.test(combined)) {
+    return "candidate.compile";
+  }
+  if (hasConcreteAssertionFailureEvidence(combined)) {
+    return "candidate.assertion";
+  }
+  if (isDockerDaemonValidationBlocker(combined))
+    return "environment.docker";
+  if (combined.includes("browser runtime preflight failed") || combined.includes("playwright install") || combined.includes("executable doesn't exist")) {
+    const fallbackSucceeded = combined.includes("using google chrome for browser automation") || combined.includes("using chromium for browser automation") || combined.includes("using firefox for browser automation") || combined.includes("using webkit for browser automation");
+    if (!fallbackSucceeded)
+      return "environment.browser";
+  }
+  if (combined.includes("missing required tool") || combined.includes("command not found") || combined.includes("executable not found") || combined.includes("not recognized as an internal or external command")) {
+    return "environment.toolchain";
+  }
+  if (combined.includes("read-only file system") || combined.includes("permission denied") || combined.includes("operation not permitted") || combined.includes("eperm") || combined.includes("eacces")) {
+    return "environment.sandbox";
+  }
+  if (combined.includes("network access") || combined.includes("connection refused") || combined.includes("getaddrinfo") || combined.includes("err_socket_bad_port") || combined.includes("expo exited early")) {
+    return "environment.network";
+  }
+  return "unknown";
+}
+function validationEvidenceId(run) {
+  const hasOutcome = typeof run.ok === "boolean" || typeof run.exitCode === "number";
+  const provenance = hasOutcome ? [
+    validationCommandKey(run.command),
+    run.ok === true ? "pass" : "fail",
+    Number.isFinite(Number(run.exitCode)) ? String(run.exitCode) : "unknown",
+    run.terminalStatusSource ?? "process_exit",
+    createHash5("sha256").update(`${run.stdout ?? ""}
+${run.stderr ?? ""}`).digest("hex").slice(0, 16)
+  ].join("\x00") : validationCommandKey(run.command);
+  return `validation:${createHash5("sha256").update(provenance).digest("hex").slice(0, 12)}`;
+}
 function buildValidationRunDiagnostics(runs, attempt) {
   return runs.slice(0, 20).map((run) => ({
     attempt,
@@ -8125,11 +8510,16 @@ function buildValidationRunDiagnostics(runs, attempt) {
     exitCode: run.exitCode,
     durationMs: run.elapsedMs,
     passed: run.ok,
-    failureClass: classifyValidationRunFailure(run),
+    failureClass: classifyValidationFailureClass(run) ?? classifyValidationRunFailure(run),
     stdoutTail: compactDiagnosticText(run.stdout),
     stderrTail: compactDiagnosticText(run.stderr),
-    ...run.browserSignal || run.inheritedFailureClass || run.deferredByCommand ? {
+    ...run.browserSignal || run.inheritedFailureClass || run.deferredByCommand || run.evidenceId || run.plannedEvidenceId || run.capability ? {
       metadata: {
+        evidenceId: run.evidenceId ?? validationEvidenceId(run),
+        ...run.plannedEvidenceId ? { plannedEvidenceId: run.plannedEvidenceId } : {},
+        ...run.capability ? { capability: run.capability } : {},
+        ...run.subsumes?.length ? { subsumes: run.subsumes } : {},
+        ...run.subsumedBy?.length ? { subsumedBy: run.subsumedBy } : {},
         ...run.browserSignal ? {
           browserSignal: run.browserSignal,
           terminalStatusSource: run.terminalStatusSource ?? "process_exit"
@@ -8733,7 +9123,7 @@ async function runValidationArgv(repo, command, argv, env, timeoutMs, outputPoli
   }
   const stdoutCapture = captureValidationStream(proc.stdout ?? null);
   const stderrCapture = captureValidationStream(proc.stderr ?? null);
-  const timeout = Math.max(1000, timeoutMs);
+  const timeout = Math.max(1, Math.floor(timeoutMs));
   let timeoutTimer = null;
   const timeoutPromise = new Promise((resolveTimeout) => {
     timeoutTimer = setTimeout(() => {
@@ -8794,7 +9184,7 @@ async function runValidationCommand(repo, command, timeoutMs, outputPolicy) {
       elapsedMs: 1
     };
   }
-  return runValidationArgv(repo, command, argv, env, timeoutMs, outputPolicy, `Validation command timed out after ${Math.max(1000, timeoutMs)}ms. Captured output is the process output emitted before PushPals terminated the command and its process tree.`);
+  return runValidationArgv(repo, command, argv, env, timeoutMs, outputPolicy, `Validation command timed out after ${Math.max(1, Math.floor(timeoutMs))}ms. Captured output is the process output emitted before PushPals terminated the command and its process tree.`);
 }
 function isRepoAggregateValidationCommand(repo, command) {
   const resolvedScript = resolvePackageScriptForValidationCommand(repo, command);
@@ -8847,7 +9237,7 @@ function repoValidationLeaseRecoveryReason(opts) {
   }
   return ageMs > LEGACY_REPO_VALIDATION_LEASE_STALE_MS ? "stale legacy lease" : null;
 }
-async function acquireRepoValidationLease(repo, command, onLog) {
+async function acquireRepoValidationLease(repo, command, onLog, waitTimeoutMs = 15 * 60000) {
   if (!isRepoAggregateValidationCommand(repo, command))
     return () => {};
   const commonDirResult = await git2(repo, ["rev-parse", "--git-common-dir"]);
@@ -8862,7 +9252,8 @@ async function acquireRepoValidationLease(repo, command, onLog) {
   const waitStartedAt = Date.now();
   let lastWaitLogAt = 0;
   mkdirSync3(leaseParent, { recursive: true });
-  while (Date.now() - waitStartedAt < 15 * 60000) {
+  const waitDeadlineAt = waitStartedAt + Math.max(1, Math.floor(waitTimeoutMs));
+  while (Date.now() < waitDeadlineAt) {
     try {
       mkdirSync3(leaseDir);
       const acquiredAt = new Date().toISOString();
@@ -8928,26 +9319,60 @@ async function acquireRepoValidationLease(repo, command, onLog) {
         lastWaitLogAt = Date.now();
         onLog?.("stdout", `[ValidationGate] Waiting for another WorkerPal's aggregate validation to finish: ${command}`);
       }
-      await new Promise((resolveWait) => setTimeout(resolveWait, 750));
+      const remainingWaitMs = Math.max(0, waitDeadlineAt - Date.now());
+      if (remainingWaitMs <= 0)
+        break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, Math.min(750, remainingWaitMs)));
     }
   }
   return null;
 }
-async function runValidationCommandWithRepoLease(repo, command, timeoutMs, outputPolicy, onLog) {
-  const release = await acquireRepoValidationLease(repo, command, onLog);
-  if (!release) {
+async function runValidationCommandWithRepoLease(repo, command, timeoutMs, outputPolicy, onLog, deadlineLedger) {
+  const leaseStartedAt = Date.now();
+  const leaseWaitTimeoutMs = deadlineLedger ? deadlineLedger.remainingWorkMs() : 15 * 60000;
+  if (leaseWaitTimeoutMs <= 0) {
     return {
       step: command,
       command,
       ok: false,
-      exitCode: 75,
+      exitCode: 124,
       stdout: "",
-      stderr: "Timed out waiting for the repo aggregate-validation lease. Another WorkerPal is still validating this repository; retry after it completes.",
-      elapsedMs: 15 * 60000
+      stderr: "Validation lease wait did not start because the absolute job deadline expired.",
+      elapsedMs: 0,
+      terminalStatusSource: "deadline",
+      failureClass: "deadline"
+    };
+  }
+  const release = await acquireRepoValidationLease(repo, command, onLog, leaseWaitTimeoutMs);
+  if (!release) {
+    const deadlineExpired = deadlineLedger?.workExpired() === true;
+    return {
+      step: command,
+      command,
+      ok: false,
+      exitCode: deadlineExpired ? 124 : 75,
+      stdout: "",
+      stderr: deadlineExpired ? "The absolute job deadline expired while waiting for the repo aggregate-validation lease." : "Timed out waiting for the repo aggregate-validation lease. Another WorkerPal is still validating this repository; retry after it completes.",
+      elapsedMs: Math.max(1, Date.now() - leaseStartedAt),
+      ...deadlineExpired ? { terminalStatusSource: "deadline", failureClass: "deadline" } : {}
     };
   }
   try {
-    return await runValidationCommand(repo, command, timeoutMs, outputPolicy);
+    const commandTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(timeoutMs) : timeoutMs;
+    if (commandTimeoutMs <= 0) {
+      return {
+        step: command,
+        command,
+        ok: false,
+        exitCode: 124,
+        stdout: "",
+        stderr: "Validation did not start after acquiring the repo lease because the absolute job deadline expired.",
+        elapsedMs: Math.max(1, Date.now() - leaseStartedAt),
+        terminalStatusSource: "deadline",
+        failureClass: "deadline"
+      };
+    }
+    return await runValidationCommand(repo, command, commandTimeoutMs, outputPolicy);
   } finally {
     release();
   }
@@ -9329,7 +9754,7 @@ function playwrightBrowserRuntimeCacheMarkerPath(repo, targets, env = buildWorke
 }
 async function runPlaywrightBrowserRuntimePreflight(repo, command, targets, timeoutMs, outputPolicy) {
   const env = buildWorkerSandboxWritableEnv(repo);
-  const timeout = Math.max(120000, Math.min(600000, timeoutMs));
+  const timeout = Math.max(1, Math.min(600000, Math.floor(timeoutMs)));
   return runValidationArgv(repo, command, playwrightBrowserInstallArgv(targets), env, timeout, outputPolicy, `Browser runtime preflight timed out after ${timeout}ms while ensuring Playwright browser target(s): ${targets.join(", ")}. Captured output is the process output emitted before PushPals terminated the installer process tree.`);
 }
 function resolveValidationCommandTimeoutMs(command, baseTimeoutMs, repo) {
@@ -9674,7 +10099,7 @@ function removeLinkedNodeModulesDependencyArtifact(repo, onLog) {
     return { ok: false, removed: false, error };
   }
 }
-async function runBunDependencyLayoutPreflight(repo, validationCommands, failureValidationCommand, timeoutMs, outputPolicy, onLog) {
+async function runBunDependencyLayoutPreflight(repo, validationCommands, failureValidationCommand, timeoutMs, outputPolicy, onLog, deadlineLedger) {
   const preflight = resolveBunDependencyLayoutPreflight(repo, validationCommands);
   if (!preflight)
     return null;
@@ -9682,7 +10107,19 @@ async function runBunDependencyLayoutPreflight(repo, validationCommands, failure
   if (preflight.removeLinkedNodeModules) {
     removeLinkedNodeModulesDependencyArtifact(repo, onLog);
   }
-  const run = await runValidationCommand(repo, preflight.command, resolveBunDependencyLayoutPreflightTimeoutForValidationCommands(repo, validationCommands, timeoutMs), outputPolicy);
+  const requestedTimeoutMs = resolveBunDependencyLayoutPreflightTimeoutForValidationCommands(repo, validationCommands, timeoutMs);
+  const preflightTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(requestedTimeoutMs) : requestedTimeoutMs;
+  const run = preflightTimeoutMs <= 0 ? {
+    step: preflight.command,
+    command: preflight.command,
+    ok: false,
+    exitCode: 124,
+    stdout: "",
+    stderr: "Dependency layout preflight did not start because the absolute job deadline expired.",
+    elapsedMs: 0,
+    terminalStatusSource: "deadline",
+    failureClass: "deadline"
+  } : await runValidationCommand(repo, preflight.command, preflightTimeoutMs, outputPolicy);
   if (run.ok) {
     onLog?.("stdout", `[ValidationGate] Dependency layout preflight repaired local Bun install layout (${run.elapsedMs}ms).`);
     return null;
@@ -9726,7 +10163,7 @@ async function checkToolCandidate(candidate, env, timeoutMs = 5000) {
   try {
     const result = await runBoundedProcess(toolProbeArgv(candidate, spawnEnv), {
       env: spawnEnv,
-      timeoutMs: Math.max(1000, timeoutMs),
+      timeoutMs: Math.max(1, Math.floor(timeoutMs)),
       outputLimitBytes: 64 * 1024
     });
     return !result.timedOut && !result.drainTimedOut && result.exitCode === 0;
@@ -9734,13 +10171,14 @@ async function checkToolCandidate(candidate, env, timeoutMs = 5000) {
     return false;
   }
 }
-async function checkToolAvailability(requirements, env = withResolvedBunOnPath(process.env)) {
+async function checkToolAvailability(requirements, env = withResolvedBunOnPath(copyEnvWithoutScmRepairAuthoritySecret(process.env)), deadlineLedger) {
   const cache = new Map;
   const check = (candidate) => {
     const key = candidate.toLowerCase();
     let cached = cache.get(key);
     if (!cached) {
-      cached = checkToolCandidate(candidate, env);
+      const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(5000) : 5000;
+      cached = timeoutMs > 0 ? checkToolCandidate(candidate, env, timeoutMs) : Promise.resolve(false);
       cache.set(key, cached);
     }
     return cached;
@@ -9883,47 +10321,24 @@ function detectValidationBlocker(runs) {
   const failedRuns = runs.filter((run) => !run.ok);
   if (failedRuns.length === 0)
     return null;
-  if (failedRuns.every((run) => run.inheritedFailureClass === "environment")) {
-    return {
-      category: "environment",
-      detail: "Validation was skipped because a lower-tier command is blocked by the worker environment. Preserve the candidate and rerun the blocked command chain on the trusted host."
-    };
+  const failureClasses = failedRuns.map((run) => classifyValidationFailureClass(run));
+  const allEnvironment = failureClasses.every((failureClass) => failureClass?.startsWith("environment.") === true);
+  if (allEnvironment) {
+    const categories = new Set(failureClasses);
+    const detail = categories.has("environment.docker") ? "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the exact candidate and rerun the blocked command against that SHA in a trusted host environment." : categories.has("environment.toolchain") || categories.has("environment.browser") ? "Validation is blocked by missing required toolchain executables or browser runtime support in the worker environment. Preserve the exact candidate and provision the trusted host before validating that SHA." : "Validation is blocked by sandbox environment restrictions (filesystem, permissions, or network). Preserve the exact candidate and rerun the blocked command chain against that SHA on the trusted host.";
+    return { category: "environment", detail };
   }
-  const combined = failedRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean).join(`
-`).toLowerCase();
-  if (!combined)
-    return null;
-  const browserFallbackSucceeded = combined.includes("using google chrome for browser automation") || combined.includes("using chromium for browser automation") || combined.includes("using firefox for browser automation") || combined.includes("using webkit for browser automation");
-  const hasMissingBrowserRuntime = !browserFallbackSucceeded && (combined.includes("browser runtime preflight failed") || combined.includes("playwright install") || combined.includes("executable doesn't exist") || combined.includes("please run the following command to download new browsers"));
-  if (isDockerDaemonValidationBlocker(combined)) {
-    return {
-      category: "environment",
-      detail: "Validation requires access to a Docker daemon that is unavailable inside the worker sandbox. Preserve the candidate and rerun the blocked command in a trusted host environment."
-    };
-  }
-  if (combined.includes("validation skipped before execution because required tool") || combined.includes("missing required tool") || combined.includes("command not found") || combined.includes("executable not found") || hasMissingBrowserRuntime || combined.includes("not recognized as an internal or external command")) {
-    return {
-      category: "environment",
-      detail: "Validation is blocked by missing required toolchain executables or browser runtime support in the worker environment. Install/provision the missing tools or browser runtime before retrying this job."
-    };
-  }
-  if (combined.includes("cannot find module") || combined.includes("module not found") || combined.includes("failed to resolve import") || combined.includes("could not resolve") || combined.includes("no such file or directory") || combined.includes("package not found")) {
+  if (failureClasses.every((failureClass) => failureClass === "repository.dependency")) {
     return {
       category: "repo",
       detail: "Validation is blocked by missing repo dependencies or imported files. Fix the repository test/runtime setup before retrying this job."
-    };
-  }
-  if (combined.includes("read-only file system") || combined.includes("permission denied") || combined.includes("network access") || combined.includes("connection refused") || combined.includes("getaddrinfo") || combined.includes("err_socket_bad_port") || combined.includes("expo exited early") || combined.includes("eperm") || combined.includes("operation not permitted") || combined.includes("eacces")) {
-    return {
-      category: "environment",
-      detail: "Validation is blocked by sandbox environment restrictions (filesystem, permissions, or network). Retry only after the worker environment is fixed."
     };
   }
   return null;
 }
 function isolatePureEnvironmentValidationDeferral(quality) {
   const failedRuns = quality.validationRuns.filter((run) => !run.ok);
-  const pureEnvironmentDeferral = failedRuns.length > 0 && failedRuns.every((run) => detectValidationBlocker([run])?.category === "environment");
+  const pureEnvironmentDeferral = failedRuns.length > 0 && failedRuns.every((run) => classifyValidationFailureClass(run)?.startsWith("environment.") === true);
   if (!pureEnvironmentDeferral) {
     return { pureEnvironmentDeferral: false, qualityForCritic: quality, blockedCommands: [] };
   }
@@ -10199,8 +10614,8 @@ function validationFileFingerprint(repo, changedPaths) {
   }
   return hash.digest("hex");
 }
-async function validationCacheContext(repo, changedPaths) {
-  const head = await git2(repo, ["rev-parse", "HEAD"]);
+async function validationCacheContext(repo, changedPaths, deadlineLedger) {
+  const head = deadlineLedger ? await git2(repo, ["rev-parse", "HEAD"], deadlineLedger, "work") : await git2(repo, ["rev-parse", "HEAD"]);
   return `${head.ok ? head.stdout.trim() : "unknown-head"}:${validationFileFingerprint(repo, changedPaths)}`;
 }
 function findUnchangedValidationFailure(runs, previousFailureDigests, repo) {
@@ -11258,7 +11673,17 @@ function buildValidationExecutionDag(repo, commands) {
   const retained = deduped.filter((candidate, candidateIndex) => {
     if (isFocusedValidationCommand(candidate))
       return true;
-    return !deduped.some((aggregate, aggregateIndex) => aggregateIndex !== candidateIndex && validationCommandSubsumes(repo, aggregate, candidate) && (!validationCommandSubsumes(repo, candidate, aggregate) || aggregateIndex < candidateIndex));
+    return !deduped.some((aggregate, aggregateIndex) => {
+      if (aggregateIndex === candidateIndex)
+        return false;
+      if (!validationCommandSubsumes(repo, aggregate, candidate))
+        return false;
+      const aggregateCapability = trustedEnvironmentValidationDeferralReason(repo, aggregate);
+      const candidateCapability = trustedEnvironmentValidationDeferralReason(repo, candidate);
+      if (aggregateCapability && !candidateCapability)
+        return false;
+      return !validationCommandSubsumes(repo, candidate, aggregate) || aggregateIndex < candidateIndex;
+    });
   });
   return retained.sort((left, right) => {
     const focusedDelta = Number(isFocusedValidationCommand(right)) - Number(isFocusedValidationCommand(left));
@@ -11269,6 +11694,28 @@ function buildValidationExecutionDag(repo, commands) {
     return Number(leftAggregate) - Number(rightAggregate);
   });
 }
+function withValidationExecutionPlanProvenance(run, plan) {
+  if (!plan)
+    return run;
+  return {
+    ...run,
+    plannedEvidenceId: plan.evidenceId,
+    capability: plan.capability,
+    subsumes: [...plan.subsumes],
+    subsumedBy: [...plan.subsumedBy]
+  };
+}
+function buildValidationExecutionPlan(repo, commands) {
+  const deduped = dedupeValidationCommands(commands);
+  const executionCommands = buildValidationExecutionDag(repo, deduped);
+  return executionCommands.map((command) => ({
+    command,
+    evidenceId: validationEvidenceId({ command }),
+    capability: trustedEnvironmentValidationDeferralReason(repo, command) ? "trusted_host" : "worker",
+    subsumes: deduped.filter((candidate) => validationCommandKey(candidate) !== validationCommandKey(command) && validationCommandSubsumes(repo, command, candidate)),
+    subsumedBy: deduped.filter((candidate) => validationCommandKey(candidate) !== validationCommandKey(command) && validationCommandSubsumes(repo, candidate, command))
+  }));
+}
 function collectQualityGateValidationCommands(params) {
   const requiredRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(params.repo, runnableValidationCommandsFromSteps(params.planning.requiredValidationSteps).slice(0, 12));
   const plannerRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(params.repo, runnableValidationCommandsFromSteps(params.planning.validationSteps).slice(0, 4));
@@ -11277,6 +11724,7 @@ function collectQualityGateValidationCommands(params) {
   const discoveredCommands = dedupeValidationCommands(requiredRunnableSteps, plannerRunnableSteps.length > 0 ? plannerRunnableSteps : fallbackValidationSteps, inferredRepoNativeValidationSteps).slice(0, 16);
   const commandsToRun = params.repo ? buildValidationExecutionDag(params.repo, discoveredCommands) : discoveredCommands;
   return {
+    discoveredCommands,
     commandsToRun,
     requiredRunnableSteps,
     plannerRunnableSteps,
@@ -11465,7 +11913,7 @@ function inferRepoNativeValidationCommands(repo, changedPaths) {
   }
   return dedupeValidationCommands(commands).slice(0, 4);
 }
-async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityGatePolicy, onLog, validationRetryState) {
+async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityGatePolicy, onLog, validationRetryState, deadlineLedger) {
   const instruction = String(params.instruction ?? "");
   const targetPath = String(params.targetPath ?? params.path ?? "").trim() || undefined;
   const planning = params.planning;
@@ -11490,9 +11938,9 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
       validationFailureScope: "none"
     };
   }
-  const statusResult = await git2(repo, ["status", "--porcelain"]);
+  const statusResult = deadlineLedger ? await git2(repo, ["status", "--porcelain"], deadlineLedger, "work") : await git2(repo, ["status", "--porcelain"]);
   const rawChangedPaths = statusResult.ok ? expandKnownArtifactDirectoryPaths(repo, parseChangedPathsFromStatus(statusResult.stdout)) : [];
-  const changedPaths = statusResult.ok ? await filterChangedPathsByGitContentDelta(repo, rawChangedPaths) : rawChangedPaths;
+  const changedPaths = statusResult.ok ? await filterChangedPathsByGitContentDelta(repo, rawChangedPaths, deadlineLedger) : rawChangedPaths;
   const preparedMergeConflictPaths = extractPreparedMergeConflictPaths(params);
   const changedTestPaths = Array.from(new Set([...changedPaths, ...preparedMergeConflictPaths].filter((path) => isLikelyTestPath(path))));
   const changedAssertionCoverageTestPaths = changedTestPaths.filter((path) => isAssertionCoverageTestPath(path));
@@ -11544,7 +11992,7 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
     onLog?.("stdout", "[ValidationGate] Disabled by workerpals.quality_validation_gate_enabled=false.");
   }
   const {
-    commandsToRun: collectedCommandsToRun,
+    discoveredCommands,
     requiredRunnableSteps,
     plannerRunnableSteps,
     fallbackValidationSteps
@@ -11557,12 +12005,14 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
     repo,
     changedPaths
   });
-  const commandsToRun = collectedCommandsToRun.map((command, index) => ({ command, index })).sort((left, right) => {
+  const validationExecutionPlan = buildValidationExecutionPlan(repo, discoveredCommands);
+  const commandsToRun = validationExecutionPlan.map(({ command }, index) => ({ command, index })).sort((left, right) => {
     const tierDelta = validationCommandExecutionTier(left.command) - validationCommandExecutionTier(right.command);
     return tierDelta !== 0 ? tierDelta : left.index - right.index;
   }).map((entry) => entry.command);
   const validationRuns = [];
-  const cacheContext = await validationCacheContext(repo, changedPaths);
+  const validationPlanByCommand = new Map(validationExecutionPlan.map((node) => [validationCommandKey(node.command), node]));
+  const cacheContext = await validationCacheContext(repo, changedPaths, deadlineLedger);
   const runValidationWithCache = async (command, runner) => {
     const cacheKey = `${cacheContext}\x00${validationCommandKey(command)}`;
     const cached = validationRetryState?.passingValidationCache?.get(cacheKey);
@@ -11588,6 +12038,21 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
       return 180000;
     return Math.max(1000, Math.min(7200000, Math.floor(value)));
   })();
+  const qualityCommandTimeoutMs = (command) => {
+    const requested = resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo);
+    return deadlineLedger ? deadlineLedger.capWorkTimeout(requested) : requested;
+  };
+  const deadlineFailureRun = (command) => ({
+    step: command,
+    command,
+    ok: false,
+    exitCode: 124,
+    stdout: "",
+    stderr: "Validation did not start because the absolute WorkerPal job deadline was exhausted; this is not a passing validation result.",
+    elapsedMs: 0,
+    terminalStatusSource: "deadline",
+    failureClass: "deadline"
+  });
   let requiredValidationFailures = [];
   if (qualityGatePolicy.validationGateEnabled) {
     if (hasRequiredValidationCriteria && requiredRunnableSteps.length === 0) {
@@ -11602,7 +12067,8 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
       if (isTestTask && plannerRunnableSteps.length === 0 && fallbackValidationSteps.length > 0) {
         onLog?.("stdout", `[ValidationGate] No runnable planning.validationSteps found; using fallback validation command(s): ${commandsToRun.join(" | ")}`);
       }
-      const dependencyPreflightFailure = await runBunDependencyLayoutPreflight(repo, commandsToRun, requiredRunnableSteps[0] ?? commandsToRun[0] ?? "", qualityValidationStepTimeoutMs, outputPolicy, onLog);
+      const dependencyPreflightTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(qualityValidationStepTimeoutMs) : qualityValidationStepTimeoutMs;
+      const dependencyPreflightFailure = dependencyPreflightTimeoutMs <= 0 ? deadlineFailureRun(requiredRunnableSteps[0] ?? commandsToRun[0] ?? "validation") : await runBunDependencyLayoutPreflight(repo, commandsToRun, requiredRunnableSteps[0] ?? commandsToRun[0] ?? "", dependencyPreflightTimeoutMs, outputPolicy, onLog, deadlineLedger);
       if (dependencyPreflightFailure) {
         validationRuns.push(dependencyPreflightFailure);
         onLog?.("stderr", `[ValidationGate] Dependency layout preflight blocked validation before "${dependencyPreflightFailure.command}".`);
@@ -11614,7 +12080,7 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
         if (toolchainPlan.requirements.length > 0) {
           onLog?.("stdout", `[ValidationGate] Toolchain preflight: source=${toolchainPlan.environmentSource}, required=${toolchainPlan.requirements.map((requirement) => requirement.tool).join(", ")}`);
         }
-        const toolAvailability = await checkToolAvailability(toolchainPlan.requirements, buildWorkerSandboxWritableEnv(repo));
+        const toolAvailability = await checkToolAvailability(toolchainPlan.requirements, buildWorkerSandboxWritableEnv(repo), deadlineLedger);
         const missingToolRequirements = toolAvailability.filter((entry) => !entry.ok).map((entry) => entry.requirement);
         if (missingToolRequirements.length > 0) {
           onLog?.("stderr", `[ValidationGate] Toolchain preflight blocked dependent validation command(s): ${formatMissingToolRequirements(missingToolRequirements)}`);
@@ -11622,6 +12088,11 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
         const playwrightBrowserRuntimeReadyTargets = new Set;
         for (let commandIndex = 0;commandIndex < commandsToRun.length; ) {
           const nextCommand = commandsToRun[commandIndex];
+          if (deadlineLedger?.workExpired()) {
+            validationRuns.push(deadlineFailureRun(nextCommand));
+            onLog?.("stderr", `[ValidationGate] Absolute job deadline exhausted before validation command: ${nextCommand}`);
+            break;
+          }
           const higherTierDeferral = higherTierValidationDeferralAfterFailure(nextCommand, validationRuns);
           if (higherTierDeferral) {
             commandIndex += 1;
@@ -11671,11 +12142,15 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
                   summary: `[ValidationGate] Validation skipped (missing toolchain): ${command2}`
                 };
               }
-              let run2 = await runValidationWithCache(command2, () => runValidationCommand(repo, command2, resolveValidationCommandTimeoutMs(command2, qualityValidationStepTimeoutMs, repo), outputPolicy));
+              let run2 = await runValidationWithCache(command2, () => {
+                const commandTimeoutMs = qualityCommandTimeoutMs(command2);
+                return commandTimeoutMs <= 0 ? Promise.resolve(deadlineFailureRun(command2)) : runValidationCommand(repo, command2, commandTimeoutMs, outputPolicy);
+              });
               if (!run2.ok && (shouldRetryPassingVitestTeardownOnce(run2) || shouldRetryTransientInfrastructureValidationOnce(run2))) {
                 const firstDigest2 = extractValidationFailureDigest(run2);
                 onLog?.("stderr", `[ValidationGate] Retrying fast validation once after transient infrastructure/teardown failure: ${command2}${firstDigest2 ? ` - ${firstDigest2}` : ""}`);
-                run2 = await runValidationCommand(repo, command2, resolveValidationCommandTimeoutMs(command2, qualityValidationStepTimeoutMs, repo), outputPolicy);
+                const retryTimeoutMs = qualityCommandTimeoutMs(command2);
+                run2 = retryTimeoutMs <= 0 ? deadlineFailureRun(command2) : await runValidationCommand(repo, command2, retryTimeoutMs, outputPolicy);
                 if (run2.ok) {
                   validationRetryState?.passingValidationCache?.set(`${cacheContext}\x00${validationCommandKey(command2)}`, { ...run2, step: command2, command: command2 });
                 }
@@ -11756,7 +12231,8 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
             }
             if (!commandBrowserRuntimeEnsured) {
               onLog?.("stdout", `[ValidationGate] Browser runtime preflight: ensuring Playwright browser target(s) ${missingPlaywrightBrowserTargets.join(", ")} for "${command}" at ${browserEnv.PLAYWRIGHT_BROWSERS_PATH ?? "(default browser cache)"}`);
-              const browserPreflight = await runPlaywrightBrowserRuntimePreflight(repo, command, missingPlaywrightBrowserTargets, resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo), outputPolicy);
+              const browserPreflightTimeoutMs = qualityCommandTimeoutMs(command);
+              const browserPreflight = browserPreflightTimeoutMs <= 0 ? deadlineFailureRun(command) : await runPlaywrightBrowserRuntimePreflight(repo, command, missingPlaywrightBrowserTargets, browserPreflightTimeoutMs, outputPolicy);
               if (!browserPreflight.ok) {
                 const digest2 = extractValidationFailureDigest(browserPreflight);
                 validationRuns.push({
@@ -11799,7 +12275,10 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
             continue;
           }
           onLog?.("stdout", `[ValidationGate] Running "${command}"`);
-          let run = await runValidationWithCache(command, () => runValidationCommandWithRepoLease(repo, command, resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo), outputPolicy, onLog));
+          let run = await runValidationWithCache(command, () => {
+            const commandTimeoutMs = qualityCommandTimeoutMs(command);
+            return commandTimeoutMs <= 0 ? Promise.resolve(deadlineFailureRun(command)) : runValidationCommandWithRepoLease(repo, command, commandTimeoutMs, outputPolicy, onLog, deadlineLedger);
+          });
           const firstDigest = run.ok ? "" : extractValidationFailureDigest(run);
           const retryBrowserValidation = shouldRetryBrowserValidationRunOnce(run, repo);
           const retryAggregateWorkerValidation = shouldRetryAggregateWorkerValidationRunOnce(run, repo);
@@ -11809,13 +12288,18 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
           if (retryBrowserValidation || retryAggregateWorkerValidation || retryPassingVitestTeardown || retryTransientInfrastructure) {
             onLog?.("stderr", retryPassingVitestTeardown ? `[ValidationGate] Retrying validation once after all Vitest assertions passed but worker teardown failed: ${command}${firstDigest ? ` - ${firstDigest}` : ""}` : retryAggregateWorkerValidation ? `[ValidationGate] Retrying only the failed Worker validation stage after aggregate cold-start failure: ${focusedAggregateRetryCommand ?? command}${firstDigest ? ` - ${firstDigest}` : ""}` : retryBrowserValidation ? `[ValidationGate] Retrying browser validation once after retryable startup/runtime failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}` : `[ValidationGate] Retrying validation once after transient infrastructure failure: ${command}${firstDigest ? ` - ${firstDigest}` : ""}`);
             if (retryAggregateWorkerValidation) {
-              await new Promise((resolveWait) => setTimeout(resolveWait, 1500));
+              const retryDelayMs = deadlineLedger ? deadlineLedger.capWorkTimeout(1500) : 1500;
+              if (retryDelayMs > 0) {
+                await new Promise((resolveWait) => setTimeout(resolveWait, retryDelayMs));
+              }
             }
             const retryCommand = focusedAggregateRetryCommand ?? command;
-            let retryRun = await runValidationCommandWithRepoLease(repo, retryCommand, resolveValidationCommandTimeoutMs(retryCommand, qualityValidationStepTimeoutMs, repo), outputPolicy, onLog);
+            const retryTimeoutMs = qualityCommandTimeoutMs(retryCommand);
+            let retryRun = retryTimeoutMs <= 0 ? deadlineFailureRun(retryCommand) : await runValidationCommandWithRepoLease(repo, retryCommand, retryTimeoutMs, outputPolicy, onLog, deadlineLedger);
             if (focusedAggregateRetryCommand && retryRun.ok) {
               onLog?.("stdout", `[ValidationGate] Focused Worker stage passed; rerunning the aggregate command once to verify all remaining stages: ${command}`);
-              retryRun = await runValidationCommandWithRepoLease(repo, command, resolveValidationCommandTimeoutMs(command, qualityValidationStepTimeoutMs, repo), outputPolicy, onLog);
+              const aggregateRetryTimeoutMs = qualityCommandTimeoutMs(command);
+              retryRun = aggregateRetryTimeoutMs <= 0 ? deadlineFailureRun(command) : await runValidationCommandWithRepoLease(repo, command, aggregateRetryTimeoutMs, outputPolicy, onLog, deadlineLedger);
             } else if (focusedAggregateRetryCommand) {
               retryRun = {
                 ...retryRun,
@@ -11879,7 +12363,11 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
     validationIssues,
     changedPaths,
     changedTestPaths,
-    validationRuns,
+    validationRuns: validationRuns.map((run) => withValidationExecutionPlanProvenance({
+      ...run,
+      evidenceId: run.evidenceId ?? validationEvidenceId(run),
+      failureClass: run.failureClass ?? classifyValidationFailureClass(run) ?? undefined
+    }, validationPlanByCommand.get(validationCommandKey(run.command)))),
     requiredValidationFailures,
     blocker,
     validationFailureScope: scopedValidationFailure
@@ -11915,9 +12403,11 @@ function resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact = f
 function buildCriticValidationSummary(quality, maxValidationOutputChars) {
   const allPassed = quality.validationRuns.length > 0 && quality.validationRuns.every((run) => run.ok);
   const executedSummary = quality.validationRuns.map((run) => {
+    const evidenceId = run.evidenceId ?? validationEvidenceId(run);
     const output = allPassed ? "" : [run.stdout, run.stderr].filter(Boolean).join(`
 `).slice(0, maxValidationOutputChars);
     return [
+      `Evidence ID: ${evidenceId}`,
       `Command: ${run.command}`,
       `Result: ${run.ok ? "pass" : "fail"} (exit ${run.exitCode}, ${run.elapsedMs}ms)`,
       output ? `Output:
@@ -11941,6 +12431,37 @@ ${output}` : ""
 ---
 
 `);
+}
+function citedCriticEvidenceIds(value) {
+  return Array.from(value.matchAll(/(?:\[?evidence[:=]\s*|\b)(validation:[a-f0-9]{12})\]?/gi), (match) => String(match[1] ?? "").toLowerCase());
+}
+function criticClaimRequiresValidationEvidence(value) {
+  return /\b(?:tests?|validation|command|exit|assertions?|fail(?:ed|ure|ing)?|pass(?:ed|ing)?|typecheck|lint|build)\b/i.test(value);
+}
+function enforceCriticEvidenceProvenance(review, quality) {
+  const available = new Set(quality.validationRuns.map((run) => (run.evidenceId ?? validationEvidenceId(run)).toLowerCase()));
+  const unsupported = [];
+  const keep = (value) => {
+    if (!criticClaimRequiresValidationEvidence(value))
+      return true;
+    const cited = citedCriticEvidenceIds(value);
+    const supported = cited.some((evidenceId) => available.has(evidenceId));
+    if (!supported)
+      unsupported.push(value);
+    return supported;
+  };
+  const findings = review.findings.filter(keep);
+  const mustFix = review.mustFix.filter(keep);
+  const revisionGuidance = keep(review.revisionGuidance) ? review.revisionGuidance : "";
+  const evidenceIds = Array.from(new Set([...findings, ...mustFix, revisionGuidance].flatMap(citedCriticEvidenceIds).filter((evidenceId) => available.has(evidenceId))));
+  return {
+    ...review,
+    findings,
+    mustFix,
+    revisionGuidance,
+    evidenceIds,
+    unsupportedFindings: unsupported
+  };
 }
 var BUILT_IN_FINAL_REVIEWER_RUBRIC = [
   "Review the candidate as a strict senior maintainer.",
@@ -11986,16 +12507,37 @@ ${reviewFix.reviewerFindings.map((finding) => `- ${finding}`).join(`
 `) || "No prior final-review findings are available for this job."
   };
 }
-function criticTimeoutReview(source, timeoutMs, elapsedMs) {
-  const summary = `${source} critic timed out after ${elapsedMs}ms (timeout=${timeoutMs}ms).`;
+function estimatedCriticUsageAttempt(options) {
+  const promptTokens = Math.max(1, Math.ceil(Math.max(0, options.promptChars) / 3));
+  const completionTokens = Math.max(0, Math.ceil(Math.max(0, options.completionChars ?? 0) / 3));
   return {
-    score: 0,
-    findings: [summary],
-    mustFix: [
-      "CriticGate timeout behavior is set to block; complete the critic review by reducing critic input, choosing a faster critic model, or increasing workerpals.quality_critic_timeout_ms."
-    ],
-    revisionGuidance: "Do not change product code for this finding unless product code caused the critic prompt explosion. Adjust CriticGate configuration or reduce validation/diff evidence volume.",
-    raw: JSON.stringify({ score: 0, findings: [summary], must_fix: ["CriticGate timed out"] })
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: true,
+    backend: options.backend,
+    ...options.modelId ? { modelId: options.modelId } : {},
+    stage: "critic",
+    source: options.backend,
+    attempt: options.attempt,
+    ...options.timedOut === true ? { timedOut: true } : {}
+  };
+}
+function exactHttpUsageAttempt(payload, fallback) {
+  const record = payload && typeof payload === "object" ? payload : {};
+  const usage = record.usage && typeof record.usage === "object" ? record.usage : null;
+  if (!usage)
+    return fallback;
+  const promptTokens = Number(usage.prompt_tokens ?? usage.promptTokens);
+  const completionTokens = Number(usage.completion_tokens ?? usage.completionTokens);
+  if (!Number.isFinite(promptTokens) || !Number.isFinite(completionTokens))
+    return fallback;
+  return {
+    ...fallback,
+    promptTokens: Math.max(0, Math.floor(promptTokens)),
+    completionTokens: Math.max(0, Math.floor(completionTokens)),
+    totalTokens: Math.max(0, Math.floor(promptTokens)) + Math.max(0, Math.floor(completionTokens)),
+    estimated: false
   };
 }
 async function fetchWorkerCriticResponseWithHardDeadline(options) {
@@ -12017,13 +12559,27 @@ async function fetchWorkerCriticResponseWithHardDeadline(options) {
     throw err;
   }
 }
-async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog) {
+async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog, deadlineLedger) {
   const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
   const model = resolveQualityCriticModel(runtimeConfig, runtimeConfig.workerpals.llm.model.trim());
-  if (!endpoint || !model)
-    return null;
-  const qualityCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  if (!endpoint || !model) {
+    return {
+      kind: "unavailable",
+      reason: "LLM critic endpoint/model is not configured",
+      usageAttempts: []
+    };
+  }
+  const configuredCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  const qualityCriticTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs) : configuredCriticTimeoutMs;
+  if (qualityCriticTimeoutMs <= 0) {
+    return {
+      kind: "timeout",
+      reason: "job deadline expired before the LLM critic could start",
+      usageAttempts: []
+    };
+  }
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
+  const usageAttempts = [];
   const planning = params.planning;
   const instruction = String(params.instruction ?? "").trim();
   const acceptanceCriteriaText = planning.acceptanceCriteria.map((entry) => `- ${entry}`).join(`
@@ -12046,10 +12602,10 @@ async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog) 
     headers.Authorization = `Bearer ${apiKey}`;
   const buildAttemptPayload = async (compact) => {
     const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff);
+    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(0, resolveQualityCriticMaxDiffChars(runtimeConfig, compact));
     const validationSummary = buildCriticValidationSummary(quality, resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact));
-    const criticUser = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
+    const criticUserBase = loadPromptTemplate("workerpals/task_quality_critic_user_prompt.md", {
       instruction,
       acceptance_criteria: acceptanceCriteriaText,
       validation_steps: validationStepsText,
@@ -12060,6 +12616,9 @@ async function runTaskCriticReview(repo, params, quality, runtimeConfig, onLog) 
       final_reviewer_rubric: reviewContext.finalReviewerRubric,
       prior_review_context: reviewContext.priorReviewContext
     });
+    const criticUser = `${criticUserBase}
+
+Evidence contract: Every finding or must_fix claim about tests, validation, command output, pass/fail counts, or exit status MUST cite an exact Evidence ID from the validation evidence as [evidence:validation:...]. Omit claims that have no evidence ID.`;
     const promptChars = criticSystem.length + criticUser.length;
     const promptBytes = new TextEncoder().encode(`${criticSystem}
 ${criticUser}`).length;
@@ -12079,29 +12638,54 @@ ${criticUser}`).length;
       validationChars: validationSummary.length
     };
   };
-  const runCriticRequest = async (bodyBase, responseFormat) => {
-    return fetchWorkerCriticResponseWithHardDeadline({
+  const runCriticRequest = async (bodyBase, responseFormat, promptChars, usageAttempt) => {
+    const requestTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs) : qualityCriticTimeoutMs;
+    if (requestTimeoutMs <= 0) {
+      return {
+        timedOut: true,
+        err: new Error("absolute job deadline exhausted before critic request")
+      };
+    }
+    const request = await fetchWorkerCriticResponseWithHardDeadline({
       endpoint,
       init: {
         method: "POST",
         headers,
         body: JSON.stringify(responseFormat ? { ...bodyBase, response_format: responseFormat } : bodyBase)
       },
-      timeoutMs: qualityCriticTimeoutMs
+      timeoutMs: requestTimeoutMs
     });
+    const fallbackUsage = estimatedCriticUsageAttempt({
+      promptChars,
+      backend: "quality_critic_http",
+      modelId: model,
+      attempt: usageAttempt,
+      timedOut: request.timedOut
+    });
+    if (request.timedOut) {
+      usageAttempts.push(fallbackUsage);
+    } else {
+      const parsed = parseJsonObjectLoose(request.text);
+      usageAttempts.push(exactHttpUsageAttempt(parsed, {
+        ...fallbackUsage,
+        completionTokens: Math.max(0, Math.ceil(request.text.length / 3)),
+        totalTokens: fallbackUsage.promptTokens + Math.max(0, Math.ceil(request.text.length / 3))
+      }));
+    }
+    return request;
   };
   const runAttempt = async (attempt, compact) => {
     const payload = await buildAttemptPayload(compact);
     const startedAt = Date.now();
     onLog?.("stdout", `[CriticGate] LLM review attempt ${attempt}${compact ? " (compact)" : ""}: model=${model} timeout_ms=${qualityCriticTimeoutMs} behavior=${timeoutBehavior} prompt_chars=${payload.promptChars} prompt_bytes=${payload.promptBytes} diff_chars=${payload.diffChars} validation_chars=${payload.validationChars}`);
-    let request = await runCriticRequest(payload.bodyBase, { type: "json_object" });
+    let request = await runCriticRequest(payload.bodyBase, { type: "json_object" }, payload.promptChars, attempt * 10 + 1);
     if (request.timedOut)
       return { status: "timeout" };
     if (!request.response.ok && request.response.status === 400) {
       const lowered = request.text.toLowerCase();
       if (lowered.includes("response_format")) {
         onLog?.("stdout", "[CriticGate] fallback: response_format json_object unsupported; retrying without strict response_format.");
-        request = await runCriticRequest(payload.bodyBase, null);
+        request = await runCriticRequest(payload.bodyBase, null, payload.promptChars, attempt * 10 + 2);
         if (request.timedOut)
           return { status: "timeout" };
       }
@@ -12126,13 +12710,13 @@ ${criticUser}`).length;
     onLog?.("stdout", `[CriticGate] LLM review completed in ${Date.now() - startedAt}ms (attempt ${attempt}).`);
     return {
       status: "done",
-      review: {
+      review: enforceCriticEvidenceProvenance({
         score,
         findings,
         mustFix,
         revisionGuidance,
         raw: compactJobOutput(content, outputPolicyForRuntime(runtimeConfig))
-      }
+      }, quality)
     };
   };
   try {
@@ -12142,17 +12726,24 @@ ${criticUser}`).length;
       attempt = await runAttempt(2, true);
     }
     if (attempt.status === "timeout") {
-      if (timeoutBehavior === "block") {
-        onLog?.("stderr", `[CriticGate] LLM review timed out after ${qualityCriticTimeoutMs}ms; blocking because quality_critic_timeout_behavior=block.`);
-        return criticTimeoutReview("LLM", qualityCriticTimeoutMs, qualityCriticTimeoutMs);
-      }
-      onLog?.("stderr", `[CriticGate] LLM timed out after ${qualityCriticTimeoutMs}ms; skipping.`);
-      return null;
+      onLog?.("stderr", `[CriticGate] LLM timed out after ${qualityCriticTimeoutMs}ms; retaining the candidate (${timeoutBehavior}).`);
+      return {
+        kind: "timeout",
+        reason: `LLM critic timed out after ${qualityCriticTimeoutMs}ms`,
+        usageAttempts
+      };
     }
-    return attempt.review;
+    if (!attempt.review) {
+      return { kind: "invalid", reason: "LLM critic returned no usable verdict", usageAttempts };
+    }
+    return { kind: "verdict", review: attempt.review, usageAttempts };
   } catch (err) {
     onLog?.("stderr", `[CriticGate] review unavailable: ${toSingleLine(err, 220)} (continuing without critic gate).`);
-    return null;
+    return {
+      kind: "unavailable",
+      reason: toSingleLine(err, 220),
+      usageAttempts
+    };
   }
 }
 function buildQualityRevisionHint(issues, critic, planning, reviewFixContext, validationRuns = [], validationBlocker = null, browserRepairPacket = null, changedPaths = [], validationRemedyHints = [], repoValidationRepairMode = false) {
@@ -12490,11 +13081,22 @@ function resolveWorkerGitCommandTimeoutMs(args, env = process.env) {
   }
   return networkOperation ? DEFAULT_WORKERPAL_GIT_NETWORK_TIMEOUT_MS : DEFAULT_WORKERPAL_GIT_COMMAND_TIMEOUT_MS;
 }
-async function git2(cwd, args) {
+async function git2(cwd, args, deadlineLedger, deadlinePhase = "total") {
   try {
+    const configuredTimeoutMs = resolveWorkerGitCommandTimeoutMs(args);
+    const activeDeadlineLedger = deadlineLedger ?? workerGitDeadlineContext.getStore();
+    const timeoutMs = activeDeadlineLedger ? deadlinePhase === "work" ? activeDeadlineLedger.capWorkTimeout(configuredTimeoutMs) : activeDeadlineLedger.capTotalTimeout(configuredTimeoutMs) : configuredTimeoutMs;
+    if (timeoutMs <= 0) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: `git ${String(args[0] ?? "command")} did not start because the absolute job ${deadlinePhase === "work" ? "work" : "finalization"} deadline expired`,
+        exitCode: 124
+      };
+    }
     const result = await runBoundedProcess(["git", ...args], {
       cwd,
-      timeoutMs: resolveWorkerGitCommandTimeoutMs(args),
+      timeoutMs,
       outputLimitBytes: 4194304,
       preserveOutputWhitespace: true
     });
@@ -12508,36 +13110,32 @@ async function git2(cwd, args) {
     return { ok: false, stdout: "", stderr: String(err), exitCode: null };
   }
 }
-async function buildCriticDiffText(repo, changedPaths) {
+function gitDuringJobWork(repo, args, deadlineLedger) {
+  return deadlineLedger ? git2(repo, args, deadlineLedger, "work") : git2(repo, args);
+}
+async function buildCriticDiffText(repo, changedPaths, deadlineLedger) {
   const paths = Array.from(new Set(publishableChangedPaths(changedPaths).map((path) => normalizeChangedPathForCommit(String(path ?? ""))).filter((path) => Boolean(path))));
   if (paths.length === 0)
     return "";
   const chunks = [];
-  const trackedDiff = await git2(repo, ["diff", "HEAD", "--", ...paths]);
+  const trackedDiff = await gitDuringJobWork(repo, ["diff", "HEAD", "--", ...paths], deadlineLedger);
   if (trackedDiff.stdout) {
     chunks.push(trackedDiff.stdout);
   } else if (!trackedDiff.ok) {
     const [unstagedDiff, stagedDiff] = await Promise.all([
-      git2(repo, ["diff", "--", ...paths]),
-      git2(repo, ["diff", "--cached", "--", ...paths])
+      gitDuringJobWork(repo, ["diff", "--", ...paths], deadlineLedger),
+      gitDuringJobWork(repo, ["diff", "--cached", "--", ...paths], deadlineLedger)
     ]);
     if (unstagedDiff.stdout)
       chunks.push(unstagedDiff.stdout);
     if (stagedDiff.stdout)
       chunks.push(stagedDiff.stdout);
   }
-  const untrackedResult = await git2(repo, [
-    "ls-files",
-    "-z",
-    "--others",
-    "--exclude-standard",
-    "--",
-    ...paths
-  ]);
+  const untrackedResult = await gitDuringJobWork(repo, ["ls-files", "-z", "--others", "--exclude-standard", "--", ...paths], deadlineLedger);
   if (untrackedResult.ok) {
     const untrackedPaths = untrackedResult.stdout.split("\x00").map((path) => normalizeChangedPathForCommit(path)).filter((path) => Boolean(path));
     for (const path of untrackedPaths) {
-      const newFileDiff = await git2(repo, ["diff", "--no-index", "--", "/dev/null", path]);
+      const newFileDiff = await gitDuringJobWork(repo, ["diff", "--no-index", "--", "/dev/null", path], deadlineLedger);
       if (newFileDiff.stdout)
         chunks.push(newFileDiff.stdout);
     }
@@ -12545,27 +13143,27 @@ async function buildCriticDiffText(repo, changedPaths) {
   return chunks.join(`
 `);
 }
-async function trackedPathHasGitContentDelta(repo, path) {
-  const tracked = await git2(repo, ["ls-files", "--error-unmatch", "--", path]);
+async function trackedPathHasGitContentDelta(repo, path, deadlineLedger) {
+  const tracked = await gitDuringJobWork(repo, ["ls-files", "--error-unmatch", "--", path], deadlineLedger);
   if (!tracked.ok)
     return null;
-  const unstaged = await git2(repo, ["diff", "--quiet", "--", path]);
+  const unstaged = await gitDuringJobWork(repo, ["diff", "--quiet", "--", path], deadlineLedger);
   if (unstaged.exitCode === 1)
     return true;
   if (unstaged.exitCode !== 0)
     return null;
-  const staged = await git2(repo, ["diff", "--cached", "--quiet", "--", path]);
+  const staged = await gitDuringJobWork(repo, ["diff", "--cached", "--quiet", "--", path], deadlineLedger);
   if (staged.exitCode === 1)
     return true;
   if (staged.exitCode !== 0)
     return null;
   return false;
 }
-async function filterChangedPathsByGitContentDelta(repo, changedPaths) {
+async function filterChangedPathsByGitContentDelta(repo, changedPaths, deadlineLedger) {
   const [trackedResult, unstagedResult, stagedResult] = await Promise.all([
-    git2(repo, ["ls-files"]),
-    git2(repo, ["diff", "--name-only", "--no-renames"]),
-    git2(repo, ["diff", "--cached", "--name-only", "--no-renames"])
+    gitDuringJobWork(repo, ["ls-files"], deadlineLedger),
+    gitDuringJobWork(repo, ["diff", "--name-only", "--no-renames"], deadlineLedger),
+    gitDuringJobWork(repo, ["diff", "--cached", "--name-only", "--no-renames"], deadlineLedger)
   ]);
   const canFilterInBatch = trackedResult.ok && unstagedResult.ok && stagedResult.ok;
   const trackedPaths = new Set(canFilterInBatch ? parseChangedPathsFromNameOnlyOutput(trackedResult.stdout) : []);
@@ -12580,7 +13178,7 @@ async function filterChangedPathsByGitContentDelta(repo, changedPaths) {
     if (!path || seen.has(path))
       continue;
     seen.add(path);
-    const trackedDelta = canFilterInBatch ? trackedPaths.has(path) ? trackedContentDeltas.has(path) : null : await trackedPathHasGitContentDelta(repo, path);
+    const trackedDelta = canFilterInBatch ? trackedPaths.has(path) ? trackedContentDeltas.has(path) : null : await trackedPathHasGitContentDelta(repo, path, deadlineLedger);
     if (trackedDelta === false)
       continue;
     out.push(path);
@@ -12611,6 +13209,105 @@ async function resolveWorkerCommitIdentity(repo, _runtimeConfig = DEFAULT_CONFIG
 function buildGitCommitArgs2(commitMsg, identity) {
   return buildGitCommitArgs(commitMsg, identity);
 }
+function attachCommitFinalizationUsage(result, attempts) {
+  if (attempts.length === 0)
+    return result;
+  const usage = new UsageAccumulator;
+  usage.addAttempts(attempts);
+  return {
+    ...result,
+    usage: usage.total(),
+    usageAttempts: usage.attempts()
+  };
+}
+
+class CandidateCheckpointError extends Error {
+  stage;
+  candidateState;
+  constructor(stage, detail, candidateState) {
+    super(`Candidate checkpoint ${stage} failed: ${detail}`);
+    this.name = "CandidateCheckpointError";
+    this.stage = stage;
+    this.candidateState = candidateState;
+  }
+}
+function retainedCandidateRefComponent(value) {
+  const readable = value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "").slice(0, 48);
+  return readable || createHash5("sha256").update(value).digest("hex").slice(0, 16);
+}
+async function checkpointJobCandidate(repo, workerId, job, candidateState, runtimeConfig = DEFAULT_CONFIG3, baselineSha, deadlineLedger) {
+  if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
+    return workerGitDeadlineContext.run(deadlineLedger, () => checkpointJobCandidate(repo, workerId, job, candidateState, runtimeConfig, baselineSha));
+  }
+  const candidateRef = `refs/pushpals/candidates/${retainedCandidateRefComponent(workerId)}/${retainedCandidateRefComponent(job.id)}`;
+  const retainSha = async (sha2, changedPaths2) => {
+    const retained = await git2(repo, ["update-ref", candidateRef, sha2]);
+    if (!retained.ok) {
+      throw new CandidateCheckpointError("retain", retained.stderr || retained.stdout || `git update-ref exited ${retained.exitCode}`, { ...candidateState, changedPaths: changedPaths2 });
+    }
+    return {
+      ...candidateState,
+      changedPaths: changedPaths2,
+      checkpoint: {
+        ref: candidateRef,
+        sha: sha2,
+        capturedAt: new Date().toISOString()
+      }
+    };
+  };
+  const status = await git2(repo, ["status", "--porcelain"]);
+  if (!status.ok) {
+    throw new CandidateCheckpointError("status", status.stderr || status.stdout || `git status exited ${status.exitCode}`, candidateState);
+  }
+  const rawChangedPaths = expandKnownArtifactDirectoryPaths(repo, parseChangedPathsFromStatus(status.stdout));
+  const changedPaths = publishableChangedPaths(await filterChangedPathsByGitContentDelta(repo, rawChangedPaths));
+  if (changedPaths.length === 0) {
+    const normalizedBaselineSha = String(baselineSha ?? "").trim();
+    if (!normalizedBaselineSha)
+      return { ...candidateState, changedPaths: [] };
+    const head = await git2(repo, ["rev-parse", "HEAD"]);
+    if (!head.ok) {
+      throw new CandidateCheckpointError("resolve", head.stderr || head.stdout || `git rev-parse exited ${head.exitCode}`, candidateState);
+    }
+    const sha2 = head.stdout.trim();
+    if (!sha2 || sha2.toLowerCase() === normalizedBaselineSha.toLowerCase()) {
+      return { ...candidateState, changedPaths: [] };
+    }
+    const committedDiff = await git2(repo, [
+      "diff",
+      "--name-only",
+      `${normalizedBaselineSha}..${sha2}`
+    ]);
+    if (!committedDiff.ok) {
+      throw new CandidateCheckpointError("diff", committedDiff.stderr || committedDiff.stdout || `git diff exited ${committedDiff.exitCode}`, candidateState);
+    }
+    const committedPaths = publishableChangedPaths(parseChangedPathsFromNameOnlyOutput(committedDiff.stdout));
+    if (committedPaths.length === 0)
+      return { ...candidateState, changedPaths: [] };
+    return retainSha(sha2, committedPaths);
+  }
+  const stage = await git2(repo, ["add", "-A", "--", ...changedPaths]);
+  if (!stage.ok) {
+    throw new CandidateCheckpointError("stage", stage.stderr || stage.stdout || `git add exited ${stage.exitCode}`, { ...candidateState, changedPaths });
+  }
+  const staged = await git2(repo, ["diff", "--cached", "--quiet"]);
+  if (staged.ok)
+    return { ...candidateState, changedPaths };
+  if (staged.exitCode !== 1) {
+    throw new CandidateCheckpointError("diff", staged.stderr || staged.stdout || `git diff --cached exited ${staged.exitCode}`, { ...candidateState, changedPaths });
+  }
+  const identity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
+  const commit = await git2(repo, buildGitCommitArgs2(`checkpoint(worker): retain ${candidateState.status} candidate for ${job.id}`, identity));
+  if (!commit.ok) {
+    throw new CandidateCheckpointError("commit", commit.stderr || commit.stdout || `git commit exited ${commit.exitCode}`, { ...candidateState, changedPaths });
+  }
+  const shaResult = await git2(repo, ["rev-parse", "HEAD"]);
+  if (!shaResult.ok) {
+    throw new CandidateCheckpointError("resolve", shaResult.stderr || shaResult.stdout || `git rev-parse exited ${shaResult.exitCode}`, { ...candidateState, changedPaths });
+  }
+  const sha = shaResult.stdout.trim();
+  return retainSha(sha, changedPaths);
+}
 function buildPublishBlockedCommitResult(options) {
   return {
     ok: false,
@@ -12627,7 +13324,12 @@ function buildPublishBlockedCommitResult(options) {
     }
   };
 }
-async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONFIG3) {
+async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONFIG3, deadlineLedger) {
+  if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
+    return workerGitDeadlineContext.run(deadlineLedger, () => createJobCommit(repo, workerId, job, runtimeConfig));
+  }
+  let finalizationUsageAttempts = [];
+  const finish = (result) => attachCommitFinalizationUsage(result, finalizationUsageAttempts);
   const configuredBranchPrefix = normalizeReviewBranchPrefix(runtimeConfig.sourceControlManager.branchPrefix) ?? "agent/";
   const defaultPublicBranchName = `${configuredBranchPrefix}${workerId}/${job.id}`;
   const resolvedPublicBranch = resolveJobCompletionBranch(job.params, defaultPublicBranchName, configuredBranchPrefix);
@@ -12701,12 +13403,14 @@ async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONF
       ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
       ...loadRequiredValidationStepsFromVision(repo)
     ];
-    const llmCommitMsg = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff }) ? await generateCommitMessageFromDiff(diff, {
+    const commitMessageGeneration = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff }) ? await generateCommitMessageFromDiff(diff, {
       instruction: String(job.params?.instruction ?? ""),
       type: normalizeCommitType(job.kind, job.params),
       area: inferCommitArea(job.kind, job.params, changedPaths),
       validationSteps: jobValidationSteps
     }, repo, runtimeConfig).catch(() => null) : null;
+    finalizationUsageAttempts = commitMessageGeneration?.usageAttempts ?? [];
+    const llmCommitMsg = commitMessageGeneration?.message ?? null;
     if (!llmCommitMsg) {
       console.warn(`[WorkerPals] Commit message generator unavailable for job ${job.id}; using deterministic fallback.`);
     }
@@ -12714,21 +13418,21 @@ async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONF
     const commitIdentity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
     result = await git2(repo, buildGitCommitArgs2(commitMsg, commitIdentity));
     if (!result.ok) {
-      return { ok: false, error: `Failed to commit: ${result.stderr}` };
+      return finish({ ok: false, error: `Failed to commit: ${result.stderr}` });
     }
     result = await git2(repo, ["rev-parse", "HEAD"]);
     if (!result.ok) {
-      return { ok: false, error: `Failed to get commit SHA: ${result.stderr}` };
+      return finish({ ok: false, error: `Failed to get commit SHA: ${result.stderr}` });
     }
     let sha = result.stdout;
     result = await git2(repo, ["update-ref", hiddenCommitRef, sha]);
     if (!result.ok) {
-      return { ok: false, error: `Failed to store worker commit ref: ${result.stderr}` };
+      return finish({ ok: false, error: `Failed to store worker commit ref: ${result.stderr}` });
     }
     hiddenRefCreated = true;
     if (reviewFixContext) {
       console.log(`[WorkerPals] Retained immutable review-fix completion ${hiddenCommitRef} in the shared host repository; SourceControlManager owns publication to ${publicBranchName}.`);
-      return { ok: true, branch: hiddenCommitRef, publicBranch: publicBranchName, sha };
+      return finish({ ok: true, branch: hiddenCommitRef, publicBranch: publicBranchName, sha });
     }
     if (pushAgentBranch) {
       const maxPushAttempts = 3;
@@ -12738,14 +13442,14 @@ async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONF
         const sync = await syncHiddenRefWithRemoteBranchByRebase(repo, hiddenCommitRef, publicBranchName, job.id);
         if (!sync.ok) {
           pushError = `Failed to sync branch before push: ${redactSensitiveText(sync.error)}`;
-          return buildPublishBlockedCommitResult({
+          return finish(buildPublishBlockedCommitResult({
             summary: `Failed to sync and push ${job.kind} commit`,
             detail: pushError,
             publicBranch: publicBranchName,
             localRef: hiddenCommitRef,
             sha,
             stage: "sync"
-          });
+          }));
         }
         sha = sync.sha;
         result = await git2(repo, [
@@ -12767,28 +13471,28 @@ async function createJobCommit(repo, workerId, job, runtimeConfig = DEFAULT_CONF
       }
       if (!pushed) {
         if (requirePush) {
-          return buildPublishBlockedCommitResult({
+          return finish(buildPublishBlockedCommitResult({
             summary: `Failed to sync and push ${job.kind} commit`,
             detail: pushError || `Failed to push ${publicBranchName}`,
             publicBranch: publicBranchName,
             localRef: hiddenCommitRef,
             sha,
             stage: "push"
-          });
+          }));
         }
         console.warn(`[WorkerPals] ${pushError}. Continuing with local commit ref only (set WORKERPALS_REQUIRE_PUSH=1 to enforce push).`);
-        return { ok: true, branch: completionRef, publicBranch: publicBranchName, sha };
+        return finish({ ok: true, branch: completionRef, publicBranch: publicBranchName, sha });
       }
     } else {
       console.log(`[WorkerPals] Skipping push for ${publicBranchName} (WORKERPALS_PUSH_AGENT_BRANCH is disabled).`);
     }
     console.log(`[WorkerPals] Created commit ${sha} on ref ${completionRef}`);
-    return { ok: true, branch: completionRef, publicBranch: publicBranchName, sha };
+    return finish({ ok: true, branch: completionRef, publicBranch: publicBranchName, sha });
   } catch (err) {
     if (hiddenRefCreated) {
       await git2(repo, ["update-ref", "-d", hiddenCommitRef]);
     }
-    return { ok: false, error: String(err) };
+    return finish({ ok: false, error: String(err) });
   }
 }
 function toPath(value) {
@@ -13242,8 +13946,20 @@ async function activeGitOperation(repo) {
     return "cherry-pick";
   return null;
 }
-async function resumePreparedMergeConflictRebase(repo, kind, params, onLog) {
+async function resumePreparedMergeConflictRebase(repo, kind, params, onLog, deadlineLedger) {
+  if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
+    return workerGitDeadlineContext.run(deadlineLedger, () => resumePreparedMergeConflictRebase(repo, kind, params, onLog));
+  }
+  const activeDeadlineLedger = deadlineLedger ?? workerGitDeadlineContext.getStore();
+  const deadlineFailure = () => ({
+    ok: false,
+    error: "Prepared merge-conflict rebase stopped because the absolute job work deadline expired."
+  });
+  if (activeDeadlineLedger?.workExpired())
+    return deadlineFailure();
   const sequencer = await activeGitOperation(repo);
+  if (activeDeadlineLedger?.workExpired())
+    return deadlineFailure();
   if (sequencer !== "rebase") {
     return { ok: true, resumed: false, sequencer };
   }
@@ -13400,6 +14116,8 @@ async function refreshMergeConflictTrackingRefs(repo, publicBranchName, baseBran
   return { ok: true };
 }
 async function createMergeConflictJobCommit(repo, workerId, job, publicBranchName, runtimeConfig) {
+  let finalizationUsageAttempts = [];
+  const finish = (result2) => attachCommitFinalizationUsage(result2, finalizationUsageAttempts);
   const mergeConflictContext = extractMergeConflictReviewContext(job.params ?? null);
   if (!mergeConflictContext) {
     return { ok: false, error: "Merge-conflict context is missing required branch metadata." };
@@ -13475,12 +14193,14 @@ async function createMergeConflictJobCommit(repo, workerId, job, publicBranchNam
       ...toNonEmptyStringArray(jobPlanning?.requiredValidationSteps),
       ...loadRequiredValidationStepsFromVision(repo)
     ];
-    const llmCommitMsg = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff }) ? await generateCommitMessageFromDiff(diff, {
+    const commitMessageGeneration = shouldUseLlmCommitMessageForStagedDiff({ changedPaths, diff }) ? await generateCommitMessageFromDiff(diff, {
       instruction: String(job.params?.instruction ?? ""),
       type: normalizeCommitType(job.kind, job.params),
       area: inferCommitArea(job.kind, job.params, changedPaths),
       validationSteps: jobValidationSteps
     }, repo, runtimeConfig).catch(() => null) : null;
+    finalizationUsageAttempts = commitMessageGeneration?.usageAttempts ?? [];
+    const llmCommitMsg = commitMessageGeneration?.message ?? null;
     if (!llmCommitMsg) {
       console.warn(`[WorkerPals] Commit message generator unavailable for merge-conflict job ${job.id}; using deterministic fallback.`);
     }
@@ -13488,38 +14208,41 @@ async function createMergeConflictJobCommit(repo, workerId, job, publicBranchNam
     const commitIdentity = await resolveWorkerCommitIdentity(repo, runtimeConfig);
     const commit = await git2(repo, buildGitCommitArgs2(commitMsg, commitIdentity));
     if (!commit.ok) {
-      return { ok: false, error: `Failed to commit merge-conflict resolution: ${commit.stderr}` };
+      return finish({
+        ok: false,
+        error: `Failed to commit merge-conflict resolution: ${commit.stderr}`
+      });
     }
     headSha = await currentRefSha(repo, "HEAD");
     if (!headSha) {
-      return {
+      return finish({
         ok: false,
         error: `Failed to resolve committed HEAD SHA for merge-conflict job ${job.id}.`
-      };
+      });
     }
   }
   const baseRemoteRef = `refs/remotes/origin/${mergeConflictContext.baseBranch}`;
   const rebasedOntoBase = await isAncestorRef(repo, baseRemoteRef, "HEAD");
   if (!rebasedOntoBase) {
-    return {
+    return finish({
       ok: false,
       error: `Merge-conflict job ${job.id} did not finish rebased onto origin/${mergeConflictContext.baseBranch}. Detached host worktree HEAD must be a descendant of ${baseRemoteRef} before WorkerPals can hand it to SourceControlManager.`
-    };
+    });
   }
   const hiddenCompletionRef = `refs/pushpals/review/${workerId}/${job.id}`;
   const retain = await git2(repo, ["update-ref", hiddenCompletionRef, headSha]);
   if (!retain.ok) {
-    return {
+    return finish({
       ok: false,
       error: `Failed to retain rebased merge-conflict commit for SourceControlManager: ${combinedGitOutput(retain)}`
-    };
+    });
   }
-  return {
+  return finish({
     ok: true,
     branch: hiddenCompletionRef,
     publicBranch: publicBranchName,
     sha: headSha
-  };
+  });
 }
 async function autoResolveRebaseConflicts(repo, maxPasses = 8) {
   for (let pass = 1;pass <= maxPasses; pass++) {
@@ -13891,6 +14614,22 @@ function normalizeCodexReasoningEffort(value, model = "") {
   }
   return defaultEffort;
 }
+function estimatedCommitMessageUsageAttempt(options) {
+  const promptTokens = Math.max(1, Math.ceil(Math.max(0, options.promptChars) / 3));
+  const completionTokens = Math.max(0, Math.ceil(Math.max(0, options.completionChars ?? 0) / 3));
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    estimated: true,
+    backend: options.backend,
+    ...options.modelId ? { modelId: options.modelId } : {},
+    stage: "finalization",
+    source: options.backend,
+    attempt: 1,
+    ...options.timedOut === true ? { timedOut: true } : {}
+  };
+}
 async function generateCommitMessageFromDiff(diff, opts, repo, runtimeConfig) {
   const prompt = buildCommitMessageGeneratorPrompt(diff, opts);
   if (!prompt)
@@ -13898,7 +14637,7 @@ async function generateCommitMessageFromDiff(diff, opts, repo, runtimeConfig) {
   if (shouldUseCodexCliForExecutor(resolveExecutor(runtimeConfig))) {
     return generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtimeConfig);
   }
-  return generateCommitMessageFromDiffViaHttp(prompt, opts, runtimeConfig);
+  return generateCommitMessageFromDiffViaHttpWithUsage(prompt, opts, runtimeConfig);
 }
 function resolveCommitMessageGeneratorTimeoutMs(runtimeConfig = DEFAULT_CONFIG3) {
   const workerpalsConfig = runtimeConfig.workerpals;
@@ -13934,10 +14673,14 @@ async function generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtime
   const model = runtimeConfig.workerpals.llm.model.trim();
   if (!model)
     return null;
-  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
+  const finalizationLedger = workerGitDeadlineContext.getStore();
+  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin, finalizationLedger);
   if (!codexPrefix)
     return null;
-  const timeoutMs = resolveCommitMessageGeneratorTimeoutMs(runtimeConfig);
+  const configuredTimeoutMs = resolveCommitMessageGeneratorTimeoutMs(runtimeConfig);
+  const timeoutMs = finalizationLedger ? finalizationLedger.capTotalTimeout(configuredTimeoutMs) : configuredTimeoutMs;
+  if (timeoutMs <= 0)
+    return null;
   const reasoningEffort = normalizeCodexReasoningEffort(runtimeConfig.workerpals.llm.reasoningEffort, model);
   const tmpOutputPath = resolve11(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
   const cmd = [
@@ -13959,10 +14702,12 @@ async function generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtime
   cmd.push("-");
   const env = buildWorkerSandboxWritableEnv(repo);
   const codexMask = maskRepoLocalCodexFilesForCodexCli(repo, env);
-  try {
-    const stdinText = `${prompt.systemPrompt}
+  const stdinText = `${prompt.systemPrompt}
 
 ${prompt.userMessage}`;
+  let callStarted = false;
+  try {
+    callStarted = true;
     const processResult = await runBoundedProcess(cmd, {
       cwd: repo,
       env,
@@ -13971,9 +14716,6 @@ ${prompt.userMessage}`;
       outputLimitBytes: 524288,
       retainOutputTail: true
     });
-    if (processResult.timedOut || processResult.drainTimedOut || processResult.exitCode !== 0) {
-      return null;
-    }
     let content = "";
     try {
       content = readFileSync8(tmpOutputPath, "utf8").trim();
@@ -13983,12 +14725,29 @@ ${prompt.userMessage}`;
     if (!content) {
       content = processResult.stdout.trim();
     }
-    if (!content)
-      return null;
-    const clean = sanitizeGeneratedCommitMessage(content, opts.type, opts.area);
-    return clean;
+    const usageAttempt = estimatedCommitMessageUsageAttempt({
+      promptChars: stdinText.length,
+      completionChars: content.length + processResult.stderr.length,
+      backend: "commit_message_codex",
+      modelId: model,
+      timedOut: processResult.timedOut || processResult.drainTimedOut
+    });
+    if (processResult.timedOut || processResult.drainTimedOut || processResult.exitCode !== 0) {
+      return { message: null, usageAttempts: [usageAttempt] };
+    }
+    const clean = content ? sanitizeGeneratedCommitMessage(content, opts.type, opts.area) : null;
+    return { message: clean, usageAttempts: [usageAttempt] };
   } catch {
-    return null;
+    return callStarted ? {
+      message: null,
+      usageAttempts: [
+        estimatedCommitMessageUsageAttempt({
+          promptChars: stdinText.length,
+          backend: "commit_message_codex",
+          modelId: model
+        })
+      ]
+    } : null;
   } finally {
     restoreRepoLocalCodexFilesForCodexCli(codexMask);
     try {
@@ -13996,7 +14755,7 @@ ${prompt.userMessage}`;
     } catch {}
   }
 }
-async function generateCommitMessageFromDiffViaHttp(prompt, opts, runtimeConfig, requestOptions = {}) {
+async function generateCommitMessageFromDiffViaHttpWithUsage(prompt, opts, runtimeConfig, requestOptions = {}) {
   const endpoint = normalizeChatCompletionsEndpoint(runtimeConfig.workerpals.llm.endpoint);
   const model = runtimeConfig.workerpals.llm.model.trim();
   if (!endpoint || !model)
@@ -14005,7 +14764,11 @@ async function generateCommitMessageFromDiffViaHttp(prompt, opts, runtimeConfig,
   const headers = { "Content-Type": "application/json" };
   if (apiKey)
     headers.Authorization = `Bearer ${apiKey}`;
-  const timeoutMs = Math.max(1, Math.floor(requestOptions.timeoutMs ?? resolveCommitMessageGeneratorTimeoutMs(runtimeConfig)));
+  const configuredTimeoutMs = Math.max(1, Math.floor(requestOptions.timeoutMs ?? resolveCommitMessageGeneratorTimeoutMs(runtimeConfig)));
+  const finalizationLedger = workerGitDeadlineContext.getStore();
+  const timeoutMs = finalizationLedger ? finalizationLedger.capTotalTimeout(configuredTimeoutMs) : configuredTimeoutMs;
+  if (timeoutMs <= 0)
+    return null;
   try {
     const response = await fetchBufferedWithHardDeadline({
       input: endpoint,
@@ -14026,21 +14789,37 @@ async function generateCommitMessageFromDiffViaHttp(prompt, opts, runtimeConfig,
       fetchImpl: requestOptions.fetchFn,
       timeoutMessage: `commit-message HTTP request timed out after ${timeoutMs}ms`
     });
+    const responseText = await response.text();
+    const fallbackUsage = estimatedCommitMessageUsageAttempt({
+      promptChars: prompt.systemPrompt.length + prompt.userMessage.length,
+      completionChars: responseText.length,
+      backend: "commit_message_http",
+      modelId: model
+    });
     if (!response.ok)
-      return null;
-    const payload = parseJsonObjectLoose(await response.text());
+      return { message: null, usageAttempts: [fallbackUsage] };
+    const payload = parseJsonObjectLoose(responseText);
+    const usageAttempt = exactHttpUsageAttempt(payload, fallbackUsage);
     if (!payload)
-      return null;
+      return { message: null, usageAttempts: [usageAttempt] };
     const choices = Array.isArray(payload.choices) ? payload.choices : [];
     const content = String(choices[0]?.message?.content ?? "").trim();
     if (!content)
-      return null;
+      return { message: null, usageAttempts: [usageAttempt] };
     const clean = sanitizeGeneratedCommitMessage(content, opts.type, opts.area);
-    if (!clean)
-      return null;
-    return clean;
-  } catch {
-    return null;
+    return { message: clean, usageAttempts: [usageAttempt] };
+  } catch (error) {
+    return {
+      message: null,
+      usageAttempts: [
+        estimatedCommitMessageUsageAttempt({
+          promptChars: prompt.systemPrompt.length + prompt.userMessage.length,
+          backend: "commit_message_http",
+          modelId: model,
+          timedOut: /timed out|deadline/i.test(String(error))
+        })
+      ]
+    };
   }
 }
 function buildCommitMessageGeneratorUserMessage(instruction, validationSteps, diff) {
@@ -14409,13 +15188,13 @@ function validateTaskExecutePlanning(value, options) {
   return { ok: true };
 }
 var cachedCodexCommandPrefix = new Map;
-async function canExecuteCodexCommandCandidate(repo, candidate) {
-  if (candidate.length === 0)
+async function canExecuteCodexCommandCandidate(repo, candidate, timeoutMs = 15000) {
+  if (candidate.length === 0 || timeoutMs <= 0)
     return false;
   try {
     const result = await runBoundedProcess([...candidate, "--version"], {
       cwd: repo,
-      timeoutMs: 15000,
+      timeoutMs,
       outputLimitBytes: 65536
     });
     return !result.timedOut && !result.drainTimedOut && result.exitCode === 0;
@@ -14423,7 +15202,7 @@ async function canExecuteCodexCommandCandidate(repo, candidate) {
     return false;
   }
 }
-async function resolveCodexCommandPrefix(repo, configuredCommand = "") {
+async function resolveCodexCommandPrefix(repo, configuredCommand = "", deadlineLedger) {
   const cacheKey = `${repo}\x00${configuredCommand.trim()}`;
   const cached = cachedCodexCommandPrefix.get(cacheKey);
   if (cached)
@@ -14436,32 +15215,62 @@ async function resolveCodexCommandPrefix(repo, configuredCommand = "") {
   candidates.push(["bunx", "--yes", "@openai/codex"]);
   candidates.push(["codex"]);
   for (const candidate of candidates) {
-    if (await canExecuteCodexCommandCandidate(repo, candidate)) {
+    const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(15000) : 15000;
+    if (timeoutMs <= 0)
+      return null;
+    if (await canExecuteCodexCommandCandidate(repo, candidate, timeoutMs)) {
       cachedCodexCommandPrefix.set(cacheKey, [...candidate]);
       return candidate;
     }
   }
   return null;
 }
-async function runCodexCriticReview(repo, params, quality, runtimeConfig, onLog) {
-  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
+async function runCodexCriticReview(repo, params, quality, runtimeConfig, onLog, deadlineLedger) {
+  const configuredCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  if (deadlineLedger && deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs) <= 0) {
+    return {
+      kind: "timeout",
+      reason: "job deadline expired before the Codex critic could start",
+      usageAttempts: []
+    };
+  }
+  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin, deadlineLedger);
   if (!codexPrefix) {
+    if (deadlineLedger?.workExpired()) {
+      return {
+        kind: "timeout",
+        reason: "job deadline expired while resolving the Codex critic executable",
+        usageAttempts: []
+      };
+    }
     onLog?.("stderr", "[CriticGate] Codex: unable to resolve Codex CLI command (workerpals.llm.codex_bin/PATH); skipping.");
-    return null;
+    return {
+      kind: "unavailable",
+      reason: "Codex critic executable is unavailable",
+      usageAttempts: []
+    };
   }
   const instruction = String(params.instruction ?? "").trim();
   const planning = params.planning;
-  const qualityCriticTimeoutMs = resolveQualityCriticTimeoutMs(runtimeConfig);
+  const qualityCriticTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs) : configuredCriticTimeoutMs;
+  if (qualityCriticTimeoutMs <= 0) {
+    return {
+      kind: "timeout",
+      reason: "job deadline expired before the Codex critic could start",
+      usageAttempts: []
+    };
+  }
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
+  const usageAttempts = [];
   const criticModel = resolveQualityCriticModel(runtimeConfig);
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
   const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
   const buildCriticInstruction = async (compact) => {
     const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff);
+    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(0, resolveQualityCriticMaxDiffChars(runtimeConfig, compact));
     const validationSummary = buildCriticValidationSummary(quality, resolveQualityCriticMaxValidationOutputChars(runtimeConfig, compact));
-    const criticInstruction = loadPromptTemplate("workerpals/codex_quality_critic_instruction_prompt.md", {
+    const criticInstructionBase = loadPromptTemplate("workerpals/codex_quality_critic_instruction_prompt.md", {
       instruction,
       acceptance_criteria: planning.acceptanceCriteria.map((c) => `- ${c}`).join(`
 `) || "- (none)",
@@ -14474,6 +15283,9 @@ ${validationSummary}` : "Validation: (none)",
       final_reviewer_rubric: reviewContext.finalReviewerRubric,
       prior_review_context: reviewContext.priorReviewContext
     });
+    const criticInstruction = `${criticInstructionBase}
+
+Evidence contract: Every finding or must_fix claim about tests, validation, command output, pass/fail counts, or exit status MUST cite an exact Evidence ID from the validation section as [evidence:validation:...]. Omit claims that have no evidence ID.`;
     return {
       criticInstruction,
       promptChars: criticInstruction.length,
@@ -14510,20 +15322,32 @@ ${validationSummary}` : "Validation: (none)",
       unlinkSync(tmpOutputPath);
     } catch {}
     const payload = payloadOverride ?? await buildCriticInstruction(compact);
+    const attemptTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(configuredCriticTimeoutMs) : qualityCriticTimeoutMs;
+    if (attemptTimeoutMs <= 0) {
+      return { status: "timeout", payload };
+    }
     const startedAt = Date.now();
     onLog?.("stdout", `[CriticGate] Codex review attempt ${attempt}${compact ? " (compact)" : ""}: model=${criticModel || "(codex default)"} timeout_ms=${qualityCriticTimeoutMs} behavior=${timeoutBehavior} prompt_chars=${payload.promptChars} prompt_bytes=${payload.promptBytes} diff_chars=${payload.diffChars} validation_chars=${payload.validationChars}`);
     const processResult = await runBoundedProcess(buildCmd(), {
       cwd: repo,
       env,
       stdin: new Blob([payload.criticInstruction]),
-      timeoutMs: qualityCriticTimeoutMs,
+      timeoutMs: attemptTimeoutMs,
       outputLimitBytes: 524288,
       retainOutputTail: true
     });
-    if (processResult.timedOut) {
+    usageAttempts.push(estimatedCriticUsageAttempt({
+      promptChars: payload.promptChars,
+      completionChars: processResult.stdout.length + processResult.stderr.length,
+      backend: "quality_critic_codex",
+      modelId: criticModel || undefined,
+      attempt,
+      timedOut: processResult.timedOut || processResult.drainTimedOut
+    }));
+    if (processResult.timedOut || processResult.drainTimedOut) {
       return { status: "timeout", payload };
     }
-    if (processResult.drainTimedOut || processResult.exitCode !== 0) {
+    if (processResult.exitCode !== 0) {
       onLog?.("stderr", `[CriticGate] Codex exited ${processResult.exitCode}: ${toSingleLine(processResult.stderr, 220)}`);
       return { status: "done", review: null, payload };
     }
@@ -14552,13 +15376,13 @@ ${validationSummary}` : "Validation: (none)",
     return {
       status: "done",
       payload,
-      review: {
+      review: enforceCriticEvidenceProvenance({
         score,
         findings,
         mustFix,
         revisionGuidance,
         raw: compactJobOutput(lastMessage, outputPolicyForRuntime(runtimeConfig))
-      }
+      }, quality)
     };
   };
   try {
@@ -14578,21 +15402,32 @@ ${validationSummary}` : "Validation: (none)",
       } else {
         const reductionPct = Math.max(0, Math.round((1 - compactPayload.promptChars / Math.max(1, attempt.payload.promptChars)) * 100));
         onLog?.("stderr", `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; compact critic input only reduced prompt by ${reductionPct}% after clean validation; skipping retry.`);
-        return null;
+        return {
+          kind: "timeout",
+          reason: `Codex critic timed out after ${qualityCriticTimeoutMs}ms and compact retry was not viable`,
+          usageAttempts
+        };
       }
     }
     if (attempt.status === "timeout") {
-      if (timeoutBehavior === "block") {
-        onLog?.("stderr", `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; blocking because quality_critic_timeout_behavior=block.`);
-        return criticTimeoutReview("Codex", qualityCriticTimeoutMs, qualityCriticTimeoutMs);
-      }
-      onLog?.("stderr", `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; skipping.`);
-      return null;
+      onLog?.("stderr", `[CriticGate] Codex timed out after ${qualityCriticTimeoutMs}ms; retaining the candidate (${timeoutBehavior}).`);
+      return {
+        kind: "timeout",
+        reason: `Codex critic timed out after ${qualityCriticTimeoutMs}ms`,
+        usageAttempts
+      };
     }
-    return attempt.review;
+    if (!attempt.review) {
+      return { kind: "invalid", reason: "Codex critic returned no usable verdict", usageAttempts };
+    }
+    return { kind: "verdict", review: attempt.review, usageAttempts };
   } catch (err) {
     onLog?.("stderr", `[CriticGate] Codex error: ${toSingleLine(err, 220)} (skipping).`);
-    return null;
+    return {
+      kind: "unavailable",
+      reason: toSingleLine(err, 220),
+      usageAttempts
+    };
   } finally {
     restoreRepoLocalCodexFilesForCodexCli(codexMask);
     try {
@@ -14600,7 +15435,26 @@ ${validationSummary}` : "Validation: (none)",
     } catch {}
   }
 }
-async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CONFIG3) {
+function enforceJobDeadlineBeforeSuccess(result, deadlineLedger, changedPaths = []) {
+  if (!result.ok || !deadlineLedger.workExpired())
+    return result;
+  const detail = "The shared execution budget expired before the quality loop produced its terminal result; the finalization reserve cannot turn a late result into ordinary success.";
+  return {
+    ...result,
+    ok: false,
+    summary: "Job reached its absolute deadline before quality completion",
+    stderr: [result.stderr, detail].filter(Boolean).join(`
+`),
+    exitCode: 124,
+    candidateState: {
+      ...result.candidateState ?? {},
+      status: "partial",
+      reason: "absolute_job_deadline",
+      changedPaths: publishableChangedPaths(result.candidateState?.changedPaths?.length ? result.candidateState.changedPaths : changedPaths)
+    }
+  };
+}
+async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CONFIG3, deadlineLedgerOverride) {
   if (!SUPPORTED_JOB_KINDS.has(kind)) {
     return {
       ok: false,
@@ -14686,7 +15540,23 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
   }
   let revisionAttempt = 0;
   let revisionHint = "";
-  const jobStartedAt = Date.now();
+  const jobStartedAt = deadlineLedgerOverride?.startedAtMs ?? Date.now();
+  const deadlineLedger = deadlineLedgerOverride ?? new JobDeadlineLedger({
+    executionBudgetMs,
+    finalizationBudgetMs,
+    startedAtMs: jobStartedAt
+  });
+  const usageAccumulator = new UsageAccumulator;
+  const finalizeResult = (terminalResult) => usageAccumulator.apply({
+    ...terminalResult,
+    diagnostics: {
+      ...terminalResult.diagnostics ?? {},
+      metadata: {
+        ...terminalResult.diagnostics?.metadata ?? {},
+        jobDeadline: deadlineLedger.snapshot()
+      }
+    }
+  });
   const previousValidationFailureDigests = new Map;
   const passingValidationCache = new Map;
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
@@ -14702,29 +15572,66 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
       attemptParams.qualityRevisionAttempt = revisionAttempt;
     }
     const executor = resolveExecutor(runtimeConfig);
-    const defaultExecuteBudgets = nextQualityRevisionExecuteBudgets ?? {
+    const requestedExecuteBudgets = nextQualityRevisionExecuteBudgets ?? {
       executionBudgetMs,
       finalizationBudgetMs
     };
     nextQualityRevisionExecuteBudgets = null;
+    const defaultExecuteBudgets = deadlineLedger.executorBudgets(requestedExecuteBudgets.executionBudgetMs, requestedExecuteBudgets.finalizationBudgetMs);
+    if (!defaultExecuteBudgets) {
+      const changed = await git2(repo, ["status", "--porcelain"], deadlineLedger, "total");
+      const changedPaths = changed.ok ? publishableChangedPaths(parseChangedPathsFromStatus(changed.stdout)) : [];
+      return finalizeResult({
+        ok: false,
+        summary: "Job deadline reached before another quality revision could start",
+        stderr: "The absolute execution deadline was exhausted. Any publishable candidate must be checkpointed before worktree cleanup.",
+        exitCode: 124,
+        ...changedPaths.length > 0 ? {
+          candidateState: {
+            status: "partial",
+            reason: "absolute_job_deadline",
+            changedPaths
+          }
+        } : {}
+      });
+    }
     const runExecutor = getBackendTaskExecutor(executor);
     if (!runExecutor) {
-      return {
+      return finalizeResult({
         ok: false,
         summary: `No task executor registered for backend "${executor}"`,
         exitCode: 1
-      };
+      });
     }
     let result = null;
     let mergeConflictPass = 0;
     let executorElapsedMs = 0;
     let nextMergeConflictExecuteBudgets = null;
     while (true) {
-      const currentExecuteBudgets = nextMergeConflictExecuteBudgets ?? defaultExecuteBudgets;
+      const requestedMergeBudgets = nextMergeConflictExecuteBudgets ?? defaultExecuteBudgets;
       nextMergeConflictExecuteBudgets = null;
+      const currentExecuteBudgets = deadlineLedger.executorBudgets(requestedMergeBudgets.executionBudgetMs, requestedMergeBudgets.finalizationBudgetMs);
+      if (!currentExecuteBudgets) {
+        return finalizeResult({
+          ok: false,
+          summary: "Job deadline reached during merge-conflict recovery",
+          exitCode: 124
+        });
+      }
       const currentResult = await runExecutor(kind, attemptParams, repo, runtimeConfig, onLog, currentExecuteBudgets);
+      if ((currentResult.usageAttempts?.length ?? 0) > 0) {
+        usageAccumulator.addAttempts(currentResult.usageAttempts);
+      } else {
+        usageAccumulator.add(currentResult.usage, {
+          stage: mergeConflictPass > 0 ? "executor_recovery" : "executor",
+          attempt: revisionAttempt * 10 + mergeConflictPass + 1,
+          source: executor,
+          timedOut: currentResult.exitCode === 124 || /\btimed out\b/i.test(`${currentResult.summary}
+${currentResult.stderr ?? ""}`)
+        });
+      }
       if (!currentResult.ok)
-        return currentResult;
+        return finalizeResult(currentResult);
       result = currentResult;
       if (!mergeConflictContext)
         break;
@@ -14732,17 +15639,35 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
         onLog?.("stdout", "[MergeConflict] Container editing pass complete; host-side SCM will stage and continue the prepared rebase.");
         break;
       }
-      const resume = await resumePreparedMergeConflictRebase(repo, kind, attemptParams, onLog);
+      const resume = await resumePreparedMergeConflictRebase(repo, kind, attemptParams, onLog, deadlineLedger);
+      if (deadlineLedger.workExpired()) {
+        return finalizeResult({
+          ok: false,
+          summary: "Job deadline reached during merge-conflict rebase continuation",
+          stdout: currentResult.stdout,
+          stderr: [
+            currentResult.stderr ?? "",
+            "The shared work budget expired while host-side Git inspected or advanced the prepared rebase."
+          ].filter(Boolean).join(`
+`),
+          exitCode: 124,
+          candidateState: {
+            status: "partial",
+            reason: "absolute_job_deadline",
+            changedPaths: []
+          }
+        });
+      }
       if (!resume.ok) {
         onLog?.("stderr", `[MergeConflict] ${resume.error}`);
-        return {
+        return finalizeResult({
           ok: false,
           summary: "Merge-conflict rebase continuation failed",
           stdout: currentResult.stdout,
           stderr: [currentResult.stderr ?? "", resume.error].filter(Boolean).join(`
 `),
           exitCode: 4
-        };
+        });
       }
       const sequencer = resume.sequencer;
       if (!sequencer)
@@ -14752,14 +15677,14 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
         if (mergeConflictPass >= MAX_MERGE_CONFLICT_RESOLUTION_PASSES) {
           const detail2 = `Merge-conflict rebase required more than ${MAX_MERGE_CONFLICT_RESOLUTION_PASSES} resolver passes. Stopping to avoid an infinite conflict-resolution loop.`;
           onLog?.("stderr", `[MergeConflict] ${detail2}`);
-          return {
+          return finalizeResult({
             ok: false,
             summary: detail2,
             stdout: currentResult.stdout,
             stderr: [currentResult.stderr ?? "", resume.detail ?? detail2].filter(Boolean).join(`
 `),
             exitCode: 4
-          };
+          });
         }
         const retryBudget = mergeConflictResolverRetryBudgetDecision({
           jobElapsedMs: Date.now() - attemptStartedAt,
@@ -14769,14 +15694,14 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
         if (!retryBudget.shouldStart) {
           const detail2 = `Merge-conflict rebase advanced into another conflicted commit, but remaining job budget is ${retryBudget.remainingTotalBudgetMs}ms (< ${retryBudget.minimumExecutionBudgetMs}ms execution).`;
           onLog?.("stderr", `[MergeConflict] ${detail2}`);
-          return {
+          return finalizeResult({
             ok: false,
             summary: detail2,
             stdout: currentResult.stdout,
             stderr: [currentResult.stderr ?? "", resume.detail ?? detail2].filter(Boolean).join(`
 `),
             exitCode: 4
-          };
+          });
         }
         nextMergeConflictExecuteBudgets = {
           executionBudgetMs: retryBudget.executionBudgetMs,
@@ -14819,26 +15744,26 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
       }
       const detail = `Merge-conflict job returned with git ${sequencer} still in progress. Finish the ${sequencer} before returning control to WorkerPals.`;
       onLog?.("stderr", `[MergeConflict] ${detail}`);
-      return {
+      return finalizeResult({
         ok: false,
         summary: detail,
         stdout: currentResult.stdout,
         stderr: [currentResult.stderr ?? "", detail].filter(Boolean).join(`
 `),
         exitCode: 4
-      };
+      });
     }
     if (!result) {
-      return {
+      return finalizeResult({
         ok: false,
         summary: "Merge-conflict execution ended without an executor result.",
         exitCode: 4
-      };
+      });
     }
     executorElapsedMs = Date.now() - attemptStartedAt;
-    const preQualityStatus = await git2(repo, ["status", "--porcelain"]);
+    const preQualityStatus = await git2(repo, ["status", "--porcelain"], deadlineLedger, "work");
     const rawPreQualityChangedPaths = preQualityStatus.ok ? expandKnownArtifactDirectoryPaths(repo, parseChangedPathsFromStatus(preQualityStatus.stdout)) : [];
-    const preQualityChangedPaths = preQualityStatus.ok ? await filterChangedPathsByGitContentDelta(repo, rawPreQualityChangedPaths) : rawPreQualityChangedPaths;
+    const preQualityChangedPaths = preQualityStatus.ok ? await filterChangedPathsByGitContentDelta(repo, rawPreQualityChangedPaths, deadlineLedger) : rawPreQualityChangedPaths;
     const preQualityPublishablePaths = publishableChangedPaths(preQualityChangedPaths);
     if (preQualityChangedPaths.length > 0) {
       diagnosticPatchSnapshots.push(buildPatchSnapshotDiagnostics(preQualityChangedPaths, revisionAttempt, "executor"));
@@ -14858,7 +15783,7 @@ ${result.stderr ?? ""}`;
 `),
         exitCode: 4
       };
-      return withJobDiagnostics(failure, {
+      return finalizeResult(withJobDiagnostics(failure, {
         terminal: buildTerminalDiagnostics({
           result: failure,
           executor,
@@ -14868,7 +15793,7 @@ ${result.stderr ?? ""}`;
           metadata: { revisionAttempt, executorElapsedMs }
         }),
         patchSnapshots: [...diagnosticPatchSnapshots]
-      });
+      }));
     }
     if (shouldFailTaskWithoutPublishableChanges({
       mode: qualityGatePolicy.mode,
@@ -14887,7 +15812,7 @@ ${result.stderr ?? ""}`;
 `),
         exitCode: 4
       };
-      return withJobDiagnostics(failure, {
+      return finalizeResult(withJobDiagnostics(failure, {
         terminal: buildTerminalDiagnostics({
           result: failure,
           executor,
@@ -14897,14 +15822,14 @@ ${result.stderr ?? ""}`;
           metadata: { revisionAttempt, executorElapsedMs, shellWrapperReturn }
         }),
         patchSnapshots: [...diagnosticPatchSnapshots]
-      });
+      }));
     }
     const qualityStartedAt = Date.now();
     const quality = await runDeterministicQualityGate(repo, attemptParams, runtimeConfig, qualityGatePolicy, onLog, {
       previousFailureDigests: previousValidationFailureDigests,
       revisionAttempt,
       passingValidationCache
-    });
+    }, deadlineLedger);
     const qualityElapsedMs = Date.now() - qualityStartedAt;
     diagnosticPatchSnapshots.push(buildPatchSnapshotDiagnostics(quality.changedPaths, revisionAttempt, "quality"));
     diagnosticValidationRuns.push(...buildValidationRunDiagnostics(quality.validationRuns, revisionAttempt));
@@ -14977,27 +15902,39 @@ ${result.stderr ?? ""}`;
       criticTimeoutMs: resolveQualityCriticTimeoutMs(runtimeConfig),
       criticTimeoutBehavior: resolveQualityCriticTimeoutBehavior(runtimeConfig)
     });
-    const critic = quality.skipped || !qualityGatePolicy.criticGateEnabled || unchangedValidationFailure !== null || skipCriticAfterExecutorTimeout || skipCriticForDeterministicValidationRevision || skipCriticForRevisionBudget ? null : executor === "openai_codex" ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog) : await runTaskCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog);
-    const annotateTerminalResult = (terminalResult, terminalStage, changedPaths = quality.changedPaths) => withJobDiagnostics(terminalResult, {
-      terminal: buildTerminalDiagnostics({
-        result: terminalResult,
-        executor,
-        changedPaths,
-        terminalStage,
-        timeoutMs: executionBudgetMs,
-        metadata: {
-          revisionAttempt,
-          executorElapsedMs,
-          qualityElapsedMs,
-          validationFailureScope: quality.validationFailureScope,
-          repoValidationRepairMode,
-          validationRuns: quality.validationRuns.length,
-          criticScore: critic?.score ?? null
-        }
-      }),
-      validationRuns: [...diagnosticValidationRuns],
-      patchSnapshots: [...diagnosticPatchSnapshots]
-    });
+    const criticOutcome = quality.skipped ? { kind: "skipped", reason: "quality_skipped", usageAttempts: [] } : !qualityGatePolicy.criticGateEnabled ? { kind: "skipped", reason: "disabled", usageAttempts: [] } : unchangedValidationFailure !== null ? {
+      kind: "skipped",
+      reason: "unchanged_validation_failure",
+      usageAttempts: []
+    } : skipCriticAfterExecutorTimeout ? { kind: "skipped", reason: "executor_timeout", usageAttempts: [] } : skipCriticForDeterministicValidationRevision ? { kind: "skipped", reason: "deterministic_revision", usageAttempts: [] } : skipCriticForRevisionBudget ? { kind: "skipped", reason: "revision_budget", usageAttempts: [] } : executor === "openai_codex" ? await runCodexCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog, deadlineLedger) : await runTaskCriticReview(repo, attemptParams, qualityForCritic, runtimeConfig, onLog, deadlineLedger);
+    usageAccumulator.addAttempts(criticOutcome.usageAttempts);
+    const critic = criticOutcome.kind === "verdict" ? criticOutcome.review : null;
+    if ((critic?.unsupportedFindings?.length ?? 0) > 0) {
+      onLog?.("stderr", `[CriticGate] Ignored ${critic?.unsupportedFindings?.length ?? 0} validation claim(s) without exact evidence IDs.`);
+    }
+    const annotateTerminalResult = (terminalResult, terminalStage, changedPaths = quality.changedPaths) => {
+      const deadlineSafeResult = enforceJobDeadlineBeforeSuccess(terminalResult, deadlineLedger, changedPaths);
+      return finalizeResult(withJobDiagnostics(deadlineSafeResult, {
+        terminal: buildTerminalDiagnostics({
+          result: deadlineSafeResult,
+          executor,
+          changedPaths,
+          terminalStage,
+          timeoutMs: executionBudgetMs,
+          metadata: {
+            revisionAttempt,
+            executorElapsedMs,
+            qualityElapsedMs,
+            validationFailureScope: quality.validationFailureScope,
+            repoValidationRepairMode,
+            validationRuns: quality.validationRuns.length,
+            criticScore: critic?.score ?? null
+          }
+        }),
+        validationRuns: [...diagnosticValidationRuns],
+        patchSnapshots: [...diagnosticPatchSnapshots]
+      }));
+    };
     if (unchangedValidationFailure) {
       const detail = `Validation failed unchanged after two attempts for "${unchangedValidationFailure.command}": ${unchangedValidationFailure.digest}. Stopping revisions for this failure cluster; dispatch a root-cause repair or move to another component.`;
       onLog?.("stderr", `[ValidationGate] ${detail}`);
@@ -15045,7 +15982,14 @@ ${result.stderr ?? ""}`;
       onLog?.("stdout", "[QualityGate] Assertion-balance heuristic downgraded to advisory because validation passed and critic score met threshold.");
     }
     const deterministicRequiresRevision = effectiveQualityIssues.length > 0 || qualityForCritic.blocker !== null;
-    const criticRequiresRevision = Boolean(critic && critic.score < qualityCriticMinScore);
+    const criticDisposition = criticGateDisposition({
+      outcome: criticOutcome,
+      criticGateEnabled: qualityGatePolicy.criticGateEnabled,
+      deterministicRequiresRevision,
+      criticMinScore: qualityCriticMinScore
+    });
+    const criticRequiresRevision = !deterministicRequiresRevision && criticDisposition === "revise";
+    const criticEvidenceInsufficient = Boolean(critic && critic.score < qualityCriticMinScore && criticActionableFeedbackCount(critic) === 0);
     const trustedEnvironmentHandoffReady = canReturnTrustedEnvironmentValidationHandoff({
       pureEnvironmentDeferral: environmentDeferral.pureEnvironmentDeferral,
       deterministicRequiresRevision,
@@ -15053,6 +15997,26 @@ ${result.stderr ?? ""}`;
       criticScore: critic?.score ?? null,
       criticMinScore: qualityCriticMinScore
     });
+    const criticTerminalProblem = criticDisposition === "hold_candidate" || criticEvidenceInsufficient;
+    if (!deterministicRequiresRevision && qualityGatePolicy.criticGateEnabled && (criticTerminalProblem || criticOutcome.kind === "skipped" && criticOutcome.reason === "executor_timeout")) {
+      const unsupportedEvidence = critic?.unsupportedFindings ?? [];
+      const reason = criticOutcome.kind === "verdict" ? unsupportedEvidence.length > 0 ? "critic findings below threshold lacked exact supporting evidence" : "critic score was below threshold without actionable revision feedback" : criticOutcome.kind === "skipped" ? "primary executor timed out before a complete critic review" : criticOutcome.reason;
+      const summary = criticOutcome.kind === "timeout" ? "Critic timed out; candidate retained without reporting success" : criticOutcome.kind === "verdict" ? "Critic evidence was insufficient; candidate retained without reporting success" : "Critic verdict unavailable; candidate retained without reporting success";
+      onLog?.("stderr", `[CriticGate] ${summary}: ${toSingleLine(reason, 220)}`);
+      return annotateTerminalResult({
+        ok: false,
+        summary,
+        stdout: result.stdout,
+        stderr: truncate([result.stderr ?? "", reason, ...unsupportedEvidence].filter(Boolean).join(`
+`), outputPolicyForRuntime(runtimeConfig)),
+        exitCode: criticOutcome.kind === "timeout" ? 124 : 4,
+        candidateState: {
+          status: criticOutcome.kind === "timeout" || criticOutcome.kind === "skipped" && criticOutcome.reason === "executor_timeout" ? "partial" : "held",
+          reason: criticOutcome.kind === "timeout" ? "critic_timeout" : criticOutcome.kind === "skipped" ? "executor_timeout" : criticOutcome.kind === "verdict" ? "critic_evidence_insufficient" : "critic_unavailable",
+          changedPaths: publishableChangedPaths(quality.changedPaths)
+        }
+      }, criticOutcome.kind === "timeout" ? "critic_timeout" : "critic_unavailable");
+    }
     if (!qualityGatePolicy.publishGateEnabled && (deterministicRequiresRevision || criticRequiresRevision)) {
       onLog?.("stderr", "[PublishGate] Disabled by workerpals.quality_publish_gate_enabled=false; returning worker result despite gate failures.");
       const advisoryResult = {
@@ -15067,22 +16031,6 @@ ${result.stderr ?? ""}`;
         exitCode: typeof result.exitCode === "number" ? result.exitCode : 0
       };
       return annotateTerminalResult(advisoryResult, "quality");
-    }
-    if (environmentDeferral.pureEnvironmentDeferral && qualityGatePolicy.criticGateEnabled && !deterministicRequiresRevision && critic == null) {
-      const summary = "Critic review unavailable before trusted-environment validation handoff";
-      onLog?.("stderr", `[CriticGate] ${summary}; retaining the candidate without reporting a publishable success.`);
-      return annotateTerminalResult({
-        ok: false,
-        summary,
-        stdout: result.stdout,
-        stderr: truncate([
-          result.stderr ?? "",
-          "The deterministic validation blocker is environment-only, but the enabled critic did not produce a verdict.",
-          ...quality.validationRuns.flatMap((run) => [run.stdout, run.stderr]).filter(Boolean)
-        ].join(`
-`), outputPolicyForRuntime(runtimeConfig)),
-        exitCode: 4
-      }, "critic_unavailable_before_trusted_environment_handoff");
     }
     if (trustedEnvironmentHandoffReady) {
       const blockerDiagnostics = truncate([
@@ -15104,6 +16052,11 @@ ${result.stderr ?? ""}`;
           summary,
           detail: environmentDetail,
           commands: environmentDeferral.blockedCommands
+        },
+        candidateState: {
+          status: "held",
+          reason: "trusted_environment_validation_required",
+          changedPaths: publishableChangedPaths(quality.changedPaths)
         }
       };
       return annotateTerminalResult(heldCandidate, "trusted_environment_validation_required");
@@ -15352,11 +16305,11 @@ ${result.stderr ?? ""}`;
     revisionHint = buildQualityRevisionHint(issues, critic, planning, reviewFixContext, qualityForCritic.validationRuns, qualityForCritic.blocker, validationOutsideTaskScopeBlocksOnly || repoValidationRepairMode ? null : browserRepairPacket, quality.changedPaths, validationRemedyHints, repoValidationRepairMode);
     onLog?.("stderr", `[QualityGate] Quality gate requested revision ${revisionAttempt}/${activeMaxAutoRevisions}: ${toSingleLine(issueSummary, 260)}`);
   }
-  return {
+  return finalizeResult({
     ok: false,
     summary: "Quality revision loop ended unexpectedly.",
     exitCode: 4
-  };
+  });
 }
 
 // apps/workerpals/src/docker_executor.ts
@@ -15646,6 +16599,9 @@ var DOCKER_CONTROL_TIMEOUT_MS = 30000;
 var DOCKER_PROBE_TIMEOUT_MS = 15000;
 var DOCKER_SELF_CHECK_TIMEOUT_MS = 60000;
 var HOST_GIT_CONTROL_TIMEOUT_MS = 60000;
+var DEFAULT_UNPLANNED_FINALIZATION_BUDGET_MAX_MS = 120000;
+var DEFAULT_UNPLANNED_FINALIZATION_BUDGET_DIVISOR = 5;
+var SETUP_WORKTREE_RECONCILIATION_TIMEOUT_MS = 5000;
 var BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS = 3;
 var BROWSER_VALIDATION_JOB_OVERHEAD_MS = 5 * 60000;
 var BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS = 20 * 60000;
@@ -15944,7 +16900,7 @@ function buildWorktreeDependencyPreparationCommand(containerWorktreePath, depend
     '  rm -rf "$projection_root"',
     '  mkdir -p "$projection_node_modules"',
     '  : > "$projection_node_modules/.pushpals-dependency-projection-in-progress"',
-    '  cp -al "$src/." "$projection_node_modules/"',
+    '  cp -a --reflink=auto "$src/." "$projection_node_modules/"',
     '  find "$projection_node_modules" -type l -print | while IFS= read -r workspace_link; do',
     '    workspace_target="$(readlink "$workspace_link" 2>/dev/null || true)"',
     '    case "$workspace_target" in',
@@ -16122,12 +17078,81 @@ function buildLinuxWorktreeAddArgs(worktreePath, baseRef, force = false) {
 class DockerExecutionExhaustedError extends Error {
   cooldownMs;
   category;
+  candidateState;
   constructor(category, message, cooldownMs) {
     super(message);
     this.name = "DockerExecutionExhaustedError";
     this.category = category;
     this.cooldownMs = Math.max(0, Math.floor(cooldownMs));
   }
+}
+function addHostScmReviewPassUsage(accumulator, result, pass) {
+  if ((result.usageAttempts?.length ?? 0) > 0) {
+    const attemptOffset = accumulator.attempts().length;
+    accumulator.addAttempts((result.usageAttempts ?? []).map((attempt, index) => ({
+      ...attempt,
+      attempt: attemptOffset + index + 1,
+      source: `${attempt.source}:host_scm_pass_${pass}`
+    })));
+    return;
+  }
+  accumulator.add(result.usage, {
+    stage: pass === 1 ? "executor" : "executor_recovery",
+    attempt: accumulator.attempts().length + 1,
+    source: `host_scm_owned_review:pass_${pass}`,
+    timedOut: result.exitCode === 124
+  });
+}
+function addHostScmFinalizationUsage(accumulator, result, pass) {
+  if ((result.usageAttempts?.length ?? 0) > 0) {
+    const attemptOffset = accumulator.attempts().length;
+    accumulator.addAttempts((result.usageAttempts ?? []).map((attempt, index) => ({
+      ...attempt,
+      stage: "finalization",
+      attempt: attemptOffset + index + 1,
+      source: `${attempt.source}:host_scm_finalization_pass_${pass}`
+    })));
+    return;
+  }
+  accumulator.add(result.usage, {
+    stage: "finalization",
+    attempt: accumulator.attempts().length + 1,
+    source: `host_scm_finalization:pass_${pass}`
+  });
+}
+function addDockerTransportAttemptUsage(accumulator, result, attempt) {
+  const attemptOffset = accumulator.attempts().length;
+  if ((result.usageAttempts?.length ?? 0) > 0) {
+    accumulator.addAttempts((result.usageAttempts ?? []).map((usageAttempt, index) => ({
+      ...usageAttempt,
+      attempt: attemptOffset + index + 1,
+      source: `${usageAttempt.source}:docker_transport_attempt_${attempt}`
+    })));
+    return;
+  }
+  accumulator.add(result.usage, {
+    stage: attempt === 1 ? "executor" : "executor_recovery",
+    attempt: attemptOffset + 1,
+    source: `docker_transport:attempt_${attempt}`,
+    timedOut: result.exitCode === 124
+  });
+}
+function attachHostScmUsageToError(accumulator, error, pass) {
+  if (error && typeof error === "object") {
+    addHostScmReviewPassUsage(accumulator, error, Math.max(1, pass));
+  }
+  const usageSnapshot = accumulator.apply({
+    ok: false,
+    summary: `Host-side review pass ${Math.max(1, pass)} threw before completion`
+  });
+  const propagatedError = error instanceof Error && Object.isExtensible(error) ? error : Object.assign(new Error(error instanceof Error ? error.message : String(error)), error && typeof error === "object" ? error : {});
+  if ((usageSnapshot.usageAttempts?.length ?? 0) > 0) {
+    Object.assign(propagatedError, {
+      usage: usageSnapshot.usage,
+      usageAttempts: usageSnapshot.usageAttempts
+    });
+  }
+  return propagatedError;
 }
 function compactDockerDiagnosticText(value, maxChars = 1000) {
   const text = String(value ?? "").replace(/\s+$/g, "").trim();
@@ -16242,6 +17267,95 @@ function resolveDockerJobTimeoutMs(configuredTimeoutMs, job) {
   const boundedTimeoutMs = Math.min(BROWSER_VALIDATION_JOB_MAX_TIMEOUT_MS, Math.max(BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS, estimatedTimeoutMs));
   return Math.max(Math.min(baseTimeoutMs, boundedTimeoutMs), BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS);
 }
+function resolveDockerJobDeadlineBudgets(configuredTimeoutMs, job) {
+  const totalTimeoutMs = resolveDockerJobTimeoutMs(configuredTimeoutMs, job);
+  const planning = maybeRecord(job.params.planning);
+  const requestedExecutionBudgetMs = readPositiveNumber(planning?.executionBudgetMs);
+  const requestedFinalizationBudgetMs = readPositiveNumber(planning?.finalizationBudgetMs);
+  if (requestedExecutionBudgetMs === null || requestedFinalizationBudgetMs === null) {
+    const finalizationBudgetMs2 = Math.min(DEFAULT_UNPLANNED_FINALIZATION_BUDGET_MAX_MS, Math.max(1, Math.floor(totalTimeoutMs / DEFAULT_UNPLANNED_FINALIZATION_BUDGET_DIVISOR)), Math.max(1, totalTimeoutMs - 1));
+    return {
+      executionBudgetMs: Math.max(1, totalTimeoutMs - finalizationBudgetMs2),
+      finalizationBudgetMs: finalizationBudgetMs2
+    };
+  }
+  const finalizationBudgetMs = Math.min(requestedFinalizationBudgetMs, Math.max(0, totalTimeoutMs - 1));
+  return {
+    executionBudgetMs: Math.min(requestedExecutionBudgetMs, Math.max(1, totalTimeoutMs - finalizationBudgetMs)),
+    finalizationBudgetMs
+  };
+}
+function createDockerJobDeadlineLedger(configuredTimeoutMs, job, options = {}) {
+  const budgets = resolveDockerJobDeadlineBudgets(configuredTimeoutMs, job);
+  return new JobDeadlineLedger({ ...budgets, ...options });
+}
+function bindDockerJobToDeadline(job, ledger) {
+  if (ledger.workExpired())
+    return null;
+  const planning = maybeRecord(job.params.planning);
+  const requestedExecutionBudgetMs = readPositiveNumber(planning?.executionBudgetMs);
+  const requestedFinalizationBudgetMs = readPositiveNumber(planning?.finalizationBudgetMs);
+  if (planning === null || requestedExecutionBudgetMs === null || requestedFinalizationBudgetMs === null) {
+    return job;
+  }
+  const budgets = ledger.executorBudgets(requestedExecutionBudgetMs, requestedFinalizationBudgetMs);
+  if (!budgets || budgets.finalizationBudgetMs <= 0)
+    return null;
+  return {
+    ...job,
+    params: {
+      ...job.params,
+      planning: {
+        ...planning,
+        executionBudgetMs: budgets.executionBudgetMs,
+        finalizationBudgetMs: budgets.finalizationBudgetMs
+      }
+    }
+  };
+}
+function resolveDockerContainerTransportTimeoutMs(configuredTimeoutMs, job, ledger) {
+  if (!ledger)
+    return Math.max(0, configuredTimeoutMs);
+  const planning = maybeRecord(job.params.planning);
+  const hasValidInnerFinalizationPlan = readPositiveNumber(planning?.executionBudgetMs) !== null && readPositiveNumber(planning?.finalizationBudgetMs) !== null;
+  const remainingDeadlineMs = hasValidInnerFinalizationPlan ? ledger.remainingTotalMs() : ledger.remainingWorkMs();
+  return Math.max(0, Math.min(configuredTimeoutMs, remainingDeadlineMs));
+}
+function dockerAbsoluteDeadlineResult(job, ledger, stage, priorResult) {
+  const detail = `The absolute Docker job deadline was exhausted during ${stage}; retries and host-owned review passes share one wall-clock budget.`;
+  return {
+    ...priorResult ?? {},
+    ok: false,
+    summary: `Docker job ${job.id} reached its absolute deadline`,
+    stderr: appendDockerFailureDetail(priorResult?.stderr, detail),
+    exitCode: 124,
+    candidateState: priorResult?.candidateState ?? {
+      status: "partial",
+      reason: "absolute_job_deadline",
+      changedPaths: []
+    },
+    diagnostics: {
+      ...priorResult?.diagnostics ?? {},
+      terminal: {
+        ...priorResult?.diagnostics?.terminal ?? {},
+        failureClass: "timeout",
+        terminalStage: "docker",
+        summary: detail,
+        watchdogFired: true,
+        timeoutMs: ledger.deadlineAtMs - ledger.startedAtMs,
+        metadata: {
+          ...priorResult?.diagnostics?.terminal?.metadata ?? {},
+          absoluteDeadlineStage: stage,
+          jobDeadline: ledger.snapshot()
+        }
+      },
+      metadata: {
+        ...priorResult?.diagnostics?.metadata ?? {},
+        jobDeadline: ledger.snapshot()
+      }
+    }
+  };
+}
 
 class DockerExecutor {
   options;
@@ -16269,6 +17383,8 @@ class DockerExecutor {
   preparedMergeConflictJobs = new Set;
   mergeConflictRefreshPromise = null;
   config;
+  deadlineWallNow = () => Date.now();
+  deadlineMonotonicNow = () => typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
   constructor(options) {
     const { config: config2, ...optionValues } = options;
     this.config = config2 ?? DEFAULT_CONFIG4;
@@ -16299,18 +17415,39 @@ class DockerExecutor {
     } catch {}
   }
   async execute(job, onLog) {
+    const deadlineLedger = createDockerJobDeadlineLedger(this.options.timeoutMs, job, {
+      startedAtMs: this.deadlineWallNow(),
+      now: this.deadlineWallNow,
+      monotonicNow: this.deadlineMonotonicNow
+    });
     this.activeJobs += 1;
     this.clearIdleTimer();
     const worktreeName = this.buildEphemeralWorktreeName("job", job.id);
     const worktreePath = resolve12(this.worktreeDir, worktreeName);
+    let terminalResult = null;
+    let terminalError = null;
+    let worktreeBaselineSha = null;
+    let worktreeCreationStarted = false;
+    let preserveWorktreeForCandidateRecovery = false;
+    const accumulatedUsage = new UsageAccumulator;
+    const finish = (result) => {
+      terminalResult = accumulatedUsage.apply(result);
+      return terminalResult;
+    };
     try {
-      const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
-      await this.createWorktree(worktreePath, worktreeBaseRef);
+      const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog, deadlineLedger);
+      worktreeCreationStarted = true;
+      await this.createWorktree(worktreePath, worktreeBaseRef, deadlineLedger);
+      const baseline = await this.runGitBaseRefCommand(["-C", worktreePath, "rev-parse", "HEAD"], deadlineLedger);
+      if (!baseline.ok || !baseline.stdout.trim()) {
+        throw new Error(`Unable to resolve disposable worktree baseline before preparation: ${baseline.stderr || baseline.stdout || "git rev-parse failed"}`);
+      }
+      worktreeBaselineSha = baseline.stdout.trim();
       let effectiveJob = job;
       if (isReviewResolutionParams(job.params)) {
         let effectiveParams = job.params;
         if (isMergeConflictResolutionParams(job.params)) {
-          const prepared = await prepareMergeConflictWorktreeOnHost(worktreePath, job.id, job.params, onLog);
+          const prepared = await prepareMergeConflictWorktreeOnHost(worktreePath, job.id, job.params, onLog, deadlineLedger);
           effectiveParams = applyMergeConflictExecutionHints(effectiveParams, prepared);
         }
         effectiveJob = {
@@ -16319,32 +17456,78 @@ class DockerExecutor {
         };
       }
       for (let attempt = 1;attempt <= this.jobRetryMaxAttempts; attempt++) {
+        const deadlineBoundJob = bindDockerJobToDeadline(effectiveJob, deadlineLedger);
+        if (!deadlineBoundJob) {
+          return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `Docker attempt ${attempt} setup`));
+        }
         const attemptStartedAtMs = Date.now();
         try {
           this.logExecutionConfig();
-          const result = isHostScmOwnedReviewParams(effectiveJob.params) ? await this.runHostScmOwnedReviewJob(worktreePath, effectiveJob, onLog) : await this.runInWarmContainer(worktreePath, this.encodeJobSpec(effectiveJob), effectiveJob, onLog);
+          let result = isHostScmOwnedReviewParams(deadlineBoundJob.params) ? await this.runHostScmOwnedReviewJob(worktreePath, deadlineBoundJob, deadlineLedger, onLog) : await this.runInWarmContainer(worktreePath, deadlineBoundJob, onLog, deadlineLedger);
+          addDockerTransportAttemptUsage(accumulatedUsage, result, attempt);
+          if (result.ok && shouldCommit(effectiveJob.kind, this.config) && !isHostScmOwnedReviewParams(effectiveJob.params) && (!result.commit || !result.commit.branch || !result.commit.sha)) {
+            result = {
+              ...result,
+              ok: false,
+              summary: `Docker job ${job.id} completed without durable commit metadata`,
+              stderr: [
+                result.stderr,
+                "The container reported success for a file-modifying job without an exact retained ref/SHA; treating it as a finalization failure before worktree cleanup."
+              ].filter(Boolean).join(`
+`),
+              exitCode: 4,
+              candidateState: result.candidateState ?? {
+                status: "held",
+                reason: "commit_finalization_failed",
+                changedPaths: []
+              }
+            };
+          }
+          if (deadlineLedger.remainingTotalMs() <= 0) {
+            return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `Docker attempt ${attempt}`, result));
+          }
           if (result.ok)
-            return result;
+            return finish(result);
+          if (deadlineLedger.workExpired()) {
+            return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `Docker attempt ${attempt}`, result));
+          }
           const retryableFailure = this.isRetryableJobFailure(result);
           const attemptElapsedMs = Math.max(1, Date.now() - attemptStartedAtMs);
           const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
           const hasBudgetForRetry = retryableFailure && attempt < this.jobRetryMaxAttempts && this.hasBudgetForJobRetry(attempt, attemptElapsedMs, timeoutMs, onLog);
           if (attempt >= this.jobRetryMaxAttempts || !retryableFailure || !hasBudgetForRetry) {
             if (retryableFailure && attempt >= this.jobRetryMaxAttempts && this.retryExhaustionCooldownMs(result) > 0) {
-              return {
+              return finish({
                 ...result,
                 cooldownMs: this.retryExhaustionCooldownMs(result)
-              };
+              });
             }
-            return result;
+            return finish(result);
           }
           const retryInMs = this.backoffDelayMs(this.jobRetryBackoffMs, attempt);
           const note = `[DockerExecutor] Transient job failure detected for ${job.id}; retrying attempt ${attempt + 1}/${this.jobRetryMaxAttempts} in ${retryInMs}ms.`;
           console.warn(note);
           onLog?.("stderr", note);
-          await this.stopWarmContainer("job retry after transient failure", true);
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `retry backoff before attempt ${attempt + 1}`, result));
+          }
+          await this.stopWarmContainer("job retry after transient failure", true, Math.max(1, deadlineLedger.remainingWorkMs() - retryInMs));
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `retry recovery before attempt ${attempt + 1}`, result));
+          }
           await this.sleep(retryInMs);
         } catch (err) {
+          if (err && typeof err === "object") {
+            addDockerTransportAttemptUsage(accumulatedUsage, err, attempt);
+          }
+          if (deadlineLedger.workExpired() || deadlineLedger.remainingTotalMs() <= 0) {
+            return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `Docker attempt ${attempt}`, {
+              ok: false,
+              summary: `Docker attempt ${attempt} failed at the absolute deadline`,
+              stderr: this.compactError(err),
+              exitCode: 124
+            }));
+          }
           const retryableError = this.isRetryableError(err);
           const attemptElapsedMs = Math.max(1, Date.now() - attemptStartedAtMs);
           const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
@@ -16359,22 +17542,113 @@ class DockerExecutor {
           const note = `[DockerExecutor] Transient Docker execution error for ${job.id}: ${this.compactError(err)}. Retrying attempt ${attempt + 1}/${this.jobRetryMaxAttempts} in ${retryInMs}ms.`;
           console.warn(note);
           onLog?.("stderr", note);
-          await this.stopWarmContainer("job retry after execution error", true);
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `retry backoff before attempt ${attempt + 1}`));
+          }
+          await this.stopWarmContainer("job retry after execution error", true, Math.max(1, deadlineLedger.remainingWorkMs() - retryInMs));
+          if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
+            return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, `retry recovery before attempt ${attempt + 1}`));
+          }
           await this.sleep(retryInMs);
         }
       }
-      return {
+      return finish({
         ok: false,
         summary: "Docker job retries exhausted",
         stderr: `Retries exhausted after ${this.jobRetryMaxAttempts} attempts`
-      };
+      });
+    } catch (error) {
+      if (deadlineLedger.workExpired() || deadlineLedger.remainingTotalMs() <= 0) {
+        return finish(dockerAbsoluteDeadlineResult(job, deadlineLedger, "host/Docker preparation", {
+          ok: false,
+          summary: `Docker preparation for ${job.id} reached the absolute deadline`,
+          stderr: this.compactError(error),
+          exitCode: 124
+        }));
+      }
+      const propagatedError = error instanceof Error ? error : new Error(String(error));
+      const usageSnapshot = accumulatedUsage.apply({
+        ok: false,
+        summary: `Docker execution threw before completion: ${this.compactError(propagatedError)}`
+      });
+      if ((usageSnapshot.usageAttempts?.length ?? 0) > 0) {
+        Object.assign(propagatedError, {
+          usage: usageSnapshot.usage,
+          usageAttempts: usageSnapshot.usageAttempts
+        });
+      }
+      terminalError = propagatedError;
+      throw propagatedError;
     } finally {
       this.preparedMergeConflictJobs.delete(job.id);
       this.activeJobs = Math.max(0, this.activeJobs - 1);
-      await this.cleanupContainerDependencyProjection(worktreePath);
-      await this.removeWorktree(worktreePath).catch((err) => {
-        console.error(`[DockerExecutor] Failed to remove worktree: ${err}`);
-      });
+      await this.cleanupContainerDependencyProjection(worktreePath, deadlineLedger);
+      const postProjectionResult = terminalResult;
+      if (postProjectionResult?.ok && deadlineLedger.remainingTotalMs() <= 0) {
+        Object.assign(postProjectionResult, dockerAbsoluteDeadlineResult(job, deadlineLedger, "dependency-projection finalization", postProjectionResult));
+      }
+      const resultForCleanup = terminalResult ?? (terminalError ? {
+        ok: false,
+        summary: `Docker execution threw before producing a structured result: ${this.compactError(terminalError)}`,
+        candidateState: {
+          status: "partial",
+          reason: "execution_exception",
+          changedPaths: []
+        }
+      } : null);
+      const setupWorktreeNeedsReconciliation = worktreeCreationStarted && worktreeBaselineSha === null;
+      if (resultForCleanup && !resultForCleanup.ok && existsSync11(worktreePath) && !setupWorktreeNeedsReconciliation) {
+        const candidateState = resultForCleanup.candidateState ?? {
+          status: resultForCleanup.exitCode === 124 ? "partial" : "held",
+          reason: resultForCleanup.exitCode === 124 ? "execution_timeout" : "terminal_failure",
+          changedPaths: []
+        };
+        try {
+          const checkpointed = await checkpointJobCandidate(worktreePath, this.options.workerId, job, candidateState, this.config, worktreeBaselineSha, deadlineLedger);
+          if (checkpointed.checkpoint) {
+            resultForCleanup.candidateState = checkpointed;
+            if (terminalError && typeof terminalError === "object" && Object.isExtensible(terminalError)) {
+              try {
+                Object.assign(terminalError, { candidateState: checkpointed });
+              } catch {}
+            }
+            resultForCleanup.stderr = [
+              resultForCleanup.stderr,
+              `Candidate checkpoint retained at ${checkpointed.checkpoint.ref} (${checkpointed.checkpoint.sha}).`
+            ].filter(Boolean).join(`
+`);
+            onLog?.("stderr", `[DockerExecutor] Retained ${checkpointed.status} candidate ${checkpointed.checkpoint.sha.slice(0, 12)} before disposable worktree cleanup.`);
+          }
+        } catch (error) {
+          preserveWorktreeForCandidateRecovery = true;
+          resultForCleanup.candidateState = candidateState;
+          resultForCleanup.stderr = [
+            resultForCleanup.stderr,
+            `Candidate checkpoint failed; preserving disposable worktree for recovery at ${worktreePath}: ${this.compactError(error)}`
+          ].filter(Boolean).join(`
+`);
+          if (terminalError && typeof terminalError === "object" && Object.isExtensible(terminalError)) {
+            try {
+              Object.assign(terminalError, {
+                candidateState,
+                candidateWorktreePath: worktreePath
+              });
+            } catch {}
+          }
+          onLog?.("stderr", `[DockerExecutor] Candidate checkpoint failed; preserving worktree ${worktreePath}: ${this.compactError(error)}`);
+        }
+      }
+      if (!preserveWorktreeForCandidateRecovery) {
+        await this.removeWorktree(worktreePath, deadlineLedger, {
+          ensureReconciliation: setupWorktreeNeedsReconciliation
+        }).catch((err) => {
+          console.error(`[DockerExecutor] Failed to remove worktree: ${err}`);
+        });
+      }
+      const postCleanupResult = terminalResult;
+      if (postCleanupResult?.ok && deadlineLedger.remainingTotalMs() <= 0) {
+        Object.assign(postCleanupResult, dockerAbsoluteDeadlineResult(job, deadlineLedger, "worktree finalization", postCleanupResult));
+      }
       this.scheduleIdleShutdown();
     }
   }
@@ -16411,11 +17685,11 @@ class DockerExecutor {
       await this.removeWorktree(worktreePath).catch(() => {});
     }
   }
-  async createWorktree(worktreePath, baseRef) {
-    await this.ensureFreshWorktreePath(worktreePath);
+  async createWorktree(worktreePath, baseRef, deadlineLedger) {
+    await this.ensureFreshWorktreePath(worktreePath, deadlineLedger);
     let result = await this.runHostCommandCapture(["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef)], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+      timeoutMs: deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ?? HOST_GIT_CONTROL_TIMEOUT_MS
     });
     let exitCode = result.exitCode;
     let stdout = result.stdout;
@@ -16429,14 +17703,14 @@ class DockerExecutor {
     if (!result.timedOut && exitCode !== 0 && /already registered worktree/i.test(detail)) {
       const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
         cwd: this.options.repo,
-        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+        timeoutMs: deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ?? HOST_GIT_CONTROL_TIMEOUT_MS
       });
       if (prune.timedOut) {
         throw new Error(`git worktree prune timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`);
       }
       result = await this.runHostCommandCapture(["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef, true)], {
         cwd: this.options.repo,
-        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+        timeoutMs: deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ?? HOST_GIT_CONTROL_TIMEOUT_MS
       });
       exitCode = result.exitCode;
       stdout = result.stdout;
@@ -16451,11 +17725,7 @@ class DockerExecutor {
     if (result.timedOut || exitCode !== 0) {
       throw new Error(`Failed to create worktree from ${baseRef}: ${detail}`);
     }
-    const enableWorktreeConfig = await this.runGitBaseRefCommand([
-      "config",
-      "extensions.worktreeConfig",
-      "true"
-    ]);
+    const enableWorktreeConfig = await this.runGitBaseRefCommand(["config", "extensions.worktreeConfig", "true"], deadlineLedger);
     if (!enableWorktreeConfig.ok) {
       throw new Error(`Failed to enable worktree-local Git configuration: ${enableWorktreeConfig.stderr || enableWorktreeConfig.stdout}`);
     }
@@ -16463,14 +17733,7 @@ class DockerExecutor {
       ["core.autocrlf", "false"],
       ["core.eol", "lf"]
     ]) {
-      const configured = await this.runGitBaseRefCommand([
-        "-C",
-        worktreePath,
-        "config",
-        "--worktree",
-        key,
-        value
-      ]);
+      const configured = await this.runGitBaseRefCommand(["-C", worktreePath, "config", "--worktree", key, value], deadlineLedger);
       if (!configured.ok) {
         throw new Error(`Failed to configure ${key}=${value} for Linux worktree: ${configured.stderr || configured.stdout}`);
       }
@@ -16498,42 +17761,85 @@ class DockerExecutor {
 `, "utf-8");
     } catch {}
   }
-  async removeWorktree(worktreePath) {
+  async removeWorktree(worktreePath, deadlineLedger, options = {}) {
+    const ensureReconciliation = options.ensureReconciliation === true;
+    const cleanupTimeout = (requestedMs) => {
+      const reservedTimeoutMs = deadlineLedger ? deadlineLedger.capTotalTimeout(requestedMs) : requestedMs;
+      if (reservedTimeoutMs > 0 || !ensureReconciliation)
+        return reservedTimeoutMs;
+      return Math.min(requestedMs, SETUP_WORKTREE_RECONCILIATION_TIMEOUT_MS);
+    };
+    const removalTimeoutMs = cleanupTimeout(HOST_GIT_CONTROL_TIMEOUT_MS);
+    if (removalTimeoutMs <= 0) {
+      console.warn(`[DockerExecutor] Deferring worktree cleanup after the absolute job deadline: ${worktreePath}`);
+      return;
+    }
+    if (deadlineLedger?.remainingTotalMs() === 0 && ensureReconciliation) {
+      console.warn(`[DockerExecutor] Using bounded setup-worktree reconciliation after the absolute job deadline: ${worktreePath}`);
+    }
     const removal = await this.runHostCommandCapture(["git", "worktree", "remove", "--force", "--force", worktreePath], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+      timeoutMs: removalTimeoutMs
     });
     if (removal.timedOut || removal.exitCode !== 0) {
-      console.warn(`[DockerExecutor] Worktree removal warning: ${removal.timedOut ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms` : removal.stderr || removal.stdout || `exit ${removal.exitCode}`}`);
+      console.warn(`[DockerExecutor] Worktree removal warning: ${removal.timedOut ? `timed out after ${removalTimeoutMs}ms` : removal.stderr || removal.stdout || `exit ${removal.exitCode}`}`);
     }
+    const pruneTimeoutMs = cleanupTimeout(HOST_GIT_CONTROL_TIMEOUT_MS);
+    if (pruneTimeoutMs <= 0)
+      return;
     const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+      timeoutMs: pruneTimeoutMs
     });
     if (prune.timedOut || prune.exitCode !== 0) {
-      console.warn(`[DockerExecutor] Worktree prune warning: ${prune.timedOut ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms` : prune.stderr || prune.stdout || `exit ${prune.exitCode}`}`);
+      console.warn(`[DockerExecutor] Worktree prune warning: ${prune.timedOut ? `timed out after ${pruneTimeoutMs}ms` : prune.stderr || prune.stdout || `exit ${prune.exitCode}`}`);
     }
+    if (deadlineLedger?.remainingTotalMs() === 0 && !ensureReconciliation)
+      return;
     const forced = await forceDeleteWorktreePath(worktreePath, {
+      ...deadlineLedger ? { retries: 1 } : {},
       sleepFn: (ms) => this.sleep(ms)
     });
     if (!forced.removed) {
       throw new Error(`worktree path persisted after cleanup (${worktreePath})${forced.lastError ? `: ${forced.lastError}` : ""}`);
     }
+    if (ensureReconciliation) {
+      const finalPruneTimeoutMs = cleanupTimeout(HOST_GIT_CONTROL_TIMEOUT_MS);
+      if (finalPruneTimeoutMs > 0) {
+        const finalPrune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
+          cwd: this.options.repo,
+          timeoutMs: finalPruneTimeoutMs
+        });
+        if (finalPrune.timedOut || finalPrune.exitCode !== 0) {
+          console.warn(`[DockerExecutor] Final setup-worktree prune warning: ${finalPrune.timedOut ? `timed out after ${finalPruneTimeoutMs}ms` : finalPrune.stderr || finalPrune.stdout || `exit ${finalPrune.exitCode}`}`);
+        }
+      }
+    }
     console.log(`[DockerExecutor] Removed worktree: ${worktreePath}`);
   }
-  async cleanupContainerDependencyProjection(worktreePath) {
+  async cleanupContainerDependencyProjection(worktreePath, deadlineLedger) {
     const worktreeId = this.dependencyProjectionId(worktreePath);
     if (!worktreeId || !this.preparedDependencyProjectionIds.has(worktreeId))
       return;
     const projectionPath = `/workspace/.pushpals/dependency-store/projections/${worktreeId}`;
     const command = `rm -rf ${shellSingleQuote(projectionPath)}`;
+    const warmCleanupTimeoutMs = deadlineLedger ? deadlineLedger.capTotalTimeout(DOCKER_CONTROL_TIMEOUT_MS) : DOCKER_CONTROL_TIMEOUT_MS;
+    if (warmCleanupTimeoutMs <= 0) {
+      this.dependencyStoreReconciled = false;
+      return;
+    }
     try {
-      const cleanup = await this.runWarmShell(command, { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS });
+      const cleanup = await this.runWarmShell(command, { timeoutMs: warmCleanupTimeoutMs });
       if (cleanup.ok) {
         this.preparedDependencyProjectionIds.delete(worktreeId);
         return;
       }
     } catch {}
+    const fallbackCleanupTimeoutMs = deadlineLedger ? deadlineLedger.capTotalTimeout(DOCKER_CONTROL_TIMEOUT_MS) : DOCKER_CONTROL_TIMEOUT_MS;
+    if (fallbackCleanupTimeoutMs <= 0) {
+      this.dependencyStoreReconciled = false;
+      return;
+    }
     try {
       const cleanup = await this.runDockerCommandCapture([
         resolveDockerExecutable(),
@@ -16548,12 +17854,12 @@ class DockerExecutor {
         this.options.imageName,
         "-lc",
         command
-      ], { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS });
+      ], { timeoutMs: fallbackCleanupTimeoutMs });
       if (!cleanup.timedOut && cleanup.exitCode === 0) {
         this.preparedDependencyProjectionIds.delete(worktreeId);
         return;
       }
-      console.warn(`[DockerExecutor] Dependency projection cleanup was not confirmed for ${worktreeId}: ${cleanup.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : cleanup.stderr || cleanup.stdout || `exit ${cleanup.exitCode}`}`);
+      console.warn(`[DockerExecutor] Dependency projection cleanup was not confirmed for ${worktreeId}: ${cleanup.timedOut ? `timed out after ${fallbackCleanupTimeoutMs}ms` : cleanup.stderr || cleanup.stdout || `exit ${cleanup.exitCode}`}`);
     } catch (error) {
       console.warn(`[DockerExecutor] Dependency projection cleanup failed for ${worktreeId}: ${this.compactError(error)}`);
     }
@@ -16666,12 +17972,16 @@ class DockerExecutor {
       });
     }, this.options.idleTimeoutMs);
   }
-  async startWarmContainer() {
-    await this.stopWarmContainer("pre-start cleanup", true);
-    await this.ensureNamedVolume(this.dependencyVolumeName, "workerpals-dependencies");
+  async startWarmContainer(deadlineLedger) {
+    const stopTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) : DOCKER_CONTROL_TIMEOUT_MS;
+    if (stopTimeoutMs <= 0) {
+      throw new Error("Warm-container startup was cancelled by the absolute job work deadline.");
+    }
+    await this.stopWarmContainer("pre-start cleanup", true, stopTimeoutMs);
+    await this.ensureNamedVolume(this.dependencyVolumeName, "workerpals-dependencies", deadlineLedger);
     const backend = this.currentBackend();
     if (backend === "openai_codex") {
-      await this.ensureNamedVolume(this.codexVolumeName, "workerpals-codex-home");
+      await this.ensureNamedVolume(this.codexVolumeName, "workerpals-codex-home", deadlineLedger);
     }
     const backendSpec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
@@ -16728,20 +18038,20 @@ class DockerExecutor {
     }
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
     const result = await this.runDockerCommandCapture([resolveDockerExecutable(), ...args], {
-      timeoutMs: DOCKER_CONTROL_TIMEOUT_MS
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS
     });
     if (result.timedOut || result.exitCode !== 0) {
       throw new Error(`Failed to start warm container (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${result.stderr || result.stdout || "no docker output"}`);
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
-    await this.reconcileContainerDependencyStore();
+    await this.reconcileContainerDependencyStore(deadlineLedger);
   }
-  async reconcileContainerDependencyStore() {
+  async reconcileContainerDependencyStore(deadlineLedger) {
     if (this.dependencyStoreReconciled && this.preparedDependencyProjectionIds.size === 0)
       return;
     try {
       const result = await this.runWarmShell(buildDependencyStoreReconciliationCommand(), {
-        timeoutMs: DOCKER_CONTROL_TIMEOUT_MS
+        timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS
       });
       if (!result.ok) {
         this.dependencyStoreReconciled = false;
@@ -16759,7 +18069,7 @@ class DockerExecutor {
       console.warn(`[DockerExecutor] Dependency store reconciliation failed: ${this.compactError(error)}`);
     }
   }
-  async ensureNamedVolume(name, component) {
+  async ensureNamedVolume(name, component, deadlineLedger) {
     const result = await this.runDockerCommandCapture([
       resolveDockerExecutable(),
       "volume",
@@ -16769,7 +18079,9 @@ class DockerExecutor {
       "--label",
       `pushpals.repo=${this.options.repo}`,
       name
-    ], { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS });
+    ], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS
+    });
     if (result.timedOut || result.exitCode !== 0) {
       throw new Error(`Failed to prepare ${component} volume (${result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : `exit ${result.exitCode}`}): ${result.stderr || result.stdout || "no docker output"}`);
     }
@@ -16808,30 +18120,42 @@ class DockerExecutor {
     args.push("--mount", `type=bind,src=${dockerHostPath},dst=${WORKERPAL_HOST_CODEX_AUTH_PATH},readonly`);
     return { args, containerHome: containerCodexHome, hostAuthMounted: true };
   }
-  async ensureWarmContainer() {
+  async ensureWarmContainer(deadlineLedger) {
     const inspect = await this.runDockerCommandCapture([
       resolveDockerExecutable(),
       "inspect",
       "-f",
       "{{.State.Running}}|{{.HostConfig.NetworkMode}}",
       this.warmContainerName
-    ], { timeoutMs: DOCKER_PROBE_TIMEOUT_MS });
+    ], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS
+    });
     if (!inspect.timedOut && inspect.exitCode === 0) {
       const [runningRaw, networkModeRaw] = inspect.stdout.trim().split("|");
       const running = runningRaw?.trim() === "true";
       const networkMode = (networkModeRaw ?? "").trim();
       if (running && networkMode === this.options.networkMode) {
-        await this.reconcileContainerDependencyStore();
+        await this.reconcileContainerDependencyStore(deadlineLedger);
         return;
       }
       if (running && networkMode && networkMode !== this.options.networkMode) {
         console.warn(`[DockerExecutor] Warm container network mismatch (${networkMode} != ${this.options.networkMode}); recreating...`);
       }
     }
-    await this.startWarmContainer();
+    await this.startWarmContainer(deadlineLedger);
   }
   async runWarmShell(command, options = {}) {
-    const timeoutMs = typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) ? Math.max(1000, Math.floor(options.timeoutMs)) : DOCKER_PROBE_TIMEOUT_MS;
+    const hasExplicitTimeout = typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs);
+    if (hasExplicitTimeout && Number(options.timeoutMs) <= 0) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: "Warm-container command did not start because the absolute job deadline expired.",
+        exitCode: 124,
+        timedOut: true
+      };
+    }
+    const timeoutMs = hasExplicitTimeout ? Math.max(1, Math.floor(Number(options.timeoutMs))) : DOCKER_PROBE_TIMEOUT_MS;
     const effectiveCommand = `timeout --signal=TERM --kill-after=5s ${Math.max(1, Math.ceil(timeoutMs / 1000))}s /bin/sh -lc ${shellSingleQuote(command)}`;
     const proc = Bun.spawn([
       resolveDockerExecutable(),
@@ -16937,7 +18261,7 @@ class DockerExecutor {
     onLog?.("stderr", warning);
     await this.runBoundedDockerControl(["rm", "-f", this.warmContainerName], DOCKER_TIMEOUT_RECYCLE_TIMEOUT_MS);
   }
-  async runWarmWorktreeProbe(containerWorktreePath) {
+  async runWarmWorktreeProbe(containerWorktreePath, deadlineLedger) {
     const result = await this.runDockerCommandCapture([
       resolveDockerExecutable(),
       "exec",
@@ -16947,7 +18271,9 @@ class DockerExecutor {
       "/bin/sh",
       "-lc",
       "git rev-parse --is-inside-work-tree && git rev-parse --git-dir"
-    ], { timeoutMs: DOCKER_PROBE_TIMEOUT_MS });
+    ], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS
+    });
     return {
       ok: !result.timedOut && result.exitCode === 0,
       stdout: result.stdout,
@@ -16956,14 +18282,16 @@ class DockerExecutor {
       exitCode: result.timedOut ? 124 : result.exitCode
     };
   }
-  async inspectWarmContainerState() {
+  async inspectWarmContainerState(deadlineLedger) {
     const result = await this.runDockerCommandCapture([
       resolveDockerExecutable(),
       "inspect",
       "-f",
       "running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} oom={{.State.OOMKilled}}",
       this.warmContainerName
-    ], { timeoutMs: DOCKER_PROBE_TIMEOUT_MS });
+    ], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS
+    });
     const out = [result.stdout, result.stderr].filter(Boolean).join(`
 `);
     if (result.timedOut) {
@@ -16973,8 +18301,10 @@ ${out}` : ""}`;
     return result.exitCode === 0 ? out || "no inspect output" : `docker inspect failed (exit ${result.exitCode})${out ? `
 ${out}` : ""}`;
   }
-  async readWarmContainerLogs(tail = 160) {
-    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), "logs", "--tail", String(tail), this.warmContainerName], { timeoutMs: DOCKER_PROBE_TIMEOUT_MS });
+  async readWarmContainerLogs(tail = 160, deadlineLedger) {
+    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), "logs", "--tail", String(tail), this.warmContainerName], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS
+    });
     const out = [result.stdout, result.stderr].filter(Boolean).join(`
 `);
     if (result.timedOut) {
@@ -17010,7 +18340,7 @@ ${out}` : ""}`;
     } catch {}
     return Array.from(new Set(probes));
   }
-  async probeWorkerLlmEndpoint() {
+  async probeWorkerLlmEndpoint(deadlineLedger) {
     const endpoint = (this.config.workerpals.llm.endpoint ?? "").trim();
     if (!endpoint)
       return "endpoint not configured";
@@ -17019,8 +18349,11 @@ ${out}` : ""}`;
       return `endpoint malformed: ${endpoint}`;
     let lastError = "unreachable";
     for (const probe of probes) {
+      const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(2500) : 2500;
+      if (timeoutMs <= 0)
+        return "SKIPPED (absolute job work deadline expired)";
       try {
-        const status = await probeWorkerLlmHttpEndpointStatus(probe);
+        const status = await probeWorkerLlmHttpEndpointStatus(probe, timeoutMs);
         if (status >= 200 && status < 500) {
           return `reachable via ${probe} (HTTP ${status})`;
         }
@@ -17047,7 +18380,7 @@ ${out}` : ""}`;
       return raw;
     }
   }
-  async probeWorkerLlmEndpointFromContainer() {
+  async probeWorkerLlmEndpointFromContainer(deadlineLedger) {
     const endpoint = this.workerLlmEndpointForContainer();
     if (!endpoint)
       return "endpoint not configured";
@@ -17056,8 +18389,11 @@ ${out}` : ""}`;
       return `endpoint malformed: ${endpoint}`;
     let lastError = "unreachable";
     for (const probe of probes) {
+      const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(3500) : 3500;
+      if (timeoutMs <= 0)
+        return "SKIPPED (absolute job work deadline expired)";
       const cmd = `status="$(curl -sS -m 3 -o /dev/null -w "%{http_code}" ${shellSingleQuote(probe)} || true)"; ` + 'echo "$status"';
-      const result = await this.runWarmShell(cmd);
+      const result = await this.runWarmShell(cmd, { timeoutMs });
       const status = Number.parseInt(result.stdout.trim(), 10);
       if (Number.isFinite(status) && status >= 200 && status < 500) {
         return `reachable via ${probe} (HTTP ${status})`;
@@ -17071,7 +18407,7 @@ ${out}` : ""}`;
     }
     return `UNREACHABLE (${lastError})`;
   }
-  async collectWarmRuntimeDiagnostics(backend) {
+  async collectWarmRuntimeDiagnostics(backend, deadlineLedger) {
     const spec = getDockerBackendSpec(backend);
     const runtimeConfig = this.backendRuntimeConfig();
     const sections = [];
@@ -17087,12 +18423,14 @@ ${out}` : ""}`;
     if (endpoint && containerEndpoint && endpoint !== containerEndpoint) {
       sections.push(`[llm-endpoint-rewrite] ${endpoint} -> ${containerEndpoint}`);
     }
-    sections.push(`[llm-probe-host] ${await this.probeWorkerLlmEndpoint()}`);
-    sections.push(`[llm-probe-container] ${await this.probeWorkerLlmEndpointFromContainer()}`);
-    sections.push(`[container] ${await this.inspectWarmContainerState()}`);
+    sections.push(`[llm-probe-host] ${await this.probeWorkerLlmEndpoint(deadlineLedger)}`);
+    sections.push(`[llm-probe-container] ${await this.probeWorkerLlmEndpointFromContainer(deadlineLedger)}`);
+    sections.push(`[container] ${await this.inspectWarmContainerState(deadlineLedger)}`);
     sections.push(`[container-logs]
-${await this.readWarmContainerLogs(160)}`);
-    const shellProbe = await this.runWarmShell("true");
+${await this.readWarmContainerLogs(160, deadlineLedger)}`);
+    const shellProbe = await this.runWarmShell("true", {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS)
+    });
     if (!shellProbe.ok) {
       const probeOut = [shellProbe.stdout, shellProbe.stderr].filter(Boolean).join(`
 `);
@@ -17104,7 +18442,12 @@ ${probeOut}` : `
     }
     const checks = spec.diagnosticChecks?.(SHARED_CONTAINER_VENV_PYTHON) ?? [];
     for (const check of checks) {
-      const result = await this.runWarmShell(check.command);
+      const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) : DOCKER_PROBE_TIMEOUT_MS;
+      if (timeoutMs <= 0) {
+        sections.push(`[${check.label}] skipped: absolute job work deadline expired`);
+        break;
+      }
+      const result = await this.runWarmShell(check.command, { timeoutMs });
       const text = [result.stdout, result.stderr].filter(Boolean).join(`
 `);
       sections.push(`[${check.label}] exit=${result.exitCode}${text ? `
@@ -17114,9 +18457,10 @@ ${text}` : `
     return sections.join(`
 `);
   }
-  async stopWarmContainer(reason, quiet = false) {
+  async stopWarmContainer(reason, quiet = false, timeoutMs = DOCKER_CONTROL_TIMEOUT_MS) {
     this.clearIdleTimer();
-    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), "rm", "-f", this.warmContainerName], { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS });
+    const boundedTimeoutMs = Math.max(1, Math.min(DOCKER_CONTROL_TIMEOUT_MS, timeoutMs));
+    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), "rm", "-f", this.warmContainerName], { timeoutMs: boundedTimeoutMs });
     if (!result.timedOut && result.exitCode === 0) {
       if (!quiet) {
         console.log(`[DockerExecutor] Warm container stopped (${reason}): ${this.warmContainerName}`);
@@ -17124,10 +18468,7 @@ ${text}` : `
       this.warmedBackends.clear();
       return;
     }
-    const stderr = [
-      result.stderr,
-      result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : ""
-    ].filter(Boolean).join(`
+    const stderr = [result.stderr, result.timedOut ? `timed out after ${boundedTimeoutMs}ms` : ""].filter(Boolean).join(`
 `);
     const notFound = /No such container/i.test(stderr);
     if (!quiet && !notFound) {
@@ -17150,127 +18491,163 @@ ${text}` : `
       workerId: this.options.workerId
     })).toString("base64");
   }
-  mergeReviewPassUsage(accumulated, current) {
-    if (!accumulated)
-      return current;
-    if (!current)
-      return accumulated;
-    const promptTokens = accumulated.promptTokens + current.promptTokens;
-    const completionTokens = accumulated.completionTokens + current.completionTokens;
-    return {
-      promptTokens,
-      completionTokens,
-      totalTokens: (accumulated.totalTokens ?? accumulated.promptTokens + accumulated.completionTokens) + (current.totalTokens ?? current.promptTokens + current.completionTokens),
-      estimated: Boolean(accumulated.estimated || current.estimated),
-      backend: current.backend || accumulated.backend,
-      modelId: current.modelId || accumulated.modelId
-    };
-  }
-  async runHostScmOwnedReviewJob(worktreePath, initialJob, onLog) {
+  async runHostScmOwnedReviewJob(worktreePath, initialJob, deadlineLedger, onLog) {
     const maxMergeConflictPasses = 8;
     let effectiveJob = initialJob;
-    let accumulatedUsage;
-    for (let pass = 1;pass <= maxMergeConflictPasses; pass++) {
-      const result = await this.runInWarmContainer(worktreePath, this.encodeJobSpec(effectiveJob), effectiveJob, onLog);
-      accumulatedUsage = this.mergeReviewPassUsage(accumulatedUsage, result.usage);
-      if (!result.ok)
-        return { ...result, usage: accumulatedUsage };
-      if (isMergeConflictResolutionParams(effectiveJob.params)) {
-        const resume = await resumePreparedMergeConflictRebase(worktreePath, effectiveJob.kind, effectiveJob.params, onLog);
-        if (!resume.ok) {
-          return {
-            ...result,
-            ok: false,
-            summary: "Host-side merge-conflict rebase continuation failed",
-            stderr: [result.stderr, resume.error].filter(Boolean).join(`
-`),
-            exitCode: 4,
-            usage: accumulatedUsage
-          };
+    const accumulatedUsage = new UsageAccumulator;
+    const withAccumulatedUsage = (result) => accumulatedUsage.apply(result);
+    let activePass = 0;
+    try {
+      for (let pass = 1;pass <= maxMergeConflictPasses; pass++) {
+        activePass = pass;
+        const deadlineBoundJob = bindDockerJobToDeadline(effectiveJob, deadlineLedger);
+        if (!deadlineBoundJob) {
+          return withAccumulatedUsage(dockerAbsoluteDeadlineResult(initialJob, deadlineLedger, `host-owned review pass ${pass}`));
         }
-        if (resume.sequencer) {
-          if (resume.sequencer !== "rebase" || pass >= maxMergeConflictPasses) {
-            const detail = resume.sequencer !== "rebase" ? `Host-side review worktree left unexpected git ${resume.sequencer} in progress.` : `Host-side merge-conflict repair exceeded ${maxMergeConflictPasses} focused resolver passes.`;
-            return {
+        const result = await this.runInWarmContainer(worktreePath, deadlineBoundJob, onLog, deadlineLedger);
+        addHostScmReviewPassUsage(accumulatedUsage, result, pass);
+        if (deadlineLedger.remainingTotalMs() <= 0) {
+          return withAccumulatedUsage(dockerAbsoluteDeadlineResult(initialJob, deadlineLedger, `host-owned review pass ${pass}`, result));
+        }
+        if (!result.ok)
+          return withAccumulatedUsage(result);
+        if (isMergeConflictResolutionParams(effectiveJob.params)) {
+          if (deadlineLedger.workExpired()) {
+            return withAccumulatedUsage(dockerAbsoluteDeadlineResult(initialJob, deadlineLedger, `host-owned rebase continuation after pass ${pass}`, result));
+          }
+          const resume = await resumePreparedMergeConflictRebase(worktreePath, effectiveJob.kind, effectiveJob.params, onLog, deadlineLedger);
+          if (deadlineLedger.workExpired()) {
+            return withAccumulatedUsage(dockerAbsoluteDeadlineResult(initialJob, deadlineLedger, `host-owned rebase continuation after pass ${pass}`, result));
+          }
+          if (!resume.ok) {
+            return withAccumulatedUsage({
               ...result,
               ok: false,
-              summary: detail,
-              stderr: [result.stderr, resume.detail, detail].filter(Boolean).join(`
+              summary: "Host-side merge-conflict rebase continuation failed",
+              stderr: [result.stderr, resume.error].filter(Boolean).join(`
 `),
-              exitCode: 4,
-              usage: accumulatedUsage
-            };
+              exitCode: 4
+            });
           }
-          const refreshedParams = await refreshMergeConflictWorktreeHints(worktreePath, effectiveJob.params);
-          const planning = refreshedParams.planning && typeof refreshedParams.planning === "object" && !Array.isArray(refreshedParams.planning) ? { ...refreshedParams.planning } : {};
-          planning.executionBudgetMs = Math.min(300000, Math.max(60000, Number(planning.executionBudgetMs) || 300000));
-          planning.finalizationBudgetMs = Math.min(60000, Math.max(30000, Number(planning.finalizationBudgetMs) || 60000));
-          effectiveJob = {
-            ...effectiveJob,
-            params: markHostScmGitOwnership({
-              ...refreshedParams,
-              planning,
-              qualityRevisionAttempt: pass,
-              qualityRevisionHint: [
-                String(refreshedParams.qualityRevisionHint ?? "").trim(),
-                resume.detail ?? "Host-side rebase continuation advanced to another unresolved conflict.",
-                "Resolve only the currently conflicted file contents. Host-side SCM will stage and continue after this pass."
-              ].filter(Boolean).join(`
+          if (resume.sequencer) {
+            if (resume.sequencer !== "rebase" || pass >= maxMergeConflictPasses) {
+              const detail = resume.sequencer !== "rebase" ? `Host-side review worktree left unexpected git ${resume.sequencer} in progress.` : `Host-side merge-conflict repair exceeded ${maxMergeConflictPasses} focused resolver passes.`;
+              return withAccumulatedUsage({
+                ...result,
+                ok: false,
+                summary: detail,
+                stderr: [result.stderr, resume.detail, detail].filter(Boolean).join(`
+`),
+                exitCode: 4
+              });
+            }
+            const refreshedParams = await refreshMergeConflictWorktreeHints(worktreePath, effectiveJob.params, deadlineLedger);
+            if (deadlineLedger.workExpired()) {
+              return withAccumulatedUsage(dockerAbsoluteDeadlineResult(initialJob, deadlineLedger, `refreshing host-owned conflict hints after pass ${pass}`, result));
+            }
+            const planning = refreshedParams.planning && typeof refreshedParams.planning === "object" && !Array.isArray(refreshedParams.planning) ? { ...refreshedParams.planning } : {};
+            planning.executionBudgetMs = Math.min(300000, Math.max(60000, Number(planning.executionBudgetMs) || 300000));
+            planning.finalizationBudgetMs = Math.min(60000, Math.max(30000, Number(planning.finalizationBudgetMs) || 60000));
+            effectiveJob = {
+              ...effectiveJob,
+              params: markHostScmGitOwnership({
+                ...refreshedParams,
+                planning,
+                qualityRevisionAttempt: pass,
+                qualityRevisionHint: [
+                  String(refreshedParams.qualityRevisionHint ?? "").trim(),
+                  resume.detail ?? "Host-side rebase continuation advanced to another unresolved conflict.",
+                  "Resolve only the currently conflicted file contents. Host-side SCM will stage and continue after this pass."
+                ].filter(Boolean).join(`
 
 `)
-            })
-          };
-          onLog?.("stdout", `[MergeConflictHost] Rebase still requires conflict editing; starting focused container pass ${pass + 1}/${maxMergeConflictPasses}.`);
-          continue;
+              })
+            };
+            onLog?.("stdout", `[MergeConflictHost] Rebase still requires conflict editing; starting focused container pass ${pass + 1}/${maxMergeConflictPasses}.`);
+            continue;
+          }
         }
-      }
-      if (!shouldCommit(effectiveJob.kind, this.config)) {
-        return { ...result, usage: accumulatedUsage };
-      }
-      const commitResult = await createJobCommit(worktreePath, this.options.workerId, {
-        id: effectiveJob.id,
-        taskId: effectiveJob.taskId,
-        kind: effectiveJob.kind,
-        params: effectiveJob.params,
-        sessionId: effectiveJob.sessionId,
-        context: "host",
-        deferPublication: Boolean(result.validationBlocked)
-      }, this.config);
-      if (!commitResult.ok || !commitResult.sha || !commitResult.branch) {
-        const detail = commitResult.error ?? `Host-side completion metadata missing for review job ${effectiveJob.id}.`;
-        return {
-          ...result,
-          ok: false,
-          summary: commitResult.publishBlocked?.summary ?? "Host-side review finalization failed",
-          stderr: [result.stderr, detail].filter(Boolean).join(`
+        if (!shouldCommit(effectiveJob.kind, this.config)) {
+          return withAccumulatedUsage(result);
+        }
+        if (deadlineLedger.remainingTotalMs() <= 0) {
+          return withAccumulatedUsage(dockerAbsoluteDeadlineResult(initialJob, deadlineLedger, "host-owned commit finalization", result));
+        }
+        const commitResult = await createJobCommit(worktreePath, this.options.workerId, {
+          id: effectiveJob.id,
+          taskId: effectiveJob.taskId,
+          kind: effectiveJob.kind,
+          params: effectiveJob.params,
+          sessionId: effectiveJob.sessionId,
+          context: "host",
+          deferPublication: Boolean(result.validationBlocked)
+        }, this.config, deadlineLedger);
+        addHostScmFinalizationUsage(accumulatedUsage, commitResult, pass);
+        if (deadlineLedger.remainingTotalMs() <= 0) {
+          return withAccumulatedUsage(dockerAbsoluteDeadlineResult(initialJob, deadlineLedger, "host-owned commit finalization", {
+            ...result,
+            ...commitResult.ok && commitResult.sha && commitResult.branch ? {
+              commit: {
+                branch: commitResult.branch,
+                sha: commitResult.sha,
+                publicBranch: commitResult.publicBranch
+              }
+            } : {}
+          }));
+        }
+        if (!commitResult.ok || !commitResult.sha || !commitResult.branch) {
+          const detail = commitResult.error ?? `Host-side completion metadata missing for review job ${effectiveJob.id}.`;
+          return withAccumulatedUsage({
+            ...result,
+            ok: false,
+            summary: commitResult.publishBlocked?.summary ?? "Host-side review finalization failed",
+            stderr: [result.stderr, detail].filter(Boolean).join(`
 `),
-          exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 1,
-          publishBlocked: commitResult.publishBlocked,
-          usage: accumulatedUsage
-        };
+            exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 1,
+            publishBlocked: commitResult.publishBlocked
+          });
+        }
+        return withAccumulatedUsage({
+          ...result,
+          commit: {
+            branch: commitResult.branch,
+            sha: commitResult.sha,
+            publicBranch: commitResult.publicBranch
+          }
+        });
       }
-      return {
-        ...result,
-        commit: {
-          branch: commitResult.branch,
-          sha: commitResult.sha,
-          publicBranch: commitResult.publicBranch
-        },
-        usage: accumulatedUsage
-      };
+      return withAccumulatedUsage({
+        ok: false,
+        summary: "Host-side review execution exhausted resolver passes",
+        stderr: `Exceeded ${maxMergeConflictPasses} host-owned review passes.`,
+        exitCode: 4
+      });
+    } catch (error) {
+      throw attachHostScmUsageToError(accumulatedUsage, error, activePass);
     }
-    return {
-      ok: false,
-      summary: "Host-side review execution exhausted resolver passes",
-      exitCode: 4,
-      usage: accumulatedUsage
-    };
   }
-  async runInWarmContainer(worktreePath, base64Spec, job, onLog) {
-    await this.ensureWarmRuntimeReady(job, onLog);
+  async runInWarmContainer(worktreePath, job, onLog, deadlineLedger) {
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-container setup");
+    }
+    await this.ensureWarmRuntimeReady(job, onLog, deadlineLedger);
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-runtime setup");
+    }
     const startedAtMs = Date.now();
-    const containerWorktreePath = await this.ensureWorktreeAccessibleInWarmContainer(worktreePath, onLog);
-    const dependencyPreparation = await this.ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog);
+    const containerWorktreePath = await this.ensureWorktreeAccessibleInWarmContainer(worktreePath, onLog, deadlineLedger);
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "worktree visibility setup");
+    }
+    const dependencyPreparation = await this.ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog, deadlineLedger);
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "dependency preparation");
+    }
+    const deadlineBoundJob = deadlineLedger ? bindDockerJobToDeadline(job, deadlineLedger) : job;
+    if (!deadlineBoundJob) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-container dependency preparation");
+    }
+    const base64Spec = this.encodeJobSpec(deadlineBoundJob);
     const args = this.buildWarmContainerExecArgs(containerWorktreePath);
     console.log(`[DockerExecutor] Running job in warm container: ${this.warmContainerName} (${this.executionConfigSummary()})`);
     const dockerArgv = [resolveDockerExecutable(), ...args];
@@ -17284,10 +18661,22 @@ ${text}` : `
     } catch (err) {
       throw new Error(`failed to spawn warm-container docker exec (${this.warmContainerName}, cwd=${containerWorktreePath}, argv_chars=${dockerArgv.join("\x00").length}, spec_chars=${base64Spec.length}): ${this.compactError(err)}`);
     }
-    const timeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, job);
-    if (timeoutMs !== this.options.timeoutMs) {
-      const verb = timeoutMs > this.options.timeoutMs ? "Extended" : "Capped";
-      const note = `[DockerExecutor] ${verb} job timeout for browser validation convergence: ${timeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
+    const configuredTimeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, deadlineBoundJob);
+    const timeoutMs = resolveDockerContainerTransportTimeoutMs(configuredTimeoutMs, deadlineBoundJob, deadlineLedger);
+    if (timeoutMs <= 0) {
+      await terminateDockerExecProcessTree(proc);
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "Docker spawn");
+    }
+    if (configuredTimeoutMs !== this.options.timeoutMs) {
+      const verb = configuredTimeoutMs > this.options.timeoutMs ? "Extended" : "Capped";
+      const note = `[DockerExecutor] ${verb} job timeout for browser validation convergence: ${configuredTimeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
+      console.log(note);
+      onLog?.("stdout", note);
+    }
+    if (timeoutMs < configuredTimeoutMs) {
+      const planning = maybeRecord(deadlineBoundJob.params.planning);
+      const preservesHostCleanupReserve = readPositiveNumber(planning?.executionBudgetMs) === null || readPositiveNumber(planning?.finalizationBudgetMs) === null;
+      const note = `[DockerExecutor] Capped this container invocation to ${timeoutMs}ms from the shared absolute job deadline (${preservesHostCleanupReserve ? "host cleanup reserve preserved" : "remaining work plus inner finalization"}).`;
       console.log(note);
       onLog?.("stdout", note);
     }
@@ -17438,14 +18827,18 @@ ${text}` : `
     }
     throw new Error("docker exec stdin pipe does not support write/end or getWriter");
   }
-  async ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog) {
+  async ensureWorktreeDependencyArtifacts(containerWorktreePath, onLog, deadlineLedger) {
     const startedAt = Date.now();
     const worktreeId = this.dependencyProjectionId(containerWorktreePath);
     if (worktreeId)
       this.preparedDependencyProjectionIds.add(worktreeId);
     let currentPhase = "starting";
     let currentProgress = 0;
-    const startNote = `[DependencyPreparation] phase=${currentPhase} progress=${currentProgress} timeout_ms=${this.dependencyPreparationTimeoutMs}`;
+    const preparationTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(this.dependencyPreparationTimeoutMs) : this.dependencyPreparationTimeoutMs;
+    if (preparationTimeoutMs <= 0) {
+      throw new Error("Dependency preparation did not start because the absolute job work deadline expired.");
+    }
+    const startNote = `[DependencyPreparation] phase=${currentPhase} progress=${currentProgress} timeout_ms=${preparationTimeoutMs}`;
     console.log(startNote);
     onLog?.("stdout", startNote);
     const command = buildWorktreeDependencyPreparationCommand(containerWorktreePath);
@@ -17455,7 +18848,7 @@ ${text}` : `
       onLog?.("stdout", note2);
     }, 15000);
     const result = await this.runWarmShell(command, {
-      timeoutMs: this.dependencyPreparationTimeoutMs,
+      timeoutMs: preparationTimeoutMs,
       onLog: (stream, line) => {
         const progress = line.match(/^\[DependencyPreparation\]\s+phase=([^\s]+)\s+progress=(\d+)$/);
         if (progress) {
@@ -17493,29 +18886,39 @@ ${text}` : `
       artifacts: linked
     };
   }
-  async waitForWorktreePathInWarmContainer(containerWorktreePath, timeoutMs = 5000) {
-    const deadline = Date.now() + timeoutMs;
+  async waitForWorktreePathInWarmContainer(containerWorktreePath, timeoutMs = 5000, deadlineLedger) {
+    const boundedTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(timeoutMs) : timeoutMs;
+    if (boundedTimeoutMs <= 0) {
+      throw new Error("worktree visibility probe did not start because the absolute job work deadline expired");
+    }
+    const deadline = Date.now() + boundedTimeoutMs;
     let lastDetail = "";
     const command = `test -d ${shellSingleQuote(containerWorktreePath)}`;
     while (Date.now() < deadline) {
-      const result = await this.runWarmShell(command);
+      const probeTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(Math.max(1, deadline - Date.now())) : Math.max(1, deadline - Date.now());
+      if (probeTimeoutMs <= 0)
+        break;
+      const result = await this.runWarmShell(command, { timeoutMs: probeTimeoutMs });
       if (result.ok)
         return;
       lastDetail = [result.stdout, result.stderr].filter(Boolean).join(`
 `).trim();
-      await this.sleep(100);
+      const retryDelayMs = deadlineLedger ? deadlineLedger.capWorkTimeout(100) : 100;
+      if (retryDelayMs <= 0)
+        break;
+      await this.sleep(retryDelayMs);
     }
-    throw new Error(`worktree path not visible inside warm container after ${timeoutMs}ms: ${containerWorktreePath}${lastDetail ? ` (${lastDetail})` : ""}`);
+    throw new Error(`worktree path not visible inside warm container after ${boundedTimeoutMs}ms: ${containerWorktreePath}${lastDetail ? ` (${lastDetail})` : ""}`);
   }
-  async ensureWorktreeAccessibleInWarmContainer(worktreePath, onLog) {
+  async ensureWorktreeAccessibleInWarmContainer(worktreePath, onLog, deadlineLedger) {
     const worktreeRelPath = relative2(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
     let lastError = null;
     for (let attempt = 1;attempt <= 2; attempt++) {
       try {
-        await this.ensureWarmContainer();
-        await this.waitForWorktreePathInWarmContainer(containerWorktreePath, this.worktreeVisibilityTimeoutMs);
-        const probe = await this.runWarmWorktreeProbe(containerWorktreePath);
+        await this.ensureWarmContainer(deadlineLedger);
+        await this.waitForWorktreePathInWarmContainer(containerWorktreePath, this.worktreeVisibilityTimeoutMs, deadlineLedger);
+        const probe = await this.runWarmWorktreeProbe(containerWorktreePath, deadlineLedger);
         if (probe.ok) {
           return containerWorktreePath;
         }
@@ -17525,13 +18928,16 @@ ${text}` : `
       } catch (err) {
         lastError = err;
         if (attempt >= 2) {
-          const diagnostics = await this.inspectWarmContainerState().catch(() => "");
+          const diagnostics = await this.inspectWarmContainerState(deadlineLedger).catch(() => "");
           throw new Error(`worktree not accessible inside warm container after ${attempt} attempts: ${containerWorktreePath}${lastError ? ` (${this.compactError(lastError)})` : ""}${diagnostics ? ` | container=${diagnostics}` : ""}`);
         }
         const note = `[DockerExecutor] Warm container could not access worktree ${containerWorktreePath}; ` + `recycling container and retrying once (${this.compactError(err)}).`;
         console.warn(note);
         onLog?.("stderr", note);
-        await this.stopWarmContainer("worktree visibility retry", true);
+        const stopTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) : DOCKER_CONTROL_TIMEOUT_MS;
+        if (stopTimeoutMs <= 0)
+          throw err;
+        await this.stopWarmContainer("worktree visibility retry", true, stopTimeoutMs);
       }
     }
     return containerWorktreePath;
@@ -17878,14 +19284,17 @@ ${text}` : `
       diagnostics: dockerFallbackDiagnostics(summary, context, exitCode === 0 ? 1 : exitCode, failureClass)
     };
   }
-  async ensureWarmRuntimeReady(job, onLog) {
+  async ensureWarmRuntimeReady(job, onLog, deadlineLedger) {
     const backend = resolveExecutor(this.config);
     let attempt = 1;
     let recoveredMissingImage = false;
     while (attempt <= this.warmSetupMaxAttempts) {
+      if (deadlineLedger?.workExpired()) {
+        throw new Error(`Warm runtime setup for ${job.id} stopped at the absolute job work deadline.`);
+      }
       try {
-        await this.ensureWarmContainer();
-        await this.ensureBackendWarmup(backend);
+        await this.ensureWarmContainer(deadlineLedger);
+        await this.ensureBackendWarmup(backend, deadlineLedger);
         return;
       } catch (err) {
         if (this.isMissingDockerImageError(err) && !recoveredMissingImage) {
@@ -17893,9 +19302,12 @@ ${text}` : `
           const rebuildNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is missing locally; rebuilding before retrying warm container startup.`;
           console.warn(rebuildNote);
           onLog?.("stderr", rebuildNote);
-          await this.stopWarmContainer("missing image recovery", true);
+          const recoveryTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) : DOCKER_CONTROL_TIMEOUT_MS;
+          if (recoveryTimeoutMs <= 0)
+            throw err;
+          await this.stopWarmContainer("missing image recovery", true, recoveryTimeoutMs);
           this.warmedBackends.clear();
-          if (await this.pullImage()) {
+          if (await this.pullImage(deadlineLedger)) {
             const retryNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is available again; retrying warm container startup.`;
             console.log(retryNote);
             onLog?.("stdout", retryNote);
@@ -17913,13 +19325,20 @@ ${text}` : `
         const note = `[DockerExecutor] Warm runtime setup failed (attempt ${attempt}/${this.warmSetupMaxAttempts}): ${this.compactError(err)}. Retrying in ${retryInMs}ms.`;
         console.warn(note);
         onLog?.("stderr", note);
-        await this.stopWarmContainer("warm setup retry", true);
-        await this.sleep(retryInMs);
+        const retryRecoveryTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) : DOCKER_CONTROL_TIMEOUT_MS;
+        if (retryRecoveryTimeoutMs <= 0)
+          throw err;
+        await this.stopWarmContainer("warm setup retry", true, retryRecoveryTimeoutMs);
+        const boundedRetryInMs = deadlineLedger ? deadlineLedger.capWorkTimeout(retryInMs) : retryInMs;
+        if (boundedRetryInMs < retryInMs) {
+          throw new Error(`Warm runtime retry for ${job.id} was cancelled to preserve the finalization reserve.`);
+        }
+        await this.sleep(boundedRetryInMs);
         attempt += 1;
       }
     }
   }
-  async ensureBackendWarmup(backend) {
+  async ensureBackendWarmup(backend, deadlineLedger) {
     if (this.warmedBackends.has(backend))
       return;
     const spec = getDockerBackendSpec(backend);
@@ -17928,11 +19347,13 @@ ${text}` : `
       await spec.ensureWarmRuntime({
         ...warmContext,
         warmContainerName: this.warmContainerName,
-        runWarmShell: (command) => this.runWarmShell(command, { timeoutMs: this.warmAgentStartupTimeoutMs }),
+        runWarmShell: (command) => this.runWarmShell(command, {
+          timeoutMs: deadlineLedger?.capWorkTimeout(this.warmAgentStartupTimeoutMs) ?? this.warmAgentStartupTimeoutMs
+        }),
         restartWarmContainer: async () => {
-          await this.startWarmContainer();
+          await this.startWarmContainer(deadlineLedger);
         },
-        collectWarmDiagnostics: async () => this.collectWarmRuntimeDiagnostics(backend)
+        collectWarmDiagnostics: async () => deadlineLedger?.workExpired() ? "Warm-runtime diagnostics skipped because the absolute job work deadline expired." : this.collectWarmRuntimeDiagnostics(backend, deadlineLedger)
       });
       this.warmedBackends.add(backend);
       return;
@@ -17940,7 +19361,7 @@ ${text}` : `
     const cmd = spec.warmupProbeCommand?.(SHARED_CONTAINER_VENV_PYTHON);
     if (cmd) {
       const result = await this.runWarmShell(cmd, {
-        timeoutMs: this.warmAgentStartupTimeoutMs
+        timeoutMs: deadlineLedger?.capWorkTimeout(this.warmAgentStartupTimeoutMs) ?? this.warmAgentStartupTimeoutMs
       });
       if (!result.ok) {
         const detail = [result.stdout, result.stderr].filter(Boolean).join(`
@@ -17959,6 +19380,17 @@ ${text}` : `
     await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
   }
   async runHostCommandCapture(command, opts = {}) {
+    const hasExplicitTimeout = typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs);
+    if (hasExplicitTimeout && Number(opts.timeoutMs) <= 0) {
+      return {
+        stdout: "",
+        stderr: "Command did not start because the absolute job deadline expired.",
+        exitCode: 124,
+        timedOut: true,
+        drainTimedOut: false
+      };
+    }
+    const timeoutMs = hasExplicitTimeout ? Math.max(1, Math.floor(Number(opts.timeoutMs))) : DOCKER_CONTROL_TIMEOUT_MS;
     const proc = Bun.spawn(command, {
       cwd: opts.cwd,
       stdin: "ignore",
@@ -17971,7 +19403,6 @@ ${text}` : `
       await terminateDockerExecProcessTree(proc);
       throw new Error(`bounded process capture pipes were unavailable: ${command.join(" ")}`);
     }
-    const timeoutMs = typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? Math.max(1, Math.floor(opts.timeoutMs)) : DOCKER_CONTROL_TIMEOUT_MS;
     const streamAbort = new AbortController;
     const streams = Promise.all([
       readCapturedProcessStream(stdout, streamAbort.signal),
@@ -18087,6 +19518,15 @@ ${result.stderr ?? ""}`.toLowerCase();
     onLog?.("stderr", note);
     return false;
   }
+  hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog) {
+    const remainingWorkMs = deadlineLedger.remainingWorkMs();
+    if (remainingWorkMs > retryInMs)
+      return true;
+    const note = `[DockerExecutor] Skipping retry attempt ${attempt + 1}/${this.jobRetryMaxAttempts}: absolute job deadline has ${remainingWorkMs}ms work budget remaining, which cannot cover ${retryInMs}ms backoff while preserving finalization reserve.`;
+    console.warn(note);
+    onLog?.("stderr", note);
+    return false;
+  }
   toDockerPath(hostPath) {
     const winMatch = hostPath.match(/^([a-zA-Z]):([\\/])(.*)$/);
     if (winMatch) {
@@ -18134,18 +19574,21 @@ ${result.stderr ?? ""}`.toLowerCase();
       return "work";
     return normalized.slice(0, maxLength);
   }
-  async ensureFreshWorktreePath(worktreePath) {
+  async ensureFreshWorktreePath(worktreePath, deadlineLedger) {
     if (!existsSync11(worktreePath))
       return;
     console.warn(`[DockerExecutor] Worktree path already exists; forcing cleanup before create: ${worktreePath}`);
     await this.runHostCommandCapture(["git", "worktree", "remove", "--force", "--force", worktreePath], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+      timeoutMs: deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ?? HOST_GIT_CONTROL_TIMEOUT_MS
     });
     await this.runHostCommandCapture(["git", "worktree", "prune"], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+      timeoutMs: deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ?? HOST_GIT_CONTROL_TIMEOUT_MS
     });
+    if (deadlineLedger?.workExpired()) {
+      throw new Error(`Stale worktree cleanup for ${worktreePath} stopped at the absolute job work deadline.`);
+    }
     const forced = await forceDeleteWorktreePath(worktreePath, {
       sleepFn: (ms) => this.sleep(ms)
     });
@@ -18215,16 +19658,16 @@ ${result.stderr ?? ""}`.toLowerCase();
     console.log(doneMsg);
     onLog?.("stdout", doneMsg);
   }
-  async resolveWorktreeBaseRefForJob(job, onLog) {
+  async resolveWorktreeBaseRefForJob(job, onLog, deadlineLedger) {
     return resolveReviewWorktreeBase({
       jobId: job.id,
       params: job.params,
-      git: (args) => this.runGitBaseRefCommand(args),
+      git: (args) => this.runGitBaseRefCommand(args, deadlineLedger),
       fallback: () => resolveFreshWorktreeBaseRef({
         requestedRef: this.options.baseRef,
         integrationBranch: this.config.sourceControlManager.mainBranch || this.config.workerpals.baseRef || this.options.baseRef,
         sourceBaseBranch: this.config.sourceControlManager.baseBranch,
-        git: (args) => this.runGitBaseRefCommand(args),
+        git: (args) => this.runGitBaseRefCommand(args, deadlineLedger),
         log: (level, message) => {
           const line = `[DockerExecutor] ${message}`;
           if (level === "warn") {
@@ -18248,61 +19691,63 @@ ${result.stderr ?? ""}`.toLowerCase();
       }
     });
   }
-  async runGitBaseRefCommand(args) {
+  async runGitBaseRefCommand(args, deadlineLedger) {
+    const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) : HOST_GIT_CONTROL_TIMEOUT_MS;
     const result = await this.runHostCommandCapture(["git", ...args], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS
+      timeoutMs
     });
     return {
       ok: !result.timedOut && result.exitCode === 0,
       stdout: result.stdout,
-      stderr: [
-        result.stderr,
-        result.timedOut ? `git command timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms` : ""
-      ].filter(Boolean).join(`
+      stderr: [result.stderr, result.timedOut ? `git command timed out after ${timeoutMs}ms` : ""].filter(Boolean).join(`
 `)
     };
   }
-  async pullImage() {
+  async pullImage(deadlineLedger) {
     const runtimeTag = resolveWorkerpalRuntimeTag();
-    const existingRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag() : "";
-    if (await this.imageExists()) {
+    const existingRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag(deadlineLedger) : "";
+    if (await this.imageExists(deadlineLedger)) {
       if (!runtimeTag || existingRuntimeTag === runtimeTag) {
         console.log(`[DockerExecutor] Using local image: ${this.options.imageName}`);
         return true;
       }
       console.warn(`[DockerExecutor] Local image ${this.options.imageName} is stale or unlabeled (runtimeTag=${existingRuntimeTag || "missing"}, expected=${runtimeTag}).`);
     }
-    if (await this.buildLocalImage(runtimeTag)) {
-      const rebuiltRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag() : "";
+    if (await this.buildLocalImage(runtimeTag, deadlineLedger)) {
+      const rebuiltRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag(deadlineLedger) : "";
       if (!runtimeTag || rebuiltRuntimeTag === runtimeTag) {
         console.log(`[DockerExecutor] Using locally built image: ${this.options.imageName}`);
         return true;
       }
     }
     console.log(`[DockerExecutor] Local image is unavailable or unsuitable. Pulling: ${this.options.imageName}`);
-    const pull = await this.runDockerCommandCapture([resolveDockerExecutable(), "pull", this.options.imageName], { timeoutMs: DOCKER_IMAGE_PULL_TIMEOUT_MS });
+    const pull = await this.runDockerCommandCapture([resolveDockerExecutable(), "pull", this.options.imageName], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_PULL_TIMEOUT_MS) ?? DOCKER_IMAGE_PULL_TIMEOUT_MS
+    });
     if (!pull.timedOut && pull.exitCode === 0) {
       console.log(`[DockerExecutor] Image pulled successfully`);
       return true;
     }
     const detail = pull.stderr || pull.stdout || `docker pull exited ${pull.exitCode}`;
     console.error(`[DockerExecutor] Failed to pull image: ${pull.timedOut ? `timed out after ${DOCKER_IMAGE_PULL_TIMEOUT_MS}ms` : detail}`);
-    if (await this.imageExists()) {
+    if (await this.imageExists(deadlineLedger)) {
       console.warn(`[DockerExecutor] Pull failed but local image is now available: ${this.options.imageName}`);
       return true;
     }
     return false;
   }
-  async imageExists() {
-    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), "image", "inspect", this.options.imageName], { timeoutMs: DOCKER_IMAGE_INSPECT_TIMEOUT_MS });
+  async imageExists(deadlineLedger) {
+    const result = await this.runDockerCommandCapture([resolveDockerExecutable(), "image", "inspect", this.options.imageName], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_INSPECT_TIMEOUT_MS) ?? DOCKER_IMAGE_INSPECT_TIMEOUT_MS
+    });
     if (result.timedOut) {
       console.warn(`[DockerExecutor] Timed out checking local image ${this.options.imageName}; treating it as unavailable and attempting rebuild.`);
       return false;
     }
     return result.exitCode === 0;
   }
-  async inspectImageRuntimeTag() {
+  async inspectImageRuntimeTag(deadlineLedger) {
     const result = await this.runDockerCommandCapture([
       resolveDockerExecutable(),
       "image",
@@ -18310,7 +19755,9 @@ ${result.stderr ?? ""}`.toLowerCase();
       "--format",
       `{{ index .Config.Labels "${WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL}" }}`,
       this.options.imageName
-    ], { timeoutMs: DOCKER_IMAGE_INSPECT_TIMEOUT_MS });
+    ], {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_INSPECT_TIMEOUT_MS) ?? DOCKER_IMAGE_INSPECT_TIMEOUT_MS
+    });
     if (result.timedOut) {
       console.warn(`[DockerExecutor] Timed out inspecting runtime tag for ${this.options.imageName}; treating the local image as stale and attempting rebuild.`);
       return "";
@@ -18325,7 +19772,7 @@ ${result.stderr ?? ""}`.toLowerCase();
     const value = result.stdout.trim();
     return value === "<no value>" ? "" : value;
   }
-  async buildLocalImage(runtimeTag) {
+  async buildLocalImage(runtimeTag, deadlineLedger) {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
     if (!existsSync11(sandboxContext.dockerfilePath)) {
       return false;
@@ -18351,7 +19798,7 @@ ${result.stderr ?? ""}`.toLowerCase();
     }
     const build = await this.runDockerCommandCapture(args, {
       cwd: sandboxContext.root,
-      timeoutMs: DOCKER_IMAGE_BUILD_TIMEOUT_MS
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_BUILD_TIMEOUT_MS) ?? DOCKER_IMAGE_BUILD_TIMEOUT_MS
     });
     if (!build.timedOut && build.exitCode === 0) {
       return true;
@@ -19034,10 +20481,15 @@ function buildUnhandledWorkerFailureResult(error, executorBackend = resolveExecu
   const failureClass = workerRuntimeFailure ? "worker_runtime_failure" : dockerFailure ? "docker_engine" : "worker_failure";
   const terminalStage = workerRuntimeFailure ? "worker_runtime" : dockerFailure ? "docker" : "worker";
   const summary = `Job execution failed before completion: ${errorSummary}`;
+  const candidateState = error && typeof error === "object" ? error.candidateState ?? undefined : undefined;
+  const carriedUsage = error && typeof error === "object" ? error : {};
   return {
     ok: false,
     summary,
     stderr: detail,
+    ...candidateState ? { candidateState } : {},
+    ...carriedUsage.usage ? { usage: carriedUsage.usage } : {},
+    ...carriedUsage.usageAttempts ? { usageAttempts: carriedUsage.usageAttempts } : {},
     diagnostics: {
       terminal: {
         failureClass,
@@ -19330,12 +20782,47 @@ async function resolveWorkerGitToken(repo, configuredToken) {
   }
   return resolved.token;
 }
-async function runJob(job, repo, dockerExecutor, runtimeConfig, onLog) {
+async function runJob(job, repo, dockerExecutor, runtimeConfig, onLog, directDeadlineLedger) {
   if (dockerExecutor) {
     const result = await dockerExecutor.execute(job, onLog);
     return workerJobResultFromDocker(result);
   }
-  return executeJob(job.kind, job.params, repo, onLog, runtimeConfig);
+  return executeJob(job.kind, job.params, repo, onLog, runtimeConfig, directDeadlineLedger);
+}
+async function retainDirectFailureCandidate(result, repo, workerId, job, runtimeConfig = CONFIG, baselineSha, deadlineLedger) {
+  if (result.ok)
+    return result;
+  const candidateState = result.candidateState ?? {
+    status: result.exitCode === 124 ? "partial" : "held",
+    reason: result.exitCode === 124 ? "execution_timeout" : "terminal_failure",
+    changedPaths: []
+  };
+  const retained = await checkpointJobCandidate(repo, workerId, job, candidateState, runtimeConfig, baselineSha, deadlineLedger);
+  return retained.checkpoint ? {
+    ...result,
+    candidateState: retained,
+    stderr: [
+      result.stderr,
+      `Candidate checkpoint retained at ${retained.checkpoint.ref} (${retained.checkpoint.sha}).`
+    ].filter(Boolean).join(`
+`)
+  } : retained.changedPaths.length > 0 ? { ...result, candidateState: retained } : result;
+}
+function buildDirectCommitFinalizationFailure(result, error) {
+  const detail = error.trim() || "Host-side Git finalization returned no commit metadata.";
+  return {
+    ...result,
+    ok: false,
+    summary: "Failed to finalize the candidate commit",
+    stderr: [result.stderr, detail].filter(Boolean).join(`
+`),
+    exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 4,
+    candidateState: result.candidateState ?? {
+      status: "held",
+      reason: "commit_finalization_failed",
+      changedPaths: []
+    }
+  };
 }
 function workerJobResultFromDocker(result) {
   return {
@@ -19346,6 +20833,8 @@ function workerJobResultFromDocker(result) {
     exitCode: result.exitCode,
     cooldownMs: result.cooldownMs,
     usage: result.usage,
+    usageAttempts: result.usageAttempts,
+    candidateState: result.candidateState,
     publishBlocked: result.publishBlocked,
     validationBlocked: result.validationBlocked,
     commit: result.commit,
@@ -19377,13 +20866,39 @@ function holdCommitForTrustedValidation(result, commit) {
       completionCommit: null
     };
   }
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(commit.sha.trim())) {
+    return {
+      result: {
+        ...result,
+        ok: false,
+        summary: "Trusted-environment validation requires an exact candidate commit SHA",
+        stderr: [
+          result.stderr,
+          `Refusing trusted-host handoff with non-immutable candidate identifier: ${commit.sha}`
+        ].filter(Boolean).join(`
+`),
+        exitCode: 4
+      },
+      completionCommit: null
+    };
+  }
   return {
     result: {
       ...result,
       ok: true,
       summary: `${result.validationBlocked.summary}; queued for host-side validation`,
       exitCode: 0,
-      publishBlocked: undefined
+      publishBlocked: undefined,
+      candidateState: {
+        status: "held",
+        reason: "trusted_environment_validation_required",
+        changedPaths: result.candidateState?.changedPaths ?? [],
+        checkpoint: {
+          ref: commit.branch,
+          sha: commit.sha,
+          capturedAt: new Date().toISOString()
+        }
+      }
     },
     completionCommit: commit
   };
@@ -19421,12 +20936,12 @@ function buildTrustedValidationCompletionPayload(validationBlocked) {
     trustedValidationDetail: validationBlocked.detail
   };
 }
-async function resolveWorktreeBaseRef(repo, requestedRef) {
+async function resolveWorktreeBaseRef(repo, requestedRef, deadlineLedger) {
   return resolveFreshWorktreeBaseRef({
     requestedRef,
     integrationBranch: integrationBranchName(),
     sourceBaseBranch: CONFIG.sourceControlManager.baseBranch,
-    git: (args) => git2(repo, args),
+    git: (args) => git2(repo, args, deadlineLedger, "work"),
     log: (level, message) => {
       const line = `[WorkerPals] ${message}`;
       if (level === "warn")
@@ -19436,12 +20951,12 @@ async function resolveWorktreeBaseRef(repo, requestedRef) {
     }
   });
 }
-async function resolveWorktreeBaseRefForJob(repo, requestedRef, jobId, params) {
+async function resolveWorktreeBaseRefForJob(repo, requestedRef, jobId, params, deadlineLedger) {
   return resolveReviewWorktreeBase({
     jobId,
     params,
-    git: (args) => git2(repo, args),
-    fallback: () => resolveWorktreeBaseRef(repo, requestedRef),
+    git: (args) => git2(repo, args, deadlineLedger, "work"),
+    fallback: () => resolveWorktreeBaseRef(repo, requestedRef, deadlineLedger),
     log: (level, message) => {
       const line = `[WorkerPals] ${message}`;
       if (level === "warn")
@@ -19451,11 +20966,11 @@ async function resolveWorktreeBaseRefForJob(repo, requestedRef, jobId, params) {
     }
   });
 }
-async function createIsolatedWorktree(repo, jobId, baseRef, onLog) {
+async function createIsolatedWorktree(repo, jobId, baseRef, onLog, deadlineLedger) {
   const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random().toString(36).slice(2, 6)}`;
   const worktreePath = resolveDirectWorktreePath(repo, jobId, nonce);
   mkdirSync5(resolve13(worktreePath, ".."), { recursive: true });
-  const addResult = await git2(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
+  const addResult = await git2(repo, ["worktree", "add", "--detach", worktreePath, baseRef], deadlineLedger, "work");
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
   }
@@ -20234,26 +21749,78 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
             emitJobLog("stdout", `[WorkerPals] Job ${job.id} still running after ${formatDurationMs(now - jobClaimedAtMs)} (kind=${job.kind}, worker=${opts.workerId}, phase=${currentJobPhase ?? "unknown"}, quiet_for=${formatDurationMs(quietForMs)}).`);
           }, jobProgressLogEveryMs) : null;
           let directWorktreePath = null;
+          let directWorktreeBaselineSha = null;
+          let preserveDirectWorktreeForCandidateRecovery = false;
           let executionRepo = opts.repo;
           let result = null;
           let recycleWorkerAfterJob = false;
           let recycleWorkerAfterUnconfirmedTerminal = false;
           try {
             let parsedParams;
-            const preparationStartedAtMs = Date.now();
+            const jobStartedAtMs = Date.now();
+            const preparationStartedAtMs = jobStartedAtMs;
+            let directDeadlineLedger;
             try {
               parsedParams = typeof job.params === "string" ? JSON.parse(job.params) : job.params;
               if (!dockerExecutor) {
-                const jobBaseRef = await resolveWorktreeBaseRefForJob(opts.repo, opts.worktreeBaseRef, job.id, parsedParams);
-                directWorktreePath = await createIsolatedWorktree(opts.repo, job.id, jobBaseRef, onLog);
+                const directPlanning = parsedParams.planning && typeof parsedParams.planning === "object" && !Array.isArray(parsedParams.planning) ? parsedParams.planning : null;
+                const directExecutionBudgetMs = Number(directPlanning?.executionBudgetMs);
+                const directFinalizationBudgetMs = Number(directPlanning?.finalizationBudgetMs);
+                directDeadlineLedger = directPlanning && Number.isFinite(directExecutionBudgetMs) && directExecutionBudgetMs > 0 && Number.isFinite(directFinalizationBudgetMs) && directFinalizationBudgetMs > 0 ? new JobDeadlineLedger({
+                  executionBudgetMs: directExecutionBudgetMs,
+                  finalizationBudgetMs: directFinalizationBudgetMs,
+                  startedAtMs: jobStartedAtMs
+                }) : undefined;
+                const jobBaseRef = await resolveWorktreeBaseRefForJob(opts.repo, opts.worktreeBaseRef, job.id, parsedParams, directDeadlineLedger);
+                directWorktreePath = await createIsolatedWorktree(opts.repo, job.id, jobBaseRef, onLog, directDeadlineLedger);
                 executionRepo = directWorktreePath;
+                const directBaseline = await git2(executionRepo, ["rev-parse", "HEAD"], directDeadlineLedger, "work");
+                if (!directBaseline.ok || !directBaseline.stdout.trim()) {
+                  throw new Error(`Unable to resolve isolated worktree baseline before execution: ${directBaseline.stderr || directBaseline.stdout || `git exited ${directBaseline.exitCode}`}`);
+                }
+                directWorktreeBaselineSha = directBaseline.stdout.trim();
                 if (isMergeConflictResolutionParams(parsedParams)) {
-                  const prepared = await prepareMergeConflictWorktreeOnHost(executionRepo, job.id, parsedParams, onLog);
+                  const prepared = await prepareMergeConflictWorktreeOnHost(executionRepo, job.id, parsedParams, onLog, directDeadlineLedger);
                   parsedParams = applyMergeConflictExecutionHints(parsedParams, prepared);
                 }
               }
             } catch (preparationError) {
               result = buildWorkerPreparationFailureResult(preparationError);
+              if (directDeadlineLedger?.workExpired()) {
+                result = {
+                  ...result,
+                  summary: `Job ${job.id} reached its absolute deadline during host preparation`,
+                  stderr: [
+                    result.stderr,
+                    "The shared work budget was exhausted before executor startup; the reserved finalization window was not borrowed."
+                  ].filter(Boolean).join(`
+`),
+                  exitCode: 124
+                };
+              }
+              if (directWorktreePath) {
+                try {
+                  result = await retainDirectFailureCandidate(result, directWorktreePath, opts.workerId, { id: job.id, kind: job.kind }, CONFIG, directWorktreeBaselineSha, directDeadlineLedger);
+                  if (result.candidateState?.checkpoint) {
+                    onLog?.("stderr", `[WorkerPals] Retained preparation-failure candidate ${result.candidateState.checkpoint.sha.slice(0, 12)} before terminal persistence and worktree cleanup.`);
+                  }
+                } catch (candidateError) {
+                  preserveDirectWorktreeForCandidateRecovery = true;
+                  result = {
+                    ...result,
+                    candidateState: result.candidateState ?? {
+                      status: result.exitCode === 124 ? "partial" : "held",
+                      reason: "preparation_checkpoint_failed_worktree_preserved",
+                      changedPaths: []
+                    },
+                    stderr: [
+                      result.stderr,
+                      `Preparation candidate checkpoint failed; preserving direct worktree at ${directWorktreePath}: ${compactWorkerError(candidateError)}`
+                    ].filter(Boolean).join(`
+`)
+                  };
+                }
+              }
               const preparationDurationMs = Math.max(0, Date.now() - preparationStartedAtMs);
               allowHeartbeatRecycle = false;
               await transport.flush();
@@ -20282,9 +21849,8 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
               sessionId: job.sessionId
             };
             let cooldownAfterJobMs = 0;
-            const jobStartedAtMs = Date.now();
             try {
-              result = await runJob(jobData, executionRepo, dockerExecutor, CONFIG, onLog);
+              result = await runJob(jobData, executionRepo, dockerExecutor, CONFIG, onLog, directDeadlineLedger);
               cooldownAfterJobMs = Number.isFinite(result.cooldownMs) && (result.cooldownMs ?? 0) > 0 ? Math.floor(result.cooldownMs ?? 0) : 0;
             } catch (err) {
               if (err instanceof DockerExecutionExhaustedError) {
@@ -20302,14 +21868,32 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                 stderr: "Worker result was not produced"
               };
             }
-            const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
+            if (!dockerExecutor && directWorktreePath && !result.ok) {
+              try {
+                result = await retainDirectFailureCandidate(result, executionRepo, opts.workerId, jobData, CONFIG, directWorktreeBaselineSha, directDeadlineLedger);
+                if (result.candidateState?.checkpoint) {
+                  onLog?.("stderr", `[WorkerPals] Retained ${result.candidateState.status} candidate ${result.candidateState.checkpoint.sha.slice(0, 12)} before direct worktree cleanup.`);
+                }
+              } catch (error) {
+                preserveDirectWorktreeForCandidateRecovery = true;
+                result = {
+                  ...result,
+                  candidateState: result.candidateState ?? {
+                    status: result.exitCode === 124 ? "partial" : "held",
+                    reason: "checkpoint_failed_worktree_preserved",
+                    changedPaths: []
+                  },
+                  stderr: [
+                    result.stderr,
+                    `Candidate checkpoint failed; preserving direct worktree at ${executionRepo}: ${compactWorkerError(error)}`
+                  ].filter(Boolean).join(`
+`)
+                };
+                onLog?.("stderr", `[WorkerPals] Candidate checkpoint failed; preserving direct worktree ${executionRepo}: ${compactWorkerError(error)}`);
+              }
+            }
             allowHeartbeatRecycle = false;
             await transport.flush();
-            try {
-              await reportWorkerLlmUsage(opts.server, headers, jobData, result);
-            } catch (err) {
-              console.warn(`[WorkerPals] Failed to report LLM usage for job ${job.id}: ${err instanceof Error ? err.message : String(err)}`);
-            }
             let completionCommit = null;
             if (result.ok && shouldCommit(job.kind, CONFIG)) {
               if (result.commit) {
@@ -20350,8 +21934,53 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                   sessionId: job.sessionId,
                   context: "host",
                   deferPublication: Boolean(result.validationBlocked)
-                }, CONFIG);
-                if (commitResult.ok && commitResult.sha && commitResult.branch) {
+                }, CONFIG, directDeadlineLedger);
+                if ((commitResult.usageAttempts?.length ?? 0) > 0) {
+                  const usageAccumulator = new UsageAccumulator;
+                  usageAccumulator.addAttempts(result.usageAttempts);
+                  if ((result.usageAttempts?.length ?? 0) === 0 && result.usage) {
+                    usageAccumulator.add(result.usage, {
+                      stage: "executor",
+                      attempt: 1,
+                      source: result.usage.backend ?? "executor_legacy_total"
+                    });
+                  }
+                  usageAccumulator.addAttempts(commitResult.usageAttempts);
+                  result = usageAccumulator.apply(result);
+                }
+                const directFinalizationExpired = directDeadlineLedger?.remainingTotalMs() === 0;
+                if (directFinalizationExpired) {
+                  const exactCandidate = commitResult.ok && commitResult.sha && commitResult.sha !== "no-changes" && commitResult.branch ? {
+                    status: "held",
+                    reason: "finalization_deadline",
+                    changedPaths: [],
+                    checkpoint: {
+                      ref: commitResult.branch,
+                      sha: commitResult.sha,
+                      capturedAt: new Date().toISOString()
+                    }
+                  } : undefined;
+                  if (!exactCandidate) {
+                    preserveDirectWorktreeForCandidateRecovery = true;
+                  }
+                  result = {
+                    ...result,
+                    ok: false,
+                    summary: `Job ${job.id} reached its absolute deadline during commit finalization`,
+                    stderr: [
+                      result.stderr,
+                      "The absolute job deadline expired during host-side commit finalization; the job cannot be reported as ordinary success."
+                    ].filter(Boolean).join(`
+`),
+                    exitCode: 124,
+                    candidateState: exactCandidate ?? result.candidateState ?? {
+                      status: "partial",
+                      reason: "finalization_deadline_worktree_preserved",
+                      changedPaths: []
+                    }
+                  };
+                  completionCommit = null;
+                } else if (commitResult.ok && commitResult.sha && commitResult.branch) {
                   if (commitResult.sha !== "no-changes") {
                     completionCommit = {
                       branch: commitResult.branch,
@@ -20375,8 +22004,20 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                     publishBlocked: commitResult.publishBlocked
                   };
                   console.error(`[WorkerPals] Publish blocked: ${commitResult.error}`);
-                } else if (commitResult.error) {
-                  console.error(`[WorkerPals] Failed to create commit: ${commitResult.error}`);
+                } else {
+                  const commitFailureDetail = commitResult.error ?? `Host-side commit finalization returned incomplete metadata (ok=${commitResult.ok}, branch=${commitResult.branch ?? "missing"}, sha=${commitResult.sha ?? "missing"}).`;
+                  result = buildDirectCommitFinalizationFailure(result, commitFailureDetail);
+                  try {
+                    result = await retainDirectFailureCandidate(result, executionRepo, opts.workerId, jobData, CONFIG, directWorktreeBaselineSha, directDeadlineLedger);
+                  } catch (error) {
+                    preserveDirectWorktreeForCandidateRecovery = true;
+                    result.stderr = [
+                      result.stderr,
+                      `Candidate checkpoint failed; preserving direct worktree at ${executionRepo}: ${compactWorkerError(error)}`
+                    ].filter(Boolean).join(`
+`);
+                  }
+                  console.error(`[WorkerPals] Failed to create commit: ${commitFailureDetail}`);
                 }
               }
             }
@@ -20402,6 +22043,12 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
               }
             }
             const finalizedAtMs = Date.now();
+            const jobDurationMs = Math.max(0, finalizedAtMs - jobStartedAtMs);
+            try {
+              await reportWorkerLlmUsage(opts.server, headers, jobData, result);
+            } catch (err) {
+              console.warn(`[WorkerPals] Failed to report LLM usage for job ${job.id}: ${err instanceof Error ? err.message : String(err)}`);
+            }
             const jobAttemptRaw = Number(job.attempt ?? 1);
             const jobAttempt = Number.isFinite(jobAttemptRaw) && jobAttemptRaw > 0 ? Math.floor(jobAttemptRaw) : 1;
             const llm = workerLlmConfig(CONFIG);
@@ -20623,7 +22270,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
               }, CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS);
               try {
                 await maybeHeartbeat("offline", null, true);
-                if (directWorktreePath) {
+                if (directWorktreePath && !preserveDirectWorktreeForCandidateRecovery) {
                   await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                     console.error(`[WorkerPals] Failed to remove isolated worktree before Codex recycle: ${String(err)}`);
                   });
@@ -20654,10 +22301,12 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
             runtimeState.currentJobId = null;
             runtimeState.currentClaimGeneration = null;
             runtimeState.currentSessionId = null;
-            if (directWorktreePath) {
+            if (directWorktreePath && !preserveDirectWorktreeForCandidateRecovery) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                 console.error(`[WorkerPals] Failed to remove isolated worktree: ${String(err)}`);
               });
+            } else if (directWorktreePath) {
+              console.error(`[WorkerPals] Preserved isolated worktree for candidate recovery: ${directWorktreePath}`);
             }
           }
         }
@@ -20832,6 +22481,7 @@ async function main() {
   });
 }
 if (import.meta.main) {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
   main();
 }
 export {
@@ -20841,6 +22491,7 @@ export {
   shouldRecycleWorkerForCodexUnavailableFailure,
   shouldEmitDirectSessionJobEvent,
   shouldDeferDockerCodexStartupStallForDirectRetry,
+  retainDirectFailureCandidate,
   resolveWorkerRuntimeGeneration,
   requiresPublishableCodeChange,
   postJsonWithTimeout,
@@ -20856,5 +22507,6 @@ export {
   buildWorkerPreparationFailureResult,
   buildWorkerJobClaimAuthority,
   buildUnhandledWorkerFailureResult,
-  buildTrustedValidationCompletionPayload
+  buildTrustedValidationCompletionPayload,
+  buildDirectCommitFinalizationFailure
 };

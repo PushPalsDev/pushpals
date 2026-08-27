@@ -153,12 +153,27 @@ ideation prompt, so prompt variations cannot repeatedly spend scoring tokens on
 one file or directory. A timed-out ideation request receives one compact retry
 with a 30-second ceiling.
 
-Dispatch uses a durable two-step handoff: RemoteBuddy first persists a `gated`
-objective, then enqueues the request with the objective-derived idempotency key.
-The Server validates the reservation identity and owns the transition to
-`dispatched`. Startup and periodic stale-claim reconciliation link an already
-enqueued request or fail an orphaned reservation, preventing queue/objective
-split-brain after a process interruption.
+Dispatch uses a durable fenced handoff: RemoteBuddy first persists a `gated`
+objective, then enqueues an unclaimable provisional request with the
+objective-derived idempotency key. Only the same still-live cycle can confirm
+that request before its absolute snapshot/deadline expiry. The Server validates
+the reservation and confirmation capability, makes the request claimable, and
+owns the transition to `dispatched`. Unconfirmed rows expire durably and the
+same idempotency key can be rearmed, so disable/deadline races cannot leak work
+or suppress a later healthy cycle. Startup and periodic stale-claim
+reconciliation link an already dispatched request or fail an orphaned
+reservation, preventing queue/objective split-brain after interruption.
+
+Every autonomy tick owns an abortable cycle generation. Scoring and planning
+receive that signal and perform bounded provider draining on cancellation.
+After each dispatch-lock renewal and objective reservation, at the provisional
+enqueue response, and before confirmation, RemoteBuddy rechecks runtime
+activity, the snapshot TTL, and the absolute cycle deadline. Both enqueue and
+confirmation carry the cycle abort signal. Runtime configuration `enabled=false` is a
+resumable scheduling pause; process disposal uses the separate terminal
+`stop()` lifecycle and cannot be reversed on the same engine instance.
+RemoteBuddy fails closed if a mixed-version Server omits the provisional or
+already-confirmed attestation rather than trusting a bare request ID.
 
 ## Config Knobs
 

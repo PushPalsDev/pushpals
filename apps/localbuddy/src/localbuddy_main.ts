@@ -22,6 +22,7 @@ import {
   loadPromptTemplate,
   loadPushPalsConfig,
   resolveLocalServerConnection,
+  scrubScmRepairAuthoritySecretFromEnv,
   type RepositoryAgentServiceClients,
 } from "shared";
 import { createLLMClient, preflightServiceLlm, type LLMClient } from "../../remotebuddy/src/llm.js";
@@ -38,6 +39,7 @@ import { answerLocalReadonlyQuery, isLocalReadonlyQueryPrompt } from "./local_re
 
 // ─── CLI args ───────────────────────────────────────────────────────────────
 
+scrubScmRepairAuthoritySecretFromEnv(process.env);
 const CONFIG = loadPushPalsConfig();
 const LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS = 10_000;
 

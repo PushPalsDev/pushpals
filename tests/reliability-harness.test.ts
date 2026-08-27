@@ -21,6 +21,8 @@ describe("reliability harness release coverage", () => {
 
     expect(files).toContain("tests/workerpals.quality-gate-issues.test.ts");
     expect(files).toContain("tests/workerpals.quality-loop-durability.test.ts");
+    expect(files).toContain("tests/workerpals.docker-deadline.test.ts");
+    expect(files).toContain("tests/workerpals.commit-message-generation.test.ts");
     expect(files).toContain("tests/workerpals.validation-command-safety.test.ts");
     expect(watchdogFiles).toContain(
       "apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py",
@@ -32,6 +34,17 @@ describe("reliability harness release coverage", () => {
 
     expect(files).toContain("tests/workerpals.generic-python-executor.test.ts");
     expect(files).toContain("tests/workerpals.packaged-generic-python-executor.test.ts");
+  });
+
+  test("gates control-plane authority and child-process secret isolation", () => {
+    const repairFiles = listReliabilityHarnessPhaseFiles("repair_orchestration");
+    const runtimeFiles = listReliabilityHarnessPhaseFiles("runtime_boundary");
+
+    expect(repairFiles).toContain("tests/source-control-manager.review-agent.test.ts");
+    expect(runtimeFiles).toContain("tests/shared.scm-repair-authority.test.ts");
+    expect(runtimeFiles).toContain("tests/cli.runtime-bootstrap.test.ts");
+    expect(runtimeFiles).toContain("tests/remotebuddy.llm-codex.test.ts");
+    expect(runtimeFiles).toContain("tests/workerpals.sandbox-env.test.ts");
   });
 
   test("gates durable runtime-circuit and claim-generation recovery behavior", () => {

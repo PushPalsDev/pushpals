@@ -90,6 +90,17 @@ export {
   type BoundedProcessSpawner,
   type BoundedSubprocess,
 } from "./bounded_process.js";
+export {
+  SCM_REPAIR_AUTHORITY_HEADER,
+  SCM_REPAIR_AUTHORITY_SECRET_ENV,
+  copyEnvWithoutScmRepairAuthoritySecret,
+  createScmRepairAuthorityProof,
+  resolveScmRepairAuthoritySecret,
+  scrubScmRepairAuthoritySecretFromEnv,
+  takeScmRepairAuthoritySecretFromEnv,
+  verifyScmRepairAuthorityProof,
+  type ScmRepairAuthorityVerification,
+} from "./scm_repair_authority.js";
 export { loadPromptTemplate, loadRepoDocText } from "./prompts.js";
 export {
   evaluateClientRuntimePreflight,

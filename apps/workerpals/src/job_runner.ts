@@ -17,7 +17,7 @@
  */
 
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
-import { loadPushPalsConfig } from "shared";
+import { loadPushPalsConfig, scrubScmRepairAuthoritySecretFromEnv } from "shared";
 import { writeFileSync } from "fs";
 import type {
   JobCandidateState,
@@ -337,6 +337,7 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
   main().catch((err) => {
     const result = buildFatalJobResult(err);
     // eslint-disable-next-line no-console

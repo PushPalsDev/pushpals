@@ -8,6 +8,11 @@ import {
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import { inferRepositoryValidationSteps } from "../../../packages/shared/src/repo_validation.js";
 import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
+import {
+  SCM_REPAIR_AUTHORITY_HEADER,
+  copyEnvWithoutScmRepairAuthoritySecret,
+  createScmRepairAuthorityProof,
+} from "../../../packages/shared/src/scm_repair_authority.js";
 import type { RepositoryAgentServiceClients } from "../../../packages/shared/src/repository_agent.js";
 import {
   addPullRequestComment,
@@ -142,6 +147,7 @@ interface ReviewAgentDeps {
   logWarn: (line: string) => void;
   logError: (line: string) => void;
   validationRepoRoot: () => string;
+  scmRepairAuthoritySecret: string | null;
 }
 
 const MAX_DIFF_BYTES = 150_000;
@@ -217,6 +223,7 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   logWarn: (line) => console.warn(line),
   logError: (line) => console.error(line),
   validationRepoRoot: resolveReviewValidationRepoRoot,
+  scmRepairAuthoritySecret: null,
 };
 
 export function createBoundedReviewAgentFetch(
@@ -385,7 +392,7 @@ export function resolveReviewerMdPath(
 }
 
 export function buildCodexEnv(config: ReviewAgentConfig): Record<string, string> {
-  const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+  const env = copyEnvWithoutScmRepairAuthoritySecret(process.env);
   if (config.codexAuthMode === "chatgpt" && config.codexHomeDir) {
     env.CODEX_HOME = config.codexHomeDir;
     env.HOME = config.codexHomeDir;
@@ -1242,8 +1249,17 @@ function persistedLinkReconciliationKey(link: PersistedPrLink): string {
   return `${link.prNumber}:${link.jobId}:${link.updatedAt ?? "unknown"}`;
 }
 
-function reviewFixDedupeKey(prNumber: number, headSha: string): string {
-  return `${prNumber}:${normalizeReviewFixHeadSha(headSha)}`;
+function reviewFixDedupeKey(prNumber: number, headSha: string, baseSha: string): string {
+  return [
+    "review-fix",
+    Math.floor(prNumber),
+    normalizeReviewFixHeadSha(headSha),
+    normalizeReviewFixHeadSha(baseSha),
+  ].join(":");
+}
+
+function reviewRevisionFingerprint(pr: Pick<GitHubPR, "head" | "base">): string {
+  return `${normalizeReviewFixHeadSha(pr.head.sha)}:${normalizeReviewFixHeadSha(pr.base.sha)}`;
 }
 
 export function mergeConflictDedupeKey(prNumber: number, headSha: string, baseSha: string): string {
@@ -1329,7 +1345,7 @@ function extractActiveReviewJobContextFromJob(job: ActiveJobLike): ActiveReviewJ
     dedupeKey:
       resolutionType === "merge_conflict"
         ? mergeConflictDedupeKey(Math.floor(prNumber), prHeadSha, prBaseSha)
-        : reviewFixDedupeKey(Math.floor(prNumber), prHeadSha),
+        : reviewFixDedupeKey(Math.floor(prNumber), prHeadSha, prBaseSha),
     resolutionType,
     prNumber: Math.floor(prNumber),
     headSha: prHeadSha,
@@ -1758,9 +1774,9 @@ export class ReviewAgent {
 
       const eligible = prs
         .filter((pr) => {
-          const reviewedSha = this.reviewed.get(pr.number);
+          const reviewedRevision = this.reviewed.get(pr.number);
           const forcedSha = this.forceReReview.get(pr.number);
-          return reviewedSha !== pr.head.sha || forcedSha === pr.head.sha;
+          return reviewedRevision !== reviewRevisionFingerprint(pr) || forcedSha === pr.head.sha;
         })
         .sort((a, b) => a.number - b.number);
       const startIndex =
@@ -1909,13 +1925,16 @@ export class ReviewAgent {
 
   private async reviewPr(pr: GitHubPR): Promise<void> {
     const sha = pr.head.sha;
-    const reviewedSha = this.reviewed.get(pr.number);
+    const revisionFingerprint = reviewRevisionFingerprint(pr);
+    const reviewedRevision = this.reviewed.get(pr.number);
     const forcedSha = this.forceReReview.get(pr.number);
-    if (reviewedSha !== sha && forcedSha) {
-      // Clear stale forced re-review markers when the PR head has advanced.
+    if (reviewedRevision !== revisionFingerprint && forcedSha) {
+      // A changed head or base is already independently eligible. Consume any
+      // old force marker so it cannot cause an unnecessary third review after
+      // the new exact revision is finalized.
       this.forceReReview.delete(pr.number);
     }
-    if (reviewedSha === sha) {
+    if (reviewedRevision === revisionFingerprint) {
       if (forcedSha !== sha) return;
       this.forceReReview.delete(pr.number);
       this.deps.logInfo(
@@ -1943,7 +1962,7 @@ export class ReviewAgent {
 
     if (!diff.trim()) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has an empty diff - skipping`);
-      this.reviewed.set(pr.number, sha);
+      this.reviewed.set(pr.number, revisionFingerprint);
       return;
     }
 
@@ -1951,7 +1970,7 @@ export class ReviewAgent {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] PR #${pr.number} diff is too large (${diff.length} bytes) - skipping`,
       );
-      this.reviewed.set(pr.number, sha);
+      this.reviewed.set(pr.number, revisionFingerprint);
       return;
     }
 
@@ -1969,7 +1988,7 @@ export class ReviewAgent {
       );
       const finalized = await this.rejectPr(pr, verdict, diff);
       if (finalized) {
-        this.reviewed.set(pr.number, sha);
+        this.reviewed.set(pr.number, revisionFingerprint);
       }
       return;
     }
@@ -2006,7 +2025,7 @@ export class ReviewAgent {
       : await this.rejectPr(pr, verdict, diff);
 
     if (finalized) {
-      this.reviewed.set(pr.number, sha);
+      this.reviewed.set(pr.number, revisionFingerprint);
     }
   }
 
@@ -2234,33 +2253,40 @@ export class ReviewAgent {
     }
 
     const rejectionComment = formatRejectionComment(effectiveVerdict);
-    try {
-      await this.deps.addPullRequestComment({
-        token: this.githubToken,
-        remoteUrl: this.remoteUrl,
-        prNumber: pr.number,
-        body: rejectionComment,
-      });
-    } catch (err: any) {
-      this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`,
+    const acknowledgeRejection = async (): Promise<boolean> => {
+      const commentAlreadyPresent = recentComments.some(
+        (comment) => collapseWhitespace(comment.body) === collapseWhitespace(rejectionComment),
       );
-    }
-    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
-      pr,
-      verdict: "rejected",
-      verdictSummary: effectiveVerdict.summary,
-      reviewScore: effectiveVerdict.score,
-      jobId,
-      sessionId,
-      comments: recentComments,
-    });
+      if (!commentAlreadyPresent) {
+        try {
+          await this.deps.addPullRequestComment({
+            token: this.githubToken,
+            remoteUrl: this.remoteUrl,
+            prNumber: pr.number,
+            body: rejectionComment,
+          });
+        } catch (err: any) {
+          this.deps.logWarn(
+            `[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`,
+          );
+        }
+      }
+      return this.postAutonomyPrFeedback({
+        pr,
+        verdict: "rejected",
+        verdictSummary: effectiveVerdict.summary,
+        reviewScore: effectiveVerdict.score,
+        jobId,
+        sessionId,
+        comments: recentComments,
+      });
+    };
 
     if (!sessionId) {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] PR #${pr.number} has no pushpals-sessionId in body - cannot re-queue`,
       );
-      return feedbackAcknowledged;
+      return acknowledgeRejection();
     }
 
     const priorReReviewEnqueues = this.reReviewEnqueueCounts.get(pr.number) ?? 0;
@@ -2283,12 +2309,13 @@ export class ReviewAgent {
       pr.number,
       pr.head.sha,
       "review_fix",
+      pr.base.sha,
     );
     if (existingFixJobId) {
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`,
       );
-      return feedbackAcknowledged;
+      return acknowledgeRejection();
     }
 
     const nextReReviewEnqueues = priorReReviewEnqueues + 1;
@@ -2302,18 +2329,23 @@ export class ReviewAgent {
       [rejectionComment],
       recentComments,
     );
-    if (enqueued) {
-      if (nextReReviewEnqueues === MAX_PR_RE_REVIEW_ENQUEUES) {
-        this.deps.logWarn(
-          `[${ts()}] [ReviewAgent] PR #${pr.number} hit max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); future rejections will not auto-enqueue fix jobs.`,
-        );
-      }
-    } else if (priorReReviewEnqueues > 0) {
+    if (!enqueued && priorReReviewEnqueues > 0) {
       this.reReviewEnqueueCounts.set(pr.number, priorReReviewEnqueues);
-    } else {
+    } else if (!enqueued) {
       this.reReviewEnqueueCounts.delete(pr.number);
     }
-    return feedbackAcknowledged;
+    if (!enqueued) {
+      // Infrastructure/capability failures are not review outcomes. Leave the
+      // exact head+base revision eligible and avoid publishing duplicate PR
+      // comments while a later poll retries admission.
+      return false;
+    }
+    if (nextReReviewEnqueues === MAX_PR_RE_REVIEW_ENQUEUES) {
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} hit max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); future rejections will not auto-enqueue fix jobs.`,
+      );
+    }
+    return acknowledgeRejection();
   }
 
   private async giveUpOnRejectedPr(
@@ -2483,12 +2515,7 @@ export class ReviewAgent {
             continue;
           }
           if (resolutionType && context.resolutionType !== resolutionType) continue;
-          if (
-            resolutionType === "merge_conflict" &&
-            normalizedBaseSha &&
-            context.baseSha &&
-            context.baseSha !== normalizedBaseSha
-          ) {
+          if (normalizedBaseSha && context.baseSha !== normalizedBaseSha) {
             continue;
           }
           const jobId =
@@ -2852,8 +2879,9 @@ export class ReviewAgent {
       sessionId,
       kind: "task.execute",
       workClass: "repair",
+      repositoryIdentity: this.remoteUrl,
       prUrl: pr.html_url,
-      dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha),
+      dedupeKey: reviewFixDedupeKey(pr.number, pr.head.sha, pr.base.sha),
       dedupeCooldownMs: REVIEW_FIX_JOB_DEDUPE_COOLDOWN_MS,
       params: {
         schemaVersion: 2,
@@ -2899,7 +2927,9 @@ export class ReviewAgent {
           branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
+          repositoryIdentity: this.remoteUrl,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
+          prBaseSha: normalizeReviewFixHeadSha(pr.base.sha),
           prHeadRef: prHeadRef ?? pr.head.ref,
           prBaseRef: pr.base.ref,
           resolutionType: "review_fix",
@@ -2916,14 +2946,21 @@ export class ReviewAgent {
       },
     };
 
+    const requestBody = JSON.stringify(payload);
     const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.deps.scmRepairAuthoritySecret) {
+      headers[SCM_REPAIR_AUTHORITY_HEADER] = createScmRepairAuthorityProof(
+        payload,
+        this.deps.scmRepairAuthoritySecret,
+      );
+    }
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
 
     try {
       const response = await this.deps.fetchImpl(`${this.serverUrl}/jobs/enqueue`, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload),
+        body: requestBody,
       });
 
       if (!response.ok) {
@@ -2936,10 +2973,15 @@ export class ReviewAgent {
         message?: unknown;
       } | null;
       const enqueuedJobId =
-        responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId : "";
+        responseBody && typeof responseBody.jobId === "string" ? responseBody.jobId.trim() : "";
       const deduped = responseBody?.deduped === true;
       const dedupeMessage =
         responseBody && typeof responseBody.message === "string" ? responseBody.message : "";
+      if (!enqueuedJobId) {
+        throw new Error(
+          "Server accepted repair enqueue without returning a jobId; exact repair ownership is unconfirmed",
+        );
+      }
       if (enqueuedJobId && !deduped) {
         try {
           await this.emitFixJobQueuedEvents({
@@ -3024,6 +3066,7 @@ export class ReviewAgent {
       sessionId,
       kind: "task.execute",
       workClass: "repair",
+      repositoryIdentity: this.remoteUrl,
       prUrl: pr.html_url,
       dedupeKey: mergeConflictDedupeKey(pr.number, pr.head.sha, pr.base.sha),
       dedupeCooldownMs: REVIEW_MERGE_CONFLICT_JOB_DEDUPE_COOLDOWN_MS,
@@ -3069,6 +3112,7 @@ export class ReviewAgent {
           branchPrefix: this.headPrefix,
           prNumber: pr.number,
           prUrl: pr.html_url,
+          repositoryIdentity: this.remoteUrl,
           prHeadSha: normalizeReviewFixHeadSha(pr.head.sha),
           prBaseSha: normalizeReviewFixHeadSha(pr.base.sha),
           prHeadRef: prHeadRef ?? pr.head.ref,
@@ -3085,14 +3129,21 @@ export class ReviewAgent {
       },
     };
 
+    const requestBody = JSON.stringify(payload);
     const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.deps.scmRepairAuthoritySecret) {
+      headers[SCM_REPAIR_AUTHORITY_HEADER] = createScmRepairAuthorityProof(
+        payload,
+        this.deps.scmRepairAuthoritySecret,
+      );
+    }
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
 
     try {
       const response = await this.deps.fetchImpl(`${this.serverUrl}/jobs/enqueue`, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload),
+        body: requestBody,
       });
       if (!response.ok) {
         const text = await response.text();

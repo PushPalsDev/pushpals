@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, dirname, join, resolve } from "path";
+import { copyEnvWithoutScmRepairAuthoritySecret } from "shared";
 import { directWorktreePoolRoot } from "./direct_worktree.js";
 
 export const WINDOWS_WORKER_SANDBOX_ROOT_NAME = ".ppe";
@@ -12,11 +13,7 @@ const TEMP_PLAYWRIGHT_CACHE_NAME = "playwright-browsers";
 function stringEnv(
   source: Record<string, string | undefined> = process.env,
 ): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(source)) {
-    if (typeof value === "string") env[key] = value;
-  }
-  return env;
+  return copyEnvWithoutScmRepairAuthoritySecret(source);
 }
 
 function pathListDelimiter(platform: NodeJS.Platform = process.platform): string {

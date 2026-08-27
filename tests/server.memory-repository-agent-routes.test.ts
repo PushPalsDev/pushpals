@@ -228,6 +228,25 @@ describe("server memory routes", () => {
     await waitForHealth(firstServer, firstPort);
     const firstClient = new MemoryHttpClient({ serverUrl: `http://127.0.0.1:${firstPort}` });
 
+    await expect(
+      firstClient.put(
+        {
+          scope: { namespace: "repository.semantic", repositoryId: "repo-a" },
+          key: "expired-http-write",
+          kind: "ownership",
+          summary: "This delayed HTTP write must not commit.",
+          provenance: { service: "repository_agent", runId: "expired-http-write" },
+        },
+        { validUntil: new Date(Date.now() - 1).toISOString() },
+      ),
+    ).rejects.toThrow("commit fence expired");
+    expect(
+      await firstClient.get({
+        scope: { namespace: "repository.semantic", repositoryId: "repo-a" },
+        key: "expired-http-write",
+      }),
+    ).toBeNull();
+
     const first = await firstClient.put({
       scope: { namespace: "repository.semantic", repositoryId: "repo-a" },
       key: "routing-owner",

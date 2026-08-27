@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -16,6 +16,7 @@ import {
 } from "../apps/source_control_manager/src/trusted_validation";
 import { createSourceControlManagerHealthTracker } from "../apps/source_control_manager/src/runtime_helpers";
 import { assertExactCleanValidationWorktree } from "../apps/source_control_manager/src/validation_worktree";
+import { SCM_REPAIR_AUTHORITY_SECRET_ENV } from "../packages/shared/src/scm_repair_authority";
 
 function gitResult(repoPath: string, args: string[]) {
   const result = Bun.spawnSync(["git", "-C", repoPath, ...args], {
@@ -51,6 +52,30 @@ describe("SourceControlManager trusted validation", () => {
     expect(result).toMatchObject({ ok: false, exitCode: 124, timedOut: true });
     expect(result.output).toContain("terminated process tree");
     expect(Date.now() - startedAt).toBeLessThan(4_000);
+  });
+
+  test("does not expose SCM repair authority to trusted validation commands", async () => {
+    const previous = process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV];
+    process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV] =
+      "test-validation-scm-repair-authority-secret-0123456789abcdef";
+    try {
+      const result = await runProcessWithTreeTimeout(
+        [
+          process.execPath,
+          "-e",
+          `console.log(Object.keys(process.env).filter((key) => key.toLowerCase() === ${JSON.stringify(
+            SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase(),
+          )}).join(",") || "authority-absent")`,
+        ],
+        { cwd: process.cwd(), timeoutMs: 2_000 },
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.output.trim()).toBe("authority-absent");
+    } finally {
+      if (previous === undefined) delete process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV];
+      else process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV] = previous;
+    }
   });
 
   (process.platform === "win32" ? test : test.skip)(
@@ -481,21 +506,29 @@ describe("SourceControlManager trusted validation", () => {
           mkdirSync(join(repoPath, "node_modules"), { recursive: true });
         return { ok: true, output: "passed", exitCode: 0 };
       };
+      const invariantContext = {
+        baseSha: "a".repeat(40),
+        candidateSha: "b".repeat(40),
+        affectedPaths: ["src/file.ts"],
+      };
 
       const firstFingerprint = trustedValidationInstallFingerprint({
         repoPath,
         bunExecutable: "/runtime/bun",
+        invariantContext,
       });
       const first = await runTrustedValidationCommands({
         repoPath,
         commandsJson: JSON.stringify(["bun run validate"]),
         bunExecutable: "/runtime/bun",
+        invariantContext,
         runner,
       });
       const second = await runTrustedValidationCommands({
         repoPath,
         commandsJson: JSON.stringify(["bun run validate"]),
         bunExecutable: "/runtime/bun",
+        invariantContext,
         runner,
       });
 
@@ -507,19 +540,28 @@ describe("SourceControlManager trusted validation", () => {
         durationMs: 0,
         phase: "dependency_install",
       });
-      expect(hasFreshTrustedValidationInstall({ repoPath, bunExecutable: "/runtime/bun" })).toBe(
-        true,
-      );
+      expect(
+        hasFreshTrustedValidationInstall({
+          repoPath,
+          bunExecutable: "/runtime/bun",
+          invariantContext,
+        }),
+      ).toBe(true);
       expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(1);
 
       writeFileSync(join(repoPath, "bun.lock"), "lock-b");
       expect(
-        trustedValidationInstallFingerprint({ repoPath, bunExecutable: "/runtime/bun" }),
+        trustedValidationInstallFingerprint({
+          repoPath,
+          bunExecutable: "/runtime/bun",
+          invariantContext,
+        }),
       ).not.toBe(firstFingerprint);
       await runTrustedValidationCommands({
         repoPath,
         commandsJson: JSON.stringify(["bun run validate"]),
         bunExecutable: "/runtime/bun",
+        invariantContext,
         runner,
       });
       expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(2);
@@ -528,7 +570,37 @@ describe("SourceControlManager trusted validation", () => {
     }
   });
 
-  test("scopes invariant preparation cache by base, toolchain, lockfile, and affected paths", async () => {
+  test("does not cache install artifacts without exact candidate tree identity", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-no-tree-cache-"));
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      let installCalls = 0;
+      const runner = async (argv: string[]) => {
+        if (argv.includes("install")) {
+          installCalls += 1;
+          mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+        }
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+      await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        runner,
+      });
+      await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        runner,
+      });
+      expect(trustedValidationInstallFingerprint({ repoPath })).toBeNull();
+      expect(installCalls).toBe(2);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("scopes trusted preparation cache by candidate, base, toolchain, lockfile, and paths", async () => {
     const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-invariant-cache-"));
     try {
       writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
@@ -541,12 +613,15 @@ describe("SourceControlManager trusted validation", () => {
         return { ok: true, output: "passed", exitCode: 0 };
       };
       const baseSha = "a".repeat(40);
+      const candidateSha = "c".repeat(40);
       const firstContext = {
         baseSha,
+        candidateSha,
         affectedPaths: ["src\\router.ts", "./tests/router.test.ts", "src/router.ts"],
       };
       const equivalentContext = {
         baseSha: baseSha.toUpperCase(),
+        candidateSha: candidateSha.toUpperCase(),
         affectedPaths: ["tests/router.test.ts", "src/router.ts"],
       };
 
@@ -612,10 +687,401 @@ describe("SourceControlManager trusted validation", () => {
         repoPath,
         commandsJson: JSON.stringify(["bun run validate"]),
         bunExecutable: "/runtime/bun",
-        invariantContext: { baseSha: "b".repeat(40), affectedPaths: ["src/other.ts"] },
+        invariantContext: {
+          baseSha: "b".repeat(40),
+          candidateSha,
+          affectedPaths: ["src/other.ts"],
+        },
         runner,
       });
       expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(3);
+
+      await runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        invariantContext: {
+          ...firstContext,
+          baseSha: "b".repeat(40),
+          affectedPaths: ["src/other.ts"],
+          candidateSha: "d".repeat(40),
+        },
+        runner,
+      });
+      expect(calls.filter((argv) => argv.includes("install"))).toHaveLength(4);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes different candidate install preparation for the same repository", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-single-flight-"));
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolvePromise) => {
+        releaseFirst = resolvePromise;
+      });
+      let installCalls = 0;
+      let activeInstalls = 0;
+      let maxActiveInstalls = 0;
+      const runner = async (argv: string[]) => {
+        if (argv.includes("install")) {
+          installCalls += 1;
+          activeInstalls += 1;
+          maxActiveInstalls = Math.max(maxActiveInstalls, activeInstalls);
+          if (installCalls === 1) await firstGate;
+          mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+          activeInstalls -= 1;
+        }
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+      const common = {
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        runner,
+      };
+      const first = runTrustedValidationCommands({
+        ...common,
+        invariantContext: {
+          baseSha: "a".repeat(40),
+          candidateSha: "b".repeat(40),
+          affectedPaths: ["src/file.ts"],
+        },
+      });
+      while (installCalls === 0) await Bun.sleep(1);
+      const second = runTrustedValidationCommands({
+        ...common,
+        invariantContext: {
+          baseSha: "a".repeat(40),
+          candidateSha: "c".repeat(40),
+          affectedPaths: ["src/file.ts"],
+        },
+      });
+      await Bun.sleep(10);
+      expect(installCalls).toBe(1);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(installCalls).toBe(2);
+      expect(maxActiveInstalls).toBe(1);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("waits for an active repo install before trusting a matching cached marker", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-marker-flight-"));
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+      const contextA = {
+        baseSha: "a".repeat(40),
+        candidateSha: "b".repeat(40),
+        affectedPaths: ["src/file.ts"],
+      };
+      const contextB = {
+        baseSha: "a".repeat(40),
+        candidateSha: "c".repeat(40),
+        affectedPaths: ["src/file.ts"],
+      };
+      const cachedFingerprintB = trustedValidationInstallFingerprint({
+        repoPath,
+        bunExecutable: "/runtime/bun",
+        invariantContext: contextB,
+      });
+      writeFileSync(
+        join(repoPath, "node_modules", ".pushpals-trusted-install.json"),
+        JSON.stringify({ schemaVersion: 3, fingerprint: cachedFingerprintB }),
+      );
+
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolvePromise) => {
+        releaseFirst = resolvePromise;
+      });
+      let installCalls = 0;
+      const runner = async (argv: string[]) => {
+        if (argv.includes("install")) {
+          installCalls += 1;
+          if (installCalls === 1) await firstGate;
+        }
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+      const common = {
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        runner,
+      };
+      const first = runTrustedValidationCommands({ ...common, invariantContext: contextA });
+      while (installCalls === 0) await Bun.sleep(1);
+      let secondSettled = false;
+      const second = runTrustedValidationCommands({
+        ...common,
+        invariantContext: contextB,
+      }).finally(() => {
+        secondSettled = true;
+      });
+      await Bun.sleep(10);
+      expect(secondSettled).toBe(false);
+      expect(installCalls).toBe(1);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(installCalls).toBe(2);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("does not let a different-candidate waiter reuse a marker after the active install fails", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-failed-stale-marker-"));
+    let releaseFailedInstall: (() => void) | undefined;
+    let activeRun: ReturnType<typeof runTrustedValidationCommands> | undefined;
+    let waitingRun: ReturnType<typeof runTrustedValidationCommands> | undefined;
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+      const activeContext = {
+        baseSha: "a".repeat(40),
+        candidateSha: "b".repeat(40),
+        affectedPaths: ["src/file.ts"],
+      };
+      const waitingContext = {
+        baseSha: "a".repeat(40),
+        candidateSha: "c".repeat(40),
+        affectedPaths: ["src/file.ts"],
+      };
+      const markerPath = join(repoPath, "node_modules", ".pushpals-trusted-install.json");
+      const waitingFingerprint = trustedValidationInstallFingerprint({
+        repoPath,
+        bunExecutable: "/runtime/bun",
+        invariantContext: waitingContext,
+      });
+      writeFileSync(
+        markerPath,
+        JSON.stringify({ schemaVersion: 3, fingerprint: waitingFingerprint }),
+      );
+
+      const failedInstallGate = new Promise<void>((resolvePromise) => {
+        releaseFailedInstall = resolvePromise;
+      });
+      let installCalls = 0;
+      const markerPresentAtInstall: boolean[] = [];
+      const runner = async (argv: string[]) => {
+        if (argv.includes("install")) {
+          installCalls += 1;
+          markerPresentAtInstall.push(existsSync(markerPath));
+          if (installCalls === 1) {
+            await failedInstallGate;
+            return { ok: false, output: "dependency install failed", exitCode: 1 };
+          }
+        }
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+      const common = {
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        runner,
+        retryTransientFailures: false,
+      };
+      activeRun = runTrustedValidationCommands({
+        ...common,
+        invariantContext: activeContext,
+      });
+      while (installCalls === 0) await Bun.sleep(1);
+      expect(existsSync(markerPath)).toBe(false);
+
+      let waiterSettled = false;
+      waitingRun = runTrustedValidationCommands({
+        ...common,
+        invariantContext: waitingContext,
+      }).finally(() => {
+        waiterSettled = true;
+      });
+      await Bun.sleep(10);
+      expect(waiterSettled).toBe(false);
+      expect(installCalls).toBe(1);
+
+      releaseFailedInstall();
+      const [activeResults, waitingResults] = await Promise.all([activeRun, waitingRun]);
+      expect(activeResults[0]).toMatchObject({ ok: false, phase: "dependency_install" });
+      expect(waitingResults[0]).toMatchObject({
+        ok: true,
+        phase: "dependency_install",
+      });
+      expect(waitingResults[0]?.cached).not.toBe(true);
+      expect(installCalls).toBe(2);
+      expect(markerPresentAtInstall).toEqual([false, false]);
+      expect(
+        hasFreshTrustedValidationInstall({
+          repoPath,
+          bunExecutable: "/runtime/bun",
+          invariantContext: waitingContext,
+        }),
+      ).toBe(true);
+    } finally {
+      releaseFailedInstall?.();
+      if (activeRun) await activeRun.catch(() => undefined);
+      if (waitingRun) await waitingRun.catch(() => undefined);
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("drains a cancelled different-candidate install before its waiter can replace stale state", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-cancelled-stale-marker-"));
+    let releaseDrain: (() => void) | undefined;
+    let activeRun: ReturnType<typeof runTrustedValidationCommands> | undefined;
+    let waitingRun: ReturnType<typeof runTrustedValidationCommands> | undefined;
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+      const activeContext = {
+        baseSha: "a".repeat(40),
+        candidateSha: "d".repeat(40),
+        affectedPaths: ["src/file.ts"],
+      };
+      const waitingContext = {
+        baseSha: "a".repeat(40),
+        candidateSha: "e".repeat(40),
+        affectedPaths: ["src/file.ts"],
+      };
+      const markerPath = join(repoPath, "node_modules", ".pushpals-trusted-install.json");
+      const waitingFingerprint = trustedValidationInstallFingerprint({
+        repoPath,
+        bunExecutable: "/runtime/bun",
+        invariantContext: waitingContext,
+      });
+      writeFileSync(
+        markerPath,
+        JSON.stringify({ schemaVersion: 3, fingerprint: waitingFingerprint }),
+      );
+
+      const drainGate = new Promise<void>((resolvePromise) => {
+        releaseDrain = resolvePromise;
+      });
+      let installCalls = 0;
+      let activeAbortObserved = false;
+      const markerPresentAtInstall: boolean[] = [];
+      const runner = async (argv: string[], options: { signal?: AbortSignal }) => {
+        if (argv.includes("install")) {
+          installCalls += 1;
+          markerPresentAtInstall.push(existsSync(markerPath));
+          if (installCalls === 1) {
+            await new Promise<void>((resolvePromise) => {
+              if (options.signal?.aborted) {
+                resolvePromise();
+                return;
+              }
+              options.signal?.addEventListener("abort", () => resolvePromise(), { once: true });
+            });
+            activeAbortObserved = true;
+            await drainGate;
+            throw new Error("cancelled install finished draining");
+          }
+        }
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+      const common = {
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        bunExecutable: "/runtime/bun",
+        runner,
+        retryTransientFailures: false,
+      };
+      const activeController = new AbortController();
+      activeRun = runTrustedValidationCommands({
+        ...common,
+        invariantContext: activeContext,
+        signal: activeController.signal,
+      });
+      while (installCalls === 0) await Bun.sleep(1);
+      expect(existsSync(markerPath)).toBe(false);
+
+      let waiterSettled = false;
+      waitingRun = runTrustedValidationCommands({
+        ...common,
+        invariantContext: waitingContext,
+      }).finally(() => {
+        waiterSettled = true;
+      });
+      activeController.abort();
+      while (!activeAbortObserved) await Bun.sleep(1);
+      await Bun.sleep(10);
+      expect(waiterSettled).toBe(false);
+      expect(installCalls).toBe(1);
+
+      releaseDrain();
+      const [activeResults, waitingResults] = await Promise.all([activeRun, waitingRun]);
+      expect(activeResults[0]).toMatchObject({
+        ok: false,
+        phase: "dependency_install",
+        failureClass: "timeout",
+      });
+      expect(activeResults[0]?.output).toContain("cancelled");
+      expect(waitingResults[0]).toMatchObject({
+        ok: true,
+        phase: "dependency_install",
+      });
+      expect(waitingResults[0]?.cached).not.toBe(true);
+      expect(installCalls).toBe(2);
+      expect(markerPresentAtInstall).toEqual([false, false]);
+    } finally {
+      releaseDrain?.();
+      if (activeRun) await activeRun.catch(() => undefined);
+      if (waitingRun) await waitingRun.catch(() => undefined);
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  test("cancels a bounded wait without starting a second install", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-flight-cancel-"));
+    try {
+      writeFileSync(join(repoPath, "package.json"), '{"scripts":{"validate":"bun test"}}');
+      writeFileSync(join(repoPath, "bun.lock"), "lock-a");
+      let releaseInstall!: () => void;
+      const installGate = new Promise<void>((resolvePromise) => {
+        releaseInstall = resolvePromise;
+      });
+      let installCalls = 0;
+      const runner = async (argv: string[]) => {
+        if (argv.includes("install")) {
+          installCalls += 1;
+          await installGate;
+          mkdirSync(join(repoPath, "node_modules"), { recursive: true });
+        }
+        return { ok: true, output: "passed", exitCode: 0 };
+      };
+      const first = runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        runner,
+      });
+      while (installCalls === 0) await Bun.sleep(1);
+      const controller = new AbortController();
+      const waiting = runTrustedValidationCommands({
+        repoPath,
+        commandsJson: JSON.stringify(["bun run validate"]),
+        runner,
+        signal: controller.signal,
+        singleFlightWaitMs: 1_000,
+        retryTransientFailures: false,
+      });
+      controller.abort();
+      const waitingResults = await waiting;
+      expect(waitingResults[0]).toMatchObject({
+        ok: false,
+        phase: "dependency_install",
+        failureClass: "timeout",
+      });
+      expect(waitingResults[0]?.output).toContain("cancelled");
+      expect(installCalls).toBe(1);
+      releaseInstall();
+      await first;
     } finally {
       rmSync(repoPath, { recursive: true, force: true });
     }

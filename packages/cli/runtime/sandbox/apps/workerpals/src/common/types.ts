@@ -9,6 +9,33 @@ export interface JobTokenUsage {
   modelId?: string;
 }
 
+export type JobUsageStage =
+  | "executor"
+  | "executor_recovery"
+  | "critic"
+  | "validation"
+  | "finalization";
+
+export interface JobUsageAttempt extends JobTokenUsage {
+  stage: JobUsageStage;
+  attempt: number;
+  source: string;
+  timedOut?: boolean;
+}
+
+export interface JobCandidateCheckpoint {
+  ref: string;
+  sha: string;
+  capturedAt: string;
+}
+
+export interface JobCandidateState {
+  status: "held" | "partial";
+  reason: string;
+  changedPaths: string[];
+  checkpoint?: JobCandidateCheckpoint;
+}
+
 export interface JobPublishBlockedInfo {
   summary: string;
   detail: string;
@@ -101,6 +128,10 @@ export interface JobResult {
   exitCode?: number;
   cooldownMs?: number;
   usage?: JobTokenUsage;
+  /** Per-call provenance used to audit cumulative usage across retries and critics. */
+  usageAttempts?: JobUsageAttempt[];
+  /** A non-success candidate that must remain reachable instead of being discarded. */
+  candidateState?: JobCandidateState;
   publishBlocked?: JobPublishBlockedInfo;
   validationBlocked?: JobValidationBlockedInfo;
   diagnostics?: JobDiagnostics;

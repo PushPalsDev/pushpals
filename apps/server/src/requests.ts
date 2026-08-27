@@ -30,6 +30,9 @@ const DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT = 200;
 const MAX_HANDOFF_CHAIN_RECONCILE_LIMIT = 1_000;
 const DEFAULT_HANDOFF_CHAIN_DEPTH = 16;
 const MAX_HANDOFF_CHAIN_DEPTH = 64;
+const DEFAULT_DISPATCH_CONFIRMATION_TTL_MS = 30_000;
+const MIN_DISPATCH_CONFIRMATION_TTL_MS = 1;
+const MAX_DISPATCH_CONFIRMATION_TTL_MS = 2 * 60_000;
 
 const PRIORITY_ORDER: QueuePriority[] = ["interactive", "normal", "background"];
 const PRIORITY_SLA_MS: Record<QueuePriority, number> = {
@@ -61,6 +64,28 @@ function normalizeRequestLeaseMs(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REQUEST_LEASE_MS;
   return Math.max(MIN_REQUEST_LEASE_MS, Math.min(MAX_REQUEST_LEASE_MS, Math.floor(parsed)));
+}
+
+function normalizeDispatchConfirmationTtlMs(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_DISPATCH_CONFIRMATION_TTL_MS;
+  return Math.max(
+    MIN_DISPATCH_CONFIRMATION_TTL_MS,
+    Math.min(MAX_DISPATCH_CONFIRMATION_TTL_MS, Math.floor(parsed)),
+  );
+}
+
+function resolveDispatchConfirmationExpiresAt(
+  body: Record<string, unknown>,
+  nowMs: number,
+): string {
+  const ttlDeadlineMs = nowMs + normalizeDispatchConfirmationTtlMs(body.dispatchConfirmationTtlMs);
+  const deadlineText = asString(body.dispatchConfirmationDeadlineAt);
+  const requestedDeadlineMs = deadlineText ? Date.parse(deadlineText) : Number.NaN;
+  const expiresAtMs = Number.isFinite(requestedDeadlineMs)
+    ? Math.min(ttlDeadlineMs, requestedDeadlineMs)
+    : ttlDeadlineMs;
+  return new Date(expiresAtMs).toISOString();
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -209,6 +234,14 @@ export interface RequestRow {
   workerRequired: number; // Durable server-owned planning/handoff invariant (0/1)
   handoffJobId: string | null;
   /**
+   * Autonomous cycles enqueue provisionally, then confirm only while their
+   * snapshot/deadline fence is still live. A token without confirmedAt keeps
+   * the row durable but invisible to claimers until it expires.
+   */
+  dispatchConfirmationToken: string | null;
+  dispatchConfirmationExpiresAt: string | null;
+  dispatchConfirmedAt: string | null;
+  /**
    * Read-model fields. `status` remains the planner queue protocol state, while
    * `outcomeStatus` follows a durable WorkerPal handoff through execution.
    */
@@ -314,6 +347,9 @@ function projectRequestOutcome(
 
   return {
     ...row,
+    // The dispatch capability is write-only outside enqueue/confirmation.
+    // Never expose it through detail, list, SLO, or lifecycle projections.
+    dispatchConfirmationToken: null,
     handoffJobStatus,
     outcomeStatus,
     outcomeUpdatedAt,
@@ -358,6 +394,9 @@ export class RequestQueue {
     forceLane,
     workerRequired,
     handoffJobId,
+    dispatchConfirmationToken,
+    dispatchConfirmationExpiresAt,
+    dispatchConfirmedAt,
     status,
     agentId,
     claimToken,
@@ -471,6 +510,9 @@ export class RequestQueue {
         forceLane        TEXT,
         workerRequired   INTEGER NOT NULL DEFAULT 0,
         handoffJobId     TEXT,
+        dispatchConfirmationToken TEXT,
+        dispatchConfirmationExpiresAt TEXT,
+        dispatchConfirmedAt TEXT,
         status           TEXT NOT NULL DEFAULT 'pending',
         agentId          TEXT,
         claimToken       TEXT,
@@ -521,6 +563,18 @@ export class RequestQueue {
       `ALTER TABLE requests ADD COLUMN workerRequired INTEGER NOT NULL DEFAULT 0;`,
     );
     ensureColumn("handoffJobId", `ALTER TABLE requests ADD COLUMN handoffJobId TEXT;`);
+    ensureColumn(
+      "dispatchConfirmationToken",
+      `ALTER TABLE requests ADD COLUMN dispatchConfirmationToken TEXT;`,
+    );
+    ensureColumn(
+      "dispatchConfirmationExpiresAt",
+      `ALTER TABLE requests ADD COLUMN dispatchConfirmationExpiresAt TEXT;`,
+    );
+    ensureColumn(
+      "dispatchConfirmedAt",
+      `ALTER TABLE requests ADD COLUMN dispatchConfirmedAt TEXT;`,
+    );
     ensureColumn("claimToken", `ALTER TABLE requests ADD COLUMN claimToken TEXT;`);
     ensureColumn(
       "claimGeneration",
@@ -552,6 +606,10 @@ export class RequestQueue {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_requests_lease_expiry
          ON requests(status, leaseExpiresAt);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_requests_dispatch_confirmation
+         ON requests(status, dispatchConfirmationExpiresAt, dispatchConfirmedAt);`,
     );
 
     this.db.exec(`
@@ -602,10 +660,12 @@ export class RequestQueue {
   }
 
   private pendingOrderedIds(): string[] {
+    this.expireUnconfirmedDispatches();
     const rows = this.all<{ id: string }>(
       `SELECT id, priority, createdAt
        FROM requests
        WHERE status = 'pending'
+         AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
        ORDER BY
          CASE LOWER(priority)
            WHEN 'interactive' THEN 0
@@ -641,6 +701,10 @@ export class RequestQueue {
     requestId?: string;
     queuePosition?: number;
     etaMs?: number;
+    dispatchConfirmationRequired?: boolean;
+    dispatchConfirmationToken?: string;
+    dispatchConfirmationExpiresAt?: string;
+    dispatchConfirmed?: boolean;
     deduplicated?: boolean;
     requeued?: boolean;
     message?: string;
@@ -667,13 +731,26 @@ export class RequestQueue {
       return { ok: false, message: "sessionId and prompt are required" };
     }
 
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    const dispatchConfirmationRequired = body.dispatchConfirmationRequired === true;
+    const dispatchConfirmationToken = dispatchConfirmationRequired ? randomUUID() : null;
+    const dispatchConfirmationExpiresAt = dispatchConfirmationRequired
+      ? resolveDispatchConfirmationExpiresAt(body, nowMs)
+      : null;
+    this.expireUnconfirmedDispatches(now);
+
     if (idempotencyKey) {
       const existing = this.get<{
         id: string;
         priority: QueuePriority;
         status: RequestStatus;
+        dispatchConfirmationToken: string | null;
+        dispatchConfirmationExpiresAt: string | null;
+        dispatchConfirmedAt: string | null;
       }>(
-        `SELECT id, priority, status
+        `SELECT id, priority, status, dispatchConfirmationToken,
+                dispatchConfirmationExpiresAt, dispatchConfirmedAt
          FROM requests
          WHERE idempotencyKey = ?
          ORDER BY createdAt DESC
@@ -682,7 +759,6 @@ export class RequestQueue {
       );
       if (existing?.id) {
         if (existing.status === "failed") {
-          const now = new Date().toISOString();
           const reopened = this.run(
             `UPDATE requests
              SET sessionId = ?,
@@ -694,6 +770,9 @@ export class RequestQueue {
                  forceLane = ?,
                  workerRequired = ?,
                  handoffJobId = NULL,
+                 dispatchConfirmationToken = ?,
+                 dispatchConfirmationExpiresAt = ?,
+                 dispatchConfirmedAt = NULL,
                  status = 'pending',
                  agentId = NULL,
                  claimToken = NULL,
@@ -716,6 +795,8 @@ export class RequestQueue {
             forceWorker,
             forceLane,
             forceWorker,
+            dispatchConfirmationToken,
+            dispatchConfirmationExpiresAt,
             now,
             now,
             existing.id,
@@ -728,7 +809,46 @@ export class RequestQueue {
               requestId: existing.id,
               queuePosition: queuePosition ?? undefined,
               etaMs: etaMs ?? undefined,
+              ...(dispatchConfirmationRequired && dispatchConfirmationToken
+                ? {
+                    dispatchConfirmationRequired: true,
+                    dispatchConfirmationToken,
+                    dispatchConfirmationExpiresAt: dispatchConfirmationExpiresAt ?? undefined,
+                  }
+                : {}),
               requeued: true,
+            };
+          }
+        }
+        if (
+          dispatchConfirmationRequired &&
+          existing.status === "pending" &&
+          !existing.dispatchConfirmationToken &&
+          !existing.dispatchConfirmedAt &&
+          dispatchConfirmationToken
+        ) {
+          const upgraded = this.run(
+            `UPDATE requests
+             SET dispatchConfirmationToken = ?,
+                 dispatchConfirmationExpiresAt = ?,
+                 updatedAt = ?
+             WHERE id = ?
+               AND status = 'pending'
+               AND dispatchConfirmationToken IS NULL
+               AND dispatchConfirmedAt IS NULL`,
+            dispatchConfirmationToken,
+            dispatchConfirmationExpiresAt,
+            now,
+            existing.id,
+          );
+          if (upgraded.changes > 0) {
+            return {
+              ok: true,
+              requestId: existing.id,
+              dispatchConfirmationRequired: true,
+              dispatchConfirmationToken,
+              dispatchConfirmationExpiresAt: dispatchConfirmationExpiresAt ?? undefined,
+              deduplicated: true,
             };
           }
         }
@@ -740,21 +860,31 @@ export class RequestQueue {
           requestId: existing.id,
           queuePosition: queuePosition ?? undefined,
           etaMs: etaMs ?? undefined,
+          ...(existing.dispatchConfirmedAt ? { dispatchConfirmed: true } : {}),
+          ...(existing.status === "pending" &&
+          existing.dispatchConfirmationToken &&
+          !existing.dispatchConfirmedAt
+            ? {
+                dispatchConfirmationRequired: true,
+                dispatchConfirmationToken: existing.dispatchConfirmationToken,
+                dispatchConfirmationExpiresAt: existing.dispatchConfirmationExpiresAt ?? undefined,
+              }
+            : {}),
           deduplicated: true,
         };
       }
     }
 
     const requestId = randomUUID();
-    const now = new Date().toISOString();
 
     this.run(
       `INSERT INTO requests (
         id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
-        workerRequired, handoffJobId, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
+        workerRequired, handoffJobId, dispatchConfirmationToken, dispatchConfirmationExpiresAt,
+        dispatchConfirmedAt, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
         enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
       )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`,
       requestId,
       sessionId,
       prompt,
@@ -765,6 +895,8 @@ export class RequestQueue {
       forceWorker,
       forceLane,
       forceWorker,
+      dispatchConfirmationToken,
+      dispatchConfirmationExpiresAt,
       now,
       now,
       now,
@@ -778,7 +910,135 @@ export class RequestQueue {
       requestId,
       queuePosition: queuePosition ?? undefined,
       etaMs: etaMs ?? undefined,
+      ...(dispatchConfirmationRequired && dispatchConfirmationToken
+        ? {
+            dispatchConfirmationRequired: true,
+            dispatchConfirmationToken,
+            dispatchConfirmationExpiresAt: dispatchConfirmationExpiresAt ?? undefined,
+          }
+        : {}),
     };
+  }
+
+  expireUnconfirmedDispatches(nowInput: string | Date = new Date()): {
+    expired: number;
+    requestIds: string[];
+  } {
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+    const rows = this.all<{ id: string }>(
+      `SELECT id
+       FROM requests
+       WHERE status = 'pending'
+         AND dispatchConfirmationToken IS NOT NULL
+         AND dispatchConfirmedAt IS NULL
+         AND (
+           dispatchConfirmationExpiresAt IS NULL
+           OR dispatchConfirmationExpiresAt <= ?
+         )
+       ORDER BY createdAt ASC`,
+      now,
+    );
+    if (rows.length === 0) return { expired: 0, requestIds: [] };
+    const result = this.run(
+      `UPDATE requests
+       SET status = 'failed',
+           error = ?,
+           failedAt = ?,
+           completedAt = NULL,
+           durationMs = MAX(
+             0,
+             CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+           ),
+           updatedAt = ?
+       WHERE status = 'pending'
+         AND dispatchConfirmationToken IS NOT NULL
+         AND dispatchConfirmedAt IS NULL
+         AND (
+           dispatchConfirmationExpiresAt IS NULL
+           OR dispatchConfirmationExpiresAt <= ?
+         )`,
+      JSON.stringify({
+        message: "Autonomy dispatch confirmation expired",
+        detail: "dispatch_confirmation_expired",
+      }),
+      now,
+      now,
+      now,
+      now,
+    );
+    return {
+      expired: result.changes,
+      requestIds: rows.slice(0, result.changes).map((row) => row.id),
+    };
+  }
+
+  confirmDispatch(
+    requestIdRaw: string,
+    confirmationTokenRaw: string,
+    nowInput: string | Date = new Date(),
+  ): {
+    ok: boolean;
+    requestId?: string;
+    confirmed?: boolean;
+    idempotent?: boolean;
+    message?: string;
+  } {
+    const requestId = asString(requestIdRaw);
+    const confirmationToken = asString(confirmationTokenRaw);
+    if (!requestId) return { ok: false, message: "requestId is required" };
+    if (!confirmationToken) {
+      return { ok: false, message: "dispatchConfirmationToken is required" };
+    }
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+
+    const updated = this.run(
+      `UPDATE requests
+       SET dispatchConfirmedAt = ?, updatedAt = ?
+       WHERE id = ?
+         AND status = 'pending'
+         AND dispatchConfirmationToken = ?
+         AND dispatchConfirmedAt IS NULL
+         AND dispatchConfirmationExpiresAt IS NOT NULL
+         AND dispatchConfirmationExpiresAt > ?`,
+      now,
+      now,
+      requestId,
+      confirmationToken,
+      now,
+    );
+    if (updated.changes > 0) {
+      return { ok: true, requestId, confirmed: true, idempotent: false };
+    }
+
+    const current = this.get<{
+      status: RequestStatus;
+      dispatchConfirmationToken: string | null;
+      dispatchConfirmationExpiresAt: string | null;
+      dispatchConfirmedAt: string | null;
+    }>(
+      `SELECT status, dispatchConfirmationToken, dispatchConfirmationExpiresAt,
+              dispatchConfirmedAt
+       FROM requests
+       WHERE id = ?`,
+      requestId,
+    );
+    if (!current) return { ok: false, message: "Request not found" };
+    if (current.dispatchConfirmationToken !== confirmationToken) {
+      return { ok: false, message: "Dispatch confirmation token is invalid" };
+    }
+    if (current.dispatchConfirmedAt) {
+      return { ok: true, requestId, confirmed: true, idempotent: true };
+    }
+    this.expireUnconfirmedDispatches(now);
+    if (
+      current.status === "pending" &&
+      (!current.dispatchConfirmationExpiresAt || current.dispatchConfirmationExpiresAt <= now)
+    ) {
+      return { ok: false, message: "Dispatch confirmation expired" };
+    }
+    return { ok: false, message: `Request cannot be confirmed from status ${current.status}` };
   }
 
   /**
@@ -805,6 +1065,7 @@ export class RequestQueue {
     // A task.execute job is the durable planning handoff. Close any expired
     // crash window before requeueing/claiming the request so a replacement
     // planner cannot dispatch the same user request a second time.
+    this.expireUnconfirmedDispatches(now);
     this.reconcileWorkerHandoffsFromJobs(now);
 
     const tx = this.db.transaction(() => {
@@ -813,6 +1074,7 @@ export class RequestQueue {
         `SELECT ${RequestQueue.SELECT_COLUMNS}
          FROM requests
          WHERE status = 'pending'
+           AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
          ORDER BY
            CASE LOWER(priority)
              WHEN 'interactive' THEN 0
@@ -860,6 +1122,7 @@ export class RequestQueue {
         request: {
           ...row,
           metadata: parseMetadataJson(row.metadataJson),
+          dispatchConfirmationToken: null,
           status: "claimed" as RequestStatus,
           agentId,
           claimToken,
@@ -1343,11 +1606,14 @@ export class RequestQueue {
          ORDER BY candidate.createdAt DESC, candidate.id DESC
          LIMIT 1
        )
-       WHERE r.status = 'pending'
-          OR (
+       WHERE (
+            r.status = 'pending'
+            OR (
             r.status = 'claimed'
             AND (r.leaseExpiresAt IS NULL OR r.leaseExpiresAt <= ?)
+            )
           )
+         AND (r.dispatchConfirmationToken IS NULL OR r.dispatchConfirmedAt IS NOT NULL)
        ORDER BY r.createdAt ASC
        LIMIT 400`,
       now,
@@ -1379,11 +1645,14 @@ export class RequestQueue {
            WHERE id = ?
              AND sessionId = ?
              AND (
-               status = 'pending'
-               OR (
+               (
+                 status = 'pending'
+                 OR (
                  status = 'claimed'
                  AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+                 )
                )
+               AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
              )`,
           row.jobId,
           JSON.stringify({
@@ -1574,10 +1843,12 @@ export class RequestQueue {
   }
 
   getPendingRequests(): RequestRow[] {
+    this.expireUnconfirmedDispatches();
     const rows = this.all<RequestRow>(
       `SELECT ${RequestQueue.SELECT_COLUMNS}
        FROM requests
        WHERE status = 'pending'
+         AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
        ORDER BY
          CASE LOWER(priority)
            WHEN 'interactive' THEN 0
@@ -1587,7 +1858,11 @@ export class RequestQueue {
           END ASC,
           createdAt ASC`,
     );
-    return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
+    return rows.map((row) => ({
+      ...row,
+      metadata: parseMetadataJson(row.metadataJson),
+      dispatchConfirmationToken: null,
+    }));
   }
 
   listRequests(options?: { status?: RequestStatus | "all"; limit?: number }): RequestRow[] {
@@ -1625,8 +1900,14 @@ export class RequestQueue {
   }
 
   countByStatus(): Record<RequestStatus, number> {
+    this.expireUnconfirmedDispatches();
     const rows = this.all<{ status: RequestStatus; count: number }>(
-      `SELECT status, COUNT(*) AS count FROM requests GROUP BY status`,
+      `SELECT status, COUNT(*) AS count
+       FROM requests
+       WHERE status <> 'pending'
+          OR dispatchConfirmationToken IS NULL
+          OR dispatchConfirmedAt IS NOT NULL
+       GROUP BY status`,
     );
 
     const counts: Record<RequestStatus, number> = {
@@ -1646,6 +1927,11 @@ export class RequestQueue {
       `SELECT priority, COUNT(*) AS count
        FROM requests
        WHERE status IN ('pending', 'claimed')
+         AND (
+           status <> 'pending'
+           OR dispatchConfirmationToken IS NULL
+           OR dispatchConfirmedAt IS NOT NULL
+         )
        GROUP BY priority`,
     );
 
@@ -1685,6 +1971,11 @@ export class RequestQueue {
       `SELECT metadataJson
        FROM requests
        WHERE status IN (${placeholders})
+         AND (
+           status <> 'pending'
+           OR dispatchConfirmationToken IS NULL
+           OR dispatchConfirmedAt IS NOT NULL
+         )
          AND metadataJson IS NOT NULL
          AND metadataJson <> ''`,
       ...normalized,

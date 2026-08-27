@@ -158,6 +158,32 @@ export interface MemoryPutOptions {
    * history are always preserved.
    */
   expectedRevision?: number;
+  /**
+   * Absolute commit-time fence for staged writers. A backend must reject the
+   * write when its clock is at or past this timestamp, immediately before the
+   * mutation is applied. This prevents an operation that completed after its
+   * caller timed out from becoming a durable ghost write.
+   */
+  validUntil?: string;
+  /** Process-local best-effort cancellation; HTTP clients do not serialize it. */
+  signal?: AbortSignal;
+}
+
+function assertMemoryPutFence(options: MemoryPutOptions, nowMs: number): void {
+  if (options.signal?.aborted) {
+    throw options.signal.reason instanceof Error
+      ? options.signal.reason
+      : new DOMException("The memory write was aborted", "AbortError");
+  }
+  if (options.validUntil === undefined) return;
+  if (typeof options.validUntil !== "string") {
+    throw new TypeError("validUntil must be an ISO timestamp");
+  }
+  const validUntilMs = Date.parse(options.validUntil);
+  if (!Number.isFinite(validUntilMs)) throw new TypeError("validUntil must be an ISO timestamp");
+  if (validUntilMs <= nowMs) {
+    throw new Error("Memory write commit fence expired before mutation");
+  }
 }
 
 export interface MemoryGetOptions {
@@ -763,7 +789,9 @@ export class InMemoryMemoryStore implements MemoryStore {
       }
     }
 
-    const now = this.now().toISOString();
+    const writeNow = this.now();
+    assertMemoryPutFence(options, writeNow.getTime());
+    const now = writeNow.toISOString();
     let expiresAt: string | null;
     if (input.expiresAt !== undefined) {
       expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
@@ -808,6 +836,7 @@ export class InMemoryMemoryStore implements MemoryStore {
       invalidationReason:
         status === "invalid" && remainsInvalid ? existing.invalidationReason : null,
     };
+    assertMemoryPutFence(options, this.now().getTime());
     this.records.set(storageKey, record as MemoryRecord);
     return cloneRecord(record);
   }
@@ -1079,6 +1108,7 @@ export class MemoryHttpClient implements MemoryStore {
     path: string,
     method: "POST" | "PUT",
     body: unknown,
+    signal?: AbortSignal,
   ): Promise<MemoryHttpEnvelope> {
     if (this.closed) throw new MemoryStoreClosedError();
     const headers: Record<string, string> = {
@@ -1089,7 +1119,7 @@ export class MemoryHttpClient implements MemoryStore {
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
     const response = await fetchBufferedWithHardDeadline({
       input: `${this.serverUrl}${path}`,
-      init: { method, headers, body: JSON.stringify(body) },
+      init: { method, headers, body: JSON.stringify(body), ...(signal ? { signal } : {}) },
       timeoutMs: this.timeoutMs,
       maxResponseBytes: this.maxResponseBytes,
       fetchImpl: this.fetchImpl,
@@ -1124,7 +1154,13 @@ export class MemoryHttpClient implements MemoryStore {
     input: MemoryPutInput<T>,
     options: MemoryPutOptions = {},
   ): Promise<MemoryRecord<T>> {
-    const payload = await this.request("/memory/records", "PUT", { input, options });
+    const { signal, ...durableOptions } = options;
+    const payload = await this.request(
+      "/memory/records",
+      "PUT",
+      { input, options: durableOptions },
+      signal,
+    );
     if (!payload.record) throw new MemoryHttpError("Memory server response omitted record");
     return payload.record as MemoryRecord<T>;
   }

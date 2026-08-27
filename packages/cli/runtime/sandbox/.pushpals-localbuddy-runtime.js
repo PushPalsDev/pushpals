@@ -592,9 +592,26 @@ var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
 var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
 var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
   "repository_agent_cache",
+  "repository_agent_capabilities",
   "repository_facts"
 ]);
 var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+function assertMemoryPutFence(options, nowMs) {
+  if (options.signal?.aborted) {
+    throw options.signal.reason instanceof Error ? options.signal.reason : new DOMException("The memory write was aborted", "AbortError");
+  }
+  if (options.validUntil === undefined)
+    return;
+  if (typeof options.validUntil !== "string") {
+    throw new TypeError("validUntil must be an ISO timestamp");
+  }
+  const validUntilMs = Date.parse(options.validUntil);
+  if (!Number.isFinite(validUntilMs))
+    throw new TypeError("validUntil must be an ISO timestamp");
+  if (validUntilMs <= nowMs) {
+    throw new Error("Memory write commit fence expired before mutation");
+  }
+}
 
 class MemoryConflictError extends Error {
   code;
@@ -955,7 +972,9 @@ class InMemoryMemoryStore {
         throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
       }
     }
-    const now = this.now().toISOString();
+    const writeNow = this.now();
+    assertMemoryPutFence(options, writeNow.getTime());
+    const now = writeNow.toISOString();
     let expiresAt;
     if (input.expiresAt !== undefined) {
       expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
@@ -992,6 +1011,7 @@ class InMemoryMemoryStore {
       invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
       invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
     };
+    assertMemoryPutFence(options, this.now().getTime());
     this.records.set(storageKey, record);
     return cloneRecord(record);
   }
@@ -1156,7 +1176,7 @@ class MemoryHttpClient {
     const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
     this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
   }
-  async request(path, method, body) {
+  async request(path, method, body, signal) {
     if (this.closed)
       throw new MemoryStoreClosedError;
     const headers = {
@@ -1168,7 +1188,7 @@ class MemoryHttpClient {
       headers.Authorization = `Bearer ${this.authToken}`;
     const response = await fetchBufferedWithHardDeadline({
       input: `${this.serverUrl}${path}`,
-      init: { method, headers, body: JSON.stringify(body) },
+      init: { method, headers, body: JSON.stringify(body), ...signal ? { signal } : {} },
       timeoutMs: this.timeoutMs,
       maxResponseBytes: this.maxResponseBytes,
       fetchImpl: this.fetchImpl,
@@ -1191,7 +1211,8 @@ class MemoryHttpClient {
     return payload;
   }
   async put(input, options = {}) {
-    const payload = await this.request("/memory/records", "PUT", { input, options });
+    const { signal, ...durableOptions } = options;
+    const payload = await this.request("/memory/records", "PUT", { input, options: durableOptions }, signal);
     if (!payload.record)
       throw new MemoryHttpError("Memory server response omitted record");
     return payload.record;
@@ -2105,6 +2126,38 @@ class CommunicationManager {
   subscribeSessionEvents(onEvent, options = {}) {
     return this.subscribeSessionEventsForSession(this.sessionId, onEvent, options);
   }
+}
+// packages/shared/src/scm_repair_authority.ts
+var SCM_REPAIR_AUTHORITY_SECRET_ENV = "PUSHPALS_SCM_REPAIR_AUTHORITY_SECRET";
+var SCM_REPAIR_AUTHORITY_MAX_AGE_MS = 2 * 60000;
+var SCM_REPAIR_AUTHORITY_RETRYABLE_IO_CODES = new Set([
+  "EACCES",
+  "EAGAIN",
+  "EBUSY",
+  "EEXIST",
+  "EMFILE",
+  "ENFILE",
+  "ENOENT",
+  "EPERM",
+  "ETXTBSY"
+]);
+var SCM_REPAIR_AUTHORITY_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
+function scrubScmRepairAuthoritySecretFromEnv(env) {
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === target)
+      delete env[key];
+  }
+}
+function copyEnvWithoutScmRepairAuthoritySecret(env = process.env) {
+  const copy = {};
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === target || typeof value !== "string")
+      continue;
+    copy[key] = value;
+  }
+  return copy;
 }
 // packages/shared/src/prompts.ts
 import { readFileSync as readFileSync2 } from "fs";
@@ -3561,6 +3614,9 @@ async function runProcessWithNode(command, opts) {
   });
 }
 var cachedCodexCommandPrefix = new Map;
+function codexChildEnv() {
+  return copyEnvWithoutScmRepairAuthoritySecret(process.env);
+}
 function bunCodexCommandFromEnv(env) {
   const bunBin = (env.PUSHPALS_BUN_BIN ?? "").trim();
   return bunBin ? [bunBin, "x", "--yes", "@openai/codex"] : [];
@@ -3596,7 +3652,7 @@ async function resolveCodexCommandPrefix(configuredCommand, signal) {
   pushCandidate(["bunx", "--yes", "@openai/codex"]);
   pushCandidate(["codex"]);
   const cwd = process.cwd();
-  const env = process.env;
+  const env = codexChildEnv();
   const attemptErrors = [];
   const successfulProbes = [];
   for (const candidate of candidates) {
@@ -4394,7 +4450,7 @@ async function prepareCodexExecutionWorkspace(input) {
   try {
     const initialized = await runProcess(["git", "init", "--quiet"], {
       cwd,
-      env: process.env,
+      env: codexChildEnv(),
       timeoutMs: 5000,
       signal: input.signal
     });
@@ -4478,7 +4534,7 @@ class OpenAiCodexCliClient {
       }
     }
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
-    const env = { ...process.env };
+    const env = codexChildEnv();
     env.PYTHONIOENCODING = "utf-8";
     if (authMode === "chatgpt") {
       delete env.OPENAI_API_KEY;
@@ -4500,7 +4556,7 @@ class OpenAiCodexCliClient {
     throwIfLlmAborted(opts.signal);
     const model = normalizeCodexModel(opts.model);
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin, opts.signal);
-    const env = { ...process.env };
+    const env = codexChildEnv();
     env.PYTHONIOENCODING = "utf-8";
     env.PUSHPALS_LLM_SERVICE = this.service;
     env.PUSHPALS_LLM_SESSION_TAG = this.sessionTag;
@@ -5330,6 +5386,7 @@ async function answerLocalReadonlyQuery(userPrompt, ctx) {
 }
 
 // apps/localbuddy/src/localbuddy_main.ts
+scrubScmRepairAuthoritySecretFromEnv(process.env);
 var CONFIG = loadPushPalsConfig();
 var LOCALBUDDY_CONTROL_HTTP_TIMEOUT_MS = 1e4;
 function parseArgs() {

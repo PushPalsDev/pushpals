@@ -3,6 +3,10 @@ import {
   type FetchLike,
 } from "../packages/shared/src/bounded_fetch.js";
 import { terminateProcessTree } from "../packages/shared/src/bounded_process.js";
+import {
+  SCM_REPAIR_AUTHORITY_SECRET_ENV,
+  copyEnvWithoutScmRepairAuthoritySecret,
+} from "../packages/shared/src/scm_repair_authority.js";
 
 export {
   computeLocalBuddyRestartBackoffMs,
@@ -921,33 +925,47 @@ export function buildCoreManagedServiceSpecs(
   bunExecPath = (process.execPath ?? "").trim() || "bun",
   cwd = process.cwd(),
   env?: Record<string, string>,
+  scmRepairAuthoritySecretOverride?: string,
 ): ManagedServiceSpec[] {
-  const base = { cwd, env };
+  const safeEnv = copyEnvWithoutScmRepairAuthoritySecret(env);
+  const authoritySecret = String(scmRepairAuthoritySecretOverride ?? "").trim();
+  const serviceEnv = (name: string): Record<string, string> => ({
+    ...safeEnv,
+    ...(authoritySecret && (name === "server" || name === "source_control_manager")
+      ? { [SCM_REPAIR_AUTHORITY_SECRET_ENV]: authoritySecret }
+      : {}),
+  });
+  const base = (name: string) => ({ cwd, env: serviceEnv(name) });
   return [
-    { name: "server", color: "blue", command: [bunExecPath, "run", "server:only"], ...base },
+    {
+      name: "server",
+      color: "blue",
+      command: [bunExecPath, "run", "server:only"],
+      ...base("server"),
+    },
     {
       name: "remotebuddy",
       color: "red",
       command: [bunExecPath, "run", "remotebuddy:only"],
-      ...base,
+      ...base("remotebuddy"),
     },
     {
       name: "workerpals",
       color: "yellow",
       command: [bunExecPath, "run", "workerpals:only:docker"],
-      ...base,
+      ...base("workerpals"),
     },
     {
       name: "source_control_manager",
       color: "cyan",
       command: [bunExecPath, "run", "source_control_manager:only:dev"],
-      ...base,
+      ...base("source_control_manager"),
     },
     {
       name: "client",
       color: "green",
       command: [bunExecPath, "run", "client:only:offline"],
-      ...base,
+      ...base("client"),
     },
   ];
 }

@@ -30,6 +30,7 @@ import {
   loadPushPalsConfig,
   resolveLocalServerConnection,
   resolveGitTokenForRemote,
+  scrubScmRepairAuthoritySecretFromEnv,
   createToolRunRecordFromFailure,
   fetchBufferedWithHardDeadline,
   isWorkerOwnedRuntimeStackFrame,
@@ -59,7 +60,13 @@ import { resolveDirectWorktreePath } from "./common/direct_worktree.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 import { resolveFreshWorktreeBaseRef, resolveReviewWorktreeBase } from "./worktree_base_ref.js";
-import type { JobCandidateState, JobDiagnostics, JobPhaseSpanDiagnostics } from "./common/types.js";
+import type {
+  JobCandidateState,
+  JobDiagnostics,
+  JobPhaseSpanDiagnostics,
+  JobTokenUsage,
+  JobUsageAttempt,
+} from "./common/types.js";
 import {
   applyMergeConflictExecutionHints,
   isMergeConflictResolutionParams,
@@ -69,7 +76,7 @@ import {
   appendValidationRepairPublicationLease,
   validationRepairPublicationLeaseFromJobParams,
 } from "shared";
-import { UsageAccumulator } from "./quality_loop_durability.js";
+import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
 
 type CommitRef = {
   branch: string;
@@ -744,11 +751,17 @@ export function buildUnhandledWorkerFailureResult(
     error && typeof error === "object"
       ? ((error as { candidateState?: JobCandidateState }).candidateState ?? undefined)
       : undefined;
+  const carriedUsage =
+    error && typeof error === "object"
+      ? (error as { usage?: JobTokenUsage; usageAttempts?: JobUsageAttempt[] })
+      : {};
   return {
     ok: false,
     summary,
     stderr: detail,
     ...(candidateState ? { candidateState } : {}),
+    ...(carriedUsage.usage ? { usage: carriedUsage.usage } : {}),
+    ...(carriedUsage.usageAttempts ? { usageAttempts: carriedUsage.usageAttempts } : {}),
     diagnostics: {
       terminal: {
         failureClass,
@@ -1148,12 +1161,13 @@ async function runJob(
   dockerExecutor: DockerExecutor | null,
   runtimeConfig: ReturnType<typeof loadPushPalsConfig>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  directDeadlineLedger?: JobDeadlineLedger,
 ): Promise<WorkerJobResult> {
   if (dockerExecutor) {
     const result = await dockerExecutor.execute(job, onLog);
     return workerJobResultFromDocker(result);
   }
-  return executeJob(job.kind, job.params, repo, onLog, runtimeConfig);
+  return executeJob(job.kind, job.params, repo, onLog, runtimeConfig, directDeadlineLedger);
 }
 
 export async function retainDirectFailureCandidate(
@@ -1163,6 +1177,7 @@ export async function retainDirectFailureCandidate(
   job: { id: string; kind: string },
   runtimeConfig: ReturnType<typeof loadPushPalsConfig> = CONFIG,
   baselineSha?: string | null,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<WorkerJobResult> {
   if (result.ok) return result;
   const candidateState =
@@ -1179,6 +1194,7 @@ export async function retainDirectFailureCandidate(
     candidateState,
     runtimeConfig,
     baselineSha,
+    deadlineLedger,
   );
   return retained.checkpoint
     ? {
@@ -1348,12 +1364,16 @@ export function buildTrustedValidationCompletionPayload(
   };
 }
 
-async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promise<string> {
+async function resolveWorktreeBaseRef(
+  repo: string,
+  requestedRef: string,
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<string> {
   return resolveFreshWorktreeBaseRef({
     requestedRef,
     integrationBranch: integrationBranchName(),
     sourceBaseBranch: CONFIG.sourceControlManager.baseBranch,
-    git: (args) => git(repo, args),
+    git: (args) => git(repo, args, deadlineLedger, "work"),
     log: (level, message) => {
       const line = `[WorkerPals] ${message}`;
       if (level === "warn") console.warn(line);
@@ -1367,12 +1387,13 @@ async function resolveWorktreeBaseRefForJob(
   requestedRef: string,
   jobId: string,
   params: Record<string, unknown>,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<string> {
   return resolveReviewWorktreeBase({
     jobId,
     params,
-    git: (args) => git(repo, args),
-    fallback: () => resolveWorktreeBaseRef(repo, requestedRef),
+    git: (args) => git(repo, args, deadlineLedger, "work"),
+    fallback: () => resolveWorktreeBaseRef(repo, requestedRef, deadlineLedger),
     log: (level, message) => {
       const line = `[WorkerPals] ${message}`;
       if (level === "warn") console.warn(line);
@@ -1386,12 +1407,18 @@ async function createIsolatedWorktree(
   jobId: string,
   baseRef: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<string> {
   const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random().toString(36).slice(2, 6)}`;
   const worktreePath = resolveDirectWorktreePath(repo, jobId, nonce);
   mkdirSync(resolve(worktreePath, ".."), { recursive: true });
 
-  const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
+  const addResult = await git(
+    repo,
+    ["worktree", "add", "--detach", worktreePath, baseRef],
+    deadlineLedger,
+    "work",
+  );
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
   }
@@ -2549,7 +2576,9 @@ async function workerLoop(
 
           try {
             let parsedParams: Record<string, unknown>;
-            const preparationStartedAtMs = Date.now();
+            const jobStartedAtMs = Date.now();
+            const preparationStartedAtMs = jobStartedAtMs;
+            let directDeadlineLedger: JobDeadlineLedger | undefined;
             try {
               parsedParams =
                 typeof job.params === "string"
@@ -2557,20 +2586,47 @@ async function workerLoop(
                   : job.params;
 
               if (!dockerExecutor) {
+                const directPlanning =
+                  parsedParams.planning &&
+                  typeof parsedParams.planning === "object" &&
+                  !Array.isArray(parsedParams.planning)
+                    ? (parsedParams.planning as Record<string, unknown>)
+                    : null;
+                const directExecutionBudgetMs = Number(directPlanning?.executionBudgetMs);
+                const directFinalizationBudgetMs = Number(directPlanning?.finalizationBudgetMs);
+                directDeadlineLedger =
+                  directPlanning &&
+                  Number.isFinite(directExecutionBudgetMs) &&
+                  directExecutionBudgetMs > 0 &&
+                  Number.isFinite(directFinalizationBudgetMs) &&
+                  directFinalizationBudgetMs > 0
+                    ? new JobDeadlineLedger({
+                        executionBudgetMs: directExecutionBudgetMs,
+                        finalizationBudgetMs: directFinalizationBudgetMs,
+                        startedAtMs: jobStartedAtMs,
+                      })
+                    : undefined;
                 const jobBaseRef = await resolveWorktreeBaseRefForJob(
                   opts.repo,
                   opts.worktreeBaseRef,
                   job.id,
                   parsedParams,
+                  directDeadlineLedger,
                 );
                 directWorktreePath = await createIsolatedWorktree(
                   opts.repo,
                   job.id,
                   jobBaseRef,
                   onLog,
+                  directDeadlineLedger,
                 );
                 executionRepo = directWorktreePath;
-                const directBaseline = await git(executionRepo, ["rev-parse", "HEAD"]);
+                const directBaseline = await git(
+                  executionRepo,
+                  ["rev-parse", "HEAD"],
+                  directDeadlineLedger,
+                  "work",
+                );
                 if (!directBaseline.ok || !directBaseline.stdout.trim()) {
                   throw new Error(
                     `Unable to resolve isolated worktree baseline before execution: ${directBaseline.stderr || directBaseline.stdout || `git exited ${directBaseline.exitCode}`}`,
@@ -2583,12 +2639,63 @@ async function workerLoop(
                     job.id,
                     parsedParams,
                     onLog,
+                    directDeadlineLedger,
                   );
                   parsedParams = applyMergeConflictExecutionHints(parsedParams, prepared);
                 }
               }
             } catch (preparationError) {
               result = buildWorkerPreparationFailureResult(preparationError);
+              if (directDeadlineLedger?.workExpired()) {
+                result = {
+                  ...result,
+                  summary: `Job ${job.id} reached its absolute deadline during host preparation`,
+                  stderr: [
+                    result.stderr,
+                    "The shared work budget was exhausted before executor startup; the reserved finalization window was not borrowed.",
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                  exitCode: 124,
+                };
+              }
+              if (directWorktreePath) {
+                try {
+                  result = await retainDirectFailureCandidate(
+                    result,
+                    directWorktreePath,
+                    opts.workerId,
+                    { id: job.id, kind: job.kind },
+                    CONFIG,
+                    directWorktreeBaselineSha,
+                    directDeadlineLedger,
+                  );
+                  if (result.candidateState?.checkpoint) {
+                    onLog?.(
+                      "stderr",
+                      `[WorkerPals] Retained preparation-failure candidate ${result.candidateState.checkpoint.sha.slice(0, 12)} before terminal persistence and worktree cleanup.`,
+                    );
+                  }
+                } catch (candidateError) {
+                  preserveDirectWorktreeForCandidateRecovery = true;
+                  result = {
+                    ...result,
+                    candidateState:
+                      result.candidateState ??
+                      ({
+                        status: result.exitCode === 124 ? "partial" : "held",
+                        reason: "preparation_checkpoint_failed_worktree_preserved",
+                        changedPaths: [],
+                      } satisfies JobCandidateState),
+                    stderr: [
+                      result.stderr,
+                      `Preparation candidate checkpoint failed; preserving direct worktree at ${directWorktreePath}: ${compactWorkerError(candidateError)}`,
+                    ]
+                      .filter(Boolean)
+                      .join("\n"),
+                  };
+                }
+              }
               const preparationDurationMs = Math.max(0, Date.now() - preparationStartedAtMs);
               allowHeartbeatRecycle = false;
               await transport.flush();
@@ -2629,9 +2736,15 @@ async function workerLoop(
             };
 
             let cooldownAfterJobMs = 0;
-            const jobStartedAtMs = Date.now();
             try {
-              result = await runJob(jobData, executionRepo, dockerExecutor, CONFIG, onLog);
+              result = await runJob(
+                jobData,
+                executionRepo,
+                dockerExecutor,
+                CONFIG,
+                onLog,
+                directDeadlineLedger,
+              );
               cooldownAfterJobMs =
                 Number.isFinite(result.cooldownMs) && (result.cooldownMs ?? 0) > 0
                   ? Math.floor(result.cooldownMs ?? 0)
@@ -2664,6 +2777,7 @@ async function workerLoop(
                   jobData,
                   CONFIG,
                   directWorktreeBaselineSha,
+                  directDeadlineLedger,
                 );
                 if (result.candidateState?.checkpoint) {
                   onLog?.(
@@ -2695,19 +2809,8 @@ async function workerLoop(
                 );
               }
             }
-            const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
-
             allowHeartbeatRecycle = false;
             await transport.flush();
-            try {
-              await reportWorkerLlmUsage(opts.server, headers, jobData, result);
-            } catch (err) {
-              console.warn(
-                `[WorkerPals] Failed to report LLM usage for job ${job.id}: ${
-                  err instanceof Error ? err.message : String(err)
-                }`,
-              );
-            }
 
             let completionCommit: CommitRef | null = null;
             if (result.ok && shouldCommit(job.kind, CONFIG)) {
@@ -2764,6 +2867,7 @@ async function workerLoop(
                     deferPublication: Boolean(result.validationBlocked),
                   },
                   CONFIG,
+                  directDeadlineLedger,
                 );
                 if ((commitResult.usageAttempts?.length ?? 0) > 0) {
                   const usageAccumulator = new UsageAccumulator();
@@ -2779,7 +2883,47 @@ async function workerLoop(
                   result = usageAccumulator.apply(result);
                 }
 
-                if (commitResult.ok && commitResult.sha && commitResult.branch) {
+                const directFinalizationExpired = directDeadlineLedger?.remainingTotalMs() === 0;
+                if (directFinalizationExpired) {
+                  const exactCandidate =
+                    commitResult.ok &&
+                    commitResult.sha &&
+                    commitResult.sha !== "no-changes" &&
+                    commitResult.branch
+                      ? {
+                          status: "held" as const,
+                          reason: "finalization_deadline",
+                          changedPaths: [],
+                          checkpoint: {
+                            ref: commitResult.branch,
+                            sha: commitResult.sha,
+                            capturedAt: new Date().toISOString(),
+                          },
+                        }
+                      : undefined;
+                  if (!exactCandidate) {
+                    preserveDirectWorktreeForCandidateRecovery = true;
+                  }
+                  result = {
+                    ...result,
+                    ok: false,
+                    summary: `Job ${job.id} reached its absolute deadline during commit finalization`,
+                    stderr: [
+                      result.stderr,
+                      "The absolute job deadline expired during host-side commit finalization; the job cannot be reported as ordinary success.",
+                    ]
+                      .filter(Boolean)
+                      .join("\n"),
+                    exitCode: 124,
+                    candidateState: exactCandidate ??
+                      result.candidateState ?? {
+                        status: "partial",
+                        reason: "finalization_deadline_worktree_preserved",
+                        changedPaths: [],
+                      },
+                  };
+                  completionCommit = null;
+                } else if (commitResult.ok && commitResult.sha && commitResult.branch) {
                   if (commitResult.sha !== "no-changes") {
                     completionCommit = {
                       branch: commitResult.branch,
@@ -2819,6 +2963,7 @@ async function workerLoop(
                       jobData,
                       CONFIG,
                       directWorktreeBaselineSha,
+                      directDeadlineLedger,
                     );
                   } catch (error) {
                     preserveDirectWorktreeForCandidateRecovery = true;
@@ -2869,6 +3014,20 @@ async function workerLoop(
             }
 
             const finalizedAtMs = Date.now();
+            const jobDurationMs = Math.max(0, finalizedAtMs - jobStartedAtMs);
+            // Report only after direct/Docker finalization has merged all
+            // executor, recovery, critic, and commit-message calls into the
+            // terminal result. Reporting earlier silently omitted direct-mode
+            // finalization usage and understated the end-to-end duration.
+            try {
+              await reportWorkerLlmUsage(opts.server, headers, jobData, result);
+            } catch (err) {
+              console.warn(
+                `[WorkerPals] Failed to report LLM usage for job ${job.id}: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
             const jobAttemptRaw = Number((job as { attempt?: unknown }).attempt ?? 1);
             const jobAttempt =
               Number.isFinite(jobAttemptRaw) && jobAttemptRaw > 0 ? Math.floor(jobAttemptRaw) : 1;
@@ -3478,5 +3637,6 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
   main();
 }

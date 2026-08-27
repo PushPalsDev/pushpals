@@ -1,3 +1,5 @@
+import { copyEnvWithoutScmRepairAuthoritySecret } from "../packages/shared/src/scm_repair_authority.js";
+
 type HarnessPhase = {
   name: string;
   files: string[];
@@ -85,6 +87,8 @@ const phases: HarnessPhase[] = [
       "tests/workerpals.execute-job-clarification.test.ts",
       "tests/workerpals.quality-gate-issues.test.ts",
       "tests/workerpals.quality-loop-durability.test.ts",
+      "tests/workerpals.docker-deadline.test.ts",
+      "tests/workerpals.commit-message-generation.test.ts",
       "tests/workerpals.validation-command-safety.test.ts",
       "tests/workerpals.job-runner.test.ts",
       "tests/workerpals.generic-python-executor.test.ts",
@@ -112,12 +116,14 @@ const phases: HarnessPhase[] = [
       "tests/bounded-line-buffer.test.ts",
       "tests/shared.bounded-fetch.test.ts",
       "tests/shared.bounded-process.test.ts",
+      "tests/shared.scm-repair-authority.test.ts",
       "tests/workerpals.bounded-process.test.ts",
       "tests/shared.communication.test.ts",
       "tests/workerpals.generic-python-executor.test.ts",
       "tests/workerpals.packaged-generic-python-executor.test.ts",
       "apps/localbuddy/src/http_deadlines.test.ts",
       "tests/cli.http-deadline.test.ts",
+      "tests/cli.runtime-bootstrap.test.ts",
       "tests/cli.sse-buffer.test.ts",
       "tests/client.http-deadline.test.ts",
       "tests/vscode.http-deadline.test.ts",
@@ -125,6 +131,7 @@ const phases: HarnessPhase[] = [
       "tests/start.runtime-services.test.ts",
       "tests/remotebuddy.llm-codex.test.ts",
       "tests/workerpals.validation-command-safety.test.ts",
+      "tests/workerpals.sandbox-env.test.ts",
       "tests/workerpals.runtime-sandbox-mirror.test.ts",
       "tests/release-package-payload.test.ts",
       "tests/release-workflow-actions.test.ts",
@@ -157,7 +164,10 @@ async function runPhase(phase: HarnessPhase): Promise<{ ok: boolean; durationMs:
     stdout: "inherit",
     stderr: "inherit",
     detached: process.platform !== "win32",
-    env: { ...process.env, PUSHPALS_RELIABILITY_HARNESS: "1" },
+    env: {
+      ...copyEnvWithoutScmRepairAuthoritySecret(process.env),
+      PUSHPALS_RELIABILITY_HARNESS: "1",
+    },
   });
   let timer: ReturnType<typeof setTimeout> | null = null;
   const outcome = await Promise.race([

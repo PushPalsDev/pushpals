@@ -1603,8 +1603,8 @@ describe("workerpals docker executor internals", () => {
     expect(capturedCommand).toContain("projection=container-volume-v1");
     expect(capturedCommand).toContain("node_modules-container-native");
     expect(capturedCommand).toContain('for entry in "$src"/* "$src"/.[!.]* "$src"/..?*');
-    expect(capturedCommand).toContain('cp -al "$src/." "$projection_node_modules/"');
-    expect(capturedCommand).not.toContain('cp -al "$entry" "$dest/$entry_name"');
+    expect(capturedCommand).toContain('cp -a --reflink=auto "$src/." "$projection_node_modules/"');
+    expect(capturedCommand).not.toContain("cp -al");
     expect(capturedCommand).toContain(
       'find "$snapshot_root/node_modules" -type f -exec chmod a-w {} +',
     );
@@ -1639,7 +1639,9 @@ describe("workerpals docker executor internals", () => {
     expect(command).toContain('ln -s "$workspace_placeholder');
     expect(command).toContain('ln -s "$worktree${workspace_relative:+/$workspace_relative}"');
     expect(command).toContain('printf \'%s\\n\' "$snapshot_key" > "$snapshot_ready"');
-    const projectionCopyIndex = command.indexOf('cp -al "$src/." "$projection_node_modules/"');
+    const projectionCopyIndex = command.indexOf(
+      'cp -a --reflink=auto "$src/." "$projection_node_modules/"',
+    );
     const workspaceRebindIndex = command.indexOf(
       'ln -s "$worktree${workspace_relative:+/$workspace_relative}"',
     );
@@ -1653,11 +1655,12 @@ describe("workerpals docker executor internals", () => {
     process.env.PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION === "1"
     ? test
     : test.skip)(
-    "serializes concurrent snapshot materialization and ignores abandoned lock contents",
+    "serializes snapshot materialization and isolates concurrent dependency mutations",
     async () => {
       const worktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-a-"));
       const secondWorktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-b-"));
       const thirdWorktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-c-"));
+      const fourthWorktree = mkdtempSync(join(tmpdir(), "pushpals-container-deps-d-"));
       const dependencyStore = mkdtempSync(join(tmpdir(), "pushpals-container-store-"));
       try {
         mkdirSync(join(worktree, "fixture-dep"));
@@ -1699,6 +1702,13 @@ describe("workerpals docker executor internals", () => {
           join(worktree, "fixture-dep", "package.json"),
           join(thirdWorktree, "fixture-dep", "package.json"),
         );
+        mkdirSync(join(fourthWorktree, "fixture-dep"));
+        copyFileSync(join(worktree, "package.json"), join(fourthWorktree, "package.json"));
+        copyFileSync(join(worktree, "bun.lock"), join(fourthWorktree, "bun.lock"));
+        copyFileSync(
+          join(worktree, "fixture-dep", "package.json"),
+          join(fourthWorktree, "fixture-dep", "package.json"),
+        );
 
         const command = buildWorktreeDependencyPreparationCommand(worktree, dependencyStore);
         const secondCommand = buildWorktreeDependencyPreparationCommand(
@@ -1739,21 +1749,65 @@ describe("workerpals docker executor internals", () => {
         expect(abandonedLockFiles).toHaveLength(1);
         writeFileSync(join(dependencyStore, abandonedLockFiles[0]), "abandoned-owner\n", "utf8");
 
+        const readyFiles = Array.from(
+          new Bun.Glob("snapshots/linux-*/*/.pushpals-dependency-ready").scanSync({
+            cwd: dependencyStore,
+          }),
+        );
+        expect(readyFiles).toHaveLength(1);
+        const snapshotReadyPath = join(dependencyStore, readyFiles[0]);
+        const snapshotNodeModules = join(snapshotReadyPath, "..", "node_modules");
+        const snapshotIsolationFixture = join(
+          snapshotNodeModules,
+          ".pushpals-concurrent-isolation-fixture",
+        );
+        writeFileSync(snapshotIsolationFixture, "stable snapshot\n", "utf8");
+        const readyTimestamp = new Date(Date.now() + 2_000);
+        utimesSync(snapshotReadyPath, readyTimestamp, readyTimestamp);
+
         const thirdCommand = buildWorktreeDependencyPreparationCommand(
           thirdWorktree,
+          dependencyStore,
+        );
+        const fourthCommand = buildWorktreeDependencyPreparationCommand(
+          fourthWorktree,
           dependencyStore,
         );
         const third = Bun.spawn(["sh", "-lc", thirdCommand], {
           stdout: "pipe",
           stderr: "pipe",
         });
-        const [thirdExit, thirdStderr] = await Promise.all([
+        const fourth = Bun.spawn(["sh", "-lc", fourthCommand], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [thirdExit, thirdStderr, fourthExit, fourthStderr] = await Promise.all([
           third.exited,
           new Response(third.stderr).text(),
+          fourth.exited,
+          new Response(fourth.stderr).text(),
         ]);
         expect(thirdExit).toBe(0);
+        expect(fourthExit).toBe(0);
         expect(thirdStderr).toContain("phase=snapshot_cache_hit");
+        expect(fourthStderr).toContain("phase=snapshot_cache_hit");
         expect(lstatSync(join(thirdWorktree, "node_modules")).isSymbolicLink()).toBe(true);
+        expect(lstatSync(join(fourthWorktree, "node_modules")).isSymbolicLink()).toBe(true);
+        const thirdIsolationFixture = join(
+          thirdWorktree,
+          "node_modules",
+          ".pushpals-concurrent-isolation-fixture",
+        );
+        const fourthIsolationFixture = join(
+          fourthWorktree,
+          "node_modules",
+          ".pushpals-concurrent-isolation-fixture",
+        );
+        expect(readFileSync(thirdIsolationFixture, "utf8")).toBe("stable snapshot\n");
+        expect(readFileSync(fourthIsolationFixture, "utf8")).toBe("stable snapshot\n");
+        writeFileSync(thirdIsolationFixture, "mutated by one concurrent job\n", "utf8");
+        expect(readFileSync(fourthIsolationFixture, "utf8")).toBe("stable snapshot\n");
+        expect(readFileSync(snapshotIsolationFixture, "utf8")).toBe("stable snapshot\n");
         const fixtureLink = join(thirdWorktree, "node_modules", "fixture-dep");
         if (lstatSync(fixtureLink).isSymbolicLink()) {
           expect(readlinkSync(fixtureLink)).toContain(thirdWorktree);
@@ -1763,6 +1817,7 @@ describe("workerpals docker executor internals", () => {
         rmSync(worktree, { recursive: true, force: true });
         rmSync(secondWorktree, { recursive: true, force: true });
         rmSync(thirdWorktree, { recursive: true, force: true });
+        rmSync(fourthWorktree, { recursive: true, force: true });
         rmSync(dependencyStore, { recursive: true, force: true });
       }
     },
@@ -2153,7 +2208,10 @@ describe("workerpals docker executor internals", () => {
       resolveWorktreeBaseRefForJob: () => Promise<string>;
       createWorktree: (worktreePath: string) => Promise<void>;
       logExecutionConfig: () => void;
-      runInWarmContainer: () => Promise<{
+      runInWarmContainer: (
+        worktreePath: string,
+        job: { id: string },
+      ) => Promise<{
         ok: boolean;
         summary: string;
         commit?: { branch: string; sha: string };
@@ -2171,11 +2229,14 @@ describe("workerpals docker executor internals", () => {
       mkdirSync(worktreePath, { recursive: true });
     };
     executor.logExecutionConfig = () => {};
-    executor.runInWarmContainer = async () => ({
-      ok: true,
-      summary: "ok",
-      commit: { branch: "agent/workerpal-test/job-regular", sha: "a".repeat(40) },
-    });
+    executor.runInWarmContainer = async (_worktreePath, job) =>
+      job.id === mergeConflictJob.id
+        ? { ok: false, summary: "incomplete merge-conflict review lease" }
+        : {
+            ok: true,
+            summary: "ok",
+            commit: { branch: "agent/workerpal-test/job-regular", sha: "a".repeat(40) },
+          };
     executor.removeWorktree = async (worktreePath) => {
       rmSync(worktreePath, { recursive: true, force: true });
     };

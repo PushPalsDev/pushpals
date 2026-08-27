@@ -8199,9 +8199,26 @@ var MEMORY_HTTP_CALLER_HEADER = "x-pushpals-memory-caller";
 var MEMORY_HTTP_AUTHORITY_HEADER = "x-pushpals-memory-authority";
 var REPOSITORY_AGENT_MEMORY_NAMESPACES = Object.freeze([
   "repository_agent_cache",
+  "repository_agent_capabilities",
   "repository_facts"
 ]);
 var MAX_MEMORY_REINFORCEMENT_OBSERVATIONS = 256;
+function assertMemoryPutFence(options, nowMs) {
+  if (options.signal?.aborted) {
+    throw options.signal.reason instanceof Error ? options.signal.reason : new DOMException("The memory write was aborted", "AbortError");
+  }
+  if (options.validUntil === undefined)
+    return;
+  if (typeof options.validUntil !== "string") {
+    throw new TypeError("validUntil must be an ISO timestamp");
+  }
+  const validUntilMs = Date.parse(options.validUntil);
+  if (!Number.isFinite(validUntilMs))
+    throw new TypeError("validUntil must be an ISO timestamp");
+  if (validUntilMs <= nowMs) {
+    throw new Error("Memory write commit fence expired before mutation");
+  }
+}
 
 class MemoryConflictError extends Error {
   code;
@@ -8562,7 +8579,9 @@ class InMemoryMemoryStore {
         throw new MemoryConflictError(`Memory revision conflict for ${key}: expected ${options.expectedRevision}, got ${actualRevision}`);
       }
     }
-    const now = this.now().toISOString();
+    const writeNow = this.now();
+    assertMemoryPutFence(options, writeNow.getTime());
+    const now = writeNow.toISOString();
     let expiresAt;
     if (input.expiresAt !== undefined) {
       expiresAt = input.expiresAt == null ? null : normalizeTimestamp(input.expiresAt, "expiresAt");
@@ -8599,6 +8618,7 @@ class InMemoryMemoryStore {
       invalidatedAt: status === "invalid" ? remainsInvalid ? existing.invalidatedAt : now : null,
       invalidationReason: status === "invalid" && remainsInvalid ? existing.invalidationReason : null
     };
+    assertMemoryPutFence(options, this.now().getTime());
     this.records.set(storageKey, record);
     return cloneRecord(record);
   }
@@ -8763,7 +8783,7 @@ class MemoryHttpClient {
     const requestedMaxResponseBytes = Number(options.maxResponseBytes ?? 2 * 1024 * 1024);
     this.maxResponseBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number.isFinite(requestedMaxResponseBytes) ? Math.floor(requestedMaxResponseBytes) : 2 * 1024 * 1024));
   }
-  async request(path, method, body) {
+  async request(path, method, body, signal) {
     if (this.closed)
       throw new MemoryStoreClosedError;
     const headers = {
@@ -8775,7 +8795,7 @@ class MemoryHttpClient {
       headers.Authorization = `Bearer ${this.authToken}`;
     const response = await fetchBufferedWithHardDeadline({
       input: `${this.serverUrl}${path}`,
-      init: { method, headers, body: JSON.stringify(body) },
+      init: { method, headers, body: JSON.stringify(body), ...signal ? { signal } : {} },
       timeoutMs: this.timeoutMs,
       maxResponseBytes: this.maxResponseBytes,
       fetchImpl: this.fetchImpl,
@@ -8798,7 +8818,8 @@ class MemoryHttpClient {
     return payload;
   }
   async put(input, options = {}) {
-    const payload = await this.request("/memory/records", "PUT", { input, options });
+    const { signal, ...durableOptions } = options;
+    const payload = await this.request("/memory/records", "PUT", { input, options: durableOptions }, signal);
     if (!payload.record)
       throw new MemoryHttpError("Memory server response omitted record");
     return payload.record;
@@ -9564,12 +9585,225 @@ function createRepositoryAgentServiceClients(options) {
     }
   });
 }
+// packages/shared/src/scm_repair_authority.ts
+import { createHmac, randomBytes, timingSafeEqual } from "crypto";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  readFileSync as readFileSync3,
+  statSync as statSync3,
+  unlinkSync,
+  writeFileSync
+} from "fs";
+import { join as join2, resolve as resolve4 } from "path";
+var SCM_REPAIR_AUTHORITY_HEADER = "x-pushpals-scm-repair-authority";
+var SCM_REPAIR_AUTHORITY_SECRET_ENV = "PUSHPALS_SCM_REPAIR_AUTHORITY_SECRET";
+var SCM_REPAIR_AUTHORITY_VERSION = "v1";
+var SCM_REPAIR_AUTHORITY_MAX_AGE_MS = 2 * 60000;
+var SCM_REPAIR_AUTHORITY_MAX_FUTURE_SKEW_MS = 15000;
+var SCM_REPAIR_AUTHORITY_MIN_SECRET_CHARS = 32;
+var SCM_REPAIR_AUTHORITY_CREATE_RETRY_MS = 5000;
+var SCM_REPAIR_AUTHORITY_INVALID_STABILITY_MS = 2000;
+var SCM_REPAIR_AUTHORITY_CREATE_RETRY_MIN_DELAY_MS = 10;
+var SCM_REPAIR_AUTHORITY_CREATE_RETRY_MAX_DELAY_MS = 100;
+var SCM_REPAIR_AUTHORITY_RETRYABLE_IO_CODES = new Set([
+  "EACCES",
+  "EAGAIN",
+  "EBUSY",
+  "EEXIST",
+  "EMFILE",
+  "ENFILE",
+  "ENOENT",
+  "EPERM",
+  "ETXTBSY"
+]);
+var SCM_REPAIR_AUTHORITY_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
+function normalizeAuthoritySecret(value) {
+  const secret = String(value ?? "").trim();
+  if (secret.length < SCM_REPAIR_AUTHORITY_MIN_SECRET_CHARS)
+    return "";
+  return secret;
+}
+function filesystemErrorCode(error) {
+  return String(error?.code ?? "").toUpperCase();
+}
+function isRetryableAuthorityIoError(error) {
+  return SCM_REPAIR_AUTHORITY_RETRYABLE_IO_CODES.has(filesystemErrorCode(error));
+}
+function waitForAuthorityCreationRetry(delayMs) {
+  Atomics.wait(SCM_REPAIR_AUTHORITY_RETRY_WAIT, 0, 0, Math.max(1, Math.floor(delayMs)));
+}
+function scrubScmRepairAuthoritySecretFromEnv(env) {
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === target)
+      delete env[key];
+  }
+}
+function canonicalJson(value) {
+  if (value === null)
+    return "null";
+  if (typeof value === "string" || typeof value === "boolean")
+    return JSON.stringify(value);
+  if (typeof value === "number")
+    return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry === undefined ? null : entry)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value;
+    const entries = Object.keys(record).filter((key) => record[key] !== undefined).sort((left, right) => left < right ? -1 : left > right ? 1 : 0).map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return "null";
+}
+function authorityMessage(body, issuedAtMs, nonce) {
+  return `${SCM_REPAIR_AUTHORITY_VERSION}
+${issuedAtMs}
+${nonce}
+${canonicalJson(body)}`;
+}
+function authoritySignature(body, secret, issuedAtMs, nonce) {
+  return createHmac("sha256", secret).update(authorityMessage(body, issuedAtMs, nonce), "utf8").digest("base64url");
+}
+function resolveScmRepairAuthoritySecret(options) {
+  const env = options.env ?? process.env;
+  const configured = String(env[SCM_REPAIR_AUTHORITY_SECRET_ENV] ?? "").trim();
+  if (configured) {
+    const valid = normalizeAuthoritySecret(configured);
+    if (!valid) {
+      throw new Error(`${SCM_REPAIR_AUTHORITY_SECRET_ENV} must contain at least 32 characters`);
+    }
+    return valid;
+  }
+  const authorityDir = resolve4(options.dataDir, "control-plane");
+  const secretPath = join2(authorityDir, "scm-repair-authority.key");
+  mkdirSync(authorityDir, { recursive: true, mode: 448 });
+  let lastRetryableIssue = `SCM repair authority key at ${secretPath} was not ready`;
+  const inspectExisting = () => {
+    try {
+      const raw = readFileSync3(secretPath, "utf8");
+      const existing = normalizeAuthoritySecret(raw);
+      if (existing)
+        return { state: "valid", secret: existing };
+      const stats = statSync3(secretPath);
+      lastRetryableIssue = `SCM repair authority key at ${secretPath} was incomplete`;
+      return {
+        state: "invalid",
+        fingerprint: `${stats.size}:${Math.floor(stats.mtimeMs)}:${raw}`
+      };
+    } catch (error) {
+      if (!isRetryableAuthorityIoError(error))
+        throw error;
+      const code = filesystemErrorCode(error);
+      lastRetryableIssue = `SCM repair authority key at ${secretPath} was not readable${code ? ` (${code})` : ""}`;
+      return code === "ENOENT" ? { state: "missing" } : { state: "transient", code };
+    }
+  };
+  const initial = inspectExisting();
+  if (initial.state === "valid")
+    return initial.secret;
+  const generated = randomBytes(32).toString("base64url");
+  const temporaryPath = join2(authorityDir, `.scm-repair-authority.${process.pid}.${randomBytes(9).toString("hex")}.tmp`);
+  writeFileSync(temporaryPath, `${generated}
+`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 384
+  });
+  const retryDeadlineMs = Date.now() + SCM_REPAIR_AUTHORITY_CREATE_RETRY_MS;
+  let retryCount = 0;
+  let stableInvalidFingerprint = "";
+  let stableInvalidSinceMs = 0;
+  try {
+    while (true) {
+      const nowMs = Date.now();
+      const existing = inspectExisting();
+      if (existing.state === "valid")
+        return existing.secret;
+      if (existing.state === "invalid") {
+        if (existing.fingerprint !== stableInvalidFingerprint) {
+          stableInvalidFingerprint = existing.fingerprint;
+          stableInvalidSinceMs = nowMs;
+        } else if (nowMs - stableInvalidSinceMs >= SCM_REPAIR_AUTHORITY_INVALID_STABILITY_MS) {
+          const confirmed = inspectExisting();
+          if (confirmed.state === "invalid" && confirmed.fingerprint === stableInvalidFingerprint) {
+            try {
+              unlinkSync(secretPath);
+              stableInvalidFingerprint = "";
+              stableInvalidSinceMs = 0;
+              continue;
+            } catch (error) {
+              if (!isRetryableAuthorityIoError(error))
+                throw error;
+            }
+          }
+        }
+      } else {
+        stableInvalidFingerprint = "";
+        stableInvalidSinceMs = 0;
+      }
+      if (existing.state === "missing") {
+        try {
+          linkSync(temporaryPath, secretPath);
+          try {
+            chmodSync(secretPath, 384);
+          } catch {}
+          return generated;
+        } catch (error) {
+          if (!isRetryableAuthorityIoError(error))
+            throw error;
+          const code = filesystemErrorCode(error);
+          lastRetryableIssue = `SCM repair authority key creation at ${secretPath} is still in progress${code ? ` (${code})` : ""}`;
+        }
+      }
+      const remainingMs = retryDeadlineMs - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(`${lastRetryableIssue}; timed out after ${SCM_REPAIR_AUTHORITY_CREATE_RETRY_MS}ms waiting for a concurrent first-start writer`);
+      }
+      retryCount += 1;
+      const delayMs = Math.min(remainingMs, SCM_REPAIR_AUTHORITY_CREATE_RETRY_MAX_DELAY_MS, SCM_REPAIR_AUTHORITY_CREATE_RETRY_MIN_DELAY_MS * retryCount);
+      waitForAuthorityCreationRetry(delayMs);
+    }
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {}
+  }
+}
+function verifyScmRepairAuthorityProof(options) {
+  const secret = normalizeAuthoritySecret(options.secret);
+  if (!secret)
+    return { ok: false, reason: "SCM repair authority is unavailable" };
+  const proof = String(options.proof ?? "").trim();
+  const match = proof.match(/^v1\.(\d{10,16})\.([A-Za-z0-9_-]{16,128})\.([A-Za-z0-9_-]{43})$/);
+  if (!match)
+    return { ok: false, reason: "SCM repair authority proof is missing or malformed" };
+  const issuedAtMs = Number(match[1]);
+  const nonce = match[2];
+  const suppliedSignature = match[3];
+  const nowMs = Math.floor(options.nowMs ?? Date.now());
+  if (!Number.isSafeInteger(issuedAtMs)) {
+    return { ok: false, reason: "SCM repair authority timestamp is invalid" };
+  }
+  if (issuedAtMs < nowMs - SCM_REPAIR_AUTHORITY_MAX_AGE_MS || issuedAtMs > nowMs + SCM_REPAIR_AUTHORITY_MAX_FUTURE_SKEW_MS) {
+    return { ok: false, reason: "SCM repair authority proof expired" };
+  }
+  const expectedSignature = authoritySignature(options.body, secret, issuedAtMs, nonce);
+  const supplied = Buffer.from(suppliedSignature, "utf8");
+  const expected = Buffer.from(expectedSignature, "utf8");
+  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+    return { ok: false, reason: "SCM repair authority signature is invalid" };
+  }
+  return { ok: true, issuedAtMs, nonce };
+}
 // packages/shared/src/prompts.ts
 var promptTemplateCache = new Map;
 var repoDocCache = new Map;
 // packages/shared/src/config.ts
-import { existsSync as existsSync2, readFileSync as readFileSync3 } from "fs";
-import { join as join2, resolve as resolve4, isAbsolute as isAbsolute2 } from "path";
+import { existsSync as existsSync2, readFileSync as readFileSync4 } from "fs";
+import { join as join3, resolve as resolve5, isAbsolute as isAbsolute2 } from "path";
 
 // packages/shared/src/autonomy_policy.ts
 import { createHash as createHash4 } from "crypto";
@@ -10008,7 +10242,7 @@ function normalizeLoopbackHttpUrl(value, fallbackPort) {
 }
 
 // packages/shared/src/config.ts
-var PROJECT_ROOT = resolve4(import.meta.dir, "..", "..", "..");
+var PROJECT_ROOT = resolve5(import.meta.dir, "..", "..", "..");
 var DEFAULT_CONFIG_DIR = "configs";
 var TRUTHY = new Set(["1", "true", "yes", "on"]);
 var FALSY = new Set(["0", "false", "no", "off"]);
@@ -10068,7 +10302,7 @@ function parseIntEnv(name) {
 function parseTomlFile(path) {
   if (!existsSync2(path))
     return {};
-  const raw = readFileSync3(path, "utf-8").replace(/^\uFEFF/, "");
+  const raw = readFileSync4(path, "utf-8").replace(/^\uFEFF/, "");
   const parsed = Bun.TOML.parse(raw);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
     return {};
@@ -10192,8 +10426,8 @@ function resolvePathFromRoot(projectRoot, value) {
   if (!value)
     return projectRoot;
   if (isAbsolute2(value))
-    return resolve4(value);
-  return resolve4(projectRoot, value);
+    return resolve5(value);
+  return resolve5(projectRoot, value);
 }
 function resolveRuntimeConfigDir(projectRoot, configuredDir) {
   if (configuredDir && configuredDir.trim()) {
@@ -10272,18 +10506,18 @@ function resolveLlmConfig(serviceNode, envPrefix, defaults, globalSessionId) {
 }
 function loadPushPalsConfig(options = {}) {
   const projectRootOverride = firstNonEmpty(options.projectRoot, process.env.PUSHPALS_PROJECT_ROOT_OVERRIDE, PROJECT_ROOT);
-  const projectRoot = resolve4(projectRootOverride);
+  const projectRoot = resolve5(projectRootOverride);
   const configDirOverride = firstNonEmpty(options.configDir, process.env.PUSHPALS_CONFIG_DIR_OVERRIDE, "");
   const configDir = resolveRuntimeConfigDir(projectRoot, configDirOverride);
   const cacheKey = `${projectRoot}::${configDir}::${process.env.PUSHPALS_PROFILE ?? ""}`;
   if (!options.reload && cachedConfig && cachedConfigKey === cacheKey) {
     return cachedConfig;
   }
-  const defaultToml = parseRequiredTomlFile(join2(configDir, "default.toml"));
+  const defaultToml = parseRequiredTomlFile(join3(configDir, "default.toml"));
   const preferredProfile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(defaultToml.profile, "dev"), "dev");
-  const profileToml = parseTomlFile(join2(configDir, `${preferredProfile}.toml`));
-  const localExampleToml = parseTomlFile(join2(configDir, "local.example.toml"));
-  const localToml = parseTomlFile(join2(configDir, "local.toml"));
+  const profileToml = parseTomlFile(join3(configDir, `${preferredProfile}.toml`));
+  const localExampleToml = parseTomlFile(join3(configDir, "local.example.toml"));
+  const localToml = parseTomlFile(join3(configDir, "local.toml"));
   const merged = mergeDeep(mergeDeep(mergeDeep(defaultToml, profileToml), localExampleToml), localToml);
   const profile = firstNonEmpty(process.env.PUSHPALS_PROFILE, asString(merged.profile, preferredProfile), preferredProfile);
   const sessionId = firstNonEmpty(process.env.PUSHPALS_SESSION_ID, asString(merged.session_id, "dev"), "dev");
@@ -10297,8 +10531,8 @@ function loadPushPalsConfig(options = {}) {
   const lmStudioBatchMemoryChars = Math.max(0, asInt(parseIntEnv("PUSHPALS_LMSTUDIO_BATCH_MEMORY_CHARS") ?? lmStudioNode.batch_memory_chars, 0));
   const pathsNode = getObject(merged, "paths");
   const dataDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DATA_DIR, asString(pathsNode.data_dir, "outputs/data")));
-  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join2(dataDir, "pushpals.db"))));
-  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join2(dataDir, "remotebuddy-state.db"))));
+  const sharedDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.PUSHPALS_DB_PATH, asString(pathsNode.shared_db_path, join3(dataDir, "pushpals.db"))));
+  const remotebuddyDbPath = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.REMOTEBUDDY_DB_PATH, asString(pathsNode.remotebuddy_db_path, join3(dataDir, "remotebuddy-state.db"))));
   const serverNode = getObject(merged, "server");
   const serverPort = Math.max(1, asInt(parseIntEnv("PUSHPALS_PORT") ?? serverNode.port, 3001));
   const serverUrl = normalizeLoopbackHttpUrl(firstNonEmpty(process.env.PUSHPALS_SERVER_URL, asString(serverNode.url, `http://127.0.0.1:${serverPort}`), `http://127.0.0.1:${serverPort}`), serverPort);
@@ -10484,7 +10718,7 @@ function loadPushPalsConfig(options = {}) {
   const scmBranchPrefix = asString(process.env.SOURCE_CONTROL_MANAGER_BRANCH_PREFIX ?? scmNode.branch_prefix, "agent/");
   const scmPollIntervalSeconds = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_POLL_INTERVAL_SECONDS") ?? scmNode.poll_interval_seconds, 10));
   const scmChecks = asCheckArray(scmNode.checks);
-  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join2(dataDir, "source_control_manager")), join2(dataDir, "source_control_manager")));
+  const scmStateDir = resolvePathFromRoot(projectRoot, firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_STATE_DIR, asString(scmNode.state_dir, join3(dataDir, "source_control_manager")), join3(dataDir, "source_control_manager")));
   const scmPort = Math.max(1, Math.min(65535, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_PORT") ?? scmNode.port, 3002)));
   const scmDeleteAfterMerge = parseBoolEnv("SOURCE_CONTROL_MANAGER_DELETE_AFTER_MERGE") ?? asBoolean(scmNode.delete_after_merge, false);
   const scmMaxAttempts = Math.max(1, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_MAX_ATTEMPTS") ?? scmNode.max_attempts, 3));
@@ -11497,6 +11731,45 @@ var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts
 var TRUTHY2 = new Set(["1", "true", "yes", "on"]);
 var FALSY2 = new Set(["0", "false", "no", "off"]);
+// apps/server/src/job_terminal_semantics.ts
+var TERMINAL_FAILURE_STATUSES = new Set(["failed", "abandoned", "publish_blocked"]);
+function semanticText(value) {
+  if (value == null)
+    return "";
+  if (typeof value === "string")
+    return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+function classifyJobTerminalSemantics(input) {
+  const status = semanticText(input.status).trim().toLowerCase();
+  const evidence = [
+    input.result,
+    input.error,
+    input.summary,
+    input.detail,
+    input.failureClass,
+    input.terminalStage,
+    input.userAction,
+    ...input.additionalEvidence ?? []
+  ].map(semanticText).filter(Boolean).join(`
+`).normalize("NFKC").toLowerCase();
+  const noChange = status === "completed_no_change" || /(?:^|[^\p{L}\p{N}])(?:completed[_ -]?)?no[_ -]?change(?:[^\p{L}\p{N}]|$)/u.test(evidence) || /artifact[_ -]?only[_ -]?no[_ -]?publishable[_ -]?patch|no[_ -]?publishable[_ -]?patch|no file changes|no changes (?:to commit|made)|nothing to commit|modified 0 files?|no modified files (?:were )?detected|no file changes detected/i.test(evidence);
+  if (noChange) {
+    return { kind: "no_change", terminal: true, noChange: true, success: false };
+  }
+  if (status === "completed") {
+    return { kind: "success", terminal: true, noChange: false, success: true };
+  }
+  if (TERMINAL_FAILURE_STATUSES.has(status)) {
+    return { kind: "failure", terminal: true, noChange: false, success: false };
+  }
+  return { kind: "non_terminal", terminal: false, noChange: false, success: false };
+}
+
 // apps/server/src/jobs.ts
 var JOB_PRIORITY_QUEUE_SLA_MS = {
   interactive: 20000,
@@ -11517,6 +11790,9 @@ var WORKER_RUNTIME_CIRCUIT_RECHECK_MS_DEFAULT = 30000;
 var WORKER_RUNTIME_DEFERRAL_LOG_DEDUPE_MS = 5 * 60000;
 var WORKER_RUNTIME_DEFERRAL_LOG_RETAIN = 8;
 var DEFAULT_WORKER_RUNTIME_GENERATION = "default";
+var ELEVATED_WORK_BURST_LIMIT = 3;
+var REVIEW_REPAIR_CAPABILITY_TTL_MS = 10 * 60000;
+var REVIEW_REPAIR_CAPABILITY_RETENTION_MS = 24 * 60 * 60000;
 var MAX_JOB_WORKER_ID_LENGTH = 128;
 var JOB_DEFERRAL_CONFLICT_CODE = "job_deferral_conflict";
 var JOB_DEFERRAL_PERSISTENCE_FAILED_CODE = "job_deferral_persistence_failed";
@@ -11890,6 +12166,35 @@ function normalizeJobPriority(value) {
     return text;
   return "normal";
 }
+function normalizeJobWorkClass(value, params, priority, authorizedElevatedWorkClass) {
+  const explicit = String(value ?? "").trim().toLowerCase().replace(/[_\s]+/g, "-");
+  if ((explicit === "recovery" || explicit === "repair") && explicit === authorizedElevatedWorkClass) {
+    return explicit;
+  }
+  if (explicit === "interactive")
+    return "interactive";
+  if (explicit === "autonomy" || explicit === "ideation")
+    return "autonomy";
+  if (explicit === "background")
+    return "background";
+  if (explicit === "standard" || explicit === "normal")
+    return "standard";
+  if (authorizedElevatedWorkClass)
+    return authorizedElevatedWorkClass;
+  if (priority === "interactive")
+    return "interactive";
+  if (priority === "background")
+    return "background";
+  const autonomy = params.autonomy;
+  if (String(params.origin ?? "").trim().toLowerCase() === "autonomy" || autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)) {
+    return "autonomy";
+  }
+  return "standard";
+}
+function queueDeadlineAt(enqueuedAt, queueWaitBudgetMs) {
+  const startedAtMs = Date.parse(enqueuedAt);
+  return new Date((Number.isFinite(startedAtMs) ? startedAtMs : Date.now()) + Math.max(1000, Math.floor(queueWaitBudgetMs))).toISOString();
+}
 function parseBudgetMs(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed) || parsed <= 0)
@@ -12103,6 +12408,93 @@ function extractReviewAgentPrUrl(params) {
     return null;
   return normalizePrUrl(reviewAgent.prUrl);
 }
+function normalizeReviewRepairRepositoryIdentity(value) {
+  const raw = String(value ?? "").trim().normalize("NFKC").replace(/\\/g, "/");
+  if (!raw)
+    return "";
+  const scp = raw.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+  if (scp && !raw.includes("://") && !/^[a-z]:\//i.test(raw)) {
+    return `${scp[1]}/${scp[2]}`.replace(/\.git\/?$/i, "").replace(/\/+$/, "").toLowerCase();
+  }
+  try {
+    const parsed = new URL(raw);
+    const pathname = parsed.pathname.replace(/\.git\/?$/i, "").replace(/\/+$/, "");
+    return `${parsed.hostname}${pathname}`.toLowerCase();
+  } catch {
+    return raw.replace(/\.git\/?$/i, "").replace(/\/+$/, "").toLowerCase();
+  }
+}
+function repositoryIdentityFromPrUrl(value) {
+  try {
+    const parsed = new URL(value);
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const marker = pathname.match(/^(.*?)(?:\/pull\/|\/-\/merge_requests\/)\d+$/i);
+    if (!marker)
+      return "";
+    return `${parsed.hostname}${marker[1]}`.replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+function prNumberFromReviewUrl(value) {
+  try {
+    const pathname = new URL(value).pathname.replace(/\/+$/, "");
+    const match = pathname.match(/(?:\/pull\/|\/-\/merge_requests\/)(\d+)$/i);
+    const parsed = Number(match?.[1]);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function reviewRepairIntent(params) {
+  const reviewAgent = params.reviewAgent;
+  if (!reviewAgent || typeof reviewAgent !== "object" || Array.isArray(reviewAgent))
+    return false;
+  const resolutionType = String(reviewAgent.resolutionType ?? "").trim().toLowerCase();
+  return resolutionType === "review_fix" || resolutionType === "merge_conflict";
+}
+function extractReviewRepairContext(params, prUrl, repositoryIdentity) {
+  const reviewAgent = params.reviewAgent;
+  if (!reviewAgent || typeof reviewAgent !== "object" || Array.isArray(reviewAgent))
+    return null;
+  const record = reviewAgent;
+  const resolutionRaw = String(record.resolutionType ?? "review_fix").trim().toLowerCase();
+  if (resolutionRaw !== "review_fix" && resolutionRaw !== "merge_conflict")
+    return null;
+  const prUrlNormalized = normalizePrUrl(prUrl ?? record.prUrl);
+  const nestedRepositoryIdentity = normalizeReviewRepairRepositoryIdentity(record.repositoryIdentity ?? record.repository_identity);
+  const suppliedRepositoryIdentity = normalizeReviewRepairRepositoryIdentity(repositoryIdentity);
+  const normalizedRepositoryIdentity = nestedRepositoryIdentity;
+  const headSha = String(record.prHeadSha ?? "").trim().toLowerCase();
+  if (!prUrlNormalized || !headSha)
+    return null;
+  const prNumberRaw = Number(record.prNumber);
+  const prNumber = Number.isSafeInteger(prNumberRaw) && prNumberRaw > 0 ? prNumberRaw : null;
+  const baseSha = String(record.prBaseSha ?? "").trim().toLowerCase();
+  const sourceJobId = String(record.sourceJobId ?? record.source_job_id ?? "").trim() || null;
+  const resolutionType = resolutionRaw;
+  if (!prUrlNormalized || !normalizedRepositoryIdentity || suppliedRepositoryIdentity && suppliedRepositoryIdentity !== normalizedRepositoryIdentity || !prNumber || !headSha || !baseSha || repositoryIdentityFromPrUrl(prUrlNormalized) !== normalizedRepositoryIdentity || prNumberFromReviewUrl(prUrlNormalized) !== prNumber) {
+    return null;
+  }
+  const lifecycleKey = createHash5("sha256").update(JSON.stringify({
+    repositoryIdentity: normalizedRepositoryIdentity,
+    prUrlNormalized,
+    prNumber,
+    headSha,
+    baseSha,
+    resolutionType
+  })).digest("hex").slice(0, 32);
+  return {
+    lifecycleKey,
+    repositoryIdentity: normalizedRepositoryIdentity,
+    prUrlNormalized,
+    prNumber,
+    headSha,
+    baseSha,
+    resolutionType,
+    sourceJobId
+  };
+}
 function resolveJobPrUrl(body, params) {
   return normalizePrUrl(body.prUrl) ?? extractReviewAgentPrUrl(params);
 }
@@ -12113,6 +12505,7 @@ class JobQueue {
     this.db = new Database2(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this._migrate();
+    this.reconcileReviewRepairLifecycles();
   }
   _migrate() {
     this.db.exec(`
@@ -12125,7 +12518,9 @@ class JobQueue {
           dedupeKey           TEXT,
           dedupeCooldownMs    INTEGER NOT NULL DEFAULT 0,
           priority            TEXT NOT NULL DEFAULT 'normal',
+          workClass           TEXT NOT NULL DEFAULT 'standard',
           queueWaitBudgetMs   INTEGER NOT NULL DEFAULT 90000,
+          queueDeadlineAt     TEXT,
           executionBudgetMs   INTEGER NOT NULL DEFAULT 900000,
           finalizationBudgetMs INTEGER NOT NULL DEFAULT 120000,
           status              TEXT NOT NULL DEFAULT 'pending',
@@ -12160,6 +12555,46 @@ class JobQueue {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
       CREATE INDEX IF NOT EXISTS idx_jobs_taskId ON jobs(taskId);
       CREATE INDEX IF NOT EXISTS idx_jobs_session_created ON jobs(sessionId, createdAt);
+
+      CREATE TABLE IF NOT EXISTS pr_repair_lifecycle (
+        lifecycleKey       TEXT PRIMARY KEY,
+        repositoryIdentity TEXT NOT NULL DEFAULT '',
+        prUrlNormalized    TEXT NOT NULL,
+        prNumber           INTEGER,
+        headSha            TEXT NOT NULL,
+        baseSha            TEXT,
+        resolutionType     TEXT NOT NULL,
+        sourceJobId        TEXT,
+        activeJobId        TEXT,
+        status             TEXT NOT NULL,
+        attemptCount       INTEGER NOT NULL DEFAULT 0,
+        maxAttempts        INTEGER NOT NULL DEFAULT 2,
+        nextRetryAt        TEXT,
+        lastFailureClass   TEXT,
+        lastError          TEXT,
+        createdAt          TEXT NOT NULL,
+        updatedAt          TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_status_retry
+        ON pr_repair_lifecycle(status, nextRetryAt, updatedAt);
+
+      CREATE TABLE IF NOT EXISTS pr_repair_capabilities (
+        capabilityKey      TEXT PRIMARY KEY,
+        repositoryIdentity TEXT NOT NULL,
+        prUrlNormalized    TEXT NOT NULL,
+        prNumber           INTEGER NOT NULL,
+        headSha            TEXT NOT NULL,
+        baseSha            TEXT NOT NULL,
+        resolutionType     TEXT NOT NULL,
+        issuedBy           TEXT NOT NULL,
+        sourceJobId        TEXT,
+        consumedByJobId    TEXT,
+        expiresAt          TEXT NOT NULL,
+        createdAt          TEXT NOT NULL,
+        updatedAt          TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pr_repair_capabilities_expiry
+        ON pr_repair_capabilities(expiresAt, updatedAt);
 
       CREATE TABLE IF NOT EXISTS job_logs (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -12361,6 +12796,10 @@ class JobQueue {
       CREATE INDEX IF NOT EXISTS idx_pr_provider_outcomes_terminal_updated
         ON pr_provider_outcomes(terminal, updatedAt DESC);
     `);
+    const repairLifecycleColumns = this.db.prepare(`PRAGMA table_info(pr_repair_lifecycle)`).all();
+    if (!repairLifecycleColumns.some((column) => column.name === "repositoryIdentity")) {
+      this.db.exec(`ALTER TABLE pr_repair_lifecycle ADD COLUMN repositoryIdentity TEXT NOT NULL DEFAULT '';`);
+    }
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
     if (!jobColumns.some((col) => col.name === "targetWorkerId")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN targetWorkerId TEXT;`);
@@ -12377,6 +12816,9 @@ class JobQueue {
     if (!jobColumns.some((col) => col.name === "priority")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';`);
     }
+    if (!jobColumns.some((col) => col.name === "workClass")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN workClass TEXT NOT NULL DEFAULT 'standard';`);
+    }
     if (!jobColumns.some((col) => col.name === "dedupeKey")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN dedupeKey TEXT;`);
     }
@@ -12385,6 +12827,9 @@ class JobQueue {
     }
     if (!jobColumns.some((col) => col.name === "queueWaitBudgetMs")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN queueWaitBudgetMs INTEGER NOT NULL DEFAULT 90000;`);
+    }
+    if (!jobColumns.some((col) => col.name === "queueDeadlineAt")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN queueDeadlineAt TEXT;`);
     }
     if (!jobColumns.some((col) => col.name === "executionBudgetMs")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN executionBudgetMs INTEGER NOT NULL DEFAULT 900000;`);
@@ -12521,6 +12966,8 @@ class JobQueue {
     }
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_target_worker ON jobs(targetWorkerId);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_priority_created ON jobs(status, priority, createdAt);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_work_class_deadline
+         ON jobs(status, workClass, queueDeadlineAt, createdAt);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_available_at ON jobs(status, availableAt);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_stale_activity ON jobs(status, lastActivityAt, id);`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_runtime_generation ON jobs(runtimeGeneration, status);`);
@@ -12626,6 +13073,21 @@ class JobQueue {
           WHEN 'background' THEN 'background'
           ELSE 'normal'
         END,
+        workClass = CASE
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'recovery' THEN 'recovery'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'repair' THEN 'repair'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'interactive' THEN 'interactive'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'autonomy' THEN 'autonomy'
+          WHEN LOWER(COALESCE(workClass, 'standard')) = 'background' THEN 'background'
+          WHEN LOWER(COALESCE(priority, 'normal')) = 'interactive' THEN 'interactive'
+          WHEN LOWER(COALESCE(priority, 'normal')) = 'background' THEN 'background'
+          WHEN json_valid(params) AND LOWER(COALESCE(
+            json_extract(params, '$.origin'),
+            json_extract(params, '$.autonomy.origin'),
+            ''
+          )) = 'autonomy' THEN 'autonomy'
+          ELSE 'standard'
+        END,
         dedupeCooldownMs = CASE
           WHEN dedupeCooldownMs IS NULL OR dedupeCooldownMs < 0 THEN 0
           ELSE dedupeCooldownMs
@@ -12635,9 +13097,398 @@ class JobQueue {
         queueWaitBudgetMs = CASE WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90000 ELSE queueWaitBudgetMs END,
         executionBudgetMs = CASE WHEN executionBudgetMs IS NULL OR executionBudgetMs <= 0 THEN 900000 ELSE executionBudgetMs END,
         finalizationBudgetMs = CASE WHEN finalizationBudgetMs IS NULL OR finalizationBudgetMs <= 0 THEN 120000 ELSE finalizationBudgetMs END,
-        enqueuedAt = COALESCE(enqueuedAt, createdAt)
+        enqueuedAt = COALESCE(enqueuedAt, createdAt),
+        queueDeadlineAt = COALESCE(
+          queueDeadlineAt,
+          datetime(COALESCE(enqueuedAt, createdAt), '+' ||
+            CAST(MAX(1, CASE
+              WHEN queueWaitBudgetMs IS NULL OR queueWaitBudgetMs <= 0 THEN 90
+              ELSE queueWaitBudgetMs / 1000
+            END) AS INTEGER) || ' seconds')
+        )
       WHERE 1 = 1;
     `);
+  }
+  authorizeReviewRepairCapability(body, issuedBy = "source_control_manager", now = new Date().toISOString()) {
+    const params = body.params && typeof body.params === "object" && !Array.isArray(body.params) ? body.params : {};
+    const context = extractReviewRepairContext(params, resolveJobPrUrl(body, params), body.repositoryIdentity ?? body.repository_identity);
+    if (!context) {
+      return {
+        ok: false,
+        reason: "Review repair authority requires an exact repository, PR number/URL, head SHA, base SHA, and resolution type."
+      };
+    }
+    const expiresAt = new Date(Date.parse(now) + REVIEW_REPAIR_CAPABILITY_TTL_MS).toISOString();
+    const retentionCutoff = new Date(Date.parse(now) - REVIEW_REPAIR_CAPABILITY_RETENTION_MS).toISOString();
+    const issue = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM pr_repair_capabilities
+           WHERE expiresAt < ? AND updatedAt < ?`).run(now, retentionCutoff);
+      this.db.prepare(`INSERT INTO pr_repair_capabilities (
+             capabilityKey, repositoryIdentity, prUrlNormalized, prNumber,
+             headSha, baseSha, resolutionType, issuedBy, sourceJobId,
+             consumedByJobId, expiresAt, createdAt, updatedAt
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+           ON CONFLICT(capabilityKey) DO UPDATE SET
+             issuedBy = excluded.issuedBy,
+             sourceJobId = COALESCE(pr_repair_capabilities.sourceJobId, excluded.sourceJobId),
+             expiresAt = CASE
+               WHEN pr_repair_capabilities.consumedByJobId IS NULL THEN excluded.expiresAt
+               ELSE pr_repair_capabilities.expiresAt
+             END,
+             updatedAt = CASE
+               WHEN julianday(excluded.updatedAt) > julianday(pr_repair_capabilities.updatedAt)
+                 THEN excluded.updatedAt
+               ELSE pr_repair_capabilities.updatedAt
+             END`).run(context.lifecycleKey, context.repositoryIdentity, context.prUrlNormalized, context.prNumber, context.headSha, context.baseSha, context.resolutionType, issuedBy, context.sourceJobId, expiresAt, now, now);
+    });
+    issue();
+    return { ok: true, capabilityKey: context.lifecycleKey };
+  }
+  trackReviewRepairEnqueued(jobId, params, prUrl, now) {
+    this.db.transaction(() => {
+      this.trackReviewRepairEnqueuedWithinTransaction(jobId, params, prUrl, now);
+    })();
+  }
+  trackReviewRepairEnqueuedWithinTransaction(jobId, params, prUrl, now) {
+    const context = extractReviewRepairContext(params, prUrl);
+    if (!context)
+      return;
+    this.db.prepare(`INSERT INTO pr_repair_lifecycle (
+           lifecycleKey, repositoryIdentity, prUrlNormalized, prNumber, headSha, baseSha, resolutionType,
+           sourceJobId, activeJobId, status, attemptCount, maxAttempts,
+           nextRetryAt, lastFailureClass, lastError, createdAt, updatedAt
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, 2, NULL, NULL, NULL, ?, ?)
+         ON CONFLICT(lifecycleKey) DO UPDATE SET
+           sourceJobId = COALESCE(pr_repair_lifecycle.sourceJobId, excluded.sourceJobId),
+           activeJobId = CASE
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+               THEN pr_repair_lifecycle.activeJobId
+             WHEN pr_repair_lifecycle.status IN ('queued','running')
+               AND pr_repair_lifecycle.activeJobId IS NOT NULL
+               AND pr_repair_lifecycle.activeJobId <> excluded.activeJobId
+               THEN pr_repair_lifecycle.activeJobId
+             ELSE excluded.activeJobId
+           END,
+           status = CASE
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+               THEN pr_repair_lifecycle.status
+             WHEN pr_repair_lifecycle.status IN ('queued','running')
+               AND pr_repair_lifecycle.activeJobId IS NOT NULL
+               AND pr_repair_lifecycle.activeJobId <> excluded.activeJobId
+               THEN pr_repair_lifecycle.status
+             ELSE 'queued'
+           END,
+           attemptCount = CASE
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+               THEN pr_repair_lifecycle.attemptCount
+             WHEN pr_repair_lifecycle.activeJobId = excluded.activeJobId
+               THEN pr_repair_lifecycle.attemptCount
+             ELSE MAX(1, pr_repair_lifecycle.attemptCount)
+           END,
+           nextRetryAt = CASE
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+               THEN pr_repair_lifecycle.nextRetryAt
+             ELSE NULL
+           END,
+           updatedAt = CASE
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+               THEN pr_repair_lifecycle.updatedAt
+             WHEN julianday(excluded.updatedAt) > julianday(pr_repair_lifecycle.updatedAt)
+               THEN excluded.updatedAt
+             ELSE pr_repair_lifecycle.updatedAt
+           END`).run(context.lifecycleKey, context.repositoryIdentity, context.prUrlNormalized, context.prNumber, context.headSha, context.baseSha, context.resolutionType, context.sourceJobId, jobId, now, now);
+    this.db.prepare(`UPDATE pr_repair_capabilities
+           SET consumedByJobId = COALESCE(consumedByJobId, ?),
+               updatedAt = CASE
+                 WHEN julianday(?) > julianday(updatedAt) THEN ?
+                 ELSE updatedAt
+               END
+           WHERE capabilityKey = ?`).run(jobId, now, now, context.lifecycleKey);
+  }
+  terminalSemanticsForJob(jobId) {
+    const row = this.db.prepare(`SELECT j.status, j.result, j.error,
+                d.summary, d.failureClass, d.terminalStage
+         FROM jobs j
+         LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
+         WHERE j.id = ?
+         LIMIT 1`).get(jobId);
+    return classifyJobTerminalSemantics({
+      status: row?.status,
+      result: row?.result,
+      error: row?.error,
+      summary: row?.summary,
+      failureClass: row?.failureClass,
+      terminalStage: row?.terminalStage
+    });
+  }
+  rearmReviewRepairJob(jobId, now) {
+    const job = this.getJob(jobId);
+    if (!job)
+      return null;
+    const terminalSemantics = this.terminalSemanticsForJob(jobId);
+    if (!["failed", "publish_blocked", "abandoned"].includes(job.status) && !terminalSemantics.noChange) {
+      return null;
+    }
+    const params = parseJobParamsRecord(job.params);
+    const context = extractReviewRepairContext(params, job.prUrl);
+    if (!context)
+      return null;
+    let lifecycle = this.db.prepare(`SELECT activeJobId, status, attemptCount, maxAttempts
+         FROM pr_repair_lifecycle
+         WHERE lifecycleKey = ?`).get(context.lifecycleKey);
+    if (lifecycle?.status === "succeeded" || lifecycle?.status === "exhausted")
+      return null;
+    if (!lifecycle) {
+      const admission = this.reviewRepairAdmission({ params, prUrl: job.prUrl });
+      if (!admission.authorized)
+        return null;
+      this.trackReviewRepairEnqueued(job.id, params, job.prUrl, now);
+      lifecycle = this.db.prepare(`SELECT activeJobId, status, attemptCount, maxAttempts
+           FROM pr_repair_lifecycle
+           WHERE lifecycleKey = ?`).get(context.lifecycleKey);
+    }
+    if (!lifecycle || lifecycle.status === "succeeded" || lifecycle.status === "exhausted") {
+      return null;
+    }
+    if (lifecycle.activeJobId && lifecycle.activeJobId !== jobId) {
+      const active = this.getJob(lifecycle.activeJobId);
+      if (active && ["pending", "claimed", "finalizing"].includes(active.status)) {
+        return { jobId: active.id, created: false };
+      }
+    }
+    const attemptCount = Math.max(1, Math.floor(Number(lifecycle.attemptCount || 1)));
+    const maxAttempts = Math.max(1, Math.floor(Number(lifecycle.maxAttempts || 2)));
+    const diagnostic = this.db.prepare(`SELECT failureClass, summary
+         FROM job_terminal_diagnostics
+         WHERE jobId = ?`).get(jobId);
+    const failureClass = String(diagnostic?.failureClass ?? "").trim() || (terminalSemantics.noChange ? "completed_no_change" : null);
+    const lastError = String(diagnostic?.summary ?? job.error ?? (terminalSemantics.noChange ? "Repair completed without a publishable change." : "")).slice(0, 1000) || null;
+    if (attemptCount >= maxAttempts) {
+      this.db.prepare(`UPDATE pr_repair_lifecycle
+           SET activeJobId = NULL,
+               status = 'exhausted',
+               nextRetryAt = NULL,
+               lastFailureClass = ?,
+               lastError = ?,
+               updatedAt = ?
+           WHERE lifecycleKey = ?`).run(failureClass, lastError, now, context.lifecycleKey);
+      return null;
+    }
+    const replacementJobId = randomUUID3();
+    const nextAttempt = attemptCount + 1;
+    const reviewAgent = params.reviewAgent && typeof params.reviewAgent === "object" && !Array.isArray(params.reviewAgent) ? params.reviewAgent : {};
+    const planning = params.planning && typeof params.planning === "object" && !Array.isArray(params.planning) ? params.planning : {};
+    const recentContext = Array.isArray(params.recentContext) ? params.recentContext.map((entry) => String(entry ?? "")).filter(Boolean).slice(-20) : [];
+    const recoveryStrategy = job.status === "publish_blocked" ? "publication_root_cause" : failureClass && /environment|runtime|permission|network|timeout/i.test(failureClass) ? "capability_root_cause" : "review_root_cause";
+    const replacementParams = {
+      ...params,
+      planning: {
+        ...planning,
+        queuePriority: "interactive",
+        queueWaitBudgetMs: Math.min(90000, Math.max(1000, job.queueWaitBudgetMs || 90000)),
+        workClass: "recovery"
+      },
+      reviewAgent: {
+        ...reviewAgent,
+        recoveryAttempt: nextAttempt,
+        recoveryStrategy,
+        recoverySourceJobId: jobId
+      },
+      recovery: {
+        strategy: recoveryStrategy,
+        previousJobId: jobId,
+        attempt: nextAttempt,
+        failureClass,
+        detail: lastError
+      },
+      recentContext: [
+        ...recentContext,
+        `Durable PR repair recovery ${nextAttempt}/${maxAttempts}: diagnose the root cause of the prior ${job.status} attempt before editing. Prior failure class: ${failureClass ?? "unknown"}.`
+      ]
+    };
+    const queueBudgetMs = Math.min(90000, Math.max(1000, job.queueWaitBudgetMs || 90000));
+    const deadlineAt = queueDeadlineAt(now, queueBudgetMs);
+    const insert = this.db.transaction(() => {
+      const existingActive = this.db.prepare(`SELECT id, status
+           FROM jobs
+           WHERE dedupeKey = ?
+             AND status IN ('pending','claimed','finalizing')
+           ORDER BY createdAt DESC
+           LIMIT 1`).get(job.dedupeKey);
+      if (existingActive?.id) {
+        this.db.prepare(`UPDATE pr_repair_lifecycle
+             SET activeJobId = ?,
+                 status = ?,
+                 attemptCount = ?,
+                 nextRetryAt = NULL,
+                 lastFailureClass = ?,
+                 lastError = ?,
+                 updatedAt = ?
+             WHERE lifecycleKey = ?`).run(existingActive.id, existingActive.status === "pending" ? "queued" : "running", nextAttempt, failureClass, lastError, now, context.lifecycleKey);
+        repointDurableRecoveryLinks(this.db, jobId, existingActive.id, now);
+        return existingActive.id;
+      }
+      this.db.prepare(`INSERT INTO jobs (
+             id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs,
+             priority, workClass, queueWaitBudgetMs, queueDeadlineAt,
+             executionBudgetMs, finalizationBudgetMs, status, workerId, targetWorkerId,
+             result, prUrl, prUrlNormalized, error, availableAt, enqueuedAt, claimedAt,
+             startedAt, firstLogAt, failedAt, abandonedAt, publishBlockedAt, completedAt,
+             durationMs, resumeOfJobId, attempt, createdAt, updatedAt
+           ) VALUES (
+             ?, ?, ?, ?, ?, ?, ?,
+             'interactive', 'recovery', ?, ?,
+             ?, ?, 'pending', NULL, ?,
+             NULL, ?, ?, NULL, NULL, ?, NULL,
+             NULL, NULL, NULL, NULL, NULL, NULL,
+             NULL, ?, ?, ?, ?
+           )`).run(replacementJobId, job.taskId, job.sessionId, job.kind, JSON.stringify(replacementParams), job.dedupeKey, job.dedupeCooldownMs, queueBudgetMs, deadlineAt, job.executionBudgetMs, job.finalizationBudgetMs, job.targetWorkerId, job.prUrl, normalizePrUrl(job.prUrl), now, jobId, Math.max(1, Math.floor(Number(job.attempt || 1))) + 1, now, now);
+      this.db.prepare(`UPDATE pr_repair_lifecycle
+           SET activeJobId = ?,
+               status = 'queued',
+               attemptCount = ?,
+               nextRetryAt = NULL,
+               lastFailureClass = ?,
+               lastError = ?,
+               updatedAt = ?
+           WHERE lifecycleKey = ?`).run(replacementJobId, nextAttempt, failureClass, lastError, now, context.lifecycleKey);
+      repointDurableRecoveryLinks(this.db, jobId, replacementJobId, now);
+      return replacementJobId;
+    });
+    const replacementJobIdOrExisting = insert();
+    return {
+      jobId: replacementJobIdOrExisting,
+      created: replacementJobIdOrExisting === replacementJobId
+    };
+  }
+  markReviewRepairSucceeded(jobId, now) {
+    this.db.prepare(`UPDATE pr_repair_lifecycle
+         SET status = 'succeeded',
+             nextRetryAt = NULL,
+             updatedAt = CASE
+               WHEN julianday(?) > julianday(updatedAt) THEN ?
+               ELSE updatedAt
+             END
+         WHERE activeJobId = ?
+           AND status != 'exhausted'`).run(now, now, jobId);
+  }
+  reconcileReviewRepairLifecycles(now = new Date().toISOString()) {
+    const page = this.db.prepare(`SELECT lifecycle.rowid AS cursor, j.id, j.params, j.prUrl, j.status
+       FROM pr_repair_lifecycle lifecycle
+       JOIN jobs j ON j.id = lifecycle.activeJobId
+       WHERE lifecycle.rowid > ?
+         AND lifecycle.status NOT IN ('succeeded','exhausted')
+         AND j.status IN ('completed','failed','publish_blocked','abandoned')
+       ORDER BY lifecycle.rowid ASC
+       LIMIT 200`);
+    let cursor = 0;
+    let scanned = 0;
+    let rearmed = 0;
+    while (true) {
+      const rows = page.all(cursor);
+      if (rows.length === 0)
+        break;
+      for (const row of rows) {
+        cursor = Math.max(cursor, Number(row.cursor));
+        scanned += 1;
+        if (row.status === "completed" && !this.terminalSemanticsForJob(row.id).noChange) {
+          this.markReviewRepairSucceeded(row.id, now);
+        } else if (this.rearmReviewRepairJob(row.id, now)?.created) {
+          rearmed += 1;
+        }
+      }
+    }
+    const exhausted = this.db.prepare(`SELECT COUNT(*) AS count FROM pr_repair_lifecycle WHERE status = 'exhausted'`).get();
+    return {
+      scanned,
+      rearmed,
+      exhausted: Math.max(0, Math.floor(Number(exhausted?.count ?? 0)))
+    };
+  }
+  reviewRepairAdmission(body) {
+    const params = body.params && typeof body.params === "object" && !Array.isArray(body.params) ? body.params : {};
+    const requested = reviewRepairIntent(params);
+    const context = extractReviewRepairContext(params, resolveJobPrUrl(body, params), body.repositoryIdentity ?? body.repository_identity);
+    if (!context) {
+      return {
+        requested,
+        authorized: false,
+        exhausted: false,
+        terminal: false,
+        workClass: null,
+        activeJobId: null,
+        ...requested ? {
+          reason: "Review repair requires an exact repository, PR number/URL, head SHA, base SHA, and resolution type."
+        } : {}
+      };
+    }
+    const lifecycle = this.db.prepare(`SELECT status, sourceJobId, activeJobId
+         FROM pr_repair_lifecycle
+         WHERE lifecycleKey = ?
+         LIMIT 1`).get(context.lifecycleKey);
+    if (lifecycle?.status === "exhausted") {
+      return {
+        requested: true,
+        authorized: false,
+        exhausted: true,
+        terminal: true,
+        workClass: null,
+        activeJobId: lifecycle.activeJobId,
+        reason: "The durable PR/head repair lifecycle is exhausted."
+      };
+    }
+    if (lifecycle?.status === "succeeded") {
+      return {
+        requested: true,
+        authorized: false,
+        exhausted: false,
+        terminal: true,
+        workClass: null,
+        activeJobId: lifecycle.activeJobId,
+        reason: "The durable PR/head repair lifecycle already succeeded."
+      };
+    }
+    if (lifecycle) {
+      return {
+        requested: true,
+        authorized: true,
+        exhausted: false,
+        terminal: false,
+        workClass: "repair",
+        activeJobId: lifecycle.activeJobId
+      };
+    }
+    const capability = this.db.prepare(`SELECT capabilityKey
+         FROM pr_repair_capabilities
+         WHERE capabilityKey = ?
+           AND repositoryIdentity = ?
+           AND prUrlNormalized = ?
+           AND prNumber = ?
+           AND headSha = ?
+           AND baseSha = ?
+           AND resolutionType = ?
+           AND issuedBy = 'source_control_manager'
+           AND datetime(expiresAt) >= datetime('now')
+         LIMIT 1`).get(context.lifecycleKey, context.repositoryIdentity, context.prUrlNormalized, context.prNumber, context.headSha, context.baseSha, context.resolutionType);
+    if (!capability) {
+      return {
+        requested: true,
+        authorized: false,
+        exhausted: false,
+        terminal: false,
+        workClass: null,
+        activeJobId: null,
+        reason: "Review repair requires an unexpired SourceControlManager capability for the exact repository/PR/head/base/resolution tuple."
+      };
+    }
+    return {
+      requested: true,
+      authorized: true,
+      exhausted: false,
+      terminal: false,
+      workClass: "repair",
+      activeJobId: null
+    };
   }
   assignedWorkerForPr(prUrl) {
     const normalizedPrUrl = normalizePrUrl(prUrl);
@@ -12676,9 +13527,18 @@ class JobQueue {
       return;
     this.upsertPrWorkerAssignment(row.prUrl, row.workerId, now);
   }
+  shouldPreferNonElevatedLane() {
+    const recent = this.db.prepare(`SELECT LOWER(COALESCE(workClass, 'standard')) AS workClass
+         FROM jobs
+         WHERE claimedAt IS NOT NULL
+         ORDER BY julianday(claimedAt) DESC, rowid DESC
+         LIMIT ?`).all(ELEVATED_WORK_BURST_LIMIT);
+    return recent.length >= ELEVATED_WORK_BURST_LIMIT && recent.every((row) => row.workClass === "recovery" || row.workClass === "repair") ? 1 : 0;
+  }
   pendingOrderedIds(targetWorkerId = null) {
     const now = new Date().toISOString();
     const targetWorkerCutoff = new Date(Date.now() - PR_WORKER_ASSIGNMENT_MAX_AGE_MS).toISOString();
+    const preferNonElevated = this.shouldPreferNonElevatedLane();
     if (targetWorkerId) {
       const rows2 = this.db.prepare(`SELECT id
            FROM jobs
@@ -12697,8 +13557,29 @@ class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-             )
+           )
            ORDER BY
+             CASE WHEN julianday(queueDeadlineAt) <= julianday(?) THEN 0 ELSE 1 END ASC,
+             CASE
+               WHEN julianday(queueDeadlineAt) <= julianday(?) THEN julianday(queueDeadlineAt)
+               ELSE NULL
+             END ASC,
+             CASE
+               WHEN ? = 1 THEN
+                 CASE LOWER(COALESCE(workClass, 'standard'))
+                   WHEN 'interactive' THEN 0 WHEN 'standard' THEN 1
+                   WHEN 'recovery' THEN 2 WHEN 'repair' THEN 3
+                   WHEN 'autonomy' THEN 4 WHEN 'background' THEN 5 ELSE 1 END
+               ELSE
+                 CASE LOWER(COALESCE(workClass, 'standard'))
+                   WHEN 'recovery' THEN 0 WHEN 'repair' THEN 1
+                   WHEN 'interactive' THEN 2 WHEN 'standard' THEN 3
+                   WHEN 'autonomy' THEN 4 WHEN 'background' THEN 5 ELSE 3 END
+             END ASC,
+             CASE
+               WHEN julianday(queueDeadlineAt) > julianday(?) THEN julianday(queueDeadlineAt)
+               ELSE NULL
+             END ASC,
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
              CASE LOWER(priority)
                WHEN 'interactive' THEN 0
@@ -12706,7 +13587,7 @@ class JobQueue {
                WHEN 'background' THEN 2
                ELSE 1
              END ASC,
-             createdAt ASC`).all(targetWorkerId, targetWorkerCutoff, now, targetWorkerId);
+             createdAt ASC`).all(targetWorkerId, targetWorkerCutoff, now, now, now, preferNonElevated, now, targetWorkerId);
       return rows2.map((row) => row.id);
     }
     const rows = this.db.prepare(`SELECT id
@@ -12725,15 +13606,36 @@ class JobQueue {
                  AND COALESCE(tw.status, 'idle') <> 'offline'
                  AND tw.lastHeartbeat >= ?
              )
-           )
+         )
          ORDER BY
+           CASE WHEN julianday(queueDeadlineAt) <= julianday(?) THEN 0 ELSE 1 END ASC,
+           CASE
+             WHEN julianday(queueDeadlineAt) <= julianday(?) THEN julianday(queueDeadlineAt)
+             ELSE NULL
+           END ASC,
+           CASE
+             WHEN ? = 1 THEN
+               CASE LOWER(COALESCE(workClass, 'standard'))
+                 WHEN 'interactive' THEN 0 WHEN 'standard' THEN 1
+                 WHEN 'recovery' THEN 2 WHEN 'repair' THEN 3
+                 WHEN 'autonomy' THEN 4 WHEN 'background' THEN 5 ELSE 1 END
+             ELSE
+               CASE LOWER(COALESCE(workClass, 'standard'))
+                 WHEN 'recovery' THEN 0 WHEN 'repair' THEN 1
+                 WHEN 'interactive' THEN 2 WHEN 'standard' THEN 3
+                 WHEN 'autonomy' THEN 4 WHEN 'background' THEN 5 ELSE 3 END
+           END ASC,
+           CASE
+             WHEN julianday(queueDeadlineAt) > julianday(?) THEN julianday(queueDeadlineAt)
+             ELSE NULL
+           END ASC,
            CASE LOWER(priority)
              WHEN 'interactive' THEN 0
              WHEN 'normal' THEN 1
              WHEN 'background' THEN 2
              ELSE 1
            END ASC,
-           createdAt ASC`).all(now, targetWorkerCutoff);
+           createdAt ASC`).all(now, targetWorkerCutoff, now, now, preferNonElevated, now);
     return rows.map((row) => row.id);
   }
   queuePosition(jobId, targetWorkerId = null) {
@@ -12749,7 +13651,7 @@ class JobQueue {
     const slotMs = JOB_PRIORITY_QUEUE_SLA_MS[priority];
     return Math.max(0, slotMs * (position - 1));
   }
-  enqueue(body) {
+  enqueue(body, options = {}) {
     const taskId = String(body.taskId ?? "").trim();
     const kind = String(body.kind ?? "").trim();
     const sessionId = String(body.sessionId ?? "").trim();
@@ -12763,9 +13665,62 @@ class JobQueue {
     }
     const priority = normalizeJobPriority(body.priority ?? extractPlanningField(params, "queuePriority"));
     const queueWaitBudgetMs = parseBudgetMs(body.queueWaitBudgetMs ?? extractPlanningField(params, "queueWaitBudgetMs"), JOB_PRIORITY_QUEUE_SLA_MS[priority]);
+    const workClass = normalizeJobWorkClass(body.workClass ?? body.work_class ?? extractPlanningField(params, "workClass"), params, priority, options.authorizedElevatedWorkClass);
+    let repairAdmission = this.reviewRepairAdmission(body);
+    if (repairAdmission.requested) {
+      if (repairAdmission.terminal) {
+        return {
+          ok: false,
+          message: repairAdmission.reason ?? "Durable PR/head repair lifecycle is exhausted"
+        };
+      }
+      if (!repairAdmission.authorized || options.authorizedElevatedWorkClass !== "repair") {
+        return {
+          ok: false,
+          message: repairAdmission.reason ?? "Persisted review repair authority is required"
+        };
+      }
+      if (repairAdmission.activeJobId) {
+        const activeLifecycleJob = this.getJob(repairAdmission.activeJobId);
+        if (activeLifecycleJob && ["pending", "claimed", "finalizing"].includes(activeLifecycleJob.status)) {
+          return {
+            ok: true,
+            jobId: activeLifecycleJob.id,
+            taskId: activeLifecycleJob.taskId,
+            deduped: true,
+            message: "Active job already owns this durable PR/head repair lifecycle"
+          };
+        }
+        this.reconcileReviewRepairLifecycles();
+        repairAdmission = this.reviewRepairAdmission(body);
+        if (repairAdmission.terminal) {
+          return {
+            ok: false,
+            message: repairAdmission.reason ?? "Durable PR/head repair lifecycle is settled"
+          };
+        }
+        if (repairAdmission.activeJobId) {
+          const reconciledActive = this.getJob(repairAdmission.activeJobId);
+          if (reconciledActive && ["pending", "claimed", "finalizing"].includes(reconciledActive.status)) {
+            return {
+              ok: true,
+              jobId: reconciledActive.id,
+              taskId: reconciledActive.taskId,
+              deduped: true,
+              message: "Reconciled job owns this durable PR/head repair lifecycle"
+            };
+          }
+          return {
+            ok: false,
+            message: "Durable PR/head repair lifecycle reconciliation is still pending"
+          };
+        }
+      }
+    }
     const executionBudgetMs = parseBudgetMs(body.executionBudgetMs ?? extractPlanningField(params, "executionBudgetMs"), JOB_EXECUTION_BUDGET_MS[priority]);
     const finalizationBudgetMs = parseBudgetMs(body.finalizationBudgetMs ?? extractPlanningField(params, "finalizationBudgetMs"), JOB_FINALIZATION_BUDGET_MS_DEFAULT);
-    const dedupeKey = normalizeDedupeKey(body.dedupeKey);
+    const repairContext = repairAdmission.requested ? extractReviewRepairContext(params, prUrl, body.repositoryIdentity ?? body.repository_identity) : null;
+    const dedupeKey = repairContext ? `review-repair:${repairContext.lifecycleKey}` : normalizeDedupeKey(body.dedupeKey);
     const dedupeCooldownMs = parseDedupeCooldownMs(body.dedupeCooldownMs, dedupeKey ? 0 : 0);
     if (dedupeKey) {
       const active = this.db.prepare(`SELECT id, taskId
@@ -12805,21 +13760,28 @@ class JobQueue {
     }
     const jobId = randomUUID3();
     const now = new Date().toISOString();
-    try {
+    const deadlineAt = queueDeadlineAt(now, queueWaitBudgetMs);
+    const insertJob = this.db.transaction(() => {
       this.db.prepare(`INSERT INTO jobs (
-            id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
-            queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+            id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority, workClass,
+            queueWaitBudgetMs, queueDeadlineAt, executionBudgetMs, finalizationBudgetMs,
             status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error,
             enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, completedAt, durationMs,
             createdAt, updatedAt
           )
            VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
             'pending', NULL, ?, NULL, ?, ?, NULL,
             ?, NULL, NULL, NULL, NULL, NULL, NULL,
             ?, ?
-           )`).run(jobId, taskId, sessionId, kind, JSON.stringify(params), dedupeKey, dedupeCooldownMs, priority, queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs, targetWorkerId, prUrl, normalizePrUrl(prUrl), now, now, now);
+           )`).run(jobId, taskId, sessionId, kind, JSON.stringify(params), dedupeKey, dedupeCooldownMs, priority, workClass, queueWaitBudgetMs, deadlineAt, executionBudgetMs, finalizationBudgetMs, targetWorkerId, prUrl, normalizePrUrl(prUrl), now, now, now);
+      if (repairAdmission.requested && options.authorizedElevatedWorkClass === "repair") {
+        this.trackReviewRepairEnqueuedWithinTransaction(jobId, params, prUrl, now);
+      }
+    });
+    try {
+      insertJob();
     } catch (err) {
       const message = String(err?.message ?? err ?? "");
       if (dedupeKey && /UNIQUE constraint failed/i.test(message)) {
@@ -12912,8 +13874,29 @@ class JobQueue {
              AND (
                availableAt IS NULL
                OR availableAt <= ?
-             )
+           )
            ORDER BY
+             CASE WHEN julianday(queueDeadlineAt) <= julianday(?) THEN 0 ELSE 1 END ASC,
+             CASE
+               WHEN julianday(queueDeadlineAt) <= julianday(?) THEN julianday(queueDeadlineAt)
+               ELSE NULL
+             END ASC,
+             CASE
+               WHEN ? = 1 THEN
+                 CASE LOWER(COALESCE(workClass, 'standard'))
+                   WHEN 'interactive' THEN 0 WHEN 'standard' THEN 1
+                   WHEN 'recovery' THEN 2 WHEN 'repair' THEN 3
+                   WHEN 'autonomy' THEN 4 WHEN 'background' THEN 5 ELSE 1 END
+               ELSE
+                 CASE LOWER(COALESCE(workClass, 'standard'))
+                   WHEN 'recovery' THEN 0 WHEN 'repair' THEN 1
+                   WHEN 'interactive' THEN 2 WHEN 'standard' THEN 3
+                   WHEN 'autonomy' THEN 4 WHEN 'background' THEN 5 ELSE 3 END
+             END ASC,
+             CASE
+               WHEN julianday(queueDeadlineAt) > julianday(?) THEN julianday(queueDeadlineAt)
+               ELSE NULL
+             END ASC,
              CASE WHEN targetWorkerId = ? THEN 0 ELSE 1 END ASC,
              CASE LOWER(priority)
                WHEN 'interactive' THEN 0
@@ -12922,7 +13905,7 @@ class JobQueue {
                ELSE 1
              END ASC,
              createdAt ASC
-           LIMIT 1`).get(workerId, targetWorkerCutoff, now, workerId);
+           LIMIT 1`).get(workerId, targetWorkerCutoff, now, now, now, this.shouldPreferNonElevatedLane(), now, workerId);
       if (!row) {
         this.db.prepare(`UPDATE workers SET status = 'idle', currentJobId = NULL, lastHeartbeat = ?, updatedAt = ?
              WHERE workerId = ?`).run(now, now, workerId);
@@ -12949,6 +13932,10 @@ class JobQueue {
             WHERE id = ?`).run(workerId, runtimeGeneration, now, now, now, row.id);
       this.db.prepare(`UPDATE workers SET status = 'busy', currentJobId = ?, lastHeartbeat = ?, updatedAt = ?
            WHERE workerId = ?`).run(row.id, now, now, workerId);
+      this.db.prepare(`UPDATE pr_repair_lifecycle
+           SET status = 'running', updatedAt = ?
+           WHERE activeJobId = ?
+             AND status = 'queued'`).run(now, row.id);
       this.upsertPrWorkerAssignment(row.prUrl, workerId, now);
       const queueWaitMs = Math.max(0, Math.floor(Date.parse(now) - Date.parse(row.enqueuedAt || row.createdAt || now) || 0));
       return {
@@ -13115,20 +14102,27 @@ class JobQueue {
         if (abandonedInfo.changes === 0)
           return false;
         this.db.prepare(`INSERT INTO jobs (
-               id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority,
-               queueWaitBudgetMs, executionBudgetMs, finalizationBudgetMs,
+               id, taskId, sessionId, kind, params, dedupeKey, dedupeCooldownMs, priority, workClass,
+               queueWaitBudgetMs, queueDeadlineAt, executionBudgetMs, finalizationBudgetMs,
                status, workerId, targetWorkerId, result, prUrl, prUrlNormalized, error, availableAt,
                enqueuedAt, claimedAt, startedAt, firstLogAt, failedAt, abandonedAt, completedAt,
                durationMs, resumeOfJobId, attempt, createdAt, updatedAt
              )
              VALUES (
-               ?, ?, ?, ?, ?, ?, ?, ?,
-               ?, ?, ?,
+               ?, ?, ?, ?, ?, ?, ?, ?, 'recovery',
+               ?, ?, ?, ?,
                'pending', NULL, ?, NULL, ?, ?, NULL, ?,
                ?, NULL, NULL, NULL, NULL, NULL, NULL,
                NULL, ?, ?, ?, ?
-             )`).run(replacementJobId, job.taskId, job.sessionId, job.kind, JSON.stringify(replacementParams), job.dedupeKey, job.dedupeCooldownMs, job.priority, job.queueWaitBudgetMs, job.executionBudgetMs, job.finalizationBudgetMs, nextTargetWorkerId, job.prUrl, normalizePrUrl(job.prUrl), replacementAvailableAt, now, job.id, attempt, now, now);
+             )`).run(replacementJobId, job.taskId, job.sessionId, job.kind, JSON.stringify(replacementParams), job.dedupeKey, job.dedupeCooldownMs, job.priority, job.queueWaitBudgetMs, queueDeadlineAt(now, job.queueWaitBudgetMs), job.executionBudgetMs, job.finalizationBudgetMs, nextTargetWorkerId, job.prUrl, normalizePrUrl(job.prUrl), replacementAvailableAt, now, job.id, attempt, now, now);
         repointDurableRecoveryLinks(this.db, job.id, replacementJobId, now);
+        this.db.prepare(`UPDATE pr_repair_lifecycle
+             SET activeJobId = ?,
+                 status = 'queued',
+                 nextRetryAt = NULL,
+                 updatedAt = ?
+             WHERE activeJobId = ?
+               AND status IN ('queued','running')`).run(replacementJobId, now, job.id);
         return true;
       });
       if (!recover())
@@ -13454,6 +14448,11 @@ class JobQueue {
     }
     const completed = this.db.prepare(`SELECT durationMs, completedAt FROM jobs WHERE id = ?`).get(jobId);
     this.refreshPrWorkerAssignmentForJob(jobId, now);
+    if (this.terminalSemanticsForJob(jobId).noChange) {
+      this.rearmReviewRepairJob(jobId, now);
+    } else {
+      this.markReviewRepairSucceeded(jobId, now);
+    }
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -13504,6 +14503,7 @@ class JobQueue {
     }
     const failed = this.db.prepare(`SELECT durationMs, failedAt FROM jobs WHERE id = ?`).get(jobId);
     this.refreshPrWorkerAssignmentForJob(jobId, now);
+    this.rearmReviewRepairJob(jobId, now);
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -13555,6 +14555,7 @@ class JobQueue {
     }
     const blocked = this.db.prepare(`SELECT durationMs, publishBlockedAt FROM jobs WHERE id = ?`).get(jobId);
     this.refreshPrWorkerAssignmentForJob(jobId, now);
+    this.rearmReviewRepairJob(jobId, now);
     this.setWorkerIdleIfNoClaimedJobs(jobRow?.workerId ?? null, now);
     return {
       ok: true,
@@ -14149,34 +15150,81 @@ class JobQueue {
   }
   nextPendingSnapshot(limit = 10) {
     const ordered = this.pendingOrderedIds().slice(0, Math.max(1, Math.min(limit, 50)));
+    const nowMs = Date.now();
     return ordered.map((id, idx) => {
-      const row = this.db.prepare(`SELECT priority FROM jobs WHERE id = ?`).get(id);
+      const row = this.db.prepare(`SELECT priority, workClass, queueDeadlineAt FROM jobs WHERE id = ?`).get(id);
       const priority = normalizeJobPriority(row?.priority);
+      const persistedElevatedClass = row?.workClass === "recovery" || row?.workClass === "repair" ? row.workClass : undefined;
+      const workClass = normalizeJobWorkClass(row?.workClass, {}, priority, persistedElevatedClass);
+      const deadlineMs = Date.parse(String(row?.queueDeadlineAt ?? ""));
       return {
         id,
         priority,
+        workClass,
+        queueDeadlineAt: row?.queueDeadlineAt ?? null,
+        deadlineMissed: Number.isFinite(deadlineMs) && deadlineMs <= nowMs,
         position: idx + 1,
         etaMs: this.estimateEtaMs(priority, idx + 1) ?? 0
       };
     });
   }
+  recoveryBackpressureSummary(nowIso = new Date().toISOString()) {
+    const row = this.db.prepare(`SELECT
+           SUM(CASE WHEN LOWER(workClass) = 'recovery' THEN 1 ELSE 0 END) AS pendingRecovery,
+           SUM(CASE WHEN LOWER(workClass) = 'repair' THEN 1 ELSE 0 END) AS pendingRepair,
+           SUM(CASE
+             WHEN queueDeadlineAt IS NOT NULL
+               AND julianday(queueDeadlineAt) <= julianday(?)
+             THEN 1 ELSE 0 END) AS overdue,
+           MIN(queueDeadlineAt) AS oldestDeadlineAt
+         FROM jobs
+         WHERE status = 'pending'
+           AND LOWER(workClass) IN ('recovery','repair')`).get(nowIso);
+    const pendingRecovery = Math.max(0, Math.floor(Number(row?.pendingRecovery ?? 0)));
+    const pendingRepair = Math.max(0, Math.floor(Number(row?.pendingRepair ?? 0)));
+    const overdue = Math.max(0, Math.floor(Number(row?.overdue ?? 0)));
+    return {
+      blocked: overdue > 0,
+      pendingRecovery,
+      pendingRepair,
+      overdue,
+      oldestDeadlineAt: row?.oldestDeadlineAt ?? null
+    };
+  }
   sloSummary(windowHours = 24) {
     const boundedWindowHours = Number.isFinite(windowHours) && windowHours > 0 ? Math.max(1, Math.min(24 * 30, Math.floor(windowHours))) : 24;
     const cutoffIso = new Date(Date.now() - boundedWindowHours * 60 * 60 * 1000).toISOString();
-    const rows = this.db.prepare(`SELECT status, durationMs, enqueuedAt, claimedAt, createdAt, updatedAt, error
+    const rows = this.db.prepare(`SELECT status, durationMs, enqueuedAt, claimedAt, queueDeadlineAt,
+                createdAt, updatedAt, error, result,
+                (SELECT summary FROM job_terminal_diagnostics d WHERE d.jobId = jobs.id LIMIT 1)
+                  AS terminalSummary,
+                (SELECT failureClass FROM job_terminal_diagnostics d WHERE d.jobId = jobs.id LIMIT 1)
+                  AS terminalFailureClass
          FROM jobs
          WHERE status IN ('completed', 'failed', 'abandoned', 'publish_blocked')
            AND updatedAt >= ?`).all(cutoffIso);
     let completed = 0;
+    let noChange = 0;
     let failed = 0;
     let abandoned = 0;
     let publishBlocked = 0;
     let timeoutFailures = 0;
+    let queueDeadlineMisses = 0;
     const durationSamples = [];
     const queueWaitSamples = [];
     for (const row of rows) {
-      if (row.status === "completed")
+      if (row.status === "completed") {
         completed += 1;
+        if (classifyJobTerminalSemantics({
+          status: row.status,
+          result: row.result,
+          error: row.error,
+          summary: row.terminalSummary,
+          failureClass: row.terminalFailureClass
+        }).noChange) {
+          noChange += 1;
+        }
+      }
       if (row.status === "failed" || row.status === "abandoned" || row.status === "publish_blocked") {
         if (row.status === "failed")
           failed += 1;
@@ -14195,20 +15243,28 @@ class JobQueue {
       if (queueStart != null && queueEnd != null && queueEnd >= queueStart) {
         queueWaitSamples.push(queueEnd - queueStart);
       }
+      const queueDeadline = parseIsoMs(row.queueDeadlineAt);
+      if (queueDeadline != null && queueEnd != null && queueEnd > queueDeadline) {
+        queueDeadlineMisses += 1;
+      }
     }
     const terminal = completed + failed + abandoned + publishBlocked;
-    const successRate = terminal > 0 ? Number((completed / terminal).toFixed(4)) : null;
+    const successfulCompleted = Math.max(0, completed - noChange);
+    const successRate = terminal > 0 ? Number((successfulCompleted / terminal).toFixed(4)) : null;
     const timeoutRate = terminal > 0 ? Number((timeoutFailures / terminal).toFixed(4)) : null;
     return {
       windowHours: boundedWindowHours,
       terminal,
       completed,
+      noChange,
       failed,
       abandoned,
       publishBlocked,
       timeoutFailures,
+      queueDeadlineMisses,
       successRate,
       timeoutRate,
+      queueDeadlineMissRate: terminal > 0 ? Number((queueDeadlineMisses / terminal).toFixed(4)) : null,
       durationMs: summarizeSamples(durationSamples),
       queueWaitMs: summarizeSamples(queueWaitSamples)
     };
@@ -15161,6 +16217,9 @@ var DEFAULT_HANDOFF_CHAIN_RECONCILE_LIMIT = 200;
 var MAX_HANDOFF_CHAIN_RECONCILE_LIMIT = 1000;
 var DEFAULT_HANDOFF_CHAIN_DEPTH = 16;
 var MAX_HANDOFF_CHAIN_DEPTH = 64;
+var DEFAULT_DISPATCH_CONFIRMATION_TTL_MS = 30000;
+var MIN_DISPATCH_CONFIRMATION_TTL_MS = 1;
+var MAX_DISPATCH_CONFIRMATION_TTL_MS = 2 * 60000;
 var PRIORITY_SLA_MS = {
   interactive: 20000,
   normal: 90000,
@@ -15183,6 +16242,19 @@ function normalizeRequestLeaseMs(value) {
   if (!Number.isFinite(parsed) || parsed <= 0)
     return DEFAULT_REQUEST_LEASE_MS;
   return Math.max(MIN_REQUEST_LEASE_MS, Math.min(MAX_REQUEST_LEASE_MS, Math.floor(parsed)));
+}
+function normalizeDispatchConfirmationTtlMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0)
+    return DEFAULT_DISPATCH_CONFIRMATION_TTL_MS;
+  return Math.max(MIN_DISPATCH_CONFIRMATION_TTL_MS, Math.min(MAX_DISPATCH_CONFIRMATION_TTL_MS, Math.floor(parsed)));
+}
+function resolveDispatchConfirmationExpiresAt(body, nowMs) {
+  const ttlDeadlineMs = nowMs + normalizeDispatchConfirmationTtlMs(body.dispatchConfirmationTtlMs);
+  const deadlineText = asString2(body.dispatchConfirmationDeadlineAt);
+  const requestedDeadlineMs = deadlineText ? Date.parse(deadlineText) : Number.NaN;
+  const expiresAtMs = Number.isFinite(requestedDeadlineMs) ? Math.min(ttlDeadlineMs, requestedDeadlineMs) : ttlDeadlineMs;
+  return new Date(expiresAtMs).toISOString();
 }
 function asObject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -15314,6 +16386,7 @@ function projectRequestOutcome(row, handoffJob) {
   }
   return {
     ...row,
+    dispatchConfirmationToken: null,
     handoffJobStatus,
     outcomeStatus,
     outcomeUpdatedAt,
@@ -15335,6 +16408,9 @@ class RequestQueue {
     forceLane,
     workerRequired,
     handoffJobId,
+    dispatchConfirmationToken,
+    dispatchConfirmationExpiresAt,
+    dispatchConfirmedAt,
     status,
     agentId,
     claimToken,
@@ -15423,6 +16499,9 @@ class RequestQueue {
         forceLane        TEXT,
         workerRequired   INTEGER NOT NULL DEFAULT 0,
         handoffJobId     TEXT,
+        dispatchConfirmationToken TEXT,
+        dispatchConfirmationExpiresAt TEXT,
+        dispatchConfirmedAt TEXT,
         status           TEXT NOT NULL DEFAULT 'pending',
         agentId          TEXT,
         claimToken       TEXT,
@@ -15459,6 +16538,9 @@ class RequestQueue {
     ensureColumn("forceLane", `ALTER TABLE requests ADD COLUMN forceLane TEXT;`);
     ensureColumn("workerRequired", `ALTER TABLE requests ADD COLUMN workerRequired INTEGER NOT NULL DEFAULT 0;`);
     ensureColumn("handoffJobId", `ALTER TABLE requests ADD COLUMN handoffJobId TEXT;`);
+    ensureColumn("dispatchConfirmationToken", `ALTER TABLE requests ADD COLUMN dispatchConfirmationToken TEXT;`);
+    ensureColumn("dispatchConfirmationExpiresAt", `ALTER TABLE requests ADD COLUMN dispatchConfirmationExpiresAt TEXT;`);
+    ensureColumn("dispatchConfirmedAt", `ALTER TABLE requests ADD COLUMN dispatchConfirmedAt TEXT;`);
     ensureColumn("claimToken", `ALTER TABLE requests ADD COLUMN claimToken TEXT;`);
     ensureColumn("claimGeneration", `ALTER TABLE requests ADD COLUMN claimGeneration INTEGER NOT NULL DEFAULT 0;`);
     ensureColumn("leaseExpiresAt", `ALTER TABLE requests ADD COLUMN leaseExpiresAt TEXT;`);
@@ -15476,6 +16558,8 @@ class RequestQueue {
          WHERE idempotencyKey IS NOT NULL AND idempotencyKey <> '';`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_requests_lease_expiry
          ON requests(status, leaseExpiresAt);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_requests_dispatch_confirmation
+         ON requests(status, dispatchConfirmationExpiresAt, dispatchConfirmedAt);`);
     this.db.exec(`
       UPDATE requests
       SET
@@ -15516,9 +16600,11 @@ class RequestQueue {
          AND (claimToken IS NULL OR claimToken = '')`, migrationNow);
   }
   pendingOrderedIds() {
+    this.expireUnconfirmedDispatches();
     const rows = this.all(`SELECT id, priority, createdAt
        FROM requests
        WHERE status = 'pending'
+         AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
        ORDER BY
          CASE LOWER(priority)
            WHEN 'interactive' THEN 0
@@ -15561,15 +16647,21 @@ class RequestQueue {
     if (!sessionId || !prompt) {
       return { ok: false, message: "sessionId and prompt are required" };
     }
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    const dispatchConfirmationRequired = body.dispatchConfirmationRequired === true;
+    const dispatchConfirmationToken = dispatchConfirmationRequired ? randomUUID4() : null;
+    const dispatchConfirmationExpiresAt = dispatchConfirmationRequired ? resolveDispatchConfirmationExpiresAt(body, nowMs) : null;
+    this.expireUnconfirmedDispatches(now);
     if (idempotencyKey) {
-      const existing = this.get(`SELECT id, priority, status
+      const existing = this.get(`SELECT id, priority, status, dispatchConfirmationToken,
+                dispatchConfirmationExpiresAt, dispatchConfirmedAt
          FROM requests
          WHERE idempotencyKey = ?
          ORDER BY createdAt DESC
          LIMIT 1`, idempotencyKey);
       if (existing?.id) {
         if (existing.status === "failed") {
-          const now2 = new Date().toISOString();
           const reopened = this.run(`UPDATE requests
              SET sessionId = ?,
                  prompt = ?,
@@ -15580,6 +16672,9 @@ class RequestQueue {
                  forceLane = ?,
                  workerRequired = ?,
                  handoffJobId = NULL,
+                 dispatchConfirmationToken = ?,
+                 dispatchConfirmationExpiresAt = ?,
+                 dispatchConfirmedAt = NULL,
                  status = 'pending',
                  agentId = NULL,
                  claimToken = NULL,
@@ -15593,7 +16688,7 @@ class RequestQueue {
                  failedAt = NULL,
                  durationMs = NULL,
                  updatedAt = ?
-             WHERE id = ? AND status = 'failed'`, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, forceWorker, forceLane, forceWorker, now2, now2, existing.id);
+             WHERE id = ? AND status = 'failed'`, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, forceWorker, forceLane, forceWorker, dispatchConfirmationToken, dispatchConfirmationExpiresAt, now, now, existing.id);
           if (reopened.changes > 0) {
             const queuePosition3 = this.queuePosition(existing.id);
             const etaMs3 = this.estimateEtaMs(priority, queuePosition3);
@@ -15602,7 +16697,32 @@ class RequestQueue {
               requestId: existing.id,
               queuePosition: queuePosition3 ?? undefined,
               etaMs: etaMs3 ?? undefined,
+              ...dispatchConfirmationRequired && dispatchConfirmationToken ? {
+                dispatchConfirmationRequired: true,
+                dispatchConfirmationToken,
+                dispatchConfirmationExpiresAt: dispatchConfirmationExpiresAt ?? undefined
+              } : {},
               requeued: true
+            };
+          }
+        }
+        if (dispatchConfirmationRequired && existing.status === "pending" && !existing.dispatchConfirmationToken && !existing.dispatchConfirmedAt && dispatchConfirmationToken) {
+          const upgraded = this.run(`UPDATE requests
+             SET dispatchConfirmationToken = ?,
+                 dispatchConfirmationExpiresAt = ?,
+                 updatedAt = ?
+             WHERE id = ?
+               AND status = 'pending'
+               AND dispatchConfirmationToken IS NULL
+               AND dispatchConfirmedAt IS NULL`, dispatchConfirmationToken, dispatchConfirmationExpiresAt, now, existing.id);
+          if (upgraded.changes > 0) {
+            return {
+              ok: true,
+              requestId: existing.id,
+              dispatchConfirmationRequired: true,
+              dispatchConfirmationToken,
+              dispatchConfirmationExpiresAt: dispatchConfirmationExpiresAt ?? undefined,
+              deduplicated: true
             };
           }
         }
@@ -15613,26 +16733,116 @@ class RequestQueue {
           requestId: existing.id,
           queuePosition: queuePosition2 ?? undefined,
           etaMs: etaMs2 ?? undefined,
+          ...existing.dispatchConfirmedAt ? { dispatchConfirmed: true } : {},
+          ...existing.status === "pending" && existing.dispatchConfirmationToken && !existing.dispatchConfirmedAt ? {
+            dispatchConfirmationRequired: true,
+            dispatchConfirmationToken: existing.dispatchConfirmationToken,
+            dispatchConfirmationExpiresAt: existing.dispatchConfirmationExpiresAt ?? undefined
+          } : {},
           deduplicated: true
         };
       }
     }
     const requestId = randomUUID4();
-    const now = new Date().toISOString();
     this.run(`INSERT INTO requests (
         id, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane,
-        workerRequired, handoffJobId, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
+        workerRequired, handoffJobId, dispatchConfirmationToken, dispatchConfirmationExpiresAt,
+        dispatchConfirmedAt, status, agentId, claimToken, claimGeneration, leaseExpiresAt, lastHeartbeatAt, claimAttempts, result, error,
         enqueuedAt, claimedAt, completedAt, failedAt, durationMs, createdAt, updatedAt
       )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`, requestId, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane, forceWorker, now, now, now);
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)`, requestId, sessionId, prompt, priority, queueWaitBudgetMs, metadataJson, idempotencyKey, forceWorker, forceLane, forceWorker, dispatchConfirmationToken, dispatchConfirmationExpiresAt, now, now, now);
     const queuePosition = this.queuePosition(requestId);
     const etaMs = this.estimateEtaMs(priority, queuePosition);
     return {
       ok: true,
       requestId,
       queuePosition: queuePosition ?? undefined,
-      etaMs: etaMs ?? undefined
+      etaMs: etaMs ?? undefined,
+      ...dispatchConfirmationRequired && dispatchConfirmationToken ? {
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationToken,
+        dispatchConfirmationExpiresAt: dispatchConfirmationExpiresAt ?? undefined
+      } : {}
     };
+  }
+  expireUnconfirmedDispatches(nowInput = new Date) {
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+    const rows = this.all(`SELECT id
+       FROM requests
+       WHERE status = 'pending'
+         AND dispatchConfirmationToken IS NOT NULL
+         AND dispatchConfirmedAt IS NULL
+         AND (
+           dispatchConfirmationExpiresAt IS NULL
+           OR dispatchConfirmationExpiresAt <= ?
+         )
+       ORDER BY createdAt ASC`, now);
+    if (rows.length === 0)
+      return { expired: 0, requestIds: [] };
+    const result = this.run(`UPDATE requests
+       SET status = 'failed',
+           error = ?,
+           failedAt = ?,
+           completedAt = NULL,
+           durationMs = MAX(
+             0,
+             CAST((julianday(?) - julianday(COALESCE(enqueuedAt, createdAt))) * 86400000 AS INTEGER)
+           ),
+           updatedAt = ?
+       WHERE status = 'pending'
+         AND dispatchConfirmationToken IS NOT NULL
+         AND dispatchConfirmedAt IS NULL
+         AND (
+           dispatchConfirmationExpiresAt IS NULL
+           OR dispatchConfirmationExpiresAt <= ?
+         )`, JSON.stringify({
+      message: "Autonomy dispatch confirmation expired",
+      detail: "dispatch_confirmation_expired"
+    }), now, now, now, now);
+    return {
+      expired: result.changes,
+      requestIds: rows.slice(0, result.changes).map((row) => row.id)
+    };
+  }
+  confirmDispatch(requestIdRaw, confirmationTokenRaw, nowInput = new Date) {
+    const requestId = asString2(requestIdRaw);
+    const confirmationToken = asString2(confirmationTokenRaw);
+    if (!requestId)
+      return { ok: false, message: "requestId is required" };
+    if (!confirmationToken) {
+      return { ok: false, message: "dispatchConfirmationToken is required" };
+    }
+    const parsed = nowInput instanceof Date ? nowInput : new Date(nowInput);
+    const now = Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+    const updated = this.run(`UPDATE requests
+       SET dispatchConfirmedAt = ?, updatedAt = ?
+       WHERE id = ?
+         AND status = 'pending'
+         AND dispatchConfirmationToken = ?
+         AND dispatchConfirmedAt IS NULL
+         AND dispatchConfirmationExpiresAt IS NOT NULL
+         AND dispatchConfirmationExpiresAt > ?`, now, now, requestId, confirmationToken, now);
+    if (updated.changes > 0) {
+      return { ok: true, requestId, confirmed: true, idempotent: false };
+    }
+    const current = this.get(`SELECT status, dispatchConfirmationToken, dispatchConfirmationExpiresAt,
+              dispatchConfirmedAt
+       FROM requests
+       WHERE id = ?`, requestId);
+    if (!current)
+      return { ok: false, message: "Request not found" };
+    if (current.dispatchConfirmationToken !== confirmationToken) {
+      return { ok: false, message: "Dispatch confirmation token is invalid" };
+    }
+    if (current.dispatchConfirmedAt) {
+      return { ok: true, requestId, confirmed: true, idempotent: true };
+    }
+    this.expireUnconfirmedDispatches(now);
+    if (current.status === "pending" && (!current.dispatchConfirmationExpiresAt || current.dispatchConfirmationExpiresAt <= now)) {
+      return { ok: false, message: "Dispatch confirmation expired" };
+    }
+    return { ok: false, message: `Request cannot be confirmed from status ${current.status}` };
   }
   claim(agentIdRaw, options = {}) {
     const now = new Date().toISOString();
@@ -15641,12 +16851,14 @@ class RequestQueue {
       return { ok: false, message: "agentId is required" };
     const claimToken = randomUUID4();
     const leaseExpiresAt = new Date(Date.parse(now) + normalizeRequestLeaseMs(options.leaseMs)).toISOString();
+    this.expireUnconfirmedDispatches(now);
     this.reconcileWorkerHandoffsFromJobs(now);
     const tx = this.db.transaction(() => {
       this.recoverExpiredClaims(now);
       const row = this.get(`SELECT ${RequestQueue.SELECT_COLUMNS}
          FROM requests
          WHERE status = 'pending'
+           AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
          ORDER BY
            CASE LOWER(priority)
              WHEN 'interactive' THEN 0
@@ -15678,6 +16890,7 @@ class RequestQueue {
         request: {
           ...row,
           metadata: parseMetadataJson(row.metadataJson),
+          dispatchConfirmationToken: null,
           status: "claimed",
           agentId,
           claimToken,
@@ -15999,11 +17212,14 @@ class RequestQueue {
          ORDER BY candidate.createdAt DESC, candidate.id DESC
          LIMIT 1
        )
-       WHERE r.status = 'pending'
-          OR (
+       WHERE (
+            r.status = 'pending'
+            OR (
             r.status = 'claimed'
             AND (r.leaseExpiresAt IS NULL OR r.leaseExpiresAt <= ?)
+            )
           )
+         AND (r.dispatchConfirmationToken IS NULL OR r.dispatchConfirmedAt IS NOT NULL)
        ORDER BY r.createdAt ASC
        LIMIT 400`, now);
     if (rows.length === 0)
@@ -16032,11 +17248,14 @@ class RequestQueue {
            WHERE id = ?
              AND sessionId = ?
              AND (
-               status = 'pending'
-               OR (
+               (
+                 status = 'pending'
+                 OR (
                  status = 'claimed'
                  AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)
+                 )
                )
+               AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
              )`, row.jobId, JSON.stringify({
           requiresWorker: true,
           jobId: row.jobId,
@@ -16172,9 +17391,11 @@ class RequestQueue {
     return this.projectOutcomes([{ ...row, metadata: parseMetadataJson(row.metadataJson) }])[0] ?? null;
   }
   getPendingRequests() {
+    this.expireUnconfirmedDispatches();
     const rows = this.all(`SELECT ${RequestQueue.SELECT_COLUMNS}
        FROM requests
        WHERE status = 'pending'
+         AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL)
        ORDER BY
          CASE LOWER(priority)
            WHEN 'interactive' THEN 0
@@ -16183,7 +17404,11 @@ class RequestQueue {
            ELSE 1
           END ASC,
           createdAt ASC`);
-    return rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) }));
+    return rows.map((row) => ({
+      ...row,
+      metadata: parseMetadataJson(row.metadataJson),
+      dispatchConfirmationToken: null
+    }));
   }
   listRequests(options) {
     const status = options?.status ?? "all";
@@ -16203,7 +17428,13 @@ class RequestQueue {
     return this.projectOutcomes(rows.map((row) => ({ ...row, metadata: parseMetadataJson(row.metadataJson) })));
   }
   countByStatus() {
-    const rows = this.all(`SELECT status, COUNT(*) AS count FROM requests GROUP BY status`);
+    this.expireUnconfirmedDispatches();
+    const rows = this.all(`SELECT status, COUNT(*) AS count
+       FROM requests
+       WHERE status <> 'pending'
+          OR dispatchConfirmationToken IS NULL
+          OR dispatchConfirmedAt IS NOT NULL
+       GROUP BY status`);
     const counts = {
       pending: 0,
       claimed: 0,
@@ -16220,6 +17451,11 @@ class RequestQueue {
     const rows = this.all(`SELECT priority, COUNT(*) AS count
        FROM requests
        WHERE status IN ('pending', 'claimed')
+         AND (
+           status <> 'pending'
+           OR dispatchConfirmationToken IS NULL
+           OR dispatchConfirmedAt IS NOT NULL
+         )
        GROUP BY priority`);
     const counts = {
       interactive: 0,
@@ -16240,6 +17476,11 @@ class RequestQueue {
     const rows = this.all(`SELECT metadataJson
        FROM requests
        WHERE status IN (${placeholders})
+         AND (
+           status <> 'pending'
+           OR dispatchConfirmationToken IS NULL
+           OR dispatchConfirmedAt IS NOT NULL
+         )
          AND metadataJson IS NOT NULL
          AND metadataJson <> ''`, ...normalized);
     let count = 0;
@@ -17555,10 +18796,53 @@ function asRepositoryAgentMemoryRefs(value) {
   return refs;
 }
 function normalizeObjectiveTargetPath(value) {
-  return asString3(value).replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/").replace(/\/$/, "").toLowerCase();
+  return asString3(value).normalize("NFKC").replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/").replace(/\/$/, "").toLowerCase();
 }
 function objectiveTargetPathsOverlap(left, right) {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+function normalizeObjectiveClusterProse(value) {
+  return asString3(value).normalize("NFKC").toLowerCase().replace(/\b(?:[a-z]:)?[a-z0-9_.-]+(?:[\\/][a-z0-9_.()\[\]-]+)+(?:\.[a-z0-9]+)?\b/gi, "<path>").replace(/\b\d+(?:\.\d+)?\b/g, "<n>").replace(/[^\p{L}\p{N}<>]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+function normalizeObjectiveClusterIdentifier(value) {
+  return asString3(value).normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}_.:/-]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+function objectiveTargetFamily(record) {
+  const scope = asObject2(record.scope);
+  return [
+    ...new Set([
+      ...asStringArray3(record.targetPaths ?? record.target_paths),
+      ...asStringArray3(scope.targetPaths ?? scope.target_paths)
+    ].map(normalizeObjectiveTargetPath).filter(Boolean).map((targetPath) => {
+      const parts = targetPath.split("/").filter(Boolean);
+      if (parts.length <= 1)
+        return "<root>";
+      const directoryParts = /\.[\p{L}\p{N}]+$/u.test(parts.at(-1) ?? "") ? parts.slice(0, -1) : parts;
+      return directoryParts.slice(0, Math.min(2, directoryParts.length)).join("/") || "<root>";
+    }))
+  ].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+}
+function semanticObjectiveClusterKey(record, fallback, portfolio = {}) {
+  const evidence = asObject2(record.evidence);
+  const evidencePortfolio = asObject2(evidence.portfolio);
+  const lineage = asObject2(record.lineage ?? evidence.lineage);
+  const explicitParentMembership = normalizeObjectiveClusterIdentifier(record.rootObjectiveId ?? record.root_objective_id ?? record.parentObjectiveId ?? record.parent_objective_id ?? lineage.rootObjectiveId ?? lineage.root_objective_id ?? lineage.parentObjectiveId ?? lineage.parent_objective_id ?? portfolio.root_objective_id ?? evidencePortfolio.root_objective_id);
+  const visionObjectiveId = normalizeObjectiveClusterIdentifier(record.visionObjectiveId ?? record.vision_objective_id ?? portfolio.vision_objective_id ?? evidencePortfolio.vision_objective_id);
+  const acceptanceCriteria = asStringArray3(record.acceptanceCriteria ?? record.acceptance_criteria ?? evidence.acceptanceCriteria ?? evidence.acceptance_criteria).map(normalizeObjectiveClusterProse).filter(Boolean).sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  const critic = asObject2(evidence.critic ?? record.critic);
+  const criticFingerprint = normalizeObjectiveClusterIdentifier(record.criticFingerprint ?? record.critic_fingerprint ?? evidence.criticFingerprint ?? evidence.critic_fingerprint ?? critic.fingerprint);
+  if (!visionObjectiveId && acceptanceCriteria.length === 0 && !criticFingerprint && !explicitParentMembership) {
+    return fallback;
+  }
+  return `cluster_${sha256Hex(JSON.stringify({
+    visionObjectiveId,
+    acceptanceCriteria,
+    criticFingerprint,
+    objectiveType: asString3(record.objectiveType ?? record.objective_type).toLowerCase(),
+    explicitParentMembership: explicitParentMembership || null,
+    componentArea: explicitParentMembership ? null : normalizeObjectiveClusterIdentifier(record.componentArea ?? record.component_area),
+    targetFamily: explicitParentMembership ? [] : objectiveTargetFamily(record)
+  }))}`;
 }
 var OBJECTIVE_POLICY = {
   flaky_test: {
@@ -17641,6 +18925,10 @@ var ENGINE_SOURCE_ARCHIVE_MIN_SAMPLES = 8;
 var ENGINE_SOURCE_WATCHLIST_MIN_SAMPLES = 4;
 var ENGINE_SOURCE_FRESHNESS_HALF_LIFE_DAYS = 14;
 var PROVIDER_STATE_MAX_FUTURE_SKEW_MS = 5 * 60000;
+var PROVIDER_TOMBSTONE_RETENTION_DAYS = 30;
+var PROVIDER_TOMBSTONE_MAX_ROWS = 1e4;
+var PROVIDER_AUTHORITY_GAP_MAX_OCCURRENCES = 3;
+var PROVIDER_AUTHORITY_GAP_STALE_MS = 10 * 60000;
 var NON_TERMINAL_NEGATIVE_PR_FEEDBACK_VERDICTS = new Set([
   "rejected",
   "changes_requested",
@@ -18021,18 +19309,33 @@ function isRequiredValidationFailureSignal(text) {
 function normalizedValidationEvidenceValues(values, maxItems) {
   return [...new Set(values.map(normalizeTrustedValidationFingerprintLine).filter(Boolean))].sort((left, right) => left.localeCompare(right)).slice(0, maxItems);
 }
+function normalizeValidationEvidenceMetadata(metadata) {
+  const nested = asObject2(metadata.validationEvidence ?? metadata.validation_evidence ?? metadata.evidence);
+  const values = (...candidates) => candidates.flatMap((candidate) => asStringArray3(candidate));
+  return {
+    ...metadata,
+    ...nested,
+    schemaVersion: Math.max(1, Math.floor(asNumber(nested.schemaVersion ?? nested.schema_version ?? metadata.schemaVersion ?? metadata.schema_version, 1))),
+    failedTests: values(nested.failedTests, nested.failed_tests, nested.testNames, nested.test_names, metadata.failedTests, metadata.failed_tests),
+    targetPathHints: values(nested.targetPathHints, nested.target_path_hints, nested.affectedPaths, nested.affected_paths, metadata.targetPathHints, metadata.target_path_hints),
+    failureLines: values(nested.failureLines, nested.failure_lines, nested.diagnostics, metadata.failureLines, metadata.failure_lines),
+    failureFingerprint: asString3(nested.failureFingerprint ?? nested.failure_fingerprint ?? nested.fingerprint ?? metadata.failureFingerprint ?? metadata.failure_fingerprint) || undefined,
+    retryReason: asString3(nested.retryReason ?? nested.retry_reason ?? metadata.retryReason ?? metadata.retry_reason) || undefined
+  };
+}
 function canonicalValidationFailureEvidence(params) {
+  const metadata = normalizeValidationEvidenceMetadata(params.metadata);
   const output = `${asString3(params.stderrTail)}
 ${asString3(params.stdoutTail)}`;
   const derived = extractTrustedValidationFailureEvidence({
     command: params.command,
-    phase: asString3(params.metadata.phase) === "dependency_install" ? "dependency_install" : "validation",
+    phase: asString3(metadata.phase) === "dependency_install" ? "dependency_install" : "validation",
     output,
     exitCode: 1
   });
-  const failedTests = normalizedValidationEvidenceValues([...asStringArray3(params.metadata.failedTests), ...derived.failedTests], 20);
-  const targetPathHints = normalizedValidationEvidenceValues([...asStringArray3(params.metadata.targetPathHints), ...derived.targetPathHints], 20);
-  let failureLines = normalizedValidationEvidenceValues([...asStringArray3(params.metadata.failureLines), ...derived.failureLines], 20);
+  const failedTests = normalizedValidationEvidenceValues([...asStringArray3(metadata.failedTests), ...derived.failedTests], 20);
+  const targetPathHints = normalizedValidationEvidenceValues([...asStringArray3(metadata.targetPathHints), ...derived.targetPathHints], 20);
+  let failureLines = normalizedValidationEvidenceValues([...asStringArray3(metadata.failureLines), ...derived.failureLines], 20);
   if (failureLines.length === 0) {
     failureLines = normalizedValidationEvidenceValues(output.split(/\r?\n/).filter((line) => /\b(?:error|fail|failed|failure|fatal|panic|timeout)\b/i.test(line)), 4);
   }
@@ -18069,21 +19372,32 @@ function classifyAutonomyAttemptOutcome(input) {
   const terminalStage = asString3(input.terminalStage).toLowerCase();
   const summary = asString3(input.summary).toLowerCase();
   const text = `${failureClass} ${terminalStage} ${summary}`;
-  if (/artifact_only_no_publishable_patch|no[_ -]?publishable[_ -]?patch|(?:completed[_ -]?)?no[_ -]?change/.test(text)) {
+  const terminalSemantics = classifyJobTerminalSemantics({
+    status,
+    failureClass,
+    terminalStage,
+    summary
+  });
+  if (terminalSemantics.noChange)
     return "no_change";
+  if (terminalSemantics.success)
+    return "succeeded";
+  if (/\bregression(?:_detected| detected| failure)?\b|reopened[_ -]?within/.test(text)) {
+    return "regression_detected";
   }
-  if (/critic[_ -]?(?:rejected|failed)|quality[_ -]?(?:rejected|revision[_ -]?exhausted)|deterministic_quality[_ -]?failed/.test(text)) {
-    return "quality_rejected";
+  if (/critic[_ -]?rejected|quality[_ -]?(?:rejected|failed|revision[_ -]?exhausted)|revision[_ -]?budget[_ -]?exhausted|deterministic[_ -]?quality[_ -]?failed/.test(text)) {
+    return "product_quality_failed";
   }
   if (/^(?:environment|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(failureClass) || /docker[_ -]?(?:socket|daemon)|credential|missing runtime|network is unreachable|tls[_ -]?handshake|certificate verify|permission denied/.test(`${failureClass} ${summary}`)) {
     return "environment_blocked";
   }
-  if (status === "completed")
-    return "succeeded";
-  if (status === "publish_blocked" || /trusted[_ -]?validation|validation[_ -]?blocked|test[_ -]?failure|lint[_ -]?failure|typecheck[_ -]?failure/.test(text)) {
+  if (/trusted[_ -]?validation|validation[_ -]?(?:blocked|failed)|test[_ -]?failure|lint[_ -]?failure|typecheck[_ -]?failure/.test(text)) {
     return "validation_blocked";
   }
-  return "infrastructure_failed";
+  if (status === "publish_blocked" || /publication|publish[_ -]?(?:blocked|failed)|push[_ -]?failed|merge[_ -]?failed/.test(text)) {
+    return "publication_failed";
+  }
+  return "orchestration_failed";
 }
 function percentileValue(values, percentile3) {
   const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
@@ -18695,6 +20009,17 @@ class AutonomyStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_key
         ON autonomy_pr_feedback(feedback_key)
         WHERE feedback_key IS NOT NULL AND feedback_key <> '';
+      CREATE TABLE IF NOT EXISTS autonomy_pr_feedback_tombstones (
+        feedback_key TEXT PRIMARY KEY,
+        reason TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        disposition TEXT NOT NULL DEFAULT 'permanent',
+        occurrence_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_pr_feedback_tombstones_last_seen
+        ON autonomy_pr_feedback_tombstones(last_seen_at DESC);
       CREATE TABLE IF NOT EXISTS pr_provider_outcomes (
         normalizedPrUrl TEXT PRIMARY KEY,
         prUrl           TEXT NOT NULL,
@@ -18892,6 +20217,7 @@ class AutonomyStore {
     ensureColumn("autonomy_objectives", "awaiting_review_since TEXT");
     ensureColumn("autonomy_outcomes", "terminal INTEGER NOT NULL DEFAULT 1");
     ensureColumn("autonomy_pr_feedback", "pr_url_normalized TEXT");
+    ensureColumn("autonomy_pr_feedback_tombstones", "disposition TEXT NOT NULL DEFAULT 'permanent'");
     ensureColumn("pr_provider_outcomes", "providerStateAt TEXT");
     ensureColumn("autonomy_repository_agent_memory_feedback", "weight REAL NOT NULL DEFAULT 1");
     ensureColumn("autonomy_repository_agent_memory_feedback", "claim_token TEXT");
@@ -19130,11 +20456,11 @@ class AutonomyStore {
     }, nowIso);
     return { applied: result.ok && result.state.isFrozen, state: result.state };
   }
-  safetyBlockReason(nowIso = asIsoNow()) {
+  safetyBlockReason(nowIso = asIsoNow(), options = {}) {
     const state = this.getSafetyState(nowIso);
     if (state.killSwitchEnabled)
       return "autonomy kill switch enabled";
-    if (state.isFrozen) {
+    if (state.isFrozen && !options.allowFrozenRecovery) {
       return `autonomy frozen until ${state.freezeUntil}`;
     }
     return null;
@@ -19224,26 +20550,15 @@ class AutonomyStore {
         latestTerminalAt: null
       };
     }
-    const health = this.db.prepare(`SELECT
-           COUNT(*) AS terminal_count,
-           MAX(COALESCE(
+    const terminalRows = this.db.prepare(`SELECT j.status, j.result, j.error,
+                d.summary, d.failureClass, d.terminalStage,
+                COALESCE(
              j.completedAt,
              j.failedAt,
              j.publishBlockedAt,
              j.abandonedAt,
              j.updatedAt
-           )) AS latest_terminal_at,
-           SUM(CASE WHEN j.status = 'completed' THEN 1 ELSE 0 END) AS success_count,
-           SUM(
-             CASE
-               WHEN lower(COALESCE(d.failureClass, '')) LIKE '%timeout%'
-                 OR lower(COALESCE(d.failureClass, '')) LIKE '%watchdog%'
-                 OR lower(COALESCE(d.summary, j.error, '')) LIKE '%timed out%'
-                 OR lower(COALESCE(d.summary, j.error, '')) LIKE '%timeout%'
-               THEN 1
-               ELSE 0
-             END
-           ) AS timeout_count
+           ) AS terminalAt
          FROM jobs j
          LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
          WHERE j.kind = 'task.execute'
@@ -19259,10 +20574,30 @@ class AutonomyStore {
              json_extract(j.params, '$.origin'),
              json_extract(j.params, '$.autonomy.origin'),
              ''
-           )) = 'autonomy'`).get(nowIso);
-    const terminalCount = Math.max(0, Math.floor(asNumber(health?.terminal_count, 0)));
-    const successCount = Math.max(0, Math.floor(asNumber(health?.success_count, 0)));
-    const timeoutCount = Math.max(0, Math.floor(asNumber(health?.timeout_count, 0)));
+           )) = 'autonomy'`).all(nowIso);
+    const terminalCount = terminalRows.length;
+    let successCount = 0;
+    let timeoutCount = 0;
+    let latestTerminalAt = null;
+    for (const row of terminalRows) {
+      const semantics = classifyJobTerminalSemantics({
+        status: row.status,
+        result: row.result,
+        error: row.error,
+        summary: row.summary,
+        failureClass: row.failureClass,
+        terminalStage: row.terminalStage
+      });
+      if (semantics.success)
+        successCount += 1;
+      const timeoutEvidence = `${asString3(row.failureClass)} ${asString3(row.summary)} ${asString3(row.error)}`.toLowerCase();
+      if (/timeout|timed out|watchdog/.test(timeoutEvidence))
+        timeoutCount += 1;
+      const terminalAt = asString3(row.terminalAt);
+      if (terminalAt && (!latestTerminalAt || terminalAt > latestTerminalAt)) {
+        latestTerminalAt = terminalAt;
+      }
+    }
     const resourceUsage = this.getResourceUsageLastHour(nowIso);
     let repeatedFailureCount = 0;
     if (this.hasTable("job_validation_runs") && this.hasTable("job_terminal_diagnostics")) {
@@ -19296,11 +20631,21 @@ class AutonomyStore {
            LIMIT 500`).all(nowIso);
       const fingerprintCounts = new Map;
       for (const row of repeatedRows) {
-        const targets = normalizedAutonomyFailureTargets(parseJsonObject(row.params));
-        if (targets.length === 0)
+        const jobParams = parseJsonObject(row.params);
+        const autonomy = asObject2(jobParams.autonomy);
+        const semanticCluster = semanticObjectiveClusterKey({
+          ...jobParams,
+          ...autonomy,
+          evidence: autonomy.evidence ?? jobParams.evidence
+        }, "");
+        const persistedCluster = asString3(autonomy.patternKey ?? autonomy.pattern_key);
+        const objectiveCluster = semanticCluster || (persistedCluster.startsWith("cluster_") ? persistedCluster : "");
+        const targets = normalizedAutonomyFailureTargets(jobParams);
+        if (!objectiveCluster && targets.length === 0)
           continue;
         const fingerprint = sha256Hex(JSON.stringify({
-          targets,
+          objectiveCluster: objectiveCluster || null,
+          targets: objectiveCluster ? [] : targets,
           failureClass: asString3(row.failure_class).toLowerCase() || "unknown",
           command: asString3(row.failed_command).replace(/\s+/g, " ").toLowerCase(),
           failedTests: failedTestNamesFromOutput(row.stdout_tail, row.stderr_tail, row.summary)
@@ -19316,7 +20661,7 @@ class AutonomyStore {
       timeoutRate: terminalCount > 0 ? clamp012(timeoutCount / terminalCount) : null,
       activeRuntimeMs: resourceUsage.activeRuntimeMs,
       repeatedFailureCount,
-      latestTerminalAt: asString3(health?.latest_terminal_at) || null
+      latestTerminalAt
     };
   }
   getAutonomyReviewDeliveryHealth(nowIso, windowHours) {
@@ -19339,25 +20684,18 @@ class AutonomyStore {
            AND outcome.terminal = 1
            AND COALESCE(job.prUrl, '') != ''
            AND datetime(outcome.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`).get(nowIso) : undefined;
-    const revisions = this.hasTable("jobs") ? this.db.prepare(`WITH resolved AS (
-               SELECT DISTINCT outcome.objective_id
-               FROM autonomy_outcomes outcome
-               JOIN jobs job ON job.id = outcome.job_id
-               WHERE outcome.terminal = 1
-                 AND outcome.objective_id IS NOT NULL
-                 AND COALESCE(job.prUrl, '') != ''
-                 AND datetime(outcome.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')
-             )
-             SELECT COUNT(DISTINCT feedback.objective_id) AS revision_objective_count
-             FROM autonomy_pr_feedback feedback
-             JOIN resolved ON resolved.objective_id = feedback.objective_id
-             WHERE (
-               LOWER(COALESCE(feedback.verdict, '')) LIKE '%reject%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%unmergeable%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%merge_conflict%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%changes_requested%'
-               OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%revision%'
-             )`).get(nowIso) : undefined;
+    const reviews = this.db.prepare(`SELECT COUNT(DISTINCT feedback.objective_id) AS reviewed_objective_count,
+                COUNT(DISTINCT CASE WHEN (
+                  LOWER(COALESCE(feedback.verdict, '')) LIKE '%reject%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%unmergeable%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%merge_conflict%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%changes_requested%'
+                  OR LOWER(COALESCE(feedback.verdict, '')) LIKE '%revision%'
+                ) THEN feedback.objective_id END) AS revision_objective_count
+         FROM autonomy_pr_feedback feedback
+         JOIN autonomy_objectives objective ON objective.id = feedback.objective_id
+         WHERE objective.source = 'autonomous'
+           AND datetime(feedback.created_at) >= datetime(?, '-${Math.max(1, windowHours)} hours')`).get(nowIso);
     const awaitingReviewCount = Math.max(0, Math.floor(asNumber(backlog?.awaiting_count, 0)));
     const oldestAwaitingAtMs = Date.parse(asString3(backlog?.oldest_awaiting_at));
     const nowMs = Date.parse(nowIso);
@@ -19365,7 +20703,8 @@ class AutonomyStore {
     const resolvedCount = Math.max(0, Math.floor(asNumber(resolved?.resolved_count, 0)));
     const mergedCount = Math.max(0, Math.floor(asNumber(resolved?.merged_count, 0)));
     const closedUnmergedCount = Math.max(0, Math.floor(asNumber(resolved?.closed_unmerged_count, 0)));
-    const revisionObjectiveCount = Math.max(0, Math.floor(asNumber(revisions?.revision_objective_count, 0)));
+    const reviewedObjectiveCount = Math.max(0, Math.floor(asNumber(reviews?.reviewed_objective_count, 0)));
+    const revisionObjectiveCount = Math.max(0, Math.floor(asNumber(reviews?.revision_objective_count, 0)));
     return {
       awaitingReviewCount,
       oldestAwaitingReviewAt: asString3(backlog?.oldest_awaiting_at) || null,
@@ -19373,8 +20712,9 @@ class AutonomyStore {
       resolvedCount,
       mergedCount,
       closedUnmergedCount,
+      reviewedObjectiveCount,
       revisionObjectiveCount,
-      revisionRate: resolvedCount > 0 ? clamp012(revisionObjectiveCount / resolvedCount) : null
+      revisionRate: reviewedObjectiveCount > 0 ? clamp012(revisionObjectiveCount / reviewedObjectiveCount) : null
     };
   }
   latestEvaluatorScorecard() {
@@ -19465,20 +20805,20 @@ class AutonomyStore {
     const reviewHealth = this.getAutonomyReviewDeliveryHealth(nowIso, windowHours);
     const reviewBacklogStalled = reviewHealth.awaitingReviewCount >= 2 && reviewHealth.oldestAwaitingReviewAgeMs >= 6 * 60 * 60 * 1000;
     const reviewBacklogSeverelyStalled = reviewHealth.awaitingReviewCount >= 5 && reviewHealth.oldestAwaitingReviewAgeMs >= 24 * 60 * 60 * 1000;
-    const hasReviewEvidence = reviewHealth.resolvedCount >= minSamples;
+    const hasReviewEvidence = reviewHealth.reviewedObjectiveCount >= minSamples;
     const reliability = this.getReliabilityMetrics(windowHours, nowIso);
-    const infrastructureFailureRate = reliability.attemptsTotal > 0 ? (reliability.outcomeCounts.infrastructure_failed + reliability.outcomeCounts.environment_blocked) / reliability.attemptsTotal : null;
+    const infrastructureFailureRate = reliability.attemptsTotal > 0 ? (reliability.outcomeCounts.orchestration_failed + reliability.outcomeCounts.environment_blocked) / reliability.attemptsTotal : null;
     const resourceBudget = this.resourceBudgetSnapshot(nowIso);
     const hasOutcomeEvidence = sampleCount >= minSamples;
     const hasJobEvidence = jobHealth.terminalCount >= minSamples;
     let recommendation = "healthy";
     if (resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted) {
       recommendation = "pause";
-    } else if (reviewBacklogSeverelyStalled) {
+    } else if (reviewBacklogSeverelyStalled && (hasOutcomeEvidence || hasReviewEvidence || reviewHealth.awaitingReviewCount >= minSamples)) {
       recommendation = "pause";
-    } else if (!hasOutcomeEvidence && !hasJobEvidence) {
+    } else if (!hasOutcomeEvidence) {
       recommendation = "constrain";
-    } else if (hasOutcomeEvidence && (typeof successRate === "number" && successRate < minSuccessRate || typeof regretRate === "number" && regretRate > maxRegretRate) || hasJobEvidence && (typeof infrastructureFailureRate === "number" && infrastructureFailureRate >= 0.3 || typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.3) || hasReviewEvidence && typeof reviewHealth.revisionRate === "number" && reviewHealth.revisionRate >= Math.max(0.5, maxRegretRate)) {
+    } else if (hasOutcomeEvidence && (typeof successRate === "number" && successRate < minSuccessRate || typeof regretRate === "number" && regretRate > maxRegretRate) || hasReviewEvidence && typeof reviewHealth.revisionRate === "number" && reviewHealth.revisionRate >= Math.max(0.5, maxRegretRate)) {
       recommendation = "pause";
     } else if (hasOutcomeEvidence && (typeof successRate === "number" && successRate < Math.min(1, Math.max(0.8, minSuccessRate + 0.08)) || typeof regretRate === "number" && regretRate > maxRegretRate * 0.8) || hasJobEvidence && (typeof reliability.attemptSuccessRate === "number" && reliability.attemptSuccessRate < 0.8 || typeof jobHealth.timeoutRate === "number" && jobHealth.timeoutRate >= 0.2) || jobHealth.repeatedFailureCount >= 2 || reviewBacklogStalled || hasReviewEvidence && typeof reviewHealth.revisionRate === "number" && reviewHealth.revisionRate > maxRegretRate * 0.8) {
       recommendation = "constrain";
@@ -19498,6 +20838,7 @@ class AutonomyStore {
       reviewBacklogStalled,
       reviewBacklogSeverelyStalled,
       reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewObservedCount: reviewHealth.reviewedObjectiveCount,
       reviewRevisionRate: reviewHealth.revisionRate,
       outcomeCounts: reliability.outcomeCounts,
       infrastructureFailureRate,
@@ -19531,6 +20872,7 @@ class AutonomyStore {
       awaitingReviewCount: reviewHealth.awaitingReviewCount,
       oldestAwaitingReviewAgeMs: reviewHealth.oldestAwaitingReviewAgeMs,
       reviewResolvedCount: reviewHealth.resolvedCount,
+      reviewObservedCount: reviewHealth.reviewedObjectiveCount,
       reviewMergedCount: reviewHealth.mergedCount,
       reviewClosedUnmergedCount: reviewHealth.closedUnmergedCount,
       reviewRevisionObjectiveCount: reviewHealth.revisionObjectiveCount,
@@ -19546,7 +20888,7 @@ class AutonomyStore {
           id, window_hours, sample_count, success_rate, regret_rate, avg_latency_ms, dispatch_count,
           recommendation, payload_json, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, windowHours, sampleCount, successRate, regretRate, avgLatencyMs, dispatchCount, recommendation, JSON.stringify(payload), nowIso);
-    if (recommendation === "pause" && (hasOutcomeEvidence || hasJobEvidence || reviewBacklogSeverelyStalled || hasReviewEvidence || resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted)) {
+    if (recommendation === "pause" && (hasOutcomeEvidence || reviewBacklogSeverelyStalled || hasReviewEvidence || resourceBudget.token_budget_exhausted || resourceBudget.runtime_budget_exhausted)) {
       this.recordOpsAlert({
         alertType: "evaluator_pause",
         severity: "critical",
@@ -19708,11 +21050,13 @@ class AutonomyStore {
     }
     const outcomeCounts = {
       succeeded: 0,
-      quality_rejected: 0,
+      product_quality_failed: 0,
       validation_blocked: 0,
       environment_blocked: 0,
-      no_change: 0,
-      infrastructure_failed: 0
+      orchestration_failed: 0,
+      publication_failed: 0,
+      regression_detected: 0,
+      no_change: 0
     };
     const durations = [];
     for (const row of attemptRows) {
@@ -19765,9 +21109,11 @@ class AutonomyStore {
     const nonTerminalRevisionCount = Math.max(0, Math.floor(asNumber(objectiveRow?.nonTerminalRevisionCount, 0)));
     const nonTerminalRevisionObjectiveCount = Math.max(0, Math.floor(asNumber(objectiveRow?.nonTerminalRevisionObjectiveCount, 0)));
     const revisedTerminalObjectiveCount = Math.max(0, Math.floor(asNumber(objectiveRow?.revisedTerminalObjectiveCount, 0)));
+    const reviewObservedObjectiveCount = Math.max(0, objectiveTerminalCount + nonTerminalRevisionObjectiveCount - revisedTerminalObjectiveCount);
     let validationRows = [];
     if (this.hasTable("job_validation_runs") && this.hasTable("jobs")) {
-      validationRows = this.db.prepare(`SELECT v.jobId, v.command, v.attempt, v.passed, v.failureClass, v.metadataJson
+      validationRows = this.db.prepare(`SELECT v.jobId, v.command, v.attempt, v.passed, v.failureClass,
+                  v.stdoutTail, v.stderrTail, v.metadataJson
           FROM job_validation_runs v
           JOIN jobs j ON j.id = v.jobId
           WHERE datetime(v.createdAt) >= datetime(?, '-${hours} hours')
@@ -19784,10 +21130,17 @@ class AutonomyStore {
     const transientRetryKeys = new Set;
     const signaturesByFingerprint = new Map;
     for (const row of validationRows) {
-      const metadata = parseJsonObject(row.metadataJson);
-      const failedTests = normalizedValidationEvidenceValues(asStringArray3(metadata.failedTests), 20);
-      const targetPathHints = normalizedValidationEvidenceValues(asStringArray3(metadata.targetPathHints), 20);
-      const failureLines = normalizedValidationEvidenceValues(asStringArray3(metadata.failureLines), 20);
+      const metadata = normalizeValidationEvidenceMetadata(parseJsonObject(row.metadataJson));
+      const canonical = canonicalValidationFailureEvidence({
+        command: asString3(row.command),
+        failureClass: row.failureClass,
+        stdoutTail: row.stdoutTail,
+        stderrTail: row.stderrTail,
+        metadata
+      });
+      const failedTests = canonical.failedTests;
+      const targetPathHints = canonical.targetPathHints;
+      const failureLines = canonical.failureLines;
       const attempt = Math.max(0, Math.floor(asNumber(row.attempt ?? metadata.attempt, 0)));
       if (attempt >= 2 && asString3(metadata.retryReason ?? metadata.retry_reason) === "transient_infrastructure") {
         transientRetryKeys.add(`${row.jobId}
@@ -19799,7 +21152,7 @@ ${attempt}`);
       if (failedTests.length > 0 || targetPathHints.length > 0 || failureLines.length > 0) {
         validationEvidenceCovered += 1;
       }
-      const fingerprint = asString3(metadata.failureFingerprint);
+      const fingerprint = asString3(metadata.failureFingerprint) || canonical.fingerprint;
       if (!fingerprint)
         continue;
       const structuredEvidenceAvailable = failedTests.length > 0 || targetPathHints.length > 0;
@@ -19841,8 +21194,8 @@ ${attempt}`);
       nonTerminalRevisionCount,
       nonTerminalRevisionObjectiveCount,
       revisedTerminalObjectiveCount,
-      objectiveRevisionRate: objectiveTerminalCount > 0 ? revisedTerminalObjectiveCount / objectiveTerminalCount : null,
-      objectiveFirstPassRate: objectiveTerminalCount > 0 ? Math.max(0, objectiveTerminalCount - revisedTerminalObjectiveCount) / objectiveTerminalCount : null,
+      objectiveRevisionRate: reviewObservedObjectiveCount > 0 ? nonTerminalRevisionObjectiveCount / reviewObservedObjectiveCount : null,
+      objectiveFirstPassRate: reviewObservedObjectiveCount > 0 ? Math.max(0, reviewObservedObjectiveCount - nonTerminalRevisionObjectiveCount) / reviewObservedObjectiveCount : null,
       durationMs: {
         average: durations.length > 0 ? Math.floor(durations.reduce((sum, value) => sum + value, 0) / durations.length) : null,
         p50: percentileValue(durations, 50),
@@ -21170,7 +22523,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         terminalStage: row.job_terminal_stage,
         summary: row.job_summary
       }) : null;
-      const deterministicRepairFailure = attemptOutcome === "quality_rejected" || attemptOutcome === "validation_blocked" || attemptOutcome === "no_change";
+      const deterministicRepairFailure = attemptOutcome === "product_quality_failed" || attemptOutcome === "validation_blocked" || attemptOutcome === "no_change";
       const validationCommand = asString3(row.job_validation_command);
       const attemptFailureFingerprint = deterministicRepairFailure && validationCommand && Number(row.job_validation_passed) !== 1 ? canonicalValidationFailureEvidence({
         command: validationCommand,
@@ -21320,7 +22673,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     }
     return null;
   }
-  preflightReason(snapshotId, runId) {
+  preflightReason(snapshotId, runId, options = {}) {
     if (this.isDispatchLockHeldByAnotherRun(runId)) {
       return "repo preflight blocked: dispatch lock held";
     }
@@ -21341,7 +22694,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       return "autonomy kill switch enabled";
     }
     const isFrozen = asBoolean2(safety.is_frozen, false);
-    if (isFrozen) {
+    if (isFrozen && !options.allowFrozenRecovery) {
       const freezeUntil = asString3(safety.freeze_until);
       return freezeUntil ? `autonomy frozen until ${freezeUntil}` : "autonomy frozen";
     }
@@ -21412,8 +22765,6 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const byComponentCounts = { ...counts.byComponent };
     let globalCount = counts.globalCount;
     const applySequentialAccounting = asBoolean2(body.applySequentialAccounting ?? body.apply_sequential_accounting, true);
-    const preflightErr = this.preflightReason(snapshotId, runId);
-    const safetyErr = this.safetyBlockReason(now);
     const resourceBudgetErr = this.resourceBudgetBlockReason(now);
     const requiredValidationRepairAuthorized = this.snapshotAuthorizesRequiredValidationRepair(snapshotId);
     const activePatternRows = this.db.prepare(`SELECT DISTINCT pattern_key AS patternKey
@@ -21439,11 +22790,18 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           reason: `invalid objective_type "${objectiveTypeRaw}"`
         };
       }
-      const patternKey = asString3(record.patternKey ?? record.pattern_key);
+      const patternKey = semanticObjectiveClusterKey(record, asString3(record.patternKey ?? record.pattern_key));
       const componentArea = asComponentArea(record.componentArea ?? record.component_area);
       const confidence = clamp012(asNumber(record.confidence, 0));
       const targetPaths = asStringArray3(record.targetPaths ?? record.target_paths).map(normalizeObjectiveTargetPath).filter(Boolean);
       const requiredValidationRepair = requiredValidationRepairAuthorized && asBoolean2(record.requiredValidationRepair ?? record.required_validation_repair, false);
+      const lifecycleRecovery = requiredValidationRepair;
+      const preflightErr = this.preflightReason(snapshotId, runId, {
+        allowFrozenRecovery: lifecycleRecovery
+      });
+      const safetyErr = this.safetyBlockReason(now, {
+        allowFrozenRecovery: lifecycleRecovery
+      });
       const pushpalsInternalErr = pushpalsInternalCandidateReason(record);
       if (pushpalsInternalErr) {
         return {
@@ -21506,7 +22864,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       if (resourceBudgetErr) {
         return { candidate_id: candidateId, ok: false, reason: resourceBudgetErr };
       }
-      if (patternKey && activePatternKeys.has(patternKey)) {
+      if (!requiredValidationRepair && patternKey && activePatternKeys.has(patternKey)) {
         return {
           candidate_id: candidateId,
           ok: false,
@@ -21611,7 +22969,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       if (engineTrialMeta) {
         candidateEngineTrialMetaById.set(candidateStorageId, engineTrialMeta);
       }
-      const portfolioMeta = {
+      const portfolioMeta2 = {
         work_kind: asString3(record.work_kind ?? record.workKind) || null,
         work_area_key: asString3(record.work_area_key ?? record.workAreaKey) || null,
         work_target_key: asString3(record.work_target_key ?? record.workTargetKey) || null,
@@ -21624,10 +22982,10 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         vision_section_refs: asStringArray3(record.vision_section_refs ?? record.visionSectionRefs),
         feature_hypotheses: asStringArray3(record.feature_hypotheses ?? record.featureHypotheses).slice(0, 24)
       };
-      candidatePortfolioMetaById.set(candidateStorageId, portfolioMeta);
+      candidatePortfolioMetaById.set(candidateStorageId, portfolioMeta2);
       const debugRecord = {
         ...asObject2(record.debug),
-        ...portfolioMeta,
+        ...portfolioMeta2,
         candidate_external_id: candidateExternalId
       };
       this.db.prepare(`INSERT OR REPLACE INTO autonomy_candidates (
@@ -21639,7 +22997,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(candidateStorageId, runId, snapshotId, sessionId, asString3(record.title), objectiveTypePersist, asString3(record.problemStatement ?? record.problem_statement), triggerTypePersist, componentAreaPersist, JSON.stringify(scopeValidation2.normalizedTargetPaths), JSON.stringify({
         readAnywhere: readAnywhere2,
         writeGlobs: scopeValidation2.normalizedWriteGlobs
-      }), riskLevel2, JSON.stringify(expectedValidation2), asString3(record.estimatedEffort ?? record.estimated_effort), JSON.stringify(asStringArray3(record.whyNowSignalIds ?? record.why_now_signal_ids)), clamp012(asNumber(record.confidence, 0)), makePatternKey(objectiveTypePersist, scopeValidation2.normalizedTargetPaths, triggerTypePersist, componentAreaPersist), llmScore, impactSignal, emaSuccess, emaUserAccept, JSON.stringify(penalties), finalScore, asBoolean2(record.selected, false) ? 1 : 0, asString3(record.rejectionReason ?? record.rejection_reason) || null, asString3(record.gateDecision ?? record.gate_decision) || (gateReasons.length === 0 ? "approved" : "rejected"), JSON.stringify(gateReasons.length === 0 ? asStringArray3(record.gateReasons ?? record.gate_reasons) : gateReasons), JSON.stringify(debugRecord), asIsoNow());
+      }), riskLevel2, JSON.stringify(expectedValidation2), asString3(record.estimatedEffort ?? record.estimated_effort), JSON.stringify(asStringArray3(record.whyNowSignalIds ?? record.why_now_signal_ids)), clamp012(asNumber(record.confidence, 0)), semanticObjectiveClusterKey(record, makePatternKey(objectiveTypePersist, scopeValidation2.normalizedTargetPaths, triggerTypePersist, componentAreaPersist), portfolioMeta2), llmScore, impactSignal, emaSuccess, emaUserAccept, JSON.stringify(penalties), finalScore, asBoolean2(record.selected, false) ? 1 : 0, asString3(record.rejectionReason ?? record.rejection_reason) || null, asString3(record.gateDecision ?? record.gate_decision) || (gateReasons.length === 0 ? "approved" : "rejected"), JSON.stringify(gateReasons.length === 0 ? asStringArray3(record.gateReasons ?? record.gate_reasons) : gateReasons), JSON.stringify(debugRecord), asIsoNow());
     }
     const llmCalls = Array.isArray(body.llmCalls) ? body.llmCalls : [];
     for (const raw of llmCalls) {
@@ -21695,10 +23053,11 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     }
     const objectiveCandidateRaw = asString3(objective.candidateId ?? objective.candidate_id);
     const objectiveCandidateId = objectiveCandidateRaw ? scopedCandidateStorageId(runId, objectiveCandidateRaw) : null;
-    const patternKey = makePatternKey(objectiveType, scopeValidation.normalizedTargetPaths, triggerType, normalizedComponentArea);
+    const portfolioMeta = (objectiveCandidateId ? candidatePortfolioMetaById.get(objectiveCandidateId) : undefined) ?? {};
+    const patternKey = semanticObjectiveClusterKey(objective, makePatternKey(objectiveType, scopeValidation.normalizedTargetPaths, triggerType, normalizedComponentArea), portfolioMeta);
     const objectiveEvidence = {
       ...asObject2(objective.evidence),
-      ...objectiveCandidateId && candidatePortfolioMetaById.has(objectiveCandidateId) ? { portfolio: candidatePortfolioMetaById.get(objectiveCandidateId) } : {}
+      ...objectiveCandidateId && candidatePortfolioMetaById.has(objectiveCandidateId) ? { portfolio: portfolioMeta } : {}
     };
     const validationIncidentEvidence = asObject2(objectiveEvidence.validation_incident ?? objectiveEvidence.validationIncident);
     const incidentKey = asString3(objective.incidentKey ?? objective.incident_key ?? validationIncidentEvidence.incident_id ?? validationIncidentEvidence.incidentId ?? validationIncidentEvidence.failure_fingerprint ?? validationIncidentEvidence.failureFingerprint).slice(0, 256);
@@ -21740,7 +23099,9 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
             pattern_key: patternKey,
             target_paths: scopeValidation.normalizedTargetPaths,
             confidence: clamp012(asNumber(objective.confidence, 0)),
-            required_validation_repair: requiredValidationRepair
+            required_validation_repair: requiredValidationRepair,
+            work_class: objective.workClass ?? objective.work_class,
+            lifecycle_recovery: objective.lifecycleRecovery ?? objective.lifecycle_recovery ?? false
           }
         ]
       });
@@ -21906,7 +23267,13 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     }
     const readJobById = (id) => readContextFromJobRow("id = ?", [id]);
     const readJobByPrUrl = (url) => readContextFromJobRow("prUrl = ? OR LOWER(prUrl) = LOWER(?)", [url, url]);
-    const row = (objectiveId ? readByObjective(objectiveId) : undefined) ?? (jobId ? readByJob(jobId) : undefined) ?? (requestId ? readByRequest(requestId) : undefined) ?? (prUrl ? readByPrUrl(prUrl) : undefined) ?? (jobId ? readJobById(jobId) : undefined) ?? (prUrl ? readJobByPrUrl(prUrl) : undefined);
+    const resolvedJobLineage = jobId ? this.resolveJobOutcomeContext(jobId, {}) : null;
+    const row = (objectiveId ? readByObjective(objectiveId) : undefined) ?? (jobId ? readByJob(jobId) : undefined) ?? (resolvedJobLineage ? {
+      objectiveId: resolvedJobLineage.objectiveId,
+      requestId: resolvedJobLineage.requestId,
+      jobId,
+      patternKey: resolvedJobLineage.patternKey
+    } : undefined) ?? (requestId ? readByRequest(requestId) : undefined) ?? (prUrl ? readByPrUrl(prUrl) : undefined) ?? (jobId ? readJobById(jobId) : undefined) ?? (prUrl ? readJobByPrUrl(prUrl) : undefined);
     if (!row)
       return null;
     return {
@@ -21929,37 +23296,119 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const normalizedFeedbackPrUrl = normalizePrUrl2(prUrl);
     const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
     const hasJobsTable = this.hasTable("jobs");
-    if (mappedOutcome?.terminal && hasJobsTable && (!jobIdRaw || !normalizedFeedbackPrUrl)) {
+    const explicitlyPrunedAuthority = asBoolean2(body.providerAuthorityPruned ?? body.provider_authority_pruned, false);
+    this.db.prepare(`DELETE FROM autonomy_pr_feedback_tombstones
+         WHERE datetime(last_seen_at) < datetime(?, '-${PROVIDER_TOMBSTONE_RETENTION_DAYS} days')`).run(now);
+    this.db.prepare(`DELETE FROM autonomy_pr_feedback_tombstones
+         WHERE feedback_key IN (
+           SELECT feedback_key
+           FROM autonomy_pr_feedback_tombstones
+           ORDER BY datetime(last_seen_at) DESC, feedback_key ASC
+           LIMIT -1 OFFSET ?
+         )`).run(PROVIDER_TOMBSTONE_MAX_ROWS);
+    const tombstonePayloadHash = feedbackKey ? sha256Hex(JSON.stringify({
+      verdict,
+      objectiveId: objectiveIdRaw,
+      requestId: requestIdRaw,
+      jobId: jobIdRaw,
+      prUrl: normalizedFeedbackPrUrl
+    })) : null;
+    const persistProviderTombstone = (reason, disposition) => {
+      if (feedbackKey && tombstonePayloadHash) {
+        this.db.prepare(`INSERT INTO autonomy_pr_feedback_tombstones (
+               feedback_key, reason, payload_hash, disposition,
+               occurrence_count, first_seen_at, last_seen_at
+             ) VALUES (?, ?, ?, ?, 1, ?, ?)
+             ON CONFLICT(feedback_key) DO UPDATE SET
+               reason = excluded.reason,
+               disposition = CASE
+                 WHEN autonomy_pr_feedback_tombstones.disposition = 'permanent'
+                   THEN 'permanent'
+                 ELSE excluded.disposition
+               END,
+               occurrence_count = autonomy_pr_feedback_tombstones.occurrence_count + 1,
+               last_seen_at = excluded.last_seen_at`).run(feedbackKey, reason, tombstonePayloadHash, disposition, now, now);
+        this.db.prepare(`DELETE FROM autonomy_pr_feedback_tombstones
+             WHERE feedback_key IN (
+               SELECT feedback_key
+               FROM autonomy_pr_feedback_tombstones
+               ORDER BY datetime(last_seen_at) DESC, feedback_key ASC
+               LIMIT -1 OFFSET ?
+             )`).run(PROVIDER_TOMBSTONE_MAX_ROWS);
+      }
+    };
+    const acknowledgePermanentIgnore = (reason, deduped = false) => {
+      persistProviderTombstone(reason, "permanent");
       return {
         ok: true,
         ignored: true,
-        reason: "terminal PR feedback requires matching jobId and prUrl authority"
+        acknowledged: true,
+        ...deduped ? { deduped: true } : {},
+        reason
       };
+    };
+    const acknowledgeRetryableAuthorityGap = (reason) => {
+      persistProviderTombstone(reason, "retryable");
+      const observation = feedbackKey ? this.db.prepare(`SELECT occurrence_count AS occurrenceCount, first_seen_at AS firstSeenAt
+               FROM autonomy_pr_feedback_tombstones
+               WHERE feedback_key = ?
+               LIMIT 1`).get(feedbackKey) : undefined;
+      const occurrenceCount = Math.max(1, Math.floor(asNumber(observation?.occurrenceCount, 1)));
+      const firstSeenMs = Date.parse(asString3(observation?.firstSeenAt));
+      if (explicitlyPrunedAuthority || occurrenceCount >= PROVIDER_AUTHORITY_GAP_MAX_OCCURRENCES && Number.isFinite(firstSeenMs) && Date.parse(now) - firstSeenMs >= PROVIDER_AUTHORITY_GAP_STALE_MS) {
+        if (feedbackKey) {
+          this.db.prepare(`UPDATE autonomy_pr_feedback_tombstones
+               SET disposition = 'permanent', reason = ?, last_seen_at = ?
+               WHERE feedback_key = ?`).run(reason, now, feedbackKey);
+        }
+        return {
+          ok: true,
+          ignored: true,
+          acknowledged: true,
+          deduped: true,
+          reason
+        };
+      }
+      return {
+        ok: true,
+        ignored: true,
+        acknowledged: false,
+        retryable: true,
+        reason
+      };
+    };
+    if (feedbackKey) {
+      const tombstone = this.db.prepare(`SELECT reason, payload_hash AS payloadHash, disposition
+           FROM autonomy_pr_feedback_tombstones
+           WHERE feedback_key = ?
+           LIMIT 1`).get(feedbackKey);
+      if (tombstone) {
+        if (asString3(tombstone.payloadHash) !== tombstonePayloadHash) {
+          return {
+            ok: false,
+            reason: "feedbackKey identifies a different tombstoned provider observation"
+          };
+        }
+        if (asString3(tombstone.disposition) !== "retryable") {
+          return acknowledgePermanentIgnore(asString3(tombstone.reason), true);
+        }
+      }
+    }
+    if (mappedOutcome?.terminal && hasJobsTable && (!jobIdRaw || !normalizedFeedbackPrUrl)) {
+      return acknowledgePermanentIgnore("terminal PR feedback requires matching jobId and prUrl authority");
     }
     let persistedJobPrUrl = null;
     if (jobIdRaw && normalizedFeedbackPrUrl && hasJobsTable) {
       const providerJob = this.db.prepare(`SELECT prUrl FROM jobs WHERE id = ? LIMIT 1`).get(jobIdRaw);
       if (!providerJob) {
-        return {
-          ok: true,
-          ignored: true,
-          reason: "PR feedback jobId does not identify a persisted job"
-        };
+        return acknowledgeRetryableAuthorityGap("PR feedback jobId does not identify a persisted job");
       }
       persistedJobPrUrl = normalizePrUrl2(providerJob.prUrl);
       if (persistedJobPrUrl && persistedJobPrUrl !== normalizedFeedbackPrUrl) {
-        return {
-          ok: true,
-          ignored: true,
-          reason: "PR feedback URL does not match the persisted job PR URL"
-        };
+        return acknowledgePermanentIgnore("PR feedback URL does not match the persisted job PR URL");
       }
       if (mappedOutcome?.terminal && !persistedJobPrUrl) {
-        return {
-          ok: true,
-          ignored: true,
-          reason: "terminal PR feedback requires a persisted job-to-PR link"
-        };
+        return acknowledgeRetryableAuthorityGap("terminal PR feedback requires a persisted job-to-PR link");
       }
       if (mappedOutcome?.terminal && !mappedOutcome.success) {
         const latestJob = this.db.prepare(`SELECT id
@@ -21968,12 +23417,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
              ORDER BY rowid DESC
              LIMIT 1`).get(normalizedFeedbackPrUrl);
         if (!latestJob || latestJob.id !== jobIdRaw) {
-          return {
-            ok: true,
-            ignored: true,
-            acknowledged: true,
-            reason: "closed PR feedback belongs to an older job generation"
-          };
+          return acknowledgePermanentIgnore("closed PR feedback belongs to an older job generation");
         }
       }
     }
@@ -21986,11 +23430,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     });
     const identityMismatch = objectiveIdRaw && resolvedFromJob?.objectiveId && objectiveIdRaw !== resolvedFromJob.objectiveId || requestIdRaw && resolvedFromJob?.requestId && requestIdRaw !== resolvedFromJob.requestId || patternKey && resolvedFromJob?.patternKey && patternKey !== resolvedFromJob.patternKey;
     if (identityMismatch) {
-      return {
-        ok: true,
-        ignored: true,
-        reason: "PR feedback identifiers do not match the persisted job context"
-      };
+      return acknowledgePermanentIgnore("PR feedback identifiers do not match the persisted job context");
     }
     if (!patternKey) {
       patternKey = asString3(resolved?.patternKey) || null;
@@ -22054,18 +23494,9 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     if (!patternKey) {
       if (mappedOutcome?.terminal && persistedJobPrUrl) {
         persistProviderOutcome(jobIdRaw);
-        return {
-          ok: true,
-          ignored: true,
-          acknowledged: true,
-          reason: "provider outcome recorded for a non-autonomy job"
-        };
+        return acknowledgePermanentIgnore("provider outcome recorded for a non-autonomy job");
       }
-      return {
-        ok: true,
-        ignored: true,
-        reason: "unable to resolve patternKey from objectiveId/requestId/jobId/prUrl"
-      };
+      return acknowledgePermanentIgnore("unable to resolve patternKey from objectiveId/requestId/jobId/prUrl");
     }
     const objectiveId = objectiveIdRaw ?? resolved?.objectiveId ?? null;
     const requestId = requestIdRaw ?? resolved?.requestId ?? null;
@@ -22099,6 +23530,10 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           comments_json, source, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(feedbackKey, objectiveId, requestId, jobId, patternKey, prNumber, prUrl, normalizedFeedbackPrUrl, verdict, reviewScore, reviewThreshold, summary || null, commentCount, comments.length > 0 ? JSON.stringify(comments) : null, source, now);
     const inserted = Number(insertInfo.changes ?? 0) > 0;
+    if (feedbackKey) {
+      this.db.prepare(`DELETE FROM autonomy_pr_feedback_tombstones
+           WHERE feedback_key = ? AND disposition = 'retryable'`).run(feedbackKey);
+    }
     if (!inserted) {
       const existingFeedback = feedbackKey ? this.db.prepare(`SELECT objective_id, request_id, job_id, pattern_key, pr_url_normalized, verdict
                FROM autonomy_pr_feedback
@@ -22239,7 +23674,21 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const now = asIsoNow();
     const success = asBoolean2(body.success, false);
     const retries = Math.max(0, Math.floor(asNumber(body.retries, 0)));
-    const latencyMs = Number.isFinite(asNumber(body.latencyMs ?? body.latency_ms, Number.NaN)) ? Math.max(0, Math.floor(asNumber(body.latencyMs ?? body.latency_ms, 0))) : null;
+    const reportedLatencyMs = Number.isFinite(asNumber(body.latencyMs ?? body.latency_ms, Number.NaN)) ? Math.max(0, Math.floor(asNumber(body.latencyMs ?? body.latency_ms, 0))) : null;
+    const lifecycleStart = objectiveId ? this.db.prepare(`SELECT created_at AS createdAt, dispatched_at AS dispatchedAt
+             FROM autonomy_objectives
+             WHERE id = ?
+             LIMIT 1`).get(objectiveId) : undefined;
+    const jobStart = jobId && this.hasTable("jobs") ? this.db.prepare(`SELECT enqueuedAt, createdAt FROM jobs WHERE id = ? LIMIT 1`).get(jobId) : undefined;
+    const startCandidates = [
+      lifecycleStart?.createdAt,
+      lifecycleStart?.dispatchedAt,
+      jobStart?.enqueuedAt,
+      jobStart?.createdAt
+    ].map((value) => Date.parse(asString3(value))).filter((value) => Number.isFinite(value));
+    const nowMs = Date.parse(now);
+    const endToEndLatencyMs = startCandidates.length > 0 && Number.isFinite(nowMs) ? Math.max(0, Math.floor(nowMs - Math.min(...startCandidates))) : null;
+    const latencyMs = reportedLatencyMs != null && endToEndLatencyMs != null ? Math.max(reportedLatencyMs, endToEndLatencyMs) : reportedLatencyMs ?? endToEndLatencyMs;
     const userAction = asString3(body.userAction ?? body.user_action) || null;
     const reopenedWithin24h = asBoolean2(body.reopenedWithin24h ?? body.reopened_within_24h, false);
     const regressionFlag = asBoolean2(body.regressionFlag ?? body.regression_flag, false);
@@ -22460,26 +23909,18 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           updated_at = excluded.updated_at`).run(patternKey, ema(prev.ema_success, successValue), ema(prev.ema_user_accept, userAcceptValue), ema(prev.ema_latency, latencyScore), ema(prev.ema_regret, regretValue), nextFailStreak, cooldownUntil, prev.sample_count + 1, now);
     const autoFreezeThreshold = Math.max(1, Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeFailStreakThreshold, 3)));
     if (!success && nextFailStreak >= autoFreezeThreshold) {
-      const freezeForMs = Math.max(60000, Math.floor(asNumber(this.config.remotebuddy.autonomy.autoFreezeDurationMs, 1800000)));
-      const freezeResult = this.applyAutomaticFreeze({
-        freezeForMs,
-        freezeReason: `auto_freeze:fail_streak:${patternKey}`,
+      this.recordOpsAlert({
+        alertType: `autonomy_lane_constrained:${patternKey}`,
+        severity: "warning",
+        message: `Autonomy lane constrained after fail streak ${nextFailStreak} ` + `for ${patternKey} (threshold ${autoFreezeThreshold})`,
+        details: {
+          patternKey,
+          failStreak: nextFailStreak,
+          threshold: autoFreezeThreshold,
+          cooldownUntil
+        },
         nowIso: now
       });
-      if (freezeResult.applied) {
-        this.recordOpsAlert({
-          alertType: "auto_freeze_fail_streak",
-          severity: "critical",
-          message: `Auto-freeze triggered by fail streak ${nextFailStreak} ` + `for ${patternKey} (threshold ${autoFreezeThreshold})`,
-          details: {
-            patternKey,
-            failStreak: nextFailStreak,
-            threshold: autoFreezeThreshold,
-            freezeUntil: freezeResult.state.freezeUntil
-          },
-          nowIso: now
-        });
-      }
     }
     this.maybeRunEvaluator(now);
     return { ok: true };
@@ -22758,10 +24199,12 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     }
     const revisionCountByObjective = new Map;
     const closedObjectiveIds = new Set;
+    const reviewedObjectiveIds = new Set;
     for (const row of portfolioFeedbackRows) {
       const objectiveId2 = asString3(row.objective_id);
       if (!objectiveId2)
         continue;
+      reviewedObjectiveIds.add(objectiveId2);
       const verdict = asString3(row.verdict).toLowerCase();
       if (verdict.includes("reject") || verdict.includes("unmergeable") || verdict.includes("merge_conflict") || verdict.includes("changes_requested") || verdict.includes("revision")) {
         revisionCountByObjective.set(objectiveId2, (revisionCountByObjective.get(objectiveId2) ?? 0) + 1);
@@ -22776,6 +24219,11 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
     const reviewRevisionCount = [...revisionCountByObjective.values()].reduce((sum, count) => sum + count, 0);
     const firstPassMergeCount = mergedObjectiveIds.filter((objectiveId2) => (revisionCountByObjective.get(objectiveId2) ?? 0) === 0).length;
     const resolvedObjectiveCount = mergedObjectiveIds.length + closedUnmergedObjectiveCount;
+    const reviewObservedObjectiveCount = new Set([
+      ...reviewedObjectiveIds,
+      ...mergedObjectiveIds,
+      ...closedObjectiveIds
+    ]).size;
     const awaitingReviewRows = portfolioObjectiveRows.filter((row) => asString3(row.status) === "awaiting_review");
     const nowMs = Date.parse(now);
     const oldestAwaitingAtMs = Math.min(...awaitingReviewRows.map((row) => Date.parse(asString3(row.updated_at))).filter(Number.isFinite));
@@ -22791,7 +24239,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       mergedObjectiveCount: mergedObjectiveIds.length,
       closedUnmergedObjectiveCount,
       reviewRevisionCount,
-      firstPassMergeRate: resolvedObjectiveCount > 0 ? firstPassMergeCount / resolvedObjectiveCount : null
+      firstPassMergeRate: reviewObservedObjectiveCount > 0 ? firstPassMergeCount / reviewObservedObjectiveCount : null
     };
     return {
       patternStats: patternStatsRows.map((row) => ({
@@ -23085,7 +24533,8 @@ Apply this clarification while keeping changes scoped to the existing objective 
   findObjectiveByJobId(jobId) {
     if (!jobId)
       return null;
-    const row = this.db.prepare(`SELECT id AS objectiveId, pattern_key AS patternKey, session_id AS sessionId, run_id AS runId, snapshot_id AS snapshotId
+    const row = this.db.prepare(`SELECT id AS objectiveId, pattern_key AS patternKey, request_id AS requestId,
+                session_id AS sessionId, run_id AS runId, snapshot_id AS snapshotId
          FROM autonomy_objectives
          WHERE job_id = ?
          ORDER BY updated_at DESC
@@ -23093,24 +24542,66 @@ Apply this clarification while keeping changes scoped to the existing objective 
     return row ?? null;
   }
   resolveJobOutcomeContext(jobId, params) {
-    const matched = this.findObjectiveByJobId(jobId);
-    if (matched) {
-      return {
-        objectiveId: matched.objectiveId,
-        requestId: asString3(params.requestId) || null,
-        patternKey: matched.patternKey
-      };
-    }
-    const autonomy = asObject2(params.autonomy);
-    const origin = asString3(params.origin ?? autonomy.origin).toLowerCase();
-    const patternKey = asString3(autonomy.patternKey ?? autonomy.pattern_key);
-    if (origin !== "autonomy" || !patternKey)
+    const visited = new Set;
+    const resolve6 = (currentJobId, currentParams) => {
+      if (!currentJobId || visited.has(currentJobId) || visited.size >= 16)
+        return null;
+      visited.add(currentJobId);
+      const matched = this.findObjectiveByJobId(currentJobId);
+      if (matched) {
+        return {
+          objectiveId: matched.objectiveId,
+          requestId: asString3(currentParams?.requestId ?? currentParams?.request_id) || asString3(matched.requestId) || null,
+          patternKey: matched.patternKey
+        };
+      }
+      const row = this.hasTable("jobs") ? this.db.prepare(`SELECT params, resumeOfJobId FROM jobs WHERE id = ? LIMIT 1`).get(currentJobId) : undefined;
+      const resolvedParams = currentParams && Object.keys(currentParams).length > 0 ? currentParams : parseJsonObject(row?.params ?? null);
+      const autonomy = asObject2(resolvedParams.autonomy);
+      const origin = asString3(resolvedParams.origin ?? autonomy.origin).toLowerCase();
+      const patternKey = asString3(autonomy.patternKey ?? autonomy.pattern_key);
+      const localObjectiveId = asString3(autonomy.objectiveId ?? autonomy.objective_id);
+      const localRequestId = asString3(resolvedParams.requestId ?? resolvedParams.request_id);
+      if (origin === "autonomy" && patternKey && localObjectiveId) {
+        return {
+          objectiveId: localObjectiveId,
+          requestId: localRequestId || null,
+          patternKey
+        };
+      }
+      if (localRequestId) {
+        const requestObjective = this.findObjectiveByRequestId(localRequestId);
+        if (requestObjective) {
+          return {
+            objectiveId: requestObjective.objectiveId,
+            requestId: localRequestId,
+            patternKey: requestObjective.patternKey
+          };
+        }
+      }
+      const reviewAgent = asObject2(resolvedParams.reviewAgent);
+      const recovery = asObject2(resolvedParams.recovery);
+      const parents = [
+        asString3(reviewAgent.sourceJobId ?? reviewAgent.source_job_id),
+        asString3(reviewAgent.recoverySourceJobId ?? reviewAgent.recovery_source_job_id),
+        asString3(recovery.previousJobId ?? recovery.previous_job_id),
+        asString3(row?.resumeOfJobId)
+      ].filter(Boolean);
+      for (const parentJobId of parents) {
+        const parent = resolve6(parentJobId);
+        if (parent)
+          return parent;
+      }
+      if (origin === "autonomy" && patternKey) {
+        return {
+          objectiveId: localObjectiveId || null,
+          requestId: localRequestId || null,
+          patternKey
+        };
+      }
       return null;
-    return {
-      objectiveId: asString3(autonomy.objectiveId ?? autonomy.objective_id) || null,
-      requestId: asString3(params.requestId ?? params.request_id) || null,
-      patternKey
     };
+    return resolve6(jobId, params);
   }
   linkJobToObjectiveByRequest(requestId, jobId) {
     if (!requestId || !jobId)
@@ -23249,15 +24740,23 @@ Apply this clarification while keeping changes scoped to the existing objective 
   }
   markObjectiveDispatched(objectiveId, requestId) {
     if (!objectiveId || !requestId)
-      return;
+      return false;
     const now = asIsoNow();
-    this.db.prepare(`UPDATE autonomy_objectives
+    const result = this.db.prepare(`UPDATE autonomy_objectives
          SET status = 'dispatched',
              request_id = ?,
              block_reason = NULL,
              dispatched_at = COALESCE(dispatched_at, ?),
              updated_at = ?
-         WHERE id = ?`).run(requestId, now, now, objectiveId);
+         WHERE id = ?
+           AND (
+             status = 'gated'
+             OR (
+               status = 'dispatched'
+               AND (request_id IS NULL OR request_id = '')
+             )
+           )`).run(requestId, now, now, objectiveId);
+    return result.changes > 0;
   }
   validateObjectiveReservation(input) {
     const row = this.db.prepare(`SELECT session_id AS sessionId, run_id AS runId, snapshot_id AS snapshotId, status
@@ -23288,11 +24787,15 @@ Apply this clarification while keeping changes scoped to the existing objective 
         const request = this.db.prepare(`SELECT id
              FROM requests
              WHERE idempotencyKey = ?
+               AND (
+                 dispatchConfirmationToken IS NULL
+                 OR dispatchConfirmedAt IS NOT NULL
+               )
              ORDER BY createdAt DESC
              LIMIT 1`).get(`autonomy:${row.id}`);
         if (request?.id) {
-          this.markObjectiveDispatched(row.id, request.id);
-          linked += 1;
+          if (this.markObjectiveDispatched(row.id, request.id))
+            linked += 1;
           continue;
         }
         const createdMs = Date.parse(row.createdAt);
@@ -23551,7 +25054,7 @@ Apply this clarification while keeping changes scoped to the existing objective 
         terminalStage: row.terminalStage,
         summary: row.diagnosticSummary
       });
-      return directNegative || ["quality_rejected", "validation_blocked", "no_change"].includes(classified);
+      return directNegative || ["product_quality_failed", "validation_blocked", "no_change"].includes(classified);
     });
     const candidates = [...providerRows, ...successfulJobRows, ...eligibleNegativeJobRows].sort((left, right) => right.eventAt.localeCompare(left.eventAt)).slice(0, 500);
     for (const row of candidates) {
@@ -24208,8 +25711,28 @@ class SqliteMemoryStore {
     const tags = normalizeList(input.tags, MEMORY_LIMITS.listItems, MEMORY_LIMITS.tagChars);
     const evidence = normalizeEvidence2(input.evidence);
     const requestedStatus = ALL_MEMORY_STATUSES.includes(input.status) ? input.status : undefined;
-    const now = new Date().toISOString();
+    const assertCommitFence = () => {
+      if (options.signal?.aborted) {
+        throw options.signal.reason instanceof Error ? options.signal.reason : new DOMException("The memory write was aborted", "AbortError");
+      }
+      const commitNowMs = Date.now();
+      if (options.validUntil !== undefined) {
+        if (typeof options.validUntil !== "string") {
+          throw new TypeError("validUntil must be an ISO timestamp");
+        }
+        const validUntilMs = Date.parse(options.validUntil);
+        if (!Number.isFinite(validUntilMs)) {
+          throw new TypeError("validUntil must be an ISO timestamp");
+        }
+        if (validUntilMs <= commitNowMs) {
+          throw new Error("Memory write commit fence expired before mutation");
+        }
+      }
+      return commitNowMs;
+    };
     const tx = this.db.transaction(() => {
+      const commitNowMs = assertCommitFence();
+      const now = new Date(commitNowMs).toISOString();
       const existing = this.rowForAddress({ scope, key });
       const expected = options.expectedRevision;
       if (expected !== undefined) {
@@ -24235,21 +25758,25 @@ class SqliteMemoryStore {
       const invalidationReason = status === "invalid" && remainsInvalid ? existing?.invalidationReason ?? null : null;
       if (!existing) {
         const id = randomUUID7();
+        assertCommitFence();
         this.db.prepare(`INSERT INTO memory_records (
                id, namespace, repositoryId, sessionId, memoryKey, kind, subjectKey,
                summary, valueJson, tagsJson, evidenceJson, provenanceJson,
                confidence, usefulness, status, revision, createdAt, updatedAt,
                expiresAt, invalidatedAt, invalidationReason
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`).run(id, scope.namespace, scope.repositoryId ?? "", scope.sessionId ?? "", key, kind, compact(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null, summary, input.value === undefined ? null : JSON.stringify(input.value), JSON.stringify(tags), JSON.stringify(evidence), JSON.stringify(provenance), clampUnit2(input.confidence, 0.5), clampUnit2(input.usefulness, 0.5), status, now, now, expiresAt, invalidatedAt, invalidationReason);
+        assertCommitFence();
         return this.rowForAddress({ scope, key });
       }
       const preserveLearnedScores = options.expectedRevision === undefined;
+      assertCommitFence();
       this.db.prepare(`UPDATE memory_records SET
              kind = ?, subjectKey = ?, summary = ?, valueJson = ?, tagsJson = ?,
              evidenceJson = ?, confidence = ?, usefulness = ?,
              status = ?, revision = revision + 1, updatedAt = ?, expiresAt = ?,
              invalidatedAt = ?, invalidationReason = ?
            WHERE id = ?`).run(kind, compact(input.subjectKey, MEMORY_LIMITS.subjectKeyChars) || null, summary, input.value === undefined ? null : JSON.stringify(input.value), JSON.stringify(tags), JSON.stringify(evidence), preserveLearnedScores ? existing.confidence : clampUnit2(input.confidence, existing.confidence), preserveLearnedScores ? existing.usefulness : clampUnit2(input.usefulness, existing.usefulness), status, now, expiresAt, invalidatedAt, invalidationReason, existing.id);
+      assertCommitFence();
       return this.rowForAddress({ scope, key });
     });
     return this.hydrateRecord(tx());
@@ -24461,7 +25988,7 @@ var RETRY_MAX_DELAY_MS = 30000;
 var MAINTENANCE_INTERVAL_MS = 5 * 60000;
 var MAINTENANCE_PRUNE_LIMIT = 500;
 var HEALTH_PENDING_UNHEALTHY_AFTER_MS = 5 * 60000;
-function canonicalJson(value, ancestors = new Set) {
+function canonicalJson2(value, ancestors = new Set) {
   if (value === null)
     return "null";
   if (typeof value === "string" || typeof value === "boolean")
@@ -24472,7 +25999,7 @@ function canonicalJson(value, ancestors = new Set) {
     if (ancestors.has(value))
       throw new TypeError("RepositoryAgent request must not be cyclic");
     ancestors.add(value);
-    const encoded = `[${value.map((entry) => entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? "null" : canonicalJson(entry, ancestors)).join(",")}]`;
+    const encoded = `[${value.map((entry) => entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? "null" : canonicalJson2(entry, ancestors)).join(",")}]`;
     ancestors.delete(value);
     return encoded;
   }
@@ -24483,7 +26010,7 @@ function canonicalJson(value, ancestors = new Set) {
     const record = value;
     const encoded = `{${Object.keys(record).sort().flatMap((key) => {
       const entry = record[key];
-      return entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? [] : [`${JSON.stringify(key)}:${canonicalJson(entry, ancestors)}`];
+      return entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? [] : [`${JSON.stringify(key)}:${canonicalJson2(entry, ancestors)}`];
     }).join(",")}}`;
     ancestors.delete(value);
     return encoded;
@@ -24492,7 +26019,7 @@ function canonicalJson(value, ancestors = new Set) {
 }
 function fingerprintRequest(input) {
   const deadlineMs = Date.parse(input.deadlineAt);
-  const canonical = canonicalJson({
+  const canonical = canonicalJson2({
     schema: "pushpals-repository-agent-idempotency-v1",
     sessionId: String(input.sessionId ?? "").trim(),
     callerService: String(input.callerService ?? "").trim(),
@@ -25066,10 +26593,10 @@ class RepositoryAgentQueue {
 }
 
 // apps/server/src/repository_agent_context.ts
-import { existsSync as existsSync3, realpathSync as realpathSync3, statSync as statSync3 } from "fs";
-import { resolve as resolve5 } from "path";
+import { existsSync as existsSync3, realpathSync as realpathSync3, statSync as statSync4 } from "fs";
+import { resolve as resolve6 } from "path";
 function canonicalPath2(path) {
-  const resolved = resolve5(path);
+  const resolved = resolve6(path);
   const canonical = existsSync3(resolved) ? realpathSync3.native(resolved) : resolved;
   const normalized = canonical.replace(/\\/g, "/").replace(/\/+$/, "");
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -25104,7 +26631,7 @@ async function registeredWorktrees(canonicalRepoRoot) {
       if (!raw || !existsSync3(raw))
         continue;
       try {
-        if (!statSync3(raw).isDirectory())
+        if (!statSync4(raw).isDirectory())
           continue;
         current = { root: canonicalPath2(raw), head: null };
       } catch {}
@@ -25142,7 +26669,7 @@ async function resolveRepositoryAgentContext(options) {
   let requestedRootMapped = Boolean(requestedRoot && canonicalPath2(requestedRoot) !== canonicalRepoRoot);
   let exactHostRootSelected = false;
   if (requestedRoot && existsSync3(requestedRoot)) {
-    if (!statSync3(requestedRoot).isDirectory()) {
+    if (!statSync4(requestedRoot).isDirectory()) {
       throw new Error("RepositoryAgent requested repository root is not a directory");
     }
     const canonicalRequestedRoot = canonicalPath2(requestedRoot);
@@ -25585,15 +27112,15 @@ class ClientPresenceRegistry {
 
 // apps/server/src/server_main.ts
 import { randomUUID as randomUUID9 } from "crypto";
-import { mkdirSync as mkdirSync2 } from "fs";
+import { mkdirSync as mkdirSync3 } from "fs";
 
 // apps/server/src/runtime_config.ts
-import { existsSync as existsSync4, mkdirSync, readFileSync as readFileSync4, writeFileSync } from "fs";
-import { dirname as dirname2, join as join3, relative } from "path";
+import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync5, writeFileSync as writeFileSync2 } from "fs";
+import { dirname as dirname2, join as join4, relative } from "path";
 function getRuntimeConfigFiles(config) {
   return {
-    envPath: join3(config.projectRoot, ".env"),
-    localTomlPath: join3(config.configDir, "local.toml"),
+    envPath: join4(config.projectRoot, ".env"),
+    localTomlPath: join4(config.configDir, "local.toml"),
     projectRoot: config.projectRoot
   };
 }
@@ -25681,7 +27208,7 @@ function normalizeTomlKey(rawKey) {
 }
 function patchEnvFile(path, changes) {
   ensureParentDir(path);
-  const original = existsSync4(path) ? readFileSync4(path, "utf8") : "";
+  const original = existsSync4(path) ? readFileSync5(path, "utf8") : "";
   const eol = detectEol(original);
   const lines = original.length > 0 ? original.split(/\r?\n/) : [];
   const indexByKey = new Map;
@@ -25701,7 +27228,7 @@ function patchEnvFile(path, changes) {
     }
   }
   const nextText = lines.join(eol).replace(/\s+$/g, "");
-  writeFileSync(path, `${nextText}${eol}`, "utf8");
+  writeFileSync2(path, `${nextText}${eol}`, "utf8");
 }
 function parseEnvAssignment(line) {
   const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
@@ -25719,14 +27246,14 @@ function serializeEnvValue(value) {
 }
 function patchTomlFile(path, changes) {
   ensureParentDir(path);
-  const original = existsSync4(path) ? readFileSync4(path, "utf8") : "";
+  const original = existsSync4(path) ? readFileSync5(path, "utf8") : "";
   const eol = detectEol(original);
   const lines = original.length > 0 ? original.split(/\r?\n/) : [];
   for (const change of changes) {
     setTomlValue(lines, change.path, change.value);
   }
   const nextText = lines.join(eol).replace(/\s+$/g, "");
-  writeFileSync(path, `${nextText}${eol}`, "utf8");
+  writeFileSync2(path, `${nextText}${eol}`, "utf8");
 }
 function setTomlValue(lines, path, value) {
   const key = path[path.length - 1];
@@ -25822,7 +27349,7 @@ function serializeTomlValue(value) {
   return JSON.stringify(String(value));
 }
 function ensureParentDir(path) {
-  mkdirSync(dirname2(path), { recursive: true });
+  mkdirSync2(dirname2(path), { recursive: true });
 }
 function detectEol(content) {
   return content.includes(`\r
@@ -25946,6 +27473,8 @@ function extractAutonomyPayloadDetails(value) {
   const snapshotId = compactText3(metadataAutonomy?.snapshotId ?? metadataAutonomy?.snapshot_id ?? paramsAutonomy?.snapshotId ?? paramsAutonomy?.snapshot_id, 128) || null;
   const reservationRequired = Boolean(metadataAutonomy?.reservationRequired === true || metadataAutonomy?.reservation_required === true || paramsAutonomy?.reservationRequired === true || paramsAutonomy?.reservation_required === true);
   const patternKey = compactText3(metadataAutonomy?.patternKey ?? metadataAutonomy?.pattern_key ?? paramsAutonomy?.patternKey ?? paramsAutonomy?.pattern_key, 240) || null;
+  const workClass = compactText3(value.workClass ?? value.work_class ?? planning?.workClass ?? planning?.work_class ?? metadataAutonomy?.workClass ?? metadataAutonomy?.work_class ?? paramsAutonomy?.workClass ?? paramsAutonomy?.work_class, 32).toLowerCase().replace(/[_\s]+/g, "-") || null;
+  const lifecycleRecovery = Boolean(metadataAutonomy?.lifecycleRecovery === true || metadataAutonomy?.lifecycle_recovery === true || paramsAutonomy?.lifecycleRecovery === true || paramsAutonomy?.lifecycle_recovery === true);
   return {
     objectiveId,
     snapshotId,
@@ -25953,6 +27482,8 @@ function extractAutonomyPayloadDetails(value) {
     reservationRequired,
     validationIncidentId,
     isValidationIncidentRepair: Boolean(validationIncidentId),
+    workClass,
+    isRecoveryWork: Boolean(validationIncidentId) || lifecycleRecovery || workClass === "recovery" || workClass === "repair",
     targetPaths: stringValues(metadataAutonomy?.targetPaths, metadataAutonomy?.target_paths, metadataAutonomy?.targetPath, metadataAutonomy?.target_path, paramsAutonomy?.targetPaths, paramsAutonomy?.target_paths, paramsAutonomy?.targetPath, paramsAutonomy?.target_path, params.paths, params.path, params.targetPaths, params.target_paths, params.targetPath, params.target_path, planning?.targetPaths, planning?.target_paths, planning?.targetPath, planning?.target_path, value.targetPaths, value.target_paths, value.targetPath, value.target_path),
     writeGlobs: stringValues(metadataAutonomy?.writeGlobs, metadataAutonomy?.write_globs, metadataAutonomy?.writeGlob, metadataAutonomy?.write_glob, paramsAutonomy?.writeGlobs, paramsAutonomy?.write_globs, paramsAutonomy?.writeGlob, paramsAutonomy?.write_glob, scope?.writeGlobs, scope?.write_globs, scope?.writeGlob, scope?.write_glob)
   };
@@ -26002,7 +27533,7 @@ class LifecycleReconciliationTracker {
 // apps/server/src/server_main.ts
 var STARTUP_CONFIG = loadPushPalsConfig();
 var dataDir = STARTUP_CONFIG.paths.dataDir;
-mkdirSync2(dataDir, { recursive: true });
+mkdirSync3(dataDir, { recursive: true });
 var sharedDbPath = STARTUP_CONFIG.paths.sharedDbPath;
 var sessionManager = new SessionManager(sharedDbPath);
 var jobQueue = new JobQueue(sharedDbPath);
@@ -26019,6 +27550,14 @@ var repositoryServices = createRepositoryAgentServiceClients({
   memoryStore
 });
 var repositoryAgentRepoRoot = detectRepoRoot(process.cwd());
+var scmRepairAuthoritySecret = null;
+try {
+  scmRepairAuthoritySecret = resolveScmRepairAuthoritySecret({ dataDir });
+} catch (error) {
+  console.error(`[Server] SCM repair authority is unavailable; review-repair admission will remain closed: ${error instanceof Error ? error.message : String(error)}`);
+} finally {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
+}
 var reconciliationTracker = new LifecycleReconciliationTracker;
 function guardedReconciliation(label, fallback, reconcile) {
   return reconciliationTracker.run(label, fallback, reconcile, (detail) => {
@@ -26036,7 +27575,9 @@ var requestHandoffChainReconciliation = guardedReconciliation("request retry cha
   depthLimitReached: 0
 }, () => requestQueue.reconcileRecoveredWorkerHandoffChains());
 var requestLeaseReconciliation = guardedReconciliation("request lease", { recovered: 0, requestIds: [] }, () => requestQueue.recoverExpiredClaims());
+var requestDispatchConfirmationReconciliation = guardedReconciliation("request dispatch confirmation", { expired: 0, requestIds: [] }, () => requestQueue.expireUnconfirmedDispatches());
 var completionLeaseReconciliation = guardedReconciliation("completion lease", { recovered: 0, completionIds: [] }, () => completionQueue.recoverExpiredClaims());
+var reviewRepairReconciliation = guardedReconciliation("review repair lifecycle", { scanned: 0, rearmed: 0, exhausted: 0 }, () => jobQueue.reconcileReviewRepairLifecycles());
 var repositoryAgentLeaseReconciliation = guardedReconciliation("repository agent lease", { recovered: 0, requestIds: [] }, () => repositoryAgentQueue.recoverExpiredClaims());
 guardedReconciliation("repository agent deadlines", 0, () => repositoryAgentQueue.expirePastDeadlines());
 var lifecycleReconciliation = guardedReconciliation("completion lifecycle", { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 }, () => autonomyStore.reconcileJobLinkedOutcomeLifecycle());
@@ -26047,6 +27588,9 @@ if (lifecycleReconciliation.correctedFailures > 0 || lifecycleReconciliation.rem
 }
 if (reservationReconciliation.linked > 0 || reservationReconciliation.failed > 0) {
   console.warn(`[Server] Reconciled autonomy objective reservations: ${JSON.stringify(reservationReconciliation)}`);
+}
+if (requestDispatchConfirmationReconciliation.expired > 0) {
+  console.warn(`[Server] Expired provisional autonomy dispatches during startup: ${JSON.stringify(requestDispatchConfirmationReconciliation)}`);
 }
 if (handoffReconciliation.linked > 0 || handoffReconciliation.failed > 0) {
   console.warn(`[Server] Reconciled autonomy worker handoffs: ${JSON.stringify(handoffReconciliation)}`);
@@ -26065,6 +27609,9 @@ if (requestHandoffChainReconciliation.cycleDetected > 0 || requestHandoffChainRe
 }
 if (completionLeaseReconciliation.recovered > 0) {
   console.warn(`[Server] Requeued ${completionLeaseReconciliation.recovered} completion(s) with expired publication leases.`);
+}
+if (reviewRepairReconciliation.rearmed > 0) {
+  console.warn(`[Server] Re-armed ${reviewRepairReconciliation.rearmed} stranded review repair lifecycle(s).`);
 }
 if (repositoryAgentLeaseReconciliation.recovered > 0) {
   console.warn(`[Server] Requeued ${repositoryAgentLeaseReconciliation.recovered} RepositoryAgent request(s) with expired leases.`);
@@ -26097,6 +27644,10 @@ var lifecycleWatchdogTimer = setInterval(() => {
   if (completionLeaseRecovery.recovered > 0) {
     console.warn(`[Server] Periodic watchdog requeued ${completionLeaseRecovery.recovered} completion(s) with expired publication leases.`);
   }
+  const reviewRepairRecovery = guardedReconciliation("review repair lifecycle", { scanned: 0, rearmed: 0, exhausted: 0 }, () => jobQueue.reconcileReviewRepairLifecycles());
+  if (reviewRepairRecovery.rearmed > 0) {
+    console.warn(`[Server] Periodic watchdog re-armed ${reviewRepairRecovery.rearmed} stranded review repair lifecycle(s).`);
+  }
   const repositoryAgentLeaseRecovery = guardedReconciliation("repository agent lease", { recovered: 0, requestIds: [] }, () => repositoryAgentQueue.recoverExpiredClaims());
   const expiredRepositoryAgentRequests = guardedReconciliation("repository agent deadlines", 0, () => repositoryAgentQueue.expirePastDeadlines());
   const repositoryAgentRetention = guardedReconciliation("repository agent retention", { pruned: 0, requestIds: [] }, () => repositoryAgentQueue.pruneTerminal());
@@ -26109,6 +27660,10 @@ var lifecycleWatchdogTimer = setInterval(() => {
   const completionLifecycleRecovery = guardedReconciliation("completion lifecycle", { correctedFailures: 0, removedPrematureSuccesses: 0, correctedObjectives: 0 }, () => autonomyStore.reconcileJobLinkedOutcomeLifecycle());
   if (completionLifecycleRecovery.correctedFailures > 0 || completionLifecycleRecovery.removedPrematureSuccesses > 0 || completionLifecycleRecovery.correctedObjectives > 0) {
     console.warn(`[Server] Periodic completion-lifecycle reconciliation: ${JSON.stringify(completionLifecycleRecovery)}`);
+  }
+  const dispatchConfirmationRecovery = guardedReconciliation("request dispatch confirmation", { expired: 0, requestIds: [] }, () => requestQueue.expireUnconfirmedDispatches());
+  if (dispatchConfirmationRecovery.expired > 0) {
+    console.warn(`[Server] Expired provisional autonomy dispatches: ${JSON.stringify(dispatchConfirmationRecovery)}`);
   }
   const reservationRecovery = guardedReconciliation("autonomy reservation", { linked: 0, failed: 0 }, () => autonomyStore.reconcileGatedObjectiveReservations());
   if (reservationRecovery.linked > 0 || reservationRecovery.failed > 0) {
@@ -26459,7 +28014,11 @@ function createRequestHandler() {
       const corsHeaders = buildLocalCorsHeaders({
         origin: originHeader,
         allowAuthorizationHeader: true,
-        additionalAllowedHeaders: [MEMORY_HTTP_CALLER_HEADER, MEMORY_HTTP_AUTHORITY_HEADER]
+        additionalAllowedHeaders: [
+          MEMORY_HTTP_CALLER_HEADER,
+          MEMORY_HTTP_AUTHORITY_HEADER,
+          SCM_REPAIR_AUTHORITY_HEADER
+        ]
       });
       const jsonHeaders = {
         "Content-Type": "application/json",
@@ -26532,10 +28091,6 @@ function createRequestHandler() {
         const text = value.toLowerCase();
         return text.includes("clarification") || text.includes("clarify") || text.includes("follow-up question") || text.includes("requested clarification");
       };
-      const hasNoChangeSignal = (value) => {
-        const text = value.toLowerCase();
-        return text.includes("no file changes") || text.includes("no changes to commit") || text.includes("no changes made") || text.includes("nothing to commit") || text.includes("modified 0 file") || text.includes("no modified files were detected") || text.includes("no file changes detected");
-      };
       const classifyAutonomyJobCompletion = (body) => {
         const parts = [];
         const summary = compactText4(body.summary, 1400);
@@ -26565,7 +28120,13 @@ function createRequestHandler() {
             regressionFlag: false
           };
         }
-        if (hasNoChangeSignal(combined)) {
+        if (classifyJobTerminalSemantics({
+          status: "completed",
+          result: body.result,
+          summary: body.summary,
+          detail: body.detail,
+          additionalEvidence: [combined]
+        }).noChange) {
           return {
             success: false,
             userAction: "no_change",
@@ -26578,6 +28139,21 @@ function createRequestHandler() {
           userAction: "applied",
           reopenedWithin24h: false,
           regressionFlag: false
+        };
+      };
+      const classifyAutonomyFailureProjection = (body, params) => {
+        const reviewAgent = params.reviewAgent;
+        const isRepairAttempt = Boolean(reviewAgent && typeof reviewAgent === "object" && !Array.isArray(reviewAgent));
+        const terminalDiagnostic = body.diagnostics && typeof body.diagnostics === "object" && !Array.isArray(body.diagnostics) ? body.diagnostics.terminal : null;
+        const text = [
+          body.message,
+          body.detail,
+          terminalDiagnostic && typeof terminalDiagnostic === "object" && !Array.isArray(terminalDiagnostic) ? JSON.stringify(terminalDiagnostic) : terminalDiagnostic
+        ].map((value) => compactText4(value, 1200)).filter(Boolean).join(`
+`);
+        return {
+          terminal: !isRepairAttempt,
+          regressionFlag: body.regressionFlag === true || body.regression_flag === true || /\b(?:product[_ -]?)?regression(?:[_ -]detected)?\b/i.test(text)
         };
       };
       const recordHasAutonomyOrigin = (value) => {
@@ -26601,6 +28177,38 @@ function createRequestHandler() {
           }
         }
         return {};
+      };
+      const recordAutonomyRequestDispatched = (value, requestId) => {
+        const autonomyMetadata = autonomyMetadataFromPayload(value);
+        if (autonomyMetadata.reservationRequired !== true && autonomyMetadata.reservation_required !== true) {
+          return;
+        }
+        const objectiveId = compactText4(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128);
+        if (!objectiveId)
+          return;
+        const transitioned = autonomyStore.markObjectiveDispatched(objectiveId, requestId);
+        if (!transitioned)
+          return;
+        const sessionId = compactText4(value.sessionId, 128);
+        const session = sessionManager.getSession(sessionId);
+        if (!session)
+          return;
+        session.emit({
+          protocolVersion: PROTOCOL_VERSION,
+          id: randomUUID9(),
+          ts: new Date().toISOString(),
+          sessionId,
+          type: "autonomy_objective_dispatched",
+          from: "server:autonomy",
+          payload: {
+            runId: compactText4(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+            snapshotId: compactText4(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128),
+            objectiveId,
+            requestId,
+            patternKey: compactText4(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) || "unknown",
+            origin: "autonomy"
+          }
+        });
       };
       const makeAutonomyReservationResponse = (value) => {
         const autonomyMetadata = autonomyMetadataFromPayload(value);
@@ -26701,6 +28309,7 @@ function createRequestHandler() {
           autonomyStore.linkJobToObjectiveByRequest(requestId, options.jobId);
         const outcomeContext = autonomyStore.resolveJobOutcomeContext(options.jobId, params);
         if (outcomeContext) {
+          const failureProjection = classifyAutonomyFailureProjection({ message: options.message, detail: options.detail }, params);
           autonomyStore.recordOutcome({
             objectiveId: outcomeContext.objectiveId,
             requestId: outcomeContext.requestId ?? requestId,
@@ -26710,7 +28319,8 @@ function createRequestHandler() {
             latencyMs: job.durationMs ?? null,
             userAction: "failed",
             reopenedWithin24h: false,
-            regressionFlag: true
+            regressionFlag: failureProjection.regressionFlag,
+            terminal: failureProjection.terminal
           });
         }
         if (!job.sessionId)
@@ -26795,6 +28405,21 @@ function createRequestHandler() {
           threshold: AUTONOMY_SIMILAR_FAILURE_THRESHOLD
         });
       };
+      const resolveAuthorizedAutonomyRecovery = (value) => {
+        const details = extractAutonomyPayloadDetails(value);
+        const validationIncidentAuthorized = Boolean(details.isValidationIncidentRepair && details.reservationRequired && details.objectiveId && details.validationIncidentId && autonomyStore.authorizesValidationIncidentRepair({
+          objectiveId: details.objectiveId,
+          incidentId: details.validationIncidentId,
+          snapshotId: details.snapshotId
+        }));
+        const repairAdmission = jobQueue.reviewRepairAdmission(value);
+        return {
+          details,
+          repairAdmission,
+          authorized: validationIncidentAuthorized || repairAdmission.authorized,
+          authorizedElevatedWorkClass: validationIncidentAuthorized ? "recovery" : repairAdmission.authorized ? "repair" : undefined
+        };
+      };
       const makeAutonomySimilarFailureResponse = (value) => {
         const similarFailure = autonomySimilarFailureSummary(value);
         if (!similarFailure.blocked)
@@ -26838,6 +28463,18 @@ function createRequestHandler() {
           oldestAgeMs: state.oldestAgeMs
         }, 429);
       };
+      const makeAutonomyRecoveryBackpressureResponse = () => {
+        const recovery = jobQueue.recoveryBackpressureSummary();
+        if (!recovery.blocked)
+          return null;
+        return makeJson({
+          ok: false,
+          code: "autonomy_recovery_backpressure",
+          message: `Autonomy ideation blocked while ${recovery.overdue} deadline-bound ` + `recovery/repair job(s) wait for execution.`,
+          retryAfterMs: 30000,
+          recovery
+        }, 429);
+      };
       const parseRuntimeMutations = (value) => {
         if (!Array.isArray(value))
           return [];
@@ -26867,6 +28504,10 @@ function createRequestHandler() {
           return;
         lastStaleRecoverySweepAt = nowMs;
         autonomyStore.maybeSweepStaleObjectives();
+        const dispatchConfirmationRecovery = requestQueue.expireUnconfirmedDispatches(new Date(nowMs));
+        if (dispatchConfirmationRecovery.expired > 0) {
+          console.warn(`[Server] Expired provisional autonomy dispatches during stale-claim sweep: ${JSON.stringify(dispatchConfirmationRecovery)}`);
+        }
         const reservationRecovery = autonomyStore.reconcileGatedObjectiveReservations();
         if (reservationRecovery.linked > 0 || reservationRecovery.failed > 0) {
           console.warn(`[Server] Reconciled autonomy objective reservations during stale-claim sweep: ${JSON.stringify(reservationRecovery)}`);
@@ -26906,7 +28547,7 @@ function createRequestHandler() {
           if (activeFeedback) {
             await Promise.race([
               activeFeedback.catch(() => {}),
-              new Promise((resolve6) => setTimeout(resolve6, 2000))
+              new Promise((resolve7) => setTimeout(resolve7, 2000))
             ]);
           }
           try {
@@ -27482,6 +29123,32 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             sessionBudget: budgetStatus
           }, 429);
         }
+        let recoveryAuthority = resolveAuthorizedAutonomyRecovery(body);
+        if (recoveryAuthority.repairAdmission.requested && !recoveryAuthority.repairAdmission.terminal && !recoveryAuthority.repairAdmission.authorized) {
+          const scmAuthority = verifyScmRepairAuthorityProof({
+            body,
+            proof: req.headers.get(SCM_REPAIR_AUTHORITY_HEADER),
+            secret: scmRepairAuthoritySecret
+          });
+          if (scmAuthority.ok) {
+            jobQueue.authorizeReviewRepairCapability(body);
+            recoveryAuthority = resolveAuthorizedAutonomyRecovery(body);
+          }
+        }
+        if (recoveryAuthority.repairAdmission.terminal) {
+          return makeJson({
+            ok: false,
+            code: recoveryAuthority.repairAdmission.exhausted ? "review_repair_lifecycle_exhausted" : "review_repair_lifecycle_settled",
+            message: recoveryAuthority.repairAdmission.reason
+          }, 409);
+        }
+        if (recoveryAuthority.repairAdmission.requested && !recoveryAuthority.repairAdmission.authorized) {
+          return makeJson({
+            ok: false,
+            code: "review_repair_capability_required",
+            message: recoveryAuthority.repairAdmission.reason
+          }, 403);
+        }
         const enqueueParams = body.params && typeof body.params === "object" && !Array.isArray(body.params) ? body.params : {};
         const lifecycleRequestId = compactText4(enqueueParams.requestId, 128);
         const lifecycleRequest = lifecycleRequestId ? requestQueue.getRequest(lifecycleRequestId) : null;
@@ -27511,17 +29178,24 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
           if (runtimeCircuitResponse)
             return runtimeCircuitResponse;
-          const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
-          if (failureCircuitResponse)
-            return failureCircuitResponse;
-          const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
-          if (similarFailureResponse)
-            return similarFailureResponse;
-          const publicationResponse = makeAutonomyPublicationBackpressureResponse();
-          if (publicationResponse)
-            return publicationResponse;
+          if (!recoveryAuthority.authorized) {
+            const recoveryBackpressureResponse = makeAutonomyRecoveryBackpressureResponse();
+            if (recoveryBackpressureResponse)
+              return recoveryBackpressureResponse;
+            const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
+            if (failureCircuitResponse)
+              return failureCircuitResponse;
+            const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
+            if (similarFailureResponse)
+              return similarFailureResponse;
+            const publicationResponse = makeAutonomyPublicationBackpressureResponse();
+            if (publicationResponse)
+              return publicationResponse;
+          }
         }
-        const result = jobQueue.enqueue(body);
+        const result = jobQueue.enqueue(body, {
+          authorizedElevatedWorkClass: recoveryAuthority.authorizedElevatedWorkClass
+        });
         return makeJson(result, result.ok ? 201 : 400);
       }
       if (pathname === "/jobs/claim" && method === "POST") {
@@ -28259,9 +29933,9 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           });
           if (enqueueResult.ok && enqueueResult.requestId) {
             resumedRequestId = enqueueResult.requestId;
-            autonomyStore.markObjectiveDispatched(result.resume.objectiveId, enqueueResult.requestId);
+            const dispatchTransitioned = autonomyStore.markObjectiveDispatched(result.resume.objectiveId, enqueueResult.requestId);
             const dispatchSession = sessionManager.getSession(result.resume.sessionId);
-            if (dispatchSession) {
+            if (dispatchTransitioned && dispatchSession) {
               dispatchSession.emit({
                 protocolVersion: PROTOCOL_VERSION,
                 id: randomUUID9(),
@@ -28558,6 +30232,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
           if (outcomeContext) {
+            const failureProjection = classifyAutonomyFailureProjection(body, params);
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -28567,7 +30242,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               latencyMs: result.durationMs ?? null,
               userAction: "failed",
               reopenedWithin24h: false,
-              regressionFlag: true
+              regressionFlag: failureProjection.regressionFlag,
+              terminal: failureProjection.terminal
             });
           }
           if (job?.sessionId) {
@@ -28618,6 +30294,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             autonomyStore.linkJobToObjectiveByRequest(requestId, jobId);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(jobId, params);
           if (outcomeContext) {
+            const failureProjection = classifyAutonomyFailureProjection(body, params);
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -28627,7 +30304,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               latencyMs: result.durationMs ?? null,
               userAction: "failed",
               reopenedWithin24h: false,
-              regressionFlag: true
+              regressionFlag: failureProjection.regressionFlag,
+              terminal: failureProjection.terminal
             });
           }
           if (job?.sessionId) {
@@ -28728,27 +30406,48 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
             sessionBudget: budgetStatus
           }, 429);
         }
+        const recoveryAuthority = resolveAuthorizedAutonomyRecovery(body);
+        if (recoveryAuthority.repairAdmission.terminal) {
+          return makeJson({
+            ok: false,
+            code: recoveryAuthority.repairAdmission.exhausted ? "review_repair_lifecycle_exhausted" : "review_repair_lifecycle_settled",
+            message: recoveryAuthority.repairAdmission.reason
+          }, 409);
+        }
+        if (recoveryAuthority.repairAdmission.requested && !recoveryAuthority.repairAdmission.authorized) {
+          return makeJson({
+            ok: false,
+            code: "review_repair_capability_required",
+            message: recoveryAuthority.repairAdmission.reason
+          }, 403);
+        }
         if (isAutonomyRequestPayload(body)) {
+          const autonomyDetails = recoveryAuthority.details;
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse)
             return reservationResponse;
           const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
           if (runtimeCircuitResponse)
             return runtimeCircuitResponse;
-          const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
-          if (failureCircuitResponse)
-            return failureCircuitResponse;
-          const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
-          if (similarFailureResponse)
-            return similarFailureResponse;
-          const publicationResponse = makeAutonomyPublicationBackpressureResponse();
-          if (publicationResponse)
-            return publicationResponse;
+          if (!recoveryAuthority.authorized) {
+            const recoveryBackpressureResponse = makeAutonomyRecoveryBackpressureResponse();
+            if (recoveryBackpressureResponse)
+              return recoveryBackpressureResponse;
+            const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
+            if (failureCircuitResponse)
+              return failureCircuitResponse;
+            const similarFailureResponse = makeAutonomySimilarFailureResponse(body);
+            if (similarFailureResponse)
+              return similarFailureResponse;
+            const publicationResponse = makeAutonomyPublicationBackpressureResponse();
+            if (publicationResponse)
+              return publicationResponse;
+          }
           const workers = jobQueue.listWorkers(AUTONOMY_WORKER_TTL_MS);
           const schedulableWorkers = workers.filter((worker) => worker.isOnline && worker.status !== "offline");
           const idleWorkers = schedulableWorkers.filter((worker) => worker.status === "idle" && worker.activeJobCount === 0);
           const workersAllBusy = schedulableWorkers.length > 0 && idleWorkers.length === 0;
-          if (workersAllBusy) {
+          if (workersAllBusy && !recoveryAuthority.authorized) {
             const autonomyQueued = requestQueue.countAutonomyRequests(["pending", "claimed"]);
             if (autonomyQueued >= AUTONOMY_BUSY_QUEUE_MAX_REQUESTS) {
               return makeJson({
@@ -28762,7 +30461,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           }
           const workerPrBacklog = jobQueue.listWorkerPrBacklog(500);
           const openUnmergedWorkerPrs = workerPrBacklog.filter((entry) => entry.mergeState === "open_unmerged");
-          if (openUnmergedWorkerPrs.length >= AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS) {
+          if (!recoveryAuthority.authorized && openUnmergedWorkerPrs.length >= AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS) {
             return makeJson({
               ok: false,
               code: "autonomy_open_pr_limit",
@@ -28772,36 +30471,35 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               openUnmergedPrs: openUnmergedWorkerPrs.slice(0, 10).map((entry) => entry.prUrl)
             }, 429);
           }
+        } else if (body.dispatchConfirmationRequired === true) {
+          return makeJson({
+            ok: false,
+            code: "dispatch_confirmation_not_allowed",
+            message: "Two-phase dispatch confirmation is reserved for autonomy requests."
+          }, 400);
         }
         const result = requestQueue.enqueue(body);
-        const autonomyMetadata = autonomyMetadataFromPayload(body);
-        if (result.ok && result.requestId && (autonomyMetadata.reservationRequired === true || autonomyMetadata.reservation_required === true)) {
-          const objectiveId = compactText4(autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id, 128);
-          if (objectiveId) {
-            autonomyStore.markObjectiveDispatched(objectiveId, result.requestId);
-            const sessionId = compactText4(body.sessionId, 128);
-            const session = sessionManager.getSession(sessionId);
-            if (session) {
-              session.emit({
-                protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID9(),
-                ts: new Date().toISOString(),
-                sessionId,
-                type: "autonomy_objective_dispatched",
-                from: "server:autonomy",
-                payload: {
-                  runId: compactText4(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
-                  snapshotId: compactText4(autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id, 128),
-                  objectiveId,
-                  requestId: result.requestId,
-                  patternKey: compactText4(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) || "unknown",
-                  origin: "autonomy"
-                }
-              });
-            }
-          }
+        if (result.ok && result.requestId && !result.dispatchConfirmationRequired) {
+          recordAutonomyRequestDispatched(body, result.requestId);
         }
         return makeJson(result, result.ok ? 201 : 400);
+      }
+      const requestDispatchConfirmMatch = pathname.match(/^\/requests\/([^/]+)\/dispatch\/confirm$/);
+      if (requestDispatchConfirmMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied)
+          return denied;
+        const requestId = requestDispatchConfirmMatch[1];
+        const body = await req.json().catch(() => ({}));
+        const result = requestQueue.confirmDispatch(requestId, compactText4(body.dispatchConfirmationToken, 256));
+        if (!result.ok)
+          return makeJson(result, 409);
+        const request = requestQueue.getRequest(requestId);
+        if (!request) {
+          return makeJson({ ok: false, message: "Request not found after confirmation" }, 404);
+        }
+        recordAutonomyRequestDispatched(request, requestId);
+        return makeJson(result, 200);
       }
       if (pathname === "/requests/claim" && method === "POST") {
         const denied = requireAuth();
@@ -29038,7 +30736,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               success: false,
               userAction: "rejected",
               reopenedWithin24h: true,
-              regressionFlag: true
+              regressionFlag: false
             });
           }
         }
@@ -29122,6 +30820,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           console.log(`[Server] Trusted validation recovered; requeued ${result.requeuedJobIds?.length ?? 0} retained publication candidate(s): ${result.requeuedJobIds?.join(", ")}`);
         }
         if (result.ok && result.jobTransitioned && result.jobId) {
+          jobQueue.reconcileReviewRepairLifecycles();
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");
           const origin = deriveJobOrigin(params);
@@ -29187,12 +30886,14 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           installCacheHit: typeof body.trustedValidationCacheHit === "boolean" ? body.trustedValidationCacheHit : null
         }, body.trustedValidationReport, pusherId, claimToken);
         if (result.ok && result.jobTransitioned && result.jobId) {
+          jobQueue.reconcileReviewRepairLifecycles();
           const job = jobQueue.getJob(result.jobId);
           const params = parseJsonRecord2(job?.params ?? "");
           const origin = deriveJobOrigin(params);
           const requestId = compactText4(params.requestId, 128);
           const outcomeContext = autonomyStore.resolveJobOutcomeContext(result.jobId, params);
           if (outcomeContext) {
+            const failureProjection = classifyAutonomyFailureProjection({ message: "Candidate publication failed", detail: error }, params);
             autonomyStore.recordOutcome({
               objectiveId: outcomeContext.objectiveId,
               requestId: outcomeContext.requestId ?? requestId,
@@ -29202,7 +30903,8 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
               latencyMs: result.durationMs ?? null,
               userAction: "failed",
               reopenedWithin24h: false,
-              regressionFlag: true
+              regressionFlag: failureProjection.regressionFlag,
+              terminal: failureProjection.terminal
             });
           }
           if (job?.sessionId) {

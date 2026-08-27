@@ -80,6 +80,9 @@ const DOCKER_CONTROL_TIMEOUT_MS = 30_000;
 const DOCKER_PROBE_TIMEOUT_MS = 15_000;
 const DOCKER_SELF_CHECK_TIMEOUT_MS = 60_000;
 const HOST_GIT_CONTROL_TIMEOUT_MS = 60_000;
+const DEFAULT_UNPLANNED_FINALIZATION_BUDGET_MAX_MS = 120_000;
+const DEFAULT_UNPLANNED_FINALIZATION_BUDGET_DIVISOR = 5;
+const SETUP_WORKTREE_RECONCILIATION_TIMEOUT_MS = 5_000;
 const BROWSER_VALIDATION_JOB_REPAIR_ATTEMPTS = 3;
 const BROWSER_VALIDATION_JOB_OVERHEAD_MS = 5 * 60_000;
 const BROWSER_VALIDATION_JOB_MIN_TIMEOUT_MS = 20 * 60_000;
@@ -449,9 +452,12 @@ export function buildWorktreeDependencyPreparationCommand(
     '  rm -rf "$projection_root"',
     '  mkdir -p "$projection_node_modules"',
     '  : > "$projection_node_modules/.pushpals-dependency-projection-in-progress"',
-    // The recursive hardlink clone is now entirely Linux-native and never
-    // traverses the Windows bind mount.
-    '  cp -al "$src/." "$projection_node_modules/"',
+    // Reflinks provide an inexpensive copy-on-write projection when the
+    // volume filesystem supports them; GNU cp safely falls back to ordinary
+    // copies otherwise. Never hardlink snapshot files into a job: the worker
+    // runs as root, so a write through one projection could mutate the shared
+    // inode and contaminate concurrently running jobs.
+    '  cp -a --reflink=auto "$src/." "$projection_node_modules/"',
     '  find "$projection_node_modules" -type l -print | while IFS= read -r workspace_link; do',
     '    workspace_target="$(readlink "$workspace_link" 2>/dev/null || true)"',
     '    case "$workspace_target" in',
@@ -786,6 +792,62 @@ export function addHostScmFinalizationUsage(
   });
 }
 
+export function addDockerTransportAttemptUsage(
+  accumulator: UsageAccumulator,
+  result: Pick<DockerJobResult, "usage" | "usageAttempts" | "exitCode">,
+  attempt: number,
+): void {
+  const attemptOffset = accumulator.attempts().length;
+  if ((result.usageAttempts?.length ?? 0) > 0) {
+    accumulator.addAttempts(
+      (result.usageAttempts ?? []).map((usageAttempt, index) => ({
+        ...usageAttempt,
+        attempt: attemptOffset + index + 1,
+        source: `${usageAttempt.source}:docker_transport_attempt_${attempt}`,
+      })),
+    );
+    return;
+  }
+  accumulator.add(result.usage, {
+    stage: attempt === 1 ? "executor" : "executor_recovery",
+    attempt: attemptOffset + 1,
+    source: `docker_transport:attempt_${attempt}`,
+    timedOut: result.exitCode === 124,
+  });
+}
+
+export function attachHostScmUsageToError(
+  accumulator: UsageAccumulator,
+  error: unknown,
+  pass: number,
+): Error & { usage?: JobTokenUsage; usageAttempts?: JobUsageAttempt[] } {
+  if (error && typeof error === "object") {
+    addHostScmReviewPassUsage(
+      accumulator,
+      error as Pick<DockerJobResult, "usage" | "usageAttempts" | "exitCode">,
+      Math.max(1, pass),
+    );
+  }
+  const usageSnapshot = accumulator.apply<DockerJobResult>({
+    ok: false,
+    summary: `Host-side review pass ${Math.max(1, pass)} threw before completion`,
+  });
+  const propagatedError =
+    error instanceof Error && Object.isExtensible(error)
+      ? error
+      : Object.assign(
+          new Error(error instanceof Error ? error.message : String(error)),
+          error && typeof error === "object" ? error : {},
+        );
+  if ((usageSnapshot.usageAttempts?.length ?? 0) > 0) {
+    Object.assign(propagatedError, {
+      usage: usageSnapshot.usage,
+      usageAttempts: usageSnapshot.usageAttempts,
+    });
+  }
+  return propagatedError;
+}
+
 interface DockerExecutionResultContext {
   timedOutByDocker: boolean;
   streamDrainTimedOut: boolean;
@@ -964,7 +1026,19 @@ export function resolveDockerJobDeadlineBudgets(
   const requestedExecutionBudgetMs = readPositiveNumber(planning?.executionBudgetMs);
   const requestedFinalizationBudgetMs = readPositiveNumber(planning?.finalizationBudgetMs);
   if (requestedExecutionBudgetMs === null || requestedFinalizationBudgetMs === null) {
-    return { executionBudgetMs: totalTimeoutMs, finalizationBudgetMs: 0 };
+    // Legacy and warmup jobs do not carry planner budgets, but they still
+    // create host worktrees. Reserve a bounded share for candidate-safe
+    // cleanup instead of allowing setup/execution to consume the entire
+    // transport timeout and strand a registered worktree.
+    const finalizationBudgetMs = Math.min(
+      DEFAULT_UNPLANNED_FINALIZATION_BUDGET_MAX_MS,
+      Math.max(1, Math.floor(totalTimeoutMs / DEFAULT_UNPLANNED_FINALIZATION_BUDGET_DIVISOR)),
+      Math.max(1, totalTimeoutMs - 1),
+    );
+    return {
+      executionBudgetMs: Math.max(1, totalTimeoutMs - finalizationBudgetMs),
+      finalizationBudgetMs,
+    };
   }
 
   // The outer transport deadline may be stricter than a planner-provided
@@ -986,7 +1060,7 @@ export function resolveDockerJobDeadlineBudgets(
 export function createDockerJobDeadlineLedger(
   configuredTimeoutMs: number,
   job: Pick<Job, "kind" | "params">,
-  options: { startedAtMs?: number; now?: () => number } = {},
+  options: { startedAtMs?: number; now?: () => number; monotonicNow?: () => number } = {},
 ): JobDeadlineLedger {
   const budgets = resolveDockerJobDeadlineBudgets(configuredTimeoutMs, job);
   return new JobDeadlineLedger({ ...budgets, ...options });
@@ -1022,6 +1096,29 @@ export function bindDockerJobToDeadline(job: Job, ledger: JobDeadlineLedger): Jo
       },
     },
   };
+}
+
+/**
+ * Planned jobs perform their candidate-safe finalization inside the worker
+ * process and may therefore use the ledger's total remaining budget. Legacy
+ * and warmup jobs have no valid inner finalization plan, so their transport
+ * must stop at the work boundary and leave the reserved tail for host-owned
+ * dependency and worktree cleanup.
+ */
+export function resolveDockerContainerTransportTimeoutMs(
+  configuredTimeoutMs: number,
+  job: Pick<Job, "params">,
+  ledger?: JobDeadlineLedger,
+): number {
+  if (!ledger) return Math.max(0, configuredTimeoutMs);
+  const planning = maybeRecord(job.params.planning);
+  const hasValidInnerFinalizationPlan =
+    readPositiveNumber(planning?.executionBudgetMs) !== null &&
+    readPositiveNumber(planning?.finalizationBudgetMs) !== null;
+  const remainingDeadlineMs = hasValidInnerFinalizationPlan
+    ? ledger.remainingTotalMs()
+    : ledger.remainingWorkMs();
+  return Math.max(0, Math.min(configuredTimeoutMs, remainingDeadlineMs));
 }
 
 export function dockerAbsoluteDeadlineResult(
@@ -1091,6 +1188,11 @@ export class DockerExecutor {
   private preparedMergeConflictJobs = new Set<string>();
   private mergeConflictRefreshPromise: Promise<void> | null = null;
   private readonly config: WorkerpalsRuntimeConfig;
+  private deadlineWallNow: () => number = () => Date.now();
+  private deadlineMonotonicNow: () => number = () =>
+    typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
 
   constructor(options: DockerExecutorOptions) {
     const { config, ...optionValues } = options;
@@ -1180,6 +1282,14 @@ export class DockerExecutor {
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
   ): Promise<DockerJobResult> {
+    // Start the single outer ledger before any host-side worktree, review, or
+    // warm-runtime preparation. Setup is part of the job and must not mint an
+    // independent timeout before the container starts.
+    const deadlineLedger = createDockerJobDeadlineLedger(this.options.timeoutMs, job, {
+      startedAtMs: this.deadlineWallNow(),
+      now: this.deadlineWallNow,
+      monotonicNow: this.deadlineMonotonicNow,
+    });
     this.activeJobs += 1;
     this.clearIdleTimer();
     const worktreeName = this.buildEphemeralWorktreeName("job", job.id);
@@ -1187,16 +1297,32 @@ export class DockerExecutor {
     let terminalResult: DockerJobResult | null = null;
     let terminalError: unknown = null;
     let worktreeBaselineSha: string | null = null;
+    let worktreeCreationStarted = false;
     let preserveWorktreeForCandidateRecovery = false;
+    const accumulatedUsage = new UsageAccumulator();
     const finish = (result: DockerJobResult): DockerJobResult => {
-      terminalResult = result;
-      return result;
+      terminalResult = accumulatedUsage.apply(result);
+      return terminalResult;
     };
 
     try {
-      const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog);
+      const worktreeBaseRef = await this.resolveWorktreeBaseRefForJob(job, onLog, deadlineLedger);
       // Step 1: Create isolated git worktree
-      await this.createWorktree(worktreePath, worktreeBaseRef);
+      worktreeCreationStarted = true;
+      await this.createWorktree(worktreePath, worktreeBaseRef, deadlineLedger);
+      // Capture the immutable pre-preparation head before host SCM can rebase
+      // or otherwise mutate it. If later preparation fails, checkpointing can
+      // still distinguish and retain a clean committed candidate.
+      const baseline = await this.runGitBaseRefCommand(
+        ["-C", worktreePath, "rev-parse", "HEAD"],
+        deadlineLedger,
+      );
+      if (!baseline.ok || !baseline.stdout.trim()) {
+        throw new Error(
+          `Unable to resolve disposable worktree baseline before preparation: ${baseline.stderr || baseline.stdout || "git rev-parse failed"}`,
+        );
+      }
+      worktreeBaselineSha = baseline.stdout.trim();
 
       // Step 2: Prepare review Git state on the host before the container sees
       // the worktree. Review containers receive no branch/rebase/push duties.
@@ -1209,6 +1335,7 @@ export class DockerExecutor {
             job.id,
             job.params,
             onLog,
+            deadlineLedger,
           );
           effectiveParams = applyMergeConflictExecutionHints(effectiveParams, prepared);
         }
@@ -1217,15 +1344,6 @@ export class DockerExecutor {
           params: markHostScmGitOwnership(effectiveParams),
         };
       }
-      const baseline = await git(worktreePath, ["rev-parse", "HEAD"]);
-      if (!baseline.ok || !baseline.stdout.trim()) {
-        throw new Error(
-          `Unable to resolve disposable worktree baseline before execution: ${baseline.stderr || baseline.stdout || `git exited ${baseline.exitCode}`}`,
-        );
-      }
-      worktreeBaselineSha = baseline.stdout.trim();
-      const deadlineLedger = createDockerJobDeadlineLedger(this.options.timeoutMs, effectiveJob);
-
       // Step 3: Run Docker container with the worktree mounted
       for (let attempt = 1; attempt <= this.jobRetryMaxAttempts; attempt++) {
         const deadlineBoundJob = bindDockerJobToDeadline(effectiveJob, deadlineLedger);
@@ -1245,6 +1363,7 @@ export class DockerExecutor {
                 onLog,
               )
             : await this.runInWarmContainer(worktreePath, deadlineBoundJob, onLog, deadlineLedger);
+          addDockerTransportAttemptUsage(accumulatedUsage, result, attempt);
           if (
             result.ok &&
             shouldCommit(effectiveJob.kind, this.config) &&
@@ -1328,7 +1447,11 @@ export class DockerExecutor {
               ),
             );
           }
-          await this.stopWarmContainer("job retry after transient failure", true);
+          await this.stopWarmContainer(
+            "job retry after transient failure",
+            true,
+            Math.max(1, deadlineLedger.remainingWorkMs() - retryInMs),
+          );
           if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
             return finish(
               dockerAbsoluteDeadlineResult(
@@ -1341,6 +1464,13 @@ export class DockerExecutor {
           }
           await this.sleep(retryInMs);
         } catch (err) {
+          if (err && typeof err === "object") {
+            addDockerTransportAttemptUsage(
+              accumulatedUsage,
+              err as Pick<DockerJobResult, "usage" | "usageAttempts" | "exitCode">,
+              attempt,
+            );
+          }
           if (deadlineLedger.workExpired() || deadlineLedger.remainingTotalMs() <= 0) {
             return finish(
               dockerAbsoluteDeadlineResult(job, deadlineLedger, `Docker attempt ${attempt}`, {
@@ -1389,7 +1519,11 @@ export class DockerExecutor {
               ),
             );
           }
-          await this.stopWarmContainer("job retry after execution error", true);
+          await this.stopWarmContainer(
+            "job retry after execution error",
+            true,
+            Math.max(1, deadlineLedger.remainingWorkMs() - retryInMs),
+          );
           if (!this.hasAbsoluteBudgetForJobRetry(attempt, retryInMs, deadlineLedger, onLog)) {
             return finish(
               dockerAbsoluteDeadlineResult(
@@ -1409,12 +1543,45 @@ export class DockerExecutor {
         stderr: `Retries exhausted after ${this.jobRetryMaxAttempts} attempts`,
       });
     } catch (error) {
-      terminalError = error;
-      throw error;
+      if (deadlineLedger.workExpired() || deadlineLedger.remainingTotalMs() <= 0) {
+        return finish(
+          dockerAbsoluteDeadlineResult(job, deadlineLedger, "host/Docker preparation", {
+            ok: false,
+            summary: `Docker preparation for ${job.id} reached the absolute deadline`,
+            stderr: this.compactError(error),
+            exitCode: 124,
+          }),
+        );
+      }
+      const propagatedError = error instanceof Error ? error : new Error(String(error));
+      const usageSnapshot = accumulatedUsage.apply<DockerJobResult>({
+        ok: false,
+        summary: `Docker execution threw before completion: ${this.compactError(propagatedError)}`,
+      });
+      if ((usageSnapshot.usageAttempts?.length ?? 0) > 0) {
+        Object.assign(propagatedError, {
+          usage: usageSnapshot.usage,
+          usageAttempts: usageSnapshot.usageAttempts,
+        });
+      }
+      terminalError = propagatedError;
+      throw propagatedError;
     } finally {
       this.preparedMergeConflictJobs.delete(job.id);
       this.activeJobs = Math.max(0, this.activeJobs - 1);
-      await this.cleanupContainerDependencyProjection(worktreePath);
+      await this.cleanupContainerDependencyProjection(worktreePath, deadlineLedger);
+      const postProjectionResult = terminalResult as DockerJobResult | null;
+      if (postProjectionResult?.ok && deadlineLedger.remainingTotalMs() <= 0) {
+        Object.assign(
+          postProjectionResult,
+          dockerAbsoluteDeadlineResult(
+            job,
+            deadlineLedger,
+            "dependency-projection finalization",
+            postProjectionResult,
+          ),
+        );
+      }
       const resultForCleanup = (terminalResult ??
         (terminalError
           ? {
@@ -1427,7 +1594,14 @@ export class DockerExecutor {
               },
             }
           : null)) as DockerJobResult | null;
-      if (resultForCleanup && !resultForCleanup.ok && existsSync(worktreePath)) {
+      const setupWorktreeNeedsReconciliation =
+        worktreeCreationStarted && worktreeBaselineSha === null;
+      if (
+        resultForCleanup &&
+        !resultForCleanup.ok &&
+        existsSync(worktreePath) &&
+        !setupWorktreeNeedsReconciliation
+      ) {
         const candidateState =
           resultForCleanup.candidateState ??
           ({
@@ -1443,6 +1617,7 @@ export class DockerExecutor {
             candidateState,
             this.config,
             worktreeBaselineSha,
+            deadlineLedger,
           );
           if (checkpointed.checkpoint) {
             resultForCleanup.candidateState = checkpointed;
@@ -1502,9 +1677,23 @@ export class DockerExecutor {
       // from a durable Git ref. A checkpoint failure must never destroy the
       // sole remaining copy of a partial patch.
       if (!preserveWorktreeForCandidateRecovery) {
-        await this.removeWorktree(worktreePath).catch((err) => {
+        await this.removeWorktree(worktreePath, deadlineLedger, {
+          ensureReconciliation: setupWorktreeNeedsReconciliation,
+        }).catch((err) => {
           console.error(`[DockerExecutor] Failed to remove worktree: ${err}`);
         });
+      }
+      const postCleanupResult = terminalResult as DockerJobResult | null;
+      if (postCleanupResult?.ok && deadlineLedger.remainingTotalMs() <= 0) {
+        Object.assign(
+          postCleanupResult,
+          dockerAbsoluteDeadlineResult(
+            job,
+            deadlineLedger,
+            "worktree finalization",
+            postCleanupResult,
+          ),
+        );
       }
       this.scheduleIdleShutdown();
     }
@@ -1587,15 +1776,21 @@ export class DockerExecutor {
   /**
    * Create a git worktree for isolated job execution
    */
-  private async createWorktree(worktreePath: string, baseRef: string): Promise<void> {
-    await this.ensureFreshWorktreePath(worktreePath);
+  private async createWorktree(
+    worktreePath: string,
+    baseRef: string,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<void> {
+    await this.ensureFreshWorktreePath(worktreePath, deadlineLedger);
 
     // Create worktree from configured base ref (detached)
     let result = await this.runHostCommandCapture(
       ["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef)],
       {
         cwd: this.options.repo,
-        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ??
+          HOST_GIT_CONTROL_TIMEOUT_MS,
       },
     );
     let exitCode = result.exitCode;
@@ -1613,7 +1808,9 @@ export class DockerExecutor {
     if (!result.timedOut && exitCode !== 0 && /already registered worktree/i.test(detail)) {
       const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
         cwd: this.options.repo,
-        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ??
+          HOST_GIT_CONTROL_TIMEOUT_MS,
       });
       if (prune.timedOut) {
         throw new Error(`git worktree prune timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`);
@@ -1623,7 +1820,9 @@ export class DockerExecutor {
         ["git", ...buildLinuxWorktreeAddArgs(worktreePath, baseRef, true)],
         {
           cwd: this.options.repo,
-          timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+          timeoutMs:
+            deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ??
+            HOST_GIT_CONTROL_TIMEOUT_MS,
         },
       );
       exitCode = result.exitCode;
@@ -1645,11 +1844,10 @@ export class DockerExecutor {
       throw new Error(`Failed to create worktree from ${baseRef}: ${detail}`);
     }
 
-    const enableWorktreeConfig = await this.runGitBaseRefCommand([
-      "config",
-      "extensions.worktreeConfig",
-      "true",
-    ]);
+    const enableWorktreeConfig = await this.runGitBaseRefCommand(
+      ["config", "extensions.worktreeConfig", "true"],
+      deadlineLedger,
+    );
     if (!enableWorktreeConfig.ok) {
       throw new Error(
         `Failed to enable worktree-local Git configuration: ${
@@ -1661,14 +1859,10 @@ export class DockerExecutor {
       ["core.autocrlf", "false"],
       ["core.eol", "lf"],
     ] as const) {
-      const configured = await this.runGitBaseRefCommand([
-        "-C",
-        worktreePath,
-        "config",
-        "--worktree",
-        key,
-        value,
-      ]);
+      const configured = await this.runGitBaseRefCommand(
+        ["-C", worktreePath, "config", "--worktree", key, value],
+        deadlineLedger,
+      );
       if (!configured.ok) {
         throw new Error(
           `Failed to configure ${key}=${value} for Linux worktree: ${
@@ -1717,13 +1911,37 @@ export class DockerExecutor {
   /**
    * Remove a git worktree
    */
-  private async removeWorktree(worktreePath: string): Promise<void> {
+  private async removeWorktree(
+    worktreePath: string,
+    deadlineLedger?: JobDeadlineLedger,
+    options: { ensureReconciliation?: boolean } = {},
+  ): Promise<void> {
+    const ensureReconciliation = options.ensureReconciliation === true;
+    const cleanupTimeout = (requestedMs: number): number => {
+      const reservedTimeoutMs = deadlineLedger
+        ? deadlineLedger.capTotalTimeout(requestedMs)
+        : requestedMs;
+      if (reservedTimeoutMs > 0 || !ensureReconciliation) return reservedTimeoutMs;
+      return Math.min(requestedMs, SETUP_WORKTREE_RECONCILIATION_TIMEOUT_MS);
+    };
+    const removalTimeoutMs = cleanupTimeout(HOST_GIT_CONTROL_TIMEOUT_MS);
+    if (removalTimeoutMs <= 0) {
+      console.warn(
+        `[DockerExecutor] Deferring worktree cleanup after the absolute job deadline: ${worktreePath}`,
+      );
+      return;
+    }
+    if (deadlineLedger?.remainingTotalMs() === 0 && ensureReconciliation) {
+      console.warn(
+        `[DockerExecutor] Using bounded setup-worktree reconciliation after the absolute job deadline: ${worktreePath}`,
+      );
+    }
     // Remove worktree
     const removal = await this.runHostCommandCapture(
       ["git", "worktree", "remove", "--force", "--force", worktreePath],
       {
         cwd: this.options.repo,
-        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+        timeoutMs: removalTimeoutMs,
       },
     );
 
@@ -1731,28 +1949,32 @@ export class DockerExecutor {
       console.warn(
         `[DockerExecutor] Worktree removal warning: ${
           removal.timedOut
-            ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`
+            ? `timed out after ${removalTimeoutMs}ms`
             : removal.stderr || removal.stdout || `exit ${removal.exitCode}`
         }`,
       );
     }
 
     // Also prune worktree list
+    const pruneTimeoutMs = cleanupTimeout(HOST_GIT_CONTROL_TIMEOUT_MS);
+    if (pruneTimeoutMs <= 0) return;
     const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+      timeoutMs: pruneTimeoutMs,
     });
     if (prune.timedOut || prune.exitCode !== 0) {
       console.warn(
         `[DockerExecutor] Worktree prune warning: ${
           prune.timedOut
-            ? `timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms`
+            ? `timed out after ${pruneTimeoutMs}ms`
             : prune.stderr || prune.stdout || `exit ${prune.exitCode}`
         }`,
       );
     }
 
+    if (deadlineLedger?.remainingTotalMs() === 0 && !ensureReconciliation) return;
     const forced = await forceDeleteWorktreePath(worktreePath, {
+      ...(deadlineLedger ? { retries: 1 } : {}),
       sleepFn: (ms) => this.sleep(ms),
     });
     if (!forced.removed) {
@@ -1761,16 +1983,49 @@ export class DockerExecutor {
       );
     }
 
+    // If git removal timed out, pruning before the physical path disappeared
+    // could not remove its registration. A final bounded prune makes the
+    // forced-delete path immediately reconcilable instead of waiting for the
+    // next worker restart.
+    if (ensureReconciliation) {
+      const finalPruneTimeoutMs = cleanupTimeout(HOST_GIT_CONTROL_TIMEOUT_MS);
+      if (finalPruneTimeoutMs > 0) {
+        const finalPrune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
+          cwd: this.options.repo,
+          timeoutMs: finalPruneTimeoutMs,
+        });
+        if (finalPrune.timedOut || finalPrune.exitCode !== 0) {
+          console.warn(
+            `[DockerExecutor] Final setup-worktree prune warning: ${
+              finalPrune.timedOut
+                ? `timed out after ${finalPruneTimeoutMs}ms`
+                : finalPrune.stderr || finalPrune.stdout || `exit ${finalPrune.exitCode}`
+            }`,
+          );
+        }
+      }
+    }
+
     console.log(`[DockerExecutor] Removed worktree: ${worktreePath}`);
   }
 
-  private async cleanupContainerDependencyProjection(worktreePath: string): Promise<void> {
+  private async cleanupContainerDependencyProjection(
+    worktreePath: string,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<void> {
     const worktreeId = this.dependencyProjectionId(worktreePath);
     if (!worktreeId || !this.preparedDependencyProjectionIds.has(worktreeId)) return;
     const projectionPath = `/workspace/.pushpals/dependency-store/projections/${worktreeId}`;
     const command = `rm -rf ${shellSingleQuote(projectionPath)}`;
+    const warmCleanupTimeoutMs = deadlineLedger
+      ? deadlineLedger.capTotalTimeout(DOCKER_CONTROL_TIMEOUT_MS)
+      : DOCKER_CONTROL_TIMEOUT_MS;
+    if (warmCleanupTimeoutMs <= 0) {
+      this.dependencyStoreReconciled = false;
+      return;
+    }
     try {
-      const cleanup = await this.runWarmShell(command, { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS });
+      const cleanup = await this.runWarmShell(command, { timeoutMs: warmCleanupTimeoutMs });
       if (cleanup.ok) {
         this.preparedDependencyProjectionIds.delete(worktreeId);
         return;
@@ -1779,6 +2034,13 @@ export class DockerExecutor {
       // Fall through to a one-shot volume cleanup if the warm container is gone.
     }
 
+    const fallbackCleanupTimeoutMs = deadlineLedger
+      ? deadlineLedger.capTotalTimeout(DOCKER_CONTROL_TIMEOUT_MS)
+      : DOCKER_CONTROL_TIMEOUT_MS;
+    if (fallbackCleanupTimeoutMs <= 0) {
+      this.dependencyStoreReconciled = false;
+      return;
+    }
     try {
       const cleanup = await this.runDockerCommandCapture(
         [
@@ -1795,7 +2057,7 @@ export class DockerExecutor {
           "-lc",
           command,
         ],
-        { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS },
+        { timeoutMs: fallbackCleanupTimeoutMs },
       );
       if (!cleanup.timedOut && cleanup.exitCode === 0) {
         this.preparedDependencyProjectionIds.delete(worktreeId);
@@ -1804,7 +2066,7 @@ export class DockerExecutor {
       console.warn(
         `[DockerExecutor] Dependency projection cleanup was not confirmed for ${worktreeId}: ${
           cleanup.timedOut
-            ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms`
+            ? `timed out after ${fallbackCleanupTimeoutMs}ms`
             : cleanup.stderr || cleanup.stdout || `exit ${cleanup.exitCode}`
         }`,
       );
@@ -1956,12 +2218,22 @@ export class DockerExecutor {
     }, this.options.idleTimeoutMs);
   }
 
-  private async startWarmContainer(): Promise<void> {
-    await this.stopWarmContainer("pre-start cleanup", true);
-    await this.ensureNamedVolume(this.dependencyVolumeName, "workerpals-dependencies");
+  private async startWarmContainer(deadlineLedger?: JobDeadlineLedger): Promise<void> {
+    const stopTimeoutMs = deadlineLedger
+      ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS)
+      : DOCKER_CONTROL_TIMEOUT_MS;
+    if (stopTimeoutMs <= 0) {
+      throw new Error("Warm-container startup was cancelled by the absolute job work deadline.");
+    }
+    await this.stopWarmContainer("pre-start cleanup", true, stopTimeoutMs);
+    await this.ensureNamedVolume(
+      this.dependencyVolumeName,
+      "workerpals-dependencies",
+      deadlineLedger,
+    );
     const backend = this.currentBackend();
     if (backend === "openai_codex") {
-      await this.ensureNamedVolume(this.codexVolumeName, "workerpals-codex-home");
+      await this.ensureNamedVolume(this.codexVolumeName, "workerpals-codex-home", deadlineLedger);
     }
     const backendSpec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
@@ -2031,7 +2303,8 @@ export class DockerExecutor {
     args.push("--entrypoint", "/bin/sh", this.options.imageName, "-lc", startupCmd);
 
     const result = await this.runDockerCommandCapture([resolveDockerExecutable(), ...args], {
-      timeoutMs: DOCKER_CONTROL_TIMEOUT_MS,
+      timeoutMs:
+        deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS,
     });
     if (result.timedOut || result.exitCode !== 0) {
       throw new Error(
@@ -2041,14 +2314,17 @@ export class DockerExecutor {
       );
     }
     console.log(`[DockerExecutor] Warm container started: ${this.warmContainerName}`);
-    await this.reconcileContainerDependencyStore();
+    await this.reconcileContainerDependencyStore(deadlineLedger);
   }
 
-  private async reconcileContainerDependencyStore(): Promise<void> {
+  private async reconcileContainerDependencyStore(
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<void> {
     if (this.dependencyStoreReconciled && this.preparedDependencyProjectionIds.size === 0) return;
     try {
       const result = await this.runWarmShell(buildDependencyStoreReconciliationCommand(), {
-        timeoutMs: DOCKER_CONTROL_TIMEOUT_MS,
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS,
       });
       if (!result.ok) {
         this.dependencyStoreReconciled = false;
@@ -2073,7 +2349,11 @@ export class DockerExecutor {
     }
   }
 
-  private async ensureNamedVolume(name: string, component: string): Promise<void> {
+  private async ensureNamedVolume(
+    name: string,
+    component: string,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<void> {
     const result = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
@@ -2085,7 +2365,10 @@ export class DockerExecutor {
         `pushpals.repo=${this.options.repo}`,
         name,
       ],
-      { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS) ?? DOCKER_CONTROL_TIMEOUT_MS,
+      },
     );
     if (result.timedOut || result.exitCode !== 0) {
       throw new Error(
@@ -2157,7 +2440,7 @@ export class DockerExecutor {
     return { args, containerHome: containerCodexHome, hostAuthMounted: true };
   }
 
-  private async ensureWarmContainer(): Promise<void> {
+  private async ensureWarmContainer(deadlineLedger?: JobDeadlineLedger): Promise<void> {
     const inspect = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
@@ -2166,14 +2449,17 @@ export class DockerExecutor {
         "{{.State.Running}}|{{.HostConfig.NetworkMode}}",
         this.warmContainerName,
       ],
-      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS,
+      },
     );
     if (!inspect.timedOut && inspect.exitCode === 0) {
       const [runningRaw, networkModeRaw] = inspect.stdout.trim().split("|");
       const running = runningRaw?.trim() === "true";
       const networkMode = (networkModeRaw ?? "").trim();
       if (running && networkMode === this.options.networkMode) {
-        await this.reconcileContainerDependencyStore();
+        await this.reconcileContainerDependencyStore(deadlineLedger);
         return;
       }
       if (running && networkMode && networkMode !== this.options.networkMode) {
@@ -2182,7 +2468,7 @@ export class DockerExecutor {
         );
       }
     }
-    await this.startWarmContainer();
+    await this.startWarmContainer(deadlineLedger);
   }
 
   private async runWarmShell(
@@ -2198,10 +2484,20 @@ export class DockerExecutor {
     exitCode: number;
     timedOut?: boolean;
   }> {
-    const timeoutMs =
-      typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)
-        ? Math.max(1_000, Math.floor(options.timeoutMs))
-        : DOCKER_PROBE_TIMEOUT_MS;
+    const hasExplicitTimeout =
+      typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs);
+    if (hasExplicitTimeout && Number(options.timeoutMs) <= 0) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: "Warm-container command did not start because the absolute job deadline expired.",
+        exitCode: 124,
+        timedOut: true,
+      };
+    }
+    const timeoutMs = hasExplicitTimeout
+      ? Math.max(1, Math.floor(Number(options.timeoutMs)))
+      : DOCKER_PROBE_TIMEOUT_MS;
     const effectiveCommand = `timeout --signal=TERM --kill-after=5s ${Math.max(1, Math.ceil(timeoutMs / 1_000))}s /bin/sh -lc ${shellSingleQuote(command)}`;
     const proc = Bun.spawn(
       [
@@ -2331,7 +2627,10 @@ export class DockerExecutor {
     );
   }
 
-  private async runWarmWorktreeProbe(containerWorktreePath: string): Promise<{
+  private async runWarmWorktreeProbe(
+    containerWorktreePath: string,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<{
     ok: boolean;
     stdout: string;
     stderr: string;
@@ -2348,7 +2647,10 @@ export class DockerExecutor {
         "-lc",
         "git rev-parse --is-inside-work-tree && git rev-parse --git-dir",
       ],
-      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS,
+      },
     );
     return {
       ok: !result.timedOut && result.exitCode === 0,
@@ -2362,7 +2664,7 @@ export class DockerExecutor {
     };
   }
 
-  private async inspectWarmContainerState(): Promise<string> {
+  private async inspectWarmContainerState(deadlineLedger?: JobDeadlineLedger): Promise<string> {
     const result = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
@@ -2371,7 +2673,10 @@ export class DockerExecutor {
         "running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} oom={{.State.OOMKilled}}",
         this.warmContainerName,
       ],
-      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS,
+      },
     );
     const out = [result.stdout, result.stderr].filter(Boolean).join("\n");
     if (result.timedOut) {
@@ -2382,10 +2687,16 @@ export class DockerExecutor {
       : `docker inspect failed (exit ${result.exitCode})${out ? `\n${out}` : ""}`;
   }
 
-  private async readWarmContainerLogs(tail = 160): Promise<string> {
+  private async readWarmContainerLogs(
+    tail = 160,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<string> {
     const result = await this.runDockerCommandCapture(
       [resolveDockerExecutable(), "logs", "--tail", String(tail), this.warmContainerName],
-      { timeoutMs: DOCKER_PROBE_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS) ?? DOCKER_PROBE_TIMEOUT_MS,
+      },
     );
     const out = [result.stdout, result.stderr].filter(Boolean).join("\n");
     if (result.timedOut) {
@@ -2424,7 +2735,7 @@ export class DockerExecutor {
     return Array.from(new Set(probes));
   }
 
-  private async probeWorkerLlmEndpoint(): Promise<string> {
+  private async probeWorkerLlmEndpoint(deadlineLedger?: JobDeadlineLedger): Promise<string> {
     const endpoint = (this.config.workerpals.llm.endpoint ?? "").trim();
     if (!endpoint) return "endpoint not configured";
     const probes = this.workerLlmProbeUrls(endpoint);
@@ -2432,8 +2743,10 @@ export class DockerExecutor {
 
     let lastError = "unreachable";
     for (const probe of probes) {
+      const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(2_500) : 2_500;
+      if (timeoutMs <= 0) return "SKIPPED (absolute job work deadline expired)";
       try {
-        const status = await probeWorkerLlmHttpEndpointStatus(probe);
+        const status = await probeWorkerLlmHttpEndpointStatus(probe, timeoutMs);
         if (status >= 200 && status < 500) {
           return `reachable via ${probe} (HTTP ${status})`;
         }
@@ -2461,7 +2774,9 @@ export class DockerExecutor {
     }
   }
 
-  private async probeWorkerLlmEndpointFromContainer(): Promise<string> {
+  private async probeWorkerLlmEndpointFromContainer(
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<string> {
     const endpoint = this.workerLlmEndpointForContainer();
     if (!endpoint) return "endpoint not configured";
     const probes = this.workerLlmProbeUrls(endpoint);
@@ -2469,10 +2784,12 @@ export class DockerExecutor {
 
     let lastError = "unreachable";
     for (const probe of probes) {
+      const timeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(3_500) : 3_500;
+      if (timeoutMs <= 0) return "SKIPPED (absolute job work deadline expired)";
       const cmd =
         `status="$(curl -sS -m 3 -o /dev/null -w "%{http_code}" ${shellSingleQuote(probe)} || true)"; ` +
         'echo "$status"';
-      const result = await this.runWarmShell(cmd);
+      const result = await this.runWarmShell(cmd, { timeoutMs });
       const status = Number.parseInt(result.stdout.trim(), 10);
       if (Number.isFinite(status) && status >= 200 && status < 500) {
         return `reachable via ${probe} (HTTP ${status})`;
@@ -2487,7 +2804,10 @@ export class DockerExecutor {
     return `UNREACHABLE (${lastError})`;
   }
 
-  private async collectWarmRuntimeDiagnostics(backend: ExecutorBackend): Promise<string> {
+  private async collectWarmRuntimeDiagnostics(
+    backend: ExecutorBackend,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<string> {
     const spec = getDockerBackendSpec(backend);
     const runtimeConfig = this.backendRuntimeConfig();
     const sections: string[] = [];
@@ -2505,12 +2825,16 @@ export class DockerExecutor {
     if (endpoint && containerEndpoint && endpoint !== containerEndpoint) {
       sections.push(`[llm-endpoint-rewrite] ${endpoint} -> ${containerEndpoint}`);
     }
-    sections.push(`[llm-probe-host] ${await this.probeWorkerLlmEndpoint()}`);
-    sections.push(`[llm-probe-container] ${await this.probeWorkerLlmEndpointFromContainer()}`);
-    sections.push(`[container] ${await this.inspectWarmContainerState()}`);
-    sections.push(`[container-logs]\n${await this.readWarmContainerLogs(160)}`);
+    sections.push(`[llm-probe-host] ${await this.probeWorkerLlmEndpoint(deadlineLedger)}`);
+    sections.push(
+      `[llm-probe-container] ${await this.probeWorkerLlmEndpointFromContainer(deadlineLedger)}`,
+    );
+    sections.push(`[container] ${await this.inspectWarmContainerState(deadlineLedger)}`);
+    sections.push(`[container-logs]\n${await this.readWarmContainerLogs(160, deadlineLedger)}`);
 
-    const shellProbe = await this.runWarmShell("true");
+    const shellProbe = await this.runWarmShell("true", {
+      timeoutMs: deadlineLedger?.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS),
+    });
     if (!shellProbe.ok) {
       const probeOut = [shellProbe.stdout, shellProbe.stderr].filter(Boolean).join("\n");
       sections.push(
@@ -2522,7 +2846,14 @@ export class DockerExecutor {
     const checks = spec.diagnosticChecks?.(SHARED_CONTAINER_VENV_PYTHON) ?? [];
 
     for (const check of checks) {
-      const result = await this.runWarmShell(check.command);
+      const timeoutMs = deadlineLedger
+        ? deadlineLedger.capWorkTimeout(DOCKER_PROBE_TIMEOUT_MS)
+        : DOCKER_PROBE_TIMEOUT_MS;
+      if (timeoutMs <= 0) {
+        sections.push(`[${check.label}] skipped: absolute job work deadline expired`);
+        break;
+      }
+      const result = await this.runWarmShell(check.command, { timeoutMs });
       const text = [result.stdout, result.stderr].filter(Boolean).join("\n");
       sections.push(
         `[${check.label}] exit=${result.exitCode}${text ? `\n${text}` : "\n(no output)"}`,
@@ -2531,11 +2862,16 @@ export class DockerExecutor {
     return sections.join("\n");
   }
 
-  private async stopWarmContainer(reason: string, quiet = false): Promise<void> {
+  private async stopWarmContainer(
+    reason: string,
+    quiet = false,
+    timeoutMs = DOCKER_CONTROL_TIMEOUT_MS,
+  ): Promise<void> {
     this.clearIdleTimer();
+    const boundedTimeoutMs = Math.max(1, Math.min(DOCKER_CONTROL_TIMEOUT_MS, timeoutMs));
     const result = await this.runDockerCommandCapture(
       [resolveDockerExecutable(), "rm", "-f", this.warmContainerName],
-      { timeoutMs: DOCKER_CONTROL_TIMEOUT_MS },
+      { timeoutMs: boundedTimeoutMs },
     );
     if (!result.timedOut && result.exitCode === 0) {
       if (!quiet) {
@@ -2546,10 +2882,7 @@ export class DockerExecutor {
       this.warmedBackends.clear();
       return;
     }
-    const stderr = [
-      result.stderr,
-      result.timedOut ? `timed out after ${DOCKER_CONTROL_TIMEOUT_MS}ms` : "",
-    ]
+    const stderr = [result.stderr, result.timedOut ? `timed out after ${boundedTimeoutMs}ms` : ""]
       .filter(Boolean)
       .join("\n");
     const notFound = /No such container/i.test(stderr);
@@ -2589,215 +2922,227 @@ export class DockerExecutor {
     const accumulatedUsage = new UsageAccumulator();
     const withAccumulatedUsage = (result: DockerJobResult): DockerJobResult =>
       accumulatedUsage.apply(result);
+    let activePass = 0;
 
-    for (let pass = 1; pass <= maxMergeConflictPasses; pass++) {
-      const deadlineBoundJob = bindDockerJobToDeadline(effectiveJob, deadlineLedger);
-      if (!deadlineBoundJob) {
-        return withAccumulatedUsage(
-          dockerAbsoluteDeadlineResult(
-            initialJob,
-            deadlineLedger,
-            `host-owned review pass ${pass}`,
-          ),
-        );
-      }
-      const result = await this.runInWarmContainer(
-        worktreePath,
-        deadlineBoundJob,
-        onLog,
-        deadlineLedger,
-      );
-      addHostScmReviewPassUsage(accumulatedUsage, result, pass);
-      if (deadlineLedger.remainingTotalMs() <= 0) {
-        return withAccumulatedUsage(
-          dockerAbsoluteDeadlineResult(
-            initialJob,
-            deadlineLedger,
-            `host-owned review pass ${pass}`,
-            result,
-          ),
-        );
-      }
-      if (!result.ok) return withAccumulatedUsage(result);
-
-      if (isMergeConflictResolutionParams(effectiveJob.params)) {
-        if (deadlineLedger.workExpired()) {
+    try {
+      for (let pass = 1; pass <= maxMergeConflictPasses; pass++) {
+        activePass = pass;
+        const deadlineBoundJob = bindDockerJobToDeadline(effectiveJob, deadlineLedger);
+        if (!deadlineBoundJob) {
           return withAccumulatedUsage(
             dockerAbsoluteDeadlineResult(
               initialJob,
               deadlineLedger,
-              `host-owned rebase continuation after pass ${pass}`,
-              result,
+              `host-owned review pass ${pass}`,
             ),
           );
         }
-        const resume = await resumePreparedMergeConflictRebase(
+        const result = await this.runInWarmContainer(
           worktreePath,
-          effectiveJob.kind,
-          effectiveJob.params,
+          deadlineBoundJob,
           onLog,
+          deadlineLedger,
         );
-        if (deadlineLedger.workExpired() && (!resume.ok || resume.sequencer)) {
+        addHostScmReviewPassUsage(accumulatedUsage, result, pass);
+        if (deadlineLedger.remainingTotalMs() <= 0) {
           return withAccumulatedUsage(
             dockerAbsoluteDeadlineResult(
               initialJob,
               deadlineLedger,
-              `host-owned rebase continuation after pass ${pass}`,
+              `host-owned review pass ${pass}`,
               result,
             ),
           );
         }
-        if (!resume.ok) {
-          return withAccumulatedUsage({
-            ...result,
-            ok: false,
-            summary: "Host-side merge-conflict rebase continuation failed",
-            stderr: [result.stderr, resume.error].filter(Boolean).join("\n"),
-            exitCode: 4,
-          });
-        }
-        if (resume.sequencer) {
-          if (resume.sequencer !== "rebase" || pass >= maxMergeConflictPasses) {
-            const detail =
-              resume.sequencer !== "rebase"
-                ? `Host-side review worktree left unexpected git ${resume.sequencer} in progress.`
-                : `Host-side merge-conflict repair exceeded ${maxMergeConflictPasses} focused resolver passes.`;
+        if (!result.ok) return withAccumulatedUsage(result);
+
+        if (isMergeConflictResolutionParams(effectiveJob.params)) {
+          if (deadlineLedger.workExpired()) {
+            return withAccumulatedUsage(
+              dockerAbsoluteDeadlineResult(
+                initialJob,
+                deadlineLedger,
+                `host-owned rebase continuation after pass ${pass}`,
+                result,
+              ),
+            );
+          }
+          const resume = await resumePreparedMergeConflictRebase(
+            worktreePath,
+            effectiveJob.kind,
+            effectiveJob.params,
+            onLog,
+            deadlineLedger,
+          );
+          if (deadlineLedger.workExpired()) {
+            return withAccumulatedUsage(
+              dockerAbsoluteDeadlineResult(
+                initialJob,
+                deadlineLedger,
+                `host-owned rebase continuation after pass ${pass}`,
+                result,
+              ),
+            );
+          }
+          if (!resume.ok) {
             return withAccumulatedUsage({
               ...result,
               ok: false,
-              summary: detail,
-              stderr: [result.stderr, resume.detail, detail].filter(Boolean).join("\n"),
+              summary: "Host-side merge-conflict rebase continuation failed",
+              stderr: [result.stderr, resume.error].filter(Boolean).join("\n"),
               exitCode: 4,
             });
           }
+          if (resume.sequencer) {
+            if (resume.sequencer !== "rebase" || pass >= maxMergeConflictPasses) {
+              const detail =
+                resume.sequencer !== "rebase"
+                  ? `Host-side review worktree left unexpected git ${resume.sequencer} in progress.`
+                  : `Host-side merge-conflict repair exceeded ${maxMergeConflictPasses} focused resolver passes.`;
+              return withAccumulatedUsage({
+                ...result,
+                ok: false,
+                summary: detail,
+                stderr: [result.stderr, resume.detail, detail].filter(Boolean).join("\n"),
+                exitCode: 4,
+              });
+            }
 
-          const refreshedParams = await refreshMergeConflictWorktreeHints(
-            worktreePath,
-            effectiveJob.params,
-          );
-          const planning =
-            refreshedParams.planning &&
-            typeof refreshedParams.planning === "object" &&
-            !Array.isArray(refreshedParams.planning)
-              ? { ...(refreshedParams.planning as Record<string, unknown>) }
-              : {};
-          planning.executionBudgetMs = Math.min(
-            300_000,
-            Math.max(60_000, Number(planning.executionBudgetMs) || 300_000),
-          );
-          planning.finalizationBudgetMs = Math.min(
-            60_000,
-            Math.max(30_000, Number(planning.finalizationBudgetMs) || 60_000),
-          );
-          effectiveJob = {
-            ...effectiveJob,
-            params: markHostScmGitOwnership({
-              ...refreshedParams,
-              planning,
-              qualityRevisionAttempt: pass,
-              qualityRevisionHint: [
-                String(refreshedParams.qualityRevisionHint ?? "").trim(),
-                resume.detail ??
-                  "Host-side rebase continuation advanced to another unresolved conflict.",
-                "Resolve only the currently conflicted file contents. Host-side SCM will stage and continue after this pass.",
-              ]
-                .filter(Boolean)
-                .join("\n\n"),
-            }),
-          };
-          onLog?.(
-            "stdout",
-            `[MergeConflictHost] Rebase still requires conflict editing; starting focused container pass ${pass + 1}/${maxMergeConflictPasses}.`,
-          );
-          continue;
+            const refreshedParams = await refreshMergeConflictWorktreeHints(
+              worktreePath,
+              effectiveJob.params,
+              deadlineLedger,
+            );
+            if (deadlineLedger.workExpired()) {
+              return withAccumulatedUsage(
+                dockerAbsoluteDeadlineResult(
+                  initialJob,
+                  deadlineLedger,
+                  `refreshing host-owned conflict hints after pass ${pass}`,
+                  result,
+                ),
+              );
+            }
+            const planning =
+              refreshedParams.planning &&
+              typeof refreshedParams.planning === "object" &&
+              !Array.isArray(refreshedParams.planning)
+                ? { ...(refreshedParams.planning as Record<string, unknown>) }
+                : {};
+            planning.executionBudgetMs = Math.min(
+              300_000,
+              Math.max(60_000, Number(planning.executionBudgetMs) || 300_000),
+            );
+            planning.finalizationBudgetMs = Math.min(
+              60_000,
+              Math.max(30_000, Number(planning.finalizationBudgetMs) || 60_000),
+            );
+            effectiveJob = {
+              ...effectiveJob,
+              params: markHostScmGitOwnership({
+                ...refreshedParams,
+                planning,
+                qualityRevisionAttempt: pass,
+                qualityRevisionHint: [
+                  String(refreshedParams.qualityRevisionHint ?? "").trim(),
+                  resume.detail ??
+                    "Host-side rebase continuation advanced to another unresolved conflict.",
+                  "Resolve only the currently conflicted file contents. Host-side SCM will stage and continue after this pass.",
+                ]
+                  .filter(Boolean)
+                  .join("\n\n"),
+              }),
+            };
+            onLog?.(
+              "stdout",
+              `[MergeConflictHost] Rebase still requires conflict editing; starting focused container pass ${pass + 1}/${maxMergeConflictPasses}.`,
+            );
+            continue;
+          }
         }
-      }
 
-      if (!shouldCommit(effectiveJob.kind, this.config)) {
-        return withAccumulatedUsage(result);
-      }
-      if (deadlineLedger.remainingTotalMs() <= 0) {
-        return withAccumulatedUsage(
-          dockerAbsoluteDeadlineResult(
-            initialJob,
-            deadlineLedger,
-            "host-owned commit finalization",
-            result,
-          ),
+        if (!shouldCommit(effectiveJob.kind, this.config)) {
+          return withAccumulatedUsage(result);
+        }
+        if (deadlineLedger.remainingTotalMs() <= 0) {
+          return withAccumulatedUsage(
+            dockerAbsoluteDeadlineResult(
+              initialJob,
+              deadlineLedger,
+              "host-owned commit finalization",
+              result,
+            ),
+          );
+        }
+        const commitResult = await createJobCommit(
+          worktreePath,
+          this.options.workerId,
+          {
+            id: effectiveJob.id,
+            taskId: effectiveJob.taskId,
+            kind: effectiveJob.kind,
+            params: effectiveJob.params,
+            sessionId: effectiveJob.sessionId,
+            context: "host",
+            deferPublication: Boolean(result.validationBlocked),
+          },
+          this.config,
+          deadlineLedger,
         );
-      }
-      const commitResult = await createJobCommit(
-        worktreePath,
-        this.options.workerId,
-        {
-          id: effectiveJob.id,
-          taskId: effectiveJob.taskId,
-          kind: effectiveJob.kind,
-          params: effectiveJob.params,
-          sessionId: effectiveJob.sessionId,
-          context: "host",
-          deferPublication: Boolean(result.validationBlocked),
-        },
-        this.config,
-      );
-      addHostScmFinalizationUsage(
-        accumulatedUsage,
-        commitResult as typeof commitResult & {
-          usage?: JobTokenUsage;
-          usageAttempts?: JobUsageAttempt[];
-        },
-        pass,
-      );
-      if (deadlineLedger.remainingTotalMs() <= 0) {
-        return withAccumulatedUsage(
-          dockerAbsoluteDeadlineResult(
-            initialJob,
-            deadlineLedger,
-            "host-owned commit finalization",
-            {
-              ...result,
-              ...(commitResult.ok && commitResult.sha && commitResult.branch
-                ? {
-                    commit: {
-                      branch: commitResult.branch,
-                      sha: commitResult.sha,
-                      publicBranch: commitResult.publicBranch,
-                    },
-                  }
-                : {}),
-            },
-          ),
-        );
-      }
-      if (!commitResult.ok || !commitResult.sha || !commitResult.branch) {
-        const detail =
-          commitResult.error ??
-          `Host-side completion metadata missing for review job ${effectiveJob.id}.`;
+        addHostScmFinalizationUsage(accumulatedUsage, commitResult, pass);
+        if (deadlineLedger.remainingTotalMs() <= 0) {
+          return withAccumulatedUsage(
+            dockerAbsoluteDeadlineResult(
+              initialJob,
+              deadlineLedger,
+              "host-owned commit finalization",
+              {
+                ...result,
+                ...(commitResult.ok && commitResult.sha && commitResult.branch
+                  ? {
+                      commit: {
+                        branch: commitResult.branch,
+                        sha: commitResult.sha,
+                        publicBranch: commitResult.publicBranch,
+                      },
+                    }
+                  : {}),
+              },
+            ),
+          );
+        }
+        if (!commitResult.ok || !commitResult.sha || !commitResult.branch) {
+          const detail =
+            commitResult.error ??
+            `Host-side completion metadata missing for review job ${effectiveJob.id}.`;
+          return withAccumulatedUsage({
+            ...result,
+            ok: false,
+            summary: commitResult.publishBlocked?.summary ?? "Host-side review finalization failed",
+            stderr: [result.stderr, detail].filter(Boolean).join("\n"),
+            exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 1,
+            publishBlocked: commitResult.publishBlocked,
+          });
+        }
         return withAccumulatedUsage({
           ...result,
-          ok: false,
-          summary: commitResult.publishBlocked?.summary ?? "Host-side review finalization failed",
-          stderr: [result.stderr, detail].filter(Boolean).join("\n"),
-          exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 1,
-          publishBlocked: commitResult.publishBlocked,
+          commit: {
+            branch: commitResult.branch,
+            sha: commitResult.sha,
+            publicBranch: commitResult.publicBranch,
+          },
         });
       }
-      return withAccumulatedUsage({
-        ...result,
-        commit: {
-          branch: commitResult.branch,
-          sha: commitResult.sha,
-          publicBranch: commitResult.publicBranch,
-        },
-      });
-    }
 
-    return withAccumulatedUsage({
-      ok: false,
-      summary: "Host-side review execution exhausted resolver passes",
-      stderr: `Exceeded ${maxMergeConflictPasses} host-owned review passes.`,
-      exitCode: 4,
-    });
+      return withAccumulatedUsage({
+        ok: false,
+        summary: "Host-side review execution exhausted resolver passes",
+        stderr: `Exceeded ${maxMergeConflictPasses} host-owned review passes.`,
+        exitCode: 4,
+      });
+    } catch (error) {
+      throw attachHostScmUsageToError(accumulatedUsage, error, activePass);
+    }
   }
 
   private async runInWarmContainer(
@@ -2809,16 +3154,27 @@ export class DockerExecutor {
     if (deadlineLedger?.workExpired()) {
       return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-container setup");
     }
-    await this.ensureWarmRuntimeReady(job, onLog);
+    await this.ensureWarmRuntimeReady(job, onLog, deadlineLedger);
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "warm-runtime setup");
+    }
     const startedAtMs = Date.now();
     const containerWorktreePath = await this.ensureWorktreeAccessibleInWarmContainer(
       worktreePath,
       onLog,
+      deadlineLedger,
     );
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "worktree visibility setup");
+    }
     const dependencyPreparation = await this.ensureWorktreeDependencyArtifacts(
       containerWorktreePath,
       onLog,
+      deadlineLedger,
     );
+    if (deadlineLedger?.workExpired()) {
+      return dockerAbsoluteDeadlineResult(job, deadlineLedger, "dependency preparation");
+    }
     const deadlineBoundJob = deadlineLedger ? bindDockerJobToDeadline(job, deadlineLedger) : job;
     if (!deadlineBoundJob) {
       return dockerAbsoluteDeadlineResult(
@@ -2851,12 +3207,15 @@ export class DockerExecutor {
       );
     }
     const configuredTimeoutMs = resolveDockerJobTimeoutMs(this.options.timeoutMs, deadlineBoundJob);
-    const remainingDeadlineMs = deadlineLedger?.remainingTotalMs() ?? configuredTimeoutMs;
-    if (remainingDeadlineMs <= 0) {
+    const timeoutMs = resolveDockerContainerTransportTimeoutMs(
+      configuredTimeoutMs,
+      deadlineBoundJob,
+      deadlineLedger,
+    );
+    if (timeoutMs <= 0) {
       await terminateDockerExecProcessTree(proc);
       return dockerAbsoluteDeadlineResult(job, deadlineLedger as JobDeadlineLedger, "Docker spawn");
     }
-    const timeoutMs = Math.max(1, Math.min(configuredTimeoutMs, remainingDeadlineMs));
     if (configuredTimeoutMs !== this.options.timeoutMs) {
       const verb = configuredTimeoutMs > this.options.timeoutMs ? "Extended" : "Capped";
       const note = `[DockerExecutor] ${verb} job timeout for browser validation convergence: ${configuredTimeoutMs}ms (configured ${this.options.timeoutMs}ms).`;
@@ -2864,7 +3223,11 @@ export class DockerExecutor {
       onLog?.("stdout", note);
     }
     if (timeoutMs < configuredTimeoutMs) {
-      const note = `[DockerExecutor] Capped this container invocation to ${timeoutMs}ms from the shared absolute job deadline (remaining work plus finalization reserve).`;
+      const planning = maybeRecord(deadlineBoundJob.params.planning);
+      const preservesHostCleanupReserve =
+        readPositiveNumber(planning?.executionBudgetMs) === null ||
+        readPositiveNumber(planning?.finalizationBudgetMs) === null;
+      const note = `[DockerExecutor] Capped this container invocation to ${timeoutMs}ms from the shared absolute job deadline (${preservesHostCleanupReserve ? "host cleanup reserve preserved" : "remaining work plus inner finalization"}).`;
       console.log(note);
       onLog?.("stdout", note);
     }
@@ -3064,6 +3427,7 @@ export class DockerExecutor {
   private async ensureWorktreeDependencyArtifacts(
     containerWorktreePath: string,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<{
     startedAtMs: number;
     finishedAtMs: number;
@@ -3075,7 +3439,15 @@ export class DockerExecutor {
     if (worktreeId) this.preparedDependencyProjectionIds.add(worktreeId);
     let currentPhase = "starting";
     let currentProgress = 0;
-    const startNote = `[DependencyPreparation] phase=${currentPhase} progress=${currentProgress} timeout_ms=${this.dependencyPreparationTimeoutMs}`;
+    const preparationTimeoutMs = deadlineLedger
+      ? deadlineLedger.capWorkTimeout(this.dependencyPreparationTimeoutMs)
+      : this.dependencyPreparationTimeoutMs;
+    if (preparationTimeoutMs <= 0) {
+      throw new Error(
+        "Dependency preparation did not start because the absolute job work deadline expired.",
+      );
+    }
+    const startNote = `[DependencyPreparation] phase=${currentPhase} progress=${currentProgress} timeout_ms=${preparationTimeoutMs}`;
     console.log(startNote);
     onLog?.("stdout", startNote);
     const command = buildWorktreeDependencyPreparationCommand(containerWorktreePath);
@@ -3088,7 +3460,7 @@ export class DockerExecutor {
       onLog?.("stdout", note);
     }, 15_000);
     const result = await this.runWarmShell(command, {
-      timeoutMs: this.dependencyPreparationTimeoutMs,
+      timeoutMs: preparationTimeoutMs,
       onLog: (stream, line) => {
         const progress = line.match(
           /^\[DependencyPreparation\]\s+phase=([^\s]+)\s+progress=(\d+)$/,
@@ -3141,18 +3513,31 @@ export class DockerExecutor {
   private async waitForWorktreePathInWarmContainer(
     containerWorktreePath: string,
     timeoutMs = 5_000,
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
+    const boundedTimeoutMs = deadlineLedger ? deadlineLedger.capWorkTimeout(timeoutMs) : timeoutMs;
+    if (boundedTimeoutMs <= 0) {
+      throw new Error(
+        "worktree visibility probe did not start because the absolute job work deadline expired",
+      );
+    }
+    const deadline = Date.now() + boundedTimeoutMs;
     let lastDetail = "";
     const command = `test -d ${shellSingleQuote(containerWorktreePath)}`;
     while (Date.now() < deadline) {
-      const result = await this.runWarmShell(command);
+      const probeTimeoutMs = deadlineLedger
+        ? deadlineLedger.capWorkTimeout(Math.max(1, deadline - Date.now()))
+        : Math.max(1, deadline - Date.now());
+      if (probeTimeoutMs <= 0) break;
+      const result = await this.runWarmShell(command, { timeoutMs: probeTimeoutMs });
       if (result.ok) return;
       lastDetail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-      await this.sleep(100);
+      const retryDelayMs = deadlineLedger ? deadlineLedger.capWorkTimeout(100) : 100;
+      if (retryDelayMs <= 0) break;
+      await this.sleep(retryDelayMs);
     }
     throw new Error(
-      `worktree path not visible inside warm container after ${timeoutMs}ms: ${containerWorktreePath}${
+      `worktree path not visible inside warm container after ${boundedTimeoutMs}ms: ${containerWorktreePath}${
         lastDetail ? ` (${lastDetail})` : ""
       }`,
     );
@@ -3161,6 +3546,7 @@ export class DockerExecutor {
   private async ensureWorktreeAccessibleInWarmContainer(
     worktreePath: string,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<string> {
     const worktreeRelPath = relative(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
@@ -3168,12 +3554,13 @@ export class DockerExecutor {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        await this.ensureWarmContainer();
+        await this.ensureWarmContainer(deadlineLedger);
         await this.waitForWorktreePathInWarmContainer(
           containerWorktreePath,
           this.worktreeVisibilityTimeoutMs,
+          deadlineLedger,
         );
-        const probe = await this.runWarmWorktreeProbe(containerWorktreePath);
+        const probe = await this.runWarmWorktreeProbe(containerWorktreePath, deadlineLedger);
         if (probe.ok) {
           return containerWorktreePath;
         }
@@ -3184,7 +3571,7 @@ export class DockerExecutor {
       } catch (err) {
         lastError = err;
         if (attempt >= 2) {
-          const diagnostics = await this.inspectWarmContainerState().catch(() => "");
+          const diagnostics = await this.inspectWarmContainerState(deadlineLedger).catch(() => "");
           throw new Error(
             `worktree not accessible inside warm container after ${attempt} attempts: ${containerWorktreePath}${
               lastError ? ` (${this.compactError(lastError)})` : ""
@@ -3196,7 +3583,11 @@ export class DockerExecutor {
           `recycling container and retrying once (${this.compactError(err)}).`;
         console.warn(note);
         onLog?.("stderr", note);
-        await this.stopWarmContainer("worktree visibility retry", true);
+        const stopTimeoutMs = deadlineLedger
+          ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS)
+          : DOCKER_CONTROL_TIMEOUT_MS;
+        if (stopTimeoutMs <= 0) throw err;
+        await this.stopWarmContainer("worktree visibility retry", true, stopTimeoutMs);
       }
     }
 
@@ -3662,14 +4053,20 @@ export class DockerExecutor {
   private async ensureWarmRuntimeReady(
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<void> {
     const backend = resolveExecutor(this.config);
     let attempt = 1;
     let recoveredMissingImage = false;
     while (attempt <= this.warmSetupMaxAttempts) {
+      if (deadlineLedger?.workExpired()) {
+        throw new Error(
+          `Warm runtime setup for ${job.id} stopped at the absolute job work deadline.`,
+        );
+      }
       try {
-        await this.ensureWarmContainer();
-        await this.ensureBackendWarmup(backend);
+        await this.ensureWarmContainer(deadlineLedger);
+        await this.ensureBackendWarmup(backend, deadlineLedger);
         return;
       } catch (err) {
         if (this.isMissingDockerImageError(err) && !recoveredMissingImage) {
@@ -3677,9 +4074,13 @@ export class DockerExecutor {
           const rebuildNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is missing locally; rebuilding before retrying warm container startup.`;
           console.warn(rebuildNote);
           onLog?.("stderr", rebuildNote);
-          await this.stopWarmContainer("missing image recovery", true);
+          const recoveryTimeoutMs = deadlineLedger
+            ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS)
+            : DOCKER_CONTROL_TIMEOUT_MS;
+          if (recoveryTimeoutMs <= 0) throw err;
+          await this.stopWarmContainer("missing image recovery", true, recoveryTimeoutMs);
           this.warmedBackends.clear();
-          if (await this.pullImage()) {
+          if (await this.pullImage(deadlineLedger)) {
             const retryNote = `[DockerExecutor] Warm runtime image ${this.options.imageName} is available again; retrying warm container startup.`;
             console.log(retryNote);
             onLog?.("stdout", retryNote);
@@ -3709,14 +4110,29 @@ export class DockerExecutor {
         )}. Retrying in ${retryInMs}ms.`;
         console.warn(note);
         onLog?.("stderr", note);
-        await this.stopWarmContainer("warm setup retry", true);
-        await this.sleep(retryInMs);
+        const retryRecoveryTimeoutMs = deadlineLedger
+          ? deadlineLedger.capWorkTimeout(DOCKER_CONTROL_TIMEOUT_MS)
+          : DOCKER_CONTROL_TIMEOUT_MS;
+        if (retryRecoveryTimeoutMs <= 0) throw err;
+        await this.stopWarmContainer("warm setup retry", true, retryRecoveryTimeoutMs);
+        const boundedRetryInMs = deadlineLedger
+          ? deadlineLedger.capWorkTimeout(retryInMs)
+          : retryInMs;
+        if (boundedRetryInMs < retryInMs) {
+          throw new Error(
+            `Warm runtime retry for ${job.id} was cancelled to preserve the finalization reserve.`,
+          );
+        }
+        await this.sleep(boundedRetryInMs);
         attempt += 1;
       }
     }
   }
 
-  private async ensureBackendWarmup(backend: ExecutorBackend): Promise<void> {
+  private async ensureBackendWarmup(
+    backend: ExecutorBackend,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<void> {
     if (this.warmedBackends.has(backend)) return;
     const spec = getDockerBackendSpec(backend);
     const warmContext = this.warmStartupContext();
@@ -3725,11 +4141,18 @@ export class DockerExecutor {
         ...warmContext,
         warmContainerName: this.warmContainerName,
         runWarmShell: (command: string): Promise<DockerWarmShellResult> =>
-          this.runWarmShell(command, { timeoutMs: this.warmAgentStartupTimeoutMs }),
+          this.runWarmShell(command, {
+            timeoutMs:
+              deadlineLedger?.capWorkTimeout(this.warmAgentStartupTimeoutMs) ??
+              this.warmAgentStartupTimeoutMs,
+          }),
         restartWarmContainer: async () => {
-          await this.startWarmContainer();
+          await this.startWarmContainer(deadlineLedger);
         },
-        collectWarmDiagnostics: async () => this.collectWarmRuntimeDiagnostics(backend),
+        collectWarmDiagnostics: async () =>
+          deadlineLedger?.workExpired()
+            ? "Warm-runtime diagnostics skipped because the absolute job work deadline expired."
+            : this.collectWarmRuntimeDiagnostics(backend, deadlineLedger),
       });
       this.warmedBackends.add(backend);
       return;
@@ -3737,7 +4160,9 @@ export class DockerExecutor {
     const cmd = spec.warmupProbeCommand?.(SHARED_CONTAINER_VENV_PYTHON);
     if (cmd) {
       const result = await this.runWarmShell(cmd, {
-        timeoutMs: this.warmAgentStartupTimeoutMs,
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(this.warmAgentStartupTimeoutMs) ??
+          this.warmAgentStartupTimeoutMs,
       });
       if (!result.ok) {
         const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
@@ -3769,6 +4194,20 @@ export class DockerExecutor {
     timedOut: boolean;
     drainTimedOut: boolean;
   }> {
+    const hasExplicitTimeout =
+      typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs);
+    if (hasExplicitTimeout && Number(opts.timeoutMs) <= 0) {
+      return {
+        stdout: "",
+        stderr: "Command did not start because the absolute job deadline expired.",
+        exitCode: 124,
+        timedOut: true,
+        drainTimedOut: false,
+      };
+    }
+    const timeoutMs = hasExplicitTimeout
+      ? Math.max(1, Math.floor(Number(opts.timeoutMs)))
+      : DOCKER_CONTROL_TIMEOUT_MS;
     const proc = Bun.spawn(command, {
       cwd: opts.cwd,
       stdin: "ignore",
@@ -3782,10 +4221,6 @@ export class DockerExecutor {
       throw new Error(`bounded process capture pipes were unavailable: ${command.join(" ")}`);
     }
 
-    const timeoutMs =
-      typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
-        ? Math.max(1, Math.floor(opts.timeoutMs))
-        : DOCKER_CONTROL_TIMEOUT_MS;
     const streamAbort = new AbortController();
     const streams = Promise.all([
       readCapturedProcessStream(stdout, streamAbort.signal),
@@ -4038,7 +4473,10 @@ export class DockerExecutor {
     return normalized.slice(0, maxLength);
   }
 
-  private async ensureFreshWorktreePath(worktreePath: string): Promise<void> {
+  private async ensureFreshWorktreePath(
+    worktreePath: string,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<void> {
     if (!existsSync(worktreePath)) return;
 
     console.warn(
@@ -4049,15 +4487,23 @@ export class DockerExecutor {
       ["git", "worktree", "remove", "--force", "--force", worktreePath],
       {
         cwd: this.options.repo,
-        timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ??
+          HOST_GIT_CONTROL_TIMEOUT_MS,
       },
     );
 
     await this.runHostCommandCapture(["git", "worktree", "prune"], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+      timeoutMs:
+        deadlineLedger?.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS) ?? HOST_GIT_CONTROL_TIMEOUT_MS,
     });
 
+    if (deadlineLedger?.workExpired()) {
+      throw new Error(
+        `Stale worktree cleanup for ${worktreePath} stopped at the absolute job work deadline.`,
+      );
+    }
     const forced = await forceDeleteWorktreePath(worktreePath, {
       sleepFn: (ms) => this.sleep(ms),
     });
@@ -4171,11 +4617,12 @@ export class DockerExecutor {
   private async resolveWorktreeBaseRefForJob(
     job: Job,
     onLog?: (stream: "stdout" | "stderr", line: string) => void,
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<string> {
     return resolveReviewWorktreeBase({
       jobId: job.id,
       params: job.params,
-      git: (args) => this.runGitBaseRefCommand(args),
+      git: (args) => this.runGitBaseRefCommand(args, deadlineLedger),
       fallback: () =>
         resolveFreshWorktreeBaseRef({
           requestedRef: this.options.baseRef,
@@ -4184,7 +4631,7 @@ export class DockerExecutor {
             this.config.workerpals.baseRef ||
             this.options.baseRef,
           sourceBaseBranch: this.config.sourceControlManager.baseBranch,
-          git: (args) => this.runGitBaseRefCommand(args),
+          git: (args) => this.runGitBaseRefCommand(args, deadlineLedger),
           log: (level, message) => {
             const line = `[DockerExecutor] ${message}`;
             if (level === "warn") {
@@ -4211,18 +4658,19 @@ export class DockerExecutor {
 
   private async runGitBaseRefCommand(
     args: string[],
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+    const timeoutMs = deadlineLedger
+      ? deadlineLedger.capWorkTimeout(HOST_GIT_CONTROL_TIMEOUT_MS)
+      : HOST_GIT_CONTROL_TIMEOUT_MS;
     const result = await this.runHostCommandCapture(["git", ...args], {
       cwd: this.options.repo,
-      timeoutMs: HOST_GIT_CONTROL_TIMEOUT_MS,
+      timeoutMs,
     });
     return {
       ok: !result.timedOut && result.exitCode === 0,
       stdout: result.stdout,
-      stderr: [
-        result.stderr,
-        result.timedOut ? `git command timed out after ${HOST_GIT_CONTROL_TIMEOUT_MS}ms` : "",
-      ]
+      stderr: [result.stderr, result.timedOut ? `git command timed out after ${timeoutMs}ms` : ""]
         .filter(Boolean)
         .join("\n"),
     };
@@ -4231,10 +4679,10 @@ export class DockerExecutor {
   /**
    * Pull the Docker image
    */
-  async pullImage(): Promise<boolean> {
+  async pullImage(deadlineLedger?: JobDeadlineLedger): Promise<boolean> {
     const runtimeTag = resolveWorkerpalRuntimeTag();
-    const existingRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag() : "";
-    if (await this.imageExists()) {
+    const existingRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag(deadlineLedger) : "";
+    if (await this.imageExists(deadlineLedger)) {
       if (!runtimeTag || existingRuntimeTag === runtimeTag) {
         console.log(`[DockerExecutor] Using local image: ${this.options.imageName}`);
         return true;
@@ -4244,8 +4692,8 @@ export class DockerExecutor {
       );
     }
 
-    if (await this.buildLocalImage(runtimeTag)) {
-      const rebuiltRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag() : "";
+    if (await this.buildLocalImage(runtimeTag, deadlineLedger)) {
+      const rebuiltRuntimeTag = runtimeTag ? await this.inspectImageRuntimeTag(deadlineLedger) : "";
       if (!runtimeTag || rebuiltRuntimeTag === runtimeTag) {
         console.log(`[DockerExecutor] Using locally built image: ${this.options.imageName}`);
         return true;
@@ -4257,7 +4705,11 @@ export class DockerExecutor {
     );
     const pull = await this.runDockerCommandCapture(
       [resolveDockerExecutable(), "pull", this.options.imageName],
-      { timeoutMs: DOCKER_IMAGE_PULL_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_PULL_TIMEOUT_MS) ??
+          DOCKER_IMAGE_PULL_TIMEOUT_MS,
+      },
     );
     if (!pull.timedOut && pull.exitCode === 0) {
       console.log(`[DockerExecutor] Image pulled successfully`);
@@ -4272,7 +4724,7 @@ export class DockerExecutor {
     );
 
     // Another process may have built/pulled the image while this pull was running.
-    if (await this.imageExists()) {
+    if (await this.imageExists(deadlineLedger)) {
       console.warn(
         `[DockerExecutor] Pull failed but local image is now available: ${this.options.imageName}`,
       );
@@ -4285,10 +4737,14 @@ export class DockerExecutor {
   /**
    * Check if the Docker image exists locally
    */
-  private async imageExists(): Promise<boolean> {
+  private async imageExists(deadlineLedger?: JobDeadlineLedger): Promise<boolean> {
     const result = await this.runDockerCommandCapture(
       [resolveDockerExecutable(), "image", "inspect", this.options.imageName],
-      { timeoutMs: DOCKER_IMAGE_INSPECT_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_INSPECT_TIMEOUT_MS) ??
+          DOCKER_IMAGE_INSPECT_TIMEOUT_MS,
+      },
     );
     if (result.timedOut) {
       console.warn(
@@ -4299,7 +4755,7 @@ export class DockerExecutor {
     return result.exitCode === 0;
   }
 
-  private async inspectImageRuntimeTag(): Promise<string> {
+  private async inspectImageRuntimeTag(deadlineLedger?: JobDeadlineLedger): Promise<string> {
     const result = await this.runDockerCommandCapture(
       [
         resolveDockerExecutable(),
@@ -4309,7 +4765,11 @@ export class DockerExecutor {
         `{{ index .Config.Labels "${WORKERPAL_SANDBOX_RUNTIME_TAG_LABEL}" }}`,
         this.options.imageName,
       ],
-      { timeoutMs: DOCKER_IMAGE_INSPECT_TIMEOUT_MS },
+      {
+        timeoutMs:
+          deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_INSPECT_TIMEOUT_MS) ??
+          DOCKER_IMAGE_INSPECT_TIMEOUT_MS,
+      },
     );
     if (result.timedOut) {
       console.warn(
@@ -4330,7 +4790,10 @@ export class DockerExecutor {
     return value === "<no value>" ? "" : value;
   }
 
-  private async buildLocalImage(runtimeTag: string): Promise<boolean> {
+  private async buildLocalImage(
+    runtimeTag: string,
+    deadlineLedger?: JobDeadlineLedger,
+  ): Promise<boolean> {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
     if (!existsSync(sandboxContext.dockerfilePath)) {
       return false;
@@ -4363,7 +4826,9 @@ export class DockerExecutor {
     }
     const build = await this.runDockerCommandCapture(args, {
       cwd: sandboxContext.root,
-      timeoutMs: DOCKER_IMAGE_BUILD_TIMEOUT_MS,
+      timeoutMs:
+        deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_BUILD_TIMEOUT_MS) ??
+        DOCKER_IMAGE_BUILD_TIMEOUT_MS,
     });
     if (!build.timedOut && build.exitCode === 0) {
       return true;

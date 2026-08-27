@@ -13,6 +13,8 @@ import {
   runBoundedProcess,
   sanitizeRepositoryAgentResult,
   type MemoryJsonValue,
+  type MemoryPutInput,
+  type MemoryPutOptions,
   type MemoryRecord,
   type MemoryStore,
   type BoundedProcessResult,
@@ -56,6 +58,7 @@ const DEFAULT_CAPABILITY_CIRCUIT_COOLDOWN_MS = 10 * 60_000;
 const DEFAULT_CAPABILITY_HALF_OPEN_LEASE_MS = 60_000;
 const DEFAULT_PROVIDER_DRAIN_MS = 1_000;
 const DEFAULT_MEMORY_STAGE_TIMEOUT_MS = 2_000;
+const MEMORY_TERMINAL_RESULT_RESERVE_MS = 100;
 const MIN_SYNTHESIS_START_BUDGET_MS = 500;
 const MIN_FINALIZATION_RESERVE_MS = 500;
 const MAX_FINALIZATION_RESERVE_MS = 5_000;
@@ -791,19 +794,38 @@ function boundedRetrievalTerms(request: RepositoryAgentRequest): string[] {
   const source = [request.purpose, request.question, ...boundedVision]
     .map((value) => compactText(value, 8_000).normalize("NFKC").toLocaleLowerCase("und"))
     .join("\n");
-  return [
-    ...new Set(
-      (source.match(/[\p{L}\p{M}\p{N}_.@/-]+/gu) ?? [])
-        .map((term) => term.replace(/^[-./]+|[-./]+$/g, ""))
-        .filter((term) => term.length >= 3 && term.length <= 80)
-        .flatMap((term) => {
-          const stem = /^[a-z0-9_.@/-]+$/i.test(term)
-            ? term.replace(/(?:ing|ed|es|s)$/i, "")
-            : term;
-          return stem.length >= 4 && stem !== term ? [term, stem] : [term];
-        }),
-    ),
-  ].slice(0, 128);
+  const output = new Set<string>();
+  // Natural CJK questions commonly omit spaces. Add a tightly bounded set of
+  // longest-first script-aware n-grams so a phrase such as “检查支付处理边界” can
+  // still select a tracked path containing “支付处理”, without quadratic input
+  // growth or language-specific dictionaries.
+  const cjkRuns =
+    source.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu) ??
+    [];
+  let cjkTerms = 0;
+  for (const rawRun of cjkRuns.slice(0, 12)) {
+    const run = Array.from(rawRun).slice(0, 32);
+    for (let width = Math.min(8, run.length); width >= 2; width--) {
+      for (let start = 0; start + width <= run.length; start++) {
+        output.add(run.slice(start, start + width).join(""));
+        cjkTerms++;
+        if (cjkTerms >= 64 || output.size >= 128) break;
+      }
+      if (cjkTerms >= 64 || output.size >= 128) break;
+    }
+    if (cjkTerms >= 64 || output.size >= 128) break;
+  }
+  for (const term of source.match(/[\p{L}\p{M}\p{N}_.@/-]+/gu) ?? []) {
+    const normalized = term.replace(/^[-./]+|[-./]+$/g, "");
+    if (normalized.length < 3 || normalized.length > 80) continue;
+    output.add(normalized);
+    const stem = /^[a-z0-9_.@/-]+$/i.test(normalized)
+      ? normalized.replace(/(?:ing|ed|es|s)$/i, "")
+      : normalized;
+    if (stem.length >= 4 && stem !== normalized) output.add(stem);
+    if (output.size >= 128) break;
+  }
+  return [...output].slice(0, 128);
 }
 
 /**
@@ -1081,6 +1103,32 @@ function autonomyVisionFingerprint(request: RepositoryAgentRequest): string | nu
   );
 }
 
+function normalizedDeterministicPolicy(request: RepositoryAgentRequest) {
+  const context = request.context ?? {};
+  const policy = isRecord(context.deterministicPolicy) ? context.deterministicPolicy : {};
+  const list = (value: unknown, maxItems: number, maxChars: number) => {
+    if (!Array.isArray(value)) return [];
+    const output: string[] = [];
+    const seen = new Set<string>();
+    for (const entry of value) {
+      const normalized = compactText(entry, maxChars).normalize("NFKC");
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      output.push(normalized);
+      if (output.length >= maxItems) break;
+    }
+    return output;
+  };
+  const rawConfidence = Number(policy.minimumConfidence ?? 0);
+  return {
+    maxCandidates: clampInt(policy.maxCandidates, 3, 1, 64),
+    minimumConfidence: Number.isFinite(rawConfidence) ? Math.max(0, Math.min(1, rawConfidence)) : 0,
+    allowedObjectiveTypes: list(policy.allowedObjectiveTypes, 16, 128),
+    requiredCandidateFields: list(policy.requiredCandidateFields, 32, 256),
+    notes: list(policy.notes, 8, 1_000),
+  };
+}
+
 function cacheKey(request: RepositoryAgentRequest, modelId: string, promptVersion: string): string {
   const visionFingerprint = autonomyVisionFingerprint(request);
   return sha256(
@@ -1094,6 +1142,7 @@ function cacheKey(request: RepositoryAgentRequest, modelId: string, promptVersio
             operation: "analyze_autonomy_opportunities",
             visionFingerprint,
             questionProtocol: sha256(compactText(request.question, 32_000)),
+            deterministicPolicy: normalizedDeterministicPolicy(request),
           }
         : {
             revision: request.repository.revision,
@@ -1174,8 +1223,8 @@ function parseCapabilityCircuit(value: unknown): CapabilityCircuitValue | null {
     probeOwner: compactText(value.probeOwner, 256) || null,
     probeRevision:
       typeof value.probeRevision === "number" && Number.isFinite(value.probeRevision)
-      ? clampInt(value.probeRevision, 0, 0, Number.MAX_SAFE_INTEGER)
-      : null,
+        ? clampInt(value.probeRevision, 0, 0, Number.MAX_SAFE_INTEGER)
+        : null,
     updatedAt: compactText(value.updatedAt, 128) || new Date(0).toISOString(),
   };
 }
@@ -1235,6 +1284,7 @@ function factKey(
   request: RepositoryAgentRequest,
   result: RepositoryAgentResult,
   topic = safeFactTopic(request),
+  observationSource: "model_synthesis" | "deterministic_fallback" = "model_synthesis",
 ): string {
   return `analysis_${sha256(
     canonicalJson({
@@ -1244,6 +1294,7 @@ function factKey(
       tree: request.repository.tree,
       purpose: request.purpose,
       topicDigest: topic.digest,
+      observationSource,
       evidence: result.evidence.map((entry) => ({
         path: entry.path,
         blobHash: entry.blobHash ?? null,
@@ -1355,6 +1406,8 @@ export class RepositoryAgentWorker {
   private readonly logger: Pick<Console, "log" | "warn" | "error">;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private stopped = false;
+  private lifecycleGeneration = 0;
   private inFlight: Promise<void> | null = null;
   private readonly activeAnalyses = new Set<AbortController>();
 
@@ -1406,12 +1459,16 @@ export class RepositoryAgentWorker {
   }
 
   start(): void {
-    if (this.running) return;
+    if (this.running || this.stopped) return;
+    this.lifecycleGeneration++;
     this.running = true;
     this.schedule(0);
   }
 
   async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.lifecycleGeneration++;
     this.running = false;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -1433,7 +1490,8 @@ export class RepositoryAgentWorker {
       () => {
         this.timer = null;
         if (!this.running || this.inFlight) return;
-        const operation = this.pollOnce()
+        const generation = this.lifecycleGeneration;
+        const operation = this.pollOnce(generation)
           .catch((error) => {
             this.logger.warn(`[RepositoryAgent] poll failed: ${String(error)}`);
             return this.pollMs;
@@ -1450,7 +1508,8 @@ export class RepositoryAgentWorker {
     );
   }
 
-  async pollOnce(): Promise<number> {
+  async pollOnce(expectedGeneration?: number): Promise<number> {
+    if (this.stopped) return this.pollMs;
     const claimed = await this.control.claim({
       agentId: this.agentId,
       leaseMs: this.leaseMs,
@@ -1464,6 +1523,18 @@ export class RepositoryAgentWorker {
         concurrency: 1,
       },
     });
+    if (
+      this.stopped ||
+      (expectedGeneration !== undefined &&
+        (!this.running || this.lifecycleGeneration !== expectedGeneration))
+    ) {
+      if (claimed.claim) {
+        this.logger.warn(
+          `[RepositoryAgent] discarding delayed claim ${claimed.claim.requestId} after worker lifecycle changed; its fenced lease will be recovered by the queue.`,
+        );
+      }
+      return claimed.pollAfterMs || this.pollMs;
+    }
     if (!claimed.claim) return claimed.pollAfterMs || this.pollMs;
     await this.processClaim(claimed.claim);
     return 0;
@@ -1667,7 +1738,7 @@ export class RepositoryAgentWorker {
     stage: string,
     signal: AbortSignal,
     deadlineMs: number,
-    operation: () => Promise<T>,
+    operation: (stageSignal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     throwIfAborted(signal);
     const remainingMs = deadlineMs - Date.now();
@@ -1678,37 +1749,60 @@ export class RepositoryAgentWorker {
         true,
       );
     }
-    const pending = Promise.resolve().then(operation);
+    const stageController = new AbortController();
+    const abortFromRequest = () => stageController.abort(signal.reason);
+    signal.addEventListener("abort", abortFromRequest, { once: true });
+    if (signal.aborted) abortFromRequest();
+    const pending = Promise.resolve().then(() => operation(stageController.signal));
     let timer: ReturnType<typeof setTimeout> | null = null;
-    let abortListener: (() => void) | null = null;
-    const deadline = new Promise<never>((_resolve, reject) => {
-      const rejectAborted = () => {
-        try {
-          throwIfAborted(signal);
-        } catch (error) {
-          reject(error);
-        }
-      };
-      abortListener = rejectAborted;
-      signal.addEventListener("abort", rejectAborted, { once: true });
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const rejectAborted = () =>
+        reject(stageController.signal.reason ?? new Error(`Repository Agent ${stage} aborted`));
+      stageController.signal.addEventListener("abort", rejectAborted, { once: true });
+      if (stageController.signal.aborted) rejectAborted();
       timer = setTimeout(
-        () =>
-          reject(
+        () => {
+          stageController.abort(
             new RepositoryAgentWorkerError(
               "memory_timeout",
               `Repository Agent ${stage} exceeded its stage deadline`,
               true,
             ),
-          ),
+          );
+        },
         Math.max(1, remainingMs),
       );
     });
     try {
-      return await Promise.race([pending, deadline]);
+      return await Promise.race([pending, aborted]);
     } finally {
       if (timer) clearTimeout(timer);
-      if (abortListener) signal.removeEventListener("abort", abortListener);
+      signal.removeEventListener("abort", abortFromRequest);
     }
+  }
+
+  private async memoryPutWithinDeadline<T extends MemoryJsonValue>(
+    stage: string,
+    signal: AbortSignal,
+    deadlineMs: number,
+    input: MemoryPutInput<T>,
+    options: MemoryPutOptions = {},
+  ): Promise<MemoryRecord<T>> {
+    const suppliedFenceMs =
+      typeof options.validUntil === "string" ? Date.parse(options.validUntil) : Number.NaN;
+    if (options.validUntil !== undefined && !Number.isFinite(suppliedFenceMs)) {
+      throw new TypeError("validUntil must be an ISO timestamp");
+    }
+    const writeFenceMs = Number.isFinite(suppliedFenceMs)
+      ? Math.min(deadlineMs, suppliedFenceMs)
+      : deadlineMs;
+    return await this.memoryWithinDeadline(stage, signal, deadlineMs, (stageSignal) =>
+      this.memory.put(input, {
+        ...options,
+        validUntil: new Date(writeFenceMs).toISOString(),
+        signal: stageSignal,
+      }),
+    );
   }
 
   private async capabilityCircuitPermission(
@@ -1718,7 +1812,9 @@ export class RepositoryAgentWorker {
   ): Promise<CapabilityCircuitPermission> {
     const scope = capabilityScope(request);
     const key = capabilityKey(request, this.modelId, this.promptVersion);
-    const stageDeadlineMs = this.memoryStageDeadline(deadlineMs);
+    const stageDeadlineMs = this.memoryStageDeadline(
+      Math.max(Date.now() + 1, deadlineMs - MIN_FINALIZATION_RESERVE_MS),
+    );
     for (let attempt = 0; attempt < 3; attempt++) {
       let record: MemoryRecord | null;
       try {
@@ -1756,6 +1852,14 @@ export class RepositoryAgentWorker {
           reason: `synthesis circuit ${circuit.state} until ${new Date(blockedUntilMs).toISOString()}`,
         };
       }
+      if (deadlineMs - nowMs < MIN_SYNTHESIS_START_BUDGET_MS) {
+        return {
+          allowed: false,
+          halfOpen: false,
+          observedRevision: record.revision,
+          reason: "synthesis circuit probe skipped because its stage budget was exhausted",
+        };
+      }
       const probeId = randomUUID();
       const probeRevision = record.revision + 1;
       // The lease covers the request's absolute deadline and the bounded
@@ -1778,32 +1882,29 @@ export class RepositoryAgentWorker {
         updatedAt: new Date(nowMs).toISOString(),
       };
       try {
-        const claimed = await this.memoryWithinDeadline(
+        const claimed = await this.memoryPutWithinDeadline(
           "capability half-open claim",
           signal,
           stageDeadlineMs,
-          () =>
-            this.memory.put(
-              {
-                scope,
-                key,
-                kind: "repository_agent_capability_circuit",
-                subjectKey: request.purpose,
-                summary: `Repository Agent synthesis half-open probe for ${request.purpose}`,
-                value: asMemoryJson(next),
-                tags: [request.purpose, "synthesis", "half_open", this.promptVersion, this.modelId],
-                provenance: {
-                  service: "repository_agent",
-                  agentId: this.agentId,
-                  modelId: this.modelId,
-                  promptVersion: this.promptVersion,
-                },
-                confidence: 1,
-                usefulness: 1,
-                ttlMs: Math.max(24 * 60 * 60_000, this.capabilityCircuitCooldownMs * 4),
-              },
-              { expectedRevision: record.revision },
-            ),
+          {
+            scope,
+            key,
+            kind: "repository_agent_capability_circuit",
+            subjectKey: request.purpose,
+            summary: `Repository Agent synthesis half-open probe for ${request.purpose}`,
+            value: asMemoryJson(next),
+            tags: [request.purpose, "synthesis", "half_open", this.promptVersion, this.modelId],
+            provenance: {
+              service: "repository_agent",
+              agentId: this.agentId,
+              modelId: this.modelId,
+              promptVersion: this.promptVersion,
+            },
+            confidence: 1,
+            usefulness: 1,
+            ttlMs: Math.max(24 * 60 * 60_000, this.capabilityCircuitCooldownMs * 4),
+          },
+          { expectedRevision: record.revision },
         );
         if (claimed.revision !== probeRevision) {
           this.logger.warn(
@@ -1858,7 +1959,9 @@ export class RepositoryAgentWorker {
     const scope = capabilityScope(request);
     const key = capabilityKey(request, this.modelId, this.promptVersion);
     const fingerprint = synthesisFailureFingerprint(error);
-    const stageDeadlineMs = this.memoryStageDeadline(deadlineMs);
+    const stageDeadlineMs = this.memoryStageDeadline(
+      Math.max(Date.now() + 1, deadlineMs - MEMORY_TERMINAL_RESULT_RESERVE_MS),
+    );
     for (let attempt = 0; attempt < 3; attempt++) {
       let record: MemoryRecord | null = null;
       try {
@@ -1872,13 +1975,17 @@ export class RepositoryAgentWorker {
         const expired = record ? isExpiredMemoryRecord(record) : false;
         const previous = !expired ? parseCapabilityCircuit(record?.value) : null;
         if (permission.probe) {
+          const probeUntilMs = Date.parse(previous?.probeUntil ?? "");
           if (
             !record ||
             actualRevision !== permission.probe.revision ||
             previous?.state !== "half_open" ||
             previous.probeId !== permission.probe.id ||
             previous.probeOwner !== permission.probe.owner ||
-            previous.probeRevision !== permission.probe.revision
+            previous.probeRevision !== permission.probe.revision ||
+            previous.probeUntil !== permission.probe.until ||
+            !Number.isFinite(probeUntilMs) ||
+            probeUntilMs <= Date.now()
           ) {
             return;
           }
@@ -1909,36 +2016,40 @@ export class RepositoryAgentWorker {
           probeRevision: null,
           updatedAt: now.toISOString(),
         };
-        await this.memoryWithinDeadline("capability failure write", signal, stageDeadlineMs, () =>
-          this.memory.put(
-            {
-              scope,
-              key,
-              kind: "repository_agent_capability_circuit",
-              subjectKey: request.purpose,
-              summary: open
-                ? `Repository Agent synthesis circuit open after ${consecutiveFailures} matching failures`
-                : "Repository Agent synthesis failure observed",
-              value: asMemoryJson(value),
-              tags: [
-                request.purpose,
-                "synthesis",
-                open ? "open" : "failure_observed",
-                this.promptVersion,
-                this.modelId,
-              ],
-              provenance: {
-                service: "repository_agent",
-                agentId: this.agentId,
-                modelId: this.modelId,
-                promptVersion: this.promptVersion,
-              },
-              confidence: 1,
-              usefulness: 1,
-              ttlMs: Math.max(24 * 60 * 60_000, this.capabilityCircuitCooldownMs * 4),
+        const writeDeadlineMs = permission.probe
+          ? Math.min(stageDeadlineMs, Date.parse(permission.probe.until))
+          : stageDeadlineMs;
+        await this.memoryPutWithinDeadline(
+          "capability failure write",
+          signal,
+          writeDeadlineMs,
+          {
+            scope,
+            key,
+            kind: "repository_agent_capability_circuit",
+            subjectKey: request.purpose,
+            summary: open
+              ? `Repository Agent synthesis circuit open after ${consecutiveFailures} matching failures`
+              : "Repository Agent synthesis failure observed",
+            value: asMemoryJson(value),
+            tags: [
+              request.purpose,
+              "synthesis",
+              open ? "open" : "failure_observed",
+              this.promptVersion,
+              this.modelId,
+            ],
+            provenance: {
+              service: "repository_agent",
+              agentId: this.agentId,
+              modelId: this.modelId,
+              promptVersion: this.promptVersion,
             },
-            { expectedRevision: actualRevision },
-          ),
+            confidence: 1,
+            usefulness: 1,
+            ttlMs: Math.max(24 * 60 * 60_000, this.capabilityCircuitCooldownMs * 4),
+          },
+          { expectedRevision: actualRevision },
         );
         return;
       } catch (failure) {
@@ -1959,7 +2070,9 @@ export class RepositoryAgentWorker {
     if (permission.observedRevision == null) return;
     const scope = capabilityScope(request);
     const key = capabilityKey(request, this.modelId, this.promptVersion);
-    const stageDeadlineMs = this.memoryStageDeadline(deadlineMs);
+    const stageDeadlineMs = this.memoryStageDeadline(
+      Math.max(Date.now() + 1, deadlineMs - MEMORY_TERMINAL_RESULT_RESERVE_MS),
+    );
     try {
       const record = await this.memoryWithinDeadline(
         "capability success read",
@@ -1971,12 +2084,16 @@ export class RepositoryAgentWorker {
       const previous = parseCapabilityCircuit(record.value);
       if (!previous) return;
       if (permission.probe) {
+        const probeUntilMs = Date.parse(previous.probeUntil ?? "");
         if (
           record.revision !== permission.probe.revision ||
           previous.state !== "half_open" ||
           previous.probeId !== permission.probe.id ||
           previous.probeOwner !== permission.probe.owner ||
-          previous.probeRevision !== permission.probe.revision
+          previous.probeRevision !== permission.probe.revision ||
+          previous.probeUntil !== permission.probe.until ||
+          !Number.isFinite(probeUntilMs) ||
+          probeUntilMs <= Date.now()
         ) {
           return;
         }
@@ -1996,23 +2113,27 @@ export class RepositoryAgentWorker {
         probeRevision: null,
         updatedAt: new Date().toISOString(),
       };
-      await this.memoryWithinDeadline("capability success write", signal, stageDeadlineMs, () =>
-        this.memory.put(
-          {
-            scope,
-            key,
-            kind: "repository_agent_capability_circuit",
-            subjectKey: request.purpose,
-            summary: `Repository Agent synthesis capability healthy for ${request.purpose}`,
-            value: asMemoryJson(value),
-            tags: [request.purpose, "synthesis", "closed", this.promptVersion, this.modelId],
-            provenance: record.provenance,
-            confidence: 1,
-            usefulness: 1,
-            ttlMs: 24 * 60 * 60_000,
-          },
-          { expectedRevision: record.revision },
-        ),
+      const writeDeadlineMs = permission.probe
+        ? Math.min(stageDeadlineMs, Date.parse(permission.probe.until))
+        : stageDeadlineMs;
+      await this.memoryPutWithinDeadline(
+        "capability success write",
+        signal,
+        writeDeadlineMs,
+        {
+          scope,
+          key,
+          kind: "repository_agent_capability_circuit",
+          subjectKey: request.purpose,
+          summary: `Repository Agent synthesis capability healthy for ${request.purpose}`,
+          value: asMemoryJson(value),
+          tags: [request.purpose, "synthesis", "closed", this.promptVersion, this.modelId],
+          provenance: record.provenance,
+          confidence: 1,
+          usefulness: 1,
+          ttlMs: 24 * 60 * 60_000,
+        },
+        { expectedRevision: record.revision },
       );
     } catch (error) {
       throwIfAborted(signal);
@@ -2030,7 +2151,9 @@ export class RepositoryAgentWorker {
     deadlineMs: number,
   ): Promise<AdvisoryMemory> {
     let records: Array<MemoryRecord> = [];
-    const stageDeadlineMs = this.memoryStageDeadline(deadlineMs);
+    const stageDeadlineMs = this.memoryStageDeadline(
+      Math.max(Date.now() + 1, deadlineMs - MIN_FINALIZATION_RESERVE_MS),
+    );
     try {
       records = await this.memoryWithinDeadline(
         "advisory memory search",
@@ -2250,9 +2373,6 @@ export class RepositoryAgentWorker {
     if (autonomyVisionFingerprint(request) == null) return context;
     const vision = isRecord(context.vision) ? context.vision : {};
     const runtimeSignals = isRecord(context.runtimeSignals) ? context.runtimeSignals : {};
-    const deterministicPolicy = isRecord(context.deterministicPolicy)
-      ? context.deterministicPolicy
-      : {};
     const compactArray = (value: unknown, limit: number) =>
       Array.isArray(value) ? value.slice(0, limit) : [];
     return asMemoryJson({
@@ -2283,13 +2403,7 @@ export class RepositoryAgentWorker {
         recentObjectives: compactArray(runtimeSignals.recentObjectives, 4),
         activeCooldowns: compactArray(runtimeSignals.activeCooldowns, 4),
       },
-      deterministicPolicy: {
-        maxCandidates: deterministicPolicy.maxCandidates ?? 3,
-        minimumConfidence: deterministicPolicy.minimumConfidence ?? 0,
-        allowedObjectiveTypes: compactArray(deterministicPolicy.allowedObjectiveTypes, 16),
-        requiredCandidateFields: compactArray(deterministicPolicy.requiredCandidateFields, 32),
-        notes: compactArray(deterministicPolicy.notes, 8),
-      },
+      deterministicPolicy: normalizedDeterministicPolicy(request),
     }) as RepositoryAgentContext;
   }
 
@@ -2341,7 +2455,11 @@ export class RepositoryAgentWorker {
     const byPath = new Map(
       evidencePacket.files.map((entry) => [comparablePath(entry.path), entry] as const),
     );
+    const exactContextPaths = [
+      ...collectContextPaths([request.question, request.context], tracked),
+    ];
     const preferred = [
+      ...exactContextPaths,
       ...evidencePacket.selectedPaths,
       ...evidencePacket.seedPaths,
       ...evidencePacket.files.map((entry) => entry.path),
@@ -2355,11 +2473,13 @@ export class RepositoryAgentWorker {
         return [
           {
             path: byPath.get(comparable)!.path,
-            rationale: evidencePacket.selectedPaths.some(
-              (selected) => comparablePath(selected) === comparable,
-            )
-              ? "Host-selected purpose-relevant repository evidence available before model synthesis"
-              : "Host-selected repository evidence available before model synthesis",
+            rationale:
+              exactContextPaths.some((selected) => comparablePath(selected) === comparable) ||
+              evidencePacket.selectedPaths.some(
+                (selected) => comparablePath(selected) === comparable,
+              )
+                ? "Host-selected purpose-relevant repository evidence available before model synthesis"
+                : "Host-selected repository evidence available before model synthesis",
           },
         ];
       })
@@ -2465,6 +2585,18 @@ export class RepositoryAgentWorker {
     throwIfAborted(signal);
     const finalizationReserveMs = this.finalizationReserveFor(deadlineMs);
     const synthesisDeadlineMs = deadlineMs - finalizationReserveMs;
+    if (synthesisDeadlineMs - Date.now() < MIN_SYNTHESIS_START_BUDGET_MS) {
+      return {
+        result: this.deterministicFallbackResult(
+          requestId,
+          request,
+          fallbackEvidence,
+          "insufficient synthesis budget after deterministic retrieval",
+        ),
+        inferenceModelId: null,
+        cacheable: false,
+      };
+    }
     const circuit = await this.capabilityCircuitPermission(request, signal, synthesisDeadlineMs);
     throwIfAborted(signal);
     if (!circuit.allowed) {
@@ -2530,7 +2662,9 @@ export class RepositoryAgentWorker {
               context: this.compactSynthesisContext(request),
               repository: {
                 identity: request.repository.identity,
-                revision: request.repository.revision,
+                ...(autonomyVisionFingerprint(request) == null
+                  ? { revision: request.repository.revision }
+                  : {}),
                 tree: request.repository.tree,
                 dirty: request.repository.dirty,
               },
@@ -2624,7 +2758,9 @@ export class RepositoryAgentWorker {
       headSha: request.repository.revision,
       promptVersion: this.promptVersion,
     };
-    const stageDeadlineMs = this.memoryStageDeadline(deadlineMs);
+    const stageDeadlineMs = this.memoryStageDeadline(
+      Math.max(Date.now() + 1, deadlineMs - MEMORY_TERMINAL_RESULT_RESERVE_MS),
+    );
     const cacheEvidence = result.evidence.map((entry) => ({
       path: entry.path,
       blobOid: entry.blobHash,
@@ -2644,39 +2780,43 @@ export class RepositoryAgentWorker {
         observedAt: result.completedAt,
       }));
       if (coordinates.length > 0) {
-        const factRecord = await this.memoryWithinDeadline(
+        const factRecord = await this.memoryPutWithinDeadline(
           "fact memory write",
           signal,
           stageDeadlineMs,
-          () =>
-            this.memory.put({
-              scope: factScope(request),
-              key: factKey(request, result, topic),
-              kind: "repository_evidence_observation",
-              subjectKey: request.purpose,
-              summary: compactText(
-                `Verified repository evidence for ${request.purpose}: ${coordinates
-                  .map((entry) => entry.path)
-                  .join(", ")}`,
-                600,
-              ),
-              value: asMemoryJson({
-                purpose: request.purpose,
-                topicDigest: topic.digest,
-                revision: request.repository.revision,
-                tree: request.repository.tree,
-                evidence: coordinates,
-              }),
-              tags: [
-                request.purpose,
-                ...new Set(coordinates.map((entry) => entry.path.split("/", 1)[0]).filter(Boolean)),
-              ],
-              evidence: factEvidence,
-              provenance,
-              confidence: result.confidence,
-              usefulness: 0.5,
-              ttlMs: this.factTtlMs,
+          {
+            scope: factScope(request),
+            key: factKey(
+              request,
+              result,
+              topic,
+              inferenceModelId ? "model_synthesis" : "deterministic_fallback",
+            ),
+            kind: "repository_evidence_observation",
+            subjectKey: request.purpose,
+            summary: compactText(
+              `Verified repository evidence for ${request.purpose}: ${coordinates
+                .map((entry) => entry.path)
+                .join(", ")}`,
+              600,
+            ),
+            value: asMemoryJson({
+              purpose: request.purpose,
+              topicDigest: topic.digest,
+              revision: request.repository.revision,
+              tree: request.repository.tree,
+              evidence: coordinates,
             }),
+            tags: [
+              request.purpose,
+              ...new Set(coordinates.map((entry) => entry.path.split("/", 1)[0]).filter(Boolean)),
+            ],
+            evidence: factEvidence,
+            provenance,
+            confidence: result.confidence,
+            usefulness: 0.5,
+            ttlMs: this.factTtlMs,
+          },
         );
         learnedResult = {
           ...learnedResult,
@@ -2692,30 +2832,29 @@ export class RepositoryAgentWorker {
 
     if (allowExactCache) {
       try {
-        const cacheRecord = await this.memoryWithinDeadline(
+        const cacheRecord = await this.memoryPutWithinDeadline(
           "exact cache write",
           signal,
           stageDeadlineMs,
-          () =>
-            this.memory.put({
-              scope: cacheScope(request),
-              key,
-              kind: "exact_repository_analysis",
-              subjectKey: request.purpose,
-              summary: compactText(learnedResult.summary, 2_000),
-              value: asMemoryJson({ result: learnedResult }),
-              tags: [
-                request.purpose,
-                "exact",
-                this.promptVersion,
-                inferenceModelId ?? "deterministic",
-              ],
-              evidence: cacheEvidence,
-              provenance,
-              confidence: learnedResult.confidence,
-              usefulness: 0.5,
-              ttlMs: this.cacheTtlMs,
-            }),
+          {
+            scope: cacheScope(request),
+            key,
+            kind: "exact_repository_analysis",
+            subjectKey: request.purpose,
+            summary: compactText(learnedResult.summary, 2_000),
+            value: asMemoryJson({ result: learnedResult }),
+            tags: [
+              request.purpose,
+              "exact",
+              this.promptVersion,
+              inferenceModelId ?? "deterministic",
+            ],
+            evidence: cacheEvidence,
+            provenance,
+            confidence: learnedResult.confidence,
+            usefulness: 0.5,
+            ttlMs: this.cacheTtlMs,
+          },
         );
         learnedResult = {
           ...learnedResult,
@@ -2736,6 +2875,25 @@ export class RepositoryAgentWorker {
       },
       result.requestId,
     );
+  }
+
+  private async assertCurrentSnapshot(
+    repoRoot: string,
+    request: RepositoryAgentRequest,
+    signal: AbortSignal,
+    deadlineMs: number,
+  ): Promise<void> {
+    throwIfAborted(signal);
+    const current = await resolveRepositorySnapshotWithinDeadline(repoRoot, deadlineMs, signal);
+    throwIfAborted(signal);
+    if (current.identity !== request.repository.identity) {
+      throw new RepositoryAgentWorkerError(
+        "repository_identity_mismatch",
+        "Repository Agent request identity does not match its resolved worktree",
+        false,
+      );
+    }
+    assertSnapshot(request, current);
   }
 
   /** Analyze one already-resolved durable request. Useful for direct callers and tests. */
@@ -2830,7 +2988,10 @@ export class RepositoryAgentWorker {
           controller.signal,
           preSynthesisMemoryDeadlineMs,
         );
-        if (cached) return cached;
+        if (cached) {
+          await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
+          return cached;
+        }
       }
       if (request.freshness === "cache_only") {
         throw new RepositoryAgentWorkerError(
@@ -2883,6 +3044,7 @@ export class RepositoryAgentWorker {
         deadlineMs,
       );
       throwIfAborted(controller.signal);
+      await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
       return learned;
     } finally {
       clearTimeout(deadlineTimer);

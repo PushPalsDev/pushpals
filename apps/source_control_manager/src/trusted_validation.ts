@@ -6,7 +6,7 @@ import {
   type TrustedValidationExecutionResult,
 } from "../../../packages/shared/src/trusted_validation.js";
 import { createHash } from "crypto";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { basename, resolve } from "path";
 import {
   buildWindowsProcessTreeTerminationArgv as buildSharedWindowsProcessTreeTerminationArgv,
@@ -14,6 +14,7 @@ import {
   terminateProcessTree as terminateSharedProcessTree,
   type BoundedSubprocess,
 } from "../../../packages/shared/src/bounded_process.js";
+import { copyEnvWithoutScmRepairAuthoritySecret } from "../../../packages/shared/src/scm_repair_authority.js";
 
 export type TrustedValidationCommandResult = TrustedValidationExecutionResult;
 
@@ -25,6 +26,8 @@ export type TrustedValidationOutcome = {
 export type TrustedValidationInvariantContext = {
   /** Exact integration head the candidate was prepared against. */
   baseSha: string;
+  /** Exact candidate tree/content being prepared. */
+  candidateSha: string;
   /** Repository-relative paths changed between the base and candidate trees. */
   affectedPaths: readonly string[];
 };
@@ -59,7 +62,7 @@ export type TrustedValidationProgressCallback = (
 
 type CommandRunner = (
   argv: string[],
-  options: { cwd: string; timeoutMs: number },
+  options: { cwd: string; timeoutMs: number; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }>;
 
 const DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60_000;
@@ -183,6 +186,15 @@ export function trustedValidationInstallFingerprint(options: {
   bunExecutable?: string;
   invariantContext?: TrustedValidationInvariantContext;
 }): string | null {
+  const candidateSha = String(options.invariantContext?.candidateSha ?? "")
+    .trim()
+    .toLowerCase();
+  const baseSha = String(options.invariantContext?.baseSha ?? "")
+    .trim()
+    .toLowerCase();
+  // Install hooks and generated artifacts may depend on candidate contents
+  // outside package/lock files. No exact tree identity means no cache reuse.
+  if (!candidateSha || !baseSha) return null;
   const packagePath = resolve(options.repoPath, "package.json");
   const lockPath = [
     resolve(options.repoPath, "bun.lock"),
@@ -194,11 +206,8 @@ export function trustedValidationInstallFingerprint(options: {
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}\n`);
   hash.update(`version=${typeof Bun !== "undefined" ? Bun.version : "unknown"}\n`);
   if (options.invariantContext) {
-    hash.update(
-      `base=${String(options.invariantContext.baseSha ?? "")
-        .trim()
-        .toLowerCase()}\n`,
-    );
+    hash.update(`candidate=${candidateSha}\n`);
+    hash.update(`base=${baseSha}\n`);
     hash.update(
       `affected=${JSON.stringify(
         normalizeTrustedValidationAffectedPaths(options.invariantContext.affectedPaths),
@@ -213,6 +222,14 @@ export function trustedValidationInstallFingerprint(options: {
 
 function trustedInstallMarkerPath(repoPath: string): string {
   return resolve(repoPath, "node_modules", TRUSTED_INSTALL_MARKER);
+}
+
+function invalidateTrustedInstallMarker(repoPath: string): void {
+  const markerPath = trustedInstallMarkerPath(repoPath);
+  rmSync(markerPath, { force: true });
+  if (existsSync(markerPath)) {
+    throw new Error("Could not invalidate the prior trusted dependency install marker.");
+  }
 }
 
 export function hasFreshTrustedValidationInstall(options: {
@@ -235,11 +252,64 @@ export function hasFreshTrustedValidationInstall(options: {
 async function runTimed(
   runner: CommandRunner,
   argv: string[],
-  options: { cwd: string; timeoutMs: number },
+  options: { cwd: string; timeoutMs: number; signal?: AbortSignal },
 ): Promise<{ ok: boolean; output: string; exitCode: number; durationMs: number }> {
   const startedAt = Date.now();
   const result = await runner(argv, options);
   return { ...result, durationMs: Math.max(0, Date.now() - startedAt) };
+}
+
+function trustedInstallWaitFailure(reason: "timeout" | "cancelled", durationMs: number) {
+  const message =
+    reason === "cancelled"
+      ? "Trusted dependency install wait was cancelled."
+      : "Timed out waiting for the repository's trusted dependency install lock.";
+  return {
+    command: "bun install --frozen-lockfile",
+    ok: false,
+    output: message,
+    exitCode: 124,
+    durationMs: Math.max(0, durationMs),
+    phase: "dependency_install" as const,
+    failureClass: "timeout" as const,
+    failedTests: [],
+    targetPathHints: [],
+    failureLines: [message],
+  };
+}
+
+async function waitForTrustedInstallFlight(
+  promise: Promise<TrustedValidationCommandResult>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<
+  | { state: "completed"; result: TrustedValidationCommandResult }
+  | { state: "failed"; error: unknown }
+  | { state: "timeout" | "cancelled" }
+> {
+  if (signal?.aborted) return { state: "cancelled" };
+  return await new Promise((resolvePromise) => {
+    let settled = false;
+    const finish = (
+      result:
+        | { state: "completed"; result: TrustedValidationCommandResult }
+        | { state: "failed"; error: unknown }
+        | { state: "timeout" | "cancelled" },
+    ) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolvePromise(result);
+    };
+    const onAbort = () => finish({ state: "cancelled" });
+    const timer = setTimeout(() => finish({ state: "timeout" }), Math.max(1, timeoutMs));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (result) => finish({ state: "completed", result }),
+      (error) => finish({ state: "failed", error }),
+    );
+  });
 }
 
 async function ensureTrustedValidationInstall(options: {
@@ -249,92 +319,124 @@ async function ensureTrustedValidationInstall(options: {
   bunExecutable?: string;
   invariantContext?: TrustedValidationInvariantContext;
   runner: CommandRunner;
+  signal?: AbortSignal;
+  singleFlightWaitMs?: number;
 }): Promise<TrustedValidationCommandResult> {
-  if (hasFreshTrustedValidationInstall(options)) {
-    return {
-      command: "bun install --frozen-lockfile",
-      ok: true,
-      output: "Trusted dependency install cache hit for unchanged package and lockfile inputs.",
-      exitCode: 0,
-      durationMs: 0,
-      cached: true,
-      phase: "dependency_install",
-    };
-  }
-
+  const waitStartedAt = Date.now();
+  const waitDeadline =
+    waitStartedAt + Math.max(1, options.singleFlightWaitMs ?? options.timeoutMs + 1_000);
   const flightKey = resolve(options.repoPath);
   const requestedFingerprint = trustedValidationInstallFingerprint(options);
-  const activeFlight = trustedInstallFlights.get(flightKey);
-  if (activeFlight) {
-    const activeResult = await activeFlight.promise;
-    if (activeFlight.fingerprint === requestedFingerprint) {
-      if (!activeResult.ok || !hasFreshTrustedValidationInstall(options)) return activeResult;
-      return {
-        command: "bun install --frozen-lockfile",
-        ok: true,
-        output: "Trusted dependency install cache hit after waiting for another validation.",
-        exitCode: 0,
-        durationMs: 0,
-        cached: true,
-        phase: "dependency_install",
-      };
+  let waitedForFlight = false;
+  while (true) {
+    if (options.signal?.aborted) {
+      return trustedInstallWaitFailure("cancelled", Date.now() - waitStartedAt);
     }
-  }
-  const flight = (async (): Promise<TrustedValidationCommandResult> => {
+    const activeFlight = trustedInstallFlights.get(flightKey);
+    if (activeFlight) {
+      waitedForFlight = true;
+      const remainingMs = waitDeadline - Date.now();
+      if (remainingMs <= 0) {
+        return trustedInstallWaitFailure("timeout", Date.now() - waitStartedAt);
+      }
+      const waited = await waitForTrustedInstallFlight(
+        activeFlight.promise,
+        remainingMs,
+        options.signal,
+      );
+      if (waited.state === "failed") throw waited.error;
+      if (waited.state !== "completed") {
+        return trustedInstallWaitFailure(waited.state, Date.now() - waitStartedAt);
+      }
+      if (trustedInstallFlights.get(flightKey) === activeFlight) {
+        trustedInstallFlights.delete(flightKey);
+      }
+      if (activeFlight.fingerprint === requestedFingerprint && !waited.result.ok) {
+        return waited.result;
+      }
+      continue;
+    }
+    // A marker is only meaningful while no install is mutating this repo's
+    // dependency tree. Always drain the active per-repo flight first, even if
+    // the marker currently matches this caller's candidate.
     if (hasFreshTrustedValidationInstall(options)) {
       return {
         command: "bun install --frozen-lockfile",
         ok: true,
-        output: "Trusted dependency install cache hit after waiting for another validation.",
+        output: waitedForFlight
+          ? "Trusted dependency install cache hit after waiting for another validation."
+          : "Trusted dependency install cache hit for unchanged candidate inputs.",
         exitCode: 0,
         durationMs: 0,
         cached: true,
         phase: "dependency_install",
       };
     }
-    const preparation = await runTimed(options.runner, options.preparationArgv, {
-      cwd: options.repoPath,
-      timeoutMs: options.timeoutMs,
-    });
-    const evidence = preparation.ok
-      ? null
-      : extractTrustedValidationFailureEvidence({
-          command: "bun install --frozen-lockfile",
-          phase: "dependency_install",
-          output: preparation.output,
-          exitCode: preparation.exitCode,
+
+    const flight = (async (): Promise<TrustedValidationCommandResult> => {
+      // A non-cached install can mutate the shared dependency tree before it
+      // succeeds. Invalidate any marker from a different candidate first so a
+      // waiter cannot treat that pre-mutation state as trusted after this
+      // flight fails or is cancelled. Removal is synchronous and fail-closed:
+      // the install runner is never entered while an old marker remains.
+      invalidateTrustedInstallMarker(options.repoPath);
+      let preparation: Awaited<ReturnType<typeof runTimed>>;
+      try {
+        preparation = await runTimed(options.runner, options.preparationArgv, {
+          cwd: options.repoPath,
+          timeoutMs: options.timeoutMs,
+          signal: options.signal,
         });
-    const result: TrustedValidationCommandResult = {
-      command: "bun install --frozen-lockfile",
-      ...preparation,
-      output: truncateTrustedValidationOutput(preparation.output),
-      phase: "dependency_install",
-      ...(evidence ?? {}),
-    };
-    if (preparation.ok) {
-      const fingerprint = trustedValidationInstallFingerprint(options);
-      if (fingerprint) {
-        try {
-          writeFileSync(
-            trustedInstallMarkerPath(options.repoPath),
-            JSON.stringify({ schemaVersion: 2, fingerprint, updatedAt: new Date().toISOString() }),
-            "utf8",
-          );
-        } catch {
-          // A successful install remains valid for this run; a later run will
-          // simply reinstall if its marker could not be persisted.
+      } catch (error) {
+        if (options.signal?.aborted) {
+          return trustedInstallWaitFailure("cancelled", Date.now() - waitStartedAt);
+        }
+        throw error;
+      }
+      const evidence = preparation.ok
+        ? null
+        : extractTrustedValidationFailureEvidence({
+            command: "bun install --frozen-lockfile",
+            phase: "dependency_install",
+            output: preparation.output,
+            exitCode: preparation.exitCode,
+          });
+      const result: TrustedValidationCommandResult = {
+        command: "bun install --frozen-lockfile",
+        ...preparation,
+        output: truncateTrustedValidationOutput(preparation.output),
+        phase: "dependency_install",
+        ...(evidence ?? {}),
+      };
+      if (preparation.ok) {
+        const fingerprint = trustedValidationInstallFingerprint(options);
+        if (fingerprint) {
+          try {
+            writeFileSync(
+              trustedInstallMarkerPath(options.repoPath),
+              JSON.stringify({
+                schemaVersion: 3,
+                fingerprint,
+                updatedAt: new Date().toISOString(),
+              }),
+              "utf8",
+            );
+          } catch {
+            // A successful install remains valid for this run; a later run will
+            // simply reinstall if its marker could not be persisted.
+          }
         }
       }
-    }
-    return result;
-  })();
-  const flightRecord = { fingerprint: requestedFingerprint, promise: flight };
-  trustedInstallFlights.set(flightKey, flightRecord);
-  try {
-    return await flight;
-  } finally {
-    if (trustedInstallFlights.get(flightKey) === flightRecord) {
-      trustedInstallFlights.delete(flightKey);
+      return result;
+    })();
+    const flightRecord = { fingerprint: requestedFingerprint, promise: flight };
+    trustedInstallFlights.set(flightKey, flightRecord);
+    try {
+      return await flight;
+    } finally {
+      if (trustedInstallFlights.get(flightKey) === flightRecord) {
+        trustedInstallFlights.delete(flightKey);
+      }
     }
   }
 }
@@ -421,14 +523,15 @@ export async function terminateProcessTree(
 
 export async function runProcessWithTreeTimeout(
   argv: string[],
-  options: { cwd: string; timeoutMs: number },
+  options: { cwd: string; timeoutMs: number; signal?: AbortSignal },
 ): Promise<{ ok: boolean; output: string; exitCode: number; timedOut?: boolean }> {
   const result = await runBoundedProcess(argv, {
     cwd: options.cwd,
-    env: { ...process.env },
+    env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
     timeoutMs: Math.max(1, options.timeoutMs),
     outputLimitBytes: PROCESS_OUTPUT_LIMIT_BYTES,
     streamDrainTimeoutMs: PROCESS_STREAM_DRAIN_GRACE_MS,
+    signal: options.signal,
   });
   return {
     ok: !result.timedOut && result.exitCode === 0,
@@ -446,6 +549,8 @@ export async function runTrustedValidationCommands(options: {
   runner?: CommandRunner;
   retryTransientFailures?: boolean;
   onProgress?: TrustedValidationProgressCallback;
+  signal?: AbortSignal;
+  singleFlightWaitMs?: number;
   /**
    * Scopes only candidate-invariant preparation caching. Validation commands
    * always execute against the exact candidate and are never reused.
@@ -486,6 +591,8 @@ export async function runTrustedValidationCommands(options: {
       bunExecutable: options.bunExecutable,
       invariantContext: options.invariantContext,
       runner,
+      signal: options.signal,
+      singleFlightWaitMs: options.singleFlightWaitMs,
     });
     emitTrustedValidationProgress(options.onProgress, {
       boundary: "complete",
@@ -527,6 +634,8 @@ export async function runTrustedValidationCommands(options: {
           bunExecutable: options.bunExecutable,
           invariantContext: options.invariantContext,
           runner,
+          signal: options.signal,
+          singleFlightWaitMs: options.singleFlightWaitMs,
         })),
         attempt: 2,
         retryReason: "transient_infrastructure",
@@ -554,7 +663,11 @@ export async function runTrustedValidationCommands(options: {
         command,
         attempt,
       });
-      const result = await runTimed(runner, resolvedArgv, { cwd: options.repoPath, timeoutMs });
+      const result = await runTimed(runner, resolvedArgv, {
+        cwd: options.repoPath,
+        timeoutMs,
+        signal: options.signal,
+      });
       const evidence = result.ok
         ? null
         : extractTrustedValidationFailureEvidence({

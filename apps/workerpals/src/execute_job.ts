@@ -4,6 +4,7 @@
  */
 
 import { createHash } from "crypto";
+import { AsyncLocalStorage } from "async_hooks";
 import {
   existsSync,
   lstatSync,
@@ -19,6 +20,7 @@ import {
 import { basename, isAbsolute, resolve } from "path";
 import {
   buildGitCommitArgs as buildSourceControlGitCommitArgs,
+  copyEnvWithoutScmRepairAuthoritySecret,
   explicitSourceControlCommitIdentityFromEnv,
   loadPromptTemplate,
   loadPushPalsConfig,
@@ -74,6 +76,7 @@ import {
 } from "./merge_conflict_job.js";
 
 const DEFAULT_CONFIG = loadPushPalsConfig();
+const workerGitDeadlineContext = new AsyncLocalStorage<JobDeadlineLedger>();
 
 export interface TaskExecutePlanning {
   intent: TaskExecuteIntent;
@@ -1108,8 +1111,9 @@ export function classifyValidationRunFailure(run: ValidationExecutionResult): st
   ) {
     return "timeout";
   }
+  if (run.exitCode === 127) return "missing_tool";
+  if (hasConcreteAssertionFailureEvidence(combined)) return "nonzero_exit";
   if (
-    run.exitCode === 127 ||
     combined.includes("missing required tool") ||
     combined.includes("command not found") ||
     combined.includes("executable not found") ||
@@ -1117,7 +1121,6 @@ export function classifyValidationRunFailure(run: ValidationExecutionResult): st
   ) {
     return "missing_tool";
   }
-  if (hasConcreteAssertionFailureEvidence(combined)) return "nonzero_exit";
   if (isDockerDaemonValidationBlocker(combined)) {
     return "environment";
   }
@@ -3523,7 +3526,9 @@ async function checkToolCandidate(
 
 async function checkToolAvailability(
   requirements: ToolRequirement[],
-  env: Record<string, string> = withResolvedBunOnPath(process.env as Record<string, string>),
+  env: Record<string, string> = withResolvedBunOnPath(
+    copyEnvWithoutScmRepairAuthoritySecret(process.env),
+  ),
   deadlineLedger?: JobDeadlineLedger,
 ): Promise<ToolAvailabilityResult[]> {
   const cache = new Map<string, Promise<boolean>>();
@@ -4162,8 +4167,14 @@ function validationFileFingerprint(repo: string, changedPaths: string[]): string
   return hash.digest("hex");
 }
 
-async function validationCacheContext(repo: string, changedPaths: string[]): Promise<string> {
-  const head = await git(repo, ["rev-parse", "HEAD"]);
+export async function validationCacheContext(
+  repo: string,
+  changedPaths: string[],
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<string> {
+  const head = deadlineLedger
+    ? await git(repo, ["rev-parse", "HEAD"], deadlineLedger, "work")
+    : await git(repo, ["rev-parse", "HEAD"]);
   return `${head.ok ? head.stdout.trim() : "unknown-head"}:${validationFileFingerprint(
     repo,
     changedPaths,
@@ -6024,12 +6035,14 @@ async function runDeterministicQualityGate(
     };
   }
 
-  const statusResult = await git(repo, ["status", "--porcelain"]);
+  const statusResult = deadlineLedger
+    ? await git(repo, ["status", "--porcelain"], deadlineLedger, "work")
+    : await git(repo, ["status", "--porcelain"]);
   const rawChangedPaths = statusResult.ok
     ? expandKnownArtifactDirectoryPaths(repo, parseChangedPathsFromStatus(statusResult.stdout))
     : [];
   const changedPaths = statusResult.ok
-    ? await filterChangedPathsByGitContentDelta(repo, rawChangedPaths)
+    ? await filterChangedPathsByGitContentDelta(repo, rawChangedPaths, deadlineLedger)
     : rawChangedPaths;
   const preparedMergeConflictPaths = extractPreparedMergeConflictPaths(params);
   const changedTestPaths = Array.from(
@@ -6134,7 +6147,7 @@ async function runDeterministicQualityGate(
   const validationPlanByCommand = new Map(
     validationExecutionPlan.map((node) => [validationCommandKey(node.command), node] as const),
   );
-  const cacheContext = await validationCacheContext(repo, changedPaths);
+  const cacheContext = await validationCacheContext(repo, changedPaths, deadlineLedger);
   const runValidationWithCache = async (
     command: string,
     runner: () => Promise<ValidationExecutionResult>,
@@ -7090,7 +7103,7 @@ async function runTaskCriticReview(
 
   const buildAttemptPayload = async (compact: boolean) => {
     const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff);
+    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
       0,
       resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
@@ -7885,11 +7898,30 @@ export function resolveWorkerGitCommandTimeoutMs(
 export async function git(
   cwd: string,
   args: string[],
+  deadlineLedger?: JobDeadlineLedger,
+  deadlinePhase: "work" | "total" = "total",
 ): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number | null }> {
   try {
+    const configuredTimeoutMs = resolveWorkerGitCommandTimeoutMs(args);
+    const activeDeadlineLedger = deadlineLedger ?? workerGitDeadlineContext.getStore();
+    const timeoutMs = activeDeadlineLedger
+      ? deadlinePhase === "work"
+        ? activeDeadlineLedger.capWorkTimeout(configuredTimeoutMs)
+        : activeDeadlineLedger.capTotalTimeout(configuredTimeoutMs)
+      : configuredTimeoutMs;
+    if (timeoutMs <= 0) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: `git ${String(args[0] ?? "command")} did not start because the absolute job ${
+          deadlinePhase === "work" ? "work" : "finalization"
+        } deadline expired`,
+        exitCode: 124,
+      };
+    }
     const result = await runBoundedWorkerProcess(["git", ...args], {
       cwd,
-      timeoutMs: resolveWorkerGitCommandTimeoutMs(args),
+      timeoutMs,
       outputLimitBytes: 4 * 1024 * 1024,
       preserveOutputWhitespace: true,
     });
@@ -7907,7 +7939,23 @@ export async function git(
 
 // ─── Git commit creation ─────────────────────────────────────────────────────
 
-export async function buildCriticDiffText(repo: string, changedPaths: string[]): Promise<string> {
+function gitDuringJobWork(
+  repo: string,
+  args: string[],
+  deadlineLedger?: JobDeadlineLedger,
+): ReturnType<typeof git> {
+  return deadlineLedger
+    ? git(repo, args, deadlineLedger, "work")
+    : // With no explicit work ledger, preserve any finalization context owned
+      // by the caller (candidate checkpointing uses the total reserve).
+      git(repo, args);
+}
+
+export async function buildCriticDiffText(
+  repo: string,
+  changedPaths: string[],
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<string> {
   const paths = Array.from(
     new Set(
       publishableChangedPaths(changedPaths)
@@ -7918,33 +7966,38 @@ export async function buildCriticDiffText(repo: string, changedPaths: string[]):
   if (paths.length === 0) return "";
 
   const chunks: string[] = [];
-  const trackedDiff = await git(repo, ["diff", "HEAD", "--", ...paths]);
+  const trackedDiff = await gitDuringJobWork(
+    repo,
+    ["diff", "HEAD", "--", ...paths],
+    deadlineLedger,
+  );
   if (trackedDiff.stdout) {
     chunks.push(trackedDiff.stdout);
   } else if (!trackedDiff.ok) {
     const [unstagedDiff, stagedDiff] = await Promise.all([
-      git(repo, ["diff", "--", ...paths]),
-      git(repo, ["diff", "--cached", "--", ...paths]),
+      gitDuringJobWork(repo, ["diff", "--", ...paths], deadlineLedger),
+      gitDuringJobWork(repo, ["diff", "--cached", "--", ...paths], deadlineLedger),
     ]);
     if (unstagedDiff.stdout) chunks.push(unstagedDiff.stdout);
     if (stagedDiff.stdout) chunks.push(stagedDiff.stdout);
   }
 
-  const untrackedResult = await git(repo, [
-    "ls-files",
-    "-z",
-    "--others",
-    "--exclude-standard",
-    "--",
-    ...paths,
-  ]);
+  const untrackedResult = await gitDuringJobWork(
+    repo,
+    ["ls-files", "-z", "--others", "--exclude-standard", "--", ...paths],
+    deadlineLedger,
+  );
   if (untrackedResult.ok) {
     const untrackedPaths = untrackedResult.stdout
       .split("\u0000")
       .map((path) => normalizeChangedPathForCommit(path))
       .filter((path): path is string => Boolean(path));
     for (const path of untrackedPaths) {
-      const newFileDiff = await git(repo, ["diff", "--no-index", "--", "/dev/null", path]);
+      const newFileDiff = await gitDuringJobWork(
+        repo,
+        ["diff", "--no-index", "--", "/dev/null", path],
+        deadlineLedger,
+      );
       if (newFileDiff.stdout) chunks.push(newFileDiff.stdout);
     }
   }
@@ -7952,15 +8005,27 @@ export async function buildCriticDiffText(repo: string, changedPaths: string[]):
   return chunks.join("\n");
 }
 
-async function trackedPathHasGitContentDelta(repo: string, path: string): Promise<boolean | null> {
-  const tracked = await git(repo, ["ls-files", "--error-unmatch", "--", path]);
+async function trackedPathHasGitContentDelta(
+  repo: string,
+  path: string,
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<boolean | null> {
+  const tracked = await gitDuringJobWork(
+    repo,
+    ["ls-files", "--error-unmatch", "--", path],
+    deadlineLedger,
+  );
   if (!tracked.ok) return null;
 
-  const unstaged = await git(repo, ["diff", "--quiet", "--", path]);
+  const unstaged = await gitDuringJobWork(repo, ["diff", "--quiet", "--", path], deadlineLedger);
   if (unstaged.exitCode === 1) return true;
   if (unstaged.exitCode !== 0) return null;
 
-  const staged = await git(repo, ["diff", "--cached", "--quiet", "--", path]);
+  const staged = await gitDuringJobWork(
+    repo,
+    ["diff", "--cached", "--quiet", "--", path],
+    deadlineLedger,
+  );
   if (staged.exitCode === 1) return true;
   if (staged.exitCode !== 0) return null;
 
@@ -7970,11 +8035,12 @@ async function trackedPathHasGitContentDelta(repo: string, path: string): Promis
 export async function filterChangedPathsByGitContentDelta(
   repo: string,
   changedPaths: string[],
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<string[]> {
   const [trackedResult, unstagedResult, stagedResult] = await Promise.all([
-    git(repo, ["ls-files"]),
-    git(repo, ["diff", "--name-only", "--no-renames"]),
-    git(repo, ["diff", "--cached", "--name-only", "--no-renames"]),
+    gitDuringJobWork(repo, ["ls-files"], deadlineLedger),
+    gitDuringJobWork(repo, ["diff", "--name-only", "--no-renames"], deadlineLedger),
+    gitDuringJobWork(repo, ["diff", "--cached", "--name-only", "--no-renames"], deadlineLedger),
   ]);
   const canFilterInBatch = trackedResult.ok && unstagedResult.ok && stagedResult.ok;
   const trackedPaths = new Set(
@@ -8002,7 +8068,7 @@ export async function filterChangedPathsByGitContentDelta(
       ? trackedPaths.has(path)
         ? trackedContentDeltas.has(path)
         : null
-      : await trackedPathHasGitContentDelta(repo, path);
+      : await trackedPathHasGitContentDelta(repo, path, deadlineLedger);
     if (trackedDelta === false) continue;
     out.push(path);
   }
@@ -8108,7 +8174,13 @@ export async function checkpointJobCandidate(
   candidateState: JobCandidateState,
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
   baselineSha?: string | null,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<JobCandidateState> {
+  if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
+    return workerGitDeadlineContext.run(deadlineLedger, () =>
+      checkpointJobCandidate(repo, workerId, job, candidateState, runtimeConfig, baselineSha),
+    );
+  }
   const candidateRef = `refs/pushpals/candidates/${retainedCandidateRefComponent(
     workerId,
   )}/${retainedCandidateRefComponent(job.id)}`;
@@ -8263,7 +8335,13 @@ export async function createJobCommit(
     deferPublication?: boolean;
   },
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<CreateJobCommitResult> {
+  if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
+    return workerGitDeadlineContext.run(deadlineLedger, () =>
+      createJobCommit(repo, workerId, job, runtimeConfig),
+    );
+  }
   let finalizationUsageAttempts: JobUsageAttempt[] = [];
   const finish = (result: CreateJobCommitResult): CreateJobCommitResult =>
     attachCommitFinalizationUsage(result, finalizationUsageAttempts);
@@ -9116,6 +9194,7 @@ export async function resumePreparedMergeConflictRebase(
   kind: string,
   params?: Record<string, unknown>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<
   | {
       ok: true;
@@ -9126,7 +9205,19 @@ export async function resumePreparedMergeConflictRebase(
     }
   | { ok: false; error: string }
 > {
+  if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
+    return workerGitDeadlineContext.run(deadlineLedger, () =>
+      resumePreparedMergeConflictRebase(repo, kind, params, onLog),
+    );
+  }
+  const activeDeadlineLedger = deadlineLedger ?? workerGitDeadlineContext.getStore();
+  const deadlineFailure = (): { ok: false; error: string } => ({
+    ok: false,
+    error: "Prepared merge-conflict rebase stopped because the absolute job work deadline expired.",
+  });
+  if (activeDeadlineLedger?.workExpired()) return deadlineFailure();
   const sequencer = await activeGitOperation(repo);
+  if (activeDeadlineLedger?.workExpired()) return deadlineFailure();
   if (sequencer !== "rebase") {
     return { ok: true, resumed: false, sequencer };
   }
@@ -10097,9 +10188,18 @@ async function generateCommitMessageFromDiffViaCodex(
 ): Promise<CommitMessageGenerationOutcome | null> {
   const model = runtimeConfig.workerpals.llm.model.trim();
   if (!model) return null;
-  const codexPrefix = await resolveCodexCommandPrefix(repo, runtimeConfig.workerpals.llm.codexBin);
+  const finalizationLedger = workerGitDeadlineContext.getStore();
+  const codexPrefix = await resolveCodexCommandPrefix(
+    repo,
+    runtimeConfig.workerpals.llm.codexBin,
+    finalizationLedger,
+  );
   if (!codexPrefix) return null;
-  const timeoutMs = resolveCommitMessageGeneratorTimeoutMs(runtimeConfig);
+  const configuredTimeoutMs = resolveCommitMessageGeneratorTimeoutMs(runtimeConfig);
+  const timeoutMs = finalizationLedger
+    ? finalizationLedger.capTotalTimeout(configuredTimeoutMs)
+    : configuredTimeoutMs;
+  if (timeoutMs <= 0) return null;
   const reasoningEffort = normalizeCodexReasoningEffort(
     runtimeConfig.workerpals.llm.reasoningEffort,
     model,
@@ -10216,10 +10316,15 @@ export async function generateCommitMessageFromDiffViaHttpWithUsage(
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  const timeoutMs = Math.max(
+  const configuredTimeoutMs = Math.max(
     1,
     Math.floor(requestOptions.timeoutMs ?? resolveCommitMessageGeneratorTimeoutMs(runtimeConfig)),
   );
+  const finalizationLedger = workerGitDeadlineContext.getStore();
+  const timeoutMs = finalizationLedger
+    ? finalizationLedger.capTotalTimeout(configuredTimeoutMs)
+    : configuredTimeoutMs;
+  if (timeoutMs <= 0) return null;
   try {
     const response = await fetchBufferedWithHardDeadline({
       input: endpoint,
@@ -10887,7 +10992,7 @@ async function runCodexCriticReview(
 
   const buildCriticInstruction = async (compact: boolean) => {
     const changedForDiff = criticChangedPaths.slice(0, compact ? 4 : 8);
-    let diffText = await buildCriticDiffText(repo, changedForDiff);
+    let diffText = await buildCriticDiffText(repo, changedForDiff, deadlineLedger);
     diffText = compactJobOutput(diffText, outputPolicyForRuntime(runtimeConfig)).slice(
       0,
       resolveQualityCriticMaxDiffChars(runtimeConfig, compact),
@@ -11127,12 +11232,40 @@ async function runCodexCriticReview(
   }
 }
 
+export function enforceJobDeadlineBeforeSuccess(
+  result: JobResult,
+  deadlineLedger: JobDeadlineLedger,
+  changedPaths: string[] = [],
+): JobResult {
+  if (!result.ok || !deadlineLedger.workExpired()) return result;
+  const detail =
+    "The shared execution budget expired before the quality loop produced its terminal result; the finalization reserve cannot turn a late result into ordinary success.";
+  return {
+    ...result,
+    ok: false,
+    summary: "Job reached its absolute deadline before quality completion",
+    stderr: [result.stderr, detail].filter(Boolean).join("\n"),
+    exitCode: 124,
+    candidateState: {
+      ...(result.candidateState ?? {}),
+      status: "partial",
+      reason: "absolute_job_deadline",
+      changedPaths: publishableChangedPaths(
+        result.candidateState?.changedPaths?.length
+          ? result.candidateState.changedPaths
+          : changedPaths,
+      ),
+    },
+  };
+}
+
 export async function executeJob(
   kind: string,
   params: Record<string, unknown>,
   repo: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
   runtimeConfig: WorkerpalsRuntimeConfig = DEFAULT_CONFIG,
+  deadlineLedgerOverride?: JobDeadlineLedger,
 ): Promise<JobResult> {
   if (!SUPPORTED_JOB_KINDS.has(kind)) {
     return {
@@ -11278,12 +11411,14 @@ export async function executeJob(
 
   let revisionAttempt = 0;
   let revisionHint = "";
-  const jobStartedAt = Date.now();
-  const deadlineLedger = new JobDeadlineLedger({
-    executionBudgetMs,
-    finalizationBudgetMs,
-    startedAtMs: jobStartedAt,
-  });
+  const jobStartedAt = deadlineLedgerOverride?.startedAtMs ?? Date.now();
+  const deadlineLedger =
+    deadlineLedgerOverride ??
+    new JobDeadlineLedger({
+      executionBudgetMs,
+      finalizationBudgetMs,
+      startedAtMs: jobStartedAt,
+    });
   const usageAccumulator = new UsageAccumulator();
   const finalizeResult = <T extends JobResult>(terminalResult: T): T =>
     usageAccumulator.apply({
@@ -11325,7 +11460,9 @@ export async function executeJob(
       requestedExecuteBudgets.finalizationBudgetMs,
     );
     if (!defaultExecuteBudgets) {
-      const changed = await git(repo, ["status", "--porcelain"]);
+      // Candidate inspection is finalization work, so it may use the reserve
+      // but remains bounded by the same absolute total deadline.
+      const changed = await git(repo, ["status", "--porcelain"], deadlineLedger, "total");
       const changedPaths = changed.ok
         ? publishableChangedPaths(parseChangedPathsFromStatus(changed.stdout))
         : [];
@@ -11403,7 +11540,32 @@ export async function executeJob(
         break;
       }
 
-      const resume = await resumePreparedMergeConflictRebase(repo, kind, attemptParams, onLog);
+      const resume = await resumePreparedMergeConflictRebase(
+        repo,
+        kind,
+        attemptParams,
+        onLog,
+        deadlineLedger,
+      );
+      if (deadlineLedger.workExpired()) {
+        return finalizeResult({
+          ok: false,
+          summary: "Job deadline reached during merge-conflict rebase continuation",
+          stdout: currentResult.stdout,
+          stderr: [
+            currentResult.stderr ?? "",
+            "The shared work budget expired while host-side Git inspected or advanced the prepared rebase.",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          exitCode: 124,
+          candidateState: {
+            status: "partial",
+            reason: "absolute_job_deadline",
+            changedPaths: [],
+          },
+        });
+      }
       if (!resume.ok) {
         onLog?.("stderr", `[MergeConflict] ${resume.error}`);
         return finalizeResult({
@@ -11527,7 +11689,7 @@ export async function executeJob(
     }
     executorElapsedMs = Date.now() - attemptStartedAt;
 
-    const preQualityStatus = await git(repo, ["status", "--porcelain"]);
+    const preQualityStatus = await git(repo, ["status", "--porcelain"], deadlineLedger, "work");
     const rawPreQualityChangedPaths = preQualityStatus.ok
       ? expandKnownArtifactDirectoryPaths(
           repo,
@@ -11535,7 +11697,7 @@ export async function executeJob(
         )
       : [];
     const preQualityChangedPaths = preQualityStatus.ok
-      ? await filterChangedPathsByGitContentDelta(repo, rawPreQualityChangedPaths)
+      ? await filterChangedPathsByGitContentDelta(repo, rawPreQualityChangedPaths, deadlineLedger)
       : rawPreQualityChangedPaths;
     const preQualityPublishablePaths = publishableChangedPaths(preQualityChangedPaths);
     if (preQualityChangedPaths.length > 0) {
@@ -11793,11 +11955,16 @@ export async function executeJob(
       terminalResult: JobResult,
       terminalStage: string,
       changedPaths: string[] = quality.changedPaths,
-    ): JobResult =>
-      finalizeResult(
-        withJobDiagnostics(terminalResult, {
+    ): JobResult => {
+      const deadlineSafeResult = enforceJobDeadlineBeforeSuccess(
+        terminalResult,
+        deadlineLedger,
+        changedPaths,
+      );
+      return finalizeResult(
+        withJobDiagnostics(deadlineSafeResult, {
           terminal: buildTerminalDiagnostics({
-            result: terminalResult,
+            result: deadlineSafeResult,
             executor,
             changedPaths,
             terminalStage,
@@ -11816,6 +11983,7 @@ export async function executeJob(
           patchSnapshots: [...diagnosticPatchSnapshots],
         }),
       );
+    };
     if (unchangedValidationFailure) {
       const detail =
         `Validation failed unchanged after two attempts for "${unchangedValidationFailure.command}": ` +

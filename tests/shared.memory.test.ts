@@ -56,6 +56,23 @@ describe("shared memory contract", () => {
     expect(updated.summary).toContain("public HTTP routes");
   });
 
+  test("rejects a staged write at the exact commit-fence clock boundary", async () => {
+    const nowMs = Date.parse("2026-08-26T12:00:00.000Z");
+    const store = new InMemoryMemoryStore({ now: () => new Date(nowMs) });
+
+    await expect(
+      store.put(input("expired-boundary", "Must not commit."), {
+        validUntil: new Date(nowMs).toISOString(),
+      }),
+    ).rejects.toThrow("commit fence expired");
+    expect(await store.get({ scope: SCOPE, key: "expired-boundary" })).toBeNull();
+
+    const live = await store.put(input("live-boundary", "May commit."), {
+      validUntil: new Date(nowMs + 1).toISOString(),
+    });
+    expect(live.revision).toBe(1);
+  });
+
   test("search is repository-scoped, relevant, filtered, and bounded", async () => {
     const store = new InMemoryMemoryStore();
     await store.put(input("api-owner", "HTTP routing and API request ownership."));
@@ -293,5 +310,43 @@ describe("MemoryHttpClient", () => {
       fetchImpl: () => new Promise<Response>(() => undefined),
     });
     await expect(hanging.search({ scope: SCOPE })).rejects.toThrow("timed out");
+  });
+
+  test("cancels a delayed HTTP write and keeps its durable commit fence off the wire signal", async () => {
+    const durable = new InMemoryMemoryStore();
+    let postedOptions: Record<string, unknown> | null = null;
+    let delayedSettled = false;
+    const client = new MemoryHttpClient({
+      serverUrl: "http://127.0.0.1:3001",
+      timeoutMs: 500,
+      fetchImpl: async (_request, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          input: ReturnType<typeof input>;
+          options: Record<string, unknown>;
+        };
+        postedOptions = body.options;
+        await Bun.sleep(50);
+        try {
+          const record = await durable.put(body.input, body.options);
+          return Response.json({ ok: true, record });
+        } finally {
+          delayedSettled = true;
+        }
+      },
+    });
+    const controller = new AbortController();
+    const pending = client.put(input("delayed-http", "Must not appear after cancellation."), {
+      validUntil: new Date(Date.now() + 20).toISOString(),
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(new Error("memory stage elapsed")), 5);
+
+    await expect(pending).rejects.toThrow("memory stage elapsed");
+    await Bun.sleep(75);
+
+    expect(delayedSettled).toBe(true);
+    expect(postedOptions?.validUntil).toBeString();
+    expect(postedOptions).not.toHaveProperty("signal");
+    expect(await durable.get({ scope: SCOPE, key: "delayed-http" })).toBeNull();
   });
 });

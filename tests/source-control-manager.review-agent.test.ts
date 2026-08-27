@@ -7,6 +7,7 @@ import {
   buildReviewFeedbackContext,
   buildReviewPrompt,
   buildCodexExecArgs,
+  buildCodexEnv,
   collectReviewHygieneIssuesFromDiff,
   deriveFixWriteGlobsFromDiff,
   deriveReviewTaskValidationSteps,
@@ -18,6 +19,13 @@ import {
   type ReviewAgentConfig,
 } from "../apps/source_control_manager/src/review_agent";
 import type { GitHubPR } from "../apps/source_control_manager/src/github_pr";
+import {
+  SCM_REPAIR_AUTHORITY_HEADER,
+  SCM_REPAIR_AUTHORITY_SECRET_ENV,
+  verifyScmRepairAuthorityProof,
+} from "../packages/shared/src/scm_repair_authority";
+
+const TEST_SCM_REPAIR_AUTHORITY_SECRET = "test-scm-repair-authority-secret-0123456789abcdef";
 
 const baseConfig: ReviewAgentConfig = {
   enabled: true,
@@ -73,6 +81,27 @@ const silentLogs = {
 };
 
 describe("ReviewAgent", () => {
+  test("does not expose SCM repair authority to Codex review subprocesses", () => {
+    const previous = process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV];
+    process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV] = TEST_SCM_REPAIR_AUTHORITY_SECRET;
+    try {
+      const env = buildCodexEnv({
+        ...baseConfig,
+        codexHomeDir: "C:/isolated-codex-home",
+      });
+      const authorityKeys = Object.keys(env).filter(
+        (key) => key.toLowerCase() === SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase(),
+      );
+
+      expect(authorityKeys).toEqual([]);
+      expect(env.CODEX_HOME).toBe("C:/isolated-codex-home");
+      expect(process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV]).toBe(TEST_SCM_REPAIR_AUTHORITY_SECRET);
+    } finally {
+      if (previous === undefined) delete process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV];
+      else process.env[SCM_REPAIR_AUTHORITY_SECRET_ENV] = previous;
+    }
+  });
+
   test("bounds an injected server fetch when response headers never arrive", async () => {
     const agent = new ReviewAgent(
       baseConfig,
@@ -1574,6 +1603,78 @@ describe("ReviewAgent", () => {
     expect(mergeCalls).toBe(1);
   });
 
+  for (const failureStatus of [403, 503]) {
+    test(`keeps a rejected PR revision retryable after repair enqueue HTTP ${failureStatus}`, async () => {
+      const pr = makePr({ number: 60, html_url: "https://example.com/pr/60" });
+      let reviewCalls = 0;
+      let enqueueCalls = 0;
+      let commentCalls = 0;
+      let feedbackCalls = 0;
+
+      const agent = new ReviewAgent(
+        { ...baseConfig, passThreshold: 8.5 },
+        "http://localhost:3001",
+        "token",
+        "https://github.com/org/repo.git",
+        "main",
+        undefined,
+        {
+          ...silentLogs,
+          listOpenPullRequests: async () => [pr],
+          getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+          invokeCodexReview: async () => {
+            reviewCalls += 1;
+            return JSON.stringify({
+              score: 7.0,
+              summary: "Needs a repair",
+              issues: ["Add the missing failure-path assertion"],
+              fix_instruction: "Add the missing failure-path assertion.",
+            });
+          },
+          listPullRequestComments: async () => [],
+          addPullRequestComment: async () => {
+            commentCalls += 1;
+          },
+          feedbackFetchImpl: async () => {
+            feedbackCalls += 1;
+            return new Response(JSON.stringify({ ok: true, ignored: false }), { status: 200 });
+          },
+          fetchImpl: async (input) => {
+            const url = String(input);
+            if (url.includes("/jobs?status=")) {
+              return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+            }
+            if (url.endsWith("/jobs/enqueue")) {
+              enqueueCalls += 1;
+              if (enqueueCalls === 1) {
+                return new Response("repair admission unavailable", { status: failureStatus });
+              }
+              return new Response(JSON.stringify({ ok: true, jobId: "repair-retry-owner" }), {
+                status: 200,
+              });
+            }
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          },
+          now: () => 600,
+        },
+      );
+
+      await agent.poll();
+      expect(reviewCalls).toBe(1);
+      expect(enqueueCalls).toBe(1);
+      expect(commentCalls).toBe(0);
+      expect(feedbackCalls).toBe(0);
+
+      await agent.poll();
+      await agent.poll();
+
+      expect(reviewCalls).toBe(2);
+      expect(enqueueCalls).toBe(2);
+      expect(commentCalls).toBe(1);
+      expect(feedbackCalls).toBe(1);
+    });
+  }
+
   test("re-reviews the same PR SHA exactly once when re-review is requested", async () => {
     const pr = makePr({ number: 61, html_url: "https://example.com/pr/61" });
     let reviewCalls = 0;
@@ -1668,7 +1769,10 @@ describe("ReviewAgent", () => {
           const url = String(input);
           if (url.endsWith("/jobs/enqueue")) {
             jobEnqueueCalls += 1;
-            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+            return new Response(
+              JSON.stringify({ ok: true, jobId: `review-fix-${jobEnqueueCalls}` }),
+              { status: 200 },
+            );
           }
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         },
@@ -1685,7 +1789,7 @@ describe("ReviewAgent", () => {
     expect(deleteCalls).toBe(1);
   });
 
-  test("skips duplicate fix enqueue when active job already exists for same PR head SHA", async () => {
+  test("skips duplicate fix enqueue when an active job owns the exact PR revision", async () => {
     const pr = makePr({ number: 77, html_url: "https://example.com/pr/77" });
     let enqueueCalls = 0;
 
@@ -1722,6 +1826,8 @@ describe("ReviewAgent", () => {
                       reviewAgent: {
                         prNumber: pr.number,
                         prHeadSha: pr.head.sha,
+                        prBaseSha: pr.base.sha,
+                        resolutionType: "review_fix",
                       },
                     }),
                   },
@@ -1742,6 +1848,90 @@ describe("ReviewAgent", () => {
 
     await agent.poll();
     expect(enqueueCalls).toBe(0);
+  });
+
+  test("reviews and enqueues again when only the PR base SHA advances", async () => {
+    const prNumber = 79;
+    let baseSha = "ffff1111";
+    let reviewCalls = 0;
+    const enqueuedDedupeKeys: string[] = [];
+    const enqueuedBaseShas: string[] = [];
+    let firstRepairParams: Record<string, unknown> | null = null;
+
+    const agent = new ReviewAgent(
+      { ...baseConfig, passThreshold: 8.5 },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        listOpenPullRequests: async () => [
+          makePr({
+            number: prNumber,
+            html_url: `https://example.com/pr/${prNumber}`,
+            base: { ref: "main", sha: baseSha },
+          }),
+        ],
+        getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
+        invokeCodexReview: async () => {
+          reviewCalls += 1;
+          return JSON.stringify({
+            score: 7.0,
+            summary: "Needs a repair",
+            issues: ["Cover the changed base contract"],
+            fix_instruction: "Cover the changed base contract.",
+          });
+        },
+        listPullRequestComments: async () => [],
+        addPullRequestComment: async () => {},
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (url.includes("/jobs?status=pending")) {
+            const jobs = firstRepairParams
+              ? [
+                  {
+                    id: "old-base-repair",
+                    kind: "task.execute",
+                    params: JSON.stringify(firstRepairParams),
+                  },
+                ]
+              : [];
+            return new Response(JSON.stringify({ ok: true, jobs }), { status: 200 });
+          }
+          if (url.includes("/jobs?status=claimed")) {
+            return new Response(JSON.stringify({ ok: true, jobs: [] }), { status: 200 });
+          }
+          if (url.endsWith("/jobs/enqueue")) {
+            const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            const params = payload.params as Record<string, unknown>;
+            const reviewAgent = params.reviewAgent as Record<string, unknown>;
+            enqueuedDedupeKeys.push(String(payload.dedupeKey ?? ""));
+            enqueuedBaseShas.push(String(reviewAgent.prBaseSha ?? ""));
+            if (!firstRepairParams) firstRepairParams = params;
+            return new Response(
+              JSON.stringify({ ok: true, jobId: `base-repair-${enqueuedDedupeKeys.length}` }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+        now: () => 790,
+      },
+    );
+
+    await agent.poll();
+    baseSha = "ffff2222";
+    await agent.poll();
+    await agent.poll();
+
+    expect(reviewCalls).toBe(2);
+    expect(enqueuedBaseShas).toEqual(["ffff1111", "ffff2222"]);
+    expect(enqueuedDedupeKeys).toEqual([
+      `review-fix:${prNumber}:abc123def456:ffff1111`,
+      `review-fix:${prNumber}:abc123def456:ffff2222`,
+    ]);
   });
 
   test("does not let an active review-fix job suppress merge-conflict repair enqueue", async () => {
@@ -1852,6 +2042,9 @@ describe("ReviewAgent", () => {
     let enqueuedBranchPrefix = "";
     let enqueuedReviewThreshold = 0;
     let enqueuedReviewerFindings: string[] = [];
+    let enqueuedRepositoryIdentity = "";
+    let enqueuedBaseSha = "";
+    let enqueueAuthorityVerified = false;
     let createdTaskTitle = "";
     let createdTaskTags: string[] = [];
     const emittedCommandTypes: string[] = [];
@@ -1896,7 +2089,13 @@ describe("ReviewAgent", () => {
           const url = String(_input);
           const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
           if (url.endsWith("/jobs/enqueue")) {
+            enqueueAuthorityVerified = verifyScmRepairAuthorityProof({
+              body: payload,
+              proof: new Headers(init?.headers).get(SCM_REPAIR_AUTHORITY_HEADER),
+              secret: TEST_SCM_REPAIR_AUTHORITY_SECRET,
+            }).ok;
             enqueuedTaskId = String(payload.taskId ?? "");
+            enqueuedRepositoryIdentity = String(payload.repositoryIdentity ?? "");
             enqueuedDedupeKey = String(payload.dedupeKey ?? "");
             enqueuedDedupeCooldownMs = Number(payload.dedupeCooldownMs ?? -1);
             const params =
@@ -1933,6 +2132,7 @@ describe("ReviewAgent", () => {
             enqueuedResolutionType = String(reviewAgent.resolutionType ?? "");
             enqueuedBranchPrefix = String(reviewAgent.branchPrefix ?? "");
             enqueuedReviewThreshold = Number(reviewAgent.reviewThreshold ?? 0);
+            enqueuedBaseSha = String(reviewAgent.prBaseSha ?? "");
             enqueuedReviewerFindings = Array.isArray(reviewAgent.reviewerFindings)
               ? reviewAgent.reviewerFindings.map((entry) => String(entry))
               : [];
@@ -1955,6 +2155,7 @@ describe("ReviewAgent", () => {
           return new Response("ok", { status: 200 });
         },
         now: () => 123,
+        scmRepairAuthoritySecret: TEST_SCM_REPAIR_AUTHORITY_SECRET,
         ...silentLogs,
       },
       "automation/",
@@ -1965,7 +2166,7 @@ describe("ReviewAgent", () => {
     expect(enqueuedInstruction).toContain("Address ReviewAgent feedback for PR #7");
     expect(enqueuedInstruction).toContain("Missing negative-path assertions");
     expect(enqueuedTaskId).toBe("review-fix-pr7-123");
-    expect(enqueuedDedupeKey).toBe("7:abc123def456");
+    expect(enqueuedDedupeKey).toBe("review-fix:7:abc123def456:ffff1111");
     expect(enqueuedDedupeCooldownMs).toBe(60_000);
     expect(enqueuedCompletionBranch).toBe("automation/test-branch");
     expect(enqueuedPlannerWorkerInstruction).toContain("Rejected PR revision brief:");
@@ -1980,6 +2181,9 @@ describe("ReviewAgent", () => {
     expect(enqueuedBranchPrefix).toBe("automation/");
     expect(enqueuedReviewThreshold).toBe(9.5);
     expect(enqueuedReviewerFindings).toEqual(["Missing negative-path assertions"]);
+    expect(enqueuedRepositoryIdentity).toBe("https://github.com/org/repo.git");
+    expect(enqueuedBaseSha).toBe("ffff1111");
+    expect(enqueueAuthorityVerified).toBe(true);
     expect(enqueuedPlannerWorkerInstruction).toContain("Do not return an unchanged branch");
     expect(enqueuedPlannerWorkerInstruction).toContain(
       "do not checkout, switch, reset, merge, rebase, stage, commit, or push",
@@ -3011,6 +3215,7 @@ describe("ReviewAgent", () => {
                       reviewAgent: {
                         prNumber: pr.number,
                         prHeadSha: pr.head.sha,
+                        prBaseSha: pr.base.sha,
                         resolutionType: "merge_conflict",
                       },
                     }),

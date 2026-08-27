@@ -53,6 +53,22 @@ At a high level:
 7. Otherwise it persists the exact `complete`, `fail`, or `publish-blocked` terminal result.
 8. Worktree is cleaned up.
 
+One absolute deadline ledger starts before worktree and runtime preparation and
+is shared by every child operation: execution, critic calls, Git inspection,
+validation, host-side SCM assistance, commit generation, completion handoff,
+and cleanup. A child can use only the time left after required gate and
+finalization reserves. Continuations therefore cannot silently mint another
+full execution budget. Legacy and warmup jobs without a valid inner
+finalization plan stop their container transport at the work boundary, leaving
+the reserved tail exclusively for host-owned dependency and worktree cleanup.
+
+Terminal execution state distinguishes a completed result from a retained
+partial candidate, an environment-blocked candidate, and a failure without a
+candidate. Before a disposable worktree is removed, any publishable partial is
+checkpointed under a hidden job/generation ref. A timeout never becomes proof
+of success; the exact checkpoint can instead seed a bounded resume or trusted
+validation handoff.
+
 Logs, diagnostics, deferrals, terminal reports, and completion handoffs carry `workerId + claimGeneration`. Authoritative control transitions are confirmed only by an explicit JSON `{ "ok": true }`. After an ambiguous response, WorkerPals retries the identical transition a bounded number of times; if it remains unconfirmed, it suppresses contradictory projection and recycles so Server recovery stays authoritative. Server admission permits only its single half-open runtime canary to cross the execution boundary.
 
 The daemon sends its packaged runtime generation on claims and heartbeats. The
@@ -70,12 +86,15 @@ failure rather than being mislabeled as a WorkerPal implementation crash.
 
 Each job runs in an isolated git worktree to avoid cross-job contamination.
 
-For Linux-container jobs, dependency snapshots and per-job hardlink projections
-live in a repo-keyed Docker volume. The Windows bind-mounted worktree receives
-only a symlink to that container-native projection, so dependency preparation
-does not recursively copy `node_modules` through the host filesystem. Progress
-is streamed as `DependencyPreparation` phase telemetry and is bounded by
-`workerpals.dependency_preparation_timeout_ms` (five minutes by default).
+For Linux-container jobs, dependency snapshots and per-job copy-on-write
+projections live in a repo-keyed Docker volume. Reflinks are used when the
+volume filesystem supports them, with an isolated ordinary-copy fallback;
+jobs never share writable dependency inodes. The Windows bind-mounted worktree
+receives only a symlink to that container-native projection, so dependency
+preparation does not recursively copy `node_modules` through the host
+filesystem. Progress is streamed as `DependencyPreparation` phase telemetry
+and is bounded by `workerpals.dependency_preparation_timeout_ms` (five minutes
+by default).
 The preparation and validation paths share one fingerprint version keyed by
 Bun, dependency manifests, platform, and workspace identity, preventing a valid
 Linux projection from being discarded and reinstalled during quality checks.
@@ -100,6 +119,23 @@ This provides:
 - validation-step execution support,
 - optional critic/revision loops (backend-specific),
 - output compaction and structured result handling.
+
+Validation commands form a provenance- and capability-aware DAG. Aggregate
+commands suppress their focused children only after the aggregate actually
+runs and passes. When an aggregate is deferred or blocked by its environment,
+runnable children remain active and only the blocked node is handed to the
+trusted host. Critic findings are typed and tied to supplied evidence IDs, so a
+host-validation request cannot be confused with a code-revision request.
+
+The progress watchdog tracks meaningful discovery, unique targeted searches,
+active bounded commands, tests, documentation, and implementation artifacts.
+For an edit request that requires tests or docs, a small source-only diff is not
+an eligible early-stop result. Repeated broad reads do not extend the discovery
+window.
+
+Usage is accumulated across every executor, recovery, critic, validation, SCM,
+and commit-message pass. Terminal events retain the cumulative exact/estimated
+provenance even when a later pass times out or throws.
 
 Docs-only declared targets override incidental test terminology, and read-only
 discovery hints alone do not classify a job as test-focused. The local revision

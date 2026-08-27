@@ -10,6 +10,10 @@ import {
 } from "../../../packages/shared/src/git_backend.js";
 import { fetchBufferedWithHardDeadline } from "../../../packages/shared/src/bounded_fetch.js";
 import { createRepositoryAgentServiceClients } from "../../../packages/shared/src/repository_agent.js";
+import {
+  resolveScmRepairAuthoritySecret,
+  scrubScmRepairAuthoritySecretFromEnv,
+} from "../../../packages/shared/src/scm_repair_authority.js";
 import { MergeQueueDB } from "./db";
 import { FileLock } from "./lock";
 import { createSourceControlApi, runGitCommandCapture, type SourceControlApi } from "./git";
@@ -120,6 +124,22 @@ type GitCmdResult = {
 };
 
 const PUSH_CONFIG = loadPushPalsConfig();
+let scmRepairAuthoritySecret: string | null = null;
+try {
+  scmRepairAuthoritySecret = resolveScmRepairAuthoritySecret({
+    dataDir: PUSH_CONFIG.paths.dataDir,
+  });
+} catch (error) {
+  console.error(
+    `[SourceControlManager] SCM repair authority is unavailable; review repairs cannot be admitted: ${
+      error instanceof Error ? error.message : String(error)
+    }`,
+  );
+} finally {
+  // The signing key is needed by this service, not by Git hooks, validation
+  // commands, or the reviewer model processes it launches later.
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
+}
 const repoRoot = resolveSourceControlManagerRuntimeRepoRoot(PUSH_CONFIG.projectRoot, process.cwd());
 const defaultSourceControlManagerRepoPath = resolve(PUSH_CONFIG.sourceControlManager.repoPath);
 const COMPLETION_LEASE_MS = 3 * 60_000;
@@ -541,7 +561,7 @@ const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(asyn
     remoteUrl,
     prBaseBranch,
     config.authToken,
-    { repositoryServices },
+    { repositoryServices, scmRepairAuthoritySecret },
     config.branchPrefix,
   );
   reviewAgentInstance = reviewAgent;
@@ -1568,6 +1588,7 @@ async function tick(): Promise<void> {
               trustedValidationBaselineSha && trustedValidationCandidateSha
                 ? {
                     baseSha: trustedValidationBaselineSha,
+                    candidateSha: trustedValidationCandidateSha,
                     affectedPaths: trustedValidationAffectedPaths,
                   }
                 : undefined,

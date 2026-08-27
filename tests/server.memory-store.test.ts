@@ -118,6 +118,17 @@ describe("SqliteMemoryStore", () => {
     await store.close();
   });
 
+  test("rejects expired commit-fenced writes atomically", async () => {
+    const store = new SqliteMemoryStore(":memory:");
+    await expect(
+      store.put(fact("repo-fenced", "expired"), {
+        validUntil: new Date(Date.now() - 1).toISOString(),
+      }),
+    ).rejects.toThrow("commit fence expired");
+    expect(await store.get({ scope: fact("repo-fenced").scope, key: "expired" })).toBeNull();
+    await store.close();
+  });
+
   test("learns from outcomes and retains an observation-backed revision", async () => {
     const store = new SqliteMemoryStore(":memory:");
     const initial = await store.put(fact("repo-a"));

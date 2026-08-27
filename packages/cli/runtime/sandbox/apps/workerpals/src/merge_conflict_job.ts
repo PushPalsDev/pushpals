@@ -3,6 +3,7 @@ import {
   mergeRepositoryValidationSteps,
   runBoundedProcess as runBoundedWorkerProcess,
 } from "shared";
+import type { JobDeadlineLedger } from "./quality_loop_durability.js";
 
 type LogFn = (stream: "stdout" | "stderr", line: string) => void;
 
@@ -90,12 +91,26 @@ function isMergeConflictOutput(text: string): boolean {
   );
 }
 
-async function git(cwd: string, args: string[]): Promise<GitResult> {
+async function git(
+  cwd: string,
+  args: string[],
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<GitResult> {
   const configuredTimeoutMs = Number(Bun.env.PUSHPALS_WORKERPAL_GIT_COMMAND_TIMEOUT_MS);
-  const timeoutMs =
+  const configuredBudgetMs =
     Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
       ? Math.max(1_000, Math.min(30 * 60_000, Math.floor(configuredTimeoutMs)))
       : 120_000;
+  const timeoutMs = deadlineLedger
+    ? deadlineLedger.capWorkTimeout(configuredBudgetMs)
+    : configuredBudgetMs;
+  if (timeoutMs <= 0) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: "git command did not start because the absolute job work deadline expired",
+    };
+  }
   const result = await runBoundedWorkerProcess(["git", ...args], {
     cwd,
     timeoutMs,
@@ -108,8 +123,13 @@ async function git(cwd: string, args: string[]): Promise<GitResult> {
   };
 }
 
-async function mustGit(cwd: string, args: string[], label: string): Promise<string> {
-  const result = await git(cwd, args);
+async function mustGit(
+  cwd: string,
+  args: string[],
+  label: string,
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<string> {
+  const result = await git(cwd, args, deadlineLedger);
   if (!result.ok) {
     throw new Error(`${label} failed: git ${args.join(" ")}\n${result.stderr || result.stdout}`);
   }
@@ -332,6 +352,7 @@ export async function prepareMergeConflictWorktreeOnHost(
   jobId: string,
   params: Record<string, unknown>,
   onLog?: LogFn,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<MergeConflictSandboxPreparation> {
   const context = extractMergeConflictReviewContext(params);
   if (!context) {
@@ -346,7 +367,7 @@ export async function prepareMergeConflictWorktreeOnHost(
   }
 
   const currentHeadSha = (
-    await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve host worktree HEAD")
+    await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve host worktree HEAD", deadlineLedger)
   )
     .trim()
     .toLowerCase();
@@ -358,7 +379,12 @@ export async function prepareMergeConflictWorktreeOnHost(
 
   const baseRef = context.expectedBaseSha || `refs/remotes/origin/${context.baseBranch}`;
   const resolvedBaseSha = (
-    await mustGit(worktreePath, ["rev-parse", `${baseRef}^{commit}`], "resolve leased PR base")
+    await mustGit(
+      worktreePath,
+      ["rev-parse", `${baseRef}^{commit}`],
+      "resolve leased PR base",
+      deadlineLedger,
+    )
   )
     .trim()
     .toLowerCase();
@@ -368,10 +394,24 @@ export async function prepareMergeConflictWorktreeOnHost(
     );
   }
 
-  await mustGit(worktreePath, ["config", "rerere.enabled", "true"], "enable rerere");
-  await mustGit(worktreePath, ["config", "rerere.autoupdate", "true"], "enable rerere autoupdate");
+  await mustGit(
+    worktreePath,
+    ["config", "rerere.enabled", "true"],
+    "enable rerere",
+    deadlineLedger,
+  );
+  await mustGit(
+    worktreePath,
+    ["config", "rerere.autoupdate", "true"],
+    "enable rerere autoupdate",
+    deadlineLedger,
+  );
 
-  const rebase = await git(worktreePath, ["-c", "core.editor=true", "rebase", resolvedBaseSha]);
+  const rebase = await git(
+    worktreePath,
+    ["-c", "core.editor=true", "rebase", resolvedBaseSha],
+    deadlineLedger,
+  );
   let rebasedCleanly = false;
   let conflictPaths: string[] = [];
   if (rebase.ok) {
@@ -385,6 +425,7 @@ export async function prepareMergeConflictWorktreeOnHost(
       worktreePath,
       ["diff", "--name-only", "--diff-filter=U"],
       "list host-prepared unresolved conflict paths",
+      deadlineLedger,
     );
     conflictPaths = extractConflictPaths(unresolved);
     onLog?.(
@@ -396,7 +437,12 @@ export async function prepareMergeConflictWorktreeOnHost(
   }
 
   const preparedHeadSha = (
-    await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve prepared host worktree HEAD")
+    await mustGit(
+      worktreePath,
+      ["rev-parse", "HEAD"],
+      "resolve prepared host worktree HEAD",
+      deadlineLedger,
+    )
   ).trim();
   return {
     repoPath: resolve(worktreePath),
@@ -411,6 +457,7 @@ export async function prepareMergeConflictWorktreeOnHost(
 export async function refreshMergeConflictWorktreeHints(
   worktreePath: string,
   params: Record<string, unknown>,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<Record<string, unknown>> {
   const context = extractMergeConflictReviewContext(params);
   if (!context) return params;
@@ -418,10 +465,16 @@ export async function refreshMergeConflictWorktreeHints(
     worktreePath,
     ["diff", "--name-only", "--diff-filter=U"],
     "refresh host-prepared unresolved conflict paths",
+    deadlineLedger,
   );
   const conflictPaths = extractConflictPaths(unresolved);
   const currentHeadSha = (
-    await mustGit(worktreePath, ["rev-parse", "HEAD"], "refresh host-prepared worktree HEAD")
+    await mustGit(
+      worktreePath,
+      ["rev-parse", "HEAD"],
+      "refresh host-prepared worktree HEAD",
+      deadlineLedger,
+    )
   ).trim();
   return applyMergeConflictExecutionHints(params, {
     repoPath: resolve(worktreePath),

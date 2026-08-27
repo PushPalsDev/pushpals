@@ -79,6 +79,7 @@ describe("release package payload verification", () => {
         "runtime/sandbox/packages/shared/src/repository_agent.ts",
         "runtime/sandbox/packages/shared/src/repository_identity.ts",
         "runtime/sandbox/packages/shared/src/repository_snapshot.ts",
+        "runtime/sandbox/packages/shared/src/scm_repair_authority.ts",
         "runtime/sandbox/packages/shared/src/tooling.ts",
         "runtime/sandbox/packages/protocol/package.json",
         "runtime/sandbox/packages/protocol/src/index.ts",
@@ -216,15 +217,16 @@ describe("release package payload verification", () => {
     );
   });
 
-  test("rejects packages missing RepositoryAgent shared code or its isolated prompt", () => {
-    const repositoryAgentRuntimePaths = [
+  test("rejects packages missing required shared runtime code or the isolated RepositoryAgent prompt", () => {
+    const requiredRuntimePaths = [
       "runtime/sandbox/packages/shared/src/memory.ts",
       "runtime/sandbox/packages/shared/src/repository_agent.ts",
+      "runtime/sandbox/packages/shared/src/scm_repair_authority.ts",
       "runtime/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
       "runtime/sandbox/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
     ];
 
-    for (const missingPath of repositoryAgentRuntimePaths) {
+    for (const missingPath of requiredRuntimePaths) {
       const issues = findDisallowedCliPackageEntries(
         requiredCliPackageFiles().filter((file) => file.path !== missingPath),
       );
@@ -236,6 +238,36 @@ describe("release package payload verification", () => {
         },
       ]);
     }
+  });
+
+  test("packaged sandbox shared index resolves and imports SCM repair authority", () => {
+    const sandboxRoot = join(repoRoot, "packages", "cli", "runtime", "sandbox");
+    const probe = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        [
+          'const shared = await import("./packages/shared/src/index.ts");',
+          'const secret = "s".repeat(32);',
+          'const body = { requestId: "req_packaged_scm_repair" };',
+          "const nowMs = 1770000000000;",
+          'const proof = shared.createScmRepairAuthorityProof(body, secret, { nowMs, nonce: "packaged_probe_01" });',
+          "const verified = shared.verifyScmRepairAuthorityProof({ body, proof, secret, nowMs });",
+          "if (!verified.ok) throw new Error(`packaged authority verification failed: ${verified.reason}`);",
+          'if (shared.SCM_REPAIR_AUTHORITY_HEADER !== "x-pushpals-scm-repair-authority") throw new Error("missing packaged authority export");',
+        ].join("\n"),
+      ],
+      {
+        cwd: sandboxRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+
+    expect({ status: probe.status, stdout: probe.stdout, stderr: probe.stderr }).toMatchObject({
+      status: 0,
+      stderr: "",
+    });
   });
 
   test("release artifact guard allows only PushPals release assets", () => {
@@ -424,7 +456,7 @@ describe("release package payload verification", () => {
     expect(publishReleaseJob).toContain("name: pushpals-macos-x64");
     expect(publishReleaseJob).toContain("name: pushpals-macos-arm64");
     expect(publishReleaseJob).toContain("pattern: runtime-*");
-    expect(publishReleaseJob.match(/uses: actions\/download-artifact@v4/g)).toHaveLength(5);
+    expect(publishReleaseJob.match(/uses: actions\/download-artifact@v8/g)).toHaveLength(5);
     expect(publishReleaseJob).not.toContain("name: pushpals-cli-package-");
     expect(publishReleaseJob).not.toContain("- name: Download binaries");
 

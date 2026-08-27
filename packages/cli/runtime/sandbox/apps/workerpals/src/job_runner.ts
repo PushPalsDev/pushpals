@@ -17,10 +17,16 @@
  */
 
 import { executeJob, shouldCommit, createJobCommit } from "./execute_job.js";
-import { loadPushPalsConfig } from "shared";
+import { loadPushPalsConfig, scrubScmRepairAuthoritySecretFromEnv } from "shared";
 import { writeFileSync } from "fs";
-import type { JobDiagnostics, JobTokenUsage } from "./common/types.js";
+import type {
+  JobCandidateState,
+  JobDiagnostics,
+  JobTokenUsage,
+  JobUsageAttempt,
+} from "./common/types.js";
 import { isHostScmOwnedReviewParams } from "./merge_conflict_job.js";
+import { UsageAccumulator } from "./quality_loop_durability.js";
 
 const CONFIG = loadPushPalsConfig();
 const GIT_CONFIG_TIMEOUT_MS = 10_000;
@@ -43,6 +49,8 @@ interface JobResult {
   exitCode?: number;
   cooldownMs?: number;
   usage?: JobTokenUsage;
+  usageAttempts?: JobUsageAttempt[];
+  candidateState?: JobCandidateState;
   commit?: {
     branch: string;
     sha: string;
@@ -163,6 +171,8 @@ export function buildJobRunnerResult(
     | "exitCode"
     | "cooldownMs"
     | "usage"
+    | "usageAttempts"
+    | "candidateState"
     | "diagnostics"
     | "validationBlocked"
   >,
@@ -175,6 +185,8 @@ export function buildJobRunnerResult(
     exitCode: result.exitCode,
     cooldownMs: result.cooldownMs,
     usage: result.usage,
+    usageAttempts: result.usageAttempts,
+    candidateState: result.candidateState,
     diagnostics: result.diagnostics,
     validationBlocked: result.validationBlocked,
   };
@@ -238,7 +250,7 @@ async function main(): Promise<void> {
       CONFIG,
     );
     // Build result object
-    const jobResult = buildJobRunnerResult(result);
+    let jobResult = buildJobRunnerResult(result);
     // Create commit for file-modifying jobs
     if (result.ok && shouldCommit(spec.kind, CONFIG) && !hostScmOwnsGit) {
       log("stdout", `[JobRunner] Job modified files, creating commit...`);
@@ -255,6 +267,19 @@ async function main(): Promise<void> {
         },
         CONFIG,
       );
+      if ((commitResult.usageAttempts?.length ?? 0) > 0) {
+        const usageAccumulator = new UsageAccumulator();
+        usageAccumulator.addAttempts(jobResult.usageAttempts);
+        if ((jobResult.usageAttempts?.length ?? 0) === 0 && jobResult.usage) {
+          usageAccumulator.add(jobResult.usage, {
+            stage: "executor",
+            attempt: 1,
+            source: jobResult.usage.backend ?? "executor_legacy_total",
+          });
+        }
+        usageAccumulator.addAttempts(commitResult.usageAttempts);
+        jobResult = usageAccumulator.apply(jobResult);
+      }
 
       if (commitResult.ok && commitResult.sha && commitResult.branch) {
         jobResult.commit = {
@@ -262,6 +287,16 @@ async function main(): Promise<void> {
           sha: commitResult.sha,
           publicBranch: commitResult.publicBranch,
         };
+        if (jobResult.candidateState && commitResult.sha !== "no-changes") {
+          jobResult.candidateState = {
+            ...jobResult.candidateState,
+            checkpoint: {
+              ref: commitResult.branch,
+              sha: commitResult.sha,
+              capturedAt: new Date().toISOString(),
+            },
+          };
+        }
         if (commitResult.sha === "no-changes") {
           log("stdout", `[JobRunner] No changes to commit for ${spec.jobId}`);
         } else {
@@ -302,6 +337,7 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
   main().catch((err) => {
     const result = buildFatalJobResult(err);
     // eslint-disable-next-line no-console

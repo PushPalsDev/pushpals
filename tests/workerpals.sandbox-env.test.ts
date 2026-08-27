@@ -18,8 +18,33 @@ import {
   WINDOWS_WORKER_SANDBOX_ROOT_NAME,
   withResolvedBunOnPath,
 } from "../apps/workerpals/src/common/sandbox_env";
+import { SCM_REPAIR_AUTHORITY_SECRET_ENV } from "../packages/shared/src/scm_repair_authority";
 
 describe("workerpals sandbox writable env", () => {
+  test("does not expose SCM repair authority to worker sandbox processes", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-secret-"));
+    const repo = join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+
+    try {
+      const env = buildWorkerSandboxWritableEnv(repo, {
+        SAFE_WORKER_VALUE: "retained",
+        [SCM_REPAIR_AUTHORITY_SECRET_ENV]:
+          "test-worker-scm-repair-authority-secret-0123456789abcdef",
+        [SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase()]:
+          "test-worker-lowercase-secret-0123456789abcdef",
+      });
+      const authorityKeys = Object.keys(env).filter(
+        (key) => key.toLowerCase() === SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase(),
+      );
+
+      expect(authorityKeys).toEqual([]);
+      expect(env.SAFE_WORKER_VALUE).toBe("retained");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("redirects HOME and Expo caches to writable temp paths", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-sandbox-env-"));
     const repo = join(root, "repo");

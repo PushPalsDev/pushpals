@@ -303,6 +303,205 @@ function makeSnapshot() {
   };
 }
 
+describe("autonomy two-phase dispatch fencing", () => {
+  const dispatchInput = (snapshot: ReturnType<typeof makeSnapshot>, signal?: AbortSignal) => ({
+    objectiveId: "obj-two-phase",
+    runId: "run-two-phase",
+    snapshotId: snapshot.snapshot_id,
+    patternKey: "two-phase",
+    componentArea: "apps/server",
+    targetPaths: ["apps/server/src/requests.ts"],
+    writeGlobs: ["apps/server/src/*.ts"],
+    dispatchFence: {
+      snapshot,
+      cycleDeadline: Date.now() + 30_000,
+      signal,
+    },
+  });
+
+  test("does not confirm a provisional request when autonomy is disabled after enqueue", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-dispatch-disable-"));
+    tempDirs.push(root);
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_dispatch_disable",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const calls: string[] = [];
+    (engine as any).fetchControl = async (url: string) => {
+      calls.push(url);
+      engine.setRuntimeEnabled(false);
+      return jsonResponse(201, {
+        ok: true,
+        requestId: "request-provisional-disabled",
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationToken: "confirmation-disabled",
+      });
+    };
+
+    const requestId = await (engine as any).enqueueSyntheticRequest(
+      "Fix the queue race.",
+      dispatchInput(makeSnapshot()),
+    );
+
+    expect(requestId).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEndWith("/requests/enqueue");
+  });
+
+  test("does not confirm a provisional request after its snapshot expires", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-dispatch-expiry-"));
+    tempDirs.push(root);
+    const snapshot = makeSnapshot();
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_dispatch_expiry",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const calls: string[] = [];
+    (engine as any).fetchControl = async (url: string) => {
+      calls.push(url);
+      snapshot.snapshot_ttl_ms = 0;
+      snapshot.snapshot_created_at = new Date(Date.now() - 1_000).toISOString();
+      return jsonResponse(201, {
+        ok: true,
+        requestId: "request-provisional-expired",
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationToken: "confirmation-expired",
+      });
+    };
+
+    const requestId = await (engine as any).enqueueSyntheticRequest(
+      "Fix the snapshot race.",
+      dispatchInput(snapshot),
+    );
+
+    expect(requestId).toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
+  test("fails closed when a stale server omits dispatch confirmation attestation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-dispatch-stale-server-"));
+    tempDirs.push(root);
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_dispatch_stale_server",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const calls: string[] = [];
+    (engine as any).fetchControl = async (url: string) => {
+      calls.push(url);
+      return jsonResponse(201, {
+        ok: true,
+        requestId: "request-from-stale-server",
+      });
+    };
+
+    const requestId = await (engine as any).enqueueSyntheticRequest(
+      "Do not trust a mixed-version server.",
+      dispatchInput(makeSnapshot()),
+    );
+
+    expect(requestId).toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
+  test("accepts an explicit attestation for an already-confirmed idempotent replay", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-dispatch-replay-"));
+    tempDirs.push(root);
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_dispatch_replay",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const calls: string[] = [];
+    (engine as any).fetchControl = async (url: string) => {
+      calls.push(url);
+      return jsonResponse(201, {
+        ok: true,
+        requestId: "request-confirmed-replay",
+        dispatchConfirmed: true,
+      });
+    };
+
+    const requestId = await (engine as any).enqueueSyntheticRequest(
+      "Reuse the exact confirmed dispatch.",
+      dispatchInput(makeSnapshot()),
+    );
+
+    expect(requestId).toBe("request-confirmed-replay");
+    expect(calls).toHaveLength(1);
+  });
+
+  test("confirms and returns a provisional request while the cycle fence remains live", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-dispatch-confirm-"));
+    tempDirs.push(root);
+    const snapshot = makeSnapshot();
+    const controller = new AbortController();
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_dispatch_confirm",
+      authToken: "tok",
+      repo: root,
+      llm: { complete: async () => ({ text: "{}", usage: {} }) } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    (engine as any).fetchControl = async (url: string, init?: RequestInit) => {
+      calls.push({ url, init });
+      if (url.endsWith("/requests/enqueue")) {
+        return jsonResponse(201, {
+          ok: true,
+          requestId: "request-provisional-live",
+          dispatchConfirmationRequired: true,
+          dispatchConfirmationToken: "confirmation-live",
+        });
+      }
+      return jsonResponse(200, {
+        ok: true,
+        requestId: "request-provisional-live",
+        confirmed: true,
+      });
+    };
+
+    const requestId = await (engine as any).enqueueSyntheticRequest(
+      "Fix the live dispatch.",
+      dispatchInput(snapshot, controller.signal),
+    );
+
+    expect(requestId).toBe("request-provisional-live");
+    expect(calls.map((call) => call.url)).toEqual([
+      "http://localhost:3001/requests/enqueue",
+      "http://localhost:3001/requests/request-provisional-live/dispatch/confirm",
+    ]);
+    expect(calls.every((call) => call.init?.signal === controller.signal)).toBe(true);
+    expect(JSON.parse(String(calls[0]?.init?.body))).toMatchObject({
+      dispatchConfirmationRequired: true,
+      dispatchConfirmationTtlMs: expect.any(Number),
+    });
+    expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({
+      dispatchConfirmationToken: "confirmation-live",
+    });
+  });
+});
+
 describe("RepositoryAgent autonomy ideation", () => {
   test("asks the shared RepositoryAgent to inspect the exact repo before legacy ideation", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-agent-"));
@@ -492,6 +691,113 @@ describe("RepositoryAgent autonomy ideation", () => {
     expect(result?.json.candidates).toEqual([]);
     expect(result?.llmCall.provider).toBe("repository_agent_deterministic_fallback");
     expect(legacyCalls).toBe(0);
+  });
+
+  test("installs repository ideation cancellation before snapshot discovery", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-snapshot-abort-"));
+    tempDirs.push(root);
+    let markGitStarted: (() => void) | null = null;
+    const gitStarted = new Promise<void>((resolveStarted) => {
+      markGitStarted = resolveStarted;
+    });
+    let resolveExit: (code: number) => void = () => undefined;
+    let stdoutController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let stderrController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let killed = false;
+    const finish = () => {
+      if (killed) return;
+      killed = true;
+      stdoutController?.close();
+      stderrController?.close();
+      resolveExit(137);
+    };
+    const stalledGit = {
+      pid: 2_147_480_100,
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) {
+          stdoutController = controller;
+        },
+      }),
+      stderr: new ReadableStream<Uint8Array>({
+        start(controller) {
+          stderrController = controller;
+        },
+      }),
+      exited: new Promise<number>((resolve) => {
+        resolveExit = resolve;
+      }),
+      kill: finish,
+    };
+    originalSpawn = Bun.spawn;
+    (Bun as any).spawn = (cmd: string[]) => {
+      if (cmd[0] === "git") {
+        markGitStarted?.();
+        return stalledGit;
+      }
+      if (cmd[0] === "taskkill") {
+        finish();
+        return {
+          pid: 2_147_480_101,
+          stdout: null,
+          stderr: null,
+          exited: Promise.resolve(0),
+          kill() {},
+        };
+      }
+      return originalSpawn(cmd as any);
+    };
+    let askCalls = 0;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_repository_snapshot_abort",
+      authToken: "tok",
+      repo: root,
+      llm: { generate: async () => ({ text: "{}" }) },
+      repositoryAgent: {
+        async ask() {
+          askCalls++;
+          throw new Error("ask must not start after snapshot cancellation");
+        },
+      } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).autonomyRepo = root;
+    const pending = (engine as any).repositoryAgentIdeation({
+      runId: "run-repository-snapshot-abort",
+      snapshot: makeSnapshot(),
+      visionContext: {
+        path: "vision.md",
+        markdown: "# Vision",
+        one_sentence: "Stay responsive",
+        sections: [{ number: "1", title: "Priorities", markdown: "Stay responsive" }],
+        key_items: {
+          target_users: [],
+          priorities: ["Stay responsive"],
+          objectives: [],
+          guardrails: [],
+          constraints: [],
+          non_goals: [],
+          metrics: [],
+          testing_criteria: [],
+          risk_policy: [],
+          operating_model: [],
+          governance: [],
+        },
+        section_numbers: ["1"],
+        sha256: "vision-snapshot-abort-hash",
+        truncated: false,
+      },
+      cycleDeadline: Date.now() + 30_000,
+    });
+    await gitStarted;
+
+    engine.setRuntimeEnabled(false);
+    const result = await pending;
+
+    expect(killed).toBe(true);
+    expect(askCalls).toBe(0);
+    expect(result?.llmCall.provider).toBe("repository_agent_deterministic_fallback");
   });
 });
 
@@ -873,6 +1179,111 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(JSON.stringify(reservation)).not.toContain(repositoryMemoryId);
   });
 
+  test("stop during repository ideation prevents scoring, reservation, and enqueue", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-stop-during-ideation-"));
+    tempDirs.push(root);
+    seedGenericAutonomyRepoLayout(root);
+    writeFileSync(join(root, "vision.md"), "# Vision\n\n## Priorities\n- Stay responsive\n");
+    execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["config", "user.name", "PushPals Test"], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
+
+    let scoringCalls = 0;
+    let objectivePosts = 0;
+    let enqueueCalls = 0;
+    let markIdeationStarted: (() => void) | null = null;
+    const ideationStarted = new Promise<void>((resolveStarted) => {
+      markIdeationStarted = resolveStarted;
+    });
+    let finishIdeation: (() => void) | null = null;
+    const ideationFinished = new Promise<void>((resolveFinished) => {
+      finishIdeation = resolveFinished;
+    });
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_stop_during_ideation",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        async generate() {
+          scoringCalls++;
+          return { text: "{}" };
+        },
+      } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).autonomyRepo = root;
+    (engine as any).acquireDispatchLock = async () => ({ ok: true });
+    (engine as any).renewDispatchLock = async () => true;
+    (engine as any).releaseDispatchLock = async () => undefined;
+    (engine as any).ensureAutonomyRepoReady = async () => true;
+    (engine as any).fetchSnapshot = async () => makeSnapshot();
+    (engine as any).fetchWorkerLoadSnapshot = async () => null;
+    (engine as any).loadVisionContext = () => ({
+      path: "vision.md",
+      markdown: "# Vision\n\n## Priorities\n- Stay responsive\n",
+      one_sentence: "Stay responsive.",
+      sections: [{ number: "1", title: "Priorities", markdown: "Stay responsive." }],
+      key_items: {
+        target_users: [],
+        priorities: ["Stay responsive"],
+        objectives: [],
+        guardrails: [],
+        constraints: [],
+        non_goals: [],
+        metrics: [],
+        testing_criteria: [],
+        risk_policy: [],
+        operating_model: [],
+        governance: [],
+      },
+      section_numbers: ["1"],
+      sha256: "stop-during-ideation-vision",
+      truncated: false,
+    });
+    (engine as any).loadCommitHistoryHints = async () => [];
+    (engine as any).ingestAutoInspirationPatterns = async () => undefined;
+    (engine as any).fetchInspirationPatterns = async () => [];
+    (engine as any).fetchInspirationSourceInsights = async () => [];
+    (engine as any).repositoryAgentIdeation = async () => {
+      markIdeationStarted?.();
+      await ideationFinished;
+      return {
+        json: { candidates: [] },
+        llmCall: { phase: "ideation" },
+        result: null,
+      };
+    };
+    (engine as any).postObjective = async () => {
+      objectivePosts++;
+      return true;
+    };
+    (engine as any).enqueueSyntheticRequest = async () => {
+      enqueueCalls++;
+      return "must-not-enqueue";
+    };
+
+    const tick = engine.tick();
+    await ideationStarted;
+    engine.stop();
+    finishIdeation?.();
+    await tick;
+
+    expect(scoringCalls).toBe(0);
+    expect(objectivePosts).toBe(0);
+    expect(enqueueCalls).toBe(0);
+    expect((engine as any).lastDetail).toBe("disabled_during_repository_agent_ideation");
+  });
+
   test("tick auto-ingests inspiration and dispatches an objective end-to-end", async () => {
     originalFetch = globalThis.fetch;
     mockGitSpawnForTest();
@@ -925,7 +1336,11 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         });
       }
       if (url.endsWith("/requests/enqueue"))
-        return jsonResponse(201, { ok: true, requestId: "req_tick_1" });
+        return jsonResponse(201, {
+          ok: true,
+          requestId: "req_tick_1",
+          dispatchConfirmed: true,
+        });
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
         return jsonResponse(200, {
@@ -1133,7 +1548,11 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         });
       }
       if (url.endsWith("/requests/enqueue"))
-        return jsonResponse(201, { ok: true, requestId: "req_python_native_validation" });
+        return jsonResponse(201, {
+          ok: true,
+          requestId: "req_python_native_validation",
+          dispatchConfirmed: true,
+        });
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
         return jsonResponse(200, {
@@ -1370,7 +1789,11 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         });
       }
       if (url.endsWith("/requests/enqueue"))
-        return jsonResponse(201, { ok: true, requestId: "req_validation_repair" });
+        return jsonResponse(201, {
+          ok: true,
+          requestId: "req_validation_repair",
+          dispatchConfirmed: true,
+        });
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
         return jsonResponse(200, {
@@ -1465,6 +1888,102 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(objective.expected_validation).toEqual(["bun run web:e2e", "bun test"]);
     expect(objective.required_validation_repair).toBe(true);
     expect(objective.incident_key).toBe("valid_inc_web_e2e");
+  });
+
+  test("rechecks active snapshot authority after validation-repair lock renewal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-validation-renew-fence-"));
+    tempDirs.push(root);
+    mkdirSync(join(root, "tests"), { recursive: true });
+    writeFileSync(join(root, "tests", "account.test.ts"), "// repair target\n", "utf8");
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_validation_renew_fence",
+      authToken: "tok",
+      repo: root,
+      llm: { async generate() {} } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    (engine as any).autonomyRepo = root;
+    (engine as any).fetchEligibility = async (
+      _runId: string,
+      _snapshotId: string,
+      candidates: any[],
+    ) => new Map(candidates.map((candidate) => [candidate.id, { ok: true }]));
+    let markRenewStarted: (() => void) | null = null;
+    const renewStarted = new Promise<void>((resolveStarted) => {
+      markRenewStarted = resolveStarted;
+    });
+    let finishRenew: ((value: boolean) => void) | null = null;
+    const delayedRenew = new Promise<boolean>((resolveRenew) => {
+      finishRenew = resolveRenew;
+    });
+    (engine as any).renewDispatchLock = async () => {
+      markRenewStarted?.();
+      return await delayedRenew;
+    };
+    let reservations = 0;
+    let enqueues = 0;
+    (engine as any).postObjective = async () => {
+      reservations++;
+      return true;
+    };
+    (engine as any).enqueueSyntheticRequest = async () => {
+      enqueues++;
+      return "must-not-enqueue";
+    };
+    const snapshot = {
+      ...makeSnapshot(),
+      validation_incident: {
+        active: true,
+        incident_id: "valid_inc_renew_fence",
+        command: "bun test tests/account.test.ts",
+        signal_type: "test_failure",
+        failure_class: "test_failure",
+        failure_count: 2,
+        total_runs: 2,
+        failed_job_ids: ["job-a", "job-b"],
+        last_failed_job_id: "job-b",
+        first_failed_at: new Date(Date.now() - 2_000).toISOString(),
+        last_failed_at: new Date(Date.now() - 1_000).toISOString(),
+        digest: "renew-fence",
+        sample_error: "account assertion failed",
+        required_commands: ["bun test tests/account.test.ts"],
+        target_path_hints: ["tests/account.test.ts"],
+        failed_tests: ["account state remains stable"],
+        failure_fingerprint: "fp-renew-fence",
+        candidate_sha: "c".repeat(40),
+        candidate_shas: ["c".repeat(40)],
+        validation_scope: "candidate_specific" as const,
+        evidence_quality: "high" as const,
+        failure_lines: ["(fail) account state remains stable"],
+        source: "trusted_host" as const,
+        cross_job_circuit_open: true,
+      },
+    };
+    const cycleController = new AbortController();
+    const pending = (engine as any).dispatchValidationIncidentRepair({
+      runId: "run-validation-renew-fence",
+      snapshot,
+      repoTargets: [],
+      visionSectionRefs: ["1"],
+      cycleDeadline: Date.now() + 30_000,
+      cycleSignal: cycleController.signal,
+    });
+    await renewStarted;
+
+    engine.setRuntimeEnabled(false);
+    cycleController.abort(new Error("runtime disabled"));
+    finishRenew?.(true);
+    const result = await pending;
+
+    expect(result).toEqual({
+      handled: true,
+      outcome: "skipped",
+      detail: "disabled_after_validation_repair_lock_renew",
+    });
+    expect(reservations).toBe(0);
+    expect(enqueues).toBe(0);
   });
 
   test("repair circuit counts only executed same-fingerprint failures and continues ideation", async () => {
@@ -2183,6 +2702,58 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(fetchCalls).toBe(0);
 
     engine.stop();
+    engine.setRuntimeEnabled(true);
+    engine.start();
+    await engine.tick();
+    await Bun.sleep(40);
+    expect((engine as any).runtimeEnabled).toBe(false);
+    expect((engine as any).stopped).toBe(true);
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("runtime disable is a resumable pause while stop remains terminal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-resumable-pause-"));
+    tempDirs.push(root);
+    const cfg = makeConfig();
+    cfg.remotebuddy.autonomy.tickIntervalMs = 20;
+    cfg.remotebuddy.autonomy.heartbeatLogMs = 10_000;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_resumable_pause",
+      authToken: "tok",
+      repo: root,
+      llm: { async generate() {} } as any,
+      comm: { async emit() {} } as any,
+      config: cfg,
+    });
+    let ticks = 0;
+    (engine as any).tick = async () => {
+      ticks++;
+    };
+
+    engine.setRuntimeEnabled(false);
+    engine.start();
+    await Bun.sleep(50);
+    expect(ticks).toBe(0);
+
+    engine.setRuntimeEnabled(true);
+    await Bun.sleep(50);
+    expect(ticks).toBeGreaterThan(0);
+    engine.setRuntimeEnabled(false);
+    const pausedAt = ticks;
+    await Bun.sleep(50);
+    expect(ticks).toBe(pausedAt);
+
+    engine.setRuntimeEnabled(true);
+    await Bun.sleep(50);
+    expect(ticks).toBeGreaterThan(pausedAt);
+    engine.stop();
+    const stoppedAt = ticks;
+    engine.setRuntimeEnabled(true);
+    engine.start();
+    await Bun.sleep(50);
+    expect(ticks).toBe(stoppedAt);
+    expect((engine as any).stopped).toBe(true);
   });
 
   test("startup lock contention retries quickly with aggressive stale lock threshold", async () => {
@@ -2598,7 +3169,11 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         });
       }
       if (url.endsWith("/requests/enqueue"))
-        return jsonResponse(201, { ok: true, requestId: "req_timeout_recovery_1" });
+        return jsonResponse(201, {
+          ok: true,
+          requestId: "req_timeout_recovery_1",
+          dispatchConfirmed: true,
+        });
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
         return jsonResponse(200, {
@@ -2843,7 +3418,11 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       }
       if (url.endsWith("/requests/enqueue")) {
         requestPosts.push(body as Record<string, unknown>);
-        return jsonResponse(201, { ok: true, requestId: "req_scoring_timeout_1" });
+        return jsonResponse(201, {
+          ok: true,
+          requestId: "req_scoring_timeout_1",
+          dispatchConfirmed: true,
+        });
       }
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
@@ -2968,6 +3547,72 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect(llmCall).toBe(3);
     expect(objectivePosts.length).toBeGreaterThan(0);
     expect(requestPosts.length).toBe(1);
+  });
+
+  test("cancels and drains active scoring and planning phases on cycle abort", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-phase-abort-"));
+    tempDirs.push(root);
+    let markStarted: (() => void) | null = null;
+    let started = new Promise<void>((resolveStarted) => {
+      markStarted = resolveStarted;
+    });
+    let providerActive = false;
+    let observedSignal: AbortSignal | undefined;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_phase_abort",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        async generate(input: { signal?: AbortSignal }) {
+          observedSignal = input.signal;
+          providerActive = true;
+          markStarted?.();
+          return await new Promise((_resolve, reject) => {
+            const onAbort = () => {
+              setTimeout(() => {
+                providerActive = false;
+                reject(input.signal?.reason ?? new Error("phase cancelled"));
+              }, 25);
+            };
+            input.signal?.addEventListener("abort", onAbort, { once: true });
+            if (input.signal?.aborted) onAbort();
+          });
+        },
+      } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+
+    for (const phase of ["scoring", "planning"] as const) {
+      const controller = new AbortController();
+      const pending = (engine as any).llmPhase(
+        phase,
+        `run-${phase}`,
+        `snapshot-${phase}`,
+        {
+          system: "Return JSON.",
+          json: true,
+          messages: [{ role: "user", content: "{}" }],
+        },
+        undefined,
+        undefined,
+        controller.signal,
+      );
+      await started;
+      const abortedAt = Date.now();
+      controller.abort(new Error(`cycle disabled during ${phase}`));
+
+      await expect(pending).rejects.toThrow(`cycle disabled during ${phase}`);
+      expect(Date.now() - abortedAt).toBeGreaterThanOrEqual(20);
+      expect(Date.now() - abortedAt).toBeLessThan(500);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(providerActive).toBe(false);
+      started = new Promise<void>((resolveStarted) => {
+        markStarted = resolveStarted;
+      });
+    }
+    engine.stop();
   });
 
   test("filters recently completed targets before scoring and records every rejection as unselected", async () => {
@@ -3201,7 +3846,11 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
         });
       }
       if (url.endsWith("/requests/enqueue"))
-        return jsonResponse(201, { ok: true, requestId: "req_generic_1" });
+        return jsonResponse(201, {
+          ok: true,
+          requestId: "req_generic_1",
+          dispatchConfirmed: true,
+        });
       if (url.endsWith("/autonomy/objectives")) {
         objectivePosts.push(body as Record<string, unknown>);
         return jsonResponse(200, {

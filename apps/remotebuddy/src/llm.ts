@@ -14,6 +14,7 @@ import {
   fetchBufferedWithHardDeadline,
   loadPromptTemplate,
   loadPushPalsConfig,
+  copyEnvWithoutScmRepairAuthoritySecret,
   runBoundedProcess,
   terminateProcessTree,
   type BoundedProcessSpawner,
@@ -632,6 +633,10 @@ async function runProcessWithNode(
 
 const cachedCodexCommandPrefix = new Map<string, string[]>();
 
+function codexChildEnv(): NodeJS.ProcessEnv {
+  return copyEnvWithoutScmRepairAuthoritySecret(process.env);
+}
+
 function bunCodexCommandFromEnv(env: NodeJS.ProcessEnv): string[] {
   const bunBin = (env.PUSHPALS_BUN_BIN ?? "").trim();
   return bunBin ? [bunBin, "x", "--yes", "@openai/codex"] : [];
@@ -668,7 +673,7 @@ async function resolveCodexCommandPrefix(
   pushCandidate(["bunx", "--yes", "@openai/codex"]);
   pushCandidate(["codex"]);
   const cwd = process.cwd();
-  const env = process.env;
+  const env = codexChildEnv();
   const attemptErrors: string[] = [];
   const successfulProbes: CodexCommandProbe[] = [];
   for (const candidate of candidates) {
@@ -1753,7 +1758,7 @@ async function prepareCodexExecutionWorkspace(
   try {
     const initialized = await runProcess(["git", "init", "--quiet"], {
       cwd,
-      env: process.env,
+      env: codexChildEnv(),
       timeoutMs: 5_000,
       signal: input.signal,
     });
@@ -1864,7 +1869,7 @@ export class OpenAiCodexCliClient implements LLMClient {
     }
 
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin);
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env = codexChildEnv();
     env.PYTHONIOENCODING = "utf-8";
 
     if (authMode === "chatgpt") {
@@ -1903,7 +1908,7 @@ export class OpenAiCodexCliClient implements LLMClient {
     throwIfLlmAborted(opts.signal);
     const model = normalizeCodexModel(opts.model);
     const commandPrefix = await resolveCodexCommandPrefix(this.codexBin, opts.signal);
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env = codexChildEnv();
     env.PYTHONIOENCODING = "utf-8";
     env.PUSHPALS_LLM_SERVICE = this.service;
     env.PUSHPALS_LLM_SESSION_TAG = this.sessionTag;

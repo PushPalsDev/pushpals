@@ -1535,7 +1535,7 @@ describe("JobQueue stale recovery", () => {
       const jobId = enqueueKindAndClaim(queue, workerId, "task.execute", {
         requestId: `request-pre-execution-stale-${suffix}`,
         retrySafety: "manual_retry_required",
-        reviewAgent: { resolutionType: "merge_conflict" },
+        resolutionType: "merge_conflict",
       });
       originalJobIds.push(jobId);
       expect(queue.getJob(jobId)?.startedAt).toBeNull();

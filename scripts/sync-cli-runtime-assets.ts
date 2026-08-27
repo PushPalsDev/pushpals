@@ -73,6 +73,10 @@ const copyPairs: Array<[string, string]> = [
     join(repoRoot, "packages", "shared", "src", "repository_snapshot.ts"),
     join(outDir, "sandbox", "packages", "shared", "src", "repository_snapshot.ts"),
   ],
+  [
+    join(repoRoot, "packages", "shared", "src", "scm_repair_authority.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "scm_repair_authority.ts"),
+  ],
 ];
 const trackedSandboxCopyPairs: Array<[string, string]> = [
   ["package.json", join(outDir, "sandbox", "package.json")],

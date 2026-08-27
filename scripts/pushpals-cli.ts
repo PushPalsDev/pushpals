@@ -52,6 +52,10 @@ import {
   isSupportedBunVersion,
 } from "../packages/shared/src/runtime_version.js";
 import { shouldDisplayInteractiveSessionEvent } from "../packages/shared/src/session_event_visibility.js";
+import {
+  SCM_REPAIR_AUTHORITY_SECRET_ENV,
+  takeScmRepairAuthoritySecretFromEnv,
+} from "../packages/shared/src/scm_repair_authority.js";
 
 type CliOptions = {
   serverUrl?: string;
@@ -185,7 +189,7 @@ type GitRemoteCheckResult =
   | { status: "missing_remote"; remote: string }
   | { status: "error"; remote: string; detail: string };
 
-type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_control_manager";
+export type RuntimeServiceName = "server" | "localbuddy" | "remotebuddy" | "source_control_manager";
 type RuntimeBinaryName = RuntimeServiceName | "workerpals";
 
 type RuntimeServiceLogPaths = Record<RuntimeServiceName, string>;
@@ -2446,7 +2450,48 @@ export function buildEmbeddedRuntimeEnv(
     platform,
     runtimeRoot: opts.runtimeRoot,
   });
-  return withWindowsGitSchannelEnv(runtimeEnvWithWindowsCa, platform) as Record<string, string>;
+  const childEnv = withWindowsGitSchannelEnv(runtimeEnvWithWindowsCa, platform) as Record<
+    string,
+    string
+  >;
+  scrubScmRepairAuthoritySecret(childEnv);
+  return childEnv;
+}
+
+function scmRepairAuthoritySecretFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() !== target) continue;
+    return String(value ?? "").trim();
+  }
+  return "";
+}
+
+function scrubScmRepairAuthoritySecret(env: Record<string, string | undefined>): void {
+  const target = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === target) delete env[key];
+  }
+}
+
+/**
+ * Derive one embedded service environment without exposing the SCM repair
+ * signing key to services that must never mint repair authority proofs.
+ */
+export function buildEmbeddedRuntimeServiceEnv(
+  runtimeEnv: Readonly<Record<string, string>>,
+  serviceName: RuntimeServiceName,
+  scmRepairAuthoritySecretOverride?: string,
+): Record<string, string> {
+  const serviceEnv = { ...runtimeEnv };
+  scrubScmRepairAuthoritySecret(serviceEnv);
+  const secret = String(scmRepairAuthoritySecretOverride ?? "").trim();
+  if (secret && (serviceName === "server" || serviceName === "source_control_manager")) {
+    serviceEnv[SCM_REPAIR_AUTHORITY_SECRET_ENV] = secret;
+  }
+  return serviceEnv;
 }
 
 function parseBooleanFlag(raw: string | undefined): boolean | null {
@@ -5581,6 +5626,7 @@ async function autoStartRuntimeServices(opts: {
   requestedRuntimeTag?: string;
   startLocalBuddy?: boolean;
   baseEnv?: Record<string, string | undefined>;
+  scmRepairAuthoritySecretOverride?: string;
 }): Promise<AutoStartedRuntime> {
   const { runtimePreflight } = opts.preparedRuntime;
   const runtimeRoot = opts.preparedRuntime.runtimeRoot;
@@ -5604,19 +5650,20 @@ async function autoStartRuntimeServices(opts: {
       : await ensureRuntimeBinaries(runtimeRoot, runtimeTag);
   const sandboxPaths = buildWorkerpalSandboxPaths(runtimeRoot);
 
-  const runtimeEnv = buildEmbeddedRuntimeEnv(
-    (opts.baseEnv ?? (process.env as Record<string, string | undefined>)) as Record<
-      string,
-      string | undefined
-    >,
-    {
-      repoRoot: opts.repoRoot,
-      runtimeRoot,
-      useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
-      sessionId: opts.sessionId,
-      runtimeTag,
-    },
-  );
+  const baseEnv = (opts.baseEnv ?? (process.env as Record<string, string | undefined>)) as Record<
+    string,
+    string | undefined
+  >;
+  const scmRepairAuthoritySecretOverride = String(
+    opts.scmRepairAuthoritySecretOverride ?? scmRepairAuthoritySecretFromEnv(baseEnv),
+  ).trim();
+  const runtimeEnv = buildEmbeddedRuntimeEnv(baseEnv, {
+    repoRoot: opts.repoRoot,
+    runtimeRoot,
+    useRuntimeConfig: opts.preparedRuntime.preflightUsesEmbeddedRuntime,
+    sessionId: opts.sessionId,
+    runtimeTag,
+  });
   const embeddedBunExecutable = resolveEmbeddedBunExecutableFromEnv(
     runtimeEnv,
     process.platform,
@@ -5820,7 +5867,7 @@ async function autoStartRuntimeServices(opts: {
       color: "",
       command: launchPlan.command,
       cwd,
-      env: runtimeEnv,
+      env: buildEmbeddedRuntimeServiceEnv(runtimeEnv, name, scmRepairAuthoritySecretOverride),
       logPath,
       launchReadyLine: launchPlan.launchReadyLine,
       launchTimeoutMs: launchPlan.launchTimeoutMs,
@@ -7162,6 +7209,9 @@ export function isCliExitCommand(text: string): boolean {
 }
 
 async function main(): Promise<void> {
+  // Capture an operator-provided control-plane credential once, then remove it
+  // before any preflight, Git, Docker, browser, or monitor helper can inherit it.
+  const scmRepairAuthoritySecretOverride = takeScmRepairAuthoritySecretFromEnv(process.env);
   const argv = process.argv.slice(2);
   logCliInvocation(argv);
   const parsed = parseArgs(argv);
@@ -7478,6 +7528,7 @@ async function main(): Promise<void> {
           requestedRuntimeTag: resolvedRuntimeTagForAutoStart || parsed.runtimeTag,
           startLocalBuddy,
           baseEnv: workerpalDockerPrecheck.env,
+          scmRepairAuthoritySecretOverride,
         });
         autoStartedServiceManager = startedRuntime.serviceManager;
         pushpalsLogPath = startedRuntime.pushpalsLogPath;

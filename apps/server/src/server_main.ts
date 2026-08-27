@@ -48,6 +48,10 @@ import {
   sanitizePushPalsConfigForLogging,
   sanitizeGitRemoteUrl,
   toGitHubRepoWebUrl,
+  SCM_REPAIR_AUTHORITY_HEADER,
+  resolveScmRepairAuthoritySecret,
+  scrubScmRepairAuthoritySecretFromEnv,
+  verifyScmRepairAuthorityProof,
   MemoryConflictError,
   MemoryValidationError,
   MEMORY_HTTP_AUTHORITY_HEADER,
@@ -75,6 +79,7 @@ import { deriveRuntimeConfigImpact } from "./runtime_config_policy.js";
 import { resolveRequestAuthHeader } from "./request_auth.js";
 import { extractAutonomyPayloadDetails } from "./autonomy_payload.js";
 import { LifecycleReconciliationTracker } from "./lifecycle_reconciliation.js";
+import { classifyJobTerminalSemantics } from "./job_terminal_semantics.js";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
 const STARTUP_CONFIG = loadPushPalsConfig();
@@ -97,6 +102,20 @@ const repositoryServices = createRepositoryAgentServiceClients({
   memoryStore,
 });
 const repositoryAgentRepoRoot = detectRepoRoot(process.cwd());
+let scmRepairAuthoritySecret: string | null = null;
+try {
+  scmRepairAuthoritySecret = resolveScmRepairAuthoritySecret({ dataDir });
+} catch (error) {
+  console.error(
+    `[Server] SCM repair authority is unavailable; review-repair admission will remain closed: ${
+      error instanceof Error ? error.message : String(error)
+    }`,
+  );
+} finally {
+  // Keep the authority only in this module. Child processes and hooks must
+  // never inherit a credential that can mint repair admission proofs.
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
+}
 const reconciliationTracker = new LifecycleReconciliationTracker();
 function guardedReconciliation<T>(label: string, fallback: T, reconcile: () => T): T {
   return reconciliationTracker.run(label, fallback, reconcile, (detail) => {
@@ -127,6 +146,11 @@ const requestLeaseReconciliation = guardedReconciliation(
   "request lease",
   { recovered: 0, requestIds: [] as string[] },
   () => requestQueue.recoverExpiredClaims(),
+);
+const requestDispatchConfirmationReconciliation = guardedReconciliation(
+  "request dispatch confirmation",
+  { expired: 0, requestIds: [] as string[] },
+  () => requestQueue.expireUnconfirmedDispatches(),
 );
 const completionLeaseReconciliation = guardedReconciliation(
   "completion lease",
@@ -173,6 +197,11 @@ if (
 if (reservationReconciliation.linked > 0 || reservationReconciliation.failed > 0) {
   console.warn(
     `[Server] Reconciled autonomy objective reservations: ${JSON.stringify(reservationReconciliation)}`,
+  );
+}
+if (requestDispatchConfirmationReconciliation.expired > 0) {
+  console.warn(
+    `[Server] Expired provisional autonomy dispatches during startup: ${JSON.stringify(requestDispatchConfirmationReconciliation)}`,
   );
 }
 if (handoffReconciliation.linked > 0 || handoffReconciliation.failed > 0) {
@@ -322,6 +351,16 @@ const lifecycleWatchdogTimer = setInterval(() => {
   ) {
     console.warn(
       `[Server] Periodic completion-lifecycle reconciliation: ${JSON.stringify(completionLifecycleRecovery)}`,
+    );
+  }
+  const dispatchConfirmationRecovery = guardedReconciliation(
+    "request dispatch confirmation",
+    { expired: 0, requestIds: [] as string[] },
+    () => requestQueue.expireUnconfirmedDispatches(),
+  );
+  if (dispatchConfirmationRecovery.expired > 0) {
+    console.warn(
+      `[Server] Expired provisional autonomy dispatches: ${JSON.stringify(dispatchConfirmationRecovery)}`,
     );
   }
   const reservationRecovery = guardedReconciliation(
@@ -787,7 +826,11 @@ export function createRequestHandler() {
       const corsHeaders = buildLocalCorsHeaders({
         origin: originHeader,
         allowAuthorizationHeader: true,
-        additionalAllowedHeaders: [MEMORY_HTTP_CALLER_HEADER, MEMORY_HTTP_AUTHORITY_HEADER],
+        additionalAllowedHeaders: [
+          MEMORY_HTTP_CALLER_HEADER,
+          MEMORY_HTTP_AUTHORITY_HEADER,
+          SCM_REPAIR_AUTHORITY_HEADER,
+        ],
       });
 
       // Common JSON headers (CORS + no-store cache)
@@ -877,18 +920,6 @@ export function createRequestHandler() {
           text.includes("requested clarification")
         );
       };
-      const hasNoChangeSignal = (value: string): boolean => {
-        const text = value.toLowerCase();
-        return (
-          text.includes("no file changes") ||
-          text.includes("no changes to commit") ||
-          text.includes("no changes made") ||
-          text.includes("nothing to commit") ||
-          text.includes("modified 0 file") ||
-          text.includes("no modified files were detected") ||
-          text.includes("no file changes detected")
-        );
-      };
       const classifyAutonomyJobCompletion = (
         body: Record<string, unknown>,
       ): {
@@ -925,7 +956,15 @@ export function createRequestHandler() {
             regressionFlag: false,
           };
         }
-        if (hasNoChangeSignal(combined)) {
+        if (
+          classifyJobTerminalSemantics({
+            status: "completed",
+            result: body.result,
+            summary: body.summary,
+            detail: body.detail,
+            additionalEvidence: [combined],
+          }).noChange
+        ) {
           return {
             success: false,
             userAction: "no_change",
@@ -999,6 +1038,49 @@ export function createRequestHandler() {
           }
         }
         return {};
+      };
+      const recordAutonomyRequestDispatched = (
+        value: Record<string, unknown>,
+        requestId: string,
+      ): void => {
+        const autonomyMetadata = autonomyMetadataFromPayload(value);
+        if (
+          autonomyMetadata.reservationRequired !== true &&
+          autonomyMetadata.reservation_required !== true
+        ) {
+          return;
+        }
+        const objectiveId = compactText(
+          autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id,
+          128,
+        );
+        if (!objectiveId) return;
+        const transitioned = autonomyStore.markObjectiveDispatched(objectiveId, requestId);
+        if (!transitioned) return;
+        const sessionId = compactText(value.sessionId, 128);
+        const session = sessionManager.getSession(sessionId);
+        if (!session) return;
+        session.emit({
+          protocolVersion: PROTOCOL_VERSION,
+          id: randomUUID(),
+          ts: new Date().toISOString(),
+          sessionId,
+          type: "autonomy_objective_dispatched",
+          from: "server:autonomy",
+          payload: {
+            runId: compactText(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
+            snapshotId: compactText(
+              autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id,
+              128,
+            ),
+            objectiveId,
+            requestId,
+            patternKey:
+              compactText(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) ||
+              "unknown",
+            origin: "autonomy",
+          },
+        });
       };
       const makeAutonomyReservationResponse = (value: Record<string, unknown>): Response | null => {
         const autonomyMetadata = autonomyMetadataFromPayload(value);
@@ -1259,6 +1341,31 @@ export function createRequestHandler() {
           threshold: AUTONOMY_SIMILAR_FAILURE_THRESHOLD,
         });
       };
+      const resolveAuthorizedAutonomyRecovery = (value: Record<string, unknown>) => {
+        const details = extractAutonomyPayloadDetails(value);
+        const validationIncidentAuthorized = Boolean(
+          details.isValidationIncidentRepair &&
+          details.reservationRequired &&
+          details.objectiveId &&
+          details.validationIncidentId &&
+          autonomyStore.authorizesValidationIncidentRepair({
+            objectiveId: details.objectiveId,
+            incidentId: details.validationIncidentId,
+            snapshotId: details.snapshotId,
+          }),
+        );
+        const repairAdmission = jobQueue.reviewRepairAdmission(value);
+        return {
+          details,
+          repairAdmission,
+          authorized: validationIncidentAuthorized || repairAdmission.authorized,
+          authorizedElevatedWorkClass: validationIncidentAuthorized
+            ? ("recovery" as const)
+            : repairAdmission.authorized
+              ? ("repair" as const)
+              : undefined,
+        };
+      };
       const makeAutonomySimilarFailureResponse = (
         value: Record<string, unknown>,
       ): Response | null => {
@@ -1367,6 +1474,14 @@ export function createRequestHandler() {
         if (nowMs - lastStaleRecoverySweepAt < staleClaimSweepIntervalMs) return;
         lastStaleRecoverySweepAt = nowMs;
         autonomyStore.maybeSweepStaleObjectives();
+        const dispatchConfirmationRecovery = requestQueue.expireUnconfirmedDispatches(
+          new Date(nowMs),
+        );
+        if (dispatchConfirmationRecovery.expired > 0) {
+          console.warn(
+            `[Server] Expired provisional autonomy dispatches during stale-claim sweep: ${JSON.stringify(dispatchConfirmationRecovery)}`,
+          );
+        }
         const reservationRecovery = autonomyStore.reconcileGatedObjectiveReservations();
         if (reservationRecovery.linked > 0 || reservationRecovery.failed > 0) {
           console.warn(
@@ -2170,6 +2285,47 @@ export function createRequestHandler() {
             429,
           );
         }
+        let recoveryAuthority = resolveAuthorizedAutonomyRecovery(body);
+        if (
+          recoveryAuthority.repairAdmission.requested &&
+          !recoveryAuthority.repairAdmission.terminal &&
+          !recoveryAuthority.repairAdmission.authorized
+        ) {
+          const scmAuthority = verifyScmRepairAuthorityProof({
+            body,
+            proof: req.headers.get(SCM_REPAIR_AUTHORITY_HEADER),
+            secret: scmRepairAuthoritySecret,
+          });
+          if (scmAuthority.ok) {
+            jobQueue.authorizeReviewRepairCapability(body);
+            recoveryAuthority = resolveAuthorizedAutonomyRecovery(body);
+          }
+        }
+        if (recoveryAuthority.repairAdmission.terminal) {
+          return makeJson(
+            {
+              ok: false,
+              code: recoveryAuthority.repairAdmission.exhausted
+                ? "review_repair_lifecycle_exhausted"
+                : "review_repair_lifecycle_settled",
+              message: recoveryAuthority.repairAdmission.reason,
+            },
+            409,
+          );
+        }
+        if (
+          recoveryAuthority.repairAdmission.requested &&
+          !recoveryAuthority.repairAdmission.authorized
+        ) {
+          return makeJson(
+            {
+              ok: false,
+              code: "review_repair_capability_required",
+              message: recoveryAuthority.repairAdmission.reason,
+            },
+            403,
+          );
+        }
         const enqueueParams =
           body.params && typeof body.params === "object" && !Array.isArray(body.params)
             ? (body.params as Record<string, unknown>)
@@ -2218,7 +2374,7 @@ export function createRequestHandler() {
           if (reservationResponse) return reservationResponse;
           const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
           if (runtimeCircuitResponse) return runtimeCircuitResponse;
-          if (!extractAutonomyPayloadDetails(body).isRecoveryWork) {
+          if (!recoveryAuthority.authorized) {
             const recoveryBackpressureResponse = makeAutonomyRecoveryBackpressureResponse();
             if (recoveryBackpressureResponse) return recoveryBackpressureResponse;
             const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
@@ -2229,7 +2385,9 @@ export function createRequestHandler() {
             if (publicationResponse) return publicationResponse;
           }
         }
-        const result = jobQueue.enqueue(body);
+        const result = jobQueue.enqueue(body, {
+          authorizedElevatedWorkClass: recoveryAuthority.authorizedElevatedWorkClass,
+        });
         return makeJson(result, result.ok ? 201 : 400);
       }
 
@@ -3112,12 +3270,12 @@ export function createRequestHandler() {
           });
           if (enqueueResult.ok && enqueueResult.requestId) {
             resumedRequestId = enqueueResult.requestId;
-            autonomyStore.markObjectiveDispatched(
+            const dispatchTransitioned = autonomyStore.markObjectiveDispatched(
               result.resume.objectiveId,
               enqueueResult.requestId,
             );
             const dispatchSession = sessionManager.getSession(result.resume.sessionId);
-            if (dispatchSession) {
+            if (dispatchTransitioned && dispatchSession) {
               dispatchSession.emit({
                 protocolVersion: PROTOCOL_VERSION,
                 id: randomUUID(),
@@ -3687,13 +3845,39 @@ export function createRequestHandler() {
             429,
           );
         }
+        const recoveryAuthority = resolveAuthorizedAutonomyRecovery(body);
+        if (recoveryAuthority.repairAdmission.terminal) {
+          return makeJson(
+            {
+              ok: false,
+              code: recoveryAuthority.repairAdmission.exhausted
+                ? "review_repair_lifecycle_exhausted"
+                : "review_repair_lifecycle_settled",
+              message: recoveryAuthority.repairAdmission.reason,
+            },
+            409,
+          );
+        }
+        if (
+          recoveryAuthority.repairAdmission.requested &&
+          !recoveryAuthority.repairAdmission.authorized
+        ) {
+          return makeJson(
+            {
+              ok: false,
+              code: "review_repair_capability_required",
+              message: recoveryAuthority.repairAdmission.reason,
+            },
+            403,
+          );
+        }
         if (isAutonomyRequestPayload(body)) {
-          const autonomyDetails = extractAutonomyPayloadDetails(body);
+          const autonomyDetails = recoveryAuthority.details;
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse) return reservationResponse;
           const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
           if (runtimeCircuitResponse) return runtimeCircuitResponse;
-          if (!autonomyDetails.isRecoveryWork) {
+          if (!recoveryAuthority.authorized) {
             const recoveryBackpressureResponse = makeAutonomyRecoveryBackpressureResponse();
             if (recoveryBackpressureResponse) return recoveryBackpressureResponse;
             const failureCircuitResponse = makeAutonomyFailureCircuitResponse();
@@ -3712,7 +3896,7 @@ export function createRequestHandler() {
             (worker) => worker.status === "idle" && worker.activeJobCount === 0,
           );
           const workersAllBusy = schedulableWorkers.length > 0 && idleWorkers.length === 0;
-          if (workersAllBusy && !autonomyDetails.isRecoveryWork) {
+          if (workersAllBusy && !recoveryAuthority.authorized) {
             const autonomyQueued = requestQueue.countAutonomyRequests(["pending", "claimed"]);
             if (autonomyQueued >= AUTONOMY_BUSY_QUEUE_MAX_REQUESTS) {
               return makeJson(
@@ -3735,7 +3919,7 @@ export function createRequestHandler() {
             (entry) => entry.mergeState === "open_unmerged",
           );
           if (
-            !autonomyDetails.isRecoveryWork &&
+            !recoveryAuthority.authorized &&
             openUnmergedWorkerPrs.length >= AUTONOMY_MAX_OPEN_UNMERGED_WORKER_PRS
           ) {
             return makeJson(
@@ -3752,49 +3936,44 @@ export function createRequestHandler() {
               429,
             );
           }
+        } else if (body.dispatchConfirmationRequired === true) {
+          return makeJson(
+            {
+              ok: false,
+              code: "dispatch_confirmation_not_allowed",
+              message: "Two-phase dispatch confirmation is reserved for autonomy requests.",
+            },
+            400,
+          );
         }
         const result = requestQueue.enqueue(body);
-        const autonomyMetadata = autonomyMetadataFromPayload(body);
-        if (
-          result.ok &&
-          result.requestId &&
-          (autonomyMetadata.reservationRequired === true ||
-            autonomyMetadata.reservation_required === true)
-        ) {
-          const objectiveId = compactText(
-            autonomyMetadata.objectiveId ?? autonomyMetadata.objective_id,
-            128,
-          );
-          if (objectiveId) {
-            autonomyStore.markObjectiveDispatched(objectiveId, result.requestId);
-            const sessionId = compactText(body.sessionId, 128);
-            const session = sessionManager.getSession(sessionId);
-            if (session) {
-              session.emit({
-                protocolVersion: PROTOCOL_VERSION,
-                id: randomUUID(),
-                ts: new Date().toISOString(),
-                sessionId,
-                type: "autonomy_objective_dispatched",
-                from: "server:autonomy",
-                payload: {
-                  runId: compactText(autonomyMetadata.runId ?? autonomyMetadata.run_id, 128),
-                  snapshotId: compactText(
-                    autonomyMetadata.snapshotId ?? autonomyMetadata.snapshot_id,
-                    128,
-                  ),
-                  objectiveId,
-                  requestId: result.requestId,
-                  patternKey:
-                    compactText(autonomyMetadata.patternKey ?? autonomyMetadata.pattern_key, 128) ||
-                    "unknown",
-                  origin: "autonomy",
-                },
-              });
-            }
-          }
+        if (result.ok && result.requestId && !result.dispatchConfirmationRequired) {
+          recordAutonomyRequestDispatched(body, result.requestId);
         }
         return makeJson(result, result.ok ? 201 : 400);
+      }
+
+      // POST /requests/:id/dispatch/confirm
+      const requestDispatchConfirmMatch = pathname.match(
+        /^\/requests\/([^/]+)\/dispatch\/confirm$/,
+      );
+      if (requestDispatchConfirmMatch && method === "POST") {
+        const denied = requireAuth();
+        if (denied) return denied;
+
+        const requestId = requestDispatchConfirmMatch[1];
+        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = requestQueue.confirmDispatch(
+          requestId,
+          compactText(body.dispatchConfirmationToken, 256),
+        );
+        if (!result.ok) return makeJson(result, 409);
+        const request = requestQueue.getRequest(requestId);
+        if (!request) {
+          return makeJson({ ok: false, message: "Request not found after confirmation" }, 404);
+        }
+        recordAutonomyRequestDispatched(request as unknown as Record<string, unknown>, requestId);
+        return makeJson(result, 200);
       }
 
       // POST /requests/claim

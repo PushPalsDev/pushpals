@@ -51,6 +51,15 @@ Sessions use monotonic event cursors (`event_id`) so clients can reconnect with 
 
 Each queue has typed statuses (`pending`, `claimed`, `completed`, `failed`, etc.) and transition checks.
 
+Autonomy requests add a two-phase admission fence without inventing a hidden
+claim state. A provisional `pending` row carries a one-time confirmation token
+and absolute expiry, is excluded from queue position, backlog counts, recovery,
+and claim selection, and becomes eligible only after exact confirmation.
+Abandoned provisional rows become failed audit records and their idempotency key
+can be safely rearmed on the next live cycle. The capability token is returned
+only by enqueue and is redacted from request detail, list, claim, and telemetry
+projections. Confirmation retries remain idempotent after claim or completion.
+
 ### 4) Built-in stale recovery
 
 Jobs claimed by dead workers can be recovered through stale-claim sweeps.
@@ -150,6 +159,14 @@ Requests support:
 
 The queue validates autonomy-origin metadata against component scope policy to prevent broad writes.
 
+Jobs also carry an authoritative work class. Elevated `repair` and `recovery`
+admission is derived from an existing Server-owned validation incident or PR
+repair lifecycle; caller-provided labels alone cannot bypass an autonomy freeze
+or queue backpressure. Claim ordering combines deadlines and aging with a
+bounded elevated-work burst, so urgent recovery makes progress without
+permanently starving interactive or ordinary work. An overdue recovery blocks
+new ideation, not the recovery itself.
+
 ## Job Queue Model
 
 Jobs include:
@@ -161,6 +178,15 @@ Jobs include:
 - queue metrics and SLO summaries.
 
 Worker heartbeats are persisted to infer online/offline state.
+
+Autonomy health uses independent root objectives for global freeze sampling;
+child repairs do not manufacture extra samples. Attempt outcomes distinguish
+quality rejection, environment blocking, orchestration/runtime failure,
+publication failure, no-change completion, and confirmed product regression.
+Latency and review metrics include unresolved reviewed objectives and successful
+provider outcomes rather than silently dropping null terminal rows. Semantic
+failure clusters include stable vision lineage plus component/target family, so
+adjacent-path retries coalesce without suppressing unrelated work.
 
 ## Completion Queue Model
 

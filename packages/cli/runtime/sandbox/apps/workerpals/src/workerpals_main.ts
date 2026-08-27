@@ -30,6 +30,7 @@ import {
   loadPushPalsConfig,
   resolveLocalServerConnection,
   resolveGitTokenForRemote,
+  scrubScmRepairAuthoritySecretFromEnv,
   createToolRunRecordFromFailure,
   fetchBufferedWithHardDeadline,
   isWorkerOwnedRuntimeStackFrame,
@@ -41,6 +42,7 @@ import {
   executeJob,
   shouldCommit,
   createJobCommit,
+  checkpointJobCandidate,
   git,
   redactSensitiveText,
   resolveReviewNoChangeCompletionBranch,
@@ -58,7 +60,13 @@ import { resolveDirectWorktreePath } from "./common/direct_worktree.js";
 import { WorkerServerTransport, type WorkerHeartbeatPayload } from "./common/server_transport.js";
 import { DEFAULT_DOCKER_TIMEOUT_MS, parseDockerTimeoutMs } from "./timeout_policy.js";
 import { resolveFreshWorktreeBaseRef, resolveReviewWorktreeBase } from "./worktree_base_ref.js";
-import type { JobDiagnostics, JobPhaseSpanDiagnostics } from "./common/types.js";
+import type {
+  JobCandidateState,
+  JobDiagnostics,
+  JobPhaseSpanDiagnostics,
+  JobTokenUsage,
+  JobUsageAttempt,
+} from "./common/types.js";
 import {
   applyMergeConflictExecutionHints,
   isMergeConflictResolutionParams,
@@ -68,6 +76,7 @@ import {
   appendValidationRepairPublicationLease,
   validationRepairPublicationLeaseFromJobParams,
 } from "shared";
+import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
 
 type CommitRef = {
   branch: string;
@@ -738,10 +747,21 @@ export function buildUnhandledWorkerFailureResult(
       ? "docker"
       : "worker";
   const summary = `Job execution failed before completion: ${errorSummary}`;
+  const candidateState =
+    error && typeof error === "object"
+      ? ((error as { candidateState?: JobCandidateState }).candidateState ?? undefined)
+      : undefined;
+  const carriedUsage =
+    error && typeof error === "object"
+      ? (error as { usage?: JobTokenUsage; usageAttempts?: JobUsageAttempt[] })
+      : {};
   return {
     ok: false,
     summary,
     stderr: detail,
+    ...(candidateState ? { candidateState } : {}),
+    ...(carriedUsage.usage ? { usage: carriedUsage.usage } : {}),
+    ...(carriedUsage.usageAttempts ? { usageAttempts: carriedUsage.usageAttempts } : {}),
     diagnostics: {
       terminal: {
         failureClass,
@@ -1141,12 +1161,74 @@ async function runJob(
   dockerExecutor: DockerExecutor | null,
   runtimeConfig: ReturnType<typeof loadPushPalsConfig>,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  directDeadlineLedger?: JobDeadlineLedger,
 ): Promise<WorkerJobResult> {
   if (dockerExecutor) {
     const result = await dockerExecutor.execute(job, onLog);
     return workerJobResultFromDocker(result);
   }
-  return executeJob(job.kind, job.params, repo, onLog, runtimeConfig);
+  return executeJob(job.kind, job.params, repo, onLog, runtimeConfig, directDeadlineLedger);
+}
+
+export async function retainDirectFailureCandidate(
+  result: WorkerJobResult,
+  repo: string,
+  workerId: string,
+  job: { id: string; kind: string },
+  runtimeConfig: ReturnType<typeof loadPushPalsConfig> = CONFIG,
+  baselineSha?: string | null,
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<WorkerJobResult> {
+  if (result.ok) return result;
+  const candidateState =
+    result.candidateState ??
+    ({
+      status: result.exitCode === 124 ? "partial" : "held",
+      reason: result.exitCode === 124 ? "execution_timeout" : "terminal_failure",
+      changedPaths: [],
+    } satisfies JobCandidateState);
+  const retained = await checkpointJobCandidate(
+    repo,
+    workerId,
+    job,
+    candidateState,
+    runtimeConfig,
+    baselineSha,
+    deadlineLedger,
+  );
+  return retained.checkpoint
+    ? {
+        ...result,
+        candidateState: retained,
+        stderr: [
+          result.stderr,
+          `Candidate checkpoint retained at ${retained.checkpoint.ref} (${retained.checkpoint.sha}).`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      }
+    : retained.changedPaths.length > 0
+      ? { ...result, candidateState: retained }
+      : result;
+}
+
+export function buildDirectCommitFinalizationFailure(
+  result: WorkerJobResult,
+  error: string,
+): WorkerJobResult {
+  const detail = error.trim() || "Host-side Git finalization returned no commit metadata.";
+  return {
+    ...result,
+    ok: false,
+    summary: "Failed to finalize the candidate commit",
+    stderr: [result.stderr, detail].filter(Boolean).join("\n"),
+    exitCode: result.exitCode && result.exitCode !== 0 ? result.exitCode : 4,
+    candidateState: result.candidateState ?? {
+      status: "held",
+      reason: "commit_finalization_failed",
+      changedPaths: [],
+    },
+  };
 }
 
 export function workerJobResultFromDocker(result: DockerJobResult): WorkerJobResult {
@@ -1158,6 +1240,8 @@ export function workerJobResultFromDocker(result: DockerJobResult): WorkerJobRes
     exitCode: result.exitCode,
     cooldownMs: result.cooldownMs,
     usage: result.usage,
+    usageAttempts: result.usageAttempts,
+    candidateState: result.candidateState,
     publishBlocked: result.publishBlocked,
     validationBlocked: result.validationBlocked,
     commit: result.commit,
@@ -1200,6 +1284,23 @@ export function holdCommitForTrustedValidation(
       completionCommit: null,
     };
   }
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(commit.sha.trim())) {
+    return {
+      result: {
+        ...result,
+        ok: false,
+        summary: "Trusted-environment validation requires an exact candidate commit SHA",
+        stderr: [
+          result.stderr,
+          `Refusing trusted-host handoff with non-immutable candidate identifier: ${commit.sha}`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        exitCode: 4,
+      },
+      completionCommit: null,
+    };
+  }
 
   return {
     result: {
@@ -1208,6 +1309,16 @@ export function holdCommitForTrustedValidation(
       summary: `${result.validationBlocked.summary}; queued for host-side validation`,
       exitCode: 0,
       publishBlocked: undefined,
+      candidateState: {
+        status: "held",
+        reason: "trusted_environment_validation_required",
+        changedPaths: result.candidateState?.changedPaths ?? [],
+        checkpoint: {
+          ref: commit.branch,
+          sha: commit.sha,
+          capturedAt: new Date().toISOString(),
+        },
+      },
     },
     completionCommit: commit,
   };
@@ -1253,12 +1364,16 @@ export function buildTrustedValidationCompletionPayload(
   };
 }
 
-async function resolveWorktreeBaseRef(repo: string, requestedRef: string): Promise<string> {
+async function resolveWorktreeBaseRef(
+  repo: string,
+  requestedRef: string,
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<string> {
   return resolveFreshWorktreeBaseRef({
     requestedRef,
     integrationBranch: integrationBranchName(),
     sourceBaseBranch: CONFIG.sourceControlManager.baseBranch,
-    git: (args) => git(repo, args),
+    git: (args) => git(repo, args, deadlineLedger, "work"),
     log: (level, message) => {
       const line = `[WorkerPals] ${message}`;
       if (level === "warn") console.warn(line);
@@ -1272,12 +1387,13 @@ async function resolveWorktreeBaseRefForJob(
   requestedRef: string,
   jobId: string,
   params: Record<string, unknown>,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<string> {
   return resolveReviewWorktreeBase({
     jobId,
     params,
-    git: (args) => git(repo, args),
-    fallback: () => resolveWorktreeBaseRef(repo, requestedRef),
+    git: (args) => git(repo, args, deadlineLedger, "work"),
+    fallback: () => resolveWorktreeBaseRef(repo, requestedRef, deadlineLedger),
     log: (level, message) => {
       const line = `[WorkerPals] ${message}`;
       if (level === "warn") console.warn(line);
@@ -1291,12 +1407,18 @@ async function createIsolatedWorktree(
   jobId: string,
   baseRef: string,
   onLog?: (stream: "stdout" | "stderr", line: string) => void,
+  deadlineLedger?: JobDeadlineLedger,
 ): Promise<string> {
   const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random().toString(36).slice(2, 6)}`;
   const worktreePath = resolveDirectWorktreePath(repo, jobId, nonce);
   mkdirSync(resolve(worktreePath, ".."), { recursive: true });
 
-  const addResult = await git(repo, ["worktree", "add", "--detach", worktreePath, baseRef]);
+  const addResult = await git(
+    repo,
+    ["worktree", "add", "--detach", worktreePath, baseRef],
+    deadlineLedger,
+    "work",
+  );
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
   }
@@ -2445,6 +2567,8 @@ async function workerLoop(
               : null;
 
           let directWorktreePath: string | null = null;
+          let directWorktreeBaselineSha: string | null = null;
+          let preserveDirectWorktreeForCandidateRecovery = false;
           let executionRepo = opts.repo;
           let result: WorkerJobResult | null = null;
           let recycleWorkerAfterJob = false;
@@ -2452,7 +2576,9 @@ async function workerLoop(
 
           try {
             let parsedParams: Record<string, unknown>;
-            const preparationStartedAtMs = Date.now();
+            const jobStartedAtMs = Date.now();
+            const preparationStartedAtMs = jobStartedAtMs;
+            let directDeadlineLedger: JobDeadlineLedger | undefined;
             try {
               parsedParams =
                 typeof job.params === "string"
@@ -2460,31 +2586,116 @@ async function workerLoop(
                   : job.params;
 
               if (!dockerExecutor) {
+                const directPlanning =
+                  parsedParams.planning &&
+                  typeof parsedParams.planning === "object" &&
+                  !Array.isArray(parsedParams.planning)
+                    ? (parsedParams.planning as Record<string, unknown>)
+                    : null;
+                const directExecutionBudgetMs = Number(directPlanning?.executionBudgetMs);
+                const directFinalizationBudgetMs = Number(directPlanning?.finalizationBudgetMs);
+                directDeadlineLedger =
+                  directPlanning &&
+                  Number.isFinite(directExecutionBudgetMs) &&
+                  directExecutionBudgetMs > 0 &&
+                  Number.isFinite(directFinalizationBudgetMs) &&
+                  directFinalizationBudgetMs > 0
+                    ? new JobDeadlineLedger({
+                        executionBudgetMs: directExecutionBudgetMs,
+                        finalizationBudgetMs: directFinalizationBudgetMs,
+                        startedAtMs: jobStartedAtMs,
+                      })
+                    : undefined;
                 const jobBaseRef = await resolveWorktreeBaseRefForJob(
                   opts.repo,
                   opts.worktreeBaseRef,
                   job.id,
                   parsedParams,
+                  directDeadlineLedger,
                 );
                 directWorktreePath = await createIsolatedWorktree(
                   opts.repo,
                   job.id,
                   jobBaseRef,
                   onLog,
+                  directDeadlineLedger,
                 );
                 executionRepo = directWorktreePath;
+                const directBaseline = await git(
+                  executionRepo,
+                  ["rev-parse", "HEAD"],
+                  directDeadlineLedger,
+                  "work",
+                );
+                if (!directBaseline.ok || !directBaseline.stdout.trim()) {
+                  throw new Error(
+                    `Unable to resolve isolated worktree baseline before execution: ${directBaseline.stderr || directBaseline.stdout || `git exited ${directBaseline.exitCode}`}`,
+                  );
+                }
+                directWorktreeBaselineSha = directBaseline.stdout.trim();
                 if (isMergeConflictResolutionParams(parsedParams)) {
                   const prepared = await prepareMergeConflictWorktreeOnHost(
                     executionRepo,
                     job.id,
                     parsedParams,
                     onLog,
+                    directDeadlineLedger,
                   );
                   parsedParams = applyMergeConflictExecutionHints(parsedParams, prepared);
                 }
               }
             } catch (preparationError) {
               result = buildWorkerPreparationFailureResult(preparationError);
+              if (directDeadlineLedger?.workExpired()) {
+                result = {
+                  ...result,
+                  summary: `Job ${job.id} reached its absolute deadline during host preparation`,
+                  stderr: [
+                    result.stderr,
+                    "The shared work budget was exhausted before executor startup; the reserved finalization window was not borrowed.",
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                  exitCode: 124,
+                };
+              }
+              if (directWorktreePath) {
+                try {
+                  result = await retainDirectFailureCandidate(
+                    result,
+                    directWorktreePath,
+                    opts.workerId,
+                    { id: job.id, kind: job.kind },
+                    CONFIG,
+                    directWorktreeBaselineSha,
+                    directDeadlineLedger,
+                  );
+                  if (result.candidateState?.checkpoint) {
+                    onLog?.(
+                      "stderr",
+                      `[WorkerPals] Retained preparation-failure candidate ${result.candidateState.checkpoint.sha.slice(0, 12)} before terminal persistence and worktree cleanup.`,
+                    );
+                  }
+                } catch (candidateError) {
+                  preserveDirectWorktreeForCandidateRecovery = true;
+                  result = {
+                    ...result,
+                    candidateState:
+                      result.candidateState ??
+                      ({
+                        status: result.exitCode === 124 ? "partial" : "held",
+                        reason: "preparation_checkpoint_failed_worktree_preserved",
+                        changedPaths: [],
+                      } satisfies JobCandidateState),
+                    stderr: [
+                      result.stderr,
+                      `Preparation candidate checkpoint failed; preserving direct worktree at ${directWorktreePath}: ${compactWorkerError(candidateError)}`,
+                    ]
+                      .filter(Boolean)
+                      .join("\n"),
+                  };
+                }
+              }
               const preparationDurationMs = Math.max(0, Date.now() - preparationStartedAtMs);
               allowHeartbeatRecycle = false;
               await transport.flush();
@@ -2525,9 +2736,15 @@ async function workerLoop(
             };
 
             let cooldownAfterJobMs = 0;
-            const jobStartedAtMs = Date.now();
             try {
-              result = await runJob(jobData, executionRepo, dockerExecutor, CONFIG, onLog);
+              result = await runJob(
+                jobData,
+                executionRepo,
+                dockerExecutor,
+                CONFIG,
+                onLog,
+                directDeadlineLedger,
+              );
               cooldownAfterJobMs =
                 Number.isFinite(result.cooldownMs) && (result.cooldownMs ?? 0) > 0
                   ? Math.floor(result.cooldownMs ?? 0)
@@ -2551,19 +2768,49 @@ async function workerLoop(
                 stderr: "Worker result was not produced",
               };
             }
-            const jobDurationMs = Math.max(0, Date.now() - jobStartedAtMs);
-
+            if (!dockerExecutor && directWorktreePath && !result.ok) {
+              try {
+                result = await retainDirectFailureCandidate(
+                  result,
+                  executionRepo,
+                  opts.workerId,
+                  jobData,
+                  CONFIG,
+                  directWorktreeBaselineSha,
+                  directDeadlineLedger,
+                );
+                if (result.candidateState?.checkpoint) {
+                  onLog?.(
+                    "stderr",
+                    `[WorkerPals] Retained ${result.candidateState.status} candidate ${result.candidateState.checkpoint.sha.slice(0, 12)} before direct worktree cleanup.`,
+                  );
+                }
+              } catch (error) {
+                preserveDirectWorktreeForCandidateRecovery = true;
+                result = {
+                  ...result,
+                  candidateState:
+                    result.candidateState ??
+                    ({
+                      status: result.exitCode === 124 ? "partial" : "held",
+                      reason: "checkpoint_failed_worktree_preserved",
+                      changedPaths: [],
+                    } satisfies JobCandidateState),
+                  stderr: [
+                    result.stderr,
+                    `Candidate checkpoint failed; preserving direct worktree at ${executionRepo}: ${compactWorkerError(error)}`,
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                };
+                onLog?.(
+                  "stderr",
+                  `[WorkerPals] Candidate checkpoint failed; preserving direct worktree ${executionRepo}: ${compactWorkerError(error)}`,
+                );
+              }
+            }
             allowHeartbeatRecycle = false;
             await transport.flush();
-            try {
-              await reportWorkerLlmUsage(opts.server, headers, jobData, result);
-            } catch (err) {
-              console.warn(
-                `[WorkerPals] Failed to report LLM usage for job ${job.id}: ${
-                  err instanceof Error ? err.message : String(err)
-                }`,
-              );
-            }
 
             let completionCommit: CommitRef | null = null;
             if (result.ok && shouldCommit(job.kind, CONFIG)) {
@@ -2620,9 +2867,63 @@ async function workerLoop(
                     deferPublication: Boolean(result.validationBlocked),
                   },
                   CONFIG,
+                  directDeadlineLedger,
                 );
+                if ((commitResult.usageAttempts?.length ?? 0) > 0) {
+                  const usageAccumulator = new UsageAccumulator();
+                  usageAccumulator.addAttempts(result.usageAttempts);
+                  if ((result.usageAttempts?.length ?? 0) === 0 && result.usage) {
+                    usageAccumulator.add(result.usage, {
+                      stage: "executor",
+                      attempt: 1,
+                      source: result.usage.backend ?? "executor_legacy_total",
+                    });
+                  }
+                  usageAccumulator.addAttempts(commitResult.usageAttempts);
+                  result = usageAccumulator.apply(result);
+                }
 
-                if (commitResult.ok && commitResult.sha && commitResult.branch) {
+                const directFinalizationExpired = directDeadlineLedger?.remainingTotalMs() === 0;
+                if (directFinalizationExpired) {
+                  const exactCandidate =
+                    commitResult.ok &&
+                    commitResult.sha &&
+                    commitResult.sha !== "no-changes" &&
+                    commitResult.branch
+                      ? {
+                          status: "held" as const,
+                          reason: "finalization_deadline",
+                          changedPaths: [],
+                          checkpoint: {
+                            ref: commitResult.branch,
+                            sha: commitResult.sha,
+                            capturedAt: new Date().toISOString(),
+                          },
+                        }
+                      : undefined;
+                  if (!exactCandidate) {
+                    preserveDirectWorktreeForCandidateRecovery = true;
+                  }
+                  result = {
+                    ...result,
+                    ok: false,
+                    summary: `Job ${job.id} reached its absolute deadline during commit finalization`,
+                    stderr: [
+                      result.stderr,
+                      "The absolute job deadline expired during host-side commit finalization; the job cannot be reported as ordinary success.",
+                    ]
+                      .filter(Boolean)
+                      .join("\n"),
+                    exitCode: 124,
+                    candidateState: exactCandidate ??
+                      result.candidateState ?? {
+                        status: "partial",
+                        reason: "finalization_deadline_worktree_preserved",
+                        changedPaths: [],
+                      },
+                  };
+                  completionCommit = null;
+                } else if (commitResult.ok && commitResult.sha && commitResult.branch) {
                   if (commitResult.sha !== "no-changes") {
                     completionCommit = {
                       branch: commitResult.branch,
@@ -2649,8 +2950,31 @@ async function workerLoop(
                     publishBlocked: commitResult.publishBlocked,
                   };
                   console.error(`[WorkerPals] Publish blocked: ${commitResult.error}`);
-                } else if (commitResult.error) {
-                  console.error(`[WorkerPals] Failed to create commit: ${commitResult.error}`);
+                } else {
+                  const commitFailureDetail =
+                    commitResult.error ??
+                    `Host-side commit finalization returned incomplete metadata (ok=${commitResult.ok}, branch=${commitResult.branch ?? "missing"}, sha=${commitResult.sha ?? "missing"}).`;
+                  result = buildDirectCommitFinalizationFailure(result, commitFailureDetail);
+                  try {
+                    result = await retainDirectFailureCandidate(
+                      result,
+                      executionRepo,
+                      opts.workerId,
+                      jobData,
+                      CONFIG,
+                      directWorktreeBaselineSha,
+                      directDeadlineLedger,
+                    );
+                  } catch (error) {
+                    preserveDirectWorktreeForCandidateRecovery = true;
+                    result.stderr = [
+                      result.stderr,
+                      `Candidate checkpoint failed; preserving direct worktree at ${executionRepo}: ${compactWorkerError(error)}`,
+                    ]
+                      .filter(Boolean)
+                      .join("\n");
+                  }
+                  console.error(`[WorkerPals] Failed to create commit: ${commitFailureDetail}`);
                 }
               }
             }
@@ -2690,6 +3014,20 @@ async function workerLoop(
             }
 
             const finalizedAtMs = Date.now();
+            const jobDurationMs = Math.max(0, finalizedAtMs - jobStartedAtMs);
+            // Report only after direct/Docker finalization has merged all
+            // executor, recovery, critic, and commit-message calls into the
+            // terminal result. Reporting earlier silently omitted direct-mode
+            // finalization usage and understated the end-to-end duration.
+            try {
+              await reportWorkerLlmUsage(opts.server, headers, jobData, result);
+            } catch (err) {
+              console.warn(
+                `[WorkerPals] Failed to report LLM usage for job ${job.id}: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
             const jobAttemptRaw = Number((job as { attempt?: unknown }).attempt ?? 1);
             const jobAttempt =
               Number.isFinite(jobAttemptRaw) && jobAttemptRaw > 0 ? Math.floor(jobAttemptRaw) : 1;
@@ -3048,7 +3386,7 @@ async function workerLoop(
               }, CODEX_UNAVAILABLE_WORKER_FORCE_EXIT_MS);
               try {
                 await maybeHeartbeat("offline", null, true);
-                if (directWorktreePath) {
+                if (directWorktreePath && !preserveDirectWorktreeForCandidateRecovery) {
                   await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                     console.error(
                       `[WorkerPals] Failed to remove isolated worktree before Codex recycle: ${String(
@@ -3089,10 +3427,14 @@ async function workerLoop(
             runtimeState.currentJobId = null;
             runtimeState.currentClaimGeneration = null;
             runtimeState.currentSessionId = null;
-            if (directWorktreePath) {
+            if (directWorktreePath && !preserveDirectWorktreeForCandidateRecovery) {
               await removeIsolatedWorktree(opts.repo, directWorktreePath).catch((err) => {
                 console.error(`[WorkerPals] Failed to remove isolated worktree: ${String(err)}`);
               });
+            } else if (directWorktreePath) {
+              console.error(
+                `[WorkerPals] Preserved isolated worktree for candidate recovery: ${directWorktreePath}`,
+              );
             }
           }
         }
@@ -3295,5 +3637,6 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+  scrubScmRepairAuthoritySecretFromEnv(process.env);
   main();
 }

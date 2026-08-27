@@ -1,6 +1,7 @@
 import { resolve, win32 as pathWin32 } from "path";
 import {
   assertSupportedSourceControlProvider,
+  copyEnvWithoutScmRepairAuthoritySecret,
   explicitSourceControlCommitIdentityFromEnv,
   resolveSourceControlProvider,
   sanitizeSourceControlIdentityField,
@@ -338,7 +339,7 @@ async function expandWindowsGitExecutableCandidates(
               DEFAULT_GIT_DISCOVERY_TIMEOUT_MS,
             ),
             cwd: repoPath,
-            env: process.env as Record<string, string | undefined>,
+            env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
             stdout: "pipe",
             stderr: "ignore",
           });
@@ -391,7 +392,7 @@ export async function runGitCommandCapture(
     try {
       const result = await runBoundedScmProcess(gitArgs, {
         cwd: repoPath,
-        env: process.env as Record<string, string | undefined>,
+        env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
         stdout: "pipe",
         stderr: "pipe",
         timeoutMs,

@@ -9,6 +9,7 @@ import {
   type PushPalsConfig,
   type RepositoryAgentMemoryRef,
 } from "shared";
+import { classifyJobTerminalSemantics } from "./job_terminal_semantics.js";
 import {
   normalizeAutonomyComponentArea,
   makePatternKey,
@@ -157,6 +158,7 @@ interface ObjectiveStatusSignalRow {
 
 function normalizeObjectiveTargetPath(value: unknown): string {
   return asString(value)
+    .normalize("NFKC")
     .replace(/\\/g, "/")
     .replace(/^\.\/+/, "")
     .replace(/\/+/g, "/")
@@ -168,14 +170,46 @@ function objectiveTargetPathsOverlap(left: string, right: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
-function normalizeObjectiveClusterText(value: unknown): string {
+function normalizeObjectiveClusterProse(value: unknown): string {
   return asString(value)
+    .normalize("NFKC")
     .toLowerCase()
     .replace(/\b(?:[a-z]:)?[a-z0-9_.-]+(?:[\\/][a-z0-9_.()\[\]-]+)+(?:\.[a-z0-9]+)?\b/gi, "<path>")
     .replace(/\b\d+(?:\.\d+)?\b/g, "<n>")
-    .replace(/[^a-z0-9<>]+/g, " ")
+    .replace(/[^\p{L}\p{N}<>]+/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizeObjectiveClusterIdentifier(value: unknown): string {
+  return asString(value)
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}_.:/-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function objectiveTargetFamily(record: Record<string, unknown>): string[] {
+  const scope = asObject(record.scope);
+  return [
+    ...new Set(
+      [
+        ...asStringArray(record.targetPaths ?? record.target_paths),
+        ...asStringArray(scope.targetPaths ?? scope.target_paths),
+      ]
+        .map(normalizeObjectiveTargetPath)
+        .filter(Boolean)
+        .map((targetPath) => {
+          const parts = targetPath.split("/").filter(Boolean);
+          if (parts.length <= 1) return "<root>";
+          const directoryParts = /\.[\p{L}\p{N}]+$/u.test(parts.at(-1) ?? "")
+            ? parts.slice(0, -1)
+            : parts;
+          return directoryParts.slice(0, Math.min(2, directoryParts.length)).join("/") || "<root>";
+        }),
+    ),
+  ].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 }
 
 function semanticObjectiveClusterKey(
@@ -185,7 +219,20 @@ function semanticObjectiveClusterKey(
 ): string {
   const evidence = asObject(record.evidence);
   const evidencePortfolio = asObject(evidence.portfolio);
-  const visionObjectiveId = normalizeObjectiveClusterText(
+  const lineage = asObject(record.lineage ?? evidence.lineage);
+  const explicitParentMembership = normalizeObjectiveClusterIdentifier(
+    record.rootObjectiveId ??
+      record.root_objective_id ??
+      record.parentObjectiveId ??
+      record.parent_objective_id ??
+      lineage.rootObjectiveId ??
+      lineage.root_objective_id ??
+      lineage.parentObjectiveId ??
+      lineage.parent_objective_id ??
+      portfolio.root_objective_id ??
+      evidencePortfolio.root_objective_id,
+  );
+  const visionObjectiveId = normalizeObjectiveClusterIdentifier(
     record.visionObjectiveId ??
       record.vision_objective_id ??
       portfolio.vision_objective_id ??
@@ -197,18 +244,23 @@ function semanticObjectiveClusterKey(
       evidence.acceptanceCriteria ??
       evidence.acceptance_criteria,
   )
-    .map(normalizeObjectiveClusterText)
+    .map(normalizeObjectiveClusterProse)
     .filter(Boolean)
-    .sort();
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
   const critic = asObject(evidence.critic ?? record.critic);
-  const criticFingerprint = normalizeObjectiveClusterText(
+  const criticFingerprint = normalizeObjectiveClusterIdentifier(
     record.criticFingerprint ??
       record.critic_fingerprint ??
       evidence.criticFingerprint ??
       evidence.critic_fingerprint ??
       critic.fingerprint,
   );
-  if (!visionObjectiveId && acceptanceCriteria.length === 0 && !criticFingerprint) {
+  if (
+    !visionObjectiveId &&
+    acceptanceCriteria.length === 0 &&
+    !criticFingerprint &&
+    !explicitParentMembership
+  ) {
     return fallback;
   }
   return `cluster_${sha256Hex(
@@ -217,6 +269,11 @@ function semanticObjectiveClusterKey(
       acceptanceCriteria,
       criticFingerprint,
       objectiveType: asString(record.objectiveType ?? record.objective_type).toLowerCase(),
+      explicitParentMembership: explicitParentMembership || null,
+      componentArea: explicitParentMembership
+        ? null
+        : normalizeObjectiveClusterIdentifier(record.componentArea ?? record.component_area),
+      targetFamily: explicitParentMembership ? [] : objectiveTargetFamily(record),
     }),
   )}`;
 }
@@ -393,6 +450,10 @@ const ENGINE_SOURCE_ARCHIVE_MIN_SAMPLES = 8;
 const ENGINE_SOURCE_WATCHLIST_MIN_SAMPLES = 4;
 const ENGINE_SOURCE_FRESHNESS_HALF_LIFE_DAYS = 14;
 const PROVIDER_STATE_MAX_FUTURE_SKEW_MS = 5 * 60_000;
+const PROVIDER_TOMBSTONE_RETENTION_DAYS = 30;
+const PROVIDER_TOMBSTONE_MAX_ROWS = 10_000;
+const PROVIDER_AUTHORITY_GAP_MAX_OCCURRENCES = 3;
+const PROVIDER_AUTHORITY_GAP_STALE_MS = 10 * 60_000;
 
 type EngineSourceCurationStatus = "candidate" | "trusted" | "watchlist" | "archived";
 
@@ -1288,14 +1349,14 @@ function classifyAutonomyAttemptOutcome(input: {
   const terminalStage = asString(input.terminalStage).toLowerCase();
   const summary = asString(input.summary).toLowerCase();
   const text = `${failureClass} ${terminalStage} ${summary}`;
-  if (
-    /artifact_only_no_publishable_patch|no[_ -]?publishable[_ -]?patch|(?:completed[_ -]?)?no[_ -]?change/.test(
-      text,
-    )
-  ) {
-    return "no_change";
-  }
-  if (status === "completed") return "succeeded";
+  const terminalSemantics = classifyJobTerminalSemantics({
+    status,
+    failureClass,
+    terminalStage,
+    summary,
+  });
+  if (terminalSemantics.noChange) return "no_change";
+  if (terminalSemantics.success) return "succeeded";
   if (/\bregression(?:_detected| detected| failure)?\b|reopened[_ -]?within/.test(text)) {
     return "regression_detected";
   }
@@ -2096,6 +2157,7 @@ export class AutonomyStore {
         feedback_key TEXT PRIMARY KEY,
         reason TEXT NOT NULL,
         payload_hash TEXT NOT NULL,
+        disposition TEXT NOT NULL DEFAULT 'permanent',
         occurrence_count INTEGER NOT NULL DEFAULT 1,
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL
@@ -2303,6 +2365,10 @@ export class AutonomyStore {
     ensureColumn("autonomy_objectives", "awaiting_review_since TEXT");
     ensureColumn("autonomy_outcomes", "terminal INTEGER NOT NULL DEFAULT 1");
     ensureColumn("autonomy_pr_feedback", "pr_url_normalized TEXT");
+    ensureColumn(
+      "autonomy_pr_feedback_tombstones",
+      "disposition TEXT NOT NULL DEFAULT 'permanent'",
+    );
     ensureColumn("pr_provider_outcomes", "providerStateAt TEXT");
     ensureColumn("autonomy_repository_agent_memory_feedback", "weight REAL NOT NULL DEFAULT 1");
     ensureColumn("autonomy_repository_agent_memory_feedback", "claim_token TEXT");
@@ -2823,28 +2889,17 @@ export class AutonomyStore {
         latestTerminalAt: null,
       };
     }
-    const health = this.db
+    const terminalRows = this.db
       .prepare(
-        `SELECT
-           COUNT(*) AS terminal_count,
-           MAX(COALESCE(
+        `SELECT j.status, j.result, j.error,
+                d.summary, d.failureClass, d.terminalStage,
+                COALESCE(
              j.completedAt,
              j.failedAt,
              j.publishBlockedAt,
              j.abandonedAt,
              j.updatedAt
-           )) AS latest_terminal_at,
-           SUM(CASE WHEN j.status = 'completed' THEN 1 ELSE 0 END) AS success_count,
-           SUM(
-             CASE
-               WHEN lower(COALESCE(d.failureClass, '')) LIKE '%timeout%'
-                 OR lower(COALESCE(d.failureClass, '')) LIKE '%watchdog%'
-                 OR lower(COALESCE(d.summary, j.error, '')) LIKE '%timed out%'
-                 OR lower(COALESCE(d.summary, j.error, '')) LIKE '%timeout%'
-               THEN 1
-               ELSE 0
-             END
-           ) AS timeout_count
+           ) AS terminalAt
          FROM jobs j
          LEFT JOIN job_terminal_diagnostics d ON d.jobId = j.id
          WHERE j.kind = 'task.execute'
@@ -2862,17 +2917,38 @@ export class AutonomyStore {
              ''
            )) = 'autonomy'`,
       )
-      .get(nowIso) as
-      | {
-          terminal_count: number | null;
-          success_count: number | null;
-          timeout_count: number | null;
-          latest_terminal_at: string | null;
-        }
-      | undefined;
-    const terminalCount = Math.max(0, Math.floor(asNumber(health?.terminal_count, 0)));
-    const successCount = Math.max(0, Math.floor(asNumber(health?.success_count, 0)));
-    const timeoutCount = Math.max(0, Math.floor(asNumber(health?.timeout_count, 0)));
+      .all(nowIso) as Array<{
+      status: string;
+      result: string | null;
+      error: string | null;
+      summary: string | null;
+      failureClass: string | null;
+      terminalStage: string | null;
+      terminalAt: string | null;
+    }>;
+    const terminalCount = terminalRows.length;
+    let successCount = 0;
+    let timeoutCount = 0;
+    let latestTerminalAt: string | null = null;
+    for (const row of terminalRows) {
+      const semantics = classifyJobTerminalSemantics({
+        status: row.status,
+        result: row.result,
+        error: row.error,
+        summary: row.summary,
+        failureClass: row.failureClass,
+        terminalStage: row.terminalStage,
+      });
+      if (semantics.success) successCount += 1;
+      const timeoutEvidence = `${asString(row.failureClass)} ${asString(row.summary)} ${asString(
+        row.error,
+      )}`.toLowerCase();
+      if (/timeout|timed out|watchdog/.test(timeoutEvidence)) timeoutCount += 1;
+      const terminalAt = asString(row.terminalAt);
+      if (terminalAt && (!latestTerminalAt || terminalAt > latestTerminalAt)) {
+        latestTerminalAt = terminalAt;
+      }
+    }
     const resourceUsage = this.getResourceUsageLastHour(nowIso);
 
     let repeatedFailureCount = 0;
@@ -2954,7 +3030,7 @@ export class AutonomyStore {
       timeoutRate: terminalCount > 0 ? clamp01(timeoutCount / terminalCount) : null,
       activeRuntimeMs: resourceUsage.activeRuntimeMs,
       repeatedFailureCount,
-      latestTerminalAt: asString(health?.latest_terminal_at) || null,
+      latestTerminalAt,
     };
   }
 
@@ -6062,12 +6138,9 @@ export class AutonomyStore {
       const requiredValidationRepair =
         requiredValidationRepairAuthorized &&
         asBoolean(record.requiredValidationRepair ?? record.required_validation_repair, false);
-      const workClass = asString(record.workClass ?? record.work_class).toLowerCase();
-      const lifecycleRecovery =
-        requiredValidationRepair ||
-        workClass === "recovery" ||
-        workClass === "repair" ||
-        asBoolean(record.lifecycleRecovery ?? record.lifecycle_recovery, false);
+      // Freeze bypass is a DB-backed capability. Caller-supplied workClass or
+      // lifecycleRecovery labels are planning hints and cannot grant it.
+      const lifecycleRecovery = requiredValidationRepair;
       const preflightErr = this.preflightReason(snapshotId, runId, {
         allowFrozenRecovery: lifecycleRecovery,
       });
@@ -7043,6 +7116,7 @@ export class AutonomyStore {
     patternKey?: string;
     objectiveId?: string;
     deduped?: boolean;
+    retryable?: boolean;
     success?: boolean;
     userAction?: string;
   } {
@@ -7058,6 +7132,27 @@ export class AutonomyStore {
     const normalizedFeedbackPrUrl = normalizePrUrl(prUrl);
     const mappedOutcome = deriveOutcomeFromPrFeedbackVerdict(verdict);
     const hasJobsTable = this.hasTable("jobs");
+    const explicitlyPrunedAuthority = asBoolean(
+      body.providerAuthorityPruned ?? body.provider_authority_pruned,
+      false,
+    );
+    this.db
+      .prepare(
+        `DELETE FROM autonomy_pr_feedback_tombstones
+         WHERE datetime(last_seen_at) < datetime(?, '-${PROVIDER_TOMBSTONE_RETENTION_DAYS} days')`,
+      )
+      .run(now);
+    this.db
+      .prepare(
+        `DELETE FROM autonomy_pr_feedback_tombstones
+         WHERE feedback_key IN (
+           SELECT feedback_key
+           FROM autonomy_pr_feedback_tombstones
+           ORDER BY datetime(last_seen_at) DESC, feedback_key ASC
+           LIMIT -1 OFFSET ?
+         )`,
+      )
+      .run(PROVIDER_TOMBSTONE_MAX_ROWS);
     const tombstonePayloadHash = feedbackKey
       ? sha256Hex(
           JSON.stringify({
@@ -7069,19 +7164,40 @@ export class AutonomyStore {
           }),
         )
       : null;
-    const acknowledgePermanentIgnore = (reason: string, deduped = false) => {
+    const persistProviderTombstone = (reason: string, disposition: "permanent" | "retryable") => {
       if (feedbackKey && tombstonePayloadHash) {
         this.db
           .prepare(
             `INSERT INTO autonomy_pr_feedback_tombstones (
-               feedback_key, reason, payload_hash, occurrence_count, first_seen_at, last_seen_at
-             ) VALUES (?, ?, ?, 1, ?, ?)
+               feedback_key, reason, payload_hash, disposition,
+               occurrence_count, first_seen_at, last_seen_at
+             ) VALUES (?, ?, ?, ?, 1, ?, ?)
              ON CONFLICT(feedback_key) DO UPDATE SET
+               reason = excluded.reason,
+               disposition = CASE
+                 WHEN autonomy_pr_feedback_tombstones.disposition = 'permanent'
+                   THEN 'permanent'
+                 ELSE excluded.disposition
+               END,
                occurrence_count = autonomy_pr_feedback_tombstones.occurrence_count + 1,
                last_seen_at = excluded.last_seen_at`,
           )
-          .run(feedbackKey, reason, tombstonePayloadHash, now, now);
+          .run(feedbackKey, reason, tombstonePayloadHash, disposition, now, now);
+        this.db
+          .prepare(
+            `DELETE FROM autonomy_pr_feedback_tombstones
+             WHERE feedback_key IN (
+               SELECT feedback_key
+               FROM autonomy_pr_feedback_tombstones
+               ORDER BY datetime(last_seen_at) DESC, feedback_key ASC
+               LIMIT -1 OFFSET ?
+             )`,
+          )
+          .run(PROVIDER_TOMBSTONE_MAX_ROWS);
       }
+    };
+    const acknowledgePermanentIgnore = (reason: string, deduped = false) => {
+      persistProviderTombstone(reason, "permanent");
       return {
         ok: true as const,
         ignored: true as const,
@@ -7090,16 +7206,65 @@ export class AutonomyStore {
         reason,
       };
     };
+    const acknowledgeRetryableAuthorityGap = (reason: string) => {
+      persistProviderTombstone(reason, "retryable");
+      const observation = feedbackKey
+        ? (this.db
+            .prepare(
+              `SELECT occurrence_count AS occurrenceCount, first_seen_at AS firstSeenAt
+               FROM autonomy_pr_feedback_tombstones
+               WHERE feedback_key = ?
+               LIMIT 1`,
+            )
+            .get(feedbackKey) as
+            | { occurrenceCount: number | null; firstSeenAt: string | null }
+            | undefined)
+        : undefined;
+      const occurrenceCount = Math.max(1, Math.floor(asNumber(observation?.occurrenceCount, 1)));
+      const firstSeenMs = Date.parse(asString(observation?.firstSeenAt));
+      if (
+        explicitlyPrunedAuthority ||
+        (occurrenceCount >= PROVIDER_AUTHORITY_GAP_MAX_OCCURRENCES &&
+          Number.isFinite(firstSeenMs) &&
+          Date.parse(now) - firstSeenMs >= PROVIDER_AUTHORITY_GAP_STALE_MS)
+      ) {
+        if (feedbackKey) {
+          this.db
+            .prepare(
+              `UPDATE autonomy_pr_feedback_tombstones
+               SET disposition = 'permanent', reason = ?, last_seen_at = ?
+               WHERE feedback_key = ?`,
+            )
+            .run(reason, now, feedbackKey);
+        }
+        return {
+          ok: true as const,
+          ignored: true as const,
+          acknowledged: true as const,
+          deduped: true as const,
+          reason,
+        };
+      }
+      return {
+        ok: true as const,
+        ignored: true as const,
+        acknowledged: false as const,
+        retryable: true as const,
+        reason,
+      };
+    };
 
     if (feedbackKey) {
       const tombstone = this.db
         .prepare(
-          `SELECT reason, payload_hash AS payloadHash
+          `SELECT reason, payload_hash AS payloadHash, disposition
            FROM autonomy_pr_feedback_tombstones
            WHERE feedback_key = ?
            LIMIT 1`,
         )
-        .get(feedbackKey) as { reason: string; payloadHash: string | null } | undefined;
+        .get(feedbackKey) as
+        | { reason: string; payloadHash: string | null; disposition: string | null }
+        | undefined;
       if (tombstone) {
         if (asString(tombstone.payloadHash) !== tombstonePayloadHash) {
           return {
@@ -7107,7 +7272,9 @@ export class AutonomyStore {
             reason: "feedbackKey identifies a different tombstoned provider observation",
           };
         }
-        return acknowledgePermanentIgnore(asString(tombstone.reason), true);
+        if (asString(tombstone.disposition) !== "retryable") {
+          return acknowledgePermanentIgnore(asString(tombstone.reason), true);
+        }
       }
     }
 
@@ -7123,7 +7290,9 @@ export class AutonomyStore {
         .prepare(`SELECT prUrl FROM jobs WHERE id = ? LIMIT 1`)
         .get(jobIdRaw) as { prUrl: string | null } | undefined;
       if (!providerJob) {
-        return acknowledgePermanentIgnore("PR feedback jobId does not identify a persisted job");
+        return acknowledgeRetryableAuthorityGap(
+          "PR feedback jobId does not identify a persisted job",
+        );
       }
       persistedJobPrUrl = normalizePrUrl(providerJob.prUrl);
       if (persistedJobPrUrl && persistedJobPrUrl !== normalizedFeedbackPrUrl) {
@@ -7132,7 +7301,7 @@ export class AutonomyStore {
         );
       }
       if (mappedOutcome?.terminal && !persistedJobPrUrl) {
-        return acknowledgePermanentIgnore(
+        return acknowledgeRetryableAuthorityGap(
           "terminal PR feedback requires a persisted job-to-PR link",
         );
       }
@@ -7366,6 +7535,14 @@ export class AutonomyStore {
         now,
       );
     const inserted = Number(insertInfo.changes ?? 0) > 0;
+    if (feedbackKey) {
+      this.db
+        .prepare(
+          `DELETE FROM autonomy_pr_feedback_tombstones
+           WHERE feedback_key = ? AND disposition = 'retryable'`,
+        )
+        .run(feedbackKey);
+    }
     if (!inserted) {
       const existingFeedback = feedbackKey
         ? (this.db
@@ -9456,10 +9633,10 @@ export class AutonomyStore {
     return { linked, failed, pending, scanned: rows.length };
   }
 
-  markObjectiveDispatched(objectiveId: string, requestId: string): void {
-    if (!objectiveId || !requestId) return;
+  markObjectiveDispatched(objectiveId: string, requestId: string): boolean {
+    if (!objectiveId || !requestId) return false;
     const now = asIsoNow();
-    this.db
+    const result = this.db
       .prepare(
         `UPDATE autonomy_objectives
          SET status = 'dispatched',
@@ -9467,9 +9644,17 @@ export class AutonomyStore {
              block_reason = NULL,
              dispatched_at = COALESCE(dispatched_at, ?),
              updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ?
+           AND (
+             status = 'gated'
+             OR (
+               status = 'dispatched'
+               AND (request_id IS NULL OR request_id = '')
+             )
+           )`,
       )
       .run(requestId, now, now, objectiveId);
+    return result.changes > 0;
   }
 
   validateObjectiveReservation(input: {
@@ -9528,13 +9713,16 @@ export class AutonomyStore {
             `SELECT id
              FROM requests
              WHERE idempotencyKey = ?
+               AND (
+                 dispatchConfirmationToken IS NULL
+                 OR dispatchConfirmedAt IS NOT NULL
+               )
              ORDER BY createdAt DESC
              LIMIT 1`,
           )
           .get(`autonomy:${row.id}`) as { id: string } | null;
         if (request?.id) {
-          this.markObjectiveDispatched(row.id, request.id);
-          linked += 1;
+          if (this.markObjectiveDispatched(row.id, request.id)) linked += 1;
           continue;
         }
         const createdMs = Date.parse(row.createdAt);

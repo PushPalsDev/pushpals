@@ -1,6 +1,13 @@
 #!/usr/bin/env bun
 
-import { loadPushPalsConfig, terminateProcessTree } from "shared";
+import {
+  copyEnvWithoutScmRepairAuthoritySecret,
+  loadPushPalsConfig,
+  scrubScmRepairAuthoritySecretFromEnv,
+  terminateProcessTree,
+} from "shared";
+
+scrubScmRepairAuthoritySecretFromEnv(process.env);
 
 const CONFIG = loadPushPalsConfig();
 const restartEnabled = CONFIG.remotebuddy.crashRestartEnabled;
@@ -53,7 +60,7 @@ async function run(): Promise<never> {
       stdin: "inherit",
       stdout: "inherit",
       stderr: "inherit",
-      env: { ...process.env },
+      env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
       detached: process.platform !== "win32",
     });
 

@@ -10,6 +10,7 @@ import {
   resolveLocalBuddyStartGate,
   shouldDetachManagedServiceProcess,
 } from "../scripts/start_runtime_services";
+import { SCM_REPAIR_AUTHORITY_SECRET_ENV } from "../packages/shared/src/scm_repair_authority";
 
 describe("start runtime service helpers", () => {
   test("caps no-newline managed service output while continuing to drain", async () => {
@@ -77,6 +78,32 @@ describe("start runtime service helpers", () => {
       "source_control_manager",
       "client",
     ]);
+  });
+
+  test("buildCoreManagedServiceSpecs isolates SCM repair authority to its two owners", () => {
+    const secret = "test-start-scm-repair-authority-secret-0123456789abcdef";
+    const specs = buildCoreManagedServiceSpecs(
+      "bun",
+      "C:/repo/example",
+      {
+        SAFE_RUNTIME_VALUE: "retained",
+        [SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase()]: "must-be-replaced",
+      },
+      secret,
+    );
+
+    for (const spec of specs) {
+      expect(spec.env?.SAFE_RUNTIME_VALUE).toBe("retained");
+      const authorityKeys = Object.keys(spec.env ?? {}).filter(
+        (key) => key.toLowerCase() === SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase(),
+      );
+      if (spec.name === "server" || spec.name === "source_control_manager") {
+        expect(authorityKeys).toEqual([SCM_REPAIR_AUTHORITY_SECRET_ENV]);
+        expect(spec.env?.[SCM_REPAIR_AUTHORITY_SECRET_ENV]).toBe(secret);
+      } else {
+        expect(authorityKeys).toEqual([]);
+      }
+    }
   });
 
   test("resolveLocalBuddyRuntimeAction starts and stops only when runtime state changes require it", () => {

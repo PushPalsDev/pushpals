@@ -6,9 +6,13 @@ import {
   buildValidationExecutionDag,
   buildValidationExecutionPlan,
   checkpointJobCandidate,
+  createJobCommit,
   criticGateDisposition,
   enforceCriticEvidenceProvenance,
+  enforceJobDeadlineBeforeSuccess,
+  git as runWorkerGit,
   runValidationCommandWithRepoLease,
+  validationCacheContext,
   validationEvidenceId,
   withValidationExecutionPlanProvenance,
   type CriticOutcome,
@@ -79,6 +83,132 @@ describe("WorkerPal absolute deadline and cumulative usage", () => {
     expect(zeroBudgetLedger.deadlineAtMs).toBe(11_500);
     expect(zeroBudgetLedger.capWorkTimeout(0)).toBe(0);
     expect(zeroBudgetLedger.executorBudgets(0, 0)).toBeNull();
+  });
+
+  test("monotonic time charges work that spans a wall-clock rollback", () => {
+    let now = 10_000;
+    let monotonicNow = 500;
+    const ledger = new JobDeadlineLedger({
+      executionBudgetMs: 1_000,
+      finalizationBudgetMs: 200,
+      startedAtMs: now,
+      now: () => now,
+      monotonicNow: () => monotonicNow,
+    });
+
+    expect(ledger.deadlineAtMs).toBe(11_200);
+    expect(ledger.remainingTotalMs()).toBe(1_200);
+    now += 400;
+    monotonicNow += 400;
+    expect(ledger.remainingTotalMs()).toBe(800);
+
+    now -= 1_000;
+    monotonicNow += 300;
+    expect(ledger.remainingTotalMs()).toBe(500);
+    expect(ledger.remainingWorkMs()).toBe(300);
+    expect(ledger.snapshot()).toMatchObject({
+      startedAtMs: 10_000,
+      deadlineAtMs: 11_200,
+      effectiveNowMs: 10_700,
+      observedWallClockAtMs: 9_400,
+      monotonicStartedAtMs: 500,
+      observedMonotonicAtMs: 1_200,
+      clockRollbackCount: 1,
+      clockRollbackTotalMs: 1_000,
+      remainingTotalMs: 500,
+    });
+
+    now += 100;
+    monotonicNow += 100;
+    expect(ledger.remainingTotalMs()).toBe(400);
+  });
+
+  test("an expired finalization reserve prevents host Git mutation", async () => {
+    const repo = temporaryGitRepo("pushpals-finalization-deadline-");
+    writeFileSync(join(repo, "README.md"), "# changed candidate\n", "utf8");
+    const ledger = new JobDeadlineLedger({
+      executionBudgetMs: 10,
+      finalizationBudgetMs: 10,
+      startedAtMs: Date.now() - 1_000,
+    });
+
+    const result = await createJobCommit(
+      repo,
+      "workerpal-deadline",
+      {
+        id: "job-finalization-deadline",
+        taskId: "task-finalization-deadline",
+        kind: "task.execute",
+        params: { instruction: "Update README" },
+      },
+      undefined,
+      ledger,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("absolute job finalization deadline expired");
+    expect(Bun.spawnSync(["git", "diff", "--quiet"], { cwd: repo }).exitCode).not.toBe(0);
+  });
+
+  test("host preparation Git cannot borrow from the finalization reserve", async () => {
+    const repo = temporaryGitRepo("pushpals-preparation-deadline-");
+    let now = 1_000;
+    const ledger = new JobDeadlineLedger({
+      executionBudgetMs: 10,
+      finalizationBudgetMs: 100,
+      startedAtMs: now,
+      now: () => now,
+    });
+    now += 10;
+
+    const result = await runWorkerGit(repo, ["status", "--porcelain"], ledger, "work");
+
+    expect(result).toMatchObject({ ok: false, exitCode: 124 });
+    expect(result.stderr).toContain("absolute job work deadline expired");
+    expect(ledger.remainingTotalMs()).toBe(100);
+  });
+
+  test("an expired work budget can never become an ordinary quality success", () => {
+    let now = 2_000;
+    const ledger = new JobDeadlineLedger({
+      executionBudgetMs: 20,
+      finalizationBudgetMs: 200,
+      startedAtMs: now,
+      now: () => now,
+    });
+    now += 20;
+
+    const result = enforceJobDeadlineBeforeSuccess(
+      { ok: true, summary: "late clean quality result", exitCode: 0 },
+      ledger,
+      ["src/late.ts"],
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(124);
+    expect(result.candidateState).toMatchObject({
+      status: "partial",
+      reason: "absolute_job_deadline",
+      changedPaths: ["src/late.ts"],
+    });
+    expect(ledger.remainingTotalMs()).toBe(200);
+  });
+
+  test("validation cache Git cannot run inside the finalization reserve", async () => {
+    const repo = temporaryGitRepo("pushpals-validation-cache-deadline-");
+    let now = 3_000;
+    const ledger = new JobDeadlineLedger({
+      executionBudgetMs: 25,
+      finalizationBudgetMs: 250,
+      startedAtMs: now,
+      now: () => now,
+    });
+    now += 25;
+
+    const cacheContext = await validationCacheContext(repo, ["README.md"], ledger);
+
+    expect(cacheContext.startsWith("unknown-head:")).toBe(true);
+    expect(ledger.remainingTotalMs()).toBe(250);
   });
 
   test("preserves executor, recovery, and timed-out critic usage on a failed terminal path", () => {

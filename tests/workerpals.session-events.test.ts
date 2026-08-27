@@ -119,6 +119,30 @@ describe("workerpals session event emission", () => {
     );
   });
 
+  test("preserves cumulative model usage from an unhandled Docker recovery exception", () => {
+    const usageAttempt = {
+      promptTokens: 13,
+      completionTokens: 7,
+      totalTokens: 20,
+      stage: "executor" as const,
+      attempt: 1,
+      source: "codex:docker_transport_attempt_1",
+    };
+    const error = Object.assign(new Error("docker recovery failed"), {
+      usage: {
+        promptTokens: 13,
+        completionTokens: 7,
+        totalTokens: 20,
+      },
+      usageAttempts: [usageAttempt],
+    });
+
+    expect(buildUnhandledWorkerFailureResult(error, "openai_codex")).toMatchObject({
+      usage: { totalTokens: 20 },
+      usageAttempts: [usageAttempt],
+    });
+  });
+
   test("preserves structurally owned terminal stages through final diagnostic enrichment", () => {
     for (const terminalStage of ["worker_runtime", "docker"]) {
       const merged = mergeWorkerDiagnostics(

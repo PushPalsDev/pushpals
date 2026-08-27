@@ -16,6 +16,7 @@ import {
   resolveDirectWorktreePath,
   resolveLegacyDirectWorktreeRoot,
 } from "../apps/workerpals/src/common/direct_worktree";
+import { SCM_REPAIR_AUTHORITY_SECRET_ENV } from "../packages/shared/src/scm_repair_authority";
 import {
   buildCliClearTargets,
   buildEmbeddedRuntimeServiceLaunchPlan,
@@ -31,6 +32,7 @@ import {
   cleanupLingeringWorkerpalWarmContainers,
   describeWorkerExecutionReadiness,
   buildEmbeddedRuntimeEnv,
+  buildEmbeddedRuntimeServiceEnv,
   copyTrackedRepoPath,
   buildWorkerpalSandboxPaths,
   buildRuntimeServiceLogPaths,
@@ -164,6 +166,42 @@ async function waitForCondition(
 }
 
 describe("pushpals CLI runtime bootstrap helpers", () => {
+  test("only exposes SCM repair authority to the server and source-control manager", () => {
+    const secret = "test-cli-scm-repair-authority-secret-0123456789abcdef";
+    const mixedCaseSecretKey = SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase();
+    const runtimeEnv = buildEmbeddedRuntimeEnv(
+      {
+        PATH: process.env.PATH,
+        SAFE_RUNTIME_VALUE: "retained",
+        [mixedCaseSecretKey]: secret,
+      },
+      {
+        repoRoot: "C:/repo/example",
+        runtimeRoot: "C:/runtime/pushpals",
+      },
+    );
+
+    const authorityKeys = (env: Readonly<Record<string, string>>) =>
+      Object.keys(env).filter(
+        (key) => key.toLowerCase() === SCM_REPAIR_AUTHORITY_SECRET_ENV.toLowerCase(),
+      );
+
+    expect(runtimeEnv.SAFE_RUNTIME_VALUE).toBe("retained");
+    expect(authorityKeys(runtimeEnv)).toEqual([]);
+
+    for (const serviceName of ["localbuddy", "remotebuddy"] as const) {
+      const serviceEnv = buildEmbeddedRuntimeServiceEnv(runtimeEnv, serviceName, secret);
+      expect(authorityKeys(serviceEnv)).toEqual([]);
+      expect(serviceEnv.SAFE_RUNTIME_VALUE).toBe("retained");
+    }
+
+    for (const serviceName of ["server", "source_control_manager"] as const) {
+      const serviceEnv = buildEmbeddedRuntimeServiceEnv(runtimeEnv, serviceName, secret);
+      expect(authorityKeys(serviceEnv)).toEqual([SCM_REPAIR_AUTHORITY_SECRET_ENV]);
+      expect(serviceEnv[SCM_REPAIR_AUTHORITY_SECRET_ENV]).toBe(secret);
+    }
+  });
+
   test("buildEmbeddedRuntimeEnv injects repo/config/schema overrides without forcing autonomy off", () => {
     const env = buildEmbeddedRuntimeEnv(
       {

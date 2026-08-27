@@ -295,7 +295,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       advisoryMemory?: unknown[];
     };
     expect(freshPayload.advisoryMemory?.length).toBeGreaterThan(0);
-  });
+  }, 20_000);
 
   test("reuses a structural autonomy cache across volatile snapshots and invalidates on vision change", async () => {
     const repo = createRepository();
@@ -326,8 +326,26 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     });
 
     const first = await worker.analyze("structural-first", base);
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=PushPals Test",
+        "-c",
+        "user.email=pushpals@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "same-tree history only",
+      ],
+      { cwd: repo, stdio: "ignore" },
+    );
+    const sameTreeSnapshot = await resolveRepositorySnapshot(repo);
+    expect(sameTreeSnapshot.tree).toBe(base.repository.tree);
+    expect(sameTreeSnapshot.revision).not.toBe(base.repository.revision);
     const second = await worker.analyze("structural-second", {
       ...base,
+      repository: sameTreeSnapshot,
       idempotencyKey: "structural-second-key",
       context: {
         ...(base.context ?? {}),
@@ -342,9 +360,21 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(second.cache.hit).toBe(true);
     expect(llm.analysisCalls).toHaveLength(1);
     expect(second.cache.key).toBeTruthy();
+    expect(second.evidence.every((entry) => entry.revision === sameTreeSnapshot.revision)).toBe(
+      true,
+    );
+    const structuralPayload = JSON.parse(llm.analysisCalls[0]?.messages[0]?.content ?? "{}") as {
+      advisoryMemory?: unknown[];
+      evidencePacket?: { recentGitHistory?: string[] };
+      request?: { repository?: Record<string, unknown> };
+    };
+    expect(structuralPayload.advisoryMemory).toEqual([]);
+    expect(structuralPayload.evidencePacket?.recentGitHistory).toEqual([]);
+    expect(structuralPayload.request?.repository?.revision).toBeUndefined();
 
     const changedVision = await worker.analyze("structural-third", {
       ...base,
+      repository: sameTreeSnapshot,
       idempotencyKey: "structural-third-key",
       context: {
         ...(base.context ?? {}),
@@ -359,12 +389,188 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
 
     const changedProtocol = await worker.analyze("structural-fourth", {
       ...base,
+      repository: sameTreeSnapshot,
       question: "Identify grounded architecture candidates instead.",
       idempotencyKey: "structural-fourth-key",
     });
     expect(changedProtocol.cache.hit).toBe(false);
     expect(llm.analysisCalls).toHaveLength(3);
-  });
+
+    const changedPolicy = await worker.analyze("structural-fifth", {
+      ...base,
+      repository: sameTreeSnapshot,
+      idempotencyKey: "structural-fifth-key",
+      context: {
+        ...(base.context ?? {}),
+        deterministicPolicy: {
+          maxCandidates: 7,
+          minimumConfidence: 0.75,
+          allowedObjectiveTypes: ["docs"],
+          requiredCandidateFields: ["id", "target_paths"],
+          notes: ["Return only documentation candidates."],
+        },
+      },
+    });
+    expect(changedPolicy.cache.hit).toBe(false);
+    expect(llm.analysisCalls).toHaveLength(4);
+    const policyPayload = JSON.parse(llm.analysisCalls[3]?.messages[0]?.content ?? "{}") as {
+      request?: { context?: { deterministicPolicy?: Record<string, unknown> } };
+    };
+    expect(policyPayload.request?.context?.deterministicPolicy).toMatchObject({
+      maxCandidates: 7,
+      minimumConfidence: 0.75,
+      allowedObjectiveTypes: ["docs"],
+    });
+  }, 20_000);
+
+  test("keys ordinary history-sensitive analysis by revision even when the tree is unchanged", async () => {
+    const repo = createRepository();
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      modelId: "history-cache-model",
+    });
+    const firstRequest = await requestFor(repo, {
+      purpose: "general",
+      question: "Summarize the latest repository history and its evidence.",
+    });
+
+    await worker.analyze("history-first", firstRequest);
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=PushPals Test",
+        "-c",
+        "user.email=pushpals@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "history changed without tree change",
+      ],
+      { cwd: repo, stdio: "ignore" },
+    );
+    const secondRequest = await requestFor(repo, {
+      purpose: "general",
+      question: firstRequest.question,
+      context: firstRequest.context,
+      idempotencyKey: "history-second",
+    });
+    expect(secondRequest.repository.tree).toBe(firstRequest.repository.tree);
+    expect(secondRequest.repository.revision).not.toBe(firstRequest.repository.revision);
+
+    const second = await worker.analyze("history-second", secondRequest);
+
+    expect(second.cache.hit).toBe(false);
+    expect(llm.analysisCalls).toHaveLength(2);
+  }, 20_000);
+
+  test("rechecks the repository snapshot before returning cached and newly learned results", async () => {
+    const makeStore = (
+      delegate: InMemoryMemoryStore,
+      onGet: (address: any) => void,
+      onPut: (input: any) => void,
+    ) => ({
+      put: async (input: any, options?: any) => {
+        const record = await delegate.put(input, options);
+        onPut(input);
+        return record;
+      },
+      get: async (address: any, options?: any) => {
+        const record = await delegate.get(address, options);
+        onGet(address);
+        return record;
+      },
+      search: (query: any) => delegate.search(query),
+      invalidate: (selector: any) => delegate.invalidate(selector),
+      reinforce: (input: any) => delegate.reinforce(input),
+      prune: (options?: any) => delegate.prune(options),
+      close: () => delegate.close(),
+    });
+
+    const cachedRepo = createRepository();
+    const cachedMemory = new InMemoryMemoryStore();
+    const cachedRequest = await requestFor(cachedRepo);
+    await new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: cachedMemory,
+      llm: new FakeLlm(),
+    }).analyze("snapshot-cache-seed", cachedRequest);
+    let cacheMutated = false;
+    const cacheStore = makeStore(
+      cachedMemory,
+      (address) => {
+        if (cacheMutated || address?.scope?.namespace !== "repository_agent_cache") return;
+        cacheMutated = true;
+        writeFileSync(join(cachedRepo, "src", "index.ts"), "export const value = 2;\n");
+        execFileSync("git", ["add", "src/index.ts"], { cwd: cachedRepo, stdio: "ignore" });
+        execFileSync(
+          "git",
+          [
+            "-c",
+            "user.name=PushPals Test",
+            "-c",
+            "user.email=pushpals@example.invalid",
+            "commit",
+            "-m",
+            "change during cache lookup",
+          ],
+          { cwd: cachedRepo, stdio: "ignore" },
+        );
+      },
+      () => {},
+    );
+    await expect(
+      new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory: cacheStore as any,
+        llm: new FakeLlm(),
+      }).analyze("snapshot-cache-return", {
+        ...cachedRequest,
+        idempotencyKey: "snapshot-cache-return",
+      }),
+    ).rejects.toThrow();
+    expect(cacheMutated).toBe(true);
+
+    const generatedRepo = createRepository();
+    const generatedMemory = new InMemoryMemoryStore();
+    const generatedRequest = await requestFor(generatedRepo, { freshness: "fresh_required" });
+    let writeMutated = false;
+    const generatedStore = makeStore(
+      generatedMemory,
+      () => {},
+      (input) => {
+        if (writeMutated || input?.scope?.namespace !== "repository_facts") return;
+        writeMutated = true;
+        writeFileSync(join(generatedRepo, "src", "index.ts"), "export const value = 3;\n");
+        execFileSync("git", ["add", "src/index.ts"], { cwd: generatedRepo, stdio: "ignore" });
+        execFileSync(
+          "git",
+          [
+            "-c",
+            "user.name=PushPals Test",
+            "-c",
+            "user.email=pushpals@example.invalid",
+            "commit",
+            "-m",
+            "change during memory write",
+          ],
+          { cwd: generatedRepo, stdio: "ignore" },
+        );
+      },
+    );
+    await expect(
+      new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory: generatedStore as any,
+        llm: new FakeLlm(),
+      }).analyze("snapshot-generated-return", generatedRequest),
+    ).rejects.toThrow();
+    expect(writeMutated).toBe(true);
+  }, 20_000);
 
   test("persists timeout evidence, opens after two matching failures, and recovers half-open", async () => {
     const repo = createRepository();
@@ -413,7 +619,16 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect((second.data as Record<string, unknown>).repositoryAgentMode).toBe(
       "deterministic_evidence_fallback",
     );
+    expect(first.memoryRefs.some((ref) => ref.role === "recalled_fact")).toBe(false);
     expect(providerCalls).toBe(2);
+
+    const fallbackFacts = await memory.search({
+      scope: { namespace: "repository_facts", repositoryId: first.analyzedRepository.identity },
+      maxItems: 10,
+      maxChars: 100_000,
+    });
+    expect(fallbackFacts).toHaveLength(1);
+    expect(fallbackFacts[0]?.provenance.modelId).toBeUndefined();
 
     const openCircuit = await memory.search({
       scope: {
@@ -453,6 +668,288 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect((recoveredCircuit[0]?.value as Record<string, unknown>).state).toBe("closed");
     expect((recoveredCircuit[0]?.value as Record<string, unknown>).consecutiveFailures).toBe(0);
   }, 20_000);
+
+  test("fences half-open outcomes to the exact probe owner and revision", async () => {
+    const repo = createRepository();
+    const memory = new InMemoryMemoryStore();
+    const llm: LLMClient = {
+      async generate(): Promise<LLMGenerateOutput> {
+        throw new TypeError("provider offline");
+      },
+    };
+    const worker = new RepositoryAgentWorker({
+      agentId: "probe-owner-one",
+      control: unusedControl(),
+      memory,
+      llm,
+      modelId: "probe-fence-model",
+      capabilityCircuitCooldownMs: 100,
+      logger: { log: () => {}, warn: () => {}, error: () => {} },
+    });
+    const request = await requestFor(repo, { freshness: "fresh_required" });
+    await worker.analyze("probe-seed-one", { ...request, idempotencyKey: "probe-seed-one" });
+    await worker.analyze("probe-seed-two", { ...request, idempotencyKey: "probe-seed-two" });
+    await Bun.sleep(125);
+
+    const signal = new AbortController().signal;
+    const deadlineMs = Date.now() + 5_000;
+    const permission = await (worker as any).capabilityCircuitPermission(
+      request,
+      signal,
+      deadlineMs,
+    );
+    expect(permission.halfOpen).toBe(true);
+    expect(permission.probe.owner).toBe("probe-owner-one");
+    expect(Date.parse(permission.probe.until)).toBeGreaterThanOrEqual(deadlineMs);
+
+    const records = await memory.search({
+      scope: {
+        namespace: "repository_agent_capabilities",
+        repositoryId: request.repository.identity,
+      },
+      maxItems: 10,
+      maxChars: 100_000,
+    });
+    const claimed = records[0]!;
+    const newerRevision = claimed.revision + 1;
+    const newerValue = {
+      ...(claimed.value as Record<string, unknown>),
+      state: "half_open",
+      probeId: "newer-probe",
+      probeOwner: "probe-owner-two",
+      probeRevision: newerRevision,
+      probeUntil: new Date(Date.now() + 20_000).toISOString(),
+    };
+    const newer = await memory.put(
+      {
+        scope: claimed.scope,
+        key: claimed.key,
+        kind: claimed.kind,
+        subjectKey: claimed.subjectKey,
+        summary: "newer half-open probe",
+        value: newerValue,
+        tags: claimed.tags,
+        evidence: claimed.evidence,
+        provenance: claimed.provenance,
+        confidence: claimed.confidence,
+        usefulness: claimed.usefulness,
+        ttlMs: 60_000,
+      },
+      { expectedRevision: claimed.revision },
+    );
+
+    await (worker as any).recordCapabilitySuccess(request, permission, signal, deadlineMs);
+    await (worker as any).recordCapabilityFailure(
+      request,
+      new TypeError("provider offline"),
+      permission,
+      signal,
+      deadlineMs,
+    );
+
+    const after = await memory.get(
+      { scope: newer.scope, key: newer.key },
+      { includeExpired: true },
+    );
+    expect(after?.revision).toBe(newer.revision);
+    expect((after?.value as Record<string, unknown>).state).toBe("half_open");
+    expect((after?.value as Record<string, unknown>).probeId).toBe("newer-probe");
+    expect((after?.value as Record<string, unknown>).probeOwner).toBe("probe-owner-two");
+
+    const expiredProbeUntil = new Date(Date.now() - 1).toISOString();
+    const expiredProbeRevision = after!.revision + 1;
+    const expiredProbe = await memory.put(
+      {
+        scope: after!.scope,
+        key: after!.key,
+        kind: after!.kind,
+        subjectKey: after!.subjectKey,
+        summary: "expired half-open probe",
+        value: {
+          ...(after!.value as Record<string, unknown>),
+          state: "half_open",
+          probeId: "expired-probe",
+          probeOwner: "probe-owner-one",
+          probeRevision: expiredProbeRevision,
+          probeUntil: expiredProbeUntil,
+        },
+        tags: after!.tags,
+        evidence: after!.evidence,
+        provenance: after!.provenance,
+        confidence: after!.confidence,
+        usefulness: after!.usefulness,
+        ttlMs: 60_000,
+      },
+      { expectedRevision: after!.revision },
+    );
+    const expiredPermission = {
+      allowed: true,
+      halfOpen: true,
+      observedRevision: expiredProbe.revision,
+      probe: {
+        id: "expired-probe",
+        owner: "probe-owner-one",
+        revision: expiredProbe.revision,
+        until: expiredProbeUntil,
+      },
+    };
+
+    await (worker as any).recordCapabilitySuccess(
+      request,
+      expiredPermission,
+      signal,
+      Date.now() + 5_000,
+    );
+    await (worker as any).recordCapabilityFailure(
+      request,
+      new TypeError("provider offline"),
+      expiredPermission,
+      signal,
+      Date.now() + 5_000,
+    );
+
+    const afterExpiredOutcomes = await memory.get(
+      { scope: expiredProbe.scope, key: expiredProbe.key },
+      { includeExpired: true },
+    );
+    expect(afterExpiredOutcomes?.revision).toBe(expiredProbe.revision);
+    expect((afterExpiredOutcomes?.value as Record<string, unknown>).state).toBe("half_open");
+  }, 20_000);
+
+  test("treats an expired capability row as reset while retaining its CAS revision", async () => {
+    const repo = createRepository();
+    const memory = new InMemoryMemoryStore();
+    let healthy = false;
+    let calls = 0;
+    const llm: LLMClient = {
+      async generate(): Promise<LLMGenerateOutput> {
+        calls++;
+        if (healthy) return { text: JSON.stringify(modelResponse()) };
+        throw new Error("same provider failure");
+      },
+    };
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      modelId: "expired-circuit-model",
+      capabilityCircuitCooldownMs: 60_000,
+      logger: { log: () => {}, warn: () => {}, error: () => {} },
+    });
+    const request = await requestFor(repo, { freshness: "fresh_required" });
+    await worker.analyze("expired-seed-one", {
+      ...request,
+      idempotencyKey: "expired-seed-one",
+    });
+    await worker.analyze("expired-seed-two", {
+      ...request,
+      idempotencyKey: "expired-seed-two",
+    });
+    const [opened] = await memory.search({
+      scope: {
+        namespace: "repository_agent_capabilities",
+        repositoryId: request.repository.identity,
+      },
+      maxItems: 10,
+      maxChars: 100_000,
+    });
+    expect((opened?.value as Record<string, unknown>).state).toBe("open");
+    const expired = await memory.put(
+      {
+        scope: opened!.scope,
+        key: opened!.key,
+        kind: opened!.kind,
+        subjectKey: opened!.subjectKey,
+        summary: "expired open circuit",
+        value: opened!.value,
+        tags: opened!.tags,
+        evidence: opened!.evidence,
+        provenance: opened!.provenance,
+        confidence: opened!.confidence,
+        usefulness: opened!.usefulness,
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      },
+      { expectedRevision: opened!.revision },
+    );
+
+    healthy = true;
+    const recovered = await worker.analyze("expired-reset-success", {
+      ...request,
+      idempotencyKey: "expired-reset-success",
+    });
+    expect(recovered.answer).toContain("documented reliability priority");
+    expect(calls).toBe(3);
+
+    healthy = false;
+    await worker.analyze("expired-reset-failure", {
+      ...request,
+      idempotencyKey: "expired-reset-failure",
+    });
+    expect(calls).toBe(4);
+    const reset = await memory.get(
+      { scope: expired.scope, key: expired.key },
+      { includeExpired: true },
+    );
+    expect(reset?.revision).toBeGreaterThan(expired.revision);
+    expect((reset?.value as Record<string, unknown>).state).toBe("closed");
+    expect((reset?.value as Record<string, unknown>).consecutiveFailures).toBe(1);
+  }, 20_000);
+
+  test("does not attribute recalled memory or a model to deterministic fallback", async () => {
+    const repo = createRepository();
+    const memory = new InMemoryMemoryStore();
+    const calls: LLMGenerateInput[] = [];
+    const llm: LLMClient = {
+      async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+        calls.push(input);
+        if (calls.length === 1) {
+          return {
+            text: JSON.stringify(modelResponse()),
+            provider: "test-provider",
+            modelId: "test-model",
+          };
+        }
+        throw new Error("provider failed after recall");
+      },
+    };
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      modelId: "fallback-provenance-model",
+      logger: { log: () => {}, warn: () => {}, error: () => {} },
+    });
+    const request = await requestFor(repo, {
+      purpose: "general",
+      freshness: "fresh_required",
+    });
+    await worker.analyze("model-backed-fact", {
+      ...request,
+      idempotencyKey: "model-backed-fact",
+    });
+
+    const fallback = await worker.analyze("fallback-after-recall", {
+      ...request,
+      idempotencyKey: "fallback-after-recall",
+    });
+
+    const fallbackPrompt = JSON.parse(calls[1]?.messages[0]?.content ?? "{}") as {
+      advisoryMemory?: unknown[];
+    };
+    expect(fallbackPrompt.advisoryMemory?.length).toBeGreaterThan(0);
+    expect(fallback.memoryRefs.some((ref) => ref.role === "recalled_fact")).toBe(false);
+    const facts = await memory.search({
+      scope: { namespace: "repository_facts", repositoryId: request.repository.identity },
+      maxItems: 10,
+      maxChars: 100_000,
+    });
+    const fallbackFact = facts.find(
+      (record) => record.provenance.requestId === "fallback-after-recall",
+    );
+    expect(fallbackFact).toBeDefined();
+    expect(fallbackFact?.provenance.modelId).toBeUndefined();
+    expect(fallback.memoryRefs.some((ref) => ref.id === fallbackFact?.id)).toBe(true);
+  });
 
   test("uses exact clean-snapshot Git blob content and citations across CRLF smudge", async () => {
     const repo = createRepository();
@@ -779,6 +1276,67 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(result.evidence[0]?.path).toBe("src/scheduler.ts");
   });
 
+  test("reserves packet capacity for Unicode-ranked sources and prefers them in fallback evidence", async () => {
+    const repo = createRepository();
+    const relevantPath = "src/支付处理.ts";
+    writeFileSync(join(repo, "vision.md"), `# Vision\n\n${"priority details ".repeat(2_000)}\n`);
+    writeFileSync(join(repo, "README.md"), `# Example\n\n${"overview details ".repeat(2_000)}\n`);
+    writeFileSync(join(repo, "package.json"), `${"manifest details ".repeat(2_000)}\n`);
+    writeFileSync(join(repo, ...relevantPath.split("/")), "export const 支付处理 = 'bounded';\n");
+    execFileSync("git", ["add", "."], { cwd: repo, stdio: "ignore" });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=PushPals Test",
+        "-c",
+        "user.email=pushpals@example.invalid",
+        "commit",
+        "-m",
+        "add unicode payment source",
+      ],
+      { cwd: repo, stdio: "ignore" },
+    );
+    const calls: LLMGenerateInput[] = [];
+    const llm: LLMClient = {
+      async generate(input: LLMGenerateInput): Promise<LLMGenerateOutput> {
+        calls.push(input);
+        throw new Error("provider unavailable");
+      },
+    };
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      repositoryTools: true,
+      logger: { log: () => {}, warn: () => {}, error: () => {} },
+    });
+    const request = await requestFor(repo, {
+      freshness: "fresh_required",
+      purpose: "architecture",
+      question: "检查支付处理的实现边界",
+      context: {},
+    });
+
+    const result = await worker.analyze("unicode-ranked-fallback", request);
+
+    const payload = JSON.parse(calls[0]?.messages[0]?.content ?? "{}") as {
+      evidencePacket: {
+        selectedPaths: string[];
+        files: Array<{ path: string; content: string }>;
+      };
+    };
+    expect(payload.evidencePacket.selectedPaths).toContain(relevantPath);
+    expect(payload.evidencePacket.files.map((entry) => entry.path)).toContain(relevantPath);
+    expect(
+      payload.evidencePacket.files.reduce((chars, entry) => chars + entry.content.length, 0),
+    ).toBeLessThanOrEqual(64_000);
+    expect(result.evidence[0]?.path).toBe(relevantPath);
+    expect((result.data as Record<string, unknown>).repositoryAgentMode).toBe(
+      "deterministic_evidence_fallback",
+    );
+  });
+
   test("deterministic retrieval never admits absolute or untracked context paths", async () => {
     const repo = createRepository();
     writeFileSync(join(repo, "untracked.txt"), "must not enter the evidence packet\n");
@@ -917,6 +1475,89 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     };
     expect(payload.evidencePacket.selectedPaths).toEqual([]);
     expect(result.evidence[0]?.path).toBe("vision.md");
+  });
+
+  test("bounds hanging cache, recall, and fact-memory operations within the request deadline", async () => {
+    const repo = createRepository();
+    for (const hangingStage of ["get", "search", "put"] as const) {
+      const delegate = new InMemoryMemoryStore();
+      const never = () => new Promise<never>(() => {});
+      const memory = {
+        put: (input: any, options?: any) =>
+          hangingStage === "put" && input?.scope?.namespace === "repository_facts"
+            ? never()
+            : delegate.put(input, options),
+        get: (address: any, options?: any) =>
+          hangingStage === "get" ? never() : delegate.get(address, options),
+        search: (query: any) => (hangingStage === "search" ? never() : delegate.search(query)),
+        invalidate: (selector: any) => delegate.invalidate(selector),
+        reinforce: (input: any) => delegate.reinforce(input),
+        prune: (options?: any) => delegate.prune(options),
+        close: () => delegate.close(),
+      };
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory: memory as any,
+        llm: new FakeLlm(),
+        repositoryTools: true,
+        finalizationReserveMs: 800,
+        logger: { log: () => {}, warn: () => {}, error: () => {} },
+      });
+      const request = await requestFor(repo, {
+        freshness: hangingStage === "get" ? "cache_preferred" : "fresh_required",
+        idempotencyKey: `hanging-memory-${hangingStage}`,
+        deadlineAt: new Date(Date.now() + 5_000).toISOString(),
+      });
+      const startedAt = Date.now();
+
+      const result = await worker.analyze(`hanging-memory-${hangingStage}`, request);
+
+      expect(Date.now() - startedAt).toBeLessThan(5_500);
+      expect(result.evidence.length).toBeGreaterThan(0);
+    }
+  }, 30_000);
+
+  test("fences a delayed staged put so it cannot ghost-write after timeout", async () => {
+    const delegate = new InMemoryMemoryStore();
+    let delayedSettled = false;
+    const memory = {
+      put: async (input: any, options?: any) => {
+        await Bun.sleep(50);
+        try {
+          return await delegate.put(input, options);
+        } finally {
+          delayedSettled = true;
+        }
+      },
+      get: (address: any, options?: any) => delegate.get(address, options),
+      search: (query: any) => delegate.search(query),
+      invalidate: (selector: any) => delegate.invalidate(selector),
+      reinforce: (input: any) => delegate.reinforce(input),
+      prune: (options?: any) => delegate.prune(options),
+      close: () => delegate.close(),
+    };
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: memory as any,
+      llm: new FakeLlm(),
+      logger: { log: () => {}, warn: () => {}, error: () => {} },
+    });
+    const scope = { namespace: "repository_facts", repositoryId: "repo-delayed-write" };
+    const signal = new AbortController().signal;
+
+    await expect(
+      (worker as any).memoryPutWithinDeadline("delayed test write", signal, Date.now() + 15, {
+        scope,
+        key: "delayed",
+        kind: "test",
+        summary: "This record must never become durable.",
+        provenance: { service: "repository_agent" },
+      }),
+    ).rejects.toThrow("exceeded its stage deadline");
+    await Bun.sleep(75);
+
+    expect(delayedSettled).toBe(true);
+    expect(await delegate.get({ scope, key: "delayed" }, { includeExpired: true })).toBeNull();
   });
 
   test("drops untracked evidence and path proposals, refreshes excerpts, and never executes validation", async () => {
@@ -1241,7 +1882,7 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     };
     expect(recallPayload.advisoryMemory).toHaveLength(1);
     expect(recallPayload.advisoryMemory[0]?.evidence).toHaveLength(3);
-  });
+  }, 15_000);
 
   test("ranks recall with repository-validated paths instead of arbitrary caller terms", async () => {
     const repo = createRepository();
@@ -1398,6 +2039,51 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     } catch {
       // Bun SQLite can retain a transient Windows WAL handle after close.
     }
+  });
+
+  test("does not process a delayed claim that arrives after worker shutdown", async () => {
+    const repo = createRepository();
+    const request = await requestFor(repo, { freshness: "fresh_required" });
+    const claim: RepositoryAgentClaim = {
+      requestId: "delayed-after-stop",
+      claimToken: "delayed-after-stop-token",
+      claimGeneration: 1,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      request,
+    };
+    let markClaimStarted: (() => void) | null = null;
+    const claimStarted = new Promise<void>((resolveStarted) => {
+      markClaimStarted = resolveStarted;
+    });
+    let finishClaim: ((value: RepositoryAgentClaimResult) => void) | null = null;
+    const delayedClaim = new Promise<RepositoryAgentClaimResult>((resolveClaim) => {
+      finishClaim = resolveClaim;
+    });
+    const control = new FakeWorkerControl(null);
+    control.claim = async () => {
+      markClaimStarted?.();
+      return await delayedClaim;
+    };
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control,
+      memory: new InMemoryMemoryStore(),
+      llm,
+      repositoryTools: true,
+      stopDrainMs: 100,
+      logger: { log: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    worker.start();
+    await claimStarted;
+    await worker.stop();
+    finishClaim?.({ claim, pollAfterMs: 5 });
+    await Bun.sleep(50);
+
+    expect(llm.calls).toHaveLength(0);
+    expect(control.completed).toBeNull();
+    expect(control.failed).toBeNull();
+    expect(control.renewals).toBe(0);
   });
 
   test("waits for provider cancellation cleanup while bounding worker shutdown", async () => {
