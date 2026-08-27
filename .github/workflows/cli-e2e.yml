@@ -29,6 +29,7 @@ on:
       - "tests/workerpals.runtime-paths.test.ts"
       - "tests/integration/workerpals.control-plane.e2e.ts"
       - "tests/workerpals.direct-worktree.test.ts"
+      - "tests/workerpals.docker-executor.test.ts"
       - "tests/workerpals.runtime-sandbox-mirror.test.ts"
       - "tests/workerpals.sandbox-env.test.ts"
       - "tests/workerpals.windows-sandbox-env.integration.test.ts"
@@ -65,6 +66,7 @@ on:
       - "tests/workerpals.runtime-paths.test.ts"
       - "tests/integration/workerpals.control-plane.e2e.ts"
       - "tests/workerpals.direct-worktree.test.ts"
+      - "tests/workerpals.docker-executor.test.ts"
       - "tests/workerpals.runtime-sandbox-mirror.test.ts"
       - "tests/workerpals.sandbox-env.test.ts"
       - "tests/workerpals.windows-sandbox-env.integration.test.ts"
@@ -171,6 +173,11 @@ jobs:
 
       - name: Verify Docker engine
         run: docker version
+
+      - name: Verify Linux dependency projection contract
+        env:
+          PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION: "1"
+        run: bun test tests/workerpals.docker-executor.test.ts
 
       - name: Run WorkerPals control-plane E2E suite
         run: bun run test:workerpals:e2e

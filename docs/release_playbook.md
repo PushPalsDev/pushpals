@@ -57,6 +57,18 @@ bun run test:root
 git diff --check
 ```
 
+Before preparing the release tag, wait for the `CLI E2E` run for the final
+product-change commit on `main` and require it to succeed. Do not tag while that
+run is pending or failing; tag-triggered release gates are the final defense,
+not the first cross-platform execution of a changed contract.
+
+```powershell
+$productCommit = git rev-parse HEAD
+gh run list --repo PushPalsDev/pushpals --workflow cli-e2e.yml --commit $productCommit --limit 1
+gh run watch <run_id> --repo PushPalsDev/pushpals
+gh run view <run_id> --repo PushPalsDev/pushpals --json status,conclusion,jobs
+```
+
 If `bun run cli:bundle` changes `packages/cli/runtime` or monitor UI assets,
 commit those generated updates before tagging. The published package uses those
 packaged assets.

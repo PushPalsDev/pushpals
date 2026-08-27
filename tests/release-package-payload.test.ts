@@ -148,6 +148,20 @@ describe("release package payload verification", () => {
     );
   });
 
+  test("hosted Linux CI exercises dependency projection before release tags", () => {
+    const workflow = readFileSync(join(repoRoot, ".github", "workflows", "cli-e2e.yml"), "utf8");
+    const workerJobIndex = workflow.indexOf("workerpals_control_plane_e2e_linux:");
+    const windowsDockerJobIndex = workflow.indexOf("windows_host_docker_e2e:");
+    const workerJob = workflow.slice(workerJobIndex, windowsDockerJobIndex);
+
+    expect(workflow.match(/- "tests\/workerpals\.docker-executor\.test\.ts"/g)).toHaveLength(2);
+    expect(workerJobIndex).toBeGreaterThanOrEqual(0);
+    expect(windowsDockerJobIndex).toBeGreaterThan(workerJobIndex);
+    expect(workerJob).toContain("Verify Linux dependency projection contract");
+    expect(workerJob).toContain('PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION: "1"');
+    expect(workerJob).toContain("bun test tests/workerpals.docker-executor.test.ts");
+  });
+
   test("allows the expected CLI package payload shape without vendored tool binaries", () => {
     const issues = findDisallowedCliPackageEntries([
       { path: "README.md" },

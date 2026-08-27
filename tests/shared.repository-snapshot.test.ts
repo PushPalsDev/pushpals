@@ -38,6 +38,15 @@ function fixtureRoot(): string {
   return root;
 }
 
+function canonicalPathKey(path: string): string {
+  const canonical = realpathSync.native(path);
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+function isSameCanonicalPath(actual: string, expected: string): boolean {
+  return canonicalPathKey(actual) === canonicalPathKey(expected);
+}
+
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, {
     cwd,
@@ -402,7 +411,7 @@ describe("resolveRepositorySnapshot", () => {
     const fileSystem: RepositorySnapshotFileSystem = {
       ...nativeSnapshotFileSystem,
       async open(path, flags) {
-        const handle = await openPath(path === untracked ? outside : path, flags);
+        const handle = await openPath(isSameCanonicalPath(path, untracked) ? outside : path, flags);
         return {
           async stat(options) {
             return await handle.stat(options);
@@ -443,7 +452,8 @@ describe("resolveRepositorySnapshot", () => {
     const fileSystem: RepositorySnapshotFileSystem = {
       ...nativeSnapshotFileSystem,
       async lstat(path) {
-        counts.set(path, (counts.get(path) ?? 0) + 1);
+        const key = canonicalPathKey(path);
+        counts.set(key, (counts.get(key) ?? 0) + 1);
         return await nativeSnapshotFileSystem.lstat(path);
       },
     };
@@ -452,8 +462,8 @@ describe("resolveRepositorySnapshot", () => {
     expect(snapshot.dirty).toBe(true);
     // Each capture observes a prefix once and validates it once. The number of
     // descendant files must not multiply shared-prefix lstat calls.
-    expect(counts.get(shared)).toBe(4);
-    expect(counts.get(deep)).toBe(4);
+    expect(counts.get(canonicalPathKey(shared))).toBe(4);
+    expect(counts.get(canonicalPathKey(deep))).toBe(4);
   });
 
   test("does not recurse into ignored directories while discovering boundaries", async () => {
@@ -471,15 +481,16 @@ describe("resolveRepositorySnapshot", () => {
     const fileSystem: RepositorySnapshotFileSystem = {
       ...nativeSnapshotFileSystem,
       async readdir(path) {
-        readdirCounts.set(path, (readdirCounts.get(path) ?? 0) + 1);
+        const key = canonicalPathKey(path);
+        readdirCounts.set(key, (readdirCounts.get(key) ?? 0) + 1);
         return await nativeSnapshotFileSystem.readdir(path);
       },
     };
 
     const snapshot = await resolveRepositorySnapshot(root, { fileSystem });
     expect(snapshot.dirty).toBe(true);
-    expect(readdirCounts.get(container)).toBe(2);
-    expect(readdirCounts.has(ignored)).toBe(false);
+    expect(readdirCounts.get(canonicalPathKey(container))).toBe(2);
+    expect(readdirCounts.has(canonicalPathKey(ignored))).toBe(false);
   });
 
   test("records nested repository boundaries without trying to hash a directory", async () => {
@@ -705,7 +716,8 @@ describe("resolveRepositorySnapshot", () => {
     ).toBe(true);
     expect(
       calls.some(
-        ({ args }) => args[0] === "-C" && args[1] === container && args[2] === "rev-parse",
+        ({ args }) =>
+          args[0] === "-C" && isSameCanonicalPath(args[1], container) && args[2] === "rev-parse",
       ),
     ).toBe(true);
     const ignoreProbes = calls.filter(({ args }) => args[0] === "check-ignore");
@@ -759,7 +771,11 @@ describe("resolveRepositorySnapshot", () => {
     try {
       await resolveRepositorySnapshot(root, {
         runGit: async (repoRoot, args, options) => {
-          if (args[0] === "-C" && args[1] === container && args[2] === "rev-parse") {
+          if (
+            args[0] === "-C" &&
+            isSameCanonicalPath(args[1], container) &&
+            args[2] === "rev-parse"
+          ) {
             git(container, ["init"]);
             markerPopulated = true;
             validationInitializations += 1;
