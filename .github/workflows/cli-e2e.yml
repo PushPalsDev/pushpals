@@ -24,6 +24,7 @@ on:
       - "tests/cli.runtime-bootstrap.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
+      - "tests/release-package-payload.test.ts"
       - "tests/runtime-launch-trampoline.test.ts"
       - "tests/start.runtime-services.test.ts"
       - "tests/workerpals.runtime-paths.test.ts"
@@ -61,6 +62,7 @@ on:
       - "tests/cli.runtime-bootstrap.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
+      - "tests/release-package-payload.test.ts"
       - "tests/runtime-launch-trampoline.test.ts"
       - "tests/start.runtime-services.test.ts"
       - "tests/workerpals.runtime-paths.test.ts"
@@ -143,6 +145,9 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Verify release package payload contract
+        run: bun test tests/release-package-payload.test.ts
 
       - name: Verify repository snapshot boundaries
         run: bun test tests/shared.repository-snapshot.test.ts

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
@@ -10,6 +10,9 @@ import { SqliteMemoryStore } from "../apps/server/src/memory_store";
 import { applyRepositoryAgentMemoryFeedbackBatch } from "../apps/server/src/repository_agent_memory_feedback";
 import { RepositoryAgentQueue } from "../apps/server/src/repository_agent_queue";
 import { RequestQueue } from "../apps/server/src/requests";
+
+// Keep SQLite-heavy fixtures bounded while tolerating host filesystem scheduling under the full suite.
+setDefaultTimeout(15_000);
 
 const stores: AutonomyStore[] = [];
 const tempDirs: string[] = [];

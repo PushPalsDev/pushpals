@@ -6,11 +6,14 @@ import { dirname, join, resolve } from "node:path";
 import {
   findDisallowedCliPackageEntries,
   findDisallowedReleaseArtifactEntries,
+  NPM_PACK_DRY_RUN_TIMEOUT_MS,
   REQUIRED_CLI_PACKAGE_PATHS,
 } from "../scripts/verify-cli-package-payload.ts";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const verifierScript = join(repoRoot, "scripts", "verify-cli-package-payload.ts");
+const VERIFIER_PROCESS_TIMEOUT_MS = NPM_PACK_DRY_RUN_TIMEOUT_MS + 5_000;
+const VERIFIER_TEST_TIMEOUT_MS = VERIFIER_PROCESS_TIMEOUT_MS + 5_000;
 function requiredCliPackageFiles() {
   return REQUIRED_CLI_PACKAGE_PATHS.map((path) => ({
     path,
@@ -52,12 +55,23 @@ function withTempPackage<T>(fn: (packageDir: string) => T): T {
   }
 }
 
-function runVerifier(args: string[]) {
+function runVerifier(args: string[], env: Record<string, string | undefined> = process.env) {
   return spawnSync(process.execPath, ["run", verifierScript, ...args], {
     cwd: repoRoot,
     encoding: "utf8",
+    env,
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: VERIFIER_PROCESS_TIMEOUT_MS,
   });
+}
+
+function envWithoutExecutableSearchPath(): Record<string, string | undefined> {
+  return {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "path"),
+    ),
+    PATH: "",
+  };
 }
 
 describe("release package payload verification", () => {
@@ -88,6 +102,12 @@ describe("release package payload verification", () => {
         "runtime/sandbox/prompts/remotebuddy/repository_agent_codex_prompt_template.md",
       ]),
     );
+  });
+
+  test("bounds npm package inspection below the verifier and test deadlines", () => {
+    expect(NPM_PACK_DRY_RUN_TIMEOUT_MS).toBe(30_000);
+    expect(VERIFIER_PROCESS_TIMEOUT_MS).toBeGreaterThan(NPM_PACK_DRY_RUN_TIMEOUT_MS);
+    expect(VERIFIER_TEST_TIMEOUT_MS).toBeGreaterThan(VERIFIER_PROCESS_TIMEOUT_MS);
   });
 
   test("rejects developer-local runtime configuration from npm packages", () => {
@@ -160,6 +180,19 @@ describe("release package payload verification", () => {
     expect(workerJob).toContain("Verify Linux dependency projection contract");
     expect(workerJob).toContain('PUSHPALS_RUN_DEPENDENCY_PROJECTION_INTEGRATION: "1"');
     expect(workerJob).toContain("bun test tests/workerpals.docker-executor.test.ts");
+  });
+
+  test("hosted Linux CI verifies package payload changes before release tags", () => {
+    const workflow = readFileSync(join(repoRoot, ".github", "workflows", "cli-e2e.yml"), "utf8");
+    const packagedJobIndex = workflow.indexOf("packaged_cli_e2e_linux:");
+    const workerJobIndex = workflow.indexOf("workerpals_control_plane_e2e_linux:");
+    const packagedJob = workflow.slice(packagedJobIndex, workerJobIndex);
+
+    expect(workflow.match(/- "tests\/release-package-payload\.test\.ts"/g)).toHaveLength(2);
+    expect(packagedJobIndex).toBeGreaterThanOrEqual(0);
+    expect(workerJobIndex).toBeGreaterThan(packagedJobIndex);
+    expect(packagedJob).toContain("Verify release package payload contract");
+    expect(packagedJob).toContain("bun test tests/release-package-payload.test.ts");
   });
 
   test("allows the expected CLI package payload shape without vendored tool binaries", () => {
@@ -308,28 +341,85 @@ describe("release package payload verification", () => {
     ).toEqual(["bun.exe", "node", "codex", "pushpals-runtime-workerpals-windows-x64.exe.old"]);
   });
 
-  test("script succeeds against a clean packed package fixture", () => {
-    withTempPackage((packageDir) => {
-      const result = runVerifier(["--package-dir", packageDir]);
+  test(
+    "script succeeds against a clean packed package fixture",
+    () => {
+      withTempPackage((packageDir) => {
+        const result = runVerifier(["--package-dir", packageDir]);
 
-      expect(result.status).toBe(0);
-      expect(result.stdout).toContain("verified npm package payload");
-      expect(result.stderr).toBe("");
-    });
-  });
+        expect({
+          status: result.status,
+          signal: result.signal,
+          error: result.error?.message ?? null,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        }).toEqual({
+          status: 0,
+          signal: null,
+          error: null,
+          stdout: expect.stringContaining("verified npm package payload"),
+          stderr: "",
+        });
+      });
+    },
+    VERIFIER_TEST_TIMEOUT_MS,
+  );
 
-  test("script fails against a package fixture that would ship Bun", () => {
-    withTempPackage((packageDir) => {
-      mkdirSync(join(packageDir, "runtime", "bin"), { recursive: true });
-      writeFileSync(join(packageDir, "runtime", "bin", "bun.exe"), "not really bun\n", "utf8");
+  test(
+    "script fails against a package fixture that would ship Bun",
+    () => {
+      withTempPackage((packageDir) => {
+        mkdirSync(join(packageDir, "runtime", "bin"), { recursive: true });
+        writeFileSync(join(packageDir, "runtime", "bin", "bun.exe"), "not really bun\n", "utf8");
 
-      const result = runVerifier(["--package-dir", packageDir]);
+        const result = runVerifier(["--package-dir", packageDir]);
 
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("runtime/bin/bun.exe");
-      expect(result.stderr).toContain("external toolchain");
-    });
-  });
+        expect({
+          status: result.status,
+          signal: result.signal,
+          error: result.error?.message ?? null,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        }).toEqual({
+          status: 1,
+          signal: null,
+          error: null,
+          stdout: "",
+          stderr: expect.stringContaining("runtime/bin/bun.exe"),
+        });
+        expect(result.stderr).toContain("runtime/bin/bun.exe");
+        expect(result.stderr).toContain("external toolchain");
+      });
+    },
+    VERIFIER_TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "script preserves npm launch diagnostics when the executable search path is empty",
+    () => {
+      withTempPackage((packageDir) => {
+        const result = runVerifier(["--package-dir", packageDir], envWithoutExecutableSearchPath());
+
+        expect({
+          status: result.status,
+          signal: result.signal,
+          error: result.error?.message ?? null,
+          stdout: result.stdout,
+        }).toEqual({
+          status: 1,
+          signal: null,
+          error: null,
+          stdout: "",
+        });
+        expect(result.stderr).toContain("npm pack --dry-run failed");
+        expect(result.stderr).toMatch(
+          /(?:spawn error:|no such file or directory|not (?:found|recognized))/i,
+        );
+        expect(result.stderr).not.toContain("TypeError");
+      });
+    },
+    VERIFIER_TEST_TIMEOUT_MS,
+  );
 
   test("release workflow tests and publishes one immutable CLI package artifact", () => {
     const workflow = readFileSync(

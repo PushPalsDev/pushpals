@@ -73,6 +73,7 @@ const LOCAL_RUNTIME_OVERRIDE_PATTERN = /(?:^|\/)local\.toml$/i;
 
 const RELEASE_ARTIFACT_ALLOW_PATTERN =
   /^(pushpals-(linux-x64|windows-x64\.exe|macos-x64|macos-arm64)|pushpals-runtime-(server|localbuddy|remotebuddy|workerpals|source-control-manager)-(linux-x64|windows-x64\.exe|macos-x64|macos-arm64)|SHA256SUMS\.txt)(\.asc)?$/;
+export const NPM_PACK_DRY_RUN_TIMEOUT_MS = 30_000;
 
 function normalizePackagePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\.?\//, "");
@@ -178,14 +179,17 @@ function runNpmPackDryRun(packageDir: string): PackagePayloadFile[] {
     cwd: packageDir,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: NPM_PACK_DRY_RUN_TIMEOUT_MS,
   });
 
   if (result.status !== 0) {
     throw new Error(
       [
         `npm pack --dry-run failed with exit ${result.status ?? "(signal)"}`,
-        result.stdout.trim(),
-        result.stderr.trim(),
+        result.signal ? `signal: ${result.signal}` : "",
+        result.error ? `spawn error: ${result.error.message}` : "",
+        (result.stdout ?? "").trim(),
+        (result.stderr ?? "").trim(),
       ]
         .filter(Boolean)
         .join("\n"),

@@ -17,6 +17,41 @@ import {
   seedCandidateRuntimeBinaries,
 } from "../scripts/release-installed-cli-smoke.ts";
 
+function isValidProcessId(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 0;
+}
+
+function isEffectivelyAlive(pid: number): boolean {
+  if (!isValidProcessId(pid)) return false;
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const state = stat
+        .slice(stat.lastIndexOf(")") + 1)
+        .trim()
+        .split(/\s+/, 1)[0];
+      // Minimal containers without a subreaper can retain a terminated orphan
+      // as a zombie. It has no executable process left to terminate.
+      if (state === "Z") return false;
+    } catch {
+      // If procfs is restricted or unavailable, keep treating a PID that still
+      // answers kill(0) as alive. A second probe closes the normal exit race.
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 describe("published Windows CLI runtime soak contract", () => {
   test("derives and verifies the exact installed CLI release version", () => {
     expect(expectedCliVersionFromReleaseInput("@pushpalsdev/cli@1.2.42", null)).toBe("1.2.42");
@@ -71,6 +106,7 @@ console.log("[pushpals] platform=" + process.platform + "/" + process.arch);
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-version-timeout-"));
     const fixture = join(root, "stuck-version-fixture.ts");
     const childPidFile = join(root, "child.pid");
+    let childPid = 0;
     try {
       writeFileSync(
         fixture,
@@ -99,14 +135,35 @@ setInterval(() => {}, 1000);
       ).rejects.toThrow("Timed out after 1000ms");
       expect(Date.now() - startedAt).toBeLessThan(8_000);
 
-      const childPid = Number.parseInt(readFileSync(childPidFile, "utf8"), 10);
-      expect(Number.isFinite(childPid)).toBeTrue();
-      await Bun.sleep(100);
-      expect(() => process.kill(childPid, 0)).toThrow();
+      childPid = Number.parseInt(readFileSync(childPidFile, "utf8"), 10);
+      expect(isValidProcessId(childPid)).toBeTrue();
+      let alive = true;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (!isEffectivelyAlive(childPid)) {
+          alive = false;
+          break;
+        }
+        await Bun.sleep(50);
+      }
+      expect(alive).toBeFalse();
     } finally {
+      if (!isValidProcessId(childPid) && existsSync(childPidFile)) {
+        try {
+          childPid = Number.parseInt(readFileSync(childPidFile, "utf8"), 10);
+        } catch {
+          // The fixture may have failed before persisting its descendant PID.
+        }
+      }
+      if (isValidProcessId(childPid) && isEffectivelyAlive(childPid)) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The bounded runner already cleaned it up.
+        }
+      }
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("validates the exact CLI tarball against same-run runtime candidates", () => {
     const workflow = readFileSync(
