@@ -2,37 +2,38 @@
 
 ## Release Metadata
 
-- version: `v1.2.43`
-- start_commit: `62898e04155fc8854c72c7da73fcebbab087fc7c`
-- end_commit: `66fa7f0ee1fce88634c2753f2a74d4d5befd6131`
-- commits_in_range: `1`
+- version: `v1.2.44`
+- start_commit: `bd6122beb64830557ca80a2b1939b408c08db412`
+- end_commit: `491e0abe0f6af2bd059e3a28178e2b9d61da05a1`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Add a shared RepositoryAgent that every backend service can call for bounded, evidence-cited repository reasoning, with RemoteBuddy hosting isolated model execution and durable request leases.
-- Add a separate typed memory interface and SQLite authority with repository isolation, provenance, expiry, invalidation, outcome reinforcement, cache reuse, and cross-session learning.
-- Ground autonomous ideation, scoring, validation selection, and review repair in generic repository evidence and `vision.md` priorities without product-specific path rules.
-- Harden end-to-end job and publication lifecycles with exact claim generations, stale recovery, provider reconciliation, validation incident fencing, completion backpressure, and bounded process-tree cleanup.
-- Improve execution speed and observability through focused-first validation, invariant caching, dependency preparation telemetry, container-native projections, runtime circuit breakers, and phase-level diagnostics.
-- Make packaged Windows startup self-repair only missing or stale runtime assets while preserving repository configuration, and ship every required source bundle, prompt, and launch trampoline.
-- Finalize transient SQLite statements deterministically so RequestQueue shutdown releases Windows database handles synchronously.
+- Make the RepositoryAgent a generic, shared capability for every PushPals service, with evidence-bounded analysis, durable leases, structural caching, and repository-scoped memory reinforcement.
+- Fence autonomous dispatch with a fail-closed two-phase reservation protocol so disabled, expired, replayed, or unconfirmed objectives cannot leak into worker execution.
+- Enforce one monotonic end-to-end WorkerPal deadline across setup, execution, retries, validation, and host finalization while preserving a bounded cleanup reserve and cumulative model-usage evidence.
+- Retain exact candidate commits through trusted-host validation and add HMAC-scoped SCM repair authority, durable repair lifecycles, startup reconciliation, and cross-job failure circuit breaking.
+- Improve quality and speed with focused-first validation DAGs, invariant-gate reuse, rollout/no-edit watchdog recovery, candidate-aware repair, and accurate terminal semantics for unchanged or blocked work.
+- Isolate concurrent Linux dependency projections with copy-on-write snapshots instead of shared writable hardlink inodes, while keeping deterministic LF worktrees and bounded dependency preparation telemetry.
+- Expand lifecycle, timeout, crash, publication, memory, package-parity, and observability harnesses across source and embedded runtime assets.
 
 ## Validation
 
-- `bun run test:root` passed `1,811` tests with `7` intentional platform or opt-in skips, `0` failures, and `14,631` assertions across `163` files on Windows with Bun 1.3.14.
-- RepositoryAgent, memory-store conformance, repository-context fencing, provider reconciliation, autonomy policy, publication recovery, runtime bootstrap, and RequestQueue handle-lifecycle regression suites passed.
-- `bun run cli:bundle` rebuilt all packaged service runtimes and source mirrors successfully.
-- `bun run cli:verify-package-payload` verified `267` package files with no external toolchain files.
-- Server and packaged-runtime builds passed, generated runtime mirrors remained byte-identical, and `git diff --check` passed.
+- `bun run test:root` passed `1,944` tests with `7` intentional platform-gated skips, `0` failures, and `15,403` assertions across `168` files on Windows with Bun 1.3.14.
+- `bun run harness:reliability` passed all `7` phases, including `125` Python WorkerPal watchdog tests and `469` runtime-boundary tests with the same `7` platform-gated skips.
+- RepositoryAgent/memory, two-phase autonomy dispatch, durable SCM repair, publication recovery, monotonic deadline, cleanup-reserve, and dependency-projection regression suites passed both focused and full runs.
+- `bun run cli:bundle` rebuilt all packaged service runtimes and source mirrors successfully, and runtime mirror parity checks passed.
+- `bun run cli:verify-package-payload` verified `269` package files with no external toolchain files.
+- Shared, RemoteBuddy, Server, SourceControlManager, and WorkerPal typechecks passed; two independent review passes found no remaining actionable issue; `git diff --check` passed.
 
 ## Install
 
 ```bash
-npm i -g @pushpalsdev/cli@1.2.43
+npm i -g @pushpalsdev/cli@1.2.44
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.43
+bun install -g @pushpalsdev/cli@1.2.44
 ```
 
 ## Artifacts
