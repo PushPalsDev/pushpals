@@ -24,6 +24,7 @@ const WINDOWS_SOURCE_RUNTIME_ASSET_PATHS = [
   "runtime/sandbox/.pushpals-runtime-launch-trampoline.js",
 ] as const;
 export const REQUIRED_CLI_PACKAGE_PATHS = [
+  "bin/bun-runtime.cjs",
   "bin/pushpals.cjs",
   "dist/pushpals-cli.js",
   ...WINDOWS_SOURCE_RUNTIME_ASSET_PATHS,

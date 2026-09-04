@@ -4,7 +4,12 @@
 const { spawn, spawnSync } = require("node:child_process");
 const { existsSync, mkdirSync, readFileSync, rmSync } = require("node:fs");
 const { tmpdir } = require("node:os");
-const { dirname, join, resolve } = require("node:path");
+const { join, resolve } = require("node:path");
+const {
+  buildBunVersionProbeInvocation,
+  enumerateWindowsBunCandidates,
+  selectCompatibleBunRuntime,
+} = require("./bun-runtime.cjs");
 
 const bundledCliPath = resolve(__dirname, "..", "dist", "pushpals-cli.js");
 const packageJsonPath = resolve(__dirname, "..", "package.json");
@@ -17,7 +22,7 @@ const BOOTSTRAP_READY_MARKER_ENV = "PUSHPALS_CLI_READY_MARKER";
 let packageVersion = "";
 let minimumBunVersion = "1.3.14";
 let readyMarkerPath = "";
-let resolvedBunCommand = "";
+let resolvedBunRuntime = null;
 if (existsSync(packageJsonPath)) {
   try {
     const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8"));
@@ -74,40 +79,38 @@ function killChildTree(child) {
   }
 }
 
-function resolveWindowsBunCommand() {
+function resolveBunCandidates(timeoutMs) {
+  const explicitBunBin = String(process.env.PUSHPALS_BUN_BIN ?? "").trim();
+  if (explicitBunBin) {
+    if (process.platform === "win32") {
+      return enumerateWindowsBunCandidates("", {
+        explicitBunBin,
+        pathExists: existsSync,
+      });
+    }
+    return [{ command: explicitBunBin, source: "PUSHPALS_BUN_BIN", shell: false }];
+  }
+  if (process.platform !== "win32") {
+    return [{ command: "bun", source: "PATH", shell: false }];
+  }
+
   try {
     const where = spawnSync("where.exe", ["bun"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5_000,
+      timeout: timeoutMs > 0 ? Math.max(1, Math.min(5_000, timeoutMs)) : 5_000,
     });
-    if (where.status !== 0) return "bun";
-    const candidates = String(where.stdout ?? "")
-      .split(/\r?\n/g)
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    for (const candidate of candidates) {
-      const lower = candidate.toLowerCase();
-      if (lower.endsWith(".exe") && existsSync(candidate)) return candidate;
-
-      // Bun installed through npm/nvm on Windows commonly exposes shell shims:
-      //   <node-dir>\bun
-      //   <node-dir>\bun.cmd
-      // Those shims delegate to <node-dir>\node_modules\bun\bin\bun.exe.
-      const shimTarget = join(dirname(candidate), "node_modules", "bun", "bin", "bun.exe");
-      if (existsSync(shimTarget)) return shimTarget;
-    }
+    return enumerateWindowsBunCandidates(where.status === 0 ? where.stdout : "", {
+      pathExists: existsSync,
+    });
   } catch {
     // Fall back to PATH/shell command resolution below.
   }
-  return "bun";
+  return enumerateWindowsBunCandidates("", { pathExists: existsSync });
 }
 
 function resolveBunCommand() {
-  if (resolvedBunCommand) return resolvedBunCommand;
-  resolvedBunCommand = process.platform === "win32" ? resolveWindowsBunCommand() : "bun";
-  return resolvedBunCommand;
+  return resolvedBunRuntime?.command || "bun";
 }
 
 if (!existsSync(bundledCliPath)) {
@@ -120,31 +123,54 @@ if (!existsSync(bundledCliPath)) {
 
 function probeBunRuntime() {
   const timeout = parseBunProbeTimeoutMs();
-  const options = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout };
-  const result = spawnSync(resolveBunCommand(), ["--version"], options);
-  const version = String(result.stdout ?? "").trim();
-  return {
-    ok: result.status === 0,
-    timedOut: Boolean(result.error && result.error.code === "ETIMEDOUT"),
-    version,
-  };
-}
-
-function parseVersion(value) {
-  const match = String(value ?? "")
-    .trim()
-    .match(/v?(\d+)\.(\d+)\.(\d+)/i);
-  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
-}
-
-function versionAtLeast(actualValue, minimumValue) {
-  const actual = parseVersion(actualValue);
-  const minimum = parseVersion(minimumValue);
-  if (!actual || !minimum) return false;
-  for (let index = 0; index < 3; index += 1) {
-    if (actual[index] !== minimum[index]) return actual[index] > minimum[index];
+  const probeStartedAt = Date.now();
+  const candidates = resolveBunCandidates(timeout);
+  const discoveryElapsedMs = Math.max(0, Date.now() - probeStartedAt);
+  if (timeout > 0 && discoveryElapsedMs >= timeout) {
+    return {
+      ok: false,
+      compatible: false,
+      timedOut: true,
+      budgetExhausted: true,
+      command: "",
+      shell: false,
+      version: "",
+      attempts: [],
+    };
   }
-  return true;
+  const remainingTimeoutMs = timeout > 0 ? Math.max(1, timeout - discoveryElapsedMs) : 0;
+  const result = selectCompatibleBunRuntime(candidates, {
+    minimumVersion: minimumBunVersion,
+    timeoutMs: remainingTimeoutMs,
+    probe: (candidate, candidateTimeoutMs) => {
+      const invocation = buildBunVersionProbeInvocation(candidate);
+      const options = {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(candidateTimeoutMs > 0 ? { timeout: candidateTimeoutMs } : {}),
+        ...(invocation.shell ? { shell: true } : {}),
+      };
+      return spawnSync(invocation.command, invocation.args, options);
+    },
+  });
+  if (result.compatible) {
+    resolvedBunRuntime = { command: result.command, shell: result.shell };
+  }
+  return result;
+}
+
+function bunProbeDiagnosticLines(bunRuntime) {
+  if (!Array.isArray(bunRuntime.attempts) || bunRuntime.attempts.length === 0) return [];
+  return [
+    "[pushpals] Bun runtime candidates checked:",
+    ...bunRuntime.attempts.map((attempt) => {
+      if (attempt.runnable) {
+        return `[pushpals] - ${attempt.version || "unknown version"} at ${attempt.command}`;
+      }
+      const detail = attempt.timedOut ? "probe timed out" : attempt.detail || "unavailable";
+      return `[pushpals] - ${detail} at ${attempt.command}`;
+    }),
+  ];
 }
 
 const bunRuntime = probeBunRuntime();
@@ -155,19 +181,30 @@ if (!bunRuntime.ok) {
       "[pushpals] This usually means the Bun process wedged during startup; the CLI refused to continue so it does not freeze the shell.",
       `[pushpals] Set ${BUN_PROBE_TIMEOUT_ENV}=0 to disable this probe timeout, or use a direct binary release:`,
       `[pushpals] ${releaseUrl}`,
+      ...bunProbeDiagnosticLines(bunRuntime),
     ]);
   }
   fail([
     "[pushpals] Bun runtime is required for the npm package entrypoint.",
     "[pushpals] Install Bun from https://bun.sh, or use a direct binary release:",
     `[pushpals] ${releaseUrl}`,
+    ...bunProbeDiagnosticLines(bunRuntime),
   ]);
 }
-if (!versionAtLeast(bunRuntime.version, minimumBunVersion)) {
+if (!bunRuntime.compatible) {
   fail([
     `[pushpals] Unsupported Bun runtime ${bunRuntime.version || "unknown"}; this PushPals package requires Bun ${minimumBunVersion} or newer.`,
+    ...(bunRuntime.timedOut
+      ? [
+          `[pushpals] The Bun candidate scan also exhausted its ${parseBunProbeTimeoutMs()}ms probe budget; some candidates may not have been checked.`,
+          `[pushpals] Set ${BUN_PROBE_TIMEOUT_ENV}=0 to disable this probe timeout.`,
+        ]
+      : []),
+    "[pushpals] For a standard Bun install, run: bun upgrade",
     `[pushpals] For npm-managed Bun, run: npm install -g bun@${minimumBunVersion}`,
+    "[pushpals] On Windows, use 'where.exe bun' to inspect shadowed Bun installations.",
     "[pushpals] PushPals refused to launch an incompatible runtime so it cannot crash-loop or freeze the shell.",
+    ...bunProbeDiagnosticLines(bunRuntime),
   ]);
 }
 
@@ -180,7 +217,7 @@ function spawnBunCli() {
   };
 
   const bunCommand = resolveBunCommand();
-  if (process.platform === "win32" && bunCommand === "bun") {
+  if (process.platform === "win32" && resolvedBunRuntime?.shell) {
     const quoteWindows = (value) => `"${String(value).replace(/"/g, '\\"')}"`;
     const commandLine = [
       bunCommand,

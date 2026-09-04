@@ -14,6 +14,31 @@ managed certificate store, use
 
 The npm entrypoint requires Node.js 20+ and Bun 1.3.14+. Native binaries are also available from [GitHub Releases](https://github.com/PushPalsDev/pushpals/releases).
 
+### Windows Bun resolution
+
+It is possible to have more than one Bun installation on Windows, especially
+after installing Bun both from bun.sh and npm. The CLI checks the Bun
+executables reported by `where.exe bun` in PATH order and uses the first one
+that satisfies its minimum version. Global and project-local npm `bun` and
+`bun.cmd` shims are resolved to their native `node_modules/bun/bin/bun.exe`
+target before launch.
+
+To inspect or repair a runtime mismatch:
+
+```powershell
+where.exe bun
+Get-Command bun -All
+bun upgrade
+```
+
+For an npm-managed installation, use `npm install -g bun@1.3.14`. You can also
+pin the launcher to a specific native executable for the current shell:
+
+```powershell
+$env:PUSHPALS_BUN_BIN = "$env:APPDATA\npm\node_modules\bun\bin\bun.exe"
+pushpals --version
+```
+
 ## Common Commands
 
 Run from inside the Git repository you want PushPals to manage.
@@ -34,6 +59,7 @@ The CLI refuses to run outside a Git repository or against a Server attached to 
 ## Implementation Map
 
 - `bin/pushpals.cjs` - npm shim, Bun version check, bootstrap watchdog, and signal forwarding.
+- `bin/bun-runtime.cjs` - Windows Bun candidate discovery, version selection, and probe budgeting.
 - `../../scripts/pushpals-cli.ts` - bundled CLI, preflights, runtime supervision, session transport, and interactive commands.
 - `../../scripts/sync-cli-runtime-assets.ts` - packaged runtime mirror generation.
 - `package.json` - package payload and build contract.

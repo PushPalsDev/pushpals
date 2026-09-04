@@ -21,6 +21,7 @@ on:
       - "apps/workerpals/**"
       - "apps/source_control_manager/**"
       - "tests/integration/cli.e2e.ts"
+      - "tests/cli.bun-runtime-resolver.test.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
@@ -59,6 +60,7 @@ on:
       - "apps/workerpals/**"
       - "apps/source_control_manager/**"
       - "tests/integration/cli.e2e.ts"
+      - "tests/cli.bun-runtime-resolver.test.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
@@ -100,6 +102,11 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Verify Windows Bun runtime resolution
+        run: |
+          bun test tests/cli.bun-runtime-resolver.test.ts
+          bun test tests/cli.runtime-bootstrap.test.ts --test-name-pattern "npm package shim"
 
       - name: Verify compact worktree, sandbox, and packaged-runtime paths
         run: >-

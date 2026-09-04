@@ -23,6 +23,7 @@ PushPals has three user surfaces with different strengths:
 
 - `scripts/pushpals-cli.ts` - terminal UX, repo attachment, and embedded runtime supervision.
 - `packages/cli/bin/pushpals.cjs` - installed npm launcher and Bun bootstrap watchdog.
+- `packages/cli/bin/bun-runtime.cjs` - Windows Bun candidate discovery and compatible-runtime selection.
 - `packages/cli/README.md` - installation and common command reference.
 - `packages/cli/runtime/` - packaged configuration, prompts, schemas, and runtime bundles.
 

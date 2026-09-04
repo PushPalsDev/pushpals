@@ -1829,8 +1829,12 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(shim).toContain("minimumBunVersion");
     expect(shim).toContain("Unsupported Bun runtime");
     expect(shim).toContain("npm install -g bun@");
+    expect(shim).toContain("bun upgrade");
+    expect(shim).toContain("PUSHPALS_BUN_BIN");
     expect(shim).toContain("where.exe");
-    expect(shim).toContain('join(dirname(candidate), "node_modules", "bun", "bin", "bun.exe")');
+    expect(shim).toContain('require("./bun-runtime.cjs")');
+    expect(shim).toContain("buildBunVersionProbeInvocation");
+    expect(shim).toContain("selectCompatibleBunRuntime");
     expect(shim).toContain("terminating Bun process tree");
     expect(shim).toContain("taskkill");
     expect(shim).toContain('process.once("SIGINT"');
@@ -1851,6 +1855,11 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       writeFileSync(
         join(binDir, "pushpals.cjs"),
         readFileSync(join(process.cwd(), "packages", "cli", "bin", "pushpals.cjs"), "utf8"),
+        "utf8",
+      );
+      writeFileSync(
+        join(binDir, "bun-runtime.cjs"),
+        readFileSync(join(process.cwd(), "packages", "cli", "bin", "bun-runtime.cjs"), "utf8"),
         "utf8",
       );
       writeFileSync(

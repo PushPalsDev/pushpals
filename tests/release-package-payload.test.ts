@@ -78,6 +78,7 @@ describe("release package payload verification", () => {
   test("requires the complete WorkerPal sandbox bootstrap surface", () => {
     expect(REQUIRED_CLI_PACKAGE_PATHS).toEqual(
       expect.arrayContaining([
+        "bin/bun-runtime.cjs",
         "runtime/sandbox/package.json",
         "runtime/sandbox/bun.lock",
         "runtime/sandbox/configs/default.toml",
@@ -152,9 +153,15 @@ describe("release package payload verification", () => {
   });
 
   test("hosted Windows CI exercises source-only startup without compiling standalone runtimes", () => {
-    const workflow = readFileSync(join(repoRoot, ".github", "workflows", "cli-e2e.yml"), "utf8");
+    const workflow = readFileSync(
+      join(repoRoot, ".github", "workflows", "cli-e2e.yml"),
+      "utf8",
+    ).replaceAll("\r\n", "\n");
     const e2eSource = readFileSync(join(repoRoot, "tests", "integration", "cli.e2e.ts"), "utf8");
 
+    expect(workflow.match(/- "tests\/cli\.bun-runtime-resolver\.test\.ts"/g)).toHaveLength(2);
+    expect(workflow).toContain("Verify Windows Bun runtime resolution");
+    expect(workflow).toContain("bun test tests/cli.bun-runtime-resolver.test.ts");
     expect(workflow).toContain("Verify isolated Windows source-only runtime startup");
     expect(workflow).toContain(
       '--test-name-pattern "boots (packaged Windows runtime|every Windows service)"',
