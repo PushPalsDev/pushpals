@@ -1,60 +1,90 @@
-# RemoteBuddy Queue Monitoring Expectations (`queue.monitoring`)
+# Monitoring RemoteBuddy queues
 
-_Last updated: 25 February 2026 — codifies the live signals, alert thresholds, and remediation flow everyone on RemoteBuddy Platform must follow._
+PushPals exposes queue health through Server's JSON APIs and the client System, Requests, and Jobs views. The repository does not ship a metrics exporter, dashboards, alert rules, paging integration, or chat-ops automation.
 
-Use this doc when you are staring at Grafana, Alertmanager, or `/system/status` and need a quick reference for what "healthy" means, when to page, and what to try first. Pair it with `queue.md` (broader guidance) and `queue-health.md` (restart-focused runbook) for deeper detail.
+Use `GET /system/status` as the primary snapshot. The examples assume the default Server URL:
 
-## Core Metrics to Track Every 5 Minutes
+```bash
+curl -sS http://127.0.0.1:3001/system/status
+```
 
-| Metric                                               | Healthy Range                        | Surface / How to Pull                                                                               | Why it matters                                                                                                 |
-| ---------------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `queue_p95` (RemoteBuddy request queue wait)         | 0.7 s–0.9 s baseline, ≤1.0 s SLO     | Grafana › RemoteBuddy Queue Overview (`queue_p95` panel), `/system/status.slo.requests.queueWaitMs` | Primary SLO indicator; rising trends hint at worker starvation or upstream slowness.                           |
-| Interactive backlog (`requests.pending.interactive`) | < 40 requests, ≤2 min oldest request | Grafana backlog panel, `/system/status.queues.requestPendingSnapshot.interactive`                   | Direct impact on user-facing latency; determines when to throttle background lanes.                            |
-| Background/eval backlog                              | < 80 combined, ≤5 min oldest         | Same panel + API snapshot                                                                           | Swells silently; pausing these lanes protects interactive work.                                                |
-| Job queue depth (`queues.jobPendingSnapshot`)        | Spikes cleared in < 3 min            | `/system/status` (job snapshot), WorkerPals Ops board                                               | Detects job stuck loops or scheduling gaps even when request backlog looks normal.                             |
-| Worker idle slots per lane                           | ≥3 interactive, ≥1 background        | `/workers`, WorkerPals dashboard, worker logs                                                       | Ensures the planner can immediately claim work; anything lower means add capacity or investigate hung workers. |
-| Worker error rate (`job_failure_rate`)               | ≤0.2 sustained                       | Grafana › WorkerPals Job Outcomes (`job_failure_rate` panel)                                        | Rising failures reduce effective capacity and precede queue inflation.                                         |
+On PowerShell, use `curl.exe` if `curl` resolves to `Invoke-WebRequest`.
 
-Always capture Grafana + `/system/status` snapshots before intervening so you can prove whether actions helped and so later handoffs stay grounded in data.
+## Built-in status fields
 
-## Alert Thresholds and Expectations
+| JSON path                                        | Meaning                                                                                                                       |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `runtime.uptimeMs`                               | Age of the current Server process. A recent value helps distinguish a cleared in-memory view from a persistent queue problem. |
+| `runtime.reconciliation`                         | Results of guarded lifecycle reconciliation work. Inspect errors before changing queue state.                                 |
+| `workers.online`, `workers.busy`, `workers.idle` | WorkerPal capacity using the route's online TTL, 15 seconds by default.                                                       |
+| `queues.requests`                                | Request counts by lifecycle status.                                                                                           |
+| `queues.requestPriorities`                       | Active request counts in `interactive`, `normal`, and `background`.                                                           |
+| `queues.requestPendingSnapshot`                  | Up to ten claimable requests in claim order, with `id`, `priority`, `position`, and estimated `etaMs`.                        |
+| `queues.jobs`                                    | Job counts, including `pending`, `claimed`, `finalizing`, and terminal states.                                                |
+| `queues.jobPriorities`                           | Active job counts by priority.                                                                                                |
+| `queues.jobPendingSnapshot`                      | Up to ten claimable jobs in scheduler order, including `workClass`, `queueDeadlineAt`, and `deadlineMissed`.                  |
+| `queues.completions`                             | SourceControlManager completion counts.                                                                                       |
+| `queues.publication`                             | Finalization/publication backlog and age information.                                                                         |
+| `queues.repositoryAgentHealth`                   | RepositoryAgent counts, stale claims, delayed retries, deadline failures, and its computed `unhealthy` flag.                  |
+| `queues.workerPrBacklog`                         | Open, merged, and closed-unmerged PR projection from persisted jobs/provider feedback.                                        |
+| `slo.requests`                                   | 24-hour terminal count, success rate, duration, and queue-wait summaries for projected request outcomes.                      |
+| `slo.jobs`                                       | 24-hour terminal/no-change/failure counts, deadline misses, and duration/queue-wait summaries.                                |
+| `autonomy`                                       | Autonomy safety, activity, failure, queue, and dispatch signals.                                                              |
+| `repo`                                           | Cached repository identity/status summary.                                                                                    |
 
-| Signal                      | Warning channel / trigger                                                      | Paging trigger                                                                 | Immediate expectation                                                             |
-| --------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| `queue_p95` (15 min rollup) | ≥1.5 s for 2 min → Grafana `queue_p95_spike_warning` posts in `#pushpals-ops`. | ≥2.0 s for 5 min → PagerDuty **RemoteBuddy Platform** incident + Slack mirror. | Acknowledge ≤5 min, post status thread, begin remediation workflow below.         |
-| Interactive backlog         | >40 requests for 3 polls → Slack reminder.                                     | >60 requests or any request >10 min old → PagerDuty page.                      | Throttle/stop background submissions immediately, note ticket IDs deferred.       |
-| Worker idle slots           | <2 idle workers per lane for 3 polls → Slack ping `@workerpals-oc`.            | ≤1 idle worker overall for 5 min → WorkerPals Runtime page.                    | Launch additional WorkerPals pools or restart hung workers.                       |
-| `job_failure_rate`          | ≥0.3 for 5 min → Grafana note in `#pushpals-ops`.                              | ≥0.4 → WorkerPals Runtime secondary page.                                      | Capture failing job IDs/logs and prep restarts before retriggering queue traffic. |
+Percentile objects use `{ p50, p95, avg, sampleSize }` in milliseconds. When there are no samples, values are `null`; do not interpret `null` as zero latency.
 
-- **Acknowledgement discipline:** All alerts hitting `#pushpals-ops` get an acknowledgement emoji + thread reply within 5 minutes. Paging alerts require PagerDuty ack and a thread status post (timestamp, owner, next update time).
-- **Escalation ladder:** RemoteBuddy Platform → WorkerPals Runtime → Reliability Lead. Use `/pd escalate` if remediation stalls or queue_p95 ≥2.0 s for >10 minutes after initial actions.
+## Focused reads
 
-## Troubleshooting + Remediation Workflow
+Use the narrow endpoints when the combined snapshot shows a problem:
 
-1. **Validate telemetry** (0–3 min)
-   - Refresh Grafana (Queue Overview + Worker Backends) and `/system/status`. Pin screenshots + JSON in the alert thread.
-   - Confirm idle worker counts and backlog per lane; avoid acting on stale points.
-2. **Stabilize demand** (3–5 min)
-   - Pause or throttle background/eval submissions via LocalBuddy Admin or `throttle set background hard`. Document when throttles start.
-   - For interactive-only spikes, coordinate with product support before deferring any sessions.
-3. **Recover capacity** (5–10 min)
-   - Launch/scale WorkerPals: `bun run workerpals:only[:docker]` until each lane regains ≥ documented idle slots.
-   - Restart unhealthy workers or pods (`--drain` then relaunch) if logs show hung tasks or wrapper timeouts.
-4. **Clear stuck jobs** (10–15 min)
-   - Inspect `queues.jobPendingSnapshot` for items retrying >3 times; requeue or rebuild them.
-   - Use `/requests/:id` admin PATCH to fail obsolete requests so fresh work can start.
-5. **Check dependencies** (parallel while above runs)
-   - Grafana Worker Backends latency: if upstream OpenAI/storage is slow, flip simple planners to `requires_worker=false` so critical jobs keep capacity.
-   - Confirm server APIs (`bun run server:only -- --health`) respond within normal latency.
-6. **Verify + document** (after metrics recover)
-   - Ensure `queue_p95` ≤1.0 s, backlog within limits, worker idle restored. Post updated screenshots + `/system/status` excerpt.
-   - Track everything in PagerDuty notes + Slack: what changed, when throttles lift, who owns any follow-up.
+```bash
+curl -sS "http://127.0.0.1:3001/requests?status=pending&limit=50"
+curl -sS "http://127.0.0.1:3001/jobs?status=all&limit=50"
+curl -sS "http://127.0.0.1:3001/workers?ttlMs=15000"
+curl -sS "http://127.0.0.1:3001/workers/autoscale?ttlMs=15000"
+curl -sS "http://127.0.0.1:3001/completions?status=all&limit=50"
+curl -sS "http://127.0.0.1:3001/jobs/JOB_ID/logs?limit=200"
+curl -sS "http://127.0.0.1:3001/jobs/JOB_ID/tool-runs?limit=100"
+curl -sS "http://127.0.0.1:3001/jobs/JOB_ID/diagnostics"
+```
 
-## Rapid Verification Checklist (Run Twice: immediately + 10 min later)
+`GET /requests/:id` is available for exact request state. There is no corresponding `GET /jobs/:id`; select the job from `GET /jobs` and use its narrow log/tool/diagnostic routes.
 
-1. `queue_p95` ≤1.0 s, `job_failure_rate` ≤0.2, backlog per lane back under guardrails.
-2. `/system/status` shows no pending interactive requests older than 2 minutes; `queues.jobPendingSnapshot` stable.
-3. Worker logs are clean (no crash loops, wrapper timeouts) for two claim cycles.
-4. Synthetic probe `probe.queue_lowload` stays <650 ms and no new autonomy `sig_queue_health` requests trigger.
+## Health interpretation
 
-If any check fails, repeat the remediation workflow from the relevant step (capacity, job clearing, dependency verification) and update the incident thread before closing alerts.
+Do not alert on a fixed universal latency threshold. Compare observations with each row's configured budget and with recent load:
+
+- Request queue defaults: 20 seconds interactive, 90 seconds normal, 240 seconds background.
+- `requestPendingSnapshot[].etaMs` is a scheduling estimate derived from priority and position, not a measured completion ETA.
+- `jobPendingSnapshot[].deadlineMissed=true` is stronger evidence than queue depth alone.
+- Rising `pending` with no active RemoteBuddy claim suggests the planner is absent or cannot reach Server.
+- Rising jobs with zero online workers suggests WorkerPal startup/capacity failure.
+- `finalizing` jobs with pending or claimed completions belong to the SourceControlManager stage, not RemoteBuddy.
+- A high `slo.*.queueWaitMs.p95` is historical over the last 24 hours of terminal rows. It does not prove the current head of queue is stuck.
+- `workers.idle=0` is not automatically unhealthy if workers are busy and work is progressing. Correlate it with log timestamps and queue deadlines.
+
+The autonomy alert thresholds in `[remotebuddy.autonomy]` feed autonomy's own evidence and gating. They do not configure an external alerting system.
+
+## Event and log signals
+
+RemoteBuddy publishes status, assistant, task, and job-related events to the configured Server session. Clients can consume the session's SSE or WebSocket stream with a cursor. Service stdout/stderr remains the authoritative source for planner and worker-spawn failures.
+
+Useful RemoteBuddy log prefixes include:
+
+```text
+[RemoteBuddy] Planning request ...
+[RemoteBuddy] Planner output: ...
+[RemoteBuddy] Worker autoscaler (...)
+[RemoteBuddy] Spawning WorkerPal ...
+[RemoteBuddy] Job enqueue outcome is ambiguous ...
+[RemoteBuddy] Poll error: ...
+[RemoteBuddySupervisor] RemoteBuddy exited ...
+[RepositoryAgent] ...
+```
+
+HTTP polling routes are intentionally omitted from normal Server logs unless debug HTTP logging is enabled. Their absence from ordinary Server output is not evidence that polling stopped.
+
+## External monitoring
+
+An installation may export these JSON fields into its own monitoring stack. If it does, document the exporter, dashboard names, alert thresholds, and escalation ownership in deployment-specific operations documentation. Do not place those assumptions in this repository unless the integration and its configuration are checked in.

@@ -1,8 +1,9 @@
 # PushPals Documentation
 
-The `docs` directory is the right place for a project wiki. It does not need to be renamed to `wiki`.
-
-This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base for onboarding, architecture, and operations.
+This repository uses `docs/wiki/` as the canonical, structured knowledge base
+for onboarding, architecture, and operations. The publish workflow copies that
+directory to the GitHub wiki; update `docs/wiki/` rather than a published or
+root-level wiki copy.
 
 ## Maintainer References
 
@@ -18,7 +19,7 @@ This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base
 - `docs/wiki/02-runtime-architecture.md` - End-to-end runtime architecture and queues
 - `docs/wiki/03-configuration-and-environments.md` - Config model (`.env` + TOML) and environment strategy
 - `docs/wiki/04-server-control-plane.md` - Server internals and persistence model
-- `docs/wiki/05-localbuddy.md` - LocalBuddy behavior and request ingress
+- `docs/wiki/05-localbuddy.md` - Optional LocalBuddy fast ingress and routing
 - `docs/wiki/06-remotebuddy.md` - RemoteBuddy planner and autonomy loop
 - `docs/wiki/07-workerpals.md` - Worker execution, Docker isolation, and backend model
 - `docs/wiki/08-source-control-manager.md` - Integration pipeline and merge orchestration
@@ -26,6 +27,7 @@ This repository now uses `docs/wiki/` as a structured, wiki-style knowledge base
 - `docs/wiki/10-shared-packages-and-protocol.md` - `packages/shared` and `packages/protocol`
 - `docs/wiki/11-prompts-llm-and-safety.md` - Prompting strategy, structured outputs, and guardrails
 - `docs/wiki/12-operations-testing-and-roadmap.md` - Startup, operations, testing, and future roadmap
+- `docs/wiki/13-repository-agent-and-memory.md` - Brokered repository analysis and evidence-backed shared memory
 
 ## Maintenance Notes
 

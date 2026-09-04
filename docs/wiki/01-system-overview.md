@@ -16,7 +16,8 @@ The design goal is not just "generate code". The goal is:
 PushPals runs two modes in one architecture:
 
 - Human-guided mode:
-  - A user sends prompts from UI.
+  - A user sends prompts from CLI, Expo, or VS Code directly to the Server
+    session ingress. LocalBuddy is a separate optional fast-ingress path.
   - The system plans and executes with bounded scope.
 - Autonomous mode:
   - `RemoteBuddy` periodically proposes bounded maintenance objectives.
@@ -33,7 +34,7 @@ Both modes end up in the same request/job/completion queues so behavior is visib
 - `packages/cli`
   - Repo-aware terminal client and packaged runtime supervisor.
 - `apps/localbuddy`
-  - Fast ingress endpoint (`POST /message`) and lightweight handling.
+  - Optional fast ingress endpoint (`POST /message`) and lightweight handling.
 - `apps/server`
   - Shared control plane: sessions, events, queues, RepositoryAgent broker, shared memory, and autonomy endpoints.
 - `apps/remotebuddy`
@@ -71,7 +72,10 @@ These assumptions should remain true unless we intentionally redesign the platfo
 
 - Requests and jobs are queue-mediated, not direct ad-hoc calls.
 - RepositoryAgent work uses its own durable, leased queue; callers never call its RemoteBuddy host or database directly.
-- Event history is replayable for session recovery.
+- Event history is durable and cursor-replayable for session recovery. A new
+  SSE/WS connection currently replays at most 1,000 persisted events after its
+  cursor before switching to live delivery, so clients should retain and
+  advance cursors continuously.
 - Execution and integration are separate responsibilities.
 - Worker execution is isolated to a per-job repo worktree/sandbox; planning scope metadata guides relevance and review rather than acting as a filesystem write boundary.
 - RepositoryAgent output is advisory. Deterministic policy, validation, execution, review, and publication gates remain authoritative.
@@ -87,7 +91,9 @@ These assumptions should remain true unless we intentionally redesign the platfo
 ## What "Good" Looks Like In This Codebase
 
 - Deterministic contracts where possible (`protocol`, JSON schemas, typed queues).
-- Explicit scope constraints for writes (`target_paths`, `write_globs`, max files).
+- Explicit, normalized scope metadata (`target_paths`, `write_globs`, max
+  files) for planning and review, followed by diff and quality checks. This
+  metadata is guidance, not a filesystem sandbox.
 - Recoverability first (SQLite persistence, replay cursors, stale-claim sweeps, worktree isolation).
 - Operational guardrails (timeouts, retry limits, lock leasing, startup preflights).
 

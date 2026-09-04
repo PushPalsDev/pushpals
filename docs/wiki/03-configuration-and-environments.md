@@ -5,7 +5,7 @@
 PushPals intentionally uses a layered config model:
 
 - TOML for stable, typed runtime behavior.
-- `.env` for deployment wiring and secrets.
+- `.env` for process wiring and secrets.
 - A single shared config loader (`packages/shared/src/config.ts`) to normalize both.
 
 This is the main abstraction boundary that prevents downstream code churn when config keys move between TOML and env.
@@ -16,12 +16,25 @@ This is the main abstraction boundary that prevents downstream code churn when c
    - baseline defaults for all services.
 2. `configs/<profile>.toml`
    - profile-specific overrides (via `PUSHPALS_PROFILE`).
-3. `configs/local.toml`
+3. `configs/local.example.toml`
+   - checked-in active baseline and starter configuration.
+4. `configs/local.toml`
    - machine-local, gitignored overrides.
-4. `.env`
-   - URLs, tokens, API keys, deployment wiring.
-5. CLI flags
+5. Environment variables
+   - final typed overrides, including values loaded from `.env` by Bun or the
+     runtime launcher.
+6. CLI/entrypoint flags
    - final runtime overrides for service entrypoints.
+
+The order above is last-wins. `configs/local.example.toml` is not passive
+sample text: `loadPushPalsConfig` always merges it when present, even if
+`configs/local.toml` has not been created. Copying the example creates an
+editable machine-local layer; it does not activate the example values for the
+first time.
+
+The shared loader reads `process.env`; it does not parse `.env` itself. Root
+scripts and package entrypoints arrange for `.env` to be loaded before calling
+the loader.
 
 ## Env vs TOML Decision Rule
 
@@ -34,7 +47,7 @@ Use TOML for:
 Use `.env` for:
 
 - secrets and tokens,
-- deployment-specific endpoints,
+- machine/process-specific endpoints,
 - CI/runtime wiring that should not be committed.
 
 ## Why This Design Works
@@ -111,6 +124,13 @@ Keep secrets out of TOML and in `.env` or secret stores:
 - git/github tokens.
 
 The repository templates (`.env.example`, `configs/local.example.toml`) are intentionally non-secret.
+
+PushPals currently operates as a loopback-only local system. Configured hosts
+and service URLs are normalized to `127.0.0.1`, browser CORS is limited to
+loopback origins, and the general `PUSHPALS_AUTH_TOKEN` is deliberately ignored.
+Do not rely on bearer authentication to isolate one local process from another.
+This does not replace narrower integrity controls such as fenced queue leases
+and SCM repair-authority proofs.
 
 ## Common Misconfiguration Symptoms
 

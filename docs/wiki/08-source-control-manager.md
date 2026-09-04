@@ -70,6 +70,12 @@ ReviewAgent uses score-only gating:
 
 The LLM may provide other fields, but merge/reject policy is controlled by threshold comparison in SCM.
 
+The current poller marks an unchanged PR revision as reviewed and skips further
+action when its provider diff is empty or exceeds 300,000 characters. It does
+not comment, merge, close, or enqueue repair for that revision; the PR becomes
+eligible again only when its head/base fingerprint changes or another explicit
+force condition applies. Operators must handle those skipped PRs manually.
+
 ## Git Backend and Auth Resolution
 
 SCM token resolution is centralized via shared git backend logic (`packages/shared/src/git_backend.ts`):
@@ -148,6 +154,14 @@ Review-fix and merge-conflict jobs derive validation from the target
 repository's changed paths and nearest manifests. They do not assume PushPals'
 package manager or test command.
 
+Trusted-host validation is a trust boundary, not an OS sandbox. SCM parses
+allowlisted commands without a shell, proves the candidate SHA and clean tree
+around each command, and enforces process-tree deadlines. Permitted package
+scripts can nevertheless execute candidate-controlled repository code on the
+host, with only narrowly sensitive PushPals authority removed from the child
+environment. Enable trusted-host commands only for repositories and candidates
+allowed to run under the SCM process identity.
+
 ## Debugging Checklist
 
 1. Confirm completion claim + check pass logs in SCM.
@@ -155,6 +169,12 @@ package manager or test command.
 3. Confirm ReviewAgent threshold and score log line.
 4. If rejected, confirm fix job enqueue and session/task/job events.
 5. If approved, confirm approval comment, merge result, and branch-delete log.
+
+`--dry-run` is discovery-only, but the current loop still claims a Server
+completion before skipping processing. It does not explicitly release that
+claim; Server returns it to pending after lease expiry. Do not leave a dry-run
+SCM polling against a live completion queue because it can repeatedly delay
+real publication.
 
 ## Tradeoffs
 

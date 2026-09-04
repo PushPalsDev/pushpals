@@ -26,6 +26,10 @@ Important files:
 
 Design goal: every service can validate inbound/outbound payloads against the same source.
 
+The current wire version is `0.1.0`. `packages/protocol/src/a2a/` contains
+mapping/design scaffolding only; PushPals does not currently expose an A2A
+transport or Server endpoints.
+
 ## `packages/shared`
 
 `packages/shared` contains cross-cutting infrastructure that should not be duplicated in apps.
@@ -69,7 +73,13 @@ Each backend service constructs one inert `RepositoryAgentServiceClients` bundle
 
 `MemoryStore` is independent of RepositoryAgent and can be used by any service. It provides `put`, `get`, `search`, `invalidate`, `reinforce`, `prune`, and `close`. Records have an explicit scope, stable key, typed value, evidence, original provenance, confidence/usefulness, revision, status, expiry, and bounded outcome-observation history. The in-memory and SQLite implementations run through the same conformance suite.
 
-Use the bundle's `memoryStore` (a `MemoryHttpClient` by default) from service processes. Server is the only runtime owner of durable memory SQLite. Direct database access from callers would bypass validation and compare-and-set semantics and create cross-process contention.
+Use the bundle's `memoryStore` (a `MemoryHttpClient` by default) from service
+processes. Server is the only runtime owner of durable memory-table behavior;
+direct memory-table access would bypass validation and compare-and-set
+semantics. RemoteBuddy currently has a separate, narrow layering exception: it
+opens the shared database and issues `SELECT` queries against `jobs` for worker
+resolution and recent planning context. It still performs queue and memory
+mutations through Server.
 
 RepositoryAgent is one consumer: it stores an exact cache separately from longer-lived evidence-backed facts. Memory references declare whether they identify an analysis cache, newly verified fact, or recalled fact. Other services may consume or reinforce memory only through the interface and should derive outcome reinforcement from authoritative job, review, validation, or publication results rather than model self-assessment. Delivery outcomes train analysis usefulness without incorrectly treating an execution failure as contradictory repository evidence.
 

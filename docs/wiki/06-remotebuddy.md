@@ -11,7 +11,7 @@ It owns:
 - deciding lane (`deterministic` vs `worker`),
 - emitting assistant/task/job status events,
 - enqueueing executable jobs for WorkerPals,
-- maintaining durable planning memory for the repository.
+- maintaining durable planning memory for the repository,
 - physically hosting the worker for the logical, cross-service RepositoryAgent capability.
 
 It does not own:
@@ -31,7 +31,8 @@ The request handoff is `claimed request + planning context -> sanitized plan -> 
 - `apps/remotebuddy/src/command_policy.ts` and `path_targeting.ts` - validation and repository targeting.
 - `apps/remotebuddy/src/memory.ts` - memory backend interface, noop/in-memory/composite backends.
 - `apps/remotebuddy/src/persistent_memory.ts` - SQLite-backed persistent memory backend.
-- `apps/remotebuddy/src/idempotency.ts` - replay-safe duplicate suppression.
+- `apps/remotebuddy/src/idempotency.ts` - legacy compatibility store; the
+  current polling path constructs it but does not invoke it.
 - `apps/remotebuddy/src/worker_spawn.ts` - managed WorkerPal launch commands.
 - `apps/remotebuddy/src/autonomous_engine.ts` - bounded autonomous objective dispatch.
 - `apps/remotebuddy/src/repository_agent.ts` - read-only RepositoryAgent worker, evidence checks, cache/fact use, and leased polling.
@@ -52,7 +53,14 @@ RemoteBuddy starts one bounded worker that:
 
 The before/after snapshot fence catches repository drift and unintended writes. Repository content, recalled memory, and tool output are treated as untrusted evidence rather than instructions. Results and validation commands are proposals; the calling service's deterministic policy and validation gates remain authoritative.
 
-RepositoryAgent availability must not deadlock RemoteBuddy's ordinary request loop. The typed client applies bounded HTTP and overall polling deadlines. Autonomy currently falls back to bounded legacy ideation when repository assistance is unavailable or malformed; safety-critical callers should instead fail closed or use an existing deterministic path.
+RepositoryAgent availability must not deadlock RemoteBuddy's ordinary request
+loop. The typed client applies bounded HTTP and overall polling deadlines. In
+the normal RepositoryAgent-enabled autonomy path, an unavailable, timed-out,
+malformed, or empty result leads directly to bounded deterministic repo/vision
+candidates without a second model call. A composition with no RepositoryAgent
+capability can still use the older bounded ideation path. Safety-critical
+callers fail closed unless an existing deterministic path is independently
+safe.
 
 Codex-backed analysis never runs with the target repository as its working directory. It runs in a disposable neutral Git repository with project instructions, user rules, shell, apps, and web access disabled. HTTP completion backends receive the same evidence-only request and ignore the Codex execution hint.
 
@@ -150,8 +158,9 @@ longer blocks ideation by itself when another online worker is safely idle.
 Before scoring, autonomy removes candidates whose normalized targets overlap
 open or recently completed objectives. The same exclusions are included in the
 ideation prompt, so prompt variations cannot repeatedly spend scoring tokens on
-one file or directory. A timed-out ideation request receives one compact retry
-with a 30-second ceiling.
+one file or directory. On the compatibility path with no RepositoryAgent, a
+timed-out legacy ideation request receives one compact retry with a 30-second
+ceiling; a late RepositoryAgent failure does not start that retry.
 
 Dispatch uses a durable fenced handoff: RemoteBuddy first persists a `gated`
 objective, then enqueues an unclaimable provisional request with the

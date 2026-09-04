@@ -1,26 +1,22 @@
-# PushPals Chat Screen
+# PushPals Expo Routes
 
-This directory contains the Chat screen used by the PushPals client. The app opens directly to a single-screen chat experience.
+This directory contains the Expo Router entry points. `index.tsx` is the
+mission-control dashboard, not a standalone chat demo.
 
-How it works
+The dashboard:
 
-- `app/index.tsx` — Chat UI wired to `usePushPalsSession(baseUrl)`.
-- Messages are displayed as bubbles. Sending a message calls `session.send(text)` and appends a local user bubble immediately.
-- Incoming server events (EventEnvelope) are mapped to assistant/system bubbles and deduplicated by envelope id.
+- joins the configured Server session through `usePushPalsSession`;
+- sends chat directly to `POST /sessions/:id/message`;
+- consumes cursor-framed Server events over SSE on web or WebSocket on native;
+- polls request, job, completion, worker, autonomy, question, configuration,
+  and system-health snapshots;
+- presents Coordination, Chat, Requests, Jobs & Traces, System, and Config
+  views.
 
-Configuration
+`_layout.tsx` owns Expo navigation setup. `modal.tsx` is retained from the Expo
+route scaffold and is not part of the PushPals control-plane workflow.
 
-- The client uses `EXPO_PUBLIC_PUSHPALS_URL` (env) or falls back to `http://localhost:3001`.
-- For device/emulator testing, replace the base URL with your machine's LAN IP if necessary.
-
-Run
-
-Use the existing scripts from the root package.json:
-
-```bash
-# Start server
-bun --cwd apps/server dev
-
-# Start client (Expo)
-bun --cwd apps/client start
-```
+From the repository root, use `bun run client` to build the protocol package
+and start Expo, or `bun run start` for the preflighted full stack. Runtime URL
+and session selection are documented in the parent
+[`README.md`](../README.md).

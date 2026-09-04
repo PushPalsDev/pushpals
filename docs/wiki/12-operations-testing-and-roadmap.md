@@ -21,6 +21,8 @@ Useful alternatives:
 
 ## Fast Runbook Commands
 
+- Primary Bun suite:
+  - `bun run test`
 - Full stack with preflights:
   - `bun run start`
 - Full stack without preflight wrapper:
@@ -29,6 +31,12 @@ Useful alternatives:
   - `bun run test:integration`
 - Eval harness:
   - `bun run test:integration:eval`
+- Focused runtime end-to-end suites:
+  - `bun run test:cli:e2e`
+  - `bun run test:workerpals:e2e`
+  - `bun run test:start:e2e`
+- Consolidated reliability contract:
+  - `bun run harness:reliability`
 - VS Code extension package/lint:
   - `bun run vscode:client:lint`
   - `bun run vscode:client:package`
@@ -37,10 +45,18 @@ Useful alternatives:
 
 Baseline tooling:
 
-- Bun
+- Bun 1.3.14+
+- Node.js 20+ for the npm-installed CLI launcher
 - Python 3.12+
 - Docker (for default worker flow)
 - Git (and optionally GitHub CLI for PR workflows)
+
+The source-checkout `bun run start` path launches the Server, RemoteBuddy, a
+Docker WorkerPal, SourceControlManager, and the offline-capable Expo client;
+LocalBuddy is added only while `localbuddy.enabled=true`. The CLI packages the
+same responsibilities differently: non-Windows hosts use release binaries,
+while Windows launches embedded source bundles. VS Code uses that installed
+CLI runtime-only path for repositories that are not PushPals source checkouts.
 
 ## Logging and Debugging
 
@@ -73,10 +89,31 @@ pauses remain hard limits until their rolling window recovers.
 
 ## Testing Layers
 
-- Unit/integration tests (TypeScript + Python harnesses).
+- Primary root suite:
+  - `bun run test` runs prompt-policy enforcement, `bun test tests`, and the
+    standalone protocol integration script.
+  - It does not discover tests colocated under `apps/**/src` or Python backend
+    unit tests.
+- Colocated/service checks:
+  - `bun run vscode:client:test`
+  - `bun --cwd apps/localbuddy test`
+  - `bun test apps/remotebuddy/src`
+  - `bun run protocol:typecheck`
+  - `bun run vscode:client:lint`
+- Python backend unit tests are executable directly:
+  - `python apps/workerpals/src/backends/shared/test_settings_resolver.py`
+  - `python apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py`
+  - `python apps/workerpals/src/backends/openhands/test_openhands_runtime_paths.py`
 - End-to-end integration harness:
   - `tests/integration/integration_controller.py`
   - `tests/integration/test_workerpals_e2e.py`
+- Reliability contract:
+  - `scripts/reliability-harness.ts` runs the failure-evidence,
+    durable-lifecycle, repair-orchestration, and runtime-boundary phases.
+  - Linux dependency-projection/container checks and the Windows-host/Linux-
+    container worktree boundary are opt-in; use
+    [`docs/reliability-harnesses.md`](../reliability-harnesses.md) for the exact
+    environment flags.
 - Eval scenarios:
   - `tests/integration/eval_scenarios.swebench_like.json`
 
@@ -116,7 +153,8 @@ Cons:
 
 4. Autonomy quality
 
-- objective outcome attribution loops,
+- clearer operator-visible explanations for existing objective outcome and
+  RepositoryAgent feedback attribution,
 - model/prompt benchmark gating before production rollout.
 
 5. Platform hardening

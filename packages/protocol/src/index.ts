@@ -6,11 +6,14 @@ export type {
   EventType,
   EventPayload,
   EventTypePayloadMap,
+  ClientRegistration,
+  CreateSessionRequest,
   CreateSessionResponse,
   MessageRequest,
   MessageResponse,
   ApprovalDecisionRequest,
   ApprovalDecisionResponse,
+  SessionEventFrame,
   CommandRequest,
   CommandResponse,
 } from "./types";
@@ -21,5 +24,6 @@ export {
   validateApprovalDecisionRequest,
   validateApprovalDecisionResponse,
   validateCommandRequest,
+  validateSessionEventFrame,
   type ValidationResult,
 } from "./validate";

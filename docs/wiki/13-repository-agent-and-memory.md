@@ -66,7 +66,12 @@ A result carries:
 - exact-cache metadata,
 - memory references and completion time.
 
-The shared client sanitizes request and response shapes, caps payload sizes, requires exact positive acknowledgements, supports bearer authentication, and distinguishes invalid input, abort, timeout, transport, HTTP, malformed-response, and remote terminal errors.
+The shared client sanitizes request and response shapes, caps payload sizes,
+requires exact positive acknowledgements, can attach a bearer header for API
+compatibility, and distinguishes invalid input, abort, timeout, transport,
+HTTP, malformed-response, and remote terminal errors. The current loopback-only
+Server deliberately sets its general auth token to `null`, so that bearer
+option is not a security boundary between local processes.
 
 ## Caller Example
 
@@ -145,7 +150,13 @@ Shared memory endpoints:
 - `POST /memory/reinforce`
 - `POST /memory/prune`
 
-Services should normally use `createRepositoryAgentServiceClients` instead of hand-writing these requests. Direct `RepositoryAgentClient` and `MemoryHttpClient` construction remains available for specialized integrations. No service other than Server should open the shared SQLite file.
+Services should normally use `createRepositoryAgentServiceClients` instead of
+hand-writing these requests. Direct `RepositoryAgentClient` and
+`MemoryHttpClient` construction remains available for specialized integrations.
+Server owns all shared-memory table access and queue mutations. RemoteBuddy does
+currently open the same SQLite file to issue two bounded `SELECT` queries over
+`jobs` for failed-worker resolution and recent planning context; this is a
+known layering exception, not a memory-access path.
 
 Every memory request carries typed `x-pushpals-memory-caller` identity. The dedicated hosted worker additionally carries `x-pushpals-memory-authority: repository_agent`; ordinary RemoteBuddy code does not. RepositoryAgent cache, capability-circuit, and fact namespaces require that narrow authority for reads and writes. The worker may reinforce only its own validated cache hit as `confirmed`; authoritative success/failure/contradiction and internal pruning remain Server-owned. Other services retain normal operations in their own namespaces, including scoped pruning, while global pruning requires Server authority. These headers provide an auditable least-privilege boundary between cooperating loopback services, but they are not secrets and cannot defend against a malicious local process that can impersonate another service.
 

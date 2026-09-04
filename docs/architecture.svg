@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="680" viewBox="0 0 1760 680" role="img" aria-labelledby="title description">
+  <title id="title">PushPals runtime architecture</title>
+  <desc id="description">CLI, Expo, and VS Code connect directly to the durable Server control plane. Optional LocalBuddy can answer locally or enqueue a request. RemoteBuddy plans, WorkerPals execute, SourceControlManager validates and publishes, and Server persists lifecycle state in SQLite.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155" />
+    </marker>
+    <style>
+      .title { font: 700 28px Inter, Segoe UI, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 15px Inter, Segoe UI, sans-serif; fill: #475569; }
+      .box-title { font: 700 19px Inter, Segoe UI, sans-serif; fill: #0f172a; text-anchor: middle; }
+      .box-copy { font: 400 14px Inter, Segoe UI, sans-serif; fill: #334155; text-anchor: middle; }
+      .edge-label { font: 600 12px Inter, Segoe UI, sans-serif; fill: #475569; text-anchor: middle; }
+      .note { font: 400 13px Inter, Segoe UI, sans-serif; fill: #334155; }
+      .edge { fill: none; stroke: #334155; stroke-width: 2; marker-end: url(#arrow); }
+      .edge-both { fill: none; stroke: #334155; stroke-width: 2; marker-start: url(#arrow); marker-end: url(#arrow); }
+      .human { fill: #f8fafc; stroke: #64748b; stroke-width: 2; }
+      .surface { fill: #eff6ff; stroke: #2563eb; stroke-width: 2; }
+      .optional { fill: #f8fafc; stroke: #64748b; stroke-width: 2; stroke-dasharray: 8 5; }
+      .authority { fill: #ecfeff; stroke: #0891b2; stroke-width: 3; }
+      .service { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 2; }
+      .trusted { fill: #fff7ed; stroke: #ea580c; stroke-width: 2; }
+      .state { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect width="1760" height="680" fill="#ffffff" />
+  <text class="title" x="40" y="44">PushPals runtime architecture</text>
+  <text class="subtitle" x="40" y="70">Queue-mediated local control plane; deterministic host gates remain authoritative.</text>
+
+  <rect class="human" x="40" y="270" width="130" height="72" rx="14" />
+  <text class="box-title" x="105" y="313">User</text>
+
+  <rect class="surface" x="240" y="115" width="270" height="112" rx="14" />
+  <text class="box-title" x="375" y="151">Primary clients</text>
+  <text class="box-copy" x="375" y="180">Terminal CLI · Expo · VS Code</text>
+  <text class="box-copy" x="375" y="203">Direct Server session ingress</text>
+
+  <rect class="optional" x="240" y="388" width="270" height="112" rx="14" />
+  <text class="box-title" x="375" y="424">LocalBuddy (optional)</text>
+  <text class="box-copy" x="375" y="453">Quick/local read-only answer</text>
+  <text class="box-copy" x="375" y="476">or durable request enqueue</text>
+
+  <rect class="authority" x="630" y="225" width="310" height="162" rx="16" />
+  <text class="box-title" x="785" y="265">Server control plane</text>
+  <text class="box-copy" x="785" y="295">sessions · events · requests · jobs</text>
+  <text class="box-copy" x="785" y="319">completions · workers · autonomy</text>
+  <text class="box-copy" x="785" y="343">RepositoryAgent queue · shared memory</text>
+  <text class="box-copy" x="785" y="367">HTTP + SSE/WS on loopback</text>
+
+  <rect class="state" x="630" y="500" width="310" height="100" rx="14" />
+  <text class="box-title" x="785" y="538">SQLite authority</text>
+  <text class="box-copy" x="785" y="568">outputs/data/pushpals.db · WAL</text>
+
+  <rect class="service" x="1070" y="90" width="290" height="125" rx="14" />
+  <text class="box-title" x="1215" y="127">RemoteBuddy</text>
+  <text class="box-copy" x="1215" y="156">planning · request orchestration · autonomy</text>
+  <text class="box-copy" x="1215" y="180">hosts RepositoryAgent worker</text>
+  <text class="box-copy" x="1215" y="202">vision.md → provisional request → same queue</text>
+
+  <rect class="service" x="1070" y="257" width="290" height="125" rx="14" />
+  <text class="box-title" x="1215" y="294">WorkerPals</text>
+  <text class="box-copy" x="1215" y="323">detached worktree / Docker execution</text>
+  <text class="box-copy" x="1215" y="347">quality loop · immutable candidate commit</text>
+  <text class="box-copy" x="1215" y="369">does not decide publication</text>
+
+  <rect class="trusted" x="1070" y="424" width="290" height="125" rx="14" />
+  <text class="box-title" x="1215" y="461">SourceControlManager</text>
+  <text class="box-copy" x="1215" y="490">trusted validation · ReviewAgent</text>
+  <text class="box-copy" x="1215" y="514">lease-fenced publication and callbacks</text>
+  <text class="box-copy" x="1215" y="536">does not execute the coding job</text>
+
+  <rect class="state" x="1480" y="236" width="240" height="252" rx="14" />
+  <text class="box-title" x="1600" y="275">Git</text>
+  <text class="box-copy" x="1600" y="309">detached worktrees</text>
+  <text class="box-copy" x="1600" y="335">internal candidate refs</text>
+  <line x1="1515" y1="358" x2="1685" y2="358" stroke="#86efac" stroke-width="2" />
+  <text class="box-copy" x="1600" y="390">main_agents integration branch</text>
+  <text class="box-copy" x="1600" y="418">individual or aggregate PR</text>
+  <text class="box-copy" x="1600" y="450">main source of truth</text>
+
+  <path class="edge" d="M 170 292 C 198 258, 210 205, 240 186" />
+  <path class="edge" d="M 170 320 C 200 354, 212 417, 240 437" />
+  <path class="edge-both" d="M 510 171 C 565 171, 582 255, 630 271" />
+  <text class="edge-label" x="570" y="191">message / events</text>
+  <path class="edge" d="M 510 444 C 568 444, 585 365, 630 345" />
+  <text class="edge-label" x="568" y="430">enqueue</text>
+  <path class="edge-both" d="M 785 387 L 785 500" />
+  <text class="edge-label" x="847" y="451">durable state</text>
+  <path class="edge-both" d="M 940 256 C 986 236, 1018 174, 1070 161" />
+  <text class="edge-label" x="1000" y="198">claim / plan</text>
+  <path class="edge-both" d="M 940 306 L 1070 317" />
+  <text class="edge-label" x="1005" y="298">job / logs</text>
+  <path class="edge-both" d="M 940 356 C 990 385, 1018 461, 1070 476" />
+  <text class="edge-label" x="998" y="430">completion / callback</text>
+  <path class="edge" d="M 1360 319 L 1480 319" />
+  <text class="edge-label" x="1420" y="305">candidate ref</text>
+  <path class="edge" d="M 1360 486 C 1410 486, 1428 425, 1480 418" />
+  <text class="edge-label" x="1417" y="470">validated publish</text>
+
+  <rect x="40" y="625" width="1680" height="34" rx="8" fill="#f8fafc" />
+  <text class="note" x="55" y="647">All queue mutations use durable state and fenced leases. Model output proposes work; deterministic identity, policy, validation, review, and publication checks authorize it.</text>
+</svg>

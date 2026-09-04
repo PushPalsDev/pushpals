@@ -1,5 +1,6 @@
-# Copy this file to configs/local.toml for machine-specific, non-secret overrides.
-# Keep secrets in .env (or CI secret store), not in TOML.
+# This checked-in baseline is always merged after the selected profile and
+# before configs/local.toml. Copy only the settings you want to override into
+# configs/local.toml; keep secrets in .env (or a CI secret store), not in TOML.
 
 # Uncomment to enable LocalBuddy when using `bun run start`.
 # The `bun run start` supervisor applies `localbuddy.enabled` changes live.

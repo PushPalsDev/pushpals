@@ -28,7 +28,23 @@ PushPals has three user surfaces with different strengths:
 
 ### Runtime Model
 
-The CLI runs from the current git repository and submits chat through the Server session API. If the local stack is unavailable, it can start the packaged control services and WorkerPal capacity, storing repo attachment state in the repository's Git metadata directory and installed assets under `~/.pushpals/runtime`. `pushpals --clear` removes repo-local PushPals state. The CLI owns terminal interaction and supervision; planning, execution, and publication remain with their runtime services.
+The CLI runs from the current Git repository and submits chat directly through
+`POST /sessions/:id/message`, then streams the session from Server. LocalBuddy
+is not on this common ingress path. If the local stack is unavailable, the CLI
+can start the packaged control services and WorkerPal capacity, storing repo
+attachment state in the repository's Git metadata directory and installed
+assets under `~/.pushpals/runtime`. It rejects a healthy Server attached to a
+different repository.
+
+On non-Windows platforms, packaged auto-start downloads release-tagged service
+binaries. On Windows it skips those standalone downloads and launches the
+embedded source bundles through bounded, isolated launchers. `--runtime-only`
+keeps the supervisor alive without terminal chat, `--status-once` reports
+readiness and exits, and `--clear` stops the repo-affine managed runtime and
+clears its validated state targets, warm containers, and configured WorkerPal
+sandbox image. The CLI also serves the exported Expo
+monitor UI locally when those assets are available. Planning, execution, and
+publication remain with their runtime services.
 
 ## Expo Client (`apps/client`)
 
@@ -44,9 +60,13 @@ The CLI runs from the current git repository and submits chat through the Server
 - "Coordination-first" UI:
   - flow ribbon,
   - queue tiles,
-  - tabbed panes (coordination, chat, requests, jobs, system).
+  - tabbed panes (Coordination, Chat, Requests, Jobs & Traces, System, Config).
 - Session stream drives real-time UI state.
 - Polling snapshots augment event stream for queue/system summaries.
+- System includes autonomy health, inspiration, safety controls, and question
+  actions; Config reads and mutates the runtime configuration through Server.
+- Browser builds use SSE while native builds use WebSocket. The client persists
+  its latest cursor per session and resumes from it on reconnect.
 
 ### Developer Workflow
 
@@ -84,22 +104,35 @@ Cons:
 ### Core Behavior
 
 - Commands to start/stop local stack.
+- Direct Server session chat over WebSocket with a stable per-workspace session
+  ID stored in VS Code global state.
 - Preflight checks:
   - Bun runtime,
   - protocol build,
   - Docker daemon and worker image availability/build.
+- In a PushPals source checkout, starts Server, RemoteBuddy, a Docker
+  WorkerPal, config-enabled LocalBuddy, and optionally SourceControlManager.
+- In any other Git repository, starts the installed CLI as
+  `pushpals --runtime-only` instead of requiring PushPals source files there.
 - Optional include of SourceControlManager in startup profile.
-- Workspace trust gating for stack operations.
+- Workspace trust gates start, stop, and auto-start operations; opening the
+  client panel itself does not require trust.
 
 ### Startup Preconditions
 
-- Workspace root must be the PushPals repo.
-- Required local config files must exist (`.env`, `configs/local.toml`).
-- Bun and Docker must be available for stack orchestration.
+- The workspace must be inside a Git repository.
+- A PushPals source checkout requires Bun 1.3.14+, Docker, `.env`,
+  `configs/local.toml`, and a valid `vision.md` when autonomy is enabled.
+- Other repositories require the configured `pushpals.cliCommand` (or
+  `pushpals`/`pushpals.cmd`) to be installed and available on `PATH`; the
+  installed runtime performs its own preflights.
 
 ### Notable Engineering Detail
 
-The extension scripts use `bunx tsc` / `bunx @vscode/vsce` instead of raw `tsc`/`vsce` binaries so package/lint commands work in environments without global installs.
+The extension scripts use `bunx tsc` / `bunx @vscode/vsce` instead of raw
+`tsc`/`vsce` binaries so package/lint commands work in environments without
+global installs. Its current webview reconnect always requests `after=0`; the
+Server's bounded replay can therefore redisplay recent events after a reconnect.
 
 ### Tradeoffs
 

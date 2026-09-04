@@ -1,7 +1,7 @@
 {
   "name": "@pushpalsdev/cli",
   "version": "0.0.0-dev",
-  "description": "PushPals terminal CLI for LocalBuddy -> RemoteBuddy orchestration",
+  "description": "PushPals terminal client and local multi-service runtime supervisor",
   "license": "MIT",
   "repository": {
     "type": "git",

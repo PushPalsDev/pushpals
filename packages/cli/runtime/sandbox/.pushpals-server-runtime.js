@@ -6520,47 +6520,31 @@ function loadSchema(filename) {
 }
 var envelopeSchema = loadSchema("envelope.schema.json");
 var eventsSchema = loadSchema("events.schema.json");
+var httpSchema = loadSchema("http.schema.json");
 try {
   ajv.addSchema(envelopeSchema, "envelope.schema.json");
   ajv.addSchema(eventsSchema, "events.schema.json");
+  ajv.addSchema(httpSchema, "http.schema.json");
 } catch (_e) {}
 var validateEnvelopeBase = ajv.compile(envelopeSchema);
 var validateEventPayload = ajv.compile(eventsSchema);
 var validateMessageRequestSchema = ajv.compile({
-  type: "object",
-  required: ["text"],
-  properties: {
-    text: { type: "string" },
-    intent: { type: "object", additionalProperties: true }
-  },
-  additionalProperties: false
+  $ref: "http.schema.json#/definitions/MessageRequest"
 });
 var validateMessageResponseSchema = ajv.compile({
-  type: "object",
-  required: ["ok"],
-  properties: {
-    ok: { type: "boolean" }
-  },
-  additionalProperties: false
+  $ref: "http.schema.json#/definitions/MessageResponse"
 });
 var validateApprovalDecisionRequestSchema = ajv.compile({
-  type: "object",
-  required: ["decision"],
-  properties: {
-    decision: {
-      type: "string",
-      enum: ["approve", "deny"]
-    }
-  },
-  additionalProperties: false
+  $ref: "http.schema.json#/definitions/ApprovalDecisionRequest"
 });
 var validateApprovalDecisionResponseSchema = ajv.compile({
-  type: "object",
-  required: ["ok"],
-  properties: {
-    ok: { type: "boolean" }
-  },
-  additionalProperties: false
+  $ref: "http.schema.json#/definitions/ApprovalDecisionResponse"
+});
+var validateCommandRequestSchema = ajv.compile({
+  $ref: "http.schema.json#/definitions/CommandRequest"
+});
+var validateSessionEventFrameSchema = ajv.compile({
+  $ref: "http.schema.json#/definitions/SessionEventFrame"
 });
 function validateEventEnvelope(data) {
   const baseValid = validateEnvelopeBase(data);
@@ -6591,57 +6575,6 @@ function validateApprovalDecisionRequest(data) {
     errors: valid ? undefined : ajv.errorsText(validateApprovalDecisionRequestSchema.errors).split(", ")
   };
 }
-var allEventTypes = [
-  "log",
-  "scan_result",
-  "suggestions",
-  "diff_ready",
-  "approval_required",
-  "approved",
-  "denied",
-  "committed",
-  "assistant_message",
-  "error",
-  "done",
-  "agent_status",
-  "task_created",
-  "task_started",
-  "task_progress",
-  "task_completed",
-  "task_failed",
-  "tool_call",
-  "tool_result",
-  "delegate_request",
-  "delegate_response",
-  "job_enqueued",
-  "job_claimed",
-  "job_completed",
-  "job_failed",
-  "message",
-  "job_log",
-  "status",
-  "autonomy_cycle_started",
-  "autonomy_candidates_generated",
-  "autonomy_objective_dispatched",
-  "autonomy_objective_blocked",
-  "autonomy_feedback_recorded",
-  "question_asked",
-  "question_answered"
-];
-var validateCommandRequestSchema = ajv.compile({
-  type: "object",
-  required: ["type", "payload"],
-  properties: {
-    type: { type: "string", enum: allEventTypes },
-    payload: { type: "object", additionalProperties: true },
-    from: { type: "string" },
-    to: { type: "string" },
-    correlationId: { type: "string" },
-    turnId: { type: "string" },
-    parentId: { type: "string" }
-  },
-  additionalProperties: false
-});
 function validateCommandRequest(data) {
   const valid = validateCommandRequestSchema(data);
   return {

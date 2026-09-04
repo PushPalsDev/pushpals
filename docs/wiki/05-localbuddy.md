@@ -26,6 +26,13 @@ The handoff is intentionally small: `message -> local reply` or `message -> requ
 - `apps/localbuddy/src/local_readonly.ts` - local read-only query handling.
 - `apps/localbuddy/src/request_status.ts` - request/job status response helpers.
 
+`apps/localbuddy/src/planner.ts` and `apps/localbuddy/src/tools.ts` are dormant
+legacy modules: the production entrypoint does not import them. In particular,
+the broad tool registry in `tools.ts` is not an active LocalBuddy capability or
+permission boundary. The composition root also constructs the shared
+RepositoryAgent/memory client bundle for lifecycle consistency, but the current
+LocalBuddy request path does not call either capability.
+
 ## Behavioral Model
 
 When a message arrives, LocalBuddy decides:
@@ -45,8 +52,9 @@ It also supports explicit routing via `/ask_remote_buddy ...`.
   - prefer local response path.
 - Explicit execution prompts or `/ask_remote_buddy`:
   - force RemoteBuddy enqueue path.
-- Ambiguous prompts:
-  - bias toward safe local clarification or explicit routing prompt.
+- Other prompts without an execution cue:
+  - handle locally when they are at most 120 characters,
+  - enqueue longer prompts for RemoteBuddy.
 
 ## Why This Layer Exists
 

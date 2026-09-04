@@ -69,7 +69,8 @@ Important design detail:
 
 - persist first, broadcast second for events.
 
-This guarantees replay correctness after crashes or reconnects.
+This keeps the replay source durable after crashes or reconnects. Transport
+replay is intentionally bounded per connection, as described below.
 
 ## Failure Domains
 
@@ -91,7 +92,12 @@ Two transport options are supported:
 - SSE (`/sessions/:id/events`) with cursor replay (`after` query param).
 - WebSocket (`/sessions/:id/ws`) also cursor-aware.
 
-Client libraries choose transport by environment and fall back with reconnect policies.
+Both transports deliver `{ envelope, cursor }` wrappers. On each new
+connection, Server currently replays at most 1,000 persisted events after the
+requested cursor and then subscribes the connection to live events. Expo and
+CLI clients retain their latest cursors; the current VS Code webview reconnects
+from cursor `0` and can therefore redisplay replayed events. Client libraries
+choose transport by environment and use bounded reconnect policies.
 
 ## Queue Semantics
 
@@ -101,7 +107,11 @@ Requests, jobs, and RepositoryAgent requests support priority tiers:
 - `normal`
 - `background`
 
-Ordering is priority first, then age. Queue stats and SLO summaries are computed from persisted timestamps.
+Request and RepositoryAgent claims sort by priority and then creation time;
+completion claims are FIFO. Job ordering is richer: overdue deadlines come
+first, followed by bounded work-class fairness and remaining deadlines, then
+priority and creation time. Worker affinity also constrains job eligibility.
+Queue stats and SLO summaries are computed from persisted timestamps.
 
 ## Correlation and Traceability
 
@@ -115,7 +125,9 @@ To trace one unit of work end-to-end, follow:
 
 ## Reliability Patterns Used
 
-- Idempotency store in RemoteBuddy to avoid duplicate processing on reconnect.
+- Server-side idempotency keys plus fenced claims and callbacks. RemoteBuddy's
+  local `IdempotencyStore` remains a constructed compatibility object but is not
+  called by the current polling path.
 - Stale-claim recovery sweeps for jobs in Server.
 - Lock lease lifecycle for autonomy dispatch (`acquire`, `renew`, `release`).
 - Fenced RepositoryAgent claim tokens/generations, heartbeats, request deadlines, and stale-claim recovery.

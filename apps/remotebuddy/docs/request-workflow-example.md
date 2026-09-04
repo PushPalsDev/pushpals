@@ -1,59 +1,115 @@
-# RemoteBuddy Request Workflow Example ("Add two more tests")
+# Request workflow example: "Add two more tests"
 
-_Last updated: 25 February 2026 — concrete LocalBuddy → RemoteBuddy → WorkerPals → SourceControlManager lifecycle for a code-change request._
+This walkthrough follows the current durable request-to-publication path. Identifiers and model output are illustrative; route names and ownership match the implementation.
 
-## Scenario setup
+## 1. Ingress
 
-- User asks: “Add two more tests for the new queue maintenance helper.”
-- LocalBuddy is pointed at `server` (`http://localhost:3001`), RemoteBuddy is healthy, WorkerPals have idle worker-lane slots, and SourceControlManager (SCM) + ReviewAgent are watching completions.
-- The request needs repo edits plus validation, so LocalBuddy routes it to RemoteBuddy with `priority = normal` and `queueWaitBudgetMs = 90_000`.
+The Expo client, CLI, or VS Code client first joins a session with `POST /sessions`, then submits:
 
-## End-to-end timeline (Add two more tests)
+```http
+POST /sessions/SESSION_ID/message
+Content-Type: application/json
 
-| #   | Actor / owner                      | Input & queue transition                                                                                                                                                                                          | Output & success criteria                                                                                                             | Failure branch & signal                                                                                                                                                                                                                                                                                                                                                                                        |
-| --- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | LocalBuddy classifier              | Chat payload hits `POST /message` → `POST /requests/enqueue` with repo hash + validation budget. Request enters `requests.normal` queue; SSE stream shows `enqueuing` → `queued (REQ-xxxx)`.                      | Request acknowledged before the 90 s budget; `/status` begins reporting queue position (`queue_p95`, `requests_pending.normal`).      | **Queue/claim timeout**: if queue wait exceeds budget, SSE emits `error`, LocalBuddy retries enqueue once, then surfaces guidance to check [queue.md](./queue.md); alert: `queue_p95_spike_warning`.                                                                                                                                                                                                           |
-| 2   | RemoteBuddy planner                | Server stores request; RemoteBuddy claims it, runs `memory.recallForPlanning`, expands acceptance criteria (“two tests cover success + failure”), scopes `write_globs`, and records plan events (`task_created`). | Structured plan + validation command (`bun test queue-maintenance.test.ts --filter helper`) saved; `job_enqueued` with lane `worker`. | **Validation failure**: planner sanity checks fail → request marked `planning_failed`, alert `remotebuddy_planning_failed`; RemoteBuddy auto-retries once with reduced context, then pages **RemoteBuddy Platform**.                                                                                                                                                                                           |
-| 3   | RemoteBuddy dispatcher             | Produces `task.execute` job, posts to WorkerPal queue (`jobs.worker.pending` +1) with telemetry breadcrumbs (`job_enqueued`).                                                                                     | Job becomes claimable; `/workers` shows pending task; ETA visible in user session timeline.                                           | **Job claim timeout**: if no worker accepts before lease expiry, `job_enqueue_failed` fires and job requeues with exponential backoff (≤3 attempts) before paging **WorkerPals Runtime**.                                                                                                                                                                                                                      |
-| 4   | WorkerPal executor                 | WorkerPal leases job, syncs repo worktree, edits the test file, runs `bun test …`, attaches git diff + stdout/stderr to log stream.                                                                               | `job_completed` emitted with exit status 0, diff uploaded, worker returns to `idle`.                                                  | **Execution/test failure**: non-zero exit triggers `job_failed`, retains diff, increments `job_failure_rate`; RemoteBuddy either auto-schedules a `fix_up` job (≤1 retry) or returns failure to user; >40% failure/5 min pages **WorkerPals Runtime**.                                                                                                                                                         |
-| 5   | SourceControlManager + ReviewAgent | SCM claims completion (`completions.pending` +1), rebases onto tracked branch, runs repo validators (`bun lint apps/remotebuddy`, `bun test` subset), and asks ReviewAgent to score.                              | Passing checks + ReviewAgent approval → SCM merges, publishes merge SHA/PR URL, decrements `completions.pending`.                     | **PR/check failure**: SCM validation fails → `completion_failed` + Slack ping to **SourceControlManager**; job auto-retried once after dependency refresh. **Review rejection**: ReviewAgent posts comments, SCM spawns a `fix_up` request routed back through RemoteBuddy. **Merge conflict**: SCM attempts two auto-rebases; on repeat failure, escalates to SourceControlManager on-call for manual rebase. |
-| 6   | LocalBuddy status helper           | LocalBuddy polls `/status`, sees SCM success, composes final assistant reply linking the merge and summarizing the tests. User can query `/status` later for PR/SHA.                                              | Request marked `completed`; Ops board removes it from backlog overlay.                                                                | **Status drift**: if SCM event missing, `/status` remains `pending`; Ops looks at `/system/status` telemetry and either replays SCM webhook or requeues delivery.                                                                                                                                                                                                                                              |
+{"text":"Add two tests for request-status failure handling."}
+```
 
-## Queue + telemetry touchpoints
+Server validates the message, emits a session `message` event, and enqueues an `interactive` request. The response can include `requestId`, `queuePosition`, and `etaMs`.
 
-- `requests_pending.*` and `queue_p95` expose LocalBuddy intake health; watch ETA budgets for `normal` traffic during spikes.
-- `task_created`, `job_enqueued`, and `jobs_pending.worker` confirm RemoteBuddy queued work; `job_enqueue_failed` highlights missing capacity.
-- `job_logs` streaming + `job_failure_rate` surfacing ≥0.4 for 5 minutes is the WorkerPal error barometer.
-- `completions.pending`, ReviewAgent comment webhooks, and SCM’s `source_control_manager_failure` alerts indicate integration or merge stalls.
-- `/status` + Ops board overlay provide the user-facing heartbeat; discrepancies versus the telemetry above generally mean webhook or notifier lag.
+LocalBuddy is an optional alternative ingress. `POST /message` answers status/read-only/lightweight prompts locally; other prompts, or `/ask_remote_buddy <request>`, are sent to Server's `POST /requests/enqueue`. LocalBuddy is not between the normal clients and Server.
 
-## Failure handling & escalation matrix
+## 2. Planning claim
 
-| Failure mode                                | Automatic response                                                                                                                                           | Retry policy                                                                                                                        | Escalation owner                                                                               |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Queue/claim timeout (LocalBuddy → Server)   | LocalBuddy retries `POST /requests/enqueue` once within the 90 s budget and posts SSE `error` if still unaccepted; `queue_p95_spike_warning` fires in Slack. | Manual requeue allowed immediately after backlog check; defer background/eval traffic per [queue-playbook.md](./queue-playbook.md). | **RemoteBuddy Platform** on-call (`@remote-queue-oc`).                                         |
-| Planner validation failure (RemoteBuddy)    | RemoteBuddy dumps context summary to logs, emits `planning_failed`, and leaves the request pending so it can be retried.                                     | Auto retry once with sanitized recall; additional retries require human review + narrower scope.                                    | **RemoteBuddy Platform**.                                                                      |
-| Job claim timeout (Worker queue saturation) | `job_enqueue_failed` event; dispatcher requeues with exponential backoff (up to 3 claims) while `jobs_pending.worker` alarm watches idle slots.              | After 3 failed claims, RemoteBuddy pauses new worker-lane enqueue for this session until capacity restored.                         | **WorkerPals Runtime** (`@workerpals-oc`).                                                     |
-| Execution/test failure (WorkerPal)          | WorkerPal marks `job_failed`, uploads logs/diff, and RemoteBuddy appends guidance to the session transcript.                                                 | Auto `fix_up` job once if failure is deterministic (tests) and scope < 200 LOC; otherwise waits for user or operator input.         | **WorkerPals Runtime** for systemic spikes; request owner for single failures.                 |
-| PR/check failure (SCM validators)           | SCM logs the command output, marks completion `failed`, notifies session, and retries after refreshing dependencies/tooling.                                 | One automatic rerun (fresh install + cache prune); further attempts need SourceControlManager approval.                             | **SourceControlManager** schedule.                                                             |
-| Review rejection (ReviewAgent)              | ReviewAgent comments on the PR with reasons; SCM tags the session and opens a `fix_up` task routed to RemoteBuddy.                                           | Unlimited fix-up cycles, but each must clear reviewer-provided blockers before retry.                                               | **SourceControlManager** (ensures ReviewAgent feedback resolved).                              |
-| Merge conflict (SCM rebase)                 | SCM attempts two auto-rebases; on failure, it leaves the completion unmerged and tags the session with conflict details.                                     | No automated retries after two failures; rebase locally, push, and re-run SCM.                                                      | **SourceControlManager** with optional help from **RemoteBuddy Platform** if re-plan required. |
-| Status drift / webhook miss                 | `/status` stays `pending`, heartbeat alert fires in Ops board.                                                                                               | Replay SCM webhook or mark request complete manually via admin tooling once verification is done.                                   | Service owning the missing webhook (usually **RemoteBuddy Platform**).                         |
+RemoteBuddy polls `POST /requests/claim` with its fixed agent ID and a three-minute lease. Server returns the next claimable request in priority/FIFO order with a unique claim token and generation.
 
-## Retry quick-reference
+RemoteBuddy immediately starts a 30-second renewal heartbeat and serializes this request behind any planner work already in progress. The corresponding logs resemble:
 
-| Stage                | Automatic attempts                                                                     | When to involve humans                                                                                                            |
-| -------------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| LocalBuddy enqueue   | 1 immediate retry                                                                      | If backlog still > budget after retry, follow queue runbooks and notify RemoteBuddy Platform.                                     |
-| RemoteBuddy planner  | 1 sanitized re-plan                                                                    | Planning fails twice → gather logs, loop in RemoteBuddy Platform before requeueing.                                               |
-| WorkerPal execution  | 1 fix-up rerun when failure is deterministic; 0 when failure is user input / flaky env | If two sequential jobs fail, pause request, inspect logs, and decide whether to re-scope tests or escalate to WorkerPals Runtime. |
-| SCM validation/merge | 1 rerun with clean install + auto-rebase (covers PR/check + merge conflict).           | After rerun fails, SourceControlManager takes over, possibly asks RemoteBuddy for a fresh completion.                             |
+```text
+[RemoteBuddy] Claimed request ...
+[RemoteBuddy] Planning request ... priority=interactive queueWait=...ms
+```
 
-## Linked runbooks and owners
+## 3. Structured plan
 
-- [queue.md](./queue.md) — metrics, alert thresholds, throttling guidance.
-- [queue-health.md](./queue-health.md) + [queue-maintenance.md](./queue-maintenance.md) — WorkerPals + queue remediation.
-- [queue-playbook.md](./queue-playbook.md) — deeper debugging + paging paths.
-- [docs/wiki/06-remotebuddy.md](../../../docs/wiki/06-remotebuddy.md) and [docs/wiki/08-source-control-manager.md](../../../docs/wiki/08-source-control-manager.md) — service responsibilities.
+`AgentBrain` classifies this as repository work and returns a structured worker plan. RemoteBuddy then:
 
-Always start incident response with the runbooks above; they contain the paging rotations (**RemoteBuddy Platform**, **WorkerPals Runtime**, **SourceControlManager**) referenced throughout this example.
+- Resolves and checks target-path hints against the current repository.
+- Ensures write globs cover concrete target hints.
+- Supplies an acceptance criterion if a forced-worker request omitted one.
+- Normalizes validation commands and includes required validation criteria extracted from `vision.md`.
+- Selects a deterministic or agentic execution lane, normally the worker lane for an open-ended edit.
+- Adds bounded recent session and job context.
+
+For an ordinary user request, a malformed non-forced worker plan fails before enqueue when required contract fields cannot be established. An autonomous request is always worker-required and retains its server-validated scope metadata.
+
+## 4. Worker selection and durable enqueue
+
+RemoteBuddy prefers an idle online WorkerPal. If none is idle and auto-spawn is enabled below `max_workerpals`, it starts another worker and waits for its heartbeat. If workers are online but busy, the job can remain untargeted for the first available compatible worker.
+
+RemoteBuddy posts a schema-v2 `task.execute` job to `POST /jobs/enqueue`. The payload contains:
+
+- The canonical user instruction and optional planner guidance.
+- `requestId`, `sessionId`, and origin.
+- Target paths and structured scope/discovery hints.
+- Acceptance criteria and validation steps.
+- Queue priority plus queue, execution, and finalization budgets.
+- A stable dedupe identity; retries reuse the exact serialized payload.
+
+Only after Server returns a durable job ID does RemoteBuddy emit `task_created`, `task_started`, `task_progress`, and `job_enqueued` session events. If an active matching job exists, the enqueue can return that job with `deduped=true`.
+
+## 5. Durable handoff
+
+RemoteBuddy records the exact job with:
+
+```text
+POST /requests/REQUEST_ID/worker-handoff
+POST /requests/REQUEST_ID/complete
+```
+
+Both transitions require the current request claim token. The planning request is now complete, but Server's request read model projects its `outcomeStatus` from the linked job until execution reaches a terminal outcome.
+
+If the job was durably created and either callback response is lost, RemoteBuddy does not reverse the result or enqueue another job. It leaves the handoff for Server reconciliation.
+
+## 6. WorkerPal execution
+
+A WorkerPal claims the job with its own fenced lease, crosses the explicit `/jobs/:id/start` boundary, prepares an isolated worktree/container as configured, inspects the repository, edits the test files, and runs the planned/required quality checks.
+
+Activity is persisted through `/jobs/:id/log`, structured tool runs, heartbeats, and diagnostics. WorkerPal's bounded quality loop—not RemoteBuddy—decides whether the candidate is ready to hand to SourceControlManager.
+
+If execution fails, Server makes the job terminally failed or applies its stale-claim retry-safety rules. RemoteBuddy observes the `job_failed` session event and can fetch a bounded failure-log summary for the user. It does not automatically create the previously documented generic `fix_up` job.
+
+## 7. Completion and publication
+
+For publishable changes, WorkerPal commits an immutable candidate and enqueues a completion. Server moves the job to `finalizing`.
+
+SourceControlManager then:
+
+1. Claims the completion with a separate fenced lease.
+2. Revalidates candidate identity and clean repository state.
+3. Applies/integrates the candidate and runs trusted-host validation.
+4. Publishes according to the configured branch/PR policy.
+5. Calls the completion `processed` or `fail` route with its current authority.
+
+Only the acknowledged processed callback makes the job `completed` and emits the authoritative `job_completed` event. A failed publication can become `publish_blocked`; it is not reported as successful simply because WorkerPal produced a commit.
+
+## Failure ownership
+
+| Failure                                      | Durable evidence                                                 | Owner/recovery                                            |
+| -------------------------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------- |
+| Message validation or queue enqueue rejected | Error response/session `error`; no accepted request              | Client or Server input/configuration                      |
+| Planner/model failure before a job exists    | Failed request and RemoteBuddy planning log                      | Fix planner/backend/request, then submit a new request    |
+| Ambiguous job enqueue                        | Possible job plus claimed request                                | Server handoff reconciliation; do not duplicate           |
+| No online WorkerPal                          | Pending job or failed pre-handoff request plus worker/spawn logs | RemoteBuddy autoscaler or manually started WorkerPal      |
+| Worker execution failure                     | Job logs/tool runs/diagnostics and terminal job state            | WorkerPal/runtime; follow retry-safety classification     |
+| Publication failure                          | Finalizing/publish-blocked job, completion row, candidate ref    | SourceControlManager                                      |
+| Status appears inconsistent                  | `GET /requests/:id`, `GET /jobs`, and session cursor history     | Use durable rows as authority; there is no webhook replay |
+
+## Observe the example
+
+```bash
+curl -sS "http://127.0.0.1:3001/requests?status=all&limit=20"
+curl -sS "http://127.0.0.1:3001/jobs?status=all&limit=20"
+curl -sS "http://127.0.0.1:3001/completions?status=all&limit=20"
+curl -sS http://127.0.0.1:3001/system/status
+```
+
+Use the session's SSE or WebSocket cursor stream, or the client UI, for human-readable progress. Use queue rows and fenced transitions as lifecycle authority.

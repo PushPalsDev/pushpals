@@ -1,7 +1,31 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "HTTPContracts",
+  "title": "PushPals core session HTTP and transport contracts",
   "definitions": {
+    "ClientRegistration": {
+      "type": "object",
+      "required": ["clientId", "kind"],
+      "properties": {
+        "clientId": { "type": "string" },
+        "kind": { "type": "string" },
+        "label": { "type": "string" },
+        "version": { "type": "string" },
+        "platform": { "type": "string" },
+        "repoRoot": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "CreateSessionRequest": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9._-]{1,64}$"
+        },
+        "client": { "$ref": "#/definitions/ClientRegistration" }
+      },
+      "additionalProperties": false
+    },
     "CreateSessionResponse": {
       "type": "object",
       "required": ["sessionId", "protocolVersion"],
@@ -15,7 +39,8 @@
       "type": "object",
       "required": ["text"],
       "properties": {
-        "text": { "type": "string" }
+        "text": { "type": "string" },
+        "intent": { "type": "object", "additionalProperties": true }
       },
       "additionalProperties": false
     },
@@ -23,7 +48,40 @@
       "type": "object",
       "required": ["ok"],
       "properties": {
-        "ok": { "type": "boolean" }
+        "ok": { "type": "boolean" },
+        "code": {
+          "type": "string",
+          "enum": ["accepted", "invalid", "session_not_found", "enqueue_failed"]
+        },
+        "eventId": { "type": "string" },
+        "requestId": { "type": "string" },
+        "queuePosition": { "type": "number", "minimum": 0 },
+        "etaMs": { "type": "number", "minimum": 0 },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "CommandRequest": {
+      "type": "object",
+      "required": ["type", "payload"],
+      "properties": {
+        "type": { "$ref": "envelope.schema.json#/properties/type" },
+        "payload": { "type": "object", "additionalProperties": true },
+        "from": { "type": "string" },
+        "to": { "type": "string" },
+        "correlationId": { "type": "string" },
+        "turnId": { "type": "string" },
+        "parentId": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "CommandResponse": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "eventId": { "type": "string" },
+        "message": { "type": "string" }
       },
       "additionalProperties": false
     },
@@ -42,7 +100,17 @@
       "type": "object",
       "required": ["ok"],
       "properties": {
-        "ok": { "type": "boolean" }
+        "ok": { "type": "boolean" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SessionEventFrame": {
+      "type": "object",
+      "required": ["envelope", "cursor"],
+      "properties": {
+        "envelope": { "$ref": "envelope.schema.json" },
+        "cursor": { "type": "integer", "minimum": 0 }
       },
       "additionalProperties": false
     }

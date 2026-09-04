@@ -46,6 +46,15 @@ Events are persisted before live broadcast. This keeps SSE/WS replay consistent 
 ### 2) Cursor-based replay
 
 Sessions use monotonic event cursors (`event_id`) so clients can reconnect with `after=<cursor>`.
+Each connection replays one page of at most 1,000 later events before moving to
+live delivery; it is not an unbounded history export.
+
+The session rows and events are durable, but `SessionManager` does not hydrate
+its active in-memory session map during process startup. After a Server restart,
+a client must first rejoin the stable ID with `POST /sessions` before opening
+SSE/WS or posting commands. Startup-readiness bookkeeping and pending approval
+objects are also process-local; an approval event is durable, but an interrupted
+in-memory approval continuation is not reconstructed automatically.
 
 ### 3) Queue state is explicit
 
@@ -121,7 +130,17 @@ RepositoryAgent is a logical capability, not Server-side model execution. Server
 
 Submission is idempotent within `(repository identity, caller service, session, idempotency key)`. This lets independent services use conventional operation names without colliding. Before enqueue, Server resolves the request against its canonical repository root and rejects identity, revision, or content-tree drift. Completion repeats that identity/revision/tree fence so an answer cannot silently describe another checkout.
 
-Shared memory is a separate Server-owned subsystem. Other processes call it through the typed HTTP client and never open the SQLite database directly. This avoids cross-process database contention and keeps validation, compare-and-set revisions, invalidation, expiry, and reinforcement behavior consistent. Server also reconciles authoritative autonomy lifecycle outcomes into a durable, leased, idempotent RepositoryAgent feedback ledger; only analysis-cache references are trained by delivery outcomes, and infrastructure/environment failures are excluded.
+Shared memory is a separate Server-owned subsystem. Other processes call memory
+operations through the typed HTTP client and do not access its tables directly.
+This keeps validation, compare-and-set revisions, invalidation, expiry, and
+reinforcement behavior consistent. One current layering exception is
+RemoteBuddy: it opens the same shared database and issues `SELECT` queries
+against `jobs` to resolve a failed job's worker and assemble recent planning
+context. It does not use that connection for memory or queue mutations; those
+still go through Server. Server also reconciles authoritative autonomy lifecycle
+outcomes into a durable, leased, idempotent RepositoryAgent feedback ledger;
+only analysis-cache references are trained by delivery outcomes, and
+infrastructure/environment failures are excluded.
 
 ## Endpoint Families
 
@@ -145,8 +164,25 @@ Server endpoints are easiest to reason about by family:
 - Shared memory:
   - `PUT /memory/records`,
   - `POST /memory/get`, `/memory/search`, `/memory/invalidate`, `/memory/reinforce`, and `/memory/prune`.
+- Runtime configuration and operations:
+  - `GET`/`POST /config/runtime`,
+  - `GET /system/status` and `GET /healthz`,
+  - `POST /telemetry/llm-usage`,
+  - local `POST /admin/shutdown`.
 - Autonomy:
   - snapshot/objective state, lock lifecycle, replay payload storage.
+
+The general route-level bearer check is intentionally inert in the current
+loopback-only runtime because Server sets the session auth token to `null`.
+Queue claim generations/tokens, memory caller authority, and SCM repair proofs
+remain separate integrity mechanisms; none of them makes the API safe to expose
+off-host.
+
+The bounded streaming JSON reader is currently used only by the memory and
+RepositoryAgent submission surfaces. Many session, configuration, queue, and
+autonomy routes still call `request.json()` directly and therefore have no
+application-level request-body cap. The loopback boundary is part of their
+current denial-of-service threat model.
 
 ## Request Queue Model
 
@@ -157,7 +193,15 @@ Requests support:
 - queue wait budgets,
 - optional autonomy metadata with scope invariants.
 
-The queue validates autonomy-origin metadata against component scope policy to prevent broad writes.
+Ordinary request idempotency keys are currently global rather than scoped by
+session/caller. Reusing a key for a different prompt can return the existing
+non-failed request without comparing its content. Callers must allocate one
+stable key per logical request and never recycle it for unrelated work.
+
+The request queue sanitizes and validates the shape of autonomy-origin scope
+hints, but evaluates them in advisory `hintsOnly` mode. They do not prevent
+broad writes; execution isolation and the later deterministic validation,
+review, and publication gates provide the enforcement boundaries.
 
 Jobs also carry an authoritative work class. Elevated `repair` and `recovery`
 admission is derived from an existing Server-owned validation incident or PR

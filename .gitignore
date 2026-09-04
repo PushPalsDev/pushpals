@@ -169,6 +169,9 @@ apps/worker/.dockerbuild/
 configs/local.toml
 config/local.toml
 
+# Temporary checkout of the separate GitHub Wiki repository. Canonical wiki
+# source lives in docs/wiki and is published by .github/workflows/publish-wiki.yml.
+/wiki/
 
 # Python bytecode / cache
 __pycache__/

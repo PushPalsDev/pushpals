@@ -4,23 +4,25 @@ You are operating inside the PushPals repository.
 
 PushPals is a multi-device, always-on, multi-agent coding system designed to “run a small software team” around a repo with clear orchestration and auditability. It provides:
 
-- apps/client: Expo (web/mobile) chat UI
-- apps/server: event hub + persistence + queues (SQLite)
-- apps/localbuddy: HTTP ingress + prompt enhancement
-- apps/remotebuddy: orchestrator + scheduler (the “head”)
-- apps/workerpals: execution daemons (host or Docker/OpenHands)
-- apps/source_control_manager: merge/push daemon (serializes integration)
+- apps/client: Expo (web/mobile) mission-control UI
+- apps/server: authoritative event, persistence, and queue control plane (SQLite)
+- apps/localbuddy: optional HTTP quick-reply and read-only ingress
+- apps/remotebuddy: request planner, orchestrator, autonomy engine, and RepositoryAgent worker host
+- apps/workerpals: isolated execution and candidate-commit workers (host or Docker)
+- apps/source_control_manager: trusted validation, review, and publication service
 
 Core runtime model to keep in mind:
 
-- Fast path: user → LocalBuddy → Server events → RemoteBuddy claims + emits progress → client renders via SSE/WS.
-- Slow path: RemoteBuddy schedules WorkerPals → workers execute in isolated worktrees / Docker → workers produce per-job branches → completions queued → SourceControlManager merges/pushes into the integration branch (main_agents by default).
+- Interactive path: user → CLI / Expo / VS Code → Server session ingress and durable request queue → RemoteBuddy claim → direct reply or planned job. Server streams durable lifecycle events back to clients via SSE/WS.
+- Optional LocalBuddy path: caller → LocalBuddy `POST /message` → bounded local reply/read-only status or the same durable Server request queue. LocalBuddy is not a required hop for the primary clients.
+- Delegated execution path: RemoteBuddy enqueues a job → WorkerPals execute in isolated worktrees / Docker → workers retain immutable candidate commits on internal refs → completion queue → SourceControlManager validates and publishes an individual PR or the integration branch (`main_agents` by default).
+- Autonomous path: RemoteBuddy derives a bounded objective from `vision.md`, confirms a provisional request through Server, and then uses the same request/job/completion pipeline.
 
 Repo-wide rules (apply to ALL components):
 
 - First, read README.md (and any docs/ENHANCEMENTS/ROADMAP files you see referenced) before attempting any broad change. If you already know the repo, still re-scan the README when starting a new session or when proposing enhancements.
 - Respect the repository’s existing conventions, architecture, and communication model (CommunicationManager in packages/shared).
-- Preserve the orchestration semantics: LocalBuddy = ingress/enrichment, RemoteBuddy = scheduling/orchestration, WorkerPals = execution, SourceControlManager = integration/merge/push.
+- Preserve the orchestration semantics: Server = durable authority, LocalBuddy = optional quick ingress, RemoteBuddy = planning/orchestration, WorkerPals = isolated execution and candidate creation, SourceControlManager = trusted validation/review/publication.
 
 Change discipline:
 
@@ -59,4 +61,4 @@ Definition of “done” across PushPals:
 
 - The requested behavior works end-to-end in the correct component(s).
 - Minimal relevant validation passes (lint/tests/typecheck/build slice as appropriate).
-- The system remains aligned with the fast path / slow path model and does not regress isolation, orchestration, or auditability.
+- The system remains aligned with the interactive, optional-LocalBuddy, delegated-execution, and autonomous paths and does not regress isolation, orchestration, or auditability.

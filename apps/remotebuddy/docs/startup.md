@@ -1,122 +1,123 @@
-# RemoteBuddy Startup Preflight Runbook
+# RemoteBuddy startup and readiness
 
-_Last updated: 27 Feb 2026 -- applies to RemoteBuddy v2026.02 train._
+The supported source-checkout entrypoint is the repository-level startup supervisor:
 
-Run this playbook whenever you cold-start a RemoteBuddy stack (fresh host, CI boot, or recovering
-from a full outage). It sequences the dependent services, captures the telemetry gates that must be
-green before admitting traffic, and lists the verification plus rollback actions that keep startup
-safe and auditable.
+```bash
+bun run start
+```
 
-## When to run this check
+It performs the real preflight work for the complete stack: configuration/template checks, dependencies, `vision.md`, LLM/Codex readiness, port ownership, Git integration/worktree safety, WorkerPal Docker image preparation, optional warmup, and managed service supervision.
 
-- Any time you restart `bun run remotebuddy:only` outside a rolling deploy.
-- After rotating secrets or upgrading WorkerPals/Server components that RemoteBuddy depends on.
-- Following hardware or container migrations where persistent config may differ.
-- When a previous startup failed and you need the exact evidence to prove the stack is healthy.
+## Prerequisites
 
-## High-level flow (15 minute target)
+- Run from the target Git repository root.
+- Bun must be 1.3.14 or newer.
+- Install workspace dependencies with `bun install` when they are not already present.
+- Create machine-specific configuration in `configs/local.toml` and secrets in `.env` as needed for the selected model/backend.
+- Ensure the configured Server port is available.
+- Ensure Docker is running when the effective WorkerPal configuration requires Docker.
 
-| Minute | Owner               | Action                                                               | Evidence to capture                                            |
-| ------ | ------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------- |
-| 0      | Platform on-call    | Confirm repo state + config parity (`git status`, `configs/*.toml`). | Screenshot or paste of clean diff summary.                     |
-| 2      | Server on-call      | Start Server + WorkerPals lanes; watch `/system/status`.             | `curl .../system/status` JSON snippet with worker idle counts. |
-| 5      | RemoteBuddy on-call | Launch RemoteBuddy process with `PUSHPALS_AUTH_TOKEN` loaded.        | Process log tail sent to `#pushpals-ops`.                      |
-| 7      | Platform on-call    | Perform telemetry gates (table below).                               | Grafana snapshot + Alertmanager screenshot.                    |
-| 10     | RemoteBuddy on-call | Run verification RPC + synthetic end-to-end request.                 | `request_id` link + resulting transcript.                      |
-| 13     | Platform on-call    | Announce green state or rollback trigger with explicit timestamps.   | Thread update referencing evidence artifacts.                  |
+The canonical key set and defaults are in [`configs/default.toml`](../../../configs/default.toml). RemoteBuddy accepts only `--server`, `--sessionId`, and `--token` as direct CLI flags. The current local-only network policy normalizes Server to loopback and ignores the token flag.
 
-Always attach the captured evidence to your PagerDuty incident or the on-call log so the next
-startup can reference a single source of truth.
+## Full-stack startup
 
-## Dependency bring-up checklist
+`bun run start` is preferred because it checks the dependencies that RemoteBuddy itself does not validate before entering its polling loop. It starts Server before the dependent services and supervises their process trees.
 
-1. **Config + secrets**
-   - `bun install` has been run at least once on the host; `node_modules` is present.
-   - `configs/default.toml` and `configs/local.toml` match the intended train (`git status --short` is
-     empty or only shows deliberate overrides).
-   - Environment variables exported: `PUSHPALS_AUTH_TOKEN`, `REMOTE_STABLE_ID`, `WORKERPALS_API_URL`,
-     `SERVER_BASE_URL`. Document redacted values in the ops log.
-2. **Server**
-   - Command: `PUSHPALS_AUTH_TOKEN=... bun run server:only --env-file .env`.
-   - Health: `curl -sf http://localhost:3001/healthz` returns `ok` within 2 seconds.
-   - Metrics: `/system/status` shows `queues.requests.pending` ≤ 5 per lane.
-3. **WorkerPals**
-   - Command: `PUSHPALS_AUTH_TOKEN=... bun run workerpals:only -- --lanes interactive=4,normal=2,background=1`.
-   - Confirm `worker_idle_slots` ≥ 3 per lane for two consecutive polls.
-   - Watch Worker Backends Latency dashboard for RPC spikes.
-4. **RemoteBuddy**
-   - Command: `PUSHPALS_AUTH_TOKEN=... bun run remotebuddy:only`.
-   - Verify the bootstrap log prints `planner ready` and `worker lease acquired` within 90 seconds.
-5. **Optional LocalBuddy / client probes**
-   - If this host also serves LocalBuddy traffic, start `bun run client:only` and open the Ops tab to
-     confirm it sees the new RemoteBuddy instance before accepting paid tasks.
+LocalBuddy is optional. RemoteBuddy and WorkerPals are the services required to turn a queued repository request into executed work. SourceControlManager is required for configured publication/finalization behavior.
 
-## Telemetry gates (block startup if any fail)
+Do not use `bun run dev:full` as an operational preflight substitute. It is a development convenience that launches processes concurrently and deliberately skips the complete startup checks.
 
-| Signal                                                | Pass criteria                                   | Source or command                                             | Rollback / block trigger                                                                                                        |
-| ----------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Remote queue latency `queue_p95` (interactive, 5 min) | ≤ 0.65 s while traffic ≤ 35 RPS.                | Grafana › RemoteBuddy Queue Overview › `queue_p95`.           | ≥ 0.8 s for 5 min or upward trend immediately after RemoteBuddy launch. Roll back to previous build or pause RemoteBuddy start. |
-| Pending interactive requests                          | < 10 steady; zero monotonic growth.             | `/system/status` → `queues.requests.pending`.                 | ≥ 15 pending with flat traffic: stop RemoteBuddy and re-check WorkerPals allocation.                                            |
-| Worker idle slots                                     | ≥ 3 per lane; no `busy` workers > queue budget. | Worker Backends Latency dashboard + `/system/status.workers`. | ≤ 1 idle slot for 3 polls: tear down RemoteBuddy, scale WorkerPals up, retry.                                                   |
-| Synthetic probe `probe.remote_startup`                | < 700 ms, 0 drops in 10 samples.                | Grafana › Synthetic Probes › `probe.remote_startup`.          | ≥ 850 ms or probe failures: roll back RemoteBuddy or mute traffic sources.                                                      |
-| Alertmanager `remote-*` group                         | No active warning/page alerts.                  | Alertmanager quick view filtered by `remote`.                 | Any warning still firing after dependency start: block startup until cleared.                                                   |
+## RemoteBuddy-only startup
 
-Record each check with timestamp, screenshot link, and the PromQL/command you used. Without stored
-evidence the preflight is considered incomplete.
+When Server and the rest of the runtime are already managed separately:
 
-## Verification steps before declaring success
+```bash
+bun run protocol:build
+bun run remotebuddy:only
+```
 
-1. **API smoke test**
-   ```bash
-   curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
-     -H "Content-Type: application/json" \
-     http://localhost:3001/requests/enqueue \
-     -d '{"prompt":"startup smoke","priority":"interactive","metadata":{"source":"startup-preflight"}}'
-   ```
+`remotebuddy:only` runs `src/remotebuddy_supervisor.ts`, which starts `remotebuddy_main.ts`. For development, `bun run remotebuddy:only:watch` runs the main process directly and bypasses crash supervision.
 
-   - Confirm response includes `requestId`.
-   - Watch RemoteBuddy logs for the matching ID finishing with status `completed`.
-2. **Planner loop check**
-   - Tail the RemoteBuddy logs you captured during launch (for example,
-     `tail -f /tmp/remotebuddy.log | grep <requestId>`) while the
-     smoke test executes.
-   - Success criteria: log shows `PlannerOutput intent=interactive lane=worker`, followed by
-     `worker lease acquired` and `request completed`.
-3. **Synthetic deterministic lane check**
-   - Use `/system/status` to verify deterministic lane latency ≤ 200 ms if deterministic overrides are
-     enabled.
-4. **Client-surface verification**
-   - Load the Ops dashboard and ensure ETA overlays show the new pod plus no stuck jobs.
-   - Post a screenshot in `#pushpals-ops` with the timestamped verifying job.
+RemoteBuddy-only startup does not:
 
-Only after all four verifications pass may you switch background/evaluation job intake from paused to
-normal.
+- Start Server.
+- Run the repository-level preflight suite.
+- Build or validate the WorkerPal Docker image.
+- Start SourceControlManager.
+- Prove that a WorkerPal can execute a job.
 
-## Rollback triggers and actions
+It does retry Server session creation indefinitely with exponential backoff capped at 30 seconds. Once connected, WorkerPal prewarming runs asynchronously; the planner can be online while worker capacity is still starting or unavailable.
 
-Trigger any of the actions below and immediately follow the recorded rollback procedure (same as in
-`apps/remotebuddy/docs/queue-playbook.md`):
+## Readiness evidence
 
-- Telemetry gate fails for two consecutive polls (≈5 minutes) after RemoteBuddy launch.
-- Startup logs show `worker lease lost` or `planner panic` twice in 10 minutes.
-- `/system/status` pending counts grow ≥ 20 despite idle slots being ≥ 5 (indicates logic regressions).
-- Synthetic probe uptime < 95% over the first 15 minutes of traffic.
-- Alertmanager escalates (`remote_startup_page` or `worker_idle_global_page`) before verification ends.
+Check Server first:
 
-**Rollback steps (summarized)**
+```bash
+curl -sS http://127.0.0.1:3001/healthz
+curl -sS http://127.0.0.1:3001/system/status
+```
 
-1. `git status` → snapshot current diffs; stash if necessary.
-2. Stop RemoteBuddy (`Ctrl+C`) plus WorkerPals lanes you started for this attempt.
-3. `git checkout <last-good-tag> -- configs/default.toml configs/local.toml` (or reapply the saved copies).
-4. Restart Server and WorkerPals using the known-good command set.
-5. Re-run telemetry gates; keep RemoteBuddy offline until every signal is green for one full interval.
+RemoteBuddy readiness is established by its process logs and session status event; it has no HTTP health endpoint. Expected logs include:
 
-Document the exact trigger, timestamp, and commands in the incident thread so when you retry the
-startup you can prove the rollback completed successfully.
+```text
+[RemoteBuddy] PushPals RemoteBuddy Orchestrator
+[RemoteBuddy] Using session: ...
+[RemoteBuddy] Worker scheduler: min=... max=... autoSpawn=...
+[RepositoryAgent] Started shared repository capability (...)
+[RemoteBuddy] Starting polling loop (every ...ms)
+```
 
-## Post-start reminders
+Worker execution readiness is separate:
 
-- Backfill the ops journal entry with links to Grafana snapshots, Alertmanager cards, `/system/status`
-  JSON, RemoteBuddy log excerpts, and the verification request ID.
-- Set a reminder (next business day 17:00 PT) to confirm telemetry stayed inside the pass criteria.
-- File any follow-up issues (config drift, flaky probes) before ending your on-call shift.
+```bash
+curl -sS "http://127.0.0.1:3001/workers?ttlMs=15000"
+curl -sS "http://127.0.0.1:3001/workers/autoscale?ttlMs=15000"
+```
+
+An online worker has a current heartbeat and `isOnline=true`. If auto-spawn is enabled, RemoteBuddy logs prewarming, spawning, startup timeout, and cooldown outcomes.
+
+For an end-to-end readiness check, submit a bounded request through a normal client and follow its returned request/job IDs. Do not use a fabricated `probe.remote_startup` metric as proof; no production synthetic-probe integration exists in this repository.
+
+## Crash supervision
+
+The supervisor reads:
+
+- `remotebuddy.crash_restart_enabled`
+- `remotebuddy.crash_restart_max_restarts`
+- `remotebuddy.crash_restart_backoff_ms`
+
+It restarts only unexpected nonzero exits, up to the configured number of restarts. Exit 0 and normal SIGINT/SIGTERM shutdowns are not restarted. It forwards shutdown by terminating the child process tree and strips the SCM repair-authority secret from the child environment.
+
+If the limit is reached, the log is explicit:
+
+```text
+[RemoteBuddySupervisor] RemoteBuddy exited with code ...; restart limit reached (.../...)
+```
+
+## Common startup failures
+
+| Symptom                          | Check                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------------------------- |
+| Repeated `Server unavailable`    | Server process, loopback URL/port, then `/healthz`.                                          |
+| Planner starts but requests fail | Effective `[remotebuddy.llm]` backend, endpoint, model, and Codex/API authentication.        |
+| `Auto-spawn disabled`            | WorkerPal runtime bundle/entrypoint availability and packaged Windows launcher inputs.       |
+| Worker did not report online     | Docker availability/image when required, WorkerPal process logs, configured startup timeout. |
+| Auto-spawn enters cooldown       | Prior spawn error/exit and `crash_restart_backoff_ms`.                                       |
+| RepositoryAgent unhealthy        | `[RepositoryAgent]` logs and `queues.repositoryAgentHealth` in `/system/status`.             |
+| Autonomy does not start          | `remotebuddy.autonomy.enabled`, kill switch, startup grace, and safety/eligibility state.    |
+
+## Configuration reload behavior
+
+RemoteBuddy periodically reloads configuration only to apply `remotebuddy.autonomy.enabled`. Restart it after changing model, memory, polling, worker scheduling, Docker, budget, or supervisor settings.
+
+## Shutdown and restart
+
+Use the owning supervisor's normal stop mechanism or Ctrl+C. RemoteBuddy stops autonomy and RepositoryAgent work, closes event subscriptions, closes its recent-job/planning-memory database handles, emits a shutting-down status, and terminates WorkerPals it spawned. The separately instantiated legacy `IdempotencyStore` has no explicit shutdown call in the current main path; process exit releases that handle.
+
+Keep `outputs/data/pushpals.db` and `outputs/data/remotebuddy-state.db` for ordinary restarts. `bun run start -c` deliberately clears scoped runtime data and must not be used as a routine recovery command.
+
+## About `src/startup/checklist.ts`
+
+The `startup/checklist.ts` module defines and tests a dependency-injected checklist abstraction for Bun, Docker, repository, alert, synthetic, and dispatch checks. No production source imports or invokes `runStartupPreflight` today. Its Alertmanager and synthetic-probe interfaces are test doubles/contracts, not proof that those integrations exist.
+
+Use `scripts/start.ts` (`bun run start`) as the source of truth for current startup behavior. If the checklist module is wired into production later, update this document in the same change.

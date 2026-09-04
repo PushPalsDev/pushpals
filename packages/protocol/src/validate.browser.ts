@@ -2,6 +2,7 @@ import Ajv from "ajv";
 import addFormats from "ajv-formats";
 import envelopeSchema from "./schemas/envelope.schema.json";
 import eventsSchema from "./schemas/events.schema.json";
+import httpSchema from "./schemas/http.schema.json";
 
 const ajv = new Ajv({ strict: true });
 addFormats(ajv);
@@ -10,6 +11,7 @@ addFormats(ajv);
 try {
   ajv.addSchema(envelopeSchema as object, "envelope.schema.json");
   ajv.addSchema(eventsSchema as object, "events.schema.json");
+  ajv.addSchema(httpSchema as object, "http.schema.json");
 } catch (_e) {
   // ignore addSchema failures; we'll still compile below
 }
@@ -18,31 +20,27 @@ const validateEnvelopeBase = ajv.compile(envelopeSchema as unknown as object);
 const validateEventPayload = ajv.compile(eventsSchema as unknown as object);
 
 const validateMessageRequestSchema = ajv.compile({
-  type: "object",
-  required: ["text"],
-  properties: { text: { type: "string" }, intent: { type: "object", additionalProperties: true } },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/MessageRequest",
 });
 
 const validateMessageResponseSchema = ajv.compile({
-  type: "object",
-  required: ["ok"],
-  properties: { ok: { type: "boolean" } },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/MessageResponse",
 });
 
 const validateApprovalDecisionRequestSchema = ajv.compile({
-  type: "object",
-  required: ["decision"],
-  properties: { decision: { type: "string", enum: ["approve", "deny"] } },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/ApprovalDecisionRequest",
 });
 
 const validateApprovalDecisionResponseSchema = ajv.compile({
-  type: "object",
-  required: ["ok"],
-  properties: { ok: { type: "boolean" } },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/ApprovalDecisionResponse",
+});
+
+const validateCommandRequestSchema = ajv.compile({
+  $ref: "http.schema.json#/definitions/CommandRequest",
+});
+
+const validateSessionEventFrameSchema = ajv.compile({
+  $ref: "http.schema.json#/definitions/SessionEventFrame",
 });
 
 export interface ValidationResult {
@@ -95,42 +93,13 @@ export function validateMessageResponse(data: unknown): ValidationResult {
 }
 
 export function validateCommandRequest(data: unknown): ValidationResult {
-  const allEventTypes = [
-    "log",
-    "scan_result",
-    "suggestions",
-    "diff_ready",
-    "approval_required",
-    "approved",
-    "denied",
-    "committed",
-    "assistant_message",
-    "error",
-    "done",
-    "agent_status",
-    "task_created",
-    "task_started",
-    "task_progress",
-    "task_completed",
-    "task_failed",
-    "tool_call",
-    "tool_result",
-    "delegate_request",
-    "delegate_response",
-    "job_enqueued",
-    "job_claimed",
-    "job_completed",
-    "job_failed",
-    "message",
-    "job_log",
-    "status",
-  ];
-  const d = data as any;
-  if (!d || typeof d !== "object") return { ok: false, errors: ["Expected object"] };
-  if (!d.type || !allEventTypes.includes(d.type)) return { ok: false, errors: ["Invalid type"] };
-  if (!d.payload || typeof d.payload !== "object")
-    return { ok: false, errors: ["Invalid payload"] };
-  return { ok: true };
+  const valid = validateCommandRequestSchema(data);
+  const errors = valid
+    ? undefined
+    : (validateCommandRequestSchema.errors ?? []).map((e) =>
+        `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),
+      );
+  return { ok: valid, errors };
 }
 
 export function validateApprovalDecisionRequest(data: unknown): ValidationResult {
@@ -151,4 +120,15 @@ export function validateApprovalDecisionResponse(data: unknown): ValidationResul
         `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),
       );
   return { ok: valid, errors };
+}
+
+export function validateSessionEventFrame(data: unknown): ValidationResult {
+  const valid = validateSessionEventFrameSchema(data);
+  if (!valid) {
+    const errors = (validateSessionEventFrameSchema.errors ?? []).map((e) =>
+      `${e.instancePath || "/"} ${e.message ?? ""}`.trim(),
+    );
+    return { ok: false, errors };
+  }
+  return validateEventEnvelope((data as { envelope: unknown }).envelope);
 }

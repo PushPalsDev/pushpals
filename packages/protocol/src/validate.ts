@@ -50,11 +50,13 @@ function loadSchema(filename: string): Record<string, unknown> {
 // Load schemas
 const envelopeSchema = loadSchema("envelope.schema.json");
 const eventsSchema = loadSchema("events.schema.json");
+const httpSchema = loadSchema("http.schema.json");
 
 // Register schemas with AJV (helps with $ref resolution across files)
 try {
   ajv.addSchema(envelopeSchema as object, "envelope.schema.json");
   ajv.addSchema(eventsSchema as object, "events.schema.json");
+  ajv.addSchema(httpSchema as object, "http.schema.json");
 } catch (_e) {
   // addSchema may throw in strict modes for malformed schemas; compilation below
   // will still attempt to compile standalone validators.
@@ -64,40 +66,22 @@ try {
 const validateEnvelopeBase = ajv.compile(envelopeSchema as object);
 const validateEventPayload = ajv.compile(eventsSchema as object);
 const validateMessageRequestSchema = ajv.compile({
-  type: "object",
-  required: ["text"],
-  properties: {
-    text: { type: "string" },
-    intent: { type: "object", additionalProperties: true },
-  },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/MessageRequest",
 });
 const validateMessageResponseSchema = ajv.compile({
-  type: "object",
-  required: ["ok"],
-  properties: {
-    ok: { type: "boolean" },
-  },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/MessageResponse",
 });
 const validateApprovalDecisionRequestSchema = ajv.compile({
-  type: "object",
-  required: ["decision"],
-  properties: {
-    decision: {
-      type: "string",
-      enum: ["approve", "deny"],
-    },
-  },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/ApprovalDecisionRequest",
 });
 const validateApprovalDecisionResponseSchema = ajv.compile({
-  type: "object",
-  required: ["ok"],
-  properties: {
-    ok: { type: "boolean" },
-  },
-  additionalProperties: false,
+  $ref: "http.schema.json#/definitions/ApprovalDecisionResponse",
+});
+const validateCommandRequestSchema = ajv.compile({
+  $ref: "http.schema.json#/definitions/CommandRequest",
+});
+const validateSessionEventFrameSchema = ajv.compile({
+  $ref: "http.schema.json#/definitions/SessionEventFrame",
 });
 
 export interface ValidationResult {
@@ -170,64 +154,21 @@ export function validateApprovalDecisionResponse(data: unknown): ValidationResul
   };
 }
 
-// Command request schema (agent-friendly ingest)
-const allEventTypes = [
-  "log",
-  "scan_result",
-  "suggestions",
-  "diff_ready",
-  "approval_required",
-  "approved",
-  "denied",
-  "committed",
-  "assistant_message",
-  "error",
-  "done",
-  "agent_status",
-  "task_created",
-  "task_started",
-  "task_progress",
-  "task_completed",
-  "task_failed",
-  "tool_call",
-  "tool_result",
-  "delegate_request",
-  "delegate_response",
-  "job_enqueued",
-  "job_claimed",
-  "job_completed",
-  "job_failed",
-  "message",
-  "job_log",
-  "status",
-  "autonomy_cycle_started",
-  "autonomy_candidates_generated",
-  "autonomy_objective_dispatched",
-  "autonomy_objective_blocked",
-  "autonomy_feedback_recorded",
-  "question_asked",
-  "question_answered",
-];
-
-const validateCommandRequestSchema = ajv.compile({
-  type: "object",
-  required: ["type", "payload"],
-  properties: {
-    type: { type: "string", enum: allEventTypes },
-    payload: { type: "object", additionalProperties: true },
-    from: { type: "string" },
-    to: { type: "string" },
-    correlationId: { type: "string" },
-    turnId: { type: "string" },
-    parentId: { type: "string" },
-  },
-  additionalProperties: false,
-});
-
 export function validateCommandRequest(data: unknown): ValidationResult {
   const valid = validateCommandRequestSchema(data);
   return {
     ok: valid,
     errors: valid ? undefined : ajv.errorsText(validateCommandRequestSchema.errors).split(", "),
   };
+}
+
+export function validateSessionEventFrame(data: unknown): ValidationResult {
+  const valid = validateSessionEventFrameSchema(data);
+  if (!valid) {
+    return {
+      ok: false,
+      errors: ajv.errorsText(validateSessionEventFrameSchema.errors).split(", "),
+    };
+  }
+  return validateEventEnvelope((data as { envelope: unknown }).envelope);
 }

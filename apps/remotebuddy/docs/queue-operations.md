@@ -1,36 +1,71 @@
-# RemoteBuddy Queue Operations
+# RemoteBuddy queue operations
 
-_Last updated: 25 February 2026 — sourced from current queue guardrails and monitoring runbooks._
+This reference describes the normal operator-visible transitions around RemoteBuddy. Server is the queue authority; RemoteBuddy is a fenced request consumer and job producer.
 
-Use this reference whenever RemoteBuddy’s request queues drift from the ≤1.0 s SLO so everyone responds with the same thresholds, alerts, and escalation posture. Pair it with [queue-monitoring](./queue-monitoring.md) for live dashboards and [queue-playbook](./queue-playbook.md) for deep remediation steps.
+## Normal request lifecycle
 
-## Metric checkpoints
+| Stage           | Durable evidence                                                                                                    | Owner                               |
+| --------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Accepted        | Request row is `pending`; session emits the user's `message` event.                                                 | Server                              |
+| Planning        | Request is `claimed` with `agentId`, `claimToken`, `claimGeneration`, and lease timestamps.                         | RemoteBuddy                         |
+| Direct response | Assistant event is emitted and request becomes `completed` with `workerRequired=0`.                                 | RemoteBuddy through Server          |
+| Worker handoff  | A durable job exists; request records `workerRequired=1` and the exact `handoffJobId`.                              | RemoteBuddy through Server          |
+| Execution       | Job is `claimed`; `/jobs/:id/start`, heartbeats, logs, and tool runs prove activity.                                | WorkerPal through Server            |
+| Publication     | Job is `finalizing` and a completion is pending or claimed.                                                         | SourceControlManager through Server |
+| Terminal        | Job becomes `completed`, `failed`, `abandoned`, or `publish_blocked`; request `outcomeStatus` projects that result. | Server                              |
 
-| Signal                                        | Healthy       | Monitor band                     | Alert band                                   | Prompt                                                                                     |
-| --------------------------------------------- | ------------- | -------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `queue_p95` (interactive lane, 15 min rollup) | ≤ 1.0 s       | 1.0–1.5 s for ≥ 3 polls (~6 min) | ≥ 1.5 s for 5 min **or** ≥ 2.0 s for 2 polls | Validate backlog shape, idle workers, and worker recycle history.                          |
-| Pending interactive requests                  | < 10 per lane | 10–25 for ≥ 3 polls              | ≥ 30 for ≥ 5 min                             | Pause background/eval submissions, prioritize interactive.                                 |
-| `job_failure_rate`                            | ≤ 0.2         | 0.2–0.4                          | ≥ 0.4                                        | Combine with queue metrics to determine severity; this doc focuses on the queue-only case. |
+Session task events are useful UI breadcrumbs, but the queue rows are authoritative. In particular, `task_created` is emitted after a durable job enqueue and should not be used as the proof that a job exists.
 
-## Elevated `queue_p95` with zero failures
+## Priority and work class
 
-Seeing `queue_p95` spike to 1.157 s (example: `queue_p95=1157 ms job_failure_rate=0.000`) usually means the workers are saturated or mis-prioritized—not that they are erroring out. The absence of `job_failure_rate` increases or explicit failures simply removes one symptom; it does **not** make the latency acceptable. Treat the queue like a capacity incident whenever the monitor or alert bands are met.
+Requests have three priorities: `interactive`, `normal`, and `background`.
 
-### Monitor vs. alert thresholds
+Jobs carry both a priority and a work class. Work classes include `interactive`, `standard`, `autonomy`, `background`, plus capability-controlled `recovery` and `repair`. Queue-deadline misses and elevated recovery work can rank ahead of ordinary priority order. Operators should use the returned `jobPendingSnapshot` order rather than recreating the scheduler with a simple sort.
 
-- **Monitor (warning):** `queue_p95` between 1.0 s and 1.5 s for ≥ 3 consecutive `/system/status` polls (~6 min) while `job_failure_rate` stays at 0 and pending interactive < 30. Action: open a `#pushpals-ops` thread, capture Grafana RemoteBuddy Queue Overview snapshots, and begin queue-playbook diagnostics while keeping PagerDuty quiet.
-- **Alert (paging):** `queue_p95` ≥ 1.5 s for ≥ 5 min, ≥ 2.0 s for 2 polls, or pending interactive ≥ 30 even if failures remain 0. Action: acknowledge/trigger `queue_p95_sustained`, treat as an incident, and throttle input to interactive-only until the backlog contracts.
+RemoteBuddy does not maintain independent queues or worker pools for these lanes. Any compatible online WorkerPal can claim from Server's job queue, subject to target-worker and runtime constraints.
 
-### Operator runbook and escalation ladder
+## Worker capacity
 
-1. **Snapshot telemetry:** Immediately capture `/system/status` output plus Grafana panels (`queue_p95`, pending queues, worker idle). Post both and the raw metric snippet (e.g., `queue_p95=1157 ms job_failure_rate=0.000`) in `#pushpals-ops`.
-2. **Verify automation:** Confirm `sig_queue_health` logs fired and that `forceWorker` remediation jobs are queued. If not present, manually enqueue `forceWorker` with lane `worker` and `origin=manual` and note the timestamp in the ops thread.
-3. **Rebalance load:** Pause new background/eval submissions (LocalBuddy admin throttle → `interactive-only`) and drain any evaluators older than 2 min so interactive traffic owns the runway.
-4. **Add capacity:** If idle workers < 2 for 3 polls, recycle stuck workers and add at least one WorkerPal per busy lane. Document each action in the ops thread.
-5. **Escalate:**
-   - At T+5 min in the alert band, page **RemoteBuddy Platform** (`@remote-queue-oc` via PagerDuty) if not already engaged.
-   - If queue_p95 stays ≥ 1.5 s for 10 min, loop in **WorkerPals Runtime** on-call.
-   - If ≥ 15 min or backlog > 60 with no recovery path, escalate to the **Reliability Lead** and prep leadership/status comms.
-6. **Communicate until green:** Post updates every 15 min and close the thread only after `queue_p95` < 1.0 s and pending interactive < 10 for two consecutive polls.
+RemoteBuddy's autoscaler reads `GET /workers/autoscale` at the configured request poll interval. With auto-spawn enabled, its target is bounded by `min_workerpals` and `max_workerpals` and considers:
 
-Following this flow keeps zero-failure latency spikes visible, ensures the right alerting level, and documents clear ownership for each escalation hop.
+- Current online and busy workers.
+- Autoscalable pending `task.execute` jobs.
+- A small floor while persisted WorkerPal PRs remain open and unmerged.
+
+It spawns workers one at a time and waits for a Server heartbeat before considering startup healthy. A startup failure enters a cooldown based on `crash_restart_backoff_ms`.
+
+If a Docker WorkerPal exits with the dedicated Codex-startup-stall code, RemoteBuddy can switch future spawns to direct isolated-worktree execution. Set `REMOTEBUDDY_DISABLE_WORKERPAL_DIRECT_FALLBACK=1` only when an installation must prohibit that fallback.
+
+## Supported operator actions
+
+| Need                        | Supported action                                                                                                  |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Inspect queue and capacity  | Client observability views or `GET /system/status`.                                                               |
+| Inspect one request         | `GET /requests/:id`.                                                                                              |
+| Inspect a job               | `GET /jobs`, then its logs, tool runs, and diagnostics endpoints.                                                 |
+| Add manual worker capacity  | `bun run workerpals:only` or `bun run workerpals:only:docker`.                                                    |
+| Restart RemoteBuddy only    | Stop the process cleanly and run `bun run remotebuddy:only`.                                                      |
+| Restart with full preflight | `bun run start`.                                                                                                  |
+| Toggle autonomy at runtime  | Change `remotebuddy.autonomy.enabled` through the supported runtime-config surface; RemoteBuddy polls that field. |
+
+There is no supported operator action to "force complete," rewrite a lease, replay a publication webhook, drain a worker with `--drain`, or throttle background jobs through LocalBuddy.
+
+## Idempotency and retry rules
+
+- RemoteBuddy derives a stable job dedupe key from session, request, and targeted scope. A retry reuses the exact payload.
+- Active matching work can return the existing job with `deduped=true`; RemoteBuddy emits progress against that task instead of creating a duplicate.
+- Enqueue and request lifecycle calls have bounded retries. Ambiguous outcomes are reconciled from durable state.
+- A request with a durable worker handoff is not failed merely because the handoff callback response was lost.
+- Expired request or job claims are recovered by Server, with fencing tokens preventing stale owners from mutating reclaimed rows.
+
+## Escalating a failure
+
+Escalate by subsystem, using evidence from the durable stage:
+
+- Planning/claim failure: RemoteBuddy logs plus the request row.
+- Execution/worker lease failure: WorkerPal logs, job logs, tool runs, and diagnostics.
+- Finalization/publication failure: completion row, publication summary, candidate ref, and SourceControlManager logs.
+- Repository analysis failure: `queues.repositoryAgentHealth` and `[RepositoryAgent]` logs.
+- Autonomous dispatch failure: `/autonomy/insights`, `/autonomy/safety`, the request's autonomy metadata, and `[Autonomy]` logs.
+
+External team names, paging rotations, and chat channels are deployment-specific and are intentionally not asserted here.

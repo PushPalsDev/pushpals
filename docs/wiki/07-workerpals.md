@@ -86,6 +86,18 @@ failure rather than being mislabeled as a WorkerPal implementation crash.
 
 Each job runs in an isolated git worktree to avoid cross-job contamination.
 
+This is operational/Git isolation, not a hostile-code security sandbox. Direct
+host executors can access the host under their process identity and inherit
+most of the parent environment (the SCM repair-authority secret is stripped).
+The current Docker worker runs as root with bridge networking and bind-mounts
+the repository root read-write at `/repo`; it does not use a read-only root
+filesystem or capability-drop profile. Worktree targeting and deterministic
+Git checks protect lifecycle provenance, but they do not prevent a compromised
+backend from addressing sibling paths visible through that mount. A configured
+`GIT_TOKEN` is also supplied to the reused warm container, including while it
+runs review-fix work. Deployments should treat WorkerPal backends as trusted
+local code until stronger OS/container isolation is implemented.
+
 For Linux-container jobs, dependency snapshots and per-job copy-on-write
 projections live in a repo-keyed Docker volume. Reflinks are used when the
 volume filesystem supports them, with an isolated ordinary-copy fallback;
@@ -119,6 +131,21 @@ This provides:
 - validation-step execution support,
 - optional critic/revision loops (backend-specific),
 - output compaction and structured result handling.
+
+The checked-in default `quality_soft_pass_on_exhausted=true` permits the
+original successful execution result to continue after the bounded revision
+budget when only non-required validation or critic findings remain. Required
+`vision.md` checks stay hard failures. ReviewAgent mode adds another downstream
+score gate; direct integration mode does not. Disable the soft pass when an
+installation requires every configured non-required finding to block
+publication.
+
+Planner `target_paths`, `write_globs`, and `max_files_to_edit` values guide the
+executor and make scope reviewable, but they are not a hard per-path write
+sandbox. The job worktree is the isolation boundary, and the current
+changed-path scope collector does not reject edits outside those hints.
+Validation, critic, hygiene, and publication checks still apply, but none
+should be mistaken for a deterministic path allowlist.
 
 Validation commands form a provenance- and capability-aware DAG. Aggregate
 commands suppress their focused children only after the aggregate actually

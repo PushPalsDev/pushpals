@@ -13,7 +13,12 @@ Both modes flow through the same queues, events, and integration pipeline so beh
 
 ## Architecture Visuals
 
-- Excalidraw source: `docs/architecture.excalidraw`:
+- Editable Excalidraw overview: [`docs/architecture.excalidraw`](docs/architecture.excalidraw)
+- Detailed accessible SVG: [`docs/architecture.svg`](docs/architecture.svg)
+
+Both representations describe the same runtime topology and are maintained together; the SVG and PNG include additional operational annotations.
+
+- Raster preview/fallback:
 
 ![Excalidraw Architecture](docs/excalidraw_architecture.png)
 
@@ -51,8 +56,8 @@ PushPals keeps coordination, planning, execution, and publication separate. The
 | Expo client (`apps/client`)                                       | Mission-control UI and live projections                      | User actions and Server events -> visible session/queue state         | [Client surfaces](docs/wiki/09-client-surfaces.md)              |
 | VS Code client (`apps/vscode-client`)                             | Editor UI and local stack controls                           | Editor prompts -> Server session ingress; controls -> local services  | [Client surfaces](docs/wiki/09-client-surfaces.md)              |
 | Terminal CLI (`packages/cli`)                                     | Repo-aware terminal ingress and packaged runtime supervision | Terminal prompt -> Server session ingress; runtime health -> operator | [CLI surface](docs/wiki/09-client-surfaces.md)                  |
-| LocalBuddy (`apps/localbuddy`)                                    | Fast user ingress and lightweight replies                    | `POST /message` -> local answer or queued request                     | [LocalBuddy](docs/wiki/05-localbuddy.md)                        |
-| Server (`apps/server`)                                            | Durable sessions, events, queues, leases, and worker state   | API mutations -> persisted state, claims, snapshots, and events       | [Server control plane](docs/wiki/04-server-control-plane.md)    |
+| LocalBuddy (`apps/localbuddy`)                                    | Optional fast ingress and lightweight replies                | `POST /message` -> local answer or queued request                     | [LocalBuddy](docs/wiki/05-localbuddy.md)                        |
+| Server (`apps/server`)                                            | Durable sessions, queues, shared memory, and broker state    | API mutations -> persisted state, claims, snapshots, and events       | [Server control plane](docs/wiki/04-server-control-plane.md)    |
 | RemoteBuddy (`apps/remotebuddy`)                                  | Planning, request orchestration, and autonomy                | Claimed request -> direct reply or scoped `task.execute` job          | [RemoteBuddy](docs/wiki/06-remotebuddy.md)                      |
 | WorkerPals (`apps/workerpals`)                                    | Isolated execution, validation, and candidate commits        | Claimed job -> logs and completion candidate                          | [WorkerPals](docs/wiki/07-workerpals.md)                        |
 | SourceControlManager (`apps/source_control_manager`)              | Trusted validation and publication policy                    | Completion candidate -> integrated commit or PR outcome               | [SourceControlManager](docs/wiki/08-source-control-manager.md)  |
@@ -62,7 +67,8 @@ PushPals keeps coordination, planning, execution, and publication separate. The
 
 ### Prerequisites
 
-- Bun 1.x
+- Bun 1.3.14 or newer
+- Node.js 20 or newer when using the npm-installed CLI launcher
 - Python 3.12+ (for integration/eval harness and Python executor scripts)
 - Docker (recommended; required for default `bun run start` flow)
 - Git + GitHub auth if push/PR automation is enabled
@@ -82,6 +88,12 @@ bun install
 Copy-Item .env.example .env
 Copy-Item configs/local.example.toml configs/local.toml
 ```
+
+`configs/local.example.toml` is both the checked-in starter and an active
+baseline layer. The shared loader merges it before the gitignored
+`configs/local.toml`, so its values already affect the effective configuration
+before the copy. The copy creates the machine-local layer where you can make
+explicit overrides.
 
 ## Run commands
 
@@ -180,7 +192,11 @@ The `Release CLI` workflow will:
 
 PushPals also ships a VS Code extension client in `apps/vscode-client` that can:
 
-- Start/stop local stack services (`server`, `localbuddy`, `remotebuddy`, `workerpals:only:docker`).
+- Start/stop the source-checkout stack (`server`, `remotebuddy`, Docker
+  `workerpals`, config-enabled `localbuddy`, and optionally
+  `source_control_manager`).
+- Run an installed `pushpals --runtime-only` supervisor when the open Git
+  repository is not a PushPals source checkout.
 - Verify/build the worker Docker image before stack startup.
 - Provide an in-editor chat/event client wired to your local PushPals server.
 
@@ -229,11 +245,27 @@ Terminal 2: `bun run localbuddy:only`
 ## Testing and Evaluation
 
 - `bun run test`
-  - Root tests + protocol tests.
+  - Prompt-policy enforcement, the Bun suites under `tests/`, and the protocol
+    integration script.
+  - This command does not discover tests colocated under `apps/**/src` or the
+    Python backend unit tests; run the relevant service suites separately.
+- `bun run vscode:client:test`
+  - Colocated VS Code extension tests.
+- `bun --cwd apps/localbuddy test`
+  - LocalBuddy's package-local tests.
+- `bun test apps/remotebuddy/src`
+  - RemoteBuddy's colocated Bun tests.
 - `bun run test:integration`
   - End-to-end integration harness (`tests/integration/integration_controller.py --mode integration`).
 - `bun run test:integration:eval`
   - Backend evaluation mode (`--mode eval`) with scenario/budget controls.
+- `bun run test:cli:e2e`, `bun run test:workerpals:e2e`, and
+  `bun run test:start:e2e`
+  - Focused packaged-CLI, WorkerPal control-plane, and startup end-to-end suites.
+- `bun run harness:reliability`
+  - Consolidated failure-evidence, durable-lifecycle, repair-orchestration, and
+    runtime-boundary contract. See `docs/reliability-harnesses.md` for opt-in
+    container coverage.
 - `bun run smoke`
   - Smoke script for startup/stack sanity.
 
@@ -325,7 +357,9 @@ Related settings per service:
 - LocalBuddy remains an optional fast ingress on `POST /message` and chooses:
   - local reply path for lightweight chat/status/read-only requests, or
   - remote delegation path by enqueuing to server: `POST /requests/enqueue`.
-- Explicit remote override command supported in chat: `/ask_remote_buddy ...`.
+- `/ask_remote_buddy ...` forces delegation on LocalBuddy's optional ingress;
+  direct Server clients accept it as a compatibility alias because their
+  ordinary messages already enter RemoteBuddy's request queue.
 
 ### 2) Server as control plane
 
@@ -337,6 +371,16 @@ Main server route families in `apps/server/src/server_main.ts`:
   - `GET /sessions/:id/ws` (WebSocket replay)
   - `POST /sessions/:id/message`
   - `POST /sessions/:id/command` (local-only)
+- Runtime configuration:
+  - `GET /config/runtime`
+  - `POST /config/runtime`
+- Repository assistance and shared memory:
+  - `POST /repository-agent/requests`
+  - `GET /repository-agent/requests/:id`
+  - claim, lease-renewal, completion, and failure routes for the hosted worker
+  - `PUT /memory/records`
+  - `POST /memory/get`, `/memory/search`, `/memory/invalidate`,
+    `/memory/reinforce`, and `/memory/prune`
 - Request queue:
   - `POST /requests/enqueue`
   - `POST /requests/claim`
@@ -370,7 +414,7 @@ Main server route families in `apps/server/src/server_main.ts`:
 
 ### 3) Queue semantics
 
-Both request and job queues are priority ordered:
+Request, job, and RepositoryAgent queues expose the same priority tiers:
 
 - `interactive`
 - `normal`
@@ -382,11 +426,15 @@ Queue implementations:
 - `apps/server/src/jobs.ts`
 - `apps/server/src/completions.ts`
 
-Shared behavior:
+Claim ordering is queue-specific:
 
-- FIFO within each priority band.
+- Request and RepositoryAgent claims sort by priority, then creation time.
+- Completion claims are FIFO.
+- Job claims first honor overdue deadlines, then bounded work-class fairness and
+  remaining deadlines, then priority and creation time. Worker affinity also
+  constrains which jobs a worker can claim.
 - Claim transitions are atomic.
-- Queue position and ETA snapshots are derived from live pending order.
+- Queue position and ETA snapshots are derived from each queue's live pending order.
 - SLO summaries are derived over rolling windows and exposed by `/system/status`.
 
 ### 4) Planner and job contract
@@ -399,7 +447,8 @@ Worker contract (`task.execute` in job params, schema v2) includes:
 - `lane` (`deterministic` or `worker`)
 - `instruction`
 - `planning.intent`
-- `planning.scope` (read/write bounds)
+- `planning.scope` (read/write relevance and review guidance, not an OS-level
+  filesystem boundary)
 - `planning.acceptanceCriteria`
 - `planning.validationSteps`
 - queue/execution/finalization budgets
@@ -442,9 +491,19 @@ Queue + worker tables:
 - `requests`
 - `jobs`
 - `job_logs`
+- `job_attempts`, `job_terminal_diagnostics`, `job_phase_spans`
+- `job_validation_runs`, `job_patch_snapshots`, `tool_runs`
 - `job_artifacts`
 - `workers`
+- `worker_runtime_circuits`
 - `completions`
+- PR repair, assignment, and provider-outcome state
+
+Repository assistance and shared memory:
+
+- `repository_agent_requests`
+- `memory_records`
+- `memory_observations`
 
 Autonomy tables in `apps/server/src/autonomy.ts`:
 
@@ -453,8 +512,13 @@ Autonomy tables in `apps/server/src/autonomy.ts`:
 - `autonomy_objectives`
 - `autonomy_outcomes`
 - `autonomy_pattern_stats`
+- engine-idea trials/stats, inspiration patterns, and source stats
+- PR feedback and tombstones
 - `questions_queue`
+- safety state, evaluator scorecards/evidence, alerts, and dead letters
 - `autonomy_llm_calls`
+- `llm_usage_events`
+- RepositoryAgent memory links and durable feedback delivery
 - `autonomy_dispatch_lock`
 
 ### 7) Branch and isolation model
@@ -479,14 +543,17 @@ Canonical config files:
 
 - `configs/default.toml`
 - `configs/<profile>.toml`
+- `configs/local.example.toml` (checked-in active baseline and starter)
 - `configs/local.toml` (local override, typically gitignored)
 
 Load order (last wins):
 
 1. `configs/default.toml`
 2. `configs/<PUSHPALS_PROFILE>.toml`
-3. `configs/local.toml`
-4. environment variables
+3. `configs/local.example.toml`
+4. `configs/local.toml`
+5. environment variables (including values loaded from `.env` by the runtime)
+6. supported entrypoint flags
 
 High-value env overrides:
 
@@ -504,7 +571,7 @@ High-value env overrides:
 ## Repository Layout
 
 - `apps/client` - Expo UI
-- `apps/localbuddy` - user ingress and local routing
+- `apps/localbuddy` - optional fast ingress and local routing
 - `apps/remotebuddy` - orchestration, planning, autonomy
 - `apps/workerpals` - executor daemon and backend adapters
 - `apps/source_control_manager` - integration daemon
@@ -517,6 +584,9 @@ High-value env overrides:
 ## Operational Notes
 
 - This repository is under active development.
+- PushPals normalizes configured service URLs and listeners to loopback. The
+  general `PUSHPALS_AUTH_TOKEN` setting is ignored in this local-only mode; do
+  not treat it as a security boundary between local processes.
 - For most local development, use Docker worker mode (`workerpals:only:docker`) to keep toolchains reproducible.
 - Repos that need host Windows semantics for validation can set
   `[workerpals] execution_platform = "windows"` in `configs/local.toml` or

@@ -1,6 +1,9 @@
 # PushPals Server
 
-`apps/server` is the durable control plane for PushPals. It owns session history, request/job/completion queues, worker presence, runtime configuration, and autonomy state. It does not plan tasks, execute repository changes, or publish commits.
+`apps/server` is the durable control plane for PushPals. It owns session history,
+request/job/completion queues, worker presence, runtime configuration, autonomy
+state, RepositoryAgent requests, and shared memory. It does not plan tasks,
+execute repository changes, run repository analysis models, or publish commits.
 
 ## Quick Start
 
@@ -18,7 +21,9 @@ The default endpoint is `http://127.0.0.1:3001`; `GET /healthz` is the smallest 
 ## Component Contract
 
 - Receives session messages and queue mutations from clients, LocalBuddy, RemoteBuddy, WorkerPals, and SourceControlManager.
-- Persists events before broadcasting them over SSE or WebSocket, so clients can reconnect with a cursor and replay missed history.
+- Persists events before broadcasting them over SSE or WebSocket. A reconnect
+  replays one bounded page of at most 1,000 events after the supplied cursor;
+  clients must not interpret `after=0` as an unbounded history export.
 - Owns all queue transitions. Callers propose a mutation; the Server validates ownership and commits it atomically.
 - Exposes queue snapshots, job logs and diagnostics, worker health, runtime configuration, and autonomy endpoints.
 
@@ -30,7 +35,10 @@ request -> RemoteBuddy claim -> job -> WorkerPal claim/start -> completion -> SC
 
 ## Durable State and Recovery
 
-The configured `paths.shared_db_path` is the shared SQLite database; it defaults to `outputs/data/pushpals.db`. It stores sessions, replayable events, queues, job activity, worker state, and autonomy records.
+The configured `paths.shared_db_path` is the shared SQLite database; it defaults
+to `outputs/data/pushpals.db`. It stores sessions, replayable events, queues, job
+activity, worker state, autonomy records, RepositoryAgent work, and shared
+memory. Server owns the write-side validation and lifecycle for that state.
 
 Worker-owned job writes are fenced by `workerId` plus `claimGeneration`. A claim is pre-execution until `POST /jobs/:id/start` is positively acknowledged. Stale-claim sweeps, lease recovery, lifecycle reconciliation, and the durable WorkerPal runtime circuit recover interrupted work without accepting late writes from an old owner. Completion processing similarly uses renewable, fenced claims.
 

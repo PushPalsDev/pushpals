@@ -1,194 +1,203 @@
-# RemoteBuddy Queue Tuning & Rollback Playbook
+# RemoteBuddy queue recovery playbook
 
-_Last updated: 24 February 2026 — 23–24 Feb low-load window (`queue_p95` 0.533 s ± 0.075 s; job failures 0)._
+Use this playbook after [queue-health.md](./queue-health.md) identifies the stalled stage. It intentionally avoids fabricated dashboards, alert channels, deployment tooling, or administrative APIs.
 
-Use this playbook when RemoteBuddy queue wait is drifting from the low-load contract but the paging
-bands documented in `apps/remotebuddy/docs/queue.md` have not triggered. The monitoring doc handles
-high-severity incidents; this playbook documents how to stay inside the low-load envelope, which
-sources back each lever, and the exact rollback plus follow-up actions so the low-load reference
-remains single-sourced.
+## Preserve evidence first
 
-## Baseline + Thresholds (23–24 Feb 2026 low-load window)
-
-The table below is the only authoritative baseline and threshold reference. It combines the
-22:00 UTC 23 Feb → 02:00 UTC 24 Feb Grafana snapshots, Alertmanager rules, and PromQL queries. Do
-not maintain duplicate bullet lists elsewhere—update this table when baselines shift.
-
-| Signal                                                        | Baseline (23–24 Feb)                                                      | Warning threshold + sources                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Rollback trigger + sources                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `queue_p95` (interactive, 15 min rollup)                      | 0.533 s ± 0.075 s with ≤ 35 interactive RPS and ≤ 10 eval/background RPS. | ≥ 0.8 s for ≥ 5 min without matching traffic.<br>• Grafana panel — [RemoteBuddy Queue Overview › `queue_p95`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=queue_p95)<br>• Alert rule — [`queue_p95_spike_warning`](alertmanager://remote-buddy-platform/rules/queue_p95_spike_warning)<br>• PromQL — [`histogram_quantile(0.95,sum(rate(remote_queue_wait_ms_bucket{lane="interactive"}[15m])))`](promql://remote_queue_wait_ms_bucket/p95-interactive)<br>• Evidence (2026‑02‑24 00:45 UTC) — [Grafana snapshot](grafana://snapshots/remotebuddy-queue/low-load-20260224T0045Z)                                                                                   | ≥ 0.9 s for ≥ 5 min or ± > 75 ms jitter immediately after a lever change.<br>• Grafana panel — [RemoteBuddy Queue Overview › `queue_p95`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=queue_p95)<br>• Alert rule — [`queue_p95_sustained`](alertmanager://remote-buddy-platform/rules/queue_p95_sustained)<br>• PromQL — [`stddev_over_time(remote_queue_wait_ms_bucket{lane="interactive"}[15m])`](promql://remote_queue_wait_ms_bucket/stddev)<br>• Evidence (2026‑02‑24 00:45 UTC) — [Grafana snapshot](grafana://snapshots/remotebuddy-queue/low-load-20260224T0045Z)   |
-| Pending interactive requests (`requests.pending.interactive`) | < 10 per lane steady state.                                               | > 15 for 3 polls (~6 min) while traffic remains ≤ 35 RPS.<br>• Grafana panel — [`requests_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=requests_pending)<br>• Alert rule — [`queue_pending_interactive_warning`](alertmanager://remote-buddy-platform/rules/queue_pending_interactive_warning)<br>• PromQL — [`sum(queues_requests_pending{priority="interactive"})`](promql://queues_requests_pending/interactive)<br>• Evidence (2026‑02‑24 00:55 UTC) — [Slack ops log](slack://channel/queue_p95_spike_warning/p/202602240055)                                                                                                                        | ≥ 20 or any interactive wait > 2 min; revert the last lever immediately.<br>• Grafana panel — [`requests_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=requests_pending)<br>• Alert rule — [`queue_pending_interactive_page`](alertmanager://remote-buddy-platform/rules/queue_pending_interactive_page)<br>• PromQL — [`sum(queues_requests_pending{priority="interactive"})`](promql://queues_requests_pending/interactive)<br>• Evidence (2026‑02‑24 00:55 UTC) — [Slack ops log](slack://channel/queue_p95_spike_warning/p/202602240055)                        |
-| Worker idle slots (per lane)                                  | ≥ 3 idle workers per lane; no worker stuck `busy` beyond queue budget.    | < 3 idle workers for 3 consecutive `/system/status` polls.<br>• API — [/system/status `queues.requestPendingSnapshot` + `workers`](runbook://server/system-status#queues)<br>• Grafana panel — [Worker Backends Latency › `idle_slots`](grafana://d/worker-backends/latency?viewPanel=idle_slots)<br>• Alert rule — [`worker_idle_lane_warning`](alertmanager://workerpals-runtime/rules/worker_idle_lane_warning)<br>• PromQL — [`sum(remote_worker_idle_slots{lane=~"interactive\|background"})`](promql://remote_worker_idle_slots/sum)<br>• Evidence (2026‑02‑24 01:00 UTC) — [PagerDuty incident PD-REMOTE-2026-02-24-01](pagerduty://incidents/PD-REMOTE-2026-02-24-01) | ≤ 1 idle worker cluster-wide for ≥ 5 min or automation fails to recover idle slots.<br>• Grafana panel — [Worker Backends Latency › `idle_slots`](grafana://d/worker-backends/latency?viewPanel=idle_slots)<br>• Alert rule — [`worker_idle_global_page`](alertmanager://workerpals-runtime/rules/worker_idle_global_page)<br>• PromQL — [`sum(remote_worker_idle_slots{lane=~"interactive\|background"})`](promql://remote_worker_idle_slots/sum)<br>• Evidence (2026‑02‑24 01:00 UTC) — [PagerDuty incident PD-REMOTE-2026-02-24-01](pagerduty://incidents/PD-REMOTE-2026-02-24-01)  |
-| Job failures (`queues.jobPendingSnapshot.failed`)             | 0 failures, 0 worker retry bursts.                                        | Any increment > 0 or retries > 3/min tied to tuning.<br>• Grafana panel — [`jobs_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=jobs_pending)<br>• Alert rule — [`queue_job_failure_warning`](alertmanager://remote-buddy-platform/rules/queue_job_failure_warning)<br>• PromQL — [`sum(rate(remote_jobs_failed_total[5m]))`](promql://remote_jobs_failed_total/rate)<br>• Evidence (2026‑02‑24 01:05 UTC) — [WorkerPals log bundle](s3://pushpals-ops/queue-low-load/workerpals-20260224T0105Z.log)                                                                                                                                                        | Failure rate ≥ 0.5/min or alert reopens twice within 30 min for the same knob.<br>• Grafana panel — [`jobs_pending`](grafana://d/remotebuddy-queue/queue-overview?viewPanel=jobs_pending)<br>• Alert rule — [`queue_job_failure_page`](alertmanager://remote-buddy-platform/rules/queue_job_failure_page)<br>• PromQL — [`sum(rate(remote_jobs_failed_total[5m]))`](promql://remote_jobs_failed_total/rate)<br>• Evidence (2026‑02‑24 01:05 UTC) — [WorkerPals log bundle](s3://pushpals-ops/queue-low-load/workerpals-20260224T0105Z.log)                                             |
-| Synthetic probe latency (`probe.queue_lowload`)               | < 550 ms round-trip, 0 drops per 20 samples.                              | ≥ 650 ms for 2 probes or 1 drop/20 samples.<br>• Grafana panel — [Synthetic Queue Probes › `queue_lowload`](grafana://d/remotebuddy-synth/probe?viewPanel=queue_lowload)<br>• Alert rule — [`probe_queue_lowload_warning`](alertmanager://remote-buddy-platform/rules/probe_queue_lowload_warning)<br>• PromQL — [`avg_over_time(probe_queue_lowload_latency_ms[10m])`](promql://probe_queue_lowload_latency_ms/avg)<br>• Evidence (2026‑02‑24 00:40 UTC) — [Probe export](notion://pushpals/ops-journal/remote-queue-low-load-2026-02-24#probe)                                                                                                                              | ≥ 750 ms or ≥ 2 drops/20 → roll back the last lever and re-check upstream dependencies.<br>• Grafana panel — [Synthetic Queue Probes › `queue_lowload`](grafana://d/remotebuddy-synth/probe?viewPanel=queue_lowload)<br>• Alert rule — [`probe_queue_lowload_page`](alertmanager://remote-buddy-platform/rules/probe_queue_lowload_page)<br>• PromQL — [`avg_over_time(probe_queue_lowload_latency_ms[10m])`](promql://probe_queue_lowload_latency_ms/avg)<br>• Evidence (2026‑02‑24 00:40 UTC) — [Probe export](notion://pushpals/ops-journal/remote-queue-low-load-2026-02-24#probe) |
-
-Update the table with fresh sources (new Grafana panel IDs, new alert names, or evidence timestamps)
-instead of layering new paragraphs elsewhere. That ensures every future reader sees one canonical
-set of numbers.
-
-## Monitoring + tooling
-
-| Surface                                                        | What to inspect                                                                                | Access / notes                                                                                                       |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Grafana › RemoteBuddy Queue Overview                           | `queue_p95`, `requests_pending`, `jobs_pending`, backlog shape.                                | Pin last 15 min vs 24 h, export snapshot links for the table above.                                                  |
-| Grafana › Worker Backends Latency                              | Worker RPC p95/p99, upstream saturation, idle slots.                                           | Confirms whether queue inflation started upstream before spending time on WorkerPals.                                |
-| Alertmanager quick view                                        | Active `queue_*`, `worker_idle_*`, probe alerts.                                               | Link alerts to the threshold table row when posting in `#pushpals-ops`.                                              |
-| Server `/system/status` API                                    | `queues.requestPendingSnapshot`, `queues.jobPendingSnapshot`, worker idle counts, SLO digests. | `curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \| jq '{queues, slo}'` |
-| Client Ops board (`bun run client:only` → Ops tab)             | Real-time ETA overlay + retry notifications.                                                   | Use when deciding whether to pause background/eval submissions.                                                      |
-| WorkerPals logs (`bun run workerpals:only[:docker] -- --tail`) | `task.execute` retries, wrapper timeouts, stuck workers.                                       | Combine with `/workers` heartbeat to prove capacity additions had effect.                                            |
-
-## Tuning levers (link to config + owner)
-
-Only adjust one lever at a time and wait three measurement intervals before tagging the next. Use
-the registry below to find the canonical config/code path, the accountable owner, and the default
-entry point before diving into the per-lever procedures.
-
-| Lever / flag                              | Canonical config path(s)                                                                                                                                                       | Owner (Slack / PagerDuty)                                                                                                                                                                       | Execution entry point                                                            |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Worker allocation per lane                | [`configs/default.toml`](../../../configs/default.toml) (`[remotebuddy]`, `[workerpals]`); [`apps/workerpals/src/workerpals_main.ts`](../../workerpals/src/workerpals_main.ts) | [Slack `@workerpals-oc`](slack://user/@workerpals-oc) / [PagerDuty WorkerPals Runtime](pagerduty://schedules/workerpals-runtime)                                                                | `bun run workerpals:only -- --lanes <lane=m>` (record command)                   |
-| Lane throttles (background/eval deferral) | [`apps/server/src/requests.ts`](../../server/src/requests.ts); [`apps/remotebuddy/src/remotebuddy_main.ts`](../src/remotebuddy_main.ts)                                        | [Slack `@remote-queue-oc`](slack://user/@remote-queue-oc) / [PagerDuty RemoteBuddy Platform](pagerduty://schedules/remotebuddy-platform)                                                        | `curl …/requests/enqueue` to force worker lane; LocalBuddy Admin throttle toggle |
-| Deterministic lane prefetch toggle        | [`apps/remotebuddy/src/brain.ts`](../src/brain.ts); [`prompts/remotebuddy/remotebuddy_system_prompt.md`](../../prompts/remotebuddy/remotebuddy_system_prompt.md)               | [Slack `@remote-queue-oc`](slack://user/@remote-queue-oc), [Slack `@safety-review`](slack://user/@safety-review) / [PagerDuty RemoteBuddy Platform](pagerduty://schedules/remotebuddy-platform) | Planner override change (`requires_worker=false`, `lane="deterministic"`)        |
-| Autonomy `forceWorker` remediation rate   | [`configs/default.toml`](../../../configs/default.toml) (`[remotebuddy.autonomy]`); [`apps/remotebuddy/src/autonomous_engine.ts`](../src/autonomous_engine.ts)                 | [Slack `@remote-autonomy`](slack://user/@remote-autonomy) / [PagerDuty Remote Autonomy](pagerduty://schedules/remote-autonomy)                                                                  | `remotebuddy.autonomy.max_dispatch_per_hour=<n>` + `bun run remotebuddy:only`    |
-| Queue priority weights/budgets            | [`apps/server/src/jobs.ts`](../../server/src/jobs.ts)                                                                                                                          | [Slack `@server-core`](slack://user/@server-core), [Slack `@remote-queue-oc`](slack://user/@remote-queue-oc) / [PagerDuty Server Core](pagerduty://schedules/server-core)                       | Edit `JOB_PRIORITY_QUEUE_SLA_MS` + `bun run server:only --env-file .env`         |
-
-### 1. Worker allocation per lane
-
-- Config reference: [`configs/default.toml` (`[remotebuddy]` & `[workerpals]`)](../../../configs/default.toml) and [`apps/workerpals/src/workerpals_main.ts`](../../workerpals/src/workerpals_main.ts).
-- Owner: WorkerPals Runtime ([Slack `@workerpals-oc`](slack://user/@workerpals-oc), [PagerDuty WorkerPals Runtime](pagerduty://schedules/workerpals-runtime)).
-- How to:
-  1. Launch one extra worker per stressed lane: `PUSHPALS_AUTH_TOKEN=… bun run workerpals:only -- --lanes interactive=4,normal=2,background=1` (increase/decrease counts symmetrically).
-  2. Confirm `/system/status` shows ≥ 3 idle slots per lane before ending the change.
-  3. Document the invocation + timestamp in the on-call thread so rollback just reverses the same command.
-
-### 2. Lane throttles (background/eval deferral)
-
-- Config reference: [`apps/server/src/requests.ts`](../../server/src/requests.ts) (`forceWorker`, `forceLane` fields) and [`apps/remotebuddy/src/remotebuddy_main.ts`](../src/remotebuddy_main.ts) (lane selection).
-- Owner: RemoteBuddy Platform ([Slack `@remote-queue-oc`](slack://user/@remote-queue-oc), [PagerDuty RemoteBuddy Platform](pagerduty://schedules/remotebuddy-platform)).
-- How to:
-  1. Pause background/eval submissions by forcing new requests onto the worker lane:
-
-     ```bash
-     curl -sS -X POST http://localhost:3001/requests/enqueue \
-       -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" \
-       -H "Content-Type: application/json" \
-       -d '{"prompt":"pause background","priority":"background","forceLane":"worker","forceWorker":true,"metadata":{"throttle":"queue-low-load"}}'
-     ```
-
-  2. If LocalBuddy is injecting traffic, toggle its Admin throttle to `interactive-only` and note when you resume (5-job increments once `queue_p95` ≤ 0.6 s).
-  3. Keep a list of deferred job IDs in the incident thread so they can be replayed once the queue stabilizes.
-
-### 3. Deterministic lane prefetch toggle
-
-- Config reference: [`apps/remotebuddy/src/brain.ts`](../src/brain.ts) (planner overrides) and [`prompts/remotebuddy/remotebuddy_system_prompt.md`](../../prompts/remotebuddy/remotebuddy_system_prompt.md) (`requires_worker` policy).
-- Owner: RemoteBuddy Platform + Safety ([Slack `@remote-queue-oc`](slack://user/@remote-queue-oc), [Slack `@safety-review`](slack://user/@safety-review), [PagerDuty RemoteBuddy Platform](pagerduty://schedules/remotebuddy-platform)).
-- How to:
-  1. When worker bandwidth is scarce, reroute lightweight prompts by explicitly setting `requires_worker=false` and `lane="deterministic"` through the planner overrides.
-  2. Confirm the deterministic lane handles those prompts in ≤ 200 ms before leaving the knob in place (attach evidence from the synthetic probe panel).
-  3. Roll back by restoring the original planner overrides (set `requires_worker=true` or remove the override block) and posting the reversal time in the ops thread.
-
-### 4. Autonomy `forceWorker` remediation rate
-
-- Config reference: [`configs/default.toml` (`[remotebuddy.autonomy]`)](../../../configs/default.toml) and [`apps/remotebuddy/src/autonomous_engine.ts`](../src/autonomous_engine.ts) (`max_dispatch_per_hour`, `queue_health` logic).
-- Owner: RemoteBuddy Autonomy DRI ([Slack `@remote-autonomy`](slack://user/@remote-autonomy), [PagerDuty Remote Autonomy](pagerduty://schedules/remote-autonomy)).
-- How to:
-  1. Tighten the dispatch budget when automation is over-enqueuing by dropping `remotebuddy.autonomy.max_dispatch_per_hour` to 3 via `configs/local.toml` or a temporary env override.
-  2. Restart RemoteBuddy (`bun run remotebuddy:only`) so the new limit applies, then watch the `forceWorker` metadata in `/requests?status=pending` to confirm the rate change.
-  3. Restore the default (6) once backlog and idle slots return to baseline.
-
-### 5. Queue priority weights and budgets
-
-- Config reference: [`apps/server/src/jobs.ts`](../../server/src/jobs.ts) (`JOB_PRIORITY_ORDER`, `JOB_PRIORITY_QUEUE_SLA_MS`).
-- Owner: Server + RemoteBuddy Platform ([Slack `@server-core`](slack://user/@server-core), [Slack `@remote-queue-oc`](slack://user/@remote-queue-oc), [PagerDuty Server Core](pagerduty://schedules/server-core)).
-- How to:
-  1. If interactive latency creeps upward despite low backlog, temporarily bump the interactive SLA by editing `JOB_PRIORITY_QUEUE_SLA_MS.interactive` and restarting the server: `bun run server:only --env-file .env`.
-  2. Keep the change local (commitless) and note the diff/sha in the ops thread.
-  3. Roll back by re-checking the file from `main` or via the rollback procedure below as soon as p95 returns < 0.7 s.
-
-## On-call response flow
-
-1. **Prove the alert window** by exporting the Grafana queue snapshot + `/system/status` JSON referenced in the threshold table, pinning both links to the active `#pushpals-ops` thread.
-2. **Confirm traffic really is “low-load”** (≤ 35 interactive RPS, ≤ 10 eval/background RPS). If the traffic window is higher, switch to the primary incident guide in `apps/remotebuddy/docs/queue.md`.
-3. **Pick exactly one lever** from the section above, tag the owner listed for that lever, and record the command/override you applied in the thread together with the evidence links used for the decision.
-4. **Measure for three intervals** (minimum 5 minutes) before stacking another change. If a rollback trigger hits, jump directly to the rollback procedure instead of experimenting further.
-5. **Escalate** when `queue_p95` ≥ 0.9 s or idle slots fall below the rollback trigger even after undoing the most recent change; page RemoteBuddy Platform first, then WorkerPals Runtime if capacity is at fault.
-
-## Rollback procedure (config + deployment)
-
-When a rollback trigger fires, stop changing levers and follow these reproducible steps:
-
-**Pre-checks (capture current state before overwriting config)**
+Before restarting anything, capture:
 
 ```bash
-git status --short configs/default.toml configs/local.toml
-curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \
-  | jq '{queue_p95: .slo.requests.queueWaitMs, pending: .queues.requests.pending, idle: .workers.idle}'
+curl -sS http://127.0.0.1:3001/system/status
+curl -sS "http://127.0.0.1:3001/requests?status=all&limit=100"
+curl -sS "http://127.0.0.1:3001/jobs?status=all&limit=100"
+curl -sS "http://127.0.0.1:3001/completions?status=all&limit=100"
+curl -sS "http://127.0.0.1:3001/workers?ttlMs=15000"
 ```
 
-1. Discover and select the last known-good tag. Pick the newest `remotebuddy-queue-lowload-*` tag that predates the current incident window and matches the evidence timestamps in the baseline table:
-
-   ```bash
-   git fetch --tags origin
-   git tag -l 'remotebuddy-queue-lowload-*' --sort=-creatordate | head -n 5
-   export RB_QUEUE_TAG=remotebuddy-queue-lowload-20260224
-   ```
-
-2. Inspect the tagged config so you know what will be restored:
-
-   ```bash
-   git show $RB_QUEUE_TAG:configs/default.toml | sed -n '/^\[remotebuddy\]/,/^\[/p'
-   git show $RB_QUEUE_TAG:configs/default.toml | sed -n '/^\[workerpals\]/,/^\[/p'
-   ```
-
-3. Backup current overrides, then restore the tagged values:
-
-   ```bash
-   ts=$(date +%Y%m%d%H%M%S)
-   cp configs/default.toml configs/default.toml.$ts.bak
-   cp configs/local.toml configs/local.toml.$ts.bak 2>/dev/null || true
-   git checkout $RB_QUEUE_TAG -- configs/default.toml
-   git checkout $RB_QUEUE_TAG -- configs/local.toml 2>/dev/null || true
-   ```
-
-4. Restart the services so the restored config applies:
-
-   ```bash
-   bun run server:only > /tmp/server.log 2>&1 &
-   bun run remotebuddy:only > /tmp/remotebuddy.log 2>&1 &
-   bun run workerpals:only:docker > /tmp/workerpals.log 2>&1 &
-   ```
-
-**Post-checks (prove rollback succeeded before closing the loop)**
+For an affected job, also capture:
 
 ```bash
-curl -sS -H "Authorization: Bearer $PUSHPALS_AUTH_TOKEN" http://localhost:3001/system/status \
-  | jq '{queue_p95: .slo.requests.queueWaitMs, pending: .queues.requests.pending, idle: .workers.idle}'
+curl -sS "http://127.0.0.1:3001/jobs/JOB_ID/logs?limit=500"
+curl -sS "http://127.0.0.1:3001/jobs/JOB_ID/tool-runs?limit=100"
+curl -sS "http://127.0.0.1:3001/jobs/JOB_ID/diagnostics"
 ```
 
-5. Post the tag, command log, and `/system/status` snapshot in the PagerDuty incident + `#pushpals-ops` thread.
+Save the relevant service stdout/stderr. Do not delete the database, worktree, candidate ref, or runtime logs while diagnosing an ambiguous handoff.
 
-## Incident follow-up checklist
+## Server unavailable
 
-Complete these items once mitigation stabilizes (even if p95 stays healthy):
+Symptoms:
 
-1. **File the follow-up ticket** in the Ops tracker with the following required fields:
+- `/healthz` fails.
+- RemoteBuddy logs `Server unavailable (...)` during startup or repeated `Poll error` messages.
+- Workers and SourceControlManager also lose their control-plane calls.
 
-   | Field            | Required value                                                       |
-   | ---------------- | -------------------------------------------------------------------- |
-   | Project / Board  | `OPS` (RemoteBuddy Platform)                                         |
-   | Title            | `RemoteBuddy queue tuning – <YYYY-MM-DD HH:MM UTC>`                  |
-   | Component        | `RemoteBuddy Queue`                                                  |
-   | Severity         | `S2 – Degradation`                                                   |
-   | Primary assignee | Current RemoteBuddy Platform on-call (`@remote-queue-oc`)            |
-   | Due date         | Next business day 17:00 PT (enter explicit date, e.g., `2026-02-26`) |
-   | Attachments      | Grafana snapshot, `/system/status` JSON, WorkerPals log bundle       |
+Actions:
 
-2. **List every lever touched** (command + timestamp + outcome) inside the ticket description and link back to this playbook section.
+1. Check whether another process owns the configured Server port.
+2. Confirm all processes resolve the same loopback Server URL and project root.
+3. Prefer restarting the complete stack with `bun run start`; its preflight handles port ownership and repository affinity.
+4. If manually managed, start Server before RemoteBuddy. RemoteBuddy retries session bootstrap indefinitely, so it can remain running while Server comes back.
+5. Verify `/system/status` and its `runtime.reconciliation` values after Server returns.
 
-3. **Assign follow-up owners** for deferred work (e.g., replaying paused background jobs) and note the Slack handle plus PagerDuty schedule in the ticket.
+SQLite-backed state survives a normal Server restart.
 
-4. **Schedule a verification reminder** (calendar or Linear/Jira reminder) for the due date so the assignee confirms the queue stayed within the baseline window or files a new incident if regression reappears.
+## Requests remain pending
 
-5. **Close the incident communication loop** by dropping the ticket link + due date into the resolved `#pushpals-ops` thread and updating the PagerDuty timeline.
+Symptoms:
 
-Keeping this checklist updated avoids vague "follow up later" notes and ensures every queue tuning
-exercise ends with an auditable artifact.
+- `queues.requests.pending` grows.
+- `requestPendingSnapshot` ages while RemoteBuddy emits no `Claimed request` log.
+
+Actions:
+
+1. Confirm RemoteBuddy reached `Using session` and `Starting polling loop`.
+2. Check supervisor output for repeated exits or `restart limit reached`.
+3. Check model/backend setup if claims are followed by `RemoteBuddy planning failed`.
+4. Inspect `GET /requests/:id` for priority, claim state, confirmation fields, and prior errors.
+5. If RemoteBuddy is wedged, stop and restart only that service with `bun run remotebuddy:only`. Leave Server and both databases intact.
+
+RemoteBuddy requests a three-minute lease and renews every 30 seconds. Server will recover an expired claim. There is no supported manual "release request" route.
+
+## Planning is slow or fails
+
+Symptoms:
+
+- Request remains claimed with fresh heartbeat timestamps.
+- Planner/backend errors appear before a job ID exists.
+- RemoteBuddy emits a planning-failure assistant message and the request becomes failed.
+
+Actions:
+
+1. Validate the configured `[remotebuddy.llm]` backend using the normal `bun run start` preflight.
+2. Check network/local model availability and the configured model/auth mode.
+3. Inspect repo-hint preflight warnings and whether the request names stale/nonexistent target paths.
+4. Narrow the request if planning or worker guidance is too broad.
+5. Submit a new request only after the previous request is durably failed. RemoteBuddy does not perform the previously documented automatic sanitized re-plan.
+
+Do not infer a failure solely because `queueWaitMs.p95` increased; that metric measures time before claim, not model planning time.
+
+## Job enqueue acknowledgement is ambiguous
+
+Symptoms:
+
+- `Job enqueue outcome is ambiguous after 3 attempt(s)`.
+- User receives a message that automatic reconciliation is being preserved.
+- Request may remain claimed temporarily even though a matching job exists.
+
+Actions:
+
+1. Search `GET /jobs` for the request's job and dedupe identity.
+2. Inspect `GET /requests/:id` for `workerRequired` and `handoffJobId`.
+3. Allow Server's handoff reconciliation to close the crash window.
+4. Restart RemoteBuddy only if needed; retain its planning-memory/compatibility database.
+5. Do not enqueue a duplicate or force an opposite terminal transition.
+
+RemoteBuddy retries only retryable/ambiguous responses (408, 429, 5xx, and transport failures), reusing the byte-identical payload. A definitive client error is not blindly retried. This protection uses Server's durable dedupe contract; the legacy `IdempotencyStore` methods are not used by the current polling path.
+
+## Jobs remain pending
+
+Symptoms:
+
+- `queues.jobs.pending` grows.
+- `workers.online` is zero, all workers are busy, or `jobPendingSnapshot[].deadlineMissed` becomes true.
+
+Actions:
+
+1. Read `GET /workers/autoscale` to distinguish total pending jobs from `autoscalablePending` jobs.
+2. Check RemoteBuddy's configured `auto_spawn_workerpals`, `min_workerpals`, `max_workerpals`, Docker requirement, image, and startup timeout.
+3. Inspect logs for worker spawn cooldown or startup timeout.
+4. Verify Docker only when the effective worker configuration uses or requires it.
+5. Add a manual worker with `bun run workerpals:only` or `bun run workerpals:only:docker` if auto-spawn is intentionally disabled or capped.
+6. Confirm the new worker appears online and begins logging against the job.
+
+Do not assume every pending job can be autoscaled: delayed jobs and jobs targeted to a still-online worker are excluded from the autoscalable count.
+
+## Claimed job stops making progress
+
+Symptoms:
+
+- Job is claimed but has no recent activity/log timestamp.
+- Worker heartbeat disappears or no longer names the job.
+
+Actions:
+
+1. Inspect the job's logs, tool runs, and terminal diagnostics.
+2. Inspect the worker row's heartbeat, active job count, status, and current job.
+3. Check the WorkerPal process/container and its hard execution deadline.
+4. Let Server's stale-claim recovery classify the work. Retry-safe work may be requeued; potentially side-effectful work can require manual review or become abandoned.
+5. Do not start a parallel replacement against the same candidate without that classification.
+
+RemoteBuddy observes terminal `job_failed` events and can fetch a bounded failure-log summary, but it does not automatically issue the old documented one-shot `fix_up` job. Review repair is a separate, capability-controlled SCM workflow.
+
+## Jobs remain finalizing
+
+Symptoms:
+
+- `queues.jobs.finalizing` grows.
+- `queues.publication` or `/completions` shows pending/claimed work.
+- Worker execution has already produced a candidate ref/SHA.
+
+Actions:
+
+1. Move diagnosis to SourceControlManager logs and completion state.
+2. Preserve the candidate ref, source SHA, and completion record.
+3. Check integration worktree, remote access, trusted validation, and publication state.
+4. Restart SourceControlManager—not RemoteBuddy—if its process is absent.
+5. Let completion lease recovery and callback reconciliation handle an interrupted publisher.
+
+There is no webhook to replay. Publication completion is a fenced Server callback from SourceControlManager.
+
+## RepositoryAgent unhealthy
+
+Symptoms:
+
+- `queues.repositoryAgentHealth.unhealthy` is true.
+- Counts show old pending/claimed work, delayed retries, exhausted attempts, or past-deadline active work.
+- `[RepositoryAgent]` logs show repeated model or snapshot failures.
+
+Actions:
+
+1. Confirm RemoteBuddy started the shared repository capability.
+2. Inspect the health structure rather than the request queue; RepositoryAgent has its own queue and lease contract.
+3. Verify the RemoteBuddy LLM configuration and repository identity/snapshot evidence.
+4. Restart RemoteBuddy if the hosted worker is absent. Caller timeouts do not cancel already durable RepositoryAgent work.
+
+## Autonomy is idle
+
+Autonomy deliberately stops dispatching for many healthy reasons. Inspect:
+
+```bash
+curl -sS http://127.0.0.1:3001/autonomy/safety
+curl -sS http://127.0.0.1:3001/autonomy/insights
+```
+
+Then check the configured enable flag and kill switch, startup grace, dirty-worktree policy, dispatch lock, worker capacity, request/publication backpressure, hourly dispatch/resource budgets, cooldown/freeze state, unanswered questions, and evaluator gates.
+
+Changing `remotebuddy.autonomy.enabled` through the supported runtime-config surface is applied live. Other autonomy settings should be treated as restart-required unless their implementation explicitly states otherwise.
+
+## Recovery validation
+
+After any intervention:
+
+1. Re-capture `/system/status` and compare the same queue stage.
+2. Verify claim/activity timestamps advance.
+3. Verify no new deadline misses or terminal failures appear for the same cause.
+4. Submit one bounded low-risk request and follow its exact request/job IDs.
+5. Keep any external incident record in the deployment's operations system. This repository intentionally does not assume a paging service, Slack channel, team alias, or response-time target.
+
+## Configuration levers
+
+The supported queue/capacity levers are in [`configs/default.toml`](../../../configs/default.toml):
+
+- `remotebuddy.poll_ms`
+- `remotebuddy.workerpal_online_ttl_ms`
+- `remotebuddy.wait_for_workerpal_ms`
+- `remotebuddy.auto_spawn_workerpals`
+- `remotebuddy.min_workerpals` / `max_workerpals`
+- `remotebuddy.workerpal_startup_timeout_ms`
+- `remotebuddy.workerpal_docker` / `workerpal_require_docker` / `workerpal_image`
+- RemoteBuddy execution/finalization budgets
+- `[remotebuddy.autonomy]` dispatch, backpressure, cooldown, and safety settings
+
+Change one bounded variable at a time, restart when required, and verify it through the built-in status fields. The previously documented `REMOTE_QUEUE_*`, `WORKER_LANE_*`, `REMOTE_TUNE_*`, and `REMOTE_AUTOPAUSE_*` variables are not implemented configuration keys.

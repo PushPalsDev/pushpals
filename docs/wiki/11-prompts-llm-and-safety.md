@@ -62,10 +62,13 @@ When editing prompts:
 
 Safety is implemented as layered controls:
 
-- scope invariants (`validateScopeInvariants`) around `target_paths` and `write_globs`,
+- scope metadata normalization (`validateScopeInvariants`) around
+  `target_paths` and `write_globs`; these fields guide planning and review but
+  are not a hard filesystem boundary,
 - policy checks by objective type/risk/glob breadth,
-- write limits (`max_files_to_edit`) and lane enforcement,
+- `max_files_to_edit` planning guidance and lane validation,
 - execution isolation (worktrees, Docker mode),
+- post-execution diff, validation, and critic gates,
 - downstream integration gating in SourceControlManager.
 
 ## Common Failure Modes
@@ -77,7 +80,9 @@ Safety is implemented as layered controls:
 - Provider behavior drift:
   - run eval suites and compare quality metrics before rollout.
 - RepositoryAgent is unavailable, times out, or returns invalid evidence:
-  - use a bounded existing deterministic/legacy path when safe, or fail closed when the answer is required for a safety decision; never bypass a gate.
+  - use a bounded existing deterministic path when safe, or fail closed when
+    the answer is required for a safety decision; RemoteBuddy autonomy does not
+    start a second model call after a late RepositoryAgent failure.
 - Recalled repository fact conflicts with the current worktree:
   - reject or invalidate it based on blob evidence and analyze the current snapshot.
 

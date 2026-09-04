@@ -8,10 +8,17 @@ import {
   PROTOCOL_VERSION,
   validateEventEnvelope,
   validateMessageRequest,
+  validateMessageResponse,
   validateApprovalDecisionRequest,
   validateCommandRequest,
+  validateSessionEventFrame,
   AnyEventEnvelope,
 } from "../packages/protocol/src/index";
+import {
+  validateCommandRequest as validateBrowserCommandRequest,
+  validateMessageResponse as validateBrowserMessageResponse,
+  validateSessionEventFrame as validateBrowserSessionEventFrame,
+} from "../packages/protocol/src/index.browser";
 import { randomUUID } from "crypto";
 
 console.log("PushPals Protocol Integration Test\n");
@@ -84,6 +91,30 @@ test("Invalid ts format rejected", () => {
 test("Valid message request passes", () => {
   const result = validateMessageRequest({ text: "Hello" });
   return result.ok === true;
+});
+
+test("Message request accepts structured intent metadata", () => {
+  const result = validateMessageRequest({
+    text: "Inspect the queue",
+    intent: { source: "client", readOnly: true },
+  });
+  return result.ok === true;
+});
+
+test("Message request rejects non-object intent metadata", () => {
+  return validateMessageRequest({ text: "Inspect the queue", intent: "status" }).ok === false;
+});
+
+test("Message response accepts queue-ingress metadata", () => {
+  const response = {
+    ok: true,
+    code: "accepted",
+    eventId: randomUUID(),
+    requestId: randomUUID(),
+    queuePosition: 1,
+    etaMs: 250,
+  };
+  return validateMessageResponse(response).ok && validateBrowserMessageResponse(response).ok;
 });
 
 // Test 4: Message request with invalid type fails
@@ -640,6 +671,14 @@ test("validateCommandRequest accepts valid command", () => {
   );
 });
 
+test("node and browser command validators accept autonomy events", () => {
+  const command = {
+    type: "autonomy_cycle_started",
+    payload: { runId: randomUUID(), snapshotId: randomUUID() },
+  };
+  return validateCommandRequest(command).ok && validateBrowserCommandRequest(command).ok;
+});
+
 test("validateCommandRequest rejects unknown type", () => {
   return (
     validateCommandRequest({
@@ -651,6 +690,46 @@ test("validateCommandRequest rejects unknown type", () => {
 
 test("validateCommandRequest rejects missing payload", () => {
   return validateCommandRequest({ type: "log" }).ok === false;
+});
+
+test("validateSessionEventFrame accepts the SSE/WebSocket wrapper", () => {
+  const envelope: EventEnvelope<"assistant_message"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "assistant_message",
+    payload: { text: "Ready" },
+  };
+  const frame = { envelope, cursor: 42 };
+  return validateSessionEventFrame(frame).ok && validateBrowserSessionEventFrame(frame).ok;
+});
+
+test("validateSessionEventFrame rejects a bare envelope", () => {
+  const envelope: EventEnvelope<"assistant_message"> = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    sessionId: randomUUID(),
+    type: "assistant_message",
+    payload: { text: "Ready" },
+  };
+  return validateSessionEventFrame(envelope).ok === false;
+});
+
+test("validateSessionEventFrame validates the nested event payload", () => {
+  const frame = {
+    envelope: {
+      protocolVersion: PROTOCOL_VERSION,
+      id: randomUUID(),
+      ts: new Date().toISOString(),
+      sessionId: randomUUID(),
+      type: "assistant_message",
+      payload: {},
+    },
+    cursor: 42,
+  };
+  return !validateSessionEventFrame(frame).ok && !validateBrowserSessionEventFrame(frame).ok;
 });
 
 // Summary

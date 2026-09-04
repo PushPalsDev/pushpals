@@ -228,6 +228,20 @@ export type AnyEventEnvelope = EventEnvelope<EventType>;
 /**
  * HTTP Request/Response types
  */
+export interface ClientRegistration {
+  clientId: string;
+  kind: string;
+  label?: string;
+  version?: string;
+  platform?: string;
+  repoRoot?: string;
+}
+
+export interface CreateSessionRequest {
+  sessionId?: string;
+  client?: ClientRegistration;
+}
+
 export interface CreateSessionResponse {
   sessionId: string;
   protocolVersion: typeof PROTOCOL_VERSION;
@@ -240,6 +254,12 @@ export interface MessageRequest {
 
 export interface MessageResponse {
   ok: boolean;
+  code?: "accepted" | "invalid" | "session_not_found" | "enqueue_failed";
+  eventId?: string;
+  requestId?: string;
+  queuePosition?: number;
+  etaMs?: number;
+  message?: string;
 }
 
 export interface ApprovalDecisionRequest {
@@ -248,6 +268,13 @@ export interface ApprovalDecisionRequest {
 
 export interface ApprovalDecisionResponse {
   ok: boolean;
+  message?: string;
+}
+
+/** Wire frame used by both the SSE `data:` field and WebSocket messages. */
+export interface SessionEventFrame {
+  envelope: EventEnvelope;
+  cursor: number;
 }
 
 /**
@@ -266,4 +293,5 @@ export interface CommandRequest {
 export interface CommandResponse {
   ok: boolean;
   eventId?: string;
+  message?: string;
 }

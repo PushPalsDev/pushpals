@@ -1,56 +1,94 @@
-# RemoteBuddy Queue Health (`task.execute`)
+# RemoteBuddy queue health triage
 
-_Last updated: 25 February 2026 — describes the paging playbook for on-call engineers when `task.execute` queue health alerts fire._
+Use this runbook when requests are not being planned, jobs are waiting, or queue latency is increasing. It relies only on controls and telemetry implemented in this repository.
 
-Use this runbook when Alertmanager or Grafana reports `task.execute` degradation. It pairs with
-`apps/remotebuddy/docs/queue.md` (monitoring) and `queue-playbook.md` (deep tuning) but keeps the
-alert triggers, restart order, and verification checks for `task.execute` in one place.
+## Establish the failing stage
 
-## Alert Thresholds
+1. Confirm Server is reachable:
 
-| Trigger                                                                                | Metric + surface                                                                                                                                                                              | Immediate action                                                                                       |
-| -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `queue_p95` ≥ **1.5 s** for 5 minutes (interactive lane, 15 min rollup)                | Grafana › RemoteBuddy Queue Overview (`queue_p95` panel), `/system/status.slo.requests.queueWaitMs`                                                                                           | Page RemoteBuddy Platform, confirm autopause of background/eval submissions, prep restart steps below. |
-| `job_failure_rate` ≥ **0.4** (failures / total `task.execute` jobs in last 10 minutes) | Grafana › WorkerPals Job Outcomes (`job_failure_rate` panel), PromQL `sum(rate(remote_jobs_failed_total{kind="task.execute"}[10m])) / sum(rate(remote_jobs_total{kind="task.execute"}[10m]))` | Page WorkerPals Runtime secondary, capture most recent WorkerPals logs, then run the restart flow.     |
+   ```bash
+   curl -sS http://127.0.0.1:3001/healthz
+   curl -sS http://127.0.0.1:3001/system/status
+   ```
 
-Treat either condition as a full queue-health incident. Always acknowledge alerts in `#pushpals-ops`
-within 5 minutes and start the steps below before experimenting with additional levers.
+2. Classify the backlog from `/system/status`:
 
-## On-Call Restart Steps
+   | Observation                                              | Owning stage                                 |
+   | -------------------------------------------------------- | -------------------------------------------- |
+   | `queues.requests.pending > 0`, no claim activity         | RemoteBuddy planning                         |
+   | Requests remain `claimed` without renewal/progress       | RemoteBuddy process or Server connectivity   |
+   | `queues.jobs.pending > 0`, no online workers             | WorkerPal capacity/startup                   |
+   | Claimed job has no recent job logs                       | WorkerPal execution or lost worker lease     |
+   | `queues.jobs.finalizing > 0` or completion backlog grows | SourceControlManager publication             |
+   | `queues.repositoryAgentHealth.unhealthy=true`            | RepositoryAgent worker hosted by RemoteBuddy |
 
-1. **Freeze the queue:** Pause background/eval submissions (LocalBuddy Admin throttle) and note
-   job IDs waiting longer than their queue budget; confirm interactive users keep priority.
-2. **Snapshot telemetry:** Collect `/system/status` (queue wait, pending per lane, idle workers) and
-   Grafana links for `queue_p95`, `job_failure_rate`, and Worker Backends latency. Pin both in the
-   incident thread.
-3. **Drain active workers gracefully:**
-   - `bun run workerpals:only -- --drain` (or `workerpals:only:docker`) to stop new `task.execute`
-     claims while letting in-flight jobs finish.
-   - Watch `/workers` until all lanes show idle > 0 and `runningTasks` drops to zero.
-4. **Restart components in order:**
-   1. `bun run server:only --env-file .env` (ensures job APIs are healthy) — keep logs in `/tmp/server.log`.
-   2. `bun run remotebuddy:only` (reseats planner + autonomous engine, rebuilds queue health state).
-   3. Restart WorkerPals pool: `bun run workerpals:only` (or `workerpals:only:docker` for the shared
-      pool). Launch at least the documented minimum idle workers per lane (≥3 interactive, ≥1 background).
-5. **Re-enable traffic carefully:** Resume background/eval submissions in 5-job batches only after
-   `queue_p95` < 1.0 s and `job_failure_rate` < 0.2 for two consecutive polls.
-6. **Document:** Post restart timestamps, commands, hostnames, and any anomalies (crash loops, schema
-   mismatches) in the PagerDuty incident + Slack thread.
+3. Inspect the oldest relevant rows rather than relying on queue depth alone:
 
-## Verification Checks
+   ```bash
+   curl -sS "http://127.0.0.1:3001/requests?status=pending&limit=20"
+   curl -sS "http://127.0.0.1:3001/jobs?status=all&limit=20"
+   curl -sS "http://127.0.0.1:3001/workers/autoscale?ttlMs=15000"
+   curl -sS "http://127.0.0.1:3001/completions?status=all&limit=20"
+   ```
 
-Run these immediately after restarts and again 10 minutes later:
+## Request backlog
 
-1. **Metrics back to green:** `queue_p95` ≤ 1.0 s, `job_failure_rate` ≤ 0.2, worker idle ≥ 3 per lane;
-   attach new Grafana snapshots to the thread.
-2. **WorkerPals log sweep:** No `task.execute` wrapper timeouts or crash loops for at least two claim
-   cycles; confirm `workerpals:only -- --tail` stays quiet aside from normal heartbeats.
-3. **Request sanity:** `curl -sS /system/status \| jq '{queue_p95: .slo.requests.queueWaitMs, pending: .queues.requests, jobs: .queues.jobPendingSnapshot}'`
-   shows pending interactive < 10 and zero zombie jobs; sample `/requests?status=pending&limit=5` to
-   ensure `createdAt` timestamps are < 2 minutes old.
-4. **Synthetic probe + autonomy review:** Ensure `probe.queue_lowload` < 650 ms and no new
-   `sig_queue_health` autonomy requests fired after the restart; close any remaining alerts only after
-   these probes stay healthy for 10 minutes.
+Healthy RemoteBuddy startup includes these messages:
 
-If any check fails, loop back to the restart step that applies (workers, remotebuddy, or server) and
-repeat verification before resuming background traffic.
+```text
+[RemoteBuddy] Using session: ...
+[RemoteBuddy] Starting polling loop (every ...ms)
+```
+
+When requests stay pending:
+
+- Confirm the RemoteBuddy process is alive and attached to the same Server URL/database as the client.
+- Look for `Poll error`, session-monitor errors, LLM failures, or supervisor restart-limit messages.
+- Compare `queues.requestPendingSnapshot` with `slo.requests.queueWaitMs`; the snapshot is current, while the percentile is a 24-hour terminal-history statistic.
+- Check whether a request is an unconfirmed autonomous dispatch. Such a row is intentionally hidden from claimers until its reservation is confirmed or expires.
+
+When a request stays claimed, do not manually mark it failed. RemoteBuddy renews its lease every 30 seconds, and Server recovers expired claims during normal request/status operations. A live claim may legitimately be waiting on the planner model.
+
+## Job backlog
+
+Check `GET /workers` and `GET /workers/autoscale`.
+
+- With `auto_spawn_workerpals=true`, RemoteBuddy tries to maintain `min_workerpals` and scales toward `max_workerpals` from busy workers plus autoscalable pending jobs. Open unmerged WorkerPal PRs may impose a small capacity floor.
+- Worker online state is derived from heartbeat age. A process can exist but still be offline from Server's perspective.
+- If Docker-backed startup is required, inspect Docker itself and the `Spawning WorkerPal`, startup-timeout, and process-exit logs.
+- If auto-spawn is disabled, start a worker using the repository's supported command: `bun run workerpals:only` or `bun run workerpals:only:docker`.
+- There are no lane-specific worker counts and no `--drain` command. Priorities and work classes are scheduler attributes on one durable job queue.
+
+For one failing job, fetch its persisted logs, tool runs, and terminal diagnostics. Do not immediately enqueue a replacement: stale-claim recovery distinguishes retry-safe work from work that requires manual review, and blindly duplicating a job can produce competing commits.
+
+## Finalization backlog
+
+A `finalizing` job has crossed the WorkerPal-to-SCM handoff. Inspect `queues.publication`, `/completions`, and SourceControlManager logs. Restarting RemoteBuddy will not publish it.
+
+Keep the candidate ref and shared database intact. SourceControlManager and Server use them to reconcile ambiguous callbacks and retained publication candidates.
+
+## Safe restart order
+
+For a source checkout, the preferred recovery is to stop the managed stack cleanly and restart it with:
+
+```bash
+bun run start
+```
+
+That path performs the repository's supported dependency, configuration, Git, Docker/image, port, and warmup checks.
+
+If services are being managed manually, start Server first, then RemoteBuddy, then any manually managed WorkerPals, and finally SourceControlManager. RemoteBuddy can start before a worker is online and will prewarm/auto-scale workers when configured. Preserve `outputs/data/pushpals.db` and `outputs/data/remotebuddy-state.db` throughout the restart.
+
+## Verification
+
+After recovery, verify behavior rather than an invented global threshold:
+
+- Server health returns `ok: true`.
+- RemoteBuddy logs a successful session and polling loop.
+- Pending requests are being claimed and their oldest age stops increasing.
+- Worker heartbeats are current and claimed jobs gain logs/activity.
+- Queue-deadline misses stop accumulating.
+- Finalizing jobs advance only when SourceControlManager is online.
+- A new low-risk request traverses the expected request or request-to-job path.
+
+If the same stage fails again, preserve its logs and follow the symptom-specific [recovery playbook](./queue-playbook.md).
