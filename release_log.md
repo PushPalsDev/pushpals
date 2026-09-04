@@ -2,45 +2,45 @@
 
 ## Release Metadata
 
-- version: `v1.2.47`
-- start_commit: `bd6122beb64830557ca80a2b1939b408c08db412`
-- end_commit: `761c7aa823f4cf7c457a13744ccaa90d5f9df947`
-- commits_in_range: `5`
+- version: `v1.2.48`
+- start_commit: `26e48bd1c6158ff415da364812e955f5d0cb449a`
+- end_commit: `9fc5385b0bc9840e4cc33d3f3fe3e0706df9cbce`
+- commits_in_range: `2`
 
 ## Highlights
 
-- Make the RepositoryAgent a generic, shared capability for every PushPals service, with evidence-bounded analysis, durable leases, structural caching, and repository-scoped memory reinforcement.
-- Build RepositoryAgent evidence from stable, deadline-bounded repository snapshots that resist root swaps, symlink and junction traversal, nested-repository leakage, concurrent file mutation, malformed Git object IDs, and executable-bit-only changes.
-- Fence autonomous dispatch with a fail-closed two-phase reservation protocol so disabled, expired, replayed, or unconfirmed objectives cannot leak into worker execution.
-- Enforce one monotonic end-to-end WorkerPal deadline across setup, execution, retries, validation, and host finalization while preserving a bounded cleanup reserve and cumulative model-usage evidence.
-- Retain exact candidate commits through trusted-host validation and add HMAC-scoped SCM repair authority, durable repair lifecycles, startup reconciliation, and cross-job failure circuit breaking.
-- Improve quality and speed with focused-first validation DAGs, invariant-gate reuse, rollout/no-edit watchdog recovery, candidate-aware repair, and accurate terminal semantics for unchanged or blocked work.
-- Isolate concurrent Linux dependency projections with copy-on-write snapshots instead of shared writable hardlink inodes, while keeping deterministic LF worktrees and bounded dependency preparation telemetry.
-- Report subprocess output truncation and UTF-8 decoding failures structurally, preserve literal output bytes, and forward cancellation and stdin consistently through every service adapter.
-- Expand lifecycle, timeout, crash, publication, memory, snapshot-security, package-parity, and observability harnesses across Windows, Linux, source, and embedded runtime assets.
-- Run Linux dependency-projection integration coverage on every relevant main/PR CLI E2E, require the exact product commit's cross-platform CI to pass before tagging, and keep Windows snapshot instrumentation stable across canonical path spellings.
-- Run the npm package-payload contract before release tags, bound nested package inspection with layered deadlines and complete launch diagnostics, and keep process-tree smoke assertions portable across minimal Linux containers.
+- Fix Windows startup when an outdated Bun installation appears before a compatible npm-managed Bun on `PATH`; the launcher now checks candidates in order and selects the first runtime satisfying Bun 1.3.14+.
+- Resolve global and project-local npm `bun`/`bun.cmd` shims to their native executable, deduplicate equivalent paths, honor the authoritative `PUSHPALS_BUN_BIN` override, and keep discovery within one bounded probe budget.
+- Report every checked Bun path and version with actionable upgrade, timeout, and shadowed-installation diagnostics when startup cannot continue.
+- Package the new runtime resolver with the npm CLI and exercise its selection and payload contracts in hosted Windows CI before release.
+- Synchronize Node and browser protocol validators, schemas, and packaged mirrors with the current structured session-ingress and session-event-frame contracts.
+- Refresh the canonical architecture diagram and operational documentation to match the implemented service topology, queue scheduling, authority boundaries, configuration, and client surfaces.
 
 ## Validation
 
-- A clean, resource-limited Linux container with Bun 1.3.14 passed `bun run test:root`: `1,973` tests passed, `12` intentional platform-gated skips, `0` failures, and `11,149` assertions across `168` files.
-- Focused Windows release, process-tree, package-payload, and durable-autonomy coverage passed `137` tests with `0` failures and `1,233` assertions.
-- `bun run harness:reliability` passed all `7` phases in `508` seconds; its runtime-boundary phase passed `473` tests with `7` Windows platform-gated skips and `0` failures.
-- Repository snapshot regressions passed `37` Windows tests and a container-native Linux/parity run of `41` tests, covering root replacement, junction opacity, nested Git state, no-follow file access, SHA-1/SHA-256 repositories, deadlines, cancellation, and stable observations.
-- The exact final product commit passed hosted Windows snapshot/startup contracts, Linux packaged CLI E2E (including the new package-payload gate), Linux WorkerPal control-plane E2E, and both Linux dependency-projection integrations before tagging.
-- RepositoryAgent/memory, two-phase autonomy dispatch, durable SCM repair, publication recovery, monotonic deadline, cleanup-reserve, and dependency-projection regression suites passed both focused and full runs.
-- `bun run cli:bundle` rebuilt all packaged service runtimes and source mirrors successfully, and runtime mirror parity checks passed.
-- `bun run cli:verify-package-payload` verified `269` package files with no external toolchain files.
-- Shared and RemoteBuddy typechecks passed; two independent final review passes found and confirmed fixes for conservative PID validation and cleanup, then found no remaining actionable issue; Prettier and `git diff --check` passed.
+- Bun 1.3.14 passed `bun run test:root`: `1,987` tests passed, `7` intentional platform-gated skips, `0` failures, and `15,581` assertions across `169` files.
+- `bun test tests/cli.bun-runtime-resolver.test.ts` passed all `9` focused resolver tests, including outdated-first/compatible-npm-second, project-local shim, explicit override, fallback-shell, and shared-timeout cases.
+- `bun run test:protocol` passed all `51` Node/browser contract checks, and `bun run protocol:typecheck` passed.
+- `bun run cli:bundle` rebuilt the packaged CLI successfully without producing stale generated-asset changes.
+- `bun run cli:verify-package-payload` verified `270` package files, including `bin/bun-runtime.cjs`, with no external toolchain files.
+- The exact final product commit passed hosted Windows resolver/startup contracts, Linux packaged CLI E2E, Linux WorkerPal control-plane E2E, and Linux dependency-projection coverage in CLI E2E run `33847165864`.
+- Source and installed-package launcher smokes passed with Bun 1.3.14, including the explicit executable override.
+- Two independent review passes found and closed hosted-CI, project-local-shim, timeout-diagnostic, documentation-map, and Windows line-ending gaps; Prettier, Node syntax checks, and `git diff --check` passed.
 
 ## Install
 
 ```bash
-npm i -g @pushpalsdev/cli@1.2.47
+npm install -g @pushpalsdev/cli@1.2.48
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.47
+bun install -g @pushpalsdev/cli@1.2.48
+```
+
+For environments using a managed certificate store:
+
+```bash
+bun install -g --use-system-ca @pushpalsdev/cli@1.2.48
 ```
 
 ## Artifacts
@@ -57,6 +57,8 @@ bun install -g @pushpalsdev/cli@1.2.47
 
 ## Known Issues
 
-- The immutable `v1.2.44`, `v1.2.45`, and `v1.2.46` tags did not publish to npm: their pre-publication gates exposed a repository-snapshot regression, a Linux-only test import omission, and an implicit test-timeout ceiling. The corrected release is `v1.2.47`; do not install or republish those unpublished tags.
+- The npm entrypoint requires Node.js 20+ and at least one Bun 1.3.14+ installation. Standalone GitHub release binaries remain available when installing Bun is not practical.
+- `PUSHPALS_BUN_BIN` is authoritative when set; unset or correct it if it points to a removed or outdated runtime.
+- The immutable `v1.2.44`, `v1.2.45`, and `v1.2.46` tags remain unpublished on npm; install `v1.2.47` or newer.
 - Docker-backed WorkerPal execution still requires Docker to be installed and running when auto-spawn is enabled. `pushpals --clear` treats a stopped Docker daemon as a best-effort cleanup skip.
 - Some Windows Git installations may need Schannel certificate handling for remote operations, for example `git -c http.sslBackend=schannel fetch origin`.
