@@ -118,6 +118,12 @@ jobs:
           tests/workerpals.windows-sandbox-env.integration.test.ts
           tests/workerpals.worktree-boundary.test.ts
 
+      - name: Verify Windows worker recovery and trusted-validation contracts
+        run: >-
+          bun test
+          tests/workerpals.executor-timeout-recovery.test.ts
+          tests/source-control-manager.trusted-validation.test.ts
+
       - name: Verify isolated Windows source-only runtime startup
         env:
           PUSHPALS_KEEP_E2E_TMP: "1"

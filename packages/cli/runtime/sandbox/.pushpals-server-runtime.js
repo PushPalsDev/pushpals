@@ -15223,7 +15223,8 @@ class JobQueue {
       if (hasPhaseSpans)
         this.db.prepare(`DELETE FROM job_phase_spans WHERE jobId = ?`).run(jobId);
       if (hasValidationRuns) {
-        this.db.prepare(`DELETE FROM job_validation_runs WHERE jobId = ?`).run(jobId);
+        this.db.prepare(`DELETE FROM job_validation_runs WHERE jobId = ?
+          AND COALESCE(json_extract(CASE WHEN json_valid(metadataJson) THEN metadataJson ELSE '{}' END, '$.source'), 'worker') <> 'trusted_host'`).run(jobId);
       }
       if (hasPatchSnapshots) {
         this.db.prepare(`DELETE FROM job_patch_snapshots WHERE jobId = ?`).run(jobId);
@@ -15264,7 +15265,19 @@ class JobQueue {
         const command = diagnosticText(run.command, 1000);
         if (!command)
           continue;
-        insertValidationRun.run(jobId, boundedDbInt(run.attempt, 1000), command, boundedDbInt(run.exitCode, 999), boundedDbInt(run.durationMs, 24 * 60 * 60 * 1000), boolFromUnknown(run.passed) ? 1 : 0, diagnosticText(run.failureClass, 160), diagnosticText(run.stdoutTail, 8000), diagnosticText(run.stderrTail, 8000), diagnosticMetadataJson(run.metadata), now);
+        const metadata = { ...recordFromUnknown(run.metadata), source: "worker" };
+        for (const key of [
+          "completionId",
+          "baselineSha",
+          "candidateSha",
+          "candidateRef",
+          "validationTarget",
+          "validation_target",
+          "baselineFailureProven",
+          "baseline_failure_proven"
+        ])
+          delete metadata[key];
+        insertValidationRun.run(jobId, boundedDbInt(run.attempt, 1000), command, boundedDbInt(run.exitCode, 999), boundedDbInt(run.durationMs, 24 * 60 * 60 * 1000), boolFromUnknown(run.passed) ? 1 : 0, diagnosticText(run.failureClass, 160), diagnosticText(run.stdoutTail, 8000), diagnosticText(run.stderrTail, 8000), diagnosticMetadataJson(metadata), now);
       }
       const insertPatchSnapshot = this.db.prepare(`INSERT INTO job_patch_snapshots (
            jobId, attempt, phase, publishableFileCount, artifactOnlyPathCount,
@@ -22490,7 +22503,7 @@ ${failureFingerprint2}`;
           group.requiredCommands.add(command);
       }
     }
-    const activeGroups = [...groups.values()].filter((group) => group.failureCount >= 2).filter((group) => group.failedJobIds.size >= 2).filter((group) => {
+    const activeGroups = [...groups.values()].filter((group) => group.failureCount >= 2 && group.failedJobIds.size >= 2 || group.source === "trusted_host" && group.failedTests.size > 0 && group.pathHints.length > 0 && (group.baselineFailureProven || group.candidateRefs.size > 0)).filter((group) => {
       const commandSourceKey = `${group.command}
 ${group.source}
 ${group.baselineSha ?? "unknown-baseline"}`;
@@ -23167,6 +23180,8 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         active_cooldowns: snapshot.active_cooldowns.slice(0, 40),
         open_objectives: snapshot.open_objectives.slice(0, 40),
         recent_objectives: snapshot.recent_objectives.slice(0, 80),
+        executed_objectives: snapshot.executed_objectives ?? [],
+        executed_outcome_watermark: snapshot.executed_outcome_watermark ?? null,
         repo_health_flags: snapshot.repo_health_flags,
         validation_incident: snapshot.validation_incident,
         dispatch_budget: snapshot.dispatch_budget,
@@ -23453,6 +23468,26 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
          ORDER BY o.updated_at DESC
          LIMIT 100`).all(new Date(Date.parse(now) - 24 * 60 * 60000).toISOString());
     const recentObjectives = recentObjectiveRows.map(hydrateObjective);
+    const executedObjectiveRows = this.db.prepare(`SELECT o.id AS objective_id, o.title, o.status, o.objective_type, o.component_area,
+              o.pattern_key, o.incident_key, o.job_id, o.scope_json, o.updated_at,
+              o.evidence_json, ${objectiveJobProjection}, ${objectiveValidationProjection}
+       FROM autonomy_objectives o
+       ${objectiveJobJoins}
+       ${objectiveValidationJoins}
+       WHERE o.job_id IS NOT NULL AND o.job_id <> ''
+         AND o.status IN ('completed', 'failed', 'dead_letter')
+         AND o.updated_at >= ?
+       ORDER BY o.updated_at DESC LIMIT 16`).all(new Date(Date.parse(now) - 24 * 60 * 60000).toISOString());
+    const executedObjectives = executedObjectiveRows.map(hydrateObjective);
+    const executedOutcomeSummary = this.db.prepare(`SELECT COUNT(*) AS total,
+              SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+              SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
+              MAX(updated_at) AS latest_update
+       FROM autonomy_objectives
+       WHERE job_id IS NOT NULL AND job_id <> ''
+         AND status IN ('completed', 'failed', 'dead_letter')`).get();
+    const executedOutcomeWatermark = sha256Hex(JSON.stringify(executedOutcomeSummary));
     const dispatchBudget = this.getDispatchCountsLastHour(now);
     const resourceBudget = this.resourceBudgetSnapshot(now);
     const stateTraits = this.buildStateTraits({
@@ -23479,6 +23514,8 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
       active_cooldowns: activeCooldowns,
       open_objectives: openObjectives,
       recent_objectives: recentObjectives,
+      executed_objectives: executedObjectives,
+      executed_outcome_watermark: executedOutcomeWatermark,
       repo_health_flags: {
         is_worktree_dirty: Boolean(params.repoHealthFlags?.is_worktree_dirty),
         is_merge_in_progress: Boolean(params.repoHealthFlags?.is_merge_in_progress),

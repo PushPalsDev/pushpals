@@ -3937,7 +3937,14 @@ export class JobQueue {
       if (hasAttempts) this.db.prepare(`DELETE FROM job_attempts WHERE jobId = ?`).run(jobId);
       if (hasPhaseSpans) this.db.prepare(`DELETE FROM job_phase_spans WHERE jobId = ?`).run(jobId);
       if (hasValidationRuns) {
-        this.db.prepare(`DELETE FROM job_validation_runs WHERE jobId = ?`).run(jobId);
+        // Worker retries may replace worker observations, never SCM's trusted
+        // publication evidence (including a delayed upload during finalizing).
+        this.db
+          .prepare(
+            `DELETE FROM job_validation_runs WHERE jobId = ?
+          AND COALESCE(json_extract(CASE WHEN json_valid(metadataJson) THEN metadataJson ELSE '{}' END, '$.source'), 'worker') <> 'trusted_host'`,
+          )
+          .run(jobId);
       }
       if (hasPatchSnapshots) {
         this.db.prepare(`DELETE FROM job_patch_snapshots WHERE jobId = ?`).run(jobId);
@@ -4028,6 +4035,21 @@ export class JobQueue {
       for (const run of validationRuns) {
         const command = diagnosticText(run.command, 1000);
         if (!command) continue;
+        const metadata = { ...recordFromUnknown(run.metadata), source: "worker" } as Record<
+          string,
+          unknown
+        >;
+        for (const key of [
+          "completionId",
+          "baselineSha",
+          "candidateSha",
+          "candidateRef",
+          "validationTarget",
+          "validation_target",
+          "baselineFailureProven",
+          "baseline_failure_proven",
+        ])
+          delete metadata[key];
         insertValidationRun.run(
           jobId,
           boundedDbInt(run.attempt, 1000),
@@ -4038,7 +4060,7 @@ export class JobQueue {
           diagnosticText(run.failureClass, 160),
           diagnosticText(run.stdoutTail, 8_000),
           diagnosticText(run.stderrTail, 8_000),
-          diagnosticMetadataJson(run.metadata),
+          diagnosticMetadataJson(metadata),
           now,
         );
       }

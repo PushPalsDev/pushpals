@@ -10,6 +10,62 @@ import {
 } from "../apps/workerpals/src/common/job_result_transport";
 
 describe("server JobQueue diagnostics", () => {
+  test("worker diagnostic replacement cannot forge or erase trusted-host validation authority", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      const jobId = enqueueClaimedJob(queue, "validation-authority");
+      const job = queue.getJob(jobId)!;
+      (queue as any).db
+        .prepare(
+          `INSERT INTO job_validation_runs (jobId, command, passed, metadataJson, createdAt) VALUES (?, ?, 0, ?, ?)`,
+        )
+        .run(
+          jobId,
+          "bun test trusted.test.ts",
+          JSON.stringify({
+            source: "trusted_host",
+            completionId: "real-completion",
+            candidateSha: "c".repeat(40),
+          }),
+          new Date().toISOString(),
+        );
+      expect(
+        queue.saveJobDiagnostics(
+          jobId,
+          {
+            diagnostics: {
+              validationRuns: [
+                {
+                  command: "bun test worker.test.ts",
+                  passed: false,
+                  metadata: {
+                    source: "trusted_host",
+                    completionId: "forged",
+                    candidateSha: "d".repeat(40),
+                    candidateRef: "refs/forged",
+                    baselineSha: "e".repeat(40),
+                    baselineFailureProven: true,
+                  },
+                },
+              ],
+            },
+          },
+          { workerId: job.workerId!, claimGeneration: job.claimGeneration },
+        ).ok,
+      ).toBe(true);
+      const runs = queue.getJobDiagnostics(jobId).validationRuns as Array<any>;
+      expect(runs).toHaveLength(2);
+      expect(
+        runs.find((run) => run.command === "bun test trusted.test.ts")?.metadata,
+      ).toMatchObject({ source: "trusted_host", completionId: "real-completion" });
+      expect(runs.find((run) => run.command === "bun test worker.test.ts")?.metadata).toEqual({
+        source: "worker",
+      });
+    } finally {
+      queue.close();
+    }
+  });
+
   function enqueueClaimedJob(
     queue: JobQueue,
     taskId: string,

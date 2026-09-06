@@ -56,8 +56,11 @@ The before/after snapshot fence catches repository drift and unintended writes. 
 RepositoryAgent availability must not deadlock RemoteBuddy's ordinary request
 loop. The typed client applies bounded HTTP and overall polling deadlines. In
 the normal RepositoryAgent-enabled autonomy path, an unavailable, timed-out,
-malformed, or empty result leads directly to bounded deterministic repo/vision
-candidates without a second model call. A composition with no RepositoryAgent
+malformed, or empty result leads to bounded deterministic repo/vision candidates
+without a separate ideation model call. Within its existing synthesis deadline,
+RepositoryAgent may first make one correction attempt for a malformed candidate
+contract. Invalid results are never accepted as cache hits, and executed outcomes
+invalidate stale advice independently of volatile queue snapshots. A composition with no RepositoryAgent
 capability can still use the older bounded ideation path. Safety-critical
 callers fail closed unless an existing deterministic path is independently
 safe.

@@ -863,10 +863,25 @@ def _looks_like_route_shell_task(params: Dict[str, Any]) -> bool:
 
 
 def _build_efficiency_guidance(params: Dict[str, Any]) -> str:
+    revision = bool(str(params.get("qualityRevisionHint") or "").strip())
+    raw_turn_budget = params.get("executorTurnBudgetMs")
+    turn_budget_s = (
+        max(1, int(raw_turn_budget // 1000))
+        if isinstance(raw_turn_budget, (int, float)) and not isinstance(raw_turn_budget, bool)
+        and 0 < raw_turn_budget < float("inf") else None
+    )
     lines: List[str] = [
         "Worker speed/convergence contract from PushPals:",
-        "- Target useful completion in roughly 20 minutes for small or medium repo tasks; optimize for the smallest coherent patch over exhaustive exploration.",
-        "- Phase soft budgets: discovery <= 3m for small scoped tasks and <= 5m otherwise, editing <= 10m, focused validation <= 5m, final diff review <= 2m. If a phase runs long, narrow scope rather than expanding the harness.",
+        (
+            f"- This executor turn has at most {turn_budget_s}s for reading, edits, focused checks, and its final response; the original job deadline is shared with other turns."
+            if turn_budget_s is not None else
+            "- Target useful completion in roughly 20 minutes for small or medium repo tasks; optimize for the smallest coherent patch over exhaustive exploration."
+        ),
+        (
+            "- This is a focused revision of an existing patch. Inspect the current diff and the supplied failure/critic evidence, spend at most 30s rediscovering context, make the smallest correction, and return after focused checks. Do not restart full repository discovery or run aggregate validation; PushPals owns the full gates after this turn."
+            if revision else
+            "- Allocate roughly 15% of this turn to discovery, 60% to editing, 20% to focused validation, and 5% to the final diff review. If a phase runs long, narrow scope rather than expanding the harness."
+        ),
         "- No-edit checkpoint: if you have not made a patch after identifying the behavior-owning file, stop discovering and edit that file now. Do not spend the execution budget proving every adjacent assumption first.",
         "- Discovery command budget: for compact tasks, use at most 5-8 targeted read/search commands before editing. If that is not enough, state the blocker and patch the best behavior owner rather than widening discovery.",
     ]
@@ -926,7 +941,7 @@ def _build_planning_guidance(params: Dict[str, Any]) -> str:
     )
     lines.append("  - final diff review: remove unrelated churn before returning.")
     lines.append(
-        "- Phase soft budget: aim for discovery <= 5m, editing <= 10m, focused validation <= 5m, final diff review <= 2m; if test harness setup starts consuming the budget, reduce to simpler helper/state coverage."
+        "- Phase limits: follow the current executor-turn budget and revision guidance above; do not assume a fresh full-job budget. If test harness setup consumes that budget, reduce to focused coverage using the existing harness."
     )
 
     scope = planning.get("scope")

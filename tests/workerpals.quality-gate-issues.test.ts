@@ -215,7 +215,13 @@ describe("workerpals quality gate critic issue formatting", () => {
 
     const result = isolatePureEnvironmentValidationDeferral(quality);
     expect(result.pureEnvironmentDeferral).toBe(false);
-    expect(result.qualityForCritic).toBe(quality);
+    expect(result.blockedCommands).toEqual(["bun run validate"]);
+    expect(result.qualityForCritic.validationRuns).toEqual([assertionRun]);
+    expect(result.qualityForCritic.requiredValidationFailures).toEqual([]);
+    expect(result.qualityForCritic.issues.join("\n")).toContain("bun test focused.test.ts");
+    expect(result.qualityForCritic.issues.join("\n")).not.toContain("bun run validate");
+    expect(result.qualityForCritic.trustedValidationPendingCommands).toEqual(["bun run validate"]);
+    expect(result.qualityForCritic.ok).toBe(false);
   });
 
   test("does not classify assertion text as environment-only from incidental substrings", () => {

@@ -27,8 +27,13 @@ import {
   type RepositoryAgentWorkerControl,
 } from "shared";
 import type { LLMClient, LLMGenerateInput } from "./llm.js";
+import {
+  AUTONOMY_CANDIDATE_ENUMS,
+  AUTONOMY_CANDIDATES_DATA_SCHEMA,
+  autonomyCandidateContractErrors,
+} from "./autonomy_candidate_contract.js";
 
-const PROMPT_VERSION = "repository-agent-v4-staged-evidence";
+const PROMPT_VERSION = "repository-agent-v5-validated-candidates";
 const CACHE_NAMESPACE = "repository_agent_cache";
 const CAPABILITY_NAMESPACE = "repository_agent_capabilities";
 const FACT_NAMESPACE = "repository_facts";
@@ -1129,6 +1134,7 @@ function normalizedDeterministicPolicy(request: RepositoryAgentRequest) {
   const rawConfidence = Number(policy.minimumConfidence ?? 0);
   return {
     maxCandidates: clampInt(policy.maxCandidates, 3, 1, 64),
+    candidateEnums: AUTONOMY_CANDIDATE_ENUMS,
     minimumConfidence: Number.isFinite(rawConfidence) ? Math.max(0, Math.min(1, rawConfidence)) : 0,
     allowedObjectiveTypes: list(policy.allowedObjectiveTypes, 16, 128),
     requiredCandidateFields: list(policy.requiredCandidateFields, 32, 256),
@@ -1150,6 +1156,17 @@ function cacheKey(request: RepositoryAgentRequest, modelId: string, promptVersio
             visionFingerprint,
             questionProtocol: sha256(compactText(request.question, 32_000)),
             deterministicPolicy: normalizedDeterministicPolicy(request),
+            // Snapshot IDs, queue ages and transient counters do not invalidate
+            // structural analysis. Executed outcomes do: do not replay the same
+            // recommendation after its concrete job has failed.
+            executedOutcomes: executedAutonomyOutcomes(request),
+            executedOutcomeWatermark:
+              compactText(
+                isRecord(request.context?.runtimeSignals)
+                  ? request.context.runtimeSignals.executedOutcomeWatermark
+                  : null,
+                128,
+              ) || null,
           }
         : {
             revision: request.repository.revision,
@@ -1160,6 +1177,36 @@ function cacheKey(request: RepositoryAgentRequest, modelId: string, promptVersio
       promptVersion,
     }),
   );
+}
+
+function executedAutonomyOutcomes(request: RepositoryAgentRequest) {
+  const signals = isRecord(request.context?.runtimeSignals) ? request.context.runtimeSignals : {};
+  return (Array.isArray(signals.recentObjectives) ? signals.recentObjectives : [])
+    .filter(
+      (entry) =>
+        isRecord(entry) &&
+        entry.job_id &&
+        ["completed", "failed", "dead_letter"].includes(String(entry.status)),
+    )
+    .slice(0, 16)
+    .map((entry) => {
+      const row = entry as Record<string, unknown>;
+      return {
+        jobId: row.job_id,
+        status: row.status,
+        visionObjectiveId: row.vision_objective_id ?? null,
+        targetPaths: row.target_paths ?? [],
+        failureFingerprint: row.attempt_failure_fingerprint ?? null,
+      };
+    })
+    .sort((left, right) => String(left.jobId).localeCompare(String(right.jobId)));
+}
+
+function validateAutonomyCandidateData(request: RepositoryAgentRequest, data: unknown): void {
+  if (autonomyVisionFingerprint(request) == null) return;
+  const errors = autonomyCandidateContractErrors(data);
+  if (errors.length)
+    throw new RepositoryAgentWorkerError("invalid_autonomy_candidates", errors.join("; "), false);
 }
 
 type CapabilityCircuitValue = {
@@ -2282,6 +2329,7 @@ export class RepositoryAgentWorker {
     if (!cached) return null;
     try {
       const structuralAutonomy = autonomyVisionFingerprint(request) != null;
+      validateAutonomyCandidateData(request, cached.data);
       const cachedEvidence = Array.isArray(cached.evidence)
         ? cached.evidence.map((entry) => {
             if (!structuralAutonomy || !isRecord(entry)) return entry;
@@ -2331,21 +2379,29 @@ export class RepositoryAgentWorker {
         memoryRefForRecord(record, "analysis_cache"),
       ]);
       try {
-        await this.memoryWithinDeadline("exact cache reinforcement", signal, stageDeadlineMs, () =>
-          this.memory.reinforce({
-            scope: cacheScope(request),
-            key,
-            outcome: "confirmed",
-            provenance: {
-              service: "repository_agent",
-              agentId: this.agentId,
-              requestId,
-              modelId: record.provenance.modelId ?? this.modelId,
-              headSha: request.repository.revision,
-              promptVersion: this.promptVersion,
-            },
-          }),
-        );
+        // Reading an analysis is not evidence that its proposed work succeeded.
+        // Autonomy usefulness is reinforced by durable downstream job/PR outcomes.
+        if (!structuralAutonomy) {
+          await this.memoryWithinDeadline(
+            "exact cache reinforcement",
+            signal,
+            stageDeadlineMs,
+            () =>
+              this.memory.reinforce({
+                scope: cacheScope(request),
+                key,
+                outcome: "confirmed",
+                provenance: {
+                  service: "repository_agent",
+                  agentId: this.agentId,
+                  requestId,
+                  modelId: record.provenance.modelId ?? this.modelId,
+                  headSha: request.repository.revision,
+                  promptVersion: this.promptVersion,
+                },
+              }),
+          );
+        }
       } catch (error) {
         throwIfAborted(signal);
         this.logger.warn(`[RepositoryAgent] cache reinforcement skipped: ${String(error)}`);
@@ -2362,7 +2418,7 @@ export class RepositoryAgentWorker {
             this.memory.invalidate({
               scope: cacheScope(request),
               keys: [key],
-              reason: `cached Repository Agent evidence is stale: ${String(error)}`,
+              reason: `cached Repository Agent result failed validation: ${String(error)}`,
             }),
         );
       } catch (invalidationError) {
@@ -2407,7 +2463,7 @@ export class RepositoryAgentWorker {
         stateTraits: compactArray(runtimeSignals.stateTraits, 5),
         feedbackPriors: compactArray(runtimeSignals.feedbackPriors, 4),
         openObjectives: compactArray(runtimeSignals.openObjectives, 4),
-        recentObjectives: compactArray(runtimeSignals.recentObjectives, 4),
+        recentObjectives: compactArray(runtimeSignals.recentObjectives, 16),
         activeCooldowns: compactArray(runtimeSignals.activeCooldowns, 4),
       },
       deterministicPolicy: normalizedDeterministicPolicy(request),
@@ -2652,7 +2708,17 @@ export class RepositoryAgentWorker {
     const input: LLMGenerateInput = {
       system: REPOSITORY_AGENT_SYSTEM_PROMPT,
       json: true,
-      jsonSchema: REPOSITORY_AGENT_OUTPUT_SCHEMA,
+      jsonSchema:
+        autonomyVisionFingerprint(request) == null
+          ? REPOSITORY_AGENT_OUTPUT_SCHEMA
+          : {
+              ...REPOSITORY_AGENT_OUTPUT_SCHEMA,
+              required: [...(REPOSITORY_AGENT_OUTPUT_SCHEMA.required as string[]), "data"],
+              properties: {
+                ...(REPOSITORY_AGENT_OUTPUT_SCHEMA.properties as Record<string, unknown>),
+                data: AUTONOMY_CANDIDATES_DATA_SCHEMA,
+              },
+            },
       maxTokens: 3_200,
       temperature: 0.1,
       // HTTP completion backends ignore executionContext. A configured or
@@ -2684,9 +2750,39 @@ export class RepositoryAgentWorker {
       ],
     };
     try {
-      const generated = await this.generateWithinStage(input, signal, synthesisDeadlineMs);
+      let generated = await this.generateWithinStage(input, signal, synthesisDeadlineMs);
       throwIfAborted(signal);
-      const raw = parseJsonObject(generated.text);
+      let raw = parseJsonObject(generated.text);
+      try {
+        validateAutonomyCandidateData(request, raw.data);
+      } catch (error) {
+        if (
+          !(error instanceof RepositoryAgentWorkerError) ||
+          error.code !== "invalid_autonomy_candidates" ||
+          synthesisDeadlineMs - Date.now() < MIN_SYNTHESIS_START_BUDGET_MS
+        )
+          throw error;
+        this.logger.warn(
+          `[RepositoryAgent] autonomyCandidateContractRejected=${JSON.stringify({ requestId, attempt: 1, errors: autonomyCandidateContractErrors(raw.data), retry: true })}`,
+        );
+        generated = await this.generateWithinStage(
+          {
+            ...input,
+            messages: [
+              ...input.messages,
+              {
+                role: "user",
+                content: `Your previous result failed deterministic candidate-contract validation: ${autonomyCandidateContractErrors(raw.data).join("; ")}. Return one complete corrected result using the exact schema enums and fields. Do not invent aliases or propose multi-day work as a small task.`,
+              },
+            ],
+          },
+          signal,
+          synthesisDeadlineMs,
+        );
+        throwIfAborted(signal);
+        raw = parseJsonObject(generated.text);
+        validateAutonomyCandidateData(request, raw.data);
+      }
       const evidence = await validateEvidence(
         repoRoot,
         request,

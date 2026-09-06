@@ -53,6 +53,8 @@ const BACKEND_TIMEOUT_RESULT_GRACE_MS = 30_000;
 const OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS = 240_000;
 const OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS = 720_000;
 const OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS = 540_000;
+const OPENAI_CODEX_MIN_REVISION_TURN_BUDGET_MS = 120_000;
+const OPENAI_CODEX_MIN_REVISION_VALIDATION_RESERVE_MS = 90_000;
 const OPENAI_CODEX_VALIDATION_RESERVE_RATIO = 0.25;
 
 function estimateTokensFromText(text: string): number {
@@ -262,14 +264,18 @@ export function resolveGenericPythonExecutorTimeoutMs(params: {
 
 export function resolveOpenAICodexValidationReserveMs(
   executionBudgetMs: number | null | undefined,
+  qualityRevisionAttempt = 0,
 ): number {
   if (typeof executionBudgetMs !== "number" || !Number.isFinite(executionBudgetMs)) return 0;
   const budgetMs = Math.max(1, Math.floor(executionBudgetMs));
+  const revision = Number.isFinite(qualityRevisionAttempt) && qualityRevisionAttempt > 0;
   const targetReserveMs = Math.floor(
     Math.min(
       budgetMs,
       Math.max(
-        OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS,
+        revision
+          ? OPENAI_CODEX_MIN_REVISION_VALIDATION_RESERVE_MS
+          : OPENAI_CODEX_MIN_VALIDATION_RESERVE_MS,
         Math.min(
           OPENAI_CODEX_MAX_VALIDATION_RESERVE_MS,
           budgetMs * OPENAI_CODEX_VALIDATION_RESERVE_RATIO,
@@ -279,7 +285,10 @@ export function resolveOpenAICodexValidationReserveMs(
   );
   const maxReserveAfterPrimaryTurn = Math.max(
     0,
-    budgetMs - OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS,
+    budgetMs -
+      (revision
+        ? Math.min(OPENAI_CODEX_MIN_REVISION_TURN_BUDGET_MS, Math.floor(budgetMs / 2))
+        : OPENAI_CODEX_MIN_PRIMARY_TURN_BUDGET_MS),
   );
   return Math.max(0, Math.min(targetReserveMs, maxReserveAfterPrimaryTurn));
 }
@@ -288,6 +297,7 @@ export function resolveGenericPythonExecutorChildTimeoutMs(params: {
   backendName: string;
   hostTimeoutMs: number;
   executionBudgetMs?: number | null;
+  qualityRevisionAttempt?: number;
 }): number | null {
   const hostTimeoutMs = Math.max(1, Math.floor(params.hostTimeoutMs));
   if (params.backendName !== "openai_codex") return null;
@@ -295,7 +305,10 @@ export function resolveGenericPythonExecutorChildTimeoutMs(params: {
     typeof params.executionBudgetMs === "number" && Number.isFinite(params.executionBudgetMs)
       ? Math.max(1, Math.floor(params.executionBudgetMs))
       : null;
-  const validationReserveMs = resolveOpenAICodexValidationReserveMs(executionBudgetMs);
+  const validationReserveMs = resolveOpenAICodexValidationReserveMs(
+    executionBudgetMs,
+    params.qualityRevisionAttempt,
+  );
   const childBudgetMs =
     executionBudgetMs == null
       ? hostTimeoutMs
@@ -312,6 +325,7 @@ export function resolveGenericPythonExecutorChildTimeoutEnv(params: {
   backendName: string;
   hostTimeoutMs: number;
   executionBudgetMs?: number | null;
+  qualityRevisionAttempt?: number;
 }): Record<string, string> {
   const childTimeoutMs = resolveGenericPythonExecutorChildTimeoutMs(params);
   if (childTimeoutMs == null) return {};
@@ -531,19 +545,23 @@ export function createGenericPythonExecutor(
       finalizationBudgetMs,
       timeoutMs,
     );
-    const payloadBase64 = Buffer.from(
-      JSON.stringify({
-        kind,
-        params,
-        repo,
-      }),
-      "utf-8",
-    ).toString("base64");
     const childTimeoutMs = resolveGenericPythonExecutorChildTimeoutMs({
       backendName,
       hostTimeoutMs: timeoutMs,
       executionBudgetMs,
+      qualityRevisionAttempt: Number(params.qualityRevisionAttempt) || 0,
     });
+    const payloadBase64 = Buffer.from(
+      JSON.stringify({
+        kind,
+        params: {
+          ...params,
+          executorTurnBudgetMs: childTimeoutMs ?? executionBudgetMs ?? timeoutMs,
+        },
+        repo,
+      }),
+      "utf-8",
+    ).toString("base64");
     const childTimeoutEnv =
       childTimeoutMs == null
         ? {}
@@ -557,6 +575,7 @@ export function createGenericPythonExecutor(
       childTimeoutMs != null
         ? `; codex_child_timeout=${childTimeoutMs}ms; reserved_validation_budget=${resolveOpenAICodexValidationReserveMs(
             executionBudgetMs,
+            Number(params.qualityRevisionAttempt) || 0,
           )}ms`
         : "";
 

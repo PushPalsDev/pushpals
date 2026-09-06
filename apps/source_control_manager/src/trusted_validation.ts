@@ -808,8 +808,16 @@ function isExplicitTestRunnerTimeoutFailure(output: string): boolean {
   // A mixed runner report is outside this narrow recovery case, even if its
   // other failures do not use familiar assertion diagnostics.
   if (/^\s*(?:\(fail\)|--- FAIL:|FAILED|FAIL:|[\u2715\u2717\u25cf])\s/m.test(plain)) return false;
+  // Bun appends one exit summary per nested `bun run` wrapper. Those summaries
+  // report the same failed command, not an additional Error diagnostic. Keep
+  // them in the persisted output, but exclude only the exact nonzero-exit form
+  // from this mixed-error guard after proving every failed test timed out.
+  const diagnostics = plain.replace(
+    /^\s*error: script "[^"\r\n]+" exited with code [1-9]\d*\s*$/gm,
+    "",
+  );
   // Do not rerun a mixed batch with a genuine assertion or another error.
   return !/^\s*(?:Assertion(?:Error|\s+failed)\b|(?:Type|Reference|Range|Syntax|URI|Eval|Aggregate)Error\b|(?:error:\s*)?expect\(|(?:Expected|Received):|Error:(?!\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$))/im.test(
-    plain,
+    diagnostics,
   );
 }

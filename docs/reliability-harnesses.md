@@ -88,7 +88,42 @@ credential-redacted commands. An explicit timeout-only test-runner failure gets
 one retry, without discarding named-test evidence. Assertions and mixed failures
 do not qualify for that timeout retry; repeated failure still blocks publication.
 
+### Bounded recovery and learning
+
+Short executor revisions reserve time for independent validation and critic
+review inside the original job deadline. A backend's explicit retained timeout
+candidate can enter those gates; it cannot bypass them or start another editing
+loop. A passing critic with unresolved must-fix findings is insufficient for
+timeout recovery. Docker-dependent checks remain held for trusted-host validation,
+while runnable failures drive focused repair. Earlier validation, patch, and
+critic evidence survives a later executor failure.
+
+The `quality_loop` phase includes real temporary-Git-repository recovery tests
+with focused Bun tests and a controlled critic subprocess. They exercise accepted
+recovery, rejected recovery, deadline exhaustion, and evidence preservation.
+
+RepositoryAgent uses the same candidate enums and schema as autonomy admission.
+It may correct a malformed candidate once within the existing synthesis deadline;
+invalid results cannot become reinforced cache hits. Analysis-cache reads are not
+successful-job observations. Executed outcomes are selected before limiting the
+context size, and a compact retained-outcome watermark prevents an older analysis
+from reappearing when the detailed 24-hour narrative expires.
+
+A terminal trusted-host failure with named tests, paths, and exact candidate or
+baseline authority can admit one incident-scoped repair without waiting for a
+second failed job. Concurrent ticks still share one repair lease. Worker uploads
+cannot label their own validation as trusted-host evidence or replace SCM's
+persisted results. The separate cross-job circuit threshold is unchanged.
+
 ### Metrics
+
+Worker phase intervals inferred from logs use `transitioned` when a later phase
+was observed. This describes an interval boundary, not a successful test result;
+the separate validation-run records remain authoritative for pass/fail. Only
+the last open interval receives the terminal job outcome. Each interval also
+records `metadata.jobOutcome`. Long revision loops retain the first and last
+31 intervals, including the terminal phase, and disclose `omittedSpanCount` on
+the first interval instead of silently dropping the failure location.
 
 The autonomy operations summary and System pane report:
 

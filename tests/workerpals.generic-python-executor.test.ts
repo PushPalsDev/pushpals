@@ -711,6 +711,87 @@ describe("generic python executor timeout resolution", () => {
     ).toBe(870_000);
   });
 
+  test("reserves independent validation inside the remaining deadline on short revision turns", () => {
+    for (const executionBudgetMs of [235_564, 317_273, 588_207]) {
+      const reserve = resolveOpenAICodexValidationReserveMs(executionBudgetMs, 2);
+      const child = resolveGenericPythonExecutorChildTimeoutMs({
+        backendName: "openai_codex",
+        hostTimeoutMs: executionBudgetMs + 120_000,
+        executionBudgetMs,
+        qualityRevisionAttempt: 2,
+      })!;
+      expect(reserve).toBeGreaterThanOrEqual(90_000);
+      expect(child).toBeGreaterThan(0);
+      expect(child + reserve).toBeLessThanOrEqual(executionBudgetMs);
+      expect(
+        resolveGenericPythonExecutorChildTimeoutEnv({
+          backendName: "openai_codex",
+          hostTimeoutMs: executionBudgetMs + 120_000,
+          executionBudgetMs,
+          qualityRevisionAttempt: 2,
+        }).WORKERPALS_OPENAI_CODEX_TIMEOUT_MS,
+      ).toBe(String(child));
+    }
+    expect(resolveOpenAICodexValidationReserveMs(235_564)).toBe(0);
+  });
+
+  test("passes the actual revision child deadline to Python guidance without replacing job planning", async () => {
+    const base = loadPushPalsConfig({ projectRoot: process.cwd() });
+    const prefix = "__PUSHPALS_REVISION_BUDGET_TEST__ ";
+    let observed = false;
+    const execute = createGenericPythonExecutor({
+      backendName: "openai_codex",
+      scriptPath: process.execPath,
+      pythonConfigKey: "testPython",
+      timeoutConfigKey: "testTimeoutMs",
+      processRunner: (async (
+        args: string[],
+        options: { env?: Record<string, string | undefined> },
+      ) => {
+        const path = args[args.indexOf("--payload-file") + 1]!;
+        const payload = JSON.parse(
+          Buffer.from(readFileSync(path, "utf8"), "base64").toString("utf8"),
+        );
+        const childTimeout = Number(options.env?.WORKERPALS_OPENAI_CODEX_TIMEOUT_MS);
+        expect(payload.params.executorTurnBudgetMs).toBe(childTimeout);
+        expect(childTimeout).toBeGreaterThan(0);
+        expect(childTimeout).toBeLessThan(235_564 - 90_000);
+        expect(payload.params.planning.executionBudgetMs).toBe(1_200_000);
+        expect(payload.params.qualityRevisionHint).toBe("Fix the specific failed assertion");
+        observed = true;
+        return {
+          stdout: `${prefix}${JSON.stringify({ ok: true, summary: "fixture", exitCode: 0 })}\n`,
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+        };
+      }) as never,
+    });
+    const result = await execute(
+      "task.execute",
+      {
+        planning: { executionBudgetMs: 1_200_000 },
+        executorTurnBudgetMs: 999_999,
+        qualityRevisionAttempt: 2,
+        qualityRevisionHint: "Fix the specific failed assertion",
+      },
+      process.cwd(),
+      {
+        ...base,
+        workerpals: {
+          ...base.workerpals,
+          testPython: process.execPath,
+          testTimeoutMs: 1_320_000,
+          executorResultPrefix: prefix,
+        },
+      } as never,
+      undefined,
+      { executionBudgetMs: 235_564, finalizationBudgetMs: 120_000 },
+    );
+    expect(observed).toBe(true);
+    expect(result.ok).toBe(true);
+  });
+
   test("does not inject Codex timeout env into unrelated Python backends", () => {
     expect(
       resolveGenericPythonExecutorChildTimeoutEnv({

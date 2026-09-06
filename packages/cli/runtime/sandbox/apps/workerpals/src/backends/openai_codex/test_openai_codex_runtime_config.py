@@ -663,6 +663,28 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             self.assertIn("Home shell startup is assertable", guidance)
             self.assertIn("bun run web:e2e", guidance)
 
+    def test_revision_guidance_uses_actual_child_budget_not_a_fresh_full_job(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pushpals-revision-budget-") as temp_dir:
+            payload = {
+                "kind": "task.execute",
+                "repo": temp_dir,
+                "params": {
+                    "instruction": "Apply the critic's narrow correction",
+                    "executorTurnBudgetMs": 121_564,
+                    "qualityRevisionAttempt": 2,
+                    "qualityRevisionHint": "Preserve the fixture assertion.",
+                },
+            }
+            encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+            task = parse_task_execute_payload(["executor", encoded], logger=Logger("[test]"))
+            guidance = "\n".join(task.supplemental_guidance)
+            self.assertIn("at most 121s", guidance)
+            self.assertIn("focused revision of an existing patch", guidance)
+            self.assertIn("at most 30s rediscovering context", guidance)
+            self.assertIn("PushPals owns the full gates", guidance)
+            self.assertNotIn("roughly 20 minutes", guidance)
+            self.assertNotIn("discovery <=5m", guidance)
+
     def test_parse_payload_accepts_file_backed_payload_transport(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pushpals-payload-file-") as temp_dir:
             repo = Path(temp_dir) / "repo"

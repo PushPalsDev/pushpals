@@ -527,6 +527,8 @@ export interface AutonomySnapshot {
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: OpenObjective[];
   recent_objectives: OpenObjective[];
+  executed_objectives?: OpenObjective[];
+  executed_outcome_watermark?: string;
   repo_health_flags: {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
@@ -4480,8 +4482,18 @@ export class AutonomyStore {
     }
 
     const activeGroups = [...groups.values()]
-      .filter((group) => group.failureCount >= 2)
-      .filter((group) => group.failedJobIds.size >= 2)
+      .filter(
+        (group) =>
+          (group.failureCount >= 2 && group.failedJobIds.size >= 2) ||
+          // A terminal trusted-host rejection with named tests and an exact
+          // retained candidate is already actionable. Waiting for another job
+          // to hit the same global gate wastes a full worker execution. Keep the
+          // cross-job circuit threshold separate from admission of one repair.
+          (group.source === "trusted_host" &&
+            group.failedTests.size > 0 &&
+            group.pathHints.length > 0 &&
+            (group.baselineFailureProven || group.candidateRefs.size > 0)),
+      )
       .filter((group) => {
         const commandSourceKey = `${group.command}\n${group.source}\n${group.baselineSha ?? "unknown-baseline"}`;
         const passKey =
@@ -5414,6 +5426,8 @@ export class AutonomyStore {
         active_cooldowns: snapshot.active_cooldowns.slice(0, 40),
         open_objectives: snapshot.open_objectives.slice(0, 40),
         recent_objectives: snapshot.recent_objectives.slice(0, 80),
+        executed_objectives: snapshot.executed_objectives ?? [],
+        executed_outcome_watermark: snapshot.executed_outcome_watermark ?? null,
         repo_health_flags: snapshot.repo_health_flags,
         validation_incident: snapshot.validation_incident,
         dispatch_budget: snapshot.dispatch_budget,
@@ -5831,6 +5845,40 @@ export class AutonomyStore {
       )
       .all(new Date(Date.parse(now) - 24 * 60 * 60_000).toISOString()) as ObjectiveSnapshotRow[];
     const recentObjectives = recentObjectiveRows.map(hydrateObjective);
+    // A burst of rejected/no-job ideas must not evict the execution evidence
+    // that tells RepositoryAgent why a previous recommendation did not work.
+    const executedObjectiveRows = this.db
+      .prepare(
+        `SELECT o.id AS objective_id, o.title, o.status, o.objective_type, o.component_area,
+              o.pattern_key, o.incident_key, o.job_id, o.scope_json, o.updated_at,
+              o.evidence_json, ${objectiveJobProjection}, ${objectiveValidationProjection}
+       FROM autonomy_objectives o
+       ${objectiveJobJoins}
+       ${objectiveValidationJoins}
+       WHERE o.job_id IS NOT NULL AND o.job_id <> ''
+         AND o.status IN ('completed', 'failed', 'dead_letter')
+         AND o.updated_at >= ?
+       ORDER BY o.updated_at DESC LIMIT 16`,
+      )
+      .all(new Date(Date.parse(now) - 24 * 60 * 60_000).toISOString()) as ObjectiveSnapshotRow[];
+    const executedObjectives = executedObjectiveRows.map(hydrateObjective);
+    // Cache TTLs can exceed the 24-hour narrative window. Keep a stable summary
+    // of all retained executed outcomes so aging out of that window cannot
+    // restore the pre-execution cache key. Jobless planning rejections do not
+    // affect this watermark, and its size never grows with repository history.
+    const executedOutcomeSummary = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+              SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
+              MAX(updated_at) AS latest_update
+       FROM autonomy_objectives
+       WHERE job_id IS NOT NULL AND job_id <> ''
+         AND status IN ('completed', 'failed', 'dead_letter')`,
+      )
+      .get();
+    const executedOutcomeWatermark = sha256Hex(JSON.stringify(executedOutcomeSummary));
     const dispatchBudget = this.getDispatchCountsLastHour(now);
     const resourceBudget = this.resourceBudgetSnapshot(now);
     const stateTraits = this.buildStateTraits({
@@ -5858,6 +5906,8 @@ export class AutonomyStore {
       active_cooldowns: activeCooldowns,
       open_objectives: openObjectives,
       recent_objectives: recentObjectives,
+      executed_objectives: executedObjectives,
+      executed_outcome_watermark: executedOutcomeWatermark,
       repo_health_flags: {
         is_worktree_dirty: Boolean(params.repoHealthFlags?.is_worktree_dirty),
         is_merge_in_progress: Boolean(params.repoHealthFlags?.is_merge_in_progress),

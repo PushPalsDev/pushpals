@@ -87,6 +87,7 @@ const phases: HarnessPhase[] = [
       "tests/workerpals.execute-job-clarification.test.ts",
       "tests/workerpals.quality-gate-issues.test.ts",
       "tests/workerpals.quality-loop-durability.test.ts",
+      "tests/workerpals.executor-timeout-recovery.test.ts",
       "tests/workerpals.docker-deadline.test.ts",
       "tests/workerpals.commit-message-generation.test.ts",
       "tests/workerpals.validation-command-safety.test.ts",

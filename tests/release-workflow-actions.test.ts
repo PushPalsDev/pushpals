@@ -13,6 +13,19 @@ function workflowText(): string {
 }
 
 describe("release workflow action runtimes", () => {
+  test.each(["cli-e2e.yml", "release-cli.yml"])(
+    "%s gates Windows timeout-candidate recovery and real Bun wrapper retries",
+    (filename) => {
+      const text = readFileSync(join(workflowRoot, filename), "utf8");
+      const step = text
+        .split("- name: Verify Windows worker recovery and trusted-validation contracts")[1]
+        ?.split("- name:")[0];
+      expect(step).toContain("bun test");
+      expect(step).toContain("tests/workerpals.executor-timeout-recovery.test.ts");
+      expect(step).toContain("tests/source-control-manager.trusted-validation.test.ts");
+    },
+  );
+
   test("uses Node-24-native action generations", () => {
     const text = workflowText();
 

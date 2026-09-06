@@ -21,6 +21,7 @@ describe("reliability harness release coverage", () => {
 
     expect(files).toContain("tests/workerpals.quality-gate-issues.test.ts");
     expect(files).toContain("tests/workerpals.quality-loop-durability.test.ts");
+    expect(files).toContain("tests/workerpals.executor-timeout-recovery.test.ts");
     expect(files).toContain("tests/workerpals.docker-deadline.test.ts");
     expect(files).toContain("tests/workerpals.commit-message-generation.test.ts");
     expect(files).toContain("tests/workerpals.validation-command-safety.test.ts");

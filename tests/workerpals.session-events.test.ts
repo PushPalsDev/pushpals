@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildPhaseSpanDiagnostics,
   buildUnhandledWorkerFailureResult,
   buildWorkerJobClaimAuthority,
   buildWorkerPreparationFailureResult,
@@ -24,6 +25,59 @@ import {
 } from "../apps/workerpals/src/workerpals_main";
 
 describe("workerpals session event emission", () => {
+  test("does not relabel every observed phase as failed when the final revision times out", () => {
+    const spans = buildPhaseSpanDiagnostics(
+      [
+        { phase: "dependency preparation", startedAtMs: 0, finishedAtMs: 25 },
+        { phase: "full validation", startedAtMs: 25, finishedAtMs: 75 },
+        { phase: "editing", startedAtMs: 75 },
+      ],
+      2,
+      100,
+      "failed",
+    );
+    expect(spans.map((span) => span.outcome)).toEqual(["transitioned", "transitioned", "failed"]);
+    expect(spans.map((span) => span.durationMs)).toEqual([25, 50, 25]);
+    expect(spans[1].metadata).toEqual({ jobOutcome: "failed", boundary: "log_transition" });
+    expect(spans[2].metadata).toEqual({ jobOutcome: "failed", boundary: "job_terminal" });
+    expect(spans.every((span) => span.attempt === 2)).toBe(true);
+  });
+
+  test("retains the terminal phase and discloses omitted intervals in long revision loops", () => {
+    const input = Array.from({ length: 40 }, (_, index) => ({
+      phase: "discovering" as const,
+      startedAtMs: index * 10,
+      ...(index < 39 ? { finishedAtMs: (index + 1) * 10 } : {}),
+    }));
+    const spans = buildPhaseSpanDiagnostics(input, 1, 400, "failed");
+    expect(spans).toHaveLength(32);
+    expect(spans[0].startedAt).toBe(new Date(0).toISOString());
+    expect(spans[0].metadata?.omittedSpanCount).toBe(8);
+    expect(spans[1].startedAt).toBe(new Date(90).toISOString());
+    expect(spans.at(-1)).toMatchObject({
+      startedAt: new Date(390).toISOString(),
+      durationMs: 10,
+      outcome: "failed",
+    });
+    expect(input).toHaveLength(40);
+    expect(input[39].finishedAtMs).toBeUndefined();
+  });
+
+  test("keeps publication pending distinct from earlier phase transitions", () => {
+    expect(buildPhaseSpanDiagnostics([], 1, 100, "failed")).toEqual([]);
+    const spans = buildPhaseSpanDiagnostics(
+      [
+        { phase: "editing", startedAtMs: 10, finishedAtMs: 20 },
+        { phase: "publishing", startedAtMs: 20 },
+      ],
+      1,
+      15,
+      "finalizing",
+    );
+    expect(spans.map((span) => span.outcome)).toEqual(["transitioned", "finalizing"]);
+    expect(spans[1].durationMs).toBe(0);
+  });
+
   test("requires exact positive-integer claimed-job authority", () => {
     expect(buildWorkerJobClaimAuthority("worker-authority", 17)).toEqual({
       workerId: "worker-authority",

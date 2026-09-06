@@ -32,6 +32,7 @@ import {
 } from "shared";
 import type { PushPalsConfig } from "shared";
 import type { LLMClient } from "./llm.js";
+import { AUTONOMY_CANDIDATE_ENUMS } from "./autonomy_candidate_contract.js";
 import {
   canonicalizeInstructionTextForBun,
   canonicalizeValidationCommandForBun,
@@ -140,6 +141,8 @@ type Snapshot = {
   active_cooldowns: Array<{ pattern_key: string; cooldown_until: string }>;
   open_objectives: SnapshotOpenObjective[];
   recent_objectives?: SnapshotOpenObjective[];
+  executed_objectives?: SnapshotOpenObjective[];
+  executed_outcome_watermark?: string;
   repo_health_flags: {
     is_worktree_dirty: boolean;
     is_merge_in_progress: boolean;
@@ -1540,17 +1543,7 @@ function isMetaRepoObjective(objective: CompiledRepoObjective): boolean {
   return META_OBJECTIVE_CATEGORIES.has(objective.category);
 }
 
-const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>([
-  "flaky_test",
-  "lint_fix",
-  "type_fix",
-  "small_refactor",
-  "feature_small",
-  "feature_medium",
-  "feature_large",
-  "docs",
-  "dep_bump",
-]);
+const OBJECTIVE_TYPES = new Set<AutonomyObjectiveType>(AUTONOMY_CANDIDATE_ENUMS.objective_type);
 
 export type RepoTargetProfile = {
   component_area: AutonomyComponentArea;
@@ -2691,7 +2684,7 @@ function buildValidationIncidentRepairCandidate(params: {
     title: `Restore required validation: ${command}`,
     objective_type: objectiveType,
     problem_statement: [
-      "Required validation is repeatedly failing before publication.",
+      "Required validation failed before publication.",
       `Primary failing command: ${command}.`,
       `Recent failures: ${failureCount} across ${failedJobCount} job(s).`,
       incident.cross_job_circuit_open
@@ -7271,7 +7264,7 @@ export class RemoteBuddyAutonomousEngine {
       JSON.stringify({
         purpose: "priority",
         vision: params.visionContext.sha256,
-        repositoryAgentPrompt: "autonomy-priority-v2",
+        repositoryAgentPrompt: "autonomy-priority-v3",
       }),
     );
     let requestController: AbortController | null = null;
@@ -7287,7 +7280,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v4",
+          promptTemplateVersion: "repository-agent-v5-validated-candidates",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -7366,17 +7359,12 @@ export class RemoteBuddyAutonomousEngine {
         deterministicPolicy: {
           maxCandidates: this.cfg.ideationMaxCandidates,
           minimumConfidence: this.cfg.minConfidence,
-          allowedObjectiveTypes: [
-            "flaky_test",
-            "lint_fix",
-            "type_fix",
-            "small_refactor",
-            "feature_small",
-            "feature_medium",
-            "feature_large",
-            "docs",
-            "dep_bump",
-          ],
+          allowedObjectiveTypes: Object.entries(POLICY)
+            .filter(([, rule]) => rule.autonomousAllowed)
+            .map(([type]) => type),
+          candidateEnums: Object.fromEntries(
+            Object.entries(AUTONOMY_CANDIDATE_ENUMS).map(([field, values]) => [field, [...values]]),
+          ),
           requiredCandidateFields: [
             "id",
             "title",
@@ -7402,7 +7390,27 @@ export class RemoteBuddyAutonomousEngine {
             "Use tracked, repository-relative target paths and repo-native validation proposals.",
             "Do not infer the project ecosystem from PushPals itself or from generic defaults.",
             "The host will independently enforce scope, risk, cooldown, and command policy.",
+            "Use the exact candidateEnums values, not vision_priority, normal risk, or estimates measured in days. Select one bounded implementation slice executable in a worker job.",
           ],
+        },
+        runtimeSignals: {
+          executedOutcomeWatermark: params.snapshot.executed_outcome_watermark ?? null,
+          topSignals: params.snapshot.top_signals.slice(0, 5),
+          stateTraits: params.snapshot.state_traits.slice(0, 5),
+          feedbackPriors: params.snapshot.feedback_priors.slice(0, 4),
+          openObjectives: params.snapshot.open_objectives.slice(0, 8),
+          recentObjectives: (
+            params.snapshot.executed_objectives ??
+            params.snapshot.recent_objectives ??
+            []
+          )
+            .filter(
+              (objective) =>
+                objective.job_id &&
+                ["completed", "failed", "dead_letter"].includes(objective.status),
+            )
+            .slice(0, 16),
+          activeCooldowns: params.snapshot.active_cooldowns.slice(0, 8),
         },
       };
       requestFingerprint = sha256(
@@ -7410,7 +7418,7 @@ export class RemoteBuddyAutonomousEngine {
           repository: { identity: repository.identity, tree: repository.tree },
           purpose: "priority",
           vision: params.visionContext.sha256,
-          repositoryAgentPrompt: "autonomy-priority-v2",
+          repositoryAgentPrompt: "autonomy-priority-v3",
         }),
       );
       const result = await this.repositoryAgent.ask(
@@ -7457,7 +7465,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v4",
+          promptTemplateVersion: "repository-agent-v5-validated-candidates",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {

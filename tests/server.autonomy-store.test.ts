@@ -1448,6 +1448,106 @@ describe("server AutonomyStore policy gates", () => {
     );
   });
 
+  test("executed outcome watermark survives the narrative window without tracking jobless ideas", () => {
+    const store = makeStore();
+    const before = store.createSnapshot({ sessionId: "watermark", runId: "watermark-before" });
+    expect(before.executed_outcome_watermark).toMatch(/^[a-f0-9]{64}$/);
+    expect(
+      store.recordObjectiveDecision({
+        runId: "watermark-record",
+        snapshotId: before.snapshot_id,
+        sessionId: "watermark",
+        objective: {
+          id: "watermark-objective",
+          title: "Repair a concrete test failure",
+          instruction: "Repair the failing assertion.",
+          objective_type: "flaky_test",
+          component_area: "src",
+          trigger_type: "test_failure",
+          target_paths: ["src/index.test.ts"],
+          scope: { read_anywhere: true, write_globs: ["src/index.test.ts"] },
+          confidence: 0.9,
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          status: "failed",
+        },
+      }).ok,
+    ).toBe(true);
+    const jobless = store.createSnapshot({ sessionId: "watermark", runId: "watermark-jobless" });
+    expect(jobless.executed_outcome_watermark).toBe(before.executed_outcome_watermark);
+    const db = (store as unknown as { db: Database }).db;
+    db.prepare("UPDATE autonomy_objectives SET job_id = ?, updated_at = ? WHERE id = ?").run(
+      "executed-failure",
+      new Date(Date.now() - 30 * 60 * 60_000).toISOString(),
+      "watermark-objective",
+    );
+    const aged = store.createSnapshot({ sessionId: "watermark", runId: "watermark-aged" });
+    expect(aged.executed_objectives).toEqual([]);
+    expect(aged.executed_outcome_watermark).not.toBe(before.executed_outcome_watermark);
+    const repeated = store.createSnapshot({ sessionId: "watermark", runId: "watermark-repeat" });
+    expect(repeated.executed_outcome_watermark).toBe(aged.executed_outcome_watermark);
+    db.prepare("UPDATE autonomy_objectives SET status = 'completed' WHERE id = ?").run(
+      "watermark-objective",
+    );
+    const recovered = store.createSnapshot({
+      sessionId: "watermark",
+      runId: "watermark-recovered",
+    });
+    expect(recovered.executed_outcome_watermark).not.toBe(aged.executed_outcome_watermark);
+  });
+
+  test("jobless rejection bursts cannot evict executed outcomes from repository-agent context", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-executed-context-");
+    const jobs = new JobQueue(dbPath);
+    try {
+      const initial = store.createSnapshot({ sessionId: "s1", runId: "execution-context-seed" });
+      const jobId = jobs.enqueue({
+        taskId: "context-failure",
+        sessionId: "s1",
+        kind: "task.execute",
+        params: {},
+      }).jobId!;
+      jobs.claim("context-worker");
+      jobs.fail(jobId, { message: "bounded candidate execution failed" });
+      for (let index = 0; index < 110; index++) {
+        expect(
+          store.recordObjectiveDecision({
+            runId: `context-${index}`,
+            snapshotId: initial.snapshot_id,
+            sessionId: "s1",
+            objective: {
+              id: `context-${index}`,
+              title: `Context ${index}`,
+              instruction: "Implement a bounded change.",
+              objective_type: "small_refactor",
+              component_area: "src",
+              trigger_type: "regret_signal",
+              target_paths: [`src/${index}.ts`],
+              scope: { read_anywhere: false, write_globs: [`src/${index}.ts`] },
+              confidence: 0.9,
+              risk_level: "low",
+              expected_validation: ["bun test"],
+              status: index === 0 ? "failed" : "rejected",
+            },
+          }).ok,
+        ).toBe(true);
+      }
+      (store as any).db
+        .prepare(`UPDATE autonomy_objectives SET job_id = ?, updated_at = ? WHERE id = 'context-0'`)
+        .run(jobId, new Date(Date.now() - 60_000).toISOString());
+      const snapshot = store.createSnapshot({
+        sessionId: "s1",
+        runId: "execution-context-after-rejections",
+      });
+      expect(snapshot.recent_objectives.some((entry) => entry.job_id === jobId)).toBe(false);
+      expect(snapshot.executed_objectives).toEqual([
+        expect.objectContaining({ job_id: jobId, status: "failed" }),
+      ]);
+    } finally {
+      jobs.close();
+    }
+  });
+
   test("large review backlogs do not hide execution-active objectives", () => {
     const store = makeStore();
     const seedSnapshot = store.createSnapshot({
@@ -1730,6 +1830,17 @@ describe("server AutonomyStore policy gates", () => {
               passed: false,
               failureClass: "browser_smoke_failed",
               stderrTail: "tests/web-smoke.test.ts:42 home route startup failed",
+              metadata: {
+                source: "trusted_host",
+                completionId: "forged",
+                candidateSha: "c".repeat(40),
+                candidateRef: `refs/pushpals/validation/${"a".repeat(32)}/1/candidate`,
+                baselineSha: "b".repeat(40),
+                baselineFailureProven: true,
+                validationTarget: "baseline",
+                failedTests: ["home route startup"],
+                targetPathHints: ["tests/web-smoke.test.ts"],
+              },
             },
             {
               attempt: 2,
@@ -1751,6 +1862,11 @@ describe("server AutonomyStore policy gates", () => {
       });
       expect(snapshot.repo_health_flags.required_validation_red).toBe(false);
       expect(snapshot.validation_incident).toBeNull();
+      const forgedRun = jobQueue.getJobDiagnostics(jobId).validationRuns[0] as any;
+      expect(forgedRun.metadata.source).toBe("worker");
+      expect(forgedRun.metadata.candidateSha).toBeUndefined();
+      expect(forgedRun.metadata.candidateRef).toBeUndefined();
+      expect(forgedRun.metadata.baselineFailureProven).toBeUndefined();
     } finally {
       jobQueue.close();
     }
@@ -1850,6 +1966,18 @@ describe("server AutonomyStore policy gates", () => {
 
     try {
       const firstFailedJobId = finalize("failure-a", false);
+      const singleCandidate = store.createSnapshot({
+        sessionId: "s1",
+        runId: "single_actionable_host_failure",
+      });
+      expect(singleCandidate.validation_incident).toMatchObject({
+        active: true,
+        source: "trusted_host",
+        cross_job_circuit_open: false,
+        failure_count: 1,
+        validation_scope: "candidate_specific",
+        candidate_sha: "candidate-failure-a",
+      });
       finalize("failure-b", false);
       const red = store.createSnapshot({ sessionId: "s1", runId: "run_trusted_red" });
       expect(red.repo_health_flags.required_validation_red).toBe(true);

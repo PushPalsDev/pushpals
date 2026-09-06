@@ -10557,7 +10557,8 @@ function isExplicitTestRunnerTimeoutFailure(output) {
   }
   if (/^\s*(?:\(fail\)|--- FAIL:|FAILED|FAIL:|[\u2715\u2717\u25cf])\s/m.test(plain))
     return false;
-  return !/^\s*(?:Assertion(?:Error|\s+failed)\b|(?:Type|Reference|Range|Syntax|URI|Eval|Aggregate)Error\b|(?:error:\s*)?expect\(|(?:Expected|Received):|Error:(?!\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$))/im.test(plain);
+  const diagnostics = plain.replace(/^\s*error: script "[^"\r\n]+" exited with code [1-9]\d*\s*$/gm, "");
+  return !/^\s*(?:Assertion(?:Error|\s+failed)\b|(?:Type|Reference|Range|Syntax|URI|Eval|Aggregate)Error\b|(?:error:\s*)?expect\(|(?:Expected|Received):|Error:(?!\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$))/im.test(diagnostics);
 }
 
 // apps/source_control_manager/src/validation_repair_publication.ts

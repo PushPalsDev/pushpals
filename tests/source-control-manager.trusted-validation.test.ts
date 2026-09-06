@@ -556,6 +556,75 @@ describe("SourceControlManager trusted validation", () => {
     });
   });
 
+  test.each([{ recovers: true }, { recovers: false }])(
+    "handles real nested Bun exit summaries around a Vitest timeout (recovers=$recovers)",
+    async ({ recovers }) => {
+      const repoPath = mkdtempSync(join(tmpdir(), "pushpals-trusted-nested-timeout-"));
+      try {
+        writeFileSync(
+          join(repoPath, "package.json"),
+          JSON.stringify({
+            scripts: {
+              validate: "bun run test:worker",
+              "test:worker": "bun run reporter.ts",
+            },
+          }),
+        );
+        writeFileSync(
+          join(repoPath, "reporter.ts"),
+          [
+            'import { existsSync, writeFileSync } from "fs";',
+            'const retried = existsSync("attempt.marker");',
+            'writeFileSync("attempt.marker", "attempted");',
+            `if (retried && ${JSON.stringify(recovers)}) { console.log("1 pass"); process.exit(0); }`,
+            'console.log("1943 pass\\n10 skip\\n0 fail");',
+            'console.log("Tests 1 failed | 364 passed (365)");',
+            'console.error(JSON.stringify({ message: "expected mock request failed", error: "INVALID_INPUT" }));',
+            'console.error("\\u001b[41m FAIL \\u001b[49m tests/notifications.vitest.ts > notifications > rejects invalid input");',
+            'console.error("\\u001b[31mError: Test timed out in 5000ms.\\u001b[39m");',
+            'console.error("If this is a long-running test, pass a timeout value as the last argument.");',
+            'console.error("Publish readiness failed during worker tests: command exited with status 1.");',
+            "process.exit(1);",
+          ].join("\n"),
+        );
+        const progress: TrustedValidationProgressEvent[] = [];
+        const results = await runTrustedValidationCommands({
+          repoPath,
+          commandsJson: JSON.stringify(["bun run validate"]),
+          bunExecutable: process.execPath,
+          timeoutMs: 5_000,
+          onProgress: (event) => progress.push(event),
+        });
+
+        expect(results).toHaveLength(2);
+        expect(results[0]).toMatchObject({
+          ok: false,
+          attempt: 1,
+          failureClass: "test_failure",
+          failedTests: ["notifications > rejects invalid input"],
+          targetPathHints: ["tests/notifications.vitest.ts"],
+          retryReason: "transient_infrastructure",
+        });
+        expect(results[0]!.output).toContain('error: script "test:worker" exited with code 1');
+        expect(results[0]!.output).toContain('error: script "validate" exited with code 1');
+        expect(progress.filter((event) => event.boundary === "retry")).toHaveLength(1);
+        expect(results[1]).toMatchObject({ ok: recovers, attempt: 2 });
+        if (recovers) {
+          expect(resolveTrustedValidationOutcome(results).terminalFailure).toBeNull();
+        } else {
+          expect(resolveTrustedValidationOutcome(results).terminalFailure).toMatchObject({
+            ok: false,
+            attempt: 2,
+            failureClass: "test_failure",
+          });
+        }
+      } finally {
+        rmSync(repoPath, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
   test.each([
     {
       name: "a test name quoting a runner timeout",
@@ -591,6 +660,21 @@ describe("SourceControlManager trusted validation", () => {
       name: "a mixed report with a failure from another runner",
       output:
         "FAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.\n(fail) another runner > custom failure",
+    },
+    {
+      name: "an assertion hidden between nested Bun script exit summaries",
+      output:
+        'FAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.\nerror: script "test:worker" exited with code 1\nAssertionError: an independent gate failed\nerror: script "validate" exited with code 1',
+    },
+    {
+      name: "an unrelated Bun error accompanying a script exit summary",
+      output:
+        'FAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.\nerror: Cannot find module missing-package\nerror: script "validate" exited with code 1',
+    },
+    {
+      name: "a script-summary lookalike containing another error",
+      output:
+        'FAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.\nerror: script "validate" exited with code 1: deterministic failure',
     },
   ])("does not retry $name", async ({ output }) => {
     let calls = 0;

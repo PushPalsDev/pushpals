@@ -9,6 +9,10 @@ import {
   resolveAutonomyGitCommandTimeoutMs,
 } from "../apps/remotebuddy/src/autonomous_engine";
 import { resolveRepositorySnapshot } from "../packages/shared/src";
+import { AutonomyStore } from "../apps/server/src/autonomy";
+import { JobQueue } from "../apps/server/src/jobs";
+import { CompletionQueue } from "../apps/server/src/completions";
+import { RequestQueue } from "../apps/server/src/requests";
 
 type FetchCall = {
   url: string;
@@ -668,7 +672,10 @@ describe("RepositoryAgent autonomy ideation", () => {
     expect((submitted?.context as Record<string, unknown>).operation).toBe(
       "analyze_autonomy_opportunities",
     );
-    expect((submitted?.context as Record<string, unknown>).runtimeSignals).toBeUndefined();
+    expect((submitted?.context as Record<string, unknown>).runtimeSignals).toMatchObject({
+      recentObjectives: [],
+      openObjectives: [],
+    });
     expect(String(submitted?.idempotencyKey)).toContain("snap_tick_1");
     expect(JSON.stringify(submitted)).not.toContain("repo_targets");
   });
@@ -1830,6 +1837,145 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     const ideationSnapshot = (ideationInput?.snapshot ?? {}) as Record<string, unknown>;
     expect(ideationSnapshot.top_signals).toEqual([]);
     expect(ideationSnapshot.state_traits).toEqual([]);
+  });
+
+  test("one terminal trusted failure becomes an exact-candidate repair with one durable reservation under concurrent dispatch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-composed-repair-"));
+    tempDirs.push(root);
+    mkdirSync(join(root, "tests"), { recursive: true });
+    writeFileSync(join(root, "tests", "boundary.test.ts"), "// repair target fixture\n");
+    const dbPath = join(root, "control.sqlite");
+    const store = new AutonomyStore(dbPath);
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const requests = new RequestQueue(dbPath);
+    try {
+      const jobId = jobs.enqueue({
+        taskId: "candidate",
+        sessionId: "repair-session",
+        kind: "task.execute",
+        params: {},
+      }).jobId!;
+      const claim = jobs.claim("repair-source-worker").job!;
+      const candidateSha = "c".repeat(40);
+      const candidateRef = `refs/pushpals/validation/${"a".repeat(32)}/1/candidate`;
+      const completionId = completions.enqueue(
+        {
+          jobId,
+          sessionId: "repair-session",
+          origin: "worker",
+          commitSha: candidateSha,
+          branch: "candidate-branch",
+          message: "retained candidate requires trusted validation",
+          trustedValidationCommands: ["bun test tests/boundary.test.ts"],
+        },
+        {
+          beginJobFinalization: true,
+          jobClaimAuthority: { workerId: claim.workerId!, claimGeneration: claim.claimGeneration },
+        },
+      ).completionId!;
+      const completion = completions.claim("repair-scm").completion!;
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "Required validation failed",
+          undefined,
+          {
+            version: 1,
+            baselineSha: "b".repeat(40),
+            candidateSha,
+            candidateRef,
+            results: [
+              {
+                ok: false,
+                command: "bun test tests/boundary.test.ts",
+                output:
+                  "FAIL tests/boundary.test.ts > boundary rejects invalid input\nError: Test timed out in 5000ms.",
+                exitCode: 1,
+                durationMs: 5_000,
+                phase: "validation",
+                failureClass: "test_failure",
+                failedTests: ["boundary rejects invalid input"],
+                targetPathHints: ["tests/boundary.test.ts"],
+              },
+            ],
+          },
+          "repair-scm",
+          completion.claimToken,
+        ).ok,
+      ).toBe(true);
+      const snapshot = store.createSnapshot({ sessionId: "repair-session", runId: "repair-run" });
+      expect(snapshot.validation_incident).toMatchObject({
+        active: true,
+        failure_count: 1,
+        cross_job_circuit_open: false,
+        candidate_sha: candidateSha,
+        candidate_ref: candidateRef,
+      });
+      let modelCalls = 0;
+      const constructEngine = () => {
+        const engine = new RemoteBuddyAutonomousEngine({
+          server: "http://unused",
+          sessionId: "repair-session",
+          repo: root,
+          llm: {
+            generate: async () => {
+              modelCalls++;
+              throw new Error("repair must precede ideation");
+            },
+          },
+          comm: { async emit() {} } as any,
+          config: makeConfig(),
+        });
+        (engine as any).autonomyRepo = root;
+        (engine as any).fetchEligibility = async (
+          runId: string,
+          snapshotId: string,
+          candidates: unknown[],
+        ) =>
+          new Map(
+            (store.evaluateEligibility({ runId, snapshotId, candidates }).results ?? []).map(
+              (entry) => [entry.candidate_id, entry],
+            ),
+          );
+        (engine as any).renewDispatchLock = async () => true;
+        (engine as any).postObjective = async (body: Record<string, unknown>) =>
+          store.recordObjectiveDecision(body).ok;
+        (engine as any).enqueueSyntheticRequest = async (instruction: string, autonomy: any) => {
+          expect(
+            store.authorizesValidationIncidentRepair({
+              objectiveId: autonomy.objectiveId,
+              incidentId: autonomy.validationIncident.incidentId,
+              snapshotId: autonomy.snapshotId,
+            }),
+          ).toBe(true);
+          expect(autonomy.validationIncident.candidateSha).toBe(candidateSha);
+          expect(instruction).toContain("candidate-specific");
+          return (
+            requests.enqueue({
+              sessionId: "repair-session",
+              prompt: instruction,
+              metadata: { origin: "autonomy", autonomy },
+            }).requestId ?? null
+          );
+        };
+        return engine;
+      };
+      const params = { runId: "repair-run", snapshot, repoTargets: [], visionSectionRefs: ["1"] };
+      const results = await Promise.all(
+        [constructEngine(), constructEngine()].map((engine) =>
+          (engine as any).dispatchValidationIncidentRepair(params),
+        ),
+      );
+      expect(results.filter((result) => result.outcome === "success")).toHaveLength(1);
+      expect(requests.countByStatus().pending).toBe(1);
+      expect(modelCalls).toBe(0);
+    } finally {
+      requests.close();
+      completions.close();
+      jobs.close();
+      store.close();
+    }
   });
 
   test("tick dispatches validation repair before normal ideation when required validation is red", async () => {

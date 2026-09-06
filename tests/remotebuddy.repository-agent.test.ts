@@ -1,4 +1,9 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import Ajv from "ajv";
+import {
+  AUTONOMY_CANDIDATES_DATA_SCHEMA,
+  autonomyCandidateContractErrors,
+} from "../apps/remotebuddy/src/autonomy_candidate_contract";
 import { execFileSync } from "child_process";
 import { createHash } from "crypto";
 import {
@@ -103,8 +108,23 @@ function modelResponse(overrides: Record<string, unknown> = {}): Record<string, 
     data: {
       candidates: [
         {
+          id: "reliability-candidate",
           title: "Improve repository reliability",
+          objective_type: "feature_small",
+          problem_statement:
+            "Add one bounded reliability improvement with focused regression coverage.",
+          trigger_type: "regret_signal",
+          component_area: "src",
           target_paths: ["src/index.ts"],
+          scope: { read_anywhere: true, write_globs: ["src/index.ts"] },
+          risk_level: "low",
+          expected_validation: ["bun test"],
+          estimated_effort: "small",
+          why_now_signal_ids: [],
+          confidence: 0.9,
+          vision_alignment_reason: "Advance the documented reliability priority.",
+          vision_section_refs: ["1"],
+          feature_hypotheses: ["A bounded fix improves reliability."],
         },
       ],
     },
@@ -129,6 +149,51 @@ function modelResponse(overrides: Record<string, unknown> = {}): Record<string, 
     ...overrides,
   };
 }
+
+test("autonomy candidate deterministic contract agrees with the provider schema on optional and unknown fields", () => {
+  const validate = new Ajv().compile(AUTONOMY_CANDIDATES_DATA_SCHEMA);
+  const cases: Array<(data: any) => void> = [
+    () => {},
+    (data) => {
+      data.extra = true;
+    },
+    (data) => {
+      data.candidates[0].extra = true;
+    },
+    (data) => {
+      data.candidates[0].requires_user_input = "false";
+    },
+    (data) => {
+      data.candidates[0].question_if_blocked = null;
+    },
+    (data) => {
+      data.candidates[0].vision_objective_id = {};
+    },
+    (data) => {
+      data.candidates[0].scope.extra = true;
+    },
+    (data) => {
+      delete data.candidates[0].confidence;
+    },
+    (data) => {
+      data.candidates[0].target_paths = [42];
+    },
+    (data) => {
+      data.candidates[0].trigger_type = "vision_priority";
+    },
+    (data) => {
+      data.candidates[0].risk_level = "normal";
+    },
+    (data) => {
+      data.candidates[0].estimated_effort = "1-2 days";
+    },
+  ];
+  for (const mutate of cases) {
+    const data = structuredClone(modelResponse().data) as any;
+    mutate(data);
+    expect(autonomyCandidateContractErrors(data).length === 0).toBe(validate(data));
+  }
+});
 
 class FakeLlm implements LLMClient {
   calls: LLMGenerateInput[] = [];
@@ -426,6 +491,148 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
       minimumConfidence: 0.75,
       allowedObjectiveTypes: ["docs"],
     });
+    const afterFailure = await worker.analyze("structural-after-failure", {
+      ...base,
+      repository: sameTreeSnapshot,
+      context: {
+        ...base.context,
+        runtimeSignals: {
+          recentObjectives: [
+            {
+              job_id: "failed-execution-1",
+              status: "failed",
+              target_paths: ["src/index.ts"],
+            },
+          ],
+        },
+      },
+    });
+    expect(afterFailure.cache.hit).toBe(false);
+    expect(llm.analysisCalls).toHaveLength(5);
+    const terminalPayload = JSON.parse(llm.analysisCalls[4]!.messages[0]!.content);
+    expect(terminalPayload.request.context.runtimeSignals.recentObjectives).toEqual([
+      { job_id: "failed-execution-1", status: "failed", target_paths: ["src/index.ts"] },
+    ]);
+  }, 20_000);
+
+  test("an outcome watermark prevents reuse after executed details age out of a long-lived cache", async () => {
+    const repo = createRepository();
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      cacheTtlMs: 7 * 24 * 60 * 60_000,
+    });
+    const base = await requestFor(repo, {
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: { path: "vision.md", sha256: "d".repeat(64) },
+        runtimeSignals: { recentObjectives: [], executedOutcomeWatermark: "a".repeat(64) },
+      },
+    });
+    const before = await worker.analyze("watermark-before", base);
+    const agedRequest = {
+      ...base,
+      context: {
+        ...base.context,
+        runtimeSignals: { recentObjectives: [], executedOutcomeWatermark: "b".repeat(64) },
+      },
+    };
+    const aged = await worker.analyze("watermark-aged", agedRequest);
+    expect(aged.cache.hit).toBe(false);
+    expect(aged.memoryRefs.find((ref) => ref.role === "analysis_cache")?.key).not.toBe(
+      before.memoryRefs.find((ref) => ref.role === "analysis_cache")?.key,
+    );
+    expect(llm.analysisCalls).toHaveLength(2);
+    const repeated = await worker.analyze("watermark-repeat", agedRequest);
+    expect(repeated.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(2);
+  });
+
+  test("repairs an invalid autonomy candidate contract once and never reinforces a cached analysis merely for being read", async () => {
+    const repo = createRepository();
+    const request = await requestFor(repo, {
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: { path: "vision.md", sha256: "c".repeat(64) },
+      },
+    });
+    const memory = new InMemoryMemoryStore();
+    let generated = 0;
+    const llm = new FakeLlm(() => {
+      const response = modelResponse();
+      if (++generated === 1) (response.data as any).candidates[0].trigger_type = "vision_priority";
+      return response;
+    });
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      modelId: "contract-model",
+    });
+    const first = await worker.analyze("contract-first", request);
+    expect(generated).toBe(2);
+    expect((first.data as any).candidates[0].trigger_type).toBe("regret_signal");
+    expect(llm.analysisCalls[1]!.messages.at(-1)!.content).toContain("trigger_type must be one of");
+    const schema = llm.analysisCalls[0]!.jsonSchema as any;
+    expect(
+      schema.properties.data.properties.candidates.items.properties.trigger_type.enum,
+    ).not.toContain("vision_priority");
+    const ref = first.memoryRefs.find((entry) => entry.role === "analysis_cache")!;
+    const scope = { namespace: ref.namespace, repositoryId: request.repository.identity };
+    const beforeRead = await memory.get({ scope, key: ref.key });
+    const hit = await worker.analyze("contract-hit", request);
+    expect(hit.cache.hit).toBe(true);
+    const afterRead = await memory.get({ scope, key: ref.key });
+    expect(afterRead?.confidence).toBe(beforeRead?.confidence);
+    expect(afterRead?.usefulness).toBe(beforeRead?.usefulness);
+
+    // Simulate a pre-upgrade or corrupted cached provider answer. It must be
+    // rejected before cache reinforcement, then replaced by fresh valid output.
+    const invalid = structuredClone(beforeRead!.value) as any;
+    invalid.result.data.candidates[0].risk_level = "normal";
+    await memory.put({
+      scope,
+      key: ref.key,
+      kind: beforeRead!.kind,
+      summary: beforeRead!.summary,
+      value: invalid,
+      confidence: beforeRead!.confidence,
+      usefulness: beforeRead!.usefulness,
+    });
+    const repaired = await worker.analyze("contract-corrupt-cache", request);
+    expect(repaired.cache.hit).toBe(false);
+    expect(generated).toBe(3);
+    expect((repaired.data as any).candidates[0].risk_level).toBe("low");
+  }, 20_000);
+
+  test("does not cache repeatedly invalid autonomy candidates or retry beyond the one schema repair", async () => {
+    const repo = createRepository();
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm(() => {
+      const response = modelResponse();
+      (response.data as any).candidates[0].objective_type = "invented_large_change";
+      return response;
+    });
+    const worker = new RepositoryAgentWorker({ control: unusedControl(), memory, llm });
+    const request = await requestFor(repo, {
+      context: {
+        operation: "analyze_autonomy_opportunities",
+        vision: { path: "vision.md", sha256: "d".repeat(64) },
+      },
+    });
+    const result = await worker.analyze("invalid-contract", request);
+    expect(llm.analysisCalls).toHaveLength(2);
+    expect(result.data).toMatchObject({ repositoryAgentMode: "deterministic_evidence_fallback" });
+    expect((result.data as any).candidates).toBeUndefined();
+    expect(result.cache.hit).toBe(false);
+    expect(result.memoryRefs.every((ref) => ref.role === "evidence_fact")).toBe(true);
+    expect(
+      await memory.search({
+        scope: { namespace: "repository_agent_cache", repositoryId: request.repository.identity },
+      }),
+    ).toEqual([]);
   }, 20_000);
 
   test("keys ordinary history-sensitive analysis by revision even when the tree is unchanged", async () => {

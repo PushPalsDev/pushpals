@@ -888,13 +888,16 @@ export function didWorkerWatchdogFire(result: JobResult): boolean {
   );
 }
 
-function buildPhaseSpanDiagnostics(
+export function buildPhaseSpanDiagnostics(
   spans: Array<{ phase: WorkerJobPhase; startedAtMs: number; finishedAtMs?: number }>,
   attempt: number,
   fallbackFinishedAtMs: number,
   outcome: string,
 ): JobPhaseSpanDiagnostics[] {
-  return spans.slice(0, 32).map((span) => {
+  // Keep the terminal phase even when a long revision loop exceeds the storage
+  // bound. Keeping only the first 32 spans hid the actual timeout location.
+  const retainedSpans = spans.length > 32 ? [spans[0], ...spans.slice(-31)] : spans;
+  return retainedSpans.map((span, index) => {
     const startedAtMs = Math.max(0, span.startedAtMs);
     const finishedAtMs = Math.max(startedAtMs, span.finishedAtMs ?? fallbackFinishedAtMs);
     return {
@@ -903,7 +906,16 @@ function buildPhaseSpanDiagnostics(
       startedAt: new Date(startedAtMs).toISOString(),
       finishedAt: new Date(finishedAtMs).toISOString(),
       durationMs: finishedAtMs - startedAtMs,
-      outcome,
+      // A log transition proves that this interval ended, not that its tests
+      // passed. Do not overwrite every earlier phase with the final job failure.
+      outcome: span.finishedAtMs == null ? outcome : "transitioned",
+      metadata: {
+        jobOutcome: outcome,
+        boundary: span.finishedAtMs == null ? "job_terminal" : "log_transition",
+        ...(index === 0 && spans.length > retainedSpans.length
+          ? { omittedSpanCount: spans.length - retainedSpans.length }
+          : {}),
+      },
     };
   });
 }

@@ -7788,6 +7788,139 @@ import {
 } from "fs";
 import { dirname, relative as relative2, resolve as resolve6 } from "path";
 
+// apps/remotebuddy/src/autonomy_candidate_contract.ts
+var AUTONOMY_CANDIDATE_ENUMS = {
+  objective_type: [
+    "flaky_test",
+    "lint_fix",
+    "type_fix",
+    "small_refactor",
+    "feature_small",
+    "feature_medium",
+    "feature_large",
+    "docs",
+    "dep_bump"
+  ],
+  trigger_type: [
+    "test_failure",
+    "lint_failure",
+    "typecheck_failure",
+    "queue_health",
+    "regret_signal"
+  ],
+  risk_level: ["low", "medium", "high"],
+  estimated_effort: ["small", "medium", "large"]
+};
+var stringFields = [
+  "id",
+  "title",
+  "problem_statement",
+  "component_area",
+  "vision_alignment_reason"
+];
+var arrayFields = [
+  "target_paths",
+  "expected_validation",
+  "why_now_signal_ids",
+  "vision_section_refs",
+  "feature_hypotheses"
+];
+var strings = { type: "array", items: { type: "string" } };
+var AUTONOMY_CANDIDATES_DATA_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["candidates"],
+  properties: {
+    candidates: {
+      type: "array",
+      maxItems: 64,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          ...stringFields,
+          ...arrayFields,
+          ...Object.keys(AUTONOMY_CANDIDATE_ENUMS),
+          "scope",
+          "confidence"
+        ],
+        properties: {
+          ...Object.fromEntries(stringFields.map((field) => [field, { type: "string", minLength: 1 }])),
+          ...Object.fromEntries(arrayFields.map((field) => [field, strings])),
+          ...Object.fromEntries(Object.entries(AUTONOMY_CANDIDATE_ENUMS).map(([field, values]) => [
+            field,
+            { type: "string", enum: values }
+          ])),
+          scope: {
+            type: "object",
+            additionalProperties: false,
+            required: ["read_anywhere", "write_globs"],
+            properties: { read_anywhere: { type: "boolean" }, write_globs: strings }
+          },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          requires_user_input: { type: "boolean" },
+          question_if_blocked: { type: "string" },
+          vision_objective_id: { type: "string" }
+        }
+      }
+    }
+  }
+};
+function autonomyCandidateContractErrors(data) {
+  const object = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  if (!object(data) || !Array.isArray(data.candidates))
+    return ["data.candidates must be an array"];
+  if (data.candidates.length > 64)
+    return ["data.candidates exceeds 64 entries"];
+  const errors = [];
+  if (Object.keys(data).some((key) => key !== "candidates"))
+    errors.push("data contains unsupported fields");
+  const candidateFields = new Set([
+    ...stringFields,
+    ...arrayFields,
+    ...Object.keys(AUTONOMY_CANDIDATE_ENUMS),
+    "scope",
+    "confidence",
+    "requires_user_input",
+    "question_if_blocked",
+    "vision_objective_id"
+  ]);
+  for (const [index, candidate] of data.candidates.entries()) {
+    const prefix = `data.candidates[${index}]`;
+    if (!object(candidate)) {
+      errors.push(`${prefix} must be an object`);
+      continue;
+    }
+    if (Object.keys(candidate).some((key) => !candidateFields.has(key)))
+      errors.push(`${prefix} contains unsupported fields`);
+    for (const field of stringFields) {
+      if (typeof candidate[field] !== "string" || !candidate[field].trim())
+        errors.push(`${prefix}.${field} must be a nonempty string`);
+    }
+    for (const field of arrayFields) {
+      if (!Array.isArray(candidate[field]) || !candidate[field].every((entry) => typeof entry === "string"))
+        errors.push(`${prefix}.${field} must be a string array`);
+    }
+    for (const [field, values] of Object.entries(AUTONOMY_CANDIDATE_ENUMS)) {
+      if (!values.includes(candidate[field]))
+        errors.push(`${prefix}.${field} must be one of ${values.join(", ")}`);
+    }
+    if (!object(candidate.scope) || typeof candidate.scope.read_anywhere !== "boolean" || !Array.isArray(candidate.scope.write_globs) || !candidate.scope.write_globs.every((entry) => typeof entry === "string"))
+      errors.push(`${prefix}.scope requires read_anywhere and write_globs`);
+    if (object(candidate.scope) && Object.keys(candidate.scope).some((key) => key !== "read_anywhere" && key !== "write_globs"))
+      errors.push(`${prefix}.scope contains unsupported fields`);
+    if (candidate.requires_user_input !== undefined && typeof candidate.requires_user_input !== "boolean")
+      errors.push(`${prefix}.requires_user_input must be boolean`);
+    for (const field of ["question_if_blocked", "vision_objective_id"]) {
+      if (candidate[field] !== undefined && typeof candidate[field] !== "string")
+        errors.push(`${prefix}.${field} must be a string`);
+    }
+    if (typeof candidate.confidence !== "number" || !Number.isFinite(candidate.confidence) || candidate.confidence < 0 || candidate.confidence > 1)
+      errors.push(`${prefix}.confidence must be between 0 and 1`);
+  }
+  return errors.slice(0, 16);
+}
+
 // apps/remotebuddy/src/command_policy.ts
 var YARN_NON_SCRIPT_COMMANDS = new Set([
   "add",
@@ -8606,17 +8739,7 @@ function categoryTriggerType(category, topSignals) {
 function isMetaRepoObjective(objective) {
   return META_OBJECTIVE_CATEGORIES.has(objective.category);
 }
-var OBJECTIVE_TYPES = new Set([
-  "flaky_test",
-  "lint_fix",
-  "type_fix",
-  "small_refactor",
-  "feature_small",
-  "feature_medium",
-  "feature_large",
-  "docs",
-  "dep_bump"
-]);
+var OBJECTIVE_TYPES = new Set(AUTONOMY_CANDIDATE_ENUMS.objective_type);
 var COMMON_REPO_TARGET_FILES = [
   "README.md",
   "package.json",
@@ -9504,7 +9627,7 @@ function buildValidationIncidentRepairCandidate(params) {
     title: `Restore required validation: ${command}`,
     objective_type: objectiveType,
     problem_statement: [
-      "Required validation is repeatedly failing before publication.",
+      "Required validation failed before publication.",
       `Primary failing command: ${command}.`,
       `Recent failures: ${failureCount} across ${failedJobCount} job(s).`,
       incident.cross_job_circuit_open ? "The same deterministic publication failure has been confirmed across jobs." : "",
@@ -12599,7 +12722,7 @@ ${JSON.stringify(input.messages ?? [])}`),
     let requestFingerprint = sha256(JSON.stringify({
       purpose: "priority",
       vision: params.visionContext.sha256,
-      repositoryAgentPrompt: "autonomy-priority-v2"
+      repositoryAgentPrompt: "autonomy-priority-v3"
     }));
     let requestController = null;
     const deterministicFallbackPhase = (detail) => {
@@ -12614,7 +12737,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v4",
+          promptTemplateVersion: "repository-agent-v5-validated-candidates",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -12684,17 +12807,8 @@ ${JSON.stringify(input.messages ?? [])}`),
         deterministicPolicy: {
           maxCandidates: this.cfg.ideationMaxCandidates,
           minimumConfidence: this.cfg.minConfidence,
-          allowedObjectiveTypes: [
-            "flaky_test",
-            "lint_fix",
-            "type_fix",
-            "small_refactor",
-            "feature_small",
-            "feature_medium",
-            "feature_large",
-            "docs",
-            "dep_bump"
-          ],
+          allowedObjectiveTypes: Object.entries(POLICY).filter(([, rule]) => rule.autonomousAllowed).map(([type]) => type),
+          candidateEnums: Object.fromEntries(Object.entries(AUTONOMY_CANDIDATE_ENUMS).map(([field, values]) => [field, [...values]])),
           requiredCandidateFields: [
             "id",
             "title",
@@ -12719,15 +12833,25 @@ ${JSON.stringify(input.messages ?? [])}`),
             "Return purpose-specific structured output as data.candidates.",
             "Use tracked, repository-relative target paths and repo-native validation proposals.",
             "Do not infer the project ecosystem from PushPals itself or from generic defaults.",
-            "The host will independently enforce scope, risk, cooldown, and command policy."
+            "The host will independently enforce scope, risk, cooldown, and command policy.",
+            "Use the exact candidateEnums values, not vision_priority, normal risk, or estimates measured in days. Select one bounded implementation slice executable in a worker job."
           ]
+        },
+        runtimeSignals: {
+          executedOutcomeWatermark: params.snapshot.executed_outcome_watermark ?? null,
+          topSignals: params.snapshot.top_signals.slice(0, 5),
+          stateTraits: params.snapshot.state_traits.slice(0, 5),
+          feedbackPriors: params.snapshot.feedback_priors.slice(0, 4),
+          openObjectives: params.snapshot.open_objectives.slice(0, 8),
+          recentObjectives: (params.snapshot.executed_objectives ?? params.snapshot.recent_objectives ?? []).filter((objective) => objective.job_id && ["completed", "failed", "dead_letter"].includes(objective.status)).slice(0, 16),
+          activeCooldowns: params.snapshot.active_cooldowns.slice(0, 8)
         }
       };
       requestFingerprint = sha256(JSON.stringify({
         repository: { identity: repository.identity, tree: repository.tree },
         purpose: "priority",
         vision: params.visionContext.sha256,
-        repositoryAgentPrompt: "autonomy-priority-v2"
+        repositoryAgentPrompt: "autonomy-priority-v3"
       }));
       const result = await this.repositoryAgent.ask({
         caller: { sessionId: this.sessionId, correlationId: params.runId },
@@ -12760,7 +12884,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v4",
+          promptTemplateVersion: "repository-agent-v5-validated-candidates",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -14690,7 +14814,7 @@ Scope:
 import { createHash as createHash6, randomUUID as randomUUID3 } from "crypto";
 import { closeSync as closeSync2, existsSync as existsSync5, openSync as openSync2, readSync as readSync2, realpathSync as realpathSync2, statSync as statSync3 } from "fs";
 import { basename, isAbsolute as isAbsolute4, relative as relative3, resolve as resolve7 } from "path";
-var PROMPT_VERSION = "repository-agent-v4-staged-evidence";
+var PROMPT_VERSION = "repository-agent-v5-validated-candidates";
 var CACHE_NAMESPACE = "repository_agent_cache";
 var CAPABILITY_NAMESPACE = "repository_agent_capabilities";
 var FACT_NAMESPACE = "repository_facts";
@@ -15473,6 +15597,7 @@ function normalizedDeterministicPolicy(request) {
   const rawConfidence = Number(policy.minimumConfidence ?? 0);
   return {
     maxCandidates: clampInt(policy.maxCandidates, 3, 1, 64),
+    candidateEnums: AUTONOMY_CANDIDATE_ENUMS,
     minimumConfidence: Number.isFinite(rawConfidence) ? Math.max(0, Math.min(1, rawConfidence)) : 0,
     allowedObjectiveTypes: list(policy.allowedObjectiveTypes, 16, 128),
     requiredCandidateFields: list(policy.requiredCandidateFields, 32, 256),
@@ -15490,7 +15615,9 @@ function cacheKey(request, modelId, promptVersion) {
       operation: "analyze_autonomy_opportunities",
       visionFingerprint,
       questionProtocol: sha2562(compactText2(request.question, 32000)),
-      deterministicPolicy: normalizedDeterministicPolicy(request)
+      deterministicPolicy: normalizedDeterministicPolicy(request),
+      executedOutcomes: executedAutonomyOutcomes(request),
+      executedOutcomeWatermark: compactText2(isRecord2(request.context?.runtimeSignals) ? request.context.runtimeSignals.executedOutcomeWatermark : null, 128) || null
     } : {
       revision: request.repository.revision,
       question: request.question,
@@ -15499,6 +15626,26 @@ function cacheKey(request, modelId, promptVersion) {
     modelId,
     promptVersion
   }));
+}
+function executedAutonomyOutcomes(request) {
+  const signals = isRecord2(request.context?.runtimeSignals) ? request.context.runtimeSignals : {};
+  return (Array.isArray(signals.recentObjectives) ? signals.recentObjectives : []).filter((entry) => isRecord2(entry) && entry.job_id && ["completed", "failed", "dead_letter"].includes(String(entry.status))).slice(0, 16).map((entry) => {
+    const row = entry;
+    return {
+      jobId: row.job_id,
+      status: row.status,
+      visionObjectiveId: row.vision_objective_id ?? null,
+      targetPaths: row.target_paths ?? [],
+      failureFingerprint: row.attempt_failure_fingerprint ?? null
+    };
+  }).sort((left, right) => String(left.jobId).localeCompare(String(right.jobId)));
+}
+function validateAutonomyCandidateData(request, data) {
+  if (autonomyVisionFingerprint(request) == null)
+    return;
+  const errors = autonomyCandidateContractErrors(data);
+  if (errors.length)
+    throw new RepositoryAgentWorkerError("invalid_autonomy_candidates", errors.join("; "), false);
 }
 function capabilityScope(request) {
   return { namespace: CAPABILITY_NAMESPACE, repositoryId: request.repository.identity };
@@ -16311,6 +16458,7 @@ class RepositoryAgentWorker {
       return null;
     try {
       const structuralAutonomy = autonomyVisionFingerprint(request) != null;
+      validateAutonomyCandidateData(request, cached.data);
       const cachedEvidence = Array.isArray(cached.evidence) ? cached.evidence.map((entry) => {
         if (!structuralAutonomy || !isRecord2(entry))
           return entry;
@@ -16342,19 +16490,21 @@ class RepositoryAgentWorker {
         memoryRefForRecord(record, "analysis_cache")
       ]);
       try {
-        await this.memoryWithinDeadline("exact cache reinforcement", signal, stageDeadlineMs, () => this.memory.reinforce({
-          scope: cacheScope(request),
-          key,
-          outcome: "confirmed",
-          provenance: {
-            service: "repository_agent",
-            agentId: this.agentId,
-            requestId,
-            modelId: record.provenance.modelId ?? this.modelId,
-            headSha: request.repository.revision,
-            promptVersion: this.promptVersion
-          }
-        }));
+        if (!structuralAutonomy) {
+          await this.memoryWithinDeadline("exact cache reinforcement", signal, stageDeadlineMs, () => this.memory.reinforce({
+            scope: cacheScope(request),
+            key,
+            outcome: "confirmed",
+            provenance: {
+              service: "repository_agent",
+              agentId: this.agentId,
+              requestId,
+              modelId: record.provenance.modelId ?? this.modelId,
+              headSha: request.repository.revision,
+              promptVersion: this.promptVersion
+            }
+          }));
+        }
       } catch (error) {
         throwIfAborted(signal);
         this.logger.warn(`[RepositoryAgent] cache reinforcement skipped: ${String(error)}`);
@@ -16366,7 +16516,7 @@ class RepositoryAgentWorker {
         await this.memoryWithinDeadline("stale exact cache invalidation", signal, stageDeadlineMs, () => this.memory.invalidate({
           scope: cacheScope(request),
           keys: [key],
-          reason: `cached Repository Agent evidence is stale: ${String(error)}`
+          reason: `cached Repository Agent result failed validation: ${String(error)}`
         }));
       } catch (invalidationError) {
         throwIfAborted(signal);
@@ -16403,7 +16553,7 @@ class RepositoryAgentWorker {
         stateTraits: compactArray(runtimeSignals.stateTraits, 5),
         feedbackPriors: compactArray(runtimeSignals.feedbackPriors, 4),
         openObjectives: compactArray(runtimeSignals.openObjectives, 4),
-        recentObjectives: compactArray(runtimeSignals.recentObjectives, 4),
+        recentObjectives: compactArray(runtimeSignals.recentObjectives, 16),
         activeCooldowns: compactArray(runtimeSignals.activeCooldowns, 4)
       },
       deterministicPolicy: normalizedDeterministicPolicy(request)
@@ -16544,7 +16694,14 @@ class RepositoryAgentWorker {
     const input = {
       system: REPOSITORY_AGENT_SYSTEM_PROMPT,
       json: true,
-      jsonSchema: REPOSITORY_AGENT_OUTPUT_SCHEMA,
+      jsonSchema: autonomyVisionFingerprint(request) == null ? REPOSITORY_AGENT_OUTPUT_SCHEMA : {
+        ...REPOSITORY_AGENT_OUTPUT_SCHEMA,
+        required: [...REPOSITORY_AGENT_OUTPUT_SCHEMA.required, "data"],
+        properties: {
+          ...REPOSITORY_AGENT_OUTPUT_SCHEMA.properties,
+          data: AUTONOMY_CANDIDATES_DATA_SCHEMA
+        }
+      },
       maxTokens: 3200,
       temperature: 0.1,
       executionContext: { repositoryMode: "isolated-evidence" },
@@ -16570,9 +16727,29 @@ class RepositoryAgentWorker {
       ]
     };
     try {
-      const generated = await this.generateWithinStage(input, signal, synthesisDeadlineMs);
+      let generated = await this.generateWithinStage(input, signal, synthesisDeadlineMs);
       throwIfAborted(signal);
-      const raw = parseJsonObject2(generated.text);
+      let raw = parseJsonObject2(generated.text);
+      try {
+        validateAutonomyCandidateData(request, raw.data);
+      } catch (error) {
+        if (!(error instanceof RepositoryAgentWorkerError) || error.code !== "invalid_autonomy_candidates" || synthesisDeadlineMs - Date.now() < MIN_SYNTHESIS_START_BUDGET_MS)
+          throw error;
+        this.logger.warn(`[RepositoryAgent] autonomyCandidateContractRejected=${JSON.stringify({ requestId, attempt: 1, errors: autonomyCandidateContractErrors(raw.data), retry: true })}`);
+        generated = await this.generateWithinStage({
+          ...input,
+          messages: [
+            ...input.messages,
+            {
+              role: "user",
+              content: `Your previous result failed deterministic candidate-contract validation: ${autonomyCandidateContractErrors(raw.data).join("; ")}. Return one complete corrected result using the exact schema enums and fields. Do not invent aliases or propose multi-day work as a small task.`
+            }
+          ]
+        }, signal, synthesisDeadlineMs);
+        throwIfAborted(signal);
+        raw = parseJsonObject2(generated.text);
+        validateAutonomyCandidateData(request, raw.data);
+      }
       const evidence = await validateEvidence(repoRoot, request, tracked, raw.evidence, evidencePacket.files.map((entry) => entry.path), signal);
       const confidence = Math.max(0, Math.min(1, Number(raw.confidence) || 0));
       await this.recordCapabilitySuccess(request, circuit, signal, deadlineMs);
