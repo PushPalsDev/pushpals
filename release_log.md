@@ -2,45 +2,45 @@
 
 ## Release Metadata
 
-- version: `v1.2.48`
-- start_commit: `26e48bd1c6158ff415da364812e955f5d0cb449a`
-- end_commit: `9fc5385b0bc9840e4cc33d3f3fe3e0706df9cbce`
-- commits_in_range: `2`
+- version: `v1.2.49`
+- start_commit: `82e388d0a942f9b707f2d3717b0518e3d266ac5b`
+- end_commit: `f679a3c7bbf1924dfa557a5df50b29529abe4c7d`
+- commits_in_range: `3`
 
 ## Highlights
 
-- Fix Windows startup when an outdated Bun installation appears before a compatible npm-managed Bun on `PATH`; the launcher now checks candidates in order and selects the first runtime satisfying Bun 1.3.14+.
-- Resolve global and project-local npm `bun`/`bun.cmd` shims to their native executable, deduplicate equivalent paths, honor the authoritative `PUSHPALS_BUN_BIN` override, and keep discovery within one bounded probe budget.
-- Report every checked Bun path and version with actionable upgrade, timeout, and shadowed-installation diagnostics when startup cannot continue.
-- Package the new runtime resolver with the npm CLI and exercise its selection and payload contracts in hosted Windows CI before release.
-- Synchronize Node and browser protocol validators, schemas, and packaged mirrors with the current structured session-ingress and session-event-frame contracts.
-- Refresh the canonical architecture diagram and operational documentation to match the implemented service topology, queue scheduling, authority boundaries, configuration, and client surfaces.
+- Preserve worker completion messages independently of ordinary log truncation, including candidate commits, trusted-validation handoffs, and accumulated usage. Large test output and shutdown noise can no longer silently discard a successful worker's structured result.
+- Bound result frames and compact verbose output while failing explicitly on oversized or malformed results; never fall back to an older success after a newer invalid result.
+- Recover an open WorkerPal runtime circuit even when every earlier job has finished and the queue is empty. After cooldown, admit one durable probe, retain the atomic canary fence, and recover expired planner leases without admitting duplicate probes.
+- Check runtime admission before spending RepositoryAgent, ideation, or scoring tokens. Persist specific enqueue rejection reasons and apply bounded backoff to transport errors, malformed responses, confirmation failures, and new admission codes.
+- Retry an explicit timeout-only trusted test-runner failure once while preserving failed-test evidence. Repeated failures still block publication; mixed assertions do not qualify for the timeout retry.
+- Emit immediate trusted-validation start, completion, and retry progress with job/completion/candidate identity and credential-redacted commands.
+- Regenerate all packaged runtime bundles and WorkerPal source mirrors so installed clients receive the fixes. Add regression coverage to the release reliability harness and isolate image-preparation tests from the developer checkout.
 
 ## Validation
 
-- Bun 1.3.14 passed `bun run test:root`: `1,987` tests passed, `7` intentional platform-gated skips, `0` failures, and `15,581` assertions across `169` files.
-- `bun test tests/cli.bun-runtime-resolver.test.ts` passed all `9` focused resolver tests, including outdated-first/compatible-npm-second, project-local shim, explicit override, fallback-shell, and shared-timeout cases.
-- `bun run test:protocol` passed all `51` Node/browser contract checks, and `bun run protocol:typecheck` passed.
-- `bun run cli:bundle` rebuilt the packaged CLI successfully without producing stale generated-asset changes.
-- `bun run cli:verify-package-payload` verified `270` package files, including `bin/bun-runtime.cjs`, with no external toolchain files.
-- The exact final product commit passed hosted Windows resolver/startup contracts, Linux packaged CLI E2E, Linux WorkerPal control-plane E2E, and Linux dependency-projection coverage in CLI E2E run `33847165864`.
-- Source and installed-package launcher smokes passed with Bun 1.3.14, including the explicit executable override.
-- Two independent review passes found and closed hosted-CI, project-local-shim, timeout-diagnostic, documentation-map, and Windows line-ending gaps; Prettier, Node syntax checks, and `git diff --check` passed.
+- Bun 1.3.14 passed `bun run cli:bundle` and `bun run cli:verify-package-payload` in a resource-capped container checkout with native dependencies; the package contains `271` files and no external toolchain payloads.
+- `bun run test:root` passed in the same isolated native-dependency container: `2,025` tests passed, `12` platform/opt-in skips, `0` failures, and `11,561` assertions across `170` files.
+- `341` distinct targeted tests passed across resource-capped Docker suites; `149` Windows tests passed, including actual subprocess result delivery and process-tree timeout coverage.
+- Server, RemoteBuddy, WorkerPal, and SourceControlManager TypeScript checks passed in Docker.
+- `23` packaged runtime parity and package-payload regression tests passed on Windows after regenerating the assets.
+- Final product commit `f679a3c7bbf1924dfa557a5df50b29529abe4c7d` passed CLI E2E run `34013126870`: hosted Windows package/startup contracts, Linux packaged CLI E2E, Linux WorkerPal control-plane E2E, and Linux dependency-projection coverage. The separate opt-in Windows-host Docker job was not run.
+- Independent reviews closed malformed-handoff backoff, credential-redaction, mixed-failure retry, and test-isolation gaps. Prettier and `git diff --check` passed.
 
 ## Install
 
 ```bash
-npm install -g @pushpalsdev/cli@1.2.48
+npm install -g @pushpalsdev/cli@1.2.49
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.48
+bun install -g @pushpalsdev/cli@1.2.49
 ```
 
 For environments using a managed certificate store:
 
 ```bash
-bun install -g --use-system-ca @pushpalsdev/cli@1.2.48
+bun install -g --use-system-ca @pushpalsdev/cli@1.2.49
 ```
 
 ## Artifacts
