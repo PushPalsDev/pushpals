@@ -4029,6 +4029,15 @@ var KNOWN_TOOL_NAMES = new Set([
   "python",
   "shell"
 ]);
+function cleanText(value) {
+  return String(value ?? "").trim();
+}
+function redactToolText(value) {
+  const text = cleanText(value);
+  if (!text)
+    return "";
+  return text.replace(/\b(OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|PUSHPALS_AUTH_TOKEN)=([^\s]+)/gi, "$1=[redacted]").replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}/gi, "$1[redacted]").replace(/\b(ghp|github_pat)_[A-Za-z0-9_]{20,}/g, "[redacted-github-token]").replace(/\bsk-[A-Za-z0-9_-]{20,}/g, "[redacted-openai-key]");
+}
 // packages/shared/src/toolchain.ts
 var SHELL_CONTROL_TOKENS = new Set(["|", "||", "&", "&&", ";", ">", ">>", "<", "<<"]);
 var NODE_BACKED_CLI_NAMES = new Set([
@@ -10086,6 +10095,41 @@ function emitTrustedValidationProgress(callback, event) {
 function trustedValidationHealthPhase(event) {
   return `trusted_validation_${event.phase}_${event.boundary}_attempt_${event.attempt}`;
 }
+function redactTrustedValidationProgressCommand(command) {
+  const argv = tokenizeTrustedValidationCommand(command);
+  if (!argv)
+    return "[unparseable validation command]";
+  const sensitiveOption = /^--?(?:(?:api|auth|access|refresh)[-_]?(?:key|token)|token|secret|password|authorization)$/i;
+  let redactNext = false;
+  return argv.map((argument) => {
+    if (redactNext) {
+      redactNext = false;
+      return "[redacted]";
+    }
+    const equals = argument.indexOf("=");
+    const option = equals < 0 ? argument : argument.slice(0, equals);
+    if (sensitiveOption.test(option)) {
+      if (equals >= 0)
+        return `${option}=[redacted]`;
+      redactNext = true;
+      return option;
+    }
+    const redacted = redactToolText(argument).replace(/(https?:\/\/)[^@\s/]+@/gi, "$1[redacted]@");
+    return /\s/.test(redacted) ? JSON.stringify(redacted) : redacted;
+  }).join(" ");
+}
+function createTrustedValidationProgressLogger(identity, log = console.log) {
+  return (progress) => {
+    const observedAt = new Date().toISOString();
+    log(`[${observedAt}] trustedValidationProgress=${JSON.stringify({
+      event: "trusted_validation_progress",
+      observedAt,
+      ...identity,
+      ...progress,
+      command: redactTrustedValidationProgressCommand(progress.command)
+    })}`);
+  };
+}
 function resolveTrustedValidationOutcome(results) {
   const terminalByCommand = new Map;
   for (const result of results) {
@@ -10466,10 +10510,13 @@ async function runTrustedValidationCommands(options) {
         durationMs: validationResult2.durationMs,
         cached: Boolean(validationResult2.cached)
       });
-      return validationResult2;
+      return {
+        result: validationResult2,
+        retryable: !validationResult2.ok && isTransientTrustedValidationFailure({ ...validationResult2, output: result.output })
+      };
     };
-    let validationResult = await execute(1);
-    if (!validationResult.ok && options.retryTransientFailures !== false && isTransientTrustedValidationFailure(validationResult)) {
+    let { result: validationResult, retryable } = await execute(1);
+    if (!validationResult.ok && options.retryTransientFailures !== false && retryable) {
       results.push({
         ...validationResult,
         retryReason: "transient_infrastructure"
@@ -10482,7 +10529,7 @@ async function runTrustedValidationCommands(options) {
         retryReason: "transient_infrastructure"
       });
       validationResult = {
-        ...await execute(2),
+        ...(await execute(2)).result,
         retryReason: "transient_infrastructure"
       };
     }
@@ -10495,7 +10542,22 @@ async function runTrustedValidationCommands(options) {
 function isTransientTrustedValidationFailure(result) {
   if (result.failureClass === "timeout" || result.exitCode === 124)
     return true;
+  if (isExplicitTestRunnerTimeoutFailure(result.output))
+    return true;
   return /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(String(result.output ?? ""));
+}
+function isExplicitTestRunnerTimeoutFailure(output) {
+  const plain = String(output ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  const timeoutDiagnostic = /^\s*Error:\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$/m;
+  if (!timeoutDiagnostic.test(plain))
+    return false;
+  const failedSections = plain.split(/^\s*FAIL\s+.+$/m).slice(1);
+  if (failedSections.length === 0 || !failedSections.every((section) => timeoutDiagnostic.test(section))) {
+    return false;
+  }
+  if (/^\s*(?:\(fail\)|--- FAIL:|FAILED|FAIL:|[\u2715\u2717\u25cf])\s/m.test(plain))
+    return false;
+  return !/^\s*(?:Assertion(?:Error|\s+failed)\b|(?:Type|Reference|Range|Syntax|URI|Eval|Aggregate)Error\b|(?:error:\s*)?expect\(|(?:Expected|Received):|Error:(?!\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$))/im.test(plain);
 }
 
 // apps/source_control_manager/src/validation_repair_publication.ts
@@ -11970,6 +12032,12 @@ async function tick() {
         if (completion.trustedValidationCommandsJson) {
           healthTracker.progress("trusted_validation", completion.id);
           console.log(`[${ts2()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`);
+          const logValidationProgress = createTrustedValidationProgressLogger({
+            jobId: completion.jobId,
+            completionId: completion.id,
+            commitSha: completion.commitSha,
+            candidateSha: trustedValidationCandidateSha
+          });
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: completion.trustedValidationCommandsJson,
@@ -11978,7 +12046,10 @@ async function tick() {
               candidateSha: trustedValidationCandidateSha,
               affectedPaths: trustedValidationAffectedPaths
             } : undefined,
-            onProgress: (event) => healthTracker.progress(trustedValidationHealthPhase(event), completion.id)
+            onProgress: (event) => {
+              healthTracker.progress(trustedValidationHealthPhase(event), completion.id);
+              logValidationProgress(event);
+            }
           });
           const validationOutcome = resolveTrustedValidationOutcome(trustedValidationResults);
           const terminalResults = new Set(validationOutcome.terminalResults);

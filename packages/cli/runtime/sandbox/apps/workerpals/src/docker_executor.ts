@@ -27,6 +27,11 @@ import type {
   JobUsageAttempt,
 } from "./common/types.js";
 import { validateStructuredJobResultEnvelope } from "./common/execution_utils.js";
+import {
+  isJobResultFrame,
+  JOB_RESULT_MAX_CHARS,
+  oversizedJobResultFrame,
+} from "./common/job_result_transport.js";
 import { computeTimeoutWarningWindow, DEFAULT_DOCKER_TIMEOUT_MS } from "./timeout_policy.js";
 import {
   BACKEND_DOCKER_PASSTHROUGH_ENV,
@@ -3711,6 +3716,9 @@ export class DockerExecutor {
     let droppedLines = 0;
     let droppedPrefixCount = 0;
     let pendingTruncationReported = false;
+    let pendingLineTruncated = false;
+    let discardingResultLine = false;
+    let latestResultFrame: string | undefined;
     const abortReader = () => {
       try {
         void reader.cancel().catch(() => {});
@@ -3720,15 +3728,29 @@ export class DockerExecutor {
     };
     signal?.addEventListener("abort", abortReader, { once: true });
 
-    const forwardLine = (line: string) => {
+    const forwardLine = (line: string, truncated = false) => {
       const cleanLine = line.endsWith("\r") ? line.slice(0, -1) : line;
       if (!cleanLine) return;
+
+      if (streamName === "stdout" && !truncated && isJobResultFrame(cleanLine)) {
+        // Keep only the newest control frame, even if it is malformed. Falling
+        // back to an older success would hide a newer terminal failure.
+        latestResultFrame =
+          cleanLine.length <= JOB_RESULT_MAX_CHARS ? cleanLine : oversizedJobResultFrame();
+        return;
+      }
 
       let retainedLine = cleanLine;
       if (retainedLine.length + 1 > retentionLimit) {
         const retainedLength = Math.max(1, retentionLimit - 1);
         droppedChars += retainedLine.length - retainedLength;
         retainedLine = retainedLine.slice(-retainedLength);
+      }
+      if (isJobResultFrame(retainedLine)) {
+        // A truncated ordinary log can coincidentally begin with the sentinel.
+        // Keep its identity as log output when parseResult scans the tail.
+        const marker = "[truncated log] ";
+        retainedLine = marker + retainedLine.slice(marker.length);
       }
       lines.push(retainedLine);
       retainedChars += retainedLine.length + 1;
@@ -3771,14 +3793,29 @@ export class DockerExecutor {
         while (newlineIndex >= 0) {
           const line = pending.slice(0, newlineIndex);
           pending = pending.slice(newlineIndex + 1);
-          forwardLine(line);
+          if (!discardingResultLine) forwardLine(line, pendingLineTruncated);
+          pendingLineTruncated = false;
+          discardingResultLine = false;
           newlineIndex = pending.indexOf("\n");
+        }
+        if (discardingResultLine) {
+          pending = "";
+          continue;
+        }
+        if (streamName === "stdout" && !pendingLineTruncated && isJobResultFrame(pending)) {
+          if (pending.length > JOB_RESULT_MAX_CHARS) {
+            latestResultFrame = oversizedJobResultFrame();
+            pending = "";
+            discardingResultLine = true;
+          }
+          continue;
         }
         const pendingLimit = Math.max(128, Math.min(retentionLimit, DOCKER_PENDING_LINE_MAX_CHARS));
         if (pending.length > pendingLimit) {
           const omittedChars = pending.length - pendingLimit;
           droppedChars += omittedChars;
           pending = pending.slice(-pendingLimit);
+          pendingLineTruncated = true;
           if (!pendingTruncationReported) {
             pendingTruncationReported = true;
             onLog?.(
@@ -3790,8 +3827,8 @@ export class DockerExecutor {
       }
 
       pending += decoder.decode();
-      if (pending) {
-        forwardLine(pending);
+      if (pending && !discardingResultLine) {
+        forwardLine(pending, pendingLineTruncated);
       }
     } catch (error) {
       if (!signal?.aborted) throw error;
@@ -3810,6 +3847,7 @@ export class DockerExecutor {
           `${DOCKER_STREAM_TRUNCATION_MARKER} (${droppedLines} lines, ${droppedChars} chars omitted; bounded tail retained).`,
         );
       }
+      if (latestResultFrame) lines.push(latestResultFrame);
     }
   }
 

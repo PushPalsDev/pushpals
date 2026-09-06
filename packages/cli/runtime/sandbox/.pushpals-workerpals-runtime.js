@@ -16677,6 +16677,30 @@ import { existsSync as existsSync11, mkdirSync as mkdirSync4, readFileSync as re
 import { homedir as homedir3 } from "os";
 import { isAbsolute as isAbsolute5, relative as relative3, resolve as resolve13 } from "path";
 
+// apps/workerpals/src/common/job_result_transport.ts
+var JOB_RESULT_PREFIX = "___RESULT___";
+var JOB_RESULT_MAX_CHARS = 2 * 1024 * 1024;
+var JOB_RESULT_OUTPUT_MAX_CHARS = 32 * 1024;
+function isJobResultFrame(line) {
+  return /^___RESULT___(?:\s|$)/.test(line.trimStart());
+}
+function oversizedJobResultFrame() {
+  const summary = `Worker structured result exceeded the ${JOB_RESULT_MAX_CHARS}-character transport limit`;
+  return `${JOB_RESULT_PREFIX} ${JSON.stringify({
+    ok: false,
+    summary,
+    exitCode: 1,
+    diagnostics: {
+      terminal: {
+        failureClass: "structured_result_too_large",
+        terminalStage: "docker_result_transport",
+        summary,
+        watchdogFired: false
+      }
+    }
+  })}`;
+}
+
 // apps/workerpals/src/common/worktree_cleanup.ts
 import { existsSync as existsSync10, rmSync as rmSync4 } from "fs";
 function defaultSleep(ms) {
@@ -19398,21 +19422,32 @@ ${text}` : `
     let droppedLines = 0;
     let droppedPrefixCount = 0;
     let pendingTruncationReported = false;
+    let pendingLineTruncated = false;
+    let discardingResultLine = false;
+    let latestResultFrame;
     const abortReader = () => {
       try {
         reader.cancel().catch(() => {});
       } catch {}
     };
     signal?.addEventListener("abort", abortReader, { once: true });
-    const forwardLine = (line) => {
+    const forwardLine = (line, truncated = false) => {
       const cleanLine = line.endsWith("\r") ? line.slice(0, -1) : line;
       if (!cleanLine)
         return;
+      if (streamName === "stdout" && !truncated && isJobResultFrame(cleanLine)) {
+        latestResultFrame = cleanLine.length <= JOB_RESULT_MAX_CHARS ? cleanLine : oversizedJobResultFrame();
+        return;
+      }
       let retainedLine = cleanLine;
       if (retainedLine.length + 1 > retentionLimit) {
         const retainedLength = Math.max(1, retentionLimit - 1);
         droppedChars += retainedLine.length - retainedLength;
         retainedLine = retainedLine.slice(-retainedLength);
+      }
+      if (isJobResultFrame(retainedLine)) {
+        const marker = "[truncated log] ";
+        retainedLine = marker + retainedLine.slice(marker.length);
       }
       lines.push(retainedLine);
       retainedChars += retainedLine.length + 1;
@@ -19449,15 +19484,31 @@ ${text}` : `
         while (newlineIndex >= 0) {
           const line = pending.slice(0, newlineIndex);
           pending = pending.slice(newlineIndex + 1);
-          forwardLine(line);
+          if (!discardingResultLine)
+            forwardLine(line, pendingLineTruncated);
+          pendingLineTruncated = false;
+          discardingResultLine = false;
           newlineIndex = pending.indexOf(`
 `);
+        }
+        if (discardingResultLine) {
+          pending = "";
+          continue;
+        }
+        if (streamName === "stdout" && !pendingLineTruncated && isJobResultFrame(pending)) {
+          if (pending.length > JOB_RESULT_MAX_CHARS) {
+            latestResultFrame = oversizedJobResultFrame();
+            pending = "";
+            discardingResultLine = true;
+          }
+          continue;
         }
         const pendingLimit = Math.max(128, Math.min(retentionLimit, DOCKER_PENDING_LINE_MAX_CHARS));
         if (pending.length > pendingLimit) {
           const omittedChars = pending.length - pendingLimit;
           droppedChars += omittedChars;
           pending = pending.slice(-pendingLimit);
+          pendingLineTruncated = true;
           if (!pendingTruncationReported) {
             pendingTruncationReported = true;
             onLog?.(streamName, `${DOCKER_PENDING_LINE_TRUNCATION_MARKER} (${omittedChars}+ chars omitted).`);
@@ -19465,8 +19516,8 @@ ${text}` : `
         }
       }
       pending += decoder.decode();
-      if (pending) {
-        forwardLine(pending);
+      if (pending && !discardingResultLine) {
+        forwardLine(pending, pendingLineTruncated);
       }
     } catch (error) {
       if (!signal?.aborted)
@@ -19482,6 +19533,8 @@ ${text}` : `
       if (droppedChars > 0 || droppedLines > 0) {
         lines.unshift(`${DOCKER_STREAM_TRUNCATION_MARKER} (${droppedLines} lines, ${droppedChars} chars omitted; bounded tail retained).`);
       }
+      if (latestResultFrame)
+        lines.push(latestResultFrame);
     }
   }
   parseResult(stdoutLines, stderrLines, exitCode, context) {
