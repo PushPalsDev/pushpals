@@ -229,6 +229,7 @@ type SnapshotOpenObjective = {
 };
 
 type WorkerLoadSnapshot = {
+  autonomyAdmission?: { allowed: boolean; code?: string; retryAfterMs?: number };
   workers: {
     total: number;
     online: number;
@@ -6410,6 +6411,7 @@ export class RemoteBuddyAutonomousEngine {
   private lastCompletedAtMs = 0;
   private dispatchBackoffUntilMs = 0;
   private dispatchBackoffReason = "";
+  private lastEnqueueRejectionReason: string | null = null;
   private readonly suppressedFailureTargets = new Map<string, number>();
   private pendingIdeationTimeoutRecovery: IdeationTimeoutRecovery | null = null;
   private activeRepositoryIdeation: AbortController | null = null;
@@ -6862,9 +6864,13 @@ export class RemoteBuddyAutonomousEngine {
         completions?: Partial<WorkerLoadSnapshot["completions"]>;
         publication?: Partial<WorkerLoadSnapshot["publication"]>;
         prs?: Partial<WorkerLoadSnapshot["prs"]>;
+        autonomyAdmission?: WorkerLoadSnapshot["autonomyAdmission"];
       };
       if (!data.ok || !data.workers || !data.jobs) return null;
       return {
+        ...(typeof data.autonomyAdmission?.allowed === "boolean"
+          ? { autonomyAdmission: data.autonomyAdmission }
+          : {}),
         workers: data.workers,
         jobs: data.jobs,
         completions: {
@@ -6897,6 +6903,9 @@ export class RemoteBuddyAutonomousEngine {
   }
 
   private deferReasonForWorkerLoad(snapshot: WorkerLoadSnapshot): string | null {
+    if (snapshot.autonomyAdmission?.allowed === false) {
+      return `autonomy_admission:${this.enqueueRejectionCode(snapshot.autonomyAdmission.code)}`;
+    }
     const busyWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.busy, 0)));
     const onlineWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.online, 0)));
     const idleWorkers = Math.max(0, Math.floor(asNumber(snapshot.workers.idle, 0)));
@@ -7539,166 +7548,224 @@ export class RemoteBuddyAutonomousEngine {
       };
     },
   ): Promise<string | null> {
+    this.lastEnqueueRejectionReason = null;
     if (!this.runtimeEnabled) return null;
-    const canonicalInstruction = instructionTextForRepo(this.autonomyRepo, instruction);
-    const reservationRequired = autonomy.reservationRequired !== false;
-    if (
-      autonomy.dispatchFence &&
-      this.cycleFenceReason(
-        autonomy.dispatchFence.snapshot,
-        autonomy.dispatchFence.cycleDeadline,
-        autonomy.dispatchFence.signal,
-      )
-    ) {
-      return null;
-    }
-    const dispatchConfirmationDeadlineMs = autonomy.dispatchFence
-      ? Math.min(
+    try {
+      const canonicalInstruction = instructionTextForRepo(this.autonomyRepo, instruction);
+      const reservationRequired = autonomy.reservationRequired !== false;
+      if (
+        autonomy.dispatchFence &&
+        this.cycleFenceReason(
+          autonomy.dispatchFence.snapshot,
           autonomy.dispatchFence.cycleDeadline,
-          Date.parse(autonomy.dispatchFence.snapshot.snapshot_created_at) +
-            autonomy.dispatchFence.snapshot.snapshot_ttl_ms,
+          autonomy.dispatchFence.signal,
         )
-      : null;
-    const dispatchConfirmationTtlMs =
-      dispatchConfirmationDeadlineMs == null
-        ? null
-        : Math.max(1, Math.min(2 * 60_000, dispatchConfirmationDeadlineMs - Date.now()));
-    const res = await this.fetchControl(`${this.server}/requests/enqueue`, {
-      method: "POST",
-      headers: this.headers(),
-      ...(autonomy.dispatchFence?.signal ? { signal: autonomy.dispatchFence.signal } : {}),
-      body: JSON.stringify({
-        sessionId: this.sessionId,
-        prompt: canonicalInstruction,
-        priority: "background",
-        forceWorker: true,
-        forceLane: "worker",
-        ...(reservationRequired ? { idempotencyKey: `autonomy:${autonomy.objectiveId}` } : {}),
-        ...(dispatchConfirmationTtlMs != null
-          ? {
-              dispatchConfirmationRequired: true,
-              dispatchConfirmationTtlMs,
-              dispatchConfirmationDeadlineAt: new Date(
-                dispatchConfirmationDeadlineMs!,
-              ).toISOString(),
-            }
-          : {}),
-        metadata: {
-          origin: "autonomy",
-          autonomy: {
-            objectiveId: autonomy.objectiveId,
-            runId: autonomy.runId,
-            snapshotId: autonomy.snapshotId,
-            patternKey: autonomy.patternKey,
-            componentArea: autonomy.componentArea,
-            targetPaths: autonomy.targetPaths,
-            writeGlobs: autonomy.writeGlobs,
-            ...(autonomy.validationIncident
-              ? { validationIncident: autonomy.validationIncident }
-              : {}),
-            reservationRequired,
-          },
-        },
-      }),
-    });
-    if (!res.ok) {
-      let errorPayload: Record<string, unknown> = {};
-      try {
-        const parsed = (await res.json()) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          errorPayload = parsed as Record<string, unknown>;
-        }
-      } catch {
-        errorPayload = {};
-      }
-      const code = String(errorPayload.code ?? "").trim();
-      const retryAfterMsRaw = Number(errorPayload.retryAfterMs ?? 0);
-      const retryAfterMs = Number.isFinite(retryAfterMsRaw)
-        ? Math.max(60_000, Math.min(60 * 60 * 1000, Math.floor(retryAfterMsRaw)))
-        : 30 * 60 * 1000;
-      if (res.status === 429 && code === "autonomy_similar_failure_suppressed") {
-        this.rememberSuppressedFailureTargets(
-          Array.isArray(errorPayload.targetPathSample)
-            ? errorPayload.targetPathSample
-            : autonomy.targetPaths,
-          retryAfterMs,
-        );
-        console.warn(
-          `[RemoteBuddyAutonomousEngine] Suppressing failed target cluster for ${retryAfterMs}ms and continuing future selection on other components.`,
-        );
+      ) {
         return null;
       }
-      if (
-        res.status === 429 &&
-        (code === "autonomy_worker_runtime_circuit_open" ||
-          code === "autonomy_worker_failure_circuit_open" ||
-          code === "autonomy_similar_no_publishable_suppressed" ||
-          code === "autonomy_queue_backpressure" ||
-          code === "autonomy_publication_backpressure" ||
-          code === "autonomy_open_pr_limit")
-      ) {
-        this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
-        this.dispatchBackoffReason =
-          compactStatusDetail(
-            code || String(errorPayload.message ?? "autonomy_enqueue_rejected"),
-          ) || "autonomy_enqueue_rejected";
-      }
-      return null;
-    }
-    const data = (await res.json()) as {
-      ok?: boolean;
-      requestId?: string;
-      dispatchConfirmationRequired?: boolean;
-      dispatchConfirmationToken?: string;
-      dispatchConfirmed?: boolean;
-    };
-    if (data.ok && data.requestId) {
-      if (autonomy.dispatchFence && data.dispatchConfirmed !== true) {
-        if (data.dispatchConfirmationRequired !== true) {
+      const dispatchConfirmationDeadlineMs = autonomy.dispatchFence
+        ? Math.min(
+            autonomy.dispatchFence.cycleDeadline,
+            Date.parse(autonomy.dispatchFence.snapshot.snapshot_created_at) +
+              autonomy.dispatchFence.snapshot.snapshot_ttl_ms,
+          )
+        : null;
+      const dispatchConfirmationTtlMs =
+        dispatchConfirmationDeadlineMs == null
+          ? null
+          : Math.max(1, Math.min(2 * 60_000, dispatchConfirmationDeadlineMs - Date.now()));
+      const res = await this.fetchControl(`${this.server}/requests/enqueue`, {
+        method: "POST",
+        headers: this.headers(),
+        ...(autonomy.dispatchFence?.signal ? { signal: autonomy.dispatchFence.signal } : {}),
+        body: JSON.stringify({
+          sessionId: this.sessionId,
+          prompt: canonicalInstruction,
+          priority: "background",
+          forceWorker: true,
+          forceLane: "worker",
+          ...(reservationRequired ? { idempotencyKey: `autonomy:${autonomy.objectiveId}` } : {}),
+          ...(dispatchConfirmationTtlMs != null
+            ? {
+                dispatchConfirmationRequired: true,
+                dispatchConfirmationTtlMs,
+                dispatchConfirmationDeadlineAt: new Date(
+                  dispatchConfirmationDeadlineMs!,
+                ).toISOString(),
+              }
+            : {}),
+          metadata: {
+            origin: "autonomy",
+            autonomy: {
+              objectiveId: autonomy.objectiveId,
+              runId: autonomy.runId,
+              snapshotId: autonomy.snapshotId,
+              patternKey: autonomy.patternKey,
+              componentArea: autonomy.componentArea,
+              targetPaths: autonomy.targetPaths,
+              writeGlobs: autonomy.writeGlobs,
+              ...(autonomy.validationIncident
+                ? { validationIncident: autonomy.validationIncident }
+                : {}),
+              reservationRequired,
+            },
+          },
+        }),
+      });
+      if (!res.ok) {
+        let errorPayload: Record<string, unknown> = {};
+        try {
+          const parsed = (await res.json()) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            errorPayload = parsed as Record<string, unknown>;
+          }
+        } catch {
+          errorPayload = {};
+        }
+        const code = this.enqueueRejectionCode(errorPayload.code);
+        const retryAfterMs = this.enqueueRetryAfterMs(errorPayload.retryAfterMs);
+        const targetSuppression =
+          res.status === 429 && code === "autonomy_similar_failure_suppressed";
+        this.recordEnqueueRejection(autonomy, res.status, code, retryAfterMs, !targetSuppression);
+        if (targetSuppression) {
+          this.rememberSuppressedFailureTargets(
+            Array.isArray(errorPayload.targetPathSample)
+              ? errorPayload.targetPathSample
+              : autonomy.targetPaths,
+            retryAfterMs,
+          );
           console.warn(
-            "[RemoteBuddyAutonomousEngine] Server did not attest two-phase autonomy dispatch; refusing the request ID.",
+            `[RemoteBuddyAutonomousEngine] Suppressing failed target cluster for ${retryAfterMs}ms and continuing future selection on other components.`,
           );
           return null;
         }
-        const confirmationToken = String(data.dispatchConfirmationToken ?? "").trim();
-        if (!confirmationToken) return null;
-        if (
-          this.cycleFenceReason(
-            autonomy.dispatchFence.snapshot,
-            autonomy.dispatchFence.cycleDeadline,
-            autonomy.dispatchFence.signal,
-          )
-        ) {
-          return null;
-        }
-        const confirmResponse = await this.fetchControl(
-          `${this.server}/requests/${encodeURIComponent(data.requestId)}/dispatch/confirm`,
-          {
-            method: "POST",
-            headers: this.headers(),
-            ...(autonomy.dispatchFence.signal ? { signal: autonomy.dispatchFence.signal } : {}),
-            body: JSON.stringify({ dispatchConfirmationToken: confirmationToken }),
-          },
-          Math.max(
-            1,
-            Math.min(
-              AUTONOMY_CONTROL_HTTP_TIMEOUT_MS,
-              autonomy.dispatchFence.cycleDeadline - Date.now(),
-            ),
-          ),
-        );
-        if (!confirmResponse.ok) return null;
-        const confirmation = (await confirmResponse.json()) as {
-          ok?: boolean;
-          confirmed?: boolean;
-        };
-        if (!confirmation.ok || !confirmation.confirmed) return null;
+        return null;
       }
-      this.dispatchBackoffUntilMs = 0;
-      this.dispatchBackoffReason = "";
-      return data.requestId;
+      const data = asObject(await res.json().catch(() => null)) as {
+        ok?: boolean;
+        requestId?: string;
+        dispatchConfirmationRequired?: boolean;
+        dispatchConfirmationToken?: string;
+        dispatchConfirmed?: boolean;
+      };
+      if (data.ok === true && typeof data.requestId === "string" && data.requestId.trim()) {
+        if (autonomy.dispatchFence && data.dispatchConfirmed !== true) {
+          if (data.dispatchConfirmationRequired !== true) {
+            console.warn(
+              "[RemoteBuddyAutonomousEngine] Server did not attest two-phase autonomy dispatch; refusing the request ID.",
+            );
+            return this.recordEnqueueRejection(
+              autonomy,
+              res.status,
+              "dispatch_attestation_missing",
+            );
+          }
+          const confirmationToken = String(data.dispatchConfirmationToken ?? "").trim();
+          if (!confirmationToken) {
+            return this.recordEnqueueRejection(
+              autonomy,
+              res.status,
+              "dispatch_confirmation_token_missing",
+            );
+          }
+          if (
+            this.cycleFenceReason(
+              autonomy.dispatchFence.snapshot,
+              autonomy.dispatchFence.cycleDeadline,
+              autonomy.dispatchFence.signal,
+            )
+          ) {
+            return null;
+          }
+          const confirmResponse = await this.fetchControl(
+            `${this.server}/requests/${encodeURIComponent(data.requestId)}/dispatch/confirm`,
+            {
+              method: "POST",
+              headers: this.headers(),
+              ...(autonomy.dispatchFence.signal ? { signal: autonomy.dispatchFence.signal } : {}),
+              body: JSON.stringify({ dispatchConfirmationToken: confirmationToken }),
+            },
+            Math.max(
+              1,
+              Math.min(
+                AUTONOMY_CONTROL_HTTP_TIMEOUT_MS,
+                autonomy.dispatchFence.cycleDeadline - Date.now(),
+              ),
+            ),
+          );
+          if (!confirmResponse.ok) {
+            return this.recordEnqueueRejection(
+              autonomy,
+              confirmResponse.status,
+              "dispatch_confirmation_rejected",
+            );
+          }
+          const confirmation = asObject(await confirmResponse.json().catch(() => null)) as {
+            ok?: boolean;
+            confirmed?: boolean;
+          };
+          if (confirmation.ok !== true || confirmation.confirmed !== true) {
+            return this.recordEnqueueRejection(
+              autonomy,
+              confirmResponse.status,
+              "dispatch_confirmation_invalid",
+            );
+          }
+        }
+        this.dispatchBackoffUntilMs = 0;
+        this.dispatchBackoffReason = "";
+        return data.requestId;
+      }
+      return this.recordEnqueueRejection(autonomy, res.status, "enqueue_response_invalid");
+    } catch {
+      // A cancelled cycle is fenced by the caller; it is not an admission failure.
+      if (!this.runtimeEnabled || this.stopped || autonomy.dispatchFence?.signal?.aborted)
+        return null;
+      return this.recordEnqueueRejection(autonomy, null, "enqueue_transport_error");
+    }
+  }
+
+  private recordEnqueueRejection(
+    identity: { runId: string; objectiveId: string },
+    status: number | null,
+    code: string,
+    retryAfterMs = 5 * 60_000,
+    globalBackoff = true,
+  ): null {
+    this.lastEnqueueRejectionReason = `request_enqueue_rejected:${status == null ? "transport" : `http_${status}`}:${code}`;
+    // Do not log response bodies or exception text, which can contain credentials.
+    console.warn(
+      `[RemoteBuddyAutonomousEngine] autonomyEnqueueRejected=${JSON.stringify({
+        event: "autonomy_enqueue_rejected",
+        runId: identity.runId,
+        objectiveId: identity.objectiveId,
+        status,
+        code,
+        retryAfterMs,
+      })}`,
+    );
+    // Unknown/new admission codes and server errors need the same bounded backoff.
+    if (globalBackoff) {
+      this.dispatchBackoffUntilMs = Date.now() + retryAfterMs;
+      this.dispatchBackoffReason = code;
     }
     return null;
+  }
+
+  private enqueueRejectionCode(value: unknown): string {
+    return typeof value === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(value)
+      ? value
+      : "autonomy_enqueue_rejected";
+  }
+
+  private enqueueRetryAfterMs(value: unknown): number {
+    const parsed =
+      typeof value === "number" || (typeof value === "string" && value.trim())
+        ? Number(value)
+        : Number.NaN;
+    return Number.isFinite(parsed) && parsed > 0
+      ? Math.max(60_000, Math.min(30 * 60_000, Math.floor(parsed)))
+      : 5 * 60_000;
   }
 
   private isSnapshotExpired(snapshot: Snapshot): boolean {
@@ -8308,8 +8375,10 @@ export class RemoteBuddyAutonomousEngine {
           confidence: candidate.confidence,
           risk_level: candidate.risk_level,
           expected_validation: candidate.expected_validation,
-          status: enqueueSuppressionReason ? "rejected" : "failed",
-          block_reason: enqueueSuppressionReason ?? "request_enqueue_failed",
+          status:
+            enqueueSuppressionReason || this.lastEnqueueRejectionReason ? "rejected" : "failed",
+          block_reason:
+            enqueueSuppressionReason ?? this.lastEnqueueRejectionReason ?? "request_enqueue_failed",
           required_validation_repair: true,
           incident_key: incidentKey,
         },
@@ -8324,7 +8393,11 @@ export class RemoteBuddyAutonomousEngine {
           ),
         };
       }
-      return { handled: true, outcome: "failed", detail: "validation_repair_enqueue_failed" };
+      return {
+        handled: true,
+        outcome: this.lastEnqueueRejectionReason ? "skipped" : "failed",
+        detail: this.lastEnqueueRejectionReason ?? "validation_repair_enqueue_failed",
+      };
     }
 
     console.log(
@@ -9775,12 +9848,12 @@ export class RemoteBuddyAutonomousEngine {
             confidence: selected.candidate.confidence,
             risk_level: selected.candidate.risk_level,
             expected_validation: selected.candidate.expected_validation,
-            status: "failed",
-            block_reason: "request_enqueue_failed",
+            status: this.lastEnqueueRejectionReason ? "rejected" : "failed",
+            block_reason: this.lastEnqueueRejectionReason ?? "request_enqueue_failed",
           },
           llmCalls,
         });
-        outcomeDetail = "request_enqueue_failed";
+        outcomeDetail = this.lastEnqueueRejectionReason ?? "request_enqueue_failed";
         return;
       }
 

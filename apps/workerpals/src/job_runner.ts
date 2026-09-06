@@ -27,6 +27,12 @@ import type {
 } from "./common/types.js";
 import { isHostScmOwnedReviewParams } from "./merge_conflict_job.js";
 import { UsageAccumulator } from "./quality_loop_durability.js";
+import {
+  compactJobResultOutput,
+  JOB_RESULT_MAX_CHARS,
+  JOB_RESULT_PREFIX,
+  oversizedJobResultFrame,
+} from "./common/job_result_transport.js";
 
 const CONFIG = loadPushPalsConfig();
 const GIT_CONFIG_TIMEOUT_MS = 10_000;
@@ -196,6 +202,33 @@ export function containerOwnsGitFinalization(params: Record<string, unknown>): b
   return !isHostScmOwnedReviewParams(params);
 }
 
+export function formatJobRunnerResult(result: JobResult): string {
+  const stdout = compactJobResultOutput(result.stdout);
+  const stderr = compactJobResultOutput(result.stderr);
+  const compacted = stdout !== result.stdout || stderr !== result.stderr;
+  const payload = compacted
+    ? {
+        ...result,
+        stdout,
+        stderr,
+        diagnostics: {
+          ...result.diagnostics,
+          metadata: {
+            ...result.diagnostics?.metadata,
+            resultTransport: {
+              stdoutOriginalChars: result.stdout?.length ?? 0,
+              stderrOriginalChars: result.stderr?.length ?? 0,
+              stdoutRetainedChars: stdout?.length ?? 0,
+              stderrRetainedChars: stderr?.length ?? 0,
+            },
+          },
+        },
+      }
+    : result;
+  const frame = `${JOB_RESULT_PREFIX} ${JSON.stringify(payload)}`;
+  return frame.length <= JOB_RESULT_MAX_CHARS ? frame : oversizedJobResultFrame();
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -325,9 +358,8 @@ async function main(): Promise<void> {
     }
 
     // Output result with sentinel
-    const resultJson = JSON.stringify(jobResult);
     // eslint-disable-next-line no-console
-    console.log(`___RESULT___ ${resultJson}`);
+    console.log(formatJobRunnerResult(jobResult));
 
     // Exit with appropriate code
     process.exit(jobResult.exitCode ?? (jobResult.ok ? 0 : 1));
@@ -345,7 +377,7 @@ if (import.meta.main) {
     // Preserve a structured terminal result even for unexpected runtime faults
     // so the host does not have to infer timeout state from arbitrary job logs.
     // eslint-disable-next-line no-console
-    console.log(`___RESULT___ ${JSON.stringify(result)}`);
+    console.log(formatJobRunnerResult(result));
     process.exit(1);
   });
 }

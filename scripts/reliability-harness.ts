@@ -110,6 +110,7 @@ const phases: HarnessPhase[] = [
     name: "runtime_boundary",
     files: [
       "tests/workerpals.docker-executor.test.ts",
+      "tests/workerpals.job-result-transport.test.ts",
       "tests/workerpals.worktree-boundary.test.ts",
       "tests/workerpals.http-deadline.test.ts",
       "tests/workerpals.server-transport.test.ts",

@@ -450,6 +450,61 @@ describe("autonomy two-phase dispatch fencing", () => {
     expect(calls).toHaveLength(1);
   });
 
+  test.each(["transport", "invalid_json", "ok_false", "confirm_http", "confirm_invalid"])(
+    "backs off failed two-phase handoffs without exposing payloads: %s",
+    async (failure) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-handoff-failure-"));
+      tempDirs.push(root);
+      const engine = new RemoteBuddyAutonomousEngine({
+        server: "http://localhost:3001",
+        sessionId: "s_handoff",
+        authToken: "tok",
+        repo: root,
+        llm: {} as any,
+        comm: { async emit() {} } as any,
+        config: makeConfig(),
+      });
+      (engine as any).fetchControl = async (url: string) => {
+        if (failure === "transport") throw new Error("secret=DO_NOT_LOG");
+        if (failure === "invalid_json") return new Response("DO_NOT_LOG", { status: 200 });
+        if (failure === "ok_false") return jsonResponse(200, { ok: false });
+        if (url.endsWith("/requests/enqueue"))
+          return jsonResponse(201, {
+            ok: true,
+            requestId: "provisional-request",
+            dispatchConfirmationRequired: true,
+            dispatchConfirmationToken: "DO_NOT_LOG",
+          });
+        return failure === "confirm_http"
+          ? new Response("DO_NOT_LOG", { status: 503 })
+          : jsonResponse(200, { ok: true, confirmed: false });
+      };
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+      try {
+        const input = dispatchInput(makeSnapshot());
+        (input as any).privateData = "DO_NOT_LOG";
+        const started = Date.now();
+        expect(await (engine as any).enqueueSyntheticRequest("DO_NOT_LOG", input)).toBeNull();
+        expect((engine as any).dispatchBackoffUntilMs).toBeGreaterThanOrEqual(started + 300_000);
+        const expected =
+          failure === "transport"
+            ? "enqueue_transport_error"
+            : failure === "confirm_http"
+              ? "dispatch_confirmation_rejected"
+              : failure === "confirm_invalid"
+                ? "dispatch_confirmation_invalid"
+                : "enqueue_response_invalid";
+        expect((engine as any).lastEnqueueRejectionReason).toEndWith(`:${expected}`);
+        expect(warnings.join("\n")).not.toContain("DO_NOT_LOG");
+      } finally {
+        console.warn = originalWarn;
+        engine.stop();
+      }
+    },
+  );
+
   test("confirms and returns a provisional request while the cycle fence remains live", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-dispatch-confirm-"));
     tempDirs.push(root);
@@ -1023,6 +1078,91 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       beforeEnqueueMs + 120_000,
     );
     expect((engine as any).dispatchBackoffUntilMs).toBeLessThanOrEqual(Date.now() + 120_000);
+  });
+
+  test.each([
+    { status: 429, code: "autonomy_recovery_backpressure", retry: 30_000, expected: 60_000 },
+    { status: 429, code: "future_admission_gate", retry: 120_000, expected: 120_000 },
+    { status: 429, code: "session_token_budget_exceeded", retry: null, expected: 300_000 },
+    { status: 409, code: "autonomy_reservation_invalid", retry: undefined, expected: 300_000 },
+    { status: 503, code: "service_unavailable", retry: "", expected: 300_000 },
+    { status: 429, code: "rate_limited", retry: 86_400_000, expected: 1_800_000 },
+    { status: 401, code: "credential=DO_NOT_LOG", retry: -1, expected: 300_000 },
+    { status: 502, code: null, retry: "invalid", expected: 300_000 },
+  ])("enqueue rejection backs off and preserves bounded diagnostics: %j", async (scenario) => {
+    originalFetch = globalThis.fetch;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-enqueue-diagnostics-"));
+    tempDirs.push(root);
+    let accepted = false;
+    globalThis.fetch = (async () =>
+      accepted
+        ? jsonResponse(201, { ok: true, requestId: "recovered-request" })
+        : scenario.status === 502
+          ? new Response("<html>DO_NOT_LOG</html>", { status: 502 })
+          : jsonResponse(scenario.status, {
+              code: scenario.code,
+              retryAfterMs: scenario.retry,
+              message: "DO_NOT_LOG",
+            })) as typeof fetch;
+    const engine = new RemoteBuddyAutonomousEngine({
+      server: "http://localhost:3001",
+      sessionId: "s_rejection",
+      authToken: "tok",
+      repo: root,
+      llm: {
+        generate: async () => {
+          throw new Error("must not plan during backoff");
+        },
+      } as any,
+      comm: { async emit() {} } as any,
+      config: makeConfig(),
+    });
+    const identity = {
+      objectiveId: "objective_rejection",
+      runId: "run_rejection",
+      snapshotId: "snap_rejection",
+      patternKey: "rejection",
+      componentArea: "src",
+      targetPaths: ["src/example.ts"],
+      writeGlobs: ["src/example.ts"],
+    };
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+    try {
+      const started = Date.now();
+      expect(await (engine as any).enqueueSyntheticRequest("task", identity)).toBeNull();
+      const code =
+        scenario.code && /^[a-z][a-z0-9_]*$/.test(scenario.code)
+          ? scenario.code
+          : "autonomy_enqueue_rejected";
+      expect((engine as any).lastEnqueueRejectionReason).toBe(
+        `request_enqueue_rejected:http_${scenario.status}:${code}`,
+      );
+      expect((engine as any).dispatchBackoffUntilMs).toBeGreaterThanOrEqual(
+        started + scenario.expected,
+      );
+      expect((engine as any).dispatchBackoffUntilMs).toBeLessThanOrEqual(
+        Date.now() + scenario.expected,
+      );
+      expect(warnings.join("\n")).toContain('"event":"autonomy_enqueue_rejected"');
+      expect(warnings.join("\n")).toContain('"objectiveId":"objective_rejection"');
+      expect(warnings.join("\n")).not.toContain("DO_NOT_LOG");
+      (engine as any).acquireDispatchLock = async () => {
+        throw new Error("must not leave backoff");
+      };
+      await engine.tick();
+      expect((engine as any).lastDetail).toStartWith(`dispatch_backoff:${code}:`);
+      accepted = true;
+      expect(await (engine as any).enqueueSyntheticRequest("task", identity)).toBe(
+        "recovered-request",
+      );
+      expect((engine as any).lastEnqueueRejectionReason).toBeNull();
+      expect((engine as any).dispatchBackoffUntilMs).toBe(0);
+    } finally {
+      console.warn = originalWarn;
+      engine.stop();
+    }
   });
 
   test("does not attribute deterministic fallback candidates to an empty RepositoryAgent result", async () => {
@@ -2953,77 +3093,102 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect((engine as any).lastDetail).toBe("kill_switch_enabled");
   });
 
-  test("tick defers ideation while worker load is active", async () => {
-    originalFetch = globalThis.fetch;
-    mockGitSpawnForTest();
-    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-worker-load-"));
-    tempDirs.push(root);
-    const calls: FetchCall[] = [];
-    let llmCalls = 0;
+  test.each([false, true])(
+    "tick defers ideation for busy workers or runtime admission (circuit=%s)",
+    async (circuit) => {
+      originalFetch = globalThis.fetch;
+      mockGitSpawnForTest();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-worker-load-"));
+      tempDirs.push(root);
+      const calls: FetchCall[] = [];
+      let llmCalls = 0;
 
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url =
-        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      const method = String(init?.method ?? "GET").toUpperCase();
-      const bodyRaw = typeof init?.body === "string" ? init.body : "";
-      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
-      calls.push({ url, method, body });
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = String(init?.method ?? "GET").toUpperCase();
+        const bodyRaw = typeof init?.body === "string" ? init.body : "";
+        const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+        calls.push({ url, method, body });
 
-      if (url.includes("/autonomy/lock/acquire"))
-        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/release"))
-        return jsonResponse(200, { ok: true, released: true });
-      if (url.includes("/autonomy/snapshot"))
-        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
-      if (url.includes("/workers/autoscale"))
-        return jsonResponse(200, {
-          ok: true,
-          workers: { total: 2, online: 2, busy: 1, idle: 1 },
-          jobs: { pending: 2, claimed: 1, autoscalablePending: 1 },
-          prs: { openUnmerged: 2 },
-        });
-      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
-    }) as typeof globalThis.fetch;
+        if (url.includes("/autonomy/lock/acquire"))
+          return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+        if (url.includes("/autonomy/lock/release"))
+          return jsonResponse(200, { ok: true, released: true });
+        if (url.includes("/autonomy/snapshot"))
+          return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+        if (url.includes("/workers/autoscale"))
+          return jsonResponse(200, {
+            ok: true,
+            workers: { total: 2, online: 2, busy: circuit ? 0 : 1, idle: circuit ? 2 : 1 },
+            jobs: {
+              pending: circuit ? 0 : 2,
+              claimed: circuit ? 0 : 1,
+              autoscalablePending: circuit ? 0 : 1,
+            },
+            prs: { openUnmerged: 2 },
+            ...(circuit
+              ? {
+                  autonomyAdmission: {
+                    allowed: false,
+                    code: "autonomy_worker_runtime_circuit_open",
+                    retryAfterMs: 60_000,
+                  },
+                }
+              : {}),
+          });
+        throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+      }) as typeof globalThis.fetch;
 
-    const llm = {
-      async generate() {
-        llmCalls += 1;
-        return {
-          text: JSON.stringify({ candidates: [] }),
-          usage: { promptTokens: 1, completionTokens: 1 },
-        };
-      },
-    };
-    const comm = {
-      async emit() {
+      const llm = {
+        async generate() {
+          llmCalls += 1;
+          return {
+            text: JSON.stringify({ candidates: [] }),
+            usage: { promptTokens: 1, completionTokens: 1 },
+          };
+        },
+      };
+      const comm = {
+        async emit() {
+          return true;
+        },
+      };
+
+      const engine = new RemoteBuddyAutonomousEngine({
+        server: "http://localhost:3001",
+        sessionId: "s_worker_load",
+        authToken: "tok",
+        repo: root,
+        llm: llm as any,
+        comm: comm as any,
+        config: makeConfig(),
+        repositoryAgent: {
+          ask: async () => {
+            throw new Error("must not spend repository-agent tokens");
+          },
+        } as any,
+      });
+      (engine as any).ensureAutonomyRepoReady = async () => {
+        const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+        mkdirSync(autonomyRepo, { recursive: true });
+        seedPushpalsAutonomyRepoLayout(autonomyRepo);
         return true;
-      },
-    };
+      };
 
-    const engine = new RemoteBuddyAutonomousEngine({
-      server: "http://localhost:3001",
-      sessionId: "s_worker_load",
-      authToken: "tok",
-      repo: root,
-      llm: llm as any,
-      comm: comm as any,
-      config: makeConfig(),
-    });
-    (engine as any).ensureAutonomyRepoReady = async () => {
-      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
-      mkdirSync(autonomyRepo, { recursive: true });
-      seedPushpalsAutonomyRepoLayout(autonomyRepo);
-      return true;
-    };
+      await engine.tick();
 
-    await engine.tick();
-
-    expect(llmCalls).toBe(0);
-    expect(calls.some((entry) => entry.url.includes("/workers/autoscale"))).toBe(true);
-    expect(calls.some((entry) => entry.url.includes("/autonomy/inspiration"))).toBe(false);
-    expect((engine as any).lastOutcome).toBe("skipped");
-    expect((engine as any).lastDetail).toBe("worker_load_busy_1_pending_2_autoscalable_1");
-  });
+      expect(llmCalls).toBe(0);
+      expect(calls.some((entry) => entry.url.includes("/workers/autoscale"))).toBe(true);
+      expect(calls.some((entry) => entry.url.includes("/autonomy/inspiration"))).toBe(false);
+      expect((engine as any).lastOutcome).toBe("skipped");
+      expect((engine as any).lastDetail).toBe(
+        circuit
+          ? "autonomy_admission:autonomy_worker_runtime_circuit_open"
+          : "worker_load_busy_1_pending_2_autoscalable_1",
+      );
+    },
+  );
 
   test("worker-load backpressure drains publication first, then uses safe idle capacity", () => {
     const engine = Object.create(RemoteBuddyAutonomousEngine.prototype) as {
@@ -3043,6 +3208,12 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
       prs: { openUnmerged: 1 },
     };
     expect(engine.deferReasonForWorkerLoad(healthyCapacity)).toBeNull();
+    expect(
+      engine.deferReasonForWorkerLoad({
+        ...healthyCapacity,
+        autonomyAdmission: { allowed: true },
+      }),
+    ).toBeNull();
 
     expect(
       engine.deferReasonForWorkerLoad({
@@ -3800,159 +3971,180 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     expect((engine as any).lastDetail).toBe("no_eligible_candidates");
   });
 
-  test("tick can dispatch generic repo autonomy work when vision.md is present", async () => {
-    originalFetch = globalThis.fetch;
-    mockGitSpawnForTest();
-    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-generic-repo-"));
-    tempDirs.push(root);
-    const calls: FetchCall[] = [];
-    const objectivePosts: Array<Record<string, unknown>> = [];
-    let llmCall = 0;
+  test.each([false, true])(
+    "generic repo tick dispatches or records the admission rejection (rejected=%s)",
+    async (rejected) => {
+      originalFetch = globalThis.fetch;
+      mockGitSpawnForTest();
+      const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-generic-repo-"));
+      tempDirs.push(root);
+      const calls: FetchCall[] = [];
+      const objectivePosts: Array<Record<string, unknown>> = [];
+      let llmCall = 0;
 
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url =
-        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      const method = String(init?.method ?? "GET").toUpperCase();
-      const bodyRaw = typeof init?.body === "string" ? init.body : "";
-      const body = bodyRaw ? JSON.parse(bodyRaw) : {};
-      calls.push({ url, method, body });
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = String(init?.method ?? "GET").toUpperCase();
+        const bodyRaw = typeof init?.body === "string" ? init.body : "";
+        const body = bodyRaw ? JSON.parse(bodyRaw) : {};
+        calls.push({ url, method, body });
 
-      if (url.includes("/autonomy/lock/acquire"))
-        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/renew"))
-        return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
-      if (url.includes("/autonomy/lock/release"))
-        return jsonResponse(200, { ok: true, released: true });
-      if (url.includes("/autonomy/snapshot"))
-        return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
-      if (url.includes("/workers/autoscale"))
-        return jsonResponse(200, {
-          ok: true,
-          workers: { total: 1, online: 1, busy: 0, idle: 1 },
-          jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
-          prs: { openUnmerged: 0 },
-        });
-      if (url.includes("/autonomy/inspiration/ingest"))
-        return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
-      if (url.includes("/autonomy/inspiration?"))
-        return jsonResponse(200, { ok: true, patterns: [] });
-      if (url.includes("/autonomy/insights?"))
-        return jsonResponse(200, { ok: true, engineSourceStats: [] });
-      if (url.endsWith("/autonomy/eligibility")) {
-        const candidates = Array.isArray((body as Record<string, unknown>).candidates)
-          ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
-          : [];
-        return jsonResponse(200, {
-          ok: true,
-          results: candidates.map((entry) => ({
-            candidate_id: String(entry.id ?? entry.candidate_id ?? ""),
+        if (url.includes("/autonomy/lock/acquire"))
+          return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+        if (url.includes("/autonomy/lock/renew"))
+          return jsonResponse(200, { ok: true, lockUntil: new Date().toISOString() });
+        if (url.includes("/autonomy/lock/release"))
+          return jsonResponse(200, { ok: true, released: true });
+        if (url.includes("/autonomy/snapshot"))
+          return jsonResponse(200, { ok: true, snapshot: makeSnapshot() });
+        if (url.includes("/workers/autoscale"))
+          return jsonResponse(200, {
             ok: true,
-          })),
-        });
-      }
-      if (url.endsWith("/requests/enqueue"))
-        return jsonResponse(201, {
-          ok: true,
-          requestId: "req_generic_1",
-          dispatchConfirmed: true,
-        });
-      if (url.endsWith("/autonomy/objectives")) {
-        objectivePosts.push(body as Record<string, unknown>);
-        return jsonResponse(200, {
-          ok: true,
-          objectiveId: "obj_generic_1",
-          patternKey: "pk_generic_1",
-        });
-      }
-      throw new Error(`Unhandled fetch in test: ${method} ${url}`);
-    }) as typeof globalThis.fetch;
+            workers: { total: 1, online: 1, busy: 0, idle: 1 },
+            jobs: { pending: 0, claimed: 0, autoscalablePending: 0 },
+            prs: { openUnmerged: 0 },
+          });
+        if (url.includes("/autonomy/inspiration/ingest"))
+          return jsonResponse(200, { ok: true, inserted: 1, updated: 0, skipped: 0 });
+        if (url.includes("/autonomy/inspiration?"))
+          return jsonResponse(200, { ok: true, patterns: [] });
+        if (url.includes("/autonomy/insights?"))
+          return jsonResponse(200, { ok: true, engineSourceStats: [] });
+        if (url.endsWith("/autonomy/eligibility")) {
+          const candidates = Array.isArray((body as Record<string, unknown>).candidates)
+            ? ((body as Record<string, unknown>).candidates as Array<Record<string, unknown>>)
+            : [];
+          return jsonResponse(200, {
+            ok: true,
+            results: candidates.map((entry) => ({
+              candidate_id: String(entry.id ?? entry.candidate_id ?? ""),
+              ok: true,
+            })),
+          });
+        }
+        if (url.endsWith("/requests/enqueue"))
+          return rejected
+            ? jsonResponse(429, {
+                ok: false,
+                code: "autonomy_worker_runtime_circuit_open",
+                retryAfterMs: 60_000,
+              })
+            : jsonResponse(201, {
+                ok: true,
+                requestId: "req_generic_1",
+                dispatchConfirmed: true,
+              });
+        if (url.endsWith("/autonomy/objectives")) {
+          objectivePosts.push(body as Record<string, unknown>);
+          return jsonResponse(200, {
+            ok: true,
+            objectiveId: "obj_generic_1",
+            patternKey: "pk_generic_1",
+          });
+        }
+        throw new Error(`Unhandled fetch in test: ${method} ${url}`);
+      }) as typeof globalThis.fetch;
 
-    const llm = {
-      async generate() {
-        llmCall += 1;
-        if (llmCall === 1) {
+      const llm = {
+        async generate() {
+          llmCall += 1;
+          if (llmCall === 1) {
+            return {
+              text: JSON.stringify({ candidates: [] }),
+              usage: { promptTokens: 1, completionTokens: 1 },
+            };
+          }
+          if (llmCall === 2) {
+            return {
+              text: JSON.stringify({ scores: [] }),
+              usage: { promptTokens: 1, completionTokens: 1 },
+            };
+          }
           return {
-            text: JSON.stringify({ candidates: [] }),
+            text: JSON.stringify({
+              instruction:
+                "Improve src/autonomy.ts using the queue health signal and keep the change narrow.",
+            }),
             usage: { promptTokens: 1, completionTokens: 1 },
           };
-        }
-        if (llmCall === 2) {
-          return {
-            text: JSON.stringify({ scores: [] }),
-            usage: { promptTokens: 1, completionTokens: 1 },
-          };
-        }
-        return {
-          text: JSON.stringify({
-            instruction:
-              "Improve src/autonomy.ts using the queue health signal and keep the change narrow.",
-          }),
-          usage: { promptTokens: 1, completionTokens: 1 },
-        };
-      },
-    };
-    const comm = {
-      async emit() {
-        return true;
-      },
-    };
-
-    const engine = new RemoteBuddyAutonomousEngine({
-      server: "http://localhost:3001",
-      sessionId: "s_generic_repo",
-      authToken: "tok",
-      repo: root,
-      llm: llm as any,
-      comm: comm as any,
-      config: makeConfig(),
-    });
-    (engine as any).ensureAutonomyRepoReady = async () => {
-      const autonomyRepo = String((engine as any).autonomyRepo ?? "");
-      mkdirSync(autonomyRepo, { recursive: true });
-      seedGenericAutonomyRepoLayout(autonomyRepo);
-      return true;
-    };
-    (engine as any).loadVisionContext = () => ({
-      path: "vision.md",
-      markdown: "# Vision\n",
-      one_sentence: "Improve queue throughput safely for this repo.",
-      sections: [
-        {
-          number: "1",
-          title: "Reliability",
-          markdown: "Favor narrow, deterministic fixes.",
-          truncated: false,
         },
-      ],
-      key_items: {
-        target_users: ["maintainers"],
-        priorities: ["queue reliability"],
-        objectives: ["reduce queue latency"],
-        guardrails: ["small scoped changes"],
-        constraints: ["only repo-relative targets"],
-        non_goals: [],
-        metrics: ["queue p95"],
-        risk_policy: ["low risk autonomous"],
-        operating_model: ["remotebuddy + workerpals"],
-        governance: ["review high risk manually"],
-      },
-      section_numbers: ["1"],
-      sha256: "visionhash",
-      truncated: false,
-    });
-    (engine as any).loadCommitHistoryHints = async () => [];
+      };
+      const comm = {
+        async emit() {
+          return true;
+        },
+      };
 
-    await engine.tick();
+      const engine = new RemoteBuddyAutonomousEngine({
+        server: "http://localhost:3001",
+        sessionId: "s_generic_repo",
+        authToken: "tok",
+        repo: root,
+        llm: llm as any,
+        comm: comm as any,
+        config: makeConfig(),
+      });
+      (engine as any).ensureAutonomyRepoReady = async () => {
+        const autonomyRepo = String((engine as any).autonomyRepo ?? "");
+        mkdirSync(autonomyRepo, { recursive: true });
+        seedGenericAutonomyRepoLayout(autonomyRepo);
+        return true;
+      };
+      (engine as any).loadVisionContext = () => ({
+        path: "vision.md",
+        markdown: "# Vision\n",
+        one_sentence: "Improve queue throughput safely for this repo.",
+        sections: [
+          {
+            number: "1",
+            title: "Reliability",
+            markdown: "Favor narrow, deterministic fixes.",
+            truncated: false,
+          },
+        ],
+        key_items: {
+          target_users: ["maintainers"],
+          priorities: ["queue reliability"],
+          objectives: ["reduce queue latency"],
+          guardrails: ["small scoped changes"],
+          constraints: ["only repo-relative targets"],
+          non_goals: [],
+          metrics: ["queue p95"],
+          risk_policy: ["low risk autonomous"],
+          operating_model: ["remotebuddy + workerpals"],
+          governance: ["review high risk manually"],
+        },
+        section_numbers: ["1"],
+        sha256: "visionhash",
+        truncated: false,
+      });
+      (engine as any).loadCommitHistoryHints = async () => [];
 
-    const enqueueCall = calls.find((entry) => entry.url.endsWith("/requests/enqueue"));
-    expect(enqueueCall).toBeDefined();
-    const autonomy = (
-      ((enqueueCall?.body as Record<string, unknown>).metadata ?? {}) as Record<string, unknown>
-    ).autonomy as Record<string, unknown>;
-    expect(Array.isArray(autonomy.targetPaths)).toBe(true);
-    expect(String((autonomy.targetPaths as string[])[0] ?? "")).toContain("src/");
-    expect(String((autonomy.targetPaths as string[])[0] ?? "")).not.toContain("apps/server");
-    expect(objectivePosts.length).toBeGreaterThan(0);
-    expect((engine as any).lastOutcome).toBe("success");
-  });
+      await engine.tick();
+
+      const enqueueCall = calls.find((entry) => entry.url.endsWith("/requests/enqueue"));
+      expect(enqueueCall).toBeDefined();
+      const autonomy = (
+        ((enqueueCall?.body as Record<string, unknown>).metadata ?? {}) as Record<string, unknown>
+      ).autonomy as Record<string, unknown>;
+      expect(Array.isArray(autonomy.targetPaths)).toBe(true);
+      expect(String((autonomy.targetPaths as string[])[0] ?? "")).toContain("src/");
+      expect(String((autonomy.targetPaths as string[])[0] ?? "")).not.toContain("apps/server");
+      expect(objectivePosts.length).toBeGreaterThan(0);
+      expect((engine as any).lastOutcome).toBe(rejected ? "skipped" : "success");
+      if (rejected) {
+        expect(objectivePosts.at(-1)?.objective).toMatchObject({
+          status: "rejected",
+          block_reason: "request_enqueue_rejected:http_429:autonomy_worker_runtime_circuit_open",
+        });
+        expect((engine as any).lastDetail).toBe(
+          "request_enqueue_rejected:http_429:autonomy_worker_runtime_circuit_open",
+        );
+        const callsBeforeBackoff = llmCall;
+        await engine.tick();
+        expect(llmCall).toBe(callsBeforeBackoff);
+      }
+    },
+  );
 });

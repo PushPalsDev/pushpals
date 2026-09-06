@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CompletionQueue } from "../apps/server/src/completions";
 import { JobQueue, resolveWorkerRuntimeCircuitRetryAfterMs } from "../apps/server/src/jobs";
+import {
+  JOB_RESULT_PREFIX,
+  oversizedJobResultFrame,
+} from "../apps/workerpals/src/common/job_result_transport";
 
 describe("server JobQueue diagnostics", () => {
   function enqueueClaimedJob(
@@ -1438,6 +1442,29 @@ describe("server JobQueue diagnostics", () => {
       expect(summary.qualifyingFailureCount).toBe(2);
       expect(summary.recentMatchingFailureCount).toBe(2);
       expect(summary.failureClass).toBe("worker_runtime_failure");
+    } finally {
+      queue.close();
+    }
+  });
+
+  test("repeated result transport overflow opens the runtime circuit", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      const result = JSON.parse(oversizedJobResultFrame().slice(JOB_RESULT_PREFIX.length));
+      for (const index of [1, 2]) {
+        failWorkerRuntimeJob(queue, `task-result-overflow-${index}`, {
+          failureClass: result.diagnostics.terminal.failureClass,
+          terminalStage: result.diagnostics.terminal.terminalStage,
+          detail: result.summary,
+          summary: result.summary,
+        });
+        expect(queue.workerRuntimeFailureCircuitSummary({ threshold: 2 }).blocked).toBe(
+          index === 2,
+        );
+      }
+      expect(queue.workerRuntimeFailureCircuitSummary({ threshold: 2 }).failureClass).toBe(
+        "structured_result_too_large",
+      );
     } finally {
       queue.close();
     }

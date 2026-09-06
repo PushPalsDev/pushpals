@@ -57,6 +57,39 @@ The reliability harness exercises both the never-headers and never-body cases.
 
 ## Outcome and evidence metrics
 
+### Result delivery and circuit recovery
+
+Worker completion control frames are retained separately from the ordinary log
+tail. Large validation output cannot remove the completion sentinel or evict a
+candidate's commit, trusted-validation handoff, or usage metadata. Output fields
+retain at most 32,768 characters of head/tail text each; frames have a separate 2,097,152-character
+limit and fail explicitly on overflow. The newest malformed frame never falls
+back to an earlier success. The runtime-boundary harness covers adversarial
+chunks, shutdown noise, Unicode, overflow, and immediate process exit.
+
+An open WorkerPal runtime circuit still requires a successful canary to close.
+After cooldown, an empty queue can admit one durable request to supply that
+canary; concurrent admissions and unconfirmed requests cannot multiply probes.
+Existing queued work takes precedence. Normal request leases and the atomic
+worker-canary claim retain ownership through planning, execution, and recovery.
+The HTTP harness exercises empty-queue recovery, concurrent admission, idempotent
+replay, successful probes, and repeated failures.
+
+RemoteBuddy checks `autonomyAdmission` on `/workers/autoscale` before repository
+ideation or scoring. Rejected handoffs record HTTP status and a bounded reason
+code in `autonomyEnqueueRejected`, objective `block_reason`, and tick status.
+Transport, malformed-response, and confirmation failures also back off; unknown
+admission codes do not bypass backoff. Backoff intervals are capped at 30 minutes, and
+target-specific suppression continues to allow other components.
+
+Trusted-host validation emits `trustedValidationProgress` at each start,
+completion, and retry boundary with job/completion/candidate identity and
+credential-redacted commands. An explicit timeout-only test-runner failure gets
+one retry, without discarding named-test evidence. Assertions and mixed failures
+do not qualify for that timeout retry; repeated failure still blocks publication.
+
+### Metrics
+
 The autonomy operations summary and System pane report:
 
 - attempt outcomes: `succeeded`, `quality_rejected`, `validation_blocked`, `environment_blocked`, `no_change`, and `infrastructure_failed`;

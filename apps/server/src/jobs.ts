@@ -667,6 +667,7 @@ const WORKER_RUNTIME_CIRCUIT_FAILURE_CLASSES = new Set([
   "missing_runtime_asset",
   "no_structured_result",
   "malformed_structured_result",
+  "structured_result_too_large",
 ]);
 
 function normalizeWorkerRuntimeFailureEvidence(value: unknown): string {

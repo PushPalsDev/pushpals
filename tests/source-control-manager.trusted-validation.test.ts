@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   buildWindowsProcessTreeTerminationArgv,
+  createTrustedValidationProgressLogger,
   hasFreshTrustedValidationInstall,
   normalizeTrustedValidationAffectedPaths,
   resolveTrustedValidationOutcome,
@@ -492,6 +493,253 @@ describe("SourceControlManager trusted validation", () => {
       failureClass: "test_failure",
       failedTests: ["runWebE2e lifecycle > reports a timeout while draining the process tree"],
     });
+  });
+
+  test("retries an explicit named Vitest timeout once without losing failed-test evidence", async () => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async () => {
+        calls += 1;
+        return calls === 1
+          ? {
+              ok: false,
+              output: [
+                "\u001b[41m FAIL \u001b[49m tests/notifications.vitest.ts > notifications > rejects invalid input",
+                "\u001b[31mError: Test timed out in 5000ms.\u001b[39m",
+                "If this is a long-running test, pass a timeout value as the last argument.",
+              ].join("\n"),
+              exitCode: 1,
+            }
+          : { ok: true, output: "passed", exitCode: 0 };
+      },
+    });
+
+    expect(calls).toBe(2);
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({
+      ok: false,
+      attempt: 1,
+      failureClass: "test_failure",
+      failedTests: ["notifications > rejects invalid input"],
+      targetPathHints: ["tests/notifications.vitest.ts"],
+      retryReason: "transient_infrastructure",
+    });
+    expect(results[1]).toMatchObject({ ok: true, attempt: 2 });
+    expect(resolveTrustedValidationOutcome(results).terminalFailure).toBeNull();
+  });
+
+  test("blocks publication after the second explicit runner timeout", async () => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate", "bun run later"]),
+      runner: async () => {
+        calls += 1;
+        return {
+          ok: false,
+          output:
+            "FAIL tests/notifications.vitest.ts > rejects invalid input\nError: Test timed out in 5000ms.",
+          exitCode: 1,
+        };
+      },
+    });
+
+    expect(calls).toBe(2);
+    expect(results).toHaveLength(2);
+    expect(resolveTrustedValidationOutcome(results).terminalFailure).toMatchObject({
+      ok: false,
+      attempt: 2,
+      failureClass: "test_failure",
+      command: "bun run validate",
+    });
+  });
+
+  test.each([
+    {
+      name: "a test name quoting a runner timeout",
+      output:
+        "FAIL tests/runner.vitest.ts > reports Error: Test timed out in 5000ms.\nAssertionError: expected status 1 to be 0",
+    },
+    {
+      name: "an assertion in a second failing test",
+      output:
+        "FAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.\nFAIL tests/runner.vitest.ts > rejects invalid input\nAssertionError: expected status 1 to be 0",
+    },
+    {
+      name: "an assertion before timeout cleanup in the same failed test",
+      output:
+        "FAIL tests/runner.vitest.ts > rejects invalid input\nAssertionError: expected status 1 to be 0\nError: Test timed out in 5000ms.",
+    },
+    {
+      name: "a second unexplained failed test",
+      output:
+        "FAIL tests/runner.vitest.ts > unexplained failure\ncustom assertion failed\nFAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.",
+    },
+    {
+      name: "another error before a runner timeout",
+      output:
+        "FAIL tests/runner.vitest.ts > rejects invalid input\nError: invalid response\nError: Test timed out in 5000ms.",
+    },
+    {
+      name: "an assertion diagnostic without an Error class",
+      output:
+        "FAIL tests/runner.vitest.ts > rejects invalid input\nassertion failed: response status is invalid\nError: Test timed out in 5000ms.",
+    },
+    {
+      name: "a mixed report with a failure from another runner",
+      output:
+        "FAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.\n(fail) another runner > custom failure",
+    },
+  ])("does not retry $name", async ({ output }) => {
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async () => {
+        calls += 1;
+        return { ok: false, output, exitCode: 1 };
+      },
+    });
+
+    expect(calls).toBe(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ attempt: 1, ok: false, failureClass: "test_failure" });
+  });
+
+  test("logs identified progress and retries before the validation batch finishes", async () => {
+    const lines: string[] = [];
+    const identity = {
+      jobId: "job-progress",
+      completionId: "completion-progress",
+      commitSha: "a".repeat(40),
+      candidateSha: "b".repeat(40),
+    };
+    let releaseRunner!: () => void;
+    const runnerGate = new Promise<void>((resolveGate) => {
+      releaseRunner = resolveGate;
+    });
+    let notifyLastCommandStarted!: () => void;
+    const lastCommandStarted = new Promise<void>((resolveStarted) => {
+      notifyLastCommandStarted = resolveStarted;
+    });
+    let calls = 0;
+    const validation = runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run first", "bun run second"]),
+      onProgress: createTrustedValidationProgressLogger(identity, (line) => lines.push(line)),
+      runner: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            ok: false,
+            output: "FAIL tests/runner.vitest.ts > slow test\nError: Test timed out in 5000ms.",
+            exitCode: 1,
+          };
+        }
+        if (calls === 3) {
+          notifyLastCommandStarted();
+          await runnerGate;
+        }
+        return { ok: true, output: "private command output", exitCode: 0 };
+      },
+    });
+
+    try {
+      await lastCommandStarted;
+      const events = lines.map((line) => JSON.parse(line.split("trustedValidationProgress=")[1]));
+      expect(events.map(({ boundary, attempt }) => [boundary, attempt])).toEqual([
+        ["start", 1],
+        ["complete", 1],
+        ["retry", 2],
+        ["start", 2],
+        ["complete", 2],
+        ["start", 1],
+      ]);
+      for (const event of events) {
+        expect(event).toMatchObject({
+          ...identity,
+          event: "trusted_validation_progress",
+          observedAt: expect.any(String),
+          phase: "validation",
+        });
+      }
+      expect(events.at(-1)).toMatchObject({ command: "bun run second", boundary: "start" });
+      expect(lines.join("\n")).not.toContain("private command output");
+    } finally {
+      releaseRunner();
+      await validation;
+    }
+    expect(lines).toHaveLength(7);
+  });
+
+  test("decides timeout retries before report truncation can hide a mixed assertion", async () => {
+    const output = [
+      "FAIL tests/runner.vitest.ts > slow test",
+      "Error: Test timed out in 5000ms.",
+      ...Array.from({ length: 200 }, () => `failure context ${"x".repeat(100)}`),
+      "AssertionError: a deterministic failure must not be retried",
+      ...Array.from({ length: 200 }, () => `other diagnostic ${"x".repeat(100)}`),
+    ].join("\n");
+    let calls = 0;
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify(["bun run validate"]),
+      runner: async () => {
+        calls += 1;
+        return { ok: false, output, exitCode: 1 };
+      },
+    });
+
+    expect(calls).toBe(1);
+    expect(results[0].output).toContain("Test timed out in 5000ms.");
+    expect(results[0].output).not.toContain("AssertionError");
+    expect(results[0]).toMatchObject({ ok: false, attempt: 1, failureClass: "test_failure" });
+  });
+
+  test("redacts credentials from progress logs without changing the executed command", async () => {
+    const lines: string[] = [];
+    const fakeToken = `ghp_${"synthetic".repeat(4)}`;
+    const fakeKey = `sk-${"synthetic".repeat(4)}`;
+    const command = `node scripts/check.js --token ${fakeToken} --password "synthetic password with spaces" --api-key=generic-synthetic-key --data ${fakeKey} --url https://synthetic-user:synthetic-password@example.test/check`;
+    let executed: string[] = [];
+    const results = await runTrustedValidationCommands({
+      repoPath: "C:/repo",
+      commandsJson: JSON.stringify([command]),
+      onProgress: createTrustedValidationProgressLogger(
+        {
+          jobId: "job-redacted",
+          completionId: "completion-redacted",
+          commitSha: "a".repeat(40),
+          candidateSha: "b".repeat(40),
+        },
+        (line) => lines.push(line),
+      ),
+      runner: async (argv) => {
+        executed = argv;
+        return { ok: true, output: "passed", exitCode: 0 };
+      },
+    });
+
+    expect(results[0].ok).toBe(true);
+    expect(executed).toContain(fakeToken);
+    expect(executed).toContain("synthetic password with spaces");
+    expect(executed).toContain("--api-key=generic-synthetic-key");
+    expect(lines).toHaveLength(2);
+    const logged = lines.join("\n");
+    expect(logged).toContain("node scripts/check.js");
+    for (const secret of [
+      fakeToken,
+      fakeKey,
+      "synthetic password",
+      "generic-synthetic-key",
+      "synthetic-user",
+      "synthetic-password",
+    ]) {
+      expect(logged).not.toContain(secret);
+    }
+    expect(logged).toContain("[redacted]");
   });
 
   test("reuses a successful trusted install until dependency inputs change", async () => {

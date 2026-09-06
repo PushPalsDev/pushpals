@@ -7,6 +7,67 @@ import { JobQueue } from "../apps/server/src/jobs";
 import { RequestQueue } from "../apps/server/src/requests";
 
 describe("server RequestQueue", () => {
+  test("runtime probe backlog includes provisional dispatches but not expired or deferred planners", () => {
+    const queue = new RequestQueue(":memory:");
+    try {
+      const provisional = queue.enqueue({
+        sessionId: "probe",
+        prompt: "Recover runtime with one candidate",
+        idempotencyKey: "probe-idempotent",
+        metadata: {
+          origin: "autonomy",
+          autonomy: {
+            objectiveId: "probe-objective",
+            runId: "probe-run",
+            snapshotId: "probe-snapshot",
+            patternKey: "probe-pattern",
+            componentArea: "apps/server",
+            targetPaths: ["apps/server/src/requests.ts"],
+            writeGlobs: ["apps/server/src/*.ts"],
+          },
+        },
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationTtlMs: 30_000,
+      });
+      expect(provisional.ok).toBe(true);
+      expect(queue.countWorkerRuntimeProbeRequests()).toBe(1);
+      expect(queue.countWorkerRuntimeProbeRequests({ activeOnly: true })).toBe(0);
+      expect(
+        queue.countWorkerRuntimeProbeRequests({ excludeIdempotencyKey: "probe-idempotent" }),
+      ).toBe(0);
+      expect(queue.countWorkerRuntimeProbeRequests({ nowMs: Date.now() + 60_000 })).toBe(0);
+      queue.confirmDispatch(provisional.requestId!, provisional.dispatchConfirmationToken!);
+      const claim = queue.claim("probe-planner");
+      expect(claim.ok).toBe(true);
+      expect(queue.countWorkerRuntimeProbeRequests({ activeOnly: true })).toBe(1);
+      expect(
+        queue.countWorkerRuntimeProbeRequests({
+          activeOnly: true,
+          excludeRequestId: provisional.requestId,
+        }),
+      ).toBe(0);
+      expect(
+        queue.countWorkerRuntimeProbeRequests({
+          activeOnly: true,
+          nowMs: Date.now() + 60 * 60_000,
+        }),
+      ).toBe(0);
+      queue.deferClaim(
+        provisional.requestId!,
+        "probe-planner",
+        claim.request!.claimToken!,
+        30_000,
+        {
+          reason: "worker_runtime_circuit_open",
+        },
+      );
+      expect(queue.countWorkerRuntimeProbeRequests()).toBe(1);
+      expect(queue.countWorkerRuntimeProbeRequests({ activeOnly: true })).toBe(0);
+    } finally {
+      queue.close();
+    }
+  });
+
   test("requires prompt for enqueue", () => {
     const queue = new RequestQueue(":memory:");
     const result = queue.enqueue({

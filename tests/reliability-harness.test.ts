@@ -34,6 +34,7 @@ describe("reliability harness release coverage", () => {
 
     expect(files).toContain("tests/workerpals.generic-python-executor.test.ts");
     expect(files).toContain("tests/workerpals.packaged-generic-python-executor.test.ts");
+    expect(files).toContain("tests/workerpals.job-result-transport.test.ts");
   });
 
   test("gates control-plane authority and child-process secret isolation", () => {

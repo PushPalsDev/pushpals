@@ -82,6 +82,7 @@ import {
   type AuthoritativePublicationReprobe,
 } from "./publication_recovery";
 import {
+  createTrustedValidationProgressLogger,
   normalizeTrustedValidationAffectedPaths,
   resolveTrustedValidationOutcome,
   runProcessWithTreeTimeout,
@@ -1581,6 +1582,12 @@ async function tick(): Promise<void> {
           console.log(
             `[${ts()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`,
           );
+          const logValidationProgress = createTrustedValidationProgressLogger({
+            jobId: completion.jobId,
+            completionId: completion.id,
+            commitSha: completion.commitSha,
+            candidateSha: trustedValidationCandidateSha,
+          });
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
             commandsJson: completion.trustedValidationCommandsJson,
@@ -1592,8 +1599,10 @@ async function tick(): Promise<void> {
                     affectedPaths: trustedValidationAffectedPaths,
                   }
                 : undefined,
-            onProgress: (event) =>
-              healthTracker.progress(trustedValidationHealthPhase(event), completion.id),
+            onProgress: (event) => {
+              healthTracker.progress(trustedValidationHealthPhase(event), completion.id);
+              logValidationProgress(event);
+            },
           });
           const validationOutcome = resolveTrustedValidationOutcome(trustedValidationResults);
           const terminalResults = new Set(validationOutcome.terminalResults);

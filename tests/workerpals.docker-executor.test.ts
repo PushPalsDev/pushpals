@@ -2183,7 +2183,13 @@ describe("workerpals docker executor internals", () => {
   });
 
   test("keeps merge-conflict image preparation explicit and never rebuilds inside execute", async () => {
-    const executor = createExecutor() as unknown as {
+    const repo = mkdtempSync(join(tmpdir(), "pushpals-image-preparation-contract-"));
+    const executor = new DockerExecutor({
+      repo,
+      workerId: "workerpal-test",
+      imageName: "unused-image-preparation-contract",
+      timeoutMs: 60_000,
+    }) as unknown as {
       execute: (job: {
         id: string;
         taskId: string;
@@ -2208,6 +2214,9 @@ describe("workerpals docker executor internals", () => {
       rebuildImageForMergeConflictJob: () => Promise<void>;
       resolveWorktreeBaseRefForJob: () => Promise<string>;
       createWorktree: (worktreePath: string) => Promise<void>;
+      runGitBaseRefCommand: (
+        args: string[],
+      ) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
       logExecutionConfig: () => void;
       runInWarmContainer: (
         worktreePath: string,
@@ -2221,59 +2230,76 @@ describe("workerpals docker executor internals", () => {
       scheduleIdleShutdown: () => void;
     };
 
-    let rebuildCalls = 0;
-    executor.rebuildImageForMergeConflictJob = async () => {
-      rebuildCalls += 1;
-    };
-    executor.resolveWorktreeBaseRefForJob = async () => "HEAD";
-    executor.createWorktree = async (worktreePath) => {
-      mkdirSync(worktreePath, { recursive: true });
-    };
-    executor.logExecutionConfig = () => {};
-    executor.runInWarmContainer = async (_worktreePath, job) =>
-      job.id === mergeConflictJob.id
-        ? { ok: false, summary: "incomplete merge-conflict review lease" }
-        : {
-            ok: true,
-            summary: "ok",
-            commit: { branch: "agent/workerpal-test/job-regular", sha: "a".repeat(40) },
-          };
-    executor.removeWorktree = async (worktreePath) => {
-      rmSync(worktreePath, { recursive: true, force: true });
-    };
-    executor.scheduleIdleShutdown = () => {};
+    try {
+      let rebuildCalls = 0;
+      let baselineCalls = 0;
+      const executedJobs: string[] = [];
+      executor.rebuildImageForMergeConflictJob = async () => {
+        rebuildCalls += 1;
+      };
+      executor.resolveWorktreeBaseRefForJob = async () => "HEAD";
+      executor.createWorktree = async (worktreePath) => {
+        expect(worktreePath.startsWith(join(repo, ".worktrees"))).toBe(true);
+        // This contract exercises image preparation, not Git. Do not create a
+        // fake worktree that lets baseline/checkpoint commands climb into a repo.
+      };
+      executor.runGitBaseRefCommand = async (args) => {
+        baselineCalls += 1;
+        expect(args[0]).toBe("-C");
+        expect(args[1]?.startsWith(join(repo, ".worktrees"))).toBe(true);
+        expect(args.slice(2)).toEqual(["rev-parse", "HEAD"]);
+        return { ok: true, stdout: "b".repeat(40), stderr: "" };
+      };
+      executor.logExecutionConfig = () => {};
+      executor.runInWarmContainer = async (_worktreePath, job) => {
+        executedJobs.push(job.id);
+        return job.id === mergeConflictJob.id
+          ? { ok: false, summary: "incomplete merge-conflict review lease" }
+          : {
+              ok: true,
+              summary: "ok",
+              commit: { branch: "agent/workerpal-test/job-regular", sha: "a".repeat(40) },
+            };
+      };
+      executor.removeWorktree = async () => {};
+      executor.scheduleIdleShutdown = () => {};
 
-    const mergeConflictJob = {
-      id: "job-merge",
-      taskId: "task-merge",
-      kind: "task.execute",
-      params: {
-        reviewAgent: {
-          resolutionType: "merge_conflict",
+      const mergeConflictJob = {
+        id: "job-merge",
+        taskId: "task-merge",
+        kind: "task.execute",
+        params: {
+          reviewAgent: {
+            resolutionType: "merge_conflict",
+          },
         },
-      },
-      sessionId: "dev",
-    };
-    expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(true);
-    await executor.prepareMergeConflictJobEnvironment(mergeConflictJob);
-    expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(false);
-    expect(rebuildCalls).toBe(1);
+        sessionId: "dev",
+      };
+      expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(true);
+      await executor.prepareMergeConflictJobEnvironment(mergeConflictJob);
+      expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(false);
+      expect(rebuildCalls).toBe(1);
 
-    const regularResult = await executor.execute({
-      id: "job-regular",
-      taskId: "task-regular",
-      kind: "task.execute",
-      params: {},
-      sessionId: "dev",
-    });
-    expect(regularResult.ok).toBe(true);
-    expect(rebuildCalls).toBe(1);
+      const regularResult = await executor.execute({
+        id: "job-regular",
+        taskId: "task-regular",
+        kind: "task.execute",
+        params: {},
+        sessionId: "dev",
+      });
+      expect(regularResult.ok).toBe(true);
+      expect(rebuildCalls).toBe(1);
 
-    const mergeConflictExecuteResult = await executor.execute(mergeConflictJob);
-    // The intentionally incomplete review lease cannot pass the new host-side
-    // PR preparation boundary, but execute must not trigger an image rebuild.
-    expect(mergeConflictExecuteResult.ok).toBe(false);
-    expect(rebuildCalls).toBe(1);
-    expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(true);
+      const mergeConflictExecuteResult = await executor.execute(mergeConflictJob);
+      // A failed review clears its preparation flag but must not rebuild inside
+      // execution. Git preparation and candidate durability have separate tests.
+      expect(mergeConflictExecuteResult.ok).toBe(false);
+      expect(rebuildCalls).toBe(1);
+      expect(executor.shouldPrepareMergeConflictJobBeforeExecution(mergeConflictJob)).toBe(true);
+      expect(baselineCalls).toBe(2);
+      expect(executedJobs).toEqual(["job-regular", "job-merge"]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

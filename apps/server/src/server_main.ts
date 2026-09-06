@@ -1176,15 +1176,52 @@ export function createRequestHandler() {
         resolveWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit, {
           maxRetryAfterMs: AUTONOMY_WORKER_RUNTIME_MAX_DEFER_MS,
         });
-      const makeAutonomyWorkerRuntimeCircuitResponse = (): Response | null => {
+      const autonomyWorkerRuntimeAdmission = (
+        runtimeCircuit: ReturnType<typeof autonomyWorkerRuntimeCircuitSummary>,
+        options: { requestClaimId?: string; idempotencyKey?: string } = {},
+      ) => {
+        if (!runtimeCircuit.blocked) return { allowed: true };
+        const retryAtMs = Date.parse(runtimeCircuit.retryAt ?? "");
+        const probeDue =
+          runtimeCircuit.phase === "open" &&
+          (!Number.isFinite(retryAtMs) || retryAtMs <= Date.now());
+        // The circuit stays open until a real worker canary succeeds. After its
+        // cooldown, let one durable candidate reach that claim fence, including
+        // when all earlier jobs have already failed and the queue is empty.
+        // Admission and enqueue/claim below deliberately have no await between
+        // them: the durable queue row is the permit for subsequent HTTP calls.
+        const queuedWork =
+          probeDue &&
+          (jobQueue.countByKindAndStatus("task.execute", "pending") > 0 ||
+            jobQueue.countByKindAndStatus("task.execute", "claimed") > 0 ||
+            requestQueue.countWorkerRuntimeProbeRequests({
+              activeOnly: Boolean(options.requestClaimId),
+              excludeRequestId: options.requestClaimId,
+              excludeIdempotencyKey: options.idempotencyKey,
+            }) > 0);
+        if (probeDue && !queuedWork) return { allowed: true };
+        return {
+          allowed: false,
+          code: "autonomy_worker_runtime_circuit_open",
+          retryAfterMs: probeDue
+            ? WORKER_RUNTIME_CIRCUIT_RECHECK_MS
+            : autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+        };
+      };
+      const makeAutonomyWorkerRuntimeCircuitResponse = (
+        body?: Record<string, unknown>,
+      ): Response | null => {
         const runtimeCircuit = autonomyWorkerRuntimeCircuitSummary();
-        if (!runtimeCircuit.blocked) return null;
+        const admission = autonomyWorkerRuntimeAdmission(runtimeCircuit, {
+          idempotencyKey: compactText(body?.idempotencyKey ?? body?.idempotency_key, 256),
+        });
+        if (admission.allowed) return null;
         return makeJson(
           {
             ok: false,
             code: "autonomy_worker_runtime_circuit_open",
             message: autonomyWorkerRuntimeCircuitMessage(runtimeCircuit),
-            retryAfterMs: autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),
+            retryAfterMs: admission.retryAfterMs,
             ...runtimeCircuit,
           },
           429,
@@ -2666,6 +2703,7 @@ export function createRequestHandler() {
         const publication = completionQueue.publicationBacklogSummary();
         return makeJson({
           ok: true,
+          autonomyAdmission: autonomyWorkerRuntimeAdmission(autonomyWorkerRuntimeCircuitSummary()),
           workers: {
             total: workers.length,
             online: onlineWorkers.length,
@@ -3875,7 +3913,7 @@ export function createRequestHandler() {
           const autonomyDetails = recoveryAuthority.details;
           const reservationResponse = makeAutonomyReservationResponse(body);
           if (reservationResponse) return reservationResponse;
-          const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse();
+          const runtimeCircuitResponse = makeAutonomyWorkerRuntimeCircuitResponse(body);
           if (runtimeCircuitResponse) return runtimeCircuitResponse;
           if (!recoveryAuthority.authorized) {
             const recoveryBackpressureResponse = makeAutonomyRecoveryBackpressureResponse();
@@ -4015,7 +4053,10 @@ export function createRequestHandler() {
             const runtimeCircuit =
               cachedRuntimeCircuit ??
               (cachedRuntimeCircuit = autonomyWorkerRuntimeCircuitSummary());
-            if (runtimeCircuit.blocked) {
+            const runtimeAdmission = autonomyWorkerRuntimeAdmission(runtimeCircuit, {
+              requestClaimId: result.request.id,
+            });
+            if (!runtimeAdmission.allowed) {
               const retryAfterMs = Math.min(
                 WORKER_RUNTIME_CIRCUIT_RECHECK_MS,
                 autonomyWorkerRuntimeCircuitRetryAfterMs(runtimeCircuit),

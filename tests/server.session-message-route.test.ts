@@ -935,6 +935,231 @@ describe("server session message route", () => {
     expect(await handoff.json()).toMatchObject({ ok: true, jobId: expect.any(String) });
   }, 15_000);
 
+  for (const outcome of ["complete", "fail"] as const) {
+    test(`recovers an empty runtime-circuit queue through one durable probe (${outcome})`, async () => {
+      const root = makeTempDir();
+      const port = await getFreePort();
+      writeServerConfig(root, port);
+      const server = spawnServer(root, port);
+      await waitForHealth(server, port);
+      await seedWorkerRuntimeCircuit(port, `empty-${outcome}`);
+
+      const admission = async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/workers/autoscale`);
+        expect(response.status).toBe(200);
+        return (
+          (await response.json()) as {
+            autonomyAdmission: { allowed: boolean; code?: string; retryAfterMs?: number };
+          }
+        ).autonomyAdmission;
+      };
+      expect(await admission()).toMatchObject({
+        allowed: false,
+        code: "autonomy_worker_runtime_circuit_open",
+      });
+      const makeDue = () => {
+        const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+        try {
+          const dueAt = new Date(Date.now() - 1_000).toISOString();
+          db.prepare(`UPDATE worker_runtime_circuits SET retryAt = ?, updatedAt = ?`).run(
+            dueAt,
+            dueAt,
+          );
+        } finally {
+          db.close();
+        }
+      };
+      makeDue();
+      expect(await admission()).toMatchObject({ allowed: true });
+
+      const candidates = Array.from({ length: 8 }, (_, index) => ({
+        sessionId: "empty-runtime-circuit",
+        prompt: `Run runtime recovery candidate ${index}`,
+        priority: "background",
+        forceWorker: true,
+        forceLane: "worker",
+        metadata: autonomyRequestMetadata(`empty-${outcome}-${index}`),
+        idempotencyKey: `empty-probe-${outcome}-${index}`,
+        dispatchConfirmationRequired: true,
+        dispatchConfirmationTtlMs: 30_000,
+      }));
+      const admissions = await Promise.all(
+        candidates.map(async (body) => {
+          const response = await postServerJson(port, "/requests/enqueue", body);
+          return { status: response.status, body, result: await response.json() };
+        }),
+      );
+      expect(admissions.filter((entry) => entry.status === 201)).toHaveLength(1);
+      expect(admissions.filter((entry) => entry.status === 429)).toHaveLength(7);
+      const accepted = admissions.find((entry) => entry.status === 201)!;
+      const requestId = String(accepted.result.requestId);
+      expect(await admission()).toMatchObject({ allowed: false });
+
+      // A lost enqueue response is recoverable without reserving another slot.
+      const replay = await postServerJson(port, "/requests/enqueue", accepted.body);
+      expect(replay.status).toBe(201);
+      expect(await replay.json()).toMatchObject({ requestId, deduplicated: true });
+      const confirmed = await postServerJson(port, `/requests/${requestId}/dispatch/confirm`, {
+        dispatchConfirmationToken: accepted.result.dispatchConfirmationToken,
+      });
+      expect(confirmed.status).toBe(200);
+      const planning = await postServerJson(port, "/requests/claim", {
+        agentId: "empty-probe-planner",
+        leaseMs: 60_000,
+      });
+      expect(planning.status).toBe(200);
+      const planningPayload = await planning.json();
+      expect(planningPayload).toMatchObject({ request: { id: requestId } });
+
+      const competingJob = await postServerJson(port, "/jobs/enqueue", {
+        taskId: "competing-probe",
+        sessionId: "empty-runtime-circuit",
+        kind: "task.execute",
+        idempotencyKey: accepted.body.idempotencyKey,
+        params: { origin: "autonomy" },
+      });
+      expect(competingJob.status).toBe(429);
+      const handoff = await postServerJson(port, "/jobs/enqueue", {
+        taskId: `empty-probe-${outcome}`,
+        sessionId: "empty-runtime-circuit",
+        kind: "task.execute",
+        params: { origin: "autonomy", requestId },
+        requestAgentId: "empty-probe-planner",
+        requestClaimToken: planningPayload.request.claimToken,
+      });
+      expect(handoff.status).toBe(201);
+      const jobId = String((await handoff.json()).jobId);
+      const claim = await postServerJson(port, "/jobs/claim", { workerId: "empty-probe-worker" });
+      expect(claim.status).toBe(200);
+      const claimed = await claim.json();
+      expect(claimed).toMatchObject({ runtimeCanary: true, job: { id: jobId } });
+      expect(await admission()).toMatchObject({ allowed: false });
+
+      const queuedUserJob = await postServerJson(port, "/jobs/enqueue", {
+        taskId: `waiting-for-probe-${outcome}`,
+        sessionId: "empty-runtime-circuit",
+        kind: "task.execute",
+        params: { origin: "user" },
+      });
+      expect(queuedUserJob.status).toBe(201);
+      const competingClaim = await postServerJson(port, "/jobs/claim", {
+        workerId: "competing-worker",
+      });
+      expect(competingClaim.status).toBe(200);
+      expect(await competingClaim.json()).toMatchObject({ job: null });
+
+      const terminal = await postServerJson(port, `/jobs/${jobId}/${outcome}`, {
+        workerId: claimed.job.workerId,
+        claimGeneration: claimed.job.claimGeneration,
+        summary: "Runtime probe finished",
+        message: "WorkerPal job execution failed",
+        detail:
+          "ReferenceError: Cannot access 'timedOut' before initialization.\n" +
+          "    at <anonymous> (/workspace/apps/workerpals/src/common/generic_python_executor.ts:412:13)",
+        diagnostics: {
+          terminal: {
+            failureClass: outcome === "complete" ? "success" : "worker_runtime_failure",
+            terminalStage: outcome === "complete" ? "completed" : "executor",
+            executorBackend: "openai_codex",
+          },
+        },
+      });
+      expect(terminal.status).toBe(200);
+      expect(await admission()).toMatchObject({ allowed: outcome === "complete" });
+      if (outcome === "fail") {
+        makeDue();
+        // The next probe must drain the already-admitted job, not plan a new one.
+        expect(await admission()).toMatchObject({ allowed: false });
+      }
+    }, 20_000);
+  }
+
+  test("drains one existing deferred planner after cooldown and recovers its lease across restart", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    let server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    for (let index = 0; index < 2; index += 1) {
+      const queued = await postServerJson(port, "/requests/enqueue", {
+        sessionId: "existing-runtime-probes",
+        prompt: `Existing candidate ${index}`,
+        priority: "background",
+        metadata: autonomyRequestMetadata(`existing-probe-${index}`),
+      });
+      expect(queued.status).toBe(201);
+    }
+    await seedWorkerRuntimeCircuit(port, "existing-probe");
+    const deferred = await postServerJson(port, "/requests/claim", { agentId: "deferred-planner" });
+    expect(deferred.status).toBe(404);
+    const deferredRequests = await fetch(`http://127.0.0.1:${port}/requests?limit=10`);
+    expect(await deferredRequests.json()).toMatchObject({ counts: { claimed: 2, failed: 0 } });
+    const expire = () => {
+      const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+      try {
+        const dueAt = new Date(Date.now() - 1_000).toISOString();
+        db.prepare(`UPDATE worker_runtime_circuits SET retryAt = ?, updatedAt = ?`).run(
+          dueAt,
+          dueAt,
+        );
+        db.prepare(`UPDATE requests SET leaseExpiresAt = ? WHERE status = 'claimed'`).run(dueAt);
+      } finally {
+        db.close();
+      }
+    };
+    expire();
+    const claims = await Promise.all(
+      ["first-planner", "second-planner"].map(async (agentId) => {
+        const response = await postServerJson(port, "/requests/claim", {
+          agentId,
+          leaseMs: 60_000,
+        });
+        return await response.json();
+      }),
+    );
+    expect(claims.filter((claim) => claim.request?.id)).toHaveLength(1);
+    const firstClaim = claims.find((claim) => claim.request?.id)!.request;
+    const telemetry = await fetch(`http://127.0.0.1:${port}/workers/autoscale`);
+    expect(await telemetry.json()).toMatchObject({ autonomyAdmission: { allowed: false } });
+
+    // No in-memory permit can wedge admission if the admitted planner dies.
+    server.proc.kill();
+    await server.proc.exited;
+    await Promise.allSettled([server.stdout, server.stderr]);
+    expire();
+    server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const recovered = await postServerJson(port, "/requests/claim", {
+      agentId: "recovered-planner",
+    });
+    expect(recovered.status).toBe(200);
+    const recoveredClaim = (await recovered.json()).request;
+    expect(recoveredClaim.id).toBe(firstClaim.id);
+    expect(recoveredClaim.claimToken).not.toBe(firstClaim.claimToken);
+    const staleHandoff = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "stale-runtime-probe-planner",
+      sessionId: "existing-runtime-probes",
+      kind: "task.execute",
+      params: { origin: "autonomy", requestId: firstClaim.id },
+      requestAgentId: firstClaim.agentId,
+      requestClaimToken: firstClaim.claimToken,
+    });
+    expect(staleHandoff.status).toBe(409);
+    const handoff = await postServerJson(port, "/jobs/enqueue", {
+      taskId: "recovered-runtime-probe-planner",
+      sessionId: "existing-runtime-probes",
+      kind: "task.execute",
+      params: { origin: "autonomy", requestId: recoveredClaim.id },
+      requestAgentId: recoveredClaim.agentId,
+      requestClaimToken: recoveredClaim.claimToken,
+    });
+    expect(handoff.status).toBe(201);
+    const claim = await postServerJson(port, "/jobs/claim", {
+      workerId: "recovered-runtime-probe",
+    });
+    expect(await claim.json()).toMatchObject({ runtimeCanary: true });
+  }, 20_000);
+
   test("defers every queued task.execute nonterminal while the worker-runtime circuit is open", async () => {
     const root = makeTempDir();
     const port = await getFreePort();

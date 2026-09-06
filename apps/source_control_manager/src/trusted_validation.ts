@@ -15,6 +15,7 @@ import {
   type BoundedSubprocess,
 } from "../../../packages/shared/src/bounded_process.js";
 import { copyEnvWithoutScmRepairAuthoritySecret } from "../../../packages/shared/src/scm_repair_authority.js";
+import { redactToolText } from "../../../packages/shared/src/tooling.js";
 
 export type TrustedValidationCommandResult = TrustedValidationExecutionResult;
 
@@ -99,6 +100,57 @@ function emitTrustedValidationProgress(
 
 export function trustedValidationHealthPhase(event: TrustedValidationProgressEvent): string {
   return `trusted_validation_${event.phase}_${event.boundary}_attempt_${event.attempt}`;
+}
+
+function redactTrustedValidationProgressCommand(command: string): string {
+  const argv = tokenizeTrustedValidationCommand(command);
+  if (!argv) return "[unparseable validation command]";
+  const sensitiveOption =
+    /^--?(?:(?:api|auth|access|refresh)[-_]?(?:key|token)|token|secret|password|authorization)$/i;
+  let redactNext = false;
+  return argv
+    .map((argument) => {
+      if (redactNext) {
+        redactNext = false;
+        return "[redacted]";
+      }
+      const equals = argument.indexOf("=");
+      const option = equals < 0 ? argument : argument.slice(0, equals);
+      if (sensitiveOption.test(option)) {
+        if (equals >= 0) return `${option}=[redacted]`;
+        redactNext = true;
+        return option;
+      }
+      const redacted = redactToolText(argument).replace(
+        /(https?:\/\/)[^@\s/]+@/gi,
+        "$1[redacted]@",
+      );
+      return /\s/.test(redacted) ? JSON.stringify(redacted) : redacted;
+    })
+    .join(" ");
+}
+
+export function createTrustedValidationProgressLogger(
+  identity: {
+    jobId: string;
+    completionId: string;
+    commitSha: string;
+    candidateSha: string | null;
+  },
+  log: (line: string) => void = console.log,
+): TrustedValidationProgressCallback {
+  return (progress) => {
+    const observedAt = new Date().toISOString();
+    log(
+      `[${observedAt}] trustedValidationProgress=${JSON.stringify({
+        event: "trusted_validation_progress",
+        observedAt,
+        ...identity,
+        ...progress,
+        command: redactTrustedValidationProgressCommand(progress.command),
+      })}`,
+    );
+  };
 }
 
 /**
@@ -656,7 +708,9 @@ export async function runTrustedValidationCommands(options: {
 
   for (const { command, argv } of commandsWithArgv) {
     const resolvedArgv = resolveTrustedValidationArgv(argv, options.bunExecutable);
-    const execute = async (attempt: number): Promise<TrustedValidationCommandResult> => {
+    const execute = async (
+      attempt: number,
+    ): Promise<{ result: TrustedValidationCommandResult; retryable: boolean }> => {
       emitTrustedValidationProgress(options.onProgress, {
         boundary: "start",
         phase: "validation",
@@ -693,14 +747,17 @@ export async function runTrustedValidationCommands(options: {
         durationMs: validationResult.durationMs,
         cached: Boolean(validationResult.cached),
       });
-      return validationResult;
+      return {
+        result: validationResult,
+        // Classify before report truncation: an omitted assertion must not
+        // make a mixed failure look like a timeout-only batch.
+        retryable:
+          !validationResult.ok &&
+          isTransientTrustedValidationFailure({ ...validationResult, output: result.output }),
+      };
     };
-    let validationResult = await execute(1);
-    if (
-      !validationResult.ok &&
-      options.retryTransientFailures !== false &&
-      isTransientTrustedValidationFailure(validationResult)
-    ) {
+    let { result: validationResult, retryable } = await execute(1);
+    if (!validationResult.ok && options.retryTransientFailures !== false && retryable) {
       results.push({
         ...validationResult,
         retryReason: "transient_infrastructure",
@@ -713,7 +770,7 @@ export async function runTrustedValidationCommands(options: {
         retryReason: "transient_infrastructure",
       });
       validationResult = {
-        ...(await execute(2)),
+        ...(await execute(2)).result,
         retryReason: "transient_infrastructure",
       };
     }
@@ -727,7 +784,32 @@ export function isTransientTrustedValidationFailure(
   result: Pick<TrustedValidationCommandResult, "failureClass" | "output" | "exitCode">,
 ): boolean {
   if (result.failureClass === "timeout" || result.exitCode === 124) return true;
+  if (isExplicitTestRunnerTimeoutFailure(result.output)) return true;
   return /\b(?:connection (?:reset|closed|refused)|econnreset|etimedout|temporary failure|temporarily unavailable|docker daemon is not responding|the docker daemon|tls handshake timeout|network is unreachable|could not resolve host|resource busy)\b/i.test(
     String(result.output ?? ""),
+  );
+}
+
+function isExplicitTestRunnerTimeoutFailure(output: string): boolean {
+  // Keep named-test evidence classified as test_failure, but permit the same
+  // bounded retry as a process timeout when the runner reports only timed-out
+  // tests. A test name containing "timeout" or an assertion followed by slow
+  // teardown is not infrastructure evidence.
+  const plain = String(output ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  const timeoutDiagnostic = /^\s*Error:\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$/m;
+  if (!timeoutDiagnostic.test(plain)) return false;
+  const failedSections = plain.split(/^\s*FAIL\s+.+$/m).slice(1);
+  if (
+    failedSections.length === 0 ||
+    !failedSections.every((section) => timeoutDiagnostic.test(section))
+  ) {
+    return false;
+  }
+  // A mixed runner report is outside this narrow recovery case, even if its
+  // other failures do not use familiar assertion diagnostics.
+  if (/^\s*(?:\(fail\)|--- FAIL:|FAILED|FAIL:|[\u2715\u2717\u25cf])\s/m.test(plain)) return false;
+  // Do not rerun a mixed batch with a genuine assertion or another error.
+  return !/^\s*(?:Assertion(?:Error|\s+failed)\b|(?:Type|Reference|Range|Syntax|URI|Eval|Aggregate)Error\b|(?:error:\s*)?expect\(|(?:Expected|Received):|Error:(?!\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$))/im.test(
+    plain,
   );
 }

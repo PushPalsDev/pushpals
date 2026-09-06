@@ -1989,6 +1989,36 @@ export class RequestQueue {
     return count;
   }
 
+  /** Durable work already available to probe an open WorkerPal runtime circuit. */
+  countWorkerRuntimeProbeRequests(
+    options: {
+      activeOnly?: boolean;
+      excludeRequestId?: string;
+      excludeIdempotencyKey?: string;
+      nowMs?: number;
+    } = {},
+  ): number {
+    const now = new Date(options.nowMs ?? Date.now()).toISOString();
+    const rows = this.all<{ metadataJson: string | null }>(
+      `SELECT metadataJson FROM requests
+       WHERE status IN ('pending', 'claimed')
+         AND id <> ?
+         AND (? = '' OR COALESCE(idempotencyKey, '') <> ?)
+         AND (dispatchConfirmationToken IS NULL OR dispatchConfirmedAt IS NOT NULL
+              OR dispatchConfirmationExpiresAt > ?)
+         AND (? = 0 OR (status = 'claimed' AND deferReason IS NULL AND leaseExpiresAt > ?))`,
+      options.excludeRequestId ?? "",
+      options.excludeIdempotencyKey ?? "",
+      options.excludeIdempotencyKey ?? "",
+      now,
+      options.activeOnly ? 1 : 0,
+      now,
+    );
+    // Unconfirmed dispatches count too: admitting another objective during the
+    // confirmation round trip would otherwise create an unbounded probe queue.
+    return rows.filter((row) => isAutonomyMetadata(parseMetadataJson(row.metadataJson))).length;
+  }
+
   nextPendingSnapshot(
     limit = 10,
   ): Array<{ id: string; priority: QueuePriority; position: number; etaMs: number }> {
