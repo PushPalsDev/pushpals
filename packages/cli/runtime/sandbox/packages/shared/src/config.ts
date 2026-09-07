@@ -31,7 +31,7 @@ const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
 const DEFAULT_REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS = 420;
 const DEFAULT_REMOTEBUDDY_MEMORY_RETENTION_DAYS = 30;
-const DEFAULT_OPENAI_CODEX_MODEL = "gpt-5.6-sol";
+export const DEFAULT_OPENAI_CODEX_MODEL = "gpt-6-astra";
 const DEFAULT_OPENAI_CODEX_REASONING_EFFORT = "xhigh";
 const REDACTED_LOG_VALUE = "[REDACTED]";
 const SENSITIVE_CONFIG_KEY_PATTERN =
@@ -265,6 +265,7 @@ export interface PushPalsConfig {
       passThreshold: number;
       maxPrCommentsBeforeGiveUp: number;
       mergeMethod: "squash" | "merge" | "rebase";
+      model?: string;
       codexBin: string;
       codexAuthMode: string;
       codexHomeDir: string;
@@ -1470,6 +1471,11 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
     asString(scmReviewAgentNode.codex_bin, "bun x --yes @openai/codex"),
     "bun x --yes @openai/codex",
   );
+  const scmReviewAgentModel = firstNonEmpty(
+    process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL,
+    asString(scmReviewAgentNode.model, ""),
+    DEFAULT_OPENAI_CODEX_MODEL,
+  );
   const scmReviewAgentCodexAuthMode = firstNonEmpty(
     process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_AUTH_MODE,
     asString(scmReviewAgentNode.codex_auth_mode, "chatgpt"),
@@ -2219,6 +2225,7 @@ export function loadPushPalsConfig(options: LoadOptions = {}): PushPalsConfig {
         passThreshold: scmReviewAgentPassThreshold,
         maxPrCommentsBeforeGiveUp: scmReviewAgentMaxPrCommentsBeforeGiveUp,
         mergeMethod: scmReviewAgentMergeMethod,
+        model: scmReviewAgentModel,
         codexBin: scmReviewAgentCodexBin,
         codexAuthMode: scmReviewAgentCodexAuthMode,
         codexHomeDir: scmReviewAgentCodexHomeDir,

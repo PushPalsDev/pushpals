@@ -25,6 +25,8 @@ from executor_base import (
     runtime_config,
 )
 from openai_codex_executor import (
+    DEFAULT_CODEX_MODEL,
+    LEGACY_CODEX_MODEL_FALLBACK,
     OpenAICodexRuntimeConfig,
     _augment_supplemental_guidance,
     _build_wrapper_bootstrap_context,
@@ -61,6 +63,7 @@ from openai_codex_executor import (
     _resolve_no_edit_watchdog_seconds,
     _resolve_rollout_watchdog_seconds,
     _resolve_startup_stall_watchdog_seconds,
+    _safe_model_for_codex,
     _unwrap_shell_wrapper_command,
     _usage_from_trace_or_estimate,
 )
@@ -312,7 +315,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             finally:
                 _restore_repo_local_codex_files(masked)
 
-    def test_reasoning_effort_defaults_to_extra_high_for_default_gpt_5_6_sol(self) -> None:
+    def test_reasoning_effort_defaults_to_extra_high_for_default_gpt_6_astra(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
             SettingsResolver(env={}, config_loader=lambda: {}),
         )
@@ -471,7 +474,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         )
         self.assertEqual(_resolve_reasoning_effort(cfg, model="gpt-5.4"), "high")
 
-    def test_reasoning_effort_preserves_extra_high_for_default_gpt_5_6_sol(self) -> None:
+    def test_reasoning_effort_preserves_extra_high_for_default_gpt_6_astra(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
             SettingsResolver(
                 env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "extra high"},
@@ -479,6 +482,18 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             ),
         )
         self.assertEqual(_resolve_reasoning_effort(cfg), "xhigh")
+
+    def test_reasoning_effort_preserves_explicit_levels_on_astra_and_sol_fallback(self) -> None:
+        for model in ("gpt-6-astra", "gpt-5.6-sol"):
+            for effort in ("low", "medium", "high", "xhigh"):
+                with self.subTest(model=model, effort=effort):
+                    cfg = OpenAICodexRuntimeConfig.from_sources(
+                        SettingsResolver(
+                            env={"WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": effort},
+                            config_loader=lambda: {},
+                        ),
+                    )
+                    self.assertEqual(_resolve_reasoning_effort(cfg, model=model), effort)
 
     def test_reasoning_effort_preserves_extra_high_for_future_models(self) -> None:
         cfg = OpenAICodexRuntimeConfig.from_sources(
@@ -496,13 +511,13 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             "- Route-entry/shell task rule: inspect the hinted route wrapper, then patch the owner.\n"
         )
 
-        self.assertEqual(_resolve_task_reasoning_effort("xhigh", prompt, "gpt-5.6-sol"), "high")
-        self.assertEqual(_resolve_task_reasoning_effort("high", prompt, "gpt-5.6-sol"), "high")
+        self.assertEqual(_resolve_task_reasoning_effort("xhigh", prompt, "gpt-6-astra"), "high")
+        self.assertEqual(_resolve_task_reasoning_effort("high", prompt, "gpt-6-astra"), "high")
         self.assertEqual(
             _resolve_task_reasoning_effort(
                 "xhigh",
                 "Merge-conflict rebase task with risk=low wording in reviewer text.",
-                "gpt-5.6-sol",
+                "gpt-6-astra",
             ),
             "xhigh",
         )
@@ -1511,7 +1526,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "        break",
                         "",
                         "prompt = sys.stdin.read()",
-                        "if 'Codex startup-stall recovery' in prompt and model == 'gpt-5.5':",
+                        "if 'Codex startup-stall recovery' in prompt and model == 'gpt-5.6-sol':",
                         "    Path('src').mkdir(exist_ok=True)",
                         "    Path('src/startup-stall-recovered.txt').write_text('patched after restart\\n', encoding='utf-8')",
                         "    if last_message_path:",
@@ -1670,7 +1685,7 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                         "prompt = sys.stdin.read()",
                         "has_no_edit_recovery = 'No-edit watchdog recovery' in prompt",
                         "has_startup_recovery = 'Codex startup-stall recovery' in prompt",
-                        "if has_no_edit_recovery and has_startup_recovery and model != 'gpt-5.5':",
+                        "if has_no_edit_recovery and has_startup_recovery and model != 'gpt-5.6-sol':",
                         "    Path('src').mkdir(exist_ok=True)",
                         "    Path('src/no-edit-startup-stall-recovered.txt').write_text('patched after same-model restart\\n', encoding='utf-8')",
                         "    if last_message_path:",
@@ -4118,7 +4133,13 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
         self.assertIn("strict wrapper recovery", str(result.get("stdout") or "").lower())
         self.assertIn("backend-supplied direct command bootstrap", str(result.get("stdout") or ""))
 
-    def test_run_codex_task_recovers_when_default_model_requires_newer_codex(self) -> None:
+    def _run_model_selection_stub(
+        self,
+        responses: dict,
+        *,
+        configured_model: str = "",
+        **task_options,
+    ) -> tuple:
         with tempfile.TemporaryDirectory(prefix="pushpals-codex-model-compat-") as temp_dir:
             repo = Path(temp_dir) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
@@ -4148,33 +4169,36 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
             )
 
             stub_path = Path(temp_dir) / "fake_codex_model_compat.py"
+            calls_path = Path(temp_dir) / "calls.jsonl"
             stub_path.write_text(
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "import json",
                         "import sys",
                         "",
                         "argv = sys.argv[1:]",
                         "model = ''",
+                        "effort = ''",
                         "last_message_path = None",
                         "for index, arg in enumerate(argv):",
                         "    if arg == '-m' and index + 1 < len(argv):",
                         "        model = argv[index + 1]",
                         "    if arg == '--output-last-message' and index + 1 < len(argv):",
                         "        last_message_path = argv[index + 1]",
+                        "    if arg == '-c' and index + 1 < len(argv):",
+                        "        effort = argv[index + 1]",
                         "",
-                        "if model == 'gpt-5.6-sol':",
-                        "    print(\"ERROR: {'detail': \\\"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\\\"}\", file=sys.stderr)",
-                        "    sys.exit(1)",
-                        "",
-                        "if model == 'gpt-5.5':",
-                        "    if last_message_path:",
-                        "        Path(last_message_path).write_text('Recovered on legacy model fallback.', encoding='utf-8')",
-                        "    print('item.completed | Used legacy model fallback.', flush=True)",
-                        "    sys.exit(0)",
-                        "",
-                        "print(f'unexpected model {model}', file=sys.stderr)",
-                        "sys.exit(2)",
+                        f"with Path({str(calls_path)!r}).open('a', encoding='utf-8') as calls:",
+                        "    calls.write(json.dumps({'model': model, 'effort': effort}) + '\\n')",
+                        f"responses = {responses!r}",
+                        "exit_code, message = responses.get(model, (2, f'unexpected model {model}'))",
+                        "if exit_code:",
+                        "    print(message, file=sys.stderr)",
+                        "elif last_message_path:",
+                        "    Path(last_message_path).write_text(message, encoding='utf-8')",
+                        "print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 11, 'output_tokens': 7}}), flush=True)",
+                        "sys.exit(exit_code)",
                     ]
                 ),
                 encoding="utf-8",
@@ -4186,19 +4210,115 @@ class OpenAICodexRuntimeConfigTests(unittest.TestCase):
                 "OPENAI_API_KEY": "pushpals-model-compat-test-key",
                 "WORKERPALS_OPENAI_CODEX_TIMEOUT_S": "10",
                 "WORKERPALS_OPENAI_CODEX_PROGRESS_LOG_INTERVAL_S": "1",
+                "WORKERPALS_OPENAI_CODEX_REASONING_EFFORT": "xhigh",
             }
-            with mock.patch.dict(os.environ, env_overrides, clear=False):
+            usage_attempts = []
+            with mock.patch.dict(os.environ, env_overrides, clear=False), mock.patch(
+                "openai_codex_executor.resolve_llm_config",
+                return_value=(configured_model, "", ""),
+            ) as resolve_model:
                 result = _run_codex_task(
                     str(repo),
                     "Use the configured Codex model.",
                     [],
+                    usage_attempts=usage_attempts,
+                    **task_options,
                 )
+                self.assertTrue(resolve_model.call_args_list)
+                for call in resolve_model.call_args_list:
+                    self.assertEqual(call.args[0], "gpt-6-astra")
+            calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+        return result, calls, usage_attempts
+
+    def test_default_model_and_provider_prefix_preserve_user_choices(self) -> None:
+        self.assertEqual(DEFAULT_CODEX_MODEL, "gpt-6-astra")
+        self.assertEqual(LEGACY_CODEX_MODEL_FALLBACK, "gpt-5.6-sol")
+        self.assertEqual(_safe_model_for_codex("", ""), "gpt-6-astra")
+        self.assertEqual(_safe_model_for_codex("openai/gpt-6-astra", ""), "gpt-6-astra")
+        self.assertEqual(_safe_model_for_codex("gpt-5.5-mini", ""), "gpt-5.5-mini")
+        self.assertEqual(_safe_model_for_codex("openai/gpt-5.6-sol", ""), "gpt-5.6-sol")
+
+    def test_run_codex_task_uses_astra_xhigh_without_compatibility_retry(self) -> None:
+        result, calls, usage_attempts = self._run_model_selection_stub(
+            {"gpt-6-astra": (0, "Inspected with the default model.")}
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(calls, [{"model": "gpt-6-astra", "effort": 'model_reasoning_effort="xhigh"'}])
+        self.assertEqual([attempt["modelId"] for attempt in usage_attempts], ["gpt-6-astra"])
+        self.assertEqual(result["usage"]["totalTokens"], 18)
+        self.assertNotIn("rejected default model", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_recovers_when_default_model_requires_newer_codex(self) -> None:
+        result, calls, usage_attempts = self._run_model_selection_stub(
+            {
+                "gpt-6-astra": (1, "The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."),
+                "gpt-5.6-sol": (0, "Recovered on legacy model fallback."),
+            }
+        )
 
         self.assertTrue(result.get("ok"), result)
         stdout = str(result.get("stdout") or "")
-        self.assertIn("rejected default model gpt-5.6-sol", stdout.lower())
-        self.assertIn("gpt-5.5", stdout)
+        self.assertIn("rejected default model gpt-6-astra", stdout.lower())
+        self.assertIn("gpt-5.6-sol", stdout)
         self.assertIn("Recovered on legacy model fallback.", stdout)
+        self.assertEqual([call["model"] for call in calls], ["gpt-6-astra", "gpt-5.6-sol"])
+        self.assertTrue(all(call["effort"] == 'model_reasoning_effort="xhigh"' for call in calls))
+        self.assertEqual([attempt["modelId"] for attempt in usage_attempts], ["gpt-6-astra", "gpt-5.6-sol"])
+        self.assertEqual([attempt["attempt"] for attempt in usage_attempts], [1, 2])
+        self.assertEqual(result["usage"]["modelId"], "gpt-5.6-sol")
+        self.assertEqual(result["usage"]["totalTokens"], 36)
+
+    def test_run_codex_task_does_not_retry_a_rejected_compatibility_fallback(self) -> None:
+        result, calls, usage_attempts = self._run_model_selection_stub(
+            {
+                "gpt-6-astra": (1, "The 'gpt-6-astra' model requires a newer version of Codex."),
+                "gpt-5.6-sol": (1, "The 'gpt-5.6-sol' model requires a newer version of Codex."),
+            }
+        )
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual(result["exitCode"], 1)
+        self.assertEqual([call["model"] for call in calls], ["gpt-6-astra", "gpt-5.6-sol"])
+        self.assertEqual(len(usage_attempts), 2)
+        self.assertIn("gpt-5.6-sol", result["stderr"])
+        self.assertNotIn("recovered by retrying", str(result.get("stdout") or ""))
+
+    def test_run_codex_task_does_not_fallback_on_auth_rate_limit_or_generic_errors(self) -> None:
+        for failure in (
+            "401 Unauthorized: API key is invalid",
+            "429 Too many requests: rate limit exceeded",
+            "500 Internal Server Error",
+            "Authentication failed. Please upgrade to the latest app or CLI and try again.",
+            "Your extension requires a newer version of Codex.",
+        ):
+            with self.subTest(failure=failure):
+                result, calls, usage_attempts = self._run_model_selection_stub(
+                    {"gpt-6-astra": (1, failure)}
+                )
+                self.assertFalse(result.get("ok"), result)
+                self.assertEqual([call["model"] for call in calls], ["gpt-6-astra"])
+                self.assertEqual(len(usage_attempts), 1)
+                self.assertIn(failure, result["stderr"])
+
+    def test_run_codex_task_preserves_explicit_nondefault_models_on_rejection(self) -> None:
+        for configured_model in ("gpt-5.6-sol", "openai/gpt-5.5-mini"):
+            model = configured_model.removeprefix("openai/")
+            with self.subTest(model=configured_model):
+                result, calls, usage_attempts = self._run_model_selection_stub(
+                    {model: (1, f"The '{model}' model requires a newer version of Codex.")},
+                    configured_model=configured_model,
+                )
+                self.assertFalse(result.get("ok"), result)
+                self.assertEqual([call["model"] for call in calls], [model])
+                self.assertEqual(len(usage_attempts), 1)
+
+    def test_run_codex_task_honors_model_compatibility_retry_limit(self) -> None:
+        result, calls, usage_attempts = self._run_model_selection_stub(
+            {"gpt-6-astra": (1, "The 'gpt-6-astra' model requires a newer version of Codex.")},
+            model_compatibility_recovery_attempt=1,
+        )
+        self.assertFalse(result.get("ok"), result)
+        self.assertEqual([call["model"] for call in calls], ["gpt-6-astra"])
+        self.assertEqual(len(usage_attempts), 1)
 
     def test_usage_falls_back_to_estimate_when_trace_has_no_usage(self) -> None:
         usage = _usage_from_trace_or_estimate({}, "abc" * 30, "done", model="gpt-5.4")

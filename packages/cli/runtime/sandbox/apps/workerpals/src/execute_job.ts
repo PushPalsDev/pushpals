@@ -11058,7 +11058,7 @@ async function runCodexCriticReview(
   }
   const timeoutBehavior = resolveQualityCriticTimeoutBehavior(runtimeConfig);
   const usageAttempts: JobUsageAttempt[] = [];
-  const criticModel = resolveQualityCriticModel(runtimeConfig);
+  const criticModel = resolveQualityCriticModel(runtimeConfig, runtimeConfig.workerpals.llm.model);
   const reviewContext = resolveWorkerCriticReviewContext(repo, params, runtimeConfig);
   const criticChangedPaths = publishableChangedPaths(quality.changedPaths);
 

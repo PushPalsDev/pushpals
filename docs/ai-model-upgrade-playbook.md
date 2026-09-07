@@ -1,7 +1,7 @@
 # AI Model Upgrade Playbook
 
 Use this when upgrading PushPals to a newer AI model, for example moving Codex from
-`gpt-5.5` to `gpt-5.6-sol` while retaining the default `xhigh` reasoning effort.
+`gpt-5.6-sol` to `gpt-6-astra` while retaining the default `xhigh` reasoning effort.
 
 The main lesson from the `gpt-5.4` -> `gpt-5.5` upgrade: changing source defaults is
 not enough. PushPals has source defaults, packaged runtime copies, WorkerPal sandbox
@@ -23,27 +23,38 @@ change, not a string replacement.
 
 ```powershell
 codex --version
-codex exec --model gpt-5.6-sol --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
+codex exec --model gpt-6-astra --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
 ```
 
 2. Check the launcher form used by PushPals.
 
 ```powershell
-bun x --yes @openai/codex@0.146.0 --version
+bun x --yes @openai/codex@0.153.2 --version
+bun x --yes @openai/codex@0.153.2 exec --model gpt-6-astra --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
 ```
 
 3. Search all active defaults and packaged copies.
 
 ```powershell
-rg -n "gpt-5\.4|gpt-5\.5|gpt-5\.6-sol|reasoning_effort|reasoningEffort|DEFAULT.*CODEX|model_reasoning_effort" configs packages apps tests scripts --glob "!**/node_modules/**" --glob "!packages/cli/monitor-ui/**"
+rg -n "gpt-5\.4|gpt-5\.5|gpt-5\.6-sol|gpt-6-astra|reasoning_effort|reasoningEffort|DEFAULT.*CODEX|model_reasoning_effort" configs packages apps tests scripts --glob "!**/node_modules/**" --glob "!packages/cli/monitor-ui/**"
 ```
 
-WorkerPals pins `bun x --yes @openai/codex@0.146.0` because earlier native
-Windows Codex sandboxes could create files in a Git worktree while denying
-overwrites of files that existed before sandbox startup. If a newer explicit
-pin is being evaluated, preserve it during the test. PushPals services launch
-Codex through the configured `codex_bin`, not necessarily the global `codex`
-executable.
+WorkerPals pins `bun x --yes @openai/codex@0.153.2`. The previous generated pin,
+`0.146.0`, rejects `gpt-6-astra` with a newer-CLI requirement; changing only the
+model would therefore use the compatibility fallback instead of Astra. Earlier
+native Windows Codex sandboxes could create files in a Git worktree while denying
+overwrites of files that existed before sandbox startup, so verify both operations
+in an isolated disposable worktree when advancing the pin. Preserve custom pins.
+PushPals services launch Codex through the configured `codex_bin`, not necessarily
+the global `codex` executable.
+
+The [Astra model documentation](https://developers.openai.com/api/docs/models/gpt-6-astra)
+confirms the exact ID and `xhigh` support. Keep the existing lower-effort task and
+critic overrides; this migration does not enable `max`, change job deadlines, or
+change other providers. Review the [Astra migration guidance](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra)
+before changing direct API clients: Astra tool calling requires Responses, and
+`none`/`minimal` reasoning and sampling parameters are unsupported. The Codex
+backend delegates that API contract to the verified Codex CLI.
 
 On Windows, also test the service launcher path rather than only PowerShell command
 resolution. PowerShell may resolve `codex` through a `.ps1` or `.cmd` shim, while a
@@ -68,9 +79,20 @@ Update these first:
   - reasoning normalization and fallback behavior
 - `apps/workerpals/src/execute_job.ts`
   - Codex reasoning effort normalization for WorkerPal task execution and critic
+  - Default Codex critic model must inherit `workerpals.llm.model`; preserve an
+    explicit `quality_critic_model` override and its existing low reasoning effort.
+- `apps/source_control_manager/src/review_agent.ts`
+  - Pass the resolved `source_control_manager.review_agent.model` to Codex; do not
+    silently inherit an unrelated Codex default. Preserve explicit model/profile
+    selections in custom launchers and the reviewer's existing low effort.
 
-Keep fallback behavior explicit. For the 5.6 Sol upgrade, older Codex CLIs can reject
-`gpt-5.6-sol`, so the Codex backends keep a one-time fallback to `gpt-5.5`.
+Keep fallback behavior explicit. Older Codex CLIs can reject `gpt-6-astra`, so the
+Codex backends keep a one-time compatibility fallback to the previous default,
+`gpt-5.6-sol`. Authentication, rate-limit, network, permission, and ordinary model
+errors must not qualify as a newer-CLI compatibility failure. Record the actual
+model used in usage telemetry; a fallback response is not an Astra smoke pass.
+WorkerPal's separate, already bounded startup-stall recovery also uses the previous
+default without increasing its existing recovery count or deadline.
 
 ## Config Templates And Packaged Runtime Copies
 
@@ -110,14 +132,14 @@ C:\Users\<user>\.pushpals\runtime\configs\local.toml
 ```
 
 or the equivalent configured runtime root. This file can override new release
-defaults. During the 5.6 Sol upgrade, a stale `local.toml` can still pin:
+defaults. During the Astra upgrade, a stale `local.toml` can still pin:
 
 ```toml
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 reasoning_effort = "xhigh"
 ```
 
-even though source defaults are already `gpt-5.6-sol` and `xhigh`.
+even though source defaults are already `gpt-6-astra` and `xhigh`.
 
 For model upgrades, add or update a migration in `scripts/pushpals-cli.ts` near
 `migrateEmbeddedRuntimeLocalToml`.
@@ -125,6 +147,9 @@ For model upgrades, add or update a migration in `scripts/pushpals-cli.ts` near
 Migration rules:
 
 - Migrate exact generated legacy defaults only.
+- Recognize `gpt-5.4`, `gpt-5.5`, and `gpt-5.6-sol` as legacy generated model
+  defaults. Migrate the exact old generated WorkerPal launcher pin `0.146.0`
+  alongside the model; leave other explicit version pins and custom launchers alone.
 - Preserve custom overrides such as `gpt-5.5-mini`, `medium`, custom backends, or
   non-Codex sections.
 - Apply to `localbuddy.llm`, `remotebuddy.llm`, and `workerpals.llm` only when
@@ -169,10 +194,16 @@ bun run test:cli:integration
 bun run test:cli:e2e
 ```
 
+The full CLI E2E suite requires a Docker CLI and daemon reachable from the test
+process, including when the test runner itself is containerized. If that boundary
+is unavailable, report the blocked Docker-dependent cases separately from the
+installed-package startup and session-stream checks; do not count the full suite
+as passing or replace real Docker with a stub to make it pass.
+
 Run the live Codex smoke with the exact model and reasoning config:
 
 ```powershell
-codex exec --model gpt-5.6-sol --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
+bun x --yes @openai/codex@0.153.2 exec --model gpt-6-astra --sandbox read-only --ephemeral -c 'model_reasoning_effort="xhigh"' -C . "Reply exactly: PUSHPALS_CODEX_MODEL_OK"
 ```
 
 When diagnosing a real user runtime, inspect the bootstrap log:
@@ -237,15 +268,40 @@ npm view @pushpalsdev/cli@X.Y.Z version
 - E2E passes on source but installed-package smoke fails because the packaged payload
   differs from the repo root.
 
-## Quick Example: Codex 5.5 To 5.6 Sol
+## Quick Example: Codex 5.6 Sol To GPT-6 Astra
 
 Minimum expected final state:
 
-- All OpenAI Codex service defaults resolve `model = "gpt-5.6-sol"`.
+- All OpenAI Codex service defaults resolve `model = "gpt-6-astra"`.
 - All OpenAI Codex service defaults resolve `reasoning_effort = "xhigh"`.
-- Codex backends can fall back to `gpt-5.5` only when an old Codex CLI rejects
-  the default model.
+- Codex backends can use a one-time compatibility fallback to `gpt-5.6-sol` only
+  when an old Codex CLI explicitly requires a newer version for the default model.
 - Existing generated `runtime/configs/local.toml` files migrate exact legacy model
-  defaults (`gpt-5.4` or `gpt-5.5`) to `gpt-5.6-sol` and exact `high` effort to `xhigh`.
+  defaults (`gpt-5.4`, `gpt-5.5`, or `gpt-5.6-sol`) to `gpt-6-astra` and exact
+  legacy `high` effort to `xhigh`.
+- The generated WorkerPal launcher uses `@openai/codex@0.153.2`; exact old
+  generated `0.146.0` pins migrate too.
 - Custom user overrides are not overwritten.
 - `bun run test:cli:e2e` and the release installed-package smokes pass.
+
+## Astra live compatibility evidence (2026-09-07)
+
+- `@openai/codex@0.146.0` rejected Astra with the explicit newer-CLI error.
+- The exact Bun launcher at `0.153.2` returned `PUSHPALS_CODEX_MODEL_OK` using
+  `gpt-6-astra`, `xhigh`, read-only sandboxing, and an ephemeral session.
+- The same pinned launcher overwrote an existing tracked file under
+  `workspace-write` in a disposable Windows Git worktree. File content and
+  `git status --porcelain` were checked independently of the model's response.
+- The actual RepositoryAgent client resolved the unpinned service launcher to
+  `0.153.4`, completed an isolated-evidence request, and reported `gpt-6-astra` in
+  its result and usage telemetry. This was not a fallback response.
+- SCM's actual review argument builder completed a live read-only smoke using
+  `gpt-6-astra` and its retained `low` reasoning effort on Codex `0.153.2`.
+- The pinned `0.153.2` launcher also returned `PUSHPALS_LINUX_ASTRA_OK` with
+  Astra/`xhigh` in an isolated Linux container using read-only authentication
+  projection and no target-repository mount.
+
+These checks used PushPals' existing Windows root-CA projection for the Bun
+launcher. They do not require changing global npm settings or disabling TLS
+verification. Repeat the checks when evaluating another pin or account; model
+access is not granted by changing a local configuration value.

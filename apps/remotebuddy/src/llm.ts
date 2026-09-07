@@ -113,8 +113,8 @@ const DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 const DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "local-model";
-const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
-const LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.5";
+const DEFAULT_CODEX_MODEL = "gpt-6-astra";
+const LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.6-sol";
 const DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 const DEFAULT_CODEX_TIMEOUT_MS = 120_000;
 const DEFAULT_LLM_HTTP_TIMEOUT_MS = 120_000;
@@ -374,11 +374,7 @@ function chooseCodexCommandProbe(
 }
 
 function requiresNewerCodexForModel(stdout: string, stderr: string): boolean {
-  const combined = `${stdout}\n${stderr}`.toLowerCase();
-  return (
-    combined.includes("requires a newer version of codex") ||
-    (combined.includes("requires newer") && combined.includes("codex"))
-  );
+  return /\bmodel\s+requires\s+a\s+newer\s+version\s+of\s+codex\b/i.test(`${stdout}\n${stderr}`);
 }
 
 function isDefaultCodexModel(model: string): boolean {
@@ -2359,6 +2355,7 @@ export async function preflightServiceLlm(opts: LLMClientOptions = {}): Promise<
 
 export const __TEST_ONLY__ = {
   bunCodexCommandFromEnv,
+  codexReasoningEffort,
   chooseCodexCommandProbe,
   compareCodexVersions,
   parseCodexCliVersion,

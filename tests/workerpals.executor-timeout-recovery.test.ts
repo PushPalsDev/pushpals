@@ -235,7 +235,13 @@ describe("retained executor timeout candidates fail closed", () => {
 });
 
 async function runRecoveryFixture(
-  options: { score?: number; mustFix?: string[]; failAfterRevision?: boolean } = {},
+  options: {
+    score?: number;
+    mustFix?: string[];
+    failAfterRevision?: boolean;
+    workerModel?: string;
+    criticModel?: string;
+  } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "pushpals-timeout-recovery-"));
   const repo = join(root, "repo");
@@ -271,7 +277,7 @@ async function runRecoveryFixture(
       [
         'if (process.argv.includes("--version")) { console.log("fixture codex 1"); process.exit(0); }',
         "await Bun.stdin.text();",
-        `await Bun.write(${JSON.stringify(marker)}, "called");`,
+        `await Bun.write(${JSON.stringify(marker)}, JSON.stringify(Bun.argv.slice(2)));`,
         'const output = process.argv[process.argv.indexOf("--output-last-message") + 1];',
         `await Bun.write(output, ${JSON.stringify(JSON.stringify({ score: options.score ?? 9, must_fix: options.mustFix ?? [], findings: [], revision_guidance: "Improve the candidate implementation." }))});`,
       ].join("\n"),
@@ -302,8 +308,11 @@ async function runRecoveryFixture(
         qualityPublishGateEnabled: true,
         qualityCriticMinScore: 8,
         qualityCriticTimeoutMs: 5_000,
+        qualityCriticModel: options.criticModel ?? "",
         llm: {
           ...config.workerpals.llm,
+          model: options.workerModel ?? "gpt-6-astra",
+          reasoningEffort: "xhigh",
           codexBin: `"${process.execPath.replace(/\\/g, "/")}" "${criticScript.replace(/\\/g, "/")}"`,
         },
       },
@@ -350,11 +359,17 @@ async function runRecoveryFixture(
         },
       },
     );
-    let criticCalled = false;
+    let criticArgs: string[] = [];
     try {
-      criticCalled = readFileSync(marker, "utf8") === "called";
+      criticArgs = JSON.parse(readFileSync(marker, "utf8"));
     } catch {}
-    return { result, logs, criticCalled, attempts };
+    return {
+      result,
+      logs,
+      criticCalled: criticArgs.includes("--output-last-message"),
+      criticArgs,
+      attempts,
+    };
   } finally {
     if (previous) registerBackendTaskExecutor("openai_codex", previous);
     else unregisterBackendTaskExecutor("openai_codex");
@@ -378,7 +393,33 @@ describe("executeJob timeout recovery with real Git, tests, and critic subproces
     expect(observed.result.diagnostics?.metadata?.executorTimeoutRecovery).toMatchObject({
       status: "validated",
     });
+    expect(observed.criticArgs[observed.criticArgs.indexOf("-m") + 1]).toBe("gpt-6-astra");
+    expect(observed.criticArgs).toContain('model_reasoning_effort="low"');
+    expect(observed.result.usageAttempts).toContainEqual(
+      expect.objectContaining({ stage: "critic", modelId: "gpt-6-astra" }),
+    );
   }, 20_000);
+  test.each([
+    { workerModel: "custom-worker-model", expectedModel: "custom-worker-model" },
+    {
+      workerModel: "gpt-6-astra",
+      criticModel: "custom-critic-model",
+      expectedModel: "custom-critic-model",
+    },
+  ])(
+    "routes the critic through the assigned model while preserving its low effort: %j",
+    async ({ expectedModel, ...options }) => {
+      const observed = await runRecoveryFixture(options);
+      expect(observed.result.ok, JSON.stringify(observed.logs)).toBe(true);
+      expect(observed.criticCalled).toBe(true);
+      expect(observed.criticArgs[observed.criticArgs.indexOf("-m") + 1]).toBe(expectedModel);
+      expect(observed.criticArgs).toContain('model_reasoning_effort="low"');
+      expect(observed.result.usageAttempts).toContainEqual(
+        expect.objectContaining({ stage: "critic", modelId: expectedModel }),
+      );
+    },
+    20_000,
+  );
   test("keeps low-scoring and high-scoring must-fix candidates failed without more editing", async () => {
     for (const score of [7, 9]) {
       const observed = await runRecoveryFixture({

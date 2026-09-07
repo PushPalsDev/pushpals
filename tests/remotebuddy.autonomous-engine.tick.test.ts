@@ -221,7 +221,7 @@ function makeConfig(): any {
       llm: {
         backend: "openai_codex",
         endpoint: "http://127.0.0.1:1234",
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         sessionId: "remotebuddy-dev",
         apiKey: "",
         reasoningEffort: "xhigh",

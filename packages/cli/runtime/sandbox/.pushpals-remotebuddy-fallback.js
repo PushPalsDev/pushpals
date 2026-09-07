@@ -4040,7 +4040,7 @@ var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_ITEMS = 12;
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_RECALL_CHARS = 2400;
 var DEFAULT_REMOTEBUDDY_MEMORY_MAX_SUMMARY_CHARS = 420;
 var DEFAULT_REMOTEBUDDY_MEMORY_RETENTION_DAYS = 30;
-var DEFAULT_OPENAI_CODEX_MODEL = "gpt-5.6-sol";
+var DEFAULT_OPENAI_CODEX_MODEL = "gpt-6-astra";
 var DEFAULT_OPENAI_CODEX_REASONING_EFFORT = "xhigh";
 var REDACTED_LOG_VALUE = "[REDACTED]";
 var SENSITIVE_CONFIG_KEY_PATTERN = /(token|secret|password|api[_-]?key|private[_-]?key|access[_-]?key)/i;
@@ -4531,6 +4531,7 @@ function loadPushPalsConfig(options = {}) {
   const scmReviewAgentMergeMethodRaw = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MERGE_METHOD, asString(scmReviewAgentNode.merge_method, "squash"), "squash").toLowerCase();
   const scmReviewAgentMergeMethod = scmReviewAgentMergeMethodRaw === "merge" || scmReviewAgentMergeMethodRaw === "rebase" ? scmReviewAgentMergeMethodRaw : "squash";
   const scmReviewAgentCodexBin = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_BIN, asString(scmReviewAgentNode.codex_bin, "bun x --yes @openai/codex"), "bun x --yes @openai/codex");
+  const scmReviewAgentModel = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL, asString(scmReviewAgentNode.model, ""), DEFAULT_OPENAI_CODEX_MODEL);
   const scmReviewAgentCodexAuthMode = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_AUTH_MODE, asString(scmReviewAgentNode.codex_auth_mode, "chatgpt"), "chatgpt");
   const scmReviewAgentCodexHomeDir = firstNonEmpty(process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_HOME_DIR, asString(scmReviewAgentNode.codex_home_dir, ""));
   const scmReviewAgentCodexTimeoutMs = Math.max(30000, asInt(parseIntEnv("SOURCE_CONTROL_MANAGER_REVIEW_AGENT_CODEX_TIMEOUT_MS") ?? scmReviewAgentNode.codex_timeout_ms, 300000));
@@ -4777,6 +4778,7 @@ function loadPushPalsConfig(options = {}) {
         passThreshold: scmReviewAgentPassThreshold,
         maxPrCommentsBeforeGiveUp: scmReviewAgentMaxPrCommentsBeforeGiveUp,
         mergeMethod: scmReviewAgentMergeMethod,
+        model: scmReviewAgentModel,
         codexBin: scmReviewAgentCodexBin,
         codexAuthMode: scmReviewAgentCodexAuthMode,
         codexHomeDir: scmReviewAgentCodexHomeDir,
@@ -5242,8 +5244,8 @@ var DEFAULT_LMSTUDIO_ENDPOINT = "http://127.0.0.1:1234";
 var DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat";
 var DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 var DEFAULT_MODEL = "local-model";
-var DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
-var LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.5";
+var DEFAULT_CODEX_MODEL = "gpt-6-astra";
+var LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.6-sol";
 var DEFAULT_CODEX_REASONING_EFFORT = "xhigh";
 var DEFAULT_CODEX_TIMEOUT_MS = 120000;
 var DEFAULT_LLM_HTTP_TIMEOUT_MS = 120000;
@@ -5433,9 +5435,8 @@ function chooseCodexCommandProbe(probes, opts) {
   return probes.reduce((best, probe) => compareCodexVersions(probe.version, best.version) > 0 ? probe : best);
 }
 function requiresNewerCodexForModel(stdout, stderr) {
-  const combined = `${stdout}
-${stderr}`.toLowerCase();
-  return combined.includes("requires a newer version of codex") || combined.includes("requires newer") && combined.includes("codex");
+  return /\bmodel\s+requires\s+a\s+newer\s+version\s+of\s+codex\b/i.test(`${stdout}
+${stderr}`);
 }
 function isDefaultCodexModel(model) {
   return model.trim().toLowerCase() === DEFAULT_CODEX_MODEL.toLowerCase();

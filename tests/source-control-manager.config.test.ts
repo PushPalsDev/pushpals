@@ -89,4 +89,39 @@ describe("source_control_manager config", () => {
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });
+
+  test("review model resolves the shared default, TOML override, then environment override", () => {
+    const originalConfigDir = process.env.PUSHPALS_CONFIG_DIR_OVERRIDE;
+    const originalModel = process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL;
+    const root = mkdtempSync(join(tmpdir(), "pushpals-scm-model-config-"));
+    const configDir = join(root, "configs");
+    try {
+      mkdirSync(configDir, { recursive: true });
+      cpSync(
+        resolve(import.meta.dir, "..", "configs", "default.toml"),
+        join(configDir, "default.toml"),
+      );
+      writeFileSync(join(configDir, "local.example.toml"), "");
+      process.env.PUSHPALS_CONFIG_DIR_OVERRIDE = configDir;
+      delete process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL;
+      expect(loadConfig({ reload: true }).reviewAgent.model).toBe("gpt-6-astra");
+
+      writeFileSync(
+        join(configDir, "local.toml"),
+        '[source_control_manager.review_agent]\nmodel = "gpt-5.5-mini"\n',
+      );
+      expect(loadConfig({ reload: true }).reviewAgent.model).toBe("gpt-5.5-mini");
+
+      process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL = "custom-env-model";
+      expect(loadConfig({ reload: true }).reviewAgent.model).toBe("custom-env-model");
+      process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL = "  ";
+      expect(loadConfig({ reload: true }).reviewAgent.model).toBe("gpt-5.5-mini");
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.PUSHPALS_CONFIG_DIR_OVERRIDE;
+      else process.env.PUSHPALS_CONFIG_DIR_OVERRIDE = originalConfigDir;
+      if (originalModel === undefined) delete process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL;
+      else process.env.SOURCE_CONTROL_MANAGER_REVIEW_AGENT_MODEL = originalModel;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

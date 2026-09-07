@@ -44,8 +44,8 @@ from executor_base import (
 )
 
 LOG_PREFIX = "[OpenAICodexExecutor]"
-DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
-LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.5"
+DEFAULT_CODEX_MODEL = "gpt-6-astra"
+LEGACY_CODEX_MODEL_FALLBACK = "gpt-5.6-sol"
 _ACTIVE_CHILD: Optional[subprocess.Popen[str]] = None
 _INTERRUPTED_SIGNAL: Optional[int] = None
 log = Logger(LOG_PREFIX)
@@ -78,8 +78,10 @@ _CODEX_WORKAROUND_NEGATION_HINTS = (
     "codex cli is required infrastructure",
 )
 _REJECTED_EXEC_COMMAND_PATTERN = re.compile(r"exec_command failed for `([^`]+)`", re.IGNORECASE)
+# Upgrade advice alone can accompany authentication or infrastructure failures;
+# only an explicit model-compatibility rejection permits changing the model.
 _MODEL_REQUIRES_NEWER_CODEX_PATTERN = re.compile(
-    r"model requires a newer version of codex|requires a newer version of codex|upgrade to the latest app or cli",
+    r"\bmodel\s+requires\s+a\s+newer\s+version\s+of\s+codex\b",
     re.IGNORECASE,
 )
 _DISALLOWED_SHELL_WRAPPER_PREFIXES = (

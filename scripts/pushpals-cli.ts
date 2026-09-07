@@ -1908,26 +1908,29 @@ function migrateEmbeddedRuntimeTomlSection(
   });
 }
 
+function embeddedSectionUsesOpenAICodex(sectionBody: string): boolean {
+  return /^\s*backend\s*=\s*"openai_codex"\s*$/m.test(sectionBody);
+}
+
 function migrateLegacyOpenAICodexDefaults(sectionBody: string, opts: { includeModel: boolean }) {
-  const backendIsOpenAICodex = /^\s*backend\s*=\s*"openai_codex"\s*$/m.test(sectionBody);
-  if (!backendIsOpenAICodex && opts.includeModel) return sectionBody;
+  if (!embeddedSectionUsesOpenAICodex(sectionBody) && opts.includeModel) return sectionBody;
 
   let updated = sectionBody;
   if (opts.includeModel) {
-    updated = updated.replace(/^(\s*model\s*=\s*)"gpt-5\.(?:4|5)"\s*$/m, '$1"gpt-5.6-sol"');
+    updated = updated.replace(/^(\s*model\s*=\s*)"gpt-5\.(?:4|5|6-sol)"\s*$/m, '$1"gpt-6-astra"');
   }
   updated = updated.replace(/^(\s*reasoning_effort\s*=\s*)"high"\s*$/m, '$1"xhigh"');
   return updated;
 }
 
-const PINNED_WORKER_CODEX_COMMAND = "bun x --yes @openai/codex@0.146.0";
+const PINNED_WORKER_CODEX_COMMAND = "bun x --yes @openai/codex@0.153.2";
 
 function migrateLegacyWorkerCodexCommandDefault(
   sectionBody: string,
   key: "codex_bin" | "bin",
 ): string {
   const pattern = new RegExp(
-    `^(\\s*${key}\\s*=\\s*)"(?:codex|(?:bun\\s+x|bunx)\\s+--yes\\s+@openai/codex)"\\s*$`,
+    `^(\\s*${key}\\s*=\\s*)"(?:codex|(?:bun\\s+x|bunx)\\s+--yes\\s+@openai/codex(?:@0\\.146\\.0)?)"\\s*$`,
     "m",
   );
   return sectionBody.replace(pattern, `$1"${PINNED_WORKER_CODEX_COMMAND}"`);
@@ -1959,12 +1962,13 @@ function migrateEmbeddedRuntimeLocalToml(localTomlPath: string): void {
       migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: true }),
     );
   }
-  migrated = migrateEmbeddedRuntimeTomlSection(migrated, "workerpals.llm", (sectionBody) =>
-    migrateLegacyWorkerCodexCommandDefault(
+  migrated = migrateEmbeddedRuntimeTomlSection(migrated, "workerpals.llm", (sectionBody) => {
+    if (!embeddedSectionUsesOpenAICodex(sectionBody)) return sectionBody;
+    return migrateLegacyWorkerCodexCommandDefault(
       migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: true }),
       "codex_bin",
-    ),
-  );
+    );
+  });
   migrated = migrateEmbeddedRuntimeTomlSection(migrated, "workerpals.openai_codex", (sectionBody) =>
     migrateLegacyWorkerCodexCommandDefault(
       migrateLegacyOpenAICodexDefaults(sectionBody, { includeModel: false }),

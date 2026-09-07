@@ -7,7 +7,10 @@ import {
 } from "../../../packages/shared/src/bounded_fetch.js";
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import { inferRepositoryValidationSteps } from "../../../packages/shared/src/repo_validation.js";
-import { loadPushPalsConfig } from "../../../packages/shared/src/config.js";
+import {
+  DEFAULT_OPENAI_CODEX_MODEL,
+  loadPushPalsConfig,
+} from "../../../packages/shared/src/config.js";
 import {
   SCM_REPAIR_AUTHORITY_HEADER,
   copyEnvWithoutScmRepairAuthoritySecret,
@@ -340,9 +343,89 @@ export function resolveCodexCmd(codexBin: string): string[] {
   return parts;
 }
 
-export function buildCodexExecArgs(codexCmd: string[], outputPath: string): string[] {
+function codexLauncherModelSelectionArgs(codexCmd: string[]): string[] {
+  const executable = basename(String(codexCmd[0] ?? "").replace(/\\/g, "/"))
+    .toLowerCase()
+    .replace(/\.(?:exe|cmd|bat)$/, "");
+  const packageRunnerStart =
+    executable === "bun" && codexCmd[1] === "x"
+      ? 2
+      : executable === "bunx" || executable === "npx"
+        ? 1
+        : null;
+  if (packageRunnerStart !== null) {
+    // npx/bunx -p selects a package, not a Codex profile. Codex flags start
+    // after the package/command operand, not in the package runner's prefix.
+    for (let index = packageRunnerStart; index < codexCmd.length; index++) {
+      const arg = codexCmd[index];
+      if (arg === "-p" || arg === "--package") {
+        index++;
+      } else if (arg === "--") {
+        return codexCmd.slice(index + 2);
+      } else if (!arg.startsWith("-")) {
+        return codexCmd.slice(index + 1);
+      }
+    }
+    return [];
+  }
+  if (/^(?:python(?:\d+(?:\.\d+)*)?|py)$/.test(executable)) {
+    // Likewise, python -m selects the launcher module. A subsequent -m,
+    // after that module/script operand, belongs to the Codex launcher.
+    for (let index = 1; index < codexCmd.length; index++) {
+      const arg = codexCmd[index];
+      if (arg === "-m" || arg === "-c" || arg === "--") {
+        return codexCmd.slice(index + 2);
+      }
+      if (arg === "-W" || arg === "-X") {
+        index++;
+      } else if (!arg.startsWith("-")) {
+        return codexCmd.slice(index + 1);
+      }
+    }
+    return [];
+  }
+  return codexCmd.slice(1);
+}
+
+function codexLauncherSelectsModelOrProfile(codexCmd: string[]): boolean {
+  const args = codexLauncherModelSelectionArgs(codexCmd);
+  return args.some((arg, index) => {
+    if (
+      arg === "--model" ||
+      arg === "--profile" ||
+      arg === "-m" ||
+      arg === "-p" ||
+      /^--(?:model|profile)=/.test(arg) ||
+      /^-[mp].+/.test(arg)
+    ) {
+      return true;
+    }
+    const configOverride =
+      arg === "-c" || arg === "--config"
+        ? (args[index + 1] ?? "")
+        : arg.startsWith("--config=")
+          ? arg.slice("--config=".length)
+          : arg.startsWith("-c")
+            ? arg.slice(2)
+            : "";
+    return /^(?:model|profile|["'](?:model|profile)["'])\s*=/.test(configOverride.trim());
+  });
+}
+
+export function buildCodexExecArgs(
+  codexCmd: string[],
+  outputPath: string,
+  model = DEFAULT_OPENAI_CODEX_MODEL,
+): string[] {
+  // A custom launcher explicitly selecting a model/profile owns that choice.
+  // Otherwise apply the dedicated review model (or shared default), not the
+  // machine-local Codex profile's implicit default.
+  const modelArgs = codexLauncherSelectsModelOrProfile(codexCmd)
+    ? []
+    : ["-m", model.trim() || DEFAULT_OPENAI_CODEX_MODEL];
   return [
     ...codexCmd,
+    ...modelArgs,
     "-c",
     "model_reasoning_effort=low",
     "-a",
@@ -400,28 +483,65 @@ export function buildCodexEnv(config: ReviewAgentConfig): Record<string, string>
   return env;
 }
 
-async function invokeCodexReview(prompt: string, config: ReviewAgentConfig): Promise<string> {
+export async function invokeCodexReview(
+  prompt: string,
+  config: ReviewAgentConfig,
+): Promise<string> {
   const tmpFile = join(tmpdir(), `review-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   const codexCmd = resolveCodexCmd(config.codexBin);
-  const args = buildCodexExecArgs(codexCmd, tmpFile);
+  const requestedModel = config.model?.trim() || DEFAULT_OPENAI_CODEX_MODEL;
+  const compatibilityFallbackModel = "gpt-5.6-sol";
+  const mayUseCompatibilityFallback =
+    requestedModel.toLowerCase() === DEFAULT_OPENAI_CODEX_MODEL.toLowerCase() &&
+    !codexLauncherSelectsModelOrProfile(codexCmd);
+  const deadline = performance.now() + config.codexTimeoutMs;
+  let effectiveModel = requestedModel;
 
   try {
-    const result = await runBoundedScmProcess(args, {
-      stdin: new Blob([prompt]),
-      stdout: "ignore",
-      stderr: "pipe",
-      env: buildCodexEnv(config),
-      timeoutMs: config.codexTimeoutMs,
-    });
-    if (result.timedOut) {
-      throw new Error(`Codex review timed out after ${config.codexTimeoutMs}ms`);
-    }
-    if (result.exitCode !== 0) {
-      const detail = result.stderr.trim().slice(0, 800);
-      throw new Error(`Codex review failed (exit ${result.exitCode}): ${detail || "no stderr"}`);
-    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // A failed attempt can write a plausible last message. Never allow the
+      // fallback to succeed by reading that earlier attempt's stale artifact.
+      await Bun.file(tmpFile)
+        .delete()
+        .catch((error: unknown) => {
+          if ((error as { code?: string })?.code !== "ENOENT") throw error;
+        });
+      const timeoutMs = Math.ceil(deadline - performance.now());
+      if (timeoutMs <= 0) {
+        throw new Error(`Codex review timed out after ${config.codexTimeoutMs}ms`);
+      }
+      const result = await runBoundedScmProcess(
+        buildCodexExecArgs(codexCmd, tmpFile, effectiveModel),
+        {
+          stdin: new Blob([prompt]),
+          stdout: "ignore",
+          stderr: "pipe",
+          env: buildCodexEnv(config),
+          timeoutMs,
+        },
+      );
+      if (result.timedOut) {
+        throw new Error(`Codex review timed out after ${config.codexTimeoutMs}ms`);
+      }
+      if (result.exitCode !== 0) {
+        if (
+          attempt === 0 &&
+          mayUseCompatibilityFallback &&
+          /\bmodel\s+requires\s+a\s+newer\s+version\s+of\s+codex\b/i.test(result.stderr)
+        ) {
+          effectiveModel = compatibilityFallbackModel;
+          console.warn(
+            `[ReviewAgent] Codex CLI rejected default model ${requestedModel}; retrying once with model=${effectiveModel} inside the original ${config.codexTimeoutMs}ms review deadline. Upgrade Codex CLI to use ${requestedModel}.`,
+          );
+          continue;
+        }
+        const detail = result.stderr.trim().slice(0, 800);
+        throw new Error(`Codex review failed (exit ${result.exitCode}): ${detail || "no stderr"}`);
+      }
 
-    return (await Bun.file(tmpFile).text()).trim();
+      return (await Bun.file(tmpFile).text()).trim();
+    }
+    throw new Error("Codex review compatibility retry exhausted");
   } finally {
     await Bun.file(tmpFile)
       .delete()

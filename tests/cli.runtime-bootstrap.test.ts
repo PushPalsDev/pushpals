@@ -2540,66 +2540,72 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     }
   });
 
-  test("prepareCliRuntime migrates stale embedded Codex defaults to gpt-5.6 Sol xhigh", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-default-migrate-"));
-    const repoRoot = join(root, "repo");
-    const runtimeRoot = join(root, "runtime");
+  test.each(["gpt-5.4", "gpt-5.5", "gpt-5.6-sol"])(
+    "prepareCliRuntime migrates exact generated %s defaults to GPT-6 Astra xhigh idempotently",
+    async (legacyModel) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-default-migrate-"));
+      const repoRoot = join(root, "repo");
+      const runtimeRoot = join(root, "runtime");
 
-    try {
-      mkdirSync(repoRoot, { recursive: true });
-      mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
-      writeFileSync(
-        join(runtimeRoot, "configs", "local.toml"),
-        [
-          "[localbuddy.llm]",
-          'backend = "openai_codex"',
-          'model = "gpt-5.5"',
-          'reasoning_effort = "xhigh"',
-          "",
-          "[remotebuddy.llm]",
-          'backend = "openai_codex"',
-          'model = "gpt-5.5"',
-          'reasoning_effort = "xhigh"',
-          "",
-          "[workerpals.llm]",
-          'backend = "openai_codex"',
-          'model = "gpt-5.4"',
-          'codex_bin = "codex"',
-          'reasoning_effort = "high"',
-          "",
-          "[workerpals.openai_codex]",
-          'bin = "bunx --yes @openai/codex"',
-          'reasoning_effort = "high"',
-          "",
-        ].join("\n"),
-        "utf8",
-      );
+      try {
+        mkdirSync(repoRoot, { recursive: true });
+        mkdirSync(join(runtimeRoot, "configs"), { recursive: true });
+        writeFileSync(
+          join(runtimeRoot, "configs", "local.toml"),
+          [
+            "[localbuddy.llm]",
+            'backend = "openai_codex"',
+            `model = "${legacyModel}"`,
+            'reasoning_effort = "xhigh"',
+            "",
+            "[remotebuddy.llm]",
+            'backend = "openai_codex"',
+            `model = "${legacyModel}"`,
+            'reasoning_effort = "xhigh"',
+            "",
+            "[workerpals.llm]",
+            'backend = "openai_codex"',
+            `model = "${legacyModel}"`,
+            'codex_bin = "codex"',
+            'reasoning_effort = "high"',
+            "",
+            "[workerpals.openai_codex]",
+            'bin = "bunx --yes @openai/codex"',
+            'reasoning_effort = "high"',
+            "",
+          ].join("\n"),
+          "utf8",
+        );
 
-      const prepared = await prepareCliRuntime({
-        repoRoot,
-        runtimeRoot,
-      });
+        const prepared = await prepareCliRuntime({
+          repoRoot,
+          runtimeRoot,
+        });
 
-      const migratedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
-      expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
-      expect(prepared.runtimePreflight.config?.localbuddy.llm.model).toBe("gpt-5.6-sol");
-      expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe("gpt-5.6-sol");
-      expect(prepared.runtimePreflight.config?.workerpals.llm.model).toBe("gpt-5.6-sol");
-      expect(prepared.runtimePreflight.config?.localbuddy.llm.reasoningEffort).toBe("xhigh");
-      expect(prepared.runtimePreflight.config?.remotebuddy.llm.reasoningEffort).toBe("xhigh");
-      expect(prepared.runtimePreflight.config?.workerpals.llm.reasoningEffort).toBe("xhigh");
-      expect(migratedLocalToml).toContain('model = "gpt-5.6-sol"');
-      expect(migratedLocalToml).toContain('reasoning_effort = "xhigh"');
-      expect(migratedLocalToml).not.toContain("gpt-5.4");
-      expect(migratedLocalToml).not.toContain('model = "gpt-5.5"');
-      expect(
-        migratedLocalToml.match(/(?:codex_bin|bin) = "bun x --yes @openai\/codex@0\.146\.0"/g)
-          ?.length,
-      ).toBe(2);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
+        const migratedLocalToml = readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8");
+        expect(prepared.preflightUsesEmbeddedRuntime).toBe(true);
+        expect(prepared.runtimePreflight.config?.localbuddy.llm.model).toBe("gpt-6-astra");
+        expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe("gpt-6-astra");
+        expect(prepared.runtimePreflight.config?.workerpals.llm.model).toBe("gpt-6-astra");
+        expect(prepared.runtimePreflight.config?.localbuddy.llm.reasoningEffort).toBe("xhigh");
+        expect(prepared.runtimePreflight.config?.remotebuddy.llm.reasoningEffort).toBe("xhigh");
+        expect(prepared.runtimePreflight.config?.workerpals.llm.reasoningEffort).toBe("xhigh");
+        expect(migratedLocalToml).toContain('model = "gpt-6-astra"');
+        expect(migratedLocalToml).toContain('reasoning_effort = "xhigh"');
+        expect(migratedLocalToml).not.toContain(`model = "${legacyModel}"`);
+        expect(
+          migratedLocalToml.match(/(?:codex_bin|bin) = "bun x --yes @openai\/codex@0\.153\.2"/g)
+            ?.length,
+        ).toBe(2);
+        await prepareCliRuntime({ repoRoot, runtimeRoot });
+        expect(readFileSync(join(runtimeRoot, "configs", "local.toml"), "utf8")).toBe(
+          migratedLocalToml,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("prepareCliRuntime preserves custom embedded Codex model overrides", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-custom-preserve-"));
@@ -2676,6 +2682,116 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       expect(migratedLocalToml).toContain('codex_bin = "bun x --yes @openai/codex@0.147.0"');
       expect(migratedLocalToml).toContain('bin = "bunx --yes @openai/codex@0.147.0"');
       expect(migratedLocalToml).not.toContain("@openai/codex@0.146.0");
+      expect(migratedLocalToml).not.toContain("@openai/codex@0.153.2");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime upgrades only the old generated WorkerPal Codex pin", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-generated-pin-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+    const localTomlPath = join(runtimeRoot, "configs", "local.toml");
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(dirname(localTomlPath), { recursive: true });
+      writeFileSync(
+        localTomlPath,
+        [
+          "[workerpals.llm]",
+          'backend = "openai_codex"',
+          'model = "gpt-5.6-sol"',
+          'codex_bin = "bun x --yes @openai/codex@0.146.0"',
+          'reasoning_effort = "medium"',
+          "",
+          "[workerpals.openai_codex]",
+          'bin = "bunx --yes @openai/codex@0.146.0"',
+          'reasoning_effort = "low"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
+      const migrated = readFileSync(localTomlPath, "utf8");
+      expect(prepared.runtimePreflight.config?.workerpals.llm.model).toBe("gpt-6-astra");
+      expect(prepared.runtimePreflight.config?.workerpals.llm.codexBin).toBe(
+        "bun x --yes @openai/codex@0.153.2",
+      );
+      expect(prepared.runtimePreflight.config?.workerpals.llm.reasoningEffort).toBe("medium");
+      expect(migrated).toContain('bin = "bun x --yes @openai/codex@0.153.2"');
+      expect(migrated).toContain('reasoning_effort = "low"');
+      expect(migrated).not.toContain("@0.146.0");
+      await prepareCliRuntime({ repoRoot, runtimeRoot });
+      expect(readFileSync(localTomlPath, "utf8")).toBe(migrated);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prepareCliRuntime preserves non-Codex sections and custom model names verbatim", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-cli-codex-migration-guard-"));
+    const repoRoot = join(root, "repo");
+    const runtimeRoot = join(root, "runtime");
+    const localTomlPath = join(runtimeRoot, "configs", "local.toml");
+    try {
+      mkdirSync(repoRoot, { recursive: true });
+      mkdirSync(dirname(localTomlPath), { recursive: true });
+      const original = [
+        "[localbuddy.llm]",
+        'backend = "openai"',
+        'model = "gpt-5.5"',
+        'reasoning_effort = "high"',
+        "",
+        "[remotebuddy.llm]",
+        'backend = "ollama"',
+        'model = "gpt-5.6-sol"',
+        'reasoning_effort = "high"',
+        "",
+        "[workerpals.llm]",
+        'backend = "lmstudio"',
+        'model = "gpt-5.4"',
+        'codex_bin = "bun x --yes @openai/codex@0.146.0"',
+        'reasoning_effort = "high"',
+        "",
+        "[custom.llm]",
+        'backend = "openai_codex"',
+        'model = "gpt-5.6-sol"',
+        'reasoning_effort = "high"',
+        "",
+      ].join("\n");
+      writeFileSync(localTomlPath, original, "utf8");
+      await prepareCliRuntime({ repoRoot, runtimeRoot });
+      expect(readFileSync(localTomlPath, "utf8")).toBe(original);
+
+      const customCodexModels = [
+        "gpt-5.4-custom",
+        "gpt-5.5-mini",
+        "gpt-5.6-sol-mini",
+        "gpt-5.6-sol-20260906",
+        "gpt-6-astra",
+      ];
+      for (const model of customCodexModels) {
+        const custom = ["localbuddy", "remotebuddy", "workerpals"]
+          .map((service) =>
+            [
+              `[${service}.llm]`,
+              'backend = "openai_codex"',
+              `model = "${model}"`,
+              'reasoning_effort = "medium"',
+              'codex_bin = "bun x --yes @openai/codex@0.146.0-custom"',
+              "",
+            ].join("\n"),
+          )
+          .join("\n");
+        writeFileSync(localTomlPath, custom, "utf8");
+        const prepared = await prepareCliRuntime({ repoRoot, runtimeRoot });
+        expect(readFileSync(localTomlPath, "utf8")).toBe(custom);
+        expect(prepared.runtimePreflight.config?.localbuddy.llm.model).toBe(model);
+        expect(prepared.runtimePreflight.config?.remotebuddy.llm.model).toBe(model);
+        expect(prepared.runtimePreflight.config?.workerpals.llm.model).toBe(model);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

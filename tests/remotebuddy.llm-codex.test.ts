@@ -11,7 +11,10 @@ function quoteArg(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function createFakeCodexScript(invocationLogPath = ""): string {
+function createFakeCodexScript(
+  invocationLogPath = "",
+  options: { rejectedModels?: string[]; failureMessage?: string } = {},
+): string {
   const dir = mkdtempSync(join(tmpdir(), "pushpals-fake-codex-"));
   tempDirs.push(dir);
   const scriptPath = join(dir, "fake-codex.ts");
@@ -22,6 +25,8 @@ import { appendFileSync } from "fs";
 
 const args = Bun.argv.slice(2);
 const invocationLogPath = ${JSON.stringify(invocationLogPath)};
+const rejectedModels: string[] = ${JSON.stringify(options.rejectedModels ?? [])};
+const failureMessage: string | null = ${JSON.stringify(options.failureMessage ?? null)};
 const authorityKeys = Object.keys(process.env).filter(
   (key) => key.toLowerCase() === ${JSON.stringify(
     "PUSHPALS_SCM_REPAIR_AUTHORITY_SECRET".toLowerCase(),
@@ -58,8 +63,8 @@ const outputFlag = args.indexOf("--output-last-message");
 const outputPath = outputFlag >= 0 ? args[outputFlag + 1] ?? "" : "";
 await Bun.stdin.text();
 
-if (model === "gpt-5.6-sol") {
-  console.error("ERROR: {\\"detail\\":\\"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.\\"}");
+if (rejectedModels.includes(model)) {
+  console.error("ERROR: " + JSON.stringify({ detail: failureMessage ?? "The '" + model + "' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again." }));
   process.exit(1);
 }
 
@@ -72,6 +77,27 @@ process.exit(0);
   );
   return scriptPath;
 }
+
+function createInvocationLog(): string {
+  const dir = mkdtempSync(join(tmpdir(), "pushpals-codex-model-invocations-"));
+  tempDirs.push(dir);
+  return join(dir, "invocations.jsonl");
+}
+
+function readExecInvocations(path: string): string[][] {
+  return readFileSync(path, "utf8")
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => (JSON.parse(line) as { args: string[] }).args)
+    .filter((args) => args.includes("exec"));
+}
+
+const generateInput = {
+  system: "Return a short answer.",
+  messages: [{ role: "user" as const, content: "Say hello." }],
+  maxTokens: 64,
+};
 
 function isEffectivelyAlive(pid: number): boolean {
   try {
@@ -204,13 +230,88 @@ describe("RemoteBuddy OpenAI Codex CLI client", () => {
     ).toEqual(["C:/tools/bun/bin/bun.exe", "x", "--yes", "@openai/codex"]);
   });
 
-  test("retries default gpt-5.6 Sol requests with the legacy model when Codex is too old", async () => {
-    const scriptPath = createFakeCodexScript();
+  test("executes the default Astra model with xhigh effort and records the effective model", async () => {
+    const invocationLogPath = createInvocationLog();
+    const scriptPath = createFakeCodexScript(invocationLogPath);
+    const usageEvents: Array<{ modelId?: string | null }> = [];
+    const client = new OpenAiCodexCliClient({
+      codexAuthMode: "chatgpt",
+      codexBin: `${quoteArg(process.execPath)} ${quoteArg(scriptPath)}`,
+      usageReporter: {
+        async reportUsage(event) {
+          usageEvents.push(event);
+        },
+      },
+    });
+
+    const output = await client.generate(generateInput);
+
+    expect(output.provider).toBe("openai_codex");
+    expect(output.modelId).toBe("gpt-6-astra");
+    const invocations = readExecInvocations(invocationLogPath);
+    expect(invocations).toHaveLength(1);
+    const args = invocations[0]!;
+    expect(args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)).toEqual(["-m", "gpt-6-astra"]);
+    expect(args.slice(args.indexOf("-c"), args.indexOf("-c") + 2)).toEqual([
+      "-c",
+      'model_reasoning_effort="xhigh"',
+    ]);
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]?.modelId).toBe("gpt-6-astra");
+  });
+
+  test.each(["low", "medium", "high", "xhigh"])(
+    "preserves supported Astra reasoning effort %s",
+    (effort) => {
+      expect(__TEST_ONLY__.codexReasoningEffort(effort, "gpt-6-astra")).toBe(effort);
+    },
+  );
+
+  test("retains reasoning aliases and older model compatibility without changing defaults", () => {
+    for (const effort of [undefined, "", "extra high", "extra-high", "extrahigh", "x-high"]) {
+      expect(__TEST_ONLY__.codexReasoningEffort(effort, "gpt-6-astra")).toBe("xhigh");
+      expect(__TEST_ONLY__.codexReasoningEffort(effort, "gpt-5.4")).toBe("high");
+    }
+    expect(__TEST_ONLY__.codexReasoningEffort("xhigh", "gpt-5.4")).toBe("high");
+    expect(__TEST_ONLY__.codexReasoningEffort("medium", "gpt-5.4")).toBe("medium");
+  });
+
+  test.each([
+    ["openai/gpt-5.6-sol", "gpt-5.6-sol", "medium"],
+    ["custom-codex-model", "custom-codex-model", "low"],
+    ["gpt-6-astra", "gpt-6-astra", "high"],
+  ])(
+    "preserves explicit model %s and reasoning override",
+    async (model, effectiveModel, effort) => {
+      const invocationLogPath = createInvocationLog();
+      const scriptPath = createFakeCodexScript(invocationLogPath);
+      const client = new OpenAiCodexCliClient({
+        model,
+        reasoningEffort: effort,
+        codexAuthMode: "chatgpt",
+        codexBin: `${quoteArg(process.execPath)} ${quoteArg(scriptPath)}`,
+      });
+
+      const output = await client.generate(generateInput);
+
+      expect(output.modelId).toBe(effectiveModel);
+      const invocations = readExecInvocations(invocationLogPath);
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]![invocations[0]!.indexOf("-m") + 1]).toBe(effectiveModel);
+      expect(invocations[0]).toContain(`model_reasoning_effort="${effort}"`);
+    },
+  );
+
+  test("retries default Astra requests once with Sol when Codex is too old", async () => {
+    const invocationLogPath = createInvocationLog();
+    const scriptPath = createFakeCodexScript(invocationLogPath, {
+      rejectedModels: ["gpt-6-astra"],
+    });
     const usageEvents: Array<{ modelId?: string | null }> = [];
     const client = new OpenAiCodexCliClient({
       service: "remotebuddy",
       sessionId: "test-session",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       codexAuthMode: "chatgpt",
       codexBin: `${quoteArg(process.execPath)} ${quoteArg(scriptPath)}`,
       reasoningEffort: "xhigh",
@@ -221,17 +322,92 @@ describe("RemoteBuddy OpenAI Codex CLI client", () => {
       },
     });
 
-    const output = await client.generate({
-      system: "Return a short answer.",
-      messages: [{ role: "user", content: "Say hello." }],
-      maxTokens: 64,
+    const output = await client.generate(generateInput);
+
+    expect(output.text).toBe("fallback:gpt-5.6-sol");
+    expect(output.provider).toBe("openai_codex");
+    expect(output.modelId).toBe("gpt-5.6-sol");
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]?.modelId).toBe("gpt-5.6-sol");
+    const invocations = readExecInvocations(invocationLogPath);
+    expect(invocations.map((args) => args[args.indexOf("-m") + 1])).toEqual([
+      "gpt-6-astra",
+      "gpt-5.6-sol",
+    ]);
+    expect(invocations.every((args) => args.includes('model_reasoning_effort="xhigh"'))).toBe(true);
+  });
+
+  test("does not start a third model attempt if the compatibility fallback also fails", async () => {
+    const invocationLogPath = createInvocationLog();
+    const scriptPath = createFakeCodexScript(invocationLogPath, {
+      rejectedModels: ["gpt-6-astra", "gpt-5.6-sol"],
+    });
+    const usageEvents: unknown[] = [];
+    const client = new OpenAiCodexCliClient({
+      codexAuthMode: "chatgpt",
+      codexBin: `${quoteArg(process.execPath)} ${quoteArg(scriptPath)}`,
+      usageReporter: {
+        async reportUsage(event) {
+          usageEvents.push(event);
+        },
+      },
     });
 
-    expect(output.text).toBe("fallback:gpt-5.5");
-    expect(output.provider).toBe("openai_codex");
-    expect(output.modelId).toBe("gpt-5.5");
-    expect(usageEvents).toHaveLength(1);
-    expect(usageEvents[0]?.modelId).toBe("gpt-5.5");
+    await expect(client.generate(generateInput)).rejects.toThrow(
+      "The 'gpt-5.6-sol' model requires a newer version of Codex",
+    );
+
+    expect(
+      readExecInvocations(invocationLogPath).map((args) => args[args.indexOf("-m") + 1]),
+    ).toEqual(["gpt-6-astra", "gpt-5.6-sol"]);
+    expect(usageEvents).toHaveLength(0);
+  });
+
+  test.each([
+    "401 Unauthorized: token expired",
+    "429 Too Many Requests: rate limit reached",
+    "503 Service Unavailable: upstream connection failed",
+    "Permission denied while accessing the workspace",
+    "The model 'gpt-6-astra' does not exist or you do not have access to it",
+    "Authentication failed. Please upgrade to the latest app or CLI and try again.",
+    "The shell extension requires a newer version of Codex",
+  ])(
+    "does not mask a non-compatibility failure with a model fallback: %s",
+    async (failureMessage) => {
+      const invocationLogPath = createInvocationLog();
+      const scriptPath = createFakeCodexScript(invocationLogPath, {
+        rejectedModels: ["gpt-6-astra"],
+        failureMessage,
+      });
+      const client = new OpenAiCodexCliClient({
+        codexAuthMode: "chatgpt",
+        codexBin: `${quoteArg(process.execPath)} ${quoteArg(scriptPath)}`,
+      });
+
+      await expect(client.generate(generateInput)).rejects.toThrow(failureMessage);
+
+      expect(readExecInvocations(invocationLogPath)).toHaveLength(1);
+    },
+  );
+
+  test("does not replace an explicit older model when that model requires a newer CLI", async () => {
+    const invocationLogPath = createInvocationLog();
+    const scriptPath = createFakeCodexScript(invocationLogPath, {
+      rejectedModels: ["gpt-5.6-sol"],
+    });
+    const client = new OpenAiCodexCliClient({
+      model: "gpt-5.6-sol",
+      codexAuthMode: "chatgpt",
+      codexBin: `${quoteArg(process.execPath)} ${quoteArg(scriptPath)}`,
+    });
+
+    await expect(client.generate(generateInput)).rejects.toThrow(
+      "The 'gpt-5.6-sol' model requires a newer version of Codex",
+    );
+
+    const invocations = readExecInvocations(invocationLogPath);
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]![invocations[0]!.indexOf("-m") + 1]).toBe("gpt-5.6-sol");
   });
 
   test("keeps SCM repair authority out of Codex probes, login, isolated workspace, and exec", async () => {

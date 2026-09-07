@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import {
@@ -11,6 +11,7 @@ import {
   collectReviewHygieneIssuesFromDiff,
   deriveFixWriteGlobsFromDiff,
   deriveReviewTaskValidationSteps,
+  invokeCodexReview,
   listPersistedPrLinks,
   parseReviewVerdict,
   resolveCodexCmd,
@@ -79,6 +80,67 @@ const silentLogs = {
   closePullRequest: async () => ({ state: "closed", closed: true }),
   deleteBranchRef: async () => ({ deleted: true, reason: "deleted" as const }),
 };
+
+async function runReviewModelCompatibilityStub(options: {
+  model?: string;
+  launcherSelection?: string[];
+  timeoutMs?: number;
+  responses: Record<
+    string,
+    { exitCode: number; stderr?: string; output?: string; delayMs?: number }
+  >;
+}) {
+  const root = mkdtempSync(join(tmpdir(), "pushpals-review-model-compat-"));
+  const callsPath = join(root, "calls.jsonl");
+  try {
+    const stubPath = join(root, "codex-compat-stub.ts");
+    writeFileSync(
+      stubPath,
+      [
+        'import { appendFileSync } from "fs";',
+        "const args = process.argv.slice(2);",
+        'const modelIndex = args.indexOf("-m");',
+        'const model = modelIndex >= 0 ? args[modelIndex + 1] : "implicit";',
+        `appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ model, args }) + "\\n");`,
+        `const responses = ${JSON.stringify(options.responses)};`,
+        "const response = responses[model] ?? { exitCode: 2, stderr: 'Unexpected model: ' + model };",
+        "await Bun.stdin.text();",
+        "if (response.delayMs) await Bun.sleep(response.delayMs);",
+        'const outputPath = args[args.indexOf("--output-last-message") + 1];',
+        "if (response.output !== undefined) await Bun.write(outputPath, response.output);",
+        "if (response.stderr) console.error(response.stderr);",
+        "process.exit(response.exitCode);",
+      ].join("\n"),
+    );
+    const launcher = [process.execPath, stubPath, ...(options.launcherSelection ?? [])]
+      .map((value) => JSON.stringify(value.replaceAll("\\", "/")))
+      .join(" ");
+    const startedAt = performance.now();
+    let output: string | null = null;
+    let error: Error | null = null;
+    try {
+      output = await invokeCodexReview("Review the candidate.", {
+        ...baseConfig,
+        model: options.model,
+        codexBin: launcher,
+        codexTimeoutMs: options.timeoutMs ?? 5_000,
+      });
+    } catch (failure) {
+      error = failure instanceof Error ? failure : new Error(String(failure));
+    }
+    return {
+      output,
+      error,
+      elapsedMs: performance.now() - startedAt,
+      calls: (existsSync(callsPath) ? readFileSync(callsPath, "utf8") : "")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { model: string; args: string[] }),
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 describe("ReviewAgent", () => {
   test("does not expose SCM repair authority to Codex review subprocesses", () => {
@@ -239,6 +301,242 @@ describe("ReviewAgent", () => {
     expect(args).not.toContain("--approval-policy");
     expect(args).not.toContain("--sandbox");
     expect(args).toContain("exec");
+    expect(args.slice(args.indexOf("-m"), args.indexOf("-m") + 2)).toEqual(["-m", "gpt-6-astra"]);
+    expect(args).toContain("model_reasoning_effort=low");
+  });
+
+  test("review model configuration changes the model without changing review effort", () => {
+    const args = buildCodexExecArgs(["codex"], "/tmp/out.txt", "gpt-5.5-mini");
+    expect(args.slice(1, 3)).toEqual(["-m", "gpt-5.5-mini"]);
+    expect(args).toContain("model_reasoning_effort=low");
+    expect(args).not.toContain("gpt-6-astra");
+    expect(buildCodexExecArgs(["codex"], "/tmp/out.txt", "  ")).toContain("gpt-6-astra");
+  });
+
+  test.each([
+    ["--model", "custom-model"],
+    ["-m", "custom-model"],
+    ["--model=custom-model"],
+    ["-mcustom-model"],
+    ["-m=custom-model"],
+    ["--profile", "custom-profile"],
+    ["-p", "custom-profile"],
+    ["--profile=custom-profile"],
+    ["-pcustom-profile"],
+    ["-c", 'model="custom-model"'],
+    ["--config", 'model = "custom-model"'],
+    ['--config=model="custom-model"'],
+    ['-cmodel="custom-model"'],
+    ["-c", '"model"="custom-model"'],
+    ["-c", 'profile="custom-profile"'],
+  ])("explicit launcher model/profile wins over review model (%j)", (...selection) => {
+    const launcher = ["codex", ...selection];
+    const args = buildCodexExecArgs(launcher, "/tmp/out.txt", "configured-review-model");
+    expect(args.slice(0, launcher.length)).toEqual(launcher);
+    expect(args).not.toContain("configured-review-model");
+    expect(args).not.toContain("gpt-6-astra");
+    expect(args.slice(launcher.length, launcher.length + 2)).toEqual([
+      "-c",
+      "model_reasoning_effort=low",
+    ]);
+  });
+
+  test("unrelated Codex configuration does not suppress the review model", () => {
+    for (const selection of [
+      ["-c", 'model_reasoning_effort="medium"'],
+      ["--config", "model_context_window=128000"],
+      ['--config=service_tier="fast"'],
+    ]) {
+      const args = buildCodexExecArgs(["codex", ...selection], "/tmp/out.txt");
+      expect(args).toContain("gpt-6-astra");
+      expect(args).toContain("model_reasoning_effort=low");
+    }
+  });
+
+  test.each([
+    ["npx", "--yes", "-p", "@openai/codex", "codex"],
+    ["npx", "--package=@openai/codex", "codex"],
+    ["npx", "-p@openai/codex", "codex"],
+    ["npx", "--yes", "@openai/codex"],
+    ["bunx", "--yes", "-p", "@openai/codex", "codex"],
+    ["bun", "x", "--package", "@openai/codex", "codex"],
+    ["bun", "x", "--yes", "@openai/codex@0.153.2"],
+    ["C:\\runtime\\bun.exe", "x", "--yes", "@openai/codex@0.153.2"],
+    ["python", "-m", "codex_launcher"],
+    ["python3", "-u", "-X", "utf8", "-m", "codex_launcher"],
+    ["py.exe", "-3", "-m", "codex_launcher"],
+    ["python", "codex_launcher.py"],
+  ])("wrapper package/module flags do not select a Codex model or profile (%j)", (...launcher) => {
+    const args = buildCodexExecArgs(launcher, "/tmp/out.txt");
+    expect(args.slice(0, launcher.length)).toEqual(launcher);
+    expect(args.slice(launcher.length, launcher.length + 2)).toEqual(["-m", "gpt-6-astra"]);
+
+    for (const selection of [
+      ["--profile", "explicit-profile"],
+      ["-p", "explicit-profile"],
+      ["-m", "explicit-model"],
+      ["-c", 'model="explicit-model"'],
+    ]) {
+      const customLauncher = [...launcher, ...selection];
+      const customArgs = buildCodexExecArgs(customLauncher, "/tmp/out.txt");
+      expect(customArgs.slice(0, customLauncher.length)).toEqual(customLauncher);
+      expect(customArgs).not.toContain("gpt-6-astra");
+      expect(customArgs.slice(customLauncher.length, customLauncher.length + 2)).toEqual([
+        "-c",
+        "model_reasoning_effort=low",
+      ]);
+    }
+  });
+
+  test("bounded review subprocess receives the configured model and preserved launcher choices", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-review-model-argv-"));
+    try {
+      const stubPath = join(root, "codex-model-stub.ts");
+      writeFileSync(
+        stubPath,
+        [
+          "const args = process.argv.slice(2);",
+          'const outputPath = args[args.indexOf("--output-last-message") + 1];',
+          "await Bun.stdin.text();",
+          "await Bun.write(outputPath, JSON.stringify(args));",
+        ].join("\n"),
+      );
+      const launcher = [process.execPath, stubPath]
+        .map((value) => JSON.stringify(value.replaceAll("\\", "/")))
+        .join(" ");
+      const configured = JSON.parse(
+        await invokeCodexReview("Review the candidate.", {
+          ...baseConfig,
+          model: "gpt-5.5-mini",
+          codexBin: launcher,
+        }),
+      ) as string[];
+      expect(configured.slice(0, 2)).toEqual(["-m", "gpt-5.5-mini"]);
+      expect(configured).toContain("model_reasoning_effort=low");
+      expect(configured).toContain("read-only");
+
+      const defaultArgs = JSON.parse(
+        await invokeCodexReview("Review the candidate.", { ...baseConfig, codexBin: launcher }),
+      ) as string[];
+      expect(defaultArgs.slice(0, 2)).toEqual(["-m", "gpt-6-astra"]);
+
+      const customArgs = JSON.parse(
+        await invokeCodexReview("Review the candidate.", {
+          ...baseConfig,
+          model: "gpt-6-astra",
+          codexBin: `${launcher} --profile explicit-user-profile`,
+        }),
+      ) as string[];
+      expect(customArgs.slice(0, 2)).toEqual(["--profile", "explicit-user-profile"]);
+      expect(customArgs).not.toContain("-m");
+      expect(customArgs).not.toContain("gpt-6-astra");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("review retries an explicit default-model CLI rejection once with Sol and low effort", async () => {
+    const result = await runReviewModelCompatibilityStub({
+      responses: {
+        "gpt-6-astra": {
+          exitCode: 1,
+          stderr: "The 'gpt-6-astra' model requires a newer version of Codex.",
+          output: "Stale failed review.",
+        },
+        "gpt-5.6-sol": { exitCode: 0, output: "Reviewed on compatibility model." },
+      },
+    });
+    expect(result.error).toBeNull();
+    expect(result.output).toBe("Reviewed on compatibility model.");
+    expect(result.calls.map((call) => call.model)).toEqual(["gpt-6-astra", "gpt-5.6-sol"]);
+    expect(result.calls.every((call) => call.args.includes("model_reasoning_effort=low"))).toBe(
+      true,
+    );
+  });
+
+  test("review does not retry a rejected fallback a second time", async () => {
+    const result = await runReviewModelCompatibilityStub({
+      responses: {
+        "gpt-6-astra": {
+          exitCode: 1,
+          stderr: "The 'gpt-6-astra' model requires a newer version of Codex.",
+        },
+        "gpt-5.6-sol": {
+          exitCode: 1,
+          stderr: "The 'gpt-5.6-sol' model requires a newer version of Codex.",
+        },
+      },
+    });
+    expect(result.output).toBeNull();
+    expect(result.error?.message).toContain("gpt-5.6-sol");
+    expect(result.calls.map((call) => call.model)).toEqual(["gpt-6-astra", "gpt-5.6-sol"]);
+  });
+
+  test.each([
+    "401 Unauthorized: authentication failed",
+    "429 Too many requests: rate limit exceeded",
+    "500 Internal Server Error",
+    "Authentication failed. Please upgrade to the latest app or CLI.",
+    "Your extension requires a newer version of Codex.",
+  ])("review does not change models for unrelated failures (%s)", async (stderr) => {
+    const result = await runReviewModelCompatibilityStub({
+      responses: { "gpt-6-astra": { exitCode: 1, stderr } },
+    });
+    expect(result.output).toBeNull();
+    expect(result.error?.message).toContain(stderr);
+    expect(result.calls.map((call) => call.model)).toEqual(["gpt-6-astra"]);
+  });
+
+  test("review does not replace a custom model or explicit launcher model/profile on rejection", async () => {
+    const rejection = "The selected model requires a newer version of Codex.";
+    for (const selection of [
+      { model: "gpt-5.5-mini", expectedModel: "gpt-5.5-mini" },
+      { launcherSelection: ["-m", "explicit-model"], expectedModel: "explicit-model" },
+      { launcherSelection: ["--profile", "explicit-profile"], expectedModel: "implicit" },
+      { launcherSelection: ["-c", 'model="explicit-model"'], expectedModel: "implicit" },
+    ]) {
+      const result = await runReviewModelCompatibilityStub({
+        ...selection,
+        responses: { [selection.expectedModel]: { exitCode: 1, stderr: rejection } },
+      });
+      expect(result.output).toBeNull();
+      expect(result.error?.message).toContain(rejection);
+      expect(result.calls.map((call) => call.model)).toEqual([selection.expectedModel]);
+    }
+  });
+
+  test("review fallback cannot accept an earlier failed attempt's output artifact", async () => {
+    const result = await runReviewModelCompatibilityStub({
+      responses: {
+        "gpt-6-astra": {
+          exitCode: 1,
+          stderr: "The 'gpt-6-astra' model requires a newer version of Codex.",
+          output: "Stale successful-looking verdict from failed attempt.",
+        },
+        "gpt-5.6-sol": { exitCode: 0 },
+      },
+    });
+    expect(result.output).toBeNull();
+    expect(result.error).not.toBeNull();
+    expect(result.calls.map((call) => call.model)).toEqual(["gpt-6-astra", "gpt-5.6-sol"]);
+  });
+
+  test("review compatibility retry shares the original timeout instead of receiving a fresh budget", async () => {
+    const result = await runReviewModelCompatibilityStub({
+      timeoutMs: 650,
+      responses: {
+        "gpt-6-astra": {
+          exitCode: 1,
+          stderr: "The 'gpt-6-astra' model requires a newer version of Codex.",
+          delayMs: 400,
+        },
+        "gpt-5.6-sol": { exitCode: 0, output: "Too late to accept.", delayMs: 400 },
+      },
+    });
+    expect(result.output).toBeNull();
+    expect(result.error?.message).toContain("timed out after 650ms");
+    expect(result.calls.map((call) => call.model)).toEqual(["gpt-6-astra", "gpt-5.6-sol"]);
+    expect(result.elapsedMs).toBeLessThan(1_300);
   });
 
   test("builds review prompt with configured score threshold policy", () => {
