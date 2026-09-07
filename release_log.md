@@ -2,45 +2,42 @@
 
 ## Release Metadata
 
-- version: `v1.2.50`
-- start_commit: `29c27dd08164eaec6a1031e140a870dc78c2cd13`
-- end_commit: `1965d8fe14e93db295775bddaa28244db84282f5`
+- version: `v1.2.51`
+- start_commit: `5c566ef46c44c5da39838200ee4f62fd2f796634`
+- end_commit: `bfc1c19a8e5a21a664f8dfa324a532421f48fa6a`
 - commits_in_range: `1`
 
 ## Highlights
 
-- Reserve validation and critic time during short worker revisions without extending the original job deadline. Give executors their actual turn budget and focus revision instructions on actionable failures instead of repeating full discovery or unavailable Docker checks.
-- Let an explicitly retained timeout candidate undergo independent validation and critic review inside its remaining budget. Missing verdicts, unresolved must-fix findings, assertions, empty diffs, and expired deadlines still prevent success; environment-only checks remain held for trusted-host validation.
-- Preserve earlier validation, patch, and critic evidence when a later executor turn fails. Keep terminal phase intervals visible and stop labeling every earlier phase with the final job failure.
-- Fix trusted-validation retries for real nested Bun commands: ordinary script-exit summaries no longer suppress the single timeout retry. Mixed failures do not qualify, and a repeated timeout still blocks publication.
-- Dispatch one exact-candidate repair after a single actionable trusted-host rejection, without waiting for another full job to hit the same gate. Concurrent ticks retain one repair lease; worker diagnostics cannot impersonate or erase trusted-host evidence.
-- Align RepositoryAgent and autonomy candidate contracts, permit one bounded schema correction, and reject invalid cache entries. Feed executed outcomes back into analysis without reinforcing cache reads as successful jobs; a retained-outcome watermark prevents stale advice from returning when detailed history ages out.
-- Use the platform temporary directory for critic output, refresh packaged runtime bundles and source mirrors, and gate the new real-process recovery tests on Windows before tagging and publication.
+- Upgrade the default OpenAI Codex model from `gpt-5.6-sol` to `gpt-6-astra` across LocalBuddy, RemoteBuddy/RepositoryAgent, WorkerPal, and SCM PR review. Preserve existing reasoning-effort policies, deadlines, and validation requirements.
+- Pin generated WorkerPal launchers to `@openai/codex@0.153.2`, verified to support Astra. Migrate exact legacy generated model defaults and the old `0.146.0` worker pin while preserving custom models, explicit alternate pins, non-Codex backends, and custom launchers.
+- Make WorkerPal quality review inherit the configured worker model unless an explicit critic override is supplied. Give SCM PR review an explicit Astra default and an optional model setting, while respecting model/profile selections in custom launchers, including Bun, npm, and Python wrappers.
+- Retain a bounded, one-time fallback to Sol for an explicit older-Codex model-version rejection. Ordinary authentication, rate-limit, and network failures do not trigger model downgrade. SCM review fallback shares the original deadline and clears stale output before retrying.
+- Refresh all packaged runtime bundles and source/config mirrors, expand model-routing and migration regression coverage, and document the live compatibility probes in the model-upgrade playbook.
 
 ## Validation
 
-- Bun 1.3.14 passed `bun run cli:bundle` and `bun run cli:verify-package-payload` in a resource-capped container checkout with native dependencies; the package contains `271` files and no external toolchain payloads.
-- `bun run test:root` passed in the same isolated native-dependency container: `2,051` tests passed, `12` platform/opt-in skips, `0` failures, and `11,867` assertions across `171` files. The additional Windows workflow coverage checks passed in a subsequent `11`-test Docker run.
-- Focused Docker suites passed `242` server/planning tests, `113` worker/harness tests, `47` trusted-validation tests, and `126` Python executor tests. Both new real nested-Bun retry scenarios also passed on Windows.
-- Server, RemoteBuddy, WorkerPal, and SourceControlManager TypeScript checks passed in Docker.
-- All `151` staged runtime source mirrors have identical Git blob hashes to their canonical sources.
-- Final product commit `1965d8fe14e93db295775bddaa28244db84282f5` passed CLI E2E run `34065677306`: Windows package/path/startup contracts including the new timeout-candidate and trusted-validation regressions, Linux WorkerPal control-plane E2E, and Linux packaged CLI E2E. The separate manual-only Windows-host Docker job was skipped as configured.
-- Independent reviews closed critic-bypass, evidence-loss, trusted-source spoofing, and stale-cache resurrection gaps. Prettier and `git diff --check` passed.
+- Bun 1.3.14 passed `bun run cli:bundle` and `bun run cli:verify-package-payload` in a resource-capped container checkout with native dependencies; the package contains `271` files and no external toolchain payloads. The final host payload check also passed.
+- `bun run test:root` passed in the isolated container: `2,118` tests passed, `12` platform/opt-in skips, `0` failures, and `12,296` assertions across `171` files. After the final equivalent string-normalization adjustment for the SCM TypeScript target, all `122` SCM tests, SCM typecheck, bundle, and payload checks passed again.
+- Python executor coverage passed `133` tests; CLI integration coverage passed `189` tests. Selected installed-package checks passed, and focused Windows fake-executable tests exercised model routing, custom overrides, fallback classification, stale-output removal, and bounded retry deadlines.
+- RemoteBuddy, WorkerPal, and SourceControlManager TypeScript checks passed in Docker. Independent review checked `155` canonical source/config-to-runtime mirror pairs with no mismatches after line-ending normalization. Prettier and `git diff --check` passed.
+- Live isolated probes verified the exact Bun-launched Codex `0.153.2` pin with Astra/`xhigh` on Windows and Linux, including overwriting an existing tracked file in a disposable Windows worktree. The actual RepositoryAgent client and SCM review argument builder also completed Astra requests without fallback. The old `0.146.0` pin was confirmed to reject Astra.
+- Final product commit `bfc1c19a8e5a21a664f8dfa324a532421f48fa6a` passed CLI E2E run `34106946008`: Windows package/path/recovery/startup contracts, Linux WorkerPal control-plane E2E, and the full Linux packaged CLI E2E suite. This closes the earlier local runner's missing-Docker E2E gap. The separate manual-only Windows-host Docker job was skipped as configured.
 
 ## Install
 
 ```bash
-npm install -g @pushpalsdev/cli@1.2.50
+npm install -g @pushpalsdev/cli@1.2.51
 ```
 
 ```bash
-bun install -g @pushpalsdev/cli@1.2.50
+bun install -g @pushpalsdev/cli@1.2.51
 ```
 
 For environments using a managed certificate store:
 
 ```bash
-bun install -g --use-system-ca @pushpalsdev/cli@1.2.50
+bun install -g --use-system-ca @pushpalsdev/cli@1.2.51
 ```
 
 ## Artifacts
@@ -57,7 +54,8 @@ bun install -g --use-system-ca @pushpalsdev/cli@1.2.50
 
 ## Known Issues
 
-- This release does not change users' repository tests. Persistent test failures and substantive critic findings still block publication; regression and release smoke checks do not establish new live job or PR outcomes for a stopped repository session.
+- Astra still requires account access and a compatible Codex CLI. Explicit custom launcher pins are preserved; users retaining an older custom pin may need to upgrade it themselves. The compatibility fallback does not grant model access or bypass authentication failures.
+- Live model probes and regression/release smokes are not a long-duration SectorCommand job soak. This release does not change users' repository tests; persistent test failures and substantive critic findings still block publication.
 - The npm entrypoint requires Node.js 20+ and at least one Bun 1.3.14+ installation. Standalone GitHub release binaries remain available when installing Bun is not practical.
 - `PUSHPALS_BUN_BIN` is authoritative when set; unset or correct it if it points to a removed or outdated runtime.
 - The immutable `v1.2.44`, `v1.2.45`, and `v1.2.46` tags remain unpublished on npm; install `v1.2.47` or newer.
