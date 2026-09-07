@@ -3507,6 +3507,51 @@ describe("server session message route", () => {
     }
   }, 20_000);
 
+  test("serves exact read-only repair lifecycle authority and rejects incomplete lookups", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const endpoint = `http://127.0.0.1:${port}/jobs/review-repair-lifecycle`;
+    expect((await fetch(endpoint)).status).toBe(400);
+    const query = new URLSearchParams({
+      repositoryIdentity: "https://github.com/example/repo.git",
+      prNumber: "42",
+      headSha: "a".repeat(40),
+      baseSha: "b".repeat(40),
+    });
+    expect(await (await fetch(`${endpoint}?${query}`)).json()).toMatchObject({
+      ok: true,
+      state: "none",
+    });
+    const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+    try {
+      db.query(
+        `INSERT INTO pr_repair_lifecycle(lifecycleKey, repositoryIdentity, prUrlNormalized, prNumber, headSha, baseSha, resolutionType, status, attemptCount, maxAttempts, lastError, createdAt, updatedAt)
+        VALUES ('route-proof', 'github.com/example/repo', 'https://github.com/example/repo/pull/42', 42, ?, ?, 'review_fix', 'exhausted', 2, 2, 'Original assertion still fails', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+      ).run("a".repeat(40), "b".repeat(40));
+      const before = db
+        .query("SELECT * FROM pr_repair_lifecycle WHERE lifecycleKey='route-proof'")
+        .get();
+      expect(await (await fetch(`${endpoint}?${query}`)).json()).toMatchObject({
+        ok: true,
+        state: "exhausted",
+        detail: "Original assertion still fails",
+      });
+      query.set("repositoryIdentity", "https://github.com/other/repo.git");
+      expect(await (await fetch(`${endpoint}?${query}`)).json()).toMatchObject({
+        ok: true,
+        state: "none",
+      });
+      expect(
+        db.query("SELECT * FROM pr_repair_lifecycle WHERE lifecycleKey='route-proof'").get(),
+      ).toEqual(before);
+    } finally {
+      db.close();
+    }
+  }, 20_000);
+
   test("normalizes a published completion PR URL for provider reconciliation", async () => {
     const root = makeTempDir();
     const port = await getFreePort();

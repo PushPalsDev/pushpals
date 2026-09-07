@@ -758,29 +758,39 @@ describe("SourceControlManager trusted validation", () => {
     expect(lines).toHaveLength(7);
   });
 
-  test("decides timeout retries before report truncation can hide a mixed assertion", async () => {
-    const output = [
-      "FAIL tests/runner.vitest.ts > slow test",
-      "Error: Test timed out in 5000ms.",
-      ...Array.from({ length: 200 }, () => `failure context ${"x".repeat(100)}`),
-      "AssertionError: a deterministic failure must not be retried",
-      ...Array.from({ length: 200 }, () => `other diagnostic ${"x".repeat(100)}`),
-    ].join("\n");
-    let calls = 0;
-    const results = await runTrustedValidationCommands({
-      repoPath: "C:/repo",
-      commandsJson: JSON.stringify(["bun run validate"]),
-      runner: async () => {
-        calls += 1;
-        return { ok: false, output, exitCode: 1 };
-      },
-    });
+  test.each([false, true])(
+    "decides mixed-failure retries from full output (diagnostic overflow: %s)",
+    async (overflow) => {
+      const output = [
+        "FAIL tests/runner.vitest.ts > slow test",
+        "Error: Test timed out in 5000ms.",
+        ...Array.from({ length: 200 }, (_, index) =>
+          overflow
+            ? `FAIL tests/runner.vitest.ts > other slow test ${index} ${"x".repeat(100)}`
+            : `failure context ${"x".repeat(100)}`,
+        ),
+        "AssertionError: a deterministic failure must not be retried",
+        ...Array.from({ length: 200 }, () => `other diagnostic ${"x".repeat(100)}`),
+      ].join("\n");
+      let calls = 0;
+      const results = await runTrustedValidationCommands({
+        repoPath: "C:/repo",
+        commandsJson: JSON.stringify(["bun run validate"]),
+        runner: async () => {
+          calls += 1;
+          return { ok: false, output, exitCode: 1 };
+        },
+      });
 
-    expect(calls).toBe(1);
-    expect(results[0].output).toContain("Test timed out in 5000ms.");
-    expect(results[0].output).not.toContain("AssertionError");
-    expect(results[0]).toMatchObject({ ok: false, attempt: 1, failureClass: "test_failure" });
-  });
+      expect(calls).toBe(1);
+      expect(results[0].output).toContain("Test timed out in 5000ms.");
+      // Normally prioritized evidence now preserves the assertion. Even if more
+      // authoritative verdicts overflow the report budget, it must not be retried.
+      if (overflow) expect(results[0].output).not.toContain("AssertionError");
+      else expect(results[0].output).toContain("AssertionError");
+      expect(results[0]).toMatchObject({ ok: false, attempt: 1, failureClass: "test_failure" });
+    },
+  );
 
   test("redacts credentials from progress logs without changing the executed command", async () => {
     const lines: string[] = [];

@@ -72,9 +72,13 @@ const phases: HarnessPhase[] = [
       "tests/source-control-manager.completion-callback.test.ts",
       "tests/source-control-manager.completion-gc.test.ts",
       "tests/source-control-manager.completion-lease.test.ts",
+      "tests/source-control-manager.github-pr.test.ts",
+      "tests/source-control-manager.http.test.ts",
       "tests/source-control-manager.integration-maintenance.test.ts",
       "tests/source-control-manager.publication-recovery.test.ts",
       "tests/source-control-manager.review-agent.test.ts",
+      "tests/source-control-manager.review-journal.test.ts",
+      "tests/source-control-manager.runtime-helpers.test.ts",
       "tests/source-control-manager.validation-repair-publication.test.ts",
       "tests/workerpals.review-fix-branch.test.ts",
       "tests/workerpals.worktree-base-ref.test.ts",
@@ -84,6 +88,8 @@ const phases: HarnessPhase[] = [
   {
     name: "quality_loop",
     files: [
+      "tests/shared.repo-test-runner.test.ts",
+      "tests/shared.repo-validation.test.ts",
       "tests/workerpals.execute-job-clarification.test.ts",
       "tests/workerpals.quality-gate-issues.test.ts",
       "tests/workerpals.quality-loop-durability.test.ts",

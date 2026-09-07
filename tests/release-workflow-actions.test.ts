@@ -23,6 +23,11 @@ describe("release workflow action runtimes", () => {
       expect(step).toContain("bun test");
       expect(step).toContain("tests/workerpals.executor-timeout-recovery.test.ts");
       expect(step).toContain("tests/source-control-manager.trusted-validation.test.ts");
+      expect(step).toContain("tests/source-control-manager.http.test.ts");
+      expect(step).toContain("tests/source-control-manager.runtime-helpers.test.ts");
+      expect(step).toContain("tests/source-control-manager.review-agent.test.ts");
+      expect(step).toContain("tests/source-control-manager.review-journal.test.ts");
+      expect(step).toContain("tests/source-control-manager.github-pr.test.ts");
     },
   );
 

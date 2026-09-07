@@ -3,6 +3,7 @@ import {
   ensureIntegrationPullRequest,
   listOpenPullRequests,
   listRecentlyClosedPullRequests,
+  mergePullRequest,
   type GitHubPR,
   type PullRequestScanCursor,
 } from "../apps/source_control_manager/src/github_pr";
@@ -39,6 +40,81 @@ function closedPr(overrides: Partial<GitHubPR> = {}): GitHubPR {
 }
 
 describe("source control manager GitHub PR provider", () => {
+  test("atomically pins a PR merge to the reviewed provider head", async () => {
+    const expectedHeadSha = "a".repeat(40);
+    const result = await mergePullRequest({
+      token: "provider-token",
+      remoteUrl: "https://github.com/org/repo.git",
+      prNumber: 42,
+      mergeMethod: "squash",
+      commitTitle: "Reviewed improvement",
+      commitMessage: "Validation and review evidence",
+      expectedHeadSha,
+      fetchImpl: async (input, init) => {
+        expect(String(input)).toBe("https://api.github.com/repos/org/repo/pulls/42/merge");
+        expect(init?.method).toBe("PUT");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          merge_method: "squash",
+          commit_title: "Reviewed improvement",
+          commit_message: "Validation and review evidence",
+          sha: expectedHeadSha,
+        });
+        return Response.json({ merged: true, sha: "merged-sha", message: "merged" });
+      },
+    });
+    expect(result.merged).toBe(true);
+  });
+
+  test("does not retry a changed-head conflict as an unpinned merge", async () => {
+    let requests = 0;
+    await expect(
+      mergePullRequest({
+        token: "provider-token",
+        remoteUrl: "https://github.com/org/repo.git",
+        prNumber: 42,
+        expectedHeadSha: "b".repeat(40),
+        fetchImpl: async (_input, init) => {
+          requests += 1;
+          expect(JSON.parse(String(init?.body)).sha).toBe("b".repeat(40));
+          return Response.json(
+            { message: "Head branch was modified. Review and try the merge again." },
+            { status: 409 },
+          );
+        },
+      }),
+    ).rejects.toThrow("GitHub API 409");
+    expect(requests).toBe(1);
+  });
+
+  test("rejects an explicitly empty expected head rather than silently disabling the merge lease", async () => {
+    let requests = 0;
+    await expect(
+      mergePullRequest({
+        token: "provider-token",
+        remoteUrl: "https://github.com/org/repo.git",
+        prNumber: 42,
+        expectedHeadSha: "  ",
+        fetchImpl: async () => {
+          requests += 1;
+          return Response.json({ merged: true, sha: "unexpected", message: "unexpected" });
+        },
+      }),
+    ).rejects.toThrow("expectedHeadSha must not be empty");
+    expect(requests).toBe(0);
+  });
+
+  test("keeps the provider helper compatible with callers that do not request head pinning", async () => {
+    await mergePullRequest({
+      token: "provider-token",
+      remoteUrl: "https://github.com/org/repo.git",
+      prNumber: 42,
+      fetchImpl: async (_input, init) => {
+        expect(JSON.parse(String(init?.body))).toEqual({ merge_method: "squash" });
+        return Response.json({ merged: true, sha: "legacy-merge", message: "merged" });
+      },
+    });
+  });
+
   test("reuses only a same-repository integration PR when a fork result appears first", async () => {
     const fork = closedPr({
       number: 21,

@@ -25,6 +25,8 @@ describe("reliability harness release coverage", () => {
     expect(files).toContain("tests/workerpals.docker-deadline.test.ts");
     expect(files).toContain("tests/workerpals.commit-message-generation.test.ts");
     expect(files).toContain("tests/workerpals.validation-command-safety.test.ts");
+    expect(files).toContain("tests/shared.repo-test-runner.test.ts");
+    expect(files).toContain("tests/shared.repo-validation.test.ts");
     expect(watchdogFiles).toContain(
       "apps/workerpals/src/backends/openai_codex/test_openai_codex_runtime_config.py",
     );
@@ -43,10 +45,23 @@ describe("reliability harness release coverage", () => {
     const runtimeFiles = listReliabilityHarnessPhaseFiles("runtime_boundary");
 
     expect(repairFiles).toContain("tests/source-control-manager.review-agent.test.ts");
+    expect(repairFiles).toContain("tests/source-control-manager.review-journal.test.ts");
+    expect(repairFiles).toContain("tests/source-control-manager.github-pr.test.ts");
     expect(runtimeFiles).toContain("tests/shared.scm-repair-authority.test.ts");
     expect(runtimeFiles).toContain("tests/cli.runtime-bootstrap.test.ts");
     expect(runtimeFiles).toContain("tests/remotebuddy.llm-codex.test.ts");
     expect(runtimeFiles).toContain("tests/workerpals.sandbox-env.test.ts");
+  });
+
+  test("gates publication liveness under real validation subprocesses and watchdog semantics", () => {
+    const repairFiles = listReliabilityHarnessPhaseFiles("repair_orchestration");
+    const evidenceFiles = listReliabilityHarnessPhaseFiles("failure_evidence");
+
+    expect(repairFiles).toContain("tests/source-control-manager.http.test.ts");
+    expect(repairFiles).toContain("tests/source-control-manager.runtime-helpers.test.ts");
+    expect(repairFiles).toContain("tests/source-control-manager.completion-lease.test.ts");
+    expect(evidenceFiles).toContain("tests/source-control-manager.trusted-validation.test.ts");
+    expect(evidenceFiles).toContain("tests/shared.trusted-validation-evidence.test.ts");
   });
 
   test("gates durable runtime-circuit and claim-generation recovery behavior", () => {

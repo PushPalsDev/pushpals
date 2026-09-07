@@ -1246,6 +1246,46 @@ function prNumberFromReviewUrl(value: string): number | null {
   }
 }
 
+function legacyReviewRepairRepositoryIdentity(prUrl: string, prNumber: number | null): string {
+  // Historical lifecycle rows are durable scheduling evidence, not permission
+  // to execute a new repair. Recover only an unambiguous repository identity;
+  // never manufacture missing PR numbers, rewrite lifecycle keys, or trust
+  // caller-supplied job parameters as migration authority.
+  try {
+    const parsed = new URL(prUrl);
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password ||
+      parsed.port ||
+      parsed.search ||
+      parsed.hash ||
+      /[\\\u0000-\u0020\u007f]/.test(prUrl) ||
+      prUrl.replace(/\/+$/, "").toLowerCase() !==
+        parsed.toString().replace(/\/+$/, "").toLowerCase()
+    ) {
+      return "";
+    }
+    const match = parsed.pathname
+      .replace(/\/+$/, "")
+      .match(
+        /^\/((?:[a-z0-9._~-]+\/)+[a-z0-9._~-]+)(?:\/pull\/|\/-\/merge_requests\/)([1-9]\d*)$/i,
+      );
+    if (
+      !match ||
+      !Number.isSafeInteger(prNumber) ||
+      prNumber !== Number(match[2]) ||
+      match[1].split("/").some((part) => part === "." || part === "..")
+    ) {
+      return "";
+    }
+    return `${parsed.hostname}/${match[1]}`.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
 function reviewRepairIntent(params: Record<string, unknown>): boolean {
   const reviewAgent = params.reviewAgent;
   if (!reviewAgent || typeof reviewAgent !== "object" || Array.isArray(reviewAgent)) return false;
@@ -1408,7 +1448,6 @@ export class JobQueue {
       );
       CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_status_retry
         ON pr_repair_lifecycle(status, nextRetryAt, updatedAt);
-
       CREATE TABLE IF NOT EXISTS pr_repair_capabilities (
         capabilityKey      TEXT PRIMARY KEY,
         repositoryIdentity TEXT NOT NULL,
@@ -1636,6 +1675,9 @@ export class JobQueue {
         `ALTER TABLE pr_repair_lifecycle ADD COLUMN repositoryIdentity TEXT NOT NULL DEFAULT '';`,
       );
     }
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_exact_head
+      ON pr_repair_lifecycle(repositoryIdentity, prNumber, headSha, baseSha);`);
+    this.backfillReviewRepairRepositoryIdentities();
 
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{ name: string }>;
     if (!jobColumns.some((col) => col.name === "targetWorkerId")) {
@@ -2059,6 +2101,29 @@ export class JobQueue {
         )
       WHERE 1 = 1;
     `);
+  }
+
+  private backfillReviewRepairRepositoryIdentities(): void {
+    const page = this.db.query(`SELECT rowid AS cursor, prUrlNormalized, prNumber
+      FROM pr_repair_lifecycle
+      WHERE rowid > ? AND TRIM(repositoryIdentity) = ''
+      ORDER BY rowid ASC LIMIT 200`);
+    const update = this.db.query(`UPDATE pr_repair_lifecycle SET repositoryIdentity = ?
+      WHERE rowid = ? AND TRIM(repositoryIdentity) = ''`);
+    const migratePage = this.db.transaction((cursor: number): number | null => {
+      const rows = page.all(cursor) as Array<{
+        cursor: number;
+        prUrlNormalized: string;
+        prNumber: number | null;
+      }>;
+      for (const row of rows) {
+        const repository = legacyReviewRepairRepositoryIdentity(row.prUrlNormalized, row.prNumber);
+        if (repository) update.run(repository, row.cursor);
+      }
+      return rows.length > 0 ? rows[rows.length - 1].cursor : null;
+    });
+    let cursor: number | null = 0;
+    while (cursor !== null) cursor = migratePage(cursor);
   }
 
   authorizeReviewRepairCapability(
@@ -2564,6 +2629,72 @@ export class JobQueue {
     };
   }
 
+  getReviewRepairLifecycleState(input: {
+    repositoryIdentity: string;
+    prNumber: number;
+    headSha: string;
+    baseSha: string;
+  }): {
+    state: "none" | "active" | "exhausted" | "settled";
+    activeJobId: string | null;
+    detail: string;
+  } {
+    const repository = normalizeReviewRepairRepositoryIdentity(input.repositoryIdentity);
+    const head = input.headSha.trim().toLowerCase();
+    const base = input.baseSha.trim().toLowerCase();
+    if (
+      !repository ||
+      !Number.isSafeInteger(input.prNumber) ||
+      input.prNumber <= 0 ||
+      !head ||
+      !base ||
+      head.length > 128 ||
+      base.length > 128
+    ) {
+      throw new Error("Invalid exact review lifecycle lookup");
+    }
+    // Active repairs own the head even when the base moves. Terminal history
+    // applies only to its exact head/base; a new base is a distinct lifecycle.
+    const rows = this.db
+      .query(
+        `SELECT status, activeJobId, baseSha, lastError FROM pr_repair_lifecycle
+       WHERE repositoryIdentity = ? AND prNumber = ? AND headSha = ?
+         AND (baseSha = ? OR status NOT IN ('succeeded', 'exhausted'))
+       LIMIT 101`,
+      )
+      .all(repository, input.prNumber, head, base) as Array<{
+      status: string;
+      activeJobId: string | null;
+      baseSha: string;
+      lastError: string | null;
+    }>;
+    if (rows.length > 100)
+      throw new Error("Exact review lifecycle lookup exceeded its safety bound");
+    const active = rows.find((row) => !["succeeded", "exhausted"].includes(row.status));
+    if (active)
+      return {
+        state: "active",
+        activeJobId: active.activeJobId,
+        detail: "A durable repair lifecycle still owns this PR head.",
+      };
+    const exhausted = rows.find((row) => row.status === "exhausted");
+    if (exhausted)
+      return {
+        state: "exhausted",
+        activeJobId: null,
+        detail: String(
+          exhausted.lastError || "Exact PR revision repair attempts are exhausted.",
+        ).slice(0, 2000),
+      };
+    if (rows.some((row) => row.status === "succeeded"))
+      return {
+        state: "settled",
+        activeJobId: null,
+        detail: "Exact PR revision repair lifecycle already succeeded.",
+      };
+    return { state: "none", activeJobId: null, detail: "" };
+  }
+
   reviewRepairAdmission(body: Record<string, unknown>): ReviewRepairAdmission {
     const params =
       body.params && typeof body.params === "object" && !Array.isArray(body.params)
@@ -2597,11 +2728,23 @@ export class JobQueue {
         `SELECT status, sourceJobId, activeJobId
          FROM pr_repair_lifecycle
          WHERE lifecycleKey = ?
+            OR (status IN ('succeeded', 'exhausted')
+                AND repositoryIdentity = ?
+                AND prNumber = ? AND headSha = ? AND baseSha = ? AND resolutionType = ?)
+         ORDER BY CASE status WHEN 'exhausted' THEN 0 WHEN 'succeeded' THEN 1 ELSE 2 END
          LIMIT 1`,
       )
-      .get(context.lifecycleKey) as
-      | { status: string; sourceJobId: string | null; activeJobId: string | null }
-      | undefined;
+      // Older keys omitted repository identity (and sometimes the base).
+      // Their exact terminal tuple can deny duplicate work, but never grant
+      // elevated execution authority or rearm a historical active lifecycle.
+      .get(
+        context.lifecycleKey,
+        context.repositoryIdentity,
+        context.prNumber,
+        context.headSha,
+        context.baseSha,
+        context.resolutionType,
+      ) as { status: string; sourceJobId: string | null; activeJobId: string | null } | undefined;
     if (lifecycle?.status === "exhausted") {
       return {
         requested: true,

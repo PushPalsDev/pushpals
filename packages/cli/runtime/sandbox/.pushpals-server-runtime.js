@@ -12307,6 +12307,26 @@ var ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 var TEST_DURATION_SUFFIX_RE = /\s+\[(?:\d+(?:\.\d+)?)(?:ms|s)\]\s*$/i;
 var FAILURE_LINE_RE = /(?:^|\s)(?:error|fail(?:ed|ure)?|fatal|panic|panicked|timed?\s*out|timeout|expected|received|assert(?:ion|ionerror)?)(?:\b|:)/i;
 var PASS_LINE_RE = /^(?:\(pass\)|PASS\b|\u2713\s|\u2714\s|Tests?\s+\d+\s+passed\b)/i;
+var COMPILER_ERROR_LINE_RE = /^(?:.+?(?:\((?:\d+|<line>),(?:\d+|<column>)\):|:(?:\d+|<line>):(?:\d+|<column>)\s+-)\s+error\b|error\s+TS\d+:)/i;
+function failureLinePriority(value) {
+  const line = value.replace(ANSI_ESCAPE_RE, "").trim();
+  if (!line || PASS_LINE_RE.test(line) || /^(?:stdout|stderr)\s*\|\s*.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?\s*>/i.test(line) || /^(?:\(skip\)|0\s+(?:tests?\s+failed|fail(?:ed|ures?)?|errors?)\b)/i.test(line))
+    return -1;
+  if (/^(?:\(fail\)|FAIL(?:ED)?\s|[\u2715\u2717\u25cf]\s|---\s+FAIL:|thread\s+['"]|test\s+.+\s+\.\.\.\s+FAILED)/i.test(line))
+    return 4;
+  if (COMPILER_ERROR_LINE_RE.test(line) || /^(?:[\w.]*Error:|error(?:\[[^\]]+\])?:|fatal:|panic:|Expected\b|Received\b|Actual\b|assertion\s+failed\b)/i.test(line))
+    return 3;
+  if (/^(?:\d+\s+tests?\s+failed|Test(?:s| Files)?\s+.*\bfailed\b)|\b(?:Test timed out|test timed out|test timeout of)\b/i.test(line))
+    return 2;
+  if (/^[{[]/.test(line))
+    return 0;
+  return FAILURE_LINE_RE.test(line) ? 1 : 0;
+}
+function prioritizeTrustedValidationFailureLines(values, maxItems = 20) {
+  const lines = uniqueSorted(values.map(normalizeFailureLine)).filter((line) => failureLinePriority(line) >= 0);
+  const hasDiagnostic = lines.some((line) => failureLinePriority(line) >= 2);
+  return lines.filter((line) => !hasDiagnostic || failureLinePriority(line) > 0).sort((a, b) => failureLinePriority(b) - failureLinePriority(a) || a.localeCompare(b)).slice(0, maxItems);
+}
 function uniqueSorted(values) {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
@@ -12333,22 +12353,31 @@ function extractTrustedValidationFailureEvidence(options) {
   const targetPathHints = [];
   const failureLines = [];
   let currentTestPath = null;
+  let inBunFailureSummary = false;
+  const namedTestPaths = new Map;
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line)
       continue;
+    if (/^\d+\s+tests?\s+failed:\s*$/i.test(line)) {
+      currentTestPath = null;
+      inBunFailureSummary = true;
+    }
     const bunPath = line.match(/^(.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?):\s*$/i)?.[1];
     const suitePath = line.match(/^(?:FAIL|failed)\s+(.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?)(?:\s|$)/i)?.[1];
-    const diagnosticPath = line.match(/^([^:(]+\.[cm]?[jt]sx?)\(\d+,\d+\):\s+error\b/i)?.[1];
+    const diagnosticPath = line.match(/^(.+?\.[cm]?[jt]sx?)(?:\(\d+,\d+\):|:\d+:\d+\s+-)\s+error\b/i)?.[1];
     const pytestFailure = line.match(/^FAILED\s+(.+?\.py)::([^\s]+)(?:\s+-\s+|$)/i);
     const portableDiagnosticPath = line.match(/^(.+?\.(?:py|go|rs)):\d+(?::\d+)?:/i)?.[1];
     const cargoPanic = line.match(/^thread\s+['"]([^'"]+)['"]\s+panicked\s+at\s+(.+?\.rs):\d+(?::\d+)?:/i);
     const bunContextPath = normalizeEvidencePath(bunPath ?? "");
-    if (bunContextPath)
+    if (bunContextPath) {
       currentTestPath = bunContextPath;
+      inBunFailureSummary = false;
+    }
     const failingPath = normalizeEvidencePath(suitePath ?? pytestFailure?.[1] ?? cargoPanic?.[2] ?? diagnosticPath ?? portableDiagnosticPath ?? "");
     if (failingPath) {
       currentTestPath = failingPath;
+      inBunFailureSummary = false;
       targetPathHints.push(failingPath);
     }
     const bunFailure = line.match(/^\(fail\)\s+(.+)$/i)?.[1];
@@ -12361,13 +12390,18 @@ function extractTrustedValidationFailureEvidence(options) {
     const namedFailure = (bunFailure ?? jestFailure ?? vitestFailure ?? jestSuiteFailure ?? pytestFailure?.[2] ?? goFailure ?? cargoStdoutFailure ?? cargoTestFailure ?? cargoPanic?.[1] ?? "").replace(TEST_DURATION_SUFFIX_RE, "").trim();
     if (namedFailure) {
       failedTests.push(namedFailure);
-      if (currentTestPath)
-        targetPathHints.push(currentTestPath);
+      const knownPaths = namedTestPaths.get(namedFailure) ?? new Set;
+      if (!inBunFailureSummary && currentTestPath) {
+        knownPaths.add(currentTestPath);
+        namedTestPaths.set(namedFailure, knownPaths);
+      }
+      targetPathHints.push(...knownPaths);
     }
-    if (!PASS_LINE_RE.test(line) && (Boolean(namedFailure) || Boolean(failingPath) || FAILURE_LINE_RE.test(line))) {
+    if (failureLinePriority(line) >= 0 && (Boolean(namedFailure) || Boolean(failingPath) || FAILURE_LINE_RE.test(line))) {
       failureLines.push(normalizeFailureLine(line));
     }
   }
+  const prioritizedFailureLines = prioritizeTrustedValidationFailureLines(failureLines);
   let failureClass;
   if (options.phase === "dependency_install") {
     failureClass = "dependency_setup_failed";
@@ -12375,7 +12409,9 @@ function extractTrustedValidationFailureEvidence(options) {
     failureClass = "timeout";
   } else if (failedTests.length > 0) {
     failureClass = "test_failure";
-  } else if (/timed?\s*out|timeout/i.test(output)) {
+  } else if (prioritizedFailureLines.some((line) => COMPILER_ERROR_LINE_RE.test(line))) {
+    failureClass = "typecheck_failure";
+  } else if (prioritizedFailureLines.some((line) => /timed?\s*out|timeout/i.test(line))) {
     failureClass = "timeout";
   } else if (/(?:^|\s)(?:test|pytest|jest|vitest)(?:\s|$)/i.test(command)) {
     failureClass = "test_failure";
@@ -12390,7 +12426,7 @@ function extractTrustedValidationFailureEvidence(options) {
     failureClass,
     failedTests: uniqueSorted(failedTests),
     targetPathHints: uniqueSorted(targetPathHints),
-    failureLines: uniqueSorted(failureLines).slice(0, 20)
+    failureLines: prioritizedFailureLines
   };
 }
 function isSafeRelativeValidationPath(value, allowDot = false) {
@@ -13322,6 +13358,21 @@ function prNumberFromReviewUrl(value) {
     return null;
   }
 }
+function legacyReviewRepairRepositoryIdentity(prUrl, prNumber) {
+  try {
+    const parsed = new URL(prUrl);
+    if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash || /[\\\u0000-\u0020\u007f]/.test(prUrl) || prUrl.replace(/\/+$/, "").toLowerCase() !== parsed.toString().replace(/\/+$/, "").toLowerCase()) {
+      return "";
+    }
+    const match = parsed.pathname.replace(/\/+$/, "").match(/^\/((?:[a-z0-9._~-]+\/)+[a-z0-9._~-]+)(?:\/pull\/|\/-\/merge_requests\/)([1-9]\d*)$/i);
+    if (!match || !Number.isSafeInteger(prNumber) || prNumber !== Number(match[2]) || match[1].split("/").some((part) => part === "." || part === "..")) {
+      return "";
+    }
+    return `${parsed.hostname}/${match[1]}`.toLowerCase();
+  } catch {
+    return "";
+  }
+}
 function reviewRepairIntent(params) {
   const reviewAgent = params.reviewAgent;
   if (!reviewAgent || typeof reviewAgent !== "object" || Array.isArray(reviewAgent))
@@ -13453,7 +13504,6 @@ class JobQueue {
       );
       CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_status_retry
         ON pr_repair_lifecycle(status, nextRetryAt, updatedAt);
-
       CREATE TABLE IF NOT EXISTS pr_repair_capabilities (
         capabilityKey      TEXT PRIMARY KEY,
         repositoryIdentity TEXT NOT NULL,
@@ -13676,6 +13726,9 @@ class JobQueue {
     if (!repairLifecycleColumns.some((column) => column.name === "repositoryIdentity")) {
       this.db.exec(`ALTER TABLE pr_repair_lifecycle ADD COLUMN repositoryIdentity TEXT NOT NULL DEFAULT '';`);
     }
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_exact_head
+      ON pr_repair_lifecycle(repositoryIdentity, prNumber, headSha, baseSha);`);
+    this.backfillReviewRepairRepositoryIdentities();
     const jobColumns = this.db.prepare(`PRAGMA table_info(jobs)`).all();
     if (!jobColumns.some((col) => col.name === "targetWorkerId")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN targetWorkerId TEXT;`);
@@ -13985,6 +14038,26 @@ class JobQueue {
       WHERE 1 = 1;
     `);
   }
+  backfillReviewRepairRepositoryIdentities() {
+    const page = this.db.query(`SELECT rowid AS cursor, prUrlNormalized, prNumber
+      FROM pr_repair_lifecycle
+      WHERE rowid > ? AND TRIM(repositoryIdentity) = ''
+      ORDER BY rowid ASC LIMIT 200`);
+    const update = this.db.query(`UPDATE pr_repair_lifecycle SET repositoryIdentity = ?
+      WHERE rowid = ? AND TRIM(repositoryIdentity) = ''`);
+    const migratePage = this.db.transaction((cursor2) => {
+      const rows = page.all(cursor2);
+      for (const row of rows) {
+        const repository = legacyReviewRepairRepositoryIdentity(row.prUrlNormalized, row.prNumber);
+        if (repository)
+          update.run(repository, row.cursor);
+      }
+      return rows.length > 0 ? rows[rows.length - 1].cursor : null;
+    });
+    let cursor = 0;
+    while (cursor !== null)
+      cursor = migratePage(cursor);
+  }
   authorizeReviewRepairCapability(body, issuedBy = "source_control_manager", now = new Date().toISOString()) {
     const params = body.params && typeof body.params === "object" && !Array.isArray(body.params) ? body.params : {};
     const context = extractReviewRepairContext(params, resolveJobPrUrl(body, params), body.repositoryIdentity ?? body.repository_identity);
@@ -14281,6 +14354,41 @@ class JobQueue {
       exhausted: Math.max(0, Math.floor(Number(exhausted?.count ?? 0)))
     };
   }
+  getReviewRepairLifecycleState(input) {
+    const repository = normalizeReviewRepairRepositoryIdentity(input.repositoryIdentity);
+    const head = input.headSha.trim().toLowerCase();
+    const base = input.baseSha.trim().toLowerCase();
+    if (!repository || !Number.isSafeInteger(input.prNumber) || input.prNumber <= 0 || !head || !base || head.length > 128 || base.length > 128) {
+      throw new Error("Invalid exact review lifecycle lookup");
+    }
+    const rows = this.db.query(`SELECT status, activeJobId, baseSha, lastError FROM pr_repair_lifecycle
+       WHERE repositoryIdentity = ? AND prNumber = ? AND headSha = ?
+         AND (baseSha = ? OR status NOT IN ('succeeded', 'exhausted'))
+       LIMIT 101`).all(repository, input.prNumber, head, base);
+    if (rows.length > 100)
+      throw new Error("Exact review lifecycle lookup exceeded its safety bound");
+    const active = rows.find((row) => !["succeeded", "exhausted"].includes(row.status));
+    if (active)
+      return {
+        state: "active",
+        activeJobId: active.activeJobId,
+        detail: "A durable repair lifecycle still owns this PR head."
+      };
+    const exhausted = rows.find((row) => row.status === "exhausted");
+    if (exhausted)
+      return {
+        state: "exhausted",
+        activeJobId: null,
+        detail: String(exhausted.lastError || "Exact PR revision repair attempts are exhausted.").slice(0, 2000)
+      };
+    if (rows.some((row) => row.status === "succeeded"))
+      return {
+        state: "settled",
+        activeJobId: null,
+        detail: "Exact PR revision repair lifecycle already succeeded."
+      };
+    return { state: "none", activeJobId: null, detail: "" };
+  }
   reviewRepairAdmission(body) {
     const params = body.params && typeof body.params === "object" && !Array.isArray(body.params) ? body.params : {};
     const requested = reviewRepairIntent(params);
@@ -14301,7 +14409,11 @@ class JobQueue {
     const lifecycle = this.db.prepare(`SELECT status, sourceJobId, activeJobId
          FROM pr_repair_lifecycle
          WHERE lifecycleKey = ?
-         LIMIT 1`).get(context.lifecycleKey);
+            OR (status IN ('succeeded', 'exhausted')
+                AND repositoryIdentity = ?
+                AND prNumber = ? AND headSha = ? AND baseSha = ? AND resolutionType = ?)
+         ORDER BY CASE status WHEN 'exhausted' THEN 0 WHEN 'succeeded' THEN 1 ELSE 2 END
+         LIMIT 1`).get(context.lifecycleKey, context.repositoryIdentity, context.prNumber, context.headSha, context.baseSha, context.resolutionType);
     if (lifecycle?.status === "exhausted") {
       return {
         requested: true,
@@ -18494,6 +18606,22 @@ function trustedValidationStringArray(value, maxItems = 20) {
     ...new Set(value.map((entry) => trustedValidationText(entry, 1000)).filter(Boolean).slice(0, maxItems))
   ].sort((a, b) => a.localeCompare(b));
 }
+function trustedValidationFailureLines(value) {
+  if (!Array.isArray(value))
+    return [];
+  return prioritizeTrustedValidationFailureLines(value.map((entry) => trustedValidationText(entry, 1000)).filter(Boolean));
+}
+function trustedValidationOutputTail(output, maxChars = 8000) {
+  if (output.length <= maxChars)
+    return output;
+  const start = output.length - maxChars;
+  if (output[start - 1] === `
+`)
+    return output.slice(start);
+  const nextLine = output.indexOf(`
+`, start);
+  return nextLine < 0 ? "[oversized trailing line omitted; see structured failure evidence]" : output.slice(nextLine + 1);
+}
 function normalizeTrustedValidationReport(value) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
@@ -18515,7 +18643,7 @@ function normalizeTrustedValidationReport(value) {
     const evidence = extractTrustedValidationFailureEvidence({ command, phase, output, exitCode });
     const providedFailedTests = trustedValidationStringArray(result.failedTests);
     const providedPathHints = trustedValidationStringArray(result.targetPathHints);
-    const providedFailureLines = trustedValidationStringArray(result.failureLines);
+    const providedFailureLines = trustedValidationFailureLines(result.failureLines);
     const failedTests = trustedValidationStringArray([
       ...providedFailedTests,
       ...evidence.failedTests
@@ -18524,7 +18652,7 @@ function normalizeTrustedValidationReport(value) {
       ...providedPathHints,
       ...evidence.targetPathHints
     ]);
-    const failureLines = trustedValidationStringArray([
+    const failureLines = trustedValidationFailureLines([
       ...providedFailureLines,
       ...evidence.failureLines
     ]);
@@ -18560,7 +18688,7 @@ function normalizeTrustedValidationReport(value) {
   };
 }
 function trustedValidationFailureFingerprint(result) {
-  const failureLines = trustedValidationStringArray(result.failureLines).map(normalizeTrustedValidationFingerprintLine);
+  const failureLines = trustedValidationFailureLines(result.failureLines).map(normalizeTrustedValidationFingerprintLine);
   const fallback = result.output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").split(/\r?\n/).map(normalizeTrustedValidationFingerprintLine).filter((line) => /\b(?:error|fail|failed|failure|timeout)\b/i.test(line)).slice(0, 4);
   return createHash6("sha256").update(JSON.stringify({
     command: result.command.trim().replace(/\s+/g, " ").toLowerCase(),
@@ -19467,9 +19595,9 @@ class CompletionQueue {
       }
       const failedTests = trustedValidationStringArray(result.failedTests);
       const targetPathHints = trustedValidationStringArray(result.targetPathHints);
-      const failureLines = trustedValidationStringArray(result.failureLines);
+      const failureLines = trustedValidationFailureLines(result.failureLines);
       const failureFingerprint2 = result.ok ? null : trustedValidationFailureFingerprint(result);
-      insert.run(completion.jobId, result.command, result.exitCode, result.durationMs, result.ok ? 1 : 0, result.ok ? null : result.failureClass ?? "trusted_validation_failed", result.output.slice(-8000), JSON.stringify({
+      insert.run(completion.jobId, result.command, result.exitCode, result.durationMs, result.ok ? 1 : 0, result.ok ? null : result.failureClass ?? "trusted_validation_failed", trustedValidationOutputTail(result.output), JSON.stringify({
         source: "trusted_host",
         completionId: completion.id,
         phase: result.phase,
@@ -20235,7 +20363,7 @@ ${asString3(params.stdoutTail)}`;
   });
   const failedTests = normalizedValidationEvidenceValues([...asStringArray3(metadata.failedTests), ...derived.failedTests], 20);
   const targetPathHints = normalizedValidationEvidenceValues([...asStringArray3(metadata.targetPathHints), ...derived.targetPathHints], 20);
-  let failureLines = normalizedValidationEvidenceValues([...asStringArray3(metadata.failureLines), ...derived.failureLines], 20);
+  let failureLines = prioritizeTrustedValidationFailureLines([...asStringArray3(metadata.failureLines), ...derived.failureLines], 20);
   if (failureLines.length === 0) {
     failureLines = normalizedValidationEvidenceValues(output.split(/\r?\n/).filter((line) => /\b(?:error|fail|failed|failure|fatal|panic|timeout)\b/i.test(line)), 4);
   }
@@ -22526,7 +22654,7 @@ unknown-candidate`;
     const selected = activeGroups[0];
     if (!selected?.lastFailure)
       return null;
-    const structuredFailureLines = [...selected.failureLines].slice(0, 12);
+    const structuredFailureLines = prioritizeTrustedValidationFailureLines([...selected.failureLines], 12);
     const sample = truncateText(structuredFailureLines.join(`
 `) || asString3(selected.lastFailure.stderrTail) || asString3(selected.lastFailure.stdoutTail), 900);
     const failureClass = asString3(selected.lastFailure.failureClass) || null;
@@ -30953,6 +31081,30 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           });
         }
         return makeJson(result, 200);
+      }
+      if (pathname === "/jobs/review-repair-lifecycle" && method === "GET") {
+        const denied = requireAuth();
+        if (denied)
+          return denied;
+        const repositoryIdentity = String(url.searchParams.get("repositoryIdentity") ?? "").trim();
+        const prNumber = Number(url.searchParams.get("prNumber"));
+        const headSha = String(url.searchParams.get("headSha") ?? "").trim();
+        const baseSha = String(url.searchParams.get("baseSha") ?? "").trim();
+        if (!repositoryIdentity || !Number.isSafeInteger(prNumber) || prNumber <= 0 || !headSha || !baseSha || headSha.length > 128 || baseSha.length > 128) {
+          return makeJson({ ok: false, message: "Invalid exact review lifecycle lookup" }, 400);
+        }
+        try {
+          const lifecycle = jobQueue.getReviewRepairLifecycleState({
+            repositoryIdentity,
+            prNumber,
+            headSha,
+            baseSha
+          });
+          return makeJson({ ok: true, ...lifecycle });
+        } catch (error) {
+          console.error("[Server] Exact review lifecycle lookup failed", error);
+          return makeJson({ ok: false, message: "Review lifecycle authority unavailable" }, 503);
+        }
       }
       if (pathname === "/jobs/pr-links" && method === "GET") {
         const denied = requireAuth();

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import type { ReviewJournal, ReviewJournalEntry } from "./review_journal";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -28,7 +29,7 @@ export interface SeenBranch {
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-export class MergeQueueDB {
+export class MergeQueueDB implements ReviewJournal {
   private db: Database;
 
   constructor(dbPath: string) {
@@ -72,6 +73,17 @@ export class MergeQueueDB {
         PRIMARY KEY(remote, branch)
       );
 
+      CREATE TABLE IF NOT EXISTS review_decisions (
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        revision TEXT NOT NULL,
+        verdict_json TEXT,
+        finalized INTEGER NOT NULL DEFAULT 0,
+        repair_enqueues INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(repository, pr_number, revision)
+      );
+
       CREATE TABLE IF NOT EXISTS job_logs (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
         job_id  INTEGER NOT NULL,
@@ -90,6 +102,56 @@ export class MergeQueueDB {
       .prepare(`SELECT last_seen_sha FROM seen WHERE remote = ? AND branch = ?`)
       .get(remote, branch) as { last_seen_sha: string } | undefined;
     return row?.last_seen_sha ?? null;
+  }
+
+  getReviewDecision(
+    repository: string,
+    prNumber: number,
+    revision: string,
+  ): ReviewJournalEntry | null {
+    const row = this.db
+      .query(
+        `SELECT verdict_json AS verdictJson, finalized, repair_enqueues AS repairEnqueues
+       FROM review_decisions WHERE repository = ? AND pr_number = ? AND revision = ?`,
+      )
+      .get(repository, prNumber, revision) as
+      | (Omit<ReviewJournalEntry, "finalized"> & { finalized: number })
+      | null;
+    return row ? { ...row, finalized: row.finalized === 1 } : null;
+  }
+
+  saveReviewDecision(
+    repository: string,
+    prNumber: number,
+    revision: string,
+    entry: ReviewJournalEntry,
+  ): void {
+    this.db
+      .query(
+        `INSERT INTO review_decisions(repository, pr_number, revision, verdict_json, finalized, repair_enqueues, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(repository, pr_number, revision) DO UPDATE SET
+         verdict_json = excluded.verdict_json, finalized = excluded.finalized,
+         repair_enqueues = excluded.repair_enqueues, updated_at = excluded.updated_at`,
+      )
+      .run(
+        repository,
+        prNumber,
+        revision,
+        entry.verdictJson,
+        entry.finalized ? 1 : 0,
+        entry.repairEnqueues,
+        new Date().toISOString(),
+      );
+  }
+
+  getReviewRepairEnqueueCount(repository: string, prNumber: number): number {
+    const row = this.db
+      .query(
+        `SELECT COALESCE(MAX(repair_enqueues), 0) AS count FROM review_decisions WHERE repository = ? AND pr_number = ?`,
+      )
+      .get(repository, prNumber) as { count: number };
+    return row.count;
   }
 
   updateSeen(remote: string, branch: string, sha: string): void {

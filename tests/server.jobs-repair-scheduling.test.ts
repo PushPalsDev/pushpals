@@ -60,7 +60,361 @@ function enqueueAuthorizedReviewRepair(
   return queue.enqueue(authorizedBody, { authorizedElevatedWorkClass: "repair" });
 }
 
+type LegacyRepairLifecycle = {
+  prUrlNormalized?: string;
+  prNumber?: number | null;
+  headSha?: string;
+  baseSha?: string | null;
+  status?: string;
+  activeJobId?: string | null;
+};
+
+function createLegacyRepairLifecycleDatabase(dbPath: string, rows: LegacyRepairLifecycle[]) {
+  const db = new Database(dbPath);
+  try {
+    // This is the actual pre-repositoryIdentity shape, not a new JobQueue
+    // database with its migration column merely overwritten.
+    db.exec(`CREATE TABLE pr_repair_lifecycle (
+      lifecycleKey TEXT PRIMARY KEY,
+      prUrlNormalized TEXT NOT NULL,
+      prNumber INTEGER,
+      headSha TEXT NOT NULL,
+      baseSha TEXT,
+      resolutionType TEXT NOT NULL,
+      sourceJobId TEXT,
+      activeJobId TEXT,
+      status TEXT NOT NULL,
+      attemptCount INTEGER NOT NULL DEFAULT 0,
+      maxAttempts INTEGER NOT NULL DEFAULT 2,
+      nextRetryAt TEXT,
+      lastFailureClass TEXT,
+      lastError TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );`);
+    const insert = db.query(`INSERT INTO pr_repair_lifecycle (
+      lifecycleKey, prUrlNormalized, prNumber, headSha, baseSha, resolutionType,
+      sourceJobId, activeJobId, status, attemptCount, maxAttempts,
+      nextRetryAt, lastFailureClass, lastError, createdAt, updatedAt
+    ) VALUES (?, ?, ?, ?, ?, 'review_fix', 'historical-source', ?, ?, 2, 2,
+      NULL, 'assertion', 'Original validation failure', '2026-01-01T00:00:00.000Z',
+      '2026-01-02T00:00:00.000Z')`);
+    db.transaction(() => {
+      for (const [index, row] of rows.entries()) {
+        const prUrlNormalized = row.prUrlNormalized ?? "https://github.com/example/repo/pull/697";
+        const headSha = row.headSha ?? "abc1234";
+        // Older review-fix keys deliberately omitted the repository identity,
+        // PR number, and base, so their hash differs from the current key.
+        const lifecycleKey = createHash("sha256")
+          .update(
+            JSON.stringify({ prUrlNormalized, headSha, baseSha: "", resolutionType: "review_fix" }),
+          )
+          .digest("hex")
+          .slice(0, 32);
+        insert.run(
+          lifecycleKey,
+          prUrlNormalized,
+          row.prNumber === undefined ? 697 : row.prNumber,
+          headSha,
+          row.baseSha === undefined ? "def5678" : row.baseSha,
+          row.activeJobId === undefined ? `historical-repair-${index}` : row.activeJobId,
+          row.status ?? "exhausted",
+        );
+      }
+    })();
+    return db.query("SELECT * FROM pr_repair_lifecycle ORDER BY lifecycleKey").all();
+  } finally {
+    db.close();
+  }
+}
+
+function removeClosedSqliteFixture(root: string) {
+  // JobQueue uses uncached SQLite statements during startup. On Windows the
+  // native file handle can outlive close() until those statements are collected.
+  Bun.gc(true);
+  rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+}
+
 describe("server JobQueue repair scheduling", () => {
+  test("migrates the real pre-column lifecycle schema before indexing and preserves exhausted history across reopen", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-pre-column-repair-"));
+    const dbPath = join(root, "state.sqlite");
+    const original = createLegacyRepairLifecycleDatabase(dbPath, [{}]);
+    const lookup = {
+      repositoryIdentity: "git@github.com:example/repo.git",
+      prNumber: 697,
+      headSha: "abc1234",
+      baseSha: "def5678",
+    };
+    try {
+      for (let reopen = 0; reopen < 2; reopen += 1) {
+        const queue = new JobQueue(dbPath);
+        try {
+          const db = (queue as unknown as { db: Database }).db;
+          expect(
+            db
+              .query("PRAGMA index_info(idx_pr_repair_lifecycle_exact_head)")
+              .all()
+              .map((row) => (row as { name: string }).name),
+          ).toEqual(["repositoryIdentity", "prNumber", "headSha", "baseSha"]);
+          expect(queue.getReviewRepairLifecycleState(lookup)).toEqual({
+            state: "exhausted",
+            activeJobId: null,
+            detail: "Original validation failure",
+          });
+          expect(
+            queue.getReviewRepairLifecycleState({ ...lookup, baseSha: "new-base" }).state,
+          ).toBe("none");
+          expect(
+            queue.getReviewRepairLifecycleState({ ...lookup, headSha: "new-head" }).state,
+          ).toBe("none");
+          expect(
+            queue.getReviewRepairLifecycleState({
+              ...lookup,
+              repositoryIdentity: "github.com/other/repo",
+            }).state,
+          ).toBe("none");
+          expect(queue.reconcileReviewRepairLifecycles()).toEqual({
+            scanned: 0,
+            rearmed: 0,
+            exhausted: 1,
+          });
+          expect(db.query("SELECT COUNT(*) AS count FROM jobs").get()).toEqual({ count: 0 });
+          expect(db.query("SELECT COUNT(*) AS count FROM pr_repair_capabilities").get()).toEqual({
+            count: 0,
+          });
+          const migrated = db
+            .query("SELECT * FROM pr_repair_lifecycle ORDER BY lifecycleKey")
+            .all() as Array<Record<string, unknown>>;
+          expect(migrated[0].repositoryIdentity).toBe("github.com/example/repo");
+          expect(migrated.map(({ repositoryIdentity: _identity, ...row }) => row)).toEqual(
+            original,
+          );
+        } finally {
+          queue.close();
+        }
+      }
+    } finally {
+      removeClosedSqliteFixture(root);
+    }
+  });
+
+  test("migrated legacy terminal tuples deny new capabilities without rekeying or granting legacy active repairs authority", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-legacy-repair-authority-"));
+    const dbPath = join(root, "state.sqlite");
+    createLegacyRepairLifecycleDatabase(dbPath, [
+      {},
+      { prUrlNormalized: "https://github.com/other/repo/pull/697", status: "succeeded" },
+      { prUrlNormalized: "https://github.com/queued/repo/pull/697", status: "queued" },
+    ]);
+    const queue = new JobQueue(dbPath);
+    try {
+      const bodyFor = (owner: string) => ({
+        taskId: `legacy-${owner}`,
+        sessionId: "dev",
+        kind: "task.execute",
+        repositoryIdentity: `github.com/${owner}/repo`,
+        params: {
+          ...reviewRepairParams(),
+          reviewAgent: {
+            ...reviewRepairParams().reviewAgent,
+            prUrl: `https://github.com/${owner}/repo/pull/697`,
+            repositoryIdentity: `github.com/${owner}/repo`,
+          },
+        },
+      });
+      const exhaustedBody = bodyFor("example");
+      expect(queue.reviewRepairAdmission(exhaustedBody)).toMatchObject({
+        authorized: false,
+        exhausted: true,
+        terminal: true,
+      });
+      expect(queue.authorizeReviewRepairCapability(exhaustedBody)).toMatchObject({ ok: true });
+      expect(queue.enqueue(exhaustedBody, { authorizedElevatedWorkClass: "repair" })).toMatchObject(
+        { ok: false, message: expect.stringContaining("exhausted") },
+      );
+      expect(queue.reviewRepairAdmission(bodyFor("other"))).toMatchObject({
+        authorized: false,
+        exhausted: false,
+        terminal: true,
+      });
+      expect(queue.reviewRepairAdmission(bodyFor("queued"))).toMatchObject({
+        authorized: false,
+        exhausted: false,
+        terminal: false,
+      });
+      expect(queue.getPendingJobs()).toHaveLength(0);
+      const advancedBody = {
+        ...exhaustedBody,
+        params: {
+          ...exhaustedBody.params,
+          reviewAgent: { ...exhaustedBody.params.reviewAgent, prBaseSha: "new-base" },
+        },
+      };
+      expect(queue.authorizeReviewRepairCapability(advancedBody)).toMatchObject({ ok: true });
+      expect(queue.reviewRepairAdmission(advancedBody)).toMatchObject({
+        authorized: true,
+        exhausted: false,
+      });
+    } finally {
+      queue.close();
+      removeClosedSqliteFixture(root);
+    }
+  });
+
+  test("legacy identity backfill rejects ambiguous URL proof and never guesses from a PR number", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-legacy-repair-identity-"));
+    const dbPath = join(root, "state.sqlite");
+    const invalid: LegacyRepairLifecycle[] = [
+      { prUrlNormalized: "not-a-pr-url" },
+      { prUrlNormalized: "https://github.com/mismatched/repo/pull/697", prNumber: 698 },
+      { prUrlNormalized: "https://github.com/missing/repo/pull/697", prNumber: null },
+      { prUrlNormalized: "file://github.com/example/repo/pull/697" },
+      { prUrlNormalized: "https://user:secret@github.com/example/repo/pull/697" },
+      { prUrlNormalized: "https://github.com/example/repo/pull/697/files" },
+      { prUrlNormalized: "https://github.com/pull/697" },
+      { prUrlNormalized: "https://github.com/example%2frepo/pull/697" },
+      { prUrlNormalized: "https://github.com/example/ignored/../repo/pull/697" },
+      { prUrlNormalized: "https://github.com:8443/example/repo/pull/697" },
+      { prUrlNormalized: "https://github.com/example/repo/pull/697?other=repo" },
+    ];
+    createLegacyRepairLifecycleDatabase(dbPath, [
+      ...invalid,
+      { prUrlNormalized: "https://git.internal.example/group/subgroup/repo/-/merge_requests/697" },
+    ]);
+    const queue = new JobQueue(dbPath);
+    try {
+      const db = (queue as unknown as { db: Database }).db;
+      expect(
+        db
+          .query("SELECT COUNT(*) AS count FROM pr_repair_lifecycle WHERE repositoryIdentity = ''")
+          .get(),
+      ).toEqual({ count: invalid.length });
+      expect(
+        queue.getReviewRepairLifecycleState({
+          repositoryIdentity: "git.internal.example/group/subgroup/repo",
+          prNumber: 697,
+          headSha: "abc1234",
+          baseSha: "def5678",
+        }).state,
+      ).toBe("exhausted");
+      expect(db.query("SELECT COUNT(*) AS count FROM pr_repair_capabilities").get()).toEqual({
+        count: 0,
+      });
+      expect(db.query("SELECT COUNT(*) AS count FROM jobs").get()).toEqual({ count: 0 });
+    } finally {
+      queue.close();
+      removeClosedSqliteFixture(root);
+    }
+  });
+
+  test("backfills already-added blank identity columns beyond one bounded page without altering existing identities", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-legacy-repair-pages-"));
+    const dbPath = join(root, "state.sqlite");
+    createLegacyRepairLifecycleDatabase(
+      dbPath,
+      Array.from({ length: 205 }, (_, index) => ({
+        prUrlNormalized: `https://github.com/example/repo/pull/${index + 1}`,
+        prNumber: index + 1,
+      })),
+    );
+    const legacy = new Database(dbPath);
+    try {
+      legacy.exec(
+        "ALTER TABLE pr_repair_lifecycle ADD COLUMN repositoryIdentity TEXT NOT NULL DEFAULT ''",
+      );
+      legacy
+        .query(
+          "UPDATE pr_repair_lifecycle SET repositoryIdentity = 'github.com/existing/repo' WHERE prNumber = 1",
+        )
+        .run();
+    } finally {
+      legacy.close();
+    }
+    const queue = new JobQueue(dbPath);
+    try {
+      const db = (queue as unknown as { db: Database }).db;
+      expect(
+        db
+          .query(
+            "SELECT COUNT(*) AS count FROM pr_repair_lifecycle WHERE repositoryIdentity = 'github.com/example/repo'",
+          )
+          .get(),
+      ).toEqual({ count: 204 });
+      expect(
+        db.query("SELECT repositoryIdentity FROM pr_repair_lifecycle WHERE prNumber = 1").get(),
+      ).toEqual({ repositoryIdentity: "github.com/existing/repo" });
+      expect(queue.reconcileReviewRepairLifecycles()).toEqual({
+        scanned: 0,
+        rearmed: 0,
+        exhausted: 205,
+      });
+      expect(db.query("SELECT COUNT(*) AS count FROM jobs").get()).toEqual({ count: 0 });
+    } finally {
+      queue.close();
+      removeClosedSqliteFixture(root);
+    }
+  });
+
+  test("exact review lifecycle lookup is read-only, repository scoped, and protects active old-base repairs", () => {
+    const queue = new JobQueue(":memory:");
+    try {
+      const repair = enqueueAuthorizedReviewRepair(
+        queue,
+        {
+          taskId: "lifecycle-lookup",
+          sessionId: "dev",
+          kind: "task.execute",
+          workClass: "repair",
+        },
+        "lookup",
+      );
+      const db = (queue as unknown as { db: Database }).db;
+      const lookup = {
+        repositoryIdentity: "git@github.com:example/repo.git",
+        prNumber: 697,
+        headSha: "abc1234",
+        baseSha: "def5678",
+      };
+      const before = db.query("SELECT * FROM pr_repair_lifecycle").all();
+      expect(queue.getReviewRepairLifecycleState(lookup)).toMatchObject({
+        state: "active",
+        activeJobId: repair.jobId,
+      });
+      expect(queue.getReviewRepairLifecycleState({ ...lookup, baseSha: "new-base" }).state).toBe(
+        "active",
+      );
+      expect(
+        queue.getReviewRepairLifecycleState({ ...lookup, headSha: "another-head" }).state,
+      ).toBe("none");
+      expect(
+        queue.getReviewRepairLifecycleState({
+          ...lookup,
+          repositoryIdentity: "https://github.com/another/repo",
+        }).state,
+      ).toBe("none");
+      expect(db.query("SELECT * FROM pr_repair_lifecycle").all()).toEqual(before);
+      db.query(
+        "UPDATE pr_repair_lifecycle SET status='exhausted', activeJobId=NULL, lastError='Original failure remains'",
+      ).run();
+      expect(queue.getReviewRepairLifecycleState(lookup)).toEqual({
+        state: "exhausted",
+        activeJobId: null,
+        detail: "Original failure remains",
+      });
+      expect(queue.getReviewRepairLifecycleState({ ...lookup, baseSha: "new-base" }).state).toBe(
+        "none",
+      );
+      db.query("UPDATE pr_repair_lifecycle SET status='succeeded'").run();
+      expect(queue.getReviewRepairLifecycleState(lookup).state).toBe("settled");
+      expect(() => queue.getReviewRepairLifecycleState({ ...lookup, headSha: "" })).toThrow(
+        "Invalid exact",
+      );
+    } finally {
+      queue.close();
+    }
+  });
+
   test("claims deadline-bound repair work ahead of older background autonomy work", () => {
     const queue = new JobQueue(":memory:");
     try {

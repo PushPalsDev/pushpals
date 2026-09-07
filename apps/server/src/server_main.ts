@@ -3399,6 +3399,39 @@ export function createRequestHandler() {
         return makeJson(result, 200);
       }
 
+      // GET /jobs/review-repair-lifecycle: read-only exact revision authority.
+      if (pathname === "/jobs/review-repair-lifecycle" && method === "GET") {
+        const denied = requireAuth();
+        if (denied) return denied;
+        const repositoryIdentity = String(url.searchParams.get("repositoryIdentity") ?? "").trim();
+        const prNumber = Number(url.searchParams.get("prNumber"));
+        const headSha = String(url.searchParams.get("headSha") ?? "").trim();
+        const baseSha = String(url.searchParams.get("baseSha") ?? "").trim();
+        if (
+          !repositoryIdentity ||
+          !Number.isSafeInteger(prNumber) ||
+          prNumber <= 0 ||
+          !headSha ||
+          !baseSha ||
+          headSha.length > 128 ||
+          baseSha.length > 128
+        ) {
+          return makeJson({ ok: false, message: "Invalid exact review lifecycle lookup" }, 400);
+        }
+        try {
+          const lifecycle = jobQueue.getReviewRepairLifecycleState({
+            repositoryIdentity,
+            prNumber,
+            headSha,
+            baseSha,
+          });
+          return makeJson({ ok: true, ...lifecycle });
+        } catch (error) {
+          console.error("[Server] Exact review lifecycle lookup failed", error);
+          return makeJson({ ok: false, message: "Review lifecycle authority unavailable" }, 503);
+        }
+      }
+
       // GET /jobs/pr-links
       // Compact, cursor-paged authority for SourceControlManager provider
       // reconciliation. Never expose full job params/results on this hot poll.

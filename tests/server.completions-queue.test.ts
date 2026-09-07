@@ -757,7 +757,15 @@ describe("server CompletionQueue PR URL persistence", () => {
               phase: "validation",
               failedTests: ["visible suite > visible assertion", "hidden suite > hidden assertion"],
               targetPathHints: ["tests/visible.test.ts", "tests/hidden.test.ts"],
-              failureLines: ["(fail) hidden suite > hidden assertion"],
+              failureLines: [
+                ...Array.from({ length: 25 }, (_, index) =>
+                  JSON.stringify({
+                    message: "expected fixture error",
+                    requestId: `noise-${index}`,
+                  }),
+                ),
+                "(fail) hidden suite > hidden assertion",
+              ],
             },
           ],
         },
@@ -773,6 +781,8 @@ describe("server CompletionQueue PR URL persistence", () => {
     ]);
     expect(metadata.targetPathHints).toEqual(["tests/hidden.test.ts", "tests/visible.test.ts"]);
     expect(metadata.failureLines).toContain("(fail) hidden suite > hidden assertion");
+    expect(metadata.failureLines).toContain("(fail) visible suite > visible assertion");
+    expect(metadata.failureLines).toHaveLength(2);
     completions.close();
     jobs.close();
   });

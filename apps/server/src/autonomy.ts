@@ -4,6 +4,7 @@ import {
   extractTrustedValidationFailureEvidence,
   loadPushPalsConfig,
   normalizeTrustedValidationFingerprintLine,
+  prioritizeTrustedValidationFailureLines,
   sanitizeRepositoryAgentRequest,
   sanitizeRepositoryAgentResult,
   type PushPalsConfig,
@@ -1266,7 +1267,7 @@ function canonicalValidationFailureEvidence(params: {
     [...asStringArray(metadata.targetPathHints), ...derived.targetPathHints],
     20,
   );
-  let failureLines = normalizedValidationEvidenceValues(
+  let failureLines = prioritizeTrustedValidationFailureLines(
     [...asStringArray(metadata.failureLines), ...derived.failureLines],
     20,
   );
@@ -4516,7 +4517,10 @@ export class AutonomyStore {
     const selected = activeGroups[0];
     if (!selected?.lastFailure) return null;
 
-    const structuredFailureLines = [...selected.failureLines].slice(0, 12);
+    const structuredFailureLines = prioritizeTrustedValidationFailureLines(
+      [...selected.failureLines],
+      12,
+    );
     const sample = truncateText(
       structuredFailureLines.join("\n") ||
         asString(selected.lastFailure.stderrTail) ||

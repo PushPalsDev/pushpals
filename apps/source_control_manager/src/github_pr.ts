@@ -602,10 +602,18 @@ export async function mergePullRequest(opts: {
   mergeMethod?: "merge" | "squash" | "rebase";
   commitTitle?: string;
   commitMessage?: string;
+  /** Atomically refuse a merge if the provider head changed after review. */
+  expectedHeadSha?: string;
+  fetchImpl?: FetchLike;
 }): Promise<{ merged: boolean; sha: string; message: string }> {
   const repo = parseGitHubRepo(opts.remoteUrl);
   if (!repo) {
     throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  }
+
+  const expectedHeadSha = opts.expectedHeadSha?.trim();
+  if (opts.expectedHeadSha !== undefined && !expectedHeadSha) {
+    throw new Error("expectedHeadSha must not be empty when requesting a pinned PR merge");
   }
 
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/pulls/${opts.prNumber}/merge`;
@@ -614,12 +622,17 @@ export async function mergePullRequest(opts: {
   };
   if (opts.commitTitle) body.commit_title = opts.commitTitle;
   if (opts.commitMessage) body.commit_message = opts.commitMessage;
+  if (expectedHeadSha) body.sha = expectedHeadSha;
 
-  const response = await githubFetch(url, {
-    method: "PUT",
-    headers: githubHeaders(opts.token),
-    body: JSON.stringify(body),
-  });
+  const response = await githubFetch(
+    url,
+    {
+      method: "PUT",
+      headers: githubHeaders(opts.token),
+      body: JSON.stringify(body),
+    },
+    opts.fetchImpl,
+  );
 
   if (!response.ok) {
     const text = await response.text();

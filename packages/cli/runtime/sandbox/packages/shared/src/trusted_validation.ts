@@ -105,6 +105,54 @@ const TEST_DURATION_SUFFIX_RE = /\s+\[(?:\d+(?:\.\d+)?)(?:ms|s)\]\s*$/i;
 const FAILURE_LINE_RE =
   /(?:^|\s)(?:error|fail(?:ed|ure)?|fatal|panic|panicked|timed?\s*out|timeout|expected|received|assert(?:ion|ionerror)?)(?:\b|:)/i;
 const PASS_LINE_RE = /^(?:\(pass\)|PASS\b|\u2713\s|\u2714\s|Tests?\s+\d+\s+passed\b)/i;
+const COMPILER_ERROR_LINE_RE =
+  /^(?:.+?(?:\((?:\d+|<line>),(?:\d+|<column>)\):|:(?:\d+|<line>):(?:\d+|<column>)\s+-)\s+error\b|error\s+TS\d+:)/i;
+
+function failureLinePriority(value: string): number {
+  const line = value.replace(ANSI_ESCAPE_RE, "").trim();
+  if (
+    !line ||
+    PASS_LINE_RE.test(line) ||
+    /^(?:stdout|stderr)\s*\|\s*.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?\s*>/i.test(line) ||
+    /^(?:\(skip\)|0\s+(?:tests?\s+failed|fail(?:ed|ures?)?|errors?)\b)/i.test(line)
+  )
+    return -1;
+  if (
+    /^(?:\(fail\)|FAIL(?:ED)?\s|[\u2715\u2717\u25cf]\s|---\s+FAIL:|thread\s+['"]|test\s+.+\s+\.\.\.\s+FAILED)/i.test(
+      line,
+    )
+  )
+    return 4;
+  if (
+    COMPILER_ERROR_LINE_RE.test(line) ||
+    /^(?:[\w.]*Error:|error(?:\[[^\]]+\])?:|fatal:|panic:|Expected\b|Received\b|Actual\b|assertion\s+failed\b)/i.test(
+      line,
+    )
+  )
+    return 3;
+  if (
+    /^(?:\d+\s+tests?\s+failed|Test(?:s| Files)?\s+.*\bfailed\b)|\b(?:Test timed out|test timed out|test timeout of)\b/i.test(
+      line,
+    )
+  )
+    return 2;
+  // Structured application logs often describe expected negative-path tests.
+  // Retain them as a last resort, never ahead of the test runner's verdict.
+  if (/^[{[]/.test(line)) return 0;
+  return FAILURE_LINE_RE.test(line) ? 1 : 0;
+}
+
+/** Keep authoritative failure diagnostics ahead of incidental negative-path logs. */
+export function prioritizeTrustedValidationFailureLines(values: string[], maxItems = 20): string[] {
+  const lines = uniqueSorted(values.map(normalizeFailureLine)).filter(
+    (line) => failureLinePriority(line) >= 0,
+  );
+  const hasDiagnostic = lines.some((line) => failureLinePriority(line) >= 2);
+  return lines
+    .filter((line) => !hasDiagnostic || failureLinePriority(line) > 0)
+    .sort((a, b) => failureLinePriority(b) - failureLinePriority(a) || a.localeCompare(b))
+    .slice(0, maxItems);
+}
 
 function uniqueSorted(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort((a, b) =>
@@ -175,9 +223,17 @@ function normalizeFailureLine(value: string): string {
 function failureNeighborhoodLines(output: string, radius = 2): string[] {
   const lines = output.replace(ANSI_ESCAPE_RE, "").split(/\r?\n/);
   const selected = new Set<number>();
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]?.trim() ?? "";
-    if (!line || PASS_LINE_RE.test(line) || !FAILURE_LINE_RE.test(line)) continue;
+  const anchors = lines
+    .map((line, index) => ({ index, priority: failureLinePriority(line) }))
+    .filter(
+      ({ index, priority }) =>
+        priority >= 2 || (priority >= 0 && FAILURE_LINE_RE.test(lines[index] ?? "")),
+    )
+    .sort((a, b) => b.priority - a.priority || a.index - b.index);
+  // Place verdicts themselves before their neighborhoods. An enormous JSON
+  // log immediately before a failing test must not consume its entire budget.
+  for (const { index } of anchors) selected.add(index);
+  for (const { index } of anchors) {
     for (
       let candidate = Math.max(0, index - radius);
       candidate <= Math.min(lines.length - 1, index + radius);
@@ -187,9 +243,8 @@ function failureNeighborhoodLines(output: string, radius = 2): string[] {
     }
   }
   return [...selected]
-    .sort((a, b) => a - b)
-    .map((index) => lines[index]?.trim() ?? "")
-    .filter(Boolean);
+    .map((index) => (lines[index]?.trim() ?? "").slice(0, 1_000))
+    .filter((line) => Boolean(line) && failureLinePriority(line) >= 0);
 }
 
 /**
@@ -211,10 +266,18 @@ export function extractTrustedValidationFailureEvidence(options: {
   const targetPathHints: string[] = [];
   const failureLines: string[] = [];
   let currentTestPath: string | null = null;
+  let inBunFailureSummary = false;
+  const namedTestPaths = new Map<string, Set<string>>();
 
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
+    // Bun repeats named failures after all suite headings. That summary must
+    // not attribute every failure to the last (often passing) file printed.
+    if (/^\d+\s+tests?\s+failed:\s*$/i.test(line)) {
+      currentTestPath = null;
+      inBunFailureSummary = true;
+    }
 
     // A bare Bun test-file heading is not failure evidence. Keep it as context
     // and associate it with a path only after a named failure is observed.
@@ -222,14 +285,19 @@ export function extractTrustedValidationFailureEvidence(options: {
     const suitePath = line.match(
       /^(?:FAIL|failed)\s+(.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?)(?:\s|$)/i,
     )?.[1];
-    const diagnosticPath = line.match(/^([^:(]+\.[cm]?[jt]sx?)\(\d+,\d+\):\s+error\b/i)?.[1];
+    const diagnosticPath = line.match(
+      /^(.+?\.[cm]?[jt]sx?)(?:\(\d+,\d+\):|:\d+:\d+\s+-)\s+error\b/i,
+    )?.[1];
     const pytestFailure = line.match(/^FAILED\s+(.+?\.py)::([^\s]+)(?:\s+-\s+|$)/i);
     const portableDiagnosticPath = line.match(/^(.+?\.(?:py|go|rs)):\d+(?::\d+)?:/i)?.[1];
     const cargoPanic = line.match(
       /^thread\s+['"]([^'"]+)['"]\s+panicked\s+at\s+(.+?\.rs):\d+(?::\d+)?:/i,
     );
     const bunContextPath = normalizeEvidencePath(bunPath ?? "");
-    if (bunContextPath) currentTestPath = bunContextPath;
+    if (bunContextPath) {
+      currentTestPath = bunContextPath;
+      inBunFailureSummary = false;
+    }
     const failingPath = normalizeEvidencePath(
       suitePath ??
         pytestFailure?.[1] ??
@@ -240,6 +308,7 @@ export function extractTrustedValidationFailureEvidence(options: {
     );
     if (failingPath) {
       currentTestPath = failingPath;
+      inBunFailureSummary = false;
       targetPathHints.push(failingPath);
     }
 
@@ -268,17 +337,26 @@ export function extractTrustedValidationFailureEvidence(options: {
       .trim();
     if (namedFailure) {
       failedTests.push(namedFailure);
-      if (currentTestPath) targetPathHints.push(currentTestPath);
+      const knownPaths = namedTestPaths.get(namedFailure) ?? new Set<string>();
+      if (!inBunFailureSummary && currentTestPath) {
+        knownPaths.add(currentTestPath);
+        namedTestPaths.set(namedFailure, knownPaths);
+      }
+      targetPathHints.push(...knownPaths);
     }
 
     if (
-      !PASS_LINE_RE.test(line) &&
+      failureLinePriority(line) >= 0 &&
       (Boolean(namedFailure) || Boolean(failingPath) || FAILURE_LINE_RE.test(line))
     ) {
       failureLines.push(normalizeFailureLine(line));
     }
   }
 
+  // Classification and the durable handoff must use the same authoritative
+  // evidence. Expected application errors must not override compiler/test
+  // diagnostics merely because an incidental JSON log mentions a timeout.
+  const prioritizedFailureLines = prioritizeTrustedValidationFailureLines(failureLines);
   let failureClass: TrustedValidationFailureEvidence["failureClass"];
   if (options.phase === "dependency_install") {
     failureClass = "dependency_setup_failed";
@@ -286,7 +364,9 @@ export function extractTrustedValidationFailureEvidence(options: {
     failureClass = "timeout";
   } else if (failedTests.length > 0) {
     failureClass = "test_failure";
-  } else if (/timed?\s*out|timeout/i.test(output)) {
+  } else if (prioritizedFailureLines.some((line) => COMPILER_ERROR_LINE_RE.test(line))) {
+    failureClass = "typecheck_failure";
+  } else if (prioritizedFailureLines.some((line) => /timed?\s*out|timeout/i.test(line))) {
     failureClass = "timeout";
   } else if (/(?:^|\s)(?:test|pytest|jest|vitest)(?:\s|$)/i.test(command)) {
     failureClass = "test_failure";
@@ -302,7 +382,7 @@ export function extractTrustedValidationFailureEvidence(options: {
     failureClass,
     failedTests: uniqueSorted(failedTests),
     targetPathHints: uniqueSorted(targetPathHints),
-    failureLines: uniqueSorted(failureLines).slice(0, 20),
+    failureLines: prioritizedFailureLines,
   };
 }
 

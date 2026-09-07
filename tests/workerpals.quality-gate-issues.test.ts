@@ -247,6 +247,66 @@ describe("workerpals quality gate critic issue formatting", () => {
     }
   });
 
+  test("classifies the failed assertion rather than passing test names or fixture values", () => {
+    const run = {
+      step: "bun run test",
+      command: "bun run test",
+      ok: false,
+      exitCode: 1,
+      stdout: [
+        "(pass) parser > handles compile and SyntaxError failures [1ms]",
+        "(pass) loader > handles cannot find module [1ms]",
+        "(pass) deadline > reports test timed out [1ms]",
+      ].join("\n"),
+      stderr:
+        "(fail) loader > validates missing import fixture\nExpected 'cannot find module' to equal 'missing import'\n1 test failed",
+      elapsedMs: 10,
+    };
+    expect(classifyValidationFailureClass(run)).toBe("candidate.assertion");
+    expect(classifyValidationRunFailure(run)).toBe("nonzero_exit");
+    expect(detectValidationBlocker([run])).toBeNull();
+  });
+
+  test("retains real compiler and missing-dependency diagnostics after filtering passing tests", () => {
+    const run = {
+      step: "bun run test",
+      command: "bun run test",
+      ok: false,
+      exitCode: 1,
+      stdout: "(pass) boundary > rejects permission denied [1ms]",
+      stderr: "src/file.ts(4,2): error TS2322: Type 'string' is not assignable to type 'number'.",
+      elapsedMs: 10,
+    };
+    expect(classifyValidationFailureClass({ ...run, command: "bun run typecheck" })).toBe(
+      "candidate.compile",
+    );
+    expect(
+      classifyValidationFailureClass({ ...run, stderr: "Cannot find module './missing.ts'" }),
+    ).toBe("repository.dependency");
+  });
+
+  test.each(["0 tests failed", "0 test failed", "10 tests failed", "100 tests failed"])(
+    "assertion evidence distinguishes the failure count in %s",
+    (summary) => {
+      const run = {
+        step: "bun run test",
+        command: "bun run test",
+        ok: false,
+        exitCode: 1,
+        stdout: summary,
+        stderr: "Error: Cannot find module @acme/widget",
+        elapsedMs: 10,
+      };
+      const failed = !summary.startsWith("0 ");
+      expect(classifyValidationFailureClass(run)).toBe(
+        failed ? "candidate.assertion" : "repository.dependency",
+      );
+      expect(classifyValidationRunFailure(run)).toBe(failed ? "nonzero_exit" : "test_harness");
+      if (failed) expect(detectValidationBlocker([run])).toBeNull();
+      else expect(detectValidationBlocker([run])?.category).toBe("repo");
+    },
+  );
+
   test("does not defer repository dependency failures", () => {
     const quality = {
       ok: false,

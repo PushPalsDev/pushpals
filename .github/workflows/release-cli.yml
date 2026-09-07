@@ -689,6 +689,11 @@ jobs:
           bun test
           tests/workerpals.executor-timeout-recovery.test.ts
           tests/source-control-manager.trusted-validation.test.ts
+          tests/source-control-manager.http.test.ts
+          tests/source-control-manager.runtime-helpers.test.ts
+          tests/source-control-manager.review-agent.test.ts
+          tests/source-control-manager.review-journal.test.ts
+          tests/source-control-manager.github-pr.test.ts
 
       - name: Verify Windows deadline and process-tree contracts
         run: >-

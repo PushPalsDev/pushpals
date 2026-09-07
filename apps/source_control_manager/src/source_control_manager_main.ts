@@ -562,7 +562,7 @@ const syncReviewAgentRuntimeConfigSingleFlight = createSingleFlightExecutor(asyn
     remoteUrl,
     prBaseBranch,
     config.authToken,
-    { repositoryServices, scmRepairAuthoritySecret },
+    { repositoryServices, scmRepairAuthoritySecret, reviewJournal: db },
     config.branchPrefix,
   );
   reviewAgentInstance = reviewAgent;

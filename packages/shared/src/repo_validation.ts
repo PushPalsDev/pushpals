@@ -1,6 +1,7 @@
 import { closeSync, existsSync, openSync, readSync, readdirSync } from "fs";
 import { basename, dirname, extname, relative, resolve } from "path";
 import { tokenizeTrustedValidationCommand } from "./trusted_validation.js";
+import { routeRepositoryFocusedTestCommand } from "./repo_test_runner.js";
 
 export type RepositoryValidationEcosystem =
   | "package"
@@ -325,7 +326,7 @@ function resolvePackageManager(repoRoot: string, manifestDirectory: string): Pac
 }
 
 function isJavaScriptTestPath(path: string): boolean {
-  return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path);
+  return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec|vitest)\.[cm]?[jt]sx?$/i.test(path);
 }
 
 function packageValidationSteps(
@@ -358,7 +359,10 @@ function packageValidationSteps(
       .filter(Boolean)
       .slice(0, 4);
     if (focusedTests.length > 0) {
-      return [`${directory ? `bun --cwd ${directoryArg}` : "bun"} test ${focusedTests.join(" ")}`];
+      return routeRepositoryFocusedTestCommand(
+        repoRoot,
+        `${directory ? `bun --cwd ${directoryArg}` : "bun"} test ${focusedTests.join(" ")}`,
+      );
     }
   }
 

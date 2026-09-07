@@ -69,6 +69,11 @@ function makePr(overrides: Partial<GitHubPR> = {}): GitHubPR {
 }
 
 const silentLogs = {
+  // These unit tests model admission separately; journal integration tests
+  // exercise the real pending/claimed/finalizing authority scan.
+  findActiveRepair: async () => null,
+  findReviewLifecycle: async () => ({ state: "none" as const, activeJobId: null, detail: "" }),
+  isReviewRevisionCurrent: async () => true,
   logInfo: () => {},
   logWarn: () => {},
   logError: () => {},
@@ -1918,6 +1923,7 @@ describe("ReviewAgent", () => {
         undefined,
         {
           ...silentLogs,
+          findActiveRepair: async () => (enqueueCalls >= 2 ? "repair-retry-owner" : null),
           listOpenPullRequests: async () => [pr],
           getPullRequestDiff: async () => "diff --git a/file b/file\n+line",
           invokeCodexReview: async () => {
@@ -1966,14 +1972,14 @@ describe("ReviewAgent", () => {
       await agent.poll();
       await agent.poll();
 
-      expect(reviewCalls).toBe(2);
+      expect(reviewCalls).toBe(1);
       expect(enqueueCalls).toBe(2);
       expect(commentCalls).toBe(1);
       expect(feedbackCalls).toBe(1);
     });
   }
 
-  test("re-reviews the same PR SHA exactly once when re-review is requested", async () => {
+  test("does not rescore a finalized exact revision when re-review is requested", async () => {
     const pr = makePr({ number: 61, html_url: "https://example.com/pr/61" });
     let reviewCalls = 0;
 
@@ -2008,7 +2014,7 @@ describe("ReviewAgent", () => {
     await agent.poll();
     await agent.poll();
 
-    expect(reviewCalls).toBe(2);
+    expect(reviewCalls).toBe(1);
   });
 
   test("closes PR when automated review-fix retries hit the cap", async () => {
@@ -2165,6 +2171,7 @@ describe("ReviewAgent", () => {
       undefined,
       {
         ...silentLogs,
+        findActiveRepair: async () => (enqueuedDedupeKeys.length >= 2 ? "new-base-repair" : null),
         listOpenPullRequests: async () => [
           makePr({
             number: prNumber,
@@ -3371,6 +3378,11 @@ describe("ReviewAgent", () => {
         },
         now: () => 321,
         ...silentLogs,
+        findReviewLifecycle: async () => ({
+          state: enqueueCalls > 0 ? ("active" as const) : ("none" as const),
+          activeJobId: enqueueCalls > 0 ? "job-merge-70" : null,
+          detail: "",
+        }),
       },
     );
 
@@ -3584,11 +3596,8 @@ describe("ReviewAgent", () => {
           if (url.endsWith("/jobs/enqueue")) enqueueCalls += 1;
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         },
-        logInfo: () => {},
+        ...silentLogs,
         logWarn: (message) => warnings.push(message),
-        logError: () => {},
-        closePullRequest: silentLogs.closePullRequest,
-        deleteBranchRef: silentLogs.deleteBranchRef,
       },
     );
 

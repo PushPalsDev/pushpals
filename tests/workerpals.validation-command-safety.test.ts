@@ -1731,6 +1731,50 @@ describe("workerpals validation command safety", () => {
     }
   });
 
+  test("passing negative-path test names do not veto a clean command exit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-pass-label-"));
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run test",
+        [
+          process.execPath,
+          "-e",
+          "console.log('(pass) browser errors > reports AssertionError, TimeoutError and EADDRINUSE [1ms]');",
+        ],
+        process.env as Record<string, string>,
+        5_000,
+        {},
+        "validation timed out",
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.ok).toBe(true);
+      expect(result.browserSignal).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("wrapper stderr prefixes cannot hide a real failure behind a clean exit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-validation-wrapper-label-"));
+    try {
+      const result = await runValidationArgv(
+        root,
+        "bun run web:e2e",
+        [process.execPath, "-e", "console.log('stderr | TimeoutError: actual browser timed out');"],
+        process.env as Record<string, string>,
+        5_000,
+        {},
+        "validation timed out",
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.ok).toBe(false);
+      expect(result.browserSignal).toBe("failure");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("waits for authoritative exit before applying a browser failure-marker veto", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-validation-idle-browser-failure-"));
     const script = [

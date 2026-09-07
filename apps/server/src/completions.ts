@@ -17,6 +17,7 @@ import {
   MAX_TRUSTED_VALIDATION_COMMANDS,
   normalizeTrustedValidationFingerprintLine,
   normalizeTrustedValidationCommands,
+  prioritizeTrustedValidationFailureLines,
   type TrustedValidationExecutionResult,
   type TrustedValidationReport,
 } from "../../../packages/shared/src/trusted_validation.js";
@@ -168,6 +169,30 @@ function trustedValidationStringArray(value: unknown, maxItems = 20): string[] {
   ].sort((a, b) => a.localeCompare(b));
 }
 
+function trustedValidationFailureLines(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  // Publishers from older versions may put expected application-error logs
+  // before the actual test verdict. Rank all supplied evidence before the
+  // durable 20-line cap, or the useful diagnostic can be lost permanently.
+  return prioritizeTrustedValidationFailureLines(
+    value.map((entry) => trustedValidationText(entry, 1_000)).filter(Boolean),
+  );
+}
+
+function trustedValidationOutputTail(output: string, maxChars = 8_000): string {
+  if (output.length <= maxChars) return output;
+  const start = output.length - maxChars;
+  if (output[start - 1] === "\n") return output.slice(start);
+  const nextLine = output.indexOf("\n", start);
+  // A partial "stderr | path > passing test" heading can look like a real
+  // failing-path diagnostic once its prefix is removed. Whole-line tails are
+  // supplementary evidence; the separately retained diagnostics remain the
+  // authority when the last line itself exceeds this transport budget.
+  return nextLine < 0
+    ? "[oversized trailing line omitted; see structured failure evidence]"
+    : output.slice(nextLine + 1);
+}
+
 function normalizeTrustedValidationReport(value: unknown): TrustedValidationReport | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const input = value as Record<string, unknown>;
@@ -193,7 +218,7 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
     const evidence = extractTrustedValidationFailureEvidence({ command, phase, output, exitCode });
     const providedFailedTests = trustedValidationStringArray(result.failedTests);
     const providedPathHints = trustedValidationStringArray(result.targetPathHints);
-    const providedFailureLines = trustedValidationStringArray(result.failureLines);
+    const providedFailureLines = trustedValidationFailureLines(result.failureLines);
     const failedTests = trustedValidationStringArray([
       ...providedFailedTests,
       ...evidence.failedTests,
@@ -202,7 +227,7 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
       ...providedPathHints,
       ...evidence.targetPathHints,
     ]);
-    const failureLines = trustedValidationStringArray([
+    const failureLines = trustedValidationFailureLines([
       ...providedFailureLines,
       ...evidence.failureLines,
     ]);
@@ -252,7 +277,7 @@ function normalizeTrustedValidationReport(value: unknown): TrustedValidationRepo
 }
 
 function trustedValidationFailureFingerprint(result: TrustedValidationExecutionResult): string {
-  const failureLines = trustedValidationStringArray(result.failureLines).map(
+  const failureLines = trustedValidationFailureLines(result.failureLines).map(
     normalizeTrustedValidationFingerprintLine,
   );
   const fallback = result.output
@@ -1621,7 +1646,7 @@ export class CompletionQueue {
       }
       const failedTests = trustedValidationStringArray(result.failedTests);
       const targetPathHints = trustedValidationStringArray(result.targetPathHints);
-      const failureLines = trustedValidationStringArray(result.failureLines);
+      const failureLines = trustedValidationFailureLines(result.failureLines);
       const failureFingerprint = result.ok ? null : trustedValidationFailureFingerprint(result);
       insert.run(
         completion.jobId,
@@ -1630,7 +1655,7 @@ export class CompletionQueue {
         result.durationMs,
         result.ok ? 1 : 0,
         result.ok ? null : (result.failureClass ?? "trusted_validation_failed"),
-        result.output.slice(-8_000),
+        trustedValidationOutputTail(result.output),
         JSON.stringify({
           source: "trusted_host",
           completionId: completion.id,

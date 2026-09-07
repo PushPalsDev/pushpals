@@ -1872,6 +1872,208 @@ describe("server AutonomyStore policy gates", () => {
     }
   });
 
+  test("trusted compiler failure remains repairable through completion persistence despite expected timeout logs", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-compiler-incident-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    try {
+      // Compiler incidents keep the existing two-job threshold (unlike named
+      // test failures with retained candidate authority). Do not weaken it.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const jobId = String(
+          jobs.enqueue({
+            taskId: `compiler-task-${attempt}`,
+            sessionId: "s1",
+            kind: "task.execute",
+            params: { origin: "autonomy", instruction: "Improve request handling." },
+          }).jobId,
+        );
+        const workerId = "compiler-worker";
+        const job = jobs.claim(workerId).job;
+        expect(job?.id).toBe(jobId);
+        const handoff = completions.enqueue(
+          {
+            jobId,
+            sessionId: "s1",
+            commitSha: "compiler-candidate",
+            branch: "refs/pushpals/agent/worker/compiler",
+            message: "candidate",
+            trustedValidationCommands: ["bun run typecheck"],
+          },
+          {
+            beginJobFinalization: true,
+            jobClaimAuthority: { workerId, claimGeneration: Number(job?.claimGeneration ?? 0) },
+          },
+        );
+        const claim = completions.claim("compiler-scm").completion;
+        expect(claim?.id).toBe(handoff.completionId);
+        const result = completions.markFailedAndBlockJob(
+          handoff.completionId ?? "",
+          "Typecheck rejected candidate.",
+          undefined,
+          {
+            version: 1,
+            baselineSha: "compiler-base",
+            candidateSha: "compiler-candidate",
+            candidateRef: `refs/pushpals/validation/${"b".repeat(32)}/1/candidate`,
+            results: [
+              {
+                ok: false,
+                command: "bun run typecheck",
+                exitCode: 1,
+                phase: "validation",
+                durationMs: 100,
+                output:
+                  '{"level":"error","message":"request timeout expected for negative fixture"}\nsrc/api.ts:12:3 - error TS2322: incompatible types',
+              },
+            ],
+          },
+          "compiler-scm",
+          claim?.claimToken,
+        );
+        expect(result.ok).toBe(true);
+        const runs = jobs.getJobDiagnostics(jobId).validationRuns;
+        expect(runs[0]?.failureClass).toBe("typecheck_failure");
+        if (attempt === 0) continue;
+        const incident = store.createSnapshot({
+          sessionId: "s1",
+          runId: "compiler-run",
+        }).validation_incident;
+        expect(incident).toMatchObject({
+          active: true,
+          source: "trusted_host",
+          failure_class: "typecheck_failure",
+          target_path_hints: ["src/api.ts"],
+          validation_scope: "candidate_specific",
+        });
+        expect(incident?.sample_error).toContain("TS2322");
+        expect(incident?.sample_error).not.toContain("request timeout expected");
+      }
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
+  test("trusted-host incident prompts preserve the actual verdict through noisy expected-error logs", () => {
+    const { store, dbPath } = makePersistentStore("pushpals-autonomy-noisy-incident-");
+    const jobs = new JobQueue(dbPath);
+    const completions = new CompletionQueue(dbPath);
+    const targetPath = "services/account/test/account-api.vitest.ts";
+    const failedTest =
+      "account Worker public surface > rejects an unverified notification without upstream access";
+    const actualFailure = `FAIL ${targetPath} > ${failedTest}`;
+    const timeoutFailure = "Error: Test timed out in 5000ms.";
+    const noise = (index: number, suffix: string): string =>
+      JSON.stringify({
+        message: "match room formation prepare failed",
+        requestId: `request_${suffix}_${index}_abcdef`,
+        error: "MATCH_ROOM_RESUME_FAILED:SERVICE_UNAVAILABLE",
+        context: "Expected rejection from a successful negative-path test.",
+      });
+    let firstFingerprint: string | undefined;
+    try {
+      for (const suffix of ["first", "second"]) {
+        const enqueued = jobs.enqueue({
+          taskId: `task-noisy-incident-${suffix}`,
+          sessionId: "s1",
+          kind: "task.execute",
+          params: { origin: "autonomy", instruction: "Improve an unrelated UI component." },
+          dedupeKey: `noisy-incident:${suffix}`,
+        });
+        const jobId = String(enqueued.jobId ?? "");
+        const workerId = `worker-noisy-${suffix}`;
+        const claimedJob = jobs.claim(workerId).job;
+        expect(claimedJob?.id).toBe(jobId);
+        const candidateSha = `candidate-${suffix}`;
+        const handoff = completions.enqueue(
+          {
+            jobId,
+            sessionId: "s1",
+            commitSha: candidateSha,
+            branch: `refs/pushpals/agent/worker/noisy-${suffix}`,
+            message: "candidate",
+            trustedValidationCommands: ["bun run validate"],
+          },
+          {
+            beginJobFinalization: true,
+            jobClaimAuthority: {
+              workerId,
+              claimGeneration: Number(claimedJob?.claimGeneration ?? 0),
+            },
+          },
+        );
+        const completionId = handoff.completionId ?? "";
+        const pusherId = `scm-noisy-${suffix}`;
+        const claimed = completions.claim(pusherId).completion;
+        expect(claimed?.id).toBe(completionId);
+        // Keep the real diagnostic near the start, then exceed the persisted
+        // stderr tail. Mixed-version publishers may also supply an old list
+        // of incidental errors before the authoritative runner diagnostics.
+        const noiseLines = Array.from({ length: 100 }, (_, index) => noise(index, suffix));
+        const output = [
+          actualFailure,
+          timeoutFailure,
+          ...noiseLines.flatMap((line, index) => [
+            `stderr | services/queue/test/queue.vitest.ts > handles expected rejection ${index}`,
+            line,
+          ]),
+        ].join("\n");
+        const result = completions.markFailedAndBlockJob(
+          completionId,
+          "Trusted validation rejected the candidate.",
+          undefined,
+          {
+            version: 1,
+            baselineSha: "shared-noisy-baseline",
+            candidateSha,
+            candidateRef: `refs/pushpals/validation/${"b".repeat(32)}/1/candidate`,
+            results: [
+              {
+                ok: false,
+                command: "bun run validate",
+                output,
+                exitCode: 1,
+                durationMs: 175_000,
+                phase: "validation",
+                failureLines: [...noiseLines.slice(0, 20), actualFailure, timeoutFailure],
+              },
+            ],
+          },
+          pusherId,
+          claimed?.claimToken,
+        );
+        expect(result.ok).toBe(true);
+        const snapshot = store.createSnapshot({ sessionId: "s1", runId: `noisy-${suffix}` });
+        const incident = snapshot.validation_incident;
+        expect(incident).toMatchObject({
+          active: true,
+          source: "trusted_host",
+          failure_class: "test_failure",
+          failed_tests: [failedTest],
+          target_path_hints: [targetPath],
+          validation_scope: "candidate_specific",
+        });
+        expect(incident?.sample_error).toContain(actualFailure);
+        expect(incident?.sample_error).toContain("Test timed out");
+        expect(incident?.sample_error?.length).toBeLessThanOrEqual(900);
+        expect(incident?.failure_lines?.join("\n")).not.toContain("match room formation");
+        expect(incident?.sample_error).not.toContain("queue.vitest.ts");
+        if (firstFingerprint) {
+          expect(incident?.failure_fingerprint).toBe(firstFingerprint);
+          expect(incident?.cross_job_circuit_open).toBe(true);
+          expect(incident?.failure_count).toBe(2);
+        } else {
+          firstFingerprint = incident?.failure_fingerprint;
+          expect(incident?.cross_job_circuit_open).toBe(false);
+        }
+      }
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
   test("trusted-host failures stay candidate-specific until the failing candidate passes", () => {
     const { store, dbPath } = makePersistentStore("pushpals-autonomy-trusted-host-circuit-");
     const jobs = new JobQueue(dbPath);

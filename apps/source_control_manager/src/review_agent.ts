@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "fs";
+import { createHash } from "crypto";
 import { tmpdir } from "os";
 import { basename, delimiter, isAbsolute, join, resolve } from "path";
 import {
@@ -7,6 +8,7 @@ import {
 } from "../../../packages/shared/src/bounded_fetch.js";
 import { loadPromptTemplate } from "../../../packages/shared/src/prompts.js";
 import { inferRepositoryValidationSteps } from "../../../packages/shared/src/repo_validation.js";
+import { normalizeRepositoryOriginRemote } from "../../../packages/shared/src/repository_identity.js";
 import {
   DEFAULT_OPENAI_CODEX_MODEL,
   loadPushPalsConfig,
@@ -39,6 +41,7 @@ import {
 import type { ReviewAgentConfig as SourceControlManagerReviewAgentConfig } from "./config";
 import { runBoundedScmProcess } from "./bounded_process";
 import type { SourceControlManagerReviewProviderHealth } from "./runtime_helpers";
+import type { ReviewJournal, ReviewJournalEntry } from "./review_journal";
 
 export type ReviewAgentConfig = SourceControlManagerReviewAgentConfig;
 
@@ -125,7 +128,17 @@ export async function listPersistedPrLinks(opts: {
   return { links, nextCursor: nextCursor || null };
 }
 
+type ReviewLifecycleState = {
+  state: "none" | "active" | "exhausted" | "settled";
+  activeJobId: string | null;
+  detail: string;
+};
+
 interface ReviewAgentDeps {
+  reviewJournal: ReviewJournal | null;
+  findActiveRepair: ((pr: GitHubPR) => Promise<string | null>) | null;
+  findReviewLifecycle: ((pr: GitHubPR) => Promise<ReviewLifecycleState>) | null;
+  isReviewRevisionCurrent: ((pr: GitHubPR) => Promise<boolean>) | null;
   repositoryServices: RepositoryAgentServiceClients | null;
   listOpenPullRequests: typeof listOpenPullRequests;
   listRecentlyClosedPullRequests: typeof listRecentlyClosedPullRequests;
@@ -202,6 +215,10 @@ function resolveReviewValidationRepoRoot(): string {
 }
 
 const DEFAULT_DEPS: ReviewAgentDeps = {
+  reviewJournal: null,
+  findActiveRepair: null,
+  findReviewLifecycle: null,
+  isReviewRevisionCurrent: null,
   repositoryServices: null,
   listOpenPullRequests,
   listRecentlyClosedPullRequests,
@@ -1474,6 +1491,9 @@ function extractActiveReviewJobContextFromJob(job: ActiveJobLike): ActiveReviewJ
 }
 
 export class ReviewAgent {
+  private reviewDecisions = new Map<string, ReviewJournalEntry>();
+  private awaitingRepairPrs = new Set<number>();
+  private activeReviewKeys = new Map<number, string>();
   private reviewed = new Map<number, string>();
   private forceReReview = new Map<number, string>();
   private reReviewEnqueueCounts = new Map<number, number>();
@@ -1504,6 +1524,134 @@ export class ReviewAgent {
   private activePollRuns = new Set<Promise<void>>();
   private readonly deps: ReviewAgentDeps;
   private readonly headPrefix: string;
+
+  private reviewDecisionKey(pr: GitHubPR): string {
+    const policy = createHash("sha256")
+      .update(
+        JSON.stringify({
+          contract: 1,
+          model: this.config.model || DEFAULT_OPENAI_CODEX_MODEL,
+          launcher: this.config.codexBin,
+          threshold: this.config.passThreshold,
+          reviewer: this.loadReviewerMd(),
+          mergeMethod: this.config.mergeMethod,
+          maxComments: this.config.maxPrCommentsBeforeGiveUp,
+          title: pr.title,
+          body: pr.body,
+        }),
+      )
+      .digest("hex");
+    return `${reviewRevisionFingerprint(pr)}:${policy}`;
+  }
+
+  private reviewRepositoryKey(): string {
+    // Transport/userinfo are not repository identity. A remote changing from
+    // HTTPS to SSH must not discard retained verdicts or reset repair budgets.
+    return normalizeRepositoryOriginRemote(this.remoteUrl).toLowerCase();
+  }
+
+  private loadReviewDecision(pr: GitHubPR, key: string): ReviewJournalEntry | null {
+    const entry = this.deps.reviewJournal
+      ? this.deps.reviewJournal.getReviewDecision(this.reviewRepositoryKey(), pr.number, key)
+      : (this.reviewDecisions.get(`${pr.number}:${key}`) ?? null);
+    if (entry && entry.verdictJson !== null && !parseReviewVerdict(entry.verdictJson)) {
+      throw new Error(`Refusing review of PR #${pr.number}: durable review evidence is invalid`);
+    }
+    const count =
+      this.deps.reviewJournal?.getReviewRepairEnqueueCount(this.reviewRepositoryKey(), pr.number) ??
+      0;
+    this.reReviewEnqueueCounts.set(
+      pr.number,
+      Math.max(this.reReviewEnqueueCounts.get(pr.number) ?? 0, count),
+    );
+    if (entry?.finalized) this.reviewed.set(pr.number, key);
+    return entry;
+  }
+
+  private saveReviewDecision(pr: GitHubPR, key: string, entry: ReviewJournalEntry): void {
+    const record = { ...entry, repairEnqueues: this.reReviewEnqueueCounts.get(pr.number) ?? 0 };
+    // Write before updating memory or performing provider/dispatch side effects.
+    // A failed journal write must not permit an unrecorded merge or repair.
+    this.deps.reviewJournal?.saveReviewDecision(this.reviewRepositoryKey(), pr.number, key, record);
+    this.reviewDecisions.set(`${pr.number}:${key}`, record);
+    while (this.reviewDecisions.size > 256) {
+      this.reviewDecisions.delete(this.reviewDecisions.keys().next().value!);
+    }
+  }
+
+  private persistCurrentReviewDecision(pr: GitHubPR): void {
+    const key = this.reviewDecisionKey(pr);
+    const entry =
+      this.reviewDecisions.get(`${pr.number}:${key}`) ??
+      this.deps.reviewJournal?.getReviewDecision(this.reviewRepositoryKey(), pr.number, key);
+    if (entry) this.saveReviewDecision(pr, key, entry);
+  }
+
+  private async activeRepairForPr(pr: GitHubPR): Promise<string | null> {
+    return this.deps.findActiveRepair
+      ? this.deps.findActiveRepair(pr)
+      : this.findActiveReviewJobIdForPrHead(pr.number, pr.head.sha, undefined, "", true);
+  }
+
+  private assertReviewPolicyUnchanged(pr: GitHubPR): void {
+    const key = this.activeReviewKeys.get(pr.number);
+    if (key && key !== this.reviewDecisionKey(pr)) {
+      throw new Error(
+        `PR #${pr.number} review inputs or policy changed during review; refusing stale side effects`,
+      );
+    }
+  }
+
+  private async confirmReviewRevisionCurrent(pr: GitHubPR): Promise<boolean> {
+    this.assertReviewPolicyUnchanged(pr);
+    const current = this.deps.isReviewRevisionCurrent
+      ? await this.deps.isReviewRevisionCurrent(pr)
+      : await this.deps
+          .getPullRequest({
+            token: this.githubToken,
+            remoteUrl: this.remoteUrl,
+            prNumber: pr.number,
+          })
+          .then(
+            (latest) =>
+              latest.state === "open" &&
+              this.reviewDecisionKey(latest) === this.reviewDecisionKey(pr),
+          );
+    this.assertReviewPolicyUnchanged(pr);
+    if (!current)
+      this.deps.logWarn(
+        `[${ts()}] [ReviewAgent] PR #${pr.number} changed or closed during review; refusing stale side effects.`,
+      );
+    return current;
+  }
+
+  private async reviewLifecycleForPr(pr: GitHubPR): Promise<ReviewLifecycleState> {
+    if (this.deps.findReviewLifecycle) return this.deps.findReviewLifecycle(pr);
+    const url = new URL(`${this.serverUrl}/jobs/review-repair-lifecycle`);
+    url.searchParams.set("repositoryIdentity", this.remoteUrl);
+    url.searchParams.set("prNumber", String(pr.number));
+    url.searchParams.set("headSha", pr.head.sha);
+    url.searchParams.set("baseSha", pr.base.sha);
+    const response = await this.deps.fetchImpl(url.toString(), {
+      headers: this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {},
+    });
+    if (!response.ok)
+      throw new Error(`Review lifecycle authority unavailable: HTTP ${response.status}`);
+    const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (
+      !payload ||
+      payload.ok !== true ||
+      typeof payload.state !== "string" ||
+      !["none", "active", "exhausted", "settled"].includes(payload.state)
+    ) {
+      throw new Error("Review lifecycle authority returned an invalid response");
+    }
+    return {
+      state: payload.state as ReviewLifecycleState["state"],
+      activeJobId: typeof payload.activeJobId === "string" ? payload.activeJobId : null,
+      detail: String(payload.detail ?? "").slice(0, 2000),
+    };
+  }
 
   constructor(
     private config: ReviewAgentConfig,
@@ -1894,9 +2042,11 @@ export class ReviewAgent {
 
       const eligible = prs
         .filter((pr) => {
+          const key = this.reviewDecisionKey(pr);
+          this.loadReviewDecision(pr, key);
           const reviewedRevision = this.reviewed.get(pr.number);
           const forcedSha = this.forceReReview.get(pr.number);
-          return reviewedRevision !== reviewRevisionFingerprint(pr) || forcedSha === pr.head.sha;
+          return reviewedRevision !== key || forcedSha === pr.head.sha;
         })
         .sort((a, b) => a.number - b.number);
       const startIndex =
@@ -2044,8 +2194,13 @@ export class ReviewAgent {
   }
 
   private async reviewPr(pr: GitHubPR): Promise<void> {
+    this.awaitingRepairPrs.delete(pr.number);
     const sha = pr.head.sha;
-    const revisionFingerprint = reviewRevisionFingerprint(pr);
+    const revisionFingerprint = this.reviewDecisionKey(pr);
+    this.activeReviewKeys.set(pr.number, revisionFingerprint);
+    while (this.activeReviewKeys.size > 256)
+      this.activeReviewKeys.delete(this.activeReviewKeys.keys().next().value!);
+    const retainedDecision = this.loadReviewDecision(pr, revisionFingerprint);
     const reviewedRevision = this.reviewed.get(pr.number);
     const forcedSha = this.forceReReview.get(pr.number);
     if (reviewedRevision !== revisionFingerprint && forcedSha) {
@@ -2055,12 +2210,60 @@ export class ReviewAgent {
       this.forceReReview.delete(pr.number);
     }
     if (reviewedRevision === revisionFingerprint) {
-      if (forcedSha !== sha) return;
       this.forceReReview.delete(pr.number);
-      this.deps.logInfo(
-        `[${ts()}] [ReviewAgent] Re-reviewing PR #${pr.number} at unchanged head ${sha.slice(0, 8)} (forced re-review).`,
-      );
+      return;
     }
+
+    const lifecycle = await this.reviewLifecycleForPr(pr);
+    if (lifecycle.state === "active" || lifecycle.state === "settled") {
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] Deferring PR #${pr.number}: durable repair lifecycle is ${lifecycle.state}${lifecycle.activeJobId ? ` (${lifecycle.activeJobId})` : ""}.`,
+      );
+      return;
+    }
+    if (lifecycle.state === "exhausted") {
+      const verdict = retainedDecision?.verdictJson
+        ? parseReviewVerdict(retainedDecision.verdictJson)!
+        : {
+            score: Math.max(0, this.config.passThreshold - 1),
+            summary:
+              `Durable repair attempts for this exact PR revision are exhausted. ${truncateText(collapseWhitespace(lifecycle.detail), 400)}`.trim(),
+            issues: [lifecycle.detail || "The repair lifecycle exhausted its attempts."],
+            fix_instruction: "",
+          };
+      this.assertReviewPolicyUnchanged(pr);
+      this.saveReviewDecision(pr, revisionFingerprint, {
+        verdictJson: JSON.stringify(verdict),
+        finalized: false,
+        repairEnqueues: 0,
+      });
+      const { jobId, sessionId } = extractPrMeta(pr.body);
+      const finalized = await this.giveUpOnRejectedPr(pr, verdict, {
+        jobId,
+        sessionId,
+        recentComments: await this.listRecentPrComments(pr.number),
+        maxPrCommentsBeforeGiveUp: Math.max(1, this.config.maxPrCommentsBeforeGiveUp),
+        reason:
+          "The server's durable repair lifecycle exhausted this exact revision; unchanged failing work must not be rescored into approval.",
+        feedbackVerdict: "rejected_re_review_cap_closed",
+      });
+      this.saveReviewDecision(pr, revisionFingerprint, {
+        verdictJson: JSON.stringify(verdict),
+        finalized,
+        repairEnqueues: 0,
+      });
+      if (finalized) this.reviewed.set(pr.number, revisionFingerprint);
+      return;
+    }
+
+    const activeRepair = await this.activeRepairForPr(pr);
+    if (activeRepair) {
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] Deferring PR #${pr.number}: repair ${activeRepair} still owns head ${sha.slice(0, 8)} (including publication).`,
+      );
+      return;
+    }
+    this.assertReviewPolicyUnchanged(pr);
 
     this.deps.logInfo(
       `[${ts()}] [ReviewAgent] Reviewing PR #${pr.number} (${pr.head.ref} @ ${sha.slice(0, 8)})`,
@@ -2080,9 +2283,15 @@ export class ReviewAgent {
       return;
     }
 
+    this.assertReviewPolicyUnchanged(pr);
     if (!diff.trim()) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has an empty diff - skipping`);
       this.reviewed.set(pr.number, revisionFingerprint);
+      this.saveReviewDecision(pr, revisionFingerprint, {
+        verdictJson: null,
+        finalized: true,
+        repairEnqueues: 0,
+      });
       return;
     }
 
@@ -2091,6 +2300,11 @@ export class ReviewAgent {
         `[${ts()}] [ReviewAgent] PR #${pr.number} diff is too large (${diff.length} bytes) - skipping`,
       );
       this.reviewed.set(pr.number, revisionFingerprint);
+      this.saveReviewDecision(pr, revisionFingerprint, {
+        verdictJson: null,
+        finalized: true,
+        repairEnqueues: 0,
+      });
       return;
     }
 
@@ -2098,7 +2312,7 @@ export class ReviewAgent {
       repositoryIdentity: this.remoteUrl,
       taskIntent: `${pr.title ?? ""}\n${pr.body ?? ""}`,
     });
-    if (deterministicHygieneIssues.length > 0) {
+    if (!retainedDecision?.verdictJson && deterministicHygieneIssues.length > 0) {
       const verdict = buildDeterministicReviewHygieneVerdict(
         deterministicHygieneIssues,
         this.config.passThreshold,
@@ -2106,33 +2320,56 @@ export class ReviewAgent {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] PR #${pr.number} failed deterministic hygiene gate (${deterministicHygieneIssues.length} issue(s)); skipping Codex review.`,
       );
+      this.saveReviewDecision(pr, revisionFingerprint, {
+        verdictJson: JSON.stringify(verdict),
+        finalized: false,
+        repairEnqueues: 0,
+      });
       const finalized = await this.rejectPr(pr, verdict, diff);
-      if (finalized) {
+      const terminal = finalized && !this.awaitingRepairPrs.has(pr.number);
+      this.saveReviewDecision(pr, revisionFingerprint, {
+        verdictJson: JSON.stringify(verdict),
+        finalized: terminal,
+        repairEnqueues: 0,
+      });
+      if (terminal) {
         this.reviewed.set(pr.number, revisionFingerprint);
       }
       return;
     }
 
-    const reviewerMd = this.loadReviewerMd();
-    const prompt = buildReviewPrompt(reviewerMd, pr, diff, this.config.passThreshold);
-
-    let raw: string;
-    try {
-      this.deps.logInfo(`[${ts()}] [ReviewAgent] Invoking Codex review for PR #${pr.number}...`);
-      raw = await this.deps.invokeCodexReview(prompt, this.config);
-    } catch (err: any) {
-      this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Codex invocation failed for PR #${pr.number}: ${err?.message ?? err}`,
-      );
-      return;
-    }
-
-    const verdict = parseReviewVerdict(raw);
+    let verdict = retainedDecision?.verdictJson
+      ? parseReviewVerdict(retainedDecision.verdictJson)
+      : null;
     if (!verdict) {
-      this.deps.logWarn(
-        `[${ts()}] [ReviewAgent] Could not parse Codex verdict for PR #${pr.number}. Raw output:\n${raw.slice(0, 500)}`,
+      const prompt = buildReviewPrompt(this.loadReviewerMd(), pr, diff, this.config.passThreshold);
+      let raw: string;
+      try {
+        this.deps.logInfo(`[${ts()}] [ReviewAgent] Invoking Codex review for PR #${pr.number}...`);
+        raw = await this.deps.invokeCodexReview(prompt, this.config);
+      } catch (err: any) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Codex invocation failed for PR #${pr.number}: ${err?.message ?? err}`,
+        );
+        return;
+      }
+      verdict = parseReviewVerdict(raw);
+      if (!verdict) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Could not parse Codex verdict for PR #${pr.number}. Raw output:\n${raw.slice(0, 500)}`,
+        );
+        return;
+      }
+      this.assertReviewPolicyUnchanged(pr);
+      this.saveReviewDecision(pr, revisionFingerprint, {
+        verdictJson: JSON.stringify(verdict),
+        finalized: false,
+        repairEnqueues: 0,
+      });
+    } else {
+      this.deps.logInfo(
+        `[${ts()}] [ReviewAgent] Resuming retained verdict for PR #${pr.number}; unchanged evidence is not rescored.`,
       );
-      return;
     }
 
     const approved = verdict.score >= this.config.passThreshold;
@@ -2144,12 +2381,22 @@ export class ReviewAgent {
       ? await this.approvePr(pr, verdict, diff)
       : await this.rejectPr(pr, verdict, diff);
 
-    if (finalized) {
+    const terminal = finalized && !this.awaitingRepairPrs.has(pr.number);
+    this.saveReviewDecision(pr, revisionFingerprint, {
+      verdictJson: JSON.stringify(verdict),
+      finalized: terminal,
+      repairEnqueues: 0,
+    });
+
+    if (terminal) {
       this.reviewed.set(pr.number, revisionFingerprint);
     }
   }
 
   private async approvePr(pr: GitHubPR, verdict: ReviewVerdict, diff: string): Promise<boolean> {
+    if ((await this.reviewLifecycleForPr(pr)).state !== "none") return false;
+    if (await this.activeRepairForPr(pr)) return false;
+    if (!(await this.confirmReviewRevisionCurrent(pr))) return false;
     const { jobId, sessionId } = extractPrMeta(pr.body);
     try {
       await this.deps.addPullRequestComment({
@@ -2202,10 +2449,14 @@ export class ReviewAgent {
     }
 
     try {
+      if ((await this.reviewLifecycleForPr(pr)).state !== "none") return false;
+      if (await this.activeRepairForPr(pr)) return false;
+      if (!(await this.confirmReviewRevisionCurrent(pr))) return false;
       const result = await this.deps.mergePullRequest({
         token: this.githubToken,
         remoteUrl: this.remoteUrl,
         prNumber: pr.number,
+        expectedHeadSha: pr.head.sha,
         mergeMethod: this.config.mergeMethod,
         commitTitle,
         commitMessage,
@@ -2269,6 +2520,12 @@ export class ReviewAgent {
       );
       return false;
     }
+
+    // A handled merge conflict is not a completed review lifecycle. Preserve
+    // the verdict, but keep this revision eligible for durable repair checks
+    // after restart, duplicate admission, or the publication settle window.
+    // Otherwise a successful enqueue can permanently hide an exhausted repair.
+    this.awaitingRepairPrs.add(pr.number);
 
     const existingReviewJobId = await this.findActiveReviewJobIdForPrHead(
       pr.number,
@@ -2374,6 +2631,7 @@ export class ReviewAgent {
 
     const rejectionComment = formatRejectionComment(effectiveVerdict);
     const acknowledgeRejection = async (): Promise<boolean> => {
+      this.assertReviewPolicyUnchanged(pr);
       const commentAlreadyPresent = recentComments.some(
         (comment) => collapseWhitespace(comment.body) === collapseWhitespace(rejectionComment),
       );
@@ -2432,6 +2690,7 @@ export class ReviewAgent {
       pr.base.sha,
     );
     if (existingFixJobId) {
+      this.awaitingRepairPrs.add(pr.number);
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} already has active fix job ${existingFixJobId} for head ${pr.head.sha.slice(0, 8)}; skipping duplicate enqueue.`,
       );
@@ -2440,6 +2699,7 @@ export class ReviewAgent {
 
     const nextReReviewEnqueues = priorReReviewEnqueues + 1;
     this.reReviewEnqueueCounts.set(pr.number, nextReReviewEnqueues);
+    this.persistCurrentReviewDecision(pr);
     const enqueued = await this.enqueueFixJob(
       pr,
       effectiveVerdict,
@@ -2449,12 +2709,26 @@ export class ReviewAgent {
       [rejectionComment],
       recentComments,
     );
-    if (!enqueued && priorReReviewEnqueues > 0) {
+    if (enqueued !== "enqueued" && priorReReviewEnqueues > 0) {
       this.reReviewEnqueueCounts.set(pr.number, priorReReviewEnqueues);
-    } else if (!enqueued) {
+    } else if (enqueued !== "enqueued") {
       this.reReviewEnqueueCounts.delete(pr.number);
     }
-    if (!enqueued) {
+    this.persistCurrentReviewDecision(pr);
+    if (enqueued === "exhausted") {
+      return this.giveUpOnRejectedPr(pr, effectiveVerdict, {
+        jobId,
+        sessionId,
+        recentComments,
+        maxPrCommentsBeforeGiveUp,
+        reason:
+          "Server repair lifecycle is exhausted for this exact PR revision; an unchanged rejection cannot be rescored into approval.",
+        feedbackVerdict: "rejected_re_review_cap_closed",
+        feedbackSummarySuffix: "closed after the durable repair lifecycle exhausted its attempts.",
+      });
+    }
+    if (enqueued === "settled") return acknowledgeRejection();
+    if (enqueued !== "enqueued") {
       // Infrastructure/capability failures are not review outcomes. Leave the
       // exact head+base revision eligible and avoid publishing duplicate PR
       // comments while a later poll retries admission.
@@ -2465,6 +2739,7 @@ export class ReviewAgent {
         `[${ts()}] [ReviewAgent] PR #${pr.number} hit max re-review cap (${MAX_PR_RE_REVIEW_ENQUEUES}); future rejections will not auto-enqueue fix jobs.`,
       );
     }
+    this.awaitingRepairPrs.add(pr.number);
     return acknowledgeRejection();
   }
 
@@ -2487,6 +2762,8 @@ export class ReviewAgent {
     this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} ${reason} Closing without merge.`);
 
     try {
+      if (await this.activeRepairForPr(pr)) return false;
+      if (!(await this.confirmReviewRevisionCurrent(pr))) return false;
       const result = await this.deps.closePullRequest({
         token: this.githubToken,
         remoteUrl: this.remoteUrl,
@@ -2605,23 +2882,29 @@ export class ReviewAgent {
     headSha: string,
     resolutionType?: "review_fix" | "merge_conflict",
     baseSha = "",
+    requireComplete = false,
   ): Promise<string | null> {
     const normalizedHeadSha = normalizeReviewFixHeadSha(headSha);
     const normalizedBaseSha = normalizeReviewFixHeadSha(baseSha);
     const headers: Record<string, string> = {};
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
-    for (const status of ["pending", "claimed"] as const) {
+    for (const status of ["pending", "claimed", "finalizing"] as const) {
       try {
         const url = `${this.serverUrl}/jobs?status=${status}&limit=${MAX_ACTIVE_FIX_JOB_SCAN}`;
         const response = await this.deps.fetchImpl(url, { headers });
         if (!response.ok) {
           const text = await response.text().catch(() => "");
+          if (requireComplete)
+            throw new Error(`Active repair authority unavailable: HTTP ${response.status} ${text}`);
           this.deps.logWarn(
             `[${ts()}] [ReviewAgent] Failed active-fix dedupe scan (${status}) for PR #${prNumber}: HTTP ${response.status}${text ? `: ${text}` : ""}`,
           );
           continue;
         }
         const payload = (await response.json().catch(() => null)) as { jobs?: unknown } | null;
+        if (requireComplete && (!payload || !Array.isArray(payload.jobs))) {
+          throw new Error("Active repair authority returned an invalid job list");
+        }
         const jobs = payload && Array.isArray(payload.jobs) ? payload.jobs : [];
         for (const rawJob of jobs) {
           if (!rawJob || typeof rawJob !== "object" || Array.isArray(rawJob)) continue;
@@ -2642,7 +2925,13 @@ export class ReviewAgent {
             typeof job.id === "string" && job.id.trim().length > 0 ? job.id.trim() : "(unknown)";
           return jobId;
         }
+        if (requireComplete && jobs.length >= MAX_ACTIVE_FIX_JOB_SCAN) {
+          throw new Error(
+            "Active repair authority scan is truncated; refusing an unverified merge",
+          );
+        }
       } catch (err: any) {
+        if (requireComplete) throw err;
         this.deps.logWarn(
           `[${ts()}] [ReviewAgent] Active-fix dedupe scan failed for PR #${prNumber} (${status}): ${err?.message ?? err}`,
         );
@@ -2953,7 +3242,7 @@ export class ReviewAgent {
     diff: string,
     excludedBodies: string[] = [],
     prefetchedComments?: PullRequestComment[],
-  ): Promise<boolean> {
+  ): Promise<"enqueued" | "retryable" | "exhausted" | "settled"> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
     const reviewGuidance = deriveReviewGuidance(verdict);
     const rejectionReasoning = reviewGuidance.items;
@@ -3077,6 +3366,7 @@ export class ReviewAgent {
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
 
     try {
+      if (!(await this.confirmReviewRevisionCurrent(pr))) return "retryable";
       const response = await this.deps.fetchImpl(`${this.serverUrl}/jobs/enqueue`, {
         method: "POST",
         headers,
@@ -3085,6 +3375,16 @@ export class ReviewAgent {
 
       if (!response.ok) {
         const text = await response.text();
+        if (response.status === 409) {
+          let code = "";
+          try {
+            code = String(JSON.parse(text)?.code ?? "");
+          } catch {
+            /* Not a semantic lifecycle response. */
+          }
+          if (code === "review_repair_lifecycle_exhausted") return "exhausted";
+          if (code === "review_repair_lifecycle_settled") return "settled";
+        }
         throw new Error(`HTTP ${response.status}: ${text}`);
       }
       const responseBody = (await response.json().catch(() => null)) as {
@@ -3126,18 +3426,18 @@ export class ReviewAgent {
         this.deps.logInfo(
           `[${ts()}] [ReviewAgent] PR #${pr.number} fix request deduped to existing active job ${enqueuedJobId || "(unknown)"} for head ${pr.head.sha.slice(0, 8)}${dedupeMessage ? ` (${dedupeMessage})` : ""}; skipping duplicate task events.`,
         );
-        return true;
+        return "enqueued";
       }
 
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] PR #${pr.number} rejected (score ${verdict.score.toFixed(1)}/10) - fix job ${taskId}${enqueuedJobId ? ` (${enqueuedJobId})` : ""} enqueued`,
       );
-      return true;
+      return "enqueued";
     } catch (err: any) {
       this.deps.logError(
         `[${ts()}] [ReviewAgent] Failed to enqueue fix job for PR #${pr.number}: ${err?.message ?? err}`,
       );
-      return false;
+      return "retryable";
     }
   }
 
@@ -3260,6 +3560,7 @@ export class ReviewAgent {
     if (this.authToken) headers.Authorization = `Bearer ${this.authToken}`;
 
     try {
+      if (!(await this.confirmReviewRevisionCurrent(pr))) return false;
       const response = await this.deps.fetchImpl(`${this.serverUrl}/jobs/enqueue`, {
         method: "POST",
         headers,

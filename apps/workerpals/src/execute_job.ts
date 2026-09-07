@@ -33,6 +33,7 @@ import {
   normalizeTargetPath,
   requirementsForValidationCommand,
   resolveGitStateFilePath,
+  routeRepositoryFocusedTestCommand,
   runBoundedProcess as runBoundedWorkerProcess,
   sanitizeSourceControlIdentityField,
   terminateProcessTree,
@@ -1117,17 +1118,31 @@ function isDockerDaemonValidationBlocker(value: string): boolean {
 }
 
 function hasConcreteAssertionFailureEvidence(value: string): boolean {
-  return /\bassertionerror\b|\bassert(?:ion)?(?:\s+failed|:)\b|\bexpected\b[\s\S]{0,160}\b(?:received|actual|to be|to equal|to contain|to match)\b|\b(?:\d+\s+)?tests?\s+failed\b|\blocator\.[a-z0-9_]+:\s+timeout\b/.test(
-    value,
+  return /(?:^|\n)\s*\(fail\)\s|\bassertionerror\b|\bassert(?:ion)?(?:\s+failed|:)\b|\bexpected\b[\s\S]{0,160}\b(?:received|actual|to be|to equal|to contain|to match)\b|\b(?:\d+\s+)?tests?\s+failed\b|\blocator\.[a-z0-9_]+:\s+timeout\b/.test(
+    value.replace(/\b0\s+tests?\s+failed\b/g, ""),
   );
+}
+
+function validationDiagnosticText(output: string): string {
+  return output
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .split(/\r?\n/)
+    .filter(
+      (line) =>
+        !/^\s*(?:\((?:pass|skip)\)|PASS\b|[\u2713\u2714]\s|(?:stdout|stderr)\s*\|\s*.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?\s*>)/i.test(
+          line,
+        ),
+    )
+    .join("\n");
 }
 
 export function classifyValidationRunFailure(run: ValidationExecutionResult): string | null {
   if (run.ok) return null;
   if (run.inheritedFailureClass) return run.inheritedFailureClass;
-  const combined = `${run.command}\n${run.stdout}\n${run.stderr}`.toLowerCase();
+  const combined =
+    `${run.command}\n${validationDiagnosticText(`${run.stdout}\n${run.stderr}`)}`.toLowerCase();
   const command = run.command.toLowerCase();
-  const output = `${run.stdout}\n${run.stderr}`.toLowerCase();
+  const output = validationDiagnosticText(`${run.stdout}\n${run.stderr}`).toLowerCase();
   if (
     run.exitCode === 124 ||
     /\b(?:command|process|request|connection|validation|test|browser|playwright|executor)\s+timed out\b/i.test(
@@ -1174,11 +1189,15 @@ export function classifyValidationFailureClass(
   if (run.ok) return null;
   if (run.failureClass) return run.failureClass;
   if (run.inheritedFailureClass === "environment") return "environment.sandbox";
-  const combined = `${run.command}\n${run.stdout}\n${run.stderr}`.toLowerCase();
+  const combined =
+    `${run.command}\n${validationDiagnosticText(`${run.stdout}\n${run.stderr}`)}`.toLowerCase();
   if (run.terminalStatusSource === "deadline" || run.exitCode === 124) return "deadline";
   // Exit 127 is structural process evidence; unlike output substrings, an
   // assertion cannot make a process-level missing executable trustworthy.
   if (run.exitCode === 127) return "environment.toolchain";
+  // Test verdicts outrank words in fixture names and assertion values (e.g.
+  // "compile", "cannot find module"). Such text is not compiler evidence.
+  if (hasConcreteAssertionFailureEvidence(combined)) return "candidate.assertion";
   if (
     combined.includes("cannot find module") ||
     combined.includes("module not found") ||
@@ -1193,13 +1212,6 @@ export function classifyValidationFailureClass(
     /typecheck|compile|syntaxerror|does not provide an export|no exported member/.test(combined)
   ) {
     return "candidate.compile";
-  }
-  // Concrete assertion/test-runner evidence is authoritative even when the
-  // assertion text happens to mention an environmental phrase such as
-  // "permission denied" or "connection refused". Do not hand a broken
-  // candidate to trusted-host validation from an incidental substring.
-  if (hasConcreteAssertionFailureEvidence(combined)) {
-    return "candidate.assertion";
   }
   if (isDockerDaemonValidationBlocker(combined)) return "environment.docker";
   if (
@@ -2044,7 +2056,7 @@ function captureValidationStream(
 }
 
 function hasBrowserValidationFailureSignal(output: string): boolean {
-  const text = String(output ?? "");
+  const text = validationDiagnosticText(String(output ?? ""));
   if (!text.trim()) return false;
   const patterns = [
     /\bAssertionError\b/i,
@@ -4007,7 +4019,7 @@ export function isAssertionCoverageTestPath(path: string): boolean {
     normalized.includes("/test/") ||
     normalized.includes("__tests__/") ||
     /\.test\.[a-z0-9]+$/i.test(normalized) ||
-    /\.spec\.[a-z0-9]+$/i.test(normalized)
+    /\.(?:spec|vitest)\.[a-z0-9]+$/i.test(normalized)
   );
 }
 
@@ -5739,6 +5751,8 @@ export function collectQualityGateValidationCommands(params: {
   const plannerRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(
     params.repo,
     runnableValidationCommandsFromSteps(params.planning.validationSteps).slice(0, 4),
+  ).flatMap((command) =>
+    params.repo ? routeRepositoryFocusedTestCommand(params.repo, command) : [command],
   );
   const fallbackValidationSteps = sanitizeValidationCommandsForCurrentCheckout(
     params.repo,
@@ -5750,6 +5764,8 @@ export function collectQualityGateValidationCommands(params: {
           params.changedTestPaths,
         )
       : [],
+  ).flatMap((command) =>
+    params.repo ? routeRepositoryFocusedTestCommand(params.repo, command) : [command],
   );
   const inferredRepoNativeValidationSteps = params.repo
     ? inferRepoNativeValidationCommands(params.repo, params.changedPaths ?? [])

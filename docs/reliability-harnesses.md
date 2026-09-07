@@ -90,6 +90,26 @@ do not qualify for that timeout retry; repeated failure still blocks publication
 
 ### Bounded recovery and learning
 
+Focused JavaScript validation must respect repository test-runner ownership.
+The shared runner-routing fixtures cover mixed Bun/Vitest/Jest repositories,
+nearest package boundaries, configured suites, name filters, and ambiguous or
+excluded targets. A script that can pass without discovering the requested file
+is not acceptable evidence of ownership. Routing does not remove mandatory gates.
+
+SCM persists exact-revision review decisions before provider or repair side
+effects. Restart and transient admission retries reuse that decision instead of
+asking the model to rescore unchanged code. Real temporary-SQLite tests cover
+close/reopen, changed revisions, active repairs through finalization, and exhausted
+repair admission. Windows CI and release checks also exercise HTTP health while a
+bounded validation child emits output, times out, and has its process tree drained.
+
+Failure-evidence tests include noisy expected application errors, repeated Bun
+summaries, duplicate test names across files, and truncation next to oversized
+logs. The completion-to-autonomy harness verifies that actual failed-test names
+and paths survive the durable handoff and remain at the front of repair context.
+Passing negative-path test names must not create false failures; a real wrapper
+failure must still veto a nominally successful child exit.
+
 Short executor revisions reserve time for independent validation and critic
 review inside the original job deadline. A backend's explicit retained timeout
 candidate can enter those gates; it cannot bypass them or start another editing

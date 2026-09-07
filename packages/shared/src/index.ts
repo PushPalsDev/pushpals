@@ -185,10 +185,12 @@ export {
   type MergeRepositoryValidationStepsOptions,
   type RepositoryValidationEcosystem,
 } from "./repo_validation.js";
+export { routeRepositoryFocusedTestCommand } from "./repo_test_runner.js";
 export {
   MAX_TRUSTED_VALIDATION_COMMANDS,
   MAX_TRUSTED_VALIDATION_COMMAND_LENGTH,
   extractTrustedValidationFailureEvidence,
+  prioritizeTrustedValidationFailureLines,
   normalizeTrustedValidationFingerprintLine,
   normalizeTrustedValidationCommands,
   tokenizeTrustedValidationCommand,

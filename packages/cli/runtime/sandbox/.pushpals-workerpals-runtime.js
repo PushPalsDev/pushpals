@@ -4,7 +4,7 @@
 // apps/workerpals/src/workerpals_main.ts
 import { randomUUID as randomUUID3 } from "crypto";
 import { mkdirSync as mkdirSync5 } from "fs";
-import { resolve as resolve14 } from "path";
+import { resolve as resolve15 } from "path";
 
 // packages/shared/src/repo.ts
 import { existsSync, readFileSync, statSync } from "fs";
@@ -4616,8 +4616,8 @@ function repoRelativePath(repoRoot, pathValue) {
   return path;
 }
 // packages/shared/src/repo_validation.ts
-import { closeSync, existsSync as existsSync4, openSync, readSync, readdirSync as readdirSync2 } from "fs";
-import { basename as basename2, dirname, extname, relative as relative2, resolve as resolve6 } from "path";
+import { closeSync, existsSync as existsSync5, openSync, readSync, readdirSync as readdirSync2 } from "fs";
+import { basename as basename3, dirname as dirname2, extname, relative as relative3, resolve as resolve7 } from "path";
 
 // packages/shared/src/trusted_validation.ts
 var MAX_TRUSTED_VALIDATION_COMMAND_LENGTH = 1000;
@@ -4844,6 +4844,500 @@ function tokenizeTrustedValidationCommand(command) {
   return argv;
 }
 
+// packages/shared/src/repo_test_runner.ts
+import { existsSync as existsSync4, readFileSync as readFileSync5, realpathSync, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname, relative as relative2, resolve as resolve6 } from "path";
+var MAX_EVIDENCE_BYTES = 256000;
+function within(root, path) {
+  const rel = relative2(root, path).replace(/\\/g, "/");
+  return rel === "" || !rel.startsWith("../") && rel !== ".." && !/^(?:\/|[A-Za-z]:)/.test(rel);
+}
+function readEvidence(root, path) {
+  try {
+    if (!within(root, path) || !within(realpathSync(root), realpathSync(path)))
+      return null;
+    const stat = statSync3(path);
+    return stat.isFile() && stat.size <= MAX_EVIDENCE_BYTES ? readFileSync5(path, "utf8") : null;
+  } catch {
+    return null;
+  }
+}
+function readManifest(root, directory) {
+  const text = readEvidence(root, resolve6(directory, "package.json"));
+  if (!text)
+    return null;
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function quote(value) {
+  return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
+}
+function packageManager(root, directory) {
+  for (let cursor = directory;within(root, cursor); cursor = dirname(cursor)) {
+    const declared = String(readManifest(root, cursor)?.packageManager ?? "").split("@")[0];
+    if (["bun", "npm", "pnpm", "yarn"].includes(declared))
+      return declared;
+    for (const [manager, lock] of [
+      ["bun", "bun.lock"],
+      ["bun", "bun.lockb"],
+      ["pnpm", "pnpm-lock.yaml"],
+      ["yarn", "yarn.lock"],
+      ["npm", "package-lock.json"]
+    ]) {
+      if (existsSync4(resolve6(cursor, lock)))
+        return manager;
+    }
+    if (cursor === root)
+      break;
+  }
+  return "npm";
+}
+function packageScriptCommand(root, directory, name) {
+  const manager = packageManager(root, directory);
+  const path = relative2(root, directory).replace(/\\/g, "/");
+  const option = manager === "npm" ? "--prefix" : manager === "pnpm" ? "--dir" : "--cwd";
+  return `${manager}${path ? ` ${option} ${quote(path)}` : ""} run ${quote(name)}`;
+}
+function runnerForFile(text, path) {
+  for (const [module, runner] of [
+    ["bun:test", "bun"],
+    ["vitest", "vitest"],
+    ["@jest/globals", "jest"]
+  ]) {
+    if (new RegExp(`(?:from\\s*|(?:require|import)\\s*\\(\\s*)["']${module}["']`).test(text))
+      return runner;
+  }
+  return /\.vitest\.[cm]?[jt]sx?$/i.test(path) ? "vitest" : null;
+}
+function configTokens(text) {
+  const tokens = [];
+  for (let cursor = 0;cursor < text.length; ) {
+    const char = text[cursor];
+    if (/\s/.test(char)) {
+      cursor += 1;
+      continue;
+    }
+    if (text.startsWith("//", cursor)) {
+      while (cursor < text.length && !/[\r\n\u2028\u2029]/.test(text[cursor]))
+        cursor += 1;
+      continue;
+    }
+    if (text.startsWith("/*", cursor)) {
+      const end = text.indexOf("*/", cursor + 2);
+      if (end < 0)
+        return null;
+      cursor = end + 2;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      const start = ++cursor;
+      let escaped = false;
+      while (cursor < text.length && text[cursor] !== char) {
+        if (/[\r\n\u2028\u2029]/.test(text[cursor]))
+          return null;
+        if (text[cursor] === "\\") {
+          escaped = true;
+          cursor += 1;
+        }
+        cursor += 1;
+      }
+      if (cursor >= text.length)
+        return null;
+      const value = text.slice(start, cursor++);
+      tokens.push({ kind: "string", value, ...escaped ? {} : { literal: value } });
+      continue;
+    }
+    if (char === "`" || char === "/" || char === "\\")
+      return null;
+    const word = /^[A-Za-z_$][\w$]*/.exec(text.slice(cursor));
+    if (word) {
+      tokens.push({ kind: "word", value: word[0] });
+      cursor += word[0].length;
+    } else {
+      tokens.push({ kind: "punctuation", value: char });
+      cursor += 1;
+    }
+  }
+  return tokens;
+}
+function punct(token, value) {
+  return token?.kind === "punctuation" && token.value === value;
+}
+function literalObject(tokens) {
+  if (!punct(tokens[0], "{") || !punct(tokens.at(-1), "}"))
+    return null;
+  const fields = new Map;
+  let cursor = 1;
+  while (cursor < tokens.length - 1) {
+    const token = tokens[cursor++];
+    const key = token.kind === "word" ? token.value : token.literal;
+    if (key === undefined || key === "__proto__" || fields.has(key) || !punct(tokens[cursor++], ":"))
+      return null;
+    const start = cursor;
+    const closing = [];
+    for (;cursor < tokens.length - 1; cursor += 1) {
+      const current = tokens[cursor];
+      if (current.kind !== "punctuation")
+        continue;
+      if (current.value === "," && !closing.length)
+        break;
+      const end = { "{": "}", "[": "]", "(": ")" }[current.value];
+      if (end)
+        closing.push(end);
+      else if (["}", "]", ")"].includes(current.value) && closing.pop() !== current.value)
+        return null;
+    }
+    if (closing.length || cursor === start)
+      return null;
+    fields.set(key, tokens.slice(start, cursor));
+    if (cursor < tokens.length - 1)
+      cursor += 1;
+  }
+  return fields;
+}
+function literalPatterns(tokens) {
+  if (!tokens)
+    return;
+  if (!punct(tokens[0], "[") || !punct(tokens.at(-1), "]"))
+    return null;
+  const patterns = [];
+  for (let cursor = 1;cursor < tokens.length - 1; cursor += 2) {
+    if (tokens[cursor].kind !== "string" || tokens[cursor].literal === undefined)
+      return null;
+    patterns.push(tokens[cursor].literal);
+    if (cursor + 1 < tokens.length - 1 && !punct(tokens[cursor + 1], ","))
+      return null;
+  }
+  return patterns;
+}
+function selectionPreservingPlugins(tokens, helpers) {
+  if (!tokens)
+    return true;
+  if (!punct(tokens[0], "[") || !punct(tokens.at(-1), "]"))
+    return false;
+  let expression = tokens.slice(1, -1);
+  if (!expression.length)
+    return true;
+  if (punct(expression.at(-1), ","))
+    expression = expression.slice(0, -1);
+  return expression[0]?.kind === "word" && helpers.has(expression[0].value) && punct(expression[1], "(") && punct(expression.at(-1), ")") && literalObject(expression.slice(2, -1)) !== null;
+}
+function exportedConfig(text, json) {
+  const tokens = configTokens(text);
+  if (!tokens)
+    return null;
+  if (json) {
+    try {
+      JSON.parse(text);
+    } catch {
+      return null;
+    }
+    const object2 = literalObject(tokens);
+    return object2 && selectionPreservingPlugins(object2.get("plugins"), new Set) ? object2 : null;
+  }
+  const wrappers = new Set;
+  const plugins = new Set;
+  let cursor = 0;
+  while (tokens[cursor]?.kind === "word" && tokens[cursor].value === "import") {
+    const start = ++cursor;
+    while (cursor < tokens.length && tokens[cursor].kind !== "string")
+      cursor += 1;
+    const source = tokens[cursor]?.literal;
+    if (source === undefined)
+      return null;
+    if (cursor > start && tokens[cursor - 1]?.value !== "from")
+      return null;
+    const helper = ["vitest/config", "vite"].includes(source) ? "defineConfig" : source === "@cloudflare/vitest-pool-workers/config" ? "defineWorkersConfig" : null;
+    const plugin = ["@cloudflare/vitest-pool-workers", "@cloudflare/vitest-plugin"].includes(source) ? "cloudflareTest" : null;
+    const clause = tokens.slice(start, cursor - 1);
+    if ((helper || plugin) && punct(clause[0], "{") && punct(clause.at(-1), "}")) {
+      for (let index = 1;index < clause.length - 1; ) {
+        const imported = clause[index++];
+        if (imported.kind !== "word")
+          return null;
+        let local = imported.value;
+        if (clause[index]?.value === "as") {
+          index += 1;
+          if (clause[index]?.kind !== "word")
+            return null;
+          local = clause[index++].value;
+        }
+        if (imported.value === helper)
+          wrappers.add(local);
+        if (imported.value === plugin)
+          plugins.add(local);
+        if (index < clause.length - 1 && !punct(clause[index++], ","))
+          return null;
+      }
+    }
+    cursor += 1;
+    if (punct(tokens[cursor], ";"))
+      cursor += 1;
+  }
+  if (tokens[cursor]?.value === "export" && tokens[cursor + 1]?.value === "default")
+    cursor += 2;
+  else if (tokens[cursor]?.value === "module" && punct(tokens[cursor + 1], ".") && tokens[cursor + 2]?.value === "exports" && punct(tokens[cursor + 3], "="))
+    cursor += 4;
+  else
+    return null;
+  let expression = tokens.slice(cursor);
+  if (punct(expression.at(-1), ";"))
+    expression = expression.slice(0, -1);
+  if (expression[0]?.kind === "word" && wrappers.has(expression[0].value)) {
+    if (!punct(expression[1], "(") || !punct(expression.at(-1), ")"))
+      return null;
+    expression = expression.slice(2, -1);
+  }
+  const object = literalObject(expression);
+  return object && selectionPreservingPlugins(object.get("plugins"), plugins) ? object : null;
+}
+function configSelection(text, path, runner) {
+  const object = exportedConfig(text, path.endsWith(".json"));
+  if (!object)
+    return null;
+  const selection = runner === "vitest" && object.has("test") ? literalObject(object.get("test")) : runner === "vitest" ? new Map : object;
+  if (!selection)
+    return null;
+  const unsupported = [
+    "projects",
+    "workspace",
+    "testRegex",
+    "testPathIgnorePatterns",
+    "rootDir",
+    "roots",
+    "preset",
+    "testNamePattern",
+    "dir",
+    "includeSource",
+    "shard",
+    "changed",
+    "related",
+    "filter",
+    "testSequencer",
+    "modulePathIgnorePatterns",
+    "moduleFileExtensions",
+    "runner",
+    "testRunner",
+    "sequence",
+    "extends"
+  ];
+  if (unsupported.some((key) => object.has(key) || selection.has(key)))
+    return null;
+  if (runner === "jest" && object.has("root"))
+    return null;
+  if (selection !== object && selection.has("plugins"))
+    return null;
+  const rootValues = [
+    object.get("root"),
+    selection === object ? undefined : selection.get("root")
+  ].filter((value) => value !== undefined);
+  if (rootValues.length > 1 || rootValues.some((value) => value.length !== 1 || value[0].literal === undefined))
+    return null;
+  const includes = literalPatterns(selection.get(runner === "vitest" ? "include" : "testMatch"));
+  const excludes = runner === "vitest" ? literalPatterns(selection.get("exclude")) : undefined;
+  if (includes === null || excludes === null)
+    return null;
+  return { root: rootValues[0]?.[0].literal, includes, excludes };
+}
+function matchesPattern(path, pattern) {
+  if (pattern.startsWith("!") || pattern.includes("<rootDir>"))
+    return false;
+  try {
+    return new Bun.Glob(pattern.replace(/^\.\//, "")).match(path);
+  } catch {
+    return false;
+  }
+}
+function scriptRunner(argv) {
+  let index = 0;
+  if (argv[0] === "bun" && argv[1] === "x")
+    index = 2;
+  else if (["bunx", "npx"].includes(argv[0]))
+    index = 1;
+  else if (["pnpm", "yarn"].includes(argv[0]) && argv[1] === "exec")
+    index = 2;
+  while (["--yes", "-y", "--no-install"].includes(argv[index]))
+    index += 1;
+  const runner = argv[index];
+  if (runner !== "vitest" && runner !== "jest")
+    return null;
+  if (argv.some((arg) => /^(?:--watch(?:All)?(?:=true)?|-w)$/.test(arg)))
+    return null;
+  if (runner === "vitest" && !argv.slice(index + 1).some((arg) => arg === "run" || arg === "--run"))
+    return null;
+  const valueOptions = new Set([
+    "--config",
+    "-c",
+    "--pool",
+    "--maxWorkers",
+    "--minWorkers",
+    "--testTimeout",
+    "--hookTimeout",
+    "--reporter"
+  ]);
+  const booleanOptions = new Set([
+    "run",
+    "--run",
+    "--runInBand",
+    "--ci",
+    "--silent",
+    "--coverage",
+    "--no-file-parallelism"
+  ]);
+  for (let cursor = index + 1;cursor < argv.length; cursor += 1) {
+    const option = argv[cursor];
+    if (booleanOptions.has(option))
+      continue;
+    if (valueOptions.has(option)) {
+      if (!argv[cursor + 1] || argv[cursor + 1].startsWith("-"))
+        return null;
+      cursor += 1;
+      continue;
+    }
+    if (option.includes("=") && valueOptions.has(option.split("=", 1)[0]))
+      continue;
+    return null;
+  }
+  return { runner, index };
+}
+function commandsForTest(root, path) {
+  const source = readEvidence(root, path);
+  if (source === null)
+    return [];
+  const requiredRunner = runnerForFile(source, path);
+  if (requiredRunner === "bun")
+    return [];
+  for (let directory = dirname(path);within(root, directory); directory = dirname(directory)) {
+    const manifest = readManifest(root, directory);
+    if (!manifest) {
+      if (existsSync4(resolve6(directory, "package.json")))
+        return [];
+      if (directory === root)
+        break;
+      continue;
+    }
+    const scripts = manifest.scripts;
+    if (!scripts || typeof scripts !== "object" || Array.isArray(scripts))
+      return [];
+    const candidates = [];
+    for (const [name, script] of Object.entries(scripts)) {
+      if (typeof script !== "string" || !/^[A-Za-z0-9_:@.-]+$/.test(name))
+        continue;
+      const argv = tokenizeTrustedValidationCommand(script);
+      if (!argv)
+        continue;
+      const runner = scriptRunner(argv);
+      if (!runner || requiredRunner && requiredRunner !== runner.runner)
+        continue;
+      const configOptions = argv.filter((arg) => arg === "--config" || arg === "-c" || arg.startsWith("--config=") || arg.startsWith("-c="));
+      if (configOptions.length > 1)
+        continue;
+      const configIndex = argv.findIndex((arg) => arg === "--config" || arg === "-c");
+      const configArg = configIndex >= 0 ? argv[configIndex + 1] : configOptions[0]?.slice(configOptions[0].indexOf("=") + 1);
+      const configFiles = (base) => ["ts", "mts", "js", "mjs", "cjs", "cts", "json"].map((ext) => `${base}.config.${ext}`).filter((file) => existsSync4(resolve6(directory, file)));
+      let defaultConfigs = configFiles(runner.runner);
+      if (runner.runner === "vitest" && defaultConfigs.length === 0)
+        defaultConfigs = configFiles("vite");
+      if (!configArg && (defaultConfigs.length > 1 || runner.runner === "jest" && manifest.jest))
+        continue;
+      const defaultConfig = defaultConfigs[0];
+      const configPath = configArg ?? defaultConfig;
+      if (runner.runner === "jest" && configPath && basename2(configPath).toLowerCase() === "package.json")
+        continue;
+      const config = configPath ? readEvidence(root, resolve6(directory, configPath)) : null;
+      if (configPath && config === null)
+        continue;
+      if (runner.runner === "vitest" && ["ts", "mts", "js", "mjs", "json"].some((extension) => existsSync4(resolve6(directory, `vitest.workspace.${extension}`))))
+        continue;
+      const selection = config !== null ? configSelection(config, configPath, runner.runner) : { root: undefined, includes: undefined, excludes: undefined };
+      if (!selection)
+        continue;
+      const defaultRoot = runner.runner === "jest" && configPath ? dirname(resolve6(directory, configPath)) : directory;
+      const testRoot = selection.root !== undefined ? resolve6(directory, selection.root) : defaultRoot;
+      if (!within(root, testRoot) || !within(testRoot, path))
+        continue;
+      const relativePath = relative2(testRoot, path).replace(/\\/g, "/");
+      const selectedPath = runner.runner === "jest" ? path.replace(/\\/g, "/") : relativePath;
+      const { includes, excludes } = selection;
+      if ([...includes ?? [], ...excludes ?? []].some((pattern) => pattern.startsWith("!")))
+        continue;
+      if ([...includes ?? [], ...excludes ?? []].some((pattern) => /[\[\]]|[?*+@!]\(/.test(pattern)))
+        continue;
+      if (excludes?.some((pattern) => matchesPattern(relativePath, pattern)))
+        continue;
+      if (runner.runner === "jest" && /(?:^|\/)node_modules\//.test(relativePath))
+        continue;
+      if (runner.runner === "vitest" && excludes === undefined && (/(?:^|\/)(?:node_modules|dist|cypress|\.idea|\.git|\.cache|\.output|\.temp)\//.test(relativePath) || /(?:^|\/)(?:karma|rollup|webpack|vite|vitest|jest|ava|babel|nyc|cypress|tsup|build|eslint|prettier)\.config\./.test(relativePath)))
+        continue;
+      if (includes && !includes.some((pattern) => matchesPattern(selectedPath, pattern)))
+        continue;
+      if (!includes && !/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(relativePath))
+        continue;
+      const score = includes?.length ? 2 : requiredRunner ? 1 : 0;
+      if (score)
+        candidates.push({ command: packageScriptCommand(root, directory, name), score });
+    }
+    const strongest = Math.max(0, ...candidates.map((candidate) => candidate.score));
+    const selected = candidates.filter((candidate) => candidate.score === strongest);
+    if (strongest === 2 || selected.length === 1)
+      return selected.map((candidate) => candidate.command);
+    return [];
+  }
+  return [];
+}
+function routeRepositoryFocusedTestCommand(repoRoot, command) {
+  const root = resolve6(repoRoot);
+  const argv = tokenizeTrustedValidationCommand(command);
+  if (!argv || argv[0] !== "bun")
+    return [command];
+  let index = 1;
+  let cwd = root;
+  if (argv[index] === "--cwd") {
+    cwd = resolve6(root, argv[index + 1] ?? ".");
+    index += 2;
+  }
+  if (!within(root, cwd) || argv[index] !== "test")
+    return [command];
+  const tail = argv.slice(index + 1);
+  const targets = [];
+  const narrowOptions = new Set(["-t", "--test-name-pattern", "--timeout"]);
+  for (let cursor = 0;cursor < tail.length; cursor += 1) {
+    const token = tail[cursor];
+    if (narrowOptions.has(token)) {
+      if (!tail[cursor + 1])
+        return [command];
+      cursor += 1;
+      continue;
+    }
+    if (token.includes("=") && narrowOptions.has(token.split("=", 1)[0]))
+      continue;
+    if (token.startsWith("-") || !/\.[cm]?[jt]sx?$/i.test(token))
+      return [command];
+    targets.push({ path: token, index: cursor });
+  }
+  if (!targets.length || targets.length > 16)
+    return [command];
+  const output = [];
+  const routedIndexes = new Set;
+  for (const target of targets) {
+    const resolved = resolve6(cwd, target.path);
+    const routed = within(root, resolved) ? commandsForTest(root, resolved) : [];
+    if (routed.length) {
+      output.push(...routed);
+      routedIndexes.add(target.index);
+    }
+  }
+  if (!output.length)
+    return [command];
+  if (routedIndexes.size < targets.length)
+    output.push([...argv.slice(0, index + 1), ...tail.filter((_, tailIndex) => !routedIndexes.has(tailIndex))].map(quote).join(" "));
+  return [...new Set(output)];
+}
+
 // packages/shared/src/repo_validation.ts
 var FALLBACK_VALIDATION_STEP = "git diff --check";
 var MAX_JSON_BYTES = 1e6;
@@ -4940,7 +5434,7 @@ function readJson(path) {
   }
 }
 function ecosystemForPath(path) {
-  const filename = basename2(path).toLowerCase();
+  const filename = basename3(path).toLowerCase();
   const extension = extname(path).toLowerCase();
   if (filename === "package.json" || ["bun.lock", "bun.lockb", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"].includes(filename)) {
     return "package";
@@ -5074,10 +5568,10 @@ function validationSearchDirectories(paths) {
     out.push(normalized);
   };
   for (const path of paths) {
-    let directory = dirname(path).replace(/\\/g, "/");
+    let directory = dirname2(path).replace(/\\/g, "/");
     while (directory && directory !== ".") {
       add(directory);
-      const parent = dirname(directory).replace(/\\/g, "/");
+      const parent = dirname2(directory).replace(/\\/g, "/");
       if (parent === directory)
         break;
       directory = parent;
@@ -5087,33 +5581,33 @@ function validationSearchDirectories(paths) {
   return out;
 }
 function packageManagerAt(directory) {
-  const manifest = readJson(resolve6(directory, "package.json"));
+  const manifest = readJson(resolve7(directory, "package.json"));
   const declared = String(manifest?.packageManager ?? "").trim().split("@")[0]?.toLowerCase();
   if (["bun", "pnpm", "yarn", "npm"].includes(declared)) {
     return declared;
   }
-  if (existsSync4(resolve6(directory, "bun.lock")) || existsSync4(resolve6(directory, "bun.lockb"))) {
+  if (existsSync5(resolve7(directory, "bun.lock")) || existsSync5(resolve7(directory, "bun.lockb"))) {
     return "bun";
   }
-  if (existsSync4(resolve6(directory, "pnpm-lock.yaml")))
+  if (existsSync5(resolve7(directory, "pnpm-lock.yaml")))
     return "pnpm";
-  if (existsSync4(resolve6(directory, "yarn.lock")))
+  if (existsSync5(resolve7(directory, "yarn.lock")))
     return "yarn";
-  if (existsSync4(resolve6(directory, "package-lock.json")))
+  if (existsSync5(resolve7(directory, "package-lock.json")))
     return "npm";
   return null;
 }
 function resolvePackageManager(repoRoot, manifestDirectory) {
-  const absoluteRoot = resolve6(repoRoot);
-  let cursor = resolve6(manifestDirectory);
+  const absoluteRoot = resolve7(repoRoot);
+  let cursor = resolve7(manifestDirectory);
   while (true) {
     const manager = packageManagerAt(cursor);
     if (manager)
       return manager;
     if (cursor === absoluteRoot)
       break;
-    const parent = dirname(cursor);
-    const relativeParent = relative2(absoluteRoot, parent).replace(/\\/g, "/");
+    const parent = dirname2(cursor);
+    const relativeParent = relative3(absoluteRoot, parent).replace(/\\/g, "/");
     if (parent === cursor || relativeParent.startsWith("../"))
       break;
     cursor = parent;
@@ -5121,11 +5615,11 @@ function resolvePackageManager(repoRoot, manifestDirectory) {
   return "npm";
 }
 function isJavaScriptTestPath(path) {
-  return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path);
+  return /(^|\/)(?:__tests__|tests?)(\/|$)|\.(?:test|spec|vitest)\.[cm]?[jt]sx?$/i.test(path);
 }
 function packageValidationSteps(repoRoot, directory, changedPaths) {
-  const manifestDirectory = resolve6(repoRoot, directory || ".");
-  const manifest = readJson(resolve6(manifestDirectory, "package.json"));
+  const manifestDirectory = resolve7(repoRoot, directory || ".");
+  const manifest = readJson(resolve7(manifestDirectory, "package.json"));
   if (!manifest)
     return null;
   const manager = resolvePackageManager(repoRoot, manifestDirectory);
@@ -5135,13 +5629,13 @@ function packageValidationSteps(repoRoot, directory, changedPaths) {
     return null;
   if (manager === "bun") {
     const focusedTests = changedPaths.filter(isJavaScriptTestPath).map((path) => {
-      const relativeTest = relative2(manifestDirectory, resolve6(repoRoot, path)).replace(/\\/g, "/");
+      const relativeTest = relative3(manifestDirectory, resolve7(repoRoot, path)).replace(/\\/g, "/");
       if (!relativeTest || relativeTest.startsWith("../"))
         return "";
       return commandPathArg(relativeTest, true);
     }).filter(Boolean).slice(0, 4);
     if (focusedTests.length > 0) {
-      return [`${directory ? `bun --cwd ${directoryArg}` : "bun"} test ${focusedTests.join(" ")}`];
+      return routeRepositoryFocusedTestCommand(repoRoot, `${directory ? `bun --cwd ${directoryArg}` : "bun"} test ${focusedTests.join(" ")}`);
     }
   }
   const scriptName = ["test", "check", "lint"].find((name) => {
@@ -5168,7 +5662,7 @@ function packageValidationSteps(repoRoot, directory, changedPaths) {
   ];
 }
 function pythonValidationSteps(repoRoot, directory, paths) {
-  const root = resolve6(repoRoot, directory || ".");
+  const root = resolve7(repoRoot, directory || ".");
   const manifestNames = [
     "pyproject.toml",
     "setup.cfg",
@@ -5177,14 +5671,14 @@ function pythonValidationSteps(repoRoot, directory, paths) {
     "tox.ini",
     "requirements.txt"
   ];
-  const hasManifest = manifestNames.some((name) => existsSync4(resolve6(root, name)));
+  const hasManifest = manifestNames.some((name) => existsSync5(resolve7(root, name)));
   const pythonPaths = paths.filter((path) => extname(path).toLowerCase() === ".py");
   if (!hasManifest)
     return null;
   const testPaths = pythonPaths.filter((path) => /(^|\/)(?:tests?|specs?)(\/|$)|(^|\/)test_[^/]+\.py$|_test\.py$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
   let evidence = "";
   for (const name of [...manifestNames, "requirements-dev.txt", "conftest.py"]) {
-    const read = readTextBounded(resolve6(root, name));
+    const read = readTextBounded(resolve7(root, name));
     if (read)
       evidence += `
 ${read.text}`;
@@ -5192,7 +5686,7 @@ ${read.text}`;
   if (testPaths.length > 0 || /\bpytest\b/i.test(evidence)) {
     return [`python -m pytest${testPaths.length > 0 ? ` ${testPaths.join(" ")}` : ""}`];
   }
-  if (existsSync4(resolve6(root, "manage.py"))) {
+  if (existsSync5(resolve7(root, "manage.py"))) {
     const managePath = commandPathArg(directory ? `${directory}/manage.py` : "manage.py");
     return managePath ? [`python ${managePath} test`] : null;
   }
@@ -5200,13 +5694,13 @@ ${read.text}`;
   return compileTargets.length > 0 ? [`python -m compileall ${compileTargets.join(" ")}`] : null;
 }
 function goValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve6(repoRoot, directory || ".", "go.mod")))
+  if (!existsSync5(resolve7(repoRoot, directory || ".", "go.mod")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `go -C ${directoryArg} test ./...` : "go test ./..."];
 }
 function rustValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve6(repoRoot, directory || ".", "Cargo.toml")))
+  if (!existsSync5(resolve7(repoRoot, directory || ".", "Cargo.toml")))
     return null;
   if (!directory)
     return ["cargo test"];
@@ -5214,19 +5708,19 @@ function rustValidationSteps(repoRoot, directory) {
   return manifestArg ? [`cargo test --manifest-path ${manifestArg}`] : null;
 }
 function jvmValidationSteps(repoRoot, directory) {
-  const root = resolve6(repoRoot, directory || ".");
+  const root = resolve7(repoRoot, directory || ".");
   const directoryArg = directory ? commandPathArg(directory) : "";
-  if (existsSync4(resolve6(root, "pom.xml"))) {
+  if (existsSync5(resolve7(root, "pom.xml"))) {
     const manifestArg = commandPathArg(directory ? `${directory}/pom.xml` : "pom.xml");
     return [directory && manifestArg ? `mvn -f ${manifestArg} test` : "mvn test"];
   }
-  if (existsSync4(resolve6(root, "build.gradle")) || existsSync4(resolve6(root, "build.gradle.kts"))) {
+  if (existsSync5(resolve7(root, "build.gradle")) || existsSync5(resolve7(root, "build.gradle.kts"))) {
     return [directoryArg ? `gradle -p ${directoryArg} test` : "gradle test"];
   }
   return null;
 }
 function dotnetValidationSteps(repoRoot, directory, paths) {
-  const root = resolve6(repoRoot, directory || ".");
+  const root = resolve7(repoRoot, directory || ".");
   const explicitProject = paths.find((path) => /\.(?:sln|csproj|fsproj)$/i.test(path));
   let project = explicitProject ?? "";
   if (!project) {
@@ -5241,25 +5735,25 @@ function dotnetValidationSteps(repoRoot, directory, paths) {
   return projectArg ? [`dotnet test ${projectArg}`] : null;
 }
 function rubyValidationSteps(repoRoot, directory, paths) {
-  const root = resolve6(repoRoot, directory || ".");
+  const root = resolve7(repoRoot, directory || ".");
   const rubyPaths = paths.filter((path) => extname(path).toLowerCase() === ".rb");
-  const hasRubyProjectEvidence = existsSync4(resolve6(root, "Gemfile")) || existsSync4(resolve6(root, "Rakefile")) || existsSync4(resolve6(root, ".rspec"));
+  const hasRubyProjectEvidence = existsSync5(resolve7(root, "Gemfile")) || existsSync5(resolve7(root, "Rakefile")) || existsSync5(resolve7(root, ".rspec"));
   if (directory && !hasRubyProjectEvidence)
     return null;
-  if (!directory && existsSync4(resolve6(root, "Gemfile"))) {
+  if (!directory && existsSync5(resolve7(root, "Gemfile"))) {
     const tests = rubyPaths.filter((path) => /(^|\/)spec(s)?(\/|$)|_spec\.rb$/i.test(path)).map((path) => commandPathArg(path)).filter(Boolean).slice(0, 4);
-    if (tests.length > 0 || existsSync4(resolve6(root, "spec")) || existsSync4(resolve6(root, ".rspec"))) {
+    if (tests.length > 0 || existsSync5(resolve7(root, "spec")) || existsSync5(resolve7(root, ".rspec"))) {
       return [`bundle exec rspec${tests.length > 0 ? ` ${tests.join(" ")}` : ""}`];
     }
-    if (existsSync4(resolve6(root, "Rakefile")))
+    if (existsSync5(resolve7(root, "Rakefile")))
       return ["bundle exec rake test"];
   }
   const target = commandPathArg(rubyPaths[0] ?? "");
   return target ? [`ruby -c ${target}`] : null;
 }
 function phpValidationSteps(repoRoot, directory, paths) {
-  const root = resolve6(repoRoot, directory || ".");
-  const composer = readJson(resolve6(root, "composer.json"));
+  const root = resolve7(repoRoot, directory || ".");
+  const composer = readJson(resolve7(root, "composer.json"));
   if (directory && !composer)
     return null;
   const scripts = composer?.scripts && typeof composer.scripts === "object" && !Array.isArray(composer.scripts) ? composer.scripts : null;
@@ -5275,16 +5769,16 @@ function changedManifestAt(paths, directory, names) {
   const expectedDir = directory || ".";
   const lowerNames = new Set(names.map((name) => name.toLowerCase()));
   return paths.some((path) => {
-    const pathDirectory = dirname(path).replace(/\\/g, "/");
-    return (pathDirectory || ".") === expectedDir && lowerNames.has(basename2(path).toLowerCase());
+    const pathDirectory = dirname2(path).replace(/\\/g, "/");
+    return (pathDirectory || ".") === expectedDir && lowerNames.has(basename3(path).toLowerCase());
   });
 }
 function makeValidationSteps(repoRoot, directory) {
-  const root = resolve6(repoRoot, directory || ".");
-  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync4(resolve6(root, name)));
+  const root = resolve7(repoRoot, directory || ".");
+  const makefile = ["Makefile", "makefile", "GNUmakefile"].find((name) => existsSync5(resolve7(root, name)));
   if (!makefile)
     return null;
-  const evidence = readTextBounded(resolve6(root, makefile));
+  const evidence = readTextBounded(resolve7(root, makefile));
   if (!evidence)
     return null;
   const target = ["test", "check"].find((name) => new RegExp(`^${name}\\s*:(?![=])`, "m").test(evidence.text));
@@ -5294,7 +5788,7 @@ function makeValidationSteps(repoRoot, directory) {
   return [directoryArg ? `make -C ${directoryArg} ${target}` : `make ${target}`];
 }
 function cmakeValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve6(repoRoot, directory || ".", "CMakeLists.txt")))
+  if (!existsSync5(resolve7(repoRoot, directory || ".", "CMakeLists.txt")))
     return null;
   const sourceArg = directory ? commandPathArg(directory) : ".";
   const buildPath = directory ? `${directory}/build` : "build";
@@ -5308,13 +5802,13 @@ function cmakeValidationSteps(repoRoot, directory) {
   ];
 }
 function hasBazelWorkspaceAt(repoRoot) {
-  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync4(resolve6(repoRoot, name)));
+  return ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"].some((name) => existsSync5(resolve7(repoRoot, name)));
 }
 function bazelValidationSteps(repoRoot, directory) {
   if (!hasBazelWorkspaceAt(repoRoot))
     return null;
-  const root = resolve6(repoRoot, directory || ".");
-  const hasPackage = existsSync4(resolve6(root, "BUILD")) || existsSync4(resolve6(root, "BUILD.bazel"));
+  const root = resolve7(repoRoot, directory || ".");
+  const hasPackage = existsSync5(resolve7(root, "BUILD")) || existsSync5(resolve7(root, "BUILD.bazel"));
   if (directory && !hasPackage)
     return null;
   const target = directory ? `//${directory}/...` : "//...";
@@ -5339,15 +5833,15 @@ function nativeValidationSteps(repoRoot, directory, paths) {
   return cmakeValidationSteps(repoRoot, directory) ?? bazelValidationSteps(repoRoot, directory) ?? makeValidationSteps(repoRoot, directory);
 }
 function protobufValidationSteps(repoRoot, directory) {
-  const root = resolve6(repoRoot, directory || ".");
-  if (!existsSync4(resolve6(root, "buf.yaml")) && !existsSync4(resolve6(root, "buf.work.yaml"))) {
+  const root = resolve7(repoRoot, directory || ".");
+  if (!existsSync5(resolve7(root, "buf.yaml")) && !existsSync5(resolve7(root, "buf.work.yaml"))) {
     return null;
   }
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `buf lint ${directoryArg}` : "buf lint"];
 }
 function swiftValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve6(repoRoot, directory || ".", "Package.swift")))
+  if (!existsSync5(resolve7(repoRoot, directory || ".", "Package.swift")))
     return null;
   const directoryArg = directory ? commandPathArg(directory) : "";
   return [directoryArg ? `swift test --package-path ${directoryArg}` : "swift test"];
@@ -5360,14 +5854,14 @@ function withoutYamlComments(text) {
 `);
 }
 function dartValidationSteps(repoRoot, directory, paths) {
-  const root = resolve6(repoRoot, directory || ".");
-  const pubspec = readTextBounded(resolve6(root, "pubspec.yaml"));
+  const root = resolve7(repoRoot, directory || ".");
+  const pubspec = readTextBounded(resolve7(root, "pubspec.yaml"));
   if (!pubspec)
     return null;
   const pubspecEvidence = withoutYamlComments(pubspec.text);
   const executable = /\bsdk\s*:\s*flutter\b|^flutter\s*:/m.test(pubspecEvidence) ? "flutter" : "dart";
   if (directory && executable === "flutter") {
-    const rootPubspec = readTextBounded(resolve6(repoRoot, "pubspec.yaml"));
+    const rootPubspec = readTextBounded(resolve7(repoRoot, "pubspec.yaml"));
     if (!rootPubspec || !/^workspace\s*:/m.test(withoutYamlComments(rootPubspec.text)) || !/^resolution\s*:\s*workspace\s*$/m.test(pubspecEvidence)) {
       return null;
     }
@@ -5381,12 +5875,12 @@ function dartValidationSteps(repoRoot, directory, paths) {
     return [`${executable} test ${focusedTests.join(" ")}`];
   if (!directory)
     return [`${executable} test`];
-  const relativeTests = existsSync4(resolve6(root, "test")) ? `${directory}/test` : existsSync4(resolve6(root, "integration_test")) ? `${directory}/integration_test` : "";
+  const relativeTests = existsSync5(resolve7(root, "test")) ? `${directory}/test` : existsSync5(resolve7(root, "integration_test")) ? `${directory}/integration_test` : "";
   const target = commandPathArg(relativeTests);
   return target ? [`${executable} test ${target}`] : null;
 }
 function elixirValidationSteps(repoRoot, directory, paths) {
-  if (!existsSync4(resolve6(repoRoot, directory || ".", "mix.exs")))
+  if (!existsSync5(resolve7(repoRoot, directory || ".", "mix.exs")))
     return null;
   if (directory) {
     const directoryArg = commandPathArg(directory);
@@ -5396,7 +5890,7 @@ function elixirValidationSteps(repoRoot, directory, paths) {
   return [`mix test${focusedTests.length > 0 ? ` ${focusedTests.join(" ")}` : ""}`];
 }
 function hasCabalManifest(directory) {
-  if (existsSync4(resolve6(directory, "cabal.project")))
+  if (existsSync5(resolve7(directory, "cabal.project")))
     return true;
   try {
     return readdirSync2(directory).some((entry) => entry.toLowerCase().endsWith(".cabal"));
@@ -5405,8 +5899,8 @@ function hasCabalManifest(directory) {
   }
 }
 function haskellValidationSteps(repoRoot, directory) {
-  const root = resolve6(repoRoot, directory || ".");
-  if (existsSync4(resolve6(root, "stack.yaml"))) {
+  const root = resolve7(repoRoot, directory || ".");
+  if (existsSync5(resolve7(root, "stack.yaml"))) {
     if (!directory)
       return ["stack test"];
     const yamlArg = commandPathArg(`${directory}/stack.yaml`);
@@ -5468,7 +5962,7 @@ function ednMapAfterKeyword(text, keyword) {
 function clojureValidationSteps(repoRoot, directory) {
   if (directory)
     return null;
-  const deps = readTextBounded(resolve6(repoRoot, "deps.edn"));
+  const deps = readTextBounded(resolve7(repoRoot, "deps.edn"));
   if (deps) {
     const testAlias = ednMapAfterKeyword(deps.text, ":test");
     if (/:exec-fn\b/.test(testAlias))
@@ -5476,12 +5970,12 @@ function clojureValidationSteps(repoRoot, directory) {
     if (/:main-opts\b/.test(testAlias))
       return ["clojure -M:test"];
   }
-  if (existsSync4(resolve6(repoRoot, "project.clj")))
+  if (existsSync5(resolve7(repoRoot, "project.clj")))
     return ["lein test"];
   return null;
 }
 function zigValidationSteps(repoRoot, directory) {
-  if (!existsSync4(resolve6(repoRoot, directory || ".", "build.zig")))
+  if (!existsSync5(resolve7(repoRoot, directory || ".", "build.zig")))
     return null;
   if (!directory)
     return ["zig build test"];
@@ -5553,7 +6047,7 @@ function syntaxFallbackForEcosystem(ecosystem, paths) {
   return null;
 }
 function isFallbackEligiblePath(path) {
-  const filename = basename2(path).toLowerCase();
+  const filename = basename3(path).toLowerCase();
   const extension = extname(path).toLowerCase();
   if (/^(?:readme|license|licence|changelog|contributing|authors|notice)(?:\..*)?$/.test(filename)) {
     return true;
@@ -5592,7 +6086,7 @@ function isFallbackEligiblePath(path) {
 }
 function inferRepositoryValidationSteps(options) {
   const maxSteps = Math.max(1, Math.min(8, Math.floor(options.maxSteps ?? 4)));
-  const repoRoot = resolve6(options.repoRoot || ".");
+  const repoRoot = resolve7(options.repoRoot || ".");
   const paths = (options.changedPaths ?? []).map(normalizeRepoPath).filter(Boolean);
   const plans = [];
   for (const group of pathsByEcosystem(paths)) {
@@ -5729,12 +6223,12 @@ var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 var TRUTHY2 = new Set(["1", "true", "yes", "on"]);
 var FALSY2 = new Set(["0", "false", "no", "off"]);
 // apps/workerpals/src/backends/backend_config.ts
-import { existsSync as existsSync8, readFileSync as readFileSync6 } from "fs";
+import { existsSync as existsSync9, readFileSync as readFileSync7 } from "fs";
 import { join as join8 } from "path";
 
 // apps/workerpals/src/common/generic_python_executor.ts
-import { existsSync as existsSync6 } from "fs";
-import { dirname as dirname3, join as join7, resolve as resolve8 } from "path";
+import { existsSync as existsSync7 } from "fs";
+import { dirname as dirname4, join as join7, resolve as resolve9 } from "path";
 
 // apps/workerpals/src/common/execution_utils.ts
 var DEFAULT_CONFIG = loadPushPalsConfig();
@@ -5857,9 +6351,9 @@ function filterResultLines(stdout, executorResultPrefix = resolveOutputCompactio
 
 // apps/workerpals/src/common/sandbox_env.ts
 import { createHash as createHash4 } from "crypto";
-import { existsSync as existsSync5, mkdirSync, readFileSync as readFileSync5, writeFileSync } from "fs";
+import { existsSync as existsSync6, mkdirSync, readFileSync as readFileSync6, writeFileSync } from "fs";
 import { homedir as homedir2, tmpdir as tmpdir2 } from "os";
-import { basename as basename3, dirname as dirname2, join as join5, resolve as resolve7 } from "path";
+import { basename as basename4, dirname as dirname3, join as join5, resolve as resolve8 } from "path";
 
 // apps/workerpals/src/common/direct_worktree.ts
 import { createHash as createHash3 } from "crypto";
@@ -5949,7 +6443,7 @@ function resolveBunExecutableFromEnv(sourceEnv, platform = process.platform, cur
       continue;
     for (const candidate of candidates) {
       const fullPath = join5(dir, candidate);
-      if (existsSync5(fullPath))
+      if (existsSync6(fullPath))
         return fullPath;
     }
   }
@@ -5958,7 +6452,7 @@ function resolveBunExecutableFromEnv(sourceEnv, platform = process.platform, cur
 function commandDirectory(value) {
   if (!/[\\/]/.test(value))
     return "";
-  return dirname2(value);
+  return dirname3(value);
 }
 function withResolvedBunOnPath(sourceEnv, platform = process.platform, currentExecPathOverride = process.execPath) {
   const env = normalizePathEnv(stringEnv(sourceEnv), platform);
@@ -5983,8 +6477,8 @@ function withResolvedBunOnPath(sourceEnv, platform = process.platform, currentEx
   return out;
 }
 function safeRepoSlug(repo, platform = process.platform) {
-  const leaf = basename3(resolve7(repo)).replace(/[^A-Za-z0-9_.-]+/g, "-") || "repo";
-  const resolvedRepo = resolve7(repo);
+  const leaf = basename4(resolve8(repo)).replace(/[^A-Za-z0-9_.-]+/g, "-") || "repo";
+  const resolvedRepo = resolve8(repo);
   const hashInput = platform === "win32" ? resolvedRepo.replace(/\\/g, "/").toLowerCase() : resolvedRepo;
   const hash = createHash4("sha256").update(hashInput).digest("hex").slice(0, 12);
   if (platform === "win32")
@@ -5992,30 +6486,30 @@ function safeRepoSlug(repo, platform = process.platform) {
   return `${leaf}-${hash}`;
 }
 function browserCacheRepoKey(repo, platform = process.platform) {
-  const normalized = resolve7(repo).replace(/\\/g, "/");
+  const normalized = resolve8(repo).replace(/\\/g, "/");
   const marker = "/.worktrees/";
   const markerIndex = normalized.lastIndexOf(marker);
   if (markerIndex >= 0)
     return normalized.slice(0, markerIndex);
-  return directWorktreePoolRoot(repo, platform) ?? resolve7(repo);
+  return directWorktreePoolRoot(repo, platform) ?? resolve8(repo);
 }
 function resolveWorkerSandboxRoot(repo, platform = process.platform, homeRoot = homedir2(), tempRoot = tmpdir2()) {
-  const parent = platform === "win32" ? resolve7(homeRoot, WINDOWS_WORKER_SANDBOX_ROOT_NAME) : resolve7(tempRoot, TEMP_WORKER_SANDBOX_ROOT_NAME);
-  return resolve7(parent, safeRepoSlug(repo, platform));
+  const parent = platform === "win32" ? resolve8(homeRoot, WINDOWS_WORKER_SANDBOX_ROOT_NAME) : resolve8(tempRoot, TEMP_WORKER_SANDBOX_ROOT_NAME);
+  return resolve8(parent, safeRepoSlug(repo, platform));
 }
 function defaultExpoPortForRepo(repo) {
-  const hashPrefix = createHash4("sha256").update(resolve7(repo)).digest("hex").slice(0, 8);
+  const hashPrefix = createHash4("sha256").update(resolve8(repo)).digest("hex").slice(0, 8);
   const offset = Number.parseInt(hashPrefix, 16) % 1000;
   return String(19006 + offset);
 }
 function resolveExpoRouterAppRoot(repo) {
   try {
-    const packageJson = JSON.parse(readFileSync5(resolve7(repo, "package.json"), "utf8"));
+    const packageJson = JSON.parse(readFileSync6(resolve8(repo, "package.json"), "utf8"));
     const usesExpoRouter = typeof packageJson.main === "string" && packageJson.main.includes("expo-router") || packageJson.dependencies?.["expo-router"] !== undefined || packageJson.devDependencies?.["expo-router"] !== undefined;
     if (!usesExpoRouter)
       return;
-    for (const candidate of [resolve7(repo, "src", "app"), resolve7(repo, "app")]) {
-      if (existsSync5(candidate))
+    for (const candidate of [resolve8(repo, "src", "app"), resolve8(repo, "app")]) {
+      if (existsSync6(candidate))
         return candidate;
     }
   } catch {}
@@ -6029,9 +6523,9 @@ function ensureDirs(paths) {
   }
 }
 function ensureSandboxGitConfig(homeDir) {
-  const gitConfigPath = resolve7(homeDir, ".gitconfig");
+  const gitConfigPath = resolve8(homeDir, ".gitconfig");
   try {
-    const existing = existsSync5(gitConfigPath) ? readFileSync5(gitConfigPath, "utf8") : "";
+    const existing = existsSync6(gitConfigPath) ? readFileSync6(gitConfigPath, "utf8") : "";
     if (/(^|\n)\s*directory\s*=\s*\*/.test(existing))
       return;
     const prefix = existing.trim() ? `${existing.replace(/\s+$/, "")}
@@ -6051,9 +6545,9 @@ function withWorkerNodeOptions(value) {
 }
 function withWorkerNodePath(repo, value, platform = process.platform) {
   const delimiter = pathListDelimiter(platform);
-  const jobNodeModules = resolve7(repo, "node_modules");
+  const jobNodeModules = resolve8(repo, "node_modules");
   const existing = (value ?? "").split(delimiter).map((entry) => entry.trim()).filter(Boolean);
-  const remaining = existing.filter((entry) => !(platform === "win32" ? resolve7(entry).toLowerCase() === jobNodeModules.toLowerCase() : resolve7(entry) === jobNodeModules));
+  const remaining = existing.filter((entry) => !(platform === "win32" ? resolve8(entry).toLowerCase() === jobNodeModules.toLowerCase() : resolve8(entry) === jobNodeModules));
   return [jobNodeModules, ...remaining].join(delimiter);
 }
 function resolveOriginalHome(env) {
@@ -6062,8 +6556,8 @@ function resolveOriginalHome(env) {
 function resolveCodexHome(env, originalHome) {
   if (env.CODEX_HOME)
     return env.CODEX_HOME;
-  const defaultCodexHome = resolve7(originalHome, ".codex");
-  return existsSync5(defaultCodexHome) ? defaultCodexHome : undefined;
+  const defaultCodexHome = resolve8(originalHome, ".codex");
+  return existsSync6(defaultCodexHome) ? defaultCodexHome : undefined;
 }
 function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform = process.platform) {
   const env = withResolvedBunOnPath(sourceEnv);
@@ -6071,15 +6565,15 @@ function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform =
   const sandboxHomeRoot = platform === "win32" ? env.USERPROFILE || originalHome : originalHome;
   const codexHome = resolveCodexHome(env, originalHome);
   const baseDir = resolveWorkerSandboxRoot(repo, platform, sandboxHomeRoot);
-  const homeDir = resolve7(baseDir, "home");
-  const cacheDir = resolve7(baseDir, "cache");
-  const expoDir = resolve7(baseDir, "expo");
-  const tempDir = resolve7(baseDir, "tmp");
-  const configDir = resolve7(baseDir, "config");
-  const roamingDir = resolve7(baseDir, "roaming");
-  const localAppDataDir = resolve7(baseDir, "local");
-  const powershellAnalysisCachePath = resolve7(localAppDataDir, "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache");
-  const playwrightBrowsersDir = env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0" ? env.PLAYWRIGHT_BROWSERS_PATH : resolve7(resolveWorkerSandboxRoot(browserCacheRepoKey(repo, platform), platform, sandboxHomeRoot), platform === "win32" ? WINDOWS_PLAYWRIGHT_CACHE_NAME : TEMP_PLAYWRIGHT_CACHE_NAME);
+  const homeDir = resolve8(baseDir, "home");
+  const cacheDir = resolve8(baseDir, "cache");
+  const expoDir = resolve8(baseDir, "expo");
+  const tempDir = resolve8(baseDir, "tmp");
+  const configDir = resolve8(baseDir, "config");
+  const roamingDir = resolve8(baseDir, "roaming");
+  const localAppDataDir = resolve8(baseDir, "local");
+  const powershellAnalysisCachePath = resolve8(localAppDataDir, "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache");
+  const playwrightBrowsersDir = env.PLAYWRIGHT_BROWSERS_PATH && env.PLAYWRIGHT_BROWSERS_PATH !== "0" ? env.PLAYWRIGHT_BROWSERS_PATH : resolve8(resolveWorkerSandboxRoot(browserCacheRepoKey(repo, platform), platform, sandboxHomeRoot), platform === "win32" ? WINDOWS_PLAYWRIGHT_CACHE_NAME : TEMP_PLAYWRIGHT_CACHE_NAME);
   const defaultExpoPort = defaultExpoPortForRepo(repo);
   const expoRouterAppRoot = resolveExpoRouterAppRoot(repo);
   ensureDirs([
@@ -6089,8 +6583,8 @@ function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform =
     tempDir,
     configDir,
     ...platform === "win32" ? [roamingDir, localAppDataDir] : [],
-    ...platform === "win32" ? [dirname2(powershellAnalysisCachePath)] : [],
-    resolve7(cacheDir, "npm"),
+    ...platform === "win32" ? [dirname3(powershellAnalysisCachePath)] : [],
+    resolve8(cacheDir, "npm"),
     playwrightBrowsersDir
   ]);
   ensureSandboxGitConfig(homeDir);
@@ -6106,7 +6600,7 @@ function buildWorkerSandboxWritableEnv(repo, sourceEnv = process.env, platform =
       LOCALAPPDATA: localAppDataDir,
       PSModuleAnalysisCachePath: powershellAnalysisCachePath
     } : {},
-    npm_config_cache: resolve7(cacheDir, "npm"),
+    npm_config_cache: resolve8(cacheDir, "npm"),
     PLAYWRIGHT_BROWSERS_PATH: env.PLAYWRIGHT_BROWSERS_PATH ?? playwrightBrowsersDir,
     EXPO_HOME: expoDir,
     EXPO_NO_TELEMETRY: env.EXPO_NO_TELEMETRY ?? "1",
@@ -6281,7 +6775,7 @@ function coerceJobCandidateState(value) {
 function resolveRuntimeSettings(config, runtimeConfig) {
   const workerCfg = runtimeConfig.workerpals;
   const rawPython = String(workerCfg[config.pythonConfigKey] ?? "python");
-  const pythonBin = rawPython.includes("/") || rawPython.includes("\\") ? resolve8(runtimeConfig.projectRoot, rawPython) : rawPython;
+  const pythonBin = rawPython.includes("/") || rawPython.includes("\\") ? resolve9(runtimeConfig.projectRoot, rawPython) : rawPython;
   const rawTimeout = Number(workerCfg[config.timeoutConfigKey]);
   const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(1e4, Math.floor(rawTimeout)) : 300000;
   return { pythonBin, timeoutMs };
@@ -6337,7 +6831,7 @@ function uniqueStrings(values) {
 function resolveGenericPythonExecutorScriptPath(config, runtimeConfig) {
   const candidates = [];
   if (config.scriptSegments && config.scriptSegments.length > 0) {
-    const runtimeRoot = dirname3(runtimeConfig.configDir);
+    const runtimeRoot = dirname4(runtimeConfig.configDir);
     candidates.push(join7(runtimeRoot, "sandbox", ...config.scriptSegments));
     candidates.push(config.scriptPath);
     candidates.push(join7(runtimeRoot, ...config.scriptSegments));
@@ -6345,9 +6839,9 @@ function resolveGenericPythonExecutorScriptPath(config, runtimeConfig) {
   } else {
     candidates.push(config.scriptPath);
   }
-  const uniqueCandidates = uniqueStrings(candidates.map((candidate) => resolve8(candidate)));
+  const uniqueCandidates = uniqueStrings(candidates.map((candidate) => resolve9(candidate)));
   return {
-    scriptPath: uniqueCandidates.find((candidate) => existsSync6(candidate)) ?? null,
+    scriptPath: uniqueCandidates.find((candidate) => existsSync7(candidate)) ?? null,
     candidates: uniqueCandidates
   };
 }
@@ -6763,11 +7257,11 @@ function createGenericPythonExecutor(config) {
 }
 
 // apps/workerpals/src/common/runtime_paths.ts
-import { resolve as resolve9 } from "path";
+import { resolve as resolve10 } from "path";
 function resolveWorkerpalsSourcePath(...segments) {
   const configuredRoot = String(process.env.PUSHPALS_WORKERPALS_SOURCE_ROOT ?? "").trim();
-  const sourceRoot = configuredRoot || resolve9(import.meta.dir, "..");
-  return resolve9(sourceRoot, ...segments);
+  const sourceRoot = configuredRoot || resolve10(import.meta.dir, "..");
+  return resolve10(sourceRoot, ...segments);
 }
 
 // apps/workerpals/src/backends/miniswe_backend.ts
@@ -6846,7 +7340,7 @@ var OPENAI_CODEX_BACKEND = {
 };
 
 // apps/workerpals/src/backends/openhands_task_execute.ts
-import { existsSync as existsSync7 } from "fs";
+import { existsSync as existsSync8 } from "fs";
 
 // apps/workerpals/src/timeout_policy.ts
 var DEFAULT_DOCKER_TIMEOUT_MS = 1860000;
@@ -6999,7 +7493,7 @@ function extractClarificationQuestionFromOutput(output) {
 async function executeWithOpenHands(kind, params, repo, runtimeConfig, onLog, budgets, executionOptions = {}) {
   const pythonBin = runtimeConfig.workerpals.openhandsPython || "python";
   const scriptPath = executionOptions.scriptPath ?? OPENHANDS_SCRIPT_PATH;
-  if (!existsSync7(scriptPath)) {
+  if (!existsSync8(scriptPath)) {
     return {
       ok: false,
       summary: `OpenHands wrapper script not found: ${scriptPath}`,
@@ -7573,10 +8067,10 @@ function toStrings(value) {
   return value.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean);
 }
 function parseRequiredBackendToml(path) {
-  if (!existsSync8(path)) {
+  if (!existsSync9(path)) {
     throw new Error(`Missing required runtime backend config file: ${path}`);
   }
-  const parsed = Bun.TOML.parse(readFileSync6(path, "utf-8"));
+  const parsed = Bun.TOML.parse(readFileSync7(path, "utf-8"));
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`Invalid runtime backend config file: ${path}`);
   }
@@ -7693,18 +8187,18 @@ class Logger {
 import { createHash as createHash6 } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import {
-  existsSync as existsSync9,
+  existsSync as existsSync10,
   lstatSync as lstatSync2,
   mkdirSync as mkdirSync3,
   readdirSync as readdirSync4,
-  readFileSync as readFileSync8,
+  readFileSync as readFileSync9,
   renameSync,
   rmSync as rmSync3,
-  statSync as statSync4,
+  statSync as statSync5,
   unlinkSync,
   writeFileSync as writeFileSync4
 } from "fs";
-import { basename as basename5, isAbsolute as isAbsolute4, resolve as resolve12 } from "path";
+import { basename as basename6, isAbsolute as isAbsolute4, resolve as resolve13 } from "path";
 import { tmpdir as tmpdir4 } from "os";
 
 // apps/workerpals/src/quality_loop_durability.ts
@@ -7886,14 +8380,14 @@ import {
   copyFileSync,
   lstatSync,
   mkdirSync as mkdirSync2,
-  readFileSync as readFileSync7,
+  readFileSync as readFileSync8,
   readdirSync as readdirSync3,
   rmSync as rmSync2,
-  statSync as statSync3,
+  statSync as statSync4,
   symlinkSync,
   writeFileSync as writeFileSync3
 } from "fs";
-import { resolve as resolve10 } from "path";
+import { resolve as resolve11 } from "path";
 var DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS = ["node_modules"];
 var DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-dependency-snapshot";
 var DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER = ".pushpals-validation-safe-dependency-snapshot";
@@ -7922,11 +8416,11 @@ function dependencySnapshotKey(repo) {
   const hash = createHash5("sha256");
   let included = 0;
   for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
-    const path = resolve10(repo, name);
+    const path = resolve11(repo, name);
     try {
       hash.update(name);
       hash.update("\x00");
-      hash.update(readFileSync7(path));
+      hash.update(readFileSync8(path));
       hash.update("\x00");
       included += 1;
     } catch {}
@@ -7936,18 +8430,18 @@ function dependencySnapshotKey(repo) {
 function materializeDependencySnapshot(source, destination, snapshotKey) {
   mkdirSync2(destination, { recursive: true });
   for (const entry of readdirSync3(source)) {
-    const sourceEntry = resolve10(source, entry);
-    const destinationEntry = resolve10(destination, entry);
+    const sourceEntry = resolve11(source, entry);
+    const destinationEntry = resolve11(destination, entry);
     const stat = lstatSync(sourceEntry);
     if (MUTABLE_DEPENDENCY_DIRS.has(entry)) {
       mkdirSync2(destinationEntry, { recursive: true });
-    } else if (stat.isDirectory() || stat.isSymbolicLink() && statSync3(sourceEntry).isDirectory()) {
+    } else if (stat.isDirectory() || stat.isSymbolicLink() && statSync4(sourceEntry).isDirectory()) {
       symlinkSync(sourceEntry, destinationEntry, linkTypeForHost());
     } else {
       copyFileSync(sourceEntry, destinationEntry);
     }
   }
-  writeFileSync3(resolve10(destination, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER), `${snapshotKey}
+  writeFileSync3(resolve11(destination, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER), `${snapshotKey}
 `, "utf8");
 }
 function linkDirectWorktreeDependencyArtifacts(repo, worktreePath, onLog, artifactNames = DIRECT_WORKTREE_DEPENDENCY_ARTIFACTS) {
@@ -7955,8 +8449,8 @@ function linkDirectWorktreeDependencyArtifacts(repo, worktreePath, onLog, artifa
   const skipped = [];
   const warnings = [];
   for (const name of artifactNames) {
-    const source = resolve10(repo, name);
-    const destination = resolve10(worktreePath, name);
+    const source = resolve11(repo, name);
+    const destination = resolve11(worktreePath, name);
     if (!sourceCanBeLinked(source)) {
       skipped.push(name);
       continue;
@@ -7990,7 +8484,7 @@ function linkDirectWorktreeDependencyArtifacts(repo, worktreePath, onLog, artifa
   return { linked, skipped, warnings };
 }
 // apps/workerpals/src/merge_conflict_job.ts
-import { basename as basename4, dirname as dirname4, resolve as resolve11 } from "path";
+import { basename as basename5, dirname as dirname5, resolve as resolve12 } from "path";
 function asRecord(value) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
@@ -8062,10 +8556,10 @@ function dedupeStrings(values, maxItems = 16) {
   return out;
 }
 function deriveLikelyDirs(paths) {
-  return dedupeStrings(paths.map((entry) => dirname4(entry).replace(/\\/g, "/")).filter((entry) => entry && entry !== "."), 12);
+  return dedupeStrings(paths.map((entry) => dirname5(entry).replace(/\\/g, "/")).filter((entry) => entry && entry !== "."), 12);
 }
 function deriveRipgrepQueries(paths) {
-  return dedupeStrings(paths.map((entry) => basename4(entry)).filter(Boolean), 8);
+  return dedupeStrings(paths.map((entry) => basename5(entry)).filter(Boolean), 8);
 }
 function extractConflictPaths(stdout) {
   return dedupeStrings(String(stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean), 32);
@@ -8219,7 +8713,7 @@ ${rebase.stdout}`)) {
   }
   const preparedHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "resolve prepared host worktree HEAD", deadlineLedger)).trim();
   return {
-    repoPath: resolve11(worktreePath),
+    repoPath: resolve12(worktreePath),
     cleanup: () => {},
     conflictPaths,
     plannerGuidance: buildPlannerGuidance(context, conflictPaths, rebasedCleanly),
@@ -8235,7 +8729,7 @@ async function refreshMergeConflictWorktreeHints(worktreePath, params, deadlineL
   const conflictPaths = extractConflictPaths(unresolved);
   const currentHeadSha = (await mustGit(worktreePath, ["rev-parse", "HEAD"], "refresh host-prepared worktree HEAD", deadlineLedger)).trim();
   return applyMergeConflictExecutionHints(params, {
-    repoPath: resolve11(worktreePath),
+    repoPath: resolve12(worktreePath),
     cleanup: () => {},
     conflictPaths,
     plannerGuidance: buildPlannerGuidance(context, conflictPaths, false),
@@ -8799,7 +9293,11 @@ function isDockerDaemonValidationBlocker(value) {
   return socketUnavailable || /cannot connect to (?:the )?docker daemon/i.test(value) || /is the docker daemon running/i.test(value) || /docker daemon is not running/i.test(value) || /failed to connect to the docker api/i.test(value);
 }
 function hasConcreteAssertionFailureEvidence(value) {
-  return /\bassertionerror\b|\bassert(?:ion)?(?:\s+failed|:)\b|\bexpected\b[\s\S]{0,160}\b(?:received|actual|to be|to equal|to contain|to match)\b|\b(?:\d+\s+)?tests?\s+failed\b|\blocator\.[a-z0-9_]+:\s+timeout\b/.test(value);
+  return /(?:^|\n)\s*\(fail\)\s|\bassertionerror\b|\bassert(?:ion)?(?:\s+failed|:)\b|\bexpected\b[\s\S]{0,160}\b(?:received|actual|to be|to equal|to contain|to match)\b|\b(?:\d+\s+)?tests?\s+failed\b|\blocator\.[a-z0-9_]+:\s+timeout\b/.test(value.replace(/\b0\s+tests?\s+failed\b/g, ""));
+}
+function validationDiagnosticText(output) {
+  return output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").split(/\r?\n/).filter((line) => !/^\s*(?:\((?:pass|skip)\)|PASS\b|[\u2713\u2714]\s|(?:stdout|stderr)\s*\|\s*.+\.(?:test|spec|vitest)\.[cm]?[jt]sx?\s*>)/i.test(line)).join(`
+`);
 }
 function classifyValidationRunFailure(run) {
   if (run.ok)
@@ -8807,11 +9305,11 @@ function classifyValidationRunFailure(run) {
   if (run.inheritedFailureClass)
     return run.inheritedFailureClass;
   const combined = `${run.command}
-${run.stdout}
-${run.stderr}`.toLowerCase();
+${validationDiagnosticText(`${run.stdout}
+${run.stderr}`)}`.toLowerCase();
   const command = run.command.toLowerCase();
-  const output = `${run.stdout}
-${run.stderr}`.toLowerCase();
+  const output = validationDiagnosticText(`${run.stdout}
+${run.stderr}`).toLowerCase();
   if (run.exitCode === 124 || /\b(?:command|process|request|connection|validation|test|browser|playwright|executor)\s+timed out\b/i.test(combined) || /\btimeout(?:error)?\b[^a-z0-9]*(?:after|exceeded|expired)/i.test(combined)) {
     return "timeout";
   }
@@ -8841,20 +9339,19 @@ function classifyValidationFailureClass(run) {
   if (run.inheritedFailureClass === "environment")
     return "environment.sandbox";
   const combined = `${run.command}
-${run.stdout}
-${run.stderr}`.toLowerCase();
+${validationDiagnosticText(`${run.stdout}
+${run.stderr}`)}`.toLowerCase();
   if (run.terminalStatusSource === "deadline" || run.exitCode === 124)
     return "deadline";
   if (run.exitCode === 127)
     return "environment.toolchain";
+  if (hasConcreteAssertionFailureEvidence(combined))
+    return "candidate.assertion";
   if (combined.includes("cannot find module") || combined.includes("module not found") || combined.includes("failed to resolve import") || combined.includes("could not resolve") || combined.includes("no such file or directory") || combined.includes("package not found")) {
     return "repository.dependency";
   }
   if (/typecheck|compile|syntaxerror|does not provide an export|no exported member/.test(combined)) {
     return "candidate.compile";
-  }
-  if (hasConcreteAssertionFailureEvidence(combined)) {
-    return "candidate.assertion";
   }
   if (isDockerDaemonValidationBlocker(combined))
     return "environment.docker";
@@ -9227,7 +9724,7 @@ function normalizeChatCompletionsEndpoint(endpoint) {
 function splitArgs(raw) {
   const out = [];
   let current = "";
-  let quote = null;
+  let quote2 = null;
   let escaped = false;
   for (const ch of raw.trim()) {
     if (escaped) {
@@ -9235,20 +9732,20 @@ function splitArgs(raw) {
       escaped = false;
       continue;
     }
-    if (ch === "\\" && quote !== "'") {
+    if (ch === "\\" && quote2 !== "'") {
       escaped = true;
       continue;
     }
-    if (quote) {
-      if (ch === quote) {
-        quote = null;
+    if (quote2) {
+      if (ch === quote2) {
+        quote2 = null;
       } else {
         current += ch;
       }
       continue;
     }
     if (ch === '"' || ch === "'") {
-      quote = ch;
+      quote2 = ch;
       continue;
     }
     if (/\s/.test(ch)) {
@@ -9310,7 +9807,7 @@ function tokenizeValidationCommandArgv(command) {
     return null;
   const out = [];
   let current = "";
-  let quote = null;
+  let quote2 = null;
   let escaped = false;
   const pushCurrent = () => {
     if (!current)
@@ -9324,20 +9821,20 @@ function tokenizeValidationCommandArgv(command) {
       escaped = false;
       continue;
     }
-    if (quote) {
-      if (quote === '"' && ch === "\\") {
+    if (quote2) {
+      if (quote2 === '"' && ch === "\\") {
         escaped = true;
         continue;
       }
-      if (ch === quote) {
-        quote = null;
+      if (ch === quote2) {
+        quote2 = null;
       } else {
         current += ch;
       }
       continue;
     }
     if (ch === "'" || ch === '"') {
-      quote = ch;
+      quote2 = ch;
       continue;
     }
     if (ch === "|" || ch === ";" || ch === "&" || ch === ">" || ch === "<" || ch === "`" || ch === "$") {
@@ -9351,7 +9848,7 @@ function tokenizeValidationCommandArgv(command) {
   }
   if (escaped)
     current += "\\";
-  if (quote)
+  if (quote2)
     return null;
   pushCurrent();
   if (out.length === 0)
@@ -9442,7 +9939,7 @@ function captureValidationStream(stream, onChunk) {
   };
 }
 function hasBrowserValidationFailureSignal(output) {
-  const text = String(output ?? "");
+  const text = validationDiagnosticText(String(output ?? ""));
   if (!text.trim())
     return false;
   const patterns = [
@@ -9594,7 +10091,7 @@ function validationLeaseHostId() {
 }
 function readRepoValidationLeaseOwner(ownerPath) {
   try {
-    const parsed = JSON.parse(readFileSync8(ownerPath, "utf8"));
+    const parsed = JSON.parse(readFileSync9(ownerPath, "utf8"));
     return parsed && typeof parsed === "object" ? parsed : null;
   } catch {
     return null;
@@ -9626,10 +10123,10 @@ async function acquireRepoValidationLease(repo, command, onLog, waitTimeoutMs = 
   const commonDirResult = await git2(repo, ["rev-parse", "--git-common-dir"]);
   if (!commonDirResult.ok || !commonDirResult.stdout.trim())
     return () => {};
-  const commonDir = resolve12(repo, commonDirResult.stdout.trim());
-  const leaseParent = resolve12(commonDir, "pushpals");
-  const leaseDir = resolve12(leaseParent, "validation-lease");
-  const ownerPath = resolve12(leaseDir, "owner.json");
+  const commonDir = resolve13(repo, commonDirResult.stdout.trim());
+  const leaseParent = resolve13(commonDir, "pushpals");
+  const leaseDir = resolve13(leaseParent, "validation-lease");
+  const ownerPath = resolve13(leaseDir, "owner.json");
   const owner = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const ownerHost = validationLeaseHostId();
   const waitStartedAt = Date.now();
@@ -9682,7 +10179,7 @@ async function acquireRepoValidationLease(repo, command, onLog, waitTimeoutMs = 
     } catch {
       try {
         const currentOwner = readRepoValidationLeaseOwner(ownerPath);
-        const ownerMtimeMs = statSync4(ownerPath).mtimeMs;
+        const ownerMtimeMs = statSync5(ownerPath).mtimeMs;
         const sameHost = Boolean(currentOwner?.host) && Boolean(ownerHost) && currentOwner?.host === ownerHost;
         const ownerProcessAlive = sameHost && typeof currentOwner?.pid === "number" ? isProcessAlive(currentOwner.pid) : null;
         const recoveryReason = repoValidationLeaseRecoveryReason({
@@ -9791,11 +10288,11 @@ ${referencedText}`)) {
       return true;
     }
     for (const match of resolvedScript.script.matchAll(/\b(bun|npm|pnpm|yarn)(?:\s+run)?\s+([A-Za-z0-9][A-Za-z0-9:._-]*)\b/gi)) {
-      const packageManager = match[1] ?? "";
+      const packageManager2 = match[1] ?? "";
       const scriptName = match[2] ?? "";
-      if (!packageManager || !scriptName)
+      if (!packageManager2 || !scriptName)
         continue;
-      if (visit(resolvedScript.cwd, `${packageManager} run ${scriptName}`, depth + 1)) {
+      if (visit(resolvedScript.cwd, `${packageManager2} run ${scriptName}`, depth + 1)) {
         return true;
       }
     }
@@ -9829,11 +10326,11 @@ ${referencedText}`;
     if (textIncludesTestValidation(aggregateText))
       return true;
     for (const match of aggregateText.matchAll(/\b(bun|npm|pnpm|yarn)(?:\s+run)?\s+([A-Za-z0-9][A-Za-z0-9:._-]*)\b/gi)) {
-      const packageManager = match[1] ?? "";
+      const packageManager2 = match[1] ?? "";
       const scriptName = match[2] ?? "";
-      if (!packageManager || !scriptName)
+      if (!packageManager2 || !scriptName)
         continue;
-      if (visit(resolvedScript.cwd, `${packageManager} run ${scriptName}`, depth + 1)) {
+      if (visit(resolvedScript.cwd, `${packageManager2} run ${scriptName}`, depth + 1)) {
         return true;
       }
     }
@@ -9883,11 +10380,11 @@ function shouldDeferLongValidationAfterFastFailures(command, previousRuns, repo)
   return `fast validation already failed for "${first.command}"${digest ? ` (${digest})` : ""}`;
 }
 function readPackageJson(repo) {
-  const packagePath = resolve12(repo, "package.json");
-  if (!existsSync9(packagePath))
+  const packagePath = resolve13(repo, "package.json");
+  if (!existsSync10(packagePath))
     return null;
   try {
-    return JSON.parse(readFileSync8(packagePath, "utf8"));
+    return JSON.parse(readFileSync9(packagePath, "utf8"));
   } catch {
     return null;
   }
@@ -9914,12 +10411,12 @@ function resolvePackageScriptForValidationCommand(repo, command) {
   const consumeCwdOption = (index) => {
     const token = argv[index] ?? "";
     if ((token === "--cwd" || token === "-C" || token === "--prefix") && argv[index + 1]) {
-      cwd = resolve12(repo, argv[index + 1] ?? "");
+      cwd = resolve13(repo, argv[index + 1] ?? "");
       return index + 2;
     }
     for (const prefix of ["--cwd=", "-C=", "--prefix="]) {
       if (token.startsWith(prefix)) {
-        cwd = resolve12(repo, token.slice(prefix.length));
+        cwd = resolve13(repo, token.slice(prefix.length));
         return index + 1;
       }
     }
@@ -9982,11 +10479,11 @@ function readReferencedValidationScriptText(cwd, script) {
       continue;
     if (token.includes("://") || token.includes("node_modules/"))
       continue;
-    const scriptPath = resolve12(cwd, token);
-    if (!existsSync9(scriptPath))
+    const scriptPath = resolve13(cwd, token);
+    if (!existsSync10(scriptPath))
       continue;
     try {
-      texts.push(readFileSync8(scriptPath, "utf8").slice(0, 64000));
+      texts.push(readFileSync9(scriptPath, "utf8").slice(0, 64000));
     } catch {}
   }
   return texts.join(`
@@ -10133,7 +10630,7 @@ function playwrightBrowserRuntimeCacheMarkerPath(repo, targets, env = buildWorke
   if (!browsersPath || browsersPath === "0")
     return null;
   const cacheKey = createHash6("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
-  return resolve12(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
+  return resolve13(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
 }
 async function runPlaywrightBrowserRuntimePreflight(repo, command, targets, timeoutMs, outputPolicy) {
   const env = buildWorkerSandboxWritableEnv(repo);
@@ -10193,7 +10690,7 @@ function prepareValidationSpawnArgv(argv, env) {
 }
 function readJsonRecord(path) {
   try {
-    return asRecord2(JSON.parse(readFileSync8(path, "utf8")));
+    return asRecord2(JSON.parse(readFileSync9(path, "utf8")));
   } catch {
     return null;
   }
@@ -10219,7 +10716,7 @@ function packageJsonDeclaresDependency(packageJson, name) {
   return declaredPackageDependencyNames(packageJson).includes(name);
 }
 function hasBunLockfile(repo) {
-  return existsSync9(resolve12(repo, "bun.lock")) || existsSync9(resolve12(repo, "bun.lockb"));
+  return existsSync10(resolve13(repo, "bun.lock")) || existsSync10(resolve13(repo, "bun.lockb"));
 }
 function isBunPackageManagedValidationCommand(command) {
   const tokens = tokenizeValidationCommandArgv(command);
@@ -10245,7 +10742,7 @@ function isBunPackageManagedValidationCommand(command) {
   return false;
 }
 function resolvePackageRoot(nodeModulesDir, packageName) {
-  return resolve12(nodeModulesDir, ...packageName.split("/").filter(Boolean));
+  return resolve13(nodeModulesDir, ...packageName.split("/").filter(Boolean));
 }
 function defaultBinNameForPackage(packageName) {
   return packageName.split("/").filter(Boolean).pop() ?? packageName;
@@ -10254,12 +10751,12 @@ function isSafeBinName(value) {
   return Boolean(value.trim()) && !/[\\/:\0]/.test(value);
 }
 function isPathInside(parent, child) {
-  const normalizedParent = resolve12(parent).replace(/\\/g, "/").replace(/\/+$/, "");
-  const normalizedChild = resolve12(child).replace(/\\/g, "/");
+  const normalizedParent = resolve13(parent).replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedChild = resolve13(child).replace(/\\/g, "/");
   return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
 }
 function packageBinaryNames(packageRoot, dependencyName) {
-  const packageJson = readJsonRecord(resolve12(packageRoot, "package.json"));
+  const packageJson = readJsonRecord(resolve13(packageRoot, "package.json"));
   if (!packageJson)
     return [];
   const packageName = typeof packageJson.name === "string" && packageJson.name.trim() ? packageJson.name.trim() : dependencyName;
@@ -10279,17 +10776,17 @@ function packageBinaryNames(packageRoot, dependencyName) {
   return Array.from(new Set(entries.filter(([name, target]) => {
     if (!isSafeBinName(name))
       return false;
-    const targetPath = resolve12(packageRoot, target);
-    return isPathInside(packageRoot, targetPath) && existsSync9(targetPath);
+    const targetPath = resolve13(packageRoot, target);
+    return isPathInside(packageRoot, targetPath) && existsSync10(targetPath);
   }).map(([name]) => name))).sort((a, b) => a.localeCompare(b));
 }
 function hasLocalBinShim(binDir, binName) {
-  const candidates = ["", ".bunx", ".exe", ".cmd", ".ps1"].map((extension) => resolve12(binDir, `${binName}${extension}`));
-  return candidates.some((candidate) => existsSync9(candidate));
+  const candidates = ["", ".bunx", ".exe", ".cmd", ".ps1"].map((extension) => resolve13(binDir, `${binName}${extension}`));
+  return candidates.some((candidate) => existsSync10(candidate));
 }
 function isLinkedNodeModulesDependencyArtifact(repo) {
   try {
-    return lstatSync2(resolve12(repo, "node_modules")).isSymbolicLink();
+    return lstatSync2(resolve13(repo, "node_modules")).isSymbolicLink();
   } catch (err) {
     const code = String(err?.code ?? "").toUpperCase();
     if (process.platform !== "win32" || !["EACCES", "EINVAL"].includes(code))
@@ -10302,40 +10799,40 @@ function isLinkedNodeModulesDependencyArtifact(repo) {
   }
 }
 function isManagedLinkedPackageDependencySnapshot(repo) {
-  const nodeModulesDir = resolve12(repo, "node_modules");
-  return existsSync9(resolve12(nodeModulesDir, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER)) && !existsSync9(resolve12(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
+  const nodeModulesDir = resolve13(repo, "node_modules");
+  return existsSync10(resolve13(nodeModulesDir, DIRECT_WORKTREE_DEPENDENCY_SNAPSHOT_MARKER)) && !existsSync10(resolve13(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
 }
 function bunDependencySnapshotKey(repo, bunVersion = String(process.versions.bun ?? "unknown")) {
-  const packagePath = resolve12(repo, "package.json");
-  if (!existsSync9(packagePath))
+  const packagePath = resolve13(repo, "package.json");
+  if (!existsSync10(packagePath))
     return null;
   const hashInput = [
     `projection=${VALIDATION_SAFE_DEPENDENCY_PROJECTION_VERSION}`,
     `bun=${bunVersion}`
   ];
   for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
-    const path = resolve12(repo, name);
-    if (!existsSync9(path))
+    const path = resolve13(repo, name);
+    if (!existsSync10(path))
       continue;
-    hashInput.push(createHash6("sha256").update(readFileSync8(path)).digest("hex"));
+    hashInput.push(createHash6("sha256").update(readFileSync9(path)).digest("hex"));
   }
   let key = createHash6("sha256").update(`${hashInput.join(`
 `)}
 `).digest("hex");
   const packageJson = readJsonRecord(packagePath);
   if (packageJson?.workspaces != null)
-    key = `${key}-${basename5(resolve12(repo))}`;
+    key = `${key}-${basename6(resolve13(repo))}`;
   return key;
 }
 function validationSafeDependencySnapshotIsCurrent(repo) {
-  const markerPath = resolve12(repo, "node_modules", DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER);
-  if (!existsSync9(markerPath))
+  const markerPath = resolve13(repo, "node_modules", DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER);
+  if (!existsSync10(markerPath))
     return false;
   const expected = bunDependencySnapshotKey(repo);
   if (!expected)
     return false;
   try {
-    return readFileSync8(markerPath, "utf8").trim() === expected;
+    return readFileSync9(markerPath, "utf8").trim() === expected;
   } catch {
     return false;
   }
@@ -10344,13 +10841,13 @@ function validationNeedsExpoRouterBrowserLocalInstall(repo, packageJson, validat
   return packageJsonDeclaresDependency(packageJson, "expo-router") && validationCommands.some((command) => validationCommandIncludesLongRunningBrowserWork(repo, command));
 }
 function collectMissingTopLevelDependencyPackages(repo, packageJson) {
-  const nodeModulesDir = resolve12(repo, "node_modules");
+  const nodeModulesDir = resolve13(repo, "node_modules");
   const missing = [];
   for (const dependencyName of declaredPackageDependencyNames(packageJson, [
     "dependencies",
     "devDependencies"
   ])) {
-    if (!existsSync9(resolvePackageRoot(nodeModulesDir, dependencyName))) {
+    if (!existsSync10(resolvePackageRoot(nodeModulesDir, dependencyName))) {
       missing.push(dependencyName);
       if (missing.length >= 8)
         return missing;
@@ -10359,12 +10856,12 @@ function collectMissingTopLevelDependencyPackages(repo, packageJson) {
   return missing;
 }
 function collectMissingTopLevelDependencyBinaryShims(repo, packageJson) {
-  const nodeModulesDir = resolve12(repo, "node_modules");
-  const binDir = resolve12(nodeModulesDir, ".bin");
+  const nodeModulesDir = resolve13(repo, "node_modules");
+  const binDir = resolve13(nodeModulesDir, ".bin");
   const missing = [];
   for (const dependencyName of declaredPackageDependencyNames(packageJson)) {
     const packageRoot = resolvePackageRoot(nodeModulesDir, dependencyName);
-    if (!existsSync9(packageRoot))
+    if (!existsSync10(packageRoot))
       continue;
     for (const binName of packageBinaryNames(packageRoot, dependencyName)) {
       if (!hasLocalBinShim(binDir, binName))
@@ -10381,17 +10878,17 @@ function resolveBunDependencyLayoutPreflight(repo, validationCommands) {
   }
   if (!hasBunLockfile(repo))
     return null;
-  const packageJson = readJsonRecord(resolve12(repo, "package.json"));
+  const packageJson = readJsonRecord(resolve13(repo, "package.json"));
   if (!packageJson)
     return null;
-  const nodeModulesDir = resolve12(repo, "node_modules");
-  if (!existsSync9(nodeModulesDir)) {
+  const nodeModulesDir = resolve13(repo, "node_modules");
+  if (!existsSync10(nodeModulesDir)) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules is missing for Bun validation commands"
     };
   }
-  const validationSafeSnapshotMarkerExists = existsSync9(resolve12(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
+  const validationSafeSnapshotMarkerExists = existsSync10(resolve13(nodeModulesDir, DIRECT_WORKTREE_VALIDATION_SAFE_DEPENDENCY_SNAPSHOT_MARKER));
   const validationSafeSnapshotIsCurrent = validationSafeSnapshotMarkerExists && validationSafeDependencySnapshotIsCurrent(repo);
   if (validationSafeSnapshotMarkerExists && !validationSafeSnapshotIsCurrent) {
     return {
@@ -10414,8 +10911,8 @@ function resolveBunDependencyLayoutPreflight(repo, validationCommands) {
       removeLinkedNodeModules: true
     };
   }
-  const binDir = resolve12(nodeModulesDir, ".bin");
-  if (!existsSync9(binDir)) {
+  const binDir = resolve13(nodeModulesDir, ".bin");
+  if (!existsSync10(binDir)) {
     return {
       command: BUN_DEPENDENCY_LAYOUT_PREFLIGHT_COMMAND,
       reason: "node_modules/.bin is missing for Bun validation commands"
@@ -10463,7 +10960,7 @@ function buildBunDependencyLayoutPreflightFailureRun(args) {
   };
 }
 function removeLinkedNodeModulesDependencyArtifact(repo, onLog) {
-  const nodeModulesDir = resolve12(repo, "node_modules");
+  const nodeModulesDir = resolve13(repo, "node_modules");
   const linkedArtifact = isLinkedNodeModulesDependencyArtifact(repo);
   if (!linkedArtifact && !isManagedLinkedPackageDependencySnapshot(repo)) {
     return { ok: true, removed: false };
@@ -10859,13 +11356,13 @@ function expandKnownArtifactDirectoryPaths(repo, paths) {
       addPath(rawPath);
       continue;
     }
-    const powerShellRoot = resolve12(repo, "Microsoft", "Windows", "PowerShell");
+    const powerShellRoot = resolve13(repo, "Microsoft", "Windows", "PowerShell");
     const knownArtifacts = [];
-    const moduleCache = resolve12(powerShellRoot, "ModuleAnalysisCache");
-    if (existsSync9(moduleCache))
+    const moduleCache = resolve13(powerShellRoot, "ModuleAnalysisCache");
+    if (existsSync10(moduleCache))
       knownArtifacts.push("Microsoft/Windows/PowerShell/ModuleAnalysisCache");
-    const psReadLineRoot = resolve12(powerShellRoot, "PSReadLine");
-    if (existsSync9(psReadLineRoot)) {
+    const psReadLineRoot = resolve13(powerShellRoot, "PSReadLine");
+    if (existsSync10(psReadLineRoot)) {
       for (const entry of readdirSync4(psReadLineRoot, { withFileTypes: true })) {
         if (entry.isFile()) {
           knownArtifacts.push(`Microsoft/Windows/PowerShell/PSReadLine/${entry.name}`);
@@ -10883,7 +11380,7 @@ function expandKnownArtifactDirectoryPaths(repo, paths) {
 }
 function isAssertionCoverageTestPath(path) {
   const normalized = path.replace(/\\/g, "/").toLowerCase();
-  return normalized.includes("/tests/") || normalized.includes("/test/") || normalized.includes("__tests__/") || /\.test\.[a-z0-9]+$/i.test(normalized) || /\.spec\.[a-z0-9]+$/i.test(normalized);
+  return normalized.includes("/tests/") || normalized.includes("/test/") || normalized.includes("__tests__/") || /\.test\.[a-z0-9]+$/i.test(normalized) || /\.(?:spec|vitest)\.[a-z0-9]+$/i.test(normalized);
 }
 function isBrowserSmokeHarnessPath(path) {
   const normalized = path.replace(/\\/g, "/").toLowerCase();
@@ -11006,20 +11503,20 @@ function validationFileFingerprint(repo, changedPaths) {
   hash.update(`${process.platform}\x00${process.arch}\x00`);
   const fingerprintPaths = ["bun.lock", "bun.lockb", "package.json", ...changedPaths].map((entry) => entry.replace(/\\/g, "/")).filter((entry, index, values) => values.indexOf(entry) === index).sort();
   for (const relativePath of fingerprintPaths) {
-    const absolutePath = resolve12(repo, relativePath);
+    const absolutePath = resolve13(repo, relativePath);
     hash.update(relativePath);
     hash.update("\x00");
-    if (!existsSync9(absolutePath)) {
+    if (!existsSync10(absolutePath)) {
       hash.update("missing\x00");
       continue;
     }
     try {
-      const stats = statSync4(absolutePath);
+      const stats = statSync5(absolutePath);
       if (!stats.isFile()) {
         hash.update(`non-file:${stats.size}\x00`);
         continue;
       }
-      hash.update(readFileSync8(absolutePath));
+      hash.update(readFileSync9(absolutePath));
       hash.update("\x00");
     } catch (error) {
       hash.update(`unreadable:${String(error)}\x00`);
@@ -11274,22 +11771,22 @@ function extractBalancedLocatorCall(text) {
   let match;
   while ((match = callPattern.exec(text)) != null) {
     let depth = 0;
-    let quote = null;
+    let quote2 = null;
     let escaped = false;
     for (let index = match.index;index < text.length; index += 1) {
       const char = text[index] ?? "";
-      if (quote) {
+      if (quote2) {
         if (escaped) {
           escaped = false;
         } else if (char === "\\") {
           escaped = true;
-        } else if (char === quote) {
-          quote = null;
+        } else if (char === quote2) {
+          quote2 = null;
         }
         continue;
       }
       if (char === "'" || char === '"' || char === "`") {
-        quote = char;
+        quote2 = char;
         continue;
       }
       if (char === "(") {
@@ -11367,7 +11864,7 @@ function extractBrowserValidationArtifacts(text) {
 function collectRecentBrowserValidationFiles(repo, extensions, limit = 8) {
   if (!repo)
     return [];
-  const roots = ["outputs/web-e2e", "test-results", "playwright-report"].map((entry) => resolve12(repo, entry)).filter((entry) => existsSync9(entry));
+  const roots = ["outputs/web-e2e", "test-results", "playwright-report"].map((entry) => resolve13(repo, entry)).filter((entry) => existsSync10(entry));
   const files = [];
   const visit = (dir, depth) => {
     if (depth > 4 || files.length > 2000)
@@ -11380,7 +11877,7 @@ function collectRecentBrowserValidationFiles(repo, extensions, limit = 8) {
     }
     for (const entry of entries) {
       const entryName = String(entry.name);
-      const path = resolve12(dir, entryName);
+      const path = resolve13(dir, entryName);
       if (entry.isDirectory()) {
         visit(path, depth + 1);
         continue;
@@ -11406,7 +11903,7 @@ function summarizeRecentBrowserValidationLogs(repo) {
   for (const logFile of logFiles) {
     let content = "";
     try {
-      content = readFileSync8(logFile, "utf8");
+      content = readFileSync9(logFile, "utf8");
     } catch {
       continue;
     }
@@ -11496,13 +11993,13 @@ function summarizeBrowserValidationArtifacts(params) {
     let artifactText = "";
     if (params.repo && !/^(?:\/repo|\/workspace|[A-Za-z]:[\\/])/.test(artifact)) {
       try {
-        artifactText = readFileSync8(resolve12(params.repo, artifact), "utf8");
+        artifactText = readFileSync9(resolve13(params.repo, artifact), "utf8");
       } catch {
         artifactText = "";
       }
-    } else if (existsSync9(artifact) && /\.(?:log|txt|json)$/i.test(artifact)) {
+    } else if (existsSync10(artifact) && /\.(?:log|txt|json)$/i.test(artifact)) {
       try {
-        artifactText = readFileSync8(artifact, "utf8");
+        artifactText = readFileSync9(artifact, "utf8");
       } catch {
         artifactText = "";
       }
@@ -11573,11 +12070,11 @@ function resolveFailureMemoryPath(repo) {
     process.env.PUSHPALS_REPO_PATH,
     repo
   ].map((entry) => String(entry ?? "").trim()).filter(Boolean);
-  const root = rootCandidates.find((entry) => existsSync9(entry)) ?? repo;
+  const root = rootCandidates.find((entry) => existsSync10(entry)) ?? repo;
   const gitStatePath = resolveGitStateFilePath(root, "pushpals-worker-failure-memory.json");
   if (gitStatePath)
     return gitStatePath;
-  return resolve12(root, "outputs", "data", "workerpals-failure-memory.json");
+  return resolve13(root, "outputs", "data", "workerpals-failure-memory.json");
 }
 function resolveRemedyMemoryPath(repo) {
   const rootCandidates = [
@@ -11586,16 +12083,16 @@ function resolveRemedyMemoryPath(repo) {
     process.env.PUSHPALS_REPO_PATH,
     repo
   ].map((entry) => String(entry ?? "").trim()).filter(Boolean);
-  const root = rootCandidates.find((entry) => existsSync9(entry)) ?? repo;
+  const root = rootCandidates.find((entry) => existsSync10(entry)) ?? repo;
   const gitStatePath = resolveGitStateFilePath(root, "pushpals-worker-remedy-memory.json");
   if (gitStatePath)
     return gitStatePath;
-  return resolve12(root, "outputs", "data", "workerpals-remedy-memory.json");
+  return resolve13(root, "outputs", "data", "workerpals-remedy-memory.json");
 }
 function readBrowserFailureMemory(repo) {
   const memoryPath = resolveFailureMemoryPath(repo);
   try {
-    const parsed = JSON.parse(readFileSync8(memoryPath, "utf8"));
+    const parsed = JSON.parse(readFileSync9(memoryPath, "utf8"));
     if (!Array.isArray(parsed.entries))
       return [];
     return parsed.entries.filter((entry) => Boolean(entry && typeof entry === "object")).slice(0, 80);
@@ -11655,7 +12152,7 @@ function recordBrowserFailureMemory(repo, jobFamily, packet) {
   }
   const next = entries.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)).slice(0, 80);
   try {
-    mkdirSync3(resolve12(memoryPath, ".."), { recursive: true });
+    mkdirSync3(resolve13(memoryPath, ".."), { recursive: true });
     writeFileSync4(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}
 `);
   } catch {}
@@ -11712,7 +12209,7 @@ function validationFailureSuggestedRemedy(run) {
 function readValidationRemedyMemory(repo) {
   const memoryPath = resolveRemedyMemoryPath(repo);
   try {
-    const parsed = JSON.parse(readFileSync8(memoryPath, "utf8"));
+    const parsed = JSON.parse(readFileSync9(memoryPath, "utf8"));
     if (!Array.isArray(parsed.entries))
       return [];
     return parsed.entries.filter((entry) => Boolean(entry && typeof entry === "object")).slice(0, 120);
@@ -11767,7 +12264,7 @@ function recordValidationRemedyMemory(repo, jobFamily, runs) {
   }
   const next = entries.sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)).slice(0, 120);
   try {
-    mkdirSync3(resolve12(memoryPath, ".."), { recursive: true });
+    mkdirSync3(resolve13(memoryPath, ".."), { recursive: true });
     writeFileSync4(memoryPath, `${JSON.stringify({ version: 1, entries: next }, null, 2)}
 `);
   } catch {}
@@ -11907,11 +12404,11 @@ function extractRequiredValidationStepsFromVisionMarkdown(markdown) {
   return out;
 }
 function loadRequiredValidationStepsFromVision(repo) {
-  const visionPath = resolve12(repo, "vision.md");
-  if (!existsSync9(visionPath))
+  const visionPath = resolve13(repo, "vision.md");
+  if (!existsSync10(visionPath))
     return [];
   try {
-    return extractRequiredValidationStepsFromVisionMarkdown(readFileSync8(visionPath, "utf8"));
+    return extractRequiredValidationStepsFromVisionMarkdown(readFileSync9(visionPath, "utf8"));
   } catch {
     return [];
   }
@@ -12002,7 +12499,7 @@ function sanitizeMissingExplicitTestTargets(repo, command) {
   for (const arg of argv.slice(testIndex + 1)) {
     const normalizedPath = normalizeValidationPathToken(arg);
     const isConcreteTestTarget = Boolean(normalizedPath) && (isAssertionCoverageTestPath(normalizedPath ?? "") || isBrowserSmokeHarnessPath(normalizedPath ?? ""));
-    if (isConcreteTestTarget && normalizedPath && !existsSync9(resolve12(repo, normalizedPath))) {
+    if (isConcreteTestTarget && normalizedPath && !existsSync10(resolve13(repo, normalizedPath))) {
       droppedMissingTarget = true;
       continue;
     }
@@ -12131,8 +12628,8 @@ function buildValidationExecutionPlan(repo, commands) {
 }
 function collectQualityGateValidationCommands(params) {
   const requiredRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(params.repo, runnableValidationCommandsFromSteps(params.planning.requiredValidationSteps).slice(0, 12));
-  const plannerRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(params.repo, runnableValidationCommandsFromSteps(params.planning.validationSteps).slice(0, 4));
-  const fallbackValidationSteps = sanitizeValidationCommandsForCurrentCheckout(params.repo, params.isTestTask && plannerRunnableSteps.length === 0 ? inferFallbackValidationCommandsForTestTask(params.instruction, params.targetPath, params.planning, params.changedTestPaths) : []);
+  const plannerRunnableSteps = sanitizeValidationCommandsForCurrentCheckout(params.repo, runnableValidationCommandsFromSteps(params.planning.validationSteps).slice(0, 4)).flatMap((command) => params.repo ? routeRepositoryFocusedTestCommand(params.repo, command) : [command]);
+  const fallbackValidationSteps = sanitizeValidationCommandsForCurrentCheckout(params.repo, params.isTestTask && plannerRunnableSteps.length === 0 ? inferFallbackValidationCommandsForTestTask(params.instruction, params.targetPath, params.planning, params.changedTestPaths) : []).flatMap((command) => params.repo ? routeRepositoryFocusedTestCommand(params.repo, command) : [command]);
   const inferredRepoNativeValidationSteps = params.repo ? inferRepoNativeValidationCommands(params.repo, params.changedPaths ?? []) : [];
   const discoveredCommands = dedupeValidationCommands(requiredRunnableSteps, plannerRunnableSteps.length > 0 ? plannerRunnableSteps : fallbackValidationSteps, inferredRepoNativeValidationSteps).slice(0, 16);
   const commandsToRun = params.repo ? buildValidationExecutionDag(params.repo, discoveredCommands) : discoveredCommands;
@@ -12233,10 +12730,10 @@ function hasBalancedPositiveNegativeAssertions(paths, repo) {
   let positiveAssertions = 0;
   let negativeAssertions = 0;
   for (const rel of paths) {
-    const fullPath = resolve12(repo, rel);
+    const fullPath = resolve13(repo, rel);
     let content = "";
     try {
-      content = readFileSync8(fullPath, "utf-8");
+      content = readFileSync9(fullPath, "utf-8");
     } catch {
       continue;
     }
@@ -12280,7 +12777,7 @@ function collectPrePublishHygieneIssues(params) {
     const changedTestPaths = changedPaths.filter((path) => isAssertionCoverageTestPath(path));
     const hasConsumerInChangedTests = changedTestPaths.some((rel) => {
       try {
-        return /reactNativeMock/i.test(readFileSync8(resolve12(params.repo, rel), "utf8"));
+        return /reactNativeMock/i.test(readFileSync9(resolve13(params.repo, rel), "utf8"));
       } catch {
         return false;
       }
@@ -12296,12 +12793,12 @@ function collectPrePublishHygieneIssues(params) {
   return Array.from(new Set(issues));
 }
 function inferRepoNativeValidationCommands(repo, changedPaths) {
-  const packageJsonPath = resolve12(repo, "package.json");
-  if (!existsSync9(packageJsonPath))
+  const packageJsonPath = resolve13(repo, "package.json");
+  if (!existsSync10(packageJsonPath))
     return [];
   let packageJson = {};
   try {
-    packageJson = JSON.parse(readFileSync8(packageJsonPath, "utf8"));
+    packageJson = JSON.parse(readFileSync9(packageJsonPath, "utf8"));
   } catch {
     return [];
   }
@@ -12317,7 +12814,7 @@ function inferRepoNativeValidationCommands(repo, changedPaths) {
   if (hasTsChange) {
     if (typeof scripts.typecheck === "string" && scripts.typecheck.trim()) {
       commands.push("bun run typecheck");
-    } else if (existsSync9(resolve12(repo, "tsconfig.json")) || Object.prototype.hasOwnProperty.call(dependencies, "typescript")) {
+    } else if (existsSync10(resolve13(repo, "tsconfig.json")) || Object.prototype.hasOwnProperty.call(dependencies, "typescript")) {
       commands.push("bun x tsc --noEmit");
     }
   }
@@ -12635,7 +13132,7 @@ async function runDeterministicQualityGate(repo, params, runtimeConfig, qualityG
           if (missingPlaywrightBrowserTargets.length > 0) {
             const browserEnv = buildWorkerSandboxWritableEnv(repo);
             const browserReadyMarker = playwrightBrowserRuntimeCacheMarkerPath(repo, missingPlaywrightBrowserTargets, browserEnv);
-            if (browserReadyMarker && existsSync9(browserReadyMarker)) {
+            if (browserReadyMarker && existsSync10(browserReadyMarker)) {
               for (const target of missingPlaywrightBrowserTargets) {
                 playwrightBrowserRuntimeReadyTargets.add(target);
               }
@@ -12887,11 +13384,11 @@ function resolveWorkerCriticReviewContext(repo, params, runtimeConfig = DEFAULT_
   const thresholdRaw = Number(reviewAgent.passThreshold);
   const finalReviewThreshold = Number.isFinite(thresholdRaw) ? Math.max(0, Math.min(10, thresholdRaw)) : 9.5;
   const configuredPath = String(reviewAgent.reviewerMdPath ?? "").trim();
-  const reviewerPath = configuredPath ? isAbsolute4(configuredPath) ? configuredPath : resolve12(repo, configuredPath) : "";
+  const reviewerPath = configuredPath ? isAbsolute4(configuredPath) ? configuredPath : resolve13(repo, configuredPath) : "";
   let finalReviewerRubric = "";
-  if (reviewerPath && existsSync9(reviewerPath)) {
+  if (reviewerPath && existsSync10(reviewerPath)) {
     try {
-      finalReviewerRubric = readFileSync8(reviewerPath, "utf8").trim();
+      finalReviewerRubric = readFileSync9(reviewerPath, "utf8").trim();
     } catch {
       finalReviewerRubric = "";
     }
@@ -14345,18 +14842,18 @@ async function gitDirPath(repo) {
   const gitDir = result.stdout.trim();
   if (!gitDir)
     return null;
-  return resolve12(repo, gitDir);
+  return resolve13(repo, gitDir);
 }
 async function activeGitOperation(repo) {
   const gitDir = await gitDirPath(repo);
   if (!gitDir)
     return null;
-  if (existsSync9(resolve12(gitDir, "rebase-merge")) || existsSync9(resolve12(gitDir, "rebase-apply"))) {
+  if (existsSync10(resolve13(gitDir, "rebase-merge")) || existsSync10(resolve13(gitDir, "rebase-apply"))) {
     return "rebase";
   }
-  if (existsSync9(resolve12(gitDir, "MERGE_HEAD")))
+  if (existsSync10(resolve13(gitDir, "MERGE_HEAD")))
     return "merge";
-  if (existsSync9(resolve12(gitDir, "CHERRY_PICK_HEAD")))
+  if (existsSync10(resolve13(gitDir, "CHERRY_PICK_HEAD")))
     return "cherry-pick";
   return null;
 }
@@ -14388,7 +14885,7 @@ async function resumePreparedMergeConflictRebase(repo, kind, params, onLog, dead
   if (unresolvedPaths.length > 0) {
     const stillMarked = unresolvedPaths.filter((relativePath) => {
       try {
-        const contents = readFileSync8(resolve12(repo, relativePath), "utf8");
+        const contents = readFileSync9(resolve13(repo, relativePath), "utf8");
         return /^(<{7}|={7}|>{7})( .*)?$/m.test(contents);
       } catch {
         return true;
@@ -14736,8 +15233,8 @@ async function syncHiddenRefWithRemoteBranchByRebase(repo, hiddenCommitRef, publ
         error: `Refusing to reset publication checkout because its Git directory layout could not be verified: ${combinedGitOutput(!gitDir.ok ? gitDir : commonDir)}`
       };
     }
-    const resolvedGitDir = resolve12(repo, gitDir.stdout.trim());
-    const resolvedCommonDir = resolve12(repo, commonDir.stdout.trim());
+    const resolvedGitDir = resolve13(repo, gitDir.stdout.trim());
+    const resolvedCommonDir = resolve13(repo, commonDir.stdout.trim());
     const normalizePath = (value) => process.platform === "win32" ? value.toLowerCase() : value;
     if (normalizePath(resolvedGitDir) === normalizePath(resolvedCommonDir)) {
       return {
@@ -14790,8 +15287,8 @@ async function syncHiddenRefWithRemoteBranchByRebase(repo, hiddenCommitRef, publ
     return resetPublicationResidueInDisposableWorktree("git pull --rebase");
   };
   const scrubKnownPreSyncArtifacts = async () => {
-    const codexPath = resolve12(repo, ".codex");
-    if (!existsSync9(codexPath))
+    const codexPath = resolve13(repo, ".codex");
+    if (!existsSync10(codexPath))
       return { ok: true };
     const trackedCodex = await git2(repo, ["ls-files", "--error-unmatch", "--", ".codex"]);
     if (trackedCodex.ok) {
@@ -14833,7 +15330,7 @@ async function syncHiddenRefWithRemoteBranchByRebase(repo, hiddenCommitRef, publ
         error: `Failed to scrub transient .codex artifact before branch sync: ${String(error)}`
       };
     }
-    if (existsSync9(codexPath)) {
+    if (existsSync10(codexPath)) {
       return {
         ok: false,
         error: "Failed to scrub transient .codex artifact before branch sync: path still exists."
@@ -14960,7 +15457,7 @@ function codexProjectConfigRoots(repo, env) {
     const text = String(raw ?? "").trim();
     if (!text)
       return;
-    const root = resolve12(text);
+    const root = resolve13(text);
     const key = root.toLowerCase();
     if (seen.has(key))
       return;
@@ -14981,17 +15478,17 @@ function codexProjectConfigRoots(repo, env) {
 function maskRepoLocalCodexFilesForCodexCli(repo, env) {
   const masked = [];
   for (const root of codexProjectConfigRoots(repo, env)) {
-    const codexPath = resolve12(root, ".codex");
-    if (!existsSync9(codexPath))
+    const codexPath = resolve13(root, ".codex");
+    if (!existsSync10(codexPath))
       continue;
     try {
       if (lstatSync2(codexPath).isDirectory())
         continue;
-      let backupPath = resolve12(root, `.codex.pushpals-masked-${process.pid}-${masked.length}`);
+      let backupPath = resolve13(root, `.codex.pushpals-masked-${process.pid}-${masked.length}`);
       let suffix = 0;
-      while (existsSync9(backupPath)) {
+      while (existsSync10(backupPath)) {
         suffix += 1;
-        backupPath = resolve12(root, `.codex.pushpals-masked-${process.pid}-${masked.length}-${suffix}`);
+        backupPath = resolve13(root, `.codex.pushpals-masked-${process.pid}-${masked.length}-${suffix}`);
       }
       renameSync(codexPath, backupPath);
       masked.push({ codexPath, backupPath });
@@ -15005,10 +15502,10 @@ function maskRepoLocalCodexFilesForCodexCli(repo, env) {
 function restoreRepoLocalCodexFilesForCodexCli(masked) {
   for (const entry of [...masked].reverse()) {
     try {
-      if (existsSync9(entry.codexPath)) {
+      if (existsSync10(entry.codexPath)) {
         rmSync3(entry.codexPath, { recursive: true, force: true });
       }
-      if (existsSync9(entry.backupPath)) {
+      if (existsSync10(entry.backupPath)) {
         renameSync(entry.backupPath, entry.codexPath);
       }
     } catch (error) {
@@ -15096,7 +15593,7 @@ async function generateCommitMessageFromDiffViaCodex(prompt, opts, repo, runtime
   if (timeoutMs <= 0)
     return null;
   const reasoningEffort = normalizeCodexReasoningEffort(runtimeConfig.workerpals.llm.reasoningEffort, model);
-  const tmpOutputPath = resolve12(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+  const tmpOutputPath = resolve13(Bun.env.TEMP || Bun.env.TMP || Bun.env.TMPDIR || "/tmp", `pushpals-commit-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
   const cmd = [
     ...codexPrefix,
     "-c",
@@ -15132,7 +15629,7 @@ ${prompt.userMessage}`;
     });
     let content = "";
     try {
-      content = readFileSync8(tmpOutputPath, "utf8").trim();
+      content = readFileSync9(tmpOutputPath, "utf8").trim();
     } catch {
       content = "";
     }
@@ -15332,7 +15829,7 @@ function shouldTreatMissingPathHintAsStale(repo, path, taskText) {
   const normalized = normalizeStagePath(path);
   if (!normalized || normalized === "." || pathHintHasGlob(normalized))
     return false;
-  if (existsSync9(resolve12(repo, normalized)))
+  if (existsSync10(resolve13(repo, normalized)))
     return false;
   if (!pathHintLooksLikeConcreteFile(normalized))
     return false;
@@ -15347,7 +15844,7 @@ function pathParentExists(repo, path) {
   const parts = normalized.split("/");
   if (parts.length <= 1)
     return true;
-  return existsSync9(resolve12(repo, parts.slice(0, -1).join("/")));
+  return existsSync10(resolve13(repo, parts.slice(0, -1).join("/")));
 }
 function sanitizeStalePathHints(repo, values, taskText, opts = {}) {
   const stale = [];
@@ -15708,7 +16205,7 @@ Evidence contract: Every finding or must_fix claim about tests, validation, comm
       validationChars: validationSummary.length
     };
   };
-  const tmpOutputPath = resolve12(tmpdir4(), `pushpals-critic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+  const tmpOutputPath = resolve13(tmpdir4(), `pushpals-critic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
   const buildCmd = () => {
     const cmd = [
       ...codexPrefix,
@@ -16826,9 +17323,9 @@ ${result.stderr ?? ""}`;
 
 // apps/workerpals/src/docker_executor.ts
 import { createHash as createHash7, randomUUID as randomUUID2 } from "crypto";
-import { existsSync as existsSync11, mkdirSync as mkdirSync4, readFileSync as readFileSync9, writeFileSync as writeFileSync5 } from "fs";
+import { existsSync as existsSync12, mkdirSync as mkdirSync4, readFileSync as readFileSync10, writeFileSync as writeFileSync5 } from "fs";
 import { homedir as homedir3 } from "os";
-import { isAbsolute as isAbsolute5, relative as relative3, resolve as resolve13 } from "path";
+import { isAbsolute as isAbsolute5, relative as relative4, resolve as resolve14 } from "path";
 
 // apps/workerpals/src/common/job_result_transport.ts
 var JOB_RESULT_PREFIX = "___RESULT___";
@@ -16855,9 +17352,9 @@ function oversizedJobResultFrame() {
 }
 
 // apps/workerpals/src/common/worktree_cleanup.ts
-import { existsSync as existsSync10, rmSync as rmSync4 } from "fs";
+import { existsSync as existsSync11, rmSync as rmSync4 } from "fs";
 function defaultSleep(ms) {
-  return new Promise((resolve13) => setTimeout(resolve13, ms));
+  return new Promise((resolve14) => setTimeout(resolve14, ms));
 }
 function windowsDeletionCandidates(worktreePath) {
   const seen = new Set;
@@ -16879,7 +17376,7 @@ async function forceDeleteWorktreePath(worktreePath, options = {}) {
   const delayMs = Math.max(0, Math.floor(options.delayMs ?? 120));
   const sleep = options.sleepFn ?? defaultSleep;
   const removePath = options.removeFn ?? ((targetPath) => rmSync4(targetPath, { recursive: true, force: true }));
-  const pathExists = options.existsFn ?? ((targetPath) => existsSync10(targetPath));
+  const pathExists = options.existsFn ?? ((targetPath) => existsSync11(targetPath));
   let lastError = "";
   for (let attempt = 1;attempt <= retries; attempt++) {
     if (!pathExists(worktreePath))
@@ -17501,20 +17998,20 @@ function resolveDockerExecutable() {
     return configured;
   return process.platform === "win32" ? "docker.exe" : "docker";
 }
-function resolveWorkerpalDockerBuildCaSecretArgs(env = process.env, fileExists = existsSync11) {
+function resolveWorkerpalDockerBuildCaSecretArgs(env = process.env, fileExists = existsSync12) {
   const configured = String(env.PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS ?? env.NODE_EXTRA_CA_CERTS ?? "").trim();
   if (!configured)
     return [];
-  const path = resolve13(configured);
+  const path = resolve14(configured);
   if (!fileExists(path))
     return [];
   return ["--secret", `id=${WORKERPAL_SANDBOX_EXTRA_CA_SECRET_ID},src=${path}`];
 }
-function resolveWorkerpalDockerRuntimeCaArgs(env = process.env, fileExists = existsSync11, dockerHostPath = (path) => path) {
+function resolveWorkerpalDockerRuntimeCaArgs(env = process.env, fileExists = existsSync12, dockerHostPath = (path) => path) {
   const configured = String(env.PUSHPALS_DOCKER_RUNTIME_EXTRA_CA_CERTS ?? env.PUSHPALS_DOCKER_BUILD_EXTRA_CA_CERTS ?? env.NODE_EXTRA_CA_CERTS ?? "").trim();
   if (!configured)
     return [];
-  const path = resolve13(configured);
+  const path = resolve14(configured);
   if (!fileExists(path))
     return [];
   return [
@@ -17548,7 +18045,7 @@ function prependWorkerpalRuntimeCaStartup(startupCommand, runtimeCaEnabled) {
 function resolveWorkerpalSandboxBuildContext(repoRoot) {
   const configuredRoot = String(process.env.PUSHPALS_WORKERPALS_SANDBOX_ROOT ?? "").trim();
   const sandboxRoot = configuredRoot || repoRoot;
-  const dockerfilePath = configuredRoot ? resolve13(sandboxRoot, "apps", "workerpals", "Dockerfile.sandbox") : resolve13(repoRoot, "apps", "workerpals", "Dockerfile.sandbox");
+  const dockerfilePath = configuredRoot ? resolve14(sandboxRoot, "apps", "workerpals", "Dockerfile.sandbox") : resolve14(repoRoot, "apps", "workerpals", "Dockerfile.sandbox");
   return {
     root: sandboxRoot,
     dockerfilePath
@@ -17558,7 +18055,7 @@ function resolveWorkerpalRuntimeTag() {
   return String(process.env.PUSHPALS_RUNTIME_TAG ?? "").trim();
 }
 function dockerBuildFileArg(root, dockerfilePath) {
-  const relativePath = relative3(root, dockerfilePath).replace(/\\/g, "/").trim();
+  const relativePath = relative4(root, dockerfilePath).replace(/\\/g, "/").trim();
   return relativePath || "apps/workerpals/Dockerfile.sandbox";
 }
 function isMissingDockerImageDetail(detail) {
@@ -17933,9 +18430,9 @@ class DockerExecutor {
       networkMode: "bridge",
       ...optionValues
     };
-    this.worktreeDir = resolve13(this.options.repo, ".worktrees");
+    this.worktreeDir = resolve14(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
-    const dependencyRepoPath = resolve13(this.options.repo);
+    const dependencyRepoPath = resolve14(this.options.repo);
     this.dependencyVolumeName = `pushpals-deps-${createHash7("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
     this.codexVolumeName = `pushpals-codex-${createHash7("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
@@ -17959,7 +18456,7 @@ class DockerExecutor {
     this.activeJobs += 1;
     this.clearIdleTimer();
     const worktreeName = this.buildEphemeralWorktreeName("job", job.id);
-    const worktreePath = resolve13(this.worktreeDir, worktreeName);
+    const worktreePath = resolve14(this.worktreeDir, worktreeName);
     let terminalResult = null;
     let terminalError = null;
     let worktreeBaselineSha = null;
@@ -18133,7 +18630,7 @@ class DockerExecutor {
         }
       } : null);
       const setupWorktreeNeedsReconciliation = worktreeCreationStarted && worktreeBaselineSha === null;
-      if (resultForCleanup && !resultForCleanup.ok && existsSync11(worktreePath) && !setupWorktreeNeedsReconciliation) {
+      if (resultForCleanup && !resultForCleanup.ok && existsSync12(worktreePath) && !setupWorktreeNeedsReconciliation) {
         const candidateState = resultForCleanup.candidateState ?? {
           status: resultForCleanup.exitCode === 124 ? "partial" : "held",
           reason: resultForCleanup.exitCode === 124 ? "execution_timeout" : "terminal_failure",
@@ -18190,7 +18687,7 @@ class DockerExecutor {
   }
   async validateWorktreeGitInterop() {
     const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "startup");
-    const worktreePath = resolve13(this.worktreeDir, worktreeName);
+    const worktreePath = resolve14(this.worktreeDir, worktreeName);
     try {
       await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath);
@@ -18213,7 +18710,7 @@ class DockerExecutor {
       throw new Error(`Invalid LF boundary assertion path: ${assertLfPath}`);
     }
     const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "windows-linux-lf");
-    const worktreePath = resolve13(this.worktreeDir, worktreeName);
+    const worktreePath = resolve14(this.worktreeDir, worktreeName);
     try {
       await this.createWorktree(worktreePath, this.options.baseRef);
       await this.runGitSelfCheckContainer(worktreePath, normalizedPath);
@@ -18279,8 +18776,8 @@ class DockerExecutor {
   }
   rewriteWorktreeGitdirToRelative(worktreePath) {
     try {
-      const gitFilePath = resolve13(worktreePath, ".git");
-      const raw = readFileSync9(gitFilePath, "utf-8").trim();
+      const gitFilePath = resolve14(worktreePath, ".git");
+      const raw = readFileSync10(gitFilePath, "utf-8").trim();
       const match = raw.match(/^gitdir:\s*(.+)$/i);
       if (!match)
         return;
@@ -18289,7 +18786,7 @@ class DockerExecutor {
       if (!hasWindowsDrive && !isAbsolute5(gitdirRaw)) {
         return;
       }
-      const rel = relative3(worktreePath, gitdirRaw).replace(/\\/g, "/");
+      const rel = relative4(worktreePath, gitdirRaw).replace(/\\/g, "/");
       if (!rel || rel.startsWith("..") === false) {
         return;
       }
@@ -18524,7 +19021,7 @@ class DockerExecutor {
     const dockerRepoPath = this.toDockerPath(this.options.repo);
     const envArgs = this.collectContainerEnv();
     const authMount = this.openaiCodexAuthMount(backend);
-    const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(process.env, existsSync11, (path) => this.toDockerPath(path));
+    const runtimeCaArgs = resolveWorkerpalDockerRuntimeCaArgs(process.env, existsSync12, (path) => this.toDockerPath(path));
     const args = [
       "run",
       "-d",
@@ -18595,7 +19092,7 @@ class DockerExecutor {
         return;
       }
       for (const worktreeId of this.preparedDependencyProjectionIds) {
-        if (!existsSync11(resolve13(this.worktreeDir, worktreeId))) {
+        if (!existsSync12(resolve14(this.worktreeDir, worktreeId))) {
           this.preparedDependencyProjectionIds.delete(worktreeId);
         }
       }
@@ -18632,9 +19129,9 @@ class DockerExecutor {
     }
     const hostCodexHomeRaw = (process.env.PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME || "").trim();
     if (hostCodexHomeRaw && !isAbsolute5(hostCodexHomeRaw)) {
-      console.warn(`[DockerExecutor] Ignoring relative PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME=${hostCodexHomeRaw}; using ${resolve13(homedir3(), ".codex")} so Codex state stays outside the repo worktree.`);
+      console.warn(`[DockerExecutor] Ignoring relative PUSHPALS_OPENAI_CODEX_HOST_CODEX_HOME=${hostCodexHomeRaw}; using ${resolve14(homedir3(), ".codex")} so Codex state stays outside the repo worktree.`);
     }
-    const hostCodexHome = (hostCodexHomeRaw && isAbsolute5(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve13(homedir3(), ".codex")).trim();
+    const hostCodexHome = (hostCodexHomeRaw && isAbsolute5(hostCodexHomeRaw) ? hostCodexHomeRaw : resolve14(homedir3(), ".codex")).trim();
     const configuredContainerHome = process.env.PUSHPALS_OPENAI_CODEX_CONTAINER_CODEX_HOME;
     const containerCodexHome = resolveOpenAiCodexContainerHome(configuredContainerHome);
     if (configuredContainerHome?.trim() && containerCodexHome !== configuredContainerHome.trim().replace(/\/$/, "")) {
@@ -18646,8 +19143,8 @@ class DockerExecutor {
       "-e",
       `CODEX_HOME=${containerCodexHome}`
     ];
-    const hostAuthPath = resolve13(hostCodexHome, "auth.json");
-    if (!existsSync11(hostAuthPath)) {
+    const hostAuthPath = resolve14(hostCodexHome, "auth.json");
+    if (!existsSync12(hostAuthPath)) {
       console.warn(`[DockerExecutor] Host Codex auth file not found at ${hostAuthPath}; preserving any auth already stored in ${this.codexVolumeName}.`);
       return { args, containerHome: containerCodexHome, hostAuthMounted: false };
     }
@@ -19447,7 +19944,7 @@ ${text}` : `
     throw new Error(`worktree path not visible inside warm container after ${boundedTimeoutMs}ms: ${containerWorktreePath}${lastDetail ? ` (${lastDetail})` : ""}`);
   }
   async ensureWorktreeAccessibleInWarmContainer(worktreePath, onLog, deadlineLedger) {
-    const worktreeRelPath = relative3(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const worktreeRelPath = relative4(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
     let lastError = null;
     for (let attempt = 1;attempt <= 2; attempt++) {
@@ -19516,7 +20013,7 @@ ${text}` : `
   async runGitSelfCheckContainer(worktreePath, assertLfPath) {
     const containerName = `pushpals-${this.options.workerId}-selfcheck-${Date.now()}`;
     const dockerRepoPath = this.toDockerPath(this.options.repo);
-    const worktreeRelPath = relative3(this.options.repo, worktreePath).replace(/\\/g, "/");
+    const worktreeRelPath = relative4(this.options.repo, worktreePath).replace(/\\/g, "/");
     const containerWorktreePath = `/repo/${worktreeRelPath}`;
     const args = [
       resolveDockerExecutable(),
@@ -20140,7 +20637,7 @@ ${result.stderr ?? ""}`.toLowerCase();
     return normalized.slice(0, maxLength);
   }
   async ensureFreshWorktreePath(worktreePath, deadlineLedger) {
-    if (!existsSync11(worktreePath))
+    if (!existsSync12(worktreePath))
       return;
     console.warn(`[DockerExecutor] Worktree path already exists; forcing cleanup before create: ${worktreePath}`);
     await this.runHostCommandCapture(["git", "worktree", "remove", "--force", "--force", worktreePath], {
@@ -20193,7 +20690,7 @@ ${result.stderr ?? ""}`.toLowerCase();
   async rebuildImageForMergeConflictJob(job, onLog) {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
     const dockerfilePath = sandboxContext.dockerfilePath;
-    if (!existsSync11(dockerfilePath)) {
+    if (!existsSync12(dockerfilePath)) {
       throw new Error(`Merge-conflict job ${job.id} requires Docker image refresh, but Dockerfile is missing at ${dockerfilePath}.`);
     }
     const startMsg = `[DockerExecutor] Merge-conflict job ${job.id}: rebuilding ${this.options.imageName} with --no-cache and restarting warm runtime.`;
@@ -20339,7 +20836,7 @@ ${result.stderr ?? ""}`.toLowerCase();
   }
   async buildLocalImage(runtimeTag, deadlineLedger) {
     const sandboxContext = resolveWorkerpalSandboxBuildContext(this.options.repo);
-    if (!existsSync11(sandboxContext.dockerfilePath)) {
+    if (!existsSync12(sandboxContext.dockerfilePath)) {
       return false;
     }
     const dockerfileArg = dockerBuildFileArg(sandboxContext.root, sandboxContext.dockerfilePath);
@@ -20545,21 +21042,21 @@ class WorkerServerTransport {
   async flush(timeoutMs = 15000) {
     if (this.queuedRequests.length === 0 && !this.queueDrainInFlight)
       return;
-    await new Promise((resolve14) => {
+    await new Promise((resolve15) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled)
           return;
         settled = true;
         this.logWarn(`[WorkerPals] Timed out flushing queued server transport requests after ${timeoutMs}ms (queued=${this.queuedRequests.length}).`);
-        resolve14();
+        resolve15();
       }, timeoutMs);
       this.queueFlushWaiters.push(() => {
         if (settled)
           return;
         settled = true;
         clearTimeout(timer);
-        resolve14();
+        resolve15();
       });
       this.maybeResolveFlushWaiters();
     });
@@ -20572,8 +21069,8 @@ class WorkerServerTransport {
       }
       return Promise.resolve();
     }
-    return new Promise((resolve14) => {
-      const queued = { ...task, resolve: resolve14 };
+    return new Promise((resolve15) => {
+      const queued = { ...task, resolve: resolve15 };
       if (queued.priority === "high") {
         const firstNormalIndex = this.queuedRequests.findIndex((entry) => entry.priority !== "high");
         if (firstNormalIndex === -1) {
@@ -21540,7 +22037,7 @@ async function resolveWorktreeBaseRefForJob(repo, requestedRef, jobId, params, d
 async function createIsolatedWorktree(repo, jobId, baseRef, onLog, deadlineLedger) {
   const nonce = `${Date.now().toString(36).slice(-6)}-${Math.random().toString(36).slice(2, 6)}`;
   const worktreePath = resolveDirectWorktreePath(repo, jobId, nonce);
-  mkdirSync5(resolve14(worktreePath, ".."), { recursive: true });
+  mkdirSync5(resolve15(worktreePath, ".."), { recursive: true });
   const addResult = await git2(repo, ["worktree", "add", "--detach", worktreePath, baseRef], deadlineLedger, "work");
   if (!addResult.ok) {
     throw new Error(`Failed to create isolated worktree: ${addResult.stderr}`);
