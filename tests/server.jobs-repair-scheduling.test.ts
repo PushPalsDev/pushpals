@@ -187,9 +187,10 @@ describe("server JobQueue repair scheduling", () => {
             .query("SELECT * FROM pr_repair_lifecycle ORDER BY lifecycleKey")
             .all() as Array<Record<string, unknown>>;
           expect(migrated[0].repositoryIdentity).toBe("github.com/example/repo");
-          expect(migrated.map(({ repositoryIdentity: _identity, ...row }) => row)).toEqual(
-            original,
-          );
+          expect(migrated[0].heldBaseSha).toBeNull();
+          expect(
+            migrated.map(({ repositoryIdentity: _identity, heldBaseSha: _held, ...row }) => row),
+          ).toEqual(original);
         } finally {
           queue.close();
         }
@@ -412,6 +413,101 @@ describe("server JobQueue repair scheduling", () => {
       );
     } finally {
       queue.close();
+    }
+  });
+
+  test("holds publication conflicts on the observed base across restart without cloning, exhausting, or occupying the queue", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-held-repair-"));
+    const dbPath = join(root, "jobs.db");
+    let queue = new JobQueue(dbPath);
+    try {
+      const repair = enqueueAuthorizedReviewRepair(
+        queue,
+        {
+          taskId: "held-review",
+          sessionId: "dev",
+          kind: "task.execute",
+          workClass: "repair",
+        },
+        "held",
+      );
+      const params = JSON.parse(queue.getJob(String(repair.jobId))!.params);
+      const lookup = {
+        repositoryIdentity: "git@github.com:example/repo.git",
+        prNumber: 697,
+        headSha: "abc1234",
+        baseSha: "fresh-conflict-base",
+      };
+      const db = (queue as unknown as { db: Database }).db;
+      db.transaction(() => {
+        db.query("UPDATE jobs SET status='publish_blocked' WHERE id=?").run(repair.jobId);
+        db.query(
+          "UPDATE pr_repair_lifecycle SET status='held', heldBaseSha=?, activeJobId=NULL, nextRetryAt=NULL, lastError='Manual conflict resolution required'",
+        ).run(lookup.baseSha);
+      })();
+      const before = db.query("SELECT * FROM pr_repair_lifecycle").all();
+      for (let restart = 0; restart < 2; restart++) {
+        queue.close();
+        queue = new JobQueue(dbPath);
+        const reopened = (queue as unknown as { db: Database }).db;
+        expect(queue.getReviewRepairLifecycleState(lookup)).toEqual({
+          state: "held",
+          activeJobId: null,
+          detail: "Manual conflict resolution required",
+        });
+        expect(
+          queue.getReviewRepairLifecycleState({ ...lookup, baseSha: "later-base" }).state,
+        ).toBe("none");
+        expect(
+          queue.getReviewRepairLifecycleState({ ...lookup, headSha: "repaired-head" }).state,
+        ).toBe("none");
+        const requested = {
+          taskId: `held-clone-${restart}`,
+          sessionId: "dev",
+          kind: "task.execute",
+          params: {
+            ...params,
+            reviewAgent: {
+              ...params.reviewAgent,
+              prBaseSha: lookup.baseSha,
+              resolutionType: "merge_conflict",
+            },
+          },
+        };
+        expect(queue.authorizeReviewRepairCapability(requested).ok).toBe(true);
+        expect(queue.reviewRepairAdmission(requested)).toMatchObject({
+          authorized: false,
+          terminal: true,
+          exhausted: false,
+          held: true,
+          activeJobId: null,
+        });
+        expect(queue.enqueue(requested, { authorizedElevatedWorkClass: "repair" }).ok).toBe(false);
+        expect(queue.reconcileReviewRepairLifecycles()).toMatchObject({
+          scanned: 0,
+          rearmed: 0,
+          exhausted: 0,
+        });
+        expect(reopened.query("SELECT * FROM pr_repair_lifecycle").all()).toEqual(before);
+        expect(
+          reopened
+            .query(
+              "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending','claimed','finalizing')",
+            )
+            .get(),
+        ).toEqual({ count: 0 });
+      }
+      const changed = {
+        params: { ...params, reviewAgent: { ...params.reviewAgent, prBaseSha: "later-base" } },
+      };
+      expect(queue.authorizeReviewRepairCapability(changed).ok).toBe(true);
+      expect(queue.reviewRepairAdmission(changed)).toMatchObject({
+        authorized: true,
+        terminal: false,
+      });
+    } finally {
+      queue.close();
+      removeClosedSqliteFixture(root);
     }
   });
 

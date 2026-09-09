@@ -28,6 +28,9 @@ describe("release workflow action runtimes", () => {
       expect(step).toContain("tests/source-control-manager.review-agent.test.ts");
       expect(step).toContain("tests/source-control-manager.review-journal.test.ts");
       expect(step).toContain("tests/source-control-manager.github-pr.test.ts");
+      expect(step).toContain("tests/source-control-manager.review-publication.test.ts");
+      expect(step).toContain("tests/source-control-manager.review-publication-recovery.test.ts");
+      expect(step).toContain("tests/shared.review-publication-validation.test.ts");
     },
   );
 

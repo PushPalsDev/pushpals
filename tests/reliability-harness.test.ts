@@ -64,6 +64,21 @@ describe("reliability harness release coverage", () => {
     expect(evidenceFiles).toContain("tests/shared.trusted-validation-evidence.test.ts");
   });
 
+  test("gates retained review candidates across target-base movement and lease recovery", () => {
+    const repairFiles = listReliabilityHarnessPhaseFiles("repair_orchestration");
+    const lifecycleFiles = listReliabilityHarnessPhaseFiles("durable_lifecycle");
+    const evidenceFiles = listReliabilityHarnessPhaseFiles("failure_evidence");
+
+    expect(repairFiles).toContain("tests/source-control-manager.review-publication.test.ts");
+    expect(repairFiles).toContain("tests/shared.review-publication-validation.test.ts");
+    expect(repairFiles).toContain(
+      "tests/source-control-manager.review-publication-recovery.test.ts",
+    );
+    expect(repairFiles).toContain("tests/source-control-manager.review-journal.test.ts");
+    expect(lifecycleFiles).toContain("tests/server.jobs-repair-scheduling.test.ts");
+    expect(evidenceFiles).toContain("tests/server.completions-queue.test.ts");
+  });
+
   test("gates durable runtime-circuit and claim-generation recovery behavior", () => {
     const lifecycleFiles = listReliabilityHarnessPhaseFiles("durable_lifecycle");
     const runtimeFiles = listReliabilityHarnessPhaseFiles("runtime_boundary");

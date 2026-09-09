@@ -13490,6 +13490,7 @@ class JobQueue {
         prNumber           INTEGER,
         headSha            TEXT NOT NULL,
         baseSha            TEXT,
+        heldBaseSha        TEXT,
         resolutionType     TEXT NOT NULL,
         sourceJobId        TEXT,
         activeJobId        TEXT,
@@ -13639,6 +13640,14 @@ class JobQueue {
       CREATE INDEX IF NOT EXISTS idx_job_validation_runs_failure_class
         ON job_validation_runs(failureClass, createdAt);
 
+      CREATE TABLE IF NOT EXISTS job_validation_snapshots (
+        jobId TEXT PRIMARY KEY,
+        claimGeneration INTEGER NOT NULL,
+        commandsJson TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+
       CREATE TABLE IF NOT EXISTS job_patch_snapshots (
         id                     INTEGER PRIMARY KEY AUTOINCREMENT,
         jobId                  TEXT NOT NULL,
@@ -13725,6 +13734,9 @@ class JobQueue {
     const repairLifecycleColumns = this.db.prepare(`PRAGMA table_info(pr_repair_lifecycle)`).all();
     if (!repairLifecycleColumns.some((column) => column.name === "repositoryIdentity")) {
       this.db.exec(`ALTER TABLE pr_repair_lifecycle ADD COLUMN repositoryIdentity TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!repairLifecycleColumns.some((column) => column.name === "heldBaseSha")) {
+      this.db.exec(`ALTER TABLE pr_repair_lifecycle ADD COLUMN heldBaseSha TEXT;`);
     }
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_exact_head
       ON pr_repair_lifecycle(repositoryIdentity, prNumber, headSha, baseSha);`);
@@ -14110,7 +14122,7 @@ class JobQueue {
          ON CONFLICT(lifecycleKey) DO UPDATE SET
            sourceJobId = COALESCE(pr_repair_lifecycle.sourceJobId, excluded.sourceJobId),
            activeJobId = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.activeJobId
              WHEN pr_repair_lifecycle.status IN ('queued','running')
                AND pr_repair_lifecycle.activeJobId IS NOT NULL
@@ -14119,7 +14131,7 @@ class JobQueue {
              ELSE excluded.activeJobId
            END,
            status = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.status
              WHEN pr_repair_lifecycle.status IN ('queued','running')
                AND pr_repair_lifecycle.activeJobId IS NOT NULL
@@ -14128,19 +14140,19 @@ class JobQueue {
              ELSE 'queued'
            END,
            attemptCount = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.attemptCount
              WHEN pr_repair_lifecycle.activeJobId = excluded.activeJobId
                THEN pr_repair_lifecycle.attemptCount
              ELSE MAX(1, pr_repair_lifecycle.attemptCount)
            END,
            nextRetryAt = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.nextRetryAt
              ELSE NULL
            END,
            updatedAt = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.updatedAt
              WHEN julianday(excluded.updatedAt) > julianday(pr_repair_lifecycle.updatedAt)
                THEN excluded.updatedAt
@@ -14185,7 +14197,7 @@ class JobQueue {
     let lifecycle = this.db.prepare(`SELECT activeJobId, status, attemptCount, maxAttempts
          FROM pr_repair_lifecycle
          WHERE lifecycleKey = ?`).get(context.lifecycleKey);
-    if (lifecycle?.status === "succeeded" || lifecycle?.status === "exhausted")
+    if (lifecycle && ["succeeded", "exhausted", "superseded", "held"].includes(lifecycle.status))
       return null;
     if (!lifecycle) {
       const admission = this.reviewRepairAdmission({ params, prUrl: job.prUrl });
@@ -14196,7 +14208,7 @@ class JobQueue {
            FROM pr_repair_lifecycle
            WHERE lifecycleKey = ?`).get(context.lifecycleKey);
     }
-    if (!lifecycle || lifecycle.status === "succeeded" || lifecycle.status === "exhausted") {
+    if (!lifecycle || ["succeeded", "exhausted", "superseded", "held"].includes(lifecycle.status)) {
       return null;
     }
     if (lifecycle.activeJobId && lifecycle.activeJobId !== jobId) {
@@ -14319,14 +14331,14 @@ class JobQueue {
                ELSE updatedAt
              END
          WHERE activeJobId = ?
-           AND status != 'exhausted'`).run(now, now, jobId);
+           AND status NOT IN ('exhausted', 'superseded', 'held')`).run(now, now, jobId);
   }
   reconcileReviewRepairLifecycles(now = new Date().toISOString()) {
     const page = this.db.prepare(`SELECT lifecycle.rowid AS cursor, j.id, j.params, j.prUrl, j.status
        FROM pr_repair_lifecycle lifecycle
        JOIN jobs j ON j.id = lifecycle.activeJobId
        WHERE lifecycle.rowid > ?
-         AND lifecycle.status NOT IN ('succeeded','exhausted')
+         AND lifecycle.status NOT IN ('succeeded','exhausted','superseded','held')
          AND j.status IN ('completed','failed','publish_blocked','abandoned')
        ORDER BY lifecycle.rowid ASC
        LIMIT 200`);
@@ -14361,18 +14373,27 @@ class JobQueue {
     if (!repository || !Number.isSafeInteger(input.prNumber) || input.prNumber <= 0 || !head || !base || head.length > 128 || base.length > 128) {
       throw new Error("Invalid exact review lifecycle lookup");
     }
-    const rows = this.db.query(`SELECT status, activeJobId, baseSha, lastError FROM pr_repair_lifecycle
+    const rows = this.db.query(`SELECT status, activeJobId, baseSha, heldBaseSha, lastError FROM pr_repair_lifecycle
        WHERE repositoryIdentity = ? AND prNumber = ? AND headSha = ?
-         AND (baseSha = ? OR status NOT IN ('succeeded', 'exhausted'))
-       LIMIT 101`).all(repository, input.prNumber, head, base);
+         AND ((status = 'held' AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+           OR (status <> 'held' AND baseSha = ?)
+           OR status NOT IN ('succeeded', 'exhausted', 'superseded', 'held'))
+       LIMIT 101`).all(repository, input.prNumber, head, base, base);
     if (rows.length > 100)
       throw new Error("Exact review lifecycle lookup exceeded its safety bound");
-    const active = rows.find((row) => !["succeeded", "exhausted"].includes(row.status));
+    const active = rows.find((row) => !["succeeded", "exhausted", "superseded", "held"].includes(row.status));
     if (active)
       return {
         state: "active",
         activeJobId: active.activeJobId,
         detail: "A durable repair lifecycle still owns this PR head."
+      };
+    const held = rows.find((row) => row.status === "held");
+    if (held)
+      return {
+        state: "held",
+        activeJobId: null,
+        detail: String(held.lastError || "Publication requires explicit resolution; unchanged repair work is held.").slice(0, 2000)
       };
     const exhausted = rows.find((row) => row.status === "exhausted");
     if (exhausted)
@@ -14381,11 +14402,11 @@ class JobQueue {
         activeJobId: null,
         detail: String(exhausted.lastError || "Exact PR revision repair attempts are exhausted.").slice(0, 2000)
       };
-    if (rows.some((row) => row.status === "succeeded"))
+    if (rows.some((row) => row.status === "succeeded" || row.status === "superseded"))
       return {
         state: "settled",
         activeJobId: null,
-        detail: "Exact PR revision repair lifecycle already succeeded."
+        detail: "Exact PR revision repair lifecycle already settled."
       };
     return { state: "none", activeJobId: null, detail: "" };
   }
@@ -14409,11 +14430,25 @@ class JobQueue {
     const lifecycle = this.db.prepare(`SELECT status, sourceJobId, activeJobId
          FROM pr_repair_lifecycle
          WHERE lifecycleKey = ?
-            OR (status IN ('succeeded', 'exhausted')
+            OR (status = 'held' AND repositoryIdentity = ?
+                AND prNumber = ? AND headSha = ?
+                AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+            OR (status IN ('succeeded', 'exhausted', 'superseded')
                 AND repositoryIdentity = ?
                 AND prNumber = ? AND headSha = ? AND baseSha = ? AND resolutionType = ?)
-         ORDER BY CASE status WHEN 'exhausted' THEN 0 WHEN 'succeeded' THEN 1 ELSE 2 END
-         LIMIT 1`).get(context.lifecycleKey, context.repositoryIdentity, context.prNumber, context.headSha, context.baseSha, context.resolutionType);
+         ORDER BY CASE status WHEN 'held' THEN 0 WHEN 'exhausted' THEN 1 WHEN 'succeeded' THEN 2 WHEN 'superseded' THEN 2 ELSE 3 END
+         LIMIT 1`).get(context.lifecycleKey, context.repositoryIdentity, context.prNumber, context.headSha, context.baseSha, context.repositoryIdentity, context.prNumber, context.headSha, context.baseSha, context.resolutionType);
+    if (lifecycle?.status === "held")
+      return {
+        requested: true,
+        authorized: false,
+        exhausted: false,
+        terminal: true,
+        held: true,
+        workClass: null,
+        activeJobId: null,
+        reason: "Publication is held for explicit resolution; unchanged repair work cannot be cloned."
+      };
     if (lifecycle?.status === "exhausted") {
       return {
         requested: true,
@@ -14425,7 +14460,7 @@ class JobQueue {
         reason: "The durable PR/head repair lifecycle is exhausted."
       };
     }
-    if (lifecycle?.status === "succeeded") {
+    if (lifecycle?.status === "succeeded" || lifecycle?.status === "superseded") {
       return {
         requested: true,
         authorized: false,
@@ -14433,7 +14468,7 @@ class JobQueue {
         terminal: true,
         workClass: null,
         activeJobId: lifecycle.activeJobId,
-        reason: "The durable PR/head repair lifecycle already succeeded."
+        reason: `The durable PR/head repair lifecycle already ${lifecycle.status === "superseded" ? "settled after publication supersession" : "succeeded"}.`
       };
     }
     if (lifecycle) {
@@ -15392,6 +15427,26 @@ class JobQueue {
         ])
           delete metadata[key];
         insertValidationRun.run(jobId, boundedDbInt(run.attempt, 1000), command, boundedDbInt(run.exitCode, 999), boundedDbInt(run.durationMs, 24 * 60 * 60 * 1000), boolFromUnknown(run.passed) ? 1 : 0, diagnosticText(run.failureClass, 160), diagnosticText(run.stdoutTail, 8000), diagnosticText(run.stderrTail, 8000), diagnosticMetadataJson(metadata), now);
+      }
+      if (hasValidationRuns && terminal) {
+        const owner = this.db.query("SELECT claimGeneration FROM jobs WHERE id = ?").get(jobId);
+        const rawRuns = diagnostics.validationRuns;
+        const terminalMetadata = recordFromUnknown(terminal.metadata);
+        const finalRevision = terminalMetadata?.revisionAttempt;
+        const finalCount = terminalMetadata?.validationRuns;
+        const hasFinalRevision = Number.isSafeInteger(finalRevision) && Number(finalRevision) >= 0;
+        const finalRuns = hasFinalRevision ? rawRuns.filter((run) => recordFromUnknown(run)?.attempt === finalRevision) : rawRuns;
+        const completeFinalRevision = hasFinalRevision ? Number.isSafeInteger(finalCount) && finalCount === finalRuns.length : finalRevision === undefined && finalCount === undefined;
+        const completeCommands = rawRuns.length <= MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS && completeFinalRevision && finalRuns.every((run) => {
+          const record = recordFromUnknown(run);
+          return typeof record?.command === "string" && record.command.length <= 1000;
+        }) ? finalRuns.map((run) => run.command) : null;
+        if (owner) {
+          this.db.query(`INSERT INTO job_validation_snapshots
+              (jobId, claimGeneration, commandsJson, createdAt) VALUES (?, ?, ?, ?)
+              ON CONFLICT(jobId) DO UPDATE SET claimGeneration = excluded.claimGeneration,
+                commandsJson = excluded.commandsJson, createdAt = excluded.createdAt`).run(jobId, owner.claimGeneration, JSON.stringify(completeCommands), now);
+        }
       }
       const insertPatchSnapshot = this.db.prepare(`INSERT INTO job_patch_snapshots (
            jobId, attempt, phase, publishableFileCount, artifactOnlyPathCount,
@@ -18574,6 +18629,142 @@ class RequestQueue {
 // apps/server/src/completions.ts
 import { Database as Database4 } from "bun:sqlite";
 import { createHash as createHash6, randomUUID as randomUUID5 } from "crypto";
+
+// packages/shared/src/review_publication_validation.ts
+function rejected(status, reason) {
+  return { version: 1, status, commands: [], reason };
+}
+function commandArray(value, label, optional = true) {
+  if (optional && (value === undefined || value === null))
+    return [];
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      throw new Error(`${label} must be a command array, not unparsed text.`);
+    }
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim()))
+    throw new Error(`${label} must contain only nonempty strings.`);
+  if (value.length > 256)
+    throw new Error(`${label} exceeds the evidence bound.`);
+  return value;
+}
+function plannedCommands(steps, required) {
+  const commands = [];
+  for (const step of steps) {
+    const trimmed = step.trim();
+    const candidate = trimmed.replace(/^(?:run|execute)\s+/i, "");
+    if (tokenizeTrustedValidationCommand(candidate)) {
+      commands.push(candidate);
+      continue;
+    }
+    if (/^(?:(?:run|execute)\s+)?`/i.test(trimmed)) {
+      const matches = [...trimmed.matchAll(/`([^`\r\n]+)`/g)];
+      if (matches.length && matches.every((match) => tokenizeTrustedValidationCommand(match[1]))) {
+        commands.push(...matches.map((match) => match[1].trim()));
+        continue;
+      }
+      throw new Error(`Unsafe or ambiguous planned validation command: ${trimmed}`);
+    }
+    if (required || /^(?:run|execute)\s+/i.test(trimmed))
+      throw new Error(`Cannot establish the required validation command: ${trimmed}`);
+  }
+  return commands;
+}
+function completeCommands(values) {
+  const commands = [];
+  const seen = new Set;
+  for (const command of values) {
+    const argv = tokenizeTrustedValidationCommand(command);
+    if (!argv)
+      throw new Error(`Unsafe or unsupported validation command: ${command}`);
+    const key = JSON.stringify(argv);
+    if (seen.has(key))
+      continue;
+    seen.add(key);
+    commands.push(command.trim());
+  }
+  if (commands.length > MAX_TRUSTED_VALIDATION_COMMANDS)
+    throw new Error(`The complete plan exceeds ${MAX_TRUSTED_VALIDATION_COMMANDS} commands; no gates were truncated.`);
+  const normalized = normalizeTrustedValidationCommands(commands);
+  if (!normalized.ok)
+    throw new Error(normalized.message);
+  if (normalized.commands.length !== commands.length)
+    throw new Error("Distinct validation gates collide under trusted-runner normalization.");
+  return commands;
+}
+function buildReviewPublicationValidationPlan(options) {
+  if (options.complete !== true)
+    return rejected("pending", "The final worker validation snapshot is not complete.");
+  try {
+    const commands = completeCommands([
+      ...plannedCommands(commandArray(options.requiredValidationSteps, "Required steps"), true),
+      ...plannedCommands(commandArray(options.validationSteps, "Validation steps"), false),
+      ...commandArray(options.workerCommands, "Worker validation evidence", false),
+      ...commandArray(options.deferredCommands, "Deferred validation")
+    ]);
+    return { version: 1, status: "ready", commands };
+  } catch (error) {
+    return rejected("invalid", error instanceof Error ? error.message : String(error));
+  }
+}
+
+// apps/server/src/completions.ts
+function exactPublicationOutcome(value, jobParams) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return null;
+  const input = value;
+  let review;
+  try {
+    review = JSON.parse(jobParams).reviewAgent;
+    if (!review || typeof review !== "object" || Array.isArray(review))
+      return null;
+  } catch {
+    return null;
+  }
+  const exactSha = (value2) => typeof value2 === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value2.trim()) ? value2.trim().toLowerCase() : "";
+  const repository = typeof input.repositoryIdentity === "string" ? normalizeRepositoryOriginRemote(input.repositoryIdentity).toLowerCase() : "";
+  const expectedRepository = typeof review.repositoryIdentity === "string" ? normalizeRepositoryOriginRemote(review.repositoryIdentity).toLowerCase() : "";
+  const expectedHeadSha = exactSha(input.expectedHeadSha);
+  const expectedBaseSha = exactSha(input.expectedBaseSha);
+  const observedHeadSha = exactSha(input.observedHeadSha);
+  if (input.version !== 1 || typeof input.code !== "string" || ![
+    "publication_superseded",
+    "publication_conflict",
+    "publication_validation_unavailable"
+  ].includes(input.code) || !repository || repository !== expectedRepository || !Number.isSafeInteger(input.prNumber) || Number(input.prNumber) <= 0 || input.prNumber !== review.prNumber || !["review_fix", "merge_conflict"].includes(String(review.resolutionType)) || !expectedHeadSha || expectedHeadSha !== exactSha(review.prHeadSha) || !expectedBaseSha || expectedBaseSha !== exactSha(review.prBaseSha) || !observedHeadSha || input.observedState !== "open" && input.observedState !== "closed" || input.code === "publication_superseded" && input.observedState === "open" && observedHeadSha === expectedHeadSha)
+    return null;
+  if (input.code === "publication_conflict" || input.code === "publication_validation_unavailable") {
+    const observedBaseSha = exactSha(input.observedBaseSha);
+    const retainedCandidateSha = exactSha(input.retainedCandidateSha);
+    if (input.observedState !== "open" || observedHeadSha !== expectedHeadSha || !observedBaseSha || !retainedCandidateSha || typeof input.retainedCandidateRef !== "string")
+      return null;
+    return {
+      version: 1,
+      code: input.code,
+      repositoryIdentity: repository,
+      prNumber: input.prNumber,
+      expectedHeadSha,
+      expectedBaseSha,
+      observedHeadSha,
+      observedState: "open",
+      observedBaseSha,
+      retainedCandidateSha,
+      retainedCandidateRef: input.retainedCandidateRef
+    };
+  }
+  return {
+    version: 1,
+    code: "publication_superseded",
+    repositoryIdentity: repository,
+    prNumber: input.prNumber,
+    expectedHeadSha,
+    expectedBaseSha,
+    observedHeadSha,
+    observedState: input.observedState
+  };
+}
 var TRUSTED_VALIDATION_RECOVERY_MAX_ATTEMPTS = 1;
 var DEFAULT_COMPLETION_LEASE_MS = 3 * 60000;
 var MIN_COMPLETION_LEASE_MS = 30000;
@@ -18748,6 +18939,15 @@ class CompletionQueue {
 
       CREATE INDEX IF NOT EXISTS idx_completions_status ON completions(status);
       CREATE INDEX IF NOT EXISTS idx_completions_job ON completions(jobId);
+
+      CREATE TABLE IF NOT EXISTS completion_validation_plans (
+        completionId TEXT PRIMARY KEY,
+        jobId TEXT NOT NULL,
+        workerClaimGeneration INTEGER NOT NULL,
+        candidateSha TEXT NOT NULL,
+        commandsJson TEXT NOT NULL,
+        createdAt TEXT NOT NULL
+      );
     `);
     const columns = this.db.prepare(`PRAGMA table_info(completions)`).all();
     if (!columns.some((col) => col.name === "prTitle")) {
@@ -18898,6 +19098,7 @@ class CompletionQueue {
            WHERE type = 'table' AND name = 'job_terminal_diagnostics'`).get();
       if (diagnosticsTable) {
         const failedParents = this.db.prepare(`SELECT j.id AS jobId,
+                    c.id AS completionId,
                     c.error AS error,
                     c.trustedValidationCommandsJson AS trustedValidationCommandsJson
              FROM jobs j
@@ -18908,11 +19109,16 @@ class CompletionQueue {
              )
              WHERE j.status = 'publish_blocked'`).all();
         for (const row of failedParents) {
+          const failure = this.publicationFailureDiagnostics({
+            id: row.completionId,
+            jobId: row.jobId,
+            trustedValidationCommandsJson: row.trustedValidationCommandsJson,
+            error: row.error
+          });
           this.upsertPublicationTerminalDiagnostics({
             jobId: row.jobId,
             status: "publish_blocked",
-            failureClass: row.trustedValidationCommandsJson ? "trusted_validation_failed" : "publication_failed",
-            terminalStage: row.trustedValidationCommandsJson ? "trusted_environment_validation" : "publication",
+            ...failure,
             summary: row.error || "Candidate publication failed",
             now
           });
@@ -19050,6 +19256,9 @@ class CompletionQueue {
          JOIN jobs passedJob ON passedJob.id = passed.jobId AND passedJob.status = 'completed'
          WHERE c.status = 'failed'
            AND blockedJob.status = 'publish_blocked'
+           AND CASE WHEN json_valid(c.error)
+               THEN COALESCE(json_extract(c.error, '$.publicationOutcome.code'), '') ELSE '' END
+               NOT IN ('publication_conflict', 'publication_superseded', 'publication_validation_unavailable')
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
            AND failed.passed = 0
@@ -19294,7 +19503,13 @@ class CompletionQueue {
                claimAttempts = COALESCE(claimAttempts, 0) + 1,
                updatedAt = ?
            WHERE id = ? AND status = 'pending'`).run(pusherId, claimToken, now, leaseExpiresAt, now, now, row.id);
-      return this.getCompletion(row.id);
+      const claimed = this.getCompletion(row.id);
+      if (claimed) {
+        const plan = this.snapshotReviewValidationPlan(claimed, now);
+        if (plan)
+          claimed.reviewValidationPlan = plan;
+      }
+      return claimed;
     });
     const completion = tx();
     if (!completion)
@@ -19483,7 +19698,7 @@ class CompletionQueue {
     });
     return tx();
   }
-  markFailedAndBlockJob(completionId, error, trustedTiming, trustedReportInput, pusherIdRaw, claimTokenRaw) {
+  markFailedAndBlockJob(completionId, error, trustedTiming, trustedReportInput, pusherIdRaw, claimTokenRaw, publicationOutcomeInput) {
     const now = new Date().toISOString();
     const pusherId = String(pusherIdRaw ?? "").trim();
     if (!pusherId)
@@ -19510,7 +19725,7 @@ class CompletionQueue {
       if (!completion.leaseExpiresAt || completion.leaseExpiresAt <= now) {
         return { ok: false, message: "Completion lease is expired or owned by another pusher" };
       }
-      const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId);
+      const job = this.db.prepare(`SELECT status, params FROM jobs WHERE id = ?`).get(completion.jobId);
       if (!job)
         return { ok: false, message: "Parent job not found" };
       if (job.status !== "finalizing" && job.status !== "completed") {
@@ -19519,6 +19734,32 @@ class CompletionQueue {
           message: `Parent job is ${job.status}; expected finalizing`
         };
       }
+      const publicationOutcome = publicationOutcomeInput === undefined ? null : exactPublicationOutcome(publicationOutcomeInput, job.params);
+      if (publicationOutcomeInput !== undefined && !publicationOutcome) {
+        return { ok: false, message: "Invalid exact publication outcome evidence" };
+      }
+      const superseded = publicationOutcome?.code === "publication_superseded";
+      const conflict = publicationOutcome && publicationOutcome.code !== "publication_superseded" ? publicationOutcome : null;
+      if (publicationOutcome) {
+        const lifecycle = this.db.query(`SELECT 1 AS present FROM pr_repair_lifecycle
+          WHERE activeJobId = ? AND repositoryIdentity = ? AND prNumber = ?
+            AND headSha = ? AND baseSha = ? AND status IN ('queued', 'running')`).get(completion.jobId, publicationOutcome.repositoryIdentity, publicationOutcome.prNumber, publicationOutcome.expectedHeadSha, publicationOutcome.expectedBaseSha);
+        if (!lifecycle)
+          return { ok: false, message: "Publication no longer owns its exact repair lifecycle" };
+      }
+      if (conflict) {
+        const namespace = `refs/pushpals/validation/${createHash6("sha256").update(completion.id).digest("hex").slice(0, 32)}/`;
+        const suffix = conflict.retainedCandidateRef.startsWith(namespace) ? conflict.retainedCandidateRef.slice(namespace.length) : "";
+        const match = suffix.match(/^([1-9][0-9]*)\/candidate$/);
+        const generation = Number(match?.[1]);
+        if (!match || !Number.isSafeInteger(generation) || generation > completion.claimGeneration || trustedReport?.candidateSha !== conflict.retainedCandidateSha || trustedReport?.candidateRef !== conflict.retainedCandidateRef) {
+          return {
+            ok: false,
+            message: "Publication hold requires this completion's exact retained checkpoint evidence"
+          };
+        }
+      }
+      const retainedFailure = publicationOutcome ? JSON.stringify({ message: failure, publicationOutcome }) : failure;
       const completionUpdated = this.db.prepare(`UPDATE completions
            SET status = 'failed',
                trustedInstallDurationMs = COALESCE(?, trustedInstallDurationMs),
@@ -19530,37 +19771,44 @@ class CompletionQueue {
              AND pusherId = ?
              AND claimToken = ?
              AND leaseExpiresAt IS NOT NULL
-             AND leaseExpiresAt > ?`).run(normalizedTiming.installDurationMs, normalizedTiming.validationDurationMs, normalizedTiming.installCacheHit, failure, now, completionId, pusherId, claimToken, now);
+             AND leaseExpiresAt > ?`).run(normalizedTiming.installDurationMs, normalizedTiming.validationDurationMs, normalizedTiming.installCacheHit, retainedFailure, now, completionId, pusherId, claimToken, now);
       if (completionUpdated.changes === 0) {
         return { ok: false, message: "Completion lease was lost before failure finalization" };
       }
       this.replaceTrustedValidationRuns(completion, trustedReport, now);
       const transitioned = this.db.prepare(`UPDATE jobs
-           SET status = 'publish_blocked',
+           SET status = ?,
                error = ?,
                publishBlockedAt = ?,
                completedAt = NULL,
                failedAt = NULL,
-               abandonedAt = NULL,
+               abandonedAt = ?,
                durationMs = MAX(
                  0,
                  CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
                ),
                updatedAt = ?
-           WHERE id = ? AND status IN ('finalizing', 'completed')`).run(JSON.stringify({
-        message: "Candidate publication failed",
+           WHERE id = ? AND status IN ('finalizing', 'completed')`).run(superseded ? "abandoned" : "publish_blocked", JSON.stringify({
+        message: superseded ? "Candidate publication superseded" : "Candidate publication failed",
         detail: failure,
-        completionId
-      }), now, now, now, completion.jobId);
+        completionId,
+        ...publicationOutcome ? { publicationOutcome } : {}
+      }), superseded ? null : now, superseded ? now : null, now, now, completion.jobId);
       if (transitioned.changes > 0) {
         this.upsertPublicationTerminalDiagnostics({
           jobId: completion.jobId,
-          status: "publish_blocked",
-          failureClass: completion.trustedValidationCommandsJson ? "trusted_validation_failed" : "publication_failed",
-          terminalStage: completion.trustedValidationCommandsJson ? "trusted_environment_validation" : "publication",
+          status: superseded ? "abandoned" : "publish_blocked",
+          ...superseded ? { failureClass: "publication_superseded", terminalStage: "publication" } : conflict ? { failureClass: conflict.code, terminalStage: "publication" } : this.publicationFailureDiagnostics(completion),
           summary: failure,
           now
         });
+      }
+      if (publicationOutcome) {
+        this.db.query(`UPDATE pr_repair_lifecycle SET status = ?,
+            activeJobId = NULL, nextRetryAt = NULL, updatedAt = ?, heldBaseSha = ?,
+            lastError = ?
+          WHERE activeJobId = ? AND repositoryIdentity = ? AND prNumber = ?
+            AND headSha = ? AND baseSha = ? AND status IN ('queued', 'running')`).run(superseded ? "superseded" : "held", now, conflict?.observedBaseSha ?? null, failure.slice(0, 1000), completion.jobId, publicationOutcome.repositoryIdentity, publicationOutcome.prNumber, publicationOutcome.expectedHeadSha, publicationOutcome.expectedBaseSha);
       }
       const saved = this.db.prepare(`SELECT durationMs, publishBlockedAt FROM jobs WHERE id = ?`).get(completion.jobId);
       return {
@@ -19568,18 +19816,136 @@ class CompletionQueue {
         jobId: completion.jobId,
         jobTransitioned: transitioned.changes > 0,
         durationMs: saved?.durationMs ?? undefined,
-        publishBlockedAt: saved?.publishBlockedAt ?? undefined
+        publishBlockedAt: saved?.publishBlockedAt ?? undefined,
+        ...superseded ? { publicationSuperseded: true } : {},
+        ...conflict ? { publicationHeld: true } : {}
       };
     });
     return tx();
   }
+  snapshotReviewValidationPlan(completion, now) {
+    if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").get())
+      return null;
+    const job = this.db.query("SELECT params, claimGeneration FROM jobs WHERE id = ?").get(completion.jobId);
+    if (!job)
+      return null;
+    let params;
+    try {
+      params = JSON.parse(job.params);
+    } catch {
+      return null;
+    }
+    const review = params?.reviewAgent;
+    if (!review || !["review_fix", "merge_conflict"].includes(String(review.resolutionType)))
+      return null;
+    const frozen = this.db.query(`SELECT jobId, workerClaimGeneration, candidateSha, commandsJson
+      FROM completion_validation_plans WHERE completionId = ?`).get(completion.id);
+    if (frozen) {
+      if (frozen.jobId !== completion.jobId || frozen.candidateSha !== completion.commitSha || frozen.workerClaimGeneration !== job.claimGeneration)
+        return {
+          version: 1,
+          status: "invalid",
+          commands: [],
+          reason: "The frozen validation plan does not match this completion's worker identity."
+        };
+      return buildReviewPublicationValidationPlan({
+        complete: true,
+        requiredValidationSteps: [],
+        validationSteps: [],
+        workerCommands: frozen.commandsJson,
+        deferredCommands: completion.trustedValidationCommandsJson
+      });
+    }
+    const snapshotTable = this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_validation_snapshots'").get();
+    const snapshot = snapshotTable ? this.db.query(`SELECT claimGeneration, commandsJson
+      FROM job_validation_snapshots WHERE jobId = ?`).get(completion.jobId) : null;
+    const planning = params.planning && typeof params.planning === "object" && !Array.isArray(params.planning) ? params.planning : {};
+    const joinedSteps = (key) => {
+      const fields = [params[key], planning[key]].filter((value) => value !== undefined && value !== null);
+      if (fields.some((value) => !Array.isArray(value)))
+        return {};
+      return fields.flatMap((value) => value);
+    };
+    const plan = buildReviewPublicationValidationPlan({
+      complete: Boolean(snapshot && snapshot.claimGeneration === job.claimGeneration),
+      requiredValidationSteps: joinedSteps("requiredValidationSteps"),
+      validationSteps: joinedSteps("validationSteps"),
+      workerCommands: snapshot?.commandsJson,
+      deferredCommands: completion.trustedValidationCommandsJson
+    });
+    if (plan.status === "ready" && completion.commitSha) {
+      this.db.query(`INSERT INTO completion_validation_plans
+        (completionId, jobId, workerClaimGeneration, candidateSha, commandsJson, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(completion.id, completion.jobId, job.claimGeneration, completion.commitSha, JSON.stringify(plan.commands), now);
+    }
+    return plan;
+  }
+  permittedTrustedValidationCommands(completion) {
+    const deferred = normalizeTrustedValidationCommands(completion.trustedValidationCommandsJson);
+    const frozen = this.db.query(`SELECT commandsJson FROM completion_validation_plans
+      WHERE completionId = ? AND jobId = ?`).get(completion.id, completion.jobId);
+    const complete = frozen ? normalizeTrustedValidationCommands(frozen.commandsJson) : null;
+    return [
+      ...new Set([
+        ...deferred.ok ? deferred.commands : [],
+        ...complete?.ok ? complete.commands : []
+      ])
+    ];
+  }
+  publicationFailureDiagnostics(completion) {
+    const publication = { failureClass: "publication_failed", terminalStage: "publication" };
+    try {
+      const retained = JSON.parse(completion.error ?? "null")?.publicationOutcome;
+      if (retained) {
+        const job = this.db.query("SELECT params FROM jobs WHERE id = ?").get(completion.jobId);
+        const outcome = job && exactPublicationOutcome(retained, job.params);
+        if (outcome)
+          return { failureClass: outcome.code, terminalStage: "publication" };
+      }
+    } catch {}
+    const requestedCommands = this.permittedTrustedValidationCommands(completion);
+    if (requestedCommands.length === 0)
+      return publication;
+    const exists = this.db.query(`SELECT 1 AS present FROM sqlite_master
+      WHERE type = 'table' AND name = 'job_validation_runs'`).get();
+    if (!exists)
+      return publication;
+    const allowed = new Set(requestedCommands.map(trustedValidationCommandKey));
+    const rows = this.db.query(`SELECT command, passed, exitCode,
+        json_extract(metadataJson, '$.phase') AS phase,
+        json_extract(metadataJson, '$.attempt') AS attempt
+      FROM job_validation_runs
+      WHERE jobId = ? AND json_valid(metadataJson)
+        AND json_extract(metadataJson, '$.source') = 'trusted_host'
+        AND json_extract(metadataJson, '$.completionId') = ?
+        AND COALESCE(json_extract(metadataJson, '$.validationTarget'), 'candidate') != 'baseline'
+      ORDER BY id ASC`).all(completion.jobId, completion.id);
+    const terminal = new Map;
+    for (const row of rows) {
+      const command = trustedValidationCommandKey(row.command);
+      if (row.phase !== "dependency_install" && !allowed.has(command))
+        continue;
+      const key = `${row.phase === "dependency_install" ? "install" : "validation"}:${command}`;
+      const previous = terminal.get(key);
+      if (!previous || Number(row.attempt ?? 1) >= Number(previous.attempt ?? 1)) {
+        terminal.set(key, row);
+      }
+    }
+    if ([...terminal.values()].some((row) => row.passed !== 1 || row.exitCode !== null && row.exitCode !== 0)) {
+      return {
+        failureClass: "trusted_validation_failed",
+        terminalStage: "trusted_environment_validation"
+      };
+    }
+    return publication;
+  }
   replaceTrustedValidationRuns(completion, report, now) {
-    if (!completion.trustedValidationCommandsJson || !report || report.results.length === 0)
+    if (!report || report.results.length === 0)
       return;
-    const requested = normalizeTrustedValidationCommands(completion.trustedValidationCommandsJson);
-    if (!requested.ok)
+    const requestedCommands = this.permittedTrustedValidationCommands(completion);
+    if (requestedCommands.length === 0)
       return;
-    const allowedCommands = new Set(requested.commands.map((command) => command.trim().replace(/\s+/g, " ").toLowerCase()));
+    const allowedCommands = new Set(requestedCommands.map((command) => command.trim().replace(/\s+/g, " ").toLowerCase()));
     this.db.prepare(`DELETE FROM job_validation_runs
          WHERE jobId = ?
            AND json_extract(metadataJson, '$.source') = 'trusted_host'
@@ -19641,6 +20007,9 @@ class CompletionQueue {
          JOIN job_validation_runs r ON r.jobId = c.jobId
          WHERE c.status = 'failed'
            AND j.status = 'publish_blocked'
+           AND CASE WHEN json_valid(c.error)
+               THEN COALESCE(json_extract(c.error, '$.publicationOutcome.code'), '') ELSE '' END
+               NOT IN ('publication_conflict', 'publication_superseded', 'publication_validation_unavailable')
            AND c.id != ?
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
@@ -30211,7 +30580,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (recoveryAuthority.repairAdmission.terminal) {
           return makeJson({
             ok: false,
-            code: recoveryAuthority.repairAdmission.exhausted ? "review_repair_lifecycle_exhausted" : "review_repair_lifecycle_settled",
+            code: recoveryAuthority.repairAdmission.held ? "review_repair_lifecycle_held" : recoveryAuthority.repairAdmission.exhausted ? "review_repair_lifecycle_exhausted" : "review_repair_lifecycle_settled",
             message: recoveryAuthority.repairAdmission.reason
           }, 409);
         }
@@ -31508,7 +31877,7 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         if (recoveryAuthority.repairAdmission.terminal) {
           return makeJson({
             ok: false,
-            code: recoveryAuthority.repairAdmission.exhausted ? "review_repair_lifecycle_exhausted" : "review_repair_lifecycle_settled",
+            code: recoveryAuthority.repairAdmission.held ? "review_repair_lifecycle_held" : recoveryAuthority.repairAdmission.exhausted ? "review_repair_lifecycle_exhausted" : "review_repair_lifecycle_settled",
             message: recoveryAuthority.repairAdmission.reason
           }, 409);
         }
@@ -31876,6 +32245,23 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
         const result = completionQueue.claim(pusherId, {
           leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined
         });
+        if (result.completion) {
+          const parent = jobQueue.getJob(result.completion.jobId);
+          const params = parseJsonRecord2(parent?.params ?? "");
+          const review = params.reviewAgent;
+          if (review && typeof review === "object" && !Array.isArray(review)) {
+            const record = review;
+            if (typeof record.repositoryIdentity === "string" && Number.isSafeInteger(record.prNumber) && Number(record.prNumber) > 0 && typeof record.prHeadSha === "string" && typeof record.prBaseSha === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record.prHeadSha) && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record.prBaseSha) && (record.resolutionType === "review_fix" || record.resolutionType === "merge_conflict")) {
+              result.completion.reviewPublicationAuthority = {
+                repositoryIdentity: record.repositoryIdentity,
+                prNumber: record.prNumber,
+                expectedHeadSha: record.prHeadSha,
+                expectedBaseSha: record.prBaseSha,
+                resolutionType: record.resolutionType
+              };
+            }
+          }
+        }
         return makeJson(result, result.ok ? 200 : 404);
       }
       const compLeaseMatch = pathname.match(/^\/completions\/([^/]+)\/lease\/renew$/);
@@ -31985,7 +32371,24 @@ data: ${JSON.stringify({ envelope, cursor: eventId })}
           installDurationMs: typeof body.trustedInstallDurationMs === "number" ? body.trustedInstallDurationMs : null,
           validationDurationMs: typeof body.trustedValidationDurationMs === "number" ? body.trustedValidationDurationMs : null,
           installCacheHit: typeof body.trustedValidationCacheHit === "boolean" ? body.trustedValidationCacheHit : null
-        }, body.trustedValidationReport, pusherId, claimToken);
+        }, body.trustedValidationReport, pusherId, claimToken, body.publicationOutcome);
+        if (result.ok && result.jobTransitioned && result.jobId && (result.publicationSuperseded || result.publicationHeld)) {
+          const job = jobQueue.getJob(result.jobId);
+          const message = result.publicationSuperseded ? `Job ${result.jobId} publication was superseded; its obsolete repair was settled without a code-quality retry.` : `Job ${result.jobId} publication is held for explicit resolution; its candidate is retained and unrelated publication may continue.`;
+          if (job?.sessionId) {
+            sessionManager.getSession(job.sessionId)?.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID9(),
+              ts: new Date().toISOString(),
+              sessionId: job.sessionId,
+              type: "log",
+              from: "server:completion-publication-disposition",
+              payload: { level: result.publicationHeld ? "warn" : "info", message }
+            });
+          }
+          console.log(`[Server] ${message}`);
+          return makeJson(result, 200);
+        }
         if (result.ok && result.jobTransitioned && result.jobId) {
           jobQueue.reconcileReviewRepairLifecycles();
           const job = jobQueue.getJob(result.jobId);

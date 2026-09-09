@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -3551,6 +3552,286 @@ describe("server session message route", () => {
       db.close();
     }
   }, 20_000);
+
+  test("fences typed publication dispositions over HTTP without code-quality failures or repair clones", async () => {
+    const root = makeTempDir();
+    const port = await getFreePort();
+    writeServerConfig(root, port);
+    const server = spawnServer(root, port);
+    await waitForHealth(server, port);
+    const repositoryIdentity = "https://github.com/example/repo.git";
+    const expectedHeadSha = "a".repeat(40);
+    const expectedBaseSha = "b".repeat(40);
+    const observedBaseSha = "c".repeat(40);
+    const candidateSha = "d".repeat(40);
+
+    for (const [index, disposition] of ["superseded", "held"].entries()) {
+      const prNumber = 950 + index;
+      const prUrl = `https://github.com/example/repo/pull/${prNumber}`;
+      const sessionId = `publication-disposition-${disposition}`;
+      const sourceJobId = await seedPublishedPrJob(port, disposition, prNumber);
+      const { events } = await connectSessionSocket(port, sessionId);
+      const body = {
+        taskId: sessionId,
+        sessionId,
+        kind: "task.execute",
+        workClass: "repair",
+        repositoryIdentity,
+        params: {
+          ...autonomyRequestMetadata(sessionId),
+          planning: { workClass: "repair", queuePriority: "interactive" },
+          reviewAgent: {
+            repositoryIdentity,
+            prNumber,
+            prUrl,
+            prHeadSha: expectedHeadSha,
+            prBaseSha: expectedBaseSha,
+            resolutionType: "review_fix",
+            sourceJobId,
+          },
+        },
+      };
+      // Local-only server auth does not use bearer tokens. SCM admission still
+      // requires its signed authority, and completion callbacks require leases.
+      const unauthorized = await postServerJson(port, "/jobs/enqueue", body);
+      expect(unauthorized.status).toBe(403);
+      expect(await unauthorized.json()).toMatchObject({
+        ok: false,
+        code: "review_repair_capability_required",
+      });
+      const enqueued = await postServerJson(
+        port,
+        "/jobs/enqueue",
+        body,
+        scmRepairAuthorityHeaders(body),
+      );
+      expect(enqueued.status).toBe(201);
+      const jobId = String(((await enqueued.json()) as { jobId: string }).jobId);
+      // Repairs retain affinity to the online worker that published this PR.
+      // Claim as that worker instead of bypassing the scheduler's lease.
+      const workerId = `published-pr-worker-${disposition}`;
+      const claimed = await postServerJson(port, "/jobs/claim", { workerId });
+      expect(claimed.status).toBe(200);
+      const workerClaim = (
+        (await claimed.json()) as {
+          job: { id: string; claimGeneration: number };
+        }
+      ).job;
+      expect(workerClaim.id).toBe(jobId);
+      const completion = await postServerJson(port, "/completions/enqueue", {
+        jobId,
+        workerId,
+        claimGeneration: workerClaim.claimGeneration,
+        sessionId,
+        origin: "autonomy",
+        commitSha: candidateSha,
+        branch: `refs/pushpals/review/${sessionId}`,
+        message: "Retained review candidate",
+        prUrl,
+        // Worker checkout metadata can name a newer base. It must not replace
+        // the immutable, server-authorized repair lifecycle tuple in the claim.
+        prBody: [
+          `<!-- pushpals-reviewTargetBranch: pushpals/${sessionId} -->`,
+          "<!-- pushpals-reviewBaseBranch: main -->",
+          `<!-- pushpals-reviewExpectedHeadSha: ${expectedHeadSha} -->`,
+          `<!-- pushpals-reviewExpectedBaseSha: ${observedBaseSha} -->`,
+        ].join("\n"),
+      });
+      expect(completion.status).toBe(201);
+      const completionId = ((await completion.json()) as { completionId: string }).completionId;
+      const pusherId = `scm-${sessionId}`;
+      const claimResponse = await postServerJson(port, "/completions/claim", { pusherId });
+      expect(claimResponse.status).toBe(200);
+      const claim = (
+        (await claimResponse.json()) as {
+          completion: {
+            id: string;
+            claimToken: string;
+            claimGeneration: number;
+            reviewPublicationAuthority: Record<string, unknown>;
+          };
+        }
+      ).completion;
+      expect(claim.id).toBe(completionId);
+      expect(claim.reviewPublicationAuthority).toEqual({
+        repositoryIdentity,
+        prNumber,
+        expectedHeadSha,
+        expectedBaseSha,
+        resolutionType: "review_fix",
+      });
+      const candidateRef = `refs/pushpals/validation/${createHash("sha256").update(completionId).digest("hex").slice(0, 32)}/${claim.claimGeneration}/candidate`;
+      const publicationOutcome = {
+        version: 1,
+        code: disposition === "held" ? "publication_conflict" : "publication_superseded",
+        repositoryIdentity,
+        prNumber,
+        expectedHeadSha,
+        expectedBaseSha,
+        observedHeadSha: disposition === "held" ? expectedHeadSha : "e".repeat(40),
+        observedState: "open",
+        ...(disposition === "held"
+          ? {
+              observedBaseSha,
+              retainedCandidateSha: candidateSha,
+              retainedCandidateRef: candidateRef,
+            }
+          : {}),
+      };
+      const callback = {
+        pusherId,
+        claimToken: claim.claimToken,
+        error: `Authoritative publication ${disposition}`,
+        publicationOutcome,
+        trustedValidationReport: {
+          version: 1,
+          candidateSha,
+          candidateRef,
+          results: [],
+        },
+      };
+      const endpoint = `/completions/${completionId}/fail`;
+      const db = new Database(join(root, "outputs", "data", "pushpals.db"));
+      try {
+        const before = db.query("SELECT * FROM jobs WHERE id = ?").get(jobId);
+        for (const invalid of [
+          { ...callback, claimToken: "" },
+          { ...callback, claimToken: "stale-token" },
+          { ...callback, pusherId: "another-pusher" },
+          { ...callback, publicationOutcome: { ...publicationOutcome, version: 2 } },
+          {
+            ...callback,
+            publicationOutcome: { ...publicationOutcome, expectedBaseSha: observedBaseSha },
+          },
+          ...(disposition === "held"
+            ? [{ ...callback, trustedValidationReport: { version: 1, results: [] } }]
+            : [
+                {
+                  ...callback,
+                  publicationOutcome: { ...publicationOutcome, observedHeadSha: expectedHeadSha },
+                },
+              ]),
+        ]) {
+          const rejected = await postServerJson(port, endpoint, invalid);
+          expect(rejected.status).toBe(400);
+          expect(await rejected.json()).toMatchObject({ ok: false });
+          expect(db.query("SELECT * FROM jobs WHERE id = ?").get(jobId)).toEqual(before);
+          expect(db.query("SELECT status FROM completions WHERE id = ?").get(completionId)).toEqual(
+            {
+              status: "claimed",
+            },
+          );
+        }
+        const settled = await postServerJson(port, endpoint, callback);
+        expect(settled.status).toBe(200);
+        expect(await settled.json()).toMatchObject({
+          ok: true,
+          jobId,
+          jobTransitioned: true,
+          ...(disposition === "held" ? { publicationHeld: true } : { publicationSuperseded: true }),
+        });
+        await waitForSessionSocketEvent(
+          events,
+          (event) => event.from === "server:completion-publication-disposition",
+        );
+        expect(events.some((event) => event.type === "job_failed")).toBe(false);
+        expect(db.query("SELECT status, failedAt FROM jobs WHERE id = ?").get(jobId)).toEqual({
+          status: disposition === "held" ? "publish_blocked" : "abandoned",
+          failedAt: null,
+        });
+        expect(
+          db
+            .query(
+              "SELECT status, activeJobId, baseSha, heldBaseSha FROM pr_repair_lifecycle WHERE prNumber = ?",
+            )
+            .get(prNumber),
+        ).toEqual({
+          status: disposition,
+          activeJobId: null,
+          baseSha: expectedBaseSha,
+          heldBaseSha: disposition === "held" ? observedBaseSha : null,
+        });
+        expect(
+          db
+            .query(
+              "SELECT failureClass, terminalStage FROM job_terminal_diagnostics WHERE jobId = ?",
+            )
+            .get(jobId),
+        ).toEqual({
+          failureClass: publicationOutcome.code,
+          terminalStage: "publication",
+        });
+        expect(
+          db.query("SELECT COUNT(*) AS count FROM autonomy_outcomes WHERE job_id = ?").get(jobId),
+        ).toEqual({ count: 0 });
+        expect(
+          db
+            .query(
+              "SELECT COUNT(*) AS count FROM events WHERE session_id = ? AND type = 'job_failed'",
+            )
+            .get(sessionId),
+        ).toEqual({ count: 0 });
+        const query = new URLSearchParams({
+          repositoryIdentity,
+          prNumber: String(prNumber),
+          headSha: expectedHeadSha,
+          baseSha: disposition === "held" ? observedBaseSha : expectedBaseSha,
+        });
+        expect(
+          await (
+            await fetch(`http://127.0.0.1:${port}/jobs/review-repair-lifecycle?${query}`)
+          ).json(),
+        ).toMatchObject({
+          ok: true,
+          state: disposition === "held" ? "held" : "settled",
+        });
+        const duplicate = {
+          ...body,
+          taskId: `${sessionId}-clone`,
+          params: {
+            ...body.params,
+            reviewAgent: {
+              ...body.params.reviewAgent,
+              prBaseSha: disposition === "held" ? observedBaseSha : expectedBaseSha,
+            },
+          },
+        };
+        const deniedClone = await postServerJson(
+          port,
+          "/jobs/enqueue",
+          duplicate,
+          scmRepairAuthorityHeaders(duplicate),
+        );
+        expect(deniedClone.status).toBe(409);
+        expect(await deniedClone.json()).toMatchObject({
+          ok: false,
+          code:
+            disposition === "held"
+              ? "review_repair_lifecycle_held"
+              : "review_repair_lifecycle_settled",
+        });
+        const dispositionCount = db
+          .query("SELECT COUNT(*) AS count FROM events WHERE session_id = ?")
+          .get(sessionId);
+        const replay = await postServerJson(port, endpoint, callback);
+        expect(replay.status).toBe(200);
+        expect(await replay.json()).toMatchObject({ ok: true, jobTransitioned: false });
+        expect(
+          db.query("SELECT COUNT(*) AS count FROM events WHERE session_id = ?").get(sessionId),
+        ).toEqual(dispositionCount);
+      } finally {
+        db.close();
+      }
+    }
+    // Neither a held content conflict nor an obsolete repair owns the queue.
+    const unrelated = await seedPendingPublication(port, "after-publication-dispositions");
+    const nextClaim = await postServerJson(port, "/completions/claim", {
+      pusherId: "unrelated-scm",
+    });
+    expect(await nextClaim.json()).toMatchObject({
+      completion: { id: unrelated.completionId },
+    });
+  }, 30_000);
 
   test("normalizes a published completion PR URL for provider reconciliation", async () => {
     const root = makeTempDir();

@@ -32,6 +32,20 @@ import {
   shouldPublishWithExactReviewLease,
   shouldUseReviewPublicationFlow,
 } from "./review_publication";
+import {
+  assertReviewCompletionLease,
+  assertReviewPublicationBaseUnchanged,
+  buildReviewPublicationSettlement,
+  reviewPublicationFailureDisposition,
+  prepareReviewPublicationCandidate,
+  resolveReviewPublicationAuthority,
+  resolveReviewPublicationValidationCommands,
+  ReviewPublicationDeferredError,
+  ReviewPublicationSupersededError,
+  type ReviewPublicationAuthority,
+  type ReviewPublicationClaimAuthority,
+} from "./review_publication_recovery";
+import type { ReviewPublicationValidationPlan } from "../../../packages/shared/src/review_publication_validation.js";
 import { normalizePrTitleCandidate, resolveReviewAgentPrTitle } from "./pr_title";
 import { reviewApplyFailureBlocksPublication } from "./review_apply_fallback";
 import {
@@ -1020,6 +1034,8 @@ async function tick(): Promise<void> {
         pusherId: string;
         claimToken: string;
         claimGeneration: number;
+        reviewPublicationAuthority?: ReviewPublicationClaimAuthority | null;
+        reviewValidationPlan?: ReviewPublicationValidationPlan;
         createdAt: string;
         updatedAt: string;
       };
@@ -1051,6 +1067,9 @@ async function tick(): Promise<void> {
       reviewPublicationLease &&
       reviewPublicationLease.targetBranch === runtimeConfig.mainBranch &&
       reviewPublicationLease.baseBranch === runtimeConfig.integrationBaseBranch,
+    );
+    const isOriginalPrReviewPublication = Boolean(
+      reviewPublicationLease && !isIntegrationReconciliationCompletion,
     );
     const useReviewPublicationFlow = shouldUseReviewPublicationFlow(
       runtimeConfig.reviewAgent.enabled,
@@ -1145,6 +1164,7 @@ async function tick(): Promise<void> {
     let trustedValidationCandidateRef: string | null = null;
     let trustedValidationAffectedPaths: string[] = [];
     let trustedValidationResults: TrustedValidationExecutionResult[] = [];
+    let validationCommandsJson = completion.trustedValidationCommandsJson;
     let publicationAlreadyIntegrated = false;
     let publicationReadyForFinalization = false;
     let validationCheckpointPersisted = false;
@@ -1155,12 +1175,16 @@ async function tick(): Promise<void> {
     let validatedCheckpointRecoveryPending = false;
     let previousValidationCheckpoint: Awaited<ReturnType<typeof loadLatestValidationCheckpoint>> =
       null;
+    let reviewPublicationAuthority: ReviewPublicationAuthority | null = null;
+    let reviewPublicationCredentials: { remoteUrl: string; token: string } | null = null;
+    let preparedReviewBaseSha: string | null = null;
+    let originalReviewPushAttempted = false;
     const completionValidationRefs = validationCheckpointRefs(
       completion.id,
       completionClaimGeneration,
     );
     const trustedValidationReport = (): TrustedValidationReport | null =>
-      completion.trustedValidationCommandsJson
+      completion.trustedValidationCommandsJson || isOriginalPrReviewPublication
         ? {
             version: 1,
             baselineSha: trustedValidationBaselineSha,
@@ -1190,6 +1214,32 @@ async function tick(): Promise<void> {
     };
     const validationGit = (gitArgs: string[]) =>
       runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot);
+    const checkOriginalReviewAuthority = async (
+      publishedCandidateSha?: string,
+    ): Promise<ReviewPublicationAuthority> => {
+      if (!reviewPublicationLease) throw new Error("Review publication lease is missing.");
+      if (!reviewPublicationCredentials) {
+        const remote = await validationGit(["remote", "get-url", runtimeConfig.remote]);
+        const remoteUrl = remote.ok ? remote.stdout.trim() : "";
+        const token = remoteUrl
+          ? await resolveGitAuthToken(remoteUrl, runtimeConfig.gitToken ?? "")
+          : null;
+        if (!remoteUrl || !token) {
+          throw new ReviewPublicationDeferredError(
+            "review_authority_unavailable",
+            "Original review PR authority is unavailable; preserving the candidate without publication.",
+          );
+        }
+        reviewPublicationCredentials = { remoteUrl, token };
+      }
+      return resolveReviewPublicationAuthority({
+        ...reviewPublicationCredentials,
+        prUrl: completion.prUrl ?? null,
+        lease: reviewPublicationLease,
+        publishedCandidateSha,
+        publishedRecoveryProven: skipValidationForDurableRecovery && publicationAlreadyIntegrated,
+      });
+    };
     const probeAuthoritativeRefSha = async (ref: string): Promise<string | null> =>
       authoritativeRefShaFromGitResult(
         await validationGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]),
@@ -1268,6 +1318,7 @@ async function tick(): Promise<void> {
       }
     };
     try {
+      assertReviewCompletionLease(completion.branch, reviewPublicationLease);
       validationRepairPublicationLease = parseValidationRepairPublicationLease(completion.prBody);
       if (validationRepairPublicationLease && reviewPublicationLease) {
         throw new Error(
@@ -1293,6 +1344,12 @@ async function tick(): Promise<void> {
         // A prior validated checkpoint may represent an accepted push whose
         // response was lost. Do not terminally fail it merely because the
         // authority is still unreachable on the next lease generation.
+        if (isOriginalPrReviewPublication) {
+          throw new ReviewPublicationDeferredError(
+            "review_authority_unavailable",
+            `Unable to refresh authoritative review refs: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
         throw error;
       }
       if (reviewPublicationLease) {
@@ -1344,9 +1401,11 @@ async function tick(): Promise<void> {
       console.log(`[${ts()}] Creating temp branch ${tempBranch}...`);
 
       await gitOps.resetToClean();
-      await gitOps.checkoutMain();
-      await gitOps.pullMainFF();
-      if (!isIntegrationReconciliationCompletion) {
+      if (!isOriginalPrReviewPublication) {
+        await gitOps.checkoutMain();
+        await gitOps.pullMainFF();
+      }
+      if (!isIntegrationReconciliationCompletion && !isOriginalPrReviewPublication) {
         const baseSync = await gitOps.syncMainWithBaseBranch();
         if (baseSync.status === "conflicted") {
           throw new Error(
@@ -1432,26 +1491,48 @@ async function tick(): Promise<void> {
         } else {
           validationSuccessProven = false;
           trustedValidationCandidateSha = null;
-          retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
-            baselineSha: previousValidationCheckpoint.baselineSha,
-            candidateSha: previousValidationCheckpoint.candidateSha,
-            currentIntegrationSha: trustedValidationBaselineSha ?? "",
-            git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
-          });
+          retainedCheckpointApplyResult = isOriginalPrReviewPublication
+            ? await validationGit([
+                "checkout",
+                "-B",
+                tempBranch,
+                previousValidationCheckpoint.candidateSha,
+              ])
+            : await applyRetainedValidationCheckpoint({
+                baselineSha: previousValidationCheckpoint.baselineSha,
+                candidateSha: previousValidationCheckpoint.candidateSha,
+                currentIntegrationSha: trustedValidationBaselineSha ?? "",
+                git: (gitArgs) =>
+                  runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
+              });
           console.log(
             `[${ts()}] Replayed exact retained checkpoint ${previousValidationCheckpoint.candidateRef} onto the current integration head.`,
           );
         }
       } else if (previousValidationCheckpoint) {
-        retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
-          baselineSha: previousValidationCheckpoint.baselineSha,
-          candidateSha: previousValidationCheckpoint.candidateSha,
-          currentIntegrationSha: trustedValidationBaselineSha ?? "",
-          git: validationGit,
-        });
+        retainedCheckpointApplyResult = isOriginalPrReviewPublication
+          ? await validationGit([
+              "checkout",
+              "-B",
+              tempBranch,
+              previousValidationCheckpoint.candidateSha,
+            ])
+          : await applyRetainedValidationCheckpoint({
+              baselineSha: previousValidationCheckpoint.baselineSha,
+              candidateSha: previousValidationCheckpoint.candidateSha,
+              currentIntegrationSha: trustedValidationBaselineSha ?? "",
+              git: validationGit,
+            });
         console.log(
           `[${ts()}] Replayed unvalidated retained checkpoint ${previousValidationCheckpoint.candidateRef}; validation-success proof is required before publication.`,
         );
+      }
+      if (
+        isOriginalPrReviewPublication &&
+        previousValidationCheckpoint &&
+        !skipValidationForDurableRecovery
+      ) {
+        trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
       }
 
       const applyResult = retainedCheckpointApplyResult
@@ -1531,6 +1612,18 @@ async function tick(): Promise<void> {
         }
       }
       if (
+        isOriginalPrReviewPublication &&
+        !skipValidationForDurableRecovery &&
+        !previousValidationCheckpoint &&
+        reviewPublicationLease!.expectedHeadSha !== trustedValidationCandidateSha &&
+        (await probeAuthoritativeAncestry(
+          reviewPublicationLease!.expectedHeadSha,
+          trustedValidationCandidateSha!,
+        ))
+      ) {
+        trustedValidationBaselineSha = reviewPublicationLease!.expectedHeadSha;
+      }
+      if (
         trustedValidationBaselineSha &&
         trustedValidationCandidateSha &&
         !(await gitOps.isAncestor(trustedValidationBaselineSha, trustedValidationCandidateSha))
@@ -1541,11 +1634,69 @@ async function tick(): Promise<void> {
           git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot),
         });
       }
+      if (isOriginalPrReviewPublication && !skipValidationForDurableRecovery) {
+        // Preserve worker history on an exact checkpoint checkout. PR.base.sha
+        // is historical metadata; only the live target ref is a validation base.
+        reviewPublicationAuthority = await checkOriginalReviewAuthority();
+        if (
+          !(await probeAuthoritativeAncestry(completion.commitSha, trustedValidationCandidateSha!))
+        ) {
+          throw new Error(
+            "Retained review candidate does not preserve the immutable worker completion.",
+          );
+        }
+        const baseBranch = reviewPublicationLease!.baseBranch!;
+        const fetched = await validationGit([
+          "fetch",
+          runtimeConfig.remote,
+          `+refs/heads/${baseBranch}:refs/remotes/${runtimeConfig.remote}/${baseBranch}`,
+        ]);
+        if (!fetched.ok) {
+          throw new ReviewPublicationDeferredError(
+            "review_authority_unavailable",
+            `Unable to fetch live review base: ${fetched.stderr || fetched.stdout}`,
+          );
+        }
+        const fetchedBaseSha = await probeAuthoritativeRefSha(
+          `refs/remotes/${runtimeConfig.remote}/${baseBranch}`,
+        );
+        assertReviewPublicationBaseUnchanged(reviewPublicationAuthority.baseSha, {
+          ...reviewPublicationAuthority,
+          baseSha: fetchedBaseSha ?? "unknown",
+        });
+        await requireCompletionLease("review-base reconciliation");
+        const prepared = await prepareReviewPublicationCandidate({
+          completionId: completion.id,
+          candidateSha: trustedValidationCandidateSha!,
+          baseSha: reviewPublicationAuthority.baseSha,
+          git: validationGit,
+          commitIdentity: await gitOps.getCommitIdentity(),
+        });
+        trustedValidationCandidateSha = prepared.candidateSha;
+        // Checkpoint baselines must be distinct ancestors, including the rare
+        // case where this candidate is already exactly the live target commit.
+        if (prepared.baseSha !== prepared.candidateSha)
+          trustedValidationBaselineSha = prepared.baseSha;
+        preparedReviewBaseSha = prepared.baseSha;
+        healthTracker.progress("review_base_reconciled", completion.id);
+        console.log(
+          `[${ts()}] Review publication prepared candidate ${prepared.candidateSha} against live base ${prepared.baseSha}; hostMerge=${prepared.reconciled}.`,
+        );
+      }
       await persistExactValidationCheckpoint();
+      if (isOriginalPrReviewPublication && !skipValidationForDurableRecovery) {
+        validationCommandsJson = resolveReviewPublicationValidationCommands({
+          originalCandidateSha: completion.commitSha,
+          candidateSha: trustedValidationCandidateSha!,
+          claimGeneration: completionClaimGeneration,
+          deferredCommandsJson: completion.trustedValidationCommandsJson,
+          fullPlan: completion.reviewValidationPlan,
+        });
+      }
 
       if (
         !skipValidationForDurableRecovery &&
-        completion.trustedValidationCommandsJson &&
+        validationCommandsJson &&
         trustedValidationBaselineSha &&
         trustedValidationCandidateSha
       ) {
@@ -1577,7 +1728,7 @@ async function tick(): Promise<void> {
         );
       } else {
         await assertValidationWorktree("before trusted validation");
-        if (completion.trustedValidationCommandsJson) {
+        if (validationCommandsJson) {
           healthTracker.progress("trusted_validation", completion.id);
           console.log(
             `[${ts()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`,
@@ -1590,7 +1741,7 @@ async function tick(): Promise<void> {
           });
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
-            commandsJson: completion.trustedValidationCommandsJson,
+            commandsJson: validationCommandsJson,
             invariantContext:
               trustedValidationBaselineSha && trustedValidationCandidateSha
                 ? {
@@ -1724,7 +1875,12 @@ async function tick(): Promise<void> {
           const prBaseBranch =
             reviewPublicationLease.baseBranch ??
             (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
-          if (reviewPublicationLease.expectedBaseSha) {
+          if (isOriginalPrReviewPublication) {
+            reviewPublicationAuthority = await checkOriginalReviewAuthority();
+            if (!preparedReviewBaseSha)
+              throw new Error("Review candidate lacks a prepared live base.");
+            assertReviewPublicationBaseUnchanged(preparedReviewBaseSha, reviewPublicationAuthority);
+          } else if (reviewPublicationLease.expectedBaseSha) {
             const remoteBase = await runGitCapture(
               [
                 "-C",
@@ -1742,9 +1898,10 @@ async function tick(): Promise<void> {
             }
           }
           console.log(
-            `[${ts()}] Publishing reviewed completion ${completion.commitSha.slice(0, 8)} to ${prHeadBranch} with an exact force-with-lease.`,
+            `[${ts()}] Publishing validated review candidate ${trustedValidationCandidateSha!.slice(0, 8)} to ${prHeadBranch} with the original exact head lease.`,
           );
           await requireCompletionLease(`review branch push ${prHeadBranch}`);
+          originalReviewPushAttempted = isOriginalPrReviewPublication;
           const publication = await publishWithAuthoritativeProof({
             mutate: () =>
               runGitCapture(
@@ -1753,7 +1910,7 @@ async function tick(): Promise<void> {
                   runtimeConfig.repoPath,
                   ...buildReviewPublicationPushArgs({
                     remote: runtimeConfig.remote,
-                    commitSha: completion.commitSha,
+                    commitSha: trustedValidationCandidateSha!,
                     lease: reviewPublicationLease,
                   }),
                 ],
@@ -1836,17 +1993,25 @@ async function tick(): Promise<void> {
         const prBaseBranch = (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
 
         await requireCompletionLease(`pull request creation for ${prHeadBranch}`);
-        const pr = await ensureIntegrationPullRequest({
-          token,
-          remoteUrl,
-          headBranch: prHeadBranch,
-          baseBranch: prBaseBranch,
-          title: prTitle,
-          body: prBody,
-          draft: false,
-        });
-        if (!pr.created && !publicationAlreadyIntegrated) {
-          reviewAgentForTick?.requestReReview(pr.number, completion.commitSha);
+        // Repairs update only their original PR. In particular, a closed PR
+        // must never trigger ensureIntegrationPullRequest's create fallback.
+        const originalPr = isOriginalPrReviewPublication
+          ? (reviewPublicationAuthority ??
+            (await checkOriginalReviewAuthority(trustedValidationCandidateSha!)))
+          : null;
+        const pr = originalPr
+          ? { created: false, number: originalPr.prNumber, htmlUrl: originalPr.prUrl }
+          : await ensureIntegrationPullRequest({
+              token,
+              remoteUrl,
+              headBranch: prHeadBranch,
+              baseBranch: prBaseBranch,
+              title: prTitle,
+              body: prBody,
+              draft: false,
+            });
+        if (!pr.created && !skipValidationForDurableRecovery) {
+          reviewAgentForTick?.requestReReview(pr.number, trustedValidationCandidateSha!);
         }
         const prMessage = pr.created
           ? `Opened individual PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`
@@ -2018,6 +2183,8 @@ async function tick(): Promise<void> {
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err: any) {
+      let reviewDeferred = err instanceof ReviewPublicationDeferredError ? err : null;
+      let reviewSuperseded = err instanceof ReviewPublicationSupersededError ? err : null;
       const publicationConfirmationPending = err instanceof PublicationConfirmationPendingError;
       const publicationAttemptUncertain = err instanceof PublicationAuthorityUnreachableError;
       let authoritativeReprobe: AuthoritativePublicationReprobe = "absent";
@@ -2060,13 +2227,70 @@ async function tick(): Promise<void> {
           );
         }
       }
-      const failureDisposition = publicationFailureDisposition({
-        publicationReadyForFinalization,
-        publicationAttemptUncertain,
-        publicationConfirmationPending,
-        authoritativeReprobe,
-        validatedCheckpointRecoveryPending,
-      });
+      if (
+        originalReviewPushAttempted &&
+        !publicationReadyForFinalization &&
+        authoritativeReprobe === "absent"
+      ) {
+        try {
+          // A contributor can update/close the PR between provider preflight
+          // and Git's atomic head lease. Do not clone obsolete coding work when
+          // the rejected lease has a now-observable supersession cause.
+          const current = await checkOriginalReviewAuthority();
+          if (preparedReviewBaseSha)
+            assertReviewPublicationBaseUnchanged(preparedReviewBaseSha, current);
+        } catch (authorityError) {
+          if (authorityError instanceof ReviewPublicationSupersededError) {
+            reviewSuperseded = authorityError;
+            err = authorityError;
+          } else if (authorityError instanceof ReviewPublicationDeferredError) {
+            reviewDeferred = authorityError;
+            err = authorityError;
+          }
+        }
+      }
+      let publicationOutcome: Record<string, unknown> | undefined;
+      if (
+        reviewSuperseded ||
+        reviewDeferred?.code === "review_base_conflict" ||
+        reviewDeferred?.code === "review_validation_unavailable"
+      ) {
+        try {
+          publicationOutcome = buildReviewPublicationSettlement({
+            completionId: completion.id,
+            claimGeneration: completionClaimGeneration,
+            lease: reviewPublicationLease,
+            claimedAuthority: completion.reviewPublicationAuthority,
+            superseded: reviewSuperseded,
+            observedAuthority: reviewPublicationAuthority,
+            checkpointPersisted: validationCheckpointPersisted,
+            candidateSha: trustedValidationCandidateSha,
+            candidateRef: trustedValidationCandidateRef,
+            heldCode:
+              reviewDeferred?.code === "review_validation_unavailable"
+                ? "publication_validation_unavailable"
+                : "publication_conflict",
+          });
+        } catch (settlementError) {
+          reviewDeferred =
+            settlementError instanceof ReviewPublicationDeferredError
+              ? settlementError
+              : new ReviewPublicationDeferredError(
+                  "review_authority_unavailable",
+                  String(settlementError),
+                );
+        }
+      }
+      const failureDisposition = reviewPublicationFailureDisposition(
+        reviewDeferred,
+        publicationFailureDisposition({
+          publicationReadyForFinalization,
+          publicationAttemptUncertain,
+          publicationConfirmationPending,
+          authoritativeReprobe,
+          validatedCheckpointRecoveryPending,
+        }),
+      );
       if (failureDisposition === "finalize") {
         console.warn(
           `[${ts()}] Publication completed for ${completion.id}, but finalization is pending after: ${err.message}. Retaining the completion for idempotent stale-claim recovery.`,
@@ -2084,13 +2308,29 @@ async function tick(): Promise<void> {
           );
         }
       } else if (failureDisposition === "reconcile") {
+        if (reviewDeferred)
+          console.warn(
+            `[${ts()}] reviewPublicationDeferred=${JSON.stringify({
+              event: "review_publication_deferred",
+              code: reviewDeferred.code,
+              completionId: completion.id,
+              jobId: completion.jobId,
+              candidateSha: trustedValidationCandidateSha,
+              candidateRef: trustedValidationCandidateRef,
+              ...reviewDeferred.detail,
+              retry: "next_completion_lease",
+              detail: reviewDeferred.message,
+            })}`,
+          );
         console.warn(
           `[${ts()}] Publication outcome is not yet confirmed for ${completion.id}. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`,
         );
         try {
           await emitPusherMessage(
             comm,
-            `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`,
+            reviewDeferred
+              ? `Review publication deferred (${reviewDeferred.code}) for ${completion.id.slice(0, 8)}: ${reviewDeferred.message} The candidate is retained for the next host reconciliation; no worker coding retry was dispatched.`
+              : `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`,
             completion.id,
             completionEventMeta,
           );
@@ -2117,6 +2357,7 @@ async function tick(): Promise<void> {
                   pusherId,
                   claimToken: completionClaimToken,
                   error: err.message,
+                  publicationOutcome,
                   trustedInstallDurationMs,
                   trustedValidationDurationMs,
                   trustedValidationCacheHit,

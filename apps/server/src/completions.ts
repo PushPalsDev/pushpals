@@ -22,6 +22,11 @@ import {
   type TrustedValidationReport,
 } from "../../../packages/shared/src/trusted_validation.js";
 import { repointDurableRecoveryLinks, type JobClaimAuthority } from "./jobs.js";
+import { normalizeRepositoryOriginRemote } from "../../../packages/shared/src/repository_identity.js";
+import {
+  buildReviewPublicationValidationPlan,
+  type ReviewPublicationValidationPlan,
+} from "../../../packages/shared/src/review_publication_validation.js";
 
 export type CompletionStatus = "pending" | "claimed" | "processed" | "failed";
 
@@ -54,6 +59,14 @@ export interface CompletionRow {
   error: string | null;
   createdAt: string;
   updatedAt: string;
+  reviewValidationPlan?: ReviewPublicationValidationPlan;
+  reviewPublicationAuthority?: {
+    repositoryIdentity: string;
+    prNumber: number;
+    expectedHeadSha: string;
+    expectedBaseSha: string;
+    resolutionType: "review_fix" | "merge_conflict";
+  };
 }
 
 export interface CompletionFinalizationResult {
@@ -66,6 +79,123 @@ export interface CompletionFinalizationResult {
   publishBlockedAt?: string;
   requeuedCompletionIds?: string[];
   requeuedJobIds?: string[];
+  publicationSuperseded?: boolean;
+  publicationHeld?: boolean;
+}
+
+export interface PublicationSupersededOutcome {
+  version: 1;
+  code: "publication_superseded";
+  repositoryIdentity: string;
+  prNumber: number;
+  expectedHeadSha: string;
+  expectedBaseSha: string;
+  observedHeadSha: string;
+  observedState: "open" | "closed";
+}
+
+export interface PublicationConflictOutcome extends Omit<
+  PublicationSupersededOutcome,
+  "code" | "observedState"
+> {
+  code: "publication_conflict" | "publication_validation_unavailable";
+  observedState: "open";
+  observedBaseSha: string;
+  retainedCandidateSha: string;
+  retainedCandidateRef: string;
+}
+
+function exactPublicationOutcome(
+  value: unknown,
+  jobParams: string,
+): PublicationSupersededOutcome | PublicationConflictOutcome | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  let review: Record<string, unknown>;
+  try {
+    review = JSON.parse(jobParams).reviewAgent;
+    if (!review || typeof review !== "object" || Array.isArray(review)) return null;
+  } catch {
+    return null;
+  }
+  const exactSha = (value: unknown): string =>
+    typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value.trim())
+      ? value.trim().toLowerCase()
+      : "";
+  const repository =
+    typeof input.repositoryIdentity === "string"
+      ? normalizeRepositoryOriginRemote(input.repositoryIdentity).toLowerCase()
+      : "";
+  const expectedRepository =
+    typeof review.repositoryIdentity === "string"
+      ? normalizeRepositoryOriginRemote(review.repositoryIdentity).toLowerCase()
+      : "";
+  const expectedHeadSha = exactSha(input.expectedHeadSha);
+  const expectedBaseSha = exactSha(input.expectedBaseSha);
+  const observedHeadSha = exactSha(input.observedHeadSha);
+  if (
+    input.version !== 1 ||
+    typeof input.code !== "string" ||
+    ![
+      "publication_superseded",
+      "publication_conflict",
+      "publication_validation_unavailable",
+    ].includes(input.code) ||
+    !repository ||
+    repository !== expectedRepository ||
+    !Number.isSafeInteger(input.prNumber) ||
+    Number(input.prNumber) <= 0 ||
+    input.prNumber !== review.prNumber ||
+    !["review_fix", "merge_conflict"].includes(String(review.resolutionType)) ||
+    !expectedHeadSha ||
+    expectedHeadSha !== exactSha(review.prHeadSha) ||
+    !expectedBaseSha ||
+    expectedBaseSha !== exactSha(review.prBaseSha) ||
+    !observedHeadSha ||
+    (input.observedState !== "open" && input.observedState !== "closed") ||
+    (input.code === "publication_superseded" &&
+      input.observedState === "open" &&
+      observedHeadSha === expectedHeadSha)
+  )
+    return null;
+  if (
+    input.code === "publication_conflict" ||
+    input.code === "publication_validation_unavailable"
+  ) {
+    const observedBaseSha = exactSha(input.observedBaseSha);
+    const retainedCandidateSha = exactSha(input.retainedCandidateSha);
+    if (
+      input.observedState !== "open" ||
+      observedHeadSha !== expectedHeadSha ||
+      !observedBaseSha ||
+      !retainedCandidateSha ||
+      typeof input.retainedCandidateRef !== "string"
+    )
+      return null;
+    return {
+      version: 1,
+      code: input.code,
+      repositoryIdentity: repository,
+      prNumber: input.prNumber as number,
+      expectedHeadSha,
+      expectedBaseSha,
+      observedHeadSha,
+      observedState: "open",
+      observedBaseSha,
+      retainedCandidateSha,
+      retainedCandidateRef: input.retainedCandidateRef,
+    };
+  }
+  return {
+    version: 1,
+    code: "publication_superseded",
+    repositoryIdentity: repository,
+    prNumber: input.prNumber as number,
+    expectedHeadSha,
+    expectedBaseSha,
+    observedHeadSha,
+    observedState: input.observedState,
+  };
 }
 
 export type CompletionProcessingAuthority = Pick<
@@ -392,6 +522,15 @@ export class CompletionQueue {
 
       CREATE INDEX IF NOT EXISTS idx_completions_status ON completions(status);
       CREATE INDEX IF NOT EXISTS idx_completions_job ON completions(jobId);
+
+      CREATE TABLE IF NOT EXISTS completion_validation_plans (
+        completionId TEXT PRIMARY KEY,
+        jobId TEXT NOT NULL,
+        workerClaimGeneration INTEGER NOT NULL,
+        candidateSha TEXT NOT NULL,
+        commandsJson TEXT NOT NULL,
+        createdAt TEXT NOT NULL
+      );
     `);
 
     const columns = this.db.prepare(`PRAGMA table_info(completions)`).all() as Array<{
@@ -610,6 +749,7 @@ export class CompletionQueue {
         const failedParents = this.db
           .prepare(
             `SELECT j.id AS jobId,
+                    c.id AS completionId,
                     c.error AS error,
                     c.trustedValidationCommandsJson AS trustedValidationCommandsJson
              FROM jobs j
@@ -622,19 +762,21 @@ export class CompletionQueue {
           )
           .all() as Array<{
           jobId: string;
+          completionId: string;
           error: string | null;
           trustedValidationCommandsJson: string | null;
         }>;
         for (const row of failedParents) {
+          const failure = this.publicationFailureDiagnostics({
+            id: row.completionId,
+            jobId: row.jobId,
+            trustedValidationCommandsJson: row.trustedValidationCommandsJson,
+            error: row.error,
+          });
           this.upsertPublicationTerminalDiagnostics({
             jobId: row.jobId,
             status: "publish_blocked",
-            failureClass: row.trustedValidationCommandsJson
-              ? "trusted_validation_failed"
-              : "publication_failed",
-            terminalStage: row.trustedValidationCommandsJson
-              ? "trusted_environment_validation"
-              : "publication",
+            ...failure,
             summary: row.error || "Candidate publication failed",
             now,
           });
@@ -828,6 +970,9 @@ export class CompletionQueue {
          JOIN jobs passedJob ON passedJob.id = passed.jobId AND passedJob.status = 'completed'
          WHERE c.status = 'failed'
            AND blockedJob.status = 'publish_blocked'
+           AND CASE WHEN json_valid(c.error)
+               THEN COALESCE(json_extract(c.error, '$.publicationOutcome.code'), '') ELSE '' END
+               NOT IN ('publication_conflict', 'publication_superseded', 'publication_validation_unavailable')
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
            AND failed.passed = 0
@@ -1200,7 +1345,12 @@ export class CompletionQueue {
         )
         .run(pusherId, claimToken, now, leaseExpiresAt, now, now, row.id);
 
-      return this.getCompletion(row.id);
+      const claimed = this.getCompletion(row.id);
+      if (claimed) {
+        const plan = this.snapshotReviewValidationPlan(claimed, now);
+        if (plan) claimed.reviewValidationPlan = plan;
+      }
+      return claimed;
     });
 
     const completion = tx();
@@ -1492,6 +1642,7 @@ export class CompletionQueue {
     trustedReportInput?: unknown,
     pusherIdRaw?: string | null,
     claimTokenRaw?: string | null,
+    publicationOutcomeInput?: unknown,
   ): CompletionFinalizationResult {
     const now = new Date().toISOString();
     const pusherId = String(pusherIdRaw ?? "").trim();
@@ -1516,9 +1667,9 @@ export class CompletionQueue {
       if (!completion.leaseExpiresAt || completion.leaseExpiresAt <= now) {
         return { ok: false, message: "Completion lease is expired or owned by another pusher" };
       }
-      const job = this.db.prepare(`SELECT status FROM jobs WHERE id = ?`).get(completion.jobId) as
-        | { status: string }
-        | undefined;
+      const job = this.db
+        .prepare(`SELECT status, params FROM jobs WHERE id = ?`)
+        .get(completion.jobId) as { status: string; params: string } | undefined;
       if (!job) return { ok: false, message: "Parent job not found" };
       if (job.status !== "finalizing" && job.status !== "completed") {
         return {
@@ -1526,6 +1677,59 @@ export class CompletionQueue {
           message: `Parent job is ${job.status}; expected finalizing`,
         };
       }
+      const publicationOutcome =
+        publicationOutcomeInput === undefined
+          ? null
+          : exactPublicationOutcome(publicationOutcomeInput, job.params);
+      if (publicationOutcomeInput !== undefined && !publicationOutcome) {
+        return { ok: false, message: "Invalid exact publication outcome evidence" };
+      }
+      const superseded = publicationOutcome?.code === "publication_superseded";
+      const conflict =
+        publicationOutcome && publicationOutcome.code !== "publication_superseded"
+          ? publicationOutcome
+          : null;
+      if (publicationOutcome) {
+        const lifecycle = this.db
+          .query(
+            `SELECT 1 AS present FROM pr_repair_lifecycle
+          WHERE activeJobId = ? AND repositoryIdentity = ? AND prNumber = ?
+            AND headSha = ? AND baseSha = ? AND status IN ('queued', 'running')`,
+          )
+          .get(
+            completion.jobId,
+            publicationOutcome.repositoryIdentity,
+            publicationOutcome.prNumber,
+            publicationOutcome.expectedHeadSha,
+            publicationOutcome.expectedBaseSha,
+          );
+        if (!lifecycle)
+          return { ok: false, message: "Publication no longer owns its exact repair lifecycle" };
+      }
+      if (conflict) {
+        const namespace = `refs/pushpals/validation/${createHash("sha256").update(completion.id).digest("hex").slice(0, 32)}/`;
+        const suffix = conflict.retainedCandidateRef.startsWith(namespace)
+          ? conflict.retainedCandidateRef.slice(namespace.length)
+          : "";
+        const match = suffix.match(/^([1-9][0-9]*)\/candidate$/);
+        const generation = Number(match?.[1]);
+        if (
+          !match ||
+          !Number.isSafeInteger(generation) ||
+          generation > completion.claimGeneration ||
+          trustedReport?.candidateSha !== conflict.retainedCandidateSha ||
+          trustedReport?.candidateRef !== conflict.retainedCandidateRef
+        ) {
+          return {
+            ok: false,
+            message:
+              "Publication hold requires this completion's exact retained checkpoint evidence",
+          };
+        }
+      }
+      const retainedFailure = publicationOutcome
+        ? JSON.stringify({ message: failure, publicationOutcome })
+        : failure;
 
       const completionUpdated = this.db
         .prepare(
@@ -1546,7 +1750,7 @@ export class CompletionQueue {
           normalizedTiming.installDurationMs,
           normalizedTiming.validationDurationMs,
           normalizedTiming.installCacheHit,
-          failure,
+          retainedFailure,
           now,
           completionId,
           pusherId,
@@ -1560,12 +1764,12 @@ export class CompletionQueue {
       const transitioned = this.db
         .prepare(
           `UPDATE jobs
-           SET status = 'publish_blocked',
+           SET status = ?,
                error = ?,
                publishBlockedAt = ?,
                completedAt = NULL,
                failedAt = NULL,
-               abandonedAt = NULL,
+               abandonedAt = ?,
                durationMs = MAX(
                  0,
                  CAST((julianday(?) - julianday(COALESCE(startedAt, claimedAt, enqueuedAt, createdAt))) * 86400000 AS INTEGER)
@@ -1574,12 +1778,17 @@ export class CompletionQueue {
            WHERE id = ? AND status IN ('finalizing', 'completed')`,
         )
         .run(
+          superseded ? "abandoned" : "publish_blocked",
           JSON.stringify({
-            message: "Candidate publication failed",
+            message: superseded
+              ? "Candidate publication superseded"
+              : "Candidate publication failed",
             detail: failure,
             completionId,
+            ...(publicationOutcome ? { publicationOutcome } : {}),
           }),
-          now,
+          superseded ? null : now,
+          superseded ? now : null,
           now,
           now,
           completion.jobId,
@@ -1587,16 +1796,36 @@ export class CompletionQueue {
       if (transitioned.changes > 0) {
         this.upsertPublicationTerminalDiagnostics({
           jobId: completion.jobId,
-          status: "publish_blocked",
-          failureClass: completion.trustedValidationCommandsJson
-            ? "trusted_validation_failed"
-            : "publication_failed",
-          terminalStage: completion.trustedValidationCommandsJson
-            ? "trusted_environment_validation"
-            : "publication",
+          status: superseded ? "abandoned" : "publish_blocked",
+          ...(superseded
+            ? { failureClass: "publication_superseded", terminalStage: "publication" }
+            : conflict
+              ? { failureClass: conflict.code, terminalStage: "publication" }
+              : this.publicationFailureDiagnostics(completion)),
           summary: failure,
           now,
         });
+      }
+      if (publicationOutcome) {
+        this.db
+          .query(
+            `UPDATE pr_repair_lifecycle SET status = ?,
+            activeJobId = NULL, nextRetryAt = NULL, updatedAt = ?, heldBaseSha = ?,
+            lastError = ?
+          WHERE activeJobId = ? AND repositoryIdentity = ? AND prNumber = ?
+            AND headSha = ? AND baseSha = ? AND status IN ('queued', 'running')`,
+          )
+          .run(
+            superseded ? "superseded" : "held",
+            now,
+            conflict?.observedBaseSha ?? null,
+            failure.slice(0, 1000),
+            completion.jobId,
+            publicationOutcome.repositoryIdentity,
+            publicationOutcome.prNumber,
+            publicationOutcome.expectedHeadSha,
+            publicationOutcome.expectedBaseSha,
+          );
       }
       const saved = this.db
         .prepare(`SELECT durationMs, publishBlockedAt FROM jobs WHERE id = ?`)
@@ -1609,9 +1838,212 @@ export class CompletionQueue {
         jobTransitioned: transitioned.changes > 0,
         durationMs: saved?.durationMs ?? undefined,
         publishBlockedAt: saved?.publishBlockedAt ?? undefined,
+        ...(superseded ? { publicationSuperseded: true } : {}),
+        ...(conflict ? { publicationHeld: true } : {}),
       };
     });
     return tx();
+  }
+
+  private snapshotReviewValidationPlan(
+    completion: CompletionRow,
+    now: string,
+  ): ReviewPublicationValidationPlan | null {
+    if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").get())
+      return null;
+    const job = this.db
+      .query("SELECT params, claimGeneration FROM jobs WHERE id = ?")
+      .get(completion.jobId) as { params: string; claimGeneration: number } | null;
+    if (!job) return null;
+    let params: Record<string, unknown>;
+    try {
+      params = JSON.parse(job.params);
+    } catch {
+      return null;
+    }
+    const review = params?.reviewAgent as Record<string, unknown> | undefined;
+    if (!review || !["review_fix", "merge_conflict"].includes(String(review.resolutionType)))
+      return null;
+    const frozen = this.db
+      .query(
+        `SELECT jobId, workerClaimGeneration, candidateSha, commandsJson
+      FROM completion_validation_plans WHERE completionId = ?`,
+      )
+      .get(completion.id) as {
+      jobId: string;
+      workerClaimGeneration: number;
+      candidateSha: string;
+      commandsJson: string;
+    } | null;
+    if (frozen) {
+      if (
+        frozen.jobId !== completion.jobId ||
+        frozen.candidateSha !== completion.commitSha ||
+        frozen.workerClaimGeneration !== job.claimGeneration
+      )
+        return {
+          version: 1,
+          status: "invalid",
+          commands: [],
+          reason: "The frozen validation plan does not match this completion's worker identity.",
+        };
+      return buildReviewPublicationValidationPlan({
+        complete: true,
+        requiredValidationSteps: [],
+        validationSteps: [],
+        workerCommands: frozen.commandsJson,
+        deferredCommands: completion.trustedValidationCommandsJson,
+      });
+    }
+    const snapshotTable = this.db
+      .query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_validation_snapshots'",
+      )
+      .get();
+    const snapshot = snapshotTable
+      ? (this.db
+          .query(
+            `SELECT claimGeneration, commandsJson
+      FROM job_validation_snapshots WHERE jobId = ?`,
+          )
+          .get(completion.jobId) as {
+          claimGeneration: number;
+          commandsJson: string;
+        } | null)
+      : null;
+    const planning =
+      params.planning && typeof params.planning === "object" && !Array.isArray(params.planning)
+        ? (params.planning as Record<string, unknown>)
+        : {};
+    const joinedSteps = (key: string): unknown => {
+      const fields = [params[key], planning[key]].filter(
+        (value) => value !== undefined && value !== null,
+      );
+      // Keep malformed mandatory evidence invalid instead of dropping it.
+      if (fields.some((value) => !Array.isArray(value))) return {};
+      return fields.flatMap((value) => value as unknown[]);
+    };
+    const plan = buildReviewPublicationValidationPlan({
+      complete: Boolean(snapshot && snapshot.claimGeneration === job.claimGeneration),
+      requiredValidationSteps: joinedSteps("requiredValidationSteps"),
+      validationSteps: joinedSteps("validationSteps"),
+      workerCommands: snapshot?.commandsJson,
+      deferredCommands: completion.trustedValidationCommandsJson,
+    });
+    if (plan.status === "ready" && completion.commitSha) {
+      // Completion claims/restarts never reinterpret a later partial upload as
+      // a smaller validation contract for the retained immutable candidate.
+      this.db
+        .query(
+          `INSERT INTO completion_validation_plans
+        (completionId, jobId, workerClaimGeneration, candidateSha, commandsJson, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          completion.id,
+          completion.jobId,
+          job.claimGeneration,
+          completion.commitSha,
+          JSON.stringify(plan.commands),
+          now,
+        );
+    }
+    return plan;
+  }
+
+  private permittedTrustedValidationCommands(
+    completion: Pick<CompletionRow, "id" | "jobId" | "trustedValidationCommandsJson">,
+  ): string[] {
+    const deferred = normalizeTrustedValidationCommands(completion.trustedValidationCommandsJson);
+    const frozen = this.db
+      .query(
+        `SELECT commandsJson FROM completion_validation_plans
+      WHERE completionId = ? AND jobId = ?`,
+      )
+      .get(completion.id, completion.jobId) as {
+      commandsJson: string;
+    } | null;
+    const complete = frozen ? normalizeTrustedValidationCommands(frozen.commandsJson) : null;
+    return [
+      ...new Set([
+        ...(deferred.ok ? deferred.commands : []),
+        ...(complete?.ok ? complete.commands : []),
+      ]),
+    ];
+  }
+
+  private publicationFailureDiagnostics(
+    completion: Pick<CompletionRow, "id" | "jobId" | "trustedValidationCommandsJson" | "error">,
+  ): { failureClass: string; terminalStage: string } {
+    const publication = { failureClass: "publication_failed", terminalStage: "publication" };
+    // Typed host dispositions were already tuple/claim fenced when persisted.
+    // Reopen must preserve their publication meaning even when validation
+    // passed or never ran on the conflicting candidate.
+    try {
+      const retained = JSON.parse(completion.error ?? "null")?.publicationOutcome;
+      if (retained) {
+        const job = this.db.query("SELECT params FROM jobs WHERE id = ?").get(completion.jobId) as {
+          params: string;
+        } | null;
+        const outcome = job && exactPublicationOutcome(retained, job.params);
+        if (outcome) return { failureClass: outcome.code, terminalStage: "publication" };
+      }
+    } catch {
+      // Plain legacy error strings are not typed publication authority.
+    }
+    const requestedCommands = this.permittedTrustedValidationCommands(completion);
+    if (requestedCommands.length === 0) return publication;
+    const exists = this.db
+      .query(
+        `SELECT 1 AS present FROM sqlite_master
+      WHERE type = 'table' AND name = 'job_validation_runs'`,
+      )
+      .get();
+    if (!exists) return publication;
+    const allowed = new Set(requestedCommands.map(trustedValidationCommandKey));
+    const rows = this.db
+      .query(
+        `SELECT command, passed, exitCode,
+        json_extract(metadataJson, '$.phase') AS phase,
+        json_extract(metadataJson, '$.attempt') AS attempt
+      FROM job_validation_runs
+      WHERE jobId = ? AND json_valid(metadataJson)
+        AND json_extract(metadataJson, '$.source') = 'trusted_host'
+        AND json_extract(metadataJson, '$.completionId') = ?
+        AND COALESCE(json_extract(metadataJson, '$.validationTarget'), 'candidate') != 'baseline'
+      ORDER BY id ASC`,
+      )
+      .all(completion.jobId, completion.id) as Array<{
+      command: string;
+      passed: number;
+      exitCode: number | null;
+      phase: string | null;
+      attempt: number | null;
+    }>;
+    const terminal = new Map<string, (typeof rows)[number]>();
+    for (const row of rows) {
+      const command = trustedValidationCommandKey(row.command);
+      if (row.phase !== "dependency_install" && !allowed.has(command)) continue;
+      const key = `${row.phase === "dependency_install" ? "install" : "validation"}:${command}`;
+      const previous = terminal.get(key);
+      if (!previous || Number(row.attempt ?? 1) >= Number(previous.attempt ?? 1)) {
+        terminal.set(key, row);
+      }
+    }
+    // Configuring a mandatory gate is not evidence that the gate failed.
+    // Baseline probes and transient attempts later repaired by a passing retry
+    // must not turn a later Git/provider error into a code-validation failure.
+    if (
+      [...terminal.values()].some(
+        (row) => row.passed !== 1 || (row.exitCode !== null && row.exitCode !== 0),
+      )
+    ) {
+      return {
+        failureClass: "trusted_validation_failed",
+        terminalStage: "trusted_environment_validation",
+      };
+    }
+    return publication;
   }
 
   private replaceTrustedValidationRuns(
@@ -1619,11 +2051,11 @@ export class CompletionQueue {
     report: TrustedValidationReport | null,
     now: string,
   ): void {
-    if (!completion.trustedValidationCommandsJson || !report || report.results.length === 0) return;
-    const requested = normalizeTrustedValidationCommands(completion.trustedValidationCommandsJson);
-    if (!requested.ok) return;
+    if (!report || report.results.length === 0) return;
+    const requestedCommands = this.permittedTrustedValidationCommands(completion);
+    if (requestedCommands.length === 0) return;
     const allowedCommands = new Set(
-      requested.commands.map((command) => command.trim().replace(/\s+/g, " ").toLowerCase()),
+      requestedCommands.map((command) => command.trim().replace(/\s+/g, " ").toLowerCase()),
     );
     this.db
       .prepare(
@@ -1728,6 +2160,9 @@ export class CompletionQueue {
          JOIN job_validation_runs r ON r.jobId = c.jobId
          WHERE c.status = 'failed'
            AND j.status = 'publish_blocked'
+           AND CASE WHEN json_valid(c.error)
+               THEN COALESCE(json_extract(c.error, '$.publicationOutcome.code'), '') ELSE '' END
+               NOT IN ('publication_conflict', 'publication_superseded', 'publication_validation_unavailable')
            AND c.id != ?
            AND c.trustedValidationCommandsJson IS NOT NULL
            AND c.trustedValidationRecoveryAttempts < ?
@@ -1824,7 +2259,7 @@ export class CompletionQueue {
 
   private upsertPublicationTerminalDiagnostics(options: {
     jobId: string;
-    status: "completed" | "publish_blocked";
+    status: "completed" | "publish_blocked" | "abandoned";
     failureClass: string;
     terminalStage: string;
     summary: string;

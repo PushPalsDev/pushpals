@@ -397,6 +397,7 @@ export interface ReviewRepairAdmission {
   authorized: boolean;
   exhausted: boolean;
   terminal: boolean;
+  held?: boolean;
   workClass: "repair" | null;
   activeJobId: string | null;
   reason?: string;
@@ -1434,6 +1435,7 @@ export class JobQueue {
         prNumber           INTEGER,
         headSha            TEXT NOT NULL,
         baseSha            TEXT,
+        heldBaseSha        TEXT,
         resolutionType     TEXT NOT NULL,
         sourceJobId        TEXT,
         activeJobId        TEXT,
@@ -1583,6 +1585,14 @@ export class JobQueue {
       CREATE INDEX IF NOT EXISTS idx_job_validation_runs_failure_class
         ON job_validation_runs(failureClass, createdAt);
 
+      CREATE TABLE IF NOT EXISTS job_validation_snapshots (
+        jobId TEXT PRIMARY KEY,
+        claimGeneration INTEGER NOT NULL,
+        commandsJson TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        FOREIGN KEY (jobId) REFERENCES jobs(id)
+      );
+
       CREATE TABLE IF NOT EXISTS job_patch_snapshots (
         id                     INTEGER PRIMARY KEY AUTOINCREMENT,
         jobId                  TEXT NOT NULL,
@@ -1674,6 +1684,9 @@ export class JobQueue {
       this.db.exec(
         `ALTER TABLE pr_repair_lifecycle ADD COLUMN repositoryIdentity TEXT NOT NULL DEFAULT '';`,
       );
+    }
+    if (!repairLifecycleColumns.some((column) => column.name === "heldBaseSha")) {
+      this.db.exec(`ALTER TABLE pr_repair_lifecycle ADD COLUMN heldBaseSha TEXT;`);
     }
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_pr_repair_lifecycle_exact_head
       ON pr_repair_lifecycle(repositoryIdentity, prNumber, headSha, baseSha);`);
@@ -2226,7 +2239,7 @@ export class JobQueue {
          ON CONFLICT(lifecycleKey) DO UPDATE SET
            sourceJobId = COALESCE(pr_repair_lifecycle.sourceJobId, excluded.sourceJobId),
            activeJobId = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.activeJobId
              WHEN pr_repair_lifecycle.status IN ('queued','running')
                AND pr_repair_lifecycle.activeJobId IS NOT NULL
@@ -2235,7 +2248,7 @@ export class JobQueue {
              ELSE excluded.activeJobId
            END,
            status = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.status
              WHEN pr_repair_lifecycle.status IN ('queued','running')
                AND pr_repair_lifecycle.activeJobId IS NOT NULL
@@ -2244,19 +2257,19 @@ export class JobQueue {
              ELSE 'queued'
            END,
            attemptCount = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.attemptCount
              WHEN pr_repair_lifecycle.activeJobId = excluded.activeJobId
                THEN pr_repair_lifecycle.attemptCount
              ELSE MAX(1, pr_repair_lifecycle.attemptCount)
            END,
            nextRetryAt = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.nextRetryAt
              ELSE NULL
            END,
            updatedAt = CASE
-             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted')
+             WHEN pr_repair_lifecycle.status IN ('succeeded','exhausted','superseded','held')
                THEN pr_repair_lifecycle.updatedAt
              WHEN julianday(excluded.updatedAt) > julianday(pr_repair_lifecycle.updatedAt)
                THEN excluded.updatedAt
@@ -2352,7 +2365,8 @@ export class JobQueue {
     // Startup/watchdog reconciliation is read-only for a settled lifecycle.
     // In particular, do not revive an exhausted PR/head or rewind updatedAt
     // with the historical job's createdAt.
-    if (lifecycle?.status === "succeeded" || lifecycle?.status === "exhausted") return null;
+    if (lifecycle && ["succeeded", "exhausted", "superseded", "held"].includes(lifecycle.status))
+      return null;
     if (!lifecycle) {
       const admission = this.reviewRepairAdmission({ params, prUrl: job.prUrl });
       if (!admission.authorized) return null;
@@ -2372,7 +2386,7 @@ export class JobQueue {
           }
         | undefined;
     }
-    if (!lifecycle || lifecycle.status === "succeeded" || lifecycle.status === "exhausted") {
+    if (!lifecycle || ["succeeded", "exhausted", "superseded", "held"].includes(lifecycle.status)) {
       return null;
     }
     if (lifecycle.activeJobId && lifecycle.activeJobId !== jobId) {
@@ -2577,7 +2591,7 @@ export class JobQueue {
                ELSE updatedAt
              END
          WHERE activeJobId = ?
-           AND status != 'exhausted'`,
+           AND status NOT IN ('exhausted', 'superseded', 'held')`,
       )
       .run(now, now, jobId);
   }
@@ -2592,7 +2606,7 @@ export class JobQueue {
        FROM pr_repair_lifecycle lifecycle
        JOIN jobs j ON j.id = lifecycle.activeJobId
        WHERE lifecycle.rowid > ?
-         AND lifecycle.status NOT IN ('succeeded','exhausted')
+         AND lifecycle.status NOT IN ('succeeded','exhausted','superseded','held')
          AND j.status IN ('completed','failed','publish_blocked','abandoned')
        ORDER BY lifecycle.rowid ASC
        LIMIT 200`,
@@ -2635,7 +2649,7 @@ export class JobQueue {
     headSha: string;
     baseSha: string;
   }): {
-    state: "none" | "active" | "exhausted" | "settled";
+    state: "none" | "active" | "exhausted" | "settled" | "held";
     activeJobId: string | null;
     detail: string;
   } {
@@ -2657,12 +2671,14 @@ export class JobQueue {
     // applies only to its exact head/base; a new base is a distinct lifecycle.
     const rows = this.db
       .query(
-        `SELECT status, activeJobId, baseSha, lastError FROM pr_repair_lifecycle
+        `SELECT status, activeJobId, baseSha, heldBaseSha, lastError FROM pr_repair_lifecycle
        WHERE repositoryIdentity = ? AND prNumber = ? AND headSha = ?
-         AND (baseSha = ? OR status NOT IN ('succeeded', 'exhausted'))
+         AND ((status = 'held' AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+           OR (status <> 'held' AND baseSha = ?)
+           OR status NOT IN ('succeeded', 'exhausted', 'superseded', 'held'))
        LIMIT 101`,
       )
-      .all(repository, input.prNumber, head, base) as Array<{
+      .all(repository, input.prNumber, head, base, base) as Array<{
       status: string;
       activeJobId: string | null;
       baseSha: string;
@@ -2670,12 +2686,24 @@ export class JobQueue {
     }>;
     if (rows.length > 100)
       throw new Error("Exact review lifecycle lookup exceeded its safety bound");
-    const active = rows.find((row) => !["succeeded", "exhausted"].includes(row.status));
+    const active = rows.find(
+      (row) => !["succeeded", "exhausted", "superseded", "held"].includes(row.status),
+    );
     if (active)
       return {
         state: "active",
         activeJobId: active.activeJobId,
         detail: "A durable repair lifecycle still owns this PR head.",
+      };
+    const held = rows.find((row) => row.status === "held");
+    if (held)
+      return {
+        state: "held",
+        activeJobId: null,
+        detail: String(
+          held.lastError ||
+            "Publication requires explicit resolution; unchanged repair work is held.",
+        ).slice(0, 2000),
       };
     const exhausted = rows.find((row) => row.status === "exhausted");
     if (exhausted)
@@ -2686,11 +2714,11 @@ export class JobQueue {
           exhausted.lastError || "Exact PR revision repair attempts are exhausted.",
         ).slice(0, 2000),
       };
-    if (rows.some((row) => row.status === "succeeded"))
+    if (rows.some((row) => row.status === "succeeded" || row.status === "superseded"))
       return {
         state: "settled",
         activeJobId: null,
-        detail: "Exact PR revision repair lifecycle already succeeded.",
+        detail: "Exact PR revision repair lifecycle already settled.",
       };
     return { state: "none", activeJobId: null, detail: "" };
   }
@@ -2728,10 +2756,13 @@ export class JobQueue {
         `SELECT status, sourceJobId, activeJobId
          FROM pr_repair_lifecycle
          WHERE lifecycleKey = ?
-            OR (status IN ('succeeded', 'exhausted')
+            OR (status = 'held' AND repositoryIdentity = ?
+                AND prNumber = ? AND headSha = ?
+                AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+            OR (status IN ('succeeded', 'exhausted', 'superseded')
                 AND repositoryIdentity = ?
                 AND prNumber = ? AND headSha = ? AND baseSha = ? AND resolutionType = ?)
-         ORDER BY CASE status WHEN 'exhausted' THEN 0 WHEN 'succeeded' THEN 1 ELSE 2 END
+         ORDER BY CASE status WHEN 'held' THEN 0 WHEN 'exhausted' THEN 1 WHEN 'succeeded' THEN 2 WHEN 'superseded' THEN 2 ELSE 3 END
          LIMIT 1`,
       )
       // Older keys omitted repository identity (and sometimes the base).
@@ -2743,8 +2774,24 @@ export class JobQueue {
         context.prNumber,
         context.headSha,
         context.baseSha,
+        context.repositoryIdentity,
+        context.prNumber,
+        context.headSha,
+        context.baseSha,
         context.resolutionType,
       ) as { status: string; sourceJobId: string | null; activeJobId: string | null } | undefined;
+    if (lifecycle?.status === "held")
+      return {
+        requested: true,
+        authorized: false,
+        exhausted: false,
+        terminal: true,
+        held: true,
+        workClass: null,
+        activeJobId: null,
+        reason:
+          "Publication is held for explicit resolution; unchanged repair work cannot be cloned.",
+      };
     if (lifecycle?.status === "exhausted") {
       return {
         requested: true,
@@ -2756,7 +2803,7 @@ export class JobQueue {
         reason: "The durable PR/head repair lifecycle is exhausted.",
       };
     }
-    if (lifecycle?.status === "succeeded") {
+    if (lifecycle?.status === "succeeded" || lifecycle?.status === "superseded") {
       return {
         requested: true,
         authorized: false,
@@ -2764,7 +2811,7 @@ export class JobQueue {
         terminal: true,
         workClass: null,
         activeJobId: lifecycle.activeJobId,
-        reason: "The durable PR/head repair lifecycle already succeeded.",
+        reason: `The durable PR/head repair lifecycle already ${lifecycle.status === "superseded" ? "settled after publication supersession" : "succeeded"}.`,
       };
     }
     if (lifecycle) {
@@ -4206,6 +4253,48 @@ export class JobQueue {
           diagnosticMetadataJson(metadata),
           now,
         );
+      }
+
+      if (hasValidationRuns && terminal) {
+        // A partial upload (or SCM's later terminal diagnostic) cannot prove
+        // that every worker gate was captured. Freeze only the full terminal
+        // worker upload, atomically with its observations and claim identity.
+        const owner = this.db.query("SELECT claimGeneration FROM jobs WHERE id = ?").get(jobId) as {
+          claimGeneration: number;
+        } | null;
+        const rawRuns = diagnostics.validationRuns as unknown[];
+        const terminalMetadata = recordFromUnknown(terminal.metadata);
+        const finalRevision = terminalMetadata?.revisionAttempt;
+        const finalCount = terminalMetadata?.validationRuns;
+        const hasFinalRevision = Number.isSafeInteger(finalRevision) && Number(finalRevision) >= 0;
+        const finalRuns = hasFinalRevision
+          ? rawRuns.filter((run) => recordFromUnknown(run)?.attempt === finalRevision)
+          : rawRuns;
+        // Current workers upload every revision and cap each revision's
+        // diagnostic rows. Their terminal count proves the final plan wasn't
+        // truncated; earlier experiments are not the final candidate's gates.
+        const completeFinalRevision = hasFinalRevision
+          ? Number.isSafeInteger(finalCount) && finalCount === finalRuns.length
+          : finalRevision === undefined && finalCount === undefined;
+        const completeCommands =
+          rawRuns.length <= MAX_JOB_DIAGNOSTIC_VALIDATION_RUNS &&
+          completeFinalRevision &&
+          finalRuns.every((run) => {
+            const record = recordFromUnknown(run);
+            return typeof record?.command === "string" && record.command.length <= 1_000;
+          })
+            ? finalRuns.map((run) => (run as Record<string, unknown>).command)
+            : null;
+        if (owner) {
+          this.db
+            .query(
+              `INSERT INTO job_validation_snapshots
+              (jobId, claimGeneration, commandsJson, createdAt) VALUES (?, ?, ?, ?)
+              ON CONFLICT(jobId) DO UPDATE SET claimGeneration = excluded.claimGeneration,
+                commandsJson = excluded.commandsJson, createdAt = excluded.createdAt`,
+            )
+            .run(jobId, owner.claimGeneration, JSON.stringify(completeCommands), now);
+        }
       }
 
       const insertPatchSnapshot = this.db.prepare(

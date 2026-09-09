@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   ensureIntegrationPullRequest,
+  getBranchHeadSha,
   listOpenPullRequests,
   listRecentlyClosedPullRequests,
   mergePullRequest,
@@ -40,6 +41,113 @@ function closedPr(overrides: Partial<GitHubPR> = {}): GitHubPR {
 }
 
 describe("source control manager GitHub PR provider", () => {
+  test("resolves an exact live target branch independently of PR metadata", async () => {
+    const sha = "C".repeat(40);
+    expect(
+      await getBranchHeadSha({
+        token: "provider-token",
+        remoteUrl: "git@github.com:org/repo.git",
+        branchRef: "refs/heads/release/next",
+        fetchImpl: async (input, init) => {
+          expect(String(input)).toBe(
+            "https://api.github.com/repos/org/repo/git/ref/heads/release%2Fnext",
+          );
+          expect(init?.method).toBe("GET");
+          return Response.json({ ref: "refs/heads/release/next", object: { type: "commit", sha } });
+        },
+      }),
+    ).toBe(sha.toLowerCase());
+  });
+
+  test("refreshes target branch authority between publication attempts", async () => {
+    const heads = ["a".repeat(40), "b".repeat(40)];
+    let requests = 0;
+    const options = {
+      token: "provider-token",
+      remoteUrl: "https://github.com/org/repo.git",
+      branchRef: "main",
+      fetchImpl: async () =>
+        Response.json({
+          ref: "refs/heads/main",
+          object: { type: "commit", sha: heads[requests++] },
+        }),
+    };
+
+    expect(await getBranchHeadSha(options)).toBe(heads[0]);
+    expect(await getBranchHeadSha(options)).toBe(heads[1]);
+    expect(requests).toBe(2);
+  });
+
+  test.each(
+    [
+      null,
+      [],
+      { ref: "refs/heads/another", object: { type: "commit", sha: "a".repeat(40) } },
+      { ref: "refs/heads/main", object: { type: "tag", sha: "a".repeat(40) } },
+      { ref: "refs/heads/main", object: { type: "commit", sha: "short" } },
+      { ref: "refs/heads/main", object: { type: "commit", sha: 123 } },
+    ].map((payload) => ({ payload })),
+  )("rejects malformed or nonmatching target branch authority (%#)", async ({ payload }) => {
+    await expect(
+      getBranchHeadSha({
+        token: "provider-token",
+        remoteUrl: "https://github.com/org/repo.git",
+        branchRef: "main",
+        fetchImpl: async () => Response.json(payload),
+      }),
+    ).rejects.toThrow("invalid commit head");
+  });
+
+  test.each(["", "../main", "main..other", "heads/*", "main?other", "branch.lock", "main\nother"])(
+    "rejects ambiguous branch references without a provider request (%s)",
+    async (branchRef) => {
+      let calls = 0;
+      await expect(
+        getBranchHeadSha({
+          token: "provider-token",
+          remoteUrl: "https://github.com/org/repo.git",
+          branchRef,
+          fetchImpl: async () => {
+            calls++;
+            return Response.json({});
+          },
+        }),
+      ).rejects.toThrow("exact valid branch");
+      expect(calls).toBe(0);
+    },
+  );
+
+  test("does not substitute stale metadata when the target branch was deleted", async () => {
+    await expect(
+      getBranchHeadSha({
+        token: "provider-token",
+        remoteUrl: "https://github.com/org/repo.git",
+        branchRef: "main",
+        fetchImpl: async () => Response.json({ message: "Not Found" }, { status: 404 }),
+      }),
+    ).rejects.toThrow("404");
+  });
+
+  test("bounds a target-ref provider that never settles or honors abort", async () => {
+    const previous = process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS;
+    process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS = "1000";
+    const started = Date.now();
+    try {
+      await expect(
+        getBranchHeadSha({
+          token: "provider-token",
+          remoteUrl: "https://github.com/org/repo.git",
+          branchRef: "main",
+          fetchImpl: async () => new Promise<Response>(() => {}),
+        }),
+      ).rejects.toThrow("timed out after 1000ms");
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      if (previous === undefined) delete process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS;
+      else process.env.PUSHPALS_GITHUB_API_TIMEOUT_MS = previous;
+    }
+  });
+
   test("atomically pins a PR merge to the reviewed provider head", async () => {
     const expectedHeadSha = "a".repeat(40);
     const result = await mergePullRequest({

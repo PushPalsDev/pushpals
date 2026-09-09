@@ -103,6 +103,14 @@ close/reopen, changed revisions, active repairs through finalization, and exhaus
 repair admission. Windows CI and release checks also exercise HTTP health while a
 bounded validation child emits output, times out, and has its process tree drained.
 
+The repair harness and Windows CI/release gates also exercise review publication
+against a target branch that was already newer at dispatch or moved during
+validation. Retained-candidate Git fixtures protect original PR changes, exact
+head leases, fresh validation proofs, and restart recovery. SQLite lifecycle
+regressions verify that completion-claim recovery does not create another coding
+job or consume code-quality repair attempts. Passing host checks followed by a
+publication failure must retain their passing evidence and correct terminal phase.
+
 Failure-evidence tests include noisy expected application errors, repeated Bun
 summaries, duplicate test names across files, and truncation next to oversized
 logs. The completion-to-autonomy harness verifies that actual failed-test names

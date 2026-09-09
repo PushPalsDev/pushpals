@@ -39,6 +39,53 @@ work. Provider head/base and review inputs are checked immediately before closur
 and repair dispatch. Merges additionally send GitHub the exact reviewed head SHA,
 so an unreviewed concurrent head cannot be merged.
 
+## Target-branch movement is publication coordination
+
+The PR provider's reported comparison base is not assumed to be the current
+target-branch tip. ReviewAgent resolves the exact target branch separately before
+building its review, journal, and repair-lifecycle snapshot. It repeats that
+authority check before side effects. Missing or malformed branch authority defers
+the review; it never falls back to the historical PR base.
+
+An in-flight review repair retains its immutable worker candidate when the target
+branch advances. SourceControlManager reconciles that candidate with the fresh
+target base in its disposable host worktree, then validates the resulting exact
+SHA. A prior validation pass is not proof for a newly reconciled tree. Publication
+still requires the original PR to remain open, its leased head to remain current,
+and the exact expected-head force-with-lease.
+
+For a reconciled candidate, validation includes the full original worker plan,
+including checks that passed before reconciliation, plus deferred commands. The
+server snapshots complete worker validation evidence independently of later SCM
+diagnostics. Partial uploads do not establish a complete plan, and the host never
+truncates an oversized plan into a passing subset. Missing evidence gets a bounded
+claim retry for the diagnostics-upload race; persistently missing or invalid
+evidence holds the retained candidate as `publication_validation_unavailable`
+instead of publishing unchecked changes or blocking the queue indefinitely.
+
+Base movement during validation defers the same completion for fenced claim
+recovery, instead of cloning the coding task with its obsolete base. Immutable
+checkpoints survive restarts. Each claim performs bounded work, and ordinary
+branch movement does not spend another code-quality repair attempt or close the
+PR. Real content conflicts become `publish_blocked` with a retained candidate and
+a `held` lifecycle keyed to the observed conflict base. They leave the active
+completion queue so unrelated publication can proceed. Unchanged held work is
+neither regenerated nor automatically closed; it needs explicit resolution or a
+changed head/base. The original repair capability is not rewritten to invent new
+authority. Conflicts are never resolved by dropping changes or bypassing checks.
+
+A closed PR or a replaced head can settle an obsolete repair as `abandoned` with
+`publication_superseded`, without exhausting code-quality retries. These typed
+outcomes use the existing fenced completion callback and the original durable
+repair owner. Stale owners and mismatched publication tuples cannot settle newer
+work. A repair never creates a replacement PR when the original is closed.
+
+Successful trusted-host validation remains successful evidence even if a later
+publication step fails. Terminal classification uses the actual candidate's
+latest command results, not the mere presence of configured trusted commands.
+Baseline probes and earlier failures recovered by a passing retry do not turn a
+later publication problem into a test failure.
+
 Approved but unmergeable revisions are also nonterminal while conflict recovery
 is dispatched, deduplicated, circuit-blocked, or waiting for publication to settle.
 A successful enqueue is not a successful merge. After a restart these revisions

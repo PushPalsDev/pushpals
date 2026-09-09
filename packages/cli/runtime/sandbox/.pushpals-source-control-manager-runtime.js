@@ -6790,6 +6790,28 @@ async function getPullRequest(opts) {
   }
   return await response.json();
 }
+async function getBranchHeadSha(opts) {
+  const repo = parseGitHubRepo2(opts.remoteUrl);
+  if (!repo)
+    throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  const branch = String(opts.branchRef ?? "").trim().replace(/^refs\/heads\//, "");
+  if (!branch || branch.startsWith("/") || branch.endsWith("/") || /[\s\x00-\x1f\x7f~^:?*\[\\]|\.\.|@\{|\/\/|(?:^|\/)\.|\.lock(?:\/|$)|\.$/.test(branch)) {
+    throw new Error("branchRef must identify an exact valid branch");
+  }
+  const ref = `refs/heads/${branch}`;
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const response = await githubFetch(url, {
+    method: "GET",
+    headers: githubHeaders(opts.token)
+  }, opts.fetchImpl);
+  if (!response.ok)
+    throw githubError(response.status, await response.text());
+  const payload = await response.json().catch(() => null);
+  if (!payload || payload.ref !== ref || payload.object?.type !== "commit" || typeof payload.object.sha !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(payload.object.sha)) {
+    throw new Error(`GitHub returned an invalid commit head for ${ref}`);
+  }
+  return payload.object.sha.toLowerCase();
+}
 async function getPullRequestDiff(opts) {
   const repo = parseGitHubRepo2(opts.remoteUrl);
   if (!repo) {
@@ -7390,6 +7412,7 @@ var DEFAULT_DEPS = {
   listOpenPullRequests,
   listRecentlyClosedPullRequests,
   getPullRequest,
+  getBranchHeadSha,
   listPersistedPrLinks,
   getPullRequestDiff,
   getCommitMessage,
@@ -8430,11 +8453,27 @@ class ReviewAgent {
       token: this.githubToken,
       remoteUrl: this.remoteUrl,
       prNumber: pr.number
-    }).then((latest) => latest.state === "open" && this.reviewDecisionKey(latest) === this.reviewDecisionKey(pr));
+    }).then(async (latest) => {
+      if (latest.state !== "open" || latest.base.ref !== pr.base.ref)
+        return false;
+      const targetBaseSha = await this.currentTargetBaseSha(latest.base.ref);
+      return this.reviewDecisionKey(this.withTargetBaseSha(latest, targetBaseSha)) === this.reviewDecisionKey(pr);
+    });
     this.assertReviewPolicyUnchanged(pr);
     if (!current)
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} changed or closed during review; refusing stale side effects.`);
     return current;
+  }
+  currentTargetBaseSha(branchRef) {
+    return this.deps.getBranchHeadSha({
+      token: this.githubToken,
+      remoteUrl: this.remoteUrl,
+      branchRef,
+      fetchImpl: this.deps.fetchImpl
+    });
+  }
+  withTargetBaseSha(pr, targetBaseSha) {
+    return { ...pr, head: { ...pr.head }, base: { ...pr.base, sha: targetBaseSha } };
   }
   async reviewLifecycleForPr(pr) {
     if (this.deps.findReviewLifecycle)
@@ -8450,7 +8489,7 @@ class ReviewAgent {
     if (!response.ok)
       throw new Error(`Review lifecycle authority unavailable: HTTP ${response.status}`);
     const payload = await response.json().catch(() => null);
-    if (!payload || payload.ok !== true || typeof payload.state !== "string" || !["none", "active", "exhausted", "settled"].includes(payload.state)) {
+    if (!payload || payload.ok !== true || typeof payload.state !== "string" || !["none", "active", "exhausted", "settled", "held"].includes(payload.state)) {
       throw new Error("Review lifecycle authority returned an invalid response");
     }
     return {
@@ -8757,7 +8796,16 @@ class ReviewAgent {
         this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to list PRs: ${err?.message ?? err}`);
         return;
       }
-      const eligible = prs.filter((pr) => {
+      if (!prs.length)
+        return;
+      let targetBaseSha;
+      try {
+        targetBaseSha = await this.currentTargetBaseSha(this.prBaseBranch);
+      } catch (err) {
+        this.deps.logWarn(`[${ts()}] [ReviewAgent] Target branch authority unavailable for ${this.prBaseBranch}; deferring reviews and repairs: ${err?.message ?? err}`);
+        return;
+      }
+      const eligible = prs.filter((pr) => pr.base.ref === this.prBaseBranch).map((pr) => this.withTargetBaseSha(pr, targetBaseSha)).filter((pr) => {
         const key = this.reviewDecisionKey(pr);
         this.loadReviewDecision(pr, key);
         const reviewedRevision = this.reviewed.get(pr.number);
@@ -8880,7 +8928,7 @@ class ReviewAgent {
       return;
     }
     const lifecycle = await this.reviewLifecycleForPr(pr);
-    if (lifecycle.state === "active" || lifecycle.state === "settled") {
+    if (lifecycle.state === "active" || lifecycle.state === "settled" || lifecycle.state === "held") {
       this.deps.logInfo(`[${ts()}] [ReviewAgent] Deferring PR #${pr.number}: durable repair lifecycle is ${lifecycle.state}${lifecycle.activeJobId ? ` (${lifecycle.activeJobId})` : ""}.`);
       return;
     }
@@ -9260,6 +9308,10 @@ ${raw.slice(0, 500)}`);
         feedbackVerdict: "rejected_re_review_cap_closed",
         feedbackSummarySuffix: "closed after the durable repair lifecycle exhausted its attempts."
       });
+    }
+    if (enqueued === "held") {
+      this.awaitingRepairPrs.add(pr.number);
+      return false;
     }
     if (enqueued === "settled")
       return acknowledgeRejection();
@@ -9719,6 +9771,8 @@ ${raw.slice(0, 500)}`);
             return "exhausted";
           if (code === "review_repair_lifecycle_settled")
             return "settled";
+          if (code === "review_repair_lifecycle_held")
+            return "held";
         }
         throw new Error(`HTTP ${response.status}: ${text}`);
       }
@@ -9991,6 +10045,646 @@ function shouldUseReviewPublicationFlow(reviewAgentEnabled, lease) {
 }
 function shouldPublishWithExactReviewLease(lease) {
   return lease !== null;
+}
+
+// packages/shared/src/review_publication_validation.ts
+function rejected(status, reason) {
+  return { version: 1, status, commands: [], reason };
+}
+function commandArray(value, label, optional = true) {
+  if (optional && (value === undefined || value === null))
+    return [];
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      throw new Error(`${label} must be a command array, not unparsed text.`);
+    }
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim()))
+    throw new Error(`${label} must contain only nonempty strings.`);
+  if (value.length > 256)
+    throw new Error(`${label} exceeds the evidence bound.`);
+  return value;
+}
+function completeCommands(values) {
+  const commands = [];
+  const seen = new Set;
+  for (const command of values) {
+    const argv = tokenizeTrustedValidationCommand(command);
+    if (!argv)
+      throw new Error(`Unsafe or unsupported validation command: ${command}`);
+    const key = JSON.stringify(argv);
+    if (seen.has(key))
+      continue;
+    seen.add(key);
+    commands.push(command.trim());
+  }
+  if (commands.length > MAX_TRUSTED_VALIDATION_COMMANDS)
+    throw new Error(`The complete plan exceeds ${MAX_TRUSTED_VALIDATION_COMMANDS} commands; no gates were truncated.`);
+  const normalized = normalizeTrustedValidationCommands(commands);
+  if (!normalized.ok)
+    throw new Error(normalized.message);
+  if (normalized.commands.length !== commands.length)
+    throw new Error("Distinct validation gates collide under trusted-runner normalization.");
+  return commands;
+}
+function resolveReconciledReviewValidationPlan(value, deferredCommands) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return rejected("pending", "The completion has no authoritative full validation plan.");
+  const plan = value;
+  if (plan.version !== 1 || !["ready", "pending", "invalid"].includes(String(plan.status)))
+    return rejected("invalid", "Unsupported full validation plan evidence.");
+  if (plan.status !== "ready")
+    return rejected(plan.status, typeof plan.reason === "string" ? plan.reason : "The full validation plan is not ready.");
+  try {
+    return {
+      version: 1,
+      status: "ready",
+      commands: completeCommands([
+        ...commandArray(plan.commands, "Authoritative validation", false),
+        ...commandArray(deferredCommands, "Deferred validation")
+      ])
+    };
+  } catch (error) {
+    return rejected("invalid", error instanceof Error ? error.message : String(error));
+  }
+}
+
+// apps/source_control_manager/src/validation_repair_publication.ts
+import { createHash as createHash4 } from "crypto";
+var SHA_RE2 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+var MAX_REPAIR_CHAIN_COMMITS = 32;
+function normalizeSha3(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return SHA_RE2.test(normalized) ? normalized : "";
+}
+function validationCheckpointNamespace(completionId) {
+  const key = createHash4("sha256").update(String(completionId)).digest("hex").slice(0, 32);
+  return `refs/pushpals/validation/${key}`;
+}
+function validationCheckpointRefs(completionId, claimGeneration) {
+  const generation = Math.max(1, Math.floor(claimGeneration));
+  const namespace = validationCheckpointNamespace(completionId);
+  return {
+    baselineRef: `${namespace}/${generation}/baseline`,
+    candidateRef: `${namespace}/${generation}/candidate`,
+    validatedRef: `${namespace}/${generation}/validated`
+  };
+}
+async function immutableRefSha(git2, ref) {
+  const result = await git2(["rev-parse", "--verify", `${ref}^{commit}`]);
+  if (!result.ok)
+    return null;
+  const sha = normalizeSha3(result.stdout);
+  if (!sha)
+    throw new Error(`Validation checkpoint ${ref} did not resolve to an exact commit.`);
+  return sha;
+}
+async function loadValidationCheckpoint(options) {
+  const refs = validationCheckpointRefs(options.completionId, options.claimGeneration);
+  const [baselineSha, candidateSha, validatedSha] = await Promise.all([
+    immutableRefSha(options.git, refs.baselineRef),
+    immutableRefSha(options.git, refs.candidateRef),
+    immutableRefSha(options.git, refs.validatedRef)
+  ]);
+  if (!baselineSha && !candidateSha && !validatedSha)
+    return null;
+  if (!baselineSha || !candidateSha) {
+    throw new Error(`Validation checkpoint for completion ${options.completionId} is incomplete; refusing generic-base recovery.`);
+  }
+  if (validatedSha && validatedSha !== candidateSha) {
+    throw new Error(`Immutable validation-success proof ${refs.validatedRef} points to ${validatedSha}, not candidate ${candidateSha}.`);
+  }
+  return {
+    ...refs,
+    baselineSha,
+    candidateSha,
+    validationProven: validatedSha === candidateSha
+  };
+}
+async function loadLatestValidationCheckpoint(options) {
+  const namespace = validationCheckpointNamespace(options.completionId);
+  const listed = await options.git(["for-each-ref", "--format=%(refname)", `${namespace}/`]);
+  if (!listed.ok) {
+    throw new Error(`Failed to enumerate retained validation checkpoints for ${options.completionId}: ${listed.stderr || listed.stdout}.`);
+  }
+  const generations = [
+    ...new Set(listed.stdout.split(/\r?\n/).map((ref) => Number(ref.trim().match(new RegExp(`^${namespace}/([1-9][0-9]*)/candidate$`))?.[1])).filter((generation) => Number.isSafeInteger(generation) && generation > 0 && generation < options.beforeClaimGeneration))
+  ].sort((a, b) => b - a);
+  for (const claimGeneration of generations) {
+    const checkpoint = await loadValidationCheckpoint({
+      completionId: options.completionId,
+      claimGeneration,
+      git: options.git
+    });
+    if (checkpoint)
+      return { claimGeneration, ...checkpoint };
+  }
+  return null;
+}
+async function persistValidationSuccessProof(options) {
+  const candidateSha = normalizeSha3(options.candidateSha);
+  if (!candidateSha)
+    throw new Error("Validation-success proof requires an exact candidate SHA.");
+  const checkpoint = await loadValidationCheckpoint({
+    completionId: options.completionId,
+    claimGeneration: options.claimGeneration,
+    git: options.git
+  });
+  if (!checkpoint || checkpoint.candidateSha !== candidateSha) {
+    throw new Error(`Validation-success proof requires the matching immutable candidate checkpoint ${candidateSha}.`);
+  }
+  const existing = await immutableRefSha(options.git, checkpoint.validatedRef);
+  if (existing && existing !== candidateSha) {
+    throw new Error(`Immutable validation-success proof ${checkpoint.validatedRef} already points to ${existing}, not ${candidateSha}.`);
+  }
+  if (!existing) {
+    const zeroOid = "0".repeat(candidateSha.length);
+    const update = await options.git([
+      "update-ref",
+      checkpoint.validatedRef,
+      candidateSha,
+      zeroOid
+    ]);
+    if (!update.ok) {
+      const concurrent = await immutableRefSha(options.git, checkpoint.validatedRef);
+      if (concurrent !== candidateSha) {
+        throw new Error(`Failed atomic creation of validation-success proof ${checkpoint.validatedRef}: ${update.stderr || update.stdout}.`);
+      }
+    }
+  }
+  const verified = await immutableRefSha(options.git, checkpoint.validatedRef);
+  if (verified !== candidateSha) {
+    throw new Error(`Validation-success proof ${checkpoint.validatedRef} failed exact-SHA verification after update.`);
+  }
+  return { validatedRef: checkpoint.validatedRef, candidateSha };
+}
+async function persistValidationCheckpoint(options) {
+  const baselineSha = normalizeSha3(options.baselineSha);
+  const candidateSha = normalizeSha3(options.candidateSha);
+  if (!baselineSha || !candidateSha || baselineSha === candidateSha) {
+    throw new Error("Validation checkpoint requires distinct exact baseline and candidate SHAs.");
+  }
+  await resolveExactCommit(options.git, baselineSha, "validation baseline");
+  await resolveExactCommit(options.git, candidateSha, "tested candidate");
+  await requireAncestor(options.git, baselineSha, candidateSha, `tested candidate ${candidateSha} is not descended from validation baseline ${baselineSha}`);
+  const refs = validationCheckpointRefs(options.completionId, options.claimGeneration);
+  for (const [ref, sha] of [
+    [refs.baselineRef, baselineSha],
+    [refs.candidateRef, candidateSha]
+  ]) {
+    const existing = await immutableRefSha(options.git, ref);
+    if (existing && existing !== sha) {
+      throw new Error(`Immutable validation checkpoint ${ref} already points to ${existing}, not ${sha}.`);
+    }
+    if (!existing) {
+      const zeroOid = "0".repeat(sha.length);
+      const update = await options.git(["update-ref", ref, sha, zeroOid]);
+      if (!update.ok) {
+        const concurrent = await immutableRefSha(options.git, ref);
+        if (concurrent !== sha) {
+          throw new Error(`Failed atomic creation of trusted-validation checkpoint ${ref}: ${update.stderr || update.stdout}.`);
+        }
+      }
+    }
+    const verified = await immutableRefSha(options.git, ref);
+    if (verified !== sha) {
+      throw new Error(`Validation checkpoint ${ref} failed exact-SHA verification after update.`);
+    }
+  }
+  const validatedSha = await immutableRefSha(options.git, refs.validatedRef);
+  if (validatedSha && validatedSha !== candidateSha) {
+    throw new Error(`Immutable validation-success proof ${refs.validatedRef} points to ${validatedSha}, not candidate ${candidateSha}.`);
+  }
+  return {
+    ...refs,
+    baselineSha,
+    candidateSha,
+    validationProven: validatedSha === candidateSha
+  };
+}
+async function resolveExactCommit(git2, sha, label) {
+  const result = await git2(["rev-parse", "--verify", `${sha}^{commit}`]);
+  const resolved = result.ok ? normalizeSha3(result.stdout) : "";
+  if (!resolved || resolved !== sha) {
+    throw new Error(`Validation-repair publication lease could not verify exact ${label} ${sha}: ${result.stderr || result.stdout || "revision unavailable"}.`);
+  }
+  return resolved;
+}
+async function requireAncestor(git2, ancestor, descendant, detail) {
+  const result = await git2(["merge-base", "--is-ancestor", ancestor, descendant]);
+  if (!result.ok) {
+    throw new Error(`Validation-repair publication lease mismatch: ${detail}.`);
+  }
+}
+async function resolveValidationCheckpointBaseline(options) {
+  const preApplyBaselineSha = normalizeSha3(options.preApplyBaselineSha);
+  const candidateSha = normalizeSha3(options.candidateSha);
+  if (!preApplyBaselineSha || !candidateSha) {
+    throw new Error("Validation checkpoint baseline resolution requires exact SHAs.");
+  }
+  await resolveExactCommit(options.git, preApplyBaselineSha, "pre-apply baseline");
+  await resolveExactCommit(options.git, candidateSha, "tested candidate");
+  const directAncestry = await options.git([
+    "merge-base",
+    "--is-ancestor",
+    preApplyBaselineSha,
+    candidateSha
+  ]);
+  if (directAncestry.ok)
+    return preApplyBaselineSha;
+  const mergeBase = await options.git(["merge-base", preApplyBaselineSha, candidateSha]);
+  const exactMergeBase = mergeBase.ok ? normalizeSha3(mergeBase.stdout) : "";
+  if (!exactMergeBase) {
+    throw new Error(`Unable to derive an exact trusted-validation baseline for candidate ${candidateSha}: ${mergeBase.stderr || mergeBase.stdout || "no merge base"}.`);
+  }
+  await requireAncestor(options.git, exactMergeBase, candidateSha, `derived baseline ${exactMergeBase} is not an ancestor of candidate ${candidateSha}`);
+  return exactMergeBase;
+}
+async function applyRetainedValidationCheckpoint(options) {
+  const baselineSha = normalizeSha3(options.baselineSha);
+  const candidateSha = normalizeSha3(options.candidateSha);
+  const currentIntegrationSha = normalizeSha3(options.currentIntegrationSha);
+  if (!baselineSha || !candidateSha || !currentIntegrationSha) {
+    throw new Error("Retained validation replay requires exact baseline, candidate, and integration SHAs.");
+  }
+  await resolveExactCommit(options.git, baselineSha, "retained baseline");
+  await resolveExactCommit(options.git, candidateSha, "retained candidate");
+  await resolveExactCommit(options.git, currentIntegrationSha, "current integration head");
+  await requireAncestor(options.git, baselineSha, candidateSha, `retained candidate ${candidateSha} is not descended from baseline ${baselineSha}`);
+  await requireAncestor(options.git, baselineSha, currentIntegrationSha, `current integration head ${currentIntegrationSha} is not descended from retained baseline ${baselineSha}`);
+  const chainResult = await options.git([
+    "rev-list",
+    "--reverse",
+    "--ancestry-path",
+    `${baselineSha}..${candidateSha}`
+  ]);
+  const chain = chainResult.ok ? chainResult.stdout.split(/\r?\n/).map((value) => normalizeSha3(value)).filter(Boolean) : [];
+  if (!chainResult.ok || chain.length < 1 || chain.length > MAX_REPAIR_CHAIN_COMMITS || chain.at(-1) !== candidateSha) {
+    throw new Error(`Retained validation replay refused an invalid or oversized commit chain (${chain.length} commits): ${chainResult.stderr || chainResult.stdout}.`);
+  }
+  const cherryResult = await options.git([
+    "cherry",
+    currentIntegrationSha,
+    candidateSha,
+    baselineSha
+  ]);
+  if (!cherryResult.ok) {
+    throw new Error(`Retained validation replay could not compare patch equivalence: ${cherryResult.stderr || cherryResult.stdout}.`);
+  }
+  const equivalent = new Set(cherryResult.stdout.split(/\r?\n/).map((line) => line.trim().match(/^-\s+([0-9a-f]{40,64})(?:\s|$)/i)?.[1]?.toLowerCase()).filter((sha) => Boolean(sha)));
+  const applied = [];
+  for (const commitSha of chain) {
+    const ancestor = await options.git([
+      "merge-base",
+      "--is-ancestor",
+      commitSha,
+      currentIntegrationSha
+    ]);
+    if (ancestor.ok || equivalent.has(commitSha))
+      continue;
+    const result = await options.git(["cherry-pick", commitSha]);
+    if (!result.ok) {
+      return {
+        ...result,
+        stderr: [
+          result.stderr,
+          `Failed while replaying retained trusted-validation commit ${commitSha}.`
+        ].filter(Boolean).join(`
+`)
+      };
+    }
+    applied.push(commitSha);
+  }
+  return applied.length > 0 ? {
+    ok: true,
+    stdout: `Replayed ${applied.length} retained trusted-validation commit(s).`,
+    stderr: "",
+    exitCode: 0
+  } : {
+    ok: true,
+    stdout: `Retained trusted-validation candidate ${candidateSha} is already integrated.`,
+    stderr: "",
+    exitCode: 0,
+    idempotent: true
+  };
+}
+async function applyValidationRepairPublication(options) {
+  const lease = validateValidationRepairPublicationLease(options.lease);
+  const completionSha = normalizeSha3(options.completionSha);
+  const currentIntegrationSha = normalizeSha3(options.currentIntegrationSha);
+  if (!completionSha || completionSha !== lease.expectedCompletionSha) {
+    throw new Error(`Validation-repair publication lease expected completion ${lease.expectedCompletionSha}, received ${options.completionSha}.`);
+  }
+  if (!currentIntegrationSha) {
+    throw new Error("Validation-repair publication requires an exact current integration SHA.");
+  }
+  await resolveExactCommit(options.git, lease.baselineSha, "baseline");
+  await resolveExactCommit(options.git, lease.candidateSha, "candidate");
+  await resolveExactCommit(options.git, completionSha, "completion");
+  await resolveExactCommit(options.git, currentIntegrationSha, "current integration head");
+  const retainedCandidate = await options.git([
+    "rev-parse",
+    "--verify",
+    `${lease.candidateRef}^{commit}`
+  ]);
+  if (!retainedCandidate.ok || normalizeSha3(retainedCandidate.stdout) !== lease.candidateSha) {
+    throw new Error(`Validation-repair publication lease mismatch: retained candidate ref ${lease.candidateRef} does not resolve to ${lease.candidateSha}.`);
+  }
+  await requireAncestor(options.git, lease.baselineSha, lease.candidateSha, `candidate ${lease.candidateSha} is not descended from baseline ${lease.baselineSha}`);
+  await requireAncestor(options.git, lease.candidateSha, completionSha, `completion ${completionSha} is not descended from candidate ${lease.candidateSha}`);
+  await requireAncestor(options.git, lease.baselineSha, currentIntegrationSha, `current integration head ${currentIntegrationSha} is not descended from leased baseline ${lease.baselineSha}`);
+  const chainResult = await options.git([
+    "rev-list",
+    "--reverse",
+    "--ancestry-path",
+    `${lease.baselineSha}..${completionSha}`
+  ]);
+  if (!chainResult.ok) {
+    throw new Error(`Validation-repair publication could not enumerate the leased commit chain: ${chainResult.stderr || chainResult.stdout}.`);
+  }
+  const chain = chainResult.stdout.split(/\r?\n/).map((value) => normalizeSha3(value)).filter(Boolean);
+  const candidateIndex = chain.indexOf(lease.candidateSha);
+  if (chain.length < 2 || chain.length > MAX_REPAIR_CHAIN_COMMITS || candidateIndex < 0 || chain.at(-1) !== completionSha) {
+    throw new Error(`Validation-repair publication refused an invalid or oversized leased chain (${chain.length} commits; candidate index ${candidateIndex}).`);
+  }
+  const cherryResult = await options.git([
+    "cherry",
+    currentIntegrationSha,
+    completionSha,
+    lease.baselineSha
+  ]);
+  if (!cherryResult.ok) {
+    throw new Error(`Validation-repair publication could not compare patch equivalence for idempotent recovery: ${cherryResult.stderr || cherryResult.stdout}.`);
+  }
+  const equivalentCommits = new Set(cherryResult.stdout.split(/\r?\n/).map((line) => line.trim().match(/^-\s+([0-9a-f]{40,64})(?:\s|$)/i)?.[1]?.toLowerCase()).filter((sha) => Boolean(sha)));
+  const applied = [];
+  for (const commitSha of chain) {
+    const alreadyIntegrated = await options.git([
+      "merge-base",
+      "--is-ancestor",
+      commitSha,
+      currentIntegrationSha
+    ]);
+    if (alreadyIntegrated.ok || equivalentCommits.has(commitSha))
+      continue;
+    const appliedResult = await options.git(["cherry-pick", commitSha]);
+    if (!appliedResult.ok) {
+      return {
+        ...appliedResult,
+        stderr: [
+          appliedResult.stderr,
+          `Failed while applying leased validation-repair commit ${commitSha} (${applied.length + 1}/${chain.length}).`
+        ].filter(Boolean).join(`
+`)
+      };
+    }
+    applied.push(commitSha);
+  }
+  if (applied.length === 0) {
+    return {
+      ok: true,
+      stdout: `Validation-repair completion ${completionSha} is already integrated; no duplicate mutation was applied.`,
+      stderr: "",
+      exitCode: 0,
+      idempotent: true
+    };
+  }
+  return {
+    ok: true,
+    stdout: `Applied ${applied.length} leased validation-repair commit(s): ${applied.join(", ")}`,
+    stderr: "",
+    exitCode: 0
+  };
+}
+
+// apps/source_control_manager/src/review_publication_recovery.ts
+function assertReviewCompletionLease(branch, lease) {
+  if (branch.startsWith("refs/pushpals/review/") && !lease) {
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", "Review completion has a missing or malformed publication lease; refusing an unleased replacement PR.");
+  }
+}
+
+class ReviewPublicationDeferredError extends Error {
+  code;
+  detail;
+  constructor(code, message, detail = {}) {
+    super(message);
+    this.code = code;
+    this.detail = detail;
+    this.name = "ReviewPublicationDeferredError";
+  }
+}
+function reviewPublicationFailureDisposition(deferred, publicationDisposition) {
+  if (publicationDisposition === "finalize")
+    return "finalize";
+  if (deferred && deferred.code !== "review_base_conflict" && deferred.code !== "review_validation_unavailable")
+    return "reconcile";
+  return publicationDisposition;
+}
+function resolveReviewPublicationValidationCommands(options) {
+  if (options.candidateSha === options.originalCandidateSha)
+    return options.deferredCommandsJson;
+  const plan = resolveReconciledReviewValidationPlan(options.fullPlan, options.deferredCommandsJson);
+  if (plan.status === "ready")
+    return JSON.stringify(plan.commands);
+  const pending = plan.status === "pending" && options.claimGeneration < 3;
+  throw new ReviewPublicationDeferredError(pending ? "review_validation_pending" : "review_validation_unavailable", `${plan.reason ?? "Full validation authority is unavailable."} ${pending ? "Retaining the changed candidate for the next diagnostics-aware claim." : "Holding the retained candidate without publication or a duplicate worker retry."}`, { candidateSha: options.candidateSha });
+}
+
+class ReviewPublicationSupersededError extends Error {
+  outcome;
+  constructor(outcome) {
+    super(`Original PR #${outcome.prNumber} is ${outcome.observedState} at ${outcome.observedHeadSha.slice(0, 8)}; refusing superseded review publication.`);
+    this.outcome = outcome;
+    this.name = "ReviewPublicationSupersededError";
+  }
+}
+function buildReviewPublicationSettlement(options) {
+  const claimed = options.claimedAuthority;
+  const observedPrNumber = options.superseded?.outcome.prNumber ?? options.observedAuthority?.prNumber;
+  const observedRepository = options.superseded?.outcome.repositoryIdentity ?? options.observedAuthority?.prUrl.replace(/\/pull\/[1-9][0-9]*\/?$/, "") ?? "";
+  if (!claimed || claimed.prNumber !== observedPrNumber || claimed.expectedHeadSha !== options.lease?.expectedHeadSha || !claimed.repositoryIdentity || normalizeRepositoryOriginRemote(claimed.repositoryIdentity).toLowerCase() !== normalizeRepositoryOriginRemote(observedRepository).toLowerCase() || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(claimed.expectedBaseSha)) {
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", "Claim response lacks matching durable review-job authority for neutral publication settlement; retaining candidate without guessing the original lease.");
+  }
+  if (options.superseded)
+    return {
+      ...options.superseded.outcome,
+      repositoryIdentity: claimed.repositoryIdentity,
+      expectedHeadSha: claimed.expectedHeadSha,
+      expectedBaseSha: claimed.expectedBaseSha
+    };
+  const checkpointPrefix = `${validationCheckpointNamespace(options.completionId)}/`;
+  const checkpointGeneration = options.candidateRef?.startsWith(checkpointPrefix) ? options.candidateRef.slice(checkpointPrefix.length).match(/^([1-9][0-9]*)\/candidate$/)?.[1] : null;
+  if (!options.observedAuthority || !options.checkpointPersisted || !options.candidateSha || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.candidateSha) || !checkpointGeneration || !Number.isSafeInteger(Number(checkpointGeneration)) || Number(checkpointGeneration) > options.claimGeneration) {
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", "Held publication candidate retention is not proven; preserving the completion for safe host recovery.");
+  }
+  return {
+    version: 1,
+    code: options.heldCode ?? "publication_conflict",
+    repositoryIdentity: claimed.repositoryIdentity,
+    prNumber: claimed.prNumber,
+    expectedHeadSha: claimed.expectedHeadSha,
+    expectedBaseSha: claimed.expectedBaseSha,
+    observedHeadSha: options.observedAuthority.headSha,
+    observedBaseSha: options.observedAuthority.baseSha,
+    observedState: "open",
+    retainedCandidateSha: options.candidateSha,
+    retainedCandidateRef: options.candidateRef
+  };
+}
+async function resolveReviewPublicationAuthority(options) {
+  const normalizeUrl = (value) => value.replace(/\/+$/, "").toLowerCase();
+  let prNumber;
+  try {
+    const url = new URL(options.prUrl ?? "");
+    const match = url.pathname.match(/^\/[^/]+\/[^/]+\/pull\/([1-9][0-9]*)\/?$/);
+    if (url.protocol !== "https:" || !match || !options.lease.baseBranch)
+      throw new Error("missing original PR or base branch");
+    prNumber = Number(match[1]);
+    if (!Number.isSafeInteger(prNumber))
+      throw new Error("invalid PR number");
+  } catch {
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", "Review publication requires the original PR URL and exact base branch; refusing creation of a replacement PR.");
+  }
+  let pr;
+  let baseSha;
+  try {
+    pr = await (options.getPr ?? getPullRequest)({
+      token: options.token,
+      remoteUrl: options.remoteUrl,
+      prNumber
+    });
+    if (pr.number !== prNumber || !["open", "closed"].includes(pr.state) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(pr.head?.sha ?? "") || normalizeUrl(pr.html_url) !== normalizeUrl(options.prUrl) || pr.head?.ref !== options.lease.targetBranch || pr.base?.ref !== options.lease.baseBranch || !pullRequestHeadBelongsToRemoteRepository(pr, options.remoteUrl))
+      throw new Error("provider returned incompatible original PR metadata");
+  } catch (error) {
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", `Unable to verify original PR publication authority: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const headSha = pr.head.sha.toLowerCase();
+  const recoveringPublishedCandidate = options.publishedRecoveryProven === true && headSha === options.publishedCandidateSha;
+  if (pr.state === "closed" && !recoveringPublishedCandidate || headSha !== options.lease.expectedHeadSha && !recoveringPublishedCandidate) {
+    throw new ReviewPublicationSupersededError({
+      version: 1,
+      code: "publication_superseded",
+      repositoryIdentity: options.remoteUrl,
+      prNumber,
+      expectedHeadSha: options.lease.expectedHeadSha,
+      expectedBaseSha: options.lease.expectedBaseSha ?? "",
+      observedHeadSha: headSha,
+      observedState: pr.state
+    });
+  }
+  try {
+    baseSha = await (options.getBase ?? getBranchHeadSha)({
+      token: options.token,
+      remoteUrl: options.remoteUrl,
+      branchRef: options.lease.baseBranch
+    });
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(baseSha))
+      throw new Error("target ref is not an exact commit");
+  } catch (error) {
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", `Unable to resolve live review base: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { prNumber, prUrl: pr.html_url, headSha, baseSha: baseSha.toLowerCase() };
+}
+async function prepareReviewPublicationCandidate(options) {
+  const { git: git2, candidateSha, baseSha } = options;
+  for (const sha of [candidateSha, baseSha]) {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha))
+      throw new Error("Review reconciliation requires exact commit SHAs.");
+    const result = await git2(["rev-parse", "--verify", `${sha}^{commit}`]);
+    if (!result.ok || result.stdout.trim().toLowerCase() !== sha)
+      throw new Error(`Review reconciliation cannot resolve ${sha}.`);
+  }
+  const status = await git2(["status", "--porcelain"]);
+  const head = await git2(["rev-parse", "HEAD"]);
+  if (!status.ok || status.stdout.trim() || !head.ok || head.stdout.trim().toLowerCase() !== candidateSha)
+    throw new Error("Review reconciliation requires the exact clean disposable candidate checkout.");
+  const containsBase = await git2(["merge-base", "--is-ancestor", baseSha, candidateSha]);
+  if (containsBase.ok)
+    return { candidateSha, baseSha, reconciled: false };
+  if (containsBase.exitCode !== 1)
+    throw new Error(`Unable to compare review candidate with base: ${containsBase.stderr}`);
+  const conflictRef = `${validationCheckpointNamespace(options.completionId)}/conflicts/${baseSha}/${candidateSha}`;
+  const remembered = await git2(["rev-parse", "--verify", "--quiet", conflictRef]);
+  if (remembered.ok) {
+    if (remembered.stdout.trim().toLowerCase() !== candidateSha)
+      throw new Error("Retained review conflict evidence is inconsistent.");
+    throw new ReviewPublicationDeferredError("review_base_conflict", "Unchanged candidate/base conflict remains held for resolution; not rerunning validation or worker coding.", { candidateSha, currentBaseSha: baseSha });
+  }
+  if (remembered.exitCode !== 1)
+    throw new Error(`Unable to inspect retained review conflict evidence: ${remembered.stderr}`);
+  const identity = options.commitIdentity;
+  if (!identity?.name || !identity.email)
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", "Host commit identity is unavailable for review-base reconciliation.");
+  const config = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    `user.name=${identity.name}`,
+    "-c",
+    `user.email=${identity.email}`
+  ];
+  const merged = await git2([...config, "merge", "--no-ff", "--no-commit", "--no-edit", baseSha]);
+  if (!merged.ok) {
+    const conflicts = await git2(["diff", "--name-only", "--diff-filter=U"]);
+    const mergeHead = await git2(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]);
+    if (mergeHead.ok) {
+      const aborted = await git2(["merge", "--abort"]);
+      if (!aborted.ok)
+        throw new Error(`Unable to abort disposable review reconciliation: ${aborted.stderr}`);
+    } else if (mergeHead.exitCode !== 1) {
+      throw new Error(`Unable to inspect disposable merge state: ${mergeHead.stderr}`);
+    }
+    const restored = await git2(["status", "--porcelain"]);
+    const restoredHead = await git2(["rev-parse", "HEAD"]);
+    if (!restored.ok || restored.stdout.trim() || !restoredHead.ok || restoredHead.stdout.trim() !== candidateSha) {
+      throw new Error("Failed review-base merge did not restore the exact clean retained candidate.");
+    }
+    if (conflicts.ok && conflicts.stdout.trim()) {
+      const retained = await git2([
+        "update-ref",
+        conflictRef,
+        candidateSha,
+        "0".repeat(candidateSha.length)
+      ]);
+      if (!retained.ok)
+        throw new Error(`Unable to retain review conflict checkpoint: ${retained.stderr}`);
+      throw new ReviewPublicationDeferredError("review_base_conflict", `Review base reconciliation has content conflicts in ${conflicts.stdout.trim().split(/\r?\n/).slice(0, 12).join(", ")}; original candidate retained for resolution.`, { candidateSha, currentBaseSha: baseSha });
+    }
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", `Host review-base merge could not complete: ${merged.stderr || merged.stdout}`, { candidateSha, currentBaseSha: baseSha });
+  }
+  const committed = await git2([
+    ...config,
+    "commit",
+    "--no-verify",
+    "-m",
+    `Merge current review base ${baseSha.slice(0, 12)} into preserved candidate`
+  ]);
+  if (!committed.ok) {
+    await git2(["merge", "--abort"]);
+    throw new ReviewPublicationDeferredError("review_authority_unavailable", `Host review-base reconciliation commit failed: ${committed.stderr || committed.stdout}`);
+  }
+  const prepared = await git2(["rev-parse", "HEAD"]);
+  const resultSha = prepared.stdout.trim().toLowerCase();
+  if (!prepared.ok || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultSha))
+    throw new Error("Unable to resolve reconciled candidate.");
+  for (const ancestor of [candidateSha, baseSha]) {
+    if (!(await git2(["merge-base", "--is-ancestor", ancestor, resultSha])).ok) {
+      throw new Error("Reconciled review commit failed original-candidate/base ancestry verification.");
+    }
+  }
+  const clean = await git2(["status", "--porcelain"]);
+  if (!clean.ok || clean.stdout.trim())
+    throw new Error("Reconciled review commit is not an exact clean checkout.");
+  return { candidateSha: resultSha, baseSha, reconciled: true };
+}
+function assertReviewPublicationBaseUnchanged(expectedBaseSha, current) {
+  if (current.baseSha !== expectedBaseSha)
+    throw new ReviewPublicationDeferredError("review_base_moved", `Review target base advanced from ${expectedBaseSha.slice(0, 8)} to ${current.baseSha.slice(0, 8)} during validation; retaining the candidate for a fresh bounded host reconciliation.`, { expectedBaseSha, currentBaseSha: current.baseSha });
 }
 
 // apps/source_control_manager/src/pr_title.ts
@@ -10443,7 +11137,7 @@ async function postCompletionCallbackWithRetry(options) {
 var postCompletionProcessedWithRetry = postCompletionCallbackWithRetry;
 
 // apps/source_control_manager/src/completion_gc.ts
-import { createHash as createHash4, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash5, randomUUID as randomUUID2 } from "crypto";
 import {
   closeSync as closeSync2,
   existsSync as existsSync7,
@@ -10458,14 +11152,14 @@ import {
 } from "fs";
 import { join as join7 } from "path";
 var COMPLETION_GC_VERSION = 1;
-var SHA_RE2 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+var SHA_RE3 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 var SAFE_COMPLETION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/;
 var SAFE_REMOTE_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 var SAFE_PUSHPALS_REF_RE = /^refs\/pushpals\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 var SAFE_VALIDATION_REF_RE = /^refs\/pushpals\/validation\/[0-9a-f]{32}\/[1-9][0-9]*\/(?:baseline|candidate|validated)$/i;
 var MAX_ADDITIONAL_VALIDATION_REFS = 24;
 function validationNamespace(completionId) {
-  const key = createHash4("sha256").update(completionId).digest("hex").slice(0, 32);
+  const key = createHash5("sha256").update(completionId).digest("hex").slice(0, 32);
   return `refs/pushpals/validation/${key}`;
 }
 function isSafePushpalsRef(value) {
@@ -10487,7 +11181,7 @@ function normalizeRecord(input) {
     throw new Error(`Completion GC record ${completionId} has an unsafe PushPals ref.`);
   }
   const commitSha = String(input?.commitSha ?? "").trim().toLowerCase();
-  if (!SHA_RE2.test(commitSha)) {
+  if (!SHA_RE3.test(commitSha)) {
     throw new Error(`Completion GC record ${completionId} has an invalid commit SHA.`);
   }
   const claimGeneration = Number(input?.claimGeneration);
@@ -10584,7 +11278,7 @@ class CompletionGcJournal {
     mkdirSync3(this.directory, { recursive: true });
   }
   pathFor(record) {
-    const key = createHash4("sha256").update(record.completionId).digest("hex").slice(0, 32);
+    const key = createHash5("sha256").update(record.completionId).digest("hex").slice(0, 32);
     return join7(this.directory, `${key}-${record.claimGeneration}.json`);
   }
   enqueue(input) {
@@ -10972,7 +11666,7 @@ async function isValidationCheckpointPublished(options) {
 }
 
 // apps/source_control_manager/src/trusted_validation.ts
-import { createHash as createHash5 } from "crypto";
+import { createHash as createHash6 } from "crypto";
 import { existsSync as existsSync8, readFileSync as readFileSync9, rmSync, writeFileSync as writeFileSync4 } from "fs";
 import { basename as basename4, resolve as resolve11 } from "path";
 var DEFAULT_TRUSTED_VALIDATION_TIMEOUT_MS = 8 * 60000;
@@ -11092,7 +11786,7 @@ function trustedValidationInstallFingerprint(options) {
   ].find((path) => existsSync8(path));
   if (!existsSync8(packagePath) || !lockPath)
     return null;
-  const hash = createHash5("sha256");
+  const hash = createHash6("sha256");
   hash.update(`platform=${process.platform}-${process.arch}
 `);
   hash.update(`bun=${currentBunExecutable(options.bunExecutable) || "bun"}
@@ -11463,354 +12157,6 @@ function isExplicitTestRunnerTimeoutFailure(output) {
     return false;
   const diagnostics = plain.replace(/^\s*error: script "[^"\r\n]+" exited with code [1-9]\d*\s*$/gm, "");
   return !/^\s*(?:Assertion(?:Error|\s+failed)\b|(?:Type|Reference|Range|Syntax|URI|Eval|Aggregate)Error\b|(?:error:\s*)?expect\(|(?:Expected|Received):|Error:(?!\s+Test timed out in \d+(?:\.\d+)?ms\.?\s*$))/im.test(diagnostics);
-}
-
-// apps/source_control_manager/src/validation_repair_publication.ts
-import { createHash as createHash6 } from "crypto";
-var SHA_RE3 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-var MAX_REPAIR_CHAIN_COMMITS = 32;
-function normalizeSha3(value) {
-  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-  return SHA_RE3.test(normalized) ? normalized : "";
-}
-function validationCheckpointNamespace(completionId) {
-  const key = createHash6("sha256").update(String(completionId)).digest("hex").slice(0, 32);
-  return `refs/pushpals/validation/${key}`;
-}
-function validationCheckpointRefs(completionId, claimGeneration) {
-  const generation = Math.max(1, Math.floor(claimGeneration));
-  const namespace = validationCheckpointNamespace(completionId);
-  return {
-    baselineRef: `${namespace}/${generation}/baseline`,
-    candidateRef: `${namespace}/${generation}/candidate`,
-    validatedRef: `${namespace}/${generation}/validated`
-  };
-}
-async function immutableRefSha(git2, ref) {
-  const result = await git2(["rev-parse", "--verify", `${ref}^{commit}`]);
-  if (!result.ok)
-    return null;
-  const sha = normalizeSha3(result.stdout);
-  if (!sha)
-    throw new Error(`Validation checkpoint ${ref} did not resolve to an exact commit.`);
-  return sha;
-}
-async function loadValidationCheckpoint(options) {
-  const refs = validationCheckpointRefs(options.completionId, options.claimGeneration);
-  const [baselineSha, candidateSha, validatedSha] = await Promise.all([
-    immutableRefSha(options.git, refs.baselineRef),
-    immutableRefSha(options.git, refs.candidateRef),
-    immutableRefSha(options.git, refs.validatedRef)
-  ]);
-  if (!baselineSha && !candidateSha && !validatedSha)
-    return null;
-  if (!baselineSha || !candidateSha) {
-    throw new Error(`Validation checkpoint for completion ${options.completionId} is incomplete; refusing generic-base recovery.`);
-  }
-  if (validatedSha && validatedSha !== candidateSha) {
-    throw new Error(`Immutable validation-success proof ${refs.validatedRef} points to ${validatedSha}, not candidate ${candidateSha}.`);
-  }
-  return {
-    ...refs,
-    baselineSha,
-    candidateSha,
-    validationProven: validatedSha === candidateSha
-  };
-}
-async function loadLatestValidationCheckpoint(options) {
-  const namespace = validationCheckpointNamespace(options.completionId);
-  const listed = await options.git(["for-each-ref", "--format=%(refname)", `${namespace}/`]);
-  if (!listed.ok) {
-    throw new Error(`Failed to enumerate retained validation checkpoints for ${options.completionId}: ${listed.stderr || listed.stdout}.`);
-  }
-  const generations = [
-    ...new Set(listed.stdout.split(/\r?\n/).map((ref) => Number(ref.trim().match(new RegExp(`^${namespace}/([1-9][0-9]*)/candidate$`))?.[1])).filter((generation) => Number.isSafeInteger(generation) && generation > 0 && generation < options.beforeClaimGeneration))
-  ].sort((a, b) => b - a);
-  for (const claimGeneration of generations) {
-    const checkpoint = await loadValidationCheckpoint({
-      completionId: options.completionId,
-      claimGeneration,
-      git: options.git
-    });
-    if (checkpoint)
-      return { claimGeneration, ...checkpoint };
-  }
-  return null;
-}
-async function persistValidationSuccessProof(options) {
-  const candidateSha = normalizeSha3(options.candidateSha);
-  if (!candidateSha)
-    throw new Error("Validation-success proof requires an exact candidate SHA.");
-  const checkpoint = await loadValidationCheckpoint({
-    completionId: options.completionId,
-    claimGeneration: options.claimGeneration,
-    git: options.git
-  });
-  if (!checkpoint || checkpoint.candidateSha !== candidateSha) {
-    throw new Error(`Validation-success proof requires the matching immutable candidate checkpoint ${candidateSha}.`);
-  }
-  const existing = await immutableRefSha(options.git, checkpoint.validatedRef);
-  if (existing && existing !== candidateSha) {
-    throw new Error(`Immutable validation-success proof ${checkpoint.validatedRef} already points to ${existing}, not ${candidateSha}.`);
-  }
-  if (!existing) {
-    const zeroOid = "0".repeat(candidateSha.length);
-    const update = await options.git([
-      "update-ref",
-      checkpoint.validatedRef,
-      candidateSha,
-      zeroOid
-    ]);
-    if (!update.ok) {
-      const concurrent = await immutableRefSha(options.git, checkpoint.validatedRef);
-      if (concurrent !== candidateSha) {
-        throw new Error(`Failed atomic creation of validation-success proof ${checkpoint.validatedRef}: ${update.stderr || update.stdout}.`);
-      }
-    }
-  }
-  const verified = await immutableRefSha(options.git, checkpoint.validatedRef);
-  if (verified !== candidateSha) {
-    throw new Error(`Validation-success proof ${checkpoint.validatedRef} failed exact-SHA verification after update.`);
-  }
-  return { validatedRef: checkpoint.validatedRef, candidateSha };
-}
-async function persistValidationCheckpoint(options) {
-  const baselineSha = normalizeSha3(options.baselineSha);
-  const candidateSha = normalizeSha3(options.candidateSha);
-  if (!baselineSha || !candidateSha || baselineSha === candidateSha) {
-    throw new Error("Validation checkpoint requires distinct exact baseline and candidate SHAs.");
-  }
-  await resolveExactCommit(options.git, baselineSha, "validation baseline");
-  await resolveExactCommit(options.git, candidateSha, "tested candidate");
-  await requireAncestor(options.git, baselineSha, candidateSha, `tested candidate ${candidateSha} is not descended from validation baseline ${baselineSha}`);
-  const refs = validationCheckpointRefs(options.completionId, options.claimGeneration);
-  for (const [ref, sha] of [
-    [refs.baselineRef, baselineSha],
-    [refs.candidateRef, candidateSha]
-  ]) {
-    const existing = await immutableRefSha(options.git, ref);
-    if (existing && existing !== sha) {
-      throw new Error(`Immutable validation checkpoint ${ref} already points to ${existing}, not ${sha}.`);
-    }
-    if (!existing) {
-      const zeroOid = "0".repeat(sha.length);
-      const update = await options.git(["update-ref", ref, sha, zeroOid]);
-      if (!update.ok) {
-        const concurrent = await immutableRefSha(options.git, ref);
-        if (concurrent !== sha) {
-          throw new Error(`Failed atomic creation of trusted-validation checkpoint ${ref}: ${update.stderr || update.stdout}.`);
-        }
-      }
-    }
-    const verified = await immutableRefSha(options.git, ref);
-    if (verified !== sha) {
-      throw new Error(`Validation checkpoint ${ref} failed exact-SHA verification after update.`);
-    }
-  }
-  const validatedSha = await immutableRefSha(options.git, refs.validatedRef);
-  if (validatedSha && validatedSha !== candidateSha) {
-    throw new Error(`Immutable validation-success proof ${refs.validatedRef} points to ${validatedSha}, not candidate ${candidateSha}.`);
-  }
-  return {
-    ...refs,
-    baselineSha,
-    candidateSha,
-    validationProven: validatedSha === candidateSha
-  };
-}
-async function resolveExactCommit(git2, sha, label) {
-  const result = await git2(["rev-parse", "--verify", `${sha}^{commit}`]);
-  const resolved = result.ok ? normalizeSha3(result.stdout) : "";
-  if (!resolved || resolved !== sha) {
-    throw new Error(`Validation-repair publication lease could not verify exact ${label} ${sha}: ${result.stderr || result.stdout || "revision unavailable"}.`);
-  }
-  return resolved;
-}
-async function requireAncestor(git2, ancestor, descendant, detail) {
-  const result = await git2(["merge-base", "--is-ancestor", ancestor, descendant]);
-  if (!result.ok) {
-    throw new Error(`Validation-repair publication lease mismatch: ${detail}.`);
-  }
-}
-async function resolveValidationCheckpointBaseline(options) {
-  const preApplyBaselineSha = normalizeSha3(options.preApplyBaselineSha);
-  const candidateSha = normalizeSha3(options.candidateSha);
-  if (!preApplyBaselineSha || !candidateSha) {
-    throw new Error("Validation checkpoint baseline resolution requires exact SHAs.");
-  }
-  await resolveExactCommit(options.git, preApplyBaselineSha, "pre-apply baseline");
-  await resolveExactCommit(options.git, candidateSha, "tested candidate");
-  const directAncestry = await options.git([
-    "merge-base",
-    "--is-ancestor",
-    preApplyBaselineSha,
-    candidateSha
-  ]);
-  if (directAncestry.ok)
-    return preApplyBaselineSha;
-  const mergeBase = await options.git(["merge-base", preApplyBaselineSha, candidateSha]);
-  const exactMergeBase = mergeBase.ok ? normalizeSha3(mergeBase.stdout) : "";
-  if (!exactMergeBase) {
-    throw new Error(`Unable to derive an exact trusted-validation baseline for candidate ${candidateSha}: ${mergeBase.stderr || mergeBase.stdout || "no merge base"}.`);
-  }
-  await requireAncestor(options.git, exactMergeBase, candidateSha, `derived baseline ${exactMergeBase} is not an ancestor of candidate ${candidateSha}`);
-  return exactMergeBase;
-}
-async function applyRetainedValidationCheckpoint(options) {
-  const baselineSha = normalizeSha3(options.baselineSha);
-  const candidateSha = normalizeSha3(options.candidateSha);
-  const currentIntegrationSha = normalizeSha3(options.currentIntegrationSha);
-  if (!baselineSha || !candidateSha || !currentIntegrationSha) {
-    throw new Error("Retained validation replay requires exact baseline, candidate, and integration SHAs.");
-  }
-  await resolveExactCommit(options.git, baselineSha, "retained baseline");
-  await resolveExactCommit(options.git, candidateSha, "retained candidate");
-  await resolveExactCommit(options.git, currentIntegrationSha, "current integration head");
-  await requireAncestor(options.git, baselineSha, candidateSha, `retained candidate ${candidateSha} is not descended from baseline ${baselineSha}`);
-  await requireAncestor(options.git, baselineSha, currentIntegrationSha, `current integration head ${currentIntegrationSha} is not descended from retained baseline ${baselineSha}`);
-  const chainResult = await options.git([
-    "rev-list",
-    "--reverse",
-    "--ancestry-path",
-    `${baselineSha}..${candidateSha}`
-  ]);
-  const chain = chainResult.ok ? chainResult.stdout.split(/\r?\n/).map((value) => normalizeSha3(value)).filter(Boolean) : [];
-  if (!chainResult.ok || chain.length < 1 || chain.length > MAX_REPAIR_CHAIN_COMMITS || chain.at(-1) !== candidateSha) {
-    throw new Error(`Retained validation replay refused an invalid or oversized commit chain (${chain.length} commits): ${chainResult.stderr || chainResult.stdout}.`);
-  }
-  const cherryResult = await options.git([
-    "cherry",
-    currentIntegrationSha,
-    candidateSha,
-    baselineSha
-  ]);
-  if (!cherryResult.ok) {
-    throw new Error(`Retained validation replay could not compare patch equivalence: ${cherryResult.stderr || cherryResult.stdout}.`);
-  }
-  const equivalent = new Set(cherryResult.stdout.split(/\r?\n/).map((line) => line.trim().match(/^-\s+([0-9a-f]{40,64})(?:\s|$)/i)?.[1]?.toLowerCase()).filter((sha) => Boolean(sha)));
-  const applied = [];
-  for (const commitSha of chain) {
-    const ancestor = await options.git([
-      "merge-base",
-      "--is-ancestor",
-      commitSha,
-      currentIntegrationSha
-    ]);
-    if (ancestor.ok || equivalent.has(commitSha))
-      continue;
-    const result = await options.git(["cherry-pick", commitSha]);
-    if (!result.ok) {
-      return {
-        ...result,
-        stderr: [
-          result.stderr,
-          `Failed while replaying retained trusted-validation commit ${commitSha}.`
-        ].filter(Boolean).join(`
-`)
-      };
-    }
-    applied.push(commitSha);
-  }
-  return applied.length > 0 ? {
-    ok: true,
-    stdout: `Replayed ${applied.length} retained trusted-validation commit(s).`,
-    stderr: "",
-    exitCode: 0
-  } : {
-    ok: true,
-    stdout: `Retained trusted-validation candidate ${candidateSha} is already integrated.`,
-    stderr: "",
-    exitCode: 0,
-    idempotent: true
-  };
-}
-async function applyValidationRepairPublication(options) {
-  const lease = validateValidationRepairPublicationLease(options.lease);
-  const completionSha = normalizeSha3(options.completionSha);
-  const currentIntegrationSha = normalizeSha3(options.currentIntegrationSha);
-  if (!completionSha || completionSha !== lease.expectedCompletionSha) {
-    throw new Error(`Validation-repair publication lease expected completion ${lease.expectedCompletionSha}, received ${options.completionSha}.`);
-  }
-  if (!currentIntegrationSha) {
-    throw new Error("Validation-repair publication requires an exact current integration SHA.");
-  }
-  await resolveExactCommit(options.git, lease.baselineSha, "baseline");
-  await resolveExactCommit(options.git, lease.candidateSha, "candidate");
-  await resolveExactCommit(options.git, completionSha, "completion");
-  await resolveExactCommit(options.git, currentIntegrationSha, "current integration head");
-  const retainedCandidate = await options.git([
-    "rev-parse",
-    "--verify",
-    `${lease.candidateRef}^{commit}`
-  ]);
-  if (!retainedCandidate.ok || normalizeSha3(retainedCandidate.stdout) !== lease.candidateSha) {
-    throw new Error(`Validation-repair publication lease mismatch: retained candidate ref ${lease.candidateRef} does not resolve to ${lease.candidateSha}.`);
-  }
-  await requireAncestor(options.git, lease.baselineSha, lease.candidateSha, `candidate ${lease.candidateSha} is not descended from baseline ${lease.baselineSha}`);
-  await requireAncestor(options.git, lease.candidateSha, completionSha, `completion ${completionSha} is not descended from candidate ${lease.candidateSha}`);
-  await requireAncestor(options.git, lease.baselineSha, currentIntegrationSha, `current integration head ${currentIntegrationSha} is not descended from leased baseline ${lease.baselineSha}`);
-  const chainResult = await options.git([
-    "rev-list",
-    "--reverse",
-    "--ancestry-path",
-    `${lease.baselineSha}..${completionSha}`
-  ]);
-  if (!chainResult.ok) {
-    throw new Error(`Validation-repair publication could not enumerate the leased commit chain: ${chainResult.stderr || chainResult.stdout}.`);
-  }
-  const chain = chainResult.stdout.split(/\r?\n/).map((value) => normalizeSha3(value)).filter(Boolean);
-  const candidateIndex = chain.indexOf(lease.candidateSha);
-  if (chain.length < 2 || chain.length > MAX_REPAIR_CHAIN_COMMITS || candidateIndex < 0 || chain.at(-1) !== completionSha) {
-    throw new Error(`Validation-repair publication refused an invalid or oversized leased chain (${chain.length} commits; candidate index ${candidateIndex}).`);
-  }
-  const cherryResult = await options.git([
-    "cherry",
-    currentIntegrationSha,
-    completionSha,
-    lease.baselineSha
-  ]);
-  if (!cherryResult.ok) {
-    throw new Error(`Validation-repair publication could not compare patch equivalence for idempotent recovery: ${cherryResult.stderr || cherryResult.stdout}.`);
-  }
-  const equivalentCommits = new Set(cherryResult.stdout.split(/\r?\n/).map((line) => line.trim().match(/^-\s+([0-9a-f]{40,64})(?:\s|$)/i)?.[1]?.toLowerCase()).filter((sha) => Boolean(sha)));
-  const applied = [];
-  for (const commitSha of chain) {
-    const alreadyIntegrated = await options.git([
-      "merge-base",
-      "--is-ancestor",
-      commitSha,
-      currentIntegrationSha
-    ]);
-    if (alreadyIntegrated.ok || equivalentCommits.has(commitSha))
-      continue;
-    const appliedResult = await options.git(["cherry-pick", commitSha]);
-    if (!appliedResult.ok) {
-      return {
-        ...appliedResult,
-        stderr: [
-          appliedResult.stderr,
-          `Failed while applying leased validation-repair commit ${commitSha} (${applied.length + 1}/${chain.length}).`
-        ].filter(Boolean).join(`
-`)
-      };
-    }
-    applied.push(commitSha);
-  }
-  if (applied.length === 0) {
-    return {
-      ok: true,
-      stdout: `Validation-repair completion ${completionSha} is already integrated; no duplicate mutation was applied.`,
-      stderr: "",
-      exitCode: 0,
-      idempotent: true
-    };
-  }
-  return {
-    ok: true,
-    stdout: `Applied ${applied.length} leased validation-repair commit(s): ${applied.join(", ")}`,
-    stderr: "",
-    exitCode: 0
-  };
 }
 
 // apps/source_control_manager/src/validation_worktree.ts
@@ -12594,6 +12940,7 @@ async function tick() {
     const reviewPublicationLease = completion.branch.startsWith("refs/pushpals/review/") ? parseReviewPublicationLease(completion.prBody) : null;
     let validationRepairPublicationLease = null;
     const isIntegrationReconciliationCompletion = Boolean(reviewPublicationLease && reviewPublicationLease.targetBranch === runtimeConfig.mainBranch && reviewPublicationLease.baseBranch === runtimeConfig.integrationBaseBranch);
+    const isOriginalPrReviewPublication = Boolean(reviewPublicationLease && !isIntegrationReconciliationCompletion);
     const useReviewPublicationFlow = shouldUseReviewPublicationFlow(runtimeConfig.reviewAgent.enabled, reviewPublicationLease);
     const comm = createSessionComm(completion.sessionId);
     const completionEventMeta = completion.origin === "autonomy" ? { from: "agent:source_control_manager/autonomy" } : undefined;
@@ -12653,6 +13000,7 @@ async function tick() {
     let trustedValidationCandidateRef = null;
     let trustedValidationAffectedPaths = [];
     let trustedValidationResults = [];
+    let validationCommandsJson = completion.trustedValidationCommandsJson;
     let publicationAlreadyIntegrated = false;
     let publicationReadyForFinalization = false;
     let validationCheckpointPersisted = false;
@@ -12662,8 +13010,12 @@ async function tick() {
     let validationWorktreeInvariantFailed = false;
     let validatedCheckpointRecoveryPending = false;
     let previousValidationCheckpoint = null;
+    let reviewPublicationAuthority = null;
+    let reviewPublicationCredentials = null;
+    let preparedReviewBaseSha = null;
+    let originalReviewPushAttempted = false;
     const completionValidationRefs = validationCheckpointRefs(completion.id, completionClaimGeneration);
-    const trustedValidationReport = () => completion.trustedValidationCommandsJson ? {
+    const trustedValidationReport = () => completion.trustedValidationCommandsJson || isOriginalPrReviewPublication ? {
       version: 1,
       baselineSha: trustedValidationBaselineSha,
       candidateSha: trustedValidationCandidateSha,
@@ -12686,6 +13038,26 @@ async function tick() {
       validationCheckpointGeneration = completionClaimGeneration;
     };
     const validationGit = (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot);
+    const checkOriginalReviewAuthority = async (publishedCandidateSha) => {
+      if (!reviewPublicationLease)
+        throw new Error("Review publication lease is missing.");
+      if (!reviewPublicationCredentials) {
+        const remote = await validationGit(["remote", "get-url", runtimeConfig.remote]);
+        const remoteUrl = remote.ok ? remote.stdout.trim() : "";
+        const token = remoteUrl ? await resolveGitAuthToken(remoteUrl, runtimeConfig.gitToken ?? "") : null;
+        if (!remoteUrl || !token) {
+          throw new ReviewPublicationDeferredError("review_authority_unavailable", "Original review PR authority is unavailable; preserving the candidate without publication.");
+        }
+        reviewPublicationCredentials = { remoteUrl, token };
+      }
+      return resolveReviewPublicationAuthority({
+        ...reviewPublicationCredentials,
+        prUrl: completion.prUrl ?? null,
+        lease: reviewPublicationLease,
+        publishedCandidateSha,
+        publishedRecoveryProven: skipValidationForDurableRecovery && publicationAlreadyIntegrated
+      });
+    };
     const probeAuthoritativeRefSha = async (ref) => authoritativeRefShaFromGitResult(await validationGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]), ref);
     const probeAuthoritativeAncestry = async (ancestor, descendant) => authoritativeAncestryFromGitResult(await validationGit(["merge-base", "--is-ancestor", ancestor, descendant]), `${ancestor} -> ${descendant}`);
     const assertValidationWorktree = async (phase) => {
@@ -12737,6 +13109,7 @@ async function tick() {
       }
     };
     try {
+      assertReviewCompletionLease(completion.branch, reviewPublicationLease);
       validationRepairPublicationLease = parseValidationRepairPublicationLease(completion.prBody);
       if (validationRepairPublicationLease && reviewPublicationLease) {
         throw new Error("Completion contains conflicting review and validation-repair publication leases.");
@@ -12753,6 +13126,9 @@ async function tick() {
       try {
         await gitOps.fetchPrune();
       } catch (error) {
+        if (isOriginalPrReviewPublication) {
+          throw new ReviewPublicationDeferredError("review_authority_unavailable", `Unable to refresh authoritative review refs: ${error instanceof Error ? error.message : String(error)}`);
+        }
         throw error;
       }
       if (reviewPublicationLease) {
@@ -12780,9 +13156,11 @@ async function tick() {
       tempBranch = `_source_control_manager/${completion.id}`;
       console.log(`[${ts2()}] Creating temp branch ${tempBranch}...`);
       await gitOps.resetToClean();
-      await gitOps.checkoutMain();
-      await gitOps.pullMainFF();
-      if (!isIntegrationReconciliationCompletion) {
+      if (!isOriginalPrReviewPublication) {
+        await gitOps.checkoutMain();
+        await gitOps.pullMainFF();
+      }
+      if (!isIntegrationReconciliationCompletion && !isOriginalPrReviewPublication) {
         const baseSync = await gitOps.syncMainWithBaseBranch();
         if (baseSync.status === "conflicted") {
           throw new Error(`Integration reconciliation is active for ${runtimeConfig.mainBranch} and ${runtimeConfig.integrationBaseBranch}; conflicted paths: ${baseSync.conflictPaths.join(", ")}.`);
@@ -12844,7 +13222,12 @@ async function tick() {
         } else {
           validationSuccessProven = false;
           trustedValidationCandidateSha = null;
-          retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
+          retainedCheckpointApplyResult = isOriginalPrReviewPublication ? await validationGit([
+            "checkout",
+            "-B",
+            tempBranch,
+            previousValidationCheckpoint.candidateSha
+          ]) : await applyRetainedValidationCheckpoint({
             baselineSha: previousValidationCheckpoint.baselineSha,
             candidateSha: previousValidationCheckpoint.candidateSha,
             currentIntegrationSha: trustedValidationBaselineSha ?? "",
@@ -12853,13 +13236,21 @@ async function tick() {
           console.log(`[${ts2()}] Replayed exact retained checkpoint ${previousValidationCheckpoint.candidateRef} onto the current integration head.`);
         }
       } else if (previousValidationCheckpoint) {
-        retainedCheckpointApplyResult = await applyRetainedValidationCheckpoint({
+        retainedCheckpointApplyResult = isOriginalPrReviewPublication ? await validationGit([
+          "checkout",
+          "-B",
+          tempBranch,
+          previousValidationCheckpoint.candidateSha
+        ]) : await applyRetainedValidationCheckpoint({
           baselineSha: previousValidationCheckpoint.baselineSha,
           candidateSha: previousValidationCheckpoint.candidateSha,
           currentIntegrationSha: trustedValidationBaselineSha ?? "",
           git: validationGit
         });
         console.log(`[${ts2()}] Replayed unvalidated retained checkpoint ${previousValidationCheckpoint.candidateRef}; validation-success proof is required before publication.`);
+      }
+      if (isOriginalPrReviewPublication && previousValidationCheckpoint && !skipValidationForDurableRecovery) {
+        trustedValidationBaselineSha = previousValidationCheckpoint.baselineSha;
       }
       const applyResult = retainedCheckpointApplyResult ? retainedCheckpointApplyResult : reviewPublicationLease ? await (async () => {
         console.log(`[${ts2()}] Checking out exact reviewed completion ${completion.commitSha.slice(0, 8)} on ${tempBranch} for validation...`);
@@ -12907,6 +13298,9 @@ async function tick() {
           trustedValidationBaselineSha = validationRepairPublicationLease.baselineSha;
         }
       }
+      if (isOriginalPrReviewPublication && !skipValidationForDurableRecovery && !previousValidationCheckpoint && reviewPublicationLease.expectedHeadSha !== trustedValidationCandidateSha && await probeAuthoritativeAncestry(reviewPublicationLease.expectedHeadSha, trustedValidationCandidateSha)) {
+        trustedValidationBaselineSha = reviewPublicationLease.expectedHeadSha;
+      }
       if (trustedValidationBaselineSha && trustedValidationCandidateSha && !await gitOps.isAncestor(trustedValidationBaselineSha, trustedValidationCandidateSha)) {
         trustedValidationBaselineSha = await resolveValidationCheckpointBaseline({
           preApplyBaselineSha: trustedValidationBaselineSha,
@@ -12914,8 +13308,51 @@ async function tick() {
           git: (gitArgs) => runGitCapture(["-C", runtimeConfig.repoPath, ...gitArgs], repoRoot)
         });
       }
+      if (isOriginalPrReviewPublication && !skipValidationForDurableRecovery) {
+        reviewPublicationAuthority = await checkOriginalReviewAuthority();
+        if (!await probeAuthoritativeAncestry(completion.commitSha, trustedValidationCandidateSha)) {
+          throw new Error("Retained review candidate does not preserve the immutable worker completion.");
+        }
+        const baseBranch = reviewPublicationLease.baseBranch;
+        const fetched = await validationGit([
+          "fetch",
+          runtimeConfig.remote,
+          `+refs/heads/${baseBranch}:refs/remotes/${runtimeConfig.remote}/${baseBranch}`
+        ]);
+        if (!fetched.ok) {
+          throw new ReviewPublicationDeferredError("review_authority_unavailable", `Unable to fetch live review base: ${fetched.stderr || fetched.stdout}`);
+        }
+        const fetchedBaseSha = await probeAuthoritativeRefSha(`refs/remotes/${runtimeConfig.remote}/${baseBranch}`);
+        assertReviewPublicationBaseUnchanged(reviewPublicationAuthority.baseSha, {
+          ...reviewPublicationAuthority,
+          baseSha: fetchedBaseSha ?? "unknown"
+        });
+        await requireCompletionLease("review-base reconciliation");
+        const prepared = await prepareReviewPublicationCandidate({
+          completionId: completion.id,
+          candidateSha: trustedValidationCandidateSha,
+          baseSha: reviewPublicationAuthority.baseSha,
+          git: validationGit,
+          commitIdentity: await gitOps.getCommitIdentity()
+        });
+        trustedValidationCandidateSha = prepared.candidateSha;
+        if (prepared.baseSha !== prepared.candidateSha)
+          trustedValidationBaselineSha = prepared.baseSha;
+        preparedReviewBaseSha = prepared.baseSha;
+        healthTracker.progress("review_base_reconciled", completion.id);
+        console.log(`[${ts2()}] Review publication prepared candidate ${prepared.candidateSha} against live base ${prepared.baseSha}; hostMerge=${prepared.reconciled}.`);
+      }
       await persistExactValidationCheckpoint();
-      if (!skipValidationForDurableRecovery && completion.trustedValidationCommandsJson && trustedValidationBaselineSha && trustedValidationCandidateSha) {
+      if (isOriginalPrReviewPublication && !skipValidationForDurableRecovery) {
+        validationCommandsJson = resolveReviewPublicationValidationCommands({
+          originalCandidateSha: completion.commitSha,
+          candidateSha: trustedValidationCandidateSha,
+          claimGeneration: completionClaimGeneration,
+          deferredCommandsJson: completion.trustedValidationCommandsJson,
+          fullPlan: completion.reviewValidationPlan
+        });
+      }
+      if (!skipValidationForDurableRecovery && validationCommandsJson && trustedValidationBaselineSha && trustedValidationCandidateSha) {
         const affectedPathDiff = await validationGit([
           "diff",
           "--name-only",
@@ -12934,7 +13371,7 @@ async function tick() {
         console.log(`[${ts2()}] Exact candidate ${trustedValidationCandidateSha?.slice(0, 8)} already has immutable validation-success and publication proof; skipping duplicate validation.`);
       } else {
         await assertValidationWorktree("before trusted validation");
-        if (completion.trustedValidationCommandsJson) {
+        if (validationCommandsJson) {
           healthTracker.progress("trusted_validation", completion.id);
           console.log(`[${ts2()}] Running trusted-environment validation for ${completion.commitSha.slice(0, 8)}...`);
           const logValidationProgress = createTrustedValidationProgressLogger({
@@ -12945,7 +13382,7 @@ async function tick() {
           });
           trustedValidationResults = await runTrustedValidationCommands({
             repoPath: runtimeConfig.repoPath,
-            commandsJson: completion.trustedValidationCommandsJson,
+            commandsJson: validationCommandsJson,
             invariantContext: trustedValidationBaselineSha && trustedValidationCandidateSha ? {
               baseSha: trustedValidationBaselineSha,
               candidateSha: trustedValidationCandidateSha,
@@ -13036,7 +13473,12 @@ async function tick() {
           console.log(`[${ts2()}] Review completion ${completion.id} is already present on ${prHeadBranch}; skipping duplicate branch mutation.`);
         } else if (shouldPublishWithExactReviewLease(reviewPublicationLease)) {
           const prBaseBranch2 = reviewPublicationLease.baseBranch ?? (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
-          if (reviewPublicationLease.expectedBaseSha) {
+          if (isOriginalPrReviewPublication) {
+            reviewPublicationAuthority = await checkOriginalReviewAuthority();
+            if (!preparedReviewBaseSha)
+              throw new Error("Review candidate lacks a prepared live base.");
+            assertReviewPublicationBaseUnchanged(preparedReviewBaseSha, reviewPublicationAuthority);
+          } else if (reviewPublicationLease.expectedBaseSha) {
             const remoteBase = await runGitCapture([
               "-C",
               runtimeConfig.repoPath,
@@ -13048,15 +13490,16 @@ async function tick() {
               throw new Error(`Review base ${prBaseBranch2} moved from expected ${reviewPublicationLease.expectedBaseSha.slice(0, 8)} to ${actualBaseSha.slice(0, 8) || "unknown"}; refusing stale review publication.`);
             }
           }
-          console.log(`[${ts2()}] Publishing reviewed completion ${completion.commitSha.slice(0, 8)} to ${prHeadBranch} with an exact force-with-lease.`);
+          console.log(`[${ts2()}] Publishing validated review candidate ${trustedValidationCandidateSha.slice(0, 8)} to ${prHeadBranch} with the original exact head lease.`);
           await requireCompletionLease(`review branch push ${prHeadBranch}`);
+          originalReviewPushAttempted = isOriginalPrReviewPublication;
           const publication = await publishWithAuthoritativeProof({
             mutate: () => runGitCapture([
               "-C",
               runtimeConfig.repoPath,
               ...buildReviewPublicationPushArgs({
                 remote: runtimeConfig.remote,
-                commitSha: completion.commitSha,
+                commitSha: trustedValidationCandidateSha,
                 lease: reviewPublicationLease
               })
             ], repoRoot),
@@ -13119,7 +13562,8 @@ async function tick() {
         const remoteUrl = remoteUrlResult.stdout.trim();
         const prBaseBranch = (runtimeConfig.prBaseBranch || integrationBaseBranch).trim();
         await requireCompletionLease(`pull request creation for ${prHeadBranch}`);
-        const pr = await ensureIntegrationPullRequest({
+        const originalPr = isOriginalPrReviewPublication ? reviewPublicationAuthority ?? await checkOriginalReviewAuthority(trustedValidationCandidateSha) : null;
+        const pr = originalPr ? { created: false, number: originalPr.prNumber, htmlUrl: originalPr.prUrl } : await ensureIntegrationPullRequest({
           token,
           remoteUrl,
           headBranch: prHeadBranch,
@@ -13128,8 +13572,8 @@ async function tick() {
           body: prBody,
           draft: false
         });
-        if (!pr.created && !publicationAlreadyIntegrated) {
-          reviewAgentForTick?.requestReReview(pr.number, completion.commitSha);
+        if (!pr.created && !skipValidationForDurableRecovery) {
+          reviewAgentForTick?.requestReReview(pr.number, trustedValidationCandidateSha);
         }
         const prMessage = pr.created ? `Opened individual PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}` : `Reused existing PR #${pr.number} for ReviewAgent: ${pr.htmlUrl}`;
         processedPrUrl = pr.htmlUrl;
@@ -13250,6 +13694,8 @@ async function tick() {
         await emitPusherMessage(comm, pushMessage, completion.id, completionEventMeta);
       }
     } catch (err) {
+      let reviewDeferred = err instanceof ReviewPublicationDeferredError ? err : null;
+      let reviewSuperseded = err instanceof ReviewPublicationSupersededError ? err : null;
       const publicationConfirmationPending = err instanceof PublicationConfirmationPendingError;
       const publicationAttemptUncertain = err instanceof PublicationAuthorityUnreachableError;
       let authoritativeReprobe = "absent";
@@ -13280,13 +13726,47 @@ async function tick() {
           console.warn(`[${ts2()}] Could not confirm authoritative publication state for ${completion.id}: ${publicationProbeError instanceof Error ? publicationProbeError.message : String(publicationProbeError)}`);
         }
       }
-      const failureDisposition = publicationFailureDisposition({
+      if (originalReviewPushAttempted && !publicationReadyForFinalization && authoritativeReprobe === "absent") {
+        try {
+          const current = await checkOriginalReviewAuthority();
+          if (preparedReviewBaseSha)
+            assertReviewPublicationBaseUnchanged(preparedReviewBaseSha, current);
+        } catch (authorityError) {
+          if (authorityError instanceof ReviewPublicationSupersededError) {
+            reviewSuperseded = authorityError;
+            err = authorityError;
+          } else if (authorityError instanceof ReviewPublicationDeferredError) {
+            reviewDeferred = authorityError;
+            err = authorityError;
+          }
+        }
+      }
+      let publicationOutcome;
+      if (reviewSuperseded || reviewDeferred?.code === "review_base_conflict" || reviewDeferred?.code === "review_validation_unavailable") {
+        try {
+          publicationOutcome = buildReviewPublicationSettlement({
+            completionId: completion.id,
+            claimGeneration: completionClaimGeneration,
+            lease: reviewPublicationLease,
+            claimedAuthority: completion.reviewPublicationAuthority,
+            superseded: reviewSuperseded,
+            observedAuthority: reviewPublicationAuthority,
+            checkpointPersisted: validationCheckpointPersisted,
+            candidateSha: trustedValidationCandidateSha,
+            candidateRef: trustedValidationCandidateRef,
+            heldCode: reviewDeferred?.code === "review_validation_unavailable" ? "publication_validation_unavailable" : "publication_conflict"
+          });
+        } catch (settlementError) {
+          reviewDeferred = settlementError instanceof ReviewPublicationDeferredError ? settlementError : new ReviewPublicationDeferredError("review_authority_unavailable", String(settlementError));
+        }
+      }
+      const failureDisposition = reviewPublicationFailureDisposition(reviewDeferred, publicationFailureDisposition({
         publicationReadyForFinalization,
         publicationAttemptUncertain,
         publicationConfirmationPending,
         authoritativeReprobe,
         validatedCheckpointRecoveryPending
-      });
+      }));
       if (failureDisposition === "finalize") {
         console.warn(`[${ts2()}] Publication completed for ${completion.id}, but finalization is pending after: ${err.message}. Retaining the completion for idempotent stale-claim recovery.`);
         try {
@@ -13295,9 +13775,21 @@ async function tick() {
           console.warn(`[${ts2()}] Could not emit pending-finalization status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
         }
       } else if (failureDisposition === "reconcile") {
+        if (reviewDeferred)
+          console.warn(`[${ts2()}] reviewPublicationDeferred=${JSON.stringify({
+            event: "review_publication_deferred",
+            code: reviewDeferred.code,
+            completionId: completion.id,
+            jobId: completion.jobId,
+            candidateSha: trustedValidationCandidateSha,
+            candidateRef: trustedValidationCandidateRef,
+            ...reviewDeferred.detail,
+            retry: "next_completion_lease",
+            detail: reviewDeferred.message
+          })}`);
         console.warn(`[${ts2()}] Publication outcome is not yet confirmed for ${completion.id}. Retaining the immutable checkpoint and leaving the completion nonterminal for stale-claim reconciliation.`);
         try {
-          await emitPusherMessage(comm, `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`, completion.id, completionEventMeta);
+          await emitPusherMessage(comm, reviewDeferred ? `Review publication deferred (${reviewDeferred.code}) for ${completion.id.slice(0, 8)}: ${reviewDeferred.message} The candidate is retained for the next host reconciliation; no worker coding retry was dispatched.` : `Publication outcome is temporarily unconfirmed for ${completion.id.slice(0, 8)}. SourceControlManager retained the exact validated checkpoint and will reconcile it on the next authoritative recheck; the job was not marked failed.`, completion.id, completionEventMeta);
         } catch (messageError) {
           console.warn(`[${ts2()}] Could not emit uncertain-publication status for ${completion.id}: ${messageError instanceof Error ? messageError.message : String(messageError)}`);
         }
@@ -13316,6 +13808,7 @@ async function tick() {
                   pusherId,
                   claimToken: completionClaimToken,
                   error: err.message,
+                  publicationOutcome,
                   trustedInstallDurationMs,
                   trustedValidationDurationMs,
                   trustedValidationCacheHit,

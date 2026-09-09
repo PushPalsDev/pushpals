@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -96,6 +97,62 @@ function currentCompletionClaim(
   expect(pusherId).not.toBe("");
   expect(claimToken).not.toBe("");
   return [pusherId, claimToken];
+}
+
+function createReviewPublication(planning?: Record<string, unknown>) {
+  const seeded = createSharedQueues();
+  expect(seeded.jobs.complete(seeded.jobId, { summary: "source candidate published" }).ok).toBe(
+    true,
+  );
+  const reviewAgent = {
+    repositoryIdentity: "https://github.com/example/repo.git",
+    prNumber: 42,
+    prUrl: "https://github.com/example/repo/pull/42",
+    prHeadSha: "a".repeat(40),
+    prBaseSha: "b".repeat(40),
+    resolutionType: "review_fix",
+    sourceJobId: seeded.jobId,
+  };
+  const body = {
+    taskId: "repair-exact-publication",
+    sessionId: "dev",
+    kind: "task.execute",
+    repositoryIdentity: reviewAgent.repositoryIdentity,
+    prUrl: reviewAgent.prUrl,
+    params: { origin: "autonomy", reviewAgent, ...(planning ? { planning } : {}) },
+  };
+  expect(seeded.jobs.authorizeReviewRepairCapability(body).ok).toBe(true);
+  const enqueued = seeded.jobs.enqueue(body, { authorizedElevatedWorkClass: "repair" });
+  expect(enqueued.ok).toBe(true);
+  const jobId = String(enqueued.jobId);
+  expect(seeded.jobs.claim("worker-exact-review").job?.id).toBe(jobId);
+  const handoff = seeded.completions.enqueue(
+    {
+      jobId,
+      sessionId: "dev",
+      commitSha: "c".repeat(40),
+      branch: "refs/pushpals/agent/worker/exact-review",
+      prUrl: reviewAgent.prUrl,
+      message: "retained repair candidate",
+      trustedValidationCommands: ["bun run validate:publish"],
+    },
+    finalizationOptions(seeded.jobs, jobId),
+  );
+  expect(handoff.ok).toBe(true);
+  return { ...seeded, jobId, completionId: String(handoff.completionId), body, reviewAgent };
+}
+
+function exactSupersededOutcome() {
+  return {
+    version: 1,
+    code: "publication_superseded",
+    repositoryIdentity: "git@github.com:example/repo.git",
+    prNumber: 42,
+    expectedHeadSha: "a".repeat(40),
+    expectedBaseSha: "b".repeat(40),
+    observedHeadSha: "d".repeat(40),
+    observedState: "open",
+  };
 }
 
 function trustedValidationReport(options: {
@@ -299,6 +356,595 @@ function expectLegacyDurableOwners(
 }
 
 describe("server CompletionQueue PR URL persistence", () => {
+  test.each(["passing", "retry-passed", "baseline-only", "missing-report", "failed"])(
+    "classifies publication failure from terminal trusted evidence (%s), including SQLite reopen",
+    (scenario) => {
+      let { jobs, completions, jobId, dbPath } = createSharedQueues();
+      try {
+        const handoff = completions.enqueue(
+          {
+            jobId,
+            sessionId: "dev",
+            commitSha: "candidate",
+            branch: "refs/pushpals/agent/evidence",
+            message: "candidate",
+            trustedValidationCommands: ["bun run validate:publish"],
+          },
+          finalizationOptions(jobs, jobId),
+        );
+        const completionId = String(handoff.completionId);
+        const claim = completions.claim("scm-terminal-evidence").completion!;
+        const pass = {
+          ok: true,
+          command: "bun run validate:publish",
+          output: "4 pass, 0 fail",
+          exitCode: 0,
+          durationMs: 20,
+          phase: "validation",
+          attempt: 2,
+        };
+        const fail = {
+          ...pass,
+          ok: false,
+          output: "(fail) intended assertion",
+          exitCode: 1,
+          attempt: 1,
+        };
+        const report =
+          scenario === "missing-report"
+            ? undefined
+            : {
+                version: 1,
+                candidateSha: "candidate",
+                candidateRef: "refs/pushpals/retained/candidate",
+                results:
+                  scenario === "retry-passed"
+                    ? [fail, pass]
+                    : scenario === "baseline-only"
+                      ? [pass, { ...fail, validationTarget: "baseline", attempt: 3 }]
+                      : scenario === "failed"
+                        ? [fail]
+                        : [pass],
+              };
+        expect(
+          completions.markFailedAndBlockJob(
+            completionId,
+            "Git publication rejected after validation",
+            undefined,
+            report,
+            "scm-terminal-evidence",
+            claim.claimToken,
+          ).ok,
+        ).toBe(true);
+        const expected =
+          scenario === "failed"
+            ? {
+                failureClass: "trusted_validation_failed",
+                terminalStage: "trusted_environment_validation",
+              }
+            : { failureClass: "publication_failed", terminalStage: "publication" };
+        expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject(expected);
+        const runs = jobs.getJobDiagnostics(jobId).validationRuns;
+        const db = (jobs as unknown as { db: Database }).db;
+        db.query(
+          "UPDATE job_terminal_diagnostics SET failureClass='incorrect-old-class', terminalStage='incorrect-old-stage' WHERE jobId=?",
+        ).run(jobId);
+        completions.close();
+        jobs.close();
+        jobs = new JobQueue(dbPath);
+        completions = new CompletionQueue(dbPath);
+        expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject(expected);
+        expect(jobs.getJobDiagnostics(jobId).validationRuns).toEqual(runs);
+        expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
+      } finally {
+        completions.close();
+        jobs.close();
+      }
+    },
+  );
+
+  test("three publication claim recoveries preserve the same repair budget and reject stale failures before final success", () => {
+    let { jobs, completions, jobId, completionId, dbPath } = createReviewPublication();
+    const oldClaims: Array<[string, string]> = [];
+    try {
+      for (let generation = 1; generation <= 4; generation++) {
+        const owner = `scm-review-generation-${generation}`;
+        const claim = completions.claim(owner).completion!;
+        expect(claim.id).toBe(completionId);
+        expect(claim.claimGeneration).toBe(generation);
+        for (const [pusherId, token] of oldClaims) {
+          expect(
+            completions.markFailedAndBlockJob(
+              completionId,
+              "stale base failure",
+              undefined,
+              undefined,
+              pusherId,
+              token,
+            ).ok,
+          ).toBe(false);
+        }
+        expect(jobs.reconcileReviewRepairLifecycles()).toMatchObject({ rearmed: 0, exhausted: 0 });
+        expect(jobs.getJob(jobId)).toMatchObject({ status: "finalizing", attempt: 1 });
+        const db = (jobs as unknown as { db: Database }).db;
+        expect(db.query("SELECT attemptCount, activeJobId FROM pr_repair_lifecycle").get()).toEqual(
+          { attemptCount: 1, activeJobId: jobId },
+        );
+        expect(
+          db.query("SELECT COUNT(*) AS count FROM jobs WHERE resumeOfJobId = ?").get(jobId),
+        ).toEqual({ count: 0 });
+        if (generation === 4) {
+          expect(
+            completions.markProcessedAndFinalizeJob(
+              completionId,
+              "https://github.com/example/repo/pull/42",
+              undefined,
+              trustedValidationReport({ ok: true, candidateSha: "c".repeat(40) }),
+              owner,
+              claim.claimToken,
+            ).ok,
+          ).toBe(true);
+          jobs.reconcileReviewRepairLifecycles();
+          expect(jobs.getJob(jobId)?.status).toBe("completed");
+          expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+            failureClass: "success",
+            terminalStage: "publication",
+          });
+          expect(db.query("SELECT status, attemptCount FROM pr_repair_lifecycle").get()).toEqual({
+            status: "succeeded",
+            attemptCount: 1,
+          });
+          expect(
+            (jobs.getJobDiagnostics(jobId).validationRuns as Array<Record<string, unknown>>).every(
+              (run) => run.passed === true,
+            ),
+          ).toBe(true);
+        } else {
+          oldClaims.push([owner, claim.claimToken!]);
+          db.query("UPDATE completions SET leaseExpiresAt=? WHERE id=?").run(
+            new Date(Date.now() - 1000).toISOString(),
+            completionId,
+          );
+          completions.close();
+          jobs.close();
+          jobs = new JobQueue(dbPath);
+          completions = new CompletionQueue(dbPath);
+          expect(completions.getCompletion(completionId)?.status).toBe("pending");
+        }
+      }
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
+  test.each(["open", "closed"])(
+    "exact provider %s supersession abandons the obsolete candidate without exhausting repair after reopen",
+    (observedState) => {
+      let { jobs, completions, jobId, completionId, dbPath, body } = createReviewPublication();
+      try {
+        const claim = completions.claim("scm-superseded").completion!;
+        const outcome = { ...exactSupersededOutcome(), observedState };
+        const result = completions.markFailedAndBlockJob(
+          completionId,
+          "Original PR changed",
+          undefined,
+          trustedValidationReport({ ok: true, candidateSha: "c".repeat(40) }),
+          "scm-superseded",
+          claim.claimToken,
+          outcome,
+        );
+        expect(result).toMatchObject({
+          ok: true,
+          publicationSuperseded: true,
+          jobTransitioned: true,
+        });
+        expect(jobs.getJob(jobId)).toMatchObject({
+          status: "abandoned",
+          publishBlockedAt: null,
+          completedAt: null,
+        });
+        expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+          failureClass: "publication_superseded",
+          terminalStage: "publication",
+        });
+        expect(completions.getCompletion(completionId)).toMatchObject({
+          status: "failed",
+          commitSha: "c".repeat(40),
+        });
+        const db = (jobs as unknown as { db: Database }).db;
+        expect(
+          db.query("SELECT status, attemptCount, activeJobId FROM pr_repair_lifecycle").get(),
+        ).toEqual({ status: "superseded", attemptCount: 1, activeJobId: null });
+        expect(
+          completions.markFailedAndBlockJob(
+            completionId,
+            "replay",
+            undefined,
+            undefined,
+            "scm-superseded",
+            claim.claimToken,
+            outcome,
+          ),
+        ).toMatchObject({ ok: true, jobTransitioned: false });
+        completions.close();
+        jobs.close();
+        jobs = new JobQueue(dbPath);
+        completions = new CompletionQueue(dbPath);
+        expect(jobs.reconcileReviewRepairLifecycles()).toMatchObject({ rearmed: 0, exhausted: 0 });
+        expect(jobs.reviewRepairAdmission(body)).toMatchObject({
+          authorized: false,
+          terminal: true,
+          exhausted: false,
+        });
+        expect(jobs.getJob(jobId)?.status).toBe("abandoned");
+        expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+          failureClass: "publication_superseded",
+        });
+        expect(jobs.getPendingJobs()).toHaveLength(0);
+      } finally {
+        completions.close();
+        jobs.close();
+      }
+    },
+  );
+
+  test("review publication freezes the complete worker plan across partial uploads, claim recovery and database reopen", () => {
+    let { jobs, completions, jobId, completionId, dbPath } = createReviewPublication({
+      requiredValidationSteps: ["bun run validate:contracts"],
+      validationSteps: ["Run bun run typecheck"],
+    });
+    try {
+      let db = (jobs as unknown as { db: Database }).db;
+      const authority = finalizationOptions(jobs, jobId).jobClaimAuthority!;
+      const runs = [
+        { command: "bun test tests/unit.test.ts", attempt: 1, passed: true, exitCode: 0 },
+        { command: "git diff --check", attempt: 1, passed: true, exitCode: 0 },
+      ];
+      expect(
+        jobs.saveJobDiagnostics(jobId, { diagnostics: { validationRuns: runs } }, authority).ok,
+      ).toBe(true);
+      expect(completions.claim("scm-plan").completion?.reviewValidationPlan?.status).toBe(
+        "pending",
+      );
+      expect(db.query("SELECT COUNT(*) AS count FROM job_validation_snapshots").get()).toEqual({
+        count: 0,
+      });
+      expect(
+        jobs.saveJobDiagnostics(
+          jobId,
+          {
+            diagnostics: {
+              validationRuns: [runs[0]],
+              terminal: {
+                terminalStage: "publication_handoff",
+                metadata: { revisionAttempt: 1, validationRuns: 2 },
+              },
+            },
+          },
+          authority,
+        ).ok,
+      ).toBe(true);
+      expect(
+        db.query("SELECT commandsJson FROM job_validation_snapshots WHERE jobId = ?").get(jobId),
+      ).toEqual({ commandsJson: "null" });
+      expect(
+        jobs.saveJobDiagnostics(
+          jobId,
+          {
+            diagnostics: {
+              validationRuns: [
+                {
+                  command: "unsupported earlier experiment",
+                  attempt: 0,
+                  passed: false,
+                  exitCode: 1,
+                },
+                ...runs,
+              ],
+              terminal: {
+                terminalStage: "publication_handoff",
+                metadata: { revisionAttempt: 1, validationRuns: 2 },
+              },
+            },
+          },
+          authority,
+        ).ok,
+      ).toBe(true);
+      db.query(
+        "UPDATE job_validation_snapshots SET claimGeneration = claimGeneration - 1 WHERE jobId = ?",
+      ).run(jobId);
+      db.query(
+        "UPDATE completions SET leaseExpiresAt = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+      ).run(completionId);
+      expect(completions.claim("scm-plan").completion?.reviewValidationPlan?.status).toBe(
+        "pending",
+      );
+      db.query("UPDATE job_validation_snapshots SET claimGeneration = ? WHERE jobId = ?").run(
+        authority.claimGeneration,
+        jobId,
+      );
+      db.query(
+        "UPDATE completions SET leaseExpiresAt = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+      ).run(completionId);
+      const expectedPlan = {
+        version: 1,
+        status: "ready",
+        commands: [
+          "bun run validate:contracts",
+          "bun run typecheck",
+          "bun test tests/unit.test.ts",
+          "git diff --check",
+          "bun run validate:publish",
+        ],
+      };
+      expect(completions.claim("scm-plan").completion?.reviewValidationPlan).toEqual(expectedPlan);
+      // A later smaller diagnostic upload cannot remove already-passed gates
+      // from the immutable candidate's trusted-host revalidation contract.
+      expect(
+        jobs.saveJobDiagnostics(
+          jobId,
+          {
+            diagnostics: {
+              validationRuns: [runs[1]],
+              terminal: { terminalStage: "publication_handoff" },
+            },
+          },
+          authority,
+        ).ok,
+      ).toBe(true);
+      db.query(
+        "UPDATE completions SET leaseExpiresAt = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+      ).run(completionId);
+      completions.close();
+      jobs.close();
+      jobs = new JobQueue(dbPath);
+      completions = new CompletionQueue(dbPath);
+      db = (jobs as unknown as { db: Database }).db;
+      const resumed = completions.claim("scm-plan").completion!;
+      expect(resumed.reviewValidationPlan).toEqual(expectedPlan);
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "Fresh candidate unit gate failed",
+          undefined,
+          trustedValidationReport({
+            ok: false,
+            command: runs[0].command,
+            candidateSha: "f".repeat(40),
+          }),
+          "scm-plan",
+          resumed.claimToken,
+        ).ok,
+      ).toBe(true);
+      expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+        failureClass: "trusted_validation_failed",
+        terminalStage: "trusted_environment_validation",
+      });
+      expect(
+        db
+          .query(
+            `SELECT command FROM job_validation_runs WHERE jobId = ?
+        AND json_extract(metadataJson, '$.source') = 'trusted_host'`,
+          )
+          .all(jobId),
+      ).toEqual([{ command: runs[0].command }]);
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
+  test.each(["publication_conflict", "publication_validation_unavailable"])(
+    "typed %s holds only the attempted fresh base and retains evidence without blocking unrelated completions",
+    (code) => {
+      let { jobs, completions, jobId, completionId, dbPath } = createReviewPublication();
+      try {
+        const claim = completions.claim("scm-held").completion!;
+        const candidateRef = `refs/pushpals/validation/${createHash("sha256").update(completionId).digest("hex").slice(0, 32)}/${claim.claimGeneration}/candidate`;
+        const outcome = {
+          ...exactSupersededOutcome(),
+          code,
+          observedState: "open",
+          observedHeadSha: "a".repeat(40),
+          observedBaseSha: "e".repeat(40),
+          retainedCandidateSha: "f".repeat(40),
+          retainedCandidateRef: candidateRef,
+        };
+        const report = {
+          version: 1,
+          baselineSha: "baseline-sha",
+          candidateSha: outcome.retainedCandidateSha,
+          candidateRef,
+          results: [
+            {
+              ok: false,
+              command: "bun run validate:publish",
+              output: "error: network connection reset",
+              exitCode: 1,
+              durationMs: 10,
+              phase: "validation",
+              attempt: 1,
+            },
+            {
+              ok: true,
+              command: "bun run validate:publish",
+              output: "4 pass, 0 fail",
+              exitCode: 0,
+              durationMs: 10,
+              phase: "validation",
+              attempt: 2,
+            },
+          ],
+        };
+        expect(
+          completions.markFailedAndBlockJob(
+            completionId,
+            "Exact retained candidate conflicts with current base",
+            undefined,
+            report,
+            "scm-held",
+            claim.claimToken,
+            outcome,
+          ),
+        ).toMatchObject({ ok: true, publicationHeld: true });
+        const db = (jobs as unknown as { db: Database }).db;
+        expect(
+          db
+            .query(
+              "SELECT status, attemptCount, baseSha, heldBaseSha, activeJobId FROM pr_repair_lifecycle",
+            )
+            .get(),
+        ).toEqual({
+          status: "held",
+          attemptCount: 1,
+          baseSha: "b".repeat(40),
+          heldBaseSha: "e".repeat(40),
+          activeJobId: null,
+        });
+        expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
+        expect(completions.publicationBacklogSummary().backlog).toBe(0);
+        const retained = completions.getCompletion(completionId)?.error;
+        expect(JSON.parse(String(retained)).publicationOutcome).toMatchObject({
+          ...outcome,
+          repositoryIdentity: "github.com/example/repo",
+        });
+        completions.close();
+        jobs.close();
+        jobs = new JobQueue(dbPath);
+        completions = new CompletionQueue(dbPath);
+        expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+          failureClass: code,
+          terminalStage: "publication",
+        });
+        expect(jobs.reconcileReviewRepairLifecycles()).toMatchObject({ rearmed: 0, exhausted: 0 });
+        expect(
+          jobs.getReviewRepairLifecycleState({
+            repositoryIdentity: "github.com/example/repo",
+            prNumber: 42,
+            headSha: "a".repeat(40),
+            baseSha: "e".repeat(40),
+          }).state,
+        ).toBe("held");
+        const other = enqueueClaimedJob(jobs, "unrelated-after-held-conflict");
+        const handoff = completions.enqueue(
+          {
+            jobId: other,
+            sessionId: "dev",
+            message: "unrelated candidate",
+            commitSha: "9".repeat(40),
+            branch: "refs/pushpals/agent/other",
+            trustedValidationCommands: ["bun run validate:publish"],
+          },
+          finalizationOptions(jobs, other),
+        );
+        const nextClaim = completions.claim("scm-unrelated").completion!;
+        expect(nextClaim.id).toBe(handoff.completionId);
+        const published = completions.markProcessedAndFinalizeJob(
+          nextClaim.id,
+          "https://github.com/example/repo/pull/43",
+          undefined,
+          trustedValidationReport({ ok: true, candidateSha: "9".repeat(40) }),
+          "scm-unrelated",
+          nextClaim.claimToken,
+        );
+        expect(published.ok).toBe(true);
+        expect(published.requeuedJobIds).toBeUndefined();
+        expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
+        completions.close();
+        jobs.close();
+        jobs = new JobQueue(dbPath);
+        completions = new CompletionQueue(dbPath);
+        expect(jobs.getJob(jobId)?.status).toBe("publish_blocked");
+        expect(completions.getCompletion(completionId)?.status).toBe("failed");
+        expect(jobs.getJobDiagnostics(jobId).terminal).toMatchObject({
+          failureClass: code,
+        });
+        expect(completions.publicationBacklogSummary().backlog).toBe(0);
+      } finally {
+        completions.close();
+        jobs.close();
+      }
+    },
+  );
+
+  test("typed publication dispositions reject malformed or wrong tuples, unretained checkpoints, and newer lifecycle owners", () => {
+    const { jobs, completions, jobId, completionId } = createReviewPublication();
+    try {
+      const claim = completions.claim("scm-invalid-disposition").completion!;
+      const outcome = exactSupersededOutcome();
+      for (const patch of [
+        { version: 2 },
+        { code: ["publication_superseded"] },
+        { prNumber: "42" },
+        { repositoryIdentity: "github.com/other/repo" },
+        { expectedHeadSha: "f".repeat(40) },
+        { expectedBaseSha: "e".repeat(40) },
+        { observedState: "closed", observedHeadSha: "" },
+        { observedState: "closed", observedHeadSha: "not-a-sha" },
+        { observedState: "open", observedHeadSha: "a".repeat(40) },
+      ]) {
+        expect(
+          completions.markFailedAndBlockJob(
+            completionId,
+            "must preserve ownership",
+            undefined,
+            undefined,
+            "scm-invalid-disposition",
+            claim.claimToken,
+            { ...outcome, ...patch },
+          ).ok,
+        ).toBe(false);
+      }
+      const conflict = {
+        ...outcome,
+        code: "publication_conflict",
+        observedHeadSha: "a".repeat(40),
+        observedBaseSha: "e".repeat(40),
+        retainedCandidateSha: "f".repeat(40),
+        retainedCandidateRef: "refs/pushpals/validation/wrong/1/candidate",
+      };
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "wrong checkpoint",
+          undefined,
+          {
+            version: 1,
+            candidateSha: conflict.retainedCandidateSha,
+            candidateRef: conflict.retainedCandidateRef,
+            results: [],
+          },
+          "scm-invalid-disposition",
+          claim.claimToken,
+          conflict,
+        ).ok,
+      ).toBe(false);
+      const db = (jobs as unknown as { db: Database }).db;
+      db.query("UPDATE pr_repair_lifecycle SET activeJobId='newer-owner'").run();
+      expect(
+        completions.markFailedAndBlockJob(
+          completionId,
+          "obsolete owner",
+          undefined,
+          undefined,
+          "scm-invalid-disposition",
+          claim.claimToken,
+          outcome,
+        ).ok,
+      ).toBe(false);
+      expect(jobs.getJob(jobId)?.status).toBe("finalizing");
+      expect(completions.getCompletion(completionId)?.status).toBe("claimed");
+      expect(db.query("SELECT attemptCount, activeJobId FROM pr_repair_lifecycle").get()).toEqual({
+        attemptCount: 1,
+        activeJobId: "newer-owner",
+      });
+    } finally {
+      completions.close();
+      jobs.close();
+    }
+  });
+
   test("keeps a handed-off candidate nonterminal until publication succeeds", () => {
     const { jobs, completions, jobId } = createSharedQueues();
     const handoff = completions.enqueue(

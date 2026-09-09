@@ -67,6 +67,7 @@ const phases: HarnessPhase[] = [
   {
     name: "repair_orchestration",
     files: [
+      "tests/shared.review-publication-validation.test.ts",
       "tests/remotebuddy.autonomous-engine.tick.test.ts",
       "tests/source-control-manager.bounded-process.test.ts",
       "tests/source-control-manager.completion-callback.test.ts",
@@ -78,6 +79,8 @@ const phases: HarnessPhase[] = [
       "tests/source-control-manager.publication-recovery.test.ts",
       "tests/source-control-manager.review-agent.test.ts",
       "tests/source-control-manager.review-journal.test.ts",
+      "tests/source-control-manager.review-publication.test.ts",
+      "tests/source-control-manager.review-publication-recovery.test.ts",
       "tests/source-control-manager.runtime-helpers.test.ts",
       "tests/source-control-manager.validation-repair-publication.test.ts",
       "tests/workerpals.review-fix-branch.test.ts",

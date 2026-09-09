@@ -2342,9 +2342,11 @@ export function createRequestHandler() {
           return makeJson(
             {
               ok: false,
-              code: recoveryAuthority.repairAdmission.exhausted
-                ? "review_repair_lifecycle_exhausted"
-                : "review_repair_lifecycle_settled",
+              code: recoveryAuthority.repairAdmission.held
+                ? "review_repair_lifecycle_held"
+                : recoveryAuthority.repairAdmission.exhausted
+                  ? "review_repair_lifecycle_exhausted"
+                  : "review_repair_lifecycle_settled",
               message: recoveryAuthority.repairAdmission.reason,
             },
             409,
@@ -3921,9 +3923,11 @@ export function createRequestHandler() {
           return makeJson(
             {
               ok: false,
-              code: recoveryAuthority.repairAdmission.exhausted
-                ? "review_repair_lifecycle_exhausted"
-                : "review_repair_lifecycle_settled",
+              code: recoveryAuthority.repairAdmission.held
+                ? "review_repair_lifecycle_held"
+                : recoveryAuthority.repairAdmission.exhausted
+                  ? "review_repair_lifecycle_exhausted"
+                  : "review_repair_lifecycle_settled",
               message: recoveryAuthority.repairAdmission.reason,
             },
             409,
@@ -4450,6 +4454,32 @@ export function createRequestHandler() {
         const result = completionQueue.claim(pusherId, {
           leaseMs: typeof body.leaseMs === "number" ? body.leaseMs : undefined,
         });
+        if (result.completion) {
+          const parent = jobQueue.getJob(result.completion.jobId);
+          const params = parseJsonRecord(parent?.params ?? "");
+          const review = params.reviewAgent;
+          if (review && typeof review === "object" && !Array.isArray(review)) {
+            const record = review as Record<string, unknown>;
+            if (
+              typeof record.repositoryIdentity === "string" &&
+              Number.isSafeInteger(record.prNumber) &&
+              Number(record.prNumber) > 0 &&
+              typeof record.prHeadSha === "string" &&
+              typeof record.prBaseSha === "string" &&
+              /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record.prHeadSha) &&
+              /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(record.prBaseSha) &&
+              (record.resolutionType === "review_fix" || record.resolutionType === "merge_conflict")
+            ) {
+              result.completion.reviewPublicationAuthority = {
+                repositoryIdentity: record.repositoryIdentity,
+                prNumber: record.prNumber as number,
+                expectedHeadSha: record.prHeadSha,
+                expectedBaseSha: record.prBaseSha,
+                resolutionType: record.resolutionType,
+              };
+            }
+          }
+        }
         return makeJson(result, result.ok ? 200 : 404);
       }
 
@@ -4593,7 +4623,32 @@ export function createRequestHandler() {
           body.trustedValidationReport,
           pusherId,
           claimToken,
+          body.publicationOutcome,
         );
+        if (
+          result.ok &&
+          result.jobTransitioned &&
+          result.jobId &&
+          (result.publicationSuperseded || result.publicationHeld)
+        ) {
+          const job = jobQueue.getJob(result.jobId);
+          const message = result.publicationSuperseded
+            ? `Job ${result.jobId} publication was superseded; its obsolete repair was settled without a code-quality retry.`
+            : `Job ${result.jobId} publication is held for explicit resolution; its candidate is retained and unrelated publication may continue.`;
+          if (job?.sessionId) {
+            sessionManager.getSession(job.sessionId)?.emit({
+              protocolVersion: PROTOCOL_VERSION,
+              id: randomUUID(),
+              ts: new Date().toISOString(),
+              sessionId: job.sessionId,
+              type: "log",
+              from: "server:completion-publication-disposition",
+              payload: { level: result.publicationHeld ? "warn" : "info", message },
+            });
+          }
+          console.log(`[Server] ${message}`);
+          return makeJson(result, 200);
+        }
         if (result.ok && result.jobTransitioned && result.jobId) {
           jobQueue.reconcileReviewRepairLifecycles();
           const job = jobQueue.getJob(result.jobId);

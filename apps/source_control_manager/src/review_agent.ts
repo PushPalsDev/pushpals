@@ -25,6 +25,7 @@ import {
   deleteBranchRef,
   type DeleteBranchRefResult,
   getCommitMessage,
+  getBranchHeadSha,
   getPullRequest,
   listPullRequestComments,
   getPullRequestCommitMessage,
@@ -129,7 +130,7 @@ export async function listPersistedPrLinks(opts: {
 }
 
 type ReviewLifecycleState = {
-  state: "none" | "active" | "exhausted" | "settled";
+  state: "none" | "active" | "exhausted" | "settled" | "held";
   activeJobId: string | null;
   detail: string;
 };
@@ -143,6 +144,7 @@ interface ReviewAgentDeps {
   listOpenPullRequests: typeof listOpenPullRequests;
   listRecentlyClosedPullRequests: typeof listRecentlyClosedPullRequests;
   getPullRequest: typeof getPullRequest;
+  getBranchHeadSha: typeof getBranchHeadSha;
   listPersistedPrLinks: typeof listPersistedPrLinks;
   getPullRequestDiff: typeof getPullRequestDiff;
   getCommitMessage: typeof getCommitMessage;
@@ -223,6 +225,7 @@ const DEFAULT_DEPS: ReviewAgentDeps = {
   listOpenPullRequests,
   listRecentlyClosedPullRequests,
   getPullRequest,
+  getBranchHeadSha,
   listPersistedPrLinks,
   getPullRequestDiff,
   getCommitMessage,
@@ -1612,17 +1615,36 @@ export class ReviewAgent {
             remoteUrl: this.remoteUrl,
             prNumber: pr.number,
           })
-          .then(
-            (latest) =>
-              latest.state === "open" &&
-              this.reviewDecisionKey(latest) === this.reviewDecisionKey(pr),
-          );
+          .then(async (latest) => {
+            if (latest.state !== "open" || latest.base.ref !== pr.base.ref) return false;
+            const targetBaseSha = await this.currentTargetBaseSha(latest.base.ref);
+            return (
+              this.reviewDecisionKey(this.withTargetBaseSha(latest, targetBaseSha)) ===
+              this.reviewDecisionKey(pr)
+            );
+          });
     this.assertReviewPolicyUnchanged(pr);
     if (!current)
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] PR #${pr.number} changed or closed during review; refusing stale side effects.`,
       );
     return current;
+  }
+
+  private currentTargetBaseSha(branchRef: string): Promise<string> {
+    return this.deps.getBranchHeadSha({
+      token: this.githubToken,
+      remoteUrl: this.remoteUrl,
+      branchRef,
+      fetchImpl: this.deps.fetchImpl,
+    });
+  }
+
+  private withTargetBaseSha(pr: GitHubPR, targetBaseSha: string): GitHubPR {
+    // Do not mutate provider list/diff metadata: a PR's comparison base may be
+    // historical. All decision, lifecycle and dispatch identities in this
+    // cloned review snapshot instead bind the current target branch head.
+    return { ...pr, head: { ...pr.head }, base: { ...pr.base, sha: targetBaseSha } };
   }
 
   private async reviewLifecycleForPr(pr: GitHubPR): Promise<ReviewLifecycleState> {
@@ -1642,7 +1664,7 @@ export class ReviewAgent {
       !payload ||
       payload.ok !== true ||
       typeof payload.state !== "string" ||
-      !["none", "active", "exhausted", "settled"].includes(payload.state)
+      !["none", "active", "exhausted", "settled", "held"].includes(payload.state)
     ) {
       throw new Error("Review lifecycle authority returned an invalid response");
     }
@@ -2040,7 +2062,19 @@ export class ReviewAgent {
         return;
       }
 
+      if (!prs.length) return;
+      let targetBaseSha: string;
+      try {
+        targetBaseSha = await this.currentTargetBaseSha(this.prBaseBranch);
+      } catch (err: any) {
+        this.deps.logWarn(
+          `[${ts()}] [ReviewAgent] Target branch authority unavailable for ${this.prBaseBranch}; deferring reviews and repairs: ${err?.message ?? err}`,
+        );
+        return;
+      }
       const eligible = prs
+        .filter((pr) => pr.base.ref === this.prBaseBranch)
+        .map((pr) => this.withTargetBaseSha(pr, targetBaseSha))
         .filter((pr) => {
           const key = this.reviewDecisionKey(pr);
           this.loadReviewDecision(pr, key);
@@ -2215,7 +2249,11 @@ export class ReviewAgent {
     }
 
     const lifecycle = await this.reviewLifecycleForPr(pr);
-    if (lifecycle.state === "active" || lifecycle.state === "settled") {
+    if (
+      lifecycle.state === "active" ||
+      lifecycle.state === "settled" ||
+      lifecycle.state === "held"
+    ) {
       this.deps.logInfo(
         `[${ts()}] [ReviewAgent] Deferring PR #${pr.number}: durable repair lifecycle is ${lifecycle.state}${lifecycle.activeJobId ? ` (${lifecycle.activeJobId})` : ""}.`,
       );
@@ -2726,6 +2764,10 @@ export class ReviewAgent {
         feedbackVerdict: "rejected_re_review_cap_closed",
         feedbackSummarySuffix: "closed after the durable repair lifecycle exhausted its attempts.",
       });
+    }
+    if (enqueued === "held") {
+      this.awaitingRepairPrs.add(pr.number);
+      return false;
     }
     if (enqueued === "settled") return acknowledgeRejection();
     if (enqueued !== "enqueued") {
@@ -3242,7 +3284,7 @@ export class ReviewAgent {
     diff: string,
     excludedBodies: string[] = [],
     prefetchedComments?: PullRequestComment[],
-  ): Promise<"enqueued" | "retryable" | "exhausted" | "settled"> {
+  ): Promise<"enqueued" | "retryable" | "exhausted" | "settled" | "held"> {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
     const reviewGuidance = deriveReviewGuidance(verdict);
     const rejectionReasoning = reviewGuidance.items;
@@ -3384,6 +3426,7 @@ export class ReviewAgent {
           }
           if (code === "review_repair_lifecycle_exhausted") return "exhausted";
           if (code === "review_repair_lifecycle_settled") return "settled";
+          if (code === "review_repair_lifecycle_held") return "held";
         }
         throw new Error(`HTTP ${response.status}: ${text}`);
       }

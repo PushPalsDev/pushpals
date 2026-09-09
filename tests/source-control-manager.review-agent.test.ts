@@ -74,6 +74,7 @@ const silentLogs = {
   findActiveRepair: async () => null,
   findReviewLifecycle: async () => ({ state: "none" as const, activeJobId: null, detail: "" }),
   isReviewRevisionCurrent: async () => true,
+  getBranchHeadSha: async () => "ffff1111",
   logInfo: () => {},
   logWarn: () => {},
   logError: () => {},
@@ -2171,6 +2172,7 @@ describe("ReviewAgent", () => {
       undefined,
       {
         ...silentLogs,
+        getBranchHeadSha: async () => baseSha,
         findActiveRepair: async () => (enqueuedDedupeKeys.length >= 2 ? "new-base-repair" : null),
         listOpenPullRequests: async () => [
           makePr({

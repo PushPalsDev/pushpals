@@ -127,6 +127,9 @@ jobs:
           tests/source-control-manager.runtime-helpers.test.ts
           tests/source-control-manager.review-agent.test.ts
           tests/source-control-manager.review-journal.test.ts
+          tests/source-control-manager.review-publication.test.ts
+          tests/source-control-manager.review-publication-recovery.test.ts
+          tests/shared.review-publication-validation.test.ts
           tests/source-control-manager.github-pr.test.ts
 
       - name: Verify isolated Windows source-only runtime startup

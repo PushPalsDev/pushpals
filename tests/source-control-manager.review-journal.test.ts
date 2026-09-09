@@ -45,12 +45,15 @@ class ReviewHarness {
   malformedScan = false;
   pendingScans = 0;
   activateOnPendingScan = 0;
-  lifecycleState: "none" | "active" | "exhausted" | "settled" = "none";
+  lifecycleState: "none" | "active" | "exhausted" | "settled" | "held" = "none";
   lifecycleStatus = 200;
   malformedLifecycle = false;
   lifecycleStateOverride: unknown = undefined;
   beforeReview: (() => void) | null = null;
   beforeProviderProbe: (() => void) | null = null;
+  targetBaseSha: string | null = null;
+  targetLookupFailure = false;
+  targetLookups = 0;
   mergedExpectedHead: string | undefined;
   score = 7.8;
   pr: GitHubPR = {
@@ -92,6 +95,12 @@ class ReviewHarness {
         getPullRequest: async () => {
           this.beforeProviderProbe?.();
           return structuredClone(this.pr);
+        },
+        getBranchHeadSha: async ({ branchRef }) => {
+          this.targetLookups++;
+          expect(branchRef).toBe(this.pr.base.ref);
+          if (this.targetLookupFailure) throw new Error("target ref unavailable");
+          return this.targetBaseSha ?? this.pr.base.sha;
         },
         listRecentlyClosedPullRequests: async () => [],
         listPersistedPrLinks: async () => ({ links: [], nextCursor: null }),
@@ -212,8 +221,9 @@ class ReviewHarness {
                 { status: this.admissionStatus },
               );
             this.activeStatus = "pending";
-            this.repairHead = this.pr.head.sha;
-            this.repairBase = this.pr.base.sha;
+            const request = JSON.parse(String(init?.body));
+            this.repairHead = request.params.reviewAgent.prHeadSha;
+            this.repairBase = request.params.reviewAgent.prBaseSha;
             this.repairResolutionType = JSON.parse(
               String(init?.body),
             ).params.reviewAgent.resolutionType;
@@ -246,6 +256,117 @@ class ReviewHarness {
 }
 
 describe("durable PR review journal and repair ownership", () => {
+  test.each(["head", "base"] as const)(
+    "held conflict on a fresh observed base blocks unchanged review without closing, then permits a changed %s",
+    async (changed) => {
+      const h = new ReviewHarness();
+      try {
+        h.lifecycleState = "held";
+        h.targetBaseSha = "d".repeat(40);
+        h.repairBase = h.targetBaseSha;
+        h.score = 9.9;
+        await h.agent().poll();
+        h.reopen();
+        const restarted = h.agent();
+        restarted.requestReReview(h.pr.number, h.pr.head.sha);
+        await restarted.poll();
+        expect(h.reviewCalls).toBe(0);
+        expect(h.enqueueCalls).toBe(0);
+        expect(h.closeCalls).toBe(0);
+        expect(h.mergeCalls).toBe(0);
+        if (changed === "head") h.pr.head.sha = "e".repeat(40);
+        else h.targetBaseSha = "f".repeat(40);
+        await restarted.poll();
+        expect(h.reviewCalls).toBe(1);
+        expect(h.mergeCalls).toBe(1);
+        expect(h.closeCalls).toBe(0);
+      } finally {
+        h.cleanup();
+      }
+    },
+  );
+
+  test.each([false, true])(
+    "repair dispatch uses the live target head instead of historical PR base (conflict=%s)",
+    async (conflict) => {
+      const h = new ReviewHarness();
+      try {
+        const historicalBase = h.pr.base.sha;
+        h.targetBaseSha = "d".repeat(40);
+        h.score = conflict ? 9.4 : 7.8;
+        h.mergeConflict = conflict;
+        await h.agent().poll();
+        expect(h.reviewCalls).toBe(1);
+        expect(h.enqueueCalls).toBe(1);
+        expect(h.repairBase).toBe(h.targetBaseSha);
+        expect(h.pr.base.sha).toBe(historicalBase);
+        h.reopen();
+        h.score = 9.9;
+        await h.agent().poll();
+        expect(h.reviewCalls).toBe(1);
+        expect(h.enqueueCalls).toBe(1);
+      } finally {
+        h.cleanup();
+      }
+    },
+  );
+
+  test("target head advance invalidates only the old review while PR comparison metadata stays unchanged", async () => {
+    const h = new ReviewHarness();
+    try {
+      h.admissionStatus = 503;
+      const historicalBase = h.pr.base.sha;
+      await h.agent().poll();
+      h.reopen();
+      h.targetBaseSha = "d".repeat(40);
+      h.admissionStatus = 200;
+      await h.agent().poll();
+      expect(h.reviewCalls).toBe(2);
+      expect(h.repairBase).toBe(h.targetBaseSha);
+      expect(h.pr.base.sha).toBe(historicalBase);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test.each([false, true])(
+    "target movement during model execution blocks stale side effects (approval=%s)",
+    async (approval) => {
+      const h = new ReviewHarness();
+      try {
+        h.score = approval ? 9.9 : 7.8;
+        h.beforeReview = () => {
+          h.targetBaseSha = "d".repeat(40);
+        };
+        await h.agent().poll();
+        expect(h.reviewCalls).toBe(1);
+        expect(h.enqueueCalls).toBe(0);
+        expect(h.mergeCalls).toBe(0);
+        expect(h.closeCalls).toBe(0);
+      } finally {
+        h.cleanup();
+      }
+    },
+  );
+
+  test("target lookup failure defers review without storing an invented decision", async () => {
+    const h = new ReviewHarness();
+    try {
+      h.targetLookupFailure = true;
+      await h.agent().poll();
+      expect(h.reviewCalls).toBe(0);
+      expect(h.enqueueCalls).toBe(0);
+      expect(h.mergeCalls).toBe(0);
+      expect(h.closeCalls).toBe(0);
+      h.targetLookupFailure = false;
+      await h.agent().poll();
+      expect(h.reviewCalls).toBe(1);
+      expect(h.enqueueCalls).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test.each(["pending", "claimed", "finalizing"] as const)(
     "an approved merge-conflict repair remains nonterminal while %s and closes after exhaustion across restart",
     async (status) => {

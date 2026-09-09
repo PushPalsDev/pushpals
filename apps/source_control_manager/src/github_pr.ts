@@ -470,6 +470,55 @@ export async function getPullRequest(opts: {
   return (await response.json()) as GitHubPR;
 }
 
+/** Resolve the current target ref, independently of the PR comparison base.
+ * Missing, ambiguous or malformed authority is not a license to use a cached
+ * base SHA for a repair lease or publication check. */
+export async function getBranchHeadSha(opts: {
+  token: string;
+  remoteUrl: string;
+  branchRef: string;
+  fetchImpl?: FetchLike;
+}): Promise<string> {
+  const repo = parseGitHubRepo(opts.remoteUrl);
+  if (!repo) throw new Error(`Remote URL is not a supported GitHub URL: ${opts.remoteUrl}`);
+  const branch = String(opts.branchRef ?? "")
+    .trim()
+    .replace(/^refs\/heads\//, "");
+  if (
+    !branch ||
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    /[\s\x00-\x1f\x7f~^:?*\[\\]|\.\.|@\{|\/\/|(?:^|\/)\.|\.lock(?:\/|$)|\.$/.test(branch)
+  ) {
+    throw new Error("branchRef must identify an exact valid branch");
+  }
+  const ref = `refs/heads/${branch}`;
+  const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const response = await githubFetch(
+    url,
+    {
+      method: "GET",
+      headers: githubHeaders(opts.token),
+    },
+    opts.fetchImpl,
+  );
+  if (!response.ok) throw githubError(response.status, await response.text());
+  const payload = (await response.json().catch(() => null)) as {
+    ref?: unknown;
+    object?: { type?: unknown; sha?: unknown };
+  } | null;
+  if (
+    !payload ||
+    payload.ref !== ref ||
+    payload.object?.type !== "commit" ||
+    typeof payload.object.sha !== "string" ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(payload.object.sha)
+  ) {
+    throw new Error(`GitHub returned an invalid commit head for ${ref}`);
+  }
+  return payload.object.sha.toLowerCase();
+}
+
 export async function getPullRequestDiff(opts: {
   token: string;
   remoteUrl: string;
