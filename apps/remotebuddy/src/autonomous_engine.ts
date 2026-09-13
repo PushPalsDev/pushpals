@@ -2225,6 +2225,7 @@ function chooseRepoObjectiveTargetProfile(
 ): RepoTargetProfile | null {
   if (profiles.length === 0) return null;
   const hintTokens = visionMatchTokens([...objective.keywords, objective.title].join(" "));
+  const domainTokens = visionMatchTokens(objective.title);
   const categories = new Set<AutonomyObjectiveCategory>([
     objective.category,
     ...objective.secondary_categories,
@@ -2242,6 +2243,19 @@ function chooseRepoObjectiveTargetProfile(
   for (const profile of profiles) {
     const label = profile.label.toLowerCase();
     const profileTokens = new Set(profile.keywords);
+    const domainProfileTokens = new Set(
+      visionMatchTokens([profile.label, ...profile.keywords].join(" ")),
+    );
+    // Surface/category bonuses are ranking hints, not evidence that this file
+    // owns the requested behavior. Never fall through to unrelated source or
+    // a fixture just because better targets are busy or cooling down.
+    if (!domainTokens.some((token) => domainProfileTokens.has(token))) continue;
+    if (
+      objective.category !== "validation" &&
+      /(?:^|\/)(?:__fixtures__|fixtures|testdata|__mocks__|mocks)(?:\/|$)/i.test(label)
+    ) {
+      continue;
+    }
     let score = 0;
     for (const token of hintTokens) {
       if (profileTokens.has(token)) score += 3;
@@ -3402,7 +3416,11 @@ function isPriorityContainerVisionSectionTitle(value: string): boolean {
 }
 
 function actionablePriorityProse(markdown: string): string[] {
-  const blocks = asString(markdown)
+  // Subsections have their own scope (including exclusions). Their lists are
+  // extracted by the shared vision parser; do not reinterpret nested examples
+  // or non-goals as prose instructions owned by this priority heading.
+  const ownProse = asString(markdown).split(/(?:^|\r?\n)(?=#{1,6}\s)/, 1)[0];
+  const blocks = ownProse
     .replace(/```[\s\S]*?```/g, " ")
     .split(/(?:\r?\n){2,}|\r?\n(?=\s*(?:[-*+] |\d+[.)]\s+))/g)
     .flatMap((block) => block.split(/(?<=[.!?])\s+(?=[A-Z])/g))
@@ -5992,7 +6010,7 @@ export function buildRepoVisionFallbackCandidates(params: {
       excludedTargetPaths: [...asStringArray(params.excludedTargetPaths), ...selectedTargetPaths],
       avoidedComponentAreas: selectedComponentAreas,
     });
-    if ((params.repoTargets?.length ?? 0) > 0 && !target) continue;
+    if (!target) continue;
     const targetPaths = target?.target_paths ?? [objective.section_ref ? "vision.md" : "README.md"];
     if (
       selected.length > 0 &&
@@ -7391,6 +7409,8 @@ export class RemoteBuddyAutonomousEngine {
             "Do not infer the project ecosystem from PushPals itself or from generic defaults.",
             "The host will independently enforce scope, risk, cooldown, and command policy.",
             "Use the exact candidateEnums values, not vision_priority, normal risk, or estimates measured in days. Select one bounded implementation slice executable in a worker job.",
+            "Honor explicit priorities in their listed order before general success metrics; non-goals and excluded scope are prohibitions, never objectives.",
+            "Return data.candidates=[] when evidence does not establish unfinished, actionable work. A desired outcome or matching filename alone is not evidence of a defect.",
           ],
         },
         runtimeSignals: {
@@ -7446,7 +7466,7 @@ export class RemoteBuddyAutonomousEngine {
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
       if (candidates.length === 0) {
         console.warn(
-          `[RemoteBuddyAutonomousEngine] RepositoryAgent returned no structured candidates for ${params.runId}; using deterministic repo-vision fallback without another model call.`,
+          `[RemoteBuddyAutonomousEngine] RepositoryAgent returned no grounded candidates for ${params.runId}; recording an empty planning cycle without inventing implementation work.`,
         );
       }
       const response = { candidates };
@@ -7494,7 +7514,7 @@ export class RemoteBuddyAutonomousEngine {
       };
     } catch (error) {
       console.warn(
-        `[RemoteBuddyAutonomousEngine] RepositoryAgent ideation unavailable for ${params.runId}; using deterministic repo-vision fallback without another model call: ${error instanceof Error ? error.message : String(error)}`,
+        `[RemoteBuddyAutonomousEngine] RepositoryAgent ideation unavailable for ${params.runId}; deferring implementation dispatch until grounded analysis is available: ${error instanceof Error ? error.message : String(error)}`,
       );
       return deterministicFallbackPhase(error instanceof Error ? error.message : String(error));
     } finally {
@@ -8756,6 +8776,13 @@ export class RemoteBuddyAutonomousEngine {
         return;
       }
       const repositoryAgentResult = repositoryAgentPhase?.result ?? null;
+      // RepositoryAgent owns repository-specific recommendations. An explicit
+      // empty result, unavailable analysis, or rejected/exhausted candidates
+      // are not authorization to manufacture work from a filename and a vision
+      // title. The same rule forbids replacing grounded suggestions with
+      // synthetic higher-ranked "portfolio" tasks. Legacy installations with
+      // no RepositoryAgent retain their existing deterministic recovery path.
+      const allowDeterministicCandidateFallback = repositoryAgentPhase == null;
       let ideationPhase: {
         json: Record<string, unknown>;
         llmCall: Record<string, unknown>;
@@ -8812,7 +8839,7 @@ export class RemoteBuddyAutonomousEngine {
       let rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
       let rawCandidatesSource: "llm" | "repo_vision_fallback" | "engine_fallback" = "llm";
       let deterministicFallbackAttempted = false;
-      if (rawCandidates.length === 0) {
+      if (rawCandidates.length === 0 && allowDeterministicCandidateFallback) {
         deterministicFallbackAttempted = true;
         const repoSynthesized = buildRepoVisionFallbackCandidates({
           engineInspiration,
@@ -9038,6 +9065,7 @@ export class RemoteBuddyAutonomousEngine {
           candidate.vision_objective_id === uncoveredUserObservablePriority?.id,
       );
       if (
+        allowDeterministicCandidateFallback &&
         rawCandidatesSource === "llm" &&
         uncoveredUserObservablePriority &&
         !hasUserObservablePriorityCandidate &&
@@ -9067,7 +9095,11 @@ export class RemoteBuddyAutonomousEngine {
           deterministicFallbackAttempted = true;
         }
       }
-      if (normalizedCandidates.length === 0 && !deterministicFallbackAttempted) {
+      if (
+        normalizedCandidates.length === 0 &&
+        !deterministicFallbackAttempted &&
+        allowDeterministicCandidateFallback
+      ) {
         deterministicFallbackAttempted = true;
         const repoSynthesizedFallback = buildRepoVisionFallbackCandidates({
           engineInspiration,
@@ -9106,7 +9138,11 @@ export class RemoteBuddyAutonomousEngine {
         openObjectives: snapshot.open_objectives,
         recentObjectives: snapshot.recent_objectives,
       });
-      if (preScoringDiversity.rows.length === 0 && !deterministicFallbackAttempted) {
+      if (
+        preScoringDiversity.rows.length === 0 &&
+        !deterministicFallbackAttempted &&
+        allowDeterministicCandidateFallback
+      ) {
         deterministicFallbackAttempted = true;
         const beforeFallbackCount = normalizedCandidates.length;
         const repoFallback = buildRepoVisionFallbackCandidates({

@@ -39,6 +39,10 @@ export type ManagedServiceSpec = {
     intervalMs?: number;
     timeoutMs?: number;
     unhealthyThreshold?: number;
+    /** Transport failures need sustained evidence; an explicit unhealthy response uses the strike limit. */
+    transportFailureGraceMs?: number;
+    /** Observe shared dependencies without cascading process-tree termination during a local outage. */
+    restartOnFailure?: boolean;
   };
 };
 
@@ -70,8 +74,22 @@ type ServiceManagerState = {
   nextHealthProbeAtMs: number;
   healthProbeInFlight: boolean;
   consecutiveUnhealthyProbes: number;
+  consecutiveExplicitUnhealthyProbes: number;
   healthTerminationRequested: boolean;
   healthFailureDetail: string;
+  healthFailureKind: ManagedServiceHealthFailureKind | null;
+  firstHealthFailureAtMs: number | null;
+  lastHealthyAtMs: number | null;
+  healthySinceMs: number | null;
+  awaitingRecoveryConfirmation: boolean;
+};
+
+export type ManagedServiceHealthFailureKind = "unhealthy_response" | "transport_error";
+export type ManagedServiceHealthResult = {
+  ok: boolean;
+  detail: string;
+  failureKind?: ManagedServiceHealthFailureKind;
+  responseStatus?: number;
 };
 
 export type ManagedServiceExitFingerprintContext = {
@@ -84,6 +102,8 @@ export type ManagedServiceExitFingerprintContext = {
 
 export type ServiceManagerOptions = {
   pollMs?: number;
+  now?: () => number;
+  terminationExitConfirmationMs?: number;
   maxRestartAttempts?: number;
   stableWindowMs?: number;
   repeatedExitFingerprintLimit?: number;
@@ -96,10 +116,9 @@ export type ServiceManagerOptions = {
   onServiceDegraded?: (name: string, reason: string, health: EmbeddedRuntimeHealth) => void;
   onEvent?: (level: "log" | "warn" | "error", line: string) => void;
   onLifecycleEvent?: (event: ManagedServiceLifecycleEvent) => void;
-  probeServiceHealth?: (spec: NonNullable<ManagedServiceSpec["healthCheck"]>) => Promise<{
-    ok: boolean;
-    detail: string;
-  }>;
+  probeServiceHealth?: (
+    spec: NonNullable<ManagedServiceSpec["healthCheck"]>,
+  ) => Promise<ManagedServiceHealthResult>;
   terminateService?: (service: ManagedServiceProcess) => Promise<void>;
 };
 
@@ -113,6 +132,29 @@ export type ManagedServiceLifecycleEvent =
       restartAttempt: number;
       maxRestartAttempts: number;
       recoveryPlanned: boolean;
+      exitCause: "health_termination" | "unexpected_exit";
+      detail: string;
+      observedAt: string;
+    }
+  | {
+      type: "recovered";
+      service: string;
+      restartAttempt: number;
+      maxRestartAttempts: number;
+      confirmation: "health_probe" | "launcher_ready" | "process_started";
+      observedAt: string;
+    }
+  | {
+      type: "health";
+      service: string;
+      healthy: boolean;
+      detail: string;
+      failureKind: ManagedServiceHealthFailureKind | null;
+      responseStatus: number | null;
+      consecutiveFailures: number;
+      failureDurationMs: number;
+      lastHealthyAt: string | null;
+      restartOnFailure: boolean;
       observedAt: string;
     }
   | {
@@ -148,6 +190,7 @@ const DEFAULT_SERVICE_MANAGER_MAX_BACKOFF_MS = 30_000;
 const DEFAULT_SERVICE_HEALTH_INTERVAL_MS = 5_000;
 const DEFAULT_SERVICE_HEALTH_TIMEOUT_MS = 2_500;
 const DEFAULT_SERVICE_UNHEALTHY_THRESHOLD = 3;
+const DEFAULT_SERVICE_TRANSPORT_FAILURE_GRACE_MS = 60_000;
 const DEFAULT_SERVICE_TERMINATION_TIMEOUT_MS = 15_000;
 const MAX_MANAGED_SERVICE_OUTPUT_LINE_CHARS = 64 * 1024;
 
@@ -185,11 +228,14 @@ export function shouldDetachManagedServiceProcess(platform: NodeJS.Platform): bo
 export async function defaultProbeServiceHealth(
   spec: NonNullable<ManagedServiceSpec["healthCheck"]>,
   fetchImpl: FetchLike = fetch,
-): Promise<{ ok: boolean; detail: string }> {
+): Promise<ManagedServiceHealthResult> {
   const timeoutMs = Math.max(250, spec.timeoutMs ?? DEFAULT_SERVICE_HEALTH_TIMEOUT_MS);
   try {
     const response = await fetchBufferedWithHardDeadline({
       input: spec.url,
+      // Health must test the listener, not the liveness of a pooled socket
+      // previously used by bulk/control traffic (Bun supports per-request reuse control).
+      init: { keepalive: false, headers: { Connection: "close" } },
       timeoutMs,
       maxResponseBytes: 1024 * 1024,
       fetchImpl,
@@ -199,10 +245,34 @@ export async function defaultProbeServiceHealth(
     return {
       ok: response.ok,
       detail: detail.trim().slice(0, 500) || `HTTP ${response.status}`,
+      responseStatus: response.status,
+      ...(!response.ok ? { failureKind: "unhealthy_response" as const } : {}),
     };
   } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+    return {
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+      failureKind: "transport_error",
+    };
   }
+}
+
+export function shouldTerminateAfterHealthFailure(options: {
+  failureKind: ManagedServiceHealthFailureKind;
+  consecutiveFailures: number;
+  consecutiveExplicitFailures?: number;
+  unhealthyThreshold: number;
+  failureDurationMs: number;
+  transportFailureGraceMs?: number;
+}): boolean {
+  if (options.consecutiveFailures < Math.max(1, options.unhealthyThreshold)) return false;
+  return (
+    (options.failureKind === "unhealthy_response" &&
+      (options.consecutiveExplicitFailures ?? options.consecutiveFailures) >=
+        Math.max(1, options.unhealthyThreshold)) ||
+    options.failureDurationMs >=
+      Math.max(1_000, options.transportFailureGraceMs ?? DEFAULT_SERVICE_TRANSPORT_FAILURE_GRACE_MS)
+  );
 }
 
 export async function terminateManagedServiceTree(
@@ -245,6 +315,8 @@ export function shouldRestartService(
 }
 
 export function maxRssKiBToBytes(value: unknown): number | null {
+  if (value == null || typeof value === "boolean" || (typeof value === "string" && !value.trim()))
+    return null;
   const maxRssKiB = Number(value);
   if (!Number.isFinite(maxRssKiB) || maxRssKiB < 0) return null;
   return Math.floor(maxRssKiB * 1024);
@@ -426,11 +498,23 @@ export class ServiceManager {
   private readonly onLifecycleEvent?: (event: ManagedServiceLifecycleEvent) => void;
   private readonly probeServiceHealth: NonNullable<ServiceManagerOptions["probeServiceHealth"]>;
   private readonly terminateService: NonNullable<ServiceManagerOptions["terminateService"]>;
+  private readonly now: () => number;
+  private readonly terminationExitConfirmationMs: number;
   private readonly timer: ReturnType<typeof setInterval>;
   private shutdownBegun = false;
   private stopped = false;
 
   constructor(options: ServiceManagerOptions = {}) {
+    this.now = options.now ?? Date.now;
+    this.terminationExitConfirmationMs = Math.max(
+      1,
+      Math.min(
+        5_000,
+        Number.isFinite(options.terminationExitConfirmationMs)
+          ? options.terminationExitConfirmationMs!
+          : 1_000,
+      ),
+    );
     this.pollMs = Math.max(50, Math.floor(options.pollMs ?? DEFAULT_SERVICE_MANAGER_POLL_MS));
     this.maxRestartAttempts = Math.max(
       1,
@@ -504,8 +588,14 @@ export class ServiceManager {
     state.nextHealthProbeAtMs = 0;
     state.healthProbeInFlight = false;
     state.consecutiveUnhealthyProbes = 0;
+    state.consecutiveExplicitUnhealthyProbes = 0;
     state.healthTerminationRequested = false;
     state.healthFailureDetail = "";
+    state.healthFailureKind = null;
+    state.firstHealthFailureAtMs = null;
+    state.lastHealthyAtMs = null;
+    state.healthySinceMs = null;
+    state.awaitingRecoveryConfirmation = false;
     if (options.resetAttempts !== false) {
       state.attempts = 0;
       state.lastExitFingerprint = "";
@@ -637,8 +727,14 @@ export class ServiceManager {
       nextHealthProbeAtMs: 0,
       healthProbeInFlight: false,
       consecutiveUnhealthyProbes: 0,
+      consecutiveExplicitUnhealthyProbes: 0,
       healthTerminationRequested: false,
       healthFailureDetail: "",
+      healthFailureKind: null,
+      firstHealthFailureAtMs: null,
+      lastHealthyAtMs: null,
+      healthySinceMs: null,
+      awaitingRecoveryConfirmation: false,
     };
     this.stateByService.set(name, created);
     return created;
@@ -650,6 +746,24 @@ export class ServiceManager {
 
   private emitEvent(level: "log" | "warn" | "error", line: string): void {
     this.onEvent?.(level, line);
+  }
+
+  private confirmRecovery(
+    name: string,
+    state: ServiceManagerState,
+    confirmation: "health_probe" | "launcher_ready" | "process_started",
+  ): void {
+    if (this.degradedServiceReasons.delete(name)) this.emitHealthChange();
+    if (!state.awaitingRecoveryConfirmation) return;
+    state.awaitingRecoveryConfirmation = false;
+    this.onLifecycleEvent?.({
+      type: "recovered",
+      service: name,
+      restartAttempt: state.attempts,
+      maxRestartAttempts: this.maxRestartAttempts,
+      confirmation,
+      observedAt: new Date(this.now()).toISOString(),
+    });
   }
 
   private recordExitFingerprint(
@@ -718,49 +832,144 @@ export class ServiceManager {
       .then(async (health) => {
         if (this.shutdownBegun || this.stopped) return;
         if (this.services.get(name) !== service || service.exited) return;
+        const observedAtMs = this.now();
+        const wasUnhealthy = state.consecutiveUnhealthyProbes > 0;
         if (health.ok) {
+          if (wasUnhealthy || state.awaitingRecoveryConfirmation) {
+            this.onLifecycleEvent?.({
+              type: "health",
+              service: name,
+              healthy: true,
+              detail: health.detail,
+              failureKind: null,
+              responseStatus: health.responseStatus ?? null,
+              consecutiveFailures: 0,
+              failureDurationMs:
+                state.firstHealthFailureAtMs === null
+                  ? 0
+                  : Math.max(0, observedAtMs - state.firstHealthFailureAtMs),
+              lastHealthyAt: new Date(observedAtMs).toISOString(),
+              restartOnFailure: healthCheck.restartOnFailure !== false,
+              observedAt: new Date(observedAtMs).toISOString(),
+            });
+          }
           state.consecutiveUnhealthyProbes = 0;
+          state.consecutiveExplicitUnhealthyProbes = 0;
           state.healthFailureDetail = "";
+          state.healthFailureKind = null;
+          state.firstHealthFailureAtMs = null;
+          state.lastHealthyAtMs = observedAtMs;
+          state.healthySinceMs ??= observedAtMs;
+          this.confirmRecovery(name, state, "health_probe");
           return;
         }
+        const failureKind = health.failureKind ?? "unhealthy_response";
+        // Alternating HTTP errors and transport failures are still one outage.
+        // Only a confirmed healthy response resets its age and overall count.
+        state.consecutiveExplicitUnhealthyProbes =
+          failureKind === "unhealthy_response" ? state.consecutiveExplicitUnhealthyProbes + 1 : 0;
+        state.healthFailureKind = failureKind;
+        state.firstHealthFailureAtMs ??= observedAtMs;
+        state.healthySinceMs = null;
         state.consecutiveUnhealthyProbes += 1;
         state.healthFailureDetail = health.detail;
+        const failureDurationMs = Math.max(0, observedAtMs - state.firstHealthFailureAtMs);
         const threshold = Math.max(
           1,
           Math.floor(healthCheck.unhealthyThreshold ?? DEFAULT_SERVICE_UNHEALTHY_THRESHOLD),
         );
         this.emitEvent(
           state.consecutiveUnhealthyProbes >= threshold ? "warn" : "log",
-          `Managed ${name} health probe failed (${state.consecutiveUnhealthyProbes}/${threshold}): ${health.detail}`,
+          `Managed ${name} health probe failed (${state.consecutiveUnhealthyProbes}/${threshold}, ${failureKind}, ${failureDurationMs}ms): ${health.detail}`,
         );
-        if (state.consecutiveUnhealthyProbes < threshold) return;
+        this.onLifecycleEvent?.({
+          type: "health",
+          service: name,
+          healthy: false,
+          detail: health.detail,
+          failureKind,
+          responseStatus: health.responseStatus ?? null,
+          consecutiveFailures: state.consecutiveUnhealthyProbes,
+          failureDurationMs,
+          lastHealthyAt:
+            state.lastHealthyAtMs === null ? null : new Date(state.lastHealthyAtMs).toISOString(),
+          restartOnFailure: healthCheck.restartOnFailure !== false,
+          observedAt: new Date(observedAtMs).toISOString(),
+        });
+        if (!this.degradedServiceReasons.has(name)) {
+          this.degradedServiceReasons.set(
+            name,
+            `health unconfirmed (${failureKind}): ${health.detail}`,
+          );
+          this.emitHealthChange();
+        }
+        if (
+          healthCheck.restartOnFailure === false ||
+          !shouldTerminateAfterHealthFailure({
+            failureKind,
+            consecutiveFailures: state.consecutiveUnhealthyProbes,
+            consecutiveExplicitFailures: state.consecutiveExplicitUnhealthyProbes,
+            unhealthyThreshold: threshold,
+            failureDurationMs,
+            transportFailureGraceMs: healthCheck.transportFailureGraceMs,
+          })
+        )
+          return;
         state.healthTerminationRequested = true;
         this.emitEvent(
           "warn",
           `Managed ${name} is unhealthy; terminating its process tree so the supervisor can restart it.`,
         );
-        await this.terminateService(service);
+        const terminated = await settleManagedProcessWithin(
+          this.terminateService(service),
+          DEFAULT_SERVICE_TERMINATION_TIMEOUT_MS,
+        );
+        if (terminated === null) {
+          state.healthTerminationRequested = false;
+          throw new Error(
+            `Timed out terminating unhealthy managed ${name}; retrying termination on a later probe.`,
+          );
+        }
+        if (!service.exited) {
+          await settleManagedProcessWithin(
+            service.proc.exited ?? new Promise<never>(() => {}),
+            this.terminationExitConfirmationMs,
+          );
+        }
+        if (!service.exited && this.services.get(name) === service) {
+          state.healthTerminationRequested = false;
+          throw new Error(
+            `Managed ${name} termination returned without confirmed process exit after ${this.terminationExitConfirmationMs}ms; retrying termination on a later probe.`,
+          );
+        }
       })
       .catch((error) => {
+        if (this.services.get(name) === service && !service.exited)
+          state.healthTerminationRequested = false;
         this.emitEvent(
           "warn",
           `Managed ${name} health supervision failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       })
       .finally(() => {
-        state.healthProbeInFlight = false;
+        if (this.services.get(name) === service) state.healthProbeInFlight = false;
       });
   }
 
   private tick(): void {
     if (this.shutdownBegun || this.stopped) return;
-    const now = Date.now();
+    const now = this.now();
     for (const [name, service] of this.services.entries()) {
       const launchSpec = this.launchSpecs.get(name);
       if (!launchSpec) continue;
       const state = this.ensureState(name);
       if (!service.exited) {
-        if (state.attempts > 0 && now - service.launchedAtMs >= this.stableWindowMs) {
+        const stableSince = launchSpec.healthCheck ? state.healthySinceMs : service.launchedAtMs;
+        if (
+          state.attempts > 0 &&
+          stableSince !== null &&
+          now - stableSince >= this.stableWindowMs
+        ) {
           state.attempts = 0;
           state.nextRestartAtMs = 0;
           state.lastRestartReason = "";
@@ -776,9 +985,13 @@ export class ServiceManager {
         : `exit code ${service.exitCode ?? "unknown"}`;
       const exitAlreadyReported = state.lastReportedExitedProcess === service;
       const uptimeMs = Math.max(0, now - service.launchedAtMs);
-      const exitFingerprint = exitAlreadyReported
-        ? null
-        : this.recordExitFingerprint(state, name, service, now);
+      const exitCause = state.healthTerminationRequested
+        ? ("health_termination" as const)
+        : ("unexpected_exit" as const);
+      const exitFingerprint =
+        exitAlreadyReported || state.healthTerminationRequested
+          ? null
+          : this.recordExitFingerprint(state, name, service, now);
       const fingerprintCircuitOpen = Boolean(exitFingerprint?.limitReached);
       if (
         fingerprintCircuitOpen ||
@@ -795,6 +1008,8 @@ export class ServiceManager {
             restartAttempt: state.attempts,
             maxRestartAttempts: this.maxRestartAttempts,
             recoveryPlanned: false,
+            exitCause,
+            detail: reason,
             observedAt: new Date(now).toISOString(),
           });
         }
@@ -810,7 +1025,7 @@ export class ServiceManager {
           : `reached restart limit (${state.attempts}/${this.maxRestartAttempts})`;
         this.emitEvent("error", `Managed ${name} exited (${reason}) and ${repeatedFailureDetail}.`);
         this.launchSpecs.delete(name);
-        if (!this.degradedServiceReasons.has(name)) {
+        {
           const degradationReason = fingerprintCircuitOpen
             ? `${repeatedFailureDetail} after ${reason}; automatic restarts paused for this service`
             : `reached restart limit after ${reason} (${state.attempts}/${this.maxRestartAttempts})`;
@@ -838,8 +1053,17 @@ export class ServiceManager {
           restartAttempt: nextAttempt,
           maxRestartAttempts: this.maxRestartAttempts,
           recoveryPlanned: true,
+          exitCause,
+          detail: reason,
           observedAt: new Date(now).toISOString(),
         });
+      }
+      if (!this.degradedServiceReasons.has(name)) {
+        this.degradedServiceReasons.set(
+          name,
+          `restarting after ${reason}; recovery is not confirmed`,
+        );
+        this.emitHealthChange();
       }
       this.emitEvent(
         "warn",
@@ -860,19 +1084,44 @@ export class ServiceManager {
           const restarted = this.spawnService(spec);
           this.services.set(name, restarted);
           state.nextHealthProbeAtMs =
-            Date.now() +
+            this.now() +
             Math.max(50, spec.healthCheck?.intervalMs ?? DEFAULT_SERVICE_HEALTH_INTERVAL_MS);
           state.consecutiveUnhealthyProbes = 0;
+          state.consecutiveExplicitUnhealthyProbes = 0;
           state.healthTerminationRequested = false;
           state.healthFailureDetail = "";
+          state.healthProbeInFlight = false;
+          state.healthFailureKind = null;
+          state.firstHealthFailureAtMs = null;
+          state.healthySinceMs = null;
+          state.awaitingRecoveryConfirmation = true;
           this.emitEvent("log", `Restarted managed ${name}.`);
           this.onLifecycleEvent?.({
             type: "restarted",
             service: name,
             restartAttempt: state.attempts,
             maxRestartAttempts: this.maxRestartAttempts,
-            observedAt: new Date().toISOString(),
+            observedAt: new Date(this.now()).toISOString(),
           });
+          if (!spec.healthCheck && restarted.launchReady) {
+            void restarted.launchReady
+              .then((ready) => {
+                if (
+                  ready &&
+                  !this.shutdownBegun &&
+                  !this.stopped &&
+                  this.services.get(name) === restarted &&
+                  !restarted.exited
+                ) {
+                  this.confirmRecovery(
+                    name,
+                    state,
+                    spec.launchReadyLine ? "launcher_ready" : "process_started",
+                  );
+                }
+              })
+              .catch(() => {});
+          }
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           state.lastRestartReason = `launch error: ${detail}`;

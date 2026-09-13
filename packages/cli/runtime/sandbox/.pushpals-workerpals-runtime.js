@@ -3386,8 +3386,8 @@ function loadPushPalsConfig(options = {}) {
 }
 
 // packages/shared/src/vision.ts
-var ANY_HEADING_RE = /^##+\s+(.+?)\s*$/;
-var BULLET_RE = /^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$/;
+var ANY_HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/;
+var BULLET_RE = /^(\s*)(?:[-*+]|\d+[.)])\s+(.+?)\s*$/;
 var MAX_KEY_ITEMS_PER_BUCKET = 8;
 function toLines(markdown) {
   return String(markdown ?? "").replace(/\r\n/g, `
@@ -3462,13 +3462,18 @@ function dedupeAndClamp(values) {
   return out;
 }
 function classifyHeadingBucket(heading) {
-  const text = heading.toLowerCase();
+  const text = heading.toLowerCase().replace(/[\u2010-\u2015-]+/g, " ");
+  if (/\b(?:non\s+goals?|out\s+of\s+scope|not|never)\b/.test(text)) {
+    return "nonGoals";
+  }
   if (text.includes("priorit") || text.includes("roadmap") || text.includes("focus") || text.includes("strategy") || text.includes("what's next") || text.includes("what is next")) {
     return "priorities";
   }
-  if (text.includes("objective") || text.includes("goal") || text.includes("outcome")) {
+  if (text.includes("objective") || text.includes("goal")) {
     return "objectives";
   }
+  if (text.includes("outcome"))
+    return "metrics";
   if (text.includes("who this is for") || text.includes("target user") || text.includes("intended user") || text.includes("audience") || text.includes("persona") || /^(?:the\s+)?users?$/.test(text.trim())) {
     return "targetUsers";
   }
@@ -3476,9 +3481,6 @@ function classifyHeadingBucket(heading) {
     return "guardrails";
   if (text.includes("constraint"))
     return "constraints";
-  if (text.includes("non-goal") || text.includes("out of scope") || text.includes("not ")) {
-    return "nonGoals";
-  }
   if (text.includes("testing criteria") || text.includes("test criteria") || text.includes("required tests") || text.includes("required validation") || text.includes("validation criteria")) {
     return "testingCriteria";
   }
@@ -3509,19 +3511,39 @@ function extractVisionKeyItems(markdown) {
     governance: []
   };
   let activeBucket = null;
+  const headings = [];
+  let pending = null;
+  const flushItem = () => {
+    if (pending)
+      buckets[pending.bucket].push(pending.text);
+    pending = null;
+  };
   for (const line of lines) {
     const heading = line.match(ANY_HEADING_RE);
     if (heading) {
-      activeBucket = classifyHeadingBucket(heading[1]);
+      flushItem();
+      const level = heading[1].length;
+      while (headings.length && headings[headings.length - 1].level >= level)
+        headings.pop();
+      activeBucket = headings.some((parent) => parent.bucket === "nonGoals") ? "nonGoals" : classifyHeadingBucket(heading[2]) ?? headings[headings.length - 1]?.bucket ?? null;
+      headings.push({ level, bucket: activeBucket });
       continue;
     }
     const bullet = line.match(BULLET_RE);
-    if (!bullet)
+    if (bullet) {
+      flushItem();
+      if (activeBucket) {
+        pending = { bucket: activeBucket, text: bullet[2], indent: bullet[1].length };
+      }
       continue;
-    if (!activeBucket)
-      continue;
-    buckets[activeBucket].push(bullet[1]);
+    }
+    if (pending && line.trim() && (line.match(/^\s*/)?.[0].length ?? 0) > pending.indent && !/^\s*(?:\||>|#{1,6}\s)/.test(line)) {
+      pending.text += ` ${line.trim()}`;
+    } else {
+      flushItem();
+    }
   }
+  flushItem();
   return {
     targetUsers: dedupeAndClamp(buckets.targetUsers),
     priorities: dedupeAndClamp(buckets.priorities),
@@ -8184,7 +8206,7 @@ class Logger {
 }
 
 // apps/workerpals/src/execute_job.ts
-import { createHash as createHash6 } from "crypto";
+import { createHash as createHash7 } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import {
   existsSync as existsSync10,
@@ -8374,8 +8396,84 @@ class UsageAccumulator {
   }
 }
 
-// apps/workerpals/src/common/worktree_dependency_artifacts.ts
+// apps/workerpals/src/capability_revision_circuit.ts
 import { createHash as createHash5 } from "crypto";
+function reportsUnavailableBrowser(executorResult) {
+  const text = [executorResult.summary, executorResult.stdout].filter(Boolean).join(`
+`).split(/\b(?:Previous )?Codex event trace(?: excerpt)?:/i)[0].split(/\r?\n/).filter((line) => !/\b(?:item|thread|turn)\.(?:started|completed)\s*(?:\||$)/i.test(line)).join(`
+`).replace(/[\u2019\u2018]/g, "'");
+  if (/\b(?:now|successfully|finally)\b[^\r\n]{0,100}\b(?:captured|obtained|produced)\b[^\r\n]{0,100}\b(?:screenshots?|captures?|rendered evidence)\b/i.test(text) || /\b(?:captured|obtained|produced)\b[^\r\n]{0,100}\b(?:screenshots?|captures?)\b[^\r\n]{0,60}\bsuccessfully\b/i.test(text))
+    return false;
+  return /\b(?:browser|chromium|playwright)\b[^\r\n]{0,200}\b(?:failed (?:before|to|with)|(?:is|was|executable is) missing|(?:is|was) unavailable|denied socket|listen EPERM)\b/i.test(text) || /\b(?:listen EPERM|socket operation (?:was )?denied)\b[^\r\n]{0,200}\b(?:browser|capture|executor)\b/i.test(text) || /\b(?:no|neither) (?:callable |working |provisioned[- ]|available )*(?:browser|chromium)[^\r\n]{0,140}\b(?:available|accessible|exposed|tool|interface)\b/i.test(text) || /\b(?:this executor|this sandbox|I) (?:cannot|can't)[^\r\n]{0,100}\b(?:run|launch|produce|obtain|capture|inspect)[^\r\n]{0,100}\b(?:browser|screenshots?|captures?)\b/i.test(text);
+}
+function requestsRenderedArtifacts(mustFix) {
+  return mustFix.some((finding) => /\b(?:attach|capture|obtain|retain|execute|run|inspect|supply|provide)\b[^\r\n]{0,220}\b(?:screenshots?|viewport captures?|overlap captures?|browser[- ]measured|rendered (?:evidence|measurements)|visual (?:evidence|acceptance))\b/i.test(finding));
+}
+
+class CapabilityRevisionCircuit {
+  previousFingerprint = null;
+  occurrences = 0;
+  observe(options) {
+    if (!options.criticRequiresRevision || options.deterministicIssues.length > 0 || options.deterministicBlocker || !requestsRenderedArtifacts(options.mustFix) || !reportsUnavailableBrowser(options.executorResult)) {
+      this.previousFingerprint = null;
+      this.occurrences = 0;
+      return null;
+    }
+    const targets = [
+      ...new Set(options.targetPaths.map((path) => path.trim().replace(/\\/g, "/").replace(/^\.\//, "")).filter(Boolean))
+    ].sort();
+    const fingerprint = createHash5("sha256").update(JSON.stringify(["browser_capture", "rendered_artifacts", targets])).digest("hex");
+    this.occurrences = this.previousFingerprint === fingerprint ? this.occurrences + 1 : 1;
+    this.previousFingerprint = fingerprint;
+    if (this.occurrences < 2)
+      return null;
+    return {
+      version: 1,
+      capability: "browser_capture",
+      fingerprint,
+      occurrences: this.occurrences,
+      requiredEvidence: ["rendered_artifacts"],
+      disposition: "await_capability",
+      classificationOwner: "worker_capability_circuit"
+    };
+  }
+}
+function withCapabilityBlockedResult(result, blocker, changedPaths) {
+  const summary = "Browser evidence capability unavailable; candidate held for a capable environment";
+  return {
+    ...result,
+    ok: false,
+    exitCode: 4,
+    summary,
+    validationBlocked: undefined,
+    publishBlocked: undefined,
+    candidateState: {
+      ...result.candidateState,
+      status: "held",
+      reason: "browser_capture_capability_unavailable",
+      changedPaths
+    },
+    diagnostics: {
+      ...result.diagnostics,
+      metadata: { ...result.diagnostics?.metadata, capabilityBlocker: blocker },
+      terminal: {
+        ...result.diagnostics?.terminal,
+        failureClass: "environment.browser",
+        terminalStage: "capability_blocked",
+        summary,
+        watchdogFired: false,
+        metadata: {
+          ...result.diagnostics?.terminal?.metadata,
+          classificationOwner: "worker_capability_circuit",
+          capabilityBlocker: blocker
+        }
+      }
+    }
+  };
+}
+
+// apps/workerpals/src/common/worktree_dependency_artifacts.ts
+import { createHash as createHash6 } from "crypto";
 import {
   copyFileSync,
   lstatSync,
@@ -8413,7 +8511,7 @@ function linkTypeForHost() {
 }
 var MUTABLE_DEPENDENCY_DIRS = new Set([".cache", ".expo", ".vite"]);
 function dependencySnapshotKey(repo) {
-  const hash = createHash5("sha256");
+  const hash = createHash6("sha256");
   let included = 0;
   for (const name of ["package.json", "bun.lock", "bun.lockb"]) {
     const path = resolve11(repo, name);
@@ -9378,10 +9476,10 @@ function validationEvidenceId(run) {
     run.ok === true ? "pass" : "fail",
     Number.isFinite(Number(run.exitCode)) ? String(run.exitCode) : "unknown",
     run.terminalStatusSource ?? "process_exit",
-    createHash6("sha256").update(`${run.stdout ?? ""}
+    createHash7("sha256").update(`${run.stdout ?? ""}
 ${run.stderr ?? ""}`).digest("hex").slice(0, 16)
   ].join("\x00") : validationCommandKey(run.command);
-  return `validation:${createHash6("sha256").update(provenance).digest("hex").slice(0, 12)}`;
+  return `validation:${createHash7("sha256").update(provenance).digest("hex").slice(0, 12)}`;
 }
 function buildValidationRunDiagnostics(runs, attempt) {
   return runs.slice(0, 20).map((run) => ({
@@ -10629,7 +10727,7 @@ function playwrightBrowserRuntimeCacheMarkerPath(repo, targets, env = buildWorke
   const browsersPath = String(env.PLAYWRIGHT_BROWSERS_PATH ?? "").trim();
   if (!browsersPath || browsersPath === "0")
     return null;
-  const cacheKey = createHash6("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
+  const cacheKey = createHash7("sha256").update(validationFileFingerprint(repo, [])).update("\x00").update(Array.from(new Set(targets)).sort().join(",")).digest("hex").slice(0, 24);
   return resolve13(browsersPath, `.pushpals-browser-ready-${cacheKey}`);
 }
 async function runPlaywrightBrowserRuntimePreflight(repo, command, targets, timeoutMs, outputPolicy) {
@@ -10814,9 +10912,9 @@ function bunDependencySnapshotKey(repo, bunVersion = String(process.versions.bun
     const path = resolve13(repo, name);
     if (!existsSync10(path))
       continue;
-    hashInput.push(createHash6("sha256").update(readFileSync9(path)).digest("hex"));
+    hashInput.push(createHash7("sha256").update(readFileSync9(path)).digest("hex"));
   }
-  let key = createHash6("sha256").update(`${hashInput.join(`
+  let key = createHash7("sha256").update(`${hashInput.join(`
 `)}
 `).digest("hex");
   const packageJson = readJsonRecord(packagePath);
@@ -11499,7 +11597,7 @@ function higherTierValidationDeferralAfterFailure(command, previousRuns) {
   };
 }
 function validationFileFingerprint(repo, changedPaths) {
-  const hash = createHash6("sha256");
+  const hash = createHash7("sha256");
   hash.update(`${process.platform}\x00${process.arch}\x00`);
   const fingerprintPaths = ["bun.lock", "bun.lockb", "package.json", ...changedPaths].map((entry) => entry.replace(/\\/g, "/")).filter((entry, index, values) => values.indexOf(entry) === index).sort();
   for (const relativePath of fingerprintPaths) {
@@ -12272,9 +12370,9 @@ function recordValidationRemedyMemory(repo, jobFamily, runs) {
 function extractValidationFailureRetryDigest(run, repo) {
   const baseDigest = extractValidationFailureDigest(run);
   const failedTests = validationFailedTestIdentities(run);
-  const failedTestDigest = failedTests.length > 0 ? `failed tests (${failedTests.length}, signature=${createHash6("sha256").update(failedTests.join("\x00")).digest("hex").slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}` : "";
+  const failedTestDigest = failedTests.length > 0 ? `failed tests (${failedTests.length}, signature=${createHash7("sha256").update(failedTests.join("\x00")).digest("hex").slice(0, 12)}): ${failedTests.slice(0, 8).join(" | ")}` : "";
   const assertionContext = validationFailureAssertionContext(run);
-  const assertionDigest = assertionContext.length > 0 ? `assertion context (${assertionContext.length}, signature=${createHash6("sha256").update(assertionContext.join("\x00")).digest("hex").slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}` : "";
+  const assertionDigest = assertionContext.length > 0 ? `assertion context (${assertionContext.length}, signature=${createHash7("sha256").update(assertionContext.join("\x00")).digest("hex").slice(0, 12)}): ${assertionContext.slice(0, 6).join(" | ")}` : "";
   if (!isLongRunningBrowserValidationCommand(run.command) && !(repo && validationCommandIncludesLongRunningBrowserWork(repo, run.command))) {
     return toSingleLine([baseDigest, failedTestDigest, assertionDigest].filter(Boolean).join(" | "), 900);
   }
@@ -14144,7 +14242,7 @@ class CandidateCheckpointError extends Error {
 }
 function retainedCandidateRefComponent(value) {
   const readable = value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "").slice(0, 48);
-  return readable || createHash6("sha256").update(value).digest("hex").slice(0, 16);
+  return readable || createHash7("sha256").update(value).digest("hex").slice(0, 16);
 }
 async function checkpointJobCandidate(repo, workerId, job, candidateState, runtimeConfig = DEFAULT_CONFIG3, baselineSha, deadlineLedger) {
   if (deadlineLedger && workerGitDeadlineContext.getStore() !== deadlineLedger) {
@@ -16524,6 +16622,7 @@ async function executeJob(kind, params, repo, onLog, runtimeConfig = DEFAULT_CON
     }
   });
   const previousValidationFailureDigests = new Map;
+  const capabilityRevisionCircuit = new CapabilityRevisionCircuit;
   const passingValidationCache = new Map;
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   const diagnosticValidationRuns = [];
@@ -16926,6 +17025,18 @@ ${result.stderr ?? ""}`;
         patchSnapshots: [...diagnosticPatchSnapshots]
       }));
     };
+    const capabilityBlocker = capabilityRevisionCircuit.observe({
+      executorResult: result,
+      mustFix: critic?.mustFix ?? [],
+      criticRequiresRevision: Boolean(critic && (critic.score < qualityCriticMinScore || critic.mustFix.length > 0)),
+      deterministicIssues: qualityForCritic.issues,
+      deterministicBlocker: qualityForCritic.blocker !== null,
+      targetPaths: planning.targetPaths ?? []
+    });
+    if (capabilityBlocker) {
+      onLog?.("stderr", `[QualityGate] capabilityBlocked=${JSON.stringify(capabilityBlocker)}. Browser capture is unavailable in the executor environment; outer-container tool readiness does not establish agent sandbox capability. Retaining the candidate without publication. Resume only when the required rendered artifacts can be produced and reviewed.`);
+      return withCapabilityBlockedResult(annotateTerminalResult({ ...result, ok: false, exitCode: 4 }, "capability_blocked"), capabilityBlocker, publishableChangedPaths(quality.changedPaths));
+    }
     if (unchangedValidationFailure) {
       const detail = `Validation failed unchanged after two attempts for "${unchangedValidationFailure.command}": ${unchangedValidationFailure.digest}. Stopping revisions for this failure cluster; dispatch a root-cause repair or move to another component.`;
       onLog?.("stderr", `[ValidationGate] ${detail}`);
@@ -17322,7 +17433,7 @@ ${result.stderr ?? ""}`;
 }
 
 // apps/workerpals/src/docker_executor.ts
-import { createHash as createHash7, randomUUID as randomUUID2 } from "crypto";
+import { createHash as createHash8, randomUUID as randomUUID2 } from "crypto";
 import { existsSync as existsSync12, mkdirSync as mkdirSync4, readFileSync as readFileSync10, writeFileSync as writeFileSync5 } from "fs";
 import { homedir as homedir3 } from "os";
 import { isAbsolute as isAbsolute5, relative as relative4, resolve as resolve14 } from "path";
@@ -18433,8 +18544,8 @@ class DockerExecutor {
     this.worktreeDir = resolve14(this.options.repo, ".worktrees");
     this.warmContainerName = `pushpals-${this.options.workerId}-warm`;
     const dependencyRepoPath = resolve14(this.options.repo);
-    this.dependencyVolumeName = `pushpals-deps-${createHash7("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
-    this.codexVolumeName = `pushpals-codex-${createHash7("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
+    this.dependencyVolumeName = `pushpals-deps-${createHash8("sha256").update(process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath).digest("hex").slice(0, 16)}`;
+    this.codexVolumeName = `pushpals-codex-${createHash8("sha256").update(`${process.platform === "win32" ? dependencyRepoPath.toLowerCase() : dependencyRepoPath}\x00${this.options.workerId}`).digest("hex").slice(0, 20)}`;
     this.warmAgentStartupTimeoutMs = startupTimeoutMs;
     this.warmSetupMaxAttempts = parseClampedInt(this.config.workerpals.dockerWarmMaxAttempts, 3, 1, 5);
     this.warmSetupBackoffMs = parseClampedInt(this.config.workerpals.dockerWarmRetryBackoffMs, 2000, 250, 60000);
@@ -21604,6 +21715,9 @@ function inferWorkerTerminalFailureClass(result) {
     return "success";
   const structuredTerminal = result.diagnostics?.terminal;
   const structuredFailureClass = String(structuredTerminal?.failureClass ?? "").trim();
+  if (structuredFailureClass === "environment.browser" && structuredTerminal?.terminalStage === "capability_blocked" && structuredTerminal.metadata?.classificationOwner === "worker_capability_circuit") {
+    return structuredFailureClass;
+  }
   if (structuredFailureClass && structuredTerminal?.terminalStage === "worker_runtime") {
     return structuredFailureClass;
   }
@@ -23146,7 +23260,7 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                 phaseSpans: buildPhaseSpanDiagnostics(phaseSpans, jobAttempt, finalizedAtMs, completionEnqueued ? "finalizing" : result.ok ? "completed" : result.publishBlocked ? "publish_blocked" : "failed"),
                 terminal: {
                   failureClass: terminalFailureClass,
-                  terminalStage: terminalFailureClass === "codex_startup_stall" ? "executor_startup" : completionEnqueued ? result.validationBlocked ? "trusted_environment_validation" : "publication" : currentJobPhase ?? (result.ok ? "completed" : "worker"),
+                  terminalStage: terminalFailureClass === "codex_startup_stall" ? "executor_startup" : terminalFailureClass === "environment.browser" && result.diagnostics?.terminal?.terminalStage === "capability_blocked" ? "capability_blocked" : completionEnqueued ? result.validationBlocked ? "trusted_environment_validation" : "publication" : currentJobPhase ?? (result.ok ? "completed" : "worker"),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
                   watchdogFired: didWorkerWatchdogFire(result),
@@ -23154,7 +23268,8 @@ async function workerLoop(opts, dockerExecutor, runtimeState, transport, reposit
                     workerId: opts.workerId,
                     docker: Boolean(dockerExecutor),
                     jobKind: job.kind,
-                    phase: currentJobPhase
+                    phase: currentJobPhase,
+                    ...terminalFailureClass === "environment.browser" && result.diagnostics?.terminal?.terminalStage === "capability_blocked" ? { candidateState: result.candidateState ?? null } : {}
                   }
                 }
               })

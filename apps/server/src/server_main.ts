@@ -79,7 +79,8 @@ import { deriveRuntimeConfigImpact } from "./runtime_config_policy.js";
 import { resolveRequestAuthHeader } from "./request_auth.js";
 import { extractAutonomyPayloadDetails } from "./autonomy_payload.js";
 import { LifecycleReconciliationTracker } from "./lifecycle_reconciliation.js";
-import { classifyJobTerminalSemantics } from "./job_terminal_semantics.js";
+import { classifyAutonomyJobCompletion } from "./job_completion_outcome.js";
+import { BoundedJsonBodyError, readBoundedJsonObject } from "./bounded_json_body.js";
 
 // ─── Data directory ─────────────────────────────────────────────────────────
 const STARTUP_CONFIG = loadPushPalsConfig();
@@ -733,63 +734,6 @@ function repositoryAgentSnapshot(row: RepositoryAgentQueueRow) {
   };
 }
 
-class BoundedJsonBodyError extends Error {
-  readonly status: 400 | 413;
-
-  constructor(status: 400 | 413, message: string) {
-    super(message);
-    this.name = "BoundedJsonBodyError";
-    this.status = status;
-  }
-}
-
-/**
- * Read JSON without trusting Content-Length. This is intentionally used by
- * the shared-memory and RepositoryAgent control-plane routes, including
- * chunked requests, so a local service cannot make Server buffer an
- * unbounded body before validation.
- */
-async function readBoundedJsonObject(
-  req: Request,
-  maxBytes: number,
-  label: string,
-): Promise<Record<string, unknown>> {
-  const declaredLength = Number(req.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-    throw new BoundedJsonBodyError(413, `${label} body is too large`);
-  }
-  if (!req.body) throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
-
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      totalBytes += value.byteLength;
-      if (totalBytes > maxBytes) {
-        throw new BoundedJsonBodyError(413, `${label} body is too large`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
-  } catch {
-    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new BoundedJsonBodyError(400, `${label} body must be a JSON object`);
-  }
-  return parsed as Record<string, unknown>;
-}
-
 /**
  * HTTP Middleware & Routes
  */
@@ -840,8 +784,11 @@ export function createRequestHandler() {
         ...corsHeaders,
       };
 
-      const makeJson = (body: unknown, status = 200) =>
-        new Response(JSON.stringify(body), { status, headers: jsonHeaders });
+      const makeJson = (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) =>
+        new Response(JSON.stringify(body), {
+          status,
+          headers: { ...jsonHeaders, ...extraHeaders },
+        });
       const parseLimit = (raw: string | null, fallback = 200): number => {
         const parsed = raw ? parseInt(raw, 10) : NaN;
         if (!Number.isFinite(parsed)) return fallback;
@@ -910,74 +857,6 @@ export function createRequestHandler() {
         return autonomy && typeof autonomy === "object" && !Array.isArray(autonomy)
           ? "autonomy"
           : "user";
-      };
-      const hasClarificationSignal = (value: string): boolean => {
-        const text = value.toLowerCase();
-        return (
-          text.includes("clarification") ||
-          text.includes("clarify") ||
-          text.includes("follow-up question") ||
-          text.includes("requested clarification")
-        );
-      };
-      const classifyAutonomyJobCompletion = (
-        body: Record<string, unknown>,
-      ): {
-        success: boolean;
-        userAction: "applied" | "no_change" | "needs_clarification";
-        reopenedWithin24h: boolean;
-        regressionFlag: boolean;
-      } => {
-        const parts: string[] = [];
-        const summary = compactText(body.summary, 1400);
-        if (summary) parts.push(summary);
-        const detail = compactText(body.detail, 1400);
-        if (detail) parts.push(detail);
-        if (typeof body.result === "string") {
-          parts.push(compactText(body.result, 1400));
-        } else if (body.result && typeof body.result === "object" && !Array.isArray(body.result)) {
-          parts.push(compactText(JSON.stringify(body.result), 1800));
-        }
-        const artifacts = Array.isArray(body.artifacts)
-          ? (body.artifacts.filter((entry) => entry && typeof entry === "object") as Array<
-              Record<string, unknown>
-            >)
-          : [];
-        for (const artifact of artifacts.slice(0, 8)) {
-          const artifactText = compactText(artifact.text ?? artifact.message, 400);
-          if (artifactText) parts.push(artifactText);
-        }
-        const combined = parts.join("\n");
-        if (hasClarificationSignal(combined)) {
-          return {
-            success: false,
-            userAction: "needs_clarification",
-            reopenedWithin24h: true,
-            regressionFlag: false,
-          };
-        }
-        if (
-          classifyJobTerminalSemantics({
-            status: "completed",
-            result: body.result,
-            summary: body.summary,
-            detail: body.detail,
-            additionalEvidence: [combined],
-          }).noChange
-        ) {
-          return {
-            success: false,
-            userAction: "no_change",
-            reopenedWithin24h: true,
-            regressionFlag: false,
-          };
-        }
-        return {
-          success: true,
-          userAction: "applied",
-          reopenedWithin24h: false,
-          regressionFlag: false,
-        };
       };
       const classifyAutonomyFailureProjection = (
         body: Record<string, unknown>,
@@ -1718,6 +1597,7 @@ export function createRequestHandler() {
           return makeJson(
             { ok: false, message: bounded.message || "Invalid Memory request body" },
             bounded.status === 413 ? 413 : 400,
+            bounded.status === 413 ? { Connection: "close" } : {},
           );
         }
         const operation: MemoryHttpOperation | null =
@@ -1824,6 +1704,7 @@ export function createRequestHandler() {
           return makeJson(
             { ok: false, message: bounded.message || "Invalid RepositoryAgent request body" },
             bounded.status === 413 ? 413 : 400,
+            bounded.status === 413 ? { Connection: "close" } : {},
           );
         }
         try {
@@ -1900,6 +1781,7 @@ export function createRequestHandler() {
           return makeJson(
             { ok: false, message: bounded.message || "Invalid RepositoryAgent claim body" },
             bounded.status === 413 ? 413 : 400,
+            bounded.status === 413 ? { Connection: "close" } : {},
           );
         }
         const agentId = compactText(body.agentId, 256);
@@ -1957,6 +1839,7 @@ export function createRequestHandler() {
           return makeJson(
             { ok: false, requestId, message: bounded.message || "Invalid RepositoryAgent body" },
             bounded.status === 413 ? 413 : 400,
+            bounded.status === 413 ? { Connection: "close" } : {},
           );
         }
         const agentId = compactText(body.agentId, 256);

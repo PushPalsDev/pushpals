@@ -468,6 +468,7 @@ function assertNoStartupFailure(text: string): void {
     "oh no: Bun has crashed",
     "Embedded remotebuddy exited during startup",
     "embeddedRuntimeCrash=",
+    "embeddedRuntimeExit=",
     "embeddedRuntime=degraded",
   ];
   for (const blocker of blockers) {

@@ -624,22 +624,6 @@ function jobPathOverlaps(left: string[], right: string[]): boolean {
   return false;
 }
 
-function overlappingFailureTargetPaths(currentPaths: string[], previousPaths: string[]): string[] {
-  const overlapping = new Set<string>();
-  for (const current of currentPaths) {
-    for (const previous of previousPaths) {
-      if (
-        current === previous ||
-        current.startsWith(`${previous}/`) ||
-        previous.startsWith(`${current}/`)
-      ) {
-        overlapping.add(current.length >= previous.length ? current : previous);
-      }
-    }
-  }
-  return [...overlapping].sort();
-}
-
 function normalizeFailureCommand(value: unknown): string {
   return String(value ?? "")
     .trim()
@@ -2400,11 +2384,18 @@ export class JobQueue {
     const maxAttempts = Math.max(1, Math.floor(Number(lifecycle.maxAttempts || 2)));
     const diagnostic = this.db
       .prepare(
-        `SELECT failureClass, summary
+        `SELECT failureClass, summary, terminalStage, metadataJson
          FROM job_terminal_diagnostics
          WHERE jobId = ?`,
       )
-      .get(jobId) as { failureClass: string | null; summary: string | null } | undefined;
+      .get(jobId) as
+      | {
+          failureClass: string | null;
+          summary: string | null;
+          terminalStage: string | null;
+          metadataJson: string | null;
+        }
+      | undefined;
     const failureClass =
       String(diagnostic?.failureClass ?? "").trim() ||
       (terminalSemantics.noChange ? "completed_no_change" : null);
@@ -2414,6 +2405,38 @@ export class JobQueue {
           job.error ??
           (terminalSemantics.noChange ? "Repair completed without a publishable change." : ""),
       ).slice(0, 1_000) || null;
+    const blocker = recordFromUnknown(
+      parseObjectJson(diagnostic?.metadataJson ?? null).capabilityBlocker,
+    );
+    if (
+      job.status === "failed" &&
+      lifecycle.activeJobId === jobId &&
+      diagnostic?.terminalStage === "capability_blocked" &&
+      ["environment.browser", "environment.sandbox"].includes(failureClass ?? "") &&
+      blocker?.version === 1 &&
+      blocker.capability === "browser_capture" &&
+      blocker.disposition === "await_capability" &&
+      blocker.classificationOwner === "worker_capability_circuit" &&
+      Number.isSafeInteger(blocker.occurrences) &&
+      Number(blocker.occurrences) >= 2 &&
+      typeof blocker.fingerprint === "string" &&
+      /^[a-f0-9]{64}$/.test(blocker.fingerprint) &&
+      Array.isArray(blocker.requiredEvidence) &&
+      blocker.requiredEvidence.includes("rendered_artifacts")
+    ) {
+      // A fenced worker has observed the same unavailable capability twice.
+      // Another coding clone cannot provision that capability; preserve the
+      // rejected head for explicit resolution without spending a repair retry.
+      this.db
+        .prepare(
+          `UPDATE pr_repair_lifecycle
+        SET status = 'held', activeJobId = NULL, heldBaseSha = baseSha,
+            nextRetryAt = NULL, lastFailureClass = ?, lastError = ?, updatedAt = ?
+        WHERE lifecycleKey = ? AND activeJobId = ? AND status IN ('queued', 'running')`,
+        )
+        .run(failureClass, lastError, now, context.lifecycleKey, jobId);
+      return null;
+    }
     if (attemptCount >= maxAttempts) {
       this.db
         .prepare(
@@ -2667,13 +2690,15 @@ export class JobQueue {
     ) {
       throw new Error("Invalid exact review lifecycle lookup");
     }
-    // Active repairs own the head even when the base moves. Terminal history
-    // applies only to its exact head/base; a new base is a distinct lifecycle.
+    // Active repairs and unavailable capabilities own the head across base
+    // movements. An unrelated merge cannot provision a missing browser.
+    // Publication conflicts still apply only to their exact observed base.
     const rows = this.db
       .query(
         `SELECT status, activeJobId, baseSha, heldBaseSha, lastError FROM pr_repair_lifecycle
        WHERE repositoryIdentity = ? AND prNumber = ? AND headSha = ?
-         AND ((status = 'held' AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+         AND ((status = 'held' AND (COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?
+             OR lastFailureClass IN ('environment.browser', 'environment.sandbox')))
            OR (status <> 'held' AND baseSha = ?)
            OR status NOT IN ('succeeded', 'exhausted', 'superseded', 'held'))
        LIMIT 101`,
@@ -2758,7 +2783,8 @@ export class JobQueue {
          WHERE lifecycleKey = ?
             OR (status = 'held' AND repositoryIdentity = ?
                 AND prNumber = ? AND headSha = ?
-                AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+                AND (COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?
+                  OR lastFailureClass IN ('environment.browser', 'environment.sandbox')))
             OR (status IN ('succeeded', 'exhausted', 'superseded')
                 AND repositoryIdentity = ?
                 AND prNumber = ? AND headSha = ? AND baseSha = ? AND resolutionType = ?)
@@ -6606,6 +6632,22 @@ export class JobQueue {
     if (targetPaths.length === 0) return empty;
 
     const cutoffIso = new Date(Date.now() - windowMs).toISOString();
+    // A worker's trusted-host deferral is an unexecuted gate, not a failed
+    // check. Select only the latest candidate observation for each command;
+    // earlier failures recovered by a pass cannot suppress unrelated work.
+    const candidateObservation = (alias: string) =>
+      `COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.validationTarget') END, 'candidate') != 'baseline'`;
+    const executedObservation = (alias: string) => `${candidateObservation(alias)}
+      AND NOT (COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.source') END, '') = 'worker'
+        AND COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.capability') END, '') = 'trusted_host')`;
+    const actualValidationFailure = `v.jobId = j.id AND v.passed = 0
+      AND ${executedObservation("v")}
+      AND NOT EXISTS (SELECT 1 FROM job_validation_runs later
+        WHERE later.jobId = v.jobId AND later.command = v.command AND later.id > v.id
+          AND ${executedObservation("later")})`;
     const rows = this.db
       .prepare(
         `SELECT
@@ -6618,28 +6660,28 @@ export class JobQueue {
            (
              SELECT v.command
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS command,
            (
              SELECT v.failureClass
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS validationFailureClass,
            (
              SELECT v.stdoutTail
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS stdoutTail,
            (
              SELECT v.stderrTail
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS stderrTail
@@ -6707,11 +6749,11 @@ export class JobQueue {
       if (uniquePreviousPaths.length === 0 || !jobPathOverlaps(targetPaths, uniquePreviousPaths)) {
         continue;
       }
-      const fingerprintTargetPaths = overlappingFailureTargetPaths(
-        targetPaths,
-        uniquePreviousPaths,
-      );
-      if (fingerprintTargetPaths.length === 0) continue;
+      // An incidental overlap does not establish the same failed target.
+      // Require coverage of the previous target set, and fingerprint that
+      // complete set rather than collapsing different jobs to a shared file.
+      if (!uniquePreviousPaths.every((path) => jobPathOverlaps(targetPaths, [path]))) continue;
+      const fingerprintTargetPaths = uniquePreviousPaths;
 
       const command = normalizeFailureCommand(row.command) || nestedFailureCommand(row.error);
       const failureClass = String(

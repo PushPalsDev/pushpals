@@ -299,6 +299,7 @@ setInterval(() => {}, 1000);
     expect(workflow).toContain("--soak-ms 150000");
     expect(smoke).toContain('[options.pushpalsPath, "--runtime-only"');
     expect(smoke).toContain('"embeddedRuntimeCrash="');
+    expect(smoke).toContain('"embeddedRuntimeExit="');
     expect(smoke).toContain('"embeddedRuntime=degraded"');
     expect(smoke).toContain("Runtime remained healthy");
   });

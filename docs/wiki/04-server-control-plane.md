@@ -43,6 +43,13 @@ Publication-bearing jobs follow `pending -> claimed (pre-start) -> claimed (star
 
 Events are persisted before live broadcast. This keeps SSE/WS replay consistent across crashes.
 
+EventStore installs a startup-only SQLite busy timeout before enabling WAL and
+initializing its schema, allowing a retiring process's short-lived lock to clear.
+Each SQL statement may wait up to one second; this is not an overall migration
+deadline. Before serving requests, it restores the connection's previous runtime
+timeout so live writes do not inherit a new synchronous wait. Failed initialization
+closes the connection. See [SQLite busy-timeout semantics](https://www.sqlite.org/c3ref/busy_timeout.html).
+
 ### 2) Cursor-based replay
 
 Sessions use monotonic event cursors (`event_id`) so clients can reconnect with `after=<cursor>`.

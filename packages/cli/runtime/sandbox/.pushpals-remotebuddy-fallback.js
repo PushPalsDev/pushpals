@@ -4852,10 +4852,10 @@ function sanitizePushPalsConfigForLogging(value) {
 
 // packages/shared/src/vision.ts
 var SECTION_HEADING_RE = /^##\s+(?:(\d+)[.)]\s*)?(.+?)\s*$/;
-var ANY_HEADING_RE = /^##+\s+(.+?)\s*$/;
+var ANY_HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/;
 var ONE_SENTENCE_PROMPT_RE = /^\>\s*\*\*One sentence:\*\*\s*(.+)\s*$/i;
 var BLOCKQUOTE_RE = /^\>\s*(.+?)\s*$/;
-var BULLET_RE = /^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$/;
+var BULLET_RE = /^(\s*)(?:[-*+]|\d+[.)])\s+(.+?)\s*$/;
 var MAX_KEY_ITEMS_PER_BUCKET = 8;
 function toLines(markdown) {
   return String(markdown ?? "").replace(/\r\n/g, `
@@ -4981,13 +4981,18 @@ function dedupeAndClamp(values) {
   return out;
 }
 function classifyHeadingBucket(heading) {
-  const text = heading.toLowerCase();
+  const text = heading.toLowerCase().replace(/[\u2010-\u2015-]+/g, " ");
+  if (/\b(?:non\s+goals?|out\s+of\s+scope|not|never)\b/.test(text)) {
+    return "nonGoals";
+  }
   if (text.includes("priorit") || text.includes("roadmap") || text.includes("focus") || text.includes("strategy") || text.includes("what's next") || text.includes("what is next")) {
     return "priorities";
   }
-  if (text.includes("objective") || text.includes("goal") || text.includes("outcome")) {
+  if (text.includes("objective") || text.includes("goal")) {
     return "objectives";
   }
+  if (text.includes("outcome"))
+    return "metrics";
   if (text.includes("who this is for") || text.includes("target user") || text.includes("intended user") || text.includes("audience") || text.includes("persona") || /^(?:the\s+)?users?$/.test(text.trim())) {
     return "targetUsers";
   }
@@ -4995,9 +5000,6 @@ function classifyHeadingBucket(heading) {
     return "guardrails";
   if (text.includes("constraint"))
     return "constraints";
-  if (text.includes("non-goal") || text.includes("out of scope") || text.includes("not ")) {
-    return "nonGoals";
-  }
   if (text.includes("testing criteria") || text.includes("test criteria") || text.includes("required tests") || text.includes("required validation") || text.includes("validation criteria")) {
     return "testingCriteria";
   }
@@ -5113,19 +5115,39 @@ function extractVisionKeyItems(markdown) {
     governance: []
   };
   let activeBucket = null;
+  const headings = [];
+  let pending = null;
+  const flushItem = () => {
+    if (pending)
+      buckets[pending.bucket].push(pending.text);
+    pending = null;
+  };
   for (const line of lines) {
     const heading = line.match(ANY_HEADING_RE);
     if (heading) {
-      activeBucket = classifyHeadingBucket(heading[1]);
+      flushItem();
+      const level = heading[1].length;
+      while (headings.length && headings[headings.length - 1].level >= level)
+        headings.pop();
+      activeBucket = headings.some((parent) => parent.bucket === "nonGoals") ? "nonGoals" : classifyHeadingBucket(heading[2]) ?? headings[headings.length - 1]?.bucket ?? null;
+      headings.push({ level, bucket: activeBucket });
       continue;
     }
     const bullet = line.match(BULLET_RE);
-    if (!bullet)
+    if (bullet) {
+      flushItem();
+      if (activeBucket) {
+        pending = { bucket: activeBucket, text: bullet[2], indent: bullet[1].length };
+      }
       continue;
-    if (!activeBucket)
-      continue;
-    buckets[activeBucket].push(bullet[1]);
+    }
+    if (pending && line.trim() && (line.match(/^\s*/)?.[0].length ?? 0) > pending.indent && !/^\s*(?:\||>|#{1,6}\s)/.test(line)) {
+      pending.text += ` ${line.trim()}`;
+    } else {
+      flushItem();
+    }
   }
+  flushItem();
   return {
     targetUsers: dedupeAndClamp(buckets.targetUsers),
     priorities: dedupeAndClamp(buckets.priorities),
@@ -9306,6 +9328,7 @@ function chooseRepoObjectiveTargetProfile(profiles, objective, options = {}) {
   if (profiles.length === 0)
     return null;
   const hintTokens = visionMatchTokens([...objective.keywords, objective.title].join(" "));
+  const domainTokens = visionMatchTokens(objective.title);
   const categories = new Set([
     objective.category,
     ...objective.secondary_categories
@@ -9316,6 +9339,12 @@ function chooseRepoObjectiveTargetProfile(profiles, objective, options = {}) {
   for (const profile of profiles) {
     const label = profile.label.toLowerCase();
     const profileTokens = new Set(profile.keywords);
+    const domainProfileTokens = new Set(visionMatchTokens([profile.label, ...profile.keywords].join(" ")));
+    if (!domainTokens.some((token) => domainProfileTokens.has(token)))
+      continue;
+    if (objective.category !== "validation" && /(?:^|\/)(?:__fixtures__|fixtures|testdata|__mocks__|mocks)(?:\/|$)/i.test(label)) {
+      continue;
+    }
     let score = 0;
     for (const token of hintTokens) {
       if (profileTokens.has(token))
@@ -10159,7 +10188,8 @@ function isPriorityContainerVisionSectionTitle(value) {
   return /^(?:(?:current |near term |product |technical |user experience )?priorities|goals?|objectives?|outcomes?|roadmap|focus areas?|strategy|what good looks like|success criteria)$/.test(title);
 }
 function actionablePriorityProse(markdown) {
-  const blocks = asString2(markdown).replace(/```[\s\S]*?```/g, " ").split(/(?:\r?\n){2,}|\r?\n(?=\s*(?:[-*+] |\d+[.)]\s+))/g).flatMap((block) => block.split(/(?<=[.!?])\s+(?=[A-Z])/g)).map((line) => line.replace(/^#{1,6}\s+/, "").replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").replace(/\s+/g, " ").trim()).filter((line) => line.length >= 8 && line.length <= 320);
+  const ownProse = asString2(markdown).split(/(?:^|\r?\n)(?=#{1,6}\s)/, 1)[0];
+  const blocks = ownProse.replace(/```[\s\S]*?```/g, " ").split(/(?:\r?\n){2,}|\r?\n(?=\s*(?:[-*+] |\d+[.)]\s+))/g).flatMap((block) => block.split(/(?<=[.!?])\s+(?=[A-Z])/g)).map((line) => line.replace(/^#{1,6}\s+/, "").replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").replace(/\s+/g, " ").trim()).filter((line) => line.length >= 8 && line.length <= 320);
   return blocks.filter((line) => /^(?:(?:our |the )?(?:top |current |next |near[- ]term )?(?:priority|objective|goal)\s+(?:is|remains|should be)\b|(?:we|users?|customers?|operators?|maintainers?)\s+(?:must|should|need(?:s)? to|will)\b|(?:must|should|need to)\b|(?:add|build|create|deliver|enable|expand|fix|improve|introduce|make|migrate|optimize|reduce|remove|replace|restore|simplify|support|upgrade)\b)/i.test(line));
 }
 function compileRepoVisionObjectives(params) {
@@ -11782,7 +11812,7 @@ function buildRepoVisionFallbackCandidates(params) {
       excludedTargetPaths: [...asStringArray2(params.excludedTargetPaths), ...selectedTargetPaths],
       avoidedComponentAreas: selectedComponentAreas
     });
-    if ((params.repoTargets?.length ?? 0) > 0 && !target)
+    if (!target)
       continue;
     const targetPaths = target?.target_paths ?? [objective.section_ref ? "vision.md" : "README.md"];
     if (selected.length > 0 && targetPaths.some((targetPath) => selectedTargetPaths.some((selectedPath) => workPathsOverlap(targetPath, selectedPath)))) {
@@ -12835,7 +12865,9 @@ ${JSON.stringify(input.messages ?? [])}`),
             "Use tracked, repository-relative target paths and repo-native validation proposals.",
             "Do not infer the project ecosystem from PushPals itself or from generic defaults.",
             "The host will independently enforce scope, risk, cooldown, and command policy.",
-            "Use the exact candidateEnums values, not vision_priority, normal risk, or estimates measured in days. Select one bounded implementation slice executable in a worker job."
+            "Use the exact candidateEnums values, not vision_priority, normal risk, or estimates measured in days. Select one bounded implementation slice executable in a worker job.",
+            "Honor explicit priorities in their listed order before general success metrics; non-goals and excluded scope are prohibitions, never objectives.",
+            "Return data.candidates=[] when evidence does not establish unfinished, actionable work. A desired outcome or matching filename alone is not evidence of a defect."
           ]
         },
         runtimeSignals: {
@@ -12871,7 +12903,7 @@ ${JSON.stringify(input.messages ?? [])}`),
       const data = asObject(result.data);
       const candidates = Array.isArray(data.candidates) ? data.candidates : [];
       if (candidates.length === 0) {
-        console.warn(`[RemoteBuddyAutonomousEngine] RepositoryAgent returned no structured candidates for ${params.runId}; using deterministic repo-vision fallback without another model call.`);
+        console.warn(`[RemoteBuddyAutonomousEngine] RepositoryAgent returned no grounded candidates for ${params.runId}; recording an empty planning cycle without inventing implementation work.`);
       }
       const response = { candidates };
       const latencyMs = Date.now() - startedAt;
@@ -12913,7 +12945,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         }
       };
     } catch (error) {
-      console.warn(`[RemoteBuddyAutonomousEngine] RepositoryAgent ideation unavailable for ${params.runId}; using deterministic repo-vision fallback without another model call: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[RemoteBuddyAutonomousEngine] RepositoryAgent ideation unavailable for ${params.runId}; deferring implementation dispatch until grounded analysis is available: ${error instanceof Error ? error.message : String(error)}`);
       return deterministicFallbackPhase(error instanceof Error ? error.message : String(error));
     } finally {
       if (this.activeRepositoryIdeation === requestController) {
@@ -13817,6 +13849,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         return;
       }
       const repositoryAgentResult = repositoryAgentPhase?.result ?? null;
+      const allowDeterministicCandidateFallback = repositoryAgentPhase == null;
       let ideationPhase = repositoryAgentPhase;
       if (!ideationPhase) {
         try {
@@ -13848,7 +13881,7 @@ ${JSON.stringify(input.messages ?? [])}`),
       let rawCandidates = Array.isArray(ideationJson.candidates) ? ideationJson.candidates : [];
       let rawCandidatesSource = "llm";
       let deterministicFallbackAttempted = false;
-      if (rawCandidates.length === 0) {
+      if (rawCandidates.length === 0 && allowDeterministicCandidateFallback) {
         deterministicFallbackAttempted = true;
         const repoSynthesized = buildRepoVisionFallbackCandidates({
           engineInspiration,
@@ -14013,7 +14046,7 @@ ${JSON.stringify(input.messages ?? [])}`),
       const uncoveredUserObservablePriority = engineInspiration.compiled_repo_objectives.find((objective) => objective.source_bucket === "priorities" && USER_OBSERVABLE_OBJECTIVE_CATEGORIES.has(objective.category) && !visionObjectiveWasCovered(objective, coveredObjectiveTitles, coveredObjectiveIds));
       const hasUserObservablePriorityCandidate = normalizedCandidates.some((candidate) => candidate.vision_objective_id === uncoveredUserObservablePriority?.id);
       const uncoveredPriorityNeedsUserInput = normalizedCandidates.some((candidate) => candidate.requires_user_input && candidate.vision_objective_id === uncoveredUserObservablePriority?.id);
-      if (rawCandidatesSource === "llm" && uncoveredUserObservablePriority && !hasUserObservablePriorityCandidate && !uncoveredPriorityNeedsUserInput) {
+      if (allowDeterministicCandidateFallback && rawCandidatesSource === "llm" && uncoveredUserObservablePriority && !hasUserObservablePriorityCandidate && !uncoveredPriorityNeedsUserInput) {
         const portfolioFallback = buildRepoVisionFallbackCandidates({
           engineInspiration,
           snapshotTopSignals: ideationSignals.top_signals,
@@ -14036,7 +14069,7 @@ ${JSON.stringify(input.messages ?? [])}`),
           deterministicFallbackAttempted = true;
         }
       }
-      if (normalizedCandidates.length === 0 && !deterministicFallbackAttempted) {
+      if (normalizedCandidates.length === 0 && !deterministicFallbackAttempted && allowDeterministicCandidateFallback) {
         deterministicFallbackAttempted = true;
         const repoSynthesizedFallback = buildRepoVisionFallbackCandidates({
           engineInspiration,
@@ -14067,7 +14100,7 @@ ${JSON.stringify(input.messages ?? [])}`),
         openObjectives: snapshot.open_objectives,
         recentObjectives: snapshot.recent_objectives
       });
-      if (preScoringDiversity.rows.length === 0 && !deterministicFallbackAttempted) {
+      if (preScoringDiversity.rows.length === 0 && !deterministicFallbackAttempted && allowDeterministicCandidateFallback) {
         deterministicFallbackAttempted = true;
         const beforeFallbackCount = normalizedCandidates.length;
         const repoFallback = buildRepoVisionFallbackCandidates({

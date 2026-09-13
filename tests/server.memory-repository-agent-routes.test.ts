@@ -502,30 +502,66 @@ describe("server RepositoryAgent routes", () => {
     const server = spawnServer(root, port);
     await waitForHealth(server, port);
 
-    const encoder = new TextEncoder();
-    const parts = [
-      '{"agentId":"oversized","padding":"',
-      ...Array.from({ length: 5 }, () => "x".repeat(16 * 1024)),
-      '"}',
-    ];
-    const body = new ReadableStream<Uint8Array>({
-      pull(controller) {
-        const next = parts.shift();
-        if (next === undefined) controller.close();
-        else controller.enqueue(encoder.encode(next));
-      },
-    });
-    const response = await fetch(`http://127.0.0.1:${port}/repository-agent/requests/claim`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      duplex: "half",
-    } as RequestInit & { duplex: "half" });
-    expect(response.status).toBe(413);
-    expect(await response.text()).toContain("too large");
+    // Repeat on one origin so a native pooled-socket framing regression cannot
+    // disappear behind a single fortunate upload/response scheduling order.
+    for (let upload = 0; upload < 20; upload += 1) {
+      const encoder = new TextEncoder();
+      const parts = [
+        '{"agentId":"oversized","padding":"',
+        ...Array.from({ length: 5 }, () => "x".repeat(16 * 1024)),
+        '"}',
+      ];
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          const next = parts.shift();
+          if (next === undefined) controller.close();
+          else controller.enqueue(encoder.encode(next));
+        },
+      });
+      const response = await fetch(`http://127.0.0.1:${port}/repository-agent/requests/claim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+      expect(response.status).toBe(413);
+      expect(response.headers.get("connection")).toBe("close");
+      expect(await response.text()).toContain("too large");
 
-    const health = await fetch(`http://127.0.0.1:${port}/healthz`);
-    expect(health.status).toBe(200);
+      // Exercise the normal pooled client, not the supervisor's isolated probes:
+      // unread upload bytes must never poison the next request on this origin.
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const health = await fetch(`http://127.0.0.1:${port}/healthz`, {
+          signal: AbortSignal.timeout(2_000),
+        });
+        expect(health.status).toBe(200);
+        expect((await health.json()).ok).toBe(true);
+      }
+    }
+    // Declared oversized bodies exercise the early-rejection path as well as
+    // every bounded route family. The finite upload must be drained before
+    // rejection even when the runtime ignores the response's close header.
+    for (const [path, method, limit] of [
+      ["/memory/records", "PUT", 2 * 1024 * 1024],
+      ["/repository-agent/requests", "POST", 256 * 1024],
+      ["/repository-agent/requests/claim", "POST", 64 * 1024],
+      ["/repository-agent/requests/missing/lease/renew", "POST", 2 * 1024 * 1024],
+    ] as const) {
+      const rejected = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        body: "x".repeat(limit + 1),
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(3_000),
+      });
+      expect(rejected.status).toBe(413);
+      expect(rejected.headers.get("connection")).toBe("close");
+      expect(await rejected.text()).toContain("too large");
+      const next = await fetch(`http://127.0.0.1:${port}/healthz`, {
+        signal: AbortSignal.timeout(2_000),
+      });
+      expect(next.status).toBe(200);
+      await next.text();
+    }
   });
 
   test("maps repository roots and fences submit, claim, renew, complete, get, and ask", async () => {

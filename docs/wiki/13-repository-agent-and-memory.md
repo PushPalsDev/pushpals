@@ -235,7 +235,7 @@ RemoteBuddy's existing session-planning `remotebuddy_memory` backend remains a p
 RepositoryAgent is assistance, so failure behavior must be explicit and bounded:
 
 - On synthesis timeout, transport failure, or malformed output, return the already host-verified bounded evidence packet when it is safe to do so and persist its immutable coordinates. Purpose-selected paths receive reserved packet capacity and are preferred as fallback evidence. A deterministic fallback does not claim model or recalled-memory provenance that never contributed to an accepted answer. Stale snapshots, invalid repositories, fabricated citations, and authority loss still fail closed.
-- Use an existing bounded deterministic path when that path is independently safe. RemoteBuddy autonomy goes directly to repo/vision synthesis and does not launch a fresh legacy-model ideation call after a late RepositoryAgent failure.
+- Use an existing bounded deterministic path when that path is independently safe. In RepositoryAgent-enabled autonomy, empty, unavailable, malformed, or exhausted candidate advice produces no coding job that tick. Host-verified fallback evidence is not a synthesized task. RemoteBuddy does not launch a fresh legacy-model ideation call or manufacture generic work after a late RepositoryAgent failure. Ordinary requests continue and future ticks can reevaluate.
 - If repository advice is required to make a safety decision, fail closed and surface the typed error. Never interpret absence of advice as approval.
 - Never skip scope, command, test, review, lease, or publication gates because RepositoryAgent succeeded or failed.
 - Do not use stale memory merely to keep work moving; invalidate it or request fresh analysis.

@@ -241,6 +241,7 @@ async function runRecoveryFixture(
     failAfterRevision?: boolean;
     workerModel?: string;
     criticModel?: string;
+    capabilityUnavailable?: boolean;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "pushpals-timeout-recovery-"));
@@ -291,6 +292,12 @@ async function runRecoveryFixture(
       );
       if (options.failAfterRevision && attempts === 1)
         return { ok: true, exitCode: 0, summary: "candidate changed" };
+      if (options.capabilityUnavailable)
+        return {
+          ok: true,
+          exitCode: 0,
+          summary: "Preserved the patch. This executor cannot obtain browser screenshots.",
+        };
       return options.failAfterRevision ? { ...partial, candidateState: undefined } : partial;
     });
     const config = loadPushPalsConfig({ projectRoot: process.cwd() });
@@ -299,7 +306,7 @@ async function runRecoveryFixture(
       workerpals: {
         ...config.workerpals,
         executor: "openai_codex" as const,
-        qualityMaxAutoRevisions: 1,
+        qualityMaxAutoRevisions: options.capabilityUnavailable ? 3 : 1,
         qualityValidationMaxAutoRevisions: 1,
         qualitySoftPassOnExhausted: false,
         qualityScopeGateEnabled: true,
@@ -378,6 +385,25 @@ async function runRecoveryFixture(
 }
 
 describe("executeJob timeout recovery with real Git, tests, and critic subprocess", () => {
+  test("holds an unavailable browser candidate after two attempts without publishing or spending all revisions", async () => {
+    const observed = await runRecoveryFixture({
+      capabilityUnavailable: true,
+      score: 7.8,
+      mustFix: ["Attach actual viewport captures with measured rendered dimensions."],
+    });
+    expect(observed.attempts, JSON.stringify(observed)).toBe(2);
+    expect(observed.result.ok).toBe(false);
+    expect(observed.result.validationBlocked).toBeUndefined();
+    expect(observed.result.candidateState?.status).toBe("held");
+    expect(observed.result.diagnostics?.terminal).toMatchObject({
+      failureClass: "environment.browser",
+      terminalStage: "capability_blocked",
+      metadata: { capabilityBlocker: { occurrences: 2, disposition: "await_capability" } },
+    });
+    expect(observed.result.diagnostics?.validationRuns?.some((run) => run.passed)).toBe(true);
+    expect(observed.logs.some((line) => line.includes("capabilityBlocked="))).toBe(true);
+  }, 30_000);
+
   test("validates a retained candidate and invokes the configured critic despite the timeout summary", async () => {
     const observed = await runRecoveryFixture();
     expect(

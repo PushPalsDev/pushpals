@@ -1,8 +1,8 @@
 const SECTION_HEADING_RE = /^##\s+(?:(\d+)[.)]\s*)?(.+?)\s*$/;
-const ANY_HEADING_RE = /^##+\s+(.+?)\s*$/;
+const ANY_HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/;
 const ONE_SENTENCE_PROMPT_RE = /^\>\s*\*\*One sentence:\*\*\s*(.+)\s*$/i;
 const BLOCKQUOTE_RE = /^\>\s*(.+?)\s*$/;
-const BULLET_RE = /^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$/;
+const BULLET_RE = /^(\s*)(?:[-*+]|\d+[.)])\s+(.+?)\s*$/;
 
 export type VisionSection = {
   number: string;
@@ -171,7 +171,12 @@ function dedupeAndClamp(values: string[]): string[] {
 }
 
 function classifyHeadingBucket(heading: string): keyof VisionKeyItems | null {
-  const text = heading.toLowerCase();
+  const text = heading.toLowerCase().replace(/[\u2010-\u2015-]+/g, " ");
+  // Negative scope must win before broad words such as "goal" or "priority".
+  // Otherwise "Out of scope / non-goals" becomes an implementation backlog.
+  if (/\b(?:non\s+goals?|out\s+of\s+scope|not|never)\b/.test(text)) {
+    return "nonGoals";
+  }
   if (
     text.includes("priorit") ||
     text.includes("roadmap") ||
@@ -182,9 +187,12 @@ function classifyHeadingBucket(heading: string): keyof VisionKeyItems | null {
   ) {
     return "priorities";
   }
-  if (text.includes("objective") || text.includes("goal") || text.includes("outcome")) {
+  if (text.includes("objective") || text.includes("goal")) {
     return "objectives";
   }
+  // Outcomes describe success; they must not displace explicit objectives
+  // merely because their section happens to occur earlier in the document.
+  if (text.includes("outcome")) return "metrics";
   if (
     text.includes("who this is for") ||
     text.includes("target user") ||
@@ -197,9 +205,6 @@ function classifyHeadingBucket(heading: string): keyof VisionKeyItems | null {
   }
   if (text.includes("principle") || text.includes("guardrail")) return "guardrails";
   if (text.includes("constraint")) return "constraints";
-  if (text.includes("non-goal") || text.includes("out of scope") || text.includes("not ")) {
-    return "nonGoals";
-  }
   if (
     text.includes("testing criteria") ||
     text.includes("test criteria") ||
@@ -331,18 +336,46 @@ export function extractVisionKeyItems(markdown: string): VisionKeyItems {
   };
 
   let activeBucket: keyof VisionKeyItems | null = null;
+  const headings: Array<{ level: number; bucket: keyof VisionKeyItems | null }> = [];
+  let pending: { bucket: keyof VisionKeyItems; text: string; indent: number } | null = null;
+  const flushItem = (): void => {
+    if (pending) buckets[pending.bucket].push(pending.text);
+    pending = null;
+  };
   for (const line of lines) {
     const heading = line.match(ANY_HEADING_RE);
     if (heading) {
-      activeBucket = classifyHeadingBucket(heading[1]);
+      flushItem();
+      const level = heading[1].length;
+      while (headings.length && headings[headings.length - 1].level >= level) headings.pop();
+      // Nested examples/goals under an excluded section remain excluded.
+      activeBucket = headings.some((parent) => parent.bucket === "nonGoals")
+        ? "nonGoals"
+        : (classifyHeadingBucket(heading[2]) ?? headings[headings.length - 1]?.bucket ?? null);
+      headings.push({ level, bucket: activeBucket });
       continue;
     }
 
     const bullet = line.match(BULLET_RE);
-    if (!bullet) continue;
-    if (!activeBucket) continue;
-    buckets[activeBucket].push(bullet[1]);
+    if (bullet) {
+      flushItem();
+      if (activeBucket) {
+        pending = { bucket: activeBucket, text: bullet[2], indent: bullet[1].length };
+      }
+      continue;
+    }
+    if (
+      pending &&
+      line.trim() &&
+      (line.match(/^\s*/)?.[0].length ?? 0) > pending.indent &&
+      !/^\s*(?:\||>|#{1,6}\s)/.test(line)
+    ) {
+      pending.text += ` ${line.trim()}`;
+    } else {
+      flushItem();
+    }
   }
+  flushItem();
 
   return {
     targetUsers: dedupeAndClamp(buckets.targetUsers),

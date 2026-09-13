@@ -22,6 +22,8 @@ import {
   buildEmbeddedRuntimeServiceLaunchPlan,
   buildEmbeddedRuntimeCrashEnvelope,
   buildEmbeddedRuntimeCrashFingerprint,
+  embeddedRuntimeRecoveryOutcome,
+  embeddedServiceHealthCheck,
   applyResolvedDockerBinaryToRuntimeEnv,
   applyResolvedGitBinaryToRuntimeEnv,
   buildOpenConfigCommand,
@@ -442,6 +444,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(envelope.requestId).toBe("req-1234");
     expect(envelope.jobId).toBe("job-5678");
     expect(envelope.memory.rssBytes).toBe(Math.floor(0.26 * 1024 ** 3));
+    expect(envelope.memory.measurement).toBe("crash_report_rss");
     expect(envelope.crashReport).toBe("https://bun.report/1.3.14/abc123");
     expect(envelope.recoveryOutcome).toBe("restart_planned");
   });
@@ -458,10 +461,95 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
     expect(buildEmbeddedRuntimeCrashFingerprint("process exited with code 1")).toBeNull();
   });
 
+  test("supervisor health termination is not a native crash even with a stale crash log", () => {
+    const envelope = buildEmbeddedRuntimeCrashEnvelope({
+      service: "source_control_manager",
+      logText:
+        "Bun v1.3.14\npanic(main thread): Segmentation fault\nRSS: 200 MB\nhttps://bun.report/old-crash",
+      uptimeMs: 100_000,
+      exitCode: 1,
+      rssBytes: null,
+      recoveryPlanned: true,
+      observedAt: "2026-09-11T15:17:19.000Z",
+      exitCause: "health_termination",
+      detail: "sustained transport timeout",
+    });
+    expect(envelope.event).toBe("embedded_runtime_exit");
+    expect(envelope.exitCause).toBe("health_termination");
+    expect(envelope.detail).toBe("sustained transport timeout");
+    expect(envelope.crashReport).toBeNull();
+    expect(envelope.crashSignature).toBeNull();
+    expect(envelope.memory.rssBytes).toBeNull();
+    expect(envelope.memory.measurement).toBe("unavailable");
+  });
+
+  test("restart spawn and launcher readiness never claim confirmed service health", () => {
+    const identity = {
+      service: "source_control_manager",
+      restartAttempt: 1,
+      maxRestartAttempts: 4,
+      observedAt: "2026-09-11T15:17:21.000Z",
+    };
+    expect(embeddedRuntimeRecoveryOutcome({ ...identity, type: "restarted" })).toBe(
+      "restart_started",
+    );
+    expect(
+      embeddedRuntimeRecoveryOutcome({
+        ...identity,
+        type: "recovered",
+        confirmation: "launcher_ready",
+      }),
+    ).toBe("launcher_ready");
+    expect(
+      embeddedRuntimeRecoveryOutcome({
+        ...identity,
+        type: "recovered",
+        confirmation: "process_started",
+      }),
+    ).toBe("restart_started");
+    expect(
+      embeddedRuntimeRecoveryOutcome({
+        ...identity,
+        type: "recovered",
+        confirmation: "health_probe",
+      }),
+    ).toBe("recovered");
+    expect(embeddedRuntimeRecoveryOutcome({ ...identity, type: "recovery_exhausted" })).toBe(
+      "recovery_exhausted",
+    );
+  });
+
+  test("SCM health is restartable while server probes observe shared transport outages without cascading kills", () => {
+    expect(
+      embeddedServiceHealthCheck("source_control_manager", "http://127.0.0.1:3001", 3002),
+    ).toEqual({
+      url: "http://127.0.0.1:3002/health",
+      intervalMs: 5_000,
+      timeoutMs: 2_500,
+      unhealthyThreshold: 3,
+      transportFailureGraceMs: 60_000,
+    });
+    expect(embeddedServiceHealthCheck("server", "http://127.0.0.1:3001/", 3002)).toEqual({
+      url: "http://127.0.0.1:3001/healthz",
+      intervalMs: 5_000,
+      timeoutMs: 2_500,
+      restartOnFailure: false,
+    });
+    expect(
+      embeddedServiceHealthCheck("remotebuddy", "http://127.0.0.1:3001", 3002),
+    ).toBeUndefined();
+  });
+
   test("converts Bun resourceUsage maxRSS KiB telemetry to bytes", () => {
     expect(maxRssKiBToBytes(131_092)).toBe(134_238_208);
     expect(maxRssKiBToBytes(-1)).toBeNull();
     expect(maxRssKiBToBytes("unknown")).toBeNull();
+    expect(maxRssKiBToBytes(null)).toBeNull();
+    expect(maxRssKiBToBytes(undefined)).toBeNull();
+    expect(maxRssKiBToBytes("")).toBeNull();
+    expect(maxRssKiBToBytes(" ")).toBeNull();
+    expect(maxRssKiBToBytes(false)).toBeNull();
+    expect(maxRssKiBToBytes(0)).toBe(0);
   });
 
   test("ServiceManager reports degraded runtime health after restart exhaustion", async () => {
@@ -515,7 +603,10 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
 
       try {
         await waitForCondition(
-          () => spawnCalls === 2 && supervisor.getHealth()?.state === "degraded",
+          () =>
+            spawnCalls === 2 &&
+            supervisor.getHealth()?.state === "degraded" &&
+            lifecycleEvents.some((event) => event.type === "recovery_exhausted"),
           2_000,
           "Expected the managed service to restart once and then report degraded health.",
         );
@@ -657,7 +748,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       supervisor.stop();
       await Bun.sleep(220);
       expect(spawnCalls).toBe(1);
-      expect(supervisor.getHealth()).toBeNull();
+      expect(supervisor.getHealth()?.detail).toContain("restarting");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

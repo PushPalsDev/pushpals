@@ -6596,43 +6596,55 @@ class EventStore {
   getLatestCursorStmt;
   insertSessionStmt;
   getSessionStmt;
-  constructor(dbPath = ":memory:") {
+  constructor(dbPath = ":memory:", options = {}) {
     this.db = new Database(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
-    this.db.exec("PRAGMA synchronous = NORMAL;");
-    this.db.exec("PRAGMA foreign_keys = ON;");
-    this._migrate();
-    this.insertEventStmt = this.db.prepare(`
+    const startupBusyTimeoutMs = Math.max(1, Math.min(1000, Number.isFinite(options.startupBusyTimeoutMs) ? Math.floor(options.startupBusyTimeoutMs) : 1000));
+    try {
+      const priorBusyTimeout = this.db.query("PRAGMA busy_timeout;").get();
+      const runtimeBusyTimeoutMs = typeof priorBusyTimeout?.timeout === "number" && Number.isSafeInteger(priorBusyTimeout.timeout) && priorBusyTimeout.timeout >= 0 ? priorBusyTimeout.timeout : 0;
+      this.db.exec(`PRAGMA busy_timeout = ${startupBusyTimeoutMs};`);
+      this.db.exec("PRAGMA journal_mode = WAL;");
+      this.db.exec("PRAGMA synchronous = NORMAL;");
+      this.db.exec("PRAGMA foreign_keys = ON;");
+      this._migrate();
+      this.insertEventStmt = this.db.prepare(`
       INSERT INTO events (id, session_id, type, ts, envelope)
       VALUES ($id, $sessionId, $type, $ts, $envelope)
       RETURNING event_id AS eventId
     `);
-    this.getEventsAfterStmt = this.db.prepare(`
+      this.getEventsAfterStmt = this.db.prepare(`
       SELECT event_id AS eventId, id, session_id AS sessionId, type, ts, envelope
       FROM events
       WHERE session_id = $sessionId AND event_id > $afterEventId
       ORDER BY event_id ASC
       LIMIT $limit
     `);
-    this.getAllEventsStmt = this.db.prepare(`
+      this.getAllEventsStmt = this.db.prepare(`
       SELECT event_id AS eventId, id, session_id AS sessionId, type, ts, envelope
       FROM events
       WHERE session_id = $sessionId
       ORDER BY event_id ASC
     `);
-    this.getLatestCursorStmt = this.db.prepare(`
+      this.getLatestCursorStmt = this.db.prepare(`
       SELECT MAX(event_id) AS cursor FROM events WHERE session_id = $sessionId
     `);
-    this.insertSessionStmt = this.db.prepare(`
+      this.insertSessionStmt = this.db.prepare(`
       INSERT INTO sessions (session_id, created_at, label)
       VALUES ($sessionId, $createdAt, $label)
       ON CONFLICT(session_id) DO NOTHING
     `);
-    this.getSessionStmt = this.db.prepare(`
+      this.getSessionStmt = this.db.prepare(`
       SELECT session_id AS sessionId, created_at AS createdAt, label
       FROM sessions
       WHERE session_id = $sessionId
     `);
+      this.db.exec(`PRAGMA busy_timeout = ${runtimeBusyTimeoutMs};`);
+    } catch (error) {
+      try {
+        this.db.close();
+      } catch {}
+      throw error;
+    }
   }
   _migrate() {
     this.db.exec(`
@@ -12645,30 +12657,87 @@ var FALSY2 = new Set(["0", "false", "no", "off"]);
 // apps/server/src/job_terminal_semantics.ts
 var TERMINAL_FAILURE_STATUSES = new Set(["failed", "abandoned", "publish_blocked"]);
 function semanticText(value) {
-  if (value == null)
-    return "";
-  if (typeof value === "string")
-    return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
+  return typeof value === "string" ? value : "";
+}
+var TYPED_TERMINAL_FIELDS = [
+  "status",
+  "failureClass",
+  "terminalStage",
+  "userAction",
+  "kind",
+  "outcome"
+];
+var TERMINAL_PROSE_FIELDS = ["summary", "message", "detail"];
+function collectJobTerminalEvidence(value, depth = 0) {
+  const empty = () => ({ typed: [], prose: [] });
+  if (depth > 4 || value == null)
+    return empty();
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed)
+      return empty();
+    if (/^[{\["]/.test(trimmed)) {
+      try {
+        return collectJobTerminalEvidence(JSON.parse(trimmed), depth + 1);
+      } catch {
+        return empty();
+      }
+    }
+    return { typed: [], prose: [value] };
   }
+  if (typeof value !== "object" || Array.isArray(value))
+    return empty();
+  const record = value;
+  const evidence = {
+    typed: TYPED_TERMINAL_FIELDS.map((key) => semanticText(record[key])).filter(Boolean),
+    prose: TERMINAL_PROSE_FIELDS.map((key) => semanticText(record[key])).filter(Boolean)
+  };
+  const include = (nested) => {
+    const child = collectJobTerminalEvidence(nested, depth + 1);
+    evidence.typed.push(...child.typed);
+    evidence.prose.push(...child.prose);
+  };
+  for (const key of ["result", "error"]) {
+    if (record[key] !== undefined)
+      include(record[key]);
+  }
+  const diagnostics = record.diagnostics;
+  if (diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics)) {
+    include(diagnostics.terminal);
+  }
+  return evidence;
+}
+function isNoChangeToken(value) {
+  const token = value.normalize("NFKC").trim().toLowerCase().replace(/[ -]+/g, "_");
+  return [
+    "no_change",
+    "completed_no_change",
+    "artifact_only_no_publishable_patch",
+    "no_publishable_patch"
+  ].includes(token);
+}
+function declaresNoChange(value) {
+  const text = value.normalize("NFKC").trim().toLowerCase().replace(/\*\*/g, "");
+  if (isNoChangeToken(text))
+    return true;
+  return /^(?:completed[_ -]?)?no[_ -]?change\s*[:;.!](?:\s|$)/.test(text) || /^no changes? (?:was|were|is|are) (?:needed|required|necessary|made|produced|detected)\b/.test(text) || /^(?:job )?completed(?: task)? (?:with no|without any) (?:file )?changes(?:[.!:;,]|$)/.test(text) || /^no file changes(?: (?:were )?(?:detected|made|produced|required))?(?:[.!:;,]|$)/.test(text) || /^no modified files (?:were )?detected(?:[.!:;,]|$)/.test(text) || /^(?:no changes (?:to commit|made)|nothing to commit|modified 0 files?)(?:[.!:;,]|$)/.test(text) || /^executed task via [a-z0-9_-]+ \(no file changes detected\)(?:[.!:;,]|$)/.test(text) || /^executor (?:produced|made) no publishable (?:code )?(?:changes?|patch)\b/.test(text) || /^no publishable patch (?:was |has been )?(?:produced|created|detected)\b/.test(text);
 }
 function classifyJobTerminalSemantics(input) {
   const status = semanticText(input.status).trim().toLowerCase();
-  const evidence = [
-    input.result,
-    input.error,
-    input.summary,
-    input.detail,
-    input.failureClass,
-    input.terminalStage,
-    input.userAction,
-    ...input.additionalEvidence ?? []
-  ].map(semanticText).filter(Boolean).join(`
-`).normalize("NFKC").toLowerCase();
-  const noChange = status === "completed_no_change" || /(?:^|[^\p{L}\p{N}])(?:completed[_ -]?)?no[_ -]?change(?:[^\p{L}\p{N}]|$)/u.test(evidence) || /artifact[_ -]?only[_ -]?no[_ -]?publishable[_ -]?patch|no[_ -]?publishable[_ -]?patch|no file changes|no changes (?:to commit|made)|nothing to commit|modified 0 files?|no modified files (?:were )?detected|no file changes detected/i.test(evidence);
+  if (status !== "completed" && status !== "completed_no_change" && !TERMINAL_FAILURE_STATUSES.has(status)) {
+    return { kind: "non_terminal", terminal: false, noChange: false, success: false };
+  }
+  const evidence = collectJobTerminalEvidence({
+    result: input.result,
+    error: input.error,
+    summary: input.summary,
+    detail: input.detail,
+    failureClass: input.failureClass,
+    terminalStage: input.terminalStage,
+    userAction: input.userAction
+  });
+  evidence.typed.push(...(input.additionalEvidence ?? []).map(semanticText));
+  const noChange = status === "completed_no_change" || evidence.typed.some(isNoChangeToken) || evidence.prose.some(declaresNoChange);
   if (noChange) {
     return { kind: "no_change", terminal: true, noChange: true, success: false };
   }
@@ -12918,17 +12987,6 @@ function jobPathOverlaps(left, right) {
     }
   }
   return false;
-}
-function overlappingFailureTargetPaths(currentPaths, previousPaths) {
-  const overlapping = new Set;
-  for (const current of currentPaths) {
-    for (const previous of previousPaths) {
-      if (current === previous || current.startsWith(`${previous}/`) || previous.startsWith(`${current}/`)) {
-        overlapping.add(current.length >= previous.length ? current : previous);
-      }
-    }
-  }
-  return [...overlapping].sort();
 }
 function normalizeFailureCommand(value) {
   return String(value ?? "").trim().replace(/\\/g, "/").replace(/\s+/g, " ").toLowerCase().slice(0, 1000);
@@ -14219,11 +14277,19 @@ class JobQueue {
     }
     const attemptCount = Math.max(1, Math.floor(Number(lifecycle.attemptCount || 1)));
     const maxAttempts = Math.max(1, Math.floor(Number(lifecycle.maxAttempts || 2)));
-    const diagnostic = this.db.prepare(`SELECT failureClass, summary
+    const diagnostic = this.db.prepare(`SELECT failureClass, summary, terminalStage, metadataJson
          FROM job_terminal_diagnostics
          WHERE jobId = ?`).get(jobId);
     const failureClass = String(diagnostic?.failureClass ?? "").trim() || (terminalSemantics.noChange ? "completed_no_change" : null);
     const lastError = String(diagnostic?.summary ?? job.error ?? (terminalSemantics.noChange ? "Repair completed without a publishable change." : "")).slice(0, 1000) || null;
+    const blocker = recordFromUnknown(parseObjectJson(diagnostic?.metadataJson ?? null).capabilityBlocker);
+    if (job.status === "failed" && lifecycle.activeJobId === jobId && diagnostic?.terminalStage === "capability_blocked" && ["environment.browser", "environment.sandbox"].includes(failureClass ?? "") && blocker?.version === 1 && blocker.capability === "browser_capture" && blocker.disposition === "await_capability" && blocker.classificationOwner === "worker_capability_circuit" && Number.isSafeInteger(blocker.occurrences) && Number(blocker.occurrences) >= 2 && typeof blocker.fingerprint === "string" && /^[a-f0-9]{64}$/.test(blocker.fingerprint) && Array.isArray(blocker.requiredEvidence) && blocker.requiredEvidence.includes("rendered_artifacts")) {
+      this.db.prepare(`UPDATE pr_repair_lifecycle
+        SET status = 'held', activeJobId = NULL, heldBaseSha = baseSha,
+            nextRetryAt = NULL, lastFailureClass = ?, lastError = ?, updatedAt = ?
+        WHERE lifecycleKey = ? AND activeJobId = ? AND status IN ('queued', 'running')`).run(failureClass, lastError, now, context.lifecycleKey, jobId);
+      return null;
+    }
     if (attemptCount >= maxAttempts) {
       this.db.prepare(`UPDATE pr_repair_lifecycle
            SET activeJobId = NULL,
@@ -14375,7 +14441,8 @@ class JobQueue {
     }
     const rows = this.db.query(`SELECT status, activeJobId, baseSha, heldBaseSha, lastError FROM pr_repair_lifecycle
        WHERE repositoryIdentity = ? AND prNumber = ? AND headSha = ?
-         AND ((status = 'held' AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+         AND ((status = 'held' AND (COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?
+             OR lastFailureClass IN ('environment.browser', 'environment.sandbox')))
            OR (status <> 'held' AND baseSha = ?)
            OR status NOT IN ('succeeded', 'exhausted', 'superseded', 'held'))
        LIMIT 101`).all(repository, input.prNumber, head, base, base);
@@ -14432,7 +14499,8 @@ class JobQueue {
          WHERE lifecycleKey = ?
             OR (status = 'held' AND repositoryIdentity = ?
                 AND prNumber = ? AND headSha = ?
-                AND COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?)
+                AND (COALESCE(NULLIF(heldBaseSha, ''), baseSha) = ?
+                  OR lastFailureClass IN ('environment.browser', 'environment.sandbox')))
             OR (status IN ('succeeded', 'exhausted', 'superseded')
                 AND repositoryIdentity = ?
                 AND prNumber = ? AND headSha = ? AND baseSha = ? AND resolutionType = ?)
@@ -16856,6 +16924,18 @@ class JobQueue {
     if (targetPaths.length === 0)
       return empty;
     const cutoffIso = new Date(Date.now() - windowMs).toISOString();
+    const candidateObservation = (alias) => `COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.validationTarget') END, 'candidate') != 'baseline'`;
+    const executedObservation = (alias) => `${candidateObservation(alias)}
+      AND NOT (COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.source') END, '') = 'worker'
+        AND COALESCE(CASE WHEN json_valid(${alias}.metadataJson) THEN
+        json_extract(${alias}.metadataJson, '$.capability') END, '') = 'trusted_host')`;
+    const actualValidationFailure = `v.jobId = j.id AND v.passed = 0
+      AND ${executedObservation("v")}
+      AND NOT EXISTS (SELECT 1 FROM job_validation_runs later
+        WHERE later.jobId = v.jobId AND later.command = v.command AND later.id > v.id
+          AND ${executedObservation("later")})`;
     const rows = this.db.prepare(`SELECT
            j.id,
            j.params,
@@ -16866,28 +16946,28 @@ class JobQueue {
            (
              SELECT v.command
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS command,
            (
              SELECT v.failureClass
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS validationFailureClass,
            (
              SELECT v.stdoutTail
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS stdoutTail,
            (
              SELECT v.stderrTail
              FROM job_validation_runs v
-             WHERE v.jobId = j.id AND v.passed = 0
+             WHERE ${actualValidationFailure}
              ORDER BY v.id DESC
              LIMIT 1
            ) AS stderrTail
@@ -16915,9 +16995,9 @@ class JobQueue {
       if (uniquePreviousPaths.length === 0 || !jobPathOverlaps(targetPaths, uniquePreviousPaths)) {
         continue;
       }
-      const fingerprintTargetPaths = overlappingFailureTargetPaths(targetPaths, uniquePreviousPaths);
-      if (fingerprintTargetPaths.length === 0)
+      if (!uniquePreviousPaths.every((path) => jobPathOverlaps(targetPaths, [path])))
         continue;
+      const fingerprintTargetPaths = uniquePreviousPaths;
       const command = normalizeFailureCommand(row.command) || nestedFailureCommand(row.error);
       const failureClass = String(failureClassFromEvidence(row.error) ?? row.validationFailureClass ?? row.failureClass ?? "unknown_failure").trim().toLowerCase();
       const nestedFailedTests = nestedFailedTestSample(row.error);
@@ -20773,7 +20853,8 @@ function classifyAutonomyAttemptOutcome(input) {
     status,
     failureClass,
     terminalStage,
-    summary
+    summary,
+    result: input.summary
   });
   if (terminalSemantics.noChange)
     return "no_change";
@@ -20785,7 +20866,7 @@ function classifyAutonomyAttemptOutcome(input) {
   if (/critic[_ -]?rejected|quality[_ -]?(?:rejected|failed|revision[_ -]?exhausted)|revision[_ -]?budget[_ -]?exhausted|deterministic[_ -]?quality[_ -]?failed/.test(text)) {
     return "product_quality_failed";
   }
-  if (/^(?:environment|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(failureClass) || /docker[_ -]?(?:socket|daemon)|credential|missing runtime|network is unreachable|tls[_ -]?handshake|certificate verify|permission denied/.test(`${failureClass} ${summary}`)) {
+  if (/^(?:environment(?:\.[a-z0-9_-]+)?|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(failureClass) || /docker[_ -]?(?:socket|daemon)|credential|missing runtime|network is unreachable|tls[_ -]?handshake|certificate verify|permission denied/.test(`${failureClass} ${summary}`)) {
     return "environment_blocked";
   }
   if (/trusted[_ -]?validation|validation[_ -]?(?:blocked|failed)|test[_ -]?failure|lint[_ -]?failure|typecheck[_ -]?failure/.test(text)) {
@@ -28951,6 +29032,123 @@ class LifecycleReconciliationTracker {
   }
 }
 
+// apps/server/src/job_completion_outcome.ts
+function normalized(value) {
+  return value.normalize("NFKC").trim().toLowerCase();
+}
+function classifyAutonomyJobCompletion(body) {
+  const evidence = collectJobTerminalEvidence(body);
+  const needsClarification = evidence.typed.some((value) => /^(?:needs?|requires?|awaiting)[_ -]clarification$/.test(normalized(value))) || evidence.prose.some((value) => {
+    const text = normalized(value);
+    if (/^openhands needs clarification:\s*\S/.test(text))
+      return true;
+    return /^(?:(?:needs?|requires?|awaiting|requested|requesting)[_ -]clarification|clarification (?:is )?(?:needed|required|requested)|waiting for (?:user )?clarification)(?:\s*[.:;!?\n]|$)/.test(text);
+  });
+  if (needsClarification)
+    return {
+      success: false,
+      userAction: "needs_clarification",
+      reopenedWithin24h: true,
+      regressionFlag: false
+    };
+  if (classifyJobTerminalSemantics({ status: "completed", result: body }).noChange)
+    return {
+      success: false,
+      userAction: "no_change",
+      reopenedWithin24h: true,
+      regressionFlag: false
+    };
+  return { success: true, userAction: "applied", reopenedWithin24h: false, regressionFlag: false };
+}
+
+// apps/server/src/bounded_json_body.ts
+class BoundedJsonBodyError extends Error {
+  status;
+  constructor(status, message) {
+    super(message);
+    this.name = "BoundedJsonBodyError";
+    this.status = status;
+  }
+}
+var REJECTED_BODY_DRAIN_TIMEOUT_MS = 250;
+var REJECTED_BODY_EXTRA_BYTES = 64 * 1024;
+async function drainRejectedJsonBody(reader, maxDiscardBytes, timeoutMs = REJECTED_BODY_DRAIN_TIMEOUT_MS) {
+  const deadline = performance.now() + timeoutMs;
+  let timer;
+  const expired = new Promise((resolve7) => {
+    timer = setTimeout(() => resolve7(null), timeoutMs);
+  });
+  let complete = false;
+  let discardedBytes = 0;
+  try {
+    while (performance.now() < deadline) {
+      const next = await Promise.race([reader.read(), expired]);
+      if (!next)
+        break;
+      if (next.done) {
+        complete = true;
+        break;
+      }
+      discardedBytes += next.value?.byteLength ?? 0;
+      if (discardedBytes > maxDiscardBytes)
+        break;
+    }
+  } catch {} finally {
+    clearTimeout(timer);
+    if (!complete) {
+      try {
+        reader.cancel().catch(() => {
+          return;
+        });
+      } catch {}
+    }
+  }
+  return complete;
+}
+async function readBoundedJsonObject(req, maxBytes, label) {
+  const declaredLength = Number(req.headers.get("content-length"));
+  const declaredTooLarge = Number.isFinite(declaredLength) && declaredLength > maxBytes;
+  if (!req.body) {
+    if (declaredTooLarge)
+      throw new BoundedJsonBodyError(413, `${label} body is too large`);
+    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
+  }
+  const reader = req.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    if (declaredTooLarge) {
+      await drainRejectedJsonBody(reader, maxBytes + REJECTED_BODY_EXTRA_BYTES);
+      throw new BoundedJsonBodyError(413, `${label} body is too large`);
+    }
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      if (!value)
+        continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await drainRejectedJsonBody(reader, REJECTED_BODY_EXTRA_BYTES);
+        throw new BoundedJsonBodyError(413, `${label} body is too large`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
+  } catch {
+    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new BoundedJsonBodyError(400, `${label} body must be a JSON object`);
+  }
+  return parsed;
+}
+
 // apps/server/src/server_main.ts
 var STARTUP_CONFIG = loadPushPalsConfig();
 var dataDir = STARTUP_CONFIG.paths.dataDir;
@@ -29358,52 +29556,6 @@ function repositoryAgentSnapshot(row) {
     ...status === "failed" || status === "expired" ? { error: repositoryAgentRemoteError(row.error) } : {}
   };
 }
-
-class BoundedJsonBodyError extends Error {
-  status;
-  constructor(status, message) {
-    super(message);
-    this.name = "BoundedJsonBodyError";
-    this.status = status;
-  }
-}
-async function readBoundedJsonObject(req, maxBytes, label) {
-  const declaredLength = Number(req.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-    throw new BoundedJsonBodyError(413, `${label} body is too large`);
-  }
-  if (!req.body)
-    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
-  const reader = req.body.getReader();
-  const chunks = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done)
-        break;
-      if (!value)
-        continue;
-      totalBytes += value.byteLength;
-      if (totalBytes > maxBytes) {
-        throw new BoundedJsonBodyError(413, `${label} body is too large`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
-  } catch {
-    throw new BoundedJsonBodyError(400, `Valid JSON ${label} body is required`);
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new BoundedJsonBodyError(400, `${label} body must be a JSON object`);
-  }
-  return parsed;
-}
 function createRequestHandler() {
   const startupConfig = loadPushPalsConfig();
   if (startupConfig.authToken) {
@@ -29446,7 +29598,10 @@ function createRequestHandler() {
         "Cache-Control": "no-store",
         ...corsHeaders
       };
-      const makeJson = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: jsonHeaders });
+      const makeJson = (body, status = 200, extraHeaders = {}) => new Response(JSON.stringify(body), {
+        status,
+        headers: { ...jsonHeaders, ...extraHeaders }
+      });
       const parseLimit = (raw, fallback = 200) => {
         const parsed = raw ? parseInt(raw, 10) : NaN;
         if (!Number.isFinite(parsed))
@@ -29507,60 +29662,6 @@ function createRequestHandler() {
           return "autonomy";
         const autonomy = params.autonomy;
         return autonomy && typeof autonomy === "object" && !Array.isArray(autonomy) ? "autonomy" : "user";
-      };
-      const hasClarificationSignal = (value) => {
-        const text = value.toLowerCase();
-        return text.includes("clarification") || text.includes("clarify") || text.includes("follow-up question") || text.includes("requested clarification");
-      };
-      const classifyAutonomyJobCompletion = (body) => {
-        const parts = [];
-        const summary = compactText4(body.summary, 1400);
-        if (summary)
-          parts.push(summary);
-        const detail = compactText4(body.detail, 1400);
-        if (detail)
-          parts.push(detail);
-        if (typeof body.result === "string") {
-          parts.push(compactText4(body.result, 1400));
-        } else if (body.result && typeof body.result === "object" && !Array.isArray(body.result)) {
-          parts.push(compactText4(JSON.stringify(body.result), 1800));
-        }
-        const artifacts = Array.isArray(body.artifacts) ? body.artifacts.filter((entry) => entry && typeof entry === "object") : [];
-        for (const artifact of artifacts.slice(0, 8)) {
-          const artifactText = compactText4(artifact.text ?? artifact.message, 400);
-          if (artifactText)
-            parts.push(artifactText);
-        }
-        const combined = parts.join(`
-`);
-        if (hasClarificationSignal(combined)) {
-          return {
-            success: false,
-            userAction: "needs_clarification",
-            reopenedWithin24h: true,
-            regressionFlag: false
-          };
-        }
-        if (classifyJobTerminalSemantics({
-          status: "completed",
-          result: body.result,
-          summary: body.summary,
-          detail: body.detail,
-          additionalEvidence: [combined]
-        }).noChange) {
-          return {
-            success: false,
-            userAction: "no_change",
-            reopenedWithin24h: true,
-            regressionFlag: false
-          };
-        }
-        return {
-          success: true,
-          userAction: "applied",
-          reopenedWithin24h: false,
-          regressionFlag: false
-        };
       };
       const classifyAutonomyFailureProjection = (body, params) => {
         const reviewAgent = params.reviewAgent;
@@ -30102,7 +30203,7 @@ function createRequestHandler() {
           body = await readBoundedJsonObject(req, 2 * 1024 * 1024, "Memory request");
         } catch (error) {
           const bounded = error;
-          return makeJson({ ok: false, message: bounded.message || "Invalid Memory request body" }, bounded.status === 413 ? 413 : 400);
+          return makeJson({ ok: false, message: bounded.message || "Invalid Memory request body" }, bounded.status === 413 ? 413 : 400, bounded.status === 413 ? { Connection: "close" } : {});
         }
         const operation = pathname === "/memory/records" && method === "PUT" ? "put" : pathname === "/memory/get" && method === "POST" ? "get" : pathname === "/memory/search" && method === "POST" ? "search" : pathname === "/memory/invalidate" && method === "POST" ? "invalidate" : pathname === "/memory/reinforce" && method === "POST" ? "reinforce" : pathname === "/memory/prune" && method === "POST" ? "prune" : null;
         if (!operation)
@@ -30177,7 +30278,7 @@ function createRequestHandler() {
           body = await readBoundedJsonObject(req, 256 * 1024, "RepositoryAgent request");
         } catch (error) {
           const bounded = error;
-          return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent request body" }, bounded.status === 413 ? 413 : 400);
+          return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent request body" }, bounded.status === 413 ? 413 : 400, bounded.status === 413 ? { Connection: "close" } : {});
         }
         try {
           const request = sanitizeRepositoryAgentRequest(body);
@@ -30241,7 +30342,7 @@ function createRequestHandler() {
           body = await readBoundedJsonObject(req, 64 * 1024, "RepositoryAgent claim");
         } catch (error) {
           const bounded = error;
-          return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent claim body" }, bounded.status === 413 ? 413 : 400);
+          return makeJson({ ok: false, message: bounded.message || "Invalid RepositoryAgent claim body" }, bounded.status === 413 ? 413 : 400, bounded.status === 413 ? { Connection: "close" } : {});
         }
         const agentId = compactText4(body.agentId, 256);
         const identities = Array.isArray(body.repositoryIdentities) ? body.repositoryIdentities.map((value) => compactText4(value, 1024)).filter(Boolean) : [];
@@ -30284,7 +30385,7 @@ function createRequestHandler() {
           body = await readBoundedJsonObject(req, 2 * 1024 * 1024, `RepositoryAgent ${action}`);
         } catch (error) {
           const bounded = error;
-          return makeJson({ ok: false, requestId, message: bounded.message || "Invalid RepositoryAgent body" }, bounded.status === 413 ? 413 : 400);
+          return makeJson({ ok: false, requestId, message: bounded.message || "Invalid RepositoryAgent body" }, bounded.status === 413 ? 413 : 400, bounded.status === 413 ? { Connection: "close" } : {});
         }
         const agentId = compactText4(body.agentId, 256);
         const claimToken = compactText4(body.claimToken, 512);

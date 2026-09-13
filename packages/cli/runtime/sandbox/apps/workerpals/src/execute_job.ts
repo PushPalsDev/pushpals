@@ -54,6 +54,10 @@ import type {
 } from "./common/types.js";
 import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
 import {
+  CapabilityRevisionCircuit,
+  withCapabilityBlockedResult,
+} from "./capability_revision_circuit.js";
+import {
   compactJobOutput,
   truncate,
   type OutputCompactionPolicy,
@@ -11642,6 +11646,7 @@ export async function executeJob(
       },
     } as T);
   const previousValidationFailureDigests = new Map<string, string>();
+  const capabilityRevisionCircuit = new CapabilityRevisionCircuit();
   const passingValidationCache = new Map<string, ValidationExecutionResult>();
   const failureJobFamily = buildTaskFailureJobFamily(normalizedParams);
   const diagnosticValidationRuns: JobValidationRunDiagnostics[] = [];
@@ -12232,6 +12237,29 @@ export async function executeJob(
         }),
       );
     };
+    const capabilityBlocker = capabilityRevisionCircuit.observe({
+      executorResult: result,
+      mustFix: critic?.mustFix ?? [],
+      criticRequiresRevision: Boolean(
+        critic && (critic.score < qualityCriticMinScore || critic.mustFix.length > 0),
+      ),
+      deterministicIssues: qualityForCritic.issues,
+      deterministicBlocker: qualityForCritic.blocker !== null,
+      targetPaths: planning.targetPaths ?? [],
+    });
+    if (capabilityBlocker) {
+      onLog?.(
+        "stderr",
+        `[QualityGate] capabilityBlocked=${JSON.stringify(capabilityBlocker)}. ` +
+          "Browser capture is unavailable in the executor environment; outer-container tool readiness does not establish agent sandbox capability. " +
+          "Retaining the candidate without publication. Resume only when the required rendered artifacts can be produced and reviewed.",
+      );
+      return withCapabilityBlockedResult(
+        annotateTerminalResult({ ...result, ok: false, exitCode: 4 }, "capability_blocked"),
+        capabilityBlocker,
+        publishableChangedPaths(quality.changedPaths),
+      );
+    }
     if (unchangedValidationFailure) {
       const detail =
         `Validation failed unchanged after two attempts for "${unchangedValidationFailure.command}": ` +

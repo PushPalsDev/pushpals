@@ -33,6 +33,8 @@ import {
   terminateManagedServiceTree,
   type EmbeddedRuntimeHealth,
   type ManagedServiceProcess,
+  type ManagedServiceLifecycleEvent,
+  type ManagedServiceSpec,
 } from "./start_runtime_services.js";
 import { forceDeleteWorktreePath } from "../apps/workerpals/src/common/worktree_cleanup.js";
 import { isDirectWorkerWorktreePath } from "../apps/workerpals/src/common/direct_worktree.js";
@@ -2650,7 +2652,9 @@ function readLogTail(logPath: string, maxLines = 40): string {
 }
 
 export type EmbeddedRuntimeCrashEnvelope = {
-  event: "embedded_runtime_crash";
+  event: "embedded_runtime_crash" | "embedded_runtime_exit";
+  exitCause: "native_crash" | "health_termination" | "unexpected_exit";
+  detail: string | null;
   crashId: string;
   service: string;
   runtimeVersion: string | null;
@@ -2661,6 +2665,7 @@ export type EmbeddedRuntimeCrashEnvelope = {
   jobId: string | null;
   memory: {
     rssBytes: number | null;
+    measurement: "crash_report_rss" | "managed_process_peak_rss" | "unavailable";
   };
   crashReport: string | null;
   crashSignature: string | null;
@@ -2684,6 +2689,8 @@ export function buildEmbeddedRuntimeCrashEnvelope(options: {
   rssBytes?: number | null;
   recoveryPlanned: boolean;
   observedAt: string;
+  exitCause?: "health_termination" | "unexpected_exit";
+  detail?: string;
 }): EmbeddedRuntimeCrashEnvelope {
   const logText = String(options.logText ?? "");
   const runtimeMatch = logText.match(/\bBun\s+v?(\d+\.\d+\.\d+(?:[-+][a-z0-9.-]+)?)/i);
@@ -2700,9 +2707,18 @@ export function buildEmbeddedRuntimeCrashEnvelope(options: {
   const signatureMatch = logText.match(
     /\b(?:panic\(main thread\)[^\r\n]*|segmentation fault[^\r\n]*|oh no:\s*bun has crashed[^\r\n]*)/i,
   );
-  const logRssBytes = rssMatch ? memoryValueToBytes(rssMatch[1], rssMatch[2]) : null;
+  // A retained old crash signature must not relabel a supervisor-directed kill.
+  const nativeCrash = options.exitCause !== "health_termination" && Boolean(signatureMatch);
+  const logRssBytes = nativeCrash && rssMatch ? memoryValueToBytes(rssMatch[1], rssMatch[2]) : null;
   return {
-    event: "embedded_runtime_crash",
+    event: nativeCrash ? "embedded_runtime_crash" : "embedded_runtime_exit",
+    exitCause:
+      options.exitCause === "health_termination"
+        ? "health_termination"
+        : nativeCrash
+          ? "native_crash"
+          : "unexpected_exit",
+    detail: options.detail ?? null,
     crashId: `crash_${crypto.randomUUID().slice(0, 12)}`,
     service: options.service,
     runtimeVersion: runtimeMatch?.[1] ?? process.versions.bun ?? null,
@@ -2712,17 +2728,60 @@ export function buildEmbeddedRuntimeCrashEnvelope(options: {
     requestId: requestMatch?.[1] ?? null,
     jobId: jobMatch?.[1] ?? null,
     memory: {
+      // The managed process can be an isolated launcher, not the service child.
+      measurement:
+        logRssBytes !== null
+          ? "crash_report_rss"
+          : typeof options.rssBytes === "number" && Number.isFinite(options.rssBytes)
+            ? "managed_process_peak_rss"
+            : "unavailable",
       rssBytes:
         logRssBytes ??
         (typeof options.rssBytes === "number" && Number.isFinite(options.rssBytes)
           ? Math.max(0, Math.floor(options.rssBytes))
           : null),
     },
-    crashReport: crashReportMatch?.[0] ?? null,
-    crashSignature: signatureMatch?.[0] ?? null,
+    crashReport: nativeCrash ? (crashReportMatch?.[0] ?? null) : null,
+    crashSignature: nativeCrash ? (signatureMatch?.[0] ?? null) : null,
     recoveryOutcome: options.recoveryPlanned ? "restart_planned" : "restart_not_planned",
     observedAt: options.observedAt,
   };
+}
+
+export function embeddedRuntimeRecoveryOutcome(
+  event: Extract<
+    ManagedServiceLifecycleEvent,
+    { type: "restarted" | "recovered" | "recovery_exhausted" }
+  >,
+): "restart_started" | "recovered" | "launcher_ready" | "recovery_exhausted" {
+  if (event.type === "recovery_exhausted") return "recovery_exhausted";
+  if (event.type === "restarted") return "restart_started";
+  if (event.confirmation === "process_started") return "restart_started";
+  return event.confirmation === "health_probe" ? "recovered" : "launcher_ready";
+}
+
+export function embeddedServiceHealthCheck(
+  serviceName: string,
+  serverUrl: string,
+  scmPort: number,
+): ManagedServiceSpec["healthCheck"] {
+  if (serviceName === "source_control_manager")
+    return {
+      url: `http://127.0.0.1:${scmPort}/health`,
+      intervalMs: 5_000,
+      timeoutMs: 2_500,
+      unhealthyThreshold: 3,
+      transportFailureGraceMs: 60_000,
+    };
+  // Observe shared local HTTP failures without cascading process-tree kills.
+  if (serviceName === "server")
+    return {
+      url: `${serverUrl.replace(/\/$/, "")}/healthz`,
+      intervalMs: 5_000,
+      timeoutMs: 2_500,
+      restartOnFailure: false,
+    };
+  return undefined;
 }
 
 export function buildEmbeddedRuntimeCrashFingerprint(logText: string): string | null {
@@ -5782,6 +5841,11 @@ async function autoStartRuntimeServices(opts: {
       appendRuntimeServicesLogLine(runtimeServicesLogPath, cliLine);
     },
     onLifecycleEvent: (event) => {
+      if (event.type === "health") {
+        const line = `[pushpals] embeddedRuntimeHealth=${JSON.stringify({ ...event, event: "embedded_runtime_health" })}`;
+        appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
+        return;
+      }
       if (event.type === "exit") {
         const logPath =
           serviceLogPaths[event.service as keyof RuntimeServiceLogPaths] ?? runtimeServicesLogPath;
@@ -5793,34 +5857,37 @@ async function autoStartRuntimeServices(opts: {
           rssBytes: event.rssBytes,
           recoveryPlanned: event.recoveryPlanned,
           observedAt: event.observedAt,
+          exitCause: event.exitCause,
+          detail: event.detail,
         });
         pendingCrashEnvelopes.set(event.service, {
           envelope,
           observedAtMs: Date.parse(event.observedAt),
         });
-        const line = `[pushpals] embeddedRuntimeCrash=${JSON.stringify(envelope)}`;
+        const line = `[pushpals] ${envelope.event === "embedded_runtime_crash" ? "embeddedRuntimeCrash" : "embeddedRuntimeExit"}=${JSON.stringify(envelope)}`;
         console.warn(line);
         appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
         return;
       }
       const pending = pendingCrashEnvelopes.get(event.service);
       const recoveredAtMs = Date.parse(event.observedAt);
-      const recoveryOutcome =
-        event.type === "recovery_exhausted" ? "recovery_exhausted" : "recovered";
+      const recoveryOutcome = embeddedRuntimeRecoveryOutcome(event);
       const recovery = {
         event: "embedded_runtime_recovery",
         crashId: pending?.envelope.crashId ?? null,
         service: event.service,
         runtimeVersion: pending?.envelope.runtimeVersion ?? null,
         recoveryOutcome,
+        healthConfirmed: event.type === "recovered" && event.confirmation === "health_probe",
         recoveryDurationMs:
           pending && Number.isFinite(recoveredAtMs) && Number.isFinite(pending.observedAtMs)
             ? Math.max(0, recoveredAtMs - pending.observedAtMs)
             : null,
         restartAttempt: event.restartAttempt,
-        recoveredAt: event.observedAt,
+        observedAt: event.observedAt,
+        recoveredAt: recoveryOutcome === "recovered" ? event.observedAt : null,
       };
-      pendingCrashEnvelopes.delete(event.service);
+      if (event.type !== "restarted") pendingCrashEnvelopes.delete(event.service);
       const line = `[pushpals] embeddedRuntimeRecovery=${JSON.stringify(recovery)}`;
       if (event.type === "recovery_exhausted") console.error(line);
       else console.log(line);
@@ -5892,16 +5959,7 @@ async function autoStartRuntimeServices(opts: {
         appendFileSync(logPath, `${serviceLine}\n`, "utf8");
         appendRuntimeServicesLogLine(runtimeServicesLogPath, `[${name}] ${serviceLine}`);
       },
-      ...(name === "source_control_manager"
-        ? {
-            healthCheck: {
-              url: `http://127.0.0.1:${opts.sourceControlManagerPort}/health`,
-              intervalMs: 5_000,
-              timeoutMs: 2_500,
-              unhealthyThreshold: 3,
-            },
-          }
-        : {}),
+      healthCheck: embeddedServiceHealthCheck(name, opts.serverUrl, opts.sourceControlManagerPort),
     };
   };
   let latestServiceLaunchAtMs = 0;

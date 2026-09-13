@@ -170,6 +170,19 @@ circuit compares failed-test identities and assertion context, so a changed
 failure cluster can receive another bounded repair while an exact repeat still
 stops.
 
+If two consecutive revisions have clean runnable checks but the executor still
+cannot obtain browser captures required by the critic, the capability circuit
+stops the editing loop with `capability_blocked` / `environment.browser`.
+Current execution evidence must show the missing capability; historical trace
+text and a subsequently recovered capture do not qualify. The failure retains
+the candidate checkpoint and typed `browser_capture` blocker. It is not a
+trusted-validation handoff or permission to publish without the required images.
+For an owned PR repair, Server holds that exact PR head without consuming more
+repair attempts or closing the PR; unrelated work remains claimable. An unrelated
+base-branch merge does not restore browser capability. Explicit resolution or a
+new PR head is required to reconsider that repair. This circuit does not itself
+provide browser access or prove that screenshots have been reviewed.
+
 Packaged WorkerPal sandbox images receive the complete runtime prompt bundle,
 including the shared ReviewAgent rubric used by CriticGate. Package-payload and
 runtime-completeness checks require the critical critic/reviewer files. If an

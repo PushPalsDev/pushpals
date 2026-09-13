@@ -372,6 +372,70 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
     expect(candidates).toHaveLength(0);
   });
 
+  test("repo fallback requires domain evidence rather than generic surface bonuses", () => {
+    const focusedVision = {
+      ...vision,
+      key_items: {
+        ...vision.key_items,
+        priorities: ["Improve document search accuracy"],
+        objectives: [],
+        metrics: [],
+      },
+    };
+    const repoTargets = [
+      "src/account/index.ts",
+      "app/privacy.tsx",
+      "app/__tests__/fixtures/module.cjs",
+    ].map((label) => ({
+      component_area: "app",
+      target_paths: [label],
+      write_globs: [label],
+      label,
+      keywords: ["app", "product_core", "reliability", "validation"],
+    }));
+    const context = buildEngineInspirationContext({ vision: focusedVision, snapshot, repoTargets });
+    for (const targets of [repoTargets, []]) {
+      expect(
+        buildRepoVisionFallbackCandidates({
+          engineInspiration: context,
+          snapshotTopSignals: snapshot.top_signals,
+          visionSectionRefs: ["1"],
+          repoTargets: targets,
+        }),
+      ).toEqual([]);
+    }
+  });
+
+  test("repo fallback does not select a matching fixture for a runtime improvement", () => {
+    const focusedVision = {
+      ...vision,
+      key_items: {
+        ...vision.key_items,
+        priorities: ["Improve document search accuracy"],
+        objectives: [],
+        metrics: [],
+      },
+    };
+    const repoTargets = [
+      {
+        component_area: "app/__tests__/fixtures",
+        target_paths: ["app/__tests__/fixtures/search.ts"],
+        write_globs: ["app/__tests__/fixtures/search.ts"],
+        label: "app/__tests__/fixtures/search.ts",
+        keywords: ["search", "accuracy"],
+      },
+    ];
+    const context = buildEngineInspirationContext({ vision: focusedVision, snapshot, repoTargets });
+    expect(
+      buildRepoVisionFallbackCandidates({
+        engineInspiration: context,
+        snapshotTopSignals: snapshot.top_signals,
+        visionSectionRefs: ["1"],
+        repoTargets,
+      }),
+    ).toEqual([]);
+  });
+
   test("repo fallback preserves package-manager and build-tool validation", () => {
     const cases = [
       {
@@ -1917,6 +1981,26 @@ describe("RemoteBuddy autonomous engine idea generation", () => {
       "The current priority is to reduce checkout abandonment.",
     ]);
     expect(context.compiled_repo_objectives[0]?.section_ref).toBe("4");
+  });
+
+  test("priority-container prose does not promote nested non-goals", () => {
+    const scopedVision = {
+      ...vision,
+      key_items: { ...vision.key_items, priorities: [], objectives: [], metrics: [] },
+      sections: [
+        {
+          number: "1",
+          title: "Current priorities",
+          markdown:
+            "Improve document search accuracy.\n\n### Non-goals\n\nAdd unrelated billing features.",
+          truncated: false,
+        },
+      ],
+    };
+    const context = buildEngineInspirationContext({ vision: scopedVision, snapshot });
+    expect(context.compiled_repo_objectives.map((objective) => objective.title)).toEqual([
+      "Improve document search accuracy.",
+    ]);
   });
 
   test("repo fallback resolves auto Docker execution to the Linux project wrapper", () => {

@@ -825,6 +825,13 @@ export function inferWorkerTerminalFailureClass(result: JobResult): string {
   if (result.ok) return "success";
   const structuredTerminal = result.diagnostics?.terminal;
   const structuredFailureClass = String(structuredTerminal?.failureClass ?? "").trim();
+  if (
+    structuredFailureClass === "environment.browser" &&
+    structuredTerminal?.terminalStage === "capability_blocked" &&
+    structuredTerminal.metadata?.classificationOwner === "worker_capability_circuit"
+  ) {
+    return structuredFailureClass;
+  }
   if (structuredFailureClass && structuredTerminal?.terminalStage === "worker_runtime") {
     // JobRunner owns this boundary and emits it only for fatal failures in the
     // WorkerPal process itself. It may not have a stack after serialization.
@@ -3088,11 +3095,14 @@ async function workerLoop(
                   terminalStage:
                     terminalFailureClass === "codex_startup_stall"
                       ? "executor_startup"
-                      : completionEnqueued
-                        ? result.validationBlocked
-                          ? "trusted_environment_validation"
-                          : "publication"
-                        : (currentJobPhase ?? (result.ok ? "completed" : "worker")),
+                      : terminalFailureClass === "environment.browser" &&
+                          result.diagnostics?.terminal?.terminalStage === "capability_blocked"
+                        ? "capability_blocked"
+                        : completionEnqueued
+                          ? result.validationBlocked
+                            ? "trusted_environment_validation"
+                            : "publication"
+                          : (currentJobPhase ?? (result.ok ? "completed" : "worker")),
                   executorBackend: resolveExecutor(CONFIG),
                   summary: result.summary,
                   watchdogFired: didWorkerWatchdogFire(result),
@@ -3101,6 +3111,10 @@ async function workerLoop(
                     docker: Boolean(dockerExecutor),
                     jobKind: job.kind,
                     phase: currentJobPhase,
+                    ...(terminalFailureClass === "environment.browser" &&
+                    result.diagnostics?.terminal?.terminalStage === "capability_blocked"
+                      ? { candidateState: result.candidateState ?? null }
+                      : {}),
                   },
                 },
               }),

@@ -36,12 +36,18 @@ const phases: HarnessPhase[] = [
       "tests/remotebuddy.repository-agent.test.ts",
       "tests/remotebuddy.llm-repository-context.test.ts",
       "tests/remotebuddy.autonomous-engine.tick.test.ts",
+      "tests/remotebuddy.autonomous-engine-ideas.test.ts",
+      "tests/shared.vision-doc.test.ts",
     ],
     timeoutMs: 300_000,
   },
   {
     name: "failure_evidence",
     files: [
+      "tests/server.failure-circuit-evidence.test.ts",
+      "tests/server.job-terminal-semantics.test.ts",
+      "tests/server.job-completion-outcome.test.ts",
+      "tests/run-health-report.test.ts",
       "tests/shared.trusted-validation-evidence.test.ts",
       "tests/client.pushpals-api.test.ts",
       "tests/server.completions-queue.test.ts",
@@ -53,6 +59,7 @@ const phases: HarnessPhase[] = [
   {
     name: "durable_lifecycle",
     files: [
+      "tests/server.event-store-startup-lock.test.ts",
       "tests/server.autonomy-store.test.ts",
       "tests/server.lifecycle-reconciliation.test.ts",
       "tests/server.job-diagnostics.test.ts",
@@ -97,6 +104,7 @@ const phases: HarnessPhase[] = [
       "tests/workerpals.quality-gate-issues.test.ts",
       "tests/workerpals.quality-loop-durability.test.ts",
       "tests/workerpals.executor-timeout-recovery.test.ts",
+      "tests/workerpals.capability-revision-circuit.test.ts",
       "tests/workerpals.docker-deadline.test.ts",
       "tests/workerpals.commit-message-generation.test.ts",
       "tests/workerpals.validation-command-safety.test.ts",
@@ -119,6 +127,7 @@ const phases: HarnessPhase[] = [
   {
     name: "runtime_boundary",
     files: [
+      "tests/server.bounded-json-body.test.ts",
       "tests/workerpals.docker-executor.test.ts",
       "tests/workerpals.job-result-transport.test.ts",
       "tests/workerpals.worktree-boundary.test.ts",

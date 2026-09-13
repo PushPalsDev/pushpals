@@ -44,24 +44,48 @@ export class EventStore {
   private insertSessionStmt: ReturnType<Database["prepare"]>;
   private getSessionStmt: ReturnType<Database["prepare"]>;
 
-  constructor(dbPath: string = ":memory:") {
+  constructor(dbPath: string = ":memory:", options: { startupBusyTimeoutMs?: number } = {}) {
     this.db = new Database(dbPath);
+    const startupBusyTimeoutMs = Math.max(
+      1,
+      Math.min(
+        1_000,
+        Number.isFinite(options.startupBusyTimeoutMs)
+          ? Math.floor(options.startupBusyTimeoutMs!)
+          : 1_000,
+      ),
+    );
+    try {
+      const priorBusyTimeout = this.db.query("PRAGMA busy_timeout;").get() as {
+        timeout?: unknown;
+      } | null;
+      const runtimeBusyTimeoutMs =
+        typeof priorBusyTimeout?.timeout === "number" &&
+        Number.isSafeInteger(priorBusyTimeout.timeout) &&
+        priorBusyTimeout.timeout >= 0
+          ? priorBusyTimeout.timeout
+          : 0;
+      // Set the handler before WAL/schema work: a retiring process may still
+      // own a short-lived SQLite lock during restart. The bound is per SQL
+      // statement (not an overall migration deadline). This is startup-only;
+      // request/event writes must not acquire a new synchronous one-second wait.
+      this.db.exec(`PRAGMA busy_timeout = ${startupBusyTimeoutMs};`);
 
-    // WAL mode for concurrent reads + writes
-    this.db.exec("PRAGMA journal_mode = WAL;");
-    this.db.exec("PRAGMA synchronous = NORMAL;");
-    this.db.exec("PRAGMA foreign_keys = ON;");
+      // WAL mode for concurrent reads + writes
+      this.db.exec("PRAGMA journal_mode = WAL;");
+      this.db.exec("PRAGMA synchronous = NORMAL;");
+      this.db.exec("PRAGMA foreign_keys = ON;");
 
-    this._migrate();
+      this._migrate();
 
-    // Prepare statements
-    this.insertEventStmt = this.db.prepare(`
+      // Prepare statements
+      this.insertEventStmt = this.db.prepare(`
       INSERT INTO events (id, session_id, type, ts, envelope)
       VALUES ($id, $sessionId, $type, $ts, $envelope)
       RETURNING event_id AS eventId
     `);
 
-    this.getEventsAfterStmt = this.db.prepare(`
+      this.getEventsAfterStmt = this.db.prepare(`
       SELECT event_id AS eventId, id, session_id AS sessionId, type, ts, envelope
       FROM events
       WHERE session_id = $sessionId AND event_id > $afterEventId
@@ -69,28 +93,38 @@ export class EventStore {
       LIMIT $limit
     `);
 
-    this.getAllEventsStmt = this.db.prepare(`
+      this.getAllEventsStmt = this.db.prepare(`
       SELECT event_id AS eventId, id, session_id AS sessionId, type, ts, envelope
       FROM events
       WHERE session_id = $sessionId
       ORDER BY event_id ASC
     `);
 
-    this.getLatestCursorStmt = this.db.prepare(`
+      this.getLatestCursorStmt = this.db.prepare(`
       SELECT MAX(event_id) AS cursor FROM events WHERE session_id = $sessionId
     `);
 
-    this.insertSessionStmt = this.db.prepare(`
+      this.insertSessionStmt = this.db.prepare(`
       INSERT INTO sessions (session_id, created_at, label)
       VALUES ($sessionId, $createdAt, $label)
       ON CONFLICT(session_id) DO NOTHING
     `);
 
-    this.getSessionStmt = this.db.prepare(`
+      this.getSessionStmt = this.db.prepare(`
       SELECT session_id AS sessionId, created_at AS createdAt, label
       FROM sessions
       WHERE session_id = $sessionId
     `);
+      this.db.exec(`PRAGMA busy_timeout = ${runtimeBusyTimeoutMs};`);
+    } catch (error) {
+      // A failed constructor has no owner that can later call close().
+      try {
+        this.db.close();
+      } catch {
+        /* Preserve the original initialization error. */
+      }
+      throw error;
+    }
   }
 
   // ─── Schema migration ──────────────────────────────────────────────────

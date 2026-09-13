@@ -13,6 +13,8 @@ describe("reliability harness release coverage", () => {
     expect(files).toContain("tests/server.repository-agent-queue.test.ts");
     expect(files).toContain("tests/memory-store-conformance.test.ts");
     expect(files).toContain("tests/remotebuddy.autonomous-engine.tick.test.ts");
+    expect(files).toContain("tests/remotebuddy.autonomous-engine-ideas.test.ts");
+    expect(files).toContain("tests/shared.vision-doc.test.ts");
   });
 
   test("gates the composed worker quality loop and watchdog policy", () => {
@@ -22,6 +24,7 @@ describe("reliability harness release coverage", () => {
     expect(files).toContain("tests/workerpals.quality-gate-issues.test.ts");
     expect(files).toContain("tests/workerpals.quality-loop-durability.test.ts");
     expect(files).toContain("tests/workerpals.executor-timeout-recovery.test.ts");
+    expect(files).toContain("tests/workerpals.capability-revision-circuit.test.ts");
     expect(files).toContain("tests/workerpals.docker-deadline.test.ts");
     expect(files).toContain("tests/workerpals.commit-message-generation.test.ts");
     expect(files).toContain("tests/workerpals.validation-command-safety.test.ts");
@@ -48,6 +51,7 @@ describe("reliability harness release coverage", () => {
     expect(repairFiles).toContain("tests/source-control-manager.review-journal.test.ts");
     expect(repairFiles).toContain("tests/source-control-manager.github-pr.test.ts");
     expect(runtimeFiles).toContain("tests/shared.scm-repair-authority.test.ts");
+    expect(runtimeFiles).toContain("tests/server.bounded-json-body.test.ts");
     expect(runtimeFiles).toContain("tests/cli.runtime-bootstrap.test.ts");
     expect(runtimeFiles).toContain("tests/remotebuddy.llm-codex.test.ts");
     expect(runtimeFiles).toContain("tests/workerpals.sandbox-env.test.ts");
@@ -62,6 +66,10 @@ describe("reliability harness release coverage", () => {
     expect(repairFiles).toContain("tests/source-control-manager.completion-lease.test.ts");
     expect(evidenceFiles).toContain("tests/source-control-manager.trusted-validation.test.ts");
     expect(evidenceFiles).toContain("tests/shared.trusted-validation-evidence.test.ts");
+    expect(evidenceFiles).toContain("tests/server.failure-circuit-evidence.test.ts");
+    expect(evidenceFiles).toContain("tests/server.job-terminal-semantics.test.ts");
+    expect(evidenceFiles).toContain("tests/server.job-completion-outcome.test.ts");
+    expect(evidenceFiles).toContain("tests/run-health-report.test.ts");
   });
 
   test("gates retained review candidates across target-base movement and lease recovery", () => {
@@ -84,6 +92,7 @@ describe("reliability harness release coverage", () => {
     const runtimeFiles = listReliabilityHarnessPhaseFiles("runtime_boundary");
 
     expect(lifecycleFiles).toContain("tests/server.job-diagnostics.test.ts");
+    expect(lifecycleFiles).toContain("tests/server.event-store-startup-lock.test.ts");
     expect(lifecycleFiles).toContain("tests/server.jobs.stale-recovery.test.ts");
     expect(lifecycleFiles).toContain("tests/server.jobs-repair-scheduling.test.ts");
     expect(lifecycleFiles).toContain("tests/server.session-message-route.test.ts");

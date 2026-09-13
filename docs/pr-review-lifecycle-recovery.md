@@ -74,6 +74,15 @@ neither regenerated nor automatically closed; it needs explicit resolution or a
 changed head/base. The original repair capability is not rewritten to invent new
 authority. Conflicts are never resolved by dropping changes or bypassing checks.
 
+Browser-evidence capability failures use a distinct hold. Server accepts only a
+typed, repeated `browser_capture` blocker from the current fenced repair job.
+It preserves the failed job and retained checkpoint, releases the lifecycle's
+active job, and does not clone another attempt or close the PR. That hold is
+scoped to the PR head, not the target base: unrelated base merges cannot repair
+an unavailable browser. It survives restart until explicit resolution or a new
+head; other jobs remain claimable. This is an honest capability block, not
+successful validation or automatic provisioning of browser capture.
+
 A closed PR or a replaced head can settle an obsolete repair as `abandoned` with
 `publication_superseded`, without exhausting code-quality retries. These typed
 outcomes use the existing fenced completion callback and the original durable

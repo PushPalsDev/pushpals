@@ -9,10 +9,51 @@ import {
   resolveLocalBuddyRuntimeAction,
   resolveLocalBuddyStartGate,
   shouldDetachManagedServiceProcess,
+  shouldTerminateAfterHealthFailure,
+  type ManagedServiceHealthResult,
+  type ManagedServiceLifecycleEvent,
 } from "../scripts/start_runtime_services";
 import { SCM_REPAIR_AUTHORITY_SECRET_ENV } from "../packages/shared/src/scm_repair_authority";
+import { createServer, type Socket } from "node:net";
 
 describe("start runtime service helpers", () => {
+  test("health probes bypass a silent pooled socket without weakening the deadline", async () => {
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const listener = createServer((socket) => {
+      sockets.add(socket);
+      connections += 1;
+      let requests = 0;
+      socket.on("data", () => {
+        requests += 1;
+        // A new connection is healthy; a reused one simulates a half-open peer.
+        if (requests === 1)
+          socket.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
+      });
+      socket.on("close", () => sockets.delete(socket));
+    });
+    await new Promise<void>((resolve, reject) => {
+      listener.once("error", reject);
+      listener.listen(0, "127.0.0.1", resolve);
+    });
+    const address = listener.address();
+    if (!address || typeof address === "string") throw new Error("TCP fixture has no port");
+    const url = `http://127.0.0.1:${address.port}/health`;
+    try {
+      await (await fetch(url)).text();
+      await Bun.sleep(10);
+      expect(connections).toBe(1);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const health = await defaultProbeServiceHealth({ url, timeoutMs: 250 });
+        expect(health.ok).toBe(true);
+        expect(health.responseStatus).toBe(200);
+      }
+      expect(connections).toBe(4);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  }, 5_000);
   test("caps no-newline managed service output while continuing to drain", async () => {
     const lines: string[] = [];
     const stream = new ReadableStream<Uint8Array>({
@@ -48,9 +89,244 @@ describe("start runtime service helpers", () => {
 
     await Bun.sleep(0);
     expect(health.ok).toBe(false);
+    expect(health.failureKind).toBe("transport_error");
     expect(health.detail).toContain("timed out after 250ms");
     expect(bodyCancelled).toBe(true);
     expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  test("explicit unhealthy responses stay distinct from transport timeouts", async () => {
+    const health = await defaultProbeServiceHealth(
+      { url: "http://127.0.0.1/unhealthy" },
+      async () => Response.json({ healthy: false, reason: "tick stalled" }, { status: 503 }),
+    );
+    expect(health.failureKind).toBe("unhealthy_response");
+    expect(health.responseStatus).toBe(503);
+    expect(health.ok).toBe(false);
+  });
+
+  test("three brief transport timeouts cannot kill validation, but sustained failure remains bounded", () => {
+    const failure = {
+      failureKind: "transport_error" as const,
+      consecutiveFailures: 3,
+      unhealthyThreshold: 3,
+      failureDurationMs: 10_000,
+    };
+    expect(shouldTerminateAfterHealthFailure(failure)).toBe(false);
+    expect(shouldTerminateAfterHealthFailure({ ...failure, failureDurationMs: 59_999 })).toBe(
+      false,
+    );
+    expect(shouldTerminateAfterHealthFailure({ ...failure, failureDurationMs: 60_000 })).toBe(true);
+    expect(
+      shouldTerminateAfterHealthFailure({ ...failure, failureKind: "unhealthy_response" }),
+    ).toBe(true);
+    expect(
+      shouldTerminateAfterHealthFailure({
+        ...failure,
+        consecutiveFailures: 2,
+        failureDurationMs: 90_000,
+      }),
+    ).toBe(false);
+  });
+
+  test("shared transport outage is visible, recovers without kills, and a later sustained SCM outage restarts only SCM", async () => {
+    let now = 1_000;
+    let health: ManagedServiceHealthResult = {
+      ok: false,
+      detail: "HTTP timeout",
+      failureKind: "transport_error",
+    };
+    const terminated: string[] = [];
+    const events: ManagedServiceLifecycleEvent[] = [];
+    const manager = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      computeRestartBackoffMs: () => 1,
+      probeServiceHealth: async () => health,
+      onLifecycleEvent: (event) => events.push(event),
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: { kill() {} } as any,
+        command: spec.command,
+        cwd: spec.cwd,
+        env: {},
+        exited: false,
+        exitCode: null,
+        launchedAtMs: now,
+      }),
+      terminateService: async (service) => {
+        terminated.push(service.name);
+        service.exited = true;
+        service.exitCode = 1;
+      },
+      // A prior native signature must not open the crash circuit for health-directed kills.
+      resolveExitFingerprint: () => {
+        throw new Error("must not fingerprint a health-directed kill");
+      },
+    });
+    const tick = async (at: number) => {
+      now = at;
+      (manager as any).tick();
+      await Bun.sleep(0);
+    };
+    try {
+      for (const name of ["server", "source_control_manager"])
+        manager.startService({
+          name,
+          color: "",
+          command: ["fake"],
+          cwd: process.cwd(),
+          healthCheck: {
+            url: `http://127.0.0.1/${name}`,
+            intervalMs: 50,
+            restartOnFailure: name !== "server",
+          },
+        });
+      await tick(1_000);
+      await tick(6_000);
+      await tick(11_000);
+      expect(terminated).toEqual([]);
+      expect(manager.getHealth()?.detail).toContain("server");
+      expect(manager.getHealth()?.detail).toContain("source_control_manager");
+      health = { ok: true, detail: "healthy", responseStatus: 200 };
+      await tick(16_000);
+      expect(manager.getHealth()).toBeNull();
+
+      health = { ok: false, detail: "HTTP timeout", failureKind: "transport_error" };
+      await tick(20_000);
+      await tick(50_000);
+      await tick(79_999);
+      expect(terminated).toEqual([]);
+      await tick(80_100);
+      expect(terminated).toEqual(["source_control_manager"]);
+      await tick(80_200);
+      await Bun.sleep(5);
+      expect(events.filter((event) => event.type === "restarted")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "recovered")).toHaveLength(0);
+      const exit = events.find((event) => event.type === "exit");
+      expect(exit?.type === "exit" && exit.exitCause).toBe("health_termination");
+      expect(manager.getHealth()).not.toBeNull();
+      health = { ok: true, detail: "healthy", responseStatus: 200 };
+      await tick(85_000);
+      expect(events.filter((event) => event.type === "recovered")).toEqual([
+        expect.objectContaining({
+          service: "source_control_manager",
+          confirmation: "health_probe",
+          observedAt: new Date(85_000).toISOString(),
+        }),
+      ]);
+      expect(manager.getHealth()).toBeNull();
+      expect(terminated).toEqual(["source_control_manager"]);
+    } finally {
+      manager.stop();
+    }
+  });
+
+  test("alternating HTTP errors and timeouts cannot reset the sustained-outage deadline", async () => {
+    let now = 1_000;
+    let probes = 0;
+    let terminations = 0;
+    const manager = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      probeServiceHealth: async () => ({
+        ok: false,
+        detail: "unavailable",
+        failureKind: ++probes % 2 ? "unhealthy_response" : "transport_error",
+      }),
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: { kill() {} } as any,
+        command: spec.command,
+        cwd: spec.cwd,
+        env: {},
+        exited: false,
+        exitCode: null,
+        launchedAtMs: now,
+      }),
+      terminateService: async (service) => {
+        terminations += 1;
+        service.exited = true;
+        service.exitCode = 1;
+      },
+    });
+    const tick = async (at: number) => {
+      now = at;
+      (manager as any).tick();
+      await Bun.sleep(0);
+    };
+    try {
+      manager.startService({
+        name: "scm",
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: { url: "http://127.0.0.1/health", intervalMs: 50, unhealthyThreshold: 3 },
+      });
+      await tick(1_000);
+      await tick(20_000);
+      await tick(40_000);
+      expect(terminations).toBe(0); // No three consecutive explicit unhealthy responses.
+      await tick(61_000);
+      expect(terminations).toBe(1); // Continuous outage still reached its 60-second bound.
+    } finally {
+      manager.stop();
+    }
+  });
+
+  test("best-effort termination without process exit is bounded and retried instead of latching forever", async () => {
+    let now = 1_000;
+    let terminations = 0;
+    const logs: string[] = [];
+    const manager = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      terminationExitConfirmationMs: 5,
+      probeServiceHealth: async () => ({
+        ok: false,
+        detail: "tick stalled",
+        failureKind: "unhealthy_response",
+      }),
+      onEvent: (_level, line) => logs.push(line),
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: { kill() {}, exited: new Promise<number>(() => {}) } as any,
+        command: spec.command,
+        cwd: spec.cwd,
+        env: {},
+        exited: false,
+        exitCode: null,
+        launchedAtMs: now,
+      }),
+      terminateService: async (service) => {
+        terminations += 1;
+        if (terminations === 2) {
+          service.exited = true;
+          service.exitCode = 1;
+        }
+      },
+    });
+    try {
+      manager.startService({
+        name: "scm",
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: { url: "http://127.0.0.1/health", intervalMs: 50, unhealthyThreshold: 1 },
+      });
+      (manager as any).tick();
+      await Bun.sleep(15);
+      expect(terminations).toBe(1);
+      expect(manager.getService("scm")?.exited).toBe(false);
+      expect(logs.some((line) => line.includes("without confirmed process exit"))).toBe(true);
+      now = 2_000;
+      (manager as any).tick();
+      await Bun.sleep(0);
+      expect(terminations).toBe(2);
+      expect(manager.getService("scm")?.exited).toBe(true);
+    } finally {
+      manager.stop();
+    }
   });
 
   test("builds forced Windows process-tree termination for unhealthy services", () => {

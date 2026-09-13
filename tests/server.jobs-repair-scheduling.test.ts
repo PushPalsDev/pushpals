@@ -136,6 +136,124 @@ function removeClosedSqliteFixture(root: string) {
 }
 
 describe("server JobQueue repair scheduling", () => {
+  test("holds a fenced repeated capability blocker without cloning or exhausting the repair", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-capability-held-"));
+    const dbPath = join(root, "state.sqlite");
+    let queue = new JobQueue(dbPath);
+    const db = new Database(dbPath);
+    try {
+      const created = enqueueAuthorizedReviewRepair(
+        queue,
+        {
+          taskId: "capability-held",
+          sessionId: "dev",
+          kind: "task.execute",
+        },
+        "capability-held",
+      );
+      const jobId = String(created.jobId);
+      const claim = queue.claim("worker-source-capability-held");
+      expect(claim.job?.id).toBe(jobId);
+      const candidateState = {
+        status: "held",
+        reason: "Browser capture capability unavailable",
+        changedPaths: ["src/widget.ts"],
+        checkpoint: {
+          ref: "refs/pushpals/candidates/worker/job",
+          sha: "c".repeat(40),
+          capturedAt: new Date().toISOString(),
+        },
+      };
+      const fail = {
+        message: "Browser captures are unavailable in the execution sandbox",
+        diagnostics: {
+          terminal: {
+            status: "failed",
+            failureClass: "environment.browser",
+            terminalStage: "capability_blocked",
+            summary: "Required rendered evidence remains unavailable; candidate retained",
+            metadata: {
+              candidateState,
+              capabilityBlocker: {
+                version: 1,
+                capability: "browser_capture",
+                fingerprint: "a".repeat(64),
+                occurrences: 2,
+                requiredEvidence: ["rendered_artifacts"],
+                disposition: "await_capability",
+                classificationOwner: "worker_capability_circuit",
+              },
+            },
+          },
+        },
+      };
+      const owner = { workerId: claim.job!.workerId!, claimGeneration: claim.job!.claimGeneration };
+      expect(
+        queue.fail(jobId, fail, { ...owner, claimGeneration: owner.claimGeneration + 1 }).ok,
+      ).toBe(false);
+      expect(queue.fail(jobId, fail, owner).ok).toBe(true);
+      expect(queue.fail(jobId, fail, owner).replayed).toBe(true);
+      for (let reopen = 0; reopen < 2; reopen++) {
+        if (reopen) {
+          queue.close();
+          queue = new JobQueue(dbPath);
+        }
+        expect(
+          db.query("SELECT status, activeJobId, attemptCount FROM pr_repair_lifecycle").get(),
+        ).toEqual({ status: "held", activeJobId: null, attemptCount: 1 });
+        expect(db.query("SELECT COUNT(*) n FROM jobs").get()).toEqual({ n: 2 });
+        expect(
+          queue.getReviewRepairLifecycleState({
+            repositoryIdentity: "https://github.com/example/repo.git",
+            prNumber: 697,
+            headSha: "abc1234",
+            baseSha: "def5678",
+          }).state,
+        ).toBe("held");
+        expect(
+          queue.getReviewRepairLifecycleState({
+            repositoryIdentity: "https://github.com/example/repo.git",
+            prNumber: 697,
+            headSha: "abc1234",
+            baseSha: "new-base",
+          }).state,
+        ).toBe("held");
+        expect(
+          queue.getReviewRepairLifecycleState({
+            repositoryIdentity: "https://github.com/example/repo.git",
+            prNumber: 697,
+            headSha: "new-head",
+            baseSha: "new-base",
+          }).state,
+        ).toBe("none");
+        const params = reviewRepairParams();
+        expect(
+          queue.reviewRepairAdmission({
+            params: {
+              ...params,
+              reviewAgent: { ...params.reviewAgent, prBaseSha: "new-base" },
+            },
+          }),
+        ).toMatchObject({ held: true, authorized: false, exhausted: false });
+        expect((queue.getJobDiagnostics(jobId).terminal as any).metadata.candidateState).toEqual(
+          candidateState,
+        );
+        queue.reconcileReviewRepairLifecycles();
+      }
+      const unrelated = queue.enqueue({
+        taskId: "unrelated-capable-work",
+        sessionId: "dev",
+        kind: "task.execute",
+        params: {},
+      });
+      expect(queue.claim("worker-unrelated").job?.id).toBe(unrelated.jobId);
+    } finally {
+      db.close();
+      queue.close();
+      removeClosedSqliteFixture(root);
+    }
+  });
+
   test("migrates the real pre-column lifecycle schema before indexing and preserves exhausted history across reopen", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-pre-column-repair-"));
     const dbPath = join(root, "state.sqlite");

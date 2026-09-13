@@ -116,6 +116,25 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
 - `/health` becomes unhealthy when an active tick stops making progress or an
   old publication backlog remains idle; the embedded supervisor then terminates
   the full Windows process tree with `taskkill /T /F` and restarts SCM,
+- an explicit unhealthy HTTP response uses three consecutive probes, while
+  transport timeouts require at least 60 seconds of sustained unavailability
+  as well as three failures. Brief shared localhost outages therefore do not
+  immediately discard an active validation. Probes remain bounded at 2.5 seconds;
+  only a confirmed healthy response resets the failure window, including when
+  HTTP errors and transport failures alternate. A termination that returns
+  without a confirmed process exit is retried after bounded exit confirmation,
+- health probes use fresh connections rather than Bun's shared keep-alive pool;
+  a silent reused socket cannot itself make a responsive listener look down.
+  A raw TCP regression demonstrates this isolation on Bun 1.3.14. This is not
+  proof of the underlying cause of the September 11 cross-service Windows outage,
+- Server `/healthz` is also observed for correlated local outages, without
+  health-directed Server restarts that could cascade into other services.
+  Structured `embeddedRuntimeHealth` records distinguish HTTP failures from
+  transport failures and report failure duration and last confirmed health,
+- health-directed restarts emit `embedded_runtime_exit`, not native-crash
+  events. A replacement process emits `restart_started`; only a successful
+  health probe emits `recovered`. Services without health probes report only
+  process/launcher readiness, which is not evidence of service uptime,
 - `/health.reviewProvider` reports provider poll timestamps, consecutive
   failures, retry backlog, and the durable-link cursor. Provider API outages are
   exposed as a degraded component without restarting the otherwise healthy
@@ -161,6 +180,26 @@ scripts can nevertheless execute candidate-controlled repository code on the
 host, with only narrowly sensitive PushPals authority removed from the child
 environment. Enable trusted-host commands only for repositories and candidates
 allowed to run under the SCM process identity.
+
+Transport references: Bun documents per-request connection isolation via
+[`keepalive: false`](https://bun.sh/docs/runtime/networking/fetch).
+[RFC 9112 section 9.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.3)
+requires fully consuming a request body or closing its connection before reuse.
+Server's bounded memory/Repository Agent request reader therefore drains rejected
+oversized uploads before returning `413`: it discards arriving bytes until EOF,
+with a 250ms absolute drain deadline and a 64KiB additional-discard threshold
+after the chunk that exceeded the accepted body limit. Thresholds are checked
+after each delivered chunk, so one chunk can cross the threshold. Declared
+oversized uploads have not been read yet, so their discard threshold is the route
+limit plus 64KiB; discarded bytes are not retained or accepted as JSON.
+If those bounds expire, it cancels without awaiting cancellation and returns
+`Connection: close`. Bun 1.3.14 has been observed keeping that socket open and
+reusing it despite the response header, so a rejected sender that does not finish
+within the drain bounds must abandon its connection. Fresh health probes remain
+isolated; this does not claim to repair Bun's native socket lifecycle. Regression
+tests verify finite chunked uploads finish before rejection, stalled senders
+receive bounded rejection, and subsequent ordinary pooled health
+requests remain usable; raising limits or hiding failed responses is not recovery.
 
 ## Debugging Checklist
 

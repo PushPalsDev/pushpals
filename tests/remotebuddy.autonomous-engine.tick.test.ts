@@ -676,6 +676,12 @@ describe("RepositoryAgent autonomy ideation", () => {
       recentObjectives: [],
       openObjectives: [],
     });
+    const policy = (submitted?.context as Record<string, unknown>).deterministicPolicy as {
+      notes: string[];
+    };
+    expect(policy.notes).toHaveLength(8);
+    expect(policy.notes[6]).toContain("non-goals and excluded scope are prohibitions");
+    expect(policy.notes[7]).toContain("data.candidates=[]");
     expect(String(submitted?.idempotencyKey)).toContain("snap_tick_1");
     expect(JSON.stringify(submitted)).not.toContain("repo_targets");
   });
@@ -1172,164 +1178,152 @@ describe("RemoteBuddyAutonomousEngine tick orchestration", () => {
     }
   });
 
-  test("does not attribute deterministic fallback candidates to an empty RepositoryAgent result", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-fallback-"));
-    tempDirs.push(root);
-    seedGenericAutonomyRepoLayout(root);
-    writeFileSync(
-      join(root, "vision.md"),
-      "# Vision\n\n## Priorities\n- Make queue processing reliable for users\n",
-      "utf8",
-    );
-    execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
-    execFileSync("git", ["config", "user.email", "test@example.com"], {
-      cwd: root,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["config", "user.name", "PushPals Test"], {
-      cwd: root,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
-    execFileSync("git", ["commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
+  test.each(["empty", "cached_empty", "unavailable", "malformed"])(
+    "does not invent implementation work after %s RepositoryAgent analysis",
+    async (scenario) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-repository-fallback-"));
+      tempDirs.push(root);
+      seedGenericAutonomyRepoLayout(root);
+      writeFileSync(
+        join(root, "vision.md"),
+        "# Vision\n\n## Priorities\n- Make queue processing reliable for users\n",
+        "utf8",
+      );
+      execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.com"], {
+        cwd: root,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "user.name", "PushPals Test"], {
+        cwd: root,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
 
-    const repositoryRequestId = "repo-request-without-candidates";
-    const repositoryMemoryId = "repository-memory-must-not-be-attributed";
-    let repositoryAgentCalls = 0;
-    const repositoryAgent = {
-      async ask(input: Record<string, unknown>) {
-        repositoryAgentCalls += 1;
-        const repository = input.repository as Record<string, unknown>;
-        return {
-          schemaVersion: 1,
-          requestId: repositoryRequestId,
-          analyzedRepository: {
-            identity: repository.identity,
-            revision: repository.revision,
-            tree: repository.tree,
-          },
-          answer: "No grounded candidate was available.",
-          summary: "Repository analysis completed without a usable candidate.",
-          data: { candidates: [] },
-          confidence: 0.2,
-          evidence: [],
-          recommendations: [],
-          validationProposals: [],
-          cache: { hit: false, key: "empty-repository-result" },
-          memoryRefs: [
-            {
-              id: repositoryMemoryId,
-              namespace: "repository_agent_cache",
-              role: "analysis_cache",
-            },
-          ],
-          completedAt: new Date().toISOString(),
-        };
-      },
-    };
-    let llmCall = 0;
-    const llm = {
-      async generate(input: { messages?: Array<{ content?: unknown }> }) {
-        llmCall += 1;
-        if (llmCall === 1) {
-          // Force the engine's bounded repo/vision fallback path after the
-          // RepositoryAgent also returned no usable candidates.
-          return { text: JSON.stringify({ candidates: [] }), usage: {} };
-        }
-        if (llmCall === 2) {
-          const payload = JSON.parse(String(input.messages?.at(-1)?.content ?? "{}")) as {
-            candidates?: Array<{ id?: string }>;
-          };
+      const repositoryRequestId = "repo-request-without-candidates";
+      const repositoryMemoryId = "repository-memory-must-not-be-attributed";
+      let repositoryAgentCalls = 0;
+      const repositoryAgent = {
+        async ask(input: Record<string, unknown>) {
+          repositoryAgentCalls += 1;
+          if (scenario === "unavailable") throw new Error("Repository analysis unavailable");
+          const repository = input.repository as Record<string, unknown>;
           return {
-            text: JSON.stringify({
-              scores: (payload.candidates ?? []).map((candidate) => ({
-                id: candidate.id,
-                llm_score: 0.9,
-              })),
-            }),
-            usage: {},
+            schemaVersion: 1,
+            requestId: repositoryRequestId,
+            analyzedRepository: {
+              identity: repository.identity,
+              revision: repository.revision,
+              tree: repository.tree,
+            },
+            answer: "No grounded candidate was available.",
+            summary: "Repository analysis completed without a usable candidate.",
+            data: scenario === "malformed" ? {} : { candidates: [] },
+            confidence: 0.2,
+            evidence: [],
+            recommendations: [],
+            validationProposals: [],
+            cache: { hit: scenario === "cached_empty", key: "empty-repository-result" },
+            memoryRefs: [
+              {
+                id: repositoryMemoryId,
+                namespace: "repository_agent_cache",
+                role: "analysis_cache",
+              },
+            ],
+            completedAt: new Date().toISOString(),
           };
-        }
-        return {
-          text: JSON.stringify({
-            instruction: "Improve the selected queue path and run the repository-native tests.",
-          }),
-          usage: {},
-        };
-      },
-    };
-    const objectivePosts: Array<Record<string, unknown>> = [];
-    const engine = new RemoteBuddyAutonomousEngine({
-      server: "http://localhost:3001",
-      sessionId: "s_repository_fallback",
-      authToken: "tok",
-      repo: root,
-      llm: llm as any,
-      repositoryAgent: repositoryAgent as any,
-      comm: { async emit() {} } as any,
-      config: makeConfig(),
-    });
-    (engine as any).autonomyRepo = root;
-    (engine as any).acquireDispatchLock = async () => ({ ok: true });
-    (engine as any).renewDispatchLock = async () => true;
-    (engine as any).releaseDispatchLock = async () => undefined;
-    (engine as any).ensureAutonomyRepoReady = async () => true;
-    (engine as any).fetchSnapshot = async () => makeSnapshot();
-    (engine as any).fetchWorkerLoadSnapshot = async () => null;
-    (engine as any).loadVisionContext = () => ({
-      path: "vision.md",
-      markdown: "# Vision\n\n## Priorities\n- Make queue processing reliable for users\n",
-      one_sentence: "Make queue processing reliable for users.",
-      sections: [
-        {
-          number: "1",
-          title: "Priorities",
-          markdown: "Make queue processing reliable for users.",
-          truncated: false,
         },
-      ],
-      key_items: {
-        target_users: ["application users"],
-        priorities: ["Make queue processing reliable for users"],
-        objectives: ["Reduce stalled background work"],
-        guardrails: ["Keep changes narrowly scoped"],
-        constraints: [],
-        non_goals: [],
-        metrics: ["Fewer stalled jobs"],
-        testing_criteria: ["Run repository-native tests"],
-        risk_policy: ["Low-risk autonomous changes"],
-        operating_model: [],
-        governance: [],
-      },
-      section_numbers: ["1"],
-      sha256: "fallback-vision-hash",
-      truncated: false,
-    });
-    (engine as any).loadCommitHistoryHints = async () => [];
-    (engine as any).ingestAutoInspirationPatterns = async () => undefined;
-    (engine as any).fetchInspirationPatterns = async () => [];
-    (engine as any).fetchInspirationSourceInsights = async () => [];
-    (engine as any).fetchEligibility = async (
-      _runId: string,
-      _snapshotId: string,
-      candidates: Array<{ id: string }>,
-    ) => new Map(candidates.map((candidate) => [candidate.id, { ok: true }]));
-    (engine as any).postObjective = async (payload: Record<string, unknown>) => {
-      objectivePosts.push(payload);
-      return true;
-    };
-    (engine as any).enqueueSyntheticRequest = async () => "req_repository_fallback";
+      };
+      let llmCall = 0;
+      const llm = {
+        async generate() {
+          llmCall += 1;
+          throw new Error("Empty analysis must not spend model time on scoring or planning");
+        },
+      };
+      const objectivePosts: Array<Record<string, unknown>> = [];
+      const engine = new RemoteBuddyAutonomousEngine({
+        server: "http://localhost:3001",
+        sessionId: "s_repository_fallback",
+        authToken: "tok",
+        repo: root,
+        llm: llm as any,
+        repositoryAgent: repositoryAgent as any,
+        comm: { async emit() {} } as any,
+        config: makeConfig(),
+      });
+      (engine as any).autonomyRepo = root;
+      (engine as any).acquireDispatchLock = async () => ({ ok: true });
+      (engine as any).renewDispatchLock = async () => true;
+      (engine as any).releaseDispatchLock = async () => undefined;
+      (engine as any).ensureAutonomyRepoReady = async () => true;
+      (engine as any).fetchSnapshot = async () => makeSnapshot();
+      (engine as any).fetchWorkerLoadSnapshot = async () => null;
+      (engine as any).loadVisionContext = () => ({
+        path: "vision.md",
+        markdown: "# Vision\n\n## Priorities\n- Make queue processing reliable for users\n",
+        one_sentence: "Make queue processing reliable for users.",
+        sections: [
+          {
+            number: "1",
+            title: "Priorities",
+            markdown: "Make queue processing reliable for users.",
+            truncated: false,
+          },
+        ],
+        key_items: {
+          target_users: ["application users"],
+          priorities: ["Make queue processing reliable for users"],
+          objectives: ["Reduce stalled background work"],
+          guardrails: ["Keep changes narrowly scoped"],
+          constraints: [],
+          non_goals: [],
+          metrics: ["Fewer stalled jobs"],
+          testing_criteria: ["Run repository-native tests"],
+          risk_policy: ["Low-risk autonomous changes"],
+          operating_model: [],
+          governance: [],
+        },
+        section_numbers: ["1"],
+        sha256: "fallback-vision-hash",
+        truncated: false,
+      });
+      (engine as any).loadCommitHistoryHints = async () => [];
+      (engine as any).ingestAutoInspirationPatterns = async () => undefined;
+      (engine as any).fetchInspirationPatterns = async () => [];
+      (engine as any).fetchInspirationSourceInsights = async () => [];
+      (engine as any).fetchEligibility = async (
+        _runId: string,
+        _snapshotId: string,
+        candidates: Array<{ id: string }>,
+      ) => new Map(candidates.map((candidate) => [candidate.id, { ok: true }]));
+      (engine as any).postObjective = async (payload: Record<string, unknown>) => {
+        objectivePosts.push(payload);
+        return true;
+      };
+      let enqueueCalls = 0;
+      (engine as any).enqueueSyntheticRequest = async () => {
+        enqueueCalls += 1;
+        return "req_repository_fallback";
+      };
 
-    await engine.tick();
+      await engine.tick();
 
-    expect(repositoryAgentCalls).toBe(1);
-    expect(objectivePosts).toHaveLength(1);
-    const reservation = objectivePosts[0] ?? {};
-    expect(reservation.objective).toBeDefined();
-    expect(reservation).not.toHaveProperty("repositoryAgentMemory");
-    expect(JSON.stringify(reservation)).not.toContain(repositoryRequestId);
-    expect(JSON.stringify(reservation)).not.toContain(repositoryMemoryId);
-  });
+      expect(repositoryAgentCalls).toBe(1);
+      expect(llmCall).toBe(0);
+      expect(enqueueCalls).toBe(0);
+      expect(objectivePosts).toHaveLength(1);
+      const reservation = objectivePosts[0] ?? {};
+      expect(reservation.objective).toBeUndefined();
+      expect(reservation.candidates).toEqual([]);
+      expect((engine as any).lastDetail).toBe("no_eligible_candidates");
+      expect(reservation).not.toHaveProperty("repositoryAgentMemory");
+      expect(JSON.stringify(reservation)).not.toContain(repositoryRequestId);
+      expect(JSON.stringify(reservation)).not.toContain(repositoryMemoryId);
+    },
+  );
 
   test("stop during repository ideation prevents scoring, reservation, and enqueue", async () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-autonomy-stop-during-ideation-"));

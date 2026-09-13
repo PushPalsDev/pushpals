@@ -150,4 +150,102 @@ describe("shared vision doc parsing", () => {
     expect(items.metrics).toEqual(["Test pass rate improves"]);
     expect(items.riskPolicy).toEqual(["Validation failures block release"]);
   });
+
+  test.each(["Non-goals", "Non goals", "Out of scope / non-goals", "Not priorities"])(
+    "keeps %s and its nested goal headings out of the positive backlog",
+    (heading) => {
+      const items = extractVisionKeyItems(
+        [
+          "## Current priorities",
+          "1. Improve document search relevance",
+          `## ${heading}`,
+          "- Add unrelated billing features",
+          "### Goals for a future product",
+          "- Introduce a new social network",
+          "## Near-term objectives",
+          "- Make search results explain their sources",
+        ].join("\n"),
+      );
+
+      expect(items.priorities).toEqual(["Improve document search relevance"]);
+      expect(items.objectives).toEqual(["Make search results explain their sources"]);
+      expect(items.nonGoals).toEqual([
+        "Add unrelated billing features",
+        "Introduce a new social network",
+      ]);
+    },
+  );
+
+  test("keeps early success outcomes from crowding out the near-term objectives", () => {
+    const items = extractVisionKeyItems(
+      [
+        "## What good looks like",
+        "### User-facing outcomes",
+        ...Array.from({ length: 12 }, (_, index) => `- Desired outcome ${index}`),
+        "## Near-term objectives",
+        "- Reduce search query latency",
+      ].join("\n"),
+    );
+
+    expect(items.objectives).toEqual(["Reduce search query latency"]);
+    expect(items.metrics).toHaveLength(8);
+  });
+
+  test("unclassified subsections inherit priorities but sibling sections reset their scope", () => {
+    const items = extractVisionKeyItems(
+      [
+        "# Product vision",
+        "## Priorities",
+        "### User experience",
+        "- Make search filters easier to discover",
+        "#### Keyboard behavior",
+        "- Preserve focus when submitting a search",
+        "### Success criteria",
+        "- Search interactions remain accessible",
+        "## Background",
+        "### Design notes",
+        "- Historical observations are not new priorities",
+        "## Near-term objectives",
+        "### Import workflow",
+        "- Recover interrupted imports safely",
+        "## Architecture",
+        "- This sibling must not inherit the objective bucket",
+      ].join("\n"),
+    );
+    expect(items.priorities).toEqual([
+      "Make search filters easier to discover",
+      "Preserve focus when submitting a search",
+    ]);
+    expect(items.metrics).toEqual(["Search interactions remain accessible"]);
+    expect(items.objectives).toEqual(["Recover interrupted imports safely"]);
+  });
+
+  test("preserves wrapped ordered priorities and validation commands without merging siblings", () => {
+    const items = extractVisionKeyItems(
+      [
+        "## Priorities",
+        "1. Make account setup clear so it matches the",
+        "   rest of the product's quality bar.",
+        "2) Preserve fast search",
+        "   during large imports.",
+        "",
+        "Unrelated explanatory prose must not join the last priority.",
+        "## Required validation",
+        "+ `npm run verify --",
+        "  --project search`",
+        "- `npm run lint`",
+        "### Notes",
+        "  This is not a command continuation.",
+      ].join("\r\n"),
+    );
+
+    expect(items.priorities).toEqual([
+      "Make account setup clear so it matches the rest of the product's quality bar.",
+      "Preserve fast search during large imports.",
+    ]);
+    expect(items.testingCriteria).toEqual([
+      "`npm run verify -- --project search`",
+      "`npm run lint`",
+    ]);
+  });
 });

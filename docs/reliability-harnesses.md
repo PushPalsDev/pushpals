@@ -12,12 +12,15 @@ bun run harness:reliability
 
 The harness emits one JSON envelope for each phase and a final summary. Each phase has a bounded runtime and stops the harness on its first failure.
 
-| Phase                  | Contract                                                                                                                                                                                                                                                                                                                                                                    |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `failure_evidence`     | Failure paths, test names, diagnostics, fingerprints, transient retry metadata, and no-change session outcomes remain candidate-specific and truthful.                                                                                                                                                                                                                      |
-| `durable_lifecycle`    | Worker-required requests cannot complete without a durable job across queue and HTTP boundaries; claimed requests renew completion leases; expired handoffs reconcile after restart; WorkerPal runtime circuits persist per packaged generation, admit one half-open canary, and recover bounded deferrals and lost leases.                                                 |
-| `repair_orchestration` | A validation incident has one active exact-candidate repair; repaired candidates preserve publication state; processed publication refs are reclaimed only from an exact, durable authority record; SCM Git, review, and check subprocesses have hard deadlines and bounded pipes; an open target circuit moves autonomy to another component instead of stopping the tick. |
-| `runtime_boundary`     | Process trees, complete HTTP responses, SSE/no-newline streams, and Docker control calls are bounded across the CLI, browser client, VS Code client, and runtime services; LF worktree contracts remain valid; Linux containers perform dependency-store I/O and the production backend readiness probe.                                                                    |
+| Phase                     | Contract                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `repository_intelligence` | Repository analysis and memory preserve snapshot/claim authority; vision exclusions and empty candidate results cannot manufacture work.                                                                                                                                                                                                                                    |
+| `failure_evidence`        | Failure paths, test names, diagnostics, fingerprints, transient retry metadata, and no-change session outcomes remain candidate-specific and truthful.                                                                                                                                                                                                                      |
+| `durable_lifecycle`       | Worker-required requests cannot complete without a durable job across queue and HTTP boundaries; claimed requests renew completion leases; expired handoffs reconcile after restart; WorkerPal runtime circuits persist per packaged generation, admit one half-open canary, and recover bounded deferrals and lost leases.                                                 |
+| `repair_orchestration`    | A validation incident has one active exact-candidate repair; repaired candidates preserve publication state; processed publication refs are reclaimed only from an exact, durable authority record; SCM Git, review, and check subprocesses have hard deadlines and bounded pipes; an open target circuit moves autonomy to another component instead of stopping the tick. |
+| `quality_loop`            | Focused validation, critic decisions, retained timeout candidates, and repeated capability blockers preserve actual evidence without bypassing quality gates.                                                                                                                                                                                                               |
+| `worker_watchdog`         | Backend watchdog/runtime policy bounds executor progress and preserves meaningful recovery evidence.                                                                                                                                                                                                                                                                        |
+| `runtime_boundary`        | Process trees, complete HTTP responses, SSE/no-newline streams, and Docker control calls are bounded across the CLI, browser client, VS Code client, and runtime services; LF worktree contracts remain valid; Linux containers perform dependency-store I/O and the production backend readiness probe.                                                                    |
 
 The release workflow builds the WorkerPal sandbox image on Ubuntu and runs this harness with both Linux container dependency-projection integrations enabled. A release cannot publish when those gates fail. The opt-in flags for an equivalent Linux run are:
 
@@ -56,6 +59,54 @@ cannot block LocalBuddy, RemoteBuddy, WorkerPal, or SourceControlManager pollers
 The reliability harness exercises both the never-headers and never-body cases.
 
 ## Outcome and evidence metrics
+
+For a bounded, read-only report against any repository's PushPals database:
+
+```powershell
+bun run scripts/run-health-report.ts --db "C:\path\to\repo\outputs\data\pushpals.db" --since "2026-09-11T09:32:32Z" --until "2026-09-11T21:00:00Z"
+```
+
+The window selects job creation times; outcomes reflect current persisted state,
+not a reconstructed historical snapshot. JSON separates terminal success,
+verified publication, provider merges, recorded first-pass reviews, end-to-end
+duration, execution-to-handoff, publication waiting, and trusted validation.
+Absent latency or review evidence remains unknown; publication never implies
+approval, and the report cannot infer uptime without continuous health samples.
+Reads use a consistent, read-only SQLite transaction with per-table caps and
+explicit missing/truncated-evidence markers. No queue initialization, migration,
+repair, or live-service startup is performed.
+
+The harness includes parser and tick fixtures for nested vision exclusions,
+wrapped priorities, and explicit no-suitable-work results. Failure-circuit tests
+separate deferred checks from executed failures, preserve failures across later
+deferrals, and reject incidental shared-file collisions. Real SQLite and Git
+fixtures protect browser capability holds, checkpoints, claim fencing, and
+unrelated-job progress. Runtime tests cover silent pooled sockets, fresh health
+connections, bounded oversized-body rejection, sustained transport outages,
+and health-confirmed recovery rather than spawn-only success.
+
+Oversized control requests discard remaining upload bytes within a short time
+and byte budget before returning `413`; they never become accepted requests.
+Tests cover normal pooled requests after rejection, byte-cap exhaustion, and
+stalled uploads. Bun 1.3.14 can retain a sender's socket despite a close header,
+so an unfinished/rejected sender must abandon that connection. Independent fresh
+health connections remain usable; this is not a claim that native socket cleanup
+has been fixed for every malformed client.
+
+Terminal no-change classification reads structured outcome fields, not embedded
+stdout, artifacts, or historical revision text. A published job cannot become
+no-change merely because an earlier revision produced no diff; explicit terminal
+no-change outcomes still never count as successful delivery. Pending and running
+rows remain nonterminal even if their context mentions a no-change outcome.
+Likewise, historical or negated clarification text cannot label a delivered patch
+as a request for clarification; actual current clarification outcomes remain
+unsuccessful, including the existing OpenHands declaration contract.
+
+EventStore installs a startup-only SQLite busy handler before WAL and schema
+initialization (at most one second per statement, not a total migration budget).
+It then restores the previous zero-wait runtime behavior. A failed constructor
+closes its connection. Real child-process lock tests cover transient recovery,
+persistent-lock failure, preserved data, and the restored runtime wait policy.
 
 ### Result delivery and circuit recovery
 

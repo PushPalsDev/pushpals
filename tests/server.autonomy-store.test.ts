@@ -7459,8 +7459,10 @@ describe("server AutonomyStore policy gates", () => {
       };
       finish("success", "completed");
       finish("success_regression_fix", "completed", "fixed regression");
+      finish("success_no_change_reporting_fix", "completed", "Fixed no-change reporting");
       finish("no_change", "failed", "artifact_only_no_publishable_patch");
       finish("environment", "failed", "missing_runtime_asset");
+      finish("browser_capability", "failed", "environment.browser", "capability_blocked");
       finish("completed_no_change", "completed", "completed_no_change");
       finish("publish_environment", "publish_blocked", "missing_runtime_asset");
       finish("quality_rejected", "failed", "critic_rejected", "quality_gate");
@@ -7474,17 +7476,17 @@ describe("server AutonomyStore policy gates", () => {
       );
 
       const metrics = store.getReliabilityMetrics();
-      expect(metrics.attemptsTotal).toBe(10);
+      expect(metrics.attemptsTotal).toBe(12);
       expect(metrics.outcomeCounts).toMatchObject({
-        succeeded: 2,
+        succeeded: 3,
         no_change: 2,
-        environment_blocked: 2,
+        environment_blocked: 3,
         validation_blocked: 1,
         product_quality_failed: 1,
         orchestration_failed: 1,
         regression_detected: 1,
       });
-      expect(metrics.attemptSuccessRate).toBeCloseTo(2 / 10, 5);
+      expect(metrics.attemptSuccessRate).toBeCloseTo(3 / 12, 5);
     } finally {
       jobs.close();
     }

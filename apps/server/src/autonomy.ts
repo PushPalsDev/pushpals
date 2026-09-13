@@ -1357,6 +1357,10 @@ function classifyAutonomyAttemptOutcome(input: {
     failureClass,
     terminalStage,
     summary,
+    // Legacy SQL projections fall back from diagnostic summary to the full
+    // serialized result/error. Parse that envelope through the same outcome
+    // boundary instead of treating its JSON or embedded artifacts as prose.
+    result: input.summary,
   });
   if (terminalSemantics.noChange) return "no_change";
   if (terminalSemantics.success) return "succeeded";
@@ -1371,7 +1375,7 @@ function classifyAutonomyAttemptOutcome(input: {
     return "product_quality_failed";
   }
   if (
-    /^(?:environment|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(
+    /^(?:environment(?:\.[a-z0-9_-]+)?|missing_runtime(?:_asset)?|permission(?:_denied)?|dependency_setup_failed|network_failure|tls_handshake_failure|certificate_failure)$/.test(
       failureClass,
     ) ||
     /docker[_ -]?(?:socket|daemon)|credential|missing runtime|network is unreachable|tls[_ -]?handshake|certificate verify|permission denied/.test(
