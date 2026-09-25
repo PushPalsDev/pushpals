@@ -13,6 +13,19 @@ function workflowText(): string {
 }
 
 describe("release workflow action runtimes", () => {
+  test("gates worker readiness in Linux/Windows CI and Windows release validation", () => {
+    const ci = readFileSync(join(workflowRoot, "cli-e2e.yml"), "utf8");
+    const release = readFileSync(join(workflowRoot, "release-cli.yml"), "utf8");
+    expect(ci.match(/run: bun test tests\/cli\.worker-startup-readiness\.test\.ts/g)).toHaveLength(
+      2,
+    );
+    expect(ci.match(/- "tests\/cli\.worker-startup-readiness\.test\.ts"/g)).toHaveLength(2);
+    const windowsDeadlineStep = release
+      .split("- name: Verify Windows deadline and process-tree contracts")[1]
+      ?.split("- name:")[0];
+    expect(windowsDeadlineStep).toContain("tests/cli.worker-startup-readiness.test.ts");
+  });
+
   test.each(["cli-e2e.yml", "release-cli.yml"])(
     "%s gates Windows timeout-candidate recovery and real Bun wrapper retries",
     (filename) => {

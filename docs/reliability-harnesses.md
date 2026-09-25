@@ -95,6 +95,16 @@ immediately recommending a restart. Explicit unhealthy responses, crashes,
 post-readiness failures, and elapsed startup grace still surface as degradation;
 probe counters and restart deadlines remain authoritative.
 
+CLI worker capacity is checked once after embedded service startup. Background
+warmup does not hold up SourceControlManager launch, and a cold worker does not
+prevent the CLI from connecting. The capacity probe shares one finite deadline
+across status requests, transient-error retries, and sleeps. Manual workers are
+queried even with auto-spawn disabled. A failed or malformed worker-status
+response is reported as unconfirmed/blocked execution, never as a valid empty
+worker list or successful readiness. `/status` refreshes the startup snapshot.
+The `cli.worker-startup-readiness` regressions gate these cases, including local
+HTTP failure responses and the single-probe startup wiring.
+
 ## Outcome and evidence metrics
 
 For a bounded, read-only report against any repository's PushPals database:

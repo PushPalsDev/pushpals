@@ -23,6 +23,7 @@ on:
       - "tests/integration/cli.e2e.ts"
       - "tests/cli.bun-runtime-resolver.test.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
+      - "tests/cli.worker-startup-readiness.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
       - "tests/release-package-payload.test.ts"
@@ -62,6 +63,7 @@ on:
       - "tests/integration/cli.e2e.ts"
       - "tests/cli.bun-runtime-resolver.test.ts"
       - "tests/cli.runtime-bootstrap.test.ts"
+      - "tests/cli.worker-startup-readiness.test.ts"
       - "tests/remotebuddy.worker-spawn-command.test.ts"
       - "tests/shared.repository-snapshot.test.ts"
       - "tests/release-package-payload.test.ts"
@@ -107,6 +109,9 @@ jobs:
         run: |
           bun test tests/cli.bun-runtime-resolver.test.ts
           bun test tests/cli.runtime-bootstrap.test.ts --test-name-pattern "npm package shim"
+
+      - name: Verify worker startup readiness
+        run: bun test tests/cli.worker-startup-readiness.test.ts
 
       - name: Verify compact worktree, sandbox, and packaged-runtime paths
         run: >-
@@ -172,6 +177,9 @@ jobs:
 
       - name: Verify repository snapshot boundaries
         run: bun test tests/shared.repository-snapshot.test.ts
+
+      - name: Verify worker startup readiness
+        run: bun test tests/cli.worker-startup-readiness.test.ts
 
       - name: Verify Docker engine
         run: docker version

@@ -153,6 +153,7 @@ const phases: HarnessPhase[] = [
       "apps/localbuddy/src/http_deadlines.test.ts",
       "tests/cli.http-deadline.test.ts",
       "tests/cli.runtime-bootstrap.test.ts",
+      "tests/cli.worker-startup-readiness.test.ts",
       "tests/cli.sse-buffer.test.ts",
       "tests/client.http-deadline.test.ts",
       "tests/vscode.http-deadline.test.ts",

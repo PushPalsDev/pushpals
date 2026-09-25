@@ -598,12 +598,17 @@ export async function resolveWorkerExecutionReadiness(opts: {
   sessionId?: string;
   dockerPrecheck?: WorkerpalDockerPrecheckResult | null;
   baseEnv?: Record<string, string | undefined>;
+  statusTimeoutMs?: number;
   fetchWorkersFn?: typeof fetchWorkerStatusRows;
   precheckDockerAvailabilityFn?: typeof precheckWorkerpalDockerAvailability;
 }): Promise<WorkerExecutionReadiness> {
   let workers: WorkerStatusRow[] = [];
   try {
-    workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(opts.serverUrl, opts.ttlMs);
+    workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(
+      opts.serverUrl,
+      opts.ttlMs,
+      opts.statusTimeoutMs,
+    );
   } catch (error) {
     return {
       state: "blocked",
@@ -5409,15 +5414,40 @@ async function fetchWorkerStatusRows(
   ttlMs: number,
   timeoutMs = 10_000,
 ): Promise<WorkerStatusRow[]> {
-  const payload = await fetchJsonWithTimeout<{ ok?: boolean; workers?: WorkerStatusRow[] }>(
+  const response = await fetchWithTimeout(
     `${serverUrl}/workers?ttlMs=${Math.max(1_000, Math.floor(ttlMs))}`,
     {},
-    Math.max(250, Math.floor(timeoutMs)),
+    Math.max(1, Math.floor(timeoutMs)),
   );
-  if (!payload?.ok || !Array.isArray(payload.workers)) {
-    return [];
+  if (!response.ok) {
+    throw new Error(`WorkerPal status returned HTTP ${response.status}`);
+  }
+  const payload = await response.json().catch(() => null);
+  if (
+    payload?.ok !== true ||
+    !Array.isArray(payload.workers) ||
+    payload.workers.some(
+      (worker: WorkerStatusRow | null) =>
+        !worker ||
+        typeof worker.workerId !== "string" ||
+        !worker.workerId.trim() ||
+        typeof worker.status !== "string" ||
+        !worker.status.trim() ||
+        typeof worker.isOnline !== "boolean" ||
+        typeof worker.activeJobCount !== "number" ||
+        !Number.isSafeInteger(worker.activeJobCount) ||
+        worker.activeJobCount < 0,
+    )
+  ) {
+    throw new Error("WorkerPal status returned an invalid worker list");
   }
   return payload.workers;
+}
+
+function normalizeWorkerpalProbeTimeoutMs(timeoutMs: number): number {
+  return Number.isFinite(timeoutMs)
+    ? Math.max(1_000, Math.floor(timeoutMs))
+    : DEFAULT_WORKERPAL_STARTUP_READINESS_PROBE_MAX_MS;
 }
 
 export async function waitForWorkerpalCapacity(opts: {
@@ -5426,40 +5456,98 @@ export async function waitForWorkerpalCapacity(opts: {
   ttlMs: number;
   fetchWorkersFn?: typeof fetchWorkerStatusRows;
   sleepFn?: typeof Bun.sleep;
-}): Promise<{ ok: boolean; detail: string }> {
-  const deadline = Date.now() + Math.max(1_000, opts.timeoutMs);
+  nowFn?: () => number;
+}): Promise<{ ok: boolean; detail: string; statusUnavailable?: true }> {
+  const nowFn = opts.nowFn ?? Date.now;
+  const timeoutMs = normalizeWorkerpalProbeTimeoutMs(opts.timeoutMs);
+  const deadline = nowFn() + timeoutMs;
   let lastObservedOnline = 0;
-  while (Date.now() < deadline) {
-    const remainingMs = Math.max(250, deadline - Date.now());
-    const workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(
-      opts.serverUrl,
-      opts.ttlMs,
-      Math.min(DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS, remainingMs),
-    );
-    const summary = summarizeWorkerStatusRows(workers);
-    if (summary.onlineWorkers > 0) {
-      lastObservedOnline = Math.max(lastObservedOnline, summary.onlineWorkers);
+  let lastQueryError: string | null = null;
+  while (nowFn() < deadline) {
+    const remainingMs = Math.max(1, deadline - nowFn());
+    try {
+      const workers = await (opts.fetchWorkersFn ?? fetchWorkerStatusRows)(
+        opts.serverUrl,
+        opts.ttlMs,
+        Math.min(DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS, remainingMs),
+      );
+      lastQueryError = null;
+      const summary = summarizeWorkerStatusRows(workers);
+      if (summary.onlineWorkers > 0) {
+        lastObservedOnline = Math.max(lastObservedOnline, summary.onlineWorkers);
+      }
+      if (summary.idleWorkers > 0 && nowFn() <= deadline) {
+        return {
+          ok: true,
+          detail: `${summary.idleWorkers} idle / ${summary.onlineWorkers} online`,
+        };
+      }
+    } catch (error) {
+      // Capacity is optional for connecting the CLI. Retain the diagnostic and
+      // retry only inside this one foreground budget, without aborting services.
+      lastQueryError = String(error).slice(0, 300);
     }
-    if (summary.idleWorkers > 0) {
-      return {
-        ok: true,
-        detail: `${summary.idleWorkers} idle / ${summary.onlineWorkers} online`,
-      };
-    }
-    await (opts.sleepFn ?? Bun.sleep)(DEFAULT_RUNTIME_BOOT_POLL_MS);
+    const sleepMs = Math.min(DEFAULT_RUNTIME_BOOT_POLL_MS, deadline - nowFn());
+    if (sleepMs <= 0) break;
+    await (opts.sleepFn ?? Bun.sleep)(sleepMs);
+  }
+  if (lastQueryError !== null) {
+    return {
+      ok: false,
+      statusUnavailable: true,
+      detail: `Unable to query WorkerPal status within ${timeoutMs}ms: ${lastQueryError}`,
+    };
   }
   if (lastObservedOnline > 0) {
     return {
       ok: false,
-      detail: `${lastObservedOnline} online WorkerPal(s) reported but none became idle within ${Math.max(
-        1_000,
-        opts.timeoutMs,
-      )}ms`,
+      detail: `${lastObservedOnline} online WorkerPal(s) reported but none became idle within ${timeoutMs}ms`,
     };
   }
   return {
     ok: false,
-    detail: `no online WorkerPal reported within ${Math.max(1_000, opts.timeoutMs)}ms`,
+    detail: `no online WorkerPal reported within ${timeoutMs}ms`,
+  };
+}
+
+export async function resolveStartupWorkerExecutionReadiness(opts: {
+  serverUrl: string;
+  ttlMs: number;
+  timeoutMs: number;
+  autoSpawnWorkerpals: boolean;
+  requireDocker: boolean;
+  dockerPrecheck?: WorkerpalDockerPrecheckResult | null;
+  fetchWorkersFn?: typeof fetchWorkerStatusRows;
+  sleepFn?: typeof Bun.sleep;
+  nowFn?: () => number;
+}): Promise<WorkerExecutionReadiness> {
+  if (!opts.autoSpawnWorkerpals) {
+    // Manual workers still count. Do not wait for an auto-spawn that is disabled.
+    return resolveWorkerExecutionReadiness({
+      ...opts,
+      dockerEnabled: opts.requireDocker,
+      statusTimeoutMs: Math.min(
+        DEFAULT_WORKERPAL_STARTUP_STATUS_FETCH_TIMEOUT_MS,
+        normalizeWorkerpalProbeTimeoutMs(opts.timeoutMs),
+      ),
+    });
+  }
+  const capacity = await waitForWorkerpalCapacity(opts);
+  if (capacity.ok) return { state: "ready", detail: capacity.detail };
+  if (capacity.statusUnavailable) {
+    return {
+      state: "blocked",
+      detail: capacity.detail,
+      action: "Check runtime connectivity, then retry /status.",
+    };
+  }
+  if (opts.requireDocker && opts.dockerPrecheck?.status === "failed") {
+    return describeWorkerExecutionReadiness({ ...opts, onlineWorkers: 0, idleWorkers: 0 });
+  }
+  return {
+    state: "warming",
+    detail: capacity.detail,
+    action: "Wait for WorkerPal auto-spawn/warmup or active jobs to finish, then rerun /status.",
   };
 }
 
@@ -6110,30 +6198,13 @@ async function autoStartRuntimeServices(opts: {
   reportRemoteBuddyAutonomousEngineState();
 
   if (runtimePreflight.config.remotebuddy.autoSpawnWorkerpals) {
-    const workerpalPhaseStartedAt = Date.now();
-    const workerpalReadinessProbeTimeoutMs = resolveWorkerpalStartupReadinessProbeTimeoutMs(
-      runtimePreflight.config,
+    // RemoteBuddy owns background warmup. A foreground capacity wait here
+    // delayed SCM startup and duplicated main's post-bootstrap readiness probe.
+    appendRuntimeServicesLogLine(
+      runtimeServicesLogPath,
+      "[pushpals] WorkerPal capacity check deferred until embedded services are ready; warmup continues in the background.",
     );
-    const workerpalCapacity = await waitForWorkerpalCapacity({
-      serverUrl: opts.serverUrl,
-      timeoutMs: workerpalReadinessProbeTimeoutMs,
-      ttlMs: runtimePreflight.config.remotebuddy.workerpalOnlineTtlMs,
-    });
-    if (!workerpalCapacity.ok) {
-      const startupProbeWarning =
-        `embedded workerpal readiness probe did not find idle capacity within ${workerpalReadinessProbeTimeoutMs}ms ` +
-        `(${workerpalCapacity.detail}); continuing startup while WorkerPal warmup finishes in the background.`;
-      console.warn(`[pushpals] ${startupProbeWarning}`);
-      appendRuntimeServicesLogLine(runtimeServicesLogPath, `[pushpals] ${startupProbeWarning}`);
-      recordStartupPhase("workerpal", workerpalPhaseStartedAt, "deferred");
-    } else {
-      console.log(`[pushpals] Embedded WorkerPal capacity is ready (${workerpalCapacity.detail}).`);
-      appendRuntimeServicesLogLine(
-        runtimeServicesLogPath,
-        `[pushpals] embedded workerpal capacity ready (${workerpalCapacity.detail}).`,
-      );
-      recordStartupPhase("workerpal", workerpalPhaseStartedAt, "ready");
-    }
+    recordStartupPhase("workerpal", Date.now(), "deferred");
   } else {
     recordStartupPhase("workerpal", Date.now(), "disabled");
   }
@@ -7664,22 +7735,22 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   const shouldProbeWorkerpalStartupCapacity = Boolean(config.remotebuddy.autoSpawnWorkerpals);
-  const workerpalCapacity = shouldProbeWorkerpalStartupCapacity
-    ? await waitForWorkerpalCapacity({
-        serverUrl,
-        timeoutMs: resolveWorkerpalStartupReadinessProbeTimeoutMs(config),
-        ttlMs: config.remotebuddy.workerpalOnlineTtlMs,
-      })
-    : {
-        ok: false,
-        detail: "WorkerPal auto-spawn is disabled",
-      };
-  if (shouldProbeWorkerpalStartupCapacity && !workerpalCapacity.ok) {
+  const startupWorkerExecutionReadiness = await resolveStartupWorkerExecutionReadiness({
+    serverUrl,
+    timeoutMs: resolveWorkerpalStartupReadinessProbeTimeoutMs(config),
+    ttlMs: config.remotebuddy.workerpalOnlineTtlMs,
+    autoSpawnWorkerpals: shouldProbeWorkerpalStartupCapacity,
+    requireDocker:
+      Boolean(config.remotebuddy.workerpalDocker) &&
+      Boolean(config.remotebuddy.workerpalRequireDocker),
+    dockerPrecheck: workerpalDockerPrecheck,
+  });
+  if (shouldProbeWorkerpalStartupCapacity && startupWorkerExecutionReadiness.state !== "ready") {
     console.warn(
-      `[pushpals] WorkerPal readiness probe did not find idle capacity yet (${workerpalCapacity.detail}).`,
+      `[pushpals] WorkerPal readiness is ${startupWorkerExecutionReadiness.state} (${startupWorkerExecutionReadiness.detail}).`,
     );
     console.warn(
-      "[pushpals] Continuing startup; WorkerPal warmup may still be in progress and first task dispatch can be delayed.",
+      "[pushpals] Continuing startup without confirmed idle capacity; first task dispatch can be delayed. Use /status to check again.",
     );
     if (workerpalDockerPrecheck.status === "failed") {
       console.warn(`[pushpals] Docker precheck detail: ${workerpalDockerPrecheck.detail}`);
@@ -7692,36 +7763,6 @@ async function main(): Promise<void> {
       );
     }
   }
-  const startupWorkerExecutionReadiness: WorkerExecutionReadiness = workerpalCapacity.ok
-    ? {
-        state: "ready",
-        detail: workerpalCapacity.detail,
-      }
-    : !shouldProbeWorkerpalStartupCapacity
-      ? describeWorkerExecutionReadiness({
-          autoSpawnWorkerpals: false,
-          requireDocker:
-            Boolean(config.remotebuddy.workerpalDocker) &&
-            Boolean(config.remotebuddy.workerpalRequireDocker),
-          dockerPrecheck: workerpalDockerPrecheck,
-          onlineWorkers: 0,
-          idleWorkers: 0,
-        })
-      : workerpalDockerPrecheck.status === "failed"
-        ? describeWorkerExecutionReadiness({
-            autoSpawnWorkerpals: Boolean(config.remotebuddy.autoSpawnWorkerpals),
-            requireDocker:
-              Boolean(config.remotebuddy.workerpalDocker) &&
-              Boolean(config.remotebuddy.workerpalRequireDocker),
-            dockerPrecheck: workerpalDockerPrecheck,
-            onlineWorkers: 0,
-            idleWorkers: 0,
-          })
-        : {
-            state: "warming",
-            detail: workerpalCapacity.detail,
-            action: "Wait for WorkerPal auto-spawn/warmup to finish, then rerun /status.",
-          };
   const saved = statePath ? readCliState(statePath) : {};
   pushpalsLogPath =
     pushpalsLogPath ||

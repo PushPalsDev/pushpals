@@ -67,6 +67,7 @@ describe("reliability harness release coverage", () => {
     expect(runtimeFiles).toContain("tests/shared.scm-repair-authority.test.ts");
     expect(runtimeFiles).toContain("tests/server.bounded-json-body.test.ts");
     expect(runtimeFiles).toContain("tests/cli.runtime-bootstrap.test.ts");
+    expect(runtimeFiles).toContain("tests/cli.worker-startup-readiness.test.ts");
     expect(runtimeFiles).toContain("tests/remotebuddy.llm-codex.test.ts");
     expect(runtimeFiles).toContain("tests/workerpals.sandbox-env.test.ts");
   });
