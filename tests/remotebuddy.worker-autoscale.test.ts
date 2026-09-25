@@ -10,9 +10,13 @@ import { RemoteBuddyOrchestrator } from "../apps/remotebuddy/src/remotebuddy_mai
 const tempDirs: string[] = [];
 const openStores: IdempotencyStore[] = [];
 const originalSpawn = Bun.spawn;
+const originalNow = Date.now;
+const originalSleep = Bun.sleep;
 
 afterEach(async () => {
   (Bun as any).spawn = originalSpawn;
+  Date.now = originalNow;
+  (Bun as any).sleep = originalSleep;
 
   while (openStores.length > 0) {
     try {
@@ -92,16 +96,202 @@ function createOrchestrator(
     persistentMemory: new NoopSessionMemory(),
     jobsDbPath: join(root, "outputs", "data", "pushpals.db"),
     fetchImpl,
-    terminateProcessTreeImpl,
+    terminateProcessTreeImpl: terminateProcessTreeImpl ?? (async () => {}),
   });
   // These tests replace spawnWorker with deterministic fixtures. Keep the
   // scheduler under test independent of host-specific standalone launch assets.
   (orchestrator as any).autoSpawnWorkers = true;
   (orchestrator as any).workerpalsUnavailableReason = null;
+  (orchestrator as any).cleanupWorkerContainersImpl = async () => true;
   return orchestrator;
 }
 
 describe("RemoteBuddy worker autoscaling", () => {
+  test("a prewarm fetch completing after disposal cannot spawn a worker", async () => {
+    const orchestrator = createOrchestrator(makeTempDir());
+    let releaseFetch!: (workers: unknown[]) => void;
+    (orchestrator as any).fetchWorkers = () =>
+      new Promise((resolve) => {
+        releaseFetch = resolve;
+      });
+    let spawnCalls = 0;
+    (Bun as any).spawn = () => {
+      spawnCalls += 1;
+      throw new Error("spawn after disposal");
+    };
+    const prewarm = orchestrator.ensureWorkerCapacityOnStartup();
+    await orchestrator.dispose();
+    releaseFetch([]);
+    await prewarm;
+    expect(spawnCalls).toBe(0);
+    expect((orchestrator as any).managedWorkers.size).toBe(0);
+    expect(await (orchestrator as any).spawnWorker()).toBeNull();
+  });
+
+  test("disposal joins in-flight startup termination and is idempotent", async () => {
+    let exitChild!: (code: number) => void;
+    let finishReadiness!: (ready: null) => void;
+    const exited = new Promise<number>((resolve) => {
+      exitChild = resolve;
+    });
+    let terminations = 0;
+    const orchestrator = createOrchestrator(makeTempDir(), undefined, async () => {
+      terminations += 1;
+      exitChild(0);
+    });
+    (orchestrator as any).waitForOnlineWorker = () =>
+      new Promise((resolve) => {
+        finishReadiness = resolve;
+      });
+    (Bun as any).spawn = () => ({ pid: 12345, exited, stdout: null, stderr: null, kill() {} });
+    const startup = (orchestrator as any).spawnWorker();
+    const disposing = orchestrator.dispose();
+    expect(orchestrator.dispose()).toBe(disposing);
+    await disposing;
+    finishReadiness(null);
+    expect(await startup).toBeNull();
+    expect(terminations).toBe(1);
+    expect((orchestrator as any).managedWorkers.size).toBe(0);
+  });
+
+  test("failed Docker cleanup fences replacements and retries without signalling an exited PID", async () => {
+    let terminations = 0;
+    let cleanupCalls = 0;
+    let cleanupSucceeds = false;
+    let spawnCalls = 0;
+    const orchestrator = createOrchestrator(makeTempDir(), undefined, async () => {
+      terminations += 1;
+    });
+    const workerId = "workerpal-owned";
+    const child = { pid: 12345, exited: Promise.resolve(0), kill() {} };
+    (orchestrator as any).managedWorkers.set(workerId, child);
+    (orchestrator as any).dockerManagedWorkers.add(workerId);
+    (orchestrator as any).cleanupWorkerContainersImpl = async (repo: string, id: string) => {
+      expect(repo).toBe((orchestrator as any).repo);
+      expect(id).toBe(workerId);
+      cleanupCalls += 1;
+      return cleanupSucceeds;
+    };
+    (Bun as any).spawn = () => {
+      spawnCalls += 1;
+      throw new Error("replacement must remain blocked");
+    };
+    try {
+      await expect(
+        (orchestrator as any).terminateManagedWorkerProcess(workerId, child, "test timeout"),
+      ).rejects.toThrow("cleanup could not be verified");
+      expect((orchestrator as any).managedWorkers.has(workerId)).toBe(true);
+      expect(await (orchestrator as any).spawnWorker()).toBeNull();
+      expect(spawnCalls).toBe(0);
+      expect(terminations).toBe(1);
+      expect(cleanupCalls).toBe(2);
+      expect((orchestrator as any).workerShutdownPending.has(workerId)).toBe(true);
+      cleanupSucceeds = true;
+      await (orchestrator as any).terminateManagedWorkerProcess(workerId, child, "retry cleanup");
+      expect(terminations).toBe(1);
+      expect(cleanupCalls).toBe(3);
+      expect((orchestrator as any).managedWorkers.size).toBe(0);
+      expect((orchestrator as any).workerShutdownPending.size).toBe(0);
+      await (orchestrator as any).terminateManagedWorkerProcess(
+        workerId,
+        child,
+        "already released",
+      );
+      expect(terminations).toBe(1);
+      expect(cleanupCalls).toBe(3);
+    } finally {
+      cleanupSucceeds = true;
+      await orchestrator.dispose();
+    }
+  });
+
+  test("an unexpected readiness exception still cleans the spawned worker", async () => {
+    let exitChild!: (code: number) => void;
+    const exited = new Promise<number>((resolve) => {
+      exitChild = resolve;
+    });
+    let terminations = 0;
+    let cleanups = 0;
+    const orchestrator = createOrchestrator(makeTempDir(), undefined, async () => {
+      terminations += 1;
+      exitChild(0);
+    });
+    (orchestrator as any).spawnWorkerDocker = true;
+    (orchestrator as any).cleanupWorkerContainersImpl = async () => {
+      cleanups += 1;
+      return true;
+    };
+    (orchestrator as any).waitForOnlineWorker = async () => {
+      throw new Error("unexpected readiness failure");
+    };
+    (Bun as any).spawn = () => ({ pid: 12345, exited, stdout: null, stderr: null, kill() {} });
+    try {
+      expect(await (orchestrator as any).spawnWorker()).toBeNull();
+      expect(terminations).toBe(1);
+      expect(cleanups).toBe(1);
+      expect((orchestrator as any).managedWorkers.size).toBe(0);
+    } finally {
+      await orchestrator.dispose();
+    }
+  });
+
+  test("natural worker exit cleans owned containers before a replacement starts", async () => {
+    let releaseCleanup!: () => void;
+    let cleanupStarted!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    const cleanupEntered = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    const exits: Array<(code: number) => void> = [];
+    let spawns = 0;
+    const firstSpawnTime = originalNow();
+    Date.now = () => firstSpawnTime + spawns * 1_000;
+    const orchestrator = createOrchestrator(makeTempDir());
+    (orchestrator as any).spawnWorkerDocker = true;
+    (orchestrator as any).waitForOnlineWorker = async (_timeout: number, workerId: string) => ({
+      workerId,
+      status: "idle",
+      activeJobCount: 0,
+    });
+    (orchestrator as any).cleanupWorkerContainersImpl = async () => {
+      cleanupStarted();
+      await cleanupGate;
+      return true;
+    };
+    (Bun as any).spawn = () => {
+      spawns += 1;
+      return {
+        pid: 12345 + spawns,
+        exited: new Promise<number>((resolve) => {
+          exits.push(resolve);
+        }),
+        stdout: null,
+        stderr: null,
+        kill() {},
+      };
+    };
+    try {
+      const first = await (orchestrator as any).spawnWorker();
+      exits[0](0);
+      await cleanupEntered;
+      expect((orchestrator as any).managedWorkers.has(first)).toBe(true);
+      const replacement = (orchestrator as any).spawnWorker();
+      await Promise.resolve();
+      expect(spawns).toBe(1);
+      releaseCleanup();
+      expect(await replacement).toMatch(/^workerpal-/);
+      expect(spawns).toBe(2);
+      expect((orchestrator as any).managedWorkers.has(first)).toBe(false);
+    } finally {
+      Date.now = originalNow;
+      releaseCleanup();
+      for (const exit of exits) exit(0);
+      await orchestrator.dispose();
+    }
+  });
+
   test("routes managed WorkerPal shutdown through process-tree termination", async () => {
     const terminations: Array<{ pid: number; options: Record<string, unknown> }> = [];
     const orchestrator = createOrchestrator(makeTempDir(), undefined, async (proc, options) => {
@@ -113,6 +303,8 @@ describe("RemoteBuddy worker autoscaling", () => {
       kill() {},
     } as ReturnType<typeof Bun.spawn>;
     (orchestrator as any).managedWorkers.set("workerpal-tree", proc);
+    const outputAbort = new AbortController();
+    (orchestrator as any).workerOutputAborts.set("workerpal-tree", outputAbort);
 
     try {
       await (orchestrator as any).terminateManagedWorkerProcess(
@@ -129,6 +321,8 @@ describe("RemoteBuddy worker autoscaling", () => {
         },
       ]);
       expect((orchestrator as any).managedWorkers.has("workerpal-tree")).toBe(false);
+      expect(outputAbort.signal.aborted).toBe(true);
+      expect((orchestrator as any).workerOutputAborts.has("workerpal-tree")).toBe(false);
     } finally {
       await orchestrator.dispose();
     }
@@ -314,6 +508,115 @@ describe("RemoteBuddy worker autoscaling", () => {
       await (orchestrator as any).workerStartupPrewarmInFlight;
       expect((orchestrator as any).workerStartupPrewarmInFlight).toBeNull();
     } finally {
+      await orchestrator.dispose();
+    }
+  });
+
+  test("request dispatch joins a quiet cold-build prewarm past the normal startup deadline", async () => {
+    let clockMs = 0;
+    let spawnCalls = 0;
+    let workerId = "";
+    let exitChild!: (code: number) => void;
+    const childExited = new Promise<number>((resolve) => {
+      exitChild = resolve;
+    });
+    const orchestrator = createOrchestrator(makeTempDir(), undefined, async () => exitChild(0));
+    (orchestrator as any).spawnWorkerDocker = true;
+    (orchestrator as any).workerStartupTimeoutMs = 120_000;
+    (orchestrator as any).fetchWorkers = async () => {
+      await Promise.resolve();
+      return clockMs >= 150_000
+        ? [{ workerId, isOnline: true, status: "idle", activeJobCount: 0 }]
+        : [];
+    };
+    Date.now = () => clockMs;
+    (Bun as any).sleep = async (ms: number) => {
+      clockMs += ms;
+      await Promise.resolve();
+    };
+    (Bun as any).spawn = (command: string[]) => {
+      spawnCalls += 1;
+      workerId = command[command.indexOf("--workerId") + 1];
+      return {
+        pid: 12345,
+        kill() {},
+        exited: childExited,
+        stdout: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                '[WorkerPalStartup] {"phase":"docker-image-build","event":"start","timeoutMs":600000}\n',
+              ),
+            );
+            // Deliberately leave the cold build completely quiet afterward.
+          },
+        }),
+        stderr: null,
+      };
+    };
+
+    try {
+      const prewarm = (orchestrator as any).spawnWorker();
+      const dispatch = (orchestrator as any).selectTargetWorkerForJob();
+      expect(await prewarm).toBe(workerId);
+      expect(await dispatch).toBe(workerId);
+      expect(spawnCalls).toBe(1);
+      expect(clockMs).toBeGreaterThanOrEqual(150_000);
+      expect(clockMs).toBeLessThan(600_000);
+      expect((orchestrator as any).workerpalsUnavailableReason).toBeNull();
+    } finally {
+      Date.now = originalNow;
+      (Bun as any).sleep = originalSleep;
+      await orchestrator.dispose();
+    }
+  });
+
+  test("image progress alone never makes a worker online and startup still terminates", async () => {
+    let clockMs = 0;
+    let terminations = 0;
+    let exitChild!: (code: number) => void;
+    const childExited = new Promise<number>((resolve) => {
+      exitChild = resolve;
+    });
+    const orchestrator = createOrchestrator(makeTempDir(), undefined, async () => {
+      terminations += 1;
+      exitChild(1);
+    });
+    (orchestrator as any).spawnWorkerDocker = true;
+    (orchestrator as any).workerStartupTimeoutMs = 120_000;
+    (orchestrator as any).fetchWorkers = async () => [
+      { workerId: "unrelated-worker", isOnline: true, status: "idle", activeJobCount: 0 },
+    ];
+    Date.now = () => clockMs;
+    (Bun as any).sleep = async (ms: number) => {
+      clockMs += ms;
+      await Promise.resolve();
+    };
+    (Bun as any).spawn = () => ({
+      pid: 12345,
+      kill() {},
+      exited: childExited,
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              '[WorkerPalStartup] {"phase":"docker-image-build","event":"start","timeoutMs":600000}\n',
+            ),
+          );
+        },
+      }),
+      stderr: null,
+    });
+
+    try {
+      expect(await (orchestrator as any).spawnWorker()).toBeNull();
+      expect(terminations).toBe(1);
+      expect(clockMs).toBeGreaterThanOrEqual(630_000);
+      expect(clockMs).toBeLessThan(631_000);
+      expect((orchestrator as any).managedWorkers.size).toBe(0);
+    } finally {
+      Date.now = originalNow;
+      (Bun as any).sleep = originalSleep;
       await orchestrator.dispose();
     }
   });

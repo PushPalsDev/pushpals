@@ -34,6 +34,10 @@ import {
   createToolRunRecordFromFailure,
   fetchBufferedWithHardDeadline,
   isWorkerOwnedRuntimeStackFrame,
+  runBoundedProcess,
+  WORKER_STARTUP_CLEANUP_GRACE_MS,
+  WORKER_STARTUP_DEADLINE_ENV,
+  WORKER_STARTUP_TIMEOUT_ENV,
   type RepositoryAgentServiceClients,
 } from "shared";
 import { resolveExecutor } from "./common/executor_backend.js";
@@ -77,6 +81,7 @@ import {
   validationRepairPublicationLeaseFromJobParams,
 } from "shared";
 import { JobDeadlineLedger, UsageAccumulator } from "./quality_loop_durability.js";
+import { WorkerStartupBudget } from "./startup_budget.js";
 
 type CommitRef = {
   branch: string;
@@ -1140,8 +1145,12 @@ function parseArgs(): {
   };
 }
 
-async function resolveGitRemoteUrl(repo: string, remote = "origin"): Promise<string> {
-  const result = await git(repo, ["remote", "get-url", remote]);
+async function resolveGitRemoteUrl(
+  repo: string,
+  remote = "origin",
+  deadlineLedger?: JobDeadlineLedger,
+): Promise<string> {
+  const result = await git(repo, ["remote", "get-url", remote], deadlineLedger, "work");
   if (!result.ok) return "";
   return String(result.stdout ?? "").trim();
 }
@@ -1149,12 +1158,32 @@ async function resolveGitRemoteUrl(repo: string, remote = "origin"): Promise<str
 async function resolveWorkerGitToken(
   repo: string,
   configuredToken: string | null,
+  startupBudget?: WorkerStartupBudget | null,
 ): Promise<string> {
-  const remoteUrl = await resolveGitRemoteUrl(repo, "origin");
+  const remoteUrl = await resolveGitRemoteUrl(repo, "origin", startupBudget?.workLedger());
   const resolved = await resolveGitTokenForRemote({
     remoteUrl,
     configuredToken: configuredToken ?? "",
     cwd: repo,
+    ...(startupBudget
+      ? {
+          runCommand: async (command: string[], cwd?: string) => {
+            const timeoutMs = startupBudget.capTimeout(10_000);
+            if (timeoutMs <= 0)
+              return { ok: false, stdout: "", stderr: "startup deadline expired", exitCode: 124 };
+            try {
+              const result = await runBoundedProcess(command, {
+                cwd,
+                timeoutMs,
+                outputLimitBytes: 256 * 1024,
+              });
+              return { ...result, ok: !result.timedOut && result.exitCode === 0 };
+            } catch (error) {
+              return { ok: false, stdout: "", stderr: String(error), exitCode: 127 };
+            }
+          },
+        }
+      : {}),
   });
   if (resolved.token) {
     console.log(
@@ -3480,7 +3509,48 @@ async function workerLoop(
 async function main(): Promise<void> {
   const opts = parseArgs();
   const llmConfig = workerLlmConfig(CONFIG);
-  opts.gitToken = await resolveWorkerGitToken(opts.repo, opts.gitToken);
+  const startupBudget = opts.docker
+    ? new WorkerStartupBudget({
+        normalTimeoutMs: CONFIG.remotebuddy.workerpalStartupTimeoutMs,
+        docker: true,
+      })
+    : null;
+  let dockerExecutor: DockerExecutor | null = null;
+  let earlyShutdown: Promise<void> | null = null;
+  const cleanupStartup = async (cancel = false) => {
+    const executor = dockerExecutor;
+    if (!executor) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        cancel ? executor.cancelStartup() : executor.shutdown(),
+        new Promise<void>((_resolvePromise, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("Docker startup cleanup deadline expired")),
+            WORKER_STARTUP_CLEANUP_GRACE_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const onEarlySignal = (signal: string, code: number) => {
+    if (earlyShutdown) return;
+    startupBudget?.cancel();
+    console.warn(`[WorkerPals] Startup interrupted (${signal}); cleaning owned containers...`);
+    earlyShutdown = cleanupStartup(true)
+      .catch((error) => {
+        console.error(`[WorkerPals] Docker startup cleanup failed: ${String(error)}`);
+      })
+      .finally(() => process.exit(code));
+  };
+  const earlySigint = () => onEarlySignal("SIGINT", 130);
+  const earlySigterm = () => onEarlySignal("SIGTERM", 143);
+  const earlySigbreak = () => onEarlySignal("SIGBREAK", 131);
+  process.once("SIGINT", earlySigint);
+  process.once("SIGTERM", earlySigterm);
+  if (process.platform === "win32") process.once("SIGBREAK", earlySigbreak);
 
   console.log(`[WorkerPals] PushPals WorkerPals Daemon (${opts.workerId})`);
   console.log(`[WorkerPals] Server: ${opts.server}`);
@@ -3488,24 +3558,20 @@ async function main(): Promise<void> {
   console.log(
     `[WorkerPals] Worker LLM: model=${llmConfig.model} provider=${llmConfig.provider} baseUrl=${llmConfig.baseUrl || "(unset)"}`,
   );
-  opts.worktreeBaseRef = await resolveWorktreeBaseRef(opts.repo, opts.worktreeBaseRef);
-  console.log(`[WorkerPals] Worktree base ref: ${opts.worktreeBaseRef}`);
-
-  let dockerExecutor: DockerExecutor | null = null;
-
-  if (opts.docker) {
-    const dockerAvailable = await DockerExecutor.isDockerAvailable();
-    if (!dockerAvailable) {
-      const message =
-        "[WorkerPals] Docker is not available. Make sure Docker is installed and running.";
-      if (opts.requireDocker) {
-        console.error(message);
-        console.error("[WorkerPals] Exiting because --require-docker is enabled.");
-        process.exit(1);
-      }
-      console.error(message);
-      console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
-    } else {
+  const preflight = async () => {
+    opts.gitToken = await resolveWorkerGitToken(opts.repo, opts.gitToken, startupBudget);
+    opts.worktreeBaseRef = await resolveWorktreeBaseRef(
+      opts.repo,
+      opts.worktreeBaseRef,
+      startupBudget?.workLedger(),
+    );
+    console.log(`[WorkerPals] Worktree base ref: ${opts.worktreeBaseRef}`);
+    if (opts.docker) {
+      const dockerAvailable = await DockerExecutor.isDockerAvailable(
+        startupBudget?.capTimeout(15_000),
+      );
+      if (!dockerAvailable)
+        throw new Error("Docker is not available. Make sure Docker is installed and running.");
       dockerExecutor = new DockerExecutor({
         imageName: opts.dockerImage,
         repo: opts.repo,
@@ -3517,41 +3583,64 @@ async function main(): Promise<void> {
         baseRef: opts.worktreeBaseRef,
         config: CONFIG,
       });
-
+      dockerExecutor.setStartupBudget(startupBudget);
       await dockerExecutor.cleanupOrphanedWorktrees();
-
-      const imageReady = await dockerExecutor.pullImage();
+    }
+  };
+  if (startupBudget) {
+    try {
+      await startupBudget.phase("docker-startup-preflight", preflight);
+      const executor = dockerExecutor as DockerExecutor | null;
+      if (!executor) throw new Error("Docker startup did not create an executor");
+      const imageReady = await executor.pullImage();
       if (!imageReady) {
-        console.error(`[WorkerPals] Failed to prepare Docker image: ${opts.dockerImage}`);
-        if (opts.requireDocker) {
-          console.error("[WorkerPals] Exiting because --require-docker is enabled.");
-          process.exit(1);
-        }
-        console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
-        dockerExecutor = null;
+        throw new Error(`Failed to prepare Docker image: ${opts.dockerImage}`);
       } else if (!CONFIG.workerpals.skipDockerSelfCheck) {
         console.log(
           "[WorkerPals] Running Docker startup self-check (git/worktree in container)...",
         );
-        try {
-          await dockerExecutor.validateWorktreeGitInterop();
-        } catch (err) {
-          console.error(
-            `[WorkerPals] Docker startup self-check failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          if (opts.requireDocker) {
-            console.error("[WorkerPals] Exiting because --require-docker is enabled.");
-            process.exit(1);
-          }
-          console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
-          dockerExecutor = null;
-        }
+        await startupBudget.phase("docker-startup-selfcheck", () =>
+          executor.validateWorktreeGitInterop(),
+        );
       }
+    } catch (error) {
+      if (earlyShutdown) {
+        await earlyShutdown;
+        return;
+      }
+      console.error(
+        `[WorkerPals] Docker startup failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      try {
+        await cleanupStartup();
+      } catch (cleanupError) {
+        console.error(
+          `[WorkerPals] Docker startup cleanup was not confirmed: ${String(cleanupError)}. Exiting for supervisor reconciliation.`,
+        );
+        process.exit(1);
+      }
+      if (opts.requireDocker) {
+        console.error("[WorkerPals] Exiting because --require-docker is enabled.");
+        process.exit(1);
+      }
+      console.error("[WorkerPals] Falling back to direct mode (isolated worktrees)...");
+      dockerExecutor = null;
     }
-  } else if (opts.requireDocker) {
-    console.error("[WorkerPals] --require-docker was provided without --docker.");
-    process.exit(1);
+  } else {
+    if (opts.requireDocker) {
+      console.error("[WorkerPals] --require-docker was provided without --docker.");
+      process.exit(1);
+    }
+    await preflight();
   }
+  if (earlyShutdown) {
+    await earlyShutdown;
+    return;
+  }
+  (dockerExecutor as DockerExecutor | null)?.setStartupBudget(null);
+  // Startup ceilings belong to this daemon launch, never job subprocesses.
+  delete process.env[WORKER_STARTUP_DEADLINE_ENV];
+  delete process.env[WORKER_STARTUP_TIMEOUT_ENV];
 
   const runtimeState: WorkerRuntimeState = {
     currentJobId: null,
@@ -3630,6 +3719,9 @@ async function main(): Promise<void> {
   if (process.platform === "win32") {
     process.once("SIGBREAK", () => shutdownAndExit("SIGBREAK", 131));
   }
+  process.removeListener("SIGINT", earlySigint);
+  process.removeListener("SIGTERM", earlySigterm);
+  if (process.platform === "win32") process.removeListener("SIGBREAK", earlySigbreak);
   process.once("exit", () => {
     runtimeState.shutdownRequested = true;
     void repositoryServices.close().catch(() => {});

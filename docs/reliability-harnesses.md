@@ -10,6 +10,10 @@ Run the reliability contract locally with:
 bun run harness:reliability
 ```
 
+The watchdog phase requires Python 3. On Linux images without a `python` alias,
+run `PYTHON=python3 bun run harness:reliability`; the harness honors `PYTHON` as
+the executable override.
+
 The harness emits one JSON envelope for each phase and a final summary. Each phase has a bounded runtime and stops the harness on its first failure.
 
 | Phase                     | Contract                                                                                                                                                                                                                                                                                                                                                                    |
@@ -58,6 +62,28 @@ consumption. A peer that sends headers and then leaves its body open therefore
 cannot block LocalBuddy, RemoteBuddy, WorkerPal, or SourceControlManager pollers.
 The reliability harness exercises both the never-headers and never-body cases.
 
+WorkerPal startup uses coordinated, bounded preflight, image-build, fallback-pull,
+and self-check phases. The supervisor passes its absolute deadline to the worker;
+child commands consume the remaining phase/startup budget rather than resetting
+it on retries. Build execution allows up to ten minutes, a startup pull up to ten
+minutes, and the complete Docker self-check up to five minutes. The supervisor
+allows 30 seconds for bounded timeout cleanup and delivery of the terminal phase
+marker. All phases and registration share one hard ceiling: the normal startup
+timeout plus 25.5 minutes (27.5 minutes with the default two-minute timeout).
+This is a maximum for cold/recovery startup, not a mandatory wait or a job budget.
+
+Quiet package-install steps are allowed within the fixed build budget. Progress
+reports observed byte counts, not raw build output, and cannot extend deadlines.
+Only the server's online worker state establishes readiness. Failed startup must
+clean up its Docker resources before exit or direct-mode fallback. The supervisor
+also reconciles containers belonging to the exact repository and worker ID after
+process exit/termination; unverified cleanup fences replacement rather than
+silently accumulating containers. Other repositories' containers are untouched.
+
+Runtime-boundary regressions cover actual timeout-to-fallback transitions, slow
+self-checks, cleanup failure/retry, disposal during prewarm, malformed progress,
+output backpressure, and shared warmup between autoscaling and request admission.
+
 ## Outcome and evidence metrics
 
 For a bounded, read-only report against any repository's PushPals database:
@@ -70,6 +96,9 @@ The window selects job creation times; outcomes reflect current persisted state,
 not a reconstructed historical snapshot. JSON separates terminal success,
 verified publication, provider merges, recorded first-pass reviews, end-to-end
 duration, execution-to-handoff, publication waiting, and trusted validation.
+Request-status counts use a separate creation-time cohort, making failures before
+job creation visible. Request completion does not establish job or PR success;
+missing request history remains unknown and row-cap sampling is explicit.
 Absent latency or review evidence remains unknown; publication never implies
 approval, and the report cannot infer uptime without continuous health samples.
 Reads use a consistent, read-only SQLite transaction with per-table caps and

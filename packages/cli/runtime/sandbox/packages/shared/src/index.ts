@@ -216,6 +216,18 @@ export {
   type RuntimeVersionTuple,
 } from "./runtime_version.js";
 export {
+  WORKER_STARTUP_CLEANUP_GRACE_MS,
+  WORKER_STARTUP_IMAGE_BUILD_MS,
+  WORKER_STARTUP_IMAGE_PULL_MS,
+  WORKER_STARTUP_SELFCHECK_MS,
+  WORKER_STARTUP_DEADLINE_ENV,
+  WORKER_STARTUP_TIMEOUT_ENV,
+  isWorkerStartupPhase,
+  workerStartupAllowanceMs,
+  workerStartupPhaseTimeoutMs,
+  type WorkerStartupPhase,
+} from "./worker_startup.js";
+export {
   DEFAULT_WORKERPALS_EXECUTOR,
   invalidatePushPalsConfigCache,
   loadPushPalsConfig,

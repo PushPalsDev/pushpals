@@ -42,6 +42,14 @@ const copyPairs: Array<[string, string]> = [
   // Keep newly introduced runtime primitives available during pre-commit
   // package validation; the tracked-tree copy below cannot see new files yet.
   [
+    join(repoRoot, "packages", "shared", "src", "worker_startup.ts"),
+    join(outDir, "sandbox", "packages", "shared", "src", "worker_startup.ts"),
+  ],
+  [
+    join(repoRoot, "apps", "workerpals", "src", "startup_budget.ts"),
+    join(outDir, "sandbox", "apps", "workerpals", "src", "startup_budget.ts"),
+  ],
+  [
     join(repoRoot, "packages", "shared", "src", "bounded_fetch.ts"),
     join(outDir, "sandbox", "packages", "shared", "src", "bounded_fetch.ts"),
   ],

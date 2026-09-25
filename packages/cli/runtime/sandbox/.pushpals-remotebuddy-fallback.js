@@ -82,7 +82,8 @@ async function settleWithin(promise, timeoutMs) {
 var EMPTY_STREAM_CAPTURE_RESULT = {
   text: "",
   truncated: false,
-  decodeError: false
+  decodeError: false,
+  readError: false
 };
 function captureBoundedStream(stream, maxBytes, options = {}) {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
@@ -103,6 +104,7 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
   let observedBytes = 0;
   let lineBuffer = "";
   let decodeError = false;
+  let readError = false;
   let validationActive = true;
   let cancelled = false;
   const emitLine = (line) => {
@@ -201,7 +203,10 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
         emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
         lineBuffer = "";
       }
-    } catch {} finally {
+    } catch {
+      if (!cancelled)
+        readError = true;
+    } finally {
       try {
         reader.releaseLock();
       } catch {}
@@ -216,13 +221,15 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
       return {
         text: new TextDecoder().decode(retained),
         truncated,
-        decodeError
+        decodeError,
+        readError
       };
     }
     return {
       text: options.retainTail ? `${new TextDecoder().decode(head)}${new TextDecoder().decode(tail)}` : new TextDecoder().decode(head),
       truncated,
-      decodeError
+      decodeError,
+      readError
     };
   })();
   return {
@@ -463,6 +470,8 @@ async function runBoundedProcess(argv, options) {
     stderrTruncated: stderrCaptureResult.truncated,
     stdoutDecodeError: stdoutCaptureResult.decodeError,
     stderrDecodeError: stderrCaptureResult.decodeError,
+    stdoutReadError: stdoutCaptureResult.readError,
+    stderrReadError: stderrCaptureResult.readError,
     exitCode: outcome.exitCode,
     timedOut: outcome.timedOut,
     drainTimedOut
@@ -5256,6 +5265,34 @@ var TRUSTED_VALIDATION_EXECUTABLES = new Set([
   "luac",
   "yarn"
 ]);
+// packages/shared/src/worker_startup.ts
+var WORKER_STARTUP_CLEANUP_GRACE_MS = 30000;
+var WORKER_STARTUP_IMAGE_BUILD_MS = 600000;
+var WORKER_STARTUP_IMAGE_PULL_MS = 600000;
+var WORKER_STARTUP_SELFCHECK_MS = 300000;
+var WORKER_STARTUP_DEADLINE_ENV = "PUSHPALS_WORKER_STARTUP_DEADLINE_MS";
+var WORKER_STARTUP_TIMEOUT_ENV = "PUSHPALS_WORKER_STARTUP_TIMEOUT_MS";
+function isWorkerStartupPhase(value) {
+  return value === "docker-startup-preflight" || value === "docker-image-build" || value === "docker-image-pull" || value === "docker-startup-selfcheck";
+}
+function normalStartupTimeoutMs(timeoutMs) {
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) || 1 : 120000;
+}
+function workerStartupPhaseTimeoutMs(phase, normalMs) {
+  switch (phase) {
+    case "docker-startup-preflight":
+      return normalStartupTimeoutMs(normalMs);
+    case "docker-image-build":
+      return WORKER_STARTUP_IMAGE_BUILD_MS;
+    case "docker-image-pull":
+      return WORKER_STARTUP_IMAGE_PULL_MS;
+    case "docker-startup-selfcheck":
+      return WORKER_STARTUP_SELFCHECK_MS;
+  }
+}
+function workerStartupAllowanceMs(normalMs, docker) {
+  return normalStartupTimeoutMs(normalMs) + (docker ? WORKER_STARTUP_IMAGE_BUILD_MS + WORKER_STARTUP_IMAGE_PULL_MS + WORKER_STARTUP_SELFCHECK_MS + WORKER_STARTUP_CLEANUP_GRACE_MS : 0);
+}
 // packages/shared/src/session_event_visibility.ts
 var ALWAYS_VISIBLE_EVENT_TYPES = new Set(["question_asked"]);
 // packages/shared/src/localbuddy_runtime.ts
@@ -17083,6 +17120,274 @@ function buildWorkerSpawnCommand(options) {
   return launchTrampolinePath ? [bunExecutable, launchTrampolinePath, "--", ...args] : args;
 }
 
+// apps/remotebuddy/src/worker_startup.ts
+var STARTUP_PROGRESS_PREFIX = "[WorkerPalStartup] ";
+var MAX_STARTUP_LINE_CHARS = 2048;
+
+class WorkerStartupProgress {
+  timeoutMs;
+  docker;
+  absoluteDeadlineMs;
+  deadlineMs;
+  activePhase = null;
+  startedPhases = new Set;
+  constructor(timeoutMs, startedAtMs, docker) {
+    this.timeoutMs = timeoutMs;
+    this.docker = docker;
+    this.deadlineMs = startedAtMs + timeoutMs;
+    this.absoluteDeadlineMs = startedAtMs + workerStartupAllowanceMs(timeoutMs, docker);
+  }
+  observeLine(line, nowMs = Date.now()) {
+    if (!this.docker || nowMs >= this.deadlineMs || line.length > MAX_STARTUP_LINE_CHARS || !line.startsWith(STARTUP_PROGRESS_PREFIX)) {
+      return false;
+    }
+    let data;
+    try {
+      data = JSON.parse(line.slice(STARTUP_PROGRESS_PREFIX.length));
+    } catch {
+      return false;
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data))
+      return false;
+    const { phase, event, timeoutMs } = data;
+    if (!isWorkerStartupPhase(phase) || typeof event !== "string" || !["start", "progress", "complete", "failed"].includes(event) || typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return false;
+    }
+    if (event === "start") {
+      if (this.activePhase || this.startedPhases.has(phase))
+        return false;
+      this.startedPhases.add(phase);
+      this.activePhase = {
+        name: phase,
+        deadlineMs: Math.min(nowMs + Math.min(timeoutMs, workerStartupPhaseTimeoutMs(phase, this.timeoutMs)) + WORKER_STARTUP_CLEANUP_GRACE_MS, this.absoluteDeadlineMs)
+      };
+    } else if (this.activePhase?.name !== phase) {
+      return false;
+    }
+    if (event === "complete" || event === "failed") {
+      this.activePhase = null;
+      this.deadlineMs = Math.min(nowMs + this.timeoutMs, this.absoluteDeadlineMs);
+    } else if (this.activePhase) {
+      this.deadlineMs = this.activePhase.deadlineMs;
+    }
+    return true;
+  }
+}
+async function forwardWorkerOutput(stream, write, onLine, signal) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder;
+  let pending = "";
+  let oversized = false;
+  let completed = false;
+  let releaseWrite = null;
+  const abort = () => {
+    releaseWrite?.();
+    reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted)
+    abort();
+  const inspect = (text) => {
+    let offset = 0;
+    while (offset < text.length) {
+      const newline = text.indexOf(`
+`, offset);
+      const end = newline < 0 ? text.length : newline;
+      if (!oversized) {
+        if (pending.length + end - offset > MAX_STARTUP_LINE_CHARS) {
+          pending = "";
+          oversized = true;
+        } else {
+          pending += text.slice(offset, end);
+        }
+      }
+      if (newline < 0)
+        break;
+      if (!oversized)
+        onLine(pending.replace(/\r$/, ""));
+      pending = "";
+      oversized = false;
+      offset = newline + 1;
+    }
+  };
+  try {
+    while (!signal?.aborted) {
+      const { value, done } = await reader.read();
+      if (done) {
+        completed = true;
+        break;
+      }
+      if (signal?.aborted)
+        break;
+      inspect(decoder.decode(value, { stream: true }));
+      await new Promise((resolve8, reject) => {
+        releaseWrite = resolve8;
+        try {
+          Promise.resolve(write(value)).then(resolve8, reject);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      releaseWrite = null;
+    }
+    if (!signal?.aborted) {
+      inspect(decoder.decode());
+      if (pending && !oversized)
+        onLine(pending.replace(/\r$/, ""));
+    }
+  } finally {
+    releaseWrite = null;
+    signal?.removeEventListener("abort", abort);
+    if (!completed)
+      reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+// apps/remotebuddy/src/worker_container_cleanup.ts
+var OWNED_COMPONENTS = ["workerpals-warm", "workerpals-selfcheck"];
+var CONTAINER_ID = /^[a-f0-9]{64}$/;
+var MAX_OWNED_CONTAINERS = 64;
+var COMMAND_TIMEOUT_MS = 3000;
+var INSPECT_OWNERSHIP_FORMAT = '{"Id":{{json .Id}},"Labels":{{json .Config.Labels}}}';
+function completeCapture(result) {
+  return typeof result.stdout === "string" && typeof result.stderr === "string" && result.timedOut === false && result.drainTimedOut === false && result.stdoutTruncated === false && result.stderrTruncated === false && result.stdoutDecodeError === false && result.stderrDecodeError === false && result.stdoutReadError !== true && result.stderrReadError !== true;
+}
+function onlyAlreadyAbsentErrors(result, ids) {
+  if (!completeCapture(result) || result.exitCode === 0 || !result.stderr.trim())
+    return false;
+  return result.stderr.trim().split(/\r?\n/).every((line) => {
+    const match = /^Error(?: response from daemon)?: No such (?:container|object): ([a-f0-9]{64})$/.exec(line.trim());
+    return match !== null && ids.has(match[1]);
+  });
+}
+async function cleanupOwnedWorkerContainers(repo, workerId, options = {}) {
+  if (!repo.trim() || /[\0\r\n]/.test(repo) || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(workerId))
+    return false;
+  const requestedTimeoutMs = options.timeoutMs ?? WORKER_STARTUP_CLEANUP_GRACE_MS;
+  if (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs <= 0)
+    return false;
+  const timeoutMs = Math.min(WORKER_STARTUP_CLEANUP_GRACE_MS, Math.floor(requestedTimeoutMs));
+  const now = options.now ?? Date.now;
+  const deadlineMs = now() + timeoutMs;
+  const run = options.run ?? runBoundedProcess;
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const docker = String(env.PUSHPALS_DOCKER_BIN_ABSOLUTE ?? "").trim() || String(env.PUSHPALS_DOCKER_BIN ?? "").trim() || (platform === "win32" ? "docker.exe" : "docker");
+  const controller = new AbortController;
+  const withinBudget = () => !controller.signal.aborted && now() < deadlineMs;
+  const command = async (args) => {
+    if (!withinBudget())
+      return null;
+    try {
+      const result = await run([docker, ...args], {
+        timeoutMs: Math.max(1, Math.min(COMMAND_TIMEOUT_MS, deadlineMs - now())),
+        outputLimitBytes: 64 * 1024,
+        streamDrainTimeoutMs: 250,
+        signal: controller.signal,
+        ...options.env ? { env: options.env } : {},
+        platform,
+        terminate: (proc) => terminateProcessTree(proc, {
+          platform,
+          terminationTimeoutMs: 500,
+          exitGraceMs: 250
+        })
+      });
+      return withinBudget() && completeCapture(result) ? result : null;
+    } catch {
+      return null;
+    }
+  };
+  const listOwned = async () => {
+    const found = new Map;
+    for (const component of OWNED_COMPONENTS) {
+      const result = await command([
+        "ps",
+        "-aq",
+        "--no-trunc",
+        "--filter",
+        `label=pushpals.repo=${repo}`,
+        "--filter",
+        `label=pushpals.worker_id=${workerId}`,
+        "--filter",
+        `label=pushpals.component=${component}`
+      ]);
+      if (!result || result.exitCode !== 0)
+        return null;
+      const lines = result.stdout.trim() ? result.stdout.trim().split(/\r?\n/) : [];
+      for (const line of lines) {
+        const id = line.trim();
+        if (!CONTAINER_ID.test(id) || found.has(id) || found.size >= MAX_OWNED_CONTAINERS)
+          return null;
+        found.set(id, component);
+      }
+    }
+    return withinBudget() ? found : null;
+  };
+  const verifyEmpty = async () => (await listOwned())?.size === 0 && withinBudget();
+  const cleanup = async () => {
+    const owned = await listOwned();
+    if (!owned)
+      return false;
+    if (owned.size === 0)
+      return withinBudget();
+    const ids = Array.from(owned.keys());
+    const inspection = await command([
+      "container",
+      "inspect",
+      "--format",
+      INSPECT_OWNERSHIP_FORMAT,
+      ...ids
+    ]);
+    if (!inspection)
+      return false;
+    if (inspection.exitCode !== 0) {
+      return onlyAlreadyAbsentErrors(inspection, new Set(ids)) ? verifyEmpty() : false;
+    }
+    const lines = inspection.stdout.trim().split(/\r?\n/);
+    if (lines.length !== ids.length)
+      return false;
+    const verified = new Set;
+    for (const line of lines) {
+      let item;
+      try {
+        item = JSON.parse(line);
+      } catch {
+        return false;
+      }
+      if (!item || typeof item !== "object" || Array.isArray(item))
+        return false;
+      const { Id: id, Labels: labels } = item;
+      if (typeof id !== "string" || !owned.has(id) || verified.has(id) || !labels || typeof labels !== "object" || Array.isArray(labels))
+        return false;
+      const ownership = labels;
+      if (ownership["pushpals.repo"] !== repo || ownership["pushpals.worker_id"] !== workerId || ownership["pushpals.component"] !== owned.get(id))
+        return false;
+      verified.add(id);
+    }
+    const removal = await command(["rm", "-f", ...ids]);
+    if (!removal || removal.exitCode !== 0 && !onlyAlreadyAbsentErrors(removal, verified))
+      return false;
+    return verifyEmpty();
+  };
+  let timer;
+  try {
+    return await Promise.race([
+      cleanup().catch(() => false),
+      new Promise((resolve8) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve8(false);
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    controller.abort();
+  }
+}
+
 // apps/remotebuddy/src/remotebuddy_main.ts
 var TASK_EXECUTE_REQUEST_IDEMPOTENCY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 var REQUEST_LEASE_MS = 3 * 60000;
@@ -17847,6 +18152,13 @@ class RemoteBuddyOrchestrator {
   autonomyConfigPollMs;
   autonomyConfigPollTimer = null;
   managedWorkers = new Map;
+  workerOutputAborts = new Map;
+  dockerManagedWorkers = new Set;
+  workerShutdownPending = new Set;
+  workerShutdownInFlight = new Map;
+  workerTreesTerminated = new Set;
+  cleanupWorkerContainersImpl = cleanupOwnedWorkerContainers;
+  disposeInFlight = null;
   workerSpawnInFlight = null;
   workerStartupPrewarmInFlight = null;
   workerSpawnCooldownUntil = 0;
@@ -18819,23 +19131,50 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       return null;
     }
   }
-  async terminateManagedWorkerProcess(workerId, proc, reason, timeoutMs = 8000) {
-    const waitForExit = async (waitMs) => {
-      const settled = await Promise.race([
-        proc.exited.then(() => true).catch(() => true),
-        Bun.sleep(Math.max(0, waitMs)).then(() => false)
-      ]);
-      return settled;
-    };
-    await this.terminateProcessTreeImpl(proc, {
-      terminationTimeoutMs: timeoutMs,
-      exitGraceMs: 2000
-    });
-    const exited = await waitForExit(250);
-    if (!exited) {
-      console.warn(`[RemoteBuddy] WorkerPal ${workerId} did not terminate cleanly (${reason}); process may still be running.`);
+  terminateManagedWorkerProcess(workerId, proc, reason, timeoutMs = 8000) {
+    const existing = this.workerShutdownInFlight.get(workerId);
+    if (existing)
+      return existing;
+    if (this.managedWorkers.get(workerId) !== proc) {
+      return Promise.resolve();
     }
-    this.managedWorkers.delete(workerId);
+    this.workerShutdownPending.add(workerId);
+    const shutdown = Promise.resolve().then(async () => {
+      const waitForExit = async (waitMs) => {
+        const settled = await Promise.race([
+          proc.exited.then(() => true).catch(() => false),
+          Bun.sleep(Math.max(0, waitMs)).then(() => false)
+        ]);
+        return settled;
+      };
+      try {
+        if (!this.workerTreesTerminated.has(workerId)) {
+          await this.terminateProcessTreeImpl(proc, {
+            terminationTimeoutMs: timeoutMs,
+            exitGraceMs: 2000
+          });
+          const exited = await waitForExit(250);
+          if (!exited) {
+            throw new Error(`[RemoteBuddy] WorkerPal ${workerId} did not terminate cleanly (${reason}); process may still be running.`);
+          }
+          this.workerTreesTerminated.add(workerId);
+        }
+        if (this.dockerManagedWorkers.has(workerId) && !await this.cleanupWorkerContainersImpl(this.repo, workerId)) {
+          throw new Error(`WorkerPal ${workerId} owned Docker container cleanup could not be verified.`);
+        }
+        this.managedWorkers.delete(workerId);
+        this.dockerManagedWorkers.delete(workerId);
+        this.workerShutdownPending.delete(workerId);
+        this.workerTreesTerminated.delete(workerId);
+      } finally {
+        this.workerOutputAborts.get(workerId)?.abort();
+        this.workerOutputAborts.delete(workerId);
+      }
+    }).finally(() => {
+      this.workerShutdownInFlight.delete(workerId);
+    });
+    this.workerShutdownInFlight.set(workerId, shutdown);
+    return shutdown;
   }
   async recycleWorkerForCodexUnavailableFailure(jobId, message, detail) {
     if (!isCodexUnavailableFailureSignal(message, detail))
@@ -18908,12 +19247,12 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       return [];
     }
   }
-  async fetchWorkers() {
+  async fetchWorkers(timeoutMs = SERVICE_CONTROL_HTTP_TIMEOUT_MS) {
     try {
       const res = await this.fetchServiceControl(`${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`, {
         method: "GET",
         headers: this.authHeaders()
-      });
+      }, timeoutMs);
       if (!res.ok)
         return [];
       const data = await res.json();
@@ -18955,22 +19294,36 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
     return online[0] ?? null;
   }
-  async waitForOnlineWorker(timeoutMs, preferredWorkerId) {
+  async waitForOnlineWorker(timeoutMs, preferredWorkerId, startup) {
     const deadline = Date.now() + Math.max(0, timeoutMs);
     while (true) {
-      const workers = await this.fetchWorkers();
+      if (this.disposed || startup?.stopped())
+        return null;
+      const remainingMs = (startup?.progress.deadlineMs ?? deadline) - Date.now();
+      if (startup && remainingMs <= 0)
+        return null;
+      const workers = await this.fetchWorkers(Math.max(1, Math.min(SERVICE_CONTROL_HTTP_TIMEOUT_MS, remainingMs)));
+      if (this.disposed || startup?.stopped())
+        return null;
+      if (startup && Date.now() >= startup.progress.deadlineMs)
+        return null;
       const online = this.pickOnlineWorker(workers, preferredWorkerId);
       if (online)
         return online;
-      if (Date.now() >= deadline)
+      const nextRemainingMs = (startup?.progress.deadlineMs ?? deadline) - Date.now();
+      if (nextRemainingMs <= 0)
         return null;
-      await Bun.sleep(500);
+      await Bun.sleep(Math.min(500, nextRemainingMs));
     }
   }
   async waitForIdleWorker(timeoutMs, preferredWorkerId) {
     const deadline = Date.now() + Math.max(0, timeoutMs);
     while (true) {
+      if (this.disposed)
+        return null;
       const workers = await this.fetchWorkers();
+      if (this.disposed)
+        return null;
       if (preferredWorkerId) {
         const preferred = workers.find((worker) => worker.workerId === preferredWorkerId && worker.isOnline && worker.status !== "offline" && worker.activeJobCount === 0);
         if (preferred)
@@ -19069,11 +19422,10 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     return true;
   }
   async spawnWorker() {
+    if (this.disposed)
+      return null;
     if (this.workerSpawnInFlight) {
       return await this.workerSpawnInFlight;
-    }
-    if (this.managedWorkers.size >= this.maxWorkers) {
-      return null;
     }
     if (this.workerSpawnCooldownUntil > Date.now()) {
       const retryInMs = Math.max(0, this.workerSpawnCooldownUntil - Date.now());
@@ -19081,28 +19433,100 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       return null;
     }
     const spawnPromise = (async () => {
+      for (const workerId2 of this.workerShutdownPending) {
+        const proc = this.managedWorkers.get(workerId2);
+        if (!proc)
+          continue;
+        try {
+          await this.terminateManagedWorkerProcess(workerId2, proc, "retry owned worker cleanup");
+        } catch (error) {
+          this.workerpalsUnavailableReason = `WorkerPal replacement blocked by incomplete cleanup: ${String(error)}`;
+          this.workerSpawnCooldownUntil = Date.now() + this.workerSpawnBackoffMs;
+          console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+          return null;
+        }
+        if (this.disposed)
+          return null;
+      }
+      if (this.disposed || this.managedWorkers.size >= this.maxWorkers)
+        return null;
       this.workerpalsUnavailableReason = null;
       const workerId = createWorkerPalId();
       const cmd = this.buildWorkerSpawnCommand(workerId);
       console.log(`[RemoteBuddy] Spawning WorkerPal ${workerId} (${this.managedWorkers.size + 1}/${this.maxWorkers})`);
+      const startedAtMs = Date.now();
+      let startupProgress = new WorkerStartupProgress(this.workerStartupTimeoutMs, startedAtMs, this.spawnWorkerDocker);
+      const dockerWorker = this.spawnWorkerDocker;
+      let spawnedChild = null;
       try {
+        const childEnv = copyEnvWithoutScmRepairAuthoritySecret(process.env);
+        delete childEnv[WORKER_STARTUP_DEADLINE_ENV];
+        delete childEnv[WORKER_STARTUP_TIMEOUT_ENV];
+        if (dockerWorker) {
+          childEnv[WORKER_STARTUP_DEADLINE_ENV] = String(startupProgress.absoluteDeadlineMs);
+          childEnv[WORKER_STARTUP_TIMEOUT_ENV] = String(this.workerStartupTimeoutMs);
+        }
         const child = Bun.spawn(cmd, {
           cwd: this.repo,
-          env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
+          env: childEnv,
           stdin: "ignore",
-          stdout: "inherit",
-          stderr: "inherit",
+          stdout: "pipe",
+          stderr: "pipe",
           detached: process.platform !== "win32"
         });
+        spawnedChild = child;
         this.managedWorkers.set(workerId, child);
+        if (dockerWorker)
+          this.dockerManagedWorkers.add(workerId);
+        let childExited = false;
+        const outputAbort = new AbortController;
+        this.workerOutputAborts.set(workerId, outputAbort);
+        const outputPumps = [];
+        for (const [stream, destination] of [
+          [child.stdout, process.stdout],
+          [child.stderr, process.stderr]
+        ]) {
+          if (!stream || typeof stream === "number")
+            continue;
+          outputPumps.push(forwardWorkerOutput(stream, (chunk) => new Promise((resolve9, reject) => {
+            destination.write(chunk, (error) => error ? reject(error) : resolve9());
+          }), (line) => {
+            startupProgress?.observeLine(line);
+          }, outputAbort.signal).catch((error) => {
+            console.warn(`[RemoteBuddy] WorkerPal ${workerId} output forwarding failed: ${String(error)}`);
+          }));
+        }
+        const outputsDone = Promise.all(outputPumps).then(() => {
+          this.workerOutputAborts.delete(workerId);
+        });
         child.exited.then((code) => {
-          this.managedWorkers.delete(workerId);
-          if (this.maybeFallbackFromDockerAfterWorkerExit(workerId, code)) {
-            this.ensureAutoscaledWorkerCapacity("docker codex startup fallback");
-          }
+          childExited = true;
+          const drainTimer = setTimeout(() => outputAbort.abort(), 2000);
+          drainTimer.unref();
+          outputsDone.finally(() => clearTimeout(drainTimer));
+          this.terminateManagedWorkerProcess(workerId, child, "worker process exit").then(() => {
+            if (!this.disposed && this.maybeFallbackFromDockerAfterWorkerExit(workerId, code)) {
+              this.ensureAutoscaledWorkerCapacity("docker codex startup fallback");
+            }
+          }).catch((error) => {
+            this.workerpalsUnavailableReason = `WorkerPal ${workerId} cleanup failed; replacements are blocked: ${String(error)}`;
+            console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+          });
           console.warn(`[RemoteBuddy] WorkerPal process ${workerId} exited with code ${code}`);
         });
-        const ready = await this.waitForOnlineWorker(this.workerStartupTimeoutMs, workerId);
+        if (this.disposed) {
+          await this.terminateManagedWorkerProcess(workerId, child, "shutdown during spawn");
+          return null;
+        }
+        const ready = await this.waitForOnlineWorker(this.workerStartupTimeoutMs, workerId, {
+          progress: startupProgress,
+          stopped: () => childExited
+        });
+        startupProgress = null;
+        if (this.disposed) {
+          await this.terminateManagedWorkerProcess(workerId, child, "shutdown during startup");
+          return null;
+        }
         if (ready) {
           this.workerSpawnCooldownUntil = 0;
           if (ready.activeJobCount > 0 || ready.status === "busy") {
@@ -19110,7 +19534,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
           }
           return ready.workerId;
         }
-        this.workerpalsUnavailableReason = this.spawnWorkerDocker && this.spawnWorkerRequireDocker ? `WorkerPal ${workerId} did not report online within ${this.workerStartupTimeoutMs}ms. Verify Docker is installed, running, and able to start the WorkerPal sandbox image.` : `WorkerPal ${workerId} did not report online within ${this.workerStartupTimeoutMs}ms.`;
+        const elapsedMs = Date.now() - startedAtMs;
+        const startupFailure = childExited ? `WorkerPal ${workerId} exited before reporting online.` : `WorkerPal ${workerId} did not report online after ${elapsedMs}ms (startup idle timeout ${this.workerStartupTimeoutMs}ms; Docker preparation and self-check allowances are bounded).`;
+        this.workerpalsUnavailableReason = this.spawnWorkerDocker && this.spawnWorkerRequireDocker ? `${startupFailure} Verify Docker is installed, running, and able to start the WorkerPal sandbox image.` : startupFailure;
         console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
         await this.terminateManagedWorkerProcess(workerId, child, "startup timeout");
         this.workerSpawnCooldownUntil = Date.now() + this.workerSpawnBackoffMs;
@@ -19118,8 +19544,18 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       } catch (err) {
         this.workerpalsUnavailableReason = this.spawnWorkerDocker && this.spawnWorkerRequireDocker ? `Failed to spawn Docker-backed WorkerPal: ${String(err)}` : `Failed to spawn WorkerPal: ${String(err)}`;
         console.error(`[RemoteBuddy] Failed to spawn WorkerPal ${workerId}:`, err);
+        if (spawnedChild && this.managedWorkers.get(workerId) === spawnedChild) {
+          try {
+            await this.terminateManagedWorkerProcess(workerId, spawnedChild, "startup exception");
+          } catch (cleanupError) {
+            this.workerpalsUnavailableReason += ` Cleanup remains pending: ${String(cleanupError)}`;
+            console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+          }
+        }
         this.workerSpawnCooldownUntil = Date.now() + this.workerSpawnBackoffMs;
         return null;
+      } finally {
+        startupProgress = null;
       }
     })();
     this.workerSpawnInFlight = spawnPromise;
@@ -19132,6 +19568,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     }
   }
   async ensureWorkerCapacityOnStartup() {
+    if (this.disposed)
+      return;
     if (this.workerPrewarmDelayMs > 0) {
       console.log(`[RemoteBuddy] Waiting ${this.workerPrewarmDelayMs}ms before WorkerPal startup prewarm.`);
       await Bun.sleep(this.workerPrewarmDelayMs);
@@ -19139,6 +19577,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
         return;
     }
     const workers = await this.fetchWorkers();
+    if (this.disposed)
+      return;
     if (this.pickIdleWorker(workers)) {
       return;
     }
@@ -19158,6 +19598,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     if (onlineWorkers.length < this.maxWorkers) {
       console.log("[RemoteBuddy] Prewarming initial WorkerPal capacity...");
       const spawned = await this.spawnWorker();
+      if (this.disposed)
+        return;
       if (spawned) {
         console.log(`[RemoteBuddy] Initial WorkerPal capacity ready via ${spawned}.`);
         this.ensureAutoscaledWorkerCapacity("startup warm pool");
@@ -19165,12 +19607,16 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       }
     }
     const idleWorker = await this.waitForIdleWorker(Math.max(this.waitForWorkerMs, this.workerStartupTimeoutMs));
+    if (this.disposed)
+      return;
     if (idleWorker) {
       console.log(`[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`);
       this.ensureAutoscaledWorkerCapacity("startup warm pool");
       return;
     }
     const after = await this.fetchWorkers();
+    if (this.disposed)
+      return;
     const onlineAfter = this.onlineWorkers(after);
     if (onlineAfter.length > 0) {
       this.workerpalsUnavailableReason = `${onlineAfter.length} online WorkerPal(s) reported but none became idle within ${Math.max(this.waitForWorkerMs, this.workerStartupTimeoutMs)}ms.`;
@@ -19190,7 +19636,11 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     });
   }
   async selectTargetWorkerForJob() {
+    if (this.disposed)
+      return null;
     const workers = await this.fetchWorkers();
+    if (this.disposed)
+      return null;
     const idleNow = this.pickIdleWorker(workers);
     if (idleNow) {
       return idleNow.workerId;
@@ -19198,6 +19648,8 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     const onlineWorkers = workers.filter((worker) => worker.isOnline && worker.status !== "offline");
     if (this.autoSpawnWorkers && onlineWorkers.length < this.maxWorkers) {
       const spawned = await this.spawnWorker();
+      if (this.disposed)
+        return null;
       if (spawned)
         return spawned;
     }
@@ -19703,8 +20155,14 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
       }
     }, this.autonomyConfigPollMs);
   }
-  async dispose() {
+  dispose() {
+    if (this.disposeInFlight)
+      return this.disposeInFlight;
     this.disposed = true;
+    this.disposeInFlight = this.disposeOnce();
+    return this.disposeInFlight;
+  }
+  async disposeOnce() {
     if (this.autonomyConfigPollTimer) {
       clearInterval(this.autonomyConfigPollTimer);
       this.autonomyConfigPollTimer = null;
@@ -19730,6 +20188,9 @@ Please reply with the missing details and I will enqueue a follow-up request.` :
     this.sessionMonitorWsErrorCounts.clear();
     this.workerSpawnCooldownUntil = 0;
     this.workerSpawnInFlight = null;
+    for (const outputAbort of this.workerOutputAborts.values())
+      outputAbort.abort();
+    this.workerOutputAborts.clear();
     const shutdownWorkers = Array.from(this.managedWorkers.entries()).map(([workerId, proc]) => this.terminateManagedWorkerProcess(workerId, proc, "remotebuddy shutdown"));
     if (shutdownWorkers.length > 0) {
       await Promise.allSettled(shutdownWorkers);

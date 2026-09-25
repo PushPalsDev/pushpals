@@ -136,6 +136,8 @@ function removeClosedSqliteFixture(root: string) {
 }
 
 describe("server JobQueue repair scheduling", () => {
+  // Includes real WAL writes, close/reopen migrations, and synchronous fixture
+  // cleanup. This is a durability contract, not a five-second latency assertion.
   test("holds a fenced repeated capability blocker without cloning or exhausting the repair", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-capability-held-"));
     const dbPath = join(root, "state.sqlite");
@@ -252,7 +254,7 @@ describe("server JobQueue repair scheduling", () => {
       queue.close();
       removeClosedSqliteFixture(root);
     }
-  });
+  }, 15_000);
 
   test("migrates the real pre-column lifecycle schema before indexing and preserves exhausted history across reopen", () => {
     const root = mkdtempSync(join(tmpdir(), "pushpals-pre-column-repair-"));

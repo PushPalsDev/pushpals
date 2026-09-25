@@ -43,6 +43,19 @@ describe("reliability harness release coverage", () => {
     expect(files).toContain("tests/workerpals.job-result-transport.test.ts");
   });
 
+  test("gates cold-image preparation and shared worker startup deadlines", () => {
+    const files = listReliabilityHarnessPhaseFiles("runtime_boundary");
+
+    expect(files).toContain("tests/remotebuddy.worker-startup-progress.test.ts");
+    expect(files).toContain("tests/shared.worker-startup.test.ts");
+    expect(files).toContain("tests/worker-startup.integration.test.ts");
+    expect(files).toContain("tests/remotebuddy.worker-container-cleanup.test.ts");
+    expect(files).toContain("tests/remotebuddy.worker-spawn-command.test.ts");
+    expect(files).toContain("tests/remotebuddy.worker-autoscale.test.ts");
+    expect(files).toContain("tests/workerpals.image-preparation-progress.test.ts");
+    expect(files).toContain("tests/workerpals.startup-budget.test.ts");
+  });
+
   test("gates control-plane authority and child-process secret isolation", () => {
     const repairFiles = listReliabilityHarnessPhaseFiles("repair_orchestration");
     const runtimeFiles = listReliabilityHarnessPhaseFiles("runtime_boundary");

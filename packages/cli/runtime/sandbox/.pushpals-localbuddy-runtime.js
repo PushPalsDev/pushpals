@@ -72,7 +72,8 @@ async function settleWithin(promise, timeoutMs) {
 var EMPTY_STREAM_CAPTURE_RESULT = {
   text: "",
   truncated: false,
-  decodeError: false
+  decodeError: false,
+  readError: false
 };
 function captureBoundedStream(stream, maxBytes, options = {}) {
   if (!stream || typeof stream === "number" || typeof stream.getReader !== "function") {
@@ -93,6 +94,7 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
   let observedBytes = 0;
   let lineBuffer = "";
   let decodeError = false;
+  let readError = false;
   let validationActive = true;
   let cancelled = false;
   const emitLine = (line) => {
@@ -191,7 +193,10 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
         emitLine(lineBuffer.endsWith("\r") ? lineBuffer.slice(0, -1) : lineBuffer);
         lineBuffer = "";
       }
-    } catch {} finally {
+    } catch {
+      if (!cancelled)
+        readError = true;
+    } finally {
       try {
         reader.releaseLock();
       } catch {}
@@ -206,13 +211,15 @@ function captureBoundedStream(stream, maxBytes, options = {}) {
       return {
         text: new TextDecoder().decode(retained),
         truncated,
-        decodeError
+        decodeError,
+        readError
       };
     }
     return {
       text: options.retainTail ? `${new TextDecoder().decode(head)}${new TextDecoder().decode(tail)}` : new TextDecoder().decode(head),
       truncated,
-      decodeError
+      decodeError,
+      readError
     };
   })();
   return {
@@ -453,6 +460,8 @@ async function runBoundedProcess(argv, options) {
     stderrTruncated: stderrCaptureResult.truncated,
     stdoutDecodeError: stdoutCaptureResult.decodeError,
     stderrDecodeError: stderrCaptureResult.decodeError,
+    stdoutReadError: stdoutCaptureResult.readError,
+    stderrReadError: stderrCaptureResult.readError,
     exitCode: outcome.exitCode,
     timedOut: outcome.timedOut,
     drainTimedOut

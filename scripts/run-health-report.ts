@@ -7,6 +7,7 @@ type Row = Record<string, unknown>;
 export type RunHealthWindow = { since: string; until: string; observedAt?: string };
 export type RunHealthData = {
   jobs: Row[];
+  requests?: Row[];
   completions?: Row[];
   diagnostics?: Row[];
   providers?: Row[];
@@ -77,6 +78,17 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
     );
   });
   const jobIds = new Set(jobs.map((job) => text(job.id)));
+  const requests = (data.requests ?? []).filter((request) => {
+    const created = time(request.createdAt);
+    return (
+      created != null && created >= Date.parse(cohort.since) && created < Date.parse(cohort.until)
+    );
+  });
+  const requestStatusCounts: Record<string, number> = {};
+  for (const request of requests) {
+    const status = text(request.status) || "unknown";
+    requestStatusCounts[status] = (requestStatusCounts[status] ?? 0) + 1;
+  }
   const completions = (data.completions ?? []).filter((row) => jobIds.has(text(row.jobId)));
   const handoffsByJob = new Map<string, Row[]>();
   for (const completion of completions) {
@@ -192,6 +204,7 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
   }
   const truncatedTables = data.truncatedTables ?? [];
   const missingTables = data.missingTables ?? [];
+  const requestsAvailable = data.requests !== undefined && !missingTables.includes("requests");
   const cohortIncomplete = truncatedTables.includes("jobs");
   const semanticIncomplete =
     cohortIncomplete ||
@@ -212,6 +225,14 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
       missingTables: data.missingTables ?? [],
       semanticEvidenceTruncated,
       semanticOutcomesComplete: !semanticIncomplete,
+    },
+    requests: {
+      available: requestsAvailable,
+      complete: requestsAvailable && !truncatedTables.includes("requests"),
+      observed: requestsAvailable ? requests.length : null,
+      statusCounts: requestsAvailable ? requestStatusCounts : null,
+      failed: requestsAvailable ? (requestStatusCounts.failed ?? 0) : null,
+      completed: requestsAvailable ? (requestStatusCounts.completed ?? 0) : null,
     },
     jobs: {
       statusCounts,
@@ -265,6 +286,7 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
     uptime: { rate: null, reason: "No continuous health-sample evidence is read by this report." },
     notes: [
       "The window selects job creation time; outcomes are current persisted state, not a reconstructed historical snapshot.",
+      "Requests use their own creation-time cohort. Failed requests can precede any job; request completion is not job delivery or PR publication.",
       "No-change attempts remain in the terminal denominator but never count as successful delivery.",
       "Publication is not merge or review approval. First-pass metrics describe recorded review evidence, not missing/pruned history.",
       "Trusted timings are completion-recorded values, not guaranteed totals across all recovery attempts.",
@@ -325,6 +347,13 @@ export function readRunHealthReport(dbPath: string, window: RunHealthWindow, lim
       );
       if (missingTables.includes("jobs"))
         throw new Error("Database has no jobs table; refusing an empty success report");
+      const requests = read(
+        "requests",
+        ["id", "status", "createdAt"],
+        "WHERE createdAt >= ? AND createdAt < ?",
+        [cohort.since, cohort.until],
+        "ORDER BY createdAt, id",
+      );
       const ids = JSON.stringify(jobs.map((job) => job.id));
       const completions = read(
         "completions",
@@ -375,7 +404,16 @@ export function readRunHealthReport(dbPath: string, window: RunHealthWindow, lim
         "ORDER BY created_at, id",
       );
       return aggregateRunHealth(
-        { jobs, completions, diagnostics, providers, reviews, missingTables, truncatedTables },
+        {
+          jobs,
+          requests,
+          completions,
+          diagnostics,
+          providers,
+          reviews,
+          missingTables,
+          truncatedTables,
+        },
         { ...cohort, observedAt: window.observedAt },
       );
     })();

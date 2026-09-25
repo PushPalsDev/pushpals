@@ -219,6 +219,8 @@ afterEach(async () => {
 });
 
 describe("server memory routes", () => {
+  // Two real server starts (12s each) plus the 3s restart drain and fixture I/O
+  // need an outer budget larger than Bun's 5s default on CPU-capped runners.
   test("MemoryHttpClient persists records across restart and isolates repositories", async () => {
     const root = initializeFixtureRepo();
     const firstPort = await getFreePort();
@@ -310,7 +312,7 @@ describe("server memory routes", () => {
         key: "routing-owner",
       }),
     ).toBeNull();
-  });
+  }, 35_000);
 
   test("rejects malformed reinforcement outcomes with a typed 400 and no mutation", async () => {
     const root = initializeFixtureRepo();

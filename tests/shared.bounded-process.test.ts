@@ -108,6 +108,8 @@ describe("shared bounded subprocess", () => {
     expect(result.exitCode).toBe(124);
     expect(result.timedOut).toBe(true);
     expect(result.drainTimedOut).toBe(true);
+    expect(result.stdoutReadError).toBe(false);
+    expect(result.stderrReadError).toBe(false);
     expect(result.stderr).toContain("terminated process tree");
     expect(terminated).toBe(1);
     expect(stdoutCancelled).toBe(1);
@@ -158,6 +160,45 @@ describe("shared bounded subprocess", () => {
     await expect(operation).rejects.toBe(reason);
     expect(outputCancelled).toBe(1);
   });
+
+  test.each([
+    ["stdout", ""],
+    ["stdout", "partial stdout\n"],
+    ["stderr", ""],
+    ["stderr", "partial stderr\n"],
+  ] as const)(
+    "reports stream read failures separately from empty output: %s %s",
+    async (stream, prefix) => {
+      let sentPrefix = false;
+      const failed = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (prefix && !sentPrefix) {
+            sentPrefix = true;
+            controller.enqueue(new TextEncoder().encode(prefix));
+            return;
+          }
+          controller.error(new Error("subprocess pipe read failed"));
+        },
+      });
+      const result = await runBoundedProcess(["mock-read-failure"], {
+        timeoutMs: 1_000,
+        spawn: () => ({
+          pid: 0,
+          stdout: stream === "stdout" ? failed : byteStream(),
+          stderr: stream === "stderr" ? failed : byteStream(),
+          exited: Promise.resolve(0),
+          kill() {},
+        }),
+        terminate: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(result.drainTimedOut).toBe(false);
+      expect(result.stdoutReadError).toBe(stream === "stdout");
+      expect(result.stderrReadError).toBe(stream === "stderr");
+      expect(result[stream]).toBe(prefix.trim());
+    },
+  );
 
   test("does not spawn a subprocess for an already-aborted request", async () => {
     const controller = new AbortController();

@@ -27,6 +27,77 @@ afterEach(() => {
 });
 
 describe("read-only run health reporting", () => {
+  test("reports failed requests even when worker startup created no jobs", () => {
+    const report = aggregateRunHealth(
+      {
+        jobs: [],
+        requests: [
+          job("failed-request", { status: "failed" }),
+          job("waiting-request", { status: "claimed" }),
+          job("completed-request"),
+          job("older-request", { status: "failed", createdAt: "2025-12-31T23:59:59Z" }),
+          job("boundary-request", { status: "failed", createdAt: window.until }),
+        ],
+      },
+      window,
+    );
+    expect(report.requests).toEqual({
+      available: true,
+      complete: true,
+      observed: 3,
+      statusCounts: { failed: 1, claimed: 1, completed: 1 },
+      failed: 1,
+      completed: 1,
+    });
+    expect(report.cohort.jobs).toBe(0);
+    expect(report.jobs.successful).toBe(0);
+    expect(report.jobs.terminalSuccessRate).toBeNull();
+  });
+
+  test("unknown or sampled request history is not reported as complete", () => {
+    expect(aggregateRunHealth({ jobs: [] }, window).requests).toEqual({
+      available: false,
+      complete: false,
+      observed: null,
+      statusCounts: null,
+      failed: null,
+      completed: null,
+    });
+    const sampled = aggregateRunHealth(
+      { jobs: [], requests: [job("request")], truncatedTables: ["requests"] },
+      window,
+    );
+    expect(sampled.requests).toMatchObject({ available: true, complete: false, observed: 1 });
+    expect(sampled.evidence.sampled).toBe(true);
+  });
+
+  test("reads failed request cohorts with an independent row cap and no database writes", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-run-report-requests-"));
+    roots.push(root);
+    const path = join(root, "run.sqlite");
+    const db = new Database(path);
+    db.exec(
+      "CREATE TABLE jobs (id TEXT, status TEXT, createdAt TEXT); CREATE TABLE requests (id TEXT, status TEXT, createdAt TEXT)",
+    );
+    const insert = db.query("INSERT INTO requests VALUES (?, ?, ?)");
+    insert.run("a", "failed", window.since);
+    insert.run("b", "claimed", window.since);
+    insert.run("c", "failed", window.since);
+    db.close();
+    const before = readFileSync(path);
+    const report = readRunHealthReport(path, window, 2);
+    expect(report.requests).toMatchObject({
+      available: true,
+      complete: false,
+      observed: 2,
+      statusCounts: { failed: 1, claimed: 1 },
+      failed: 1,
+    });
+    expect(report.evidence.truncatedTables).toEqual(["requests"]);
+    expect(report.cohort.jobs).toBe(0);
+    expect(readFileSync(path)).toEqual(before);
+  });
+
   test("separates completed/no-change, publication, merge and actual review success", () => {
     const report = aggregateRunHealth(
       {
@@ -250,6 +321,8 @@ describe("read-only run health reporting", () => {
     expect(report.cohort.jobs).toBe(2);
     expect(report.evidence.truncatedTables).toEqual(["jobs"]);
     expect(report.evidence.missingTables).toContain("completions");
+    expect(report.requests.available).toBe(false);
+    expect(report.requests.failed).toBeNull();
     expect(report.jobs).toMatchObject({
       noChange: 1,
       successful: 0,

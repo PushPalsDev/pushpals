@@ -27,6 +27,9 @@ export type BoundedProcessResult = {
   stderrTruncated: boolean;
   stdoutDecodeError: boolean;
   stderrDecodeError: boolean;
+  // Optional for existing injected runners; the real runner always sets both.
+  stdoutReadError?: boolean;
+  stderrReadError?: boolean;
   exitCode: number;
   timedOut: boolean;
   drainTimedOut: boolean;
@@ -116,12 +119,14 @@ type BoundedStreamCaptureResult = {
   text: string;
   truncated: boolean;
   decodeError: boolean;
+  readError: boolean;
 };
 
 const EMPTY_STREAM_CAPTURE_RESULT: BoundedStreamCaptureResult = {
   text: "",
   truncated: false,
   decodeError: false,
+  readError: false,
 };
 
 function captureBoundedStream(
@@ -149,6 +154,7 @@ function captureBoundedStream(
   let observedBytes = 0;
   let lineBuffer = "";
   let decodeError = false;
+  let readError = false;
   let validationActive = true;
   let cancelled = false;
   const emitLine = (line: string) => {
@@ -241,7 +247,9 @@ function captureBoundedStream(
         lineBuffer = "";
       }
     } catch {
-      // Deadlines and inherited-pipe recovery deliberately cancel readers.
+      // A failed pipe is not an authoritative empty/complete capture. Deliberate
+      // deadline/inherited-pipe cancellation is already reported separately.
+      if (!cancelled) readError = true;
     } finally {
       try {
         reader.releaseLock();
@@ -260,6 +268,7 @@ function captureBoundedStream(
         text: new TextDecoder().decode(retained),
         truncated,
         decodeError,
+        readError,
       };
     }
     return {
@@ -268,6 +277,7 @@ function captureBoundedStream(
         : new TextDecoder().decode(head),
       truncated,
       decodeError,
+      readError,
     };
   })();
 
@@ -610,6 +620,8 @@ export async function runBoundedProcess(
     stderrTruncated: stderrCaptureResult.truncated,
     stdoutDecodeError: stdoutCaptureResult.decodeError,
     stderrDecodeError: stderrCaptureResult.decodeError,
+    stdoutReadError: stdoutCaptureResult.readError,
+    stderrReadError: stderrCaptureResult.readError,
     exitCode: outcome.exitCode,
     timedOut: outcome.timedOut,
     drainTimedOut,

@@ -36,6 +36,8 @@ import {
   sanitizePushPalsConfigForLogging,
   scrubScmRepairAuthoritySecretFromEnv,
   terminateProcessTree,
+  WORKER_STARTUP_DEADLINE_ENV,
+  WORKER_STARTUP_TIMEOUT_ENV,
   matchesGlob,
   normalizeTargetPath,
   normalizeWriteGlob,
@@ -59,6 +61,8 @@ import {
   createWorkerPalId,
   resolveWorkerStartupTimeoutMs,
 } from "./worker_spawn.js";
+import { forwardWorkerOutput, WorkerStartupProgress } from "./worker_startup.js";
+import { cleanupOwnedWorkerContainers } from "./worker_container_cleanup.js";
 
 const TASK_EXECUTE_REQUEST_IDEMPOTENCY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const REQUEST_LEASE_MS = 3 * 60_000;
@@ -1168,6 +1172,13 @@ export class RemoteBuddyOrchestrator {
   private readonly autonomyConfigPollMs: number;
   private autonomyConfigPollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly managedWorkers = new Map<string, ReturnType<typeof Bun.spawn>>();
+  private readonly workerOutputAborts = new Map<string, AbortController>();
+  private readonly dockerManagedWorkers = new Set<string>();
+  private readonly workerShutdownPending = new Set<string>();
+  private readonly workerShutdownInFlight = new Map<string, Promise<void>>();
+  private readonly workerTreesTerminated = new Set<string>();
+  private cleanupWorkerContainersImpl = cleanupOwnedWorkerContainers;
+  private disposeInFlight: Promise<void> | null = null;
   private workerSpawnInFlight: Promise<string | null> | null = null;
   private workerStartupPrewarmInFlight: Promise<void> | null = null;
   private workerSpawnCooldownUntil = 0;
@@ -2553,32 +2564,70 @@ export class RemoteBuddyOrchestrator {
     }
   }
 
-  private async terminateManagedWorkerProcess(
+  private terminateManagedWorkerProcess(
     workerId: string,
     proc: ReturnType<typeof Bun.spawn>,
     reason: string,
     timeoutMs = 8_000,
   ): Promise<void> {
-    const waitForExit = async (waitMs: number): Promise<boolean> => {
-      const settled = await Promise.race<boolean>([
-        proc.exited.then(() => true).catch(() => true),
-        Bun.sleep(Math.max(0, waitMs)).then(() => false),
-      ]);
-      return settled;
-    };
-
-    await this.terminateProcessTreeImpl(proc, {
-      terminationTimeoutMs: timeoutMs,
-      exitGraceMs: 2_000,
-    });
-    const exited = await waitForExit(250);
-
-    if (!exited) {
-      console.warn(
-        `[RemoteBuddy] WorkerPal ${workerId} did not terminate cleanly (${reason}); process may still be running.`,
-      );
+    const existing = this.workerShutdownInFlight.get(workerId);
+    if (existing) return existing;
+    if (this.managedWorkers.get(workerId) !== proc) {
+      return Promise.resolve();
     }
-    this.managedWorkers.delete(workerId);
+    this.workerShutdownPending.add(workerId);
+    // Install single-flight ownership before process exit callbacks can reenter.
+    const shutdown = Promise.resolve()
+      .then(async () => {
+        const waitForExit = async (waitMs: number): Promise<boolean> => {
+          const settled = await Promise.race<boolean>([
+            proc.exited.then(() => true).catch(() => false),
+            Bun.sleep(Math.max(0, waitMs)).then(() => false),
+          ]);
+          return settled;
+        };
+
+        try {
+          if (!this.workerTreesTerminated.has(workerId)) {
+            // Tree termination is bounded best effort; proc.exited additionally
+            // confirms the worker root is gone. Never signal this PID again while
+            // retrying daemon-owned resources: the OS may have reused it.
+            await this.terminateProcessTreeImpl(proc, {
+              terminationTimeoutMs: timeoutMs,
+              exitGraceMs: 2_000,
+            });
+            const exited = await waitForExit(250);
+            if (!exited) {
+              throw new Error(
+                `[RemoteBuddy] WorkerPal ${workerId} did not terminate cleanly (${reason}); process may still be running.`,
+              );
+            }
+            this.workerTreesTerminated.add(workerId);
+          }
+          if (
+            this.dockerManagedWorkers.has(workerId) &&
+            !(await this.cleanupWorkerContainersImpl(this.repo, workerId))
+          ) {
+            throw new Error(
+              `WorkerPal ${workerId} owned Docker container cleanup could not be verified.`,
+            );
+          }
+          // A failed process/container cleanup retains ownership and blocks further
+          // spawns. Docker daemon resources are not children of the worker process.
+          this.managedWorkers.delete(workerId);
+          this.dockerManagedWorkers.delete(workerId);
+          this.workerShutdownPending.delete(workerId);
+          this.workerTreesTerminated.delete(workerId);
+        } finally {
+          this.workerOutputAborts.get(workerId)?.abort();
+          this.workerOutputAborts.delete(workerId);
+        }
+      })
+      .finally(() => {
+        this.workerShutdownInFlight.delete(workerId);
+      });
+    this.workerShutdownInFlight.set(workerId, shutdown);
+    return shutdown;
   }
 
   private async recycleWorkerForCodexUnavailableFailure(
@@ -2690,7 +2739,9 @@ export class RemoteBuddyOrchestrator {
     }
   }
 
-  private async fetchWorkers(): Promise<WorkerSnapshot[]> {
+  private async fetchWorkers(
+    timeoutMs = SERVICE_CONTROL_HTTP_TIMEOUT_MS,
+  ): Promise<WorkerSnapshot[]> {
     try {
       const res = await this.fetchServiceControl(
         `${this.server}/workers?ttlMs=${this.workerOnlineTtlMs}`,
@@ -2698,6 +2749,7 @@ export class RemoteBuddyOrchestrator {
           method: "GET",
           headers: this.authHeaders(),
         },
+        timeoutMs,
       );
       if (!res.ok) return [];
       const data = (await res.json()) as { ok: boolean; workers?: WorkerSnapshot[] };
@@ -2764,14 +2816,23 @@ export class RemoteBuddyOrchestrator {
   private async waitForOnlineWorker(
     timeoutMs: number,
     preferredWorkerId?: string,
+    startup?: { progress: WorkerStartupProgress; stopped: () => boolean },
   ): Promise<WorkerSnapshot | null> {
     const deadline = Date.now() + Math.max(0, timeoutMs);
     while (true) {
-      const workers = await this.fetchWorkers();
+      if (this.disposed || startup?.stopped()) return null;
+      const remainingMs = (startup?.progress.deadlineMs ?? deadline) - Date.now();
+      if (startup && remainingMs <= 0) return null;
+      const workers = await this.fetchWorkers(
+        Math.max(1, Math.min(SERVICE_CONTROL_HTTP_TIMEOUT_MS, remainingMs)),
+      );
+      if (this.disposed || startup?.stopped()) return null;
+      if (startup && Date.now() >= startup.progress.deadlineMs) return null;
       const online = this.pickOnlineWorker(workers, preferredWorkerId);
       if (online) return online;
-      if (Date.now() >= deadline) return null;
-      await Bun.sleep(500);
+      const nextRemainingMs = (startup?.progress.deadlineMs ?? deadline) - Date.now();
+      if (nextRemainingMs <= 0) return null;
+      await Bun.sleep(Math.min(500, nextRemainingMs));
     }
   }
 
@@ -2781,7 +2842,9 @@ export class RemoteBuddyOrchestrator {
   ): Promise<WorkerSnapshot | null> {
     const deadline = Date.now() + Math.max(0, timeoutMs);
     while (true) {
+      if (this.disposed) return null;
       const workers = await this.fetchWorkers();
+      if (this.disposed) return null;
       if (preferredWorkerId) {
         const preferred = workers.find(
           (worker) =>
@@ -2905,12 +2968,9 @@ export class RemoteBuddyOrchestrator {
   }
 
   private async spawnWorker(): Promise<string | null> {
+    if (this.disposed) return null;
     if (this.workerSpawnInFlight) {
       return await this.workerSpawnInFlight;
-    }
-
-    if (this.managedWorkers.size >= this.maxWorkers) {
-      return null;
     }
 
     if (this.workerSpawnCooldownUntil > Date.now()) {
@@ -2920,31 +2980,118 @@ export class RemoteBuddyOrchestrator {
     }
 
     const spawnPromise = (async () => {
+      for (const workerId of this.workerShutdownPending) {
+        const proc = this.managedWorkers.get(workerId);
+        if (!proc) continue;
+        try {
+          await this.terminateManagedWorkerProcess(workerId, proc, "retry owned worker cleanup");
+        } catch (error) {
+          this.workerpalsUnavailableReason = `WorkerPal replacement blocked by incomplete cleanup: ${String(error)}`;
+          this.workerSpawnCooldownUntil = Date.now() + this.workerSpawnBackoffMs;
+          console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+          return null;
+        }
+        if (this.disposed) return null;
+      }
+      if (this.disposed || this.managedWorkers.size >= this.maxWorkers) return null;
       this.workerpalsUnavailableReason = null;
       const workerId = createWorkerPalId();
       const cmd = this.buildWorkerSpawnCommand(workerId);
       console.log(
         `[RemoteBuddy] Spawning WorkerPal ${workerId} (${this.managedWorkers.size + 1}/${this.maxWorkers})`,
       );
+      const startedAtMs = Date.now();
+      let startupProgress: WorkerStartupProgress | null = new WorkerStartupProgress(
+        this.workerStartupTimeoutMs,
+        startedAtMs,
+        this.spawnWorkerDocker,
+      );
+      const dockerWorker = this.spawnWorkerDocker;
+      let spawnedChild: ReturnType<typeof Bun.spawn> | null = null;
       try {
+        const childEnv = copyEnvWithoutScmRepairAuthoritySecret(process.env);
+        // Never let an inherited parent/previous-worker deadline contaminate a
+        // new worker. Direct workers retain their normal startup contract.
+        delete childEnv[WORKER_STARTUP_DEADLINE_ENV];
+        delete childEnv[WORKER_STARTUP_TIMEOUT_ENV];
+        if (dockerWorker) {
+          childEnv[WORKER_STARTUP_DEADLINE_ENV] = String(startupProgress.absoluteDeadlineMs);
+          childEnv[WORKER_STARTUP_TIMEOUT_ENV] = String(this.workerStartupTimeoutMs);
+        }
         const child = Bun.spawn(cmd, {
           cwd: this.repo,
-          env: copyEnvWithoutScmRepairAuthoritySecret(process.env),
+          env: childEnv,
           stdin: "ignore",
-          stdout: "inherit",
-          stderr: "inherit",
+          stdout: "pipe",
+          stderr: "pipe",
           detached: process.platform !== "win32",
         });
+        spawnedChild = child;
         this.managedWorkers.set(workerId, child);
+        if (dockerWorker) this.dockerManagedWorkers.add(workerId);
+        let childExited = false;
+        const outputAbort = new AbortController();
+        this.workerOutputAborts.set(workerId, outputAbort);
+        const outputPumps: Promise<void>[] = [];
+        for (const [stream, destination] of [
+          [child.stdout, process.stdout],
+          [child.stderr, process.stderr],
+        ] as const) {
+          if (!stream || typeof stream === "number") continue;
+          outputPumps.push(
+            forwardWorkerOutput(
+              stream,
+              (chunk) =>
+                new Promise<void>((resolve, reject) => {
+                  destination.write(chunk, (error) => (error ? reject(error) : resolve()));
+                }),
+              (line) => {
+                startupProgress?.observeLine(line);
+              },
+              outputAbort.signal,
+            ).catch((error) => {
+              console.warn(
+                `[RemoteBuddy] WorkerPal ${workerId} output forwarding failed: ${String(error)}`,
+              );
+            }),
+          );
+        }
+        const outputsDone = Promise.all(outputPumps).then(() => {
+          this.workerOutputAborts.delete(workerId);
+        });
         child.exited.then((code) => {
-          this.managedWorkers.delete(workerId);
-          if (this.maybeFallbackFromDockerAfterWorkerExit(workerId, code)) {
-            void this.ensureAutoscaledWorkerCapacity("docker codex startup fallback");
-          }
+          childExited = true;
+          // Drain final logs, but a descendant retaining a pipe must not retain
+          // RemoteBuddy's readers forever after this worker has exited.
+          const drainTimer = setTimeout(() => outputAbort.abort(), 2_000);
+          drainTimer.unref();
+          void outputsDone.finally(() => clearTimeout(drainTimer));
+          void this.terminateManagedWorkerProcess(workerId, child, "worker process exit")
+            .then(() => {
+              if (!this.disposed && this.maybeFallbackFromDockerAfterWorkerExit(workerId, code)) {
+                void this.ensureAutoscaledWorkerCapacity("docker codex startup fallback");
+              }
+            })
+            .catch((error) => {
+              this.workerpalsUnavailableReason = `WorkerPal ${workerId} cleanup failed; replacements are blocked: ${String(error)}`;
+              console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+            });
           console.warn(`[RemoteBuddy] WorkerPal process ${workerId} exited with code ${code}`);
         });
 
-        const ready = await this.waitForOnlineWorker(this.workerStartupTimeoutMs, workerId);
+        if (this.disposed) {
+          await this.terminateManagedWorkerProcess(workerId, child, "shutdown during spawn");
+          return null;
+        }
+        const ready = await this.waitForOnlineWorker(this.workerStartupTimeoutMs, workerId, {
+          progress: startupProgress,
+          stopped: () => childExited,
+        });
+        startupProgress = null;
+        if (this.disposed) {
+          await this.terminateManagedWorkerProcess(workerId, child, "shutdown during startup");
+          return null;
+        }
         if (ready) {
           this.workerSpawnCooldownUntil = 0;
           if (ready.activeJobCount > 0 || ready.status === "busy") {
@@ -2954,10 +3101,14 @@ export class RemoteBuddyOrchestrator {
           }
           return ready.workerId;
         }
+        const elapsedMs = Date.now() - startedAtMs;
+        const startupFailure = childExited
+          ? `WorkerPal ${workerId} exited before reporting online.`
+          : `WorkerPal ${workerId} did not report online after ${elapsedMs}ms (startup idle timeout ${this.workerStartupTimeoutMs}ms; Docker preparation and self-check allowances are bounded).`;
         this.workerpalsUnavailableReason =
           this.spawnWorkerDocker && this.spawnWorkerRequireDocker
-            ? `WorkerPal ${workerId} did not report online within ${this.workerStartupTimeoutMs}ms. Verify Docker is installed, running, and able to start the WorkerPal sandbox image.`
-            : `WorkerPal ${workerId} did not report online within ${this.workerStartupTimeoutMs}ms.`;
+            ? `${startupFailure} Verify Docker is installed, running, and able to start the WorkerPal sandbox image.`
+            : startupFailure;
         console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
         await this.terminateManagedWorkerProcess(workerId, child, "startup timeout");
         this.workerSpawnCooldownUntil = Date.now() + this.workerSpawnBackoffMs;
@@ -2968,8 +3119,18 @@ export class RemoteBuddyOrchestrator {
             ? `Failed to spawn Docker-backed WorkerPal: ${String(err)}`
             : `Failed to spawn WorkerPal: ${String(err)}`;
         console.error(`[RemoteBuddy] Failed to spawn WorkerPal ${workerId}:`, err);
+        if (spawnedChild && this.managedWorkers.get(workerId) === spawnedChild) {
+          try {
+            await this.terminateManagedWorkerProcess(workerId, spawnedChild, "startup exception");
+          } catch (cleanupError) {
+            this.workerpalsUnavailableReason += ` Cleanup remains pending: ${String(cleanupError)}`;
+            console.warn(`[RemoteBuddy] ${this.workerpalsUnavailableReason}`);
+          }
+        }
         this.workerSpawnCooldownUntil = Date.now() + this.workerSpawnBackoffMs;
         return null;
+      } finally {
+        startupProgress = null;
       }
     })();
 
@@ -2984,6 +3145,7 @@ export class RemoteBuddyOrchestrator {
   }
 
   async ensureWorkerCapacityOnStartup(): Promise<void> {
+    if (this.disposed) return;
     if (this.workerPrewarmDelayMs > 0) {
       console.log(
         `[RemoteBuddy] Waiting ${this.workerPrewarmDelayMs}ms before WorkerPal startup prewarm.`,
@@ -2992,6 +3154,7 @@ export class RemoteBuddyOrchestrator {
       if (this.disposed) return;
     }
     const workers = await this.fetchWorkers();
+    if (this.disposed) return;
     if (this.pickIdleWorker(workers)) {
       return;
     }
@@ -3016,6 +3179,7 @@ export class RemoteBuddyOrchestrator {
     if (onlineWorkers.length < this.maxWorkers) {
       console.log("[RemoteBuddy] Prewarming initial WorkerPal capacity...");
       const spawned = await this.spawnWorker();
+      if (this.disposed) return;
       if (spawned) {
         console.log(`[RemoteBuddy] Initial WorkerPal capacity ready via ${spawned}.`);
         void this.ensureAutoscaledWorkerCapacity("startup warm pool");
@@ -3026,6 +3190,7 @@ export class RemoteBuddyOrchestrator {
     const idleWorker = await this.waitForIdleWorker(
       Math.max(this.waitForWorkerMs, this.workerStartupTimeoutMs),
     );
+    if (this.disposed) return;
     if (idleWorker) {
       console.log(
         `[RemoteBuddy] Initial WorkerPal capacity became idle via ${idleWorker.workerId}.`,
@@ -3034,6 +3199,7 @@ export class RemoteBuddyOrchestrator {
       return;
     }
     const after = await this.fetchWorkers();
+    if (this.disposed) return;
     const onlineAfter = this.onlineWorkers(after);
     if (onlineAfter.length > 0) {
       this.workerpalsUnavailableReason = `${onlineAfter.length} online WorkerPal(s) reported but none became idle within ${Math.max(
@@ -3060,7 +3226,9 @@ export class RemoteBuddyOrchestrator {
   }
 
   private async selectTargetWorkerForJob(): Promise<string | null> {
+    if (this.disposed) return null;
     const workers = await this.fetchWorkers();
+    if (this.disposed) return null;
     const idleNow = this.pickIdleWorker(workers);
     if (idleNow) {
       return idleNow.workerId;
@@ -3071,6 +3239,7 @@ export class RemoteBuddyOrchestrator {
     );
     if (this.autoSpawnWorkers && onlineWorkers.length < this.maxWorkers) {
       const spawned = await this.spawnWorker();
+      if (this.disposed) return null;
       if (spawned) return spawned;
     }
 
@@ -3863,8 +4032,14 @@ export class RemoteBuddyOrchestrator {
     }, this.autonomyConfigPollMs);
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposeInFlight) return this.disposeInFlight;
     this.disposed = true;
+    this.disposeInFlight = this.disposeOnce();
+    return this.disposeInFlight;
+  }
+
+  private async disposeOnce(): Promise<void> {
     if (this.autonomyConfigPollTimer) {
       clearInterval(this.autonomyConfigPollTimer);
       this.autonomyConfigPollTimer = null;
@@ -3892,6 +4067,8 @@ export class RemoteBuddyOrchestrator {
     this.sessionMonitorWsErrorCounts.clear();
     this.workerSpawnCooldownUntil = 0;
     this.workerSpawnInFlight = null;
+    for (const outputAbort of this.workerOutputAborts.values()) outputAbort.abort();
+    this.workerOutputAborts.clear();
     const shutdownWorkers = Array.from(this.managedWorkers.entries()).map(([workerId, proc]) =>
       this.terminateManagedWorkerProcess(workerId, proc, "remotebuddy shutdown"),
     );

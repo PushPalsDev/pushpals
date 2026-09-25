@@ -17,7 +17,14 @@ import { createHash, randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { isAbsolute, relative, resolve } from "path";
-import { fetchWithHardDeadline, loadPushPalsConfig } from "shared";
+import {
+  fetchWithHardDeadline,
+  loadPushPalsConfig,
+  WORKER_STARTUP_CLEANUP_GRACE_MS,
+  WORKER_STARTUP_IMAGE_BUILD_MS,
+  WORKER_STARTUP_IMAGE_PULL_MS,
+} from "shared";
+import type { WorkerStartupBudget } from "./startup_budget.js";
 import { resolveExecutor, type WorkerpalsRuntimeConfig } from "./common/executor_backend.js";
 import type {
   ExecutorBackend,
@@ -79,8 +86,8 @@ const WORKERPAL_SANDBOX_SYSTEM_CA_PATH = "/etc/ssl/certs/ca-certificates.crt";
 const DEFAULT_OPENAI_CODEX_CONTAINER_HOME = "/workspace/.pushpals/codex-home";
 const WORKERPAL_HOST_CODEX_AUTH_PATH = "/run/pushpals/host-codex-auth.json";
 const DOCKER_IMAGE_INSPECT_TIMEOUT_MS = 15_000;
-const DOCKER_IMAGE_BUILD_TIMEOUT_MS = 10 * 60_000;
-const DOCKER_IMAGE_PULL_TIMEOUT_MS = 10 * 60_000;
+const DOCKER_IMAGE_BUILD_TIMEOUT_MS = WORKER_STARTUP_IMAGE_BUILD_MS;
+const DOCKER_IMAGE_PULL_TIMEOUT_MS = WORKER_STARTUP_IMAGE_PULL_MS;
 const DOCKER_CONTROL_TIMEOUT_MS = 30_000;
 const DOCKER_PROBE_TIMEOUT_MS = 15_000;
 const DOCKER_SELF_CHECK_TIMEOUT_MS = 60_000;
@@ -143,6 +150,7 @@ async function readCapturedProcessStream(
   readable: ReadableStream<Uint8Array>,
   signal: AbortSignal,
   maxChars = DOCKER_CAPTURE_MAX_CHARS,
+  onBytes?: (byteCount: number) => void,
 ): Promise<string> {
   const decoder = new TextDecoder();
   const reader = readable.getReader();
@@ -159,6 +167,7 @@ async function readCapturedProcessStream(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (value.byteLength > 0) onBytes?.(value.byteLength);
       captured += decoder.decode(value, { stream: true });
       if (captured.length > maxChars) {
         captured = `[output truncated to final ${maxChars} characters]\n${captured.slice(-maxChars)}`;
@@ -181,6 +190,36 @@ async function readCapturedProcessStream(
 
 export function buildWindowsDockerExecTreeTerminationArgv(pid: number): string[] {
   return ["taskkill", "/PID", String(Math.max(0, Math.floor(pid))), "/T", "/F"];
+}
+
+export function confirmsOwnedContainerRemoval(
+  result: {
+    exitCode: number;
+    timedOut: boolean;
+    drainTimedOut?: boolean;
+    stdout: string;
+    stderr: string;
+  },
+  names: ReadonlySet<string>,
+): boolean {
+  if (result.timedOut || result.drainTimedOut) return false;
+  if (result.exitCode === 0) return true;
+  const confirmed = new Set<string>();
+  for (const line of result.stdout.trim().split(/\r?\n/).filter(Boolean)) {
+    if (!names.has(line.trim())) return false;
+    confirmed.add(line.trim());
+  }
+  const errors = result.stderr.trim().split(/\r?\n/).filter(Boolean);
+  if (errors.length === 0) return false;
+  for (const line of errors) {
+    const match =
+      /^Error(?: response from daemon)?: No such (?:container|object): ([a-zA-Z0-9_.-]+)$/.exec(
+        line.trim(),
+      );
+    if (!match || !names.has(match[1])) return false;
+    confirmed.add(match[1]);
+  }
+  return confirmed.size === names.size;
 }
 
 export function buildDockerRuntimeCapabilityCanaryCommand(backend: ExecutorBackend): string {
@@ -1192,6 +1231,10 @@ export class DockerExecutor {
   private dependencyStoreReconciled = false;
   private preparedMergeConflictJobs = new Set<string>();
   private mergeConflictRefreshPromise: Promise<void> | null = null;
+  private startupBudget: WorkerStartupBudget | null = null;
+  private startupSelfCheckContainers = new Set<string>();
+  private startupProcesses = new Set<ReturnType<typeof Bun.spawn>>();
+  private startupCleanupLedger: JobDeadlineLedger | null = null;
   private readonly config: WorkerpalsRuntimeConfig;
   private deadlineWallNow: () => number = () => Date.now();
   private deadlineMonotonicNow: () => number = () =>
@@ -1711,15 +1754,16 @@ export class DockerExecutor {
   async validateWorktreeGitInterop(): Promise<void> {
     const worktreeName = this.buildEphemeralWorktreeName("selfcheck", "startup");
     const worktreePath = resolve(this.worktreeDir, worktreeName);
+    const deadlineLedger = this.startupBudget?.workLedger();
 
     try {
-      await this.createWorktree(worktreePath, this.options.baseRef);
-      await this.runGitSelfCheckContainer(worktreePath);
-      await this.ensureWorktreeAccessibleInWarmContainer(worktreePath);
+      await this.createWorktree(worktreePath, this.options.baseRef, deadlineLedger);
+      await this.runGitSelfCheckContainer(worktreePath, undefined, deadlineLedger);
+      await this.ensureWorktreeAccessibleInWarmContainer(worktreePath, undefined, deadlineLedger);
       const backend = this.currentBackend();
       const capabilityCheck = await this.runWarmShell(
         buildDockerRuntimeCapabilityCanaryCommand(backend),
-        { timeoutMs: 15_000 },
+        { timeoutMs: deadlineLedger?.capWorkTimeout(15_000) ?? 15_000 },
       );
       if (!capabilityCheck.ok) {
         throw new Error(
@@ -1734,12 +1778,22 @@ export class DockerExecutor {
       // Use the backend's production warmup probe here as well. This validates
       // the executable fallback, Python wrapper, and configured auth mode
       // before the worker advertises itself as ready for a real job.
-      await this.ensureBackendWarmup(backend);
+      await this.ensureBackendWarmup(backend, deadlineLedger);
       console.log(
         `[DockerExecutor] Startup self-check passed (git/worktree, runtime tools, dependency store, and backend readiness).`,
       );
+    } catch (error) {
+      // A warm container belongs to the Docker daemon, not the worker process
+      // tree. Release it before main exits or discards this executor for fallback.
+      await this.shutdown().catch((cleanupError) => {
+        console.warn(
+          `[DockerExecutor] Startup failure cleanup: ${this.compactError(cleanupError)}`,
+        );
+      });
+      throw error;
     } finally {
-      await this.removeWorktree(worktreePath).catch(() => {
+      const remove = () => this.removeWorktree(worktreePath, deadlineLedger);
+      await (this.startupBudget ? this.startupBudget.cleanup(remove) : remove()).catch(() => {
         // Ignore cleanup failures for startup self-check artifacts.
       });
     }
@@ -1947,6 +2001,7 @@ export class DockerExecutor {
       {
         cwd: this.options.repo,
         timeoutMs: removalTimeoutMs,
+        startupCleanup: true,
       },
     );
 
@@ -1966,6 +2021,7 @@ export class DockerExecutor {
     const prune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
       cwd: this.options.repo,
       timeoutMs: pruneTimeoutMs,
+      startupCleanup: true,
     });
     if (prune.timedOut || prune.exitCode !== 0) {
       console.warn(
@@ -1998,6 +2054,7 @@ export class DockerExecutor {
         const finalPrune = await this.runHostCommandCapture(["git", "worktree", "prune"], {
           cwd: this.options.repo,
           timeoutMs: finalPruneTimeoutMs,
+          startupCleanup: true,
         });
         if (finalPrune.timedOut || finalPrune.exitCode !== 0) {
           console.warn(
@@ -2489,6 +2546,12 @@ export class DockerExecutor {
     exitCode: number;
     timedOut?: boolean;
   }> {
+    if (this.startupBudget) {
+      options = {
+        ...options,
+        timeoutMs: this.startupBudget.capTimeout(options.timeoutMs ?? DOCKER_PROBE_TIMEOUT_MS),
+      };
+    }
     const hasExplicitTimeout =
       typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs);
     if (hasExplicitTimeout && Number(options.timeoutMs) <= 0) {
@@ -2518,6 +2581,7 @@ export class DockerExecutor {
         stderr: "pipe",
       },
     );
+    this.trackStartupProcess(proc);
     const stdoutLines: string[] = [];
     const stderrLines: string[] = [];
     const stdout = proc.stdout;
@@ -2544,7 +2608,10 @@ export class DockerExecutor {
         proc.exited.then((exitCode) => ({ kind: "exit" as const, exitCode })),
         streamFailure,
         new Promise<{ kind: "timeout" }>((resolvePromise) => {
-          hostTimer = setTimeout(() => resolvePromise({ kind: "timeout" }), timeoutMs + 10_000);
+          hostTimer = setTimeout(
+            () => resolvePromise({ kind: "timeout" }),
+            timeoutMs + (this.startupBudget ? 0 : 10_000),
+          );
         }),
       ]);
       if (outcome.kind === "stream_error") {
@@ -2876,7 +2943,7 @@ export class DockerExecutor {
     const boundedTimeoutMs = Math.max(1, Math.min(DOCKER_CONTROL_TIMEOUT_MS, timeoutMs));
     const result = await this.runDockerCommandCapture(
       [resolveDockerExecutable(), "rm", "-f", this.warmContainerName],
-      { timeoutMs: boundedTimeoutMs },
+      { timeoutMs: boundedTimeoutMs, startupCleanup: true },
     );
     if (!result.timedOut && result.exitCode === 0) {
       if (!quiet) {
@@ -2890,7 +2957,12 @@ export class DockerExecutor {
     const stderr = [result.stderr, result.timedOut ? `timed out after ${boundedTimeoutMs}ms` : ""]
       .filter(Boolean)
       .join("\n");
-    const notFound = /No such container/i.test(stderr);
+    const notFound = confirmsOwnedContainerRemoval(result, new Set([this.warmContainerName]));
+    if (this.startupBudget && !notFound) {
+      throw new Error(
+        `Failed to clean startup warm container ${this.warmContainerName}: ${stderr}`,
+      );
+    }
     if (!quiet && !notFound) {
       console.error(`[DockerExecutor] Failed to stop warm container: ${stderr}`);
     }
@@ -2898,10 +2970,53 @@ export class DockerExecutor {
   }
 
   async shutdown(): Promise<void> {
-    if (this.preparedDependencyProjectionIds.size > 0) {
-      await this.reconcileContainerDependencyStore();
+    if (this.startupBudget && !this.startupCleanupLedger) {
+      this.startupCleanupLedger = new JobDeadlineLedger({
+        executionBudgetMs: this.startupBudget.capTimeout(WORKER_STARTUP_CLEANUP_GRACE_MS, true),
+        finalizationBudgetMs: 0,
+      });
     }
-    await this.stopWarmContainer("worker shutdown", true);
+    const cleanup = async () => {
+      let selfcheckCleanupError: Error | null = null;
+      if (this.preparedDependencyProjectionIds.size > 0) {
+        await this.reconcileContainerDependencyStore();
+      }
+      if (this.startupSelfCheckContainers.size > 0) {
+        const result = await this.runDockerCommandCapture(
+          [resolveDockerExecutable(), "rm", "-f", ...this.startupSelfCheckContainers],
+          { timeoutMs: WORKER_STARTUP_CLEANUP_GRACE_MS, startupCleanup: true },
+        );
+        if (confirmsOwnedContainerRemoval(result, this.startupSelfCheckContainers)) {
+          this.startupSelfCheckContainers.clear();
+        } else {
+          selfcheckCleanupError = new Error(
+            "Startup selfcheck container cleanup was not confirmed",
+          );
+        }
+      }
+      await this.stopWarmContainer("worker shutdown", true);
+      if (selfcheckCleanupError) throw selfcheckCleanupError;
+    };
+    await (this.startupBudget ? this.startupBudget.cleanup(cleanup) : cleanup());
+  }
+
+  setStartupBudget(budget: WorkerStartupBudget | null): void {
+    this.startupBudget = budget;
+    if (!budget) this.startupCleanupLedger = null;
+  }
+
+  async cancelStartup(): Promise<void> {
+    this.startupBudget?.cancel();
+    await Promise.all(
+      [...this.startupProcesses].map((proc) => terminateDockerExecProcessTree(proc)),
+    );
+    await this.shutdown();
+  }
+
+  private trackStartupProcess(proc: ReturnType<typeof Bun.spawn>): void {
+    if (!this.startupBudget) return;
+    this.startupProcesses.add(proc);
+    void proc.exited.then(() => this.startupProcesses.delete(proc));
   }
 
   private encodeJobSpec(job: Job): string {
@@ -3638,6 +3753,7 @@ export class DockerExecutor {
   private async runGitSelfCheckContainer(
     worktreePath: string,
     assertLfPath?: string,
+    deadlineLedger?: JobDeadlineLedger,
   ): Promise<void> {
     const containerName = `pushpals-${this.options.workerId}-selfcheck-${Date.now()}`;
     const dockerRepoPath = this.toDockerPath(this.options.repo);
@@ -3650,6 +3766,12 @@ export class DockerExecutor {
       "--rm",
       "--name",
       containerName,
+      "--label",
+      "pushpals.component=workerpals-selfcheck",
+      "--label",
+      `pushpals.repo=${this.options.repo}`,
+      "--label",
+      `pushpals.worker_id=${this.options.workerId}`,
       "--network",
       "none",
       "-v",
@@ -3681,9 +3803,14 @@ export class DockerExecutor {
         "fi",
       ].join("\n"),
     ];
+    this.startupSelfCheckContainers.add(containerName);
     const result = await this.runDockerCommandCapture(args, {
-      timeoutMs: DOCKER_SELF_CHECK_TIMEOUT_MS,
+      timeoutMs:
+        deadlineLedger?.capWorkTimeout(DOCKER_SELF_CHECK_TIMEOUT_MS) ??
+        DOCKER_SELF_CHECK_TIMEOUT_MS,
     });
+    if (!result.timedOut && result.exitCode === 0)
+      this.startupSelfCheckContainers.delete(containerName);
     if (result.timedOut || result.exitCode !== 0) {
       const detail = [result.stderr, result.stdout].filter(Boolean).join("\n");
       throw new Error(
@@ -4224,7 +4351,12 @@ export class DockerExecutor {
 
   private async runHostCommandCapture(
     command: string[],
-    opts: { cwd?: string; timeoutMs?: number } = {},
+    opts: {
+      cwd?: string;
+      timeoutMs?: number;
+      onOutput?: (stream: "stdout" | "stderr", byteCount: number) => void;
+      startupCleanup?: boolean;
+    } = {},
   ): Promise<{
     stdout: string;
     stderr: string;
@@ -4232,6 +4364,23 @@ export class DockerExecutor {
     timedOut: boolean;
     drainTimedOut: boolean;
   }> {
+    if (this.startupBudget) {
+      opts = {
+        ...opts,
+        timeoutMs: this.startupBudget.capTimeout(
+          opts.timeoutMs ?? DOCKER_CONTROL_TIMEOUT_MS,
+          opts.startupCleanup,
+        ),
+      };
+    }
+    if (opts.startupCleanup && this.startupCleanupLedger) {
+      opts = {
+        ...opts,
+        timeoutMs: this.startupCleanupLedger.capTotalTimeout(
+          opts.timeoutMs ?? DOCKER_CONTROL_TIMEOUT_MS,
+        ),
+      };
+    }
     const hasExplicitTimeout =
       typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs);
     if (hasExplicitTimeout && Number(opts.timeoutMs) <= 0) {
@@ -4252,6 +4401,7 @@ export class DockerExecutor {
       stdout: "pipe",
       stderr: "pipe",
     });
+    this.trackStartupProcess(proc);
     const stdout = proc.stdout;
     const stderr = proc.stderr;
     if (!isReadableByteStream(stdout) || !isReadableByteStream(stderr)) {
@@ -4261,8 +4411,12 @@ export class DockerExecutor {
 
     const streamAbort = new AbortController();
     const streams = Promise.all([
-      readCapturedProcessStream(stdout, streamAbort.signal),
-      readCapturedProcessStream(stderr, streamAbort.signal),
+      readCapturedProcessStream(stdout, streamAbort.signal, DOCKER_CAPTURE_MAX_CHARS, (bytes) =>
+        opts.onOutput?.("stdout", bytes),
+      ),
+      readCapturedProcessStream(stderr, streamAbort.signal, DOCKER_CAPTURE_MAX_CHARS, (bytes) =>
+        opts.onOutput?.("stderr", bytes),
+      ),
     ]);
     let timer: ReturnType<typeof setTimeout> | null = null;
     const streamFailure = streams.then(
@@ -4324,7 +4478,12 @@ export class DockerExecutor {
 
   private async runDockerCommandCapture(
     command: string[],
-    opts: { cwd?: string; timeoutMs?: number } = {},
+    opts: {
+      cwd?: string;
+      timeoutMs?: number;
+      onOutput?: (stream: "stdout" | "stderr", byteCount: number) => void;
+      startupCleanup?: boolean;
+    } = {},
   ): Promise<{
     stdout: string;
     stderr: string;
@@ -4333,6 +4492,68 @@ export class DockerExecutor {
     drainTimedOut: boolean;
   }> {
     return this.runHostCommandCapture(command, opts);
+  }
+
+  private async runDockerImageCommandCapture(
+    phase: "docker-image-build" | "docker-image-pull",
+    command: string[],
+    opts: { cwd?: string; timeoutMs: number },
+  ) {
+    if (opts.timeoutMs <= 0) return this.runDockerCommandCapture(command, opts);
+    if (this.startupBudget) {
+      const budget = this.startupBudget;
+      return budget.phase(
+        phase,
+        (timeoutMs) =>
+          this.runDockerCommandCapture(command, {
+            ...opts,
+            timeoutMs: Math.min(opts.timeoutMs, timeoutMs),
+            onOutput: (_stream, bytes) => budget.output(bytes),
+          }),
+        (result) => !result.timedOut && result.exitCode === 0,
+        opts.timeoutMs,
+      );
+    }
+    // Startup is not readiness: RemoteBuddy still waits for the worker heartbeat.
+    // Report only observed subprocess output, never timer-generated liveness.
+    // Progress is diagnostic and must not renew the absolute build deadline.
+    if (opts.timeoutMs <= 0) return this.runDockerCommandCapture(command, opts);
+    const timeoutMs = Math.max(1, Math.floor(opts.timeoutMs));
+    const startedAt = this.deadlineMonotonicNow();
+    let lastProgressAt = Number.NEGATIVE_INFINITY;
+    let outputBytes = 0;
+    const report = (event: "start" | "progress" | "complete" | "failed") => {
+      console.log(
+        `[WorkerPalStartup] ${JSON.stringify({
+          phase,
+          event,
+          timeoutMs,
+          elapsedMs: Math.max(0, Math.floor(this.deadlineMonotonicNow() - startedAt)),
+          outputBytes,
+        })}`,
+      );
+    };
+    report("start");
+    try {
+      const result = await this.runDockerCommandCapture(command, {
+        ...opts,
+        timeoutMs,
+        onOutput: (_stream, bytes) => {
+          if (!Number.isFinite(bytes) || bytes <= 0) return;
+          outputBytes = Math.min(Number.MAX_SAFE_INTEGER, outputBytes + Math.floor(bytes));
+          const now = this.deadlineMonotonicNow();
+          if (now - lastProgressAt < 1_000) return;
+          lastProgressAt = now;
+          // Deliberately do not forward raw build output or build-secret paths.
+          report("progress");
+        },
+      });
+      report(result.timedOut || result.exitCode !== 0 ? "failed" : "complete");
+      return result;
+    } catch (error) {
+      report("failed");
+      throw error;
+    }
   }
 
   private compactError(err: unknown): string {
@@ -4620,7 +4841,8 @@ export class DockerExecutor {
     await this.stopWarmContainer("merge-conflict image refresh", true);
     this.warmedBackends.clear();
 
-    const build = await this.runDockerCommandCapture(
+    const build = await this.runDockerImageCommandCapture(
+      "docker-image-build",
       [
         resolveDockerExecutable(),
         "build",
@@ -4741,7 +4963,8 @@ export class DockerExecutor {
     console.log(
       `[DockerExecutor] Local image is unavailable or unsuitable. Pulling: ${this.options.imageName}`,
     );
-    const pull = await this.runDockerCommandCapture(
+    const pull = await this.runDockerImageCommandCapture(
+      "docker-image-pull",
       [resolveDockerExecutable(), "pull", this.options.imageName],
       {
         timeoutMs:
@@ -4862,7 +5085,7 @@ export class DockerExecutor {
         "[DockerExecutor] Supplying host extra CA trust to the sandbox build as an ephemeral secret.",
       );
     }
-    const build = await this.runDockerCommandCapture(args, {
+    const build = await this.runDockerImageCommandCapture("docker-image-build", args, {
       cwd: sandboxContext.root,
       timeoutMs:
         deadlineLedger?.capWorkTimeout(DOCKER_IMAGE_BUILD_TIMEOUT_MS) ??
@@ -4883,14 +5106,18 @@ export class DockerExecutor {
   /**
    * Check if Docker is available
    */
-  static async isDockerAvailable(): Promise<boolean> {
+  static async isDockerAvailable(timeoutMs = DOCKER_PROBE_TIMEOUT_MS): Promise<boolean> {
+    if (timeoutMs <= 0) return false;
     try {
       const proc = Bun.spawn([resolveDockerExecutable(), "version"], {
         stdin: "ignore",
         stdout: "ignore",
         stderr: "ignore",
       });
-      const exitCode = await settleWithin(proc.exited, DOCKER_PROBE_TIMEOUT_MS);
+      const exitCode = await settleWithin(
+        proc.exited,
+        Math.min(timeoutMs, DOCKER_PROBE_TIMEOUT_MS),
+      );
       if (exitCode === null) {
         await terminateDockerExecProcessTree(proc);
         return false;

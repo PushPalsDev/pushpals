@@ -86,6 +86,8 @@ describe("release package payload verification", () => {
         "runtime/sandbox/apps/workerpals/package.json",
         "runtime/sandbox/apps/workerpals/uv.lock",
         "runtime/sandbox/apps/workerpals/src/job_runner.ts",
+        "runtime/sandbox/apps/workerpals/src/startup_budget.ts",
+        "runtime/sandbox/packages/shared/src/worker_startup.ts",
         "runtime/sandbox/apps/workerpals/src/common/generic_python_executor.ts",
         "runtime/sandbox/apps/workerpals/src/backends/openai_codex/openai_codex_executor.py",
         "runtime/sandbox/packages/shared/src/index.ts",
