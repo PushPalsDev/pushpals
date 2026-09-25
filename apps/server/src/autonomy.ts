@@ -7175,6 +7175,7 @@ export class AutonomyStore {
     objectiveId?: string;
     deduped?: boolean;
     retryable?: boolean;
+    disposition?: "permanent" | "retryable";
     success?: boolean;
     userAction?: string;
   } {
@@ -7260,6 +7261,8 @@ export class AutonomyStore {
         ok: true as const,
         ignored: true as const,
         acknowledged: true as const,
+        disposition: "permanent" as const,
+        retryable: false as const,
         ...(deduped ? { deduped: true as const } : {}),
         reason,
       };
@@ -7299,6 +7302,8 @@ export class AutonomyStore {
           ok: true as const,
           ignored: true as const,
           acknowledged: true as const,
+          disposition: "permanent" as const,
+          retryable: false as const,
           deduped: true as const,
           reason,
         };
@@ -7307,6 +7312,7 @@ export class AutonomyStore {
         ok: true as const,
         ignored: true as const,
         acknowledged: false as const,
+        disposition: "retryable" as const,
         retryable: true as const,
         reason,
       };

@@ -136,9 +136,15 @@ A claim is identified by `pusherId`, `claimToken`, and `claimGeneration`. Server
   health probe emits `recovered`. Services without health probes report only
   process/launcher readiness, which is not evidence of service uptime,
 - `/health.reviewProvider` reports provider poll timestamps, consecutive
-  failures, retry backlog, and the durable-link cursor. Provider API outages are
-  exposed as a degraded component without restarting the otherwise healthy
-  publication loop,
+  failures, retry backlog, `pendingFeedbackCount`, and the durable-link cursor.
+  Provider API outages are exposed as a degraded component without restarting
+  the otherwise healthy publication loop,
+- explicitly retryable server feedback authority gaps remain pending on bounded
+  backoff without marking provider health degraded. Logs retain the server's
+  reason and disposition; an unclassified ignore or HTTP/authentication failure
+  still degrades provider health. Missing job authority is durably terminalized
+  only after the existing three-observation/ten-minute stale window (or explicit
+  pruning), and terminal ignores still require a positive acknowledgement,
 - missing provider credentials, an unsupported remote, or an unresolved remote
   are reported as an explicit degraded provider state instead of disappearing
   from health telemetry; a provider poll that remains in flight for five minutes

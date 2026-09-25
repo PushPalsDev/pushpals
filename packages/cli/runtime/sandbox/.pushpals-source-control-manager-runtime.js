@@ -8564,6 +8564,7 @@ class ReviewAgent {
       consecutiveFailedPolls: this.consecutiveFailedProviderPolls,
       failureEvents: this.providerFailureEvents,
       lastError: this.lastProviderError,
+      pendingFeedbackCount: this.attemptedClosedPrStates.size,
       persistedLinkRetryCount: this.persistedPrLinkRetries.size,
       persistedLinkCursor: this.persistedPrLinkCursor
     };
@@ -8893,7 +8894,7 @@ class ReviewAgent {
         lastAttemptedAtMs: nowMs,
         failures: priorFailures + 1
       });
-      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+      const feedbackDisposition = await this.postAutonomyPrFeedback({
         pr,
         feedbackKey: stateKey,
         verdict: providerState === "merged" ? "approved_merged" : "closed_unmerged",
@@ -8902,8 +8903,10 @@ class ReviewAgent {
         jobId,
         sessionId
       });
-      if (!feedbackAcknowledged) {
-        this.recordProviderFailure(`publish provider outcome for PR #${pr.number}`);
+      if (feedbackDisposition !== "acknowledged") {
+        if (feedbackDisposition === "failed") {
+          this.recordProviderFailure(`publish provider outcome for PR #${pr.number}`);
+        }
         return;
       }
       this.attemptedClosedPrStates.delete(stateKey);
@@ -9146,7 +9149,7 @@ ${raw.slice(0, 500)}`);
       }
       this.deps.logInfo(`[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${String(result.sha ?? "").slice(0, 8) || "unknown"})`);
       const comments = await this.listRecentPrComments(pr.number);
-      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+      const feedbackDisposition = await this.postAutonomyPrFeedback({
         pr,
         feedbackKey: providerStateFeedbackKey(pr, "merged", jobId),
         verdict: "approved_merged",
@@ -9156,7 +9159,7 @@ ${raw.slice(0, 500)}`);
         sessionId,
         comments
       });
-      if (!feedbackAcknowledged) {
+      if (feedbackDisposition !== "acknowledged") {
         this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} merged, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`);
         return false;
       }
@@ -9197,7 +9200,7 @@ ${raw.slice(0, 500)}`);
     const handled = await this.enqueueMergeConflictJob(pr, verdict, sessionId, jobId, diff, mergeError);
     if (handled) {
       const comments = await this.listRecentPrComments(pr.number);
-      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+      const feedbackDisposition = await this.postAutonomyPrFeedback({
         pr,
         verdict: "approved_unmergeable",
         verdictSummary: `${verdict.summary} merge blocked: ${String(mergeError?.message ?? mergeError ?? "")}`.trim(),
@@ -9206,7 +9209,7 @@ ${raw.slice(0, 500)}`);
         sessionId,
         comments
       });
-      if (!feedbackAcknowledged) {
+      if (feedbackDisposition !== "acknowledged") {
         this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} merge-conflict feedback was not acknowledged; the unchanged PR will be reviewed again.`);
         return false;
       }
@@ -9264,7 +9267,7 @@ ${raw.slice(0, 500)}`);
           this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to comment on PR #${pr.number}: ${err?.message ?? err}`);
         }
       }
-      return this.postAutonomyPrFeedback({
+      const feedbackDisposition = await this.postAutonomyPrFeedback({
         pr,
         verdict: "rejected",
         verdictSummary: effectiveVerdict.summary,
@@ -9273,6 +9276,7 @@ ${raw.slice(0, 500)}`);
         sessionId,
         comments: recentComments
       });
+      return feedbackDisposition === "acknowledged";
     };
     if (!sessionId) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} has no pushpals-sessionId in body - cannot re-queue`);
@@ -9365,7 +9369,7 @@ ${raw.slice(0, 500)}`);
     } catch (err) {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] Closed PR #${pr.number} but failed to post give-up comment: ${err?.message ?? err}`);
     }
-    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+    const feedbackDisposition = await this.postAutonomyPrFeedback({
       pr,
       feedbackKey: providerStateFeedbackKey(pr, "closed_unmerged", context.jobId),
       verdict: context.feedbackVerdict ?? "rejected_comment_cap_closed",
@@ -9378,7 +9382,7 @@ ${raw.slice(0, 500)}`);
     this.reReviewEnqueueCounts.delete(pr.number);
     this.forceReReview.delete(pr.number);
     this.reviewed.delete(pr.number);
-    if (!feedbackAcknowledged) {
+    if (feedbackDisposition !== "acknowledged") {
       this.deps.logWarn(`[${ts()}] [ReviewAgent] PR #${pr.number} closed, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`);
       return false;
     }
@@ -9588,7 +9592,7 @@ ${raw.slice(0, 500)}`);
   async postAutonomyPrFeedback(args) {
     const normalizedVerdict = String(args.verdict ?? "").trim().toLowerCase();
     if (!normalizedVerdict)
-      return false;
+      return "failed";
     const providerStateAt = String(args.providerStateAt ?? "").trim();
     const headers = { "Content-Type": "application/json" };
     if (this.authToken)
@@ -9639,12 +9643,27 @@ ${raw.slice(0, 500)}`);
           } catch {
             acknowledgement = null;
           }
-          if (acknowledgement?.ok === true && (acknowledgement.ignored !== true || acknowledgement.acknowledged === true)) {
-            return true;
+          if (acknowledgement && (typeof acknowledgement.ok !== "boolean" || ["ignored", "acknowledged", "retryable"].some((field) => acknowledgement?.[field] !== undefined && typeof acknowledgement?.[field] !== "boolean") || acknowledgement.disposition !== undefined && acknowledgement.disposition !== "permanent" && acknowledgement.disposition !== "retryable" || acknowledgement.reason !== undefined && typeof acknowledgement.reason !== "string" || acknowledgement.disposition === "retryable" && acknowledgement.retryable === false || acknowledgement.disposition === "permanent" && acknowledgement.retryable === true)) {
+            lastFailure = "server response contained invalid feedback acknowledgement fields";
+            break;
           }
-          lastFailure = acknowledgement?.ignored === true ? "server returned ignored=true" : "server response did not contain a positive acknowledgement";
-          if (acknowledgement?.ignored === true)
+          const serverRetryable = acknowledgement?.retryable === true || acknowledgement?.disposition === "retryable";
+          const disposition = acknowledgement?.disposition === "permanent" || acknowledgement?.disposition === "retryable" ? acknowledgement.disposition : serverRetryable ? "retryable" : acknowledgement?.acknowledged === true ? "permanent" : "unspecified";
+          const reason = typeof acknowledgement?.reason === "string" ? truncateText(collapseWhitespace(acknowledgement.reason), 400) : "";
+          if (acknowledgement?.ok === true && acknowledgement.acknowledged !== false && !serverRetryable && (acknowledgement.ignored !== true || acknowledgement.acknowledged === true)) {
+            if (acknowledgement.ignored === true) {
+              this.deps.logInfo(`[${ts()}] [ReviewAgent] Autonomy PR feedback for PR #${args.pr.number} acknowledged as a terminal ignore (disposition=${disposition})${reason ? `: ${reason}` : "."}`);
+            }
+            return "acknowledged";
+          }
+          if (acknowledgement?.ok === true && acknowledgement.ignored === true && acknowledgement.acknowledged === false && acknowledgement.disposition !== "permanent" && serverRetryable) {
+            this.deps.logInfo(`[${ts()}] [ReviewAgent] Autonomy PR feedback for PR #${args.pr.number} deferred (disposition=${disposition})${reason ? `: ${reason}` : "."}`);
+            return "deferred";
+          }
+          lastFailure = acknowledgement?.ignored === true ? `server returned ignored=true (disposition=${disposition})${reason ? `: ${reason}` : ""}` : `server response did not contain a positive acknowledgement${reason ? `: ${reason}` : ""}`;
+          if (acknowledgement?.ignored === true || acknowledgement?.acknowledged === false || serverRetryable) {
             retryable = false;
+          }
         } else {
           lastFailure = `HTTP ${response.status}${responseText ? `: ${responseText}` : ""}`;
           retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
@@ -9656,7 +9675,7 @@ ${raw.slice(0, 500)}`);
         break;
     }
     this.deps.logWarn(`[${ts()}] [ReviewAgent] Failed to post acknowledged autonomy PR feedback for PR #${args.pr.number} after ${attemptsMade} bounded attempt(s): ${lastFailure}`);
-    return false;
+    return "failed";
   }
   async enqueueFixJob(pr, verdict, sessionId, jobId, diff, excludedBodies = [], prefetchedComments) {
     const taskId = `review-fix-pr${pr.number}-${this.deps.now()}`;
@@ -10764,6 +10783,7 @@ function createBlockedReviewProviderHealth(reason) {
     consecutiveFailedPolls: 1,
     failureEvents: 1,
     lastError: String(reason || "review provider reconciliation is blocked").slice(0, 600),
+    pendingFeedbackCount: 0,
     persistedLinkRetryCount: 0,
     persistedLinkCursor: null
   };

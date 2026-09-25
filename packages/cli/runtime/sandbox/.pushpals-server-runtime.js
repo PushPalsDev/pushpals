@@ -24854,6 +24854,8 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         ok: true,
         ignored: true,
         acknowledged: true,
+        disposition: "permanent",
+        retryable: false,
         ...deduped ? { deduped: true } : {},
         reason
       };
@@ -24876,6 +24878,8 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
           ok: true,
           ignored: true,
           acknowledged: true,
+          disposition: "permanent",
+          retryable: false,
           deduped: true,
           reason
         };
@@ -24884,6 +24888,7 @@ ${selected.failureFingerprint}`).slice(0, 16) : validationIncidentDigest(selecte
         ok: true,
         ignored: true,
         acknowledged: false,
+        disposition: "retryable",
         retryable: true,
         reason
       };

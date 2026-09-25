@@ -7628,6 +7628,7 @@ describe("server AutonomyStore policy gates", () => {
         ok: true,
         ignored: true,
         acknowledged: false,
+        disposition: "retryable",
         retryable: true,
         reason: "PR feedback jobId does not identify a persisted job",
       });
@@ -7654,6 +7655,8 @@ describe("server AutonomyStore policy gates", () => {
         ok: true,
         ignored: true,
         acknowledged: true,
+        disposition: "permanent",
+        retryable: false,
         deduped: true,
       });
       expect(store.recordPrFeedback({ ...feedback, verdict: "approved_merged" })).toMatchObject({
@@ -7674,6 +7677,26 @@ describe("server AutonomyStore policy gates", () => {
         disposition: "permanent",
         occurrenceCount: 4,
       });
+
+      closeTrackedStore(store);
+      const restartedStore = new AutonomyStore(dbPath);
+      stores.push(restartedStore);
+      expect(restartedStore.recordPrFeedback(feedback)).toMatchObject({
+        ok: true,
+        ignored: true,
+        acknowledged: true,
+        disposition: "permanent",
+        retryable: false,
+        deduped: true,
+        reason: "PR feedback jobId does not identify a persisted job",
+      });
+      const restartedDb = (restartedStore as unknown as { db: Database }).db;
+      expect(
+        restartedDb.prepare(`SELECT COUNT(*) AS count FROM autonomy_pr_feedback`).get(),
+      ).toMatchObject({ count: 0 });
+      expect(
+        restartedDb.prepare(`SELECT COUNT(*) AS count FROM pr_provider_outcomes`).get(),
+      ).toMatchObject({ count: 0 });
     } finally {
       jobs.close();
     }

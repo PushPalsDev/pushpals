@@ -1488,6 +1488,137 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(result.evidence[0]?.path).toBe("src/scheduler.ts");
   });
 
+  test("shares packet capacity across large files and a later small implementation", async () => {
+    const repo = createRepository();
+    const largePaths = ["a", "b", "c", "d", "e", "f"].map((name) => `src/large-${name}.ts`);
+    for (const path of largePaths) {
+      writeFileSync(
+        join(repo, path),
+        Array.from(
+          { length: 900 },
+          (_, index) => `// row ${index}: ${"neutral data ".repeat(8)}`,
+        ).join("\n"),
+      );
+    }
+    const implementationPath = "src/z-implementation.ts";
+    writeFileSync(join(repo, implementationPath), "export const verifiedImplementation = true;\n");
+    git(repo, ["add", "."]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "large evidence fixture",
+    ]);
+    const llm = new FakeLlm(() =>
+      modelResponse({ evidence: [{ path: implementationPath, startLine: 1, endLine: 1 }] }),
+    );
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+    });
+    const request = await requestFor(repo, {
+      freshness: "fresh_required",
+      question: "Inspect the supplied exact source coordinates.",
+      context: { targetPaths: [...largePaths, implementationPath] },
+    });
+    const result = await worker.analyze("fair-evidence", request);
+    const packet = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content).evidencePacket;
+    expect(packet.files.map((entry: { path: string }) => entry.path)).toContain(implementationPath);
+    expect(
+      packet.files.find((entry: { path: string }) => entry.path === implementationPath).content,
+    ).toContain("verifiedImplementation");
+    expect(
+      packet.files.reduce(
+        (bytes: number, entry: { content: string }) =>
+          bytes + Buffer.byteLength(entry.content, "utf8"),
+        0,
+      ),
+    ).toBeLessThanOrEqual(64_000);
+    expect(
+      packet.files.every(
+        (entry: { content: string }) => Buffer.byteLength(entry.content, "utf8") <= 16 * 1024,
+      ),
+    ).toBe(true);
+    expect(result.evidence[0]?.path).toBe(implementationPath);
+    expect(llm.analysisCalls).toHaveLength(1);
+    expect(llm.discoveryCalls).toHaveLength(0);
+  });
+
+  test("validates original-line window citations and rejects gaps or a truncated scan suffix", async () => {
+    const repo = createRepository();
+    const path = "src/scheduler.ts";
+    const lines = Array.from(
+      { length: 1_600 },
+      (_, index) => `// row ${index + 1}: ${"neutral data ".repeat(9)}`,
+    );
+    lines[611] = "export function reconcileSchedulingLease() { return recoverLostClaim(); }";
+    writeFileSync(join(repo, path), lines.join("\r\n"));
+    git(repo, ["add", path]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "window citation fixture",
+    ]);
+    const request = await requestFor(repo, {
+      freshness: "fresh_required",
+      question: "Inspect reconcileSchedulingLease and recoverLostClaim in src/scheduler.ts.",
+      context: { targetPaths: [path] },
+    });
+    let citedStart = 612;
+    let citedEnd = 612;
+    let packetFile:
+      | {
+          content: string;
+          scanTruncated: boolean;
+          lineRanges: Array<{ startLine: number; endLine: number }>;
+        }
+      | undefined;
+    const llm: LLMClient = {
+      async generate(input) {
+        packetFile = JSON.parse(input.messages[0]!.content).evidencePacket.files.find(
+          (entry: { path: string }) => entry.path === path,
+        );
+        return {
+          text: JSON.stringify(
+            modelResponse({ evidence: [{ path, startLine: citedStart, endLine: citedEnd }] }),
+          ),
+        };
+      },
+    };
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+    });
+    const valid = await worker.analyze("valid-window", request);
+    expect(valid.evidence[0]?.excerpt).toBe(lines[611]);
+    expect(packetFile?.content).toContain(lines[611]!);
+    expect(packetFile?.scanTruncated).toBe(true);
+    const ranges = packetFile!.lineRanges;
+    const gap = ranges.find(
+      (range, index) => index > 0 && range.startLine > ranges[index - 1]!.endLine + 1,
+    )!;
+    expect(gap).toBeDefined();
+    citedStart = gap.startLine - 1;
+    citedEnd = gap.startLine;
+    await expect(worker.analyze("gap-window", request)).rejects.toThrow(
+      "did not contain any current, tracked repository evidence",
+    );
+    citedStart = 1_600;
+    citedEnd = 1_600;
+    await expect(worker.analyze("unscanned-window", request)).rejects.toThrow(
+      "did not contain any current, tracked repository evidence",
+    );
+  });
+
   test("reserves packet capacity for Unicode-ranked sources and prefers them in fallback evidence", async () => {
     const repo = createRepository();
     const relevantPath = "src/支付处理.ts";

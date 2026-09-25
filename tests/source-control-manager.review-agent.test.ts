@@ -1214,6 +1214,331 @@ describe("ReviewAgent", () => {
     expect(deleteCalls).toBe(1);
   });
 
+  test.each([
+    { label: "canonical disposition", pending: { disposition: "retryable", retryable: true } },
+    { label: "legacy missing disposition", pending: { retryable: true } },
+    { label: "missing retry flag", pending: { disposition: "retryable" } },
+  ])("reports pending and terminal feedback distinctly with $label", async ({ pending }) => {
+    let pr = makePr({
+      number: 84,
+      state: "closed",
+      merged_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+    });
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    const feedbackKeys: string[] = [];
+    const warnings: string[] = [];
+    const infos: string[] = [];
+    let deleteCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => [pr],
+        feedbackFetchImpl: async (_input, init) => {
+          feedbackKeys.push(JSON.parse(String(init?.body ?? "{}")).feedbackKey);
+          const permanent = feedbackKeys.length > 1;
+          return Response.json({
+            ok: true,
+            ignored: true,
+            acknowledged: permanent,
+            ...(permanent ? { disposition: "permanent", retryable: false } : pending),
+            reason: "PR feedback jobId does not identify a persisted job",
+          });
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+        logWarn: (message) => warnings.push(message),
+        logInfo: (message) => infos.push(message),
+      },
+    );
+
+    await agent.poll();
+    expect(feedbackKeys).toHaveLength(1);
+    expect(deleteCalls).toBe(0);
+    expect(infos.join("\n")).toContain(
+      "deferred (disposition=retryable): PR feedback jobId does not identify a persisted job",
+    );
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "ok",
+      failureEvents: 0,
+      pendingFeedbackCount: 1,
+    });
+    nowMs += 60_001;
+    await agent.poll();
+    expect(feedbackKeys).toHaveLength(2);
+    expect(deleteCalls).toBe(1);
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({ pendingFeedbackCount: 0 });
+    expect(infos.join("\n")).toContain(
+      "acknowledged as a terminal ignore (disposition=permanent): PR feedback jobId does not identify a persisted job",
+    );
+    nowMs += 60_001;
+    await agent.poll();
+    expect(feedbackKeys).toHaveLength(2);
+    expect(warnings).toHaveLength(0);
+
+    pr = { ...pr, head: { ...pr.head, sha: "different-head" } };
+    nowMs += 60_001;
+    await agent.poll();
+    expect(feedbackKeys).toHaveLength(3);
+    expect(feedbackKeys[2]).not.toBe(feedbackKeys[1]);
+  });
+
+  test.each([
+    { label: "legacy unacknowledged ignore", status: 200, acknowledgement: {} },
+    {
+      label: "permanent without acknowledgement",
+      status: 200,
+      acknowledgement: { disposition: "permanent" },
+    },
+    {
+      label: "contradictory retry flag",
+      status: 200,
+      acknowledgement: { acknowledged: true, retryable: true },
+    },
+    {
+      label: "contradictory disposition",
+      status: 200,
+      acknowledgement: { acknowledged: true, disposition: "retryable" },
+    },
+    {
+      label: "explicit false retry flag conflicts with retryable disposition",
+      status: 200,
+      acknowledgement: { acknowledged: false, disposition: "retryable", retryable: false },
+    },
+    {
+      label: "retry flag conflicts with permanent disposition",
+      status: 200,
+      acknowledgement: { acknowledged: false, disposition: "permanent", retryable: true },
+    },
+    {
+      label: "unknown deferred disposition",
+      status: 200,
+      acknowledgement: { acknowledged: false, disposition: "future-state", retryable: true },
+    },
+    {
+      label: "unknown terminal disposition",
+      status: 200,
+      acknowledgement: { acknowledged: true, disposition: "future-state" },
+    },
+    {
+      label: "numeric disposition",
+      status: 200,
+      acknowledgement: { acknowledged: true, disposition: 1 },
+    },
+    {
+      label: "null disposition",
+      status: 200,
+      acknowledgement: { acknowledged: false, disposition: null, retryable: true },
+    },
+    {
+      label: "string ignored flag",
+      status: 200,
+      acknowledgement: { ignored: "false" },
+    },
+    {
+      label: "null ignored flag",
+      status: 200,
+      acknowledgement: { ignored: null },
+    },
+    {
+      label: "string acknowledged flag",
+      status: 200,
+      acknowledgement: { ignored: false, acknowledged: "true" },
+    },
+    {
+      label: "numeric acknowledged flag",
+      status: 200,
+      acknowledgement: { ignored: false, acknowledged: 0 },
+    },
+    {
+      label: "null acknowledged flag",
+      status: 200,
+      acknowledgement: { ignored: false, acknowledged: null },
+    },
+    {
+      label: "string retryable flag",
+      status: 200,
+      acknowledgement: { acknowledged: true, retryable: "false" },
+    },
+    {
+      label: "null retryable flag",
+      status: 200,
+      acknowledgement: { acknowledged: false, disposition: "retryable", retryable: null },
+    },
+    {
+      label: "object reason",
+      status: 200,
+      acknowledgement: { acknowledged: true, reason: { message: "ignored" } },
+    },
+    {
+      label: "null reason",
+      status: 200,
+      acknowledgement: { acknowledged: true, reason: null },
+    },
+    {
+      label: "string ok flag",
+      status: 200,
+      acknowledgement: { ok: "true", acknowledged: true },
+    },
+    {
+      label: "explicit false acknowledgement with no ignore",
+      status: 200,
+      acknowledgement: { ignored: false, acknowledged: false },
+    },
+    {
+      label: "explicit false acknowledgement with missing ignore",
+      status: 200,
+      acknowledgement: { ignored: undefined, acknowledged: false },
+    },
+    {
+      label: "missing acknowledgement on retryable disposition",
+      status: 200,
+      acknowledgement: { disposition: "retryable" },
+    },
+    {
+      label: "unauthorized",
+      status: 401,
+      acknowledgement: { acknowledged: true, disposition: "permanent" },
+    },
+    {
+      label: "forbidden",
+      status: 403,
+      acknowledgement: { acknowledged: true, disposition: "permanent" },
+    },
+  ])("retains unacknowledged provider outcomes for $label", async ({ status, acknowledgement }) => {
+    const pr = makePr({
+      number: 84,
+      state: "closed",
+      merged_at: "2026-08-25T17:00:00.000Z",
+      updated_at: "2026-08-25T17:00:00.000Z",
+    });
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    let feedbackCalls = 0;
+    let deleteCalls = 0;
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => [pr],
+        feedbackFetchImpl: async () => {
+          feedbackCalls += 1;
+          return Response.json({ ok: true, ignored: true, ...acknowledgement }, { status });
+        },
+        deleteBranchRef: async () => {
+          deleteCalls += 1;
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+    nowMs += 60_001;
+    await agent.poll();
+    expect(feedbackCalls).toBe(2);
+    expect(deleteCalls).toBe(0);
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "degraded",
+      failureEvents: 2,
+      pendingFeedbackCount: 1,
+    });
+  });
+
+  test("pending authority gaps do not mask real feedback failures in the same provider poll", async () => {
+    const prs = [85, 86].map((number) =>
+      makePr({
+        number,
+        state: "closed",
+        merged_at: "2026-08-25T17:00:00.000Z",
+        updated_at: "2026-08-25T17:00:00.000Z",
+      }),
+    );
+    let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+    let transportRecovered = false;
+    let authorityAvailable = false;
+    const deletedBranches: string[] = [];
+    const agent = new ReviewAgent(
+      { ...baseConfig, enabled: false },
+      "http://localhost:3001",
+      "token",
+      "https://github.com/org/repo.git",
+      "main",
+      undefined,
+      {
+        ...silentLogs,
+        now: () => nowMs,
+        listRecentlyClosedPullRequests: async () => prs,
+        feedbackFetchImpl: async (_input, init) => {
+          const { prNumber } = JSON.parse(String(init?.body ?? "{}"));
+          if (prNumber === 85 && !authorityAvailable) {
+            // The previous server version supplies the retryable flag without
+            // a disposition. It must still remain pending, not acknowledged.
+            return Response.json({
+              ok: true,
+              ignored: true,
+              acknowledged: false,
+              retryable: true,
+              reason: "terminal PR feedback requires a persisted job-to-PR link",
+            });
+          }
+          if (prNumber === 86 && !transportRecovered) {
+            return new Response("unavailable", { status: 503 });
+          }
+          return Response.json({ ok: true, ignored: false });
+        },
+        deleteBranchRef: async ({ branchRef }) => {
+          deletedBranches.push(branchRef);
+          return { deleted: true, reason: "deleted" as const };
+        },
+      },
+    );
+
+    await agent.poll();
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "degraded",
+      failureEvents: 1,
+      consecutiveFailedPolls: 1,
+      pendingFeedbackCount: 2,
+      lastError: "publish provider outcome for PR #86",
+    });
+    expect(deletedBranches).toHaveLength(0);
+
+    transportRecovered = true;
+    nowMs += 60_001;
+    await agent.poll();
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "ok",
+      failureEvents: 1,
+      consecutiveFailedPolls: 0,
+      pendingFeedbackCount: 1,
+      lastError: null,
+    });
+    expect(deletedBranches).toHaveLength(1);
+
+    authorityAvailable = true;
+    nowMs += 120_001;
+    await agent.poll();
+    expect(agent.getProviderHealthSnapshot()).toMatchObject({
+      status: "ok",
+      pendingFeedbackCount: 0,
+    });
+    expect(deletedBranches).toHaveLength(2);
+  });
+
   test("prioritizes unseen closed outcomes over backed-off ignored outcomes", async () => {
     const prs = Array.from({ length: 9 }, (_, index) =>
       makePr({

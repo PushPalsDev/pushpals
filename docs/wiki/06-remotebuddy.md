@@ -47,7 +47,7 @@ RemoteBuddy starts one bounded worker that:
 2. heartbeats the fenced claim while it runs,
 3. verifies stable repository identity plus the exact revision/content-tree snapshot,
 4. checks an exact cache and recalls only still-valid evidence-backed facts,
-5. gives RemoteBuddy's assigned LLM a bounded evidence packet; a first bounded model pass can select additional tracked files for the final analysis,
+5. deterministically selects tracked files and bounded original-line evidence windows, then gives RemoteBuddy's assigned LLM one evidence-only synthesis packet,
 6. validates cited paths/blob hashes and verifies the snapshot again,
 7. completes or fails through the lease-authority API.
 

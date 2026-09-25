@@ -54,6 +54,7 @@ export type SourceControlManagerReviewProviderHealth = {
   consecutiveFailedPolls: number;
   failureEvents: number;
   lastError: string | null;
+  pendingFeedbackCount: number;
   persistedLinkRetryCount: number;
   persistedLinkCursor: string | null;
 };
@@ -72,6 +73,7 @@ export function createBlockedReviewProviderHealth(
     consecutiveFailedPolls: 1,
     failureEvents: 1,
     lastError: String(reason || "review provider reconciliation is blocked").slice(0, 600),
+    pendingFeedbackCount: 0,
     persistedLinkRetryCount: 0,
     persistedLinkCursor: null,
   };

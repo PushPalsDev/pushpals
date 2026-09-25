@@ -129,13 +129,221 @@ describe("start runtime service helpers", () => {
     ).toBe(false);
   });
 
-  test("shared transport outage is visible, recovers without kills, and a later sustained SCM outage restarts only SCM", async () => {
+  test("cold-start refusals report starting then ready, but failures after readiness are degraded immediately", async () => {
     let now = 1_000;
     let health: ManagedServiceHealthResult = {
       ok: false,
-      detail: "HTTP timeout",
+      detail: "connection refused",
       failureKind: "transport_error",
     };
+    const events: ManagedServiceLifecycleEvent[] = [];
+    const logs: { level: string; line: string }[] = [];
+    const healthChanges: unknown[] = [];
+    let terminations = 0;
+    const manager = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      probeServiceHealth: async () => health,
+      onLifecycleEvent: (event) => events.push(event),
+      onHealthChange: (health) => healthChanges.push(health),
+      onEvent: (level, line) => logs.push({ level, line }),
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: { kill() {} } as any,
+        command: spec.command,
+        cwd: spec.cwd,
+        env: {},
+        exited: false,
+        exitCode: null,
+        launchedAtMs: now,
+      }),
+      terminateService: async () => {
+        terminations += 1;
+      },
+    });
+    const tick = async (at: number) => {
+      now = at;
+      (manager as any).tick();
+      await Bun.sleep(0);
+    };
+    try {
+      manager.startService({
+        name: "service",
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: { url: "http://127.0.0.1/health", intervalMs: 50 },
+      });
+      await tick(1_000);
+      await tick(1_050);
+      await tick(1_100);
+      expect(manager.getHealth()).toBeNull();
+      expect(healthChanges).toEqual([]);
+      expect(events).toHaveLength(3);
+      expect(events.every((event) => event.type === "health" && event.phase === "starting")).toBe(
+        true,
+      );
+      expect(logs.every(({ level, line }) => level === "log" && line.includes("is starting"))).toBe(
+        true,
+      );
+      health = { ok: true, detail: "healthy", responseStatus: 200 };
+      await tick(1_150);
+      expect(manager.getHealth()).toBeNull();
+      expect(events.at(-1)).toMatchObject({ type: "health", healthy: true, phase: "ready" });
+      expect(events.some((event) => event.type === "recovered")).toBe(false);
+      expect(logs.at(-1)?.line).toContain("is ready");
+      expect(healthChanges).toEqual([]);
+
+      health = { ok: false, detail: "connection refused", failureKind: "transport_error" };
+      await tick(1_200);
+      expect(manager.getHealth()?.state).toBe("degraded");
+      expect(healthChanges).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ type: "health", healthy: false, phase: "degraded" });
+      expect(terminations).toBe(0);
+    } finally {
+      manager.stop();
+    }
+  });
+
+  test.each(
+    [undefined, NaN, Infinity, -Infinity].flatMap((transportFailureGraceMs) =>
+      [false, true].map((restartOnFailure) => ({ restartOnFailure, transportFailureGraceMs })),
+    ),
+  )(
+    "cold-start health reporting stays bounded (restart=$restartOnFailure, grace=$transportFailureGraceMs)",
+    async ({ restartOnFailure, transportFailureGraceMs }) => {
+      let now = 1_000;
+      let terminations = 0;
+      const events: ManagedServiceLifecycleEvent[] = [];
+      const manager = new ServiceManager({
+        now: () => now,
+        pollMs: 1_000_000,
+        probeServiceHealth: async () => ({
+          ok: false,
+          detail: "connection refused",
+          failureKind: "transport_error",
+        }),
+        onLifecycleEvent: (event) => events.push(event),
+        spawnService: (spec) => ({
+          name: spec.name,
+          proc: { kill() {} } as any,
+          command: spec.command,
+          cwd: spec.cwd,
+          env: {},
+          exited: false,
+          exitCode: null,
+          launchedAtMs: now,
+        }),
+        terminateService: async (service) => {
+          terminations += 1;
+          service.exited = true;
+          service.exitCode = 1;
+        },
+      });
+      const tick = async (at: number) => {
+        now = at;
+        (manager as any).tick();
+        await Bun.sleep(0);
+      };
+      try {
+        manager.startService({
+          name: "service",
+          color: "",
+          command: ["fake"],
+          cwd: process.cwd(),
+          healthCheck: {
+            url: "http://127.0.0.1/health",
+            intervalMs: 50,
+            restartOnFailure,
+            transportFailureGraceMs,
+          },
+        });
+        // Reporting is bounded from launch, even if the first probe was delayed.
+        await tick(2_000);
+        await tick(60_000);
+        await tick(60_950);
+        expect(manager.getHealth()).toBeNull();
+        expect(events.at(-1)).toMatchObject({ phase: "starting", consecutiveFailures: 3 });
+        await tick(61_000);
+        expect(manager.getHealth()?.state).toBe("degraded");
+        expect(events.at(-1)).toMatchObject({ phase: "degraded", consecutiveFailures: 4 });
+        expect(terminations).toBe(0);
+        // The existing sustained-outage clock still starts at the first failed probe.
+        await tick(62_000);
+        expect(terminations).toBe(restartOnFailure ? 1 : 0);
+        expect(events.at(-1)).toMatchObject({
+          phase: "degraded",
+          consecutiveFailures: 5,
+          failureDurationMs: 60_000,
+        });
+      } finally {
+        manager.stop();
+      }
+    },
+  );
+
+  test("cold-start crashes remain degraded through restart until health confirms recovery", async () => {
+    let now = 1_000;
+    let spawns = 0;
+    let health: ManagedServiceHealthResult = {
+      ok: false,
+      detail: "connection refused",
+      failureKind: "transport_error",
+    };
+    const events: ManagedServiceLifecycleEvent[] = [];
+    const manager = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      computeRestartBackoffMs: () => 1,
+      probeServiceHealth: async () => health,
+      onLifecycleEvent: (event) => events.push(event),
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: { kill() {} } as any,
+        command: spec.command,
+        cwd: spec.cwd,
+        env: {},
+        exited: ++spawns === 1,
+        exitCode: spawns === 1 ? 1 : null,
+        launchedAtMs: now,
+      }),
+    });
+    try {
+      manager.startService({
+        name: "service",
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: { url: "http://127.0.0.1/health", intervalMs: 50 },
+      });
+      (manager as any).tick();
+      expect(manager.getHealth()?.state).toBe("degraded");
+      expect(events.at(-1)).toMatchObject({ type: "exit", exitCause: "unexpected_exit" });
+      await Bun.sleep(5);
+      expect(spawns).toBe(2);
+      now = 1_050;
+      (manager as any).tick();
+      await Bun.sleep(0);
+      expect(manager.getHealth()?.state).toBe("degraded");
+      expect(events.at(-1)).toMatchObject({ type: "health", healthy: false, phase: "degraded" });
+      expect(events.some((event) => event.type === "recovered")).toBe(false);
+      health = { ok: true, detail: "healthy", responseStatus: 200 };
+      now = 1_100;
+      (manager as any).tick();
+      await Bun.sleep(0);
+      expect(manager.getHealth()).toBeNull();
+      expect(events.at(-1)).toMatchObject({ type: "recovered", confirmation: "health_probe" });
+      expect(events.some((event) => event.type === "health" && event.phase === "ready")).toBe(
+        false,
+      );
+    } finally {
+      manager.stop();
+    }
+  });
+
+  test("shared transport outage is visible, recovers without kills, and a later sustained SCM outage restarts only SCM", async () => {
+    let now = 0;
+    let health: ManagedServiceHealthResult = { ok: true, detail: "healthy", responseStatus: 200 };
     const terminated: string[] = [];
     const events: ManagedServiceLifecycleEvent[] = [];
     const manager = new ServiceManager({
@@ -182,6 +390,8 @@ describe("start runtime service helpers", () => {
             restartOnFailure: name !== "server",
           },
         });
+      await tick(0);
+      health = { ok: false, detail: "HTTP timeout", failureKind: "transport_error" };
       await tick(1_000);
       await tick(6_000);
       await tick(11_000);
@@ -317,6 +527,7 @@ describe("start runtime service helpers", () => {
       (manager as any).tick();
       await Bun.sleep(15);
       expect(terminations).toBe(1);
+      expect(manager.getHealth()?.state).toBe("degraded");
       expect(manager.getService("scm")?.exited).toBe(false);
       expect(logs.some((line) => line.includes("without confirmed process exit"))).toBe(true);
       now = 2_000;

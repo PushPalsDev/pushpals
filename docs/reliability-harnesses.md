@@ -16,6 +16,12 @@ the executable override.
 
 The harness emits one JSON envelope for each phase and a final summary. Each phase has a bounded runtime and stops the harness on its first failure.
 
+Repository evidence regressions cover fair UTF-8 byte allocation across selected
+files, bounded original-line windows beyond large file headers, and rejection of
+citations into omitted or partially supplied lines. These checks preserve one
+synthesis stage, repository containment, snapshot identity, and empty-candidate
+results when the supplied evidence still does not justify implementation work.
+
 | Phase                     | Contract                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `repository_intelligence` | Repository analysis and memory preserve snapshot/claim authority; vision exclusions and empty candidate results cannot manufacture work.                                                                                                                                                                                                                                    |
@@ -83,6 +89,11 @@ silently accumulating containers. Other repositories' containers are untouched.
 Runtime-boundary regressions cover actual timeout-to-fallback transitions, slow
 self-checks, cleanup failure/retry, disposal during prewarm, malformed progress,
 output backpressure, and shared warmup between autoscaling and request admission.
+
+Initial service connection refusals are reported as bounded startup rather than
+immediately recommending a restart. Explicit unhealthy responses, crashes,
+post-readiness failures, and elapsed startup grace still surface as degradation;
+probe counters and restart deadlines remain authoritative.
 
 ## Outcome and evidence metrics
 

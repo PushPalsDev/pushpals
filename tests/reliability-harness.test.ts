@@ -10,6 +10,7 @@ describe("reliability harness release coverage", () => {
     const files = listReliabilityHarnessPhaseFiles("repository_intelligence");
 
     expect(files).toContain("tests/remotebuddy.repository-agent.test.ts");
+    expect(files).toContain("tests/remotebuddy.repository-evidence.test.ts");
     expect(files).toContain("tests/server.repository-agent-queue.test.ts");
     expect(files).toContain("tests/memory-store-conformance.test.ts");
     expect(files).toContain("tests/remotebuddy.autonomous-engine.tick.test.ts");

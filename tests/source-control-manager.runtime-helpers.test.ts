@@ -105,6 +105,7 @@ describe("source_control_manager runtime helpers", () => {
       consecutiveFailedPolls: 3,
       failureEvents: 3,
       lastError: "provider unavailable",
+      pendingFeedbackCount: 0,
       persistedLinkRetryCount: 2,
       persistedLinkCursor: "120",
     };

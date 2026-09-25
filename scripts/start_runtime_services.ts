@@ -148,6 +148,7 @@ export type ManagedServiceLifecycleEvent =
       type: "health";
       service: string;
       healthy: boolean;
+      phase: "starting" | "ready" | "degraded" | "recovered";
       detail: string;
       failureKind: ManagedServiceHealthFailureKind | null;
       responseStatus: number | null;
@@ -257,6 +258,15 @@ export async function defaultProbeServiceHealth(
   }
 }
 
+function resolveTransportFailureGraceMs(value: number | undefined): number {
+  return Math.max(
+    1_000,
+    typeof value === "number" && Number.isFinite(value)
+      ? value
+      : DEFAULT_SERVICE_TRANSPORT_FAILURE_GRACE_MS,
+  );
+}
+
 export function shouldTerminateAfterHealthFailure(options: {
   failureKind: ManagedServiceHealthFailureKind;
   consecutiveFailures: number;
@@ -270,8 +280,7 @@ export function shouldTerminateAfterHealthFailure(options: {
     (options.failureKind === "unhealthy_response" &&
       (options.consecutiveExplicitFailures ?? options.consecutiveFailures) >=
         Math.max(1, options.unhealthyThreshold)) ||
-    options.failureDurationMs >=
-      Math.max(1_000, options.transportFailureGraceMs ?? DEFAULT_SERVICE_TRANSPORT_FAILURE_GRACE_MS)
+    options.failureDurationMs >= resolveTransportFailureGraceMs(options.transportFailureGraceMs)
   );
 }
 
@@ -836,10 +845,18 @@ export class ServiceManager {
         const wasUnhealthy = state.consecutiveUnhealthyProbes > 0;
         if (health.ok) {
           if (wasUnhealthy || state.awaitingRecoveryConfirmation) {
+            const initiallyReady =
+              state.lastHealthyAtMs === null &&
+              !state.awaitingRecoveryConfirmation &&
+              !this.degradedServiceReasons.has(name);
+            if (initiallyReady) {
+              this.emitEvent("log", `Managed ${name} is ready (health probe confirmed).`);
+            }
             this.onLifecycleEvent?.({
               type: "health",
               service: name,
               healthy: true,
+              phase: initiallyReady ? "ready" : "recovered",
               detail: health.detail,
               failureKind: null,
               responseStatus: health.responseStatus ?? null,
@@ -878,14 +895,35 @@ export class ServiceManager {
           1,
           Math.floor(healthCheck.unhealthyThreshold ?? DEFAULT_SERVICE_UNHEALTHY_THRESHOLD),
         );
+        const shouldTerminate = shouldTerminateAfterHealthFailure({
+          failureKind,
+          consecutiveFailures: state.consecutiveUnhealthyProbes,
+          consecutiveExplicitFailures: state.consecutiveExplicitUnhealthyProbes,
+          unhealthyThreshold: threshold,
+          failureDurationMs,
+          transportFailureGraceMs: healthCheck.transportFailureGraceMs,
+        });
+        // A cold listener may not accept connections yet. Keep probing and counting
+        // failures, but distinguish that bounded startup wait from an outage. This
+        // only changes reporting: explicit unhealthy responses, restarts, and all
+        // existing launch/termination deadlines retain their failure semantics.
+        const starting =
+          failureKind === "transport_error" &&
+          state.lastHealthyAtMs === null &&
+          !state.awaitingRecoveryConfirmation &&
+          !this.degradedServiceReasons.has(name) &&
+          !shouldTerminate &&
+          Math.max(0, observedAtMs - service.launchedAtMs) <
+            resolveTransportFailureGraceMs(healthCheck.transportFailureGraceMs);
         this.emitEvent(
-          state.consecutiveUnhealthyProbes >= threshold ? "warn" : "log",
-          `Managed ${name} health probe failed (${state.consecutiveUnhealthyProbes}/${threshold}, ${failureKind}, ${failureDurationMs}ms): ${health.detail}`,
+          !starting && state.consecutiveUnhealthyProbes >= threshold ? "warn" : "log",
+          `Managed ${name} ${starting ? "is starting; waiting for its first healthy response" : "health probe failed"} (${state.consecutiveUnhealthyProbes}/${threshold}, ${failureKind}, ${failureDurationMs}ms): ${health.detail}`,
         );
         this.onLifecycleEvent?.({
           type: "health",
           service: name,
           healthy: false,
+          phase: starting ? "starting" : "degraded",
           detail: health.detail,
           failureKind,
           responseStatus: health.responseStatus ?? null,
@@ -896,25 +934,14 @@ export class ServiceManager {
           restartOnFailure: healthCheck.restartOnFailure !== false,
           observedAt: new Date(observedAtMs).toISOString(),
         });
-        if (!this.degradedServiceReasons.has(name)) {
+        if (!starting && !this.degradedServiceReasons.has(name)) {
           this.degradedServiceReasons.set(
             name,
             `health unconfirmed (${failureKind}): ${health.detail}`,
           );
           this.emitHealthChange();
         }
-        if (
-          healthCheck.restartOnFailure === false ||
-          !shouldTerminateAfterHealthFailure({
-            failureKind,
-            consecutiveFailures: state.consecutiveUnhealthyProbes,
-            consecutiveExplicitFailures: state.consecutiveExplicitUnhealthyProbes,
-            unhealthyThreshold: threshold,
-            failureDurationMs,
-            transportFailureGraceMs: healthCheck.transportFailureGraceMs,
-          })
-        )
-          return;
+        if (healthCheck.restartOnFailure === false || !shouldTerminate) return;
         state.healthTerminationRequested = true;
         this.emitEvent(
           "warn",

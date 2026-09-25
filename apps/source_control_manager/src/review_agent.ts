@@ -1753,6 +1753,7 @@ export class ReviewAgent {
       consecutiveFailedPolls: this.consecutiveFailedProviderPolls,
       failureEvents: this.providerFailureEvents,
       lastError: this.lastProviderError,
+      pendingFeedbackCount: this.attemptedClosedPrStates.size,
       persistedLinkRetryCount: this.persistedPrLinkRetries.size,
       persistedLinkCursor: this.persistedPrLinkCursor,
     };
@@ -2190,7 +2191,7 @@ export class ReviewAgent {
           lastAttemptedAtMs: nowMs,
           failures: priorFailures + 1,
         });
-        const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+        const feedbackDisposition = await this.postAutonomyPrFeedback({
           pr,
           feedbackKey: stateKey,
           verdict: providerState === "merged" ? "approved_merged" : "closed_unmerged",
@@ -2203,8 +2204,10 @@ export class ReviewAgent {
           jobId,
           sessionId,
         });
-        if (!feedbackAcknowledged) {
-          this.recordProviderFailure(`publish provider outcome for PR #${pr.number}`);
+        if (feedbackDisposition !== "acknowledged") {
+          if (feedbackDisposition === "failed") {
+            this.recordProviderFailure(`publish provider outcome for PR #${pr.number}`);
+          }
           return;
         }
 
@@ -2509,7 +2512,7 @@ export class ReviewAgent {
         `[${ts()}] [ReviewAgent] PR #${pr.number} merged (score ${verdict.score.toFixed(1)}/10, sha ${String(result.sha ?? "").slice(0, 8) || "unknown"})`,
       );
       const comments = await this.listRecentPrComments(pr.number);
-      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+      const feedbackDisposition = await this.postAutonomyPrFeedback({
         pr,
         feedbackKey: providerStateFeedbackKey(pr, "merged", jobId),
         verdict: "approved_merged",
@@ -2519,7 +2522,7 @@ export class ReviewAgent {
         sessionId,
         comments,
       });
-      if (!feedbackAcknowledged) {
+      if (feedbackDisposition !== "acknowledged") {
         this.deps.logWarn(
           `[${ts()}] [ReviewAgent] PR #${pr.number} merged, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`,
         );
@@ -2600,7 +2603,7 @@ export class ReviewAgent {
     );
     if (handled) {
       const comments = await this.listRecentPrComments(pr.number);
-      const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+      const feedbackDisposition = await this.postAutonomyPrFeedback({
         pr,
         verdict: "approved_unmergeable",
         verdictSummary:
@@ -2610,7 +2613,7 @@ export class ReviewAgent {
         sessionId,
         comments,
       });
-      if (!feedbackAcknowledged) {
+      if (feedbackDisposition !== "acknowledged") {
         this.deps.logWarn(
           `[${ts()}] [ReviewAgent] PR #${pr.number} merge-conflict feedback was not acknowledged; the unchanged PR will be reviewed again.`,
         );
@@ -2687,7 +2690,7 @@ export class ReviewAgent {
           );
         }
       }
-      return this.postAutonomyPrFeedback({
+      const feedbackDisposition = await this.postAutonomyPrFeedback({
         pr,
         verdict: "rejected",
         verdictSummary: effectiveVerdict.summary,
@@ -2696,6 +2699,7 @@ export class ReviewAgent {
         sessionId,
         comments: recentComments,
       });
+      return feedbackDisposition === "acknowledged";
     };
 
     if (!sessionId) {
@@ -2838,7 +2842,7 @@ export class ReviewAgent {
       );
     }
 
-    const feedbackAcknowledged = await this.postAutonomyPrFeedback({
+    const feedbackDisposition = await this.postAutonomyPrFeedback({
       pr,
       feedbackKey: providerStateFeedbackKey(pr, "closed_unmerged", context.jobId),
       verdict: context.feedbackVerdict ?? "rejected_comment_cap_closed",
@@ -2855,7 +2859,7 @@ export class ReviewAgent {
     this.reReviewEnqueueCounts.delete(pr.number);
     this.forceReReview.delete(pr.number);
     this.reviewed.delete(pr.number);
-    if (!feedbackAcknowledged) {
+    if (feedbackDisposition !== "acknowledged") {
       this.deps.logWarn(
         `[${ts()}] [ReviewAgent] PR #${pr.number} closed, but its autonomy outcome was not acknowledged; closed-PR reconciliation will retry it.`,
       );
@@ -3171,11 +3175,11 @@ export class ReviewAgent {
     jobId: string | null;
     sessionId: string | null;
     comments?: PullRequestComment[];
-  }): Promise<boolean> {
+  }): Promise<"acknowledged" | "deferred" | "failed"> {
     const normalizedVerdict = String(args.verdict ?? "")
       .trim()
       .toLowerCase();
-    if (!normalizedVerdict) return false;
+    if (!normalizedVerdict) return "failed";
     const providerStateAt = String(args.providerStateAt ?? "").trim();
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -3243,19 +3247,82 @@ export class ReviewAgent {
             acknowledgement = null;
           }
           if (
+            acknowledgement &&
+            (typeof acknowledgement.ok !== "boolean" ||
+              ["ignored", "acknowledged", "retryable"].some(
+                (field) =>
+                  acknowledgement?.[field] !== undefined &&
+                  typeof acknowledgement?.[field] !== "boolean",
+              ) ||
+              (acknowledgement.disposition !== undefined &&
+                acknowledgement.disposition !== "permanent" &&
+                acknowledgement.disposition !== "retryable") ||
+              (acknowledgement.reason !== undefined &&
+                typeof acknowledgement.reason !== "string") ||
+              (acknowledgement.disposition === "retryable" &&
+                acknowledgement.retryable === false) ||
+              (acknowledgement.disposition === "permanent" && acknowledgement.retryable === true))
+          ) {
+            lastFailure = "server response contained invalid feedback acknowledgement fields";
+            break;
+          }
+          const serverRetryable =
+            acknowledgement?.retryable === true || acknowledgement?.disposition === "retryable";
+          const disposition =
+            acknowledgement?.disposition === "permanent" ||
+            acknowledgement?.disposition === "retryable"
+              ? acknowledgement.disposition
+              : serverRetryable
+                ? "retryable"
+                : acknowledgement?.acknowledged === true
+                  ? "permanent"
+                  : "unspecified";
+          const reason =
+            typeof acknowledgement?.reason === "string"
+              ? truncateText(collapseWhitespace(acknowledgement.reason), 400)
+              : "";
+          if (
             acknowledgement?.ok === true &&
+            acknowledgement.acknowledged !== false &&
+            !serverRetryable &&
             (acknowledgement.ignored !== true || acknowledgement.acknowledged === true)
           ) {
-            return true;
+            if (acknowledgement.ignored === true) {
+              this.deps.logInfo(
+                `[${ts()}] [ReviewAgent] Autonomy PR feedback for PR #${args.pr.number} acknowledged as a terminal ignore (disposition=${disposition})${reason ? `: ${reason}` : "."}`,
+              );
+            }
+            return "acknowledged";
+          }
+          if (
+            acknowledgement?.ok === true &&
+            acknowledgement.ignored === true &&
+            acknowledgement.acknowledged === false &&
+            acknowledgement.disposition !== "permanent" &&
+            serverRetryable
+          ) {
+            // The server durably retained this authority gap. It remains
+            // pending on the existing backoff, without misreporting a healthy
+            // provider/server round trip as a transport or protocol failure.
+            this.deps.logInfo(
+              `[${ts()}] [ReviewAgent] Autonomy PR feedback for PR #${args.pr.number} deferred (disposition=${disposition})${reason ? `: ${reason}` : "."}`,
+            );
+            return "deferred";
           }
           lastFailure =
             acknowledgement?.ignored === true
-              ? "server returned ignored=true"
-              : "server response did not contain a positive acknowledgement";
+              ? `server returned ignored=true (disposition=${disposition})${reason ? `: ${reason}` : ""}`
+              : `server response did not contain a positive acknowledgement${reason ? `: ${reason}` : ""}`;
           // An ignored response is a semantic rejection, not a transient
           // transport failure. Retry it on a later provider poll with backoff
           // so it cannot consume every immediate retry slot.
-          if (acknowledgement?.ignored === true) retryable = false;
+          if (
+            acknowledgement?.ignored === true ||
+            acknowledgement?.acknowledged === false ||
+            serverRetryable
+          ) {
+            retryable = false;
+          }
         } else {
           lastFailure = `HTTP ${response.status}${responseText ? `: ${responseText}` : ""}`;
           retryable =
@@ -3273,7 +3340,7 @@ export class ReviewAgent {
     this.deps.logWarn(
       `[${ts()}] [ReviewAgent] Failed to post acknowledged autonomy PR feedback for PR #${args.pr.number} after ${attemptsMade} bounded attempt(s): ${lastFailure}`,
     );
-    return false;
+    return "failed";
   }
 
   private async enqueueFixJob(
