@@ -70,6 +70,17 @@ and success metrics do not displace actionable priorities. Safety-critical
 callers fail closed unless an existing deterministic path is independently
 safe.
 
+Clean autonomy snapshots retain bounded evidence coverage in shared memory.
+After a grounded empty result, later ticks can examine the next ranked group of
+tracked files instead of replaying the same empty packet indefinitely. The host
+retains seed files, limits discovery to sixteen pages of at most six additional
+paths, and uses one synthesis stage per request. Reaching that cap means bounded
+coverage is exhausted, not that the repository has no useful work. Scope,
+validation, and admission gates still apply; failures do not advance coverage.
+Explicit vision non-goals remain in the structural model context. Transient
+queue, objective, and cooldown state is applied by current downstream eligibility
+checks rather than cached as repository structure.
+
 Codex-backed analysis never runs with the target repository as its working directory. It runs in a disposable neutral Git repository with project instructions, user rules, shell, apps, and web access disabled. HTTP completion backends receive the same evidence-only request and ignore the Codex execution hint.
 
 See [RepositoryAgent and shared memory](https://github.com/PushPalsDev/pushpals/wiki/13-repository-agent-and-memory) for the cross-service contract.

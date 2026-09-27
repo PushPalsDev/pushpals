@@ -47,6 +47,8 @@ describe("start runtime service helpers", () => {
         const health = await defaultProbeServiceHealth({ url, timeoutMs: 250 });
         expect(health.ok).toBe(true);
         expect(health.responseStatus).toBe(200);
+        expect(health.probeDurationMs).toBeGreaterThanOrEqual(0);
+        expect(health.probeTimeoutMs).toBe(250);
       }
       expect(connections).toBe(4);
     } finally {
@@ -91,6 +93,9 @@ describe("start runtime service helpers", () => {
     expect(health.ok).toBe(false);
     expect(health.failureKind).toBe("transport_error");
     expect(health.detail).toContain("timed out after 250ms");
+    expect(health.probeDurationMs).toBeGreaterThanOrEqual(200);
+    expect(health.probeDurationMs).toBeLessThan(1_000);
+    expect(health.probeTimeoutMs).toBe(250);
     expect(bodyCancelled).toBe(true);
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
@@ -103,6 +108,8 @@ describe("start runtime service helpers", () => {
     expect(health.failureKind).toBe("unhealthy_response");
     expect(health.responseStatus).toBe(503);
     expect(health.ok).toBe(false);
+    expect(health.probeDurationMs).toBeGreaterThanOrEqual(0);
+    expect(health.probeTimeoutMs).toBe(2_500);
   });
 
   test("three brief transport timeouts cannot kill validation, but sustained failure remains bounded", () => {
@@ -479,6 +486,74 @@ describe("start runtime service helpers", () => {
       expect(terminations).toBe(0); // No three consecutive explicit unhealthy responses.
       await tick(61_000);
       expect(terminations).toBe(1); // Continuous outage still reached its 60-second bound.
+    } finally {
+      manager.stop();
+    }
+  });
+
+  test("three explicit unhealthy responses still terminate SCM without the transport grace period", async () => {
+    let now = 1_000;
+    let terminations = 0;
+    const events: ManagedServiceLifecycleEvent[] = [];
+    const manager = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      recoveryPendingAction: "Automatic supervision is continuing.",
+      degradedAction: "Automatic recovery exhausted; inspect the service log.",
+      onLifecycleEvent: (event) => events.push(event),
+      probeServiceHealth: async () => ({
+        ok: false,
+        detail: "tick stalled",
+        failureKind: "unhealthy_response",
+        responseStatus: 503,
+        probeDurationMs: 7,
+        probeTimeoutMs: 2_500,
+      }),
+      spawnService: (spec) => ({
+        name: spec.name,
+        proc: { kill() {} } as any,
+        command: spec.command,
+        cwd: spec.cwd,
+        env: {},
+        exited: false,
+        exitCode: null,
+        launchedAtMs: now,
+      }),
+      terminateService: async (service) => {
+        terminations += 1;
+        service.exited = true;
+        service.exitCode = 1;
+      },
+    });
+    try {
+      manager.startService({
+        name: "source_control_manager",
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: { url: "http://127.0.0.1/health", intervalMs: 50 },
+      });
+      for (const at of [1_000, 1_050]) {
+        now = at;
+        (manager as any).tick();
+        await Bun.sleep(0);
+        expect(terminations).toBe(0);
+        expect(manager.getHealth()?.action).toBe("Automatic supervision is continuing.");
+      }
+      now = 1_100;
+      (manager as any).tick();
+      await Bun.sleep(0);
+      expect(terminations).toBe(1);
+      expect(events.at(-1)).toMatchObject({
+        type: "health",
+        phase: "degraded",
+        failureKind: "unhealthy_response",
+        responseStatus: 503,
+        consecutiveFailures: 3,
+        failureDurationMs: 100,
+        probeDurationMs: 7,
+        probeTimeoutMs: 2_500,
+      });
     } finally {
       manager.stop();
     }

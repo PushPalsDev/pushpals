@@ -22,6 +22,12 @@ export type EmbeddedRuntimeHealth = {
   action?: string;
 };
 
+export type ManagedServiceHealthChangeCause =
+  | "degraded"
+  | "recovered"
+  | "service_replaced"
+  | "service_removed";
+
 export type ManagedServiceSpec = {
   name: string;
   color: string;
@@ -90,6 +96,9 @@ export type ManagedServiceHealthResult = {
   detail: string;
   failureKind?: ManagedServiceHealthFailureKind;
   responseStatus?: number;
+  /** Client-observed elapsed time, including any local scheduling delay. */
+  probeDurationMs?: number;
+  probeTimeoutMs?: number;
 };
 
 export type ManagedServiceExitFingerprintContext = {
@@ -110,9 +119,15 @@ export type ServiceManagerOptions = {
   repeatedExitFingerprintWindowMs?: number;
   resolveExitFingerprint?: (context: ManagedServiceExitFingerprintContext) => string | null;
   computeRestartBackoffMs?: (attempt: number) => number;
+  /** Guidance while probes or configured restart attempts are still continuing. */
+  recoveryPendingAction?: string;
+  /** Guidance after restart exhaustion or a repeated native-failure circuit opens. */
   degradedAction?: string;
   spawnService?: (spec: ManagedServiceSpec) => ManagedServiceProcess;
-  onHealthChange?: (health: EmbeddedRuntimeHealth | null) => void;
+  onHealthChange?: (
+    health: EmbeddedRuntimeHealth | null,
+    cause: ManagedServiceHealthChangeCause,
+  ) => void;
   onServiceDegraded?: (name: string, reason: string, health: EmbeddedRuntimeHealth) => void;
   onEvent?: (level: "log" | "warn" | "error", line: string) => void;
   onLifecycleEvent?: (event: ManagedServiceLifecycleEvent) => void;
@@ -154,6 +169,8 @@ export type ManagedServiceLifecycleEvent =
       responseStatus: number | null;
       consecutiveFailures: number;
       failureDurationMs: number;
+      probeDurationMs: number | null;
+      probeTimeoutMs: number | null;
       lastHealthyAt: string | null;
       restartOnFailure: boolean;
       observedAt: string;
@@ -231,6 +248,11 @@ export async function defaultProbeServiceHealth(
   fetchImpl: FetchLike = fetch,
 ): Promise<ManagedServiceHealthResult> {
   const timeoutMs = Math.max(250, spec.timeoutMs ?? DEFAULT_SERVICE_HEALTH_TIMEOUT_MS);
+  const startedAt = performance.now();
+  const probeTiming = () => ({
+    probeDurationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    probeTimeoutMs: timeoutMs,
+  });
   try {
     const response = await fetchBufferedWithHardDeadline({
       input: spec.url,
@@ -247,6 +269,7 @@ export async function defaultProbeServiceHealth(
       ok: response.ok,
       detail: detail.trim().slice(0, 500) || `HTTP ${response.status}`,
       responseStatus: response.status,
+      ...probeTiming(),
       ...(!response.ok ? { failureKind: "unhealthy_response" as const } : {}),
     };
   } catch (error) {
@@ -254,6 +277,7 @@ export async function defaultProbeServiceHealth(
       ok: false,
       detail: error instanceof Error ? error.message : String(error),
       failureKind: "transport_error",
+      ...probeTiming(),
     };
   }
 }
@@ -487,7 +511,10 @@ export class ServiceManager {
   private readonly services = new Map<string, ManagedServiceProcess>();
   private readonly launchSpecs = new Map<string, ManagedServiceSpec>();
   private readonly stateByService = new Map<string, ServiceManagerState>();
-  private readonly degradedServiceReasons = new Map<string, string>();
+  private readonly degradedServiceReasons = new Map<
+    string,
+    { reason: string; recoveryExhausted: boolean }
+  >();
   private readonly pollMs: number;
   private readonly maxRestartAttempts: number;
   private readonly stableWindowMs: number;
@@ -495,9 +522,10 @@ export class ServiceManager {
   private readonly repeatedExitFingerprintWindowMs: number;
   private readonly resolveExitFingerprint?: ServiceManagerOptions["resolveExitFingerprint"];
   private readonly computeRestartBackoffMs: (attempt: number) => number;
+  private readonly recoveryPendingAction: string;
   private readonly degradedAction: string;
   private readonly spawnService: (spec: ManagedServiceSpec) => ManagedServiceProcess;
-  private readonly onHealthChange?: (health: EmbeddedRuntimeHealth | null) => void;
+  private readonly onHealthChange?: ServiceManagerOptions["onHealthChange"];
   private readonly onServiceDegraded?: (
     name: string,
     reason: string,
@@ -546,6 +574,9 @@ export class ServiceManager {
     this.resolveExitFingerprint = options.resolveExitFingerprint;
     this.computeRestartBackoffMs =
       options.computeRestartBackoffMs ?? computeServiceRestartBackoffMs;
+    this.recoveryPendingAction =
+      options.recoveryPendingAction ??
+      "Automatic supervision is continuing. Inspect the affected service logs if the failure persists.";
     this.degradedAction =
       options.degradedAction ??
       "Inspect the affected service logs or restart the runtime after fixing the failure.";
@@ -612,7 +643,7 @@ export class ServiceManager {
       state.lastExitFingerprintAtMs = 0;
     }
     this.degradedServiceReasons.delete(spec.name);
-    this.emitHealthChange();
+    this.emitHealthChange("service_replaced");
 
     return this.startService(spec);
   }
@@ -650,18 +681,21 @@ export class ServiceManager {
     if (state?.pendingRestartTimer) clearTimeout(state.pendingRestartTimer);
     this.stateByService.delete(service.name);
     this.degradedServiceReasons.delete(service.name);
-    this.emitHealthChange();
+    this.emitHealthChange("service_removed");
   }
 
   getHealth(): EmbeddedRuntimeHealth | null {
     if (this.degradedServiceReasons.size === 0) return null;
     const detail = Array.from(this.degradedServiceReasons.entries())
-      .map(([name, reason]) => `${name}: ${reason}`)
+      .map(([name, { reason }]) => `${name}: ${reason}`)
       .join(" | ");
+    const recoveryExhausted = Array.from(this.degradedServiceReasons.values()).some(
+      (degradation) => degradation.recoveryExhausted,
+    );
     return {
       state: "degraded",
       detail,
-      action: this.degradedAction,
+      action: recoveryExhausted ? this.degradedAction : this.recoveryPendingAction,
     };
   }
 
@@ -749,8 +783,8 @@ export class ServiceManager {
     return created;
   }
 
-  private emitHealthChange(): void {
-    this.onHealthChange?.(this.getHealth());
+  private emitHealthChange(cause: ManagedServiceHealthChangeCause = "degraded"): void {
+    this.onHealthChange?.(this.getHealth(), cause);
   }
 
   private emitEvent(level: "log" | "warn" | "error", line: string): void {
@@ -762,7 +796,7 @@ export class ServiceManager {
     state: ServiceManagerState,
     confirmation: "health_probe" | "launcher_ready" | "process_started",
   ): void {
-    if (this.degradedServiceReasons.delete(name)) this.emitHealthChange();
+    if (this.degradedServiceReasons.delete(name)) this.emitHealthChange("recovered");
     if (!state.awaitingRecoveryConfirmation) return;
     state.awaitingRecoveryConfirmation = false;
     this.onLifecycleEvent?.({
@@ -865,6 +899,8 @@ export class ServiceManager {
                 state.firstHealthFailureAtMs === null
                   ? 0
                   : Math.max(0, observedAtMs - state.firstHealthFailureAtMs),
+              probeDurationMs: health.probeDurationMs ?? null,
+              probeTimeoutMs: health.probeTimeoutMs ?? null,
               lastHealthyAt: new Date(observedAtMs).toISOString(),
               restartOnFailure: healthCheck.restartOnFailure !== false,
               observedAt: new Date(observedAtMs).toISOString(),
@@ -915,9 +951,18 @@ export class ServiceManager {
           !shouldTerminate &&
           Math.max(0, observedAtMs - service.launchedAtMs) <
             resolveTransportFailureGraceMs(healthCheck.transportFailureGraceMs);
+        const timingDetail = [
+          `outageAgeMs=${failureDurationMs}`,
+          ...(health.probeDurationMs === undefined
+            ? []
+            : [`probeDurationMs=${health.probeDurationMs}`]),
+          ...(health.probeTimeoutMs === undefined
+            ? []
+            : [`probeTimeoutMs=${health.probeTimeoutMs}`]),
+        ].join(", ");
         this.emitEvent(
           !starting && state.consecutiveUnhealthyProbes >= threshold ? "warn" : "log",
-          `Managed ${name} ${starting ? "is starting; waiting for its first healthy response" : "health probe failed"} (${state.consecutiveUnhealthyProbes}/${threshold}, ${failureKind}, ${failureDurationMs}ms): ${health.detail}`,
+          `Managed ${name} ${starting ? "is starting; waiting for its first healthy response" : "health probe failed"} (${state.consecutiveUnhealthyProbes}/${threshold}, ${failureKind}, ${timingDetail}): ${health.detail}`,
         );
         this.onLifecycleEvent?.({
           type: "health",
@@ -929,16 +974,18 @@ export class ServiceManager {
           responseStatus: health.responseStatus ?? null,
           consecutiveFailures: state.consecutiveUnhealthyProbes,
           failureDurationMs,
+          probeDurationMs: health.probeDurationMs ?? null,
+          probeTimeoutMs: health.probeTimeoutMs ?? null,
           lastHealthyAt:
             state.lastHealthyAtMs === null ? null : new Date(state.lastHealthyAtMs).toISOString(),
           restartOnFailure: healthCheck.restartOnFailure !== false,
           observedAt: new Date(observedAtMs).toISOString(),
         });
         if (!starting && !this.degradedServiceReasons.has(name)) {
-          this.degradedServiceReasons.set(
-            name,
-            `health unconfirmed (${failureKind}): ${health.detail}`,
-          );
+          this.degradedServiceReasons.set(name, {
+            reason: `health unconfirmed (${failureKind}): ${health.detail}`,
+            recoveryExhausted: false,
+          });
           this.emitHealthChange();
         }
         if (healthCheck.restartOnFailure === false || !shouldTerminate) return;
@@ -1056,10 +1103,13 @@ export class ServiceManager {
           const degradationReason = fingerprintCircuitOpen
             ? `${repeatedFailureDetail} after ${reason}; automatic restarts paused for this service`
             : `reached restart limit after ${reason} (${state.attempts}/${this.maxRestartAttempts})`;
-          this.degradedServiceReasons.set(name, degradationReason);
+          this.degradedServiceReasons.set(name, {
+            reason: degradationReason,
+            recoveryExhausted: true,
+          });
           const health = this.getHealth();
           if (health) {
-            this.onHealthChange?.(health);
+            this.onHealthChange?.(health, "degraded");
             this.onServiceDegraded?.(name, degradationReason, health);
           }
         }
@@ -1086,10 +1136,10 @@ export class ServiceManager {
         });
       }
       if (!this.degradedServiceReasons.has(name)) {
-        this.degradedServiceReasons.set(
-          name,
-          `restarting after ${reason}; recovery is not confirmed`,
-        );
+        this.degradedServiceReasons.set(name, {
+          reason: `restarting after ${reason}; recovery is not confirmed`,
+          recoveryExhausted: false,
+        });
         this.emitHealthChange();
       }
       this.emitEvent(

@@ -12,6 +12,8 @@ export type RunHealthData = {
   diagnostics?: Row[];
   providers?: Row[];
   reviews?: Row[];
+  repositoryAnalyses?: Row[];
+  repositoryAnalysisMissingColumns?: string[];
   missingTables?: string[];
   truncatedTables?: string[];
 };
@@ -66,6 +68,119 @@ function checkedWindow(window: RunHealthWindow) {
   )
     throw new Error("Require valid ISO --since and --until with since < until");
   return { since: new Date(since).toISOString(), until: new Date(until).toISOString() };
+}
+
+function boundedJsonObject(value: unknown, truncated: unknown): Row | null {
+  if (truncated || typeof value !== "string" || value.length > MAX_RESULT_CHARS) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function repositoryAnalysisHealth(data: RunHealthData, cohort: ReturnType<typeof checkedWindow>) {
+  const available =
+    data.repositoryAnalyses !== undefined &&
+    !data.missingTables?.includes("repository_agent_requests");
+  const missingColumns = data.repositoryAnalysisMissingColumns ?? [];
+  const cohortAvailable = available && !missingColumns.includes("createdAt");
+  const complete =
+    cohortAvailable &&
+    missingColumns.length === 0 &&
+    !data.truncatedTables?.includes("repository_agent_requests");
+  const rows = (cohortAvailable ? (data.repositoryAnalyses ?? []) : [])
+    .filter((row) => {
+      const created = time(row.createdAt);
+      return (
+        created != null && created >= Date.parse(cohort.since) && created < Date.parse(cohort.until)
+      );
+    })
+    .sort(
+      (a, b) => time(a.createdAt)! - time(b.createdAt)! || text(a.id).localeCompare(text(b.id)),
+    );
+  const statusCounts: Record<string, number> = {};
+  const cache = { hits: 0, misses: 0, unknown: 0 };
+  const candidates = { empty: 0, nonEmpty: 0, unknown: 0 };
+  const truncatedEvidence = { requests: 0, results: 0 };
+  const latency: Array<number | null> = [];
+  let autonomyObserved = 0,
+    autonomyCompleted = 0,
+    unknownOperation = 0;
+  let trailingEmptyStreak: number | null = complete ? 0 : null;
+  let groupCreatedAt: number | null = null,
+    groupRelevantRows = 0;
+  for (const row of rows) {
+    const created = time(row.createdAt)!;
+    if (groupCreatedAt !== created) {
+      // IDs break sort ties, but cannot establish the execution order of analyses.
+      if (groupRelevantRows > 1) trailingEmptyStreak = null;
+      groupCreatedAt = created;
+      groupRelevantRows = 0;
+    }
+    const status = text(row.status) || "unknown";
+    statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+    if (row.requestJsonTruncated || text(row.requestJson).length > MAX_RESULT_CHARS)
+      truncatedEvidence.requests++;
+    if (row.resultJsonTruncated || text(row.resultJson).length > MAX_RESULT_CHARS)
+      truncatedEvidence.results++;
+    const request = boundedJsonObject(row.requestJson, row.requestJsonTruncated);
+    const operation =
+      request?.context && typeof request.context === "object" && !Array.isArray(request.context)
+        ? text((request.context as Row).operation)
+        : "";
+    const autonomy = operation === "analyze_autonomy_opportunities";
+    if (autonomy || !operation) groupRelevantRows++;
+    if (!operation) {
+      unknownOperation++;
+      trailingEmptyStreak = null;
+    }
+    if (autonomy) autonomyObserved++;
+    // In-flight/failed rows must not turn an older empty result into a current streak.
+    if (autonomy && status !== "completed") trailingEmptyStreak = null;
+    if (status !== "completed") continue;
+    latency.push(elapsed(row.createdAt, row.completedAt));
+    const result = boundedJsonObject(row.resultJson, row.resultJsonTruncated);
+    const hit =
+      result?.cache && typeof result.cache === "object" && !Array.isArray(result.cache)
+        ? (result.cache as Row).hit
+        : undefined;
+    if (hit === true) cache.hits++;
+    else if (hit === false) cache.misses++;
+    else cache.unknown++;
+    if (!autonomy) continue;
+    autonomyCompleted++;
+    const value =
+      result?.data && typeof result.data === "object" && !Array.isArray(result.data)
+        ? (result.data as Row).candidates
+        : undefined;
+    const outcome = Array.isArray(value) ? (value.length ? "nonEmpty" : "empty") : "unknown";
+    candidates[outcome]++;
+    if (outcome === "unknown") trailingEmptyStreak = null;
+    else if (outcome === "nonEmpty") trailingEmptyStreak = complete ? 0 : null;
+    else if (trailingEmptyStreak != null) trailingEmptyStreak++;
+  }
+  if (groupRelevantRows > 1) trailingEmptyStreak = null;
+  return {
+    available,
+    complete,
+    missingColumns,
+    observed: cohortAvailable ? rows.length : null,
+    statusCounts: cohortAvailable ? statusCounts : null,
+    completedLatency: cohortAvailable ? durations(latency) : null,
+    completedCache: cohortAvailable ? cache : null,
+    truncatedEvidence: cohortAvailable ? truncatedEvidence : null,
+    unknownOperation: cohortAvailable ? unknownOperation : null,
+    autonomyOpportunities: {
+      observed: cohortAvailable ? autonomyObserved : null,
+      completed: cohortAvailable ? autonomyCompleted : null,
+      candidateResults: cohortAvailable ? candidates : null,
+      observedTrailingEmptyStreak:
+        cohortAvailable && autonomyObserved > 0 ? trailingEmptyStreak : null,
+      streakOrder: "request creation time within the report window",
+    },
+  };
 }
 
 /** Pure aggregation; completion transport, publication, review and merge are distinct outcomes. */
@@ -234,6 +349,7 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
       failed: requestsAvailable ? (requestStatusCounts.failed ?? 0) : null,
       completed: requestsAvailable ? (requestStatusCounts.completed ?? 0) : null,
     },
+    repositoryAnalysis: repositoryAnalysisHealth(data, cohort),
     jobs: {
       statusCounts,
       terminal,
@@ -287,6 +403,7 @@ export function aggregateRunHealth(data: RunHealthData, window: RunHealthWindow)
     notes: [
       "The window selects job creation time; outcomes are current persisted state, not a reconstructed historical snapshot.",
       "Requests use their own creation-time cohort. Failed requests can precede any job; request completion is not job delivery or PR publication.",
+      "Repository analyses use their own creation-time cohort. Only structured analyze_autonomy_opportunities requests count as autonomy analyses; completed analysis or proposed candidates do not prove dispatched jobs. Missing, malformed or truncated result evidence remains unknown.",
       "No-change attempts remain in the terminal denominator but never count as successful delivery.",
       "Publication is not merge or review approval. First-pass metrics describe recorded review evidence, not missing/pruned history.",
       "Trusted timings are completion-recorded values, not guaranteed totals across all recovery attempts.",
@@ -302,7 +419,8 @@ export function readRunHealthReport(dbPath: string, window: RunHealthWindow, lim
   try {
     return db.transaction(() => {
       const missingTables: string[] = [],
-        truncatedTables: string[] = [];
+        truncatedTables: string[] = [],
+        repositoryAnalysisMissingColumns: string[] = [];
       const read = (
         table: string,
         fields: string[],
@@ -317,6 +435,11 @@ export function readRunHealthReport(dbPath: string, window: RunHealthWindow, lim
           missingTables.push(table);
           return [];
         }
+        if (table === "repository_agent_requests") {
+          repositoryAnalysisMissingColumns.push(...fields.filter((field) => !columns.has(field)));
+          // A legacy table without creation times cannot be assigned to this cohort.
+          if (!columns.has("createdAt")) return [];
+        }
         const select = fields.map((field) => (columns.has(field) ? field : `NULL AS ${field}`));
         if (table === "jobs") {
           for (const field of ["result", "error"]) {
@@ -330,6 +453,13 @@ export function readRunHealthReport(dbPath: string, window: RunHealthWindow, lim
             if (!columns.has(field)) continue;
             select[fields.indexOf(field)] = `SUBSTR(${field}, 1, 4096) AS ${field}`;
             select.push(`LENGTH(${field}) > 4096 AS ${field}Truncated`);
+          }
+        }
+        if (table === "repository_agent_requests") {
+          for (const field of ["requestJson", "resultJson"]) {
+            if (!columns.has(field)) continue;
+            select[fields.indexOf(field)] = `SUBSTR(${field}, 1, ${MAX_RESULT_CHARS}) AS ${field}`;
+            select.push(`LENGTH(${field}) > ${MAX_RESULT_CHARS} AS ${field}Truncated`);
           }
         }
         const rows = db
@@ -350,6 +480,13 @@ export function readRunHealthReport(dbPath: string, window: RunHealthWindow, lim
       const requests = read(
         "requests",
         ["id", "status", "createdAt"],
+        "WHERE createdAt >= ? AND createdAt < ?",
+        [cohort.since, cohort.until],
+        "ORDER BY createdAt, id",
+      );
+      const repositoryAnalyses = read(
+        "repository_agent_requests",
+        ["id", "status", "createdAt", "completedAt", "requestJson", "resultJson"],
         "WHERE createdAt >= ? AND createdAt < ?",
         [cohort.since, cohort.until],
         "ORDER BY createdAt, id",
@@ -411,6 +548,8 @@ export function readRunHealthReport(dbPath: string, window: RunHealthWindow, lim
           diagnostics,
           providers,
           reviews,
+          repositoryAnalyses,
+          repositoryAnalysisMissingColumns,
           missingTables,
           truncatedTables,
         },

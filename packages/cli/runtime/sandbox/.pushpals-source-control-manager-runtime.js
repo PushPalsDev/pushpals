@@ -6976,12 +6976,20 @@ async function deleteBranchRef(opts) {
   const response = await githubFetch(url, {
     method: "DELETE",
     headers: githubHeaders(opts.token)
-  });
+  }, opts.fetchImpl);
   if (response.status === 404) {
     return { deleted: false, reason: "not_found" };
   }
   if (!response.ok) {
     const text = await response.text();
+    if (response.status === 422) {
+      try {
+        const body = JSON.parse(text);
+        if (body !== null && typeof body === "object" && !Array.isArray(body) && body.message === "Reference does not exist") {
+          return { deleted: false, reason: "not_found" };
+        }
+      } catch {}
+    }
     throw githubError(response.status, text);
   }
   return { deleted: true, reason: "deleted" };

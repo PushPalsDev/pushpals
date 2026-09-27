@@ -21,12 +21,526 @@ const job = (id: string, overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 const pr = "https://example.test/team/repository/pull/1";
+const analysis = (id: string, overrides: Record<string, unknown> = {}) => ({
+  id,
+  status: "completed",
+  createdAt: window.since,
+  completedAt: "2026-01-01T00:00:30.000Z",
+  requestJson: JSON.stringify({
+    purpose: "priority",
+    caller: { service: "remotebuddy" },
+    context: { operation: "analyze_autonomy_opportunities" },
+  }),
+  resultJson: JSON.stringify({ data: { candidates: [] }, cache: { hit: false } }),
+  ...overrides,
+});
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("read-only run health reporting", () => {
+  test("surfaces completed empty repository analyses without inventing successful jobs", () => {
+    const report = aggregateRunHealth(
+      {
+        jobs: [],
+        repositoryAnalyses: [
+          analysis("a"),
+          analysis("b", {
+            createdAt: "2026-01-01T00:01:00.000Z",
+            completedAt: "2026-01-01T00:01:10.000Z",
+            resultJson: JSON.stringify({ data: { candidates: [] }, cache: { hit: true } }),
+          }),
+          analysis("before", { createdAt: "2025-12-31T23:59:59.000Z" }),
+          analysis("boundary", { createdAt: window.until }),
+        ],
+      },
+      window,
+    );
+    expect(report.repositoryAnalysis).toMatchObject({
+      available: true,
+      complete: true,
+      observed: 2,
+      statusCounts: { completed: 2 },
+      completedLatency: { samples: 2, missing: 0, meanMs: 20_000 },
+      completedCache: { hits: 1, misses: 1, unknown: 0 },
+      unknownOperation: 0,
+      autonomyOpportunities: {
+        observed: 2,
+        completed: 2,
+        candidateResults: { empty: 2, nonEmpty: 0, unknown: 0 },
+        observedTrailingEmptyStreak: 2,
+      },
+    });
+    expect(report.jobs.successful).toBe(0);
+    expect(report.jobs.terminalSuccessRate).toBeNull();
+    expect(report.pullRequests.mergedRate).toBeNull();
+  });
+
+  test("uses structured operation, not a caller, purpose, or prompt guess", () => {
+    const report = aggregateRunHealth(
+      {
+        jobs: [],
+        repositoryAnalyses: [
+          analysis("other", {
+            requestJson: JSON.stringify({
+              purpose: "priority",
+              caller: { service: "remotebuddy" },
+              question: "analyze_autonomy_opportunities",
+              context: { operation: "explain_repository" },
+            }),
+          }),
+          analysis("unknown", {
+            requestJson: JSON.stringify({
+              purpose: "priority",
+              caller: { service: "remotebuddy" },
+              question: "analyze_autonomy_opportunities",
+            }),
+          }),
+          analysis("autonomy"),
+        ],
+      },
+      window,
+    ).repositoryAnalysis;
+    expect(report.observed).toBe(3);
+    expect(report.completedLatency?.samples).toBe(3);
+    expect(report.completedCache?.misses).toBe(3);
+    expect(report.unknownOperation).toBe(1);
+    expect(report.autonomyOpportunities).toMatchObject({
+      observed: 1,
+      completed: 1,
+      candidateResults: { empty: 1, nonEmpty: 0, unknown: 0 },
+      observedTrailingEmptyStreak: null,
+    });
+  });
+
+  test.each([
+    ["missing", null],
+    ["malformed", "{not-json"],
+    ["null", "null"],
+    ["array", "[]"],
+    ["missing data", JSON.stringify({ cache: { hit: "true" } })],
+    ["null candidates", JSON.stringify({ data: { candidates: null }, cache: { hit: 1 } })],
+    ["object candidates", JSON.stringify({ data: { candidates: {} }, cache: { hit: null } })],
+    [
+      "oversized",
+      JSON.stringify({
+        padding: "x".repeat(70_000),
+        data: { candidates: [] },
+        cache: { hit: true },
+      }),
+    ],
+  ])("keeps %s repository result evidence unknown", (_name, resultJson) => {
+    const report = aggregateRunHealth(
+      { jobs: [], repositoryAnalyses: [analysis("a", { resultJson })] },
+      window,
+    );
+    expect(report.repositoryAnalysis.autonomyOpportunities).toMatchObject({
+      completed: 1,
+      candidateResults: { empty: 0, nonEmpty: 0, unknown: 1 },
+      observedTrailingEmptyStreak: null,
+    });
+    expect(report.repositoryAnalysis.completedCache).toEqual({ hits: 0, misses: 0, unknown: 1 });
+  });
+
+  test("distinguishes failed/in-flight analyses and missing durations from empty completed analyses", () => {
+    const report = aggregateRunHealth(
+      {
+        jobs: [],
+        repositoryAnalyses: [
+          analysis("failed", { status: "failed" }),
+          analysis("queued", { status: "queued" }),
+          analysis("invalid", { completedAt: "invalid" }),
+          analysis("missing", { completedAt: null }),
+          analysis("negative", { completedAt: "2025-12-31T23:59:00.000Z" }),
+          analysis("running", { status: "running", createdAt: "2026-01-01T01:00:00.000Z" }),
+        ],
+      },
+      window,
+    ).repositoryAnalysis;
+    expect(report.statusCounts).toEqual({ failed: 1, queued: 1, completed: 3, running: 1 });
+    expect(report.completedLatency).toMatchObject({ samples: 0, missing: 3, meanMs: null });
+    expect(report.completedCache).toEqual({ hits: 0, misses: 3, unknown: 0 });
+    expect(report.autonomyOpportunities).toMatchObject({
+      observed: 6,
+      completed: 3,
+      candidateResults: { empty: 3, nonEmpty: 0, unknown: 0 },
+      observedTrailingEmptyStreak: null,
+    });
+  });
+
+  test("rejects parseable result or request prefixes marked truncated", () => {
+    const report = aggregateRunHealth(
+      {
+        jobs: [],
+        repositoryAnalyses: [
+          analysis("a", { resultJsonTruncated: 1 }),
+          analysis("b", { requestJsonTruncated: 1 }),
+        ],
+      },
+      window,
+    ).repositoryAnalysis;
+    expect(report.truncatedEvidence).toEqual({ requests: 1, results: 1 });
+    expect(report.unknownOperation).toBe(1);
+    expect(report.completedCache).toEqual({ hits: 0, misses: 1, unknown: 1 });
+    expect(report.autonomyOpportunities).toMatchObject({
+      observed: 1,
+      completed: 1,
+      candidateResults: { empty: 0, nonEmpty: 0, unknown: 1 },
+      observedTrailingEmptyStreak: null,
+    });
+  });
+
+  test("counts only a known trailing empty streak and resets it after a nonempty result", () => {
+    const rows = [
+      analysis("a", { createdAt: "2026-01-01T00:00:00.000Z", resultJson: "{}" }),
+      analysis("b", {
+        createdAt: "2026-01-01T00:01:00.000Z",
+        resultJson: JSON.stringify({ data: { candidates: [{ id: "candidate" }] } }),
+      }),
+      analysis("c", { createdAt: "2026-01-01T00:02:00.000Z" }),
+      analysis("d", { createdAt: "2026-01-01T00:03:00.000Z" }),
+    ];
+    const data = { jobs: [], repositoryAnalyses: [...rows].reverse() };
+    const report = aggregateRunHealth(data, window).repositoryAnalysis;
+    expect(report.autonomyOpportunities).toMatchObject({
+      candidateResults: { empty: 2, nonEmpty: 1, unknown: 1 },
+      observedTrailingEmptyStreak: 2,
+    });
+    // A row cap cannot prove that later omitted rows did not interrupt the streak.
+    expect(
+      aggregateRunHealth({ ...data, truncatedTables: ["repository_agent_requests"] }, window)
+        .repositoryAnalysis.autonomyOpportunities.observedTrailingEmptyStreak,
+    ).toBeNull();
+    expect(
+      aggregateRunHealth({ jobs: [], repositoryAnalyses: [analysis("a"), analysis("b")] }, window)
+        .repositoryAnalysis.autonomyOpportunities.observedTrailingEmptyStreak,
+    ).toBeNull();
+  });
+
+  test("does not confuse unavailable analysis history with an observed idle cohort", () => {
+    expect(aggregateRunHealth({ jobs: [] }, window).repositoryAnalysis).toMatchObject({
+      available: false,
+      complete: false,
+      observed: null,
+      statusCounts: null,
+      completedLatency: null,
+      completedCache: null,
+      autonomyOpportunities: {
+        observed: null,
+        completed: null,
+        candidateResults: null,
+        observedTrailingEmptyStreak: null,
+      },
+    });
+    expect(
+      aggregateRunHealth({ jobs: [], repositoryAnalyses: [] }, window).repositoryAnalysis,
+    ).toMatchObject({
+      available: true,
+      complete: true,
+      observed: 0,
+      statusCounts: {},
+      completedLatency: { samples: 0, missing: 0, meanMs: null },
+      autonomyOpportunities: {
+        observed: 0,
+        completed: 0,
+        candidateResults: { empty: 0, nonEmpty: 0, unknown: 0 },
+        observedTrailingEmptyStreak: null,
+      },
+    });
+  });
+
+  test.each([
+    { name: "unknown operation first", id: "a", requestJson: "{}" },
+    { name: "unknown operation last", id: "z", requestJson: "{}" },
+    { name: "in-flight first", id: "a", status: "claimed" },
+    { name: "in-flight last", id: "z", status: "claimed" },
+  ])(
+    "keeps a tied $name ambiguous even after subsequent empty analyses",
+    ({ name: _name, id, ...overrides }) => {
+      const nonEmpty = JSON.stringify({ data: { candidates: [{ id: "candidate" }] } });
+      const rows = [
+        analysis(id, overrides),
+        analysis("m", { resultJson: nonEmpty }),
+        analysis("empty1", { createdAt: "2026-01-01T00:01:00.000Z" }),
+        analysis("empty2", { createdAt: "2026-01-01T00:02:00.000Z" }),
+      ];
+      expect(
+        aggregateRunHealth({ jobs: [], repositoryAnalyses: rows }, window).repositoryAnalysis
+          .autonomyOpportunities.observedTrailingEmptyStreak,
+      ).toBeNull();
+      rows.push(
+        analysis("known-reset", { createdAt: "2026-01-01T00:03:00.000Z", resultJson: nonEmpty }),
+        analysis("known-empty", { createdAt: "2026-01-01T00:04:00.000Z" }),
+      );
+      expect(
+        aggregateRunHealth({ jobs: [], repositoryAnalyses: rows }, window).repositoryAnalysis
+          .autonomyOpportunities.observedTrailingEmptyStreak,
+      ).toBe(1);
+    },
+  );
+
+  test("reads analysis cohorts independently with bounded private evidence and no writes", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-run-report-analyses-"));
+    roots.push(root);
+    const path = join(root, "run.sqlite");
+    const db = new Database(path);
+    db.exec(
+      "CREATE TABLE jobs (id TEXT, status TEXT, createdAt TEXT); CREATE TABLE repository_agent_requests (id TEXT, status TEXT, createdAt TEXT, completedAt TEXT, requestJson TEXT, resultJson TEXT)",
+    );
+    const insert = db.query("INSERT INTO repository_agent_requests VALUES (?, ?, ?, ?, ?, ?)");
+    const oversizedResult = JSON.stringify({
+      data: { candidates: [] },
+      cache: { hit: true },
+      answer: "private-answer" + "x".repeat(70_000),
+    });
+    const oversizedRequest = JSON.stringify({
+      context: { operation: "analyze_autonomy_opportunities" },
+      question: "private-prompt" + "x".repeat(70_000),
+    });
+    for (const row of [
+      analysis("a", { resultJson: oversizedResult }),
+      analysis("b", { requestJson: oversizedRequest }),
+      analysis("c"),
+    ])
+      insert.run(
+        row.id,
+        row.status,
+        row.createdAt,
+        row.completedAt,
+        row.requestJson,
+        row.resultJson,
+      );
+    db.close();
+    const before = readFileSync(path);
+    const report = readRunHealthReport(path, window, 2);
+    expect(report.evidence.truncatedTables).toEqual(["repository_agent_requests"]);
+    expect(report.repositoryAnalysis).toMatchObject({
+      available: true,
+      complete: false,
+      observed: 2,
+      completedCache: { hits: 0, misses: 1, unknown: 1 },
+      truncatedEvidence: { requests: 1, results: 1 },
+      unknownOperation: 1,
+      autonomyOpportunities: {
+        observed: 1,
+        completed: 1,
+        candidateResults: { empty: 0, nonEmpty: 0, unknown: 1 },
+        observedTrailingEmptyStreak: null,
+      },
+    });
+    expect(report.jobs.terminalSuccessRate).toBeNull();
+    expect(JSON.stringify(report)).not.toContain("private-prompt");
+    expect(JSON.stringify(report)).not.toContain("private-answer");
+    expect(readFileSync(path)).toEqual(before);
+  });
+
+  test.each([true, false])(
+    "exposes legacy analysis columns without changing the schema (createdAt present: %s)",
+    (hasCreatedAt) => {
+      const root = mkdtempSync(join(tmpdir(), "pushpals-run-report-legacy-analysis-"));
+      roots.push(root);
+      const path = join(root, "run.sqlite");
+      const db = new Database(path);
+      db.exec(
+        `CREATE TABLE jobs (id TEXT, status TEXT, createdAt TEXT); CREATE TABLE repository_agent_requests (status TEXT${hasCreatedAt ? ", createdAt TEXT" : ""})`,
+      );
+      if (hasCreatedAt)
+        db.query("INSERT INTO repository_agent_requests VALUES (?, ?)").run(
+          "completed",
+          window.since,
+        );
+      else db.query("INSERT INTO repository_agent_requests VALUES (?)").run("completed");
+      db.close();
+      const before = readFileSync(path);
+      const report = readRunHealthReport(path, window).repositoryAnalysis;
+      expect(report.available).toBe(true);
+      expect(report.complete).toBe(false);
+      expect(report.observed).toBe(hasCreatedAt ? 1 : null);
+      expect(report.missingColumns).toContain("requestJson");
+      expect(report.missingColumns).toContain("resultJson");
+      expect(report.autonomyOpportunities.observedTrailingEmptyStreak).toBeNull();
+      if (hasCreatedAt) {
+        expect(report.unknownOperation).toBe(1);
+        expect(report.completedLatency).toMatchObject({ samples: 0, missing: 1, meanMs: null });
+        expect(report.completedCache?.unknown).toBe(1);
+      } else expect(report.missingColumns).toContain("createdAt");
+      expect(readFileSync(path)).toEqual(before);
+    },
+  );
+
+  test("tracks a SQLite planning-to-publication lifecycle without promoting earlier phases to success", () => {
+    const root = mkdtempSync(join(tmpdir(), "pushpals-run-report-lifecycle-"));
+    roots.push(root);
+    const path = join(root, "run.sqlite");
+    const write = (change: (db: Database) => void) => {
+      const db = new Database(path);
+      try {
+        change(db);
+      } finally {
+        db.close();
+      }
+    };
+    const snapshot = () => {
+      const before = readFileSync(path);
+      const report = readRunHealthReport(path, window);
+      expect(readFileSync(path)).toEqual(before);
+      return report;
+    };
+    write((db) => {
+      db.exec(`
+        CREATE TABLE jobs (id TEXT, status TEXT, createdAt TEXT, startedAt TEXT, completedAt TEXT, prUrl TEXT);
+        CREATE TABLE requests (id TEXT, status TEXT, createdAt TEXT);
+        CREATE TABLE completions (id TEXT, jobId TEXT, status TEXT, commitSha TEXT, prUrl TEXT, createdAt TEXT, updatedAt TEXT);
+        CREATE TABLE job_terminal_diagnostics (jobId TEXT, summary TEXT, failureClass TEXT);
+        CREATE TABLE pr_provider_outcomes (normalizedPrUrl TEXT, prUrl TEXT, verdict TEXT, terminal INTEGER, merged INTEGER);
+        CREATE TABLE autonomy_pr_feedback (id INTEGER, pr_url_normalized TEXT, pr_url TEXT, verdict TEXT, source TEXT, review_score REAL, review_threshold REAL, created_at TEXT);
+        CREATE TABLE repository_agent_requests (id TEXT, status TEXT, createdAt TEXT, completedAt TEXT, requestJson TEXT, resultJson TEXT);
+      `);
+      for (const row of [
+        analysis("empty-miss"),
+        analysis("empty-hit", {
+          createdAt: "2026-01-01T00:05:00.000Z",
+          completedAt: "2026-01-01T00:05:05.000Z",
+          resultJson: JSON.stringify({ data: { candidates: [] }, cache: { hit: true } }),
+        }),
+      ])
+        db.query("INSERT INTO repository_agent_requests VALUES (?, ?, ?, ?, ?, ?)").run(
+          row.id,
+          row.status,
+          row.createdAt,
+          row.completedAt,
+          row.requestJson,
+          row.resultJson,
+        );
+    });
+    const idle = snapshot();
+    expect(idle.repositoryAnalysis.autonomyOpportunities.observedTrailingEmptyStreak).toBe(2);
+    expect(idle.jobs.terminalSuccessRate).toBeNull();
+    expect(idle.requests.observed).toBe(0);
+
+    write((db) => {
+      const row = analysis("actionable", {
+        createdAt: "2026-01-01T00:10:00.000Z",
+        completedAt: "2026-01-01T00:10:30.000Z",
+        resultJson: JSON.stringify({
+          data: { candidates: [{ id: "a" }, { id: "b" }] },
+          cache: { hit: false },
+        }),
+      });
+      db.query("INSERT INTO repository_agent_requests VALUES (?, ?, ?, ?, ?, ?)").run(
+        row.id,
+        row.status,
+        row.createdAt,
+        row.completedAt,
+        row.requestJson,
+        row.resultJson,
+      );
+      for (const id of ["a", "b"])
+        db.query("INSERT INTO requests VALUES (?, 'pending', ?)").run(
+          id,
+          "2026-01-01T00:10:35.000Z",
+        );
+    });
+    const planned = snapshot();
+    expect(planned.repositoryAnalysis.autonomyOpportunities).toMatchObject({
+      completed: 3,
+      candidateResults: { empty: 2, nonEmpty: 1, unknown: 0 },
+      observedTrailingEmptyStreak: 0,
+    });
+    expect(planned.requests.statusCounts).toEqual({ pending: 2 });
+    expect(planned.cohort.jobs).toBe(0);
+
+    write((db) => {
+      db.exec("UPDATE requests SET status='completed'");
+      for (const id of ["a", "b"])
+        db.query("INSERT INTO jobs VALUES (?, 'claimed', ?, ?, NULL, NULL)").run(
+          id,
+          "2026-01-01T00:10:36.000Z",
+          "2026-01-01T00:10:40.000Z",
+        );
+    });
+    const dispatched = snapshot();
+    expect(dispatched.requests.completed).toBe(2);
+    expect(dispatched.jobs).toMatchObject({
+      terminal: 0,
+      successful: 0,
+      terminalSuccessRate: null,
+      verifiedPublished: 0,
+    });
+
+    write((db) => {
+      db.exec("UPDATE jobs SET status='finalizing'");
+      for (const id of ["a", "b"])
+        db.query("INSERT INTO completions VALUES (?, ?, 'pending', ?, NULL, ?, ?)").run(
+          `completion-${id}`,
+          id,
+          id.repeat(40),
+          "2026-01-01T00:15:00.000Z",
+          "2026-01-01T00:15:00.000Z",
+        );
+    });
+    const handoff = snapshot();
+    expect(handoff.jobs).toMatchObject({ terminal: 0, successful: 0, verifiedPublished: 0 });
+    expect(handoff.timing.executionToHandoff).toMatchObject({ samples: 2, meanMs: 260_000 });
+    expect(handoff.timing.pendingPublicationAge.samples).toBe(2);
+
+    write((db) => {
+      db.query("UPDATE jobs SET status='completed', completedAt=?, prUrl=? WHERE id='a'").run(
+        "2026-01-01T00:20:36.000Z",
+        pr,
+      );
+      db.exec("UPDATE jobs SET status='publish_blocked' WHERE id='b'");
+      db.query(
+        "UPDATE completions SET status='processed', updatedAt=?, prUrl=? WHERE jobId='a'",
+      ).run("2026-01-01T00:20:36.000Z", pr);
+      db.query("UPDATE completions SET status='failed', updatedAt=? WHERE jobId='b'").run(
+        "2026-01-01T00:20:36.000Z",
+      );
+      db.query("INSERT INTO job_terminal_diagnostics VALUES ('b', ?, ?)").run(
+        "Trusted validation failed",
+        "trusted_validation_failed",
+      );
+      db.query("INSERT INTO pr_provider_outcomes VALUES (?, ?, 'open', 0, 0)").run(pr, pr);
+    });
+    const published = snapshot();
+    expect(published.jobs).toMatchObject({
+      terminal: 2,
+      successful: 1,
+      terminalSuccessRate: 0.5,
+      verifiedPublished: 1,
+      verifiedPublicationRate: 0.5,
+    });
+    expect(published.timing.completedEndToEnd).toMatchObject({
+      samples: 1,
+      meanMs: 600_000,
+      atMost10Minutes: 1,
+    });
+    expect(published.pullRequests).toMatchObject({
+      unique: 1,
+      open: 1,
+      merged: 0,
+      reviewed: 0,
+      observedFirstPassMergeRate: null,
+    });
+
+    write((db) => {
+      db.exec("UPDATE pr_provider_outcomes SET verdict='approved_merged', terminal=1, merged=1");
+      db.query(
+        "INSERT INTO autonomy_pr_feedback VALUES (1, ?, ?, 'approved_merged', 'review_agent', 9, 8, ?)",
+      ).run(pr, pr, "2026-01-01T00:22:00.000Z");
+    });
+    const merged = snapshot();
+    expect(merged.pullRequests).toMatchObject({
+      merged: 1,
+      reviewed: 1,
+      observedFirstPassMerged: 1,
+      observedFirstPassMergeRate: 1,
+    });
+    expect(merged.jobs.terminalSuccessRate).toBe(0.5);
+    expect(merged.repositoryAnalysis.completedCache).toEqual({ hits: 1, misses: 2, unknown: 0 });
+  });
+
   test("reports failed requests even when worker startup created no jobs", () => {
     const report = aggregateRunHealth(
       {

@@ -13,6 +13,24 @@ function workflowText(): string {
 }
 
 describe("release workflow action runtimes", () => {
+  test("gates aggregate health recovery in Linux/Windows CI and Windows release validation", () => {
+    const ci = readFileSync(join(workflowRoot, "cli-e2e.yml"), "utf8");
+    const release = readFileSync(join(workflowRoot, "release-cli.yml"), "utf8");
+    const healthSteps = ci.split("- name: Verify health recovery reporting").slice(1);
+    expect(healthSteps).toHaveLength(2);
+    for (const entry of healthSteps) {
+      const step = entry.split("- name:")[0];
+      expect(step).toContain("bun test");
+      expect(step).toContain("tests/start.runtime-services.test.ts");
+      expect(step).toContain("tests/cli.runtime-bootstrap.test.ts");
+    }
+    const windowsDeadlineStep = release
+      .split("- name: Verify Windows deadline and process-tree contracts")[1]
+      ?.split("- name:")[0];
+    expect(windowsDeadlineStep).toContain("tests/start.runtime-services.test.ts");
+    expect(windowsDeadlineStep).toContain("tests/cli.runtime-bootstrap.test.ts");
+  });
+
   test("gates worker readiness in Linux/Windows CI and Windows release validation", () => {
     const ci = readFileSync(join(workflowRoot, "cli-e2e.yml"), "utf8");
     const release = readFileSync(join(workflowRoot, "release-cli.yml"), "utf8");

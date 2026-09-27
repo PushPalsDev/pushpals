@@ -95,6 +95,18 @@ immediately recommending a restart. Explicit unhealthy responses, crashes,
 post-readiness failures, and elapsed startup grace still surface as degradation;
 probe counters and restart deadlines remain authoritative.
 
+Post-startup health recovery is visible in the CLI: partial recovery retains the
+remaining degraded services, and confirmed recovery of the last previously
+degraded service emits one healthy transition. A quiet initial health state or
+removal/replacement of an unready service is not reported as recovery.
+Transient transport failures receive retry guidance rather than a
+generic runtime-upgrade/restart instruction; probe deadlines and termination
+thresholds remain unchanged. Probe telemetry separates client-observed
+`probeDurationMs` and configured `probeTimeoutMs` from `outageAgeMs`, which is
+zero for the first failure and is not request latency.
+These regressions run in Linux/Windows CLI CI and
+Windows release validation as well as the reliability harness.
+
 CLI worker capacity is checked once after embedded service startup. Background
 warmup does not hold up SourceControlManager launch, and a cold worker does not
 prevent the CLI from connecting. The capacity probe shares one finite deadline
@@ -120,6 +132,13 @@ duration, execution-to-handoff, publication waiting, and trusted validation.
 Request-status counts use a separate creation-time cohort, making failures before
 job creation visible. Request completion does not establish job or PR success;
 missing request history remains unknown and row-cap sampling is explicit.
+Repository analyses have their own creation-time cohort, completed latency and
+cache counts. Only the structured `analyze_autonomy_opportunities` operation
+counts as autonomous opportunity analysis. Empty, nonempty, and unknown candidate
+results are distinct; analysis completion is not a dispatched or successful job.
+The observed trailing-empty streak is unavailable when sampling, missing schema,
+in-flight work, or ambiguous evidence prevents a reliable sequence. Raw prompts
+and answers are not included in the report.
 Absent latency or review evidence remains unknown; publication never implies
 approval, and the report cannot infer uptime without continuous health samples.
 Reads use a consistent, read-only SQLite transaction with per-table caps and
@@ -203,6 +222,12 @@ asking the model to rescore unchanged code. Real temporary-SQLite tests cover
 close/reopen, changed revisions, active repairs through finalization, and exhausted
 repair admission. Windows CI and release checks also exercise HTTP health while a
 bounded validation child emits output, times out, and has its process tree drained.
+
+Branch cleanup is idempotent for both GitHub's 404 response and its exact JSON
+422 `Reference does not exist` response. Other validation errors, malformed
+responses, authorization failures, and server errors remain errors. Provider
+and reconciliation fixtures verify that already-absent branches do not emit
+failure warnings, repeat accepted feedback, or enqueue repair work.
 
 The repair harness and Windows CI/release gates also exercise review publication
 against a target branch that was already newer at dispatch or moved during

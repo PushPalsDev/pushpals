@@ -19,7 +19,7 @@ import {
   summarizeRepeatedReviewFindings,
   type ReviewAgentConfig,
 } from "../apps/source_control_manager/src/review_agent";
-import type { GitHubPR } from "../apps/source_control_manager/src/github_pr";
+import { deleteBranchRef, type GitHubPR } from "../apps/source_control_manager/src/github_pr";
 import {
   SCM_REPAIR_AUTHORITY_HEADER,
   SCM_REPAIR_AUTHORITY_SECRET_ENV,
@@ -1167,6 +1167,100 @@ describe("ReviewAgent", () => {
     });
     expect(deletedBranches).toEqual(["agent/merged-branch", "agent/closed-branch"]);
   });
+
+  test.each([
+    { mode: "merged", status: 404 },
+    { mode: "merged", status: 422 },
+    { mode: "closed", status: 404 },
+    { mode: "closed", status: 422 },
+  ])(
+    "reconciles $mode PRs with already-absent branches ($status) without warnings or repair",
+    async ({ mode, status }) => {
+      const pr = makePr({
+        number: 84,
+        state: "closed",
+        merged_at: mode === "merged" ? "2026-08-25T17:00:00.000Z" : null,
+        closed_at: "2026-08-25T17:00:00.000Z",
+        updated_at: "2026-08-25T17:00:00.000Z",
+      });
+      const infos: string[] = [];
+      const warnings: string[] = [];
+      const errors: string[] = [];
+      const feedbackPayloads: Array<Record<string, unknown>> = [];
+      let nowMs = Date.parse("2026-08-25T18:00:00.000Z");
+      let closedListCalls = 0;
+      let deleteCalls = 0;
+      let enqueueCalls = 0;
+      const agent = new ReviewAgent(
+        baseConfig,
+        "http://localhost:3001",
+        "token",
+        "https://github.com/org/repo.git",
+        "main",
+        undefined,
+        {
+          ...silentLogs,
+          now: () => nowMs,
+          listOpenPullRequests: async () => [],
+          listRecentlyClosedPullRequests: async () => {
+            closedListCalls += 1;
+            return [pr];
+          },
+          feedbackFetchImpl: async (_input, init) => {
+            feedbackPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+            return Response.json({ ok: true, ignored: false });
+          },
+          deleteBranchRef: async (opts) =>
+            deleteBranchRef({
+              ...opts,
+              fetchImpl: async () => {
+                deleteCalls += 1;
+                return Response.json(
+                  { message: status === 404 ? "Not Found" : "Reference does not exist" },
+                  { status },
+                );
+              },
+            }),
+          fetchImpl: async (input) => {
+            if (String(input).endsWith("/jobs/enqueue")) enqueueCalls += 1;
+            return Response.json({ ok: true });
+          },
+          logInfo: (message) => infos.push(message),
+          logWarn: (message) => warnings.push(message),
+          logError: (message) => errors.push(message),
+        },
+      );
+
+      await agent.poll();
+      nowMs += 60_001;
+      await agent.poll();
+
+      expect(closedListCalls).toBe(2);
+      expect(feedbackPayloads).toHaveLength(1);
+      expect(feedbackPayloads[0]).toMatchObject({
+        prNumber: 84,
+        jobId: "job-1",
+        verdict: mode === "merged" ? "approved_merged" : "closed_unmerged",
+      });
+      expect(deleteCalls).toBe(1);
+      expect(enqueueCalls).toBe(0);
+      expect(infos.join("\n")).toContain(
+        `Branch agent/test-branch already absent after ${mode} for PR #84`,
+      );
+      expect(infos.join("\n")).toContain(
+        `Reconciled ${mode === "merged" ? "merged" : "closed_unmerged"} outcome for closed PR #84.`,
+      );
+      expect(warnings).toHaveLength(0);
+      expect(errors).toHaveLength(0);
+      expect(agent.getProviderHealthSnapshot()).toMatchObject({
+        status: "ok",
+        failureEvents: 0,
+        consecutiveFailedPolls: 0,
+        pendingFeedbackCount: 0,
+        lastError: null,
+      });
+    },
+  );
 
   test("retries ignored feedback and only acknowledges a closed PR after server acceptance", async () => {
     const pr = makePr({

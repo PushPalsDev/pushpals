@@ -22,6 +22,7 @@ import {
   REPOSITORY_AGENT_SCHEMA_VERSION,
   RepositoryAgentClientError,
   resolveRepositorySnapshot,
+  type MemoryStore,
   type RepositoryAgentClaim,
   type RepositoryAgentClaimInput,
   type RepositoryAgentClaimResult,
@@ -148,6 +149,78 @@ function modelResponse(overrides: Record<string, unknown> = {}): Record<string, 
     ],
     ...overrides,
   };
+}
+
+const coverageKind = "repository_autonomy_evidence_coverage";
+const quietLogger = { log: () => {}, warn: () => {}, error: () => {} };
+
+function createCoverageRepository(count = 13): string {
+  const repo = createRepository();
+  for (let index = 0; index < count; index++) {
+    writeFileSync(
+      join(repo, "src", `coverage-${String(index).padStart(3, "0")}.ts`),
+      `export const coverage${index} = ${index};\n`,
+    );
+  }
+  git(repo, ["add", "src"]);
+  git(repo, [
+    "-c",
+    "user.name=PushPals Test",
+    "-c",
+    "user.email=pushpals@example.invalid",
+    "commit",
+    "-m",
+    "bounded coverage fixture",
+  ]);
+  return repo;
+}
+
+async function coverageRequest(repo: string): Promise<RepositoryAgentRequest> {
+  return requestFor(repo, {
+    question: "Inspect the coverage implementation for grounded improvements.",
+    context: {
+      operation: "analyze_autonomy_opportunities",
+      vision: { path: "vision.md", sha256: "c".repeat(64), priorities: ["Improve coverage"] },
+    },
+  });
+}
+
+function coverageRecords(memory: MemoryStore, request: RepositoryAgentRequest) {
+  return memory.search({
+    scope: { namespace: "repository_agent_cache", repositoryId: request.repository.identity },
+    kinds: [coverageKind],
+    maxItems: 32,
+    maxChars: 100_000,
+  });
+}
+
+function emptyAutonomyResponse(): Record<string, unknown> {
+  return modelResponse({ data: { candidates: [] } });
+}
+
+function memoryWithHooks(
+  memory: MemoryStore,
+  hooks: {
+    put?: (input: any, options: any) => Promise<void>;
+    get?: (address: any, options: any) => Promise<void>;
+  },
+): MemoryStore {
+  return new Proxy(memory, {
+    get(target, property) {
+      if (property === "put")
+        return async (input: any, options: any) => {
+          await hooks.put?.(input, options);
+          return target.put(input, options);
+        };
+      if (property === "get")
+        return async (address: any, options: any) => {
+          await hooks.get?.(address, options);
+          return target.get(address, options);
+        };
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 test("autonomy candidate deterministic contract agrees with the provider schema on optional and unknown fields", () => {
@@ -367,6 +440,485 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(freshPayload.advisoryMemory?.length).toBeGreaterThan(0);
   }, 20_000);
 
+  test("advances grounded empty pages across restart and preserves an exact positive cache", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const stateRoot = mkdtempSync(join(tmpdir(), "pushpals-coverage-memory-"));
+    tempDirs.push(stateRoot);
+    const dbPath = join(stateRoot, "memory.sqlite");
+    let memory = new SqliteMemoryStore(dbPath);
+    let calls = 0;
+    const llm = new FakeLlm(() => (++calls < 3 ? emptyAutonomyResponse() : modelResponse()));
+    const worker = () =>
+      new RepositoryAgentWorker({ control: unusedControl(), memory, llm, logger: quietLogger });
+    const first = await worker().analyze("coverage-first", request);
+    await memory.close();
+    memory = new SqliteMemoryStore(dbPath);
+    try {
+      const second = await worker().analyze("coverage-second", request);
+      const third = await worker().analyze("coverage-third-positive", request);
+      const fourth = await worker().analyze("coverage-fourth-cache", request);
+      expect([first.cache.hit, second.cache.hit, third.cache.hit, fourth.cache.hit]).toEqual([
+        false,
+        false,
+        false,
+        true,
+      ]);
+      expect(llm.analysisCalls).toHaveLength(3);
+      const packets = llm.analysisCalls.map(
+        (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+      );
+      expect(packets.map((packet) => packet.discoveryCoverage.page)).toEqual([1, 2, 3]);
+      expect(packets.every((packet) => packet.seedPaths.includes("vision.md"))).toBe(true);
+      const selected = packets.flatMap((packet) => packet.selectedPaths as string[]);
+      expect(new Set(selected).size).toBe(selected.length);
+      expect(
+        packets.every((packet) => packet.selectedPaths.length <= 6 && packet.files.length <= 12),
+      ).toBe(true);
+      expect(
+        packets.every(
+          (packet) =>
+            packet.files.reduce(
+              (total: number, file: any) => total + Buffer.byteLength(file.content),
+              0,
+            ) <= 64_000,
+        ),
+      ).toBe(true);
+      const [cursor] = await coverageRecords(memory, request);
+      expect((cursor!.value as any).nextPage).toBe(2);
+      expect(cursor!.revision).toBe(2);
+    } finally {
+      await memory.close();
+    }
+  }, 30_000);
+
+  test("caps evidence pages and reports bounded exhaustion without claiming the repo is exhausted", async () => {
+    const repo = createCoverageRepository(100);
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const logs: string[] = [];
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: { ...quietLogger, log: (line) => logs.push(String(line)) },
+    });
+    await worker.analyze("coverage-cap-first", request);
+    const [first] = await coverageRecords(memory, request);
+    expect((first!.value as any).pageCount).toBe(16);
+    await memory.put(
+      { ...first!, value: { ...(first!.value as any), nextPage: 15 } },
+      { expectedRevision: first!.revision },
+    );
+    await worker.analyze("coverage-cap-last", request);
+    const [last] = await coverageRecords(memory, request);
+    expect((last!.value as any).nextPage).toBe(16);
+    const cached = await worker.analyze("coverage-cap-exhausted", request);
+    expect(cached.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(2);
+    expect((await coverageRecords(memory, request))[0]!.revision).toBe(last!.revision);
+    const reports = logs
+      .filter((line) => line.includes("evidenceCoverage="))
+      .map((line) => JSON.parse(line.split("evidenceCoverage=")[1]!));
+    expect(reports.at(-1)).toMatchObject({
+      page: 16,
+      pageCount: 16,
+      additionalPathsCapped: true,
+      boundedCoverageExhausted: true,
+      repositoryExhaustivenessEstablished: false,
+      cacheHit: true,
+      advanced: false,
+    });
+  }, 30_000);
+
+  test("retries failed cursor writes from cached empty pages but cache_only never advances", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let failWrite = true;
+    const fences: any[] = [];
+    const hooked = memoryWithHooks(memory, {
+      put: async (input, options) => {
+        if (input.kind !== coverageKind) return;
+        fences.push(options);
+        if (failWrite) throw new Error("temporary coverage store outage");
+      },
+    });
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: hooked,
+      llm,
+      logger: quietLogger,
+    });
+    await worker.analyze("coverage-write-failed", request);
+    expect(await coverageRecords(memory, request)).toHaveLength(0);
+    failWrite = false;
+    const only = await worker.analyze("coverage-cache-only", {
+      ...request,
+      freshness: "cache_only",
+    });
+    expect(only.cache.hit).toBe(true);
+    expect(fences).toHaveLength(1);
+    const retry = await worker.analyze("coverage-write-retry", request);
+    expect(retry.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(1);
+    const [cursor] = await coverageRecords(memory, request);
+    expect((cursor!.value as any).nextPage).toBe(1);
+    expect(fences).toHaveLength(2);
+    expect(
+      fences.every(
+        (entry) =>
+          entry.expectedRevision === 0 &&
+          entry.signal instanceof AbortSignal &&
+          Date.parse(entry.validUntil) <= Date.parse(request.deadlineAt),
+      ),
+    ).toBe(true);
+    await expect(
+      worker.analyze("coverage-unseen-cache-only", { ...request, freshness: "cache_only" }),
+    ).rejects.toThrow("does not contain this request");
+    expect(llm.analysisCalls).toHaveLength(1);
+    expect((await coverageRecords(memory, request))[0]!.revision).toBe(cursor!.revision);
+  }, 30_000);
+
+  test("concurrent empty analyses advance only once and a stale completion cannot regress coverage", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let release!: () => void;
+    let reachedBoth!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const both = new Promise<void>((resolve) => {
+      reachedBoth = resolve;
+    });
+    let calls = 0;
+    const llm: LLMClient = {
+      async generate() {
+        if (++calls === 2) reachedBoth();
+        await barrier;
+        return { text: JSON.stringify(emptyAutonomyResponse()) };
+      },
+    };
+    const workers = [1, 2].map(
+      () =>
+        new RepositoryAgentWorker({ control: unusedControl(), memory, llm, logger: quietLogger }),
+    );
+    const pending = workers.map((worker, index) =>
+      worker.analyze(`coverage-race-${index}`, request),
+    );
+    await both;
+    release();
+    await Promise.all(pending);
+    const [cursor] = await coverageRecords(memory, request);
+    expect((cursor!.value as any).nextPage).toBe(1);
+    expect(cursor!.revision).toBe(1);
+    await workers[0]!.analyze("coverage-race-next", request);
+    const [next] = await coverageRecords(memory, request);
+    expect((next!.value as any).nextPage).toBe(2);
+    expect(next!.revision).toBe(2);
+    expect(calls).toBe(3);
+  }, 30_000);
+
+  test.each(["expired", "invalid", "malformed"])(
+    "resets %s coverage while retaining the occupied CAS revision",
+    async (mode) => {
+      const repo = createCoverageRepository();
+      const request = await coverageRequest(repo);
+      const memory = new InMemoryMemoryStore();
+      const llm = new FakeLlm(emptyAutonomyResponse);
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm,
+        logger: quietLogger,
+      });
+      await worker.analyze("coverage-reset-seed", request);
+      const [first] = await coverageRecords(memory, request);
+      const broken = await memory.put(
+        {
+          ...first!,
+          ...(mode === "expired" ? { expiresAt: new Date(Date.now() - 1_000).toISOString() } : {}),
+          ...(mode === "invalid" ? { status: "invalid" as const } : {}),
+          ...(mode === "malformed" ? { value: { ...(first!.value as any), nextPage: -1 } } : {}),
+        },
+        { expectedRevision: first!.revision },
+      );
+      const recovered = await worker.analyze("coverage-reset-recovered", request);
+      expect(recovered.cache.hit).toBe(true);
+      const [next] = await coverageRecords(memory, request);
+      expect(next!.revision).toBe(broken.revision + 1);
+      expect(next!.status).toBe("active");
+      expect((next!.value as any).nextPage).toBe(1);
+    },
+  );
+
+  test("does not invent a cursor revision when coverage memory cannot be read", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    let failRead = true;
+    const hooked = memoryWithHooks(memory, {
+      get: async (address) => {
+        if (failRead && address.key.startsWith("coverage:"))
+          throw new Error("coverage read unavailable");
+      },
+    });
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: hooked,
+      llm,
+      logger: quietLogger,
+    });
+    await worker.analyze("coverage-read-unavailable", request);
+    expect(await coverageRecords(memory, request)).toHaveLength(0);
+    failRead = false;
+    const cached = await worker.analyze("coverage-read-restored", request);
+    expect(cached.cache.hit).toBe(true);
+    expect((await coverageRecords(memory, request))[0]!.revision).toBe(1);
+    expect(llm.analysisCalls).toHaveLength(1);
+  });
+
+  test.each(["dirty", "provider_failure", "cancelled", "stale", "deadline"])(
+    "does not advance coverage after %s analysis",
+    async (mode) => {
+      const repo = createCoverageRepository();
+      let request = await coverageRequest(repo);
+      const memory = new InMemoryMemoryStore();
+      const controller = new AbortController();
+      const llm: LLMClient = {
+        async generate() {
+          if (mode === "provider_failure") throw new Error("provider unavailable");
+          if (mode === "cancelled") controller.abort(new Error("cancel coverage test"));
+          if (mode === "stale")
+            writeFileSync(join(repo, "README.md"), "changed during synthesis\n");
+          return { text: JSON.stringify(emptyAutonomyResponse()) };
+        },
+      };
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory,
+        llm,
+        logger: quietLogger,
+      });
+      if (mode === "dirty") {
+        writeFileSync(join(repo, "README.md"), "dirty before analysis\n");
+        request = { ...request, repository: await resolveRepositorySnapshot(repo) };
+      }
+      if (mode === "deadline")
+        request = { ...request, deadlineAt: new Date(Date.now() - 1).toISOString() };
+      const result = worker.analyze(`coverage-no-advance-${mode}`, request, controller.signal);
+      if (["cancelled", "stale", "deadline"].includes(mode)) await expect(result).rejects.toThrow();
+      else await result;
+      expect(await coverageRecords(memory, request)).toHaveLength(0);
+    },
+  );
+
+  test("rechecks snapshot after a coverage-write await before returning success", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = memoryWithHooks(new InMemoryMemoryStore(), {
+      put: async (input) => {
+        if (input.kind === coverageKind)
+          writeFileSync(join(repo, "README.md"), "changed during coverage write\n");
+      },
+    });
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm: new FakeLlm(emptyAutonomyResponse),
+      logger: quietLogger,
+    });
+    await expect(worker.analyze("coverage-write-stale", request)).rejects.toThrow(
+      "Repository changed",
+    );
+  });
+
+  test("preserves non-goals and excludes unkeyed transient eligibility from synthesis and retrieval", async () => {
+    const repo = createCoverageRepository();
+    const request = await coverageRequest(repo);
+    const memory = new InMemoryMemoryStore();
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory,
+      llm,
+      logger: quietLogger,
+    });
+    const context = {
+      ...request.context,
+      vision: { ...(request.context!.vision as any), non_goals: ["Never add account collection."] },
+      targetPaths: ["src/coverage-012.ts"],
+      runtimeSignals: {
+        topSignals: [{ evidence: "src/coverage-012.ts" }],
+        openObjectives: [{ target_paths: ["src/coverage-012.ts"] }],
+        activeCooldowns: [{ path: "src/coverage-012.ts" }],
+      },
+    };
+    await worker.analyze("structural-context-first", { ...request, context });
+    const payload = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content);
+    expect(payload.request.context.vision.non_goals).toEqual(["Never add account collection."]);
+    expect(payload.request.context.runtimeSignals).toEqual({
+      executedOutcomeWatermark: null,
+      recentObjectives: [],
+    });
+    expect(payload.request.context.targetPaths).toBeUndefined();
+    expect(payload.evidencePacket.seedPaths).not.toContain("src/coverage-012.ts");
+    expect(payload.evidencePacket.selectedPaths).not.toContain("src/coverage-012.ts");
+    const repeated = await worker.analyze("structural-context-transient-change", {
+      ...request,
+      context: {
+        ...context,
+        targetPaths: ["src/coverage-011.ts"],
+        runtimeSignals: { activeCooldowns: [] },
+      },
+    });
+    expect(repeated.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(1);
+  });
+
+  test("normalizes structural context idempotently before retrieval, keying and synthesis", async () => {
+    const repo = createRepository();
+    const request = await coverageRequest(repo);
+    const llm = new FakeLlm();
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    const raw = {
+      ...request,
+      context: {
+        ...request.context,
+        vision: {
+          ...(request.context!.vision as any),
+          sha256: "\u0130".repeat(256),
+          non_goals: ["\uFB03".repeat(1_000)],
+          sections: [null, "invalid", {}, { number: "1", title: "Scope" }],
+        },
+        deterministicPolicy: { notes: ["\uFB03".repeat(1_000)] },
+        runtimeSignals: {
+          recentObjectives: [{ job_id: "   ", status: "failed", target_paths: ["src/index.ts"] }],
+        },
+      },
+    };
+    const canonical = (worker as any).compactSynthesisContext(raw);
+    expect((worker as any).compactSynthesisContext({ ...raw, context: canonical })).toEqual(
+      canonical,
+    );
+    expect(canonical.vision.non_goals[0].length).toBeLessThanOrEqual(2_000);
+    expect(canonical.deterministicPolicy.notes[0].length).toBeLessThanOrEqual(1_000);
+    expect(canonical.runtimeSignals.recentObjectives).toEqual([]);
+    await worker.analyze("canonical-raw", raw);
+    const payload = JSON.parse(llm.analysisCalls[0]!.messages[0]!.content);
+    expect(payload.request.context).toEqual(canonical);
+    const cached = await worker.analyze("canonical-normalized", { ...raw, context: canonical });
+    expect(cached.cache.hit).toBe(true);
+    expect(llm.analysisCalls).toHaveLength(1);
+  });
+
+  test("paged exploration never turns untracked, binary or symlink paths into supplied evidence", async () => {
+    const repo = createCoverageRepository(7);
+    writeFileSync(join(repo, "untracked.txt"), "untracked private content\n");
+    writeFileSync(join(repo, "src", "coverage-binary.ts"), Buffer.from([0, 0xff, 0xfe, 0]));
+    const outside = mkdtempSync(join(tmpdir(), "pushpals-coverage-outside-"));
+    tempDirs.push(outside);
+    writeFileSync(join(outside, "secret.txt"), "outside content must never be supplied\n");
+    let linked = false;
+    try {
+      symlinkSync(join(outside, "secret.txt"), join(repo, "src", "coverage-link.ts"));
+      linked = true;
+    } catch {
+      /* Windows hosts may not grant symlink creation; binary/untracked assertions still run. */
+    }
+    git(repo, ["add", "src"]);
+    git(repo, [
+      "-c",
+      "user.name=PushPals Test",
+      "-c",
+      "user.email=pushpals@example.invalid",
+      "commit",
+      "-m",
+      "unsafe coverage fixtures",
+    ]);
+    const base = await coverageRequest(repo);
+    // Untracked files make a normal worktree dirty. Ignore the fixture without
+    // staging it so the clean-snapshot paging policy is exercised explicitly.
+    writeFileSync(join(repo, ".git", "info", "exclude"), "untracked.txt\n");
+    const request = {
+      ...base,
+      repository: await resolveRepositorySnapshot(repo),
+      context: {
+        ...base.context,
+        targetPaths: ["untracked.txt", "../outside", join(outside, "secret.txt")],
+      },
+    };
+    const llm = new FakeLlm(emptyAutonomyResponse);
+    const worker = new RepositoryAgentWorker({
+      control: unusedControl(),
+      memory: new InMemoryMemoryStore(),
+      llm,
+      logger: quietLogger,
+    });
+    await worker.analyze("unsafe-coverage-first", request);
+    await worker.analyze("unsafe-coverage-second", request);
+    const packets = llm.analysisCalls.map(
+      (input) => JSON.parse(input.messages[0]!.content).evidencePacket,
+    );
+    const files = packets.flatMap((packet) => packet.files as Array<{ path: string }>);
+    expect(files.map((entry) => entry.path)).not.toContain("untracked.txt");
+    expect(files.map((entry) => entry.path)).not.toContain("src/coverage-binary.ts");
+    if (linked) expect(files.map((entry) => entry.path)).not.toContain("src/coverage-link.ts");
+    expect(JSON.stringify(packets)).not.toContain("outside content must never be supplied");
+    expect(JSON.stringify(packets)).not.toContain("untracked private content");
+  });
+
+  test.each([
+    "one_sentence",
+    "priorities",
+    "objectives",
+    "guardrails",
+    "constraints",
+    "non_goals",
+    "testing_criteria",
+    "sections",
+  ])(
+    "keys supplied normalized vision %s even when its claimed file hash is unchanged",
+    async (field) => {
+      const repo = createRepository();
+      const request = await coverageRequest(repo);
+      const llm = new FakeLlm();
+      const worker = new RepositoryAgentWorker({
+        control: unusedControl(),
+        memory: new InMemoryMemoryStore(),
+        llm,
+        logger: quietLogger,
+      });
+      await worker.analyze(`vision-${field}-before`, request);
+      const changed = await worker.analyze(`vision-${field}-after`, {
+        ...request,
+        context: {
+          ...request.context,
+          vision: {
+            ...(request.context!.vision as any),
+            [field]:
+              field === "one_sentence"
+                ? "Different required scope"
+                : field === "sections"
+                  ? [{ number: "1", title: "Different scope" }]
+                  : ["Different required scope"],
+          },
+        },
+      });
+      expect(changed.cache.hit).toBe(false);
+      expect(llm.analysisCalls).toHaveLength(2);
+    },
+  );
+
   test("reuses a structural autonomy cache across volatile snapshots and invalidates on vision change", async () => {
     const repo = createRepository();
     const memory = new InMemoryMemoryStore();
@@ -511,7 +1063,13 @@ describe("RemoteBuddy-hosted Repository Agent", () => {
     expect(llm.analysisCalls).toHaveLength(5);
     const terminalPayload = JSON.parse(llm.analysisCalls[4]!.messages[0]!.content);
     expect(terminalPayload.request.context.runtimeSignals.recentObjectives).toEqual([
-      { job_id: "failed-execution-1", status: "failed", target_paths: ["src/index.ts"] },
+      {
+        job_id: "failed-execution-1",
+        status: "failed",
+        target_paths: ["src/index.ts"],
+        vision_objective_id: null,
+        attempt_failure_fingerprint: null,
+      },
     ]);
   }, 20_000);
 

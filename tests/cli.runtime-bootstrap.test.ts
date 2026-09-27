@@ -30,6 +30,7 @@ import {
   buildOpenMonitoringHubCommand,
   cleanupLocalWorkerpalSandboxImage,
   createSessionEventReplayFilter,
+  createEmbeddedRuntimeHealthChangeReporter,
   cleanupLingeringPushPalsGitWorktrees,
   cleanupLingeringWorkerpalWarmContainers,
   describeWorkerExecutionReadiness,
@@ -109,6 +110,9 @@ import {
   maxRssKiBToBytes,
   shouldRestartService,
   startManagedServiceWithRetry,
+  type ManagedServiceHealthResult,
+  type ManagedServiceHealthChangeCause,
+  type ManagedServiceLifecycleEvent,
 } from "../scripts/start_runtime_services.ts";
 
 function withCliJobEventDebug<T>(fn: () => T): T {
@@ -420,7 +424,432 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
       "[pushpals] embeddedRuntime=degraded detail=source_control_manager: reached restart limit",
       "[pushpals] embeddedRuntimeAction=Restart pushpals after fixing the runtime failure.",
     ]);
+    expect(formatEmbeddedRuntimeHealthLines(null)).toEqual([]);
   });
+
+  test("embedded health change reporter stays quiet initially and reports each recovery only once", () => {
+    const lines: Array<{ line: string; level: string }> = [];
+    const report = createEmbeddedRuntimeHealthChangeReporter((line, level) =>
+      lines.push({ line, level }),
+    );
+    report(null);
+    report(null);
+    expect(lines).toEqual([]);
+    const degraded = { state: "degraded" as const, detail: "server: health unconfirmed" };
+    report(degraded);
+    report(null, "recovered");
+    report(null);
+    expect(lines).toEqual([
+      {
+        line: "[pushpals] embeddedRuntime=degraded detail=server: health unconfirmed",
+        level: "error",
+      },
+      {
+        line: "[pushpals] embeddedRuntime=healthy detail=runtime degradation cleared",
+        level: "log",
+      },
+    ]);
+    report(degraded);
+    report(null, "recovered");
+    expect(lines.filter(({ line }) => line.includes("embeddedRuntime=healthy"))).toHaveLength(2);
+  });
+
+  test.each(["service_removed", "service_replaced", undefined] as const)(
+    "embedded health reporter does not infer recovery from an unconfirmed clear (%s)",
+    (cause) => {
+      const lines: string[] = [];
+      const report = createEmbeddedRuntimeHealthChangeReporter((line) => lines.push(line));
+      report({ state: "degraded", detail: "server: health unconfirmed" });
+      report(null, cause);
+      report(null, cause);
+      report(null, "recovered");
+      expect(lines.filter((line) => line.includes("embeddedRuntimeNotice="))).toHaveLength(1);
+      expect(lines.some((line) => line.includes("embeddedRuntime=healthy"))).toBe(false);
+    },
+  );
+
+  test.each([false, true])(
+    "replacing a degraded service cannot report healthy before readiness (spawn fails: %s)",
+    async (replacementFails) => {
+      let now = 1_000;
+      let spawnCalls = 0;
+      const lines: string[] = [];
+      const causes: ManagedServiceHealthChangeCause[] = [];
+      const report = createEmbeddedRuntimeHealthChangeReporter((line) => lines.push(line));
+      const spec = {
+        name: "server",
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: { url: "http://127.0.0.1/health", intervalMs: 50 },
+      };
+      const supervisor = new ServiceManager({
+        now: () => now,
+        pollMs: 1_000_000,
+        onHealthChange: (health, cause) => {
+          causes.push(cause);
+          report(health, cause);
+        },
+        probeServiceHealth: async () => ({
+          ok: false,
+          detail: "HTTP 503",
+          failureKind: "unhealthy_response",
+        }),
+        spawnService: (launchSpec) => {
+          spawnCalls += 1;
+          if (spawnCalls > 1 && replacementFails) throw new Error("replacement spawn failed");
+          return {
+            name: launchSpec.name,
+            proc: { kill() {} } as any,
+            command: launchSpec.command,
+            cwd: launchSpec.cwd,
+            env: {},
+            exited: false,
+            exitCode: null,
+            launchedAtMs: now,
+          };
+        },
+        terminateService: async (service) => {
+          service.exited = true;
+          service.exitCode = 1;
+        },
+      });
+      try {
+        supervisor.startService(spec);
+        (supervisor as any).tick();
+        await Bun.sleep(0);
+        expect(supervisor.getHealth()?.state).toBe("degraded");
+        now = 1_050;
+        if (replacementFails) {
+          await expect(supervisor.replaceService(spec)).rejects.toThrow("replacement spawn failed");
+        } else {
+          await supervisor.replaceService(spec);
+        }
+        expect(spawnCalls).toBe(2);
+        expect(causes).toEqual(["degraded", "service_replaced"]);
+        expect(lines.at(-1)).toBe(
+          "[pushpals] embeddedRuntimeNotice=degradation cleared without confirmed recovery",
+        );
+        expect(lines.some((line) => line.includes("embeddedRuntime=healthy"))).toBe(false);
+      } finally {
+        supervisor.stop();
+      }
+    },
+  );
+
+  test.each(["service_removed", "service_replaced"] as const)(
+    "a partial unconfirmed clear prevents global healthy for the whole episode (%s)",
+    async (cause) => {
+      let now = 1_000;
+      const lines: string[] = [];
+      const report = createEmbeddedRuntimeHealthChangeReporter((line) => lines.push(line));
+      const healthy: ManagedServiceHealthResult = { ok: true, detail: "healthy" };
+      const unhealthy: ManagedServiceHealthResult = {
+        ok: false,
+        detail: "HTTP 503",
+        failureKind: "unhealthy_response",
+      };
+      const specs = ["source_control_manager", "server"].map((name) => ({
+        name,
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: { url: `http://127.0.0.1/${name}`, intervalMs: 50 },
+      }));
+      const responses = new Map<string, Promise<ManagedServiceHealthResult>>(
+        specs.map((spec) => [spec.healthCheck.url, Promise.resolve(unhealthy)]),
+      );
+      const supervisor = new ServiceManager({
+        now: () => now,
+        pollMs: 1_000_000,
+        onHealthChange: report,
+        probeServiceHealth: async (spec) => responses.get(spec.url)!,
+        spawnService: (spec) => ({
+          name: spec.name,
+          proc: { kill() {}, exited: Promise.resolve(1) } as any,
+          command: spec.command,
+          cwd: spec.cwd,
+          env: {},
+          exited: false,
+          exitCode: null,
+          launchedAtMs: now,
+        }),
+        terminateService: async (service) => {
+          service.exited = true;
+          service.exitCode = 1;
+        },
+      });
+      const tick = async (at: number) => {
+        now = at;
+        (supervisor as any).tick();
+        await Bun.sleep(0);
+      };
+      try {
+        for (const spec of specs) supervisor.startService(spec);
+        await tick(1_000);
+        expect(supervisor.getHealth()?.detail).toContain("source_control_manager:");
+        expect(supervisor.getHealth()?.detail).toContain("server:");
+
+        if (cause === "service_replaced") {
+          // The replacement has not answered its first probe when the other service recovers.
+          responses.set(specs[0]!.healthCheck.url, new Promise(() => {}));
+          await supervisor.replaceService(specs[0]!);
+        } else {
+          await supervisor.abandonService(supervisor.getService("source_control_manager")!);
+        }
+        expect(supervisor.getHealth()?.detail).not.toContain("source_control_manager:");
+        expect(supervisor.getHealth()?.detail).toContain("server:");
+        responses.set(specs[1]!.healthCheck.url, Promise.resolve(healthy));
+        await tick(1_050);
+        expect(supervisor.getHealth()).toBeNull();
+        expect(lines.at(-1)).toBe(
+          "[pushpals] embeddedRuntimeNotice=degradation cleared without confirmed recovery",
+        );
+        expect(lines.some((line) => line.includes("embeddedRuntime=healthy"))).toBe(false);
+
+        // A completed unconfirmed episode must not poison future confirmed recoveries.
+        if (cause === "service_replaced") {
+          await supervisor.abandonService(supervisor.getService("source_control_manager")!);
+        }
+        responses.set(specs[1]!.healthCheck.url, Promise.resolve(unhealthy));
+        await tick(1_100);
+        responses.set(specs[1]!.healthCheck.url, Promise.resolve(healthy));
+        await tick(1_150);
+        expect(lines.filter((line) => line.includes("embeddedRuntimeNotice="))).toHaveLength(1);
+        expect(lines.filter((line) => line.includes("embeddedRuntime=healthy"))).toHaveLength(1);
+        expect(lines.at(-1)).toBe(
+          "[pushpals] embeddedRuntime=healthy detail=runtime degradation cleared",
+        );
+      } finally {
+        supervisor.stop();
+      }
+    },
+  );
+
+  test("abandoning degraded startup attempts cannot report healthy during launch retries", async () => {
+    let now = 1_000;
+    let spawnCalls = 0;
+    let finishFirstLaunch!: (ready: boolean) => void;
+    let finishSecondLaunch!: (ready: boolean) => void;
+    let notifySecondSpawn!: () => void;
+    const firstLaunchReady = new Promise<boolean>((resolveReady) => {
+      finishFirstLaunch = resolveReady;
+    });
+    const secondLaunchReady = new Promise<boolean>((resolveReady) => {
+      finishSecondLaunch = resolveReady;
+    });
+    const secondSpawned = new Promise<void>((resolveSpawned) => {
+      notifySecondSpawn = resolveSpawned;
+    });
+    const lines: string[] = [];
+    const causes: ManagedServiceHealthChangeCause[] = [];
+    const report = createEmbeddedRuntimeHealthChangeReporter((line) => lines.push(line));
+    const supervisor = new ServiceManager({
+      now: () => now,
+      pollMs: 1_000_000,
+      onHealthChange: (health, cause) => {
+        causes.push(cause);
+        report(health, cause);
+      },
+      probeServiceHealth: async () => ({
+        ok: false,
+        detail: "listener unavailable",
+        failureKind: "transport_error",
+      }),
+      spawnService: (spec) => {
+        spawnCalls += 1;
+        if (spawnCalls === 2) notifySecondSpawn();
+        return {
+          name: spec.name,
+          proc: { kill() {}, exited: Promise.resolve(1) } as any,
+          command: spec.command,
+          cwd: spec.cwd,
+          env: {},
+          exited: false,
+          exitCode: null,
+          launchedAtMs: now,
+          launchReady: spawnCalls === 1 ? firstLaunchReady : secondLaunchReady,
+        };
+      },
+      terminateService: async (service) => {
+        service.exited = true;
+        service.exitCode = 1;
+      },
+    });
+    const launchResult = startManagedServiceWithRetry(
+      supervisor,
+      {
+        name: "server",
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        launchTimeoutMs: 60_000,
+        healthCheck: { url: "http://127.0.0.1/health", intervalMs: 50 },
+      },
+      { maxAttempts: 2, computeBackoffMs: () => 1, sleep: async () => {} },
+    ).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    try {
+      now = 61_001;
+      (supervisor as any).tick();
+      await Bun.sleep(0);
+      expect(supervisor.getHealth()?.state).toBe("degraded");
+      finishFirstLaunch(false);
+      await secondSpawned;
+      expect(spawnCalls).toBe(2);
+      expect(causes).toEqual(["degraded", "service_removed"]);
+      expect(lines.some((line) => line.includes("embeddedRuntime=healthy"))).toBe(false);
+
+      now = 121_002;
+      (supervisor as any).tick();
+      await Bun.sleep(0);
+      expect(supervisor.getHealth()?.state).toBe("degraded");
+      finishSecondLaunch(false);
+      expect(await launchResult).toMatchObject({ code: "ETIMEDOUT" });
+      expect(causes).toEqual(["degraded", "service_removed", "degraded", "service_removed"]);
+      expect(supervisor.getService("server")).toBeNull();
+      expect(lines.filter((line) => line.includes("embeddedRuntimeNotice="))).toHaveLength(2);
+      expect(lines.some((line) => line.includes("embeddedRuntime=healthy"))).toBe(false);
+    } finally {
+      finishFirstLaunch(false);
+      finishSecondLaunch(false);
+      await launchResult;
+      supervisor.stop();
+    }
+  });
+
+  test.each(["transport_error", "unhealthy_response"] as const)(
+    "embedded health callback reports full recovery only after both services recover (%s)",
+    async (failureKind) => {
+      let now = 1_000;
+      let terminations = 0;
+      const lines: Array<{ line: string; level: string }> = [];
+      const events: ManagedServiceLifecycleEvent[] = [];
+      const probeLogs: string[] = [];
+      const healthy: ManagedServiceHealthResult = {
+        ok: true,
+        detail: "healthy",
+        responseStatus: 200,
+        probeDurationMs: 2,
+        probeTimeoutMs: 2_500,
+      };
+      const failed: ManagedServiceHealthResult = {
+        ok: false,
+        detail: failureKind === "transport_error" ? "health probe timed out" : "HTTP 503",
+        failureKind,
+        probeDurationMs: failureKind === "transport_error" ? 2_507 : 7,
+        probeTimeoutMs: 2_500,
+        ...(failureKind === "unhealthy_response" ? { responseStatus: 503 } : {}),
+      };
+      const specs = ["server", "source_control_manager"].map((name) => ({
+        name,
+        color: "",
+        command: ["fake"],
+        cwd: process.cwd(),
+        healthCheck: embeddedServiceHealthCheck(name, "http://127.0.0.1:3000", 3001)!,
+      }));
+      const responses = new Map(specs.map((spec) => [spec.healthCheck.url, healthy]));
+      const report = createEmbeddedRuntimeHealthChangeReporter((line, level) =>
+        lines.push({ line, level }),
+      );
+      const supervisor = new ServiceManager({
+        now: () => now,
+        pollMs: 1_000_000,
+        recoveryPendingAction: "Automatic supervision is continuing.",
+        degradedAction: "Recovery exhausted; fix the failure before restarting.",
+        onHealthChange: report,
+        onLifecycleEvent: (event) => events.push(event),
+        onEvent: (_level, line) => probeLogs.push(line),
+        probeServiceHealth: async (spec) => responses.get(spec.url)!,
+        spawnService: (spec) => ({
+          name: spec.name,
+          proc: { kill() {} } as any,
+          command: spec.command,
+          cwd: spec.cwd,
+          env: {},
+          exited: false,
+          exitCode: null,
+          launchedAtMs: now,
+        }),
+        terminateService: async () => {
+          terminations += 1;
+        },
+      });
+      const tick = async (at: number) => {
+        now = at;
+        (supervisor as any).tick();
+        await Bun.sleep(0);
+      };
+      try {
+        report(null);
+        for (const spec of specs) supervisor.startService(spec);
+        await tick(1_000);
+        expect(lines).toEqual([]);
+
+        for (const spec of specs) responses.set(spec.healthCheck.url, failed);
+        await tick(6_000);
+        expect(supervisor.getHealth()?.detail).toContain("server:");
+        expect(supervisor.getHealth()?.detail).toContain("source_control_manager:");
+        expect(supervisor.getHealth()?.action).toBe("Automatic supervision is continuing.");
+        expect(events.at(-1)).toMatchObject({
+          type: "health",
+          phase: "degraded",
+          failureKind,
+          failureDurationMs: 0,
+          probeDurationMs: failed.probeDurationMs,
+          probeTimeoutMs: 2_500,
+        });
+        expect(probeLogs.at(-1)).toContain("outageAgeMs=0");
+        expect(probeLogs.at(-1)).toContain(`probeDurationMs=${failed.probeDurationMs}`);
+
+        responses.set(specs[1]!.healthCheck.url, healthy);
+        await tick(11_000);
+        expect(supervisor.getHealth()?.detail).toContain("server:");
+        expect(supervisor.getHealth()?.detail).not.toContain("source_control_manager:");
+        expect(lines.some(({ line }) => line.includes("embeddedRuntime=healthy"))).toBe(false);
+
+        // Persistent server failures remain visible but cannot cascade into process-tree kills.
+        await tick(71_000);
+        expect(supervisor.getHealth()?.state).toBe("degraded");
+        expect(terminations).toBe(0);
+        expect(lines.some(({ line }) => line.includes("embeddedRuntime=healthy"))).toBe(false);
+        expect(lines.some(({ line }) => /upgrade|restarting|Recovery exhausted/.test(line))).toBe(
+          false,
+        );
+
+        responses.set(specs[0]!.healthCheck.url, healthy);
+        await tick(76_000);
+        expect(supervisor.getHealth()).toBeNull();
+        expect(lines.at(-1)).toEqual({
+          line: "[pushpals] embeddedRuntime=healthy detail=runtime degradation cleared",
+          level: "log",
+        });
+        const recoveries = events.filter(
+          (event) => event.type === "health" && event.phase === "recovered",
+        );
+        expect(recoveries).toHaveLength(2);
+        expect(recoveries[1]).toMatchObject({
+          service: "server",
+          probeDurationMs: 2,
+          probeTimeoutMs: 2_500,
+          failureDurationMs: 70_000,
+        });
+        expect(events.some((event) => event.type === "exit" || event.type === "restarted")).toBe(
+          false,
+        );
+        await tick(81_000);
+        report(null);
+        report(null);
+        expect(lines.filter(({ line }) => line.includes("embeddedRuntime=healthy"))).toHaveLength(
+          1,
+        );
+      } finally {
+        supervisor.stop();
+      }
+    },
+  );
 
   test("builds a structured Bun crash envelope with runtime and recovery context", () => {
     const envelope = buildEmbeddedRuntimeCrashEnvelope({
@@ -566,6 +995,7 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         pollMs: 50,
         maxRestartAttempts: 1,
         computeRestartBackoffMs: () => 50,
+        recoveryPendingAction: "Automatic supervision is continuing.",
         degradedAction:
           "Inspect the embedded service log or restart pushpals after fixing the runtime failure.",
         spawnService: (spec) => {
@@ -585,11 +1015,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         onEvent: (level, line) => {
           appendFileSync(runtimeServicesLogPath, `[${level}] ${line}\n`, "utf8");
         },
-        onHealthChange: (health) => {
-          for (const line of formatEmbeddedRuntimeHealthLines(health)) {
-            appendFileSync(runtimeServicesLogPath, `${line}\n`, "utf8");
-          }
-        },
+        onHealthChange: createEmbeddedRuntimeHealthChangeReporter((line) => {
+          appendFileSync(runtimeServicesLogPath, `${line}\n`, "utf8");
+        }),
         onLifecycleEvent: (event) => lifecycleEvents.push(event),
       });
       supervisor.startService({
@@ -622,6 +1050,9 @@ describe("pushpals CLI runtime bootstrap helpers", () => {
         );
         const logText = readFileSync(runtimeServicesLogPath, "utf8");
         expect(logText).toContain("[pushpals] embeddedRuntime=degraded detail=");
+        expect(logText).toContain("embeddedRuntimeAction=Automatic supervision is continuing.");
+        expect(logText).toContain("embeddedRuntimeAction=Inspect the embedded service log");
+        expect(logText).not.toContain("embeddedRuntime=healthy");
       } finally {
         supervisor.stop();
       }

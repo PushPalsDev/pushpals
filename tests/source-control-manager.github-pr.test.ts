@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  deleteBranchRef,
   ensureIntegrationPullRequest,
   getBranchHeadSha,
   listOpenPullRequests,
@@ -41,6 +42,103 @@ function closedPr(overrides: Partial<GitHubPR> = {}): GitHubPR {
 }
 
 describe("source control manager GitHub PR provider", () => {
+  test.each([
+    { label: "deleted", status: 204, body: null, deleted: true, reason: "deleted" },
+    {
+      label: "already absent with 404",
+      status: 404,
+      body: JSON.stringify({ message: "Not Found" }),
+      deleted: false,
+      reason: "not_found",
+    },
+    {
+      label: "already absent with the exact missing-reference 422",
+      status: 422,
+      body: JSON.stringify({ message: "Reference does not exist", status: "422" }),
+      deleted: false,
+      reason: "not_found",
+    },
+  ])("deletes an exact encoded branch ref: $label", async ({ status, body, deleted, reason }) => {
+    let requests = 0;
+    const result = await deleteBranchRef({
+      token: "provider-token",
+      remoteUrl: "git@github.com:org/repo.git",
+      branchRef: "refs/heads/agent/cleanup-branch",
+      fetchImpl: async (input, init) => {
+        requests += 1;
+        expect(String(input)).toBe(
+          "https://api.github.com/repos/org/repo/git/refs/heads/agent%2Fcleanup-branch",
+        );
+        expect(init?.method).toBe("DELETE");
+        return new Response(body, { status });
+      },
+    });
+
+    expect(result).toEqual({ deleted, reason });
+    expect(requests).toBe(1);
+  });
+
+  test.each([
+    {
+      label: "protected default branch",
+      status: 422,
+      body: JSON.stringify({ message: "Cannot delete the default branch" }),
+    },
+    {
+      label: "other validation failure",
+      status: 422,
+      body: JSON.stringify({ message: "Validation Failed" }),
+    },
+    {
+      label: "message substring only",
+      status: 422,
+      body: JSON.stringify({ message: "Reference does not exist in the request" }),
+    },
+    { label: "malformed JSON", status: 422, body: '{"message":"Reference does not exist"' },
+    { label: "plain text", status: 422, body: "Reference does not exist" },
+    { label: "JSON string", status: 422, body: JSON.stringify("Reference does not exist") },
+    { label: "JSON null", status: 422, body: "null" },
+    {
+      label: "JSON array",
+      status: 422,
+      body: JSON.stringify([{ message: "Reference does not exist" }]),
+    },
+    {
+      label: "non-string message",
+      status: 422,
+      body: JSON.stringify({ message: ["Reference does not exist"] }),
+    },
+    {
+      label: "unauthenticated",
+      status: 401,
+      body: JSON.stringify({ message: "Reference does not exist" }),
+    },
+    {
+      label: "forbidden",
+      status: 403,
+      body: JSON.stringify({ message: "Reference does not exist" }),
+    },
+    {
+      label: "server failure",
+      status: 500,
+      body: JSON.stringify({ message: "Reference does not exist" }),
+    },
+  ])("preserves branch-delete errors: $label", async ({ status, body }) => {
+    let requests = 0;
+    await expect(
+      deleteBranchRef({
+        token: "provider-token",
+        remoteUrl: "https://github.com/org/repo.git",
+        branchRef: "agent/cleanup-branch",
+        fetchImpl: async () => {
+          requests += 1;
+          return new Response(body, { status });
+        },
+      }),
+    ).rejects.toThrow(`GitHub API ${status}: ${body}`);
+    expect(requests).toBe(1);
+  });
+
   test("resolves an exact live target branch independently of PR metadata", async () => {
     const sha = "C".repeat(40);
     expect(

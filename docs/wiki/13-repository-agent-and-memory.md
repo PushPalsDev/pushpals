@@ -212,6 +212,32 @@ The compare-and-set `expectedRevision` option prevents lost updates. A staged wr
 
 RepositoryAgent cache keys include schema version, repository identity, content tree, purpose, assigned model, and prompt version. Ordinary questions additionally include their exact revision and question/context so an empty commit or changed history cannot reuse a history-sensitive answer. RemoteBuddy autonomy-priority requests instead use the `vision.md` fingerprint, normalized deterministic candidate policy, and stable operation/question protocol, deliberately excluding revision-specific Git history, recalled observations, volatile runtime snapshots, open-objective lists, and signal ordering. A same-tree autonomy hit revalidates each cited blob and rebinds it to the current revision before use; downstream deterministic eligibility still filters a reused candidate against current objectives and cooldowns. Only clean snapshots with a cache-permitting freshness policy are eligible. A stale hit is invalidated; `cache_only` returns a typed miss rather than silently invoking the model. When the provider reports the model actually used, including a compatibility fallback, cache and fact provenance record the normalized `provider/model` attribution rather than the requested label.
 
+### Bounded autonomous evidence coverage
+
+Clean autonomy-priority analysis uses a bounded, persistent discovery cursor in
+the existing authorized `repository_agent_cache` namespace. The cursor has a
+distinct `coverage:` key and record kind; it is not an analysis answer or a
+repository fact. Its identity includes the keyed structural context, repository
+tree, assigned model, prompt version, and deterministic discovery plan. Explicit
+vision non-goals and the other compact vision constraints affect both that key
+and the model context. Transient eligibility signals are left to downstream
+admission rather than incorporated into a reusable structural answer.
+
+The worker keeps seed evidence and examines at most six additional ranked tracked
+paths per page, for at most sixteen pages. Each page has its own exact cache. A
+validated, evidence-backed empty result advances the cursor once using
+compare-and-set, bounded memory I/O, and the existing deadline commit fence.
+Concurrent completions cannot skip a page. Cache-only calls, dirty worktrees,
+cancellation, provider failures, and evidence-only fallback do not advance it.
+Positive answers remain reusable; an empty cache hit can recover a previously
+failed cursor write. Cursor expiry or changed keyed context starts a new sweep.
+
+The `evidenceCoverage` log records request identity, page/count/limit, cache use,
+and advancement. Reaching the discovery cap reports bounded coverage exhaustion
+and explicitly does **not** establish repository-wide exhaustion. This does not
+force candidates, add a second retrieval-model call, execute suggested checks,
+or bypass scope, validation, and review gates.
+
 ### Capability circuit
 
 Synthesis failures are fingerprinted by stage/error class in repository-scoped memory. Two matching consecutive failures open a persistent model/purpose circuit for a bounded cooldown. Calls during cooldown return host-verified deterministic evidence without invoking the provider. After cooldown, compare-and-set ownership permits one half-open probe. Its random probe ID, worker owner, record revision, and lease fence cover synthesis plus bounded provider draining; only that exact generation, while its probe lease is still unexpired, may close or reopen the circuit. Expired capability rows are semantically reset while their durable revision remains the compare-and-set base. The record stores no prompt, caller context, provider error body, or credential-bearing text.

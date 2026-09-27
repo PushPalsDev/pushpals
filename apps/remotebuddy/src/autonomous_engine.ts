@@ -7298,7 +7298,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent_deterministic_fallback",
-          promptTemplateVersion: "repository-agent-v6-bounded-line-windows",
+          promptTemplateVersion: "repository-agent-v7-bounded-coverage",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {
@@ -7485,7 +7485,7 @@ export class RemoteBuddyAutonomousEngine {
           snapshotId: params.snapshot.snapshot_id,
           phase: "ideation",
           provider: "repository_agent",
-          promptTemplateVersion: "repository-agent-v6-bounded-line-windows",
+          promptTemplateVersion: "repository-agent-v7-bounded-coverage",
           promptHash: requestFingerprint,
           requestPayloadHash: requestFingerprint,
           requestPayload: {

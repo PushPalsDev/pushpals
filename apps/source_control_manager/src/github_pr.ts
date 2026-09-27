@@ -733,6 +733,7 @@ export async function deleteBranchRef(opts: {
   token: string;
   remoteUrl: string;
   branchRef: string;
+  fetchImpl?: FetchLike;
 }): Promise<DeleteBranchRefResult> {
   const repo = parseGitHubRepo(opts.remoteUrl);
   if (!repo) {
@@ -750,16 +751,35 @@ export async function deleteBranchRef(opts: {
   }
 
   const url = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/git/refs/heads/${encodeURIComponent(normalizedRef)}`;
-  const response = await githubFetch(url, {
-    method: "DELETE",
-    headers: githubHeaders(opts.token),
-  });
+  const response = await githubFetch(
+    url,
+    {
+      method: "DELETE",
+      headers: githubHeaders(opts.token),
+    },
+    opts.fetchImpl,
+  );
 
   if (response.status === 404) {
     return { deleted: false, reason: "not_found" };
   }
   if (!response.ok) {
     const text = await response.text();
+    if (response.status === 422) {
+      try {
+        const body: unknown = JSON.parse(text);
+        if (
+          body !== null &&
+          typeof body === "object" &&
+          !Array.isArray(body) &&
+          (body as { message?: unknown }).message === "Reference does not exist"
+        ) {
+          return { deleted: false, reason: "not_found" };
+        }
+      } catch {
+        // Preserve malformed responses and all other 422 failures as provider errors.
+      }
+    }
     throw githubError(response.status, text);
   }
   return { deleted: true, reason: "deleted" };

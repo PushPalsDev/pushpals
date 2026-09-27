@@ -113,6 +113,9 @@ jobs:
       - name: Verify worker startup readiness
         run: bun test tests/cli.worker-startup-readiness.test.ts
 
+      - name: Verify health recovery reporting
+        run: bun test tests/start.runtime-services.test.ts tests/cli.runtime-bootstrap.test.ts
+
       - name: Verify compact worktree, sandbox, and packaged-runtime paths
         run: >-
           bun test
@@ -180,6 +183,9 @@ jobs:
 
       - name: Verify worker startup readiness
         run: bun test tests/cli.worker-startup-readiness.test.ts
+
+      - name: Verify health recovery reporting
+        run: bun test tests/start.runtime-services.test.ts tests/cli.runtime-bootstrap.test.ts
 
       - name: Verify Docker engine
         run: docker version

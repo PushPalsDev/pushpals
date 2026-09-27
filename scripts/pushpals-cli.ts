@@ -32,6 +32,7 @@ import {
   startManagedServiceWithRetry,
   terminateManagedServiceTree,
   type EmbeddedRuntimeHealth,
+  type ManagedServiceHealthChangeCause,
   type ManagedServiceProcess,
   type ManagedServiceLifecycleEvent,
   type ManagedServiceSpec,
@@ -566,6 +567,35 @@ export function formatWorkerExecutionReadinessLines(readiness: WorkerExecutionRe
 
 export function formatEmbeddedRuntimeHealthLines(health: EmbeddedRuntimeHealth | null): string[] {
   return formatSharedEmbeddedRuntimeHealthLines(health);
+}
+
+export function createEmbeddedRuntimeHealthChangeReporter(
+  writeLine: (line: string, level: "log" | "error") => void,
+): (health: EmbeddedRuntimeHealth | null, cause?: ManagedServiceHealthChangeCause) => void {
+  let wasDegraded = false;
+  let hasUnconfirmedClear = false;
+  return (health, cause) => {
+    if (cause === "service_removed" || cause === "service_replaced") {
+      hasUnconfirmedClear = true;
+    }
+    if (health) {
+      wasDegraded = true;
+      for (const line of formatEmbeddedRuntimeHealthLines(health)) writeLine(line, "error");
+    } else {
+      if (wasDegraded) {
+        // A partial removal/replacement can clear one degradation before the
+        // last service recovers. The whole episode needs confirmed recovery.
+        writeLine(
+          cause === "recovered" && !hasUnconfirmedClear
+            ? "[pushpals] embeddedRuntime=healthy detail=runtime degradation cleared"
+            : "[pushpals] embeddedRuntimeNotice=degradation cleared without confirmed recovery",
+          "log",
+        );
+      }
+      wasDegraded = false;
+      hasUnconfirmedClear = false;
+    }
+  };
 }
 
 function summarizeWorkerStatusRows(workers: WorkerStatusRow[]): {
@@ -5912,7 +5942,9 @@ async function autoStartRuntimeServices(opts: {
     { envelope: EmbeddedRuntimeCrashEnvelope; observedAtMs: number }
   >();
   const serviceManager = new ServiceManager({
-    degradedAction: `Inspect the embedded service log, upgrade to Bun ${MINIMUM_SUPPORTED_BUN_VERSION} or newer when a native crash is reported, then restart PushPals. Other healthy services remain available.`,
+    recoveryPendingAction:
+      "Automatic supervision is continuing. Inspect the embedded service log if failures persist. Other healthy services remain available.",
+    degradedAction: `Automatic recovery has stopped for an affected service. Inspect the embedded service log and fix the failure before restarting PushPals. For a reported native Bun crash, upgrade Bun only if it is older than ${MINIMUM_SUPPORTED_BUN_VERSION}. Other healthy services remain available.`,
     repeatedExitFingerprintLimit: 2,
     repeatedExitFingerprintWindowMs: 15 * 60_000,
     resolveExitFingerprint: ({ logPath }) =>
@@ -5981,12 +6013,11 @@ async function autoStartRuntimeServices(opts: {
       else console.log(line);
       appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
     },
-    onHealthChange: (health) => {
-      for (const line of formatEmbeddedRuntimeHealthLines(health)) {
-        console.error(line);
-        appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
-      }
-    },
+    onHealthChange: createEmbeddedRuntimeHealthChangeReporter((line, level) => {
+      if (level === "error") console.error(line);
+      else console.log(line);
+      appendRuntimeServicesLogLine(runtimeServicesLogPath, line);
+    }),
   });
   const buildManagedServiceSpec = (
     name: RuntimeServiceName,

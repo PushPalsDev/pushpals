@@ -38,7 +38,7 @@ import {
   autonomyCandidateContractErrors,
 } from "./autonomy_candidate_contract.js";
 
-const PROMPT_VERSION = "repository-agent-v6-bounded-line-windows";
+const PROMPT_VERSION = "repository-agent-v7-bounded-coverage";
 const CACHE_NAMESPACE = "repository_agent_cache";
 const CAPABILITY_NAMESPACE = "repository_agent_capabilities";
 const FACT_NAMESPACE = "repository_facts";
@@ -56,6 +56,8 @@ const MAX_TRACKED_PATH_INDEX_CHARS = 48_000;
 const MAX_PACKET_FILES = 12;
 const MAX_SEED_PACKET_FILES = 6;
 const MAX_DISCOVERY_PATHS = 6;
+const MAX_AUTONOMY_DISCOVERY_PAGES = 16;
+const COVERAGE_KIND = "repository_autonomy_evidence_coverage";
 const MAX_PACKET_FILE_BYTES = 16 * 1024;
 // Retain at most six seed and six discovered prefixes: 1.5 MiB in aggregate.
 const MAX_PACKET_SCAN_FILE_BYTES = 128 * 1024;
@@ -208,6 +210,18 @@ type AdvisoryMemory = {
     usefulness: number;
     evidence: Array<{ path?: string; blobOid?: string }>;
   }>;
+};
+
+type AutonomyEvidenceCoverage = {
+  key: string;
+  analysisKey: string;
+  planHash: string;
+  observedRevision: number | null;
+  page: number;
+  pageCount: number;
+  rankedPathCount: number;
+  selectedPaths: string[];
+  boundedCoverageExhausted: boolean;
 };
 
 export interface RepositoryAgentWorkerOptions {
@@ -880,12 +894,13 @@ function boundedRetrievalTerms(request: RepositoryAgentRequest): string[] {
  * synthesis time, execute repository instructions, or leave a second provider
  * request alive when the final answer starts.
  */
-function discoverAdditionalPathsDeterministically(
+function rankedAdditionalPaths(
   request: RepositoryAgentRequest,
   tracked: TrackedRepository,
-  seedPacket: EvidencePacket,
+  seedPaths: string[],
+  includeUnmatched = false,
 ): string[] {
-  const seedKeys = new Set(seedPacket.seedPaths.map(comparablePath));
+  const seedKeys = new Set(seedPaths.map(comparablePath));
   const exactContextPaths = collectContextPaths([request.question, request.context], tracked);
   const exactKeys = new Set([...exactContextPaths].map(comparablePath));
   const terms = boundedRetrievalTerms(request);
@@ -911,9 +926,9 @@ function discoverAdditionalPathsDeterministically(
       }
       return { path, score };
     })
-    .filter((entry) => entry.score > 0)
+    .filter((entry) => includeUnmatched || entry.score > 0)
     .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
-  return ranked.slice(0, MAX_DISCOVERY_PATHS).map((entry) => entry.path);
+  return ranked.map((entry) => entry.path);
 }
 
 async function extendEvidencePacket(
@@ -1142,21 +1157,44 @@ function normalizedValidationProposals(
   });
 }
 
+function boundedStrings(value: unknown, maxItems: number, maxChars: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === "string")
+    .slice(0, maxItems)
+    .map((entry) => compactText(entry.normalize("NFKC"), maxChars))
+    .filter(Boolean);
+}
+
+function normalizedAutonomyVision(request: RepositoryAgentRequest) {
+  const vision = isRecord(request.context?.vision) ? request.context.vision : {};
+  return {
+    path: compactText(vision.path, 1_000),
+    sha256: compactText(String(vision.sha256 ?? "").toLowerCase(), 256),
+    one_sentence: compactText(vision.one_sentence, 2_000),
+    priorities: boundedStrings(vision.priorities, 16, 2_000),
+    objectives: boundedStrings(vision.objectives, 16, 2_000),
+    guardrails: boundedStrings(vision.guardrails, 12, 2_000),
+    constraints: boundedStrings(vision.constraints, 12, 2_000),
+    non_goals: boundedStrings(vision.non_goals, 8, 2_000),
+    testing_criteria: boundedStrings(vision.testing_criteria, 12, 2_000),
+    sections: (Array.isArray(vision.sections) ? vision.sections : [])
+      .filter((entry): entry is Record<string, RepositoryAgentJsonValue> => isRecord(entry))
+      .slice(0, 16)
+      .map((entry) => ({
+        number: compactText(entry.number, 64),
+        title: compactText(entry.title, 500),
+      })),
+  };
+}
+
 function autonomyVisionFingerprint(request: RepositoryAgentRequest): string | null {
   if (request.purpose !== "priority" || request.caller.service !== "remotebuddy") return null;
   const context = request.context ?? {};
   if (compactText(context.operation, 128) !== "analyze_autonomy_opportunities") return null;
-  const vision = isRecord(context.vision) ? context.vision : {};
-  const supplied = compactText(vision.sha256, 256).toLowerCase();
-  if (/^[a-f0-9]{32,128}$/.test(supplied)) return supplied;
-  return sha256(
-    canonicalJson({
-      path: compactText(vision.path, 1_000),
-      oneSentence: compactText(vision.one_sentence, 4_000),
-      priorities: Array.isArray(vision.priorities) ? vision.priorities.slice(0, 64) : [],
-      objectives: Array.isArray(vision.objectives) ? vision.objectives.slice(0, 64) : [],
-    }),
-  );
+  // A caller-supplied file digest alone does not fence the actual compact
+  // constraints sent to synthesis. Hash exactly that normalized vision too.
+  return sha256(canonicalJson(normalizedAutonomyVision(request)));
 }
 
 function normalizedDeterministicPolicy(request: RepositoryAgentRequest) {
@@ -1167,7 +1205,7 @@ function normalizedDeterministicPolicy(request: RepositoryAgentRequest) {
     const output: string[] = [];
     const seen = new Set<string>();
     for (const entry of value) {
-      const normalized = compactText(entry, maxChars).normalize("NFKC");
+      const normalized = compactText(String(entry ?? "").normalize("NFKC"), maxChars);
       if (!normalized || seen.has(normalized)) continue;
       seen.add(normalized);
       output.push(normalized);
@@ -1229,21 +1267,48 @@ function executedAutonomyOutcomes(request: RepositoryAgentRequest) {
     .filter(
       (entry) =>
         isRecord(entry) &&
-        entry.job_id &&
+        typeof entry.job_id === "string" &&
+        compactText(entry.job_id, 256) &&
         ["completed", "failed", "dead_letter"].includes(String(entry.status)),
     )
     .slice(0, 16)
     .map((entry) => {
       const row = entry as Record<string, unknown>;
       return {
-        jobId: row.job_id,
-        status: row.status,
-        visionObjectiveId: row.vision_objective_id ?? null,
-        targetPaths: row.target_paths ?? [],
-        failureFingerprint: row.attempt_failure_fingerprint ?? null,
+        job_id: compactText(row.job_id, 256),
+        status: compactText(row.status, 32),
+        vision_objective_id: compactText(row.vision_objective_id, 256) || null,
+        target_paths: boundedStrings(row.target_paths, 64, 1_000),
+        attempt_failure_fingerprint: compactText(row.attempt_failure_fingerprint, 512) || null,
       };
     })
-    .sort((left, right) => String(left.jobId).localeCompare(String(right.jobId)));
+    .sort((left, right) => left.job_id.localeCompare(right.job_id));
+}
+
+function normalizedStructuralContext(request: RepositoryAgentRequest): RepositoryAgentContext {
+  const signals = isRecord(request.context?.runtimeSignals) ? request.context.runtimeSignals : {};
+  return asMemoryJson({
+    operation: "analyze_autonomy_opportunities",
+    vision: normalizedAutonomyVision(request),
+    deterministicPolicy: normalizedDeterministicPolicy(request),
+    runtimeSignals: {
+      // Do not let transient eligibility suppress a structural recommendation
+      // in a cache that intentionally outlives that eligibility. The caller
+      // applies current open-objective, cooldown and queue gates downstream.
+      executedOutcomeWatermark: compactText(signals.executedOutcomeWatermark, 128) || null,
+      recentObjectives: executedAutonomyOutcomes(request),
+    },
+  }) as RepositoryAgentContext;
+}
+
+function isGroundedEmptyAutonomyResult(result: RepositoryAgentResult): boolean {
+  return (
+    result.evidence.length > 0 &&
+    isRecord(result.data) &&
+    Array.isArray(result.data.candidates) &&
+    result.data.candidates.length === 0 &&
+    autonomyCandidateContractErrors(result.data).length === 0
+  );
 }
 
 function validateAutonomyCandidateData(request: RepositoryAgentRequest, data: unknown): void {
@@ -2475,43 +2540,167 @@ export class RepositoryAgentWorker {
     }
   }
 
+  private async readEvidenceCoverage(
+    request: RepositoryAgentRequest,
+    tracked: TrackedRepository,
+    analysisKey: string,
+    signal: AbortSignal,
+    deadlineMs: number,
+  ): Promise<AutonomyEvidenceCoverage | null> {
+    if (request.repository.dirty || autonomyVisionFingerprint(request) == null) return null;
+    const seedPaths = seedEvidencePacketPaths(tracked, request.question, request.context);
+    const rankedPaths = rankedAdditionalPaths(request, tracked, seedPaths, true);
+    const pageCount = Math.max(
+      1,
+      Math.min(MAX_AUTONOMY_DISCOVERY_PAGES, Math.ceil(rankedPaths.length / MAX_DISCOVERY_PATHS)),
+    );
+    const key = `coverage:${analysisKey}`;
+    const planHash = sha256(canonicalJson({ seedPaths, rankedPaths, pageCount }));
+    let record: MemoryRecord | null = null;
+    let observedRevision: number | null = null;
+    try {
+      record = await this.memoryWithinDeadline(
+        "evidence coverage read",
+        signal,
+        this.memoryStageDeadline(deadlineMs),
+        () =>
+          this.memory.get(
+            { scope: cacheScope(request), key },
+            { includeExpired: true, statuses: ["active", "stale", "superseded", "invalid"] },
+          ),
+      );
+      observedRevision = record?.revision ?? 0;
+    } catch (error) {
+      throwIfAborted(signal);
+      // A failed read may not fabricate a create-only CAS base. Analysis can
+      // still use page zero; advancement waits until durable state is readable.
+      this.logger.warn(`[RepositoryAgent] evidence coverage read skipped: ${String(error)}`);
+    }
+    const value = record?.value;
+    const valid =
+      record?.status === "active" &&
+      !isExpiredMemoryRecord(record) &&
+      record.kind === COVERAGE_KIND &&
+      isRecord(value) &&
+      value.schemaVersion === 1 &&
+      value.analysisKey === analysisKey &&
+      value.planHash === planHash &&
+      typeof value.nextPage === "number" &&
+      Number.isInteger(value.nextPage) &&
+      value.nextPage >= 0 &&
+      value.nextPage <= pageCount;
+    const nextPage = valid ? (value.nextPage as number) : 0;
+    const page = Math.min(nextPage, pageCount - 1);
+    return {
+      key,
+      analysisKey,
+      planHash,
+      observedRevision,
+      page,
+      pageCount,
+      rankedPathCount: rankedPaths.length,
+      selectedPaths: rankedPaths.slice(
+        page * MAX_DISCOVERY_PATHS,
+        (page + 1) * MAX_DISCOVERY_PATHS,
+      ),
+      boundedCoverageExhausted: nextPage >= pageCount,
+    };
+  }
+
+  private logEvidenceCoverage(
+    requestId: string,
+    coverage: AutonomyEvidenceCoverage,
+    cacheHit: boolean,
+    advanced: boolean,
+  ): void {
+    this.logger.log(
+      `[RepositoryAgent] evidenceCoverage=${JSON.stringify({
+        requestId,
+        page: coverage.page + 1,
+        pageCount: coverage.pageCount,
+        pageLimit: MAX_AUTONOMY_DISCOVERY_PAGES,
+        rankedPathCount: coverage.rankedPathCount,
+        selectedPathCount: coverage.selectedPaths.length,
+        additionalPathsCapped: coverage.rankedPathCount > coverage.pageCount * MAX_DISCOVERY_PATHS,
+        boundedCoverageExhausted:
+          coverage.boundedCoverageExhausted ||
+          (advanced && coverage.page + 1 >= coverage.pageCount),
+        repositoryExhaustivenessEstablished: false,
+        cacheHit,
+        advanced,
+      })}`,
+    );
+  }
+
+  private async advanceEvidenceCoverage(
+    request: RepositoryAgentRequest,
+    coverage: AutonomyEvidenceCoverage | null,
+    result: RepositoryAgentResult,
+    successfulSynthesis: boolean,
+    signal: AbortSignal,
+    deadlineMs: number,
+  ): Promise<boolean> {
+    if (!coverage) return false;
+    let advanced = false;
+    let attempted = false;
+    if (
+      successfulSynthesis &&
+      isGroundedEmptyAutonomyResult(result) &&
+      request.freshness !== "cache_only" &&
+      !request.repository.dirty &&
+      !coverage.boundedCoverageExhausted &&
+      coverage.observedRevision != null
+    ) {
+      throwIfAborted(signal);
+      attempted = true;
+      try {
+        await this.memoryPutWithinDeadline(
+          "evidence coverage advance",
+          signal,
+          this.memoryStageDeadline(deadlineMs - MIN_FINALIZATION_RESERVE_MS),
+          {
+            scope: cacheScope(request),
+            key: coverage.key,
+            kind: COVERAGE_KIND,
+            subjectKey: request.purpose,
+            summary: "Bounded autonomous evidence coverage; not repository-wide exhaustion",
+            value: {
+              schemaVersion: 1,
+              analysisKey: coverage.analysisKey,
+              planHash: coverage.planHash,
+              nextPage: coverage.page + 1,
+              pageCount: coverage.pageCount,
+            },
+            status: "active",
+            tags: [request.purpose, "bounded_evidence_coverage", this.promptVersion],
+            provenance: {
+              service: "repository_agent",
+              agentId: this.agentId,
+              requestId: result.requestId,
+              modelId: this.modelId,
+              promptVersion: this.promptVersion,
+              headSha: request.repository.revision,
+            },
+            ttlMs: this.cacheTtlMs,
+          },
+          { expectedRevision: coverage.observedRevision },
+        );
+        advanced = true;
+      } catch (error) {
+        throwIfAborted(signal);
+        // Do not retry a stale CAS against a newer page: concurrent completion
+        // of one page must advance at most once, never skip another page.
+        this.logger.warn(`[RepositoryAgent] evidence coverage advance skipped: ${String(error)}`);
+      }
+    }
+    this.logEvidenceCoverage(result.requestId, coverage, result.cache.hit, advanced);
+    return attempted;
+  }
+
   private compactSynthesisContext(request: RepositoryAgentRequest): RepositoryAgentContext {
-    const context = request.context ?? {};
-    if (autonomyVisionFingerprint(request) == null) return context;
-    const vision = isRecord(context.vision) ? context.vision : {};
-    const runtimeSignals = isRecord(context.runtimeSignals) ? context.runtimeSignals : {};
-    const compactArray = (value: unknown, limit: number) =>
-      Array.isArray(value) ? value.slice(0, limit) : [];
-    return asMemoryJson({
-      operation: "analyze_autonomy_opportunities",
-      vision: {
-        path: compactText(vision.path, 1_000),
-        sha256: compactText(vision.sha256, 256),
-        one_sentence: compactText(vision.one_sentence, 2_000),
-        priorities: compactArray(vision.priorities, 16),
-        objectives: compactArray(vision.objectives, 16),
-        guardrails: compactArray(vision.guardrails, 12),
-        constraints: compactArray(vision.constraints, 12),
-        testing_criteria: compactArray(vision.testing_criteria, 12),
-        sections: compactArray(vision.sections, 16).map((entry) =>
-          isRecord(entry)
-            ? {
-                number: compactText(entry.number, 64),
-                title: compactText(entry.title, 500),
-              }
-            : {},
-        ),
-      },
-      runtimeSignals: {
-        topSignals: compactArray(runtimeSignals.topSignals, 5),
-        stateTraits: compactArray(runtimeSignals.stateTraits, 5),
-        feedbackPriors: compactArray(runtimeSignals.feedbackPriors, 4),
-        openObjectives: compactArray(runtimeSignals.openObjectives, 4),
-        recentObjectives: compactArray(runtimeSignals.recentObjectives, 16),
-        activeCooldowns: compactArray(runtimeSignals.activeCooldowns, 4),
-      },
-      deterministicPolicy: normalizedDeterministicPolicy(request),
-    }) as RepositoryAgentContext;
+    return autonomyVisionFingerprint(request) == null
+      ? (request.context ?? {})
+      : normalizedStructuralContext(request);
   }
 
   private async generateWithinStage(
@@ -2651,6 +2840,7 @@ export class RepositoryAgentWorker {
     advisoryMemory: AdvisoryMemory,
     signal: AbortSignal,
     deadlineMs: number,
+    coverage: AutonomyEvidenceCoverage | null = null,
   ): Promise<{
     result: RepositoryAgentResult;
     inferenceModelId: string | null;
@@ -2666,7 +2856,9 @@ export class RepositoryAgentWorker {
       signal,
     );
     throwIfAborted(signal);
-    const selectedPaths = discoverAdditionalPathsDeterministically(request, tracked, seedPacket);
+    const selectedPaths =
+      coverage?.selectedPaths ??
+      rankedAdditionalPaths(request, tracked, seedPacket.seedPaths).slice(0, MAX_DISCOVERY_PATHS);
     const evidencePacket = await extendEvidencePacket(
       repoRoot,
       request,
@@ -2737,6 +2929,17 @@ export class RepositoryAgentWorker {
       seedPaths: evidencePacket.seedPaths,
       selectedPaths: evidencePacket.selectedPaths,
       files: evidencePacket.files,
+      ...(coverage
+        ? {
+            discoveryCoverage: {
+              page: coverage.page + 1,
+              pageCount: coverage.pageCount,
+              rankedPathCount: coverage.rankedPathCount,
+              additionalPathLimit: MAX_AUTONOMY_DISCOVERY_PAGES * MAX_DISCOVERY_PATHS,
+              repositoryExhaustivenessEstablished: false,
+            },
+          }
+        : {}),
       recentGitHistory:
         autonomyVisionFingerprint(request) == null
           ? evidencePacket.recentGitHistory.slice(0, 8)
@@ -3079,6 +3282,15 @@ export class RepositoryAgentWorker {
 
     try {
       throwIfAborted(controller.signal);
+      if (autonomyVisionFingerprint(request) != null) {
+        // Retrieval must see the same keyed structural inputs as synthesis.
+        // Otherwise unkeyed transient paths could silently change the packet.
+        request = {
+          ...request,
+          question: compactText(request.question, 32_000),
+          context: normalizedStructuralContext(request),
+        };
+      }
       const repoRoot = resolve(request.repository.root);
       if (
         !isAbsolute(request.repository.root) ||
@@ -3108,7 +3320,7 @@ export class RepositoryAgentWorker {
       const exactRepoRoot = before.root;
       const tracked = await loadTrackedRepository(exactRepoRoot, controller.signal);
       throwIfAborted(controller.signal);
-      const key = cacheKey(request, this.modelId, this.promptVersion);
+      const analysisKey = cacheKey(request, this.modelId, this.promptVersion);
       const allowExactCache = !request.repository.dirty && request.freshness !== "fresh_required";
       const preSynthesisMemoryDeadlineMs = Math.min(
         deadlineMs,
@@ -3117,6 +3329,16 @@ export class RepositoryAgentWorker {
           deadlineMs - this.finalizationReserveFor(deadlineMs) - MIN_SYNTHESIS_START_BUDGET_MS,
         ),
       );
+      const coverage = await this.readEvidenceCoverage(
+        request,
+        tracked,
+        analysisKey,
+        controller.signal,
+        preSynthesisMemoryDeadlineMs,
+      );
+      const key = coverage
+        ? sha256(`${analysisKey}:coverage:${coverage.planHash}:${coverage.page}`)
+        : analysisKey;
 
       if (allowExactCache) {
         const cached = await this.cachedResult(
@@ -3130,6 +3352,18 @@ export class RepositoryAgentWorker {
         );
         if (cached) {
           await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
+          const coverageWriteAttempted = await this.advanceEvidenceCoverage(
+            request,
+            coverage,
+            cached,
+            true,
+            controller.signal,
+            deadlineMs,
+          );
+          if (coverageWriteAttempted) {
+            await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
+          }
+          throwIfAborted(controller.signal);
           return cached;
         }
       }
@@ -3165,6 +3399,7 @@ export class RepositoryAgentWorker {
         advisoryMemory,
         controller.signal,
         deadlineMs,
+        coverage,
       );
       throwIfAborted(controller.signal);
       const after = await resolveRepositorySnapshotWithinDeadline(
@@ -3185,6 +3420,18 @@ export class RepositoryAgentWorker {
       );
       throwIfAborted(controller.signal);
       await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
+      const coverageWriteAttempted = await this.advanceEvidenceCoverage(
+        request,
+        coverage,
+        learned,
+        generated.cacheable,
+        controller.signal,
+        deadlineMs,
+      );
+      if (coverageWriteAttempted) {
+        await this.assertCurrentSnapshot(exactRepoRoot, request, controller.signal, deadlineMs);
+      }
+      throwIfAborted(controller.signal);
       return learned;
     } finally {
       clearTimeout(deadlineTimer);
